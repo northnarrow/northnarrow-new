@@ -576,9 +576,11 @@ sudo iptables -S NORTHNARROW_COMBAT  # → "No chain by that name"
 ## Future work (tracked, not blocking)
 
 - **Migrate `admin_release_combat` (bool stub) call sites** to
-  `admin_release_combat_with_token` and apply `#[deprecated]` on the
-  bool path. Five test sites + the `posture_demo` example are the
-  current callers.
+  `admin_release_combat_with_token`. Five test sites + the
+  `posture_demo` example are the current callers; since external audit
+  POS-013 the stub is compiled only for tests and the `posture-demo`
+  feature (the example's `required-features`), so no production build
+  contains it.
 - **`--strict-anti-tamper` boot flag**: today missing
   `combat-rules.v4` or `admin.pub` produces a WARN and the agent
   continues without isolation; production deployment configs will

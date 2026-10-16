@@ -706,8 +706,16 @@ impl TriggerDetector {
     }
 }
 
+/// `ts` lies within `window_ns` of `focal_ts`, on either side. External
+/// audit POS-006: the window used to be bounded only toward the past, so
+/// an event stamped any time after the focal one counted (the correlation
+/// buffer holds 1,000 events with no age bound). Before or after by the
+/// same window, like the mass-write second factor
+/// ([`MassWriters::wrote_near`]) and the correlation buffer: the rings
+/// are drained apart, so a later event may be read first, and a separate
+/// skew bound would undercount when one ring's pump lags under load.
 fn within(focal_ts: u64, ts: u64, window_ns: u64) -> bool {
-    focal_ts.saturating_sub(ts) <= window_ns
+    ts.abs_diff(focal_ts) <= window_ns
 }
 
 /// PID an event is attributed to, for self-exclusion. Variants the
@@ -918,11 +926,15 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
         return false;
     };
     let by_kernel = kernel_class_says(filename, *kernel_class, open_reason::SENSITIVE);
-    // root (uid=0) and system users (1..1000) are excluded — these
-    // accesses are routine. We only flag when a regular user reaches
-    // for the credential files.
-    if *uid < 1000 {
+    // root (uid=0) is excluded — its accesses are routine.
+    if *uid == 0 {
         return false;
+    }
+    // External audit POS-007: a service uid (1..999) used to be excluded
+    // as well, before any other check — a web shell running as www-data
+    // reading `/etc/shadow` raised nothing. It is judged on its own terms.
+    if *uid < 1000 {
+        return service_uid_credential_read(*pid, filename, by_kernel, auth);
     }
     // T7.13 — an authentication chain opens /etc/shadow (or
     // /etc/gshadow) under the caller's uid: the LSM file_open hook can
@@ -975,6 +987,74 @@ fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
         return false;
     }
     SENSITIVE_FILES.iter().any(|f| filename == f) || by_kernel
+}
+
+/// External audit POS-007: the credential files a service uid's read is
+/// judged on. `/etc/passwd` and `/etc/login.defs` are world-readable and
+/// every daemon reads them for NSS lookups (the BUG-018 class); these
+/// three only the auth stack and the `shadow` group read.
+const SERVICE_UID_CREDENTIAL_FILES: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
+
+/// External audit POS-007: generic file tools, by the basename of the
+/// file the kernel executed — what a web shell or a dropper reads
+/// credentials with; no daemon reads them with these.
+const GENERIC_READER_EXES: &[&str] = &[
+    "cat", "tac", "head", "tail", "less", "more", "cp", "dd", "tar", "cpio", "zip", "gzip",
+    "base64", "base32", "xxd", "od", "hexdump", "strings", "grep", "sed", "awk", "gawk", "mawk",
+    "openssl", "curl", "wget", "nc", "ncat", "socat", "busybox",
+];
+
+/// External audit POS-007: shells and interpreters, by exe basename with
+/// an optional version (`python3.12`, `php8.3`, `php-fpm8.3`): what a web
+/// shell or a script runs in.
+const INTERPRETER_EXES: &[&str] = &[
+    "sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "csh", "tcsh", "python", "perl", "php",
+    "php-fpm", "ruby", "node", "nodejs", "lua", "tclsh",
+];
+
+/// External audit POS-007: a service uid (1..999) opened a credential
+/// file. In LSM mode the event follows the DAC check, so the reader could
+/// read it: a member of the `shadow` group (a mail or auth daemon) or a
+/// misconfigured host. A daemon reading with its own binary stays quiet,
+/// and so does the auth stack's own read
+/// ([`AuthSessionTracker::is_credential_reader`]); a shell, an
+/// interpreter or a generic file tool — judged by the file the kernel
+/// executed, never by `comm` — or an image outside a root-owned system
+/// tree (`/tmp`, `/var/www`, a deleted file there) is the web-shell and
+/// dropper shape, and fires. A reader the agent cannot place (exited
+/// before its exec was read) fires too: the signal is ALERTED tier.
+/// Not covered: a module inside the daemon's own image (`mod_php` in
+/// `apache2`) reads as the daemon.
+fn service_uid_credential_read(
+    pid: u32,
+    filename: &str,
+    by_kernel: bool,
+    auth: &AuthSessionTracker,
+) -> bool {
+    let credential = SERVICE_UID_CREDENTIAL_FILES
+        .iter()
+        .any(|f| filename == *f || (by_kernel && filename.ends_with(f)));
+    if !credential || auth.is_credential_reader(pid) {
+        return false;
+    }
+    auth.image_path(pid)
+        .is_none_or(|image| reads_like_a_tool(&image))
+}
+
+/// External audit POS-007: `image` (a process's executed file, as
+/// [`AuthSessionTracker::image_path`] reports it) is a shell, an
+/// interpreter, a generic file tool, or lies outside a system tree.
+fn reads_like_a_tool(image: &str) -> bool {
+    let path = image.strip_suffix(" (deleted)").unwrap_or(image);
+    if !super::lineage::in_system_tree(path) {
+        return true;
+    }
+    let base = path.rsplit('/').next().unwrap_or(path);
+    GENERIC_READER_EXES.contains(&base)
+        || INTERPRETER_EXES.iter().any(|i| {
+            base.strip_prefix(i)
+                .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        })
 }
 
 fn lolbas_pattern(focal: &Event, recent: Recent<'_>) -> bool {
@@ -1716,13 +1796,19 @@ mod tests {
         assert!(hits.contains(&TriggerType::SensitiveFileAccess));
     }
 
+    /// External audit POS-007: root's read is routine; a service uid's is
+    /// judged by its reader — a daemon's own binary is quiet.
     #[test]
-    fn sensitive_file_access_skips_root_and_system_uids() {
-        let det = TriggerDetector::new();
+    fn sensitive_file_access_skips_root_and_a_daemons_own_read() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(42, 1, "/usr/sbin/exim4", 1), &[]);
         for uid in [0, 1, 999] {
-            let focal = file_open(42, uid, "/etc/shadow", 0, 1);
+            let focal = file_open(42, uid, "/etc/shadow", 0, 2);
             let hits = det.detect(&focal, &[]);
-            assert!(!hits.contains(&TriggerType::SensitiveFileAccess));
+            assert!(
+                !hits.contains(&TriggerType::SensitiveFileAccess),
+                "uid {uid}"
+            );
         }
     }
 
@@ -2145,14 +2231,103 @@ mod tests {
         );
     }
 
-    // ── Test #3: uid<1000 (root/system) still exempt (legacy) ───────
+    // ── Test #3: root still exempt, whoever the reader ──────────────
     #[test]
     fn sensitive_file_access_still_skips_root() {
         let det = detector_with_empty_proc();
-        for uid in [0u32, 1, 999] {
-            let focal = file_open(7777, uid, "/etc/shadow", 0, 1);
-            let hits = det.detect(&focal, &[]);
-            assert!(!hits.contains(&TriggerType::SensitiveFileAccess));
+        let _ = det.detect(&spawn_with_exe(7777, 1, "/usr/bin/cat", 1), &[]);
+        for pid in [7777, 7778] {
+            for path in ["/etc/shadow", "/etc/gshadow", "/etc/sudoers"] {
+                let focal = file_open(pid, 0, path, 0, 2);
+                let hits = det.detect(&focal, &[]);
+                assert!(
+                    !hits.contains(&TriggerType::SensitiveFileAccess),
+                    "{pid} {path}"
+                );
+            }
+        }
+    }
+
+    // ── External audit POS-007: a service uid reading credentials ───
+
+    /// A web shell's shape: `cat` under `sh`, as www-data (uid 33).
+    #[test]
+    fn a_service_uid_shell_reading_shadow_fires() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(3300, 1, "/usr/sbin/php-fpm8.3", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(3301, 3300, "/usr/bin/sh", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(3302, 3301, "/usr/bin/cat", 3), &[]);
+        for (pid, path) in [
+            (3302, "/etc/shadow"),
+            (3302, "/etc/gshadow"),
+            (3302, "/etc/sudoers"),
+            (3301, "/etc/shadow"),
+            (3300, "/etc/shadow"),
+        ] {
+            let hits = det.detect(&file_open(pid, 33, path, 0, 4), &[]);
+            assert!(
+                hits.contains(&TriggerType::SensitiveFileAccess),
+                "{pid} {path}: {hits:?}"
+            );
+        }
+    }
+
+    /// The reader is judged by the file the kernel executed: a dropper
+    /// outside a system tree fires whatever it calls itself, a deleted one
+    /// by where it ran from, and one the agent cannot place fires too.
+    #[test]
+    fn a_service_uid_reader_is_judged_by_its_image() {
+        let det = detector_with_empty_proc();
+        let mut dropper = spawn_with_exe(3400, 1, "/var/www/html/up/exim4", 1);
+        if let Event::ProcessSpawn { comm, .. } = &mut dropper {
+            *comm = "exim4".into();
+        }
+        let _ = det.detect(&dropper, &[]);
+        let _ = det.detect(&spawn_with_exe(3401, 1, "/tmp/x (deleted)", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(3402, 1, "/usr/bin/python3.12", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(3403, 1, "/usr/bin/busybox", 1), &[]);
+        for pid in [3400, 3401, 3402, 3403, 3499] {
+            let hits = det.detect(&file_open(pid, 33, "/etc/shadow", 0, 2), &[]);
+            assert!(hits.contains(&TriggerType::SensitiveFileAccess), "{pid}");
+        }
+    }
+
+    /// A `shadow` group daemon (a mail server, uid 101) reading with its
+    /// own binary is quiet, a replaced binary of a system tree too (an
+    /// upgrade not yet restarted), and so is the auth stack's own read at
+    /// a service uid (`unix_chkpwd` for a web application's PAM login).
+    #[test]
+    fn a_shadow_group_daemon_reading_with_its_own_binary_is_quiet() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(3500, 1, "/usr/sbin/exim4", 1), &[]);
+        let _ = det.detect(
+            &spawn_with_exe(3501, 1, "/usr/sbin/exim4 (deleted)", 1),
+            &[],
+        );
+        let _ = det.detect(&spawn_with_exe(3502, 3500, "/usr/sbin/unix_chkpwd", 2), &[]);
+        for pid in [3500, 3501, 3502] {
+            let hits = det.detect(&file_open(pid, 101, "/etc/shadow", 0, 3), &[]);
+            assert!(
+                !hits.contains(&TriggerType::SensitiveFileAccess),
+                "{pid}: {hits:?}"
+            );
+        }
+    }
+
+    /// `/etc/passwd` and `/etc/login.defs` are world-readable and read by
+    /// every daemon: quiet at a service uid, whoever reads them.
+    #[test]
+    fn a_service_uid_reading_passwd_stays_quiet() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe(3600, 1, "/usr/bin/cat", 1), &[]);
+        for pid in [3600, 3699] {
+            for path in ["/etc/passwd", "/etc/login.defs"] {
+                let hits = det.detect(&file_open(pid, 33, path, 0, 2), &[]);
+                assert!(
+                    !hits.contains(&TriggerType::SensitiveFileAccess),
+                    "{pid} {path}"
+                );
+            }
         }
     }
 
@@ -2300,6 +2475,44 @@ mod tests {
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "unattributed mass-write must still fire, got {hits:?}"
         );
+    }
+
+    // ── External audit POS-006 ──────────────────────────────────────
+
+    /// The window bounds both sides of the focal event (was: the past
+    /// only — an event an hour later counted).
+    #[test]
+    fn within_rejects_far_future_events() {
+        const W: u64 = 60;
+        let focal = 1_000;
+        assert!(within(focal, focal, W));
+        assert!(within(focal, focal - W, W));
+        assert!(within(focal, focal + W, W), "a later event read first");
+        assert!(!within(focal, focal - W - 1, W));
+        assert!(!within(focal, focal + W + 1, W));
+        assert!(!within(focal, u64::MAX, W));
+        assert!(!within(u64::MAX, 0, W));
+    }
+
+    /// MASS_WRITE_MIN write-opens stamped an hour after the focal open are
+    /// not a mass write with it; the same opens inside the window are.
+    #[test]
+    fn a_burst_an_hour_after_the_focal_open_is_not_a_mass_write() {
+        const HOUR: u64 = 3_600 * 1_000_000_000;
+        let focal = file_open(900, 1000, "/home/u/x", 1, 1_000);
+        for (offset, fires) in [(HOUR, false), (MASS_WRITE_WINDOW_NS / 2, true)] {
+            let det = detector_with_empty_proc();
+            let _ = det.detect(&spawn_with_exe(900, 1, "/usr/bin/zsh", 1), &[]);
+            let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
+                .map(|i| file_open(900, 1000, "/home/u/x", 1, 1_000 + offset + i))
+                .collect();
+            let hits = det.detect(&focal, &recent);
+            assert_eq!(
+                hits.contains(&TriggerType::ConfirmedIntrusion),
+                fires,
+                "opens {offset} ns after the focal one: {hits:?}"
+            );
+        }
     }
 
     // ── External audit POS-004 ──────────────────────────────────────

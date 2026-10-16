@@ -24,7 +24,9 @@ use common::posture_types::PostureKind;
 /// fire when `now - last_trigger >= decay window`.
 ///
 /// `Combat::locked = true` blocks every automatic down-transition;
-/// only [`super::PostureMachine::admin_release_combat`] can clear it.
+/// only a signed release
+/// ([`super::PostureMachine::admin_release_combat_with_token`],
+/// [`super::PostureMachine::admin_force_state_with_token`]) can clear it.
 #[derive(Debug, Clone, Default)]
 pub enum PostureState {
     #[default]

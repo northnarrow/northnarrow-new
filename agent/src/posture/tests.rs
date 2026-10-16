@@ -1997,3 +1997,74 @@ fn a_control_surface_tamper_inside_the_trusted_installer_window_raises_nothing()
     assert_eq!(state.kind(), PostureKind::Combat);
     assert_eq!(firing, Some(TriggerType::ControlSurfaceTamper));
 }
+
+// ─── External audit POS-008 — one ledger bound for every scope ─────────
+
+/// User 1000's shell (pid 700) runs `nc` `n` times: each exec an
+/// ExploitAttempt recorded in `login uid 1000`.
+fn nc_flood(m: &PostureMachine, n: u32) {
+    let _ = m.observe(&spawn(700, 1, "bash", "/usr/bin/bash", 1), &[]);
+    for i in 0..n {
+        let pid = 10_000 + i;
+        let _ = m.observe(
+            &spawn(pid, 700, "nc", "/usr/bin/nc", 100 + u64::from(i)),
+            &[],
+        );
+    }
+}
+
+/// The finding: a service (no login uid) runs an exploit tool, then an
+/// unprivileged user runs `nc` in a loop. The flood pushed the service's
+/// signal out of the one 64-entry FIFO every scope shared, and the
+/// service's exfiltration burst stayed at ENGAGED. Its signal now stays:
+/// COMBAT, unlocked, as without the flood.
+#[test]
+fn another_users_nc_flood_does_not_evict_a_units_evidence() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    workload_proc(tmp.path(), 42, "/system.slice/app.service");
+    login_proc(tmp.path(), 700, SHELL_SESSION);
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(42, 1, "sh", "/usr/bin/sh", 1), &[]);
+    let _ = m.observe(&spawn(43, 42, "nc", "/usr/bin/nc", 2), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    nc_flood(&m, 200);
+    assert_eq!(m.corroboration_len(), 2, "the flood is one entry");
+    let (ef, er) = exfil_burst(42);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(!m.is_combat_locked());
+}
+
+/// The privileged case: puppet's root change to a unit file, then the
+/// user's `nc` flood, then puppet's burst. The flood evicted the change,
+/// and with it the lock; the burst now reaches a locked COMBAT.
+#[test]
+fn a_privileged_units_evidence_survives_another_users_flood() {
+    let (tmp, m) = puppet_wrote_a_unit();
+    login_proc(tmp.path(), 700, SHELL_SESSION);
+    nc_flood(&m, 200);
+    let (ef, er) = exfil_burst(300);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(
+        m.is_combat_locked(),
+        "puppet's own pair, with its root change"
+    );
+}
+
+/// The flood itself corroborates nothing: one kind of evidence, however
+/// often, is not two (the user's own burst after it still pairs with it).
+#[test]
+fn an_nc_flood_alone_stays_engaged() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    login_proc(tmp.path(), 700, SHELL_SESSION);
+    login_proc(tmp.path(), 710, SHELL_SESSION);
+    let m = machine_on(tmp.path());
+    let _ = m.observe(&spawn(710, 700, "python3", "/usr/bin/python3", 2), &[]);
+    nc_flood(&m, 200);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    let (ef, er) = exfil_burst(710);
+    let _ = m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    assert!(!m.is_combat_locked());
+}

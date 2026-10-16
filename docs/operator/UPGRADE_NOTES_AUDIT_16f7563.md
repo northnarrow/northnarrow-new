@@ -430,6 +430,20 @@ Now **killed, or answered, where they were recorded or missed**:
   another signal from the same session stays at ENGAGED (R001..R003 still
   kill the exec), and an attack split between a login session and a
   container it starts no longer corroborates across the two.
+- **Corroboration and credential reads** (NN-AUD-305 POS-008, NN-AUD-303
+  POS-006, NN-AUD-304 POS-007, lab PR 172). Each scope keeps its own
+  corroboration signals (16 at most, the ledger 256), and a repeated signal
+  refreshes its entry: a flood from one user or unit no longer evicts
+  another actor's evidence, so that actor's next signal reaches the COMBAT
+  it reached without the flood. A full ledger is logged once ("posture
+  corroboration ledger full"). The triggers' correlation windows bound
+  both sides of the focal event. A service uid (1..999) reading
+  `/etc/shadow`, `/etc/gshadow` or `/etc/sudoers` with a shell, an
+  interpreter (`php-fpm` included), a generic file tool or a binary
+  outside a system tree raises `SensitiveFileAccess` (ALERTED); a daemon
+  reading them with its own binary does not. **Detection change:** a
+  service account in group `shadow` whose scripts read these files (a
+  backup job, an application checking passwords itself) raises ALERTED.
 - **Telemetry loss** (NN-AUD-184 SNS-001, NN-AUD-190 SNS-008, NN-AUD-191
   SNS-009, lab PR 128): a security ring losing more than 64 events in 10 s
   raises the posture to ALERTED (`TelemetryLoss`), never as corroboration
@@ -599,6 +613,10 @@ checked with its tag-bound attestation.
   would score the mock backend, and names the backend next to the rate.
 - **The range bootstrap** takes the rule count from the validation registry
   (76) instead of a fixed 69 (NN-AUD-217 LAB-012, lab PR 159).
+- **The posture demo** (NN-AUD-430 POS-013, lab PR 172):
+  `cargo run --example posture_demo` needs `--features posture-demo`, which
+  compiles the test-only `admin_release_combat(bool)` it calls; no
+  production build contains that call.
 
 ## 11. The journal: one event, one line (Wave 3)
 

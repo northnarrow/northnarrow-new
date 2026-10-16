@@ -512,9 +512,9 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-300 | PROC-012 | Low | Process rules | S | open |
 | NN-AUD-301 | PROC-013 | Low | Process rules | S | open |
 | NN-AUD-302 | PROC-015 | Low | Process rules | S | partly fixed; open |
-| NN-AUD-303 | POS-006 | Low | Posture | S | open |
-| NN-AUD-304 | POS-007 | Low | Posture | S–M | open (narrow fix) |
-| NN-AUD-305 | POS-008 | Low | Posture | S | open (worse since POS-005) |
+| NN-AUD-303 | POS-006 | Low | Posture | S | fixed (lab PR 172) |
+| NN-AUD-304 | POS-007 | Low | Posture | S–M | fixed (lab PR 172) |
+| NN-AUD-305 | POS-008 | Low | Posture | S | fixed (lab PR 172) |
 | NN-AUD-306 | POS-010 | Low | Posture | S | partly fixed; open |
 | NN-AUD-307 | POS-011 | Low | Posture | S | open |
 | NN-AUD-308 | POS-012 | Low | Posture | — | declined (the ADE parser already refuses Allow with a severity, rule 5b) |
@@ -639,7 +639,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-427 | EVD-023 | Info | Evidence logs | S | open |
 | NN-AUD-428 | NETR-016 | Info | Net rules | S | open (docs + an adjacent defect) |
 | NN-AUD-429 | PROC-014 | Info | Process rules | S | open |
-| NN-AUD-430 | POS-013 | Info | Posture | S | open |
+| NN-AUD-430 | POS-013 | Info | Posture | S | fixed (lab PR 172) |
 | NN-AUD-431 | CMB-028 | Info | Combat response | S | open |
 | NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | open (Info; narrowed to the test: argv is 512 B at the kernel) |
 | NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | open (Info; `is_ready` has no caller) |
@@ -5992,3 +5992,87 @@ group, the ones an unprivileged user or a local attacker could use first.
     (`nn-lab.sh`, `bootstrap-target-prod.sh`: LAB-027, batch 8). The first
     build on a lab guest or developer host downloads the pinned toolchain.
   - Lab: No lab run: CI and build configuration. The static tests in `xtask/tests/supply_chain.rs` fail on `main` (8) and pass with the change; the MSRV 1.89 checked with `cargo +1.89.0 check --workspace --all-targets --locked`; a dependency added without updating the lock is refused by `--locked`, also in the nested build of `agent-ebpf`; the workflows' YAML and actionlint 1.7.12 clean. The PR's own CI is the first run of the changed workflows. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.
+- **Wave 3 — posture corroboration, lab PR 172.** Batch B1 of the Wave 3
+  triage of group G4: NN-AUD-305 (POS-008), NN-AUD-303 (POS-006),
+  NN-AUD-304 (POS-007), all Low, and NN-AUD-430 (POS-013, Informational).
+  No wire, kernel or configuration change.
+  - POS-008, worse since POS-005: the ledger was one `VecDeque` capped at
+    64 for every scope, with no dedup, so a flood from one scope pushed
+    out another's evidence, a privileged entry (what locks COMBAT)
+    included; an unprivileged user's `nc` loop sufficed. The ledger is now
+    a map scope → entries. A repeat of the same trigger, evidence class,
+    privilege and pending writer refreshes its entry (`seen` counts the
+    repeats, for the sustained knob, off); every answer is the same with
+    the older copy dropped. Two choices differ from the triage:
+    `privileged` is part of the key instead of being OR-ed (an
+    unprivileged repeat would otherwise extend a root change's window),
+    and the per-scope bound is 16, not 8 — with the dedup a scope holds at
+    most 15 placed entries (11 corroboration triggers, 12 trigger-class
+    pairs, 3 of them privileged as well), so only pending changes of
+    distinct writers (never merged; one writer's repeat is) can reach it,
+    and a scope never loses a placed entry to its own variety. Above the
+    bound the scope's least useful entry goes: pending, then ordinary,
+    then privileged, oldest first. The global bound (256) charges the
+    tenant holding the most entries, then its fullest scope (on a tie the
+    one that recorded last): a `Login(uid)` scope and every scope below
+    `/user.slice/user-<uid>.slice` are one tenant, a unit and its
+    sub-cgroups another (`Delegate=yes`), so the scope splitting accepted
+    in lab PR 161 (`systemd-run --user --scope --unit=libpod-<64 hex>`)
+    cannot fill the ledger with one-entry scopes until a quieter actor's
+    becomes the fullest. One WARN per episode ("posture corroboration
+    ledger full"), re-armed once the ledger is half empty. The order of
+    a scope's entries no longer matters (prune is by age, eviction by
+    rank), so a pending entry placed into another scope keeps its time.
+    Residual: an attacker with many accounts or units is many tenants.
+  - POS-006: `within` is `ts.abs_diff(focal_ts) <= window_ns`, like the
+    mass-write second factor and the correlation buffer; no separate skew
+    bound (it would undercount when one ring's pump lags).
+  - POS-007, the narrow fix: root is still excluded; a uid 1..999 is
+    judged on `/etc/shadow`, `/etc/gshadow` and `/etc/sudoers` only
+    (`/etc/passwd` and `/etc/login.defs` stay quiet: the BUG-018 class),
+    with `is_credential_reader` exempt, and fires when the image
+    (`image_path`: the spawn cache, else `/proc/<pid>/exe`, never `comm`)
+    is a shell or interpreter (with a version suffix: `python3.12`,
+    `php8.3`, `php-fpm8.3`), a generic file tool (`cat`, `cp`, `dd`,
+    `tar`, `base64`, `busybox`, …) or outside a system tree. A deleted
+    image is judged by where it ran from (a dropper in `/tmp` fires, an
+    upgraded `/usr/sbin/exim4` not yet restarted does not); a reader the
+    agent cannot place fires (ALERTED tier). Added to the triage's list:
+    `php-fpm`, the web-shell host the triage's list missed. Not covered: a
+    module in the daemon's own image (`mod_php` in `apache2`).
+  - POS-013: `admin_release_combat(bool)` is `#[cfg(any(test, feature =
+    "posture-demo"))]`; `agent/Cargo.toml` gains the feature and the
+    example's `required-features`; CI runs clippy on the example with it.
+    The docs that named it as the way out of COMBAT (`state.rs`,
+    `transitions.rs`, the error enum) name the signed release.
+  - Lab PR 162: its `ControlSurfaceTamper` (Kernel class, not privileged)
+    is recorded like any signal; the ledger tests include it as the
+    evidence a flood must not evict. It is decisive, so it locks COMBAT on
+    its own, and its FIM event is not windowed by `within`.
+  - Tests (ledger): `another_scopes_flood_does_not_evict_this_scopes_evidence`
+    (an exploit tool, a control-surface tamper, a privileged root change),
+    `a_same_class_flood_keeps_the_distinct_signal`,
+    `a_privileged_entry_survives_a_flood`,
+    `a_users_many_scopes_evict_only_their_own_entries`,
+    `a_repeat_refreshes_only_its_own_entry`,
+    `pending_writers_are_placed_one_by_one`,
+    `a_scope_is_charged_to_whoever_can_create_it`,
+    `ledger_capped_against_flood` (now distinct pending entries, per scope
+    and in all); (machine)
+    `another_users_nc_flood_does_not_evict_a_units_evidence`,
+    `a_privileged_units_evidence_survives_another_users_flood`,
+    `an_nc_flood_alone_stays_engaged`; (triggers)
+    `within_rejects_far_future_events`,
+    `a_burst_an_hour_after_the_focal_open_is_not_a_mass_write`,
+    `a_service_uid_shell_reading_shadow_fires`,
+    `a_service_uid_reader_is_judged_by_its_image`,
+    `a_shadow_group_daemon_reading_with_its_own_binary_is_quiet`,
+    `a_service_uid_reading_passwd_stays_quiet`;
+    `sensitive_file_access_skips_root_and_a_daemons_own_read` and
+    `sensitive_file_access_still_skips_root` replace the two tests that
+    asserted every uid below 1000 quiet. Checked against main's code: the
+    four flood tests (public API) and the two machine flood tests fail
+    (the entry is evicted after 64), the two window tests fail, and the
+    two firing credential-read tests fail; with each scope charged to
+    itself instead of its tenant, the many-scopes test fails.
+  - Lab: Ubuntu 24.04, postcorr172-probe.sh — before: the build of `main` with lab PRs 167–171; after: this lot on top. Control (a unit's `nc`, a sensitive read, an exfiltration burst): COMBAT in both builds. Flood: user nn ran 300 `nc` between the unit's first signal and its burst — before ENGAGED only (the unit's evidence evicted from the shared 64-entry FIFO), after COMBAT (NEUTRALIZE), as without the flood. A root unit's privileged signal against the same flood: the posture reset by the probe before isolation in both runs. Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.
