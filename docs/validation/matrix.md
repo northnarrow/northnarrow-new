@@ -9,13 +9,15 @@ The matrix itself is empty by design — V2–V4 populate it.
 
 | File | What it fixes | Version | Rows | sha256 (LF line endings) |
 |---|---|---|---|---|
-| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 1 | 77 | `4eaa0c2fa7f999277056eb56f92154f1f39174241e08c4a72a8fb31f7fdfe479` |
+| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 2 | 77 | `fdd097941ea801e199de2fb2bc9f2c5e7328fce6b3021183121221e252b77791` |
 | [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 1 | 59 | `c9304cd3d732d7067f41dfe5e981bffeac14cd3e5cd82e0b69f162d174e2a7ab` |
 | [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 1 | 16 | `d376c91f1c0a9af751d790b2f854127466efd5906ea9a4910baa987e8d2da974` |
 
 Version 1 was frozen on 2026-10-15, before any V2 run. Its rule rows are
 the 76 rules the production engine loads plus NN-L-AT-001 (issued outside
-the engine); none is N/A.
+the engine); none is N/A. Version 2 of `v2-rules.tsv` (2026-10-16, also
+before any V2 run) keeps the 77 rows and takes NN-L-NET-003 out of the
+Critical sub-gate.
 
 - A file changes only as a new version: its `# version:` line, its row in
   this table and a line in the change log below, committed before the
@@ -32,6 +34,13 @@ Change log:
 
 - Version 1 (2026-10-15): initial freeze (external audit NN-AUD-217,
   NN-AUD-218, NN-AUD-235).
+- `v2-rules.tsv` version 2 (2026-10-16, lab PR 163): NN-L-NET-003 leaves
+  the Critical sub-gate (`gate -`), inactive until BUG-025 — no sensor
+  produces a TLS fingerprint, so it cannot issue a Critical verdict on the
+  agent as built. It stays in the denominator (`status in`): a miss of it
+  counts against the headline. It returns to the sub-gate with the version
+  that follows BUG-025. NN-L-CANARY-003 stays in the sub-gate: a connect to
+  a network canary trips it since lab PR 163. Sub-gate: 25 rules.
 
 ## Gate formulas (§13 Q1, as frozen)
 
@@ -41,7 +50,8 @@ Change log:
 - **Critical sub-gate:** PASS ÷ the rows with `gate = critical`. Gate:
   100 %. The sub-gate holds every rule Q1 names (FIM-001/002/008/010/021/022
   and every CHAIN rule) and every other rule that can issue a Critical
-  verdict.
+  verdict on the agent as built: NN-L-NET-003 cannot, inactive until
+  BUG-025 (version 2).
 - **Technique coverage** (reported apart, no gate): the techniques of
   `v2-techniques.tsv` whose every row has an observed detection, denial or
   drift, with evidence, ÷ every technique in the file. A `known-gap` row is
@@ -109,6 +119,13 @@ NN-AUD-235). A proof cell cites `path::test` (a test function), or
 The sub-gate passes only on campaign proof. Until REPORT.md is filled, no
 coverage percentage goes into external material.
 
+Out of the sub-gate (`gate -`, still in the denominator), with what
+brings each one back:
+
+- `NN-L-NET-003_BadJa3` — inactive until BUG-025: no sensor produces a TLS
+  fingerprint (`FlowTracker::attach_tls` has no caller), so it cannot fire;
+  registry version 2, lab PR 163.
+
 | rule_id | Q1 | unit | e2e | lab | campaign | status | notes |
 |---|---|---|---|---|---|---|---|
 | R004_ExecFromProcSelfFd | - | `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_proc_self_fd` | `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_memfd_fileless_exec_trips_r004` | `deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd` | no proof | e2e | The lab probe also checks the kill (exit status 137). |
@@ -125,10 +142,9 @@ coverage percentage goes into external material.
 | NN-L-FIM-025_FileCapabilityGranted | - | `agent/src/fim/rules.rs::fim025_strips_a_granted_capability` | no proof | no proof | no proof | unit | Critical for a root-equivalent capability; the response strips it. |
 | NN-L-CANARY-001_FileAccess | - | `agent/src/decision/rules/canary.rs::canary001_fires_on_file_canary_file_open` | `agent/tests/canary_privileged_e2e.rs::file_canary_open_triggers_canary_tripped_event_and_combat` | no proof | no proof | e2e-event | The e2e asserts the signed access row, not the verdict. |
 | NN-L-CANARY-002_ProcessExec | - | `agent/src/decision/rules/canary.rs::canary002_fires_on_process_canary_exec` | `agent/tests/canary_privileged_e2e.rs::process_canary_exec_triggers_canary_tripped_event_and_combat` | no proof | no proof | e2e-event | The e2e asserts the signed access row, not the verdict. |
-| NN-L-CANARY-003_NetworkConnect | - | `agent/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect` | no proof | no proof | no proof | unit | Nothing in the agent produces a Network canary trip (`CanaryIndexes::is_canary_port` is called by tests only): a sensor gap, so a FAIL unless it is wired before V2. |
+| NN-L-CANARY-003_NetworkConnect | - | `agent/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect` | `agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector` | no proof | no proof | e2e | Lab PR 163: a local connect to the canary's address and port trips it (the connect kprobe; the agent opens no listener, a connection from another host is not seen). The e2e waits for the signed access row, the rule's detection record (Critical, KillProcessTree) and the connecting shell's kill; `agent/src/canary/detector.rs::a_network_canary_trip_draws_canary_003_on_the_connector` runs connect → trip → verdict in process. |
 | NN-L-CANARY-004_CredentialRead | - | `agent/src/decision/rules/canary.rs::canary004_fires_on_credential_canary_read` | no proof | no proof | no proof | unit | - |
 | NN-L-NET-001_OutboundToBlockedIp | - | `agent/src/decision/rules/net.rs::net_001_fires_on_blocklist_match` | no proof | no proof | no proof | unit | Needs an entry in the operator blocklist on the target. |
-| NN-L-NET-003_BadJa3 | - | `agent/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match` | no proof | no proof | no proof | unit | The TLS fingerprint is never captured (`FlowTracker::attach_tls` has no caller): a sensor gap, so a FAIL unless it is wired before V2. |
 | NN-L-CHAIN-001_CredReadThenEgress | yes | `agent/src/decision/rules/chain.rs::chain001_fires_on_cred_read_then_egress` | no proof | no proof | no proof | unit | Same-PID form; no e2e. |
 | NN-L-CHAIN-002_TmpExecThenEgress | yes | `agent/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress` | `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002` | no proof | no proof | e2e | Negative e2e: `chain_tmp_exec_without_egress_does_not_trip_chain_002`. |
 | NN-L-CHAIN-003_CanaryThenEgress | yes | `agent/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress` | no proof | no proof | no proof | unit | Same-PID form; no e2e. |
@@ -151,4 +167,4 @@ coverage percentage goes into external material.
 | `bpf` (NN-L-BPF-001/002) | 2 | | | | | | |
 | `anti-tamper` (NN-L-AT-001) | 1 | | | | | | |
 | **Total** | **77** | | | | | | |
-| **Critical sub-gate** | **26** | | | | | | |
+| **Critical sub-gate** | **25** | | | | | | |

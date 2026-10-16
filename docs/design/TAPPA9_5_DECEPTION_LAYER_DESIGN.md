@@ -461,6 +461,44 @@ the network-canary type is feature-gated dormant
 + process + credential canaries today, and add network
 canaries once Tappa 10 lands.
 
+### 5.4 As built (lab PR 163)
+
+The listener above was never built, and until lab PR 163 nothing
+produced a Network canary trip: NN-L-CANARY-003 could not fire. No
+sensor observes an accept (the `tcp_close` fexit drops passive sockets,
+review 79), and a connection accepted from another host names no local
+process for KillProcessTree. The Network canary is a decoy destination
+instead (`agent/src/canary/network.rs`):
+
+- **Trip.** The connect kprobe (`tcp_v4_connect` / `tcp_v6_connect`,
+  `Event::TcpConnect`) reports a local process connecting to the
+  canary's address and port. The K3 detector replaces that event with
+  `Event::CanaryTripped` (`access_kind = NetworkConnect`), with the
+  connecting process as the accessor: the signed access row,
+  `first_trip`, the `trip` registry row and the NN-L-CANARY-003 verdict,
+  as for the other types. The connect is reported at its start, whether
+  or not anything answers, before any byte is sent.
+- **Address.** One address (of this host — a loopback or a dummy
+  interface address — or one no host uses), or `0.0.0.0` / `::`: the
+  port at any address of this host, IPv4 only for `0.0.0.0`. A
+  dual-stack connect to an IPv4-mapped address is judged on its IPv4
+  record (the kernel connects it through `tcp_v4_connect`; one access,
+  one row).
+- **The trip's close.** The flow the tracker builds from that connection
+  (same pid, the connect's timestamp) is recorded in the netflow log and
+  not judged again: NN-L-CHAIN-003 ("a canary trip, then a flow of the
+  same process") answered the one access a second time.
+- **Deploy check.** Refused when the address is not an IP address, the
+  port is 0, or a TCP listener on this host takes the canary's
+  connections (each client of that service would trip it).
+- **Not covered.** A connection from another host, a UDP datagram, and
+  the lure of a port `ss -tlnp` shows: the agent opens no listener (no
+  new socket reachable from the network). The operator places the
+  destination where an intruder finds it (a configuration file, a hosts
+  entry, an ssh config). Like the other canary types, a trip does not
+  move the posture by itself: no posture trigger reads
+  `Event::CanaryTripped`.
+
 ---
 
 ## 6. Detection rules — NN-L-CANARY-001 through NN-L-CANARY-004

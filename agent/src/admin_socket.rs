@@ -3335,11 +3335,36 @@ fn dispatch_canary_deploy(
         }
     };
 
+    let primary_fp = fps_out.first().cloned().unwrap_or_default();
+
+    // Lab PR 163: a network canary trips on a connect to its address and
+    // port (`canary::network`). One whose address is not an IP address
+    // could never trip, and one where a listener on this host takes the
+    // connections would trip on every client of that service.
+    if let common::wire::admin_signed_payload::CanaryDeploymentWire::Network {
+        bind_addr,
+        bind_port,
+    } = &extra.deployment
+    {
+        if let Err(why) = crate::canary::network::check_deployable(bind_addr, *bind_port) {
+            warn!(
+                signer_fp = %primary_fp,
+                bind_addr = %bind_addr,
+                bind_port = *bind_port,
+                reason = %why,
+                "canary-deploy: REFUSED — network canary"
+            );
+            return CanaryDeployResponse {
+                result: AdminResult::UnknownOperation,
+                canary_id: String::new(),
+            };
+        }
+    }
+
     // For File + Credential types: render the file content +
     // write to the deployment path. The K3 detector matches
     // on the resulting inode (after rebuild_canary_indexes
     // stats it).
-    let primary_fp = fps_out.first().cloned().unwrap_or_default();
     let (decoy, content) = match materialise_canary_file(&extra.deployment, state) {
         Ok(m) => m,
         Err(e) => {
@@ -3447,8 +3472,9 @@ fn materialise_canary_file(
             (path, body.into_bytes())
         }
         // Process + Network canaries: no file materialisation
-        // at deploy time. K7 install.sh / K8 e2e set up the
-        // binary placement + listener spawn separately.
+        // at deploy time. The operator places a Process canary's
+        // binary; a Network canary opens no listener (lab PR 163,
+        // `canary::network`).
         CanaryDeploymentWire::Process { .. } | CanaryDeploymentWire::Network { .. } => {
             return Ok((None, None))
         }
@@ -5806,6 +5832,78 @@ mod tests {
         let resp = dispatch_canary_deploy(req, &auth, None, &mut fps);
         assert!(matches!(resp.result, AdminResult::UnknownOperation));
         assert!(resp.canary_id.is_empty());
+    }
+
+    /// Lab PR 163: a network canary deploy is checked before it is
+    /// registered — an address that is not an IP address could never trip,
+    /// and a port a listener on this host serves would trip on each of its
+    /// clients. Both were registered as they came. An accepted one is in
+    /// the detector's index at once.
+    #[test]
+    fn a_network_canary_deploy_is_checked_then_indexed() {
+        use common::wire::admin_protocol::KeyedSignature;
+        use common::wire::admin_signed_payload::{
+            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
+        };
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0xa1; 16];
+        let (auth, _auth_dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let dir = TempDir::new().unwrap();
+        let state = canary_state(&dir);
+        let deploy = |bind_addr: &str, bind_port: u16| {
+            let nonce = auth.issue_challenge().unwrap();
+            let payload = SignedPayload::new_canary_deploy(
+                nonce,
+                now_unix_secs(),
+                agent_id,
+                format!("decoy-{bind_port}"),
+                CanaryTypeWire::Network,
+                CanaryDeploymentWire::Network {
+                    bind_addr: bind_addr.to_string(),
+                    bind_port,
+                },
+            );
+            let sig = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+            let req = CanaryDeployRequest {
+                payload,
+                signatures: vec![KeyedSignature { signature: sig }],
+            };
+            dispatch_canary_deploy(req, &auth, Some(&state), &mut Vec::new())
+        };
+        let served = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let served_port = served.local_addr().unwrap().port();
+        for (addr, port) in [
+            ("db.internal", 4444),
+            ("127.0.0.1", 0),
+            ("127.0.0.1", served_port),
+        ] {
+            let resp = deploy(addr, port);
+            assert!(
+                matches!(resp.result, AdminResult::UnknownOperation),
+                "{addr}:{port} must be refused"
+            );
+        }
+        assert!(
+            state.registry.lock().list().is_empty(),
+            "nothing registered"
+        );
+
+        let free_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let resp = deploy("127.0.0.1", free_port);
+        assert!(matches!(resp.result, AdminResult::Success));
+        let lo = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            state
+                .indexes
+                .lock()
+                .is_canary_destination(lo, free_port, &|_| false),
+            Some(resp.canary_id.as_str())
+        );
+        drop(served);
     }
 
     /// K6 dispatch test #2: dispatch_canary_list short-circuits

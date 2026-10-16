@@ -6,7 +6,7 @@
 //!
 //! The detector runs SYNCHRONOUSLY inside `main::process_event`,
 //! BEFORE the rule engine sees the event. For every inbound
-//! `Event::Fim` / `Event::ProcessSpawn` / future `Event::NetFlow`,
+//! `Event::Fim` / `Event::ProcessSpawn` / `Event::TcpConnect`,
 //! `Detector::process_event` checks the corresponding hot-path
 //! index against the [`crate::canary::registry::Registry`]'s
 //! live set:
@@ -18,10 +18,13 @@
 //!   userland discriminates here).
 //! - `is_canary_exe(path)` — Process canary trip path.
 //!   Consulted on `Event::ProcessSpawn`.
-//! - `is_canary_port(port)` — Network canary trip path. Tappa
-//!   10 dependency; the helper exists today but is unused
-//!   until Tappa 10's `inet_csk_listen` ships and main wires
-//!   `Event::NetFlow` events into `Detector::process_event`.
+//! - `is_canary_destination(dst, port)` — Network canary trip
+//!   path (lab PR 163). Consulted on `Event::TcpConnect`: a local
+//!   process connecting to a canary's address and port is the
+//!   accessor ([`crate::canary::network`] says why it is the
+//!   connect, not an accept). The close of that connection
+//!   (`Event::NetFlow`) belongs to the trip:
+//!   [`Detector::owns_trip_flow`].
 //!
 //! When any helper returns `Some(canary_id)`, under the registry lock:
 //!
@@ -56,7 +59,8 @@
 //! `process_event` tokio task itself + don't block the
 //! reactor longer than a few HashMap lookups.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -67,7 +71,13 @@ use parking_lot::Mutex;
 use tracing::{error, warn};
 
 use crate::canary::access_log::{CanaryAccessDb, CanaryAccessDraft};
+use crate::canary::network::{connect_destination, CanaryAddr, LocalAddrs, PortCanaries};
 use crate::canary::registry::Registry;
+
+/// Network trips whose connection's close is still to come, for
+/// [`Detector::owns_trip_flow`]. A close that never arrives (a lost ring
+/// record) leaves its entry until it is the oldest of this many.
+const PENDING_TRIP_FLOWS: usize = 256;
 
 // ── hot-path indexes ────────────────────────────────────────────────
 
@@ -84,7 +94,9 @@ use crate::canary::registry::Registry;
 ///   deployment (the BPF process-spawn event carries
 ///   `filename`, which userland resolves to absolute path
 ///   before consultation).
-/// - `port_index`: u16 from the canary `Network` deployment.
+/// - `port_index`: the canary `Network` deployment's port, then its
+///   address ([`CanaryAddr`]: one address, or every address of this
+///   host).
 ///
 /// Values are the per-canary stable `canary_id` (32-hex-char
 /// from K2 `compute_canary_id`).
@@ -104,7 +116,7 @@ use crate::canary::registry::Registry;
 pub struct CanaryIndexes {
     inode_index: HashMap<InodeKey, String>,
     exe_index: HashMap<PathBuf, String>,
-    port_index: HashMap<u16, String>,
+    port_index: HashMap<u16, PortCanaries>,
     /// Reverse lookup `canary_id → name` for trip-event
     /// construction without re-walking the registry.
     name_index: HashMap<String, (String, CanaryTypeTag)>,
@@ -154,9 +166,24 @@ impl CanaryIndexes {
                     self.exe_index
                         .insert(PathBuf::from(path), canary_id.clone());
                 }
-                CanaryDeploymentWire::Network { bind_port, .. } => {
-                    self.port_index.insert(*bind_port, canary_id.clone());
-                }
+                CanaryDeploymentWire::Network {
+                    bind_addr,
+                    bind_port,
+                } => match CanaryAddr::parse(bind_addr) {
+                    Some(addr) => self
+                        .port_index
+                        .entry(*bind_port)
+                        .or_default()
+                        .push(addr, canary_id.clone()),
+                    // Deployed before the deploy check (lab PR 163) refused
+                    // such an address.
+                    None => warn!(
+                        canary_id = %canary_id,
+                        bind_addr = %bind_addr,
+                        "network canary: its address is not an IP address — no connect can \
+                         trip it; burn it and deploy it again"
+                    ),
+                },
             }
         }
         // Publish the file-canary inodes so the FIM drain forwards
@@ -177,11 +204,17 @@ impl CanaryIndexes {
         self.exe_index.get(path).map(|s| s.as_str())
     }
 
-    /// Hot-path port lookup (Tappa 10 dependency for the
-    /// `Event::NetFlow` path). Returns the canary_id of the
-    /// matching network listener canary, or `None`.
-    pub fn is_canary_port(&self, port: u16) -> Option<&str> {
-        self.port_index.get(&port).map(|s| s.as_str())
+    /// Hot-path connect lookup (lab PR 163): the canary_id of the
+    /// network canary a connect to `dst` (canonical) and `port` reaches,
+    /// or `None`. `is_local` (is an address one of this host's) is
+    /// called only for a wildcard canary on that port.
+    pub fn is_canary_destination(
+        &self,
+        dst: IpAddr,
+        port: u16,
+        is_local: &dyn Fn(IpAddr) -> bool,
+    ) -> Option<&str> {
+        self.port_index.get(&port)?.find(dst, is_local)
     }
 
     /// Resolve `canary_id` → `(name, type_tag)`. Used by the
@@ -235,7 +268,13 @@ impl CanaryIndexes {
     /// since each canary lives in exactly one). Useful for
     /// boot logs + future `nn-admin canary status`.
     pub fn len(&self) -> usize {
-        self.inode_index.len() + self.exe_index.len() + self.port_index.len()
+        self.inode_index.len()
+            + self.exe_index.len()
+            + self
+                .port_index
+                .values()
+                .map(PortCanaries::len)
+                .sum::<usize>()
     }
 
     /// True when zero canaries are indexed.
@@ -263,6 +302,11 @@ pub struct Detector {
     registry: Arc<Mutex<Registry>>,
     access_log: Arc<Mutex<CanaryAccessDb>>,
     indexes: Arc<Mutex<CanaryIndexes>>,
+    /// This host's addresses, for the wildcard network canaries.
+    local_addrs: LocalAddrs,
+    /// `(pid, connect timestamp)` of the network trips whose close has
+    /// not been seen yet ([`Detector::owns_trip_flow`]).
+    trip_flows: Mutex<VecDeque<(u32, u64)>>,
 }
 
 impl Detector {
@@ -277,6 +321,38 @@ impl Detector {
             registry,
             access_log,
             indexes,
+            local_addrs: LocalAddrs::default(),
+            trip_flows: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Lab PR 163: whether `event` is the close of a connection that
+    /// tripped a network canary — the `Event::NetFlow` the flow tracker
+    /// builds from that connect (same pid, the connect's timestamp as its
+    /// start). It belongs to the trip: main records it in the netflow log
+    /// and does not judge it again, as the FIM rules never see a File
+    /// canary's open (design §6, cross-cutting). Judged, the flow was a
+    /// second response to the one access: NN-L-CHAIN-003 ("a canary trip,
+    /// then a flow of the same process") fired on the trip's own
+    /// connection. A close that reaches the loop before its connect is
+    /// judged as any flow (it precedes the trip, so no chain is complete).
+    pub fn owns_trip_flow(&self, event: &Event) -> bool {
+        let Event::NetFlow(nf) = event else {
+            return false;
+        };
+        if nf.proto != 6 {
+            return false;
+        }
+        let mut flows = self.trip_flows.lock();
+        match flows
+            .iter()
+            .position(|&(pid, ts)| pid == nf.pid && ts == nf.start_ns)
+        {
+            Some(i) => {
+                flows.remove(i);
+                true
+            }
+            None => false,
         }
     }
 
@@ -359,10 +435,35 @@ impl Detector {
                     *timestamp_ns,
                 )
             }
-            // All other event variants fall through — canary
-            // detection only consumes file-open + process-exec
-            // events in V1.0. Tappa 10 will add network-flow
-            // intercept here once Event::NetFlow ships.
+            // Lab PR 163: a connect to a network canary's address and
+            // port, by the local process that makes it.
+            Event::TcpConnect {
+                pid,
+                uid,
+                comm,
+                family,
+                dst_addr,
+                dst_port,
+                timestamp_ns,
+                ..
+            } => {
+                let dst = connect_destination(*family, dst_addr)?;
+                let canary_id = {
+                    let idx = self.indexes.lock();
+                    idx.is_canary_destination(dst, *dst_port, &|a| self.local_addrs.contains(a))
+                        .map(String::from)
+                };
+                let canary_id = canary_id?;
+                (
+                    canary_id,
+                    CanaryAccessKind::NetworkConnect,
+                    *pid,
+                    *uid,
+                    comm.clone(),
+                    *timestamp_ns,
+                )
+            }
+            // All other event variants fall through.
             _ => return None,
         };
 
@@ -440,6 +541,14 @@ impl Detector {
             }
             first_trip
         };
+
+        if access_kind == CanaryAccessKind::NetworkConnect {
+            let mut flows = self.trip_flows.lock();
+            if flows.len() >= PENDING_TRIP_FLOWS {
+                flows.pop_front();
+            }
+            flows.push_back((accessor_pid, ts));
+        }
 
         // Return the trip event for main to route through the
         // K5 canary rules.
@@ -850,7 +959,9 @@ mod tests {
         let idx = detector.indexes.lock();
         assert!(idx.is_canary_inode(&InodeKey { dev: 1, ino: 2 }).is_none());
         assert!(idx.is_canary_exe(Path::new("/bin/ls")).is_none());
-        assert!(idx.is_canary_port(22).is_none());
+        assert!(idx
+            .is_canary_destination("127.0.0.1".parse().unwrap(), 22, &|_| true)
+            .is_none());
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
     }
@@ -892,8 +1003,9 @@ mod tests {
         assert!(idx
             .is_canary_exe(Path::new("/usr/local/bin/helper"))
             .is_some());
-        assert!(idx.is_canary_port(4444).is_some());
-        assert!(idx.is_canary_port(22).is_none());
+        let lo = "127.0.0.1".parse().unwrap();
+        assert!(idx.is_canary_destination(lo, 4444, &|_| false).is_some());
+        assert!(idx.is_canary_destination(lo, 22, &|_| false).is_none());
         // Two canaries total (one in exe, one in port).
         assert_eq!(idx.len(), 2);
     }
@@ -1002,5 +1114,274 @@ mod tests {
             Some("abc123def4567890")
         );
         assert!(idx.is_canary_exe(Path::new("/other/path")).is_none());
+    }
+
+    // ── lab PR 163: network canaries ───────────────────────────────
+
+    fn deploy_network_canary(
+        registry: &Arc<Mutex<Registry>>,
+        detector: &Detector,
+        bind_addr: &str,
+        bind_port: u16,
+    ) -> String {
+        let canary_id = registry
+            .lock()
+            .deploy(CanaryTokenDraft {
+                name: format!("decoy-{bind_addr}-{bind_port}"),
+                canary_type: CanaryTypeWire::Network,
+                deployment: CanaryDeploymentWire::Network {
+                    bind_addr: bind_addr.to_string(),
+                    bind_port,
+                },
+                deployed_by_fp: "deadbeef".to_string(),
+                content: None,
+            })
+            .unwrap()
+            .canary_id;
+        detector.indexes.lock().rebuild_live(&registry.lock());
+        canary_id
+    }
+
+    /// `Event::TcpConnect` as the connect kprobe reports it.
+    fn connect_to(dst: &str, dst_port: u16, pid: u32, ts: u64) -> Event {
+        let (family, dst_addr) = match dst.parse::<IpAddr>().unwrap() {
+            IpAddr::V4(a) => {
+                let mut b = [0u8; 16];
+                b[..4].copy_from_slice(&a.octets());
+                (2, b)
+            }
+            IpAddr::V6(a) => (10, a.octets()),
+        };
+        Event::TcpConnect {
+            pid,
+            uid: 1000,
+            comm: "nc.openbsd".to_string(),
+            family,
+            src_addr: [0u8; 16],
+            src_port: 0,
+            dst_addr,
+            dst_port,
+            timestamp_ns: ts,
+        }
+    }
+
+    fn access_rows(dir: &TempDir) -> Vec<crate::canary::access_log::CanaryAccessEntry> {
+        std::fs::read_to_string(dir.path().join("canary_access.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Lab PR 163 (NN-L-CANARY-003 could not fire): a connect to a network
+    /// canary's address and port is a trip, as an open of a File canary
+    /// is — the signed access row with `first_trip`, the registry's Trip
+    /// row naming it, and `Event::CanaryTripped` with the connecting
+    /// process as the accessor. Nothing consulted the port index before.
+    #[test]
+    fn a_connect_to_a_network_canary_trips_it() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        let id = deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
+
+        let out = detector.process_event(&connect_to("100.64.0.9", 4444, 7001, 1_000));
+        match out {
+            Some(Event::CanaryTripped {
+                canary_id,
+                canary_type,
+                access_kind,
+                accessor_pid,
+                accessor_uid,
+                accessor_comm,
+                timestamp_ns,
+                first_trip,
+                ..
+            }) => {
+                assert_eq!(canary_id, id);
+                assert_eq!(canary_type, CanaryTypeTag::Network);
+                assert_eq!(access_kind, CanaryAccessKind::NetworkConnect);
+                assert_eq!((accessor_pid, accessor_uid), (7001, 1000));
+                assert_eq!(accessor_comm, "nc.openbsd");
+                assert_eq!(timestamp_ns, 1_000);
+                assert!(first_trip);
+            }
+            other => panic!("expected a network canary trip, got {other:?}"),
+        }
+        let rows = access_rows(&dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].canary_id, id);
+        assert_eq!(rows[0].accessor_pid, 7001);
+        assert!(rows[0].first_trip);
+        let state = registry.lock().get(&id).unwrap();
+        assert!(state.tripped);
+        assert_eq!(
+            state.first_trip_access_hash.as_deref(),
+            Some(rows[0].entry_hash.as_str())
+        );
+
+        // a second connect is recorded, not a first trip
+        let again = detector.process_event(&connect_to("100.64.0.9", 4444, 7002, 2_000));
+        assert!(matches!(
+            again,
+            Some(Event::CanaryTripped {
+                first_trip: false,
+                accessor_pid: 7002,
+                ..
+            })
+        ));
+        assert_eq!(access_rows(&dir).len(), 2);
+    }
+
+    /// The verdict: NN-L-CANARY-003 on the trip the connect makes, Critical,
+    /// the connecting process's tree killed.
+    #[test]
+    fn a_network_canary_trip_draws_canary_003_on_the_connector() {
+        use crate::decision::rules::canary::NnLCanary003NetworkConnect;
+        use crate::decision::Rule as _;
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        deploy_network_canary(&registry, &detector, "127.0.0.1", 31337);
+        let trip = detector
+            .process_event(&connect_to("127.0.0.1", 31337, 4242, 5_000))
+            .expect("a trip");
+        let v = NnLCanary003NetworkConnect::default()
+            .evaluate(&trip)
+            .expect("NN-L-CANARY-003 fires");
+        assert_eq!(v.rule_id, "NN-L-CANARY-003_NetworkConnect");
+        assert_eq!(v.severity, common::Severity::Critical);
+        assert_eq!(v.action, common::ResponseAction::KillProcessTree);
+        assert_eq!(v.event_pid, 4242);
+    }
+
+    /// What does not trip: another port, another address, a destination
+    /// on another host for a wildcard canary, and the IPv4-mapped IPv6
+    /// record of a dual-stack connect (its IPv4 record is the trip: one
+    /// access, one row).
+    #[test]
+    fn connects_a_network_canary_does_not_cover_do_not_trip_it() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
+        deploy_network_canary(&registry, &detector, "0.0.0.0", 5555);
+        for ev in [
+            connect_to("100.64.0.9", 4445, 1, 1),
+            connect_to("100.64.0.10", 4444, 1, 2),
+            connect_to("192.0.2.7", 5555, 1, 3),
+            connect_to("::1", 5555, 1, 4),
+            connect_to("::ffff:100.64.0.9", 4444, 1, 5),
+        ] {
+            assert!(detector.process_event(&ev).is_none(), "{ev:?}");
+        }
+        assert!(access_rows(&dir).is_empty());
+        // the IPv4 record of that dual-stack connect, and the wildcard
+        // canary's port on this host
+        assert!(detector
+            .process_event(&connect_to("100.64.0.9", 4444, 1, 6))
+            .is_some());
+        assert!(detector
+            .process_event(&connect_to("127.0.0.1", 5555, 1, 7))
+            .is_some());
+        assert!(detector
+            .process_event(&connect_to("0.0.0.0", 5555, 1, 8))
+            .is_some());
+        assert_eq!(access_rows(&dir).len(), 3);
+    }
+
+    /// A burned network canary trips no more.
+    #[test]
+    fn a_burned_network_canary_does_not_trip() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        let id = deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
+        registry.lock().burn(&id, "deadbeef").unwrap();
+        detector.indexes.lock().rebuild_live(&registry.lock());
+        assert!(detector
+            .process_event(&connect_to("100.64.0.9", 4444, 1, 1))
+            .is_none());
+    }
+
+    fn flow_close(pid: u32, start_ns: u64, proto: u8) -> Event {
+        Event::NetFlow(common::wire::NetFlowEvent {
+            start_ns,
+            end_ns: start_ns + 1_000,
+            family: 2,
+            src_addr: "127.0.0.1".parse().unwrap(),
+            src_port: 40000,
+            dst_addr: "100.64.0.9".parse().unwrap(),
+            dst_port: 4444,
+            proto,
+            pid,
+            uid: 1000,
+            comm: "nc.openbsd".to_string(),
+            exe: None,
+            proc_start_ns: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            resolved_hostname: None,
+            tls_fingerprint: None,
+            flow_id: String::new(),
+            close_reason: 111,
+        })
+    }
+
+    /// The close of the trip's own connection belongs to the trip (main
+    /// does not judge it again: NN-L-CHAIN-003 fired on it, a second
+    /// response to one access). Once, and only that flow: another flow of
+    /// the same process, a flow of another process and a UDP record are
+    /// judged as usual.
+    #[test]
+    fn the_close_of_the_trip_connection_belongs_to_the_trip() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
+        assert!(!detector.owns_trip_flow(&flow_close(7001, 9_000, 6)));
+        detector
+            .process_event(&connect_to("100.64.0.9", 4444, 7001, 9_000))
+            .expect("a trip");
+        assert!(!detector.owns_trip_flow(&flow_close(7001, 9_001, 6)));
+        assert!(!detector.owns_trip_flow(&flow_close(7002, 9_000, 6)));
+        assert!(!detector.owns_trip_flow(&flow_close(7001, 9_000, 17)));
+        assert!(detector.owns_trip_flow(&flow_close(7001, 9_000, 6)));
+        assert!(
+            !detector.owns_trip_flow(&flow_close(7001, 9_000, 6)),
+            "once: a later flow with the same key is not the trip's"
+        );
+        // a file canary trip owns no flow
+        deploy_file_canary(&registry, &detector, "/tmp/decoy.txt", "f");
+        let mut fim = fim_event_on("/tmp/decoy.txt", 7003);
+        if let Event::Fim(fe) = &mut fim {
+            fe.timestamp_ns = 9_500;
+        }
+        detector.process_event(&fim).expect("a file trip");
+        assert!(!detector.owns_trip_flow(&flow_close(7003, 9_500, 6)));
+    }
+
+    /// The pending trips are bounded: the oldest goes first.
+    #[test]
+    fn pending_trip_flows_are_bounded() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
+        for i in 0..=PENDING_TRIP_FLOWS as u64 {
+            detector
+                .process_event(&connect_to("100.64.0.9", 4444, 9, i))
+                .expect("a trip");
+        }
+        assert_eq!(detector.trip_flows.lock().len(), PENDING_TRIP_FLOWS);
+        assert!(!detector.owns_trip_flow(&flow_close(9, 0, 6)));
+        assert!(detector.owns_trip_flow(&flow_close(9, PENDING_TRIP_FLOWS as u64, 6)));
+    }
+
+    /// A network canary recorded with an address that is not one (deployed
+    /// before the deploy check) is indexed nowhere and trips nothing.
+    #[test]
+    fn a_network_canary_with_no_ip_address_is_not_indexed() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        deploy_network_canary(&registry, &detector, "db.internal", 4444);
+        assert!(detector.indexes.lock().is_empty());
+        assert!(detector
+            .process_event(&connect_to("127.0.0.1", 4444, 1, 1))
+            .is_none());
     }
 }

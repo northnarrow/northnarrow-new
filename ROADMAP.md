@@ -473,7 +473,9 @@ Design: `docs/design/TAPPA9_FIM_DESIGN.md`,
 ## Tappa 9.5 — Deception layer / canary token (chiusa)
 
 - Canary di credenziali (aws, azure, gcp, docker, generic) renderizzati
-  da template, registro a catena, scatto su READ e su exec
+  da template, registro a catena, scatto su READ e su exec; dal lab PR 163
+  anche il canary di rete: scatta al connect di un processo locale verso
+  il suo indirizzo e porta (l'agente non apre listener)
 - 9.5.1: honeypot anti-tamper — 10 file esca sulla superficie di
   controllo (`/etc`, `/var/lib`, `/run`), regola NN-L-FIM-024
 - Ruoli `canary-manage` / `canary-read`; policy di percorso sul deploy

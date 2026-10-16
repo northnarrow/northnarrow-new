@@ -3972,6 +3972,13 @@ async fn process_event(
         Some(canary_event) => canary_event,
         None => event,
     };
+    // Lab PR 163: the close of a connection that tripped a network canary
+    // belongs to the trip (its row is in the signed netflow log already);
+    // judged again, NN-L-CHAIN-003 answered the one access a second time.
+    if canary_detector.is_some_and(|d| d.owns_trip_flow(&event)) {
+        debug!("close of a network canary trip connection — part of the trip, not judged again");
+        return;
+    }
 
     // Run posture detection BEFORE we push the focal event into the
     // correlation buffer — the trigger detector counts the focal as

@@ -304,6 +304,8 @@ method is fixed now; where this section disagrees with §1, §4.1, §4.2,
 - **Critical sub-gate.** Every rule Q1 names and every other rule that
   can issue a Critical verdict: 26 rules, `gate = critical` in the
   registry. `matrix.md` records where each one's proof lives today.
+  Version 2 (2026-10-16, lab PR 163): 25 — NN-L-NET-003, which cannot
+  fire until BUG-025, is out of it and stays in the denominator.
 - **ATT&CK technique coverage** is measured on the pre-registered rows of
   [`docs/validation/v2-techniques.tsv`](../validation/v2-techniques.tsv):
   the techniques the rules name and those the audit found without a rule
@@ -627,6 +629,11 @@ separately and do **not** gate T10.7.
   canary trip) cannot fire on the agent as built: FAILs unless wired
   before V2. No coverage percentage goes into external material until
   `docs/validation/REPORT.md` is filled.
+- **Amendment (2026-10-16, lab PR 163, registry version 2):** CANARY-003
+  is wired (a local connect to a network canary's address and port trips
+  it) and stays in the sub-gate. NET-003 leaves it, inactive until
+  BUG-025, and stays in the denominator; it returns with the version that
+  follows BUG-025. The sub-gate is 25 rules.
 
 ### Q2 — Atomic Red Team install: full git clone or curated subset?
 

@@ -79,13 +79,15 @@ entry names the lab PR that fixed it.
   and chown of a protected or watched file cannot be relied on there. The
   lab kernels go up to 6.8, and `--btf-check` does not check hook
   prototypes (`docs/operator/KERNEL_COMPATIBILITY.md`).
-- **Two Critical rules cannot fire.** NN-L-CANARY-003 has no trip source
-  (`CanaryIndexes::is_canary_port` has no caller outside tests), and
-  NN-L-NET-003 is inactive because no sensor produces TLS fingerprints
-  (BUG-025; a JA3 list with entries is a signed `subsystem_degraded` since
-  lab PR 142). The 100 % Critical sub-gate of the V2 campaign
-  (`docs/validation/matrix.md`, lab PR 159) cannot pass until both are
-  wired or retired.
+- **Two Critical rules could not fire.** NN-L-CANARY-003 had no trip
+  source (`CanaryIndexes::is_canary_port` had no caller outside tests):
+  resolved (lab PR 163) — a local process connecting to a network
+  canary's address and port trips it. NN-L-NET-003 is inactive because no
+  sensor produces TLS fingerprints (BUG-025; a JA3 list with entries is a
+  signed `subsystem_degraded` since lab PR 142): retired from the Critical
+  sub-gate until BUG-025 (lab PR 163); it stays in the denominator. The
+  100 % Critical sub-gate of the V2 campaign (`docs/validation/matrix.md`,
+  lab PR 159) holds 25 rules and can pass.
 - **FIM-024 does not raise the posture.** No posture trigger reads FIM
   events, so a honeypot tamper (NN-L-FIM-024, Critical, KillProcessTree)
   leaves the posture where it was, although the rule's reasoning and the
@@ -5095,3 +5097,67 @@ the audit did not report, noted with the fix that takes them.
     `docs/validation/v2-rules.tsv` does not carry the action (no new
     version); the R006 note in `matrix.md` is updated.
   - Lab: Ubuntu 24.04, treekill166-probe.sh. `main`: a `/tmp` dropper that forks at once leaves its child running under init — as root (R009, `KillProcess`) and as user nn (R001): 1 survivor each; R017 kills `/usr/local/bin/bash -c` and an `env bash` script with `/usr/local/bin` first in `PATH` (exit 137). This build: `KillProcessTree`, 0 survivors in both; both shells run (exit 0, no verdict); `/tmp/nnx166/bash` still draws R017, now `KillProcessTree`. Found in the lab and fixed here: a first fix stopped the root with SIGSTOP, and the `sudo` that launched the root dropper stopped itself in turn and stayed stopped (the probe hung); the kill cgroup's freeze replaced it and the root case returns at once. Not changed: short-lived copies run from `/tmp` (`unshare --version`, `bash -c 'exit 0'`) end before their verdict in both builds — `main`: 3 of 4 exited 0 under `KillProcess`, while the same binary from a home directory was killed 4 of 4 (a follow-up). Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.
+- **Lab follow-ups — network canary wiring and NN-L-NET-003, lab PR 163.**
+  The two Critical rules of the V2 sub-gate that could not fire (the
+  follow-ups above). One product decision (NET-003), one wiring
+  (CANARY-003).
+  - NN-L-CANARY-003: nothing consulted the network canaries' port index,
+    so no Network canary could trip. Design §5.3 has the agent listen on
+    the canary port and trip on `accept()`; no sensor observes an accept
+    (the `tcp_close` fexit drops passive sockets, review 79), and an
+    accepted connection from another host names no local process for
+    KillProcessTree. Built instead with the sensors that exist: the
+    canary is a decoy destination, and the connect kprobe
+    (`Event::TcpConnect`) of a local process to its address and port is
+    the trip (`agent/src/canary/network.rs`, design §5.4). The K3
+    detector replaces the connect with `Event::CanaryTripped`
+    (`NetworkConnect`, the connecting process as the accessor), as it
+    replaces a File canary's open: the signed access row with
+    `first_trip`, the registry's `trip` row naming it, the NN-L-CANARY-003
+    verdict (Critical, KillProcessTree, on every connect since NETR-006).
+    No posture trigger reads canary trips, for any type; none is added.
+    `0.0.0.0` / `::` is the port at any address of this host (loopback,
+    the interfaces' addresses, read at most once a second); a connect to
+    the port on another host is not a trip; a dual-stack connect to an
+    IPv4-mapped address is judged on its IPv4 record, which the kernel
+    makes of it (one access, one row). The agent opens no listener: a
+    connection from another host, a UDP datagram and the lure of a port
+    `ss -tlnp` shows are not covered.
+  - The trip's own connection: its close (`Event::NetFlow`, same pid, the
+    connect's timestamp) is recorded in the netflow log and not judged
+    again (`Detector::owns_trip_flow`); NN-L-CHAIN-003 fired on it, a
+    second Critical for one access. A close that reaches the loop before
+    its connect is judged as any flow, before any precursor.
+  - Deploy check: a network canary is refused when its address is not an
+    IP address, its port is 0, or a TCP listener on this host
+    (`/proc/net/tcp`, `tcp6`) takes its connections — each client of that
+    service would be killed. Both were registered as they came. A
+    canary recorded earlier with no IP address is reported at the index
+    rebuild and trips nothing. `nn-admin canary deploy network --help`
+    said the agent binds a listener; it says what is built.
+  - NN-L-NET-003 (product decision, delegated by the founder): out of the
+    Critical sub-gate until BUG-025 gives it a TLS fingerprint producer;
+    not implemented here. `v2-rules.tsv` version 2 (`gate -`, `status in`:
+    a miss still counts against the headline), recorded in `matrix.md`
+    (version, hash, change log, the rule out of the evidence table and
+    listed with its reason, roll-up 25) before any V2 run; design §4.3 and
+    the Q1 amendment follow.
+  - Tests: `a_connect_to_a_network_canary_trips_it`,
+    `a_network_canary_trip_draws_canary_003_on_the_connector`,
+    `connects_a_network_canary_does_not_cover_do_not_trip_it`,
+    `a_burned_network_canary_does_not_trip`,
+    `the_close_of_the_trip_connection_belongs_to_the_trip`,
+    `pending_trip_flows_are_bounded`,
+    `a_network_canary_with_no_ip_address_is_not_indexed` (detector),
+    `a_network_canary_deploy_is_checked_then_indexed` (admin socket), the
+    `canary::network` tests (addresses, wildcard coverage, the mapped
+    record, `/proc/net/tcp` parsing, the deploy check),
+    `a_rule_out_of_the_sub_gate_stays_in_the_denominator_with_its_reason`
+    (registry); privileged e2e
+    `network_canary_connect_trips_canary_003_and_kills_the_connector`
+    (access row, `trip` row, the NN-L-CANARY-003 record, the connecting
+    shell killed, a second connect `first_trip = false`, no
+    NN-L-CHAIN-003). With the detector's connect arm taken out, five of
+    the detector tests fail (all but the burned-canary and no-IP-address
+    ones); with the deploy check taken out, the admin-socket test fails.
+  - Lab: Ubuntu 24.04, netcanary163-probe.sh. `main`: both deploys that cannot work succeed (`db.internal`; port 22, where sshd listens); two connects to the canary 100.64.163.1:15432 exit 0 after 5 s with no access row and no verdict. This build: both deploys refused (`canary-deploy: REFUSED — network canary`, with the reason); the first connect is killed (137) with a signed `NetworkConnect` access row `first_trip=true`, the registry's `trip` row naming its hash and NN-L-CANARY-003 Critical `KillProcessTree`; the second is killed with `first_trip=false`; connects to another port and to 127.0.0.1 exit 0 and leave no row; no NN-L-CHAIN-003 for the trip pids; the trip connections' 4 netflow rows recorded. Found in the gate and fixed here: the canary e2e fixture removed its tempdir — which now holds the agent's protected chains — before stopping its agent; the agent took the unlink for a tamper, killed the test runner and isolated the Debian 12 guest. The fixture now stops its agent first. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.

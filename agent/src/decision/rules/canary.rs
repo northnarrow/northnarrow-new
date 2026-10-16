@@ -36,13 +36,13 @@
 //!    keys; file canary trip → also snapshot the host's
 //!    process tree for forensics).
 //! 3. ADE prompt variation per type (Credential trips get the
-//!    richest enrichment; Network trips get the connecting
-//!    peer's IP + Tappa 10 JA3 fingerprint when wired).
+//!    richest enrichment).
 //!
 //! ## Source-event filter
 //!
 //! The K3 detector emits `Event::CanaryTripped` and replaces
-//! the source `Event::Fim` / `Event::ProcessSpawn` in
+//! the source `Event::Fim` / `Event::ProcessSpawn` /
+//! `Event::TcpConnect` in
 //! main::process_event BEFORE the rule engine sees it.
 //! Consequence: the K5 rules NEVER see the source events —
 //! they consume only `Event::CanaryTripped`. The K2/K9 FIM
@@ -340,21 +340,18 @@ impl Rule for NnLCanary002ProcessExec {
 
 // ── NN-L-CANARY-003 — Network canary connected ─────────────────────
 
-/// Network listener canary connected — the K3 detector
-/// observed a `tokio::TcpListener::accept()` return on a
-/// deployed `Network`-type canary's port. By zero-FP
-/// construction this is guaranteed-malicious activity (no
-/// operator process should be scanning ports the agent owns
-/// for deception). Always Critical, KillProcessTree the
-/// accessor, posture → COMBAT.
+/// Network canary connected — the K3 detector observed a local
+/// process connecting (`Event::TcpConnect`, the connect kprobe) to a
+/// deployed `Network`-type canary's address and port: a destination no
+/// legitimate process uses ([`crate::canary::network`]). Always
+/// Critical, KillProcessTree the connecting process's tree, on every
+/// connect (external audit NETR-006).
 ///
-/// **Dormant until Tappa 10:** the K3 detector's
-/// `is_canary_port` helper exists today but is consulted only
-/// when `Event::NetFlow` events are wired into the inline
-/// filter — that wiring is part of Tappa 10's NetFlow drain
-/// loop. Until then this rule compiles + tests pass with
-/// synthetic events, but production never sees a Network
-/// canary trip.
+/// Lab PR 163: the detector consults the canary destinations on every
+/// connect. Before, nothing did (`is_canary_port` was called by tests
+/// only) and this rule could not fire. The design's listener on the
+/// canary port (§5.3) is not built: no sensor observes an accept, and
+/// a remote peer has no process to kill.
 #[derive(Default)]
 pub struct NnLCanary003NetworkConnect {
     /// External audit NETR-006: spared when they read the canary.

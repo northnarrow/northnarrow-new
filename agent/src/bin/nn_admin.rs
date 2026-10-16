@@ -853,9 +853,11 @@ enum CanaryDeployKindCmd {
         #[arg(long = "fake-arg0")]
         fake_arg0: String,
     },
-    /// Network listener canary. The server binds a tokio
-    /// TcpListener on `--bind-addr:--bind-port`; any accept()
-    /// trips the canary (immediate close per §12 Q6).
+    /// Network canary: a decoy destination. A local process that
+    /// connects to `--bind-addr:--bind-port` trips it (NN-L-CANARY-003);
+    /// `0.0.0.0` / `::` is the port at any address of this host. The
+    /// agent opens no listener, and a connection from another host is
+    /// not seen. Refused when a listener on this host serves the port.
     Network {
         #[arg(long = "bind-addr")]
         bind_addr: String,

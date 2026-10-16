@@ -4,7 +4,8 @@
 //! lives. These tests hold `docs/validation/` to the code:
 //!
 //! - `v2-rules.tsv` lists exactly the rules the agent can record;
-//! - every rule design §13 Q1 names is in the Critical sub-gate;
+//! - every rule design §13 Q1 names is in the Critical sub-gate, and a
+//!   rule taken out of it stays in the denominator with its reason;
 //! - every sub-gate rule has one row in matrix.md's evidence table, no cell
 //!   is empty, and every test, probe or evidence file a cell cites exists;
 //! - the version, row count and sha256 matrix.md records for each frozen
@@ -390,6 +391,36 @@ fn recorded_versions_and_hashes_match_the_frozen_files() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(files, want, "{MATRIX_MD} must record each frozen file once");
+}
+
+/// Rules that can issue a Critical verdict but are out of the sub-gate,
+/// each with what brings it back: the reason `matrix.md` must give.
+/// Lab PR 163 (registry version 2): NN-L-NET-003 cannot fire until BUG-025
+/// gives it a TLS fingerprint producer.
+const OUT_OF_THE_SUB_GATE: &[(&str, &str)] = &[("NN-L-NET-003_BadJa3", "BUG-025")];
+
+/// A rule out of the sub-gate is a decision recorded with its reason, not a
+/// way out of the campaign: it stays in the denominator (a miss of it
+/// counts against the headline), and `matrix.md` says why it is out.
+#[test]
+fn a_rule_out_of_the_sub_gate_stays_in_the_denominator_with_its_reason() {
+    let rows = registry();
+    let matrix = read(MATRIX_MD);
+    for (id, why) in OUT_OF_THE_SUB_GATE {
+        let r = rows
+            .iter()
+            .find(|r| r["rule_id"] == *id)
+            .unwrap_or_else(|| panic!("{id} is not in {RULES_TSV}"));
+        assert_eq!(r["gate"], "-", "{id}: out of the sub-gate");
+        assert_eq!(
+            r["status"], "in",
+            "{id}: out of the sub-gate, not out of the denominator"
+        );
+        assert!(
+            matrix.lines().any(|l| l.contains(id) && l.contains(why)),
+            "{MATRIX_MD} must say why {id} is out of the sub-gate ({why})"
+        );
+    }
 }
 
 #[test]

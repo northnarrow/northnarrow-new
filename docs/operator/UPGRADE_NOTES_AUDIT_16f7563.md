@@ -347,6 +347,15 @@ Now **killed, or answered, where they were recorded or missed**:
 - New rule NN-L-NET-021 names a process that floods `listen()` or
   `io_uring_setup()` (NN-AUD-103 EBPF-009, NN-AUD-105 EBPF-013, lab PR
   129).
+- A network canary trips: a local process connecting to its
+  `--bind-addr` and `--bind-port` (`0.0.0.0` / `::`: the port at any
+  address of this host) is killed with its tree (NN-L-CANARY-003,
+  Critical). No network canary tripped before. The agent opens no
+  listener on the port, and a connection from another host is not seen.
+  `nn-admin canary deploy network` is refused when the address is not an
+  IP address or a listener on this host serves the port; a network canary
+  deployed before with such an address trips nothing (burn it and deploy
+  it again). Lab PR 163, a follow-up found in the lab.
 
 ## 6. Posture and COMBAT
 
