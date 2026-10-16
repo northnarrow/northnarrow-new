@@ -29,7 +29,7 @@ Status: `open`, `fixed (lab PR N)`, `partial (lab PR N; what remains)`,
 | 0 | 25 (6 Critical, 19 High) | 25 fixed | lab PRs 78–85 |
 | 1 | 54 High | 53 fixed, 1 already fixed | three rows (NN-AUD-048, -061, -062) were taken with Wave 0 and appear in both tables; Waves 0 and 1 together cover the 76 Critical and High findings; fixes up to lab PR 109 |
 | 2 | 159 Medium | 152 fixed, 7 already fixed | one finding narrowed first, its residual fixed (NN-AUD-092); one fix leaves an operational residual for the maintainer, the rpm signing key and a signed apt repository (NN-AUD-199); fixes in lab PRs 110–161 |
-| 3 | 188 Low, 21 Informational | not started | a Low finding fixed alongside a Medium one is named in that Medium's note (CMB-026 with NN-AUD-148) |
+| 3 | 188 Low, 21 Informational | in progress: re-checked on 2026-10-16 — 14 already fixed, 30 fixed in part, 5 obsolete, 10 declined; 180 to fix | a Low finding fixed alongside a Medium one is named in that Medium's note (CMB-026 with NN-AUD-148); NN-AUD-299 fixed with lab PR 166 |
 
 The 234 hardening improvements of the report are not tracked in this
 file. Lab PR 134 is not a finding: it is the product decision, taken
@@ -130,6 +130,40 @@ entry names the lab PR that fixed it.
   the kill, ran on under init with the image from `/tmp`, and a child
   that never execs draws no verdict of its own. Fixed: the rules that
   kill a payload's exec kill its tree (lab PR 166).
+- **Journal line injection.** The agent logged file names, comms and other
+  strings a local user chooses through tracing's Display, which does not
+  escape a newline: a file run from `/tmp` whose name holds one adds a line
+  of the user's choosing to the agent's journal (Debian 13, before lab PR
+  167: an entry starting `ANTI-TAMPER DENIAL op=signal`, which the
+  anti-tamper suite counted as evidence). Found by the Wave 3 re-check;
+  taken with NN-AUD-413 (lab PR 167).
+- **DNS attribution on hosts that resolve through systemd-resolved.** On
+  Debian 13 `nsswitch.conf` puts `resolve` before `dns`: `getaddrinfo`
+  asks systemd-resolved over varlink and resolved sends the query, so the
+  query and the connect never share a pid
+  (`net_outbound_connect_records_flow_with_dns_attribution` fails there,
+  on `main` too). Distributions with `nss-resolve` (Debian 13, Fedora)
+  lose the hostname on their flows.
+- **A burst of TCP closes overflows the `tcp_close` ring.** 20,000 sockets
+  closed at one process exit: 16,079 close events dropped by the 256 KiB
+  ring (counted in `nn-admin net status` and the journal) — lab PR 164's
+  `FLOW_SOCK_MAP` no longer forgets them, the ring is the next limit.
+- **Short-lived payloads run from `/tmp` end before their verdict.** A copy
+  of `unshare --version` or `bash -c 'exit 0'` run from `/tmp` exited on its
+  own in 3 of 4 runs on `main` under `KillProcess`, while the same binary
+  run from a home directory was killed 4 of 4: a staging exec reaches the
+  rules later (lab PR 166).
+- **32-bit `chattr`: `file_ioctl_compat` is not hooked.** From 6.8, and in
+  the 5.15.y and 6.1.y stable backports, the ioctls of a 32-bit process go
+  through `file_ioctl_compat`, which the agent does not attach: a 32-bit
+  `chattr` on a protected file would pass the `file_ioctl` deny (from the
+  kernel sources, lab PR 164; to confirm on a lab guest).
+- **NN-L-NET-001 judges a flow at its close.** A process that connects to a
+  blocked address and keeps the socket open is judged when it closes it or
+  exits (the probe of lab PR 168 held its socket: the verdict came at exit,
+  `AlreadyGone`).
+- **`nn-admin` aborts on a closed pipe.** `nn-admin status | grep -m1 …`
+  exits 134: a write to a closed stdout panics instead of ending quietly.
 - **To run on a host with the model.** The real `prompt_tokens` of the v1.1
   system prompt (`ignored_model_host_prompt_tokens`, lab PR 133; the
   window budget rests on estimates), `ade_attacks` before and after the
@@ -395,6 +429,231 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-233 | TST-012 | Privileged tests | M | fixed (lab PR 158) |
 | NN-AUD-234 | TST-018 | Privileged tests | L | fixed (lab PR 155) |
 | NN-AUD-235 | TST-019 | Privileged tests | M | fixed (lab PR 159) |
+
+## Wave 3
+
+The Low and Informational findings, NN-AUD-236 to NN-AUD-444. Each was
+re-checked against `main` at `b9bf4d5` (2026-10-16), in six groups, before
+it was scheduled. 14 had been fixed by earlier changes ("already fixed",
+with the lab PR), 30 in part ("partly fixed": what remains is open), 5
+concern code that no longer exists ("obsolete"), and 10 are declined with
+their reason: the premise does not hold, or the proposed change would make
+the product worse. Where the re-check found more than the audit reported, or
+a fix the audit proposed that would weaken the product, the row says so and
+the lot's note gives the detail. The open findings are fixed in lots by
+group, the ones an unprivileged user or a local attacker could use first.
+
+| ID | Audit ref | Severity | Area | Effort | Status |
+|---|---|---|---|---|---|
+| NN-AUD-236 | ASK-005 | Low | Admin socket | S | partly fixed (reads bounded, lab PR 139); open |
+| NN-AUD-237 | ASK-009 | Low | Admin socket | M | open |
+| NN-AUD-238 | ASK-012 | Low | Admin socket | S | open |
+| NN-AUD-239 | ASK-013 | Low | Admin socket | S | open |
+| NN-AUD-240 | ASK-014 | Low | Admin socket | S | partly fixed (exit now signed, lab PR 138); open |
+| NN-AUD-241 | ASK-015 | Low | Admin socket | S | open |
+| NN-AUD-242 | ASK-016 | Low | Admin socket | S | open |
+| NN-AUD-243 | ASK-017 | Low | Admin socket | S | open (latent) |
+| NN-AUD-244 | AUT-001 | Low | Admin auth | S | open (latent) |
+| NN-AUD-245 | AUT-005 | Low | Admin auth | S | open |
+| NN-AUD-246 | AUT-006 | Low | Admin auth | S | open |
+| NN-AUD-247 | AUT-007 | Low | Admin auth | S (docs) | partly fixed (escalation closed, lab PR 138); open |
+| NN-AUD-248 | AUT-010 | Low | Admin auth | — | already fixed (lab PR 115) |
+| NN-AUD-249 | AUT-011 | Low | Admin auth | (S, optional pin test) | declined (premise false: ciborium 0.2.2 caps recursion at 256 levels; the only caller decodes the shutdown marker, not socket input) |
+| NN-AUD-250 | AUT-013 | Low | Admin auth | S | open |
+| NN-AUD-251 | MAIN-009 | Low | Agent main | S | open |
+| NN-AUD-252 | MAIN-010 | Low | Agent main | S | open |
+| NN-AUD-253 | MAIN-011 | Low | Agent main | — | already fixed (lab PR 115) |
+| NN-AUD-254 | MAIN-012 | Low | Agent main | — | already fixed (lab PR 115) |
+| NN-AUD-255 | MAIN-013 | Low | Agent main | S | open |
+| NN-AUD-256 | MAIN-014 | Low | Agent main | M | open |
+| NN-AUD-257 | MAIN-015 | Low | Agent main | S | open (narrowed; cap declined) |
+| NN-AUD-258 | MAIN-016 | Low | Agent main | S | open |
+| NN-AUD-259 | ATP-006 | Low | Anti-tamper | S | open |
+| NN-AUD-260 | ATP-007 | Low | Anti-tamper | S | open |
+| NN-AUD-261 | ATP-011 | Low | Anti-tamper | — | declined (the slot-table test the audit asks for exists, already at 16f7563) |
+| NN-AUD-262 | ATP-014 | Low | Anti-tamper | S | open |
+| NN-AUD-263 | ATP-015 | Low | Anti-tamper | S | partly fixed; open |
+| NN-AUD-264 | ATP-016 | Low | Anti-tamper | S | open |
+| NN-AUD-265 | ATP-017 | Low | Anti-tamper | S | open |
+| NN-AUD-266 | EBPF-012 | Low | eBPF kernel | — | declined (root reads the same from the agent's state files) |
+| NN-AUD-267 | EBPF-016 | Low | eBPF kernel | M | open |
+| NN-AUD-268 | EBPF-017 | Low | eBPF kernel | S/M | open |
+| NN-AUD-269 | EBPF-018 | Low | eBPF kernel | — | declined (an unreadable tracefs already stops the boot) |
+| NN-AUD-270 | EBPF-019 | Low | eBPF kernel | S | partly fixed; open |
+| NN-AUD-271 | EBPF-020 | Low | eBPF kernel | S | open |
+| NN-AUD-272 | EBPF-021 | Low | eBPF kernel | M | open |
+| NN-AUD-273 | EVD-007 | Low | Evidence logs | M | open |
+| NN-AUD-274 | EVD-008 | Low | Evidence logs | M | partly fixed (audit/canary domains, lab PR 160); open |
+| NN-AUD-275 | EVD-010 | Low | Evidence logs | S | open (slightly worse: raw lines kept too) |
+| NN-AUD-276 | EVD-011 | Low | Evidence logs | S | open (narrowed) |
+| NN-AUD-277 | EVD-014 | Low | Evidence logs | S | open |
+| NN-AUD-278 | EVD-015 | Low | Evidence logs | S (+lab) | open |
+| NN-AUD-279 | EVD-016 | Low | Evidence logs | S (docs) | partly fixed (fail-open fixed, lab PR 148; signing declined); open |
+| NN-AUD-280 | EVD-017 | Low | Evidence logs | S | open (now reachable from a shipped command) |
+| NN-AUD-281 | EVD-019 | Low | Evidence logs | S | open |
+| NN-AUD-282 | EVD-020 | Low | Evidence logs | S | open |
+| NN-AUD-283 | EVD-022 | Low | Evidence logs | S | partly fixed (overwrite closed, lab PR 131); open |
+| NN-AUD-284 | FIMR-010 | Low | FIM rules | M | partly fixed; open |
+| NN-AUD-285 | FIMR-011 | Low | FIM rules | M | open |
+| NN-AUD-286 | FIMR-012 | Low | FIM rules | S | partly fixed; open |
+| NN-AUD-287 | FIMR-013 | Low | FIM rules | S | open |
+| NN-AUD-288 | FIMR-014 | Low | FIM rules | S | open |
+| NN-AUD-289 | FIMR-015 | Low | FIM rules | S | open |
+| NN-AUD-290 | FIMR-016 | Low | FIM rules | S (+L) | open (S part; L part a product decision) |
+| NN-AUD-291 | FIMP-012 | Low | FIM pipeline | S/M | open |
+| NN-AUD-292 | FIMP-013 | Low | FIM pipeline | M | open |
+| NN-AUD-293 | FIMP-014 | Low | FIM pipeline | S | open |
+| NN-AUD-294 | NETR-011 | Low | Net rules | — | already fixed (lab PR 140) |
+| NN-AUD-295 | NETR-012 | Low | Net rules | S | open |
+| NN-AUD-296 | NETR-013 | Low | Net rules | — | already fixed (lab PR 146) |
+| NN-AUD-297 | NETR-014 | Low | Net rules | M | open (product decision) |
+| NN-AUD-298 | NETR-015 | Low | Net rules | S | open (listener half; C2-port half declined) |
+| NN-AUD-299 | PROC-011 | Low | Process rules | S | fixed (lab PR 166) |
+| NN-AUD-300 | PROC-012 | Low | Process rules | S | open |
+| NN-AUD-301 | PROC-013 | Low | Process rules | S | open |
+| NN-AUD-302 | PROC-015 | Low | Process rules | S | partly fixed; open |
+| NN-AUD-303 | POS-006 | Low | Posture | S | open |
+| NN-AUD-304 | POS-007 | Low | Posture | S–M | open (narrow fix) |
+| NN-AUD-305 | POS-008 | Low | Posture | S | open (worse since POS-005) |
+| NN-AUD-306 | POS-010 | Low | Posture | S | partly fixed; open |
+| NN-AUD-307 | POS-011 | Low | Posture | S | open |
+| NN-AUD-308 | POS-012 | Low | Posture | — | declined (the ADE parser already refuses Allow with a severity, rule 5b) |
+| NN-AUD-309 | POS-014 | Low | Posture | — | declined (the transition log has no production reader; not in `nn-admin status`) |
+| NN-AUD-310 | CMB-018 | Low | Combat response | S | partly fixed (lab PR 118); open |
+| NN-AUD-311 | CMB-020 | Low | Combat response | S | open |
+| NN-AUD-312 | CMB-021 | Low | Combat response | — | declined (`cgroup_slice` is not configurable in production) |
+| NN-AUD-313 | CMB-022 | Low | Combat response | S | open (the audit's fix is unsafe) |
+| NN-AUD-314 | CMB-023 | Low | Combat response | — | obsolete (lab PR 103) |
+| NN-AUD-315 | CMB-024 | Low | Combat response | S | partly fixed (CMB-001); open |
+| NN-AUD-316 | CMB-025 | Low | Combat response | S | open |
+| NN-AUD-317 | CMB-026 | Low | Combat response | — | already fixed (lab PR 123) |
+| NN-AUD-318 | CMB-027 | Low | Combat response | S–M | partly fixed (lab PR 118; the audit's fail-closed declined); open |
+| NN-AUD-319 | LLMP-005 | Low | LLM prompts | S | open (no consumer: hygiene; revised fix declined) |
+| NN-AUD-320 | LLMP-007 | Low | LLM prompts | M | open (dormant: templates not wired) |
+| NN-AUD-321 | LLMP-008 | Low | LLM prompts | S | open (dormant) |
+| NN-AUD-322 | LLMP-010 | Low | LLM prompts | S | open (wider: a `"` in the preamble does the same) |
+| NN-AUD-323 | LLMP-012 | Low | LLM prompts | S | open (dead code: delete) |
+| NN-AUD-324 | LLMP-014 | Low | LLM prompts | S | open |
+| NN-AUD-325 | LLMR-009 | Low | LLM runtime | S–M | open (the audit's fix changes candle's threading) |
+| NN-AUD-326 | LLMR-011 | Low | LLM runtime | S | partly fixed (corpus pinned, lab PR 145; titles and query left); open |
+| NN-AUD-327 | LLMR-015 | Low | LLM runtime | M | open (wider: upgraded hosts never get new defaults) |
+| NN-AUD-328 | LLMR-018 | Low | LLM runtime | S | open (narrowed: mock only behind a signed weakening) |
+| NN-AUD-329 | LLMR-019 | Low | LLM runtime | M (at XAI wiring) | partly fixed (one prompt path, lab PRs 133/144/145; digest not recorded); open |
+| NN-AUD-330 | NET-007 | Low | Network | S | open (latent) |
+| NN-AUD-331 | NET-008 | Low | Network | S | open (latent) |
+| NN-AUD-332 | NET-013 | Low | Network | S | open (latent) |
+| NN-AUD-333 | NET-014 | Low | Network | S | open (latent) |
+| NN-AUD-334 | NET-015 | Low | Network | S | open (latent, dead code) |
+| NN-AUD-335 | NET-017 | Low | Network | M | open |
+| NN-AUD-336 | NET-018 | Low | Network | M | open (latent) |
+| NN-AUD-337 | DEC-012 | Low | Deception | S | partly fixed (echo gone, lab PR 90; no cap; a non-UTF-8 line still disarms deception); open |
+| NN-AUD-338 | DEC-013 | Low | Deception | — | already fixed (lab PR 143, with DEC-011) |
+| NN-AUD-339 | DEC-014 | Low | Deception | S (test) | already fixed (lab PR 99, with DEC-005; test gap) |
+| NN-AUD-340 | DEC-015 | Low | Deception | S | open |
+| NN-AUD-341 | DEC-016 | Low | Deception | S | open (live: templates are write-allowed by design) |
+| NN-AUD-342 | DEC-017 | Low | Deception | S | open |
+| NN-AUD-343 | XAI-003 | Low | XAI and RAG | S (one line) | obsolete (the on-disk index is gone, lab PR 145) |
+| NN-AUD-344 | XAI-006 | Low | XAI and RAG | S | open (dormant: XAI not wired) |
+| NN-AUD-345 | XAI-007 | Low | XAI and RAG | S (guard) | declined as filed (argv/parent_comm are not in the prompt); guard test |
+| NN-AUD-346 | XAI-008 | Low | XAI and RAG | S–M | open (dormant: RAG off) |
+| NN-AUD-347 | XAI-012 | Low | XAI and RAG | S | open (dormant) |
+| NN-AUD-348 | XAI-014 | Low | XAI and RAG | S | partly fixed (confidence domain fixed, lab PR 132; encoding left); open |
+| NN-AUD-349 | XAI-015 | Low | XAI and RAG | — | obsolete (on-disk `build_index` removed, lab PR 145) |
+| NN-AUD-350 | XAI-016 | Low | XAI and RAG | S | open (dormant) |
+| NN-AUD-351 | XAI-017 | Low | XAI and RAG | S | open (latent: capacity is a constant today) |
+| NN-AUD-352 | SNS-004 | Low | Sensors | S | open |
+| NN-AUD-353 | SNS-010 | Low | Sensors | S | open |
+| NN-AUD-354 | SNS-011 | Low | Sensors | S | open |
+| NN-AUD-355 | SNS-012 | Low | Sensors | — | declined (a boot without BTF already fails closed, review 53) |
+| NN-AUD-356 | SNS-013 | Low | Sensors | — | already fixed (lab PR 115) |
+| NN-AUD-357 | SNS-014 | Low | Sensors | M | open |
+| NN-AUD-358 | WDG-007 | Low | Watchdog tooling | M | open |
+| NN-AUD-359 | WDG-008 | Low | Watchdog tooling | S | partly fixed (lab PR 149); open |
+| NN-AUD-360 | WDG-010 | Low | Watchdog tooling | S | open |
+| NN-AUD-361 | WDG-012 | Low | Watchdog tooling | S | partly fixed (lab PR 105); open |
+| NN-AUD-362 | WDG-013 | Low | Watchdog tooling | — | already fixed (lab PR 160) |
+| NN-AUD-363 | WDG-014 | Low | Watchdog tooling | S | open |
+| NN-AUD-364 | WDG-015 | Low | Watchdog tooling | S | open (agent pidfile too) |
+| NN-AUD-365 | WDG-016 | Low | Watchdog tooling | S | open |
+| NN-AUD-366 | WDG-017 | Low | Watchdog tooling | S | open |
+| NN-AUD-367 | WDG-018 | Low | Watchdog tooling | S | open |
+| NN-AUD-368 | WDG-R02 | Low | Watchdog tooling | S | open |
+| NN-AUD-369 | WDG-R03 | Low | Watchdog tooling | S | open |
+| NN-AUD-370 | WDG-R04 | Low | Watchdog tooling | S | open |
+| NN-AUD-371 | WDG-R05 | Low | Watchdog tooling | S | open |
+| NN-AUD-372 | WDG-R06 | Low | Watchdog tooling | S | open |
+| NN-AUD-373 | WDG-R07 | Low | Watchdog tooling | S | open |
+| NN-AUD-374 | WDG-R08 | Low | Watchdog tooling | S | open |
+| NN-AUD-375 | WDG-R09 | Low | Watchdog tooling | S | open |
+| NN-AUD-376 | WDG-R10 | Low | Watchdog tooling | S | open |
+| NN-AUD-377 | WDG-R11 | Low | Watchdog tooling | S | open |
+| NN-AUD-378 | WDG-R12 | Low | Watchdog tooling | S | open |
+| NN-AUD-379 | WDG-R13 | Low | Watchdog tooling | S | open |
+| NN-AUD-380 | WDG-R14 | Low | Watchdog tooling | S | open |
+| NN-AUD-381 | DEP-005 | Low | Deploy | M | open |
+| NN-AUD-382 | DEP-010 | Low | Deploy | S | open |
+| NN-AUD-383 | DEP-011 | Low | Deploy | — | declined (prerm already requires the signed trusted-installer window; the proposed default archive would leave `agent.sig.key` on disk after a purge) |
+| NN-AUD-384 | DEP-012 | Low | Deploy | S | partly fixed (lab PR 96); open |
+| NN-AUD-385 | DEP-013 | Low | Deploy | S (docs) | open |
+| NN-AUD-386 | DEP-014 | Low | Deploy | S | open |
+| NN-AUD-387 | DEP-015 | Low | Deploy | — | already fixed (lab PR 93) |
+| NN-AUD-388 | DEP-016 | Low | Deploy | S | open |
+| NN-AUD-389 | DEP-017 | Low | Deploy | S | open |
+| NN-AUD-390 | DEP-018 | Low | Deploy | S | open |
+| NN-AUD-391 | DEP-019 | Low | Deploy | — | already fixed (lab PR 152) |
+| NN-AUD-392 | SUP-004 | Low | Supply chain | S | open |
+| NN-AUD-393 | SUP-007 | Low | Supply chain | S | open |
+| NN-AUD-394 | SUP-008 | Low | Supply chain | S | open (not reachable; accept with a recorded exception) |
+| NN-AUD-395 | SUP-009 | Low | Supply chain | S | open (not reachable; accept with a recorded exception) |
+| NN-AUD-396 | SUP-010 | Low | Supply chain | S | open (root lockfile only) |
+| NN-AUD-397 | SUP-012 | Low | Supply chain | S | open |
+| NN-AUD-398 | SUP-013 | Low | Supply chain | S | open |
+| NN-AUD-399 | SUP-014 | Low | Supply chain | M | open |
+| NN-AUD-400 | SUP-015 | Low | Supply chain | S | open (worse: the declared MSRV is already false) |
+| NN-AUD-401 | SUP-016 | Low | Supply chain | S | open |
+| NN-AUD-402 | SUP-018 | Low | Supply chain | M | open (10 targets now, none seeded) |
+| NN-AUD-403 | SUP-019 | Low | Supply chain | S (docs) | open (narrowed: the model is not redistributed) |
+| NN-AUD-404 | SUP-020 | Low | Supply chain | S-M (docs) | open |
+| NN-AUD-405 | SUP-021 | Low | Supply chain | S | open |
+| NN-AUD-406 | SUP-022 | Low | Supply chain | S | open |
+| NN-AUD-407 | SUP-023 | Low | Supply chain | S | open |
+| NN-AUD-408 | SUP-024 | Low | Supply chain | M | partly fixed (lab PR 150; two-person review declined for now); open |
+| NN-AUD-409 | LAB-019 | Low | Lab scripts | S | open |
+| NN-AUD-410 | LAB-020 | Low | Lab scripts | S | partly fixed (lab PRs 153, 156); open |
+| NN-AUD-411 | LAB-021 | Low | Lab scripts | — | obsolete (verify-2b.sh deleted, lab PR 153) |
+| NN-AUD-412 | LAB-022 | Low | Lab scripts | S | open |
+| NN-AUD-413 | LAB-023 | Low | Lab scripts | M | open (more reachable than reported) |
+| NN-AUD-414 | LAB-024 | Low | Lab scripts | S | partly fixed (C17 fixed in `4672283`); open |
+| NN-AUD-415 | LAB-025 | Low | Lab scripts | S | open |
+| NN-AUD-416 | LAB-026 | Low | Lab scripts | S | partly fixed (lab PR 154 guards some setup); open |
+| NN-AUD-417 | LAB-027 | Low | Lab scripts | S | open |
+| NN-AUD-418 | TST-007 | Low | Privileged tests | — | already fixed (lab PR 138, with NN-AUD-079) |
+| NN-AUD-419 | TST-013 | Low | Privileged tests | S | open (five readers now) |
+| NN-AUD-420 | TST-014 | Low | Privileged tests | S | partly fixed (lab PR 158); open |
+| NN-AUD-421 | TST-015 | Low | Privileged tests | S | partly fixed (lab PRs 138, 153); open |
+| NN-AUD-422 | TST-016 | Low | Privileged tests | S | open |
+| NN-AUD-423 | TST-017 | Low | Privileged tests | M | open (degraded path now an ERROR and signed, AUT-004; not asserted) |
+| NN-AUD-424 | ASK-018 | Info | Admin socket | S | open |
+| NN-AUD-425 | AUT-012 | Info | Admin auth | — | obsolete (lab PR 138) |
+| NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | partly fixed; open |
+| NN-AUD-427 | EVD-023 | Info | Evidence logs | S | open |
+| NN-AUD-428 | NETR-016 | Info | Net rules | S | open (docs + an adjacent defect) |
+| NN-AUD-429 | PROC-014 | Info | Process rules | S | open |
+| NN-AUD-430 | POS-013 | Info | Posture | S | open |
+| NN-AUD-431 | CMB-028 | Info | Combat response | S | open |
+| NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | open (Info; narrowed to the test: argv is 512 B at the kernel) |
+| NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | open (Info; `is_ready` has no caller) |
+| NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
+| NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | open (Info) |
+| NN-AUD-436 | SNS-015 | Info | Sensors | S | open |
+| NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | open (doc only) |
+| NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | open |
+| NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | open |
+| NN-AUD-440 | DEP-020 | Info | Deploy | S | open |
+| NN-AUD-441 | DEP-021 | Info | Deploy | S (docs) | open |
+| NN-AUD-442 | DEP-022 | Info | Deploy | — | already fixed (lab PR 150) |
+| NN-AUD-443 | SUP-011 | Info | Supply chain | S | open (no fix exists; accept with a recorded exception) |
+| NN-AUD-444 | LAB-028 | Info | Lab scripts | S gate / L campaign | open (methodology frozen in lab PR 159; no run yet) |
 
 ## Notes on the fixes
 
