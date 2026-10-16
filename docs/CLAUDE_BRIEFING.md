@@ -5,6 +5,26 @@
 > Documento per paste integrale a inizio chat post-Edinburgo (lunedì 19 maggio).
 > Struttura ereditata dal transfer del 12-13 maggio, aggiornata con stato di chiusura giornata.
 
+> **Status note (2026-10-16).** This briefing is a snapshot of 13 May 2026.
+> The current state is in `ROADMAP.md`, `CHANGELOG.md` and the external
+> audit tracker `docs/audit/EXTERNAL_AUDIT_16f7563.md` (Waves 0–2 closed,
+> Wave 3 not started, follow-ups found in the lab). Superseded since:
+> - the ADE is a consultant (lab PR 134): a model verdict that names a
+>   response is recorded as a recommendation and not executed; responses
+>   come from the deterministic rules and the COMBAT ladder.
+>   `NN_ADE_ENFORCE=1` lets the verdicts act again and is recorded as a
+>   weakening in the signed audit log;
+> - COMBAT isolates the network only when it is locked (a kernel-adjudicated
+>   denial, root changing a system file outside an administrator's
+>   session, or an administrator's order); a COMBAT reached on heuristics
+>   alone contains threats at the process level and decays (NN-AUD-002);
+> - Tappa 7 (watchdog included), Tappa 8 and Tappa 6.9 (XAI, standalone)
+>   are closed;
+> - Bug #4 below: the two-argument `inode_setattr` is the hook's mainline
+>   shape up to 6.8, not an Ubuntu backport; from 6.9 the hook takes `mnt_idmap`
+>   first, which the agent does not handle yet (follow-up in the tracker,
+>   `docs/operator/KERNEL_COMPATIBILITY.md`).
+
 ---
 
 ## 0. CONTEXT PERSONALE FORTY (Founder)
@@ -283,6 +303,11 @@ Helper #177 wrapper produces no trace output (suspected fmt-buffer .rodata reloc
 ### Bug #4: Linux 6.8 `inode_setattr` 2-arg signature
 Ubuntu 6.8 ha backport `(dentry, iattr)` vlen=2, mainline ≥6.3 ha `(mnt_idmap, dentry, iattr)` vlen=3.
 **Fix applicato (commit `4a5492c`):** arg(3)→arg(2), arg(1)→arg(0).
+**Correction (2026-10-16):** in mainline the LSM hook `inode_setattr` has
+`(dentry, iattr)` up to 6.8 (the earlier `mnt_idmap` argument is on
+`security_inode_setattr`, the caller, not on the hook); the hook itself takes
+`(mnt_idmap, dentry, iattr)` from 6.9, so on 6.9+ the agent's `arg(0)` reads the idmap. Open follow-up: `docs/operator/KERNEL_COMPATIBILITY.md`,
+"Kernels from 6.9".
 
 ### Bug #5: dev_t encoding mismatch userland vs kernel ✅ RESOLVED 13 maggio
 Userland `meta.dev()` ritorna `new_encode_dev(MKDEV)` (legacy compact form, 0x802 = 2050 per sda2).

@@ -22,6 +22,100 @@ least two supported kernels (6.8 and 5.14/5.15).
 Status: `open`, `fixed (lab PR N)`, `partial (lab PR N; what remains)`,
 `already fixed (PR)`, or `declined (reason)`.
 
+## Summary (2026-10-16)
+
+| Wave | Findings | Closed | Notes |
+|---|---|---|---|
+| 0 | 25 (6 Critical, 19 High) | 25 fixed | lab PRs 78–85 |
+| 1 | 54 High | 53 fixed, 1 already fixed | three rows (NN-AUD-048, -061, -062) were taken with Wave 0 and appear in both tables; Waves 0 and 1 together cover the 76 Critical and High findings; fixes up to lab PR 109 |
+| 2 | 159 Medium | 152 fixed, 7 already fixed | one finding narrowed first, its residual fixed (NN-AUD-092); one fix leaves an operational residual for the maintainer, the rpm signing key and a signed apt repository (NN-AUD-199); fixes in lab PRs 110–161 |
+| 3 | 188 Low, 21 Informational | not started | a Low finding fixed alongside a Medium one is named in that Medium's note (CMB-026 with NN-AUD-148) |
+
+The 234 hardening improvements of the report are not tracked in this
+file. Lab PR 134 is not a finding: it is the product decision, taken
+during Wave 2, that the ADE is a consultant (note below). What the fixes
+change for an operator, and the regressions they declare, are grouped in
+[`docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md`](../operator/UPGRADE_NOTES_AUDIT_16f7563.md);
+the fixes have their entries in `CHANGELOG.md` `[Unreleased]`.
+
+## Method
+
+- **Re-check, then test, then fix.** Each finding is checked against the
+  current code first; a failing regression test comes before the fix, and
+  each note lists the tests and says which of them fail with the fix taken
+  out. Where the check found adjacent defects the audit did not report,
+  the note says so and the fix takes them.
+- **Before and after in the lab, per lot.** A lot's note ends with its
+  `Lab:` line: in most lots a probe script run on a lab guest against the
+  build of `main` and against the build of the change, with what each
+  showed. A lot that is pure code with unit coverage says so instead.
+- **Gates.** The lots of Waves 0 and 1, and those of Wave 2 up to lab PR
+  141, were each gated on their own: the privileged suites on two lab
+  kernels (in Wave 2 mostly Ubuntu 24.04 / 6.8 and Debian 12 / 6.1) and
+  the host tests, with the anti-tamper suite (`nn-lab.sh tamper-check`)
+  in most of them. The later lots were gated together, on integration
+  trees: lab PRs 142–147 and 151; then 148–150, 153–156 and 159 on top of
+  them; then 138, 152, 158, 160 and 161 on top of those. The last tree ran
+  on Ubuntu 24.04, Ubuntu 22.04 (5.15) and Debian 12: 35 suites, 79
+  passed, 0 failed on each in the final run, the anti-tamper suite OK on
+  24.04 and 22.04, host 2,123 passed, 0 failed. Lab PR 157, the last
+  lot, was gated on its own on Ubuntu 24.04 and Debian 12. Each note's
+  `Gate:` line names the tree it ran on.
+- **Not measured in the lab.** No lab guest has the model: what needs it
+  is listed below and in the notes of lab PRs 132, 133, 144 and 151.
+
+## Follow-ups found in the lab (not audit findings)
+
+Defects and gaps found while fixing and verifying the findings. They are
+not in the report and are not counted above; each is open.
+
+- **`inode_setattr` on kernel 6.9 and later.** From 6.9 the LSM hook
+  receives `struct mnt_idmap *` as its first argument (`idmap, dentry,
+  attr`; checked in the BTF of the WSL2 6.18 host). The setattr deny
+  (`agent-ebpf/src/inode_protect.rs::try_inode_setattr`) and the FIM
+  setattr observer (`fim_watch.rs::fim_setattr_observe`) read argument 0
+  as the dentry, so on 6.9+ they read the wrong argument: truncate, chmod
+  and chown of a protected or watched file cannot be relied on there. The
+  lab kernels go up to 6.8, and `--btf-check` does not check hook
+  prototypes (`docs/operator/KERNEL_COMPATIBILITY.md`).
+- **Two Critical rules cannot fire.** NN-L-CANARY-003 has no trip source
+  (`CanaryIndexes::is_canary_port` has no caller outside tests), and
+  NN-L-NET-003 is inactive because no sensor produces TLS fingerprints
+  (BUG-025; a JA3 list with entries is a signed `subsystem_degraded` since
+  lab PR 142). The 100 % Critical sub-gate of the V2 campaign
+  (`docs/validation/matrix.md`, lab PR 159) cannot pass until both are
+  wired or retired.
+- **FIM-024 does not raise the posture.** No posture trigger reads FIM
+  events, so a honeypot tamper (NN-L-FIM-024, Critical, KillProcessTree)
+  leaves the posture where it was, although the rule's reasoning and the
+  FIM module documentation say "posture → COMBAT" (lab PR 155). A product
+  question for the FIM group.
+- **`FLOW_SOCK_MAP` forgets long sessions.** The kernel map that pairs a
+  connect with its close is an LRU of 4,096 sockets: beyond 4,096 pending
+  connects it drops the least recently used one (a long session first),
+  and that socket's close is never recorded, whatever the userland tracker
+  does (lab PR 142).
+- **One ADE slot per exec, taken by the wrong event.** Evaluations run one
+  at a time (NN-AUD-004). For each exec the `ExecCheck`, which carries the
+  parent's comm, takes the slot, and the child's `ProcessSpawn`
+  microseconds later is counted and dropped, so the model judges the exec
+  under its parent's name (lab PR 144).
+- **No `nft` on Debian 12.** The lab's Debian 12 cloud image ships without
+  `nft`, so `block_outbound` and the COMBAT soft egress block (both
+  nftables) do not work there: the failure is recorded, INVESTIGATE is
+  shortened to 10 s and `nn-admin host-check` reports the host (lab PR
+  119).
+- **A root dropper with a paused parent.** A root dropper launched from
+  `/tmp` whose parent sat in `pause()` drew no R001 verdict in the lab.
+  To be verified: the cause is not known yet.
+- **To run on a host with the model.** The real `prompt_tokens` of the v1.1
+  system prompt (`ignored_model_host_prompt_tokens`, lab PR 133; the
+  window budget rests on estimates), `ade_attacks` before and after the
+  prompt, sanitizer and context changes (lab PRs 132, 133, 144; the
+  off-repo LoRA was trained on the old prompt format), and the golden of
+  the production tokenizer (`ignored_real_tokenizer_matches_its_golden`,
+  lab PR 151).
+
 ## Wave 0
 
 | ID | Audit ref | Severity | Area | File | Status |

@@ -37,7 +37,7 @@ cites file + stable symbol; "Verification" cites the test that locks it.
 | **13(2)** operating instructions | concise/complete/correct instructions for use | *Out of scope of 6.9.* The chain is the **evidence** artifact; the operator runbook (separate) references this dossier. | n/a — documented scope boundary |
 | **13(3)(a)** provider identity | identity of the provider | `XaiModelRef` (model_id/quantization/backend, from `AdeMetadata`) + `environment_hash` (agent binary ‖ model ‖ combat-rules ‖ host ‖ build-SHA ‖ RAG corpus fingerprint, empty with RAG off — §8) | `agent/src/xai/engine.rs` — `environment_hash_is_deterministic_and_tamper_sensitive` |
 | **13(3)(b)(i)** intended purpose | the system's intended purpose | `method.kind = "perturbation/occlusion"` + `ADE_DOCTRINE.md` / plan cross-ref | `common/src/xai_types.rs` — `enum_canonical_tags_are_locked` |
-| **13(3)(b)(iv)** performance & accuracy | level of accuracy / known limitations | `saliency_coverage` + `status` (`Complete` / `Degraded(reason)` honesty pair, never silent); `method.inference_settings` (R1 deterministic decoding recorded verbatim) | `agent/src/xai/saliency.rs` — `coverage_and_degraded_reason_are_exact_and_deterministic` |
+| **13(3)(b)(iv)** performance & accuracy | level of accuracy / known limitations | `saliency_coverage` + `status` (`Complete` / `Degraded(reason)` honesty pair, never silent); `method.inference_settings` (R1 deterministic decoding recorded verbatim); the known limits of the production ADE's input and evaluation: §6, §10 | `agent/src/xai/saliency.rs` — `coverage_and_degraded_reason_are_exact_and_deterministic` |
 | **13(3)(c)** identifiable output | the output is identifiable | `xai_trace_id` (UUIDv4) + `ade_trace_id` FK → `AdeVerdict.trace_id` | `agent/src/xai/engine.rs` — `explain_assembles_signs_and_verifies_a_full_chain` (asserts FK) |
 | **13(3)(d)** human oversight prerequisite | enable effective human oversight | Mandatory guardrail: any `Err(XaiUnavailable)` ⇒ synthesis disabled — an unexplained rule can never deploy (fail-closed). The ADE is advisory: a verdict that names a response is recorded as a recommendation for the operator and not executed (§9) | `agent/src/xai/saliency.rs` — `guardrail_contract_refuses_on_any_err_but_not_on_degraded`, `preflight_refuses_before_any_inference`, `mid_run_timeout_is_fail_closed`; `agent/src/ade/advisory.rs` — `disposition` tests |
 
@@ -136,6 +136,25 @@ fields (hostname, host_id, paths). Posture:
   "but-for" counterfactual and the strongest available black-box
   attribution given a quantized GGUF exposes no attention/gradients; the
   method, weights, and settings are recorded in-chain for scrutiny.
+- **XAI is not wired to production verdicts.** Its consumer (Tappa 10.5)
+  is not built; no chain has been produced in production. What the
+  production ADE does with a verdict is §9; what it shows the model is
+  §10.
+- **One evaluation slot, taken by the parent's view of an exec.** The ADE
+  evaluates one event at a time (external audit LLMR-002, lab PR 82); an
+  exec that arrives while one runs is judged by the rules only and
+  counted. For each exec the `ExecCheck`, which carries the parent's comm,
+  takes the slot, and the child's `ProcessSpawn` microseconds later is
+  counted and dropped, so the model judges the exec under its parent's
+  name. Found in the lab (lab PR 144); a follow-up in
+  `docs/audit/EXTERNAL_AUDIT_16f7563.md`, to be improved.
+- **Model behaviour not re-measured after the audit's prompt changes.**
+  The window budget of §10 rests on token estimates; the real count of the
+  v1.1 prompt (`ignored_model_host_prompt_tokens`), `ade_attacks` before
+  and after (the off-repo LoRA was trained on the old prompt format) and
+  the golden of the production tokenizer
+  (`ignored_real_tokenizer_matches_its_golden`) are owed on a host that
+  has the model.
 
 ---
 
@@ -254,7 +273,51 @@ who decides whether to act on it (13(3)(d)). A deployer who sets
 `NN_ADE_ENFORCE` takes that decision away from the operator, and the
 signed audit log shows that it did.
 
-## 10. Change log
+## 10. What the model is shown (external audit, lab PRs 132, 133, 144)
+
+The input an operator reads in a recommendation, and that an XAI chain
+would explain, is bounded and built the same way for both: one engine
+helper (`prepare`) serves `evaluate` and `assembled_prompt`, so the signed
+`prompt_sha256` binds what the model saw (LLMR-008).
+
+- **Window.** The prompt must fit 4,096 − 768 = 3,328 tokens (768 left to
+  the verdict: candle's quantized Llama precomputes 4,096 positions,
+  prompt and output together). To fit, the engine drops the oldest
+  correlated events, then the RAG block, and never the system prompt; an
+  event whose system prompt, focal event and task alone do not fit is a
+  synthetic Escalate ("prompt exceeds the model window") and nothing
+  reaches the model (`PromptExceedsWindow` for XAI, §4). The prefill runs
+  in 256-token chunks and stops at the time budget; a timeout or a
+  backend error is recorded as an Escalate of kind `ade_unavailable`
+  (LLMR-008, LLMR-017, LLMR-003; lab PR 133).
+- **System prompt v1.1.** Observed strings — event fields, correlated
+  events, RAG titles — are evidence, never instructions; a string that
+  tries to steer the verdict is an indicator and never lowers severity;
+  decide on behaviour. Three few-shot examples in the production format
+  instead of five (LLMP-013, lab PR 133). The prompt is built into the
+  agent (lab PR 105).
+- **Correlated context.** At most 20 events and 4 KiB: up to half go to
+  events sharing the process, its parent or the file with the focal event,
+  within 5 minutes, then nearby events; the window fit drops nearby events
+  before keyed ones. The focal event is not repeated as untrusted
+  correlated data. An event left out for its injection score takes no
+  slot (XAI-004, XAI-013; lab PR 144).
+- **Sanitization.** Correlated events are sanitized and printed as JSON
+  strings inside an untrusted block (LLMP-002, lab PR 81). Each string is
+  scored once on its deduplicated flags; one strong signal forces an
+  Escalate, a high injection score overrides any verdict but Escalate, a
+  severe indicator with an Allow is escalated, decoded ROT13 text is never
+  echoed, and a confidence or novelty outside [0, 1] is a parse error
+  (LLMP-003, LLMP-004, LLMP-006, LLMP-011, LLMR-010; lab PR 132). An
+  event the model never sees (injection short-circuit, prompt over the
+  window) is refused by XAI before any probe (§4).
+- **RAG.** Only from the pinned corpus, indexed in memory at start (§8).
+
+For Article 13 this is the content of 13(3)(b)(iv): the known limits of
+what the model can weigh (20 correlated events, the window, the fields
+the agent sends), stated here rather than discovered in a chain.
+
+## 11. Change log
 
 - **2026-05-17 — initial (Tappa 6.9 P0→P5).** §1–§7 above.
 - **2026-05-17 (Tappa 6.9.7 P7).** RAG-local-KB integration
@@ -274,3 +337,9 @@ signed audit log shows that it did.
   chain had been produced in production (XAI is not wired yet, Tappa
   10.5). New §9: the ADE is advisory (lab PR 134); §2 row 13(3)(d)
   updated. The former §9 is now §10.
+- **2026-10-16 (after Wave 2 of the external audit).** New §10, what the
+  model is shown (window, system prompt v1.1, correlated context,
+  sanitization; lab PRs 132, 133, 144). §6 gains three limitations: XAI
+  not wired to production verdicts, the single evaluation slot taken by
+  the exec's `ExecCheck` (lab PR 144), and the model's behaviour not
+  re-measured. The change log is now §11.

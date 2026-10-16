@@ -24,8 +24,20 @@ verifiable: either every read resolves, or the agent does not run.
 
 Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
 `/sys/kernel/btf/vmlinux` file), `bpf` in `/sys/kernel/security/lsm`,
-bpffs mounted at `/sys/fs/bpf`, `iptables-restore` (nft backend is fine),
-x86_64. See `docs/TAPPA7_PREREQ.md` for the grub step.
+bpffs mounted at `/sys/fs/bpf` (the unit checks it with
+`/usr/bin/mountpoint`, util-linux), `iptables-restore` (nft backend is
+fine), x86_64. See `docs/TAPPA7_PREREQ.md` for the grub step.
+
+`nft` (the nftables CLI) is needed too, for the per-process egress block:
+the `BlockOutbound` response and the COMBAT soft egress block of
+INVESTIGATE are nftables rules. The lab's Debian 12 cloud image ships
+without it: there the block fails, the failure is recorded, INVESTIGATE is
+shortened to 10 s, and `nn-admin host-check` reports the host (external
+audit CMB-014, lab PR 119). Install the `nftables` package on such hosts.
+
+**Not verified: kernels from 6.9.** Every lab guest runs 6.8 or older.
+See "Kernels from 6.9: `inode_setattr`" below before deploying on a newer
+kernel.
 
 ## Computed matrix (`northnarrow-agent --btf-check <btf>`)
 
@@ -45,7 +57,7 @@ native BTF, so the lab guests (table above) cover 5.15, 6.1 and 6.8.
 
 | Source | Kernel | BPF LSM | Verdict | Notes |
 |---|---|---|---|---|
-| WSL2 (host) | 6.18 | — | SUPPORTED | 16 of 44 slots differ from the build kernel — handled at runtime |
+| WSL2 (host) | 6.18 | — | SUPPORTED | 16 of 44 slots differ from the build kernel — handled at runtime; the verdict does not cover LSM hook prototypes (see "Kernels from 6.9" below) |
 | lab guest | 6.8 (Ubuntu 24.04) | yes | SUPPORTED | 0 drift (build kernel) |
 | lab guest | 6.1 (Debian 12) | yes | SUPPORTED | 20 drift, `ubuf`/`count`, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC` |
 | lab guest | 5.15 (Ubuntu 22.04) | yes | SUPPORTED (degraded) | 20 drift, 2 absent; no `iov_iter.ubuf` and no `ITER_UBUF` enumerator (both optional) → QNAME via `ITER_IOVEC` only |
@@ -62,6 +74,28 @@ floor is therefore **BPF LSM (5.7+) plus a distro kernel built with
 `CONFIG_BPF_LSM`**, not the struct layout. `tcp_sock.bytes_sent` (4.18 /
 4.14) could become optional too, but no 4.x kernel can run the
 anti-tamper hooks, so it is not worth a variant.
+
+## Kernels from 6.9: `inode_setattr` (open follow-up)
+
+From kernel 6.9 the `inode_setattr` LSM hook receives `struct mnt_idmap *`
+as its first argument: `(idmap, dentry, attr)`, where 6.8 and older pass
+`(dentry, attr)`. (Checked in the BTF of the WSL2 6.18 host:
+`bpf_lsm_inode_setattr(idmap, dentry, attr)`; the 6.8 guest has two
+arguments.) The two programs on that hook — the anti-tamper setattr deny
+(`agent-ebpf/src/inode_protect.rs::try_inode_setattr`) and the FIM setattr
+observer (`agent-ebpf/src/fim_watch.rs::fim_setattr_observe`) — read
+argument 0 as the dentry. On 6.9 and later they read the wrong argument,
+so the refusal of `truncate`, `chmod` and `chown` on a protected file, and
+FIM's view of those changes on a watched file, cannot be relied on there.
+`--btf-check` resolves struct offsets, not hook prototypes, so its
+SUPPORTED verdict does not cover this. Fix pending (choose the argument
+from the running kernel's prototype, and a lab guest on 6.9 or later);
+tracked with the follow-ups of `docs/audit/EXTERNAL_AUDIT_16f7563.md`.
+In the same 6.18 BTF the other inode, file, task and BPF hooks the agent
+attaches still have their arguments where the programs read them (the
+xattr hooks have taken a `user_namespace`, later `mnt_idmap`, first since
+5.12, the ACL hooks since they appeared, and their programs read the
+dentry as argument 1).
 
 ## Debian-family kernels and `perf_event_paranoid`
 

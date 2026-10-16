@@ -26,6 +26,12 @@ only with `--source-tree` (section 5.1), e.g.
 The `.deb` / `.rpm` packages wrap the same steps for the package manager:
 see section 6.
 
+Upgrading across the remediation of the external audit of `16f7563`
+(anything newer than `v0.0.1-tappa9.0`)? Read
+[`UPGRADE_NOTES_AUDIT_16f7563.md`](UPGRADE_NOTES_AUDIT_16f7563.md) first:
+the changes of behaviour and the regressions it brings, grouped by what an
+operator touches, each with its finding and lab PR.
+
 ## 1. Fresh install
 
 `install.sh` copies binaries, units, the journald namespace config, the
@@ -48,6 +54,10 @@ with `Operation not permitted` halfway through.
 ```sh
 sudo ./deploy/install.sh --upgrade --grant-key /path/to/admin.key
 ```
+
+From `v0.0.1-tappa9.0` or an earlier `main`, see
+[`UPGRADE_NOTES_AUDIT_16f7563.md`](UPGRADE_NOTES_AUDIT_16f7563.md) for what
+changes (its "Before you upgrade" list first).
 
 The key must carry the `trusted-installer` role (the one `install.sh`
 bootstraps does; see `COMBAT_RECOVERY.md` §1.1 for older keys). Without
@@ -471,7 +481,9 @@ pins it recreates by its predecessor's hooks.
   first time — see `docs/TAPPA7_PREREQ.md`.
 - A kernel upgrade: the agent revalidates BTF offsets at boot and refuses
   to start on a mismatch rather than run with wrong offsets; the
-  supported-kernel matrix is the next item on the reliability list.
+  supported-kernel matrix is the next item on the reliability list. A
+  kernel from 6.9 on is not verified: the `inode_setattr` hook gained an
+  argument there (`KERNEL_COMPATIBILITY.md`, "Kernels from 6.9").
 
 ## 5. Release artefacts and how to verify them
 
@@ -699,9 +711,13 @@ package brings its own scripts.
 **`.rpm` (RHEL, AlmaLinux).** The release `.rpm` carries an RPM signature
 made in the release workflow, on a `v*` tag only, with the key whose
 public half is committed at `deploy/release/RPM-GPG-KEY-northnarrow.asc`
-(also attached to each release). Import that key once, from the
-repository at the release tag, and compare its fingerprint with the one
-the project publishes; then let rpm or dnf check every package:
+(also attached to each release). The key itself is a maintainer action
+still to do (NN-AUD-199): the rpm is signed on tag builds, and the public
+key and its fingerprint are published with the first signed release;
+until then the file is not in the repository and a tag release stops at
+the signing job. Import that key once, from the repository at the release
+tag, and compare its fingerprint with the one the project publishes; then
+let rpm or dnf check every package:
 
 ```sh
 curl -fsSLo RPM-GPG-KEY-northnarrow.asc \

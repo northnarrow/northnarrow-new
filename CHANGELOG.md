@@ -14,6 +14,32 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   deterministic rules and the COMBAT ladder. `NN_ADE_ENFORCE=1` lets the
   verdicts act again and is reported as a weakening in the signed chain.
 
+### Documentation
+- The documentation follows the remediation of the external audit of
+  `16f7563` (Waves 0–2) and the advisory ADE. README: the model's role
+  (it recommends, the rules and the COMBAT ladder respond), what is
+  verified today (76 rules, 16 deny hooks, the anti-tamper suite, the
+  kernels from 6.9 not verified), the audit's status, the install checks
+  (`--source-tree`, `--allow-manifest-only`, the boot-time check) and the
+  supply chain (actions pinned by SHA, attestations bound to the release
+  workflow at a `v*` tag, the `.rpm` signed on tag builds with its public
+  key and fingerprint published with the first signed release, the `.deb`
+  checked by attestation). New
+  `docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md`: the changes of
+  behaviour and the regressions of `[Unreleased]` grouped for an operator,
+  each with its finding and lab PR, linked from the install guide (whose
+  §6.1 now says the rpm key is still to come) and the README. The tracker gains a summary per wave, the method and a section
+  of follow-ups found in the lab (`inode_setattr` on 6.9+,
+  NN-L-CANARY-003 and NN-L-NET-003 unable to fire, FIM-024 and the
+  posture, `FLOW_SOCK_MAP`, the single ADE slot, no `nft` on Debian 12, an
+  unexplained missing R001, the measurements owed on a model host).
+  `docs/ADE_DOCTRINE.md` and the Article 13 dossier describe the advisory
+  ADE, the prompt window, sanitization and context selection, the pinned
+  RAG corpus and the one-slot limit; `ROADMAP.md`, `SECURITY.md`,
+  `docs/CLAUDE_BRIEFING.md`, `docs/operator/KERNEL_COMPATIBILITY.md`
+  (6.9+ and `nft`) and `docs/validation/README.md` (the Critical
+  sub-gate) are brought up to date. No change to the agent.
+
 ### Fixed
 - External audit, Wave 2, range bootstrap and lab verdict integrity
   (Medium LAB-006, LAB-018, LAB-016, LAB-017, LAB-011, LAB-014): the

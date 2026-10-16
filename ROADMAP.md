@@ -8,7 +8,7 @@ CET, PQC, honeypots, micro-segmentazione), vedi VISION_TECHNICAL.md.
 Quella è la stella polare. Questa è la marcia operativa.
 
 
-## Stato di avanzamento (aggiornato il 10 ottobre 2026)
+## Stato di avanzamento (aggiornato il 16 ottobre 2026)
 
 | Tappa | Stato | Riferimento |
 |---|---|---|
@@ -18,16 +18,26 @@ Quella è la stella polare. Questa è la marcia operativa.
 | 8 | chiusa | sblocco COMBAT con firma Ed25519, audit log firmato |
 | 9 (FIM) + 9.0.a/b/c | chiuse | File Integrity Monitoring, detections su chainlog firmato, triage |
 | 9.5 + 9.5.1 | chiuse | canary token e honeypot anti-tamper |
-| 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole, profondità di detection |
+| 10 (rete) + 10.5 + 10.6 | chiuse | osservabilità di rete, 69 regole alla chiusura (76 oggi), profondità di detection |
 | 10.7 | in corso | validazione avversariale via Kali (design chiuso, range automatizzato) |
-| **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak; restano fuzzing, io_uring, autodifesa BPF, avversariale anti-tamper, overhead, .deb |
-| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passi 1 (aperture file su LSM) e 2 (exec su LSM) fatti il 12 ottobre, passo 3 (DNS letto dal buffer del socket, anche IPv6) in verifica |
+| **10.8** | **in corso** | affidabilità: hardening 8–10 ott, upgrade/uninstall, release firmata, multi-kernel (4 kernel), soak da 24 h, fuzzing, io_uring (prima parte), autodifesa BPF, avversariale anti-tamper, overhead su 6.8, pacchetti `.deb`/`.rpm`; restano il soak da 72 h, l'overhead sugli altri guest, la chiave di firma dell'`.rpm` (azione del maintainer) e i kernel dal 6.9 (`inode_setattr`, vedi audit esterno) |
+| 10.9 | in corso | copertura delle evasioni: contesto cgroup/container, injection a runtime, DNS cifrato/tunnel (decisa il 10 ottobre dopo revisione esterna); punto di aggancio dei sensori: progetto accettato, passo 0 superato su 6.8, 6.1 e 5.15, passi 1 (aperture file su LSM), 2 (exec su LSM) e 3 (DNS letto dal buffer del socket, anche IPv6) fatti il 12 ottobre |
+| Audit esterno di `16f7563` | Wave 0–2 chiuse, Wave 3 non iniziata | 444 rilievi: Wave 0 e 1 (6 Critical, 70 High) e Wave 2 (159 Medium) chiuse, Wave 3 (188 Low, 21 Info) non iniziata; seguiti trovati in lab da chiudere. Registro: `docs/audit/EXTERNAL_AUDIT_16f7563.md`; note per l'operatore: `docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md` |
 | UI locale, Scout proattivo | non iniziate | slittate dopo la 10.9, numerazione da confermare dal founder |
 | 11 – 17 | non iniziate | Windows, backend EU, console, hardening avanzato, beta, lancio |
 
 Release taggata: `v0.0.1-tappa9.0` (9 ottobre 2026) — tutto fino alla Tappa 9.0 più il giro
 di hardening. Registri difetti: `docs/audit/NN_BUG_AUDIT_2026-06-09.md`,
-`docs/audit/NN_REVIEW_2026-10-08.md` (High e Medium tutti chiusi al 9 ottobre).
+`docs/audit/NN_REVIEW_2026-10-08.md` (High e Medium tutti chiusi al 9 ottobre),
+`docs/audit/EXTERNAL_AUDIT_16f7563.md` (audit esterno del 12 ottobre: Critical, High e
+Medium chiusi al 16 ottobre, con i seguiti trovati in lab).
+
+Decisione di prodotto del 15 ottobre 2026 (lab PR 134): l'ADE è un consulente. Un
+verdetto del modello che nomina un'azione (Kill, KillTree, Quarantine, BlockNetwork,
+Isolate) è registrato come raccomandazione, con il ragionamento del modello, e non è
+eseguito; le risposte restano alle regole deterministiche e alla scala COMBAT.
+`NN_ADE_ENFORCE=1` riabilita l'esecuzione ed è registrata come variabile
+d'indebolimento nell'audit log firmato.
 
 ---
 
@@ -134,6 +144,8 @@ Obiettivo: decisioni euristiche su casi ambigui.
 
 Demo: binario sconosciuto eseguito. Regole non lo classificano.
 LLM lo analizza (filename, syscalls, network behavior) e decide.
+Dal 15 ottobre 2026 (lab PR 134) la decisione del modello è una
+raccomandazione registrata, non un'azione: vedi lo stato di avanzamento.
 
 ### Sub-tappa 6.1 — Backend candle reale (chiusa)
 
@@ -814,8 +826,9 @@ cambia l'ordine delle Tappe successive.
   ftrace e lista moduli (moduli nascosti), credenziali cambiate senza
   setuid legittimo (copia ombra alla LKRG), viste incrociate per processi
   e socket nascosti (PUMAKIT, VoidLink)
-- JA4 nella blocklist accanto a JA3 (oggi JA4 è calcolato ma nessuna
-  regola lo usa)
+- JA4 nella blocklist accanto a JA3 (oggi nessun sensore cattura
+  l'impronta TLS, né JA3 né JA4: NN-L-NET-003 è inattiva, BUG-025, e
+  `nn-admin net status` lo dice; serve prima la cattura)
 - Enforcement inline (LSM `-EPERM`) per un sottoinsieme deterministico
   delle regole: exec da tmpfs/memfd, lettura di credenziali da binari
   fuori allowlist, connect verso blocklist; l'LLM e la scala di posture
