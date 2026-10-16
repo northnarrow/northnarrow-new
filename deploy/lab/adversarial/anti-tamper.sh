@@ -770,6 +770,16 @@ state_row() {   # <id> <title> <detail> <check...>
     rows+=("| $id | $title | $detail | — | $v |")
     echo "$id $title → $detail; $v" >&2
 }
+# External audit NN-AUD-222 (LAB-017): a case that does not run is a table
+# row, never just a line on stderr. "Not applicable" (the kernel has the
+# feature switched off: kernel.io_uring_disabled=2) is N/A; anything else
+# (a probe that did not build) is a DEVIATION, so the run fails.
+skipped_case() { # ids reason na(0|1)
+    local v
+    if [[ "$3" == 1 ]]; then v="N/A ($2)"; else v="DEVIATION (not run: $2)"; fail=1; fi
+    rows+=("| $1 | (not run) | SKIPPED ($2) | — | $v |")
+    echo "$1 skipped: $2 → $v" >&2
+}
 print_table() {
     echo
     echo "| case | action | outcome | evidence | verdict |"
@@ -902,11 +912,11 @@ IOU_SRC="$(dirname "$0")/iouring-probe.c"
 IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
 if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
     # RHEL 9 ships kernel.io_uring_disabled=2: no ring, not even for root.
-    echo "C22 skipped: io_uring disabled on this host (kernel.io_uring_disabled=2)" >&2
+    skipped_case C22 "io_uring_disabled=2" 1
 elif [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>"$TMPD/iou-cc.log"; then
     WAIT=8 run_case C22 "io_uring: openat + read + connect through a ring" allowed "NN-L-IOU-00[12]" 0 -- "$IOU_BIN" /etc/hostname 127.0.0.1 9
 else
-    echo "C22 skipped: cannot build the io_uring probe ($(head -1 "$TMPD/iou-cc.log" 2>/dev/null))" >&2
+    skipped_case C22 "cannot build the io_uring probe: $(head -1 "$TMPD/iou-cc.log" 2>/dev/null)" 0
 fi
 # ── signed overlays (Tappa 10.8) ──────────────────────────────────────────
 # An unsigned exemption appended to the allowlist overlay, then a restart:
@@ -939,7 +949,7 @@ if [[ "$BPF_MODE" == enforce ]]; then
     # the count would read 0 → 0 and prove nothing.
     for c in "C30 PROTECTED_INODES" "C61 PROTECTED_PIDS"; do
         selected "${c%% *}" || continue
-        rows+=("| ${c%% *} | ${c#* } across an agent restart | skipped (enforce: bpftool cannot open the map) | — | — |")
+        rows+=("| ${c%% *} | ${c#* } across an agent restart | SKIPPED (enforce: bpftool cannot open the map) | — | N/A (enforce mode) |")
         echo "${c%% *} skipped: the BPF guard is in enforce mode (bpftool cannot open the map)" >&2
     done
 elif selected C30 || selected C61; then
@@ -1112,7 +1122,7 @@ fi
 IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
 IOU_TGT=$ETC/netflow-blocklist.v1
 if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
-    echo "C59a-C59c skipped: io_uring disabled on this host (kernel.io_uring_disabled=2)" >&2
+    skipped_case C59a-C59c "io_uring_disabled=2" 1
 elif [[ -x "$IOU_BIN" ]] && "$IOU_BIN" --modes 2>/dev/null | grep -qw rename; then
     POST=$(post post_not_shrunk "$AUDIT" "$(nnpy fileid "$AUDIT" size)") \
     run_case C59a "io_uring: open audit.log for writing through a ring" denied "op=write" 0 -- "$IOU_BIN" --open-write "$AUDIT"
@@ -1126,7 +1136,7 @@ elif [[ -x "$IOU_BIN" ]] && "$IOU_BIN" --modes 2>/dev/null | grep -qw rename; th
         run_case C59c "io_uring: rename a protected file through a ring" denied "op=rename" 0 -- "$IOU_BIN" --rename "$IOU_TGT" "$IOU_TGT.nn-lab-c59c"
     fi
 else
-    echo "C59a-C59c skipped: no io_uring probe with the tamper modes (see C22)" >&2
+    skipped_case C59a-C59c "no io_uring probe with the tamper modes (see C22)" 0
 fi
 # C60: masking the watchdog. `systemctl mask` cannot replace an installed
 # unit file (systemd refuses: the file exists), and in /etc/systemd/system
@@ -1176,7 +1186,7 @@ if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -
     # foreign root process got a writable handle on each.
     run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
 else
-    echo "C34-C37 skipped: cannot build the probe library ($(head -1 "$TMPD/pbf-cc.log" 2>/dev/null))" >&2
+    skipped_case C34-C37 "cannot build the probe library: $(head -1 "$TMPD/pbf-cc.log" 2>/dev/null)" 0
 fi
 # The way in that stays open: a watchdog restarted inside a window is the
 # fresh successor of its role and registers itself (the agent's restart is
@@ -1229,7 +1239,7 @@ if [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BI
     run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" "$TMPD/link-alias"
     rm -f "$TMPD/link-alias"
 else
-    echo "C39-C40 skipped: cannot build the link probe ($(head -1 "$TMPD/lnk-cc.log" 2>/dev/null))" >&2
+    skipped_case C39-C40 "cannot build the link probe: $(head -1 "$TMPD/lnk-cc.log" 2>/dev/null)" 0
 fi
 
 # External audit EVD-001: the agent's private signing key — every evidence
@@ -1252,7 +1262,7 @@ if [[ -f "$FSX_SRC" ]] && mkdir -p "$(dirname "$FSX_BIN")" && cc -O2 -o "$FSX_BI
     POST=$(post post_flag "$ETC/audit.log" a absent) \
     run_case C45 "fsxattr: make audit.log append-only" denied "op=ioctl" 0 -- "$FSX_BIN" "$ETC/audit.log" +a
 else
-    echo "C44-C45 skipped: cannot build the fsxattr probe ($(head -1 "$TMPD/fsx-cc.log" 2>/dev/null))" >&2
+    skipped_case C44-C45 "cannot build the fsxattr probe: $(head -1 "$TMPD/fsx-cc.log" 2>/dev/null)" 0
 fi
 POST=$(post post_same "$ETC/netflow-blocklist.v1" hash "$(nnpy fileid "$ETC/netflow-blocklist.v1" hash)") \
 run_case C46 "append to the shipped netflow blocklist" denied "op=write" 0 -- \

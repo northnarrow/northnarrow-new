@@ -794,13 +794,17 @@ impl AuditLog {
     }
 }
 
-/// Audit op recording a repaired torn tail of a chain log.
 /// External audit ATP-009: the test and debug features this binary was
-/// built with — none in a release build.
-fn build_features() -> Vec<&'static str> {
+/// built with — none in a release build. Also printed by
+/// `northnarrow-agent --build-features`, which the range bootstrap checks
+/// before it installs a binary (external audit NN-AUD-211).
+pub fn build_features() -> Vec<&'static str> {
     let mut features = Vec::new();
     if cfg!(feature = "debug-trigger") {
         features.push("debug-trigger");
+    }
+    if cfg!(feature = "demo-tappa5") {
+        features.push("demo-tappa5");
     }
     if cfg!(feature = "test-privileged") {
         features.push("test-privileged");
@@ -808,6 +812,7 @@ fn build_features() -> Vec<&'static str> {
     features
 }
 
+/// Audit op recording a repaired torn tail of a chain log.
 pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 
 /// Escape hatch: run with an unwritable / unopenable audit log.

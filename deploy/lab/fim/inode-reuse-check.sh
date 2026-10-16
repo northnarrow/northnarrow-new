@@ -36,7 +36,7 @@ sleep 2
 # O_EXCL), so root never writes into a file another user placed there.
 pfx=$(mktemp -u /tmp/nn-reuse.XXXXXXXX)
 hit=""
-for i in $(seq 1 2000); do
+for i in $(seq 1 5000); do
     f="$pfx-$i"
     sudo sh -c "set -C; : > '$f'" || { echo "FAIL  $f exists already"; sudo sh -c "rm -f $pfx-*"; exit 1; }
     if [[ $(sudo stat -c %i "$f") == "$ino" && $(sudo stat -c %d "$f") == "$dev" ]]; then
@@ -45,10 +45,13 @@ for i in $(seq 1 2000); do
     fi
 done
 cleanup() { sudo sh -c "rm -f $pfx-*"; }
+# External audit NN-AUD-222 (LAB-017): a run that never got the reused
+# inode proved nothing; it used to be a SKIP with exit 0. Exit 2 (NOT RUN)
+# counts as a failure in the nightly.
 if [[ -z $hit ]]; then
-    echo "SKIP  inode $ino not reused within 2000 files"
+    echo "NOT RUN  inode $ino not reused within 5000 files"
     cleanup
-    exit 0
+    exit 2
 fi
 echo "      inode $ino of the deleted $W is now $hit"
 sudo sh -c "echo appended >> '$hit'"

@@ -15,6 +15,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, range bootstrap and lab verdict integrity
+  (Medium LAB-006, LAB-018, LAB-016, LAB-017, LAB-011, LAB-014): the
+  bootstrap refuses a lab-featured binary (`--build-features`), stops on
+  a failed FIM baseline or canary deploy and checks baseline, canary,
+  passwordless sudo and a decodable CapEff; the t713 reproducer, the
+  btrfs and inode-reuse checks and the anti-tamper suite report a case
+  that did not run as NOT RUN / DEVIATION (N/A only when the kernel lacks
+  the feature); the soak FAILs on a dead agent, a missing watchdog, a map
+  at 90 % and ring drops; `verify-isolation.sh` gates the range's
+  snapshots on an adapter allowlist and in-guest probes.
 - External audit, Wave 2, privileged fixture hygiene (Medium TST-011,
   TST-012, TST-009): the two iptables self-tests of the shared fixture
   module ran in each of the eight test binaries that include it, and the

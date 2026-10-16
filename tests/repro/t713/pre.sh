@@ -47,7 +47,8 @@ echo "OK:   northnarrow-agent active"
 POSTURE=$(sudo nn-admin status --json 2>/dev/null | jq -r '.posture // empty')
 if [[ "$POSTURE" != "Observing" ]]; then
   echo "FAIL: posture=$POSTURE (expected Observing)."
-  echo "      Try: sudo systemctl restart northnarrow-agent"
+  echo "      Reset the agent through a trusted-installer window (systemctl restart"
+  echo "      is refused since EBPF-001): see reset_agent in run.sh."
   exit 1
 fi
 echo "OK:   posture == Observing"

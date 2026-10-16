@@ -254,19 +254,19 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-208 | LAB-003 | Lab scripts | S | fixed (lab PR 154) |
 | NN-AUD-209 | LAB-004 | Lab scripts | L | fixed (lab PR 154) |
 | NN-AUD-210 | LAB-005 | Lab scripts | M | fixed (lab PR 154) |
-| NN-AUD-211 | LAB-006 | Lab scripts | S | open |
+| NN-AUD-211 | LAB-006 | Lab scripts | S | fixed (lab PR 157) |
 | NN-AUD-212 | LAB-007 | Lab scripts | S | fixed (lab PR 154) |
 | NN-AUD-213 | LAB-008 | Lab scripts | M | fixed (lab PR 156) |
 | NN-AUD-214 | LAB-009 | Lab scripts | M | fixed (lab PR 156) |
 | NN-AUD-215 | LAB-010 | Lab scripts | S | fixed (lab PR 156) |
-| NN-AUD-216 | LAB-011 | Lab scripts | M | open |
+| NN-AUD-216 | LAB-011 | Lab scripts | M | fixed (lab PR 157) |
 | NN-AUD-217 | LAB-012 | Lab scripts | M | fixed (lab PR 159) |
 | NN-AUD-218 | LAB-013 | Lab scripts | L | fixed (lab PR 159) |
-| NN-AUD-219 | LAB-014 | Lab scripts | S | open |
+| NN-AUD-219 | LAB-014 | Lab scripts | S | fixed (lab PR 157) |
 | NN-AUD-220 | LAB-015 | Lab scripts | S | fixed (lab PR 156) |
-| NN-AUD-221 | LAB-016 | Lab scripts | S | open |
-| NN-AUD-222 | LAB-017 | Lab scripts | M | open |
-| NN-AUD-223 | LAB-018 | Lab scripts | S | open |
+| NN-AUD-221 | LAB-016 | Lab scripts | S | fixed (lab PR 157) |
+| NN-AUD-222 | LAB-017 | Lab scripts | M | fixed (lab PR 157) |
+| NN-AUD-223 | LAB-018 | Lab scripts | S | fixed (lab PR 157) |
 | NN-AUD-224 | TST-001 | Privileged tests | M | fixed (lab PR 153) |
 | NN-AUD-225 | TST-002 | Privileged tests | S | fixed (lab PR 153) |
 | NN-AUD-226 | TST-004 | Privileged tests | S | fixed (lab PR 111) |
@@ -4787,3 +4787,66 @@ the audit did not report, noted with the fix that takes them.
     stopped install, `privileged_map_pin` (it fails naming the hook when
     one deny-hook pin is renamed in a scratch build).
   - Lab: The gate: `fixture_selftest` (the guard self-tests on their own chain, run first), `honeypot_tamper_e2e` (refuses off an nn-lab guest; the baits restored and re-checked) and `privileged_map_pin` (the sixteen deny hooks' programs, task_kill and ptrace bound to PROTECTED_PIDS, fresh programs after the restart) pass on Ubuntu 24.04 and 22.04. Found by the gates and fixed here: the agent's BPF guard refuses a foreign handle on its pinned links, so their presence is checked; on Debian 12, iptables-nft 1.8.9 answers `-S` for a chain that does not exist with "incompatible", so the whole-table listing decides. With the final version of this change, Debian 12: 35 suites, 79 passed, 0 failed. Gate: the integration tree of lab PRs 138, 152, 158, 160 and 161 (on top of 142–159): Ubuntu 24.04 and Ubuntu 22.04 (5.15.0-198), 35 suites, 79 passed, 0 failed each; Debian 12, 35 suites, 79 passed, 0 failed (final run); anti-tamper suite OK on 24.04 and 22.04; host 2123 passed, 0 failed.
+- **NN-AUD-211 (LAB-006), NN-AUD-223 (LAB-018), NN-AUD-221 (LAB-016),
+  NN-AUD-222 (LAB-017), NN-AUD-216 (LAB-011), NN-AUD-219 (LAB-014), lab PR
+  157.** Range bootstrap and lab verdict integrity (batch F8). Finished in
+  the main session after the subagent that started it was stopped by
+  auto mode's safety check (its part: 211, the first half of 223, 221).
+  - LAB-006 (211): `northnarrow-agent --build-features` prints the
+    compiled features; the bootstrap refuses a binary unless it prints
+    exactly `none` (the `strings` gate it replaces passed a lab build);
+    the scrub fails closed; pipelines run under `pipefail`.
+  - LAB-018 (223): step 1 stops the units through a trusted-installer
+    window and `systemctl kill` (EBPF-001: `systemctl stop` is refused)
+    and waits for the deny hooks to detach; steps 6 (FIM baseline) and 7
+    (the `range-aws-creds` canary, path from the build user's home) stop
+    the bootstrap on failure instead of warning. Health check: CapEff only
+    from the unit's MainPID when its comm is `northnarrow-age` and the
+    mask is 16 hex digits — an undecodable mask fails every capability
+    probe (the "does NOT have cap_sys_admin" ones passed on an empty
+    decode); `iptables -S` captured, a failed listing fails; `lsattr`
+    captured; a baseline newer than the bootstrap's start (60 s wait); the
+    canary listed; no `NOPASSWD`/`!authenticate` for the build user and
+    every login user (`sudo -l -U`, captured: `grep -q` on the pipe under
+    `pipefail` could miss it).
+  - LAB-016 (221): `tests/repro/t713/run.sh` resets the agent through the
+    window (as `anti-tamper.sh restart_agent`) and aggregates exit codes
+    (0 PASS, 1 FAIL, 2 INCONCLUSIVE); scenarios A, B, C exit 0/1/2 with a
+    safe trap (no `kill 0`); B always makes its 30 deterministic writes
+    and counts them before the verdict. Scenario C (the negative control)
+    expected a /tmp exec to drive COMBAT on its own, which it no longer
+    does since POS-015 (lab PR 141: a staging exec is `StagingExec`,
+    ENGAGED) and POS-001; it now expects an R001 verdict for the payload
+    and the posture out of Observing — still Observing, or no verdict,
+    means the lineage gate exempted a /tmp exec.
+  - LAB-017 (222): `btrfs-check.sh` loads the btrfs module with the agent
+    stopped (R011 killed `modprobe`, then the check SKIPped with exit 0 on
+    a kernel that has btrfs): N/A (exit 0) only when the kernel has no
+    btrfs, NOT RUN (exit 2) when the module does not load;
+    `inode-reuse-check.sh` tries 5,000 files and a miss is NOT RUN (exit
+    2), not a SKIP with exit 0; the anti-tamper suite turns every skipped
+    case into a table row, `N/A` for `io_uring_disabled=2` and the
+    enforce-mode map cases, `DEVIATION (not run: …)` for a probe that did
+    not build. verify-2b was retired by lab PR 153.
+  - LAB-011 (216): the soak sampler takes the units' MainPID checked by
+    process name (the pid file goes when the watchdog holds; the old pgrep
+    pattern missed the package layout) and records `agent_alive`,
+    `wd_alive` and `map_pct` (the fullest sampled map's share of its
+    `max_entries`); the report FAILs on a dead agent beyond a one-sample
+    respawn gap or at the end, a missing watchdog, a map at 90 % or more,
+    and ring drops above `NN_LAB_SOAK_MAX_DROPS` (default 0). Checked on
+    synthetic samples: an agent dead from the middle → FAIL "agent down",
+    one missing sample → PASS.
+  - LAB-014 (219): `deploy/adversarial/verify-isolation.sh` — `host`:
+    every adapter of both VMs against an allowlist (target: intnet on
+    `$INTNET` plus at most one host-only NIC; attacker: intnet only; nat,
+    natnetwork, bridged, generic, another intnet are breaches), then the
+    guest probes through `VBoxManage guestcontrol` (or, after running
+    `guest` in both VMs, `GUEST_PROBES_DONE=1`); `guest`: no
+    `tailscale0`/`wg*`, no route to 1.1.1.1, TCP to 1.1.1.1:443 does not
+    connect, the intnet peer answers; `snapshot`: the gate, then the
+    revert snapshots — refused unless it passed. RANGE_SETUP §5 and §8
+    require it; `docs/adversarial/scripts/05_verify_isolation.sh` (NAT
+    only) is marked superseded. `selftest`: 10 adapter cases (a bridged or
+    NAT adapter fails, intnet only passes).
+  - Lab: Ubuntu 24.04, lab157-probe.sh with this build. LAB-006: the lab build answers `--build-features` with `debug-trigger,test-privileged` (refused by the bootstrap, which accepts only `none`; the shipped `cargo xtask build --release` prints `none`). LAB-016: `tests/repro/t713/run.sh` (as user nn, posture reset first) — scenarios A, B, C PASS, rc 0; with the posture forced to Alerted, scenario A exits 1 ("PRE-FIX BUG REPRODUCED"); run with the posture already Alerted, `run.sh` refuses at its preconditions (rc 1); the first run of the rewritten C found its outdated expectation (COMBAT from a /tmp exec alone), fixed above. LAB-017: btrfs not loaded (Ubuntu ships it as a module) → loaded with the agent stopped, control and btrfs subvolume both draw NN-L-FIM-011, PASS (it used to SKIP with exit 0); `fim-reuse-check` PASS (inode 2960 reused within the 5,000 tries); `tamper-check` OK, no case skipped on this guest. LAB-011: a 6-minute soak with agent and watchdog stopped through a window at 2 minutes → FAIL "agent down (11 consecutive sample(s) without a live agent, down at the end); watchdog missing (11 …)" (the old verdict read pid 0 rows as healthy). LAB-014/LAB-018 need the VirtualBox range: `verify-isolation.sh selftest` 10/10 (bridged, NAT, NAT network, another intnet, a second host-only NIC fail; intnet only passes), `guest` run on a networked host reports FAIL (a route to the public probe address). Gate: Ubuntu 24.04 and Debian 12, 36 suites, 76 passed, 0 failed each; anti-tamper suite OK; host 2112 passed, 0 failed.
