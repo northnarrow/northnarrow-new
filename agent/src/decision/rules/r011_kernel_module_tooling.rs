@@ -364,7 +364,7 @@ mod tests {
     /// forked after its parent ran its program.
     fn package_transaction(dir: &std::path::Path) -> crate::posture::lineage::AuthSessionTracker {
         let t = crate::posture::lineage::AuthSessionTracker::new(dir);
-        t.ingest_exec(100, 1, "/usr/bin/apt", &argv(&["apt", "install"]), 10, 5);
+        t.ingest_exec(100, 1, "/usr/bin/apt", &argv(&["apt", "install"]), 10, 5, 0);
         t.ingest_exec(
             200,
             100,
@@ -372,6 +372,7 @@ mod tests {
             &argv(&["dpkg", "--configure"]),
             20,
             15,
+            0,
         );
         t.ingest_exec(
             300,
@@ -384,6 +385,7 @@ mod tests {
             ]),
             30,
             25,
+            0,
         );
         t.ingest_exec(
             400,
@@ -392,6 +394,7 @@ mod tests {
             &argv(&["/bin/bash", "/usr/sbin/dkms", "install", "foo/1.0"]),
             40,
             35,
+            0,
         );
         t
     }
@@ -400,7 +403,7 @@ mod tests {
     /// tracker and the rule see it.
     fn kmod_exec(t: &crate::posture::lineage::AuthSessionTracker, uid: u32, exe: &str) -> Event {
         let a = argv(&["modprobe", "foo"]);
-        t.ingest_exec(500, 400, exe, &a, 50, 45);
+        t.ingest_exec(500, 400, exe, &a, 50, 45, 0);
         let mut e = crate::decision::rules::testutil::spawn_exe("modprobe", exe, exe, 0);
         if let Event::ProcessSpawn {
             pid,
@@ -442,11 +445,11 @@ mod tests {
     fn a_forked_payload_that_later_execs_apt_is_still_killed() {
         let dir = tempfile::tempdir().unwrap();
         let t = crate::posture::lineage::AuthSessionTracker::new(dir.path());
-        t.ingest_exec(600, 1, "/usr/bin/bash", &argv(&["bash"]), 10, 5);
+        t.ingest_exec(600, 1, "/usr/bin/bash", &argv(&["bash"]), 10, 5, 0);
         // the payload is forked at 30; its parent executes apt at 60
-        t.ingest_exec(600, 1, "/usr/bin/apt", &argv(&["apt", "list"]), 60, 5);
+        t.ingest_exec(600, 1, "/usr/bin/apt", &argv(&["apt", "list"]), 60, 5, 0);
         let a = argv(&["modprobe", "evil"]);
-        t.ingest_exec(700, 600, "/usr/sbin/modprobe", &a, 70, 30);
+        t.ingest_exec(700, 600, "/usr/sbin/modprobe", &a, 70, 30, 0);
         let mut e = crate::decision::rules::testutil::spawn_exe(
             "modprobe",
             "/usr/sbin/modprobe",

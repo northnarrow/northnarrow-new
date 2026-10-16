@@ -540,6 +540,7 @@ impl TriggerDetector {
         if let Event::ProcessSpawn {
             pid,
             ppid,
+            uid,
             filename,
             argv,
             timestamp_ns,
@@ -552,7 +553,8 @@ impl TriggerDetector {
             // flag (node running npm-cli.js) for the mass-write exemption.
             // Tappa 10.9 step 2: the file the kernel executed (review 61).
             // External audit POS-003: and the process's own start, which
-            // orders its fork against its ancestors' execs.
+            // orders its fork against its ancestors' execs. Lab PR 175:
+            // and the uid it executed as (a package transaction is root's).
             self.auth.ingest_exec(
                 *pid,
                 *ppid,
@@ -560,6 +562,7 @@ impl TriggerDetector {
                 argv,
                 *timestamp_ns,
                 *start_ns,
+                *uid,
             );
         }
 
@@ -1131,8 +1134,12 @@ enum StagedExec {
 /// - the mass-write arm fired for the same process within a mass-write
 ///   window (its lineage gates applied).
 ///
-/// Never promoted under a package manager's lineage: maintainer scripts
-/// and scriptlets run helpers they unpack in `/tmp`. Not gated by the auth
+/// Never promoted within a package transaction: maintainer scripts and
+/// scriptlets run helpers they unpack in `/tmp`. Lab PR 175: the
+/// transaction of the rules' carve-outs
+/// ([`AuthSessionTracker::in_package_transaction`]: a package manager
+/// proper executed by root whose run covers the exec), no longer any
+/// `mandb` or package manager in the lineage. Not gated by the auth
 /// lineage: a sudo-spawned process running `/tmp/payload` is raised like
 /// any other. R001..R003 still kill the exec, whatever the posture.
 fn staging_exec(
@@ -1161,7 +1168,7 @@ fn staging_exec(
     if !crate::decision::rules::is_staging_path(image) {
         return None;
     }
-    if auth.is_system_daemon_mediated(pid) {
+    if auth.in_package_transaction(pid, ts) {
         return Some(StagedExec::Plain);
     }
     let unlinked = exe.has(exe_flags::DELETED) || exe.has(exe_flags::MEMFD);
@@ -1208,7 +1215,7 @@ fn confirmed_intrusion(
         ..
     } = focal
     {
-        if auth.is_system_daemon_mediated(*pid) || auth.is_npm_cli_writer(*pid) {
+        if mass_write_exempt(auth, *pid, *timestamp_ns, filename, false) {
             return false;
         }
         // External audit POS-002: a process of an authenticated session
@@ -1263,6 +1270,7 @@ fn confirmed_intrusion(
         filename: focal_filename,
         flags,
         timestamp_ns: focal_ts,
+        path_from_user,
         ..
     } = focal
     {
@@ -1290,7 +1298,8 @@ fn confirmed_intrusion(
             // the threshold during routine maintenance; same exe-path
             // lineage keying. Only the mass-write arm is gated here;
             // FsProtectDenial and the staging exec still fire for these
-            // PIDs.
+            // PIDs. Lab PR 175: a package transaction's writes, and
+            // mandb's own as a system account ([`mass_write_exempt`]).
             // FP-2 — `npm install` unpacks a package tarball (+ writes
             // the ~/.npm content cache) well past the threshold. npm is
             // a `#!/usr/bin/env node` script, so the writer's exe is the
@@ -1312,7 +1321,7 @@ fn confirmed_intrusion(
             // so a bare node_modules constraint would reintroduce the FP
             // for the cache-write burst; a correct v2 must allowlist the
             // (configurable) cache dir too.
-            if auth.is_system_daemon_mediated(*focal_pid) || auth.is_npm_cli_writer(*focal_pid) {
+            if mass_write_exempt(auth, *focal_pid, *focal_ts, focal_filename, *path_from_user) {
                 return false;
             }
             // External audit POS-002 (tracepoint mode, which sees the open
@@ -1394,6 +1403,33 @@ fn confirmed_intrusion(
     false
 }
 
+/// The mass-write arm's writers (review 49 (ii), FP-2): a package
+/// transaction's ([`AuthSessionTracker::in_package_transaction`]), mandb's
+/// own as a system account (its cache rebuild,
+/// [`AuthSessionTracker::is_system_man_cache_writer`]), npm's CLI's own.
+///
+/// Lab PR 175: it was anything with a package manager or `mandb` in its
+/// lineage. Neither is set-id: a user ran `mandb` (or `dpkg --version`)
+/// with `LD_PRELOAD` and whatever it forked rewrote the user's files
+/// without raising `ConfirmedIntrusion`. A package manager a user runs (a
+/// rootless `podman build`'s `dnf`) is exempt for what it writes in that
+/// user's container storage only
+/// ([`AuthSessionTracker::is_user_container_storage_write`], judged on the
+/// open `path` names: the kernel counts a process's write-opens, and
+/// reports the one that crossed the threshold).
+fn mass_write_exempt(
+    auth: &AuthSessionTracker,
+    pid: u32,
+    ts_ns: u64,
+    path: &str,
+    path_from_user: bool,
+) -> bool {
+    auth.in_package_transaction(pid, ts_ns)
+        || auth.is_system_man_cache_writer(pid)
+        || auth.is_npm_cli_writer(pid)
+        || auth.is_user_container_storage_write(pid, ts_ns, path, path_from_user)
+}
+
 /// One mass-write WARN per pid per window (review entry 37). Returns true
 /// when the line should be logged and records `ts_ns`; the map is pruned
 /// of pids older than a window whenever it exceeds 1024 entries.
@@ -1422,6 +1458,8 @@ fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
         filename,
         flags,
         kernel_class,
+        timestamp_ns,
+        path_from_user,
         ..
     } = focal
     else {
@@ -1444,7 +1482,15 @@ fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
     // `sudo systemctl edit` / hand-dropped unit STILL raises
     // PersistenceMechanism (keeps the persistence exemption tight to
     // package daemons; an attacker holding sudo gets no free pass here).
-    if auth.is_system_daemon_mediated(*pid) {
+    // Lab PR 175: a package transaction only (a package manager proper
+    // executed by root whose run covers the write). Any `mandb` or package
+    // manager in the lineage did: a user's crontab installed by a process
+    // forked under `mandb` raised nothing. A package manager a user runs:
+    // within that user's container storage only (a unit a rootless build
+    // installs in its image), never a host path.
+    if auth.in_package_transaction(*pid, *timestamp_ns)
+        || auth.is_user_container_storage_write(*pid, *timestamp_ns, filename, *path_from_user)
+    {
         return false;
     }
     true
@@ -1613,6 +1659,16 @@ pub(super) mod testutil {
             parent_is_kthread: false,
             exe: Default::default(),
         }
+    }
+
+    /// [`spawn`] executed as `uid` (lab PR 175: a package transaction is
+    /// a package manager root executed).
+    pub fn spawn_by(uid: u32, pid: u32, ppid: u32, comm: &str, filename: &str, ts: u64) -> Event {
+        let mut e = spawn(pid, ppid, comm, filename, ts);
+        if let Event::ProcessSpawn { uid: u, gid, .. } = &mut e {
+            (*u, *gid) = (uid, uid);
+        }
+        e
     }
 
     pub fn file_open(pid: u32, uid: u32, filename: &str, flags: u32, ts: u64) -> Event {
@@ -1931,7 +1987,7 @@ mod tests {
     fn a_package_managers_staged_helper_is_never_promoted() {
         use common::wire::exe::exe_flags::DELETED;
         let det = detector_with_empty_proc();
-        let _ = det.detect(&spawn_with_exe(100, 1, "/usr/bin/dpkg", 1), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 100, 1, "/usr/bin/dpkg", 1), &[]);
         let hits = det.detect(
             &spawn_exe_flags(101, 100, "/tmp/postinst-helper", DELETED, 2),
             &[],
@@ -2163,6 +2219,17 @@ mod tests {
     /// Build a ProcessSpawn fixture with `filename` (the kernel
     /// reports the exec'd binary's resolved path there). `comm` is
     /// the truncated name; immaterial to the lineage gate.
+    /// [`spawn_with_exe`] executed as `uid` (lab PR 175: a package
+    /// transaction is a package manager root executed; man-db's rebuild
+    /// runs as `man`, uid 6 on Debian and Ubuntu).
+    fn spawn_with_exe_by(uid: u32, pid: u32, ppid: u32, filename: &str, ts: u64) -> Event {
+        let mut e = spawn_with_exe(pid, ppid, filename, ts);
+        if let Event::ProcessSpawn { uid: u, gid, .. } = &mut e {
+            (*u, *gid) = (uid, uid);
+        }
+        e
+    }
+
     fn spawn_with_exe(pid: u32, ppid: u32, filename: &str, ts: u64) -> Event {
         Event::ProcessSpawn {
             pid,
@@ -2444,7 +2511,7 @@ mod tests {
         let det = detector_with_empty_proc();
         // user shell -> sudo -> apt
         let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
-        let _ = det.detect(&spawn_with_exe(200, 100, "/usr/bin/apt", 2), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 200, 100, "/usr/bin/apt", 2), &[]);
 
         // 25 write-opens from apt's pid in 60 s — would normally
         // trip ConfirmedIntrusion mass-write arm.
@@ -2640,7 +2707,7 @@ mod tests {
         let hits = det.detect(&mass_write(600, false, 13), &[]);
         assert!(hits.contains(&TriggerType::ConfirmedIntrusion));
         // a package manager stays exempt either way
-        let _ = det.detect(&spawn_with_exe(700, 500, "/usr/bin/dpkg", 7), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 700, 500, "/usr/bin/dpkg", 7), &[]);
         let hits = det.detect(&mass_write(700, true, 14), &[]);
         assert!(!hits.contains(&TriggerType::ConfirmedIntrusion));
     }
@@ -2704,12 +2771,18 @@ mod tests {
     // state churn, cache rebuilds) AND write systemd units / cron entries
     // (package install) during normal maintenance. Both arms exempt them
     // via exe-path lineage; detection stays intact for non-daemon writers.
+    // Lab PR 175: a package transaction (the package manager executed by
+    // root, while its run covers the event: the fixtures spawn them as
+    // root), and mandb's own rebuild as a system account (as `man`).
 
     #[test]
     fn mass_write_exempt_for_snapd_daemon() {
         let det = detector_with_empty_proc();
         // snapd daemon parented by systemd — the 2026-06-02 self-lock.
-        let _ = det.detect(&spawn_with_exe(1096, 1, "/usr/lib/snapd/snapd", 1), &[]);
+        let _ = det.detect(
+            &spawn_with_exe_by(0, 1096, 1, "/usr/lib/snapd/snapd", 1),
+            &[],
+        );
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
             .map(|i| file_open(1096, 0, "/var/lib/snapd/state.json.tmp", 1, i + 10))
             .collect();
@@ -2730,7 +2803,7 @@ mod tests {
     #[test]
     fn mass_write_exempt_for_mandb() {
         let det = detector_with_empty_proc();
-        let _ = det.detect(&spawn_with_exe(3096, 1, "/usr/bin/mandb", 1), &[]);
+        let _ = det.detect(&spawn_with_exe_by(6, 3096, 1, "/usr/bin/mandb", 1), &[]);
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
             .map(|i| file_open(3096, 0, "/var/cache/man/de/3096", 1, i + 10))
             .collect();
@@ -2752,7 +2825,7 @@ mod tests {
     fn mass_write_exempt_for_dpkg_maintainer_script_via_lineage() {
         let det = detector_with_empty_proc();
         // dpkg -> /bin/sh maintainer script: exempt via the dpkg ancestor.
-        let _ = det.detect(&spawn_with_exe(400, 1, "/usr/bin/dpkg", 1), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 400, 1, "/usr/bin/dpkg", 1), &[]);
         let _ = det.detect(&spawn_with_exe(401, 400, "/bin/sh", 2), &[]);
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
             .map(|i| file_open(401, 0, "/usr/share/foo/data", 1, i + 10))
@@ -2903,7 +2976,10 @@ mod tests {
     #[test]
     fn persistence_exempt_for_snapd_unit_write() {
         let det = detector_with_empty_proc();
-        let _ = det.detect(&spawn_with_exe(1096, 1, "/usr/lib/snapd/snapd", 1), &[]);
+        let _ = det.detect(
+            &spawn_with_exe_by(0, 1096, 1, "/usr/lib/snapd/snapd", 1),
+            &[],
+        );
         let focal = file_open(1096, 0, "/etc/systemd/system/snap-snapd-26865.mount", 1, 5);
         let hits = det.detect(&focal, &[]);
         assert!(
@@ -2938,6 +3014,193 @@ mod tests {
             hits.contains(&TriggerType::PersistenceMechanism),
             "sudo-mediated cron write must STILL fire persistence, got {hits:?}"
         );
+    }
+
+    /// Lab PR 175: the posture's arms trusted anything with `mandb` (or a
+    /// package manager) in its lineage. `mandb` is not set-id: a user runs
+    /// it with `LD_PRELOAD` and has it fork `crontab`, a payload from /tmp,
+    /// a file encryptor — none raised its trigger. They trust a root
+    /// package transaction now, and the mass-write arm `mandb`'s own
+    /// rebuild as a system account.
+    #[test]
+    fn the_posture_judges_what_a_users_mandb_forks() {
+        use common::wire::exe::exe_flags::DELETED;
+        let det = detector_with_empty_proc();
+        // the user's shell (900) → mandb (910) → crontab (911)
+        let _ = det.detect(&spawn_with_exe(900, 1, "/usr/bin/bash", 1), &[]);
+        let _ = det.detect(&spawn_with_exe(910, 900, "/usr/bin/mandb", 2), &[]);
+        let _ = det.detect(&spawn_with_exe(911, 910, "/usr/bin/crontab", 3), &[]);
+        let hits = det.detect(
+            &file_open(911, 1000, "/var/spool/cron/crontabs/u", 1, 4),
+            &[],
+        );
+        assert!(
+            hits.contains(&TriggerType::PersistenceMechanism),
+            "{hits:?}"
+        );
+        // … → a payload from /tmp, unlinked as it runs: promoted
+        let hits = det.detect(&spawn_exe_flags(912, 910, "/tmp/payload", DELETED, 5), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        // … → a process rewriting the user's files, and mandb itself
+        let _ = det.detect(&spawn_with_exe(913, 910, "/home/u/cryptor", 6), &[]);
+        let hits = det.detect(&mass_write(913, true, 7), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        let hits = det.detect(&mass_write(910, true, 8), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+    }
+
+    /// Lab PR 175: man-db's rebuild as `man` stays exempt from the
+    /// mass-write arm; what it forks does not inherit that.
+    #[test]
+    fn mandbs_own_cache_rebuild_is_exempt_not_its_children() {
+        let det = detector_with_empty_proc();
+        let _ = det.detect(&spawn_with_exe_by(6, 3096, 1, "/usr/bin/mandb", 1), &[]);
+        let _ = det.detect(&spawn_with_exe_by(6, 3097, 3096, "/usr/bin/sh", 2), &[]);
+        let hits = det.detect(&mass_write(3096, true, 3), &[]);
+        assert!(!hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        let hits = det.detect(&mass_write(3097, true, 4), &[]);
+        assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+    }
+
+    /// Lab PR 175: a package transaction is root's package manager while
+    /// its run covers the write. A user's `dpkg --version` (`LD_PRELOAD`)
+    /// vouches for nothing, nor a dpkg that ended long before.
+    #[test]
+    fn persistence_is_exempt_within_a_root_transaction_only() {
+        const S: u64 = 1_000_000_000;
+        let det = detector_with_empty_proc();
+        // root's dpkg (400) → a maintainer script (401) writes a unit
+        let _ = det.detect(&spawn_with_exe_by(0, 400, 1, "/usr/bin/dpkg", S), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 401, 400, "/bin/sh", 2 * S), &[]);
+        let unit = |ts: u64| file_open(401, 0, "/etc/systemd/system/foo.service", 1, ts);
+        let hits = det.detect(&unit(3 * S), &[]);
+        assert!(
+            !hits.contains(&TriggerType::PersistenceMechanism),
+            "{hits:?}"
+        );
+        // the same write, by what the script left running, 120 s on
+        let hits = det.detect(&unit(120 * S), &[]);
+        assert!(
+            hits.contains(&TriggerType::PersistenceMechanism),
+            "{hits:?}"
+        );
+        // the user's dpkg (500) → crontab (501)
+        let _ = det.detect(&spawn_with_exe(500, 1, "/usr/bin/dpkg", 3 * S), &[]);
+        let _ = det.detect(&spawn_with_exe(501, 500, "/usr/bin/crontab", 4 * S), &[]);
+        let hits = det.detect(
+            &file_open(501, 1000, "/var/spool/cron/crontabs/u", 1, 5 * S),
+            &[],
+        );
+        assert!(
+            hits.contains(&TriggerType::PersistenceMechanism),
+            "{hits:?}"
+        );
+    }
+
+    /// A detector over fixture `/proc` and host trees, with a rootless
+    /// build: the user's podman (600) → `dnf` (700) in a container of its
+    /// own, rooted in an overlay (0:77) of the user's storage (the test's
+    /// uid owns `/home/u/.local/share/containers`).
+    fn rootless_build() -> (tempfile::TempDir, tempfile::TempDir, TriggerDetector, u32) {
+        use super::super::exempt::ExemptPids;
+        use super::super::lineage::AuthSessionTracker;
+        use std::os::unix::fs::symlink;
+        let host = tempfile::tempdir().unwrap();
+        let procs = tempfile::tempdir().unwrap();
+        let me = unsafe { libc::getuid() };
+        std::fs::create_dir_all(host.path().join("home/u/.local/share/containers/storage"))
+            .unwrap();
+        for (pid, ns) in [("1", "mnt:[4026531841]"), ("700", "mnt:[4026532900]")] {
+            std::fs::create_dir_all(procs.path().join(pid).join("ns")).unwrap();
+            symlink(ns, procs.path().join(pid).join("ns/mnt")).unwrap();
+        }
+        let o = "/home/u/.local/share/containers/storage/overlay";
+        std::fs::write(
+            procs.path().join("700/mountinfo"),
+            format!(
+                "900 800 0:77 / / rw - overlay overlay rw,lowerdir={o}/l/A,upperdir={o}/0a1b/diff,workdir={o}/0a1b/work\n"
+            ),
+        )
+        .unwrap();
+        let auth = AuthSessionTracker::new(procs.path()).with_host_root(host.path());
+        let det = TriggerDetector::with_exempt_and_auth(ExemptPids::default(), auth);
+        let _ = det.detect(&spawn_with_exe_by(me, 600, 1, "/usr/bin/podman", 1), &[]);
+        let _ = det.detect(&spawn_with_exe_by(me, 700, 600, "/usr/bin/dnf", 2), &[]);
+        (host, procs, det, me)
+    }
+
+    /// Lab PR 175: a rootless `podman build`'s `dnf` writing 2,000 files
+    /// into the user's container storage (the overlay's upper layer, or its
+    /// own root overlay) raises no `ConfirmedIntrusion`, in either arm; the
+    /// same process rewriting the user's documents does.
+    #[test]
+    fn a_rootless_build_mass_writes_its_storage_not_the_users_files() {
+        let (_host, _procs, det, me) = rootless_build();
+        let burst = |pid: u32, path: &str, ts: u64| {
+            let mut e = mass_write(pid, true, ts);
+            if let Event::MassWrite {
+                filename, count, ..
+            } = &mut e
+            {
+                (*filename, *count) = (path.to_string(), 2000);
+            }
+            det.detect(&e, &[])
+        };
+        let storage =
+            "/home/u/.local/share/containers/storage/overlay/0a1b/diff/usr/lib64/libfoo.so";
+        let docs = "/home/u/Documents/report.docx";
+        let ci = TriggerType::ConfirmedIntrusion;
+        assert!(!burst(700, storage, 3).contains(&ci));
+        assert!(!burst(700, "mnt[0:77:12]/usr/lib64/libfoo.so", 4).contains(&ci));
+        assert!(burst(700, docs, 5).contains(&ci));
+        assert!(burst(700, "mnt[0:78:12]/report.docx", 6).contains(&ci));
+        // tracepoint mode: 2,000 opens, each one judged
+        let opens = |path: &str, from: u64| -> (Event, Vec<Event>) {
+            let recent = (0..2000u64)
+                .map(|i| file_open(700, me, path, 1, from + i))
+                .collect();
+            (file_open(700, me, path, 1, from + 2000), recent)
+        };
+        let (focal, recent) = opens(storage, 10);
+        assert!(!det.detect(&focal, &recent).contains(&ci));
+        let (focal, recent) = opens(docs, 3000);
+        assert!(det.detect(&focal, &recent).contains(&ci));
+    }
+
+    /// Lab PR 175: outside that storage nothing is exempt — a unit the
+    /// build installs in its image is not raised, the host's cron spool is,
+    /// and a user's `LD_PRELOAD` dpkg (init's namespace) gets nothing.
+    #[test]
+    fn a_rootless_build_installs_units_in_its_image_not_on_the_host() {
+        let (_host, _procs, det, me) = rootless_build();
+        let pm = TriggerType::PersistenceMechanism;
+        let open = |pid: u32, path: &str, from_user: bool, ts: u64| {
+            let mut e = file_open(pid, me, path, 1, ts);
+            if let Event::FileOpen {
+                path_from_user,
+                kernel_class,
+                ..
+            } = &mut e
+            {
+                (*path_from_user, *kernel_class) = (from_user, open_reason::PERSIST);
+            }
+            det.detect(&e, &[])
+        };
+        // in the image: its root overlay, or the caller's string inside it
+        // (tracepoint mode: a caller's string raises SensitiveFileAccess
+        // at most, POS-004)
+        let sfa = TriggerType::SensitiveFileAccess;
+        assert!(!open(700, "mnt[0:77:5]/etc/systemd/system/foo.service", false, 3).contains(&pm));
+        let hits = open(700, "/etc/systemd/system/foo.service", true, 4);
+        assert!(!hits.contains(&pm) && !hits.contains(&sfa), "{hits:?}");
+        // the host's
+        assert!(open(700, "/var/spool/cron/crontabs/u", false, 5).contains(&pm));
+        assert!(open(700, "mnt[0:78:5]/etc/cron.d/x", false, 6).contains(&pm));
+        // the user's dpkg --version (LD_PRELOAD) → crontab, in init's namespace
+        let _ = det.detect(&spawn_with_exe_by(me, 800, 1, "/usr/bin/dpkg", 7), &[]);
+        let _ = det.detect(&spawn_with_exe_by(me, 801, 800, "/usr/bin/crontab", 8), &[]);
+        assert!(open(801, "/var/spool/cron/crontabs/u", false, 9).contains(&pm));
+        assert!(open(801, "/etc/systemd/system/x.service", true, 10).contains(&sfa));
     }
 
     // ── Test #6: sudo subprocess exec'ing /tmp still trips ──────────
@@ -2991,7 +3254,7 @@ mod tests {
         let det = detector_with_empty_proc();
         let _ = det.detect(&spawn_with_exe(100, 50, "/usr/bin/sudo", 1), &[]);
         let _ = det.detect(&spawn_with_exe(200, 100, "/bin/bash", 2), &[]);
-        let _ = det.detect(&spawn_with_exe(300, 200, "/usr/bin/apt", 3), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 300, 200, "/usr/bin/apt", 3), &[]);
 
         let recent: Vec<Event> = (0..(MASS_WRITE_MIN as u64))
             .map(|i| file_open(300, 0, "/var/lib/apt/lists/x", 1, i + 10))
@@ -3695,7 +3958,7 @@ mod tests {
             evidence_class(TriggerType::ConfirmedIntrusion, &e),
             EvidenceClass::FileSystem
         );
-        let _ = det.detect(&spawn_with_exe(700, 300, "/usr/bin/dpkg", 4), &[]);
+        let _ = det.detect(&spawn_with_exe_by(0, 700, 300, "/usr/bin/dpkg", 4), &[]);
         if let Event::MassWrite { pid, .. } = &mut e {
             *pid = 700;
         }

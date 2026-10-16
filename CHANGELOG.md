@@ -61,6 +61,57 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Lab follow-up, package-manager mediation bound to a real transaction
+  for the network, chain, R009 and posture consumers (lab PR 175). Lab PR
+  173 bound the FIM rules' package carve-out to a transaction and left the
+  other consumers on the lineage predicate (`is_system_daemon_mediated`: a
+  `mandb` or a package manager anywhere among the ancestors, whoever ran
+  it, for as long as the descendant lived). `mandb` is not set-id: a user
+  ran it with `LD_PRELOAD`, had it fork a program from `/tmp` that called
+  out, and NN-L-NET-008 recorded the flow (Log) instead of killing the
+  process, NN-L-CHAIN-002/005/007 gave no verdict, and a crontab, a staged
+  payload or a mass rewrite of the user's files forked the same way raised
+  no `PersistenceMechanism` and no `ConfirmedIntrusion`; under a root
+  `mandb`, a root exec from `/tmp` was R009's Log, which kept R001,
+  evaluated after it, from killing it. NN-L-NET-008, the chains' package
+  carve-out, R009's sanction and the posture's persistence, staging-exec
+  and mass-write arms now use the FIM rules' transaction
+  (`AuthSessionTracker::in_package_transaction`), at the event's own time
+  (the connect, the exec, the write). Found while fixing, and fixed for the
+  FIM rules too: no package manager is set-id either, so a user's
+  `dpkg --version` run with `LD_PRELOAD` forked what it liked inside lab PR
+  173's transaction, and an image a user builds (rootless Podman) brings
+  its own `/usr/bin/dpkg`. A transaction is now a package manager proper
+  the kernel executed as root: the exec event's real uid, a host uid, or
+  the real uid of `/proc/<pid>/status` for a package manager that predates
+  the agent — as the ring-drop exemption (SNS-009) already required.
+  `mandb` keeps one exemption, from the mass-write arm: its own writes as
+  root or a system account (uid 999 or below: man-db's timer runs it as
+  `man` on Debian and Ubuntu, as root on Fedora), not what it forks and
+  not a user's own `mandb`. A package manager a user runs (a rootless
+  `podman build`'s `dnf` or `apt`) is exempt from the posture's mass-write
+  and persistence arms for what it writes in that user's container storage
+  only (`is_user_container_storage_write`): a path the kernel placed under
+  `<dir>/.local/share/containers/` or `<dir>/.local/share/lxc/` whose marker
+  directory the user (or the owner of the `/etc/subuid` range of the uid)
+  owns, `/run/user/<uid>/containers/` or a `/var/lib/lxc/<name>/` the user
+  owns; or, for a path on a filesystem no host mount shows, cut by the
+  walk or given by the caller (tracepoint mode), a process in a mount
+  namespace of its own whose root is an overlay with its layers in that
+  storage — and, for an unplaced path, on that overlay. An event without
+  a time is judged when it is read. **Regressions:** a package manager not
+  executed by the host's root (rootless Podman, unprivileged LXC or LXD)
+  is no transaction for the rules, and for the posture outside that
+  user's container storage: its writes to the user's home, a bind-mounted
+  directory or the host's paths count and can raise `ConfirmedIntrusion`
+  or `PersistenceMechanism`; an LXD storage pool (root's) and Podman
+  storage moved elsewhere (`storage.conf`) or under `fuse-overlayfs` are
+  not recognised; a process a transaction left behind that calls
+  out from a staging directory, executes from a user path as root, writes
+  a persistence path or rewrites many files more than 30 s after the
+  package manager was last seen running (60 s after its exec if never
+  seen) is judged like any other; a user's own `mandb` that rewrites many
+  files raises `ConfirmedIntrusion`.
 - External audit, Wave 3, FIM rules (Low FIMR-010 NN-AUD-284, FIMR-011
   NN-AUD-285, FIMR-014 NN-AUD-288, FIMR-012 NN-AUD-286, FIMR-013
   NN-AUD-287; lab PR 173). The FIM rules' package carve-out (review 49: a

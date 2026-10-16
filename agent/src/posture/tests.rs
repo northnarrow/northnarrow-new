@@ -11,7 +11,9 @@ use common::ade_types::{
 use common::posture_types::{PostureKind, TriggerType};
 use common::Event;
 
-use super::triggers::testutil::{file_open, fs_protect_denial, spawn, spawn_exe_flags, tcp_v4};
+use super::triggers::testutil::{
+    file_open, fs_protect_denial, spawn, spawn_by, spawn_exe_flags, tcp_v4,
+};
 use super::{AdminReleaseError, AuthSessionTracker, ExemptPids, PostureMachine};
 
 /// External audit POS-005: `/proc/<pid>` of a process with no login uid
@@ -851,7 +853,7 @@ fn sudo_cascade_e2e_stays_at_observing() {
     assert_eq!(m.current_kind(), PostureKind::Observing);
 
     // 3. apt spawns as sudo's child.
-    let apt_spawn = spawn(200, 100, "apt", "/usr/bin/apt", 3);
+    let apt_spawn = spawn_by(0, 200, 100, "apt", "/usr/bin/apt", 3);
     let r = m.observe(&apt_spawn, &[]);
     assert!(r.is_none(), "apt spawn must not transition: {r:?}");
 
@@ -1222,7 +1224,10 @@ fn snapd_refresh_e2e_stays_at_observing() {
     let m = machine_with_isolated_auth();
     // snapd daemon spawned by systemd (pid 1).
     assert!(m
-        .observe(&spawn(1096, 1, "snapd", "/usr/lib/snapd/snapd", 1), &[])
+        .observe(
+            &spawn_by(0, 1096, 1, "snapd", "/usr/lib/snapd/snapd", 1),
+            &[]
+        )
         .is_none());
 
     // 1. 25 atomic state.json rewrites in-window (mass-write arm).
@@ -1604,7 +1609,7 @@ fn a_package_managers_staged_helper_stays_engaged() {
         workload_proc(tmp.path(), pid, unit);
     }
     let m = machine_on(tmp.path());
-    let _ = m.observe(&spawn(300, 1, "dpkg", "/usr/bin/dpkg", 1), &[]);
+    let _ = m.observe(&spawn_by(0, 300, 1, "dpkg", "/usr/bin/dpkg", 1), &[]);
     let deleted = common::wire::exe::exe_flags::DELETED;
     let r = m.observe(
         &spawn_exe_flags(301, 300, "/tmp/dpkg-helper", deleted, 2),

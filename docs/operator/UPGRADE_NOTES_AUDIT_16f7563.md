@@ -417,6 +417,19 @@ Now **killed, or answered, where they were recorded or missed**:
   a process a maintainer script left running that writes a watched path
   after the transaction is killed; an in-place edit of a watched cloud
   credential file by another program gives two High verdicts.
+- Package transactions (lab PR 175, a follow-up found in the lab): a
+  package transaction is a package manager the host's root executed,
+  while it runs or for 30 s after it was last seen running (60 s after its
+  exec if never seen) — for the FIM rules, NN-L-NET-008, the chains and
+  R009 alike. A program from `/tmp` forked by a user's `mandb` or
+  `dpkg --version` (run with `LD_PRELOAD`) that calls out is killed by
+  NN-L-NET-008 (it was recorded) and judged by NN-L-CHAIN-002/005/007; a
+  root exec from `/tmp` under a root `mandb` is killed by R009 (it was
+  recorded, and R001 did not run). **Regression:** for these rules a
+  package manager not executed by the host's root (rootless Podman,
+  unprivileged LXC or LXD) is no transaction; a process a transaction left
+  behind that calls out from a staging directory or executes from a user
+  path as root after the window is killed.
 - New rule NN-L-NET-021 names a process that floods `listen()` or
   `io_uring_setup()` (NN-AUD-103 EBPF-009, NN-AUD-105 EBPF-013, lab PR
   129).
@@ -457,6 +470,23 @@ Now **killed, or answered, where they were recorded or missed**:
   reading them with its own binary does not. **Detection change:** a
   service account in group `shadow` whose scripts read these files (a
   backup job, an application checking passwords itself) raises ALERTED.
+- **Package transactions and `mandb`** (lab PR 175, a follow-up found in
+  the lab). The persistence, staging-exec and mass-write arms exempt a
+  package transaction only (a package manager the host's root executed,
+  while its run covers the event), and the mass-write arm `mandb`'s own
+  cache rebuild as root or a system account. What a user's `mandb` (or
+  `dpkg --version`) run with `LD_PRELOAD` forks raises
+  `PersistenceMechanism` for a crontab and `ConfirmedIntrusion` for a
+  staged exec with a second factor or a mass rewrite. A package manager a
+  user runs (a rootless `podman build`) is exempt for what it writes in
+  that user's container storage: `~/.local/share/containers/`,
+  `/run/user/<uid>/containers/`, `~/.local/share/lxc/`, a
+  `/var/lib/lxc/<name>/` the user owns, or its own container's root
+  overlay there. **Detection change:** its writes outside that storage
+  (the user's home, a bind-mounted directory, the host's paths) count; a
+  build whose storage is elsewhere (`storage.conf`), under
+  `fuse-overlayfs`, or in an LXD pool can raise `ConfirmedIntrusion`; a
+  user's own `mandb` that rewrites many files raises `ConfirmedIntrusion`.
 - **Telemetry loss** (NN-AUD-184 SNS-001, NN-AUD-190 SNS-008, NN-AUD-191
   SNS-009, lab PR 128): a security ring losing more than 64 events in 10 s
   raises the posture to ALERTED (`TelemetryLoss`), never as corroboration
