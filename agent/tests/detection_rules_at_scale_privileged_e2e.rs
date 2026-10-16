@@ -726,7 +726,7 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(25);
 /// child→ancestor while the ancestor is alive); it then double-forks so
 /// its egress survives the canary trip's `KillProcessTree` (which would
 /// otherwise kill the whole ancestor tree, the egressing process
-/// included — unlike CHAIN-004/005/008 whose precursors kill only the
+/// included — unlike CHAIN-004/008 whose precursors kill only the
 /// parent PID):
 ///
 ///   phase 1 (the exec'd child / intermediate): fork a grandchild that
@@ -862,15 +862,16 @@ fn process_kernel_module_tooling_trips_r011() {
 }
 
 /// R017 — shell binary from a non-standard path. Install a benign
-/// binary as `/usr/local/bin/bash` (comm == "bash"; /usr/local/bin
-/// is outside {/bin,/usr/bin}), exec it, assert R017 fires.
+/// binary as `/usr/local/lib/nn-e2etest/bash` (comm == "bash"; outside
+/// every directory R017 exempts — `/usr/local/bin` is one since PROC-011),
+/// exec it, assert R017 fires.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn process_shell_from_nonstandard_path_trips_r017() {
     let _eni = EniIptablesGuard::install();
     let fx = Fixture::setup(&[]);
 
-    // R017 fires KillProcess; ignore the helper's exit status.
+    // R017 fires KillProcessTree; ignore the helper's exit status.
     let helper = install_named_to_priv_bin(Path::new("/bin/true"), "bash");
     let _ = Command::new(&helper.path).stdout(Stdio::null()).status();
 
@@ -1412,8 +1413,9 @@ fn chain_privesc_then_descendant_egress_trips_chain_008() {
 }
 
 /// CHAIN-005 — `/tmp` exec by a parent, descendant egress to a non-DNS
-/// port (T1059 → T1571). R001 KillProcess targets the parent PID only,
-/// so the already-forked child survives to connect.
+/// port (T1059 → T1571). The suite runs detect-only, so the forked child
+/// connects. Enforced, the /tmp exec's kill (R009 as root, R001 otherwise)
+/// takes the tree since lab PR 166, the child with it.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn chain_tmp_parent_then_descendant_egress_trips_chain_005() {
@@ -1512,7 +1514,7 @@ fn chain_tmp_then_cred_then_egress_trips_chain_007() {
 /// CHAIN-006 — canary trip by an ancestor, descendant egress (deception
 /// → T1041). Cross-PID form of CHAIN-003.
 ///
-/// Unlike CHAIN-004/005/008 (whose precursor responses kill only the
+/// Unlike CHAIN-004/008 (whose precursor responses kill only the
 /// parent PID, so a direct child survives to egress), a canary trip
 /// responds with `KillProcessTree` — it kills the whole ancestor tree,
 /// the egressing process included. So the descendant must **escape the

@@ -1,4 +1,9 @@
 //! R001 — Process executed from `/tmp/`.
+//!
+//! Lab PR 166: the executable is the payload itself, so the response is
+//! the tree. A dropper that forks before the verdict lands left its child
+//! running the same image under init, and a child that never execs draws
+//! no verdict of its own. The tree kill reaps descendants only.
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
@@ -38,7 +43,7 @@ impl Rule for R001ExecFromTmp {
         Some(build_verdict(
             self,
             event,
-            ResponseAction::KillProcess,
+            ResponseAction::KillProcessTree,
             Severity::Medium,
             "Process executed from /tmp/ — common malware staging location",
         ))
@@ -48,7 +53,7 @@ impl Rule for R001ExecFromTmp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::spawn;
+    use crate::decision::rules::testutil::{spawn, spawn_as};
 
     /// Review 61: `cd /tmp && ./payload`, a symlink or `..` — the rule
     /// matches the file the kernel executed.
@@ -74,9 +79,20 @@ mod tests {
         let event = spawn("payload", "/tmp/payload");
         let v = R001ExecFromTmp.evaluate(&event).expect("should fire");
         assert_eq!(v.rule_id, "R001_ExecFromTmp");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
         assert_eq!(v.severity, Severity::Medium);
         assert_eq!(v.event_filename, "/tmp/payload");
+    }
+
+    /// Lab PR 166: the payload's forked children die with it.
+    #[test]
+    fn r001_kills_the_process_tree() {
+        for uid in [0, 998, 1000] {
+            let v = R001ExecFromTmp
+                .evaluate(&spawn_as(uid, "payload", "/tmp/payload"))
+                .expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "uid {uid}");
+        }
     }
 
     #[test]

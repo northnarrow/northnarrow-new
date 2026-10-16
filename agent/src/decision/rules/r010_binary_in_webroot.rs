@@ -1,4 +1,7 @@
 //! R010 — Process executed from a web server document root.
+//!
+//! Lab PR 166: the executable is the payload itself, so the response is
+//! the tree, as for R001.
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
@@ -37,7 +40,7 @@ impl Rule for R010BinaryInWebroot {
         Some(build_verdict(
             self,
             event,
-            ResponseAction::KillProcess,
+            ResponseAction::KillProcessTree,
             Severity::High,
             "Process executed from web server document root — webshell indicator",
         ))
@@ -56,9 +59,18 @@ mod tests {
             let v = R010BinaryInWebroot
                 .evaluate(&spawn("payload", &path))
                 .unwrap_or_else(|| panic!("should fire on {path}"));
-            assert_eq!(v.action, ResponseAction::KillProcess);
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
             assert_eq!(v.severity, Severity::High);
         }
+    }
+
+    /// Lab PR 166: a webshell's forked children die with it.
+    #[test]
+    fn r010_kills_the_process_tree() {
+        let v = R010BinaryInWebroot
+            .evaluate(&spawn("payload", "/var/www/html/payload"))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     #[test]

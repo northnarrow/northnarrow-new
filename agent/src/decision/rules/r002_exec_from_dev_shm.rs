@@ -1,4 +1,7 @@
 //! R002 — Process executed from `/dev/shm/`.
+//!
+//! Lab PR 166: the executable is the payload itself, so the response is
+//! the tree, as for R001.
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
@@ -29,7 +32,7 @@ impl Rule for R002ExecFromDevShm {
         Some(build_verdict(
             self,
             event,
-            ResponseAction::KillProcess,
+            ResponseAction::KillProcessTree,
             Severity::High,
             "Process executed from /dev/shm/ — fileless malware indicator",
         ))
@@ -47,7 +50,16 @@ mod tests {
             .evaluate(&spawn("dropper", "/dev/shm/dropper"))
             .expect("fires");
         assert_eq!(v.severity, Severity::High);
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// Lab PR 166: the payload's forked children die with it.
+    #[test]
+    fn r002_kills_the_process_tree() {
+        let v = R002ExecFromDevShm
+            .evaluate(&spawn("dropper", "/dev/shm/dropper"))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     #[test]

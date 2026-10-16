@@ -30,10 +30,14 @@
 //! issue, kernel without BTF) lands `parent_is_kthread = false`,
 //! which falls through to the FIRE path — over-fire is acceptable,
 //! under-fire (missing a forged-kworker rootkit install) is not.
+//!
+//! Lab PR 166: a copy run from a staging directory is killed with its
+//! tree, as R001..R003 would ([`super::tool_kill`]); the tool anywhere
+//! else keeps the single-process kill.
 
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use common::{Event, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
@@ -67,6 +71,8 @@ impl Rule for R011KernelModuleTooling {
         let Event::ProcessSpawn {
             pid,
             comm,
+            filename,
+            exe,
             argv,
             parent_comm,
             parent_is_kthread,
@@ -143,7 +149,7 @@ impl Rule for R011KernelModuleTooling {
                 build_verdict(
                     self,
                     event,
-                    ResponseAction::KillProcess,
+                    super::tool_kill(exe.path_or(filename)),
                     Severity::High,
                     &reasoning,
                 ),
@@ -157,6 +163,7 @@ impl Rule for R011KernelModuleTooling {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::{spawn, spawn_full};
+    use common::ResponseAction;
 
     fn rule() -> R011KernelModuleTooling {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))
@@ -193,6 +200,21 @@ mod tests {
             assert_eq!(v.rule_id, "R011_KernelModuleTooling");
             assert_eq!(v.action, ResponseAction::KillProcess);
             assert_eq!(v.severity, Severity::High);
+        }
+    }
+
+    /// Lab PR 166: a staged copy is the payload itself and is killed with
+    /// its tree; the system's tool keeps the single-process kill.
+    #[test]
+    fn r011_staged_copy_kills_the_process_tree() {
+        for dir in ["/tmp/", "/var/tmp/", "/dev/shm/"] {
+            let path = format!("{dir}insmod");
+            let v = rule().evaluate(&spawn("insmod", &path)).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{path}");
+        }
+        for path in ["/usr/sbin/insmod", "/home/alice/insmod"] {
+            let v = rule().evaluate(&spawn("insmod", path)).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcess, "{path}");
         }
     }
 
@@ -448,7 +470,7 @@ mod tests {
         let t = package_transaction(dir.path());
         let staged = kmod_exec(&t, 0, "/var/tmp/modprobe");
         let v = shipped_with(t.clone()).evaluate(&staged).expect("fires");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
         let user = kmod_exec(&t, 1000, "/usr/sbin/modprobe");
         let v = shipped_with(t).evaluate(&user).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcess);

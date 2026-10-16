@@ -112,7 +112,7 @@ coverage percentage goes into external material.
 | rule_id | Q1 | unit | e2e | lab | campaign | status | notes |
 |---|---|---|---|---|---|---|---|
 | R004_ExecFromProcSelfFd | - | `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_proc_self_fd` | `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_memfd_fileless_exec_trips_r004` | `deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd` | no proof | e2e | The lab probe also checks the kill (exit status 137). |
-| R006_ReverseShellTooling | - | `agent/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool` | no proof | no proof | no proof | unit | Critical with KillProcess, not the tree. |
+| R006_ReverseShellTooling | - | `agent/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool` | no proof | no proof | no proof | unit | Critical with KillProcessTree since lab PR 166 (the shell `socat EXEC:` runs is its child). |
 | R007_CryptoMiner | - | `agent/src/decision/rules/r007_crypto_miner.rs::match_is_case_insensitive` | no proof | no proof | no proof | unit | - |
 | R018_KernelModuleLoad | - | `agent/src/decision/rules/r018_kernel_module_load.rs::fire_nonstandard_path_is_critical_killtree` | no proof | no proof | no proof | unit | Critical only for a module outside the module directories; anti-tamper.sh C16 loads an in-tree module. |
 | NN-L-FIM-001_SystemBinaryModified | yes | `agent/src/fim/rules.rs::fim001_fires_on_system_binary_modified` | no proof | no proof | no proof | unit | - |

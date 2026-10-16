@@ -63,7 +63,7 @@ fn exec_from_tmp_routes_to_r001() {
         .evaluate(&spawn("payload", "/tmp/payload"))
         .expect("should fire");
     assert_eq!(v.rule_id, "R001_ExecFromTmp");
-    assert_eq!(v.action, ResponseAction::KillProcess);
+    assert_eq!(v.action, ResponseAction::KillProcessTree);
     assert_eq!(v.severity, Severity::Medium);
     assert_eq!(v.event_pid, 1234);
     assert_eq!(v.event_filename, "/tmp/payload");
@@ -115,6 +115,7 @@ fn root_in_user_path_takes_priority_over_r001() {
         .expect("should fire");
     assert_eq!(v.rule_id, "R009_RootExecFromUserPath");
     assert_eq!(v.severity, Severity::High);
+    assert_eq!(v.action, ResponseAction::KillProcessTree);
 }
 
 #[test]
@@ -451,7 +452,7 @@ fn staging_kmod_tool_is_r011() {
         let v = engine.evaluate(&spawn("insmod", path)).expect(path);
         assert_eq!(v.rule_id, "R011_KernelModuleTooling", "{path}");
         assert_eq!(v.severity, Severity::High, "{path}");
-        assert_eq!(v.action, ResponseAction::KillProcess, "{path}");
+        assert_eq!(v.action, ResponseAction::KillProcessTree, "{path}");
         assert!(v.reasoning.contains("T1547.006"), "{}", v.reasoning);
     }
     let v = engine
@@ -489,7 +490,7 @@ fn a_log_rule_never_shadows_a_staging_kill() {
             .evaluate(&spawn_as(uid, comm, path))
             .unwrap_or_else(|| panic!("{path}"));
         assert_eq!(v.rule_id, rule, "{path}");
-        assert_eq!(v.action, ResponseAction::KillProcess, "{path}");
+        assert_eq!(v.action, ResponseAction::KillProcessTree, "{path}");
     }
 }
 
@@ -516,4 +517,54 @@ fn name_fragments_and_system_socat_are_recorded() {
         .evaluate(&spawn("xmrig", "/usr/local/bin/xmrig"))
         .expect("fires");
     assert_eq!(v.action, ResponseAction::KillProcessTree);
+}
+
+// ── Lab PR 166: an exec whose executable is the payload kills the tree ──
+
+/// The rules whose verdict is about the executed file itself: a staging
+/// directory, a user-writable path, a webroot, a copied shell, an
+/// offensive tool.
+const PAYLOAD_IMAGE_RULES: &[&str] = &[
+    "R001_ExecFromTmp",
+    "R002_ExecFromDevShm",
+    "R003_ExecFromVarTmp",
+    "R006_ReverseShellTooling",
+    "R009_RootExecFromUserPath",
+    "R010_BinaryInWebroot",
+    "R017_ShellFromNonstandardPath",
+];
+
+/// Lab PR 166: none of these rules kills a single process — a dropper
+/// that forked before the verdict kept its child running the payload —
+/// and no rule answers an exec from a staging directory with one (the
+/// tool rules R011..R013 outrank R001..R003 there). Each rule is seen
+/// killing a tree at least once, so the check is not vacuous.
+#[test]
+fn no_payload_image_rule_kills_a_single_process() {
+    let mut killed_a_tree = std::collections::BTreeSet::new();
+    for event in spawn_fixtures() {
+        let Event::ProcessSpawn { uid, filename, .. } = &event else {
+            unreachable!("spawn fixtures are spawns");
+        };
+        for v in super::rules::default_rules()
+            .iter()
+            .filter_map(|r| r.evaluate(&event))
+        {
+            let payload_rule = PAYLOAD_IMAGE_RULES.contains(&v.rule_id.as_str());
+            if payload_rule || super::rules::is_staging_path(filename) {
+                assert_ne!(
+                    v.action,
+                    ResponseAction::KillProcess,
+                    "{} on {filename} (uid {uid})",
+                    v.rule_id
+                );
+            }
+            if payload_rule && v.action == ResponseAction::KillProcessTree {
+                killed_a_tree.insert(v.rule_id);
+            }
+        }
+    }
+    let expected: std::collections::BTreeSet<String> =
+        PAYLOAD_IMAGE_RULES.iter().map(|r| r.to_string()).collect();
+    assert_eq!(killed_a_tree, expected);
 }

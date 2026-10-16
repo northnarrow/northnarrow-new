@@ -13,6 +13,15 @@
 //! the staging rules R001..R003, so `/tmp/bash` is attributed here
 //! (High) rather than to R001 (Medium); R004 (fileless, Critical), R009
 //! (root from a user path) and R010 (webroot) still come first.
+//!
+//! Lab PR 166: the copied shell is the payload itself, so the response is
+//! the tree, as for R001..R003. The allowlist and the trusted-actor record
+//! (PROC-008) are unchanged.
+//!
+//! External audit PROC-011 (lab PR 166): the trees only root can write
+//! where a distribution or an administrator installs a shell
+//! (`/usr/local/bin`, `/usr/sbin`, `/sbin`, `/nix/store`) are standard too;
+//! a script with `#!/usr/local/bin/bash` was killed.
 
 use std::sync::Arc;
 
@@ -25,9 +34,27 @@ use crate::decision::{rules::build_verdict, Rule};
 /// Interactive shell comms (design §7.1).
 const SHELL_COMMS: &[&str] = &["sh", "bash", "dash"];
 
-/// The only directories a system shell legitimately lives in per the
-/// design §7.1 trigger. A shell `comm` from anywhere else is flagged.
-const SHELL_STD_PREFIXES: &[&str] = &["/bin/", "/usr/bin/"];
+/// The directories a shell legitimately runs from; a shell `comm` from
+/// anywhere else is flagged. Each is writable by root only, so an
+/// unprivileged user gains nothing from the exemption.
+///
+/// - `/bin/`, `/usr/bin/`: the distribution's shells (design §7.1).
+/// - `/usr/local/bin/`: a shell an administrator built or installed
+///   (external audit PROC-011).
+/// - `/usr/sbin/`, `/sbin/`: the system's other binary directories, where
+///   a distribution may place a shell.
+/// - `/nix/store/`: every Nix-built shell, the system's included.
+///
+/// Not `/opt/`: an application user often owns its subtree. Not `/snap/`
+/// until a lab run shows what a snap shell looks like to the sensor.
+const SHELL_STD_PREFIXES: &[&str] = &[
+    "/bin/",
+    "/usr/bin/",
+    "/usr/local/bin/",
+    "/usr/sbin/",
+    "/sbin/",
+    "/nix/store/",
+];
 
 pub struct R017ShellFromNonstandardPath {
     allowlist: Arc<CommAllowlist>,
@@ -111,7 +138,7 @@ impl Rule for R017ShellFromNonstandardPath {
                 build_verdict(
                     self,
                     event,
-                    ResponseAction::KillProcess,
+                    ResponseAction::KillProcessTree,
                     Severity::High,
                     &reasoning,
                 ),
@@ -159,8 +186,56 @@ mod tests {
                 .evaluate(&spawn(comm, path))
                 .unwrap_or_else(|| panic!("should fire on {path}"));
             assert_eq!(v.rule_id, "R017_ShellFromNonstandardPath");
-            assert_eq!(v.action, ResponseAction::KillProcess);
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
             assert_eq!(v.severity, Severity::High);
+        }
+    }
+
+    /// Lab PR 166: a copied shell's children die with it.
+    #[test]
+    fn r017_kills_the_process_tree() {
+        let v = rule().evaluate(&spawn("sh", "/dev/shm/sh")).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// External audit PROC-011: an administrator's shell in /usr/local/bin
+    /// (a `#!/usr/local/bin/bash` script) is not flagged.
+    #[test]
+    fn shell_from_usr_local_bin_is_not_flagged() {
+        for path in [
+            "/usr/local/bin/bash",
+            "/usr/local/bin/sh",
+            "/usr/sbin/bash",
+            "/sbin/sh",
+        ] {
+            let comm = path.rsplit('/').next().unwrap();
+            assert!(rule().evaluate(&spawn(comm, path)).is_none(), "{path}");
+        }
+    }
+
+    /// External audit PROC-011: a Nix-built shell is not flagged.
+    #[test]
+    fn nix_store_shell_is_not_flagged() {
+        let path = "/nix/store/8c3x0yv5gq7h0kqz1dvl3j2p9q1m4r2s-bash-5.2p32/bin/bash";
+        assert!(rule().evaluate(&spawn("bash", path)).is_none());
+    }
+
+    /// External audit PROC-011: the trees anyone can write, and `/opt`,
+    /// stay flagged.
+    #[test]
+    fn writable_and_opt_shells_still_fire() {
+        for path in [
+            "/opt/evil/sh",
+            "/dev/shm/bash",
+            "/home/alice/.x/bash",
+            "/tmp/bash",
+            "/usr/local/lib/x/bash",
+        ] {
+            let comm = path.rsplit('/').next().unwrap();
+            let v = rule()
+                .evaluate(&spawn(comm, path))
+                .unwrap_or_else(|| panic!("should fire on {path}"));
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{path}");
         }
     }
 
@@ -221,7 +296,7 @@ mod tests {
         let v = r
             .evaluate(&spawn("bash", "/dev/shm/bash"))
             .expect("a copy in /dev/shm is not the allowlisted bash");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
         assert!(v.reasoning.contains("named 'bash'"), "{}", v.reasoning);
     }
 }

@@ -299,6 +299,10 @@ Now **recorded, not killed**:
 - R009: root scripts run from a home or `/tmp` in an administrator's sudo
   session at a terminal, and package scriptlets (NN-AUD-042 PROC-007, lab
   PR 86).
+- R017 no longer fires for a shell in `/usr/local/bin`, `/usr/sbin`,
+  `/sbin` or `/nix/store`, trees only root can write (a `bash` installed
+  in `/usr/local/bin` was killed at every login or `#!/usr/bin/env bash`
+  script; NN-AUD-299 PROC-011, lab PR 166).
 - Canaries: every access after the first, and a File or Credential canary
   read by a backup, anti-malware, indexing or sync program (add a generic
   tool such as `tar` or `rsync` in the signed `canary-readers.local`;
@@ -317,6 +321,13 @@ Now **killed, or answered, where they were recorded or missed**:
   `/tmp/insmod` is R011 (High, T1547.006), not R001 (Medium). A canary
   accessed in a way its type does not expect (a File decoy's path
   executed) draws NN-L-CANARY-001 instead of no verdict (lab PR 140).
+- The rules that kill an exec whose executable is the payload itself —
+  R001..R003, R009, R010, R017, R006, and R011..R013 for a copy in
+  `/tmp`, `/var/tmp` or `/dev/shm` — kill its process tree: a dropper's
+  forked children die with it (lab follow-up, lab PR 166).
+  **Regression:** more processes are killed, all of them descendants of
+  the exec (what it forked, the children it had when it executed the
+  payload in place); never its parent or siblings.
 - NN-L-NET-008 fires: the image is named at connect time, so a dropper's
   forked child that never execs is killed when it calls out. NN-L-NET-007
   and -018 treat IPv6 unique-local and link-local peers as internal
