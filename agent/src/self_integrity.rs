@@ -511,7 +511,12 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
 /// External audit DEP-004: the holds the watchdog recorded while the agent
 /// was down ([`common::watchdog_hold::HoldRecord`], one JSON line each) at
 /// `path` — a respawn that brought no agent back (a start job queued for a
-/// unit that then failed or was skipped) or the restart ceiling.
+/// unit that then failed or was skipped) or the restart ceiling. The same
+/// file carries the supervision events the watchdog cannot sign, each under
+/// its own kind: `admin_socket_vanished` (external audit WDG-007: the
+/// agent's admin socket gone after it answered — a frozen agent signs it
+/// after its recovery) and `respawn_argv_degraded` (WDG-008: the exec
+/// backend respawns with a recorded or the minimal argv).
 pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
     let Ok(body) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -519,10 +524,22 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
     body.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
-            let detail = match serde_json::from_str::<common::watchdog_hold::HoldRecord>(l) {
+            use common::watchdog_hold as wh;
+            let (kind, detail) = match serde_json::from_str::<wh::HoldRecord>(l) {
                 Ok(r) => {
+                    let (kind, what) = match r.reason.as_str() {
+                        wh::REASON_ADMIN_SOCKET_VANISHED => (
+                            "admin_socket_vanished",
+                            "the watchdog found the agent's admin socket gone",
+                        ),
+                        wh::REASON_RESPAWN_ARGV_DEGRADED => (
+                            "respawn_argv_degraded",
+                            "the watchdog could not capture the agent's argv for its respawns",
+                        ),
+                        _ => ("watchdog_hold", "the watchdog stopped respawning the agent"),
+                    };
                     let mut d = format!(
-                        "the watchdog stopped respawning the agent at {} (last agent pid {}): {}: {}",
+                        "{what} at {} (last agent pid {}): {}: {}",
                         r.at,
                         r.agent_pid,
                         r.reason,
@@ -534,17 +551,17 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             state.chars().take(256).collect::<String>()
                         ));
                     }
-                    d
+                    (kind, d)
                 }
-                Err(_) => format!(
-                    "the watchdog recorded a hold: {}",
-                    l.chars().take(300).collect::<String>()
+                Err(_) => (
+                    "watchdog_hold",
+                    format!(
+                        "the watchdog recorded a hold: {}",
+                        l.chars().take(300).collect::<String>()
+                    ),
                 ),
             };
-            Finding {
-                kind: "watchdog_hold",
-                detail,
-            }
+            Finding { kind, detail }
         })
         .collect()
 }
@@ -932,20 +949,7 @@ impl Checker {
     }
 
     fn append(&self, op: &str, extra: serde_json::Value, result: &str) {
-        let Some(log) = &self.audit_log else { return };
-        let draft = AuditEntryDraft {
-            op: op.to_string(),
-            extra,
-            key_fp: "agent-self".to_string(),
-            cosigner_fps: Vec::new(),
-            result: result.to_string(),
-            client_pid: std::process::id(),
-            client_uid: 0,
-            client_comm: "northnarrow-agent".to_string(),
-        };
-        if let Err(e) = log.lock().append(draft) {
-            warn!(error = format!("{e:#}"), "integrity: audit entry failed");
-        }
+        append_entry(self.audit_log.as_ref(), op, extra, result);
     }
 
     /// A `config_overlay` finding for a known overlay whose content carries
@@ -1061,6 +1065,48 @@ impl Checker {
             let _ = std::fs::remove_file(holds);
         }
     }
+}
+
+/// One signed entry of the agent itself (`key_fp` `agent-self`).
+fn append_entry(
+    audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    op: &str,
+    extra: serde_json::Value,
+    result: &str,
+) {
+    let Some(log) = audit_log else { return };
+    let draft = AuditEntryDraft {
+        op: op.to_string(),
+        extra,
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: result.to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = format!("{e:#}"), "integrity: audit entry failed");
+    }
+}
+
+/// A finding another task of the agent detected between two rounds (the
+/// admin socket's own watch, external audit WDG-007): an ERROR and one
+/// signed `integrity_drift`, as a round records one. The caller bounds
+/// how often.
+pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
+    error!(
+        kind = f.kind,
+        detail = %f.detail,
+        at_boot = false,
+        "INTEGRITY DRIFT — the agent's runtime state changed outside the agent"
+    );
+    append_entry(
+        audit_log,
+        AUDIT_OP,
+        serde_json::json!({ "kind": f.kind, "detail": f.detail, "at_boot": false }),
+        "detected",
+    );
 }
 
 /// Start the check (from `main`, once the audit log exists).
@@ -1199,6 +1245,72 @@ mod tests {
         );
         assert!(!f[1].detail.contains("[unit:"), "{}", f[1].detail);
         assert!(f[2].detail.contains("not json"), "{}", f[2].detail);
+    }
+
+    /// External audit WDG-007 / WDG-008: the supervision events the
+    /// watchdog records next to its holds are signed under their own kind,
+    /// not as a hold.
+    #[test]
+    fn watchdog_events_are_signed_under_their_own_kind() {
+        use common::watchdog_hold::{
+            HoldRecord, REASON_ADMIN_SOCKET_VANISHED, REASON_RESPAWN_ARGV_DEGRADED,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("watchdog.hold");
+        let ev = |reason: &str, detail: &str| HoldRecord {
+            at: 1_800_000_000,
+            agent_pid: 77,
+            reason: reason.to_string(),
+            detail: detail.to_string(),
+            unit_state: None,
+        };
+        let body = [
+            ev(
+                REASON_ADMIN_SOCKET_VANISHED,
+                "/run/northnarrow/admin.sock: nothing that is the agent answers there",
+            ),
+            ev(
+                REASON_RESPAWN_ARGV_DEGRADED,
+                "respawns use the minimal argv",
+            ),
+        ]
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap() + "\n")
+        .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+        let f = watchdog_holds(&path);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].kind, "admin_socket_vanished");
+        assert!(
+            f[0].detail.contains("admin socket gone") && f[0].detail.contains("pid 77"),
+            "{}",
+            f[0].detail
+        );
+        assert_eq!(f[1].kind, "respawn_argv_degraded");
+        assert!(
+            !f[1].detail.contains("stopped respawning"),
+            "{}",
+            f[1].detail
+        );
+    }
+
+    /// External audit WDG-007: a finding another task reports between two
+    /// rounds is one signed `integrity_drift`, like a round's.
+    #[test]
+    fn an_event_reported_between_rounds_is_signed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (checker, log_path) = checker_with_log(dir.path());
+        report_event(
+            checker.audit_log.as_ref(),
+            &Finding {
+                kind: "admin_socket_removed",
+                detail: "/run/northnarrow/admin.sock: removed".to_string(),
+            },
+        );
+        assert_eq!(
+            audit_ops(&log_path),
+            [(AUDIT_OP.to_string(), "admin_socket_removed".to_string())]
+        );
     }
 
     /// External audit ATP-001 / DEP-003: a COMBAT file is reported once it

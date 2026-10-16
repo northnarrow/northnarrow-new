@@ -848,17 +848,11 @@ pub enum AdminMessage {
     /// "Tell me the agent's posture + network state." Triggers
     /// [`StatusResponse`] reply.
     Status(StatusRequest),
-    /// Debug-only: force a posture transition. Triggers an empty
-    /// [`AdminMessage::DebugForcePostureAck`] reply on success.
-    #[cfg(feature = "debug-trigger")]
-    DebugForcePosture(DebugForcePosture),
 
     // ── server → client ────────────────────────────────────────
     Challenge(Challenge),
     UnlockResult(UnlockResult),
     StatusResponse(StatusResponse),
-    #[cfg(feature = "debug-trigger")]
-    DebugForcePostureAck,
 
     // ── Tappa 8 commit A7 — appended last to preserve every
     //    prior variant's postcard discriminant. New variants in
@@ -993,6 +987,20 @@ pub enum AdminMessage {
     ResponseRestoreRequest(ResponseRestoreRequest),
     /// Reply to [`AdminMessage::ResponseRestoreRequest`].
     ResponseRestoreResponse(ResponseRestoreResponse),
+
+    // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
+    // A `cfg` variant shifts the postcard discriminant of every variant
+    // after it: in the middle of the enum, a `debug-trigger` build (the
+    // lab's) read a production peer's `StatusResponse` as another variant
+    // — a lab agent's watchdog built without the feature never saw a ping
+    // answered. New production variants go ABOVE this block.
+    /// Debug-only: force a posture transition. Triggers an empty
+    /// [`AdminMessage::DebugForcePostureAck`] reply on success.
+    #[cfg(feature = "debug-trigger")]
+    DebugForcePosture(DebugForcePosture),
+    /// Debug-only reply to [`AdminMessage::DebugForcePosture`].
+    #[cfg(feature = "debug-trigger")]
+    DebugForcePostureAck,
 }
 
 /// Hard ceiling on a single frame's body length. Defends the
@@ -1259,6 +1267,39 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit ASK-016 (lab PR 170): the postcard discriminant of
+    /// the production variants is the same with and without
+    /// `debug-trigger` (the first byte of the encoding is the variant
+    /// index); the debug-only variants come last. Run in both feature sets
+    /// (CI: `cargo test -p northnarrow-common --features debug-trigger`).
+    #[test]
+    fn production_discriminants_do_not_depend_on_debug_trigger() {
+        let first = |m: &AdminMessage| postcard::to_allocvec(m).unwrap()[0];
+        assert_eq!(first(&AdminMessage::Status(StatusRequest {})), 2);
+        // after both debug-only variants in the old order: it moved by 2
+        // there (StatusResponse, the watchdog's, by 1)
+        assert_eq!(
+            first(&AdminMessage::ShutdownResult(AdminResult::RoleDenied)),
+            7,
+            "ShutdownResult"
+        );
+        let restore = AdminMessage::ResponseRestoreResponse(ResponseRestoreResponse {
+            result: AdminResult::RoleDenied,
+            restored: false,
+            path: String::new(),
+            message: String::new(),
+        });
+        assert_eq!(first(&restore), 49, "the last production variant");
+        #[cfg(feature = "debug-trigger")]
+        {
+            assert_eq!(
+                first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
+                50
+            );
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 51);
+        }
+    }
 
     fn roundtrip(msg: AdminMessage) {
         let bytes = encode_frame(&msg).expect("encode");

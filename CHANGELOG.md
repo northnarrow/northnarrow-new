@@ -61,6 +61,69 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, watchdog supervision (Low WDG-007 NN-AUD-358,
+  WDG-010 NN-AUD-360, WDG-008 NN-AUD-359, WDG-015 NN-AUD-364,
+  Informational WDG-019 NN-AUD-437; lab PR 170). Root could `rm
+  /run/northnarrow/admin.sock` (the directory is outside the inode deny
+  set) and then freeze the agent's cgroup: the watchdog read the missing
+  socket as "never came up", so the STATUS ping — what recovers a frozen
+  agent — never failed again, and `nn-admin` was dead until the next agent
+  start. The watchdog now remembers whether the agent it supervises
+  answered. A socket that never came up is still never a hang (the
+  2026-10-08 restart loop stays closed); one gone after an answer is
+  reported on the second ping 30 s later (ERROR on `watchdog.tamper`, a
+  `watchdog.hold` line with reason `admin_socket_vanished` that the agent
+  signs as `integrity_drift` `admin_socket_vanished`, after its recovery
+  when it was frozen) and recovered on the third (SIGINT, 5 s, evict and
+  SIGKILL, respawn). "Nothing listens" now also covers ECONNREFUSED and
+  ENOTDIR (a stale socket, a file or a directory at the path), which
+  counted as a hang; the answer must come from the supervised pid
+  (`SO_PEERCRED`), so a process that binds the path in the agent's place
+  is not an answer; nothing is pinged between an agent's death and the
+  next one. The agent records its socket's device and inode and looks at
+  the path every 10 s: a socket removed or replaced is a signed
+  `integrity_drift` (`admin_socket_removed`, at most one per 10 minutes,
+  with the count of the others) and is bound again at once, so a healthy
+  agent answers before the watchdog counts anything. Its bind removes
+  what sits at the path without following a link (a dangling link at the
+  name made `bind` fail), creates a missing parent 0700 and sets 0600
+  through an `O_PATH | O_NOFOLLOW` descriptor; it stops at shutdown, after
+  the agent's own unlink. WDG-015: the agent's and the watchdog's pidfiles
+  are written with the AUT-003 writer, moved to `common::atomic_file`
+  (the temporary name removed, created `O_CREAT | O_EXCL`, renamed, the
+  directory synced); `watchdog.pid.tmp` and `agent.pid.tmp.<pid>` were
+  opened through a link planted at the name by the processes the hooks
+  trust. WDG-008 (exec backend, non-systemd hosts): the argv captured from
+  `/proc` is kept at `/run/northnarrow/agent.argv` (0600; read back only
+  as a regular file of the watchdog's user closed to others) and used
+  when a later watchdog start cannot read `/proc`, with argv[0] the
+  verified binary; that fallback, or the minimal one when there is no
+  record, is a `respawn_argv_degraded` record the agent signs — not the
+  refusal to start the audit proposed, which would leave such a host with
+  no respawn at all. WDG-010 (exec backend): an exited agent the watchdog
+  started is collected through its pidfd (`waitid(P_PIDFD, WEXITED |
+  WNOHANG)`; ECHILD for an agent systemd started) — each respawned agent
+  stayed a zombie child. WDG-019: the comment of the pidfile retry loop
+  says what it does (every error retried to the deadline; EACCES on
+  `/proc/<pid>/exe` is transient by design, WDG-003) — no change of
+  behaviour. **Regressions / changes:** a running agent that cannot bind
+  its socket again (a directory planted at the path) is restarted once by
+  the watchdog about 90 s later — its successor then runs without admin
+  plane, as before, and is not restarted again; an agent with no admin
+  plane that leaves a stale socket file behind is no longer restarted
+  every minute; the temporary pidfiles are `.agent.pid.tmp` and
+  `.watchdog.pid.tmp`; the watchdog's absent-socket WARN no longer says
+  "(ENOENT)"; exec-backend hosts gain `/run/northnarrow/agent.argv`; new
+  signed kinds `admin_socket_removed`, `admin_socket_vanished`,
+  `respawn_argv_degraded`. Found by the watchdog's new e2e and fixed here, ASK-016 (Low
+  NN-AUD-242): the two `debug-trigger` variants of `AdminMessage` sat in
+  the middle of the enum and shifted the postcard discriminant of every
+  variant after them, so a `debug-trigger` build (the lab's agent) and a
+  build without it (the e2e's watchdog) misread each other's frames — the
+  watchdog decoded the agent's `StatusResponse` as another variant and
+  never saw a ping answered. They are the last variants now (production
+  discriminants unchanged), a test pins the production ones in both
+  feature sets, and CI runs it with `debug-trigger`.
 - External audit, Wave 3, evidence files and the telemetry probe (Low
   EVD-019 NN-AUD-281, EVD-015 NN-AUD-278; lab PR 169): `audit.log` and
   `chain_heads.json` were `0644` in the world-readable `/etc/northnarrow`,

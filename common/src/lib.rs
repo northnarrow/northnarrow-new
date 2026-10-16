@@ -46,6 +46,11 @@ pub mod ade_types;
 #[cfg(feature = "std")]
 pub mod admin_quorum;
 
+/// Replacing a file without writing through a planted link (external
+/// audit AUT-003, WDG-015).
+#[cfg(feature = "std")]
+pub mod atomic_file;
+
 /// Network addresses as the kernel records them, in canonical form
 /// (external audit NET-001: IPv4-mapped IPv6).
 #[cfg(feature = "std")]

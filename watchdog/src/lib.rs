@@ -320,19 +320,20 @@ pub fn pidfd_open(pid: u32) -> std::io::Result<RawFd> {
 /// `agent_pidfile` every [`PIDFD_OPEN_RETRY_INTERVAL`] until the
 /// file appears and the PID resolves OR until `deadline` elapses.
 ///
-/// Tolerated transient errors (treated as "agent hasn't fully
-/// come up yet, keep polling"):
-/// - pidfile missing (`NotFound`)
-/// - pidfile present but content not yet a valid u32
-/// - pidfd_open returns `ESRCH` (pidfile contained a stale PID
-///   from a crashed previous boot; agent hasn't rewritten yet)
-///
-/// Any other error short-circuits the loop (we don't want to
-/// poll forever on a misconfigured path).
+/// Every error is retried until `deadline`, then returned: the pidfile
+/// missing (`NotFound`) or not yet a valid u32, `pidfd_open` → `ESRCH` (a
+/// stale PID from a crashed previous boot the agent has not rewritten
+/// yet), and `EACCES`/`EPERM` on `/proc/<pid>/exe` — transient by design
+/// (external audit WDG-003: the read succeeds once the watchdog is in
+/// PROTECTED_PIDS, and a failed [`register_self_pid`] is healed by the
+/// agent's 30 s refresh). A misconfigured path therefore costs `deadline`
+/// and is then reported; failing fast on it would turn a boot-order race
+/// into a watchdog exit loop (external audit WDG-019, NN-AUD-437: this
+/// comment promised a short-circuit the loop never had).
 ///
 /// External audit WDG-003: the pid must run `agent_bin`
 /// ([`open_verified_agent`]); a pidfile naming any other process is
-/// waited out like a missing one, and reported.
+/// waited out like a missing one, and reported once as tamper.
 pub async fn open_agent_pidfd_with_retry(
     agent_pidfile: &Path,
     deadline: Duration,
@@ -404,40 +405,26 @@ pub async fn open_agent_pidfd_with_retry(
     }
 }
 
-/// Atomic pidfile write — tmpfile + fsync + `rename(2)`. Same
-/// pattern as `agent_id::load_or_bootstrap` (Tappa 8 A3) and
-/// `agent/src/main.rs` `write_pid_file`. Mode 0644 so the
-/// agent's W6 PROTECTED_PIDS widening (running as root) can
-/// read this trivially.
+/// Atomic pidfile write — tmpfile + fsync + `rename(2)`. Mode 0644 so the
+/// agent's W6 PROTECTED_PIDS widening (running as root) can read this
+/// trivially.
+///
+/// External audit WDG-015 (NN-AUD-364): the temporary file was opened at
+/// `<pidfile>.tmp` with `create(true).truncate(true)`, so a link planted at
+/// that name in `/run/northnarrow` (root-writable, outside the inode deny
+/// set) was written through by a process the hooks trust. It is now the
+/// agent's AUT-003 writer ([`common::atomic_file::write_pidfile`]): the
+/// temporary name is removed, created exclusively, renamed into place, and
+/// the directory synced.
 pub fn write_pidfile_atomic(path: &Path, pid: u32) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating pidfile parent {}", parent.display()))?;
         }
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp_path = PathBuf::from(tmp);
-
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o644)
-            .open(&tmp_path)
-            .with_context(|| format!("opening tmpfile {}", tmp_path.display()))?;
-        writeln!(f, "{pid}").with_context(|| format!("writing pid to {}", tmp_path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp_path.display()))?;
-    }
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
-    Ok(())
+    common::atomic_file::write_pidfile(path, pid)
+        .with_context(|| format!("writing pidfile {} (atomic replace)", path.display()))
 }
 
 /// Manual systemd `sd_notify(READY=1)` — sends a single Unix
@@ -575,6 +562,59 @@ pub async fn wait_for_agent_death(agent_pidfd: &OwnedFd) -> Result<()> {
         .await
         .context("awaiting agent pidfd POLLIN")?;
     Ok(())
+}
+
+/// What [`reap_agent`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reaped {
+    /// A child of the watchdog (the exec backend started it): its exit
+    /// status collected, the zombie gone. `code` is the exit code or the
+    /// signal number, as `si_code` says.
+    Collected { pid: u32, si_code: i32, code: i32 },
+    /// Not a child of the watchdog (systemd or an operator started it):
+    /// its parent collects it. The normal case on a systemd host.
+    NotOurChild,
+    /// A child that has not exited yet.
+    Running,
+}
+
+/// External audit WDG-010 (NN-AUD-360): the exec backend dropped each
+/// respawned agent's `Child` at once and nothing ever waited for it, so
+/// every respawned agent stayed a zombie child of the watchdog (inside the
+/// unit, `TasksMax=8`). Called once the pidfd reports the agent's exit:
+/// `waitid(P_PIDFD, fd, WEXITED | WNOHANG)` collects it through the pidfd
+/// already held — never by pid, which may have been reused. `ECHILD` (an
+/// agent the watchdog did not start) is [`Reaped::NotOurChild`].
+pub fn reap_agent(pidfd: &OwnedFd) -> std::io::Result<Reaped> {
+    // SAFETY: an all-zero siginfo_t is a valid value to pass to waitid.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid on a pidfd we hold, writing into `info`, which we own.
+    let ret = unsafe {
+        libc::waitid(
+            libc::P_PIDFD,
+            pidfd.as_raw_fd() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG,
+        )
+    };
+    if ret < 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ECHILD) => Ok(Reaped::NotOurChild),
+            _ => Err(e),
+        };
+    }
+    // SAFETY: waitid filled `info` (or left it zeroed under WNOHANG when
+    // the child has not exited: si_pid 0).
+    let (pid, code) = unsafe { (info.si_pid(), info.si_status()) };
+    if pid == 0 {
+        return Ok(Reaped::Running);
+    }
+    Ok(Reaped::Collected {
+        pid: pid as u32,
+        si_code: info.si_code,
+        code,
+    })
 }
 
 /// Perform the layer-2 PROTECTED_PIDS evict on confirmed agent
@@ -920,6 +960,157 @@ pub fn agent_argv_from_proc(pid: u32, agent_bin: Option<&Path>) -> Result<Vec<St
     Ok(argv)
 }
 
+/// External audit WDG-008 (NN-AUD-359): where the exec backend keeps the
+/// agent's last captured argv, next to the agent pidfile
+/// (`/run/northnarrow/agent.argv`; the watchdog unit may write only there,
+/// `ReadWritePaths=/run/northnarrow`).
+pub const AGENT_ARGV_FILE_NAME: &str = "agent.argv";
+
+/// Largest argv record read back.
+pub const AGENT_ARGV_MAX_BYTES: u64 = 64 * 1024;
+
+/// [`AGENT_ARGV_FILE_NAME`] beside `agent_pidfile`.
+pub fn agent_argv_record_path(agent_pidfile: &Path) -> PathBuf {
+    agent_pidfile.with_file_name(AGENT_ARGV_FILE_NAME)
+}
+
+/// Keep a successful capture: NUL-separated like `/proc/<pid>/cmdline`,
+/// 0600, with the AUT-003 writer (never through a link at the name).
+pub fn persist_agent_argv(path: &Path, argv: &[String]) -> Result<()> {
+    let mut body = Vec::new();
+    for arg in argv {
+        body.extend_from_slice(arg.as_bytes());
+        body.push(0);
+    }
+    common::atomic_file::replace(path, &body, 0o600)
+        .with_context(|| format!("recording the agent argv at {}", path.display()))
+}
+
+/// The argv [`persist_agent_argv`] kept: a regular file (a link is not
+/// followed), owned by the watchdog's user, closed to others, at most
+/// [`AGENT_ARGV_MAX_BYTES`], with at least the binary.
+pub fn read_persisted_agent_argv(path: &Path) -> Result<Vec<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let meta = f
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if !meta.file_type().is_file() {
+        return Err(anyhow!("{} is not a regular file", path.display()));
+    }
+    if meta.uid() != euid || meta.mode() & 0o077 != 0 {
+        return Err(anyhow!(
+            "{} is owned by uid {} with mode {:o}: not the watchdog's 0600 record",
+            path.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        ));
+    }
+    if meta.len() > AGENT_ARGV_MAX_BYTES {
+        return Err(anyhow!(
+            "{} is larger than {AGENT_ARGV_MAX_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    f.take(AGENT_ARGV_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let argv = parse_proc_cmdline(&bytes);
+    if argv.is_empty() {
+        return Err(anyhow!("{} is empty", path.display()));
+    }
+    Ok(argv)
+}
+
+/// Argv for the exec backend, captured once at the watchdog's start
+/// (external audit WDG-008, NN-AUD-359): the agent's full
+/// `/proc/<pid>/cmdline` (`--agent-bin` overriding argv[0]), kept at
+/// `record` for a later start of the watchdog; when /proc cannot be read
+/// (the agent exited between the pidfd open and the capture), the argv
+/// kept at `record` by an earlier capture, with argv[0] the binary the
+/// agent was verified to run; with neither, the minimal
+/// `[verified_bin, --pid-file, pidfile]`, which drops every other flag.
+/// Each fallback is a WARN and a record at `hold_path`
+/// ([`common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED`]) that the agent
+/// signs at its next round: every later respawn uses that argv. Only the
+/// exec backend (non-systemd hosts) calls this.
+pub fn exec_respawn_argv(
+    agent_pid: u32,
+    agent_bin: Option<&Path>,
+    verified_bin: &Path,
+    agent_pidfile: &Path,
+    hold_path: &Path,
+) -> Vec<String> {
+    let record = agent_argv_record_path(agent_pidfile);
+    let capture_error = match agent_argv_from_proc(agent_pid, agent_bin) {
+        Ok(argv) => {
+            if let Err(e) = persist_agent_argv(&record, &argv) {
+                warn!(
+                    target: "watchdog.respawn",
+                    error = format!("{e:#}"),
+                    "the agent argv was captured but not recorded; a later watchdog start that \
+                     cannot read /proc falls back to the minimal argv"
+                );
+            }
+            return argv;
+        }
+        Err(e) => e,
+    };
+    let (argv, source) = match read_persisted_agent_argv(&record) {
+        Ok(mut argv) => {
+            argv[0] = verified_bin.to_string_lossy().into_owned();
+            (argv, format!("the argv recorded at {}", record.display()))
+        }
+        Err(e) => (
+            vec![
+                verified_bin.to_string_lossy().into_owned(),
+                "--pid-file".to_string(),
+                agent_pidfile.to_string_lossy().into_owned(),
+            ],
+            format!(
+                "the minimal argv (flags such as --detect-only / --admin-pub do NOT survive a \
+                 respawn; no usable record: {e:#})"
+            ),
+        ),
+    };
+    warn!(
+        target: "watchdog.respawn",
+        error = format!("{capture_error:#}"),
+        args = ?argv,
+        "full argv capture from /proc failed — respawns use {source}"
+    );
+    let detail = format!(
+        "/proc/{agent_pid}/cmdline unreadable ({capture_error:#}); respawns use {source}: {argv:?}"
+    );
+    let rec = common::watchdog_hold::HoldRecord {
+        at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        agent_pid,
+        reason: common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED.to_string(),
+        detail,
+        unit_state: None,
+    };
+    if let Err(e) = record_hold(hold_path, &rec) {
+        warn!(
+            target: "watchdog.respawn",
+            error = format!("{e:#}"),
+            path = %hold_path.display(),
+            "could not record the degraded respawn argv for the agent's audit chain"
+        );
+    }
+    argv
+}
+
 /// First existing `systemctl` from [`SYSTEMCTL_CANDIDATES`].
 pub fn find_systemctl() -> Option<PathBuf> {
     SYSTEMCTL_CANDIDATES
@@ -971,8 +1162,9 @@ pub fn systemctl_start(unit: &str) -> Result<()> {
 }
 
 /// Bring the agent back through `backend`. For the exec backend the
-/// child handle is dropped immediately (the agent is tracked by pidfd,
-/// never by `waitpid`, same as before).
+/// child handle is dropped immediately: the agent is tracked by its pidfd,
+/// and collected through it once it exits ([`reap_agent`], external audit
+/// WDG-010).
 pub fn respawn_agent(backend: &RespawnBackend) -> Result<()> {
     match backend {
         RespawnBackend::SystemdUnit { unit } => systemctl_start(unit),
@@ -1402,40 +1594,91 @@ pub enum PingOutcome {
     /// First timeout in a row — log WARN, continue (per §4.1
     /// "STATUS reply timeout × 1 only → log WARN, continue").
     TimeoutOnce,
-    /// Threshold reached (default 2 consecutive). Caller should
-    /// kick off the stuck-recovery sequence
-    /// ([`stuck_recovery`]).
+    /// Threshold reached (default 2 consecutive timeouts, or
+    /// [`STATUS_PING_VANISHED_STUCK_AFTER`] pings without the agent's
+    /// socket after it had answered). Caller should kick off the
+    /// stuck-recovery sequence ([`stuck_recovery`]).
     StuckDetected,
-    /// The admin socket path does not exist (ENOENT on connect). The
-    /// agent is not *stuck* — it never opened the socket (or removed it
-    /// on a clean exit, which the pidfd path reports separately). This
-    /// never feeds the stuck threshold; `consecutive` counts how many
-    /// pings in a row saw the socket missing so the caller can escalate
-    /// the log level without ever SIGINT-ing a healthy agent.
+    /// Nothing that is the agent listens at the admin socket path, and the
+    /// agent has not answered since it started: it never opened the
+    /// socket (no admin plane, a slow start). This never feeds the stuck
+    /// threshold; `consecutive` counts how many pings in a row saw it so
+    /// the caller can escalate the log level without ever SIGINT-ing a
+    /// healthy agent.
     SocketAbsent { consecutive: u32 },
+    /// External audit WDG-007 (NN-AUD-358): the same, after the agent
+    /// answered — its socket was removed or replaced while it ran (a
+    /// healthy agent binds it again within
+    /// [`AGENT_SOCKET_REBIND_WITHIN`]). Counts toward stuck recovery:
+    /// [`STATUS_PING_VANISHED_STUCK_AFTER`] in a row are
+    /// [`PingOutcome::StuckDetected`].
+    SocketVanished { consecutive: u32 },
 }
 
 /// Why a STATUS ping failed, as far as the stuck-recovery policy cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PingFailure {
-    /// `connect(2)` → ENOENT: no socket file at the path. Misconfiguration
-    /// (the agent starts the admin socket only with a loadable COMBAT
-    /// ruleset and a valid admin.pub) or a clean agent exit — not a hang.
+    /// Nothing listens at the path: `connect(2)` → ENOENT (no file, or a
+    /// dangling link), ECONNREFUSED (a socket nobody listens on, or a
+    /// file or directory at the path), ENOTDIR. Not a hang — whether it
+    /// is a misconfiguration or a removal depends on whether the agent
+    /// answered before ([`StatusPingTracker::record_socket_absent`]).
     SocketAbsent,
-    /// Anything else: connect refused/reset, protocol error, or the
-    /// 2 s timeout — the agent is there but not answering.
+    /// Something answered that is not the agent the watchdog supervises
+    /// (external audit WDG-007: the peer's `SO_PEERCRED` pid; a process
+    /// that binds the path after removing the agent's socket can answer
+    /// STATUS itself). Handled like [`PingFailure::SocketAbsent`].
+    NotTheAgent,
+    /// Anything else: connect reset, protocol error, or the 2 s timeout —
+    /// the agent is there but not answering.
     Unresponsive,
 }
 
-/// Classify a [`ping_agent_status`] error by walking its source chain
-/// for an `io::Error` with `NotFound`.
+/// The STATUS answer came from a process other than the agent
+/// ([`ping_agent_status`] with an expected pid).
+#[derive(Debug)]
+pub struct NotTheAgent {
+    /// The peer's pid as the kernel recorded it at `listen(2)`.
+    pub peer_pid: Option<i32>,
+    /// The agent the watchdog supervises.
+    pub agent_pid: u32,
+}
+
+impl std::fmt::Display for NotTheAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.peer_pid {
+            Some(p) => write!(
+                f,
+                "the admin socket is served by pid {p}, not by the agent (pid {})",
+                self.agent_pid
+            ),
+            None => write!(
+                f,
+                "the admin socket's server has no pid in this namespace (agent pid {})",
+                self.agent_pid
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NotTheAgent {}
+
+/// Classify a [`ping_agent_status`] error by walking its source chain.
 pub fn classify_ping_error(e: &anyhow::Error) -> PingFailure {
-    let not_found = e.chain().any(|c| {
+    if e.chain().any(|c| c.downcast_ref::<NotTheAgent>().is_some()) {
+        return PingFailure::NotTheAgent;
+    }
+    let nothing_listens = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
-            .map(|io| io.kind() == std::io::ErrorKind::NotFound)
+            .map(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) || io.raw_os_error() == Some(libc::ENOTDIR)
+            })
             .unwrap_or(false)
     });
-    if not_found {
+    if nothing_listens {
         PingFailure::SocketAbsent
     } else {
         PingFailure::Unresponsive
@@ -1447,15 +1690,49 @@ pub fn classify_ping_error(e: &anyhow::Error) -> PingFailure {
 /// minutes without ever opening its admin socket.
 pub const STATUS_PING_ABSENT_ERROR_AFTER: u32 = 4;
 
+/// External audit WDG-007: how long a healthy agent takes at most to bind
+/// its admin socket again after it was removed (the agent checks its path
+/// every 10 s, `admin_socket::SOCKET_CHECK_EVERY`). Documentation of the
+/// thresholds below; the watchdog does not wait on it.
+pub const AGENT_SOCKET_REBIND_WITHIN: Duration = Duration::from_secs(10);
+
+/// External audit WDG-007: a vanished socket on this many pings in a row
+/// (≥ 30 s without the socket, three times
+/// [`AGENT_SOCKET_REBIND_WITHIN`]) is reported as tamper — an ERROR on
+/// `watchdog.tamper` and a record the agent signs
+/// ([`common::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED`]). Not on the
+/// first: a ping can land between the agent's clean unlink at shutdown and
+/// its exit, or inside the rebind window.
+pub const STATUS_PING_VANISHED_TAMPER_AFTER: u32 = 2;
+
+/// External audit WDG-007: a vanished socket on this many pings in a row
+/// (≥ 60 s without the socket an agent rebinds within 10 s) is a stuck
+/// agent: a frozen one cannot bind it again, and its STATUS ping —
+/// what recovers a frozen agent — would otherwise never fail again.
+pub const STATUS_PING_VANISHED_STUCK_AFTER: u32 = 3;
+
 /// Sliding-counter state machine that tracks consecutive
 /// STATUS-ping timeouts. Reset on any successful ping. Threshold
 /// configurable for tests so we don't have to hardcode 2 in
 /// every assertion.
+///
+/// External audit WDG-007 (NN-AUD-358): it also remembers whether the
+/// agent it watches answered once. A socket that never came up is a
+/// misconfiguration ([`PingOutcome::SocketAbsent`], never stuck — the
+/// 2026-10-08 restart loop); a socket that left after the agent answered
+/// is [`PingOutcome::SocketVanished`] and feeds stuck recovery. Root could
+/// `rm` the socket (`/run/northnarrow` is outside the inode deny set) and
+/// freeze the agent's cgroup: the watchdog read "never came up" and
+/// recovered nothing.
 #[derive(Debug, Clone)]
 pub struct StatusPingTracker {
     consecutive_timeouts: u8,
     threshold: u8,
     consecutive_absent: u32,
+    /// The agent watched answered a STATUS ping at least once.
+    answered: bool,
+    consecutive_vanished: u32,
+    vanished_threshold: u32,
 }
 
 impl StatusPingTracker {
@@ -1471,25 +1748,45 @@ impl StatusPingTracker {
             consecutive_timeouts: 0,
             threshold,
             consecutive_absent: 0,
+            answered: false,
+            consecutive_vanished: 0,
+            vanished_threshold: STATUS_PING_VANISHED_STUCK_AFTER,
         }
     }
 
-    /// Record a successful ping. Resets the counters; returns
-    /// [`PingOutcome::Ok`].
+    /// Record a successful ping. Resets the counters and remembers that
+    /// this agent answered; returns [`PingOutcome::Ok`].
     pub fn record_ok(&mut self) -> PingOutcome {
         self.consecutive_timeouts = 0;
         self.consecutive_absent = 0;
+        self.consecutive_vanished = 0;
+        self.answered = true;
         PingOutcome::Ok
     }
 
-    /// The socket file is missing. Does NOT touch the stuck counter:
-    /// an agent that never opened its admin socket is misconfigured,
-    /// not hung, and SIGINT-ing it only produces a restart loop (seen on
-    /// the lab guest with a missing combat-rules.v4, 2026-10-08).
+    /// Nothing that is the agent listens at the path. Before the agent
+    /// ever answered this does NOT touch the stuck counters: an agent that
+    /// never opened its admin socket is misconfigured, not hung, and
+    /// SIGINT-ing it only produces a restart loop (seen on the lab guest
+    /// with a missing combat-rules.v4, 2026-10-08). After it answered, the
+    /// socket was taken away while it ran (external audit WDG-007):
+    /// [`PingOutcome::SocketVanished`], and
+    /// [`STATUS_PING_VANISHED_STUCK_AFTER`] in a row are
+    /// [`PingOutcome::StuckDetected`].
     pub fn record_socket_absent(&mut self) -> PingOutcome {
-        self.consecutive_absent = self.consecutive_absent.saturating_add(1);
-        PingOutcome::SocketAbsent {
-            consecutive: self.consecutive_absent,
+        if !self.answered {
+            self.consecutive_absent = self.consecutive_absent.saturating_add(1);
+            return PingOutcome::SocketAbsent {
+                consecutive: self.consecutive_absent,
+            };
+        }
+        self.consecutive_vanished = self.consecutive_vanished.saturating_add(1);
+        if self.consecutive_vanished >= self.vanished_threshold {
+            PingOutcome::StuckDetected
+        } else {
+            PingOutcome::SocketVanished {
+                consecutive: self.consecutive_vanished,
+            }
         }
     }
 
@@ -1508,16 +1805,27 @@ impl StatusPingTracker {
         }
     }
 
-    /// Reset the counter (e.g., after a stuck-recovery cycle so
-    /// the new respawned agent gets a fresh ping budget).
+    /// Reset the tracker for a new agent, or after a stuck signal so the
+    /// respawned agent gets a fresh ping budget: the counters, and whether
+    /// the agent answered (external audit WDG-007: the next agent has to
+    /// answer before its socket can "vanish").
     pub fn reset(&mut self) {
         self.consecutive_timeouts = 0;
+        self.consecutive_absent = 0;
+        self.consecutive_vanished = 0;
+        self.answered = false;
     }
 
     /// Snapshot of the consecutive-timeout counter. Used by log
     /// lines + tests.
     pub fn consecutive_timeouts(&self) -> u8 {
         self.consecutive_timeouts
+    }
+
+    /// The agent watched answered since its start (or the last
+    /// [`Self::reset`]).
+    pub fn answered(&self) -> bool {
+        self.answered
     }
 }
 
@@ -1539,11 +1847,33 @@ impl Default for StatusPingTracker {
 /// Per design §3.3 the watchdog inspects only **reply latency**,
 /// not contents. The match against `StatusResponse` is purely
 /// for protocol-shape validation — content fields are ignored.
-pub async fn ping_agent_status(socket_path: &Path, timeout: Duration) -> Result<()> {
+///
+/// External audit WDG-007: with `agent_pid`, the server must be that
+/// process (`SO_PEERCRED`, recorded by the kernel when the server called
+/// `listen(2)`); any other server is a [`NotTheAgent`] error before a
+/// byte is sent. A root process that removed the agent's socket could
+/// otherwise bind its own and answer for a frozen agent.
+pub async fn ping_agent_status(
+    socket_path: &Path,
+    timeout: Duration,
+    agent_pid: Option<u32>,
+) -> Result<()> {
     let fut = async {
         let mut stream = UnixStream::connect(socket_path)
             .await
             .with_context(|| format!("connect {}", socket_path.display()))?;
+        if let Some(agent_pid) = agent_pid {
+            let peer_pid = stream
+                .peer_cred()
+                .context("SO_PEERCRED on the admin socket")?
+                .pid();
+            if peer_pid != Some(agent_pid as i32) {
+                return Err(anyhow::Error::new(NotTheAgent {
+                    peer_pid,
+                    agent_pid,
+                }));
+            }
+        }
 
         let req = AdminMessage::Status(StatusRequest {});
         let bytes = encode_frame(&req).map_err(|e| anyhow!("encode_frame: {e}"))?;
@@ -1832,16 +2162,35 @@ mod tests {
         let read = read_pid_from_file(&p).unwrap();
         assert_eq!(read, 12345);
 
-        let tmp = {
-            let mut s = p.as_os_str().to_owned();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
-        assert!(
-            !tmp.exists(),
-            "atomic write must clean up its .tmp file: {}",
-            tmp.display()
-        );
+        for tmp in ["watchdog.pid.tmp", ".watchdog.pid.tmp"] {
+            let tmp = dir.path().join(tmp);
+            assert!(
+                !tmp.exists(),
+                "atomic write must clean up its temporary file: {}",
+                tmp.display()
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    /// External audit WDG-015 (NN-AUD-364): a link planted at the temporary
+    /// name (the old `watchdog.pid.tmp` and the new `.watchdog.pid.tmp`) is
+    /// replaced, never written through.
+    #[test]
+    fn write_pidfile_atomic_replaces_a_planted_link() {
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("audit.log");
+        std::fs::write(&victim, "CHAIN").unwrap();
+        for name in ["watchdog.pid.tmp", ".watchdog.pid.tmp"] {
+            std::os::unix::fs::symlink(&victim, dir.path().join(name)).unwrap();
+        }
+        let p = dir.path().join("watchdog.pid");
+        write_pidfile_atomic(&p, 4242).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "CHAIN");
+        assert_eq!(read_pid_from_file(&p).unwrap(), 4242);
+        assert!(std::fs::symlink_metadata(&p).unwrap().file_type().is_file());
     }
 
     /// sd_notify_ready is a no-op when NOTIFY_SOCKET is unset
@@ -2598,9 +2947,11 @@ mod tests {
         t.record_socket_absent();
         t.record_socket_absent();
         assert_eq!(t.record_ok(), PingOutcome::Ok);
+        // External audit WDG-007: once the agent answered, a missing
+        // socket is a vanished one, counted from 1.
         assert_eq!(
             t.record_socket_absent(),
-            PingOutcome::SocketAbsent { consecutive: 1 }
+            PingOutcome::SocketVanished { consecutive: 1 }
         );
     }
 
@@ -2609,23 +2960,306 @@ mod tests {
         let io = std::io::Error::new(std::io::ErrorKind::NotFound, "nope");
         let e = anyhow::Error::from(io).context("connect /run/northnarrow/admin.sock");
         assert_eq!(classify_ping_error(&e), PingFailure::SocketAbsent);
+        // External audit WDG-007: a socket nobody listens on (or a file at
+        // the path) is "nothing listens", not a hang.
         let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "nope");
         let e = anyhow::Error::from(io).context("connect");
+        assert_eq!(classify_ping_error(&e), PingFailure::SocketAbsent);
+        let io = std::io::Error::from_raw_os_error(libc::ENOTDIR);
+        let e = anyhow::Error::from(io).context("connect");
+        assert_eq!(classify_ping_error(&e), PingFailure::SocketAbsent);
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "nope");
+        let e = anyhow::Error::from(io).context("reading reply frame header");
         assert_eq!(classify_ping_error(&e), PingFailure::Unresponsive);
         assert_eq!(
             classify_ping_error(&anyhow!("reply body length exceeds")),
             PingFailure::Unresponsive
         );
+        let e = anyhow::Error::new(NotTheAgent {
+            peer_pid: Some(7),
+            agent_pid: 42,
+        })
+        .context("STATUS ping");
+        assert_eq!(classify_ping_error(&e), PingFailure::NotTheAgent);
+    }
+
+    /// External audit WDG-007: `connect` to a path that holds a stale
+    /// socket, a regular file or a directory fails with ECONNREFUSED —
+    /// "nothing listens" — like a missing path.
+    #[tokio::test]
+    async fn nothing_listening_at_the_path_is_absent_not_unresponsive() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let file = dir.path().join("file.sock");
+        std::fs::write(&file, "").unwrap();
+        let sub = dir.path().join("dir.sock");
+        std::fs::create_dir(&sub).unwrap();
+        let dangling = dir.path().join("dangling.sock");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        for path in [&stale, &file, &sub, &dangling] {
+            let err = ping_agent_status(path, Duration::from_secs(1), Some(1))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                classify_ping_error(&err),
+                PingFailure::SocketAbsent,
+                "{}: {err:#}",
+                path.display()
+            );
+        }
+    }
+
+    /// External audit WDG-007: a server that is not the agent — a process
+    /// that bound the path after removing the agent's socket — is refused
+    /// before a request is sent, whatever it would answer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_status_answer_from_another_process_is_not_the_agent() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("impostor.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let not_us = std::process::id() + 1;
+        let err = ping_agent_status(&socket, Duration::from_secs(2), Some(not_us))
+            .await
+            .unwrap_err();
+        assert_eq!(classify_ping_error(&err), PingFailure::NotTheAgent);
+        assert!(
+            format!("{err:#}").contains(&format!("served by pid {}", std::process::id())),
+            "{err:#}"
+        );
+    }
+
+    // ── External audit WDG-007: never seen vs. vanished ────────────
+    #[test]
+    fn socket_never_seen_is_not_stuck() {
+        let mut t = StatusPingTracker::new();
+        for i in 1..=20u32 {
+            assert_eq!(
+                t.record_socket_absent(),
+                PingOutcome::SocketAbsent { consecutive: i }
+            );
+        }
+        assert!(!t.answered());
+        assert_eq!(t.consecutive_timeouts(), 0);
+    }
+
+    #[test]
+    fn socket_vanished_after_an_answer_feeds_recovery() {
+        let mut t = StatusPingTracker::new();
+        assert_eq!(t.record_ok(), PingOutcome::Ok);
+        for i in 1..STATUS_PING_VANISHED_STUCK_AFTER {
+            assert_eq!(
+                t.record_socket_absent(),
+                PingOutcome::SocketVanished { consecutive: i }
+            );
+        }
+        assert_eq!(t.record_socket_absent(), PingOutcome::StuckDetected);
+        // The thresholds keep their order: tamper report first, then
+        // recovery, and the healthy agent's rebind window well inside.
+        const {
+            assert!(STATUS_PING_VANISHED_TAMPER_AFTER < STATUS_PING_VANISHED_STUCK_AFTER);
+            assert!(
+                STATUS_PING_INTERVAL.as_secs() * (STATUS_PING_VANISHED_STUCK_AFTER as u64 - 1)
+                    >= 3 * AGENT_SOCKET_REBIND_WITHIN.as_secs()
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_that_comes_back_ends_the_vanished_streak() {
+        let mut t = StatusPingTracker::new();
+        t.record_ok();
+        assert_eq!(
+            t.record_socket_absent(),
+            PingOutcome::SocketVanished { consecutive: 1 }
+        );
+        // The agent bound it again.
+        assert_eq!(t.record_ok(), PingOutcome::Ok);
+        for i in 1..STATUS_PING_VANISHED_STUCK_AFTER {
+            assert_eq!(
+                t.record_socket_absent(),
+                PingOutcome::SocketVanished { consecutive: i }
+            );
+        }
+    }
+
+    #[test]
+    fn reset_forgets_the_answer() {
+        let mut t = StatusPingTracker::new();
+        t.record_ok();
+        t.record_socket_absent();
+        t.reset();
+        assert!(!t.answered());
+        // A new agent whose socket is not up yet is not stuck.
+        for i in 1..=10u32 {
+            assert_eq!(
+                t.record_socket_absent(),
+                PingOutcome::SocketAbsent { consecutive: i }
+            );
+        }
     }
 
     #[tokio::test]
     async fn missing_socket_ping_error_classifies_as_absent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent.sock");
-        let err = ping_agent_status(&path, Duration::from_secs(1))
+        let err = ping_agent_status(&path, Duration::from_secs(1), Some(1))
             .await
             .unwrap_err();
         assert_eq!(classify_ping_error(&err), PingFailure::SocketAbsent);
+    }
+
+    // ── External audit WDG-010: reaping exec-backend children ──────
+    #[test]
+    fn reap_ignores_echild() {
+        // PID 1 is never our child: its pidfd can be opened, not reaped.
+        let raw = pidfd_open(1).expect("pidfd_open(1)");
+        // SAFETY: pidfd_open returned this fd to us.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert_eq!(reap_agent(&fd).unwrap(), Reaped::NotOurChild);
+    }
+
+    #[test]
+    fn reap_collects_an_exited_child_through_its_pidfd() {
+        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let pid = child.id();
+        let raw = pidfd_open(pid).expect("pidfd_open(child)");
+        // SAFETY: pidfd_open returned this fd to us.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pidfd_exited(&fd) {
+            assert!(Instant::now() < deadline, "the child never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Exited and not collected: a zombie until reap_agent.
+        let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        assert!(state.contains(") Z "), "{state}");
+        assert_eq!(
+            reap_agent(&fd).unwrap(),
+            Reaped::Collected {
+                pid,
+                si_code: libc::CLD_EXITED,
+                code: 7
+            }
+        );
+        assert!(!Path::new(&format!("/proc/{pid}")).exists(), "zombie left");
+        // Nothing left to collect (Child::try_wait sees ECHILD too).
+        assert_eq!(reap_agent(&fd).unwrap(), Reaped::NotOurChild);
+        assert!(child.try_wait().is_err());
+    }
+
+    #[test]
+    fn reap_leaves_a_running_child_alone() {
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        let raw = pidfd_open(child.id()).expect("pidfd_open(child)");
+        // SAFETY: pidfd_open returned this fd to us.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        assert_eq!(reap_agent(&fd).unwrap(), Reaped::Running);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    // ── External audit WDG-008: the exec backend's argv ─────────────
+    /// A pid that does not exist (pid_max is at most 2^22).
+    const NO_SUCH_PID: u32 = 4_194_304 + 17;
+
+    #[test]
+    fn exec_argv_records_the_capture_and_prefers_it_later() {
+        let dir = TempDir::new().unwrap();
+        let pidfile = dir.path().join("agent.pid");
+        let holds = dir.path().join("watchdog.hold");
+        let bin = Path::new("/usr/local/bin/northnarrow-agent");
+        // A capture that works (this process) is recorded, 0600.
+        let own = exec_respawn_argv(std::process::id(), Some(bin), bin, &pidfile, &holds);
+        assert_eq!(own[0], bin.to_string_lossy());
+        let record = agent_argv_record_path(&pidfile);
+        assert_eq!(record, dir.path().join(AGENT_ARGV_FILE_NAME));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!holds.exists(), "a successful capture records no event");
+        // An agent gone before its capture: the recorded argv, argv[0] the
+        // verified binary, and a record for the agent to sign.
+        persist_agent_argv(
+            &record,
+            &[
+                "/old/northnarrow-agent".to_string(),
+                "--detect-only".to_string(),
+                "--admin-pub".to_string(),
+                "/etc/northnarrow/admin.pub".to_string(),
+            ],
+        )
+        .unwrap();
+        let verified = Path::new("/usr/local/bin/northnarrow-agent.verified");
+        let argv = exec_respawn_argv(NO_SUCH_PID, None, verified, &pidfile, &holds);
+        assert_eq!(
+            argv,
+            [
+                "/usr/local/bin/northnarrow-agent.verified",
+                "--detect-only",
+                "--admin-pub",
+                "/etc/northnarrow/admin.pub"
+            ]
+        );
+        let line = std::fs::read_to_string(&holds).unwrap();
+        let rec: common::watchdog_hold::HoldRecord =
+            serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            rec.reason,
+            common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED
+        );
+        assert_eq!(rec.agent_pid, NO_SUCH_PID);
+        assert!(rec.detail.contains("--detect-only"), "{}", rec.detail);
+    }
+
+    #[test]
+    fn exec_argv_records_a_degraded_fallback() {
+        let dir = TempDir::new().unwrap();
+        let pidfile = dir.path().join("agent.pid");
+        let holds = dir.path().join("watchdog.hold");
+        let verified = Path::new("/usr/local/bin/northnarrow-agent");
+        // No record: the minimal argv, recorded as degraded.
+        let argv = exec_respawn_argv(NO_SUCH_PID, None, verified, &pidfile, &holds);
+        assert_eq!(
+            argv,
+            [
+                verified.to_string_lossy().into_owned(),
+                "--pid-file".to_string(),
+                pidfile.to_string_lossy().into_owned()
+            ]
+        );
+        let body = std::fs::read_to_string(&holds).unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(body.contains(common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED));
+        assert!(body.contains("minimal argv"), "{body}");
+    }
+
+    #[test]
+    fn a_planted_argv_record_is_not_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let record = dir.path().join(AGENT_ARGV_FILE_NAME);
+        // A link at the name is not followed.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"/bin/sh\0-c\0id\0").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+        assert!(read_persisted_agent_argv(&record).is_err());
+        // A record others can write is not the watchdog's.
+        std::fs::remove_file(&record).unwrap();
+        persist_agent_argv(&record, &["/a".to_string()]).unwrap();
+        assert_eq!(read_persisted_agent_argv(&record).unwrap(), ["/a"]);
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_persisted_agent_argv(&record).is_err());
+        // Neither is an empty one, or a directory.
+        std::fs::remove_file(&record).unwrap();
+        persist_agent_argv(&record, &[]).unwrap();
+        assert!(read_persisted_agent_argv(&record).is_err());
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        assert!(read_persisted_agent_argv(&record).is_err());
     }
 
     #[test]
@@ -2802,7 +3436,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("never_bound.sock");
         let start = Instant::now();
-        let result = ping_agent_status(&socket, Duration::from_secs(5)).await;
+        let result = ping_agent_status(&socket, Duration::from_secs(5), None).await;
         let elapsed = start.elapsed();
         assert!(result.is_err(), "missing socket must error");
         // Connect fail is near-instant; well under the 5 s
@@ -2864,7 +3498,9 @@ mod tests {
         // Give the listener a tick to be ready.
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        ping_agent_status(&socket, Duration::from_secs(2))
+        // External audit WDG-007: the server is this process, so the ping
+        // expecting it succeeds.
+        ping_agent_status(&socket, Duration::from_secs(2), Some(std::process::id()))
             .await
             .expect("ping must succeed against mock server");
 

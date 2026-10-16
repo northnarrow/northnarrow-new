@@ -132,6 +132,12 @@ jobs:
       - name: Compile privileged_e2e module (test-privileged)
         run: cargo test --workspace --no-run --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger --verbose
 
+      # External audit ASK-016 (lab PR 170): the wire's production
+      # discriminants must not move with `debug-trigger` (a lab agent and a
+      # watchdog built without it must still read each other's frames).
+      - name: Wire discriminants with debug-trigger
+        run: cargo test --locked -p northnarrow-common --features debug-trigger --lib wire::admin_protocol
+
   ade-build:
     # Tappa 6 — verifies the ADE module compiles cleanly without
     # ever pulling a GGUF model or any C++ dependency. The default
