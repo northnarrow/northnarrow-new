@@ -15,7 +15,7 @@
 pub(crate) use northnarrow_common::btf_offsets::*;
 
 use aya_ebpf::{macros::map, maps::Array};
-use northnarrow_common::btf_offsets::{BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, BTF_OFFSETS_SLOTS};
+use northnarrow_common::btf_offsets::{BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC, BTF_OFFSETS_SLOTS, HOOK_ARG_MAX};
 
 /// Runtime offset table, written by the agent before any program is
 /// attached (multi-kernel, level 1). Slot 0 carries
@@ -51,6 +51,24 @@ pub fn rt_opt(slot: u32, default: usize) -> Option<usize> {
             None => Some(default),
         },
         _ => Some(default),
+    }
+}
+
+/// Position of an LSM hook argument in the hook's context, resolved by
+/// the agent from the running kernel's prototype (lab PR 164,
+/// `HOOK_ARGS`). `None` when the map is not armed, when the agent marked
+/// the slot absent (a prototype of another shape), or for a value out of
+/// bounds: unlike the offsets there is no compiled fallback, because a
+/// guessed position reads another argument (`inode_setattr`'s dentry is
+/// argument 0 up to 6.8 and argument 1 from 6.9).
+#[inline(always)]
+pub fn hook_arg(slot: u32) -> Option<usize> {
+    match BTF_OFFSETS.get(0) {
+        Some(magic) if *magic == BTF_OFFSETS_MAGIC => match BTF_OFFSETS.get(slot) {
+            Some(v) if *v < HOOK_ARG_MAX => Some(*v as usize),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

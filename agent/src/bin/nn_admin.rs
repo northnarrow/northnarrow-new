@@ -2066,7 +2066,7 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
             .collect();
         println!(
-            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{}}}",
+            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{},\"flow_sock_pending\":{},\"flow_sock_capacity\":{},\"flow_sock_forgotten_min\":{}}}",
             opt(out.netflow_rows_skipped_total),
             opt(out.netflow_pending_evicted_total),
             drops.join(","),
@@ -2075,6 +2075,9 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             } else {
                 "null".to_string()
             },
+            opt(out.flow_sock_pending),
+            opt(out.flow_sock_capacity),
+            opt(out.flow_sock_forgotten_min),
         );
         return;
     }
@@ -2089,6 +2092,7 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
         Some(n) => println!("pending connects evicted at capacity  : {n}"),
         None => println!("pending connects evicted at capacity  : (agent predates the counter)"),
     }
+    println!("{}", flow_sock_line(out));
     if drops.is_empty() {
         println!("network ring drops                    : none");
     } else {
@@ -2106,6 +2110,28 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             }
         }
         None => println!("inactive network rules                : (agent predates the field)"),
+    }
+}
+
+/// Lab PR 164: the kernel's connect→close socket map, for `net status`.
+fn flow_sock_line(out: &StatusOutcome) -> String {
+    match (out.flow_sock_pending, out.flow_sock_capacity) {
+        (Some(p), Some(c)) if c > 0 => {
+            let mut line = format!(
+                "kernel FLOW_SOCK_MAP                  : {p} sockets without their close yet, \
+                 of {c} ({} %)",
+                p.min(c) * 100 / c
+            );
+            match out.flow_sock_forgotten_min {
+                Some(f) if f > 0 => line.push_str(&format!(
+                    "; at least {f} forgotten (their closes are not recorded)"
+                )),
+                _ => {}
+            }
+            line
+        }
+        _ => "kernel FLOW_SOCK_MAP                  : (unknown: agent predates the counters)"
+            .to_string(),
     }
 }
 
@@ -3511,5 +3537,53 @@ mod roles_csv_tests {
             parse_roles_csv("unlock,unlock").unwrap(),
             vec![Role::Unlock]
         );
+    }
+}
+
+#[cfg(test)]
+mod flow_sock_line_tests {
+    use super::flow_sock_line;
+    use northnarrow_agent::admin_cli::StatusOutcome;
+
+    fn outcome(
+        pending: Option<u64>,
+        capacity: Option<u64>,
+        forgotten: Option<u64>,
+    ) -> StatusOutcome {
+        StatusOutcome {
+            posture: common::posture_types::PostureKind::Observing,
+            network_isolation_engaged: false,
+            last_admin_action_secs_ago: None,
+            ringbuf_drops_total: None,
+            ringbuf_drops: Vec::new(),
+            combat_stage: None,
+            combat_locked: None,
+            ringbuf_rejected_total: None,
+            ringbuf_rejected: Vec::new(),
+            netflow_rows_skipped_total: None,
+            netflow_pending_evicted_total: None,
+            net_inactive_rules: None,
+            flow_sock_pending: pending,
+            flow_sock_capacity: capacity,
+            flow_sock_forgotten_min: forgotten,
+        }
+    }
+
+    /// Lab PR 164: occupancy, and the forgotten sockets once beyond capacity.
+    #[test]
+    fn net_status_reports_the_kernel_socket_map() {
+        let l = flow_sock_line(&outcome(Some(6_553), Some(65_536), Some(0)));
+        assert!(
+            l.contains("6553 sockets without their close yet, of 65536 (9 %)"),
+            "{l}"
+        );
+        assert!(!l.contains("forgotten"));
+        let l = flow_sock_line(&outcome(Some(70_000), Some(65_536), Some(4_464)));
+        assert!(
+            l.contains("(100 %)") && l.contains("at least 4464 forgotten"),
+            "{l}"
+        );
+        let l = flow_sock_line(&outcome(None, None, None));
+        assert!(l.contains("unknown"), "{l}");
     }
 }

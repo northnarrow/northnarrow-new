@@ -8,10 +8,15 @@ are **resolved at boot from the running kernel's BTF**
 object are only the fallback for an unarmed map. Fields that moved
 between kernel versions have alternative paths (`iov_iter` on ≤ 6.3 vs
 6.4+), and enumerators that changed value are resolved by name too
-(`ITER_UBUF`). The agent still **refuses to start** when a field or
-enumerator does not exist at all on the running kernel (BUG-036
-fail-closed gate, exit 78) — so the support status stays binary and
-verifiable: either every read resolves, or the agent does not run.
+(`ITER_UBUF`). LSM hook arguments are read by position, so the agent also
+reads each hook's prototype from the BTF (lab PR 164): an argument that
+moved between kernel versions is resolved there (`inode_setattr` from
+6.9, the xattr hooks before 5.12), and every other one is checked where
+the program reads it. The agent still **refuses to start** when a field,
+an enumerator or a checked hook argument does not exist at all on the
+running kernel (BUG-036 fail-closed gate, exit 78) — so the support status
+stays binary and verifiable: either every read resolves, or the agent does
+not run.
 
 ## Verified matrix (lab, `deploy/lab/nn-lab.sh`)
 
@@ -21,6 +26,7 @@ verifiable: either every read resolves, or the agent does not run.
 | Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning) with 20 of 42 offsets resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC`. Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts | 2026-10-09 |
 | Ubuntu 22.04 LTS | 5.15.0-198-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — all 27 programs and the 8 FIM observe hooks load and attach after three rewrites for the older verifier (see below); 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`); e2e + ignored suites green | 2026-10-10 (lab PR 17) |
 | AlmaLinux 9 (RHEL / Rocky 9 family) | 5.14.0-687 el9_8 | yes (default list includes `bpf`) | yes | **supported** — e2e agent 6/6, FIM 4/4, watchdog 4/4 with SELinux **enforcing** (no AVC denial); `--btf-check` = SUPPORTED, 0 absent (RHEL backports `iov_iter.ubuf`); the vendor tracepoint header (`common_preempt_lazy_count`) is handled by resolving tracepoint field offsets from tracefs at boot (see below) | 2026-10-10 (lab PR 20) |
+| Debian 13 (trixie) | 6.12 | `lsm=…,bpf` set by the lab template | yes | the first guest from 6.9: `inode_setattr`'s dentry is argument 1, read from the prototype (see "Kernels from 6.9" below); verified there: chmod, chown and touch of a protected file refused (allowed on `main`), the FIM setattr observer records; privileged suites 81 of 82 — DNS attribution fails on `main` too, the guest resolves through `nss-resolve` | 2026-10-16 (lab PR 164) |
 
 Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
 `/sys/kernel/btf/vmlinux` file), `bpf` in `/sys/kernel/security/lsm`,
@@ -41,9 +47,12 @@ on its `PATH` ("block_outbound unavailable: nft missing"). The lab guests
 install it. See the Prerequisites of
 [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md).
 
-**Not verified: kernels from 6.9.** Every lab guest runs 6.8 or older.
-See "Kernels from 6.9: `inode_setattr`" below before deploying on a newer
-kernel.
+**Kernels from 6.9.** The `inode_setattr` hook gained an argument there;
+since lab PR 164 the agent reads its position from the running kernel.
+Verified on Debian 13 (6.12) on 2026-10-16: the setattr deny and the FIM
+observer act there (`main` let chmod, chown and touch of a protected file
+through). See "Kernels from 6.9:
+`inode_setattr`" below.
 
 ## Computed matrix (`northnarrow-agent --btf-check <btf>`)
 
@@ -59,11 +68,12 @@ archive (newest non-cloud kernel per distro/version) and compares it with
 every PR touching the offset tables or the resolver, weekly, and on
 demand, and fails on a verdict worse than the baseline or on a BTF the
 parser cannot read. BTFHub archives only kernels shipped **without**
-native BTF, so the lab guests (table above) cover 5.15, 6.1 and 6.8.
+native BTF, so the lab guests (table above) cover 5.14, 5.15, 6.1, 6.8
+and, with the Debian 13 guest, 6.12.
 
 | Source | Kernel | BPF LSM | Verdict | Notes |
 |---|---|---|---|---|
-| WSL2 (host) | 6.18 | — | SUPPORTED | 16 of 44 slots differ from the build kernel — handled at runtime; the verdict does not cover LSM hook prototypes (see "Kernels from 6.9" below) |
+| WSL2 (host) | 6.18 | — | SUPPORTED | 28 of 82 slots differ from the build kernel — handled at runtime, `inode_setattr`'s dentry among them (argument 1); 28 of 28 fixed hook arguments where the programs read them (lab PR 164) |
 | lab guest | 6.8 (Ubuntu 24.04) | yes | SUPPORTED | 0 drift (build kernel) |
 | lab guest | 6.1 (Debian 12) | yes | SUPPORTED | 20 drift, `ubuf`/`count`, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC` |
 | lab guest | 5.15 (Ubuntu 22.04) | yes | SUPPORTED (degraded) | 20 drift, 2 absent; no `iov_iter.ubuf` and no `ITER_UBUF` enumerator (both optional) → QNAME via `ITER_IOVEC` only |
@@ -81,27 +91,63 @@ floor is therefore **BPF LSM (5.7+) plus a distro kernel built with
 4.14) could become optional too, but no 4.x kernel can run the
 anti-tamper hooks, so it is not worth a variant.
 
-## Kernels from 6.9: `inode_setattr` (open follow-up)
+## Kernels from 6.9: `inode_setattr` (lab PR 164)
 
-From kernel 6.9 the `inode_setattr` LSM hook receives `struct mnt_idmap *`
-as its first argument: `(idmap, dentry, attr)`, where 6.8 and older pass
-`(dentry, attr)`. (Checked in the BTF of the WSL2 6.18 host:
-`bpf_lsm_inode_setattr(idmap, dentry, attr)`; the 6.8 guest has two
-arguments.) The two programs on that hook — the anti-tamper setattr deny
+An LSM program reads its hook's arguments by position, and a kernel that
+inserts an argument moves every later one. From 6.9 the `inode_setattr`
+hook receives `struct mnt_idmap *` first, `(idmap, dentry, attr)`, where
+6.8 and older pass `(dentry, attr)`. The anti-tamper setattr deny
 (`agent-ebpf/src/inode_protect.rs::try_inode_setattr`) and the FIM setattr
-observer (`agent-ebpf/src/fim_watch.rs::fim_setattr_observe`) — read
-argument 0 as the dentry. On 6.9 and later they read the wrong argument,
-so the refusal of `truncate`, `chmod` and `chown` on a protected file, and
-FIM's view of those changes on a watched file, cannot be relied on there.
-`--btf-check` resolves struct offsets, not hook prototypes, so its
-SUPPORTED verdict does not cover this. Fix pending (choose the argument
-from the running kernel's prototype, and a lab guest on 6.9 or later);
-tracked with the follow-ups of `docs/audit/EXTERNAL_AUDIT_16f7563.md`.
-In the same 6.18 BTF the other inode, file, task and BPF hooks the agent
-attaches still have their arguments where the programs read them (the
-xattr hooks have taken a `user_namespace`, later `mnt_idmap`, first since
-5.12, the ACL hooks since they appeared, and their programs read the
-dentry as argument 1).
+observer (`agent-ebpf/src/fim_watch.rs::fim_setattr_observe`) read
+argument 0 as the dentry until lab PR 164: on 6.9 and later `truncate`,
+`chmod` and `chown` of a protected file were not refused, and FIM did not
+see them on a watched file.
+
+The agent now reads the prototype of `bpf_lsm_inode_setattr` from the
+running kernel's BTF at boot, takes the position of its only `struct
+dentry *` argument (which must be followed by the `struct iattr *`), and
+writes it into the `BTF_OFFSETS` map (`INODE_SETATTR_DENTRY_ARG`, slot
+89) before anything attaches; both programs read the dentry at that
+position. The same check found a second case: on 5.7 to 5.11 (5.10 LTS
+included) `inode_setxattr` and `inode_removexattr` start with the dentry,
+where the xattr deny read argument 1 (the attribute name); their
+positions are resolved the same way (slots 90 and 91, the name taken
+right after the dentry).
+
+Hook prototypes per kernel, for the arguments the programs read
+(`lsm_hook_defs.h` of each version; the BTF of the WSL2 6.18 host):
+
+| Hook | 5.7–5.11 | 5.15, 6.1, 6.8 | 6.9, 6.12, 6.18 |
+|---|---|---|---|
+| `inode_setattr` | `(dentry, attr)` | `(dentry, attr)` | `(idmap, dentry, attr)` |
+| `inode_setxattr` | `(dentry, name, …)` | `(userns or idmap, dentry, name, …)` | `(idmap, dentry, name, …)` |
+| `inode_removexattr` | `(dentry, name)` | `(userns or idmap, dentry, name)` | `(idmap, dentry, name)` |
+| `inode_set_acl`, `inode_remove_acl` | — | from 6.2: `(idmap, dentry, acl_name, …)` | same |
+| the other inode, file, task, module and BPF hooks | as on 5.15 for the arguments read | unchanged | unchanged (`bpf` gains a fourth argument, not read) |
+
+What the agent does with a prototype:
+
+- **Resolved positions** (the three hooks above): a prototype of another
+  shape (no `struct dentry *`, two of them, or not followed by what the
+  program reads next) is never guessed. The slot is written absent, the
+  eBPF program reads nothing, and the agent does not attach the programs
+  on that hook: a missing deny hook refuses the start unless
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, the FIM observer counts as a FIM
+  coverage shortfall, and a signed `subsystem_degraded` names the hook
+  and what is lost. An unarmed map (no BTF) gives the programs no
+  position at all: a hook argument has no compiled fallback.
+- **Fixed positions** (28 pointer arguments of the other hooks,
+  `HOOK_ARG_CHECKS` in `common/src/btf_offsets.rs`): checked against the
+  running kernel's prototypes. A moved one refuses the start (exit 78),
+  like a missing field; a hook the kernel does not have (`inode_set_acl`
+  before 6.2) is not checked, its program does not attach.
+
+`--btf-check` reads the prototypes too: its summary counts the hook
+arguments checked, a resolved position that differs from the build kernel
+is a `drift` line (`INODE_SETATTR_DENTRY_ARG … compiled=0 runtime=1` on
+6.9 and later), an unresolved one an `absent` line, and a moved fixed one
+a `missing` line (NOT SUPPORTED). Verified on Debian 13 (6.12): `28 hook
+arguments checked` and the `INODE_SETATTR_DENTRY_ARG` drift line.
 
 ## Debian-family kernels and `perf_event_paranoid`
 
@@ -133,9 +179,16 @@ shipped file (`integrity_drift`, kind `unit_dropin`).
    the agent writes the values into `BTF_OFFSETS` and arms slot 0 with a
    magic. The eBPF programs read offsets through `off!(NAME)`.
 3. **Refusal.** A field or enumerator absent on the running kernel (no
-   path and no alternative resolves) → exit 78 with the field named. The
-   fix is a new alternative path in `REVALIDATE` (level 2 work), never a
-   guess.
+   path and no alternative resolves), or a fixed-position hook argument
+   that moved → exit 78 with the field or the hook named. The fix is a
+   new alternative path in `REVALIDATE`, or a runtime position in
+   `HOOK_ARGS` (level 2 work), never a guess.
+4. **Hook prototypes** (lab PR 164). The positions in `HOOK_ARGS` are
+   published in the same map, after the tracepoint slots; the programs
+   read them with `hook_arg(slot)` (`agent-ebpf/src/btf_offsets.rs`),
+   which has no compiled fallback. The argument is read with
+   `bpf_probe_read_kernel` from the context (a context load needs a
+   constant offset), at a position bounded below 6 first.
 
 Level 2 so far: optional fields (degrade instead of refuse), the
 `--btf-check` verdict, the computed BTFHub matrix in CI with a baseline,

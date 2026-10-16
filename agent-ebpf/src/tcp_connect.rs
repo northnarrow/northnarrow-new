@@ -36,10 +36,13 @@ use aya_ebpf::{
         bpf_probe_read_kernel,
     },
     macros::{kprobe, map},
-    maps::{LruHashMap, RingBuf},
+    maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::ProbeContext,
 };
-use northnarrow_common::wire::{TcpConnectRaw, ADDR_LEN, FLOW_SOCK_MAP_MAX_ENTRIES, TASK_COMM_LEN};
+use northnarrow_common::wire::{
+    flow_sock_slot, TcpConnectRaw, ADDR_LEN, FLOW_SOCK_COUNT_SLOTS, FLOW_SOCK_MAP_MAX_ENTRIES,
+    TASK_COMM_LEN,
+};
 
 #[map]
 static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -48,10 +51,43 @@ static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 /// (cast to u64), value = 16-byte correlation ID. Populated by
 /// this connect kprobe at flow start, read by the `tcp_close`
 /// fexit at flow end. LRU eviction bounds the per-flow kernel
-/// state under DDoS (per design §5.3, 4096-entry cap).
+/// state under DDoS (65,536 entries since lab PR 164, see
+/// `FLOW_SOCK_MAP_MAX_ENTRIES`).
 #[map]
 pub static FLOW_SOCK_MAP: LruHashMap<u64, [u8; 16]> =
     LruHashMap::with_max_entries(FLOW_SOCK_MAP_MAX_ENTRIES, 0);
+
+/// Lab PR 164 — sockets entered into and taken out of [`FLOW_SOCK_MAP`]
+/// (`northnarrow_common::wire::flow_sock_slot`), read by the agent for
+/// `nn-admin net status`: an LRU does not report its evictions.
+#[map]
+pub static FLOW_SOCK_COUNTS: PerCpuArray<u64> =
+    PerCpuArray::with_max_entries(FLOW_SOCK_COUNT_SLOTS, 0);
+
+/// `BPF_NOEXIST` (uapi): insert only a key that is not there yet.
+const BPF_NOEXIST: u64 = 1;
+
+/// Count one event in [`FLOW_SOCK_COUNTS`] (per-CPU, no atomics).
+#[inline(always)]
+pub(crate) fn count_flow_sock(slot: u32) {
+    if let Some(c) = FLOW_SOCK_COUNTS.get_ptr_mut(slot) {
+        // SAFETY: per-CPU slot owned by this CPU while the program runs;
+        // the verifier bounds `slot` against the map size.
+        unsafe { *c = (*c).wrapping_add(1) };
+    }
+}
+
+/// Remember `sk_ptr`'s flow for its close. A new socket is counted; a
+/// socket connecting again (after a failed connect) has its entry
+/// overwritten, as before. Best-effort: a full LRU drops its oldest entry.
+#[inline(always)]
+fn remember_flow_sock(sk_ptr: u64, corr: &[u8; 16]) {
+    if FLOW_SOCK_MAP.insert(&sk_ptr, corr, BPF_NOEXIST).is_ok() {
+        count_flow_sock(flow_sock_slot::INSERTED);
+    } else {
+        let _ = FLOW_SOCK_MAP.insert(&sk_ptr, corr, 0);
+    }
+}
 
 /// Build the 16-byte correlation ID for `FLOW_SOCK_MAP`. Layout:
 ///   bytes 0..8  = `timestamp_ns` (little-endian)
@@ -182,11 +218,10 @@ fn try_tcp_connect_v4(ctx: &ProbeContext) -> Result<(), i64> {
         }
     }
     // N2: populate FLOW_SOCK_MAP so the tcp_close fexit can read
-    // a stable corr_id back out. Best-effort — a full LRU just
-    // drops the oldest entry.
+    // a stable corr_id back out.
     if sk_ptr != 0 {
         let corr = build_corr_id(ts, sk_ptr);
-        let _ = FLOW_SOCK_MAP.insert(&sk_ptr, &corr, 0);
+        remember_flow_sock(sk_ptr, &corr);
     }
     entry.submit(0);
     Ok(())
@@ -239,7 +274,7 @@ fn try_tcp_connect_v6(ctx: &ProbeContext) -> Result<(), i64> {
     }
     if sk_ptr != 0 {
         let corr = build_corr_id(ts, sk_ptr);
-        let _ = FLOW_SOCK_MAP.insert(&sk_ptr, &corr, 0);
+        remember_flow_sock(sk_ptr, &corr);
     }
     entry.submit(0);
     Ok(())

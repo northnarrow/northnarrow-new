@@ -594,6 +594,27 @@ pub(crate) fn attach(
     // on the same ring and are reattached fresh too (review 62).
     let mut deny_hooks_attached: usize = 0;
     for (program, hook) in LSM_PROGRAMS {
+        // Lab PR 164: the setattr and xattr denies read the dentry at the
+        // position the running kernel's prototype gives (setattr: 1 from
+        // 6.9, 0 before; xattr: 0 on 5.7-5.11, 1 after). Unknown position:
+        // not attached, a deny shortfall like a verifier reject, and the
+        // prior boot's pins of this hook go too, so that no older program
+        // keeps reading a fixed position.
+        if let Some(Err(why)) = super::btf_revalidate::hook_attach_gate(hook) {
+            warn!(
+                program, hook, reason = %why,
+                effect = super::btf_revalidate::hook_arg_effect(&format!("bpf_lsm_{hook}")),
+                "anti-tamper FS: deny hook NOT attached — the dentry's position in the hook's \
+                 prototype is unknown"
+            );
+            if let Some(root) = pin_root {
+                let (prog_pin, link_pin) = antitamper_bpf::lsm_pin_paths(root, hook);
+                antitamper_bpf::purge_stale_pin(&link_pin);
+                antitamper_bpf::purge_stale_pin(&prog_pin);
+            }
+            health.deny_failures.push((program, why));
+            continue;
+        }
         match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
             Ok(()) => deny_hooks_attached += 1,
             Err(e) => {

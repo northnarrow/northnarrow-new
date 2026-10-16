@@ -126,6 +126,12 @@ pub struct StatusOutcome {
     /// External audit NET-009: network rules that cannot fire, with why
     /// (`None`: agent predates the field).
     pub net_inactive_rules: Option<Vec<String>>,
+    /// Lab PR 164: the kernel's `FLOW_SOCK_MAP` — sockets held without
+    /// their close seen, capacity, sockets forgotten at least (`None`:
+    /// agent predates the fields, or runs without the counters).
+    pub flow_sock_pending: Option<u64>,
+    pub flow_sock_capacity: Option<u64>,
+    pub flow_sock_forgotten_min: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -258,6 +264,9 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         netflow_rows_skipped_total: resp.netflow_rows_skipped_total,
         netflow_pending_evicted_total: resp.netflow_pending_evicted_total,
         net_inactive_rules: resp.net_inactive_rules,
+        flow_sock_pending: resp.flow_sock_pending,
+        flow_sock_capacity: resp.flow_sock_capacity,
+        flow_sock_forgotten_min: resp.flow_sock_forgotten_min,
     })
 }
 
@@ -3308,6 +3317,9 @@ mod tests {
                     netflow_rows_skipped_total: Some(7),
                     netflow_pending_evicted_total: Some(0),
                     net_inactive_rules: Some(vec!["NN-L-NET-003 (JA3)".to_string()]),
+                    flow_sock_pending: Some(70_000),
+                    flow_sock_capacity: Some(65_536),
+                    flow_sock_forgotten_min: Some(4_464),
                 }),
             );
         });
@@ -3318,6 +3330,10 @@ mod tests {
         // External audit NET-019 / NET-009: the `net status` fields.
         assert_eq!(out.netflow_rows_skipped_total, Some(7));
         assert_eq!(out.netflow_pending_evicted_total, Some(0));
+        // Lab PR 164: the kernel socket map's occupancy.
+        assert_eq!(out.flow_sock_pending, Some(70_000));
+        assert_eq!(out.flow_sock_capacity, Some(65_536));
+        assert_eq!(out.flow_sock_forgotten_min, Some(4_464));
         assert_eq!(
             out.net_inactive_rules.as_deref(),
             Some(&["NN-L-NET-003 (JA3)".to_string()][..])

@@ -664,6 +664,17 @@ pub struct StatusResponse {
     /// field.
     #[serde(default)]
     pub net_inactive_rules: Option<Vec<String>>,
+    /// Lab PR 164: outbound sockets the kernel's `FLOW_SOCK_MAP` holds
+    /// without their close seen yet (open sessions and forgotten ones),
+    /// its capacity, and the sockets it forgot at least (beyond the
+    /// capacity: their closes are not recorded). `None` from an agent
+    /// older than the fields, or without the counters.
+    #[serde(default)]
+    pub flow_sock_pending: Option<u64>,
+    #[serde(default)]
+    pub flow_sock_capacity: Option<u64>,
+    #[serde(default)]
+    pub flow_sock_forgotten_min: Option<u64>,
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -1317,6 +1328,9 @@ mod tests {
             netflow_rows_skipped_total: None,
             netflow_pending_evicted_total: None,
             net_inactive_rules: None,
+            flow_sock_pending: None,
+            flow_sock_capacity: None,
+            flow_sock_forgotten_min: None,
         }));
     }
 
@@ -1335,6 +1349,9 @@ mod tests {
             netflow_rows_skipped_total: None,
             netflow_pending_evicted_total: None,
             net_inactive_rules: None,
+            flow_sock_pending: None,
+            flow_sock_capacity: None,
+            flow_sock_forgotten_min: None,
         }));
     }
 
@@ -1501,6 +1518,9 @@ mod tests {
             netflow_rows_skipped_total: Some(5),
             netflow_pending_evicted_total: Some(2),
             net_inactive_rules: Some(vec!["NN-L-NET-003 (JA3)".to_string()]),
+            flow_sock_pending: Some(70_000),
+            flow_sock_capacity: Some(65_536),
+            flow_sock_forgotten_min: Some(4_464),
         }));
     }
 

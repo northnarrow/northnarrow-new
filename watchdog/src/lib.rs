@@ -2853,6 +2853,9 @@ mod tests {
                 netflow_rows_skipped_total: None,
                 netflow_pending_evicted_total: None,
                 net_inactive_rules: None,
+                flow_sock_pending: None,
+                flow_sock_capacity: None,
+                flow_sock_forgotten_min: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");
