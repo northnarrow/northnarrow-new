@@ -15,6 +15,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Documentation
+
+- The external audit tracker gets its Wave 3 table
+  (`docs/audit/EXTERNAL_AUDIT_16f7563.md`): the 188 Low and 21
+  Informational findings re-checked against `main` at `b9bf4d5` — 14
+  already fixed by Waves 0–2 (with their lab PR), 30 in part, 5 obsolete,
+  10 declined with the reason, 180 to fix in lots; NN-AUD-299 fixed with
+  lab PR 166. Seven follow-ups found in the lab since lab PR 162 are added
+  to "Follow-ups found in the lab": journal line injection (taken with
+  NN-AUD-413), DNS attribution on `nss-resolve` hosts, a `tcp_close` ring
+  burst, short-lived staging payloads that end before their verdict, the
+  unhooked `file_ioctl_compat`, NN-L-NET-001 judging a flow at its close,
+  `nn-admin` aborting on a closed pipe.
 - The documentation follows the remediation of the external audit of
   `16f7563` (Waves 0–2) and the advisory ADE. README: the model's role
   (it recommends, the rules and the COMBAT ladder respond), what is
