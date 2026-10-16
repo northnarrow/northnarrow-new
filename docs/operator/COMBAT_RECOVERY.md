@@ -82,6 +82,18 @@ nn-admin rotate-keys add --new-pubkey <hex> --new-roles canary-manage,audit-read
     --key admin.key [--cosign-key ...]
 ```
 
+`rotate-keys add` delegates, it does not mint (external audit NN-AUD-084):
+each role of the new key must be held by one of the signing keys — `all`
+only by a key that holds `all` — and an omitted role list stands for
+`unlock,audit-read`. The signers of the example above therefore need
+`canary-manage` and `audit-read` besides `rotate-keys`. A "custodian" key
+holding only `rotate-keys` can no longer add an `unlock` or `all` key: give
+it the roles it is meant to delegate. The bootstrap 1-of-N add follows the
+same rule. Likewise `force-posture` out of COMBAT releases the containment
+like `unlock`, so it needs a key that also holds `unlock` (NN-AUD-083); a
+`force-posture`-only key can force COMBAT but not leave it — use
+`nn-admin unlock`.
+
 Keep the principle of least privilege: the key that releases COMBAT
 does not need `canary-manage`, and a canary operator does not need
 `unlock`. The lab runbook's test fixtures grant the roles each suite

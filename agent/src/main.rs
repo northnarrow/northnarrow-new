@@ -3354,6 +3354,10 @@ async fn main() -> Result<()> {
                         Arc::new(move || ladder.current_stage().map(|s| s.as_str().to_string()))
                     },
                 }));
+                // External audit NN-AUD-077: the loop now outlives a
+                // transient accept error; if it still ends, the admin plane
+                // is gone until a restart — an ERROR and a signed record.
+                let audit_log_on_exit = audit_log.clone();
                 tokio::spawn(async move {
                     if let Err(e) = admin_socket::serve_with_marker_path(
                         socket_path,
@@ -3372,7 +3376,16 @@ async fn main() -> Result<()> {
                     )
                     .await
                     {
-                        warn!(error = %e, "admin socket serve loop exited");
+                        error!(
+                            error = %e,
+                            "admin socket serve loop exited — no unlock, shutdown or key \
+                             rotation until the agent restarts"
+                        );
+                        attest_degraded_at(
+                            audit_log_on_exit.as_ref(),
+                            &format!("admin socket serve loop exited: {e:#}"),
+                            false,
+                        );
                     }
                 });
             }

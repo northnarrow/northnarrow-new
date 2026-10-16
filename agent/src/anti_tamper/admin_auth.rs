@@ -11,34 +11,42 @@
 //!    [`Role::Unlock`] + [`Role::AuditRead`] — backward-compatible
 //!    with every admin.pub file written before A5.
 //! 2. Mint a 32-byte cryptographic nonce on demand
-//!    ([`AdminAuth::issue_challenge`]).
+//!    ([`ConnAuth::issue_challenge`]).
 //! 3. Verify a 64-byte Ed25519 signature over that nonce against
 //!    every loaded pubkey AND check the matched key's role
 //!    allowlist against the operation being authorised
-//!    ([`AdminAuth::verify_with_role`]; the legacy
-//!    [`AdminAuth::verify_unlock`] is a thin wrapper that requires
+//!    ([`ConnAuth::verify_with_role`]; the legacy
+//!    [`ConnAuth::verify_unlock`] is a thin wrapper that requires
 //!    [`Role::Unlock`] for backward-compat).
 //! 4. On success, mint an [`UnlockToken`] via the capability gate in
-//!    `network_isolate.rs`. On invalid-signature failure, increment
-//!    a rate-limit counter; three failures inside a 5-minute window
-//!    block further challenge issuance. Role-mismatch failures
-//!    deliberately do **not** trip the rate limiter — a legitimate
-//!    operator using a correctly-signed key with an insufficient
-//!    role is a configuration error, not an attack signal.
+//!    `network_isolate.rs`.
+//!
+//! External audit NN-AUD-078 / NN-AUD-079: the challenge and the failure
+//! count belong to ONE admin-socket connection ([`ConnAuth`]), not to the
+//! agent. A client asking for a challenge cannot replace or consume the
+//! challenge another connection is about to sign, and failures on one
+//! connection do not lock out another. A connection that fails
+//! [`MAX_AUTH_FAILURES_PER_CONNECTION`] signature checks is answered
+//! `RateLimited` and closed. Role-mismatch failures deliberately do
+//! **not** count — a legitimate operator using a correctly-signed key with
+//! an insufficient role is a configuration error, not an attack signal.
+//! Ed25519 cannot be brute-forced; the limit only bounds the work one
+//! client gets per connection.
 //!
 //! The nonce is single-use — it is consumed inside the verify path
-//! regardless of outcome. A failed attempt forces the attacker to
-//! request a fresh challenge AND to incur a rate-limit hit.
+//! regardless of outcome. A failed attempt forces the client to
+//! request a fresh challenge AND counts against its connection.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use common::admin_quorum::{self, distinct_matches, quorum_decision, QuorumDecision};
 use common::wire::admin_signed_payload::{self, Role, SignedPayload, SignedPayloadError};
 use ed25519_dalek::{Signature, VerifyingKey};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -47,20 +55,20 @@ use tracing::{info, warn};
 
 use super::network_isolate::{mint_unlock_token, UnlockToken};
 
-/// Production rate-limit window — three failures inside this period
-/// pause new challenge issuance until the window slides past the
-/// oldest failure.
-pub const DEFAULT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// External audit NN-AUD-079: failed signature checks one admin-socket
+/// connection may make. The one that reaches this count is answered
+/// `RateLimited` and the socket server closes the connection.
+pub const MAX_AUTH_FAILURES_PER_CONNECTION: u32 = 3;
 
-/// Failures inside [`DEFAULT_RATE_LIMIT_WINDOW`] that trigger the
-/// throttle. Verify itself is NOT rate-limited; only the entrance
-/// gate (`issue_challenge`) is.
-pub const RATE_LIMIT_THRESHOLD: u32 = 3;
+/// `retry_after_secs` of that `RateLimited` reply. Only the connection is
+/// closed, so a new one may retry at once; a non-zero value keeps the
+/// "never advertise retry in 0 s" convention of the wire variant.
+const CONNECTION_RETRY_AFTER_SECS: u32 = 1;
 
 #[cfg(test)]
 use admin_quorum::default_roles;
 
-/// Reasons [`AdminAuth::issue_challenge`] / [`AdminAuth::verify_with_role`]
+/// Reasons [`ConnAuth::issue_challenge`] / [`ConnAuth::verify_with_role`]
 /// can refuse, carrying the user-facing detail needed to translate
 /// into an [`UnlockResult`](common::wire::admin_protocol::UnlockResult)
 /// or the broader Tappa 8 [`AdminResult`](docs/design/TAPPA8_…)
@@ -89,23 +97,23 @@ pub enum AdminAuthError {
     /// admin pubkey AND came from a distinct key from any
     /// previously matched signature in the same submission.
     /// `required` mirrors the design §6.6 wire variant's
-    /// `required` field. This error does **not** increment the
-    /// rate-limit counter — a quorum shortfall is operator UX
+    /// `required` field. This error does **not** count against
+    /// the connection — a quorum shortfall is operator UX
     /// (a co-signer hasn't replied yet), not an attack signal.
     #[error("quorum not met: {provided} distinct valid signatures (need {required})")]
     QuorumNotMet { required: u8, provided: u8 },
     /// Tappa 8 A7: `payload.ts` was outside the server's ±skew
     /// window. Mirrors `AdminResult::TimestampSkew` in the wire
-    /// layer. Returned by [`AdminAuth::verify_signed_payload_quorum`]
+    /// layer. Returned by [`ConnAuth::verify_signed_payload_quorum`]
     /// (and any future SignedPayload-consuming verify path).
-    /// Does NOT increment the rate-limit counter — clock skew
+    /// Does NOT count against the connection — clock skew
     /// is an operator-environment issue, not an attack signal.
     #[error("timestamp outside ±{max_skew_secs}s window (server_ts={server_ts})")]
     TimestampSkew { server_ts: u64, max_skew_secs: u32 },
     /// Tappa 8 A7: `payload.agent_id` did not match the agent's
     /// bootstrapped install UUID — a captured signature was
     /// replayed against a different agent install (design §6.4
-    /// layer 3). Rate-limit IS incremented: this can only happen
+    /// layer 3). Counts against the connection: this can only happen
     /// from a deliberate attack (legitimate clients always read
     /// `agent_id` from the same agent's `status` reply before
     /// signing).
@@ -113,16 +121,16 @@ pub enum AdminAuthError {
     AgentIdMismatch,
     /// Tappa 8 A7: `payload.nonce` did not match the outstanding
     /// challenge nonce — a signed-payload submission whose
-    /// nonce-binding was forged or stale. Rate-limit IS
-    /// incremented; this is an attack signal under the same
+    /// nonce-binding was forged or stale. Counts against the
+    /// connection; this is an attack signal under the same
     /// rationale as `InvalidSignature`.
     #[error("nonce mismatch")]
     NonceMismatch,
     /// Tappa 8 A7: `payload.op` was not the operation expected
     /// on this wire variant (e.g., a `ShutdownRequest` carrying
     /// `op = Unlock`). Surfaces design §6.6
-    /// `AdminResult::UnknownOperation`. Rate-limit IS
-    /// incremented — a wire-shape mismatch can only come from a
+    /// `AdminResult::UnknownOperation`. Counts against the
+    /// connection — a wire-shape mismatch can only come from a
     /// confused or hostile client.
     #[error("unknown operation: payload.op={got:?} expected {expected:?}")]
     UnknownOperation {
@@ -145,17 +153,11 @@ type KeyEntry = admin_quorum::AdminKey;
 
 /// Server-side admin authenticator.
 ///
-/// `pub_keys` is read-only after construction so we never need a
-/// lock for verification — only the nonce slot, the failure counter,
-/// and the last-failure timestamp are mutable. Each entry pairs a
-/// verifying key with the operations its operator is authorised to
-/// trigger ([`Role`] enum from [`common::wire::admin_signed_payload`]).
-///
-/// The `rate_limit_window` field is the one deviation from the
-/// spec's struct layout: tests need to override the 5-minute
-/// production window with something like 100 ms to run in a sane
-/// amount of time. Production callers use [`AdminAuth::load`]
-/// which pins the field to [`DEFAULT_RATE_LIMIT_WINDOW`].
+/// Each entry of `pub_keys` pairs a verifying key with the operations
+/// its operator is authorised to trigger ([`Role`] enum from
+/// [`common::wire::admin_signed_payload`]). External audit NN-AUD-078 /
+/// NN-AUD-079: no challenge and no failure count live here — they belong
+/// to the connection ([`ConnAuth`]), the only way to verify a live request.
 #[derive(Debug)]
 pub struct AdminAuth {
     /// Tappa 8 A13: behind an `RwLock` so the dispatcher can
@@ -167,16 +169,12 @@ pub struct AdminAuth {
     /// many concurrent admin requests reading should never
     /// serialise on each other.
     pub_keys: RwLock<Vec<KeyEntry>>,
-    pending_challenge: Mutex<Option<[u8; 32]>>,
-    failure_count: AtomicU32,
-    last_failure: Mutex<Option<Instant>>,
-    rate_limit_window: Duration,
     /// Per-install agent identity (Tappa 8 A3). Bootstrapped by
     /// [`crate::agent_id::load_or_bootstrap`] and passed in via
     /// [`Self::load_with_agent_id`]. The legacy [`Self::load`]
     /// defaults to `[0u8; 16]` for backward compatibility — that
     /// matters only for the new
-    /// [`Self::verify_signed_payload_quorum`] path; the legacy
+    /// [`ConnAuth::verify_signed_payload_quorum`] path; the legacy
     /// `verify_unlock` / `verify_with_role` / `verify_quorum`
     /// surfaces never touch this field.
     agent_id: [u8; 16],
@@ -218,7 +216,7 @@ impl AdminAuth {
     ///
     /// Tappa 8 A7: defaults `agent_id` to `[0u8; 16]`. The new
     /// SignedPayload-consuming verify
-    /// ([`Self::verify_signed_payload_quorum`]) compares incoming
+    /// ([`ConnAuth::verify_signed_payload_quorum`]) compares incoming
     /// `payload.agent_id` against this field; production code
     /// should use [`Self::load_with_agent_id`] to bind the real
     /// install UUID (bootstrapped via
@@ -260,8 +258,7 @@ impl AdminAuth {
             ));
         }
 
-        let mut auth =
-            Self::build_entries_with_agent_id(pub_keys, DEFAULT_RATE_LIMIT_WINDOW, agent_id);
+        let mut auth = Self::build_entries_with_agent_id(pub_keys, agent_id);
         *auth.loaded_admin_pub.write() = content.as_bytes().to_vec();
         *auth.skipped_lines.write() = parsed.skipped;
         // A13: remember the file we loaded from so the
@@ -337,7 +334,7 @@ impl AdminAuth {
     /// exercised end-to-end. The signature is stable across A5 so
     /// every pre-A5 test still compiles.
     #[cfg(test)]
-    fn build(pub_keys: Vec<VerifyingKey>, rate_limit_window: Duration) -> Self {
+    fn build(pub_keys: Vec<VerifyingKey>) -> Self {
         let entries = pub_keys
             .into_iter()
             .map(|key| KeyEntry {
@@ -345,7 +342,7 @@ impl AdminAuth {
                 roles: default_roles(),
             })
             .collect();
-        Self::build_entries(entries, rate_limit_window)
+        Self::build_entries(entries)
     }
 
     /// Lower-level builder used by tests that want to pin custom
@@ -355,22 +352,14 @@ impl AdminAuth {
     /// UUID (only matters for `verify_signed_payload_quorum`).
     /// Production callers go through [`Self::load_with_agent_id`].
     #[cfg(test)]
-    fn build_entries(pub_keys: Vec<KeyEntry>, rate_limit_window: Duration) -> Self {
-        Self::build_entries_with_agent_id(pub_keys, rate_limit_window, [0u8; 16])
+    fn build_entries(pub_keys: Vec<KeyEntry>) -> Self {
+        Self::build_entries_with_agent_id(pub_keys, [0u8; 16])
     }
 
     /// Lowest-level builder, used by [`Self::load_with_agent_id`].
-    fn build_entries_with_agent_id(
-        pub_keys: Vec<KeyEntry>,
-        rate_limit_window: Duration,
-        agent_id: [u8; 16],
-    ) -> Self {
+    fn build_entries_with_agent_id(pub_keys: Vec<KeyEntry>, agent_id: [u8; 16]) -> Self {
         Self {
             pub_keys: RwLock::new(pub_keys),
-            pending_challenge: Mutex::new(None),
-            failure_count: AtomicU32::new(0),
-            last_failure: Mutex::new(None),
-            rate_limit_window,
             agent_id,
             config_path: None,
             loaded_admin_pub: RwLock::new(Vec::new()),
@@ -397,71 +386,14 @@ impl AdminAuth {
         self.bootstrap_consumed.store(true, Ordering::SeqCst);
     }
 
-    /// Test-only constructor that overrides the rate-limit window so
-    /// the failure-window tests don't have to wait five minutes.
-    #[cfg(test)]
-    fn new_with_window(pub_keys: Vec<VerifyingKey>, window: Duration) -> Self {
-        Self::build(pub_keys, window)
-    }
-
-    /// Mint a 32-byte challenge from OS entropy and store it as the
-    /// outstanding nonce. Fails fast if the rate limiter is currently
-    /// throttling — the caller should propagate `RateLimited` to the
-    /// admin so they back off, not silently issue an unsignable nonce.
-    pub fn issue_challenge(&self) -> std::result::Result<[u8; 32], AdminAuthError> {
-        if let Some(retry_after_secs) = self.check_rate_limit() {
-            warn!(
-                target: "anti_tamper.admin_auth.verify_failure",
-                reason = "rate_limited",
-                retry_after_secs,
-                "admin challenge issuance rate-limited"
-            );
-            return Err(AdminAuthError::RateLimited { retry_after_secs });
-        }
-
-        let mut nonce = [0u8; 32];
-        // `OsRng` is deliberately preferred over `rand::thread_rng()`
-        // here — for security primitives we want the OS CSPRNG
-        // directly, not a userland-cached source.
-        OsRng.fill_bytes(&mut nonce);
-        *self.pending_challenge.lock() = Some(nonce);
-        info!(
-            target: "anti_tamper.admin_auth.challenge_issued",
-            "admin challenge issued (32-byte nonce)"
-        );
-        Ok(nonce)
-    }
-
-    /// Verify `signature` against the outstanding nonce, requiring
-    /// the matched key to authorise [`Role::Unlock`]. Thin wrapper
-    /// over [`Self::verify_with_role`]; preserved as a separate
-    /// method so the legacy COMBAT-release call path (admin_socket
-    /// dispatcher, pre-A7) compiles unchanged.
-    ///
-    /// Every admin.pub line — including pubkey-only lines from
-    /// before A5 — has [`Role::Unlock`] in its allowlist by
-    /// default, so this method's behaviour is byte-identical to
-    /// the pre-A5 implementation for every legacy admin.pub.
-    pub fn verify_unlock(
-        &self,
-        signature: &[u8; 64],
-    ) -> std::result::Result<UnlockToken, AdminAuthError> {
-        self.verify_with_role(signature, Role::Unlock)
-    }
-
-    /// Verify `signature` against the outstanding nonce AND check
-    /// that the matched key's role allowlist includes
-    /// `required_role` (or [`Role::All`], the break-glass
-    /// super-role). On success, mint an [`UnlockToken`]; on
-    /// invalid-signature failure, increment the rate-limit
-    /// counter; on role-mismatch, return [`AdminAuthError::RoleDenied`]
-    /// **without** incrementing rate limit (legit operator picked
-    /// the wrong key, not an attack signal).
-    ///
-    /// The nonce is consumed unconditionally — even a failed
-    /// verify invalidates it. That forces an attacker who guessed
-    /// wrong to roundtrip another challenge AND eat a rate-limit
-    /// hit.
+    /// Verify `signature` over `nonce` — the challenge one connection
+    /// issued and has just consumed ([`ConnAuth`]) — AND check that the
+    /// matched key's role allowlist includes `required_role` (or
+    /// [`Role::All`], the break-glass super-role). On success, mint an
+    /// [`UnlockToken`]. A role mismatch returns
+    /// [`AdminAuthError::RoleDenied`], which [`ConnAuth`] does not count
+    /// as a failure (legit operator picked the wrong key, not an attack
+    /// signal).
     ///
     /// Constant-time iteration is preserved across the per-key
     /// signature scan: the loop does NOT short-circuit on the
@@ -470,23 +402,12 @@ impl AdminAuth {
     /// any matched at all). Role lookup happens once after the
     /// loop on the matched index — that's an O(1) check on a
     /// short Vec, no side-channel relative to key position.
-    pub fn verify_with_role(
+    fn verify_with_role_with_nonce(
         &self,
+        nonce: &[u8; 32],
         signature: &[u8; 64],
         required_role: Role,
     ) -> std::result::Result<UnlockToken, AdminAuthError> {
-        let nonce = match self.pending_challenge.lock().take() {
-            Some(n) => n,
-            None => {
-                warn!(
-                    target: "anti_tamper.admin_auth.verify_failure",
-                    reason = "no_pending_challenge",
-                    "admin verify with no outstanding challenge"
-                );
-                return Err(AdminAuthError::NoPendingChallenge);
-            }
-        };
-
         let sig = Signature::from_bytes(signature);
 
         // A13: snapshot the keys behind a read lock for the
@@ -501,7 +422,7 @@ impl AdminAuth {
         // `verify_strict` is itself constant-time.
         let mut matched_idx: Option<usize> = None;
         for (idx, entry) in pub_keys.iter().enumerate() {
-            if entry.key.verify_strict(&nonce, &sig).is_ok() {
+            if entry.key.verify_strict(nonce, &sig).is_ok() {
                 matched_idx = Some(idx);
                 // intentionally NOT `break` — preserve constant-time iteration
             }
@@ -511,8 +432,6 @@ impl AdminAuth {
             Some(idx) => {
                 let entry = &pub_keys[idx];
                 if entry.authorizes(required_role) {
-                    self.failure_count.store(0, Ordering::SeqCst);
-                    *self.last_failure.lock() = None;
                     info!(
                         target: "anti_tamper.admin_auth.verify_success",
                         key_fingerprint = %fingerprint(&entry.key),
@@ -521,12 +440,10 @@ impl AdminAuth {
                     );
                     Ok(mint_unlock_token())
                 } else {
-                    // Role mismatch — do NOT increment failure
-                    // counter. A correctly-signed but
-                    // under-privileged request is a config
-                    // mistake by a legitimate operator, not an
-                    // attack signal; counting it would lock the
-                    // operator out under rate-limit.
+                    // Role mismatch — not counted as a failure. A
+                    // correctly-signed but under-privileged request is
+                    // a config mistake by a legitimate operator, not an
+                    // attack signal.
                     let fp = fingerprint(&entry.key);
                     warn!(
                         target: "anti_tamper.admin_auth.verify_failure",
@@ -542,8 +459,6 @@ impl AdminAuth {
                 }
             }
             None => {
-                self.failure_count.fetch_add(1, Ordering::SeqCst);
-                *self.last_failure.lock() = Some(Instant::now());
                 warn!(
                     target: "anti_tamper.admin_auth.verify_failure",
                     reason = "invalid_sig",
@@ -554,54 +469,40 @@ impl AdminAuth {
         }
     }
 
-    /// Verify a multi-signature **quorum** submission against the
-    /// outstanding nonce. Each signature in `signatures` is verified
-    /// independently; the agent tallies **distinct** matched pubkey
-    /// indices (per design §3.3, two signatures from the same key
-    /// count as one) and accepts the submission iff:
+    /// Verify a multi-signature **quorum** submission over `nonce` (see
+    /// [`Self::verify_with_role_with_nonce`]). Each signature in
+    /// `signatures` is verified independently; the agent tallies
+    /// **distinct** matched pubkey indices (per design §3.3, two
+    /// signatures from the same key count as one) and accepts the
+    /// submission iff:
     /// - at least `min_distinct` distinct keys verified, AND
     /// - each role in `role_requirements` is carried by at least
     ///   one of the matched keys ([`Role::All`] satisfies any
     ///   required role).
     ///
-    /// Failure-mode mapping (matches the design §6.6 wire variants
-    /// A7 will introduce):
+    /// Failure-mode mapping (matches the design §6.6 wire variants):
     /// - `signatures.is_empty()` OR `0 < matched < min_distinct`
-    ///   → [`AdminAuthError::QuorumNotMet`] (no rate-limit hit —
-    ///   a quorum shortfall is operator UX, not an attack signal).
+    ///   → [`AdminAuthError::QuorumNotMet`] (not a failure — a quorum
+    ///   shortfall is operator UX, not an attack signal).
     /// - non-empty `signatures` with zero valid matches →
-    ///   [`AdminAuthError::InvalidSignature`] (rate-limit hit —
-    ///   the only way to land here is to submit signatures that
-    ///   verify under no loaded pubkey, which is an attack
-    ///   indicator).
+    ///   [`AdminAuthError::InvalidSignature`] (counted by [`ConnAuth`]
+    ///   — the only way to land here is to submit signatures that
+    ///   verify under no loaded pubkey, which is an attack indicator).
     /// - `min_distinct` keys matched but no matched key carries a
-    ///   required role → [`AdminAuthError::RoleDenied`]
-    ///   (no rate-limit hit — same rationale as A5).
-    /// - all checks pass → [`UnlockToken`] is minted; the nonce
-    ///   was consumed at the top of this method (single-use,
-    ///   regardless of outcome).
+    ///   required role → [`AdminAuthError::RoleDenied`] (not a
+    ///   failure — same rationale as A5).
+    /// - all checks pass → [`UnlockToken`] is minted.
     ///
     /// **Constant-time iteration property:** for each submitted
     /// signature, the inner per-key loop does NOT short-circuit on
-    /// match (same property as [`Self::verify_with_role`]). The
-    /// outer per-signature loop iterates every submitted signature
+    /// match (same property as [`Self::verify_with_role_with_nonce`]).
+    /// The outer per-signature loop iterates every submitted signature
     /// regardless of how many have already matched — so the total
     /// verification cost is `O(signatures × pub_keys)` regardless
     /// of which sigs verify or in which order.
-    ///
-    /// **Forward note (A7):** signatures here are over the raw
-    /// 32-byte outstanding nonce, mirroring [`Self::verify_with_role`].
-    /// A7 will introduce wire variants (`ShutdownRequest`, etc.)
-    /// that carry a [`SignedPayload`](common::wire::admin_signed_payload::SignedPayload)
-    /// and signatures over its
-    /// [`signing_digest`](common::wire::admin_signed_payload::signing_digest);
-    /// the quorum-verify machinery here stays unchanged — only the
-    /// caller-supplied "message to verify against" swaps from
-    /// `nonce[..]` to `signing_digest(payload)[..]`. That refactor
-    /// can be a pure parameter swap because both shapes produce a
-    /// fixed-size byte slice over which `verify_strict` operates.
-    pub fn verify_quorum(
+    fn verify_quorum_with_nonce(
         &self,
+        nonce: &[u8; 32],
         signatures: &[[u8; 64]],
         min_distinct: u8,
         role_requirements: &[Role],
@@ -612,27 +513,15 @@ impl AdminAuth {
              0 would mint a token with no signature"
         );
 
-        let nonce = match self.pending_challenge.lock().take() {
-            Some(n) => n,
-            None => {
-                warn!(
-                    target: "anti_tamper.admin_auth.verify_failure",
-                    reason = "no_pending_challenge",
-                    "admin quorum verify with no outstanding challenge"
-                );
-                return Err(AdminAuthError::NoPendingChallenge);
-            }
-        };
-
         // A13: snapshot the keys behind a read lock for the
-        // duration of the verify; see verify_with_role for the
-        // rationale.
+        // duration of the verify; see verify_with_role_with_nonce for
+        // the rationale.
         let pub_keys = self.pub_keys.read();
 
         // Which key each submitted signature verified against (the
         // constant-time scan keeps the last match, no early break), then
         // the shared quorum rule (`quorum_decision`, proved with Kani).
-        let per_signature = admin_quorum::match_signatures(&pub_keys, &nonce, signatures);
+        let per_signature = admin_quorum::match_signatures(&pub_keys, nonce, signatures);
         let distinct = distinct_matches(&per_signature).len().min(u8::MAX as usize) as u8;
         match quorum_decision(
             &per_signature,
@@ -642,10 +531,8 @@ impl AdminAuth {
         ) {
             QuorumDecision::Accept => {}
             // Zero matches + non-empty submission = attack signal. Zero
-            // matches + empty submission = operator UX (no rate-limit).
+            // matches + empty submission = operator UX (not counted).
             QuorumDecision::NoValidSignature => {
-                self.failure_count.fetch_add(1, Ordering::SeqCst);
-                *self.last_failure.lock() = Some(Instant::now());
                 warn!(
                     target: "anti_tamper.admin_auth.verify_failure",
                     reason = "invalid_sig",
@@ -683,10 +570,6 @@ impl AdminAuth {
             }
         }
 
-        // All checks pass — mint the token. Reset failure state on
-        // success (consistent with verify_with_role).
-        self.failure_count.store(0, Ordering::SeqCst);
-        *self.last_failure.lock() = None;
         info!(
             target: "anti_tamper.admin_auth.verify_success",
             distinct,
@@ -701,10 +584,10 @@ impl AdminAuth {
     /// the `.sig` next to an operator overlay), at agent boot.
     ///
     /// Same signature, quorum, role, op and `agent_id` checks as
-    /// [`Self::verify_signed_payload_quorum`], without the parts that only
+    /// [`ConnAuth::verify_signed_payload_quorum`], without the parts that only
     /// make sense for a live request: no challenge nonce is consumed, no
     /// timestamp skew window applies (the caller orders stored signatures
-    /// by `ts` to refuse a rollback), and no rate-limit / failure counter
+    /// by `ts` to refuse a rollback), and no connection failure counter
     /// is touched (a bad file at boot is not a brute-force attempt).
     /// Returns the fingerprints of the matched keys.
     pub fn verify_stored_payload(
@@ -789,84 +672,60 @@ impl AdminAuth {
     ///   `role_requirements`.
     /// - A6: distinct-key tally must meet `min_distinct`.
     ///
-    /// The outstanding nonce is consumed at the top of this
-    /// method (single-use, regardless of outcome) AND
-    /// `payload.nonce` must equal that nonce — same nonce-binding
-    /// the legacy [`Self::verify_unlock`] enforces, surfaced as
-    /// `NonceMismatch` for the SignedPayload path.
+    /// `expected_nonce` is the challenge the connection issued and has
+    /// just consumed ([`ConnAuth`]); `payload.nonce` must equal it.
     ///
-    /// Failure-mode summary (matching design §6.6 wire variants):
-    /// - `NoPendingChallenge` → no challenge has been issued.
-    /// - `NonceMismatch` → payload nonce ≠ outstanding nonce
-    ///   (rate-limit++ — attack signal).
+    /// Failure-mode summary (matching design §6.6 wire variants; "counted"
+    /// means [`ConnAuth`] counts it against the connection):
+    /// - `NonceMismatch` → payload nonce ≠ the connection's challenge
+    ///   (counted — attack signal).
     /// - `UnknownOperation` → `payload.op` is not the expected
-    ///   one for this wire variant (rate-limit++).
+    ///   one for this wire variant (counted).
     /// - `AgentIdMismatch` → `payload.agent_id` ≠ `self.agent_id`
-    ///   (rate-limit++).
-    /// - `TimestampSkew` → outside ±60 s window (no rate-limit —
+    ///   (counted).
+    /// - `TimestampSkew` → outside ±60 s window (not counted —
     ///   operator-clock issue).
     /// - `QuorumNotMet` → fewer distinct valid signatures than
-    ///   `min_distinct` (no rate-limit — operator UX).
+    ///   `min_distinct` (not counted — operator UX).
     /// - `InvalidSignature` → zero valid matches in non-empty
-    ///   submission (rate-limit++).
+    ///   submission (counted).
     /// - `RoleDenied` → matched keys are short of a required
-    ///   role (no rate-limit).
+    ///   role (not counted).
     /// - Success → mint `UnlockToken`.
     ///
-    /// Caller pattern (production dispatcher, A7):
-    /// ```text
-    /// let now = SystemClock.now_unix_secs();
-    /// auth.verify_signed_payload_quorum(
-    ///     &req.payload,
-    ///     &sigs,
-    ///     2,                        // shutdown quorum
-    ///     &[Role::Shutdown],        // §3.3 role requirement
-    ///     OperationCode::Shutdown,  // expected op
-    ///     now,
-    /// )?;
-    /// ```
-    /// PHASE_D_004: the success arm returns `(UnlockToken,
-    /// Vec<String>)` where the `Vec` is the 8-hex-char
-    /// fingerprints of every matched key, primary first by index
-    /// order in `admin.pub`. The dispatch layer threads these
-    /// into the audit log's `key_fp` / `cosigner_fps` fields so
-    /// the chain records WHICH operator(s) authorised each
-    /// signed action.
-    pub fn verify_signed_payload_quorum(
+    /// PHASE_D_004: the success arm carries the 8-hex-char fingerprints
+    /// of every matched key, primary first by index order in
+    /// `admin.pub`. The dispatch layer threads these into the audit
+    /// log's `key_fp` / `cosigner_fps` fields so the chain records WHICH
+    /// operator(s) authorised each signed action.
+    ///
+    /// External audit NN-AUD-083 / NN-AUD-084: it also carries the
+    /// matched keys themselves (key and roles), read under the same lock
+    /// as the signature scan, so a dispatcher can confine what the
+    /// operation does to what its signers hold. A 4-byte fingerprint
+    /// looked up later must not drive authorization, and a reload can
+    /// happen in between.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_signed_payload_quorum_with_nonce(
         &self,
+        expected_nonce: &[u8; 32],
         payload: &SignedPayload,
         signatures: &[[u8; 64]],
         min_distinct: u8,
         role_requirements: &[Role],
         expected_op: admin_signed_payload::OperationCode,
         server_now_unix_secs: u64,
-    ) -> std::result::Result<(UnlockToken, Vec<String>), AdminAuthError> {
+    ) -> std::result::Result<VerifiedSigners, AdminAuthError> {
         debug_assert!(
             min_distinct >= 1,
             "verify_signed_payload_quorum: min_distinct must be >= 1 \
              (got {min_distinct}); 0 would mint a token with no signature"
         );
 
-        // Consume the outstanding nonce up front (single-use,
-        // regardless of subsequent failure). Mirrors verify_quorum.
-        let nonce = match self.pending_challenge.lock().take() {
-            Some(n) => n,
-            None => {
-                warn!(
-                    target: "anti_tamper.admin_auth.verify_failure",
-                    reason = "no_pending_challenge",
-                    "signed-payload quorum verify with no outstanding challenge"
-                );
-                return Err(AdminAuthError::NoPendingChallenge);
-            }
-        };
-
         // Operation tag must match what this wire variant expects.
         // Cheap field check first — surfaces a clear "wrong wire
         // shape" error before we burn an Ed25519 verify on it.
         if payload.op != expected_op {
-            self.failure_count.fetch_add(1, Ordering::SeqCst);
-            *self.last_failure.lock() = Some(Instant::now());
             warn!(
                 target: "anti_tamper.admin_auth.verify_failure",
                 reason = "unknown_operation",
@@ -881,11 +740,9 @@ impl AdminAuth {
         }
 
         // Nonce binding: payload must reference THE nonce the
-        // server issued. A forged payload that names some other
-        // nonce can't replay an old signature here.
-        if payload.nonce != nonce {
-            self.failure_count.fetch_add(1, Ordering::SeqCst);
-            *self.last_failure.lock() = Some(Instant::now());
+        // server issued on this connection. A forged payload that
+        // names some other nonce can't replay an old signature here.
+        if payload.nonce != *expected_nonce {
             warn!(
                 target: "anti_tamper.admin_auth.verify_failure",
                 reason = "nonce_mismatch",
@@ -897,8 +754,6 @@ impl AdminAuth {
         // Agent-ID binding (design §6.4 layer 3). A captured
         // signature from agent-A is rejected against agent-B.
         if payload.agent_id != self.agent_id {
-            self.failure_count.fetch_add(1, Ordering::SeqCst);
-            *self.last_failure.lock() = Some(Instant::now());
             warn!(
                 target: "anti_tamper.admin_auth.verify_failure",
                 reason = "agent_id_mismatch",
@@ -908,8 +763,8 @@ impl AdminAuth {
         }
 
         // Timestamp skew (design §6.4 layer 2). Pure predicate
-        // from A4 — no rate-limit increment on failure (operator
-        // clock issue, not attack).
+        // from A4 — not counted on failure (operator clock issue,
+        // not attack).
         if let Err(TimestampSkewError::OutOfWindow {
             server_ts,
             max_skew_secs,
@@ -938,8 +793,9 @@ impl AdminAuth {
         let pub_keys = self.pub_keys.read();
 
         // Per-signature constant-time scan (same machinery as
-        // verify_quorum, except the message bytes are the SignedPayload
-        // digest instead of the raw nonce), then the shared quorum rule.
+        // verify_quorum_with_nonce, except the message bytes are the
+        // SignedPayload digest instead of the raw nonce), then the shared
+        // quorum rule.
         let per_signature = admin_quorum::match_signatures(&pub_keys, &digest, signatures);
         let matched = distinct_matches(&per_signature);
         let distinct = matched.len().min(u8::MAX as usize) as u8;
@@ -952,8 +808,6 @@ impl AdminAuth {
             QuorumDecision::Accept => {}
             // Zero matches + non-empty submission = attack signal.
             QuorumDecision::NoValidSignature => {
-                self.failure_count.fetch_add(1, Ordering::SeqCst);
-                *self.last_failure.lock() = Some(Instant::now());
                 warn!(
                     target: "anti_tamper.admin_auth.verify_failure",
                     reason = "invalid_sig",
@@ -989,16 +843,14 @@ impl AdminAuth {
             }
         }
 
-        // All checks pass.
-        self.failure_count.store(0, Ordering::SeqCst);
-        *self.last_failure.lock() = None;
-        // PHASE_D_004: collect the matched-key fingerprints (in
-        // matched-order, which is admin.pub index-order via the
-        // per-sig scan above) for the audit log.
-        let matched_fps: Vec<String> = matched
+        // All checks pass. PHASE_D_004: the matched-key fingerprints (in
+        // matched-order, which is admin.pub index-order via the per-sig
+        // scan above) for the audit log, and the matched keys themselves.
+        let fingerprints: Vec<String> = matched
             .iter()
             .map(|&idx| fingerprint(&pub_keys[idx].key))
             .collect();
+        let keys: Vec<KeyEntry> = matched.iter().map(|&idx| pub_keys[idx].clone()).collect();
         info!(
             target: "anti_tamper.admin_auth.verify_success",
             op = ?expected_op,
@@ -1007,33 +859,242 @@ impl AdminAuth {
             role_count = role_requirements.len(),
             "signed-payload quorum verified, unlock token minted"
         );
-        Ok((mint_unlock_token(), matched_fps))
+        Ok(VerifiedSigners {
+            token: mint_unlock_token(),
+            fingerprints,
+            keys,
+        })
     }
+}
 
-    /// Inspect rate-limit state and reset the counter when the
-    /// window has slid past the most recent failure. Returns
-    /// `Some(retry_after_secs)` if currently throttled, `None`
-    /// otherwise.
-    fn check_rate_limit(&self) -> Option<u32> {
-        let now = Instant::now();
-        let mut last = self.last_failure.lock();
-        match *last {
-            None => None,
-            Some(t) if now.saturating_duration_since(t) >= self.rate_limit_window => {
-                // Window elapsed — clear state, fresh start.
-                self.failure_count.store(0, Ordering::SeqCst);
-                *last = None;
-                None
-            }
-            Some(t) if self.failure_count.load(Ordering::SeqCst) >= RATE_LIMIT_THRESHOLD => {
-                let elapsed = now.saturating_duration_since(t);
-                let remaining = self.rate_limit_window.saturating_sub(elapsed);
-                // +1 so we never advertise "retry in 0s" while still throttled.
-                Some(remaining.as_secs() as u32 + 1)
-            }
-            Some(_) => None,
+/// What a successful signed-payload verify yields: the capability token,
+/// the matched keys' fingerprints (for the audit log) and the matched
+/// keys with their roles (external audit NN-AUD-083 / NN-AUD-084).
+#[derive(Debug)]
+pub struct VerifiedSigners {
+    pub token: UnlockToken,
+    pub fingerprints: Vec<String>,
+    pub keys: Vec<KeyEntry>,
+}
+
+/// A fresh 32-byte challenge from OS entropy. `OsRng` is deliberately
+/// preferred over `rand::thread_rng()` — for security primitives we want
+/// the OS CSPRNG directly, not a userland-cached source.
+fn mint_challenge_nonce() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+
+/// External audit NN-AUD-078 / NN-AUD-079: the authentication state of
+/// ONE admin-socket connection — its outstanding challenge and the
+/// signature checks it has failed. The socket server builds one per
+/// connection; it is the only way to verify a live request.
+///
+/// The challenge used to be a single agent-wide slot that any client
+/// could overwrite with an unauthenticated `ChallengeRequest`, and the
+/// failure count was agent-wide too: a polling dashboard broke a
+/// concurrent `unlock` with `NonceMismatch`, and three bad signatures from
+/// anyone blocked every client for five minutes. Every in-repo client
+/// fetches the challenge and submits the signed request on the same
+/// stream, so binding both to the connection costs them nothing.
+///
+/// Dereferences to the [`AdminAuth`] it was built from, for the key-set
+/// accessors (`config_path`, `reload`, `agent_id`, …).
+#[derive(Debug)]
+pub struct ConnAuth<'a> {
+    auth: &'a AdminAuth,
+    nonce: Cell<Option<[u8; 32]>>,
+    failures: Cell<u32>,
+}
+
+impl<'a> ConnAuth<'a> {
+    pub fn new(auth: &'a AdminAuth) -> Self {
+        Self {
+            auth,
+            nonce: Cell::new(None),
+            failures: Cell::new(0),
         }
     }
+
+    /// Mint a challenge for this connection, replacing the one it asked
+    /// for before (if any). Refused once the connection has used up its
+    /// failures.
+    pub fn issue_challenge(&self) -> std::result::Result<[u8; 32], AdminAuthError> {
+        if self.exhausted() {
+            return Err(AdminAuthError::RateLimited {
+                retry_after_secs: CONNECTION_RETRY_AFTER_SECS,
+            });
+        }
+        let nonce = mint_challenge_nonce();
+        self.nonce.set(Some(nonce));
+        info!(
+            target: "anti_tamper.admin_auth.challenge_issued",
+            "admin challenge issued (32-byte nonce)"
+        );
+        Ok(nonce)
+    }
+
+    /// Verify `signature` over this connection's challenge, requiring
+    /// [`Role::Unlock`]. Every admin.pub line — including pubkey-only
+    /// lines from before A5 — has `unlock` in its allowlist by default.
+    pub fn verify_unlock(
+        &self,
+        signature: &[u8; 64],
+    ) -> std::result::Result<UnlockToken, AdminAuthError> {
+        self.verify_with_role(signature, Role::Unlock)
+    }
+
+    /// See `AdminAuth::verify_with_role_with_nonce`. The challenge is
+    /// consumed whatever the outcome.
+    pub fn verify_with_role(
+        &self,
+        signature: &[u8; 64],
+        required_role: Role,
+    ) -> std::result::Result<UnlockToken, AdminAuthError> {
+        let nonce = self.take_challenge()?;
+        let outcome = self
+            .auth
+            .verify_with_role_with_nonce(&nonce, signature, required_role);
+        self.count(outcome)
+    }
+
+    /// See `AdminAuth::verify_quorum_with_nonce`.
+    pub fn verify_quorum(
+        &self,
+        signatures: &[[u8; 64]],
+        min_distinct: u8,
+        role_requirements: &[Role],
+    ) -> std::result::Result<UnlockToken, AdminAuthError> {
+        let nonce = self.take_challenge()?;
+        let outcome =
+            self.auth
+                .verify_quorum_with_nonce(&nonce, signatures, min_distinct, role_requirements);
+        self.count(outcome)
+    }
+
+    /// See `AdminAuth::verify_signed_payload_quorum_with_nonce`. Returns
+    /// the token and the matched keys' fingerprints.
+    pub fn verify_signed_payload_quorum(
+        &self,
+        payload: &SignedPayload,
+        signatures: &[[u8; 64]],
+        min_distinct: u8,
+        role_requirements: &[Role],
+        expected_op: admin_signed_payload::OperationCode,
+        server_now_unix_secs: u64,
+    ) -> std::result::Result<(UnlockToken, Vec<String>), AdminAuthError> {
+        self.verify_signed_payload_quorum_keys(
+            payload,
+            signatures,
+            min_distinct,
+            role_requirements,
+            expected_op,
+            server_now_unix_secs,
+        )
+        .map(|v| (v.token, v.fingerprints))
+    }
+
+    /// [`Self::verify_signed_payload_quorum`] that also returns the
+    /// matched keys with their roles (external audit NN-AUD-083 /
+    /// NN-AUD-084).
+    pub fn verify_signed_payload_quorum_keys(
+        &self,
+        payload: &SignedPayload,
+        signatures: &[[u8; 64]],
+        min_distinct: u8,
+        role_requirements: &[Role],
+        expected_op: admin_signed_payload::OperationCode,
+        server_now_unix_secs: u64,
+    ) -> std::result::Result<VerifiedSigners, AdminAuthError> {
+        let nonce = self.take_challenge()?;
+        let outcome = self.auth.verify_signed_payload_quorum_with_nonce(
+            &nonce,
+            payload,
+            signatures,
+            min_distinct,
+            role_requirements,
+            expected_op,
+            server_now_unix_secs,
+        );
+        self.count(outcome)
+    }
+
+    /// `true` once the connection has failed
+    /// [`MAX_AUTH_FAILURES_PER_CONNECTION`] signature checks: the server
+    /// closes it after the reply.
+    pub fn exhausted(&self) -> bool {
+        self.failures.get() >= MAX_AUTH_FAILURES_PER_CONNECTION
+    }
+
+    /// The connection's challenge, consumed (single use, whatever the
+    /// outcome of the verify).
+    fn take_challenge(&self) -> std::result::Result<[u8; 32], AdminAuthError> {
+        if self.exhausted() {
+            return Err(AdminAuthError::RateLimited {
+                retry_after_secs: CONNECTION_RETRY_AFTER_SECS,
+            });
+        }
+        self.nonce.take().ok_or_else(|| {
+            warn!(
+                target: "anti_tamper.admin_auth.verify_failure",
+                reason = "no_pending_challenge",
+                "admin verify with no outstanding challenge on this connection"
+            );
+            AdminAuthError::NoPendingChallenge
+        })
+    }
+
+    /// Count a failed signature check against the connection. The one
+    /// that uses up the budget is answered `RateLimited` (the reason is
+    /// in the journal line the verify already wrote).
+    fn count<T>(
+        &self,
+        outcome: std::result::Result<T, AdminAuthError>,
+    ) -> std::result::Result<T, AdminAuthError> {
+        let Err(e) = outcome else {
+            return outcome;
+        };
+        if !counts_as_failure(&e) {
+            return Err(e);
+        }
+        let failures = self.failures.get().saturating_add(1);
+        self.failures.set(failures);
+        if failures < MAX_AUTH_FAILURES_PER_CONNECTION {
+            return Err(e);
+        }
+        warn!(
+            target: "anti_tamper.admin_auth.verify_failure",
+            reason = "connection_failure_budget",
+            failures,
+            last = %e,
+            "admin connection failed {failures} signature checks; answering RateLimited and closing it"
+        );
+        Err(AdminAuthError::RateLimited {
+            retry_after_secs: CONNECTION_RETRY_AFTER_SECS,
+        })
+    }
+}
+
+impl std::ops::Deref for ConnAuth<'_> {
+    type Target = AdminAuth;
+
+    fn deref(&self) -> &AdminAuth {
+        self.auth
+    }
+}
+
+/// The verify outcomes that are an attack signal (a signature or a binding
+/// that does not hold) rather than operator UX (missing challenge, quorum
+/// shortfall, wrong role, clock skew).
+fn counts_as_failure(e: &AdminAuthError) -> bool {
+    matches!(
+        e,
+        AdminAuthError::InvalidSignature
+            | AdminAuthError::NonceMismatch
+            | AdminAuthError::AgentIdMismatch
+            | AdminAuthError::UnknownOperation { .. }
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1509,7 +1570,8 @@ mod tests {
     #[test]
     fn issue_challenge_returns_32_bytes_of_entropy() {
         let (_, vk) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let n1 = auth.issue_challenge().expect("issue");
         let n2 = auth.issue_challenge().expect("issue");
         // Two random 32-byte nonces colliding has probability 2^-256.
@@ -1521,7 +1583,8 @@ mod tests {
     #[test]
     fn issue_challenge_overwrites_previous_pending() {
         let (signing, vk) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let stale = auth.issue_challenge().unwrap();
         let fresh = auth.issue_challenge().unwrap();
         assert_ne!(stale, fresh);
@@ -1537,7 +1600,8 @@ mod tests {
     #[test]
     fn verify_unlock_succeeds_with_valid_signature() {
         let (signing, vk) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
         let _token = auth.verify_unlock(&sig).expect("verify should succeed");
@@ -1549,7 +1613,8 @@ mod tests {
     fn verify_unlock_fails_with_invalid_signature() {
         let (_, vk) = make_keypair();
         let (other_signing, _) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         // Sign the right nonce with the WRONG private key.
         let bad_sig: [u8; 64] = other_signing.sign(&nonce).to_bytes();
@@ -1561,7 +1626,8 @@ mod tests {
     fn verify_unlock_consumes_nonce_even_on_failure() {
         let (signing, vk) = make_keypair();
         let (other_signing, _) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
 
         // First attempt: wrong key → fail, nonce consumed.
@@ -1582,7 +1648,8 @@ mod tests {
     #[test]
     fn verify_unlock_with_no_outstanding_challenge() {
         let (signing, vk) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let dummy_msg = [0u8; 32];
         let sig: [u8; 64] = signing.sign(&dummy_msg).to_bytes();
         let err = auth.verify_unlock(&sig).unwrap_err();
@@ -1596,93 +1663,109 @@ mod tests {
         let (_, k1) = make_keypair();
         let (_, k2) = make_keypair();
         let (s3, k3) = make_keypair();
-        let auth = AdminAuth::build(vec![k1, k2, k3], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![k1, k2, k3]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = s3.sign(&nonce).to_bytes();
         let _ = auth.verify_unlock(&sig).expect("third key should verify");
     }
 
-    // ── rate limit ─────────────────────────────────────────────────
+    // ── per-connection challenge and failure budget ───────────────
 
+    /// External audit NN-AUD-078: a challenge issued to another
+    /// connection neither replaces nor consumes mine.
     #[test]
-    fn rate_limit_triggers_after_3_failures() {
-        let (_, vk) = make_keypair();
-        let (other, _) = make_keypair();
-        let auth = AdminAuth::new_with_window(vec![vk], Duration::from_secs(5 * 60));
-
-        for _ in 0..RATE_LIMIT_THRESHOLD {
-            let nonce = auth.issue_challenge().unwrap();
-            let bad: [u8; 64] = other.sign(&nonce).to_bytes();
-            assert!(auth.verify_unlock(&bad).is_err());
+    fn challenge_on_other_connection_does_not_invalidate_mine() {
+        let (signing, vk) = make_keypair();
+        let auth = AdminAuth::build(vec![vk]);
+        let mine = ConnAuth::new(&auth);
+        let other = ConnAuth::new(&auth);
+        let nonce = mine.issue_challenge().unwrap();
+        for _ in 0..8 {
+            other.issue_challenge().unwrap();
         }
-
-        // 4th challenge attempt must hit the gate.
-        let err = auth.issue_challenge().unwrap_err();
-        match err {
-            AdminAuthError::RateLimited { retry_after_secs } => {
-                assert!(retry_after_secs > 0, "retry_after must be positive");
-                assert!(
-                    retry_after_secs <= 5 * 60 + 1,
-                    "retry_after must not exceed window+1: {retry_after_secs}"
-                );
-            }
-            other => panic!("expected RateLimited, got {other:?}"),
-        }
+        // The other connection consumes ITS challenge with a bad signature.
+        let _ = other.verify_unlock(&[0u8; 64]);
+        let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
+        mine.verify_unlock(&sig)
+            .expect("my challenge must survive another connection's requests");
     }
 
+    /// External audit NN-AUD-079: the connection that fails
+    /// MAX_AUTH_FAILURES_PER_CONNECTION signature checks is answered
+    /// `RateLimited` on the last one and gets no further challenge.
     #[test]
-    fn rate_limit_resets_after_window() {
+    fn third_failure_exhausts_the_connection() {
         let (_, vk) = make_keypair();
         let (other, _) = make_keypair();
-        // 100 ms window so the test runs in ~150 ms total.
-        let window = Duration::from_millis(100);
-        let auth = AdminAuth::new_with_window(vec![vk], window);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
 
-        for _ in 0..RATE_LIMIT_THRESHOLD {
+        for attempt in 1..=MAX_AUTH_FAILURES_PER_CONNECTION {
             let nonce = auth.issue_challenge().unwrap();
             let bad: [u8; 64] = other.sign(&nonce).to_bytes();
-            let _ = auth.verify_unlock(&bad);
+            let err = auth.verify_unlock(&bad).unwrap_err();
+            if attempt < MAX_AUTH_FAILURES_PER_CONNECTION {
+                assert!(matches!(err, AdminAuthError::InvalidSignature), "{err:?}");
+                assert!(!auth.exhausted());
+            } else {
+                assert!(
+                    matches!(err, AdminAuthError::RateLimited { retry_after_secs } if retry_after_secs > 0),
+                    "{err:?}"
+                );
+            }
         }
-        // Throttled.
+        assert!(auth.exhausted());
         assert!(matches!(
             auth.issue_challenge(),
             Err(AdminAuthError::RateLimited { .. })
         ));
-
-        // Wait past the window.
-        std::thread::sleep(window + Duration::from_millis(20));
-
-        // Counter has slid past; a fresh challenge issues.
-        assert!(auth.issue_challenge().is_ok());
     }
 
+    /// External audit NN-AUD-079: failures on one connection do not
+    /// rate-limit another — the old agent-wide counter let anyone lock
+    /// every operator out by sending three bad signatures.
     #[test]
-    fn rate_limit_counter_resets_on_successful_verify() {
+    fn failures_on_one_connection_do_not_rate_limit_another() {
         let (signing, vk) = make_keypair();
         let (other, _) = make_keypair();
-        let auth = AdminAuth::new_with_window(vec![vk], Duration::from_secs(5 * 60));
-
-        // Two failures — under threshold.
-        for _ in 0..2 {
-            let nonce = auth.issue_challenge().unwrap();
-            let bad: [u8; 64] = other.sign(&nonce).to_bytes();
-            let _ = auth.verify_unlock(&bad);
+        let auth = AdminAuth::build(vec![vk]);
+        let hostile = ConnAuth::new(&auth);
+        for _ in 0..MAX_AUTH_FAILURES_PER_CONNECTION {
+            let nonce = hostile.issue_challenge().unwrap();
+            let _ = hostile.verify_unlock(&other.sign(&nonce).to_bytes());
         }
-        // Successful verify resets the counter.
-        let nonce = auth.issue_challenge().unwrap();
-        let good: [u8; 64] = signing.sign(&nonce).to_bytes();
-        let _ = auth.verify_unlock(&good).expect("verify");
+        assert!(hostile.exhausted());
 
-        // Three more failures from a clean slate — still allowed
-        // (i.e., the counter really did reset; otherwise we'd hit
-        // the gate after just one more).
-        for _ in 0..2 {
+        let operator = ConnAuth::new(&auth);
+        let nonce = operator
+            .issue_challenge()
+            .expect("another connection is not rate-limited");
+        operator
+            .verify_unlock(&signing.sign(&nonce).to_bytes())
+            .expect("and its signature verifies");
+    }
+
+    /// Operator-UX outcomes (no challenge, quorum shortfall, wrong role)
+    /// never use up the connection's budget.
+    #[test]
+    fn operator_ux_errors_do_not_count_against_the_connection() {
+        let (signing, vk) = make_keypair();
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
+        for _ in 0..5 {
+            assert!(matches!(
+                auth.verify_unlock(&[0u8; 64]),
+                Err(AdminAuthError::NoPendingChallenge)
+            ));
             let nonce = auth.issue_challenge().unwrap();
-            let bad: [u8; 64] = other.sign(&nonce).to_bytes();
-            let _ = auth.verify_unlock(&bad);
+            assert!(matches!(
+                auth.verify_with_role(&signing.sign(&nonce).to_bytes(), Role::Shutdown),
+                Err(AdminAuthError::RoleDenied { .. })
+            ));
         }
-        // 3rd failure trips the gate, but 1+2 should not.
-        assert!(auth.issue_challenge().is_ok());
+        assert_eq!(auth.failures.get(), 0);
+        assert!(!auth.exhausted());
     }
 
     // ── A4: timestamp skew check (§6.4 layer 2) ────────────────────
@@ -2006,7 +2089,8 @@ mod tests {
     #[test]
     fn verify_with_role_succeeds_when_key_authorises_required_role() {
         let (signing, vk) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
         // Default roles include AuditRead, so this must succeed.
@@ -2026,7 +2110,8 @@ mod tests {
         // Default roles are {Unlock, AuditRead} — they do NOT
         // include Shutdown. A correctly-signed Shutdown request
         // must surface RoleDenied, not InvalidSignature.
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
         let err = auth.verify_with_role(&sig, Role::Shutdown).unwrap_err();
@@ -2048,7 +2133,7 @@ mod tests {
         // Rate-limit counter MUST NOT have been incremented: the
         // request was a config error, not an attack signal.
         assert_eq!(
-            auth.failure_count.load(Ordering::SeqCst),
+            auth.failures.get(),
             0,
             "RoleDenied must not count toward rate-limit"
         );
@@ -2067,7 +2152,8 @@ mod tests {
             key: vk,
             roles: vec![Role::All],
         };
-        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build_entries(vec![entry]);
+        let auth = ConnAuth::new(&auth);
         for role in [
             Role::Unlock,
             Role::Shutdown,
@@ -2098,7 +2184,8 @@ mod tests {
             key: vk,
             roles: vec![Role::TelemetryRead],
         };
-        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build_entries(vec![entry]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
         match auth.verify_with_role(&sig, Role::Unlock).unwrap_err() {
@@ -2108,7 +2195,7 @@ mod tests {
             other => panic!("expected RoleDenied for telemetry-read key, got {other:?}"),
         }
         assert_eq!(
-            auth.failure_count.load(Ordering::SeqCst),
+            auth.failures.get(),
             0,
             "RoleDenied must not count toward rate-limit"
         );
@@ -2126,7 +2213,8 @@ mod tests {
             key: vk,
             roles: vec![Role::Triage],
         };
-        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build_entries(vec![entry]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
         auth.verify_with_role(&sig, Role::TelemetryRead)
@@ -2145,7 +2233,8 @@ mod tests {
             key: vk,
             roles: vec![Role::TelemetryRead],
         };
-        let auth = AdminAuth::build_entries(vec![entry], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build_entries(vec![entry]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
         match auth.verify_with_role(&sig, Role::Triage).unwrap_err() {
@@ -2155,13 +2244,13 @@ mod tests {
             other => panic!("expected RoleDenied for telemetry-read key, got {other:?}"),
         }
         assert_eq!(
-            auth.failure_count.load(Ordering::SeqCst),
+            auth.failures.get(),
             0,
             "RoleDenied must not count toward rate-limit"
         );
     }
 
-    /// The pre-A5 [`AdminAuth::verify_unlock`] entry point is now
+    /// The pre-A5 [`ConnAuth::verify_unlock`] entry point is now
     /// a wrapper around `verify_with_role(sig, Role::Unlock)` and
     /// behaves byte-identically for every legacy admin.pub line
     /// (default roles include Unlock). Anchor for the backward-
@@ -2169,7 +2258,8 @@ mod tests {
     #[test]
     fn verify_unlock_is_backward_compatible_with_pre_a5_admin_pub() {
         let (signing, vk) = make_keypair();
-        let auth = AdminAuth::build(vec![vk], DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build(vec![vk]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
         let _token = auth
@@ -2194,7 +2284,7 @@ mod tests {
             });
             signers.push(signing);
         }
-        let auth = AdminAuth::build_entries(entries, DEFAULT_RATE_LIMIT_WINDOW);
+        let auth = AdminAuth::build_entries(entries);
         (auth, signers)
     }
 
@@ -2207,6 +2297,7 @@ mod tests {
             vec![Role::Shutdown, Role::Unlock],
             vec![Role::Shutdown, Role::AuditRead],
         ]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sigs = [
             signers[0].sign(&nonce).to_bytes(),
@@ -2224,6 +2315,7 @@ mod tests {
     fn verify_quorum_rejects_insufficient_distinct_signatures_without_rate_limit() {
         let (auth, signers) =
             build_auth_with_keyed_roles(&[vec![Role::Shutdown], vec![Role::Shutdown]]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sigs = [signers[0].sign(&nonce).to_bytes()];
         match auth.verify_quorum(&sigs, 2, &[Role::Shutdown]) {
@@ -2236,7 +2328,7 @@ mod tests {
         // Rate-limit counter MUST stay at zero — operator UX
         // event, not attack signal.
         assert_eq!(
-            auth.failure_count.load(Ordering::SeqCst),
+            auth.failures.get(),
             0,
             "QuorumNotMet must not count toward rate-limit"
         );
@@ -2250,6 +2342,7 @@ mod tests {
     fn verify_quorum_tallies_distinct_keys_not_signatures() {
         let (auth, signers) =
             build_auth_with_keyed_roles(&[vec![Role::Shutdown], vec![Role::Shutdown]]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         // Same signing key, twice.
         let sig0: [u8; 64] = signers[0].sign(&nonce).to_bytes();
@@ -2277,6 +2370,7 @@ mod tests {
             vec![Role::RotateKeys, Role::Unlock], // the rotate-keys-bearing co-signer
             vec![Role::Unlock],                   // the "any second admin" co-signer
         ]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sigs = [
             signers[0].sign(&nonce).to_bytes(),
@@ -2296,6 +2390,7 @@ mod tests {
             vec![Role::Unlock, Role::AuditRead],
             vec![Role::Unlock, Role::AuditRead],
         ]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sigs = [
             signers[0].sign(&nonce).to_bytes(),
@@ -2309,7 +2404,7 @@ mod tests {
         }
         // RoleDenied also must not trip the rate-limit counter —
         // legit operator with the wrong key, not attack.
-        assert_eq!(auth.failure_count.load(Ordering::SeqCst), 0);
+        assert_eq!(auth.failures.get(), 0);
     }
 
     /// Required A6 test 6 (counts only valid signatures): a
@@ -2321,6 +2416,7 @@ mod tests {
     fn verify_quorum_counts_only_valid_matching_signatures() {
         let (auth, signers) =
             build_auth_with_keyed_roles(&[vec![Role::Shutdown], vec![Role::Shutdown]]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let valid: [u8; 64] = signers[0].sign(&nonce).to_bytes();
         let garbage: [u8; 64] = [0u8; 64];
@@ -2335,7 +2431,7 @@ mod tests {
         // Submission HAD a garbage sig but ALSO had a valid one
         // — so it's not an "all-invalid" attack signal. Rate-limit
         // counter must stay zero.
-        assert_eq!(auth.failure_count.load(Ordering::SeqCst), 0);
+        assert_eq!(auth.failures.get(), 0);
     }
 
     // ── Supplementary A6 tests ─────────────────────────────────────
@@ -2346,6 +2442,7 @@ mod tests {
     #[test]
     fn verify_quorum_all_garbage_signatures_trips_rate_limit() {
         let (auth, _) = build_auth_with_keyed_roles(&[vec![Role::Shutdown]]);
+        let auth = ConnAuth::new(&auth);
         let _nonce = auth.issue_challenge().unwrap();
         let sigs = [[0u8; 64], [1u8; 64]];
         match auth.verify_quorum(&sigs, 1, &[]) {
@@ -2353,7 +2450,7 @@ mod tests {
             other => panic!("expected InvalidSignature, got {other:?}"),
         }
         assert_eq!(
-            auth.failure_count.load(Ordering::SeqCst),
+            auth.failures.get(),
             1,
             "all-garbage submission must count toward rate-limit"
         );
@@ -2365,6 +2462,7 @@ mod tests {
     #[test]
     fn verify_quorum_rejects_empty_submission_as_quorum_not_met_no_rate_limit() {
         let (auth, _) = build_auth_with_keyed_roles(&[vec![Role::Shutdown]]);
+        let auth = ConnAuth::new(&auth);
         let _nonce = auth.issue_challenge().unwrap();
         match auth.verify_quorum(&[], 2, &[Role::Shutdown]) {
             Err(AdminAuthError::QuorumNotMet { required, provided }) => {
@@ -2373,7 +2471,7 @@ mod tests {
             }
             other => panic!("expected QuorumNotMet{{2,0}}, got {other:?}"),
         }
-        assert_eq!(auth.failure_count.load(Ordering::SeqCst), 0);
+        assert_eq!(auth.failures.get(), 0);
     }
 
     /// [`Role::All`] satisfies any required role in a quorum
@@ -2382,6 +2480,7 @@ mod tests {
     #[test]
     fn verify_quorum_role_all_satisfies_any_required_role() {
         let (auth, signers) = build_auth_with_keyed_roles(&[vec![Role::All], vec![Role::Unlock]]);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let sigs = [
             signers[0].sign(&nonce).to_bytes(),
@@ -2570,8 +2669,8 @@ mod tests {
                 roles: vec![Role::Shutdown],
             })
             .collect();
-        let auth =
-            AdminAuth::build_entries_with_agent_id(entries, DEFAULT_RATE_LIMIT_WINDOW, agent_id);
+        let auth = AdminAuth::build_entries_with_agent_id(entries, agent_id);
+        let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_shutdown(nonce, 1_700_000_000, agent_id, 10);
         // Sanity: signing_digest is non-empty.
@@ -2614,5 +2713,28 @@ mod tests {
                 "fp {fp} not in expected set {expected:?}"
             );
         }
+
+        // External audit NN-AUD-083 / NN-AUD-084: the `_keys` variant also
+        // hands back the matched keys with their roles.
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload::new_shutdown(nonce, 1_700_000_000, agent_id, 10);
+        let sigs: Vec<[u8; 64]> = vec![sign_payload(&payload, &signers[1]).expect("sign")];
+        let verified = auth
+            .verify_signed_payload_quorum_keys(
+                &payload,
+                &sigs,
+                1,
+                &[Role::Shutdown],
+                OperationCode::Shutdown,
+                1_700_000_000,
+            )
+            .expect("verify must succeed");
+        assert_eq!(verified.keys.len(), 1);
+        assert_eq!(verified.keys[0].key, signers[1].verifying_key());
+        assert_eq!(verified.keys[0].roles, vec![Role::Shutdown]);
+        assert_eq!(
+            verified.fingerprints,
+            vec![fingerprint(&signers[1].verifying_key())]
+        );
     }
 }

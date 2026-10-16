@@ -258,7 +258,8 @@ enum Cmd {
     /// the full Tappa 8 verify path (nonce binding, timestamp
     /// skew, agent_id binding, signature verify, role check).
     /// 1-of-N quorum — only `--key` is required. The admin.pub
-    /// line for that key MUST include the `force-posture` role.
+    /// line for that key MUST include the `force-posture` role, and
+    /// also `unlock` to leave COMBAT.
     ///
     /// NOT the preferred path out of COMBAT. `nn-admin unlock`
     /// carries clearer audit semantics ("admin acknowledged
@@ -541,7 +542,9 @@ enum RotateKeysCmd {
         #[arg(long = "new-pubkey")]
         new_pubkey: String,
         /// Comma-separated role allowlist for the new key. At
-        /// least one role required. Maps to design §3.2 roles.
+        /// least one role required. Maps to design §3.2 roles. Each
+        /// role must be held by one of the signing keys (`all` only
+        /// by a key holding `all`).
         #[arg(long = "new-roles", default_value = "unlock,audit-read")]
         new_roles: String,
         /// Path to the operator's primary admin private key
@@ -1631,8 +1634,10 @@ fn exit_from_force_posture(
                 "{}",
                 colorize(
                     "force-posture: role denied (key verified but lacks the \
-                     `force-posture` role in admin.pub — add it to the line's \
-                     role list, e.g. `<hex>  force-posture,unlock`)",
+                     `force-posture` role in admin.pub, or the target leaves \
+                     COMBAT and the key lacks `unlock` — add the role to the \
+                     line's role list, e.g. `<hex>  force-posture,unlock`, or \
+                     use `nn-admin unlock`)",
                     "31",
                     tty
                 )
@@ -2148,8 +2153,8 @@ fn exit_from_rotate_keys(outcome: RotateKeysOutcome, op_label: &str) -> ExitCode
         }
         RotateKeysOutcome::RoleDenied => {
             eprintln!(
-                "{op_label}: role denied (one of the submitted keys lacks the \
-                 `rotate-keys` role in admin.pub)"
+                "{op_label}: role denied (no submitted key holds the `rotate-keys` \
+                 role in admin.pub, or the new key asks for a role no signer holds)"
             );
             ExitCode::from(7)
         }

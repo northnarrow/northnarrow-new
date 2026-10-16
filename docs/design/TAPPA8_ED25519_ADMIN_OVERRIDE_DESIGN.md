@@ -79,7 +79,7 @@ Anything outside that boundary is hostile by assumption.
 | Surface | Where | Notes |
 |---|---|---|
 | Pubkey loading (multi-key, hex, `#` comments) | `agent/src/anti_tamper/admin_auth.rs:87-130` | At least one key required; line-numbered parse errors. |
-| `AdminAuth` server: challenge issuance, verify, rate-limit (3 fails / 5 min) | `admin_auth.rs:153-257` | OsRng nonces, constant-time multi-key verify, nonce consumed even on failed verify. |
+| `AdminAuth` server: challenge issuance, verify, rate-limit (3 fails / 5 min; per connection since external audit NN-AUD-078/079) | `admin_auth.rs:153-257` | OsRng nonces, constant-time multi-key verify, nonce consumed even on failed verify. |
 | `UnlockToken` capability type | `network_isolate.rs:48-64` | Zero-size private-field token; `mint_unlock_token()` is `pub(in crate::anti_tamper)` — type-system prevents external minting. |
 | `PostureMachine::admin_release_combat_with_token` | `posture/mod.rs:310-340` | Combat → Alerted (intentionally not Engaged, see docstring). Fires `combat_release_hook` so `NetworkIsolator::release` can tear down iptables. |
 | Wire protocol enum `AdminMessage` | `common/src/wire/admin_protocol.rs:103-130` | Variants: `ChallengeRequest`, `Challenge`, `Unlock`, `UnlockResult`, `Status`, `StatusResponse`, `DebugForcePosture(Ack)`. Length-prefixed framing, 64 KiB max body. |
@@ -388,7 +388,10 @@ Three layers:
 1. **Nonce single-use** (already implemented):
    `admin_auth.rs:188-198` consumes the pending challenge inside
    `verify_unlock` regardless of outcome. A replay of an old
-   signature always hits `NoPendingChallenge`.
+   signature always hits `NoPendingChallenge`. Since external audit
+   NN-AUD-078 the pending challenge belongs to the connection that
+   asked for it (`ConnAuth`): a challenge requested on another
+   connection neither replaces nor consumes it.
 2. **Timestamp skew check** (NEW): server rejects `ts` outside a
    ± **60 s** window relative to its own clock. Replay of an
    ancient capture is bounded. Required because nonce single-use
@@ -774,11 +777,11 @@ is "crash" by definition.
 | A8 | nn-admin invoked from a compromised user shell on the operator's workstation | Out of scope by definition (the workstation is in the trust boundary). Defence-in-depth: HSM (§13 Q6) requires physical touch per signature. |
 | A9 | Quorum requested but only 1 signature provided | server returns `QuorumNotMet { required: 2, provided: 1 }`; exit 6. |
 | A10 | All quorum signatures from the same key (one operator double-signing) | server tallies distinct fingerprints; rejects with `QuorumNotMet { required: 2, provided: 1 }`. |
-| A11 | Rate-limited (3 fails / 5 min already implemented) | server replies `RateLimited { retry_after_secs }`; exit 4. (Existing behaviour.) |
-| A12 | nn-admin exits / crashes mid-handshake (between Challenge and Unlock frames) | server's per-connection task observes EOF, the pending challenge stays in `pending_challenge` and is overwritten by the next `issue_challenge` call (existing `admin_auth.rs:352-364` test confirms). |
+| A11 | Rate-limited | External audit NN-AUD-079: the third failed signature check on one connection is answered `RateLimited { retry_after_secs }` (exit 4) and the connection is closed; other connections are not affected. (Was: 3 fails / 5 min for the whole agent.) |
+| A12 | nn-admin exits / crashes mid-handshake (between Challenge and Unlock frames) | server's per-connection task observes EOF; the pending challenge belonged to that connection and goes with it (external audit NN-AUD-078). |
 | A13 | Watchdog's `entry_hash` validation against the audit log finds the chain broken | Watchdog logs `ERROR` and restarts the agent (defence: prefer restart over honouring a possibly-forged marker). Operator sees the failed shutdown, runs `nn-admin audit verify`, investigates. |
 | A14 | `agent_id` file deleted / regenerated mid-flight | All in-flight signed payloads (including ones already sent over the wire) become `AgentIdMismatch`. nn-admin retries with the fresh agent_id (visible via `nn-admin status` which already returns it). |
-| A15 | Two simultaneous quorum operations contend for the same nonce | Existing nonce-single-use semantics handle this: second op gets `NoPendingChallenge` and must re-request. nn-admin retries. |
+| A15 | Two simultaneous quorum operations contend for the same nonce | External audit NN-AUD-078: they cannot — each connection has its own challenge, so concurrent operations (and a polling dashboard) no longer break each other with `NonceMismatch` / `NoPendingChallenge`. |
 
 ---
 
