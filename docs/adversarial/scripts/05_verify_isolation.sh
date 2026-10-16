@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Tappa 10.7 V1 — pre-attack isolation validation (the C2-containment gate).
 #
+# SUPERSEDED (external audit NN-AUD-219): it checked only for NAT adapters.
+# Use deploy/adversarial/verify-isolation.sh (adapter allowlist per VM,
+# in-guest probes, required before the snapshots).
+#
 # RUNS ON: the VirtualBox host (NIC-config checks) — and prints the
 # in-guest checks the operator runs inside each VM. MUST pass before any
 # attack run: a leaked NAT adapter would let a C2 implant reach the real

@@ -99,9 +99,15 @@ VBoxManage controlvm kalidev        nic1 null
 VBoxManage controlvm northnarrowdev nic1 null
 #   (powered off instead? use:  VBoxManage modifyvm <vm> --nic1 none)
 
-# 3. verify isolation from the target: intnet peer reachable, world is not
-ping -c1 10.10.10.10        # MUST succeed  (kalidev on intnet)
-ping -c1 1.1.1.1            # MUST fail     (no outbound)
+# 3. the containment gate (external audit NN-AUD-219), REQUIRED:
+#    inside each VM:   sudo deploy/adversarial/verify-isolation.sh guest
+#      (no tailscale0/wg*, no route to 1.1.1.1, TCP to 1.1.1.1:443 times out,
+#       the intnet peer answers; exit 0 only when all four hold)
+#    on the host:      deploy/adversarial/verify-isolation.sh host
+#      (every adapter of both VMs allowed: target = intnet + at most one
+#       host-only NIC, attacker = intnet only; the guest probes through
+#       guestcontrol with GUEST_USER + GUEST_PASSFILE, or GUEST_PROBES_DONE=1
+#       after the in-guest runs passed)
 ```
 
 ### Target access with NAT detached
@@ -126,10 +132,9 @@ VBoxManage controlvm kalidev        nic1 nat   # re-enable NAT to download tools
 
 ### Snapshots (revert points)
 ```bash
-# target — AFTER bootstrap health check passes, NOPASSWD removed, NAT detached:
-VBoxManage snapshot northnarrowdev take clean-prod --description "registry v1 prod (76 rules), BUG-042 unit, isolated"
-# attacker — AFTER toolchain verified, NAT + Tailscale detached:
-VBoxManage snapshot kalidev take armed --description "toolchain ready, isolated"
+# AFTER the bootstrap health check passed, NOPASSWD removed, NAT + Tailscale
+# detached: the snapshots are taken only when the containment gate passes
+deploy/adversarial/verify-isolation.sh snapshot   # gate, then clean-prod + armed
 ```
 Revert cadence (§6.1 / §13 Q10): target → `clean-prod` **per TTP family**;
 **per-TTP** for state-mutating tests (PAM / `ld.so.preload` / log tamper /
@@ -147,9 +152,16 @@ dry-run against the live agent on 2026-06-02):
 | Rule count | `decision engine ready … rules=N`, N = the `engine` rows of `docs/validation/v2-rules.tsv` (76 in version 1; engine's own load) |
 | LSM | `bpf` in `/sys/kernel/security/lsm` **and** NN BPF-LSM progs attached (`task_kill`, `inode_*`, `fim_*`, `ptrace_access_check`) |
 | **Capabilities (master probe)** | running agent's `CapEff` decodes to the BUG-042 set **and does NOT include `cap_sys_admin`** |
-| COMBAT at rest | `nn-admin status --json` → `network_isolation_engaged:false`; no `northnarrow` iptables chain |
+| COMBAT at rest | `nn-admin status --json` → `network_isolation_engaged:false`; `iptables -S` readable and without a `northnarrow` chain |
 | Anti-tamper | `+i` set on `/var/lib/northnarrow` |
 | Admin surface | `/run/northnarrow/admin.sock` + `/run/northnarrow/agent.pid` present |
+| FIM baseline | `fim_baseline.jsonl` non-empty and newer than the bootstrap's start (step 6 now stops the bootstrap on failure) |
+| Canary | `range-aws-creds` in `nn-admin canary list` (step 7 stops on failure; `DEPLOY_CANARIES=0` makes this probe fail) |
+| Privilege posture | no `NOPASSWD` / `!authenticate` in `sudo -l -U` for the build user and every login user (§4: remove the session sudoers file **before** the bootstrap) |
+
+The capability probes read `CapEff` only from the unit's MainPID when it
+is `northnarrow-agent` and the mask is well formed; when it cannot be
+decoded every capability probe fails (external audit NN-AUD-223).
 
 **Why the capability decode is the master probe (and there is no
 "lineage log line" probe):** the `/proc/<pid>/exe` lineage path
@@ -198,9 +210,8 @@ sudo rm /etc/sudoers.d/forty-claude-session             # realistic privilege po
 
 # ── host: ARM ──
 #   stop Tailscale on kalidev; detach NAT on both VMs (§5)
-#   verify isolation (ping intnet OK, ping 1.1.1.1 FAIL)
-VBoxManage snapshot northnarrowdev take clean-prod ...
-VBoxManage snapshot kalidev        take armed ...
+#   verify-isolation.sh guest (in both VMs), then on the host:
+deploy/adversarial/verify-isolation.sh snapshot    # refuses to snapshot unless the gate passes
 VBoxManage sharedfolder add northnarrowdev --name evidence ... --readonly
 
 # ── run the sweep (V2–V4) ──   revert clean-prod per family; armed between runs

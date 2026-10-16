@@ -19,10 +19,34 @@ fail=0
 say() { printf 'btrfs-check: %s\n' "$*"; }
 
 # Built in (Debian's cloud kernel) or a module: /proc/filesystems decides.
-grep -qw btrfs /proc/filesystems || sudo modprobe btrfs 2>/dev/null
+# External audit NN-AUD-222 (LAB-017): `modprobe` while the agent runs is
+# killed by R011 (module tooling), and the check used to SKIP with exit 0 on
+# a kernel that does have btrfs. The module is now loaded with the agent
+# stopped (trusted-installer window), and the exit code says which case it
+# is: 0 PASS or N/A (no btrfs in this kernel), 1 FAIL, 2 NOT RUN.
+load_btrfs_with_agent_stopped() {
+    local nn_admin key i
+    nn_admin=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
+    key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo test -r "$k" && { echo "$k"; break; }; done)
+    sudo "$nn_admin" trusted-installer-grant --key "$key" --window-secs 120 >/dev/null 2>&1
+    sudo systemctl kill --signal=SIGTERM northnarrow-watchdog
+    sleep 2
+    sudo systemctl kill --signal=SIGTERM northnarrow-agent
+    for i in $(seq 1 15); do systemctl is-active --quiet northnarrow-agent || break; sleep 1; done
+    sudo modprobe btrfs
+    sudo systemctl start northnarrow-agent; sleep 4; sudo systemctl start northnarrow-watchdog
+}
 if ! grep -qw btrfs /proc/filesystems; then
-    say "SKIP — this kernel has no btrfs (RHEL 9 does not ship it)"
-    exit 0
+    if ! sudo modinfo btrfs >/dev/null 2>&1; then
+        say "N/A — this kernel has no btrfs (RHEL 9 does not ship it)"
+        exit 0
+    fi
+    load_btrfs_with_agent_stopped
+    if ! grep -qw btrfs /proc/filesystems; then
+        say "NOT RUN — the btrfs module exists but did not load"
+        exit 2
+    fi
+    say "btrfs module loaded with the agent stopped"
 fi
 # mkfs.btrfs lives in /usr/sbin, outside a user's PATH on Debian: look
 # through sudo's secure_path.

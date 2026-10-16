@@ -3,8 +3,9 @@
 # Exercises the `confirmed_intrusion` mass-write arm via the new
 # auth-lineage exemption (T7.13 PRIMARY AMPLIFIER -> COMBAT).
 #
-# Stimulus: `sudo apt-get -qq update` (or `dnf -q makecache`, or a
-#            deterministic shell-loop fallback).
+# Stimulus: `sudo apt-get -qq update` (or `dnf -q makecache`), best
+#            effort, then ALWAYS 30 deterministic writes by a sudo
+#            subprocess, counted before the verdict.
 # Mechanism: apt's PID is a child of sudo. apt does >=20 write-opens
 #            within 60 s while refreshing /var/cache/apt and
 #            /var/lib/apt/lists. Pre-fix this trips
@@ -30,15 +31,23 @@
 #   no transition; posture stays Observing
 #
 # WARNING: If pre-fix COMBAT engages, external network is blocked.
-#          Recovery from another local console:
-#            sudo systemctl restart northnarrow-agent
-#          The agent's reconcile-stale-chain logic (main.rs:872+)
-#          tears down the orphaned chain at boot.
+#          Recovery from another local console: run.sh's reset_agent
+#          (trusted-installer window + SIGTERM; `systemctl restart` is
+#          refused since EBPF-001). The agent's reconcile-stale-chain
+#          logic tears down the orphaned chain at boot.
 #
 # Runtime: ~90 s
+#
+# Exit status (external audit NN-AUD-221): 0 PASS, 1 bug reproduced or
+# unexpected posture, 2 inconclusive (the 30 deterministic writes did not
+# all land, so a quiet posture would prove nothing).
 
 set -u
-trap 'kill ${JCTL:-0} 2>/dev/null; wait ${JCTL:-0} 2>/dev/null || true' EXIT
+# Kill only a journal tail this script started: with JCTL unset the old
+# `kill ${JCTL:-0}` signalled the whole process group (run.sh included).
+JCTL=""
+WDIR=""
+trap '[ -n "$JCTL" ] && { kill "$JCTL" 2>/dev/null; wait "$JCTL" 2>/dev/null; }; [ -n "$WDIR" ] && sudo rm -rf "$WDIR"; true' EXIT
 
 LOG=$(mktemp -t t713-B.XXXX.log)
 echo "Tailing journal -> $LOG"
@@ -47,19 +56,26 @@ sudo journalctl --namespace=northnarrow -fu northnarrow-agent --since "now" > "$
 JCTL=$!
 sleep 1
 
-echo "[t=0] choosing sudo-subprocess workload"
+# The package manager is the realistic stimulus, but it needs a network
+# (an isolated range has none) and a refresh with nothing new may write
+# little. It is best-effort; the deterministic stimulus below always runs
+# and is counted, so the verdict never rests on writes that did not happen.
+echo "[t=0] sudo-subprocess workload"
 if command -v apt-get >/dev/null; then
-  echo "  using: sudo apt-get -qq update  (>50 writes via sudo subprocess)"
-  sudo apt-get -qq update
+  echo "  best-effort: sudo apt-get -qq update"
+  sudo apt-get -qq update || echo "  (apt-get update failed — offline range?)"
 elif command -v dnf >/dev/null; then
-  echo "  using: sudo dnf -q makecache    (>50 writes via sudo subprocess)"
-  sudo dnf -q makecache
-else
-  echo "  fallback: sudo bash -c '30 writes'"
-  # External audit LAB-008: root writes into a directory mktemp creates (a
-  # fixed /tmp/t713-B could be another user's, with links in it).
-  WORKB=$(sudo mktemp -d /tmp/t713-B.XXXXXXXX)
-  sudo bash -c 'for i in {1..30}; do echo $i > "$1/f_$i"; done' _ "$WORKB"
+  echo "  best-effort: sudo dnf -q makecache"
+  sudo dnf -q makecache || echo "  (dnf makecache failed — offline range?)"
+fi
+WDIR=$(sudo mktemp -d /tmp/t713-B.XXXXXX) || { echo "RESULT: INCONCLUSIVE (mktemp failed)"; exit 2; }
+echo "  deterministic: sudo bash -c '30 writes into $WDIR'"
+sudo bash -c 'for i in $(seq 1 30); do echo "$i" > "$1/f_$i"; done' t713-B "$WDIR"
+WRITES=$(sudo find "$WDIR" -maxdepth 1 -type f -name 'f_*' | wc -l)
+echo "  files written: $WRITES/30"
+if [[ "$WRITES" -ne 30 ]]; then
+  echo; echo "RESULT: INCONCLUSIVE (only $WRITES of the 30 writes landed — writer killed?)"
+  exit 2
 fi
 
 echo "[t=2s] waiting 65 s for mass-write window to populate"
@@ -78,17 +94,15 @@ echo; echo "=== nn-admin status ==="
 sudo nn-admin status --json 2>/dev/null \
   | jq -r '"posture=" + .posture + "  isolation=" + (.network_isolation_engaged|tostring)'
 
-# Cleanup fallback workdir
-[[ -n "${WORKB:-}" ]] && sudo rm -rf "$WORKB"
-
-# Assertion
+# Assertion (the workdir goes with the EXIT trap)
 POSTURE=$(sudo nn-admin status --json 2>/dev/null | jq -r '.posture // empty')
 if [[ "$POSTURE" == "Observing" ]]; then
-  echo; echo "RESULT: PASS (post-fix — sudo cascade fully suppressed)"
+  echo; echo "RESULT: PASS (post-fix — sudo cascade fully suppressed)"; rc=0
 elif [[ "$POSTURE" == "Combat" ]]; then
-  echo; echo "RESULT: PRE-FIX BUG REPRODUCED (posture=Combat — SSH may have died)"
+  echo; echo "RESULT: PRE-FIX BUG REPRODUCED (posture=Combat — SSH may have died)"; rc=1
 else
-  echo; echo "RESULT: UNEXPECTED (posture=$POSTURE)"
+  echo; echo "RESULT: UNEXPECTED (posture=${POSTURE:-unreadable})"; rc=1
 fi
 
 echo; echo "--- log saved at $LOG ---"
+exit "$rc"

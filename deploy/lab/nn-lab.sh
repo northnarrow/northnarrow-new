@@ -913,8 +913,10 @@ cmd_fim_reuse_check() {
 cmd_btrfs_check() {
     # Review 55 regression check (deploy/lab/btrfs/btrfs-check.sh): a watched
     # credential file on a btrfs subvolume (loop filesystem bind-mounted on
-    # /root/.aws) must draw NN-L-FIM-011 when read. SKIP on kernels without
-    # btrfs. The guest is put back as it was.
+    # /root/.aws) must draw NN-L-FIM-011 when read. N/A (exit 0) on kernels
+    # without btrfs, NOT RUN (exit 2) when the module does not load (it is
+    # loaded with the agent stopped: R011 kills module tooling). The guest is
+    # put back as it was.
     vm_running || die "guest is not running"
     rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/btrfs/btrfs-check.sh" "$GUEST:/tmp/nn-btrfs-check.sh"
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; bash /tmp/nn-btrfs-check.sh'
@@ -1097,15 +1099,25 @@ cmd_soak() {
             vssh 'sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" -p 4 --no-pager -q 2>/dev/null | tail -200' > "$dir/journal-warn-err.log" 2>/dev/null || true
             [ -s "$dir/samples.csv" ] || die "no samples.csv on the guest — was the soak started?"
             local max_rss_mb_h=${NN_LAB_SOAK_MAX_RSS_MB_H:-5}
+            # External audit NN-AUD-216: ring drops fail the soak above this
+            # (0 by default; raise it while review 45 is open)
+            local max_drops=${NN_LAB_SOAK_MAX_DROPS:-0}
             local rc=0
             set +e
             awk -F, -v repo="$REPO" -v head="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)" -v distro="$DISTRO" \
-                -v host="$(cat "$dir/host" 2>/dev/null)" -v hours="$(cat "$dir/hours" 2>/dev/null)" -v maxslope="$max_rss_mb_h" -v logdir="$dir" '
+                -v host="$(cat "$dir/host" 2>/dev/null)" -v hours="$(cat "$dir/hours" 2>/dev/null)" -v maxslope="$max_rss_mb_h" -v maxdrops="$max_drops" -v logdir="$dir" '
             NR == 1 { next }
             {
                 n++; t[n]=$1; pid[n]=$2; rss[n]=$3; vsz[n]=$4; cpu[n]=$5; thr[n]=$6; fds[n]=$7; wd[n]=$8
                 ar[n]=$9; wr[n]=$10; jw[n]=$11; je[n]=$12; cb[n]=$13; det[n]=$14; sts[n]=$15; aud[n]=$16; fim[n]=$17
                 fs[n]=$18; us[n]=$19; fdm[n]=$20; pp[n]=$21; dr[n]=$22; gi[n]=$23
+                # NN-AUD-216: liveness per sample (a sampler without the column
+                # counts as alive when it found a pid); one dead sample is a
+                # respawn gap, two in a row or the last one is a dead agent
+                al[n] = (NF >= 24) ? $24 : (pid[n] != 0); wa[n] = (NF >= 25) ? $25 : 1; mp[n] = (NF >= 26) ? $26 : 0
+                if (al[n] == 0) { deadrun++; if (deadrun > maxdead) maxdead = deadrun } else deadrun = 0
+                if (wa[n] == 0) { wdrun++; if (wdrun > maxwd) maxwd = wdrun } else wdrun = 0
+                if (mp[n] > mpmax) mpmax = mp[n]
                 if (rss[n] > rssmax) rssmax = rss[n]; if (cpu[n] > cpumax) cpumax = cpu[n]; cpusum += cpu[n]
                 if (fds[n] > fdsmax) fdsmax = fds[n]; if (fs[n] > fsmax) fsmax = fs[n]; if (us[n] > usmax) usmax = us[n]; if (fdm[n] > fdmmax) fdmmax = fdm[n]
                 if (pid[n] != 0 && pid[n] != lastpid) { if (lastpid != 0) pidchanges++; lastpid = pid[n] }
@@ -1125,7 +1137,11 @@ cmd_soak() {
                 if (dur_h >= 2 && slope_mb_h > maxslope) fail = fail "; RSS slope " sprintf("%.2f", slope_mb_h) " MB/h > " maxslope
                 if (dur_h < 2 && slope_mb_h > maxslope) warn = warn "; RSS slope " sprintf("%.2f", slope_mb_h) " MB/h (run < 2 h, not judged)"
                 if (fds[n] > fds[1]*1.5 && fds[n] - fds[1] > 100) fail = fail "; fds grew " fds[1] " → " fds[n]
-                if (dr[n] - dr[1] > 0) warn = warn "; ring-buffer drops +" (dr[n]-dr[1])
+                if (maxdead >= 2 || al[n] == 0) fail = fail "; agent down (" maxdead " consecutive sample(s) without a live agent" (al[n] == 0 ? ", down at the end" : "") ")"
+                if (maxwd >= 2 || wa[n] == 0) fail = fail "; watchdog missing (" maxwd " consecutive sample(s))"
+                if (mpmax >= 90) fail = fail "; a BPF map at " mpmax "% of max_entries"
+                if (dr[n] - dr[1] > maxdrops) fail = fail "; ring-buffer drops +" (dr[n]-dr[1]) " > " maxdrops
+                else if (dr[n] - dr[1] > 0) warn = warn "; ring-buffer drops +" (dr[n]-dr[1])
                 if (cb[n] > 0) warn = warn "; " cb[n] " COMBAT journal line(s)"
                 if (jw[n] > 0) warn = warn "; " jw[n] " journal WARN line(s)"
                 verdict = (fail == "") ? "PASS" : "FAIL"
@@ -1147,7 +1163,8 @@ cmd_soak() {
                 printf "| ring-buffer drops (cumulative) | %d | %d | — | |\n\n", dr[1], dr[n]
                 if (fail != "") printf "**FAIL**: %s\n\n", substr(fail, 3)
                 if (warn != "") printf "Notes: %s\n\n", substr(warn, 3)
-                printf "Thresholds: 0 restarts, 0 journal ERROR, RSS slope ≤ %s MB/h on runs ≥ 2 h, fds growth < 50%%.\n", maxslope
+                printf "| agent / watchdog alive (samples) | %d / %d | %d / %d | — | longest gap %d / %d, fullest map %d%% |\n", al[1], wa[1], al[n], wa[n], maxdead, maxwd, mpmax
+                printf "Thresholds: 0 restarts, 0 journal ERROR, RSS slope ≤ %s MB/h on runs ≥ 2 h, fds growth < 50%%, agent and watchdog alive (one-sample gap allowed), maps < 90%%, ring drops ≤ %s.\n", maxslope, maxdrops
                 exit (fail == "") ? 0 : 1
             }' "$dir/samples.csv" > "$report"
             rc=$?

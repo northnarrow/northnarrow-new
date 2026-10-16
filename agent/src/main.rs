@@ -102,6 +102,14 @@ struct Cli {
     #[arg(long = "sensor-feasibility", hide = true)]
     sensor_feasibility: bool,
 
+    /// Print the test and debug cargo features this binary was built with
+    /// (comma-separated: `debug-trigger`, `demo-tappa5`, `test-privileged`)
+    /// or `none`, and exit. A release build prints `none`; the range
+    /// bootstrap refuses to install anything else (external audit
+    /// NN-AUD-211).
+    #[arg(long = "build-features")]
+    build_features: bool,
+
     /// File-open sensor (Tappa 10.9 step 1). `lsm` (default): the FIM
     /// `file_open` observer classifies every open in the kernel and ships
     /// only the ones a rule reads, counting write-opens for mass write.
@@ -758,6 +766,15 @@ fn report_open_rules(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.build_features {
+        let features = northnarrow_agent::audit::build_features();
+        if features.is_empty() {
+            println!("none");
+        } else {
+            println!("{}", features.join(","));
+        }
+        std::process::exit(0);
+    }
     if let Some(nonce) = cli.telemetry_probe.as_deref() {
         std::process::exit(northnarrow_agent::telemetry_probe::run_child(nonce));
     }

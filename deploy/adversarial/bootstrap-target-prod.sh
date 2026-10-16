@@ -13,17 +13,24 @@
 # CAP_LINUX_IMMUTABLE / CAP_SYS_PTRACE. This script lands a CLEAN production
 # state — not dev-state-with-a-fresh-agent-on-top:
 #
-#   1. stop the dev agent + watchdog
+#   1. stop the dev agent + watchdog  (through a signed trusted-installer
+#      window: the units refuse `systemctl stop`, external audit EBPF-001)
+#      and drop the bpffs pin root so the deny hooks detach
 #   2. scrub dev/smoke RUNTIME state  (keeps /etc config + the admin keypair
 #      — regenerating it would break BUG-013's single-key posture)
 #   3. rebuild the SHIPPED binary  (cargo xtask build --release, NO
 #      test-privileged feature; xtask, NOT bare cargo — eBPF freshness gate)
+#      and refuse it unless it reports no lab feature (--build-features)
 #   4. install via the real path  (install.sh lands the BUG-042 unit +
 #      re-applies +i; it does NOT enable, so we do)
 #   5. enable + start the real units
 #   6. fresh FIM baseline  (so the baseline reflects prod, not the dev box)
 #   7. deploy canaries     (signed; skipped if the admin key is absent)
 #   8. HEALTH CHECK — fail loud unless production mode is genuinely live
+#
+# Step 1 needs the admin key (/root/northnarrow-admin.key,
+# $NN_ETC_DIR/admin.key or NN_ADMIN_KEY) with the trusted-installer role
+# when the agent is running, and stops the bootstrap on any failure.
 #
 # Idempotent: safe to re-run. Re-running re-scrubs runtime state and
 # rebuilds/reinstalls; it never touches /etc config or the admin keypair.
@@ -56,11 +63,69 @@ if ip route get 1.1.1.1 >/dev/null 2>&1 && [ "${ALLOW_NAT:-0}" != 1 ]; then
     warn "during an armed campaign. Set ALLOW_NAT=1 to silence."
 fi
 
-# ── 1. stop the dev agent + watchdog ─────────────────────────────────
-# Safe without reboot: the task_kill LSM hook has a PID-1 carve-out armed
-# at boot and the watchdog is disabled for stop. (northnarrow-vm-ops memo.)
-log "Stopping dev agent + watchdog..."
-systemctl stop "$NN_AGENT_UNIT" "$NN_WATCHDOG_UNIT" 2>/dev/null || true
+# The admin key, if it is still on the range host: install.sh writes it to
+# /root/northnarrow-admin.key since external audit DEP-001 (the agent reports
+# it there, as intended on a range). Needed from step 1 on.
+ADMIN_KEY=${NN_ADMIN_KEY:-}
+for k in /root/northnarrow-admin.key "$NN_ETC_DIR/admin.key"; do
+    if [ -z "$ADMIN_KEY" ] && [ -f "$k" ]; then ADMIN_KEY=$k; fi
+done
+# The health check compares what steps 6 and 7 leave behind with this.
+BOOTSTRAP_START=$(date +%s)
+
+# ── 1. stop the dev agent + watchdog (trusted-installer window) ──────
+# External audit EBPF-001: the units refuse `systemctl stop`
+# (RefuseManualStop) and PID 1 relays signals to them only inside a signed
+# trusted-installer window; the old `systemctl stop … || true` was refused
+# without a word and install.sh then refused the running install. Same path
+# as install.sh --upgrade (stop_nn_unit) and the lab's anti-tamper suite:
+# open the window with the admin key, SIGTERM the watchdog first (it would
+# respawn the agent), then the agent, SIGKILL what outlives 10 s, then drop
+# the bpffs pin root so the deny hooks detach. Any failure stops here.
+unit_has_procs() {
+    local cg
+    cg=$(systemctl show -p ControlGroup --value "$1" 2>/dev/null || true)
+    [ -n "$(cat "/sys/fs/cgroup${cg:-/system.slice/$1}/cgroup.procs" 2>/dev/null)" ]
+}
+units_present=0
+for u in "$NN_WATCHDOG_UNIT" "$NN_AGENT_UNIT"; do
+    st=$(systemctl is-active "$u" 2>/dev/null || true)
+    if [ "${st:-inactive}" != inactive ]; then units_present=1; fi
+done
+if [ "$units_present" = 1 ] || [ -d /sys/fs/bpf/northnarrow ]; then
+    log "Stopping the installed agent + watchdog (trusted-installer window)..."
+    if systemctl is-active --quiet "$NN_AGENT_UNIT"; then
+        [ -n "$ADMIN_KEY" ] \
+            || die "the agent is running and no admin key was found (/root/northnarrow-admin.key, $NN_ETC_DIR/admin.key or NN_ADMIN_KEY): the units refuse a manual stop (EBPF-001)"
+        "$NN_BIN_DIR/nn-admin" trusted-installer-grant --key "$ADMIN_KEY" --window-secs 600 >/dev/null \
+            || die "trusted-installer grant refused — $ADMIN_KEY needs the trusted-installer role on its admin.pub line"
+    fi
+    for u in "$NN_WATCHDOG_UNIT" "$NN_AGENT_UNIT"; do
+        systemctl kill --signal=SIGTERM "$u" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            unit_has_procs "$u" || break
+            sleep 0.5
+        done
+        if unit_has_procs "$u"; then
+            systemctl kill --signal=SIGKILL "$u" 2>/dev/null || true
+            sleep 1
+        fi
+        ! unit_has_procs "$u" || die "$u still runs after SIGTERM and SIGKILL — is the window open?"
+        systemctl reset-failed "$u" 2>/dev/null || true
+    done
+    rm -rf /sys/fs/bpf/northnarrow 2>/dev/null || true
+    [ ! -d /sys/fs/bpf/northnarrow ] \
+        || die "/sys/fs/bpf/northnarrow is still protected (no window: the agent was not running) — reboot the target (bpffs does not survive it) and re-run"
+    n=0
+    for _ in $(seq 1 30); do
+        progs=$(bpftool prog show 2>/dev/null) || die "bpftool prog show failed"
+        n=$(grep -c ' lsm ' <<<"$progs" || true)
+        [ "${n:-0}" = 0 ] && break
+        sleep 1
+    done
+    [ "${n:-0}" = 0 ] || die "$n LSM program(s) still loaded 30 s after the stop — another NorthNarrow process holds them"
+    log "  units stopped, pin root dropped, no LSM program left"
+fi
 
 # ── 2. scrub dev/smoke RUNTIME state (NOT config, NOT honeypot baits) ─
 # /var/lib/northnarrow carries +i on the DIRECTORY; drop it to mutate, then
@@ -74,20 +139,11 @@ systemctl stop "$NN_AGENT_UNIT" "$NN_WATCHDOG_UNIT" 2>/dev/null || true
 # key), agent_id, the *.v1/*.local rule config, and the 10 honeypot BAITS
 # (agent.dev.lock, kill_switch.conf, maintenance.mode, … — these are
 # install.sh-managed deception artefacts, NOT dev cruft. Do not delete.)
-log "Scrubbing dev/smoke runtime state (BEST-EFFORT — config + baits preserved)..."
-# IMPORTANT: on a box that has run a dev agent, the anti-tamper BPF-LSM deny
-# hooks stay PINNED in bpffs (/sys/fs/bpf/northnarrow/link_*) and keep
-# ENFORCING after the agent process stops, so rm/chattr here are denied at
-# the KERNEL level (EPERM) until a reboot — there is no sanctioned operator
-# verb to lift fs-protect (the anti-tamper-trust-gap). That is the
-# anti-tamper working AS DESIGNED: it resists a root-level scrub. We do NOT
-# tear out the pinned hooks (that would script-defeat the product's own
-# protection). This scrub is therefore best-effort: it clears what it can
-# (e.g. right after a fresh boot) and no-ops with a warning on a pinned host.
-# Detection is still clean — step 6 re-seeds a FRESH FIM baseline; residual
-# dev append-logs (drift/netflow/combat-audit) + the legacy file are
-# historical noise, separated from sweep evidence by timestamp and the
-# rotated journal namespace below.
+log "Scrubbing dev/smoke runtime state (config + baits preserved)..."
+# Step 1 dropped the pin root, so the deny hooks are detached and root may
+# clear +i and delete (before EBPF-001 the stop was refused and this scrub
+# hit EPERM on every pinned host). A failure now means something else holds
+# these files: stop rather than seed a "clean" range over the dev history.
 if [ -d "$NN_STATE_DIR" ]; then
     chattr -i "$NN_STATE_DIR" 2>/dev/null || true
     chattr -i "$NN_STATE_DIR"/fim_drift.jsonl* \
@@ -95,16 +151,13 @@ if [ -d "$NN_STATE_DIR" ]; then
               "$NN_STATE_DIR"/combat-audit.jsonl \
               "$NN_STATE_DIR"/netflow*.jsonl \
               "$NN_STATE_DIR"/canar*.jsonl 2>/dev/null || true
-    if rm -f "$NN_STATE_DIR"/fim_drift.jsonl* \
-             "$NN_STATE_DIR"/fim_baseline.jsonl \
-             "$NN_STATE_DIR"/combat-audit.jsonl \
-             "$NN_STATE_DIR"/netflow*.jsonl \
-             "$NN_STATE_DIR"/canar*.jsonl 2>/dev/null; then
-        log "  dev runtime state cleared"
-    else
-        warn "  scrub blocked by pinned anti-tamper (expected without a reboot) —"
-        warn "  continuing; the new agent re-seeds a fresh FIM baseline (step 6)."
-    fi
+    rm -f "$NN_STATE_DIR"/fim_drift.jsonl* \
+          "$NN_STATE_DIR"/fim_baseline.jsonl \
+          "$NN_STATE_DIR"/combat-audit.jsonl \
+          "$NN_STATE_DIR"/netflow*.jsonl \
+          "$NN_STATE_DIR"/canar*.jsonl \
+        || die "scrub of $NN_STATE_DIR failed with the deny hooks detached — inspect lsattr/lsof there"
+    log "  dev runtime state cleared"
 fi
 # Rotate the dedicated journal namespace so evidence windows start clean.
 journalctl --namespace="$NN_JOURNAL_NS" --rotate 2>/dev/null || true
@@ -117,10 +170,18 @@ journalctl --namespace="$NN_JOURNAL_NS" --vacuum-time=1s 2>/dev/null || true
 # a stale/unstamped eBPF object (the eBPF freshness gate).
 log "Building shipped binary as '$BUILD_USER': cargo xtask build --release (NO test-privileged)..."
 as_build_user "cd '$NN_REPO_DIR' && cargo xtask build --release"
-# Defence in depth: refuse to ship a binary that carries the test feature.
-if strings -n 8 target/release/northnarrow-agent | grep -q 'test-privileged'; then
-    die "release binary contains test-privileged markers — refusing to ship"
-fi
+# Defence in depth: refuse to ship a binary built with a test or debug
+# feature (debug-trigger also puts the BPF guard in observe mode). The
+# positive marker is the binary's own answer: `--build-features` prints
+# exactly `none` for a release build; anything else, or a binary that
+# cannot answer, is refused. External audit NN-AUD-211: the old
+# `strings | grep -q test-privileged` matched every correct build (the
+# release binary names the feature in an error message) and only the
+# SIGPIPE that pipefail turned into a false condition kept it quiet.
+feat=$(target/release/northnarrow-agent --build-features 2>&1) \
+    || die "target/release/northnarrow-agent cannot report its build features (${feat:-no output}) — refusing to ship"
+[ "$feat" = none ] || die "release binary built with lab features ($feat) — refusing to ship"
+log "  build features: none"
 
 # ── 4. install via the real path (lands the BUG-042 unit) ────────────
 # install.sh copies deploy/systemd/*.service → /etc/systemd/system (this is
@@ -173,35 +234,28 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
-# The admin key, if it is still on the range host: install.sh writes it to
-# /root/northnarrow-admin.key since external audit DEP-001 (the agent reports
-# it there, as intended on a range).
-ADMIN_KEY=
-for k in /root/northnarrow-admin.key "$NN_ETC_DIR/admin.key"; do
-    [ -f "$k" ] && { ADMIN_KEY=$k; break; }
-done
-
 # ── 6. fresh FIM baseline (reflects prod, not the dev box) ───────────
-if [ -n "$ADMIN_KEY" ]; then
-    log "Re-seeding FIM baseline (signed, fim-manage role)..."
-    "$NN_BIN_DIR/nn-admin" fim baseline --key "$ADMIN_KEY" 2>/dev/null \
-        || warn "fim baseline re-seed failed — verify manually (nn-admin fim baseline)"
-else
-    warn "no admin.key — skipping FIM baseline re-seed (deploy it offline per BUG-013)"
-fi
+# External audit NN-AUD-223: a failure stops the bootstrap (it used to be a
+# warning, and the health check passed without a baseline). The request is
+# queued in the agent; the health check waits for the file it writes.
+[ -n "$ADMIN_KEY" ] \
+    || die "no admin key — the FIM baseline cannot be re-seeded (a key with the fim-manage role at /root/northnarrow-admin.key, or NN_ADMIN_KEY)"
+log "Re-seeding FIM baseline (signed, fim-manage role)..."
+"$NN_BIN_DIR/nn-admin" fim baseline --key "$ADMIN_KEY" \
+    || die "fim baseline re-seed failed (does $ADMIN_KEY carry the fim-manage role on its admin.pub line?)"
 
-# ── 7. deploy canaries (signed; skippable) ───────────────────────────
-# Canary deploy is an authenticated op (--key). It needs the single admin
-# key; on a clean range this is acceptable, but we skip rather than fail if
-# the key has been moved offline.
-if [ -n "$ADMIN_KEY" ] && [ "${DEPLOY_CANARIES:-1}" = 1 ]; then
-    log "Deploying baseline canaries..."
+# ── 7. deploy canaries (signed) ──────────────────────────────────────
+# canary-manage role. A failure stops the bootstrap; DEPLOY_CANARIES=0 skips
+# the deploy on purpose and the health check then fails.
+CANARY_AWS_PATH=${CANARY_AWS_PATH:-$(getent passwd "$BUILD_USER" | cut -d: -f6)/.aws/credentials.bak}
+if [ "${DEPLOY_CANARIES:-1}" = 1 ]; then
+    log "Deploying baseline canaries ($CANARY_AWS_PATH)..."
     "$NN_BIN_DIR/nn-admin" canary deploy --name range-aws-creds \
         --key "$ADMIN_KEY" credential \
-        --path /home/forty/.aws/credentials.bak --cred-family aws 2>/dev/null \
-        || warn "canary deploy failed — deploy manually (nn-admin canary deploy ...)"
+        --path "$CANARY_AWS_PATH" --cred-family aws \
+        || die "canary deploy failed (does $ADMIN_KEY carry the canary-manage role?)"
 else
-    warn "skipping canary deploy (no admin.key or DEPLOY_CANARIES=0)"
+    warn "DEPLOY_CANARIES=0: canary deploy skipped — the health check will fail"
 fi
 
 # ── 8. HEALTH CHECK — fail loud ──────────────────────────────────────
@@ -239,30 +293,73 @@ check "bpf in kernel LSM chain" "grep -q bpf /sys/kernel/security/lsm"
 check "NN BPF-LSM programs attached" \
       "[ \"\$(bpftool prog show 2>/dev/null | grep -cE 'lsm.*(task_kill|inode_|fim_|ptrace_access)')\" -gt 0 ]"
 
-# (d) MASTER PROBE — CapEff carries the BUG-042 set, and NOT CAP_SYS_ADMIN
-CAPEFF_HEX=$(awk '/CapEff/{print $2}' "/proc/$MAINPID/status" 2>/dev/null || echo 0)
-CAP_DECODED=$(capsh --decode=0x"$CAPEFF_HEX" 2>/dev/null || echo "")
+# (d) MASTER PROBE — CapEff carries the BUG-042 set, and NOT CAP_SYS_ADMIN.
+#     External audit NN-AUD-223: decoded only from the agent's own process
+#     (MainPID > 1, comm checked) and a well-formed hex mask; when it cannot
+#     be decoded every capability probe fails (the "does NOT have" ones used
+#     to pass on an empty decode).
+CAP_DECODED=
+if [[ "$MAINPID" =~ ^[0-9]+$ ]] && [ "$MAINPID" -gt 1 ] \
+        && [ "$(cat "/proc/$MAINPID/comm" 2>/dev/null)" = northnarrow-age ]; then
+    CAPEFF_HEX=$(awk '/^CapEff:/{print $2}' "/proc/$MAINPID/status" 2>/dev/null || true)
+    if [[ "$CAPEFF_HEX" =~ ^[0-9a-fA-F]{16}$ ]]; then
+        CAP_DECODED=$(capsh --decode=0x"$CAPEFF_HEX" 2>/dev/null || true)
+    fi
+fi
+check "agent MainPID $MAINPID is northnarrow-agent and its CapEff decodes" "[ -n \"\$CAP_DECODED\" ]"
 for c in $REQUIRED_CAPS; do
-    check "CapEff has $c" "grep -qw '$c' <<<'$CAP_DECODED'"
+    check "CapEff has $c" "[ -n \"\$CAP_DECODED\" ] && grep -qw '$c' <<<\"\$CAP_DECODED\""
 done
 for c in $FORBIDDEN_CAPS; do
     check "CapEff does NOT have $c (BUG-042 regression guard)" \
-          "! grep -qw '$c' <<<'$CAP_DECODED'"
+          "[ -n \"\$CAP_DECODED\" ] && ! grep -qw '$c' <<<\"\$CAP_DECODED\""
 done
 
 # (e) COMBAT absent at rest — authoritative posture probe + chain check
 ISO=$("$NN_BIN_DIR/nn-admin" status --json 2>/dev/null \
       | grep -oE '"network_isolation_engaged":(true|false)' | cut -d: -f2 || true)
 check "network isolation NOT engaged at rest (got '${ISO:-?}')" "[ \"\${ISO:-true}\" = false ]"
+# captured first: a failed listing is a FAIL, not an empty "no chain"
+IPT=$(iptables -S 2>&1) && IPT_OK=1 || IPT_OK=0
+check "iptables readable (iptables -S)" "[ $IPT_OK = 1 ]"
 check "no NorthNarrow COMBAT iptables chain at rest" \
-      "! iptables -S 2>/dev/null | grep -qi northnarrow"
+      "[ $IPT_OK = 1 ] && ! grep -qi northnarrow <<<\"\$IPT\""
 
 # (f) +i applied on the state dir
-check "+i set on $NN_STATE_DIR" "lsattr -d '$NN_STATE_DIR' 2>/dev/null | awk '{print \$1}' | grep -q i"
+ATTRS=$(lsattr -d "$NN_STATE_DIR" 2>/dev/null | awk '{print $1}' || true)
+check "+i set on $NN_STATE_DIR (got '${ATTRS:-unreadable}')" "[[ \"\$ATTRS\" == *i* ]]"
 
 # (g) admin surface live
 check "admin socket present" "[ -S '$NN_RUN_DIR/admin.sock' ]"
 check "pid file present"     "[ -f '$NN_RUN_DIR/agent.pid' ]"
+
+# (h) External audit NN-AUD-223: a FIM baseline written by this bootstrap
+#     (step 6 queues it; the agent writes it within a minute)
+BASELINE="$NN_STATE_DIR/fim_baseline.jsonl"
+for _ in $(seq 1 60); do
+    [ -s "$BASELINE" ] && [ "$(stat -c %Y "$BASELINE" 2>/dev/null || echo 0)" -ge "$BOOTSTRAP_START" ] && break
+    sleep 1
+done
+check "FIM baseline non-empty and newer than this bootstrap ($BASELINE)" \
+      "[ -s '$BASELINE' ] && [ \"\$(stat -c %Y '$BASELINE')\" -ge $BOOTSTRAP_START ]"
+
+# (i) the range's canary is deployed (canary-read role)
+CANARIES=$("$NN_BIN_DIR/nn-admin" canary list --key "$ADMIN_KEY" 2>&1 || true)
+check "canary range-aws-creds deployed" "grep -q 'range-aws-creds' <<<\"\$CANARIES\""
+
+# (j) no passwordless sudo for the build user or any login user (uid >= 1000)
+NOPASSWD_USERS=
+while IFS=: read -r user _ uid _ _ _ shell; do
+    [ "$uid" -ge 1000 ] 2>/dev/null || [ "$user" = "$BUILD_USER" ] || continue
+    case "$shell" in */nologin|*/false) [ "$user" = "$BUILD_USER" ] || continue ;; esac
+    # captured, then matched: grep -q on the pipe would close it early and
+    # pipefail would turn sudo's SIGPIPE into a silent miss
+    rules=$(sudo -l -U "$user" 2>/dev/null || true)
+    if grep -qE 'NOPASSWD|!authenticate' <<<"$rules"; then
+        NOPASSWD_USERS="$NOPASSWD_USERS $user"
+    fi
+done < /etc/passwd
+check "no NOPASSWD sudo rule for login users (found:${NOPASSWD_USERS:- none})" "[ -z \"\$NOPASSWD_USERS\" ]"
 
 if [ "$fail" -ne 0 ]; then
     die "HEALTH CHECK FAILED — target is NOT in a clean production state. See FAILs above."
