@@ -3,8 +3,9 @@
   "url": "https://github.com/mitre-attack/attack-stix-data",
   "pin": "v18.1",
   "commit_sha": "7ad8a86f41edc91dd37de0487b0c2f44ae3a3af7",
-  "acquired_at_utc": "2026-10-09T09:47:44.246778137+00:00",
+  "acquired_at_utc": "2026-10-15T17:02:20.895761478+00:00",
   "canonical_dump_sha256": "c5bfbb28203657cb79de2390163a0cc825f871a3303bff966e25a8d5d1f76f7b",
+  "input_sha256": "f857d8f78f2f0c0b7db321a711a39fba98546c1e3076a657684850c83d0962fb",
   "license": "MITRE ATT&CK Terms of Use",
   "license_file": "LICENSES/MITRE_ATTACK_ToU.md"
 }

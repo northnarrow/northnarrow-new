@@ -18,8 +18,16 @@
 //! anchor (per-source `canonical_dump_sha256` + `kb_index_hash`) is
 //! committed in `docs/kb-sources/`. LOLBAS is deliberately absent
 //! (GPL-3.0 — plan §4.2.3).
+//!
+//! External audit WDG-011: every input is fetched by commit and checked
+//! against a pinned SHA-256 before it is parsed, in both modes — a moved
+//! tag, a poisoned mirror or a CDN serving other bytes fails the build.
+//! The provenance records the input's digest next to the output's, and a
+//! build whose dumps differ from the committed anchors writes nothing
+//! unless `--update-anchors` says the change is intended. Digests are
+//! taken once, with network, by whoever moves a pin.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
@@ -30,27 +38,56 @@ use sha2::{Digest, Sha256};
 
 // ── pinned refs (Q1/Q2 rulings; §4.2 / §4.2.3) ─────────────────────────
 
+/// One pinned input: where it is fetched (by commit, never by a tag or a
+/// branch), its name in a `--mirror` directory, and its SHA-256 (external
+/// audit WDG-011).
+struct Pinned {
+    url: &'static str,
+    mirror_file: &'static str,
+    sha256: &'static str,
+}
+
 const ATTACK_SOURCE_ID: &str = "mitre-attack-stix-data";
 const ATTACK_REPO_URL: &str = "https://github.com/mitre-attack/attack-stix-data";
+/// The release the commit is tagged with (a label: the inputs are fetched
+/// by [`ATTACK_COMMIT`]).
 const ATTACK_PIN: &str = "v18.1";
 const ATTACK_COMMIT: &str = "7ad8a86f41edc91dd37de0487b0c2f44ae3a3af7";
-const ATTACK_BUNDLE_URL: &str = "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/v18.1/enterprise-attack/enterprise-attack-18.1.json";
-const ATTACK_LICENSE_URL: &str =
-    "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/v18.1/LICENSE.txt";
-const ATTACK_BUNDLE_FILE: &str = "enterprise-attack-18.1.json";
+const ATTACK_BUNDLE: Pinned = Pinned {
+    url: "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/7ad8a86f41edc91dd37de0487b0c2f44ae3a3af7/enterprise-attack/enterprise-attack-18.1.json",
+    mirror_file: "enterprise-attack-18.1.json",
+    sha256: "f857d8f78f2f0c0b7db321a711a39fba98546c1e3076a657684850c83d0962fb",
+};
+const ATTACK_LICENSE: Pinned = Pinned {
+    url: "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/7ad8a86f41edc91dd37de0487b0c2f44ae3a3af7/LICENSE.txt",
+    mirror_file: "MITRE_ATTACK_ToU.md",
+    sha256: "d67e295e4a569b59ca0f728cadf99103b07680c5a9ecff302e1ee3c4ad289e06",
+};
 const ATTACK_LICENSE_FILE: &str = "LICENSES/MITRE_ATTACK_ToU.md";
 
 const SIGMA_SOURCE_ID: &str = "sigma-hq-rules";
 const SIGMA_REPO_URL: &str = "https://github.com/SigmaHQ/sigma";
-const SIGMA_PIN: &str = "master";
+/// External audit WDG-011: the commit, not `master` (the tarball always
+/// was this commit; the label said otherwise).
+const SIGMA_PIN: &str = SIGMA_COMMIT;
 const SIGMA_COMMIT: &str = "df5c6a6ecc149e05cb4dea306012668fb2ae5a12";
-const SIGMA_TARBALL_URL: &str =
-    "https://codeload.github.com/SigmaHQ/sigma/tar.gz/df5c6a6ecc149e05cb4dea306012668fb2ae5a12";
-const SIGMA_TARBALL_FILE: &str = "sigma-df5c6a6e.tar.gz";
+/// codeload's archive of the commit. GitHub keeps these bytes stable but
+/// does not promise it; a regenerated archive fails here, loudly.
+const SIGMA_TARBALL: Pinned = Pinned {
+    url:
+        "https://codeload.github.com/SigmaHQ/sigma/tar.gz/df5c6a6ecc149e05cb4dea306012668fb2ae5a12",
+    mirror_file: "sigma-df5c6a6e.tar.gz",
+    sha256: "070c465c08d38c93901ac965e3e0a7d061f84bab1c24ebf24bf779ac6e4a2ae6",
+};
 // DRL 1.1 lives in a SEPARATE repo (the sigma-repo root LICENSE is only
-// an index pointing here — P1.3 verification finding).
-const SIGMA_LICENSE_URL: &str =
-    "https://raw.githubusercontent.com/SigmaHQ/Detection-Rule-License/master/LICENSE.Detection.Rules.md";
+// an index pointing here — P1.3 verification finding); pinned at its
+// commit bcbdc605172d00390572cd774ba395ec9e975dfc (`main`, the URL's old
+// `master` redirected there).
+const SIGMA_LICENSE: Pinned = Pinned {
+    url: "https://raw.githubusercontent.com/SigmaHQ/Detection-Rule-License/bcbdc605172d00390572cd774ba395ec9e975dfc/LICENSE.Detection.Rules.md",
+    mirror_file: "SIGMA_DRL-1.1.md",
+    sha256: "d5f4c36a0528e01cfdd9e4fc60879201d3af49b41c520200643d321fe53da5f9",
+};
 const SIGMA_LICENSE_FILE: &str = "LICENSES/SIGMA_DRL-1.1.md";
 
 // Dump file names in `out`. `kb_index.json` records them next to each
@@ -58,6 +95,9 @@ const SIGMA_LICENSE_FILE: &str = "LICENSES/SIGMA_DRL-1.1.md";
 // by name (external audit XAI-001).
 const ATTACK_DUMP_FILE: &str = "mitre-attack.jsonl";
 const SIGMA_DUMP_FILE: &str = "sigma.jsonl";
+
+/// The committed anchors a build is compared with.
+const KB_INDEX_FILE: &str = "docs/kb-sources/kb_index.json";
 
 /// §3.1.1 domain separator (versioned; a layout change bumps `-v1`).
 const KB_CANON_DOMAIN: &[u8] = b"NN-RAG-KB-CANON-v1\0";
@@ -95,6 +135,9 @@ struct Provenance {
     commit_sha: String,
     acquired_at_utc: String,
     canonical_dump_sha256: String,
+    /// External audit WDG-011: SHA-256 of the input the dump was made
+    /// from (bundle or tarball), checked against the pin before parsing.
+    input_sha256: String,
     license: String,
     license_file: String,
 }
@@ -127,16 +170,29 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Obtain `url` (build-time) or `<mirror>/<file>` (install-time). Same
-/// bytes ⇒ same canonicalisation ⇒ same hashes either way (Q5 = both).
-fn obtain(mirror: Option<&Path>, url: &str, mirror_file: &str) -> Result<Vec<u8>> {
-    match mirror {
+/// Obtain `pin.url` (build-time) or `<mirror>/<pin.mirror_file>`
+/// (install-time). Same bytes ⇒ same canonicalisation ⇒ same hashes
+/// either way (Q5 = both). External audit WDG-011: the bytes are returned
+/// only if their SHA-256 is the pinned one, in both modes.
+fn obtain(mirror: Option<&Path>, pin: &Pinned) -> Result<Vec<u8>> {
+    let (bytes, from) = match mirror {
         Some(dir) => {
-            let p = dir.join(mirror_file);
-            std::fs::read(&p).with_context(|| format!("mirror read {}", p.display()))
+            let p = dir.join(pin.mirror_file);
+            let b = std::fs::read(&p).with_context(|| format!("mirror read {}", p.display()))?;
+            (b, p.display().to_string())
         }
-        None => http_get(url),
+        None => (http_get(pin.url)?, pin.url.to_string()),
+    };
+    let got = sha256_hex(&bytes);
+    if got != pin.sha256 {
+        bail!(
+            "{from}: SHA-256 {got} is not the pinned {} — not the artefact this build \
+             is pinned to (moved tag, other mirror content, or an upstream change: \
+             re-pin only after reviewing it)",
+            pin.sha256
+        );
     }
+    Ok(bytes)
 }
 
 // ── MITRE ATT&CK (STIX 2.1) ────────────────────────────────────────────
@@ -437,6 +493,7 @@ fn write_provenance(
     commit: &str,
     acquired: &str,
     dump_sha: &str,
+    input_sha: &str,
     license: &str,
     license_file: &str,
 ) -> Result<()> {
@@ -447,6 +504,7 @@ fn write_provenance(
         commit_sha: commit.to_string(),
         acquired_at_utc: acquired.to_string(),
         canonical_dump_sha256: dump_sha.to_string(),
+        input_sha256: input_sha.to_string(),
         license: license.to_string(),
         license_file: license_file.to_string(),
     };
@@ -478,7 +536,7 @@ fn build_notices(authors: &BTreeSet<String>) -> String {
     ));
     s.push_str("## SigmaHQ detection rules (Linux subset, distilled)\n\n");
     s.push_str(&format!(
-        "- Source: {SIGMA_REPO_URL}\n- Pin: {SIGMA_PIN} (commit {SIGMA_COMMIT})\n\
+        "- Source: {SIGMA_REPO_URL}\n- Pin: commit {SIGMA_COMMIT}\n\
          - License: Detection Rule License (DRL) 1.1 — `{SIGMA_LICENSE_FILE}`\n\
          - Rules are distilled (modified form); per-rule `author` \
          attribution is preserved in the canonical dump's `author` field.\n\
@@ -491,9 +549,63 @@ fn build_notices(authors: &BTreeSet<String>) -> String {
     s
 }
 
+/// External audit WDG-011: the per-source `canonical_dump_sha256` of the
+/// committed `kb_index.json`; `None` when there is none yet.
+fn committed_dump_shas(root: &Path) -> Result<Option<BTreeMap<String, String>>> {
+    let path = root.join(KB_INDEX_FILE);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let doc: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+    let mut out = BTreeMap::new();
+    for s in doc["sources"].as_array().into_iter().flatten() {
+        if let (Some(src), Some(sha)) = (s["source"].as_str(), s["canonical_dump_sha256"].as_str())
+        {
+            out.insert(src.to_string(), sha.to_string());
+        }
+    }
+    Ok(Some(out))
+}
+
+/// External audit WDG-011: refuse a build whose dumps differ from the
+/// committed anchors (`fresh` = source → recomputed dump digest), unless
+/// the caller says the change is intended.
+fn check_anchors(
+    committed: &BTreeMap<String, String>,
+    fresh: &[(&str, &str)],
+    update_anchors: bool,
+) -> Result<()> {
+    let differ: Vec<String> = fresh
+        .iter()
+        .filter(|(src, sha)| committed.get(*src).map(String::as_str) != Some(*sha))
+        .map(|(src, sha)| {
+            format!(
+                "{src}: committed {}, rebuilt {sha}",
+                committed.get(*src).map(String::as_str).unwrap_or("(none)")
+            )
+        })
+        .collect();
+    if differ.is_empty() {
+        return Ok(());
+    }
+    if update_anchors {
+        eprintln!("  anchors: updating ({})", differ.join("; "));
+        return Ok(());
+    }
+    bail!(
+        "the rebuilt corpus differs from the committed anchors in {KB_INDEX_FILE} \
+         ({}); nothing written. Pass --update-anchors only if the change is intended",
+        differ.join("; ")
+    )
+}
+
 /// P2 entrypoint. `root` = repo root; `mirror` = install-time source
-/// dir or `None` for build-time fetch; `out` = gitignored dump dir.
-pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
+/// dir or `None` for build-time fetch; `out` = gitignored dump dir;
+/// `update_anchors` = allow dumps that differ from the committed anchors.
+pub fn build(root: &Path, mirror: Option<&Path>, out: &Path, update_anchors: bool) -> Result<()> {
     let acquired = chrono::Utc::now().to_rfc3339();
     let out = if out.is_absolute() {
         out.to_path_buf()
@@ -506,17 +618,16 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
     );
 
     // ── MITRE ATT&CK ──
-    eprintln!("  attack: obtaining {ATTACK_PIN} bundle…");
-    let attack_bytes = obtain(mirror, ATTACK_BUNDLE_URL, ATTACK_BUNDLE_FILE)?;
+    eprintln!("  attack: obtaining {ATTACK_PIN} bundle (commit {ATTACK_COMMIT})…");
+    let attack_bytes = obtain(mirror, &ATTACK_BUNDLE)?;
     let attack_records = parse_attack(&attack_bytes)?;
     eprintln!("  attack: {} techniques", attack_records.len());
     let attack_dump = canonical_jsonl(attack_records)?;
     let attack_dump_sha = sha256_hex(&attack_dump);
-    write_file(&out.join(ATTACK_DUMP_FILE), &attack_dump)?;
 
     // ── SigmaHQ ──
     eprintln!("  sigma: obtaining pinned tarball…");
-    let sigma_gz = obtain(mirror, SIGMA_TARBALL_URL, SIGMA_TARBALL_FILE)?;
+    let sigma_gz = obtain(mirror, &SIGMA_TARBALL)?;
     let sigma_records = parse_sigma(&sigma_gz)?;
     let mut authors = BTreeSet::new();
     for r in &sigma_records {
@@ -528,13 +639,10 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
     }
     let sigma_dump = canonical_jsonl(sigma_records)?;
     let sigma_dump_sha = sha256_hex(&sigma_dump);
-    write_file(&out.join(SIGMA_DUMP_FILE), &sigma_dump)?;
 
     // ── verbatim LICENSES/ (from the exact pinned refs) ──
-    let attack_license = obtain(mirror, ATTACK_LICENSE_URL, "MITRE_ATTACK_ToU.md")?;
-    write_file(&root.join(ATTACK_LICENSE_FILE), &attack_license)?;
-    let sigma_license = obtain(mirror, SIGMA_LICENSE_URL, "SIGMA_DRL-1.1.md")?;
-    write_file(&root.join(SIGMA_LICENSE_FILE), &sigma_license)?;
+    let attack_license = obtain(mirror, &ATTACK_LICENSE)?;
+    let sigma_license = obtain(mirror, &SIGMA_LICENSE)?;
 
     // R4 license re-verification (owner standing flag-before-commit
     // rule): the MITRE source moved to attack-stix-data — confirm it is
@@ -548,6 +656,25 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
         );
     }
 
+    // External audit WDG-011: compared with the committed anchors before
+    // anything is written (dumps included: `nn-lab.sh sync` ships them).
+    match committed_dump_shas(root)? {
+        Some(committed) => check_anchors(
+            &committed,
+            &[
+                (ATTACK_SOURCE_ID, attack_dump_sha.as_str()),
+                (SIGMA_SOURCE_ID, sigma_dump_sha.as_str()),
+            ],
+            update_anchors,
+        )?,
+        None => eprintln!("  anchors: no {KB_INDEX_FILE} yet — writing the first one"),
+    }
+
+    write_file(&out.join(ATTACK_DUMP_FILE), &attack_dump)?;
+    write_file(&out.join(SIGMA_DUMP_FILE), &sigma_dump)?;
+    write_file(&root.join(ATTACK_LICENSE_FILE), &attack_license)?;
+    write_file(&root.join(SIGMA_LICENSE_FILE), &sigma_license)?;
+
     // ── provenance sidecars (plan §4.2.2) ──
     write_provenance(
         root,
@@ -557,6 +684,7 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
         ATTACK_COMMIT,
         &acquired,
         &attack_dump_sha,
+        ATTACK_BUNDLE.sha256,
         "MITRE ATT&CK Terms of Use",
         ATTACK_LICENSE_FILE,
     )?;
@@ -568,6 +696,7 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
         SIGMA_COMMIT,
         &acquired,
         &sigma_dump_sha,
+        SIGMA_TARBALL.sha256,
         "DRL-1.1",
         SIGMA_LICENSE_FILE,
     )?;
@@ -597,7 +726,7 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path) -> Result<()> {
         "note": "LOLBAS excluded (GPL-3.0, plan §4.2.3). 6.7 in-repo notes merged at index build (P3/P4), not acquired here.",
     });
     write_file(
-        &root.join("docs/kb-sources/kb_index.json"),
+        &root.join(KB_INDEX_FILE),
         format!("{}\n", serde_json::to_string_pretty(&index_doc)?).as_bytes(),
     )?;
 
@@ -677,6 +806,113 @@ mod tests {
         );
         assert_eq!(normalize_authors(None), None);
         assert_eq!(normalize_authors(Some(&Value::String("  ".into()))), None);
+    }
+
+    /// A fresh, empty directory under the system temp dir (xtask has no
+    /// tempfile dependency).
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("nn-xtask-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// External audit WDG-011: a mirror file with one byte changed is
+    /// refused before it is parsed; the pinned bytes pass.
+    #[test]
+    fn obtain_rejects_digest_mismatch() {
+        let dir = scratch_dir("mirror");
+        let good = b"pinned artefact bytes\n".to_vec();
+        let pin = Pinned {
+            url: "https://example.invalid/never-fetched",
+            mirror_file: "artefact.bin",
+            // sha256 of `good`
+            sha256: "5e0c7670c8c42054c25a4908b51ed85ae7b04ff8ebc885f64c2a1b68ea5674e1",
+        };
+        assert_eq!(sha256_hex(&good), pin.sha256);
+        std::fs::write(dir.join(pin.mirror_file), &good).unwrap();
+        assert_eq!(obtain(Some(&dir), &pin).unwrap(), good);
+
+        let mut tampered = good.clone();
+        tampered[0] ^= 0x01;
+        std::fs::write(dir.join(pin.mirror_file), &tampered).unwrap();
+        let err = obtain(Some(&dir), &pin).unwrap_err().to_string();
+        assert!(err.contains(pin.sha256), "{err}");
+        assert!(err.contains(&sha256_hex(&tampered)), "{err}");
+        assert!(err.contains("artefact.bin"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External audit WDG-011: every input is fetched by commit and carries
+    /// a digest; no tag or branch in a URL, and the Sigma pin is its commit.
+    #[test]
+    fn inputs_are_pinned_by_commit_and_digest() {
+        const SIGMA_LICENSE_COMMIT: &str = "bcbdc605172d00390572cd774ba395ec9e975dfc";
+        for (pin, commit) in [
+            (&ATTACK_BUNDLE, ATTACK_COMMIT),
+            (&ATTACK_LICENSE, ATTACK_COMMIT),
+            (&SIGMA_TARBALL, SIGMA_COMMIT),
+            (&SIGMA_LICENSE, SIGMA_LICENSE_COMMIT),
+        ] {
+            assert!(pin.url.contains(commit), "{} is not by commit", pin.url);
+            for mutable in ["/v18.1/", "/master/", "/main/"] {
+                assert!(!pin.url.contains(mutable), "{} names {mutable}", pin.url);
+            }
+            assert!(
+                pin.sha256.len() == 64
+                    && pin
+                        .sha256
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{}: {}",
+                pin.mirror_file,
+                pin.sha256
+            );
+        }
+        assert_eq!(SIGMA_PIN, SIGMA_COMMIT);
+    }
+
+    /// External audit WDG-011: dumps that differ from the committed anchors
+    /// are refused unless the update is asked for; equal ones pass.
+    #[test]
+    fn rebuilt_dumps_must_match_the_committed_anchors() {
+        let committed: BTreeMap<String, String> = [
+            ("a".to_string(), "11".repeat(32)),
+            ("b".to_string(), "22".repeat(32)),
+        ]
+        .into_iter()
+        .collect();
+        let same = "11".repeat(32);
+        let other = "33".repeat(32);
+        let b = "22".repeat(32);
+        assert!(check_anchors(&committed, &[("a", &same), ("b", &b)], false).is_ok());
+        let err = check_anchors(&committed, &[("a", &other), ("b", &b)], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a: committed") && err.contains(&other),
+            "{err}"
+        );
+        assert!(check_anchors(&committed, &[("a", &other), ("b", &b)], true).is_ok());
+        // A source the anchors do not know is a change too.
+        assert!(check_anchors(&committed, &[("c", &same)], false).is_err());
+    }
+
+    /// The repository's own anchors parse, and name both sources.
+    #[test]
+    fn committed_anchors_are_readable() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let shas = committed_dump_shas(&root).unwrap().expect("kb_index.json");
+        assert_eq!(
+            shas.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![ATTACK_SOURCE_ID, SIGMA_SOURCE_ID]
+        );
+        assert!(committed_dump_shas(&scratch_dir("noanchors"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

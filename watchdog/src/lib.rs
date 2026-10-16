@@ -984,6 +984,99 @@ pub fn respawn_agent(backend: &RespawnBackend) -> Result<()> {
     }
 }
 
+/// External audit WDG-009: run blocking work (`systemctl`, fork-exec) on
+/// tokio's blocking pool. The watchdog's runtime has one thread; a
+/// `systemctl` call waiting on a busy PID 1 (up to the D-Bus timeout) used
+/// to stop the STATUS ping and the timers with it.
+pub async fn off_runtime<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow!("blocking task: {e}"))?
+}
+
+/// [`respawn_agent`] off the runtime thread ([`off_runtime`]).
+pub async fn respawn_agent_off_runtime(backend: &RespawnBackend) -> Result<()> {
+    let backend = backend.clone();
+    off_runtime(move || respawn_agent(&backend)).await
+}
+
+/// Unit properties recorded with a hold (external audit DEP-004): they
+/// tell a unit that failed (`ActiveState=failed`, `Result=exit-code` for
+/// the bpffs pre-flight), was skipped (`ConditionResult=no`) or was
+/// stopped from one still starting.
+pub const UNIT_STATE_PROPERTIES: &str = "ActiveState,SubState,Result,ConditionResult,AssertResult";
+
+/// How long a hold waits for `systemctl show` before recording no state.
+pub const UNIT_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `systemctl show --property=… <unit>`.
+pub fn systemctl_show_command(systemctl: &Path, unit: &str) -> Command {
+    let mut cmd = Command::new(systemctl);
+    cmd.arg("show")
+        .arg(format!("--property={UNIT_STATE_PROPERTIES}"))
+        .arg(unit);
+    cmd
+}
+
+/// `systemctl show`'s `Key=Value` lines on one line, in its order; at most
+/// 256 bytes. `None` when there is none.
+pub fn unit_state_from_show(stdout: &str) -> Option<String> {
+    let mut state = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains('='))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if state.is_empty() {
+        return None;
+    }
+    if state.len() > 256 {
+        let mut end = 256;
+        while !state.is_char_boundary(end) {
+            end -= 1;
+        }
+        state.truncate(end);
+    }
+    Some(state)
+}
+
+/// The agent unit's state ([`UNIT_STATE_PROPERTIES`]). Blocking: call
+/// through [`off_runtime`].
+pub fn systemctl_unit_state(unit: &str) -> Result<String> {
+    let systemctl = find_systemctl()
+        .ok_or_else(|| anyhow!("systemctl not found at any of {SYSTEMCTL_CANDIDATES:?}"))?;
+    let out = systemctl_show_command(&systemctl, unit)
+        .output()
+        .with_context(|| format!("spawning {} show {unit}", systemctl.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "systemctl show {unit} failed (status {:?})",
+            out.status.code()
+        ));
+    }
+    unit_state_from_show(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| anyhow!("systemctl show {unit}: no properties"))
+}
+
+/// External audit DEP-004: record a hold at `path` for the agent's signed
+/// audit chain ([`common::watchdog_hold`]). One JSON line per hold,
+/// appended (0600, never through a symlink).
+pub fn record_hold(path: &Path, record: &common::watchdog_hold::HoldRecord) -> Result<()> {
+    let line = serde_json::to_string(record).context("serialising the hold record")? + "\n";
+    append_line(path, &line).with_context(|| format!("appending to {}", path.display()))
+}
+
+/// Where [`record_hold`] writes: next to the shutdown marker, like the
+/// refused-marker record ([`common::watchdog_hold::HOLD_PATH`] with the
+/// default paths).
+pub fn hold_record_path(shutdown_marker: &Path) -> PathBuf {
+    shutdown_marker.with_file_name(file_name_of(common::watchdog_hold::HOLD_PATH))
+}
+
 /// Defensive re-insert of the new agent's PID into
 /// PROTECTED_PIDS — the design §5.4 "load-bearing" duplicate
 /// of the agent's own [`register_protected_pids`] call. Closes
@@ -1270,6 +1363,17 @@ pub fn log_tamper_suspected(attempts_in_window: u8, window: Duration) {
 /// socket-load noise (the agent's own tracing heartbeat fires
 /// at 60 s, so 30 s gives ≤ 1-cycle skew detection).
 pub const STATUS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The STATUS-ping ticker. External audit WDG-009: after a stall of the
+/// watchdog (VM paused, memory-pressure stall) the default `Burst` fires
+/// every missed tick back to back, so "two timeouts 60 s apart" became two
+/// pings ~2 s apart. `Delay` fires one late tick and then keeps `period`
+/// between ticks.
+pub fn ping_ticker(period: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
+}
 
 /// Per-ping reply timeout — 2 s per design §4. Conservative cap
 /// on healthy reply (the admin socket handler runs on the
@@ -2317,6 +2421,144 @@ mod tests {
             args,
             vec!["start", "--no-block", "northnarrow-agent.service"]
         );
+    }
+
+    /// External audit WDG-009: the ping ticker never bursts.
+    #[test]
+    fn ping_ticker_delays_missed_ticks() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_eq!(
+                ping_ticker(STATUS_PING_INTERVAL).missed_tick_behavior(),
+                tokio::time::MissedTickBehavior::Delay
+            );
+        });
+    }
+
+    /// External audit WDG-009: after a stall of three intervals one late
+    /// tick fires, then the next is a whole interval later — two pings are
+    /// never closer than the interval, so two timeouts span it.
+    #[tokio::test(start_paused = true)]
+    async fn ping_ticks_stay_an_interval_apart_after_a_stall() {
+        let period = STATUS_PING_INTERVAL;
+        let mut tick = ping_ticker(period);
+        tick.tick().await; // the immediate first tick
+        tick.tick().await;
+        // The watchdog thread does not run for three intervals.
+        tokio::time::advance(period * 3).await;
+        tick.tick().await; // the late tick
+        let late = tokio::time::Instant::now();
+        tick.tick().await;
+        let next = tokio::time::Instant::now();
+        assert!(
+            next - late >= period,
+            "two ticks {:?} apart after a stall (interval {period:?})",
+            next - late
+        );
+    }
+
+    /// External audit WDG-009: blocking work does not hold the runtime's
+    /// only thread — a timer task keeps running while it blocks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_runtime_keeps_the_runtime_thread_free() {
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = ticks.clone();
+        let timer = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        off_runtime(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let seen = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        timer.abort();
+        assert!(
+            seen >= 5,
+            "only {seen} timer ticks while the blocking call ran"
+        );
+        let err = off_runtime(|| -> Result<()> { Err(anyhow!("systemctl said no")) })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("systemctl said no"), "{err}");
+    }
+
+    #[test]
+    fn systemctl_show_command_shape() {
+        let cmd =
+            systemctl_show_command(Path::new("/usr/bin/systemctl"), "northnarrow-agent.service");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "show",
+                "--property=ActiveState,SubState,Result,ConditionResult,AssertResult",
+                "northnarrow-agent.service"
+            ]
+        );
+    }
+
+    #[test]
+    fn unit_state_from_show_is_one_bounded_line() {
+        let out = "ActiveState=failed\nSubState=failed\nResult=exit-code\nConditionResult=yes\nAssertResult=yes\n";
+        assert_eq!(
+            unit_state_from_show(out).as_deref(),
+            Some("ActiveState=failed SubState=failed Result=exit-code ConditionResult=yes AssertResult=yes")
+        );
+        assert_eq!(unit_state_from_show("\n\n"), None);
+        let long = format!("Result={}\n", "é".repeat(300));
+        let s = unit_state_from_show(&long).unwrap();
+        assert!(s.len() <= 256 && s.starts_with("Result="), "{}", s.len());
+    }
+
+    /// External audit DEP-004: a hold leaves one JSON line per hold where
+    /// the agent reads it (next to the shutdown marker).
+    #[test]
+    fn record_hold_appends_one_line_per_hold() {
+        use common::watchdog_hold::{HoldRecord, HOLD_PATH};
+        assert_eq!(
+            hold_record_path(Path::new(common::shutdown_marker::MARKER_PATH)),
+            Path::new(HOLD_PATH)
+        );
+        let dir = TempDir::new().unwrap();
+        let path = hold_record_path(&dir.path().join("agent.shutdown_authorised"));
+        let rec = HoldRecord {
+            at: 1_800_000_000,
+            agent_pid: 4242,
+            reason: "agent respawn failed".into(),
+            detail: "no agent after the start job".into(),
+            unit_state: Some("ActiveState=failed Result=exit-code".into()),
+        };
+        record_hold(&path, &rec).unwrap();
+        record_hold(
+            &path,
+            &HoldRecord {
+                unit_state: None,
+                ..rec.clone()
+            },
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<HoldRecord> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], rec);
+        assert_eq!(lines[1].unit_state, None);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

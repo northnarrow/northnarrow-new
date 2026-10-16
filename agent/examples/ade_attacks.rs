@@ -14,10 +14,11 @@
 //! ```
 //!
 //! The example expects the GGUF model defined by [`AdeConfig::DEFAULT_MODEL_PATH`]
-//! (override with `ADE_MODEL` env var). If the model is missing the
-//! example exits non-zero with a clear message — it never silently
-//! falls back to `MockBackend`, because the whole point is to
-//! exercise the real model under attack.
+//! (override with `ADE_MODEL` env var). If the model is missing, or fails
+//! to load and the engine falls back to `MockBackend` (`NN_ADE_ALLOW_MOCK=1`),
+//! the example exits non-zero with a clear message — the mock never reads
+//! the prompt, so a score against it measures nothing (external audit
+//! WDG-R01). The report names the backend next to the success rate.
 //!
 //! Performance: each attack costs one ADE inference. On a CCX23 with
 //! AVX2 the round-trip is ~10–25 s; the full suite finishes in
@@ -30,6 +31,9 @@ use std::time::{Duration, Instant};
 use common::ade_types::{AdeAction, AdeVerdict};
 use common::Event;
 use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
+
+/// `MockBackend::name()`: the backend this suite refuses to score.
+const MOCK_BACKEND: &str = "mock";
 
 /// One synthetic attack: a category label, a short description, and
 /// the [`Event`] that gets fed into ADE.
@@ -73,11 +77,19 @@ async fn main() -> anyhow::Result<()> {
     config.timeout = Duration::from_secs(60);
     eprintln!("Loading ADE backend (this takes ~30 s on CPU)…");
     let engine = AdeEngine::new(config).await?;
-    eprintln!(
-        "Backend: {} | model: {}",
-        engine.backend_name(),
-        model_path.display()
-    );
+    let backend = engine.backend_name().to_string();
+    eprintln!("Backend: {backend} | model: {}", model_path.display());
+    // External audit WDG-R01: with `NN_ADE_ALLOW_MOCK=1` a model that fails
+    // to load leaves the engine on the mock, which ignores the prompt.
+    if backend == MOCK_BACKEND {
+        anyhow::bail!(
+            "ADE backend is `{MOCK_BACKEND}` (the model at {} did not load; \
+             NN_ADE_ALLOW_MOCK=1 allowed the fallback): the mock never reads the \
+             prompt, so this suite would measure nothing. Fix the model or unset \
+             NN_ADE_ALLOW_MOCK.",
+            model_path.display()
+        );
+    }
 
     let attacks = build_attack_suite();
     let limit: usize = env::var("ATTACK_LIMIT")
@@ -145,7 +157,11 @@ async fn main() -> anyhow::Result<()> {
     );
     if total > 0 {
         let success = (grand.0 + grand.1) as f32 / total as f32;
-        println!("\nBLOCKED+PARTIAL success rate: {:.1}%", success * 100.0);
+        println!(
+            "\nBLOCKED+PARTIAL success rate: {:.1}% (backend {backend}, model {})",
+            success * 100.0,
+            model_path.display()
+        );
     }
 
     if !fooled_examples.is_empty() {

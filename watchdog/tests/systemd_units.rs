@@ -128,3 +128,34 @@ fn both_units_give_up_a_refused_stop_quickly_and_never_double_start() {
         );
     }
 }
+
+/// External audit DEP-004: an unmet `Condition*` skips a unit and reports
+/// its start job as done — the agent never runs and nothing is failed. An
+/// unmet `Assert*` fails the job but leaves the unit inactive (dead), and
+/// would pre-empt the check below. The bpffs pre-flight is a command, so
+/// without bpffs the unit is `failed` and in `systemctl --failed`.
+#[test]
+fn agent_unit_asserts_bpffs() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        let skips: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k.starts_with("Condition"))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(
+            skips.is_empty(),
+            "{name}: {skips:?} would skip the unit silently"
+        );
+    }
+    let d = directives(&unit("northnarrow-agent.service"));
+    assert!(value(&d, "AssertPathIsMountPoint").is_none());
+    assert_eq!(
+        value(&d, "ExecStartPre"),
+        Some("/usr/bin/mountpoint -q /sys/fs/bpf")
+    );
+    assert!(
+        value(&d, "OnFailure").is_none(),
+        "no failure handler unit ships in deploy/systemd"
+    );
+}

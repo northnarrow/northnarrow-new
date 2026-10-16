@@ -1,6 +1,6 @@
 {
   "domain": "NN-RAG-KB-CANON-v1",
-  "kb_index_hash": "4d335aed6eec26e150b488f94bb36f65f2784b6221e1b51dede6fce63cd5fd98",
+  "kb_index_hash": "b6cd7d32ec7b3cdda7fa447f38f17cbe8614230e03131cb1832e09495a41da6c",
   "note": "LOLBAS excluded (GPL-3.0, plan §4.2.3). 6.7 in-repo notes merged at index build (P3/P4), not acquired here.",
   "sources": [
     {
@@ -12,7 +12,7 @@
     {
       "canonical_dump_sha256": "34c7707d2e1a3195e4de0af7c9da3a3579b945c5e870ebb5dd3c749ba7af9d67",
       "file": "sigma.jsonl",
-      "pin": "master",
+      "pin": "df5c6a6ecc149e05cb4dea306012668fb2ae5a12",
       "source": "sigma-hq-rules"
     }
   ]

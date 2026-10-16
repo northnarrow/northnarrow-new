@@ -25,8 +25,8 @@ Wants=northnarrow-agent.service
 RefuseManualStop=yes
 # No Requires=sys-fs-bpf.mount: /sys/fs/bpf is an API VFS with no
 # materialisable mount unit (see northnarrow-agent.service). The
-# watchdog is ordered After= the agent, which has already validated
-# bpffs via its ConditionPathIsMountPoint guard before this starts.
+# watchdog is ordered After= the agent, whose ExecStartPre= has already
+# checked bpffs (and failed the agent unit without it).
 
 [Service]
 Type=notify
