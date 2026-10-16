@@ -6,7 +6,17 @@
  * Output is numeric on purpose (the check reads "Permission denied" as a
  * refusal).
  *
+ * External audit LAB-004: the same ring aimed at a protected path, for
+ * tamper-check C59a-C59c. The deny hooks sit in the VFS, so a request the
+ * ring executes must be refused like the syscall. These modes print
+ * "errno=<NAME>" for the operation under test (the check reads the errno,
+ * not a message); a rename that goes through is renamed back at once.
+ *
  * usage: nn-iou-probe <file> <ipv4> <port>
+ *        nn-iou-probe --open-write <file>   open O_WRONLY|O_APPEND, write nothing
+ *        nn-iou-probe --unlink <path>
+ *        nn-iou-probe --rename <old> <new>
+ *        nn-iou-probe --modes               list the tamper modes
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -76,8 +86,97 @@ static int ring_run(struct ring *r, const struct io_uring_sqe *in)
     return res;
 }
 
+/* Opcode numbers are io_uring UAPI (stable): spelled out so that an older
+ * <linux/io_uring.h> without them still builds the C22 probe. */
+#define NN_IORING_OP_RENAMEAT 35
+#define NN_IORING_OP_UNLINKAT 36
+
+static const char *errno_name(int e)
+{
+    static char buf[16];
+    switch (e) {
+    case EPERM: return "EPERM";
+    case ENOENT: return "ENOENT";
+    case EACCES: return "EACCES";
+    case EBUSY: return "EBUSY";
+    case EEXIST: return "EEXIST";
+    case EXDEV: return "EXDEV";
+    case EINVAL: return "EINVAL";
+    case ETXTBSY: return "ETXTBSY";
+    case EROFS: return "EROFS";
+    case ENOSYS: return "ENOSYS";
+    case EOPNOTSUPP: return "EOPNOTSUPP";
+    default: snprintf(buf, sizeof buf, "E%d", e); return buf;
+    }
+}
+
+/* One tamper request through the ring; returns the process exit code. */
+static int tamper_mode(int argc, char **argv)
+{
+    const char *mode = argv[1];
+    if (strcmp(mode, "--modes") == 0) {
+        printf("open-write unlink rename\n");
+        return 0;
+    }
+    int is_rename = strcmp(mode, "--rename") == 0;
+    if (argc != (is_rename ? 4 : 3)) {
+        fprintf(stderr, "usage: %s --open-write <file> | --unlink <path> | --rename <old> <new>\n",
+                argv[0]);
+        return 2;
+    }
+    struct ring r;
+    if (ring_init(&r, 8) < 0) {
+        printf("setup: io_uring_setup failed (%s)\n", errno_name(errno));
+        return 2;
+    }
+    struct io_uring_sqe sqe;
+    memset(&sqe, 0, sizeof sqe);
+    sqe.fd = AT_FDCWD;
+    sqe.addr = (uint64_t)(uintptr_t)argv[2];
+    int res;
+    if (strcmp(mode, "--open-write") == 0) {
+        sqe.opcode = IORING_OP_OPENAT;
+        sqe.open_flags = O_WRONLY | O_APPEND | O_NOFOLLOW | O_NONBLOCK;
+        res = ring_run(&r, &sqe);
+        if (res >= 0) {
+            close(res); /* nothing is written */
+            printf("open-write %s through the ring: opened (nothing written)\n", argv[2]);
+            return 0;
+        }
+    } else if (strcmp(mode, "--unlink") == 0) {
+        sqe.opcode = NN_IORING_OP_UNLINKAT; /* unlink_flags (= open_flags slot) 0 */
+        res = ring_run(&r, &sqe);
+        if (res == 0) {
+            printf("unlink %s through the ring: unlinked\n", argv[2]);
+            return 0;
+        }
+    } else if (is_rename) {
+        sqe.opcode = NN_IORING_OP_RENAMEAT;
+        sqe.len = (uint32_t)AT_FDCWD;                /* new dirfd */
+        sqe.off = (uint64_t)(uintptr_t)argv[3];      /* addr2: the new path */
+        res = ring_run(&r, &sqe);                    /* rename_flags 0 */
+        if (res == 0) {
+            int back = rename(argv[3], argv[2]);
+            printf("rename %s through the ring: renamed (%s)\n", argv[2],
+                   back == 0 ? "renamed back" : "NOT renamed back");
+            return 0;
+        }
+    } else {
+        fprintf(stderr, "unknown mode %s\n", mode);
+        return 2;
+    }
+    if (res <= -10000) {
+        printf("setup: io_uring_enter failed (%s)\n", errno_name(-res - 10000));
+        return 2;
+    }
+    printf("%s %s through the ring: errno=%s\n", mode + 2, argv[2], errno_name(-res));
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 2 && strncmp(argv[1], "--", 2) == 0)
+        return tamper_mode(argc, argv);
     if (argc != 4) {
         fprintf(stderr, "usage: %s <file> <ipv4> <port>\n", argv[0]);
         return 2;

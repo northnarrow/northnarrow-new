@@ -251,11 +251,11 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-205 | SUP-017 | Supply chain | S | fixed (lab PR 150) |
 | NN-AUD-206 | LAB-001 | Lab scripts | M | fixed (lab PR 153) |
 | NN-AUD-207 | LAB-002 | Lab scripts | L | fixed (lab PR 156) |
-| NN-AUD-208 | LAB-003 | Lab scripts | S | open |
-| NN-AUD-209 | LAB-004 | Lab scripts | L | open |
-| NN-AUD-210 | LAB-005 | Lab scripts | M | open |
+| NN-AUD-208 | LAB-003 | Lab scripts | S | fixed (lab PR 154) |
+| NN-AUD-209 | LAB-004 | Lab scripts | L | fixed (lab PR 154) |
+| NN-AUD-210 | LAB-005 | Lab scripts | M | fixed (lab PR 154) |
 | NN-AUD-211 | LAB-006 | Lab scripts | S | open |
-| NN-AUD-212 | LAB-007 | Lab scripts | S | open |
+| NN-AUD-212 | LAB-007 | Lab scripts | S | fixed (lab PR 154) |
 | NN-AUD-213 | LAB-008 | Lab scripts | M | fixed (lab PR 156) |
 | NN-AUD-214 | LAB-009 | Lab scripts | M | fixed (lab PR 156) |
 | NN-AUD-215 | LAB-010 | Lab scripts | S | fixed (lab PR 156) |
@@ -4307,3 +4307,75 @@ the audit did not report, noted with the fix that takes them.
     the install): a wrong pin stops it. `bash -n` on every script touched;
     shellcheck is not installed on the host.
   - Lab: Ubuntu 24.04: `nn-lab.sh verify-image` OK (the noble image matched the signed SHA256SUMS of Canonical's key `D2EB4462…`), `pkg-check` PASS, `respawn-check` OK and `tamper-check` OK with the scratch files in a private `mktemp` directory; `bash deploy/lab/lib/verify-download-test.sh` 59/59 (no network); `release-check` refuses a SHA256SUMS without the tarball's line before extracting (file test); `git grep iter2_test_block` empty. Debian's cloud images carry no signature (HTTPS only, flagged `unsigned` in the record). Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
+- **NN-AUD-208, NN-AUD-209, NN-AUD-210, NN-AUD-212 (LAB-003, LAB-004,
+  LAB-005, LAB-007), lab PR 154.** The anti-tamper suite (triage F, batch
+  5), all in `deploy/lab/adversarial/anti-tamper.sh` plus three modes of
+  `iouring-probe.c`. No product change.
+  - LAB-003: no signal goes to a bare PID. A python3 helper (`nnpy`,
+    run with `-I`) refuses a PID that is not decimal and above 1, its own
+    or its caller's, checks comm and start time in `/proc/<pid>/stat`
+    (readable without ptrace; `exe` is not, C04b), opens a pidfd,
+    re-checks, and signals through the pidfd; ESRCH and a mismatch print
+    `target=absent`, a deviation. C02 resolves the watchdog from MainPID,
+    then its pidfile, by comm `northnarrow-wat`; `agent_pid` returns only
+    a PID whose comm is `northnarrow-age` (waiting up to 15 s for a
+    recycled agent's pidfile), which also covers the later re-reads (C18,
+    C20, C23-C31). C01, C02, C28 and C34's kill of its own probe child use
+    the helper; C03, C04b, C29 and C34 open `/proc/<pid>/mem|environ`
+    through it.
+  - LAB-005: `LC_ALL=C` (and `LANGUAGE` unset). `outcome_of` reads
+    `errno=EPERM|EACCES` from the helpers (another errno is
+    `error (errno=X)`) or the C-locale message of an external tool, and
+    a case may name a postcondition (`POST=`), evaluated in a subshell:
+    with it, a refusal whose end state changed is `partial`, a deviation.
+    Postconditions: same process alive and not stopped (a stopped one is
+    resumed; C01-C03, C28, C29, C31, C32, C55), same inode or hash (C04,
+    C06, C46, C56, C59), file not shrunk (C57, C59a), `+i` kept and `+a`
+    absent (C05, C44, C45), every pin kept (C07), no kexec image (C17),
+    dummy not loaded (C27, which now prints the errno name).
+  - LAB-007: a trap on EXIT, INT, TERM, HUP and PIPE (a lost ssh session
+    surfaces as SIGPIPE at the next write) undoes, newest first, the
+    mounts registered before C13, C14 and C26 (umount with retries, then
+    `umount -l`, then a check), thaws C15's cgroup, unmasks C60, puts
+    back what C56b/C59b unlinked and removes the scratch files; signals
+    are ignored while it runs (Ctrl-C also kills the case's child, and
+    bash runs the INT trap twice). After C14 and C26 a mount still there
+    is a DEVIATION row and stops the run; a mount the trap cannot undo
+    turns the exit status to 1. The run refuses to start over a leftover
+    mount.
+  - LAB-004: C55a-g SIGSTOP, INT, HUP, QUIT, SEGV, ABRT, BUS from a root
+    shell (denied, `op=signal`); C56a a byte-identical copy renamed over
+    the agent binary (`op=rename`), C56b the watchdog binary unlinked
+    (`op=unlink`; in-place writes are the kernel's ETXTBSY); C57a
+    truncate(2) of audit.log (`op=setattr`), C57b `: >` detections.jsonl
+    (`op=write`), copies kept in /root if a chain was cut; C57c
+    `journalctl --vacuum-time=1s` on the namespace, KNOWN GAP (archived
+    files only); C58 a copy of the module tool named `nn-modld`, run as
+    `modprobe` through argv[0] (allowed, `R018_KernelModuleLoad`; R011
+    matches the comm); C59a-c open-for-write, unlinkat and renameat
+    through an io_uring ring (`op=write|unlink|rename`; opcodes 35/36
+    spelled out so an older `<linux/io_uring.h>` still builds C22);
+    C60 `systemctl mask --runtime` of the watchdog (allowed,
+    `unit_shadowed`: a persistent mask cannot replace the installed unit,
+    systemd refuses); C61 PROTECTED_PIDS across C30's restart (observe
+    builds; no entry without a live agent or watchdog, no growth).
+    Reboot persistence: `anti-tamper.sh --persistence` after a reboot
+    (C62a-e: SIGCONT to both refused, audit.log write-open refused, `+i`
+    on the state directory, the pins back); `nn-lab.sh` is not changed
+    (a `reboot-check` wrapper is two `vssh` calls around `down`/`up`).
+    Map delete and the PID-1 relay are covered already (C08, C31-C33);
+    the new-entry vectors (create, link, symlink, mknod, mkdir, xattr in
+    the protected directories) are lab PR 152's C47-C54.
+  - Tests: `anti-tamper.sh --selftest` (unprivileged, no system change):
+    the outcome table (`partial`, `target absent`, `EPERMX` is not EPERM,
+    an Italian message is not a refusal), `valid_pid` on 0, 1, -1, 007
+    and 11 digits, `post_proc` on a child that is stopped (fails and
+    resumes it) and killed, the helper's own 35 checks (no signal to 0,
+    -1, 1, itself or its caller; wrong comm or start time leaves the
+    child alive; nothing written by `open-append`; file content never
+    printed; bpftool key decoding), the mount cleanup order and a stuck
+    mount with stubbed tools, the io_uring probe's three modes on scratch
+    files, and every case id used once. INT, TERM and PIPE in the middle
+    of a case were checked with a harness and stubbed mount tools: both
+    mounts undone newest first, the mask undone, exit 130/143/141.
+  - Lab: Ubuntu 24.04, `nn-lab.sh tamper-check` with this suite: every pre-existing case as before; new: C55a–g (STOP, INT, HUP, QUIT, SEGV, ABRT, BUS to the agent) denied `op=signal`; C56a rename over the agent binary denied `op=rename`, C56b unlink of the watchdog binary denied `op=unlink`; C57a `truncate` of audit.log denied `op=setattr`, C57b `: >` on detections.jsonl denied `op=write`; C57c `journalctl --vacuum-time` on the agent's namespace allowed (KNOWN GAP); C58 a renamed module tool → R018; C59a–c through io_uring denied (`op=write|unlink|rename`); C60 `systemctl mask --runtime` of the watchdog → `unit_shadowed`; C61 2 → 2 PROTECTED_PIDS entries, 0 stale; C14's mount undone by the trap, `findmnt /etc/northnarrow` empty after; verdict "anti-tamper check: OK (known gaps listed)". `--selftest`: 39 checks, 0 failed. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
