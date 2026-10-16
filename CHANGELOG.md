@@ -41,6 +41,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Lab follow-up, nftables (lab PR 165): the per-process outbound block (a
+  BlockOutbound verdict, the COMBAT soft egress block of INVESTIGATE) is
+  an nftables rule applied with `nft`, and nothing in the install chain
+  asked for it — on Debian 12's cloud image, which ships without it, the
+  block failed at the first offender. The `.deb` pre-depends on
+  `nftables` (dpkg refuses before the pre-unpack hook stops a running
+  agent; `apt-get install ./<deb>` pulls it in) and the `.rpm` requires
+  it; neither enables `nftables.service` or loads a ruleset.
+  `install.sh` installs no system package: on a host without `nft` it
+  refuses before changing anything (an `--upgrade` included) and names
+  the command, or goes on with `--without-nftables`, recorded in
+  `install-manifest.json` (`prerequisite_overrides`) and named by
+  `nn-admin host-check`; in `--package-configure` a missing `nft` is a
+  warning. At boot the agent looks for `nft` on its own `PATH` and, when
+  it is missing, logs an ERROR and records one signed
+  `subsystem_degraded` ("block_outbound unavailable: nft missing"). The
+  host-check line stays a WARN, like every check of that table (exit 2
+  already marks the host), now also searching `/usr/local`. The lab
+  guests install `nftables` (templates; `nn-lab.sh up` and `install`
+  for guests provisioned before), `pkg-check` checks the dependency, the
+  range bootstrap and the release workflow's package smoke test check it
+  too. **Regression:** `install.sh` on a host without `nft`, a scripted
+  `--upgrade` included, needs `nftables` installed or
+  `--without-nftables`; a bare `dpkg -i` / `rpm -U` of the package needs
+  `nftables` installed first.
 - External audit, Wave 2, range bootstrap and lab verdict integrity
   (Medium LAB-006, LAB-018, LAB-016, LAB-017, LAB-011, LAB-014): the
   bootstrap refuses a lab-featured binary (`--build-features`), stops on

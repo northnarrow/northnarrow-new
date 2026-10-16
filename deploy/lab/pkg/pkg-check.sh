@@ -14,7 +14,8 @@
 #      integrity verified against a "package" install manifest
 #   7. final cleanup so `nn-lab.sh install` can put the lab layout back
 # On rpm guests, step S first checks the release signing path
-# (deploy/release/sign-rpm.sh selftest).
+# (deploy/release/sign-rpm.sh selftest). Step D checks the nftables
+# dependency (lab PR 165).
 set -u
 cd ~/northnarrow
 fail=0
@@ -53,6 +54,17 @@ for r in 1 2 3; do
     NN_PKG_FORMATS=$fmt NN_PKG_RELEASE=$r deploy/release/mk-packages.sh "$PKGDIR" >/dev/null || { bad "build release $r"; exit 1; }
 done
 pkg() { ls "$PKGDIR"/* | grep -E "[-_]0?[0-9.]+-$1[._]" | head -1; }
+# Lab follow-up (lab PR 165): the per-process outbound block needs nft. The
+# package declares it (on the .deb a Pre-Depends: dpkg refuses before the
+# pre-unpack hook stops the agent); dpkg -i and rpm -U do not fetch it, so
+# the guest must have it (nn-lab.sh install provisions it).
+if [ "$fmt" = deb ]; then
+    check "D package pre-depends on nftables" sh -c "dpkg-deb -f '$(pkg 1)' Pre-Depends | grep -qw nftables"
+else
+    check "D package requires nftables" sh -c "rpm -qpR '$(pkg 1)' | grep -qx nftables"
+fi
+PATH="$PATH:/usr/sbin:/sbin" command -v nft >/dev/null 2>&1 \
+    || { bad "  nft on the guest (dpkg -i / rpm -U refuse without it: run nn-lab.sh install first)"; exit 1; }
 # External audit DEP-008: the signing path the release workflow uses on a
 # tag, checked with this distribution's rpm and throwaway keys on a copy:
 # signed accepted; unsigned, signed by another key, altered refused.

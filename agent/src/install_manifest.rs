@@ -49,6 +49,11 @@ pub struct InstallManifest {
     /// `--no-verify`); absent when none was needed.
     #[serde(default)]
     pub verify_override: Option<String>,
+    /// Lab follow-up (lab PR 165): the `install.sh` flags that accepted a
+    /// host without one of the agent's prerequisites (`--without-nftables`);
+    /// empty when none was needed, and in manifests written before it.
+    #[serde(default)]
+    pub prerequisite_overrides: Vec<String>,
     /// Directory the binaries were installed into.
     pub bin_dir: String,
     /// `name → sha256 hex`. Names: `northnarrow-agent`, `northnarrow-watchdog`,
@@ -402,6 +407,30 @@ mod tests {
         let parsed: InstallManifest = serde_json::from_str(&with).unwrap();
         assert_eq!(parsed.provenance, "source-tree");
         assert_eq!(parsed.verify_override.as_deref(), Some("--source-tree"));
+    }
+
+    /// Lab follow-up (lab PR 165): the flag that accepted a host without
+    /// `nft` is read back; manifests written before it have none.
+    #[test]
+    fn prerequisite_overrides_are_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = manifest_json(dir.path(), "00", "11", "22", "33");
+        let parsed: InstallManifest = serde_json::from_str(&m).unwrap();
+        assert!(parsed.prerequisite_overrides.is_empty());
+        let with = m.replacen(
+            r#""provenance":"attested","#,
+            r#""provenance":"attested","prerequisite_overrides":["--without-nftables"],"#,
+            1,
+        );
+        let parsed: InstallManifest = serde_json::from_str(&with).unwrap();
+        assert_eq!(parsed.prerequisite_overrides, vec!["--without-nftables"]);
+        let empty = m.replacen(
+            r#""provenance":"attested","#,
+            r#""provenance":"attested","prerequisite_overrides":[],"#,
+            1,
+        );
+        let parsed: InstallManifest = serde_json::from_str(&empty).unwrap();
+        assert!(parsed.prerequisite_overrides.is_empty());
     }
 
     #[test]

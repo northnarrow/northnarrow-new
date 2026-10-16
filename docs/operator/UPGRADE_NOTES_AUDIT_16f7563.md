@@ -23,7 +23,8 @@ and the tracker note have the details and the lab evidence.
 4. A model kept outside a root-owned directory is not loaded: move it to
    `/var/lib/northnarrow/models/` (§7).
 5. The host needs `/usr/bin/mountpoint` (util-linux) to start the agent
-   (§1), and `nft` for the COMBAT soft egress block (§6).
+   (§1), and `nft` for the COMBAT soft egress block (§6): `install.sh`
+   refuses a host without it unless `--without-nftables` (§1).
 6. Keep the trusted-installer key at hand: more operations on the agent's
    own directories need a window (§2).
 
@@ -39,6 +40,16 @@ and the tracker note have the details and the lab evidence.
   `--source-tree`; an extracted release without its tarball and
   `SHA256SUMS` needs `--tarball`/`--sums` or `--allow-manifest-only`.
   See [INSTALL_UPGRADE_UNINSTALL.md §5.1](INSTALL_UPGRADE_UNINSTALL.md#51-installsh-verifies-the-release-itself).
+- **A host without `nft` is refused** (lab follow-up, lab PR 165).
+  `install.sh`, an `--upgrade` included, refuses before changing anything
+  when `nft` (nftables) is missing, and names the command;
+  `--without-nftables` goes on and is recorded in `install-manifest.json`
+  (`prerequisite_overrides`). The `.deb` pre-depends on and the `.rpm`
+  requires `nftables`. **Regression:** a scripted install or upgrade on a
+  host without `nft` needs `nftables` first (or the flag); a bare
+  `dpkg -i` / `rpm -U` needs it installed first (`apt-get install ./…deb`
+  and `dnf install ./…rpm` pull it in). See
+  [INSTALL_UPGRADE_UNINSTALL.md](INSTALL_UPGRADE_UNINSTALL.md), Prerequisites.
 - **A removed install manifest refuses the boot** (NN-AUD-200 DEP-009, lab
   PR 148). Once the signed audit chain holds a verified boot of this
   install, a missing manifest stops the agent (exit 78, `agent_boot`

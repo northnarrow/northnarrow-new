@@ -116,23 +116,57 @@ fn install_provenance(root: &Path) -> Check {
     }
 }
 
-/// External audit CMB-014: where `nft` may be installed. The COMBAT
-/// soft egress block (INVESTIGATE) is an nftables rule: without `nft`
-/// the offender is not contained while the agent analyses it.
-const NFT_PATHS: &[&str] = &["usr/sbin/nft", "sbin/nft", "usr/bin/nft", "bin/nft"];
+/// External audit CMB-014: where `nft` may be installed — the directories
+/// of systemd's default `PATH` for a service, which the agent searches
+/// (lab PR 165 added `/usr/local`). The per-process outbound block (a
+/// BlockOutbound verdict, the COMBAT soft egress block of INVESTIGATE) is an
+/// nftables rule: without `nft` the offender is not contained while the
+/// agent analyses it.
+const NFT_PATHS: &[&str] = &[
+    "usr/local/sbin/nft",
+    "usr/local/bin/nft",
+    "usr/sbin/nft",
+    "usr/bin/nft",
+    "sbin/nft",
+    "bin/nft",
+];
 
+/// The `install.sh` flag that accepts a host without `nft` (lab PR 165).
+const WITHOUT_NFT_FLAG: &str = "--without-nftables";
+
+/// A missing `nft` is a WARN like every other check: host-check has no
+/// level above it, and its exit status (2) already marks the host. The
+/// refusal belongs to the install paths: the packages depend on nftables
+/// and `install.sh` refuses without it unless `--without-nftables`, which
+/// is named here when the install manifest records it (lab PR 165).
 fn nft_tool(root: &Path) -> Check {
     let found = NFT_PATHS.iter().find(|rel| root.join(rel).is_file());
     let (status, value) = match found {
         Some(rel) => (Status::Ok, format!("/{rel}")),
-        None => (Status::Warn, "not installed".to_string()),
+        None => {
+            let accepted = std::fs::read_to_string(root.join(INSTALL_MANIFEST_REL))
+                .ok()
+                .and_then(|t| {
+                    serde_json::from_str::<crate::install_manifest::InstallManifest>(&t).ok()
+                })
+                .is_some_and(|m| {
+                    m.prerequisite_overrides
+                        .iter()
+                        .any(|f| f == WITHOUT_NFT_FLAG)
+                });
+            let mut value = "not installed".to_string();
+            if accepted {
+                value.push_str(&format!(" (accepted with {WITHOUT_NFT_FLAG})"));
+            }
+            (Status::Warn, value)
+        }
     };
     Check {
         id: "nft",
         name: "nftables for COMBAT containment",
         status,
         value,
-        fix: "install nftables (`apt install nftables` / `dnf install nftables`) — without `nft` a COMBAT soft egress block does not take effect (the agent shortens INVESTIGATE and records the failure)",
+        fix: "install nftables (`apt-get install nftables` / `dnf install nftables`) — without `nft` neither a BlockOutbound verdict nor the COMBAT soft egress block drops the offender's traffic (the agent records a signed subsystem_degraded at boot, and each episode records the failure and shortens INVESTIGATE)",
     }
 }
 
@@ -482,6 +516,34 @@ mod tests {
         }
         w(r, INSTALL_MANIFEST_REL, b"{not json");
         assert_eq!(install_provenance(r).status, Status::Warn);
+    }
+
+    /// Lab follow-up (lab PR 165): a host without `nft` stays a WARN, and
+    /// names `--without-nftables` when the install manifest recorded it; an
+    /// `nft` under `/usr/local` (systemd's default service PATH) is found.
+    #[test]
+    fn nft_check_names_the_install_override() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let c = nft_tool(r);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.value, "not installed");
+        assert!(c.fix.contains("subsystem_degraded"), "{}", c.fix);
+        let with = String::from_utf8(manifest("source-tree", Some("--source-tree")))
+            .unwrap()
+            .replacen(
+                r#""bin_dir""#,
+                r#""prerequisite_overrides":["--without-nftables"],"bin_dir""#,
+                1,
+            );
+        w(r, INSTALL_MANIFEST_REL, with.as_bytes());
+        let c = nft_tool(r);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.value, "not installed (accepted with --without-nftables)");
+        w(r, "usr/local/sbin/nft", b"");
+        let c = nft_tool(r);
+        assert_eq!(c.status, Status::Ok);
+        assert_eq!(c.value, "/usr/local/sbin/nft");
     }
 
     #[test]

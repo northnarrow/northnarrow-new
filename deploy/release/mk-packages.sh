@@ -19,6 +19,18 @@
 # run when the package's own files are not on disk, so each carries an
 # inlined copy of the script it needs (@INSTALL_SH@ / @UNINSTALL_SH@).
 #
+# Dependencies: nftables besides libc and systemd (lab PR 165). The agent's
+# per-process outbound block is an nftables rule applied with `nft`, and
+# Debian 12's cloud image ships without it; the package manager pulls it in
+# (apt-get / dnf install of the package file; a bare dpkg -i or rpm -U
+# refuses). On the .deb it is a Pre-Depends: the pre-unpack hook stops the
+# running agent, and a missing plain Depends only fails at configure time,
+# after the unpack — the agent would stay stopped with the package
+# unconfigured. With Pre-Depends dpkg refuses before any hook runs, as rpm
+# does for a missing Requires. Debian's package neither enables nor starts
+# nftables.service (dh_installsystemd --no-enable --no-start) and RHEL's is
+# disabled by preset: the dependency adds the tool, it loads no ruleset.
+#
 # Nothing here is signed (external audit DEP-008): the release workflow signs
 # the .rpm afterwards, on a tag, in its rpm-sign job (sign-rpm.sh). A .deb
 # carries no signature dpkg or apt would check; its origin is the tag-bound
@@ -101,6 +113,7 @@ Architecture: amd64
 Maintainer: ${MAINTAINER}
 Section: admin
 Priority: optional
+Pre-Depends: nftables
 Depends: libc6 (>= 2.34), systemd
 Installed-Size: $(du -sk "$root" | cut -f1)
 Homepage: ${HOMEPAGE}
@@ -135,6 +148,7 @@ URL:            ${HOMEPAGE}
 AutoReqProv:    no
 Requires:       glibc >= 2.34
 Requires:       systemd
+Requires:       nftables
 %global debug_package %{nil}
 %global __os_install_post %{nil}
 
