@@ -17,8 +17,17 @@ sudo rm -rf /opt/nn-release && sudo mkdir -p /opt/nn-release && sudo cp /tmp/nn-
 cd /opt/nn-release || exit 1
 tgz=$(ls northnarrow-*-x86_64-linux.tar.gz | head -1)
 echo "== $tgz on $(. /etc/os-release; echo "$PRETTY_NAME") / $(uname -r)"
-check "tarball matches SHA256SUMS" bash -c "sha256sum -c --ignore-missing SHA256SUMS >/dev/null"
-sudo tar -xzf "$tgz" || { bad "extract"; exit 1; }
+# External audit LAB-010: `sha256sum -c --ignore-missing` passed when ANY
+# listed file matched, so the tarball itself could go unchecked, and it was
+# then extracted as root with its owners and modes. Its own line now, exactly
+# one, checked before anything is extracted; extracted as plain files.
+sums_line=$(awk -v f="$tgz" '{ n = $2; sub(/^\*/, "", n) } NF == 2 && n == f' SHA256SUMS)
+if [ -z "$sums_line" ] || [ "$(printf '%s\n' "$sums_line" | wc -l)" != 1 ]; then
+    bad "tarball matches SHA256SUMS (no single line for $tgz)"; exit 1
+fi
+check "tarball matches SHA256SUMS" bash -c 'printf "%s\n" "$1" | sha256sum -c --strict - >/dev/null' _ "$sums_line"
+[ "$fail" = 0 ] || { bad "tarball not verified: nothing extracted"; exit 1; }
+sudo tar --no-same-owner --no-same-permissions -xzf "$tgz" || { bad "extract"; exit 1; }
 tree=/opt/nn-release/${tgz%.tar.gz}
 check "release binaries run here (glibc)" "$tree/target/release/northnarrow-agent" --version
 T0=$(date "+%F %T")

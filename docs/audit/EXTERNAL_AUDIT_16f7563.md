@@ -250,20 +250,20 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-204 | SUP-006 | Supply chain | S | fixed (lab PR 110) |
 | NN-AUD-205 | SUP-017 | Supply chain | S | fixed (lab PR 150) |
 | NN-AUD-206 | LAB-001 | Lab scripts | M | fixed (lab PR 153) |
-| NN-AUD-207 | LAB-002 | Lab scripts | L | open |
+| NN-AUD-207 | LAB-002 | Lab scripts | L | fixed (lab PR 156) |
 | NN-AUD-208 | LAB-003 | Lab scripts | S | open |
 | NN-AUD-209 | LAB-004 | Lab scripts | L | open |
 | NN-AUD-210 | LAB-005 | Lab scripts | M | open |
 | NN-AUD-211 | LAB-006 | Lab scripts | S | open |
 | NN-AUD-212 | LAB-007 | Lab scripts | S | open |
-| NN-AUD-213 | LAB-008 | Lab scripts | M | open |
-| NN-AUD-214 | LAB-009 | Lab scripts | M | open |
-| NN-AUD-215 | LAB-010 | Lab scripts | S | open |
+| NN-AUD-213 | LAB-008 | Lab scripts | M | fixed (lab PR 156) |
+| NN-AUD-214 | LAB-009 | Lab scripts | M | fixed (lab PR 156) |
+| NN-AUD-215 | LAB-010 | Lab scripts | S | fixed (lab PR 156) |
 | NN-AUD-216 | LAB-011 | Lab scripts | M | open |
 | NN-AUD-217 | LAB-012 | Lab scripts | M | open |
 | NN-AUD-218 | LAB-013 | Lab scripts | L | open |
 | NN-AUD-219 | LAB-014 | Lab scripts | S | open |
-| NN-AUD-220 | LAB-015 | Lab scripts | S | open |
+| NN-AUD-220 | LAB-015 | Lab scripts | S | fixed (lab PR 156) |
 | NN-AUD-221 | LAB-016 | Lab scripts | S | open |
 | NN-AUD-222 | LAB-017 | Lab scripts | M | open |
 | NN-AUD-223 | LAB-018 | Lab scripts | S | open |
@@ -4215,3 +4215,95 @@ the audit did not report, noted with the fix that takes them.
     `describe_response`), `response_of_an_action_carried_out_is_unchanged`
     (a guard, passes on both). The privileged e2e above were not run here.
   - Lab: Ubuntu 24.04, resp155-probe.sh on main and on this build (21 processes from a fresh `/tmp` directory, R001 KillProcess; 20 copies of `true` and one `sleep 60`): main 21 records "KillProcess", 20 of them for processes that had exited 0 on their own (overstated=20, FAIL); here 17 "KillProcess (already gone)", 4 "KillProcess" (the `sleep` killed with 137, one race), overstated=0 (PASS). The new e2e (`tmp_exec_kill_hits_the_offender_only`) and the rewritten honeypot, D7, net and FIM assertions pass in the gate; found by them on Debian: a bait in a directory the agent protects refuses the unlink, so the tamperer now stays alive after the refusal (the attempt is the tamper FIM-024 answers). Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
+- **NN-AUD-213 (LAB-008), NN-AUD-214 (LAB-009), NN-AUD-215 (LAB-010),
+  NN-AUD-207 (LAB-002), NN-AUD-220 (LAB-015), lab PR 156.** Lab host
+  hygiene and lab supply chain (triage F, batch 7). Lab and range scripts
+  only; no agent change.
+  - LAB-008: every root work path at a fixed name under `/tmp` or
+    `/var/tmp` is now made by `mktemp` (0700, unpredictable name), kept on
+    the same filesystem as before so the measurements and the R001 case do
+    not change: `overhead/run.sh` (with an EXIT trap), `btrfs-check.sh`
+    (the loop image, made just before `mkfs`), `inode-reuse-check.sh` (the
+    source file; the reuse files directly in `/tmp`, as the check needs,
+    under a random prefix and created with `set -C`, i.e. `O_EXCL`), t713
+    scenario B's fallback, and in `anti-tamper.sh` one `$TMPD` for C14's
+    bind source, C21's binary, C24's overlay, C27's modules, C40's link and
+    the probes' compiler logs. `nn-bench.c` checks `mkdir`, refuses a
+    workdir that is not a real directory of its uid closed to group and
+    others, and opens with `O_NOFOLLOW`. Root installs from paths of the
+    lab user: `pkg-check` and `pkgmgr-check` build their packages in a
+    `mktemp -d` (another user could own `/tmp/nnpkg` and swap a package
+    before `dpkg -i`), and `release-check` refuses a `/tmp/nn-release` it
+    did not create (`mkdir -m 0700`, no `-p`). Not changed: files written
+    as the lab user (logs, the soak scratch), which is not a privilege
+    boundary here. Not the triage's `/var/lib/nn-lab` layout: a private
+    `mktemp` directory gives the same guarantee without moving the
+    workloads to another filesystem.
+  - LAB-009: `deploy/lab/lib/verify-download.sh`, sourced by `nn-lab.sh`.
+    Images keep the "current"/"latest" URLs (a pinned hash would break
+    with each build) and are checked against the vendor's list: Ubuntu
+    `SHA256SUMS` + `.gpg` (UEC Image Automatic Signing Key,
+    `D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81`), AlmaLinux `CHECKSUM` +
+    `.asc` (AlmaLinux OS 9, `BF18AC2876178908D6E71267D36CB86CB86B3716`).
+    The fingerprints are pinned in the script; the keys are fetched once
+    (keyserver.ubuntu.com, repo.almalinux.org) into
+    `~/.cache/nn-lab/keys/`, kept only when the primary fingerprint is the
+    pinned one, and a list counts only with gpgv's GOODSIG and a VALIDSIG
+    whose primary key is the pinned one (gpgv exits 0 on a key expired
+    since; the keyring cache vouches for nothing). Debian publishes no
+    signature for its current cloud images (only the legacy OpenStack
+    ones): `SHA512SUMS` over HTTPS, as Debian documents, recorded as
+    `unsigned` and warned about. The image is downloaded to `.part`,
+    renamed only when its digest is the one listed for its exact name
+    (exactly one entry), and its record (`<image>.verified`: digest, URL,
+    list and its sha256 prefix, signer, time) is written next to it; a new
+    guest disk is layered only on an image that matches its record. An
+    image from before is never deleted or downloaded again: `up` warns,
+    and `nn-lab.sh verify-image` looks for its digest in the current list
+    and the dated builds still published (40 at most; AlmaLinux's
+    `CHECKSUM` lists its recent builds), records it when found, fails
+    otherwise. WHPX's copy of the image carries its own record. The
+    nightly report names the image and its record. Cloud-init (three
+    templates): `rustup-init` 1.29.1 from the archive URL, checked against
+    its pinned SHA-256 before it runs (no `curl | sh`); the toolchain stays
+    `stable`, as `rust-toolchain.toml`. `provision-kali.sh`: Sliver from
+    Kali's apt repository (`SLIVER_VERSION` now an apt version pin), the
+    `ART_REF` pin fetched into the shallow clone or the script stops, the
+    installed versions in `~/nn-range-toolkit.versions`. Not done: the
+    superseded `docs/adversarial/scripts/04_install_attack_toolkit.sh`.
+  - LAB-010: `release-check.sh` checks the tarball's own `SHA256SUMS`
+    line (exactly one, exact name) with `sha256sum -c --strict` and stops
+    before extracting when it fails; extraction is
+    `tar --no-same-owner --no-same-permissions`.
+  - LAB-002: both rewrites of `admin.pub` are gone. Inside the window, a
+    guest with no `config-manage` key is only told to be recreated. When
+    the pin root stays protected, a guest whose `admin.pub` gives no key
+    `trusted-installer` is refused (die: recreate it); otherwise the
+    restart with the units disabled is kept (the recovery the lab's
+    commands rely on), without touching the file.
+  - LAB-015: the Tappa 7 iteration-2 debug script under `docs/debug/` is
+    deleted; of its two mentions in `docs/CLAUDE_BRIEFING.md`, the tree
+    line is gone and the section now points to the anti-tamper suite.
+  - Tests: `bash deploy/lab/lib/verify-download-test.sh` (no network, no
+    guest; two throwaway GnuPG keys and a directory standing for the
+    mirrors), 59 cases: a good signature, a list changed after signing, a
+    signature by a foreign key in the keyring, a pinned key expired since,
+    a key server answering with another key, the GNU and BSD list formats,
+    duplicate, missing and suffix names, the end-to-end download (refused
+    for a changed image, a foreign signer, a missing signature; nothing
+    kept), one changed byte in a cached image refusing a new guest,
+    `verify-image` finding an older build and refusing a changed or
+    unlisted image, the WHPX copy. With the pinned VALIDSIG check, the
+    GOODSIG check, the digest comparison, the exact name match or the
+    record check removed, cases fail. Against the real mirrors (read-only,
+    on symlinks to the lab's images): the noble and jammy images match
+    their current signed lists, the bookworm image the dated build
+    `20261006-2623`; a real AlmaLinux 9 download verified end to end. The
+    release-check gate on fake files: a list without the tarball line (the
+    old check passed it), a changed tarball, a duplicated line, refused.
+    `nn-bench` on the host: a symlinked or group-writable workdir and a
+    link planted in it refused, `overhead/run.sh` output unchanged. The
+    pinned `rustup-init` command run on the host (`--version` in place of
+    the install): a wrong pin stops it. `bash -n` on every script touched;
+    shellcheck is not installed on the host.
+  - Lab: Ubuntu 24.04: `nn-lab.sh verify-image` OK (the noble image matched the signed SHA256SUMS of Canonical's key `D2EB4462…`), `pkg-check` PASS, `respawn-check` OK and `tamper-check` OK with the scratch files in a private `mktemp` directory; `bash deploy/lab/lib/verify-download-test.sh` 59/59 (no network); `release-check` refuses a SHA256SUMS without the tarball's line before extracting (file test); `git grep iter2_test_block` empty. Debian's cloud images carry no signature (HTTPS only, flagged `unsigned` in the record). Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.

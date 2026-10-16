@@ -259,8 +259,7 @@ agent-ebpf/src/    eBPF Rust
 docs/
   ├─ XDR_ROADMAP.md
   ├─ TAPPA7_TASK5_DEEP_DEBUG.md (con Resolution section c33d089)
-  ├─ specs/PHASE_2_DEFERRED_TAPPE.md (4 spec deferred: 6.3, 6.7, 6.9.5 C, 6.9.5 D)
-  └─ debug/iter2_test_block.sh
+  └─ specs/PHASE_2_DEFERRED_TAPPE.md (4 spec deferred: 6.3, 6.7, 6.9.5 C, 6.9.5 D)
 ```
 
 ---
@@ -354,15 +353,12 @@ sudo chattr -i /var/lib/northnarrow 2>/dev/null
 sudo rm -rf /var/lib/northnarrow
 ```
 
-### iter2_test_block.sh struttura
-```
-Part A: setup + cleanup + launch agent + wait hooks
-Part B: bpftool prog show id <N> -j per ogni LSM (attach info)
-Part C: bpftool btf dump | grep security_* (vmlinux BTF ids)
-Part D: trace_pipe capture during attacks + nn-diag marker counts
-Part E: agent log tail
-Part F: post-attack run_cnt per LSM prog (bpf_stats)
-```
+### Script di debug dell'iterazione 2 (rimosso)
+Lo script di debug della Tappa 7 (`docs/debug/`) staccava tutti i link
+LSM dell'host e lasciava `/var/lib/northnarrow` manomessa: rimosso con
+l'audit esterno (LAB-015, NN-AUD-220). Le stesse prove, con esito atteso
+ed evidenza per caso, sono in `deploy/lab/adversarial/anti-tamper.sh`
+(`nn-lab.sh tamper-check`).
 
 ### Tools richiesti
 ```

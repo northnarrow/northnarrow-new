@@ -8,7 +8,7 @@
 # makes that a repeatable one-liner instead of a hand-built VM.
 #
 # Host prerequisites (once):
-#   sudo apt install qemu-system-x86 qemu-utils cloud-image-utils
+#   sudo apt install qemu-system-x86 qemu-utils cloud-image-utils gnupg gpgv
 #   sudo usermod -aG kvm "$USER"      # then re-login (WSL: `wsl --shutdown`)
 #   bpf-linker 0.10.3 + nightly on PATH for `cargo xtask build-ebpf`
 #
@@ -49,6 +49,7 @@
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
 #   deploy/lab/nn-lab.sh snapshot NAME | restore NAME   (guest must be down)
 #   deploy/lab/nn-lab.sh status | down | destroy
+#   deploy/lab/nn-lab.sh verify-image  # base image vs its verified download or the vendor's signed lists
 #   deploy/lab/nn-lab.sh nightly       # unattended full run → $LAB_DIR/reports/<stamp>.md (exit 1 on any failure)
 #   deploy/lab/nn-lab.sh soak start [HOURS] [INTERVAL_S] | status | stop | wait | report
 #                                      # hours of synthetic load + resource samples → $LAB_DIR/reports/soak-<stamp>.md
@@ -125,6 +126,10 @@ SSH_OPTS=(-i "$KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHosts
 
 log()  { printf 'nn-lab: %s\n' "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
+# External audit LAB-009: a base image is downloaded only against the
+# vendor's signed list, and a new guest only layered on a verified image.
+# shellcheck source=deploy/lab/lib/verify-download.sh
+source "$SCRIPT_DIR/lib/verify-download.sh"
 
 need_host_deps() {
     local missing=()
@@ -196,14 +201,15 @@ whpx_up() {
     if [[ ! -f "$dir/$BASE_IMG_NAME" ]]; then
         if [[ -f "$BASE_IMG" ]]; then
             cp "$BASE_IMG" "$dir/"
+            if [[ -f "$BASE_IMG.verified" ]]; then cp "$BASE_IMG.verified" "$dir/"; fi
         else
-            log "downloading $IMAGE_URL"
-            curl -fL --progress-bar -o "$dir/$BASE_IMG_NAME.part" "$IMAGE_URL" && mv "$dir/$BASE_IMG_NAME.part" "$dir/$BASE_IMG_NAME"
+            lab_fetch_image "$dir/$BASE_IMG_NAME"
         fi
     fi
     [[ -f "$KEY" ]] || ssh-keygen -q -t ed25519 -N '' -C nn-lab -f "$KEY"
     local fresh=0
     if [[ ! -f "$dir/disk.qcow2" ]]; then
+        lab_check_image "$dir/$BASE_IMG_NAME"
         win "$(wslpath -u "$WIN_QEMU_IMG")" create -q -f qcow2 -b "$dirw\\$BASE_IMG_NAME" -F qcow2 "$dirw\\disk.qcow2" "$DISK_SIZE"
         fresh=1
     fi
@@ -290,14 +296,14 @@ cmd_up() {
     mkdir -p "$LAB_DIR"
     vm_running && { log "already running (pid $(cat "$PIDFILE"))"; return 0; }
     if [[ ! -f "$BASE_IMG" ]]; then
-        log "downloading $IMAGE_URL"
-        curl -fL --progress-bar -o "$BASE_IMG.part" "$IMAGE_URL" && mv "$BASE_IMG.part" "$BASE_IMG"
+        lab_fetch_image "$BASE_IMG"
     fi
     if [[ ! -f "$KEY" ]]; then
         ssh-keygen -q -t ed25519 -N '' -C nn-lab -f "$KEY"
     fi
     local fresh=0
     if [[ ! -f "$DISK" ]]; then
+        lab_check_image "$BASE_IMG"
         qemu-img create -q -f qcow2 -b "$BASE_IMG" -F qcow2 "$DISK" "$DISK_SIZE"
         fresh=1
     fi
@@ -434,10 +440,12 @@ cmd_build() {
 # Purge the pin root on the guest the way an operator must now do it (review
 # entry 39 — the running agent protects /sys/fs/bpf/northnarrow): open the
 # trusted-installer window with the lab's admin key, stop the units, remove
-# the pins, wait for the LSM programs to detach. A guest installed before the
-# key carried the `trusted-installer` role cannot open the window: that guest
-# is migrated once — units disabled, VM restarted (bpffs does not survive a
-# reboot), role added to admin.pub while nothing protects it, units enabled.
+# the pins, wait for the LSM programs to detach. When no window can be
+# opened, the guest is restarted with the units disabled (bpffs does not
+# survive a reboot) and the units are enabled again. The lab never edits
+# admin.pub (external audit LAB-002): install.sh gives the bootstrap key the
+# roles the lab uses, and a guest installed before that (no key with
+# `trusted-installer`) is refused, to be recreated.
 lab_purge_pins() {
     local out
     out=$(vssh bash -s <<'REMOTE'
@@ -464,10 +472,9 @@ if sudo test -d /sys/fs/bpf/northnarrow; then
         if ! sudo "$nn_admin" trusted-installer-grant --key "$key" --window-secs 300 >/tmp/nn-grant.log 2>&1; then
             echo "grant refused: $(tail -1 /tmp/nn-grant.log)"
         elif ! sudo grep -q "config-manage" /etc/northnarrow/admin.pub; then
-            # Tappa 10.8: the lab key signs overlays too; the window lets
-            # the protected admin.pub be edited (picked up at agent start)
-            sudo sed -i -E 's/^([0-9a-fA-F]{64})[[:space:]]+([a-z,-]+)$/\1 \2,config-manage/' /etc/northnarrow/admin.pub \
-                && echo "admin.pub: config-manage added for the lab key"
+            # Tappa 10.8: the lab key signs overlays too (tamper-check C24).
+            # External audit LAB-002: admin.pub is not edited here.
+            echo "admin.pub: no key has config-manage (installed before Tappa 10.8): recreate the guest, or tamper-check C24 fails"
         fi
     fi
     # External audit EBPF-001: the units refuse a manual stop; inside the
@@ -502,17 +509,17 @@ REMOTE
 )
     echo "$out" | grep -vE "^PINS_PROTECTED$"
     if echo "$out" | grep -q "^PINS_PROTECTED$"; then
-        echo "nn-lab: pin root protected and no trusted-installer window — migrating the guest (disable units, restart VM, add the role)"
+        # External audit LAB-002: such a guest used to be "migrated" by
+        # adding roles to every key in admin.pub while nothing protected it.
+        if vssh 'sudo test -f /etc/northnarrow/admin.pub && ! sudo grep -q trusted-installer /etc/northnarrow/admin.pub'; then
+            die "pin root protected and no key in admin.pub has the trusted-installer role (installed before it existed); the lab does not edit admin.pub (external audit LAB-002): recreate the guest (destroy, up, sync, install)"
+        fi
+        echo "nn-lab: pin root protected and no trusted-installer window — restarting the guest with the units disabled"
         vssh 'sudo systemctl disable northnarrow-agent northnarrow-watchdog 2>/dev/null; true'
         cmd_down
         cmd_up
         vssh bash -s <<'REMOTE'
 sudo rm -rf /sys/fs/bpf/northnarrow 2>/dev/null
-if sudo test -f /etc/northnarrow/admin.pub && ! sudo grep -q "trusted-installer" /etc/northnarrow/admin.pub; then
-    sudo sed -i -E '/trusted-installer/! { s/^([0-9a-fA-F]{64})[[:space:]]*$/\1 unlock,audit-read,trusted-installer/; t; s/^([0-9a-fA-F]{64})[[:space:]]+([a-z,-]+)$/\1 \2,trusted-installer/ }' /etc/northnarrow/admin.pub
-    sudo sed -i -E '/config-manage/! s/^([0-9a-fA-F]{64})[[:space:]]+([a-z,-]+)$/\1 \2,config-manage/' /etc/northnarrow/admin.pub
-    echo "admin.pub roles now: $(sudo sed -E 's/^[0-9a-fA-F]{64}//' /etc/northnarrow/admin.pub | tr -d '\n')"
-fi
 sudo systemctl enable northnarrow-agent northnarrow-watchdog 2>/dev/null; true
 echo "lsm programs after restart: $(sudo bpftool prog show 2>/dev/null | grep -c " lsm ")"
 REMOTE
@@ -751,11 +758,16 @@ cmd_pkgmgr_check() {
     vssh 'bash -s' <<'REMOTE'
 set -u
 fail=0
+# External audit LAB-008: the probe package is built in a fresh directory
+# of the lab user's, then installed as root: at a fixed /tmp path another
+# user could have created the directory and swapped the package.
+pd=$(mktemp -d) || exit 1
+trap 'rm -rf "$pd"' EXIT
 log=/tmp/nn-pkgmgr-check.log; : > "$log"
 since=$(date -u +%FT%T)
 step() { local what=$1; shift; if "$@" >>"$log" 2>&1; then echo "ok    $what"; else echo "FAIL  $what (rc=$?, see $log)"; fail=1; fi; }
 if command -v dpkg >/dev/null 2>&1; then
-    deb=$(~/northnarrow/deploy/lab/pkgmgr/mk-probe-deb.sh /tmp/nn-pkgprobe) || exit 1
+    deb=$(~/northnarrow/deploy/lab/pkgmgr/mk-probe-deb.sh "$pd") || exit 1
     step "dpkg -i probe package"          sudo dpkg -i "$deb"
     step "dpkg --purge probe package"     sudo dpkg --purge nn-pkgprobe
     step "apt-get install --reinstall rsync (ships rsync.service)" \
@@ -763,7 +775,7 @@ if command -v dpkg >/dev/null 2>&1; then
     if [ -n "$(sudo dpkg --audit 2>&1)" ]; then echo "FAIL  dpkg --audit reports broken packages"; fail=1; else echo "ok    dpkg --audit clean"; fi
 else
     command -v rpmbuild >/dev/null 2>&1 || step "dnf install rpm-build" sudo dnf install -y rpm-build
-    rpm=$(~/northnarrow/deploy/lab/pkgmgr/mk-probe-rpm.sh /tmp/nn-pkgprobe) || exit 1
+    rpm=$(~/northnarrow/deploy/lab/pkgmgr/mk-probe-rpm.sh "$pd") || exit 1
     step "dnf install probe package"      sudo dnf install -y "$rpm"
     step "dnf remove probe package"       sudo dnf remove -y nn-pkgprobe
     step "dnf reinstall cronie (ships crond.service)" sudo dnf reinstall -y cronie
@@ -817,7 +829,10 @@ cmd_release_check() {
     local sums
     sums=$(find "$dir" -name SHA256SUMS | head -1)
     [[ -n "$tgz" && -n "$sums" ]] || die "no release tarball + SHA256SUMS under $dir"
-    vssh 'rm -rf /tmp/nn-release && mkdir -p /tmp/nn-release'
+    # External audit LAB-008: the tarball is extracted and installed as root
+    # from here; a /tmp/nn-release another user created first is refused
+    # (mkdir without -p), not reused.
+    vssh 'rm -rf /tmp/nn-release && mkdir -m 0700 /tmp/nn-release'
     rsync -a -e "ssh ${SSH_OPTS[*]}" "$tgz" "$sums" "$GUEST:/tmp/nn-release/"
     rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/release/release-check.sh" "$GUEST:/tmp/nn-release-check.sh"
     lab_purge_pins >/dev/null
@@ -1355,6 +1370,7 @@ cmd_nightly() {
         printf '# nn-lab nightly %s\n\n' "$stamp"
         printf -- '- repo: `%s` @ `%s`\n' "$REPO" "$rev"
         printf -- '- distro: `%s`\n' "$DISTRO"
+        printf -- '- base image: %s\n' "$(lab_image_summary)"
         printf -- '- guest: `%s`\n\n' "$(vssh 'uname -r; cat /sys/kernel/security/lsm' 2>/dev/null | tr '\n' ' ')"
         printf '| step | status | seconds |\n|---|---|---|\n'
         for step in $NIGHTLY_STEPS; do
@@ -1406,6 +1422,7 @@ case "${1:-help}" in
     snapshot)      cmd_snapshot "${2:-}" ;;
     restore)       cmd_restore "${2:-}" ;;
     destroy)       cmd_destroy ;;
+    verify-image)  cmd_verify_image ;;
     nightly)       cmd_nightly ;;
     soak)          shift; cmd_soak "$@" ;;
     help|-h|--help) cmd_help ;;
