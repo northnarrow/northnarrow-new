@@ -1866,3 +1866,134 @@ fn a_refused_new_entry_or_xattr_change_reaches_combat() {
         assert_eq!(firing, Some(TriggerType::AntiTamperDenial), "{op}");
     }
 }
+
+// ─── Lab PR 162 — a tamper of an anti-tamper control-surface file ───
+
+/// A FIM event: `op` on `path` by `pid`.
+fn fim(op: common::wire::FimOp, path: &str, pid: u32) -> Event {
+    Event::Fim(common::wire::FimEvent {
+        timestamp_ns: 1_000,
+        path: path.into(),
+        op,
+        new_sha256: None,
+        baseline_sha256: None,
+        new_size: None,
+        baseline_size: None,
+        modifier_exe: None,
+        modifier_pid: pid,
+        modifier_uid: 0,
+        modifier_comm: "rm".into(),
+        dest_path: None,
+        child_truncated: false,
+        wide_coverage: false,
+        owner_uid: None,
+        reader_dac_capable: false,
+        capability: None,
+        attrs: None,
+    })
+}
+
+const KILL_SWITCH: &str = "/etc/northnarrow/kill_switch.conf";
+
+/// A writer pid no host has (`pid_max` is at most 2^22), so never the test
+/// runner's own, which the trigger leaves out.
+const TAMPERER: u32 = 999_999_999;
+
+/// The finding: NN-L-FIM-024 said "posture → COMBAT" and no trigger read
+/// a FIM event. A tamper of a control-surface file now reaches a locked
+/// COMBAT on its own, naming the writer as the offender.
+#[test]
+fn a_control_surface_tamper_reaches_locked_combat() {
+    let m = PostureMachine::new();
+    let tamper = fim(common::wire::FimOp::Deleted, KILL_SWITCH, TAMPERER);
+    let (state, firing) = m.observe(&tamper, &[]).expect("posture transitioned");
+    assert_eq!(state.kind(), PostureKind::Combat);
+    assert_eq!(firing, Some(TriggerType::ControlSurfaceTamper));
+    assert!(m.is_combat_locked());
+    assert_eq!(super::triggers::event_owner_pid(&tamper), Some(TAMPERER));
+}
+
+/// The trigger and NN-L-FIM-024 answer the same events: every op on every
+/// control-surface file and on files next to them.
+#[test]
+fn the_trigger_fires_exactly_where_fim024_does() {
+    use crate::decision::Rule as _;
+    use crate::fim::rules::{NnLFim024AntiTamperHoneypotModified, HONEYPOT_PATHS};
+    use common::wire::FimOp;
+    let rule = NnLFim024AntiTamperHoneypotModified::new(1);
+    let ops = [
+        FimOp::Modified,
+        FimOp::Created,
+        FimOp::Deleted,
+        FimOp::Renamed,
+        FimOp::Linked,
+        FimOp::Opened,
+        FimOp::CapabilitySet,
+        FimOp::AttrChanged,
+    ];
+    let others = [
+        "/etc/northnarrow/agent.toml",
+        "/etc/northnarrow/admin.pub",
+        "/run/northnarrow/agent.pid",
+        "/etc/northnarrow/kill_switch.conf.bak",
+    ];
+    for path in HONEYPOT_PATHS.iter().copied().chain(others) {
+        for op in ops {
+            let event = fim(op, path, TAMPERER);
+            let fires = super::TriggerDetector::new()
+                .detect(&event, &[])
+                .contains(&TriggerType::ControlSurfaceTamper);
+            assert_eq!(fires, rule.evaluate(&event).is_some(), "{op:?} {path}");
+        }
+    }
+}
+
+/// The rule's exemption, mirrored: the agent's own write (its boot sweep
+/// recreating a missing file) raises nothing, whether the agent is in the
+/// stack exemption or known only as this process.
+#[test]
+fn the_agents_own_write_of_a_control_surface_file_raises_nothing() {
+    let exempt = PostureMachine::new_with_hooks_and_exempt_and_auth(
+        Arc::new(|| {}),
+        Arc::new(|_| {}),
+        ExemptPids::with_agent(4242),
+        AuthSessionTracker::default(),
+    );
+    let recreate = fim(common::wire::FimOp::Created, KILL_SWITCH, 4242);
+    assert!(exempt.observe(&recreate, &[]).is_none());
+    assert_eq!(exempt.current_kind(), PostureKind::Observing);
+
+    let unwired = PostureMachine::new();
+    let own = fim(
+        common::wire::FimOp::Created,
+        KILL_SWITCH,
+        std::process::id(),
+    );
+    assert!(unwired.observe(&own, &[]).is_none());
+    assert_eq!(unwired.current_kind(), PostureKind::Observing);
+}
+
+/// Inside the trusted-installer window the kernel refuses no write, so no
+/// anti-tamper denial reaches the posture; a control-surface tamper does
+/// not either. The window closed, the same tamper reaches COMBAT.
+#[test]
+fn a_control_surface_tamper_inside_the_trusted_installer_window_raises_nothing() {
+    use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+    let window = Arc::new(TrustedInstallerOverride::new(
+        None,
+        0,
+        None,
+        std::time::Duration::from_secs(600),
+    ));
+    let m = PostureMachine::new();
+    m.set_installer_window(Arc::clone(&window));
+    window.arm(120, std::time::Instant::now());
+    let tamper = fim(common::wire::FimOp::Modified, KILL_SWITCH, TAMPERER);
+    assert!(m.observe(&tamper, &[]).is_none());
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+
+    window.close("test");
+    let (state, firing) = m.observe(&tamper, &[]).expect("posture transitioned");
+    assert_eq!(state.kind(), PostureKind::Combat);
+    assert_eq!(firing, Some(TriggerType::ControlSurfaceTamper));
+}

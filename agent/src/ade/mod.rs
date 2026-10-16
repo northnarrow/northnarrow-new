@@ -26,6 +26,7 @@ pub mod context;
 pub mod dual_verify;
 pub mod error;
 pub mod escalate;
+pub mod exec_pairing;
 pub mod fim_template;
 pub mod inference;
 pub mod mem_guard;

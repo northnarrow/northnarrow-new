@@ -1882,6 +1882,9 @@ async fn main() -> Result<()> {
             lineage.clone(),
         )
     };
+    // Lab PR 162: inside the trusted-installer window a control-surface
+    // tamper (NN-L-FIM-024) does not raise the posture; the rule still acts.
+    posture.set_installer_window(Arc::clone(&installer_override));
     info!("posture state machine initialized (state: OBSERVING)");
 
     // Beta Step 3: keep the watchdog PID exemption fresh. The watchdog
@@ -3689,6 +3692,17 @@ async fn main() -> Result<()> {
             _ = pump_check.tick() => {
                 #[cfg(feature = "debug-trigger")]
                 debug_abort_pump(&sensor, &cli.admin_socket);
+                // Lab PR 162: on a quiet host no event runs this sweep.
+                if let Some(ade) = ade_engine.as_deref() {
+                    escalate_unsettled_exec_checks(
+                        ade,
+                        &executor,
+                        &posture,
+                        &correlation,
+                        &host,
+                        detection_sink.as_ref(),
+                    );
+                }
                 let dead = sensor.finished_pumps();
                 if !dead.is_empty() {
                     // A blind sensor is not hidden behind a silent restart:
@@ -3883,6 +3897,11 @@ fn debug_abort_pump(
 /// event loop.
 static ADE_SLOT: std::sync::LazyLock<northnarrow_agent::ade::slot::AdeSlot> =
     std::sync::LazyLock::new(northnarrow_agent::ade::slot::AdeSlot::new);
+
+/// Lab PR 162: the ADE evaluates an exec's `ProcessSpawn`; its `ExecCheck`
+/// is held back, and goes to the ADE only when no spawn follows.
+static ADE_EXECS: std::sync::LazyLock<northnarrow_agent::ade::exec_pairing::ExecPairing> =
+    std::sync::LazyLock::new(northnarrow_agent::ade::exec_pairing::ExecPairing::new);
 
 /// Categorise + log + evaluate + (maybe) execute.
 ///
@@ -4339,6 +4358,15 @@ async fn process_event(
         }
     }
 
+    // Lab PR 162: a ProcessSpawn settles its exec's held-back ExecCheck,
+    // whatever the rules make of it; then the checks nothing settled
+    // within the grace go to the ADE on their own (the pump check sweeps
+    // them too, for a quiet host).
+    if let Some(ade) = ade {
+        ADE_EXECS.note_spawn(&event, Instant::now());
+        escalate_unsettled_exec_checks(ade, executor, posture, correlation, host, detection_sink);
+    }
+
     if let Some(verdict) = engine.evaluate(&event) {
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the rule's budget for the acting uid.
@@ -4420,15 +4448,64 @@ async fn process_event(
         return;
     };
 
-    // Only ProcessSpawn / ExecCheck warrant ADE evaluation today;
-    // FileOpen / TCP / DNS volumes are too high to feed the LLM and
-    // they don't have an immediate executor mapping anyway.
-    if !matches!(&event, Event::ProcessSpawn { .. } | Event::ExecCheck { .. }) {
+    // Only execs warrant ADE evaluation today; FileOpen / TCP / DNS
+    // volumes are too high to feed the LLM and they don't have an
+    // immediate executor mapping anyway. Lab PR 162: an exec is evaluated
+    // as its ProcessSpawn (the child's comm, argv and file); its ExecCheck,
+    // read first with the parent's comm, used to take the only slot.
+    let Some(event) = ADE_EXECS.admit(event, Instant::now()) else {
         return;
-    }
+    };
 
     debug!("no rule matched, escalating to ADE");
+    escalate_to_ade(
+        ade,
+        executor,
+        posture,
+        correlation,
+        host,
+        detection_sink,
+        event,
+    );
+}
 
+/// Lab PR 162: the held-back `ExecCheck`s no `ProcessSpawn` settled (an
+/// exec that did not complete, or a lost spawn), each offered to the ADE.
+fn escalate_unsettled_exec_checks(
+    ade: &AdeEngine,
+    executor: &Executor,
+    posture: &PostureMachine,
+    correlation: &CorrelationBuffer,
+    host: &HostContext,
+    detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
+) {
+    for event in ADE_EXECS.take_unsettled(Instant::now()) {
+        debug!(
+            event = ?event,
+            "exec check with no process spawn within the grace — offered to ADE on its own"
+        );
+        escalate_to_ade(
+            ade,
+            executor,
+            posture,
+            correlation,
+            host,
+            detection_sink,
+            event,
+        );
+    }
+}
+
+/// Offer `event` to the ADE's evaluation slot.
+fn escalate_to_ade(
+    ade: &AdeEngine,
+    executor: &Executor,
+    posture: &PostureMachine,
+    correlation: &CorrelationBuffer,
+    host: &HostContext,
+    detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
+    event: Event,
+) {
     // External audit LLMR-002: the evaluation leaves the event loop, one
     // at a time (`AdeSlot`). Awaited here, an exec no rule matched held
     // every sensor for up to the inference timeout.

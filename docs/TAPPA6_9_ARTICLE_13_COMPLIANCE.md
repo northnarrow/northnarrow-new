@@ -140,14 +140,14 @@ fields (hostname, host_id, paths). Posture:
   is not built; no chain has been produced in production. What the
   production ADE does with a verdict is §9; what it shows the model is
   §10.
-- **One evaluation slot, taken by the parent's view of an exec.** The ADE
-  evaluates one event at a time (external audit LLMR-002, lab PR 82); an
-  exec that arrives while one runs is judged by the rules only and
-  counted. For each exec the `ExecCheck`, which carries the parent's comm,
-  takes the slot, and the child's `ProcessSpawn` microseconds later is
-  counted and dropped, so the model judges the exec under its parent's
-  name. Found in the lab (lab PR 144); a follow-up in
-  `docs/audit/EXTERNAL_AUDIT_16f7563.md`, to be improved.
+- **One evaluation slot.** The ADE evaluates one event at a time
+  (external audit LLMR-002, lab PR 82); an exec no rule matched that
+  arrives while one runs is judged by the rules only and counted, so under
+  a burst of unknown execs the model sees the first of them, not the most
+  dangerous. Each exec is offered once, as its `ProcessSpawn` (the child's
+  comm, argv and file), or as its `ExecCheck` when no spawn follows within
+  2 s (lab PR 162; the `ExecCheck`, with the parent's comm, used to take
+  the slot, lab PR 144).
 - **Model behaviour not re-measured after the audit's prompt changes.**
   The window budget of §10 rests on token estimates; the real count of the
   v1.1 prompt (`ignored_model_host_prompt_tokens`), `ade_attacks` before
@@ -343,3 +343,6 @@ the agent sends), stated here rather than discovered in a chain.
   not wired to production verdicts, the single evaluation slot taken by
   the exec's `ExecCheck` (lab PR 144), and the model's behaviour not
   re-measured. The change log is now §11.
+- **2026-10-16 (lab PR 162).** §6: the evaluation slot is offered an
+  exec's `ProcessSpawn`, and its `ExecCheck` only when no spawn follows;
+  the limit of a single slot under load stays.

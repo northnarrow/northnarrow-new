@@ -11,11 +11,11 @@
 //! External audit NN-AUD-227: the assertions were three independent
 //! substring searches of the agent's log. Nothing tied `KillProcessTree`
 //! to the verdict, and `COMBAT` matched the boot line "COMBAT
-//! graduated-response ladder armed". The posture is not asserted: it
-//! moves on posture triggers, and none reads a FIM event, so a FIM-024
-//! verdict leaves it where it was although the rule's reasoning says
-//! "posture → COMBAT" (a product question, tracked apart). The record's
-//! `posture_at` is printed with every failure.
+//! graduated-response ladder armed". Lab PR 162: the posture is asserted
+//! again, now that a trigger reads the tamper (`ControlSurfaceTamper`):
+//! the record's `posture_at` is COMBAT, and the agent's log holds the
+//! locked transition line naming that trigger. The agent's own writes
+//! draw neither the record nor the transition.
 //!
 //! The rule keys on the hard-coded `/etc/northnarrow/...`,
 //! `/var/lib/northnarrow/...`, `/run/northnarrow/...` paths (the agent
@@ -527,8 +527,8 @@ impl Fixture {
     /// tamper of `path`, asserted as one record — Critical, KillProcessTree
     /// carried out (the bare action name, NN-AUD-234), the tamperer as its
     /// principal — and the kill itself: the tamperer and its child died by
-    /// SIGKILL while the harness, their parent, runs on.
-    fn assert_tamper_contained(&self, tamperer: &mut Tamperer, path: &str) {
+    /// SIGKILL while the harness, their parent, runs on. Returns the record.
+    fn assert_tamper_contained(&self, tamperer: &mut Tamperer, path: &str) -> serde_json::Value {
         let pid = u64::from(tamperer.child.id());
         let rec = common::wait_jsonl_row(
             &self.detections_log,
@@ -564,8 +564,66 @@ impl Fixture {
             child_gone.is_some(),
             "the tamperer's child {descendant} survived the tree kill; record: {rec}"
         );
+        rec
+    }
+
+    /// The agent's log without colour codes (the fixture does not set
+    /// `NO_COLOR`; sudo would drop it anyway).
+    fn log_text(&self) -> String {
+        common::strip_ansi(&std::fs::read_to_string(&self.agent_log).unwrap_or_default())
+    }
+
+    /// Lab PR 162: the tamper `rec` records drove the posture to a locked
+    /// COMBAT, by one of `triggers`. The record is written after the
+    /// posture saw the event, so its `posture_at` is COMBAT; the log holds
+    /// the transition line, locked (both triggers are decisive). The line
+    /// precedes the rule's verdict line in the log: the posture observes
+    /// an event before the rules judge it. An `/etc/northnarrow` bait is
+    /// under the FS deny, which refuses the tamper and raises
+    /// `AntiTamperDenial` first (the Debian 12 gate); a `/run/northnarrow`
+    /// one is not, and only the control-surface trigger can answer it.
+    fn assert_combat_by_tamper(&self, rec: &serde_json::Value, triggers: &[&str]) {
+        assert_eq!(rec["posture_at"], "Combat", "record: {rec}");
+        let line = common::wait_until(VERDICT_POLL_TIMEOUT, || {
+            self.log_text()
+                .lines()
+                .find(|l| {
+                    l.contains("POSTURE TRANSITION")
+                        && l.contains("state=COMBAT")
+                        && triggers.iter().any(|t| l.contains(t))
+                })
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            let log = self.log_text();
+            let posture: Vec<&str> = log.lines().filter(|l| l.contains("POSTURE")).collect();
+            panic!(
+                "no POSTURE TRANSITION to COMBAT with one of {triggers:?} in agent.log; record: \
+                 {rec}; posture lines: {posture:?}"
+            )
+        });
+        assert!(line.contains("locked=true"), "{line}");
+    }
+
+    /// Lab PR 162: no transition by the control-surface trigger (checked
+    /// after [`Self::assert_absent_after_barrier`]).
+    fn assert_no_tamper_trigger(&self) {
+        let log = self.log_text();
+        let hits: Vec<&str> = log.lines().filter(|l| l.contains(TAMPER_TRIGGER)).collect();
+        assert!(
+            hits.is_empty(),
+            "the agent's own write raised the posture: {hits:?}"
+        );
     }
 }
+
+/// How the agent logs the trigger that a control-surface tamper raises
+/// (`trigger = ?Some(TriggerType::ControlSurfaceTamper)`).
+const TAMPER_TRIGGER: &str = "trigger=Some(ControlSurfaceTamper)";
+/// The triggers that answer the tamper of an `/etc/northnarrow` bait: the
+/// FS deny's `AntiTamperDenial` when it refused the unlink, or the
+/// control-surface trigger (see [`Fixture::assert_combat_by_tamper`]).
+const ETC_BAIT_TRIGGERS: &[&str] = &[TAMPER_TRIGGER, "trigger=Some(AntiTamperDenial)"];
 
 fn wait_for_socket(path: &Path) {
     let deadline = Instant::now() + SOCKET_POLL_TIMEOUT;
@@ -684,8 +742,9 @@ const VERDICT_ID: &str = "NN-L-FIM-024_AntiTamperHoneypotModified";
 
 /// #1 — external DELETE of kill_switch.conf (/etc) → one Critical
 /// record naming the tamperer, KillProcessTree carried out, the tamperer
-/// and its child killed. (Was `…_trips_fim024_combat`: its `COMBAT` check
-/// matched the boot line, see the module doc.)
+/// and its child killed, and the posture in a locked COMBAT by the
+/// control-surface trigger (lab PR 162). (Was `…_trips_fim024_combat`: its
+/// `COMBAT` check matched the boot line, see the module doc.)
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn delete_kill_switch_conf_trips_fim024_and_kills_the_tamperer() {
@@ -695,7 +754,8 @@ fn delete_kill_switch_conf_trips_fim024_and_kills_the_tamperer() {
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
     let mut tamperer = Tamperer::unlink(path);
-    fx.assert_tamper_contained(&mut tamperer, path);
+    let rec = fx.assert_tamper_contained(&mut tamperer, path);
+    fx.assert_combat_by_tamper(&rec, ETC_BAIT_TRIGGERS);
     fx.wait_for(VERDICT_ID);
 }
 
@@ -718,7 +778,8 @@ fn delete_debug_disable_flag_trips_fim024() {
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
     let mut tamperer = Tamperer::unlink(path);
-    fx.assert_tamper_contained(&mut tamperer, path);
+    let rec = fx.assert_tamper_contained(&mut tamperer, path);
+    fx.assert_combat_by_tamper(&rec, ETC_BAIT_TRIGGERS);
 }
 
 /// #3 — external DELETE of pause.flag (/run path coverage).
@@ -731,7 +792,8 @@ fn delete_pause_flag_trips_fim024() {
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
     let mut tamperer = Tamperer::unlink(path);
-    fx.assert_tamper_contained(&mut tamperer, path);
+    let rec = fx.assert_tamper_contained(&mut tamperer, path);
+    fx.assert_combat_by_tamper(&rec, &[TAMPER_TRIGGER]);
 }
 
 /// #4 — external DELETE of maintenance.mode (second /etc bait).
@@ -744,7 +806,8 @@ fn delete_maintenance_mode_trips_fim024() {
     seed_real_bait(path);
     let fx = Fixture::setup(&[path]);
     let mut tamperer = Tamperer::unlink(path);
-    fx.assert_tamper_contained(&mut tamperer, path);
+    let rec = fx.assert_tamper_contained(&mut tamperer, path);
+    fx.assert_combat_by_tamper(&rec, ETC_BAIT_TRIGGERS);
 }
 
 /// #5 — the agent's own boot recreate (PROTECTED_PIDS) must NOT fire
@@ -773,8 +836,10 @@ fn agent_boot_recreate_does_not_trip_fim024() {
         wait_for_file(path, Duration::from_secs(5)),
         "agent boot integrity must recreate the missing bait"
     );
-    // The recreate is a PROTECTED_PIDS agent write — no Critical verdict.
+    // The recreate is a PROTECTED_PIDS agent write — no Critical verdict,
+    // and no posture trigger.
     fx.assert_absent_after_barrier(VERDICT_ID);
+    fx.assert_no_tamper_trigger();
 }
 
 /// #6 — the boot integrity sweep RUNS and the agent's own bait writes
@@ -791,6 +856,8 @@ fn agent_boot_integrity_sweep_runs_without_self_trip() {
     let fx = Fixture::setup(&[]);
     // Matches both "…N/N present" (Info) and "…recreated N…" (Medium).
     fx.wait_for("Honeypot integrity:");
-    // The sweep's own writes are PROTECTED_PIDS → no Critical verdict.
+    // The sweep's own writes are PROTECTED_PIDS → no Critical verdict,
+    // and no posture trigger.
     fx.assert_absent_after_barrier(VERDICT_ID);
+    fx.assert_no_tamper_trigger();
 }

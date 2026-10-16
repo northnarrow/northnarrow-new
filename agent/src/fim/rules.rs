@@ -1800,10 +1800,23 @@ pub const HONEYPOT_PATHS: &[&str] = &[
     "/run/northnarrow/unload.signal",
 ];
 
+/// NN-L-FIM-024's match: a mutation — create, modify, delete, rename, a
+/// chmod or chown (Wave 2, TST-004) — of one of the [`HONEYPOT_PATHS`].
+/// Lab PR 162: shared with the posture trigger `ControlSurfaceTamper`
+/// (`posture::triggers`), so the two cannot drift apart; both leave out
+/// the agent itself.
+pub fn is_bait_tamper(fe: &FimEvent) -> bool {
+    matches!(
+        fe.op,
+        FimOp::Created | FimOp::Modified | FimOp::Deleted | FimOp::Renamed | FimOp::AttrChanged
+    ) && HONEYPOT_PATHS.contains(&fe.path.as_str())
+}
+
 /// NN-L-FIM-024: tamper of an anti-tamper bait file. ANY mutation —
 /// create, modify, delete, rename — is an adversary probing for an
-/// agent off-switch. Critical → KillProcessTree → COMBAT. MITRE
-/// T1562.001 (Impair Defenses: Disable or Modify Tools).
+/// agent off-switch. Critical → KillProcessTree, and (lab PR 162) the
+/// posture trigger `ControlSurfaceTamper` → COMBAT. MITRE T1562.001
+/// (Impair Defenses: Disable or Modify Tools).
 ///
 /// Holds the agent's own PID as a backstop self-guard: the agent +
 /// watchdog are already in `PROTECTED_PIDS` (the C2 BPF layer suppresses
@@ -1844,14 +1857,7 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
-        // Wave 2 (TST-004): a chmod or chown of a bait is a touch too.
-        if !matches!(
-            fe.op,
-            FimOp::Created | FimOp::Modified | FimOp::Deleted | FimOp::Renamed | FimOp::AttrChanged
-        ) {
-            return None;
-        }
-        if !HONEYPOT_PATHS.contains(&fe.path.as_str()) {
+        if !is_bait_tamper(fe) {
             return None;
         }
         // Backstop self-guard (Q5 boot recreate); PROTECTED_PIDS already

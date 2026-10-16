@@ -69,12 +69,26 @@ Any unauthorized **create / modify / delete / rename** of a bait fires:
 - **Severity:** Critical
 - **Response:** `KillProcessTree` — the tampering process and its tree
   are killed.
-- **Posture:** the agent transitions to **COMBAT** — the
-  `NORTHNARROW_COMBAT` iptables chain isolates the host to loopback-only
-  (the management interface is preserved).
+- **Posture:** the agent transitions to a locked **COMBAT** (trigger
+  `ControlSurfaceTamper`, as decisive as a refused write to the agent's
+  own files). The COMBAT ladder names the tampering process as the
+  offender: it contains it at the process level, and isolates the host
+  (the `NORTHNARROW_COMBAT` chain, loopback-only, the management
+  interface preserved) only if that fails. Only a signed release ends
+  it (§7).
 
 There is no debounce: a single tamper detonates (no benign access
 exists to wait out).
+
+**What is exempt.** The agent's and the watchdog's own writes (the §6
+sweep): the kernel does not report them, and the rule and the posture
+leave out the agent's PID as well. Install, upgrade and removal stop
+both units before they write a bait. Inside a trusted-installer window
+(`nn-admin trusted-installer-grant`) a tamper still draws the rule — the
+tamperer killed, the Critical detection recorded — but does not raise
+the posture: the window suspends the kernel's refusals, so no anti-tamper
+signal raises it there. Before lab PR 162 no posture trigger read the
+tamper, and the posture stayed where it was.
 
 ## 5. Operator do-not-touch rules
 
