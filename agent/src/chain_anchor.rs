@@ -81,6 +81,11 @@ const HEADS_DOMAIN: &[u8] = b"northnarrow/chain-heads/v1\0";
 pub const DEFAULT_HEADS_PATH: &str = "/etc/northnarrow/chain_heads.json";
 /// File name of the head anchor (next to the audit log).
 pub const HEADS_FILE_NAME: &str = "chain_heads.json";
+/// Mode of the head anchor when it is created: the audit log's
+/// ([`crate::audit::AUDIT_LOG_FILE_MODE`], external audit EVD-019): it
+/// tells when and how far every chain moved, and the same readers check
+/// it.
+pub const HEADS_FILE_MODE: u32 = crate::audit::AUDIT_LOG_FILE_MODE;
 
 /// How often the running agent re-reads the heads and anchors the ones
 /// that moved.
@@ -672,7 +677,7 @@ impl HeadsStore {
             .write(true)
             .create(true)
             .truncate(false)
-            .mode(0o644)
+            .mode(HEADS_FILE_MODE)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
@@ -1164,7 +1169,7 @@ impl Anchor {
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o644)
+                .mode(HEADS_FILE_MODE)
                 .open(path)
             {
                 Ok(_) => Ok(()),
@@ -1589,6 +1594,26 @@ mod tests {
             HeadsStore::read(&file, &pk),
             HeadsRead::Invalid(_)
         ));
+    }
+
+    /// External audit EVD-019 (NN-AUD-281): the head anchor the agent
+    /// creates is closed to other users, like the audit log next to it.
+    #[test]
+    fn the_heads_file_is_created_closed_to_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let file = dir.path().join(HEADS_FILE_NAME);
+        let s = HeadsSnapshot {
+            counter: 1,
+            ts: "t1".into(),
+            agent_id: "00".into(),
+            second_key_added: false,
+            heads: vec![],
+        };
+        HeadsStore::write(&file, &k, &s).unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640, "chain_heads.json mode {mode:o}");
     }
 
     /// External audit NN-AUD-108: on the code before lab PR 160 a cut

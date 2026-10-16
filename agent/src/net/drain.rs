@@ -73,10 +73,11 @@ pub const DEFAULT_NETFLOW_LISTENERS_JSONL_PATH: &str =
     "/var/lib/northnarrow/netflow_listeners.jsonl";
 
 /// Permission bits applied to the netflow + netflow_listeners
-/// logs at create time. 0644 — world-readable for operator
-/// inspection, agent-writable; LSM PROTECTED_INODES + PROTECTED_PIDS
-/// exemption enforces append-only against other root callers.
-const NET_LOG_FILE_MODE: u32 = 0o644;
+/// logs at create time: root only (external audit EVD-019,
+/// [`crate::chainlog::STATE_LOG_FILE_MODE`]); LSM PROTECTED_INODES +
+/// PROTECTED_PIDS exemption enforces append-only against other root
+/// callers.
+const NET_LOG_FILE_MODE: u32 = crate::chainlog::STATE_LOG_FILE_MODE;
 
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;

@@ -459,6 +459,15 @@ fn cap_from_value(env: &str, raw: Option<&str>, default: u64) -> u64 {
     }
 }
 
+/// Mode of the evidence logs the agent creates in its state directory
+/// (`/var/lib/northnarrow`: detections, status events, netflow and its
+/// listeners, the FIM baseline and drift, the canary chains), their
+/// archives and manifests. External audit EVD-019 (NN-AUD-281): they were
+/// `0644` and closed only by the directory's `0700`; a copy that keeps
+/// the mode (`cp -a`, a backup) or a log moved out of the directory was
+/// readable by every local user. Root reads them (`nn-admin`, the agent).
+pub const STATE_LOG_FILE_MODE: u32 = 0o600;
+
 /// Size + retention policy for one log.
 #[derive(Debug, Clone, Copy)]
 pub struct RotationConfig {
@@ -477,7 +486,7 @@ impl Default for RotationConfig {
         Self {
             size_cap_bytes: 64 * 1024 * 1024,
             max_archives: 8,
-            file_mode: 0o600,
+            file_mode: STATE_LOG_FILE_MODE,
         }
     }
 }

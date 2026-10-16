@@ -487,10 +487,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-275 | EVD-010 | Low | Evidence logs | S | open (slightly worse: raw lines kept too) |
 | NN-AUD-276 | EVD-011 | Low | Evidence logs | S | open (narrowed) |
 | NN-AUD-277 | EVD-014 | Low | Evidence logs | S | open |
-| NN-AUD-278 | EVD-015 | Low | Evidence logs | S (+lab) | open |
+| NN-AUD-278 | EVD-015 | Low | Evidence logs | S (+lab) | fixed (lab PR 169) |
 | NN-AUD-279 | EVD-016 | Low | Evidence logs | S (docs) | partly fixed (fail-open fixed, lab PR 148; signing declined); open |
 | NN-AUD-280 | EVD-017 | Low | Evidence logs | S | open (now reachable from a shipped command) |
-| NN-AUD-281 | EVD-019 | Low | Evidence logs | S | open |
+| NN-AUD-281 | EVD-019 | Low | Evidence logs | S | fixed (lab PR 169) |
 | NN-AUD-282 | EVD-020 | Low | Evidence logs | S | open |
 | NN-AUD-283 | EVD-022 | Low | Evidence logs | S | partly fixed (overwrite closed, lab PR 131); open |
 | NN-AUD-284 | FIMR-010 | Low | FIM rules | M | partly fixed; open |
@@ -5698,3 +5698,81 @@ group, the ones an unprivileged user or a local attacker could use first.
     `a_missing_default_list_uses_the_built_in_copy`, extended with an
     edited list; `current_default_is_used` and the pin test pass.
   - Lab: Debian 13 (6.12), shipdef168-probe.sh — before: the build of lab PRs 162–166; after: this lot on top. Before: the pre-NET-011 blocklist (it lists 100.64.0.0/10) is loaded as it stands (`entries=7`) and a connect to 100.64.168.1 draws NN-L-NET-001 Critical; `install.sh --upgrade` leaves it ("already present — leaving operator copy untouched") and the verdict comes again; a hand edit (+100.64.168.0/24) is applied silently and kept by the upgrade. After: a WARN that the list on disk is an earlier release's and the built-in copy is in force (`entries=5`), no NN-L-NET-001; `install.sh --upgrade` replaces the file; the hand edit draws an ERROR at boot and a signed `integrity_drift` `default_list_modified` with both SHA-256, is not applied, and the upgrade keeps it as `netflow-blocklist.v1.operator`, printing the difference and the overlay command. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.
+- **Wave 3 — evidence files and the telemetry probe, lab PR 169.** Batch 1
+  of the Wave 3 triage of the evidence and admin group: what the host showed
+  to unprivileged users and to the network. Two Low findings.
+  - EVD-019 (NN-AUD-281, fixed). Re-checked: `audit.log` was created 0644
+    (`audit.rs`, `filesystem::bootstrap_audit_log`) in `/etc/northnarrow`
+    (0755), and any local user read the key fingerprints, the callers'
+    pid/uid/comm, the drift details and which sensor was in a
+    `telemetry_gap`. Adjacent, not in the report: `chain_heads.json` (lab
+    PR 160) next to it, also 0644; the chain logs under
+    `/var/lib/northnarrow` (detections, status events, netflow and its
+    listeners, FIM baseline and drift, the canary chains, archives and
+    manifests) were 0644 too, unreadable today only because the directory
+    is 0700 (install.sh, re-asserted by the anti-tamper attach at every
+    start) — a `cp -a` copy or a backup kept them readable. Now: the audit
+    log and the head anchor are created 0640 (`AUDIT_LOG_FILE_MODE`,
+    `HEADS_FILE_MODE`), the chain logs 0600
+    (`chainlog::STATE_LOG_FILE_MODE`, used by the rotating logs, the
+    bootstraps, netflow listeners, the canary chains and the FIM
+    baseline). `install.sh`, after the units are stopped and the pins
+    dropped (install, `--upgrade`, the packages' configure step), closes
+    the existing `/etc` pair (0640, owner root; created empty when
+    missing; a link is left alone) and every `*.jsonl*` at the top of the
+    state directory and in `detections/` (`chmod go-rwx`; the honeypot
+    baits keep 0644). `--audit-group GROUP` / `NN_AUDIT_GROUP` (an
+    existing group, validated before anything stops) gives the `/etc` pair
+    that group for a log shipper; later upgrades keep the group. Not
+    changed: `admin.pub`, `agent_id`, `agent.sig.pub`,
+    `install-manifest.json`, the shipped lists and the baits (readable by
+    design). The agent never chmods a file it did not create: on a
+    protected inode that goes through the setattr hook (unreliable from
+    6.9, follow-up above) and would undo an operator's choice; the repair
+    belongs to the installer. Left as found: `combat-audit.jsonl` is
+    still created with the default mode by the agent (its writer is
+    MAIN-013's, Wave 3 batch 2; install.sh closes an existing one); the
+    `*.local` overlays (exemption lists) stay 0644 — configuration, not
+    evidence, a candidate for a later lot; the namespace journal is
+    readable by the distro's `adm`/`systemd-journal` members. No reader of
+    these files runs without root in the repository: `nn-admin` (as root),
+    the privileged suites (as root, their own directories) and the lab
+    scripts (`sudo`, or run as root) were checked. Tests:
+    `audit_log_is_created_closed_to_other_users`,
+    `the_heads_file_is_created_closed_to_other_users`,
+    `bootstrapped_evidence_files_are_closed_to_other_users` (new), the
+    five `bootstrap_*_creates_zero_byte_file_if_missing` (now 0600/0640);
+    all eight fail with the modes taken back to 0644. **Regression:** a
+    non-root reader of `audit.log` or `chain_heads.json` gets `EACCES`
+    until it has the group (upgrade notes §8).
+  - EVD-015 (NN-AUD-278, fixed). Re-checked: the probe child sent a
+    recursive query (`RD`) for `<nonce>.probe.northnarrow.invalid` to
+    127.0.0.1:53 every round, the nonce made of 40 bits of the clock and 24
+    of the pid; a forwarding resolver on the host passes it upstream. The
+    triage's `MSG_PROBE` was checked against the upstream source of 5.15,
+    6.1, 6.8 and 6.12 (`net/ipv4/ip_output.c`, `net/ipv4/udp.c`,
+    `net/ipv6/ip6_output.c`): `ip_make_skb` and `ip6_make_skb` return no
+    buffer for `MSG_PROBE`, and `udp_sendmsg` calls `udp_send_skb` only
+    with one. The default DNS sensor is the kprobe on `udp_send_skb`
+    (Tappa 10.9 step 3), so every round would be a DNS `telemetry_gap`;
+    only the retired `udp_sendmsg` kprobe would see such a send. Not used.
+    A TEST-NET destination was rejected too: it is routed through the
+    default gateway, off the host, and 192.0.2.0/24 is in the shipped
+    NET-001 blocklist. Now: the nonce is 64 bits from `OsRng`
+    (`make_nonce`, 16 hex characters, a failed source skips the round);
+    the datagram is flagged as a response (`QR`=1, `RD`=0, no records,
+    `dns_probe_packet`), which a name server drops on its query port
+    instead of answering or forwarding (dnsmasq, unbound, BIND and
+    systemd-resolved do; the lab checks dnsmasq) — both sensors read the
+    name after the 12-byte header, never the flags; it is sent from 127.0.0.1 (`PROBE_DNS_SOURCE`) to
+    127.0.0.1:53 (`PROBE_DNS_DEST`). `--sensor-feasibility` sends the same
+    packet. Tests: `nonce_is_random_not_pid_or_clock`,
+    `probe_packet_is_a_response_no_resolver_forwards`,
+    `probe_datagram_stays_on_loopback_and_carries_the_name` (new),
+    `dns_packet_is_well_formed` (flags); all four fail with the clock-and-pid
+    nonce and the `RD` query put back.
+  - Found in the Ubuntu 24.04 gate and fixed here: `nn-lab.sh
+    upgrade-check` counted `audit.log`'s lines with `sudo wc -l < file`,
+    the redirection made by the caller's shell — `EACCES` on the 0640
+    file; it reads the file through `sudo` now.
+  - Lab: Debian 13 (6.12), auditexp169-probe.sh — before: the build of lab PRs 162–166; after: this lot on top, installed with `install.sh --upgrade`. Before: `audit.log` and `chain_heads.json` 0644, read by user nn; the chain logs 0644, closed only by their 0700 directory (copies made with `cp -a` read by nn); the telemetry probe's datagram a recursive query naming the agent's pid, forwarded upstream by a dnsmasq on 127.0.0.1:53. After: 0640 and 0600, EACCES for nn, the copies 0600; `nn-admin audit verify` as root OK and `nn-admin audit read` as nn EACCES (the declared regression); 5 of 5 probe datagrams flagged as responses with a random nonce, none forwarded (the control query was), none on the NIC, no telemetry gap. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.

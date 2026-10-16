@@ -2574,12 +2574,12 @@ async fn main() -> Result<()> {
     let fim_drift_rotation = northnarrow_agent::chainlog::RotationConfig {
         size_cap_bytes: cap(fim_drift_cap),
         max_archives: 8,
-        file_mode: 0o644,
+        file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
     };
     let netflow_rotation = northnarrow_agent::chainlog::RotationConfig {
         size_cap_bytes: cap(16 * 1024 * 1024),
         max_archives: 16,
-        file_mode: 0o644,
+        file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
     };
 
     // Tappa 9.0.a: open the detection store + spawn its dedicated writer
@@ -2598,7 +2598,7 @@ async fn main() -> Result<()> {
         let detections_rotation = northnarrow_agent::chainlog::RotationConfig {
             size_cap_bytes: cap(cap_bytes),
             max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
-            file_mode: 0o644,
+            file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
         };
         match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
             Ok(key) => match northnarrow_agent::detection_store::open(
@@ -2649,7 +2649,7 @@ async fn main() -> Result<()> {
         let status_rotation = northnarrow_agent::chainlog::RotationConfig {
             size_cap_bytes: cap(cap_bytes),
             max_archives: northnarrow_agent::detection_store::DEFAULT_MAX_ARCHIVES,
-            file_mode: 0o644,
+            file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
         };
         match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
             Ok(key) => match northnarrow_agent::detection_store::open_status_log(

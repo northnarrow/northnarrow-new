@@ -4,8 +4,8 @@
 //! [`DEFAULT_INTERVAL_SECS`] the agent runs a child of its own binary
 //! (`northnarrow-agent --telemetry-probe <nonce>`) that produces one known,
 //! harmless event per probed sensor — an **exec** (the child itself), a
-//! **file open** of `/run/northnarrow/probe/<nonce>` and a **DNS query**
-//! for `<nonce>.probe.northnarrow.invalid` sent to the loopback resolver
+//! **file open** of `/run/northnarrow/probe/<nonce>` and a **DNS datagram**
+//! naming `<nonce>.probe.northnarrow.invalid` sent to the loopback resolver
 //! port — and checks that each one reaches its own event pipeline within
 //! [`DEADLINE_SECS`]. A sensor that stays silent is a **telemetry gap**:
 //! ERROR in the journal and a signed audit entry (`telemetry_gap`), once per
@@ -16,15 +16,41 @@
 //!
 //! The probe child is the agent binary, so the exec is one of a root-owned
 //! binary from its install path with an ordinary argv; the probe file is a
-//! dedicated directory, not one of the honeypot paths; the DNS packet goes
+//! dedicated directory, not one of the honeypot paths; the DNS datagram goes
 //! to 127.0.0.1:53 whether or not a resolver listens there (the sensor
 //! hooks the send, not the answer). None of the three trips a rule.
+//!
+//! External audit EVD-015 (NN-AUD-278): the datagram must not reach a name
+//! server off the host. It used to be a recursive query (`RD`) with a nonce
+//! made of the clock and the agent's pid: a forwarding resolver on
+//! 127.0.0.1:53 (dnsmasq, BIND in forward mode) passed it upstream every
+//! minute, a beacon naming the product, its pid and the time. Now:
+//!
+//! - the nonce is 64 bits from the OS random source ([`make_nonce`]);
+//! - the datagram is flagged as a **response** (`QR`=1, `RD`=0,
+//!   [`dns_probe_packet`]): a name server drops a response that arrives on
+//!   its query port instead of answering or forwarding it (dnsmasq,
+//!   unbound, BIND and systemd-resolved do; the lab checks dnsmasq). Both
+//!   DNS sensors skip the 12-byte header and read the name only
+//!   (`agent-ebpf/src/dns_skb.rs`, `dns_query.rs`): the flags change
+//!   nothing they see;
+//! - it is sent from 127.0.0.1 to 127.0.0.1 ([`PROBE_DNS_SOURCE`],
+//!   [`PROBE_DNS_DEST`]): loopback is never routed off the host, and a
+//!   packet with a loopback source that a NAT rule redirected elsewhere is
+//!   dropped as a martian.
+//!
+//! `MSG_PROBE` (the audit's proposal: the kernel runs `udp_sendmsg` but
+//! builds no packet) is not used: `ip_make_skb`/`ip6_make_skb` return no
+//! buffer for it (5.15, 6.1, 6.8, 6.12), so `udp_send_skb`, where the
+//! default sensor reads the query, is never called and every round would
+//! be a DNS telemetry gap. A TEST-NET destination is not used either: it is
+//! routed through the default gateway, off the host.
 //!
 //! Tap: [`observe`] is called on every event before the decision engine
 //! (`main.rs` event loop) and is a few comparisons when a round is open,
 //! nothing otherwise. Disabled with `NN_TELEMETRY_PROBE_SECS=0`.
 
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +59,8 @@ use std::time::{Duration, Instant};
 
 use common::Event;
 use parking_lot::Mutex;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use tracing::{debug, error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
@@ -50,6 +78,13 @@ pub const PROBE_DIR: &str = "/run/northnarrow/probe";
 pub const PROBE_FLAG: &str = "--telemetry-probe";
 /// Suffix of the probed DNS name (`.invalid` is reserved, never resolves).
 pub const DNS_SUFFIX: &str = ".probe.northnarrow.invalid";
+/// Where the probe's DNS datagram goes: the loopback resolver port. Port 53
+/// is the sensor's filter; loopback keeps the datagram on the host.
+pub const PROBE_DNS_DEST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53);
+/// The address the probe child sends from (any free port).
+pub const PROBE_DNS_SOURCE: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+/// Random bytes in a round nonce (16 hex characters).
+pub const NONCE_BYTES: usize = 8;
 pub const AUDIT_OP_GAP: &str = "telemetry_gap";
 pub const AUDIT_OP_RESTORED: &str = "telemetry_restored";
 
@@ -92,14 +127,20 @@ struct State {
 static TRACKER: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
 static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Round nonce: 40 low bits of the clock and the pid, hex, at most 16
-/// characters. It is the first DNS label of the probed name, and a label of
-/// 20+ alphanumerics is what NN-L-NET-004 called a base64 payload until
+/// Round nonce: [`NONCE_BYTES`] bytes from the OS random source, lowercase
+/// hex, 16 characters; `None` when the source fails (the round is skipped).
+/// External audit EVD-015 (NN-AUD-278): it was the clock and the agent's
+/// pid, which the probed name carried to any resolver that saw it.
+///
+/// It is the first DNS label of the probed name, and a label of 20+
+/// alphanumerics is what NN-L-NET-004 called a base64 payload until
 /// external audit NETR-002 (the first lab run tripped it with a 4-digit
 /// pid) — the probe must never fire a rule: it stays below NN-L-NET-014's
 /// 25-character label and NN-L-NET-004's 60-character name.
-pub fn make_nonce(nanos: u64, pid: u32) -> String {
-    format!("{:x}{:x}", nanos & 0xFF_FFFF_FFFF, pid & 0xFF_FFFF)
+pub fn make_nonce() -> Option<String> {
+    let mut b = [0u8; NONCE_BYTES];
+    OsRng.try_fill_bytes(&mut b).ok()?;
+    Some(hex::encode(b))
 }
 
 /// Probe file of a round.
@@ -215,13 +256,10 @@ pub fn spawn(audit_log: Option<Arc<Mutex<AuditLog>>>) {
 }
 
 async fn run_round(tracker: &Arc<Mutex<State>>, audit_log: Option<&Arc<Mutex<AuditLog>>>) {
-    let nonce = make_nonce(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0),
-        std::process::id(),
-    );
+    let Some(nonce) = make_nonce() else {
+        warn!("telemetry probe: the OS random source failed — round skipped");
+        return;
+    };
     let file = probe_file(&nonce);
     if let Err(e) = std::fs::write(&file, b"nn-telemetry-probe\n") {
         warn!(error = %e, path = %file.display(), "telemetry probe: cannot write the probe file — round skipped");
@@ -358,21 +396,37 @@ fn audit(
 }
 
 /// The child's side (`northnarrow-agent --telemetry-probe <nonce>`): one
-/// file open and one DNS packet, then exit. Errors are ignored on purpose —
-/// a sensor is probed by the attempt, not by the outcome.
+/// file open and one DNS datagram, then exit. Errors are ignored on purpose
+/// — a sensor is probed by the attempt, not by the outcome.
 pub fn run_child(nonce: &str) -> i32 {
     let _ = std::fs::read(probe_file(nonce));
-    if let Ok(sock) = UdpSocket::bind("127.0.0.1:0") {
-        let _ = sock.set_write_timeout(Some(Duration::from_millis(500)));
-        let _ = sock.send_to(&dns_query_packet(&dns_name(nonce)), "127.0.0.1:53");
-    }
+    let _ = send_dns_probe(&dns_name(nonce), SocketAddr::V4(PROBE_DNS_DEST));
     0
 }
 
-/// Minimal DNS query (A, IN) for `name`, wire format.
-pub fn dns_query_packet(name: &str) -> Vec<u8> {
+/// Send the probe datagram for `name` to `to` from [`PROBE_DNS_SOURCE`].
+/// `to` is [`PROBE_DNS_DEST`] outside the tests.
+pub fn send_dns_probe(name: &str, to: SocketAddr) -> std::io::Result<usize> {
+    let sock = UdpSocket::bind(PROBE_DNS_SOURCE)?;
+    sock.set_write_timeout(Some(Duration::from_millis(500)))?;
+    sock.send_to(&dns_probe_packet(name), to)
+}
+
+/// `QR`: the message is a response (header byte 2, bit 7).
+pub const DNS_FLAG_QR: u8 = 0x80;
+/// `RD`: recursion desired (header byte 2, bit 0).
+pub const DNS_FLAG_RD: u8 = 0x01;
+
+/// The probe's DNS message for `name` (A, IN), wire format. External audit
+/// EVD-015 (NN-AUD-278): flagged as a response with no recursion asked
+/// (`QR`=1, `RD`=0, no answer records), so a name server that receives it
+/// on its query port discards it instead of answering or forwarding it.
+/// The DNS sensors read the name after the header, never the flags. Also
+/// used by `--sensor-feasibility` (`sensor_feasibility::exercise_dns`).
+pub fn dns_probe_packet(name: &str) -> Vec<u8> {
     let mut p = Vec::with_capacity(32 + name.len());
-    p.extend_from_slice(&[0x4e, 0x4e, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]); // id, RD, QDCOUNT=1
+    // id, flags (QR, opcode QUERY, RD clear, rcode 0), QDCOUNT=1, no records
+    p.extend_from_slice(&[0x4e, 0x4e, DNS_FLAG_QR, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
     for label in name.split('.').filter(|l| !l.is_empty()) {
         let bytes = label.as_bytes();
         let n = bytes.len().min(63);
@@ -447,8 +501,7 @@ mod tests {
 
     #[test]
     fn probe_name_stays_below_the_dns_tunnel_rule() {
-        // worst case: all 40 clock bits and a 24-bit pid set
-        let n = make_nonce(u64::MAX, u32::MAX);
+        let n = make_nonce().unwrap();
         assert!(n.len() <= 16, "{n}");
         let name = dns_name(&n);
         assert!(
@@ -458,14 +511,75 @@ mod tests {
         assert!(name.len() <= 60, "NN-L-NET-004 length");
     }
 
+    /// External audit EVD-015 (NN-AUD-278): the nonce is random — no pid,
+    /// no clock in a name a resolver may see.
+    #[test]
+    fn nonce_is_random_not_pid_or_clock() {
+        let a = make_nonce().unwrap();
+        let b = make_nonce().unwrap();
+        assert_ne!(a, b);
+        for n in [&a, &b] {
+            assert_eq!(n.len(), 2 * NONCE_BYTES, "{n}");
+            assert!(n
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
+        // 64 random bits: two nonces sharing the pid's hex tail is a
+        // 1-in-2^24 accident at most, a clock-and-pid nonce always does it
+        let pid = format!("{:x}", std::process::id() & 0xFF_FFFF);
+        assert!(
+            !(a.ends_with(&pid) && b.ends_with(&pid)),
+            "nonce carries the pid: {a} {b}"
+        );
+    }
+
     #[test]
     fn dns_packet_is_well_formed() {
-        let p = dns_query_packet("ab.probe.northnarrow.invalid");
-        assert_eq!(&p[..12], &[0x4e, 0x4e, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        let p = dns_probe_packet("ab.probe.northnarrow.invalid");
+        assert_eq!(&p[..12], &[0x4e, 0x4e, 0x80, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(p[12], 2);
         assert_eq!(&p[13..15], b"ab");
         assert_eq!(p[15], 5);
         assert_eq!(&p[p.len() - 5..], &[0, 0, 1, 0, 1]);
+    }
+
+    /// External audit EVD-015 (NN-AUD-278): a name server must discard the
+    /// probe, not answer or forward it — a response (`QR`), no recursion
+    /// asked (`RD` clear), no answer records.
+    #[test]
+    fn probe_packet_is_a_response_no_resolver_forwards() {
+        let p = dns_probe_packet(&dns_name("0123456789abcdef"));
+        assert_eq!(p[2] & DNS_FLAG_QR, DNS_FLAG_QR, "QR set");
+        assert_eq!(p[2] & DNS_FLAG_RD, 0, "RD clear");
+        assert_eq!(p[2] & 0x78, 0, "opcode QUERY");
+        assert_eq!(
+            &p[4..12],
+            &[0, 1, 0, 0, 0, 0, 0, 0],
+            "one question, no records"
+        );
+    }
+
+    /// External audit EVD-015 (NN-AUD-278): the datagram goes from loopback
+    /// to loopback port 53 and carries the probed name after the header,
+    /// where the sensors read it.
+    #[test]
+    fn probe_datagram_stays_on_loopback_and_carries_the_name() {
+        assert!(PROBE_DNS_DEST.ip().is_loopback());
+        assert_eq!(PROBE_DNS_DEST.port(), 53, "the sensors' filter");
+        assert!(PROBE_DNS_SOURCE.ip().is_loopback());
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let name = dns_name("0123456789abcdef");
+        let sent = send_dns_probe(&name, listener.local_addr().unwrap()).unwrap();
+        let mut buf = [0u8; 512];
+        let (n, from) = listener.recv_from(&mut buf).unwrap();
+        assert_eq!(n, sent);
+        assert!(from.ip().is_loopback(), "{from}");
+        assert_eq!(&buf[..n], &dns_probe_packet(&name)[..]);
+        assert_eq!(buf[2] & DNS_FLAG_QR, DNS_FLAG_QR);
+        assert_eq!(&buf[13..29], b"0123456789abcdef");
     }
 
     #[test]

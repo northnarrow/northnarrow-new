@@ -92,8 +92,8 @@ use tracing::{info, warn};
 
 /// Default location of the tamper-evident audit log. Mirrors the
 /// `/etc/northnarrow/` install layout (`admin.pub`, `agent_id`).
-/// The directory is LSM-protected by commit A14; until then the
-/// path enjoys ordinary `0644` POSIX protection only.
+/// The directory is LSM-protected by commit A14; the file is `0640`
+/// ([`AUDIT_LOG_FILE_MODE`], external audit EVD-019).
 pub const DEFAULT_AUDIT_LOG_PATH: &str = "/etc/northnarrow/audit.log";
 
 /// Default location of the agent's audit-log signing key. Stored
@@ -115,14 +115,20 @@ pub const GENESIS_PREV_HASH: &str =
 /// reading it before the LSM widening lands.
 const SIGNING_KEY_FILE_MODE: u32 = 0o400;
 
-/// `0644` matches `agent_id` — the log is world-readable for
-/// `nn-admin audit read`'s default operator workflow (later
-/// commit). Append-only is enforced by `O_APPEND` in this module
-/// and by the FS-LSM hooks in commit A14.
-const AUDIT_LOG_FILE_MODE: u32 = 0o644;
+/// `0640`, set when the file is created. External audit EVD-019
+/// (NN-AUD-281): it was `0644` in the world-readable `/etc/northnarrow/`,
+/// and any local user read key fingerprints, callers' pid/uid/comm,
+/// drift details and which sensor was in a `telemetry_gap`. Root and the
+/// file's group read it: `install.sh --audit-group GROUP` gives a log
+/// shipper the group and closes an existing log (the agent never chmods
+/// a log it did not create). Also the mode of the head anchor
+/// ([`crate::chain_anchor::HEADS_FILE_MODE`]). Append-only is enforced
+/// by `O_APPEND` in this module and by the FS-LSM hooks in commit A14.
+pub const AUDIT_LOG_FILE_MODE: u32 = 0o640;
 
 /// Parent directory mode. Conventional `/etc/<vendor>/` layout —
-/// root writes, world reads. Matches `agent_id`.
+/// root writes, world reads (`admin.pub`, `agent_id` and `agent.sig.pub`
+/// are meant to be read; the log is closed by its own mode).
 const PARENT_DIR_MODE: u32 = 0o755;
 
 /// Strict pre-decode length check: an Ed25519 secret key is
@@ -1364,6 +1370,27 @@ mod tests {
         // open() must NOT create the file itself — first append
         // does. That keeps "open then never write" cheap.
         assert!(!log_path.exists());
+    }
+
+    /// External audit EVD-019 (NN-AUD-281): the log the first append
+    /// creates is closed to other users (0640), and a later append keeps
+    /// the mode and group an installer set.
+    #[test]
+    fn audit_log_is_created_closed_to_other_users() {
+        let (_dir, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640, "audit.log mode {mode:o}");
+        assert_eq!(mode & 0o007, 0, "no access for other users");
+        // an installer's choice (here: owner only) survives the next append
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600)).unwrap();
+        log.append(sample_draft(2)).unwrap();
+        assert_eq!(
+            fs::metadata(&log_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
     }
 
     // ── Test 5 (design A11 #5): append produces a JSONL line whose

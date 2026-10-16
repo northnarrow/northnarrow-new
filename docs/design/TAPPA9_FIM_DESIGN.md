@@ -574,7 +574,8 @@ spawned post-attach alongside the existing sensor pumps).
 
 Install changes: `deploy/install.sh` adds two empty bootstrap
 files at install time (`/var/lib/northnarrow/fim_baseline.jsonl`,
-`/var/lib/northnarrow/fim_drift.jsonl`, mode 0644) so the LSM
+`/var/lib/northnarrow/fim_drift.jsonl`, mode 0644, 0600 since
+external audit EVD-019) so the LSM
 inode registration finds something to register at first agent
 boot. Same pattern as Tappa 8 B4's `bootstrap_audit_log`.
 

@@ -136,7 +136,14 @@ Preserved across the upgrade: `admin.pub`, `agent.sig.key`, `agent_id`,
 `audit.log` (the new agent appends a signed `agent_boot` entry — review
 it with `nn-admin audit verify`), every chain log under
 `/var/lib/northnarrow`, and every `*.local` overlay (the `.v1` lists are
-the release's, §1). The window with no
+the release's, §1). Their modes are
+closed on the way (external audit EVD-019): `audit.log` and
+`chain_heads.json` become `0640` (root and the file's group), the chain
+logs under `/var/lib/northnarrow` `0600`. A log shipper that reads
+`audit.log` without root needs a group: `--audit-group GROUP` (an
+existing group; `NN_AUDIT_GROUP` too) gives both files that group, and
+every later upgrade keeps it. On a package install, open a
+trusted-installer window and `chgrp GROUP` the two files yourself. The window with no
 hooks attached is the few seconds between step 3 and the new agent's
 boot; it is the same window a reboot has.
 
@@ -337,10 +344,13 @@ A sensor that stops delivering is worse than one that was never there:
 the host looks quiet. Every 60 s the agent runs a child of its own binary
 (`northnarrow-agent --telemetry-probe <nonce>`, hidden flag) that produces
 one known, harmless event per probed sensor — the exec itself, a read of
-`/run/northnarrow/probe/<nonce>` and a DNS query for
-`<nonce>.probe.northnarrow.invalid` sent to `127.0.0.1:53` (the sensor
-hooks the send, no resolver needed) — and checks that each one reaches
-its own pipeline within 5 s. A silent sensor is a **telemetry gap**:
+`/run/northnarrow/probe/<nonce>` and a DNS datagram naming
+`<nonce>.probe.northnarrow.invalid` sent from and to loopback
+(`127.0.0.1:53`; the sensor hooks the send, no resolver needed) — and
+checks that each one reaches its own pipeline within 5 s. The nonce is
+random, and the datagram is flagged as a DNS *response* (`QR` set, no
+recursion asked): a resolver listening on `127.0.0.1:53` drops it instead
+of answering or forwarding it upstream (external audit EVD-015). A silent sensor is a **telemetry gap**:
 `ERROR TELEMETRY GAP` in the journal and a signed audit entry
 (`op=telemetry_gap`, sensor and nonce in `extra`), once per gap, with
 `op=telemetry_restored` when the sensor delivers again. None of the three

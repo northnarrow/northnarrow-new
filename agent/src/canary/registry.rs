@@ -100,10 +100,10 @@ use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
 /// protected-files list.
 pub const DEFAULT_REGISTRY_PATH: &str = "/var/lib/northnarrow/canaries.jsonl";
 
-/// File mode for the persisted registry log. World-readable
-/// per the §4.2 layout (operators inspect with `cat`; only
-/// root + the agent's own user can write).
-const REGISTRY_FILE_MODE: u32 = 0o644;
+/// File mode for the persisted registry log: root only (external
+/// audit EVD-019, [`crate::chainlog::STATE_LOG_FILE_MODE`]; it lists
+/// where every decoy is). Operators read it with `sudo` or `nn-admin`.
+const REGISTRY_FILE_MODE: u32 = crate::chainlog::STATE_LOG_FILE_MODE;
 
 /// Bumped when the on-disk schema or hash-input bytes change.
 /// Verifiers consult this to refuse a chain they were not
