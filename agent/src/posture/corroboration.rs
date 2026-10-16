@@ -48,19 +48,22 @@ const SUSTAINED_SAME_TYPE_MIN: usize = 2;
 /// External audit POS-005: every process without a login uid — each
 /// daemon, each container — used to share one host-level scope (`None`),
 /// and with it the lock: a root daemon changing a unit file locked a
-/// COMBAT that any other daemon or container then corroborated. Interim,
-/// without a wire change: a process with no login uid is scoped by the
-/// workload its cgroup names; the full fix is the workload-context design
-/// (`TAPPA10_9_WORKLOAD_CONTEXT_DESIGN.md` §4.3), which carries the cgroup
-/// id in every record and scopes a login session by workload too.
+/// COMBAT that any other daemon or container then corroborated; and the
+/// containers one user started (rootless Podman or Docker) shared that
+/// user's login scope. Without a wire change, a process is scoped by the
+/// workload its cgroup names, read from `/proc` after the event; the
+/// workload-context design (`TAPPA10_9_WORKLOAD_CONTEXT_DESIGN.md` §4.1)
+/// would capture the cgroup id with the event itself.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scope {
     /// A PAM login session: its login uid (inherited by everything the
-    /// session runs, `sudo` included).
+    /// session runs, `sudo` included), outside any container.
     Login(u32),
-    /// No login uid: the workload the process's cgroup names — a systemd
-    /// unit or a container — as the cgroup path up to that unit
-    /// (`/system.slice/puppet.service`, `/system.slice/docker-<id>.scope`).
+    /// A container, whoever started it, or a process with no login uid:
+    /// the workload its cgroup names, as the cgroup path up to that
+    /// container or unit (`/system.slice/puppet.service`,
+    /// `/system.slice/docker-<id>.scope`,
+    /// `/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-<id>.scope`).
     Workload(String),
     /// Neither could be read: no owning pid, or the owner and every
     /// ancestor the spawn cache knows have exited. Recorded, but it never

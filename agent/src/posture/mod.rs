@@ -329,7 +329,8 @@ impl PostureMachine {
         // Review `posture-ledger-scope-1`: corroboration is per actor
         // scope; a weak signal from one user, service or container never
         // vouches for a blunt signal from another (external audit POS-005:
-        // a process with no login uid is scoped by its workload).
+        // a container, and a process with no login uid, is scoped by its
+        // workload).
         let scope = self.inner.triggers.session_scope(event);
         // Review 52, read before the state lock (they read `/proc`); see
         // the recording below.
