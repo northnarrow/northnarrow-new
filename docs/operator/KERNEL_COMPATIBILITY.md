@@ -73,7 +73,7 @@ and, with the Debian 13 guest, 6.12.
 
 | Source | Kernel | BPF LSM | Verdict | Notes |
 |---|---|---|---|---|
-| WSL2 (host) | 6.18 | — | SUPPORTED | 28 of 82 slots differ from the build kernel — handled at runtime, `inode_setattr`'s dentry among them (argument 1); 28 of 28 fixed hook arguments where the programs read them (lab PR 164) |
+| WSL2 (host) | 6.18 | — | SUPPORTED | 28 of 82 slots differ from the build kernel — handled at runtime, `inode_setattr`'s dentry among them (argument 1); 28 of 28 fixed hook arguments where the programs read them (lab PR 164), 29 of 29 with `file_ioctl_compat`'s (lab PR 174); the three optional deny hooks present |
 | lab guest | 6.8 (Ubuntu 24.04) | yes | SUPPORTED | 0 drift (build kernel) |
 | lab guest | 6.1 (Debian 12) | yes | SUPPORTED | 20 drift, `ubuf`/`count`, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC` |
 | lab guest | 5.15 (Ubuntu 22.04) | yes | SUPPORTED (degraded) | 20 drift, 2 absent; no `iov_iter.ubuf` and no `ITER_UBUF` enumerator (both optional) → QNAME via `ITER_IOVEC` only |
@@ -123,6 +123,7 @@ Hook prototypes per kernel, for the arguments the programs read
 | `inode_setxattr` | `(dentry, name, …)` | `(userns or idmap, dentry, name, …)` | `(idmap, dentry, name, …)` |
 | `inode_removexattr` | `(dentry, name)` | `(userns or idmap, dentry, name)` | `(idmap, dentry, name)` |
 | `inode_set_acl`, `inode_remove_acl` | — | from 6.2: `(idmap, dentry, acl_name, …)` | same |
+| `file_ioctl_compat` | — (5.10.210 and later: as below) | 6.8, and 5.15.149, 6.1.76 and later: `(file, cmd, arg)`, as `file_ioctl` | same |
 | the other inode, file, task, module and BPF hooks | as on 5.15 for the arguments read | unchanged | unchanged (`bpf` gains a fourth argument, not read) |
 
 What the agent does with a prototype:
@@ -136,18 +137,82 @@ What the agent does with a prototype:
   coverage shortfall, and a signed `subsystem_degraded` names the hook
   and what is lost. An unarmed map (no BTF) gives the programs no
   position at all: a hook argument has no compiled fallback.
-- **Fixed positions** (28 pointer arguments of the other hooks,
-  `HOOK_ARG_CHECKS` in `common/src/btf_offsets.rs`): checked against the
-  running kernel's prototypes. A moved one refuses the start (exit 78),
-  like a missing field; a hook the kernel does not have (`inode_set_acl`
-  before 6.2) is not checked, its program does not attach.
+- **Fixed positions** (29 pointer arguments of the other hooks,
+  `HOOK_ARG_CHECKS` in `common/src/btf_offsets.rs`; 28 before lab PR 174
+  added `file_ioctl_compat`'s): checked against the running kernel's
+  prototypes. A moved one refuses the start (exit 78), like a missing
+  field; a hook the kernel does not have (`inode_set_acl` before 6.2,
+  `file_ioctl_compat` before 6.8 and its stable backports) is not
+  checked, its program does not attach.
 
 `--btf-check` reads the prototypes too: its summary counts the hook
 arguments checked, a resolved position that differs from the build kernel
 is a `drift` line (`INODE_SETATTR_DENTRY_ARG … compiled=0 runtime=1` on
 6.9 and later), an unresolved one an `absent` line, and a moved fixed one
 a `missing` line (NOT SUPPORTED). Verified on Debian 13 (6.12): `28 hook
-arguments checked` and the `INODE_SETATTR_DENTRY_ARG` drift line.
+arguments checked` and the `INODE_SETATTR_DENTRY_ARG` drift line (29 from
+lab PR 174 on a kernel with `file_ioctl_compat`).
+
+## 32-bit ioctls: `file_ioctl_compat` (lab PR 174)
+
+Upstream commit f1bb47a31dff ("lsm: new security_file_ioctl_compat()
+hook", merged for 6.8 and marked for stable) gave the compat `ioctl`
+syscall — the one a 32-bit process on a 64-bit kernel calls — its own LSM
+hook: `compat_sys_ioctl` (`fs/ioctl.c`) calls
+`security_file_ioctl_compat(file, cmd, arg)` where it called
+`security_file_ioctl`. A BPF LSM program on `file_ioctl` no longer sees
+those calls. Until lab PR 174 the agent had no program on the new hook,
+so on such a kernel a 32-bit `chattr` (`FS_IOC32_SETFLAGS`; or
+`FS_IOC_FSSETXATTR`, the same number in 32 and 64 bits) of a protected
+file was not refused, where the same `chattr` built 64-bit was.
+
+Which kernels have the hook (`include/linux/lsm_hook_defs.h` and
+`fs/ioctl.c` of each tag, git.kernel.org stable tree, read on
+2026-10-16):
+
+| Series | Without the hook | With the hook |
+|---|---|---|
+| mainline | 6.7 | 6.8 and later (6.9, 6.12, the WSL2 6.18 host) |
+| 6.7.y | 6.7.2 | 6.7.3 |
+| 6.6.y | 6.6.14 | 6.6.15 |
+| 6.1.y | 6.1.75 | 6.1.76 (Debian 12 ships later 6.1 releases) |
+| 5.15.y | 5.15.148 | 5.15.149 |
+| 5.10.y | 5.10.209 | 5.10.210 |
+
+A vendor kernel (Ubuntu 22.04's 5.15.0-*, RHEL 9's 5.14.0-*) has it if
+its maintainers took the patch: the agent does not go by version
+numbers. The hook passes the `cmd` as the caller gave it (the
+`FS_IOC32_*` to `FS_IOC_*` translation comes after), with the same
+prototype as `file_ioctl`, so `protected_ioctl_compat_deny`
+(`agent-ebpf/src/inode_protect.rs`) is the `file_ioctl` deny on another
+hook: the same three commands, the same `PROTECTED_INODES` lookup, the
+same agent-family and trusted-installer-window exemptions, the same
+`ANTI-TAMPER DENIAL op=ioctl` record. 411 BPF instructions in the
+object, the `file_ioctl` deny's count; no loop of its own.
+
+It is an **optional deny hook**, like the ACL hooks of 6.2: the agent
+attaches it where the running kernel's BTF has
+`bpf_lsm_file_ioctl_compat`, and then counts it among the expected deny
+hooks — a kernel that has it but does not attach it is a deny-hook
+shortfall, which refuses the start unless
+`NN_ANTI_TAMPER_ALLOW_DEGRADED=1`. Where the BTF does not have it, nothing
+is attached and nothing more is expected: the compat syscall still goes
+through `file_ioctl` there. The healthy boot line therefore reads
+`deny_attached=N deny_expected=N` with N = 16 required, plus 2 for the
+ACL hooks (6.2+), plus 1 for `file_ioctl_compat`:
+
+| Kernel | `deny_expected` |
+|---|---|
+| 6.8 and later (6.12), 6.7.3+, 6.6.15+ | 19 |
+| 6.2 to 6.7 without it (6.6.14, 6.7.2 and older) | 18 |
+| 6.1.76+, 5.15.149+ (and a vendor 5.14 / 5.15 with the patch) | 17 |
+| 6.1.75 and older, 5.15.148 and older | 16 |
+
+`--btf-check` prints one `optional` line per optional deny hook, present
+or absent in the BTF given to it (`optional file_ioctl_compat … present`
+on the WSL2 6.18 host, `absent` on the BTFHub Ubuntu 20.04 5.8 kernel), and
+its summary counts the hook's `struct file *` argument among the hook
+arguments checked where the kernel has it (29 on the 6.18 host).
 
 ## Debian-family kernels and `perf_event_paranoid`
 

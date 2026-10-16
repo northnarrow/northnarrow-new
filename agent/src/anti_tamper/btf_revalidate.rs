@@ -164,6 +164,11 @@ pub struct ResolvedOffsets {
     /// found where the programs read them. Hooks this kernel does not have
     /// are not counted.
     pub hook_args_checked: usize,
+    /// Lab PR 174: each optional deny hook ([`super::OPTIONAL_DENY_HOOKS`])
+    /// and whether this kernel's BTF has it (`bpf_lsm_<hook>`). Present:
+    /// its program is attached and counted as an expected deny hook;
+    /// absent: neither.
+    pub optional_deny_hooks: Vec<(&'static str, bool)>,
 }
 
 impl ResolvedOffsets {
@@ -187,6 +192,16 @@ impl ResolvedOffsets {
     /// argument).
     pub fn setattr_dentry_arg(&self) -> Option<u32> {
         self.hook_arg_position("INODE_SETATTR_DENTRY_ARG")
+    }
+
+    /// Lab PR 174: whether this kernel's BTF has the optional deny hook
+    /// `hook`; `None` for a hook that is not one of
+    /// [`super::OPTIONAL_DENY_HOOKS`].
+    pub fn optional_hook_present(&self, hook: &str) -> Option<bool> {
+        self.optional_deny_hooks
+            .iter()
+            .find(|(h, _)| *h == hook)
+            .map(|(_, present)| *present)
     }
 
     /// Lab PR 164: the sentence for the signed `subsystem_degraded` entry
@@ -262,6 +277,19 @@ fn hook_gate(r: Option<&ResolvedOffsets>, hook: &str) -> Option<Result<u32, Stri
         .map(|m| m.detail.clone())
         .unwrap_or_else(|| "argument position not resolved".to_string());
     Some(Err(format!("{}: {why}", spec.func)))
+}
+
+/// Lab PR 174: whether the running kernel has the optional deny hook
+/// `hook`, from the BTF resolution published this boot. `Some(false)`: the
+/// kernel's BTF has no `bpf_lsm_<hook>`, its program is not attached and
+/// not expected. `None`: no resolution this boot, or not an optional hook;
+/// the loader's own BTF lookup decides ([`super::filesystem::lsm_hook_absent`]).
+pub fn optional_hook_in_kernel(hook: &str) -> Option<bool> {
+    optional_hook_gate(resolved(), hook)
+}
+
+fn optional_hook_gate(r: Option<&ResolvedOffsets>, hook: &str) -> Option<bool> {
+    r?.optional_hook_present(hook)
 }
 
 /// Outcome of [`resolve_offsets`].
@@ -546,6 +574,10 @@ fn resolve_with(
             }),
         }
     }
+    let optional_deny_hooks = super::OPTIONAL_DENY_HOOKS
+        .iter()
+        .map(|h| (*h, btf.has_lsm_hook(h)))
+        .collect();
     if missing.is_empty() {
         ResolveOutcome::Resolved(ResolvedOffsets {
             values,
@@ -553,6 +585,7 @@ fn resolve_with(
             absent,
             modules_not_loaded,
             hook_args_checked,
+            optional_deny_hooks,
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
@@ -1292,6 +1325,13 @@ impl Btf {
             name_to_id,
             lsm_funcs,
         })
+    }
+
+    /// Lab PR 174: whether the kernel has LSM hook `hook` (its
+    /// `bpf_lsm_<hook>` function, which BPF LSM programs attach to).
+    fn has_lsm_hook(&self, hook: &str) -> bool {
+        self.lsm_funcs
+            .contains_key(&format!("{LSM_FUNC_PREFIX}{hook}"))
     }
 
     /// Lab PR 164: the parameter types of LSM hook function `func`.
@@ -2682,6 +2722,129 @@ mod tests {
                 assert_eq!(m[0].name, "bpf_lsm_inode_set_acl");
                 assert!(
                     m[0].detail.contains("argument 1 is not a struct dentry *"),
+                    "{}",
+                    m[0].detail
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// Lab PR 174: a kernel BTF with `file_ioctl`, `file_ioctl_compat` when
+    /// `compat` (its `struct file *` at `compat_file_at`) and the two ACL
+    /// hooks when `acl`.
+    fn ioctl_btf(compat: bool, acl: bool, compat_file_at: usize) -> Btf {
+        let mut b = BtfBuilder::new();
+        let int = b.int("int");
+        let ch = b.int("char");
+        let p_name = b.ptr(ch);
+        let file = b.composite(Some("file"), false, false, &[]);
+        let dentry = b.composite(Some("dentry"), false, false, &[]);
+        let idmap = b.composite(Some("mnt_idmap"), false, false, &[]);
+        let p_file = b.ptr(file);
+        let p_dentry = b.ptr(dentry);
+        let p_idmap = b.ptr(idmap);
+        b.func("bpf_lsm_file_ioctl", int, &[p_file, int, int]);
+        if compat {
+            let mut args = vec![int, int, int];
+            args[compat_file_at] = p_file;
+            b.func("bpf_lsm_file_ioctl_compat", int, &args);
+        }
+        if acl {
+            b.func("bpf_lsm_inode_set_acl", int, &[p_idmap, p_dentry, p_name]);
+            b.func(
+                "bpf_lsm_inode_remove_acl",
+                int,
+                &[p_idmap, p_dentry, p_name],
+            );
+        }
+        Btf::parse(&b.build()).expect("ioctl fixture parses")
+    }
+
+    /// Lab PR 174: the `file_ioctl_compat` deny is selected from the
+    /// kernel's BTF — attached and expected where `bpf_lsm_file_ioctl_compat`
+    /// exists (6.8+, 6.6.15+, 6.1.76+, 5.15.149+), neither where it does
+    /// not (6.6.14, 6.1.75, 5.15.148: the compat syscall still goes through
+    /// `file_ioctl`) — so the expected deny hooks are one more with it and
+    /// unchanged without it (the ACL hooks: 6.2 and later).
+    #[test]
+    fn file_ioctl_compat_is_selected_from_the_kernels_btf() {
+        use super::super::filesystem::{attach_optional, OptionalHook, OPTIONAL_LSM_PROGRAMS};
+        for (kernel, compat, acl, expected) in [
+            ("6.8, 6.12", true, true, 16 + 3),
+            ("6.6.15", true, true, 16 + 3),
+            ("6.6.14", false, true, 16 + 2),
+            ("6.1.76, 5.15.149", true, false, 16 + 1),
+            ("6.1.75, 5.15.148", false, false, 16),
+        ] {
+            let r = hooks_only(&ioctl_btf(compat, acl, 0));
+            assert_eq!(
+                optional_hook_gate(Some(&r), "file_ioctl_compat"),
+                Some(compat),
+                "{kernel}"
+            );
+            assert_eq!(optional_hook_gate(Some(&r), "inode_set_acl"), Some(acl));
+            assert_eq!(
+                r.optional_deny_hooks.len(),
+                super::super::OPTIONAL_DENY_HOOKS.len()
+            );
+            let mut deny_expected = super::super::LSM_DENY_HOOKS_EXPECTED;
+            for (program, hook) in OPTIONAL_LSM_PROGRAMS {
+                let in_btf = optional_hook_gate(Some(&r), hook);
+                let outcome = attach_optional(hook, in_btf, || {
+                    assert_eq!(
+                        in_btf,
+                        Some(true),
+                        "{program} tried on a kernel without {hook}"
+                    );
+                    Ok(())
+                });
+                assert_eq!(outcome == OptionalHook::Attached, in_btf == Some(true));
+                if outcome.expected() {
+                    deny_expected += 1;
+                }
+            }
+            assert_eq!(deny_expected, expected, "{kernel}");
+        }
+        // No resolution this boot, or a hook that is not optional: the BTF
+        // resolution does not decide.
+        assert_eq!(optional_hook_gate(None, "file_ioctl_compat"), None);
+        let r = hooks_only(&ioctl_btf(true, true, 0));
+        assert_eq!(optional_hook_gate(Some(&r), "file_ioctl"), None);
+    }
+
+    /// Lab PR 174: the compat deny reads the `struct file *` at argument 0,
+    /// like `file_ioctl`; checked where the kernel has the hook, a moved one
+    /// refuses the start, an absent hook is not counted.
+    #[test]
+    fn file_ioctl_compat_file_argument_is_checked() {
+        let checks: Vec<HookArgCheck> = HOOK_ARG_CHECKS
+            .iter()
+            .copied()
+            .filter(|c| c.func.starts_with("bpf_lsm_file_ioctl"))
+            .collect();
+        assert_eq!(checks.len(), 2);
+        for (compat, checked) in [(true, 2), (false, 1)] {
+            match resolve_with(
+                &ioctl_btf(compat, false, 0),
+                &[],
+                &[],
+                &[],
+                &checks,
+                &|_| None,
+            ) {
+                ResolveOutcome::Resolved(r) => assert_eq!(r.hook_args_checked, checked),
+                other => panic!("expected Resolved, got {other:?}"),
+            }
+        }
+        match resolve_with(&ioctl_btf(true, false, 1), &[], &[], &[], &checks, &|_| {
+            None
+        }) {
+            ResolveOutcome::Refuse(RefuseReason::Drift(m)) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(m[0].name, "bpf_lsm_file_ioctl_compat");
+                assert!(
+                    m[0].detail.contains("argument 0 is not a struct file *"),
                     "{}",
                     m[0].detail
                 );

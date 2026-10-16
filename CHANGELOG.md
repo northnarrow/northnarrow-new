@@ -61,6 +61,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Lab follow-up, 32-bit ioctls through `file_ioctl_compat` (lab PR 174).
+  Since kernel 6.8 (upstream f1bb47a31dff, also in the stable releases
+  6.7.3, 6.6.15, 6.1.76, 5.15.149 and 5.10.210) the `ioctl(2)` of a 32-bit
+  process goes through the LSM hook `file_ioctl_compat` instead of
+  `file_ioctl`, and the agent had no program on it: there a 32-bit
+  `chattr` (`FS_IOC32_SETFLAGS`, `FS_IOC_FSSETXATTR`) of a protected file
+  was not refused. A deny program on the new hook
+  (`protected_ioctl_compat_deny`) is the `file_ioctl` deny: the same
+  commands, the same identity and trusted-installer-window checks, the
+  same `op=ioctl` denial record. It is an optional deny hook, like the ACL
+  ones of 6.2: attached where the kernel's BTF has
+  `bpf_lsm_file_ioctl_compat`, and then counted among the expected deny
+  hooks (`deny_expected` one more: 19 on 6.8 and 6.12, 17 on 6.1.76+ and
+  5.15.149+), so a kernel that has the hook but does not attach it is a
+  deny-hook shortfall; without it nothing is attached and the count is
+  unchanged (the compat syscall goes through `file_ioctl` there). The
+  hook's `struct file *` argument is checked at boot like the other fixed
+  ones (29), the boot's prototype line lists the optional deny hooks, and
+  `--btf-check` prints an `optional` line for each, present or absent.
 - Lab follow-up, package-manager mediation bound to a real transaction
   for the network, chain, R009 and posture consumers (lab PR 175). Lab PR
   173 bound the FIM rules' package carve-out to a transaction and left the

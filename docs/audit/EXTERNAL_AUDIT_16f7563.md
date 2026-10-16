@@ -153,7 +153,7 @@ entry names the lab PR that fixed it.
   own in 3 of 4 runs on `main` under `KillProcess`, while the same binary
   run from a home directory was killed 4 of 4: a staging exec reaches the
   rules later (lab PR 166).
-- **32-bit `chattr`: `file_ioctl_compat` is not hooked.** From 6.8, and in
+- **32-bit `chattr`: `file_ioctl_compat` is not hooked — fixed (lab PR 174).** From 6.8, and in
   the 5.15.y and 6.1.y stable backports, the ioctls of a 32-bit process go
   through `file_ioctl_compat`, which the agent does not attach: a 32-bit
   `chattr` on a protected file would pass the `file_ioctl` deny (from the
@@ -6313,3 +6313,53 @@ group, the ones an unprivileged user or a local attacker could use first.
     and snapd tests are otherwise unchanged and pass. Host: 2,223
     passed, 0 failed.
   - Lab: Ubuntu 24.04, pkgmed175-probe.sh — before: the build with lab PR 173; after: this lot on top. A user's `mandb` (`LD_PRELOAD`) forking a `/tmp` program that calls out: NN-L-NET-008 Log on the parent before (package-mediated); NN-L-CHAIN-002 Critical KillProcessTree after. Root's `mandb` (`LD_PRELOAD`, no terminal) forking a `/tmp` program: R009 Log, Low (sanctioned) before; R009 KillProcessTree after. Controls unchanged in both builds: `apt-get install --reinstall rsync`, and a root `dpkg -i` whose postinst runs a staged helper (the parent exempt, its forked child killed as before). The rootless-container exemption is covered by unit tests (no podman on the guest). Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.
+- **Lab follow-ups — file_ioctl_compat, lab PR 174.** A 32-bit process's
+  `ioctl` goes through an LSM hook the agent did not attach, found by
+  reading the kernel sources in lab PR 164 ("32-bit `chattr`:
+  `file_ioctl_compat` is not hooked", Follow-ups found in the lab).
+  - Confirmed in the sources (`include/linux/lsm_hook_defs.h` and
+    `fs/ioctl.c` of each tag, git.kernel.org stable tree, 2026-10-16):
+    upstream f1bb47a31dff ("lsm: new security_file_ioctl_compat() hook",
+    6.8, marked for stable) makes `compat_sys_ioctl` call
+    `security_file_ioctl_compat(file, cmd, arg)` where it called
+    `security_file_ioctl`, before the `FS_IOC32_*` → `FS_IOC_*`
+    translation. First releases with it: 6.8, 6.7.3, 6.6.15, 6.1.76,
+    5.15.149, 5.10.210 (not in 6.7, 6.7.2, 6.6.14, 6.1.75, 5.15.148,
+    5.10.209); its prototype is `file_ioctl`'s, unchanged through 6.12.
+    There the `file_ioctl` deny does not see a 32-bit `chattr`
+    (`FS_IOC32_SETFLAGS`, or `FS_IOC_FSSETXATTR`, the same number in 32
+    and 64 bits). A vendor kernel has the hook if it took the patch; the
+    agent goes by the BTF, not by the version.
+  - eBPF: `protected_ioctl_compat_deny` on `lsm/file_ioctl_compat` runs
+    the `file_ioctl` deny's body (`try_file_ioctl`, now shared): the three
+    commands, then `deny_if_protected(FS_OP_IOCTL, f_inode)` — the
+    `PROTECTED_INODES` flags, the `FS_GRANT` trusted-installer window, the
+    `PROTECTED_PIDS` caller exemption, the `op=ioctl` denial record. 411
+    BPF instructions (446 slots) in the object, the `file_ioctl` deny's,
+    which is unchanged; no loop added.
+  - Agent: a third optional deny hook (`OPTIONAL_LSM_PROGRAMS`,
+    `OPTIONAL_DENY_HOOKS`). `ResolvedOffsets::optional_deny_hooks` records
+    from the boot's BTF resolution whether the kernel has each
+    `bpf_lsm_<hook>`; `filesystem::attach_optional` skips a hook the BTF
+    lacks without trying it, makes any attach error of a hook the BTF has
+    a failure (an expected deny hook missing: a shortfall, the start
+    refused without `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`), and takes the
+    loader's "no `bpf_lsm_<hook>`" error as absent only when there is no
+    resolution. `deny_expected` = 16 + the optional hooks present: 19 on
+    6.8 and 6.12, 17 on 6.1.76+ and 5.15.149+, unchanged where the hook is
+    absent. `HOOK_ARG_CHECKS` gains `bpf_lsm_file_ioctl_compat` argument 0
+    = `struct file *` (29 checks). The boot's "LSM hook prototypes" line
+    carries `optional_deny_hooks`; `--btf-check` prints an `optional` line
+    per optional deny hook (its summary and the `absent` / `missing` lines
+    the BTF matrix reads are unchanged): on the WSL2 6.18 host `29 hook
+    arguments checked` and the three present, on the BTFHub Ubuntu 20.04
+    5.8 BTF the three absent.
+  - Tests: `file_ioctl_compat_is_selected_from_the_kernels_btf` (the
+    expected deny hooks per kernel shape, 16 to 19),
+    `file_ioctl_compat_file_argument_is_checked`,
+    `optional_hook_attach_follows_the_btf`;
+    `deny_set_covers_new_entries_and_xattrs` and
+    `hook_arg_checks_are_well_formed` updated. The three new ones do not
+    compile on `main` (the names they check do not exist there), the two
+    updated ones fail there (two optional hooks, 28 checks).
+  - Lab: Ubuntu 24.04 (6.8), ioctlcompat174-probe.sh — before: the build of `main` with lab PRs 167–171; after: this lot on top. `FS_IOC_SETFLAGS` with the file's own flags on `/etc/northnarrow/admin.pub` outside a trusted-installer window: 64-bit refused in both builds; 32-bit allowed before (no denial), refused after with `ANTI-TAMPER DENIAL op=ioctl` (`deny_expected` 18 → 19); inside a window allowed. Ubuntu 22.04's 5.15.0-198 carries the stable backport: the deny attaches there too (17 of 17). Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.

@@ -15,6 +15,7 @@
 //! | `inode_rename` | `mv` involving a protected inode on either side |
 //! | `inode_setattr`| `chmod` / `chown` / `truncate` on a protected inode |
 //! | `file_ioctl`   | `chattr -i` / `chattr +i` via `FS_IOC_SETFLAGS` / `FS_IOC_FSSETXATTR` |
+//! | `file_ioctl_compat` (6.8+, 6.7.3, 6.6.15, 6.1.76, 5.15.149, 5.10.210) | the same ioctls from a 32-bit process |
 //! | `file_open`    | a write-open of a WRITE-protected inode, any open of a READ-protected one |
 //! | `inode_create`, `inode_mkdir`, `inode_mknod`, `inode_symlink`, `inode_link` | a new entry in a NOCREATE directory |
 //! | `inode_setxattr`, `inode_removexattr` (`inode_set_acl`, `inode_remove_acl` on 6.2+) | an extended attribute or ACL changed on a protected inode |
@@ -22,7 +23,8 @@
 //! Note: `chattr` does NOT go through `inode_setattr` — flag changes
 //! travel down the `ioctl(FS_IOC_SETFLAGS)` path, bypassing
 //! `notify_change()`. The `file_ioctl` hook is the only correct
-//! place to defeat `chattr -i` from BPF-LSM.
+//! place to defeat `chattr -i` from BPF-LSM — and, on a kernel that has
+//! it, `file_ioctl_compat` for a 32-bit caller (lab PR 174).
 //!
 //! No hook reads the LSM chain's previous verdict (see `task_kill.rs`).
 //! The [`FS_GRANT`] map is the trusted-installer window: while it is
@@ -497,23 +499,33 @@ pub(crate) unsafe fn setattr_dentry(ctx: &LsmContext) -> Option<*const c_void> {
 
 #[lsm(hook = "file_ioctl")]
 pub fn file_ioctl(ctx: LsmContext) -> i32 {
-    // Same diagnostic marker as inode_rename — unconditional, top
-    // of body, no arg access yet. If the kernel calls
-    // security_file_ioctl but this line never appears in
-    // trace_pipe, our BPF program is registered to the wrong
-    // attach point.
     unsafe { try_file_ioctl(&ctx) }
 }
 
+/// Lab PR 174: the `ioctl(2)` of a 32-bit process. Since upstream commit
+/// f1bb47a31dff ("lsm: new security_file_ioctl_compat() hook", 6.8, and
+/// the stable releases 6.7.3, 6.6.15, 6.1.76, 5.15.149 and 5.10.210) the
+/// compat `ioctl` syscall calls `security_file_ioctl_compat` instead of
+/// `security_file_ioctl`, so the `file_ioctl` deny no longer sees it: a
+/// 32-bit `chattr -i` of a protected file went through. Same prototype
+/// `(file, cmd, arg)` and the `cmd` as the caller passed it (the
+/// `FS_IOC32_*` translation comes after the hook), so the same deny.
+/// Attached only where the kernel's BTF has `bpf_lsm_file_ioctl_compat`
+/// (an optional deny hook); older kernels route the compat syscall
+/// through `file_ioctl`.
+#[lsm(hook = "file_ioctl_compat")]
+pub fn protected_ioctl_compat_deny(ctx: LsmContext) -> i32 {
+    unsafe { try_file_ioctl(&ctx) }
+}
+
+/// The chattr-family deny of `file_ioctl` and `file_ioctl_compat`.
 #[inline(always)]
 unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
-    // Kernel signature: (file, cmd, arg). No prev-retval read —
-    // see task_kill.rs.
+    // Kernel signature of both hooks: (file, cmd, arg). No prev-retval
+    // read — see task_kill.rs.
     //
-    // Fast path: this hook fires for EVERY ioctl on EVERY fd. To
-    // keep trace_pipe readable we deliberately do NOT emit a marker
-    // on the no-match branch — only on the cmd values that *could*
-    // be chattr-family, and on every step after the cmd match.
+    // Fast path: this hook fires for EVERY ioctl on EVERY fd; anything
+    // but the chattr-family commands returns before any read.
 
     let cmd: c_uint = ctx.arg(1);
 

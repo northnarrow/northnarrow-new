@@ -523,8 +523,12 @@ pub const DENY_HOOKS: [&str; 16] = [
 ];
 
 /// Deny hooks attached only where the kernel has them
-/// ([`filesystem::OPTIONAL_LSM_PROGRAMS`]: the ACL hooks, 6.2 and later).
-pub const OPTIONAL_DENY_HOOKS: [&str; 2] = ["inode_set_acl", "inode_remove_acl"];
+/// ([`filesystem::OPTIONAL_LSM_PROGRAMS`]: the ACL hooks, 6.2 and later;
+/// `file_ioctl_compat`, 6.8 and the stable releases 6.7.3, 6.6.15, 6.1.76,
+/// 5.15.149 and 5.10.210, lab PR 174). Each one the kernel has adds one
+/// to the expected deny hooks.
+pub const OPTIONAL_DENY_HOOKS: [&str; 3] =
+    ["inode_set_acl", "inode_remove_acl", "file_ioctl_compat"];
 
 /// Deny hooks expected on a healthy boot of every supported kernel; the
 /// optional ones a kernel has come on top.
