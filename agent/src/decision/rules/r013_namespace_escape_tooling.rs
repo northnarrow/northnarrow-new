@@ -8,10 +8,14 @@
 //! `/tmp`, `/dev/shm`, a home dir, …) is the escape-attempt shape.
 //! Design §7.1: comm ∈ {nsenter, unshare, runc} & filename ∉ standard
 //! path, gated by `process-comm-allowlist`.
+//!
+//! Lab PR 166: a copy run from a staging directory is killed with its
+//! tree, as R001..R003 would ([`super::tool_kill`]); from another
+//! non-standard path (`/opt`, a home) it keeps the single-process kill.
 
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use common::{Event, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
@@ -108,7 +112,7 @@ impl Rule for R013NamespaceEscapeTooling {
                 build_verdict(
                     self,
                     event,
-                    ResponseAction::KillProcess,
+                    super::tool_kill(filename),
                     Severity::High,
                     &reasoning,
                 ),
@@ -122,9 +126,24 @@ impl Rule for R013NamespaceEscapeTooling {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::{spawn, spawn_full};
+    use common::ResponseAction;
 
     fn rule() -> R013NamespaceEscapeTooling {
         R013NamespaceEscapeTooling::new(Arc::new(CommAllowlist::default()))
+    }
+
+    /// Lab PR 166: a staged copy is killed with its tree; one elsewhere
+    /// keeps the single-process kill.
+    #[test]
+    fn r013_staged_copy_kills_the_process_tree() {
+        let v = rule()
+            .evaluate(&spawn("nsenter", "/var/tmp/nsenter"))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        let v = rule()
+            .evaluate(&spawn("nsenter", "/opt/tools/nsenter"))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
     }
 
     /// Empty filename = sensor could not read the path; must not fire.
@@ -140,7 +159,7 @@ mod tests {
                 .evaluate(&spawn(tool, &format!("/tmp/{tool}")))
                 .unwrap_or_else(|| panic!("should fire on /tmp/{tool}"));
             assert_eq!(v.rule_id, "R013_NamespaceEscapeTooling");
-            assert_eq!(v.action, ResponseAction::KillProcess);
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
             assert_eq!(v.severity, Severity::High);
             // Graceful degrade: empty argv → no escape-flag clause.
             assert!(!v.reasoning.contains("host-escape flags"));

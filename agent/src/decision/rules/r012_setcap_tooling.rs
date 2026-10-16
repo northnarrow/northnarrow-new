@@ -6,10 +6,13 @@
 //! Design §7.1: comm = `setcap`, gated by `process-comm-allowlist`
 //! (a provisioning tool that legitimately sets caps adds its comm to
 //! the overlay).
+//!
+//! Lab PR 166: a copy run from a staging directory is killed with its
+//! tree, as R001..R003 would ([`super::tool_kill`]).
 
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use common::{Event, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
@@ -37,7 +40,14 @@ impl Rule for R012SetcapTooling {
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        let Event::ProcessSpawn { comm, argv, .. } = event else {
+        let Event::ProcessSpawn {
+            comm,
+            filename,
+            exe,
+            argv,
+            ..
+        } = event
+        else {
             return None;
         };
         if comm != "setcap" {
@@ -69,7 +79,7 @@ impl Rule for R012SetcapTooling {
                 build_verdict(
                     self,
                     event,
-                    ResponseAction::KillProcess,
+                    super::tool_kill(exe.path_or(filename)),
                     Severity::High,
                     &reasoning,
                 ),
@@ -83,6 +93,7 @@ impl Rule for R012SetcapTooling {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::{spawn, spawn_full};
+    use common::ResponseAction;
 
     fn rule() -> R012SetcapTooling {
         R012SetcapTooling::new(Arc::new(CommAllowlist::default()))
@@ -98,6 +109,20 @@ mod tests {
         assert_eq!(v.severity, Severity::High);
         // Graceful degrade: empty argv → base reasoning, no enrichment.
         assert!(!v.reasoning.contains("capability grant"));
+    }
+
+    /// Lab PR 166: a staged copy is killed with its tree; the system's
+    /// setcap keeps the single-process kill.
+    #[test]
+    fn r012_staged_copy_kills_the_process_tree() {
+        let v = rule()
+            .evaluate(&spawn("setcap", "/dev/shm/setcap"))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        let v = rule()
+            .evaluate(&spawn("setcap", "/usr/sbin/setcap"))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcess);
     }
 
     #[test]

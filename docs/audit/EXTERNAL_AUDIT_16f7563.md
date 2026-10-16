@@ -112,7 +112,11 @@ entry names the lab PR that fixed it.
   install it (lab PR 165).
 - **A root dropper with a paused parent.** A root dropper launched from
   `/tmp` whose parent sat in `pause()` drew no R001 verdict in the lab.
-  To be verified: the cause is not known yet.
+  Cause: R009 runs ahead of R001 and answered the root exec with
+  `KillProcess`, which reached the parent only; the child, forked before
+  the kill, ran on under init with the image from `/tmp`, and a child
+  that never execs draws no verdict of its own. Fixed: the rules that
+  kill a payload's exec kill its tree (lab PR 166).
 - **To run on a host with the model.** The real `prompt_tokens` of the v1.1
   system prompt (`ignored_model_host_prompt_tokens`, lab PR 133; the
   window budget rests on estimates), `ade_attacks` before and after the
@@ -5012,3 +5016,82 @@ the audit did not report, noted with the fix that takes them.
     without nftables answers "pre-dependency problem - not installing
     northnarrow", nothing unpacked.
   - Lab: Debian 12, nftdep165-probe.sh, nftables removed. `main`: `install.sh --upgrade` went through (the agent restarted, `nft` never asked), the `.deb` carried no nftables dependency and `apt-get -s` installed northnarrow alone. This build: `install.sh` refuses, fresh and `--upgrade`, before touching the host (agent pid unchanged, units active); `dpkg -i` refuses with "pre-dependency problem", nothing unpacked; `apt-get -s` pulls nftables in; `--without-nftables` installs, records `prerequisite_overrides: ["--without-nftables"]`, `host-check` names it, and the agent writes one ERROR and one signed `subsystem_degraded` at boot; with nftables installed an upgrade without the flag passes with no degraded row, and a process in `blocked.scope` gets EPERM on 5 of 5 UDP sends and no TCP connect while the control connects. The probe's optional root `cargo test` from `/home` was killed by the agent's R009 (no terminal), as designed: that test runs in the gate. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.
+- **Lab follow-ups — staging-exec rules kill the process tree, lab PR
+  166.** The root dropper of "Follow-ups found in the lab": a binary run
+  by root from `/tmp` that forks at once and waits in `pause()`. Also
+  closes NN-AUD-299 (PROC-011, Wave 3), R017's shell directories.
+  - Cause: R009 runs ahead of R001 (PROC-009), so the exec drew R009,
+    `KillProcess`. The kill reached the parent; the child, forked before
+    it, was adopted by init and ran on with the image from `/tmp`. It
+    never execs, so no rule sees it; NN-L-NET-008 names it only if it
+    calls out.
+  - Fix: R001, R002, R003, R009, R010 and R017, whose executable is the
+    payload itself, and R006 (the shell `socat EXEC:` runs is its child),
+    answer with `KillProcessTree`. R011, R012 and R013 do too for a copy
+    run from a staging directory (`rules::tool_kill`), and keep
+    `KillProcess` elsewhere: they outrank R001..R003, and a single kill
+    there let a dropper named `insmod`, `setcap` or `nsenter` keep its
+    children; it also broke the invariant that the engine returns the
+    strongest verdict (`the_engine_returns_the_strongest_spawn_verdict`
+    fails without it). The executor handles the action as for R004 and
+    R007: the cgroup kill of lab PR 120 (members checked by identity, the
+    host-critical guard for each pid, descendants only), the outcome in
+    the record (`KillProcessTree (partial: …)`, lab PR 155). The
+    exemptions do not depend on the action and are unchanged: the
+    allowlist judged on the executed file, R009's administrator sessions
+    and package transactions (PROC-007), the trusted actors (PROC-008),
+    R006's record of the distribution's `socat`.
+  - Found in the lab and fixed here: the tree kill now freezes its cgroup
+    as soon as the root is inside, before the walks that move the
+    descendants, so the root can neither exit (its children would be
+    re-parented and missed) nor fork meanwhile
+    (`a_tree_kill_freezes_the_root_before_moving_its_descendants`,
+    privileged: the root frozen during the moves, its parent sees a
+    SIGKILL, not a stop). A first attempt sent SIGSTOP to the root: the
+    `sudo` that ran a root dropper stopped itself in turn, as sudo does
+    when its command stops, and stayed stopped after the kill — the
+    cgroup freezer is invisible to the parent.
+  - Not changed, recorded as a follow-up: a short-lived payload copied
+    to `/tmp` (`unshare --version`, `bash -c 'exit 0'`) can end before
+    its verdict whichever kill answers it — on `main` 3 of 4 runs ended
+    with status 0 under `KillProcess`, while the same binary from a home
+    directory was killed 4 of 4: a staging exec takes longer to reach
+    the rules.
+  - Regression: these rules kill more processes, all descendants of the
+    exec — what the payload forked, the shell of a `socat EXEC:`, the
+    children a process had when it executed the payload in place. Never
+    its parent or siblings.
+  - NN-AUD-299 (PROC-011, Wave 3, Low), closed by this lot: R017 killed
+    any shell outside `/bin` and `/usr/bin`, and with the tree kill it
+    would take the shell's children too. `SHELL_STD_PREFIXES` adds the
+    trees only root can write where a distribution or an administrator
+    installs a shell: `/usr/local/bin`, `/usr/sbin`, `/sbin`,
+    `/nix/store`. Not `/opt` (an application user often owns its
+    subtree; `/opt/evil/sh` still fires), not `/snap` until a lab run.
+    The case that was killed is a `bash` exec from `/usr/local/bin` (a
+    login shell, `#!/usr/bin/env bash` with `/usr/local/bin` first in
+    `PATH`). A `#!/usr/local/bin/bash` script should not have drawn R017:
+    the kernel names a script's process after the script, and R017 reads
+    comm (the lab probe checks it). Tests:
+    `shell_from_usr_local_bin_is_not_flagged`,
+    `nix_store_shell_is_not_flagged` (both fail on the old list),
+    `writable_and_opt_shells_still_fire` (`/opt/evil/sh`,
+    `/dev/shm/bash`, `~/.x/bash`, `/tmp/bash`); the engine's
+    strongest-verdict test passes with the new list. The D7 e2e
+    `process_shell_from_nonstandard_path_trips_r017` already installs its
+    helper in `/usr/local/lib/nn-e2etest`, outside the list (comment
+    corrected).
+  - Tests: one per rule (`r001_kills_the_process_tree` …
+    `r013_staged_copy_kills_the_process_tree`), and
+    `no_payload_image_rule_kills_a_single_process` over every process
+    fixture; with the actions reverted, 30 tests fail. The existing
+    assertions of `KillProcess` for these rules now read
+    `KillProcessTree`. Privileged e2e, not run here:
+    `tmp_dropper_forked_child_dies_with_it` (the dropper as root, R009,
+    and as `nobody`, R001: record `KillProcessTree` carried out, the
+    parent's SIGKILL, the child gone), and
+    `tmp_exec_kill_hits_the_offender_only` now requires the tree kill
+    (the decoy sibling and the harness still run on).
+    `docs/validation/v2-rules.tsv` does not carry the action (no new
+    version); the R006 note in `matrix.md` is updated.
+  - Lab: Ubuntu 24.04, treekill166-probe.sh. `main`: a `/tmp` dropper that forks at once leaves its child running under init — as root (R009, `KillProcess`) and as user nn (R001): 1 survivor each; R017 kills `/usr/local/bin/bash -c` and an `env bash` script with `/usr/local/bin` first in `PATH` (exit 137). This build: `KillProcessTree`, 0 survivors in both; both shells run (exit 0, no verdict); `/tmp/nnx166/bash` still draws R017, now `KillProcessTree`. Found in the lab and fixed here: a first fix stopped the root with SIGSTOP, and the `sudo` that launched the root dropper stopped itself in turn and stayed stopped (the probe hung); the kill cgroup's freeze replaced it and the root case returns at once. Not changed: short-lived copies run from `/tmp` (`unshare --version`, `bash -c 'exit 0'`) end before their verdict in both builds — `main`: 3 of 4 exited 0 under `KillProcess`, while the same binary from a home directory was killed 4 of 4 (a follow-up). Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.

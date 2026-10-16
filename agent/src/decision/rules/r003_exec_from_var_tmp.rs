@@ -1,4 +1,7 @@
 //! R003 — Process executed from `/var/tmp/`.
+//!
+//! Lab PR 166: the executable is the payload itself, so the response is
+//! the tree, as for R001.
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
@@ -29,7 +32,7 @@ impl Rule for R003ExecFromVarTmp {
         Some(build_verdict(
             self,
             event,
-            ResponseAction::KillProcess,
+            ResponseAction::KillProcessTree,
             Severity::Medium,
             "Process executed from /var/tmp/ — persistent staging location",
         ))
@@ -47,7 +50,16 @@ mod tests {
             .evaluate(&spawn("loader", "/var/tmp/loader"))
             .expect("fires");
         assert_eq!(v.severity, Severity::Medium);
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// Lab PR 166: the payload's forked children die with it.
+    #[test]
+    fn r003_kills_the_process_tree() {
+        let v = R003ExecFromVarTmp
+            .evaluate(&spawn("loader", "/var/tmp/loader"))
+            .expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     #[test]

@@ -264,9 +264,10 @@ async fn rule_engine_short_circuits_before_ade_for_tmp_payload() {
         .evaluate(&event)
         .expect("R001 must fire on /tmp/* exec");
     assert_eq!(v.rule_id, "R001_ExecFromTmp");
+    // Lab PR 166: the kill takes the payload's tree.
     assert_eq!(
         v.action,
-        common::ResponseAction::KillProcess,
+        common::ResponseAction::KillProcessTree,
         "Tappa 3 regression: R001 must still kill /tmp/nn-test-payload"
     );
     // The main loop short-circuits when `evaluate` returns Some(_),

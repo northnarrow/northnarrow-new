@@ -55,6 +55,19 @@ pub fn is_staging_path(path: &str) -> bool {
     STAGING_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
+/// Lab PR 166: the kill of the tool rules R011..R013 for an exec of
+/// `image`. A copy run from a staging directory is the payload itself, as
+/// for R001..R003, which those rules outrank (PROC-009): its tree, so a
+/// dropper named like a system tool does not keep its forked children.
+/// Anywhere else the tool keeps the single-process kill.
+pub(crate) fn tool_kill(image: &str) -> ResponseAction {
+    if is_staging_path(image) {
+        ResponseAction::KillProcessTree
+    } else {
+        ResponseAction::KillProcess
+    }
+}
+
 pub use r001_exec_from_tmp::R001ExecFromTmp;
 pub use r002_exec_from_dev_shm::R002ExecFromDevShm;
 pub use r003_exec_from_var_tmp::R003ExecFromVarTmp;

@@ -88,7 +88,7 @@ impl RuleEngine {
     /// `R901` (BlockOutbound) instead of being killed by `R001`.
     /// This ordering only ships in the `demo-tappa5` build; the
     /// regression demo (`/tmp/nn-test-payload`) still goes through
-    /// R001 → KillProcess because its filename has no demo suffix.
+    /// R001 → KillProcessTree because its filename has no demo suffix.
     #[cfg(feature = "demo-tappa5")]
     pub fn with_default_rules_and_demo_tappa5() -> Self {
         let mut e = Self::new();

@@ -12,7 +12,9 @@
 //!   names its outcome, see `detection_store::describe_response`);
 //! - the offender died by SIGKILL;
 //! - a decoy sibling with the same name and parent, and the test harness
-//!   (the offender's parent), run on.
+//!   (the offender's parent), run on;
+//! - a child the offender forked dies with it (lab PR 166: the kill of an
+//!   exec from `/tmp` takes the tree, descendants only).
 //!
 //! Not covered here: a process spared by the host-critical guard and
 //! recorded as refused. Making a test process count as the watchdog or
@@ -33,8 +35,9 @@
 
 #![cfg(feature = "test-privileged")]
 
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -262,13 +265,14 @@ fn tmp_sleep() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// (a) An exec from `/tmp` (R001, or the exec rule that matches it first;
-/// a kill either way) by a child of the harness. A decoy with the same
-/// name and the same parent runs beside it. The record names the offender
-/// and the bare action name (carried out); the offender died by SIGKILL;
-/// the decoy and the harness run on.
+/// since lab PR 166 a tree kill either way) by a child of the harness. A
+/// decoy with the same name and the same parent runs beside it. The
+/// record names the offender and the bare action name (carried out); the
+/// offender died by SIGKILL; the decoy and the harness run on.
 ///
 /// Regressions it catches: a kill aimed at the parent kills the harness;
-/// at the wrong process (by name), the decoy; recorded but not landed, the
+/// at the wrong process (by name), the decoy; a tree kill that reaches
+/// past the offender's descendants, either; recorded but not landed, the
 /// offender's exit; a refusal or a miss recorded as the action, the
 /// `response` check.
 #[test]
@@ -297,9 +301,10 @@ fn tmp_exec_kill_hits_the_offender_only() {
     let rec = fx.wait_record_of(pid);
     assert_eq!(rec["exe"].as_str(), bin.to_str(), "record: {rec}");
     let action = rec["verdict"]["Rule"].as_str();
-    assert!(
-        matches!(action, Some("KillProcess" | "KillProcessTree")),
-        "a kill was expected; record: {rec}"
+    assert_eq!(
+        action,
+        Some("KillProcessTree"),
+        "a tree kill was expected (lab PR 166); record: {rec}"
     );
     assert_eq!(
         rec["response"].as_str(),
@@ -325,4 +330,119 @@ fn tmp_exec_kill_hits_the_offender_only() {
         .filter(|r| r["principal"]["pid"].as_u64() == Some(decoy_pid))
         .collect();
     assert!(decoy_records.is_empty(), "decoy records: {decoy_records:?}");
+}
+
+/// `nobody` on Debian and Ubuntu.
+const NOBODY: u32 = 65534;
+
+/// The lab's root dropper (lab PR 166), built with `cc` in a fresh
+/// directory under `/tmp` that another user can enter: it forks at once;
+/// the child writes its pid on stdout and sleeps, the parent waits in
+/// `pause()`. The child never execs, so it draws no verdict of its own.
+fn tmp_fork_dropper() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("nnfork")
+        .tempdir_in("/tmp")
+        .expect("tempdir under /tmp");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod the dropper's directory");
+    let src = dir.path().join("dropper.c");
+    std::fs::write(
+        &src,
+        r#"
+#include <stdio.h>
+#include <unistd.h>
+int main(void) {
+    if (fork() == 0) {
+        printf("%d\n", (int)getpid());
+        fflush(stdout);
+        sleep(30);
+        return 0;
+    }
+    pause();
+    return 0;
+}
+"#,
+    )
+    .expect("write the dropper source");
+    let bin = dir.path().join("dropper");
+    let status = Command::new("cc")
+        .arg("-O0")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .expect("spawn cc to build the dropper");
+    assert!(status.success(), "cc failed to build the dropper");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    (dir, bin)
+}
+
+/// (b) Lab PR 166: a dropper from `/tmp` that forked before the verdict.
+/// As root (R009) and as `nobody` (R001): the record names the dropper and
+/// `KillProcessTree`, carried out; the dropper died by SIGKILL; its child
+/// is gone too, and the harness, their parent, runs on.
+///
+/// Regression it catches: a single-process kill of the exec — the child
+/// ran on under init with the image from `/tmp` (seen in the lab with
+/// R009, which runs ahead of R001).
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn tmp_dropper_forked_child_dies_with_it() {
+    let _eni = EniIptablesGuard::install();
+    // Built before the agent runs: nothing here should draw a verdict.
+    let (_dir, bin) = tmp_fork_dropper();
+    let fx = Fixture::setup();
+
+    for (uid, rule) in [
+        (None, "R009_RootExecFromUserPath"),
+        (Some(NOBODY), "R001_ExecFromTmp"),
+    ] {
+        let mut cmd = Command::new(&bin);
+        cmd.stdout(Stdio::piped());
+        if let Some(id) = uid {
+            cmd.uid(id).gid(id);
+        }
+        let mut dropper = Spawned(cmd.spawn().expect("exec the /tmp dropper"));
+        let pid = dropper.0.id();
+        let mut line = String::new();
+        BufReader::new(dropper.0.stdout.take().expect("dropper stdout"))
+            .read_line(&mut line)
+            .expect("read the child's pid");
+        let child: u32 = line.trim().parse().unwrap_or_else(|_| {
+            panic!("uid {uid:?}: no child pid ({line:?}): the tree died before the child wrote it")
+        });
+
+        let rec = fx.wait_record_of(pid);
+        assert_eq!(
+            rec["rule_id"].as_str(),
+            Some(rule),
+            "uid {uid:?}; record: {rec}"
+        );
+        assert_eq!(rec["exe"].as_str(), bin.to_str(), "record: {rec}");
+        assert_eq!(
+            rec["verdict"],
+            serde_json::json!({"Rule": "KillProcessTree"}),
+            "uid {uid:?}; record: {rec}"
+        );
+        assert_eq!(
+            rec["response"], "KillProcessTree",
+            "the bare action name: the whole tree was killed; uid {uid:?}; record: {rec}"
+        );
+        let status = common::wait_exit(&mut dropper.0, RECORD_POLL_TIMEOUT).unwrap_or_else(|| {
+            panic!("uid {uid:?}: the dropper still runs: the kill did not land; record: {rec}")
+        });
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "uid {uid:?}: the dropper ended otherwise: {status:?}; record: {rec}"
+        );
+        let child_gone = common::wait_until(Duration::from_secs(5), || {
+            common::pid_gone(child).then_some(())
+        });
+        assert!(
+            child_gone.is_some(),
+            "uid {uid:?}: the dropper's child {child} survived the kill; record: {rec}"
+        );
+    }
 }

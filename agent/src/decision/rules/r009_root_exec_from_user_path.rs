@@ -16,6 +16,12 @@ const USER_WRITABLE_PREFIXES: &[&str] = &["/home/", "/tmp/", "/var/tmp/"];
 /// session at a terminal, and a package manager's transaction. A process
 /// that became root any other way — the escalation R009 exists for — has
 /// neither, and is still killed.
+///
+/// Lab PR 166: killed with its tree. The executable is the payload itself;
+/// a root dropper from `/tmp` that forked at once kept its child running
+/// the same image under init (this rule runs ahead of R001, so the lab saw
+/// an R009 kill and no R001 verdict). The record of a sanctioned lineage
+/// is unchanged.
 #[derive(Default)]
 pub struct R009RootExecFromUserPath {
     lineage: Option<AuthSessionTracker>,
@@ -81,7 +87,7 @@ impl Rule for R009RootExecFromUserPath {
         Some(build_verdict(
             self,
             event,
-            ResponseAction::KillProcess,
+            ResponseAction::KillProcessTree,
             Severity::High,
             "Root execution from user-writable path — privilege escalation indicator",
         ))
@@ -99,9 +105,19 @@ mod tests {
             let v = R009RootExecFromUserPath::default()
                 .evaluate(&spawn_as(0, "payload", path))
                 .unwrap_or_else(|| panic!("should fire on {path}"));
-            assert_eq!(v.action, ResponseAction::KillProcess);
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
             assert_eq!(v.severity, Severity::High);
         }
+    }
+
+    /// Lab PR 166: a root dropper's forked children die with it.
+    #[test]
+    fn r009_kills_the_process_tree() {
+        let v = R009RootExecFromUserPath::default()
+            .evaluate(&spawn_as(0, "dropper", "/tmp/dropper"))
+            .expect("fires");
+        assert_eq!(v.rule_id, "R009_RootExecFromUserPath");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     #[test]
@@ -162,6 +178,6 @@ mod tests {
         let v = rule.evaluate(&sudo_run).expect("recorded");
         assert_eq!(v.action, ResponseAction::Log);
         let v = rule.evaluate(&other).expect("fires");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 }

@@ -41,6 +41,47 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Lab follow-up, the rules that kill an exec whose executable is the
+  payload itself kill its process tree (lab PR 166). A root dropper run
+  from `/tmp` that forked at once and waited in `pause()` was killed by
+  R009, which runs ahead of R001 (hence no R001 verdict in the lab), but
+  `KillProcess` reached the parent only: the child, forked before the
+  kill, ran on under init with the image from `/tmp`, and a child that
+  never execs draws no verdict of its own. R001, R002, R003, R009, R010
+  and R017 now answer with `KillProcessTree`, and so does R006 (the shell
+  that `socat EXEC:` runs is its child). R011, R012 and R013, which
+  outrank R001..R003 (PROC-009), do the same for a copy run from `/tmp`,
+  `/var/tmp` or `/dev/shm` — a dropper named `insmod` kept its children —
+  and keep `KillProcess` for the tool anywhere else. The tree kill is the
+  one R004 and R007 use: a cgroup of its own, every member checked by
+  identity, the host-critical guard for each pid, descendants only, and
+  the record names what it did (`KillProcessTree (partial: …)`); its
+  cgroup is now frozen as soon as the root is inside, before the walks
+  that move the descendants, so the root can neither exit nor fork
+  meanwhile (the freezer, not SIGSTOP: a `sudo` stops itself when its
+  command stops, and in the lab stayed stopped once the command was
+  killed). A short-lived payload copied to `/tmp` (`unshare --version`,
+  `bash -c 'exit 0'`) can end before its verdict whichever kill answers
+  it: in the lab it did on `main` too (3 of 4 runs under `KillProcess`),
+  while the same binary run from a home directory was killed 4 of 4 —
+  the extra latency of a staging exec is upstream of the rules (a
+  follow-up). The exemptions are unchanged: the allowlist judged on the executed file,
+  R009's administrator sessions and package transactions (PROC-007), the
+  trusted actors (PROC-008), R006's record of the distribution's `socat`.
+  New privileged e2e `tmp_dropper_forked_child_dies_with_it` (as root and
+  as `nobody`); `tmp_exec_kill_hits_the_offender_only` now requires the
+  tree kill. **Regression:** these rules kill more processes, all of them
+  descendants of the exec: the children a payload forked, the shell of a
+  `socat EXEC:`, and the children a process already had when it executed
+  the payload in place (`exec /tmp/x` from a shell with background jobs).
+  Its parent and siblings are never touched.
+  With it, external audit NN-AUD-299 (PROC-011, Wave 3, Low): R017
+  killed every shell outside `/bin` and `/usr/bin` — a `bash` an
+  administrator installed in `/usr/local/bin`, run as a login shell or by
+  `#!/usr/bin/env bash` with `/usr/local/bin` first in `PATH`. The trees
+  only root can write where a shell is installed (`/usr/local/bin`,
+  `/usr/sbin`, `/sbin`, `/nix/store`) are exempt too; `/opt`, a home and
+  the staging directories still fire.
 - Lab follow-up, nftables (lab PR 165): the per-process outbound block (a
   BlockOutbound verdict, the COMBAT soft egress block of INVESTIGATE) is
   an nftables rule applied with `nft`, and nothing in the install chain

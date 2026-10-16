@@ -14,6 +14,9 @@
 //! - a `socat` from anywhere else, and the other tools (no distribution
 //!   ships them on a server), are still killed.
 //!
+//! Lab PR 166: a kill takes the tree. The shell that `socat EXEC:` runs is
+//! its child, and a copied tool is the payload itself.
+//!
 //! Names are chosen by whoever runs the binary; a renamed tool evades this
 //! rule, which the network and staging rules back up.
 
@@ -115,7 +118,7 @@ impl Rule for R006ReverseShellTooling {
             build_verdict(
                 self,
                 event,
-                ResponseAction::KillProcess,
+                ResponseAction::KillProcessTree,
                 Severity::Critical,
                 "Known offensive security tooling detected",
             )
@@ -139,8 +142,25 @@ mod tests {
             let v = rule()
                 .evaluate(&spawn(comm, "/home/alice/whatever"))
                 .unwrap_or_else(|| panic!("should fire on {comm}"));
-            assert_eq!(v.action, ResponseAction::KillProcess);
+            assert_eq!(v.action, ResponseAction::KillProcessTree);
             assert_eq!(v.severity, Severity::Critical);
+        }
+    }
+
+    /// Lab PR 166: the shell a system socat runs, and a copied tool's
+    /// children, die with it.
+    #[test]
+    fn r006_kills_the_process_tree() {
+        let shell = spawn_full(
+            "socat",
+            "/usr/bin/socat",
+            1000,
+            &["socat", "TCP:127.0.0.1:9", "EXEC:/bin/sh"],
+            "bash",
+        );
+        for e in [shell, spawn_exe("socat", "socat", "/tmp/socat", 0)] {
+            let v = rule().evaluate(&e).expect("fires");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{e:?}");
         }
     }
 
@@ -173,7 +193,7 @@ mod tests {
             ("msfvenom", "/usr/bin/msfvenom"),
         ] {
             let v = rule().evaluate(&spawn_exe(comm, comm, path, 0)).unwrap();
-            assert_eq!(v.action, ResponseAction::KillProcess, "{path}");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{path}");
             assert_eq!(v.severity, Severity::Critical, "{path}");
         }
     }
@@ -194,7 +214,7 @@ mod tests {
         ] {
             let e = spawn_full("socat", "/usr/bin/socat", 1000, args, "bash");
             let v = rule().evaluate(&e).unwrap();
-            assert_eq!(v.action, ResponseAction::KillProcess, "{args:?}");
+            assert_eq!(v.action, ResponseAction::KillProcessTree, "{args:?}");
         }
         for args in [
             &[
@@ -224,7 +244,7 @@ mod tests {
         let v = r
             .evaluate(&spawn_exe("socat", "./socat", "/home/alice/socat", 0))
             .expect("a copy is not the allowlisted socat");
-        assert_eq!(v.action, ResponseAction::KillProcess);
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
         assert!(v.reasoning.contains("named 'socat'"), "{}", v.reasoning);
     }
 }

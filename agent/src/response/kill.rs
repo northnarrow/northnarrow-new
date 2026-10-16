@@ -289,6 +289,13 @@ fn kill_tree_in_cgroup(
         }
         return Err(e);
     }
+    // Lab PR 166: frozen as soon as the root is inside, before the walks
+    // that move its descendants (milliseconds on a busy host), so the root
+    // can neither exit nor fork meanwhile; a descendant moved in later
+    // freezes on entry. The cgroup freezer, unlike SIGSTOP, is invisible
+    // to the root's parent: a `sudo` mirrors a stopped command by stopping
+    // itself, and stayed stopped once the command was killed (lab).
+    let _ = std::fs::write(dir.join("cgroup.freeze"), "1");
     let rel = cgroup_rel(dir);
     // Every descendant moved in or found inside, by its start: each is
     // checked after the kill.
@@ -358,10 +365,9 @@ fn kill_tree_in_cgroup(
             break;
         }
     }
-    // Freeze, sweep until nothing more is moved (a child forked by a
-    // process not yet moved when the last walk read it), then kill
-    // everything inside.
-    let _ = std::fs::write(dir.join("cgroup.freeze"), "1");
+    // Frozen (since the root moved in), sweep until nothing more is moved
+    // (a child forked by a process not yet moved when the last walk read
+    // it), then kill everything inside.
     let _ = wait_cgroup_event(dir, "frozen 1", FREEZE_WAIT);
     for _ in 0..MAX_MOVE_PASSES {
         if sweep(&mut members, &mut others) == 0 {
@@ -781,6 +787,72 @@ mod tests {
             return;
         }
         panic!("the PID was never reused in 20 attempts");
+    }
+
+    /// Lab PR 166: the root is frozen while its descendants are moved (it
+    /// can neither exit nor fork meanwhile), through the cgroup freezer:
+    /// its parent — this test — sees it killed, never stopped (a `sudo`
+    /// stops itself when its command stops).
+    #[test]
+    #[ignore = "privileged: root, cgroup v2 with cgroup.kill"]
+    fn a_tree_kill_freezes_the_root_before_moving_its_descendants() {
+        let (sh, kids) = shell_with_two_sleepers();
+        let root = sh.id();
+        let freeze_of_root = || -> Option<String> {
+            let cg = std::fs::read_to_string(format!("/proc/{root}/cgroup")).ok()?;
+            let path = cg.lines().find_map(|l| l.strip_prefix("0::"))?.to_owned();
+            std::fs::read_to_string(format!("/sys/fs/cgroup{path}/cgroup.freeze"))
+                .ok()
+                .map(|v| v.trim().to_owned())
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let scope = std::path::PathBuf::from(format!(
+            "/sys/fs/cgroup/northnarrow-test.slice/blocked.scope/neutralize-f{}",
+            std::process::id()
+        ));
+        let (primary, rest) = kill_tree_in_cgroup(
+            &ProcRef::open(root),
+            &HashSet::new(),
+            &|pid| {
+                if kids.contains(&pid) {
+                    seen.borrow_mut().push(freeze_of_root());
+                }
+                None
+            },
+            &scope,
+        )
+        .expect("the kill cgroup could not be used");
+        // the parent's view: the first state change it can wait for
+        let mut status = 0;
+        // SAFETY: waitpid(2) on this test's own child.
+        let r = unsafe { libc::waitpid(root as i32, &mut status, libc::WUNTRACED) };
+        let _ = std::fs::remove_dir(&scope);
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice/blocked.scope");
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/northnarrow-test.slice");
+        drop(sh); // reaped above (dropping a Child neither waits nor kills)
+        let seen = seen.into_inner();
+        assert!(!seen.is_empty(), "the guard never saw a descendant");
+        assert!(
+            seen.iter().all(|f| f.as_deref() == Some("1")),
+            "the root was not frozen while its descendants were moved: {seen:?}"
+        );
+        assert_eq!(r, root as i32);
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "the parent saw {status:#x} (stopped: {}), not a SIGKILL",
+            libc::WIFSTOPPED(status)
+        );
+        assert!(
+            matches!(primary, ExecutionOutcome::Killed { pid } if pid == root),
+            "{primary:?}"
+        );
+        for kid in kids {
+            assert!(
+                rest.iter()
+                    .any(|o| matches!(o, ExecutionOutcome::Killed { pid } if *pid == kid)),
+                "child {kid} not killed: {rest:?}"
+            );
+        }
     }
 
     /// External audit CMB-019 (privileged: root, cgroup v2, kernel 5.14+):
