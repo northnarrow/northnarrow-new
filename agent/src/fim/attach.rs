@@ -197,6 +197,17 @@ pub fn attach_observe_programs(
                 ),
             }
         }
+        // Lab PR 164: the setattr observer reads the dentry at the position
+        // the running kernel's prototype gives; unknown position, not
+        // attached (the coverage shortfall is attested at boot).
+        if let Some(Err(why)) = crate::anti_tamper::btf_revalidate::hook_attach_gate(hook) {
+            warn!(
+                program, hook, reason = %why,
+                "fim: LSM observe program NOT attached — the dentry's position in the hook's \
+                 prototype is unknown (chmod / chown / truncate of watched files are not seen)"
+            );
+            continue;
+        }
         match attach_transient(ebpf, program, hook, btf) {
             Ok(()) => {
                 info!(

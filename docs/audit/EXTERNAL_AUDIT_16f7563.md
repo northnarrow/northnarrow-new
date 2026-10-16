@@ -70,15 +70,18 @@ Defects and gaps found while fixing and verifying the findings. They are
 not in the report and are not counted above; each is open unless its
 entry names the lab PR that fixed it.
 
-- **`inode_setattr` on kernel 6.9 and later.** From 6.9 the LSM hook
-  receives `struct mnt_idmap *` as its first argument (`idmap, dentry,
-  attr`; checked in the BTF of the WSL2 6.18 host). The setattr deny
-  (`agent-ebpf/src/inode_protect.rs::try_inode_setattr`) and the FIM
-  setattr observer (`fim_watch.rs::fim_setattr_observe`) read argument 0
-  as the dentry, so on 6.9+ they read the wrong argument: truncate, chmod
-  and chown of a protected or watched file cannot be relied on there. The
-  lab kernels go up to 6.8, and `--btf-check` does not check hook
-  prototypes (`docs/operator/KERNEL_COMPATIBILITY.md`).
+- **`inode_setattr` on kernel 6.9 and later — fixed (lab PR 164).** From
+  6.9 the LSM hook receives `struct mnt_idmap *` as its first argument
+  (`idmap, dentry, attr`; checked in the BTF of the WSL2 6.18 host). The
+  setattr deny (`agent-ebpf/src/inode_protect.rs::try_inode_setattr`) and
+  the FIM setattr observer (`fim_watch.rs::fim_setattr_observe`) read
+  argument 0 as the dentry, so on 6.9+ they read the wrong argument:
+  truncate, chmod and chown of a protected or watched file could not be
+  relied on there. They now read the dentry at the position the running
+  kernel's prototype gives; the xattr hooks of 5.7–5.11 (dentry first)
+  are handled the same way; every other hook argument the programs read
+  is checked at boot and by `--btf-check`; the lab has a Debian 13 (6.12)
+  guest (note below; `docs/operator/KERNEL_COMPATIBILITY.md`).
 - **Two Critical rules could not fire.** NN-L-CANARY-003 had no trip
   source (`CanaryIndexes::is_canary_port` had no caller outside tests):
   resolved (lab PR 163) — a local process connecting to a network
@@ -95,11 +98,14 @@ entry names the lab PR that fixed it.
   COMBAT" (lab PR 155). The tamper now raises the decisive
   `ControlSurfaceTamper` (locked COMBAT) on the rule's own match and
   exemptions; not inside a trusted-installer window.
-- **`FLOW_SOCK_MAP` forgets long sessions.** The kernel map that pairs a
-  connect with its close is an LRU of 4,096 sockets: beyond 4,096 pending
-  connects it drops the least recently used one (a long session first),
-  and that socket's close is never recorded, whatever the userland tracker
-  does (lab PR 142).
+- **`FLOW_SOCK_MAP` forgets long sessions — fixed (lab PR 164).** The
+  kernel map that pairs a connect with its close was an LRU of 4,096
+  sockets: beyond 4,096 pending connects it dropped the least recently
+  used one (a long session first), and that socket's close was never
+  recorded, whatever the userland tracker did (lab PR 142). It now holds
+  65,536, the tracker's capacity, and `nn-admin net status` shows its
+  occupancy and the sockets it forgot at least (note below). Beyond
+  65,536 pending connects the LRU still forgets.
 - **One ADE slot per exec, taken by the wrong event** — resolved (lab PR
   162). Evaluations run one at a time (NN-AUD-004). For each exec the
   `ExecCheck`, which carries the parent's comm, took the slot, and the
@@ -5225,3 +5231,93 @@ the audit did not report, noted with the fix that takes them.
     reasoning of NN-L-FIM-021 and -022, and the module doc for -001, -002
     and -008, also say "posture → COMBAT"; no trigger reads those events.
   - Lab: Ubuntu 24.04, adeslot162-probe.sh (mock ADE backend). A, an exec no rule matches: `main` judged the parent's `ExecCheck` (comm `bash`, Escalate) in one run of two and the spawn in the other; this build judges the spawn (comm `lockbit-nn162`, `KillTree` recorded as an advisory, the process alive). B, an exec that fails (ENOEXEC): offered to the ADE on its own after the 2 s grace. C, `/etc/northnarrow/kill_switch.conf` deleted by root: refused by the FS deny in both builds, and `AntiTamperDenial` raises the locked COMBAT. D, added in the lab, `/run/northnarrow/pause.flag`, which no deny covers: `main` kills the tamperer (FIM-024) and the posture stays OBSERVING; this build: `POSTURE TRANSITION state=COMBAT locked=true trigger=Some(ControlSurfaceTamper)`. Found in the gate and fixed here: the e2e expected the control-surface trigger for the `/etc` baits too, where the deny answers first. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.
+- **Lab follow-ups — inode_setattr from 6.9 and FLOW_SOCK_MAP, lab PR 164.**
+  Two follow-ups of the section above, not audit findings.
+  - `inode_setattr` from 6.9: an LSM program reads its hook's arguments
+    by position, and from 6.9 `inode_setattr` takes `struct mnt_idmap *`
+    before the dentry (`lsm_hook_defs.h` of 6.9 and 6.12, the BTF of the
+    6.18 host; `(dentry, attr)` on 5.15, 6.1 and 6.8). The agent's BTF
+    parser now reads the prototypes of the `bpf_lsm_<hook>` functions
+    (FUNC, FUNC_PROTO, pointers and their pointees through typedefs,
+    cv-qualifiers and type tags; only the `bpf_lsm_` functions are kept).
+    `common::btf_offsets::HOOK_ARGS` names the arguments whose position is
+    resolved at boot: `inode_setattr`'s dentry (the only `struct dentry *`,
+    followed by the `struct iattr *`), published in `BTF_OFFSETS` slot 89
+    before anything attaches. Both programs on the hook read it with
+    `hook_arg(slot)`, which has no compiled fallback (an unarmed map, an
+    absent slot or a value of 6 or more: nothing is read), through
+    `bpf_probe_read_kernel` on the context at the bounded position (a
+    context load needs a constant offset). A prototype of another shape
+    is never guessed: the slot is absent, `filesystem::attach` does not
+    attach the deny and purges the prior boot's pins of the hook (a deny
+    shortfall: the start is refused unless
+    `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`), `fim::attach` does not attach the
+    observer (a FIM coverage shortfall), and a signed `subsystem_degraded`
+    names the hook and what is lost.
+  - Found by the same check, not reported before: on 5.7 to 5.11 (5.10
+    LTS) `inode_setxattr` and `inode_removexattr` start with the dentry
+    (`user_namespace` came first in 5.12), where the xattr deny of lab PR
+    152 read argument 1 (the attribute name) as the dentry. Their dentry
+    positions are resolved the same way (slots 90 and 91, followed by the
+    `const char *` name, which the deny reads next); `inode_set_acl` /
+    `inode_remove_acl` keep their fixed argument 1 (6.2+, one shape).
+    The lab has no kernel older than 5.14.
+  - Every other pointer argument the LSM programs read at a fixed
+    position (28, `HOOK_ARG_CHECKS`) is checked against the running
+    kernel's prototype at boot and by `--btf-check`: a moved one refuses
+    the start (exit 78, like a missing field), a hook the kernel lacks is
+    not checked. All 28 hold on 5.15, 6.1, 6.8, 6.9 and 6.12 (the
+    kernels' `lsm_hook_defs.h`) and in the 6.18 BTF of the host, where
+    `--btf-check` reports `SUPPORTED — 82 slots resolved, 28 differ from
+    the build kernel, 0 absent, 28 hook arguments checked` and
+    `INODE_SETATTR_DENTRY_ARG compiled=0 runtime=1`. Regression: a kernel
+    whose prototype moved a fixed argument no longer starts.
+  - `FLOW_SOCK_MAP`: `FLOW_SOCK_MAP_MAX_ENTRIES` (`common::wire`) is
+    65,536, the userland tracker's `DEFAULT_PENDING_CAPACITY` (4,096
+    before). Memory: the map is preallocated, 72 bytes per element (a
+    48-byte `htab_elem` with its LRU node, the 8-byte key, the 16-byte
+    value) and a 16-byte bucket each, about 5.5 MiB (0.34 MiB before). An
+    LRU does not report what it evicts, so the connect kprobes count a
+    socket entered as a new key (`BPF_NOEXIST`; a reconnect of the same
+    socket is overwritten as before) and the close fexit one it took out,
+    in `FLOW_SOCK_COUNTS` (per-CPU, two slots, not pinned). The agent
+    samples them every 10 s (`sensors::flow_sock`): `pending` = entered −
+    taken out (open sessions and forgotten ones), and a lower bound of the
+    forgotten ones, the largest excess of `pending` over the capacity seen
+    (WARN when it grows, at most once a minute). `StatusResponse` gains
+    `flow_sock_pending`, `flow_sock_capacity` and
+    `flow_sock_forgotten_min` (appended); `nn-admin net status` prints them
+    (text and `--json`). The soak's `map_pct` reads `max_entries` from the
+    kernel and needs no change.
+  - Lab: `NN_LAB_DISTRO=debian13` (Debian 13 trixie, kernel 6.12, ssh port
+    2722, `user-data.debian13.tmpl`: the Debian 12 template with
+    `nftables` and `python3` added); the download is checked like
+    bookworm's (HTTPS + SHA512SUMS, unsigned), with self-test cases.
+  - eBPF: the setattr deny 441 → 474 BPF instructions, the FIM setattr
+    observer 427 → 460, the xattr denies 482 → 514 (the ACL ones 490), the
+    connect kprobes 261/301 → 277/318, `tcp_close` 888 → 900; no loop
+    added. The verified count is measured in the lab.
+  - Tests: `setattr_dentry_is_argument_0_up_to_6_8`,
+    `setattr_dentry_is_argument_1_from_6_9`,
+    `xattr_dentry_follows_the_kernels_prototype`,
+    `setattr_of_another_shape_is_absent_never_guessed`,
+    `hook_gate_without_resolution_is_closed`,
+    `hook_position_beyond_the_bound_is_not_used`,
+    `fixed_hook_arguments_are_checked_against_the_prototype`,
+    `pointee_name_sees_through_qualifiers_and_tags`,
+    `only_lsm_hook_functions_are_indexed`,
+    `host_btf_hook_prototypes_match_the_programs` (the host's own BTF,
+    skipped without one), `hook_arg_slot_table_matches_specs`,
+    `hook_arg_checks_are_well_formed`,
+    `the_kernel_map_holds_what_the_tracker_holds`,
+    `pending_is_entered_minus_taken_out`,
+    `forgotten_is_a_lower_bound_that_does_not_go_back`,
+    `net_status_reports_the_kernel_socket_map`; `slot_table_matches_revalidate`,
+    `n2_map_capacity_constants_lock_in`, the status round-trips and the
+    ignored `revalidate_real_kernel_btf_all_40_match` updated. Each fails
+    on main (none of the names it checks exists there, and the capacity
+    is 4,096); with the prototype reading taken out (the compiled position
+    returned), `setattr_dentry_is_argument_1_from_6_9`,
+    `xattr_dentry_follows_the_kernels_prototype` and
+    `setattr_of_another_shape_is_absent_never_guessed` fail.
+  - Lab: Debian 13 (6.12, the lab's first kernel from 6.9), setattr164-probe.sh. `main`: outside a trusted-installer window `chmod`, `chown` and `touch` of `/etc/northnarrow/admin.pub` (same mode, owner and times) are allowed (`truncate` and `chattr` refused by other hooks); a mode flip of `/etc/hosts` leaves 0 `AttrChanged` rows; 20,000 held connects closed one by one leave 3,872 netflow rows. This build: all four refused, one `ANTI-TAMPER DENIAL op=setattr` each, allowed inside a window; 1 `AttrChanged` row; 20,000 rows of 20,000, `FLOW_SOCK_MAP` at 20,000 of 65,536 during the hold and 0 forgotten; `--btf-check` checks 28 hook arguments and prints `INODE_SETATTR_DENTRY_ARG compiled=0 runtime=1`; `setfattr` refused in both builds (the control). Ubuntu 24.04 (6.8): the setattr denials in both builds (the control), 3,872 → 20,000 rows the same way. Ubuntu 22.04 (5.15): the agent reads setattr's dentry at argument 0 and the xattr hooks' at 1, 16 of 16 deny hooks attached. A burst of 20,000 closes at one process exit overflows the 256 KiB `tcp_close` ring (16,079 drops, counted in `net status` and the journal): a separate limit, a follow-up. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.

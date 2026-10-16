@@ -41,6 +41,32 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Lab follow-ups, LSM hook prototypes and `FLOW_SOCK_MAP` (lab PR 164).
+  From kernel 6.9 `inode_setattr` takes `struct mnt_idmap *` before the
+  dentry, and the anti-tamper setattr deny and the FIM setattr observer
+  read argument 0 as the dentry: there `chmod`, `chown` and `truncate` of
+  a protected file were not refused, nor seen by FIM on a watched one.
+  The agent now reads the hook's prototype from the running kernel's BTF
+  (`bpf_lsm_inode_setattr`) and hands the dentry's position to the
+  programs through `BTF_OFFSETS`. The same check found that on 5.7 to
+  5.11 (5.10 LTS) `inode_setxattr` and `inode_removexattr` start with the
+  dentry, where the xattr deny read argument 1; their positions are
+  resolved the same way. A prototype of another shape is never guessed:
+  the programs on that hook are not attached (a deny-hook shortfall, which
+  refuses the start unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`; a FIM
+  coverage shortfall) and a signed `subsystem_degraded` says why. The 28
+  other pointer arguments the LSM programs read at a fixed position are
+  checked against the running kernel's prototypes at boot and by
+  `--btf-check`, whose summary counts them. **Regression:** a kernel
+  whose hook prototype moved an argument the agent reads at a fixed
+  position no longer starts (exit 78, like a missing field).
+  `FLOW_SOCK_MAP`, the kernel's connect→close socket map, holds 65,536
+  sockets, the userland flow tracker's capacity (it held 4,096 and beyond
+  that forgot long sessions, whose close was never recorded): about 5.5
+  MiB of kernel memory, preallocated (was 0.34 MiB). `nn-admin net status`
+  (text and `--json`) shows how many sockets the map holds without their
+  close and how many it forgot at least. The lab gains a Debian 13 guest
+  (kernel 6.12, `NN_LAB_DISTRO=debian13`, ssh port 2722).
 - Two follow-ups found in the lab (lab PR 162). The ADE judged every exec
   under its parent's name: for each exec the `ExecCheck` (before the new
   image runs, with the parent's comm) took the only evaluation slot and

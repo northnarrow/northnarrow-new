@@ -1617,6 +1617,10 @@ fn dispatch(
             netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
             netflow_pending_evicted_total: Some(crate::net::flow_tracker::pending_evictions_total()),
             net_inactive_rules: Some(crate::net::blocklist::inactive_net_rules()),
+            // Lab PR 164: the kernel's connect→close socket map.
+            flow_sock_pending: crate::sensors::flow_sock::snapshot().map(|o| o.pending),
+            flow_sock_capacity: crate::sensors::flow_sock::snapshot().map(|o| o.capacity),
+            flow_sock_forgotten_min: crate::sensors::flow_sock::snapshot().map(|o| o.forgotten_min),
         }),
 
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
@@ -5170,6 +5174,9 @@ mod tests {
             netflow_rows_skipped_total: None,
             netflow_pending_evicted_total: None,
             net_inactive_rules: None,
+            flow_sock_pending: None,
+            flow_sock_capacity: None,
+            flow_sock_forgotten_min: None,
         });
         emit_audit_for(
             &status_req,

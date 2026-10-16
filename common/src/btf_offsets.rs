@@ -1489,12 +1489,167 @@ pub const ITER_UBUF_VALUE_SLOT: u32 = 78;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
 pub const ITER_IOVEC_VALUE_SLOT: u32 = 79;
 
+// ───────────────────────────────────────
+//  LSM hook prototypes (lab PR 164).
+// ───────────────────────────────────────
+//
+// An LSM program reads its hook's arguments by position in its context
+// (`ctx[i]`), and a kernel that inserts an argument moves every later one:
+// from 6.9 `inode_setattr` takes `(struct mnt_idmap *, struct dentry *,
+// struct iattr *)`, where 6.8 and older take `(struct dentry *, struct
+// iattr *)`; from 5.12 `inode_setxattr` and `inode_removexattr` take a
+// `struct user_namespace *` (6.3: `struct mnt_idmap *`) before the
+// dentry, where 5.7 to 5.11 (5.10 LTS) start with the dentry. The agent
+// reads each hook's prototype from the BTF function the kernel generates
+// for it (`bpf_lsm_<hook>`).
+
+/// An argument whose position is resolved from the running kernel and
+/// published in the `BTF_OFFSETS` map, from which the program reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct HookArgSpec {
+    /// Slot-table identifier.
+    pub name: &'static str,
+    /// BTF function of the hook (`bpf_lsm_<hook>`).
+    pub func: &'static str,
+    /// The argument is a pointer to the struct of this name, and no other
+    /// argument of the prototype is.
+    pub pointee: &'static str,
+    /// The argument right after it must point to this type (a struct, or
+    /// a scalar such as `char`), which the program may read as well. A
+    /// prototype of another shape is not guessed at: the slot is then
+    /// [`BTF_OFFSETS_ABSENT`].
+    pub followed_by: Option<&'static str>,
+    /// Position on the build kernel (6.8). Informational only: the
+    /// program has no compiled fallback, an unarmed or absent slot makes
+    /// it read nothing (`agent-ebpf/src/btf_offsets.rs::hook_arg`).
+    pub compiled: u32,
+}
+
+/// The hook arguments read through `BTF_OFFSETS`. An absent one (no such
+/// hook, or a prototype of another shape) is not an error at resolution:
+/// the agent does not attach the programs that read it (a deny program is
+/// then a deny-hook shortfall, the FIM setattr observer a FIM coverage
+/// shortfall) and attests it as a signed `subsystem_degraded`.
+pub const HOOK_ARGS: &[HookArgSpec] = &[
+    HookArgSpec {
+        name: "INODE_SETATTR_DENTRY_ARG",
+        func: "bpf_lsm_inode_setattr",
+        pointee: "dentry",
+        followed_by: Some("iattr"),
+        compiled: 0,
+    },
+    // The xattr deny reads the attribute name right after the dentry.
+    HookArgSpec {
+        name: "INODE_SETXATTR_DENTRY_ARG",
+        func: "bpf_lsm_inode_setxattr",
+        pointee: "dentry",
+        followed_by: Some("char"),
+        compiled: 1,
+    },
+    HookArgSpec {
+        name: "INODE_REMOVEXATTR_DENTRY_ARG",
+        func: "bpf_lsm_inode_removexattr",
+        pointee: "dentry",
+        followed_by: Some("char"),
+        compiled: 1,
+    },
+];
+
+/// Hook-argument slots follow the tracepoint slots.
+pub const HOOK_ARG_SLOT_TABLE: &[(&str, u32)] = &[
+    ("INODE_SETATTR_DENTRY_ARG", 89),
+    ("INODE_SETXATTR_DENTRY_ARG", 90),
+    ("INODE_REMOVEXATTR_DENTRY_ARG", 91),
+];
+
+/// Slot of the position of `inode_setattr`'s dentry: 0 up to 6.8, 1 from
+/// 6.9.
+pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 89;
+/// Slot of the position of `inode_setxattr`'s dentry: 0 on 5.7 to 5.11,
+/// 1 from 5.12. The attribute name follows it.
+pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 90;
+/// Slot of the position of `inode_removexattr`'s dentry (as
+/// `inode_setxattr`).
+pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 91;
+
+/// Upper bound on a resolved position: every hook the agent attaches has
+/// at most six arguments. The eBPF reader bounds the slot value by it.
+pub const HOOK_ARG_MAX: u32 = 6;
+
+/// An argument read at a fixed position. Its hook has kept that position
+/// on every kernel checked (`lsm_hook_defs.h` of 5.15, 6.1, 6.8, 6.9 and
+/// 6.12, the BTF of the 6.18 WSL2 host), so the program reads the
+/// compiled position, and the agent checks at boot (and `--btf-check`
+/// offline) that the running kernel's prototype, a vendor kernel's
+/// included, still has a pointer to `pointee` there.
+/// A mismatch refuses the start like a missing field (BUG-036): the
+/// program would read another argument. A hook the kernel does not have
+/// (`inode_set_acl` before 6.2) is not checked: its program does not
+/// attach. Only pointer arguments are listed; a prototype that shifts
+/// moves them as well.
+#[derive(Debug, Clone, Copy)]
+pub struct HookArgCheck {
+    /// BTF function of the hook (`bpf_lsm_<hook>`).
+    pub func: &'static str,
+    /// Position the program reads.
+    pub position: u32,
+    /// The struct (or union) the argument points to.
+    pub pointee: &'static str,
+}
+
+const fn check(func: &'static str, position: u32, pointee: &'static str) -> HookArgCheck {
+    HookArgCheck {
+        func,
+        position,
+        pointee,
+    }
+}
+
+/// Every pointer argument the LSM programs of `agent-ebpf` read at a fixed
+/// position (`inode_protect.rs`, `fim_watch.rs`, `open_sensor.rs`,
+/// `bpf_defense.rs`, `ptrace_check.rs`, `task_kill.rs`, `exec_lsm.rs`,
+/// `module_load.rs`, `sensor_probe.rs`).
+pub const HOOK_ARG_CHECKS: &[HookArgCheck] = &[
+    check("bpf_lsm_inode_unlink", 0, "inode"),
+    check("bpf_lsm_inode_unlink", 1, "dentry"),
+    check("bpf_lsm_inode_rmdir", 0, "inode"),
+    check("bpf_lsm_inode_rmdir", 1, "dentry"),
+    check("bpf_lsm_inode_rename", 0, "inode"),
+    check("bpf_lsm_inode_rename", 1, "dentry"),
+    check("bpf_lsm_inode_rename", 2, "inode"),
+    check("bpf_lsm_inode_rename", 3, "dentry"),
+    check("bpf_lsm_inode_create", 0, "inode"),
+    check("bpf_lsm_inode_create", 1, "dentry"),
+    check("bpf_lsm_inode_mkdir", 0, "inode"),
+    check("bpf_lsm_inode_mknod", 0, "inode"),
+    check("bpf_lsm_inode_symlink", 0, "inode"),
+    check("bpf_lsm_inode_link", 0, "dentry"),
+    check("bpf_lsm_inode_link", 1, "inode"),
+    // 6.2+ (the xattr hooks are in HOOK_ARGS): `(idmap, dentry, acl_name…)`.
+    check("bpf_lsm_inode_set_acl", 1, "dentry"),
+    check("bpf_lsm_inode_remove_acl", 1, "dentry"),
+    check("bpf_lsm_inode_post_setxattr", 0, "dentry"),
+    check("bpf_lsm_file_open", 0, "file"),
+    check("bpf_lsm_file_ioctl", 0, "file"),
+    check("bpf_lsm_file_permission", 0, "file"),
+    check("bpf_lsm_file_free_security", 0, "file"),
+    check("bpf_lsm_kernel_read_file", 0, "file"),
+    check("bpf_lsm_bprm_check_security", 0, "linux_binprm"),
+    check("bpf_lsm_ptrace_access_check", 0, "task_struct"),
+    check("bpf_lsm_task_kill", 0, "task_struct"),
+    check("bpf_lsm_bpf_map", 0, "bpf_map"),
+    check("bpf_lsm_bpf", 1, "bpf_attr"),
+];
+
 /// Slot 0 value once the agent has written every resolved offset.
 pub const BTF_OFFSETS_MAGIC: u32 = 0xB7F0_0FF5;
 /// Map size: the magic slot, one slot per revalidated offset, one per enum
-/// value, one per tracepoint field.
-pub const BTF_OFFSETS_SLOTS: u32 =
-    1 + REVALIDATE.len() as u32 + ENUM_VALUES.len() as u32 + TRACEPOINT_FIELDS.len() as u32;
+/// value, one per tracepoint field, one per hook argument.
+pub const BTF_OFFSETS_SLOTS: u32 = 1
+    + REVALIDATE.len() as u32
+    + ENUM_VALUES.len() as u32
+    + TRACEPOINT_FIELDS.len() as u32
+    + HOOK_ARGS.len() as u32;
 
 #[cfg(test)]
 mod tests {
@@ -1525,7 +1680,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 89);
+        assert_eq!(BTF_OFFSETS_SLOTS, 92);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1558,5 +1713,57 @@ mod tests {
         assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 80);
         assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 83);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
+    }
+
+    /// Lab PR 164: hook-argument slots follow the tracepoint slots, one per
+    /// spec in order, inside the map.
+    #[test]
+    fn hook_arg_slot_table_matches_specs() {
+        assert_eq!(HOOK_ARG_SLOT_TABLE.len(), HOOK_ARGS.len());
+        let first =
+            REVALIDATE.len() as u32 + ENUM_VALUES.len() as u32 + TRACEPOINT_FIELDS.len() as u32 + 1;
+        for (i, (spec, (name, slot))) in HOOK_ARGS.iter().zip(HOOK_ARG_SLOT_TABLE).enumerate() {
+            assert_eq!(
+                spec.name, *name,
+                "hook-argument slot table out of order at {i}"
+            );
+            assert_eq!(*slot, first + i as u32);
+            assert!(*slot < BTF_OFFSETS_SLOTS);
+            assert!(spec.compiled < HOOK_ARG_MAX);
+            assert!(spec.func.starts_with("bpf_lsm_"));
+        }
+        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 89);
+        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 90);
+        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 91);
+        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 89));
+        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 90));
+        assert_eq!(HOOK_ARG_SLOT_TABLE[2], ("INODE_REMOVEXATTR_DENTRY_ARG", 91));
+        // a position and the argument after it stay below the bound
+        assert!(HOOK_ARGS.iter().all(|h| h.compiled + 1 < HOOK_ARG_MAX));
+    }
+
+    /// Lab PR 164: the fixed-position checks name hook functions, stay below
+    /// the position bound, are not listed twice, and never cover the hook
+    /// whose position is resolved at runtime.
+    #[test]
+    fn hook_arg_checks_are_well_formed() {
+        let mut seen: alloc::vec::Vec<(&str, u32)> = alloc::vec::Vec::new();
+        for c in HOOK_ARG_CHECKS {
+            assert!(c.func.starts_with("bpf_lsm_"), "{}", c.func);
+            assert!(c.position < HOOK_ARG_MAX, "{} {}", c.func, c.position);
+            assert!(
+                !seen.contains(&(c.func, c.position)),
+                "{} {} twice",
+                c.func,
+                c.position
+            );
+            seen.push((c.func, c.position));
+            assert!(
+                HOOK_ARGS.iter().all(|h| h.func != c.func),
+                "{} is resolved at runtime, not checked at a fixed position",
+                c.func
+            );
+        }
+        assert_eq!(HOOK_ARG_CHECKS.len(), 28);
     }
 }

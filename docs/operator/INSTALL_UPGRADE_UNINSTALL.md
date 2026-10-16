@@ -499,9 +499,12 @@ pins it recreates by its predecessor's hooks.
   first time — see `docs/TAPPA7_PREREQ.md`.
 - A kernel upgrade: the agent revalidates BTF offsets at boot and refuses
   to start on a mismatch rather than run with wrong offsets; the
-  supported-kernel matrix is the next item on the reliability list. A
-  kernel from 6.9 on is not verified: the `inode_setattr` hook gained an
-  argument there (`KERNEL_COMPATIBILITY.md`, "Kernels from 6.9").
+  supported-kernel matrix is the next item on the reliability list. From
+  6.9 the `inode_setattr` hook gained an argument; the agent reads its
+  position from the running kernel (lab PR 164), and refuses to start when
+  a hook argument it reads at a fixed position has moved
+  (`KERNEL_COMPATIBILITY.md`, "Kernels from 6.9"). Verified on Debian 13
+  (6.12) on 2026-10-16 (lab PR 164).
 
 ## 5. Release artefacts and how to verify them
 

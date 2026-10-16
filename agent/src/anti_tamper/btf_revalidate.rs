@@ -38,8 +38,9 @@ use std::fs;
 use std::sync::OnceLock;
 
 use common::btf_offsets::{
-    EnumSpec, OffsetSpec, BTF_MODULE_STRUCTS, BTF_OFFSETS_ABSENT, BTF_OFFSETS_MAGIC,
-    ENUM_SLOT_TABLE, ENUM_VALUES, REVALIDATE, SLOT_TABLE,
+    EnumSpec, HookArgCheck, HookArgSpec, OffsetSpec, BTF_MODULE_STRUCTS, BTF_OFFSETS_ABSENT,
+    BTF_OFFSETS_MAGIC, ENUM_SLOT_TABLE, ENUM_VALUES, HOOK_ARGS, HOOK_ARG_CHECKS, HOOK_ARG_MAX,
+    HOOK_ARG_SLOT_TABLE, REVALIDATE, SLOT_TABLE,
 };
 
 /// The running kernel's BTF, exported by the kernel when built with
@@ -159,6 +160,108 @@ pub struct ResolvedOffsets {
     /// the module there is nothing of its types to read (review 55:
     /// btrfs).
     pub modules_not_loaded: Vec<&'static str>,
+    /// Lab PR 164: fixed-position hook arguments ([`HOOK_ARG_CHECKS`])
+    /// found where the programs read them. Hooks this kernel does not have
+    /// are not counted.
+    pub hook_args_checked: usize,
+}
+
+impl ResolvedOffsets {
+    /// Lab PR 164: position of the [`HOOK_ARGS`] entry `name` on this
+    /// kernel, or `None` when it was not resolved.
+    pub fn hook_arg_position(&self, name: &str) -> Option<u32> {
+        let slot = HOOK_ARG_SLOT_TABLE
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, s)| *s)?;
+        self.values
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, v)| *v)
+            .filter(|v| *v < HOOK_ARG_MAX)
+    }
+
+    /// Lab PR 164: position of `inode_setattr`'s dentry on this kernel, or
+    /// `None` when it was not resolved (the setattr deny and the FIM
+    /// setattr observer are then not attached: they would read another
+    /// argument).
+    pub fn setattr_dentry_arg(&self) -> Option<u32> {
+        self.hook_arg_position("INODE_SETATTR_DENTRY_ARG")
+    }
+
+    /// Lab PR 164: the sentence for the signed `subsystem_degraded` entry
+    /// when a hook argument was not resolved; `None` when all were.
+    pub fn hook_args_degraded_detail(&self) -> Option<String> {
+        let names: Vec<String> = self
+            .absent
+            .iter()
+            .filter(|m| m.struct_name.starts_with(LSM_FUNC_PREFIX))
+            .map(|m| {
+                format!(
+                    "{} ({}): {}",
+                    m.struct_name,
+                    m.detail,
+                    hook_arg_effect(m.struct_name)
+                )
+            })
+            .collect();
+        (!names.is_empty()).then(|| {
+            format!(
+                "LSM hook argument not resolved from the kernel's BTF, its programs not \
+                 attached: {}",
+                names.join("; ")
+            )
+        })
+    }
+}
+
+/// Lab PR 164: what is lost when the programs on hook function `func` are
+/// not attached for want of an argument position.
+pub fn hook_arg_effect(func: &str) -> &'static str {
+    match func {
+        "bpf_lsm_inode_setattr" => {
+            "the anti-tamper setattr deny and the FIM setattr observer (chmod, chown and \
+             truncate of a protected or watched file are neither refused nor seen)"
+        }
+        "bpf_lsm_inode_setxattr" | "bpf_lsm_inode_removexattr" => {
+            "the anti-tamper xattr deny (an extended attribute of a protected file can be \
+             set or removed)"
+        }
+        _ => "the programs reading this argument",
+    }
+}
+
+/// Lab PR 164: whether the programs on LSM hook `hook` may attach this
+/// boot. `None`: the hook has no argument resolved at runtime (its
+/// positions are fixed and checked at resolution). `Some(Ok(pos))`: the
+/// argument's position on this kernel. `Some(Err(why))`: unknown (no BTF
+/// resolution published, or a prototype of another shape); the programs
+/// would read nothing in the kernel, so they are not attached and the
+/// shortfall is reported rather than hidden behind an attached hook.
+pub fn hook_attach_gate(hook: &str) -> Option<Result<u32, String>> {
+    hook_gate(resolved(), hook)
+}
+
+fn hook_gate(r: Option<&ResolvedOffsets>, hook: &str) -> Option<Result<u32, String>> {
+    let spec = HOOK_ARGS
+        .iter()
+        .find(|h| h.func.strip_prefix(LSM_FUNC_PREFIX) == Some(hook))?;
+    let Some(r) = r else {
+        return Some(Err(format!(
+            "no kernel BTF resolution this boot: the position of {hook}'s {} is unknown",
+            spec.pointee
+        )));
+    };
+    if let Some(pos) = r.hook_arg_position(spec.name) {
+        return Some(Ok(pos));
+    }
+    let why = r
+        .absent
+        .iter()
+        .find(|m| m.name == spec.name)
+        .map(|m| m.detail.clone())
+        .unwrap_or_else(|| "argument position not resolved".to_string());
+    Some(Err(format!("{}: {why}", spec.func)))
 }
 
 /// Outcome of [`resolve_offsets`].
@@ -222,7 +325,14 @@ pub fn resolve_offsets_from(path: &std::path::Path) -> ResolveOutcome {
         .then(|| path.parent())
         .flatten();
     let modules = |m: &str| dir.and_then(|d| fs::read(d.join(m)).ok());
-    resolve_with(&btf, REVALIDATE, ENUM_VALUES, &modules)
+    resolve_with(
+        &btf,
+        REVALIDATE,
+        ENUM_VALUES,
+        HOOK_ARGS,
+        HOOK_ARG_CHECKS,
+        &modules,
+    )
 }
 
 /// `spec` against `t`, trying the alternative paths in order.
@@ -242,10 +352,17 @@ fn resolve_spec<T: TypeTable>(t: &T, spec: &OffsetSpec) -> Result<usize, Resolve
 /// `modules(name)`: the BTF of kernel module `name`, `None` when it is not
 /// loaded. Consulted only for the structs [`BTF_MODULE_STRUCTS`] lists,
 /// when vmlinux does not carry them (module not built in).
+///
+/// Lab PR 164: `hooks` are the LSM hook arguments whose position is
+/// published in the map (absent when the prototype has another shape),
+/// `checks` the fixed positions verified against the kernel's prototypes
+/// (a mismatch refuses, like a missing field).
 fn resolve_with(
     btf: &Btf,
     specs: &[OffsetSpec],
     enums: &[EnumSpec],
+    hooks: &[HookArgSpec],
+    checks: &[HookArgCheck],
     modules: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> ResolveOutcome {
     let mut values = Vec::with_capacity(specs.len());
@@ -373,12 +490,69 @@ fn resolve_with(
             }),
         }
     }
+    for h in hooks {
+        let slot = HOOK_ARG_SLOT_TABLE
+            .iter()
+            .find(|(n, _)| *n == h.name)
+            .map(|(_, s)| *s);
+        match (btf.resolve_hook_arg(h), slot) {
+            (Ok(pos), Some(slot)) => {
+                if pos != h.compiled {
+                    drifted.push(Mismatch {
+                        name: h.name,
+                        struct_name: h.func,
+                        expected: h.compiled as usize,
+                        actual: Some(pos as usize),
+                        detail: format!(
+                            "argument position compiled {} → runtime {pos}",
+                            h.compiled
+                        ),
+                    });
+                }
+                values.push((slot, pos));
+            }
+            (Err(e), Some(slot)) => {
+                values.push((slot, BTF_OFFSETS_ABSENT));
+                absent.push(Mismatch {
+                    name: h.name,
+                    struct_name: h.func,
+                    expected: h.compiled as usize,
+                    actual: None,
+                    detail: e.to_string(),
+                });
+            }
+            (_, None) => missing.push(Mismatch {
+                name: h.name,
+                struct_name: h.func,
+                expected: h.compiled as usize,
+                actual: None,
+                detail:
+                    "no BTF_OFFSETS slot for this hook argument (HOOK_ARG_SLOT_TABLE out of sync)"
+                        .into(),
+            }),
+        }
+    }
+    let mut hook_args_checked = 0usize;
+    for c in checks {
+        match btf.check_hook_arg(c) {
+            Ok(true) => hook_args_checked += 1,
+            Ok(false) => {}
+            Err(e) => missing.push(Mismatch {
+                name: c.func,
+                struct_name: c.pointee,
+                expected: c.position as usize,
+                actual: None,
+                detail: e.to_string(),
+            }),
+        }
+    }
     if missing.is_empty() {
         ResolveOutcome::Resolved(ResolvedOffsets {
             values,
             drifted,
             absent,
             modules_not_loaded,
+            hook_args_checked,
         })
     } else {
         ResolveOutcome::Refuse(RefuseReason::Drift(missing))
@@ -667,7 +841,14 @@ fn check_format_field(
 pub fn fuzz_parse_and_resolve(data: &[u8]) -> bool {
     match Btf::parse(data) {
         Ok(btf) => {
-            let _ = resolve_with(&btf, REVALIDATE, ENUM_VALUES, &|_| None);
+            let _ = resolve_with(
+                &btf,
+                REVALIDATE,
+                ENUM_VALUES,
+                HOOK_ARGS,
+                HOOK_ARG_CHECKS,
+                &|_| None,
+            );
             let _ = revalidate_with(&btf, REVALIDATE);
             true
         }
@@ -813,6 +994,11 @@ enum ResolveError {
     BitfieldNotByteAligned(String),
     /// A module's BTF was needed but is missing or unparseable.
     ModuleBtf(String),
+    /// Lab PR 164: the kernel has no BTF function for this LSM hook.
+    FuncNotFound(String),
+    /// Lab PR 164: the hook's prototype does not have the argument where,
+    /// or in the shape, the program expects it.
+    Prototype(String),
 }
 
 impl fmt::Display for ResolveError {
@@ -825,6 +1011,8 @@ impl fmt::Display for ResolveError {
                 write!(f, "field is bit-packed, not byte-aligned ({s})")
             }
             ResolveError::ModuleBtf(s) => write!(f, "module BTF: {s}"),
+            ResolveError::FuncNotFound(s) => write!(f, "function '{s}' not in kernel BTF"),
+            ResolveError::Prototype(s) => write!(f, "unexpected hook prototype: {s}"),
         }
     }
 }
@@ -862,26 +1050,41 @@ struct Member {
 
 /// The subset of a BTF type we need to navigate offsets.
 enum Ty {
-    /// A struct or union with its members.
-    Composite { members: Vec<Member> },
+    /// A struct or union with its name and members.
+    Composite { name_off: u32, members: Vec<Member> },
     /// A type that transparently forwards to another (typedef / const /
     /// volatile / restrict) — followed during navigation.
     Forward { type_id: u32 },
     /// A (32-bit) enum: `(name_off, value)` per enumerator — looked up
     /// by name for the enum-value relocations (multi-kernel, level 2).
     Enum { values: Vec<(u32, i32)> },
-    /// Anything we don't navigate into (int, ptr, array, …). A
-    /// pointer is Opaque on purpose: field paths never cross a pointer.
+    /// A pointer, for the hook prototypes (lab PR 164). Field paths never
+    /// cross one: navigation treats it as opaque.
+    Ptr { type_id: u32 },
+    /// A forward declaration of a struct or union, by name.
+    Fwd { name_off: u32 },
+    /// A function prototype: the type of each parameter.
+    FuncProto { params: Vec<u32> },
+    /// An integer type, by name (`char`, for a hook's `const char *`).
+    Int { name_off: u32 },
+    /// Anything we don't navigate into (int, array, func, …).
     Opaque,
 }
 
 /// Parsed kernel BTF: types indexed by id (0 = void), the string
-/// section, and a name→id map for named structs/unions.
+/// section, a name→id map for named structs/unions, and the prototypes
+/// of the LSM hook functions.
 struct Btf {
     types: Vec<Ty>,
     strings: Vec<u8>,
     name_to_id: HashMap<String, u32>,
+    /// Lab PR 164: `bpf_lsm_<hook>` → its FUNC_PROTO type id. Only the
+    /// LSM hook functions are kept (a vmlinux has tens of thousands).
+    lsm_funcs: HashMap<String, u32>,
 }
+
+/// Prefix of the BTF functions the kernel generates for its LSM hooks.
+const LSM_FUNC_PREFIX: &str = "bpf_lsm_";
 
 impl Btf {
     fn parse(data: &[u8]) -> Result<Btf, ParseError> {
@@ -946,6 +1149,7 @@ impl Btf {
             vec![Ty::Opaque]
         };
         let mut name_to_id: HashMap<String, u32> = HashMap::new();
+        let mut lsm_funcs: HashMap<String, u32> = HashMap::new();
 
         let mut p = tstart;
         while p + 12 <= tend {
@@ -991,19 +1195,36 @@ impl Btf {
                             name_to_id.entry(nm).or_insert(id);
                         }
                     }
-                    types.push(Ty::Composite { members });
+                    types.push(Ty::Composite { name_off, members });
                 }
-                KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT => {
+                // A type tag (`__user`, `__rcu`, …) qualifies the type it
+                // refers to, like a cv-qualifier.
+                KIND_TYPEDEF | KIND_CONST | KIND_VOLATILE | KIND_RESTRICT | KIND_TYPE_TAG => {
                     types.push(Ty::Forward {
                         type_id: size_or_type,
                     });
                 }
-                // Fixed-size or no trailing data — skip the trailing and
-                // mark Opaque (we never navigate into these).
-                KIND_PTR | KIND_FWD | KIND_FUNC | KIND_FLOAT | KIND_TYPE_TAG => {
+                // No trailing data.
+                KIND_PTR => types.push(Ty::Ptr {
+                    type_id: size_or_type,
+                }),
+                KIND_FWD => types.push(Ty::Fwd { name_off }),
+                KIND_FUNC => {
+                    if let Some(nm) = name_of(name_off) {
+                        if nm.starts_with(LSM_FUNC_PREFIX) {
+                            lsm_funcs.entry(nm).or_insert(size_or_type);
+                        }
+                    }
                     types.push(Ty::Opaque);
                 }
-                KIND_INT | KIND_VAR | KIND_DECL_TAG => {
+                KIND_FLOAT => {
+                    types.push(Ty::Opaque);
+                }
+                KIND_INT => {
+                    p += 4;
+                    types.push(Ty::Int { name_off });
+                }
+                KIND_VAR | KIND_DECL_TAG => {
                     p += 4;
                     types.push(Ty::Opaque);
                 }
@@ -1030,8 +1251,17 @@ impl Btf {
                     types.push(Ty::Enum { values });
                 }
                 KIND_FUNC_PROTO => {
+                    if p + vlen * 8 > tend {
+                        return Err(ParseError(format!("prototype params OOB in type {id}")));
+                    }
+                    // `(name_off, type)` per parameter; a variadic one ends
+                    // with type 0 (none of the LSM hooks is variadic).
+                    let mut params = Vec::with_capacity(vlen);
+                    for i in 0..vlen {
+                        params.push(r.u32(p + i * 8 + 4)?);
+                    }
                     p += vlen * 8;
-                    types.push(Ty::Opaque);
+                    types.push(Ty::FuncProto { params });
                 }
                 KIND_DATASEC | KIND_ENUM64 => {
                     p += vlen * 12;
@@ -1060,7 +1290,137 @@ impl Btf {
             types,
             strings,
             name_to_id,
+            lsm_funcs,
         })
+    }
+
+    /// Lab PR 164: the parameter types of LSM hook function `func`.
+    fn hook_params(&self, func: &str) -> Result<&[u32], ResolveError> {
+        let proto = *self
+            .lsm_funcs
+            .get(func)
+            .ok_or_else(|| ResolveError::FuncNotFound(func.to_string()))?;
+        match self.types.get(proto as usize) {
+            Some(Ty::FuncProto { params }) => Ok(params),
+            _ => Err(ResolveError::Prototype(format!(
+                "{func}: no function prototype"
+            ))),
+        }
+    }
+
+    /// What parameter type `id` points to, through typedefs,
+    /// cv-qualifiers and type tags on both sides of the pointer: the name
+    /// of a struct or union (`true`) or of an integer type (`false`, the
+    /// `char` of a `const char *`). `None` for any other type.
+    fn pointee(&self, id: u32) -> Option<(&str, bool)> {
+        let mut id = id;
+        let mut through_ptr = false;
+        for _ in 0..64 {
+            let (name_off, is_struct) = match self.types.get(id as usize)? {
+                Ty::Forward { type_id } => {
+                    id = *type_id;
+                    continue;
+                }
+                Ty::Ptr { type_id } if !through_ptr => {
+                    through_ptr = true;
+                    id = *type_id;
+                    continue;
+                }
+                Ty::Composite { name_off, .. } | Ty::Fwd { name_off } if through_ptr => {
+                    (*name_off, true)
+                }
+                Ty::Int { name_off } if through_ptr => (*name_off, false),
+                _ => return None,
+            };
+            return name_at(&self.strings, name_off)
+                .ok()
+                .filter(|n| !n.is_empty())
+                .map(|n| (n, is_struct));
+        }
+        None
+    }
+
+    /// Name of the struct or union that parameter type `id` points to.
+    fn pointee_name(&self, id: u32) -> Option<&str> {
+        self.pointee(id).filter(|(_, s)| *s).map(|(n, _)| n)
+    }
+
+    /// `func(struct a *, char *, ?, …)`, for the error messages.
+    fn describe_prototype(&self, func: &str, params: &[u32]) -> String {
+        let args: Vec<String> = params
+            .iter()
+            .map(|t| match self.pointee(*t) {
+                Some((n, true)) => format!("struct {n} *"),
+                Some((n, false)) => format!("{n} *"),
+                None => "?".to_string(),
+            })
+            .collect();
+        format!("{func}({})", args.join(", "))
+    }
+
+    /// Lab PR 164: position of `spec`'s argument in the running kernel's
+    /// prototype. The argument must be the only pointer to
+    /// `spec.pointee`, followed by a pointer to `spec.followed_by` when
+    /// set, and below [`HOOK_ARG_MAX`]; any other shape is an error, never
+    /// a guess.
+    fn resolve_hook_arg(&self, spec: &HookArgSpec) -> Result<u32, ResolveError> {
+        let params = self.hook_params(spec.func)?;
+        let hits: Vec<usize> = params
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| self.pointee_name(**t) == Some(spec.pointee))
+            .map(|(i, _)| i)
+            .collect();
+        let shape = || self.describe_prototype(spec.func, params);
+        let [pos] = hits[..] else {
+            return Err(ResolveError::Prototype(format!(
+                "{}: {} arguments are a struct {} *, expected one",
+                shape(),
+                hits.len(),
+                spec.pointee
+            )));
+        };
+        if let Some(next) = spec.followed_by {
+            if params
+                .get(pos + 1)
+                .and_then(|t| self.pointee(*t))
+                .map(|(n, _)| n)
+                != Some(next)
+            {
+                return Err(ResolveError::Prototype(format!(
+                    "{}: the struct {} * is not followed by a pointer to {next}",
+                    shape(),
+                    spec.pointee
+                )));
+            }
+        }
+        if pos as u32 >= HOOK_ARG_MAX {
+            return Err(ResolveError::Prototype(format!(
+                "{}: argument {pos} is beyond the {HOOK_ARG_MAX} the programs read",
+                shape()
+            )));
+        }
+        Ok(pos as u32)
+    }
+
+    /// Lab PR 164: `Ok(true)` when the running kernel's prototype has a
+    /// pointer to `c.pointee` at `c.position`, `Ok(false)` when the kernel
+    /// has no such hook (its program does not attach), an error otherwise.
+    fn check_hook_arg(&self, c: &HookArgCheck) -> Result<bool, ResolveError> {
+        let params = match self.hook_params(c.func) {
+            Ok(p) => p,
+            Err(ResolveError::FuncNotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        match params.get(c.position as usize) {
+            Some(t) if self.pointee_name(*t) == Some(c.pointee) => Ok(true),
+            _ => Err(ResolveError::Prototype(format!(
+                "{}: argument {} is not a struct {} *, where the program reads it",
+                self.describe_prototype(c.func, params),
+                c.position,
+                c.pointee
+            ))),
+        }
     }
 
     /// Value of enumerator `value_name` in the named enum `enum_name`.
@@ -1103,7 +1463,12 @@ trait TypeTable {
             match self.ty(id)? {
                 Ty::Composite { .. } => return Some(id),
                 Ty::Forward { type_id } => id = *type_id,
-                Ty::Enum { .. } | Ty::Opaque => return None,
+                Ty::Enum { .. }
+                | Ty::Ptr { .. }
+                | Ty::Fwd { .. }
+                | Ty::FuncProto { .. }
+                | Ty::Int { .. }
+                | Ty::Opaque => return None,
             }
         }
         None
@@ -1115,7 +1480,7 @@ trait TypeTable {
         if depth > MAX_DESCENT {
             return None;
         }
-        let Ty::Composite { members } = self.ty(struct_id)? else {
+        let Ty::Composite { members, .. } = self.ty(struct_id)? else {
             return None;
         };
         for m in members {
@@ -1656,6 +2021,36 @@ mod tests {
             id
         }
 
+        /// A type with no trailing data (`ptr`, `const`, `type_tag`, `fwd`).
+        fn plain(&mut self, name: Option<&str>, kind: u32, refers_to: u32) -> u32 {
+            let n = name.map(|s| self.str(s)).unwrap_or(0);
+            self.push_common(n, kind, 0, false, refers_to);
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
+        fn ptr(&mut self, to: u32) -> u32 {
+            self.plain(None, KIND_PTR, to)
+        }
+
+        /// `name(params…)` returning `ret`: a FUNC_PROTO and its FUNC.
+        fn func(&mut self, name: &str, ret: u32, params: &[u32]) -> u32 {
+            self.push_common(0, KIND_FUNC_PROTO, params.len() as u32, false, ret);
+            for &t in params {
+                self.types.extend_from_slice(&0u32.to_le_bytes());
+                self.types.extend_from_slice(&t.to_le_bytes());
+            }
+            let proto = self.next_id;
+            self.next_id += 1;
+            let n = self.str(name);
+            // vlen of a FUNC is its linkage (1 = global).
+            self.push_common(n, KIND_FUNC, 1, false, proto);
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
         fn build(self) -> Vec<u8> {
             let mut out = Vec::new();
             out.extend_from_slice(&BTF_MAGIC.to_le_bytes()); // magic
@@ -1851,7 +2246,8 @@ mod tests {
         // the BTF_OFFSETS map); only a missing field is a failure.
         match resolve_offsets() {
             ResolveOutcome::Resolved(r) => {
-                let expected = REVALIDATE.len() + ENUM_VALUES.len();
+                // Lab PR 164: one slot per hook argument too.
+                let expected = REVALIDATE.len() + ENUM_VALUES.len() + HOOK_ARGS.len();
                 assert_eq!(
                     r.values.len(),
                     expected,
@@ -1908,7 +2304,7 @@ mod tests {
                 optional: false,
             },
         ];
-        match resolve_with(&btf, specs, &[], &|_| None) {
+        match resolve_with(&btf, specs, &[], &[], &[], &|_| None) {
             ResolveOutcome::Resolved(r) => {
                 assert_eq!(r.values, vec![(SLOT_TABLE[0].1, 0), (SLOT_TABLE[1].1, 8)]);
                 assert_eq!(r.drifted.len(), 1);
@@ -1930,7 +2326,7 @@ mod tests {
             optional: false,
         }];
         assert!(matches!(
-            resolve_with(&btf, specs, &[], &|_| None),
+            resolve_with(&btf, specs, &[], &[], &[], &|_| None),
             ResolveOutcome::Refuse(RefuseReason::Drift(m)) if m.len() == 1 && m[0].actual.is_none()
         ));
     }
@@ -1957,7 +2353,7 @@ mod tests {
             alt_paths: &[],
             optional: true,
         }];
-        match resolve_with(&btf, specs, &[], &|_| None) {
+        match resolve_with(&btf, specs, &[], &[], &[], &|_| None) {
             ResolveOutcome::Resolved(r) => {
                 assert_eq!(r.values, vec![(SLOT_TABLE[0].1, BTF_OFFSETS_ABSENT)]);
                 assert_eq!(r.absent.len(), 1);
@@ -2029,7 +2425,7 @@ mod tests {
         let specs = btrfs_specs();
         assert_eq!(specs.len(), 3);
         let loaded = |m: &str| (m == "btrfs").then(|| module.clone());
-        match resolve_with(&base, &specs, &[], &loaded) {
+        match resolve_with(&base, &specs, &[], &[], &[], &loaded) {
             ResolveOutcome::Resolved(r) => {
                 let slot = |n: &str| SLOT_TABLE.iter().find(|(s, _)| *s == n).unwrap().1;
                 assert!(r.values.contains(&(slot("BTRFS_INODE_ROOT_OFFSET"), 0)));
@@ -2047,7 +2443,7 @@ mod tests {
     fn module_not_loaded_is_unset_not_degraded() {
         let (base, _) = base_and_module();
         let base = Btf::parse(&base).expect("base parses");
-        match resolve_with(&base, &btrfs_specs(), &[], &|_| None) {
+        match resolve_with(&base, &btrfs_specs(), &[], &[], &[], &|_| None) {
             ResolveOutcome::Resolved(r) => {
                 assert_eq!(r.values.len(), 3);
                 assert!(r.values.iter().all(|(_, v)| *v == BTF_OFFSETS_ABSENT));
@@ -2063,7 +2459,7 @@ mod tests {
         let (base, _) = base_and_module();
         let base = Btf::parse(&base).expect("base parses");
         let garbage = |_: &str| Some(vec![0u8; 8]);
-        match resolve_with(&base, &btrfs_specs(), &[], &garbage) {
+        match resolve_with(&base, &btrfs_specs(), &[], &[], &[], &garbage) {
             ResolveOutcome::Resolved(r) => {
                 assert_eq!(r.absent.len(), 3);
                 assert!(r.absent[0].detail.contains("module BTF: btrfs"));
@@ -2071,5 +2467,304 @@ mod tests {
             }
             other => panic!("expected Resolved with absent entries, got {other:?}"),
         }
+    }
+
+    // ── Lab PR 164: LSM hook prototypes ──────────────────────────────
+
+    use common::btf_offsets::{
+        INODE_REMOVEXATTR_DENTRY_ARG_SLOT, INODE_SETATTR_DENTRY_ARG_SLOT,
+        INODE_SETXATTR_DENTRY_ARG_SLOT,
+    };
+
+    /// The shapes of `bpf_lsm_inode_setattr` the tests build.
+    enum Setattr {
+        /// 6.8 and older: `(dentry, iattr)`.
+        UpTo68,
+        /// 6.9 and later: `(idmap, dentry, iattr)`.
+        From69,
+        /// Two dentries: which one the hook means cannot be told.
+        TwoDentries,
+        /// The dentry not followed by the iattr.
+        NoIattrAfter,
+        /// No such function (no BPF LSM, or the hook renamed).
+        Absent,
+    }
+
+    /// The shapes of `bpf_lsm_inode_setxattr` / `_removexattr`.
+    #[derive(Clone, Copy)]
+    enum Xattr {
+        /// 5.7 to 5.11: `(dentry, name, …)`.
+        UpTo511,
+        /// 5.12 and later: `(mnt_userns | idmap, dentry, name, …)`.
+        From512,
+    }
+
+    /// A kernel BTF with the structs the hooks point to, the setattr hook
+    /// in `setattr`, the two xattr hooks in `xattr`, and `inode_set_acl`
+    /// with its dentry at `acl_dentry`.
+    fn hook_btf(setattr: Setattr, xattr: Xattr, acl_dentry: usize) -> Btf {
+        let mut b = BtfBuilder::new();
+        let int = b.int("int");
+        let ch = b.int("char");
+        let c_ch = b.plain(None, KIND_CONST, ch);
+        let p_name = b.ptr(c_ch);
+        let dentry = b.composite(Some("dentry"), false, false, &[]);
+        let iattr = b.composite(Some("iattr"), false, false, &[]);
+        let idmap = b.composite(Some("mnt_idmap"), false, false, &[]);
+        let p_dentry = b.ptr(dentry);
+        let p_iattr = b.ptr(iattr);
+        let p_idmap = b.ptr(idmap);
+        match setattr {
+            Setattr::UpTo68 => b.func("bpf_lsm_inode_setattr", int, &[p_dentry, p_iattr]),
+            Setattr::From69 => b.func("bpf_lsm_inode_setattr", int, &[p_idmap, p_dentry, p_iattr]),
+            Setattr::TwoDentries => {
+                b.func("bpf_lsm_inode_setattr", int, &[p_dentry, p_dentry, p_iattr])
+            }
+            Setattr::NoIattrAfter => {
+                b.func("bpf_lsm_inode_setattr", int, &[p_idmap, p_dentry, int])
+            }
+            Setattr::Absent => b.func("security_inode_setattr", int, &[p_idmap, p_dentry, p_iattr]),
+        };
+        let (set, remove): (Vec<u32>, Vec<u32>) = match xattr {
+            Xattr::UpTo511 => (
+                vec![p_dentry, p_name, int, int, int],
+                vec![p_dentry, p_name],
+            ),
+            Xattr::From512 => (
+                vec![p_idmap, p_dentry, p_name, int, int, int],
+                vec![p_idmap, p_dentry, p_name],
+            ),
+        };
+        b.func("bpf_lsm_inode_setxattr", int, &set);
+        b.func("bpf_lsm_inode_removexattr", int, &remove);
+        let mut acl = vec![p_idmap, int, p_name];
+        acl[acl_dentry] = p_dentry;
+        b.func("bpf_lsm_inode_set_acl", int, &acl);
+        Btf::parse(&b.build()).expect("hook fixture parses")
+    }
+
+    /// Resolution of the hook arguments only.
+    fn hooks_only(btf: &Btf) -> ResolvedOffsets {
+        match resolve_with(btf, &[], &[], HOOK_ARGS, &[], &|_| None) {
+            ResolveOutcome::Resolved(r) => r,
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    fn slot_value(r: &ResolvedOffsets, slot: u32) -> u32 {
+        r.values
+            .iter()
+            .find(|(s, _)| *s == slot)
+            .expect("slot written")
+            .1
+    }
+
+    #[test]
+    fn setattr_dentry_is_argument_0_up_to_6_8() {
+        let r = hooks_only(&hook_btf(Setattr::UpTo68, Xattr::From512, 1));
+        assert_eq!(slot_value(&r, INODE_SETATTR_DENTRY_ARG_SLOT), 0);
+        assert!(r.drifted.is_empty() && r.absent.is_empty());
+        assert_eq!(hook_gate(Some(&r), "inode_setattr").unwrap(), Ok(0));
+        assert_eq!(r.hook_args_degraded_detail(), None);
+    }
+
+    /// The lab follow-up: from 6.9 the dentry is argument 1. The code of
+    /// `main` read argument 0 (the `mnt_idmap`) whatever the kernel.
+    #[test]
+    fn setattr_dentry_is_argument_1_from_6_9() {
+        let r = hooks_only(&hook_btf(Setattr::From69, Xattr::From512, 1));
+        assert_eq!(slot_value(&r, INODE_SETATTR_DENTRY_ARG_SLOT), 1);
+        assert!(r.absent.is_empty());
+        assert_eq!(r.drifted.len(), 1);
+        assert_eq!(r.drifted[0].name, "INODE_SETATTR_DENTRY_ARG");
+        assert_eq!((r.drifted[0].expected, r.drifted[0].actual), (0, Some(1)));
+        assert_eq!(hook_gate(Some(&r), "inode_setattr").unwrap(), Ok(1));
+        assert_eq!(r.setattr_dentry_arg(), Some(1));
+    }
+
+    /// Found with the prototype check: on 5.7 to 5.11 (5.10 LTS) the xattr
+    /// hooks start with the dentry, where the deny read argument 1 (the
+    /// attribute name) as the dentry.
+    #[test]
+    fn xattr_dentry_follows_the_kernels_prototype() {
+        let old = hooks_only(&hook_btf(Setattr::UpTo68, Xattr::UpTo511, 1));
+        assert_eq!(slot_value(&old, INODE_SETXATTR_DENTRY_ARG_SLOT), 0);
+        assert_eq!(slot_value(&old, INODE_REMOVEXATTR_DENTRY_ARG_SLOT), 0);
+        assert_eq!(hook_gate(Some(&old), "inode_setxattr").unwrap(), Ok(0));
+        let new = hooks_only(&hook_btf(Setattr::From69, Xattr::From512, 1));
+        assert_eq!(slot_value(&new, INODE_SETXATTR_DENTRY_ARG_SLOT), 1);
+        assert_eq!(slot_value(&new, INODE_REMOVEXATTR_DENTRY_ARG_SLOT), 1);
+        assert_eq!(hook_gate(Some(&new), "inode_removexattr").unwrap(), Ok(1));
+        // a hook with fixed positions has no gate
+        assert!(hook_gate(Some(&new), "inode_unlink").is_none());
+    }
+
+    /// A prototype of another shape, or no hook function at all: the slot
+    /// is absent (the programs read nothing), the programs on the hook are
+    /// not attached, and the boot attests why. Never a guessed position.
+    #[test]
+    fn setattr_of_another_shape_is_absent_never_guessed() {
+        for (shape, why) in [
+            (Setattr::TwoDentries, "2 arguments are a struct dentry *"),
+            (Setattr::NoIattrAfter, "not followed by a pointer to iattr"),
+            (
+                Setattr::Absent,
+                "function 'bpf_lsm_inode_setattr' not in kernel BTF",
+            ),
+        ] {
+            let r = hooks_only(&hook_btf(shape, Xattr::From512, 1));
+            assert_eq!(
+                slot_value(&r, INODE_SETATTR_DENTRY_ARG_SLOT),
+                BTF_OFFSETS_ABSENT
+            );
+            assert_eq!(r.absent.len(), 1);
+            assert!(r.absent[0].detail.contains(why), "{}", r.absent[0].detail);
+            assert_eq!(r.setattr_dentry_arg(), None);
+            let gate = hook_gate(Some(&r), "inode_setattr").unwrap().unwrap_err();
+            assert!(gate.contains(why), "{gate}");
+            let detail = r.hook_args_degraded_detail().expect("attested");
+            assert!(detail.contains("bpf_lsm_inode_setattr") && detail.contains("not attached"));
+            assert!(detail.contains("setattr deny and the FIM setattr observer"));
+            // the xattr hooks are unaffected
+            assert_eq!(hook_gate(Some(&r), "inode_setxattr").unwrap(), Ok(1));
+        }
+        // the prototype is named in the reason
+        let r = hooks_only(&hook_btf(Setattr::NoIattrAfter, Xattr::From512, 1));
+        assert!(r.absent[0]
+            .detail
+            .contains("bpf_lsm_inode_setattr(struct mnt_idmap *, struct dentry *, ?)"));
+    }
+
+    /// No resolution published this boot (no BTF): the programs on a hook
+    /// with a runtime position do not attach.
+    #[test]
+    fn hook_gate_without_resolution_is_closed() {
+        for hook in ["inode_setattr", "inode_setxattr", "inode_removexattr"] {
+            let why = hook_gate(None, hook).unwrap().unwrap_err();
+            assert!(why.contains("unknown"), "{why}");
+        }
+    }
+
+    /// A value out of bounds in the slot is not a position.
+    #[test]
+    fn hook_position_beyond_the_bound_is_not_used() {
+        let mut r = hooks_only(&hook_btf(Setattr::From69, Xattr::From512, 1));
+        r.values = vec![(INODE_SETATTR_DENTRY_ARG_SLOT, HOOK_ARG_MAX)];
+        assert_eq!(r.setattr_dentry_arg(), None);
+        assert!(hook_gate(Some(&r), "inode_setattr").unwrap().is_err());
+    }
+
+    /// Fixed positions: checked where the kernel has the hook, a moved
+    /// argument refuses the start, an absent hook is not checked.
+    #[test]
+    fn fixed_hook_arguments_are_checked_against_the_prototype() {
+        let checks = &[
+            HookArgCheck {
+                func: "bpf_lsm_inode_set_acl",
+                position: 1,
+                pointee: "dentry",
+            },
+            HookArgCheck {
+                func: "bpf_lsm_inode_remove_acl",
+                position: 1,
+                pointee: "dentry",
+            },
+        ];
+        let btf = hook_btf(Setattr::From69, Xattr::From512, 1);
+        match resolve_with(&btf, &[], &[], &[], checks, &|_| None) {
+            ResolveOutcome::Resolved(r) => assert_eq!(r.hook_args_checked, 1),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        let moved = hook_btf(Setattr::From69, Xattr::From512, 0);
+        match resolve_with(&moved, &[], &[], &[], checks, &|_| None) {
+            ResolveOutcome::Refuse(RefuseReason::Drift(m)) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(m[0].name, "bpf_lsm_inode_set_acl");
+                assert!(
+                    m[0].detail.contains("argument 1 is not a struct dentry *"),
+                    "{}",
+                    m[0].detail
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// Typedefs, cv-qualifiers and type tags on either side of the pointer,
+    /// and a forward declaration, all name the struct pointed to.
+    #[test]
+    fn pointee_name_sees_through_qualifiers_and_tags() {
+        let mut b = BtfBuilder::new();
+        let int = b.int("int");
+        let task = b.composite(Some("task_struct"), false, false, &[]);
+        let c_task = b.plain(None, KIND_CONST, task);
+        let p_c_task = b.ptr(c_task);
+        let tagged = b.plain(Some("rcu"), KIND_TYPE_TAG, task);
+        let p_tagged = b.ptr(tagged);
+        let td = b.typedef("task_ptr_t", p_tagged);
+        let fwd = b.plain(Some("cred"), KIND_FWD, 0);
+        let p_fwd = b.ptr(fwd);
+        let p_int = b.ptr(int);
+        let pp_task = b.ptr(p_c_task);
+        b.func(
+            "bpf_lsm_x",
+            int,
+            &[p_c_task, td, p_fwd, p_int, task, pp_task],
+        );
+        let btf = Btf::parse(&b.build()).unwrap();
+        let params = btf.hook_params("bpf_lsm_x").unwrap().to_vec();
+        let names: Vec<Option<&str>> = params.iter().map(|t| btf.pointee_name(*t)).collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("task_struct"),
+                Some("task_struct"),
+                Some("cred"),
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    /// Only the LSM hook functions are kept from the BTF.
+    #[test]
+    fn only_lsm_hook_functions_are_indexed() {
+        let btf = hook_btf(Setattr::Absent, Xattr::From512, 1);
+        assert!(btf.lsm_funcs.contains_key("bpf_lsm_inode_setxattr"));
+        assert!(!btf.lsm_funcs.contains_key("security_inode_setattr"));
+    }
+
+    /// The running host's own BTF, when it has one with BPF LSM (the WSL2
+    /// 6.18 host, a CI runner): every runtime position resolves and every
+    /// fixed one is where the programs read it.
+    #[test]
+    fn host_btf_hook_prototypes_match_the_programs() {
+        let Ok(data) = fs::read(VMLINUX_BTF) else {
+            eprintln!("no {VMLINUX_BTF}: skipped");
+            return;
+        };
+        let btf = Btf::parse(&data).expect("host BTF parses");
+        if !btf.lsm_funcs.contains_key("bpf_lsm_inode_setattr") {
+            eprintln!("host kernel without BPF LSM: skipped");
+            return;
+        }
+        for h in HOOK_ARGS {
+            let pos = btf
+                .resolve_hook_arg(h)
+                .unwrap_or_else(|e| panic!("{}: {e}", h.name));
+            eprintln!("{} = argument {pos}", h.name);
+        }
+        let mut checked = 0;
+        for c in HOOK_ARG_CHECKS {
+            if btf.check_hook_arg(c).unwrap_or_else(|e| panic!("{e}")) {
+                checked += 1;
+            }
+        }
+        eprintln!(
+            "{checked} of {} fixed hook arguments checked",
+            HOOK_ARG_CHECKS.len()
+        );
+        assert!(checked > 0);
     }
 }

@@ -55,7 +55,8 @@ use northnarrow_common::wire::{
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, INODE_I_INO_OFFSET,
-    INODE_I_SB_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    INODE_I_SB_OFFSET, INODE_REMOVEXATTR_DENTRY_ARG_SLOT, INODE_SETATTR_DENTRY_ARG_SLOT,
+    INODE_SETXATTR_DENTRY_ARG_SLOT, SUPER_BLOCK_S_DEV_OFFSET,
 };
 
 /// Linux `EPERM` — LSM hooks return `-errno` to deny.
@@ -459,19 +460,39 @@ pub fn inode_setattr(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
-    // Kernel signature on Ubuntu 6.8: vlen=2, (dentry, iattr) —
-    // verified against /sys/kernel/btf/vmlinux. Mainline 6.3+
-    // prepended a `struct mnt_idmap *`. We previously read
-    // ctx.arg(2) as the aya "phony retval" but per task_kill.rs
-    // rationale we no longer trust that slot, so the read is gone.
-    let dentry: *const c_void = ctx.arg(0);
+    // The dentry is argument 0 up to 6.8, `(dentry, iattr)`, and argument
+    // 1 from 6.9, `(idmap, dentry, iattr)` (lab PR 164): its position
+    // comes from the running kernel's prototype. No prev-retval read, see
+    // task_kill.rs.
+    let dentry = match setattr_dentry(ctx) {
+        Some(d) => d,
+        None => return 0,
+    };
     if let Some(target_inode) = inode_from_dentry(dentry) {
         if deny_if_protected(FS_OP_SETATTR, target_inode) {
             return -EPERM;
         }
-    } else {
     }
     0
+}
+
+/// `inode_setattr`'s `struct dentry *`, read at the position the agent
+/// resolved from the running kernel's prototype of `bpf_lsm_inode_setattr`
+/// (`INODE_SETATTR_DENTRY_ARG`). `None` when that position is not known:
+/// the hook then reads nothing, rather than the `mnt_idmap` a fixed
+/// position 0 is on 6.9 and later. Shared with the FIM setattr observer.
+/// The read goes through `bpf_probe_read_kernel` because the position is
+/// a runtime value (a context load needs a constant offset); the value is
+/// bounded below `HOOK_ARG_MAX`.
+#[inline(always)]
+pub(crate) unsafe fn setattr_dentry(ctx: &LsmContext) -> Option<*const c_void> {
+    let i = crate::btf_offsets::hook_arg(INODE_SETATTR_DENTRY_ARG_SLOT)?;
+    let dentry = raw_arg(ctx, i) as *const c_void;
+    if dentry.is_null() {
+        None
+    } else {
+        Some(dentry)
+    }
 }
 
 #[lsm(hook = "file_ioctl")]
@@ -617,7 +638,10 @@ unsafe fn read_protected_ino(inode: *const c_void) -> bool {
 // parent directory first; `inode_link` is `(old_dentry, dir, new_dentry)`;
 // `inode_setxattr` / `inode_removexattr` (5.12+) and `inode_set_acl` /
 // `inode_remove_acl` (6.2+) take a `user_namespace` / `mnt_idmap` first,
-// then the dentry, then the attribute name.
+// then the dentry, then the attribute name. On 5.7 to 5.11 the two xattr
+// hooks start with the dentry, so their dentry's position comes from the
+// running kernel's prototype (lab PR 164); the agent checks the fixed
+// positions of the others at boot.
 
 /// A new entry in `dir`: refused when `dir` carries `FS_PROTECT_NOCREATE`
 /// (the agent's own directories only), outside the trusted-installer
@@ -704,15 +728,21 @@ unsafe fn xattr_is_selinux(name: u64) -> bool {
 }
 
 /// An extended attribute set, removed or (6.2+) an ACL changed on a
-/// protected inode: arg 1 is the dentry, arg 2 the attribute name.
+/// protected inode: the dentry is argument `dentry_arg`, the attribute
+/// name the next one. `None` (the position was not resolved): nothing is
+/// read.
 #[inline(always)]
-unsafe fn deny_xattr(ctx: &LsmContext) -> i32 {
-    let dentry: *const c_void = ctx.arg(1);
+unsafe fn deny_xattr(ctx: &LsmContext, dentry_arg: Option<usize>) -> i32 {
+    let i = match dentry_arg {
+        Some(i) => i,
+        None => return 0,
+    };
+    let dentry = raw_arg(ctx, i) as *const c_void;
     let inode = match inode_from_dentry(dentry) {
         Some(i) => i,
         None => return 0,
     };
-    if xattr_is_selinux(raw_arg(ctx, 2)) {
+    if xattr_is_selinux(raw_arg(ctx, i + 1)) {
         return 0;
     }
     if deny_if_protected(FS_OP_XATTR, inode) {
@@ -722,29 +752,41 @@ unsafe fn deny_xattr(ctx: &LsmContext) -> i32 {
 }
 
 /// Kernel signature: `(mnt_userns | idmap, dentry, name, value, size,
-/// flags)`. On 5.15 and 6.1 a POSIX ACL (`setfacl`) comes this way too, as
-/// `system.posix_acl_*`.
+/// flags)`, `(dentry, name, value, size, flags)` on 5.7 to 5.11: the
+/// dentry's position is resolved at boot. On 5.15 and 6.1 a POSIX ACL
+/// (`setfacl`) comes this way too, as `system.posix_acl_*`.
 #[lsm(hook = "inode_setxattr")]
 pub fn protected_setxattr_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_xattr(&ctx) }
+    unsafe {
+        deny_xattr(
+            &ctx,
+            crate::btf_offsets::hook_arg(INODE_SETXATTR_DENTRY_ARG_SLOT),
+        )
+    }
 }
 
-/// Kernel signature: `(mnt_userns | idmap, dentry, name)`.
+/// Kernel signature: `(mnt_userns | idmap, dentry, name)`, `(dentry,
+/// name)` on 5.7 to 5.11 (resolved at boot).
 #[lsm(hook = "inode_removexattr")]
 pub fn protected_removexattr_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_xattr(&ctx) }
+    unsafe {
+        deny_xattr(
+            &ctx,
+            crate::btf_offsets::hook_arg(INODE_REMOVEXATTR_DENTRY_ARG_SLOT),
+        )
+    }
 }
 
 /// 6.2+: a POSIX ACL no longer passes `inode_setxattr`. Kernel signature:
-/// `(idmap, dentry, acl_name, kacl)`. Attached only where the kernel has
-/// the hook.
+/// `(idmap, dentry, acl_name, kacl)` on every kernel that has the hook
+/// (checked at boot). Attached only where the kernel has the hook.
 #[lsm(hook = "inode_set_acl")]
 pub fn protected_set_acl_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_xattr(&ctx) }
+    unsafe { deny_xattr(&ctx, Some(1)) }
 }
 
 /// 6.2+. Kernel signature: `(idmap, dentry, acl_name)`.
 #[lsm(hook = "inode_remove_acl")]
 pub fn protected_remove_acl_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_xattr(&ctx) }
+    unsafe { deny_xattr(&ctx, Some(1)) }
 }

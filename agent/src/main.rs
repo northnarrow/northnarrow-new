@@ -823,6 +823,9 @@ async fn main() -> Result<()> {
     // External audit NN-AUD-098: tracepoint fields left on their compiled
     // offset, attested once the audit log is open.
     let mut tracepoint_degraded: Option<String> = None;
+    // Lab PR 164: an LSM hook argument whose position was not resolved,
+    // attested once the audit log is open.
+    let mut hook_args_degraded: Option<String> = None;
 
     // BUG-036: revalidate every compiled-in kernel struct offset against
     // the RUNNING kernel's BTF before attaching any program. aya-ebpf has
@@ -860,6 +863,11 @@ async fn main() -> Result<()> {
                 let effect = if m.struct_name.starts_with("btrfs_") {
                     "files on btrfs keep the superblock's device in their inode keys, so FIM \
                      and file protection do not match them (review 55)"
+                } else if m.struct_name.starts_with("bpf_lsm_") {
+                    // Lab PR 164: the programs reading it are not attached;
+                    // a missing deny hook refuses the start unless
+                    // NN_ANTI_TAMPER_ALLOW_DEGRADED=1.
+                    northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(m.struct_name)
                 } else {
                     "DNS QNAME decoding needs iov_iter.iter_type + ITER_UBUF/ITER_IOVEC"
                 };
@@ -872,6 +880,15 @@ async fn main() -> Result<()> {
                      is disabled"
                 );
             }
+            info!(
+                setattr_dentry_arg = ?r.setattr_dentry_arg(),
+                setxattr_dentry_arg = ?r.hook_arg_position("INODE_SETXATTR_DENTRY_ARG"),
+                removexattr_dentry_arg = ?r.hook_arg_position("INODE_REMOVEXATTR_DENTRY_ARG"),
+                hook_args_checked = r.hook_args_checked,
+                "LSM hook prototypes read from the running kernel — the fixed-position \
+                 arguments are where the programs read them (lab PR 164)"
+            );
+            hook_args_degraded = r.hook_args_degraded_detail();
             for module in &r.modules_not_loaded {
                 info!(
                     module,
@@ -929,8 +946,9 @@ async fn main() -> Result<()> {
                     error!(
                         count = missing.len(),
                         "BTF offset resolution FAILED — refusing to start. The running \
-                         kernel does not expose a field the eBPF programs read; attaching \
-                         LSM hooks would read the wrong kernel memory (BUG-036)."
+                         kernel does not expose a field the eBPF programs read, or an LSM \
+                         hook's prototype no longer has an argument where its program reads \
+                         it; attaching LSM hooks would read the wrong kernel memory (BUG-036)."
                     );
                     for m in &missing {
                         error!(
@@ -2436,6 +2454,9 @@ async fn main() -> Result<()> {
         attest_legacy_isolation_removed(audit_log.as_ref());
     }
     if let Some(detail) = &tracepoint_degraded {
+        attest_degraded(audit_log.as_ref(), detail);
+    }
+    if let Some(detail) = &hook_args_degraded {
         attest_degraded(audit_log.as_ref(), detail);
     }
     // External audit NET-009: the JA3 list with no producer (see its load).
@@ -5524,7 +5545,7 @@ fn btf_check(path: &std::path::Path) -> i32 {
     match resolve_offsets_from(path) {
         ResolveOutcome::Resolved(r) => {
             println!(
-                "btf-check {}: {} — {} slots resolved, {} differ from the build kernel, {} absent",
+                "btf-check {}: {} — {} slots resolved, {} differ from the build kernel, {} absent, {} hook arguments checked",
                 path.display(),
                 if r.absent.is_empty() {
                     "SUPPORTED"
@@ -5533,11 +5554,20 @@ fn btf_check(path: &std::path::Path) -> i32 {
                 },
                 r.values.len(),
                 r.drifted.len(),
-                r.absent.len()
+                r.absent.len(),
+                r.hook_args_checked
             );
             for m in &r.absent {
+                let effect = if m.struct_name.starts_with("bpf_lsm_") {
+                    format!(
+                        "not attached: {} (the agent starts only with NN_ANTI_TAMPER_ALLOW_DEGRADED=1)",
+                        northnarrow_agent::anti_tamper::btf_revalidate::hook_arg_effect(m.struct_name)
+                    )
+                } else {
+                    "dependent sensor path disabled".to_string()
+                };
                 println!(
-                    "  absent  {:<34} {:<12} {} — dependent sensor path disabled",
+                    "  absent  {:<34} {:<12} {} — {effect}",
                     m.name, m.struct_name, m.detail
                 );
             }
@@ -5565,7 +5595,7 @@ fn btf_check(path: &std::path::Path) -> i32 {
         }
         ResolveOutcome::Refuse(RefuseReason::Drift(missing)) => {
             println!(
-                "btf-check {}: NOT SUPPORTED — {} field(s)/enumerator(s) missing (the agent would refuse to start)",
+                "btf-check {}: NOT SUPPORTED — {} field(s)/enumerator(s)/hook argument(s) missing (the agent would refuse to start)",
                 path.display(),
                 missing.len()
             );

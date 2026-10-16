@@ -89,7 +89,7 @@ nightly report names the image and its record. Host packages: `gnupg`,
 against its pinned SHA-256 (no `curl | sh`). The self-test runs without
 network or guest: `bash deploy/lab/lib/verify-download-test.sh`.
 
-### Other guests: Debian 12, Ubuntu 22.04, AlmaLinux 9
+### Other guests: Debian 12, Debian 13, Ubuntu 22.04, AlmaLinux 9
 
 `NN_LAB_DISTRO=<distro> deploy/lab/nn-lab.sh up` boots a separate guest;
 prefix any sub-command with the variable to target it. Each guest has its
@@ -100,6 +100,7 @@ own disk, seed, ssh port and reports under `~/.cache/nn-lab/<distro>/`
 |---|---|---|---|
 | `ubuntu2404` (default) | 6.8 | 2222 (2322 on this host) | build kernel |
 | `debian12` | 6.1 | 2422 | `perf_event_paranoid=3` drop-in |
+| `debian13` | 6.12 | 2722 | first guest from 6.9 (`inode_setattr` takes `mnt_idmap` first); `nftables` installed; `perf_event_paranoid=3` drop-in |
 | `ubuntu2204` | 5.15 | 2522 | older verifier, sudo 1.9.9, systemd 249 |
 | `alma9` | 5.14 el9 | 2622 | SELinux enforcing, vendor tracepoint header; `kernel.io_uring_disabled=2` (no ring, not even for root); sudo's `secure_path` has no `/usr/local/bin`, so call `/usr/local/bin/nn-admin` |
 

@@ -293,10 +293,34 @@ pub const NET_FLOW_CLOSE_EVENTS_BYTES: u32 = 256 * 1024;
 /// Listener changes are rare; 64 KiB per §5.3.
 pub const NET_LISTEN_EVENTS_BYTES: u32 = 64 * 1024;
 
-/// Tappa 10 (N2) — `FLOW_SOCK_MAP` LRU HashMap entry cap. Bounds
-/// the per-flow kernel-side state; LRU eviction keeps memory
-/// bounded under DDoS load. Per design §5.3.
-pub const FLOW_SOCK_MAP_MAX_ENTRIES: u32 = 4096;
+/// Tappa 10 (N2) — `FLOW_SOCK_MAP` LRU HashMap entry cap: the outbound
+/// TCP sockets the kernel remembers between their connect and their
+/// close. Beyond it the LRU forgets the least recently used socket (a
+/// long session first) and that socket's close is never recorded. Lab PR
+/// 164: 65,536, the userland flow tracker's capacity
+/// (`DEFAULT_PENDING_CAPACITY` in `agent/src/net/flow_tracker.rs`); it was
+/// 4,096 (design §5.3). Kernel memory, preallocated when the map is
+/// created: 72 bytes per element (a 48-byte `htab_elem` with its LRU node,
+/// the 8-byte key, the 16-byte value) and a 16-byte bucket per element,
+/// 65,536 × 88 B ≈ 5.5 MiB (was ≈ 0.34 MiB).
+pub const FLOW_SOCK_MAP_MAX_ENTRIES: u32 = 65_536;
+
+/// Lab PR 164 — size of the `FLOW_SOCK_COUNTS` per-CPU array: how many
+/// sockets entered `FLOW_SOCK_MAP` as a new key, and how many a close
+/// took out. An LRU does not say what it evicts. The difference is the
+/// sockets whose close has not been seen, open sessions and forgotten
+/// ones together; beyond the capacity, at least the excess was forgotten
+/// (`nn-admin net status`).
+pub const FLOW_SOCK_COUNT_SLOTS: u32 = 2;
+
+/// Slots of `FLOW_SOCK_COUNTS`.
+pub mod flow_sock_slot {
+    /// A socket entered `FLOW_SOCK_MAP` (a new key: a reconnect of the
+    /// same socket overwrites its entry and is not counted).
+    pub const INSERTED: u32 = 0;
+    /// A close found the socket and took it out.
+    pub const REMOVED: u32 = 1;
+}
 
 /// Tappa 10 (N2) — `inet_csk_listen_start` kprobe event. Emitted
 /// once per listen() syscall on a TCP/UDP socket, unconditionally
@@ -2284,6 +2308,10 @@ mod tests {
     fn n2_map_capacity_constants_lock_in() {
         assert_eq!(NET_FLOW_CLOSE_EVENTS_BYTES, 256 * 1024);
         assert_eq!(NET_LISTEN_EVENTS_BYTES, 64 * 1024);
-        assert_eq!(FLOW_SOCK_MAP_MAX_ENTRIES, 4096);
+        // Lab PR 164: the userland flow tracker's capacity (4,096 before).
+        assert_eq!(FLOW_SOCK_MAP_MAX_ENTRIES, 65_536);
+        assert_eq!(FLOW_SOCK_COUNT_SLOTS, 2);
+        assert_eq!(flow_sock_slot::INSERTED, 0);
+        assert_eq!(flow_sock_slot::REMOVED, 1);
     }
 }

@@ -10,9 +10,10 @@
 #     only when its primary fingerprint is the pinned one, and a list counts
 #     only when gpgv reports a GOOD signature whose primary key is the
 #     pinned one (a key added to the cached keyring proves nothing).
-#   - Debian publishes no signature for its current cloud images: its
-#     SHA512SUMS is fetched over HTTPS from cloud.debian.org (Debian's
-#     documented method, TLS + DNSSEC) and the record says "unsigned".
+#   - Debian publishes no signature for its current cloud images (bookworm
+#     and trixie alike): its SHA512SUMS is fetched over HTTPS from
+#     cloud.debian.org (Debian's documented method, TLS + DNSSEC) and the
+#     record says "unsigned".
 #   - The image itself is checked against the list before it gets its
 #     final name, and its digest is recorded next to it (<image>.verified).
 #     A new guest disk is only layered on an image whose digest still
@@ -56,9 +57,9 @@ nnv_meta() {
             NNV_NAME_RE="^${name//./\\.}\$"
             NNV_HISTORY_BASE="${url%/current/*}/"
             NNV_HISTORY_RE='^[0-9]{8}(\.[0-9]+)?/$' ;;
-        debian12)
+        debian12 | debian13)
             NNV_SUMS=SHA512SUMS NNV_ALGO=sha512
-            NNV_NAME_RE='^debian-12-genericcloud-amd64(-[0-9]{8}-[0-9]+)?\.qcow2$'
+            NNV_NAME_RE="^debian-${distro#debian}-genericcloud-amd64(-[0-9]{8}-[0-9]+)?\\.qcow2\$"
             NNV_HISTORY_BASE="${url%/latest/*}/"
             NNV_HISTORY_RE='^[0-9]{8}-[0-9]+/$' ;;
         alma9)

@@ -84,6 +84,11 @@ nnv_meta debian12 https://cloud.debian.org/images/cloud/bookworm/latest/debian-1
 printf '%s  debian-12-genericcloud-amd64-20261006-2623.qcow2\n%s  debian-12-genericcloud-amd64-20261006-2623.raw\n' "$h1" "$h1" > "$W/SUMS.deb"
 ok "dated Debian build found by digest" test "$(nnv_names_for_digest "$W/SUMS.deb" "$h1" "$NNV_NAME_RE")" = debian-12-genericcloud-amd64-20261006-2623.qcow2
 no "digest listed only under another image type" nnv_names_for_digest "$W/SUMS.deb" "$h2" "$NNV_NAME_RE"
+nnv_meta debian13 https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+ok "debian13: unsigned SHA512SUMS, history under trixie/" test "$NNV_SUMS $NNV_ALGO ${NNV_SIG:-unsigned} $NNV_HISTORY_BASE" = "SHA512SUMS sha512 unsigned https://cloud.debian.org/images/cloud/trixie/"
+ok "debian13: current and dated build names" grep -qE "$NNV_NAME_RE" <<<"debian-13-genericcloud-amd64-20261015-2632.qcow2"
+no "debian13: a Debian 12 image is another image" grep -qE "$NNV_NAME_RE" <<<"debian-12-genericcloud-amd64.qcow2"
+no "debian13: the name pattern is literal" grep -qE "$NNV_NAME_RE" <<<"debian-13-genericcloud-amd64Xqcow2"
 
 echo "== per-distribution settings (nnv_meta)"
 nnv_meta ubuntu2404 https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img

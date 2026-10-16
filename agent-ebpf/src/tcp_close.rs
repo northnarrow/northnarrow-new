@@ -94,7 +94,9 @@ unsafe fn try_tcp_close(ctx: &FExitContext) -> Result<(), i64> {
     // a full ring would be found again by the next socket the slab puts at
     // this address (an accepted peer, typically), and its close would pass
     // for an outbound flow's.
-    let _ = FLOW_SOCK_MAP.remove(&sk_key);
+    if FLOW_SOCK_MAP.remove(&sk_key).is_ok() {
+        crate::tcp_connect::count_flow_sock(northnarrow_common::wire::flow_sock_slot::REMOVED);
+    }
 
     // Reserve a slot before the field-read avalanche; if the
     // ringbuf is full we drop the event cheaply.

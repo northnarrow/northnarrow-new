@@ -13,6 +13,7 @@ pub mod dns_sensor;
 pub mod ebpf_object;
 pub mod exe_identity;
 pub mod exec;
+pub mod flow_sock;
 pub mod multiplexer;
 pub mod open_sensor;
 pub mod reject;

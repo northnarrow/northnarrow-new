@@ -477,9 +477,13 @@ pub fn fim_setattr_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_fim_setattr_observe(ctx: &LsmContext) -> i32 {
-    // Kernel signature on Ubuntu 6.8: (dentry, iattr). Same
-    // shape inode_protect.rs::try_inode_setattr handles.
-    let dentry: *const c_void = ctx.arg(0);
+    // `(dentry, iattr)` up to 6.8, `(idmap, dentry, iattr)` from 6.9: the
+    // dentry's position comes from the running kernel (lab PR 164), as
+    // for inode_protect.rs::try_inode_setattr.
+    let dentry = match crate::inode_protect::setattr_dentry(ctx) {
+        Some(d) => d,
+        None => return 0,
+    };
     if let Some(inode) = inode_from_dentry(dentry) {
         if let Some(key) = should_emit(inode) {
             emit_drift(FIM_OP_MODIFIED, key);

@@ -22,8 +22,8 @@
 >   are closed;
 > - Bug #4 below: the two-argument `inode_setattr` is the hook's mainline
 >   shape up to 6.8, not an Ubuntu backport; from 6.9 the hook takes `mnt_idmap`
->   first, which the agent does not handle yet (follow-up in the tracker,
->   `docs/operator/KERNEL_COMPATIBILITY.md`).
+>   first. Since lab PR 164 the agent reads the dentry's position from the
+>   running kernel's prototype (`docs/operator/KERNEL_COMPATIBILITY.md`).
 
 ---
 
@@ -306,8 +306,9 @@ Ubuntu 6.8 ha backport `(dentry, iattr)` vlen=2, mainline ≥6.3 ha `(mnt_idmap,
 **Correction (2026-10-16):** in mainline the LSM hook `inode_setattr` has
 `(dentry, iattr)` up to 6.8 (the earlier `mnt_idmap` argument is on
 `security_inode_setattr`, the caller, not on the hook); the hook itself takes
-`(mnt_idmap, dentry, iattr)` from 6.9, so on 6.9+ the agent's `arg(0)` reads the idmap. Open follow-up: `docs/operator/KERNEL_COMPATIBILITY.md`,
-"Kernels from 6.9".
+`(mnt_idmap, dentry, iattr)` from 6.9, so on 6.9+ the agent's `arg(0)` read the idmap.
+Fixed in lab PR 164 (position read from the running kernel's prototype):
+`docs/operator/KERNEL_COMPATIBILITY.md`, "Kernels from 6.9".
 
 ### Bug #5: dev_t encoding mismatch userland vs kernel ✅ RESOLVED 13 maggio
 Userland `meta.dev()` ritorna `new_encode_dev(MKDEV)` (legacy compact form, 0x802 = 2050 per sda2).
