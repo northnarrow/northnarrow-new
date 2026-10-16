@@ -11,6 +11,11 @@
 //! evaluated. It is counted, and the count is logged at most once a
 //! minute, instead of queueing behind the model. The rules have already
 //! judged it.
+//!
+//! Lab PR 162: an exec is offered once, as its `ProcessSpawn` (the child's
+//! comm, argv and file), or as its `ExecCheck` when no spawn followed
+//! ([`super::exec_pairing`]). The `ExecCheck` used to take the slot and the
+//! spawn was skipped, so the count held one skip per exec under no load.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,7 +69,8 @@ impl AdeSlot {
         true
     }
 
-    /// Evaluations skipped since boot because another was running.
+    /// Evaluations skipped since boot because another was running: execs
+    /// no rule matched, judged by the rules only.
     pub fn skipped(&self) -> u64 {
         self.skipped.load(Ordering::Relaxed)
     }

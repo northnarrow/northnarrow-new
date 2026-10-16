@@ -37,6 +37,7 @@ use super::corroboration::Scope;
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::lineage::AuthSessionTracker;
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 
 /// The recent events the triggers scan, borrowed (review 72). The
 /// correlation buffer is a ring of up to 1,000 events; cloning it for every
@@ -339,6 +340,30 @@ pub struct TriggerDetector {
     /// mass-write arm fired for it — the second factor that makes a
     /// staging exec by the same process `ConfirmedIntrusion`.
     mass_writers: MassWriters,
+    /// Lab PR 162: the trusted-installer window, once `main.rs` has wired
+    /// it ([`Self::set_installer_window`]); inside it a control-surface
+    /// tamper does not raise the posture.
+    installer_window: InstallerWindow,
+}
+
+/// Lab PR 162: the trusted-installer window as the detector reads it.
+/// Unset (a test, a build that does not wire it) reads as closed, so the
+/// trigger fires.
+#[derive(Clone, Default)]
+struct InstallerWindow(Arc<std::sync::OnceLock<Arc<TrustedInstallerOverride>>>);
+
+impl std::fmt::Debug for InstallerWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallerWindow")
+            .field("wired", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+impl InstallerWindow {
+    fn is_open(&self) -> bool {
+        self.0.get().is_some_and(|w| w.is_window_open())
+    }
 }
 
 /// External audit POS-015: when the mass-write arm last fired for a pid
@@ -383,6 +408,7 @@ impl TriggerDetector {
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
+            installer_window: InstallerWindow::default(),
         }
     }
 
@@ -397,6 +423,7 @@ impl TriggerDetector {
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
+            installer_window: InstallerWindow::default(),
         }
     }
 
@@ -412,6 +439,7 @@ impl TriggerDetector {
             mass_write_warned: Arc::default(),
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
+            installer_window: InstallerWindow::default(),
         }
     }
 
@@ -422,6 +450,12 @@ impl TriggerDetector {
     pub fn with_mass_write_extras(mut self, extras: Vec<String>) -> Self {
         self.mass_write_extras = Arc::new(extras);
         self
+    }
+
+    /// Lab PR 162: the trusted-installer window the control-surface
+    /// trigger defers to. Set once; a second call is ignored.
+    pub fn set_installer_window(&self, window: Arc<TrustedInstallerOverride>) {
+        let _ = self.installer_window.0.set(window);
     }
 
     /// BUG-032 — builder for the escalation allowlist. Production:
@@ -622,6 +656,23 @@ impl TriggerDetector {
                 TriggerType::AntiTamperDenial
             });
         }
+        // Lab PR 162: a tamper of an anti-tamper control-surface file — the
+        // match of NN-L-FIM-024, which no workflow produces while the agent
+        // runs (install, upgrade and removal stop it first; its own boot
+        // sweep is exempt) — is tamper evidence as decisive as a denial.
+        // The rule's exemptions hold here too: the NorthNarrow stack is
+        // exempt above, and the agent's own PID here (the rule's backstop).
+        // Inside the trusted-installer window, where the kernel refuses no
+        // write and so no denial reaches the posture either, it is not
+        // raised; the rule still kills and records.
+        if let Event::Fim(fe) = event {
+            if crate::fim::rules::is_bait_tamper(fe)
+                && fe.modifier_pid != std::process::id()
+                && !self.installer_window.is_open()
+            {
+                hits.push(TriggerType::ControlSurfaceTamper);
+            }
+        }
         let mass_write = confirmed_intrusion(
             event,
             recent,
@@ -701,6 +752,9 @@ pub fn event_owner_pid(event: &Event) -> Option<u32> {
         | Event::TcpConnect { pid, .. }
         | Event::DnsQuery { pid, .. }
         | Event::FsProtectDenial { pid, .. } => Some(*pid),
+        // Lab PR 162: the writer, so the stack exemption applies to it and
+        // a control-surface tamper's COMBAT names it as the offender.
+        Event::Fim(fe) => Some(fe.modifier_pid),
         _ => None,
     }
 }

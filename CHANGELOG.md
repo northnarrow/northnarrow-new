@@ -41,6 +41,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Two follow-ups found in the lab (lab PR 162). The ADE judged every exec
+  under its parent's name: for each exec the `ExecCheck` (before the new
+  image runs, with the parent's comm) took the only evaluation slot and
+  the child's `ProcessSpawn` was counted and dropped, so a `lockbit-*`
+  binary was never evaluated. The model is now shown the `ProcessSpawn`;
+  an `ExecCheck` that no spawn follows within 2 s (an exec that did not
+  complete, or a lost spawn event) still goes to it on its own, and the
+  rules see both as before. A tamper of an anti-tamper control-surface
+  file (NN-L-FIM-024: `kill_switch.conf`, `pause.flag`, …) left the
+  posture where it was although the rule and its documentation said
+  COMBAT: no posture trigger read FIM events. It now raises the decisive
+  `ControlSurfaceTamper` trigger (a locked COMBAT, the tampering process
+  named as the offender), on the rule's own match and with its
+  exemptions (the agent and the watchdog); inside a trusted-installer
+  window the rule still kills and records, and the posture is not
+  raised. On an installed host the `/etc/northnarrow` baits are under the
+  FS deny, whose `AntiTamperDenial` already raised COMBAT; the
+  `/run/northnarrow` baits are not, and their tamper left the posture in
+  OBSERVING.
 - Lab follow-ups, network canaries and NN-L-NET-003 (lab PR 163):
   NN-L-CANARY-003 could not fire — nothing consulted the network
   canaries, so no Network canary ever tripped. A network canary is now a

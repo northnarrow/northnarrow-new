@@ -106,6 +106,15 @@ pub enum TriggerType {
     // observes, the exec raises `ConfirmedIntrusion` instead. Appended last
     // to keep variant ordering stable.
     StagingExec,
+
+    // Lab PR 162: a tamper of an anti-tamper control-surface file (the
+    // match of NN-L-FIM-024: `kill_switch.conf`, `pause.flag`, …). No
+    // workflow touches those files while the agent runs, so the tamper is
+    // as decisive as a denial: straight to COMBAT, locked. The name says
+    // what the rule's name says and no more: whoever reads the journal of
+    // a compromised host must not learn that the files are bait. Appended
+    // last to keep variant ordering stable.
+    ControlSurfaceTamper,
 }
 
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
@@ -156,9 +165,9 @@ impl TriggerType {
             TriggerType::SensitiveFileAccess
             | TriggerType::CriticalFileModification
             | TriggerType::PersistenceMechanism => EvidenceClass::FileSystem,
-            TriggerType::AntiTamperDenial | TriggerType::RelayedTamperAttempt => {
-                EvidenceClass::Kernel
-            }
+            TriggerType::AntiTamperDenial
+            | TriggerType::RelayedTamperAttempt
+            | TriggerType::ControlSurfaceTamper => EvidenceClass::Kernel,
             TriggerType::TelemetryLoss => EvidenceClass::Telemetry,
         }
     }
@@ -183,7 +192,8 @@ impl TriggerType {
             | TriggerType::PersistenceMechanism
             | TriggerType::LateralMovement
             | TriggerType::ExfiltrationPattern
-            | TriggerType::AntiTamperDenial => PostureKind::Combat,
+            | TriggerType::AntiTamperDenial
+            | TriggerType::ControlSurfaceTamper => PostureKind::Combat,
         }
     }
 
@@ -202,7 +212,9 @@ impl TriggerType {
     /// heuristic pattern is [`Confidence::NeedsCorroboration`].
     pub fn confidence(&self) -> Confidence {
         match self {
-            TriggerType::AntiTamperDenial => Confidence::Decisive,
+            TriggerType::AntiTamperDenial | TriggerType::ControlSurfaceTamper => {
+                Confidence::Decisive
+            }
             _ => Confidence::NeedsCorroboration,
         }
     }
@@ -225,6 +237,7 @@ impl TriggerType {
             TriggerType::RelayedTamperAttempt => "RelayedTamperAttempt",
             TriggerType::TelemetryLoss => "TelemetryLoss",
             TriggerType::StagingExec => "StagingExec",
+            TriggerType::ControlSurfaceTamper => "ControlSurfaceTamper",
         }
     }
 }
@@ -303,6 +316,24 @@ mod tests {
         assert!(TriggerType::ExploitAttempt.is_corroboration());
         assert!(!TriggerType::Reconnaissance.is_corroboration());
         assert!(!TriggerType::TelemetryLoss.is_corroboration());
+    }
+
+    /// Lab PR 162: a control-surface tamper is anti-tamper evidence that
+    /// reaches a locked COMBAT on its own, and its name, which the journal
+    /// shows, does not give the bait away.
+    #[test]
+    fn control_surface_tamper_is_decisive_anti_tamper_evidence() {
+        let t = TriggerType::ControlSurfaceTamper;
+        assert_eq!(t.target_level(), PostureKind::Combat);
+        assert_eq!(t.confidence(), Confidence::Decisive);
+        assert_eq!(t.evidence_class(), EvidenceClass::Kernel);
+        assert!(t.is_corroboration());
+        assert_eq!(t.as_str(), "ControlSurfaceTamper");
+        assert_eq!(alloc::format!("{t:?}"), "ControlSurfaceTamper");
+        let name = t.as_str().to_lowercase();
+        for banned in ["honeypot", "decoy", "canary", "bait", "trap"] {
+            assert!(!name.contains(banned), "{name} names the {banned}");
+        }
     }
 
     #[test]

@@ -330,14 +330,21 @@ its own. What holds since October 2026:
 - **The model is root's to install (lab PR 105).** The model and tokenizer
   load only from root-owned paths closed to others; a model that fails to
   load leaves the ADE off, with no mock fallback.
+- **The model judges the process that runs (lab PR 162).** An exec reaches
+  the agent twice: its `ExecCheck`, before the new image runs and with the
+  parent's comm, and its `ProcessSpawn`, with the child's comm, argv and
+  file. The model is shown the `ProcessSpawn`; the rules see both. Until
+  lab PR 162 the `ExecCheck` took the evaluation slot and the
+  `ProcessSpawn` was dropped, so the model judged every exec under its
+  parent's name (found in lab PR 144). An `ExecCheck` that no
+  `ProcessSpawn` follows within 2 s — an exec that did not complete, or a
+  spawn event lost — still goes to the model on its own: it is the only
+  record of that attempt.
 - **Known limit: one evaluation slot.** Evaluations run one at a time, off
-  the event loop (NN-AUD-004, lab PR 82); an exec that arrives while one
-  runs is judged by the rules only and counted. For each exec the
-  `ExecCheck`, which carries the parent's comm, takes the slot, and the
-  child's `ProcessSpawn` microseconds later is counted and dropped: the
-  model judges the exec under its parent's name. Found in the lab (lab PR
-  144), to be improved; listed with the other follow-ups in
-  `docs/audit/EXTERNAL_AUDIT_16f7563.md`.
+  the event loop (NN-AUD-004, lab PR 82); an exec no rule matched that
+  arrives while one runs is judged by the rules only and counted. Under a
+  burst of unknown execs the model sees the first, not the most
+  dangerous.
 - **Not re-measured.** No lab guest has the model. The real token count
   of the v1.1 prompt, `ade_attacks` before and after these changes (the
   off-repo LoRA was trained on the old prompt format) and the golden of
@@ -359,6 +366,7 @@ The doctrine is the spec. The Tappe are the implementation.
 
 *Document version: 1.0 — initial canonical statement, May 17, 2026.*
 *Version 1.1 — October 16, 2026: the model's role after the external audit of `16f7563` (advisory, prompt window and sanitization, context selection, pinned RAG corpus, one evaluation slot).*
+*Version 1.2 — October 16, 2026: the model judges an exec's `ProcessSpawn`, not its `ExecCheck` (lab PR 162).*
 *Companion document: `docs/XDR_ROADMAP.md` — Tappa-level implementation map.*
 *Companion document: `docs/ADE_SUITE_VISION.md` — model architecture (ADE-Defense + ADE-Forge) supporting this doctrine.*
 *Companion document: `docs/strategy/ADE_ACTIVE_DEFENDER_VISION.md` — Phase-2 / release-V1.5 Active Defender strategic context (Knowledge Ingestion, Environmental Awareness, Vulnerability Intelligence, Adaptive Deception, Panopticon, sovereignty inbound/outbound).*

@@ -295,6 +295,17 @@ impl PostureMachine {
         )
     }
 
+    /// Lab PR 162: the trusted-installer window, inside which a tamper of
+    /// an anti-tamper control-surface file does not raise the posture (the
+    /// FIM-024 rule still acts). Unwired, the trigger always fires. Set
+    /// once; a second call is ignored.
+    pub fn set_installer_window(
+        &self,
+        window: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
+    ) {
+        self.inner.triggers.set_installer_window(window);
+    }
+
     /// External audit POS-001: run `hook` when an unlocked COMBAT decays.
     /// Set once; a second call is ignored.
     pub fn on_combat_decay(&self, hook: CombatEntryHook) {

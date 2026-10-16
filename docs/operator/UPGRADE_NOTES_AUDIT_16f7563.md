@@ -385,6 +385,16 @@ Now **killed, or answered, where they were recorded or missed**:
   never to the root cgroup; kills go through a pidfd checked against the
   process the event named, and a tree that keeps forking is frozen in a
   cgroup of its own and killed as a whole.
+- **Control-surface files** (lab PR 162, a follow-up found in the lab).
+  A create, change, delete, rename, `chmod` or `chown` of one of the ten
+  anti-tamper control-surface files (NN-L-FIM-024,
+  [`anti-tamper-honeypots.md`](anti-tamper-honeypots.md)) now raises the
+  posture to a locked COMBAT on its own (`ControlSurfaceTamper`), as a
+  refused write to the agent's files does; the rule's kill was already
+  there. Not raised for the agent's own writes, nor inside a
+  trusted-installer window. **Detection change:** a host where a tool
+  touches one of these files (a `sed -i` over `/etc/northnarrow/*.conf`)
+  ends in a COMBAT that only a signed release ends.
 - **Host isolation is the ladder's alone** (NN-AUD-050 CMB-006, lab PR
   103): an ADE `Isolate` verdict no longer adds an nftables blackout of
   its own; an older agent's leftover chains are removed at start.
@@ -411,9 +421,10 @@ Now **killed, or answered, where they were recorded or missed**:
   (tracker, follow-ups).
 - **One evaluation at a time** (NN-AUD-004 LLMR-002, lab PR 82). An exec
   that arrives while the model is busy is judged by the rules only and
-  counted. Known limit, found in lab PR 144: for each exec the `ExecCheck`
-  (which carries the parent's name) takes the slot, and the child's
-  `ProcessSpawn` is counted and dropped.
+  counted. Since lab PR 162 the model is shown an exec's `ProcessSpawn`
+  (the child's name, arguments and file) and its `ExecCheck` only when no
+  spawn follows within 2 s; before, the `ExecCheck` (the parent's name)
+  took the slot and the spawn was dropped (found in lab PR 144).
 - **Tokenizer** (NN-AUD-091 MAIN-006, lab PR 151): Rust `fancy-regex`
   instead of the C Oniguruma library; same pieces and ids on the golden
   corpus, a full prompt in about 7.5 ms instead of 6.

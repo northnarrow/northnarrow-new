@@ -88,21 +88,26 @@ entry names the lab PR that fixed it.
   sub-gate until BUG-025 (lab PR 163); it stays in the denominator. The
   100 % Critical sub-gate of the V2 campaign (`docs/validation/matrix.md`,
   lab PR 159) holds 25 rules and can pass.
-- **FIM-024 does not raise the posture.** No posture trigger reads FIM
-  events, so a honeypot tamper (NN-L-FIM-024, Critical, KillProcessTree)
-  leaves the posture where it was, although the rule's reasoning and the
-  FIM module documentation say "posture → COMBAT" (lab PR 155). A product
-  question for the FIM group.
+- **FIM-024 does not raise the posture** — resolved (lab PR 162). No
+  posture trigger read FIM events, so a honeypot tamper (NN-L-FIM-024,
+  Critical, KillProcessTree) left the posture where it was, although the
+  rule's reasoning and the FIM module documentation say "posture →
+  COMBAT" (lab PR 155). The tamper now raises the decisive
+  `ControlSurfaceTamper` (locked COMBAT) on the rule's own match and
+  exemptions; not inside a trusted-installer window.
 - **`FLOW_SOCK_MAP` forgets long sessions.** The kernel map that pairs a
   connect with its close is an LRU of 4,096 sockets: beyond 4,096 pending
   connects it drops the least recently used one (a long session first),
   and that socket's close is never recorded, whatever the userland tracker
   does (lab PR 142).
-- **One ADE slot per exec, taken by the wrong event.** Evaluations run one
-  at a time (NN-AUD-004). For each exec the `ExecCheck`, which carries the
-  parent's comm, takes the slot, and the child's `ProcessSpawn`
-  microseconds later is counted and dropped, so the model judges the exec
-  under its parent's name (lab PR 144).
+- **One ADE slot per exec, taken by the wrong event** — resolved (lab PR
+  162). Evaluations run one at a time (NN-AUD-004). For each exec the
+  `ExecCheck`, which carries the parent's comm, took the slot, and the
+  child's `ProcessSpawn` microseconds later was counted and dropped, so
+  the model judged the exec under its parent's name (lab PR 144). The
+  `ProcessSpawn` is now evaluated; an `ExecCheck` goes to the ADE only
+  when no spawn follows within 2 s. The single slot under load stays a
+  limit (`docs/ADE_DOCTRINE.md`).
 - **No `nft` on Debian 12.** The lab's Debian 12 cloud image ships without
   `nft`, so `block_outbound` and the COMBAT soft egress block (both
   nftables) did not work there: the failure is recorded, INVESTIGATE is
@@ -5161,3 +5166,62 @@ the audit did not report, noted with the fix that takes them.
     the detector tests fail (all but the burned-canary and no-IP-address
     ones); with the deploy check taken out, the admin-socket test fails.
   - Lab: Ubuntu 24.04, netcanary163-probe.sh. `main`: both deploys that cannot work succeed (`db.internal`; port 22, where sshd listens); two connects to the canary 100.64.163.1:15432 exit 0 after 5 s with no access row and no verdict. This build: both deploys refused (`canary-deploy: REFUSED — network canary`, with the reason); the first connect is killed (137) with a signed `NetworkConnect` access row `first_trip=true`, the registry's `trip` row naming its hash and NN-L-CANARY-003 Critical `KillProcessTree`; the second is killed with `first_trip=false`; connects to another port and to 127.0.0.1 exit 0 and leave no row; no NN-L-CHAIN-003 for the trip pids; the trip connections' 4 netflow rows recorded. Found in the gate and fixed here: the canary e2e fixture removed its tempdir — which now holds the agent's protected chains — before stopping its agent; the agent took the unlink for a tamper, killed the test runner and isolated the Debian 12 guest. The fixture now stops its agent first. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.
+- **Lab follow-ups — ADE slot, FIM-024 and the posture, lab PR 162.** Two
+  of the follow-ups listed at the top, not audit findings.
+  - ADE slot (found in lab PR 144): the slot is offered an exec's
+    `ProcessSpawn` (`ade::exec_pairing`). The `ExecCheck` still reaches
+    the rules; for the ADE it is held back, keyed by pid, and settled by a
+    `ProcessSpawn` of the same exec — the process started before the
+    check, the check not after the spawn — read before or after it (the
+    two rings are drained apart). One held back with nothing to settle it
+    for 2 s (`EXEC_CHECK_GRACE`) is offered on its own, swept with each
+    event the rules see and at the 5 s pump check: an exec that did not
+    complete (no binary format took the file, a later security hook
+    refused it, a kill before the point of no return) or a lost spawn,
+    whose `ExecCheck` is the only record of the attempt — the more prudent
+    choice than dropping it, and rare enough to cost the slot little. A spawn settles every
+    check of its process up to it (a script's two passes, a failed
+    attempt before a successful exec), whatever the rules made of the
+    spawn: an exec whose `ProcessSpawn` a rule matched is not offered, the
+    rules judged it (its `ExecCheck` used to be). Both tables are bounded (1,024
+    held, the oldest offered when full; 4,096 spawns). The skip count
+    (`AdeSlot::skipped`, the "ADE busy" WARN) no longer holds one skip per
+    exec under no load; `ExecPairing` counts the settled and unsettled
+    checks. Tests (`ade::exec_pairing`): an exec no rule covers — the slot
+    gets the `ProcessSpawn` with the child's comm, nothing skipped (with
+    the `ExecCheck` routed as before it gets `bash` and skips the spawn);
+    an unsettled check offered after the grace, once; a spawn read before
+    its check; a later failed exec and a reused pid not settled; a
+    script's two passes; a full table.
+  - FIM-024 and the posture (found in lab PR 155): the decision, taken
+    with the founder's delegation, is that touching a control-surface
+    file is tamper evidence like a refused write. New trigger
+    `TriggerType::ControlSurfaceTamper` (appended; Kernel class, COMBAT,
+    Decisive, so a locked COMBAT), raised in `posture::triggers` on
+    `fim::rules::is_bait_tamper`, the rule's match now shared by both. Its
+    name carries no bait word (the journal shows it). Exemptions checked
+    against what FIM-024 exempts today: the kernel does not report the
+    agent's and the watchdog's writes (PROTECTED_PIDS), the rule leaves
+    out the agent's PID, and install, upgrade and removal stop both units
+    before they write a bait (the new agent's boot sweep is a protected
+    write). The trigger mirrors them: the stack exemption (`Event::Fim` now
+    has its writer as owner, which also names the offender to the ladder)
+    and the agent's PID. The rule does not consult the trusted-installer
+    window; the trigger does — inside it the kernel refuses nothing, so no
+    anti-tamper signal raises the posture there, and the rule still kills
+    and records (as `TelemetryLoss` is not raised in the window). Tests:
+    a tamper → locked COMBAT with the writer as owner; the trigger fires
+    exactly where the rule does (every op × the ten files and their
+    neighbours); the agent's own write (stack exemption, own PID) → none;
+    inside the window → none, closed → COMBAT. Each fails with its part of
+    the fix taken out. `honeypot_tamper_e2e` asserts, after the FIM-024
+    record, its `posture_at` COMBAT and a locked `POSTURE TRANSITION
+    state=COMBAT` line (which precedes the verdict line: the posture
+    observes an event before the rules): `trigger=Some(ControlSurfaceTamper)`
+    for the `/run/northnarrow` bait, which no deny covers; for an
+    `/etc/northnarrow` bait, under the FS deny, the refused unlink raises
+    `AntiTamperDenial` first (the Debian 12 gate), so either trigger. The
+    control-surface trigger is absent for the agent's own writes. Not changed: the
+    reasoning of NN-L-FIM-021 and -022, and the module doc for -001, -002
+    and -008, also say "posture → COMBAT"; no trigger reads those events.
+  - Lab: Ubuntu 24.04, adeslot162-probe.sh (mock ADE backend). A, an exec no rule matches: `main` judged the parent's `ExecCheck` (comm `bash`, Escalate) in one run of two and the spawn in the other; this build judges the spawn (comm `lockbit-nn162`, `KillTree` recorded as an advisory, the process alive). B, an exec that fails (ENOEXEC): offered to the ADE on its own after the 2 s grace. C, `/etc/northnarrow/kill_switch.conf` deleted by root: refused by the FS deny in both builds, and `AntiTamperDenial` raises the locked COMBAT. D, added in the lab, `/run/northnarrow/pause.flag`, which no deny covers: `main` kills the tamperer (FIM-024) and the posture stays OBSERVING; this build: `POSTURE TRANSITION state=COMBAT locked=true trigger=Some(ControlSurfaceTamper)`. Found in the gate and fixed here: the e2e expected the control-surface trigger for the `/etc` baits too, where the deny answers first. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.
