@@ -29,7 +29,8 @@ from T10.5:**
   pid/ppid/uid/gid` event shape they ship with; TTPs that *would* need
   argv (e.g. `curl … | bash`) are out of the validation surface, not
   counted as FAILs (§6 triage classifies these as **sensor gap →
-  T10.6**, not rule-logic gaps).
+  T10.6**, not rule-logic gaps). *Superseded by §4.3 (2026-10-15): a
+  sensor gap is a FAIL.*
 
 ---
 
@@ -230,7 +231,8 @@ isolation.
 The validation surface is the **69 production rules**, minus the
 **N/A** set, so the denominator is the live 69; any rule whose only
 trigger needs argv is marked N/A with a T10.6 pointer. Each rule is one
-matrix row.
+matrix row. *Superseded by §4.3 (2026-10-15): the denominator is the
+frozen registry, and nothing is N/A by construction.*
 
 > **Rule-count update (2026-06-02).** This section originally said **61**
 > (the T10.5-era pin). The current source loads **69**
@@ -260,20 +262,62 @@ matrix row.
 - **PARTIAL** — fires but with a mismatch (e.g. detected as High when
   spec says Critical, or correct verdict but no posture transition).
 - **FAIL** — the rule's trigger condition was genuinely met and
-  nothing fired (a real detection gap).
+  nothing fired (a real detection gap). Since §4.3, whatever the cause,
+  a sensor gap included.
 - **N/A** — the rule cannot be exercised in this environment for a
   *known, documented* reason (DNS-blocked, argv-dependent, requires a
   sensor not in scope) — excluded from the coverage denominator per
-  §13 Q1.
+  §13 Q1. Since §4.3, only a rule the frozen registry marks `n/a`, in a
+  version recorded before the run.
 
 ### 4.2 Aggregate metrics
 
 - **Coverage %** = PASS / (PASS+PARTIAL+FAIL), per MITRE tactic and
-  overall. (N/A excluded — §13 Q1.)
+  overall. (N/A excluded — §13 Q1.) Since §4.3: PASS ÷ every `in` row of
+  the frozen registry, a rule never run counted as a FAIL.
 - **Detection latency** distribution (p50/p95/p99) — event→verdict,
   read from the audit chain timestamps.
 - **False-positive rate** — verdicts fired during the legitimate-Kali
   baseline window (§8.3) that are *not* attacks, normalised per hour.
+
+### 4.3 Frozen denominator (external audit, 2026-10-15)
+
+The external audit of `16f7563` found that the gates of §4 could not
+fail (NN-AUD-217): N/A and "sensor gap → T10.6, not a FAIL" were decided
+per miss, after the run, so any miss could leave the denominator. It
+also found ATT&CK coverage undefined (NN-AUD-218) and the 100 % Critical
+sub-gate without evidence (NN-AUD-235). The campaign had not run, so the
+method is fixed now; where this section disagrees with §1, §4.1, §4.2,
+§6.3, §13 Q1 or the cross-cutting notes, it prevails.
+
+- **Denominator.** The frozen registry
+  [`docs/validation/v2-rules.tsv`](../validation/v2-rules.tsv), its
+  version and sha256 recorded in
+  [`docs/validation/matrix.md`](../validation/matrix.md): every rule the
+  agent can record. Version 1 has 77 — the 76 rules of the production
+  engine and NN-L-AT-001 — and no N/A. A rule leaves it only through a
+  new version, committed before its family runs.
+- **A miss is a FAIL** whatever its triage class. The class (§6.3) says
+  where the fix goes — a sensor gap still goes to T10.6 — and never
+  takes the row out of the denominator. A rule never run counts as a
+  FAIL (NOT RUN).
+- **Critical sub-gate.** Every rule Q1 names and every other rule that
+  can issue a Critical verdict: 26 rules, `gate = critical` in the
+  registry. `matrix.md` records where each one's proof lives today.
+- **ATT&CK technique coverage** is measured on the pre-registered rows of
+  [`docs/validation/v2-techniques.tsv`](../validation/v2-techniques.tsv):
+  the techniques the rules name and those the audit found without a rule
+  (T1070.x, T1562.004/.012, T1055.008/.009, T1499, T1497/T1480,
+  T1547.013 among them), each with its expected outcome — a rule fires,
+  an anti-tamper denial, a signed drift, or a known gap. It is reported
+  apart from rule coverage, with no gate.
+- **Controls.** Each family has one evasion row and one benign control
+  ([`docs/validation/v2-controls.tsv`](../validation/v2-controls.tsv)),
+  run like any matrix row: an evasion not caught is a FAIL, a benign
+  control punished is a false positive (§8.3).
+- `agent/src/decision/validation_registry.rs` fails when the registry no
+  longer matches the shipped rules, when a recorded version or hash is
+  stale, or when a Critical rule has no evidence row.
 
 ---
 
@@ -336,6 +380,7 @@ A non-PASS is classified before it's logged as a verdict on the engine:
 2. **Sensor gap** — the event never reached the engine because the
    sensor doesn't emit it (argv missing, a syscall path not
    instrumented). → **T10.6 backlog**, not a T10.7 rule FAIL.
+   *Since §4.3: still a FAIL in the coverage figures.*
 3. **Configuration gap** — the rule + sensor are fine but the
    `.v1`/`.local` allowlist or watch-path set excluded the test target.
    → config fix, re-run.
@@ -433,7 +478,9 @@ hardest and most impressive to demonstrate with real tooling:
 
 The §2.2-style MITRE tactic table, but with **validated** columns: per
 tactic, `rules / PASS / PARTIAL / FAIL / N-A` and a coverage %. This is
-the report's headline figure and the §13-Q1 acceptance gate.
+the report's headline figure and the §13-Q1 acceptance gate. The
+Critical sub-gate and the ATT&CK technique coverage (§4.3) are reported
+next to it, separately.
 
 ### 8.2 Detection-latency histogram
 
@@ -564,6 +611,22 @@ separately and do **not** gate T10.7.
   report.
 - **Reversibility:** easy — threshold is a report gate, not code.
 - **Date resolved:** 2026-05-21.
+- **Amendment (2026-10-15, external audit NN-AUD-235):** the sub-gate is
+  the `gate = critical` rows of `docs/validation/v2-rules.tsv` (§4.3):
+  the rules named above, "all CHAIN-*" read as all eight chain rules
+  (CHAIN-008 included, although it logs at Medium), and every other rule
+  that can issue a Critical verdict — R004, R006, R007, R018, FIM-024,
+  FIM-025, CANARY-001..004, NET-001, NET-003. A 100 % that left out
+  other rules issuing Critical verdicts would overstate it. It passes
+  only on campaign proof. Where each rule's proof lives today is the table
+  "Critical sub-gate" in `docs/validation/matrix.md`, with no empty cell;
+  at this date: 8 rules have a privileged e2e that waits for the
+  verdict, 2 an e2e of the trip event only, 1 an e2e ignored as flaky,
+  15 unit tests only, and none has campaign proof. NET-003 (no TLS
+  fingerprint is captured) and CANARY-003 (nothing produces a Network
+  canary trip) cannot fire on the agent as built: FAILs unless wired
+  before V2. No coverage percentage goes into external material until
+  `docs/validation/REPORT.md` is filled.
 
 ### Q2 — Atomic Red Team install: full git clone or curated subset?
 
@@ -701,7 +764,8 @@ separately and do **not** gate T10.7.
 - **§4 N/A denominator:** DNS-payload rules (NN-L-NET-014/015,
   T4-blocked) and argv-dependent process TTPs (T10.6-blocked) are
   explicitly **excluded** from the coverage denominator; **sensor gaps
-  route to T10.6**, never counted as T10.7 FAILs.
+  route to T10.6**, never counted as T10.7 FAILs. *Superseded by §4.3
+  (2026-10-15, external audit NN-AUD-217).*
 - **§7 matrix scope:** the full 61-row matrix is the **progressive
   product of V2–V4** (it is a chunk of the report), not a pre-authored
   artifact.

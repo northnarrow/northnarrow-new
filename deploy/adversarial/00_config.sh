@@ -42,11 +42,13 @@
 : "${NN_AGENT_UNIT:=northnarrow-agent.service}"       # CORRECTED (was northnarrow.service)
 : "${NN_WATCHDOG_UNIT:=northnarrow-watchdog.service}"
 : "${NN_JOURNAL_NS:=northnarrow}"      # LogNamespace — plain journalctl shows nothing
-# T10.5→T10.6→BUG-034 engine: current SOURCE loads 69 rules (verified
-# 2026-06-02 against agent/src/decision/tests.rs). The live binary on the
-# range reports 68 only because it was built before BUG-034 R018 landed;
-# bootstrap rebuilds from source → 69. NOT the stale-doc 61.
-: "${EXPECTED_RULE_COUNT:=69}"
+# External audit LAB-012 (NN-AUD-217): the engine must load the frozen V2
+# rule registry, so the count is its `engine` rows (76 in version 1), read
+# from docs/validation/v2-rules.tsv rather than kept here (it said 69 while
+# the source loaded 76). agent/src/decision/validation_registry.rs checks
+# the registry against the source. Empty when the file is missing, which
+# fails the health check.
+: "${EXPECTED_RULE_COUNT:=$(awk -F'\t' '$1 !~ /^#/ && $3 == "engine" { n++ } END { if (n) print n }' "$NN_REPO_DIR/docs/validation/v2-rules.tsv" 2>/dev/null)}"
 
 # Exact CapabilityBoundingSet the BUG-042-corrected unit must yield
 # (deploy/systemd/northnarrow-agent.service). The health check decodes the

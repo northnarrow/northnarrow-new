@@ -260,8 +260,8 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-214 | LAB-009 | Lab scripts | M | fixed (lab PR 156) |
 | NN-AUD-215 | LAB-010 | Lab scripts | S | fixed (lab PR 156) |
 | NN-AUD-216 | LAB-011 | Lab scripts | M | open |
-| NN-AUD-217 | LAB-012 | Lab scripts | M | open |
-| NN-AUD-218 | LAB-013 | Lab scripts | L | open |
+| NN-AUD-217 | LAB-012 | Lab scripts | M | fixed (lab PR 159) |
+| NN-AUD-218 | LAB-013 | Lab scripts | L | fixed (lab PR 159) |
 | NN-AUD-219 | LAB-014 | Lab scripts | S | open |
 | NN-AUD-220 | LAB-015 | Lab scripts | S | fixed (lab PR 156) |
 | NN-AUD-221 | LAB-016 | Lab scripts | S | open |
@@ -278,7 +278,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-232 | TST-011 | Privileged tests | S | open |
 | NN-AUD-233 | TST-012 | Privileged tests | M | open |
 | NN-AUD-234 | TST-018 | Privileged tests | L | fixed (lab PR 155) |
-| NN-AUD-235 | TST-019 | Privileged tests | M | open |
+| NN-AUD-235 | TST-019 | Privileged tests | M | fixed (lab PR 159) |
 
 ## Notes on the fixes
 
@@ -4379,3 +4379,57 @@ the audit did not report, noted with the fix that takes them.
     of a case were checked with a harness and stubbed mount tools: both
     mounts undone newest first, the mask undone, exit 130/143/141.
   - Lab: Ubuntu 24.04, `nn-lab.sh tamper-check` with this suite: every pre-existing case as before; new: C55a–g (STOP, INT, HUP, QUIT, SEGV, ABRT, BUS to the agent) denied `op=signal`; C56a rename over the agent binary denied `op=rename`, C56b unlink of the watchdog binary denied `op=unlink`; C57a `truncate` of audit.log denied `op=setattr`, C57b `: >` on detections.jsonl denied `op=write`; C57c `journalctl --vacuum-time` on the agent's namespace allowed (KNOWN GAP); C58 a renamed module tool → R018; C59a–c through io_uring denied (`op=write|unlink|rename`); C60 `systemctl mask --runtime` of the watchdog → `unit_shadowed`; C61 2 → 2 PROTECTED_PIDS entries, 0 stale; C14's mount undone by the trap, `findmnt /etc/northnarrow` empty after; verdict "anti-tamper check: OK (known gaps listed)". `--selftest`: 39 checks, 0 failed. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.
+- **NN-AUD-217, NN-AUD-218, NN-AUD-235 (LAB-012, LAB-013, TST-019), lab
+  PR 159.** Validation methodology (triage F, batch 11), fixed before the
+  V2 campaign runs. Documents, a unit-test module and the range
+  bootstrap's rule count; no agent change.
+  - LAB-012: the denominator is frozen in `docs/validation/v2-rules.tsv`
+    (version 1, 77 rows: the 76 rules `default_rules_with_net` loads and
+    NN-L-AT-001, which `process_event` issues), none N/A. `matrix.md`
+    records each frozen file's version, row count and sha256, a change
+    log, and the gate formulas: a miss is a FAIL whatever its triage class
+    (the class says where the fix goes), a rule never run is NOT RUN and
+    counts as a FAIL, the figures belong to one build, and only a matrix
+    row with its `evidence/<run-id>/` counts. `v2-controls.tsv`: one
+    evasion row and one benign control per family (8 families, 16 rows).
+    Design §4.3 amends §4, §6.3, §8.1, Q1 and the cross-cutting notes.
+    The range bootstrap expected 69 rules (`EXPECTED_RULE_COUNT`) while
+    the source loads 76: `00_config.sh` now counts the registry's `engine`
+    rows; RANGE_SETUP.md follows.
+  - LAB-013: `v2-techniques.tsv`, 59 rows over 56 techniques, each with
+    its rules, where the mapping comes from (code, design, audit,
+    v2-draft, or assigned in the registry) and its expected outcome: a
+    rule fires (40), an anti-tamper denial (2), a signed drift (1), or a
+    known gap (16: T1562.004/.012, T1055.008/.009 against another process,
+    T1070.004/.006, T1499 against the agent, T1497, T1480, T1547.013,
+    T1021.004, T1003.008 and four discovery techniques). T1070 has rule
+    rows (FIM-005, FIM-018/019/020), as do T1574.006 (FIM-022) and
+    T1556.003 (FIM-021). Technique coverage is reported apart from rule
+    coverage, with no gate; REPORT.md now has the three figures.
+  - TST-019: the sub-gate is the `gate = critical` rows: the rules Q1
+    names (all eight CHAIN rules, CHAIN-008 included) and every other rule
+    that can issue a Critical verdict (R004, R006, R007, R018, FIM-024,
+    FIM-025, CANARY-001..004, NET-001, NET-003), 26 in all. Its table in
+    `matrix.md` gives, per rule, the unit test, the privileged e2e, the
+    lab probe and the campaign evidence, or `no proof`: an e2e that waits
+    for the verdict for 8 rules, an e2e of the trip event only for
+    CANARY-001/002, CHAIN-007's e2e ignored as flaky, unit tests only for
+    15, no unit test for CHAIN-006, campaign proof for none. Found:
+    NET-003 cannot fire (`FlowTracker::attach_tls` has no caller, so no
+    flow carries a TLS fingerprint) nor can CANARY-003 (nothing outside
+    tests calls `CanaryIndexes::is_canary_port`); both are FAILs unless
+    wired before V2. Not done: the e2e the audit proposes for
+    FIM-001/002/008/010 and same-PID CHAIN-001/003 — the table records
+    them as `no proof`.
+  - Tests (`agent/src/decision/validation_registry.rs`):
+    `registry_lists_exactly_the_rules_the_agent_ships`,
+    `every_rule_q1_names_is_in_the_critical_sub_gate`,
+    `every_critical_rule_has_an_evidence_row_with_no_empty_cell`,
+    `recorded_versions_and_hashes_match_the_frozen_files`,
+    `family_roll_up_counts_match_the_registry`,
+    `technique_and_control_rows_cite_shipped_rules_and_existing_probes`.
+    They fail with a registry row dropped, a Q1 rule out of the gate, an
+    evidence row dropped or emptied, a cited test renamed, a status its
+    cells do not support, a frozen file edited without its hash, or a
+    family without a benign control.
+  - Lab: No lab run: methodology and its registry. `validation_registry` tests pass on the tree with lab PRs 140–158 (77 rules, R007's two registrations accepted; every evidence cell resolves to a test or probe that exists). Two Critical rules of the sub-gate cannot fire today (NN-L-NET-003: no TLS fingerprint producer; NN-L-CANARY-003: `is_canary_port` has no caller): the 100 % Critical gate cannot pass before they are wired or retired. Gate: the integration tree of lab PRs 148–150, 153–156 and 159 (on top of 142–147 and 151): Ubuntu 24.04, 31 suites, 91 passed, 0 failed, anti-tamper suite OK, `respawn-check`, `verify-image` and `pkg-check` OK; Debian 12 34 suites, 77 passed (the two failures: the iptables guard self-tests of lab PR 158, part of that tree and fixed there) and Ubuntu 22.04 34 suites, 77 passed (the same two) on the tree that adds lab PRs 138, 152, 158, 160 and 161; host 2056 passed, 0 failed.

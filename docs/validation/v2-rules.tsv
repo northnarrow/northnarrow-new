@@ -1,0 +1,103 @@
+# NorthNarrow — V2 validation campaign — frozen rule denominator.
+# version: 1
+# frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217, NN-AUD-235).
+#
+# One row per rule the agent can record: the 76 rules the production engine
+# loads (decision::rules::default_rules_with_net) and NN-L-AT-001, which
+# process_event issues outside the engine. The rule-coverage headline and the
+# Critical sub-gate are computed over these rows and no others; matrix.md
+# gives the formulas and the sha256 of this file. A change is a new version,
+# recorded there before the family it touches runs.
+# agent/src/decision/validation_registry.rs checks this file against the code.
+#
+# Columns (tab-separated):
+#   rule_id  the id the agent records (Verdict.rule_id)
+#   family   the matrix roll-up family; one evasion and one benign control
+#            per family in v2-controls.tsv
+#   where    engine = loaded by the production engine; direct = issued
+#            outside it
+#   gate     critical = in the 100 % Critical sub-gate: every rule design
+#            §13 Q1 names, and every other rule that can issue a Critical
+#            verdict; - otherwise
+#   q1       yes = named by Q1 itself (FIM-001/002/008/010/021/022 and every
+#            CHAIN rule); - otherwise
+#   status   in = in the denominator; n/a:<reason> = left out, decided in a
+#            version recorded before the run
+rule_id	family	where	gate	q1	status
+NN-L-CHAIN-001_CredReadThenEgress	chain	engine	critical	yes	in
+NN-L-CHAIN-002_TmpExecThenEgress	chain	engine	critical	yes	in
+NN-L-CHAIN-003_CanaryThenEgress	chain	engine	critical	yes	in
+NN-L-CHAIN-004_CrossPidCredExfil	chain	engine	critical	yes	in
+NN-L-CHAIN-005_CrossPidTmpC2	chain	engine	critical	yes	in
+NN-L-CHAIN-006_CrossPidCanaryExfil	chain	engine	critical	yes	in
+NN-L-CHAIN-007_TmpCredExfilSequence	chain	engine	critical	yes	in
+NN-L-CHAIN-008_CrossPidPrivEscExfil	chain	engine	critical	yes	in
+R001_ExecFromTmp	process	engine	-	-	in
+R002_ExecFromDevShm	process	engine	-	-	in
+R003_ExecFromVarTmp	process	engine	-	-	in
+R004_ExecFromProcSelfFd	process	engine	critical	-	in
+R005_NetcatExec	process	engine	-	-	in
+R006_ReverseShellTooling	process	engine	critical	-	in
+R007_CryptoMiner	process	engine	critical	-	in
+R008_HiddenHomeBinary	process	engine	-	-	in
+R009_RootExecFromUserPath	process	engine	-	-	in
+R010_BinaryInWebroot	process	engine	-	-	in
+R011_KernelModuleTooling	process	engine	-	-	in
+R012_SetcapTooling	process	engine	-	-	in
+R013_NamespaceEscapeTooling	process	engine	-	-	in
+R014_AtBatchScheduling	process	engine	-	-	in
+R015_EncodingToolingServiceUid	process	engine	-	-	in
+R016_DebuggerServiceUid	process	engine	-	-	in
+R017_ShellFromNonstandardPath	process	engine	-	-	in
+R018_KernelModuleLoad	process	engine	critical	-	in
+NN-L-FIM-001_SystemBinaryModified	fim	engine	critical	yes	in
+NN-L-FIM-002_NewSuidBinary	fim	engine	critical	yes	in
+NN-L-FIM-003_SensitiveConfigModified	fim	engine	-	-	in
+NN-L-FIM-004_AuthorizedKeysModified	fim	engine	-	-	in
+NN-L-FIM-005_LogTruncated	fim	engine	-	-	in
+NN-L-FIM-006_OperatorBinaryModified	fim	engine	-	-	in
+NN-L-FIM-007_CronDropInCreated	fim	engine	-	-	in
+NN-L-FIM-008_KernelModuleModified	fim	engine	critical	yes	in
+NN-L-FIM-009_SystemdUnitDropped	fim	engine	-	-	in
+NN-L-FIM-010_RansomwareExtensionRename	fim	engine	critical	yes	in
+NN-L-FIM-011_AwsCredsRead	fim	engine	-	-	in
+NN-L-FIM-012_AzureCredsRead	fim	engine	-	-	in
+NN-L-FIM-013_GcpCredsRead	fim	engine	-	-	in
+NN-L-FIM-014_DockerCredsRead	fim	engine	-	-	in
+NN-L-FIM-015_BrowserCredsAccessed	fim	engine	-	-	in
+NN-L-FIM-016_PasswordManagerDbAccessed	fim	engine	-	-	in
+NN-L-FIM-017_GpgKeyringAccessed	fim	engine	-	-	in
+NN-L-FIM-018_LastlogTampered	fim	engine	-	-	in
+NN-L-FIM-019_WtmpBtmpTampered	fim	engine	-	-	in
+NN-L-FIM-020_ShellHistoryCleared	fim	engine	-	-	in
+NN-L-FIM-021_PamModuleModified	fim	engine	critical	yes	in
+NN-L-FIM-022_LdSoPreloadModified	fim	engine	critical	yes	in
+NN-L-FIM-023_SystemdTimerCreated	fim	engine	-	-	in
+NN-L-FIM-024_AntiTamperHoneypotModified	fim	engine	critical	-	in
+NN-L-FIM-025_FileCapabilityGranted	fim	engine	critical	-	in
+NN-L-CANARY-001_FileAccess	canary	engine	critical	-	in
+NN-L-CANARY-002_ProcessExec	canary	engine	critical	-	in
+NN-L-CANARY-003_NetworkConnect	canary	engine	critical	-	in
+NN-L-CANARY-004_CredentialRead	canary	engine	critical	-	in
+NN-L-NET-001_OutboundToBlockedIp	net	engine	critical	-	in
+NN-L-NET-002_OutboundToBlockedTld	net	engine	-	-	in
+NN-L-NET-003_BadJa3	net	engine	critical	-	in
+NN-L-NET-004_SuspiciousDnsQname	net	engine	-	-	in
+NN-L-NET-005_DnsTxtNullBurst	net	engine	-	-	in
+NN-L-NET-006_UncommonListener	net	engine	-	-	in
+NN-L-NET-007_Rfc1918FromUnusualProc	net	engine	-	-	in
+NN-L-NET-008_OutboundFromTmpExec	net	engine	-	-	in
+NN-L-NET-009_ByteAnomaly	net	engine	-	-	in
+NN-L-NET-010_OutboundToHighRiskC2Port	net	engine	-	-	in
+NN-L-NET-011_PlaintextCredService	net	engine	-	-	in
+NN-L-NET-013_Beacon	net	engine	-	-	in
+NN-L-NET-014_DnsTunnelEntropy	net	engine	-	-	in
+NN-L-NET-018_Rfc1918LateralPort	net	engine	-	-	in
+NN-L-NET-019_WildcardListener	net	engine	-	-	in
+NN-L-NET-020_DnsQueryFlood	net	engine	-	-	in
+NN-L-NET-021_SensorRecordFlood	net	engine	-	-	in
+NN-L-IOU-001_IoUringRingCreated	io_uring	engine	-	-	in
+NN-L-IOU-002_IoUringFileAndNetwork	io_uring	engine	-	-	in
+NN-L-BPF-001_BpfProgramLoaded	bpf	engine	-	-	in
+NN-L-BPF-002_BpfForeignHandleOrDetach	bpf	engine	-	-	in
+NN-L-AT-001_AntiTamperDenial	anti-tamper	direct	-	-	in

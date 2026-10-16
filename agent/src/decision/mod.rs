@@ -50,3 +50,5 @@ pub trait Rule: Send + Sync {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod validation_registry;

@@ -1,7 +1,9 @@
 # RANGE_SETUP.md — Adversarial Validation range (current state + runbook)
 
 Operator runbook for the two-VM, fully isolated VirtualBox range that
-validates the **69-rule** production engine against real attacker tooling.
+validates the production engine — the frozen rule registry
+[`docs/validation/v2-rules.tsv`](docs/validation/v2-rules.tsv), 76 engine rules in
+version 1 — against real attacker tooling.
 Design of record: [`docs/design/TAPPA10_7_ADVERSARIAL_VALIDATION_DESIGN.md`](docs/design/TAPPA10_7_ADVERSARIAL_VALIDATION_DESIGN.md).
 
 > This file reflects the range **as it actually is** (verified 2026-06-02),
@@ -125,7 +127,7 @@ VBoxManage controlvm kalidev        nic1 nat   # re-enable NAT to download tools
 ### Snapshots (revert points)
 ```bash
 # target — AFTER bootstrap health check passes, NOPASSWD removed, NAT detached:
-VBoxManage snapshot northnarrowdev take clean-prod --description "69-rule prod, BUG-042 unit, isolated"
+VBoxManage snapshot northnarrowdev take clean-prod --description "registry v1 prod (76 rules), BUG-042 unit, isolated"
 # attacker — AFTER toolchain verified, NAT + Tailscale detached:
 VBoxManage snapshot kalidev take armed --description "toolchain ready, isolated"
 ```
@@ -142,7 +144,7 @@ dry-run against the live agent on 2026-06-02):
 | Probe | Pass condition |
 |---|---|
 | Units | `northnarrow-agent` **and** `northnarrow-watchdog` active |
-| Rule count | `decision engine ready … rules=69` (engine's own load; not the stale 61/68) |
+| Rule count | `decision engine ready … rules=N`, N = the `engine` rows of `docs/validation/v2-rules.tsv` (76 in version 1; engine's own load) |
 | LSM | `bpf` in `/sys/kernel/security/lsm` **and** NN BPF-LSM progs attached (`task_kill`, `inode_*`, `fim_*`, `ptrace_access_check`) |
 | **Capabilities (master probe)** | running agent's `CapEff` decodes to the BUG-042 set **and does NOT include `cap_sys_admin`** |
 | COMBAT at rest | `nn-admin status --json` → `network_isolation_engaged:false`; no `northnarrow` iptables chain |
@@ -161,12 +163,13 @@ deterministic proof that lineage/quarantine exe-reads will work — and the
 same decode simultaneously proves `+i` re-arm (`CAP_LINUX_IMMUTABLE`) and
 the minimal BPF-attach path (`CAP_PERFMON`, not `CAP_SYS_ADMIN`).
 
-> Note on the rule count: the *currently running* binary reports **68**,
-> not 69 — it was built 2026-05-30, before BUG-034 added R018
-> (2026-06-01). The bootstrap rebuilds from source, which loads **69**
-> (`agent/src/decision/tests.rs` pins exactly this). The legacy docs say
-> **61** (T10.5 era). All three numbers are reconciled in the design §4
-> note; **69 is correct after bootstrap.**
+> Note on the rule count: the count the bootstrap expects comes from the
+> frozen V2 registry (`deploy/adversarial/00_config.sh` reads its `engine`
+> rows), which `agent/src/decision/validation_registry.rs` checks against
+> the source — 76 in version 1. The 61, 68 and 69 of older notes were the
+> T10.5-era pin, a binary built before BUG-034 (R018), and the count
+> before NN-L-NET-020/021, NN-L-FIM-025 and the io_uring and BPF rules
+> (external audit NN-AUD-217, design §4.3).
 
 ## 7. Evidence pull — read-only shared folder
 

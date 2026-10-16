@@ -15,6 +15,28 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   verdicts act again and is reported as a weakening in the signed chain.
 
 ### Fixed
+- External audit, Wave 2, validation methodology (Medium LAB-012, LAB-013,
+  TST-019): the adversarial campaign's coverage gates could not fail — a
+  miss triaged after the run as N/A or as a sensor gap left the
+  denominator — ATT&CK coverage had no definition, and the "100 % on the
+  Critical tier" sub-gate had nothing behind it. Before the campaign runs,
+  its denominator is frozen in `docs/validation/v2-rules.tsv` (77 rules:
+  the 76 the production engine loads and NN-L-AT-001), with the technique
+  rows (`v2-techniques.tsv`, the techniques without a rule included, each
+  with its expected outcome) and one evasion row and one benign control
+  per family (`v2-controls.tsv`). `matrix.md` records the version and
+  sha256 of each and the gate formulas: a miss is a FAIL whatever its
+  triage class, a rule never run counts against the headline, technique
+  coverage is reported apart. The Critical sub-gate holds the rules the
+  design's Q1 names and every other rule that can issue a Critical verdict
+  (26), and `matrix.md` says where each one's proof lives today, and
+  `no proof` where there is none: none has campaign proof yet, 15 have
+  unit tests only, and NN-L-NET-003 and NN-L-CANARY-003 cannot fire on the
+  agent as built (no TLS fingerprint is captured, nothing produces a
+  Network canary trip). Unit tests hold the registry to the shipped
+  rules and the recorded hashes to the files. The range bootstrap
+  expected 69 rules; it now takes the count from the registry (76). No
+  change to the agent.
 - External audit, Wave 2, anti-tamper suite correctness and coverage
   (Medium LAB-003, LAB-004, LAB-005, LAB-007): `tamper-check` could kill
   its own session: C02 signalled whatever `systemctl show -p MainPID`

@@ -1,0 +1,43 @@
+# NorthNarrow — V2 validation campaign — pre-registered controls.
+# version: 1
+# frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217).
+#
+# One evasion row and one benign control per family of v2-rules.tsv. The
+# evasion row runs a variant of a technique the family is meant to catch,
+# not its most detectable form; the benign row runs legitimate activity the
+# family must not punish. Both are matrix rows like any other: an evasion
+# that is not caught is a FAIL, a benign control that is killed is a false
+# positive in REPORT.md section 5. The expected outcome is the acceptance
+# criterion, fixed before the run; it is not a prediction of the result.
+# agent/src/decision/validation_registry.rs checks the families, rule ids
+# and probes.
+#
+# Columns (tab-separated):
+#   id        row id (CVnn)
+#   family    a family of v2-rules.tsv
+#   kind      evasion or benign
+#   scenario  what is run
+#   rules     the rules expected to fire or record, comma-separated, or -
+#   expected  fire = the listed rules fire; denied = an anti-tamper hook
+#             refuses the action and NN-L-AT-001 records it; no-kill = at
+#             most recorded (Log), no process killed; no-verdict = no verdict
+#             above Log from the family's rules
+#   probe     an existing lab probe that runs the row (path::text it
+#             contains), or -
+id	family	kind	scenario	rules	expected	probe
+CV01	chain	evasion	A credential-store read by a parent, the egress by a descendant that double-forked and was reparented to init	NN-L-CHAIN-004_CrossPidCredExfil	fire	-
+CV02	chain	benign	A package-manager transaction that runs a maintainer script from a staging directory and downloads over HTTPS	-	no-verdict	-
+CV03	process	evasion	A payload in /tmp executed through a symlink in a root-owned directory	R001_ExecFromTmp	fire	deploy/lab/exec-sensor/exec-sensor-check.sh::exec through a symlink
+CV04	process	benign	A routine administration session: package update, service restart, scripts from /usr/local/bin	-	no-verdict	-
+CV05	fim	evasion	~/.aws/credentials read through an io_uring ring (no open(2) or read(2) call)	NN-L-FIM-011_AwsCredsRead	fire	-
+CV06	fim	benign	apt-get install --reinstall of a package that ships a binary under /usr/bin and a systemd unit	-	no-kill	-
+CV07	canary	evasion	The file canary opened through a second hard link (another path, same inode)	NN-L-CANARY-001_FileAccess	fire	-
+CV08	canary	benign	A backup program listed in canary-readers reads the home directory that holds a file canary	NN-L-CANARY-001_FileAccess	no-kill	-
+CV09	net	evasion	A connection to a high-risk C2 port by a binary whose comm is set to an allowlisted name	NN-L-NET-010_OutboundToHighRiskC2Port	fire	-
+CV10	net	benign	apt-get update and HTTPS downloads from the target	-	no-verdict	-
+CV11	io_uring	evasion	A file read and a network send through io_uring by a binary whose comm is set to an allowlisted name	NN-L-IOU-002_IoUringFileAndNetwork	fire	-
+CV12	io_uring	benign	An ordinary program that uses io_uring for file I/O only	NN-L-IOU-001_IoUringRingCreated	no-kill	-
+CV13	bpf	evasion	A foreign process reaches the agent's link_task_kill pin through a symlink	NN-L-BPF-002_BpfForeignHandleOrDetach	denied	deploy/lab/adversarial/anti-tamper.sh::case C40
+CV14	bpf	benign	bpftool feature probe (loads test programs)	NN-L-BPF-001_BpfProgramLoaded	no-kill	deploy/lab/adversarial/anti-tamper.sh::case C10
+CV15	anti-tamper	evasion	SIGKILL of the agent through systemctl kill, outside a trusted-installer window	NN-L-AT-001_AntiTamperDenial	denied	deploy/lab/adversarial/anti-tamper.sh::case C31
+CV16	anti-tamper	benign	nn-admin audit verify from the public half of the signing key	-	no-verdict	deploy/lab/adversarial/anti-tamper.sh::case C42
