@@ -38,7 +38,7 @@ The doctrine has five phases. They are not strictly sequential in time (multiple
 
 **Technical capabilities**:
 
-- RAG corpus over MITRE ATT&CK, CVE, CWE, RustSec, IoC, and TTP mappings — the structured threat knowledge base, indexed in Tantivy and queried at decision time.
+- RAG corpus over MITRE ATT&CK, CVE, CWE, RustSec, IoC, and TTP mappings — the structured threat knowledge base, indexed in Tantivy and queried at decision time. Shipped today: a pinned corpus of MITRE ATT&CK, SigmaHQ Linux rules and seed notes, off by default (§ Tappa 6.9.7 below).
 - Customer environment fingerprinting — process behavior baselines, network topology mapping, sensor placement optimization.
 - Threat intelligence feeds — anonymized cross-tenant IoC sharing (Tappa 14.x), JA3/JA4 TLS fingerprint correlation.
 - Adversarial training — continuous exposure to red-team-generated attack patterns (Tappa 15.4 + 15.6) to harden the detection model against novel variants.
@@ -86,8 +86,8 @@ adds the complementary *inbound* direction.
 
 **Technical capabilities**:
 
-- Posture state machine (Tappa 6.5) — four-state escalation (OBSERVING → ALERTED → ENGAGED → COMBAT), each state expanding ADE's response authority. State transitions are based on stateful threat assessment, not isolated event classification.
-- Hardening layer (Tappa 6.6) — four-layer defense against adversarial inputs targeting the AI engine (sanitize → structured prompt → sanity check → dual verify).
+- Posture state machine (Tappa 6.5) — four-state escalation (OBSERVING → ALERTED → ENGAGED → COMBAT). Each state above OBSERVING raises the severity of the model's verdicts and, at Medium or above, lifts an Allow (from ENGAGED also a Monitor) to an Alert; COMBAT engages the graduated response ladder, which is deterministic. State transitions are based on stateful threat assessment, not isolated event classification. The model's verdicts do not feed the posture, and since lab PR 134 a verdict stays a recommendation in every state (see "The model's role today" below).
+- Hardening layer (Tappa 6.6) — four-layer defense against adversarial inputs targeting the AI engine (sanitize → structured prompt → sanity check → dual verify), reworked with the external audit (below). Since lab PR 134 the model's output is a recommendation, so what the layer bounds is a wrong recommendation, not a kill.
 - Anti-tamper substrate (Tappa 7) — kernel-level LSM hooks that protect the agent from termination, prevent tampering with detection state, and survive across agent restart via pin-based reuse pattern.
 - Detection rules engine (Tappa 10) — sandbox-isolated rule evaluation, hot-reload, versioned ruleset.
 
@@ -105,7 +105,7 @@ adds the complementary *inbound* direction.
 
 **Technical capabilities** (Tappa 10.5):
 
-- Dynamic rule synthesis — ADE in COMBAT state generates candidate detection rules based on observed attack patterns.
+- Dynamic rule synthesis — ADE in COMBAT state generates candidate detection rules based on observed attack patterns. Not built. Since lab PR 134 every model output is a recommendation; this phase would have to revisit that decision explicitly, with the guardrails below.
 - Digital Twin pre-validation (Tappa 14.4.5 — prerequisite) — every synthesized rule is tested against a shadow-mode digital twin of the customer environment before deployment, eliminating false positives that would harm production.
 - Hard cap on rules per window — maximum 5 synthesized rules per 60-second window, preventing rule explosion.
 - Immutable whitelist — medical, industrial control system, aviation, and regulated subsystems are never affected by synthesized rules.
@@ -191,7 +191,7 @@ Doctrine includes explicit refusals — what the agent will never do, regardless
 
 The doctrine aligns with EU AI Act Article 13 (transparency and explainability) and the Network and Information Security Directive (NIS 2) requirements.
 
-**Article 13**: every defensive action, especially Phase 4 Battle-Time Synthesis, carries an XAI saliency map and evidence chain. The customer (and regulator) can reconstruct why each rule was generated, which input tokens drove the model's reasoning, and which RAG documents informed the verdict.
+**Article 13**: every defensive action, especially Phase 4 Battle-Time Synthesis, is meant to carry an XAI saliency map and evidence chain, so that the customer (and regulator) can reconstruct why each rule was generated, which input tokens drove the model's reasoning, and which RAG documents informed the verdict. Today the XAI chain is a standalone capability, not yet wired to production verdicts (its consumer, Tappa 10.5, is not built); which RAG documents were retrieved is covered only in part until the Tappa 13 retrieval log; and by default a model output is a recommendation to the operator, not an action (dossier `docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md` §§8–10).
 
 **NIS 2**: the Ed25519 admin protocol provides cryptographic audit trail for all administrative actions. COMBAT state changes are signed and timestamped; recovery requires cryptographic challenge-response, eliminating spoofed administrative commands.
 
@@ -275,6 +275,73 @@ toward curated evidence. Plan of record:
   **2.2 ms** (≤ 50 ms budget, ~23× margin), cold `open_index`
   **707 ms** (≤ 5 s). Golden suite 22/24 (cross-source Sigma
   co-retrieval gap documented — post-beta hybrid re-rank / GTFOBins).
+  Since lab PR 145 there is no index on disk to open: the in-memory
+  build takes about 0.4 s at start, and the golden bench gives 28/30
+  with a retrieval p50 of 87 µs on the host.
+
+---
+
+## The model's role today (after the external audit of `16f7563`)
+
+The doctrine above was written when the model was meant to decide. Its
+inputs include strings an attacker writes — command lines, file names, DNS
+names — and no prompt hardening makes it safe to let such a verdict kill on
+its own. What holds since October 2026:
+
+- **The ADE is a consultant (product decision, lab PR 134).** A verdict
+  that names a response (Kill, KillTree, Quarantine, BlockNetwork, Isolate)
+  is recorded as a recommendation — a detection with the model's
+  reasoning, response `advisory: <action> recommended by the model, not
+  executed` — and nothing runs (`agent/src/ade/advisory.rs`). Responses
+  stay with the deterministic rules and the COMBAT ladder, which can be
+  verified; since lab PR 103 (NN-AUD-050) an `Isolate` verdict no longer
+  isolates the host on its own. A prompt injection can therefore cost a wrong
+  recommendation or a forced human review, not a kill, a quarantine or a
+  block. `NN_ADE_ENFORCE=1` lets verdicts act again; it is a weakening
+  variable, recorded at every start in the signed audit log
+  (`integrity_drift`, `weakening_env`).
+- **Untrusted data stays data (lab PRs 81, 132, 133).** The correlated
+  events reach the model sanitized, in an untrusted block, every string
+  printed as a JSON string (NN-AUD-003). Each string is scored once, on its
+  deduplicated flags; one strong signal (a chat-template token, an explicit
+  "ignore previous instructions", a role switch) forces an Escalate on its
+  own, a high injection score overrides any verdict but Escalate, a severe
+  indicator with an Allow is escalated, and a confidence or novelty
+  outside [0, 1] is a parse error. The system prompt (v1.1) says that
+  observed strings are evidence, never instructions; its three examples
+  decide on behaviour in the format the agent sends.
+- **The window keeps the system prompt (lab PR 133).** The prompt must fit
+  4,096 − 768 = 3,328 tokens; the engine drops the oldest correlated
+  events, then the RAG block, never the system prompt, and an event whose
+  prompt still does not fit is escalated without a model call. The prefill
+  runs in 256-token chunks against the time budget; a timeout or a backend
+  error is recorded as an Escalate (`ade_unavailable`).
+- **The context is chosen for relevance (lab PR 144).** At most 20
+  correlated events: up to half of them share the process, its parent or
+  the file with the focal event (within 5 minutes), then nearby events;
+  the focal event is no longer repeated in its own context, and an event
+  left out for its injection score takes no slot but still weighs in the
+  sanity check. The selection runs on the evaluation's task, off the event
+  loop.
+- **RAG only from the pinned corpus (lab PR 145).** RAG (off by default)
+  starts only over the dumps `docs/kb-sources/kb_index.json` pins, byte for
+  byte, with the index built in memory at every start; anything else
+  leaves it off, with a signed `subsystem_degraded` (§ Tappa 6.9.7 above).
+- **The model is root's to install (lab PR 105).** The model and tokenizer
+  load only from root-owned paths closed to others; a model that fails to
+  load leaves the ADE off, with no mock fallback.
+- **Known limit: one evaluation slot.** Evaluations run one at a time, off
+  the event loop (NN-AUD-004, lab PR 82); an exec that arrives while one
+  runs is judged by the rules only and counted. For each exec the
+  `ExecCheck`, which carries the parent's comm, takes the slot, and the
+  child's `ProcessSpawn` microseconds later is counted and dropped: the
+  model judges the exec under its parent's name. Found in the lab (lab PR
+  144), to be improved; listed with the other follow-ups in
+  `docs/audit/EXTERNAL_AUDIT_16f7563.md`.
+- **Not re-measured.** No lab guest has the model. The real token count
+  of the v1.1 prompt, `ade_attacks` before and after these changes (the
+  off-repo LoRA was trained on the old prompt format) and the golden of
+  the production tokenizer are owed on a model host.
 
 ---
 
@@ -291,6 +358,7 @@ The doctrine is the spec. The Tappe are the implementation.
 ---
 
 *Document version: 1.0 — initial canonical statement, May 17, 2026.*
+*Version 1.1 — October 16, 2026: the model's role after the external audit of `16f7563` (advisory, prompt window and sanitization, context selection, pinned RAG corpus, one evaluation slot).*
 *Companion document: `docs/XDR_ROADMAP.md` — Tappa-level implementation map.*
 *Companion document: `docs/ADE_SUITE_VISION.md` — model architecture (ADE-Defense + ADE-Forge) supporting this doctrine.*
 *Companion document: `docs/strategy/ADE_ACTIVE_DEFENDER_VISION.md` — Phase-2 / release-V1.5 Active Defender strategic context (Knowledge Ingestion, Environmental Awareness, Vulnerability Intelligence, Adaptive Deception, Panopticon, sovereignty inbound/outbound).*

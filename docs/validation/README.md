@@ -24,3 +24,11 @@ reported apart (NN-AUD-218). `matrix.md` holds the gate formulas and,
 for the 100 % Critical sub-gate, where each rule's proof lives today
 (NN-AUD-235). `agent/src/decision/validation_registry.rs` checks all of
 this against the code.
+
+**Before V2 runs:** two of the 26 rules of the Critical sub-gate cannot
+fire on the agent as built — NN-L-CANARY-003 (nothing produces a Network
+canary trip: `CanaryIndexes::is_canary_port` has no caller outside tests)
+and NN-L-NET-003 (no sensor captures a TLS fingerprint, BUG-025). Each
+counts as a FAIL, so the 100 % sub-gate cannot pass until both are wired
+or retired; they are listed with the follow-ups of
+[`../audit/EXTERNAL_AUDIT_16f7563.md`](../audit/EXTERNAL_AUDIT_16f7563.md).
