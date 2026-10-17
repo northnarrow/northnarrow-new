@@ -17,7 +17,7 @@ path = "src/main.rs"
 # agent-ebpf/.cargo/config.toml. The xtask runner builds it.
 
 [dependencies]
-aya-ebpf = "0.1"
+aya-ebpf = "0.2"
 northnarrow-common = { path = "../common", default-features = false }
 
 [profile.dev]
