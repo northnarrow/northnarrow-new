@@ -552,8 +552,14 @@ pub async fn wait_for_agent_death(agent_pidfd: &OwnedFd) -> Result<()> {
     // task reap. `with_interest` is preferred over `new()` so we
     // don't accidentally register WRITE interest and pay for
     // pointless EPOLLOUT wakeups.
-    let async_fd = AsyncFd::with_interest(agent_pidfd.as_fd(), Interest::READABLE)
-        .context("registering agent pidfd with tokio AsyncFd")?;
+    // SAFETY: `agent_pidfd` is borrowed for this whole function and the
+    // `AsyncFd` is dropped before it returns: the pidfd stays open and
+    // names the same process for the `AsyncFd`'s life (tokio#8587 made
+    // that contract explicit in `register_with_interest`).
+    let async_fd =
+        unsafe { AsyncFd::register_with_interest(agent_pidfd.as_fd(), Interest::READABLE) }
+            .map_err(std::io::Error::from)
+            .context("registering agent pidfd with tokio AsyncFd")?;
     // `readable()` returns when epoll reports POLLIN. We drop
     // the ready guard immediately — there's nothing to "read"
     // from a pidfd; the wakeup IS the message.
@@ -1968,7 +1974,10 @@ pub async fn stuck_recovery(
         );
         return Ok(());
     }
-    let async_fd = AsyncFd::with_interest(owned, Interest::READABLE)
+    // SAFETY: the `AsyncFd` takes `owned`, the pidfd, and keeps it open
+    // and unchanged until it is dropped (tokio#8587).
+    let async_fd = unsafe { AsyncFd::register_with_interest(owned, Interest::READABLE) }
+        .map_err(std::io::Error::from)
         .context("registering pidfd with AsyncFd for stuck recovery")?;
 
     // 1. SIGINT.
