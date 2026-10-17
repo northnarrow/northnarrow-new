@@ -528,13 +528,21 @@ impl Drop for E2eFixture {
         // suite (it hung every teardown on the 5.15 lab guest).
         if let Some(mut a) = self.agent_child.take() {
             let tree = unprotect_tree(a.id());
+            // SIGCONT first: a test that stopped the agent
+            // (`a_removed_admin_socket_is_rebound_and_a_stopped_agent_recovered`)
+            // leaves its sudo stopped too — sudo stops itself when its
+            // command stops — and a stopped process keeps SIGQUIT pending:
+            // it stayed, holding the runner's stdout, and the lab gate
+            // never got past this suite.
             for p in tree.iter().rev() {
-                let _ = Command::new("sudo")
-                    .arg("kill")
-                    .arg("-QUIT")
-                    .arg(p.to_string())
-                    .stderr(Stdio::null())
-                    .status();
+                for sig in ["-CONT", "-QUIT"] {
+                    let _ = Command::new("sudo")
+                        .arg("kill")
+                        .arg(sig)
+                        .arg(p.to_string())
+                        .stderr(Stdio::null())
+                        .status();
+                }
             }
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
@@ -567,12 +575,14 @@ impl Drop for E2eFixture {
                         }
                     }
                 }
-                let _ = Command::new("sudo")
-                    .arg("pkill")
-                    .arg("-QUIT")
-                    .arg("-f")
-                    .arg(basename)
-                    .status();
+                for sig in ["-CONT", "-QUIT"] {
+                    let _ = Command::new("sudo")
+                        .arg("pkill")
+                        .arg(sig)
+                        .arg("-f")
+                        .arg(basename)
+                        .status();
+                }
             }
         }
         // Purge bpffs so the next test starts clean.
