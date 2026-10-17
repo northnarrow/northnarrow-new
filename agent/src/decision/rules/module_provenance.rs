@@ -62,7 +62,7 @@ impl ModuleOwners {
     /// dpkg list, and `rpm -qf` is a process to wait for, so both run off
     /// its worker.
     pub fn of(&self, path: &str) -> Provenance {
-        crate::fim::drain::off_the_runtime(|| self.lookup(path))
+        crate::runtime::off_the_runtime(|| self.lookup(path))
     }
 
     fn lookup(&self, path: &str) -> Provenance {

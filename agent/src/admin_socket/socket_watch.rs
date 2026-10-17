@@ -93,14 +93,18 @@ pub fn bind(path: &Path) -> Result<(UnixListener, SocketId)> {
     let listener = UnixListener::bind(path)
         .with_context(|| format!("binding admin socket {}", path.display()))?;
     // bind() honours the umask; root:root remains via ownership of the
-    // bind() syscall (V1.1 will tighten to root:northnarrow 0660).
+    // bind() syscall. The mode is the first gate; the accept loop checks
+    // each peer's uid as well (external audit ASK-012, NN-AUD-238), so a
+    // mode widened later lets no other user in. V1.1's root:northnarrow
+    // 0660 would widen both together.
     let id = restrict(path).with_context(|| format!("chmod 0600 {}", path.display()))?;
     Ok((listener, id))
 }
 
 /// Remove whatever sits at `path`: never through a link, never a
-/// directory (a refusal, not a recursive delete).
-fn clear(path: &Path) -> Result<()> {
+/// directory (a refusal, not a recursive delete). Also the agent's unlink
+/// at shutdown (`admin_socket::unlink_socket`, external audit ASK-014).
+pub(crate) fn clear(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() => Err(anyhow!(
             "{} is a directory, not a socket the agent can replace",

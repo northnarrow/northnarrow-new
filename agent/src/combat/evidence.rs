@@ -104,6 +104,7 @@ impl LadderEvidence for AuditEvidence {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         };
         let mut guard = log.lock();
         if let Err(e) = guard.append(draft) {

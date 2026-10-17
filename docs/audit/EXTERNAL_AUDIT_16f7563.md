@@ -445,11 +445,11 @@ group, the ones an unprivileged user or a local attacker could use first.
 
 | ID | Audit ref | Severity | Area | Effort | Status |
 |---|---|---|---|---|---|
-| NN-AUD-236 | ASK-005 | Low | Admin socket | S | partly fixed (reads bounded, lab PR 139); open |
+| NN-AUD-236 | ASK-005 | Low | Admin socket | S | fixed (lab PR 179) |
 | NN-AUD-237 | ASK-009 | Low | Admin socket | M | open |
-| NN-AUD-238 | ASK-012 | Low | Admin socket | S | open |
-| NN-AUD-239 | ASK-013 | Low | Admin socket | S | open |
-| NN-AUD-240 | ASK-014 | Low | Admin socket | S | partly fixed (exit now signed, lab PR 138); open |
+| NN-AUD-238 | ASK-012 | Low | Admin socket | S | fixed (lab PR 179) |
+| NN-AUD-239 | ASK-013 | Low | Admin socket | S | fixed (lab PR 179) |
+| NN-AUD-240 | ASK-014 | Low | Admin socket | S | fixed (lab PR 179) |
 | NN-AUD-241 | ASK-015 | Low | Admin socket | S | open |
 | NN-AUD-242 | ASK-016 | Low | Admin socket | S | fixed (lab PR 170) |
 | NN-AUD-243 | ASK-017 | Low | Admin socket | S | open (latent) |
@@ -484,7 +484,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-272 | EBPF-021 | Low | eBPF kernel | M | open |
 | NN-AUD-273 | EVD-007 | Low | Evidence logs | M | open |
 | NN-AUD-274 | EVD-008 | Low | Evidence logs | M | partly fixed (audit/canary domains, lab PR 160); open |
-| NN-AUD-275 | EVD-010 | Low | Evidence logs | S | open (slightly worse: raw lines kept too) |
+| NN-AUD-275 | EVD-010 | Low | Evidence logs | S | fixed (lab PR 179) |
 | NN-AUD-276 | EVD-011 | Low | Evidence logs | S | open (narrowed) |
 | NN-AUD-277 | EVD-014 | Low | Evidence logs | S | open |
 | NN-AUD-278 | EVD-015 | Low | Evidence logs | S (+lab) | fixed (lab PR 169) |
@@ -6583,3 +6583,106 @@ group, the ones an unprivileged user or a local attacker could use first.
     the two normal-form tests call functions new in this lot.
     `canary_privileged_e2e` unchanged (it compiles).
   - Lab: Debian 12, decep178-probe.sh — before: the build of `main` 05b5738; after: this lot on top (registry, access log, head anchor and template backed up and put back, SHA-256 checked). A credential template with an unclosed `{{tenant_id`: deployed with the placeholder in the decoy before; refused after ("unresolved placeholder"). The same template grown to 2 MiB in place: a 2 MiB decoy before; refused after ("larger than 65536 bytes"); the original template deploys in both. One non-UTF-8 line appended offline to `canaries.jsonl` and `canary_access.jsonl`: before, "canary registry open failed" and "canary access log open failed", `canary list` refused, a read of a File decoy unseen; after, "unreadable lines skipped" for both files with two signed `chain_lines_unreadable`, `canary list` served, the read tripped NN-L-CANARY-001 Critical and the reader was killed. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.
+- **Wave 3 — admin socket peers and request cost, lab PR 179.** Batch 3
+  of the Wave 3 triage of the evidence and admin group: who may connect to
+  the admin socket and what one request costs the agent. Five Low
+  findings, on `main` 052e7d0 (lab PRs 162–175, 170's socket watch
+  included).
+  - ASK-012 (NN-AUD-238, fixed). Re-checked: `peer_creds` fed only the
+    audit fields; a failed `getsockopt(SO_PEERCRED)` gave
+    `AuditClient::unknown()` — uid 0, root — and the returned `len` was not
+    checked; the only gate was the 0600 set after bind. Now the accept loop
+    screens each peer before it gets a slot (so a refused peer cannot evict
+    a waiting connection either): `peer_allowed` admits uid 0 and the
+    agent's own euid (the same in production; it lets the unit tests' agent
+    serve its user); another uid, an unreadable `SO_PEERCRED` or a reply
+    that is not a whole `struct ucred` is closed without a reply. The
+    refusal is one signed `integrity_drift` `admin_socket_foreign_peer`
+    (uid, gid, pid, the peer's `comm` marked as its own name, its exe; "the
+    socket is created 0600 in a 0700 directory, so its mode, its owner or
+    its directory was changed") per `REREPORT_SECS` (600 s), the others
+    counted into the next one and logged at most every 10 s; the append
+    runs off the runtime. Not covered, documented: a descriptor that the
+    process which connected hands on keeps that process's credentials
+    (`SO_PEERCRED` is fixed at `connect()`; per-message `SCM_CREDENTIALS`
+    would need a framing change). V1.1's group socket turns the predicate
+    into "uid 0 or a member of the service group" (comment at the bind).
+  - ASK-013 (NN-AUD-239, fixed). Re-checked: `/proc/<pid>/comm` went into
+    every audit row and the triage `StatusEvent` principal, read once at
+    connection start. Now `AuditEntry::client_comm` and the principal are
+    documented as self-reported (design §9.1, the `nn-admin audit read`
+    help), and `peer_identity` adds the executable: `client_exe` on audit
+    rows (after `client_comm`, `skip_serializing_if = None`) and
+    `principal_exe` on status events (last field, as the schema freeze
+    allows). Both are read under a pidfd on the peer — `SO_PEERPIDFD`
+    (6.5+, value 77 on x86_64/aarch64; `libc` does not export it) or, on
+    `ENOPROTOOPT`, `pidfd_open(pid)` — checked after the reads
+    (`proc_ref::pidfd_exited`, now `pub(crate)` with `pidfd_open`): a peer
+    gone by then, or for which `SO_PEERPIDFD` reports no process, is
+    `<exited>` with no exe, never whatever holds its pid. Residual: before
+    6.5 the window between the peer's exit and `pidfd_open` remains.
+    Format: rows without the field keep their bytes and pre-image (the
+    verifier re-serialises; `None` is omitted); an `nn-admin` older than
+    the agent drops the unknown field and reports new admin rows and
+    status events as broken, as for lab PR 160's `seq` (unreleased like it).
+    Agent-written rows (`agent-self`) carry no `client_exe`.
+  - ASK-005 (NN-AUD-236, the rest fixed). Re-checked: `handle_connection`
+    called `dispatch` and `emit_audit_for` (append + fsync under the audit
+    mutex) on the async task. Now both run in one
+    `crate::runtime::off_the_runtime` call — the FIM drain's helper
+    (`block_in_place` on the multi-thread runtime, a plain call on
+    `current_thread`), moved from `fim::drain` to a shared module and used
+    by the drain and R018 as before. Not `spawn_blocking`: `dispatch`
+    borrows the per-connection `ConnAuth<'_>` and ~12 states; the helper
+    needs no `'static` and gives the runtime's worker back the same way.
+    Order unchanged: one request at a time per connection, its audit row
+    before its reply; no lock is held across an `.await` (the closure takes
+    the audit mutex and releases it inside).
+  - EVD-010 (NN-AUD-275, fixed). Re-checked: `collect_matching_from_file`
+    pushed every match of a file with its raw line, `fill` cut after each
+    file, a status filter widened the scan to 1,000. Now the collector is a
+    min-heap of `cap` entries ordered as the read serves them (higher id,
+    then earlier line): `cap = limit` without the key, `limit +
+    MAX_UNVERIFIED_PER_READ` with it — the most a file's rows can count in
+    `fill`'s verify loop — and the raw line is kept only when rows are
+    verified. Same rows and same unverified count as before (checked
+    against the old algorithm, kept as the test's reference). The CPU of
+    one read stays bounded by the file's rotation cap (every line is still
+    parsed); memory is O(cap).
+  - ASK-014 (NN-AUD-240, the rest fixed). The bind part (dangling link,
+    parent 0700) was fixed by lab PR 170. `unlink_socket` at shutdown
+    used `exists()`, which follows a link: a dangling link at the path was
+    left behind. It now goes through `socket_watch::clear` (lstat, then
+    unlink; a directory refused). The bind retry the triage marked
+    optional is not added (the socket watch rebinds every 10 s).
+  - Tests: `peer_allowed_is_root_or_the_agents_own_uid`,
+    `unreadable_peer_credentials_are_refused_not_taken_for_root` (a file
+    descriptor: `ENOTSOCK` refused, not uid 0),
+    `a_peer_of_another_uid_is_refused_and_recorded` (the server told its
+    euid is another one, a `#[cfg(test)]` override per socket path; three
+    refusals, one row), `the_agents_own_uid_is_served_and_its_exe_recorded`,
+    `an_exited_peer_is_recorded_as_exited` (a forked child that connects
+    and is reaped), `a_slow_request_does_not_stop_the_runtimes_other_tasks`
+    (one worker; the audit mutex held 700 ms by another thread while an
+    unlock is audited: a 10-ms ticker advances ≥ 5 times in 300 ms),
+    `a_dangling_link_at_the_socket_path_is_replaced_and_unlinked`,
+    `client_exe_is_signed_and_rows_without_it_keep_their_bytes`,
+    `detections_collector_is_bounded_without_a_key` (20,000 rows),
+    `detections_collector_is_bounded_with_a_key_and_forged_rows` (1,300
+    matches with 1,240 forgeries, then a flood of 1,500), the runtime
+    helper's three tests; `audit_emits_on_unlock_success` checks
+    `client_exe`. On `main`: the ticker test fails (0 ticks: the request
+    held the only worker), the foreign-uid test fails (the peer is
+    answered), the dangling-link test fails at the stop-time unlink (the
+    link stays); the others do not compile there (`peer_allowed`,
+    `screen_peer`, `peer_identity`, `client_exe`, the collector's
+    high-water counter, which there would read the whole file: 20,000 /
+    1,300 / 1,560 rows). Privileged e2e (`privileged_e2e.rs`,
+    `admin_socket_refuses_a_peer_of_another_uid`, not run on the host): the
+    serve loop in process, the socket 0666 in a 0711 directory, a thread
+    whose own credentials drop to 65534 (raw `setgroups`/`setresgid`/
+    `setresuid`) connects and is closed without a reply, one signed row
+    names uid 65534, root answered before and after. Host: `cargo fmt`,
+    both clippy runs (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean, 2,313 passed, 0 failed.
+  - Lab: Ubuntu 24.04, adminsock179-probe.sh — before: the build of `main` 05b5738; after: this lot on top. With the socket's directory widened to 0711 and the socket to 0666, a uid 65534 process sending nn-admin's STATUS frame got a 153-byte reply three times out of three, no row, before; after it was closed without a reply, with an ERROR and one signed `admin_socket_foreign_peer` naming uid, pid, the self-named comm and `/usr/bin/python3.12` (as installed, 0700/0600, the connect is refused in both). A descriptor root connected and passed to a uid 65534 child is answered in both builds (the declared limit). A dangling link at the socket's name: the bind replaces it in both (lab PR 170); at the stop it was left behind before and is gone after. Twenty concurrent `detections --limit 1000 --status resolved` readers for 40 s over a 1.7 MB file: `status` RTT p50 151 ms, p90 242 ms, max 273 ms, 2,723 ring drops and one `telemetry_gap` before; p50 26 ms, p90 42 ms, max 72 ms, no drop, no gap after (2,674 and 2,543 reads completed); the audit row of a read carries `client_exe` after. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.

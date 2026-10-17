@@ -420,6 +420,7 @@ impl TrustedInstallerOverride {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         };
         let appended = audit.lock().append(draft);
         if let Err(e) = appended {

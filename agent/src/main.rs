@@ -4851,6 +4851,7 @@ fn attest_legacy_isolation_removed(
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "recording the removed legacy isolation failed");
@@ -4917,6 +4918,7 @@ fn attest_bait_integrity(
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "recording the control-surface file check failed");
@@ -4974,6 +4976,7 @@ fn attest_decoy_state(
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "recording the decoy check failed");
@@ -5009,6 +5012,7 @@ fn attest_degraded_at(
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "attesting a degraded subsystem failed");

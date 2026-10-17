@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
@@ -496,6 +496,9 @@ pub async fn serve_with_marker_path(
     let mut accept_backoff = AcceptBackoff::default();
     let mut refused_log = LogEvery::new(LOG_EVERY);
     let mut evicted_log = LogEvery::new(LOG_EVERY);
+    // External audit ASK-012 (NN-AUD-238): who may connect.
+    let own_euid = own_euid(&socket_path);
+    let mut foreign = ForeignPeers::new(socket_path.clone(), own_euid);
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
@@ -516,6 +519,16 @@ pub async fn serve_with_marker_path(
                 continue;
             }
             Err(e) => return Err(e).context("accepting admin connection"),
+        };
+        // External audit ASK-012 (NN-AUD-238): the peer's credentials are
+        // checked before it gets anything — a slot, an eviction, a reply.
+        let cred = match screen_peer(stream.as_raw_fd(), own_euid) {
+            Ok(cred) => cred,
+            Err(refusal) => {
+                foreign.refuse(&refusal, stream.as_raw_fd(), audit_log.as_ref());
+                drop(stream);
+                continue;
+            }
         };
         let Some(slot) = slots.admit() else {
             // Every slot is mid-request (none is waiting on its peer):
@@ -554,6 +567,7 @@ pub async fn serve_with_marker_path(
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
+                cred,
                 slot,
                 &auth,
                 &posture,
@@ -580,12 +594,18 @@ pub async fn serve_with_marker_path(
 /// missing file (the listener may already have been dropped). The socket's
 /// watch stops first (external audit WDG-007), so the agent does not bind
 /// it again on its way out.
+///
+/// External audit ASK-014 (NN-AUD-240): the name is removed without
+/// following a link (`lstat`, then `unlink`) — `exists()` follows one, so a
+/// dangling link at the path was left behind.
 pub fn unlink_socket(path: &Path) {
     socket_watch::retire(path);
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(path) {
-            warn!(error = ?e, path = %path.display(), "failed to unlink admin socket on shutdown");
-        }
+    if let Err(e) = socket_watch::clear(path) {
+        warn!(
+            error = format!("{e:#}"),
+            path = %path.display(),
+            "failed to unlink admin socket on shutdown"
+        );
     }
 }
 
@@ -845,6 +865,7 @@ impl LogEvery {
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: UnixStream,
+    cred: PeerCred,
     slot: ConnSlot,
     auth: &AdminAuth,
     posture: &PostureMachine,
@@ -859,11 +880,10 @@ async fn handle_connection(
     response_state: Option<&Arc<ResponseAdminState>>,
     read_paths: &AdminReadPaths,
 ) -> Result<()> {
-    // Capture peer creds once per connection — the audit log
-    // wants pid/uid/comm of the caller, and a single connection
-    // never changes peers mid-stream (SO_PEERCRED is fixed at
-    // accept time).
-    let client = peer_creds(&stream);
+    // The peer's identity once per connection — the audit log wants
+    // pid/uid/comm/exe of the caller, and a single connection never
+    // changes peers mid-stream (SO_PEERCRED is fixed at connect time).
+    let client = peer_identity(stream.as_raw_fd(), &cred);
     let auth = ConnAuth::new(auth);
     let limits = slot.limits();
     loop {
@@ -900,24 +920,35 @@ async fn handle_connection(
         if !slot.busy() {
             return Ok(());
         }
-        let mut matched_fps: Vec<String> = Vec::new();
-        let reply = dispatch(
-            msg.clone(),
-            &auth,
-            posture,
-            isolator,
-            marker_path,
-            shutdown_signal,
-            fim_state.map(|s| s.as_ref()),
-            canary_state.map(|s| s.as_ref()),
-            installer_override.map(|s| s.as_ref()),
-            detection_state.map(|s| s.as_ref()),
-            response_state.map(|s| s.as_ref()),
-            read_paths,
-            &client,
-            &mut matched_fps,
-        );
-        emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
+        // External audit ASK-005 (NN-AUD-236): the request's work — the
+        // bounded file reads, the per-row signature checks, the chain
+        // appends and the audit row's fsync under the audit mutex — runs
+        // off the runtime's worker, so the sensors' drains, the telemetry
+        // probe and the other connections keep running meanwhile. This
+        // task waits for it: one request at a time per connection, the
+        // reply written after its audit row, as before. No lock is held
+        // across an `.await`.
+        let reply = crate::runtime::off_the_runtime(|| {
+            let mut matched_fps: Vec<String> = Vec::new();
+            let reply = dispatch(
+                msg.clone(),
+                &auth,
+                posture,
+                isolator,
+                marker_path,
+                shutdown_signal,
+                fim_state.map(|s| s.as_ref()),
+                canary_state.map(|s| s.as_ref()),
+                installer_override.map(|s| s.as_ref()),
+                detection_state.map(|s| s.as_ref()),
+                response_state.map(|s| s.as_ref()),
+                read_paths,
+                &client,
+                &mut matched_fps,
+            );
+            emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
+            reply
+        });
         if !slot.waiting() {
             return Ok(());
         }
@@ -957,49 +988,69 @@ fn now_unix_secs() -> u64 {
 
 // ── Tappa 8 B5 — SO_PEERCRED + audit-log emission ─────────────────
 
-/// Triple of `(pid, uid, comm)` captured from a Unix-socket peer
-/// via `SO_PEERCRED` + `/proc/<pid>/comm`. The audit log's
-/// per-entry `client_*` fields (design §9.1) come from here so
-/// every admin operation records WHO connected, not just which
-/// key signed.
+/// Who connected, as the audit log records it: `(pid, uid)` from
+/// `SO_PEERCRED`, `comm` and `exe` from `/proc/<pid>`. The audit log's
+/// per-entry `client_*` fields (design §9.1) come from here so every
+/// admin operation records WHO connected, not just which key signed.
 #[derive(Debug, Clone)]
 pub(crate) struct AuditClient {
     pub pid: u32,
     pub uid: u32,
+    /// `/proc/<pid>/comm`. Self-reported (external audit ASK-013,
+    /// NN-AUD-239): the name the peer gave itself, which any process
+    /// chooses (`prctl(PR_SET_NAME)`). `<exited>` when the peer was gone
+    /// before it could be read, `<unknown>` when it could not be read.
     pub comm: String,
+    /// `/proc/<pid>/exe`: the program the kernel says the peer runs
+    /// (external audit ASK-013). `None` when it could not be read.
+    pub exe: Option<String>,
 }
 
-impl AuditClient {
-    /// Pre-attach unknown sentinel for callers that haven't (or
-    /// can't) capture peer creds — wire-test mock servers fall
-    /// back here so the audit-emit path is exercised even
-    /// without a real Unix socket.
-    fn unknown() -> Self {
-        Self {
-            pid: 0,
-            uid: 0,
-            comm: "<unknown>".to_string(),
-        }
-    }
+/// A peer's `SO_PEERCRED`: the credentials of the process (the thread)
+/// that called `connect()`, fixed at that moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerCred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
-/// Read `SO_PEERCRED` from `stream` to recover the peer's PID +
-/// UID, then read `/proc/<pid>/comm` for the executable name. All
-/// three feed the audit log's `client_*` fields. Failure to read
-/// any one is degrade-not-fail — the audit entry is still
-/// written, just with `<unknown>` markers; an audit row with
-/// missing client info is more useful than no audit row at all.
-fn peer_creds(stream: &UnixStream) -> AuditClient {
-    let fd = stream.as_raw_fd();
-    // SAFETY: ucred is repr(C), getsockopt fills `pid`, `uid`,
-    // `gid` if it succeeds. We pass `len` by &mut so the kernel
-    // can tell us the actual returned length.
+/// External audit ASK-012 (NN-AUD-238): why a connection was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerRefusal {
+    /// `getsockopt(SO_PEERCRED)` failed with this errno.
+    Unreadable(i32),
+    /// The kernel returned this many bytes, not a whole `struct ucred`.
+    ShortCred(usize),
+    /// A uid that may not use the admin plane.
+    ForeignUid(PeerCred),
+}
+
+/// External audit ASK-012 (NN-AUD-238): the uids that may use the admin
+/// plane — root, and the agent's own euid. In production the agent runs
+/// as root, so that is uid 0 alone (`nn-admin`, the watchdog, COMBAT
+/// recovery all run as root); the own euid lets an agent started as a
+/// user (the unit tests) serve that user. The socket's mode 0600 stays
+/// the first gate; this one holds when the mode or the directory was
+/// changed. When V1.1 widens the socket to a service group, it becomes
+/// "uid 0 or a member of that group".
+pub(crate) fn peer_allowed(cred: &PeerCred, own_euid: u32) -> bool {
+    cred.uid == 0 || cred.uid == own_euid
+}
+
+/// `getsockopt(SO_PEERCRED)` on `fd`. A failure, or a reply shorter or
+/// longer than a `struct ucred`, is a refusal: the credentials used to
+/// fall back to uid 0.
+fn peer_cred(fd: std::os::unix::io::RawFd) -> Result<PeerCred, PeerRefusal> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
         gid: 0,
     };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let want = std::mem::size_of::<libc::ucred>();
+    let mut len = want as libc::socklen_t;
+    // SAFETY: `cred` is a repr(C) ucred of `len` bytes that getsockopt
+    // fills; `len` is passed by &mut so the kernel reports what it wrote.
     let rc = unsafe {
         libc::getsockopt(
             fd,
@@ -1010,16 +1061,252 @@ fn peer_creds(stream: &UnixStream) -> AuditClient {
         )
     };
     if rc != 0 {
-        return AuditClient::unknown();
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        return Err(PeerRefusal::Unreadable(errno));
     }
-    let pid = cred.pid as u32;
-    let uid = cred.uid;
+    if len as usize != want {
+        return Err(PeerRefusal::ShortCred(len as usize));
+    }
+    Ok(PeerCred {
+        pid: cred.pid as u32,
+        uid: cred.uid,
+        gid: cred.gid,
+    })
+}
+
+/// External audit ASK-012: the peer on `fd`, if it may use the admin plane.
+fn screen_peer(fd: std::os::unix::io::RawFd, own_euid: u32) -> Result<PeerCred, PeerRefusal> {
+    let cred = peer_cred(fd)?;
+    if peer_allowed(&cred, own_euid) {
+        Ok(cred)
+    } else {
+        Err(PeerRefusal::ForeignUid(cred))
+    }
+}
+
+/// The agent's own euid ([`peer_allowed`]).
+fn own_euid(socket_path: &Path) -> u32 {
+    #[cfg(test)]
+    if let Some(euid) = tests::own_euid_override(socket_path) {
+        return euid;
+    }
+    let _ = socket_path;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// `SO_PEERPIDFD` (Linux 6.5, asm-generic value; `libc` does not export
+/// it yet): a pidfd on the peer itself.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const SO_PEERPIDFD: libc::c_int = 77;
+
+/// A pidfd on the peer, to tell whether `/proc/<pid>` still described it
+/// after it was read.
+enum PeerPidfd {
+    Open(std::os::fd::OwnedFd),
+    /// The peer had exited (no process left to read).
+    Gone,
+    /// No pidfd (out of descriptors): `/proc` read unchecked, as before.
+    Unavailable,
+}
+
+fn peer_pidfd(sock: std::os::unix::io::RawFd, pid: u32) -> PeerPidfd {
+    use std::os::fd::FromRawFd;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        let mut fd: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: an int-sized out-parameter of `len` bytes.
+        let rc = unsafe {
+            libc::getsockopt(
+                sock,
+                libc::SOL_SOCKET,
+                SO_PEERPIDFD,
+                (&mut fd as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc == 0 && fd >= 0 {
+            // SAFETY: the kernel installed this descriptor for us.
+            return PeerPidfd::Open(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            // Before 6.5: fall back to pidfd_open by pid.
+            Some(libc::ENOPROTOOPT) => {}
+            // The peer has no live process (reaped): never look the pid
+            // up again, another process may hold it.
+            Some(libc::EINVAL | libc::ESRCH | libc::ENODATA) => return PeerPidfd::Gone,
+            _ => return PeerPidfd::Unavailable,
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = sock;
+    // pidfd_open(pid): the process holding the pid now. The window between
+    // the peer's exit and this call is where a reused pid could be read;
+    // `SO_PEERPIDFD` closes it from 6.5.
+    match crate::response::proc_ref::pidfd_open(pid) {
+        // SAFETY: pidfd_open returned this fd to us; we own it.
+        Ok(fd) => PeerPidfd::Open(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => PeerPidfd::Gone,
+        Err(_) => PeerPidfd::Unavailable,
+    }
+}
+
+/// External audit ASK-013 (NN-AUD-239): `comm` and `exe` of the peer on
+/// `sock`, read from `/proc/<pid>` while a pidfd on the peer holds its
+/// pid: a peer that exited before the reads were checked is `<exited>`
+/// (its pid could already name another process), never whatever holds
+/// the pid now. Failure to read is degrade-not-fail: the audit row is
+/// still written, with `<unknown>` / no exe.
+fn peer_identity(sock: std::os::unix::io::RawFd, cred: &PeerCred) -> AuditClient {
+    let mut client = AuditClient {
+        pid: cred.pid,
+        uid: cred.uid,
+        comm: "<unknown>".to_string(),
+        exe: None,
+    };
+    // pid 0: a peer in a pid namespace this one cannot see.
+    if cred.pid == 0 {
+        return client;
+    }
+    let pidfd = peer_pidfd(sock, cred.pid);
+    if matches!(pidfd, PeerPidfd::Gone) {
+        client.comm = "<exited>".to_string();
+        return client;
+    }
+    let pid = cred.pid;
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "<unknown>".to_string());
-    AuditClient { pid, uid, comm }
+        .map(|s| s.trim_end_matches('\n').to_string())
+        .filter(|s| !s.is_empty());
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    if let PeerPidfd::Open(fd) = &pidfd {
+        // Exited (zombie included): the reads may describe another process.
+        if crate::response::proc_ref::pidfd_exited(fd) {
+            client.comm = "<exited>".to_string();
+            return client;
+        }
+    }
+    if let Some(comm) = comm {
+        client.comm = comm;
+    }
+    client.exe = exe;
+    client
+}
+
+/// The signed kind of a refused admin peer (external audit ASK-012).
+pub const FOREIGN_PEER_KIND: &str = "admin_socket_foreign_peer";
+
+/// External audit ASK-012 (NN-AUD-238): refused peers, reported. The
+/// socket is created 0600 in a 0700 directory, so a peer of another uid
+/// means the mode, the owner or the directory was changed: one signed
+/// `integrity_drift` (`admin_socket_foreign_peer`) per
+/// [`crate::self_integrity::REREPORT_SECS`], the refusals in between
+/// counted into the next one and logged at most every [`LOG_EVERY`]. A
+/// refused connection is closed without a reply.
+struct ForeignPeers {
+    socket_path: PathBuf,
+    own_euid: u32,
+    log: LogEvery,
+    last_signed: Option<Instant>,
+    unsigned: u32,
+}
+
+impl ForeignPeers {
+    fn new(socket_path: PathBuf, own_euid: u32) -> Self {
+        Self {
+            socket_path,
+            own_euid,
+            log: LogEvery::new(LOG_EVERY),
+            last_signed: None,
+            unsigned: 0,
+        }
+    }
+
+    fn refuse(
+        &mut self,
+        refusal: &PeerRefusal,
+        sock: std::os::unix::io::RawFd,
+        audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    ) {
+        use crate::self_integrity::{self, Finding};
+        let now = Instant::now();
+        let due = self.last_signed.is_none_or(|t| {
+            now.duration_since(t) >= Duration::from_secs(self_integrity::REREPORT_SECS)
+        });
+        if due {
+            let mut detail = self.describe(refusal, sock);
+            if self.unsigned > 0 {
+                detail.push_str(&format!(
+                    " ({} more refusal(s) since the last record)",
+                    self.unsigned
+                ));
+            }
+            // The audit row's append and fsync, off the accept loop's worker.
+            crate::runtime::off_the_runtime(|| {
+                self_integrity::report_event(
+                    audit_log,
+                    &Finding {
+                        kind: FOREIGN_PEER_KIND,
+                        detail,
+                    },
+                )
+            });
+            self.last_signed = Some(now);
+            self.unsigned = 0;
+        } else {
+            self.unsigned = self.unsigned.saturating_add(1);
+            if let Some(suppressed) = self.log.ready() {
+                error!(
+                    kind = FOREIGN_PEER_KIND,
+                    detail = %self.describe(refusal, sock),
+                    suppressed,
+                    "INTEGRITY DRIFT — admin connection refused again (signed with the next \
+                     record, at most one per {} s)",
+                    self_integrity::REREPORT_SECS
+                );
+            }
+        }
+    }
+
+    fn describe(&self, refusal: &PeerRefusal, sock: std::os::unix::io::RawFd) -> String {
+        let path = self.socket_path.display();
+        let allowed = if self.own_euid == 0 {
+            "uid 0".to_string()
+        } else {
+            format!("uid 0 and the agent's uid {}", self.own_euid)
+        };
+        match refusal {
+            PeerRefusal::ForeignUid(cred) => {
+                let who = peer_identity(sock, cred);
+                format!(
+                    "{path}: a connection from uid {} gid {} (pid {}, comm {:?} as the peer \
+                     names itself, exe {}) was refused without a reply: only {allowed} may use \
+                     the admin plane. The socket is created 0600 in a 0700 directory, so its \
+                     mode, its owner or its directory was changed",
+                    cred.uid,
+                    cred.gid,
+                    cred.pid,
+                    who.comm,
+                    who.exe.as_deref().unwrap_or("unknown"),
+                )
+            }
+            PeerRefusal::Unreadable(errno) => format!(
+                "{path}: a connection was refused without a reply: its peer's credentials \
+                 could not be read (SO_PEERCRED: {})",
+                std::io::Error::from_raw_os_error(*errno)
+            ),
+            PeerRefusal::ShortCred(len) => format!(
+                "{path}: a connection was refused without a reply: SO_PEERCRED returned {len} \
+                 of {} bytes",
+                std::mem::size_of::<libc::ucred>()
+            ),
+        }
+    }
 }
 
 /// Inspect the (request, reply) pair after `dispatch` returns
@@ -1437,6 +1724,7 @@ fn emit_audit_for(
         client_pid: client.pid,
         client_uid: client.uid,
         client_comm: client.comm.clone(),
+        client_exe: client.exe.clone(),
     };
     let mut log = audit_log.lock();
     if let Err(e) = log.append(draft) {
@@ -4136,6 +4424,7 @@ fn dispatch_detection_set_status(
             ppid: None,
         },
         note: extra.note.clone().filter(|s| !s.is_empty()),
+        principal_exe: client.exe.clone(),
     };
     {
         let mut log = state.status_log.lock();
@@ -5110,6 +5399,7 @@ mod tests {
             pid: 12345,
             uid: 1000,
             comm: "nn-admin".to_string(),
+            exe: Some("/usr/local/bin/nn-admin".to_string()),
         }
     }
 
@@ -5131,6 +5421,11 @@ mod tests {
         assert_eq!(entries[0].client_pid, 12345);
         assert_eq!(entries[0].client_uid, 1000);
         assert_eq!(entries[0].client_comm, "nn-admin");
+        // External audit ASK-013: the kernel's record of the program too.
+        assert_eq!(
+            entries[0].client_exe.as_deref(),
+            Some("/usr/local/bin/nn-admin")
+        );
         // First entry chains off the genesis hash (B1 invariant).
         assert_eq!(entries[0].prev_hash, crate::audit::GENESIS_PREV_HASH);
     }
@@ -7032,6 +7327,7 @@ mod tests {
             pid: 4321,
             uid: 0,
             comm: "nn-admin".to_string(),
+            exe: None,
         }
     }
 
@@ -7468,6 +7764,7 @@ mod tests {
         Arc<ConnSlots>,
     ) {
         let (client, server) = UnixStream::pair().unwrap();
+        let cred = peer_cred(server.as_raw_fd()).unwrap();
         let slots = ConnSlots::new(limits);
         let slot = slots.admit().unwrap();
         let task = tokio::spawn(async move {
@@ -7485,6 +7782,7 @@ mod tests {
             let marker = dir.path().join("marker");
             handle_connection(
                 server,
+                cred,
                 slot,
                 &auth,
                 &posture,
@@ -8006,5 +8304,377 @@ mod tests {
         );
         // A pubkey-only line loads as `unlock,audit-read`.
         assert_eq!(role_beyond_signers(&[], one), Some(Role::AuditRead));
+    }
+
+    // ── Lab PR 179: admin socket peers and request cost ─────────────
+
+    /// Socket paths whose server takes another uid for its own (the
+    /// external audit ASK-012 tests: the test runs as one user, so the
+    /// only way to be a "foreign" peer is a server that does not admit
+    /// that user).
+    static OWN_EUID_OVERRIDE: Mutex<Vec<(PathBuf, u32)>> = Mutex::new(Vec::new());
+
+    pub(super) fn own_euid_override(path: &Path) -> Option<u32> {
+        OWN_EUID_OVERRIDE
+            .lock()
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, euid)| *euid)
+    }
+
+    fn test_euid() -> u32 {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    /// A server on `dir/admin.sock` with an audit log; `own_euid` set
+    /// replaces the agent's euid for the peer check.
+    async fn spawn_audited_server(
+        dir: &TempDir,
+        own_euid: Option<u32>,
+    ) -> (PathBuf, PathBuf, Arc<Mutex<AuditLog>>, JoinHandle<()>) {
+        let socket = dir.path().join("admin.sock");
+        if let Some(euid) = own_euid {
+            OWN_EUID_OVERRIDE.lock().push((socket.clone(), euid));
+        }
+        let signing = SigningKey::generate(&mut OsRng);
+        let pub_path = dir.path().join("admin.pub");
+        std::fs::write(
+            &pub_path,
+            format!("{}\n", hex::encode(signing.verifying_key().to_bytes())),
+        )
+        .unwrap();
+        let auth = Arc::new(AdminAuth::load(&pub_path).unwrap());
+        let isolator = Arc::new(NetworkIsolator::new(rules_path()).unwrap());
+        let posture = Arc::new(PostureMachine::new());
+        let (log_path, audit) = build_test_audit_log(dir);
+        let audit_c = Arc::clone(&audit);
+        let socket_c = socket.clone();
+        let marker = dir.path().join("marker");
+        let task = tokio::spawn(async move {
+            let _ = serve_with_audit_log(socket_c, auth, posture, isolator, marker, None, audit_c)
+                .await;
+        });
+        for _ in 0..200 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (socket, log_path, audit, task)
+    }
+
+    fn foreign_peer_rows(log_path: &Path) -> Vec<String> {
+        read_audit_entries(log_path)
+            .into_iter()
+            .filter(|e| {
+                e.op == crate::self_integrity::AUDIT_OP && e.extra["kind"] == FOREIGN_PEER_KIND
+            })
+            .map(|e| e.extra["detail"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// External audit ASK-012 (NN-AUD-238): uid 0 and the agent's own
+    /// euid may use the admin plane, no one else.
+    #[test]
+    fn peer_allowed_is_root_or_the_agents_own_uid() {
+        let cred = |uid| PeerCred {
+            pid: 1,
+            uid,
+            gid: uid,
+        };
+        assert!(peer_allowed(&cred(0), 0));
+        assert!(peer_allowed(&cred(0), 1000));
+        assert!(peer_allowed(&cred(1000), 1000));
+        assert!(!peer_allowed(&cred(1000), 0));
+        assert!(!peer_allowed(&cred(65534), 0));
+        assert!(!peer_allowed(&cred(65534), 1000));
+    }
+
+    /// External audit ASK-012: `SO_PEERCRED` that cannot be read was
+    /// `AuditClient::unknown()` — uid 0, root. It is a refusal now.
+    #[test]
+    fn unreadable_peer_credentials_are_refused_not_taken_for_root() {
+        let f = tempfile::tempfile().unwrap();
+        assert_eq!(
+            screen_peer(f.as_raw_fd(), 0),
+            Err(PeerRefusal::Unreadable(libc::ENOTSOCK))
+        );
+        // A socket pair: the peer is this process.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let me = test_euid();
+        let cred = screen_peer(a.as_raw_fd(), me).expect("our own uid is admitted");
+        assert_eq!(cred.uid, me);
+        assert_eq!(cred.pid, std::process::id());
+        if me != 0 {
+            assert_eq!(
+                screen_peer(a.as_raw_fd(), 0),
+                Err(PeerRefusal::ForeignUid(cred)),
+                "another user, for an agent running as root"
+            );
+        }
+    }
+
+    /// External audit ASK-012 (NN-AUD-238): a peer whose uid may not use
+    /// the admin plane is closed without a reply (it used to be served
+    /// whatever its uid), the refusal is one signed `integrity_drift`
+    /// (`admin_socket_foreign_peer`) and the next refusals within the
+    /// re-report window add no row. Unprivileged: the server is told the
+    /// agent's uid is another one (as root, uid 0 is always admitted —
+    /// the privileged e2e covers that case with a real other uid).
+    #[tokio::test]
+    async fn a_peer_of_another_uid_is_refused_and_recorded() {
+        let me = test_euid();
+        if me == 0 {
+            eprintln!("running as root: uid 0 is always admitted; see the privileged e2e");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let (socket, log_path, _audit, _task) =
+            spawn_audited_server(&dir, Some(me.wrapping_add(1))).await;
+        for _ in 0..3 {
+            let s = socket.clone();
+            let refused = tokio::task::spawn_blocking(move || run_status(&s))
+                .await
+                .unwrap();
+            assert!(refused.is_err(), "no reply to a foreign uid: {refused:?}");
+        }
+        let rows = foreign_peer_rows(&log_path);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].contains(&format!("a connection from uid {me} ")),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[0].contains("was refused without a reply"),
+            "{}",
+            rows[0]
+        );
+        assert!(
+            rows[0].contains(&std::process::id().to_string()),
+            "{}",
+            rows[0]
+        );
+    }
+
+    /// The control: the same server answers a peer of its own uid, and
+    /// the audit row of a signed request names the peer's executable
+    /// (external audit ASK-013), here this test binary.
+    #[tokio::test]
+    async fn the_agents_own_uid_is_served_and_its_exe_recorded() {
+        let dir = TempDir::new().unwrap();
+        let (socket, log_path, _audit, _task) = spawn_audited_server(&dir, None).await;
+        let s = socket.clone();
+        let out = tokio::task::spawn_blocking(move || run_status(&s))
+            .await
+            .unwrap()
+            .expect("status answered");
+        assert_eq!(out.posture, PostureKind::Observing);
+        // An unlock with no challenge: refused, and audited.
+        let s = socket.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut c = std::os::unix::net::UnixStream::connect(&s).unwrap();
+            let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+                signature: [0; 64],
+            });
+            c.write_all(&encode_frame(&req).unwrap()).unwrap();
+            let _ = sync_read_frame(&mut c);
+        })
+        .await
+        .unwrap();
+        let rows = read_audit_entries(&log_path);
+        let unlock = rows.iter().find(|e| e.op == "unlock").expect("unlock row");
+        let me = std::fs::read_link("/proc/self/exe").unwrap();
+        assert_eq!(
+            unlock.client_exe.as_deref(),
+            Some(me.to_string_lossy().as_ref())
+        );
+        assert_eq!(unlock.client_pid, std::process::id());
+        assert!(foreign_peer_rows(&log_path).is_empty());
+    }
+
+    /// External audit ASK-013 (NN-AUD-239): a peer that is gone by the
+    /// time it is looked at is `<exited>` — never the name of whatever
+    /// holds its pid by then.
+    #[test]
+    fn an_exited_peer_is_recorded_as_exited() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("p.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // The address, built before the fork: the child makes only
+        // async-signal-safe calls (socket, connect, _exit).
+        // SAFETY: sockaddr_un is plain data; all-zero is a valid value.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert!(bytes.len() < addr.sun_path.len());
+        for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+            *d = *s as libc::c_char;
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        // SAFETY: the child calls only async-signal-safe functions on
+        // memory prepared before the fork, then _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let rc = libc::connect(fd, (&addr as *const libc::sockaddr_un).cast(), len);
+                libc::_exit(if rc == 0 { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        // SAFETY: our own child.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        // The child connected and was reaped; its connection waits in the
+        // backlog.
+        let (conn, _) = listener.accept().unwrap();
+        let cred = peer_cred(conn.as_raw_fd()).unwrap();
+        let who = peer_identity(conn.as_raw_fd(), &cred);
+        assert_eq!(who.comm, "<exited>", "{who:?}");
+        assert_eq!(who.exe, None);
+        // A live peer (this process, through a pair) is read.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cred = peer_cred(a.as_raw_fd()).unwrap();
+        let who = peer_identity(a.as_raw_fd(), &cred);
+        assert_ne!(who.comm, "<exited>");
+        assert_eq!(
+            who.exe.as_deref(),
+            Some(
+                std::fs::read_link("/proc/self/exe")
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    /// External audit ASK-005 (NN-AUD-236): a request whose audit row
+    /// waits (here on the audit mutex, as on a slow fsync) no longer holds
+    /// the runtime's worker: with one worker, a ticker task keeps running
+    /// meanwhile. The request was handled on the worker itself, which then
+    /// ran nothing else until the row was written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_slow_request_does_not_stop_the_runtimes_other_tasks() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = TempDir::new().unwrap();
+        let (socket, log_path, audit, _task) = spawn_audited_server(&dir, None).await;
+        let ticks = Arc::new(AtomicU64::new(0));
+        let t = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                every.tick().await;
+                t.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        // The audit mutex held for 700 ms by another thread.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let guard = audit.lock();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(700));
+            drop(guard);
+        });
+        locked_rx.recv().unwrap();
+        // An auditable request (an unlock without a challenge).
+        let s = socket.clone();
+        let client = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut c = std::os::unix::net::UnixStream::connect(&s).unwrap();
+            let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+                signature: [0; 64],
+            });
+            c.write_all(&encode_frame(&req).unwrap()).unwrap();
+            sync_read_frame(&mut c)
+        });
+        // The test body runs on the `block_on` thread, not on the worker.
+        std::thread::sleep(Duration::from_millis(150));
+        let before = ticks.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        let during = ticks.load(Ordering::Relaxed) - before;
+        holder.join().unwrap();
+        let reply = client.join().unwrap();
+        ticker.abort();
+        assert!(
+            matches!(reply, AdminMessage::UnlockResult(_)),
+            "the request is still answered: {reply:?}"
+        );
+        assert!(
+            read_audit_entries(&log_path)
+                .iter()
+                .any(|e| e.op == "unlock"),
+            "and audited before its reply"
+        );
+        assert!(
+            during >= 5,
+            "the ticker advanced {during} times in 300 ms while a request waited on the audit log"
+        );
+    }
+
+    /// External audit ASK-014 (NN-AUD-240): a dangling link at the socket
+    /// path does not keep the admin plane from coming up (lab PR 170's
+    /// bind), a missing parent is created 0700, and the agent's unlink at
+    /// shutdown removes a dangling link too (`exists()` followed it and
+    /// left it there).
+    #[tokio::test]
+    async fn a_dangling_link_at_the_socket_path_is_replaced_and_unlinked() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let dir = TempDir::new().unwrap();
+        let run = dir.path().join("run/northnarrow");
+        std::fs::create_dir_all(&run).unwrap();
+        let socket = run.join("admin.sock");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &socket).unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let pub_path = dir.path().join("admin.pub");
+        std::fs::write(
+            &pub_path,
+            format!("{}\n", hex::encode(signing.verifying_key().to_bytes())),
+        )
+        .unwrap();
+        let auth = Arc::new(AdminAuth::load(&pub_path).unwrap());
+        let isolator = Arc::new(NetworkIsolator::new(rules_path()).unwrap());
+        let posture = Arc::new(PostureMachine::new());
+        let s = socket.clone();
+        let task = tokio::spawn(async move {
+            let _ = serve(s, auth, posture, isolator).await;
+        });
+        for _ in 0..200 {
+            if std::fs::symlink_metadata(&socket).is_ok_and(|m| m.file_type().is_socket()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let s = socket.clone();
+        let out = tokio::task::spawn_blocking(move || run_status(&s))
+            .await
+            .unwrap()
+            .expect("bound over the dangling link, and answering");
+        assert_eq!(out.posture, PostureKind::Observing);
+        task.abort();
+
+        // A missing parent: created closed to others.
+        let fresh = dir.path().join("fresh/northnarrow/admin.sock");
+        let (_l, _id) = socket_watch::bind(&fresh).unwrap();
+        let parent = std::fs::metadata(fresh.parent().unwrap()).unwrap();
+        assert_eq!(parent.mode() & 0o777, 0o700);
+
+        // Shutdown: the link is removed, not followed.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &socket).unwrap();
+        unlink_socket(&socket);
+        assert!(
+            std::fs::symlink_metadata(&socket).is_err(),
+            "the dangling link is gone"
+        );
+        std::os::unix::fs::symlink(&victim, &socket).unwrap();
+        unlink_socket(&socket);
+        assert!(std::fs::symlink_metadata(&socket).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
     }
 }

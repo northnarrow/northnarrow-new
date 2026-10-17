@@ -309,6 +309,19 @@ packages open it themselves.
   (use `nn-admin unlock`), and a key holding only `rotate-keys` can no
   longer add keys with roles it lacks. See
   [COMBAT_RECOVERY.md §1.1](COMBAT_RECOVERY.md#11-what-the-install-key-can-do-roles).
+- **Who may use the admin socket** (NN-AUD-238 ASK-012, lab PR 179). The
+  agent checks each peer's `SO_PEERCRED`: uid 0 is served (the agent runs
+  as root, so its own uid is the same), any other uid — and a peer whose
+  credentials cannot be read — is closed without a reply, logged
+  (`INTEGRITY DRIFT`, at most every 10 s) and recorded as a signed
+  `integrity_drift` `admin_socket_foreign_peer` (one per 10 minutes, with
+  the count of the others). The socket stays 0600 in a 0700 directory;
+  the check holds when either was widened. **Regression:** a non-root
+  process (a monitoring script, a dashboard user) can no longer reach the
+  socket by widening its mode: run it as root or through `sudo nn-admin`.
+  A descriptor a root process opens and hands on keeps root's credentials
+  — the check is on the process that connected. The journal line names
+  the refused uid, pid, `comm` and executable.
 - **`nn-admin canary refresh`** (NN-AUD-172 DEC-010, NN-AUD-173 DEC-011,
   lab PR 143) writes a decoy again from a new random seed, in place, and
   records it. A trip is a signed `trip` row read back at boot.
@@ -628,6 +641,16 @@ Now **killed, or answered, where they were recorded or missed**:
   an `nn-admin` older than the agent reports numbered rows as broken;
   downgrading the agent is not supported. Runbook:
   [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md).
+- **The caller's executable in the audit log** (NN-AUD-239 ASK-013, lab
+  PR 179). `client_comm` is the name the connecting process gave itself
+  (any process can call itself `nn-admin`); the operator's identity is
+  the key fingerprint. Rows of admin operations now also carry
+  `client_exe` (`/proc/<pid>/exe`, after `client_comm`), and triage status
+  events `principal_exe`; a caller gone before it could be checked reads
+  `<exited>`. Rows written before keep their bytes and verify.
+  **Regression:** an `nn-admin` older than the agent reports the new rows
+  as broken (`audit verify`, `chain verify`): upgrade the binaries
+  together, as for the numbered rows above.
 - **Canary registry rows** (lab PR 143). An older agent skips the new
   `trip` and `decoy_check` rows as unreadable, re-arms tripped canaries and
   chains its next row to the last row it could read, which an off-host

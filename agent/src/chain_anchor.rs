@@ -811,6 +811,7 @@ impl ChainFinding {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         }
     }
 
@@ -1334,6 +1335,7 @@ pub fn spawn_boot_verify(
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         }) {
             warn!(error = %format!("{e:#}"), "chain verify: result not recorded");
         }
@@ -1455,6 +1457,7 @@ pub fn numbering_started_draft(first: &HeadsSnapshot, heads_file: &Path) -> Audi
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     }
 }
 
@@ -1482,6 +1485,7 @@ mod tests {
             client_pid: 1,
             client_uid: 0,
             client_comm: "t".to_string(),
+            client_exe: None,
         }
     }
 

@@ -49,6 +49,7 @@ fn audit_drop(ring: &str, dropped: u64, total: u64) {
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = format!("{e:#}"), "ring-drop audit entry failed");
@@ -280,6 +281,7 @@ fn attest_install_failure(log: &Arc<parking_lot::Mutex<crate::audit::AuditLog>>,
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(

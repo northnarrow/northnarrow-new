@@ -3680,6 +3680,7 @@ mod tests {
                 client_pid: 1000 + i as u32,
                 client_uid: 0,
                 client_comm: "nn-admin".to_string(),
+                client_exe: None,
             };
             entries.push(log.append(draft).unwrap());
         }

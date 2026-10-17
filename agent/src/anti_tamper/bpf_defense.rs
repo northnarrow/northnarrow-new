@@ -810,6 +810,7 @@ pub fn spawn_link_self_check(audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>
                         client_pid: std::process::id(),
                         client_uid: 0,
                         client_comm: "northnarrow-agent".to_string(),
+                        client_exe: None,
                     };
                     if let Err(e) = log.lock().append(draft) {
                         warn!(

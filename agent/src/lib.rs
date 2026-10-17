@@ -37,6 +37,7 @@ pub mod net;
 pub mod posture;
 pub mod rag;
 pub mod response;
+pub(crate) mod runtime;
 pub mod sd_notify;
 pub mod self_integrity;
 /// Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`).
