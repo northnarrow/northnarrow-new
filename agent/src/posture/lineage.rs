@@ -201,13 +201,14 @@ pub const ELEVATION_EXES: &[&str] = &[
 /// those entries out of the regular FIFO eviction so a long transaction
 /// does not lose its root. `packagekitd` drives libdnf in-process too.
 ///
-/// SECURITY: a lineage match suppresses the mass-write arm of
-/// [`super::triggers::confirmed_intrusion`] AND
-/// [`super::triggers::persistence_mechanism`]. Compromise OF one of
-/// these binaries (root + write to a FIM/fs-protect-guarded system dir)
-/// inherits the exemption — the same trust boundary as
-/// [`AUTH_BINARY_EXES`]. Keep tight; add the most-specific exec path,
-/// never a directory.
+/// SECURITY: since lab PR 175 no rule and no posture arm trusts a lineage
+/// match on this list: the package managers proper
+/// ([`PACKAGE_MANAGER_EXES`]) are trusted during a root transaction only
+/// ([`AuthSessionTracker::in_package_transaction`]), and `mandb` for its
+/// own writes as a system account
+/// ([`AuthSessionTracker::is_system_man_cache_writer`]). The list keeps
+/// the review-49 side cache ([`DAEMON_CACHE_CAP`]). Keep tight; add the
+/// most-specific exec path, never a directory.
 pub const SYSTEM_DAEMON_EXES: &[&str] = &[
     "/usr/bin/apt",
     "/usr/bin/apt-get",
@@ -231,8 +232,15 @@ pub const SYSTEM_DAEMON_EXES: &[&str] = &[
 /// those it turned a user's `crontab` install from High + KillProcess into
 /// Log + Low. When a package installs manual pages dpkg runs `mandb`
 /// through man-db's trigger, so its writes there descend from dpkg anyway.
-/// The posture's arms keep the wider list (`mandb` rebuilds its caches in
-/// bulk).
+/// Lab PR 175: the network, chain and R009 carve-outs and the posture's
+/// arms trust these the same way; `mandb`'s cache rebuild keeps its own,
+/// narrower, mass-write exemption
+/// ([`AuthSessionTracker::is_system_man_cache_writer`]).
+///
+/// None of these is set-id either: a user who runs one with `LD_PRELOAD`
+/// (`dpkg --version`) has it fork whatever it likes, as with `mandb`. A
+/// transaction is a package manager the kernel executed as root
+/// ([`AuthSessionTracker::in_package_transaction`]).
 pub const PACKAGE_MANAGER_EXES: &[&str] = &[
     "/usr/bin/apt",
     "/usr/bin/apt-get",
@@ -255,6 +263,23 @@ const TRANSACTION_EXIT_GRACE_NS: u64 = 30_000_000_000;
 /// running (a short `dpkg -i`), how long after its exec its transaction
 /// covers a write.
 const TRANSACTION_UNSEEN_GRACE_NS: u64 = 60_000_000_000;
+
+/// Lab PR 175: man-db's cache builder, whose own writes the posture's
+/// mass-write arm exempts ([`AuthSessionTracker::is_system_man_cache_writer`]).
+const MANDB_EXE: &str = "/usr/bin/mandb";
+
+/// Lab PR 175: the highest uid of a system account (`SYS_UID_MAX` in
+/// `login.defs`: 999 on Debian, Ubuntu, Fedora and RHEL). man-db rebuilds
+/// its caches as `man` (Debian, Ubuntu) or root (Fedora); a user runs a
+/// program as such an account only with root's help.
+const SYSTEM_UID_MAX: u32 = 999;
+
+/// Lab PR 175: the directories of a user's container storage below a
+/// directory of theirs — rootless Podman's (`~/.local/share/containers`)
+/// and unprivileged LXC's (`~/.local/share/lxc`); the user owns the
+/// directory the marker ends with
+/// ([`AuthSessionTracker::is_user_container_storage_write`]).
+const USER_CONTAINER_STORAGE: &[&str] = &["/.local/share/containers/", "/.local/share/lxc/"];
 
 /// Kernel-resolved exec paths of the Node.js interpreter. `npm` is a
 /// `#!/usr/bin/env node` script, so a process running `npm install`
@@ -350,6 +375,10 @@ struct Entry {
     /// Review 85: what an interpreter `exe` runs ([`script_of`]): a script
     /// path or a `-m` module. `None` for a binary, or an inline program.
     script: Option<Box<str>>,
+    /// Lab PR 175: the real uid the process executed `exe` as (the exec
+    /// event's, from the kernel's credentials; 0 for the plain ingest
+    /// calls of tests and tools).
+    uid: u32,
 }
 
 /// Review 85: what the kernel executed for a process — its exe and, for
@@ -648,6 +677,9 @@ struct Inner {
     /// `CLOCK_MONOTONIC`) instead of the clocks'.
     #[cfg(test)]
     suspended_ns: Option<u64>,
+    /// Lab PR 175: the host's `/` for `/etc/passwd`, `/etc/subuid` and the
+    /// owners of container storage directories; a fixture tree in tests.
+    host_root: PathBuf,
 }
 
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
@@ -681,6 +713,7 @@ impl AuthSessionTracker {
                 observer_start: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 suspended_ns: None,
+                host_root: PathBuf::from("/"),
             }),
         }
     }
@@ -700,6 +733,15 @@ impl AuthSessionTracker {
         Self::build(PathBuf::from("/proc"), true)
     }
 
+    /// Tests: `/etc` and the container storage read under `root`.
+    #[cfg(test)]
+    pub(crate) fn with_host_root(mut self, root: &Path) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("an unshared tracker")
+            .host_root = root.to_path_buf();
+        self
+    }
+
     /// Tests: [`Self::for_host`] on a fixture `/proc`, with the host's
     /// suspended time given.
     #[cfg(test)]
@@ -715,9 +757,10 @@ impl AuthSessionTracker {
     /// cache reaches [`TRACKER_CAP`].
     ///
     /// PID 0 is the kernel "no process" sentinel and is never
-    /// recorded.
+    /// recorded. Tests and tools: the process is recorded as executed by
+    /// root; the agent feeds [`Self::ingest_exec`], with the event's uid.
     pub fn ingest_spawn(&self, pid: u32, ppid: u32, exe: &str, spawn_ns: u64) {
-        self.ingest_inner(pid, ppid, exe, false, None, spawn_ns, 0);
+        self.ingest_inner(pid, ppid, exe, false, None, spawn_ns, 0, 0);
     }
 
     /// Like [`Self::ingest_spawn`] but also derives the npm-CLI flag
@@ -734,12 +777,14 @@ impl AuthSessionTracker {
         argv: &[String],
         spawn_ns: u64,
     ) {
-        self.ingest_exec(pid, ppid, exe, argv, spawn_ns, 0);
+        self.ingest_exec(pid, ppid, exe, argv, spawn_ns, 0, 0);
     }
 
     /// External audit POS-003: [`Self::ingest_spawn_with_argv`] with the
     /// process's own start (`Event::ProcessSpawn::start_ns`, its fork),
-    /// as the exec event carries it (production; 0 unknown).
+    /// as the exec event carries it (production; 0 unknown). Lab PR 175:
+    /// and the real uid it executed as (`Event::ProcessSpawn::uid`).
+    #[allow(clippy::too_many_arguments)]
     pub fn ingest_exec(
         &self,
         pid: u32,
@@ -748,10 +793,20 @@ impl AuthSessionTracker {
         argv: &[String],
         spawn_ns: u64,
         start_ns: u64,
+        uid: u32,
     ) {
         let argv_npm_cli = argv.get(1).is_some_and(|a| a.ends_with(NPM_CLI_SUFFIX));
         let script = script_of(Path::new(exe), argv);
-        self.ingest_inner(pid, ppid, exe, argv_npm_cli, script, spawn_ns, start_ns);
+        self.ingest_inner(
+            pid,
+            ppid,
+            exe,
+            argv_npm_cli,
+            script,
+            spawn_ns,
+            start_ns,
+            uid,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -764,6 +819,7 @@ impl AuthSessionTracker {
         script: Option<Box<str>>,
         spawn_ns: u64,
         start_ns: u64,
+        uid: u32,
     ) {
         if pid == 0 {
             return;
@@ -775,6 +831,7 @@ impl AuthSessionTracker {
             start_ns: if start_ns != 0 { start_ns } else { spawn_ns },
             argv_npm_cli,
             script,
+            uid,
         };
         let mut s = self.inner.state.write();
         // NN-AUD-284: whatever ran under this pid before is over.
@@ -836,13 +893,18 @@ impl AuthSessionTracker {
     /// package-management / cache-refresh daemon ([`SYSTEM_DAEMON_EXES`]).
     /// Same kernel-resolved `/proc/<pid>/exe` keying as
     /// [`Self::is_auth_mediated`] — `comm` is never consulted
-    /// (`prctl(PR_SET_NAME)`-spoofable). Used by the mass-write arm of
-    /// [`super::triggers::confirmed_intrusion`] and by
-    /// [`super::triggers::persistence_mechanism`] to exempt routine
-    /// snapd / dpkg / apt / mandb maintenance from escalation. The FIM
-    /// rules' package carve-out uses the narrower, time-bound
-    /// [`Self::is_package_transaction_write`] (external audit NN-AUD-284).
-    pub fn is_system_daemon_mediated(&self, pid: u32) -> bool {
+    /// (`prctl(PR_SET_NAME)`-spoofable).
+    ///
+    /// Lab PR 175: no longer a carve-out. It exempted the posture's
+    /// mass-write, staging-exec and persistence arms, NN-L-NET-008, the
+    /// chains' package carve-out and R009 for anything a `mandb`, or any
+    /// package manager, had in its lineage — whoever ran it, and for as
+    /// long as the descendant lived. They use
+    /// [`Self::in_package_transaction`] (and the mass-write arm
+    /// [`Self::is_system_man_cache_writer`]); this stays for the tests of
+    /// the walk.
+    #[cfg(test)]
+    pub(crate) fn is_system_daemon_mediated(&self, pid: u32) -> bool {
         self.lineage_exe_matches(pid, is_system_daemon_binary)
     }
 
@@ -850,8 +912,8 @@ impl AuthSessionTracker {
     /// `event_ns` (CLOCK_MONOTONIC) belongs to a package transaction —
     /// `pid` runs, or descends from, a package manager proper
     /// ([`PACKAGE_MANAGER_EXES`]: what the kernel executed, on the walk of
-    /// [`Self::is_system_daemon_mediated`], never `comm`), and that package
-    /// manager's run covers `event_ns`:
+    /// [`Self::is_auth_mediated`], never `comm`), executed by root (lab PR
+    /// 175), and that package manager's run covers `event_ns`:
     /// - it runs now, as the process the cache recorded (its start checked);
     /// - or it has exited, and `event_ns` is no later than
     ///   [`TRANSACTION_EXIT_GRACE_NS`] after a walk last found it running;
@@ -862,8 +924,31 @@ impl AuthSessionTracker {
     /// The nearest package manager in the lineage answers: a process a
     /// finished `dpkg` left behind is not covered by the `apt` above it.
     /// Used by the FIM rules' package carve-out and the drain's rate
-    /// limiter; the posture keeps [`Self::is_system_daemon_mediated`].
+    /// limiter; it is [`Self::in_package_transaction`].
     pub fn is_package_transaction_write(&self, pid: u32, event_ns: u64) -> bool {
+        self.in_package_transaction(pid, event_ns)
+    }
+
+    /// Lab PR 175: what `pid` did at `event_ns` (CLOCK_MONOTONIC: a write,
+    /// a connect, an exec) belongs to a package transaction — the check of
+    /// [`Self::is_package_transaction_write`], for every event:
+    /// - the nearest package manager proper in its lineage
+    ///   ([`PACKAGE_MANAGER_EXES`], what the kernel executed) was executed
+    ///   by root (the exec event's real uid, or `/proc/<pid>/status` for a
+    ///   package manager that predates the agent). None of them is set-id:
+    ///   a user who runs `dpkg --version` with `LD_PRELOAD` has it fork
+    ///   whatever it likes, as with `mandb`, but not as root. A package
+    ///   manager run as root inside a user namespace is its uid on the
+    ///   host (a rootless container's), so a container image's own
+    ///   `/usr/bin/dpkg` vouches for nothing either;
+    /// - its run covers `event_ns` (running now, last seen running at most
+    ///   [`TRANSACTION_EXIT_GRACE_NS`] before, or never seen running and
+    ///   executed at most [`TRANSACTION_UNSEEN_GRACE_NS`] before).
+    ///
+    /// An event without a time (0) is judged at the time it is read.
+    /// Serves the FIM rules, NN-L-NET-008, the chains' package carve-out,
+    /// R009 and the posture's arms.
+    pub fn in_package_transaction(&self, pid: u32, event_ns: u64) -> bool {
         let Some(Some(hop)) = self.lineage_walk(
             pid,
             |hop| is_package_manager_binary(&hop.exe),
@@ -871,7 +956,200 @@ impl AuthSessionTracker {
         ) else {
             return false;
         };
+        if hop.uid != Some(0) {
+            return false;
+        }
+        let event_ns = if event_ns == 0 {
+            monotonic_ns()
+        } else {
+            event_ns
+        };
         self.transaction_covers(&hop, event_ns)
+    }
+
+    /// Lab PR 175: `pid` itself runs man-db's cache builder ([`MANDB_EXE`],
+    /// what the kernel executed), as root or a system account (uid at most
+    /// [`SYSTEM_UID_MAX`]): the daily rebuild (man-db's timer or cron job,
+    /// as `man` on Debian and Ubuntu, root on Fedora). Its own writes only,
+    /// not a descendant's: the posture's mass-write arm exempts them, as it
+    /// exempted the `mandb` lineage before. A user's own `mandb` runs as
+    /// that user, `LD_PRELOAD` and all; the rebuild that dpkg's man-db
+    /// trigger runs descends from dpkg ([`Self::in_package_transaction`]).
+    pub fn is_system_man_cache_writer(&self, pid: u32) -> bool {
+        if pid == 0 || pid == 1 {
+            return false;
+        }
+        self.hop(pid).is_some_and(|hop| {
+            hop.exe == Path::new(MANDB_EXE) && hop.uid.is_some_and(|uid| uid <= SYSTEM_UID_MAX)
+        })
+    }
+
+    /// Lab PR 175: a write (or open) `pid` made at `event_ns` belongs to a
+    /// package transaction a user runs in a container of theirs, and lands
+    /// in that container's storage. The posture's mass-write and
+    /// persistence arms exempt it, so a rootless `podman build` whose `dnf`
+    /// or `apt` unpacks thousands of files raises no `ConfirmedIntrusion`;
+    /// the rules (FIM, R009, NN-L-NET-008, the chains) do not, as they judge
+    /// the host's files, execs and network.
+    ///
+    /// - The nearest package manager proper in the lineage
+    ///   ([`PACKAGE_MANAGER_EXES`]) was executed by a uid other than root
+    ///   (root's is [`Self::in_package_transaction`]), and its run covers
+    ///   `event_ns`, with the same windows.
+    /// - Its storage: `<dir>/.local/share/containers/…` or
+    ///   `<dir>/.local/share/lxc/…` whose marker directory that user owns,
+    ///   `/run/user/<uid>/containers/…`, or `/var/lib/lxc/<name>/…` whose
+    ///   `<name>` directory that user owns. "That user" is the uid, or the
+    ///   owner of the `/etc/subuid` range the uid lies in (an unprivileged
+    ///   LXC container's root is a subordinate uid). Ownership, not the
+    ///   `/etc/passwd` home: no name-service call on the detection path, and
+    ///   a directory the user owns holds nothing of anyone else.
+    /// - `path` placed by the kernel's walk (absolute, `!path_from_user`):
+    ///   inside that storage, whatever the namespace — the copy-up of an
+    ///   overlay, a volume. Outside it (the user's home, the host's `/etc`
+    ///   or `/tmp`, a bind-mounted directory): never.
+    /// - Any other `path` — on a filesystem no host mount shows
+    ///   (`mnt[maj:min:ino]/…`), cut by the walk (`…/…`), or the caller's
+    ///   string (tracepoint mode): only when `pid` runs in a mount
+    ///   namespace other than init's whose root mount is an overlay with
+    ///   its upper and work directories in that storage, and, for a
+    ///   `mnt[…]` path, on that very overlay. Another overlay the container
+    ///   mounts (its upper directory could be a bind-mounted home) is not.
+    pub fn is_user_container_storage_write(
+        &self,
+        pid: u32,
+        event_ns: u64,
+        path: &str,
+        path_from_user: bool,
+    ) -> bool {
+        let Some(Some(hop)) = self.lineage_walk(
+            pid,
+            |hop| is_package_manager_binary(&hop.exe),
+            LINEAGE_DEPTH_CAP,
+        ) else {
+            return false;
+        };
+        let Some(uid) = hop.uid.filter(|uid| *uid != 0) else {
+            return false;
+        };
+        let event_ns = if event_ns == 0 {
+            monotonic_ns()
+        } else {
+            event_ns
+        };
+        if !self.transaction_covers(&hop, event_ns) {
+            return false;
+        }
+        let users = self.storage_users(uid);
+        if !path_from_user && path.starts_with('/') {
+            return self.in_container_storage(path, uid, &users);
+        }
+        let Some(root_dev) = self.storage_rooted_namespace(pid, uid, &users) else {
+            return false;
+        };
+        crate::sensors::open_sensor::unplaced_root_dev(path).is_none_or(|dev| dev == root_dev)
+    }
+
+    /// Lab PR 175: `uid`, and the owner of the `/etc/subuid` range it lies
+    /// in, if any (named by user name or uid; the name read from
+    /// `/etc/passwd`).
+    fn storage_users(&self, uid: u32) -> Vec<u32> {
+        let mut users = vec![uid];
+        let read = |f: &str| fs::read_to_string(self.inner.host_root.join(f)).unwrap_or_default();
+        let subuid = read("etc/subuid");
+        let mut passwd: Option<String> = None;
+        for line in subuid.lines() {
+            let mut f = line.trim().splitn(3, ':');
+            let (Some(owner), Some(start), Some(count)) = (f.next(), f.next(), f.next()) else {
+                continue;
+            };
+            let (Ok(start), Ok(count)) = (start.parse::<u64>(), count.parse::<u64>()) else {
+                continue;
+            };
+            if !(start..start.saturating_add(count)).contains(&u64::from(uid)) {
+                continue;
+            }
+            let owner_uid = owner.parse::<u32>().ok().or_else(|| {
+                passwd
+                    .get_or_insert_with(|| read("etc/passwd"))
+                    .lines()
+                    .find_map(|l| {
+                        let mut p = l.split(':');
+                        (p.next() == Some(owner))
+                            .then(|| p.nth(1).and_then(|u| u.parse().ok()))
+                            .flatten()
+                    })
+            });
+            if let Some(o) = owner_uid {
+                if !users.contains(&o) {
+                    users.push(o);
+                }
+            }
+        }
+        users
+    }
+
+    /// Lab PR 175: `path` (absolute, from the kernel's walk or an overlay's
+    /// options) lies in the container storage of `users`
+    /// ([`Self::is_user_container_storage_write`]).
+    fn in_container_storage(&self, path: &str, uid: u32, users: &[u32]) -> bool {
+        if !path.starts_with('/')
+            || path.split('/').any(|c| {
+                c == "." || c == ".." || c == crate::sensors::open_sensor::UNREAD_COMPONENT
+            })
+        {
+            return false;
+        }
+        let owner = |dir: &str| {
+            fs::symlink_metadata(self.inner.host_root.join(dir.trim_start_matches('/')))
+                .ok()
+                .filter(|m| m.is_dir())
+                .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+        };
+        if users
+            .iter()
+            .any(|u| path.starts_with(&format!("/run/user/{u}/containers/")))
+        {
+            return true;
+        }
+        for marker in USER_CONTAINER_STORAGE {
+            if let Some(at) = path.find(marker) {
+                let dir = &path[..at + marker.len() - 1];
+                if owner(dir).is_some_and(|o| users.contains(&o)) {
+                    return true;
+                }
+            }
+        }
+        if let Some((name, _)) = path
+            .strip_prefix("/var/lib/lxc/")
+            .and_then(|rest| rest.split_once('/'))
+        {
+            if !name.is_empty()
+                && owner(&format!("/var/lib/lxc/{name}"))
+                    .is_some_and(|o| o == uid || users.contains(&o))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Lab PR 175: `pid` runs in a mount namespace other than init's whose
+    /// root mount (the last `/` of its `mountinfo`) is an overlay with its
+    /// `upperdir` and `workdir` in the container storage of `users`; that
+    /// overlay's `(major, minor)`.
+    fn storage_rooted_namespace(&self, pid: u32, uid: u32, users: &[u32]) -> Option<(u32, u32)> {
+        let ns = |p: &str| fs::read_link(self.inner.proc_root.join(p).join("ns").join("mnt")).ok();
+        let (own, init) = (ns(&pid.to_string())?, ns("1")?);
+        if own == init {
+            return None;
+        }
+        let text = fs::read_to_string(self.inner.proc_root.join(pid.to_string()).join("mountinfo"))
+            .ok()?;
+        let (dev, upper, work) = root_overlay(&text)?;
+        (self.in_container_storage(&format!("{upper}/"), uid, users)
+            && self.in_container_storage(&format!("{work}/"), uid, users))
+        .then_some(dev)
     }
 
     /// NN-AUD-284: the run of the package manager `hop` covers `event_ns`
@@ -1107,7 +1385,7 @@ impl AuthSessionTracker {
     /// FP-2 — true iff `pid` is npm's own node process: a DIRECT
     /// (non-lineage) check that the focal writer's `exe` ∈ [`NODE_EXES`]
     /// AND its precomputed [`Entry::argv_npm_cli`] flag is set (argv[1]
-    /// = npm's CLI entrypoint). Unlike [`Self::is_system_daemon_mediated`]
+    /// = npm's CLI entrypoint). Unlike [`Self::in_package_transaction`]
     /// this does NOT walk ancestors — only the npm-cli.js node process
     /// itself is exempted from the mass-write arm; any child it spawns
     /// (a postinstall script, node-gyp, make, …) is a different pid with
@@ -1209,7 +1487,7 @@ impl AuthSessionTracker {
 
     /// External audit PROC-008: the nearest process in the lineage of
     /// `pid` — `pid` itself or an ancestor, on the walk of
-    /// [`Self::is_system_daemon_mediated`] (an ancestor counts only if it
+    /// [`Self::is_auth_mediated`] (an ancestor counts only if it
     /// ran its program before the process below it was forked, POS-003) —
     /// whose exec identity `is_actor` accepts; its executable. `None` when
     /// there is none, or when the walk loses the chain first.
@@ -1270,10 +1548,11 @@ impl AuthSessionTracker {
                     cached: true,
                     spawn_ns: e.spawn_ns,
                     start_ns: e.start_ns,
+                    uid: Some(e.uid),
                 });
             }
         }
-        let (ppid, exe) = self.lookup_proc(pid)?;
+        let (ppid, exe, uid) = self.lookup_proc(pid)?;
         Some(Hop {
             pid,
             ppid,
@@ -1282,6 +1561,7 @@ impl AuthSessionTracker {
             cached: false,
             spawn_ns: 0,
             start_ns: 0,
+            uid,
         })
     }
 
@@ -1558,7 +1838,9 @@ impl AuthSessionTracker {
             .map(|e| (e.ppid, e.exe.clone()))
     }
 
-    fn lookup_proc(&self, pid: u32) -> Option<(u32, PathBuf)> {
+    /// `/proc/<pid>`: its parent, its exe, and its real uid (`None` when
+    /// the status shows none).
+    fn lookup_proc(&self, pid: u32) -> Option<(u32, PathBuf, Option<u32>)> {
         let pid_str = pid.to_string();
         let exe_link = self.inner.proc_root.join(&pid_str).join("exe");
         let exe = fs::read_link(&exe_link).ok()?;
@@ -1573,7 +1855,7 @@ impl AuthSessionTracker {
         let status_path = self.inner.proc_root.join(&pid_str).join("status");
         let text = fs::read_to_string(&status_path).ok()?;
         let ppid = parse_ppid(&text)?;
-        Some((ppid, exe))
+        Some((ppid, exe, parse_real_uid(&text)))
     }
 
     #[cfg(test)]
@@ -1601,6 +1883,9 @@ struct Hop {
     /// Cached only: when it executed `exe`, and its start.
     spawn_ns: u64,
     start_ns: u64,
+    /// Lab PR 175: the real uid it executed `exe` as (cached), or runs as
+    /// (`/proc`); `None` when `/proc` shows none.
+    uid: Option<u32>,
 }
 
 /// Nanoseconds per `/proc` clock tick (`sysconf(_SC_CLK_TCK)`).
@@ -1714,6 +1999,40 @@ fn parse_ppid(status_text: &str) -> Option<u32> {
     None
 }
 
+/// Lab PR 175: the root mount of a `mountinfo` text — its last line whose
+/// mount point (field 5) is `/` — when it is an overlay: its `(major,
+/// minor)` and its `upperdir` and `workdir` (octal escapes decoded).
+fn root_overlay(mountinfo: &str) -> Option<((u32, u32), String, String)> {
+    let line = mountinfo
+        .lines()
+        .rfind(|l| l.split(' ').nth(4) == Some("/"))?;
+    let (fields, sb) = line.split_once(" - ")?;
+    let mut sb = sb.split(' ');
+    if sb.next()? != "overlay" {
+        return None;
+    }
+    let options = sb.nth(1)?;
+    let (major, minor) = fields.split(' ').nth(2)?.split_once(':')?;
+    let dev = (major.parse().ok()?, minor.parse().ok()?);
+    let option = |name: &str| {
+        options
+            .split(',')
+            .find_map(|o| o.strip_prefix(name)?.strip_prefix('='))
+            .map(crate::sensors::open_sensor::unescape_octal)
+    };
+    Some((dev, option("upperdir")?, option("workdir")?))
+}
+
+/// Lab PR 175: the real uid, the first of the four on the `Uid:` line of a
+/// `/proc/<pid>/status` body.
+fn parse_real_uid(status_text: &str) -> Option<u32> {
+    status_text
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1822,7 +2141,7 @@ mod tests {
     /// transaction while the package manager proper it descends from runs
     /// (as the process the cache recorded), for 30 s after a walk last saw
     /// it running, or — never seen running — for 60 s after its exec. Not
-    /// under `mandb`, which the posture still trusts.
+    /// under `mandb`.
     #[test]
     fn a_package_transaction_is_bound_to_its_package_managers_run() {
         let tmp = TempDir::new().unwrap();
@@ -1830,8 +2149,8 @@ mod tests {
         let t = AuthSessionTracker::live_on(tmp.path(), 0);
         // far past the host's own monotonic clock
         let b = 1_000_000_000 * S;
-        t.ingest_exec(200, 1, "/usr/bin/dpkg", &[], b, b);
-        t.ingest_exec(300, 200, "/bin/sh", &[], b + S, b + S);
+        t.ingest_exec(200, 1, "/usr/bin/dpkg", &[], b, b, 0);
+        t.ingest_exec(300, 200, "/bin/sh", &[], b + S, b + S, 0);
         write_started(tmp.path(), "200", 1, ticks(b));
         assert!(t.is_package_transaction_write(300, b + 2 * S), "dpkg runs");
         assert!(t.is_package_transaction_write(200, b + 2 * S));
@@ -1841,11 +2160,11 @@ mod tests {
         assert!(!t.is_package_transaction_write(300, b + 33 * S));
         assert!(
             t.is_system_daemon_mediated(300),
-            "the posture's predicate is unchanged"
+            "the wide predicate (the walk's tests only, lab PR 175)"
         );
         // a new dpkg in the pid, never seen running: its exec + 60 s
-        t.ingest_exec(200, 1, "/usr/bin/dpkg", &[], b + 100 * S, b + 100 * S);
-        t.ingest_exec(301, 200, "/bin/sh", &[], b + 101 * S, b + 101 * S);
+        t.ingest_exec(200, 1, "/usr/bin/dpkg", &[], b + 100 * S, b + 100 * S, 0);
+        t.ingest_exec(301, 200, "/bin/sh", &[], b + 101 * S, b + 101 * S, 0);
         assert!(t.is_package_transaction_write(301, b + 160 * S));
         assert!(!t.is_package_transaction_write(301, b + 161 * S));
         // the pid now names a later process (a fork, no exec event)
@@ -1853,9 +2172,9 @@ mod tests {
         write_exe(tmp.path(), 200, "/usr/bin/bash");
         write_status(tmp.path(), 200, 1);
         assert!(!t.is_package_transaction_write(301, b + 120 * S));
-        // mandb: the posture's, not a package manager
-        t.ingest_exec(910, 1, "/usr/bin/mandb", &[], b, b);
-        t.ingest_exec(920, 910, "/usr/bin/crontab", &[], b + S, b + S);
+        // mandb: not a package manager
+        t.ingest_exec(910, 1, "/usr/bin/mandb", &[], b, b, 0);
+        t.ingest_exec(920, 910, "/usr/bin/crontab", &[], b + S, b + S, 0);
         write_started(tmp.path(), "910", 1, ticks(b));
         assert!(t.is_system_daemon_mediated(920));
         assert!(!t.is_package_transaction_write(920, b + 2 * S));
@@ -1874,6 +2193,261 @@ mod tests {
             .filter(|e| !PACKAGE_MANAGER_EXES.contains(e))
             .collect();
         assert_eq!(left, [&"/usr/bin/mandb"]);
+    }
+
+    /// `/proc/<pid>/status` with a parent and a real uid.
+    fn write_status_uid(dir: &Path, pid: u32, ppid: u32, uid: u32) {
+        let pid_dir = dir.join(pid.to_string());
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(
+            pid_dir.join("status"),
+            format!("Name:\tx\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t0\t0\t0\n"),
+        )
+        .unwrap();
+    }
+
+    /// Lab PR 175: a package transaction is a package manager root
+    /// executed. None of them is set-id: a user's `dpkg --version` run
+    /// with `LD_PRELOAD` forks what it likes, as that user — the wide
+    /// predicate took it, and the time-bound one of lab PR 173 still did.
+    /// A package manager known from `/proc` only answers with the real uid
+    /// of its status.
+    #[test]
+    fn a_package_transaction_is_a_package_manager_root_executed() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // a user's dpkg, running, and the program it forked from /tmp
+        t.ingest_exec(200, 100, "/usr/bin/dpkg", &[], S, S, 1000);
+        t.ingest_exec(201, 200, "/tmp/payload", &[], 2 * S, 2 * S, 1000);
+        fs::create_dir_all(tmp.path().join("200")).unwrap();
+        assert!(t.is_system_daemon_mediated(201), "the wide predicate");
+        assert!(!t.in_package_transaction(201, 3 * S));
+        assert!(!t.is_package_transaction_write(201, 3 * S));
+        assert!(!t.in_package_transaction(200, 3 * S));
+        // root's dpkg, the same shape: a transaction, for its children
+        // whatever they run as (apt's methods drop to `_apt`)
+        t.ingest_exec(300, 100, "/usr/bin/dpkg", &[], S, S, 0);
+        t.ingest_exec(301, 300, "/tmp/helper", &[], 2 * S, 2 * S, 0);
+        t.ingest_exec(302, 300, "/usr/lib/apt/methods/http", &[], 2 * S, 2 * S, 42);
+        fs::create_dir_all(tmp.path().join("300")).unwrap();
+        assert!(t.in_package_transaction(301, 3 * S));
+        assert!(t.in_package_transaction(302, 3 * S));
+        // the nearest package manager answers: root's apt above a user's
+        // dpkg does not cover what that dpkg forked
+        t.ingest_exec(400, 1, "/usr/bin/apt-get", &[], S, S, 0);
+        t.ingest_exec(410, 400, "/usr/bin/dpkg", &[], 2 * S, 2 * S, 1000);
+        t.ingest_exec(411, 410, "/tmp/payload", &[], 3 * S, 3 * S, 1000);
+        fs::create_dir_all(tmp.path().join("400")).unwrap();
+        fs::create_dir_all(tmp.path().join("410")).unwrap();
+        assert!(!t.in_package_transaction(411, 4 * S));
+        // known from /proc only: its status's real uid
+        write_exe(tmp.path(), 500, "/usr/bin/apt-get");
+        write_status_uid(tmp.path(), 500, 1, 0);
+        assert!(t.in_package_transaction(500, 3 * S));
+        write_exe(tmp.path(), 510, "/usr/bin/apt-get");
+        write_status_uid(tmp.path(), 510, 1, 1000);
+        assert!(!t.in_package_transaction(510, 3 * S));
+        write_exe(tmp.path(), 520, "/usr/bin/apt-get");
+        write_status(tmp.path(), 520, 1);
+        assert!(!t.in_package_transaction(520, 3 * S), "no Uid line");
+    }
+
+    /// Lab PR 175: an event without a time is judged when it is read, not
+    /// covered by any transaction that ever ran (`0 <= seen + 30 s`).
+    #[test]
+    fn an_event_without_a_time_is_judged_now() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        // root's dpkg, exited, executed at boot
+        t.ingest_exec(200, 1, "/usr/bin/dpkg", &[], 1, 1, 0);
+        t.ingest_exec(201, 200, "/bin/sh", &[], 2, 2, 0);
+        assert!(t.in_package_transaction(201, 3));
+        assert!(!t.in_package_transaction(201, 0));
+    }
+
+    /// Lab PR 175: man-db's cache rebuild, the one `mandb` exemption left
+    /// (the posture's mass-write arm): `mandb` itself, as root or a system
+    /// account — not what it forks, not a user's `mandb`.
+    #[test]
+    fn mandbs_own_writes_as_a_system_account_are_its_cache_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let t = AuthSessionTracker::new(tmp.path());
+        t.ingest_exec(910, 1, "/usr/bin/mandb", &[], S, S, 6);
+        t.ingest_exec(911, 910, "/usr/bin/crontab", &[], 2 * S, 2 * S, 6);
+        t.ingest_exec(920, 900, "/usr/bin/mandb", &[], S, S, 1000);
+        t.ingest_exec(930, 1, "/usr/bin/mandb", &[], S, S, 0);
+        assert!(t.is_system_man_cache_writer(910), "man-db's timer, as man");
+        assert!(t.is_system_man_cache_writer(930), "as root");
+        assert!(!t.is_system_man_cache_writer(911), "its child");
+        assert!(!t.is_system_man_cache_writer(920), "a user's mandb");
+        assert!(
+            !t.in_package_transaction(910, 2 * S),
+            "not a package manager"
+        );
+        assert!(!t.in_package_transaction(911, 2 * S));
+        // a child it forked without exec: /proc names mandb, and its uid
+        write_exe(tmp.path(), 940, "/usr/bin/mandb");
+        write_status_uid(tmp.path(), 940, 920, 1000);
+        assert!(!t.is_system_man_cache_writer(940));
+        write_exe(tmp.path(), 950, "/usr/bin/mandb");
+        write_status_uid(tmp.path(), 950, 910, 6);
+        assert!(t.is_system_man_cache_writer(950));
+        assert!(!t.is_system_man_cache_writer(0));
+    }
+
+    /// Lab PR 175: a user's container storage, by ownership — rootless
+    /// Podman's and LXC's below a directory of theirs, the runtime
+    /// directory's, `/var/lib/lxc/<name>` they own — for the uid or the
+    /// owner of the subordinate range it lies in.
+    #[test]
+    fn a_users_container_storage_is_told_by_ownership() {
+        let host = TempDir::new().unwrap();
+        let me = unsafe { libc::getuid() };
+        for d in [
+            "home/nn/.local/share/containers/storage",
+            "home/nn/.local/share/lxc/c1",
+            "var/lib/lxc/c2/rootfs",
+        ] {
+            fs::create_dir_all(host.path().join(d)).unwrap();
+        }
+        fs::create_dir_all(host.path().join("etc")).unwrap();
+        fs::write(
+            host.path().join("etc/passwd"),
+            format!("root:x:0:0::/root:/bin/sh\nnn:x:{me}:{me}::/home/nn:/bin/bash\n"),
+        )
+        .unwrap();
+        fs::write(host.path().join("etc/subuid"), "nn:100000:65536\n").unwrap();
+        let t = AuthSessionTracker::new("/this/path/does/not/exist").with_host_root(host.path());
+        let mine = t.storage_users(me);
+        let ok = |p: &str, users: &[u32], uid: u32| t.in_container_storage(p, uid, users);
+        let overlay = "/home/nn/.local/share/containers/storage/overlay/0a1b/diff/usr/lib/x";
+        assert!(ok(overlay, &mine, me));
+        assert!(ok(
+            &format!("/run/user/{me}/containers/overlay/x"),
+            &mine,
+            me
+        ));
+        assert!(ok("/var/lib/lxc/c2/rootfs/usr/x", &mine, me));
+        assert!(!ok("/home/nn/Documents/report.docx", &mine, me));
+        assert!(
+            !ok("/home/nn/.local/share/containers", &mine, me),
+            "the marker's own entry"
+        );
+        assert!(!ok(
+            "/home/nn/.local/share/containers/../../../Documents/a",
+            &mine,
+            me
+        ));
+        assert!(!ok("/home/nn/.local/share/containers/?/a", &mine, me));
+        assert!(
+            !ok("/run/user/4242/containers/x", &mine, me),
+            "another uid's"
+        );
+        assert!(!ok("/var/lib/lxc/c9/rootfs/x", &mine, me), "absent");
+        assert!(!ok("mnt[0:77:2]/usr/lib/x", &mine, me));
+        // a directory of that name another uid owns
+        assert!(!ok(overlay, &[me.wrapping_add(1)], me.wrapping_add(1)));
+        // an unprivileged LXC container's root: a subordinate uid of nn
+        let sub = t.storage_users(100_005);
+        assert_eq!(sub, vec![100_005, me]);
+        assert!(ok(
+            "/home/nn/.local/share/lxc/c1/rootfs/usr/x",
+            &sub,
+            100_005
+        ));
+        assert_eq!(t.storage_users(200_000), vec![200_000]);
+    }
+
+    /// Lab PR 175: the root mount of a `mountinfo` (the last `/`), when it
+    /// is an overlay; its layers decoded.
+    #[test]
+    fn the_root_overlay_is_read_from_mountinfo() {
+        let mi = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                  900 800 0:77 / / rw,relatime - overlay overlay rw,lowerdir=/l/a:/l/b,upperdir=/h/u\\054x/diff,workdir=/h/w\n\
+                  901 900 0:78 / /run rw - tmpfs tmpfs rw\n";
+        let (dev, upper, work) = root_overlay(mi).expect("overlay root");
+        assert_eq!(dev, (0, 77));
+        assert_eq!(upper, "/h/u,x/diff");
+        assert_eq!(work, "/h/w");
+        assert!(root_overlay("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n").is_none());
+        assert!(root_overlay("").is_none());
+    }
+
+    /// Lab PR 175: a package manager a user runs is exempt in that user's
+    /// container storage only, and only during its run; one root runs is
+    /// [`AuthSessionTracker::in_package_transaction`]'s.
+    #[test]
+    fn a_users_package_manager_writes_its_container_storage_only() {
+        let host = TempDir::new().unwrap();
+        let procs = TempDir::new().unwrap();
+        let me = unsafe { libc::getuid() };
+        fs::create_dir_all(host.path().join("home/nn/.local/share/containers/storage")).unwrap();
+        let t = AuthSessionTracker::new(procs.path()).with_host_root(host.path());
+        let storage = "/home/nn/.local/share/containers/storage/overlay/0a1b/diff/usr/lib/x";
+        // the user's dnf (700) in a build container, and root's (800)
+        t.ingest_exec(700, 600, "/usr/bin/dnf", &[], S, S, me);
+        t.ingest_exec(800, 1, "/usr/bin/dnf", &[], S, S, 0);
+        assert!(t.is_user_container_storage_write(700, 2 * S, storage, false));
+        assert!(!t.is_user_container_storage_write(700, 2 * S, "/home/nn/Documents/a", false));
+        assert!(
+            !t.is_user_container_storage_write(800, 2 * S, storage, false),
+            "root's: the transaction"
+        );
+        assert!(
+            !t.is_user_container_storage_write(700, 120 * S, storage, false),
+            "after its run"
+        );
+        // a path no host mount shows, cut, or the caller's string: only in a
+        // namespace of its own rooted in that storage, on that overlay
+        for p in [
+            "mnt[0:77:2]/usr/lib/x",
+            "…/site-packages/x.pyc",
+            "/usr/lib/x",
+        ] {
+            assert!(
+                !t.is_user_container_storage_write(700, 2 * S, p, p == "/usr/lib/x"),
+                "{p}"
+            );
+        }
+        fs::create_dir_all(procs.path().join("1/ns")).unwrap();
+        symlink("mnt:[4026531841]", procs.path().join("1/ns/mnt")).unwrap();
+        fs::create_dir_all(procs.path().join("700/ns")).unwrap();
+        symlink("mnt:[4026532900]", procs.path().join("700/ns/mnt")).unwrap();
+        let o = "/home/nn/.local/share/containers/storage/overlay";
+        fs::write(
+            procs.path().join("700/mountinfo"),
+            format!(
+                "900 800 0:77 / / rw - overlay overlay rw,lowerdir={o}/l/A,upperdir={o}/0a1b/diff,workdir={o}/0a1b/work\n\
+                 901 900 0:78 / /mnt rw - overlay overlay rw,lowerdir=/x,upperdir=/home/nn/Documents/up,workdir=/home/nn/Documents/w\n"
+            ),
+        )
+        .unwrap();
+        assert!(t.is_user_container_storage_write(700, 2 * S, "mnt[0:77:2]/usr/lib/x", false));
+        assert!(t.is_user_container_storage_write(700, 2 * S, "…/site-packages/x.pyc", false));
+        assert!(t.is_user_container_storage_write(700, 2 * S, "/usr/lib/x", true));
+        assert!(!t.is_user_container_storage_write(700, 2 * S, "mnt[0:78:2]/report.docx", false));
+        assert!(!t.is_user_container_storage_write(700, 2 * S, "/home/nn/Documents/a", false));
+        // rooted in the user's documents: nothing but placed storage paths
+        fs::write(
+            procs.path().join("700/mountinfo"),
+            "900 800 0:77 / / rw - overlay overlay rw,lowerdir=/x,upperdir=/home/nn/Documents/up,workdir=/home/nn/Documents/w\n",
+        )
+        .unwrap();
+        assert!(!t.is_user_container_storage_write(700, 2 * S, "mnt[0:77:2]/report.docx", false));
+        // init's own namespace
+        fs::remove_file(procs.path().join("700/ns/mnt")).unwrap();
+        symlink("mnt:[4026531841]", procs.path().join("700/ns/mnt")).unwrap();
+        assert!(!t.is_user_container_storage_write(700, 2 * S, "/usr/lib/x", true));
+    }
+
+    #[test]
+    fn parse_real_uid_takes_the_first_uid() {
+        assert_eq!(
+            parse_real_uid("Name:\tx\nUid:\t1000\t0\t0\t0\nGid:\t5\t5\t5\t5\n"),
+            Some(1000)
+        );
+        assert_eq!(parse_real_uid("Name:\tx\nPPid:\t1\n"), None);
+        assert_eq!(parse_real_uid("Uid:\tx\n"), None);
     }
 
     #[test]
@@ -2344,19 +2918,19 @@ mod tests {
     fn a_parent_executing_sudo_after_forking_does_not_launder_its_children() {
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
-        t.ingest_exec(50, 1, "/usr/sbin/nginx", &[], 10 * S, 10 * S);
+        t.ingest_exec(50, 1, "/usr/sbin/nginx", &[], 10 * S, 10 * S, 0);
         // the parent (100) runs the payload, forks 200 at 30 s, then
         // executes sudo at 40 s; 200 executes its own payload at 50 s
-        t.ingest_exec(100, 50, "/srv/www/payload", &[], 21 * S, 20 * S);
-        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 40 * S, 20 * S);
-        t.ingest_exec(200, 100, "/srv/www/crypt", &[], 50 * S, 30 * S);
+        t.ingest_exec(100, 50, "/srv/www/payload", &[], 21 * S, 20 * S, 0);
+        t.ingest_exec(100, 50, "/usr/bin/sudo", &[], 40 * S, 20 * S, 0);
+        t.ingest_exec(200, 100, "/srv/www/crypt", &[], 50 * S, 30 * S, 0);
         assert!(
             !t.is_auth_mediated(200),
             "forked before its parent ran sudo"
         );
         assert!(t.is_auth_mediated(100), "the parent itself runs sudo");
         // what the parent forks after it ran sudo is sudo's
-        t.ingest_exec(300, 100, "/usr/bin/apt", &[], 46 * S, 45 * S);
+        t.ingest_exec(300, 100, "/usr/bin/apt", &[], 46 * S, 45 * S, 0);
         assert!(t.is_auth_mediated(300));
 
         // a child forked before, that never executed: /proc shows the
@@ -2367,12 +2941,12 @@ mod tests {
         // forked after, without executing (sudo's monitor): sudo's image
         write_exe(tmp.path(), 401, "/usr/bin/sudo");
         write_status(tmp.path(), 401, 100);
-        t.ingest_exec(402, 401, "/usr/bin/tee", &[], 61 * S, 60 * S);
+        t.ingest_exec(402, 401, "/usr/bin/tee", &[], 61 * S, 60 * S, 0);
         assert!(t.is_auth_mediated(402));
         // the same holds for a package manager's exemption
-        t.ingest_exec(500, 50, "/srv/www/payload", &[], 71 * S, 70 * S);
-        t.ingest_exec(600, 500, "/srv/www/crypt", &[], 81 * S, 75 * S);
-        t.ingest_exec(500, 50, "/usr/bin/dpkg", &[], 80 * S, 70 * S);
+        t.ingest_exec(500, 50, "/srv/www/payload", &[], 71 * S, 70 * S, 0);
+        t.ingest_exec(600, 500, "/srv/www/crypt", &[], 81 * S, 75 * S, 0);
+        t.ingest_exec(500, 50, "/usr/bin/dpkg", &[], 80 * S, 70 * S, 0);
         assert!(!t.is_system_daemon_mediated(600));
     }
 
@@ -2384,18 +2958,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
         // a service (100) forks 200 at 30 s, then exits
-        t.ingest_exec(100, 1, "/usr/sbin/nginx", &[], 20 * S, 20 * S);
-        t.ingest_exec(200, 100, "/tmp/crypt", &[], 31 * S, 30 * S);
+        t.ingest_exec(100, 1, "/usr/sbin/nginx", &[], 20 * S, 20 * S, 0);
+        t.ingest_exec(200, 100, "/tmp/crypt", &[], 31 * S, 30 * S, 0);
         assert!(!t.is_auth_mediated(200));
         // pid 100 goes to a shell of an SSH session, started at 45 s
-        t.ingest_exec(50, 1, "/usr/sbin/sshd", &[], 5 * S, 5 * S);
-        t.ingest_exec(100, 50, "/usr/bin/bash", &[], 46 * S, 45 * S);
+        t.ingest_exec(50, 1, "/usr/sbin/sshd", &[], 5 * S, 5 * S, 0);
+        t.ingest_exec(100, 50, "/usr/bin/bash", &[], 46 * S, 45 * S, 0);
         assert!(t.is_auth_mediated(100));
         assert!(!t.is_auth_mediated(200), "not the session's");
         assert_eq!(t.interactive_admin_status(200), Some(false));
         // a thread of the parent forking it is still the parent: the
         // process's own start is what is compared
-        t.ingest_exec(300, 100, "/usr/bin/make", &[], 51 * S, 50 * S);
+        t.ingest_exec(300, 100, "/usr/bin/make", &[], 51 * S, 50 * S, 0);
         assert!(t.is_auth_mediated(300));
     }
 
@@ -2408,7 +2982,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ticks = |ns: u64| ns / tick_ns();
         let t = AuthSessionTracker::live_on(tmp.path(), 0);
-        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S);
+        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S, 0);
         write_started(tmp.path(), "100", 1, ticks(1000 * S));
         assert!(t.is_auth_mediated(100), "the same process");
         // a later process forked into pid 100
@@ -2419,7 +2993,7 @@ mod tests {
         // a laptop suspended an hour before sudo started: /proc shows its
         // start an hour later on the boot clock — still sudo
         let t = AuthSessionTracker::live_on(tmp.path(), 3600 * S);
-        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S);
+        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S, 0);
         write_started(tmp.path(), "100", 1, ticks(4600 * S));
         assert!(t.is_auth_mediated(100));
         // an exited process: the cache is the record
@@ -2427,7 +3001,7 @@ mod tests {
         assert!(t.is_auth_mediated(100));
         // without live checks (tests, tools) the cache is trusted
         let t = AuthSessionTracker::new(tmp.path());
-        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S);
+        t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S, 0);
         write_started(tmp.path(), "100", 1, ticks(9000 * S));
         assert!(t.is_auth_mediated(100));
     }
@@ -2443,7 +3017,7 @@ mod tests {
         let ticks = |ns: u64| ns / tick_ns();
         let t = AuthSessionTracker::live_on(tmp.path(), 0);
         // the cached exec is the process pid 100 names: its exact start
-        t.ingest_exec(100, 1, "/usr/bin/curl", &[], 1000 * S + 5, 1000 * S + 3);
+        t.ingest_exec(100, 1, "/usr/bin/curl", &[], 1000 * S + 5, 1000 * S + 3, 0);
         write_started(tmp.path(), "100", 1, ticks(1000 * S + 3));
         assert_eq!(t.start_floor_ns(100), Some(1000 * S + 3));
         // a fork took pid 100 at 2000 s (no exec event): /proc's start
@@ -2470,11 +3044,11 @@ mod tests {
     fn a_credential_reader_is_the_auth_binary_not_its_session() {
         let tmp = TempDir::new().unwrap();
         let t = AuthSessionTracker::new(tmp.path());
-        t.ingest_exec(50, 1, "/usr/sbin/sshd", &[], S, S);
-        t.ingest_exec(60, 50, "/usr/bin/bash", &[], 2 * S, 2 * S);
-        t.ingest_exec(70, 60, "/usr/bin/cat", &[], 3 * S, 3 * S);
-        t.ingest_exec(80, 60, "/usr/bin/sudo", &[], 4 * S, 4 * S);
-        t.ingest_exec(90, 1, "/usr/sbin/unix_chkpwd", &[], 5 * S, 5 * S);
+        t.ingest_exec(50, 1, "/usr/sbin/sshd", &[], S, S, 0);
+        t.ingest_exec(60, 50, "/usr/bin/bash", &[], 2 * S, 2 * S, 0);
+        t.ingest_exec(70, 60, "/usr/bin/cat", &[], 3 * S, 3 * S, 0);
+        t.ingest_exec(80, 60, "/usr/bin/sudo", &[], 4 * S, 4 * S, 0);
+        t.ingest_exec(90, 1, "/usr/sbin/unix_chkpwd", &[], 5 * S, 5 * S, 0);
         assert!(t.is_auth_mediated(70), "in the session");
         assert!(!t.is_credential_reader(70), "but not the PAM stack");
         assert!(t.is_credential_reader(80));

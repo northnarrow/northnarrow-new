@@ -737,7 +737,7 @@ pub fn mount_points(mountinfo: &str) -> Vec<String> {
         .collect()
 }
 
-fn unescape_octal(s: &str) -> String {
+pub(crate) fn unescape_octal(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -875,6 +875,18 @@ fn file_capability(r: &OpenRecordRaw) -> FileCapability {
 fn unplaced_path(r: &OpenRecordRaw, rel: &str) -> String {
     let (major, minor) = (r.root_dev >> 20, r.root_dev & 0xF_FFFF);
     format!("mnt[{major}:{minor}:{}]{rel}", r.root_ino)
+}
+
+/// Lab PR 175: the `(major, minor)` of the filesystem an [`unplaced_path`]
+/// names, as field 3 of `/proc/<pid>/mountinfo` shows it; `None` for any
+/// other path.
+pub(crate) fn unplaced_root_dev(path: &str) -> Option<(u32, u32)> {
+    let inner = path.strip_prefix("mnt[")?.split_once(']')?.0;
+    let mut it = inner.splitn(3, ':');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    it.next()?.parse::<u64>().ok()?;
+    Some((major, minor))
 }
 
 /// The events one record stands for.
@@ -1174,6 +1186,22 @@ mod tests {
                 PathBuf::from("/srv/bob")
             ]
         );
+    }
+
+    /// Lab PR 175: an unplaced path names its filesystem as mountinfo does.
+    #[test]
+    fn an_unplaced_path_names_its_filesystem() {
+        let r = record(
+            open_reason::MASS_WRITE,
+            &["x", "lib", "/"],
+            ((7 << 20) | 77, 2),
+        );
+        let path = unplaced_path(&r, &relative_path(&r));
+        assert_eq!(path, "mnt[7:77:2]/lib/x");
+        assert_eq!(unplaced_root_dev(&path), Some((7, 77)));
+        for other in ["/home/u/x", "…/lib/x", "mnt[7:77]/x", "mnt[a:77:2]/x"] {
+            assert_eq!(unplaced_root_dev(other), None, "{other}");
+        }
     }
 
     #[test]

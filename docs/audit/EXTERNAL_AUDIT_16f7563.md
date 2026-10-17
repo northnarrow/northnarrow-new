@@ -6188,3 +6188,128 @@ group, the ones an unprivileged user or a local attacker could use first.
     claim of a fire without a file, the prefix match, `Opened` only, the
     case-sensitive suffix). Host: 2,207 passed, 0 failed.
   - Lab: Ubuntu 24.04, fimrules173-probe.sh — before: the build of `main` with lab PRs 167–171; after: this lot on top. A user's `mandb` run with `LD_PRELOAD` forking `crontab`: NN-L-FIM-007 Log, Low before; High, KillProcess after (a `crontab` run directly: High in both). Two cron drop-ins written by one process: 1 verdict before, 2 after. `/root/.aws/credentials` replaced, truncated by path and `chmod`-ed without being opened: no verdict before; NN-L-FIM-011 High on each after. `apt-get install --reinstall rsync`: Log-only rows in both builds. Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.
+- **Lab follow-ups — package mediation, lab PR 175.** The consumers of the
+  package carve-out other than the FIM rules, found while fixing NN-AUD-284
+  (lab PR 173, its "found while fixing" list). No audit finding of its
+  own; no kernel change.
+  - The consumers. NN-L-NET-008's record (NETR-008, lab PR 126), the
+    `package_mediated` carve-out of NN-L-CHAIN-002/005/007 (the same),
+    R009's `sanctioned` (PROC-007, lab PR 86) and the posture's
+    `persistence_mechanism`, `staging_exec` (POS-015) and both mass-write
+    arms (the kernel's `MassWrite`, tracepoint `FileOpen`) called
+    `is_system_daemon_mediated`: a `mandb` or a package manager anywhere in
+    the lineage (POS-003's ordered walk), whoever ran it, without end. A
+    user's `mandb -q` run with `LD_PRELOAD` (it is not set-id; the 173
+    probe prints its mode) forks a program from `/tmp` that calls out:
+    NET-008 Log instead of KillProcess, no CHAIN-002/005/007 verdict (they
+    defer to NET-008's record), no `PersistenceMechanism` for a crontab, no
+    `ConfirmedIntrusion` for the staged exec with a second factor nor for
+    a mass rewrite of the user's files. Under a root `mandb` (no terminal)
+    a root exec from `/tmp` is R009's Log, and R009 runs ahead of R001
+    (PROC-009), so nothing kills it. All of them now call
+    `AuthSessionTracker::in_package_transaction(pid, event_ns)` — lab PR
+    173's check, which `is_package_transaction_write` now delegates to —
+    with the event's own CLOCK_MONOTONIC time: the flow's `start_ns` (the
+    connect), the exec's `timestamp_ns`, the write's (CHAIN-007's late
+    credential read: the read's). NET-008 and the chains ask the same
+    question at the same time, so a flow a chain leaves alone is the one
+    NET-008 records. `is_system_daemon_mediated` is `#[cfg(test)]`, kept
+    for the walk's tests; `SYSTEM_DAEMON_EXES` keeps the review-49 side
+    cache only.
+  - The transaction is root's. None of `PACKAGE_MANAGER_EXES` is set-id
+    either: `LD_PRELOAD=… dpkg --version` run by a user forks what it likes
+    inside lab PR 173's transaction (the `dpkg` runs, or ran less than 60 s
+    before), the FIM carve-out included, and an image a user builds
+    (rootless Podman) brings its own `/usr/bin/dpkg`. The nearest package
+    manager in the lineage must have been executed by root: the real uid
+    of its exec event (`bpf_get_current_uid_gid`, a host uid, now recorded
+    in the spawn cache), or the real uid of `/proc/<pid>/status` for one
+    known from `/proc` only (it predates the agent). SNS-009's ring-drop
+    exemption (lab PR 128) already required a root package manager. A
+    child it runs as another account (apt's methods as `_apt`) stays
+    covered; a user's `dpkg` under root's `apt` answers for what it forks
+    (the nearest first). The plain `ingest_spawn` calls of tests and tools
+    record root; the agent's one ingest, the posture detector's, passes the
+    event's uid.
+  - `mandb`'s cache rebuild. The mass-write arm exempted the `mandb`
+    lineage for its cache rebuilds (review 49 (ii), the triage's reason to
+    keep the wide list there). Now `is_system_man_cache_writer`: the writer
+    itself runs `/usr/bin/mandb` (what the kernel executed; `/proc` for a
+    child forked without exec) as root or a system account (uid 999 or
+    below, `SYS_UID_MAX`; man-db's timer runs it as `man` on Debian and
+    Ubuntu, as root on Fedora). Not its children, not a user's `mandb`,
+    whose constructor can rewrite the user's files. The rebuild dpkg's
+    man-db trigger runs descends from dpkg: a transaction.
+  - Rootless builds. Bound to root alone, a `podman build`'s `dnf` or
+    `apt` (the container's root is the user's uid) lost the review-49
+    exemption the exe path had given it: thousands of files unpacked, a
+    `ConfirmedIntrusion` per build on a developer's host. The posture's
+    mass-write and persistence arms exempt a package manager a user runs
+    (its nearest package manager proper, executed by a uid other than root,
+    within the same windows) for its writes in that user's container
+    storage only, `is_user_container_storage_write`. Criterion, from what
+    the events carry (no mount namespace, no task root on the wire):
+    - a path the open sensor placed (its walk to the filesystem's root,
+      then the agent's mount table; never the caller's string): inside
+      `<dir>/.local/share/containers/` or `<dir>/.local/share/lxc/` whose
+      marker directory belongs to the user — the uid, or the owner of the
+      `/etc/subuid` range it lies in (an unprivileged LXC container's root
+      is a subordinate uid) — `/run/user/<uid>/containers/`, or
+      `/var/lib/lxc/<name>/` with `<name>` owned by the user. By ownership,
+      not the `/etc/passwd` home: no name-service call on the detection
+      path, and a directory the user owns holds nothing of anyone else's.
+      Outside (the user's home, a bind-mounted directory, `/etc`, `/tmp`):
+      never;
+    - any other path — on a filesystem no host mount shows
+      (`mnt[maj:min:ino]/…`, a native overlay's own files), cut by the
+      walk (sixteen components: a copy-up deep in the storage), or the
+      caller's string (tracepoint mode): read at evaluation from
+      `/proc/<pid>`, the process runs in a mount namespace other than
+      init's whose root mount (the last `/` of its `mountinfo`) is an
+      overlay with `upperdir` and `workdir` in that storage; an unplaced
+      path must be on that overlay (another overlay the container mounts
+      could have a bind-mounted home as its upper layer).
+    The rules (FIM, R009, NN-L-NET-008, the chains) give a user's package
+    manager nothing: they judge the host's files, execs and network.
+    Residuals: the kernel counts a process's write-opens and reports the
+    one that crossed the threshold, so the arm judges that one; a cut path
+    or a tracepoint string inside such a container is taken as the
+    container's; storage elsewhere (`storage.conf`), `fuse-overlayfs`
+    (the daemon writes, the overlay's options name no layers), relative
+    layer paths and LXD's pools (root's) are not recognised.
+    `~/.config/systemd/user/` is no persistence path of the posture today
+    (neither `PERSISTENCE_PREFIXES` nor the kernel's classes): a user unit
+    raises nothing, whoever writes it (a follow-up of its own).
+  - An event whose time is 0 (none on the wire today) is judged at the
+    time it is read: otherwise any transaction ever seen covered it
+    (`0 ≤ seen + 30 s`).
+  - Not changed: R001..R003 kill a staged exec whoever runs it, package
+    transactions included (as before); the network rules' comm allowlists,
+    judged by exec identity since review 85, are another mechanism.
+  - Tests: `net_008_kills_a_staged_process_outside_a_root_transaction`,
+    `chains_judge_a_staged_process_forked_under_a_users_mandb`,
+    `root_exec_is_sanctioned_only_within_a_root_package_transaction`,
+    `the_posture_judges_what_a_users_mandb_forks`,
+    `mandbs_own_cache_rebuild_is_exempt_not_its_children`,
+    `persistence_is_exempt_within_a_root_transaction_only`,
+    `a_package_transaction_is_a_package_manager_root_executed`,
+    `mandbs_own_writes_as_a_system_account_are_its_cache_rebuild`,
+    `an_event_without_a_time_is_judged_now`,
+    `parse_real_uid_takes_the_first_uid`,
+    `a_rootless_build_mass_writes_its_storage_not_the_users_files` (2,000
+    files in each arm), `a_rootless_build_installs_units_in_its_image_not_on_the_host`,
+    `a_users_package_manager_writes_its_container_storage_only`,
+    `a_users_container_storage_is_told_by_ownership`,
+    `the_root_overlay_is_read_from_mountinfo`,
+    `an_unplaced_path_names_its_filesystem`. The rootless ones fail with
+    the exemption taken out, made unconditional, or without the namespace
+    check. Checked by inverting each part:
+    with the lineage predicate put back the first nine fail; without the
+    root check, the NET-008, persistence and lineage root tests; without
+    the 0-time guard, its test; with `mandb`'s exemption for any uid,
+    `mandbs_own_writes_…` and `the_posture_judges_…`. The posture fixtures
+    spawn their package managers as root and the `mandb` of
+    `mass_write_exempt_for_mandb` as `man` (uid 6); the apt, dpkg, rpm, dnf
+    and snapd tests are otherwise unchanged and pass. Host: 2,223
+    passed, 0 failed.
+  - Lab: Ubuntu 24.04, pkgmed175-probe.sh — before: the build with lab PR 173; after: this lot on top. A user's `mandb` (`LD_PRELOAD`) forking a `/tmp` program that calls out: NN-L-NET-008 Log on the parent before (package-mediated); NN-L-CHAIN-002 Critical KillProcessTree after. Root's `mandb` (`LD_PRELOAD`, no terminal) forking a `/tmp` program: R009 Log, Low (sanctioned) before; R009 KillProcessTree after. Controls unchanged in both builds: `apt-get install --reinstall rsync`, and a root `dpkg -i` whose postinst runs a staged helper (the parent exempt, its forked child killed as before). The rootless-container exemption is covered by unit tests (no podman on the guest). Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.

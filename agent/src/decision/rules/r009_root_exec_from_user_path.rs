@@ -22,6 +22,13 @@ const USER_WRITABLE_PREFIXES: &[&str] = &["/home/", "/tmp/", "/var/tmp/"];
 /// the same image under init (this rule runs ahead of R001, so the lab saw
 /// an R009 kill and no R001 verdict). The record of a sanctioned lineage
 /// is unchanged.
+///
+/// Lab PR 175: the package transaction is the FIM rules' and NN-L-NET-008's
+/// ([`AuthSessionTracker::in_package_transaction`]: a package manager
+/// proper executed by root whose run covers the exec). It was any `mandb`
+/// or package manager in the lineage, whoever ran it and however long
+/// before — a record that also kept R001, which runs after this rule, from
+/// killing the exec.
 #[derive(Default)]
 pub struct R009RootExecFromUserPath {
     lineage: Option<AuthSessionTracker>,
@@ -34,10 +41,10 @@ impl R009RootExecFromUserPath {
         }
     }
 
-    fn sanctioned(&self, pid: u32) -> bool {
+    fn sanctioned(&self, pid: u32, exec_ns: u64) -> bool {
         self.lineage
             .as_ref()
-            .is_some_and(|l| l.is_interactive_admin(pid) || l.is_system_daemon_mediated(pid))
+            .is_some_and(|l| l.is_interactive_admin(pid) || l.in_package_transaction(pid, exec_ns))
     }
 }
 
@@ -58,6 +65,7 @@ impl Rule for R009RootExecFromUserPath {
             uid,
             filename,
             exe,
+            timestamp_ns,
             ..
         } = event
         else {
@@ -74,7 +82,7 @@ impl Rule for R009RootExecFromUserPath {
         {
             return None;
         }
-        if self.sanctioned(*pid) {
+        if self.sanctioned(*pid, *timestamp_ns) {
             return Some(build_verdict(
                 self,
                 event,
@@ -179,5 +187,59 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         let v = rule.evaluate(&other).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcessTree);
+    }
+
+    /// Lab PR 175: the package transaction is root's package manager while
+    /// its run covers the exec. Any `mandb` or package manager in the
+    /// lineage was sanctioned — and the record kept R001, which runs after
+    /// this rule, from killing the exec.
+    #[test]
+    fn root_exec_is_sanctioned_only_within_a_root_package_transaction() {
+        const S: u64 = 1_000_000_000;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        // root's mandb (710, running; LD_PRELOAD) → /tmp/payload (711)
+        lineage.ingest_exec(710, 1, "/usr/bin/mandb", &[], S, S, 0);
+        lineage.ingest_exec(711, 710, "/tmp/payload", &[], 2 * S, 2 * S, 0);
+        // root's dpkg (720, running) → a maintainer script's helper (721)
+        lineage.ingest_exec(720, 1, "/usr/bin/dpkg", &[], S, S, 0);
+        lineage.ingest_exec(721, 720, "/tmp/postinst-helper", &[], 2 * S, 2 * S, 0);
+        // root's dpkg (730), gone since its exec at 1 s → a leftover (731)
+        // whose child (732) runs a payload from /tmp at 200 s
+        lineage.ingest_exec(730, 1, "/usr/bin/dpkg", &[], S, S, 0);
+        lineage.ingest_exec(731, 730, "/usr/bin/sh", &[], 2 * S, 2 * S, 0);
+        lineage.ingest_exec(732, 731, "/tmp/payload", &[], 200 * S, 200 * S, 0);
+        for pid in ["710", "720"] {
+            std::fs::create_dir_all(tmp.path().join(pid)).unwrap();
+        }
+        let rule = R009RootExecFromUserPath::new(lineage);
+        let exec = |pid: u32, ppid: u32, path: &str, ts: u64| {
+            let mut e = spawn_as(0, "x", path);
+            if let Event::ProcessSpawn {
+                pid: p,
+                ppid: pp,
+                timestamp_ns,
+                ..
+            } = &mut e
+            {
+                (*p, *pp, *timestamp_ns) = (pid, ppid, ts);
+            }
+            rule.evaluate(&e).expect("a root exec from /tmp").action
+        };
+        assert_eq!(
+            exec(711, 710, "/tmp/payload", 2 * S),
+            ResponseAction::KillProcessTree,
+            "under mandb"
+        );
+        assert_eq!(
+            exec(721, 720, "/tmp/postinst-helper", 2 * S),
+            ResponseAction::Log,
+            "a maintainer script's helper"
+        );
+        assert_eq!(
+            exec(732, 731, "/tmp/payload", 200 * S),
+            ResponseAction::KillProcessTree,
+            "after the transaction"
+        );
     }
 }

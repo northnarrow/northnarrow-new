@@ -165,12 +165,19 @@ fn is_on_host(addr: &IpAddr) -> bool {
 
 /// External audit NETR-008: the review-49 carve-out for the staging chains
 /// (CHAIN-002/005/007), now that their precursor covers `/var/tmp` (where
-/// package transactions stage scriptlets). A process descending from a
-/// package manager or system maintenance daemon gets no chain verdict;
-/// its flow falls through to the network rules (NN-L-NET-008 records it),
-/// so no blocking rule is shadowed by a downgraded one.
-fn package_mediated(lineage: Option<&AuthSessionTracker>, pid: u32) -> bool {
-    lineage.is_some_and(|l| l.is_system_daemon_mediated(pid))
+/// package transactions stage scriptlets). A process of a package
+/// transaction gets no chain verdict; its flow falls through to the
+/// network rules (NN-L-NET-008 records it), so no blocking rule is
+/// shadowed by a downgraded one.
+///
+/// Lab PR 175: the transaction of NN-L-NET-008 and the FIM rules
+/// ([`AuthSessionTracker::in_package_transaction`]: a package manager
+/// proper executed by root whose run covers `event_ns`), no longer any
+/// `mandb` or package manager in the lineage. The same predicate at the
+/// same time as NN-L-NET-008, so a flow a chain leaves alone is the flow
+/// NN-L-NET-008 records.
+fn package_mediated(lineage: Option<&AuthSessionTracker>, pid: u32, event_ns: u64) -> bool {
+    lineage.is_some_and(|l| l.in_package_transaction(pid, event_ns))
 }
 
 // ── NN-L-CHAIN-001 — credential read → egress ────────────────────────
@@ -336,7 +343,7 @@ impl Rule for NnLChain002TmpExecThenEgress {
                     PrecursorKind::TmpExec,
                     nf.start_ns,
                     CORRELATION_WINDOW_NS,
-                ) || package_mediated(self.lineage.as_ref(), nf.pid)
+                ) || package_mediated(self.lineage.as_ref(), nf.pid, nf.start_ns)
                 {
                     return None;
                 }
@@ -525,7 +532,7 @@ impl Rule for NnLChain005CrossPidTmpC2 {
             PrecursorKind::TmpExec,
             nf.start_ns,
             CORRELATION_WINDOW_NS,
-        ) || package_mediated(self.lineage.as_ref(), nf.pid)
+        ) || package_mediated(self.lineage.as_ref(), nf.pid, nf.start_ns)
         {
             return None;
         }
@@ -636,7 +643,7 @@ impl Rule for NnLChain007TmpCredExfilSequence {
                     return None;
                 }
                 drop(store);
-                if package_mediated(self.lineage.as_ref(), nf.pid) {
+                if package_mediated(self.lineage.as_ref(), nf.pid, nf.start_ns) {
                     return None;
                 }
                 Some(chain_verdict(
@@ -665,7 +672,7 @@ impl Rule for NnLChain007TmpCredExfilSequence {
                 ) {
                     return None;
                 }
-                if package_mediated(self.lineage.as_ref(), fe.modifier_pid) {
+                if package_mediated(self.lineage.as_ref(), fe.modifier_pid, fe.timestamp_ns) {
                     return None;
                 }
                 let egress =
@@ -1141,6 +1148,39 @@ mod tests {
         r.evaluate(&staged_spawn(702, "/var/tmp/stage2", 10 * SEC));
         assert!(r.evaluate(&flow(701, 443, 11 * SEC)).is_none());
         assert!(r.evaluate(&flow(702, 443, 11 * SEC)).is_some());
+    }
+
+    /// Lab PR 175: the carve-out is NN-L-NET-008's package transaction
+    /// (root's package manager, while its run covers the flow). A program
+    /// from `/tmp` a user's `mandb` forked (`LD_PRELOAD`; not set-id) drew
+    /// no chain verdict; now CHAIN-002 and CHAIN-005 judge it. A root
+    /// transaction's staged scriptlet still falls through to the net rules.
+    #[test]
+    fn chains_judge_a_staged_process_forked_under_a_users_mandb() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        // the user's mandb (710, running) → /tmp/payload (711) → its child (712)
+        lineage.ingest_exec(710, 700, "/usr/bin/mandb", &[], SEC, SEC, 1000);
+        lineage.ingest_exec(711, 710, "/tmp/payload", &[], 10 * SEC, 10 * SEC, 1000);
+        lineage.ingest_exec(712, 711, "/usr/bin/curl", &[], 10 * SEC, 10 * SEC, 1000);
+        // root's rpm (720, running) → its scriptlet (721)
+        lineage.ingest_exec(720, 1, "/usr/bin/rpm", &[], SEC, SEC, 0);
+        lineage.ingest_exec(721, 720, "/var/tmp/rpm-tmp.x", &[], 10 * SEC, 10 * SEC, 0);
+        for pid in ["710", "720"] {
+            std::fs::create_dir_all(tmp.path().join(pid)).unwrap();
+        }
+        let store = Arc::new(Mutex::new(CorrelationStore::new()));
+        let c002 =
+            NnLChain002TmpExecThenEgress::new(store.clone()).with_lineage(Some(lineage.clone()));
+        let c005 = NnLChain005CrossPidTmpC2::new(store).with_lineage(Some(lineage));
+        c002.evaluate(&spawn_at(711, 710, "/tmp/payload", 10 * SEC));
+        c002.evaluate(&spawn_at(712, 711, "/usr/bin/curl", 10 * SEC + 1));
+        c002.evaluate(&spawn_at(721, 720, "/var/tmp/rpm-tmp.x", 10 * SEC));
+        let v = c002.evaluate(&flow(711, 443, 11 * SEC)).expect("CHAIN-002");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        let v = c005.evaluate(&flow(712, 443, 11 * SEC)).expect("CHAIN-005");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert!(c002.evaluate(&flow(721, 443, 11 * SEC)).is_none());
     }
 
     #[test]

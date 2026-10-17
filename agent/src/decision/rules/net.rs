@@ -1386,10 +1386,18 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
 /// no exec event, no `TmpExec` precursor — running the staged image, and
 /// its egress went unjudged. The image is now named at connect time
 /// (`AuthSessionTracker::image_path`, spawn cache then `/proc`), with the
-/// lineage cache as a fallback here for a row without one. A process that
-/// descends from a package manager or another system maintenance daemon
-/// (`is_system_daemon_mediated`, the review-49 carve-out) is recorded,
-/// not killed.
+/// lineage cache as a fallback here for a row without one. A process of a
+/// package transaction (the review-49 carve-out) is recorded, not killed.
+///
+/// Lab PR 175: the carve-out trusted any process with a package manager
+/// or `mandb` in its lineage, whoever ran it and however long ago. `mandb`
+/// and the package managers are not set-id: a user ran one with
+/// `LD_PRELOAD`, had it fork a program from `/tmp`, and that program's
+/// call out was recorded instead of killed. It is now the transaction of
+/// the FIM rules' carve-out
+/// ([`AuthSessionTracker::in_package_transaction`](crate::posture::lineage::AuthSessionTracker::in_package_transaction)):
+/// a package manager proper executed by root whose run covers the
+/// connect.
 pub struct NnLNet008OutboundFromTmpExec {
     lineage: Option<crate::posture::lineage::AuthSessionTracker>,
 }
@@ -1431,15 +1439,16 @@ impl Rule for NnLNet008OutboundFromTmpExec {
         if self
             .lineage
             .as_ref()
-            .is_some_and(|l| l.is_system_daemon_mediated(nf.pid))
+            .is_some_and(|l| l.in_package_transaction(nf.pid, nf.start_ns))
         {
             return Some(net_verdict(
                 self,
                 ResponseAction::Log,
                 Severity::High,
                 "Process running from a staging directory (/tmp, /var/tmp, /dev/shm) \
-                 opened a non-DNS outbound flow; it descends from a package manager \
-                 or system maintenance daemon, so it is recorded, not killed",
+                 opened a non-DNS outbound flow; it runs in a package transaction \
+                 (a package manager executed by root, still running or just ended), \
+                 so it is recorded, not killed",
                 nf.pid,
                 nf.comm.clone(),
                 nf.start_ns,
@@ -3311,6 +3320,53 @@ mod tests {
         assert_eq!(v.action, ResponseAction::Log);
         let v = rule.evaluate(&flow_from(None, 800, 443)).expect("fires");
         assert_eq!(v.action, ResponseAction::KillProcess);
+    }
+
+    /// Lab PR 175: the carve-out is the package transaction of the FIM
+    /// rules, bound to root and to the transaction's run. Before, any
+    /// process with `mandb` or a package manager in its lineage was
+    /// recorded: a user's program from `/tmp`, forked by a `mandb` or a
+    /// `dpkg --version` run with `LD_PRELOAD` (neither is set-id), and a
+    /// process a transaction left behind long after it ended.
+    #[test]
+    fn net_008_kills_a_staged_process_outside_a_root_transaction() {
+        const S: u64 = 1_000_000_000;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let running = |pid: u32| std::fs::create_dir_all(tmp.path().join(pid.to_string())).unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        // the user's shell (900) → mandb (910, running) → /tmp/payload (911)
+        lineage.ingest_exec(910, 900, "/usr/bin/mandb", &[], S, S, 1000);
+        lineage.ingest_exec(911, 910, "/tmp/payload", &[], 2 * S, 2 * S, 1000);
+        running(910);
+        // the user's dpkg --version (920, running) → /tmp/payload (921)
+        lineage.ingest_exec(920, 900, "/usr/bin/dpkg", &[], S, S, 1000);
+        lineage.ingest_exec(921, 920, "/tmp/payload", &[], 2 * S, 2 * S, 1000);
+        running(920);
+        // root's dpkg, gone since its exec at 1 s → /tmp/helper (931)
+        lineage.ingest_exec(930, 1, "/usr/bin/dpkg", &[], S, S, 0);
+        lineage.ingest_exec(931, 930, "/tmp/helper", &[], 2 * S, 2 * S, 0);
+        // root's dnf, running → its scriptlet in /var/tmp (941)
+        lineage.ingest_exec(940, 1, "/usr/bin/dnf", &[], S, S, 0);
+        lineage.ingest_exec(941, 940, "/var/tmp/rpm-tmp.Ab12Cd", &[], 2 * S, 2 * S, 0);
+        running(940);
+        let rule = NnLNet008OutboundFromTmpExec::new(Some(lineage));
+        let at = |pid: u32, ts: u64| {
+            let mut e = flow_from(None, pid, 443);
+            if let Event::NetFlow(nf) = &mut e {
+                nf.start_ns = ts;
+                nf.end_ns = ts + 1_000;
+            }
+            rule.evaluate(&e).expect("a staged image connects").action
+        };
+        assert_eq!(at(911, 3 * S), ResponseAction::KillProcess, "under mandb");
+        assert_eq!(at(921, 3 * S), ResponseAction::KillProcess, "a user's dpkg");
+        assert_eq!(
+            at(931, 30 * S),
+            ResponseAction::Log,
+            "within the transaction"
+        );
+        assert_eq!(at(931, 120 * S), ResponseAction::KillProcess, "after it");
+        assert_eq!(at(941, 600 * S), ResponseAction::Log, "dnf still runs");
     }
 
     #[test]
