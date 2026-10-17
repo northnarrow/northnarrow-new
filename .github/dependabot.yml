@@ -31,3 +31,12 @@ updates:
     directory: /
     schedule:
       interval: monthly
+
+  # External audit SUP-015: rust-toolchain.toml pins a release; this
+  # proposes the next one as a PR of its own (new lints and codegen land
+  # reviewed). Root only: agent-ebpf's dated nightly moves with bpf-linker
+  # and is bumped by hand.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: monthly

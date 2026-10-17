@@ -1,7 +1,12 @@
 //! Supply-chain hygiene of the repository itself: what the CI runs, how
 //! releases are verified, and what the default build targets. External
-//! audit SUP-001, SUP-002, SUP-005, SUP-017 and DEP-008. Each test reads
-//! committed files only; nothing runs a tool or touches the network.
+//! audit SUP-001, SUP-002, SUP-004, SUP-005, SUP-006, SUP-012, SUP-015,
+//! SUP-016, SUP-017, SUP-022 and DEP-008. The tests read committed files;
+//! two run a local tool and none touches the network:
+//! `prune_script_fails_closed` runs the CI prune script under bash with a
+//! stub `cargo`, and `rust_version_covers_every_locked_dependency` runs
+//! `cargo metadata --locked --offline` (the crates a workspace build
+//! downloads are enough).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -382,4 +387,632 @@ fn workflows_parse_as_yaml() {
             rel(&file)
         );
     }
+}
+
+fn workflow_yaml(file: &Path) -> serde_yaml_ng::Value {
+    serde_yaml_ng::from_str(&read(file)).unwrap_or_else(|e| panic!("{}: {e}", rel(file)))
+}
+
+/// The jobs of a workflow, by name.
+fn jobs(wf: &serde_yaml_ng::Value) -> Vec<(String, serde_yaml_ng::Value)> {
+    wf.get("jobs")
+        .and_then(|j| j.as_mapping())
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.as_str().unwrap_or("?").to_string(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn steps(job: &serde_yaml_ng::Value) -> Vec<serde_yaml_ng::Value> {
+    job.get("steps")
+        .and_then(|s| s.as_sequence())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn str_of<'a>(v: &'a serde_yaml_ng::Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
+}
+
+/// SUP-004: without a `permissions:` block the token gets the repository's
+/// default, which can be read/write. Every workflow starts read-only; a
+/// job asks for more only where it publishes (release.yml's `sign`).
+#[test]
+fn every_workflow_token_is_read_only_unless_it_publishes() {
+    const WRITE_ALLOWED: [(&str, &str, &str); 3] = [
+        (".github/workflows/release.yml", "sign", "contents"),
+        (".github/workflows/release.yml", "sign", "id-token"),
+        (".github/workflows/release.yml", "sign", "attestations"),
+    ];
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        let name = rel(&file);
+        let wf = workflow_yaml(&file);
+        match wf.get("permissions").and_then(|p| p.as_mapping()) {
+            None => bad.push(format!("{name}: no top-level `permissions:` mapping")),
+            Some(m) => {
+                for (scope, level) in m {
+                    let level = level.as_str().unwrap_or("?");
+                    if level != "read" && level != "none" {
+                        bad.push(format!(
+                            "{name}: top-level permission {}: {level}",
+                            scope.as_str().unwrap_or("?")
+                        ));
+                    }
+                }
+            }
+        }
+        for (job, body) in jobs(&wf) {
+            let Some(perms) = body.get("permissions") else {
+                continue;
+            };
+            let Some(m) = perms.as_mapping() else {
+                // `write-all` / `read-all`
+                bad.push(format!("{name}: job {job}: permissions {perms:?}"));
+                continue;
+            };
+            for (scope, level) in m {
+                let scope = scope.as_str().unwrap_or("?");
+                if level.as_str() == Some("write")
+                    && !WRITE_ALLOWED
+                        .iter()
+                        .any(|(f, j, s)| *f == name && *j == job && *s == scope)
+                {
+                    bad.push(format!("{name}: job {job}: {scope}: write"));
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "workflow tokens must be read-only (write only where release.yml publishes):\n{}",
+        bad.join("\n")
+    );
+}
+
+/// SUP-004: actions/checkout writes the token into .git/config unless told
+/// not to, and every build script and proc-macro the job compiles can read
+/// it there. No job here pushes.
+#[test]
+fn no_checkout_persists_the_token() {
+    let mut seen = 0;
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        let wf = workflow_yaml(&file);
+        for (job, body) in jobs(&wf) {
+            for step in steps(&body) {
+                if !str_of(&step, "uses").is_some_and(|u| u.starts_with("actions/checkout@")) {
+                    continue;
+                }
+                seen += 1;
+                let persist = step.get("with").and_then(|w| w.get("persist-credentials"));
+                let off = persist
+                    .is_some_and(|p| p.as_bool() == Some(false) || p.as_str() == Some("false"));
+                if !off {
+                    bad.push(format!("{}: job {job}", rel(&file)));
+                }
+            }
+        }
+    }
+    assert!(seen > 0, "no actions/checkout step found");
+    assert!(
+        bad.is_empty(),
+        "every actions/checkout needs `persist-credentials: false`:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// SUP-022: a restore key is a prefix match. `${{ runner.os }}-cargo-`
+/// restored any job's cache — another job's `target/`, built with other
+/// features or toolchains — into this one. A restore key may only drop the
+/// hash from the end of the job's own key.
+#[test]
+fn cache_restore_keys_stay_within_their_own_key() {
+    let mut seen = 0;
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        let wf = workflow_yaml(&file);
+        for (job, body) in jobs(&wf) {
+            for step in steps(&body) {
+                if !str_of(&step, "uses").is_some_and(|u| u.starts_with("actions/cache@")) {
+                    continue;
+                }
+                let with = step.get("with");
+                let key = with.and_then(|w| str_of(w, "key")).unwrap_or("");
+                let Some(restore) = with.and_then(|w| str_of(w, "restore-keys")) else {
+                    continue;
+                };
+                let own = key.rfind("${{ hashFiles(").map(|i| &key[..i]);
+                for entry in restore.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    seen += 1;
+                    if own != Some(entry) {
+                        bad.push(format!(
+                            "{}: job {job}: restore key `{entry}` (key `{key}`)",
+                            rel(&file)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(seen > 0, "no restore-keys entry found");
+    assert!(
+        bad.is_empty(),
+        "a restore key must be its own key without the trailing hashFiles():\n{}",
+        bad.join("\n")
+    );
+}
+
+/// Logical lines of a shell script: continuations joined, comments dropped.
+fn script_lines(script: &str) -> Vec<String> {
+    let lines: Vec<&str> = script.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let mut cmd = String::new();
+        loop {
+            let l = lines[i].trim_end();
+            cmd.push_str(l.trim_end_matches('\\'));
+            cmd.push(' ');
+            i += 1;
+            if !l.ends_with('\\') || i >= lines.len() {
+                break;
+            }
+        }
+        let t = cmd.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let code = match t.find(" # ") {
+            Some(at) => &t[..at],
+            None => t,
+        };
+        out.push(code.to_string());
+    }
+    out
+}
+
+/// A cargo invocation in a shell script.
+#[derive(Debug)]
+struct CargoCall {
+    /// `+toolchain` and flags before the subcommand.
+    global: Vec<String>,
+    sub: String,
+    /// The arguments up to the next shell separator, without what follows `--`.
+    args: Vec<String>,
+    line: String,
+}
+
+impl CargoCall {
+    fn locked_before(flags: &[String]) -> bool {
+        flags.iter().any(|f| f == "--locked" || f == "--frozen")
+    }
+    fn global_locked(&self) -> bool {
+        Self::locked_before(&self.global)
+    }
+    fn locked(&self) -> bool {
+        self.global_locked() || Self::locked_before(&self.args)
+    }
+}
+
+fn cargo_calls(script: &str) -> Vec<CargoCall> {
+    let mut out = Vec::new();
+    for line in script_lines(script) {
+        let mut flat = line.clone();
+        for sep in ["&&", "||", "$(", ";", "|", "(", ")", "`"] {
+            flat = flat.replace(sep, "\n");
+        }
+        for segment in flat.lines() {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            let Some(at) = tokens.iter().position(|t| *t == "cargo") else {
+                continue;
+            };
+            let mut global = Vec::new();
+            let mut rest = tokens[at + 1..].iter();
+            let mut sub = None;
+            for t in rest.by_ref() {
+                if t.starts_with('+') || t.starts_with('-') {
+                    global.push(t.to_string());
+                } else {
+                    sub = Some(t.to_string());
+                    break;
+                }
+            }
+            let Some(sub) = sub else { continue };
+            let args = rest
+                .take_while(|t| **t != "--")
+                .map(|t| t.to_string())
+                .collect();
+            out.push(CargoCall {
+                global,
+                sub,
+                args,
+                line: line.trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// SUP-016: without `--locked`, cargo resolves a manifest change again on
+/// the runner and builds whatever the registry serves that day, while the
+/// audit job checks the committed lockfile. Every build, test, clippy,
+/// check, run, fetch and tree is locked; `cargo xtask` twice (xtask's own
+/// build, and the nested builds xtask runs with a cleared environment).
+/// cargo-fuzz and cargo-kani have no `--locked`: their job checks the
+/// lockfile first (`fetch --locked`) and that nothing changed it after.
+#[test]
+fn every_workflow_build_is_locked() {
+    const LOCKED: [&str; 9] = [
+        "build", "check", "clippy", "test", "run", "fetch", "tree", "doc", "bench",
+    ];
+    const NO_BUILD: [&str; 4] = ["fmt", "install", "audit", "cyclonedx"];
+    let mut seen = 0;
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        let wf = workflow_yaml(&file);
+        for (job, body) in jobs(&wf) {
+            let runs: Vec<String> = steps(&body)
+                .iter()
+                .map(|s| str_of(s, "run").unwrap_or("").to_string())
+                .collect();
+            for (i, run) in runs.iter().enumerate() {
+                for call in cargo_calls(run) {
+                    let at = format!("{}: job {job}: {}", rel(&file), call.line);
+                    let sub = call.sub.as_str();
+                    if LOCKED.contains(&sub) {
+                        seen += 1;
+                        if !call.locked() {
+                            bad.push(format!("{at} (no --locked)"));
+                        }
+                    } else if sub == "xtask" {
+                        seen += 1;
+                        if !call.global_locked() || !CargoCall::locked_before(&call.args) {
+                            bad.push(format!("{at} (needs `cargo --locked xtask … --locked`)"));
+                        }
+                    } else if sub == "fuzz" || sub == "kani" {
+                        seen += 1;
+                        let lock = if sub == "fuzz" {
+                            "fuzz/Cargo.lock"
+                        } else {
+                            "Cargo.lock"
+                        };
+                        let fetched = runs[..i].iter().any(|r| {
+                            cargo_calls(r)
+                                .iter()
+                                .any(|c| c.sub == "fetch" && c.locked())
+                                && (sub != "fuzz" || r.contains("fuzz"))
+                        });
+                        let unchanged = runs[i + 1..]
+                            .iter()
+                            .any(|r| r.contains("git diff --exit-code") && r.contains(lock));
+                        if !fetched || !unchanged {
+                            bad.push(format!(
+                                "{at} (cargo {sub} has no --locked: the job needs an earlier \
+                                 `fetch --locked` of its lockfile and a later \
+                                 `git diff --exit-code -- … {lock}`)"
+                            ));
+                        }
+                    } else if !NO_BUILD.contains(&sub) {
+                        bad.push(format!(
+                            "{at} (cargo {sub}: unknown here; add it to LOCKED or NO_BUILD)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        seen >= 20,
+        "expected the workflows' cargo builds, found {seen}"
+    );
+    assert!(
+        bad.is_empty(),
+        "every cargo build in the workflows must be --locked:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// `MAJOR.MINOR[.PATCH]` as numbers.
+fn rust_version(s: &str) -> Option<(u64, u64, u64)> {
+    let parts: Vec<u64> = s
+        .split('.')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    match parts[..] {
+        [a, b] => Some((a, b, 0)),
+        [a, b, c] => Some((a, b, c)),
+        _ => None,
+    }
+}
+
+/// The value of `key = "…"` in `[section]` of a small TOML file.
+fn toml_string(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut current = String::new();
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if l.starts_with('[') {
+            current = l.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+            continue;
+        }
+        if current != section {
+            continue;
+        }
+        if let Some((k, v)) = l.split_once('=') {
+            if k.trim() == key {
+                return Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+fn declared_rust_version() -> (String, (u64, u64, u64)) {
+    let text = read(&repo_root().join("Cargo.toml"));
+    let v = toml_string(&text, "workspace.package", "rust-version")
+        .expect("Cargo.toml [workspace.package] declares rust-version");
+    let parsed = rust_version(&v).unwrap_or_else(|| panic!("rust-version `{v}` is not a version"));
+    (v, parsed)
+}
+
+/// SUP-015: `channel = "stable"` built every PR with whatever stable was
+/// that day, and `rust-version` claimed a floor nothing checked (1.83, while
+/// the locked uuid needs 1.89). The toolchain is a fixed release, no
+/// workflow installs a moving one, the floor is at most the pin, the `msrv`
+/// CI job builds with the floor, and Dependabot proposes the next release.
+#[test]
+fn the_toolchain_is_pinned_and_the_msrv_is_checked() {
+    let root = repo_root();
+    let toolchain = read(&root.join("rust-toolchain.toml"));
+    let channel = toml_string(&toolchain, "toolchain", "channel")
+        .expect("rust-toolchain.toml names a channel");
+    let pinned = rust_version(&channel)
+        .filter(|_| channel.split('.').count() == 3)
+        .unwrap_or_else(|| {
+            panic!("rust-toolchain.toml must pin a release (`1.x.y`), not `{channel}`")
+        });
+    let (declared, floor) = declared_rust_version();
+    assert!(
+        floor <= pinned,
+        "rust-version {declared} is newer than the pinned toolchain {channel}"
+    );
+
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        for (n, line) in read(&file).lines().enumerate() {
+            let code = line.split(" #").next().unwrap_or("");
+            if code.trim_start().starts_with('#') {
+                continue;
+            }
+            if [
+                "install stable",
+                "default stable",
+                "+stable",
+                "@stable",
+                "toolchain: stable",
+            ]
+            .iter()
+            .any(|m| code.contains(m))
+            {
+                bad.push(format!("{}:{}: {}", rel(&file), n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "workflows must build with the pinned toolchain, not `stable`:\n{}",
+        bad.join("\n")
+    );
+
+    let ci = workflow_yaml(&root.join(".github/workflows/ci.yml"));
+    let msrv_job = jobs(&ci).into_iter().find(|(_, body)| {
+        let runs: Vec<String> = steps(body)
+            .iter()
+            .filter_map(|s| str_of(s, "run").map(str::to_string))
+            .collect();
+        let reads_floor = runs
+            .iter()
+            .any(|r| r.contains("rust-version") && r.contains("Cargo.toml"));
+        let checks = runs.iter().any(|r| {
+            cargo_calls(r).iter().any(|c| {
+                c.sub == "check"
+                    && c.locked()
+                    && c.global.iter().any(|g| g.starts_with('+'))
+                    && c.args.iter().any(|a| a == "--workspace")
+            })
+        });
+        reads_floor && checks
+    });
+    assert!(
+        msrv_job.is_some(),
+        "ci.yml needs a job that reads rust-version from Cargo.toml and runs \
+         `cargo +<it> check --workspace --locked`"
+    );
+
+    let dependabot: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&read(&root.join(".github/dependabot.yml"))).unwrap();
+    let toolchain_updates = dependabot
+        .get("updates")
+        .and_then(|u| u.as_sequence())
+        .is_some_and(|u| {
+            u.iter().any(|e| {
+                str_of(e, "package-ecosystem") == Some("rust-toolchain")
+                    && str_of(e, "directory") == Some("/")
+            })
+        });
+    assert!(
+        toolchain_updates,
+        ".github/dependabot.yml must propose rust-toolchain.toml bumps (rust-toolchain, /)"
+    );
+}
+
+/// SUP-015: the declared floor is not below what the locked dependencies
+/// declare for the platform the product ships on. cargo metadata runs
+/// offline: a workspace build has already downloaded those crates (CI's
+/// test job builds before it tests).
+#[test]
+fn rust_version_covers_every_locked_dependency() {
+    let root = repo_root();
+    let (declared, floor) = declared_rust_version();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        .current_dir(&root)
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            "x86_64-unknown-linux-gnu",
+        ])
+        .output()
+        .expect("cargo metadata runs");
+    assert!(
+        out.status.success(),
+        "cargo metadata --locked --offline failed (build the workspace once, or \
+         `cargo fetch --locked`):\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("metadata JSON");
+    let members: Vec<&str> = meta["workspace_members"]
+        .as_array()
+        .expect("workspace_members")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    let mut checked = 0;
+    let mut above = Vec::new();
+    for pkg in meta["packages"].as_array().expect("packages") {
+        if members.contains(&pkg["id"].as_str().unwrap_or("")) {
+            continue;
+        }
+        let Some(rv) = pkg["rust_version"].as_str() else {
+            continue;
+        };
+        checked += 1;
+        let needs =
+            rust_version(rv).unwrap_or_else(|| panic!("{}: rust_version {rv}", pkg["name"]));
+        if needs > floor {
+            above.push(format!(
+                "{} {} needs {rv}",
+                pkg["name"].as_str().unwrap_or("?"),
+                pkg["version"].as_str().unwrap_or("?")
+            ));
+        }
+    }
+    assert!(
+        checked > 50,
+        "only {checked} locked packages declare a rust-version"
+    );
+    assert!(
+        above.is_empty(),
+        "Cargo.toml rust-version {declared} is below what the locked dependencies need \
+         (raise it in the same PR):\n{}",
+        above.join("\n")
+    );
+}
+
+/// SUP-012: the prune step must not pass when it pruned nothing because
+/// cargo metadata failed: the restored workspace artifacts would stay and
+/// could be taken as fresh. Runs the script with a stub `cargo` first on
+/// PATH.
+#[cfg(unix)]
+#[test]
+fn prune_script_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let script = repo_root().join(".github/scripts/prune-workspace-cache.sh");
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("prune-workspace-cache");
+    let _ = fs::remove_dir_all(&base);
+    let run = |case: &str, stub: &str| {
+        let dir = base.join(case);
+        let bin = dir.join("bin");
+        let target = dir.join("target");
+        for d in [
+            "debug/.fingerprint/northnarrow-agent-0123",
+            "debug/.fingerprint/serde-4567",
+        ] {
+            fs::create_dir_all(target.join(d)).unwrap();
+        }
+        fs::create_dir_all(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        fs::write(&cargo, format!("#!/bin/sh\n{stub}\n")).unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(&target)
+            .env("PATH", path)
+            .output()
+            .expect("bash runs");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        (out.status.success(), stdout, target)
+    };
+
+    for (case, stub) in [
+        ("metadata-fails", "exit 1"),
+        ("no-packages", r#"echo '{"packages":[]}'"#),
+        ("not-json", "echo 'error: something else'"),
+        ("empty-name", r#"echo '{"packages":[{"name":""}]}'"#),
+    ] {
+        let (ok, stdout, target) = run(case, stub);
+        assert!(!ok, "{case}: the prune step must fail; stdout: {stdout}");
+        assert!(!stdout.contains("pruned"), "{case}: {stdout}");
+        assert!(target
+            .join("debug/.fingerprint/northnarrow-agent-0123")
+            .exists());
+    }
+
+    let (ok, stdout, target) = run(
+        "two-crates",
+        r#"echo '{"packages":[{"name":"northnarrow-agent"},{"name":"xtask"}]}'"#,
+    );
+    assert!(ok, "two crates: {stdout}");
+    assert!(
+        stdout.contains("pruned workspace artifacts (2 crates)"),
+        "{stdout}"
+    );
+    assert!(
+        !target
+            .join("debug/.fingerprint/northnarrow-agent-0123")
+            .exists(),
+        "the workspace crate's fingerprint is removed"
+    );
+    assert!(
+        target.join("debug/.fingerprint/serde-4567").exists(),
+        "a dependency's fingerprint is kept"
+    );
+}
+
+/// SUP-006 (residual of Wave 2): an advisory published against an
+/// unchanged main must not wait for the next push. ci.yml runs on a
+/// schedule, and its audit job is not skipped there.
+#[test]
+fn advisories_are_checked_on_a_schedule() {
+    let ci = workflow_yaml(&repo_root().join(".github/workflows/ci.yml"));
+    let on = ci.get("on").expect("ci.yml has `on:`");
+    let cron = on
+        .get("schedule")
+        .and_then(|s| s.as_sequence())
+        .is_some_and(|s| s.iter().any(|e| str_of(e, "cron").is_some()));
+    assert!(cron, "ci.yml needs `on: schedule: - cron: …`");
+    let audit = jobs(&ci)
+        .into_iter()
+        .find(|(_, body)| {
+            steps(body)
+                .iter()
+                .any(|s| str_of(s, "run").is_some_and(|r| r.contains("cargo audit --file")))
+        })
+        .expect("ci.yml has the cargo audit job");
+    assert!(
+        !str_of(&audit.1, "if").is_some_and(|c| c.contains("schedule")),
+        "the audit job ({}) must run on the schedule",
+        audit.0
+    );
 }

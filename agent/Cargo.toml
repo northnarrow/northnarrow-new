@@ -149,3 +149,12 @@ tempfile = "3"
 # builds with -D warnings do not flag it as an unexpected cfg.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+# External audit SUP-015: clippy reads `rust-version`, which became true
+# (1.89, was 1.83). `u*::is_multiple_of` is stable since 1.87, so clippy
+# now asks for it at eleven `x % n == 0` sites of the agent. The rewrite
+# is behaviour-neutral for the non-zero constant divisors used there and
+# is left to its own change (the audit lots editing the agent run in
+# parallel); until then the lint stays off for this crate only.
+[lints.clippy]
+manual_is_multiple_of = "allow"

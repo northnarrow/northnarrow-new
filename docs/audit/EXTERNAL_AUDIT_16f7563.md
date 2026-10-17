@@ -601,21 +601,21 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-389 | DEP-017 | Low | Deploy | S | open |
 | NN-AUD-390 | DEP-018 | Low | Deploy | S | open |
 | NN-AUD-391 | DEP-019 | Low | Deploy | — | already fixed (lab PR 152) |
-| NN-AUD-392 | SUP-004 | Low | Supply chain | S | open |
+| NN-AUD-392 | SUP-004 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-393 | SUP-007 | Low | Supply chain | S | open |
 | NN-AUD-394 | SUP-008 | Low | Supply chain | S | open (not reachable; accept with a recorded exception) |
 | NN-AUD-395 | SUP-009 | Low | Supply chain | S | open (not reachable; accept with a recorded exception) |
 | NN-AUD-396 | SUP-010 | Low | Supply chain | S | open (root lockfile only) |
-| NN-AUD-397 | SUP-012 | Low | Supply chain | S | open |
+| NN-AUD-397 | SUP-012 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-398 | SUP-013 | Low | Supply chain | S | open |
 | NN-AUD-399 | SUP-014 | Low | Supply chain | M | open |
-| NN-AUD-400 | SUP-015 | Low | Supply chain | S | open (worse: the declared MSRV is already false) |
-| NN-AUD-401 | SUP-016 | Low | Supply chain | S | open |
+| NN-AUD-400 | SUP-015 | Low | Supply chain | S | fixed (lab PR 171) |
+| NN-AUD-401 | SUP-016 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-402 | SUP-018 | Low | Supply chain | M | open (10 targets now, none seeded) |
 | NN-AUD-403 | SUP-019 | Low | Supply chain | S (docs) | open (narrowed: the model is not redistributed) |
 | NN-AUD-404 | SUP-020 | Low | Supply chain | S-M (docs) | open |
 | NN-AUD-405 | SUP-021 | Low | Supply chain | S | open |
-| NN-AUD-406 | SUP-022 | Low | Supply chain | S | open |
+| NN-AUD-406 | SUP-022 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-407 | SUP-023 | Low | Supply chain | S | open |
 | NN-AUD-408 | SUP-024 | Low | Supply chain | M | partly fixed (lab PR 150; two-person review declined for now); open |
 | NN-AUD-409 | LAB-019 | Low | Lab scripts | S | open |
@@ -5904,3 +5904,91 @@ group, the ones an unprivileged user or a local attacker could use first.
     runs the wire tests with `debug-trigger`. The e2e also waits for the
     agent's first bind (up to 30 s) before removing the socket.
   - Lab: Debian 13 (6.12), wdg170-probe.sh — before: the build of lab PRs 162–169; after: this lot on top. Before: with links planted at the pidfile temporaries the watchdog failed to start (its unit stuck in `activating`); `rm /run/northnarrow/admin.sock` left the socket gone for good and `nn-admin status` failing (rc 5) until a reboot. After: the links replaced, not followed, both pidfiles regular files, the units active; the removed socket back within 5 s (mode 0600) with a signed `integrity_drift` `admin_socket_removed`; the agent's cgroup frozen and the socket removed: the watchdog WARN at the first ping, `watchdog.tamper` and the hold line at the second, the stuck recovery at the third (SIGINT, then SIGKILL of the frozen task), a new agent 70 s after the removal that signs `admin_socket_vanished`, `nn-admin status` rc 0. Not covered: a watchdog restarted after the socket was removed has never seen it answer, so it does not count the agent as stuck (the first run of the probe did that, and nothing recovered). Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.
+- **Wave 3 — CI and build integrity, lab PR 171.** NN-AUD-392 (SUP-004),
+  NN-AUD-401 (SUP-016), NN-AUD-406 (SUP-022), NN-AUD-397 (SUP-012),
+  NN-AUD-400 (SUP-015), all Low; batch 1 of the Wave 3 supply, lab and
+  tests triage. Also the residual of NN-AUD-204 (SUP-006, lab PR 110): no
+  scheduled advisory run.
+  - SUP-004 (392): `ci.yml` and `kani.yml` had no `permissions:`, so their
+    jobs held the repository's default token, and every checkout but the
+    audit job's left it in `.git/config`, readable by the build scripts and
+    proc-macros of ~370 crates. All four workflows now start at
+    `contents: read`; `write` exists only in release.yml's `sign` job
+    (contents, id-token, attestations); every checkout has
+    `persist-credentials: false` (btf-matrix's `run.sh` takes its token
+    from the environment, unchanged here: SUP-021).
+  - SUP-016 (401): no CI or release build was `--locked`; `cargo fetch
+    --locked` in release.yml covered the root lock only, and `cargo xtask`
+    built agent-ebpf unchecked. Every cargo build, test, clippy, check,
+    fetch and tree in the workflows is `--locked`. xtask has a `--locked`
+    option (before or after the subcommand) that it passes to the nested
+    agent-ebpf, userland and ade-demo builds — it clears the parent
+    cargo's environment, so the parent's flag cannot reach them — and CI
+    and the release run `cargo --locked xtask … --locked`. cargo-fuzz and
+    cargo-kani have no `--locked`: the fuzz job runs `cargo fetch --locked`
+    in `fuzz/` and the Kani job at the root first, and both end with `git
+    diff --exit-code` on the lockfiles. Found doing it: `fuzz/Cargo.lock`
+    no longer matched the agent's manifests (procfs 0.17 against 0.18,
+    fancy-regex 0.14 and `northnarrow-common`'s hex and serde_json
+    missing), so every fuzz run had resolved it again and built versions
+    nobody audited. It is updated with a minimal online resolve (`cargo
+    fetch`): fancy-regex 0.14 added and procfs, procfs-core 0.17 → 0.18,
+    as in the root lock; rustix 0.38 and linux-raw-sys 0.4 dropped.
+  - SUP-022 (406): four jobs ended their `restore-keys` with
+    `${{ runner.os }}-cargo-`, restoring any job's registry and `target/`.
+    The generic line is gone: a restore key may only drop the trailing
+    `hashFiles()` of its own key (btf-matrix's `btfhub-blobs-` too; its
+    unverified blobs are SUP-014, batch 4).
+  - SUP-012 (397): `prune-workspace-cache.sh` read the crate list through a
+    process substitution whose status nobody checks, so a failing `cargo
+    metadata` printed "(0 crates)" and exited 0 with the restored
+    workspace artifacts still in place. The metadata call and the JSON
+    read are checked; no package, an empty or unexpected name, or a
+    failure stops the job.
+  - SUP-015 (400): `rust-toolchain.toml` said `stable`, and `rust-version
+    = "1.83"` could not build: `uuid 1.28.0` declares 1.89 (`time 0.3.47`,
+    through tantivy, 1.88). The channel is `1.99.0`, the release the last
+    green CI on main used (runner image ubuntu24/20261012.334: Rust
+    1.99.0); every workflow installs it with `rustup toolchain install`
+    (rustup ≥ 1.28 reads the file) instead of `stable`; Dependabot's
+    `rust-toolchain` ecosystem (root only, monthly) proposes the next
+    release; agent-ebpf keeps its dated nightly. `rust-version` is 1.89,
+    the highest `rust-version` of the locked dependencies, and the whole
+    workspace (all targets, the committed lock) checks with 1.89.0 on the
+    host. A new `msrv` CI job reads the value from `Cargo.toml` and runs
+    `cargo +<it> check --workspace --all-targets --locked` (no cache, no
+    `-D warnings`: the claim is that it builds). clippy reads
+    `rust-version`: at 1.89 it asks for `is_multiple_of` (stable since
+    1.87) at eleven `x % n` sites of the agent. `manual_is_multiple_of` is
+    allowed in `agent/Cargo.toml` for now, so this lot touches no agent
+    source while the agent lots run; the rewrite is a follow-up.
+  - SUP-006 residual (204): `ci.yml` runs daily at 05:23 UTC; on the
+    schedule only the audit job runs (the others are skipped), so an
+    advisory against an unchanged main shows the next morning.
+  - Tests: `xtask/tests/supply_chain.rs`:
+    `every_workflow_token_is_read_only_unless_it_publishes`,
+    `no_checkout_persists_the_token`,
+    `cache_restore_keys_stay_within_their_own_key`,
+    `every_workflow_build_is_locked` (it parses each `run:` script; a
+    cargo subcommand it does not know fails it),
+    `the_toolchain_is_pinned_and_the_msrv_is_checked` (a fixed release,
+    `rust-version` not above it, no workflow installing `stable`, the
+    `msrv` job, the Dependabot entry),
+    `rust_version_covers_every_locked_dependency` (`cargo metadata --locked
+    --offline --filter-platform x86_64-unknown-linux-gnu`: the crates a
+    workspace build downloads are enough, checked with an empty
+    `CARGO_HOME`), `prune_script_fails_closed` (bash with a stub `cargo`:
+    failing, no packages, not JSON and an empty name fail without pruning;
+    two crates prune the workspace fingerprint and keep a dependency's),
+    `advisories_are_checked_on_a_schedule`: all eight fail on main and
+    pass here; xtask's `locked_reaches_the_nested_builds` unit test.
+    actionlint 1.7.12: no finding. On the host: `cargo --locked xtask
+    build-ebpf --locked` builds; with a dependency added to
+    `agent/Cargo.toml`, `cargo build --locked` refuses ("cannot update the
+    lock file … because --locked was passed"), and with one added to
+    `agent-ebpf/Cargo.toml`, `cargo --locked xtask build-ebpf --locked`
+    stops in the nested build with the same error.
+  - Not closed: lab and range scripts still build without `--locked`
+    (`nn-lab.sh`, `bootstrap-target-prod.sh`: LAB-027, batch 8). The first
+    build on a lab guest or developer host downloads the pinned toolchain.
+  - Lab: No lab run: CI and build configuration. The static tests in `xtask/tests/supply_chain.rs` fail on `main` (8) and pass with the change; the MSRV 1.89 checked with `cargo +1.89.0 check --workspace --all-targets --locked`; a dependency added without updating the lock is refused by `--locked`, also in the nested build of `agent-ebpf`; the workflows' YAML and actionlint 1.7.12 clean. The PR's own CI is the first run of the changed workflows. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.

@@ -12,11 +12,27 @@
 # chain. Rebuilding our own crates costs a minute; the dependencies are the
 # part worth caching.
 #
+# External audit SUP-012: the crate list came from a process substitution,
+# whose exit status nobody reads, so a failing `cargo metadata` (or python)
+# gave an empty list, "(0 crates)" and exit 0 — the restored artifacts stayed.
+# Each step is now checked, and an empty list or an empty name is an error.
+# xtask/tests/supply_chain.rs runs this script against a stub cargo.
+#
 # usage: prune-workspace-cache.sh <target-dir>...
 set -euo pipefail
 
-mapfile -t names < <(cargo metadata --no-deps --format-version 1 \
-    | python3 -c 'import json,sys; [print(p["name"]) for p in json.load(sys.stdin)["packages"]]')
+die() { echo "prune-workspace-cache: $*" >&2; exit 1; }
+
+meta=$(cargo metadata --no-deps --format-version 1) \
+    || die "cargo metadata failed; refusing to keep a restored cache unpruned"
+list=$(printf '%s' "$meta" \
+    | python3 -c 'import json,sys; [print(p["name"]) for p in json.load(sys.stdin)["packages"]]') \
+    || die "cannot read the workspace packages from cargo metadata"
+[ -n "$list" ] || die "cargo metadata lists no workspace package"
+mapfile -t names <<<"$list"
+for name in "${names[@]}"; do
+    [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die "unexpected package name: '$name'"
+done
 
 for target in "$@"; do
     [ -d "$target" ] || continue

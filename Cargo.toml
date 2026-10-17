@@ -8,7 +8,14 @@ exclude = ["agent-ebpf", "fuzz", "vendor/candle-core"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.83"
+# External audit SUP-015: the oldest rustc that builds this workspace with
+# the committed Cargo.lock. It was "1.83", which no build could meet:
+# uuid 1.28.0 declares 1.89 (time 0.3.47, through tantivy, 1.88). Checked by
+# the `msrv` CI job (`cargo +<this> check --workspace --all-targets
+# --locked`) and by xtask/tests/supply_chain.rs (not below the highest
+# `rust-version` of the locked dependencies, not above rust-toolchain.toml).
+# A dependency bump that needs a newer rustc raises it in the same PR.
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/northnarrow/northnarrow-new"
 authors = ["NorthNarrow"]

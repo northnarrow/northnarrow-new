@@ -23,6 +23,14 @@ const AGENT_PACKAGE: &str = "northnarrow-agent";
 #[derive(Parser, Debug)]
 #[command(name = "xtask", about = "NorthNarrow workspace task runner", version)]
 struct Cli {
+    /// Pass `--locked` to every nested cargo build (external audit
+    /// SUP-016): the build fails instead of rewriting `Cargo.lock` or
+    /// `agent-ebpf/Cargo.lock` when a manifest no longer matches it. xtask
+    /// clears the parent cargo's environment, so the parent's own
+    /// `--locked` cannot reach those builds: CI and the release run
+    /// `cargo --locked xtask … --locked`.
+    #[arg(long, global = true)]
+    locked: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -101,15 +109,16 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let locked = cli.locked;
     match cli.cmd {
         Cmd::BuildEbpf { release } => {
             ensure_bpf_linker()?;
-            build_ebpf(release)?;
+            build_ebpf(release, locked)?;
         }
         Cmd::Build { release, features } => {
             ensure_bpf_linker()?;
-            build_ebpf(true)?; // eBPF always release
-            build_userland(release, &features)?;
+            build_ebpf(true, locked)?; // eBPF always release
+            build_userland(release, &features, locked)?;
         }
         Cmd::Run {
             release,
@@ -118,12 +127,12 @@ fn run(cli: Cli) -> Result<()> {
             args,
         } => {
             ensure_bpf_linker()?;
-            build_ebpf(true)?;
-            build_userland(release, &features)?;
+            build_ebpf(true, locked)?;
+            build_userland(release, &features, locked)?;
             run_agent(release, no_sudo, &args)?;
         }
         Cmd::InspectEbpf => inspect_ebpf()?,
-        Cmd::AdeDemo => ade_demo()?,
+        Cmd::AdeDemo => ade_demo(locked)?,
         Cmd::RagKb {
             mirror,
             out,
@@ -139,7 +148,7 @@ fn run(cli: Cli) -> Result<()> {
 /// Hermetic demo: spins up an AdeEngine with the deterministic
 /// MockBackend, runs ten synthetic events, prints verdicts and
 /// stats. No GGUF, no eBPF, no root.
-fn ade_demo() -> Result<()> {
+fn ade_demo(locked: bool) -> Result<()> {
     let root = repo_root()?;
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&root).args([
@@ -151,6 +160,7 @@ fn ade_demo() -> Result<()> {
         "--package",
         "northnarrow-agent",
     ]);
+    lock_if(&mut cmd, locked);
     scrub_cargo_env(&mut cmd);
     let status = cmd.status().with_context(|| "failed to spawn ade-demo")?;
     if !status.success() {
@@ -223,7 +233,7 @@ fn ensure_bpf_linker() -> Result<()> {
     Ok(())
 }
 
-fn build_ebpf(release: bool) -> Result<()> {
+fn build_ebpf(release: bool, locked: bool) -> Result<()> {
     let root = repo_root()?;
     let ebpf_dir = root.join("agent-ebpf");
     if !ebpf_dir.is_dir() {
@@ -240,6 +250,7 @@ fn build_ebpf(release: bool) -> Result<()> {
     if release {
         cmd.arg("--release");
     }
+    lock_if(&mut cmd, locked);
     // Strip the parent cargo's environment so agent-ebpf's nightly
     // toolchain + bpfel target + build-std settings are picked up
     // from its own rust-toolchain.toml / .cargo/config.toml without
@@ -304,7 +315,7 @@ fn build_ebpf(release: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_userland(release: bool, features: &[String]) -> Result<()> {
+fn build_userland(release: bool, features: &[String], locked: bool) -> Result<()> {
     let root = repo_root()?;
     println!(
         "xtask: building userland workspace ({}{})",
@@ -323,6 +334,7 @@ fn build_userland(release: bool, features: &[String]) -> Result<()> {
     if !features.is_empty() {
         cmd.arg("--features").arg(features.join(","));
     }
+    lock_if(&mut cmd, locked);
     scrub_cargo_env(&mut cmd);
     let status = cmd
         .status()
@@ -331,6 +343,13 @@ fn build_userland(release: bool, features: &[String]) -> Result<()> {
         bail!("userland build failed (exit {status})");
     }
     Ok(())
+}
+
+/// Adds `--locked` to a nested cargo invocation when xtask was asked for it.
+fn lock_if(cmd: &mut Command, locked: bool) {
+    if locked {
+        cmd.arg("--locked");
+    }
 }
 
 /// Remove the `CARGO_*` and `RUSTC*` env vars cargo injects when it
@@ -393,7 +412,37 @@ fn run_agent(release: bool, no_sudo: bool, extra: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::scrubbed;
+    use super::{lock_if, scrubbed, Cli, Cmd};
+    use clap::Parser;
+    use std::process::Command;
+
+    #[test]
+    fn locked_reaches_the_nested_builds() {
+        // external audit SUP-016: before or after the subcommand
+        for argv in [
+            &["xtask", "--locked", "build", "--release"][..],
+            &["xtask", "build", "--release", "--locked"][..],
+            &["xtask", "build-ebpf", "--locked"][..],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.locked, "{argv:?}");
+        }
+        let cli = Cli::try_parse_from(["xtask", "build", "--release"]).unwrap();
+        assert!(!cli.locked && matches!(cli.cmd, Cmd::Build { release: true, .. }));
+
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build");
+        lock_if(&mut cmd, true);
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            ["build", "--locked"],
+            "the nested build gets --locked"
+        );
+        let mut cmd = Command::new("cargo");
+        cmd.arg("build");
+        lock_if(&mut cmd, false);
+        assert_eq!(cmd.get_args().count(), 1);
+    }
 
     #[test]
     fn per_target_configuration_reaches_the_nested_build() {

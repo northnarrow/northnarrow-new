@@ -243,9 +243,15 @@ FIM trust model, container hosts, honeypots. Lab and test runbook:
 - **Pinned CI.** Every GitHub action is pinned by commit SHA, every tool installed with
   `cargo install` by version with `--locked`; a test fails on a tag-pinned action or an
   unpinned install. Builds target `x86-64-v2` unless a developer opts into `native`.
+  Every CI and release build is `--locked` (a manifest change without its lockfile
+  fails), with the Rust release pinned in `rust-toolchain.toml` (Dependabot proposes
+  the next); `rust-version` in `Cargo.toml` (1.89) is checked by a CI job that builds
+  with it. Workflow tokens are read-only except where the release publishes, and no
+  checkout leaves the token in `.git/config`.
 - **Dependencies** are audited in CI (`cargo audit`, every lockfile, the fuzz harness and
-  the eBPF crate included) and kept current by Dependabot. A CI step fails when the C
-  libraries `onig_sys` or `zstd-sys` enter the agent's dependency graph.
+  the eBPF crate included) on every change and daily, and kept current by Dependabot. A
+  CI step fails when the C libraries `onig_sys` or `zstd-sys` enter the agent's
+  dependency graph.
 - **Vulnerability disclosure:** [`SECURITY.md`](SECURITY.md). Please do not file
   security-sensitive reports as public issues.
 - **No telemetry, no phone-home, no update channel the agent reaches out to.** Updates

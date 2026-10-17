@@ -46,10 +46,17 @@ jobs:
       # the poisoned cache back.
       RUSTFLAGS: -C target-cpu=x86-64-v2
     steps:
+      # External audit SUP-004: the token is not left in .git/config for
+      # the build scripts of the dependency tree (run.sh gets it from env).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
+      # External audit SUP-015: the pinned release of rust-toolchain.toml.
       - name: Install Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install stable --profile minimal
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
 
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -67,7 +74,8 @@ jobs:
           .github/scripts/prune-workspace-cache.sh target
 
       - name: Build the agent (no eBPF object needed for --btf-check)
-        run: cargo build --release -p northnarrow-agent
+        # External audit SUP-016: --locked, the build of Cargo.lock as committed.
+        run: cargo build --release --locked -p northnarrow-agent
 
       - name: Cache BTFHub blobs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -76,10 +76,13 @@ jobs:
 
       # Same toolchain pins as ci.yml's ebpf-build job (bpf-linker 0.10.x
       # links against rustc's bundled LLVM; 0.11 needs a system LLVM 21+).
+      # The userland builds with the release pinned in rust-toolchain.toml
+      # (external audit SUP-015), not whatever `stable` is that day.
       - name: Install nightly Rust + rust-src for build-std
         run: |
           rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
-          rustup default stable
+          rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
+          rustup show active-toolchain
 
       # External audit SUP-005: cargo-cyclonedx writes the SBOM that `sign`
       # attests, so its version is pinned like every other tool (the version
@@ -100,10 +103,15 @@ jobs:
       - name: Lockfile is authoritative
         run: cargo fetch --locked
 
+      # External audit SUP-016: `cargo fetch --locked` checks the root lock
+      # only. The first --locked builds xtask against it; the second is
+      # xtask's own, passed on to both nested builds, so agent-ebpf's lock
+      # is held to its manifest too and neither lockfile can be resolved
+      # again here.
       - name: cargo xtask build --release
         env:
           CARGO_INCREMENTAL: "0"
-        run: cargo xtask build --release
+        run: cargo --locked xtask build --release --locked
 
       - name: Assemble tarball + SBOM + checksums
         run: deploy/release/mk-tarball.sh dist
