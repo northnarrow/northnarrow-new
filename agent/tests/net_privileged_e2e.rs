@@ -311,6 +311,8 @@ impl NetFixture {
 
         common::require_bpftool();
         let child = Command::new("sudo")
+            .arg("env")
+            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
             .arg(&installed_agent.path)
             .arg("--combat-rules")
             .arg(&combat)

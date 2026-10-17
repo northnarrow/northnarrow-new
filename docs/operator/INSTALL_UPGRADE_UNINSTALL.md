@@ -67,6 +67,22 @@ If the units are already active, `install.sh` refuses with
 `Re-run with --upgrade`: with the hooks up every copy below would fail
 with `Operation not permitted` halfway through.
 
+The five `.v1` lists (`fim-paths`, `netflow-blocklist`,
+`netflow-ja3-blocklist`, `process-comm-allowlist`,
+`netflow-comm-allowlist`) are the shipped defaults, not configuration:
+every run of `install.sh` — fresh install, `--upgrade`, the packages'
+configure step — installs the release's copy (external audit LLMR-015,
+lab PR 168). Tune a list through its signed `.local` overlay (§3.6). A
+`.v1` that is no list NorthNarrow shipped (edited by hand) is kept as
+`<list>.v1.operator` next to it, the shipped one is installed, and
+`install.sh` prints a WARNING with the difference (first 40 lines; `+`
+your additions, `-` shipped entries you removed — the overlay's own
+syntax) and the `nn-admin config overlay set <list>` command. The agent
+applies the list it was built with in any case: one left over from an
+earlier release is a WARN at boot, an edited one an ERROR and a signed
+`integrity_drift` (`default_list_modified`) at every boot, and neither is
+applied.
+
 ## 2. Upgrade in place
 
 ```sh
@@ -105,8 +121,10 @@ What it does, in order:
    predates the list falls back to that count and names what is left;
    without `bpftool` the script checks that the units' processes and the
    pin root are gone and says the unload itself is not confirmed;
-4. runs the normal install (binaries, units, configs; `chattr +i` on the
-   state dir is lifted and re-applied by the new agent at boot), then
+4. runs the normal install (binaries, units, configs — the shipped `.v1`
+   lists replaced by the release's, an edited one kept as
+   `<list>.v1.operator` (§1); `chattr +i` on the state dir is lifted and
+   re-applied by the new agent at boot), then
    adopts the `*.local` overlays already present: each one without a valid
    signature is signed with `--grant-key` (`nn-admin config overlay
    sign`); one that cannot be — the key lacks `config-manage` — is listed
@@ -117,14 +135,17 @@ What it does, in order:
 Preserved across the upgrade: `admin.pub`, `agent.sig.key`, `agent_id`,
 `audit.log` (the new agent appends a signed `agent_boot` entry — review
 it with `nn-admin audit verify`), every chain log under
-`/var/lib/northnarrow`, and every `*.local` overlay. The window with no
+`/var/lib/northnarrow`, and every `*.local` overlay (the `.v1` lists are
+the release's, §1). The window with no
 hooks attached is the few seconds between step 3 and the new agent's
 boot; it is the same window a reboot has.
 
 The lab verifies this path on every nightly (`nn-lab.sh upgrade-check`):
 refusal without the flag, pid change, new audit entry, identity files
 unchanged, ≥ 7 of the new agent's own LSM programs, none of the old ones,
-no foreign LSM program lost, and `PROTECTED_PIDS` re-pinned afterwards.
+no foreign LSM program lost, `PROTECTED_PIDS` re-pinned afterwards, and
+the five `.v1` lists equal to the release's with no edited or left-over
+list reported by the new agent.
 
 ## 3. Uninstall
 
@@ -392,8 +413,16 @@ only if `<overlay>.sig` proves that a key with the **`config-manage`**
 role signed its exact content (SHA-256 and length), for this agent
 (`agent_id`), and not earlier than the last signature the audit chain
 accepted for that list (no rollback to a retired exemption). Otherwise it
-boots on the shipped defaults (`.v1`) for that list, logs `UNAUTHORIZED
+boots on the shipped defaults for that list, logs `UNAUTHORIZED
 OVERLAY` and records a signed `integrity_drift` (`unauthorized_overlay`).
+
+The shipped defaults are the copy built into the agent. The `.v1` file is
+applied only when it is that copy byte for byte; the copy of an earlier
+release gives way to it (WARN), anything else too (ERROR and a signed
+`integrity_drift`, `default_list_modified`, with both SHA-256, at every
+boot), and so does a `.v1` that is a symbolic link, a FIFO or larger than
+4 MiB (`default_list_unavailable`). A change to a list belongs in its
+`.local` overlay; `install.sh` replaces the `.v1` files (§1).
 
 That floor is read from the chain the agent verifies at boot (links,
 hashes and signatures after the last `overlay_floor_anchor`). When the
@@ -421,8 +450,8 @@ Every accepted new content is a `config_overlay_accepted` audit entry,
 every stored one a `config_overlay_set` entry. The two posture overlays and
 every `.sig` are now protected against unlink and rename like the other
 overlays. Escape hatch for a migration: `NN_OVERLAY_ALLOW_UNSIGNED=1` loads
-unsigned overlays anyway, still reported, and is itself reported as a
-weakening environment variable.
+unsigned overlays and edited `.v1` lists anyway, still reported, and is
+itself reported as a weakening environment variable.
 
 ### 3.7 Stopping and restarting the agent
 
@@ -677,7 +706,9 @@ The packages install the package layout: binaries in `/usr/bin`, units in
 `/usr/lib/systemd/system`, and in `/usr/share/northnarrow` the data tree
 `install.sh` needs (configs, unit sources, the eBPF object). Nothing under
 `/etc` belongs to the package. The first install seeds `/etc/northnarrow`
-exactly as `install.sh` does, and an operator copy is never overwritten.
+exactly as `install.sh` does, and operator configuration is never
+overwritten; the shipped `.v1` lists are refreshed at every configure, an
+edited one kept as `<list>.v1.operator` (§1).
 The package scripts run `install.sh` / `uninstall.sh` in their package
 modes, so every step and every refusal is the one described above.
 

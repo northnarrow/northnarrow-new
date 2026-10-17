@@ -83,7 +83,11 @@ unsigned or edited file is ignored (shipped watch set) and recorded as an
 The agent merges the overlay onto the default list at every boot:
 
 1. Read `/etc/northnarrow/fim-paths.v1` (curated default, ~100
-   paths shipped by `install.sh`).
+   paths shipped by `install.sh`). It is applied only when it is the
+   list built into the agent; an earlier release's copy or one edited
+   by hand gives way to that list (a WARN, or an ERROR and a signed
+   `default_list_modified`; external audit LLMR-015), and `install.sh`
+   replaces it.
 2. Apply every `-` line: if the path is in the default list, drop
    it from the effective set AND emit
    `WARN fim paths-config: default path <P> disabled by operator
@@ -197,7 +201,9 @@ the trusted-installer window first, or expect the capability to be removed.
   filesystem.
 - The `fim-paths.v1` + `fim-paths.local` files are likewise in
   `PROTECTED_INODES` (`ETC_PROTECTED_FILES`) so an attacker can't
-  silently widen or narrow the watch set between agent restarts.
+  silently widen or narrow the watch set between agent restarts; an
+  edit made while the agent is down is reported at its next start and
+  not applied.
   Operator changes go through `nn-admin config overlay set fim-paths`
   (signed, stored by the running agent, applied at its next start).
 

@@ -398,6 +398,8 @@ impl CanaryFixture {
         .to_vec();
         common::require_bpftool();
         let child = Command::new("sudo")
+            .arg("env")
+            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
             .arg(&installed_agent.path)
             .args(&agent_args)
             .stdout(Stdio::inherit())
@@ -444,6 +446,8 @@ impl CanaryFixture {
     fn start(&mut self) {
         common::require_bpftool();
         let child = Command::new("sudo")
+            .arg("env")
+            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
             .arg(&self.agent_bin)
             .args(&self.agent_args)
             .stdout(Stdio::inherit())

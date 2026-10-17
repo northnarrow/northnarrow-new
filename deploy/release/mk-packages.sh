@@ -12,7 +12,10 @@
 #                             and the eBPF object the install manifest hashes
 #   /usr/share/doc/northnarrow/
 # Nothing under /etc is owned by the package: install.sh seeds
-# /etc/northnarrow on the first install and never overwrites an operator copy.
+# /etc/northnarrow on the first install and never overwrites operator
+# configuration. The shipped `.v1` lists are not that: it installs the
+# package's on every configure (external audit LLMR-015; an edited one is
+# kept as `<list>.v1.operator`).
 #
 # The maintainer scripts (deploy/release/pkg/) drive install.sh and
 # uninstall.sh in their package modes. The pre-unpack and post-removal hooks

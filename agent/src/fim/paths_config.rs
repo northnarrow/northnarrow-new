@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
-use crate::config::overlay::{self, DefaultsSource};
+use crate::config::overlay::{self, DefaultsSource, Shipped};
 use crate::config::overlay_auth::Verified;
 
 /// Default deploy location of the curated paths list. Matches
@@ -51,6 +51,20 @@ pub const DEFAULT_PATHS_LOCAL: &str = "/etc/northnarrow/fim-paths.local";
 /// when `fim-paths.v1` cannot be read (FIM used to watch only the
 /// overlay's additions then).
 pub const BUILTIN_PATHS_V1: &str = include_str!("../../../configs/fim-paths.v1");
+
+/// External audit LLMR-015 (NN-AUD-327): SHA-256 of every `fim-paths.v1`
+/// an earlier release shipped (the history of `configs/`). The agent
+/// watches its built-in list over one of these, and `install.sh`
+/// (`SHIPPED_V1_EARLIER`, kept equal by a test) replaces it.
+pub const EARLIER_PATHS_V1_SHA256: &[&str] = &[
+    // Tappa 9 C7 (1f7f011)
+    "6baec5b5f0dfc92bdf91a0426b8d3693bd4b4a7b25df79e6ff9aa2298b906659",
+    // Tappa 10.5 D3 (a634008)
+    "99e3364b81cf77ccd51cda88e80bc71a45b13e7b75c7ff480b195e157ab3011a",
+];
+/// The shipped `fim-paths.v1` (built-in copy, earlier ones).
+pub const FIM_PATHS_SHIPPED: Shipped<'static> =
+    Shipped::new(BUILTIN_PATHS_V1, EARLIER_PATHS_V1_SHA256);
 
 /// Outcome of [`load_watched_paths`]. The `effective` set is the
 /// one the agent registers into `WATCHED_PATHS`; the other fields
@@ -78,12 +92,23 @@ pub struct WatchedPathsLoad {
 
 /// Load + merge the default list and the operator overlay:
 ///
-/// - `fim-paths.v1` unreadable → the built-in copy
-///   ([`BUILTIN_PATHS_V1`]), an ERROR, and `defaults` says so (the
-///   caller records it).
+/// - the defaults are the shipped list ([`BUILTIN_PATHS_V1`]):
+///   `fim-paths.v1` when it is that copy; unreadable, an earlier
+///   release's or edited by hand → the built-in copy, a WARN or an ERROR,
+///   and `defaults` says so (the caller records the unreadable and the
+///   edited ones — external audit LLMR-016, LLMR-015).
 /// - `local` is the overlay as the gate verified it; none → `effective`
 ///   equals the default list.
 pub fn load_watched_paths(v1_path: &Path, local: &Verified) -> Result<WatchedPathsLoad> {
+    load_watched_paths_with(v1_path, FIM_PATHS_SHIPPED, local)
+}
+
+/// [`load_watched_paths`] with the shipped defaults given.
+fn load_watched_paths_with(
+    v1_path: &Path,
+    shipped: Shipped<'_>,
+    local: &Verified,
+) -> Result<WatchedPathsLoad> {
     // Tappa 10.5 D1: the directive-parsing + merge + boot-WARN core
     // now lives in the shared `config::overlay` loader; this wrapper
     // adds the FIM-specific absolute-path validation and maps the
@@ -92,7 +117,7 @@ pub fn load_watched_paths(v1_path: &Path, local: &Verified) -> Result<WatchedPat
     let load = overlay::load_flat_list(
         "fim paths-config",
         v1_path,
-        BUILTIN_PATHS_V1,
+        shipped,
         local,
         &validate_absolute_path,
     )?;
@@ -142,6 +167,13 @@ mod tests {
         }
     }
 
+    /// Load `v1` as the list the agent was built with (its own content is
+    /// the built-in copy): these tests are about parsing and the overlay.
+    fn load_own(v1: &Path, local: &Verified) -> WatchedPathsLoad {
+        let own = std::fs::read_to_string(v1).unwrap();
+        load_watched_paths_with(v1, Shipped::new(&own, &[]), local).expect("load")
+    }
+
     /// C7 #1: a v1-only file with no overlay yields exactly the
     /// v1 paths as `effective`; `added`, `disabled`, and
     /// `unknown_disable` are empty.
@@ -159,7 +191,7 @@ mod tests {
         )
         .unwrap();
         // No overlay — the common case.
-        let out = load_watched_paths(&v1, &Verified::Missing).expect("load");
+        let out = load_own(&v1, &Verified::Missing);
         let expected: BTreeSet<PathBuf> = ["/usr/sbin/sshd", "/etc/passwd", "/etc/shadow"]
             .iter()
             .map(PathBuf::from)
@@ -191,7 +223,7 @@ mod tests {
              -/etc/nonexistent          # unknown disable\n",
         )
         .unwrap();
-        let out = load_watched_paths(&v1, &verified(&local)).expect("load");
+        let out = load_own(&v1, &verified(&local));
 
         let expected_effective: BTreeSet<PathBuf> = [
             "/usr/sbin/sshd",
@@ -260,6 +292,29 @@ mod tests {
         );
     }
 
+    /// External audit LLMR-015: `fim-paths.v1` with a watched path taken
+    /// out by hand (offline: the inode is protected while the agent runs)
+    /// does not stop FIM watching it — the built-in list is watched and the
+    /// edit reported.
+    #[test]
+    fn a_watched_path_removed_by_hand_is_still_watched() {
+        let dir = TempDir::new().unwrap();
+        let v1 = dir.path().join("fim-paths.v1");
+        let edited: String = BUILTIN_PATHS_V1
+            .lines()
+            .filter(|l| l.trim() != "/etc/ld.so.preload")
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(edited, BUILTIN_PATHS_V1);
+        std::fs::write(&v1, &edited).unwrap();
+        let out = load_watched_paths(&v1, &Verified::Missing).unwrap();
+        assert!(out.effective.contains(&PathBuf::from("/etc/ld.so.preload")));
+        assert!(matches!(out.defaults, DefaultsSource::Modified { .. }));
+        std::fs::write(&v1, BUILTIN_PATHS_V1).unwrap();
+        let out = load_watched_paths(&v1, &Verified::Missing).unwrap();
+        assert_eq!(out.defaults, DefaultsSource::Disk);
+    }
+
     /// C7 #4: a malformed v1 (relative path) is rejected up-front
     /// rather than silently registering a non-absolute path. The
     /// agent boot continues (load_watched_paths returns Err but
@@ -297,7 +352,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let v1 = dir.path().join("fim-paths.v1");
         std::fs::write(&v1, "/etc/passwd\nrelative/path\n+/etc/x\n/etc/shadow\n").unwrap();
-        let load = load_watched_paths(&v1, &Verified::Missing).unwrap();
+        let load = load_own(&v1, &Verified::Missing);
         let got: Vec<String> = load
             .effective
             .iter()

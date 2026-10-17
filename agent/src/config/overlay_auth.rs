@@ -337,7 +337,8 @@ enum Read {
 
 /// External audit LLMR-013: an overlay is read once, without following a
 /// link (the last component), without blocking on a FIFO planted at its
-/// name, and at most [`MAX_OVERLAY_BYTES`].
+/// name, and at most [`MAX_OVERLAY_BYTES`]. So is a shipped default list
+/// (`.v1`, LLMR-015).
 pub(crate) fn read_overlay(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt;
@@ -347,7 +348,7 @@ pub(crate) fn read_overlay(path: &Path) -> std::io::Result<Vec<u8>> {
         .open(path)
         .map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
-                std::io::Error::other("a symbolic link (an overlay is not read through one)")
+                std::io::Error::other("a symbolic link (not read through one)")
             } else {
                 e
             }
@@ -609,6 +610,38 @@ impl OverlayGate {
         })));
     }
 
+    /// External audit LLMR-015 (NN-AUD-327): a shipped default list (`.v1`)
+    /// is no list NorthNarrow shipped — edited while the agent was not
+    /// running — and the copy built into the agent is in force (or, with
+    /// [`ALLOW_UNSIGNED_ENV`], the file was applied anyway): a signed
+    /// `integrity_drift` (`default_list_modified`) with both SHA-256, at
+    /// every boot the file is still there. It used to be applied silently.
+    pub fn report_default_modified(
+        &self,
+        list: &str,
+        path: &Path,
+        sha256: &str,
+        builtin_sha256: &str,
+        loaded_anyway: bool,
+    ) {
+        let outcome = if loaded_anyway {
+            format!("applied anyway ({ALLOW_UNSIGNED_ENV}=1)")
+        } else {
+            "not applied, the copy built into the agent is in force".to_string()
+        };
+        self.record_entry(drift_entry(serde_json::json!({
+            "kind": "default_list_modified",
+            "detail": format!(
+                "{list} ({}): no list NorthNarrow shipped (edited by hand?) — {outcome}",
+                path.display()
+            ),
+            "sha256": sha256,
+            "builtin_sha256": builtin_sha256,
+            "loaded_anyway": loaded_anyway,
+            "at_boot": true,
+        })));
+    }
+
     /// External audit LLMR-014: write the floor's entries (its reset, an
     /// anchor) as soon as the log opens, before this boot's `agent_boot`: a
     /// log cut back to any entry of this boot still carries them.
@@ -847,7 +880,7 @@ mod tests {
         let list = crate::config::comm_allowlist::load_comm_allowlist(
             "process-comm-allowlist",
             &dir.path().join("process-comm-allowlist.v1"),
-            "",
+            crate::config::overlay::Shipped::new("", &[]),
             &verified,
         )
         .unwrap();
@@ -903,6 +936,28 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].op, crate::self_integrity::AUDIT_OP);
         assert_eq!(pending[0].extra["kind"], "default_list_unavailable");
+    }
+
+    /// External audit LLMR-015: an edited default list is a signed record
+    /// naming the file and both SHA-256.
+    #[test]
+    fn a_modified_default_list_is_recorded() {
+        let (dir, _key, admin_pub) = setup("config-manage");
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
+        let v1 = dir.path().join("process-comm-allowlist.v1");
+        gate.report_default_modified("process-comm-allowlist", &v1, "aa", "bb", false);
+        let pending = gate.pending.lock();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].op, crate::self_integrity::AUDIT_OP);
+        assert_eq!(pending[0].result, "detected");
+        let extra = &pending[0].extra;
+        assert_eq!(extra["kind"], "default_list_modified");
+        assert_eq!(extra["sha256"], "aa");
+        assert_eq!(extra["builtin_sha256"], "bb");
+        assert_eq!(extra["loaded_anyway"], false);
+        let detail = extra["detail"].as_str().unwrap();
+        assert!(detail.contains("process-comm-allowlist.v1"), "{detail}");
+        assert!(detail.contains("not applied"), "{detail}");
     }
 
     /// External audit ATP-001 / DEP-003: the shipped COMBAT files need no

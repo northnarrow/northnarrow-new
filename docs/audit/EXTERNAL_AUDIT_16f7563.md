@@ -536,7 +536,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-324 | LLMP-014 | Low | LLM prompts | S | open |
 | NN-AUD-325 | LLMR-009 | Low | LLM runtime | S–M | open (the audit's fix changes candle's threading) |
 | NN-AUD-326 | LLMR-011 | Low | LLM runtime | S | partly fixed (corpus pinned, lab PR 145; titles and query left); open |
-| NN-AUD-327 | LLMR-015 | Low | LLM runtime | M | open (wider: upgraded hosts never get new defaults) |
+| NN-AUD-327 | LLMR-015 | Low | LLM runtime | M | fixed (lab PR 168) |
 | NN-AUD-328 | LLMR-018 | Low | LLM runtime | S | open (narrowed: mock only behind a signed weakening) |
 | NN-AUD-329 | LLMR-019 | Low | LLM runtime | M (at XAI wiring) | partly fixed (one prompt path, lab PRs 133/144/145; digest not recorded); open |
 | NN-AUD-330 | NET-007 | Low | Network | S | open (latent) |
@@ -5621,3 +5621,80 @@ group, the ones an unprivileged user or a local attacker could use first.
     the evidence of scratch records with a forged comm, a file name
     holding `op=signal`, a journal entry from another unit or transport.
   - Lab: Debian 13 (6.12), journal167-probe.sh — before: the build of lab PRs 162–166; after: this lot on top. Before: a file run from `/tmp` as user nn, named `a` + newline + `ANTI-TAMPER DENIAL op=signal` (a path component of the exec identity holds 31 bytes), gave a journal entry starting with that text, and `anti-tamper.sh --only C13` counted it (`journal:[op=signal×1 …]`, DEVIATION). After: no entry starts with it; the VERDICT line carries `target_filename="/tmp/nn167.<nonce>.a/a\nANTI-TAMPER DENIAL op=signal"`, quoted and escaped; the C13 row reads `journal:[errors=0]`, its evidence from the signed records, OK. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.
+- **Wave 3 — shipped defaults on disk, lab PR 168.** NN-AUD-327
+  (LLMR-015), wider than reported: batch A of the Wave 3 triage of the
+  LLM, XAI and deception group.
+  - Before: `config/overlay.rs` `load_defaults` applied the `.v1` of each
+    of the five lists as read (`read_to_string`: through a link, blocking
+    on a FIFO, no size cap); the built-in copy (LLMR-016, lab PR 116) only
+    when the file could not be read. At run time the `.v1` inodes are
+    write-denied (lab PR 113) and `self_integrity` watches the `*.local`
+    overlays only, so an offline edit was applied at the next boot without
+    a word. Not in the report: `install.sh` printed "already present —
+    leaving operator copy untouched" for every `.v1`, on `--upgrade` and in
+    the packages' `--package-configure` too, so a host kept the lists of
+    its first install. NET-011 (lab PR 78) took `100.64.0.0/10` and
+    `198.18.0.0/15` out of `netflow-blocklist.v1`, which feeds
+    NN-L-NET-001 (KillProcessTree): a host installed before kept killing on
+    them after every upgrade. The canary templates had this upgrade path
+    since lab PR 143; the `.v1` lists did not.
+  - Agent: `load_defaults(label, path, Shipped { builtin, earlier_sha256 },
+    parse)` reads with `overlay_auth::read_overlay` (no link, no FIFO, at
+    most 4 MiB). The built-in copy byte for byte → `Disk`, the file used;
+    an earlier release's SHA-256 → `Superseded`, built-in copy, WARN;
+    anything else (an added exemption, an emptied list, non-UTF-8) →
+    `Modified`, built-in copy, ERROR at every boot; with
+    `NN_OVERLAY_ALLOW_UNSIGNED=1` the file is applied (`loaded_anyway`);
+    unreadable → `BuiltIn`, as before. `OverlayGate::report_default_modified`,
+    beside `report_default_unavailable`, writes the signed
+    `integrity_drift` `default_list_modified` (file, `sha256`,
+    `builtin_sha256`, `loaded_anyway`); `main.rs` `report_builtin_defaults`
+    calls it for each list at boot and at a signed FIM recompute, like the
+    unavailable list. `EARLIER_*_SHA256` sit next to each built-in copy
+    (`fim/paths_config.rs`, `net/blocklist.rs`, `config/comm_allowlist.rs`),
+    from `git log -- configs/<list>.v1`: fim-paths 2, netflow-blocklist 1
+    (the seed before NET-011), JA3 1, process-comm 2, netflow-comm 1.
+    `load_comm_allowlist` and `load_flat_list` take the `Shipped` value.
+  - `install.sh`: `install_shipped_v1` with `SHIPPED_V1_EARLIER`, the same
+    hashes (`install_sh_knows_the_same_shipped_lists` compares the two
+    tables; `the_shipped_lists_are_pinned` pins each built-in copy, so a
+    change to `configs/` must move the old SHA-256 into both). Missing,
+    current, earlier-shipped, a link or a non-regular file → the shipped
+    list installed; anything else → kept as `<list>.v1.operator` (a
+    timestamped name when one that differs is there), the shipped list
+    installed, a WARNING with `diff -u` (40 lines: `+` the operator's
+    additions, `-` the shipped entries removed, the overlay's own syntax)
+    and the `nn-admin config overlay set <list>` command. Every run, not
+    only `--upgrade`: the units are stopped and the pins gone whenever the
+    copy step runs, and the packages' configure hook runs the same code.
+    `nn-lab.sh upgrade-check` compares the five lists with `configs/` after
+    the upgrade and fails on a WARN or ERROR of the new agent about them.
+  - Choices: an earlier release's copy is a WARN without a signed record
+    (what is in force is what shipped; only an upgrade that did not run
+    `install.sh` leaves one). No signed `.v1`: a change belongs in the
+    `.local` overlay, which has the signature model. The escape hatch is
+    the existing `NN_OVERLAY_ALLOW_UNSIGNED` (a reported weakening), not a
+    new variable. The privileged e2e fixtures (fs-deny, honeypot, FIM,
+    canary, net, response, detection rules at scale) write empty or
+    test-specific lists and now start the agent with it
+    (`tests/common::OWN_DEFAULT_LISTS_ENV`, through `env` under `sudo`).
+  - Not done: `self_integrity` still reports only `*.local` at run time (a
+    `.v1` cannot change while the agent runs; the boot check covers the
+    offline edit); the COMBAT files keep their own model (shipped or
+    signed, ATP-001).
+  - Tests: `current_default_is_used`,
+    `modified_default_is_reported_and_not_applied` (with the escape hatch),
+    `earlier_shipped_default_is_superseded`,
+    `default_through_a_link_or_fifo_is_refused`,
+    `a_modified_default_list_is_recorded`,
+    `a_blocklist_left_over_with_cgnat_does_not_reach_the_kill_rule`,
+    `a_watched_path_removed_by_hand_is_still_watched`,
+    `install_sh_knows_the_same_shipped_lists`,
+    `the_shipped_lists_are_pinned`; the loader tests pass their own list as
+    the built-in copy. Checked against main's behaviour (its loader put back
+    under the new signature, its `install.sh`): the modified, superseded,
+    link (at its first assertion, before the FIFO, which would block),
+    CGNAT, FIM and `install.sh` tests fail, and so does
+    `a_missing_default_list_uses_the_built_in_copy`, extended with an
+    edited list; `current_default_is_used` and the pin test pass.
+  - Lab: Debian 13 (6.12), shipdef168-probe.sh — before: the build of lab PRs 162–166; after: this lot on top. Before: the pre-NET-011 blocklist (it lists 100.64.0.0/10) is loaded as it stands (`entries=7`) and a connect to 100.64.168.1 draws NN-L-NET-001 Critical; `install.sh --upgrade` leaves it ("already present — leaving operator copy untouched") and the verdict comes again; a hand edit (+100.64.168.0/24) is applied silently and kept by the upgrade. After: a WARN that the list on disk is an earlier release's and the built-in copy is in force (`entries=5`), no NN-L-NET-001; `install.sh --upgrade` replaces the file; the hand edit draws an ERROR at boot and a signed `integrity_drift` `default_list_modified` with both SHA-256, is not applied, and the upgrade keeps it as `netflow-blocklist.v1.operator`, printing the difference and the overlay command. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.
