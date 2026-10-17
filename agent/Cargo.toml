@@ -110,7 +110,7 @@ candle-nn = { version = "0.10", default-features = false }
 # (`vendor/candle-core`). CI fails if `onig_sys` or `zstd-sys` enters the
 # agent's graph; `ade::tokenizer_golden` pins the tokenization (recorded
 # with Oniguruma).
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 
 # Sub-tappa 6.6: ADE prompt-injection hardening (base64 encoding of
 # untrusted strings inside the structured prompt).
