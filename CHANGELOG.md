@@ -61,6 +61,48 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, process rule precision (Low PROC-012
+  NN-AUD-300, PROC-013 NN-AUD-301; lab PR 177). R015 (an encoder:
+  `base64`, `xxd`, `openssl`) and R016 (a debugger: `gdb`, `strace`,
+  `ltrace`) judge an exec by a service account, and their class stopped
+  at uid 1000: `nobody` (65534) and the transient accounts of systemd's
+  `DynamicUser=yes` units (61184..65519), service accounts both, were
+  never judged — a web shell under a `nobody` worker decoding its payload
+  with `base64 -d` drew no record. One helper, `is_service_uid`
+  (`decision/rules/mod.rs`), is now the class of both rules: 1..999,
+  65534 and 61184..65519. Root, the human accounts (1000..60000, and
+  systemd-homed's 60001..60513) and the container ranges stay out: a
+  rootless container's sub-uids (`/etc/subuid`, 100000 and up by
+  default) belong to the user who owns the range, who can become any of
+  them (`podman unshare`), and from the host's uid alone a container's
+  daemon is not told apart from its root or its users (systemd-nspawn's
+  524288 and up likewise). R008 (an executable in a hidden directory of a
+  home) exempted the whole of `~/.cache/` and `~/.config/`, so a binary
+  dropped in `~/.cache/<anything>/`, or in the user's persistence
+  directories `~/.config/systemd/` and `~/.config/autostart/`, drew no
+  record; its comment said "filename contains" where the code matches a
+  prefix of the path relative to `/home/<user>/`. Under those two only the
+  directories of named tools that run their own executables there are
+  exempt now, each with its reason in the code: `.cache/go-build/` (Go
+  1.24's `go run` and `go tool`), `.cache/bazel/`, `.cache/bazelisk/`,
+  `.cache/ms-playwright/`, `.cache/puppeteer/`, `.cache/Cypress/`,
+  `.cache/selenium/`, `.cache/pre-commit/`, `.cache/uv/`,
+  `.cache/pypoetry/virtualenvs/`, `.cache/yay/`, `.cache/paru/`,
+  `.cache/coursier/arc/`, `.cache/JetBrains/RemoteDev/`, the
+  `User/globalStorage/` of the VS Code family under `.config/` (`Code`,
+  `Code - OSS`, `VSCodium`, `Cursor`) and `.config/coc/extensions/`; the
+  comment describes the prefix match. The other entries (`.cargo/bin/`,
+  `.local/bin/`, `.npm/`, …) are unchanged, and R008 still judges the file
+  the kernel executed (review 61): a script is judged by its interpreter.
+  The three rules only record (Log, Medium); nothing more is killed.
+  **Regressions:** a native executable another tool keeps and runs under
+  `~/.cache/` or `~/.config/` — Sublime Text's language servers in
+  `~/.cache/sublime-text/`, NixOS's `appimage-run` in
+  `~/.cache/appimage-run/`, an editor of the VS Code family not listed —
+  draws an R008 record at each run, and R008 has no operator allowlist; a
+  daemon running as `nobody` or as a `DynamicUser=` account that runs one
+  of the six tools draws an R015 or R016 record (an entry in the signed
+  `process-comm-allowlist.local` exempts the program).
 - External audit, Wave 3, COMBAT isolation integrity (Low ATP-006
   NN-AUD-259, ATP-014 NN-AUD-262; lab PR 176). COMBAT's isolation ran
   `iptables-restore`, `iptables` and their v6 pair by bare name, searched

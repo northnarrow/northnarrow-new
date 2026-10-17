@@ -5,9 +5,11 @@
 //! prep use (`gdb`/`strace` attaching to a process to read its
 //! memory). A debugger run by a *service account* (not a human dev,
 //! not root) is the anomaly: daemons don't normally trace processes.
-//! Medium + Log, scoped to the same non-root system-account uid class
-//! as R015 (`uid != 0 && uid < 1000`) to keep developer/sysadmin
-//! debugging out of scope. Gated by `process-comm-allowlist`.
+//! Medium + Log, scoped to the service-account uid class it shares
+//! with R015 ([`super::is_service_uid`]: 1..999, `nobody`, systemd's
+//! `DynamicUser=` range; external audit PROC-012) to keep
+//! developer/sysadmin debugging — root, human users, their containers'
+//! sub-uids — out of scope. Gated by `process-comm-allowlist`.
 //! Design §7.1.
 
 use std::sync::Arc;
@@ -20,10 +22,6 @@ use crate::decision::{rules::build_verdict, Rule};
 
 /// Debugger / tracer tool comms (design §7.1).
 const DEBUGGER_TOOLS: &[&str] = &["gdb", "strace", "ltrace"];
-
-/// Linux `UID_MIN` boundary (see R015): accounts below this and
-/// non-root are system/service accounts, i.e. "non-developer".
-const SYSTEM_UID_CEILING: u32 = 1000;
 
 pub struct R016DebuggerServiceUid {
     allowlist: Arc<CommAllowlist>,
@@ -56,7 +54,8 @@ impl Rule for R016DebuggerServiceUid {
         if !DEBUGGER_TOOLS.contains(&comm.as_str()) {
             return None;
         }
-        if *uid == 0 || *uid >= SYSTEM_UID_CEILING {
+        // Service-class uid only (PROC-012: nobody and DynamicUser too).
+        if !super::is_service_uid(*uid) {
             return None;
         }
         // External audit NETR-003 class: the allowlist judged on what the
@@ -119,14 +118,41 @@ mod tests {
         }
     }
 
+    /// External audit PROC-012: a `DynamicUser=yes` unit's transient uid.
+    #[test]
+    fn dynamic_user_uid_is_service_class() {
+        let v = rule()
+            .evaluate(&spawn_as(61_500, "strace", "/usr/bin/strace"))
+            .expect("fires");
+        assert_eq!(v.rule_id, "R016_DebuggerServiceUid");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Medium);
+    }
+
+    /// External audit PROC-012: `nobody` (65534).
+    #[test]
+    fn nobody_is_service_class() {
+        let v = rule()
+            .evaluate(&spawn_as(65_534, "gdb", "/usr/bin/gdb"))
+            .expect("fires");
+        assert_eq!(v.rule_id, "R016_DebuggerServiceUid");
+        assert_eq!(v.action, ResponseAction::Log);
+    }
+
     #[test]
     fn ignores_root_or_human_uid() {
         assert!(rule()
             .evaluate(&spawn_as(0, "gdb", "/usr/bin/gdb"))
             .is_none());
-        assert!(rule()
-            .evaluate(&spawn_as(1000, "strace", "/usr/bin/strace"))
-            .is_none());
+        // Human users and a rootless container's sub-uids (PROC-012).
+        for uid in [1000, 60_000, 100_000, 100_032] {
+            assert!(
+                rule()
+                    .evaluate(&spawn_as(uid, "strace", "/usr/bin/strace"))
+                    .is_none(),
+                "{uid}"
+            );
+        }
         assert!(rule()
             .evaluate(&spawn_as(33, "ls", "/usr/bin/ls"))
             .is_none());
