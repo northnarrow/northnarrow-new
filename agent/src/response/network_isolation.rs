@@ -13,7 +13,7 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use super::{block_outbound::nft_apply, config::ExecutorConfig};
 
@@ -52,8 +52,13 @@ fn legacy_cleanup_script(table: &str, chain: &str) -> String {
     format!("flush chain inet {table} {chain}\ndelete chain inet {table} {chain}\n")
 }
 
+/// External audit ATP-014 (NN-AUD-262): the system directories' `nft`
+/// ([`super::block_outbound::trusted_nft`]); none: no chain to find.
 fn chain_exists(table: &str, chain: &str) -> bool {
-    Command::new("nft")
+    let Ok(nft) = super::block_outbound::trusted_nft() else {
+        return false;
+    };
+    nft.command()
         .args(["list", "chain", "inet", table, chain])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

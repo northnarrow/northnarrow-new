@@ -432,13 +432,16 @@ prereq_overrides_json() {
 # command, or goes on with --without-nftables (recorded). The packages
 # depend on nftables, so in --package-configure a missing `nft` (a forced
 # install) is a warning: a failing post-unpack hook would leave the package
-# half-configured. NFT_DIRS is systemd's default PATH for a service, the
-# one the agent searches.
-NFT_DIRS=${NFT_DIRS:-"/usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin"}
+# half-configured. NFT_DIRS are the directories the agent looks in
+# (external audit ATP-014, agent/src/trusted_bin.rs): the system ones, never
+# /usr/local, and only a root-owned file nobody else can write.
+NFT_DIRS=${NFT_DIRS:-"/usr/sbin /usr/bin /sbin /bin"}
 find_nft() {
-    local d
+    local d real
     for d in $NFT_DIRS; do
-        if [[ -f "$d/nft" && -x "$d/nft" ]]; then
+        real=$(readlink -f "$d/nft" 2>/dev/null) || continue
+        if [[ -f "$real" && -x "$real" ]] && [[ $(stat -c '%u' "$real") == 0 ]] &&
+            (( (8#$(stat -c '%a' "$real") & 8#022) == 0 )); then
             echo "$d/nft"
             return 0
         fi

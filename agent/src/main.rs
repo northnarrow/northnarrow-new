@@ -1761,6 +1761,20 @@ async fn main() -> Result<()> {
             None
         }
     };
+    // External audit ATP-014 (NN-AUD-262): the files COMBAT's isolation
+    // runs — looked up in the system directories only, never on PATH —
+    // named once at boot, or why the isolation could not run.
+    if let Some(iso) = isolator.as_ref() {
+        match iso.binaries() {
+            Ok(files) => info!(binaries = %files, "COMBAT isolation binaries (system directories)"),
+            Err(why) => error!(
+                error = %why,
+                "COMBAT isolation cannot run: no trusted iptables in /usr/sbin, /usr/bin, /sbin or \
+                 /bin — a STAGE 3 isolation will fail (install iptables; a copy in /usr/local is \
+                 not used)"
+            ),
+        }
+    }
 
     // The COMBAT graduated-response ladder is constructed once agent_id
     // + the audit log are available (further down). The posture combat

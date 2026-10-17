@@ -116,21 +116,6 @@ fn install_provenance(root: &Path) -> Check {
     }
 }
 
-/// External audit CMB-014: where `nft` may be installed — the directories
-/// of systemd's default `PATH` for a service, which the agent searches
-/// (lab PR 165 added `/usr/local`). The per-process outbound block (a
-/// BlockOutbound verdict, the COMBAT soft egress block of INVESTIGATE) is an
-/// nftables rule: without `nft` the offender is not contained while the
-/// agent analyses it.
-const NFT_PATHS: &[&str] = &[
-    "usr/local/sbin/nft",
-    "usr/local/bin/nft",
-    "usr/sbin/nft",
-    "usr/bin/nft",
-    "sbin/nft",
-    "bin/nft",
-];
-
 /// The `install.sh` flag that accepts a host without `nft` (lab PR 165).
 const WITHOUT_NFT_FLAG: &str = "--without-nftables";
 
@@ -139,11 +124,29 @@ const WITHOUT_NFT_FLAG: &str = "--without-nftables";
 /// refusal belongs to the install paths: the packages depend on nftables
 /// and `install.sh` refuses without it unless `--without-nftables`, which
 /// is named here when the install manifest records it (lab PR 165).
+///
+/// External audit CMB-014: the per-process outbound block (a BlockOutbound
+/// verdict, the COMBAT soft egress block of INVESTIGATE) is an nftables
+/// rule: without `nft` the offender is not contained while the agent
+/// analyses it. External audit ATP-014 (NN-AUD-262): the `nft` the agent
+/// runs, found as it finds it ([`crate::trusted_bin`]: the system
+/// directories, root's file) — one in `/usr/local` is not used any more.
+/// Over a fixture tree the tree's owner stands for root.
 fn nft_tool(root: &Path) -> Check {
-    let found = NFT_PATHS.iter().find(|rel| root.join(rel).is_file());
+    let found = crate::trusted_bin::Lookup::under(root).resolve("nft");
     let (status, value) = match found {
-        Some(rel) => (Status::Ok, format!("/{rel}")),
-        None => {
+        Ok(bin) => (
+            Status::Ok,
+            format!(
+                "/{}",
+                bin.found()
+                    .strip_prefix(root)
+                    .unwrap_or(bin.found())
+                    .display()
+            ),
+        ),
+        Err(why) if !why.is_missing() => (Status::Warn, format!("not trusted: {why}")),
+        Err(_) => {
             let accepted = std::fs::read_to_string(root.join(INSTALL_MANIFEST_REL))
                 .ok()
                 .and_then(|t| {
@@ -166,7 +169,7 @@ fn nft_tool(root: &Path) -> Check {
         name: "nftables for COMBAT containment",
         status,
         value,
-        fix: "install nftables (`apt-get install nftables` / `dnf install nftables`) — without `nft` neither a BlockOutbound verdict nor the COMBAT soft egress block drops the offender's traffic (the agent records a signed subsystem_degraded at boot, and each episode records the failure and shortens INVESTIGATE)",
+        fix: "install nftables (`apt-get install nftables` / `dnf install nftables`); the agent runs the `nft` of /usr/sbin, /usr/bin, /sbin or /bin only, root's and writable by nobody else — without `nft` neither a BlockOutbound verdict nor the COMBAT soft egress block drops the offender's traffic (the agent records a signed subsystem_degraded at boot, and each episode records the failure and shortens INVESTIGATE)",
     }
 }
 
@@ -436,6 +439,23 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
+    /// An executable `nft` at `rel`, its directories 0755 (the agent runs
+    /// only a file nobody but its owner can change, in such directories).
+    fn nft_at(root: &Path, rel: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        w(root, rel, b"#!/bin/sh\n");
+        let p = root.join(rel);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut dir = p.parent();
+        while let Some(d) = dir {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if d == root {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+
     #[test]
     fn hardened_host_is_all_ok() {
         let d = tempfile::tempdir().unwrap();
@@ -466,7 +486,7 @@ mod tests {
         w(r, "proc/self/mountinfo", b"36 25 0:30 / /sys/fs/bpf rw,nosuid shared:17 - bpf bpf rw,mode=700\n40 25 0:31 / /proc rw - proc proc rw\n");
         // admin.pub only: the private key went offline
         w(r, "etc/northnarrow/admin.pub", b"ab unlock\n");
-        w(r, "usr/sbin/nft", b"");
+        nft_at(r, "usr/sbin/nft");
         w(r, INSTALL_MANIFEST_REL, &manifest("checksums", None));
         let checks = run_in(r);
         assert_eq!(checks.len(), 11);
@@ -519,8 +539,10 @@ mod tests {
     }
 
     /// Lab follow-up (lab PR 165): a host without `nft` stays a WARN, and
-    /// names `--without-nftables` when the install manifest recorded it; an
-    /// `nft` under `/usr/local` (systemd's default service PATH) is found.
+    /// names `--without-nftables` when the install manifest recorded it.
+    /// External audit ATP-014 (NN-AUD-262): an `nft` under `/usr/local`
+    /// (systemd's default service PATH) is not the agent's, and is not
+    /// reported as found; a system directory's is.
     #[test]
     fn nft_check_names_the_install_override() {
         let d = tempfile::tempdir().unwrap();
@@ -540,10 +562,26 @@ mod tests {
         let c = nft_tool(r);
         assert_eq!(c.status, Status::Warn);
         assert_eq!(c.value, "not installed (accepted with --without-nftables)");
-        w(r, "usr/local/sbin/nft", b"");
+        nft_at(r, "usr/local/sbin/nft");
+        let c = nft_tool(r);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.value, "not installed (accepted with --without-nftables)");
+        nft_at(r, "usr/sbin/nft");
         let c = nft_tool(r);
         assert_eq!(c.status, Status::Ok);
-        assert_eq!(c.value, "/usr/local/sbin/nft");
+        assert_eq!(c.value, "/usr/sbin/nft");
+        // a copy others can change is reported, not used
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                r.join("usr/sbin/nft"),
+                std::fs::Permissions::from_mode(0o777),
+            )
+            .unwrap();
+        }
+        let c = nft_tool(r);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.value.starts_with("not trusted: "), "{}", c.value);
     }
 
     #[test]

@@ -42,8 +42,11 @@ shortened to 10 s, and `nn-admin host-check` reports the host (external
 audit CMB-014, lab PR 119). Since lab PR 165 the install paths ask for it:
 the packages depend on `nftables`, `install.sh` refuses a host without
 `nft` unless `--without-nftables` (recorded in the install manifest), and
-the agent records a signed `subsystem_degraded` at boot when `nft` is not
-on its `PATH` ("block_outbound unavailable: nft missing"). The lab guests
+the agent records a signed `subsystem_degraded` at boot when there is no
+`nft` it may run ("block_outbound unavailable: nft missing"): since
+external audit ATP-014 (lab PR 176) that is one in `/usr/sbin`,
+`/usr/bin`, `/sbin` or `/bin`, owned by root and writable by nobody else —
+never `PATH`, never `/usr/local`. The lab guests
 install it. See the Prerequisites of
 [`INSTALL_UPGRADE_UNINSTALL.md`](INSTALL_UPGRADE_UNINSTALL.md).
 

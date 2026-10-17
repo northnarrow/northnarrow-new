@@ -36,6 +36,11 @@ Type=notify
 # `exec` backend (non-systemd hosts), where a fork-exec'd agent inherits
 # this unit's stdio and must not reach the uncapped default journal.
 LogNamespace=northnarrow
+# External audit ATP-014 (NN-AUD-262): an explicit search path, without
+# the /usr/local of systemd's default (see northnarrow-agent.service). The
+# watchdog runs `systemctl` by absolute path and the agent by --agent-bin;
+# on the `exec` backend the agent it starts inherits this environment.
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/bin/northnarrow-watchdog \
     --agent-bin /usr/local/bin/northnarrow-agent \
     --agent-pidfile /run/northnarrow/agent.pid \

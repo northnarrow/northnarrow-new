@@ -35,6 +35,9 @@ and the tracker note have the details and the lab evidence.
 9. A reader of `/etc/northnarrow/audit.log` that does not run as root (a
    log shipper, a script without `sudo`) loses access: give it a group
    with `install.sh --audit-group` (§8).
+10. `iptables`, `ip6tables`, `nft` and `rpm` must be the distribution's,
+    in `/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`: a copy only under
+    `/usr/local` is no longer run (§6).
 
 ## 1. Installation and upgrade
 
@@ -515,6 +518,28 @@ Now **killed, or answered, where they were recorded or missed**:
 - **Host isolation is the ladder's alone** (NN-AUD-050 CMB-006, lab PR
   103): an ADE `Isolate` verdict no longer adds an nftables blackout of
   its own; an older agent's leftover chains are removed at start.
+- **The binaries COMBAT runs** (NN-AUD-262 ATP-014, NN-AUD-259 ATP-006,
+  lab PR 176). `iptables-restore`, `iptables`, their v6 pair, `nft` and
+  `rpm` (R018's module provenance) are looked up in `/usr/sbin`,
+  `/usr/bin`, `/sbin` and `/bin` only — no longer on `PATH`, whose
+  systemd default put `/usr/local/sbin` first — and run only when the
+  file they resolve to (through `/etc/alternatives`) is in one of those
+  directories, root's, and writable by nobody else, as are its
+  directories. The boot logs `COMBAT isolation binaries` with the files
+  (`iptables-restore=/usr/sbin/xtables-nft-multi`, …) and the "network
+  isolated" line names `restore_bin`. Both units now set
+  `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin`. **Regression:** a
+  host whose iptables or nftables lives only under `/usr/local` (a build
+  from source), or whose copy or directory is group- or world-writable or
+  not root's, logs an ERROR at boot (`COMBAT isolation cannot run`, or the
+  signed `block_outbound unavailable: nft missing (not trusted)`), and its
+  STAGE 3 isolation or egress block fails; `nn-admin host-check` reports
+  the `nft` as not installed or not trusted, and `install.sh` refuses the
+  host without `--without-nftables`. Install the distribution's packages.
+  `nn-admin status` now reports the isolation as engaged whenever the
+  ruleset was applied, also when the jump dedup failed afterwards (it
+  used to say `false` of an isolated host), and the release removes a
+  duplicate jump that dedup left.
 
 ## 7. The model (ADE) and RAG
 
