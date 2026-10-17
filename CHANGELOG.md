@@ -16,6 +16,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ### Documentation
 
+- The `.rpm` signing key exists (external audit NN-AUD-199, the
+  maintainer's residual): its public half is committed at
+  `deploy/release/RPM-GPG-KEY-northnarrow.asc` — `NorthNarrow RPM
+  signing`, RSA 4096, signing only, expires 2028-10-16, fingerprint
+  `BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D` — and published in the README and the operator guide (§6); the
+  private half is in the `release-signing` environment. The next `v*` tag
+  ships a signed `.rpm` instead of stopping at `rpm-sign`.
+
 - The external audit tracker gets its Wave 3 table
   (`docs/audit/EXTERNAL_AUDIT_16f7563.md`): the 188 Low and 21
   Informational findings re-checked against `main` at `b9bf4d5` — 14
