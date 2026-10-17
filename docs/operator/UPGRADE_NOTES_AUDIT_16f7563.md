@@ -2,7 +2,7 @@
 
 What changes for an operator who upgrades from `v0.0.1-tappa9.0`, or from
 an earlier `main`, to a build that carries the fixes of the external audit
-of commit `16f7563` (Waves 0, 1 and 2, and the Wave 3 items of §11; tracker:
+of commit `16f7563` (Waves 0, 1 and 2, and the Wave 3 lots as they land; tracker:
 [`docs/audit/EXTERNAL_AUDIT_16f7563.md`](../audit/EXTERNAL_AUDIT_16f7563.md)).
 Every item below is a change of behaviour or a regression that
 [`CHANGELOG.md`](../../CHANGELOG.md) `[Unreleased]` declares, grouped by
@@ -32,6 +32,9 @@ and the tracker note have the details and the lab evidence.
    (§11).
 8. A `.v1` list edited by hand is no longer applied: move the change into
    the list's signed `.local` overlay (§1).
+9. A reader of `/etc/northnarrow/audit.log` that does not run as root (a
+   log shipper, a script without `sudo`) loses access: give it a group
+   with `install.sh --audit-group` (§8).
 
 ## 1. Installation and upgrade
 
@@ -148,6 +151,16 @@ and the tracker note have the details and the lab evidence.
   config overlay set <list> --file <overlay> --key <config-manage key>`
   (applies at the next start). See
   [INSTALL_UPGRADE_UNINSTALL.md §1](INSTALL_UPGRADE_UNINSTALL.md#1-fresh-install).
+- **The telemetry probe's DNS datagram stays on the host** (NN-AUD-278
+  EVD-015, lab PR 169). The probe's datagram to `127.0.0.1:53` was a
+  recursive query whose name carried the agent's pid and the time, and a
+  forwarding resolver on the host (dnsmasq, BIND in forward mode) passed
+  it upstream every minute. The nonce is now random and the datagram is
+  flagged as a DNS response (`QR` set, `RD` clear), which a resolver drops
+  instead of answering or forwarding; the sensors read only the name, and
+  the probe still reports `dns` as seen. A listener on `127.0.0.1:53`
+  still receives one datagram per round (`<16 hex>.probe.northnarrow.invalid`,
+  flags `0x8000`); `--sensor-feasibility` sends the same kind.
 - **A sensor that stops stops the agent** (NN-AUD-184 SNS-001, lab PR
   128). A telemetry task that ends is recorded in the signed audit log and
   the agent exits non-zero (`sensor_pump_exited`); the watchdog restarts
@@ -495,6 +508,26 @@ Now **killed, or answered, where they were recorded or missed**:
 - **Netflow commits in batches** (NN-AUD-168 NET-019, lab PR 142): one
   fsync at most every 100 ms, so a crash of the host can lose the last
   100 ms or tear the last row, which the next open cuts and attests.
+- **The evidence files are closed to other users** (NN-AUD-281 EVD-019,
+  lab PR 169). `audit.log` and `chain_heads.json` in the world-readable
+  `/etc/northnarrow` were `0644`: any local user read the key
+  fingerprints, the callers' pid/uid/comm, the drift details and which
+  sensor was in a `telemetry_gap`. They are created `0640` (root and the
+  file's group), and `install.sh` (install, `--upgrade`, the packages'
+  configure step) closes an existing copy. The chain logs under
+  `/var/lib/northnarrow` (detections, status events, netflow and its
+  listeners, FIM baseline and drift, the canary chains, their archives
+  and manifests) are created `0600` and closed the same way; the
+  directory's `0700` already kept other users out, a copy that keeps the
+  mode did not. `--audit-group GROUP` (or `NN_AUDIT_GROUP`) gives the two
+  `/etc` files an existing group for a log shipper; every later upgrade
+  keeps the group, and the agent never changes the mode of a file it did
+  not create. On a package install, `chgrp` the two files inside a
+  trusted-installer window (§2) once. **Regression:** a non-root reader of `audit.log` or
+  `chain_heads.json` gets `EACCES` until it has the group; `nn-admin` run
+  as root, `sudo`, and the lab scripts (all run as root) are unaffected.
+  Still readable by design: `admin.pub`, `agent_id`, `agent.sig.pub`,
+  `install-manifest.json`, the shipped lists and the honeypot baits.
 - **Findings that come back are reported again** (NN-AUD-114 EVD-013,
   NN-AUD-113 EVD-012, NN-AUD-111 EVD-006, lab PR 130): a finding that goes
   away is signed as `integrity_drift_cleared`; detections dropped from a

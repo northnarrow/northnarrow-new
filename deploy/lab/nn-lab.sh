@@ -1237,7 +1237,7 @@ at_tty() { script -qec "$*" /dev/null < /dev/null; }
 sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 3; }
 sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog
 pid_before=$(sudo cat /run/northnarrow/agent.pid)
-audit_before=$(sudo wc -l < /etc/northnarrow/audit.log)
+audit_before=$(sudo wc -l /etc/northnarrow/audit.log | cut -d" " -f1)
 # External audit EVD-001: the signing key is closed to root; its public
 # half stands for it (absent before that release: left out on both sides).
 idfiles="/etc/northnarrow/admin.pub /etc/northnarrow/agent_id"
@@ -1260,7 +1260,7 @@ echo "before: own program ids=[${own_before% }] foreign LSM programs=$foreign_be
 at_tty sudo ./deploy/install.sh --source-tree --upgrade --grant-key "$key" 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|BPF program|window|PROTECTED|grant" | cut -c1-140
 sleep 2
 pid_after=$(sudo cat /run/northnarrow/agent.pid)
-audit_after=$(sudo wc -l < /etc/northnarrow/audit.log)
+audit_after=$(sudo wc -l /etc/northnarrow/audit.log | cut -d" " -f1)
 fp_after=$(sudo sha256sum $idfiles | sha256sum | cut -c1-16)
 echo "after : agent pid=$pid_after audit_lines=$audit_after identity=$fp_after"
 fail=0

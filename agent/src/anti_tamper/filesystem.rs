@@ -1233,15 +1233,14 @@ pub fn bootstrap_canary_log(canary_log_path: &Path) -> Result<()> {
                 .with_context(|| format!("creating canary-log parent dir {}", parent.display()))?;
         }
     }
-    // 0644: world-readable for operator `cat`-inspection, only
-    // root + the agent's user can write (LSM-enforced append-only
-    // applies via PROTECTED_INODES + PROTECTED_PIDS exemption,
-    // same as the FIM logs).
+    // Root only (external audit EVD-019, STATE_LOG_FILE_MODE); the
+    // LSM-enforced append-only applies via PROTECTED_INODES +
+    // PROTECTED_PIDS exemption, same as the FIM logs.
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .open(canary_log_path)
         .with_context(|| format!("creating canary log {}", canary_log_path.display()))?;
     info!(
@@ -1263,7 +1262,7 @@ pub fn bootstrap_chain_heads(heads_path: &Path) -> Result<()> {
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::chain_anchor::HEADS_FILE_MODE)
         .open(heads_path)
         .with_context(|| format!("creating chain heads {}", heads_path.display()))?;
     info!(
@@ -1300,7 +1299,7 @@ pub fn bootstrap_netflow_listeners_log(listeners_log_path: &Path) -> Result<()> 
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .open(listeners_log_path)
         .with_context(|| {
             format!(
@@ -1333,15 +1332,14 @@ pub fn bootstrap_netflow_log(netflow_log_path: &Path) -> Result<()> {
                 .with_context(|| format!("creating netflow-log parent dir {}", parent.display()))?;
         }
     }
-    // 0644: world-readable for operator `cat`-inspection, only
-    // root + the agent's user can write (LSM-enforced append-only
-    // applies via PROTECTED_INODES + PROTECTED_PIDS exemption,
-    // same as the FIM + canary logs).
+    // Root only (external audit EVD-019, STATE_LOG_FILE_MODE); the
+    // LSM-enforced append-only applies via PROTECTED_INODES +
+    // PROTECTED_PIDS exemption, same as the FIM + canary logs.
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .open(netflow_log_path)
         .with_context(|| format!("creating netflow log {}", netflow_log_path.display()))?;
     info!(
@@ -1370,14 +1368,14 @@ pub fn bootstrap_fim_log(fim_log_path: &Path) -> Result<()> {
                 .with_context(|| format!("creating fim-log parent dir {}", parent.display()))?;
         }
     }
-    // 0644: world-readable for operator `cat`-inspection, only
-    // root + the agent's user can write (LSM-enforced append-only
-    // applies via PROTECTED_INODES + PROTECTED_PIDS exemption).
+    // Root only (external audit EVD-019, STATE_LOG_FILE_MODE); the
+    // LSM-enforced append-only applies via PROTECTED_INODES +
+    // PROTECTED_PIDS exemption.
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .open(fim_log_path)
         .with_context(|| format!("creating fim log {}", fim_log_path.display()))?;
     info!(
@@ -1391,7 +1389,7 @@ pub fn bootstrap_fim_log(fim_log_path: &Path) -> Result<()> {
 /// active file pre-attach, so PROTECTED_INODES has an inode to register
 /// before the LSM hooks come up — exactly as the FIM / netflow logs do.
 /// Creates the `detections/` sub-dir at [`STATE_DIR_MODE`] (0700) if
-/// missing, then a zero-byte 0644 active file. Idempotent: a present
+/// missing, then a zero-byte 0600 active file. Idempotent: a present
 /// file (existing chain) is left untouched.
 pub fn bootstrap_detections_log(detections_log_path: &Path) -> Result<()> {
     if detections_log_path.exists() {
@@ -1408,14 +1406,14 @@ pub fn bootstrap_detections_log(detections_log_path: &Path) -> Result<()> {
                 })?;
         }
     }
-    // 0644: world-readable for operator inspection, agent-writable
-    // (append-only enforced via PROTECTED_INODES + the agent's PID
-    // exemption) — same envelope as the FIM drift log.
+    // Root only (external audit EVD-019, STATE_LOG_FILE_MODE),
+    // agent-writable (append-only enforced via PROTECTED_INODES + the
+    // agent's PID exemption) — same envelope as the FIM drift log.
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .open(detections_log_path)
         .with_context(|| format!("creating detections log {}", detections_log_path.display()))?;
     info!(
@@ -1427,7 +1425,7 @@ pub fn bootstrap_detections_log(detections_log_path: &Path) -> Result<()> {
 
 /// Tappa 9.0.c: bootstrap the status-event chainlog
 /// (`status_events.jsonl`) pre-attach — a sibling of the detection log
-/// inside the same `detections/` dir, with the same zero-byte 0644
+/// inside the same `detections/` dir, with the same zero-byte 0600
 /// envelope. Idempotent: a present file (existing chain) is left
 /// untouched.
 ///
@@ -1457,14 +1455,14 @@ pub fn bootstrap_status_events_log(status_events_log_path: &Path) -> Result<()> 
                 })?;
         }
     }
-    // 0644: world-readable for operator inspection, agent-writable.
-    // (NOT yet PROTECTED_INODES-registered — see the fn doc-comment;
-    // same gap as the sibling detection log.)
+    // Root only (external audit EVD-019, STATE_LOG_FILE_MODE),
+    // agent-writable. (NOT yet PROTECTED_INODES-registered — see the fn
+    // doc-comment; same gap as the sibling detection log.)
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::chainlog::STATE_LOG_FILE_MODE)
         .open(status_events_log_path)
         .with_context(|| {
             format!(
@@ -1499,15 +1497,15 @@ pub fn bootstrap_audit_log(audit_log_path: &Path) -> Result<()> {
                 .with_context(|| format!("creating audit-log parent dir {}", parent.display()))?;
         }
     }
-    // 0644 matches the rest of /etc/northnarrow/ layout (design
-    // §6.5: world-readable, root-only writable + LSM-enforced
-    // append-only). Empty file body — first append writes the
-    // genesis entry.
+    // 0640 (external audit EVD-019, AUDIT_LOG_FILE_MODE): root-only
+    // writable + LSM-enforced append-only (design §6.5), readable by
+    // root and the file's group only — no longer by every local user.
+    // Empty file body — first append writes the genesis entry.
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .mode(0o644)
+        .mode(crate::audit::AUDIT_LOG_FILE_MODE)
         .open(audit_log_path)
         .with_context(|| format!("creating audit log {}", audit_log_path.display()))?;
     info!(
@@ -2189,7 +2187,7 @@ mod tests {
     }
 
     /// K7 test: `bootstrap_canary_log` creates a zero-byte file
-    /// at mode 0644 when missing — mirrors the
+    /// at mode 0600 (external audit EVD-019) when missing — mirrors the
     /// `bootstrap_fim_log` + `bootstrap_audit_log` contract so
     /// the LSM-protected layout invariants hold uniformly across
     /// all four /var/lib/northnarrow/ chain files.
@@ -2202,7 +2200,7 @@ mod tests {
         assert!(log_path.exists());
         let meta = std::fs::metadata(&log_path).unwrap();
         assert_eq!(meta.len(), 0);
-        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     /// K7 test: `bootstrap_canary_log` is idempotent — a second
@@ -2251,7 +2249,7 @@ mod tests {
     }
 
     /// N8 test: `bootstrap_netflow_log` creates a zero-byte file
-    /// at mode 0644 when missing — mirrors the
+    /// at mode 0600 (external audit EVD-019) when missing — mirrors the
     /// `bootstrap_fim_log` + `bootstrap_canary_log` contract so
     /// the LSM-protected layout invariants hold uniformly across
     /// all five /var/lib/northnarrow/ chain files.
@@ -2264,7 +2262,7 @@ mod tests {
         assert!(log_path.exists());
         let meta = std::fs::metadata(&log_path).unwrap();
         assert_eq!(meta.len(), 0);
-        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     /// N8 test: `bootstrap_netflow_log` is idempotent — a second
@@ -2288,7 +2286,7 @@ mod tests {
     }
 
     /// N9 test: `bootstrap_netflow_listeners_log` creates a
-    /// zero-byte file at mode 0644 when missing. Same shape as
+    /// zero-byte file at mode 0600 (EVD-019) when missing. Same shape as
     /// the N8 bootstrap_netflow_log invariant for the sibling
     /// listeners chain.
     #[test]
@@ -2301,7 +2299,7 @@ mod tests {
         assert!(log_path.exists());
         let meta = std::fs::metadata(&log_path).unwrap();
         assert_eq!(meta.len(), 0);
-        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     /// N9 test: `bootstrap_netflow_listeners_log` is idempotent —
@@ -2323,7 +2321,7 @@ mod tests {
     }
 
     /// C7 test: `bootstrap_fim_log` creates a zero-byte file at
-    /// mode 0644 when missing — mirrors the `bootstrap_audit_log`
+    /// mode 0600 (external audit EVD-019) when missing — mirrors the `bootstrap_audit_log`
     /// contract so the LSM-protected layout invariants hold.
     #[test]
     fn bootstrap_fim_log_creates_zero_byte_file_if_missing() {
@@ -2334,7 +2332,7 @@ mod tests {
         assert!(log_path.exists());
         let meta = std::fs::metadata(&log_path).unwrap();
         assert_eq!(meta.len(), 0);
-        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
     /// C7 test: `bootstrap_fim_log` is idempotent — a second call
@@ -2355,9 +2353,45 @@ mod tests {
         );
     }
 
+    /// External audit EVD-019 (NN-AUD-281): every evidence file the agent
+    /// bootstraps is closed to other users — the state-dir chains to root
+    /// (0600), the audit log and the head anchor in `/etc/northnarrow` to
+    /// root and the file's group (0640).
+    #[test]
+    fn bootstrapped_evidence_files_are_closed_to_other_users() {
+        let dir = TempDir::new().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        bootstrap_detections_log(&p("detections/detections.jsonl")).unwrap();
+        bootstrap_status_events_log(&p("detections/status_events.jsonl")).unwrap();
+        bootstrap_fim_log(&p("fim_drift.jsonl")).unwrap();
+        bootstrap_fim_log(&p("fim_baseline.jsonl")).unwrap();
+        bootstrap_canary_log(&p("canaries.jsonl")).unwrap();
+        bootstrap_canary_log(&p("canary_access.jsonl")).unwrap();
+        bootstrap_netflow_log(&p("netflow.jsonl")).unwrap();
+        bootstrap_netflow_listeners_log(&p("netflow_listeners.jsonl")).unwrap();
+        bootstrap_audit_log(&p("etc/audit.log")).unwrap();
+        bootstrap_chain_heads(&p("etc/chain_heads.json")).unwrap();
+        let mode = |n: &str| std::fs::metadata(p(n)).unwrap().permissions().mode() & 0o7777;
+        for n in [
+            "detections/detections.jsonl",
+            "detections/status_events.jsonl",
+            "fim_drift.jsonl",
+            "fim_baseline.jsonl",
+            "canaries.jsonl",
+            "canary_access.jsonl",
+            "netflow.jsonl",
+            "netflow_listeners.jsonl",
+        ] {
+            assert_eq!(mode(n), 0o600, "{n}: {:o}", mode(n));
+        }
+        for n in ["etc/audit.log", "etc/chain_heads.json"] {
+            assert_eq!(mode(n), 0o640, "{n}: {:o}", mode(n));
+        }
+    }
+
     /// A14 test #2: `bootstrap_audit_log` creates a zero-byte
     /// file at the given path when it doesn't exist, with mode
-    /// 0644 so the LSM-protected world-readable contract holds.
+    /// 0640: no longer world-readable (external audit EVD-019).
     #[test]
     fn bootstrap_audit_log_creates_zero_byte_file_if_missing() {
         let dir = TempDir::new().unwrap();
@@ -2367,7 +2401,7 @@ mod tests {
         assert!(log_path.exists());
         let meta = std::fs::metadata(&log_path).unwrap();
         assert_eq!(meta.len(), 0);
-        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
     }
 
     /// A14 test #3: `bootstrap_audit_log` is idempotent — a

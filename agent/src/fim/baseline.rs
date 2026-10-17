@@ -70,10 +70,11 @@ use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
 /// state directory's protected-files list.
 pub const DEFAULT_BASELINE_PATH: &str = "/var/lib/northnarrow/fim_baseline.jsonl";
 
-/// File mode for the persisted baseline log. World-readable per
-/// the design §4.2 layout (operators inspect it with `cat`;
-/// only root + the agent's own user can write).
-const BASELINE_FILE_MODE: u32 = 0o644;
+/// File mode for the persisted baseline log: root only (external audit
+/// EVD-019, [`crate::chainlog::STATE_LOG_FILE_MODE`]; it lists every
+/// watched file and its hash). Operators read it with `sudo` or
+/// `nn-admin`.
+const BASELINE_FILE_MODE: u32 = crate::chainlog::STATE_LOG_FILE_MODE;
 
 /// Bumped when the on-disk schema or hash-input bytes change.
 /// Verifiers consult this to refuse a chain they were not built

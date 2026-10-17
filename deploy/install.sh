@@ -108,6 +108,10 @@ ATTEST_BUNDLE=""
 # (prerequisite_overrides) and reported by `nn-admin host-check`.
 WITHOUT_NFT=0
 PREREQ_OVERRIDES=()
+# External audit EVD-019 (NN-AUD-281): the group that may read the audit log
+# and the head anchor besides root — a log shipper's. Empty: each file keeps
+# the group it has (root on a default install); every upgrade keeps it.
+AUDIT_GROUP=${NN_AUDIT_GROUP:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
@@ -123,6 +127,7 @@ while [[ $# -gt 0 ]]; do
         --allow-manifest-only) ALLOW_MANIFEST_ONLY=1 ;;
         --no-verify) VERIFY=0 ;;
         --without-nftables) WITHOUT_NFT=1 ;;
+        --audit-group) AUDIT_GROUP=$2; shift ;;
         -h|--help)
             echo "usage: sudo $0 [--upgrade] [--tarball FILE] [--sums FILE] [--attestation BUNDLE] [--require-attestation]"
             echo "                 [--source-tree | --allow-manifest-only | --no-verify] [--without-nftables]"
@@ -139,6 +144,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --allow-manifest-only  accept a release tree checked only against its own MANIFEST.sha256"
             echo "                         (no tarball + SHA256SUMS, no attestation; recorded as 'manifest')"
             echo "  --no-verify            skip every release check (dev only; recorded as 'unverified')"
+            echo "  --audit-group GROUP    existing group that may read $ETC_DIR/audit.log and chain_heads.json"
+            echo "                         besides root (a log shipper; NN_AUDIT_GROUP too). Kept by later upgrades"
             echo "  The flag that accepted a level below 'checksums' is recorded in the install manifest"
             echo "  and reported by nn-admin host-check."
             echo "  --without-nftables     install on a host without nft (nftables): the agent's per-process"
@@ -148,6 +155,12 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+if [[ -n "$AUDIT_GROUP" ]]; then
+    if [[ ! "$AUDIT_GROUP" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || ! getent group "$AUDIT_GROUP" >/dev/null; then
+        echo "install.sh: --audit-group $AUDIT_GROUP: no such group — create it first (groupadd --system <name>)" >&2
+        exit 2
+    fi
+fi
 if [[ $MODE != full ]]; then
     # The package manager verified and placed the files; there is no tree
     # to verify and nothing to copy. The trusted-installer key comes from
@@ -872,6 +885,33 @@ install -m 644 -o root -g root "$JOURNALD_NS_CONF_SRC" "/etc/systemd/journald@no
 echo "install.sh: ensuring $ETC_DIR (mode 0755, root:root)"
 install -d -m 0755 -o root -g root "$ETC_DIR"
 
+# External audit EVD-019 (NN-AUD-281): the audit log and the head anchor were
+# 0644 in this world-readable directory, and any local user read key
+# fingerprints, the callers' pid/uid/comm, drift details and which sensor was
+# blind. The agent creates them 0640 now (root and the file's group); an
+# existing copy is closed here — the units are stopped and the pins dropped,
+# nothing denies the chmod — and given --audit-group's group. A missing file
+# is created empty, as the agent would, so a fresh install gets the group
+# too; a link is left alone (the agent writes neither through one).
+for evidence in audit.log chain_heads.json; do
+    ev_path="$ETC_DIR/$evidence"
+    if [[ -L "$ev_path" ]]; then
+        echo "install.sh: WARNING: $ev_path is a symbolic link — left alone (external audit EVD-019)" >&2
+        continue
+    fi
+    if [[ ! -e "$ev_path" ]]; then
+        install -m 0640 -o root -g "${AUDIT_GROUP:-root}" /dev/null "$ev_path"
+    elif [[ -f "$ev_path" ]]; then
+        if [[ -n "$AUDIT_GROUP" ]]; then
+            chown "root:$AUDIT_GROUP" "$ev_path"
+        else
+            chown root "$ev_path"
+        fi
+        chmod 0640 "$ev_path"
+    fi
+    echo "install.sh: $ev_path closed to other users ($(stat -c '%a %U:%G' "$ev_path"))"
+done
+
 # The shipped default lists (`.v1`): the FIM watched paths (Tappa 9 C7), the
 # NetFlow IP/CIDR and JA3 blocklists (Tappa 10 N8), the process and NetFlow
 # comm allowlists (Tappa 10.5 D1). External audit LLMR-015 (NN-AUD-327, lab
@@ -1053,13 +1093,23 @@ if command -v lsattr >/dev/null 2>&1 && lsattr -d "$STATE_DIR" 2>/dev/null | awk
     echo "install.sh: $STATE_DIR is immutable (chattr +i from a previous agent run) — lifting for the install"
     chattr -i "$STATE_DIR"
 fi
+# External audit EVD-019 (NN-AUD-281): earlier releases created the evidence
+# logs 0644 (detections, status events, netflow and its listeners, the FIM
+# baseline and drift, the canary chains, their archives and manifests). The
+# directory's 0700 kept other users out; a copy that keeps the mode (cp -a, a
+# backup) did not. The agent creates them 0600 now; close the existing ones.
+# Only *.jsonl* at the top and in detections/: the honeypot baits keep 0644.
+while IFS= read -r -d '' evidence; do
+    echo "install.sh: closing $evidence to other users (mode $(stat -c %a "$evidence"))"
+    chmod go-rwx "$evidence"
+done < <(find "$STATE_DIR" -maxdepth 2 -xdev -type f -name '*.jsonl*' -perm /077 -print0)
 
 for fim_log in fim_baseline.jsonl fim_drift.jsonl; do
     if [[ -f "$STATE_DIR/$fim_log" ]]; then
         echo "install.sh: $STATE_DIR/$fim_log already present — leaving chain intact"
     else
         echo "install.sh: bootstrapping $STATE_DIR/$fim_log (zero-byte placeholder)"
-        install -m 0644 -o root -g root /dev/null "$STATE_DIR/$fim_log"
+        install -m 0600 -o root -g root /dev/null "$STATE_DIR/$fim_log"
     fi
 done
 
@@ -1119,7 +1169,7 @@ for canary_log in canaries.jsonl canary_access.jsonl; do
         echo "install.sh: $STATE_DIR/$canary_log already present — leaving chain intact"
     else
         echo "install.sh: bootstrapping $STATE_DIR/$canary_log (zero-byte placeholder)"
-        install -m 0644 -o root -g root /dev/null "$STATE_DIR/$canary_log"
+        install -m 0600 -o root -g root /dev/null "$STATE_DIR/$canary_log"
     fi
 done
 
@@ -1133,7 +1183,7 @@ if [[ -f "$STATE_DIR/netflow.jsonl" ]]; then
     echo "install.sh: $STATE_DIR/netflow.jsonl already present — leaving chain intact"
 else
     echo "install.sh: bootstrapping $STATE_DIR/netflow.jsonl (zero-byte placeholder)"
-    install -m 0644 -o root -g root /dev/null "$STATE_DIR/netflow.jsonl"
+    install -m 0600 -o root -g root /dev/null "$STATE_DIR/netflow.jsonl"
 fi
 
 # Tappa 9.5 K7: install the 5 canary content templates into

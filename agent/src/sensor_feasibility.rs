@@ -49,7 +49,7 @@ use common::wire::InodeKey;
 use crate::anti_tamper::btf_revalidate::{self, RefuseReason, ResolveOutcome};
 use crate::anti_tamper::filesystem::{stat_dev_to_kernel_dev, AyaInodeKey};
 use crate::sensors::ebpf_object::EBPF_BYTES;
-use crate::telemetry_probe::dns_query_packet;
+use crate::telemetry_probe::dns_probe_packet;
 
 const VMLINUX_BTF: &str = "/sys/kernel/btf/vmlinux";
 /// Maps the object pins by name land here, away from the agent's pin root.
@@ -1344,7 +1344,7 @@ fn exercise_dns(
     ret6: &[String],
     send: &[String],
 ) -> Result<()> {
-    let packet = dns_query_packet(DNS_NAME);
+    let packet = dns_probe_packet(DNS_NAME);
     let carries = |e: &SensorProbeRaw| {
         detail(e).len() >= packet.len() && detail(e)[..packet.len()] == packet[..] && e.aux != 0
     };

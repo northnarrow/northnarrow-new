@@ -49,10 +49,10 @@ use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
 /// to the K2 registry under `/var/lib/northnarrow/`.
 pub const DEFAULT_ACCESS_LOG_PATH: &str = "/var/lib/northnarrow/canary_access.jsonl";
 
-/// File mode for the persisted access log. World-readable
-/// (operators inspect with `cat`); only root + the agent's
-/// own user can write.
-const ACCESS_LOG_FILE_MODE: u32 = 0o644;
+/// File mode for the persisted access log: root only (external audit
+/// EVD-019, [`crate::chainlog::STATE_LOG_FILE_MODE`]). Operators read it
+/// with `sudo` or `nn-admin`.
+const ACCESS_LOG_FILE_MODE: u32 = crate::chainlog::STATE_LOG_FILE_MODE;
 
 // ── on-disk schema ──────────────────────────────────────────────────
 

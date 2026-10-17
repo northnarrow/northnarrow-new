@@ -61,6 +61,34 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, evidence files and the telemetry probe (Low
+  EVD-019 NN-AUD-281, EVD-015 NN-AUD-278; lab PR 169): `audit.log` and
+  `chain_heads.json` were `0644` in the world-readable `/etc/northnarrow`,
+  so any local user read the key fingerprints, the callers' pid/uid/comm,
+  the drift details and which sensor was in a `telemetry_gap`. They are
+  created `0640` now (root and the file's group); the chain logs under
+  `/var/lib/northnarrow` (detections, status events, netflow and its
+  listeners, FIM baseline and drift, the canary chains, archives and
+  manifests), closed until now only by the directory's `0700`, are
+  created `0600`. `install.sh` closes the existing files on install,
+  `--upgrade` and the packages' configure step, with the units stopped
+  and the pins dropped, and `--audit-group GROUP` (`NN_AUDIT_GROUP`)
+  gives the two `/etc` files an existing group for a log shipper, kept by
+  later upgrades. The telemetry probe's DNS datagram to `127.0.0.1:53`
+  was a recursive query whose name carried the agent's pid and the
+  clock, and a forwarding resolver on the host passed it upstream every
+  minute: the nonce is 64 random bits, and the datagram is flagged as a
+  response (`QR` set, `RD` clear), which a resolver drops instead of
+  answering or forwarding; both DNS sensors read only the name, so the
+  probe still sees `dns`. `MSG_PROBE`, proposed in triage, is not used:
+  the kernel then builds no buffer (`ip_make_skb` returns none on 5.15,
+  6.1, 6.8 and 6.12), `udp_send_skb`, where the default sensor reads, is
+  never reached, and every round would be a DNS telemetry gap.
+  **Regression:** a reader of `audit.log` or `chain_heads.json` that does
+  not run as root (a log shipper, a script without `sudo`) gets `EACCES`
+  until it has the `--audit-group` group; a listener on `127.0.0.1:53`
+  now receives the probe as a response (flags `0x8000`) with a random
+  first label.
 - External audit, Wave 3, the shipped default lists on disk (Low
   NN-AUD-327 LLMR-015, wider than reported; lab PR 168): the five `.v1`
   lists in `/etc/northnarrow` (`fim-paths`, `netflow-blocklist`,
