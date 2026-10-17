@@ -1834,7 +1834,7 @@ pub fn process_drift(
         if !is_canary && !crate::fim::rules::is_credential_path(&path) {
             debug!(
                 target: "fim.drain",
-                path = %path,
+                path = %common::log_escape::Escaped(&path),
                 "BUG-012 v2: dropping FimOp::Opened on non-credential, non-canary watched path \
                  (a read is not integrity drift; no rule consumes it)"
             );
@@ -1848,8 +1848,8 @@ pub fn process_drift(
         // so we emit a content-less event and skip the baseline probe.
         debug!(
             target: "fim.drain",
-            path = %path,
-            modifier_comm = %comm_to_string(&raw.modifier_comm),
+            path = %common::log_escape::Escaped(&path),
+            modifier_comm = %common::log_escape::Escaped(comm_to_string(&raw.modifier_comm)),
             canary = is_canary,
             "BUG-012 v2: forwarding FimOp::Opened on credential/canary path to rule engine \
              (silent — not recorded as drift)"
@@ -1945,10 +1945,10 @@ pub fn process_drift(
             if restored.is_power_of_two() {
                 warn!(
                     target: "fim.drain",
-                    path = %path,
+                    path = %common::log_escape::Escaped(&path),
                     ?op,
                     modifier_pid = raw.modifier_pid,
-                    modifier_comm = %comm_to_string(&raw.modifier_comm),
+                    modifier_comm = %common::log_escape::Escaped(comm_to_string(&raw.modifier_comm)),
                     restored_writes = restored,
                     "FIM: a write on a critical path left its content as baselined — recorded \
                      as content_restored (a touch, or a change undone before the re-hash)"
@@ -1974,7 +1974,7 @@ pub fn process_drift(
         }
         debug!(
             target: "fim.drain",
-            path = %path,
+            path = %common::log_escape::Escaped(&path),
             ?op,
             "no-op drift: sha256 unchanged for content-class op, skipping"
         );
@@ -2023,7 +2023,7 @@ pub fn process_drift(
     if skipped {
         info!(
             target: "fim.drain",
-            path = %path,
+            path = %common::log_escape::Escaped(&path),
             severity = ?severity,
             skip_reason,
             "drift suppressed by rate limit — audit chain still recorded"
@@ -2419,7 +2419,7 @@ fn content_after(path: &str, event_ns: u64) -> Option<Content> {
         Err(e) => {
             debug!(
                 target: "fim.drain",
-                path = %path,
+                path = %common::log_escape::Escaped(&path),
                 error = %e,
                 "compute_baseline failed during drift re-hash; emitting with new_sha256=None"
             );

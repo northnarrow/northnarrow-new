@@ -4,7 +4,10 @@
 # Runs ON THE GUEST as root against the installed agent (one case per
 # documented way of neutralising a Linux EDR, and answers two questions for
 # each: was the action denied, and did it leave EVIDENCE in the signed chain
-# logs (audit.log ops, detections.jsonl rule ids) or at least in the journal?
+# logs (audit.log ops, detections.jsonl rule ids and, for NN-L-AT-001, the
+# refused operation: deny=<op>)? External audit NN-AUD-413 (lab PR 167):
+# the journal is not evidence — any user can make the agent log a name
+# that reads like one of its lines; it only gives the agent's errors=<n>.
 # Every case states its expectation; a deviation fails the run, a KNOWN GAP
 # is printed as such (feeds Tappa 10.9) and does not fail it.
 #
@@ -61,7 +64,7 @@ rows=()
 # when the process it was given is not the one it was told to expect, and
 # never prints the content of a file it reads.
 NNPY_SRC=$(cat <<'PY'
-import errno, hashlib, io, json, os, signal, subprocess, sys, tempfile, time
+import errno, hashlib, io, json, os, re, signal, subprocess, sys, tempfile, time
 from contextlib import redirect_stdout
 
 PROTECTED_COMMS = ("northnarrow-age", "northnarrow-wat")
@@ -251,6 +254,116 @@ def cmd_map_pids():
                                    " pids=" + ",".join(map(str, stale)) if stale else ""))
     return 0
 
+# ── evidence (external audit NN-AUD-413, lab PR 167) ─────────────────────
+# What a case left is read from the agent's signed records, never from
+# journal text: another user could write a whole journal line of their own
+# (a file in /tmp named "x\nANTI-TAMPER DENIAL ... op=signal", logged with
+# a raw Display field) or a field that reads like one. Every token printed
+# is checked against a closed pattern; no record content is printed.
+#   audit.log         the ops of the entries after line <a0>, plus the
+#                     markers prev_run_abrupt / unauthorized_overlay /
+#                     unit_shadowed (key and value of the parsed entry)
+#   detections.jsonl  the rule ids of the records after line <d0>, and for
+#                     NN-L-AT-001 the refused operation: deny=<op>
+#   journal (stdin)   `journalctl -o json`; only errors=<n>: entries of the
+#                     agent unit's own stdout (_SYSTEMD_UNIT and _TRANSPORT
+#                     are set by journald, not by the writer) whose level
+#                     field — the second of the line — is ERROR
+AT_RULE = "NN-L-AT-001"
+TOKEN = re.compile(r"[A-Za-z0-9_-]{1,80}")
+OPNAME = re.compile(r"[a-z_]{1,40}")
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+AUDIT_MARKS = (("ended", "abrupt", "prev_run_abrupt"),
+               ("kind", "unauthorized_overlay", "unauthorized_overlay"),
+               ("kind", "unit_shadowed", "unit_shadowed"))
+
+def records_after(path, skip):
+    recs, bad = [], 0
+    try:
+        with open(path, "rb") as f:
+            for n, line in enumerate(f):
+                if n < skip or not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    rec = None
+                if isinstance(rec, dict):
+                    recs.append(rec)
+                else:
+                    bad += 1
+    except OSError:
+        pass
+    return recs, bad
+
+def pairs(v):
+    if isinstance(v, dict):
+        for k, x in v.items():
+            yield k, x
+            yield from pairs(x)
+    elif isinstance(v, list):
+        for x in v:
+            yield from pairs(x)
+
+def tally(items):
+    c = {}
+    for x in items:
+        c[x] = c.get(x, 0) + 1
+    return "".join("%s\u00d7%d " % (k, c[k]) for k in sorted(c))
+
+def journal_errors(lines):
+    n = 0
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or e.get("_SYSTEMD_UNIT") != "northnarrow-agent.service" \
+                or e.get("_TRANSPORT") != "stdout":
+            continue
+        m = e.get("MESSAGE")
+        if isinstance(m, list):
+            try:
+                m = bytes(m).decode("utf-8", "replace")
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(m, str):
+            continue
+        f = SGR.sub("", m).split(None, 2)
+        if len(f) >= 2 and f[1] == "ERROR":
+            n += 1
+    return n
+
+def evidence_line(audit, a0, dets, d0, journal):
+    arecs, abad = records_after(audit, int(a0))
+    ops = [r["op"] for r in arecs if isinstance(r.get("op"), str) and OPNAME.fullmatch(r["op"])]
+    marks = []
+    for key, val, mark in AUDIT_MARKS:
+        if mark not in marks and any(k == key and x == val for r in arecs for k, x in pairs(r)):
+            marks.append(mark)
+    drecs, dbad = records_after(dets, int(d0))
+    rules, denied = [], []
+    for r in drecs:
+        rid = r.get("rule_id")
+        if not isinstance(rid, str) or not TOKEN.fullmatch(rid):
+            continue
+        rules.append(rid)
+        if rid.startswith(AT_RULE):
+            op = r.get("operation")
+            denied.append("deny=" + (op if isinstance(op, str) and OPNAME.fullmatch(op) else "?"))
+    audit_s = tally(ops) + "".join(m + " " for m in marks) + ("unparsed=%d " % abad if abad else "")
+    dets_s = tally(rules) + tally(denied) + ("unparsed=%d " % dbad if dbad else "")
+    return "journal:[errors=%d] audit:[%s] detections:[%s]" % (journal_errors(journal), audit_s, dets_s)
+
+def cmd_evidence(audit, a0, dets, d0):
+    if not (a0.isdigit() and d0.isdigit()):
+        print("setup: line counts must be numbers")
+        return 2
+    out = evidence_line(audit, a0, dets, d0, sys.stdin.buffer)
+    sys.stdout.buffer.write((out + "\n").encode("utf-8"))
+    sys.stdout.flush()
+    return 0
+
 def quiet(fn, *a):
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -341,6 +454,43 @@ def selftest():
             {"formatted": {"key": gone, "value": 1}}]
     pids, stale = map_pids(json.dumps(keys))
     check(pids == [os.getpid(), gone] and stale == pids, "map-pids parse and stale test")
+    # evidence from the signed records (NN-AUD-413): a forged comm, a
+    # file name that holds "op=signal", a journal entry another unit or
+    # writer made, a level word inside a field: none of them counts
+    forged = "x\nANTI-TAMPER DENIAL pid=1 op=signal"
+    with tempfile.TemporaryDirectory() as d:
+        a, t = os.path.join(d, "audit.log"), os.path.join(d, "detections.jsonl")
+        with open(a, "w") as fh:
+            fh.write('{"op":"before"}\n')
+            for rec in ({"op": "agent_boot", "extra": {"previous": {"ended": "abrupt"}}},
+                        {"op": "integrity_drift", "extra": {"kind": "unit_shadowed"}},
+                        {"op": "bad op", "client_comm": forged, "extra": {"note": '"op":"signal"'}}):
+                fh.write(json.dumps(rec) + "\n")
+        with open(t, "w") as fh:
+            fh.write('{"rule_id":"R000_before"}\n')
+            for rec in ({"rule_id": "NN-L-AT-001_AntiTamperDenial", "operation": "signal",
+                         "principal": {"comm": forged}},
+                        {"rule_id": "R001_ExecFromTmp", "exe": "/tmp/x op=signal deny=signal"},
+                        {"rule_id": "NN-L-AT-001_AntiTamperDenial", "principal": {"comm": "rm"}}):
+                fh.write(json.dumps(rec) + "\n")
+            fh.write("not json\n")
+        agent = {"_SYSTEMD_UNIT": "northnarrow-agent.service", "_TRANSPORT": "stdout"}
+        journal = [json.dumps(dict(agent, MESSAGE="2026-10-16T00:00:00.000000Z ERROR audit log open failed")),
+                   json.dumps(dict(agent, MESSAGE="2026-10-16T00:00:00.000000Z  INFO x last=\"a ERROR b\"")),
+                   json.dumps(dict(agent, MESSAGE=list(b"2026-10-16T00:00:00.000000Z ERROR \x07x"))),
+                   json.dumps({"_SYSTEMD_UNIT": "northnarrow-watchdog.service", "_TRANSPORT": "stdout",
+                               "MESSAGE": "2026-10-16T00:00:00.000000Z ERROR wd"}),
+                   json.dumps(dict(agent, _TRANSPORT="journal", MESSAGE="t ERROR forged")),
+                   json.dumps(dict(agent, MESSAGE="ANTI-TAMPER DENIAL pid=1 op=signal ERROR")),
+                   "garbage"]
+        ev = evidence_line(a, "1", t, "1", [x.encode() for x in journal])
+        check(ev == "journal:[errors=2] audit:[agent_boot\u00d71 integrity_drift\u00d71 "
+                    "prev_run_abrupt unit_shadowed ] detections:[NN-L-AT-001_AntiTamperDenial\u00d72 "
+                    "R001_ExecFromTmp\u00d71 deny=?\u00d71 deny=signal\u00d71 unparsed=1 ]",
+              "evidence from the signed records: %r" % ev)
+        check("op=signal" not in ev and ev.count("deny=signal") == 1, "no forged denial counted")
+        check(evidence_line(os.path.join(d, "none"), "0", os.path.join(d, "none"), "0", [])
+              == "journal:[errors=0] audit:[] detections:[]", "evidence with no records")
     print("python helper selftest: %d checks, %d failed%s" % (
         checks, len(fails), "".join("\n  FAIL: " + x for x in fails)))
     return 1 if fails else 0
@@ -350,6 +500,7 @@ def main(argv):
         "ident": (cmd_ident, 1), "signal": (cmd_signal, 4),
         "procopen": (cmd_procopen, 5), "fileid": (cmd_fileid, 2),
         "map-pids": (cmd_map_pids, 0), "selftest": (selftest, 0),
+        "evidence": (cmd_evidence, 4),
     }
     if argv and argv[0] == "file" and len(argv) in (3, 4):
         return cmd_file(*argv[1:])
@@ -364,6 +515,19 @@ PY
 # -I: the helper runs as root from a user's checkout; nothing from the
 # current directory or the environment is imported.
 nnpy() { python3 -I -c "$NNPY_SRC" "$@"; }
+
+# evidence since (t0, audit lines before, detection lines before).
+# External audit NN-AUD-413 (lab PR 167): from the signed records — the
+# NN-L-AT-001 detections (deny=<op>, their refused operation) and rule ids
+# after line d0 of detections.jsonl, the ops after line a0 of audit.log —
+# read by the python helper (cmd_evidence). The journal gives only
+# errors=<n>, counted on the agent unit's own stdout entries by their level
+# field: it used to give the denials and verdicts too, grepped anywhere in a
+# line any user could make the agent write.
+journal_json() { journalctl --namespace=northnarrow -u northnarrow-agent --since "$1" --no-pager -o json 2>/dev/null; }
+evidence() {
+    journal_json "$1" | nnpy evidence "$AUDIT" "${2:-0}" "$DETS" "${3:-0}"
+}
 
 # valid_pid <pid> <comm>: a decimal PID above 1 whose /proc/<pid>/comm is
 # <comm> (comm is readable without ptrace; /proc/<agent>/exe is not, C04b)
@@ -567,6 +731,16 @@ selftest() {
     t eval "nnpy signal 0 sleep 1 KILL | grep -q '^target=absent'"
     t eval "nnpy signal -1 sleep 1 KILL | grep -q '^target=absent'"
     t nnpy selftest
+    # evidence() reads the signed records, the journal only for errors=
+    # (NN-AUD-413): a stubbed journal with a forged denial line, records
+    # in scratch files
+    t eval '(d=$(mktemp -d); trap "rm -rf $d" EXIT; AUDIT=$d/a; DETS=$d/t
+        printf "%s\n" "{\"op\":\"agent_boot\"}" > "$AUDIT"
+        printf "%s\n" "{\"rule_id\":\"NN-L-AT-001_AntiTamperDenial\",\"operation\":\"ptrace\"}" > "$DETS"
+        journal_json() { printf "%s\n" "{\"_SYSTEMD_UNIT\":\"northnarrow-agent.service\",\"_TRANSPORT\":\"stdout\",\"MESSAGE\":\"ANTI-TAMPER DENIAL pid=1 op=signal\"}"; }
+        ev=$(evidence "x" 0 0)
+        [[ "$ev" == "journal:[errors=0] audit:[agent_boot×1 ] detections:[NN-L-AT-001_AntiTamperDenial×1 deny=ptrace×1 ]" ]] \
+            && ! grep -q "signal" <<<"$ev" && grep -qE "deny=ptrace" <<<"$ev")'
     # mount cleanup, newest first, with stubbed mount tools
     t eval '(FAKE=" /a /b "; ORDER=""
         mountpoint() { [[ "$FAKE" == *" ${!#} "* ]]; }
@@ -653,36 +827,11 @@ restart_agent() {
 }
 export -f grant_window restart_agent
 export NNADMIN ETC ADMIN_KEY
+# The journal text, for state lines only (the BPF guard mode, C38's
+# registration line), never for a case's evidence (NN-AUD-413).
 jlines() { journalctl --namespace=northnarrow -u northnarrow-agent -u northnarrow-watchdog --since "$1" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -v "process spawn detected"; }
 audit_count() { wc -l < "$AUDIT" 2>/dev/null || echo 0; }
 dets_count() { wc -l < "$DETS" 2>/dev/null || echo 0; }
-
-# evidence since (t0, audit lines before, detection lines before)
-evidence() {
-    local t0=$1 a0=$2 d0=$3
-    local j denials verdicts errors audit dets
-    j=$(jlines "$t0")
-    denials=$(echo "$j" | grep -oE "ANTI-TAMPER DENIAL .*op=[a-z_]+" | grep -oE "op=[a-z_]+" | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
-    verdicts=$(echo "$j" | grep -oE "VERDICT \(rule\) rule=[A-Za-z0-9_-]+" | grep -oE "rule=[A-Za-z0-9_-]+" | cut -d= -f2 | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
-    errors=$(echo "$j" | grep -cE " ERROR ")
-    audit=$(tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -oE '"op":"[a-z_]+"' | cut -d'"' -f4 | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
-    dets=$(tail -n +"$((d0 + 1))" "$DETS" 2>/dev/null | grep -oE '"rule_id":"[A-Za-z0-9_-]+"' | cut -d'"' -f4 | sort | uniq -c | awk '{printf "%s×%s ", $2, $1}')
-    # a boot that reports its predecessor died without agent_stop
-    if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"ended":"abrupt"'; then
-        audit="${audit}prev_run_abrupt "
-    fi
-    # Tappa 10.8: an overlay refused at boot / a signed one accepted
-    if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"kind":"unauthorized_overlay"'; then
-        audit="${audit}unauthorized_overlay "
-    fi
-    if tail -n +"$((a0 + 1))" "$AUDIT" 2>/dev/null | grep -q '"kind":"unit_shadowed"'; then
-        audit="${audit}unit_shadowed "
-    fi
-    if echo "$j" | grep -q "signed overlay accepted"; then
-        denials="${denials}overlay_accepted "
-    fi
-    echo "journal:[${denials:-}${verdicts:-}errors=${errors}] audit:[${audit:-}] detections:[${dets:-}]"
-}
 
 # run_case ID "title" expect_outcome expect_evidence_regex known_gap(0/1) -- command...
 # POST="$(post <fn> <args>)" before it: the end state the case must leave.
@@ -718,6 +867,11 @@ run_case() {
     if [[ -n "$exp_ev" ]] && ! echo "$ev" | grep -qE "$exp_ev"; then
         if (( gap )); then verdict="KNOWN GAP"; else verdict="DEVIATION (evidence /$exp_ev/ missing)"; fail=1; fi
     fi
+    # EV_FORBID: evidence that must not be there (C24: the agent refusing
+    # the overlay it was just given).
+    if [[ -n "${EV_FORBID:-}" ]] && echo "$ev" | grep -qE "$EV_FORBID"; then
+        verdict="DEVIATION (evidence /$EV_FORBID/ present)"; fail=1
+    fi
     rows+=("| $id | $title | $status | $ev | $verdict |")
     echo "$id $title → $status; $ev; $verdict" >&2
     [[ -n "$out" ]] && echo "    $(echo "$out" | head -2 | tr '\n' ' ' | cut -c1-160)" >&2
@@ -750,17 +904,17 @@ echo "agent pid $PID, kernel $(uname -r), bpf guard mode $BPF_MODE, $(date -u +%
 agent_signal_case() {   # <id> <title> <SIG>
     local p s; p=$(agent_pid); s=$(proc_start "$p")
     POST=$(post post_proc "${p:-0}" "${s:-0}" northnarrow-age) \
-        run_case "$1" "$2" denied "op=signal" 0 -- nnpy signal "${p:-0}" northnarrow-age "${s:-0}" "$3"
+        run_case "$1" "$2" denied "deny=signal" 0 -- nnpy signal "${p:-0}" northnarrow-age "${s:-0}" "$3"
 }
 watchdog_signal_case() {   # <id> <title> <SIG>
     local p s; p=$(wd_pid); s=$(proc_start "$p")
     POST=$(post post_proc "${p:-0}" "${s:-0}" northnarrow-wat) \
-        run_case "$1" "$2" denied "op=signal" 0 -- nnpy signal "${p:-0}" northnarrow-wat "${s:-0}" "$3"
+        run_case "$1" "$2" denied "deny=signal" 0 -- nnpy signal "${p:-0}" northnarrow-wat "${s:-0}" "$3"
 }
 agent_mem_case() {   # <id> <title>: open /proc/<agent>/mem (a ptrace attach check)
     local p s; p=$(agent_pid); s=$(proc_start "$p")
     POST=$(post post_proc "${p:-0}" "${s:-0}" northnarrow-age) \
-        run_case "$1" "$2" denied "op=ptrace" 0 -- nnpy procopen "${p:-0}" northnarrow-age "${s:-0}" mem 4194304
+        run_case "$1" "$2" denied "deny=ptrace" 0 -- nnpy procopen "${p:-0}" northnarrow-age "${s:-0}" mem 4194304
 }
 # a row for a state check (no action, no evidence)
 state_row() {   # <id> <title> <detail> <check...>
@@ -797,7 +951,7 @@ if [[ "$MODE" == persistence ]]; then
     agent_signal_case C62a "after a boot: SIGCONT the agent from a root shell" CONT
     watchdog_signal_case C62b "after a boot: SIGCONT the watchdog from a root shell" CONT
     POST=$(post post_not_shrunk "$AUDIT" "$(nnpy fileid "$AUDIT" size)") \
-        run_case C62c "after a boot: open audit.log for writing" denied "op=write" 0 -- nnpy file open-append "$AUDIT"
+        run_case C62c "after a boot: open audit.log for writing" denied "deny=write" 0 -- nnpy file open-append "$AUDIT"
     state_row C62d "after a boot: the state directory keeps +i" "lsattr -d $STATE" post_flag "$STATE" i present
     state_row C62e "after a boot: the pins are back" "PROTECTED_PIDS, link_task_kill" \
         test -e "$PINS/PROTECTED_PIDS" -a -e "$PINS/link_task_kill"
@@ -819,16 +973,16 @@ PID=$(agent_pid); START=$(proc_start "$PID")
 run_case C04b "ptrace read-mode: /proc/<agent>/environ (silent by design)" denied "" 0 -- nnpy procopen "$PID" northnarrow-age "${START:-0}" environ 0
 # ── protected files and pins ──────────────────────────────────────────────
 POST=$(post post_same "$ETC/admin.pub" hash "$(nnpy fileid "$ETC/admin.pub" hash)") \
-run_case C04 "append to /etc/northnarrow/admin.pub" denied "op=write" 0 -- bash -c "echo x >> $ETC/admin.pub"
+run_case C04 "append to /etc/northnarrow/admin.pub" denied "deny=write" 0 -- bash -c "echo x >> $ETC/admin.pub"
 POST=$(post post_flag "$STATE" i present) \
-run_case C05 "chattr -i on the state dir" denied "op=ioctl" 0 -- chattr -i "$STATE"
+run_case C05 "chattr -i on the state dir" denied "deny=ioctl" 0 -- chattr -i "$STATE"
 POST=$(post post_same "$UNIT" ino "$(nnpy fileid "$UNIT" ino)") \
-run_case C06 "unlink the agent unit (systemctl mask)" denied "op=unlink" 0 -- bash -c "rm -f $UNIT"
+run_case C06 "unlink the agent unit (systemctl mask)" denied "deny=unlink" 0 -- bash -c "rm -f $UNIT"
 pin_list > "$SCRATCH/pins.before"
 POST=$(post post_pins_kept "$SCRATCH/pins.before") \
-run_case C07 "rm -rf the bpffs pin root" denied "op=unlink" 0 -- bash -c "rm -rf $PINS"
-run_case C08 "bpftool map update on PROTECTED_PIDS (pinned)" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- bpftool map update pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 value 1
-run_case C09 "bpftool link show pinned (link handle)" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- bpftool link show pinned "$PINS/link_task_kill"
+run_case C07 "rm -rf the bpffs pin root" denied "deny=unlink" 0 -- bash -c "rm -rf $PINS"
+run_case C08 "bpftool map update on PROTECTED_PIDS (pinned)" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- bpftool map update pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 value 1
+run_case C09 "bpftool link show pinned (link handle)" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- bpftool link show pinned "$PINS/link_task_kill"
 # ── BPF ecosystem ─────────────────────────────────────────────────────────
 run_case C10 "bpftool feature probe (loads test programs)" allowed "NN-L-BPF-001" 0 -- bash -c "bpftool feature probe kernel >/dev/null"
 # ── systemd ───────────────────────────────────────────────────────────────
@@ -838,7 +992,7 @@ run_case C10 "bpftool feature probe (loads test programs)" allowed "NN-L-BPF-001
 C11_EXP=allowed; C11_EV="integrity_drift"
 if journalctl --namespace=northnarrow _PID="$PID" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
     | grep -qE "registered in PROTECTED_INODES path=/etc/systemd/system/northnarrow-agent\.service\.d( |$)"; then
-    C11_EXP=denied; C11_EV="op=create"
+    C11_EXP=denied; C11_EV="deny=create"
 fi
 WAIT=40 run_case C11 "unit drop-in with a hostile Environment=" "$C11_EXP" "$C11_EV" 0 -- bash -c "mkdir -p /etc/systemd/system/northnarrow-agent.service.d && printf '[Service]\nEnvironment=NN_ANTI_TAMPER_ALLOW_DEGRADED=1\n' > /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf"
 rm -rf /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf; systemctl daemon-reload
@@ -893,7 +1047,7 @@ echo -500 > /proc/$PID/oom_score_adj 2>/dev/null || true
 # so a leftover cannot be removed until the lab purges the pins
 OVL="$ETC/zz-tamper-$(date +%s).local"
 # External audit EBPF-015: a new entry in /etc/northnarrow is refused.
-run_case C19 "drop a .local overlay in /etc/northnarrow" denied "op=create" 0 -- bash -c "echo '+evil-implant' > $OVL"
+run_case C19 "drop a .local overlay in /etc/northnarrow" denied "deny=create" 0 -- bash -c "echo '+evil-implant' > $OVL"
 # ── kills nothing can refuse, saturation, io_uring ────────────────────────
 CGK=/sys/fs/cgroup/system.slice/northnarrow-agent.service/cgroup.kill
 if [[ -w "$CGK" ]]; then
@@ -927,8 +1081,14 @@ WAIT=20 run_case C23 "unsigned allowlist overlay + agent restart" allowed "unaut
 PID=$(agent_pid)
 # The same overlay stored the authorised way (lab key, config-manage),
 # then a restart: stored with its signature, accepted at boot.
-printf '+backupd\n' > "$TMPD/ovl-allow"
-WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set.*overlay_accepted|overlay_accepted.*config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file $TMPD/ovl-allow --key $ADMIN_KEY && restart_agent"
+# NN-AUD-413 (lab PR 167): the evidence is read from audit.log, not from
+# the journal line: the store (config_overlay_set) and no refusal at the
+# restart (unauthorized_overlay). The store raises the rollback floor to its
+# signature, so the boot that applies it writes no config_overlay_accepted
+# (that row marks bytes the chain had not seen; Ubuntu 24.04 gate of lab
+# PRs 167-171). The comment line makes the bytes of every run new.
+printf '# nn-lab C24 %s\n+backupd\n' "$(date -u +%Y%m%dT%H%M%S%N)" > "$TMPD/ovl-allow"
+EV_FORBID="unauthorized_overlay" WAIT=20 run_case C24 "nn-admin config overlay set + agent restart" allowed "config_overlay_set" 0 -- bash -c "$NNADMIN config overlay set process-comm-allowlist --file $TMPD/ovl-allow --key $ADMIN_KEY && restart_agent"
 PID=$(agent_pid)
 # Review 62: after a restart the task deny hooks must still report. They
 # were reused from the pinned link, bound to the previous boot's ring, so
@@ -1033,10 +1193,10 @@ rm -f "$TMPD/nn_signed_dummy.ko" "$TMPD/nn_unsigned_dummy.ko"
 PID=$(agent_pid)
 START=$(proc_start "$PID")
 POST=$(post post_proc "${PID:-0}" "${START:-0}" northnarrow-age) \
-run_case C31 "systemctl kill -s SIGKILL the agent (no window)" denied "op=signal" 0 -- systemctl kill -s SIGKILL northnarrow-agent
+run_case C31 "systemctl kill -s SIGKILL the agent (no window)" denied "deny=signal" 0 -- systemctl kill -s SIGKILL northnarrow-agent
 WDPID=$(wd_pid); WDSTART=$(proc_start "$WDPID")
 POST=$(post post_proc "${WDPID:-0}" "${WDSTART:-0}" northnarrow-wat) \
-run_case C32 "systemctl kill -s SIGSTOP the watchdog (no window)" denied "op=signal" 0 -- systemctl kill -s SIGSTOP northnarrow-watchdog
+run_case C32 "systemctl kill -s SIGSTOP the watchdog (no window)" denied "deny=signal" 0 -- systemctl kill -s SIGSTOP northnarrow-watchdog
 if [[ -z "$ONLY" || ",$ONLY," == *",C33,"* ]]; then
     t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
     out=$(timeout 60 systemctl stop northnarrow-agent 2>&1); rc=$?
@@ -1071,13 +1231,13 @@ BIN_DIR=$(dirname "${AGENT_EXE:-/usr/local/bin/northnarrow-agent}")
 if selected C56a && BIN_TMP=$(mktemp "$BIN_DIR/.nn-lab-c56.XXXXXX") \
         && CLEAN_FILES+=("$BIN_TMP") && cp -p "$BIN_DIR/northnarrow-agent" "$BIN_TMP"; then
     POST=$(post post_same "$BIN_DIR/northnarrow-agent" ino "$(nnpy fileid "$BIN_DIR/northnarrow-agent" ino)") \
-    run_case C56a "rename a copy over the agent binary" denied "op=rename" 0 -- nnpy file rename "$BIN_TMP" "$BIN_DIR/northnarrow-agent"
+    run_case C56a "rename a copy over the agent binary" denied "deny=rename" 0 -- nnpy file rename "$BIN_TMP" "$BIN_DIR/northnarrow-agent"
 fi
 [[ -n "${BIN_TMP:-}" ]] && rm -f "$BIN_TMP"
 if selected C56b && cp -p "$BIN_DIR/northnarrow-watchdog" "$SCRATCH/northnarrow-watchdog"; then
     RESTORE+=("$BIN_DIR/northnarrow-watchdog|$SCRATCH/northnarrow-watchdog")
     POST=$(post post_same "$BIN_DIR/northnarrow-watchdog" ino "$(nnpy fileid "$BIN_DIR/northnarrow-watchdog" ino)") \
-    run_case C56b "unlink the watchdog binary" denied "op=unlink" 0 -- nnpy file unlink "$BIN_DIR/northnarrow-watchdog"
+    run_case C56b "unlink the watchdog binary" denied "deny=unlink" 0 -- nnpy file unlink "$BIN_DIR/northnarrow-watchdog"
     restore_missing "$BIN_DIR/northnarrow-watchdog" "$SCRATCH/northnarrow-watchdog"
 fi
 # C57: destroying the evidence. A path truncate(2) of audit.log goes through
@@ -1091,13 +1251,13 @@ keep_copy() {   # <case> <copy> <name>: a copy of what a deviation destroyed
 if selected C57a && cp -p "$AUDIT" "$SCRATCH/audit.log"; then
     a_before=$(nnpy fileid "$AUDIT" size)
     POST=$(post post_not_shrunk "$AUDIT" "$a_before") \
-    run_case C57a "truncate(2) audit.log to 0 bytes" denied "op=setattr" 0 -- nnpy file truncate "$AUDIT"
+    run_case C57a "truncate(2) audit.log to 0 bytes" denied "deny=setattr" 0 -- nnpy file truncate "$AUDIT"
     post_not_shrunk "$AUDIT" "$a_before" >/dev/null || keep_copy C57a "$SCRATCH/audit.log" audit.log
 fi
 if selected C57b && cp -p "$DETS" "$SCRATCH/detections.jsonl"; then
     d_before=$(nnpy fileid "$DETS" size)
     POST=$(post post_not_shrunk "$DETS" "$d_before") \
-    run_case C57b ": > detections.jsonl (open with O_TRUNC)" denied "op=write" 0 -- nnpy file open-trunc "$DETS"
+    run_case C57b ": > detections.jsonl (open with O_TRUNC)" denied "deny=write" 0 -- nnpy file open-trunc "$DETS"
     post_not_shrunk "$DETS" "$d_before" >/dev/null || keep_copy C57b "$SCRATCH/detections.jsonl" detections.jsonl
 fi
 # C58: a renamed module tool. R011 matches the comm (insmod, modprobe,
@@ -1125,15 +1285,15 @@ if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; t
     skipped_case C59a-C59c "io_uring_disabled=2" 1
 elif [[ -x "$IOU_BIN" ]] && "$IOU_BIN" --modes 2>/dev/null | grep -qw rename; then
     POST=$(post post_not_shrunk "$AUDIT" "$(nnpy fileid "$AUDIT" size)") \
-    run_case C59a "io_uring: open audit.log for writing through a ring" denied "op=write" 0 -- "$IOU_BIN" --open-write "$AUDIT"
+    run_case C59a "io_uring: open audit.log for writing through a ring" denied "deny=write" 0 -- "$IOU_BIN" --open-write "$AUDIT"
     if cp -p "$IOU_TGT" "$SCRATCH/iou-target"; then
         RESTORE+=("$IOU_TGT|$SCRATCH/iou-target")
         IOU_ID=$(nnpy fileid "$IOU_TGT" ino)
         POST=$(post post_same "$IOU_TGT" ino "$IOU_ID") \
-        run_case C59b "io_uring: unlink a protected file through a ring" denied "op=unlink" 0 -- "$IOU_BIN" --unlink "$IOU_TGT"
+        run_case C59b "io_uring: unlink a protected file through a ring" denied "deny=unlink" 0 -- "$IOU_BIN" --unlink "$IOU_TGT"
         restore_missing "$IOU_TGT" "$SCRATCH/iou-target"
         POST=$(post post_same "$IOU_TGT" ino "$IOU_ID") \
-        run_case C59c "io_uring: rename a protected file through a ring" denied "op=rename" 0 -- "$IOU_BIN" --rename "$IOU_TGT" "$IOU_TGT.nn-lab-c59c"
+        run_case C59c "io_uring: rename a protected file through a ring" denied "deny=rename" 0 -- "$IOU_BIN" --rename "$IOU_TGT" "$IOU_TGT.nn-lab-c59c"
     fi
 else
     skipped_case C59a-C59c "no io_uring probe with the tamper modes (see C22)" 0
@@ -1175,16 +1335,16 @@ if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -
     FRESH=$!
     sleep 1
     FRESH_START=$(proc_start "$FRESH")
-    run_case C34 "ptrace attach: /proc/<pid>/mem of a fresh agent binary" denied "op=ptrace" 0 -- nnpy procopen "$FRESH" northnarrow-age "${FRESH_START:-0}" mem 4194304
+    run_case C34 "ptrace attach: /proc/<pid>/mem of a fresh agent binary" denied "deny=ptrace" 0 -- nnpy procopen "$FRESH" northnarrow-age "${FRESH_START:-0}" mem 4194304
     # our own child, still unreaped; signalled only if it is still that process
     nnpy signal "$FRESH" northnarrow-age "${FRESH_START:-0}" TERM >/dev/null 2>&1; wait "$FRESH" 2>/dev/null
-    run_case C35 "nn-admin, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$NNADMIN" --version
-    run_case C36 "a second agent binary, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$AGENT_BIN" --version
-    run_case C37 "a second watchdog binary, preloaded: handle on link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_TARGET="$PINS/link_task_kill" "$WATCHDOG_BIN" --version
+    run_case C35 "nn-admin, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$NNADMIN" --version
+    run_case C36 "a second agent binary, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$AGENT_BIN" --version
+    run_case C37 "a second watchdog binary, preloaded: handle on link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_TARGET="$PINS/link_task_kill" "$WATCHDOG_BIN" --version
     # External audit ATP-013: the twelve ring buffers and RING_DROPS left
     # the eBPF object before the guard listed the agent's maps; by id, a
     # foreign root process got a writable handle on each.
-    run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
+    run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
 else
     skipped_case C34-C37 "cannot build the probe library: $(head -1 "$TMPD/pbf-cc.log" 2>/dev/null)" 0
 fi
@@ -1234,9 +1394,9 @@ if [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BI
     long="$PINS/"
     while (( ${#long} < 280 )); do long+="./"; done
     long+="link_task_kill"
-    run_case C39 "link handle through a $(( ${#long} ))-byte path to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" "$long"
+    run_case C39 "link handle through a $(( ${#long} ))-byte path to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- "$LNK_BIN" "$long"
     ln -sfn "$PINS/link_task_kill" "$TMPD/link-alias"
-    run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|op=bpf_link" 0 -- "$LNK_BIN" "$TMPD/link-alias"
+    run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- "$LNK_BIN" "$TMPD/link-alias"
     rm -f "$TMPD/link-alias"
 else
     skipped_case C39-C40 "cannot build the link probe: $(head -1 "$TMPD/lnk-cc.log" 2>/dev/null)" 0
@@ -1245,7 +1405,7 @@ fi
 # External audit EVD-001: the agent's private signing key — every evidence
 # chain is signed with it — is closed to any reader outside the agent's
 # family, root included; its public half is what verification reads.
-run_case C41 "read the agent's private signing key" denied "op=read" 0 -- nnpy file read "$ETC/agent.sig.key"
+run_case C41 "read the agent's private signing key" denied "deny=read" 0 -- nnpy file read "$ETC/agent.sig.key"
 run_case C42 "verify the audit chain from the public half" allowed "" 0 -- \
     /usr/local/bin/nn-admin audit verify --from "$ETC/audit.log"
 
@@ -1258,14 +1418,14 @@ FSX_SRC="$(dirname "$0")/fsxattr-probe.c"
 FSX_BIN=/usr/local/libexec/nn-lab/nn-fsxattr-probe
 if [[ -f "$FSX_SRC" ]] && mkdir -p "$(dirname "$FSX_BIN")" && cc -O2 -o "$FSX_BIN" "$FSX_SRC" 2>"$TMPD/fsx-cc.log"; then
     POST=$(post post_flag "$STATE" i present) \
-    run_case C44 "fsxattr: clear the immutable flag of the state directory" denied "op=ioctl" 0 -- "$FSX_BIN" "$STATE" -i
+    run_case C44 "fsxattr: clear the immutable flag of the state directory" denied "deny=ioctl" 0 -- "$FSX_BIN" "$STATE" -i
     POST=$(post post_flag "$ETC/audit.log" a absent) \
-    run_case C45 "fsxattr: make audit.log append-only" denied "op=ioctl" 0 -- "$FSX_BIN" "$ETC/audit.log" +a
+    run_case C45 "fsxattr: make audit.log append-only" denied "deny=ioctl" 0 -- "$FSX_BIN" "$ETC/audit.log" +a
 else
     skipped_case C44-C45 "cannot build the fsxattr probe: $(head -1 "$TMPD/fsx-cc.log" 2>/dev/null)" 0
 fi
 POST=$(post post_same "$ETC/netflow-blocklist.v1" hash "$(nnpy fileid "$ETC/netflow-blocklist.v1" hash)") \
-run_case C46 "append to the shipped netflow blocklist" denied "op=write" 0 -- \
+run_case C46 "append to the shipped netflow blocklist" denied "deny=write" 0 -- \
     bash -c "echo '# nn-lab C46' >> $ETC/netflow-blocklist.v1"
 
 # External audit EBPF-015: no new entry in the agent's directories — a
@@ -1276,13 +1436,13 @@ run_case C46 "append to the shipped netflow blocklist" denied "op=write" 0 -- \
 PID=$(agent_pid)
 LSRC=/etc/.nn-lab-c49-src
 echo nn-lab > "$LSRC"
-run_case C47 "mkdir in /etc/northnarrow" denied "op=mkdir" 0 -- mkdir "$ETC/.nn-lab-c47"
-run_case C48 "symlink in /etc/northnarrow" denied "op=symlink" 0 -- ln -s /etc/hostname "$ETC/.nn-lab-c48"
-run_case C49 "hard link into /etc/northnarrow" denied "op=link" 0 -- ln "$LSRC" "$ETC/.nn-lab-c49"
-run_case C50 "FIFO in /etc/northnarrow" denied "op=mknod" 0 -- mkfifo "$ETC/.nn-lab-c50"
-run_case C51 "new file in the state chain directory" denied "op=create" 0 -- bash -c ": > $STATE/detections/.nn-lab-c51"
-run_case C52 "a directory among the bpffs pins" denied "op=mkdir" 0 -- mkdir "$PINS/nn-lab-c52"
-run_case C53 "user.* xattr on admin.pub" denied "op=xattr" 0 -- \
+run_case C47 "mkdir in /etc/northnarrow" denied "deny=mkdir" 0 -- mkdir "$ETC/.nn-lab-c47"
+run_case C48 "symlink in /etc/northnarrow" denied "deny=symlink" 0 -- ln -s /etc/hostname "$ETC/.nn-lab-c48"
+run_case C49 "hard link into /etc/northnarrow" denied "deny=link" 0 -- ln "$LSRC" "$ETC/.nn-lab-c49"
+run_case C50 "FIFO in /etc/northnarrow" denied "deny=mknod" 0 -- mkfifo "$ETC/.nn-lab-c50"
+run_case C51 "new file in the state chain directory" denied "deny=create" 0 -- bash -c ": > $STATE/detections/.nn-lab-c51"
+run_case C52 "a directory among the bpffs pins" denied "deny=mkdir" 0 -- mkdir "$PINS/nn-lab-c52"
+run_case C53 "user.* xattr on admin.pub" denied "deny=xattr" 0 -- \
     python3 -c "import os; os.setxattr('$ETC/admin.pub', 'user.nn_lab', b'1')"
 rm -f "$LSRC"
 if [[ -z "$ONLY" || ",$ONLY," == *",C54,"* ]]; then
@@ -1291,7 +1451,7 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C54,"* ]]; then
     out=$(bash -c "mkdir $ETC/.nn-lab-c54 && rmdir $ETC/.nn-lab-c54 && : > $ETC/.nn-lab-c54f \
         && rm -f $ETC/.nn-lab-c54f && python3 -c \"import os; os.setxattr('$ETC', 'user.nn_lab', b'1'); os.removexattr('$ETC', 'user.nn_lab')\"" 2>&1); rc=$?
     sleep 4; ev=$(evidence "$t0" "$a0" "$d0")
-    if (( rc == 0 )) && ! echo "$ev" | grep -qE "op=(create|mkdir|xattr|unlink|rmdir)"; then
+    if (( rc == 0 )) && ! echo "$ev" | grep -qE "deny=(create|mkdir|xattr|unlink|rmdir)"; then
         v="OK"; st="allowed"
     else
         v="DEVIATION (refused inside the window: $(echo "$out" | head -1 | cut -c1-80))"; fail=1; st="denied"

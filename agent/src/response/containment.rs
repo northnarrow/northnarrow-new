@@ -184,13 +184,13 @@ pub(crate) fn release_to_origin(
         .join(rec.origin.trim_start_matches('/'))
         .join("cgroup.procs");
     if !dest.exists() {
-        warn!(pid, origin = %rec.origin, "the cgroup it came from is gone — left contained");
+        warn!(pid, origin = %common::log_escape::Escaped(&rec.origin), "the cgroup it came from is gone — left contained");
         return Ok(Release::Skipped("the cgroup it came from is gone"));
     }
     match super::block_outbound::write_pid(&dest, pid) {
         Ok(()) => {
             let _ = remove(cfg, pid, scope_name);
-            info!(pid, origin = %rec.origin, scope = scope_name, "released back to the cgroup it came from");
+            info!(pid, origin = %common::log_escape::Escaped(&rec.origin), scope = scope_name, "released back to the cgroup it came from");
             Ok(Release::Released)
         }
         Err(e)
@@ -199,7 +199,7 @@ pub(crate) fn release_to_origin(
                 Some(libc::EBUSY) | Some(libc::EOPNOTSUPP) | Some(libc::ENOENT)
             ) =>
         {
-            warn!(pid, origin = %rec.origin, error = %e, "the cgroup it came from no longer takes processes — left contained");
+            warn!(pid, origin = %common::log_escape::Escaped(&rec.origin), error = %e, "the cgroup it came from no longer takes processes — left contained");
             Ok(Release::Skipped(
                 "the cgroup it came from no longer takes processes",
             ))
@@ -247,7 +247,7 @@ fn reconcile_with(cfg: &ExecutorConfig, start_of: &dyn Fn(u32) -> Option<u64>) -
         warn!(
             pid = e.pid,
             scope = %e.scope,
-            origin = %e.origin,
+            origin = %common::log_escape::Escaped(&e.origin),
             since = e.since,
             "contained by an earlier run of the agent — still in its scope (no automatic release after a restart)"
         );

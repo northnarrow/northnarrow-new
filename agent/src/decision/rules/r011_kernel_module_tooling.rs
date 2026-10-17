@@ -116,8 +116,8 @@ impl Rule for R011KernelModuleTooling {
             rule = "R011_KernelModuleTooling",
             event = "r011_kthread_decision",
             pid = *pid,
-            comm = %comm,
-            parent_comm = %parent_comm,
+            comm = %common::log_escape::Escaped(comm),
+            parent_comm = %common::log_escape::Escaped(parent_comm),
             parent_is_kthread = *parent_is_kthread,
             decision,
             "R011 kernel-module-tooling exec: PF_KTHREAD parent-origin decision"

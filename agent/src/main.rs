@@ -799,11 +799,16 @@ async fn main() -> Result<()> {
     // on the same broken pipe; with `panic = "abort"` the agent died at its
     // next log line, and five such deaths tripped the watchdog's ceiling.
     // A lost log line must never cost the agent.
+    // External audit Wave 3 (journal line injection, lab PR 167): one event
+    // is one journal line whatever it holds, with no colour codes under
+    // journald (common::log_escape).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_ansi(common::log_escape::stdout_ansi())
+        .with_writer(common::log_escape::stdout_one_line)
         .log_internal_errors(false)
         .init();
 
@@ -3263,7 +3268,7 @@ async fn main() -> Result<()> {
                                 if check.state != DecoyState::Intact {
                                     error!(
                                         canary_id = %canary.canary_id,
-                                        name = %canary.name,
+                                        name = %common::log_escape::Escaped(&canary.name),
                                         path,
                                         state = check.state.as_str(),
                                         "canary: the decoy is not what was deployed — changed, \
@@ -4083,6 +4088,10 @@ async fn process_event(
     // arming, verdict context), and every command line on the host, with
     // any secret in its arguments, was copied into the journal. Exec and
     // flow records live in the detection store and the signed netflow log.
+    // External audit Wave 3 (journal line injection, lab PR 167): a value
+    // another user names (comm, file name, DNS name, the rule text quoting
+    // them) is logged through Escaped, quoted when it holds a separator.
+    use common::log_escape::Escaped;
     match &event {
         Event::ProcessSpawn { .. } => debug!(event = ?event, "process spawn detected"),
         Event::ModuleLoad {
@@ -4093,7 +4102,7 @@ async fn process_event(
             ..
         } => info!(
             loader_pid = *loader_pid,
-            loader_comm = %loader_comm,
+            loader_comm = %Escaped(loader_comm),
             method = ?method,
             path = path.as_deref().unwrap_or("none"),
             "kernel module load detected (BUG-034)"
@@ -4108,7 +4117,7 @@ async fn process_event(
             ..
         } => info!(
             pid = *pid,
-            comm = %comm,
+            comm = %Escaped(comm),
             created = *created,
             classes = ?common::io_uring_class_names(*classes),
             count = *count,
@@ -4123,7 +4132,7 @@ async fn process_event(
             ..
         } => info!(
             pid = *pid,
-            comm = %comm,
+            comm = %Escaped(comm),
             cmd = common::wire::bpf_cmd_name(*cmd),
             arg = *arg,
             "bpf() syscall by a non-protected process"
@@ -4134,7 +4143,7 @@ async fn process_event(
             pid,
             ..
         } => {
-            debug!(pid, comm = %comm, filename = %filename, "file open")
+            debug!(pid, comm = %Escaped(comm), filename = %Escaped(filename), "file open")
         }
         Event::MassWrite {
             pid,
@@ -4145,9 +4154,9 @@ async fn process_event(
             ..
         } => info!(
             pid = *pid,
-            comm = %comm,
+            comm = %Escaped(comm),
             overwrites = *count,
-            last = %filename,
+            last = %Escaped(filename),
             "mass write: overwrite threshold crossed by the processes of one cgroup (counted in the kernel)"
         ),
         Event::MassWrite {
@@ -4158,9 +4167,9 @@ async fn process_event(
             ..
         } => info!(
             pid = *pid,
-            comm = %comm,
+            comm = %Escaped(comm),
             count = *count,
-            last = %filename,
+            last = %Escaped(filename),
             "mass write: write-open threshold crossed (counted in the kernel)"
         ),
         Event::ExecCheck {
@@ -4169,7 +4178,7 @@ async fn process_event(
             pid,
             ..
         } => {
-            debug!(pid, comm = %comm, filename = %filename, "exec_check")
+            debug!(pid, comm = %Escaped(comm), filename = %Escaped(filename), "exec_check")
         }
         Event::TcpConnect {
             dst_addr,
@@ -4180,7 +4189,7 @@ async fn process_event(
             ..
         } => {
             debug!(
-                pid, comm = %comm, family,
+                pid, comm = %Escaped(comm), family,
                 dst = %render_addr(*family, dst_addr),
                 dst_port,
                 "tcp_connect"
@@ -4195,9 +4204,9 @@ async fn process_event(
             ..
         } => {
             debug!(
-                pid, comm = %comm,
+                pid, comm = %Escaped(comm),
                 server = %render_addr(*family, dns_server),
-                query = %query_name,
+                query = %Escaped(query_name),
                 "dns_query"
             )
         }
@@ -4208,7 +4217,7 @@ async fn process_event(
             held,
             uid_level,
             ..
-        } => debug!(pid, comm = %comm, held, uid_level, "dns_flood"),
+        } => debug!(pid, comm = %Escaped(comm), held, uid_level, "dns_flood"),
         // External audit EBPF-013: the rule (NN-L-NET-021) reports it.
         Event::SensorFlood {
             source,
@@ -4219,7 +4228,7 @@ async fn process_event(
             ..
         } => debug!(
             pid,
-            comm = %comm,
+            comm = %Escaped(comm),
             source = source.as_str(),
             held,
             uid_level,
@@ -4258,7 +4267,7 @@ async fn process_event(
             };
             if admit.record() {
                 warn!(
-                    pid, uid, comm = %comm,
+                    pid, uid, comm = %Escaped(comm),
                     op = %operation,
                     target_dev, target_ino,
                     "ANTI-TAMPER DENIAL"
@@ -4269,7 +4278,7 @@ async fn process_event(
                     warn!(
                         rule = %verdict.rule_id,
                         severity = ?verdict.severity,
-                        reasoning = %verdict.reasoning,
+                        reasoning = %Escaped(&verdict.reasoning),
                         "VERDICT (rule)"
                     );
                     if let Some(sink) = detection_sink {
@@ -4304,9 +4313,9 @@ async fn process_event(
             // Only integrity-changing ops get the FIM DRIFT line.
             if fe.op == common::wire::FimOp::Opened {
                 debug!(
-                    path = %fe.path,
+                    path = %Escaped(&fe.path),
                     modifier_pid = fe.modifier_pid,
-                    modifier_comm = %fe.modifier_comm,
+                    modifier_comm = %Escaped(&fe.modifier_comm),
                     "fim credential-path read forwarded to rule engine (not drift)"
                 );
             } else if budget_admit("FIM-DRIFT", fe.modifier_uid, &event).record() {
@@ -4314,11 +4323,11 @@ async fn process_event(
                 // line has the per-uid budget (the signed fim_drift.jsonl
                 // row is always written).
                 warn!(
-                    path = %fe.path,
+                    path = %Escaped(&fe.path),
                     op = ?fe.op,
                     modifier_pid = fe.modifier_pid,
                     modifier_uid = fe.modifier_uid,
-                    modifier_comm = %fe.modifier_comm,
+                    modifier_comm = %Escaped(&fe.modifier_comm),
                     "FIM DRIFT"
                 );
             }
@@ -4345,12 +4354,12 @@ async fn process_event(
         } => {
             warn!(
                 canary_id = %canary_id,
-                canary_name = %canary_name,
+                canary_name = %Escaped(canary_name),
                 canary_type = ?canary_type,
                 access_kind = ?access_kind,
                 accessor_pid = %accessor_pid,
                 accessor_uid = %accessor_uid,
-                accessor_comm = %accessor_comm,
+                accessor_comm = %Escaped(accessor_comm),
                 "CANARY TRIPPED"
             );
         }
@@ -4360,7 +4369,7 @@ async fn process_event(
         Event::NetFlow(nf) => {
             debug!(
                 pid = %nf.pid,
-                comm = %nf.comm,
+                comm = %Escaped(&nf.comm),
                 dst_addr = %nf.dst_addr,
                 dst_port = %nf.dst_port,
                 proto = %nf.proto,
@@ -4371,7 +4380,7 @@ async fn process_event(
         Event::NetListener(nl) => {
             info!(
                 pid = %nl.pid,
-                comm = %nl.comm,
+                comm = %Escaped(&nl.comm),
                 bind_addr = %nl.bind_addr,
                 bind_port = %nl.bind_port,
                 "net listener"
@@ -4401,8 +4410,8 @@ async fn process_event(
                 action = ?verdict.action,
                 severity = ?verdict.severity,
                 target_pid = verdict.event_pid,
-                target_filename = %verdict.event_filename,
-                reasoning = %verdict.reasoning,
+                target_filename = %Escaped(&verdict.event_filename),
+                reasoning = %Escaped(&verdict.reasoning),
                 "VERDICT (rule)"
             );
         }
@@ -4587,7 +4596,8 @@ async fn evaluate_and_respond(
         severity = %verdict.severity,
         confidence = verdict.confidence,
         trace_id = %verdict.trace_id,
-        reasoning = %verdict.reasoning.step_5_decision,
+        // Wave 3 (lab PR 167): the model's text, written from attacker strings.
+        reasoning = %common::log_escape::Escaped(&verdict.reasoning.step_5_decision),
         "VERDICT (ADE)"
     );
 

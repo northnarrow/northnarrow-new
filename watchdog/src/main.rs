@@ -62,10 +62,14 @@ async fn main() -> ExitCode {
     // A write to a closed log stream (journald@northnarrow stopped) must
     // not abort the watchdog: the fmt layer's own error report is an
     // `eprintln!` that panics on the same broken pipe (panic = "abort").
+    // External audit Wave 3 (journal line injection, lab PR 167): one
+    // event is one journal line, as in the agent (common::log_escape).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_ansi(common::log_escape::stdout_ansi())
+        .with_writer(common::log_escape::stdout_one_line)
         .log_internal_errors(false)
         .try_init();
 

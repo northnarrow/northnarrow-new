@@ -130,13 +130,13 @@ entry names the lab PR that fixed it.
   the kill, ran on under init with the image from `/tmp`, and a child
   that never execs draws no verdict of its own. Fixed: the rules that
   kill a payload's exec kill its tree (lab PR 166).
-- **Journal line injection.** The agent logged file names, comms and other
+- **Journal line injection — fixed (lab PR 167).** The agent logged file names, comms and other
   strings a local user chooses through tracing's Display, which does not
   escape a newline: a file run from `/tmp` whose name holds one adds a line
   of the user's choosing to the agent's journal (Debian 13, before lab PR
   167: an entry starting `ANTI-TAMPER DENIAL op=signal`, which the
   anti-tamper suite counted as evidence). Found by the Wave 3 re-check;
-  taken with NN-AUD-413 (lab PR 167).
+  fixed with NN-AUD-413 (lab PR 167).
 - **DNS attribution on hosts that resolve through systemd-resolved.** On
   Debian 13 `nsswitch.conf` puts `resolve` before `dns`: `getaddrinfo`
   asks systemd-resolved over varlink and resolved sends the query, so the
@@ -622,7 +622,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-410 | LAB-020 | Low | Lab scripts | S | partly fixed (lab PRs 153, 156); open |
 | NN-AUD-411 | LAB-021 | Low | Lab scripts | — | obsolete (verify-2b.sh deleted, lab PR 153) |
 | NN-AUD-412 | LAB-022 | Low | Lab scripts | S | open |
-| NN-AUD-413 | LAB-023 | Low | Lab scripts | M | open (more reachable than reported) |
+| NN-AUD-413 | LAB-023 | Low | Lab scripts | M | fixed (lab PR 167) |
 | NN-AUD-414 | LAB-024 | Low | Lab scripts | S | partly fixed (C17 fixed in `4672283`); open |
 | NN-AUD-415 | LAB-025 | Low | Lab scripts | S | open |
 | NN-AUD-416 | LAB-026 | Low | Lab scripts | S | partly fixed (lab PR 154 guards some setup); open |
@@ -5579,3 +5579,45 @@ group, the ones an unprivileged user or a local attacker could use first.
     `xattr_dentry_follows_the_kernels_prototype` and
     `setattr_of_another_shape_is_absent_never_guessed` fail.
   - Lab: Debian 13 (6.12, the lab's first kernel from 6.9), setattr164-probe.sh. `main`: outside a trusted-installer window `chmod`, `chown` and `touch` of `/etc/northnarrow/admin.pub` (same mode, owner and times) are allowed (`truncate` and `chattr` refused by other hooks); a mode flip of `/etc/hosts` leaves 0 `AttrChanged` rows; 20,000 held connects closed one by one leave 3,872 netflow rows. This build: all four refused, one `ANTI-TAMPER DENIAL op=setattr` each, allowed inside a window; 1 `AttrChanged` row; 20,000 rows of 20,000, `FLOW_SOCK_MAP` at 20,000 of 65,536 during the hold and 0 forgotten; `--btf-check` checks 28 hook arguments and prints `INODE_SETATTR_DENTRY_ARG compiled=0 runtime=1`; `setfattr` refused in both builds (the control). Ubuntu 24.04 (6.8): the setattr denials in both builds (the control), 3,872 → 20,000 rows the same way. Ubuntu 22.04 (5.15): the agent reads setattr's dentry at argument 0 and the xattr hooks' at 1, 16 of 16 deny hooks attached. A burst of 20,000 closes at one process exit overflows the 256 KiB `tcp_close` ring (16,079 drops, counted in `net status` and the journal): a separate limit, a follow-up. Gate: the integration tree of lab PRs 165, 166, 163, 162 and 164 on `main` b9bf4d5. Ubuntu 22.04 (5.15): 37 suites, 82 passed, 0 failed; anti-tamper suite OK. Debian 13 (6.12, the new guest): 37 suites, 81 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there: Debian 13 resolves through `nss-resolve`, so systemd-resolved sends the query, not the process (a follow-up). Ubuntu 24.04 and Debian 12 ran the tree before lab PR 166 dropped a kill cgroup made ahead (cgroup creation measured at 14 µs, so not worth it): 37 suites, 79 passed, 3 failed each — `honeypot_tamper_e2e`'s three `/etc` baits, whose assertion lab PR 162 then fixed; the suite rerun 6/6 on both; anti-tamper suite OK on 24.04. Host: 2,192 passed, 0 failed.
+- **Wave 3 — journal line injection, lab PR 167.** NN-AUD-413 (LAB-023,
+  Low) and the cross-cutting product finding of the Wave 3 triage: the
+  agent logged values another user names with `%` (Display), and
+  tracing-subscriber 0.3.23 escapes neither `\n` nor `\r` (only ANSI and
+  C1, in the message only), so an unprivileged user who ran a `/tmp` file
+  named `x\nANTI-TAMPER DENIAL … op=signal` made the journal show a whole
+  entry the agent never wrote, which the anti-tamper suite then counted.
+  - Product: `common::log_escape`. `Escaped` prints a plain value as it is
+    and quotes, logfmt style, a value with a space, `"`, `=`, `\` or a
+    control (C0, DEL, C1, line and bidi separators), escaping them; every
+    field that carries a name another user chose goes through it (`comm`
+    and `*_comm`, `filename` and `*_filename`, FIM paths and symlink hops,
+    DNS query names, canary names, rule and ADE reasoning, the staged exec
+    image, the quarantined binary's path, a contained process's origin
+    cgroup, the admin restore path and release detail). `OneLine` is the
+    fmt layer's writer in the agent and the watchdog: one event, one line
+    (every control byte but the final newline escaped, ESC too since the
+    journal gets no colours, a line over 16 KiB cut below journald's
+    `LineMax`), the backstop for an error that quotes a path or a
+    `format!` message. `agent/tests/journal_fields.rs`: a VERDICT line with
+    a forged file name stays one line (with `Escaped` and through the
+    guard alone), and a scan of the agent's and watchdog's log calls
+    refuses `%` on those field names without `Escaped` (and `{comm}`-style
+    captures), with a self-test of the scan.
+  - Lab (NN-AUD-413): `anti-tamper.sh` reads the evidence with the
+    `python3 -I` helper (`cmd_evidence`) from the signed records: the rule
+    ids of the detections after line d0 and, for NN-L-AT-001, the refused
+    operation (`deny=<op>`, from the new optional `operation` field of the
+    detection record; absent elsewhere, so existing records verify), and
+    the audit ops after line a0 with their markers (`prev_run_abrupt`,
+    `unauthorized_overlay`, `unit_shadowed`, read as key and value of the
+    parsed entry). The journal gives only `errors=`: entries of the agent
+    unit's own stdout (`_SYSTEMD_UNIT`, `_TRANSPORT`, set by journald)
+    whose level field is ERROR. The `op=` expectations read `deny=`; C24
+    checks `config_overlay_set` in `audit.log` and no
+    `unauthorized_overlay` at the restart (`EV_FORBID`): the store raises
+    the rollback floor to its signature, so the boot that applies it
+    writes no `config_overlay_accepted` (found in the Ubuntu 24.04 gate;
+    a per-run comment makes the overlay's bytes new). `--selftest`: 40 checks, among them
+    the evidence of scratch records with a forged comm, a file name
+    holding `op=signal`, a journal entry from another unit or transport.
+  - Lab: Debian 13 (6.12), journal167-probe.sh — before: the build of lab PRs 162–166; after: this lot on top. Before: a file run from `/tmp` as user nn, named `a` + newline + `ANTI-TAMPER DENIAL op=signal` (a path component of the exec identity holds 31 bytes), gave a journal entry starting with that text, and `anti-tamper.sh --only C13` counted it (`journal:[op=signal×1 …]`, DEVIATION). After: no entry starts with it; the VERDICT line carries `target_filename="/tmp/nn167.<nonce>.a/a\nANTI-TAMPER DENIAL op=signal"`, quoted and escaped; the C13 row reads `journal:[errors=0]`, its evidence from the signed records, OK. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.

@@ -363,6 +363,15 @@ fn file_from_event(event: &Event) -> Option<String> {
     }
 }
 
+/// The refused operation of an anti-tamper denial
+/// ([`DetectionRecord::operation`]); `None` for every other event.
+fn operation_from_event(event: &Event) -> Option<String> {
+    match event {
+        Event::FsProtectDenial { operation, .. } => Some(operation.to_string()),
+        _ => None,
+    }
+}
+
 /// The subject of a detection for the per-rule budget's held report
 /// ([`crate::detection_budget`]): `(key, text)`. The key is what the
 /// detection is about — its file, else its executable, else the acting
@@ -462,6 +471,14 @@ pub struct DetectionRecord {
     /// Mapped from the event by [`file_from_event`]; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// The operation an anti-tamper hook refused (`signal`, `ptrace`,
+    /// `write`, `unlink`, `bpf_map`, …), for the NN-L-AT-001 records of a
+    /// kernel denial; absent otherwise. External audit NN-AUD-413 (lab PR
+    /// 167): the adversarial check reads what was refused from this signed
+    /// record, not from the journal, where another user could write a line
+    /// that looked like the agent's. Absent-on-`None`, like [`Self::file`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
 }
 
 impl DetectionRecord {
@@ -501,6 +518,7 @@ impl DetectionRecord {
             explanation: None,
             suppressed_before: None,
             file: file_from_event(event),
+            operation: operation_from_event(event),
         }
     }
 
@@ -539,6 +557,7 @@ impl DetectionRecord {
             explanation: None,
             suppressed_before: None,
             file: file_from_event(event),
+            operation: operation_from_event(event),
         }
     }
 }
@@ -1605,6 +1624,7 @@ mod tests {
             explanation: None,
             suppressed_before: None,
             file: None,
+            operation: None,
         };
         assert_roundtrip(&record);
     }
@@ -2035,6 +2055,12 @@ mod tests {
             "denied in kernel (anti-tamper LSM hook)".to_string(),
         );
         assert!(r.acted());
+        // NN-AUD-413: the signed record names what was refused.
+        assert_eq!(r.operation.as_deref(), Some("unlink"));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""operation":"unlink""#), "{json}");
+        // the chain verifier re-serialises the decoded record
+        assert_roundtrip(&r);
         let r = DetectionRecord::from_rule(
             2,
             now_ts(),
@@ -2044,6 +2070,10 @@ mod tests {
             "none".to_string(),
         );
         assert!(!r.acted());
+        assert_eq!(r.operation, None);
+        assert!(!serde_json::to_string(&r)
+            .unwrap()
+            .contains(r#""operation":"#));
     }
 
     /// `suppressed_before` is absent unless something was held back, so
@@ -2423,6 +2453,7 @@ mod tests {
             explanation: None,
             suppressed_before: None,
             file: None,
+            operation: None,
         }
     }
 

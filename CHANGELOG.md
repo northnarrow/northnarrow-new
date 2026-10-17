@@ -61,6 +61,48 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, journal line injection (Low NN-AUD-413 LAB-023,
+  and the cross-cutting finding of the Wave 3 triage; lab PR 167). The
+  agent logged values another user names with `%` (Display) —
+  `target_filename`, `filename`, `comm`, the rule's `reasoning`, DNS
+  names — and tracing-subscriber 0.3 escapes neither `\n` nor `\r`: any
+  local user could run a file in `/tmp` named `x\nANTI-TAMPER DENIAL …
+  op=signal` and the journal showed a whole entry the agent never wrote.
+  The new `common::log_escape` has two layers. `Escaped` renders such a
+  value: as it is when plain (`comm=bash`, `path=/etc/passwd`), quoted
+  logfmt-style with `\n`, `\r`, `\t`, `"`, `\` and the controls escaped
+  when it holds a space, `"`, `=`, `\` or a control, so it can neither end
+  the line nor pass for another field; every such field of the agent goes
+  through it (comm of any process, the files it runs, opens or writes, FIM
+  paths and symlink hops, DNS query names, canary names, rule and model
+  reasoning, the quarantined binary, a contained process's cgroup, the
+  admin socket peer). `OneLine`, the writer of the agent's and the
+  watchdog's fmt layer, writes every event as one line whatever it holds
+  (an error quoting a path, a `format!` message): each control byte but
+  the final newline escaped (`\n`, `\xNN`), a line over 16 KiB cut below
+  journald's `LineMax`. The test `journal_fields` formats a VERDICT line
+  with a forged name and checks it stays one line, and scans the agent's
+  and watchdog's sources: a new `%` on one of those field names without
+  `Escaped` fails it. Lab side: `anti-tamper.sh` built a case's evidence
+  from journal text (`ANTI-TAMPER DENIAL .*op=`, `VERDICT (rule) rule=`
+  anywhere in a line); it now reads the signed records with `python3 -I`
+  — the NN-L-AT-001 detections after line d0 (rule ids and the refused
+  operation, `deny=<op>`), the audit ops — and keeps the journal only for
+  `errors=`, counted on the agent unit's own stdout entries by their level
+  field. NN-L-AT-001 records name the refused operation in a new optional
+  `operation` field (absent on other records, so existing records keep
+  chain-verifying). **Regressions / format changes:** the journal lines of
+  the agent and the watchdog carry no ANSI colour codes any more (they are
+  kept on a terminal); a value holding a separator is quoted — `reasoning`
+  on `VERDICT` lines always is (`reasoning="…"`); a control character in
+  any line reads `\n`, `\x07`; a line over 16 KiB ends in `[cut: N more
+  bytes]`. The suite's evidence column reads `deny=signal×1` (from
+  detections) where it read `op=signal×1` (from the journal), its journal
+  part only `errors=`, and C24 checks the store (`config_overlay_set`)
+  and no `unauthorized_overlay` at the restart in `audit.log` (the store
+  raises the rollback floor, so the boot writes no
+  `config_overlay_accepted`). An `nn-admin` older than the agent reports NN-L-AT-001 records
+  with `operation` as broken (upgrade the three binaries together).
 
 - Dependencies: `zip` 9.0.4 instead of 7.2.0 (RUSTSEC-2026-0367,
   RUSTSEC-2026-0368, RUSTSEC-2026-0369: `ZipArchive::extract` kept
