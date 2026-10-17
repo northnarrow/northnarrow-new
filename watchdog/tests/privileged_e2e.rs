@@ -381,6 +381,11 @@ impl E2eFixture {
     /// (race-free unprotect — without this the LSM hook denies
     /// the SIGKILL), then SIGKILL.
     fn unprotect_and_sigkill_agent(&self, agent_pid: u32) {
+        self.unprotect_and_signal_agent(agent_pid, "-9");
+    }
+
+    /// [`Self::unprotect_and_sigkill_agent`] with any `kill` signal flag.
+    fn unprotect_and_signal_agent(&self, agent_pid: u32, signal: &str) {
         // Unprotect, then SIGKILL — and RETRY. The watchdog performs a
         // "defensive PROTECTED_PIDS reinsert" right after it observes
         // the new pidfile, i.e. at the very moment this test also sees
@@ -417,7 +422,7 @@ impl E2eFixture {
             // launched the agent under sudo).
             let killed = Command::new("sudo")
                 .arg("kill")
-                .arg("-9")
+                .arg(signal)
                 .arg(agent_pid.to_string())
                 .stderr(Stdio::null())
                 .status()
@@ -427,8 +432,9 @@ impl E2eFixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "could not SIGKILL agent pid {agent_pid} after {attempts} attempts in 10 s: \
-                 the task_kill hook keeps denying it (PROTECTED_PIDS eviction not taking effect?)"
+                "could not signal ({signal}) agent pid {agent_pid} after {attempts} attempts in \
+                 10 s: the task_kill hook keeps denying it (PROTECTED_PIDS eviction not taking \
+                 effect?)"
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -732,6 +738,134 @@ fn watchdog_respawns_agent_3_cycles_with_backoff() {
     assert!(
         pids.contains(&final_pid),
         "final agent PID {final_pid} not in PROTECTED_PIDS: {pids:?}"
+    );
+
+    // External audit WDG-010 (NN-AUD-360): the agents the exec backend
+    // respawned (cycles 1 and 2 killed two of them) were never waited for
+    // and stayed zombie children of the watchdog. Each is collected before
+    // the next respawn, so none is left once the new pidfile appeared.
+    let watchdog_pid = fs::read_to_string(fx.watchdog_pidfile())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .expect("watchdog pidfile");
+    let zombies = zombie_children_of(watchdog_pid);
+    assert!(
+        zombies.is_empty(),
+        "zombie children of the watchdog (pid {watchdog_pid}): {zombies:?}"
+    );
+}
+
+/// Pids in state `Z` whose parent is `ppid` (`/proc/<pid>/stat`: the
+/// fields after the parenthesised comm are state, then ppid).
+fn zombie_children_of(ppid: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut f = rest.split_whitespace();
+        let (state, parent) = (f.next(), f.next().and_then(|p| p.parse::<u32>().ok()));
+        if state == Some("Z") && parent == Some(ppid) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+// ── External audit WDG-007: a removed admin socket ─────────────────
+
+/// External audit WDG-007 (NN-AUD-358): root could remove the agent's
+/// admin socket and then stop the agent (here SIGSTOP after unprotecting
+/// it; on a host, a cgroup freeze): the watchdog read the missing socket as
+/// "never came up" and never recovered the agent. Now (1) a running agent
+/// binds its socket again within one check (10 s), and (2) once the agent
+/// answered, a socket that stays away is reported (a `watchdog.hold` line,
+/// reason `admin_socket_vanished`) and, on the third ping without it, the
+/// agent is recovered like a hang: a new agent runs.
+#[test]
+fn a_removed_admin_socket_is_rebound_and_a_stopped_agent_recovered() {
+    let mut fx = E2eFixture::setup();
+    let pid0 = fx.spawn_agent();
+    fx.spawn_watchdog();
+    let watchdog_started = Instant::now();
+    let socket = fx.admin_socket();
+    let ino = |p: &Path| {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(p).ok().map(|m| m.ino())
+    };
+
+    // (1) A running agent binds it again. Its first bind is waited for: the
+    // agent opens its admin plane late in its boot (seconds on a slow guest:
+    // the Debian 12 gate of lab PRs 167-171 read it too early).
+    let bound_by = Instant::now() + Duration::from_secs(30);
+    let first = loop {
+        if let Some(i) = ino(&socket) {
+            break i;
+        }
+        assert!(
+            Instant::now() < bound_by,
+            "admin socket bound by the agent within 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let removed = Command::new("sudo")
+        .args(["rm", "-f"])
+        .arg(&socket)
+        .status()
+        .expect("sudo rm");
+    assert!(removed.success());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let again = loop {
+        if let Some(i) = ino(&socket) {
+            break i;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent did not bind its admin socket again within 20 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_ne!(again, first, "a new socket file");
+
+    // (2) The watchdog's first ping (30 s after its start) is answered;
+    // then the agent stops and its socket goes.
+    let answered_by = watchdog_started + Duration::from_secs(38);
+    if let Some(wait) = answered_by.checked_duration_since(Instant::now()) {
+        std::thread::sleep(wait);
+    }
+    fx.unprotect_and_signal_agent(pid0, "-STOP");
+    let removed = Command::new("sudo")
+        .args(["rm", "-f"])
+        .arg(&socket)
+        .status()
+        .expect("sudo rm");
+    assert!(removed.success());
+    // Three pings 30 s apart, SIGINT + 5 s grace + SIGKILL, the respawn's
+    // pidfile wait: under 3 minutes.
+    let new_pid = new_agent_pid(&fx, pid0, Duration::from_secs(180)).unwrap_or_else(|| {
+        panic!("the stopped agent {pid0} without its admin socket was never recovered")
+    });
+    assert_ne!(new_pid, pid0);
+    let holds = fx.tempdir_path().join("watchdog.hold");
+    let out = Command::new("sudo")
+        .arg("cat")
+        .arg(&holds)
+        .output()
+        .expect("sudo cat");
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("\"reason\":\"admin_socket_vanished\""),
+        "no admin_socket_vanished record in {}: {body}",
+        holds.display()
     );
 }
 

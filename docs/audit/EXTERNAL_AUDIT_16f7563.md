@@ -451,7 +451,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-239 | ASK-013 | Low | Admin socket | S | open |
 | NN-AUD-240 | ASK-014 | Low | Admin socket | S | partly fixed (exit now signed, lab PR 138); open |
 | NN-AUD-241 | ASK-015 | Low | Admin socket | S | open |
-| NN-AUD-242 | ASK-016 | Low | Admin socket | S | open |
+| NN-AUD-242 | ASK-016 | Low | Admin socket | S | fixed (lab PR 170) |
 | NN-AUD-243 | ASK-017 | Low | Admin socket | S | open (latent) |
 | NN-AUD-244 | AUT-001 | Low | Admin auth | S | open (latent) |
 | NN-AUD-245 | AUT-005 | Low | Admin auth | S | open |
@@ -567,13 +567,13 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-355 | SNS-012 | Low | Sensors | — | declined (a boot without BTF already fails closed, review 53) |
 | NN-AUD-356 | SNS-013 | Low | Sensors | — | already fixed (lab PR 115) |
 | NN-AUD-357 | SNS-014 | Low | Sensors | M | open |
-| NN-AUD-358 | WDG-007 | Low | Watchdog tooling | M | open |
-| NN-AUD-359 | WDG-008 | Low | Watchdog tooling | S | partly fixed (lab PR 149); open |
-| NN-AUD-360 | WDG-010 | Low | Watchdog tooling | S | open |
+| NN-AUD-358 | WDG-007 | Low | Watchdog tooling | M | fixed (lab PR 170) |
+| NN-AUD-359 | WDG-008 | Low | Watchdog tooling | S | fixed (lab PR 170) |
+| NN-AUD-360 | WDG-010 | Low | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-361 | WDG-012 | Low | Watchdog tooling | S | partly fixed (lab PR 105); open |
 | NN-AUD-362 | WDG-013 | Low | Watchdog tooling | — | already fixed (lab PR 160) |
 | NN-AUD-363 | WDG-014 | Low | Watchdog tooling | S | open |
-| NN-AUD-364 | WDG-015 | Low | Watchdog tooling | S | open (agent pidfile too) |
+| NN-AUD-364 | WDG-015 | Low | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-365 | WDG-016 | Low | Watchdog tooling | S | open |
 | NN-AUD-366 | WDG-017 | Low | Watchdog tooling | S | open |
 | NN-AUD-367 | WDG-018 | Low | Watchdog tooling | S | open |
@@ -646,7 +646,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
 | NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | open (Info) |
 | NN-AUD-436 | SNS-015 | Info | Sensors | S | open |
-| NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | open (doc only) |
+| NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | open |
 | NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | open |
 | NN-AUD-440 | DEP-020 | Info | Deploy | S | open |
@@ -5776,3 +5776,131 @@ group, the ones an unprivileged user or a local attacker could use first.
     the redirection made by the caller's shell — `EACCES` on the 0640
     file; it reads the file through `sudo` now.
   - Lab: Debian 13 (6.12), auditexp169-probe.sh — before: the build of lab PRs 162–166; after: this lot on top, installed with `install.sh --upgrade`. Before: `audit.log` and `chain_heads.json` 0644, read by user nn; the chain logs 0644, closed only by their 0700 directory (copies made with `cp -a` read by nn); the telemetry probe's datagram a recursive query naming the agent's pid, forwarded upstream by a dnsmasq on 127.0.0.1:53. After: 0640 and 0600, EACCES for nn, the copies 0600; `nn-admin audit verify` as root OK and `nn-admin audit read` as nn EACCES (the declared regression); 5 of 5 probe datagrams flagged as responses with a random nonce, none forwarded (the control query was), none on the NIC, no telemetry gap. Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.
+- **Wave 3 — watchdog supervision, lab PR 170.** NN-AUD-358 (WDG-007,
+  Low), NN-AUD-360 (WDG-010, Low), NN-AUD-359 (WDG-008, Low; partly fixed
+  by lab PR 149), NN-AUD-364 (WDG-015, Low) and NN-AUD-437 (WDG-019,
+  Informational): batch 1 of the Wave 3 watchdog triage, "supervision
+  cannot be blinded or degraded quietly".
+  - WDG-007: `/run/northnarrow` is outside the inode deny set, so root
+    could remove `admin.sock` and then freeze the agent's cgroup (allowed,
+    anti-tamper C15): the watchdog read ENOENT as "never came up" — never a
+    hang, by design since the 2026-10-08 restart loop — and its STATUS ping,
+    the only thing that recovers a frozen agent, stopped counting; the
+    agent's `agent_stalled` came only after a thaw, and the socket was never
+    bound again. More reachable than the audit assumed (no SIGSTOP needed).
+    Not the audit's "check liveness another way after N absences": the
+    watchdog's `StatusPingTracker` remembers whether the agent it watches
+    answered (set by an answer, cleared on a new agent). Before an answer,
+    nothing at the path stays `SocketAbsent` (no recovery, the 2026-10-08
+    case); after one it is `SocketVanished`: a WARN on the first ping, on
+    the second (`STATUS_PING_VANISHED_TAMPER_AFTER` = 2, ≥ 30 s) an ERROR on
+    `watchdog.tamper` and a `HoldRecord` line with reason
+    `admin_socket_vanished` in `watchdog.hold`, which the agent signs as
+    `integrity_drift` kind `admin_socket_vanished` (a frozen agent's
+    successor, at its first round), on the third (`…_STUCK_AFTER` = 3, ≥ 60
+    s; the triage's 4 assumed a check in the 30 s self-integrity round) the
+    stuck signal and the existing recovery ladder. Not on the first ping: a
+    ping can land between the agent's clean unlink at shutdown and its
+    exit. ECONNREFUSED and ENOTDIR are "nothing listens" too (a stale
+    socket, a file or a directory at the path): they were a hang, so an
+    agent without admin plane next to a stale socket file was restarted
+    every minute, and a directory at the path would have looped after a
+    first recovery. The ping checks `SO_PEERCRED`: an answer from any pid
+    but the supervised agent's is `NotTheAgent`, counted as nothing
+    listening (a root process could bind the path and answer STATUS for a
+    frozen agent). The main loop publishes "no agent" from a death to the
+    next agent, so a hold's or a respawn's missing socket is never read as
+    a removal. Agent side (`admin_socket::socket_watch`): `bind` records the
+    socket's `(st_dev, st_ino)`; every 10 s (`SOCKET_CHECK_EVERY`, in the
+    accept loop's `select!`) an lstat of the path — removed, or replaced by
+    a link, a file, a directory or another socket — is one signed
+    `integrity_drift` (`admin_socket_removed`, detail with the rebind's
+    outcome; at most one per `REREPORT_SECS` = 600 s, the others counted
+    into the next), and the socket is bound again and served at once; a
+    rebind that fails is retried each check, reported once. The bind
+    removes what sits at the path by `symlink_metadata` (a dangling link
+    made `bind` fail with EADDRINUSE; a directory is refused, not deleted),
+    creates a missing parent 0700 and sets 0600 through an `O_PATH |
+    O_NOFOLLOW` descriptor (`/proc/self/fd`), never on what a swap put at
+    the name — the remaining part of ASK-014 (NN-AUD-240) in substance,
+    whose own lot keeps `unlink_socket` and the tests it names.
+    `unlink_socket` stops the watch first, so the agent does not bind its
+    socket again on the way out. Regression: a running agent whose socket
+    cannot be bound again (a directory planted at the path) is restarted
+    once by the watchdog ~90 s later; its successor runs without admin
+    plane (recorded, as before) and never answers, so it is not restarted
+    again.
+  - WDG-015: `write_pidfile_atomic` (watchdog, `<pidfile>.tmp`,
+    `create+truncate`) and the agent's `write_pid_file`
+    (`agent.pid.tmp.<pid>`, `fs::write`; adjacent, not in the audit) wrote
+    through a link planted at a predictable name in `/run/northnarrow` —
+    as the processes the hooks trust (the AUT-003 pattern). The AUT-003
+    writer moved to `common::atomic_file` (`replace`, plus `write_pidfile`
+    for both daemons; `O_CREAT | O_EXCL` never follows a link and std opens
+    `O_CLOEXEC`, so `common` needs no `libc`); `agent::atomic_file`
+    re-exports it. The temporaries are `.agent.pid.tmp` and
+    `.watchdog.pid.tmp`.
+  - WDG-008 (exec backend only): the capture from `/proc/<pid>/cmdline` is
+    kept at `agent.argv` beside the agent pidfile (0600, the safe writer),
+    and a later watchdog start that cannot read `/proc` (the agent exited
+    between the pidfd open and the capture) uses it with argv[0] the
+    verified binary; it is read only as a regular file (`O_NOFOLLOW |
+    O_NONBLOCK`) of the watchdog's user, closed to others, ≤ 64 KiB. Either
+    fallback (record, or the minimal argv when there is none) is a WARN
+    and a `respawn_argv_degraded` line the agent signs, with the argv used
+    (a root-planted record is therefore in the signed chain). Not
+    `/var/lib/northnarrow` as the audit proposed (the inode deny set
+    refuses the watchdog there), and no refusal to start without a record
+    (no respawn at all). `exec_argv` moved to the library
+    (`exec_respawn_argv`).
+  - WDG-010 (exec backend only): once the pidfd reports the agent's exit
+    the main loop collects it through that pidfd (`reap_agent`:
+    `waitid(P_PIDFD, fd, WEXITED | WNOHANG)`, libc 0.2.190; ECHILD — an
+    agent systemd or an operator started — is the normal case and
+    ignored); every respawned agent stayed a zombie child of the watchdog.
+  - WDG-019: comment only — `open_agent_pidfd_with_retry` retries every
+    error to the deadline; failing fast on EACCES would turn the WDG-003
+    boot-order race into a watchdog exit loop.
+  - Tests: watchdog `socket_never_seen_is_not_stuck`,
+    `socket_vanished_after_an_answer_feeds_recovery`,
+    `a_socket_that_comes_back_ends_the_vanished_streak`,
+    `reset_forgets_the_answer`,
+    `nothing_listening_at_the_path_is_absent_not_unresponsive` (stale
+    socket, file, directory, dangling link),
+    `a_status_answer_from_another_process_is_not_the_agent`,
+    `write_pidfile_atomic_replaces_a_planted_link`, `reap_ignores_echild`,
+    `reap_collects_an_exited_child_through_its_pidfd`,
+    `reap_leaves_a_running_child_alone`,
+    `exec_argv_records_the_capture_and_prefers_it_later`,
+    `exec_argv_records_a_degraded_fallback`,
+    `a_planted_argv_record_is_not_used`; agent
+    `admin_socket_inode_change_is_a_finding`,
+    `a_link_at_the_socket_path_is_removed_not_followed`,
+    `a_path_that_cannot_be_rebound_is_reported_once`,
+    `a_retired_socket_is_not_bound_again`,
+    `bind_creates_a_missing_parent_closed_to_others`,
+    `a_removed_admin_socket_is_bound_again_and_answers` (through the serve
+    loop), `the_agent_pidfile_is_not_written_through_a_planted_link`,
+    `watchdog_events_are_signed_under_their_own_kind`,
+    `an_event_reported_between_rounds_is_signed`. Privileged e2e (not run
+    on the host): `watchdog_respawns_agent_3_cycles_with_backoff` asserts
+    no zombie child of the watchdog after three exec respawns;
+    `a_removed_admin_socket_is_rebound_and_a_stopped_agent_recovered`
+    (the agent rebinds a removed socket; an agent unprotected and SIGSTOPped
+    without its socket is recovered and `watchdog.hold` holds
+    `admin_socket_vanished`).
+  - Found by this lot's e2e and fixed here, NN-AUD-242 (ASK-016, Low):
+    `DebugForcePosture` and `DebugForcePostureAck`, compiled with
+    `debug-trigger` only, sat in the middle of `AdminMessage` and shifted
+    the postcard discriminant of every later variant: the e2e's watchdog
+    (built without the feature) decoded the lab agent's `StatusResponse`
+    as another variant ("postcard decode failed"), never counted a ping
+    answered, and so never recovered the stopped agent. Both are the last
+    variants now (production discriminants unchanged; new production
+    variants go above them), `production_discriminants_do_not_depend_on_debug_trigger`
+    pins the production ones in both feature sets (it fails on the old
+    order with `debug-trigger`: `ShutdownResult` reads 9, not 7;
+    `StatusResponse` 6, not 5), and CI
+    runs the wire tests with `debug-trigger`. The e2e also waits for the
+    agent's first bind (up to 30 s) before removing the socket.
+  - Lab: Debian 13 (6.12), wdg170-probe.sh — before: the build of lab PRs 162–169; after: this lot on top. Before: with links planted at the pidfile temporaries the watchdog failed to start (its unit stuck in `activating`); `rm /run/northnarrow/admin.sock` left the socket gone for good and `nn-admin status` failing (rc 5) until a reboot. After: the links replaced, not followed, both pidfiles regular files, the units active; the removed socket back within 5 s (mode 0600) with a signed `integrity_drift` `admin_socket_removed`; the agent's cgroup frozen and the socket removed: the watchdog WARN at the first ping, `watchdog.tamper` and the hold line at the second, the stuck recovery at the third (SIGINT, then SIGKILL of the frozen task), a new agent 70 s after the removal that signs `admin_socket_vanished`, `nn-admin status` rc 0. Not covered: a watchdog restarted after the socket was removed has never seen it answer, so it does not count the agent as stuck (the first run of the probe did that, and nothing recovered). Gate: the integration tree of lab PRs 167–171 on `main` 039830a, rebased without code changes on `main` da9f74a (zip 9, the rpm key). Ubuntu 24.04 and Debian 12: 38 suites, 82 passed, 1 failed each — lab PR 170's new watchdog e2e, which read the socket before the agent's first bind and then found NN-AUD-242 (both fixed in lab PR 170); the watchdog suite rerun 8/8 on both. Anti-tamper suite on a freshly booted 24.04: OK (C24's evidence fixed in lab PR 167); `upgrade-check` OK (lab PR 169's fix). Host: 2,249 passed, 0 failed.

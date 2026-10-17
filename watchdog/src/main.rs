@@ -32,12 +32,6 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
-    agent_argv_from_proc, classify_ping_error, hold_record_path, off_runtime, ping_ticker,
-    record_hold, respawn_agent_off_runtime, select_backend, systemctl_unit_state,
-    systemd_is_booted, PingFailure, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER,
-    SYSTEMD_RUNTIME_DIR, UNIT_STATE_TIMEOUT,
-};
-use northnarrow_watchdog::{
     check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
     log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited, ping_agent_status,
     process_start_unix, register_self_pid, reinsert_new_agent_pid, sd_notify_ready,
@@ -46,6 +40,12 @@ use northnarrow_watchdog::{
     ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN, HOLD_POLL,
     PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
     STUCK_RECOVERY_HARDKILL_GRACE,
+};
+use northnarrow_watchdog::{
+    classify_ping_error, exec_respawn_argv, hold_record_path, off_runtime, ping_ticker, reap_agent,
+    record_hold, respawn_agent_off_runtime, select_backend, systemctl_unit_state,
+    systemd_is_booted, PingFailure, Reaped, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER,
+    STATUS_PING_VANISHED_TAMPER_AFTER, SYSTEMD_RUNTIME_DIR, UNIT_STATE_TIMEOUT,
 };
 
 /// Deadline budget for the post-respawn pidfile-readiness wait.
@@ -133,12 +133,15 @@ async fn run(cli: Cli) -> Result<()> {
         systemd_is_booted(std::path::Path::new(SYSTEMD_RUNTIME_DIR)),
         &cli.agent_unit,
         || {
-            exec_argv(
+            // External audit WDG-008: the capture is recorded for a later
+            // start of the watchdog, and a fallback is signed by the agent.
+            Ok(exec_respawn_argv(
                 agent_pid,
                 cli.agent_bin.as_deref(),
                 &agent_bin,
                 &cli.agent_pidfile,
-            )
+                &hold_record_path(&cli.shutdown_marker),
+            ))
         },
     )?;
 
@@ -192,10 +195,20 @@ async fn run(cli: Cli) -> Result<()> {
     // changes (`current_agent`), and the main loop drops a signal for an
     // agent that is gone — a timeout buffered while the old agent was
     // dying used to SIGINT, evict and SIGKILL the healthy new one.
+    //
+    // External audit WDG-007: `None` while no agent runs (from its death to
+    // the next one), so the ping task neither pings a dead agent's socket
+    // nor reads a hold's missing socket as a removal.
     let (stuck_tx, mut stuck_rx) = tokio::sync::mpsc::channel::<u32>(4);
-    let (current_agent, agent_watch) = tokio::sync::watch::channel(agent_pid);
+    let (current_agent, agent_watch) = tokio::sync::watch::channel(Some(agent_pid));
     let ping_socket = cli.admin_socket.clone();
-    let ping_handle = tokio::spawn(run_ping_loop(ping_socket, stuck_tx, agent_watch));
+    let ping_holds = hold_record_path(&cli.shutdown_marker);
+    let ping_handle = tokio::spawn(run_ping_loop(
+        ping_socket,
+        ping_holds,
+        stuck_tx,
+        agent_watch,
+    ));
 
     // W4 restart loop. Each iteration:
     //   1. Park on {SIGTERM, SIGINT, agent pidfd POLLIN}
@@ -273,6 +286,31 @@ async fn run(cli: Cli) -> Result<()> {
                     agent_pid,
                     "agent pidfd POLLIN — agent has exited; running layer-2 evict"
                 );
+                // External audit WDG-007: no agent to ping until the next.
+                current_agent.send_replace(None);
+                // External audit WDG-010: an agent the exec backend started
+                // is our child — collect it, or it stays a zombie.
+                match reap_agent(&agent_pidfd) {
+                    Ok(Reaped::Collected { pid, si_code, code }) => info!(
+                        target: "watchdog.respawn",
+                        pid,
+                        si_code,
+                        code,
+                        "exited agent collected (exec backend child)"
+                    ),
+                    Ok(Reaped::NotOurChild) => {}
+                    Ok(Reaped::Running) => debug!(
+                        target: "watchdog.respawn",
+                        agent_pid,
+                        "agent reported exited but not yet collectable"
+                    ),
+                    Err(e) => debug!(
+                        target: "watchdog.respawn",
+                        error = %e,
+                        agent_pid,
+                        "waitid on the agent pidfd failed"
+                    ),
+                }
                 match evict_dead_agent(&cli.bpffs_root, agent_pid) {
                     Ok(report) => info!(
                         target: "watchdog.layer2_evict",
@@ -484,11 +522,11 @@ async fn run(cli: Cli) -> Result<()> {
 /// External audit WDG-002: a new agent is watched — tell the ping task,
 /// and drop the stuck signals raised against the previous one.
 fn new_generation(
-    current: &tokio::sync::watch::Sender<u32>,
+    current: &tokio::sync::watch::Sender<Option<u32>>,
     stuck_rx: &mut tokio::sync::mpsc::Receiver<u32>,
     pid: u32,
 ) {
-    current.send_replace(pid);
+    current.send_replace(Some(pid));
     while stuck_rx.try_recv().is_ok() {}
 }
 
@@ -497,38 +535,6 @@ enum SelectOutcome {
     AgentDied(Result<()>),
     /// External audit WDG-002: a stuck signal for an earlier agent.
     StaleStuck(u32),
-}
-
-/// Argv for the exec backend: the agent's full `/proc/<pid>/cmdline`
-/// (with `--agent-bin` overriding argv[0]); if /proc is unreadable
-/// (observer registration not yet arrived), fall back to the legacy
-/// minimal reconstruction so a non-systemd host still gets SOME
-/// respawn rather than none — logged loudly, because that argv drops
-/// every flag. External audit WDG-009: the fallback names `verified_bin`,
-/// the binary the agent was just verified to run (WDG-003); it no longer
-/// re-reads `/proc/<pid>/exe` in a 60 s `std::thread::sleep` loop.
-fn exec_argv(
-    agent_pid: u32,
-    agent_bin: Option<&std::path::Path>,
-    verified_bin: &std::path::Path,
-    pidfile: &std::path::Path,
-) -> Result<Vec<String>> {
-    match agent_argv_from_proc(agent_pid, agent_bin) {
-        Ok(argv) => Ok(argv),
-        Err(e) => {
-            warn!(
-                target: "watchdog.respawn",
-                error = %e,
-                "full argv capture from /proc failed — falling back to minimal argv \
-                 (flags such as --detect-only / --admin-pub will NOT survive a respawn)"
-            );
-            Ok(vec![
-                verified_bin.to_string_lossy().into_owned(),
-                "--pid-file".to_string(),
-                pidfile.to_string_lossy().into_owned(),
-            ])
-        }
-    }
 }
 
 /// One full respawn cycle: spawn the agent, wait for its
@@ -748,10 +754,17 @@ async fn sleep_or_signal(
 /// another stuck signal — but in practice the W4 restart loop
 /// will hit its 5-in-60s ceiling first and break out, dropping
 /// the channel and stopping this task.
+///
+/// External audit WDG-007 (NN-AUD-358): the ping must be answered by the
+/// agent watched (its pid), and an admin socket that leaves the path after
+/// the agent answered is reported at `holds` (signed by the agent) and,
+/// [`northnarrow_watchdog::STATUS_PING_VANISHED_STUCK_AFTER`] pings in a
+/// row, recovered like a hang. Nothing is pinged while no agent runs.
 async fn run_ping_loop(
     socket_path: PathBuf,
+    holds: PathBuf,
     stuck_tx: tokio::sync::mpsc::Sender<u32>,
-    mut agent: tokio::sync::watch::Receiver<u32>,
+    mut agent: tokio::sync::watch::Receiver<Option<u32>>,
 ) {
     // External audit WDG-009: `Delay`, so a stall never fires two pings
     // back to back.
@@ -766,28 +779,43 @@ async fn run_ping_loop(
     loop {
         tick.tick().await;
         // External audit WDG-002: timeouts against the previous agent do
-        // not count toward the new one.
+        // not count toward the new one (WDG-007: nor its answers).
         let current = *agent.borrow_and_update();
         if current != watching {
             tracker.reset();
             watching = current;
         }
-        let outcome = match ping_agent_status(&socket_path, STATUS_PING_TIMEOUT).await {
-            Ok(()) => tracker.record_ok(),
-            Err(e) => match classify_ping_error(&e) {
-                PingFailure::SocketAbsent => tracker.record_socket_absent(),
-                PingFailure::Unresponsive => {
-                    warn!(
-                        target: "watchdog.status_ping",
-                        error = %e,
-                        socket = %socket_path.display(),
-                        consecutive = tracker.consecutive_timeouts(),
-                        "STATUS ping failed"
-                    );
-                    tracker.record_timeout()
-                }
-            },
+        let Some(agent_pid) = watching else {
+            continue;
         };
+        let outcome =
+            match ping_agent_status(&socket_path, STATUS_PING_TIMEOUT, Some(agent_pid)).await {
+                Ok(()) => tracker.record_ok(),
+                Err(e) => match classify_ping_error(&e) {
+                    PingFailure::SocketAbsent => tracker.record_socket_absent(),
+                    PingFailure::NotTheAgent => {
+                        warn!(
+                            target: "watchdog.tamper",
+                            error = %e,
+                            socket = %socket_path.display(),
+                            agent_pid,
+                            "a process that is not the agent serves the admin socket — not \
+                             counted as an answer"
+                        );
+                        tracker.record_socket_absent()
+                    }
+                    PingFailure::Unresponsive => {
+                        warn!(
+                            target: "watchdog.status_ping",
+                            error = %e,
+                            socket = %socket_path.display(),
+                            consecutive = tracker.consecutive_timeouts(),
+                            "STATUS ping failed"
+                        );
+                        tracker.record_timeout()
+                    }
+                },
+            };
         match outcome {
             PingOutcome::Ok | PingOutcome::TimeoutOnce => {}
             PingOutcome::SocketAbsent { consecutive } => {
@@ -806,18 +834,34 @@ async fn run_ping_loop(
                         target: "watchdog.status_ping",
                         socket = %socket_path.display(),
                         consecutive,
-                        "admin socket absent (ENOENT) — not counted as stuck"
+                        "admin socket absent — the agent has not answered yet; not counted as stuck"
+                    );
+                }
+            }
+            PingOutcome::SocketVanished { consecutive } => {
+                if consecutive == STATUS_PING_VANISHED_TAMPER_AFTER {
+                    socket_vanished(&holds, &socket_path, agent_pid, consecutive);
+                } else {
+                    warn!(
+                        target: "watchdog.status_ping",
+                        socket = %socket_path.display(),
+                        agent_pid,
+                        consecutive,
+                        "the agent's admin socket is gone after it answered — waiting for the \
+                         agent to bind it again"
                     );
                 }
             }
             PingOutcome::StuckDetected => {
                 warn!(
                     target: "watchdog.status_ping",
-                    consecutive = tracker.consecutive_timeouts(),
-                    "STATUS ping threshold tripped — signalling main loop for stuck recovery"
+                    consecutive_timeouts = tracker.consecutive_timeouts(),
+                    agent_pid,
+                    "STATUS ping threshold tripped (timeouts, or the admin socket gone after \
+                     the agent answered) — signalling main loop for stuck recovery"
                 );
                 tracker.reset();
-                if stuck_tx.send(watching).await.is_err() {
+                if stuck_tx.send(agent_pid).await.is_err() {
                     // Main loop has dropped the receiver. Exit
                     // cleanly — no listener.
                     info!(
@@ -828,6 +872,45 @@ async fn run_ping_loop(
                 }
             }
         }
+    }
+}
+
+/// External audit WDG-007: the agent's admin socket stayed away after the
+/// agent answered (removed, replaced, or served by another process) — an
+/// ERROR on `watchdog.tamper` and a record the agent signs
+/// (`admin_socket_vanished`); a frozen agent signs it after its recovery.
+fn socket_vanished(holds: &std::path::Path, socket: &std::path::Path, agent_pid: u32, pings: u32) {
+    let secs = STATUS_PING_INTERVAL.as_secs() * u64::from(pings.saturating_sub(1));
+    error!(
+        target: "watchdog.tamper",
+        socket = %socket.display(),
+        agent_pid,
+        pings,
+        "the agent's admin socket has been gone for at least {secs} s after the agent answered — \
+         removed or replaced while the agent runs, and not bound again (agent frozen or \
+         stuck?); stuck recovery follows if it stays away"
+    );
+    let record = common::watchdog_hold::HoldRecord {
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        agent_pid,
+        reason: common::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED.to_string(),
+        detail: format!(
+            "{}: nothing that is the agent answers there on {pings} STATUS pings in a row \
+             (at least {secs} s) after it had answered",
+            socket.display()
+        ),
+        unit_state: None,
+    };
+    if let Err(e) = record_hold(holds, &record) {
+        warn!(
+            target: "watchdog.tamper",
+            error = %e,
+            path = %holds.display(),
+            "could not record the vanished admin socket for the agent's audit chain"
+        );
     }
 }
 

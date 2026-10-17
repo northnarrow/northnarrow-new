@@ -5474,40 +5474,21 @@ fn record_own_prog_ids(path: Option<&std::path::Path>, ebpf: &aya::Ebpf) {
 
 fn write_pid_file(path: &std::path::Path) -> Result<()> {
     let pid = std::process::id();
-
-    // The tempfile MUST live in the target's directory (same
-    // filesystem) for rename(2) to be atomic — derive it from the
-    // target, never from /tmp. `with_file_name` preserves the parent.
-    let tmp = match path.file_name() {
-        Some(name) => {
-            let mut t = name.to_os_string();
-            t.push(format!(".tmp.{pid}"));
-            path.with_file_name(t)
-        }
-        None => anyhow::bail!(
+    if path.file_name().is_none() {
+        anyhow::bail!(
             "--pid-file path has no file-name component: {}",
             path.display()
-        ),
-    };
-
-    // `fs::write` create+truncate+write+close in one shot. If the
-    // parent directory is missing this fails NotFound here, at
-    // startup, loudly — which is the intended behaviour for a
-    // misconfigured --pid-file path.
-    std::fs::write(&tmp, format!("{pid}\n"))
-        .with_context(|| format!("writing PID tempfile {}", tmp.display()))?;
-
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        // Don't litter a half-finished tempfile on rename failure.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| {
-            format!(
-                "atomically renaming PID file {} -> {}",
-                tmp.display(),
-                path.display()
-            )
-        });
+        );
     }
+    // External audit WDG-015 (NN-AUD-364): `/run/northnarrow` is writable
+    // by root and outside the inode deny set, and the agent is a process
+    // the hooks trust: its temporary file (`agent.pid.tmp.<pid>`, written
+    // with `fs::write`) followed a link planted at that predictable name.
+    // The AUT-003 writer removes whatever sits at the temporary name and
+    // creates it exclusively, then renames it into place. A missing parent
+    // directory still fails here, at startup, loudly.
+    northnarrow_agent::atomic_file::write_pidfile(path, pid)
+        .with_context(|| format!("writing PID file {} (atomic replace)", path.display()))?;
 
     info!(
         target: "anti-tamper",

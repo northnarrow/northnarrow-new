@@ -33,9 +33,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use std::os::unix::fs::PermissionsExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tracing::{info, warn};
 
 use common::wire::admin_protocol::{
@@ -72,6 +71,9 @@ use crate::posture::{AdminReleaseError, PostureMachine};
 use crate::shutdown_marker::{self, ShutdownMarker, DEFAULT_MARKER_PATH};
 
 use tokio::sync::Notify;
+
+/// External audit WDG-007: the socket's identity and its watch.
+pub mod socket_watch;
 
 /// Cross-task signal that an admin-authorised shutdown has been
 /// accepted by the dispatcher. Tappa 8 A8 wires this between the
@@ -472,27 +474,21 @@ pub async fn serve_with_marker_path(
     // External audit NN-AUD-082: the files the read verbs serve.
     read_paths: Arc<AdminReadPaths>,
 ) -> Result<()> {
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("unlinking stale socket {}", socket_path.display()))?;
-    }
-    if let Some(parent) = socket_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating socket parent dir {}", parent.display()))?;
-        }
-    }
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("binding admin socket {}", socket_path.display()))?;
-    // bind() honours umask; force 0600 explicitly so a slack umask
-    // never widens the socket. root:root remains via ownership of
-    // the bind() syscall (V1.1 will tighten to root:northnarrow 0660).
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", socket_path.display()))?;
+    // A stale socket (or anything else but a directory) at the path is
+    // removed without following a link; the mode is forced to 0600 so a
+    // slack umask never widens the socket (socket_watch::bind).
+    let (mut listener, bound) = socket_watch::bind(&socket_path)?;
     info!(
         path = %socket_path.display(),
         "admin socket listening (mode 0600)"
     );
+    // External audit WDG-007 (NN-AUD-358): the path is outside the deny
+    // hooks; a socket removed or replaced while the agent runs is a signed
+    // finding and is bound again at the next check.
+    let mut watch = socket_watch::SocketWatch::new(socket_path.clone(), bound);
+    let mut check = tokio::time::interval(socket_watch::SOCKET_CHECK_EVERY);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    check.tick().await;
 
     // External audit NN-AUD-077: a bounded table of connections, and an
     // accept loop that outlives a transient error.
@@ -501,7 +497,16 @@ pub async fn serve_with_marker_path(
     let mut refused_log = LogEvery::new(LOG_EVERY);
     let mut evicted_log = LogEvery::new(LOG_EVERY);
     loop {
-        let stream = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = check.tick() => {
+                if let Some(rebound) = watch.check(audit_log.as_ref()) {
+                    listener = rebound;
+                }
+                continue;
+            }
+        };
+        let stream = match accepted {
             Ok((stream, _)) => {
                 accept_backoff.reset();
                 stream
@@ -572,8 +577,11 @@ pub async fn serve_with_marker_path(
 }
 
 /// Helper for `main.rs` shutdown — best-effort unlink, no error on
-/// missing file (the listener may already have been dropped).
+/// missing file (the listener may already have been dropped). The socket's
+/// watch stops first (external audit WDG-007), so the agent does not bind
+/// it again on its way out.
 pub fn unlink_socket(path: &Path) {
+    socket_watch::retire(path);
     if path.exists() {
         if let Err(e) = std::fs::remove_file(path) {
             warn!(error = ?e, path = %path.display(), "failed to unlink admin socket on shutdown");
@@ -4392,6 +4400,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -4489,6 +4498,36 @@ mod tests {
         assert_eq!(out.posture, PostureKind::Observing);
         assert!(!out.network_isolation_engaged);
         assert!(out.last_admin_action_secs_ago.is_none());
+    }
+
+    /// External audit WDG-007 (NN-AUD-358): root could remove the admin
+    /// socket (`/run/northnarrow` is outside the deny hooks) and nn-admin
+    /// was dead until the agent restarted. The serve loop binds it again
+    /// within one check, and `status` answers on the new socket.
+    #[tokio::test]
+    async fn a_removed_admin_socket_is_bound_again_and_answers() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let h = spawn_server(&signing).await;
+        let first = std::fs::symlink_metadata(&h.socket).unwrap();
+        std::fs::remove_file(&h.socket).unwrap();
+        let deadline =
+            std::time::Instant::now() + socket_watch::SOCKET_CHECK_EVERY + Duration::from_secs(10);
+        while !h.socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the admin socket was not bound again"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let again = std::fs::symlink_metadata(&h.socket).unwrap();
+        assert_ne!(again.ino(), first.ino());
+        assert_eq!(again.mode() & 0o777, 0o600);
+        let socket = h.socket.clone();
+        let out = tokio::task::spawn_blocking(move || run_status(&socket).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(out.posture, PostureKind::Observing);
     }
 
     #[tokio::test]

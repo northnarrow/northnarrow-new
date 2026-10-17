@@ -14,54 +14,19 @@
 //! sets the mode on the descriptor (the umask does not decide it), writes,
 //! syncs, renames it into place and syncs the directory, so the rename
 //! survives a crash.
+//!
+//! External audit WDG-015 (NN-AUD-364): the writer lives in
+//! [`common::atomic_file`], and the agent's and the watchdog's pidfiles
+//! use it too ([`write_pidfile`]); this module keeps the agent's path to
+//! it.
 
-use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
-
-/// Replace `path` with `body` at mode `mode`.
-pub fn replace(path: &Path, body: &[u8], mode: u32) -> io::Result<()> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    let mut tmp_name = OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(".tmp");
-    let tmp = dir.join(tmp_name);
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let written = (|| {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&tmp)?;
-        f.set_permissions(fs::Permissions::from_mode(mode))?;
-        f.write_all(body)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)?;
-        File::open(dir)?.sync_all()
-    })();
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    written
-}
+pub use common::atomic_file::{replace, write_pidfile};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn a_link_planted_at_the_temporary_name_is_replaced_not_followed() {
@@ -82,6 +47,39 @@ mod tests {
         assert!(m.file_type().is_file());
         assert_eq!(m.mode() & 0o7777, 0o644);
         assert!(!dir.path().join(".admin.pub.tmp").exists());
+    }
+
+    /// External audit WDG-015 (NN-AUD-364): the agent's pidfile used to be
+    /// written to `agent.pid.tmp.<pid>` with `fs::write`, through a link
+    /// planted at that predictable name. Links at the old and the new
+    /// temporary names: neither target is touched.
+    #[test]
+    fn the_agent_pidfile_is_not_written_through_a_planted_link() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("audit.log");
+        fs::write(&victim, "CHAIN").unwrap();
+        let pid = std::process::id();
+        let pidfile = dir.path().join("agent.pid");
+        for name in [format!("agent.pid.tmp.{pid}"), ".agent.pid.tmp".to_string()] {
+            std::os::unix::fs::symlink(&victim, dir.path().join(name)).unwrap();
+        }
+        write_pidfile(&pidfile, pid).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "CHAIN");
+        assert_eq!(fs::read_to_string(&pidfile).unwrap(), format!("{pid}\n"));
+        let m = fs::symlink_metadata(&pidfile).unwrap();
+        assert!(m.file_type().is_file());
+        assert_eq!(m.mode() & 0o7777, 0o644);
+        // A pidfile planted as a link is replaced, not written through.
+        fs::remove_file(&pidfile).unwrap();
+        std::os::unix::fs::symlink(&victim, &pidfile).unwrap();
+        write_pidfile(&pidfile, pid).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "CHAIN");
+        assert!(fs::symlink_metadata(&pidfile)
+            .unwrap()
+            .file_type()
+            .is_file());
+        // A missing directory is still an error (a misconfigured --pid-file).
+        assert!(write_pidfile(&dir.path().join("nope/agent.pid"), pid).is_err());
     }
 
     #[test]

@@ -95,6 +95,24 @@ and the tracker note have the details and the lab evidence.
   start (`integrity_drift`, `watchdog_hold`). **Regression:** a host
   without bpffs shows a failed agent unit; a host without
   `/usr/bin/mountpoint` cannot start the agent.
+- **A removed admin socket comes back, and no longer hides a frozen
+  agent** (Wave 3: NN-AUD-358 WDG-007, NN-AUD-364 WDG-015, NN-AUD-359
+  WDG-008, NN-AUD-360 WDG-010, lab PR 170). The agent checks
+  `/run/northnarrow/admin.sock` every 10 s and binds it again when it was
+  removed or replaced, recording a signed `integrity_drift`
+  (`admin_socket_removed`). The watchdog treats a socket gone after the
+  agent answered as a stuck agent: a `watchdog.tamper` ERROR and a record
+  the agent signs as `admin_socket_vanished` within about a minute, and
+  the usual recovery (SIGINT, then SIGKILL, then a restart) within about
+  90 s. A socket that
+  never came up (no admin plane, a slow start) is still not a reason to
+  restart. Pidfiles are written without following a link (temporaries
+  `.agent.pid.tmp`, `.watchdog.pid.tmp`). Exec respawn backend only: the
+  agent's argv is kept at `/run/northnarrow/agent.argv`, a fallback argv
+  is signed as `respawn_argv_degraded`, and exited agents no longer stay
+  zombies. **Regression:** an agent that cannot bind its socket again (a
+  directory left at the path) is restarted once; an agent without admin
+  plane next to a stale socket file is no longer restarted every minute.
 - **The model moved** (NN-AUD-053 LLMR-004, lab PR 105). The model and its
   tokenizer are loaded only when root owns them and every directory above
   them, closed to others; the default location is
