@@ -36,8 +36,9 @@ pub const COMBAT_QUIET_WINDOW: Duration = Duration::from_secs(30 * 60);
 ///   `Reconnaissance` event during `Engaged`), the function re-arms
 ///   `last_trigger` so the decay timer slides forward.
 /// - `Combat` is sticky: nothing here can leave it. Down-transitions
-///   from `Combat` go through
-///   [`super::PostureMachine::admin_release_combat`].
+///   from `Combat` go through a signed release
+///   ([`super::PostureMachine::admin_release_combat_with_token`]) or,
+///   unlocked, the quiet-window decay of `tick_decay_at`.
 pub fn apply_trigger(state: &PostureState, trigger: TriggerType, now: Instant) -> PostureState {
     apply_to_level(state, trigger.target_level(), now)
 }

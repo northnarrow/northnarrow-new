@@ -5,7 +5,7 @@
 //! needing eBPF / a live host. Run with:
 //!
 //! ```text
-//! cargo run -p northnarrow-agent --release --example posture_demo
+//! cargo run -p northnarrow-agent --release --example posture_demo --features posture-demo
 //! ```
 //!
 //! The demo:

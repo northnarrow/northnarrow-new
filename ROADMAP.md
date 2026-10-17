@@ -181,7 +181,7 @@ ricorda quel che ha visto e diventa più aggressiva man mano che le
 prove si accumulano.
 
 Demo: `cargo run -p northnarrow-agent --release --example
-posture_demo` mostra le transizioni OBSERVING→ALERTED→ENGAGED→
+posture_demo --features posture-demo` mostra le transizioni OBSERVING→ALERTED→ENGAGED→
 COMBAT, una modulazione Allow→Alert in ALERTED, e l'admin override
 che riporta a ENGAGED.
 

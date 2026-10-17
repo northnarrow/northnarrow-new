@@ -627,12 +627,13 @@ impl PostureMachine {
     /// unit tests keep building; production code uses
     /// [`Self::admin_release_combat_with_token`], wired from
     /// `ConnAuth::verify_unlock` in the admin socket.
-    // NOTE: this bool stub is the Sub-tappa 6.5 placeholder.
-    // Production code uses `admin_release_combat_with_token`. We
-    // intentionally do NOT add a `#[deprecated]` attribute today —
-    // the legacy callers (the demo binary + several posture tests)
-    // need to be migrated first; doing both in one commit would blow
-    // up the diff. Migration tracked as a follow-up cleanup.
+    ///
+    /// External audit POS-013: compiled only for the unit tests and the
+    /// `posture-demo` feature (the demo example's). It leaves COMBAT on a
+    /// `bool`, without the release hook (no isolation lift, no ladder
+    /// stand-down) and without recording an admin action; a production
+    /// build has no such door.
+    #[cfg(any(test, feature = "posture-demo"))]
     pub fn admin_release_combat(
         &self,
         admin_authorized: bool,
@@ -684,9 +685,9 @@ impl PostureMachine {
     ///
     /// The legacy `admin_release_combat` bool stub returns to
     /// Engaged instead, for state-machine-exercise reasons that
-    /// predate the Tappa 7/8 work. That stub is `#[cfg(test)]`-
-    /// shaped (its only callers are the demo example and unit
-    /// tests); the asymmetry is intentional and deliberate.
+    /// predate the Tappa 7/8 work. That stub is compiled only for the
+    /// unit tests and the `posture-demo` feature (external audit
+    /// POS-013); the asymmetry is intentional and deliberate.
     ///
     /// Idempotent w.r.t. "already out of Combat" only at the socket
     /// layer — this method itself errors with `NotInCombat` if the
@@ -953,8 +954,9 @@ impl Default for PostureMachine {
     }
 }
 
-/// Reasons [`PostureMachine::admin_release_combat`] and
-/// [`PostureMachine::admin_force_state_with_token`] can refuse.
+/// Reasons [`PostureMachine::admin_release_combat_with_token`],
+/// [`PostureMachine::admin_force_state_with_token`] and the test-only
+/// `admin_release_combat` can refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminReleaseError {
     Unauthorized,

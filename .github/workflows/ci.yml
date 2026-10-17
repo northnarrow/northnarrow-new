@@ -90,6 +90,13 @@ jobs:
         if: matrix.task == 'clippy'
         run: cargo clippy --workspace --exclude northnarrow-agent-ebpf --all-targets --locked -- -D warnings
 
+      # External audit POS-013: the posture demo needs the `posture-demo`
+      # feature (`required-features`), so the run above skips it; keep it
+      # building.
+      - name: cargo clippy --example posture_demo --features posture-demo
+        if: matrix.task == 'clippy'
+        run: cargo clippy --locked -p northnarrow-agent --example posture_demo --features posture-demo -- -D warnings
+
       - name: cargo build --workspace
         if: matrix.task == 'build'
         run: cargo build --workspace --exclude northnarrow-agent-ebpf --locked --verbose

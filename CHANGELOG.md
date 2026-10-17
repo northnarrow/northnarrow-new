@@ -61,6 +61,45 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, posture corroboration (Low POS-008 NN-AUD-305,
+  POS-006 NN-AUD-303, POS-007 NN-AUD-304; Informational POS-013
+  NN-AUD-430; lab PR 172). The COMBAT corroboration ledger kept one FIFO
+  of 64 signals for every scope: since the ledger was scoped (lab PRs 141
+  and 161) an unprivileged user running `nc` in a loop — each exec an
+  `ExploitAttempt` recorded at ENGAGED — pushed another actor's evidence
+  out of it, a root change that locks COMBAT included, and that actor's
+  next signal stayed at ENGAGED. Each scope now has a bound of its own (16
+  entries) and the ledger one of 256. A repeat of a signal (the same
+  trigger, evidence class, privilege and pending writer) refreshes its
+  entry instead of adding one, so a flood is one entry; above a scope's
+  bound its own least useful entry goes (a change still waiting for its
+  writer, then an ordinary signal, a privileged one last); when the
+  ledger is full the entry goes from the actor holding the most, where
+  every scope below `/user.slice/user-<uid>.slice` is that user's (a flood
+  split over containers, or cgroups of one's delegated subtree named like
+  them, is charged to one actor) and a unit's sub-cgroups are the unit's;
+  a WARN says so once per episode. The correlation windows of the
+  posture triggers (`within`) counted any event stamped after the focal
+  one, however much later (the buffer holds 1,000 events of any age): the
+  window is now the same on both sides. A service uid (1..999) reading
+  `/etc/shadow`, `/etc/gshadow` or `/etc/sudoers` raised nothing (every
+  uid below 1000 was dropped first): the read now raises
+  `SensitiveFileAccess` (ALERTED) when the reader is a shell, an
+  interpreter (`php-fpm` included) or a generic file tool, judged by the
+  file the kernel executed and never by `comm`, an image outside a system
+  tree, or a process the agent cannot place; a daemon reading with its
+  own binary and the auth stack's own read stay quiet, and so do
+  `/etc/passwd` and `/etc/login.defs`; root is unchanged.
+  `PostureMachine::admin_release_combat(bool)`, which leaves COMBAT
+  without the release hook or an admin record, is compiled only for the
+  tests and the new `posture-demo` feature, which `examples/posture_demo`
+  requires (CI runs clippy on it). **Regressions:** a service-uid process
+  in group `shadow` that reads the credential files with a shell, an
+  interpreter or a tool (a backup script, an application checking
+  passwords against `/etc/shadow` itself) raises ALERTED; an event stamped
+  more than a window after the focal one no longer counts toward its
+  correlation; `cargo run --example posture_demo` needs
+  `--features posture-demo`.
 - External audit, Wave 3, CI and build integrity (Low SUP-004 NN-AUD-392,
   SUP-016 NN-AUD-401, SUP-022 NN-AUD-406, SUP-012 NN-AUD-397, SUP-015
   NN-AUD-400, and the scheduled advisory check left over from SUP-006
