@@ -53,6 +53,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+
+- Dependencies: `zip` 9.0.4 instead of 7.2.0 (RUSTSEC-2026-0367,
+  RUSTSEC-2026-0368, RUSTSEC-2026-0369: `ZipArchive::extract` kept
+  SUID/SGID bits, applied the archive's Unix permissions and followed
+  symbolic links out of the target directory). The agent's only user is
+  the vendored `candle-core` (its `.npz`/`.pth` readers, which read entries
+  in memory and never extract), so the paths were not reachable; the
+  advisories failed `cargo audit` all the same. Three lines of
+  `vendor/candle-core/src/{npy,pickle}.rs` follow zip 9's `Result` entry
+  names, marked "NorthNarrow" like the patch's other changes. The fuzz
+  harness now builds the same patched `candle-core` as the agent (it built
+  crates.io's, with Oniguruma and zip 7).
 - Lab follow-ups, LSM hook prototypes and `FLOW_SOCK_MAP` (lab PR 164).
   From kernel 6.9 `inode_setattr` takes `struct mnt_idmap *` before the
   dentry, and the anti-tamper setattr deny and the FIM setattr observer

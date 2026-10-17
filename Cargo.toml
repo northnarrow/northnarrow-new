@@ -59,10 +59,14 @@ strip = "none"
 # `onig_sys`) was in the agent whatever the agent asked for, and with both
 # backends on, tokenizers uses onig. `vendor/candle-core` is the crates.io
 # 0.10.2 package (sha256 6bd98954…2a4a, the checksum Cargo.lock recorded)
-# with two changes to its Cargo.toml, both marked "NorthNarrow": that
-# dependency asks for `fancy-regex`, and the deprecation warnings of its
-# unchanged code are allowed (a path dependency gets no --cap-lints). Check:
-# `diff -r` against the extracted .crate shows only those lines. A candle
+# with changes marked "NorthNarrow": in its Cargo.toml that dependency
+# asks for `fancy-regex`, the deprecation warnings of its unchanged code are
+# allowed (a path dependency gets no --cap-lints), and `zip` is 9.0.4
+# (RUSTSEC-2026-0367/0368/0369 on 7.x: extraction to disk, which candle does
+# not call — it reads `.npz`/`.pth` entries in memory); in `src/npy.rs` and
+# `src/pickle.rs` three lines follow zip 9's `Result` names. Check: `diff -r`
+# against the extracted .crate shows only those lines. fuzz/Cargo.toml
+# carries the same patch. A candle
 # bump must redo it: the patch does not apply to another version, and the
 # CI charter step (onig_sys in the graph) fails until it is redone.
 [patch.crates-io]

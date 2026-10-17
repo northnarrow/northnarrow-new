@@ -90,3 +90,10 @@ path = "fuzz_targets/canary_template.rs"
 test = false
 doc = false
 bench = false
+
+# The agent's real dependency graph: the same patched candle-core as the
+# workspace (root Cargo.toml, external audit MAIN-006: no Oniguruma; zip 9
+# for RUSTSEC-2026-0367/0368/0369). Without it the fuzz harness built the
+# crates.io candle-core, with onig and zip 7.
+[patch.crates-io]
+candle-core = { path = "../vendor/candle-core" }
