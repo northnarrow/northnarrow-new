@@ -33,7 +33,7 @@ use common::wire::{
 };
 use common::Event;
 use parking_lot::Mutex;
-use tokio::{io::unix::AsyncFd, sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 
 use crate::net::dns_cache::DnsCache;
@@ -633,7 +633,7 @@ where
     T: Pod,
     for<'a> Event: From<&'a T>,
 {
-    let mut async_fd = AsyncFd::new(rb)?;
+    let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
@@ -684,7 +684,7 @@ async fn pump_tcp_connect(
     flow_tracker: Option<(Arc<Mutex<FlowTracker>>, AuthSessionTracker)>,
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
-    let mut async_fd = AsyncFd::new(rb)?;
+    let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
@@ -799,7 +799,7 @@ async fn pump_dns_query(
     dns_cache: Option<Arc<DnsCache>>,
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
-    let mut async_fd = AsyncFd::new(rb)?;
+    let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;

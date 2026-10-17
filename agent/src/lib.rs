@@ -14,6 +14,7 @@ pub mod admin_socket;
 pub mod agent_id;
 pub mod anchored;
 pub mod anti_tamper;
+pub mod async_fd;
 pub mod atomic_file;
 pub mod audit;
 pub mod canary;

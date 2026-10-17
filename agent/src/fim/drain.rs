@@ -2265,8 +2265,7 @@ pub async fn drain_loop(
     lineage: AuthSessionTracker,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
-    use tokio::io::unix::AsyncFd;
-    let mut async_fd = AsyncFd::new(rb)?;
+    let mut async_fd = crate::async_fd::register(rb)?;
     info!(
         target: "fim.drain",
         baseline_cache_entries = baseline_cache.len(),
