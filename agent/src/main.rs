@@ -890,6 +890,7 @@ async fn main() -> Result<()> {
                 setxattr_dentry_arg = ?r.hook_arg_position("INODE_SETXATTR_DENTRY_ARG"),
                 removexattr_dentry_arg = ?r.hook_arg_position("INODE_REMOVEXATTR_DENTRY_ARG"),
                 hook_args_checked = r.hook_args_checked,
+                optional_deny_hooks = ?r.optional_deny_hooks,
                 "LSM hook prototypes read from the running kernel — the fixed-position \
                  arguments are where the programs read them (lab PR 164)"
             );
@@ -5571,6 +5572,18 @@ fn btf_check(path: &std::path::Path) -> i32 {
                     "  absent  {:<34} {:<12} {} — {effect}",
                     m.name, m.struct_name, m.detail
                 );
+            }
+            // Lab PR 174: the deny hooks only some kernels have, counted
+            // as expected where the BTF has them.
+            for (hook, present) in &r.optional_deny_hooks {
+                let verdict = if *present {
+                    format!(
+                        "present — bpf_lsm_{hook} in the BTF: its deny program attaches and counts as an expected deny hook"
+                    )
+                } else {
+                    format!("absent  — no bpf_lsm_{hook} in the BTF: no deny program on it, not expected")
+                };
+                println!("  optional {hook:<33} {verdict}");
             }
             for module in &r.modules_not_loaded {
                 println!(

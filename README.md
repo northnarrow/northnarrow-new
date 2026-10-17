@@ -144,7 +144,7 @@ test lab anyone with KVM can rerun (`deploy/lab/nn-lab.sh`), not by a slide:
 | | |
 |---|---|
 | Rule engine | 76 rules (plus the anti-tamper denial rule NN-L-AT-001), 18 process rules exercised end-to-end against real processes in the lab |
-| Kernel side | 16 BPF-LSM deny hooks (18 with the ACL hooks on 6.2+) attached, pinned and checked across restarts (`privileged_map_pin`), next to the tracepoint, kprobe, fexit and LSM sensors |
+| Kernel side | 16 BPF-LSM deny hooks, plus the optional ones the kernel has (the two ACL hooks from 6.2, `file_ioctl_compat` from 6.8 and its stable backports: 19 on 6.8), attached, pinned and checked across restarts (`privileged_map_pin`), next to the tracepoint, kprobe, fexit and LSM sensors |
 | Anti-tamper | `nn-lab.sh tamper-check`: adversarial cases (signals, ptrace, protected files and pins, BPF maps and links, mounts, io_uring, unit drop-ins, `systemctl`), each with its expected outcome and the evidence it must leave in the signed logs |
 | Tests | about 2,100 host tests in CI, plus privileged e2e suites (agent, watchdog, detection, canary, network, map pinning, honeypots, anti-tamper enforce mode, response targets) on the lab guests — 35 suites, 0 failed, on Ubuntu 24.04, Ubuntu 22.04 and Debian 12 at the last gate |
 | Lifecycle | fresh install, in-place upgrade and clean uninstall exercised on every nightly (`upgrade-check`, `uninstall-check`); the `.deb`/`.rpm` lifecycle by `pkg-check` |

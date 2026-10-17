@@ -1584,8 +1584,8 @@ pub const HOOK_ARG_MAX: u32 = 6;
 /// included, still has a pointer to `pointee` there.
 /// A mismatch refuses the start like a missing field (BUG-036): the
 /// program would read another argument. A hook the kernel does not have
-/// (`inode_set_acl` before 6.2) is not checked: its program does not
-/// attach. Only pointer arguments are listed; a prototype that shifts
+/// (`inode_set_acl` before 6.2, `file_ioctl_compat` before 6.8 and its
+/// stable backports) is not checked: its program does not attach. Only pointer arguments are listed; a prototype that shifts
 /// moves them as well.
 #[derive(Debug, Clone, Copy)]
 pub struct HookArgCheck {
@@ -1631,6 +1631,8 @@ pub const HOOK_ARG_CHECKS: &[HookArgCheck] = &[
     check("bpf_lsm_inode_post_setxattr", 0, "dentry"),
     check("bpf_lsm_file_open", 0, "file"),
     check("bpf_lsm_file_ioctl", 0, "file"),
+    // 6.8+ and the stable backports (lab PR 174): `(file, cmd, arg)`.
+    check("bpf_lsm_file_ioctl_compat", 0, "file"),
     check("bpf_lsm_file_permission", 0, "file"),
     check("bpf_lsm_file_free_security", 0, "file"),
     check("bpf_lsm_kernel_read_file", 0, "file"),
@@ -1764,6 +1766,6 @@ mod tests {
                 c.func
             );
         }
-        assert_eq!(HOOK_ARG_CHECKS.len(), 28);
+        assert_eq!(HOOK_ARG_CHECKS.len(), 29);
     }
 }

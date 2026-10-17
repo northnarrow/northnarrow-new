@@ -412,13 +412,17 @@ pub(crate) const LSM_PROGRAMS: &[(&str, &str)] = &[
 /// have. Since 6.2 a POSIX ACL (`setfacl`) is changed through
 /// `inode_set_acl` / `inode_remove_acl` instead of `inode_setxattr`
 /// (`system.posix_acl_*`), which the required set covers on 5.15 and 6.1.
-/// Attached where the kernel's BTF has the hook; where it has not, the
-/// program is skipped and not counted as a missing deny hook. A hook the
-/// kernel has but that fails to load or attach is a deny failure like any
-/// other.
+/// Lab PR 174: since 6.8 (and the stable releases 6.7.3, 6.6.15, 6.1.76,
+/// 5.15.149, 5.10.210) a 32-bit process's `ioctl` goes through
+/// `file_ioctl_compat` instead of `file_ioctl`, which covers it on older
+/// kernels. Attached where the kernel's BTF has the hook
+/// (`bpf_lsm_<hook>`); where it has not, the program is skipped and not
+/// counted as a missing deny hook. A hook the kernel has but that fails to
+/// load or attach is a deny failure like any other.
 pub(crate) const OPTIONAL_LSM_PROGRAMS: &[(&str, &str)] = &[
     ("protected_set_acl_deny", "inode_set_acl"),
     ("protected_remove_acl_deny", "inode_remove_acl"),
+    ("protected_ioctl_compat_deny", "file_ioctl_compat"),
 ];
 
 /// BUG-034 module-load observe hooks — `MODULE_LOAD_EVENTS` producers.
@@ -629,23 +633,28 @@ pub(crate) fn attach(
     // External audit EBPF-015: the hooks only newer kernels have. Absent
     // from this kernel's BTF = not expected here (the required set covers
     // the same change on it); present = expected, like the required ones.
+    // Lab PR 174: the boot's BTF resolution says whether the kernel has
+    // `bpf_lsm_<hook>` (`attach_optional`).
     for (program, hook) in OPTIONAL_LSM_PROGRAMS {
-        match super::reattach_fresh(ebpf, program, hook, btf, pin_root) {
-            Ok(()) => {
-                deny_hooks_attached += 1;
-                health.optional_present += 1;
-            }
-            Err(e) if lsm_hook_absent(&e, hook) => info!(
+        let in_btf = super::btf_revalidate::optional_hook_in_kernel(hook);
+        let outcome = attach_optional(hook, in_btf, || {
+            super::reattach_fresh(ebpf, program, hook, btf, pin_root)
+        });
+        if outcome.expected() {
+            health.optional_present += 1;
+        }
+        match outcome {
+            OptionalHook::Absent => info!(
                 program,
                 hook, "anti-tamper FS: optional deny hook absent on this kernel — not attached"
             ),
-            Err(e) => {
+            OptionalHook::Attached => deny_hooks_attached += 1,
+            OptionalHook::Failed(e) => {
                 warn!(
                     program, hook, error = %e,
                     "anti-tamper FS: LSM hook attach FAILED"
                 );
-                health.optional_present += 1;
-                health.deny_failures.push((program, format!("{e:#}")));
+                health.deny_failures.push((program, e));
             }
         }
     }
@@ -683,6 +692,47 @@ pub(crate) fn attach(
     }
 
     Ok(health)
+}
+
+/// How an optional deny hook ([`OPTIONAL_LSM_PROGRAMS`]) counts this boot.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OptionalHook {
+    /// The kernel has no such hook: not attached, not expected.
+    Absent,
+    /// Attached: one more expected deny hook, present.
+    Attached,
+    /// The kernel has the hook but its program did not load or attach: an
+    /// expected deny hook missing (a shortfall, like a required one).
+    Failed(String),
+}
+
+impl OptionalHook {
+    /// Whether the hook counts among this boot's expected deny hooks.
+    pub(crate) fn expected(&self) -> bool {
+        !matches!(self, OptionalHook::Absent)
+    }
+}
+
+/// Lab PR 174: attach the optional deny hook `hook` only where the
+/// kernel's BTF has it. `in_btf` is the boot's BTF resolution
+/// ([`super::btf_revalidate::optional_hook_in_kernel`]): `Some(false)`
+/// skips the hook without trying; `Some(true)` makes any attach error a
+/// failure; `None` (no resolution) leaves the decision to the loader's own
+/// lookup, whose "no `bpf_lsm_<hook>`" error ([`lsm_hook_absent`]) means
+/// absent.
+pub(crate) fn attach_optional(
+    hook: &str,
+    in_btf: Option<bool>,
+    attach: impl FnOnce() -> Result<()>,
+) -> OptionalHook {
+    if in_btf == Some(false) {
+        return OptionalHook::Absent;
+    }
+    match attach() {
+        Ok(()) => OptionalHook::Attached,
+        Err(e) if in_btf.is_none() && lsm_hook_absent(&e, hook) => OptionalHook::Absent,
+        Err(e) => OptionalHook::Failed(format!("{e:#}")),
+    }
 }
 
 /// External audit EBPF-015: whether `err`, from attaching the deny
@@ -2579,7 +2629,10 @@ mod tests {
             assert!(hooks.contains(&h), "no deny program on {h}");
         }
         let optional: Vec<&str> = OPTIONAL_LSM_PROGRAMS.iter().map(|(_, h)| *h).collect();
-        assert_eq!(optional, ["inode_set_acl", "inode_remove_acl"]);
+        assert_eq!(
+            optional,
+            ["inode_set_acl", "inode_remove_acl", "file_ioctl_compat"]
+        );
         let mut programs = std::collections::HashSet::new();
         let mut seen = std::collections::HashSet::new();
         for (program, hook) in LSM_PROGRAMS.iter().chain(OPTIONAL_LSM_PROGRAMS) {
@@ -2610,6 +2663,60 @@ mod tests {
         assert!(!lsm_hook_absent(&failed, "inode_set_acl"));
         let other = anyhow::anyhow!("attaching LSM program `protected_set_acl_deny`");
         assert!(!lsm_hook_absent(&other, "inode_set_acl"));
+    }
+
+    /// Lab PR 174: an optional deny hook is tried only where the boot's BTF
+    /// resolution does not say it is absent; with the hook in the BTF any
+    /// attach error is a failure (an expected deny hook missing), and only
+    /// without a resolution does the loader's "no `bpf_lsm_<hook>`" mean
+    /// absent.
+    #[test]
+    fn optional_hook_attach_follows_the_btf() {
+        use aya::programs::ProgramError;
+        let hook = "file_ioctl_compat";
+        let absent_err = || {
+            anyhow::Error::from(ProgramError::Btf(aya::BtfError::UnknownBtfTypeName {
+                type_name: "bpf_lsm_file_ioctl_compat".to_string(),
+            }))
+            .context("verifier rejected LSM program `protected_ioctl_compat_deny`")
+        };
+        assert!(lsm_hook_absent(&absent_err(), hook));
+        assert!(!lsm_hook_absent(&absent_err(), "file_ioctl"));
+
+        let skipped = attach_optional(hook, Some(false), || panic!("tried a hook the BTF lacks"));
+        assert_eq!(skipped, OptionalHook::Absent);
+        assert!(!skipped.expected());
+
+        let attached = attach_optional(hook, Some(true), || Ok(()));
+        assert_eq!(attached, OptionalHook::Attached);
+        assert!(attached.expected());
+
+        let failed = attach_optional(hook, Some(true), || {
+            Err(anyhow::anyhow!(
+                "verifier rejected LSM program `protected_ioctl_compat_deny`"
+            ))
+        });
+        assert!(matches!(&failed, OptionalHook::Failed(e) if e.contains("verifier rejected")));
+        assert!(failed.expected());
+        // the BTF has the hook: the loader's "absent" is a failure, not a skip
+        assert!(matches!(
+            attach_optional(hook, Some(true), || Err(absent_err())),
+            OptionalHook::Failed(_)
+        ));
+
+        // no resolution: the loader's lookup decides
+        assert_eq!(
+            attach_optional(hook, None, || Err(absent_err())),
+            OptionalHook::Absent
+        );
+        assert!(matches!(
+            attach_optional(hook, None, || Err(anyhow::anyhow!("attach failed"))),
+            OptionalHook::Failed(_)
+        ));
+        assert_eq!(
+            attach_optional(hook, None, || Ok(())),
+            OptionalHook::Attached
+        );
     }
 
     /// External audit EBPF-015: the agent's directories refuse new
