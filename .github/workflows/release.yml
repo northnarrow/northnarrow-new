@@ -199,7 +199,7 @@ jobs:
           echo "no credential in the build job"
 
       - name: Upload workflow artefacts (always)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: northnarrow-release-${{ github.sha }}
           path: dist/
@@ -284,7 +284,7 @@ jobs:
           mv SHA256SUMS.new SHA256SUMS
           sha256sum -c SHA256SUMS && cat SHA256SUMS
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: northnarrow-release-signed-${{ github.sha }}
           path: dist/
