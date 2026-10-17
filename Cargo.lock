@@ -176,15 +176,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d18bc4e506fbb85ab7392ed993a7db4d1a452c71b75a246af4a80ab8c9d2dd50"
 dependencies = [
  "assert_matches",
- "aya-obj",
+ "aya-obj 0.2.1",
  "bitflags",
  "bytes",
  "libc",
  "log",
- "object",
+ "object 0.36.7",
  "once_cell",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "aya"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e644424fada9fff4fdc63848db1732fb69b626e8328202ef55c03df1f4d939"
+dependencies = [
+ "assert_matches",
+ "aya-obj 0.3.0",
+ "bitflags",
+ "hashbrown 0.17.0",
+ "libc",
+ "log",
+ "object 0.39.1",
+ "once_cell",
+ "scopeguard",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -193,7 +211,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b600d806c1d07d3b81ab5f4a2a95fd80f479a0d3f1d68f29064d660865f85f02"
 dependencies = [
- "aya",
+ "aya 0.13.1",
  "aya-log-common",
  "bytes",
  "log",
@@ -220,8 +238,20 @@ dependencies = [
  "core-error",
  "hashbrown 0.15.5",
  "log",
- "object",
+ "object 0.36.7",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aya-obj"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077"
+dependencies = [
+ "bytes",
+ "log",
+ "object 0.39.1",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1263,6 +1293,10 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -1642,7 +1676,7 @@ version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
- "aya",
+ "aya 0.14.0",
  "aya-log",
  "base64 0.23.1",
  "bytemuck",
@@ -1683,7 +1717,7 @@ name = "northnarrow-antitamper-bpf"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "aya",
+ "aya 0.14.0",
  "libc",
  "tempfile",
  "tracing",
@@ -1805,6 +1839,18 @@ checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "crc32fast",
  "hashbrown 0.15.5",
+ "indexmap",
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.17.0",
  "indexmap",
  "memchr",
 ]
@@ -3486,7 +3532,7 @@ name = "xtask"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "aya-obj",
+ "aya-obj 0.2.1",
  "chrono",
  "clap",
  "ebpf-guard",

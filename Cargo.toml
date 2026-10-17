@@ -34,7 +34,7 @@ clap = { version = "4", features = ["derive", "env"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 # eBPF userland
-aya = "0.13"
+aya = "0.14"
 aya-log = "0.2"
 
 [profile.release]
