@@ -60,7 +60,12 @@
 //!    unless it is byte-identical to a template an earlier release
 //!    shipped ([`SUPERSEDED_TEMPLATE_SHA256`]), which named the
 //!    product: `install.sh` replaces those, and the agent does not
-//!    use one left behind.
+//!    use one left behind. The file is read without following a
+//!    link, without blocking on a FIFO, from a regular file of at
+//!    most [`MAX_TEMPLATE_BYTES`]; one there but refused fails the
+//!    render (external audit DEC-016, lab PR 178). The rendered
+//!    decoy keeps no `{{`, and a JSON family's is a JSON document
+//!    (DEC-017).
 //! 2. Falls back to the built-in default compiled in via
 //!    `include_str!` (zero-disk-dep tests; production
 //!    operators get the file too via install.sh).
@@ -129,6 +134,15 @@ impl CredFamily {
         }
     }
 
+    /// The families whose decoy is a JSON document (external audit
+    /// DEC-017: checked after rendering).
+    fn is_json(&self) -> bool {
+        matches!(
+            self,
+            CredFamily::Azure | CredFamily::Gcp | CredFamily::Docker
+        )
+    }
+
     /// Built-in template string compiled into the agent binary.
     /// Operator-override-aware variant in `render`; this is
     /// the fallback only.
@@ -158,7 +172,18 @@ pub enum RenderError {
     },
     #[error("template body contains unresolved placeholder `{0}` — template version mismatch")]
     UnresolvedPlaceholder(String),
+    /// External audit DEC-017 (lab PR 178): a JSON family's template that
+    /// does not render a JSON document.
+    #[error("rendered `{family}` decoy is not valid JSON: {reason}")]
+    MalformedOutput {
+        family: &'static str,
+        reason: String,
+    },
 }
+
+/// Largest operator template read (external audit DEC-016, lab PR 178):
+/// 64 KiB. The shipped ones are under 1 KiB.
+pub const MAX_TEMPLATE_BYTES: u64 = 64 * 1024;
 
 /// SHA-256 (hex) of each template an earlier release shipped (external
 /// audit DEC-007): they named the product (`NorthNarrow XDR`, `DO NOT
@@ -230,7 +255,17 @@ pub fn render(
 ) -> Result<String, RenderError> {
     let template = load_template(family, template_dir)?;
     let placeholders = build_placeholders(family, seed);
-    substitute(&template, &placeholders)
+    let out = substitute(&template, &placeholders)?;
+    // External audit DEC-017: a JSON family's decoy is a JSON document.
+    if family.is_json() {
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(&out) {
+            return Err(RenderError::MalformedOutput {
+                family: family.as_wire(),
+                reason: e.to_string(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Load the template body for `family`. Tries operator
@@ -242,7 +277,7 @@ fn load_template(
 ) -> Result<String, RenderError> {
     if let Some(dir) = template_dir {
         let candidate = dir.join(format!("{}.tmpl", family.as_wire()));
-        match std::fs::read_to_string(&candidate) {
+        match read_template(&candidate) {
             Ok(body) if is_superseded(family, &body) => {
                 // External audit DEC-007: an earlier release's template left
                 // on disk (an upgrade that did not run install.sh) named the
@@ -266,6 +301,45 @@ fn load_template(
         }
     }
     Ok(family.builtin_template().to_string())
+}
+
+/// External audit DEC-016 (lab PR 178): an operator template is read once,
+/// without following a link at its name, without blocking on a FIFO
+/// planted there, from a regular file only and at most
+/// [`MAX_TEMPLATE_BYTES`] — the overlay reader's pattern
+/// (`config::overlay_auth::read_overlay`). It was `read_to_string`: the
+/// templates are write-allowed at run time (MUTATE-only, so a live edit
+/// does not trip COMBAT), and one grown in place, or a missing family's
+/// file created as a link to `/dev/zero`, was read without limit at the
+/// next deploy. A template present but refused is
+/// [`RenderError::TemplateRead`] (the deploy is refused and the file
+/// named), never a silent fall-back to the built-in one.
+fn read_template(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                std::io::Error::other("a symbolic link (not read through one)")
+            } else {
+                e
+            }
+        })?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_TEMPLATE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_TEMPLATE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "larger than {MAX_TEMPLATE_BYTES} bytes"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8"))
 }
 
 /// `body` is byte-identical to the template an earlier release shipped
@@ -370,13 +444,15 @@ fn substitute(template: &str, placeholders: &HashMap<&str, String>) -> Result<St
     for (key, value) in placeholders {
         out = out.replace(&format!("{{{{{key}}}}}"), value);
     }
-    // Defensive: any remaining `{{…}}` is an unresolved
-    // placeholder. Scan + surface the first one.
+    // Any `{{` left is an unresolved placeholder (external audit DEC-017,
+    // lab PR 178: an unclosed `{{tenant_id` used to pass, needing a `}}`
+    // after it, and went into the decoy). The error names it — up to its
+    // `}}`, at most 32 characters, escaped — for the operator.
     if let Some(start) = out.find("{{") {
-        if let Some(end_rel) = out[start..].find("}}") {
-            let placeholder = &out[start + 2..start + end_rel];
-            return Err(RenderError::UnresolvedPlaceholder(placeholder.to_string()));
-        }
+        let rest = &out[start + 2..];
+        let name = rest.find("}}").map_or(rest, |end| &rest[..end]);
+        let shown: String = name.chars().take(32).flat_map(char::escape_debug).collect();
+        return Err(RenderError::UnresolvedPlaceholder(shown));
     }
     Ok(out)
 }
@@ -882,6 +958,137 @@ mod tests {
             }
             other => panic!("expected UnresolvedPlaceholder, got {other:?}"),
         }
+    }
+
+    /// External audit DEC-017 (lab PR 178): an unclosed placeholder used
+    /// to pass — the check needed a `}}` after the `{{` — and went into the
+    /// decoy.
+    #[test]
+    fn unclosed_placeholder_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("generic.tmpl"),
+            "API_TOKEN={{bearer_token}}\nTENANT_ID={{tenant_id\n",
+        )
+        .unwrap();
+        match render(CredFamily::Generic, TEST_ID, Some(dir.path())) {
+            Err(RenderError::UnresolvedPlaceholder(p)) => assert_eq!(p, "tenant_id\\n"),
+            other => panic!("expected UnresolvedPlaceholder, got {other:?}"),
+        }
+        // the name shown is bounded, closed or not
+        let long = format!("X={{{{{}}}}}\n", "a".repeat(5000));
+        std::fs::write(dir.path().join("generic.tmpl"), long).unwrap();
+        match render(CredFamily::Generic, TEST_ID, Some(dir.path())) {
+            Err(RenderError::UnresolvedPlaceholder(p)) => assert_eq!(p, "a".repeat(32)),
+            other => panic!("expected UnresolvedPlaceholder, got {other:?}"),
+        }
+    }
+
+    /// External audit DEC-017 (lab PR 178): a JSON family's template must
+    /// render a JSON document; the built-in ones do.
+    #[test]
+    fn operator_json_template_must_render_json() {
+        for family in [CredFamily::Azure, CredFamily::Gcp, CredFamily::Docker] {
+            let body = render(family, TEST_ID, None).expect("built-in renders");
+            serde_json::from_str::<serde_json::Value>(&body).expect("built-in is JSON");
+            let dir = TempDir::new().unwrap();
+            std::fs::write(
+                dir.path().join(format!("{}.tmpl", family.as_wire())),
+                "{\"id\": \"{{short_id}}\",\n",
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    render(family, TEST_ID, Some(dir.path())),
+                    Err(RenderError::MalformedOutput { .. })
+                ),
+                "{family:?}"
+            );
+        }
+        // the ini / env families are not JSON
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("aws.tmpl"), "{ key = {{access_key_id}}\n").unwrap();
+        assert!(render(CredFamily::Aws, TEST_ID, Some(dir.path())).is_ok());
+    }
+
+    /// External audit DEC-016 (lab PR 178): the templates are write-allowed
+    /// at run time; one grown in place was read whole at the next deploy.
+    #[test]
+    fn oversized_operator_template_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aws.tmpl");
+        let mut body = "aws_access_key_id = {{access_key_id}}\n".to_string();
+        std::fs::write(&path, &body).unwrap();
+        assert!(render(CredFamily::Aws, TEST_ID, Some(dir.path())).is_ok());
+        body.push_str(&"#".repeat(1024 * 1024));
+        std::fs::write(&path, &body).unwrap();
+        match render(CredFamily::Aws, TEST_ID, Some(dir.path())) {
+            Err(RenderError::TemplateRead { path: p, source }) => {
+                assert_eq!(p, path);
+                assert!(source.to_string().contains("larger than"), "{source}");
+            }
+            other => panic!("expected TemplateRead, got {other:?}"),
+        }
+        // at the cap: read
+        std::fs::write(&path, "#".repeat(MAX_TEMPLATE_BYTES as usize)).unwrap();
+        assert!(render(CredFamily::Aws, TEST_ID, Some(dir.path())).is_ok());
+    }
+
+    /// External audit DEC-016 (lab PR 178): a link at a template's name
+    /// (`/dev/zero`, or a file elsewhere) is not read through, and refuses
+    /// the render instead of falling back to the built-in one.
+    #[test]
+    fn symlinked_template_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, "aws_access_key_id = {{access_key_id}}\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("aws.tmpl")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.path().join("gcp.tmpl")).unwrap();
+        for family in [CredFamily::Aws, CredFamily::Gcp] {
+            match render(family, TEST_ID, Some(dir.path())) {
+                Err(RenderError::TemplateRead { source, .. }) => {
+                    assert!(source.to_string().contains("symbolic link"), "{source}")
+                }
+                other => panic!("expected TemplateRead, got {other:?}"),
+            }
+        }
+        // a directory at the name is refused too
+        std::fs::create_dir(dir.path().join("docker.tmpl")).unwrap();
+        assert!(matches!(
+            render(CredFamily::Docker, TEST_ID, Some(dir.path())),
+            Err(RenderError::TemplateRead { .. })
+        ));
+    }
+
+    /// External audit DEC-016 (lab PR 178): a FIFO at a template's name used
+    /// to block the deploy (and its admin connection) until a writer came.
+    #[test]
+    fn fifo_template_does_not_block() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("aws.tmpl");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo on a NUL-terminated path in our temp dir.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let template_dir = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(render(CredFamily::Aws, TEST_ID, Some(&template_dir)).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the render returns instead of blocking on the FIFO");
+        assert!(refused, "a FIFO is not a template");
+    }
+
+    /// A template that is not UTF-8 is refused, as before.
+    #[test]
+    fn non_utf8_template_is_refused() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("aws.tmpl"), b"\xff\xfe{{access_key_id}}\n").unwrap();
+        assert!(matches!(
+            render(CredFamily::Aws, TEST_ID, Some(dir.path())),
+            Err(RenderError::TemplateRead { .. })
+        ));
     }
 
     // ── K4 test #7: operator override resolves before built-in ──

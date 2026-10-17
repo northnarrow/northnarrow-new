@@ -3349,6 +3349,25 @@ fn dispatch_canary_deploy(
 
     let primary_fp = fps_out.first().cloned().unwrap_or_default();
 
+    // External audit DEC-015 (lab PR 178): a File / Credential path is
+    // judged, written, recorded and watched in its normal form (`//`
+    // folded) — the deny prefixes used to be matched on the raw string.
+    let mut extra = extra;
+    extra.deployment = match crate::canary::path_policy::normalised_deployment(&extra.deployment) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                signer_fp = %primary_fp,
+                "canary-deploy: REFUSED — canary path"
+            );
+            return CanaryDeployResponse {
+                result: AdminResult::UnknownOperation,
+                canary_id: String::new(),
+            };
+        }
+    };
+
     // Lab PR 163: a network canary trips on a connect to its address and
     // port (`canary::network`). One whose address is not an IP address
     // could never trip, and one where a listener on this host takes the

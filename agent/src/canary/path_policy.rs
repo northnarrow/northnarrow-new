@@ -9,7 +9,12 @@
 //! denylist of those trees plus the usual path hygiene.
 //!
 //! Checks, in order:
-//! 1. absolute, no `.`/`..` components, not empty;
+//! 1. absolute, no `.`/`..` components, not empty, no control
+//!    character, shorter than `PATH_MAX`; then normalised lexically
+//!    (`//` and a trailing `/` folded: external audit DEC-015, lab PR
+//!    178 — the prefixes were matched on the raw string, so `//lib32/x`
+//!    missed `/lib32/` and, on a host without `/lib32`, the write
+//!    created it). Every later step uses the normal form;
 //! 2. not under a denied prefix (system trees, procfs/sysfs/devfs,
 //!    `/run`, NorthNarrow's own state and config);
 //! 3. the nearest EXISTING ancestor, canonicalised, is not under a
@@ -21,6 +26,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+use common::wire::admin_signed_payload::CanaryDeploymentWire;
 
 /// Prefixes a canary may never be written under. A trailing `/`
 /// matches the subtree; `/var/lib/northnarrow/canary/` is carved back in
@@ -55,25 +61,78 @@ fn denied_prefix(p: &str) -> Option<&'static str> {
         .find(|d| p.starts_with(d) || p == &d[..d.len() - 1])
 }
 
-/// Validate `path` for materialisation. Returns the path to write.
-pub fn check_canary_path(path: &str) -> Result<PathBuf> {
-    let p = Path::new(path);
-    if path.is_empty() || !p.is_absolute() {
+/// Longest canary path accepted, in bytes: below `PATH_MAX` (4096 with
+/// its NUL), so the kernel can resolve it in one go.
+const MAX_CANARY_PATH_BYTES: usize = libc::PATH_MAX as usize - 1;
+
+/// External audit DEC-015 (lab PR 178): the lexical checks of a canary
+/// path and its normal form — absolute, no `.`/`..` segment, no control
+/// character, at most [`MAX_CANARY_PATH_BYTES`], rebuilt from its
+/// non-empty segments (`//` and a trailing `/` folded). The deny and
+/// allow prefixes end in `/`, so matching them on the normal form is
+/// matching by components.
+pub fn normalise_canary_path(path: &str) -> Result<String> {
+    if path.is_empty() || !path.starts_with('/') {
         return Err(anyhow!("canary path must be absolute: {path:?}"));
+    }
+    if path.len() > MAX_CANARY_PATH_BYTES {
+        return Err(anyhow!(
+            "canary path is {} bytes, longer than {MAX_CANARY_PATH_BYTES}",
+            path.len()
+        ));
+    }
+    if path.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "canary path must not contain a control character: {path:?}"
+        ));
     }
     // Check the raw segments: `Path::components` normalises a `.`
     // segment away, so a components()-based test would accept "/a/./b".
     if path.split('/').any(|seg| seg == "." || seg == "..")
-        || p.components().any(|c| matches!(c, Component::ParentDir))
+        || Path::new(path)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
     {
         return Err(anyhow!(
             "canary path must not contain `.` or `..`: {path:?}"
         ));
     }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return Err(anyhow!("canary path has no file name: {path:?}"));
+    }
+    Ok(format!("/{}", segments.join("/")))
+}
+
+/// External audit DEC-015 (lab PR 178): `deployment` with the path of a
+/// File or Credential canary in its normal form ([`normalise_canary_path`]),
+/// so the decoy written, the registry row and the watch name the same
+/// path. Process and Network canaries are returned as they are.
+pub fn normalised_deployment(deployment: &CanaryDeploymentWire) -> Result<CanaryDeploymentWire> {
+    Ok(match deployment {
+        CanaryDeploymentWire::File { path, template } => CanaryDeploymentWire::File {
+            path: normalise_canary_path(path)?,
+            template: template.clone(),
+        },
+        CanaryDeploymentWire::Credential { path, cred_family } => {
+            CanaryDeploymentWire::Credential {
+                path: normalise_canary_path(path)?,
+                cred_family: cred_family.clone(),
+            }
+        }
+        other => other.clone(),
+    })
+}
+
+/// Validate `path` for materialisation. Returns the path to write: its
+/// normal form ([`normalise_canary_path`]).
+pub fn check_canary_path(path: &str) -> Result<PathBuf> {
+    let normal = normalise_canary_path(path)?;
+    let p = Path::new(&normal);
     if p.file_name().is_none() {
         return Err(anyhow!("canary path has no file name: {path:?}"));
     }
-    if let Some(d) = denied_prefix(path) {
+    if let Some(d) = denied_prefix(&normal) {
         return Err(anyhow!(
             "canary path {path:?} is under the protected prefix {d:?}"
         ));
@@ -276,9 +335,104 @@ mod tests {
             "/sys/x",
             "/var/lib/northnarrow/quarantine/key",
             "/var/log/x",
+            // External audit DEC-015 (lab PR 178): the raw string missed
+            // the prefix. `/var/lib/northnarrow` is absent off the lab, so
+            // the canonical ancestor (`/var/lib`) did not catch these either.
+            "//lib32/x",
+            "//etc/cron.d/nn",
+            "/etc//cron.d/nn",
+            "///usr/bin/x",
+            "//var/lib/northnarrow/quarantine/key",
+            "/var//lib//northnarrow/x",
+            "/var/lib/northnarrow",
+            "//var/lib/northnarrow/",
         ] {
             assert!(check_canary_path(p).is_err(), "{p} must be denied");
         }
+    }
+
+    /// External audit DEC-015 (lab PR 178): the prefixes are matched on the
+    /// normal form, whatever the host has on disk.
+    #[test]
+    fn denied_prefixes_match_the_normal_form() {
+        for (raw, normal, denied) in [
+            ("//lib32/x", "/lib32/x", Some("/lib32/")),
+            ("//etc/cron.d/nn", "/etc/cron.d/nn", Some("/etc/")),
+            ("/etc//cron.d/nn", "/etc/cron.d/nn", Some("/etc/")),
+            ("///usr/bin/x", "/usr/bin/x", Some("/usr/")),
+            ("//lib32", "/lib32", Some("/lib32/")),
+            (
+                "/home//u/.aws/credentials/",
+                "/home/u/.aws/credentials",
+                None,
+            ),
+            (
+                "/var/lib//northnarrow/canary/x",
+                "/var/lib/northnarrow/canary/x",
+                None,
+            ),
+            ("/lib32x/y", "/lib32x/y", None),
+        ] {
+            let n = normalise_canary_path(raw).unwrap();
+            assert_eq!(n, normal, "{raw}");
+            assert_eq!(denied_prefix(&n), denied, "{raw}");
+        }
+        assert!(
+            denied_prefix("//lib32/x").is_none(),
+            "the raw string misses it"
+        );
+    }
+
+    #[test]
+    fn rejects_control_characters_and_overlong_paths() {
+        for p in [
+            "/home/u/a\nb",
+            "/home/u/\u{1b}[2Jx",
+            "/home/u/x\0",
+            "/home/u/\u{85}x",
+        ] {
+            assert!(check_canary_path(p).is_err(), "{p:?} must be refused");
+        }
+        let long = format!("/home/u/{}", "a".repeat(MAX_CANARY_PATH_BYTES));
+        assert!(check_canary_path(&long).is_err());
+        let fits = format!("/home/{}", "a".repeat(200));
+        assert!(check_canary_path(&fits).is_ok());
+    }
+
+    /// External audit DEC-015 (lab PR 178): the deployment recorded and
+    /// watched carries the path written.
+    #[test]
+    fn deployment_paths_are_normalised() {
+        let d = CanaryDeploymentWire::Credential {
+            path: "/home//u/.aws//credentials".into(),
+            cred_family: "aws".into(),
+        };
+        assert_eq!(
+            normalised_deployment(&d).unwrap(),
+            CanaryDeploymentWire::Credential {
+                path: "/home/u/.aws/credentials".into(),
+                cred_family: "aws".into(),
+            }
+        );
+        let f = CanaryDeploymentWire::File {
+            path: "relative".into(),
+            template: None,
+        };
+        assert!(normalised_deployment(&f).is_err());
+        let n = CanaryDeploymentWire::Network {
+            bind_addr: "10.0.0.1".into(),
+            bind_port: 22,
+        };
+        assert_eq!(normalised_deployment(&n).unwrap(), n);
+    }
+
+    /// A path written with `//` is written at its normal form.
+    #[test]
+    fn write_uses_the_normal_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = format!("/{}//d//c.txt", tmp.path().display());
+        write_canary_checked(&raw, b"n").unwrap();
+        assert_eq!(std::fs::read(tmp.path().join("d/c.txt")).unwrap(), b"n");
     }
 
     #[test]
