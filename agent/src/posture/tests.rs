@@ -1890,6 +1890,9 @@ fn fim(op: common::wire::FimOp, path: &str, pid: u32) -> Event {
         reader_dac_capable: false,
         capability: None,
         attrs: None,
+        file_key: None,
+        is_dir: false,
+        moved_in: false,
     })
 }
 

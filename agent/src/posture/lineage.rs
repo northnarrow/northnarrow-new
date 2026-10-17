@@ -222,6 +222,40 @@ pub const SYSTEM_DAEMON_EXES: &[&str] = &[
     "/usr/libexec/packagekitd",
 ];
 
+/// External audit NN-AUD-284 (FIMR-010): the package managers proper —
+/// [`SYSTEM_DAEMON_EXES`] without `mandb`. The FIM rules' package carve-out
+/// ([`crate::fim::rules::PackageManaged`]) and the drain's rate limiter
+/// trust these, through [`AuthSessionTracker::is_package_transaction_write`].
+/// `mandb` is not set-id (man-db's default), so any user runs it, with
+/// `LD_PRELOAD`, and has it fork whatever it likes: as a lineage root for
+/// those it turned a user's `crontab` install from High + KillProcess into
+/// Log + Low. When a package installs manual pages dpkg runs `mandb`
+/// through man-db's trigger, so its writes there descend from dpkg anyway.
+/// The posture's arms keep the wider list (`mandb` rebuilds its caches in
+/// bulk).
+pub const PACKAGE_MANAGER_EXES: &[&str] = &[
+    "/usr/bin/apt",
+    "/usr/bin/apt-get",
+    "/usr/bin/dnf",
+    "/usr/bin/dnf-3",
+    "/usr/bin/dpkg",
+    "/usr/bin/microdnf",
+    "/usr/bin/rpm",
+    "/usr/bin/yum",
+    "/usr/lib/snapd/snapd",
+    "/usr/libexec/packagekitd",
+];
+
+/// NN-AUD-284: how long after a package manager was last seen running its
+/// transaction still covers a write. There is no exit feed, so the last
+/// time a lineage walk found it running stands in for its exit.
+const TRANSACTION_EXIT_GRACE_NS: u64 = 30_000_000_000;
+
+/// NN-AUD-284: for a package manager that exited before any walk found it
+/// running (a short `dpkg -i`), how long after its exec its transaction
+/// covers a write.
+const TRANSACTION_UNSEEN_GRACE_NS: u64 = 60_000_000_000;
+
 /// Kernel-resolved exec paths of the Node.js interpreter. `npm` is a
 /// `#!/usr/bin/env node` script, so a process running `npm install`
 /// has `/proc/<pid>/exe` = the **node** binary (verified empirically),
@@ -583,6 +617,11 @@ struct InnerState {
     /// immune to the main FIFO eviction, with their own insertion order.
     daemons: HashMap<u32, Entry>,
     daemon_order: VecDeque<u32>,
+    /// External audit NN-AUD-284: package managers a lineage walk found
+    /// running — pid → (its start, as cached; the latest time it was seen
+    /// running, CLOCK_MONOTONIC ns). At most [`DAEMON_CACHE_CAP`] entries;
+    /// a later spawn reusing the pid drops its entry.
+    seen_running: HashMap<u32, (u64, u64)>,
     /// Insertion order — pushed on first insert, popped on
     /// eviction. We deliberately do NOT re-promote on overwrite:
     /// strict LRU would cost O(N) per overwrite without buying
@@ -635,6 +674,7 @@ impl AuthSessionTracker {
                     order: VecDeque::with_capacity(TRACKER_CAP),
                     daemons: HashMap::new(),
                     daemon_order: VecDeque::new(),
+                    seen_running: HashMap::new(),
                 }),
                 proc_root,
                 live,
@@ -737,6 +777,8 @@ impl AuthSessionTracker {
             script,
         };
         let mut s = self.inner.state.write();
+        // NN-AUD-284: whatever ran under this pid before is over.
+        s.seen_running.remove(&pid);
         // Review 49: package-manager spawns also go to the side cache;
         // any other spawn reusing the pid invalidates a stale copy there.
         if is_system_daemon_binary(&entry.exe) {
@@ -797,9 +839,109 @@ impl AuthSessionTracker {
     /// (`prctl(PR_SET_NAME)`-spoofable). Used by the mass-write arm of
     /// [`super::triggers::confirmed_intrusion`] and by
     /// [`super::triggers::persistence_mechanism`] to exempt routine
-    /// snapd / dpkg / apt / mandb maintenance from escalation.
+    /// snapd / dpkg / apt / mandb maintenance from escalation. The FIM
+    /// rules' package carve-out uses the narrower, time-bound
+    /// [`Self::is_package_transaction_write`] (external audit NN-AUD-284).
     pub fn is_system_daemon_mediated(&self, pid: u32) -> bool {
         self.lineage_exe_matches(pid, is_system_daemon_binary)
+    }
+
+    /// External audit NN-AUD-284 (FIMR-010): a write `pid` made at
+    /// `event_ns` (CLOCK_MONOTONIC) belongs to a package transaction —
+    /// `pid` runs, or descends from, a package manager proper
+    /// ([`PACKAGE_MANAGER_EXES`]: what the kernel executed, on the walk of
+    /// [`Self::is_system_daemon_mediated`], never `comm`), and that package
+    /// manager's run covers `event_ns`:
+    /// - it runs now, as the process the cache recorded (its start checked);
+    /// - or it has exited, and `event_ns` is no later than
+    ///   [`TRANSACTION_EXIT_GRACE_NS`] after a walk last found it running;
+    /// - or it exited before any walk found it running (a short `dpkg -i`),
+    ///   and `event_ns` is no later than [`TRANSACTION_UNSEEN_GRACE_NS`]
+    ///   after its exec.
+    ///
+    /// The nearest package manager in the lineage answers: a process a
+    /// finished `dpkg` left behind is not covered by the `apt` above it.
+    /// Used by the FIM rules' package carve-out and the drain's rate
+    /// limiter; the posture keeps [`Self::is_system_daemon_mediated`].
+    pub fn is_package_transaction_write(&self, pid: u32, event_ns: u64) -> bool {
+        let Some(Some(hop)) = self.lineage_walk(
+            pid,
+            |hop| is_package_manager_binary(&hop.exe),
+            LINEAGE_DEPTH_CAP,
+        ) else {
+            return false;
+        };
+        self.transaction_covers(&hop, event_ns)
+    }
+
+    /// NN-AUD-284: the run of the package manager `hop` covers `event_ns`
+    /// ([`Self::is_package_transaction_write`]).
+    fn transaction_covers(&self, hop: &Hop, event_ns: u64) -> bool {
+        if self.hop_running(hop) {
+            if hop.cached {
+                // Seen running no earlier than now, nor than the event it
+                // was found running for (the same clock).
+                let seen = event_ns.max(monotonic_ns());
+                // A package transaction writes in bursts: refresh at most
+                // once a second, so the walks share the read lock.
+                let fresh = self
+                    .inner
+                    .state
+                    .read()
+                    .seen_running
+                    .get(&hop.pid)
+                    .is_some_and(|(start, at)| {
+                        *start == hop.start_ns && at.saturating_add(1_000_000_000) >= seen
+                    });
+                if fresh {
+                    return true;
+                }
+                let mut s = self.inner.state.write();
+                let slot = s
+                    .seen_running
+                    .entry(hop.pid)
+                    .or_insert((hop.start_ns, seen));
+                if slot.0 != hop.start_ns {
+                    *slot = (hop.start_ns, seen);
+                }
+                slot.1 = slot.1.max(seen);
+                while s.seen_running.len() > DAEMON_CACHE_CAP {
+                    let Some(oldest) = s
+                        .seen_running
+                        .iter()
+                        .min_by_key(|(_, (_, seen))| *seen)
+                        .map(|(pid, _)| *pid)
+                    else {
+                        break;
+                    };
+                    s.seen_running.remove(&oldest);
+                }
+            }
+            return true;
+        }
+        if !hop.cached {
+            return false;
+        }
+        let seen = self
+            .inner
+            .state
+            .read()
+            .seen_running
+            .get(&hop.pid)
+            .filter(|(start, _)| *start == hop.start_ns)
+            .map(|(_, seen)| *seen);
+        match seen {
+            Some(seen) => event_ns <= seen.saturating_add(TRANSACTION_EXIT_GRACE_NS),
+            None => event_ns <= hop.spawn_ns.saturating_add(TRANSACTION_UNSEEN_GRACE_NS),
+        }
+    }
+
+    /// `hop` still runs as the process the walk read: `/proc` shows it
+    /// (not a zombie), and, for a cached hop with live checks, with the
+    /// cached start.
+    fn hop_running(&self, hop: &Hop) -> bool {
+        self.is_running(hop.pid)
+            && (!hop.cached || self.started_at(hop.pid, hop.start_ns) != Some(false))
     }
 
     /// Review 52: `pid` belongs to an administrator's interactive session
@@ -1485,6 +1627,22 @@ fn is_system_daemon_binary(exe: &Path) -> bool {
     SYSTEM_DAEMON_EXES.iter().any(|p| s == *p)
 }
 
+fn is_package_manager_binary(exe: &Path) -> bool {
+    let s = exe.to_string_lossy();
+    PACKAGE_MANAGER_EXES.iter().any(|p| s == *p)
+}
+
+/// CLOCK_MONOTONIC in ns: the clock of the kernel's event timestamps.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 fn is_elevation_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     ELEVATION_EXES.iter().any(|p| s == *p)
@@ -1658,6 +1816,64 @@ mod tests {
         let t = AuthSessionTracker::new("/proc");
         t.ingest_spawn(3096, 1, "/usr/bin/mandb", 1);
         assert!(t.is_system_daemon_mediated(3096));
+    }
+
+    /// External audit NN-AUD-284 (FIMR-010): a write belongs to a package
+    /// transaction while the package manager proper it descends from runs
+    /// (as the process the cache recorded), for 30 s after a walk last saw
+    /// it running, or — never seen running — for 60 s after its exec. Not
+    /// under `mandb`, which the posture still trusts.
+    #[test]
+    fn a_package_transaction_is_bound_to_its_package_managers_run() {
+        let tmp = TempDir::new().unwrap();
+        let ticks = |ns: u64| ns / tick_ns();
+        let t = AuthSessionTracker::live_on(tmp.path(), 0);
+        // far past the host's own monotonic clock
+        let b = 1_000_000_000 * S;
+        t.ingest_exec(200, 1, "/usr/bin/dpkg", &[], b, b);
+        t.ingest_exec(300, 200, "/bin/sh", &[], b + S, b + S);
+        write_started(tmp.path(), "200", 1, ticks(b));
+        assert!(t.is_package_transaction_write(300, b + 2 * S), "dpkg runs");
+        assert!(t.is_package_transaction_write(200, b + 2 * S));
+        // dpkg exits: its sh is covered for 30 s after dpkg was last seen
+        fs::remove_dir_all(tmp.path().join("200")).unwrap();
+        assert!(t.is_package_transaction_write(300, b + 32 * S));
+        assert!(!t.is_package_transaction_write(300, b + 33 * S));
+        assert!(
+            t.is_system_daemon_mediated(300),
+            "the posture's predicate is unchanged"
+        );
+        // a new dpkg in the pid, never seen running: its exec + 60 s
+        t.ingest_exec(200, 1, "/usr/bin/dpkg", &[], b + 100 * S, b + 100 * S);
+        t.ingest_exec(301, 200, "/bin/sh", &[], b + 101 * S, b + 101 * S);
+        assert!(t.is_package_transaction_write(301, b + 160 * S));
+        assert!(!t.is_package_transaction_write(301, b + 161 * S));
+        // the pid now names a later process (a fork, no exec event)
+        write_started(tmp.path(), "200", 1, ticks(b + 200 * S));
+        write_exe(tmp.path(), 200, "/usr/bin/bash");
+        write_status(tmp.path(), 200, 1);
+        assert!(!t.is_package_transaction_write(301, b + 120 * S));
+        // mandb: the posture's, not a package manager
+        t.ingest_exec(910, 1, "/usr/bin/mandb", &[], b, b);
+        t.ingest_exec(920, 910, "/usr/bin/crontab", &[], b + S, b + S);
+        write_started(tmp.path(), "910", 1, ticks(b));
+        assert!(t.is_system_daemon_mediated(920));
+        assert!(!t.is_package_transaction_write(920, b + 2 * S));
+        assert!(!t.is_package_transaction_write(910, b + 2 * S));
+    }
+
+    /// NN-AUD-284: the package managers proper are the posture's list
+    /// without `mandb`, so the review-49 side cache keeps holding them.
+    #[test]
+    fn package_managers_are_the_system_daemons_without_mandb() {
+        for exe in PACKAGE_MANAGER_EXES {
+            assert!(SYSTEM_DAEMON_EXES.contains(exe), "{exe}");
+        }
+        let left: Vec<_> = SYSTEM_DAEMON_EXES
+            .iter()
+            .filter(|e| !PACKAGE_MANAGER_EXES.contains(e))
+            .collect();
+        assert_eq!(left, [&"/usr/bin/mandb"]);
     }
 
     #[test]

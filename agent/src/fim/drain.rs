@@ -17,7 +17,7 @@
 //!    path.
 //! 5. If the SHA actually differs, the drift is REAL. Apply
 //!    the §6.5 hierarchical token-bucket rate-limiter to drift
-//!    written by a package manager (review 76: only there; any
+//!    written in a package transaction (review 76: only there; any
 //!    other writer always reaches the rules), then:
 //!    - **Always** append a [`FimDriftEntry`] to
 //!      `/var/lib/northnarrow/fim_drift.jsonl` (evidence
@@ -1690,11 +1690,13 @@ fn forget_if_gone(
 ///    Equal → no real drift; skip silently (kernel hook fires
 ///    on every setattr including no-op touches).
 /// 4. Apply rate limiter → record `decision_engine_skipped` +
-///    `skip_reason` on the persisted entry. Only drift whose writer
-///    descends from a package manager (`lineage`) is throttled: the
-///    buckets are host-wide, so a writer that could spend them could
-///    also skip the rules for its own next write (review 76). With no
-///    `lineage`, nothing is throttled.
+///    `skip_reason` on the persisted entry. Only drift written in a
+///    package transaction (`lineage`,
+///    [`AuthSessionTracker::is_package_transaction_write`]) is throttled:
+///    the buckets are host-wide, so a writer that could spend them could
+///    also skip the rules for its own next write (review 76; external
+///    audit NN-AUD-284: not under `mandb`, not after the transaction).
+///    With no `lineage`, nothing is throttled.
 /// 5. Append to drift DB (always, evidence preservation).
 /// 6. Push `Event::Fim` onto `outbox` ONLY if rate limiter
 ///    allowed. The drain loop forwards the outbox to the engine
@@ -1745,11 +1747,23 @@ pub fn process_drift(
     // so its later in-place edits are caught by the write-then-close
     // hook. Events without a child leaf (every non-Create/Rename op, and
     // renames whose dest dir isn't watched) fall through unchanged.
+    // External audit NN-AUD-285 (FIMR-011): which file the event is about.
+    // The watched inode itself, unless a child is reconstructed below.
+    let mut ident = FileIdent {
+        key: Some(key),
+        is_dir: false,
+        moved_in: false,
+    };
+    let mut child_read = false;
     let (path, op, child_truncated) =
         if matches!(op, FimOp::Created | FimOp::Renamed) && raw.child_name[0] != 0 {
             match reconstruct_child_path(&path, raw) {
                 Some(child) => {
                     let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
+                    // Read before the enrollment below names the inode by
+                    // this path.
+                    ident = child_ident(&child, op == FimOp::Renamed, path_map);
+                    child_read = true;
                     if !enroll_path(&child, WatchClass::RuntimeChild, path_map, watched_paths) {
                         queues(|q| q.enroll.push(child.clone(), Instant::now()));
                     }
@@ -1876,6 +1890,9 @@ pub fn process_drift(
                 reader_dac_capable: false,
                 capability: None,
                 attrs: None,
+                file_key: ident.key,
+                is_dir: false,
+                moved_in: ident.moved_in,
             }));
             return Ok(true);
         }
@@ -1893,6 +1910,12 @@ pub fn process_drift(
         FimOp::Deleted | FimOp::Renamed => None,
         _ => content_after(&path, raw.timestamp_ns),
     };
+    // NN-AUD-285: a watched directory's own event (its setattr) is told from
+    // a file's. A directory is never hashed, so only an event without
+    // content needs the look.
+    if content.is_none() && !child_read {
+        ident.is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+    }
     let new_sha256 = content.as_ref().map(|c| c.sha256.clone());
     let new_size = content.as_ref().map(|c| c.size);
     let baseline_sha256 = last_baseline.map(|b| b.sha256.clone());
@@ -1989,7 +2012,10 @@ pub fn process_drift(
     // transaction (whose writes the rules log, not kill, anyway); every
     // other write reaches the rules. The journal and the detection store
     // have their own per-rule budget (`detection_budget`).
-    let package_managed = lineage.is_some_and(|l| l.is_system_daemon_mediated(raw.modifier_pid));
+    // External audit NN-AUD-284: the package carve-out's own test — the
+    // package managers proper, during their transaction.
+    let package_managed =
+        lineage.is_some_and(|l| l.is_package_transaction_write(raw.modifier_pid, raw.timestamp_ns));
     let (skipped, skip_reason) = if package_managed {
         match rate_limiter.try_consume(severity) {
             Ok(()) => (false, String::new()),
@@ -2071,9 +2097,49 @@ pub fn process_drift(
             reader_dac_capable: false,
             capability: None,
             attrs,
+            file_key: ident.key,
+            is_dir: ident.is_dir,
+            moved_in: ident.moved_in,
         }));
     }
     Ok(true)
+}
+
+/// External audit NN-AUD-285 (FIMR-011): the file a FIM event is about
+/// ([`FimEvent::file_key`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdent {
+    key: Option<InodeKey>,
+    is_dir: bool,
+    moved_in: bool,
+}
+
+/// NN-AUD-285: the file a child created in (or moved into, `moved_in`) a
+/// watched directory is, read at its path. The hooks fire before the
+/// operation: the name may not hold the file yet, or hold it no more (a
+/// temporary file renamed on), and then the file is not told. An inode
+/// the map already names by this very path is the file the operation
+/// replaces, still there (a rename over it not landed yet): not told
+/// either.
+fn child_ident(child: &str, moved_in: bool, path_map: &InodePathMap) -> FileIdent {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(child) else {
+        return FileIdent {
+            key: None,
+            is_dir: false,
+            moved_in,
+        };
+    };
+    let key = InodeKey {
+        dev: crate::fim::attach::stat_dev_to_kernel_dev(meta.dev()),
+        ino: meta.ino(),
+    };
+    let replaced = path_map.lookup(&key).as_deref() == Some(child);
+    FileIdent {
+        key: (!replaced).then_some(key),
+        is_dir: meta.is_dir(),
+        moved_in,
+    }
 }
 
 /// External audit NN-AUD-121 (FIMP-009): the `skip_reason` of a drift row
@@ -3661,9 +3727,11 @@ mod tests {
             watched_meta.ino(),
             FimOp::Modified as u8,
         );
-        // The writer descends from dpkg: the only drift the buckets pace
-        // (review 76).
-        let lineage = AuthSessionTracker::new(dir.path().join("no-proc"));
+        // The writer is dpkg, running: the only drift the buckets pace
+        // (review 76; NN-AUD-284: during the transaction).
+        let proc_root = dir.path().join("proc");
+        running_proc(&proc_root, raw.modifier_pid);
+        let lineage = AuthSessionTracker::new(&proc_root);
         lineage.ingest_spawn(raw.modifier_pid, 1, "/usr/bin/dpkg", 0);
         let emitted = process_drift(
             &raw,
@@ -3747,6 +3815,236 @@ mod tests {
         let row: FimDriftEntry = serde_json::from_str(body.trim_end()).unwrap();
         assert!(!row.decision_engine_skipped);
         assert!(row.skip_reason.is_empty());
+    }
+
+    /// `<proc_root>/<pid>` of a running process.
+    fn running_proc(proc_root: &Path, pid: u32) {
+        let d = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("stat"),
+            format!("{pid} (p) S 1 {pid} {pid} 0 -1 0\n"),
+        )
+        .unwrap();
+    }
+
+    /// External audit NN-AUD-284 (FIMR-010): the buckets pace only a
+    /// package transaction's burst. A writer under `mandb` (any user runs
+    /// it) and one a finished dpkg left behind are not paced, so neither
+    /// can spend the buckets to keep its next write from the rules.
+    #[test]
+    fn process_drift_paces_only_a_running_package_transaction() {
+        let dir = TempDir::new().unwrap();
+        let mut drift_db = drift_db_in(&dir);
+        let path_map = InodePathMap::new();
+        let watched = dir.path().join("watched.bin");
+        std::fs::write(&watched, b"new content").unwrap();
+        let key = key_for_path(&watched).unwrap();
+        path_map.insert(key, watched.to_string_lossy().to_string());
+        let stale_baseline = dummy_baseline(&watched.to_string_lossy(), &"99".repeat(32));
+        let proc_root = dir.path().join("proc");
+        let lineage = AuthSessionTracker::new(&proc_root);
+        let raw = fake_raw(key.dev, key.ino, FimOp::Modified as u8);
+        // mandb (running) → the writer; dpkg exited ten minutes before the
+        // write → another writer.
+        lineage.ingest_spawn(7001, 1, "/usr/bin/mandb", 1);
+        running_proc(&proc_root, 7001);
+        lineage.ingest_spawn(7002, 7001, "/usr/bin/crontab", 2);
+        lineage.ingest_spawn(7101, 1, "/usr/bin/dpkg", raw.timestamp_ns - 600_000_000_000);
+        lineage.ingest_spawn(7102, 7101, "/bin/sh", raw.timestamp_ns - 599_000_000_000);
+        for writer in [7002, 7102] {
+            let mut raw = raw;
+            raw.modifier_pid = writer;
+            let mut out = Vec::new();
+            let emitted = process_drift(
+                &raw,
+                &path_map,
+                Some(&stale_baseline),
+                &mut drift_db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::with_caps(0, 0),
+                None,
+                Some(&lineage),
+                Some(&mut out),
+            )
+            .unwrap();
+            assert!(emitted, "writer {writer}: the drift must reach the rules");
+        }
+        assert!(drift_rows(&dir)
+            .iter()
+            .all(|r| r["decision_engine_skipped"] == false));
+    }
+
+    /// External audit NN-AUD-285 (FIMR-011): each event names the file it
+    /// is about — a child as found at its path (not yet there, there, moved
+    /// in, or the name still holding the file a rename replaces), a
+    /// watched file by its own inode, a watched directory as one.
+    #[test]
+    fn events_name_the_file_they_are_about() {
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let spool = dir.path().join("crontabs");
+        std::fs::create_dir(&spool).unwrap();
+        let dir_key = InodeKey { dev: 0x99, ino: 9 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, spool.to_string_lossy().into_owned());
+        // the user's crontab before the install, watched
+        std::fs::write(spool.join("nn"), b"# old\n").unwrap();
+        let old = key_for_path(&spool.join("nn")).unwrap();
+        path_map.insert(old, spool.join("nn").to_string_lossy().into_owned());
+        let child = |leaf: &[u8], op: FimOp| {
+            let mut raw = fake_raw(dir_key.dev, dir_key.ino, op as u8);
+            raw.child_name[..leaf.len()].copy_from_slice(leaf);
+            raw
+        };
+        let mut run = |raw: FimDriftRaw| {
+            let mut out = Vec::new();
+            process_drift(
+                &raw,
+                &path_map,
+                None,
+                &mut db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            match out.pop() {
+                Some(Event::Fim(fe)) => (fe.file_key, fe.moved_in, fe.is_dir),
+                other => panic!("expected one FIM event, got {other:?}"),
+            }
+        };
+        // created, read before it exists
+        assert_eq!(run(child(b"tmp.A", FimOp::Created)), (None, false, false));
+        std::fs::write(spool.join("tmp.A"), b"* * * * * true\n").unwrap();
+        let tmp = key_for_path(&spool.join("tmp.A")).unwrap();
+        // created, read once there
+        assert_eq!(
+            run(child(b"tmp.A", FimOp::Created)),
+            (Some(tmp), false, false)
+        );
+        // a write of the enrolled file: its own inode
+        assert_eq!(
+            run(fake_raw(tmp.dev, tmp.ino, FimOp::Modified as u8)).0,
+            Some(tmp)
+        );
+        // moved over the old crontab, read before the rename landed
+        assert_eq!(run(child(b"nn", FimOp::Renamed)), (None, true, false));
+        std::fs::rename(spool.join("tmp.A"), spool.join("nn")).unwrap();
+        // … and after: the temporary file's inode
+        assert_eq!(run(child(b"nn", FimOp::Renamed)), (Some(tmp), true, false));
+        // the spool directory's own setattr
+        assert_eq!(
+            run(fake_raw(dir_key.dev, dir_key.ino, FimOp::Modified as u8)),
+            (Some(dir_key), false, true)
+        );
+    }
+
+    /// NN-AUD-285, end to end: the events the drain emits for a `crontab`
+    /// install (each read at its worst moment) give NN-L-FIM-007 one
+    /// verdict, and those of two drop-ins written by one process (`cp a b
+    /// /etc/cron.d/`) two — whether or not the drain read them in time.
+    /// The temp directory stands for the cron directory.
+    #[test]
+    fn a_crontab_install_is_one_verdict_and_two_dropins_are_two() {
+        use crate::decision::Rule;
+        let dir = TempDir::new().unwrap();
+        let mut db = drift_db_in(&dir);
+        let path_map = InodePathMap::new();
+        let watched = |name: &str, ino: u64| {
+            let d = dir.path().join(name);
+            std::fs::create_dir(&d).unwrap();
+            let key = InodeKey { dev: 0x42, ino };
+            path_map.insert(key, d.to_string_lossy().into_owned());
+            (d, key)
+        };
+        let (spool, spool_key) = watched("crontabs", 1);
+        let (crond, crond_key) = watched("cron.d", 2);
+        std::fs::write(spool.join("nn"), b"# old\n").unwrap();
+        let old = key_for_path(&spool.join("nn")).unwrap();
+        path_map.insert(old, spool.join("nn").to_string_lossy().into_owned());
+        let child = |key: InodeKey, leaf: &[u8], op: FimOp| {
+            let mut raw = fake_raw(key.dev, key.ino, op as u8);
+            raw.child_name[..leaf.len()].copy_from_slice(leaf);
+            raw
+        };
+        let as_cron = |mut fe: FimEvent| {
+            fe.path = fe
+                .path
+                .replace(&*spool.to_string_lossy(), "/var/spool/cron/crontabs")
+                .replace(&*crond.to_string_lossy(), "/etc/cron.d");
+            Event::Fim(fe)
+        };
+        let run = |raw: FimDriftRaw, db: &mut FimDriftDb| -> Event {
+            let mut out = Vec::new();
+            process_drift(
+                &raw,
+                &path_map,
+                None,
+                db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            match out.pop() {
+                Some(Event::Fim(fe)) => as_cron(fe),
+                other => panic!("expected one FIM event, got {other:?}"),
+            }
+        };
+        let mut install = Vec::new();
+        install.push(run(child(spool_key, b"tmp.B", FimOp::Created), &mut db));
+        std::fs::write(spool.join("tmp.B"), b"* * * * * true\n").unwrap();
+        retry_pending_enrollments(&path_map, None);
+        let tmp = key_for_path(&spool.join("tmp.B")).unwrap();
+        install.push(run(
+            fake_raw(tmp.dev, tmp.ino, FimOp::Modified as u8),
+            &mut db,
+        ));
+        install.push(run(child(spool_key, b"nn", FimOp::Renamed), &mut db));
+        std::fs::rename(spool.join("tmp.B"), spool.join("nn")).unwrap();
+        install.push(run(
+            fake_raw(tmp.dev, tmp.ino, FimOp::Modified as u8),
+            &mut db,
+        ));
+        install.push(run(
+            fake_raw(spool_key.dev, spool_key.ino, FimOp::Modified as u8),
+            &mut db,
+        ));
+        let rule = crate::fim::rules::NnLFim007CronDropInCreated::with_fresh_window();
+        let fired = install
+            .iter()
+            .filter(|e| rule.evaluate(e).is_some())
+            .count();
+        assert_eq!(fired, 1, "one crontab install: {install:#?}");
+
+        for early in [false, true] {
+            let rule = crate::fim::rules::NnLFim007CronDropInCreated::with_fresh_window();
+            let mut fired = Vec::new();
+            for leaf in ["job-a", "job-b"] {
+                let leaf = if early {
+                    format!("{leaf}-early")
+                } else {
+                    leaf.to_string()
+                };
+                if !early {
+                    std::fs::write(crond.join(&leaf), b"* * * * * root true\n").unwrap();
+                }
+                let e = run(child(crond_key, leaf.as_bytes(), FimOp::Created), &mut db);
+                if let Some(v) = rule.evaluate(&e) {
+                    fired.push(v.event_filename);
+                }
+            }
+            assert_eq!(
+                fired.len(),
+                2,
+                "two drop-ins (read early: {early}): {fired:?}"
+            );
+        }
     }
 
     // ─── BUG-012 (v2) — op-level FimOp::Opened handling ─────────────

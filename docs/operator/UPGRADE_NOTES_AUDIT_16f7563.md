@@ -404,6 +404,19 @@ Now **killed, or answered, where they were recorded or missed**:
   `.ssh/authorized_keys` (NN-AUD-116 FIMR-007, NN-AUD-117 FIMR-008,
   NN-AUD-118 FIMR-009, lab PR 111). A watched file replaced by a rename is
   judged like a modification (NN-AUD-026 FIMR-004, lab PR 102).
+- FIM (Wave 3, lab PR 173): a process under `mandb` is no longer treated
+  as a package transaction, so a user's crontab installed through it is
+  killed (NN-L-FIM-007); the package carve-out ends with the transaction
+  (30 s after the package manager was last seen running, 60 s after its
+  exec if never seen); a second cron drop-in by one process within 2 s
+  draws its own verdict; NN-L-FIM-011..014 fire on a cloud credential file
+  replaced by a rename, truncated, chmod'ed or chown'ed; NN-L-FIM-010
+  matches `.LOCKED` like `.locked` (NN-AUD-284 FIMR-010, NN-AUD-285
+  FIMR-011, NN-AUD-286 FIMR-012, NN-AUD-287 FIMR-013). `/etc/crontab.bak`
+  no longer fires as `/etc/crontab` (NN-AUD-288 FIMR-014). **Regression:**
+  a process a maintainer script left running that writes a watched path
+  after the transaction is killed; an in-place edit of a watched cloud
+  credential file by another program gives two High verdicts.
 - New rule NN-L-NET-021 names a process that floods `listen()` or
   `io_uring_setup()` (NN-AUD-103 EBPF-009, NN-AUD-105 EBPF-013, lab PR
   129).

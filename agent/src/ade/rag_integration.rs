@@ -344,6 +344,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         });
         let q = build_rag_query_from_event(&e);
         assert!(q.contains("fim drift"));

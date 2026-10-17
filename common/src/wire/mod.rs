@@ -513,7 +513,15 @@ impl DnsQueryRaw {
 /// BPF map's key blob is naturally 8-aligned with no implicit pad.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(
+    feature = "std",
+    derive(
+        bytemuck::Pod,
+        bytemuck::Zeroable,
+        serde::Serialize,
+        serde::Deserialize
+    )
+)]
 pub struct InodeKey {
     pub dev: u64,
     pub ino: u64,
@@ -1195,6 +1203,24 @@ pub struct FimEvent {
     /// [`FimOp::AttrChanged`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attrs: Option<FileAttrChange>,
+    /// External audit NN-AUD-285 (FIMR-011): the file the event is about,
+    /// as the drain found it — the watched inode itself, or, for a child
+    /// created in or moved into a watched directory, the inode at the
+    /// child's path once it was there. `None` when it could not be told:
+    /// the child was not there yet, was already gone, or the name still
+    /// held the file the operation replaces. NN-L-FIM-007 tells one edit
+    /// (a temporary file renamed into place keeps its inode) from two
+    /// drop-ins by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_key: Option<InodeKey>,
+    /// NN-AUD-285: the event is about a watched directory itself (the
+    /// cron spool directory's own setattr), not a file in it.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub is_dir: bool,
+    /// NN-AUD-285: the child was moved into the watched directory (a
+    /// rename, reported as [`FimOp::Created`]), not created there.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub moved_in: bool,
 }
 
 /// Wave 2 (TST-004): a watched file's permission bits and ownership, as
@@ -1931,6 +1957,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1972,6 +2001,41 @@ mod tests {
         assert_eq!(parsed.baseline_size, None);
     }
 
+    /// External audit NN-AUD-285: the file identity is optional on the
+    /// wire — a row written before reads with none, an event without one
+    /// writes the row it wrote before, and one with it round-trips.
+    #[test]
+    fn fim_event_file_identity_is_optional_on_the_wire() {
+        let legacy = serde_json::json!({
+            "timestamp_ns": 1u64,
+            "path": "/etc/cron.d/job",
+            "op": 2u8,
+            "new_sha256": null,
+            "baseline_sha256": null,
+            "modifier_exe": null,
+            "modifier_pid": 7u32,
+            "modifier_uid": 0u32,
+            "modifier_comm": "cp",
+        });
+        let mut parsed: FimEvent = serde_json::from_value(legacy).expect("legacy row");
+        assert_eq!(parsed.file_key, None);
+        assert!(!parsed.is_dir && !parsed.moved_in);
+        let json = serde_json::to_string(&parsed).unwrap();
+        for absent in ["file_key", "is_dir", "moved_in"] {
+            assert!(!json.contains(absent), "{absent} written unset: {json}");
+        }
+        parsed.file_key = Some(InodeKey { dev: 8, ino: 1234 });
+        parsed.is_dir = true;
+        parsed.moved_in = true;
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(
+            json.contains(r#""file_key":{"dev":8,"ino":1234}"#),
+            "{json}"
+        );
+        let back: FimEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, parsed);
+    }
+
     /// Polish #3 test: rename event with a resolved dest_path
     /// round-trips correctly — the rule layer reads
     /// `fe.dest_path.as_deref().unwrap_or("")` for the
@@ -1997,6 +2061,9 @@ mod tests {
             reader_dac_capable: false,
             capability: None,
             attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: FimEvent = serde_json::from_str(&json).expect("deserialize");

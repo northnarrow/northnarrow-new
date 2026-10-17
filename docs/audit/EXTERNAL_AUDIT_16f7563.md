@@ -493,11 +493,11 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-281 | EVD-019 | Low | Evidence logs | S | fixed (lab PR 169) |
 | NN-AUD-282 | EVD-020 | Low | Evidence logs | S | open |
 | NN-AUD-283 | EVD-022 | Low | Evidence logs | S | partly fixed (overwrite closed, lab PR 131); open |
-| NN-AUD-284 | FIMR-010 | Low | FIM rules | M | partly fixed; open |
-| NN-AUD-285 | FIMR-011 | Low | FIM rules | M | open |
-| NN-AUD-286 | FIMR-012 | Low | FIM rules | S | partly fixed; open |
-| NN-AUD-287 | FIMR-013 | Low | FIM rules | S | open |
-| NN-AUD-288 | FIMR-014 | Low | FIM rules | S | open |
+| NN-AUD-284 | FIMR-010 | Low | FIM rules | M | fixed (lab PR 173) |
+| NN-AUD-285 | FIMR-011 | Low | FIM rules | M | fixed (lab PR 173) |
+| NN-AUD-286 | FIMR-012 | Low | FIM rules | S | fixed (lab PR 173) |
+| NN-AUD-287 | FIMR-013 | Low | FIM rules | S | fixed (lab PR 173) |
+| NN-AUD-288 | FIMR-014 | Low | FIM rules | S | fixed (lab PR 173) |
 | NN-AUD-289 | FIMR-015 | Low | FIM rules | S | open |
 | NN-AUD-290 | FIMR-016 | Low | FIM rules | S (+L) | open (S part; L part a product decision) |
 | NN-AUD-291 | FIMP-012 | Low | FIM pipeline | S/M | open |
@@ -6076,3 +6076,115 @@ group, the ones an unprivileged user or a local attacker could use first.
     two firing credential-read tests fail; with each scope charged to
     itself instead of its tenant, the many-scopes test fails.
   - Lab: Ubuntu 24.04, postcorr172-probe.sh — before: the build of `main` with lab PRs 167–171; after: this lot on top. Control (a unit's `nc`, a sensitive read, an exfiltration burst): COMBAT in both builds. Flood: user nn ran 300 `nc` between the unit's first signal and its burst — before ENGAGED only (the unit's evidence evicted from the shared 64-entry FIFO), after COMBAT (NEUTRALIZE), as without the flood. A root unit's privileged signal against the same flood: the posture reset by the probe before isolation in both runs. Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.
+- **Wave 3 — FIM rule evasions and gaps, lab PR 173.** NN-AUD-284
+  (FIMR-010), NN-AUD-285 (FIMR-011), NN-AUD-288 (FIMR-014), NN-AUD-286
+  (FIMR-012), NN-AUD-287 (FIMR-013): batch A of the Wave 3 triage, group
+  G6. All Low; no kernel change.
+  - FIMR-010, leg (c): `/usr/bin/mandb` was in `SYSTEM_DAEMON_EXES`, which
+    the package carve-out (`PackageManaged`) trusted. It is not set-id
+    (man-db's `install-setuid` is off by default; the probe prints the
+    mode), so a user's `LD_PRELOAD` constructor
+    runs inside the `mandb` process, whose exec the spawn cache records,
+    and a `crontab` it forks descends from a `mandb` that ran before the
+    fork — the order POS-003 asks for. The user's crontab install was Log
+    + Low. New `PACKAGE_MANAGER_EXES` (the list without `mandb`; a test
+    holds it a subset) and `AuthSessionTracker::is_package_transaction_write`
+    serve `PackageManaged` and the drain's rate limiter (review 76: only a
+    package transaction's drift is paced, and a writer under `mandb` could
+    spend the buckets). When a package installs manual pages, dpkg runs
+    `mandb` through man-db's trigger, so those writes still descend from
+    dpkg. `is_system_daemon_mediated` is unchanged, with `mandb`, for the
+    posture's triggers (`ControlSurfaceTamper` does not use it: it reads
+    `fim::rules::is_bait_tamper` and the stack exemption) and for the other
+    callers.
+  - FIMR-010, leg 1: the exemption is bound to the transaction. The
+    nearest package manager in the writer's lineage (a `dpkg` that has
+    finished does not borrow the cover of the `apt` still running above
+    it) covers a write when it runs now as the process the cache recorded
+    (`/proc` shows it, not a zombie, with the cached start under the live
+    checks); when it was last seen running at most 30 s before the write —
+    `seen_running`, refreshed (at most once a second) whenever a walk finds
+    it running, keyed by pid and start, dropped when the pid is reused,
+    capped at 64 — there is no exit feed; or, never seen running (a short
+    `dpkg -i`), when it was executed at most 60 s before. Leg 3 (PID reuse)
+    was handled by POS-003 (lab PR 101); leg 2 (Low severity) is not taken,
+    as the audit's verify note says: nothing reads it.
+  - FIMR-011: NN-L-FIM-007's window was keyed on `(pid, directory bucket)`,
+    so one process's second drop-in within 2 s drew no verdict. The drain
+    now carries, on `FimEvent`, the inode of the file the event is about:
+    the watched inode itself, or, for a child created in or renamed into a
+    watched directory, the inode `stat` finds at the child's path before
+    it is enrolled (`file_key`; `None` when the name does not hold the file
+    yet, holds it no more, or still holds the inode the map names by that
+    path — the file a rename over it replaces), `is_dir` for a watched
+    directory's own event (an event without content is looked at), and
+    `moved_in` for a rename into the directory. All three serde default,
+    absent when unset, so rows written before are read and written as they
+    were. `CronEditWindow` remembers each fire (pid, bucket, path, file, at
+    most 1,024) for the window: an event of a file already fired for, a
+    directory's own event, an event without a file on a fired path, and a
+    moved-in event without one are part of that edit; a fire without a file
+    takes the first file a later event on its path, or a file moved in,
+    names; anything else — a new file under a new name — fires. One
+    `crontab -e` is one verdict in each order the drain may read it (tested:
+    every file read in time, the temporary file read before it exists or
+    after it was renamed, the final name read before the rename landed, an
+    in-place edit); two drop-ins, named alike or `tmp.*`, are two.
+    Accepted: a file gone before the drain looked, then a file moved in by
+    the same process within 2 s, are one verdict naming the first — the
+    unknown file cannot be told from a crontab temporary file renamed
+    before the drain looked; both are in the drift log. An editor saving a
+    new inode at each save gives one verdict per inode (the triage's
+    regression note).
+  - FIMR-014: a `CRON_DROPIN_PATHS` entry ending in `/` matches what lies
+    below it, a file entry (`/etc/crontab`) only itself.
+  - FIMR-012: `evaluate_cred_read` (NN-L-FIM-011..014) accepts `Opened`,
+    `Modified` and `AttrChanged`, like the credential-store rules: the
+    credentials replaced by a rename over them (FIMR-004), truncated by
+    path, chmod'ed or chown'ed. `OwnClient` still exempts the cloud's CLI;
+    the test that said such a change was "covered by other rules" now
+    checks that a delete is not a verdict.
+  - FIMR-013: NN-L-FIM-010 compares the ASCII-lowercased suffix, on both
+    sides; the list and its negatives (`.lock`, `.bak`, a bare `locked`)
+    are unchanged.
+  - Found while fixing, not changed here:
+    - the posture's arms (mass-write, staged exec, `PersistenceMechanism`)
+      still trust the `mandb` lineage, so a user's crontab installed through
+      it raises no `PersistenceMechanism` (posture group; the triage keeps
+      the wide list there for `mandb`'s cache rebuilds);
+    - NN-L-NET-008 and the `package_mediated` carve-out of
+      NN-L-CHAIN-002/005/007, and R009's `sanctioned`, call
+      `is_system_daemon_mediated` too: a user's process forked under `mandb`
+      and run from `/tmp` that calls out is recorded by NET-008 instead of
+      killed and draws no chain verdict (NETR group; R009 needs root);
+    - NN-L-FIM-010's destination side cannot match on a live host:
+      `fim_rename_observe` gives the combined rename event the new
+      directory's key as its destination, so `dest_path` is at most that
+      directory's path, and a rename into a watched directory reaches the
+      rules as `Created`, which the rule does not read. A watched file
+      renamed to `x.locked` draws no FIM-010 verdict; the unit tests feed a
+      `dest_path` the drain never builds. Fix: the new leaf on the combined
+      event (eBPF).
+  - Tests: `mandb_lineage_does_not_exempt_fim_rules`,
+    `descendant_outliving_the_transaction_is_not_exempt`,
+    `short_dpkg_write_within_grace_is_exempt`,
+    `a_package_transaction_is_bound_to_its_package_managers_run`,
+    `package_managers_are_the_system_daemons_without_mandb`,
+    `process_drift_paces_only_a_running_package_transaction`,
+    `fim007_dedups_single_edit_burst_into_one_verdict` (five read orders),
+    `fim007_two_distinct_dropins_fire_twice`,
+    `fim007_tmp_named_dropins_fire_twice`,
+    `fim007_distinct_dirs_pids_and_post_window_edits_still_fire` (a second
+    drop-in now fires), `events_name_the_file_they_are_about`,
+    `a_crontab_install_is_one_verdict_and_two_dropins_are_two` (drain to
+    rule), `cron_bucket_separates_file_and_dir_entries`,
+    `fim011_fires_on_replaced_credentials`, `fim011_fires_on_chmod_widening`,
+    `fim011_own_cli_modify_is_exempt`,
+    `fim010_matches_extension_case_insensitively`,
+    `fim_event_file_identity_is_optional_on_the_wire`; the package fixtures
+    show their package managers running in the fake `/proc`. Each fails
+    with its part of the fix taken out (checked by inverting it: `mandb`
+    put back, the transaction check made true, the `(pid, bucket)` key, the
+    claim of a fire without a file, the prefix match, `Opened` only, the
+    case-sensitive suffix). Host: 2,207 passed, 0 failed.
+  - Lab: Ubuntu 24.04, fimrules173-probe.sh — before: the build of `main` with lab PRs 167–171; after: this lot on top. A user's `mandb` run with `LD_PRELOAD` forking `crontab`: NN-L-FIM-007 Log, Low before; High, KillProcess after (a `crontab` run directly: High in both). Two cron drop-ins written by one process: 1 verdict before, 2 after. `/root/.aws/credentials` replaced, truncated by path and `chmod`-ed without being opened: no verdict before; NN-L-FIM-011 High on each after. `apt-get install --reinstall rsync`: Log-only rows in both builds. Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.
