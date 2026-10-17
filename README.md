@@ -235,8 +235,9 @@ FIM trust model, container hosts, honeypots. Lab and test runbook:
   a branch do not verify as a release. Building and signing are separate jobs; the job
   that compiles the dependency tree cannot request the signing token.
 - **Packages.** The `.rpm` is signed on tag builds, in its own job, and checked with
-  `rpm -K` or dnf's `localpkg_gpgcheck`; the public key and its fingerprint are published
-  with the first signed release. The `.deb` is checked with its tag-bound attestation
+  `rpm -K` or dnf's `localpkg_gpgcheck` against
+  [`deploy/release/RPM-GPG-KEY-northnarrow.asc`](deploy/release/RPM-GPG-KEY-northnarrow.asc),
+  fingerprint `BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D` (RSA 4096, signing only, expires 2028-10-16). The `.deb` is checked with its tag-bound attestation
   before `dpkg -i`, since dpkg and apt do not verify a single package file
   ([operator guide §6.1](docs/operator/INSTALL_UPGRADE_UNINSTALL.md#61-verify-a-package-before-installing-it)).
 - **Pinned CI.** Every GitHub action is pinned by commit SHA, every tool installed with

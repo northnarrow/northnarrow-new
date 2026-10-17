@@ -28,7 +28,7 @@ Status: `open`, `fixed (lab PR N)`, `partial (lab PR N; what remains)`,
 |---|---|---|---|
 | 0 | 25 (6 Critical, 19 High) | 25 fixed | lab PRs 78–85 |
 | 1 | 54 High | 53 fixed, 1 already fixed | three rows (NN-AUD-048, -061, -062) were taken with Wave 0 and appear in both tables; Waves 0 and 1 together cover the 76 Critical and High findings; fixes up to lab PR 109 |
-| 2 | 159 Medium | 152 fixed, 7 already fixed | one finding narrowed first, its residual fixed (NN-AUD-092); one fix leaves an operational residual for the maintainer, the rpm signing key and a signed apt repository (NN-AUD-199); fixes in lab PRs 110–161 |
+| 2 | 159 Medium | 152 fixed, 7 already fixed | one finding narrowed first, its residual fixed (NN-AUD-092); one fix leaves an operational residual for the maintainer, a signed apt repository (NN-AUD-199; the rpm signing key exists since 2026-10-17); fixes in lab PRs 110–161 |
 | 3 | 188 Low, 21 Informational | in progress: re-checked on 2026-10-16 — 14 already fixed, 30 fixed in part, 5 obsolete, 10 declined; 180 to fix | a Low finding fixed alongside a Medium one is named in that Medium's note (CMB-026 with NN-AUD-148); NN-AUD-299 fixed with lab PR 166 |
 
 The 234 hardening improvements of the report are not tracked in this
@@ -392,7 +392,7 @@ the audit did not report, noted with the fix that takes them.
 | NN-AUD-196 | DEP-004 | Deploy | S | fixed (lab PR 149) |
 | NN-AUD-197 | DEP-006 | Deploy | M | fixed (lab PR 148) |
 | NN-AUD-198 | DEP-007 | Deploy | M | fixed (lab PR 148) |
-| NN-AUD-199 | DEP-008 | Deploy | M | fixed (lab PR 150), residual: the rpm signing key and a signed apt repository (operational) |
+| NN-AUD-199 | DEP-008 | Deploy | M | fixed (lab PR 150); the rpm signing key created 2026-10-17; residual: a signed apt repository (operational) |
 | NN-AUD-200 | DEP-009 | Deploy | M | fixed (lab PR 148) |
 | NN-AUD-201 | SUP-001 | Supply chain | S | fixed (lab PR 150) |
 | NN-AUD-202 | SUP-002 | Supply chain | S | fixed (lab PR 150) |
@@ -4276,14 +4276,13 @@ group, the ones an unprivileged user or a local attacker could use first.
     install.sh's package path is unchanged except for a line saying the
     origin is not verified there, and why: the package's own scripts
     cannot vouch for the package.
-  - Not closed (operational, for the maintainer): the rpm signing key does
-    not exist yet. Before the next tag: create it, commit its public half
-    at `deploy/release/RPM-GPG-KEY-northnarrow.asc`, publish its
-    fingerprint, store the private half as `RPM_SIGNING_KEY` (and
-    `RPM_SIGNING_PASSPHRASE` if any) in the `release-signing` environment
-    with deployments limited to `v*` tags, and protect `v*` tag creation
-    with a ruleset; until then a tag release stops at `rpm-sign`. A signed
-    apt repository for the `.deb`. The host-check WARN for
+  - The rpm signing key (operational, the maintainer, 2026-10-17): RSA
+    4096, signing only, expires 2028-10-16, fingerprint `BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D`; its
+    public half at `deploy/release/RPM-GPG-KEY-northnarrow.asc`, the
+    private half and its passphrase in the `release-signing` environment
+    (`RPM_SIGNING_KEY`, `RPM_SIGNING_PASSPHRASE`), a copy offline. Still
+    open: deployments of that environment limited to `v*` tags and a
+    ruleset on `v*` tag creation; a signed apt repository for the `.deb`. The host-check WARN for
     `provenance: package` belongs with the provenance check of NN-AUD-198.
   - Tests: `xtask/tests/supply_chain.rs`, run by the CI test job:
     `every_action_is_pinned_by_full_commit_sha`,

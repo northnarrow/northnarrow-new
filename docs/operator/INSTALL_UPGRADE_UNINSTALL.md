@@ -741,13 +741,16 @@ package brings its own scripts.
 **`.rpm` (RHEL, AlmaLinux).** The release `.rpm` carries an RPM signature
 made in the release workflow, on a `v*` tag only, with the key whose
 public half is committed at `deploy/release/RPM-GPG-KEY-northnarrow.asc`
-(also attached to each release). The key itself is a maintainer action
-still to do (NN-AUD-199): the rpm is signed on tag builds, and the public
-key and its fingerprint are published with the first signed release;
-until then the file is not in the repository and a tag release stops at
-the signing job. Import that key once, from the repository at the release
-tag, and compare its fingerprint with the one the project publishes; then
-let rpm or dnf check every package:
+(also attached to each release): `NorthNarrow RPM signing`, RSA 4096,
+signing only, created 2026-10-17, expires 2028-10-16, fingerprint
+
+```
+BBBB EB6F 5566 A1CE 99AE  8379 C66A E018 C172 7C8D
+```
+
+Import that key once, from the repository at the release tag, and compare
+its fingerprint with the one above (the same is in the README); then let
+rpm or dnf check every package:
 
 ```sh
 curl -fsSLo RPM-GPG-KEY-northnarrow.asc \
