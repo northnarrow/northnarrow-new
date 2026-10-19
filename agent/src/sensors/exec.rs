@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use aya::{maps::ring_buf::RingBuf, programs::TracePoint, Ebpf, EbpfLoader};
 use common::{wire::ProcessSpawnRaw, Event};
-use tokio::{io::unix::AsyncFd, sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, error, warn};
 
 /// Compiled eBPF object, embedded once in [`crate::sensors::ebpf_object`]
@@ -111,7 +111,7 @@ impl Drop for ExecSensor {
 /// arrives, decodes each entry as [`ProcessSpawnRaw`], and forwards
 /// the typed [`Event`] to userland.
 async fn pump_ringbuf(ringbuf: RingBuf<aya::maps::MapData>, tx: mpsc::Sender<Event>) {
-    let mut async_fd = match AsyncFd::new(ringbuf) {
+    let mut async_fd = match crate::async_fd::register(ringbuf) {
         Ok(fd) => fd,
         Err(e) => {
             error!(error = %e, "failed to register ringbuf fd with tokio");

@@ -61,6 +61,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+
+- Dependencies: `tokio` 1.53.3 and `serde_json` (Dependabot's `rust-minor`
+  group, PR #362, which failed CI). tokio 1.53.3 deprecates
+  `AsyncFd::new`, `try_new`, `with_interest` and `try_with_interest` as
+  unsound (tokio#8587: nothing required the fd to stay open while the
+  `AsyncFd` lived); the agent's sensors registered their ring buffers
+  with `AsyncFd::new` in nine places and `-D warnings` stopped the build.
+  They go through `async_fd::register`, the one place the agent states
+  the contract `AsyncFd::register` asks for (the ring buffer owns its fd,
+  the `AsyncFd` owns the ring buffer); the watchdog's two pidfd
+  registrations use `register_with_interest` with the same justification.
+  Behaviour unchanged (`new` called `register`).
 - Lab follow-up, 32-bit ioctls through `file_ioctl_compat` (lab PR 174).
   Since kernel 6.8 (upstream f1bb47a31dff, also in the stable releases
   6.7.3, 6.6.15, 6.1.76, 5.15.149 and 5.10.210) the `ioctl(2)` of a 32-bit

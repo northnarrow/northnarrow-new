@@ -38,7 +38,6 @@ use common::wire::open_sensor::{
 };
 use common::wire::{FileCapability, FimEvent, FimOp, InodeKey};
 use common::Event;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -1029,7 +1028,7 @@ pub(crate) fn decode_batch<'a>(
 /// Drain the ring into the agent's event channel until the receiver goes
 /// away.
 pub async fn pump(ring: RingBuf<MapData>, tx: mpsc::Sender<Event>) {
-    let mut fd = match AsyncFd::new(ring) {
+    let mut fd = match crate::async_fd::register(ring) {
         Ok(fd) => fd,
         Err(e) => {
             warn!(error = %e, "open sensor: cannot poll its ring — no file-open events");

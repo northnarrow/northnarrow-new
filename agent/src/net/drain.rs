@@ -52,7 +52,6 @@ use common::Event;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -406,11 +405,11 @@ pub async fn drain_loop(
     mut gate: RuleGate,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
-    let mut close_fd = AsyncFd::new(close_rb)?;
-    let mut listen_fd = AsyncFd::new(listen_rb)?;
+    let mut close_fd = crate::async_fd::register(close_rb)?;
+    let mut listen_fd = crate::async_fd::register(listen_rb)?;
     // Review 73: the UDP flow records have their own ring, so a UDP flood
     // cannot erase the TCP closes; they are processed the same way.
-    let mut udp_fd = AsyncFd::new(udp_rb)?;
+    let mut udp_fd = crate::async_fd::register(udp_rb)?;
     // External audit NET-019: commits the rows of a quiet period too.
     let mut commit_tick = tokio::time::interval(NETFLOW_SYNC_INTERVAL);
     commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
