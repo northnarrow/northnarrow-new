@@ -22,7 +22,11 @@ northnarrow-common = { path = "../common", default-features = false }
 
 [profile.dev]
 opt-level = 3
-debug = false
+# External audit EBPF-022: debug info is what bpf-linker turns into the
+# `.BTF` section the LSM loader requires. `.cargo/config.toml` passes
+# `-C debuginfo=2` too; the profile says the same instead of `false`, and
+# `cargo xtask build-ebpf` refuses an object without `.BTF`.
+debug = 2
 debug-assertions = false
 overflow-checks = false
 lto = "thin"
@@ -33,7 +37,8 @@ rpath = false
 
 [profile.release]
 opt-level = 3
-debug = false
+# See [profile.dev] (external audit EBPF-022).
+debug = 2
 debug-assertions = false
 overflow-checks = false
 lto = "thin"

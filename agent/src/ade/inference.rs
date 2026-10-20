@@ -656,6 +656,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         });
         assert_eq!(v.verdict, AdeAction::Kill);
         assert_eq!(v.severity, AdeSeverity::High);
@@ -677,6 +679,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         });
         assert_eq!(v.verdict, AdeAction::Allow);
         assert_eq!(v.severity, AdeSeverity::None);
@@ -698,6 +702,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         });
         assert_eq!(v.verdict, AdeAction::KillTree);
         assert_eq!(v.severity, AdeSeverity::Critical);
@@ -719,6 +725,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         });
         assert_eq!(v.verdict, AdeAction::Escalate);
         assert_eq!(v.escalation_tier, Some(EscalationTier::Tier1Review));
@@ -741,6 +749,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         });
         assert_eq!(v.verdict, AdeAction::Alert);
         assert_eq!(v.severity, AdeSeverity::Medium);

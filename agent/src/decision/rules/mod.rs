@@ -273,6 +273,39 @@ pub(crate) fn judge_spawn(
     allowlist.judge_exec(&id, comm)
 }
 
+/// External audit EBPF-021: what a rule that reads `argv` adds to its
+/// reasoning when the kernel's command line was cut at `ARGV_LEN - 1`
+/// bytes or not read at all. The arguments it looked at are then not all
+/// there, so an argument it did not find may be past the cut: filler
+/// options in front of it are enough. `None` for a whole argv (and for an
+/// older record, which carries no mark).
+pub(crate) fn argv_cut_note(event: &Event) -> Option<String> {
+    let Event::ProcessSpawn {
+        argv,
+        argv_truncated: true,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(if argv.is_empty() {
+        "argv not read by the kernel: no argument was checked".to_string()
+    } else {
+        format!(
+            "argv truncated at {} bytes: arguments past the cut were not seen",
+            common::wire::ARGV_LEN - 1
+        )
+    })
+}
+
+/// [`argv_cut_note`] appended to `reasoning` (`"{reasoning} [{note}]"`).
+pub(crate) fn with_argv_cut_note(reasoning: String, event: &Event) -> String {
+    match argv_cut_note(event) {
+        Some(note) => format!("{reasoning} [{note}]"),
+        None => reasoning,
+    }
+}
+
 /// External audit PROC-008: the response of R011, R012, R013 and R017 to
 /// an exec the allowlist did not exempt as the program run. The shipped
 /// entries name trusted ACTORS — package managers, configuration
@@ -488,6 +521,8 @@ pub(crate) mod testutil {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 
@@ -520,6 +555,8 @@ pub(crate) mod testutil {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 
@@ -547,7 +584,18 @@ pub(crate) mod testutil {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
+    }
+
+    /// External audit EBPF-021: `e` as the kernel reports an argv it cut
+    /// (or, with an empty argv, could not read).
+    pub(crate) fn argv_cut(mut e: Event) -> Event {
+        if let Event::ProcessSpawn { argv_truncated, .. } = &mut e {
+            *argv_truncated = true;
+        }
+        e
     }
 }
 

@@ -98,6 +98,8 @@ fn proc_self_fd_takes_priority_over_other_matches() {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         })
         .expect("should fire");
     assert_eq!(v.rule_id, "R004_ExecFromProcSelfFd");

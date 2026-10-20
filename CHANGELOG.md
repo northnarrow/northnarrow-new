@@ -61,6 +61,68 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, kernel record fidelity (Low EBPF-017
+  NN-AUD-268, EBPF-019 NN-AUD-270, EBPF-021 NN-AUD-272, EBPF-022
+  NN-AUD-426; lab PR 187). EBPF-021: the exec record keeps the first 511
+  bytes of the command line and the first 256 of the caller's path, and
+  said nothing when it cut them: filler options (`socat -d -d … TCP:…
+  EXEC:/bin/sh`) pushed the argument a rule decides on past the cut and
+  the argv looked whole, so the distribution's socat read as a relay
+  (Log High) instead of a shell (killed). The kernel now marks both in
+  the first byte of `ProcessSpawnRaw`'s former pad, `trunc_flags`
+  (`wire::spawn_trunc`: argv longer than 512 bytes or unread, path longer
+  than 256 bytes with its NUL; size 1,400 and every offset unchanged, an
+  older object leaves it 0), decoded into `Event::ProcessSpawn {
+  argv_truncated, filename_truncated }` (serde default `false`: an older
+  record reads as "not known to be cut"). R006 does not classify a
+  distribution socat whose argv is cut and whose part kept runs no shell
+  as a relay: Log at Critical, the severity of one that runs a shell,
+  with the cut named; R013, R015 and R017, whose argv only enriches the
+  reasoning, and R006's kill name the cut too. A cut caller's path is
+  never normalised lexically into the image path (what followed the cut
+  may climb out of any prefix): the running image names it. An executable
+  path component of 31 bytes, possibly cut by the kernel's read, ends in
+  `…`, as the file-open sensor's do since lab PR 137. EBPF-017: the
+  budget of task-denial records (refused signals and ptrace attaches on a
+  protected pid) was one `Array` read, changed and written from every
+  CPU, and a record over it left no count; it is per CPU (50 a second per
+  CPU), and a record held back is counted in a new `RING_DROPS` slot,
+  `task_denial_rate` (18, appended; 19 slots), a security ring: journal
+  WARN, signed `ringbuf_drop`, `TelemetryLoss` past 64 in a sample. The
+  deny never depended on the record. EBPF-019: the WARN for a TCP close
+  with a kernel correlator and no pending flow logged the whole
+  correlator, whose second half is the socket's kernel address; it logs
+  `corr_start_ns`, the connect's timestamp half. EBPF-022: the empty
+  `else` blocks and stale "marker" comments of `inode_protect.rs`, the
+  unused flag of the FIM rename observer, and `module_load.rs`'s "256
+  bytes" (512) are gone; `kdbx_suffix` scans from position 0, so a file
+  named `.kdbx` is a credential leaf (now in `common`, tested); the eBPF
+  profiles say `debug = 2` and `cargo xtask build-ebpf` refuses an object
+  without `.BTF`; the compatibility matrix's counts are dated. eBPF:
+  `sched_process_exec` 512 → 524 BPF instructions,
+  `fim_file_open_sensor` 2,148 → 2,153 (the bounded `.kdbx` scan runs one
+  more step), `task_kill` and `ptrace_access_check` the same size; no
+  loop added. **Regressions / changes:** a distribution socat with a
+  command line over 511 bytes and no shell address in that part is a
+  Critical record (High before); a cut argv ends the reasoning of R006,
+  R013, R015 and R017 with `[argv truncated at 511 bytes: arguments past
+  the cut were not seen]`; on N CPUs up to 50 × N task-denial records a
+  second reach the 64 KiB ring (3,200 on 64 CPUs); a burst of refused
+  signals or ptrace attaches shows `task_denial_rate` in `nn-admin
+  status`, a signed `ringbuf_drop` and an ALERTED `TelemetryLoss` (the
+  first denial already locked COMBAT); the journal field `corr_id` of "TCP
+  close had a kernel flow id but no pending flow" is `corr_start_ns`
+  (update searches); an executable path with a component of exactly 31
+  bytes reads with `…`, so an allowlist or canary path naming such a file
+  no longer equals the kernel's path (a canary still matches the caller's
+  string); when the process is gone before its exec is read, a cut
+  caller's path is left as the caller passed it instead of normalised.
+  CI found what the new `.BTF` check is for: its workflow-wide
+  `RUSTFLAGS: -D warnings` replaced the eBPF target's rustflags of
+  `agent-ebpf/.cargo/config.toml` (`-C debuginfo=2`, `--btf`), so the
+  CI-built object had no `.BTF` (the release workflow sets no global
+  RUSTFLAGS, its objects were whole); `xtask build-ebpf` now drops
+  `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` from the nested eBPF build.
 - External audit, Wave 3, network rule state (Low NETR-012 NN-AUD-295,
   NETR-015 NN-AUD-298, NETR-016 NN-AUD-428; lab PR 186). NETR-015:
   NN-L-NET-006 and -019 left alone every listener on 22, 53, 80, 443,

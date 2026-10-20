@@ -12,6 +12,10 @@
 //! Lab PR 166: a copy run from a staging directory is killed with its
 //! tree, as R001..R003 would ([`super::tool_kill`]); from another
 //! non-standard path (`/opt`, a home) it keeps the single-process kill.
+//!
+//! External audit EBPF-021: the argv flags only enrich the reasoning; when
+//! the kernel cut the argv, the reasoning says so, since a flag may be
+//! past the cut.
 
 use std::sync::Arc;
 
@@ -104,6 +108,8 @@ impl Rule for R013NamespaceEscapeTooling {
                 argv.join(" ")
             );
         }
+        // External audit EBPF-021: flags past a cut argv were not seen.
+        let reasoning = super::with_argv_cut_note(reasoning, event);
         // External audit PROC-008: and on the program's lineage.
         Some(super::judge_actor(
             &self.allowlist,
@@ -125,7 +131,7 @@ impl Rule for R013NamespaceEscapeTooling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::{spawn, spawn_full};
+    use crate::decision::rules::testutil::{argv_cut, spawn, spawn_full};
     use common::ResponseAction;
 
     fn rule() -> R013NamespaceEscapeTooling {
@@ -177,6 +183,29 @@ mod tests {
         );
         let v = rule().evaluate(&ev).expect("fires");
         assert!(v.reasoning.contains("host-escape flags in argv"));
+        assert!(!v.reasoning.contains("truncated"), "{}", v.reasoning);
+    }
+
+    /// External audit EBPF-021: with the argv cut, no host-escape flag in
+    /// the part kept proves nothing; the reasoning names the cut, and the
+    /// verdict stays the same.
+    #[test]
+    fn r013_cut_argv_is_named() {
+        let mut args = vec!["unshare"];
+        args.extend(std::iter::repeat_n("--fork", 80));
+        let whole = spawn_full("unshare", "/tmp/unshare", 0, &args, "bash");
+        let cut = argv_cut(whole.clone());
+        let (w, c) = (
+            rule().evaluate(&whole).unwrap(),
+            rule().evaluate(&cut).unwrap(),
+        );
+        assert_eq!((w.action, w.severity), (c.action, c.severity));
+        assert!(!w.reasoning.contains("argv truncated"), "{}", w.reasoning);
+        assert!(
+            c.reasoning.contains("argv truncated at 511 bytes"),
+            "{}",
+            c.reasoning
+        );
     }
 
     #[test]

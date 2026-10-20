@@ -289,9 +289,56 @@ pub struct OpenRecordRaw {
     pub path: [u8; OPEN_PATH_SLOTS * OPEN_PATH_SLOT_LEN],
 }
 
+/// `name` (a NUL-padded leaf name, as the file-open sensor reads it) ends
+/// in `.kdbx`: `.kdbx` followed by the NUL, scanned at constant-bounded
+/// positions (no `len - 5`, 5.15 rule 5). A name cut at 31 bytes is judged
+/// on the 31 bytes kept. External audit EBPF-022: from position 0, so a
+/// file named `.kdbx` matches too (the scan started at 1). Shared with the
+/// eBPF program (`fim_file_open_sensor`, on its scratch buffer); the loop
+/// bound keeps every index in range, so no bounds check is emitted.
+#[inline(always)]
+pub fn kdbx_suffix(name: &[u8; OPEN_NAME_LEN]) -> bool {
+    let mut i = 0;
+    while i + 5 < OPEN_NAME_LEN {
+        if name[i + 5] == 0 {
+            return name[i] == b'.'
+                && name[i + 1] == b'k'
+                && name[i + 2] == b'd'
+                && name[i + 3] == b'b'
+                && name[i + 4] == b'x';
+        }
+        i += 1;
+    }
+    false
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
+
+    fn name(s: &str) -> [u8; OPEN_NAME_LEN] {
+        let mut n = [0u8; OPEN_NAME_LEN];
+        let k = s.len().min(OPEN_NAME_LEN - 1);
+        n[..k].copy_from_slice(&s.as_bytes()[..k]);
+        n
+    }
+
+    /// External audit EBPF-022: a file named `.kdbx` is a KeePass
+    /// database too; the scan started at position 1 and missed it.
+    #[test]
+    fn kdbx_suffix_matches_bare_name() {
+        let k = |s: &str| kdbx_suffix(&name(s));
+        assert!(k(".kdbx"));
+        assert!(k("a.kdbx"));
+        assert!(k("Passwords.kdbx"));
+        assert!(k("twenty-six-bytes-name.kdbx"));
+        assert!(!k("kdbx"));
+        assert!(!k("a.kdbx.bak"));
+        assert!(!k(".kdb"));
+        assert!(!k(""));
+        // A longer name is judged on the 31 bytes kept.
+        assert!(!k("a-name-that-is-cut-at-31-bytes-x.kdbx"));
+    }
 
     #[test]
     fn open_sensor_layouts() {

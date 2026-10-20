@@ -30,7 +30,7 @@
 //! `file → f_path.dentry` up the `d_parent` chain on RAW pointers via
 //! `bpf_probe_read_kernel` (no allowlist, no BTF-id requirement), writing
 //! each component leaf→root into a FIXED 32-byte slot of `path`
-//! (`MODULE_PATH_SLOTS` × `MODULE_PATH_SLOT_LEN` = 256). Fixed slot
+//! (`MODULE_PATH_SLOTS` × `MODULE_PATH_SLOT_LEN` = 512). Fixed slot
 //! offsets keep the verifier's bounds-tracking trivial — no running
 //! offset. `path_len` carries the slot COUNT; userland reverses the
 //! slots to rebuild the path (`/lib/modules/<rel>` legit vs `/tmp` etc.).
@@ -190,7 +190,7 @@ unsafe fn emit_module_load(method: u8, file: *const c_void) {
 /// Walk the `d_parent` chain from `leaf`, writing each component name
 /// leaf→root into a FIXED 32-byte slot of `dst`. The slot offset comes
 /// from a `match` on the iteration index → a constant per iteration, so
-/// the verifier sees in-bounds writes into the 256-byte `path` field
+/// the verifier sees in-bounds writes into the 512-byte `path` field
 /// with no running-offset reasoning. Returns `(slots written, truncated)`
 /// where `truncated` is the wire's [`ModuleLoadRaw::path_truncated`]: 0 the
 /// root dentry was reached, [`MODULE_PATH_TOO_DEEP`] every slot was used

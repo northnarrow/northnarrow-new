@@ -912,6 +912,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 
@@ -1099,6 +1101,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         };
         r.evaluate(&non_tmp);
         assert!(r.evaluate(&flow(42, 4444, 10 * SEC + SEC)).is_none());
@@ -1297,6 +1301,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 

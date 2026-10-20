@@ -43,7 +43,8 @@ use northnarrow_common::wire::open_sensor::{
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
     },
-    cgroup_step, open_reason, write_step, ChildRuleKey, DirClass, OpenCgKey, OpenCgWindow,
+    cgroup_step, kdbx_suffix, open_reason, write_step, ChildRuleKey, DirClass, OpenCgKey,
+    OpenCgWindow,
     OpenRecordRaw, OpenWriteWindow, CHILD_RULES_MAX, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN,
     OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED,
     RUNTIME_UIDS_MAX,
@@ -700,7 +701,7 @@ unsafe fn observe(
                 }
             }
             if !cred && cls.bits & TREE_HOME != 0 {
-                cred = kdbx_suffix(scratch);
+                cred = kdbx_suffix(&*(scratch as *const [u8; OPEN_NAME_LEN]));
             }
         }
     }
@@ -753,25 +754,6 @@ unsafe fn observe(
         return;
     }
     emit(reason, key, dentry, flags, mode, 0);
-}
-
-/// `scratch[..32]` (a NUL-padded leaf name) ends in `.kdbx`: `.kdbx`
-/// followed by the NUL, scanned at constant-bounded positions (no
-/// `len - 5`, 5.15 rule 5). A name cut at 31 bytes cannot match.
-#[inline(always)]
-unsafe fn kdbx_suffix(scratch: *const u8) -> bool {
-    let mut i = 1;
-    while i + 5 < OPEN_NAME_LEN {
-        if *scratch.add(i + 5) == 0 {
-            return *scratch.add(i) == b'.'
-                && *scratch.add(i + 1) == b'k'
-                && *scratch.add(i + 2) == b'd'
-                && *scratch.add(i + 3) == b'b'
-                && *scratch.add(i + 4) == b'x';
-        }
-        i += 1;
-    }
-    false
 }
 
 /// The one emit site: identity, reason and the mount-relative path, plus

@@ -67,6 +67,26 @@ impl ExecSensor {
             debug!(?e, "aya-log not initialised (no logger map exported)");
         }
 
+        // The kernel offsets the program reads (task->mm, mm->arg_start …)
+        // from THIS kernel's BTF, resolved and armed as the agent's boot and
+        // the multiplexer do: without them the compiled-in constants apply,
+        // which match one kernel layout only — the argv read found nothing
+        // on 5.15, 6.1 and 6.12 (lab PR 187's e2e). Resolved once per
+        // process; with no BTF the constants apply.
+        {
+            use crate::anti_tamper::btf_revalidate::{
+                arm_btf_offsets, publish_resolved, resolve_offsets, resolve_tracepoint_fields,
+                resolved, ResolveOutcome,
+            };
+            if resolved().is_none() {
+                if let ResolveOutcome::Resolved(mut r) = resolve_offsets() {
+                    r.values.extend(resolve_tracepoint_fields().values);
+                    publish_resolved(r);
+                }
+            }
+            arm_btf_offsets(&mut ebpf).with_context(|| "arming the BTF_OFFSETS map")?;
+        }
+
         let program: &mut TracePoint = ebpf
             .program_mut(TP_NAME)
             .ok_or_else(|| anyhow!("eBPF program `{TP_NAME}` not found in loaded object"))?

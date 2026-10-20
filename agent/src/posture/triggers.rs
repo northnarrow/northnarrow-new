@@ -1658,6 +1658,8 @@ pub(super) mod testutil {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 
@@ -2245,6 +2247,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 
@@ -2265,6 +2269,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 

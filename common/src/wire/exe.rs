@@ -87,9 +87,18 @@ impl ExeIdentityRaw {
     }
 }
 
+/// Marks a name that may have been cut (external audit EBPF-021).
+pub const EXE_NAME_CUT_MARK: char = '…';
+
 /// The path the record describes, relative to the task's root or to the
 /// root of the file's filesystem (`/` + names, root first). Empty when
 /// unknown. A deep path keeps its top and its file, with `…` between.
+///
+/// External audit EBPF-021: a name of `EXE_PATH_SLOT_LEN - 1` bytes may
+/// have been cut (the kernel's string read keeps 31 bytes and the NUL, and
+/// a longer name reads the same), so it ends in [`EXE_NAME_CUT_MARK`]: the
+/// path then names no file exactly, as the file-open sensor's paths do
+/// since lab PR 137. Before, the 31 bytes read as the whole name.
 #[cfg(feature = "std")]
 pub fn relative_path(raw: &ExeIdentityRaw) -> String {
     let levels = raw.levels as usize;
@@ -103,8 +112,17 @@ pub fn relative_path(raw: &ExeIdentityRaw) -> String {
     let name = |level: usize| -> String {
         let slot = exe_path_slot(level);
         let bytes = &raw.path[slot * EXE_PATH_SLOT_LEN..(slot + 1) * EXE_PATH_SLOT_LEN];
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        String::from_utf8_lossy(&bytes[..end]).into_owned()
+        let end = bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(bytes.len())
+            .min(EXE_PATH_SLOT_LEN - 1);
+        let name = String::from_utf8_lossy(&bytes[..end]).into_owned();
+        if end == EXE_PATH_SLOT_LEN - 1 {
+            format!("{name}{EXE_NAME_CUT_MARK}")
+        } else {
+            name
+        }
     };
     let mut parts: Vec<String> = Vec::new();
     if levels <= EXE_PATH_SLOTS {
@@ -178,6 +196,26 @@ mod tests {
         let p = relative_path(&r);
         assert!(p.starts_with("/tmp/d1/d2/…/"), "{p}");
         assert!(p.ends_with("/x"), "{p}");
+    }
+
+    /// External audit EBPF-021: a 31-byte name may be the first 31 bytes
+    /// of a longer one; it is marked, and a shorter one is not.
+    #[test]
+    fn a_full_length_name_is_marked_as_possibly_cut() {
+        let long = "a-build-tool-with-a-long-name-v2"; // 32 bytes, read as 31
+        let r = raw_with(&[&long[..31], "bin", "opt", "/"], 0);
+        let p = relative_path(&r);
+        assert_eq!(p, format!("/opt/bin/{}…", &long[..31]));
+        assert!(p.ends_with(EXE_NAME_CUT_MARK));
+        let r = raw_with(&["x", &long[..31], "/"], 0);
+        assert_eq!(relative_path(&r), format!("/{}…/x", &long[..31]));
+        let r = raw_with(&[&long[..30], "tmp", "/"], 0);
+        assert_eq!(relative_path(&r), format!("/tmp/{}", &long[..30]));
+        // a slot with no NUL at all (not what the kernel writes) reads as
+        // 31 bytes and the mark
+        let mut r = raw_with(&["x", "tmp", "/"], 0);
+        r.path[..EXE_PATH_SLOT_LEN].fill(b'y');
+        assert_eq!(relative_path(&r), format!("/tmp/{}…", "y".repeat(31)));
     }
 
     #[test]

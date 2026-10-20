@@ -133,13 +133,17 @@ static MOUNTS: Mutex<Option<MountTable>> = Mutex::new(None);
 /// another namespace, the memfd mount) leaves no path, so consumers fall
 /// back to the caller's string, as before this sensor.
 pub fn resolve(event: &mut Event) {
-    let (pid, filename, exe) = match event {
+    let (pid, filename, filename_cut, exe) = match event {
         Event::ProcessSpawn {
+            pid,
+            filename,
+            exe,
+            filename_truncated,
+            ..
+        } => (*pid, filename.as_str(), *filename_truncated, exe),
+        Event::ExecCheck {
             pid, filename, exe, ..
-        }
-        | Event::ExecCheck {
-            pid, filename, exe, ..
-        } => (*pid, filename.as_str(), exe),
+        } => (*pid, filename.as_str(), false, exe),
         _ => return,
     };
     if exe.root != (0, 0) {
@@ -160,7 +164,7 @@ pub fn resolve(event: &mut Event) {
     // or the running image's when the string is relative. The flags are
     // untouched: nothing reads this as a kernel-resolved identity.
     if exe.path.is_empty() {
-        if let Some(path) = fallback_exec_path(pid, filename) {
+        if let Some(path) = fallback_exec_path(pid, filename, filename_cut) {
             exe.path = path;
         }
     }
@@ -170,8 +174,13 @@ pub fn resolve(event: &mut Event) {
 /// kernel's is missing — `filename` with `.`, `..` and repeated slashes
 /// resolved lexically when it is absolute (no I/O, no race), else the
 /// target of `/proc/<pid>/exe` while the process still runs.
-fn fallback_exec_path(pid: u32, filename: &str) -> Option<String> {
-    if filename.starts_with('/') {
+///
+/// External audit EBPF-021: a string the kernel cut (`cut`) is never
+/// resolved lexically: what followed the cut may climb out of any prefix
+/// (`/usr/bin/./././…/../../tmp/sh` cut inside the `./` run normalised to
+/// `/usr/bin`). Only the running image names it then.
+fn fallback_exec_path(pid: u32, filename: &str, cut: bool) -> Option<String> {
+    if filename.starts_with('/') && !cut {
         return Some(lexically_normal(filename));
     }
     std::fs::read_link(format!("/proc/{pid}/exe"))
@@ -214,6 +223,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe,
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 
@@ -236,6 +247,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         };
         for (raw, want) in [
             ("/usr/bin/../../tmp/nsenter", "/tmp/nsenter"),
@@ -267,6 +280,56 @@ mod tests {
             unreachable!()
         };
         assert_eq!(exe.path_or(filename), "./payload");
+    }
+
+    /// External audit EBPF-021: a caller's string the kernel cut is not
+    /// normalised into a path — `/usr/bin/` followed by enough `./` gives
+    /// `/usr/bin/…` whatever came after the cut. The running image names
+    /// the file; without it the path stays unknown.
+    #[test]
+    fn a_cut_callers_string_is_not_normalised() {
+        let cut_spawn = |pid: u32, filename: &str| {
+            let mut e = spawn_with(ExeIdentity::default());
+            if let Event::ProcessSpawn {
+                pid: p,
+                filename: f,
+                filename_truncated,
+                ..
+            } = &mut e
+            {
+                *p = pid;
+                *f = filename.to_string();
+                *filename_truncated = true;
+            }
+            e
+        };
+        let cut = format!("/usr/bin/{}", "./".repeat(123));
+        // the process runs: its image
+        let mut e = cut_spawn(std::process::id(), &cut);
+        resolve(&mut e);
+        let Event::ProcessSpawn { exe, .. } = &e else {
+            unreachable!()
+        };
+        let own = std::fs::read_link("/proc/self/exe").unwrap();
+        assert_eq!(exe.path, own.to_string_lossy());
+        // gone: no path is made up from the string
+        let mut e = cut_spawn(u32::MAX - 7, &cut);
+        resolve(&mut e);
+        let Event::ProcessSpawn { exe, filename, .. } = &e else {
+            unreachable!()
+        };
+        assert!(exe.path.is_empty(), "{}", exe.path);
+        assert_eq!(filename, &cut, "the caller's string is kept as evidence");
+        // the same string, whole: normalised as before
+        let mut e = spawn_with(ExeIdentity::default());
+        if let Event::ProcessSpawn { filename, .. } = &mut e {
+            *filename = cut.clone();
+        }
+        resolve(&mut e);
+        let Event::ProcessSpawn { exe, .. } = &e else {
+            unreachable!()
+        };
+        assert_eq!(exe.path, "/usr/bin");
     }
 
     #[test]

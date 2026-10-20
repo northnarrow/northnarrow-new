@@ -163,6 +163,8 @@ fn synthetic_events() -> Vec<(&'static str, Event)> {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     vec![
         ("xmrig", mk(1001, "xmrig", "/tmp/.cache/x")),

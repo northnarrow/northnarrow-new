@@ -4877,6 +4877,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         };
         h.posture.observe(&intrusion, &[]);
         assert_eq!(h.posture.current_kind(), PostureKind::Combat);

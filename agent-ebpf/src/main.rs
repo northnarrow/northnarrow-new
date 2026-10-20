@@ -53,7 +53,7 @@ use aya_ebpf::{
     programs::TracePointContext,
     EbpfContext,
 };
-use northnarrow_common::wire::{ProcessSpawnRaw, ARGV_LEN, FILENAME_LEN, TASK_COMM_LEN};
+use northnarrow_common::wire::{spawn_trunc, ProcessSpawnRaw, ARGV_LEN, FILENAME_LEN, TASK_COMM_LEN};
 
 use crate::btf_offsets::{
     MM_STRUCT_ARG_END_OFFSET, MM_STRUCT_ARG_START_OFFSET, PF_KTHREAD, TASK_STRUCT_COMM_OFFSET,
@@ -154,6 +154,9 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
     let mut f_len = ((data_loc >> 16) & 0xFFFF) as usize;
     if f_len > FILENAME_LEN {
         f_len = FILENAME_LEN;
+        // External audit EBPF-021: the string (with its NUL) did not fit;
+        // say so instead of handing userland a path that looks whole.
+        unsafe { (*raw_ptr).trunc_flags |= spawn_trunc::FILENAME };
     }
     if f_off != 0 && f_len != 0 {
         // SAFETY: the tracepoint context pointer is valid kernel memory
@@ -263,6 +266,14 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                     // and the slice index `[..len]` carries no panic branch.
                     // Capping at 511 (vs 512) costs at most a trailing byte.
                     let mut len = arg_end - arg_start;
+                    // External audit EBPF-021: a longer block is cut, and
+                    // the cut is marked — filler options pushed an argument
+                    // past byte 511 and the argv looked complete. At exec
+                    // the block ends with the last argument's NUL, so a
+                    // block of exactly ARGV_LEN bytes loses that NUL only.
+                    if len > ARGV_LEN {
+                        unsafe { (*raw_ptr).trunc_flags |= spawn_trunc::ARGV };
+                    }
                     if len > ARGV_LEN - 1 {
                         len = ARGV_LEN - 1;
                     }
@@ -274,6 +285,10 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                         );
                         if bpf_probe_read_user_buf(arg_start as *const u8, &mut dst[..len]).is_ok() {
                             (*raw_ptr).argv_len = len as u16;
+                        } else {
+                            // Unread: no argument is known, which is not
+                            // an empty command line.
+                            (*raw_ptr).trunc_flags |= spawn_trunc::ARGV;
                         }
                     }
                 }
