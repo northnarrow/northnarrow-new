@@ -205,6 +205,17 @@ fn both_scripts_share_the_stale_pin_root_block() {
 
 /// The host a stop section runs against: unit states, the pin root, the
 /// key, and what the stubs saw.
+/// The fake admin socket of a test host: a unix socket path must stay
+/// under SUN_LEN (108 bytes), and CARGO_TARGET_TMPDIR on a CI runner is
+/// already longer than that once a case directory is added — so the
+/// socket lives in the system temp directory, named from the case's.
+fn admin_socket_path(dir: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut h);
+    std::env::temp_dir().join(format!("nn194-{:016x}.sock", h.finish()))
+}
+
 struct Host {
     dir: PathBuf,
 }
@@ -321,7 +332,9 @@ exit 0"#,
     }
 
     fn socket(&self) -> std::os::unix::net::UnixListener {
-        std::os::unix::net::UnixListener::bind(self.dir.join("admin.sock")).unwrap()
+        let path = admin_socket_path(&self.dir);
+        let _ = std::fs::remove_file(&path);
+        std::os::unix::net::UnixListener::bind(path).unwrap()
     }
 
     fn pins_left(&self) -> bool {
@@ -346,7 +359,7 @@ exit 0"#,
             .env("NN_TEST_DIR", t)
             .env("OWN_IDS_FILE", t.join("own-ids"))
             .env("LSM_DRAIN_TIMEOUT", "2")
-            .env("ADMIN_SOCKET", t.join("admin.sock"))
+            .env("ADMIN_SOCKET", admin_socket_path(t))
             .env("ADMIN_SOCKET_WAIT", "2")
             .output()
             .expect("bash runs");
