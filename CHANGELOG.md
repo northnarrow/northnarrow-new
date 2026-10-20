@@ -61,6 +61,107 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, TLS and DNS parser conformance (Low NET-007
+  NN-AUD-330, NET-008 NN-AUD-331, NET-013 NN-AUD-332, NET-014 NN-AUD-333,
+  NET-015 NN-AUD-334, NET-018 NN-AUD-336, NET-020 NN-AUD-434 part (2); lab
+  PR 202). Latent: no sensor captures a ClientHello in this build
+  (BUG-025, `TLS_FINGERPRINT_PRODUCER` is false) and the DNS response
+  parser has no production caller, so nothing the agent records changes
+  today; the producer that lands on this code inherits conforming parsers.
+  `net/tls_parser.rs`: NET-007, the GREASE test `(v & 0x0F0F) == 0x0A0A`
+  accepted 256 values; it is RFC 8701's sixteen (both bytes equal, low
+  nibble `A`), so `0x1A2A` or `0x3AFA` stay in JA3/JA4 as in the
+  reference tools. NET-008, JA4: no server_name extension is `i` (it was
+  `n`, which the specification does not have), and the `d` is the
+  extension's presence; without signature algorithms the extension-hash
+  input has no `_` (checked against the specification's vector
+  `6d807ffa2a79`). Found while checking against the reference: the
+  signature algorithms are GREASE-filtered, the ALPN pair reads the first
+  protocol name's raw bytes (a non-UTF-8 name was skipped, so the next
+  one was used) and prints a byte outside ASCII as `9`, like both FoxIO
+  implementations (the specification's text
+  asks for a hex form that neither prints; we follow the
+  implementations, which make the feeds), a `supported_versions`
+  extension without a usable value is `00` instead of the legacy
+  version, and DTLS version codes give `00` on TCP as in the reference;
+  JA3 reads the last repeated supported_groups / ec_point_formats, as
+  `ja3.py` does. NET-013 and NET-020 (2): the cipher list must fit in
+  the message before anything is sized from it (the dead `> u16::MAX`
+  check is gone); the `u16` list readers are sized by their bytes and a
+  list longer than its extension is empty. NET-014: the SNI is canonical
+  at the parser (ASCII lower case, trailing dot removed, labels of 1 to
+  63 letters, digits or hyphens, at most 253 bytes); anything else,
+  two host names, or a list that does not fill its extension is
+  `Sni::NonConforming` (`sni()`), so a non-conforming name is a flag, not
+  a string of up to 65,535 bytes of the peer's choosing, and reads stay
+  inside the declared list. The flag reaches the netflow row with the
+  producer: no row carries a fingerprint today, and adding it is a wire
+  change. NET-018: the handshake message is reassembled from consecutive
+  handshake records by their lengths and bounded by its own length, so a
+  ClientHello split over records fingerprints as the unsplit one and
+  bytes after the message (in its record or after it) are not read as
+  extensions; `parse_client_hello_outcome` returns `Complete`,
+  `Incomplete` (a well-formed beginning cut by the end of the buffer) or
+  `Invalid` (another record type before the message ends, a record
+  version that is not 3.x, an empty record or one over 2^14 bytes, not a
+  ClientHello, bytes after the extensions block inside the message).
+  `net/dns_cache.rs`, NET-015 and NET-013: `skip_name` refuses the
+  reserved length prefixes `01` and `10` (so a label over 63 bytes), a
+  name over 255 octets and a compression pointer outside the message;
+  the bounds are `n > remaining()`; the answer vector is sized by what
+  the message can hold (`answer_capacity`), not `ancount` (a 12-byte
+  header reserved over a megabyte). The response parser is kept, not
+  deleted: the `dns_records` fuzz target uses it. Reference vectors, none
+  computed by our code: eleven ClientHellos of our own, built in the
+  tests from explicit fields (a Firefox-like TLS 1.3 hello with and
+  without SNI, a TLS 1.2 hello with ALPN h2, Chrome-like hellos with
+  GREASE everywhere, with GREASE in signature_algorithms and with a
+  first ALPN name outside ASCII, values shaped like GREASE, repeated
+  curve extensions, a hello without SNI or cipher, the two JA3 README
+  hellos; the SHA-256 of each is pinned), whose JA3 and JA4 come from
+  the reference tools run locally on those bytes (salesforce/ja3
+  `python/ja3.py` at `502cc63` with dpkt 1.9.8; FoxIO-LLC/ja4
+  `python/ja4.py`, the BSD 3-Clause JA4 TLS implementation, at
+  `c6469a7` with tshark 4.2.2); the JA4 specification's worked example
+  and its no-signature-algorithms vector (JA4.md, BSD 3-Clause); the two
+  JA3 README vectors. No code or data of either project is in the
+  repository. On the starting code the JA4 of eight of the eleven
+  differed from the reference (among them GREASE in
+  signature_algorithms, and the non-ASCII ALPN printed `h1` for `99`)
+  and the JA3 of the GREASE-shaped one.
+  **Regressions / changes:** none at runtime (no producer). For the
+  producer: JA4 strings change where listed (`i` for `n`, signature
+  algorithm GREASE, ALPN bytes, the hash without signature algorithms,
+  `00` versions), JA3 keeps non-GREASE `0x?A?A` values; `extract_sni`
+  returns the lower-case form and `None` for a non-conforming name; a
+  buffer that ends inside a ClientHello no longer parses as a shorter
+  TLS 1.0 hello; a DNS response with a reserved label prefix, a name over
+  255 octets or a pointer outside the message yields no address. Tests:
+  `grease_filter_matches_rfc8701_exactly`,
+  `ja3_keeps_values_shaped_like_grease_that_are_not`,
+  `ja3_matches_the_salesforce_readme_vectors`,
+  `reference_vectors_are_the_bytes_the_tools_read`,
+  `ja3_matches_the_reference_on_our_client_hellos`,
+  `ja4_matches_the_reference_on_our_client_hellos`,
+  `ja4_matches_the_specification_example`,
+  `ja4_extension_hash_omits_the_separator_without_signature_algorithms`,
+  `ja4_uses_i_when_sni_is_absent`,
+  `ja4_marks_d_for_a_present_but_nonconforming_sni`,
+  `ja4_alpn_pair_follows_the_reference_implementations`,
+  `sni_is_canonicalised_and_bounded`,
+  `sni_reads_stay_inside_the_declared_list`,
+  `overlong_extension_lists_give_empty_lists`,
+  `ja3_reads_the_last_repeated_curve_extension_like_the_reference`,
+  `fragmented_client_hello_yields_the_same_ja3`,
+  `trailing_bytes_are_not_parsed_as_extensions`,
+  `every_prefix_of_a_client_hello_is_incomplete`,
+  `a_broken_record_layer_or_message_is_invalid`,
+  `overlong_cipher_list_is_rejected`, `mutated_client_hellos_never_panic`;
+  `reserved_label_prefix_is_rejected`, `label_over_63_is_rejected`,
+  `answer_name_pointers_must_point_inside_the_message`,
+  `huge_ancount_in_a_short_packet_allocates_little`;
+  `parse_truncated_packet_returns_none_no_panic` now asserts `None` for
+  every strict prefix.
 - External audit, Wave 3, engine composition and the release build (Info
   PROC-014 NN-AUD-429, Low PROC-015 NN-AUD-302; lab PR 201). PROC-014:
   `default_rules()`, the rule set the engine tests build, lacked the

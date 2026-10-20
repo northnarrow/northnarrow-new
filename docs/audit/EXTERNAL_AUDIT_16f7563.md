@@ -541,13 +541,13 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-327 | LLMR-015 | Low | LLM runtime | M | fixed (lab PR 168) |
 | NN-AUD-328 | LLMR-018 | Low | LLM runtime | S | fixed (lab PR 191) |
 | NN-AUD-329 | LLMR-019 | Low | LLM runtime | M (at XAI wiring) | partly fixed (one prompt path, lab PRs 133/144/145; digest not recorded); open |
-| NN-AUD-330 | NET-007 | Low | Network | S | open (latent) |
-| NN-AUD-331 | NET-008 | Low | Network | S | open (latent) |
-| NN-AUD-332 | NET-013 | Low | Network | S | open (latent) |
-| NN-AUD-333 | NET-014 | Low | Network | S | open (latent) |
-| NN-AUD-334 | NET-015 | Low | Network | S | open (latent, dead code) |
+| NN-AUD-330 | NET-007 | Low | Network | S | fixed (lab PR 202) |
+| NN-AUD-331 | NET-008 | Low | Network | S | fixed (lab PR 202) |
+| NN-AUD-332 | NET-013 | Low | Network | S | fixed (lab PR 202) |
+| NN-AUD-333 | NET-014 | Low | Network | S | fixed (lab PR 202) |
+| NN-AUD-334 | NET-015 | Low | Network | S | fixed (lab PR 202) |
 | NN-AUD-335 | NET-017 | Low | Network | M | open |
-| NN-AUD-336 | NET-018 | Low | Network | M | open (latent) |
+| NN-AUD-336 | NET-018 | Low | Network | M | fixed (lab PR 202) |
 | NN-AUD-337 | DEC-012 | Low | Deception | S | fixed (lab PR 178) |
 | NN-AUD-338 | DEC-013 | Low | Deception | — | already fixed (lab PR 143, with DEC-011) |
 | NN-AUD-339 | DEC-014 | Low | Deception | S (test) | already fixed (lab PR 99, with DEC-005; test gap) |
@@ -8890,3 +8890,134 @@ group, the ones an unprivileged user or a local attacker could use first.
     (`agent/examples/posture_demo.rs:121` lacks `argv_truncated` and
     `filename_truncated`), the reason fixed on main.
   - Lab: No lab probe: the composition tests build the engine as `main.rs` does; the release step's script run locally on a fake `dist/` passes on the real binaries and fails in its four negative cases; the demo gate is covered by its unit test (a root start of a `demo-tappa5` build was not run in a VM). Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.
+- **Wave 3 — TLS and DNS parser conformance, lab PR 202.** NN-AUD-330
+  (NET-007), NN-AUD-331 (NET-008), NN-AUD-332 (NET-013), NN-AUD-333
+  (NET-014), NN-AUD-334 (NET-015), NN-AUD-336 (NET-018), all Low, and part
+  (2) of NN-AUD-434 (NET-020, Info): batch B10 of the Wave 3 triage of
+  group G4, on the integration tree (`main` with lots up to 193, and lots
+  194–199). Files: `net/tls_parser.rs`, `net/dns_cache.rs`. Latent: no sensor captures a ClientHello
+  (BUG-025, `TLS_FINGERPRINT_PRODUCER` false) and `parse_a_records` /
+  `parse_aaaa_records` have no production caller, so no probe: the gate
+  is reference vectors, none computed by our code. NN-AUD-434 stays open
+  for its part (3), the comm decoding of the drain (batch B9).
+  - Vectors. Eleven ClientHellos of our own, built in the tests from
+    explicit fields, the SHA-256 of each pinned (a Firefox-like TLS 1.3
+    hello with and without SNI, a TLS 1.2 hello with ALPN h2, Chrome-like
+    hellos with GREASE everywhere, with GREASE in signature_algorithms and
+    with a first ALPN name `0xBA 0xAD`, values shaped like GREASE, repeated
+    curve extensions, a hello without SNI or cipher, the two JA3 README
+    hellos). Their expected values come from the reference tools run
+    locally on those bytes, in a pcap with a TCP handshake to 443:
+    salesforce/ja3 `python/ja3.py` at `502cc63` (dpkt 1.9.8) for JA3,
+    FoxIO-LLC/ja4 `python/ja4.py` (the BSD 3-Clause JA4 TLS
+    implementation) at `c6469a7` with tshark 4.2.2 for JA4; the setup was
+    first checked to reproduce the JA4 that implementation publishes for
+    its own test captures. Plus the JA4 specification's worked example
+    (`t13d1516h2_8daaf6152771_e5627efa2ab1`) and its
+    no-signature-algorithms vector (`6d807ffa2a79`), JA4.md being BSD
+    3-Clause, and the two JA3 README vectors. No code or data of either
+    project is in the repository: FoxIO's repository is under the FoxIO
+    License 1.1 apart from JA4 TLS, and its captures declare no licence of
+    their own. On the starting code the JA4 of eight of the eleven
+    differed (`n` for `i` on the five without SNI, GREASE in
+    signature_algorithms hashed, `h1` for `99` on the non-ASCII ALPN, `_`
+    before an empty signature-algorithm list, `0x1A2A` / `0x3AFA`
+    dropped), and so did the JA3 of the GREASE-shaped one and the
+    specification's example with GREASE added; the Firefox-like, TLS 1.2
+    and GREASE-everywhere JA4, and the README JA3, matched before and
+    after.
+  - NET-007 (330, fixed). Re-checked: `is_grease_u16` tested
+    `(v & 0x0F0F) == 0x0A0A` (256 values). Now RFC 8701's sixteen: both
+    bytes equal, low nibble `A`.
+  - NET-008 (331, fixed; the audit's point (2) verified against the
+    specification). `i` without the server_name extension (was `n`), the
+    `d` from the extension's presence; no `_` before an empty
+    signature-algorithm list (the specification says so and gives
+    `6d807ffa2a79`; both implementations do it). Found on the vectors and
+    fixed with it: signature algorithms GREASE-filtered; the ALPN pair
+    from the first protocol name's raw bytes, a byte outside ASCII printed
+    `9` (`first_last` in `rust/ja4/src/tls.rs`, `first_last_alpn` in
+    `python/ja4.py`, which print `t13d151599` for the non-ASCII vector).
+    Deviation: the
+    specification's text (January 2026) asks for the hex form of a
+    non-alphanumeric value, which neither implementation prints; we follow
+    the implementations, which produce the feeds, and the conflict is
+    noted in the code. A `supported_versions` extension without a usable
+    value gives `00`, and DTLS codes give `00` on TCP, as in the
+    implementations. JA3 reads the last repeated supported_groups /
+    ec_point_formats, as `ja3.py` does.
+  - NET-013 (332, fixed) and NET-020 (2) (434, this part fixed). The
+    cipher list must fit in the message before it is read (`> u16::MAX`,
+    which a `u16` never is, is gone); the `u16` list readers are sized by
+    their bytes, a list longer than its extension reads as empty; the DNS
+    answer vector is sized by `answer_capacity(ancount, remaining)` (11
+    bytes per record at least), not `ancount`.
+  - NET-014 (333, fixed). `sni()` returns `Sni::Absent`, `Sni::Host`
+    (canonical: ASCII lower case, trailing dot removed, labels of 1 to 63
+    letters, digits or hyphens, at most 253 bytes) or `Sni::NonConforming`
+    (any other name, an empty or short list, no host name, two host
+    names); `extract_sni` gives the host only, and the reads stay inside
+    the declared list. Deviation: the flag is in the parser's result, not
+    yet on `TlsFingerprint` or the netflow row — no row carries a
+    fingerprint until BUG-025, and the field is a wire change for that
+    lot.
+  - NET-015 (334, fixed, kept rather than deleted). `skip_name` refuses
+    the length prefixes `01` and `10` (so a label over 63 bytes), a name
+    over 255 octets on the wire and a pointer outside the message; the
+    bounds are `n > remaining()`. The parser is kept: the `dns_records`
+    fuzz target (lot 200's tree, not touched here) imports it.
+  - NET-018 (336, fixed). The handshake message is reassembled from
+    consecutive handshake records by their lengths and bounded by its
+    length. `parse_client_hello_outcome` returns `Complete`, `Incomplete`
+    (every strict prefix of a valid ClientHello, in one record, in many,
+    or bare) or `Invalid` (a record of another type before the message
+    ends, a version other than 3.x, an empty record or one over 2^14
+    bytes, not a ClientHello, a session id over 32 bytes, bytes after the
+    extensions block inside the message); `parse_client_hello` keeps its
+    signature (`None` for both). The Kani harness on `Cursor` is
+    unchanged.
+  - Tests: `tls_parser` `grease_filter_matches_rfc8701_exactly`,
+    `ja3_keeps_values_shaped_like_grease_that_are_not`,
+    `ja3_matches_the_salesforce_readme_vectors`,
+    `reference_vectors_are_the_bytes_the_tools_read`,
+    `ja3_matches_the_reference_on_our_client_hellos`,
+    `ja4_matches_the_reference_on_our_client_hellos`,
+    `ja4_matches_the_specification_example`,
+    `ja4_extension_hash_omits_the_separator_without_signature_algorithms`,
+    `ja4_uses_i_when_sni_is_absent`,
+    `ja4_marks_d_for_a_present_but_nonconforming_sni`,
+    `ja4_alpn_pair_follows_the_reference_implementations`,
+    `sni_is_canonicalised_and_bounded`,
+    `sni_reads_stay_inside_the_declared_list`,
+    `overlong_extension_lists_give_empty_lists`,
+    `ja3_reads_the_last_repeated_curve_extension_like_the_reference`,
+    `fragmented_client_hello_yields_the_same_ja3`,
+    `trailing_bytes_are_not_parsed_as_extensions`,
+    `every_prefix_of_a_client_hello_is_incomplete`,
+    `a_broken_record_layer_or_message_is_invalid`,
+    `overlong_cipher_list_is_rejected`, `mutated_client_hellos_never_panic`
+    (16,500 mutations of the vectors); `dns_cache`
+    `reserved_label_prefix_is_rejected`, `label_over_63_is_rejected`,
+    `answer_name_pointers_must_point_inside_the_message`,
+    `huge_ancount_in_a_short_packet_allocates_little`;
+    `parse_truncated_packet_returns_none_no_panic` now asserts `None` for
+    every strict prefix. Run against the starting code (its
+    implementation, with the new types mapped onto its results), 22 fail
+    (the specification example only with GREASE added); the ones that
+    pass there are the JA3 README vectors, the SHA-256 pins, the overlong
+    cipher list (rejected there too, after the allocation) and the
+    mutation test.
+  - Fuzz targets for the producer's lot (not added: lot 200 holds
+    `fuzz/`): `tls_client_hello` should call `parse_client_hello_outcome`
+    and, on `Complete`, `compute_ja3`, `compute_ja4`, `sni` and
+    `extract_alpn` (today it only parses), with `-malloc_limit_mb`, seeded
+    with the test vectors' bytes; a differential target that splits a
+    valid ClientHello into records at fuzzer-chosen offsets and asserts
+    the same JA3/JA4; `dns_records` with `-malloc_limit_mb`.
+  - Host: `cargo fmt`, clippy `--workspace --all-targets` and the agent
+    with `test-privileged,debug-trigger` clean; `cargo test --workspace`
+    2,602 passed, 0 failed. The CI's `posture_demo` clippy fails on the
+    starting tree as on this one (`agent/examples/posture_demo.rs:121`
+    lacks `argv_truncated` and `filename_truncated`, lot
+    `nn-wt-kernfid`): not this batch.
+  - Lab: No lab probe (latent parsers): 11 ClientHellos built in the tests from explicit fields, their expected JA3/JA4 computed locally with salesforce's `ja3.py` (@502cc63) and FoxIO's BSD-3-Clause JA4 TLS implementation (@c6469a7), checked first to reproduce FoxIO's five published JA4 exactly; no third-party data in the repository; on the code before, 22 tests fail (the JA4 differs on 8 of the 11 vectors). Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.
