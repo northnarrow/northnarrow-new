@@ -3149,7 +3149,11 @@ fn dispatch_trusted_installer_grant(
 
     match installer_override {
         Some(ov) => {
-            let window = ov.arm(window_secs, Instant::now());
+            let window = ov.arm_by(
+                window_secs,
+                Instant::now(),
+                fps_out.first().map(String::as_str).unwrap_or("(unknown)"),
+            );
             info!(
                 target: "admin.trusted_installer_grant",
                 signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
@@ -3537,6 +3541,8 @@ fn telemetry_status(
     let encrypted = crate::net::blind_spots::encrypted_flows();
     let trust = crate::boot::trust::current();
     let execq = crate::execq::snapshot();
+    let ransom = crate::impact::published_counts();
+    let defense = crate::impair::published_counts();
     StatusResponse {
         posture: posture.current_kind(),
         network_isolation_engaged: isolator.is_engaged(),
@@ -3606,6 +3612,14 @@ fn telemetry_status(
             crate::net::flow_tracker::snapshots_deferred_total(),
         ),
         net_connect_denied_total: crate::sensors::connect_deny::denied_total(),
+        // Lab PR 225: the ransomware signal and the security tools.
+        ransomware_decisive_total: ransom.map(|c| c.decisive),
+        ransomware_signals_total: ransom.map(|c| c.signals),
+        ransomware_trusted_total: ransom.map(|c| c.trusted),
+        ransomware_samplings_total: ransom.map(|c| c.samplings),
+        defense_tamper_total: defense.map(|c| c.findings),
+        defense_tamper_sanctioned_total: defense.map(|c| c.sanctioned),
+        defense_tools_watched: defense.map(|c| c.defenders),
     }
 }
 
@@ -6178,6 +6192,13 @@ mod tests {
             net_flow_snapshots_total: None,
             net_flow_snapshots_deferred_total: None,
             net_connect_denied_total: None,
+            ransomware_decisive_total: None,
+            ransomware_signals_total: None,
+            ransomware_trusted_total: None,
+            ransomware_samplings_total: None,
+            defense_tamper_total: None,
+            defense_tamper_sanctioned_total: None,
+            defense_tools_watched: None,
         });
         emit_audit_for(
             &status_req,

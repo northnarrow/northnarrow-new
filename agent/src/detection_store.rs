@@ -141,7 +141,10 @@ impl Sensor {
     pub fn from_event(event: &Event) -> Self {
         match event {
             Event::ProcessSpawn { .. } | Event::ExecCheck { .. } => Sensor::Exec,
-            Event::FileOpen { .. } | Event::MassWrite { .. } | Event::Fim(_) => Sensor::File,
+            Event::FileOpen { .. }
+            | Event::MassWrite { .. }
+            | Event::FileBurst { .. }
+            | Event::Fim(_) => Sensor::File,
             Event::ModuleLoad { .. } => Sensor::ModuleLoad,
             Event::IoUring { .. } => Sensor::IoUring,
             Event::BpfSyscall { .. } => Sensor::AntiTamper,
@@ -152,7 +155,7 @@ impl Sensor {
             | Event::SensorFlood { .. }
             | Event::NetFlow(_)
             | Event::NetListener(_) => Sensor::Network,
-            Event::FsProtectDenial { .. } => Sensor::AntiTamper,
+            Event::FsProtectDenial { .. } | Event::DefenderSignal { .. } => Sensor::AntiTamper,
             Event::CanaryTripped { .. } => Sensor::Canary,
         }
     }
@@ -281,6 +284,8 @@ impl Principal {
             },
             Event::FileOpen { pid, uid, comm, .. }
             | Event::MassWrite { pid, uid, comm, .. }
+            | Event::FileBurst { pid, uid, comm, .. }
+            | Event::DefenderSignal { pid, uid, comm, .. }
             | Event::TcpConnect { pid, uid, comm, .. }
             | Event::DnsQuery { pid, uid, comm, .. }
             | Event::DnsFlood { pid, uid, comm, .. }
@@ -362,6 +367,8 @@ fn exe_from_event(event: &Event) -> Option<String> {
         }
         Event::FileOpen { .. }
         | Event::MassWrite { .. }
+        | Event::FileBurst { .. }
+        | Event::DefenderSignal { .. }
         | Event::ModuleLoad { .. }
         | Event::IoUring { .. }
         | Event::BpfSyscall { .. }
@@ -383,9 +390,9 @@ fn exe_from_event(event: &Event) -> Option<String> {
 fn file_from_event(event: &Event) -> Option<String> {
     match event {
         Event::Fim(fe) => Some(fe.path.clone()),
-        Event::FileOpen { filename, .. } | Event::MassWrite { filename, .. } => {
-            (!filename.is_empty()).then(|| filename.clone())
-        }
+        Event::FileOpen { filename, .. }
+        | Event::MassWrite { filename, .. }
+        | Event::FileBurst { filename, .. } => (!filename.is_empty()).then(|| filename.clone()),
         Event::ModuleLoad { path, .. } => path.clone(),
         Event::ProcessSpawn { .. }
         | Event::ExecCheck { .. }
@@ -396,6 +403,7 @@ fn file_from_event(event: &Event) -> Option<String> {
         | Event::DnsQuery { .. }
         | Event::DnsFlood { .. }
         | Event::SensorFlood { .. }
+        | Event::DefenderSignal { .. }
         | Event::FsProtectDenial { .. }
         | Event::CanaryTripped { .. }
         | Event::NetFlow(_)
@@ -549,7 +557,9 @@ pub struct DetectionRecord {
     // removed with the LLM advisor in Wave 4, lab PR 214.
     /// Detections of the same rule and uid acted on but not recorded
     /// since the previous report, because they exceeded the per-rule
-    /// budget ([`crate::detection_budget`], review 75). Absent when none.
+    /// budget ([`crate::detection_budget`], review 75) or repeated an
+    /// action their rule coalesced into an earlier record (NN-L-EVA-002,
+    /// lab PR 225). Absent when none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suppressed_before: Option<u64>,
     /// The file the detection is about, for the file sensors: the path
@@ -594,6 +604,15 @@ pub struct DetectionRecord {
     /// record, not from the journal. Absent-on-`None`, like [`Self::file`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
+    /// Lab PR 225: why a security-tool finding (NN-L-EVA-00x) was
+    /// sanctioned and recorded Low — a package transaction, an
+    /// administrator's interactive session, a configuration-management
+    /// actor, or the valid signed trusted-installer window (its key id and
+    /// deadline) inside which the agent's own units were stopped or
+    /// restarted. Absent on every other record (absent-on-`None`, like
+    /// [`Self::file`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sanction: Option<String>,
 }
 
 /// Lab PR 223: what the exec quarantine found and decided
@@ -662,6 +681,7 @@ impl DetectionRecord {
             mitre_version: None,
             execq: None,
             network: network_from_event(event),
+            sanction: None,
         }
     }
 
@@ -1027,6 +1047,10 @@ impl DetectionSink {
             DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
                 .with_attack(attack);
         record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
+        // Lab PR 225: a sanctioned security-tool finding names why.
+        if verdict.rule_id.starts_with("NN-L-EVA-") {
+            record.sanction = crate::impair::published_sanction(event);
+        }
         self.enqueue(record);
     }
 
@@ -1851,6 +1875,7 @@ mod tests {
             mitre_version: None,
             execq: None,
             network: None,
+            sanction: None,
         };
         assert_roundtrip(&record);
     }
@@ -2971,6 +2996,7 @@ mod tests {
             mitre_version: None,
             execq: None,
             network: None,
+            sanction: None,
         }
     }
 

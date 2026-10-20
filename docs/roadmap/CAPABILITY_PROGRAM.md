@@ -408,8 +408,8 @@ only in the table below, in the same PR as the evidence.
   - What changed: `Rule::attack()` (required, no default) returns typed
     references — a `Tactic` enum and technique ids whose shape is checked
     when the constant compiles — of ATT&CK Enterprise 20.0 (2026-10-13).
-    All 83 rules (lab PR 219's two, 223's NN-L-EXECQ-001 and 224's three
-    included) are mapped: 62 techniques and sub-techniques under 12
+    All 89 rules (lab PR 219's two, 223's NN-L-EXECQ-001, 224's three and
+    225's six included) are mapped: 64 techniques and sub-techniques under 12
     tactics. A rule detection record carries the ids in `mitre` and
     `mitre_version` `"20.0"` (an additive field: older lines keep their
     bytes and verify). The ids in use are pinned with their v20 names,
@@ -550,3 +550,61 @@ only in the table below, in the same PR as the evidence.
   that keeps a `dup2`'d socket without running a new image is not seen.
   Levels unchanged until then.
   - Lab: On Debian 12 (6.1), Ubuntu 24.04 (6.8), Ubuntu 22.04 (5.15) and Debian 13 (6.12): the stdio probe in sched_process_exec and the network programs past each verifier with no rejection, SOCKET_SK_OFFSET resolved, the connect deny off by default (counter null); with NN_NET_CONNECT_DENY=1 it armed on LSM socket_connect (ipv4=4 ipv6=1 skipped=0, counter 0, socket_connect_deny loaded, no degradation); with NN_DETECT_ONLY=1 as well it did not arm ("ignored in detect-only", counter null, trust L2 "detect-only: no response action runs"). The first run of that case found a defect of this lot: `NN_NET_CONNECT_DENY=1`, the value the help and the CHANGELOG give, stopped the agent at its start (exit 2, "invalid value '1' for '--net-connect-deny'") and the watchdog held; the environment switches now read 1/0, true/false, yes/no, on/off (a unit test), and the case passed 14 of 14 on all four kernels. On 24.04 the lot's net-check.sh passed 13 of 13 (against `main`: 4 PASS, 9 KNOWN GAP): NN-L-NET-010 at the connect of a long-lived C2-port connection (client killed after 29 ms), open-flow snapshots of a benign flow, NN-L-NET-013 on a beacon at its close, CHAIN-002/NET-008 on TCP/53 to a server that is no configured resolver (the stub 127.0.0.53 exempt), R020 Critical on bash over /dev/tcp and on a pty-wrapped reverse shell, no R020 for an Accept=yes service, NN-L-NET-026 on a 199- and a 600-host sweep and a 400-port scan, NN-L-NET-027 on 25 SSH connects, no Critical and no fan-out record for apt, git, ssh and a 40-connection burst; the kills this lot adds are held (alert only by default): R020 2, NN-L-NET-026 5, NN-L-NET-027 2 records, none a kill. A connect to 192.0.2.10:443 (TEST-NET-1, on the shipped blocklist) was judged at the connect and its client killed by NN-L-NET-001 (a kill that predates the lot); with the deny armed the same connect got EPERM at once (0 ms), a record "tcp 192.0.2.10:443 denied", operation connect, the kernel counter 0 → 1. NN_NET_SCAN_HOSTS=128 and NN_NET_SCAN_KILL_HOSTS=0 each drew a signed weakening_env, a stricter NN_NET_SCAN_HOSTS=32 none. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).
+- **Lab PR 225 — malware countermeasures M9 (part): ransomware recorded on
+  its own evidence, security tools watched.** C14 (behavioural detection and correlation),
+  C17 (response on processes and files), C19 (rollback);
+  `docs/design/RANSOMWARE_DECISIVE.md`.
+  - C14 / C17: NN-L-IMP-001 records, Critical, an actor whose file
+    activity shows two of four shapes within 120 s — rewrites of existing
+    files, ciphertext-like content left behind, renames (or copies) to one
+    new extension, deletion of originals after new files. For copies the
+    copies themselves are sampled (`<original>.<suffix>`, the original
+    gone), never the originals still waiting beside them: the lab's MS-23
+    copy-delete run on 6.1 drew no record until then (280 fresh originals
+    filled the sample). The legitimate copy-then-delete shapes — `mv`
+    across filesystems, `rsync --remove-source-files`, package unpacks,
+    compiler temporaries, editors' safe writes, `git gc`, log rotation with
+    compression — stay one shape. Its kill of the actor's tree and the
+    posture's COMBAT on it alone (unlocked: POS-001) are in the code but
+    held behind the per-rule response policy, off by default until it is
+    signed (decision of 21/10/2026): the posture's
+    RansomwareEncryption needs corroboration (ENGAGED alone). The rename and
+    unlink bursts are counted in the kernel on regular files (unlinks of
+    4 KiB or more), while the LSM file-open sensor is armed
+    (`inode_rename`, `inode_unlink`); the entropy is sampled in userland when
+    a burst is read (no host-wide close hook reads content). Trusted writers
+    — root package transactions, packaged programs with an installed
+    lineage — never count. A rename burst of an encryptor's shape (an
+    extension appended or put in place of the old one), alone, is a record
+    (NN-L-IMP-002). NN-L-FIM-010 names the renamed file, not its directory,
+    and reads a rename seen as a watched directory's new entry (that new
+    match's kill is held likewise).
+  - C14: NN-L-EVA-001..004 record a security tool stopped, disabled,
+    masked, killed (on `task_kill`, a builtin `kill` included — a forking
+    daemon restarted, Debian's auditd, is registered by `/proc` scans after
+    its exec), switched off by its own command or reconfigured, from the
+    shipped list `security-tools.v1` (not signed: pinned to the agent's
+    built-in copy, a modified file never applied, no operator overlay yet);
+    Low when sanctioned (package transaction, administrator's session,
+    configuration management; a stop or restart of the agent's own units
+    inside a valid signed trusted-installer window, the window named in
+    the record, no posture move); High with the kill of a staged script that
+    asks held behind the per-rule policy. Posture `DefenseImpairment`
+    (ENGAGED). NN-L-EVA-002 records a command once per process tree
+    within 10 s (`ufw disable`'s dozens of `iptables` calls: one record
+    per command, the repeats counted in `detections_held`).
+  - C19: once the per-rule policy turns IMP-001's kill and COMBAT on, the
+    ladder's NEUTRALIZE runs on pure ransomware, where copy on first write
+    (lab PR 222) can restore; until then a corroborated COMBAT does.
+  - Levels unchanged (C14 2, C17 2, C19 1): in-process tests only so far
+    (58 new; two of the three NN-L-FIM-010 drain tests fail with the
+    starting tree's resolution, the third needs the new kernel leaf). Owed
+    in the lab (`nn-lab.sh ransom-check`): the counters on 5.14, 5.15, 6.1,
+    6.8 and 6.12; MS-23 in place and copy-delete recorded Critical with the
+    posture at ENGAGED (the kill held); the tar, rsync, git checkout and
+    apt negatives with no
+    NN-L-IMP-001; MS-25 records. Open: fork-per-file encryptors (per-process
+    counts), packaged tools used from an interactive session, D-Bus unit
+    stops, no operator overlay of the tool list yet.
+  - Lab: On Debian 12 (6.1), Ubuntu 24.04 (6.8), Ubuntu 22.04 (5.15) and Debian 13 (6.12): fim_rename_observe, fim_unlink_observe and task_kill loaded with no verifier rejection, DEFENDER_PIDS in use with the listed tools that run registered (auditd and rsyslogd on 24.04, rsyslogd on 22.04, none on the Debian cloud images, which run neither), security-tools.v1 installed (33 tools), the ransomware and security-tool lines in the signed status. On 24.04 the lot's ransom-check.sh passed 19 of 19 (against `main`: MS-23 and MS-25 drew no record, 8 KNOWN GAP, its 11 negatives clean): MS-23 in place and copy-delete each drew a Critical NN-L-IMP-001 whose kill is held (response none: alert only by default), the simulator ran to its end (300 of 300 files), the posture reached ENGAGED and never COMBAT on RansomwareEncryption; the simulator's own gzip-delete and move-away scripts, tar (twice), rsync (twice), a git checkout and an apt install / reinstall of 400 random files drew none; MS-25 `systemctl stop auditd`, `auditctl -e 0`, a builtin `kill -STOP` of a restarted auditd, a rule file in /etc/audit/rules.d and `ufw disable` each drew its High NN-L-EVA record, none a kill. NN-L-EVA-002, which drew dozens of High records for one `ufw disable` (one per iptables call of ufw-init), was fixed in this lot before the lab: 5 records for `auditctl -e 0` and `ufw disable`, the repeats counted in a signed detections_held row. Run on their own, tar, rsync and rm bursts (new files, the same tree again, unlinks) were judged trusted writers (the status counter 0 → 6, no shape counted, no record); in the harness's run its tar / rsync negatives left no burst line at all (an open observation). A watched file renamed x → x.locked drew one Critical NN-L-FIM-010 naming the file, the verdict's reasoning naming x.locked (the watched file's own rename keeps its kill, which predates the lot). After the decision that a stop or restart of the agent's own units inside a valid signed trusted-installer window is sanctioned, the build with it ran on 24.04: two restarts inside a window each drew one Low NN-L-EVA-001 whose sanction names the window ("key c2e8f3da (until 2026-10-21T12:41:37Z)"), and the posture stayed at OBSERVING; with no window, and after a 2 s window had expired, `systemctl kill` of the agent's unit was refused (the agent kept its pid) and drew a High record with a DefenseImpairment transition; auditd stopped inside a valid window was High too; MS-25 passed 5 of 5 (none a kill, NN-L-EVA-002 coalesced), trust225 judged six bursts trusted; the upgrade-check from `main` passed, and a second one over the installed build drew two Low NN-L-EVA-001 (install.sh's stops, an administrator's sudo session at a terminal) with no posture change. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).
+

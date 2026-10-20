@@ -344,6 +344,27 @@ pub struct TriggerDetector {
     /// it ([`Self::set_installer_window`]); inside it a control-surface
     /// tamper does not raise the posture.
     installer_window: InstallerWindow,
+    /// Lab PR 225: the ransomware tracker and the security-tool detector
+    /// the rules share, once `main.rs` has wired them.
+    impact: ImpactHooks,
+}
+
+/// Lab PR 225: the shared judges of the ransomware and security-tool
+/// triggers. Unset (a test, a build that does not wire them): neither
+/// trigger fires.
+#[derive(Clone, Default)]
+struct ImpactHooks {
+    ransom: Arc<std::sync::OnceLock<Arc<crate::impact::RansomTracker>>>,
+    defense: Arc<std::sync::OnceLock<Arc<crate::impair::DefenseDetector>>>,
+}
+
+impl std::fmt::Debug for ImpactHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImpactHooks")
+            .field("ransom", &self.ransom.get().is_some())
+            .field("defense", &self.defense.get().is_some())
+            .finish()
+    }
 }
 
 /// Lab PR 162: the trusted-installer window as the detector reads it.
@@ -409,6 +430,7 @@ impl TriggerDetector {
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
             installer_window: InstallerWindow::default(),
+            impact: ImpactHooks::default(),
         }
     }
 
@@ -424,6 +446,7 @@ impl TriggerDetector {
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
             installer_window: InstallerWindow::default(),
+            impact: ImpactHooks::default(),
         }
     }
 
@@ -440,6 +463,7 @@ impl TriggerDetector {
             escalation_allow: Arc::new(EscalationAllowList::empty()),
             mass_writers: MassWriters::default(),
             installer_window: InstallerWindow::default(),
+            impact: ImpactHooks::default(),
         }
     }
 
@@ -456,6 +480,16 @@ impl TriggerDetector {
     /// trigger defers to. Set once; a second call is ignored.
     pub fn set_installer_window(&self, window: Arc<TrustedInstallerOverride>) {
         let _ = self.installer_window.0.set(window);
+    }
+
+    /// Lab PR 225: the ransomware tracker (`RansomwareEncryption`). Set once.
+    pub fn set_ransom_tracker(&self, tracker: Arc<crate::impact::RansomTracker>) {
+        let _ = self.impact.ransom.set(tracker);
+    }
+
+    /// Lab PR 225: the security-tool detector (`DefenseImpairment`). Set once.
+    pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector>) {
+        let _ = self.impact.defense.set(detector);
     }
 
     /// BUG-032 — builder for the escalation allowlist. Production:
@@ -706,6 +740,24 @@ impl TriggerDetector {
         if mass_write || staged == Some(StagedExec::Confirmed) || reverse_shell {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
+        // Lab PR 225: two shapes of ransomware for one actor whose trust is
+        // not established — decisive (not locked: POS-001; its COMBAT
+        // without corroboration is held behind the per-rule policy, off by
+        // default). The shapes alone keep their triggers (the mass-write
+        // arm above).
+        if let Some(t) = self.impact.ransom.get() {
+            if t.assess(event).is_some_and(|a| a.decisive) {
+                hits.push(TriggerType::RansomwareEncryption);
+            }
+        }
+        // Lab PR 225: a security tool switched off outside a package
+        // transaction, an administrator's session and configuration
+        // management — ENGAGED, execution evidence that corroborates.
+        if let Some(d) = self.impact.defense.get() {
+            if d.assess(event).is_some_and(|f| f.sanctioned.is_none()) {
+                hits.push(TriggerType::DefenseImpairment);
+            }
+        }
         if persistence_mechanism(event, &self.auth) {
             hits.push(if unadjudicated {
                 TriggerType::SensitiveFileAccess
@@ -760,6 +812,8 @@ pub fn event_uid(event: &Event) -> Option<u32> {
         Event::ProcessSpawn { uid, .. }
         | Event::FileOpen { uid, .. }
         | Event::MassWrite { uid, .. }
+        | Event::FileBurst { uid, .. }
+        | Event::DefenderSignal { uid, .. }
         | Event::TcpConnect { uid, .. }
         | Event::DnsQuery { uid, .. }
         | Event::ExploitPostcondition { uid, .. } => Some(*uid),
@@ -775,6 +829,8 @@ pub fn event_owner_pid(event: &Event) -> Option<u32> {
         Event::ProcessSpawn { pid, .. }
         | Event::FileOpen { pid, .. }
         | Event::MassWrite { pid, .. }
+        | Event::FileBurst { pid, .. }
+        | Event::DefenderSignal { pid, .. }
         | Event::ExecCheck { pid, .. }
         | Event::TcpConnect { pid, .. }
         | Event::DnsQuery { pid, .. }
@@ -799,6 +855,8 @@ pub fn event_owner_seen(event: &Event) -> (u64, u64) {
         } => (*start_ns, *timestamp_ns),
         Event::FileOpen { timestamp_ns, .. }
         | Event::MassWrite { timestamp_ns, .. }
+        | Event::FileBurst { timestamp_ns, .. }
+        | Event::DefenderSignal { timestamp_ns, .. }
         | Event::ExecCheck { timestamp_ns, .. }
         | Event::TcpConnect { timestamp_ns, .. }
         | Event::DnsQuery { timestamp_ns, .. }

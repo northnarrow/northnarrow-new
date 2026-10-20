@@ -675,6 +675,9 @@ same rules or the 22.04 guest will refuse to load it:
    into a ring record zeroed before: 6.1's helper leaves the bytes after
    the name's NUL unwritten). Check an object with `llvm-objdump -dr
    --disassemble-symbols=<program>`: no `R_BPF_64_32 memset`.
+   Two adjacent zero stores are merged by the compiler into the same
+   `memset` (`fim_watch`'s `dest_dev` and `dest_ino`, lab PR 225): write
+   them with `write_volatile`.
 10. **Fewer ways through the program (5.15 and 6.1).** Every branch the
     verifier cannot prove one-sided doubles the paths after it until they
     merge again, and these verifiers merge fewer. In the exploit guard:
@@ -695,6 +698,17 @@ same rules or the 22.04 guest will refuse to load it:
     6.1 and later, stack per frame and per call chain); keep every
     program well under the limit on 6.1, which reports the count (5.15
     does not; there, rule 7's `bpftrace` measure).
+11. **A loop whose state is data, in a global function of its own, its
+    result in map memory.** The ransomware rename counter (lab PR 225)
+    scanned both names' last 16 bytes for an extension and compared their
+    first 31 inline: each scan's dot position is a constant per path,
+    which the next comparison makes precise, and the products of the
+    scans and comparisons took `nn_rename_burst` past 1M instructions on
+    5.15 and 6.1. Each extension scan (`nn_rename_ext`) and the shape
+    (`nn_rename_shape`) are now global functions, verified once each,
+    whose results the caller reads from a per-CPU array: values loaded
+    from map memory carry no precision back. The decision itself stays
+    the shared `common::wire::open_sensor::rename_shape_with`.
 
 Lab notes for 22.04-era userland:
 

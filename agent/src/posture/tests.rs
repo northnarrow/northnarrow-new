@@ -2103,3 +2103,179 @@ fn an_nc_flood_alone_stays_engaged() {
     assert_eq!(m.current_kind(), PostureKind::Combat);
     assert!(!m.is_combat_locked());
 }
+
+/// Lab PR 225: a ransomware tracker over the fixture lineage at `dir`,
+/// sampling every file as ciphertext.
+fn ransom_tracker(
+    lineage: AuthSessionTracker,
+    dir: &std::path::Path,
+) -> Arc<crate::impact::RansomTracker> {
+    struct Cipher;
+    impl crate::impact::entropy::Sampler for Cipher {
+        fn sample(&self, _: &str, _: std::time::Duration) -> crate::impact::entropy::Sample {
+            crate::impact::entropy::Sample {
+                examined: 4,
+                high: 4,
+                containers: 0,
+            }
+        }
+        fn sample_copies(
+            &self,
+            copy: &str,
+            _: &str,
+            since: std::time::Duration,
+        ) -> crate::impact::entropy::Sample {
+            self.sample(copy, since)
+        }
+    }
+    Arc::new(crate::impact::RansomTracker::with(
+        lineage,
+        crate::impact::trust::ProgramOwners::new(dir.join("no-package-db")),
+        Arc::new(Cipher),
+    ))
+}
+
+fn overwrites(pid: u32, uid: u32) -> Event {
+    Event::MassWrite {
+        pid,
+        uid,
+        comm: "python3".into(),
+        count: 20,
+        filename: "/srv/nn-malsim/f020".into(),
+        timestamp_ns: 50_000_000_000,
+        overwrites: true,
+        cgroup_window: false,
+    }
+}
+
+/// Lab PR 225: before this lot a ransomware run (mass rewrites) reached
+/// ENGAGED only. Its rewrites with ciphertext left behind — two shapes of
+/// one actor whose trust is not established — raise RansomwareEncryption,
+/// COMBAT tier and never locked (POS-001: any user can encrypt their own
+/// files). Reaching COMBAT on its own is held behind the per-rule policy
+/// (decision of 21/10/2026): until then it needs corroboration, so alone it
+/// stays ENGAGED.
+#[test]
+fn ransomware_combination_needs_corroboration_until_the_policy() {
+    // Held by the decision of 21/10/2026 (until the signed per-rule policy):
+    // the combination needs corroboration — ENGAGED alone, never locked.
+    const { assert!(!common::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lineage = AuthSessionTracker::new(tmp.path());
+    lineage.ingest_exec(
+        300,
+        1,
+        "/usr/bin/python3",
+        &["python3".into(), "/srv/nn-malsim/ransom-sim.py".into()],
+        1_000_000_000,
+        1_000_000_000,
+        1000,
+    );
+    let m = machine_on(tmp.path());
+    // Unwired: the mass-write arm alone, ENGAGED (the starting tree's
+    // behaviour).
+    let _ = m.observe(&overwrites(300, 1000), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    let m = machine_on(tmp.path());
+    m.set_ransom_tracker(ransom_tracker(lineage, tmp.path()));
+    let out = m.observe(&overwrites(300, 1000), &[]);
+    assert!(out.is_some());
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    assert!(
+        !m.is_combat_locked(),
+        "the combination does not lock COMBAT"
+    );
+}
+
+/// Lab PR 225: one shape keeps its level — a trusted writer's (a packaged
+/// program started by installed programs) rewrites stay ENGAGED.
+#[test]
+fn a_trusted_writers_rewrites_stay_engaged() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lineage = AuthSessionTracker::new(tmp.path());
+    lineage.ingest_exec(200, 1, "/usr/bin/bash", &["bash".into()], 1, 1, 1000);
+    lineage.ingest_exec(
+        301,
+        200,
+        "/usr/bin/rsync",
+        &["rsync".into(), "--inplace".into()],
+        2,
+        2,
+        1000,
+    );
+    let m = machine_on(tmp.path());
+    m.set_ransom_tracker(ransom_tracker(lineage, tmp.path()));
+    let _ = m.observe(&overwrites(301, 1000), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// Lab PR 225, decision of 21/10/2026: inside a valid signed
+/// trusted-installer window a stop of the agent's own unit does not move the
+/// posture; auditd stopped in the same window does (ENGAGED), and so does
+/// the agent's own unit once the window has closed.
+#[test]
+fn a_stop_of_the_agents_units_inside_the_window_does_not_move_the_posture() {
+    use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+    let tmp = tempfile::TempDir::new().unwrap();
+    login_proc(tmp.path(), 700, SHELL_SESSION);
+    let lineage = AuthSessionTracker::new(tmp.path());
+    let window = Arc::new(TrustedInstallerOverride::new(
+        None,
+        0,
+        None,
+        std::time::Duration::from_secs(600),
+    ));
+    let detector = Arc::new(crate::impair::DefenseDetector::new(
+        Arc::new(crate::impair::SecurityTools::builtin()),
+        lineage,
+        None,
+    ));
+    detector.set_installer_window(Arc::clone(&window));
+    let stop = |pid: u32, unit: &str, at: u64| {
+        let mut e = spawn(pid, 1, "systemctl", "/usr/bin/systemctl", at);
+        if let Event::ProcessSpawn { argv, .. } = &mut e {
+            *argv = vec!["systemctl".into(), "stop".into(), unit.into()];
+        }
+        e
+    };
+    let m = machine_on(tmp.path());
+    m.set_defense_detector(Arc::clone(&detector));
+    window.arm_by(120, std::time::Instant::now(), "c2e8f3da");
+    let _ = m.observe(&stop(700, "northnarrow-agent", 2), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+    let _ = m.observe(&stop(701, "auditd", 3), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+
+    let m = machine_on(tmp.path());
+    m.set_defense_detector(Arc::clone(&detector));
+    window.close("test");
+    let _ = m.observe(&stop(702, "northnarrow-agent", 4), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// Lab PR 225: a security tool stopped outside an administrator's session
+/// raises ENGAGED (DefenseImpairment), and as execution evidence it
+/// corroborates a later file-system heuristic of the same actor.
+#[test]
+fn defense_impairment_engages_and_corroborates() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    login_proc(tmp.path(), 700, SHELL_SESSION);
+    let lineage = AuthSessionTracker::new(tmp.path());
+    let m = machine_on(tmp.path());
+    m.set_defense_detector(Arc::new(crate::impair::DefenseDetector::new(
+        Arc::new(crate::impair::SecurityTools::builtin()),
+        lineage,
+        None,
+    )));
+    let mut stop = spawn(700, 1, "systemctl", "/usr/bin/systemctl", 2);
+    if let Event::ProcessSpawn { argv, .. } = &mut stop {
+        *argv = vec!["systemctl".into(), "stop".into(), "auditd".into()];
+    }
+    let _ = m.observe(&stop, &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    assert!(m
+        .transition_log()
+        .iter()
+        .any(|t| t.trigger == Some(TriggerType::DefenseImpairment)));
+}

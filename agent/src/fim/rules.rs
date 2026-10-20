@@ -1044,12 +1044,48 @@ const RANSOMWARE_EXTENSIONS: &[&str] = &[
 /// One of the [`RANSOMWARE_EXTENSIONS`] ends `path`, in any case. External
 /// audit NN-AUD-287 (FIMR-013): the list is lowercase, and `.LOCKED` or
 /// `.Crypted` went unmatched. Compared on bytes: the extensions are ASCII.
-fn has_ransomware_extension(path: &str) -> bool {
+pub(crate) fn has_ransomware_extension(path: &str) -> bool {
     let path = path.as_bytes();
     RANSOMWARE_EXTENSIONS.iter().any(|ext| {
         path.len() >= ext.len()
             && path[path.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
     })
+}
+
+/// Lab PR 225: one rename NN-L-FIM-010 judged — its new path, renamer,
+/// time and which of its two records it was (`moved_in`).
+type Fim010Seen = (String, u32, u64, bool);
+
+/// Lab PR 225: the renames NN-L-FIM-010 judged in the last
+/// [`FIM010_DEDUP_NS`].
+static FIM010_RECENT: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::VecDeque<Fim010Seen>>,
+> = std::sync::LazyLock::new(Default::default);
+const FIM010_DEDUP_NS: u64 = 2_000_000_000;
+const FIM010_RECENT_CAP: usize = 64;
+
+/// `true` when the other record of the same rename — to `path` by `pid`
+/// around `ts`, the watched file's `Renamed` or the watched directory's
+/// moved-in `Created` — was already judged; records this one otherwise.
+///
+/// `register = false` checks without recording: a moved-in record whose
+/// kill is held must not suppress the watched file's own `Renamed`, which
+/// kills as it did before lab PR 225.
+fn fim010_seen(path: &str, pid: u32, ts: u64, moved_in: bool, register: bool) -> bool {
+    let mut recent = FIM010_RECENT.lock();
+    if recent.iter().any(|(p, q, t, m)| {
+        p == path && *q == pid && *m != moved_in && t.abs_diff(ts) <= FIM010_DEDUP_NS
+    }) {
+        return true;
+    }
+    if !register {
+        return false;
+    }
+    if recent.len() >= FIM010_RECENT_CAP {
+        recent.pop_front();
+    }
+    recent.push_back((path.to_string(), pid, ts, moved_in));
+    false
 }
 
 /// Ransomware extension rename per legacy M14.4 NN-L-FIM-001,
@@ -1090,7 +1126,12 @@ impl Rule for NnLFim010RansomwareExtensionRename {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
-        if fe.op != FimOp::Renamed {
+        // Lab PR 225: a file renamed INTO a watched directory reaches the
+        // rules as `Created` with `moved_in` (BUG-022's normalisation): the
+        // rename of `x` to `x.locked` inside a watched data directory never
+        // matched, since only `Renamed` was looked at.
+        let moved_in = fe.op == FimOp::Created && fe.moved_in;
+        if fe.op != FimOp::Renamed && !moved_in {
             return None;
         }
         // Polish #3: check the DEST path (canonical ransomware
@@ -1099,7 +1140,8 @@ impl Rule for NnLFim010RansomwareExtensionRename {
         // carries the new name once C8's drain resolved it). The
         // src-side check stays as the fallback (symmetric edge:
         // a watched `<doc>.crypted` being renamed away by the
-        // operator — rare but consistent).
+        // operator — rare but consistent). Lab PR 225: `dest_path` is the
+        // file's new path (it was its directory's).
         let dest_match = fe
             .dest_path
             .as_deref()
@@ -1108,14 +1150,36 @@ impl Rule for NnLFim010RansomwareExtensionRename {
         if !dest_match && !src_match {
             return None;
         }
-        Some(fim_verdict(
+        // Lab PR 225: one rename reaches the rule twice when both the file
+        // and its directory are watched (the file's `Renamed`, the
+        // directory's `Created` of the new name): one verdict.
+        let new_path = if moved_in {
+            fe.path.as_str()
+        } else {
+            fe.dest_path.as_deref().unwrap_or(fe.path.as_str())
+        };
+        // Lab PR 225's moved-in match is new: its kill is held behind the
+        // per-rule policy (off by default, a Critical record); the watched
+        // file's own rename kills as before.
+        let moved_in_kill = crate::decision::response_policy::FIM_010_MOVED_IN_KILL;
+        let held = moved_in && !moved_in_kill.on;
+        if fim010_seen(new_path, fe.modifier_pid, fe.timestamp_ns, moved_in, !held) {
+            return None;
+        }
+        // Lab PR 225: the record names the new name.
+        let reasoning = format!(
+            "Ransomware extension rename — MITRE T1486 (Data Encrypted for Impact); \
+             kill the modifier tree to halt the encrypt loop [new name {}]",
+            common::log_escape::Escaped(new_path)
+        );
+        let v = fim_verdict(
             self,
             fe,
             ResponseAction::KillProcessTree,
             Severity::Critical,
-            "Ransomware extension rename — MITRE T1486 (Data Encrypted for Impact); \
-             kill the modifier tree to halt the encrypt loop",
-        ))
+            &reasoning,
+        );
+        Some(if moved_in { moved_in_kill.hold(v) } else { v })
     }
 }
 
@@ -3874,6 +3938,31 @@ mod tests {
     }
 
     // ── NN-L-FIM-010 (C5.1) ─────────────────────────────────────
+
+    /// Review of lab PR 225 (decision of 21/10/2026): the moved-in match
+    /// is new, so its kill is held behind the per-rule policy — a Critical
+    /// record — and it does not suppress the watched file's own `Renamed`
+    /// of the same rename, which kills as before.
+    #[test]
+    fn fim010_moved_in_is_held_and_does_not_hide_the_files_rename() {
+        let r = NnLFim010RansomwareExtensionRename;
+        let new = "/srv/data/held-review.db.locked";
+        let mut created = fim_event(FimOp::Created, new);
+        if let Event::Fim(fe) = &mut created {
+            fe.moved_in = true;
+            fe.modifier_pid = 7171;
+        }
+        let v = r.evaluate(&created).expect("moved-in fires");
+        assert_eq!(v.severity, Severity::Critical);
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(v.reasoning.contains("[held back: "), "{}", v.reasoning);
+        let mut renamed = fim_renamed_with_dest("/srv/data/held-review.db", new);
+        if let Event::Fim(fe) = &mut renamed {
+            fe.modifier_pid = 7171;
+        }
+        let k = r.evaluate(&renamed).expect("the file's rename still fires");
+        assert_eq!(k.action, ResponseAction::KillProcessTree);
+    }
 
     #[test]
     fn fim010_fires_on_renamed_to_ransomware_extension() {

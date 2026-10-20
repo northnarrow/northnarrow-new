@@ -86,6 +86,9 @@ impl RuleEngine {
         correlation: Arc<Mutex<super::correlation::CorrelationStore>>,
         // Lab PR 224: the configured resolvers and the fan-out thresholds.
         net_config: super::rules::net::NetRuleConfig,
+        // Lab PR 225: shared with the posture.
+        ransom: Arc<crate::impact::RansomTracker>,
+        defense: Arc<crate::impair::DefenseDetector>,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -101,6 +104,8 @@ impl RuleEngine {
             canary_readers,
             correlation,
             net_config,
+            ransom,
+            defense,
         ) {
             e.add_rule(r);
         }

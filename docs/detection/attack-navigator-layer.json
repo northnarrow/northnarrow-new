@@ -11,7 +11,7 @@
       "#ffffff",
       "#66b1ff"
     ],
-    "maxValue": 7,
+    "maxValue": 8,
     "minValue": 0
   },
   "hideDisabled": false,
@@ -613,7 +613,7 @@
       "techniqueID": "T1620"
     },
     {
-      "comment": "NN-L-BPF-002_BpfForeignHandleOrDetach, NN-L-FIM-024_AntiTamperHoneypotModified, NN-L-NET-021_SensorRecordFlood, NN-L-AT-001_AntiTamperDenial",
+      "comment": "NN-L-BPF-002_BpfForeignHandleOrDetach, NN-L-FIM-024_AntiTamperHoneypotModified, NN-L-EVA-001_SecurityServiceStopped, NN-L-EVA-002_SecurityToolSwitchedOff, NN-L-EVA-003_SecurityToolKilled, NN-L-EVA-004_SecurityToolConfigChanged, NN-L-NET-021_SensorRecordFlood, NN-L-AT-001_AntiTamperDenial",
       "enabled": true,
       "metadata": [
         {
@@ -626,6 +626,22 @@
         },
         {
           "name": "rule",
+          "value": "NN-L-EVA-001_SecurityServiceStopped (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-002_SecurityToolSwitchedOff (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-003_SecurityToolKilled (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-004_SecurityToolConfigChanged (unit+lab)"
+        },
+        {
+          "name": "rule",
           "value": "NN-L-NET-021_SensorRecordFlood (unit)"
         },
         {
@@ -633,10 +649,36 @@
           "value": "NN-L-AT-001_AntiTamperDenial (unit+lab)"
         }
       ],
-      "score": 4,
+      "score": 8,
       "showSubtechniques": false,
       "tactic": "defense-impairment",
       "techniqueID": "T1685"
+    },
+    {
+      "comment": "NN-L-EVA-001_SecurityServiceStopped, NN-L-EVA-002_SecurityToolSwitchedOff, NN-L-EVA-003_SecurityToolKilled, NN-L-EVA-004_SecurityToolConfigChanged",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-001_SecurityServiceStopped (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-002_SecurityToolSwitchedOff (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-003_SecurityToolKilled (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-004_SecurityToolConfigChanged (unit+lab)"
+        }
+      ],
+      "score": 4,
+      "showSubtechniques": false,
+      "tactic": "defense-impairment",
+      "techniqueID": "T1685.004"
     },
     {
       "comment": "NN-L-FIM-005_LogTruncated, NN-L-FIM-018_LastlogTampered, NN-L-FIM-019_WtmpBtmpTampered",
@@ -659,6 +701,32 @@
       "showSubtechniques": false,
       "tactic": "defense-impairment",
       "techniqueID": "T1685.006"
+    },
+    {
+      "comment": "NN-L-EVA-001_SecurityServiceStopped, NN-L-EVA-002_SecurityToolSwitchedOff, NN-L-EVA-003_SecurityToolKilled, NN-L-EVA-004_SecurityToolConfigChanged",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-001_SecurityServiceStopped (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-002_SecurityToolSwitchedOff (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-003_SecurityToolKilled (unit+lab)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EVA-004_SecurityToolConfigChanged (unit+lab)"
+        }
+      ],
+      "score": 4,
+      "showSubtechniques": false,
+      "tactic": "defense-impairment",
+      "techniqueID": "T1686"
     },
     {
       "comment": "NN-L-NET-027_OutboundAuthBruteforce",
@@ -1179,15 +1247,23 @@
       "techniqueID": "T1048"
     },
     {
-      "comment": "NN-L-FIM-010_RansomwareExtensionRename",
+      "comment": "NN-L-FIM-010_RansomwareExtensionRename, NN-L-IMP-001_RansomwareEncryption, NN-L-IMP-002_RenameExtensionBurst",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "NN-L-FIM-010_RansomwareExtensionRename (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-IMP-001_RansomwareEncryption (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-IMP-002_RenameExtensionBurst (unit)"
         }
       ],
-      "score": 1,
+      "score": 3,
       "showSubtechniques": false,
       "tactic": "impact",
       "techniqueID": "T1486"

@@ -62,6 +62,10 @@ use trust::{proc_start_ticks, ProcId};
 /// The rule whose kill is a ransomware verdict's.
 pub const RANSOMWARE_RULE: &str = "NN-L-FIM-010";
 
+/// Every rule whose kill is a ransomware verdict's: NN-L-FIM-010 and lab PR
+/// 225's decisive NN-L-IMP-001 (KillProcessTree of the encrypting actor).
+pub const RANSOMWARE_RULES: &[&str] = &[RANSOMWARE_RULE, "NN-L-IMP-001"];
+
 /// What the guard is this boot.
 #[derive(Clone)]
 pub enum GuardState {
@@ -283,13 +287,20 @@ pub fn observe_event(event: &Event) {
 /// A rule verdict's response ran: the ransomware rule's kill neutralized
 /// its writer.
 pub fn after_rule_response(rule_id: &str, pid: u32, neutralized: bool) {
-    if global().is_none() || !rule_id.starts_with(RANSOMWARE_RULE) {
+    if global().is_none() {
         return;
     }
-    flag(pid, "NN-L-FIM-010");
+    let Some(rule) = RANSOMWARE_RULES
+        .iter()
+        .copied()
+        .find(|r| rule_id.starts_with(r))
+    else {
+        return;
+    };
+    flag(pid, rule);
     if neutralized {
         let start = proc_start_ticks(std::path::Path::new("/proc"), pid).unwrap_or(0);
-        on_neutralized(vec![ProcId { pid, start }], "NN-L-FIM-010 kill".into());
+        on_neutralized(vec![ProcId { pid, start }], format!("{rule} kill"));
     }
 }
 

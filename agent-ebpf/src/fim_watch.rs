@@ -81,7 +81,8 @@ use aya_ebpf::{
 };
 use northnarrow_common::wire::{
     FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_OP_CREATED, FIM_OP_DELETED,
-    FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, FIM_RENAME_REPLACED, TASK_COMM_LEN,
+    FIM_OP_LINKED, FIM_OP_MODIFIED, FIM_OP_OPENED, FIM_OP_RENAMED, FIM_RENAME_DEST_LEAF,
+    FIM_RENAME_REPLACED, TASK_COMM_LEN,
 };
 
 use crate::btf_offsets::{
@@ -321,11 +322,48 @@ fn emit_drift_with_dest(op: u8, key: InodeKey, dest: InodeKey, op_flags: u8) {
         (*raw_ptr).target_ino = key.ino;
         (*raw_ptr).op = op;
         (*raw_ptr).op_flags = op_flags;
-        if let Ok(comm) = bpf_get_current_comm() {
-            (*raw_ptr).modifier_comm = comm;
+        crate::comm::comm_into(&mut (*raw_ptr).modifier_comm);
+        // Volatile: `NO_DEST`'s two zero stores, merged by the compiler,
+        // became a call of the `memset` subprogram (lab PR 225;
+        // KERNEL_COMPATIBILITY "Older verifiers", rule 9).
+        core::ptr::write_volatile(&mut (*raw_ptr).dest_dev, dest.dev);
+        core::ptr::write_volatile(&mut (*raw_ptr).dest_ino, dest.ino);
+    }
+    entry.submit(0);
+}
+
+/// Lab PR 225 — [`emit_drift_with_dest`] for a watched inode renamed: the
+/// destination directory's key and the file's NEW leaf name
+/// (`new_dentry`), marked [`FIM_RENAME_DEST_LEAF`] so userland does not
+/// read it as a file moved into a watched directory. NN-L-FIM-010 used to
+/// get the directory's path as the destination, and `x → x.locked` did not
+/// match.
+#[inline(always)]
+fn emit_drift_with_dest_leaf(op: u8, key: InodeKey, dest: InodeKey, new_dentry: *const c_void) {
+    let mut entry = match FS_FIM_EVENTS.reserve::<FimDriftRaw>(0) {
+        Some(e) => e,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::FIM);
+            return;
         }
-        (*raw_ptr).dest_dev = dest.dev;
-        (*raw_ptr).dest_ino = dest.ino;
+    };
+    let raw_ptr: *mut FimDriftRaw = entry.as_mut_ptr();
+    unsafe {
+        crate::zero::zero(raw_ptr);
+        (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
+        let pid_tgid = bpf_get_current_pid_tgid();
+        (*raw_ptr).modifier_pid = (pid_tgid >> 32) as u32;
+        let uid_gid = bpf_get_current_uid_gid();
+        (*raw_ptr).modifier_uid = (uid_gid & 0xFFFF_FFFF) as u32;
+        (*raw_ptr).target_dev = key.dev;
+        (*raw_ptr).target_ino = key.ino;
+        (*raw_ptr).op = op;
+        (*raw_ptr).op_flags = FIM_RENAME_DEST_LEAF;
+        crate::comm::comm_into(&mut (*raw_ptr).modifier_comm);
+        core::ptr::write_volatile(&mut (*raw_ptr).dest_dev, dest.dev);
+        core::ptr::write_volatile(&mut (*raw_ptr).dest_ino, dest.ino);
+        let flags = read_child_leaf(new_dentry, &mut (*raw_ptr).child_name);
+        (*raw_ptr).child_name_flags = flags;
     }
     entry.submit(0);
 }
@@ -356,9 +394,7 @@ fn emit_drift_with_child(op: u8, key: InodeKey, child_dentry: *const c_void) {
         (*raw_ptr).target_dev = key.dev;
         (*raw_ptr).target_ino = key.ino;
         (*raw_ptr).op = op;
-        if let Ok(comm) = bpf_get_current_comm() {
-            (*raw_ptr).modifier_comm = comm;
-        }
+        crate::comm::comm_into(&mut (*raw_ptr).modifier_comm);
         let flags = read_child_leaf(child_dentry, &mut (*raw_ptr).child_name);
         (*raw_ptr).child_name_flags = flags;
     }
@@ -545,6 +581,9 @@ unsafe fn try_fim_unlink_observe(ctx: &LsmContext) -> i32 {
             emit_drift(FIM_OP_DELETED, key);
         }
     }
+    // Lab PR 225: every unlink counts toward its process's unlink burst
+    // (the deletion of originals after an encrypted copy was written).
+    let _ = crate::open_sensor::nn_unlink_burst(crate::open_sensor::raw_arg(ctx, 1));
     0
 }
 
@@ -584,7 +623,10 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
     }
     if let Some(old_inode) = old_inode_opt {
         if let Some(key) = should_emit(old_inode) {
-            emit_drift_with_dest(FIM_OP_RENAMED, key, new_dir_key, 0);
+            // Lab PR 225: with the new leaf, so userland names the file's
+            // new path, not the directory's.
+            let new_dentry_leaf: *const c_void = ctx.arg(3);
+            emit_drift_with_dest_leaf(FIM_OP_RENAMED, key, new_dir_key, new_dentry_leaf);
         }
     }
 
@@ -607,6 +649,12 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
             emit_drift_with_dest(FIM_OP_RENAMED, key, NO_DEST, FIM_RENAME_REPLACED);
         }
     }
+    // Lab PR 225: every rename counts toward its process's burst of
+    // renames to a new extension, wherever the file is.
+    let _ = crate::open_sensor::nn_rename_burst(
+        crate::open_sensor::raw_arg(ctx, 1),
+        crate::open_sensor::raw_arg(ctx, 3),
+    );
     0
 }
 

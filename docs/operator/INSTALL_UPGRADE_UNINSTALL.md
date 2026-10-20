@@ -121,7 +121,10 @@ syntax) and the `nn-admin config overlay set <list>` command. The agent
 applies the list it was built with in any case: one left over from an
 earlier release is a WARN at boot, an edited one an ERROR and a signed
 `integrity_drift` (`default_list_modified`) at every boot, and neither is
-applied.
+applied. `security-tools.v1` (lab PR 225, the security tools whose
+switch-off NN-L-EVA-001..004 record) is installed the same way but has no
+signed overlay yet: it is pinned to the agent's built-in copy, and an
+edited file is never applied — not even under `NN_OVERLAY_ALLOW_UNSIGNED=1`.
 
 ## 2. Upgrade in place
 
@@ -156,8 +159,8 @@ start — left the host without a working agent. What it does now, in order:
    the three units (the agent's, the watchdog's
    and its `OnFailure=` handler, lab PR 216), the Debian drop-in and the
    copy-on-first-write one (lab PR 222),
-   `journald@northnarrow.conf`, `install-manifest.json`, the five `.v1`
-   lists, the overlay template, the ten control-surface files, the five
+   `journald@northnarrow.conf`, `install-manifest.json`, the six `.v1`
+   lists (`security-tools.v1` since lab PR 225), the overlay template, the ten control-surface files, the five
    canary templates, the overlay signatures the run may add and, when
    missing, `admin.pub`, the bootstrap key and the COMBAT files. The eBPF
    object travels inside the agent binary; its pins are re-created by

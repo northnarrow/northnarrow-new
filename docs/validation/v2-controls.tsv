@@ -1,8 +1,10 @@
 # NorthNarrow — V2 validation campaign — pre-registered controls.
 # version: 2
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217).
-# version 2 (2026-10-20, lab PR 219, before any V2 run): CV17 / CV18 for the
-# new family exploit-guard.
+# version 2 (2026-10-20/21, lab PRs 219 and 225, before any V2 run; one
+# version for both, integrated in that order): CV17 / CV18 for the new
+# family exploit-guard (lab PR 219); CV19..CV22 for the impact and evasion
+# families (lab PR 225; its CV17..CV20).
 #
 # One evasion row and one benign control per family of v2-rules.tsv. The
 # evasion row runs a variant of a technique the family is meant to catch,
@@ -45,3 +47,7 @@ CV15	anti-tamper	evasion	SIGKILL of the agent through systemctl kill, outside a 
 CV16	anti-tamper	benign	nn-admin audit verify from the public half of the signing key	-	no-verdict	deploy/lab/adversarial/anti-tamper.sh::case C42
 CV17	exploit-guard	evasion	A credential gain made in kernel on behalf of a system call outside the allowed table, by a process whose comm is set to sudo (an allow-list by name would pass it; the guard's is by mechanism)	NN-L-EPG-001_CredentialPostcondition	fire	-
 CV18	exploit-guard	benign	sudo, su, newgrp, passwd, setpriv, capsh, unshare -U / -r, podman or docker, systemd-run --uid, a cron job	-	no-verdict	deploy/lab/epg/epg-check.sh::negative suite
+CV19	impact	evasion	An encryptor that writes encrypted copies under a new extension and deletes the originals (no rewrite in place, no rename)	NN-L-IMP-001_RansomwareEncryption	fire	deploy/lab/malsim/ransom-check.sh::MS-23 copy-delete
+CV20	impact	benign	tar, rsync --inplace, git checkout and apt install of 400 random files, each started by a unit	-	no-kill	deploy/lab/malsim/ransom-check.sh::MS-23 negative
+CV21	evasion	evasion	auditd stopped with a shell builtin kill -STOP (no kill exec), seen on task_kill	NN-L-EVA-003_SecurityToolKilled	fire	deploy/lab/malsim/ransom-check.sh::kill -STOP of auditd
+CV22	evasion	benign	apt upgrade of auditd, whose maintainer script restarts and stops the service	-	no-kill	-

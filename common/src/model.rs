@@ -140,6 +140,44 @@ pub enum Event {
         #[serde(default)]
         cgroup_window: bool,
     },
+    /// Lab PR 225: one process crossed a rename or an unlink burst
+    /// threshold, counted in the kernel on `inode_rename` / `inode_unlink`
+    /// for regular files, while the LSM file-open sensor is armed
+    /// (`wire::open_sensor::open_reason::MASS_RENAME`, `MASS_UNLINK`). Read
+    /// by the ransomware signal (NN-L-IMP-001/002).
+    FileBurst {
+        pid: u32,
+        uid: u32,
+        comm: String,
+        kind: FileBurstKind,
+        /// Renames of the streak, or unlinks, in the window when the
+        /// threshold was crossed.
+        count: u32,
+        /// [`FileBurstKind::RenameExtension`]: the renames that appended
+        /// the extension to the whole old name. 0 otherwise.
+        appended: u32,
+        /// [`FileBurstKind::RenameExtension`]: how often the old extension
+        /// changed from one counted rename to the next — originals of
+        /// different kinds. 0 otherwise.
+        sources: u32,
+        /// The file that crossed it: the renamed file's new name, or the
+        /// unlinked file (absolute path when resolved).
+        filename: String,
+        timestamp_ns: u64,
+    },
+    /// Lab PR 225 (CM-18): a signal that stops or ends a process, sent to
+    /// the main process of another security tool of the host (the list
+    /// `security-tools.v1`), seen on `task_kill` and never refused
+    /// (`wire::open_sensor::open_reason::DEFENDER_SIGNAL`). `pid` is the
+    /// sender. Read by NN-L-EVA-003.
+    DefenderSignal {
+        pid: u32,
+        uid: u32,
+        comm: String,
+        target_pid: u32,
+        signal: u32,
+        timestamp_ns: u64,
+    },
     /// Pre-exec event: one per binfmt pass of LSM `bprm_check_security`
     /// (Tappa 10.9 step 2), or one per `execve` in tracepoint mode.
     ExecCheck {
@@ -1468,6 +1506,25 @@ pub enum ResponseAction {
     /// verdict's file, undoing a capability grant. Acts on the file, not
     /// on the process.
     StripFileCapability,
+}
+
+/// Lab PR 225: what an [`Event::FileBurst`] counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileBurstKind {
+    /// Renames of regular files to one new extension, appended to the
+    /// whole old name or in place of the old one.
+    RenameExtension,
+    /// Unlinks of regular files of at least 4 KiB.
+    Unlink,
+}
+
+impl FileBurstKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileBurstKind::RenameExtension => "rename_extension",
+            FileBurstKind::Unlink => "unlink",
+        }
+    }
 }
 
 /// Decision produced by the engine for a given event.

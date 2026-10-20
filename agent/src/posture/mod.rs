@@ -326,6 +326,19 @@ impl PostureMachine {
         self.inner.triggers.set_installer_window(window);
     }
 
+    /// Lab PR 225: the ransomware tracker the rules share; the posture
+    /// raises `RansomwareEncryption` on its decisive assessments. Unwired,
+    /// the trigger never fires. Set once; a second call is ignored.
+    pub fn set_ransom_tracker(&self, tracker: Arc<crate::impact::RansomTracker>) {
+        self.inner.triggers.set_ransom_tracker(tracker);
+    }
+
+    /// Lab PR 225: the security-tool detector the rules share; the posture
+    /// raises `DefenseImpairment` on its unsanctioned findings. Set once.
+    pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector>) {
+        self.inner.triggers.set_defense_detector(detector);
+    }
+
     /// External audit POS-001: run `hook` when an unlocked COMBAT decays.
     /// Set once; a second call is ignored.
     pub fn on_combat_decay(&self, hook: CombatEntryHook) {
@@ -466,7 +479,10 @@ impl PostureMachine {
         if let PostureState::Combat { since, .. } = current {
             let was_locked = matches!(*guard, PostureState::Combat { locked: true, .. });
             let locked = was_locked
-                || hits.iter().any(|t| t.confidence() == Confidence::Decisive)
+                // Lab PR 225: by what locks, not by what is decisive — the
+                // ransomware combination reaches COMBAT on its own but does
+                // not lock it (`TriggerType::locks_combat`).
+                || hits.iter().any(TriggerType::locks_combat)
                 || (corroborated_here && (privileged_now || ledger.has_privileged(&scope)));
             lock_acquired = locked && !was_locked && before == PostureKind::Combat;
             current = PostureState::Combat { since, locked };

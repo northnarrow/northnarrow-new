@@ -2582,6 +2582,32 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         fanout_exempt_extra = ?cli.net_fanout_exempt,
         "network rules: configured resolvers (port-53 exemption) and fan-out thresholds"
     );
+    // Lab PR 225: the ransomware tracker (NN-L-IMP-001/002) and the
+    // security-tool detector (NN-L-EVA-001..004) the rules and the posture
+    // share; the list of security tools is the shipped content
+    // `security-tools.v1`.
+    let ransom_tracker = Arc::new(northnarrow_agent::impact::RansomTracker::new(
+        lineage.clone(),
+    ));
+    let security_tools_v1 = std::path::Path::new(northnarrow_agent::impair::SECURITY_TOOLS_V1);
+    let (security_tools, security_tools_defaults) =
+        northnarrow_agent::impair::SecurityTools::load(security_tools_v1);
+    report_builtin_defaults(
+        &overlay_gate,
+        "security-tools",
+        security_tools_v1,
+        &security_tools_defaults,
+    );
+    let defense_detector = Arc::new(northnarrow_agent::impair::DefenseDetector::new(
+        Arc::new(security_tools),
+        lineage.clone(),
+        Some(Arc::new(
+            process_allowlist
+                .as_ref()
+                .clone()
+                .with_identity(lineage.clone()),
+        )),
+    ));
     let engine = RuleEngine::with_default_rules_and_net(
         Arc::clone(&netflow_blocklist),
         Arc::clone(&ja3_blocklist),
@@ -2608,6 +2634,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         ),
         Arc::clone(&chain_store),
         net_rule_config,
+        Arc::clone(&ransom_tracker),
+        Arc::clone(&defense_detector),
     );
     // External audit PROC-015 / PROC-014: a demo build runs R901..R904
     // ahead of the production engine (operator state included), and
@@ -2973,6 +3001,19 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // Lab PR 162: inside the trusted-installer window a control-surface
     // tamper (NN-L-FIM-024) does not raise the posture; the rule still acts.
     posture.set_installer_window(Arc::clone(&installer_override));
+    // Lab PR 225: the ransomware combination (RansomwareEncryption, never
+    // locked; COMBAT without corroboration held behind the per-rule policy,
+    // off by default) and the security tools switched off
+    // (DefenseImpairment, ENGAGED), judged as the rules judge them.
+    posture.set_ransom_tracker(Arc::clone(&ransom_tracker));
+    posture.set_defense_detector(Arc::clone(&defense_detector));
+    // Lab PR 225 (decision of 21/10): inside a valid signed trusted-installer
+    // window a stop or restart of the agent's own units is sanctioned (Low,
+    // the window named; no posture move).
+    defense_detector.set_installer_window(Arc::clone(&installer_override));
+    // Lab PR 225: their counters in `status --key`.
+    northnarrow_agent::impact::publish(&ransom_tracker);
+    northnarrow_agent::impair::publish(&defense_detector);
     info!("posture state machine initialized (state: OBSERVING)");
 
     // Beta Step 3: keep the watchdog PID exemption fresh. The watchdog
@@ -3689,10 +3730,56 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     ),
                 }
                 record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
-                let inode_map = match populate_watched_paths(
-                    sensor.ebpf_mut(),
-                    &watched_paths_load.effective,
-                ) {
+                // Lab PR 225 (NN-L-EVA-004): the security tools' configuration
+                // files, and those their listed directories hold now.
+                let mut fim_watch_set = watched_paths_load.effective.clone();
+                fim_watch_set.extend(defense_detector.tools().fim_paths());
+                // Lab PR 225 (NN-L-EVA-003): the tools' running processes,
+                // into the map `task_kill` reports their stop signals by.
+                match sensor
+                    .ebpf_mut()
+                    .take_map("DEFENDER_PIDS")
+                    .map(northnarrow_agent::impair::DefenderMap::try_from)
+                {
+                    Some(Ok(map)) => {
+                        defense_detector.attach_map(map);
+                        info!(
+                            defenders = defense_detector.counts().defenders,
+                            "security tools' processes registered for task_kill reports"
+                        );
+                        // A tool's exec registers its pid; a forking
+                        // daemon's own process is registered by the
+                        // `/proc` scans the exec asks for.
+                        let rescanner = Arc::clone(&defense_detector);
+                        tokio::spawn(async move {
+                            let mut tick = tokio::time::interval(
+                                northnarrow_agent::impair::FORK_RESCAN_SPACING,
+                            );
+                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            loop {
+                                tick.tick().await;
+                                if !rescanner.rescan_due(Instant::now()) {
+                                    continue;
+                                }
+                                let r = Arc::clone(&rescanner);
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    r.rescan_if_due(Instant::now())
+                                })
+                                .await;
+                            }
+                        });
+                    }
+                    Some(Err(e)) => warn!(
+                        error = %e,
+                        "DEFENDER_PIDS is not a HashMap<u32, u8> — signals to the security \
+                         tools are seen only through kill/pkill/killall execs"
+                    ),
+                    None => warn!(
+                        "DEFENDER_PIDS missing from the eBPF object — signals to the security \
+                         tools are seen only through kill/pkill/killall execs"
+                    ),
+                }
+                let inode_map = match populate_watched_paths(sensor.ebpf_mut(), &fim_watch_set) {
                     Ok(m) => m,
                     Err(e) => {
                         warn!(
@@ -5225,6 +5312,36 @@ async fn process_event(
             count = *count,
             last = %Escaped(filename),
             "mass write: write-open threshold crossed (counted in the kernel)"
+        ),
+        // Lab PR 225: the rename and unlink bursts (NN-L-IMP-001/002 read them).
+        Event::FileBurst {
+            pid,
+            comm,
+            kind,
+            count,
+            filename,
+            ..
+        } => info!(
+            pid = *pid,
+            comm = %Escaped(comm),
+            kind = kind.as_str(),
+            count = *count,
+            last = %Escaped(filename),
+            "file burst: rename or unlink threshold crossed (counted in the kernel)"
+        ),
+        // Lab PR 225: NN-L-EVA-003 reports it.
+        Event::DefenderSignal {
+            pid,
+            comm,
+            target_pid,
+            signal,
+            ..
+        } => info!(
+            pid = *pid,
+            comm = %Escaped(comm),
+            target_pid = *target_pid,
+            signal = *signal,
+            "signal to a security tool's process (task_kill, not refused)"
         ),
         Event::ExecCheck {
             filename,

@@ -319,6 +319,10 @@ PROCESS_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/process-comm-allowlist.v1"
 # escape-to-host detection is preserved on non-container hosts.
 PROCESS_COMM_ALLOWLIST_EXAMPLE_SRC="$REPO_ROOT/configs/process-comm-allowlist.local.example"
 NETFLOW_COMM_ALLOWLIST_V1_SRC="$REPO_ROOT/configs/netflow-comm-allowlist.v1"
+# Lab PR 225: the security tools whose disabling NN-L-EVA-001..004 detect.
+# Shipped content like the other .v1 lists (install_shipped_v1); protected
+# by PROTECTED_INODES; no overlay yet.
+SECURITY_TOOLS_V1_SRC="$REPO_ROOT/configs/security-tools.v1"
 # Beta Step 4b: empty-by-default COMBAT management carve-out CIDR list.
 COMBAT_ALLOW_CIDRS_SRC="$REPO_ROOT/configs/combat-allow.cidrs"
 
@@ -902,7 +906,8 @@ txn_targets() {
     echo "$DROPIN_ROOT/northnarrow-agent.service.d/20-cow-guard.conf"
     echo "$JOURNALD_NS_CONF"
     echo "$ETC_DIR/install-manifest.json"
-    for f in fim-paths netflow-blocklist netflow-ja3-blocklist process-comm-allowlist netflow-comm-allowlist; do
+    for f in fim-paths netflow-blocklist netflow-ja3-blocklist process-comm-allowlist netflow-comm-allowlist \
+             security-tools; do
         echo "$ETC_DIR/$f.v1"
     done
     echo "$ETC_DIR/process-comm-allowlist.local.example"
@@ -1797,6 +1802,7 @@ declare -A SHIPPED_V1_EARLIER=(
     [netflow-ja3-blocklist.v1]="0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24"
     [process-comm-allowlist.v1]="4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730 e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94"
     [netflow-comm-allowlist.v1]="4fca39d4d5a35da6fb5409bf25f76ce9020f444f4ac553b3c3ecda3ad9277f10"
+    [security-tools.v1]=""
 )
 install_shipped_v1() {
     local name=$1 src=$2 what=$3 dst="$ETC_DIR/$1" on_disk keep
@@ -1840,6 +1846,7 @@ install_shipped_v1 netflow-blocklist.v1 "$NETFLOW_BLOCKLIST_V1_SRC" "NetFlow IP/
 install_shipped_v1 netflow-ja3-blocklist.v1 "$NETFLOW_JA3_BLOCKLIST_V1_SRC" "NetFlow JA3 blocklist"
 install_shipped_v1 process-comm-allowlist.v1 "$PROCESS_COMM_ALLOWLIST_V1_SRC" "process comm allowlist"
 install_shipped_v1 netflow-comm-allowlist.v1 "$NETFLOW_COMM_ALLOWLIST_V1_SRC" "NetFlow comm allowlist"
+install_shipped_v1 security-tools.v1 "$SECURITY_TOOLS_V1_SRC" "list of security tools"
 
 # COMBAT rulesets (iptables-restore bodies for the NORTHNARROW_COMBAT
 # chain, v4 + v6). Load-bearing beyond isolation: without a loadable

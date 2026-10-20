@@ -1145,6 +1145,14 @@ pub const FIM_CHILD_TRUNCATED: u8 = 0x01;
 /// PAM module, a unit), not moved away.
 pub const FIM_RENAME_REPLACED: u8 = 0x01;
 
+/// [`FimDriftRaw::op_flags`] bit (lab PR 225): a watched inode was renamed
+/// and [`FimDriftRaw::child_name`] carries its NEW leaf name, with
+/// `dest_dev`/`dest_ino` naming the directory it went to. Without the bit a
+/// leaf in a `Renamed` record is the name of a file renamed INTO a watched
+/// directory (BUG-022). NN-L-FIM-010 matched the destination directory's
+/// path instead of the file's new name, so `x → x.locked` did not fire.
+pub const FIM_RENAME_DEST_LEAF: u8 = 0x02;
+
 /// Tappa 9 (C1) — kernel↔userland record emitted by the FIM
 /// observation hooks (design §5). One record per watched-inode
 /// drift event. Userland's `agent/src/fim/drain.rs` (C4) decodes

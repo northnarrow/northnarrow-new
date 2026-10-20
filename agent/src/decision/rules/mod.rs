@@ -18,6 +18,8 @@ pub mod chain;
 /// Lab PR 219: the exploit post-condition guard's rules (issued outside
 /// the engine, like `anti_tamper`).
 pub mod epg;
+pub mod evasion;
+pub mod impact;
 pub mod iouring;
 pub(crate) mod module_provenance;
 pub mod net;
@@ -171,6 +173,20 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     rules.extend(crate::fim::rules::fim_rules(
         crate::anti_tamper::trusted_installer::TrustedInstallerOverride::inert_arc(),
     ));
+    // Lab PR 225: the ransomware and security-tool rules, over a live
+    // `/proc`-backed lineage, the host's package database and the shipped
+    // list.
+    let lineage = crate::posture::lineage::AuthSessionTracker::with_proc();
+    rules.extend(impact::impact_rules(Arc::new(
+        crate::impact::RansomTracker::new(lineage.clone()),
+    )));
+    rules.extend(evasion::evasion_rules(Arc::new(
+        crate::impair::DefenseDetector::new(
+            Arc::new(crate::impair::SecurityTools::builtin()),
+            lineage,
+            None,
+        ),
+    )));
     rules.extend(canary::canary_rules());
     // Tappa 10 (N6) — 9 NN-L-NET rules with empty boot
     // blocklists. The production agent main.rs path constructs
@@ -214,6 +230,10 @@ pub fn default_rules_with_net(
     correlation: Arc<Mutex<crate::decision::correlation::CorrelationStore>>,
     // Lab PR 224: the configured resolvers and the fan-out thresholds.
     net_config: net::NetRuleConfig,
+    // Lab PR 225: the ransomware tracker and the security-tool detector the
+    // posture shares.
+    ransom: Arc<crate::impact::RansomTracker>,
+    defense: Arc<crate::impair::DefenseDetector>,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
@@ -244,6 +264,8 @@ pub fn default_rules_with_net(
         installer_override,
         lineage.clone(),
     ));
+    rules.extend(impact::impact_rules(ransom));
+    rules.extend(evasion::evasion_rules(defense));
     rules.extend(canary::canary_rules_with_readers(canary_readers));
     // External audit NET-010 (NN-AUD-006): the network allowlist judged on
     // what the kernel executed, not on comm. Lab PR 224 (CM-02 d): its

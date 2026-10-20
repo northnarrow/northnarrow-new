@@ -148,15 +148,32 @@ pub fn load_defaults<T>(
     parse: impl Fn(&str, &str) -> T,
 ) -> (T, DefaultsSource) {
     let allow_modified = std::env::var(ALLOW_UNSIGNED_ENV).is_ok_and(|v| v == "1");
-    load_defaults_with(label, v1_path, shipped, allow_modified, parse)
+    load_defaults_with(label, v1_path, shipped, allow_modified, true, parse)
 }
 
-/// [`load_defaults`] with the escape hatch given.
+/// Lab PR 225: a shipped list with no operator overlay (`security-tools.v1`)
+/// — pinned to the agent's built-in copy. As [`load_defaults`], except that a
+/// modified file is never applied, not even under `NN_OVERLAY_ALLOW_UNSIGNED`
+/// (there is no signed way to tune such a list, so its file is no
+/// configuration), and the message points to no overlay. The file is not
+/// signed: it is compared byte for byte with the built-in copy.
+pub fn load_pinned_defaults<T>(
+    label: &str,
+    v1_path: &Path,
+    shipped: Shipped<'_>,
+    parse: impl Fn(&str, &str) -> T,
+) -> (T, DefaultsSource) {
+    load_defaults_with(label, v1_path, shipped, false, false, parse)
+}
+
+/// [`load_defaults`] with the escape hatch given, and whether the list has
+/// a signed `.local` overlay to point the operator to.
 fn load_defaults_with<T>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
     allow_modified: bool,
+    has_overlay: bool,
     parse: impl Fn(&str, &str) -> T,
 ) -> (T, DefaultsSource) {
     let built_in = |source: DefaultsSource| {
@@ -212,14 +229,20 @@ fn load_defaults_with<T>(
             );
         }
     }
+    let hint = if has_overlay {
+        "Tune the list through its signed `.local` overlay (`nn-admin config overlay set`); \
+         `install.sh --upgrade` keeps the file as `.v1.operator` and installs the shipped one"
+    } else {
+        "This list has no operator overlay: the copy built into the agent is the list, the \
+         file only mirrors it; `install.sh --upgrade` keeps the file as `.v1.operator` and \
+         installs the shipped one"
+    };
     error!(
         path = %v1_path.display(),
         sha256 = %sha256,
         builtin_sha256 = %builtin_sha256,
         "{label}: DEFAULT LIST MODIFIED — the file is no list NorthNarrow shipped (edited by hand?): \
-         not applied, the copy built into the agent is in force. Tune the list through its signed \
-         `.local` overlay (`nn-admin config overlay set`); `install.sh --upgrade` keeps the file as \
-         `.v1.operator` and installs the shipped one"
+         not applied, the copy built into the agent is in force. {hint}"
     );
     built_in(DefaultsSource::Modified {
         sha256,
@@ -476,6 +499,7 @@ mod tests {
             v1,
             Shipped::new(SHIPPED, &earlier),
             allow_modified,
+            true,
             |name, body| parse_default_text(name, body, &accept_any),
         )
     }
@@ -601,7 +625,7 @@ mod tests {
 
     /// Every shipped default list: its file name in `/etc/northnarrow` and
     /// its shipped copies.
-    fn shipped_lists() -> [(&'static str, Shipped<'static>); 5] {
+    fn shipped_lists() -> [(&'static str, Shipped<'static>); 6] {
         [
             ("fim-paths.v1", crate::fim::paths_config::FIM_PATHS_SHIPPED),
             (
@@ -620,6 +644,8 @@ mod tests {
                 "netflow-comm-allowlist.v1",
                 crate::config::comm_allowlist::NETFLOW_COMM_ALLOWLIST_SHIPPED,
             ),
+            // Lab PR 225.
+            ("security-tools.v1", crate::impair::SECURITY_TOOLS_SHIPPED),
         ]
     }
 
@@ -702,6 +728,10 @@ mod tests {
             (
                 "netflow-comm-allowlist.v1",
                 "46a1965afe80c7b578bb3584126f35a46d678bd59a6e2ca59081f65381d93266",
+            ),
+            (
+                "security-tools.v1",
+                "38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335",
             ),
         ];
         for ((name, shipped), (pin_name, pin)) in shipped_lists().into_iter().zip(pins) {

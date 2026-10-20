@@ -78,7 +78,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
     FileAttrChange, FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_NAME_LEN,
-    FIM_CHILD_TRUNCATED, FIM_RENAME_REPLACED,
+    FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED,
 };
 use common::Event;
 use serde::{Deserialize, Serialize};
@@ -1867,8 +1867,13 @@ pub fn process_drift(
         moved_in: false,
     };
     let mut child_read = false;
+    // Lab PR 225: a leaf in a `Renamed` record names a file renamed INTO a
+    // watched directory, unless the kernel marked it as the new name of the
+    // watched inode itself (`FIM_RENAME_DEST_LEAF`).
+    let moved_in_leaf = raw.child_name[0] != 0
+        && (op != FimOp::Renamed || raw.op_flags & FIM_RENAME_DEST_LEAF == 0);
     let (path, op, child_truncated) =
-        if matches!(op, FimOp::Created | FimOp::Renamed) && raw.child_name[0] != 0 {
+        if matches!(op, FimOp::Created | FimOp::Renamed) && moved_in_leaf {
             match reconstruct_child_path(&path, raw) {
                 Some(child) => {
                     let truncated = raw.child_name_flags & FIM_CHILD_TRUNCATED != 0;
@@ -1895,7 +1900,7 @@ pub fn process_drift(
     // change has landed (the hooks fire before it), watched anew, and the
     // path checked against its baseline, attributed to this writer.
     if class == WatchClass::ChainHop
-        && (op == FimOp::Deleted || (op == FimOp::Renamed && raw.child_name[0] == 0))
+        && (op == FimOp::Deleted || (op == FimOp::Renamed && !moved_in_leaf))
     {
         queues(|q| q.chain.push(path.clone(), (Instant::now(), *raw)));
         return Ok(false);
@@ -1906,7 +1911,7 @@ pub fn process_drift(
     // External audit FIMP-005: the watched inode itself renamed (no child
     // leaf: the source was watched). FIMR-004: or replaced by another file
     // renamed over it — checked as a modification once the rename lands.
-    if op == FimOp::Renamed && raw.child_name[0] == 0 {
+    if op == FimOp::Renamed && !moved_in_leaf {
         let replaced = (raw.op_flags & FIM_RENAME_REPLACED != 0).then_some(*raw);
         if settle_rename(&key, &path, class, path_map, watched_paths) {
             if let Some(r) = &replaced {
@@ -2178,11 +2183,9 @@ pub fn process_drift(
         // fall back to None and the NN-L-FIM-010 rule's dest-side
         // matcher skips silently — the rule still fires on src-side
         // matches.
+        // Lab PR 225: the file's new path, not the directory it went to.
         let dest_path = if matches!(op, FimOp::Renamed) && raw.dest_ino != 0 {
-            path_map.lookup(&InodeKey {
-                dev: raw.dest_dev,
-                ino: raw.dest_ino,
-            })
+            rename_destination(raw, &path, path_map)
         } else {
             None
         };
@@ -2215,6 +2218,54 @@ pub fn process_drift(
         }));
     }
     Ok(true)
+}
+
+/// Lab PR 225: where a watched file was renamed to — `dir/leaf`. The kernel
+/// names the destination directory (`dest_dev`/`dest_ino`); NN-L-FIM-010
+/// used to match that directory's path, so `x → x.locked` never fired. The
+/// directory is the watched one the map names, or the source's own (a
+/// rename in place, the encrypt-and-rename loop: the directory itself is
+/// rarely watched). The leaf is the one the kernel carried
+/// (`FIM_RENAME_DEST_LEAF`), else the entry of that directory that now holds
+/// the renamed inode (an older eBPF object, or a leaf cut at
+/// `FIM_CHILD_NAME_LEN`). `None` when neither can be found: a rename to an
+/// unwatched directory elsewhere.
+fn rename_destination(raw: &FimDriftRaw, src: &str, path_map: &InodePathMap) -> Option<String> {
+    let dir_key = InodeKey {
+        dev: raw.dest_dev,
+        ino: raw.dest_ino,
+    };
+    let dir = path_map.lookup(&dir_key).or_else(|| {
+        let parent = Path::new(src).parent()?.to_str()?;
+        let parent = if parent.is_empty() { "/" } else { parent };
+        matches!(key_for_path(&fs_path(parent)), Ok(k) if k == dir_key).then(|| parent.to_string())
+    })?;
+    let carried = raw.op_flags & FIM_RENAME_DEST_LEAF != 0
+        && raw.child_name[0] != 0
+        && raw.child_name_flags & FIM_CHILD_TRUNCATED == 0;
+    if carried {
+        if let Some(p) = reconstruct_child_path(&dir, raw) {
+            return Some(p);
+        }
+    }
+    let leaf = entry_holding(&dir, raw.target_ino)?;
+    Some(format!("{}/{}", dir.trim_end_matches('/'), leaf))
+}
+
+/// Lab PR 225: entries of a directory read when looking for a renamed inode.
+const RENAME_SCAN_MAX: usize = 65_536;
+
+/// Lab PR 225: the name, as the drain spells it ([`leaf_display`]), of the
+/// entry of `dir` whose inode number is `ino`.
+fn entry_holding(dir: &str, ino: u64) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirEntryExt;
+    let entries = std::fs::read_dir(fs_path(dir)).ok()?;
+    entries
+        .take(RENAME_SCAN_MAX)
+        .flatten()
+        .find(|e| e.ino() == ino)
+        .map(|e| leaf_display(e.file_name().as_bytes()))
 }
 
 /// External audit NN-AUD-285 (FIMR-011): the file a FIM event is about
@@ -5193,5 +5244,159 @@ mod tests {
             Some(watched_dir.join("evil.service").to_string_lossy().as_ref()),
             "still watched under its new name"
         );
+    }
+
+    /// Lab PR 225: the rename of a watched file, as `process_drift` turns
+    /// it into the event NN-L-FIM-010 reads. `leaf`: the new name the
+    /// kernel carried (`FIM_RENAME_DEST_LEAF`), or `None` for the wire shape
+    /// of the starting tree (the destination directory's key only).
+    fn renamed_watched_file(leaf: Option<&[u8]>) -> (TempDir, Vec<Event>) {
+        let dir = TempDir::new().unwrap();
+        let drift_db = parking_lot::Mutex::new(
+            FimDriftDb::open(
+                &dir.path().join("drift.jsonl"),
+                fresh_signing_key(&dir),
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap(),
+        );
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let x = data.join("x");
+        std::fs::write(&x, b"quarterly report").unwrap();
+        let file_key = key_for_path(&x).unwrap();
+        let dir_key = key_for_path(&data).unwrap();
+        // The file is watched (fim-paths.local), its directory is not.
+        let path_map = InodePathMap::new();
+        path_map.insert(file_key, x.to_string_lossy().into_owned());
+        // The rename has landed when the drain reads the record.
+        std::fs::rename(&x, data.join("x.locked")).unwrap();
+        let mut raw = fake_raw(file_key.dev, file_key.ino, FimOp::Renamed as u8);
+        raw.dest_dev = dir_key.dev;
+        raw.dest_ino = dir_key.ino;
+        raw.modifier_pid = 4343;
+        if let Some(leaf) = leaf {
+            raw.op_flags = FIM_RENAME_DEST_LEAF;
+            raw.child_name[..leaf.len()].copy_from_slice(leaf);
+        }
+        let mut out = Vec::new();
+        process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut &drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        (dir, out)
+    }
+
+    fn fim010_fires(out: &[Event]) -> bool {
+        fim010_verdict(out).is_some_and(|a| a == common::ResponseAction::KillProcessTree)
+    }
+
+    /// NN-L-FIM-010's action on the first event it fires on.
+    fn fim010_verdict(out: &[Event]) -> Option<common::ResponseAction> {
+        use crate::decision::Rule as _;
+        out.iter().find_map(|e| {
+            crate::fim::rules::NnLFim010RansomwareExtensionRename
+                .evaluate(e)
+                .map(|v| v.action)
+        })
+    }
+
+    /// Lab PR 225: `x → x.locked` of a watched file. The event named the
+    /// destination DIRECTORY as `dest_path`, so NN-L-FIM-010 never matched
+    /// `.locked`. Fails on the starting tree.
+    #[test]
+    fn fim010_rename_destination_is_the_new_file_not_its_directory() {
+        let (dir, out) = renamed_watched_file(None);
+        let want = dir.path().join("data/x.locked");
+        let fe = match &out[..] {
+            [Event::Fim(fe)] => fe,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(fe.op, FimOp::Renamed);
+        assert_eq!(fe.dest_path.as_deref(), Some(want.to_str().unwrap()));
+        assert!(fim010_fires(&out), "x → x.locked must fire NN-L-FIM-010");
+        use crate::decision::Rule as _;
+        let v = crate::fim::rules::NnLFim010RansomwareExtensionRename
+            .evaluate(&Event::Fim(FimEvent {
+                timestamp_ns: fe.timestamp_ns + 10_000_000_000,
+                ..fe.clone()
+            }))
+            .unwrap();
+        assert!(v.reasoning.contains("x.locked"), "{}", v.reasoning);
+    }
+
+    /// Lab PR 225: the new leaf as the kernel carries it. It is the
+    /// renamed file's own new name, not a file moved into a watched
+    /// directory: no child reconstruction against the file's path.
+    #[test]
+    fn fim010_kernel_carried_leaf_names_the_destination() {
+        let (dir, out) = renamed_watched_file(Some(b"x.locked"));
+        let want = dir.path().join("data/x.locked");
+        let fe = match &out[..] {
+            [Event::Fim(fe)] => fe,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(fe.op, FimOp::Renamed, "not normalised to a Created");
+        assert_eq!(fe.path, dir.path().join("data/x").to_string_lossy());
+        assert_eq!(fe.dest_path.as_deref(), Some(want.to_str().unwrap()));
+        assert!(fim010_fires(&out));
+    }
+
+    /// Lab PR 225: the rename inside a watched data directory reaches the
+    /// rules as the directory's `Created` of the new name (`moved_in`).
+    /// NN-L-FIM-010 looked at `Renamed` only. Fails on the starting tree.
+    /// The match is new: its kill is held behind the per-rule policy (off
+    /// by default), the Critical record kept.
+    #[test]
+    fn fim010_rename_into_a_watched_directory_fires() {
+        let dir = TempDir::new().unwrap();
+        let drift_db = parking_lot::Mutex::new(
+            FimDriftDb::open(
+                &dir.path().join("drift.jsonl"),
+                fresh_signing_key(&dir),
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap(),
+        );
+        let data = dir.path().join("vm-images");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("disk.qcow2.locked"), b"ciphertext").unwrap();
+        let dir_key = key_for_path(&data).unwrap();
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, data.to_string_lossy().into_owned());
+        let mut raw = fake_raw(dir_key.dev, dir_key.ino, FimOp::Renamed as u8);
+        raw.modifier_pid = 4444;
+        let leaf = b"disk.qcow2.locked";
+        raw.child_name[..leaf.len()].copy_from_slice(leaf);
+        let mut out = Vec::new();
+        process_drift(
+            &raw,
+            &path_map,
+            None,
+            &mut &drift_db,
+            &DriftClassifier::new(),
+            &DriftRateLimiter::new(),
+            None,
+            None,
+            Some(&mut out),
+        )
+        .unwrap();
+        assert!(
+            matches!(&out[..], [Event::Fim(fe)] if fe.op == FimOp::Created && fe.moved_in),
+            "{out:?}"
+        );
+        assert_eq!(fim010_verdict(&out), Some(common::ResponseAction::Log));
     }
 }

@@ -5,16 +5,19 @@
 # the Critical sub-gate (gate -), inactive until BUG-025 (no sensor produces
 # a TLS fingerprint); it stays in the denominator. NN-L-CANARY-003 stays in
 # the sub-gate: a connect to a network canary now trips it.
-# version 3 (2026-10-20/21, lab PRs 219 and 224, before any V2 run; one
-# version for both, integrated in that order): the exploit post-condition
-# guard's two rules (lab PR 219), NN-L-EPG-001 (credentials, T1068) and
-# NN-L-EPG-002 (namespaces and root, T1611), issued outside the engine
-# (`direct`), Critical, in the sub-gate: family exploit-guard; R020 (lab PR
-# 224: a shell or interpreter with its stdio on a network socket, Critical,
-# in the sub-gate, family process), NN-L-NET-026 (scan fan-out) and
-# NN-L-NET-027 (outbound brute force), both High, family net.
+# version 3 (2026-10-20/21, lab PRs 219, 224 and 225, before any V2 run; one
+# version for the three, integrated in that order): the exploit
+# post-condition guard's two rules (lab PR 219), NN-L-EPG-001 (credentials,
+# T1068) and NN-L-EPG-002 (namespaces and root, T1611), issued outside the
+# engine (`direct`), Critical, in the sub-gate: family exploit-guard; R020
+# (lab PR 224: a shell or interpreter with its stdio on a network socket,
+# Critical, in the sub-gate, family process), NN-L-NET-026 (scan fan-out)
+# and NN-L-NET-027 (outbound brute force), both High, family net; the
+# ransomware rules NN-L-IMP-001 (Critical, in the sub-gate) and NN-L-IMP-002,
+# and the security-tool rules NN-L-EVA-001..004 (lab PR 225: families impact
+# and evasion).
 #
-# One row per rule the agent can record: the 79 rules the production engine
+# One row per rule the agent can record: the 85 rules the production engine
 # loads (decision::rules::default_rules_with_net) and NN-L-AT-001 and
 # NN-L-EPG-001/002, which process_event issues outside the engine. The rule-coverage headline and the
 # Critical sub-gate are computed over these rows and no others; matrix.md
@@ -89,6 +92,12 @@ NN-L-FIM-022_LdSoPreloadModified	fim	engine	critical	yes	in
 NN-L-FIM-023_SystemdTimerCreated	fim	engine	-	-	in
 NN-L-FIM-024_AntiTamperHoneypotModified	fim	engine	critical	-	in
 NN-L-FIM-025_FileCapabilityGranted	fim	engine	critical	-	in
+NN-L-IMP-001_RansomwareEncryption	impact	engine	critical	-	in
+NN-L-IMP-002_RenameExtensionBurst	impact	engine	-	-	in
+NN-L-EVA-001_SecurityServiceStopped	evasion	engine	-	-	in
+NN-L-EVA-002_SecurityToolSwitchedOff	evasion	engine	-	-	in
+NN-L-EVA-003_SecurityToolKilled	evasion	engine	-	-	in
+NN-L-EVA-004_SecurityToolConfigChanged	evasion	engine	-	-	in
 NN-L-CANARY-001_FileAccess	canary	engine	critical	-	in
 NN-L-CANARY-002_ProcessExec	canary	engine	critical	-	in
 NN-L-CANARY-003_NetworkConnect	canary	engine	critical	-	in

@@ -266,6 +266,15 @@ pub fn shipped_rules() -> Vec<ShippedRule> {
         )),
         // Lab PR 224: no configured resolver, the default fan-out thresholds.
         rules::net::NetRuleConfig::default(),
+        // Lab PR 225: the ransomware tracker and the built-in security tools.
+        Arc::new(crate::impact::RansomTracker::new(
+            crate::posture::lineage::AuthSessionTracker::default(),
+        )),
+        Arc::new(crate::impair::DefenseDetector::new(
+            Arc::new(crate::impair::SecurityTools::builtin()),
+            crate::posture::lineage::AuthSessionTracker::default(),
+            None,
+        )),
     );
     let direct: [Box<dyn Rule>; 3] = [
         Box::new(rules::anti_tamper::NnLAt001AntiTamperDenial),

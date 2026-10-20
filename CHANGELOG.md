@@ -6,6 +6,94 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Ransomware recorded on its own evidence (lab PR 225, countermeasure
+  CM-16, capabilities C14, C17, C19; `docs/design/RANSOMWARE_DECISIVE.md`).
+  NN-L-IMP-001_RansomwareEncryption: two of four shapes of one actor's file
+  activity within 120 s — (a) 20 existing files of 4 KiB or more rewritten
+  in 60 s (the mass-write counter's overwrite crossing), (b) what they, the
+  renames or the copies left behind is ciphertext-like (two of up to four
+  files sampled in userland when the burst is read: entropy at least 7.5
+  bits/byte in a 4 KiB block, no known container signature), (c) 20
+  renames to one new extension in 60 s, appended or in place of the old one
+  (new `inode_rename` counter, `MASS_RENAME`) of an encryptor's shape, or
+  encrypted copies under an extension appended to the names of deleted
+  originals — the copies themselves sampled (`<original>.<suffix>` with the
+  original gone, in its directory, then below and beside it), never the
+  originals still waiting beside them, (d) 20 files of 4 KiB or more
+  deleted in 60 s after new files were written (new `inode_unlink`
+  counter, `MASS_UNLINK`; both on regular files, while the LSM file-open
+  sensor is armed) — Critical, with the new posture trigger
+  `RansomwareEncryption`, never locked (POS-001: the lock is now
+  `TriggerType::locks_combat`, the kernel-adjudicated triggers only). Its
+  KillProcessTree of the actor and the trigger's COMBAT without
+  corroboration are new destructive automation: by the decision of
+  21/10/2026 both are held behind the per-rule response policy, off by
+  default (`response_policy::IMP_001_KILL`,
+  `posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`) — the verdict
+  is a Critical record, the trigger needs corroboration (ENGAGED alone).
+  One shape keeps its level: the rewrites raise ENGAGED as before, a rename
+  burst alone is NN-L-IMP-002_RenameExtensionBurst (Log, High), deletions
+  alone nothing; the legitimate copy-then-delete shapes (`mv` across
+  filesystems, `rsync --remove-source-files`, package unpacks, compiler
+  temporaries, editors' safe writes, `git gc`, log rotation with
+  compression) stay that one shape. Writers are trusted by exec identity,
+  package ownership (dpkg lists, `rpm -qf`) and lineage, never by name: a
+  root package transaction, or a packaged program with no foreign program
+  in its lineage (rsync, tar, git, compilers, packaged backup agents and
+  databases), never counts; shapes add up per process (a payload with its
+  forked workers), the kill targets the nearest foreign program.
+  `Event::FileBurst` and `Event::DefenderSignal` are new variants (the enum
+  is serialized by name, as JSON, never by position);
+  `AuthSessionTracker::lineage_identities` (the same function as lab PR
+  222's).
+- Security tools switched off are detected (lab PR 225, CM-18):
+  NN-L-EVA-001_SecurityServiceStopped (`systemctl stop/disable/mask/kill`,
+  `service … stop`, `invoke-rc.d`, `update-rc.d`, `chkconfig`, `rc-service`,
+  `rc-update`, `/etc/init.d/<name> stop`), NN-L-EVA-002_SecurityToolSwitchedOff
+  (`auditctl -e 0` and `-D`, `ufw disable`, `setenforce 0`, `nft flush
+  ruleset`, `iptables -F`, `aa-teardown`, cloud-agent uninstallers; one
+  record per command and process tree within 10 s, the repeats — `ufw
+  disable`'s dozens of `iptables` calls — counted in `detections_held` and
+  the next record's `suppressed_before`),
+  NN-L-EVA-003_SecurityToolKilled (a stop or end signal to a tool's process
+  on `task_kill` — reported, never refused, a shell's builtin `kill`
+  included; new `DEFENDER_PIDS` map, filled at boot and from the tools'
+  execs, each followed by `/proc` scans for the daemon it forks (Debian's
+  auditd), and `Event::DefenderSignal` — or `kill`, `pkill`, `killall`),
+  NN-L-EVA-004_SecurityToolConfigChanged (the tools' configuration files
+  watched by FIM). High and recorded; Low in a package
+  transaction, an administrator's interactive session or under a
+  configuration-management actor, and for a stop or restart of the agent's
+  own units inside a valid signed trusted-installer window (the record's new
+  `sanction` field names the window's key id and deadline; no posture move;
+  never for another tool); the KillProcessTree of a program run
+  from a staging directory or a deleted executable that asked is held
+  behind the per-rule response policy (off by default: a High record).
+  Posture trigger
+  `DefenseImpairment` (ENGAGED, execution evidence). The tools — auditd,
+  AppArmor, SELinux, ufw, firewalld, nftables, iptables, rsyslog, journald,
+  fail2ban, the agent itself, falco, osquery, wazuh, CrowdStrike,
+  SentinelOne, MDE, Elastic, Sophos, Trend Micro, Carbon Black, Qualys,
+  Tanium, Datadog and the Alibaba, Tencent, Huawei, AWS, Google and Azure
+  host agents — are the shipped content `configs/security-tools.v1`
+  (installed by install.sh, write-denied). The list is not signed and has
+  no operator overlay: it is pinned to the agent's built-in copy, compared
+  byte for byte; a file that differs is never applied, not even under
+  `NN_OVERLAY_ALLOW_UNSIGNED=1`, and is a signed `default_list_modified`.
+  ATT&CK v20 (lab PR 221's typed mapping,
+  Defense Impairment): T1685, T1685.004, T1686; NN-L-IMP-001/002: Impact
+  T1486.
+- `nn-admin status --key`: the ransomware and security-tool counters
+  (`StatusResponse` fields appended at the end). Lab:
+  `deploy/lab/nn-lab.sh ransom-check` (MS-23 with the benign simulator
+  `deploy/lab/malsim/ransom-sim.py`, MS-25). The validation registry moves
+  to `v2-rules.tsv` version 3 and `v2-controls.tsv` version 2, the versions
+  lab PRs 219 and 224 open too (88 rules, 29 in the Critical sub-gate; this
+  lot's controls CV19..CV22). The copy-on-first-write guard of lab PR 222
+  restores (with `auto_restore = true`, off by default) after
+  NN-L-FIM-010's kill, and after NN-L-IMP-001's once the per-rule policy
+  turns that kill on.
+
 - Network verdicts while a flow is open (lab PR 224, W4 CM-02, capabilities
   C07/C14). A TCP flow used to reach the rules only at its close, so an open
   reverse shell or C2 session had no verdict while it lived. The connect
@@ -89,6 +177,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   version 2 (TQ61 T1046, TQ62 T1110, after lab PR 219's TQ60).
 
 ### Fixed
+- NN-L-FIM-010 named a rename's destination DIRECTORY, so a watched file
+  renamed `x → x.locked` never matched, and a rename inside a watched data
+  directory (seen as the directory's creation of the new name) was not
+  looked at (lab PR 225). The kernel carries the new leaf
+  (`FIM_RENAME_DEST_LEAF`); the drain names `dir/leaf`, falling back to the
+  directory entry that holds the renamed inode; the rule reads the moved-in
+  creation too, one verdict per rename. That moved-in match is new: its
+  kill is held behind the per-rule response policy (off by default, a
+  Critical record); the watched file's own rename kills as the rule always
+  meant to.
 - The port-53 exemption of NN-L-NET-008 and NN-L-CHAIN-002/005 ignored the
   protocol and the server (research defect D1): an implant in `/tmp` with
   its C2 on TCP/53 to its own server passed all three. It now covers only a
@@ -229,10 +327,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 - Every rule declares its MITRE ATT&CK tactics and techniques as data
   (lab PR 221, capability C16): `Rule::attack()` returns typed
   references (a `Tactic` enum, technique ids checked for shape when they
-  compile) of ATT&CK Enterprise 20.0. All 83 rules the agent can record
-  (lab PR 219's two, lab PR 223's NN-L-EXECQ-001 and lab PR 224's three
-  included) are mapped — 62 techniques and sub-techniques under 12
-  tactics — and a rule detection
+  compile) of ATT&CK Enterprise 20.0. All 89 rules the agent can record
+  (lab PR 219's two, lab PR 223's NN-L-EXECQ-001, lab PR 224's three and
+  lab PR 225's six included) are mapped — 64 techniques and
+  sub-techniques under 12 tactics — and a rule detection
   record now carries their ids in `mitre` (it was always empty on the rule
   path) and the version in a new `mitre_version` field
   (`"20.0"`). Records written before keep their bytes and still verify:

@@ -168,6 +168,14 @@ fn shipped_rule_ids() -> BTreeMap<String, &'static str> {
             crate::decision::correlation::CorrelationStore::new(),
         )),
         rules::net::NetRuleConfig::default(),
+        Arc::new(crate::impact::RansomTracker::new(
+            crate::posture::lineage::AuthSessionTracker::default(),
+        )),
+        Arc::new(crate::impair::DefenseDetector::new(
+            Arc::new(crate::impair::SecurityTools::builtin()),
+            crate::posture::lineage::AuthSessionTracker::default(),
+            None,
+        )),
     );
     let mut ids = BTreeMap::new();
     for r in &engine {

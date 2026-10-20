@@ -211,7 +211,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
         sensors: &[Sensor::File],
         data_components: &["DC0061"],
         observes: "A watched file renamed to, or from, a name ending in one of 19 ransomware \
-            marker extensions (.locked, .crypted, .encrypted, .lockbit, .conti, ...; any case).",
+            marker extensions (.locked, .crypted, .encrypted, .lockbit, .conti, ...; any case). \
+            Lab PR 225 also reads a rename inside a watched directory, seen as the \
+            directory's new entry: that match is new, so its kill is held behind the \
+            per-rule response policy (off by default) — a Critical record.",
         false_positives: "An operator renaming a file to one of these names is killed; .lock, \
             .tmp, .bak and editor swap files are not on the list. Only watched files are seen.",
         how_to_test: "Add an existing scratch file, /srv/nn-test/report.txt, to \
@@ -221,6 +224,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "agent/src/fim/rules.rs::fim010_fires_on_renamed_to_ransomware_extension",
             "agent/src/fim/rules.rs::fim010_matches_extension_case_insensitively",
+            "agent/src/fim/rules.rs::fim010_moved_in_is_held_and_does_not_hide_the_files_rename",
         ],
         attack_note: "Encryption in place, without a rename, has no rule (v2-techniques.tsv TQ32).",
     },
@@ -559,5 +563,67 @@ pub(super) const DOCS: &[RuleDoc] = &[
         ],
         attack_note: "T1548: ATT&CK has no sub-technique for Linux file capabilities (T1548.001 is \
             the set-id bits).",
+    },
+    // ── ransomware, decisive (lab PR 225, CM-16) ────────────────────
+    RuleDoc {
+        id: "NN-L-IMP-001_RansomwareEncryption",
+        severities: &[Severity::Critical],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::File],
+        data_components: &["DC0061", "DC0039", "DC0040"],
+        observes: "Two of four shapes of one actor's file activity within 120 s: existing \
+                   files rewritten (the mass-write overwrite counter), ciphertext-like content \
+                   left behind (entropy sampled in userland), a burst of renames to one new \
+                   extension (or encrypted copies under an extension appended to the names of \
+                   the originals deleted, the copies themselves sampled), deletion of originals \
+                   after new files were written. Critical, \
+                   recorded; the kill of the actor's tree (`KillProcessTree`) and the posture's \
+                   COMBAT without corroboration are held behind the per-rule response policy, \
+                   off by default (new in lab PR 225): the posture's RansomwareEncryption needs \
+                   corroboration, ENGAGED alone, never locked.",
+        false_positives: "Writers trusted by exec identity, package ownership and lineage, never \
+                          by name: a root package transaction, or a packaged program with no \
+                          foreign program in its lineage (rsync, tar, git, compilers, backup \
+                          agents, databases), never counts. Copy-then-delete by anyone else — \
+                          `mv` across filesystems, `rsync --remove-source-files`, a package \
+                          unpack, compiler temporaries, an editor's safe write, `git gc`, log \
+                          rotation with compression — is one shape (the deletions): no copy \
+                          under an appended extension beside the deleted original, or copies \
+                          that are plain, compressed or another known format. A user's own \
+                          script encrypting 20 files a minute into copies with no known \
+                          format header and deleting the originals (`openssl enc`, `ccrypt`) \
+                          is recorded.",
+        how_to_test: "`ransom-check.sh` MS-23: the benign simulator (`ransom-sim.py`, \
+                      /srv/nn-malsim only), in place and copy-delete, draws the Critical \
+                      record (its kill held: the simulator finishes) and the posture reaches \
+                      ENGAGED; tar, rsync, git checkout, an apt install and the simulator's \
+                      own script compressing or moving its files then deleting them draw no \
+                      record.",
+        tests: &[
+            "agent/src/decision/rules/impact.rs::imp001_kills_the_actors_tree_on_two_shapes",
+            "agent/src/impact/tests.rs::copy_delete_beside_fresh_originals_is_decisive",
+            "agent/src/impact/tests.rs::benign_copy_delete_shapes_are_not_decisive",
+            "deploy/lab/malsim/ransom-check.sh::MS-23",
+        ],
+        attack_note: "Data Encrypted for Impact (T1486) by the shape of the writes, not by a \
+                      ransom note or a known family.",
+    },
+    RuleDoc {
+        id: "NN-L-IMP-002_RenameExtensionBurst",
+        severities: &[Severity::High],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::File],
+        data_components: &["DC0061"],
+        observes: "A burst of renames to one new extension, of an encryptor's shape, by one \
+                   actor, alone (with a second shape it is NN-L-IMP-001).",
+        false_positives: "Bulk renames by trusted writers (by identity and lineage); a user's \
+                          own batch rename of many files to one extension is recorded.",
+        how_to_test: "From ONE process — the counter is per process, and a shell loop of \
+                      `mv` is one process per file — rename 20 regular files of 4 KiB or \
+                      more to `.locked`, with the LSM file-open sensor armed and no other \
+                      shape: `python3 -c 'import glob,os; [os.rename(f, f + \".locked\") \
+                      for f in glob.glob(\"/srv/nn-test/*\")]'`.",
+        tests: &["agent/src/decision/rules/impact.rs::imp002_records_a_lone_rename_burst"],
+        attack_note: "",
     },
 ];

@@ -188,6 +188,9 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // and its signature. MUTATE-only like the other overlays.
     "execq-hashes.local",
     "execq-hashes.local.sig",
+    // Lab PR 225: the shipped list of security tools NN-L-EVA-001..004
+    // read (`crate::impair`). Write-denied like the other shipped lists.
+    "security-tools.v1",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -234,6 +237,8 @@ pub const ETC_WRITE_DENY_FILES: &[&str] = &[
     "netflow-ja3-blocklist.v1",
     "process-comm-allowlist.v1",
     "netflow-comm-allowlist.v1",
+    // Lab PR 225: the list of security tools, on the same reasoning.
+    "security-tools.v1",
 ];
 
 /// Tappa 9 C7 + Tappa 9.5 K7: the files inside [`STATE_DIR`] that
@@ -2512,6 +2517,8 @@ mod tests {
                 "cow-guard.local.sig",
                 "execq-hashes.local",
                 "execq-hashes.local.sig",
+                // Lab PR 225 — APPENDED.
+                "security-tools.v1",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"
