@@ -2,10 +2,12 @@
 
 What changes for an operator who upgrades from `v0.0.1-tappa9.0`, or from
 an earlier `main`, to a build that carries the fixes of the external audit
-of commit `16f7563` (Waves 0, 1 and 2, and the Wave 3 lots as they land; tracker:
-[`docs/audit/EXTERNAL_AUDIT_16f7563.md`](../audit/EXTERNAL_AUDIT_16f7563.md)).
+of commit `16f7563` (Waves 0, 1 and 2, and the Wave 3 lots as they land; tracker,
+in the source repository:
+<https://github.com/northnarrow/northnarrow-new/blob/main/docs/audit/EXTERNAL_AUDIT_16f7563.md>).
 Every item below is a change of behaviour or a regression that
-[`CHANGELOG.md`](../../CHANGELOG.md) `[Unreleased]` declares, grouped by
+`CHANGELOG.md` `[Unreleased]` declares (at the root of the release tree,
+in `/usr/share/doc/northnarrow/` from a package), grouped by
 what the operator touches. Each names the finding (`NN-AUD-xxx`, with the
 audit's own reference) and the lab PR that fixed it; the CHANGELOG entry
 and the tracker note have the details and the lab evidence.
@@ -1168,7 +1170,8 @@ checked with its tag-bound attestation.
 - **Default CPU target** (NN-AUD-205 SUP-017, lab PR 150).
   `.cargo/config.toml` defaults to `target-cpu=x86-64-v2`. **Regression:**
   dev, lab and range builds decode with candle at the x86-64-v2 ISA unless
-  they opt into `native` ([`docs/PERFORMANCE.md`](../PERFORMANCE.md) §1).
+  they opt into `native` (§1 of
+  <https://github.com/northnarrow/northnarrow-new/blob/main/docs/PERFORMANCE.md>).
 - **`ade_attacks`** (NN-AUD-195 WDG-R01, lab PR 149) exits non-zero when it
   would score the mock backend, and names the backend next to the rate.
 - **The range bootstrap** takes the rule count from the validation registry

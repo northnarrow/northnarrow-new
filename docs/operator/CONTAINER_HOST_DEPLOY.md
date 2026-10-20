@@ -95,7 +95,8 @@ is restored at that start.
 ## Related
 
 - `configs/process-comm-allowlist.v1` — shipped conservative default.
-- `docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md` §13 Q3 —
-  the allowlist overlay design.
+- The allowlist overlay design (§13 Q3 of the design note, in the source
+  repository, not shipped with the release):
+  <https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md>.
 - `agent/src/decision/rules/r013_namespace_escape_tooling.rs` — the
   rule and its allowlist gate.

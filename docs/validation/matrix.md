@@ -28,7 +28,11 @@ Critical sub-gate.
   hash in this table is stale, when a rule design §13 Q1 names is missing
   from the Critical sub-gate, when a sub-gate rule has no row in the
   evidence table below, or when a cited test, probe or evidence file does
-  not exist.
+  not exist. It also fails (external audit NN-AUD-444, lab PR 209) when
+  `docs/adversarial/V2_ATOMIC_RED_TEAM_SWEEP.md` no longer says HALT while
+  the matrix below has no data row or no `evidence/<run-id>/` directory
+  exists, and when a row cites a run directory that is not there or has no
+  `SHA256SUMS`.
 
 Change log:
 

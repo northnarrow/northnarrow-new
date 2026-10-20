@@ -61,6 +61,61 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, operator documentation and compliance (Low
+  DEP-013 NN-AUD-385, DEP-018 NN-AUD-390, DEP-021 NN-AUD-441, SUP-019
+  NN-AUD-403, SUP-020 NN-AUD-404, LAB-028 NN-AUD-444 guard; lab PR 209).
+  DEP-013: the grub step that the install banner, the install guide and the
+  kernel guide sent operators to (`docs/TAPPA7_PREREQ.md`) wrote a fixed
+  `lsm=` list taken from one Ubuntu host; `lsm=` replaces the kernel's own
+  list, so a RHEL-family host would have rebooted without SELinux.
+  `docs/operator/KERNEL_COMPATIBILITY.md` now has "Enabling the `bpf`
+  LSM": the list is the `lsm=` the kernel was booted with, or else
+  `CONFIG_LSM`, plus `bpf`; a module running now that the list leaves out
+  stops the procedure; an `lsm=` already in the grub configuration is
+  edited, never doubled; `update-grub` through a drop-in on Debian and
+  Ubuntu, `grubby` on the RHEL family; after the reboot the running list
+  must differ by `bpf` alone, with SELinux enforcing or AppArmor on as
+  before; and how to undo it. The banner, the guides, the README, the
+  integration runbook and the `nn-admin host-check` hint point there, and
+  say never to write a fixed list. DEP-018: the banner and four guides
+  named documents the release does not ship (`docs/TAPPA7_PREREQ.md`, the
+  design notes, the audit tracker, `docs/PERFORMANCE.md`,
+  `../../CHANGELOG.md`): each now names a guide, a file at the release's
+  root, or a `https://github.com/northnarrow/northnarrow-new/blob/main/…`
+  URL; for the overlay formats the banner points to the headers of the
+  shipped lists and to the install guide's §3.6, and it says where a
+  package puts the guides. DEP-021: `docs/TAPPA7_PREREQ.md` is marked as a
+  dated historical record: SIGQUIT, "allowed" in its May table, is denied
+  like every signal outside a trusted-installer window; the comparison
+  with a competitor is gone. SUP-019: `NOTICES.md` paraphrased the ATT&CK
+  designation without its year and justified the LOLBAS exclusion by a
+  "proprietary distribution" the Apache-2.0 tree does not have. It now
+  says which files are under which terms (NorthNarrow's own code under
+  Apache-2.0; the ATT&CK and Sigma content; the vendored candle-core, MIT
+  OR Apache-2.0, modified; the crates' licences; the eBPF object's own
+  `Dual MIT/GPL` declaration), quotes the designation verbatim, and
+  records the model the release does not distribute
+  (Foundation-Sec-8B-Reasoning: its source, no pin, the Llama 3.1 Community License for the
+  Llama 3.1 part and Apache-2.0 for Cisco's changes, what an operator who
+  installs or passes it on takes on). `cargo xtask rag-kb` writes only its
+  own block of the file now, with the designation read from the pinned
+  Terms of Use. The licence field stays `Apache-2.0`, the licence of
+  `LICENSE`, with a comment that points to NOTICES. SUP-020: `SECURITY.md`
+  states a support period (a `0.0.x` tag is supported until the next tag),
+  the procedure for CRA Article 14 once it applies (24 hours, 72 hours, 14
+  days or one month, ENISA's single reporting platform, the users told
+  through an advisory), and a 90-day embargo limit; `.well-known/security.txt`
+  (RFC 9116) names GitHub Security Advisories, the only channel (no e-mail
+  address is published yet), and the policy. LAB-028, the guard: a
+  registry test fails when the V2 sweep document loses its HALT while
+  matrix.md has no data row or no run directory exists, and when a row
+  cites a run directory that is not there or has no `SHA256SUMS`; the
+  campaign itself is still to run.
+  **Regressions / changes:** step 4 of the install banner and the
+  `host-check` hint for `bpf_lsm` read differently; `cargo xtask rag-kb`
+  refuses a `NOTICES.md` without its block markers (and writes nothing);
+  `.well-known/security.txt` expires on 2027-10-01 and a repository test
+  fails from that day until it is renewed.
 - External audit, Wave 3, developer tooling hygiene (Low WDG-016
   NN-AUD-365, WDG-018 NN-AUD-367, WDG-R02 NN-AUD-368, WDG-R10 NN-AUD-376,
   WDG-R11 NN-AUD-377, WDG-R16 NN-AUD-439; lab PR 208). The developer

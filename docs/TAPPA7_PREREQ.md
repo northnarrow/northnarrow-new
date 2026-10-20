@@ -1,5 +1,28 @@
 # Tappa 7 — Prerequisiti tecnici
 
+> **Historical record (May 2026), not an operator guide.** Updated on
+> 2026-10-20 (lab PR 209, external audit DEP-013 NN-AUD-385, DEP-021
+> NN-AUD-441). This file records how Tappa 7 was prepared and first tested
+> on one development host. It is not shipped with the release, and two of
+> its statements no longer hold:
+>
+> - **The grub step.** The list written there named the modules that host
+>   ran, plus `bpf`. Do not copy a fixed list: `lsm=` replaces the kernel's
+>   built-in one, and a module it does not name (SELinux on the RHEL family,
+>   AppArmor on Debian and Ubuntu) is not started. The procedure that
+>   extends the running list, for Debian/Ubuntu (`update-grub`) and the RHEL
+>   family (`grubby`), is
+>   [`docs/operator/KERNEL_COMPATIBILITY.md`, "Enabling the `bpf` LSM"](operator/KERNEL_COMPATIBILITY.md#enabling-the-bpf-lsm-kernel-command-line).
+> - **SIGQUIT.** The 12 May test table allowed `kill -3`; the hook then
+>   denied SIGKILL and SIGTERM only. Since NN_REVIEW_2026-10-08 #5
+>   (`task-kill-signals-1`) the `task_kill` hook denies every signal to a
+>   protected pid except the existence probe (signal 0), a process
+>   signalling itself and the agent and watchdog signalling each other;
+>   since external audit EBPF-001 (lab PR 94) PID 1 too, outside a signed
+>   trusted-installer window and the very end of a shutdown. `kill -3`, like
+>   `kill -9`, gets `Operation not permitted`. How the agent is stopped
+>   today: `docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §3.7.
+
 > Stato: PREP — da consultare prima di iniziare Tappa 7
 > implementazione (BPF-LSM anti-tamper). Documento creato durante
 > sessione 12 maggio 2026 dopo verifica stato server Hetzner.
@@ -50,9 +73,11 @@ in posto. Build infrastruttura pronta.
 1. Backup GRUB config:
 sudo cp /etc/default/grub /etc/default/grub.bak
 
-2. Edit `/etc/default/grub`, modifica/aggiungi:
-GRUB_CMDLINE_LINUX="lsm=landlock,lockdown,yama,apparmor,bpf"
-   Mantenere LSM esistenti, aggiungere "bpf" alla fine.
+2. Edit `/etc/default/grub`: on that host (Ubuntu 24.04, AppArmor) the
+   list became `landlock,lockdown,yama,apparmor,bpf`, the modules it ran
+   plus `bpf`. **Historical, do not copy:** a fixed list can switch the host's
+   SELinux or AppArmor off. The current procedure:
+   `docs/operator/KERNEL_COMPATIBILITY.md`, "Enabling the `bpf` LSM".
 
 3. Update GRUB:
 sudo update-grub
@@ -161,7 +186,8 @@ Anche root non può uccidere l'agent.
 
 1. SSH al server, verifica Phase A Reasoning LoRA OK (PC fisso)
 2. Backup GRUB config: `sudo cp /etc/default/grub /etc/default/grub.bak`
-3. Edit `/etc/default/grub`: aggiungere `lsm=...,bpf`
+3. Edit `/etc/default/grub`: aggiungere `bpf` alla lista `lsm=` (historical;
+   today: `docs/operator/KERNEL_COMPATIBILITY.md`, "Enabling the `bpf` LSM")
 4. `sudo update-grub`
 5. `sudo reboot`
 6. Verifica: `cat /sys/kernel/security/lsm` contiene `bpf`
@@ -214,6 +240,11 @@ INFO anti-tamper: LSM hook attached (denies ptrace to agent) program="ptrace_acc
 
 ### Test results
 
+> Historical (12 May 2026): row 4 and the SIGQUIT workaround below
+> describe the first hook, which denied SIGKILL and SIGTERM only. Today
+> every signal to the agent is denied outside a trusted-installer window,
+> SIGQUIT included (note at the top of this file).
+
 | # | Test | Command | Expected | Actual | Verdict |
 |---|------|---------|----------|--------|---------|
 | 1 | SIGKILL | `sudo kill -9 14112` | denied | `kill: Operation not permitted`, agent Rl | PASS |
@@ -235,14 +266,11 @@ is VERIFIED FUNCTIONAL on production-grade kernel:
 
 - Root cannot kill the agent with SIGKILL or SIGTERM.
 - Root cannot attach a debugger to the agent.
-- Agent remains responsive to graceful shutdown (SIGQUIT).
+- Agent remains responsive to graceful shutdown (SIGQUIT) —
+  historical: SIGQUIT has been denied too since `task-kill-signals-1`.
 - LSM hooks correctly filter only the targeted signals
-  (no over-blocking).
-
-Differentiator vs CrowdStrike Falcon: CrowdStrike's userspace
-agent on Linux can be killed by root via standard signals.
-NorthNarrow agent on this server, with Tappa 7 hooks active,
-cannot. Verified empirically 12 May 2026 15:14 UTC.
+  (no over-blocking) — historical: the policy is deny-by-default since
+  `task-kill-signals-1`.
 
 ### Remaining Tappa 7 work
 

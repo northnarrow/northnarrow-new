@@ -5,7 +5,9 @@
 //! (owner ruling 2026-05-17 — `author` first, always present), writes
 //! deterministic canonical JSONL dumps (sorted by `id`, sorted keys,
 //! LF), per-source provenance sidecars (plan §4.2.2), the top-level
-//! `kb_index_hash` (plan §3.1.1), verbatim `LICENSES/`, and `NOTICES.md`.
+//! `kb_index_hash` (plan §3.1.1), verbatim `LICENSES/`, and the
+//! knowledge-base block of `NOTICES.md` (the rest of that file is edited by
+//! hand: external audit SUP-019).
 //! `kb_index.json` is built into the agent, which opens only the dumps it
 //! names, with the digests it records.
 //!
@@ -518,21 +520,42 @@ fn write_provenance(
     )
 }
 
-fn build_notices(authors: &BTreeSet<String>) -> String {
+/// External audit SUP-019 (lab PR 209): `NOTICES.md` covers more than the
+/// knowledge base (the vendored crate, the crates, the model, which file is
+/// under which terms), so this pipeline writes only its own block of it,
+/// between these two lines; the rest is edited by hand.
+const NOTICES_FILE: &str = "NOTICES.md";
+const NOTICES_KB_BEGIN: &str =
+    "<!-- BEGIN rag-kb: written by `cargo xtask rag-kb` (xtask/src/rag_kb.rs); edit it there -->";
+const NOTICES_KB_END: &str = "<!-- END rag-kb -->";
+
+/// The copyright designation the ATT&CK Terms of Use require in every copy:
+/// the quoted `"© …"` line of the pinned licence text, verbatim (external
+/// audit SUP-019: NOTICES paraphrased it, without the year).
+fn mitre_designation(terms_of_use: &str) -> Result<String> {
+    terms_of_use
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("\"©").and_then(|r| r.strip_suffix('"')))
+        .map(|r| format!("©{r}"))
+        .ok_or_else(|| {
+            anyhow!(
+                "{ATTACK_LICENSE_FILE}: no quoted \"© …\" copyright designation — \
+                 re-read the ATT&CK Terms of Use before writing NOTICES.md"
+            )
+        })
+}
+
+/// The knowledge-base block of `NOTICES.md`, markers included.
+fn build_notices(authors: &BTreeSet<String>, mitre_designation: &str) -> String {
     let mut s = String::new();
-    s.push_str("# NOTICES — Tappa 6.9.7 RAG knowledge base\n\n");
-    s.push_str(
-        "This product's RAG knowledge base is distilled from the pinned \
-         third-party sources below. LOLBAS is deliberately excluded \
-         (GPL-3.0 — incompatible with proprietary distribution; plan \
-         §4.2.3). Verbatim license texts are in `LICENSES/`.\n\n",
-    );
-    s.push_str("## MITRE ATT&CK® (Enterprise)\n\n");
+    s.push_str(NOTICES_KB_BEGIN);
+    s.push_str("\n\n## MITRE ATT&CK® (Enterprise)\n\n");
     s.push_str(&format!(
         "- Source: {ATTACK_REPO_URL}\n- Pin: {ATTACK_PIN} (commit {ATTACK_COMMIT})\n\
          - License: MITRE ATT&CK Terms of Use — `{ATTACK_LICENSE_FILE}`\n\
-         - Attribution: \"© The MITRE Corporation. ATT&CK® is reproduced \
-         and distributed with the permission of The MITRE Corporation.\"\n\n",
+         - Designation (verbatim, as the Terms of Use require in every copy): \
+         \"{mitre_designation}\"\n\n",
     ));
     s.push_str("## SigmaHQ detection rules (Linux subset, distilled)\n\n");
     s.push_str(&format!(
@@ -546,7 +569,32 @@ fn build_notices(authors: &BTreeSet<String>) -> String {
         s.push_str(&format!("  - {a}\n"));
     }
     s.push('\n');
+    s.push_str(NOTICES_KB_END);
+    s.push('\n');
     s
+}
+
+/// `existing` with its knowledge-base block replaced by `block`. Both
+/// markers must be there, once each, in order: the hand-written parts are
+/// never rewritten or guessed at.
+fn splice_notices(existing: &str, block: &str) -> Result<String> {
+    let begin = existing.find(NOTICES_KB_BEGIN);
+    let end = existing.find(NOTICES_KB_END);
+    match (begin, end) {
+        (Some(b), Some(e))
+            if b < e
+                && existing.matches(NOTICES_KB_BEGIN).count() == 1
+                && existing.matches(NOTICES_KB_END).count() == 1 =>
+        {
+            let mut tail = &existing[e + NOTICES_KB_END.len()..];
+            tail = tail.strip_prefix('\n').unwrap_or(tail);
+            Ok(format!("{}{block}{tail}", &existing[..b]))
+        }
+        _ => bail!(
+            "{NOTICES_FILE}: the knowledge-base block is not delimited by one \
+             `{NOTICES_KB_BEGIN}` and one `{NOTICES_KB_END}` line; nothing written"
+        ),
+    }
 }
 
 /// External audit WDG-011: the per-source `canonical_dump_sha256` of the
@@ -670,6 +718,16 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path, update_anchors: boo
         None => eprintln!("  anchors: no {KB_INDEX_FILE} yet — writing the first one"),
     }
 
+    // NOTICES.md is spliced before anything is written: a file whose block
+    // markers are missing stops the build with the tree untouched.
+    let notices_path = root.join(NOTICES_FILE);
+    let notices = std::fs::read_to_string(&notices_path)
+        .with_context(|| format!("reading {}", notices_path.display()))?;
+    let notices = splice_notices(
+        &notices,
+        &build_notices(&authors, &mitre_designation(&attack_lic_txt)?),
+    )?;
+
     write_file(&out.join(ATTACK_DUMP_FILE), &attack_dump)?;
     write_file(&out.join(SIGMA_DUMP_FILE), &sigma_dump)?;
     write_file(&root.join(ATTACK_LICENSE_FILE), &attack_license)?;
@@ -730,8 +788,8 @@ pub fn build(root: &Path, mirror: Option<&Path>, out: &Path, update_anchors: boo
         format!("{}\n", serde_json::to_string_pretty(&index_doc)?).as_bytes(),
     )?;
 
-    // ── NOTICES.md ──
-    write_file(&root.join("NOTICES.md"), build_notices(&authors).as_bytes())?;
+    // ── NOTICES.md: the knowledge-base block only (external audit SUP-019) ──
+    write_file(&notices_path, notices.as_bytes())?;
 
     eprintln!("xtask rag-kb: DONE");
     eprintln!("  attack dump sha256 = {attack_dump_sha}");
@@ -913,6 +971,71 @@ mod tests {
         assert!(committed_dump_shas(&scratch_dir("noanchors"))
             .unwrap()
             .is_none());
+    }
+
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
+
+    /// The Sigma authors the committed NOTICES.md lists in its block.
+    fn committed_authors(block: &str) -> BTreeSet<String> {
+        block
+            .lines()
+            .skip_while(|l| !l.starts_with("- Aggregate rule authors"))
+            .filter_map(|l| l.strip_prefix("  - "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// External audit SUP-019 (lab PR 209): the committed NOTICES.md block
+    /// is byte for byte what this generator writes (the designation read
+    /// from the committed Terms of Use, the authors from the block), so a
+    /// hand edit inside it, or a generator change not run, fails here; and
+    /// it carries the designation verbatim.
+    #[test]
+    fn committed_notices_block_is_what_the_generator_writes() {
+        let root = repo_root();
+        let notices = std::fs::read_to_string(root.join(NOTICES_FILE)).unwrap();
+        let tou = std::fs::read_to_string(root.join(ATTACK_LICENSE_FILE)).unwrap();
+        let designation = mitre_designation(&tou).unwrap();
+        assert!(
+            designation.starts_with("© 2025 The MITRE Corporation. This work is reproduced"),
+            "{designation}"
+        );
+        let b = notices.find(NOTICES_KB_BEGIN).expect("begin marker");
+        let e = notices.find(NOTICES_KB_END).expect("end marker") + NOTICES_KB_END.len() + 1;
+        let committed = &notices[b..e];
+        let authors = committed_authors(committed);
+        assert!(authors.len() > 50, "{} authors", authors.len());
+        assert_eq!(committed, build_notices(&authors, &designation));
+        assert!(committed.contains(&format!("\"{designation}\"")));
+        // Splicing the same block back changes nothing outside or inside it.
+        assert_eq!(
+            splice_notices(&notices, &build_notices(&authors, &designation)).unwrap(),
+            notices
+        );
+    }
+
+    #[test]
+    fn notices_splice_keeps_the_hand_written_parts_and_needs_its_markers() {
+        let block = build_notices(&BTreeSet::from(["A".to_string()]), "© X");
+        let file = format!(
+            "# NOTICES\n\nhead\n\n{NOTICES_KB_BEGIN}\nold\n{NOTICES_KB_END}\n\n## Model\n\ntail\n"
+        );
+        let out = splice_notices(&file, &block).unwrap();
+        assert!(out.starts_with("# NOTICES\n\nhead\n\n"));
+        assert!(out.ends_with("\n\n## Model\n\ntail\n"));
+        assert!(out.contains("  - A\n") && !out.contains("\nold\n"));
+        assert!(splice_notices("# NOTICES\nno markers\n", &block).is_err());
+        let twice = format!("{file}{NOTICES_KB_BEGIN}\n");
+        assert!(splice_notices(&twice, &block).is_err());
+        let reversed = format!("{NOTICES_KB_END}\n{NOTICES_KB_BEGIN}\n");
+        assert!(splice_notices(&reversed, &block).is_err());
+        assert!(mitre_designation("License\nno designation here\n").is_err());
+        assert_eq!(
+            mitre_designation("x\n\"© 2025 The MITRE Corporation. Y.\"\n").unwrap(),
+            "© 2025 The MITRE Corporation. Y."
+        );
     }
 
     #[test]

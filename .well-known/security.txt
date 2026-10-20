@@ -1,0 +1,9 @@
+# NorthNarrow security contact (RFC 9116). The policy, the support period,
+# the regulatory reporting procedure and the embargo are in SECURITY.md.
+# This file sits in the source repository; it names no Canonical URI
+# because no web server publishes it. Renew Expires (less than a year
+# ahead) before it passes: xtask/tests/compliance_docs.rs fails once it has.
+Contact: https://github.com/northnarrow/northnarrow-new/security/advisories/new
+Expires: 2027-10-01T00:00:00Z
+Policy: https://github.com/northnarrow/northnarrow-new/blob/main/SECURITY.md
+Preferred-Languages: en

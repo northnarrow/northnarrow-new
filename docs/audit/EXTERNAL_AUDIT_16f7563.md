@@ -596,12 +596,12 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-382 | DEP-010 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-383 | DEP-011 | Low | Deploy | — | declined (prerm already requires the signed trusted-installer window; the proposed default archive would leave `agent.sig.key` on disk after a purge) |
 | NN-AUD-384 | DEP-012 | Low | Deploy | S | fixed (lab PR 194) |
-| NN-AUD-385 | DEP-013 | Low | Deploy | S (docs) | open |
+| NN-AUD-385 | DEP-013 | Low | Deploy | S (docs) | fixed (lab PR 209) |
 | NN-AUD-386 | DEP-014 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-387 | DEP-015 | Low | Deploy | — | already fixed (lab PR 93) |
 | NN-AUD-388 | DEP-016 | Low | Deploy | S | fixed (lab PR 194) |
 | NN-AUD-389 | DEP-017 | Low | Deploy | S | fixed (lab PR 184) |
-| NN-AUD-390 | DEP-018 | Low | Deploy | S | open |
+| NN-AUD-390 | DEP-018 | Low | Deploy | S | fixed (lab PR 209) |
 | NN-AUD-391 | DEP-019 | Low | Deploy | — | already fixed (lab PR 152) |
 | NN-AUD-392 | SUP-004 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-393 | SUP-007 | Low | Supply chain | S | fixed (lab PR 183) |
@@ -614,8 +614,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-400 | SUP-015 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-401 | SUP-016 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-402 | SUP-018 | Low | Supply chain | M | fixed (lab PR 200) |
-| NN-AUD-403 | SUP-019 | Low | Supply chain | S (docs) | open (narrowed: the model is not redistributed) |
-| NN-AUD-404 | SUP-020 | Low | Supply chain | S-M (docs) | open |
+| NN-AUD-403 | SUP-019 | Low | Supply chain | S (docs) | fixed (lab PR 209) |
+| NN-AUD-404 | SUP-020 | Low | Supply chain | S-M (docs) | partly fixed (lab PR 209; the second encrypted channel and the 24-hour drill are the maintainer's); open |
 | NN-AUD-405 | SUP-021 | Low | Supply chain | S | open |
 | NN-AUD-406 | SUP-022 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-407 | SUP-023 | Low | Supply chain | S | fixed (lab PR 200) |
@@ -652,7 +652,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | fixed (lab PR 208) |
 | NN-AUD-440 | DEP-020 | Info | Deploy | S | fixed (lab PR 194) |
-| NN-AUD-441 | DEP-021 | Info | Deploy | S (docs) | open |
+| NN-AUD-441 | DEP-021 | Info | Deploy | S (docs) | fixed (lab PR 209) |
 | NN-AUD-442 | DEP-022 | Info | Deploy | — | already fixed (lab PR 150) |
 | NN-AUD-443 | SUP-011 | Info | Supply chain | S | fixed (lab PR 183) |
 | NN-AUD-444 | LAB-028 | Info | Lab scripts | S gate / L campaign | open (methodology frozen in lab PR 159; no run yet) |
@@ -9739,3 +9739,157 @@ group, the ones an unprivileged user or a local attacker could use first.
     same number before and after (no new one; none names
     `admin_release_combat`).
   - Lab: No dedicated lab probe (developer tooling): the CLI stubs' exit status, `cargo xtask run`'s environment and the repository-hygiene lints run in `cargo test --workspace`; the posture demo builds under `--features posture-demo`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.
+- **Wave 3 — operator documentation and compliance, lab PR 209.**
+  NN-AUD-385 (DEP-013, Low), NN-AUD-390 (DEP-018, Low), NN-AUD-441
+  (DEP-021, Info), NN-AUD-403 (SUP-019, Low), NN-AUD-404 (SUP-020, Low) and
+  the guard of NN-AUD-444 (LAB-028, Info): batch 5 of the Wave 3 triage of
+  group G1 and batch 9 of group G2, on the integration tree (`main` with
+  lots up to 199, and lots 200–207). Documentation, two xtask test files,
+  the registry's campaign guard; in the agent only the `host-check` hint for `bpf_lsm`
+  and two comments. Nothing under `agent-ebpf/` changed (its `Cargo.toml`
+  is in the eBPF source closure).
+  - DEP-013 (385, fixed in the documents; the lab check is pending).
+    Re-checked: `docs/TAPPA7_PREREQ.md:53-55` still wrote
+    `GRUB_CMDLINE_LINUX="lsm=landlock,lockdown,yama,apparmor,bpf"`, and the
+    banner, `INSTALL_UPGRADE_UNINSTALL.md` §4, `KERNEL_COMPATIBILITY.md`, the
+    README and the integration runbook sent readers there or repeated it.
+    Now `docs/operator/KERNEL_COMPATIBILITY.md` "Enabling the `bpf` LSM
+    (kernel command line)": check `CONFIG_BPF_LSM` and keep the running
+    list; the new list is the `lsm=` of `/proc/cmdline`, or else
+    `CONFIG_LSM` of `/boot/config-$(uname -r)` (the list `lsm=` replaces;
+    `/sys/kernel/security/lsm` only as a fallback, since it omits a module
+    without hooks, `integrity` on Ubuntu), plus `bpf`; a running module the
+    list leaves out prints MISSING and stops it; Debian/Ubuntu: an `lsm=`
+    found in `/etc/default/grub{,.d/}` is edited, otherwise a drop-in
+    `99-northnarrow-bpf-lsm.cfg` and `update-grub`, then one `lsm=` value
+    on every `grub.cfg` entry; RHEL family: `grubby --update-kernel=ALL
+    --args`, one value per entry, `/etc/default/grub` aligned, checked
+    again after a kernel update; after the reboot `diff` of the lists shows
+    `> bpf` only, `getenforce` and AppArmor's `enabled` as before,
+    `host-check` OK; how to undo it. Every reference points there, and
+    `TAPPA7_PREREQ.md` keeps the May step as history, marked "do not copy".
+  - DEP-018 (390, fixed). Re-checked: the banner named
+    `docs/TAPPA7_PREREQ.md` and two design notes; `CONTAINER_HOST_DEPLOY.md`,
+    `EVIDENCE_CHAINS.md`, `TAPPA9_FIM_TRUST_MODEL.md` (twice) named design
+    notes; `UPGRADE_NOTES_AUDIT_16f7563.md` linked `../audit/…`,
+    `../../CHANGELOG.md` (wrong in the package layout) and
+    `../PERFORMANCE.md`. Each now names a guide, a file at the release's
+    root, or a `https://github.com/northnarrow/northnarrow-new/blob/main/…`
+    URL of a file that exists. The banner gives the overlay formats from
+    the headers of the installed `.v1` lists, the kinds and signing from the
+    install guide's §3.6, and says that a package puts the guides in
+    `/usr/share/doc/northnarrow/operator/`. No internal document is added to
+    the release.
+  - DEP-021 (441, fixed). `docs/TAPPA7_PREREQ.md` opens with a dated note
+    (historical record, not shipped, not an operator guide), the 12 May test
+    table and its SIGQUIT workaround are marked superseded with today's
+    policy (every signal to a protected pid denied but signal 0, a self
+    signal and the agent–watchdog pair; PID 1 only inside a signed window
+    or as `systemd-shutdown`, `task_kill.rs`), and the comparison with a
+    competitor is removed.
+  - SUP-019 (403, fixed: the four points of the finding). `NOTICES.md`:
+    which files are under which terms (a table); the ATT&CK designation
+    verbatim (`"© 2025 The MITRE Corporation. This work is reproduced and
+    distributed with the permission of The MITRE Corporation."`); the
+    LOLBAS line reworded around GPL-3.0 against the Apache-2.0 the tree is
+    under, with the five `lolbas_*` seed notes of `kb_seed.rs` described;
+    candle-core 0.10.2 (`vendor/candle-core/`, MIT OR Apache-2.0, used under
+    Apache-2.0, the `NorthNarrow` lines as its modifications); the crates.io
+    crates (per-crate licences in the SBOMs; on 2026-10-20 only MIT,
+    Apache-2.0, BSD-2/3-Clause, Zlib, Unicode-3.0, Unlicense, BSL-1.0 in the
+    agent's and the watchdog's normal graph, from `cargo tree --format
+    "{p} {l}"`); "Licence declarations"; "Model (not distributed)":
+    Foundation-Sec-8B-Reasoning Q4_K_M GGUF and its tokenizer, the
+    Hugging Face revisions read on 2026-10-20 (`4a04f7b1…`, `63c930c8…`), no
+    pin, both repositories `license: other`, the model's `NOTICE.md` quoted
+    (Llama 3.1 Community License for Llama 3.1, Apache-2.0 for Cisco's
+    changes), the operator's obligations (AUP; on redistribution a copy of
+    the agreement, the notice line, "Built with Llama"), linked from
+    `ADE_BACKEND_NOTES.md`. `cargo xtask rag-kb` now splices only its block
+    (between two marker lines, checked before anything is written) and
+    reads the designation from the pinned Terms of Use.
+  - SUP-020 (404, partial). `SECURITY.md`: the support period (a `0.0.x`
+    tag until the next tag; 1.0's stated before it ships, at least five
+    years where the CRA applies, Art. 13(8)); GitHub Security Advisories as
+    the channel (`…/security/advisories/new`); "Regulatory reporting (EU
+    Cyber Resilience Act)": Art. 14 from 11 September 2026, conditional on
+    the product being made available on the EU market, early warning 24 h,
+    notification 72 h, final report 14 days after a measure (vulnerability)
+    or one month after the notification (severe incident), the coordinator
+    CSIRT and ENISA through the single reporting platform, the reporter
+    told, the users informed (Art. 14(8)); a 90-day embargo limit,
+    extendable once by agreement. `.well-known/security.txt` (RFC 9116):
+    Contact (the advisories URL), Expires 2027-10-01T00:00:00Z, Policy,
+    Preferred-Languages; no Canonical (no web server publishes it). Open:
+    a second, encrypted channel (no e-mail address invented: the
+    maintainer publishes one, with its key fingerprint, in both files), and
+    the 24-hour path exercised once on paper and recorded under
+    `docs/audit/`.
+  - LAB-028 (444, the guard; **stays open** for the campaign).
+    `validation_registry.rs`: `the_campaign_state_is_consistent_until_the_sweep_runs`
+    fails when `V2_ATOMIC_RED_TEAM_SWEEP.md` no longer has its `**HALT.**`
+    line while matrix.md's `## Matrix` has no data row (the template row
+    does not count) or no run directory exists under `docs/validation/evidence/`
+    or `docs/adversarial/evidence/` (the sweep's open item 3), and when a
+    row cites a run directory that is not there or has no `SHA256SUMS`.
+    The V2 campaign and the V5 baseline script stay with NN-AUD-444, after
+    the NN-L-NET-003 and NN-L-CANARY-003 follow-ups.
+  - Choices. The licence: `LICENSE` is the Apache-2.0 text, so the
+    workspace `license`, `agent-ebpf/Cargo.toml` and the `.rpm` stay
+    `Apache-2.0`; NOTICES carries the mixed terms instead of an SPDX
+    expression or `license-file`, and a test keeps the four in agreement.
+    Incoherence found and recorded, not resolved: the eBPF object declares
+    `Dual MIT/GPL` (`agent-ebpf/src/main.rs`; the kernel admits LSM
+    programs only with a GPL-compatible declaration) against the crate's
+    `Apache-2.0`; whether the eBPF programs are also offered under MIT or
+    GPL-2.0 is the maintainer's decision. The contact is GitHub Security
+    Advisories only, as decided. NOTICES lists only what the tree holds:
+    `LICENSES/` (two files), `vendor/` (one crate), the eBPF declaration;
+    the model is recorded as not distributed. The grub procedure derives
+    the list from `CONFIG_LSM` rather than from `/sys/kernel/security/lsm`
+    as the audit's snippet did: the running list can omit `integrity`.
+    `security.txt` fails its test once expired (a renewal reminder).
+  - Follow-ups (not in this lot): the crates' own copyright notices are not
+    bundled with the binaries (MIT and BSD ask for them in a binary
+    distribution; a generated third-party licence file, e.g. cargo-about,
+    and a licence gate in CI, with NN-AUD-393); the `.deb` has no
+    `/usr/share/doc/northnarrow/copyright` (Debian Policy §12.5, the
+    audit's verification note); `configs/*.v1` headers and two unit
+    comments still cite design notes (developer comments in shipped
+    files, not touched: the `.v1` files are byte-compared by the agent);
+    the five `sigma_*` seed notes of `kb_seed.rs` record no source rule,
+    so their DRL attribution is not established.
+  - Tests: `xtask/tests/operator_docs.rs` (7):
+    `the_release_ships_the_operator_guides_and_no_other_document`,
+    `shipped_texts_name_only_shipped_documents_or_repository_urls`,
+    `links_into_the_guides_resolve_with_their_anchors` (GitHub anchors),
+    `section_references_after_a_guide_name_exist` (`§n`, `section n`, a
+    quoted title), `no_operator_facing_text_hands_out_a_fixed_lsm_list`,
+    `the_bpf_lsm_procedure_extends_the_running_list_on_both_families`,
+    `the_checker_refuses_unshipped_documents_and_dead_links`;
+    `xtask/tests/compliance_docs.rs` (5):
+    `licence_declarations_agree_with_the_license_file`,
+    `notices_name_the_third_party_material_the_tree_holds`,
+    `security_policy_has_what_a_reporter_and_a_regulator_need`,
+    `security_txt_follows_rfc_9116_and_names_the_policy_channel`,
+    `the_security_txt_check_refuses_an_expired_or_foreign_file`; `rag_kb`
+    `committed_notices_block_is_what_the_generator_writes`,
+    `notices_splice_keeps_the_hand_written_parts_and_needs_its_markers`;
+    `validation_registry` `the_campaign_state_is_consistent_until_the_sweep_runs`,
+    `removing_the_halt_alone_fails_the_campaign_guard`. On the starting
+    documents (this lot's code and tests kept, the documents and scripts of the starting tree put back): 6 of
+    the 7 `operator_docs` tests fail (`the_release_ships_…` holds on both:
+    it pins the packaging premise), the 5 `compliance_docs` tests fail, and
+    `committed_notices_block_is_what_the_generator_writes` fails (no block
+    markers). The registry guard holds on the starting tree, by design; with
+    only the HALT line of the sweep document replaced it fails with two
+    messages (no data row, no run directory).
+  - Host: `cargo fmt --all`; both CI clippy invocations (`--workspace
+    --exclude northnarrow-agent-ebpf --all-targets --locked`, and the agent
+    with `test-privileged,debug-trigger`) clean; `cargo test -q --workspace`
+    2,723 passed, 0 failed, 21 ignored (2,707 on the starting tree, 16
+    new). `bash -n deploy/install.sh`. The grub procedure was not run, only
+    documented; its list derivation was traced in a shell with sample
+    `/proc/cmdline`, `CONFIG_LSM` and running lists (Ubuntu 24.04, an el9
+    `lsm=`, a list without `selinux`, which prints MISSING).
+  - Lab: The "Enabling the `bpf` LSM" procedure run as written on Ubuntu 22.04 (5.15) booted without an `lsm=`: the new list came from `CONFIG_LSM` plus `bpf` (`landlock,lockdown,yama,integrity,apparmor,bpf`, no MISSING), the drop-in path was taken, `update-grub` wrote that one value on all three entries; after the reboot `bpf` was active, the diff of the lists was `> bpf` only, AppArmor stayed enabled (37 profiles) and `nn-admin host-check` said OK; the lab's own drop-in was then put back. Not run on an AlmaLinux 9 guest. The document tests run in `cargo test --workspace`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.

@@ -37,7 +37,8 @@ Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
 `/sys/kernel/btf/vmlinux` file), `bpf` in `/sys/kernel/security/lsm`,
 bpffs mounted at `/sys/fs/bpf` (the unit checks it with
 `/usr/bin/mountpoint`, util-linux), `iptables-restore` (nft backend is
-fine), x86_64. See `docs/TAPPA7_PREREQ.md` for the grub step.
+fine), x86_64. Ubuntu needs `bpf` added to the kernel command line; see
+[Enabling the `bpf` LSM](#enabling-the-bpf-lsm-kernel-command-line) below.
 
 `nft` (the nftables CLI) is needed too, for the per-process egress block:
 the `BlockOutbound` response and the COMBAT soft egress block of
@@ -61,6 +62,105 @@ Verified on Debian 13 (6.12) on 2026-10-16: the setattr deny and the FIM
 observer act there (`main` let chmod, chown and touch of a protected file
 through). See "Kernels from 6.9:
 `inode_setattr`" below.
+
+## Enabling the `bpf` LSM (kernel command line)
+
+The anti-tamper hooks are BPF LSM programs: `bpf` must be in
+`/sys/kernel/security/lsm`. Debian 12 and AlmaLinux 9 have it in their
+default list (matrix above); Ubuntu 22.04 and 24.04 do not, nor does a host
+whose command line already sets an `lsm=` without it.
+
+**Add `bpf` to the list the kernel runs; never write a fixed list.** `lsm=`
+replaces the kernel's built-in list (`CONFIG_LSM`) as a whole: a module it
+does not name is not started (`capability` always is). A list copied from another host can therefore
+switch SELinux (RHEL family) or AppArmor (Debian, Ubuntu) off at the next
+boot. Two `lsm=` on one command line are no better: edit the one that is
+there. Keep a console (serial console, IPMI, the cloud provider's) for the
+reboot.
+
+1. Check, and keep the current list for step 5:
+
+   ```sh
+   cat /sys/kernel/security/lsm                      # bpf listed: nothing to do
+   grep CONFIG_BPF_LSM= "/boot/config-$(uname -r)"   # must be =y: no command line adds a module the kernel lacks
+   cat /sys/kernel/security/lsm > ~/lsm.before
+   ```
+
+2. Build the new list from the one `lsm=` replaces: the `lsm=` the kernel
+   was booted with, if there is one, otherwise `CONFIG_LSM`.
+   `/sys/kernel/security/lsm` is the fallback only: it lists the modules
+   that registered hooks and can miss one the kernel starts without any
+   (`integrity` on Ubuntu, for example).
+
+   ```sh
+   cur=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^lsm=//p' | tail -n 1)
+   [ -n "$cur" ] || cur=$(sed -n 's/^CONFIG_LSM="\(.*\)"$/\1/p' "/boot/config-$(uname -r)")
+   [ -n "$cur" ] || cur=$(cat /sys/kernel/security/lsm)
+   new="$cur,bpf"
+   echo "$new"
+   # every module running now must still be in it (capability always runs)
+   for m in $(tr ',' ' ' <~/lsm.before); do
+       case ",$new," in *",$m,"*) ;; *) [ "$m" = capability ] || echo "MISSING $m: stop here" ;; esac
+   done
+   ```
+
+   For example, Ubuntu 24.04 (`CONFIG_LSM="landlock,lockdown,yama,integrity,apparmor"`)
+   gives `landlock,lockdown,yama,integrity,apparmor,bpf`.
+
+3. Debian and Ubuntu (`update-grub`):
+
+   ```sh
+   sudo cp /etc/default/grub /etc/default/grub.bak
+   grep -rn 'lsm=' /etc/default/grub /etc/default/grub.d/ 2>/dev/null
+   ```
+
+   If that finds a line, change the value of its `lsm=` to `$new` in that
+   file, and add nothing. If it finds none, add a drop-in:
+
+   ```sh
+   sudo mkdir -p /etc/default/grub.d
+   printf 'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX lsm=%s"\n' "$new" \
+       | sudo tee /etc/default/grub.d/99-northnarrow-bpf-lsm.cfg
+   sudo update-grub
+   grep -o 'lsm=[^ ]*' /boot/grub/grub.cfg | sort | uniq -c    # one value, $new, on every entry
+   ```
+
+4. RHEL family (AlmaLinux, Rocky, RHEL 9: `grubby`; there is no
+   `update-grub`):
+
+   ```sh
+   sudo grubby --info=ALL | grep -E '^(kernel|args)='
+   sudo grubby --update-kernel=ALL --args="lsm=$new"
+   sudo grubby --info=ALL | grep -o 'lsm=[^ "]*' | sort | uniq -c   # one value, $new, once per entry
+   grep -n 'lsm=' /etc/default/grub
+   ```
+
+   If `/etc/default/grub` names an `lsm=`, give it the same value: a later
+   `grub2-mkconfig` would bring the old list back. After a kernel update,
+   run the `grubby --info=ALL` check again.
+
+5. Reboot, then check that `bpf` was added and nothing was lost:
+
+   ```sh
+   cat /sys/kernel/security/lsm                     # ends with bpf
+   diff <(tr ',' '\n' <~/lsm.before | sort) <(tr ',' '\n' </sys/kernel/security/lsm | sort)   # only "> bpf"
+   getenforce                                       # SELinux hosts: Enforcing, as before
+   cat /sys/module/apparmor/parameters/enabled      # AppArmor hosts: Y, as before
+   sudo nn-admin host-check                         # bpf_lsm: OK
+   ```
+
+To undo it: on Debian and Ubuntu, remove the drop-in (or put
+`/etc/default/grub.bak` back if you edited a line), `update-grub`, reboot;
+on the RHEL family, `grubby --update-kernel=ALL --remove-args="lsm=$new"`
+when there was no `lsm=` before, `--args="lsm=<previous list>"` otherwise.
+
+Status: written in lab PR 209 (external audit DEP-013), not yet run as
+written on a lab guest. The lab templates set the same kind of list
+(`deploy/lab/user-data*.tmpl`: a grub drop-in on Ubuntu and Debian,
+`grubby` on AlmaLinux 9, SELinux enforcing). The check to run: the Ubuntu
+24.04 and 22.04 guests, and an AlmaLinux 9 guest given an `lsm=` without
+`bpf`; after the reboot the list keeps `apparmor` or `selinux` and adds
+`bpf`, and `getenforce` still says Enforcing.
 
 ## Computed matrix (`northnarrow-agent --btf-check <btf>`)
 

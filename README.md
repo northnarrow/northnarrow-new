@@ -179,8 +179,9 @@ after the audit's prompt and context changes (no lab guest has the model). They 
 ## Quickstart
 
 Requirements: Linux x86_64, a kernel with BTF (`/sys/kernel/btf/vmlinux`) and the `bpf`
-LSM enabled (`lsm=…,bpf` on the kernel command line — see
-[`docs/TAPPA7_PREREQ.md`](docs/TAPPA7_PREREQ.md)), bpffs at `/sys/fs/bpf`, systemd.
+LSM enabled (`bpf` added to the kernel's `lsm=` list, never a fixed list — see
+[Enabling the `bpf` LSM](docs/operator/KERNEL_COMPATIBILITY.md#enabling-the-bpf-lsm-kernel-command-line)),
+bpffs at `/sys/fs/bpf`, systemd.
 
 ```sh
 # 1. Download the release tarball + checksums from the Releases page, then verify

@@ -580,7 +580,8 @@ for.
   hooks (it uses the debug posture override), so this isn't a
   blocker. If you want to verify LSM behaviour separately, check
   `cat /sys/kernel/security/lsm` for `bpf` in the comma-separated
-  list; if missing, set `lsm=bpf,...` in the kernel command line
+  list; if missing, add `bpf` to the list the kernel runs
+  (`docs/operator/KERNEL_COMPATIBILITY.md`, "Enabling the `bpf` LSM")
   and reboot.
 
 ## Manual smoke sequence (human verification on Hetzner)
@@ -695,9 +696,9 @@ journalctl --namespace=northnarrow -u northnarrow-agent.service -u northnarrow-w
 2. **bpffs mounted** — `mount | grep ' /sys/fs/bpf'`. If absent:
    `mount -t bpf bpf /sys/fs/bpf`.
 3. **`bpf` LSM in kernel chain** — `cat /sys/kernel/security/lsm`
-   must include `bpf`. If absent: edit `/etc/default/grub`,
-   add `lsm=...,bpf` to `GRUB_CMDLINE_LINUX`, `update-grub`,
-   `reboot`. See `docs/TAPPA7_PREREQ.md`.
+   must include `bpf`. If absent: add `bpf` to the list the kernel
+   runs (never a fixed list) as `docs/operator/KERNEL_COMPATIBILITY.md`,
+   "Enabling the `bpf` LSM", describes, and reboot.
 
 ### Manual integration tests on the unit pair
 

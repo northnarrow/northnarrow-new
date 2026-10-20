@@ -574,8 +574,10 @@ pins it recreates by its predecessor's hooks.
 
 ## 4. What still needs a reboot
 
-- Enabling the `bpf` LSM (`lsm=…,bpf` on the kernel command line) the
-  first time — see `docs/TAPPA7_PREREQ.md`.
+- Enabling the `bpf` LSM (`bpf` added to the kernel's `lsm=` list) the
+  first time — see
+  [`KERNEL_COMPATIBILITY.md`](KERNEL_COMPATIBILITY.md#enabling-the-bpf-lsm-kernel-command-line):
+  the list is extended, never replaced by a fixed one.
 - A kernel upgrade: the agent revalidates BTF offsets at boot and refuses
   to start on a mismatch rather than run with wrong offsets; the
   supported-kernel matrix is the next item on the reliability list. From
