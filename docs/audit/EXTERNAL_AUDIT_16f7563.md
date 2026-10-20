@@ -557,8 +557,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-343 | XAI-003 | Low | XAI and RAG | S (one line) | obsolete (the on-disk index is gone, lab PR 145) |
 | NN-AUD-344 | XAI-006 | Low | XAI and RAG | S | open (dormant: XAI not wired) |
 | NN-AUD-345 | XAI-007 | Low | XAI and RAG | S (guard) | declined as filed (argv/parent_comm are not in the prompt); guard test |
-| NN-AUD-346 | XAI-008 | Low | XAI and RAG | S–M | open (dormant: RAG off) |
-| NN-AUD-347 | XAI-012 | Low | XAI and RAG | S | open (dormant) |
+| NN-AUD-346 | XAI-008 | Low | XAI and RAG | S–M | fixed (lab PR 199) |
+| NN-AUD-347 | XAI-012 | Low | XAI and RAG | S | fixed (lab PR 199) |
 | NN-AUD-348 | XAI-014 | Low | XAI and RAG | S | partly fixed (confidence domain fixed, lab PR 132; encoding left); open |
 | NN-AUD-349 | XAI-015 | Low | XAI and RAG | — | obsolete (on-disk `build_index` removed, lab PR 145) |
 | NN-AUD-350 | XAI-016 | Low | XAI and RAG | S | open (dormant) |
@@ -646,7 +646,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | open (Info; narrowed to the test: argv is 512 B at the kernel) |
 | NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | fixed (lab PR 191) |
 | NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
-| NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | open (Info) |
+| NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | fixed (lab PR 199) |
 | NN-AUD-436 | SNS-015 | Info | Sensors | S | fixed (lab PR 196) |
 | NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | open |
@@ -8569,3 +8569,75 @@ group, the ones an unprivileged user or a local attacker could use first.
     `filename_truncated` (fields added by the `WIP nn-wt-kernfid` commit,
     not touched here).
   - Lab: Unit tests (the triage's call): the mass-write carve-out loader and `config overlay set|sign` share one parser that refuses `/`, top-level directories, a whole user tree and the scratch roots, line-named; escalation-allow refuses `/0` and a wildcard wider than /16 (/32 for IPv6); a carve-out reached through a symlink is refused (`a_carveout_never_follows_a_symlink`). Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.
+- **Wave 3 — RAG retrieval, lab PR 199.** NN-AUD-346 (XAI-008),
+  NN-AUD-347 (XAI-012), NN-AUD-435 (XAI-019), all Low, and the one line
+  of NN-AUD-343 (XAI-003, OBSOLETE since lab PR 145): batch G of the Wave
+  3 triage of the LLM, XAI and deception group, on the integration tree
+  (`main` with lots up to 191, and lots 192–195). Dormant: RAG runs only
+  with `NN_ADE_RAG_ENABLED`, off by default. The four points and Wave 2's
+  batch D (lab PR 145) are now blocking items of the §13 default-flip
+  checklist: an addendum below the owner's eight points in
+  `docs/TAPPA6_9_7_RAG_KB_PLAN.md`, which are left intact. No probe:
+  nothing on a default host runs this code; the gate is the golden suite
+  and the bench on `target/kb`.
+  - XAI-008 (346, fixed, with a deviation). Re-checked: `retrieve_bm25`
+    divided by the top score, then applied `min_similarity`, so the top
+    hit was 1.0 and never dropped; `min_similarity <= 0.0` meant 0.15, so
+    the golden suite measured with 0.15. Now the top hit must carry
+    `required_terms(n) = ceil(n / COVERAGE_ONE_IN)` of the query's `n`
+    distinct terms (`matched_terms`: title, author, then content, through
+    the index's analyser, stopping once enough are found), else the
+    result is empty (a DEBUG line). Deviation: the triage's one in three
+    gave 27/30, emptying "xmrig miner pool stratum", every hit of which
+    ("Linux Crypto Mining Pool Connections" first, then the xmrig seed
+    note) shares one of its four terms; one in four keeps 28/30. Where the
+    bench and tests mean "no floor" they pass `f32::MIN_POSITIVE` (golden,
+    end-to-end format, `open_index_retrieves_via_bm25_with_normalised_similarity`,
+    `retrieve_top_k_is_respected`, `planted_index_dir_ignored`); the
+    `RagQuery` API is unchanged and its doc says so. Measured residual: on
+    30 production-shaped queries (`build_rag_query` forms) the floor
+    empties none and the results are the same as before; the unrelated
+    titles left come from the query's fixed words, which count as matches
+    ("process a1b2c3 from /dev/shm/a1b2c3" retrieves "Process
+    Doppelgänging"). Changing them changes the trained retrieval signal:
+    recorded in the §13 addendum, for the Phase B + C training.
+  - XAI-012 (347, fixed). Re-checked: three `TermQuery` per analysed term
+    with no limit, and the "~120 chars" of the `build_rag_query` doc
+    enforced nowhere. Now `query_terms`: deduplicated in first-seen order,
+    then cut at `MAX_QUERY_TERMS = 32` (at most 96 clauses); the text is
+    not truncated; the doc says what bounds the query (sanitizer, wire
+    sizes, the cap). Two golden queries with a repeated word reorder below
+    their wanted id, which stays first.
+  - XAI-019 (435, fixed). `SecTokenStream::advance` stops at `len + 1`;
+    `token()` / `token_mut()` clamp the index, an empty `Token` for an
+    empty text. The tokens tantivy indexes are unchanged.
+  - XAI-003 (343, OBSOLETE; the hygiene line). The field lookup of
+    `bm25_query` (now `bm25_query_terms`) uses `?` instead of `unwrap()`;
+    `retrieve` turns the error into an empty result.
+  - Tests: `weak_match_returns_nothing`, `strong_match_still_returns_top_hit`
+    (the one-in-four boundary, two of eight, a repeated word counted
+    once), `query_terms_are_deduplicated_then_capped` (5,000 words → 32
+    terms, ≤ 96 clauses), `long_query_still_retrieves`,
+    `matched_terms_counts_distinct_terms_over_the_three_fields`,
+    `token_stream_is_safe_past_the_end`,
+    `foreign_schema_is_an_error_not_a_panic`. On the starting tree they do
+    not compile (new items); with each fix inverted the matching test
+    fails: coverage off → `weak_match_returns_nothing`; no dedup and no
+    cap → `query_terms_are_deduplicated_then_capped`; the audit's
+    truncate-then-`dedup` → that one and `long_query_still_retrieves`; the
+    old token stream and the `unwrap()` → their tests panic.
+  - Golden and bench (`cargo test -p northnarrow-agent --release --lib
+    rag::bench -- --ignored`, `target/kb`, 970 documents, three runs
+    each): golden 28/30 before and after, the same two failures
+    ("powershell credential dump lsass", "scripting interpreter
+    powershell abuse", no `sigma:` hit); at the production defaults (top
+    3, floor 0.15) 27/30 before and after. Retrieve over 6,000 calls: p50
+    95–99 → 102–106 µs, p95 120–130 → 127–131 µs; cold open 31–32 →
+    30–34 ms (budgets 50 ms and 5 s).
+  - Host: `cargo fmt`, clippy `--workspace --all-targets` and the agent
+    with `test-privileged,debug-trigger` clean; 2,543 passed, 0 failed.
+    The CI's `posture_demo` clippy fails on the starting tree as on this
+    one (`agent/examples/posture_demo.rs:121` lacks `argv_truncated` and
+    `filename_truncated`, added to `Event::ProcessSpawn` by lot
+    `nn-wt-kernfid`): not this batch, to fix with that lot.
+  - Lab: No lab or model run: the real-corpus golden suite 28/30 before and after (the triage's 1-in-3 coverage threshold gave 27/30; 1 in 4 kept 28/30, the same two misses as before), the latency bench p50 95–99 → 102–106 µs (budget 50 ms), the ids returned for 60 queries unchanged but for two repeated-word queries reordered below their expected first hit. Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.

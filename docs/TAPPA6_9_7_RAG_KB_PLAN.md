@@ -1080,6 +1080,41 @@ similar). The flip cannot be merged unless every point passes.
 
 <<<END VERBATIM>>>
 
+> **Addendum — external audit 16f7563, blocking items of the flip
+> (lab PR 199, 2026-10-20).** The owner's eight points above are
+> unchanged. The audit work done while RAG is off, and so not yet
+> exercised by any host, is added to the points the flip commit cites:
+>
+> - **Wave 2, batch D (lab PR 145; NN-AUD-175, -179, -176, -180, -183).**
+>   The agent opens only the dumps `docs/kb-sources/kb_index.json` pins
+>   (built into the binary), rebuilds the index in memory at every start,
+>   and binds the corpus fingerprint into `environment_hash`; a missing,
+>   altered or unlisted dump leaves RAG off with a WARN and a signed
+>   `subsystem_degraded`. Cite: `tampered_dump_refused`,
+>   `unlisted_jsonl_refused`, `planted_index_dir_ignored`, and the
+>   staging boot of point 5 showing "RAG enabled" on the pinned corpus.
+> - **Wave 3, batch G (lab PR 199; NN-AUD-346, -347, -435, -343).** The
+>   BM25 top hit must carry at least one in four of the query's distinct
+>   terms, else no RAG block (the relative `min_similarity` floor never
+>   drops the top hit); a query is at most 32 distinct terms (96
+>   clauses); the token stream and the field lookup cannot panic. Cite:
+>   `weak_match_returns_nothing`, `strong_match_still_returns_top_hit`,
+>   `query_terms_are_deduplicated_then_capped`,
+>   `token_stream_is_safe_past_the_end`, and, for points 3 and 4,
+>   `golden_suite_real_corpus` (at least 28/30, the rate before the
+>   coverage floor) and `latency_bench_real_corpus` on the flip's
+>   `target/kb`.
+> - **Still open, for point 2.** Measured at lab PR 199 on 30
+>   production-shaped queries (`build_rag_query` forms): the coverage
+>   floor empties none, and their results are the same as before it.
+>   The unrelated titles that remain come from the query's fixed words
+>   ("process … from", "file open", "exec check"), which count as matched
+>   terms: "process a1b2c3 from /dev/shm/a1b2c3" retrieves "Process
+>   Doppelgänging". Dropping or down-weighting those words changes the
+>   retrieval signal the model is trained on, so it is decided with the
+>   Phase B + C training, before the flip, and the flip commit records the
+>   choice.
+
 ---
 
 *Plan of record (**P1.5 — FROZEN; P1 complete**). All owner verbatim

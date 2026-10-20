@@ -102,21 +102,44 @@ fn split_tokens(text: &str) -> Vec<Token> {
 #[derive(Clone, Default)]
 pub struct SecurityTokenizer;
 
+/// External audit XAI-019: `cursor` stops at `tokens.len() + 1` and
+/// [`TokenStream::token`] clamps its index, so a caller that reads past
+/// the end, or before the first `advance`, gets the last token (or an
+/// empty one for an empty text) instead of a panic, which in the agent
+/// is an abort. tantivy only reads after an `advance` that returned
+/// `true`, so the tokens it indexes are unchanged.
 pub struct SecTokenStream {
     tokens: Vec<Token>,
     cursor: usize,
+    /// Returned when `tokens` is empty.
+    empty: Token,
+}
+
+impl SecTokenStream {
+    /// Index of the current token, clamped to `tokens`.
+    fn current(&self) -> usize {
+        self.cursor
+            .saturating_sub(1)
+            .min(self.tokens.len().saturating_sub(1))
+    }
 }
 
 impl TokenStream for SecTokenStream {
     fn advance(&mut self) -> bool {
-        self.cursor += 1;
+        if self.cursor <= self.tokens.len() {
+            self.cursor += 1;
+        }
         self.cursor <= self.tokens.len()
     }
     fn token(&self) -> &Token {
-        &self.tokens[self.cursor - 1]
+        self.tokens.get(self.current()).unwrap_or(&self.empty)
     }
     fn token_mut(&mut self) -> &mut Token {
-        &mut self.tokens[self.cursor - 1]
+        let i = self.current();
+        match self.tokens.get_mut(i) {
+            Some(t) => t,
+            None => &mut self.empty,
+        }
     }
 }
 
@@ -126,6 +149,7 @@ impl Tokenizer for SecurityTokenizer {
         SecTokenStream {
             tokens: split_tokens(text),
             cursor: 0,
+            empty: Token::default(),
         }
     }
 }
@@ -146,6 +170,76 @@ pub fn analyze(text: &str) -> Vec<String> {
         out.push(ts.token().text.clone());
     }
     out
+}
+
+/// Most distinct terms one BM25 query carries (external audit XAI-012).
+/// [`bm25_query`] builds three clauses per term (content, title, author),
+/// so a query has at most 96 clauses. The ADE query names one event,
+/// a few words around a comm, a path or a domain, and stays well under it.
+pub const MAX_QUERY_TERMS: usize = 32;
+
+/// The terms [`bm25_query`] searches for: the analysed query
+/// deduplicated, in first-seen order, then cut at [`MAX_QUERY_TERMS`]
+/// (external audit XAI-012). Deduplicating first means a repeated word
+/// takes one slot, not many; the query text itself is never truncated
+/// (that would cut a path in the middle).
+pub fn query_terms(query: &str) -> Vec<String> {
+    let mut a = analyzer();
+    let mut ts = a.token_stream(query);
+    let mut out: Vec<String> = Vec::new();
+    while out.len() < MAX_QUERY_TERMS && ts.advance() {
+        let t = &ts.token().text;
+        if !out.contains(t) {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+
+/// The lexical-coverage floor of the BM25 path (external audit XAI-008):
+/// the top hit must carry at least one in `COVERAGE_ONE_IN` of the
+/// query's distinct terms ([`required_terms`]), else the result is empty.
+/// The `min_similarity` floor is relative to the top hit, so it can never
+/// drop it; this one can.
+///
+/// The triage proposed one in three. On the golden suite over the pinned
+/// corpus (`target/kb`, 970 documents) that emptied "xmrig miner pool
+/// stratum": every one of its hits, "Linux Crypto Mining Pool
+/// Connections" first, carries one of its four terms, and the suite fell
+/// from 28/30 to 27/30. One in four keeps 28/30 and still drops a top hit
+/// that shares one term of a query of five or more, two of nine or more.
+pub const COVERAGE_ONE_IN: usize = 4;
+
+/// The distinct query terms the top hit must carry:
+/// `ceil(terms / COVERAGE_ONE_IN)` (0 for an empty query, which has no
+/// hits).
+pub fn required_terms(terms: usize) -> usize {
+    terms.div_ceil(COVERAGE_ONE_IN)
+}
+
+/// How many of `terms` (distinct, as [`query_terms`] returns them) occur
+/// in `hit`'s title, author or content, analysed as the index analyses
+/// them: the terms a clause of the query matched in this document
+/// (external audit XAI-008). The count stops at `enough` (the title and
+/// author are read first, so the long content is often not read at all).
+pub fn matched_terms(hit: &Bm25Hit, terms: &[String], enough: usize) -> usize {
+    let enough = enough.min(terms.len());
+    let mut found = vec![false; terms.len()];
+    let mut n = 0;
+    let mut a = analyzer();
+    for text in [&hit.title, &hit.author, &hit.content] {
+        let mut ts = a.token_stream(text);
+        while n < enough && ts.advance() {
+            let tok = &ts.token().text;
+            if let Some(i) = terms.iter().position(|t| t == tok) {
+                if !found[i] {
+                    found[i] = true;
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
 }
 
 // ── canonical record (P2 §4.1 8-key) + schema ──────────────────────────
@@ -376,12 +470,17 @@ pub struct Bm25Hit {
     pub category: String,
     pub title: String,
     pub content: String,
+    /// The stored `author` field (names joined by `", "`, empty for
+    /// none); read for [`matched_terms`], never rendered.
+    pub author: String,
 }
 
 /// BM25 top-`k` over `title`/`content`/`author`. The query is analysed
 /// with the SAME R3 analyzer (no `QueryParser` syntax pitfalls with
 /// `/ : .`), OR-combined as per-field `TermQuery`s — tantivy's default
-/// similarity is BM25, so `TopDocs` is BM25-ranked.
+/// similarity is BM25, so `TopDocs` is BM25-ranked. The terms are those
+/// of [`query_terms`]: distinct, at most [`MAX_QUERY_TERMS`] (external
+/// audit XAI-012).
 ///
 /// **R1 tie-break (plan §12.1):** `TopDocs` breaks score ties by
 /// internal segment/DocId order, which is not stable across rebuilds.
@@ -390,23 +489,15 @@ pub struct Bm25Hit {
 /// ≈ id order here anyway — `build_index_in_ram` inserts id-sorted — but the
 /// explicit re-sort is the contract).
 pub fn bm25_query(index: &Index, query: &str, k: usize) -> Result<Vec<Bm25Hit>> {
-    let schema = index.schema();
-    let get = |n: &str| schema.get_field(n).unwrap();
-    let (id_f, cat_f, title_f, content_f, author_f) = (
-        get("id"),
-        get("category"),
-        get("title"),
-        get("content"),
-        get("author"),
-    );
+    bm25_query_terms(index, &query_terms(query), k)
+}
 
-    let terms = analyze(query);
-    if terms.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    for t in &terms {
-        for fld in [content_f, title_f, author_f] {
+/// The `Should` clauses of a query over `terms`: one `TermQuery` per term
+/// and field.
+fn term_clauses(terms: &[String], fields: [Field; 3]) -> Vec<(Occur, Box<dyn Query>)> {
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(terms.len() * 3);
+    for t in terms {
+        for fld in fields {
             clauses.push((
                 Occur::Should,
                 Box::new(TermQuery::new(
@@ -416,7 +507,34 @@ pub fn bm25_query(index: &Index, query: &str, k: usize) -> Result<Vec<Bm25Hit>> 
             ));
         }
     }
-    let query = BooleanQuery::new(clauses);
+    clauses
+}
+
+/// [`bm25_query`] over terms already analysed by [`query_terms`] (the
+/// engine keeps them for [`matched_terms`]).
+pub(crate) fn bm25_query_terms(index: &Index, terms: &[String], k: usize) -> Result<Vec<Bm25Hit>> {
+    let schema = index.schema();
+    // External audit XAI-003: an error, not a panic, on a schema without
+    // one of these fields. The index is built from `build_schema` at every
+    // open, so this is hygiene; `retrieve` turns the error into an empty
+    // result.
+    let get = |n: &str| {
+        schema
+            .get_field(n)
+            .with_context(|| format!("index schema has no {n:?} field"))
+    };
+    let (id_f, cat_f, title_f, content_f, author_f) = (
+        get("id")?,
+        get("category")?,
+        get("title")?,
+        get("content")?,
+        get("author")?,
+    );
+
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = BooleanQuery::new(term_clauses(terms, [content_f, title_f, author_f]));
     let reader = index.reader().context("index reader")?;
     let searcher = reader.searcher();
     let hits = searcher
@@ -437,6 +555,7 @@ pub fn bm25_query(index: &Index, query: &str, k: usize) -> Result<Vec<Bm25Hit>> 
             category: txt(&doc, cat_f),
             title: txt(&doc, title_f),
             content: txt(&doc, content_f),
+            author: txt(&doc, author_f),
         });
     }
     // R1: deterministic order — score desc, id asc.
@@ -644,6 +763,122 @@ mod tests {
             );
             assert!(!hits.is_empty(), "no hits for {q:?} over the real corpus");
         }
+    }
+
+    /// External audit XAI-019: reading past the end, or before the first
+    /// `advance`, returns a token instead of panicking.
+    #[test]
+    fn token_stream_is_safe_past_the_end() {
+        // The tokenizer's own stream, and through the analyzer's filter.
+        let mut tok = SecurityTokenizer;
+        let mut ts = tok.token_stream("alpha beta");
+        assert_eq!(ts.token().text, "alpha", "before the first advance");
+        let mut seen = Vec::new();
+        while ts.advance() {
+            seen.push(ts.token().text.clone());
+        }
+        assert_eq!(seen, ["alpha", "beta"]);
+        for _ in 0..10 {
+            assert!(!ts.advance());
+        }
+        assert_eq!(ts.token().text, "beta");
+        ts.token_mut().text.push('!');
+        assert_eq!(ts.token().text, "beta!");
+        // An empty text: no token, and still no panic.
+        let mut tok = SecurityTokenizer;
+        let mut empty = tok.token_stream("  ,;  ");
+        assert!(!empty.advance());
+        assert!(!empty.advance());
+        assert_eq!(empty.token().text, "");
+        empty.token_mut().text.push('x');
+        let mut a = analyzer();
+        let mut ts = a.token_stream("Gamma");
+        while ts.advance() {}
+        for _ in 0..10 {
+            assert!(!ts.advance());
+        }
+        assert_eq!(ts.token().text, "gamma");
+    }
+
+    /// External audit XAI-012: the query terms are deduplicated (first
+    /// seen order) before the cap of 32, so a query has at most 96
+    /// clauses however long its text.
+    #[test]
+    fn query_terms_are_deduplicated_then_capped() {
+        let fields = [
+            Field::from_field_id(0),
+            Field::from_field_id(1),
+            Field::from_field_id(2),
+        ];
+        let words: Vec<String> = (0..5_000).map(|i| format!("w{i}")).collect();
+        let long = words.join(" ");
+        let terms = query_terms(&long);
+        assert_eq!(terms.len(), MAX_QUERY_TERMS);
+        assert_eq!(terms[0], "w0");
+        assert_eq!(terms[31], "w31");
+        assert!(term_clauses(&terms, fields).len() <= 96);
+        // A repeated word takes one slot: the word after 5,000 copies of
+        // it is still searched.
+        let repeated = format!("{} zqxjmarker", ["noise"; 5_000].join(" "));
+        assert_eq!(query_terms(&repeated), ["noise", "zqxjmarker"]);
+        // Order is first seen, case folded like the index.
+        assert_eq!(query_terms("b A a c B"), ["b", "a", "c"]);
+        // Every term is still the analyser's: a path stays whole.
+        assert_eq!(
+            query_terms("file open /etc/shadow"),
+            ["file", "open", "/etc/shadow"]
+        );
+    }
+
+    #[test]
+    fn long_query_still_retrieves() {
+        let idx = build_index_in_ram(&corpus()).unwrap();
+        let q = format!("{} xmrig", ["noise"; 5_000].join(" "));
+        let hits = bm25_query(&idx, &q, 5).unwrap();
+        assert_eq!(hits.first().map(|h| h.id.as_str()), Some("attack:T1496"));
+    }
+
+    /// External audit XAI-008: the terms a hit carries, in any of the
+    /// three fields, as the index analyses them.
+    #[test]
+    fn matched_terms_counts_distinct_terms_over_the_three_fields() {
+        let idx = build_index_in_ram(&corpus()).unwrap();
+        let terms = query_terms("Florian /etc/shadow linux absentword shadow");
+        let hits = bm25_query_terms(&idx, &terms, 5).unwrap();
+        let top = &hits[0];
+        assert_eq!(top.id, "sigma:shadow-1");
+        assert_eq!(top.author, "Florian Roth");
+        // florian (author), /etc/shadow and linux (content); not the
+        // absent word, nor `shadow` alone (the path is one token).
+        assert_eq!(matched_terms(top, &terms, terms.len()), 3);
+        assert_eq!(matched_terms(top, &terms, usize::MAX), 3);
+        // The count stops where the caller has enough.
+        assert_eq!(matched_terms(top, &terms, 1), 1);
+        assert_eq!(matched_terms(top, &terms, 0), 0);
+        // One in four, rounded up.
+        for (terms, need) in [
+            (0, 0),
+            (1, 1),
+            (3, 1),
+            (4, 1),
+            (5, 2),
+            (8, 2),
+            (9, 3),
+            (32, 8),
+        ] {
+            assert_eq!(required_terms(terms), need, "{terms} terms");
+        }
+    }
+
+    /// External audit XAI-003: a schema without the expected fields is an
+    /// error, not a panic.
+    #[test]
+    fn foreign_schema_is_an_error_not_a_panic() {
+        let mut b = Schema::builder();
+        b.add_text_field("id", STRING | STORED);
+        let index = Index::create_in_ram(b.build());
+        let e = bm25_query(&index, "anything", 3).unwrap_err();
+        assert!(e.to_string().contains("no \"category\" field"), "{e:#}");
     }
 
     #[test]

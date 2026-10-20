@@ -21,7 +21,7 @@ use anyhow::Result;
 use common::rag_types::{KbCategory, RagDocument, RagResult};
 
 use super::embedder::RagEmbedder;
-use super::index_tantivy::{self, bm25_query, CanonLine};
+use super::index_tantivy::{self, CanonLine};
 use super::kb_manifest::KbManifest;
 use super::kb_seed;
 use super::store::RagStore;
@@ -44,13 +44,21 @@ pub const DEFAULT_TOP_K: usize = 3;
 ///
 /// We pick `0.15`. When the embedder is upgraded to real bge-small
 /// this should be raised back to `~0.4`.
+///
+/// On the BM25 path the floor applies to scores divided by the top
+/// hit's, so it trims the tail and never drops the top hit; a weak top
+/// hit is dropped by the lexical-coverage floor instead
+/// ([`index_tantivy::COVERAGE_ONE_IN`], external audit XAI-008).
 pub const DEFAULT_MIN_SIMILARITY: f32 = 0.15;
 
 /// One retrieval call.
 ///
 /// `top_k = 0` is treated as "use [`DEFAULT_TOP_K`]"; same for
-/// `min_similarity = 0.0` → [`DEFAULT_MIN_SIMILARITY`]. This lets
+/// `min_similarity <= 0.0` → [`DEFAULT_MIN_SIMILARITY`]. This lets
 /// callers spell `RagQuery { query_text: "...", ..Default::default() }`.
+/// So `0.0` does not mean "no floor": a caller that wants every hit up
+/// to `top_k` passes `f32::MIN_POSITIVE` (external audit XAI-008). The
+/// BM25 coverage floor applies whatever `min_similarity` is.
 #[derive(Debug, Clone)]
 pub struct RagQuery<'a> {
     pub query_text: &'a str,
@@ -221,12 +229,21 @@ impl RagEngine {
         }
     }
 
-    /// BM25 path: R1 ordering (from [`bm25_query`]) → §3.4(a)
-    /// within-result normalisation (top hit = 1.0, rest proportional)
-    /// → `min_similarity` floor applied AFTER normalisation. A query
-    /// failure yields an empty `RagResult` (conservative — preserves
-    /// the infallible `retrieve` contract and the "no-match ⇒ empty"
-    /// guarantee the downstream relies on).
+    /// BM25 path: R1 ordering (from [`index_tantivy::bm25_query`]) →
+    /// lexical-coverage floor on the top hit → §3.4(a) within-result
+    /// normalisation (top hit = 1.0, rest proportional) →
+    /// `min_similarity` floor applied AFTER normalisation. A query failure yields an empty `RagResult`
+    /// (conservative — preserves the infallible `retrieve` contract and
+    /// the "no-match ⇒ empty" guarantee the downstream relies on).
+    ///
+    /// External audit XAI-008: normalising by the top score makes the top
+    /// hit 1.0 whatever it matched, so the relative floor never dropped
+    /// it, and a document sharing one common word with a long query went
+    /// into the prompt. The top hit must now carry at least one in four
+    /// of the query's distinct terms ([`index_tantivy::COVERAGE_ONE_IN`]),
+    /// else the result is empty; the hits it keeps are unchanged.
+    /// External audit XAI-012: the query is at most
+    /// [`index_tantivy::MAX_QUERY_TERMS`] distinct terms.
     fn retrieve_bm25(index: &tantivy::Index, query: RagQuery<'_>) -> RagResult {
         let top_k = if query.top_k == 0 {
             DEFAULT_TOP_K
@@ -239,17 +256,32 @@ impl RagEngine {
             query.min_similarity
         };
         let start = Instant::now();
-        let hits = match bm25_query(index, query.query_text, top_k.max(1)) {
+        let empty = |start: Instant| RagResult {
+            documents: Vec::new(),
+            query_embedding_ms: 0,
+            retrieval_ms: start.elapsed().as_millis() as u64,
+        };
+        let terms = index_tantivy::query_terms(query.query_text);
+        let hits = match index_tantivy::bm25_query_terms(index, &terms, top_k.max(1)) {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(error = %e, "BM25 retrieve failed; empty result (conservative)");
-                return RagResult {
-                    documents: Vec::new(),
-                    query_embedding_ms: 0,
-                    retrieval_ms: start.elapsed().as_millis() as u64,
-                };
+                return empty(start);
             }
         };
+        if let Some(top) = hits.first() {
+            let need = index_tantivy::required_terms(terms.len());
+            let matched = index_tantivy::matched_terms(top, &terms, need);
+            if matched < need {
+                tracing::debug!(
+                    matched,
+                    need,
+                    terms = terms.len(),
+                    "BM25 top hit below the term-coverage floor; empty result"
+                );
+                return empty(start);
+            }
+        }
         let retrieval_ms = start.elapsed().as_millis() as u64;
         let max = hits.first().map(|h| h.score).unwrap_or(0.0);
         let documents: Vec<RagDocument> = hits
@@ -414,7 +446,8 @@ mod tests {
         let r = e.retrieve(RagQuery {
             query_text: "powershell",
             top_k: 2,
-            min_similarity: 0.0,
+            // No floor (`0.0` would mean the default, external audit XAI-008).
+            min_similarity: f32::MIN_POSITIVE,
         });
         assert!(r.documents.len() <= 2);
     }
@@ -472,7 +505,8 @@ mod tests {
         let r = e.retrieve(RagQuery {
             query_text: "zqxjmarker",
             top_k: 5,
-            min_similarity: 0.0,
+            // No floor (`0.0` would mean the default, external audit XAI-008).
+            min_similarity: f32::MIN_POSITIVE,
         });
         assert!(!r.documents.is_empty(), "BM25 must find the marker doc");
         let top = &r.documents[0];
@@ -516,6 +550,90 @@ mod tests {
             min_similarity: 0.99,
         });
         assert!(r2.documents.iter().any(|d| d.id == "attack:T1059.001"));
+    }
+
+    /// The raw BM25 hits of `q` on the engine's index, before any floor.
+    fn raw_bm25(e: &RagEngine, q: &str) -> Vec<index_tantivy::Bm25Hit> {
+        match &e.backend {
+            Backend::Bm25 { index, .. } => index_tantivy::bm25_query(index, q, 5).unwrap(),
+            Backend::Embedding { .. } => unreachable!("open_index is BM25"),
+        }
+    }
+
+    fn no_floor(q: &str) -> RagQuery<'_> {
+        RagQuery {
+            query_text: q,
+            top_k: 5,
+            min_similarity: f32::MIN_POSITIVE,
+        }
+    }
+
+    /// External audit XAI-008: a top hit that shares fewer than one in
+    /// four of the query's distinct terms is dropped, with no floor set.
+    /// BM25 itself still ranks a document first (which the relative floor
+    /// alone would have kept at 1.0).
+    #[test]
+    fn weak_match_returns_nothing() {
+        let jl = tempfile::tempdir().unwrap();
+        let m = fixture_jsonl(jl.path());
+        let e = RagEngine::open_index_with_manifest(jl.path(), &m).unwrap();
+        for q in [
+            // One common word of five.
+            "execution qzvone qzvtwo qzvthree qzvfour",
+            // Even the unique marker: one of five.
+            "zqxjmarker qzvone qzvtwo qzvthree qzvfour",
+            // Two of nine.
+            "zqxjmarker powershell qa qb qc qd qe qf qg",
+        ] {
+            assert!(
+                !raw_bm25(&e, q).is_empty(),
+                "BM25 ranks something for {q:?}"
+            );
+            let r = e.retrieve(no_floor(q));
+            assert!(
+                r.documents.is_empty(),
+                "{q:?}: {:?}",
+                r.documents.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+            // The production defaults too.
+            assert!(e.retrieve(RagQuery::new(q)).documents.is_empty(), "{q:?}");
+        }
+    }
+
+    /// The coverage floor keeps a top hit that carries one term in four
+    /// (the boundary) or more, and counts distinct terms (a repeated word
+    /// does not make the query longer).
+    #[test]
+    fn strong_match_still_returns_top_hit() {
+        let jl = tempfile::tempdir().unwrap();
+        let m = fixture_jsonl(jl.path());
+        let e = RagEngine::open_index_with_manifest(jl.path(), &m).unwrap();
+        for q in [
+            "zqxjmarker",
+            "zqxjmarker powershell",
+            "zqxjmarker qzvone qzvtwo",
+            // One of four: the boundary.
+            "zqxjmarker qzvone qzvtwo qzvthree",
+            // Two of eight.
+            "zqxjmarker powershell qa qb qc qd qe qf",
+            // Distinct terms: two, not five.
+            "zqxjmarker zqxjmarker zqxjmarker zqxjmarker qzvone",
+            // Five terms, three carried.
+            "powershell command zqxjmarker from /tmp/qzv",
+        ] {
+            let r = e.retrieve(no_floor(q));
+            let top = r
+                .documents
+                .first()
+                .unwrap_or_else(|| panic!("{q:?}: empty"));
+            assert_eq!(top.id, "attack:T1059.001", "{q:?}");
+            assert_eq!(top.similarity, 1.0, "{q:?}");
+            let d = e.retrieve(RagQuery::new(q));
+            assert_eq!(
+                d.documents.first().map(|d| d.id.as_str()),
+                Some("attack:T1059.001")
+            );
+        }
     }
 
     #[test]
