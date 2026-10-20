@@ -128,12 +128,13 @@ fn sha256_file(p: &Path) -> std::io::Result<[u8; 32]> {
 /// the deployment-identity hash must agree with the rest of the
 /// agent's host identity — consistency wins over the illustrative
 /// command. Fixed-name fallback keeps the hash total.
+///
+/// External audit LLMP-014: the very function `HostContext::discover`
+/// uses — one sanitized line of at most 64 characters, `unknown` when
+/// empty — so the two cannot drift apart. It was a second copy of the
+/// raw read.
 fn canonical_hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+    crate::ade::context::discover_hostname()
 }
 
 /// `lower_hex(sha256(preimage))` exactly per the D1 spec in
@@ -332,6 +333,18 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
+
+    /// External audit LLMP-014: the `environment_hash` hostname is the
+    /// one the prompt and the XAI snapshot carry, sanitized at one place.
+    #[test]
+    fn canonical_hostname_is_the_host_context_hostname() {
+        let h = canonical_hostname();
+        assert_eq!(h, HostContext::discover().hostname);
+        assert!(
+            !h.is_empty() && !h.contains(|c: char| c.is_control()),
+            "{h:?}"
+        );
+    }
 
     fn temp_with(bytes: &[u8]) -> NamedTempFile {
         let mut f = NamedTempFile::new().expect("temp");

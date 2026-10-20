@@ -532,10 +532,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-320 | LLMP-007 | Low | LLM prompts | M | open (dormant: templates not wired) |
 | NN-AUD-321 | LLMP-008 | Low | LLM prompts | S | open (dormant) |
 | NN-AUD-322 | LLMP-010 | Low | LLM prompts | S | open (wider: a `"` in the preamble does the same) |
-| NN-AUD-323 | LLMP-012 | Low | LLM prompts | S | open (dead code: delete) |
-| NN-AUD-324 | LLMP-014 | Low | LLM prompts | S | open |
+| NN-AUD-323 | LLMP-012 | Low | LLM prompts | S | fixed (lab PR 182) |
+| NN-AUD-324 | LLMP-014 | Low | LLM prompts | S | fixed (lab PR 182) |
 | NN-AUD-325 | LLMR-009 | Low | LLM runtime | S–M | open (the audit's fix changes candle's threading) |
-| NN-AUD-326 | LLMR-011 | Low | LLM runtime | S | partly fixed (corpus pinned, lab PR 145; titles and query left); open |
+| NN-AUD-326 | LLMR-011 | Low | LLM runtime | S | fixed (lab PR 182) |
 | NN-AUD-327 | LLMR-015 | Low | LLM runtime | M | fixed (lab PR 168) |
 | NN-AUD-328 | LLMR-018 | Low | LLM runtime | S | open (narrowed: mock only behind a signed weakening) |
 | NN-AUD-329 | LLMR-019 | Low | LLM runtime | M (at XAI wiring) | partly fixed (one prompt path, lab PRs 133/144/145; digest not recorded); open |
@@ -6884,3 +6884,90 @@ group, the ones an unprivileged user or a local attacker could use first.
     `test-privileged,debug-trigger`) clean, `cargo test --workspace`
     2,361 passed, 0 failed.
   - Lab: Ubuntu 24.04, combatguard181-probe.sh — before: the build of `main` with lab PRs 176–179; after: this lot on top. A drop-in `CapabilityBoundingSet=~CAP_SYS_PTRACE` (the agent's effective set without it): before a WARN only; after an ERROR "capability preflight: CAP_SYS_PTRACE missing" and one signed `subsystem_degraded`, plus the boot line naming the files never quarantined. The guard asked (debug-trigger hook) about init, sshd, the watchdog, cron and a session's root and user processes, all with `/proc/<pid>/exe` unreadable: init, sshd (uid 0 in `ssh.service`) and the watchdog spared, cron and the session's processes not. COMBAT from an SSH session: the offender (root, non-dumpable, in the session scope) killed in both builds, sshd, the watchdog and cron untouched (same MainPIDs), released by unlock; the drop-in removed and `CAP_SYS_PTRACE` back at the end. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.
+- **Wave 3 — ADE prompt inputs, lab PR 182.** NN-AUD-324 (LLMP-014),
+  NN-AUD-326 (LLMR-011, the part left after lab PR 145), NN-AUD-323
+  (LLMP-012): batch C of the Wave 3 triage of the LLM, XAI and deception
+  group, on top of lots 176–179. No lab probe and no model (the triage's
+  verdict): the prompt does not change for clean values, which the tests
+  pin.
+  - Before: `ade/context.rs` `HostContext::discover` read
+    `/proc/sys/kernel/{hostname,osrelease}` and `/etc/machine-id` with
+    `read_to_string`, `trim()` only; `structured_prompt.rs`
+    `push_host_context` printed them, with `host_role` and
+    `language_used`, as they were inside `=== TRUSTED CONTEXT (issued by
+    NorthNarrow, immutable) ===`. `sethostname(2)` takes any 64 bytes, a
+    newline included, and the machine id had no bound: root (the declared
+    adversary) could end the block and write its own context lines or
+    sections — with the ADE a consultant, a wrong recommendation or a
+    forced review at worst. `xai/engine.rs` `canonical_hostname` was a
+    second copy of the raw read. `rag_integration.rs` `clean_title` only
+    trimmed and fixed the period; `build_rag_query_from_event` built the
+    query from the raw event. `prompt.rs` `build_event_prompt` (the raw
+    event and host context, no fences) was still `pub`, with no caller but
+    its two tests.
+  - Agent: `sanitize.rs`: `sanitize_string` is `pub(crate)`; new
+    `sanitize_line(input, cap)` — `sanitize_string` with scratch flags,
+    then the C1 controls (NEL), U+2028 and U+2029 as `?`, the characters
+    that can still break a line in a block that is not JSON-quoted.
+    `context.rs`: `host_field` (trim, `sanitize_line` at `HOST_FIELD_CAP`
+    = 64, the kernel's `__NEW_UTS_LEN`; `unknown` when nothing is left or
+    the file cannot be read) for the hostname and the release, read
+    through a 256-byte window; `machine_id`: 32 lowercase hex characters
+    after an ASCII trim, else `unknown`, read through 64 bytes;
+    `discover_hostname`, which XAI's `canonical_hostname` now calls.
+    `structured_prompt.rs`: every trusted-context line goes through
+    `push_trusted_line` → `sanitize_line` when printed too (`host_role`
+    and `language_used` included), so a `HostContext` built another way is
+    covered; an empty value stays empty (XAI occlusion clears host
+    fields). `rag_integration.rs`: `clean_title` = trim, `sanitize_line`
+    at `TITLE_CAP` = 160 characters (the corpus's longest is 81), then the
+    period rule; `build_rag_query(&SanitizedEvent)` replaces
+    `build_rag_query_from_event(&Event)`: strings from `safe_comm`,
+    `safe_filename`, `safe_query_name`, numbers and enumerations from
+    `original_event`, the `buffer` and `-` placeholders kept;
+    `AdeEngine::prepare` passes the event it has already sanitized.
+    `prompt.rs`: `build_event_prompt`, `push_host_context`,
+    `format_event_line`, `format_event_block` and their two tests deleted
+    (`SystemPrompt`, `PromptParts` kept); the doc link in
+    `structured_prompt.rs` rewritten.
+  - Choices: validated at the source as the triage says, and again where
+    printed: it costs nothing and the trusted block no longer depends on
+    how the context was built. The extra line-break characters are handled
+    in `sanitize_line`, not in the event sanitizer, whose output is
+    printed JSON-quoted and whose scores stay as they are. The flags of
+    host fields and titles go to a scratch vector: they are not observed
+    strings and are not scored. No `RAG_MAX_LINES` (bounded by
+    `DEFAULT_TOP_K` = 3, as the triage notes). The ASCII trim of the
+    machine id keeps the old leniency on surrounding whitespace. Not done:
+    the enrichment templates (batch E, dormant) are to use `sanitize_line`
+    / `sanitize_string` when they are wired.
+  - Tests: `ade::context` `host_fields_are_capped_and_single_line`,
+    `clean_host_fields_are_unchanged`, `malformed_machine_id_is_unknown`,
+    `machine_id_file_is_read_bounded` (1 MiB file),
+    `discovered_host_fields_are_single_lines`; `ade::structured_prompt`
+    `hostile_host_context_cannot_forge_a_section` (exact trusted block for
+    a newline, `===`, CR, U+2028, NEL and a chat token in the four fields
+    and `host_role`), `host_context_lines_are_capped`,
+    `clean_host_context_renders_byte_identical` (the old renderer as
+    reference: fixture, this host's `discover()`, realistic values, a
+    64-character name, empty values, with and without `host_role`),
+    `clean_prompt_bytes_are_pinned` (a whole prompt with RAG block,
+    correlated event and focal event, the literal rendered by the base
+    code); `ade::rag_integration` `hostile_title_renders_on_one_line`,
+    `long_title_is_capped`, `pinned_titles_render_unchanged` (the old
+    `clean_title` as reference: the 36 seed titles always, the 934 of the
+    pinned dumps when `target/kb` verifies against `kb_index.json`),
+    `rag_query_uses_the_sanitized_strings`; `xai::engine`
+    `canonical_hostname_is_the_host_context_hostname`. On the base:
+    `hostile_host_context_cannot_forge_a_section`,
+    `host_context_lines_are_capped`, `hostile_title_renders_on_one_line`
+    and `long_title_is_capped` fail; the `ade::context` tests and
+    `rag_query_uses_the_sanitized_strings` do not compile there
+    (`host_field`, `machine_id`, `build_rag_query`); the byte-identity
+    tests, `pinned_titles_render_unchanged` and the XAI guard pass on both
+    — they are the invariance. `format_rag_block_byte_stable_phase_abcd_contract`
+    unchanged and green. Golden suite on `target/kb` (release): 28/30, as
+    since lab PR 145. Host: `cargo fmt`, both clippy runs
+    (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean, 2,363 passed, 0 failed.
+  - Lab: No lab or model run (the prompt is unchanged for clean values): unit tests pin the clean prompt bytes as the code before rendered them, 970 RAG titles (the seed's 36 and the 934 of the verified dumps) unchanged, and a hostile hostname that closed the trusted block and opened a fake `=== YOUR TASK ===` section now staying on one neutralised line; the real-corpus golden suite 28/30 as before. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.

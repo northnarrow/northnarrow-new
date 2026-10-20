@@ -734,7 +734,10 @@ fn synth_argv_from_event(event: &Event) -> Vec<String> {
 /// 4. Search the normalised lower-case form for instruction keywords
 ///    and special tokens (raises flags). Special tokens are *also*
 ///    redacted so they never reach the model.
-fn sanitize_string(input: &str, cap: usize, flags: &mut Vec<InjectionFlag>) -> String {
+///
+/// The identity on clean text: printable characters, no homoglyph, no
+/// chat-template token, no `===`, at most `cap` characters.
+pub(crate) fn sanitize_string(input: &str, cap: usize, flags: &mut Vec<InjectionFlag>) -> String {
     let truncated = if input.chars().count() > cap {
         input.chars().take(cap).collect::<String>()
     } else {
@@ -809,6 +812,27 @@ fn sanitize_string(input: &str, cap: usize, flags: &mut Vec<InjectionFlag>) -> S
     detect_variant_separators(&buf, &lower, flags);
 
     buf
+}
+
+/// External audit LLMP-014, LLMR-011: `input` as one line of the prompt
+/// outside the untrusted blocks — a host field in the trusted context, a
+/// RAG title — where the value is printed as it is, not JSON-quoted.
+/// [`sanitize_string`] (its flags dropped: these strings are not scored),
+/// then the characters that can still break a line there — the C1
+/// controls (NEL among them), U+2028 and U+2029 — as `?`. The identity on
+/// clean text, so a clean value prints as it did.
+pub(crate) fn sanitize_line(input: &str, cap: usize) -> String {
+    let mut scratch = Vec::new();
+    sanitize_string(input, cap, &mut scratch)
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Multilingual keyword search.
