@@ -4844,15 +4844,23 @@ mod tests {
     }
 
     /// A regular, readable file a Critical rule guards (a system binary).
+    /// Ubuntu 26.04's coreutils (uutils, one multicall binary) make `env`
+    /// and `true` symlinks; `bash` is a regular file on every distro.
     fn critical_system_file() -> String {
-        ["/usr/bin/env", "/usr/bin/true", "/bin/true"]
-            .iter()
-            .find(|p| {
-                crate::fim::rules::is_critical_rule_path(p)
-                    && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
-            })
-            .expect("a system binary to read")
-            .to_string()
+        [
+            "/usr/bin/env",
+            "/usr/bin/true",
+            "/bin/true",
+            "/usr/bin/bash",
+            "/bin/bash",
+        ]
+        .iter()
+        .find(|p| {
+            crate::fim::rules::is_critical_rule_path(p)
+                && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
+        })
+        .expect("a system binary to read")
+        .to_string()
     }
 
     /// External audit NN-AUD-121 (FIMP-009): a write on a critical path
