@@ -682,6 +682,31 @@ Now **killed, or answered, where they were recorded or missed**:
   as root, `sudo`, and the lab scripts (all run as root) are unaffected.
   Still readable by design: `admin.pub`, `agent_id`, `agent.sig.pub`,
   `install-manifest.json`, the shipped lists and the honeypot baits.
+- **Unit drop-ins and mounts the integrity check now sees, and the
+  stale COMBAT chain's signed record** (Wave 3: NN-AUD-276 EVD-011,
+  NN-AUD-277 EVD-014, NN-AUD-255 MAIN-013, NN-AUD-257 MAIN-015, lab PR
+  180). Drop-ins for the agent's units are looked for in every directory
+  of systemd's unit search path, `/etc/systemd/system.attached`,
+  `/run/systemd/system.attached` and the generator directories included
+  (`unit_dropin`). A mount laid after the agent started over a directory
+  above its paths — a tmpfs over `/var/lib`, a bind over `/etc` or
+  `/usr/local/bin`, a second bpffs on `/sys/fs/bpf` — is
+  `mount_over_protected` ("… hides …"), and a mount they resolved through
+  that is gone `protected_mount_gone`; when `/proc/1/mountinfo` cannot be
+  read the agent checks its own namespace, and when neither can be read it
+  records `mountinfo_unreadable` instead of checking nothing. A stale
+  `NORTHNARROW_COMBAT` chain torn down at start is signed as
+  `combat_reconcile` (`repaired`, or `failed`: the host may still be
+  isolated, [COMBAT_RECOVERY.md §4](COMBAT_RECOVERY.md#4-recovering-from-an-agent-crash-mid-combat));
+  `combat-audit.jsonl` stays, unsigned. **Regression / note:** a mount
+  your own configuration lays over such a directory after the agent's
+  start (a late remote `/var/lib`, an automount on `/usr/local`) is
+  reported until the agent restarts with it in place (a trusted-installer
+  window, §2); the mounts present when it starts are its baseline.
+  Nothing changes on a stock Ubuntu 22.04/24.04 or Debian 12/13 host:
+  those directories hold no drop-in for the agent's units, and the
+  shipped Debian drop-in is still accepted only where `install.sh` puts
+  it, with its content.
 - **Findings that come back are reported again** (NN-AUD-114 EVD-013,
   NN-AUD-113 EVD-012, NN-AUD-111 EVD-006, lab PR 130): a finding that goes
   away is signed as `integrity_drift_cleared`; detections dropped from a

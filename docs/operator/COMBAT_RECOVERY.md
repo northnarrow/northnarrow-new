@@ -191,10 +191,22 @@ posture state behind it (the "split-brain"). NorthNarrow handles this
 - On startup the agent boots into `OBSERVING`. If it finds a stale
   `NORTHNARROW_COMBAT` chain, it tears it down and logs at **WARN**:
   `"stale COMBAT chain detected at boot — torn down …"`.
-- An audit line is appended to
+- The teardown is signed in the audit chain once it opens (lab PR 180,
+  external audit MAIN-013): an `integrity_drift` row of kind
+  `combat_reconcile`, `result` `repaired` with `rules_torn_down` — or
+  `failed` when the chain could not be checked or torn down, in which case
+  the host may still be isolated (by hand, from the console:
+  `iptables -D INPUT -j NORTHNARROW_COMBAT` — and `OUTPUT`, `FORWARD`,
+  until it fails — then `iptables -F NORTHNARROW_COMBAT; iptables -X
+  NORTHNARROW_COMBAT`, the same with `ip6tables`). Check it with
+  `sudo nn-admin audit verify && sudo grep '"kind":"combat_reconcile"'
+  /etc/northnarrow/audit.log`.
+- For compatibility a line is also appended to
   `/var/lib/northnarrow/combat-audit.jsonl`
   (`{"event":"combat_reconcile","reason":"stale_reconcile",
-  "rules_torn_down":N,…}`).
+  "rules_torn_down":N,…}`), unsigned; the state directory is immutable
+  (`chattr +i`), so the line is added only to a file that already exists
+  (created `0600` where the directory is not immutable).
 
 So after a crash + restart the host comes back on the network on its own.
 
