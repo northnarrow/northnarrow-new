@@ -190,6 +190,41 @@ jobs:
             qemu-x86_64 -cpu Nehalem "$tmp"/northnarrow-*/target/release/$b --version
           done
 
+      # External audit PROC-015 (NN-AUD-302): no test, debug or demo
+      # feature (debug-trigger, demo-tappa5, posture-demo, test-privileged)
+      # in a released binary. The build above passes no --features and the
+      # agent crate has no default feature (xtask/tests/supply_chain.rs,
+      # agent/tests/build_features_cli.rs); this reads what each artefact
+      # carries — the tarball, the .deb and the .rpm. The agent answers
+      # `--build-features` (`none`, the marker the range bootstrap checks);
+      # nn-admin has no `debug` subcommand (debug-trigger).
+      - name: No lab feature in the released binaries
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends cpio >/dev/null
+          tmp=$(mktemp -d) && mkdir "$tmp/tgz" "$tmp/deb" "$tmp/rpm"
+          tar -C "$tmp/tgz" -xzf "$(ls dist/*.tar.gz)"
+          dpkg-deb -x "$(ls dist/northnarrow_*_amd64.deb)" "$tmp/deb"
+          rpm=$(realpath "$(ls dist/northnarrow-*.x86_64.rpm)")
+          (cd "$tmp/rpm" && rpm2cpio "$rpm" | cpio -idm --quiet)
+          dirs=("$tmp"/tgz/northnarrow-*/target/release "$tmp/deb/usr/bin" "$tmp/rpm/usr/bin")
+          for d in "${dirs[@]}"; do
+            feat=$("$d/northnarrow-agent" --build-features) \
+              || { echo "::error::$d/northnarrow-agent cannot report its build features"; exit 1; }
+            if [ "$feat" != none ]; then
+              echo "::error::$d/northnarrow-agent was built with lab features: $feat"; exit 1
+            fi
+            # here-strings, not `echo | grep -q`: under pipefail an early
+            # grep exit can fail the echo with SIGPIPE (NN-AUD-211)
+            help=$("$d/nn-admin" --help)
+            grep -qE '^  status( |$)' <<<"$help" \
+              || { echo "::error::$d/nn-admin --help lists no subcommand"; exit 1; }
+            if grep -qE '^  debug( |$)' <<<"$help"; then
+              echo "::error::$d/nn-admin has the debug subcommand (debug-trigger)"; exit 1
+            fi
+            echo "$d: build features none, no nn-admin debug"
+          done
+
       # External audit SUP-003: whatever ran in this job — every build
       # script and proc-macro of the dependency tree — found no credential
       # to take. Fails the job if a token sits in the git config or the

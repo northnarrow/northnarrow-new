@@ -132,6 +132,13 @@ pub use r018_kernel_module_load::R018KernelModuleLoad;
 /// process + FIM rule families. K3 detector precedence guarantees
 /// canary events never co-occur with FIM events for the same
 /// inode (§12 Q9 inline-filter lock-in).
+///
+/// External audit PROC-014 (NN-AUD-429): the families, and their order,
+/// are those of [`default_rules_with_net`], the production builder — the
+/// io_uring (NN-L-IOU-001/002) and BPF (NN-L-BPF-001/002) rules included,
+/// which only the production builder used to register, so no engine test
+/// saw them. `decision/tests.rs` holds the two builders to one id
+/// sequence.
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules go FIRST so they OBSERVE precursor
     // events (recording + returning None, falling through to the
@@ -144,8 +151,13 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // production main.rs path constructs its engine via
     // [`default_rules_with_net`] instead, threading the operator-loaded
     // process-comm allowlist in.
-    rules.extend(spawn_rules(Arc::new(CommAllowlist::default()), None));
+    let process_allowlist = Arc::new(CommAllowlist::default());
+    rules.extend(spawn_rules(Arc::clone(&process_allowlist), None));
     rules.extend(module_load_rules());
+    // External audit PROC-014: the io_uring and BPF rules, over the same
+    // empty process allowlist (their built-in known programs still apply).
+    rules.extend(iouring::iouring_rules(Arc::clone(&process_allowlist)));
+    rules.extend(bpf::bpf_rules(process_allowlist));
     // FIM-009 self-upgrade (§15.1): the non-production rule set has no
     // admin dispatcher to arm an override, so FIM-009 gets an inert one
     // (never armed → unchanged KillProcess behaviour).

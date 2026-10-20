@@ -513,7 +513,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-299 | PROC-011 | Low | Process rules | S | fixed (lab PR 166) |
 | NN-AUD-300 | PROC-012 | Low | Process rules | S | fixed (lab PR 177) |
 | NN-AUD-301 | PROC-013 | Low | Process rules | S | fixed (lab PR 177) |
-| NN-AUD-302 | PROC-015 | Low | Process rules | S | partly fixed; open |
+| NN-AUD-302 | PROC-015 | Low | Process rules | S | fixed (lab PR 201) |
 | NN-AUD-303 | POS-006 | Low | Posture | S | fixed (lab PR 172) |
 | NN-AUD-304 | POS-007 | Low | Posture | S–M | fixed (lab PR 172) |
 | NN-AUD-305 | POS-008 | Low | Posture | S | fixed (lab PR 172) |
@@ -640,7 +640,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | fixed (lab PR 187) |
 | NN-AUD-427 | EVD-023 | Info | Evidence logs | S | open |
 | NN-AUD-428 | NETR-016 | Info | Net rules | S | fixed (lab PR 186) |
-| NN-AUD-429 | PROC-014 | Info | Process rules | S | open |
+| NN-AUD-429 | PROC-014 | Info | Process rules | S | fixed (lab PR 201) |
 | NN-AUD-430 | POS-013 | Info | Posture | S | fixed (lab PR 172) |
 | NN-AUD-431 | CMB-028 | Info | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | open (Info; narrowed to the test: argv is 512 B at the kernel) |
@@ -8808,3 +8808,85 @@ group, the ones an unprivileged user or a local attacker could use first.
     (`workflows_parse_as_yaml`). The CI's `posture_demo` clippy still
     fails as on the starting tree (lot `nn-wt-kernfid`, fixed on `main`).
   - Lab: CI and local fuzzing, no lab probe: `cargo +nightly-2025-12-01 fuzz build` of the 13 targets; the CI step's local replay (seeds and regressions, `-runs=0`) green on all 13; 180 s per target with no crash; mutations caught and reverted — a 7th field in `generate_accept_rules`, the manifest name check removed (an alias verified, a timeout on `/dev/zero`), the ADE confidence range check removed, the DNS `.` escape removed, the quorum result ignored (a forged marker found in 0.3 s); the two DNS Kani proofs locally (35 s). The fuzzers found two agent defects fixed here: `install_manifest` hashed any manifest name (`/dev/zero` blocked the boot, `../` reached any file), and an u32 overflow in `btf_parse`'s `field_offset`. Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.
+- **Wave 3 — engine composition and the release build, lab PR 201.** Batch
+  B6 of the Wave 3 triage of group G4: NN-AUD-429 (PROC-014, Info) and
+  NN-AUD-302 (PROC-015, Low, the part that remained), on the integration
+  tree (`main` with lots up to 193, and lots 194–199). Files:
+  `decision/{engine,tests}.rs`, `decision/rules/mod.rs`, `main.rs`,
+  `self_integrity.rs`, `audit.rs`, `agent/tests/build_features_cli.rs`,
+  `xtask/tests/supply_chain.rs`, `.github/workflows/release.yml`. No wire
+  change, no change to a production verdict.
+  - PROC-014 (429, fixed). Re-checked: `default_rules()` had no
+    `iouring_rules` / `bpf_rules`, which only `default_rules_with_net`
+    registered; every engine test builds `with_default_rules()`, and no
+    test outside the two rule files named NN-L-IOU-00x or NN-L-BPF-00x.
+    Both families are now in `default_rules()`, over its empty process
+    allowlist (their built-in known programs apply), at the production
+    builder's place (after R018, before FIM): 77 rules under 76 ids, the
+    count `docs/validation/` already gives the production engine.
+    `production_engine_pins_all_rule_ids` builds the engine as `main.rs`
+    does over empty operator state and requires the same id sequence as
+    `default_rules()` (pinned by `default_engine_pins_all_seventy_six_rule_ids`):
+    a family dropped from either builder, a rule registered twice or a
+    different order fails. `both_builders_keep_the_family_order` pins the
+    families' order (chains that observe, the 19 process rules in
+    `spawn_rules` order, io_uring, BPF, FIM, canary, net, CHAIN-008 last)
+    and the process precedence; `io_uring_and_bpf_events_reach_their_rules_in_both_engines`
+    sends the four rules their events through both engines (a lineage
+    cache over a temporary `/proc`, so no host process is read).
+  - PROC-015 (302, fixed; the triage's main fix, not the alternative of
+    retiring the feature). The demo engine was the four demo rules over
+    `default_rules()` (no operator blocklist, no allowlist); it is now the
+    production engine with R901..R904 put first
+    (`RuleEngine::with_demo_tappa5_first`). `decision::engine::demo_rules_gate`:
+    a `demo-tappa5` build refuses to start in enforcement unless
+    `NN_ALLOW_DEMO_RULES=1` (exactly `1`), checked in `run` once
+    detect-only is resolved and before any response, cgroup reap or
+    isolation clean-up; detect-only starts; any other build is never held
+    back. The variable is in `WEAKENING_ENV` with
+    `allow_demo_rules_weakens`: a signed `integrity_drift` in a demo build,
+    the only one that reads it (MAIN-008: the test the consumer applies).
+    Static check: `audit::LAB_FEATURES` lists every crate feature with its
+    `cfg!`, `build_features()` reads it, and
+    `every_cargo_feature_is_named_by_build_features` holds it to
+    `agent/Cargo.toml` (`default = []`, every feature named);
+    `posture-demo` was missing and is now reported. Artefact check: the
+    package job of `release.yml` gets "No lab feature in the released
+    binaries" (after the packages and the qemu start, before the upload):
+    it extracts the tarball, the .deb and the .rpm (`rpm2cpio | cpio`) and
+    fails unless each `northnarrow-agent --build-features` prints `none`
+    and each `nn-admin --help` lists `status` and no `debug` (debug-trigger
+    adds that subcommand; the watchdog's only feature gates a test file).
+    `the_release_build_carries_no_lab_feature` (xtask) requires that step
+    in that place and a release build that passes no cargo feature.
+  - Tests and checks. On the starting tree the agent's new tests do not
+    compile (`RuleEngine::rule_ids`, `demo_rules_gate`,
+    `audit::LAB_FEATURES` are new); the xtask one compiles and fails ("no
+    step checks the artefacts' --build-features"). With each fix inverted, the tests kept, the matching test fails:
+    `default_rules()` without io_uring and BPF →
+    `production_engine_pins_all_rule_ids`, `both_builders_keep_the_family_order`,
+    `io_uring_and_bpf_events_reach_their_rules_in_both_engines` and the two
+    count/pin tests; a gate that always starts →
+    `a_demo_build_enforces_only_with_the_operators_consent`; the variable
+    out of `WEAKENING_ENV` → `the_demo_rules_variable_is_a_weakening_variable`;
+    `posture-demo` out of `LAB_FEATURES` →
+    `every_cargo_feature_is_named_by_build_features`; `release.yml` with
+    `--features debug-trigger` on the build, or without the step →
+    `the_release_build_carries_no_lab_feature`. The artefact step's own
+    script, run locally on a fake `dist/` (tarball, .deb, and the .rpm
+    through stub `rpm2cpio`/`cpio`) with this tree's binaries, passes, and
+    fails for an agent that reports `debug-trigger,test-privileged`, an
+    agent that cannot answer, an nn-admin with `debug`, and an nn-admin
+    whose help lists no subcommand. On GitHub it is checked by a
+    pull-request run of `release.yml` or a `workflow_dispatch` on the
+    branch, neither of which publishes.
+  - Host: `cargo fmt`; clippy `--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger` and the agent with `demo-tappa5` clean;
+    `cargo test -q --workspace` 2,585 passed, 0 failed (21 ignored); with
+    `demo-tappa5`, `decision::` 384 passed (the demo engine test and
+    `test_actions` included) and `build_features_cli` 3 passed. actionlint
+    1.7.12 on the four workflows: clean (no shellcheck on this host). The
+    CI's `posture_demo` clippy fails on the starting tree as on this one
+    (`agent/examples/posture_demo.rs:121` lacks `argv_truncated` and
+    `filename_truncated`), the reason fixed on main.
+  - Lab: No lab probe: the composition tests build the engine as `main.rs` does; the release step's script run locally on a fake `dist/` passes on the real binaries and fails in its four negative cases; the demo gate is covered by its unit test (a root start of a `demo-tappa5` build was not run in a VM). Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.
