@@ -41,6 +41,7 @@
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
 #   deploy/lab/nn-lab.sh sensor-feasibility [BASE] # Tappa 10.9 step 0: the new sensor attach points on this kernel
 #   deploy/lab/nn-lab.sh btrfs-check      # review 55: a watched file on a btrfs subvolume is still detected
+#   deploy/lab/nn-lab.sh overlay-check    # lab PR 189: a watched file on overlayfs is detected or its boot attests it
 #   deploy/lab/nn-lab.sh open-sensor-check # Tappa 10.9 step 1: the file-open sensor on LSM file_open, end to end
 #   deploy/lab/nn-lab.sh exec-sensor-check # Tappa 10.9 step 2: the exec sensor on LSM bprm_check_security (review 61)
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
@@ -955,6 +956,17 @@ cmd_btrfs_check() {
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; bash /tmp/nn-btrfs-check.sh'
 }
 
+cmd_overlay_check() {
+    # External audit EBPF-016 (NN-AUD-267, lab PR 189;
+    # deploy/lab/overlay/overlay-check.sh): a watched credential file on an
+    # overlay mount (bind-mounted on /root/.aws) must draw NN-L-FIM-011 when
+    # read, or the boot must carry the signed `inode_identity_unverified`
+    # record naming it. Silence fails. The guest is put back as it was.
+    vm_running || die "guest is not running"
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/overlay/overlay-check.sh" "$GUEST:/tmp/nn-overlay-check.sh"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; bash /tmp/nn-overlay-check.sh'
+}
+
 cmd_tamper_check() {
     # Structured adversarial check of the anti-tamper (Tappa 10.8): every
     # documented neutralisation attempt, with expected outcome and evidence.
@@ -1479,6 +1491,7 @@ case "${1:-help}" in
     release-check) shift; cmd_release_check "$@" ;;
     sensor-feasibility) shift; cmd_sensor_feasibility "$@" ;;
     btrfs-check)   cmd_btrfs_check ;;
+    overlay-check) cmd_overlay_check ;;
     open-sensor-check) cmd_open_sensor_check ;;
     exec-sensor-check) cmd_exec_sensor_check ;;
     dns-sensor-check) cmd_dns_sensor_check ;;

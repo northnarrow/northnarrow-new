@@ -61,6 +61,63 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, anti-tamper bootstrap trust and honest health
+  (Low ATP-007 NN-AUD-260, ATP-015 NN-AUD-263, ATP-016 NN-AUD-264,
+  ATP-017 NN-AUD-265, EBPF-016 NN-AUD-267, EBPF-020 NN-AUD-271; lab PR
+  189). ATP-007, worse than reported: `ensure_state_dir` created, stat-ed,
+  chmodded and chowned `/var/lib/northnarrow` by path, so a symbolic link
+  planted there by a root before the agent started gave its target mode
+  0700, owner root and — since lab PR 152 — the state directory's NOCREATE:
+  a link to `/etc` would have refused every new file in `/etc` outside a
+  trusted-installer window. The agent now refuses to start when the state
+  directory, or one of its own entries in it (`quarantine`,
+  `quarantine/vault`, `detections`, the chain logs), is a link — checked
+  first thing at boot, before any bootstrap writes there, and again by the
+  attach — naming the link and pointing to a bind mount; the directory is
+  opened `O_NOFOLLOW | O_DIRECTORY` and repaired on the descriptor
+  (`fchmod`, `fchown`), and the key registered is that descriptor's
+  `fstat`. The same class elsewhere: the bpffs pin root as a link is not
+  chmodded, pinned into or registered (`pin_root_refusal`), the
+  `/etc/northnarrow` and unit drop-in directories as links are not
+  registered, and each refuses the start as a failed step; the agent's
+  files are keyed with `lstat` (a `fim_baseline.jsonl -> /etc/passwd`
+  write-denied `/etc/passwd`). ATP-016: the health line subtracted every
+  failure entry from the expected hooks, so an FS bootstrap failure (13
+  deny hooks absent) read "15 of 16 attached"; missing hooks and failed
+  steps that are not hooks are now kept apart (`DenyHealth`), a bootstrap
+  failure counts every FS deny hook (and the optional ones the kernel has)
+  — "3 of 16" — a BPF guard that refuses nothing counts once, and the
+  `DENY HOOK SHORTFALL` line carries `missing=` and `infra_failed=`; the
+  fail-closed decision is unchanged. A start under
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` and missing observe hooks are now a
+  signed `subsystem_degraded` each, with what is missing. ATP-017: every
+  `link_*` entry of the pin root went into the 64-entry `OWN_PIN_NAMES`,
+  so 64 planted names refused the start and a planted name equal to
+  another product's pin denied that product's `OBJ_GET`; only pins whose
+  link runs one of the agent's programs are registered, every other one is
+  a WARN and a signed `integrity_drift` (`foreign_pin`), neither registered
+  nor removed. EBPF-016: on overlayfs, FUSE and NFS the agent cannot vouch
+  that `stat()` and the hooks see the same `(dev, ino)`, and a mismatch was
+  silent both ways; every protected or watched path is checked with
+  `statfs()`, and a boot with any on such a filesystem logs a WARN and one
+  signed `subsystem_degraded` (`reason: inode_identity_unverified`, the
+  filesystems, counts, first paths); `KERNEL_COMPATIBILITY.md` documents
+  the limit, and `nn-lab.sh overlay-check` (modelled on `btrfs-check`)
+  fails on silence. EBPF-020: `attach_lsm`, which adopted any pinned link
+  that re-opened, and `fresh_attach_and_pin`, its only user, are removed
+  from `antitamper-bpf` and its re-export; `reattach_fresh` is the one
+  pinned LSM attach. ATP-015: the doc comments of the observer
+  register/evict say where the no-bpffs mode is logged and that evict has
+  nothing to withdraw. No eBPF program changes. **Regressions / changes:**
+  an install whose state directory is a symbolic link does not start (use
+  a bind mount; upgrade notes §2), and neither does one whose
+  `/etc/northnarrow`, unit drop-in directory or bpffs pin root is a link;
+  the `DENY HOOK SHORTFALL` line has two new fields and the refusal reads
+  "N of M deny hooks attached and armed; missing: …; K protection step(s)
+  failed: …"; a degraded start, missing observe hooks, foreign `link_*`
+  pins and paths on overlayfs, FUSE or NFS each add signed records (a host
+  with an overlay root gets one at every boot); `attach_lsm` and
+  `fresh_attach_and_pin` are no longer part of `antitamper-bpf`.
 - Lab follow-ups of lab PRs 176 and 180, and nn-admin on a closed pipe
   (lab PR 188). A stale `NORTHNARROW_COMBAT` chain torn down at start was
   signed (`combat_reconcile`), but its compatibility line in

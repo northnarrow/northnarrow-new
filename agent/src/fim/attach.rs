@@ -369,6 +369,9 @@ pub fn populate_watched_paths(
                     cred_watched += 1;
                 }
                 inode_map.insert(key, path_str.clone());
+                // External audit EBPF-016: a watch on overlayfs, FUSE or NFS
+                // goes into the boot's signed identity record.
+                crate::fs_type::note_identity(path);
             }
             Err(e) => {
                 warn!(
@@ -395,6 +398,7 @@ pub fn populate_watched_paths(
                     inode_map.insert_as(*hop_key, path_str.clone(), WatchClass::ChainHop);
                     hops.push(*hop_key);
                     chain_entries += 1;
+                    crate::fs_type::note_identity(hop);
                 }
                 Err(e) => warn!(
                     error = %e,
