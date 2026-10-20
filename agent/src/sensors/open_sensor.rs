@@ -150,6 +150,9 @@ pub struct RuleSet {
     /// Rules that could not be registered (a file two levels below a
     /// missing directory): logged, not fatal.
     pub skipped: Vec<String>,
+    /// Carve-outs refused because a symbolic link is on their path, with
+    /// the link (external audit POS-010, lab PR 198): a WARN when new.
+    pub refused: Vec<String>,
 }
 
 /// The inputs of [`RuleSet::build`].
@@ -307,7 +310,7 @@ impl RuleSet {
             set.add_path(p, FILE_PERSIST, TREE_PERSIST);
         }
         for p in &inputs.carveout {
-            set.add_path(p, 0, TREE_CARVEOUT);
+            set.add_carveout(p);
         }
         let probe = format!("{}/", inputs.probe_dir.display());
         set.add_path(&probe, 0, CHILDREN_PROBE);
@@ -338,6 +341,46 @@ impl RuleSet {
             *set.names.entry(name_key(name, parent)).or_default() |= bits;
         }
         set
+    }
+
+    /// One mass-write carve-out: a directory rule (its subtree), or, while
+    /// it is missing, a rule under its nearest existing ancestor by the
+    /// first missing name. External audit POS-010 (lab PR 198): the path
+    /// is walked from `/` without following a symbolic link. `metadata`
+    /// followed them, every minute: a user who replaced the directory of a
+    /// signed carve-out under their home (`~/.claude/`) with a link to `~`
+    /// or `/` moved the carve-out to that tree (in a sticky directory such
+    /// as `/tmp`, `fs.protected_symlinks` keeps root from following another
+    /// user's link, where it is on). A link on the way refuses the
+    /// carve-out (the tree is counted); a file or a non-directory on the
+    /// way is `skipped`.
+    fn add_carveout(&mut self, rule: &str) {
+        match place_carveout(Path::new(rule)) {
+            Ok(CarveoutPlace::Dir(m)) => {
+                *self.inodes.entry(key_of(&m)).or_default() |= TREE_CARVEOUT;
+            }
+            Ok(CarveoutPlace::Missing {
+                parent,
+                name,
+                direct,
+            }) => {
+                let bits = if direct {
+                    TREE_CARVEOUT
+                } else {
+                    TREE_CARVEOUT & SUBTREE
+                };
+                let key = ChildRuleKey {
+                    parent: key_of(&parent),
+                    name: name32(&name),
+                };
+                *self.children.entry(key).or_default() |= bits;
+            }
+            Ok(CarveoutPlace::Link(at)) => self.refused.push(format!(
+                "{rule}: `{}` is a symbolic link — a carve-out never follows one",
+                at.display()
+            )),
+            Ok(CarveoutPlace::NotDir) | Err(_) => self.skipped.push(rule.to_string()),
+        }
     }
 
     /// One path rule. The posture's lists are path prefixes; the kernel
@@ -414,6 +457,105 @@ impl RuleSet {
             parent = p.parent();
         }
         self.skipped.push(rule.to_string());
+    }
+}
+
+/// Where a carve-out lands ([`RuleSet::add_carveout`]).
+#[derive(Debug)]
+enum CarveoutPlace {
+    /// The directory itself.
+    Dir(std::fs::Metadata),
+    /// Its nearest existing ancestor and the first missing name below it;
+    /// `direct` when that name is the carve-out's own.
+    Missing {
+        parent: std::fs::Metadata,
+        name: String,
+        direct: bool,
+    },
+    /// No directory rule can hold it: a file, a non-directory or a `..`
+    /// on the way, a name that is not UTF-8.
+    NotDir,
+    /// A symbolic link at this prefix of the path.
+    Link(PathBuf),
+}
+
+/// Walk `path` from `/`, one component at a time, each opened `O_PATH |
+/// O_NOFOLLOW` below the last and checked on its own fd (no window
+/// between the check and the inode taken).
+fn place_carveout(path: &Path) -> std::io::Result<CarveoutPlace> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let open = |at: libc::c_int, name: &std::ffi::CStr| -> std::io::Result<std::fs::File> {
+        // SAFETY: openat on a NUL-terminated name; the fd is ours on success.
+        let fd = unsafe {
+            libc::openat(
+                at,
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a fresh fd returned by openat.
+        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    };
+    let mut names = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(n) => names.push(n),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => return Ok(CarveoutPlace::NotDir),
+        }
+    }
+    let mut cur = open(libc::AT_FDCWD, c"/")?;
+    let mut walked = PathBuf::from("/");
+    for (i, n) in names.iter().enumerate() {
+        walked.push(n);
+        let c = CString::new(n.as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let next = match open(cur.as_raw_fd(), &c) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = n.to_str() else {
+                    return Ok(CarveoutPlace::NotDir);
+                };
+                return Ok(CarveoutPlace::Missing {
+                    parent: cur.metadata()?,
+                    name: name.to_string(),
+                    direct: i + 1 == names.len(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        let m = next.metadata()?;
+        if m.file_type().is_symlink() {
+            return Ok(CarveoutPlace::Link(walked));
+        }
+        if !m.is_dir() {
+            return Ok(CarveoutPlace::NotDir);
+        }
+        cur = next;
+    }
+    Ok(CarveoutPlace::Dir(cur.metadata()?))
+}
+
+/// External audit POS-010 (lab PR 198): a WARN for each carve-out `next`
+/// refuses that `previous` did not (at boot every one; then once, not at
+/// every refresh).
+pub fn warn_refused_carveouts(previous: Option<&RuleSet>, next: &RuleSet) {
+    for r in &next.refused {
+        if previous.is_some_and(|p| p.refused.contains(r)) {
+            continue;
+        }
+        warn!(
+            carveout = %r,
+            "file-open sensor: mass-write carve-out NOT applied — a symbolic link on its path \
+             (the mass-write arm counts that tree)"
+        );
     }
 }
 
@@ -642,6 +784,7 @@ pub fn apply_rules(maps: &mut impl RuleMaps, set: &RuleSet, previous: Option<&Ru
     let mut out = Applied {
         in_maps: RuleSet {
             skipped: set.skipped.clone(),
+            refused: set.refused.clone(),
             ..RuleSet::default()
         },
         ..Applied::default()
@@ -1356,6 +1499,7 @@ pub fn refresh(
     if next == *current {
         return None;
     }
+    warn_refused_carveouts(Some(current), &next);
     let applied = maps.apply(&next, Some(current));
     info!(
         inodes = next.inodes.len(),
@@ -1731,7 +1875,8 @@ mod tests {
     #[test]
     fn carveouts_are_trees_with_or_without_the_final_slash() {
         let t = tempfile::tempdir().unwrap();
-        let root = t.path();
+        // canonical: a carve-out never follows a link (POS-010)
+        let root = &std::fs::canonicalize(t.path()).unwrap();
         std::fs::create_dir_all(root.join("state/tool")).unwrap();
         std::fs::write(root.join("state/app.log"), "").unwrap();
         let p = |s: &str| root.join(s).display().to_string();
@@ -1750,6 +1895,62 @@ mod tests {
         assert_eq!(set.children.get(&later), Some(&TREE_CARVEOUT));
         // a carve-out naming a file cannot be a directory class
         assert_eq!(set.skipped, vec![p("state/app.log")]);
+        assert!(set.refused.is_empty(), "{:?}", set.refused);
+    }
+
+    /// External audit POS-010 (lab PR 198): a user who replaces the
+    /// directory of a signed carve-out (`~/.claude/`) with a link to
+    /// their home or `/` moved the carve-out to that tree at the
+    /// next refresh (`metadata` follows links). A link anywhere on the path
+    /// now refuses it, and the tree it points to gets no carve-out.
+    #[test]
+    fn a_carveout_never_follows_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        std::fs::create_dir_all(root.join("home/u/Documents")).unwrap();
+        std::fs::create_dir_all(root.join("home/u/real-tool")).unwrap();
+        // `~/.claude` → `~`; `~/via` → `~/Documents`, a carve-out below it;
+        // `~/dangling` → a name that does not exist yet.
+        std::os::unix::fs::symlink(root.join("home/u"), root.join("home/u/.claude")).unwrap();
+        std::os::unix::fs::symlink(root.join("home/u/Documents"), root.join("home/u/via")).unwrap();
+        std::os::unix::fs::symlink(root.join("home/u/later"), root.join("home/u/dangling"))
+            .unwrap();
+        let p = |s: &str| root.join(s).display().to_string();
+        let set = RuleSet::build(&RuleInputs {
+            carveout: vec![
+                format!("{}/", p("home/u/.claude")),
+                p("home/u/via/sub"),
+                p("home/u/dangling"),
+                p("home/u/real-tool"),
+            ],
+            probe_dir: root.join("probe"),
+            ..RuleInputs::default()
+        });
+        let key = |s: &str| key_of(&std::fs::metadata(root.join(s)).unwrap());
+        assert_eq!(
+            set.inodes.get(&key("home/u")),
+            None,
+            "the home got a carve-out"
+        );
+        assert_eq!(set.inodes.get(&key("home/u/Documents")), None);
+        assert_eq!(
+            set.inodes.get(&key("home/u/real-tool")),
+            Some(&TREE_CARVEOUT)
+        );
+        assert!(
+            set.children.values().all(|b| b & TREE_CARVEOUT == 0),
+            "{:?}",
+            set.children
+        );
+        assert_eq!(set.refused.len(), 3, "{:?}", set.refused);
+        for (r, link) in set
+            .refused
+            .iter()
+            .zip(["home/u/.claude", "home/u/via", "home/u/dangling"])
+        {
+            assert!(r.contains(&format!("`{}`", p(link))), "{r}");
+        }
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
     }
 
     #[test]

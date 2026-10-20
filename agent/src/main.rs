@@ -624,8 +624,8 @@ fn start_open_sensor(
     audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
 ) {
     use northnarrow_agent::sensors::open_sensor::{
-        pump, refresh, take_ringbuf, DepthCapLog, OpenSensorMaps, RuleHealth, RuleInputs, RuleSet,
-        RULE_CAPACITY,
+        pump, refresh, take_ringbuf, warn_refused_carveouts, DepthCapLog, OpenSensorMaps,
+        RuleHealth, RuleInputs, RuleSet, RULE_CAPACITY,
     };
     if mode == FileOpenSensor::Tracepoint {
         info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
@@ -639,6 +639,7 @@ fn start_open_sensor(
         return;
     }
     let rules = RuleSet::build(&RuleInputs::from_host(carveout));
+    warn_refused_carveouts(None, &rules);
     let mut maps = match OpenSensorMaps::take(sensor.ebpf_mut()) {
         Ok(m) => m,
         Err(e) => {
@@ -1946,11 +1947,10 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
         // tooling), additive on top of the hardcoded kernel-RPC
         // pseudo-FS prefixes. See SECURITY note in
         // mass_write_overlay.rs — DO NOT add /home, /var, /tmp
-        // wholesale.
-        let mass_write_extras =
-            northnarrow_agent::posture::mass_write_overlay::load_mass_write_carveout_extras(
-                &mass_write_overlay,
-            );
+        // wholesale (external audit POS-010: the loader refuses them).
+        // Parsed once, above, for the sensor and the posture together:
+        // its WARNs (refused entries, the accepted list) are said once.
+        let mass_write_extras = open_sensor_carveout.clone();
         // BUG-032 — escalation allowlist (count-filter for exfil/lateral).
         // Missing file = empty (fail-secure). Loaded once at boot;
         // reload-on-restart for beta.

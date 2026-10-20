@@ -61,6 +61,65 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, posture overlay validation (Low POS-010
+  NN-AUD-306, POS-011 NN-AUD-307; lab PR 198). The two signed overlays
+  that widen a posture exemption are checked for breadth, not only for
+  shape: a signature proves who wrote an entry, not that it is narrow.
+  POS-010 (the part left after Tappa 10.8 and LLMR-013):
+  `mass-write-carveout.local` accepted any absolute prefix, `/` included,
+  and logged an INFO count, so a signed typo switched the ransomware arm
+  off. An entry is refused (WARN `mass-write overlay: entry REFUSED — not
+  applied`, with the path, the line and a reason that names it; the rest
+  of the file applies) when, its repeated `/` folded, it is `/`, has a
+  `.` or `..` component, is a top-level directory (`/home`, `/root`,
+  `/srv`, `/var`, `/tmp`, `/media`, `/mnt`, `/data`, `/opt`, `/usr` are
+  named as data roots; any other is refused too), is a whole user's tree
+  (`/home/<user>`, `/run/user/<uid>`), or covers `/var/tmp`, `/dev/shm`
+  or `/run/user`, the shared trees the arm counts on purpose. An entry
+  without its final `/` is judged as the name prefix the posture matches
+  (`/home/al`, `/var/t`). What is accepted is one WARN (`ransomware-shape
+  detection is OFF under these carve-outs`, the name-prefix entries
+  listed apart), said once: `main.rs` parsed the overlay twice (the
+  sensor and the posture), now once. An accepted entry's repeated `/` is
+  folded (the posture compares it with kernel paths). POS-011:
+  `escalation-allow.local` accepted the comm `*` with `0.0.0.0/0`, with
+  no warning; any `/0` network is refused, and the comm `*` (any
+  process) with a network wider than /16 (IPv4) or /32 (IPv6); `exfil *
+  140.82.112.0/20 443` stays. Refusals carry their line (`line N: …`) and
+  quote the entry. Both checks are the loaders' own, so `nn-admin config
+  overlay set` and `sign` refuse such a file, naming the line and the
+  entry (`validate_content` called a copy of the mass-write rules; it
+  now calls the loader's `parse_text`). Found while doing it: the kernel
+  file-open sensor placed a carve-out with `metadata`, which follows
+  links, at boot and at every refresh (a minute), so a user who replaced
+  the directory of a signed carve-out in their home (`~/.claude/`) with
+  a link to `~` or `/` moved the carve-out onto that tree. A carve-out is
+  now walked from `/` one component at a time (`O_PATH | O_NOFOLLOW`,
+  each checked on its own fd); a link on the way refuses it (WARN
+  `file-open sensor: mass-write carve-out NOT applied — a symbolic link
+  on its path`, once per new refusal) and that tree is counted.
+  **Regressions:** an entry of these shapes in an overlay signed before
+  stops applying (the overlay loads, the entry is a WARN at boot), so the
+  writes or connections it exempted count again, and `config overlay
+  set|sign` refuses the file until the entry is narrowed; a carve-out
+  reached through a symbolic link (`/var/run/…`, a tool directory that is
+  a link) no longer applies in the kernel sensor (it never matched in
+  tracepoint mode): list the directory it points to; journal searches
+  for `mass-write overlay: load complete` (now only when nothing is
+  added) and `escalation-allow: skipping malformed entry` (now `entry
+  REFUSED — not applied`). Upgrade notes §6. Tests: `mass_write_overlay`
+  `root_and_data_roots_are_rejected` (the triage's overlay keeps only
+  `/var/lib/devtool/cache/`), `too_broad_entries_are_refused_by_name`
+  (19 shapes, the entry and the line named), `narrow_entries_still_load`
+  (the BUG-017 dev-host overlay, `/srv/build/`, tool directories below
+  the shared trees); `triggers`
+  `a_refused_carveout_leaves_the_mass_write_arm_on` (a burst in
+  `/home/alice/Documents` still raises ConfirmedIntrusion);
+  `escalation_allow` `wildcard_with_default_route_is_rejected`,
+  `narrow_wildcard_entry_still_parses`; `overlay_auth`
+  `content_validation_uses_the_loader_rules` (extended); `open_sensor`
+  `a_carveout_never_follows_a_symlink`. Two existing loader tests used
+  `/ok/` and `/keep/`, now refused: `/ok/dir/`, `/keep/me/`.
 - External audit, Wave 3, FIM pipeline and signed-chain hygiene (Low
   FIMR-015 NN-AUD-289, FIMR-016 NN-AUD-290, FIMP-012 NN-AUD-291, FIMP-013
   NN-AUD-292, FIMP-014 NN-AUD-293; lab PR 197). FIMP-012: the FIM drain

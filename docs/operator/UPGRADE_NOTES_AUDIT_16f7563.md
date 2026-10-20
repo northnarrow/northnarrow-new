@@ -38,6 +38,10 @@ and the tracker note have the details and the lab evidence.
 10. `iptables`, `ip6tables`, `nft` and `rpm` must be the distribution's,
     in `/usr/sbin`, `/usr/bin`, `/sbin` or `/bin`: a copy only under
     `/usr/local` is no longer run (§6).
+11. A too-broad entry of `mass-write-carveout.local` (`/`, `/home`,
+    `/home/<user>`, `/var/tmp`, …) or `escalation-allow.local` (`/0`, the
+    comm `*` over a wide network) is no longer applied, and `nn-admin
+    config overlay set` refuses the file: narrow it (§6).
 
 ## 1. Installation and upgrade
 
@@ -735,6 +739,36 @@ Now **killed, or answered, where they were recorded or missed**:
   build whose storage is elsewhere (`storage.conf`), under
   `fuse-overlayfs`, or in an LXD pool can raise `ConfirmedIntrusion`; a
   user's own `mandb` that rewrites many files raises `ConfirmedIntrusion`.
+- **Posture overlays too broad to apply** (NN-AUD-306 POS-010,
+  NN-AUD-307 POS-011, lab PR 198). `mass-write-carveout.local` refuses
+  an entry that is `/`, has a `.` or `..` component, is a top-level
+  directory (`/home`, `/root`, `/srv`, `/var`, `/tmp`, `/media`, `/mnt`,
+  `/data`, `/opt`, `/usr`, any other), a whole user's tree
+  (`/home/<user>`, `/run/user/<uid>`), or covers `/var/tmp`, `/dev/shm`
+  or `/run/user`; an entry without its final `/` is a name prefix and is
+  judged as one (`/home/al` covers `/home/alice`, `/var/t` covers
+  `/var/tmp`). `escalation-allow.local` refuses any `/0` network and the
+  comm `*` with a network wider than /16 (IPv4) or /32 (IPv6) (`exfil *
+  140.82.112.0/20 443` stays). **Regression:** such an entry in an
+  overlay signed before the upgrade stops applying: the overlay still
+  loads, the entry is a WARN at boot (`mass-write overlay: entry REFUSED
+  — not applied`, `escalation-allow: entry REFUSED — not applied`, with
+  the line and the reason), and the writes or connections it exempted
+  count again (ENGAGED; COMBAT with a second signal). `nn-admin config
+  overlay set|sign` refuses the file, naming the line and the entry,
+  until the entry is narrowed. In the kernel file-open sensor (the
+  default), a carve-out with a symbolic link on its path is not applied
+  (`file-open sensor: mass-write carve-out NOT applied — a symbolic link
+  on its path`): list the directory the link points to (`/run/…`, not
+  `/var/run/…`). The accepted carve-outs are one WARN at boot
+  (`ransomware-shape detection is OFF under these carve-outs`) instead
+  of an INFO count (`mass-write overlay: load complete` only when
+  nothing is added); the escalation-allow WARN was `skipping malformed
+  entry`: **update journal searches**. **Action:** before or after the
+  upgrade, read both files (`grep -v '^#'
+  /etc/northnarrow/mass-write-carveout.local
+  /etc/northnarrow/escalation-allow.local`), narrow an entry of these
+  shapes, sign the file again (`config overlay set`, then a restart).
 - **Telemetry loss** (NN-AUD-184 SNS-001, NN-AUD-190 SNS-008, NN-AUD-191
   SNS-009, lab PR 128): a security ring losing more than 64 events in 10 s
   raises the posture to ALERTED (`TelemetryLoss`), never as corroboration

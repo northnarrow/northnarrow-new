@@ -213,25 +213,12 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         OverlayKind::NetflowJa3Blocklist => {
             crate::net::blocklist::parse_ja3_overlay_text(&label, text)?;
         }
+        // External audit POS-010 (lab PR 198): the loader's own line
+        // rules, a too-broad entry included, named with its line.
         OverlayKind::MassWriteCarveout => {
-            for (i, raw) in text.lines().enumerate() {
-                let line = raw.split('#').next().unwrap_or("").trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if line.starts_with('-') {
-                    return Err(anyhow!(
-                        "{label}:{}: `-` has no effect in this overlay",
-                        i + 1
-                    ));
-                }
-                let entry = line.strip_prefix('+').unwrap_or(line).trim();
-                if !entry.starts_with('/') {
-                    return Err(anyhow!(
-                        "{label}:{}: entry must be an absolute path prefix",
-                        i + 1
-                    ));
-                }
+            let (_, refused) = crate::posture::mass_write_overlay::parse_text(text);
+            if let Some((lineno, why)) = refused.first() {
+                return Err(anyhow!("{label}:{lineno}: {why}"));
             }
         }
         OverlayKind::EscalationAllow => {
@@ -1186,6 +1173,21 @@ mod tests {
         assert!(validate_content(OverlayKind::NetflowJa3Blocklist, "+not-a-hash\n").is_err());
         assert!(validate_content(OverlayKind::MassWriteCarveout, "+/srv/build/\n").is_ok());
         assert!(validate_content(OverlayKind::MassWriteCarveout, "-/srv\n").is_err());
+        // External audit POS-010 / POS-011: a too-broad entry is refused
+        // before it is signed or stored, named with its line.
+        let e = validate_content(OverlayKind::MassWriteCarveout, "+/srv/build/\n+/home/\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(":2:") && e.contains("`/home/`"), "{e}");
+        let e = validate_content(OverlayKind::EscalationAllow, "exfil * 0.0.0.0/0 443\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("line 1") && e.contains("/0"), "{e}");
+        assert!(validate_content(
+            OverlayKind::EscalationAllow,
+            "exfil * 140.82.112.0/20 443\n"
+        )
+        .is_ok());
         assert!(
             validate_content(OverlayKind::ProcessCommAllowlist, "# comment\n+backupd\n").is_ok()
         );
