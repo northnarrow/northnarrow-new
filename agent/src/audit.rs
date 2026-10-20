@@ -1190,34 +1190,183 @@ pub enum AuditVerifyError {
         idx: usize,
         reason: crate::chain_anchor::SeqBreak,
     },
+    /// External audit MAIN-014 (NN-AUD-256, lab PR 190): a line of the file
+    /// that is not an audit row — cut, not JSON, not UTF-8, or over the line
+    /// cap ([`crate::verify_lines::MAX_VERIFY_LINE_BYTES`]). The chain is
+    /// broken there; `line` is 1-based in the file, `verified` the rows
+    /// before it that verified. It was an I/O-style error (exit 1).
+    #[error("line {line}: not an audit row ({reason}); {verified} row(s) verified before it")]
+    UnreadableLine {
+        line: u64,
+        verified: usize,
+        reason: String,
+    },
+}
+
+/// External audit MAIN-014 (NN-AUD-256, lab PR 190): the audit chain
+/// verified one row at a time, in file order — [`verify_chain`] over a
+/// slice, [`verify_chain_file`] over a file without keeping its rows. What
+/// it keeps is the last `entry_hash`, the row-number state and counters.
+pub struct ChainVerifier<'k> {
+    pubkey: &'k VerifyingKey,
+    prev: String,
+    seq: crate::chain_anchor::RowSeq,
+    rows: usize,
+    first_numbered: Option<usize>,
+    last_seq: Option<u64>,
+}
+
+impl<'k> ChainVerifier<'k> {
+    /// A chain that starts at [`GENESIS_PREV_HASH`].
+    pub fn new(pubkey: &'k VerifyingKey) -> Self {
+        Self {
+            pubkey,
+            prev: GENESIS_PREV_HASH.to_string(),
+            seq: crate::chain_anchor::RowSeq::default(),
+            rows: 0,
+            first_numbered: None,
+            last_seq: None,
+        }
+    }
+
+    /// The next row: its number, its link to the row before, its hash and
+    /// signature. On `Err` the chain is broken at this row and the verifier
+    /// must not be fed further.
+    pub fn push(&mut self, entry: &AuditEntry) -> Result<(), AuditVerifyError> {
+        let idx = self.rows;
+        self.seq
+            .push(entry.seq)
+            .map_err(|reason| AuditVerifyError::Sequence { idx, reason })?;
+        if entry.prev_hash != self.prev {
+            return Err(AuditVerifyError::PrevHashMismatch {
+                idx,
+                got: entry.prev_hash.clone(),
+                expected: self.prev.clone(),
+            });
+        }
+        verify_entry(idx, entry, self.pubkey)?;
+        self.prev.clone_from(&entry.entry_hash);
+        if entry.seq.is_some() {
+            self.first_numbered.get_or_insert(idx);
+            self.last_seq = entry.seq;
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    /// Rows verified.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Position of the first numbered row (rows before it are in the format
+    /// from before lab PR 160).
+    pub fn first_numbered(&self) -> Option<usize> {
+        self.first_numbered
+    }
+
+    /// `seq` of the last numbered row verified.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.last_seq
+    }
 }
 
 /// Replay `entries` in order, recomputing each `entry_hash` and
 /// checking each `agent_sig` against `pubkey`. Returns `Ok(())` on
-/// a fully-intact chain. Used by `nn-admin audit verify` and
-/// `nn-admin chain verify` (`AuditLog::open` does not call it).
+/// a fully-intact chain. `nn-admin audit verify` and `nn-admin chain
+/// verify` read the file through [`verify_chain_file`], the same
+/// [`ChainVerifier`] (`AuditLog::open` does not call it).
 ///
 /// External audit NN-AUD-108: rows without `seq` (written before lab PR
 /// 160) verify as before; from the first numbered row on, every row must
 /// carry its position (`seq == idx`), so a row removed or inserted before
 /// the end breaks the chain even where the hashes would still link.
 pub fn verify_chain(entries: &[AuditEntry], pubkey: &VerifyingKey) -> Result<(), AuditVerifyError> {
-    let mut expected_prev = GENESIS_PREV_HASH.to_string();
-    let mut seq = crate::chain_anchor::RowSeq::default();
-    for (idx, entry) in entries.iter().enumerate() {
-        seq.push(entry.seq)
-            .map_err(|reason| AuditVerifyError::Sequence { idx, reason })?;
-        if entry.prev_hash != expected_prev {
-            return Err(AuditVerifyError::PrevHashMismatch {
-                idx,
-                got: entry.prev_hash.clone(),
-                expected: expected_prev,
-            });
-        }
-        verify_entry(idx, entry, pubkey)?;
-        expected_prev = entry.entry_hash.clone();
+    let mut v = ChainVerifier::new(pubkey);
+    for entry in entries {
+        v.push(entry)?;
     }
     Ok(())
+}
+
+/// What [`verify_chain_file`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainFileReport {
+    /// Rows verified: all of them when `broken` is `None`, those before the
+    /// break otherwise.
+    pub rows: usize,
+    /// Position of the first numbered row.
+    pub first_numbered: Option<usize>,
+    /// `seq` of the last numbered row verified.
+    pub last_seq: Option<u64>,
+    /// The `entry_hash` asked for is one of the rows verified.
+    pub head_seen: bool,
+    /// Where and why the chain is broken (the first break; the file is not
+    /// read past it).
+    pub broken: Option<AuditVerifyError>,
+}
+
+/// External audit MAIN-014 (NN-AUD-256, lab PR 190): verify the audit chain
+/// in `path` in one pass, one bounded line in memory at a time
+/// ([`crate::verify_lines`]); `head`: an `entry_hash` whose presence is
+/// reported in [`ChainFileReport::head_seen`]. A missing file is an empty
+/// chain. A line that is not a row breaks the chain there
+/// ([`AuditVerifyError::UnreadableLine`]), like a row that does not
+/// verify. `Err` only when the file cannot be read.
+pub fn verify_chain_file(
+    path: &Path,
+    pubkey: &VerifyingKey,
+    head: Option<&str>,
+) -> std::io::Result<ChainFileReport> {
+    let mut report = ChainFileReport {
+        rows: 0,
+        first_numbered: None,
+        last_seq: None,
+        head_seen: false,
+        broken: None,
+    };
+    let f = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(e),
+    };
+    let mut v = ChainVerifier::new(pubkey);
+    let mut lines = crate::verify_lines::VerifyLines::new(BufReader::new(f));
+    while let Some(line) = lines.next_line()? {
+        if line.is_empty() {
+            continue;
+        }
+        let entry = line.text().and_then(|t| {
+            serde_json::from_str::<AuditEntry>(t).map_err(|e| {
+                if line.newline {
+                    format!("not a row: {e}")
+                } else {
+                    format!("the last line, cut short (no newline): {e}")
+                }
+            })
+        });
+        let pushed = match entry {
+            Ok(entry) => v
+                .push(&entry)
+                .map(|()| head == Some(entry.entry_hash.as_str())),
+            Err(reason) => Err(AuditVerifyError::UnreadableLine {
+                line: line.number,
+                verified: v.rows(),
+                reason,
+            }),
+        };
+        match pushed {
+            Ok(seen) => report.head_seen |= seen,
+            Err(e) => {
+                report.broken = Some(e);
+                break;
+            }
+        }
+    }
+    report.rows = v.rows();
+    report.first_numbered = v.first_numbered();
+    report.last_seq = v.last_seq();
+    Ok(report)
 }
 
 /// One entry on its own (external audit LLMR-014): its `entry_hash`
@@ -1838,6 +1987,86 @@ mod tests {
             verify_chain(&all, &pk),
             Err(AuditVerifyError::Sequence { idx: 2, .. })
         ));
+    }
+
+    /// External audit MAIN-014 (NN-AUD-256, lab PR 190): the streaming file
+    /// verifier (`audit verify`, `chain verify`) and [`verify_chain`] over a
+    /// slice are the same [`ChainVerifier`]: on a chain of rows from before
+    /// lab PR 160 then numbered rows, and on each kind of break, they
+    /// return the same result, and the file verifier counts the rows before
+    /// the break. The file is only read.
+    #[test]
+    fn the_file_verifier_agrees_with_verify_chain_on_every_break() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        write_legacy_rows(&log_path, &key, 3);
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        for i in 0..3 {
+            log.append(sample_draft(10 + i)).unwrap();
+        }
+        drop(log);
+        let intact = rows(&log_path);
+        let before = fs::read(&log_path).unwrap();
+        let r = verify_chain_file(&log_path, &pk, Some(&intact[5].entry_hash)).unwrap();
+        assert_eq!(
+            r,
+            ChainFileReport {
+                rows: 6,
+                first_numbered: Some(3),
+                last_seq: Some(5),
+                head_seen: true,
+                broken: None,
+            }
+        );
+        assert_eq!(fs::read(&log_path).unwrap(), before, "read only");
+        assert!(
+            !verify_chain_file(&log_path, &pk, Some("00"))
+                .unwrap()
+                .head_seen
+        );
+
+        type Tamper = fn(&mut Vec<AuditEntry>);
+        let tampers: [(&str, Tamper); 5] = [
+            ("legacy row removed", |v| {
+                v.remove(1);
+            }),
+            ("numbered row removed", |v| {
+                v.remove(4);
+            }),
+            ("payload changed", |v| {
+                v[2].result = "failure: rewritten".into()
+            }),
+            ("signature of another row", |v| {
+                v[5].agent_sig = v[4].agent_sig.clone();
+            }),
+            ("numbered row without seq", |v| v[4].seq = None),
+        ];
+        let damaged = log_path.with_extension("damaged");
+        for (what, tamper) in tampers {
+            let mut v = intact.clone();
+            tamper(&mut v);
+            let body: String = v
+                .iter()
+                .map(|e| format!("{}\n", serde_json::to_string(e).unwrap()))
+                .collect();
+            fs::write(&damaged, body).unwrap();
+            let want = verify_chain(&v, &pk).expect_err(what);
+            let got = verify_chain_file(&damaged, &pk, None).unwrap();
+            assert_eq!(got.broken.as_ref(), Some(&want), "{what}");
+            let at = match want {
+                AuditVerifyError::PrevHashMismatch { idx, .. }
+                | AuditVerifyError::EntryHashMismatch { idx, .. }
+                | AuditVerifyError::SignatureInvalid { idx }
+                | AuditVerifyError::MalformedField { idx, .. }
+                | AuditVerifyError::Sequence { idx, .. } => idx,
+                AuditVerifyError::UnreadableLine { .. } => unreachable!("{what}"),
+            };
+            assert_eq!(got.rows, at, "{what}: rows verified before the break");
+        }
+        // A missing file is an empty chain.
+        let none = verify_chain_file(&log_path.with_extension("none"), &pk, None).unwrap();
+        assert_eq!((none.rows, none.broken), (0, None));
     }
 
     /// External audit NN-AUD-108 / NN-AUD-174: a numbered row's hash is

@@ -20,6 +20,12 @@
 //!   (NEW in Tappa 8 A9 per design §5.3)
 //! - 7  shutdown: role check failed (key valid but lacks `shutdown`)
 //!   (NEW in Tappa 8 A9 per design §5.3)
+//! - 8  evidence missing or altered: `audit verify` (a row that does not
+//!   verify, a line that is not a row, a head not reached), `chain verify`
+//!   (any BROKEN line; every chain is still reported), `audit read` (lines
+//!   that are not audit rows were skipped and named; every row was
+//!   printed; external audit MAIN-014, lab PR 190). See
+//!   docs/operator/EVIDENCE_CHAINS.md, "Exit codes of the verifiers".
 //! - 9  canary burn/refresh: no such canary; response release/restore:
 //!   the agent verified the request and did nothing (reason printed)
 //! - 141 stdout (or stderr) closed before everything was written —
@@ -45,7 +51,7 @@ use northnarrow_agent::admin_cli::{
     CanaryListOutcome, CanaryRefreshOutcome, DetectionSetStatusOutcome, ExpectedHead,
     FimBaselineOutcome, FimReportOutcome, FimStatusOutcome, ForcePostureOutcome, NetJsonlOutcome,
     NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
-    TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome,
+    TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome, AUDIT_READ_SKIPS_LISTED,
 };
 
 /// Lab follow-up (lab PR 188): the exit status when stdout (or stderr) was
@@ -689,6 +695,11 @@ enum AuditCmd {
     /// kernel (SO_PEERCRED); `client_comm` is the name the connecting
     /// process gave itself, which any process chooses; `client_exe`
     /// (rows from lab PR 179 on) is the program the kernel says it ran.
+    ///
+    /// A line that is not an audit row (cut, not JSON, not UTF-8, over
+    /// 16 MiB) is skipped and named on stderr with its line number; every
+    /// row before and after it is printed, and the exit code is 8. The
+    /// rows are not verified here: `audit verify` does that.
     Read {
         /// Path to the audit log file (default
         /// /etc/northnarrow/audit.log).
@@ -707,12 +718,16 @@ enum AuditCmd {
     },
 
     /// Replay the chain in `--from <path>` through
-    /// [`northnarrow_agent::audit::verify_chain`]. Loads the
+    /// [`northnarrow_agent::audit::verify_chain_file`]. Loads the
     /// verifying key either from `--agent-pubkey <hex>` (off-host
     /// verification with the pubkey conveyed out-of-band) or from
     /// the local `--agent-sig-key <path>` (default
     /// /etc/northnarrow/agent.sig.key — zero-config on the agent
     /// host, requires sudo to read the mode-0400 file).
+    ///
+    /// Exit 8 at the first row that does not verify or the first line
+    /// that is not a row, named with its line number and the rows
+    /// verified before it; one pass, one line in memory at a time.
     Verify {
         /// Path to a JSONL chain file (export from `audit read
         /// --json` or the on-disk log itself).
@@ -1421,12 +1436,31 @@ fn main() -> ExitCode {
         Cmd::Audit {
             sub: AuditCmd::Read { path, since, json },
         } => match run_audit_read(&path, since.as_deref(), json) {
-            Ok(n) => {
+            Ok(r) => {
                 // Summary goes to stderr so `audit read --json |
                 // jq` keeps a clean JSONL stream on stdout. Match
                 // the `audit: ...` prefix convention from §5.3.
-                eprintln!("audit: {n} entries read from {}", path.display());
-                ExitCode::SUCCESS
+                eprintln!("audit: {} entries read from {}", r.rows, path.display());
+                if r.skipped > 0 {
+                    // External audit MAIN-014 (NN-AUD-256, lab PR 190):
+                    // every row was printed; the lines that are not rows
+                    // were named above. Exit 8: the file is not an intact
+                    // chain.
+                    if r.skipped > AUDIT_READ_SKIPS_LISTED {
+                        eprintln!(
+                            "audit: {} more skipped line(s) not listed",
+                            r.skipped - AUDIT_READ_SKIPS_LISTED
+                        );
+                    }
+                    eprintln!(
+                        "audit: {} line(s) skipped: not audit rows — the log is damaged; run \
+                         `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md",
+                        r.skipped
+                    );
+                    ExitCode::from(8)
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
             // Lab PR 188: `audit read | head` — the reader went.
             Err(e) if is_closed_pipe(&e) => ExitCode::from(EXIT_CLOSED_PIPE),

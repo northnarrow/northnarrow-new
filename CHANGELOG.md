@@ -61,6 +61,46 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, verifiers and forensic tools on bad input (Low
+  MAIN-014 NN-AUD-256, EVD-017 NN-AUD-280, EVD-022 NN-AUD-283; lab PR
+  190). EVD-017: a sealed archive without its terminator line (an empty
+  `<log>.000001` is enough) made `verify_log_set` hit an `expect`, which
+  `nn-admin chain verify` reaches since lab PR 160: the command aborted
+  (`panic = "abort"`) before it reported any chain. It is
+  `LogSetError::ArchiveWithoutTerminator { file, seq }`, that chain's
+  `BROKEN` line, and every other chain and the anchor are still reported.
+  MAIN-014: `nn-admin audit read` stopped at the first line that is not
+  an audit row (exit 1) and every row after it went unseen; it prints
+  every row, names each skipped line on stderr with its number (the first
+  100, then the count) and exits 8. `audit verify` turned such a line
+  into an I/O-style error (exit 1); it is a broken chain, exit 8, `line N:
+  not an audit row (…); K row(s) verified before it`
+  (`AuditVerifyError::UnreadableLine`). Both verifiers of the audit chain
+  run one pass through `audit::ChainVerifier` (`verify_chain` is a
+  wrapper over it, `verify_chain_file` streams a file, `--expect-head` and
+  `--min-seq` folded in): `audit verify` kept every row and read the file
+  a second time, `chain verify` read it whole; a 128 MiB chain now
+  verifies at a 10 MiB peak RSS (265 MiB before). The full verifiers, the
+  rotating logs' manifests and `audit read` read through one bounded line
+  reader (`verify_lines`: 16 MiB a line, a longer one consumed and
+  reported, never buffered; a line that is not UTF-8 named, not an
+  error), and `verify_one_file` keeps the end offsets the manifest
+  checkpoints name instead of every line's. EVD-022: an archive name is
+  accepted when it is the canonical spelling of its seq (six digits with
+  zeros, or up to 19 without a leading zero), so archives from seq
+  1,000,000 on are listed, evicted, verified and read; the evicted-prefix
+  check walks the manifest's rows instead of every seq below the earliest
+  archive. Format: no writer changed; existing rows and archives verify
+  byte for byte as before (same pre-images; the slice and file verifiers
+  agree on every kind of break, tested). Changes for readers, declared:
+  `audit read` exits 8 (was 1) on a log with lines that are not rows and
+  prints the rows after them; `audit verify` exits 8 (was 1) on such a
+  line; a line over 16 MiB is reported as damaged (no row the agent
+  writes comes near it); `chain verify` names a bad audit line with the
+  new text; an older `nn-admin` does not see archives past seq 999,999
+  (reached only after a million rotations). Exit codes:
+  `docs/operator/EVIDENCE_CHAINS.md` ("Exit codes of the verifiers") and
+  the `nn-admin` header, which now lists 8.
 - External audit, Wave 3, anti-tamper bootstrap trust and honest health
   (Low ATP-007 NN-AUD-260, ATP-015 NN-AUD-263, ATP-016 NN-AUD-264,
   ATP-017 NN-AUD-265, EBPF-016 NN-AUD-267, EBPF-020 NN-AUD-271; lab PR

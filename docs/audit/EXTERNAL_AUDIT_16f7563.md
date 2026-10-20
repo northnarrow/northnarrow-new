@@ -467,7 +467,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-253 | MAIN-011 | Low | Agent main | — | already fixed (lab PR 115) |
 | NN-AUD-254 | MAIN-012 | Low | Agent main | — | already fixed (lab PR 115) |
 | NN-AUD-255 | MAIN-013 | Low | Agent main | S | fixed (lab PR 180) |
-| NN-AUD-256 | MAIN-014 | Low | Agent main | M | open |
+| NN-AUD-256 | MAIN-014 | Low | Agent main | M | fixed (lab PR 190) |
 | NN-AUD-257 | MAIN-015 | Low | Agent main | S | fixed (lab PR 180) |
 | NN-AUD-258 | MAIN-016 | Low | Agent main | S | open |
 | NN-AUD-259 | ATP-006 | Low | Anti-tamper | S | fixed (lab PR 176) |
@@ -491,10 +491,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-277 | EVD-014 | Low | Evidence logs | S | fixed (lab PR 180) |
 | NN-AUD-278 | EVD-015 | Low | Evidence logs | S (+lab) | fixed (lab PR 169) |
 | NN-AUD-279 | EVD-016 | Low | Evidence logs | S (docs) | partly fixed (fail-open fixed, lab PR 148; signing declined); open |
-| NN-AUD-280 | EVD-017 | Low | Evidence logs | S | open (now reachable from a shipped command) |
+| NN-AUD-280 | EVD-017 | Low | Evidence logs | S | fixed (lab PR 190) |
 | NN-AUD-281 | EVD-019 | Low | Evidence logs | S | fixed (lab PR 169) |
 | NN-AUD-282 | EVD-020 | Low | Evidence logs | S | fixed (lab PR 185) |
-| NN-AUD-283 | EVD-022 | Low | Evidence logs | S | partly fixed (overwrite closed, lab PR 131); open |
+| NN-AUD-283 | EVD-022 | Low | Evidence logs | S | fixed (lab PR 190) |
 | NN-AUD-284 | FIMR-010 | Low | FIM rules | M | fixed (lab PR 173) |
 | NN-AUD-285 | FIMR-011 | Low | FIM rules | M | fixed (lab PR 173) |
 | NN-AUD-286 | FIMR-012 | Low | FIM rules | S | fixed (lab PR 173) |
@@ -7655,3 +7655,111 @@ group, the ones an unprivileged user or a local attacker could use first.
     `test-privileged,debug-trigger`) clean, `cargo test -q --workspace`
     2,452 passed, 0 failed.
   - Lab: Ubuntu 24.04, atboot189-probe.sh — before: the build of `main` with lab PRs 176–187; after: this lot on top; every link pointing at scratch copies under `/srv/nn189-*`, undone with SHA-256 checks. `/var/lib/northnarrow` as a symlink: before the start failed with "DENY HOOK SHORTFALL … 15 of 16" (a misleading count); after "the state directory … is reached through a symbolic link … refusing to start", the link and its target named, the target untouched. The drop-in directory as a link: after an ERROR naming it, "19 of 19" hooks attached with `infra_failed=["linked agent directory …"]`, and with `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` the agent running degraded with a signed `subsystem_degraded`. 70 foreign `link_*` pins planted in bpffs: 70 signed `foreign_pin`, none adopted. `nn-lab.sh overlay-check`: PASS, the boot attested the unverified inode identity (FIM-011 once). Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.
+- **Wave 3 — verifiers and forensic tools on bad input, lab PR 190.**
+  Batch 6 of the Wave 3 triage of the evidence and admin group:
+  NN-AUD-280 (EVD-017), NN-AUD-256 (MAIN-014), NN-AUD-283 (EVD-022), all
+  Low, on the integration tree (`main` 78fd0f2 with lots 176–187).
+  - EVD-017 (280, fixed). Re-checked: `verify_log_set` took a sealed
+    archive's terminator with `.expect("sealed archive ends in a
+    terminator")`; an empty `<log>.000001`, or an archive cut before its
+    last line, reached it, and `nn-admin chain verify` (lab PR 160) died
+    there — exit 134 in a release build (`panic = "abort"`), 101 in a debug
+    one — before printing any chain. Now `LogSetError::
+    ArchiveWithoutTerminator { file, seq }` ("archive N (…) has no
+    terminator: it is empty or was cut before its last line"), that
+    chain's `BROKEN` line; `run_chain_verify` already went on to the next
+    chain and the anchor once the verifier returns. Beyond the triage: the
+    verifier's memory. `verify_one_file` kept every line's end offset and
+    hash (`line_ends`) and read lines with an unbounded `read_until`, the
+    manifest with `BufRead::lines`: a file without newlines was read
+    whole. Both read through `verify_lines::VerifyLines` (new; 16 MiB a
+    line, a longer one consumed through the reader's buffer and reported
+    with its length, every line numbered with its end offset), and only
+    the end offsets the manifest checkpoints of that generation name are
+    kept (`reach_checkpoints` unchanged in its results and texts). Not
+    changed: the agent's own `read_terminator_hash` and `verify_recent`
+    (bounded window), the open-time paths.
+  - MAIN-014 (256, fixed). Re-checked: `run_audit_read` and
+    `run_audit_verify_chain` `?` on the first line that did not decode;
+    `audit verify` collected every row in a `Vec` and, with
+    `--expect-head`/`--min-seq`, read the file a second time whole;
+    `chain verify`'s `full_audit` read it whole (`flat_rows`) and kept
+    every row. Now `audit::ChainVerifier { prev, seq: RowSeq, rows,
+    first_numbered, last_seq }` with `push(&entry)` (the same checks in the
+    same order: row number, link, hash, signature), `verify_chain` a
+    wrapper over it, and `audit::verify_chain_file(path, pubkey, head)`
+    one streaming pass over `VerifyLines`, the expected head folded in
+    (`ChainFileReport { rows, first_numbered, last_seq, head_seen, broken
+    }`); `run_audit_verify_expecting` and `full_audit` call it. A line that
+    is not a row (cut, not JSON, not UTF-8, over the cap) is
+    `AuditVerifyError::UnreadableLine { line, verified, reason }`, a broken
+    chain (exit 8): "line N: not an audit row (…); K row(s) verified
+    before it". `audit read` (`audit_read_into`, `AuditReadReport { rows,
+    skipped }`) prints every row, names each skipped line on stderr
+    (`AUDIT_READ_SKIPS_LISTED` = 100, then the count) and the binary exits
+    8 when any was skipped. Verify still stops at the first break, as the
+    triage asked; `audit read` is the tool that shows what follows.
+    Residual, declared: `chain verify`'s two canary chains still go
+    through `flat_rows` (whole file, typed error per line, no abort); their
+    rows are written on admin operations and canary trips only.
+  - EVD-022 (283, fixed). Re-checked: lab PR 131's `RENAME_NOREPLACE`
+    closed the overwrite; `parse_archive_seq` accepted exactly six digits.
+    Now a suffix is an archive iff it is the canonical spelling of its
+    seq — `format!("{:06}", n) == suffix`, six to 19 digits (19 keeps every
+    `seq + 1` of the writer and the verifier inside `u64`) — so `.000999`
+    and `.1000000` list as `[999, 1000000]` and `.00099`, `.0123456`,
+    `.+00001` and 20 digits are not archives. Beyond the triage: once long
+    names are listed, the evicted-prefix check of `verify_log_set`
+    (`for seq in 1..earliest`) would count to an archive named at 10^18;
+    it walks the manifest's `Evicted` rows instead (first missing seq,
+    same error).
+  - Format: no writer changed, no row field, no pre-image. Existing rows
+    and archives verify byte for byte as before
+    (`the_file_verifier_agrees_with_verify_chain_on_every_break`, the
+    legacy-row tests of lab PRs 160/179/185 unchanged). For readers:
+    `audit read` exits 8 instead of 1 on a log with lines that are not
+    rows, and prints the rows after them; `audit verify` exits 8 instead
+    of 1 on such a line; a line over 16 MiB is reported as damaged; the
+    text of `chain verify`'s `BROKEN` line for a bad audit line changes;
+    an older `nn-admin` does not see archives past seq 999,999.
+    Documented: `docs/operator/EVIDENCE_CHAINS.md` ("Exit codes of the
+    verifiers"), `UPGRADE_NOTES_AUDIT_16f7563.md` §3 (the regression) and
+    the exit-code list of `nn_admin.rs`, which lacked 8.
+  - Tests: `verify_lines.rs` (4: numbering and offsets, the cap, an
+    oversized line never stored, a line that is not UTF-8); `chainlog.rs`:
+    `an_archive_without_terminator_is_a_typed_error_not_a_panic` (empty
+    archive; real archive cut before its terminator),
+    `archive_names_past_seq_999999_are_listed_and_other_spellings_are_not`,
+    `a_huge_archive_seq_is_reported_at_once`,
+    `checkpoints_are_reached_without_keeping_every_line_end`; `audit.rs`:
+    `the_file_verifier_agrees_with_verify_chain_on_every_break` (five
+    kinds of break, legacy then numbered rows, read only); `admin_cli.rs`:
+    `three_rows_with_the_last_torn_read_two_and_verify_two`,
+    `audit_read_skips_damaged_lines_and_prints_every_row` (106 lines that
+    are not rows, 100 named),
+    `chain_verify_reports_the_chains_after_an_archive_without_terminator`.
+    `agent/tests/verifiers_bad_input.rs` runs the shipped `nn-admin` and
+    reads its exit code and `wait4` peak RSS; the memory runs are spawned
+    by `fork` under `RLIMIT_DATA` 64 MiB:
+    `chain_verify_reports_an_empty_archive_and_every_chain_after_it`,
+    `audit_read_prints_every_row_around_damaged_lines`,
+    `audit_verify_names_the_first_damaged_line` (middle, torn, not UTF-8;
+    an empty file is 0 rows),
+    `a_huge_line_is_reported_in_bounded_memory` (a 96 MiB line: audit
+    verify, audit read, chain verify of the detection log; about 25 MiB
+    peak),
+    `a_large_chain_verifies_in_bounded_memory` (128 MiB, 256 signed rows:
+    `audit verify --expect-head --min-seq` and `chain verify --log audit`,
+    10 MiB peak). On the starting tree the five integration tests fail:
+    exit 101 "sealed archive ends in a terminator", no chain printed; exit
+    1 after two rows ("parsing audit-log line 3"); exit 1 "parsing
+    audit-log line 4"; exit 134 "memory allocation of 126009344 bytes
+    failed"; exit 134 at the cap (271948 KiB peak without it). Of the unit
+    tests, the terminator test panics at the `expect`, the listing test
+    gets `[999]`, the huge-seq test verifies the set (the name is not
+    listed), the checkpoint test passes (a guard for the new walk), the
+    others do not compile there (new items).
+  - Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
+    agent with `test-privileged,debug-trigger`) clean, 2,458 passed,
+    0 failed.
+  - Lab: Debian 12, verifiers190-probe.sh, on copies of the guest's chains only — before: the build of `main` with lab PRs 176–187; after: this lot on top. An empty sealed archive: `chain verify` aborted (exit 134, "sealed archive ends in a terminator") before; after that chain BROKEN, every other one reported, exit 8. A torn last audit line: `audit read` stopped at it with exit 1 before; after every valid row printed, the line named, exit 8. Garbage at line 3, a 96 MiB line under a 64 MiB data limit, an archive numbered past 999,999, an empty audit file: typed errors with exit 8 (or exit 0 for the empty file), the rows after the damage read, the large archive listed. Four cases (`audit verify` on the torn, the large and the repeated-row copies; `chain verify` of a huge detections line) reported instead the older break of this guest's own chains (an old-format row at entry 1947, a detections signature) first — exit 8, no abort. Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.
