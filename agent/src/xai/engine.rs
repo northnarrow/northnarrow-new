@@ -26,7 +26,9 @@
 //!
 //! The single ADE-surface addition this phase makes is the read-only
 //! [`AdeEngine::assembled_prompt`] forensic accessor (no behaviour
-//! change); everything else lives in `xai/`.
+//! change); everything else lives in `xai/`. External audit LLMR-019 adds
+//! [`AdeEngine::evaluate_recorded`] — `evaluate` with the digest of the
+//! prompt it sent — which `explain` takes and checks.
 
 use std::path::{Path, PathBuf};
 
@@ -40,7 +42,9 @@ use common::xai_types::{
 use common::Event;
 
 use crate::ade::sanitize::sanitize_event_for_ade;
-use crate::ade::{AdeConfig, AdeEngine, EventContext, HIGH_INJECTION_SCORE_REJECT};
+use crate::ade::{
+    prompt_sha256, AdeConfig, AdeEngine, Evaluation, EventContext, HIGH_INJECTION_SCORE_REJECT,
+};
 use crate::xai::saliency::{explain_saliency, SaliencyConfig, XaiUnavailable};
 use crate::xai::source::{DecisionProbe, XaiProbeError};
 use common::xai_types::EvidenceSigner;
@@ -113,10 +117,15 @@ pub struct EnvironmentInputs {
     pub combat_rules_path: PathBuf,
 }
 
+/// External audit XAI-016: the file hashed in 64 KiB chunks by the agent's
+/// one streaming hasher ([`crate::install_manifest::sha256_file`]).
+/// `std::fs::read` held the whole file in memory — for the model, a GGUF of
+/// several GiB, beside the copy the backend had already loaded.
 fn sha256_file(p: &Path) -> std::io::Result<[u8; 32]> {
-    let bytes = std::fs::read(p)?;
+    let digest = crate::install_manifest::sha256_file(p)?;
     let mut out = [0u8; 32];
-    out.copy_from_slice(&Sha256::digest(&bytes));
+    hex::decode_to_slice(&digest, &mut out)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(out)
 }
 
@@ -188,10 +197,6 @@ pub fn compute_environment_hash(
     Ok(hex::encode(h.finalize()))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 fn snapshot_err(what: &str, e: serde_json::Error) -> XaiUnavailable {
     // A snapshot we cannot serialise ⇒ no faithful chain ⇒ fail-closed.
     XaiUnavailable::Probe(XaiProbeError(format!("{what} snapshot serialise: {e}")))
@@ -229,17 +234,24 @@ impl<S: EvidenceSigner> XaiEngine<S> {
 
     /// Explain one ADE decision: run the P3 driver against the
     /// deterministic ADE probe, assemble the signed
-    /// [`XaiEvidenceChain`]. `ade_verdict` is the explained production
-    /// decision — used ONLY for the `ade_trace_id` FK and the model
-    /// identity; the chain's `baseline_verdict` is the driver's own
-    /// deterministic `V0` (plan §3.3, R1), NOT this verdict.
+    /// [`XaiEvidenceChain`]. `evaluated` is the explained production
+    /// decision, as [`AdeEngine::evaluate_recorded`] returned it for this
+    /// `focal` and `ctx`: its verdict is used ONLY for the `ade_trace_id`
+    /// FK and the model identity — the chain's `baseline_verdict` is the
+    /// driver's own deterministic `V0` (plan §3.3, R1), NOT this verdict.
+    ///
+    /// External audit LLMR-019: its `prompt_sha256` is the prompt the
+    /// model was asked. The chain's digest was a reconstruction from the
+    /// inputs given here, equal to it only if they were the evaluated ones;
+    /// when the prompt rebuilt from them differs, nothing is explained
+    /// ([`XaiUnavailable::PromptMismatch`]).
     pub async fn explain(
         &self,
         focal: &Event,
         ctx: &EventContext,
-        ade_verdict: &AdeVerdict,
+        evaluated: &Evaluation,
     ) -> Result<XaiEvidenceChain, XaiUnavailable> {
-        self.explain_with(focal, ctx, ade_verdict, &AdeProbe::new(&self.engine))
+        self.explain_with(focal, ctx, evaluated, &AdeProbe::new(&self.engine))
             .await
     }
 
@@ -249,7 +261,7 @@ impl<S: EvidenceSigner> XaiEngine<S> {
         &self,
         focal: &Event,
         ctx: &EventContext,
-        ade_verdict: &AdeVerdict,
+        evaluated: &Evaluation,
         probe: &P,
     ) -> Result<XaiEvidenceChain, XaiUnavailable> {
         // External audit XAI-011: the prompt first. Without one, `evaluate`
@@ -259,13 +271,29 @@ impl<S: EvidenceSigner> XaiEngine<S> {
         // `assembled_prompt` shares evaluate's prompt path ⇒ the hash
         // binds the literal model prompt; it is computed once and reused
         // below.
-        let Some(prompt) = self.engine.assembled_prompt(focal, ctx) else {
-            let injection_score = sanitize_event_for_ade(focal).injection_score;
-            return Err(if injection_score >= HIGH_INJECTION_SCORE_REJECT {
-                XaiUnavailable::InjectionShortCircuit { injection_score }
-            } else {
-                XaiUnavailable::PromptExceedsWindow
-            });
+        let rebuilt = self
+            .engine
+            .assembled_prompt(focal, ctx)
+            .map(|p| prompt_sha256(&p));
+        // External audit LLMR-019: the prompt the model was asked, or
+        // nothing. A chain over another prompt — inputs other than the
+        // evaluated ones — would explain a decision nobody took.
+        let prompt_digest = match (&evaluated.prompt_sha256, rebuilt) {
+            (Some(sent), Some(rebuilt)) if *sent == rebuilt => rebuilt,
+            (None, None) => {
+                let injection_score = sanitize_event_for_ade(focal).injection_score;
+                return Err(if injection_score >= HIGH_INJECTION_SCORE_REJECT {
+                    XaiUnavailable::InjectionShortCircuit { injection_score }
+                } else {
+                    XaiUnavailable::PromptExceedsWindow
+                });
+            }
+            (sent, rebuilt) => {
+                return Err(XaiUnavailable::PromptMismatch {
+                    evaluated: sent.clone(),
+                    rebuilt,
+                })
+            }
         };
         let run = explain_saliency(&self.saliency_cfg, focal, ctx, probe).await?;
 
@@ -285,9 +313,10 @@ impl<S: EvidenceSigner> XaiEngine<S> {
                 "agent_version": host.agent_version,
             })
             .to_string(),
-            prompt_sha256: sha256_hex(prompt.as_bytes()),
+            prompt_sha256: prompt_digest,
         };
 
+        let ade_verdict = &evaluated.verdict;
         let m = &ade_verdict.metadata;
         let mut chain = XaiEvidenceChain {
             schema_version: XAI_SCHEMA_VERSION.to_string(),
@@ -317,7 +346,10 @@ impl<S: EvidenceSigner> XaiEngine<S> {
             status: run.status,
             signature: None,
         };
-        chain.sign_with(&self.signer);
+        // External audit XAI-014: a non-finite value is not signed.
+        chain
+            .try_sign_with(&self.signer)
+            .map_err(|e| XaiUnavailable::NonFiniteValue { field: e.field })?;
         Ok(chain)
     }
 }
@@ -450,8 +482,10 @@ mod tests {
             recent_events: vec![],
             host_context: HostContext::discover(),
         };
-        // The production verdict (FK + model identity source).
-        let ade_verdict = engine.evaluate(&focal, &ctx).await.unwrap();
+        // The production verdict (FK + model identity source), with the
+        // digest of the prompt it was decided on.
+        let evaluated = engine.evaluate_recorded(&focal, &ctx).await.unwrap();
+        let ade_verdict = &evaluated.verdict;
 
         let signer = Ed25519EvidenceSigner::new(SigningKey::generate(&mut OsRng));
         let xai = XaiEngine::new(
@@ -462,7 +496,7 @@ mod tests {
         )
         .unwrap();
 
-        let chain = xai.explain(&focal, &ctx, &ade_verdict).await.unwrap();
+        let chain = xai.explain(&focal, &ctx, &evaluated).await.unwrap();
 
         // Field mapping.
         assert_eq!(chain.schema_version, XAI_SCHEMA_VERSION);
@@ -475,6 +509,10 @@ mod tests {
         assert_eq!(chain.method.inference_settings.top_k, 1);
         assert_eq!(chain.environment_hash.len(), 64);
         assert_eq!(chain.input_snapshot.prompt_sha256.len(), 64);
+        assert_eq!(
+            Some(&chain.input_snapshot.prompt_sha256),
+            evaluated.prompt_sha256.as_ref()
+        );
         assert!(chain.input_snapshot.focal_event_json.contains("xmrig"));
         assert!(chain.input_snapshot.host_context_json.contains("hostname"));
         assert!(!chain.saliency_map.is_empty());
@@ -508,12 +546,12 @@ mod tests {
             recent_events: vec![],
             host_context: HostContext::discover(),
         };
-        let v = engine.evaluate(&focal, &ctx).await.unwrap();
+        let v = engine.evaluate_recorded(&focal, &ctx).await.unwrap();
 
         // Hand explain a verdict whose fields are deliberately wrong;
         // the chain baseline must reflect the probe's V0, not this.
         let mut bogus = v.clone();
-        bogus.confidence = 0.123_456;
+        bogus.verdict.confidence = 0.123_456;
         let signer = Ed25519EvidenceSigner::new(SigningKey::generate(&mut OsRng));
         let xai = XaiEngine::new(
             engine,
@@ -524,7 +562,7 @@ mod tests {
         .unwrap();
         let chain = xai.explain(&focal, &ctx, &bogus).await.unwrap();
         assert_eq!(
-            chain.ade_trace_id, bogus.trace_id,
+            chain.ade_trace_id, bogus.verdict.trace_id,
             "FK still the passed verdict"
         );
         assert!(
@@ -568,7 +606,8 @@ mod tests {
             recent_events: vec![],
             host_context: HostContext::discover(),
         };
-        let v = engine.evaluate(&focal, &ctx).await.unwrap();
+        let v = engine.evaluate_recorded(&focal, &ctx).await.unwrap();
+        assert!(v.prompt_sha256.is_none(), "the model was not asked");
         assert!(engine.assembled_prompt(&focal, &ctx).is_none());
 
         let probe_engine = engine.clone();
@@ -628,7 +667,7 @@ mod tests {
             recent_events: recent,
             host_context: HostContext::discover(),
         };
-        let v = engine.evaluate(&focal, &ctx).await.unwrap();
+        let v = engine.evaluate_recorded(&focal, &ctx).await.unwrap();
         let signer = Ed25519EvidenceSigner::new(SigningKey::generate(&mut OsRng));
         let xai = XaiEngine::new(
             engine,
@@ -641,6 +680,149 @@ mod tests {
         assert_eq!(chain.method.max_units, 4);
         assert!(matches!(chain.status, XaiStatus::Degraded(_)));
         verify_evidence(&chain).expect("signed chain verifies");
+    }
+
+    /// External audit XAI-016: the streamed digest is the in-memory one, on
+    /// a file over 3 MiB whose size is not a multiple of the 64 KiB chunk.
+    #[test]
+    fn sha256_file_matches_in_memory_digest() {
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        let f = temp_with(&bytes);
+        let mut want = [0u8; 32];
+        want.copy_from_slice(&Sha256::digest(&bytes));
+        assert_eq!(sha256_file(f.path()).unwrap(), want);
+        assert_eq!(sha256_file(temp_with(b"").path()).unwrap(), {
+            let mut e = [0u8; 32];
+            e.copy_from_slice(&Sha256::digest(b""));
+            e
+        });
+        assert!(sha256_file(Path::new("/no/such/model.gguf")).is_err());
+    }
+
+    /// External audit LLMR-019: `explain` given other inputs than the
+    /// evaluated ones — here a correlated event the evaluation did not
+    /// have — rebuilds another prompt; it is refused before any probe. It
+    /// used to sign a chain over that other prompt.
+    #[tokio::test]
+    async fn explain_refuses_inputs_other_than_the_evaluated_ones() {
+        let model = temp_with(b"gguf");
+        let rules = temp_with(b"rules");
+        let prompt = temp_with(b"# stub\nJSON.\n");
+        let engine = mock_engine(model.path(), prompt.path()).await;
+        let focal = xmrig();
+        let evaluated_ctx = EventContext {
+            recent_events: vec![],
+            host_context: HostContext::discover(),
+        };
+        let other_ctx = EventContext {
+            recent_events: vec![Event::DnsQuery {
+                pid: 4242,
+                uid: 1000,
+                comm: "xmrig".into(),
+                exe: None,
+                query_name: "pool.example.org".into(),
+                query_type: 1,
+                dns_server: [0u8; 16],
+                family: 2,
+                timestamp_ns: 0,
+                qname_partial: false,
+            }],
+            host_context: evaluated_ctx.host_context.clone(),
+        };
+        let v = engine
+            .evaluate_recorded(&focal, &evaluated_ctx)
+            .await
+            .unwrap();
+        let sent = v.prompt_sha256.clone().expect("the model was asked");
+
+        let probe_engine = engine.clone();
+        let signer = Ed25519EvidenceSigner::new(SigningKey::generate(&mut OsRng));
+        let xai = XaiEngine::new(
+            engine,
+            signer,
+            SaliencyConfig::default(),
+            &env_inputs(model.path(), rules.path()),
+        )
+        .unwrap();
+        let probe = CountingProbe {
+            inner: AdeProbe::new(&probe_engine),
+            calls: std::cell::Cell::new(0),
+        };
+        let err = xai
+            .explain_with(&focal, &other_ctx, &v, &probe)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, XaiUnavailable::PromptMismatch { evaluated, rebuilt }
+                if evaluated.as_deref() == Some(sent.as_str())
+                    && rebuilt.is_some()
+                    && rebuilt.as_deref() != Some(sent.as_str())),
+            "{err:?}"
+        );
+        assert_eq!(probe.calls.get(), 0, "no probe before the refusal");
+
+        // A verdict the model never gave (no prompt was sent for it) is not
+        // explained over inputs that make one.
+        let unasked = Evaluation {
+            verdict: v.verdict.clone(),
+            prompt_sha256: None,
+        };
+        assert!(matches!(
+            xai.explain(&focal, &evaluated_ctx, &unasked).await,
+            Err(XaiUnavailable::PromptMismatch {
+                evaluated: None,
+                rebuilt: Some(_)
+            })
+        ));
+
+        // The evaluated inputs are explained, over the digest recorded.
+        let chain = xai.explain(&focal, &evaluated_ctx, &v).await.unwrap();
+        assert_eq!(chain.input_snapshot.prompt_sha256, sent);
+    }
+
+    /// An [`AdeProbe`] whose every verdict has a NaN confidence: the parser
+    /// refuses one from the model (lab PR 132), a probe does not.
+    struct NanProbe<'a>(AdeProbe<'a>);
+    impl DecisionProbe for NanProbe<'_> {
+        async fn probe(&self, f: &Event, c: &EventContext) -> Result<AdeVerdict, XaiProbeError> {
+            let mut v = self.0.probe(f, c).await?;
+            v.confidence = f64::NAN;
+            Ok(v)
+        }
+    }
+
+    /// External audit XAI-014: a chain with a non-finite value is refused,
+    /// not signed with the value folded into the canonical NaN.
+    #[tokio::test]
+    async fn explain_refuses_a_non_finite_chain() {
+        let model = temp_with(b"gguf");
+        let rules = temp_with(b"rules");
+        let prompt = temp_with(b"# stub\nJSON.\n");
+        let engine = mock_engine(model.path(), prompt.path()).await;
+        let focal = xmrig();
+        let ctx = EventContext {
+            recent_events: vec![],
+            host_context: HostContext::discover(),
+        };
+        let v = engine.evaluate_recorded(&focal, &ctx).await.unwrap();
+        let probe_engine = engine.clone();
+        let signer = Ed25519EvidenceSigner::new(SigningKey::generate(&mut OsRng));
+        let xai = XaiEngine::new(
+            engine,
+            signer,
+            SaliencyConfig::default(),
+            &env_inputs(model.path(), rules.path()),
+        )
+        .unwrap();
+        let err = xai
+            .explain_with(&focal, &ctx, &v, &NanProbe(AdeProbe::new(&probe_engine)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, XaiUnavailable::NonFiniteValue { field }
+                if field == "baseline_verdict.confidence"),
+            "{err:?}"
+        );
     }
 
     /// Opt-in real-candle latency bench (plan §11 P4, R-P3.2). Run with

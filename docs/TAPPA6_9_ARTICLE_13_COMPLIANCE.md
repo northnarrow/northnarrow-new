@@ -140,6 +140,24 @@ fields (hostname, host_id, paths). Posture:
   is not built; no chain has been produced in production. What the
   production ADE does with a verdict is §9; what it shows the model is
   §10.
+  - *Blocking items of the wiring, done before it (external audit, lab
+    PR 203).* An occluded pid, ppid, uid or gid is `OCCLUDED_ID`
+    (`u32::MAX`), printed `<redacted>`: it was 0, so an occluded uid read
+    as root (XAI-006). A chain with a non-finite value is not signed
+    (`try_sign_with`, XAI-014); the canonical encoding and its byte-locked
+    sample are unchanged. The model file is hashed in 64 KiB chunks for
+    `environment_hash` (XAI-016). `AdeEngine::evaluate_recorded` returns
+    the digest of the prompt it sent; `XaiEngine::explain` takes it and
+    refuses (`PromptMismatch`) inputs that rebuild another prompt
+    (LLMR-019, in part).
+  - *To do with the wiring (LLMR-019, open).* The caller explains with
+    the `Evaluation` that `evaluate_recorded` returned for the same event
+    and the same `EventContext`, and keeps it until `explain` runs (the
+    detection record does not keep the digest). The XAI engine's ADE is
+    built like the production one but for R1's sampling — system prompt,
+    `host_role`, language, RAG corpus, model — or every explanation is
+    refused as a mismatch. A refusal is recorded, never retried with
+    other inputs.
 - **One evaluation slot.** The ADE evaluates one event at a time
   (external audit LLMR-002, lab PR 82); an exec no rule matched that
   arrives while one runs is judged by the rules only and counted, so under
@@ -346,3 +364,8 @@ the agent sends), stated here rather than discovered in a chain.
 - **2026-10-16 (lab PR 162).** §6: the evaluation slot is offered an
   exec's `ProcessSpawn`, and its `ExecCheck` only when no spawn follows;
   the limit of a single slot under load stays.
+- **2026-10-20 (lab PR 203).** §6: the blocking items of the XAI wiring
+  done before it — the occlusion sentinel for identifiers, non-finite
+  chains refused, the model hashed in chunks, the digest of the evaluated
+  prompt checked by `explain` — and the part of LLMR-019 left for the
+  wiring.

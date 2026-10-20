@@ -588,6 +588,52 @@ ADE budgets stay per-domain (FIM / Net / Process each 11/min). This
 is **optional** for the 10.5 ship (§12 D8); the deterministic path is
 complete without it.
 
+> **Addendum — external audit 16f7563, blocking items of the template
+> wiring (lab PR 203, 2026-10-20).** The three enrichment templates
+> (`ade/fim_template.rs`, Tappa 9 C9; `ade/chain_template.rs`, D8 here;
+> `ade/process_template.rs`, Tappa 10.6 D7) still have no caller outside
+> their tests. The shared `process_event` follow-up that wires them cites
+> these points.
+>
+> - **Done before the wiring (lab PR 203; NN-AUD-320, -321, -432).** Every
+>   string an observed process chose — comm, file, argv, parent comm, FIM
+>   path and destination, modifier comm and binary, flow comm and binary,
+>   resolved host name — and the rule's reasoning, which quotes them, are
+>   printed through `sanitize::push_untrusted_kv` / `push_untrusted_argv`
+>   (`sanitize_line`, then JSON-quoted) inside the
+>   `=== UNTRUSTED EVENT DATA ===` fence with the structured prompt's
+>   preamble, after the trusted sections. The argv within the focal
+>   prompt's caps (32 items of 256 characters, 1,024 bytes) with
+>   `argv_truncated: true` when cut there or at the kernel; the batched FIM
+>   prompt at most `BATCH_MAX_EVENTS` = 50 events, the newest. The question
+>   asks for enrichment only: the verdict and its response are final, no
+>   other severity, posture or response is to be proposed, and an
+>   `observed_injection_attempt` flag closes it. Cite:
+>   `template_fields_cannot_forge_a_section` and
+>   `enrichment_prompts_offer_no_downgrade` (one per template),
+>   `argv_is_capped_regardless_of_input_size`, `batch_is_capped`.
+> - **To do with the wiring.**
+>   1. *Window.* A template prompt does not go through
+>      `AdeEngine::prepare`, so nothing fits it to the model's window
+>      (3,328 tokens; a batch of 50 events is beyond it). The wiring puts
+>      it in `PromptParts` with the system prompt, fits it (batch events
+>      first) and refuses what does not fit, as `prepare` does (LLMR-008).
+>   2. *Score.* The templates sanitize but do not score. The wiring decides
+>      whether a high injection score skips the model, as `evaluate` does
+>      at `HIGH_INJECTION_SCORE_REJECT`, and records the flags.
+>   3. *Reply.* A schema of its own (not ADE v1.0.0), parsed with caps; a
+>      severity, posture or response in it is ignored and recorded as an
+>      anomaly, `observed_injection_attempt` recorded. Nothing in the reply
+>      reaches the responder (the advisory ADE, lab PR 134).
+>   4. *Slot and budgets.* The per-domain buckets (`AdeFimRateLimiter`, 11
+>      calls a minute) and the single ADE evaluation slot (LLMR-002): an
+>      enrichment must not take the slot an unknown exec waits for.
+>   5. *Record.* Where the reply is kept: the detection record, or the FIM
+>      drift entry (the schema change `fim_template`'s module doc names).
+>   6. *Model host.* The format is in no training dataset (only in this
+>      document): `ade_attacks` and a sample of real verdicts through each
+>      template, on a model host, before it is turned on.
+
 ---
 
 ## 9. Wire protocol

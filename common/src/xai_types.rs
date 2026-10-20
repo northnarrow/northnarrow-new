@@ -305,7 +305,10 @@ pub trait EvidenceSigner {
 /// * `f64`    → IEEE-754 bits, big-endian (exact; no text formatting); a
 ///   non-finite value is canonicalised to a fixed quiet-NaN bit pattern
 ///   (saliency values are finite by construction — this is defence in
-///   depth, recorded here so the auditor knows the rule)
+///   depth, recorded here so the auditor knows the rule). External audit
+///   XAI-014: that folds NaN, `+inf` and `-inf` into one, so a chain that
+///   carries one is not signed ([`XaiEvidenceChain::try_sign_with`]); the
+///   rule stays, and the bytes of every finite chain with it.
 /// * enums    → their `&'static str` canonical tag, written as a string
 /// * `Vec<T>` → `u32` big-endian count, then each element in order
 /// * `Option` → one byte `0`/`1`, then the value if present
@@ -479,11 +482,87 @@ impl XaiEvidenceChain {
 
     /// Sign in place: `self.signature = Some(signer.sign(canonical_bytes))`.
     /// Idempotent w.r.t. the signed bytes (signature is excluded from them).
+    /// It signs what it is given, a non-finite value included; the agent's
+    /// `XaiEngine` signs through [`Self::try_sign_with`].
     pub fn sign_with(&mut self, signer: &dyn EvidenceSigner) {
         let msg = self.canonical_bytes();
         self.signature = Some(signer.sign(&msg));
     }
+
+    /// External audit XAI-014: [`Self::sign_with`], unless the chain
+    /// carries a non-finite `f64` — the method's weights, threshold,
+    /// temperature and `top_p`, the baseline confidence, a score, a delta or
+    /// an attention score of the map, the coverage — which is refused and
+    /// left unsigned. The canonical form writes every non-finite value as
+    /// one bit pattern and the JSON artifact as `null`: a signature over it
+    /// would vouch for NaN, `+inf` and `-inf` alike.
+    pub fn try_sign_with(&mut self, signer: &dyn EvidenceSigner) -> Result<(), NonFiniteValue> {
+        if let Some(field) = self.first_non_finite() {
+            return Err(NonFiniteValue { field });
+        }
+        self.sign_with(signer);
+        Ok(())
+    }
+
+    /// The first non-finite `f64` of the chain, in the canonical order.
+    fn first_non_finite(&self) -> Option<String> {
+        let m = &self.method;
+        let head = [
+            ("method.weights.w_action", m.weights.w_action),
+            ("method.weights.w_severity", m.weights.w_severity),
+            ("method.weights.w_confidence", m.weights.w_confidence),
+            ("method.region_refine_threshold", m.region_refine_threshold),
+            (
+                "method.inference_settings.temperature",
+                m.inference_settings.temperature,
+            ),
+            (
+                "method.inference_settings.top_p",
+                m.inference_settings.top_p,
+            ),
+            (
+                "baseline_verdict.confidence",
+                self.baseline_verdict.confidence,
+            ),
+        ];
+        if let Some((name, _)) = head.iter().find(|(_, v)| !v.is_finite()) {
+            return Some(String::from(*name));
+        }
+        for (i, e) in self.saliency_map.iter().enumerate() {
+            for (name, v) in [
+                ("score", Some(e.score)),
+                ("delta.action_flip", Some(e.delta.action_flip)),
+                ("delta.severity_shift", Some(e.delta.severity_shift)),
+                ("delta.confidence_delta", Some(e.delta.confidence_delta)),
+                ("attention_score", e.attention_score),
+            ] {
+                if v.is_some_and(|v| !v.is_finite()) {
+                    return Some(alloc::format!("saliency_map[{i}].{name}"));
+                }
+            }
+        }
+        if !self.saliency_coverage.is_finite() {
+            return Some(String::from("saliency_coverage"));
+        }
+        None
+    }
 }
+
+/// External audit XAI-014: why [`XaiEvidenceChain::try_sign_with`] refused
+/// a chain — the field that carries a non-finite value
+/// (`saliency_map[2].score`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonFiniteValue {
+    pub field: String,
+}
+
+impl core::fmt::Display for NonFiniteValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "non-finite value in {}", self.field)
+    }
+}
+
+impl core::error::Error for NonFiniteValue {}
 
 #[cfg(test)]
 mod tests {
@@ -680,5 +759,63 @@ mod tests {
             c.canonical_bytes(),
             "signing must not alter the canonical (signed) bytes"
         );
+    }
+
+    /// External audit XAI-014: a chain with NaN, `+inf` or `-inf` in any
+    /// signed `f64` is refused and left unsigned. `sign_with` signed it,
+    /// the three folded into one canonical pattern.
+    #[test]
+    fn non_finite_scores_are_refused_not_canonicalised() {
+        type Set = fn(&mut XaiEvidenceChain, f64);
+        let fields: [(&str, Set); 10] = [
+            ("method.weights.w_action", |c, v| {
+                c.method.weights.w_action = v
+            }),
+            ("method.region_refine_threshold", |c, v| {
+                c.method.region_refine_threshold = v
+            }),
+            ("method.inference_settings.top_p", |c, v| {
+                c.method.inference_settings.top_p = v
+            }),
+            ("baseline_verdict.confidence", |c, v| {
+                c.baseline_verdict.confidence = v
+            }),
+            ("saliency_map[0].score", |c, v| c.saliency_map[0].score = v),
+            ("saliency_map[0].delta.action_flip", |c, v| {
+                c.saliency_map[0].delta.action_flip = v
+            }),
+            ("saliency_map[0].delta.severity_shift", |c, v| {
+                c.saliency_map[0].delta.severity_shift = v
+            }),
+            ("saliency_map[0].delta.confidence_delta", |c, v| {
+                c.saliency_map[0].delta.confidence_delta = v
+            }),
+            ("saliency_map[0].attention_score", |c, v| {
+                c.saliency_map[0].attention_score = Some(v)
+            }),
+            ("saliency_coverage", |c, v| c.saliency_coverage = v),
+        ];
+        for (field, set) in fields {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut c = sample();
+                set(&mut c, bad);
+                assert_eq!(
+                    c.try_sign_with(&FixedSigner),
+                    Err(NonFiniteValue {
+                        field: field.to_string()
+                    }),
+                    "{field} = {bad}"
+                );
+                assert!(c.signature.is_none(), "{field} = {bad} was signed");
+            }
+        }
+        // A finite chain signs as `sign_with` does, over the same bytes.
+        let mut c = sample();
+        let before = c.canonical_bytes();
+        c.try_sign_with(&FixedSigner).unwrap();
+        let mut d = sample();
+        d.sign_with(&FixedSigner);
+        assert_eq!(c.signature, d.signature);
+        assert_eq!(before, c.canonical_bytes());
     }
 }

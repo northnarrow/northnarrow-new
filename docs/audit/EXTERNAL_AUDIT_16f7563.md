@@ -531,8 +531,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-317 | CMB-026 | Low | Combat response | — | already fixed (lab PR 123) |
 | NN-AUD-318 | CMB-027 | Low | Combat response | S–M | fixed (lab PR 193) |
 | NN-AUD-319 | LLMP-005 | Low | LLM prompts | S | fixed (lab PR 191) |
-| NN-AUD-320 | LLMP-007 | Low | LLM prompts | M | open (dormant: templates not wired) |
-| NN-AUD-321 | LLMP-008 | Low | LLM prompts | S | open (dormant) |
+| NN-AUD-320 | LLMP-007 | Low | LLM prompts | M | fixed (lab PR 203) |
+| NN-AUD-321 | LLMP-008 | Low | LLM prompts | S | fixed (lab PR 203) |
 | NN-AUD-322 | LLMP-010 | Low | LLM prompts | S | fixed (lab PR 191) |
 | NN-AUD-323 | LLMP-012 | Low | LLM prompts | S | fixed (lab PR 182) |
 | NN-AUD-324 | LLMP-014 | Low | LLM prompts | S | fixed (lab PR 182) |
@@ -555,13 +555,13 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-341 | DEC-016 | Low | Deception | S | fixed (lab PR 178) |
 | NN-AUD-342 | DEC-017 | Low | Deception | S | fixed (lab PR 178) |
 | NN-AUD-343 | XAI-003 | Low | XAI and RAG | S (one line) | obsolete (the on-disk index is gone, lab PR 145) |
-| NN-AUD-344 | XAI-006 | Low | XAI and RAG | S | open (dormant: XAI not wired) |
+| NN-AUD-344 | XAI-006 | Low | XAI and RAG | S | fixed (lab PR 203) |
 | NN-AUD-345 | XAI-007 | Low | XAI and RAG | S (guard) | declined as filed (argv/parent_comm are not in the prompt); guard test |
 | NN-AUD-346 | XAI-008 | Low | XAI and RAG | S–M | fixed (lab PR 199) |
 | NN-AUD-347 | XAI-012 | Low | XAI and RAG | S | fixed (lab PR 199) |
-| NN-AUD-348 | XAI-014 | Low | XAI and RAG | S | partly fixed (confidence domain fixed, lab PR 132; encoding left); open |
+| NN-AUD-348 | XAI-014 | Low | XAI and RAG | S | fixed (lab PR 203) |
 | NN-AUD-349 | XAI-015 | Low | XAI and RAG | — | obsolete (on-disk `build_index` removed, lab PR 145) |
-| NN-AUD-350 | XAI-016 | Low | XAI and RAG | S | open (dormant) |
+| NN-AUD-350 | XAI-016 | Low | XAI and RAG | S | fixed (lab PR 203) |
 | NN-AUD-351 | XAI-017 | Low | XAI and RAG | S | fixed (lab PR 191) |
 | NN-AUD-352 | SNS-004 | Low | Sensors | S | fixed (lab PR 196) |
 | NN-AUD-353 | SNS-010 | Low | Sensors | S | fixed (lab PR 196) |
@@ -643,7 +643,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-429 | PROC-014 | Info | Process rules | S | fixed (lab PR 201) |
 | NN-AUD-430 | POS-013 | Info | Posture | S | fixed (lab PR 172) |
 | NN-AUD-431 | CMB-028 | Info | Combat response | S | fixed (lab PR 181) |
-| NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | open (Info; narrowed to the test: argv is 512 B at the kernel) |
+| NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | fixed (lab PR 203) |
 | NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | fixed (lab PR 191) |
 | NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
 | NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | fixed (lab PR 199) |
@@ -9021,3 +9021,152 @@ group, the ones an unprivileged user or a local attacker could use first.
     lacks `argv_truncated` and `filename_truncated`, lot
     `nn-wt-kernfid`): not this batch.
   - Lab: No lab probe (latent parsers): 11 ClientHellos built in the tests from explicit fields, their expected JA3/JA4 computed locally with salesforce's `ja3.py` (@502cc63) and FoxIO's BSD-3-Clause JA4 TLS implementation (@c6469a7), checked first to reproduce FoxIO's five published JA4 exactly; no third-party data in the repository; on the code before, 22 tests fail (the JA4 differs on 8 of the 11 vectors). Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.
+- **Wave 3 — enrichment templates and XAI before their wiring, lab PR 203.**
+  NN-AUD-320 (LLMP-007), NN-AUD-321 (LLMP-008), NN-AUD-432 (LLMP-009,
+  Informational), NN-AUD-344 (XAI-006), NN-AUD-348 (XAI-014, the part
+  left after lab PR 132), NN-AUD-350 (XAI-016), NN-AUD-329 (LLMR-019, the
+  part that can come before the wiring) and the guard of NN-AUD-345
+  (XAI-007, DECLINE as filed): batches E and F of the Wave 3 triage of the
+  LLM, XAI and deception group, on the integration tree (`main` with lots
+  up to 193, and lots 194–199). Dormant: the three enrichment templates
+  and `XaiEngine` have no caller outside their tests. These points are now
+  blocking items of the wiring: for the templates, an addendum to §8 of
+  `docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md` (the shared
+  `process_event` follow-up of Tappe 9, 10.5 and 10.6; the three module
+  docs point to it); for XAI, §6 of `docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md`
+  (change log §11). No probe and no model: nothing on a host runs this
+  code, and the production prompt does not change, which the tests pin.
+  - Before: `process_template.rs`, `fim_template.rs` and
+    `chain_template.rs` printed comm, file, `argv.join(" ")`, parent comm,
+    FIM path and destination, modifier comm and exe, flow comm and exe,
+    `resolved_hostname` and `verdict.reasoning` with `format!`, none
+    through `sanitize`: a newline in a path or a DNS answer wrote its own
+    `### already-taken-action:` line. Their questions said the response
+    had run and was not gated on the reply, then asked to "confirm
+    Critical, or argue a downgrade to High", for a false-positive analysis,
+    or not to change the response "unless you have a specific reason to
+    override". `prompt_stays_within_a_sane_token_budget` fed 200 arguments
+    of three bytes, which fit with no cap; the batched FIM prompt rendered
+    the whole slice. `xai/occlusion.rs` wrote 0 into an occluded pid,
+    ppid, uid or gid, and the prompt printed `uid: 0`. `Canon::f64` folds
+    NaN and both infinities into one pattern and `sign_with` signed it.
+    `xai/engine.rs` hashed the model with `std::fs::read`. `explain`
+    rebuilt the prompt from the inputs it was given and signed its digest
+    as the evaluated one.
+  - Agent: `sanitize.rs`: `json_quote` (moved from `structured_prompt.rs`,
+    one quoting for both prompts); `push_untrusted_kv(buf, label, value,
+    cap)` = `sanitize_line` (which is `sanitize_string`, then NEL, U+2028
+    and U+2029 as `?`) + `json_quote`; `push_untrusted_argv`: a JSON array
+    within `ARGV_MAX_ITEMS` (32), `ARGV_PER_ITEM_CAP` (256 characters) and
+    `ARGV_TOTAL_CAP` (1,024 bytes, the crossing item cut on a character
+    boundary), returning whether it cut; `REASONING_CAP` = 1,024.
+    `structured_prompt.rs`: `UNTRUSTED_EVENT_DATA_OPEN` / `_CLOSE` (the
+    fence and its preamble as constants, same bytes); `OCCLUDED_ID` =
+    `u32::MAX` and `render_id` (`<redacted>`), used by `push_pid_uid`,
+    `format_correlated_line` and `kernel_details`. The templates: trusted
+    sections first (event, rule or chain context, `### already-taken-action:`
+    with the response only), then the fence with the observed data and a
+    `### rule-reasoning:` (chain: `### correlation:`) section, then the
+    question; `argv_truncated: true` when the template or the kernel cut
+    the argv; `BATCH_MAX_EVENTS` = 50, the newest, with
+    `events_omitted: N (the oldest)`; one wording (`ENRICHMENT_ONLY`,
+    `OBSERVED_INJECTION_ITEM` in `fim_template.rs`): the verdict, its
+    severity and response are final, propose no other, report text that
+    asks for one, enrichment only, `observed_injection_attempt: true or
+    false`. `occlusion.rs`: the four identifiers take `OCCLUDED_ID` in
+    every variant (`anonymised_clone` neutralises no identifier, so it is
+    unchanged). `common/src/xai_types.rs`: `try_sign_with` refuses, unsigned,
+    a chain with a non-finite weight, threshold, temperature, `top_p`,
+    baseline confidence, score, delta, attention score or coverage
+    (`NonFiniteValue { field }`); `Canon` and `sign_with` unchanged.
+    `xai/engine.rs`: `sha256_file` through `install_manifest::sha256_file`
+    (64 KiB chunks), hex decoded; `explain` signs with `try_sign_with`
+    (`XaiUnavailable::NonFiniteValue`). `ade/mod.rs`: `Evaluation { verdict,
+    prompt_sha256 }`, `evaluate_recorded` (`evaluate` with the digest of
+    the prompt the backend got, `None` when none was sent), `prompt_sha256`
+    (one digest function for ADE and XAI); `explain` takes the `Evaluation`
+    and refuses `XaiUnavailable::PromptMismatch` before any probe when the
+    prompt rebuilt from its inputs differs, or when one of the two made no
+    prompt; the chain records the evaluated digest.
+  - Choices: `sanitize_line` rather than `sanitize_string` in the template
+    helper: JSON leaves NEL and U+2028 raw, and a template value should be
+    one line for any reader; the focal prompt's sanitizer and scores are
+    untouched. The reasoning moved out of the trusted section into the
+    fence, since a rule's reasoning quotes observed strings. The
+    false-positive question went with the downgrade (the triage asks for
+    enrichment only): a benign opinion on a verdict whose kill has run is
+    the downgrade by another name. The batch keeps the newest events,
+    like `OverflowBuffer`. `explain` changes signature instead of a second
+    entry point, so that no chain can be made without the evaluated
+    digest; `evaluate` keeps its signature and its behaviour (it hashes
+    the prompt, microseconds beside the inference). Not done: the
+    templates' ids are not rendered through `render_id` (they are never
+    occluded).
+  - Left open: NN-AUD-329 at the wiring (Tappa 10.5): the caller explains
+    with the `Evaluation` that `evaluate_recorded` returned for the same
+    event and `EventContext`, keeps it until it explains (the detection
+    record does not keep the digest), and builds the XAI engine's ADE as
+    the production one apart from R1's sampling, else every explanation
+    is a `PromptMismatch`. The templates' window fit, injection score,
+    reply schema, slot and budgets, record and model-host measurement
+    (the §8 addendum).
+  - Tests: `ade::process_template` `template_fields_cannot_forge_a_section`,
+    `enrichment_prompts_offer_no_downgrade`,
+    `argv_is_capped_regardless_of_input_size` (10,000 arguments of 4 KiB:
+    at most 32 items and 1,024 bytes, `argv_truncated: true`, the prompt
+    under the old test's 4 KiB; it replaces
+    `prompt_stays_within_a_sane_token_budget`; a kernel-cut argv is
+    reported too); `ade::fim_template` `template_fields_cannot_forge_a_section`
+    (individual and batched), `batch_is_capped` (75 events: 50 rendered,
+    the newest), `enrichment_prompts_offer_no_downgrade` (both renderers);
+    `ade::chain_template` `template_fields_cannot_forge_a_section`,
+    `enrichment_prompts_offer_no_downgrade`; the forge tests compare the
+    exact list of section lines for a newline, CR, U+2028, `===` and a
+    `### ` header in every observed field and the reasoning. The existing
+    template tests now expect quoted values (and the chain test no
+    "confirm Critical" or "downgrade to High").
+    `ade::structured_prompt` `prompt_never_renders_argv_or_parent_comm`
+    (the XAI-007 guard: sentinels in argv and `parent_comm`, focal and
+    correlated, absent in plain and base64), `occluded_ids_render_redacted`;
+    `ade::tests` `evaluate_recorded_digest_is_the_prompt_the_backend_got`
+    (after the window fit; none for an injection short-circuit);
+    `xai::occlusion` `identifiers_occlude_to_the_sentinel_not_zero`,
+    `occluding_uid_never_renders_root` (and
+    `occlude_units_region_block_focal_clears_every_field` expects
+    `OCCLUDED_ID`); `xai::saliency` `occluding_a_user_uid_does_not_ask_about_root`
+    (a probe that kills on `uid == 0`: on a uid-1000 process every score
+    is 0; on a root one `focal:uid` ranks first); `xai::engine`
+    `explain_refuses_inputs_other_than_the_evaluated_ones` (another
+    correlated event: `PromptMismatch`, no probe; a verdict with no prompt
+    sent: refused; the evaluated inputs: the recorded digest),
+    `explain_refuses_a_non_finite_chain` (a probe with NaN confidence:
+    `NonFiniteValue`, `baseline_verdict.confidence`),
+    `sha256_file_matches_in_memory_digest` (3 MiB + 7 bytes, an empty file);
+    `common::xai_types` `non_finite_scores_are_refused_not_canonicalised`
+    (NaN, `+inf`, `-inf` in ten fields; a finite chain signs as with
+    `sign_with`). The four engine tests that called `explain` pass an
+    `Evaluation`. On the starting tree the new tests do not compile (new
+    items); with each fix inverted in place (raw interpolation, the argv
+    joined, the batch uncapped, the old question, the sentinel 0, signing
+    without the check, no digest comparison) 14 fail — the three forge
+    tests, the three no-downgrade tests, the two caps, the two occlusion
+    tests, the saliency test, the two `explain` refusals and the
+    non-finite test — and the guard, `occluded_ids_render_redacted`, the
+    hash equality and `canonical_bytes_byte_locked_for_sample` pass, the
+    invariance. Unchanged and green: the lot 182 byte-stable tests
+    (`clean_prompt_bytes_are_pinned`,
+    `clean_host_context_renders_byte_identical`,
+    `pinned_titles_render_unchanged`),
+    `format_rag_block_byte_stable_phase_abcd_contract`, the lot 191 tests,
+    `canonical_bytes_byte_locked_for_sample`,
+    `environment_hash_is_deterministic_and_tamper_sensitive`. Golden suite
+    on `target/kb` (release, 970 documents): 28/30, as since lab PR 145;
+    retrieve p50 103 µs, p95 130 µs.
+  - Host: `cargo fmt`, clippy `--workspace --all-targets` and the
+    agent with `test-privileged,debug-trigger` clean; 2,594 passed, 0
+    failed (2,577 on the starting tree). The CI's `posture_demo` clippy
+    fails on the starting tree as on this one
+    (`agent/examples/posture_demo.rs:121` lacks `argv_truncated` and
+    `filename_truncated`, the known lot `nn-wt-kernfid` cause fixed on
+    `main`).
+  - Lab: No lab or model run (dormant code): unit and saliency tests (a probe that kills on `uid=0`), the byte-locked canonical sample unchanged, lab PRs 182/191's byte-stable prompt tests green, the real-corpus golden suite 28/30. Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.

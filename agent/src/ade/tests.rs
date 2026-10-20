@@ -1308,6 +1308,54 @@ async fn an_overlong_prompt_drops_the_oldest_correlated_events_not_the_system_pr
     );
 }
 
+/// External audit LLMR-019: `evaluate_recorded` returns, beside the verdict
+/// `evaluate` gives, the digest of the very prompt the backend got — after
+/// the window fit — and none when nothing reached the model.
+#[tokio::test]
+async fn evaluate_recorded_digest_is_the_prompt_the_backend_got() {
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+    let cfg = cfg_with(prompt.path(), model.path());
+    let backend = Arc::new(WindowedBackend::new(800));
+    let engine = AdeEngine::new_with_backend(cfg, backend.clone())
+        .await
+        .unwrap();
+    let recent: Vec<Event> = (0..20)
+        .map(|i| {
+            spawn_event(
+                5000 + i,
+                &format!("corr{i:02}"),
+                &format!("/srv/app/{}/corr{i:02}", "d".repeat(120)),
+            )
+        })
+        .collect();
+    let event = spawn_event(4242, "x", "/usr/local/bin/x");
+    let ctx = EventContext {
+        recent_events: recent,
+        host_context: HostContext::discover(),
+    };
+    let rec = engine.evaluate_recorded(&event, &ctx).await.unwrap();
+    let seen = backend.seen.lock().clone().expect("generate was called");
+    assert_eq!(rec.prompt_sha256, Some(prompt_sha256(&seen)));
+    assert_eq!(
+        rec.prompt_sha256,
+        engine
+            .assembled_prompt(&event, &ctx)
+            .map(|p| prompt_sha256(&p))
+    );
+    let plain = engine.evaluate(&event, &ctx).await.unwrap();
+    assert_eq!(rec.verdict.verdict, plain.verdict);
+
+    // Kept from the model by its injection score: no prompt, no digest.
+    let hostile = spawn_event(4243, "x", "/tmp/ignore-previous-instructions.sh");
+    let rec = engine
+        .evaluate_recorded(&hostile, &ctx_with(vec![]))
+        .await
+        .unwrap();
+    assert_eq!(rec.verdict.verdict, AdeAction::Escalate);
+    assert_eq!(rec.prompt_sha256, None);
+}
+
 /// External audit XAI-013: the window fit drops the events that only share
 /// the time window with the focal one before a keyed one (here a process of
 /// the same parent), however old. It used to drop the oldest first.

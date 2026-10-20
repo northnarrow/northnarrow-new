@@ -236,6 +236,29 @@ pub enum XaiUnavailable {
     /// [`Self::InjectionShortCircuit`].
     #[error("the prompt exceeds the model window, nothing to explain")]
     PromptExceedsWindow,
+    /// External audit LLMR-019: the prompt rebuilt from the inputs given to
+    /// `explain` is not the one `evaluate` sent the model (its digest
+    /// differs, or one of the two made no prompt). A chain over it would
+    /// explain another decision; refused before any probe.
+    #[error(
+        "the prompt rebuilt from these inputs ({}) is not the one the model was asked ({}), \
+         nothing to explain",
+        digest_or_none(.rebuilt),
+        digest_or_none(.evaluated)
+    )]
+    PromptMismatch {
+        evaluated: Option<String>,
+        rebuilt: Option<String>,
+    },
+    /// External audit XAI-014: the chain carries a non-finite value
+    /// (`field`), which its canonical form cannot tell apart from another;
+    /// it is not signed.
+    #[error("non-finite value in {field}, the chain is not signed")]
+    NonFiniteValue { field: String },
+}
+
+fn digest_or_none(d: &Option<String>) -> &str {
+    d.as_deref().unwrap_or("no prompt")
 }
 
 fn region_word(r: Region) -> &'static str {
@@ -1146,5 +1169,72 @@ mod tests {
         // Non-increasing by score.
         assert!(a.saliency_map.windows(2).all(|w| w[0].score >= w[1].score));
         let _ = live(); // MonotonicClock smoke (production seam compiles).
+    }
+
+    /// KILL iff the focal process runs as root (`uid == 0`); ALLOW else.
+    /// The shape of a model that weighs privilege, which a sentinel of 0
+    /// made answer about root.
+    struct RootKillProbe;
+    impl DecisionProbe for RootKillProbe {
+        async fn probe(
+            &self,
+            focal: &Event,
+            _ctx: &EventContext,
+        ) -> Result<AdeVerdict, XaiProbeError> {
+            let root = matches!(focal, Event::ProcessSpawn { uid: 0, .. });
+            Ok(if root {
+                verdict(AdeAction::Kill, AdeSeverity::Critical, 0.95)
+            } else {
+                verdict(AdeAction::Allow, AdeSeverity::None, 0.10)
+            })
+        }
+    }
+
+    /// External audit XAI-006: occluding the uid of a uid-1000 process
+    /// asked the probe about uid 0 — root — so a probe that kills root
+    /// flipped, and `focal:uid` ranked first, as if the user's uid had
+    /// driven a decision that never was a kill. With the sentinel nothing
+    /// in this input moves the verdict.
+    #[tokio::test]
+    async fn occluding_a_user_uid_does_not_ask_about_root() {
+        let mut focal = ps("bash");
+        if let Event::ProcessSpawn { uid, gid, .. } = &mut focal {
+            (*uid, *gid) = (1000, 1000);
+        }
+        let run = explain_saliency(
+            &SaliencyConfig::default(),
+            &focal,
+            &ctx(vec![dns("a")]),
+            &RootKillProbe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(run.baseline.verdict, AdeAction::Allow);
+        let uid = run
+            .saliency_map
+            .iter()
+            .find(|e| e.unit_id == "focal:uid")
+            .expect("focal:uid scored on its own");
+        assert_eq!(uid.delta.action_flip, 0.0, "{uid:?}");
+        assert_eq!(uid.score, 0.0, "{uid:?}");
+        assert!(
+            run.saliency_map.iter().all(|e| e.score == 0.0),
+            "{:?}",
+            run.saliency_map
+        );
+
+        // The probe does react to root: a root process is a Kill, and its
+        // uid is what drives it.
+        let run = explain_saliency(
+            &SaliencyConfig::default(),
+            &ps("bash"),
+            &ctx(vec![dns("a")]),
+            &RootKillProbe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(run.baseline.verdict, AdeAction::Kill);
+        assert_eq!(run.saliency_map[0].unit_id, "focal:uid");
+        assert_eq!(run.saliency_map[0].delta.action_flip, 1.0);
     }
 }

@@ -24,11 +24,19 @@
 //! typed neutral sentinel regardless of mode (a scalar field has no
 //! "slot" to preserve, and the prompt must stay schema-valid so the
 //! model reacts to the *absence of signal*, not to malformed input).
+//! External audit XAI-006: the sentinel of a pid, ppid, uid or gid is
+//! [`OCCLUDED_ID`], printed `<redacted>`; it was 0, so an occluded uid
+//! read as root and the counterfactual was "what if root had done it".
 
 use common::wire::ADDR_LEN;
 use common::xai_types::{OcclusionMode, Region};
 use common::{Event, FsProtectOperation};
 
+/// External audit XAI-006: the neutral value of an occluded pid, ppid, uid
+/// or gid, which the prompt prints as `<redacted>`
+/// ([`crate::ade::structured_prompt::render_id`]). It was 0: an occluded
+/// uid read as root, an occluded pid as the idle task.
+pub use crate::ade::structured_prompt::OCCLUDED_ID;
 use crate::ade::{EventContext, HostContext};
 
 /// Coarse role of a focal/host field, so the P3 coarse-to-fine driver
@@ -692,10 +700,10 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
                 filename.clear();
                 exe.path.clear();
             }
-            F::Pid => *pid = 0,
-            F::Ppid => *ppid = 0,
-            F::Uid => *uid = 0,
-            F::Gid => *gid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Ppid => *ppid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
+            F::Gid => *gid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -712,9 +720,9 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::Comm => comm.clear(),
             F::Filename => filename.clear(),
             F::Flags => *flags = 0,
-            F::Pid => *pid = 0,
-            F::Uid => *uid = 0,
-            F::Gid => *gid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
+            F::Gid => *gid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -728,8 +736,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
         } => match field {
             F::Comm => comm.clear(),
             F::Filename => filename.clear(),
-            F::Pid => *pid = 0,
-            F::Uid => *uid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -747,9 +755,9 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
                 filename.clear();
                 exe.path.clear();
             }
-            F::Pid => *pid = 0,
-            F::Ppid => *ppid = 0,
-            F::Uid => *uid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Ppid => *ppid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -770,8 +778,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::SrcAddr => *src_addr = ZERO_ADDR,
             F::SrcPort => *src_port = 0,
             F::Family => *family = 0,
-            F::Pid => *pid = 0,
-            F::Uid => *uid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -795,8 +803,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::QueryType => *query_type = 0,
             F::DstAddr => *dns_server = ZERO_ADDR,
             F::Family => *family = 0,
-            F::Pid => *pid = 0,
-            F::Uid => *uid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -815,8 +823,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             F::Operation => *operation = FsProtectOperation::Unknown(0),
             F::TargetDev => *target_dev = 0,
             F::TargetIno => *target_ino = 0,
-            F::Pid => *pid = 0,
-            F::Uid => *uid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -825,8 +833,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
         // the compiler happy + future-proof the C9 enrichment.
         Event::Fim(fe) => match field {
             F::Filename => fe.path.clear(),
-            F::Pid => fe.modifier_pid = 0,
-            F::Uid => fe.modifier_uid = 0,
+            F::Pid => fe.modifier_pid = OCCLUDED_ID,
+            F::Uid => fe.modifier_uid = OCCLUDED_ID,
             F::Timestamp => fe.timestamp_ns = 0,
             _ => {}
         },
@@ -842,8 +850,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             ..
         } => match field {
             F::Filename => canary_name.clear(),
-            F::Pid => *accessor_pid = 0,
-            F::Uid => *accessor_uid = 0,
+            F::Pid => *accessor_pid = OCCLUDED_ID,
+            F::Uid => *accessor_uid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -852,8 +860,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
         // coverage is needed for the rule-side enumerate path.
         Event::NetFlow(nf) => match field {
             F::Comm => nf.comm.clear(),
-            F::Pid => nf.pid = 0,
-            F::Uid => nf.uid = 0,
+            F::Pid => nf.pid = OCCLUDED_ID,
+            F::Uid => nf.uid = OCCLUDED_ID,
             F::Timestamp => {
                 nf.start_ns = 0;
                 nf.end_ns = 0;
@@ -862,8 +870,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
         },
         Event::NetListener(nl) => match field {
             F::Comm => nl.comm.clear(),
-            F::Pid => nl.pid = 0,
-            F::Uid => nl.uid = 0,
+            F::Pid => nl.pid = OCCLUDED_ID,
+            F::Uid => nl.uid = OCCLUDED_ID,
             F::Timestamp => nl.timestamp_ns = 0,
             _ => {}
         },
@@ -882,8 +890,8 @@ fn neutralise_focal_field(e: &mut Event, field: FocalField) {
             ..
         } => match field {
             F::Comm => comm.clear(),
-            F::Pid => *pid = 0,
-            F::Uid => *uid = 0,
+            F::Pid => *pid = OCCLUDED_ID,
+            F::Uid => *uid = OCCLUDED_ID,
             F::Timestamp => *timestamp_ns = 0,
             _ => {}
         },
@@ -1095,7 +1103,7 @@ mod tests {
                 ..
             } => {
                 assert!(comm.is_empty() && filename.is_empty());
-                assert_eq!(pid, 0);
+                assert_eq!(pid, OCCLUDED_ID);
                 assert_eq!(timestamp_ns, 0);
             }
             _ => panic!("variant changed"),
@@ -1125,5 +1133,92 @@ mod tests {
             c2.host_context.kernel_version, "6.8",
             "untargeted host intact"
         );
+    }
+
+    fn user_spawn() -> Event {
+        let mut e = ps();
+        if let Event::ProcessSpawn { uid, gid, .. } = &mut e {
+            (*uid, *gid) = (1000, 1000);
+        }
+        e
+    }
+
+    /// External audit XAI-006: an occluded identifier is the
+    /// [`OCCLUDED_ID`] sentinel, in every variant that has one, never 0.
+    #[test]
+    fn identifiers_occlude_to_the_sentinel_not_zero() {
+        for f in [
+            FocalField::Pid,
+            FocalField::Ppid,
+            FocalField::Uid,
+            FocalField::Gid,
+        ] {
+            let (e, _) = occlude(
+                &user_spawn(),
+                &ctx(vec![]),
+                &UnitAddr::Focal(f),
+                OcclusionMode::Drop,
+            );
+            let Event::ProcessSpawn {
+                pid,
+                ppid,
+                uid,
+                gid,
+                ..
+            } = e
+            else {
+                panic!("variant changed");
+            };
+            let got = match f {
+                FocalField::Pid => pid,
+                FocalField::Ppid => ppid,
+                FocalField::Uid => uid,
+                _ => gid,
+            };
+            assert_eq!(got, OCCLUDED_ID, "{f:?}");
+            assert_ne!(got, 0, "{f:?}: 0 is the idle task, or root");
+        }
+        let (e, _) = occlude(
+            &dns("a.example"),
+            &ctx(vec![]),
+            &UnitAddr::Focal(FocalField::Uid),
+            OcclusionMode::Drop,
+        );
+        assert!(matches!(e, Event::DnsQuery { uid, .. } if uid == OCCLUDED_ID));
+    }
+
+    /// External audit XAI-006: occluding the uid of a user's process put
+    /// `uid: 0` — root — in the prompt the model was asked about; it prints
+    /// `<redacted>` now, and the pid likewise.
+    #[test]
+    fn occluding_uid_never_renders_root() {
+        use crate::ade::config::AdeConfig;
+        use crate::ade::prompt::SystemPrompt;
+        use crate::ade::sanitize::sanitize_event_for_ade;
+        use crate::ade::structured_prompt::build_structured_prompt;
+        let system = SystemPrompt { raw: "s".into() };
+        let c = ctx(vec![]);
+        for (f, line) in [
+            (FocalField::Uid, "\nuid: <redacted>\n"),
+            (FocalField::Pid, "\npid: <redacted>\n"),
+        ] {
+            let (e, c2) = occlude(&user_spawn(), &c, &UnitAddr::Focal(f), OcclusionMode::Drop);
+            let p = build_structured_prompt(
+                &system,
+                &AdeConfig::default(),
+                &sanitize_event_for_ade(&e),
+                &c2,
+            );
+            assert!(p.user.contains(line), "{f:?}:\n{}", p.user);
+            assert!(!p.user.contains("\nuid: 0\n"), "{}", p.user);
+        }
+        // Unoccluded, the prompt is as it was.
+        let p = build_structured_prompt(
+            &system,
+            &AdeConfig::default(),
+            &sanitize_event_for_ade(&user_spawn()),
+            &c,
+        );
+        assert!(p.user.contains("\npid: 7\nuid: 1000\n"), "{}", p.user);
     }
 }
