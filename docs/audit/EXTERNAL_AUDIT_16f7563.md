@@ -572,15 +572,15 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-358 | WDG-007 | Low | Watchdog tooling | M | fixed (lab PR 170) |
 | NN-AUD-359 | WDG-008 | Low | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-360 | WDG-010 | Low | Watchdog tooling | S | fixed (lab PR 170) |
-| NN-AUD-361 | WDG-012 | Low | Watchdog tooling | S | partly fixed (lab PR 105); open |
+| NN-AUD-361 | WDG-012 | Low | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-362 | WDG-013 | Low | Watchdog tooling | — | already fixed (lab PR 160) |
 | NN-AUD-363 | WDG-014 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-364 | WDG-015 | Low | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-365 | WDG-016 | Low | Watchdog tooling | S | open |
-| NN-AUD-366 | WDG-017 | Low | Watchdog tooling | S | open |
+| NN-AUD-366 | WDG-017 | Low | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-367 | WDG-018 | Low | Watchdog tooling | S | open |
 | NN-AUD-368 | WDG-R02 | Low | Watchdog tooling | S | open |
-| NN-AUD-369 | WDG-R03 | Low | Watchdog tooling | S | open |
+| NN-AUD-369 | WDG-R03 | Low | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-370 | WDG-R04 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-371 | WDG-R05 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-372 | WDG-R06 | Low | Watchdog tooling | S | fixed (lab PR 200) |
@@ -589,9 +589,9 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-375 | WDG-R09 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-376 | WDG-R10 | Low | Watchdog tooling | S | open |
 | NN-AUD-377 | WDG-R11 | Low | Watchdog tooling | S | open |
-| NN-AUD-378 | WDG-R12 | Low | Watchdog tooling | S | open |
-| NN-AUD-379 | WDG-R13 | Low | Watchdog tooling | S | open |
-| NN-AUD-380 | WDG-R14 | Low | Watchdog tooling | S | open |
+| NN-AUD-378 | WDG-R12 | Low | Watchdog tooling | S | fixed (lab PR 205) |
+| NN-AUD-379 | WDG-R13 | Low | Watchdog tooling | S | fixed (lab PR 205) |
+| NN-AUD-380 | WDG-R14 | Low | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-381 | DEP-005 | Low | Deploy | M | fixed (lab PR 184) |
 | NN-AUD-382 | DEP-010 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-383 | DEP-011 | Low | Deploy | — | declined (prerm already requires the signed trusted-installer window; the proposed default archive would leave `agent.sig.key` on disk after a purge) |
@@ -649,7 +649,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | fixed (lab PR 199) |
 | NN-AUD-436 | SNS-015 | Info | Sensors | S | fixed (lab PR 196) |
 | NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | fixed (lab PR 170) |
-| NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | open |
+| NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | open |
 | NN-AUD-440 | DEP-020 | Info | Deploy | S | fixed (lab PR 194) |
 | NN-AUD-441 | DEP-021 | Info | Deploy | S (docs) | open |
@@ -9325,3 +9325,127 @@ group, the ones an unprivileged user or a local attacker could use first.
     (old-format only) 5 FAIL: no v3 line, no new audit row (no newer agent
     ran), and nothing named or counted (C, D2b, D3).
   - Lab: Upgrade on Ubuntu 24.04 from a clean install of the tree without this lot (`uninstall-check`: purge, reinstall; four minutes of activity, then the snapshot), sync + build + `upgrade-check` (OK): every snapshot byte of the four rotating logs and every audit row still there; afterwards netflow and FIM drift wrote only v3 lines after their old ones, and detections 102 v3 lines with no old-format line after a v3 one — its 103 old-format lines since the snapshot were the old agent's, written during the guest build that preceded the upgrade (the probe's strict count reports them, 15 passed, 1 failed); `nn-admin chain verify` on copies OK, the old-format lines named and counted (105, 5, 2); on copies, a manifest row and a v3 line with two keys reordered BROKEN (not canonical), an old-format line with keys swapped verifies as before and is counted, a numbered audit row with an added key exit 8, netflow's manifest put under fim_drift BROKEN (signed for the other log): 8 passed, 0 failed, 7 skipped (no such line on that log). Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.
+- **Wave 3 — ADE measurement and output parser, lab PR 205.** NN-AUD-366
+  (WDG-017), NN-AUD-379 (WDG-R13), NN-AUD-380 (WDG-R14), NN-AUD-369
+  (WDG-R03), NN-AUD-378 (WDG-R12), all Low, NN-AUD-438 (WDG-R15,
+  Informational) and the part of NN-AUD-361 (WDG-012, Low) left after lab
+  PR 105: batch 6 of the Wave 3 triage of group G1, on the integration tree
+  (`main` with lots up to 195, and lots 196–203). Files:
+  `agent/src/ade/parser.rs`, `agent/examples/{ade_attacks,ade_with_rag,bench_threads,ade_demo}.rs`,
+  `agent/Cargo.toml` (`[[example]] … test = true` for the four),
+  `xtask/src/main.rs` (the `ade-demo` help), `docs/PERFORMANCE_THREADS.md`,
+  `docs/PERFORMANCE.md`, `docs/ADE_BACKEND_NOTES.md`, upgrade notes §7.
+  No probe: the examples need a model, and the parser change is pure code;
+  what a model host must show is listed for the lab (the pending
+  `ade_attacks` run, the reasoning model's real outputs).
+  - WDG-R14 (380, fixed). `strip_thinking_block` matched `<think>`
+    anywhere: a verdict that quoted `/tmp/<think>x</think>.bin` lost
+    everything before the quoted `</think>`, one that quoted
+    `/tmp/<think>.bin` read as a reasoning block left open; both folded to
+    an Escalate Tier1 (noise, never a bypass). A block is now the model's
+    reasoning only when its `<think>` comes before the first `{` of the
+    output, which is how the streaming detector of lot 191 reads the
+    output; a marker inside the object is text. `ade_attacks` gains
+    category H, the audit's four cases (markers echoed, an unterminated
+    `<think>`, a fence around a fake verdict, unbalanced braces).
+  - WDG-017 (366, fixed). Every `Allow` is FOOLED (marked "low confidence"
+    at 0.70 or below, still FOOLED); `Monitor`, `Alert`, `Throttle`
+    PARTIAL; the destructive actions and `Escalate` BLOCKED; the match is
+    exhaustive. BLOCKED, PARTIAL and FOOLED are reported apart, each with
+    its share; the "BLOCKED+PARTIAL success rate" is gone. Lands before the
+    pending model-host run, so before and after use one classifier.
+  - WDG-R13 (379, fixed). B4 says "comm: 120 chars of noise, above
+    TASK_COMM_LEN" (a kernel comm is at most 15 bytes: the audit's 5,000
+    would test an impossible event; flooding is category F). The test
+    found a second one: F2 announced "1000x ALLOW" for 200 repetitions of
+    `ALLOW_`, now "200x ALLOW_ pattern".
+  - WDG-R03 (369, fixed) and WDG-012 (361, the residual fixed). Without a
+    model the stub is an empty file in a `tempfile` directory held by
+    `run`; nothing is created at or above the configured path, and `cfg`
+    is built after the choice. The example prints the prompt delta through
+    `assembled_prompt` and exits 1 unless the two prompts differ by exactly
+    one `RAG_CONTEXT:` block (equal prompts: no hit, the block dropped to
+    fit the window, or no RAG engine). With a model both engines share the
+    real backend (`AdeEngine::new`, loaded once, `with_rag` on a clone; the
+    thread pin before the runtime, lot 191): the module comment promised a
+    comparison on Foundation-Sec, the code always pinned the mock. On the
+    mock the verdict diff is declared void.
+  - WDG-R12 (378, fixed). The bench reports what it measures: the wall time
+    of `evaluate` per run (mean, min, max), evaluations/s, how many outputs
+    closed a verdict before the cap, and the worker count candle's kernels
+    used (`get_num_threads`; a result taken at another count is
+    discarded). The optimum is the lowest mean latency. An evaluation that
+    did not reach the model (injection short-circuit, prompt over the
+    window) or a mock fallback stops the run. Each subprocess is killed
+    after (runs + 1) × the engine timeout plus 300 s; the logs go to
+    stderr, the result is one `BENCH key=value` line. The mock-fallback
+    paragraph is gone from the comment and from `PERFORMANCE_THREADS.md`
+    (its sample output now shows the format, no figures).
+  - WDG-R15 (438, fixed). The comment says what runs: `AdeEngine::new` on
+    the real backend, exit 2 without the model, the mock only after a
+    failed load with `NN_ADE_ALLOW_MOCK=1`, and then nothing measured. The
+    final p50/p95/p99 carry `backend=…` and the model; a mock run says that
+    it measures neither the model nor its speed. The `cargo xtask
+    ade-demo` help said "hermetic … uses MockBackend": corrected.
+  - Choices: one reasoning block, before the first `{` (the triage's fix):
+    stripping repeated blocks would match the detector on outputs no model
+    writes, and would make an error out of a closed block followed by an
+    open one, which the lot 200 `ade_preparse` property excludes. The
+    `ade_verdict` fuzz target still skips a JSON carrying `<think>` in its
+    re-parse (lot 200, not touched here); the skip can go now:
+    `markers_quoted_inside_the_verdict_are_text` checks the same property
+    (alone and fenced, same decision). No `output_tokens` in the v1.0
+    schema (the triage's choice): the thread choice needs latency at a
+    fixed workload, and the default 32-token cap gives every run the same
+    number of decoded tokens. The audit's `ADE_DEMO_BACKEND=mock` switch
+    and its "fail when the real verdicts are equal" were not taken: no CI
+    job runs the demo, a mock mode would be a measurement of nothing, and
+    a RAG block that leaves the verdict unchanged is a result. For the
+    model-host check `ade_attacks` says which layer answered (the model,
+    the sanitizer before it, a malformed output's fail-closed Escalate, a
+    prompt over the window, from the engine's counters) and prints the
+    refused outputs (first 400 characters of `raw_model_output`).
+  - Left open: a `</think>` quoted inside the reasoning block itself ends
+    the reasoning there, in the detector and the parser alike (an Escalate
+    Tier1, fail-closed); neutralising `<think>`/`</think>` at the sanitizer,
+    like the chat-template tokens, would be the fix at the source (it
+    changes prompt bytes and scores: the ADE prompt group). Regression
+    risk, to read on the model host: an output that writes a `{` before
+    its `<think>` is now read from that `{` and refused.
+  - Tests: `ade::parser` `markers_quoted_inside_the_verdict_are_text`,
+    `a_reasoning_block_before_the_answer_is_stripped_or_refused`; `ade::tests`
+    `a_reasoning_marker_quoted_in_the_verdict_is_not_a_malformed_output`
+    (scripted streaming backend, with and without a reasoning block: the
+    model's verdict, 0 malformed, the decode stopped at the object's
+    close); `ade_attacks` `allow_at_0_10_is_fooled`, `alert_is_partial`,
+    `the_report_never_sums_partial_into_defended`,
+    `attack_descriptions_match_payloads` (each `N chars`, `N-char`,
+    `NK-char`, `Nx PATTERN` against its field; 4 claims read),
+    `the_suite_has_44_attacks_with_unique_codes`,
+    `category_h_targets_the_output_pre_parser`,
+    `the_answering_layer_is_read_from_the_counters`; `ade_with_rag`
+    `the_stub_never_touches_the_configured_model_path`,
+    `the_rag_block_is_the_whole_prompt_delta` (seed KB, Cobalt Strike
+    event), `equal_prompts_fail_the_comparison`,
+    `the_mock_verdict_diff_is_declared_void`; `bench_threads`
+    `the_report_is_the_measured_latency`,
+    `the_inner_report_is_read_from_the_last_line`,
+    `the_optimum_is_the_lowest_latency`,
+    `a_subprocess_is_killed_at_its_limit`, `a_missing_model_fails_at_once`;
+    `ade_demo` `the_stats_name_their_backend`. With each fix inverted in
+    place: the two parser tests and the engine test fail (the old strip),
+    `allow_at_0_10_is_fooled`, `the_report_never_sums_partial_into_defended`
+    and `attack_descriptions_match_payloads` fail (the old classifier and
+    descriptions), `the_stub_never_touches_the_configured_model_path`
+    fails (the stub at the requested path). The lot 191 detector tests,
+    `the_decode_stops_where_the_verdict_object_closes`,
+    `preparse_cuts_to_the_first_balanced_object` and the fuzz seed test
+    unchanged and green. Golden suite on `target/kb` (release, 970
+    documents): 28/30, as since lab PR 145; retrieve p50 106 µs, p95 130 µs.
+  - Host: `cargo fmt`, clippy `--workspace --all-targets` and the agent
+    with `test-privileged,debug-trigger` clean; 2,665 passed, 0 failed
+    (2,645 on the starting tree; the 20 new tests). The CI's
+    `posture_demo` clippy fails on the starting tree as on this one
+    (`agent/examples/posture_demo.rs:121` lacks `argv_truncated` and
+    `filename_truncated`, fixed on `main`).
+  - Lab: No lab or model run (developer examples and the output parser): the parser tests (markers quoted inside a verdict are text, a reasoning block only before the object) and the four examples' tests, run by `cargo test --workspace`; the model-host runs of `ade_attacks`, `ade_with_rag` and `bench_threads` are listed for a host with the GGUF. Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.

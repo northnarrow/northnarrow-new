@@ -1,17 +1,25 @@
-//! Hermetic ADE demo for Tappa 6.
+//! ADE demo and latency snapshot for Tappa 6 (`cargo xtask ade-demo`).
 //!
-//! Runs ten synthetic events through `AdeEngine` using the
-//! deterministic MockBackend so the verdict stream is reproducible.
-//! Prints each verdict + final p50/p95/p99 stats. Useful both as a
-//! smoke check (`cargo xtask ade-demo`) and as the end-of-Tappa
-//! latency snapshot.
+//! Runs ten synthetic events through `AdeEngine::new`, the production
+//! load: the Candle backend on the model at `ADE_MODEL` (default
+//! [`AdeConfig::DEFAULT_MODEL_PATH`]). Prints each verdict, then the
+//! engine's p50/p95/p99 latencies with the backend that produced them.
+//!
+//! It is not hermetic (external audit WDG-R15): without a model file it
+//! exits 2; a model that fails to load is an error, unless
+//! `NN_ADE_ALLOW_MOCK=1` lets the engine fall back to `MockBackend`. The
+//! mock's verdicts follow from the event alone (a name match, the prompt
+//! is never read) and its latency is a fixed sleep, so a run on it
+//! measures neither the model nor its speed; the report says so. No CI
+//! job runs this example.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use common::Event;
 use northnarrow_agent::ade::backend_candle::{pin_threads_before_runtime, ThreadPin};
+use northnarrow_agent::ade::stats::AdeStatsSnapshot;
 use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
 
 fn main() -> ExitCode {
@@ -53,8 +61,8 @@ async fn run(pin: ThreadPin) -> ExitCode {
     if !model_path.exists() {
         eprintln!(
             "ade-demo: model not present at {}\n\
-             (set ADE_MODEL=/path/to/model.gguf to override; the file is\n\
-              never read by the mock backend, only its presence is checked)",
+             (set ADE_MODEL=/path/to/model.gguf to override; the demo runs the\n\
+              real backend and has no hermetic mode)",
             model_path.display()
         );
         return ExitCode::from(2);
@@ -135,18 +143,29 @@ async fn run(pin: ThreadPin) -> ExitCode {
         }
     }
 
-    let snap = engine.stats();
-    println!(
-        "\nADE stats:\n\
+    print!(
+        "{}",
+        stats_report(engine.backend_name(), &model_path, &engine.stats())
+    );
+
+    ExitCode::SUCCESS
+}
+
+/// The final stats, with the backend and model they were measured on
+/// (external audit WDG-R15: the backend was printed only in the preamble).
+fn stats_report(backend: &str, model: &Path, snap: &AdeStatsSnapshot) -> String {
+    let mut out = format!(
+        "\nADE stats (backend={backend}, model={}):\n\
          \ttotal_inferences   = {}\n\
          \tsuccessful_verdicts= {}\n\
          \tmalformed_outputs  = {}\n\
          \ttimeouts           = {}\n\
          \tbackend_errors     = {}\n\
          \tavg_latency_ms     = {:.2}\n\
-         \tp50_latency_ms     = {}\n\
-         \tp95_latency_ms     = {}\n\
-         \tp99_latency_ms     = {}",
+         \tp50_latency_ms     = {} (backend={backend})\n\
+         \tp95_latency_ms     = {} (backend={backend})\n\
+         \tp99_latency_ms     = {} (backend={backend})\n",
+        model.display(),
         snap.total_inferences,
         snap.successful_verdicts,
         snap.malformed_outputs,
@@ -157,8 +176,14 @@ async fn run(pin: ThreadPin) -> ExitCode {
         snap.p95_latency_ms,
         snap.p99_latency_ms,
     );
-
-    ExitCode::SUCCESS
+    if backend == "mock" {
+        out.push_str(
+            "\nbackend=mock (NN_ADE_ALLOW_MOCK=1 after a failed model load): the verdicts \
+             come from a name match that never reads the prompt, the latencies from a fixed \
+             sleep; neither measures the model.\n",
+        );
+    }
+    out
 }
 
 fn synthetic_events() -> Vec<(&'static str, Event)> {
@@ -201,4 +226,37 @@ fn synthetic_events() -> Vec<(&'static str, Event)> {
         ("xmrig2", mk(1009, "xmrig", "/var/tmp/.x")),
         ("opaque", mk(1010, "obfuscated", "/srv/data/obfuscated")),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// External audit WDG-R15 (NN-AUD-438): the latency figures name their
+    /// backend, and a mock run says that it measures nothing.
+    #[test]
+    fn the_stats_name_their_backend() {
+        let snap = AdeStatsSnapshot {
+            total_inferences: 10,
+            successful_verdicts: 10,
+            malformed_outputs: 0,
+            timeouts: 0,
+            backend_errors: 0,
+            avg_latency_ms: 120.4,
+            p50_latency_ms: 120,
+            p95_latency_ms: 121,
+            p99_latency_ms: 121,
+        };
+        let model = Path::new("/var/lib/northnarrow/models/m.gguf");
+        let mock = stats_report("mock", model, &snap);
+        assert!(
+            mock.contains("p50_latency_ms     = 120 (backend=mock)"),
+            "{mock}"
+        );
+        assert!(mock.contains("neither measures the model"), "{mock}");
+        let real = stats_report("candle-llama3.1", model, &snap);
+        assert!(real.contains("p99_latency_ms     = 121 (backend=candle-llama3.1)"));
+        assert!(real.contains("model=/var/lib/northnarrow/models/m.gguf"));
+        assert!(!real.contains("neither measures"), "{real}");
+    }
 }

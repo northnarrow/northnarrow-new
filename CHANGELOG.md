@@ -61,6 +61,45 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, ADE measurement and output parser (Low WDG-012
+  NN-AUD-361, WDG-017 NN-AUD-366, WDG-R03 NN-AUD-369, WDG-R12 NN-AUD-378,
+  WDG-R13 NN-AUD-379, WDG-R14 NN-AUD-380, WDG-R15 NN-AUD-438; lab PR 205).
+  Parser (WDG-R14): `VerdictParser` stripped a `<think>` reasoning block
+  wherever the marker appeared, so a verdict that quoted a file name such
+  as `/tmp/<think>x</think>.bin` lost its head, or read as a block left
+  open, and folded to an Escalate Tier1 (noise, never a bypass). A block
+  is now the model's reasoning only when it opens before the first `{` of
+  the output, as the streaming detector reads it; a marker inside the
+  object is text (`docs/ADE_BACKEND_NOTES.md`, upgrade notes §7).
+  `ade_attacks` (WDG-017, WDG-R13, WDG-R14): every `Allow`
+  is FOOLED whatever its confidence (one at 0.70 or below counted as
+  PARTIAL, and the "BLOCKED+PARTIAL success rate" counted it as
+  defended); BLOCKED, PARTIAL and FOOLED are reported apart, never
+  summed; B4 says the 120-char comm it sends (it announced 5,000), F2 the
+  200 repetitions it sends (it announced 1,000); a category H of four
+  cases aimed at the output pre-parser (44 attacks); each line and the
+  report say which layer answered (the model, the sanitizer before it, a
+  malformed output's fail-closed Escalate, a prompt over the window), and
+  the refused outputs are printed (first 400 characters). `ade_with_rag`
+  (WDG-012, WDG-R03): without a model the stub is an empty file in a
+  temporary directory, never at the configured path (run as root it left
+  a 0-byte file where the production model belongs); the example prints
+  the prompt delta (`assembled_prompt`) and exits 1 unless the two prompts
+  differ by exactly the `RAG_CONTEXT:` block; with a model both engines
+  share the real backend (it always pinned the mock, which never reads
+  the prompt), and on the mock the verdict diff is declared void.
+  `bench_threads` (WDG-R12): it printed `avg_tok_per_sec`, the token cap
+  times the runs over the time; it reports milliseconds per evaluation
+  and evaluations/s, how many outputs closed a verdict before the cap and
+  the worker count candle used (a result at another count is discarded),
+  refuses a mock run, and kills a subprocess after (runs + 1) × the
+  engine timeout plus 300 s (the wait had no bound); the promised mock
+  fallback is gone from its comment and from `docs/PERFORMANCE_THREADS.md`.
+  `ade_demo` (WDG-R15): its comment and `cargo xtask ade-demo`'s help no
+  longer promise a hermetic, deterministic mock run; the final
+  p50/p95/p99 name their backend, and a mock run says that it measures
+  nothing. The four examples carry tests run by `cargo test --workspace`
+  (`[[example]] … test = true`).
 - External audit, Wave 3, chain pre-image v3 (Low EVD-007 NN-AUD-273,
   EVD-008 NN-AUD-274, EVD-023 NN-AUD-427; lab PR 204). One agent key signs
   every chain. EVD-008: the rotating logs (detections, status events,

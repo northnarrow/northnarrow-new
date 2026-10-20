@@ -6,7 +6,7 @@
 //!   one value per non-GREASE cipher and extension; JA3 is 32 hex digits;
 //! - JA4 ends with two 12-hex-digit hashes after a 10-character prefix
 //!   that starts with `t`;
-//! - a record-wrapped hello parses as its handshake alone.
+//! - a hello inside one record parses as that record's fragment alone.
 use libfuzzer_sys::fuzz_target;
 use northnarrow_agent::net::tls_parser::{
     compute_ja3, compute_ja3_raw, compute_ja4, parse_client_hello,
@@ -69,7 +69,16 @@ fuzz_target!(|data: &[u8]| {
         "{ja4}"
     );
 
-    if data[0] == 0x16 {
-        assert_eq!(parse_client_hello(&data[5..]).as_ref(), Some(&hello));
+    // One record holding the whole message: the record's fragment alone
+    // parses the same. A message split over records is joined from their
+    // fragments, so the bytes after the first header are not the message.
+    if data[0] == 0x16 && data.len() >= 9 {
+        let record_len = usize::from(u16::from_be_bytes([data[3], data[4]]));
+        let message_len =
+            4 + (usize::from(data[6]) << 16 | usize::from(data[7]) << 8 | usize::from(data[8]));
+        if message_len <= record_len {
+            let fragment = &data[5..data.len().min(5 + record_len)];
+            assert_eq!(parse_client_hello(fragment).as_ref(), Some(&hello));
+        }
     }
 });

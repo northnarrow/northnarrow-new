@@ -92,8 +92,11 @@ count pinned via RAYON_NUM_THREADS`, or the operator override).
 cargo run -p northnarrow-agent --release --example bench_threads
 ```
 
-This walks N ∈ {1, 2, 3, 4} on a short prompt and prints the best
-tok/s. On the CCX23 reference host the expected sweet spot is 2-3
+This walks N ∈ {1, 2, 3, 4} on a short prompt and prints the count
+with the lowest latency per evaluation (milliseconds per evaluation and
+evaluations/s at a fixed output cap; external audit WDG-R12: the
+`tok/s` it printed was the cap over the time, not tokens decoded). On
+the CCX23 reference host the expected sweet spot is 2-3
 threads — beyond that, hyperthread contention on the 2-physical-core
 CPU starts costing more than it gains.
 

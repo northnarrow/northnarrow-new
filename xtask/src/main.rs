@@ -73,9 +73,9 @@ enum Cmd {
     },
     /// Parse the eBPF ELF object via aya-obj and dump diagnostics.
     InspectEbpf,
-    /// Run a hermetic ADE demo: 10 synthetic events through the
-    /// engine, dump verdicts + p50/p95/p99 latency. Does not need
-    /// root, eBPF, or a real GGUF — uses MockBackend.
+    /// Run the ADE demo: 10 synthetic events through the engine on the
+    /// real backend, dump verdicts + p50/p95/p99 latency with the
+    /// backend's name. Needs the GGUF (`ADE_MODEL`); not hermetic.
     AdeDemo,
     /// Tappa 6.9.7 P2: acquire + canonicalise the RAG knowledge base
     /// (MITRE ATT&CK v18.1 + SigmaHQ Linux rules) from pinned refs,
@@ -146,9 +146,11 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Hermetic demo: spins up an AdeEngine with the deterministic
-/// MockBackend, runs ten synthetic events, prints verdicts and
-/// stats. No GGUF, no eBPF, no root.
+/// ADE demo (`agent/examples/ade_demo.rs`): ten synthetic events through
+/// `AdeEngine::new`, the real backend, verdicts and stats with the
+/// backend's name. It needs the GGUF (exit 2 without it); the mock only
+/// after a failed load with `NN_ADE_ALLOW_MOCK=1`, and then the figures
+/// measure nothing (external audit WDG-R15). No eBPF, no root.
 fn ade_demo(locked: bool) -> Result<()> {
     let root = repo_root()?;
     let mut cmd = Command::new("cargo");
