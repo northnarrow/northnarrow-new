@@ -315,7 +315,7 @@ pub fn run_shutdown(
     // dispatcher connection while we error.
     let signing_a = read_priv_key(key_path)?;
     let signing_b = read_priv_key(cosign_key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+    let agent_id_arr = agent_id::load_existing(agent_id_path).with_context(|| {
         format!(
             "reading agent_id at {} (nn-admin must run on the agent host \
                  or have the file copied / SSH-forwarded — design §6.5)",
@@ -415,7 +415,7 @@ pub fn run_force_posture(
     target: PostureKind,
 ) -> Result<ForcePostureOutcome> {
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path).with_context(|| {
+    let agent_id_arr = agent_id::load_existing(agent_id_path).with_context(|| {
         format!(
             "reading agent_id at {} (nn-admin must run on the agent host \
                  or have the file copied / SSH-forwarded — design §6.5)",
@@ -557,8 +557,7 @@ pub fn run_rotate_keys_add(
 
     let signing_a = read_priv_key(key_path)?;
     let signing_b = read_priv_key(cosign_key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -620,8 +619,7 @@ pub fn run_rotate_keys_revoke(
     let target_fp = parse_fingerprint_hex(fingerprint_hex)?;
     let signing_a = read_priv_key(key_path)?;
     let signing_b = read_priv_key(cosign_key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -1141,8 +1139,7 @@ pub fn run_fim_baseline(
     use common::wire::admin_protocol::FimBaselineRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -1263,8 +1260,7 @@ pub fn run_fim_status(
     use common::wire::admin_protocol::FimStatusRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -1317,8 +1313,7 @@ pub fn run_fim_report(
     use common::wire::admin_protocol::FimReportRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -1626,8 +1621,7 @@ pub fn run_canary_deploy(
     spec: CanaryDeploySpec,
 ) -> Result<CanaryDeployOutcome> {
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let (canary_type, deployment) = spec.to_wire();
@@ -1675,8 +1669,7 @@ pub fn run_canary_list(
     agent_id_path: &Path,
 ) -> Result<CanaryListOutcome> {
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -1725,8 +1718,7 @@ pub fn run_canary_burn(
     canary_id: String,
 ) -> Result<CanaryBurnOutcome> {
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -1774,8 +1766,7 @@ pub fn run_canary_refresh(
     canary_id: String,
 ) -> Result<CanaryRefreshOutcome> {
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -2066,8 +2057,7 @@ pub fn run_net_flows(
     use common::wire::admin_protocol::NetFlowsRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
 
     let mut stream = connect_socket(socket)?;
     write_frame(
@@ -2126,8 +2116,7 @@ pub fn run_detections(
     use common::wire::admin_protocol::DetectionsRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
 
     let mut stream = connect_socket(socket)?;
     write_frame(
@@ -2270,8 +2259,7 @@ pub fn run_detection_set_status(
     use common::wire::admin_protocol::DetectionSetStatusRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
 
     let mut stream = connect_socket(socket)?;
     write_frame(
@@ -2313,8 +2301,7 @@ pub fn run_net_listeners(
     use common::wire::admin_protocol::NetListenersRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
 
     let mut stream = connect_socket(socket)?;
     write_frame(
@@ -2360,8 +2347,7 @@ pub fn run_net_resolve(
     use common::wire::admin_protocol::{AdminResult, NetResolveRequest};
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
 
     let mut stream = connect_socket(socket)?;
     write_frame(
@@ -2427,8 +2413,7 @@ pub fn run_net_fingerprint(
     use common::wire::admin_protocol::NetFingerprintRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
 
     let mut stream = connect_socket(socket)?;
     write_frame(
@@ -2529,8 +2514,7 @@ pub fn run_trusted_installer_grant(
     use common::wire::admin_protocol::TrustedInstallerGrantRequest;
 
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     const _: () = assert!(AGENT_ID_LEN == 16);
 
     let mut stream = connect_socket(socket)?;
@@ -2591,8 +2575,7 @@ fn signed_request(
     wrap: impl FnOnce(SignedPayload, Vec<KeyedSignature>) -> AdminMessage,
 ) -> Result<AdminMessage> {
     let signing = read_priv_key(key_path)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut stream = connect_socket(socket)?;
     write_frame(
         &mut stream,
@@ -2769,8 +2752,7 @@ pub fn run_config_overlay_set(
 ) -> Result<ConfigOverlaySetOutcome> {
     use common::wire::admin_protocol::ConfigOverlaySetRequest;
     let (content, sha, len) = read_overlay_for_signing(kind, file)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut stream = connect_socket(socket)?;
     write_frame(
         &mut stream,
@@ -2820,8 +2802,7 @@ pub fn run_config_overlay_sign(
 ) -> Result<PathBuf> {
     use rand::RngCore;
     let (_content, sha, len) = read_overlay_for_signing(kind, file)?;
-    let agent_id_arr = agent_id::load_or_bootstrap(agent_id_path)
-        .with_context(|| format!("reading agent_id at {}", agent_id_path.display()))?;
+    let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut nonce = [0u8; 32];
     OsRng.fill_bytes(&mut nonce);
     let now = std::time::SystemTime::now()
@@ -3161,7 +3142,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
-        let agent_id_path = dir.path().join("agent_id");
+        let agent_id_path = write_agent_id_file(&dir, &[0x33u8; 16]);
         let signing = SigningKey::generate(&mut OsRng);
         write_priv_key_file(&priv_path, &signing);
         let vk = signing.verifying_key();
@@ -3208,7 +3189,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
-        let agent_id_path = dir.path().join("agent_id");
+        let agent_id_path = write_agent_id_file(&dir, &[0x33u8; 16]);
         let signing = SigningKey::generate(&mut OsRng);
         write_priv_key_file(&priv_path, &signing);
 
@@ -3372,6 +3353,77 @@ mod tests {
         p
     }
 
+    /// External audit MAIN-010 (NN-AUD-252): nn-admin never mints the
+    /// agent's identity. Before the agent's first start (no `agent_id`) the
+    /// read verbs — and the signing ones — fail naming the file, and leave
+    /// nothing behind: the old `load_or_bootstrap` wrote a fresh id that the
+    /// agent then adopted without a trace.
+    #[test]
+    fn cli_verbs_before_the_first_start_fail_and_mint_nothing() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let priv_path = dir.path().join("admin.key");
+        write_priv_key_file(&priv_path, &SigningKey::generate(&mut OsRng));
+        let missing = dir.path().join("etc/agent_id");
+        let overlay = dir.path().join("x.local");
+        std::fs::write(&overlay, "/etc/x\n").unwrap();
+        let errs: Vec<(&str, anyhow::Error)> = vec![
+            (
+                "fim status",
+                run_fim_status(&socket, &priv_path, &missing).unwrap_err(),
+            ),
+            (
+                "fim report",
+                run_fim_report(&socket, &priv_path, &missing, None).unwrap_err(),
+            ),
+            (
+                "canary list",
+                run_canary_list(&socket, &priv_path, &missing).unwrap_err(),
+            ),
+            (
+                "net flows",
+                run_net_flows(&socket, &priv_path, &missing, None).unwrap_err(),
+            ),
+            (
+                "net listeners",
+                run_net_listeners(&socket, &priv_path, &missing).unwrap_err(),
+            ),
+            (
+                "detections",
+                run_detections(
+                    &socket, &priv_path, &missing, 10, None, None, None, None, None, None,
+                )
+                .unwrap_err(),
+            ),
+            (
+                "trusted-installer-grant",
+                run_trusted_installer_grant(&socket, &priv_path, &missing, 60).unwrap_err(),
+            ),
+            (
+                "config overlay sign",
+                run_config_overlay_sign(
+                    &priv_path,
+                    None,
+                    &missing,
+                    common::wire::admin_signed_payload::OverlayKind::FimPaths,
+                    &overlay,
+                    None,
+                )
+                .unwrap_err(),
+            ),
+        ];
+        for (verb, err) in errs {
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&missing.display().to_string()),
+                "[{verb}] {msg}"
+            );
+            assert!(msg.contains("first start"), "[{verb}] {msg}");
+        }
+        assert!(!missing.exists(), "no agent_id minted");
+        assert!(!missing.parent().unwrap().exists(), "no directory created");
+    }
+
     /// Run `mock_server_fn` in a thread bound to `socket_path`,
     /// while `client_fn` runs in the foreground. Joins the server
     /// thread at the end so any server-side panic is surfaced.
@@ -3532,7 +3584,7 @@ mod tests {
         let signing_b = SigningKey::generate(&mut OsRng);
         write_priv_key_file(&priv_a, &signing_a);
         write_priv_key_file(&priv_b, &signing_b);
-        let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
+        let agent_id_path = write_agent_id_file(&dir, &[0x21u8; 16]);
 
         let socket_for_client = socket.clone();
         let outcome = run_with_mock_server(
@@ -3579,7 +3631,7 @@ mod tests {
         let signing_b = SigningKey::generate(&mut OsRng);
         write_priv_key_file(&priv_a, &signing_a);
         write_priv_key_file(&priv_b, &signing_b);
-        let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
+        let agent_id_path = write_agent_id_file(&dir, &[0x21u8; 16]);
 
         let socket_for_client = socket.clone();
         let outcome = run_with_mock_server(
@@ -3635,7 +3687,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let agent_id_path = write_agent_id_file(&dir, &[0u8; 16]);
+        let agent_id_path = write_agent_id_file(&dir, &[0x21u8; 16]);
         let socket = dir.path().join("never_bound.sock");
 
         let err = run_shutdown(&socket, &priv_a, &priv_b, &agent_id_path, 9999).unwrap_err();

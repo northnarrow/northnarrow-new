@@ -1256,6 +1256,9 @@ fn audit_verify_e2e() {
     assert_eq!(
         ops,
         [
+            // Lab PR 185 (MAIN-009, EVD-020): a fresh state dir mints the
+            // agent's id at boot, signed before `agent_boot`.
+            ("agent_id_minted", "success"),
             ("agent_boot", "success"),
             ("unlock", "success"),
             ("unlock", "failure: invalid_signature"),

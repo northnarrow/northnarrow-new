@@ -340,6 +340,16 @@ packages open it themselves.
   A descriptor a root process opens and hands on keeps root's credentials
   — the check is on the process that connected. The journal line names
   the refused uid, pid, `comm` and executable.
+- **`nn-admin` no longer creates `agent_id`** (NN-AUD-252 MAIN-010, lab
+  PR 185). Every verb that signs for the agent's identity, and `config
+  overlay status`, used to mint `/etc/northnarrow/agent_id` when it was
+  missing — an identity the agent then adopted at its first start without
+  a trace. They now stop with "agent_id not found at …: the agent creates
+  it at its first start" (exit 5) and create nothing. **Regression:** run
+  `nn-admin` after the agent's first start; to sign overlays before it,
+  pre-seed `agent_id` yourself (32 hex characters and a newline, mode
+  0644, not all zeros). `install.sh` already does nothing of the kind
+  before the first start.
 - **`nn-admin canary refresh`** (NN-AUD-172 DEC-010, NN-AUD-173 DEC-011,
   lab PR 143) writes a decoy again from a new random seed, in place, and
   records it. A trip is a signed `trip` row read back at boot.
@@ -699,6 +709,26 @@ Now **killed, or answered, where they were recorded or missed**:
   **Regression:** an `nn-admin` older than the agent reports the new rows
   as broken (`audit verify`, `chain verify`): upgrade the binaries
   together, as for the numbered rows above.
+- **The agent's identity in the audit log** (NN-AUD-251 MAIN-009,
+  NN-AUD-282 EVD-020, lab PR 185). The agent reads `agent_id` once per
+  boot. Its first start signs `agent_id_minted`. A start whose id is not
+  the one the chain's last row carries — the file removed and minted
+  again, replaced, or restored from a backup while the agent was stopped
+  — logs `AGENT IDENTITY CHANGED` (ERROR) and signs `integrity_drift`
+  `agent_id_changed` with the old and the new id, once. A file the agent
+  cannot use (corrupted, all zeros, unreadable) no longer means the
+  all-zero id: the boot runs on a per-boot random id, logs `agent_id
+  UNAVAILABLE` with it (`boot_agent_id`) and signs `subsystem_degraded`;
+  signed admin requests and overlays made for the install's id are refused
+  until the file is repaired. To repair it, sign for that boot: write its
+  id (the `agent_id` of the boot's audit rows) and a newline to a file,
+  `nn-admin trusted-installer-grant --agent-id-file <that file> …`, put the
+  install's id back (or remove the file to mint a new one) and restart in
+  the window. No field changes: existing rows verify, and an older
+  `nn-admin` verifies the new rows. **Regression / note:** a deliberate
+  re-mint or a restore of `agent_id` reports the change once (expected:
+  record why); overlays and admin signatures made for the old id stop
+  verifying, as they always did after a change.
 - **Canary registry rows** (lab PR 143). An older agent skips the new
   `trip` and `decoy_check` rows as unreadable, re-arms tripped canaries and
   chains its next row to the last row it could read, which an off-host
