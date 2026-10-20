@@ -41,6 +41,8 @@ mod open_sensor;
 mod ptrace_check;
 mod read_repeat;
 mod sensor_probe;
+mod socket_connect;
+mod stdio;
 mod task_kill;
 mod tcp_close;
 mod tcp_connect;
@@ -49,7 +51,7 @@ mod zero;
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
+        bpf_get_current_pid_tgid, bpf_get_current_task,
         bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
         bpf_probe_read_user_buf,
     },
@@ -94,14 +96,26 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(1024 * 1024, 0);
 
 #[tracepoint]
 pub fn sched_process_exec(ctx: TracePointContext) -> u32 {
-    match try_sched_process_exec(&ctx) {
+    match try_sched_process_exec::<true>(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// Lab PR 224: [`sched_process_exec`] without the standard-stream probes
+/// (`crate::stdio`), for a kernel whose verifier refuses them. The agent
+/// loads it only then, records R020's loss as a degradation, and keeps the
+/// exec record — whose `stdio` and `parent_stdio` stay zero, "not read".
+#[tracepoint]
+pub fn sched_process_exec_nostdio(ctx: TracePointContext) -> u32 {
+    match try_sched_process_exec::<false>(&ctx) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
 #[inline(always)]
-fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
+fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<(), i64> {
     let mut entry = match EVENTS.reserve::<ProcessSpawnRaw>(0) {
         Some(e) => e,
         None => {
@@ -136,19 +150,11 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
         (*raw_ptr).timestamp_ns = bpf_ktime_get_ns();
     }
 
-    // comm
-    let comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
-    unsafe {
-        // Copy up to TASK_COMM_LEN bytes; the source is exactly 16.
-        let src = comm.as_ptr();
-        let dst = (*raw_ptr).comm.as_mut_ptr();
-        // Bounded compile-time loop, verifier-friendly.
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            *dst.add(i) = *src.add(i);
-            i += 1;
-        }
-    }
+    // comm, straight into the record: no zeroed stack copy, whose `memset`
+    // subprogram call would cost the precision marks the two stdio probes'
+    // global calls below already cost (lab PR 224; KERNEL_COMPATIBILITY
+    // "Older verifiers", rule 9).
+    unsafe { crate::comm::comm_into(&mut (*raw_ptr).comm) };
 
     // filename (variable length via __data_loc)
     let data_loc: u32 = match unsafe { ctx.read_at::<u32>(off!(TP_SCHED_EXEC_FILENAME_OFFSET)) } {
@@ -296,6 +302,40 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
                             (*raw_ptr).trunc_flags |= spawn_trunc::ARGV;
                         }
                     }
+                }
+            }
+        }
+
+        // Lab PR 224 (CM-03): the new image's fds 0..2 and its real
+        // parent's — which are inet sockets, connected out or accepted —
+        // read by a global function into map memory, then copied over
+        // (rule 1: no ring pointer crosses the call). Not in
+        // `sched_process_exec_nostdio`.
+        if STDIO {
+            let _ = crate::stdio::nn_stdio_probe(task as u64, 0);
+            let parent = unsafe {
+                bpf_probe_read_kernel::<u64>(
+                    task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const _,
+                )
+            }
+            .unwrap_or(0);
+            let _ = crate::stdio::nn_stdio_probe(parent, 1);
+            if let Some(s) = crate::stdio::STDIO_SCRATCH.get_ptr(0) {
+                unsafe {
+                    let _ = aya_ebpf::helpers::gen::bpf_probe_read_kernel(
+                        &mut (*raw_ptr).stdio as *mut _ as *mut aya_ebpf::cty::c_void,
+                        core::mem::size_of::<northnarrow_common::wire::StdioRaw>() as u32,
+                        s as *const aya_ebpf::cty::c_void,
+                    );
+                }
+            }
+            if let Some(s) = crate::stdio::STDIO_SCRATCH.get_ptr(1) {
+                unsafe {
+                    let _ = aya_ebpf::helpers::gen::bpf_probe_read_kernel(
+                        &mut (*raw_ptr).parent_stdio as *mut _ as *mut aya_ebpf::cty::c_void,
+                        core::mem::size_of::<northnarrow_common::wire::StdioRaw>() as u32,
+                        s as *const aya_ebpf::cty::c_void,
+                    );
                 }
             }
         }

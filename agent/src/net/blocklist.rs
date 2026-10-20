@@ -204,6 +204,12 @@ impl NetBlocklist {
         self.entries.is_empty()
     }
 
+    /// Lab PR 224: the entries, in order (the `socket_connect` deny loads
+    /// them into its kernel tries).
+    pub fn entries(&self) -> impl Iterator<Item = &NetBlocklistEntry> {
+        self.entries.iter()
+    }
+
     /// Does the loaded blocklist match `addr`?
     pub fn contains(&self, addr: &IpAddr) -> bool {
         self.entries.iter().any(|e| e.matches(addr))

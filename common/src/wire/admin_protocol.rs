@@ -831,6 +831,22 @@ pub struct StatusResponse {
     pub execq_not_held_total: Option<u64>,
     #[serde(default)]
     pub execq_scanner_deaths_total: Option<u64>,
+    /// Lab PR 224 (CM-02): verdicts given to a TCP flow at its connect,
+    /// while it was open, since boot; open-flow snapshots the rules
+    /// re-judged (long-lived flows, every snapshot interval), and those
+    /// due but deferred to a later tick by the per-tick bound; connects
+    /// the optional `socket_connect` deny refused in the kernel (`None`
+    /// when the deny is off). Appended after lab PR 223's `execq_*` (the
+    /// fields of lab PRs 215 to 223 before them, after lab PR 207's); `None`
+    /// from an agent older than the fields.
+    #[serde(default)]
+    pub net_connect_verdicts_total: Option<u64>,
+    #[serde(default)]
+    pub net_flow_snapshots_total: Option<u64>,
+    #[serde(default)]
+    pub net_flow_snapshots_deferred_total: Option<u64>,
+    #[serde(default)]
+    pub net_connect_denied_total: Option<u64>,
 }
 
 /// Lab PR 219: the exploit post-condition guard in `nn-admin status`.
@@ -923,6 +939,10 @@ impl StatusResponse {
             execq_known_hash_total: None,
             execq_not_held_total: None,
             execq_scanner_deaths_total: None,
+            net_connect_verdicts_total: None,
+            net_flow_snapshots_total: None,
+            net_flow_snapshots_deferred_total: None,
+            net_connect_denied_total: None,
         }
     }
 
@@ -2000,6 +2020,10 @@ mod tests {
             execq_known_hash_total: None,
             execq_not_held_total: None,
             execq_scanner_deaths_total: None,
+            net_connect_verdicts_total: None,
+            net_flow_snapshots_total: None,
+            net_flow_snapshots_deferred_total: None,
+            net_connect_denied_total: None,
         }));
     }
 
@@ -2049,6 +2073,10 @@ mod tests {
             execq_known_hash_total: None,
             execq_not_held_total: None,
             execq_scanner_deaths_total: None,
+            net_connect_verdicts_total: None,
+            net_flow_snapshots_total: None,
+            net_flow_snapshots_deferred_total: None,
+            net_connect_denied_total: None,
         }));
     }
 
@@ -2279,6 +2307,10 @@ mod tests {
             execq_known_hash_total: None,
             execq_not_held_total: None,
             execq_scanner_deaths_total: None,
+            net_connect_verdicts_total: Some(4),
+            net_flow_snapshots_total: Some(120),
+            net_flow_snapshots_deferred_total: Some(0),
+            net_connect_denied_total: Some(2),
         }));
     }
 
@@ -2357,6 +2389,10 @@ mod tests {
             execq_known_hash_total: None,
             execq_not_held_total: None,
             execq_scanner_deaths_total: None,
+            net_connect_verdicts_total: None,
+            net_flow_snapshots_total: None,
+            net_flow_snapshots_deferred_total: None,
+            net_connect_denied_total: None,
         }
     }
 
@@ -2553,7 +2589,7 @@ mod tests {
     }
 
     /// The status reply as lab PR 207 left it (its last field
-    /// `net_quic_rows_total`), for the lab PR 215 and lab PR 218 pins.
+    /// `net_quic_rows_total`), for the lab PR 215, 218 and 224 pins.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct StatusResponseLabPr207 {
         posture: PostureKind,
@@ -2632,6 +2668,28 @@ mod tests {
             decode_status_liveness(&status_body(&old)).unwrap().posture,
             PostureKind::Combat
         );
+    }
+
+    /// Lab PR 224: the connect-verdict, snapshot and connect-deny counters
+    /// are appended after lab PR 223's fields (lab PRs 215 to 223 append
+    /// after lab PR 207's) — an `nn-admin` or watchdog of lab PR 207 reads
+    /// every field it knows from a newer reply, and the new counters are the
+    /// reply's last bytes.
+    #[test]
+    fn a_lab207_nn_admin_reads_a_lab224_status_reply() {
+        let mut new = status_with_lab193_fields();
+        new.net_connect_verdicts_total = Some(3);
+        new.net_flow_snapshots_total = Some(9);
+        new.net_flow_snapshots_deferred_total = Some(1);
+        new.net_connect_denied_total = None;
+        let body = postcard::to_allocvec(&new).unwrap();
+        let old: StatusResponseLabPr207 = postcard::from_bytes(&body).unwrap();
+        assert_eq!(old.net_quic_rows_total, Some(5));
+        assert_eq!(old.net_dot_rows_resolver, Some(2));
+        let prefix = postcard::to_allocvec(&old).unwrap();
+        assert!(body.starts_with(&prefix) && body.len() > prefix.len());
+        let back: StatusResponse = postcard::from_bytes(&body).unwrap();
+        assert_eq!(back, new);
     }
 
     /// The status reply of the first agents (Tappa 7): three fields.
@@ -2811,6 +2869,10 @@ mod tests {
         assert_eq!(public.exploit_guard, None);
         assert_eq!(public.execq_state, None);
         assert_eq!(public.execq_held_total, None);
+        assert_eq!(public.net_connect_verdicts_total, None);
+        assert_eq!(public.net_flow_snapshots_total, None);
+        assert_eq!(public.net_flow_snapshots_deferred_total, None);
+        assert_eq!(public.net_connect_denied_total, None);
         assert!(!status_with_lab193_fields().telemetry_withheld());
         // Same shape: an older nn-admin or watchdog reads it.
         let body = postcard::to_allocvec(&public).unwrap();
@@ -2897,7 +2959,8 @@ mod tests {
     /// public, passed through by the unsigned reply — and an `nn-admin` of
     /// lab PR 213 reads every byte before it (the two fields follow lab PR
     /// 215's; the fields appended after them — lab PR 218's four, 219's
-    /// and 222's one each, 223's ten — are `None` in a public reply).
+    /// and 222's one each, 223's ten, 224's four — are `None` in a public
+    /// reply).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -2914,8 +2977,9 @@ mod tests {
         // None is one byte each; Some(bool) two. The fields appended after
         // them (one `None` byte each here) are the last bytes of both: lab
         // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
-        // `cow_guard`, lab PR 223's ten `execq_*`.
-        let tail = 4 + 1 + 1 + 10;
+        // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
+        // counters.
+        let tail = 4 + 1 + 1 + 10 + 4;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);

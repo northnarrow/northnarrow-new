@@ -217,6 +217,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 

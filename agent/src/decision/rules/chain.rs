@@ -88,6 +88,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use common::wire::FlowPhase;
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
@@ -98,6 +99,7 @@ use crate::decision::correlation::{
 };
 use crate::decision::Rule;
 use crate::fim::rules::is_credential_store_access;
+use crate::net::resolvers::HostResolvers;
 use crate::posture::lineage::AuthSessionTracker;
 
 // ── verdict helper ───────────────────────────────────────────────────
@@ -294,8 +296,10 @@ impl Rule for NnLChain001CredReadThenEgress {
                 ))
             }
             // Trigger: same-PID egress after a recorded cred access.
-            // External audit NETR-014: graded by the read's age.
-            Event::NetFlow(nf) => {
+            // External audit NETR-014: graded by the read's age. Lab PR
+            // 224: any phase of the flow (the connect, an open-flow
+            // snapshot, the close), not a connect the kernel refused.
+            Event::NetFlow(nf) if nf.phase != FlowPhase::Denied => {
                 let mut store = self.buf.lock();
                 match store.chain_age_for_pid(nf.pid, PrecursorKind::CredRead, nf.start_ns)? {
                     ChainAge::Fresh => {}
@@ -344,20 +348,31 @@ impl Rule for NnLChain001CredReadThenEgress {
 pub struct NnLChain002TmpExecThenEgress {
     buf: Arc<Mutex<CorrelationStore>>,
     lineage: Option<AuthSessionTracker>,
+    resolvers: Arc<HostResolvers>,
 }
 
 impl NnLChain002TmpExecThenEgress {
-    /// DNS port — a `/tmp` binary doing plain name resolution is not
-    /// the egress that matters; any other port is.
-    const DNS_PORT: u16 = 53;
-
+    /// With no configured resolver: every port-53 flow is an egress.
     pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
-        Self { buf, lineage: None }
+        Self {
+            buf,
+            lineage: None,
+            resolvers: HostResolvers::none(),
+        }
     }
 
     /// With the package-manager carve-out ([`package_mediated`]).
     pub fn with_lineage(mut self, lineage: Option<AuthSessionTracker>) -> Self {
         self.lineage = lineage;
+        self
+    }
+
+    /// Lab PR 224 (CM-02 d, research defect D1): a `/tmp` binary doing
+    /// plain name resolution at a resolver the host is configured with is
+    /// not the egress that matters; any other flow is — TCP/53 to its own
+    /// server included. The exemption used to be any flow to port 53.
+    pub fn with_resolvers(mut self, resolvers: Arc<HostResolvers>) -> Self {
+        self.resolvers = resolvers;
         self
     }
 }
@@ -410,8 +425,13 @@ impl Rule for NnLChain002TmpExecThenEgress {
                 }
                 None
             }
-            // Trigger: same-PID egress to a non-DNS port.
-            Event::NetFlow(nf) if nf.dst_port != Self::DNS_PORT => {
+            // Trigger: same-PID egress other than a lookup at a configured
+            // resolver (lab PR 224: in any phase of the flow but a refused
+            // connect).
+            Event::NetFlow(nf)
+                if nf.phase != FlowPhase::Denied
+                    && !crate::net::resolvers::is_resolver_flow(nf, &self.resolvers) =>
+            {
                 if !self.buf.lock().has_recent_for_pid(
                     nf.pid,
                     PrecursorKind::TmpExec,
@@ -421,14 +441,17 @@ impl Rule for NnLChain002TmpExecThenEgress {
                 {
                     return None;
                 }
-                Some(chain_verdict(
-                    self,
+                Some(crate::decision::response_policy::hold_port_53(
                     nf,
-                    "Process executed from a staging directory (/tmp, /var/tmp, \
-                     /dev/shm) then opened an outbound flow \
-                     to a non-DNS port within the correlation window — \
-                     dropper C2 (T1059 → T1571); kill the process tree + \
-                     posture → COMBAT",
+                    chain_verdict(
+                        self,
+                        nf,
+                        "Process executed from a staging directory (/tmp, /var/tmp, \
+                         /dev/shm) then opened an outbound flow (other than a lookup at a \
+                         configured resolver) within the correlation window — \
+                         dropper C2 (T1059 → T1571); kill the process tree + \
+                         posture → COMBAT",
+                    ),
                 ))
             }
             _ => None,
@@ -484,7 +507,7 @@ impl Rule for NnLChain003CanaryThenEgress {
             }
             // Trigger: same-PID egress after the trip. External audit
             // NETR-014: graded by the trip's age.
-            Event::NetFlow(nf) => {
+            Event::NetFlow(nf) if nf.phase != FlowPhase::Denied => {
                 let age = self.buf.lock().chain_age_for_pid(
                     nf.pid,
                     PrecursorKind::CanaryTrip,
@@ -565,6 +588,9 @@ impl Rule for NnLChain004CrossPidCredExfil {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        if nf.phase == FlowPhase::Denied {
+            return None;
+        }
         // External audit NETR-014: graded by the read's age.
         let age =
             self.buf
@@ -597,17 +623,28 @@ impl Rule for NnLChain004CrossPidCredExfil {
 pub struct NnLChain005CrossPidTmpC2 {
     buf: Arc<Mutex<CorrelationStore>>,
     lineage: Option<AuthSessionTracker>,
+    resolvers: Arc<HostResolvers>,
 }
 
 impl NnLChain005CrossPidTmpC2 {
-    const DNS_PORT: u16 = 53;
+    /// With no configured resolver: every port-53 flow is an egress.
     pub fn new(buf: Arc<Mutex<CorrelationStore>>) -> Self {
-        Self { buf, lineage: None }
+        Self {
+            buf,
+            lineage: None,
+            resolvers: HostResolvers::none(),
+        }
     }
 
     /// With the package-manager carve-out ([`package_mediated`]).
     pub fn with_lineage(mut self, lineage: Option<AuthSessionTracker>) -> Self {
         self.lineage = lineage;
+        self
+    }
+
+    /// Lab PR 224: as [`NnLChain002TmpExecThenEgress::with_resolvers`].
+    pub fn with_resolvers(mut self, resolvers: Arc<HostResolvers>) -> Self {
+        self.resolvers = resolvers;
         self
     }
 }
@@ -633,7 +670,9 @@ impl Rule for NnLChain005CrossPidTmpC2 {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        if nf.dst_port == Self::DNS_PORT {
+        if nf.phase == FlowPhase::Denied
+            || crate::net::resolvers::is_resolver_flow(nf, &self.resolvers)
+        {
             return None;
         }
         if !self.buf.lock().has_recent_in_ancestors(
@@ -645,13 +684,16 @@ impl Rule for NnLChain005CrossPidTmpC2 {
         {
             return None;
         }
-        Some(chain_verdict(
-            self,
+        Some(crate::decision::response_policy::hold_port_53(
             nf,
-            "A process ancestor executed from a staging directory and a descendant then \
-             opened an outbound flow to a non-DNS port — cross-PID \
+            chain_verdict(
+                self,
+                nf,
+                "A process ancestor executed from a staging directory and a descendant then \
+             opened an outbound flow (other than a lookup at a configured resolver) — cross-PID \
              dropper C2 (T1059 → T1571); kill the process tree + \
              posture → COMBAT",
+            ),
         ))
     }
 }
@@ -687,6 +729,9 @@ impl Rule for NnLChain006CrossPidCanaryExfil {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        if nf.phase == FlowPhase::Denied {
+            return None;
+        }
         // External audit NETR-014: graded by the trip's age.
         let age = self.buf.lock().chain_age_in_ancestors(
             nf.pid,
@@ -759,7 +804,7 @@ impl Rule for NnLChain007TmpCredExfilSequence {
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
-            Event::NetFlow(nf) => {
+            Event::NetFlow(nf) if nf.phase != FlowPhase::Denied => {
                 let mut store = self.buf.lock();
                 let key = store.current_key(nf.pid);
                 if !store.has_sequence(
@@ -899,7 +944,9 @@ impl Rule for NnLChain008CrossPidPrivEscExfil {
             }
             // Trigger: a descendant of the sudo/su process leaves the
             // host. Loopback is local IPC, not egress.
-            Event::NetFlow(nf) if !is_on_host(&nf.dst_addr) => {
+            // Lab PR 224: a record (Medium Log), judged once, on the closed
+            // flow, as the network family's other records.
+            Event::NetFlow(nf) if nf.phase == FlowPhase::Closed && !is_on_host(&nf.dst_addr) => {
                 if !self.buf.lock().has_recent_in_ancestors(
                     nf.pid,
                     PrecursorKind::PrivEsc,
@@ -968,6 +1015,16 @@ pub fn chain_rule_set_over(
     store: Arc<Mutex<CorrelationStore>>,
     lineage: Option<AuthSessionTracker>,
 ) -> ChainRuleSet {
+    chain_rule_set_full(store, lineage, HostResolvers::none())
+}
+
+/// [`chain_rule_set_over`] with the host's configured resolvers (lab PR
+/// 224), whose DNS port the staging chains leave to a staged image.
+pub fn chain_rule_set_full(
+    store: Arc<Mutex<CorrelationStore>>,
+    lineage: Option<AuthSessionTracker>,
+    resolvers: Arc<HostResolvers>,
+) -> ChainRuleSet {
     ChainRuleSet {
         head: vec![
             // CHAIN-007 (3-step same-PID) first: the richest verdict wins
@@ -979,12 +1036,18 @@ pub fn chain_rule_set_over(
             // Same-PID 2-step originals.
             Box::new(NnLChain001CredReadThenEgress::new(Arc::clone(&store))),
             Box::new(
-                NnLChain002TmpExecThenEgress::new(Arc::clone(&store)).with_lineage(lineage.clone()),
+                NnLChain002TmpExecThenEgress::new(Arc::clone(&store))
+                    .with_lineage(lineage.clone())
+                    .with_resolvers(Arc::clone(&resolvers)),
             ),
             Box::new(NnLChain003CanaryThenEgress::new(Arc::clone(&store))),
             // Cross-PID variants (strict ancestor — never shadow the above).
             Box::new(NnLChain004CrossPidCredExfil::new(Arc::clone(&store))),
-            Box::new(NnLChain005CrossPidTmpC2::new(Arc::clone(&store)).with_lineage(lineage)),
+            Box::new(
+                NnLChain005CrossPidTmpC2::new(Arc::clone(&store))
+                    .with_lineage(lineage)
+                    .with_resolvers(resolvers),
+            ),
             Box::new(NnLChain006CrossPidCanaryExfil::new(Arc::clone(&store))),
         ],
         tail: vec![Box::new(NnLChain008CrossPidPrivEscExfil::new(Arc::clone(
@@ -1052,6 +1115,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -1091,6 +1155,8 @@ mod tests {
             tls_fingerprint: None,
             flow_id: "abc".to_string(),
             close_reason: 0,
+            phase: Default::default(),
+            observed_ns: 0,
         })
     }
 
@@ -1287,12 +1353,42 @@ mod tests {
         assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
+    /// Lab PR 224: a lookup at a configured resolver is the carve-out —
+    /// the flow helper's destination 203.0.113.9 stands in for one.
     #[test]
-    fn chain002_does_not_fire_on_dns_egress() {
-        let r = chain002();
+    fn chain002_does_not_fire_on_a_lookup_at_a_configured_resolver() {
+        let r = chain002().with_resolvers(HostResolvers::fixed([IpAddr::V4(Ipv4Addr::new(
+            203, 0, 113, 9,
+        ))]));
         r.evaluate(&tmp_spawn(42, 10 * SEC));
-        // Port 53 is the benign-resolver carve-out.
         assert!(r.evaluate(&flow(42, 53, 10 * SEC + SEC)).is_none());
+    }
+
+    /// Lab PR 224 (research defect D1): port 53 to a server the host is not
+    /// configured with is C2 like any other port — the starting tree let
+    /// every port-53 flow through. A new match: Critical, recorded, its kill
+    /// held behind the per-rule policy.
+    #[test]
+    fn chain002_fires_on_port_53_to_a_server_that_is_no_configured_resolver() {
+        let r = chain002().with_resolvers(HostResolvers::fixed([IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 53,
+        ))]));
+        r.evaluate(&tmp_spawn(42, 10 * SEC));
+        let v = r
+            .evaluate(&flow(42, 53, 10 * SEC + SEC))
+            .expect("TCP/53 to its own server is the dropper's C2");
+        assert_eq!(v.severity, Severity::Critical);
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            v.reasoning.contains("configured resolver") && v.reasoning.contains("[held back: "),
+            "{}",
+            v.reasoning
+        );
+        // Another port: the kill, as before lab PR 224.
+        let r = chain002();
+        r.evaluate(&tmp_spawn(43, 10 * SEC));
+        let v = r.evaluate(&flow(43, 4444, 10 * SEC + SEC)).expect("C2");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     #[test]
@@ -1315,6 +1411,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         };
         r.evaluate(&non_tmp);
         assert!(r.evaluate(&flow(42, 4444, 10 * SEC + SEC)).is_none());
@@ -1544,6 +1641,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -1594,9 +1692,21 @@ mod tests {
             fired.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()),
             "{fired:?}"
         );
-        // DNS egress from the descendant is the carve-out.
+        // Lab PR 224: port 53 to a server that is no configured resolver
+        // (the flow helper's 203.0.113.9; `chain_rules` knows none) is an
+        // egress.
         let dns = fire_ids(&rules, &flow(200, 53, 13 * SEC));
-        assert!(!dns.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()));
+        assert!(dns.contains(&"NN-L-CHAIN-005_CrossPidTmpC2".to_string()));
+        // A lookup at a configured one is the carve-out.
+        let store = Arc::new(Mutex::new(CorrelationStore::new()));
+        let r = NnLChain005CrossPidTmpC2::new(Arc::clone(&store)).with_resolvers(
+            HostResolvers::fixed([IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))]),
+        );
+        let spawns = NnLChain002TmpExecThenEgress::new(Arc::clone(&store));
+        spawns.evaluate(&proc_spawn(100, 1, "dropper", "/tmp/dropper", 10 * SEC));
+        spawns.evaluate(&proc_spawn(200, 100, "bash", "/usr/bin/bash", 11 * SEC));
+        assert!(r.evaluate(&flow(200, 53, 13 * SEC)).is_none());
+        assert!(r.evaluate(&flow(200, 4444, 13 * SEC)).is_some());
     }
 
     /// A spawn carrying the process's own start (POS-003).

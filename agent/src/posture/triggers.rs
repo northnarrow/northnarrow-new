@@ -695,7 +695,15 @@ impl TriggerDetector {
                 self.mass_writers.record(pid, ts);
             }
         }
-        if mass_write || staged == Some(StagedExec::Confirmed) {
+        // Lab PR 224 (CM-03): a shell or interpreter whose stdin/stdout is
+        // the network — R020's shape (reverse shell, bind shell, pty-wrapped
+        // reverse shell), read on exec identity and the kernel's file table.
+        // A COMBAT-tier execution signal: on its own it stops at ENGAGED, a
+        // second signal of another class reaches COMBAT.
+        let reverse_shell =
+            crate::decision::rules::r020_shell_with_socket_stdio::shape(event, Some(&self.auth))
+                .is_some();
+        if mass_write || staged == Some(StagedExec::Confirmed) || reverse_shell {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
         if persistence_mechanism(event, &self.auth) {
@@ -1670,6 +1678,7 @@ pub(super) mod testutil {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -1969,6 +1978,36 @@ mod tests {
         assert_eq!(hits, vec![TriggerType::StagingExec]);
     }
 
+    /// Lab PR 224 (CM-03): a shell whose stdin/stdout is a socket connected
+    /// out is a confirmed intrusion (COMBAT tier, corroboration needed);
+    /// the same shell on a terminal, or an accepted socket systemd handed
+    /// over (`Accept=yes`, PID 1 the parent), is not.
+    #[test]
+    fn a_reverse_shell_is_confirmed_intrusion() {
+        let det = detector_with_empty_proc();
+        let with = |ppid: u32, outbound: bool| {
+            let mut e = spawn_exe_flags(44, ppid, "/usr/bin/bash", 0, 1);
+            if let Event::ProcessSpawn { stdio, .. } = &mut e {
+                stdio.own = common::StdioSocket {
+                    read: true,
+                    inet_fds: 0b011,
+                    outbound,
+                    proto: 6,
+                    peer: Some("127.0.0.1:44401".parse().unwrap()),
+                };
+            }
+            e
+        };
+        assert_eq!(
+            det.detect(&with(4000, true), &[]),
+            vec![TriggerType::ConfirmedIntrusion]
+        );
+        assert!(det.detect(&with(1, false), &[]).is_empty());
+        assert!(det
+            .detect(&spawn_exe_flags(45, 4000, "/usr/bin/bash", 0, 1), &[])
+            .is_empty());
+    }
+
     /// External audit POS-015: the mass-write arm fired for the same
     /// process within a window, before or after its exec is read. Another
     /// process, or a burst a window away, is not a second factor.
@@ -2259,6 +2298,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -2281,6 +2321,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 

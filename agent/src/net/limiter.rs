@@ -248,6 +248,8 @@ mod tests {
             flow_id: "f".to_string(),
             close_reason: 0,
             proc_start_ns: 0,
+            phase: Default::default(),
+            observed_ns: 0,
         }
     }
 

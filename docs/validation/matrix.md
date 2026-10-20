@@ -9,8 +9,8 @@ The matrix itself is empty by design — V2–V4 populate it.
 
 | File | What it fixes | Version | Rows | sha256 (LF line endings) |
 |---|---|---|---|---|
-| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 3 | 79 | `18a7222b1fe1be8e321f096642bb3360d9259dbacdc09e9ef9b3326918748c5a` |
-| [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 2 | 60 | `1afd1ac52b1d2c04569c2ca3e7e386ba6f5f90dec86e4e6c8e8bbc9d34f6192b` |
+| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 3 | 82 | `d0dbf3eaccd99468243f203f769bef32f3d091f27857b3fa31819d2116f7208b` |
+| [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 2 | 62 | `f22ae7a6cf96db925177c4cf1d10ed3af0b70b53587e4b9d4f179cf4f767dbb9` |
 | [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 2 | 18 | `5cf990f1e163a823523d4e0af410966c53f716d1eef9ec7b91146d3524ecb9e9` |
 
 Version 1 was frozen on 2026-10-15, before any V2 run. Its rule rows are
@@ -46,11 +46,17 @@ Change log:
   that follows BUG-025. NN-L-CANARY-003 stays in the sub-gate: a connect to
   a network canary trips it since lab PR 163. Sub-gate: 25 rules.
 - `v2-rules.tsv` version 3, `v2-techniques.tsv` version 2,
-  `v2-controls.tsv` version 2 (2026-10-20, lab PR 219, before any V2 run):
-  the exploit post-condition guard's NN-L-EPG-001 (credentials, T1068) and
-  NN-L-EPG-002 (namespaces and root, T1611), issued outside the engine,
-  Critical, in the sub-gate (family `exploit-guard`, 79 rows, sub-gate 27);
-  TQ60 for T1068 and NN-L-EPG-002 in TQ57; CV17 / CV18 for the family.
+  `v2-controls.tsv` version 2 (2026-10-20/21, lab PRs 219 and 224, before
+  any V2 run; one version for both, integrated in that order): the exploit
+  post-condition guard's NN-L-EPG-001 (credentials, T1068) and NN-L-EPG-002
+  (namespaces and root, T1611), issued outside the engine, Critical, in the
+  sub-gate (family `exploit-guard`); TQ60 for T1068 and NN-L-EPG-002 in
+  TQ57; CV17 / CV18 for the family (lab PR 219). R020 (a shell or
+  interpreter with its stdio on a network socket, Critical, in the
+  sub-gate, family `process`), NN-L-NET-026 (scan fan-out) and NN-L-NET-027
+  (outbound brute force), High, family `net`; R020 in TQ19 (T1059.004), TQ61
+  T1046 and TQ62 T1110, both checked in the pinned ATT&CK 20.0 list (lab PR
+  224; no new family, no new control). 82 rows, sub-gate 28.
 
 ## Gate formulas (§13 Q1, as frozen)
 
@@ -142,6 +148,7 @@ brings each one back:
 | R006_ReverseShellTooling | - | `agent/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool` | no proof | no proof | no proof | unit | Critical with KillProcessTree since lab PR 166 (the shell `socat EXEC:` runs is its child). |
 | R007_CryptoMiner | - | `agent/src/decision/rules/r007_crypto_miner.rs::match_is_case_insensitive` | no proof | no proof | no proof | unit | - |
 | R018_KernelModuleLoad | - | `agent/src/decision/rules/r018_kernel_module_load.rs::fire_nonstandard_path_is_critical_killtree` | no proof | no proof | no proof | unit | Critical only for a module outside the module directories; anti-tamper.sh C16 loads an in-tree module. |
+| R020_ShellWithSocketStdio | - | `agent/src/decision/rules/r020_shell_with_socket_stdio.rs::a_shell_on_an_outbound_socket_is_a_critical_reverse_shell` | no proof | `deploy/lab/malsim/net-check.sh::MS06` | no proof | unit | Lab PR 224: the exec sensor reads the new image's fds 0..2 (and its parent's) in `sched_process_exec`; the lab probe (not yet run on a guest) asserts the signed record's `network` "stdio tcp … outbound". |
 | NN-L-EPG-001_CredentialPostcondition | - | `agent/src/decision/rules/epg.rs::credential_write_in_detect_mode_is_a_critical_log` | no proof | no proof | no proof | unit | Lab PR 219, experimental. Issued outside the engine; Critical in both responses (detect: Log; enforce: the kernel's SIGKILL, and in lite the use refused), except lite's degraded evidence — a task record the LRU task map evicted, re-taken holding privilege — at High, Log only in either response (`agent/src/decision/rules/epg.rs::a_lost_baseline_is_degraded_evidence`). Lite (default) catches it at the mechanism or at the first use (`capable`, exec, a root-private open), strict around every call; the record names the variant and the point. The lab probe exercises the record and the response through the debug-build injection, not a real kernel credential write. |
 | NN-L-EPG-002_NamespaceRootPostcondition | - | `agent/src/decision/rules/epg.rs::namespace_escape_is_epg_002` | no proof | no proof | no proof | unit | Lab PR 219, experimental. As NN-L-EPG-001, for namespaces, the fs_struct and the root. |
 | NN-L-FIM-001_SystemBinaryModified | yes | `agent/src/fim/rules.rs::fim001_fires_on_system_binary_modified` | no proof | no proof | no proof | unit | - |
@@ -171,13 +178,13 @@ brings each one back:
 | Family | Rules | PASS | PARTIAL | FAIL | NOT RUN | N/A | Coverage % |
 |---|---|---|---|---|---|---|---|
 | `chain` (NN-L-CHAIN-001..008) | 8 | | | | | | |
-| `process` (R001–R018) | 18 | | | | | | |
+| `process` (R001–R018, R020) | 19 | | | | | | |
 | `fim` (NN-L-FIM-001..025) | 25 | | | | | | |
 | `canary` (NN-L-CANARY-001..004) | 4 | | | | | | |
-| `net` (NN-L-NET-*) | 17 | | | | | | |
+| `net` (NN-L-NET-*) | 19 | | | | | | |
 | `io_uring` (NN-L-IOU-001/002) | 2 | | | | | | |
 | `bpf` (NN-L-BPF-001/002) | 2 | | | | | | |
 | `anti-tamper` (NN-L-AT-001) | 1 | | | | | | |
 | `exploit-guard` (NN-L-EPG-001/002) | 2 | | | | | | |
-| **Total** | **79** | | | | | | |
-| **Critical sub-gate** | **27** | | | | | | |
+| **Total** | **82** | | | | | | |
+| **Critical sub-gate** | **28** | | | | | | |

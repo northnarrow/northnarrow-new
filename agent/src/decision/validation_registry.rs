@@ -167,6 +167,7 @@ fn shipped_rule_ids() -> BTreeMap<String, &'static str> {
         Arc::new(Mutex::new(
             crate::decision::correlation::CorrelationStore::new(),
         )),
+        rules::net::NetRuleConfig::default(),
     );
     let mut ids = BTreeMap::new();
     for r in &engine {

@@ -105,3 +105,11 @@ path = "fuzz_targets/shutdown_marker.rs"
 test = false
 doc = false
 bench = false
+
+# Lab PR 224: the resolver lists of resolv.conf (the port-53 exemption).
+[[bin]]
+name = "resolv_conf"
+path = "fuzz_targets/resolv_conf.rs"
+test = false
+doc = false
+bench = false

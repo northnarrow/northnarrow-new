@@ -25,6 +25,7 @@ audit WDG-R04 to WDG-R08, WDG-014):
 | `install_manifest` | against a fixed fixture directory every parsed manifest reaches the hash comparison; `Verified` exactly when every name is one of those install.sh records (`RECORDED_NAMES`) and its hash matches, an unknown name refused without being opened |
 | `combat_allow` | every generated `iptables-restore` line is exactly `-A NORTHNARROW_COMBAT -s\|-d <validated address> -j ACCEPT`, two per entry of the block's family, none wider than /8 (IPv4) or /48 (IPv6), unspecified or multicast; the splice keeps every line of the operator's base ruleset |
 | `canary_template` | a rendered canary keeps no `{{`, a JSON family's is JSON, the same body renders the same |
+| `resolv_conf` | every resolver parsed is the address of a `nameserver` line (zone index dropped), canonical, listed once, at most sixteen; the list rendered as `nameserver` lines parses back to itself (lab PR 224) |
 | `shutdown_marker` | a marker honoured against the fixture carries a shutdown the fixture keys signed (the fuzzer cannot sign: anything else is a forgery accepted), names the agent that exited, has at most the signature cap, two signers including the `shutdown` key, a capped grace, and is refused as a replay once honoured |
 
 `install_manifest` and

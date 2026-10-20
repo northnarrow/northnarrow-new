@@ -265,6 +265,7 @@ fn spawn_started(pid: u32, start_ns: u64, ppid: u32, parent_start_ns: u64) -> Ev
         exe: Default::default(),
         argv_truncated: false,
         filename_truncated: false,
+        stdio: Default::default(),
     }
 }
 

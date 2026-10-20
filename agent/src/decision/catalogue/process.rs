@@ -422,6 +422,37 @@ pub(super) const DOCS: &[RuleDoc] = &[
         ],
         attack_note: "",
     },
+    // ── a shell on a network socket (lab PR 224, CM-03) ─────────────
+    RuleDoc {
+        id: "R020_ShellWithSocketStdio",
+        severities: &[Severity::Critical],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032", "DC0082"],
+        observes: "A shell or interpreter, by exec identity, whose stdin/stdout is an outbound \
+                   inet socket (the reverse shell), or an accepted one not handed over by an \
+                   inetd-style launcher (the bind shell), or whose parent's stdio is an \
+                   outbound socket (the pty-wrapped reverse shell): `sched_process_exec` \
+                   reads the new image's fds 0..2 and its parent's. Critical, recorded, \
+                   posture ConfirmedIntrusion; the kill of the tree (`KillProcessTree`) is \
+                   held behind the per-rule response policy, off by default (a new rule of \
+                   lab PR 224).",
+        false_positives: "inetd-style services (PID 1 socket activation, inetd, xinetd, \
+                          tcpserver), exempt by the launcher's identity; the process allowlist \
+                          by identity. Without the optional BTF offsets the stdio is not read \
+                          and the rule cannot fire.",
+        how_to_test: "`net-check.sh --only MS06`: bash on a /dev/tcp socket, and the Python \
+                      pty reverse shell (MS06B), to a loopback listener.",
+        tests: &[
+            "agent/src/decision/rules/r020_shell_with_socket_stdio.rs::\
+             a_shell_on_an_outbound_socket_is_a_critical_reverse_shell",
+            "agent/src/decision/rules/r020_shell_with_socket_stdio.rs::\
+             a_pty_wrapped_reverse_shell_fires_on_the_shell",
+            "deploy/lab/malsim/net-check.sh::MS06",
+        ],
+        attack_note: "The shell (T1059.004) and its raw channel (T1095), as R006 maps the \
+                      tools that set one up.",
+    },
     // ── exec quarantine (lab PR 223, experimental, off by default) ──
     RuleDoc {
         id: "NN-L-EXECQ-001_FirstSightQuarantine",

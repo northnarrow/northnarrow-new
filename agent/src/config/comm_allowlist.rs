@@ -72,6 +72,26 @@ pub const NETFLOW_COMM_ALLOWLIST_SHIPPED: Shipped<'static> = Shipped::new(
     EARLIER_NETFLOW_COMM_ALLOWLIST_V1_SHA256,
 );
 
+/// Lab PR 224 (CM-02 d): what a process's lineage holds that revokes a
+/// conditional entry's exemption for it ([`CommAllowlist::with_conditional`]):
+/// `Some(what)` names the precursor, `None` keeps the exemption.
+pub type PrecursorCheck = std::sync::Arc<dyn Fn(u32) -> Option<&'static str> + Send + Sync>;
+
+/// Lab PR 224: the conditional entries and their check.
+#[derive(Clone)]
+struct Conditional {
+    names: Vec<String>,
+    check: PrecursorCheck,
+}
+
+impl std::fmt::Debug for Conditional {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Conditional")
+            .field("names", &self.names)
+            .finish_non_exhaustive()
+    }
+}
+
 /// An immutable set of allowlisted comms. Built once at boot from a
 /// family's `.v1` + `.local` files; the rule layer queries it with
 /// [`CommAllowlist::contains`] on the hot path.
@@ -84,6 +104,9 @@ pub struct CommAllowlist {
     identity: Option<crate::posture::lineage::AuthSessionTracker>,
     /// Where the defaults came from (external audit LLMR-016).
     defaults: DefaultsSource,
+    /// Lab PR 224 (CM-02 d): entries whose exemption a precursor in the
+    /// process's lineage revokes.
+    conditional: Option<Conditional>,
 }
 
 impl PartialEq for CommAllowlist {
@@ -104,6 +127,12 @@ pub enum Judgement {
     /// cannot be read (it exited before its exec event was): the verdict
     /// is recorded, not acted on.
     Unverified,
+    /// Lab PR 224 (CM-02 d): an allowlisted program whose exemption holds
+    /// only while its lineage is clean ([`CommAllowlist::with_conditional`]:
+    /// the transfer tools of the network allowlist), and its lineage
+    /// holds `precursor`: judged as any other process. The tool is
+    /// exempt, not the dropper that drives it.
+    Revoked { precursor: &'static str },
     /// Not allowlisted. `claimed`: its `comm` names an allowlisted program
     /// that its exec identity is not.
     Denied { claimed: bool },
@@ -129,6 +158,16 @@ impl Judgement {
                     v.reasoning
                 );
             }
+            Judgement::Revoked { precursor } => {
+                v.reasoning = format!(
+                    "{} [an allowlisted transfer tool, but its lineage holds {precursor}: \
+                     judged as any other program (lab PR 224)]",
+                    v.reasoning
+                );
+                // Exempt before lab PR 224: its kill is held behind the
+                // per-rule policy (off by default), the record kept.
+                v = crate::decision::response_policy::REVOKED_TRANSFER_TOOL_KILL.hold(v);
+            }
             Judgement::Allowed | Judgement::Denied { claimed: false } => {}
         }
         v
@@ -142,7 +181,21 @@ impl CommAllowlist {
             entries: it.into_iter().collect(),
             identity: None,
             defaults: DefaultsSource::Disk,
+            conditional: None,
         }
+    }
+
+    /// Lab PR 224 (CM-02 d): the entries among `names` exempt a process
+    /// only while `check` finds no precursor in its lineage (a
+    /// staging-directory exec, a credential read, a canary trip, a shell
+    /// an exposed service started): then [`Judgement::Revoked`]. Judged on
+    /// exec identity (with [`Self::with_identity`]), never on `comm`.
+    pub fn with_conditional(mut self, names: &[&str], check: PrecursorCheck) -> Self {
+        self.conditional = Some(Conditional {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            check,
+        });
+        self
     }
 
     /// Where the defaults came from: the `.v1`, or the built-in copy and
@@ -202,7 +255,18 @@ impl CommAllowlist {
         };
         let entries: Vec<&str> = self.entries.iter().map(String::as_str).collect();
         match tracker.exec_identity(pid) {
-            Some(id) if id.is_client(&entries) || id.is_known_binary(known) => Judgement::Allowed,
+            Some(id) if id.is_client(&entries) || id.is_known_binary(known) => {
+                // Lab PR 224: a transfer tool is exempt, not what drives it.
+                if let Some(c) = &self.conditional {
+                    let names: Vec<&str> = c.names.iter().map(String::as_str).collect();
+                    if id.is_client(&names) {
+                        if let Some(precursor) = (c.check)(pid) {
+                            return Judgement::Revoked { precursor };
+                        }
+                    }
+                }
+                Judgement::Allowed
+            }
             Some(_) => Judgement::Denied { claimed: named },
             None if named => Judgement::Unverified,
             None => Judgement::Denied { claimed: false },
@@ -260,6 +324,7 @@ pub fn load_comm_allowlist(
         entries: effective,
         identity: None,
         defaults,
+        conditional: None,
     })
 }
 

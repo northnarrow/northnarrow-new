@@ -570,6 +570,144 @@ struct Cli {
     )]
     netflow_comm_allowlist_local: PathBuf,
 
+    /// Lab PR 224 (CM-02 c): refuse in the kernel, with `EPERM`, every
+    /// `connect()` to an address of the operator netflow blocklist (LSM
+    /// `socket_connect`), before any packet leaves; each refusal is a
+    /// signed NN-L-NET-001 record. Off by default: without it NN-L-NET-001
+    /// kills the process at the connect, once the connection is made.
+    /// Entries wider than /8 (IPv4) or /16 (IPv6), or covering loopback,
+    /// stay out of the kernel deny (the rule still judges them). Ignored in
+    /// detect-only, which never refuses a connect. Also
+    /// `NN_NET_CONNECT_DENY=1` (or `true`, `yes`, `on`; `0`, `false`, `no`,
+    /// `off` leave it off).
+    #[arg(
+        long = "net-connect-deny",
+        env = "NN_NET_CONNECT_DENY",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    net_connect_deny: bool,
+
+    /// Lab PR 224 (CM-02 b): a TCP flow still open is re-judged every this
+    /// many seconds (the rules that need no byte count, with the process's
+    /// current image).
+    #[arg(
+        long = "net-snapshot-interval-secs",
+        env = "NN_NET_SNAPSHOT_INTERVAL_SECS",
+        value_name = "SECS",
+        default_value_t = northnarrow_agent::net::flow_tracker::DEFAULT_SNAPSHOT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    net_snapshot_interval_secs: u64,
+
+    /// Lab PR 224: a flow is first snapshotted once open this many seconds.
+    #[arg(
+        long = "net-snapshot-min-age-secs",
+        env = "NN_NET_SNAPSHOT_MIN_AGE_SECS",
+        value_name = "SECS",
+        default_value_t = northnarrow_agent::net::flow_tracker::DEFAULT_SNAPSHOT_SECS,
+        value_parser = clap::value_parser!(u64).range(0..=86_400)
+    )]
+    net_snapshot_min_age_secs: u64,
+
+    /// Lab PR 224: at most this many open-flow snapshots per check (every
+    /// 10 s); the others wait for the next one (`net status` counts them).
+    #[arg(
+        long = "net-snapshot-max",
+        env = "NN_NET_SNAPSHOT_MAX",
+        value_name = "N",
+        default_value_t = northnarrow_agent::net::flow_tracker::DEFAULT_SNAPSHOT_MAX,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=65_536)
+    )]
+    net_snapshot_max: usize,
+
+    /// Lab PR 224 (CM-14): NN-L-NET-026 records one process (or the
+    /// children of one parent) reaching this many distinct destination
+    /// addresses within the scan window.
+    #[arg(
+        long = "net-scan-hosts",
+        env = "NN_NET_SCAN_HOSTS",
+        value_name = "N",
+        default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_HOSTS,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
+    )]
+    net_scan_hosts: usize,
+
+    /// Lab PR 224: … or this many distinct (address, port) pairs.
+    #[arg(
+        long = "net-scan-pairs",
+        env = "NN_NET_SCAN_PAIRS",
+        value_name = "N",
+        default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_PAIRS,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
+    )]
+    net_scan_pairs: usize,
+
+    /// Lab PR 224: NN-L-NET-026 kills a process reaching this many distinct
+    /// addresses within the window (0: never kill).
+    #[arg(
+        long = "net-scan-kill-hosts",
+        env = "NN_NET_SCAN_KILL_HOSTS",
+        value_name = "N",
+        default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_KILL_HOSTS,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000)
+    )]
+    net_scan_kill_hosts: usize,
+
+    /// Lab PR 224: the scan window.
+    #[arg(
+        long = "net-scan-window-secs",
+        env = "NN_NET_SCAN_WINDOW_SECS",
+        value_name = "SECS",
+        default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_WINDOW_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=3_600)
+    )]
+    net_scan_window_secs: u64,
+
+    /// Lab PR 224: NN-L-NET-027 records this many connects to
+    /// authentication services (SSH, Telnet, RDP, VNC) within its window.
+    #[arg(
+        long = "net-brute-connects",
+        env = "NN_NET_BRUTE_CONNECTS",
+        value_name = "N",
+        default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_BRUTE_CONNECTS,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
+    )]
+    net_brute_connects: usize,
+
+    /// Lab PR 224: … and kills a process reaching this many (0: never).
+    #[arg(
+        long = "net-brute-kill-connects",
+        env = "NN_NET_BRUTE_KILL_CONNECTS",
+        value_name = "N",
+        default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_BRUTE_KILL_CONNECTS,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000)
+    )]
+    net_brute_kill_connects: usize,
+
+    /// Lab PR 224: the brute-force window.
+    #[arg(
+        long = "net-brute-window-secs",
+        env = "NN_NET_BRUTE_WINDOW_SECS",
+        value_name = "SECS",
+        default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_BRUTE_WINDOW_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    net_brute_window_secs: u64,
+
+    /// Lab PR 224: a program (by name, its executable or the script an
+    /// interpreter runs, installed in a root-owned system tree) whose
+    /// processes and their descendants fan out legitimately — the host's
+    /// own monitoring — beside the built-in list; repeatable, or a comma
+    /// list in `NN_NET_FANOUT_EXEMPT`.
+    #[arg(
+        long = "net-fanout-exempt",
+        env = "NN_NET_FANOUT_EXEMPT",
+        value_name = "PROGRAM",
+        value_delimiter = ','
+    )]
+    net_fanout_exempt: Vec<String>,
+
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
     /// the "decision engine ready" line is logged), the agent's PID
@@ -2224,6 +2362,57 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &cli.netflow_blocklist_v1,
         netflow_blocklist.defaults(),
     );
+    // Lab PR 224 (CM-02 c): the optional kernel deny of a connect to a
+    // blocklisted destination, before the late programs are registered as
+    // the agent's own (below). A failure leaves it off: NN-L-NET-001 still
+    // kills at the connect. Detect-only never arms it (review A.1).
+    use northnarrow_agent::sensors::connect_deny::{arming, Arming};
+    let connect_deny = arming(cli.net_connect_deny, detect_only);
+    if connect_deny == Arming::DetectOnly {
+        warn!(
+            "connect deny NOT armed: --net-connect-deny is ignored in detect-only, which never \
+             refuses a connect (NN-L-NET-001 records the flow at the connect, nothing is killed)"
+        );
+    }
+    if connect_deny == Arming::Arm {
+        match northnarrow_agent::sensors::connect_deny::arm(sensor.ebpf_mut(), &netflow_blocklist) {
+            Ok(report) => {
+                for (entry, why) in &report.skipped {
+                    warn!(
+                        entry = %entry,
+                        why,
+                        "connect deny: blocklist entry kept out of the kernel deny \
+                         (NN-L-NET-001 still judges it at the connect)"
+                    );
+                }
+                info!(
+                    ipv4 = report.v4,
+                    ipv6 = report.v6,
+                    skipped = report.skipped.len(),
+                    "connect deny armed on LSM socket_connect: a connect to a blocklisted \
+                     destination is refused in the kernel (--net-connect-deny)"
+                );
+            }
+            Err(e) => {
+                error!(
+                    error = format!("{e:#}"),
+                    "connect deny NOT armed (--net-connect-deny): NN-L-NET-001 kills at the \
+                     connect, after the connection is made"
+                );
+                // Lab PR 218: a requested protection that did not arm is a
+                // signed degradation, listed by `status --key`.
+                northnarrow_agent::boot::degradation::report_signed(
+                    audit_log.as_ref(),
+                    "net_connect_deny",
+                    &format!(
+                        "connect deny not armed (--net-connect-deny): {e:#} — NN-L-NET-001 \
+                         kills at the connect, after the connection is made"
+                    ),
+                    true,
+                );
+            }
+        }
+    }
     let ja3_blocklist = Arc::new(
         Ja3Blocklist::load(
             &cli.netflow_ja3_blocklist_v1,
@@ -2361,6 +2550,38 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     let chain_store = Arc::new(parking_lot::Mutex::new(
         northnarrow_agent::decision::correlation::CorrelationStore::new(),
     ));
+    // Lab PR 224: the host's configured resolvers (the port-53 exemption of
+    // NN-L-NET-008 and NN-L-CHAIN-002/005) and the fan-out thresholds
+    // (NN-L-NET-026/027).
+    let net_rule_config = northnarrow_agent::decision::rules::net::NetRuleConfig {
+        resolvers: northnarrow_agent::net::resolvers::HostResolvers::for_host(),
+        fanout: Arc::new(
+            northnarrow_agent::decision::rules::net_fanout::FanoutConfig {
+                scan_window_ns: cli.net_scan_window_secs * 1_000_000_000,
+                scan_hosts: cli.net_scan_hosts,
+                scan_pairs: cli.net_scan_pairs,
+                scan_kill_hosts: cli.net_scan_kill_hosts,
+                brute_window_ns: cli.net_brute_window_secs * 1_000_000_000,
+                brute_connects: cli.net_brute_connects,
+                brute_kill_connects: cli.net_brute_kill_connects,
+                exempt: cli.net_fanout_exempt.clone(),
+                // Held behind the per-rule policy (off by default).
+                ..Default::default()
+            },
+        ),
+    };
+    info!(
+        resolvers = ?net_rule_config.resolvers.snapshot(),
+        scan_hosts = cli.net_scan_hosts,
+        scan_pairs = cli.net_scan_pairs,
+        scan_kill_hosts = cli.net_scan_kill_hosts,
+        scan_window_secs = cli.net_scan_window_secs,
+        brute_connects = cli.net_brute_connects,
+        brute_kill_connects = cli.net_brute_kill_connects,
+        brute_window_secs = cli.net_brute_window_secs,
+        fanout_exempt_extra = ?cli.net_fanout_exempt,
+        "network rules: configured resolvers (port-53 exemption) and fan-out thresholds"
+    );
     let engine = RuleEngine::with_default_rules_and_net(
         Arc::clone(&netflow_blocklist),
         Arc::clone(&ja3_blocklist),
@@ -2386,6 +2607,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             lineage.clone(),
         ),
         Arc::clone(&chain_store),
+        net_rule_config,
     );
     // External audit PROC-015 / PROC-014: a demo build runs R901..R904
     // ahead of the production engine (operator state included), and
@@ -4103,6 +4325,12 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                 Arc::clone(&netflow_blocklist),
                 Arc::clone(&chain_store),
             );
+            // Lab PR 224 (CM-02 b): the open-flow snapshots.
+            let snapshot = northnarrow_agent::net::flow_tracker::SnapshotPolicy {
+                interval_ns: cli.net_snapshot_interval_secs * 1_000_000_000,
+                min_age_ns: cli.net_snapshot_min_age_secs * 1_000_000_000,
+                max_per_tick: cli.net_snapshot_max,
+            };
             let handle = tokio::spawn(async move {
                 let outcome = drain_loop(
                     close_rb,
@@ -4114,6 +4342,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     listener_db,
                     lineage_for_net,
                     gate,
+                    snapshot,
                     event_tx,
                 )
                 .await;
@@ -4899,7 +5128,13 @@ async fn process_event(
     // Lab PR 222: a mass rewrite of existing files flags its writer for the
     // copy-on-first-write guard (a ransomware verdict's offender).
     northnarrow_agent::cow::observe_event(&event);
-    correlation.push(event.clone());
+    // Lab PR 224: an open flow's rows (its connect, its snapshots, a
+    // refused connect) are for the rules; the correlation buffer keeps its
+    // `TcpConnect` and its closed row, as before.
+    let open_flow_row = matches!(&event, Event::NetFlow(nf) if nf.phase.is_open());
+    if !open_flow_row {
+        correlation.push(event.clone());
+    }
 
     // Review 71: per-event lines for the frequent events (every exec,
     // every flow, every open) are DEBUG. At INFO, an exec burst made
@@ -5251,6 +5486,7 @@ async fn process_event(
                 dst_port = %nf.dst_port,
                 proto = %nf.proto,
                 bytes_sent = %nf.bytes_sent,
+                phase = nf.phase.as_str(),
                 "net flow"
             );
         }
@@ -6326,6 +6562,60 @@ mod tests {
 
         let cli = Cli::try_parse_from(["northnarrow-agent"]).unwrap();
         assert!(cli.removed_flags().is_empty());
+    }
+
+    /// Lab (21/10, debian12): an agent unit with `NN_NET_CONNECT_DENY=1`,
+    /// the value the help and the CHANGELOG give, did not start — exit 2,
+    /// "invalid value '1' for '--net-connect-deny'" (clap's plain bool
+    /// parser takes only `true` / `false` from the environment) — and the
+    /// watchdog held. An environment switch reads 1/0, true/false, yes/no,
+    /// on/off; anything else is refused, never read as on.
+    #[test]
+    fn env_switches_read_1_and_0() {
+        const SWITCHES: &[(&str, &str)] = &[("NN_NET_CONNECT_DENY", "--net-connect-deny")];
+        fn get(cli: &Cli, flag: &str) -> bool {
+            match flag {
+                "--net-connect-deny" => cli.net_connect_deny,
+                _ => unreachable!("{flag}"),
+            }
+        }
+        let clear = || {
+            for (env, _) in SWITCHES {
+                std::env::remove_var(env);
+            }
+        };
+        clear();
+        let cli = Cli::try_parse_from(["northnarrow-agent"]).unwrap();
+        for (_, flag) in SWITCHES {
+            assert!(!get(&cli, flag), "{flag} off by default");
+            let cli = Cli::try_parse_from(["northnarrow-agent", flag]).unwrap();
+            assert!(get(&cli, flag), "{flag} on the command line");
+        }
+        for (value, on) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            for (env, flag) in SWITCHES {
+                std::env::set_var(env, value);
+                let cli = Cli::try_parse_from(["northnarrow-agent"]);
+                std::env::remove_var(env);
+                let cli = cli.unwrap_or_else(|e| panic!("{env}={value}: {e}"));
+                assert_eq!(get(&cli, flag), on, "{env}={value}");
+            }
+        }
+        for (env, _) in SWITCHES {
+            std::env::set_var(env, "maybe");
+            let r = Cli::try_parse_from(["northnarrow-agent"]);
+            std::env::remove_var(env);
+            assert!(r.is_err(), "{env}=maybe is refused, not read as on");
+        }
+        clear();
     }
 
     /// The removed flags are hidden: `--help` no longer offers them.

@@ -21,6 +21,7 @@ pub mod epg;
 pub mod iouring;
 pub(crate) mod module_provenance;
 pub mod net;
+pub mod net_fanout;
 mod r001_exec_from_tmp;
 mod r002_exec_from_dev_shm;
 mod r003_exec_from_var_tmp;
@@ -39,6 +40,8 @@ mod r015_encoding_tooling_service_uid;
 mod r016_debugger_service_uid;
 mod r017_shell_from_nonstandard_path;
 mod r018_kernel_module_load;
+pub mod r020_shell_with_socket_stdio;
+pub mod transfer_tools;
 
 #[cfg(feature = "demo-tappa5")]
 pub mod test_actions;
@@ -123,6 +126,7 @@ pub use r015_encoding_tooling_service_uid::R015EncodingToolingServiceUid;
 pub use r016_debugger_service_uid::R016DebuggerServiceUid;
 pub use r017_shell_from_nonstandard_path::R017ShellFromNonstandardPath;
 pub use r018_kernel_module_load::R018KernelModuleLoad;
+pub use r020_shell_with_socket_stdio::R020ShellWithSocketStdio;
 
 /// Build the default rule set in evaluation order. The process rules
 /// are ordered by [`spawn_rules`]: every kill before any record. The
@@ -208,10 +212,16 @@ pub fn default_rules_with_net(
     // External audit NET-019: the chain rules' correlation store, shared
     // with the netflow limiter.
     correlation: Arc<Mutex<crate::decision::correlation::CorrelationStore>>,
+    // Lab PR 224: the configured resolvers and the fan-out thresholds.
+    net_config: net::NetRuleConfig,
 ) -> Vec<Box<dyn Rule>> {
     // Tappa 10.5 (D5) — chain rules FIRST (see `default_rules` +
     // the chain.rs module docs for the ordering rationale).
-    let chains = chain::chain_rule_set_over(correlation, Some(lineage.clone()));
+    let chains = chain::chain_rule_set_full(
+        Arc::clone(&correlation),
+        Some(lineage.clone()),
+        Arc::clone(&net_config.resolvers),
+    );
     let mut rules: Vec<Box<dyn Rule>> = chains.head;
     // External audit NETR-003 class: the process allowlist judged on what
     // the kernel executed — from the exec event itself for R006, R007 and
@@ -236,12 +246,17 @@ pub fn default_rules_with_net(
     ));
     rules.extend(canary::canary_rules_with_readers(canary_readers));
     // External audit NET-010 (NN-AUD-006): the network allowlist judged on
-    // what the kernel executed, not on comm.
+    // what the kernel executed, not on comm. Lab PR 224 (CM-02 d): its
+    // transfer tools exempt only while their lineage holds no precursor.
     let netflow_comm_allowlist = Arc::new(
         netflow_comm_allowlist
             .as_ref()
             .clone()
-            .with_identity(lineage.clone()),
+            .with_identity(lineage.clone())
+            .with_conditional(
+                transfer_tools::TRANSFER_TOOLS,
+                transfer_tools::precursor_check(Arc::clone(&correlation), lineage.clone()),
+            ),
     );
     rules.extend(net::net_rules(
         blocklist,
@@ -251,6 +266,8 @@ pub fn default_rules_with_net(
         beacon_window,
         dns_cache,
         Some(lineage.clone()),
+        net_config,
+        Some(correlation),
     ));
     // Informational chains (NN-L-CHAIN-008) go LAST so their Log
     // verdict never shadows a blocking rule on the same event.
@@ -386,6 +403,7 @@ fn spawn_rules(
     allowlist: Arc<CommAllowlist>,
     lineage: Option<crate::posture::lineage::AuthSessionTracker>,
 ) -> Vec<Box<dyn Rule>> {
+    let r020 = R020ShellWithSocketStdio::new(Arc::clone(&allowlist), lineage.clone());
     let (r004, r009) = match lineage {
         Some(l) => (
             R004ExecFromProcSelfFd::new(l.clone()),
@@ -397,6 +415,9 @@ fn spawn_rules(
     vec![
         // Kills (and R009's exceptions).
         Box::new(r004),
+        // Lab PR 224 (CM-03): a reverse or bind shell, Critical, ahead of
+        // the tool and staging rules a shell copied to /tmp also meets.
+        Box::new(r020),
         Box::new(R007CryptoMiner::new(al())),
         Box::new(R006ReverseShellTooling::new(al())),
         Box::new(r009),
@@ -544,6 +565,7 @@ pub(crate) mod testutil {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -578,6 +600,7 @@ pub(crate) mod testutil {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -607,6 +630,7 @@ pub(crate) mod testutil {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 

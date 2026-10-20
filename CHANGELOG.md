@@ -6,6 +6,107 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Network verdicts while a flow is open (lab PR 224, W4 CM-02, capabilities
+  C07/C14). A TCP flow used to reach the rules only at its close, so an open
+  reverse shell or C2 session had no verdict while it lived. The connect
+  pump now hands the rules a connect-time row (`FlowPhase::Connect`, the
+  image and DNS name read at the connect) next to `Event::TcpConnect`, and
+  the net drain re-judges every flow still open past 60 s once a minute
+  (`FlowPhase::Snapshot`, the process's current image; at most 512 per check,
+  the rest deferred and counted; `--net-snapshot-interval-secs`,
+  `--net-snapshot-min-age-secs`, `--net-snapshot-max`). The rules that need
+  no byte count judge every phase (NN-L-NET-001/002/008/010/018, the
+  chains); the record-only and byte rules (NET-003/007/009/011/013,
+  CHAIN-008) still judge the closed row, paced as before. A per-flow ledger
+  in the engine keeps one verdict per rule per flow and one chain verdict
+  per flow, so the close does not answer the connect again. Open-phase rows
+  are not written to `netflow.jsonl`. The signed detection record gains
+  `network` (`"tcp 127.0.0.1:4444 connect"`, `"… snapshot open=65s"`,
+  `"… closed"`, `"… denied"`, a connect attempt, a shell's stdio socket);
+  the verdict's reasoning says when a flow was judged open.
+- Optional synchronous deny of a connect to a blocklisted destination:
+  `--net-connect-deny` (`NN_NET_CONNECT_DENY=1`, off by default) loads the
+  operator netflow blocklist into two LPM tries and attaches a new BPF-LSM
+  program on `socket_connect`; a `connect()` to a listed address fails with
+  `EPERM` and is a signed NN-L-NET-001 record (`operation` `connect`).
+  Entries wider than /8 (IPv4) or /16 (IPv6), or covering loopback or the
+  unspecified address, stay out of the kernel copy (NN-L-NET-001 still
+  judges them); IPv4-mapped entries load as IPv4. A detect-only agent never
+  arms it: no connect is refused and nothing is killed.
+- Destructive responses new in lab PRs 219–226 are held, by the decision
+  of 21/10/2026: no new destructive automation is on by default until the
+  signed per-rule response policy (Phase 2). Every kill, or COMBAT entry
+  without corroboration, that a new rule or a wider match of an existing
+  one would make stays in the rule's definition behind a switch that is off
+  by default (`decision::response_policy`): the verdict keeps its severity,
+  its signed record and its posture escalation, its action is `Log`, its
+  reasoning says what was held back. A held verdict never stands in for a
+  response that existed before it: the engine keeps evaluating and a later
+  rule's kill still runs. Held here: R020's kill, NN-L-NET-026/027's kill
+  tier, the kill of NN-L-NET-008 and NN-L-CHAIN-002/005 on port 53 of a
+  server that is no configured resolver (port 53 was exempt), and the
+  kill of an allowlisted transfer tool whose lineage holds a precursor (it
+  was exempt).
+- R020_ShellWithSocketStdio (Critical, record; W4 CM-03): the exec
+  sensor reads in `sched_process_exec` which of the new image's fds 0..2 —
+  and its parent's — are AF_INET/AF_INET6 sockets, their peer and protocol,
+  and whether one was connected out (its socket in `FLOW_SOCK_MAP`)
+  (`ProcessSpawnRaw.stdio` / `parent_stdio`, `Event::ProcessSpawn::stdio`,
+  new optional offset `SOCKET_SK_OFFSET`). A shell or interpreter by exec
+  identity whose stdin/stdout is an outbound inet socket (the reverse
+  shell), or an accepted one not handed over by an inetd-style launcher
+  (PID 1, inetd, xinetd, tcpserver… by identity: the bind shell), or a
+  shell whose parent's stdio is an outbound socket (the pty-wrapped reverse
+  shell, `dup2` then `pty.spawn`) is recorded, Critical; its kill of the
+  tree is held behind the per-rule policy (off by default); the posture
+  raises ConfirmedIntrusion for the same shape. ATT&CK (lab PR 221's typed
+  mapping, Enterprise 20.0): Execution T1059.004 and Command and Control
+  T1095 (the raw socket on its standard streams), as R006.
+- NN-L-NET-026_ScanFanOut and NN-L-NET-027_OutboundAuthBruteforce (High;
+  W4 CM-14): connect attempts and UDP sends are counted per process and per
+  parent's direct children in sliding windows — ≥64 distinct hosts or ≥256
+  (host, port) pairs in 60 s is recorded, ≥512 hosts from one process is
+  the kill tier; ≥20 connects to SSH/Telnet/RDP/VNC ports in 300 s is
+  recorded, ≥100 from one process is the kill tier. The kill tier is held
+  behind the per-rule policy (off by default): a second record. Thresholds
+  are agent flags (`--net-scan-*`, `--net-brute-*`, environment `NN_NET_*`;
+  a weaker value is a signed weakening, `weakening_env` for a variable,
+  `weakening_flag` for a flag, as are the `--net-snapshot-*` values). The
+  host's monitoring and orchestration (Prometheus, Zabbix, Nagios, kubelet,
+  Ansible, …, plus `--net-fanout-exempt`) are exempt by lineage: the name
+  of the executable the kernel ran, in a root-owned system tree, never the
+  `comm` a process sets. ATT&CK: Discovery T1046 and Credential Access T1110 (lab PR 221's
+  typed mapping; both active in the pinned Enterprise 20.0 list).
+- `nn-admin net status` (signed telemetry) appends four counters: verdicts
+  at connect, open-flow snapshots judged and deferred, connects refused in
+  the kernel (`StatusResponse` fields appended at the end).
+- Lab suite `deploy/lab/malsim/net-check.sh` (`deploy/lab/nn-lab.sh
+  net-check`): benign loopback simulations MS-04/04B/05/05B/06/06B/06N/21
+  and a negative run, verdicts read from the signed detections log,
+  `--before` prints KNOWN GAP where the starting tree has no verdict. New
+  fuzz target `resolv_conf`. Registry: `v2-rules.tsv` version 3 (shared
+  with lab PR 219's rows: 82 rows, sub-gate 28), `v2-techniques.tsv`
+  version 2 (TQ61 T1046, TQ62 T1110, after lab PR 219's TQ60).
+
+### Fixed
+- The port-53 exemption of NN-L-NET-008 and NN-L-CHAIN-002/005 ignored the
+  protocol and the server (research defect D1): an implant in `/tmp` with
+  its C2 on TCP/53 to its own server passed all three. It now covers only a
+  flow to port 53 (UDP or TCP) of one of the host's configured resolvers
+  (`nameserver` lines of `/etc/resolv.conf` and
+  `/run/systemd/resolve/resolv.conf`, re-read when they change). That
+  match is new, so its kill is held behind the per-rule policy (off by
+  default): a record at the rule's severity.
+- The transfer tools of `netflow-comm-allowlist` (`curl`, `wget`, `ssh`,
+  `scp`, `sftp`, `rsync`, `git`) stay exempt from the network record and
+  port rules for what they are, but no longer when their lineage holds a
+  precursor (research defect D9): an exec from a staging directory or a
+  staged image among the ancestors, a credential-store read, a canary
+  trip, or a shell an exposed network service started — the
+  `curl … | sh` of a dropper and the `ssh` of a web shell are judged like
+  any other program (`Judgement::Revoked`, said in the reasoning). They
+  were exempt before, so a kill there is held behind the per-rule policy
+  (off by default): a record at the rule's severity.
 - Exec quarantine at first sight, EXPERIMENTAL and off by default
   (capabilities C13, C12; lab PR 223; `docs/design/EXEC_QUARANTINE.md`).
   With `--exec-quarantine enforce` an executable never judged on the host,
@@ -128,9 +229,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 - Every rule declares its MITRE ATT&CK tactics and techniques as data
   (lab PR 221, capability C16): `Rule::attack()` returns typed
   references (a `Tactic` enum, technique ids checked for shape when they
-  compile) of ATT&CK Enterprise 20.0. All 80 rules the agent can record
-  (lab PR 219's two and lab PR 223's NN-L-EXECQ-001 included) are mapped —
-  61 techniques and sub-techniques under 12 tactics — and a rule detection
+  compile) of ATT&CK Enterprise 20.0. All 83 rules the agent can record
+  (lab PR 219's two, lab PR 223's NN-L-EXECQ-001 and lab PR 224's three
+  included) are mapped — 62 techniques and sub-techniques under 12
+  tactics — and a rule detection
   record now carries their ids in `mitre` (it was always empty on the rule
   path) and the version in a new `mitre_version` field
   (`"20.0"`). Records written before keep their bytes and still verify:
@@ -202,8 +304,9 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   shows the variant, response and counters. The decision model is `common::epg`, the same code in the
   kernel programs and the unit tests; 17 new optional BTF offsets (slots
   78–94, later slots renumbered); a kernel missing one leaves the guard off
-  and attested. Validation registry: `v2-rules.tsv` v3 (79 rows, sub-gate
-  27), `v2-techniques.tsv` v2 (TQ60 T1068), `v2-controls.tsv` v2. Lab:
+  and attested. Validation registry: `v2-rules.tsv` v3 (with lab PR 224's
+  rows: 82 rows, sub-gate 28), `v2-techniques.tsv` v2 (TQ60 T1068),
+  `v2-controls.tsv` v2. Lab:
   `deploy/lab/epg/` (negative suite, debug-build fault injection for both
   variants, microbenchmark modes `getppid` and `rdzero` in `nn-bench`).
   Design note: `docs/design/EXPLOIT_POSTCONDITION_GUARD.md`.

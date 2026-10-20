@@ -51,6 +51,7 @@
 #   deploy/lab/nn-lab.sh exec-sensor-check # Tappa 10.9 step 2: the exec sensor on LSM bprm_check_security (review 61)
 #   deploy/lab/nn-lab.sh execq-check     # lab PR 223 (EXPERIMENTAL): exec quarantine at first sight, six cases, guest put back
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
+#   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
 #   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # agent death via systemd in a window, assert respawn v2 invariants
@@ -1320,6 +1321,15 @@ cmd_dns_sensor_check() {
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/dns-sensor/dns-sensor-check.sh'
 }
 
+cmd_net_check() {
+    # Lab PR 224 (deploy/lab/malsim/net-check.sh): benign loopback
+    # simulations of a long-lived C2 session, a beacon, a staged binary on
+    # TCP/53, reverse shells and an outbound scan / brute force; the verdicts
+    # are read from the signed detections log. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/net-check.sh'
+}
+
 cmd_fim_reuse_check() {
     # Review 57 (deploy/lab/fim/inode-reuse-check.sh): a file dropped in a
     # watched directory and deleted gives its inode number back; a write to
@@ -1993,6 +2003,7 @@ case "${1:-help}" in
     open-sensor-check) cmd_open_sensor_check ;;
     exec-sensor-check) cmd_exec_sensor_check ;;
     execq-check) cmd_execq_check ;;
+    net-check)     cmd_net_check ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;

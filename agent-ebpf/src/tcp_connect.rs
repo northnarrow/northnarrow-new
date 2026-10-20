@@ -44,8 +44,10 @@ use northnarrow_common::wire::{
     TASK_COMM_LEN,
 };
 
+/// Also written by the `socket_connect` deny (`socket_connect.rs`): a
+/// refused connect is a record of this ring with `tcp_connect_flags::DENIED`.
 #[map]
-static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+pub(crate) static TCP_CONNECT_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 /// Tappa 10 (N2) — `FLOW_SOCK_MAP`. Key = kernel `struct sock *`
 /// (cast to u64), value = 16-byte correlation ID. Populated by

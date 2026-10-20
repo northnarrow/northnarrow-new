@@ -2417,6 +2417,8 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.degradations.is_none()
         && out.exploit_guard.is_none()
         && out.execq_state.is_none()
+        && out.net_connect_verdicts_total.is_none()
+        && out.net_flow_snapshots_total.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2447,7 +2449,7 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
             .collect();
         println!(
-            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{},\"flow_sock_pending\":{},\"flow_sock_capacity\":{},\"flow_sock_forgotten_min\":{},\"net_dot_rows_total\":{},\"net_dot_rows_resolver\":{},\"net_quic_rows_total\":{},\"telemetry_signed\":{}}}",
+            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{},\"flow_sock_pending\":{},\"flow_sock_capacity\":{},\"flow_sock_forgotten_min\":{},\"net_dot_rows_total\":{},\"net_dot_rows_resolver\":{},\"net_quic_rows_total\":{},\"net_connect_verdicts_total\":{},\"net_flow_snapshots_total\":{},\"net_flow_snapshots_deferred_total\":{},\"net_connect_denied_total\":{},\"telemetry_signed\":{}}}",
             opt(out.netflow_rows_skipped_total),
             opt(out.netflow_pending_evicted_total),
             drops.join(","),
@@ -2460,6 +2462,10 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             opt(out.net_dot_rows_total),
             opt(out.net_dot_rows_resolver),
             opt(out.net_quic_rows_total),
+            opt(out.net_connect_verdicts_total),
+            opt(out.net_flow_snapshots_total),
+            opt(out.net_flow_snapshots_deferred_total),
+            opt(out.net_connect_denied_total),
             out.telemetry_signed,
         );
         return;
@@ -2509,6 +2515,50 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
     for line in encrypted_flow_lines(out) {
         println!("{line}");
     }
+    for line in open_flow_lines(out) {
+        println!("{line}");
+    }
+}
+
+/// Lab PR 224 (CM-02): the verdicts given while a flow was open, the
+/// snapshots of long-lived flows and the kernel connect deny, for
+/// `net status`.
+fn open_flow_lines(out: &StatusOutcome) -> Vec<String> {
+    let label = |l: &str| format!("{l:<38}: ");
+    let count = |v: Option<u64>, what: &str| match v {
+        Some(n) => format!("{n} since boot{what}"),
+        None => "(agent predates the counter)".to_string(),
+    };
+    let mut lines = vec![
+        format!(
+            "{}{}",
+            label("verdicts at connect (flow open)"),
+            count(out.net_connect_verdicts_total, "")
+        ),
+        format!(
+            "{}{}",
+            label("open-flow snapshots judged"),
+            count(
+                out.net_flow_snapshots_total,
+                &match out.net_flow_snapshots_deferred_total {
+                    Some(d) if d > 0 =>
+                        format!(" ({d} deferred to a later tick by the per-tick bound)"),
+                    _ => String::new(),
+                }
+            )
+        ),
+    ];
+    lines.push(match out.net_connect_denied_total {
+        Some(n) => format!(
+            "{}{n} since boot (socket_connect deny, operator blocklist)",
+            label("connects refused in the kernel")
+        ),
+        None => format!(
+            "{}off (`--net-connect-deny` not set, or an older agent)",
+            label("connects refused in the kernel")
+        ),
+    });
+    lines
 }
 
 /// External audit NET-017 (lab PR 207): the traffic whose names and
@@ -4608,8 +4658,8 @@ mod quorum_help_tests {
 mod flow_sock_line_tests {
     use super::{
         capability_lines, combat_evidence_line, degradation_lines, deny_fail_open_line,
-        encrypted_flow_lines, exploit_guard_line, flow_sock_line, response_mode_line,
-        telemetry_withheld, trust_line, withheld_line,
+        encrypted_flow_lines, exploit_guard_line, flow_sock_line, open_flow_lines,
+        response_mode_line, telemetry_withheld, trust_line, withheld_line,
     };
     use northnarrow_agent::admin_cli::StatusOutcome;
 
@@ -4686,6 +4736,10 @@ mod flow_sock_line_tests {
             execq_known_hash_total: None,
             execq_not_held_total: None,
             execq_scanner_deaths_total: None,
+            net_connect_verdicts_total: None,
+            net_flow_snapshots_total: None,
+            net_flow_snapshots_deferred_total: None,
+            net_connect_denied_total: None,
             telemetry_signed: true,
         }
     }
@@ -4772,6 +4826,44 @@ mod flow_sock_line_tests {
         o.net_dot_rows_total = Some(1);
         o.net_dot_rows_resolver = Some(5);
         assert!(encrypted_flow_lines(&o)[0].contains("1 by the local resolver"));
+    }
+
+    /// Lab PR 224 (CM-02): `net status` reports the verdicts given while a
+    /// flow was open, the open-flow snapshots (the deferred ones said), and
+    /// the kernel connect deny as off unless the agent sends its count.
+    #[test]
+    fn net_status_reports_the_open_flow_counters() {
+        let mut o = outcome(None, None, None);
+        let l = open_flow_lines(&o);
+        assert_eq!(l.len(), 3);
+        assert!(l[0].ends_with("(agent predates the counter)"), "{}", l[0]);
+        assert!(
+            l[2].contains(": off (`--net-connect-deny` not set"),
+            "{}",
+            l[2]
+        );
+        o.net_connect_verdicts_total = Some(3);
+        o.net_flow_snapshots_total = Some(14);
+        o.net_flow_snapshots_deferred_total = Some(2);
+        o.net_connect_denied_total = Some(1);
+        let l = open_flow_lines(&o);
+        assert!(
+            l[0].starts_with("verdicts at connect (flow open)       : 3 since boot"),
+            "{}",
+            l[0]
+        );
+        assert!(
+            l[1].contains(": 14 since boot (2 deferred to a later tick"),
+            "{}",
+            l[1]
+        );
+        assert!(
+            l[2].contains(": 1 since boot (socket_connect deny"),
+            "{}",
+            l[2]
+        );
+        o.net_flow_snapshots_deferred_total = Some(0);
+        assert!(open_flow_lines(&o)[1].ends_with(": 14 since boot"));
     }
 
     /// Lab PR 164: occupancy, and the forgotten sockets once beyond capacity.

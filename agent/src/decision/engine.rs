@@ -1,12 +1,17 @@
 //! Rule engine: holds a sequence of [`Rule`]s and routes events
 //! through them.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use common::{Event, Verdict};
+use common::wire::FlowPhase;
+use common::{Event, ResponseAction, Verdict};
 use parking_lot::Mutex;
 
 use super::attack::AttackRef;
+use super::flow_ledger::{self, FlowLedger};
+use super::response_policy;
+
 use super::rules::net::DnsBurstWindow;
 use super::rules::{default_rules, default_rules_with_net};
 use super::Rule;
@@ -20,12 +25,27 @@ use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 /// cheap obvious match short-circuits the rest.
 pub struct RuleEngine {
     rules: Vec<Box<dyn Rule>>,
+    /// Lab PR 224 (CM-02): the rules that already answered each open flow
+    /// ([`flow_ledger`]).
+    flow_ledger: Mutex<FlowLedger>,
+}
+
+/// Lab PR 224: verdicts given to a flow at its connect, since boot.
+static CONNECT_VERDICTS: AtomicU64 = AtomicU64::new(0);
+
+/// Lab PR 224 (CM-02): verdicts given to a TCP flow at its connect, while
+/// it was open, by any engine since boot (status surface).
+pub fn connect_verdicts_total() -> u64 {
+    CONNECT_VERDICTS.load(Ordering::Relaxed)
 }
 
 impl RuleEngine {
     /// Empty engine. Useful for tests that pin a single rule.
     pub fn new() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            flow_ledger: Mutex::new(FlowLedger::default()),
+        }
     }
 
     /// Engine pre-loaded with [`default_rules`]: the production
@@ -64,6 +84,8 @@ impl RuleEngine {
         // External audit NET-019: the chain rules' correlation store, which
         // the netflow limiter reads too.
         correlation: Arc<Mutex<super::correlation::CorrelationStore>>,
+        // Lab PR 224: the configured resolvers and the fan-out thresholds.
+        net_config: super::rules::net::NetRuleConfig,
     ) -> Self {
         let mut e = Self::new();
         for r in default_rules_with_net(
@@ -78,6 +100,7 @@ impl RuleEngine {
             lineage,
             canary_readers,
             correlation,
+            net_config,
         ) {
             e.add_rule(r);
         }
@@ -125,6 +148,12 @@ impl RuleEngine {
 
     /// First-match wins. Returns the verdict from the earliest rule
     /// that fires, or `None` if every rule abstains.
+    ///
+    /// Lab PR 224 (CM-02): a flow is judged in each of its phases (the
+    /// connect, the open-flow snapshots, the close); a rule that already
+    /// answered the flow in an earlier phase is skipped, and a flow gets
+    /// one chain verdict ([`flow_ledger`]). A verdict on an open flow, or
+    /// on a refused connect, says so in its reasoning.
     pub fn evaluate(&self, event: &Event) -> Option<Verdict> {
         self.evaluate_with_attack(event).map(|(v, _)| v)
     }
@@ -132,12 +161,85 @@ impl RuleEngine {
     /// [`Self::evaluate`], with the ATT&CK references of the rule that
     /// fired ([`Rule::attack`]) for its detection record (lab PR 221).
     pub fn evaluate_with_attack(&self, event: &Event) -> Option<(Verdict, &'static [AttackRef])> {
+        let flow = match event {
+            Event::NetFlow(nf) => Some(nf),
+            _ => None,
+        };
+        let key = flow.map(|nf| (nf.pid, nf.start_ns));
+        let fired = key.and_then(|k| self.flow_ledger.lock().fired(&k));
+        let mut found = None;
+        // A verdict whose response a rule held behind the per-rule policy
+        // (`response_policy`): an alert that must not stand in for a later
+        // rule's response — the one that rule gave before the hold existed.
+        let mut held = None;
         for rule in &self.rules {
+            if fired
+                .as_deref()
+                .is_some_and(|f| flow_ledger::excluded(rule.id(), f))
+            {
+                continue;
+            }
+            response_policy::take_held();
             if let Some(v) = rule.evaluate(event) {
-                return Some((v, rule.attack()));
+                if response_policy::take_held() {
+                    if held.is_none() {
+                        held = Some((rule.id(), rule.attack(), v));
+                    }
+                    continue;
+                }
+                if held.is_some() && v.action == ResponseAction::Log {
+                    // The held alert outranks a later record.
+                    break;
+                }
+                found = Some((rule.id(), rule.attack(), v));
+                break;
             }
         }
-        None
+        let found = found.or(held);
+        match (flow, key) {
+            (Some(nf), Some(key)) => {
+                let mut ledger = self.flow_ledger.lock();
+                match nf.phase {
+                    // The flow is over: nothing more will name it.
+                    FlowPhase::Closed => ledger.forget(&key),
+                    FlowPhase::Connect | FlowPhase::Snapshot => {
+                        if let Some((id, _, _)) = &found {
+                            ledger.record(key, id);
+                        }
+                    }
+                    // No flow follows a refused connect.
+                    FlowPhase::Denied => {}
+                }
+                if nf.phase == FlowPhase::Connect && found.is_some() {
+                    CONNECT_VERDICTS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // Review 70: a chain completed by a precursor processed after
+            // its egress names that egress (pid, connect time): its later
+            // phases get no second chain verdict.
+            _ => {
+                if let Some((id, _, v)) = &found {
+                    if id.starts_with("NN-L-CHAIN-") && v.timestamp_ns != 0 {
+                        self.flow_ledger
+                            .lock()
+                            .record((v.event_pid, v.timestamp_ns), id);
+                    }
+                }
+            }
+        }
+        let (_, attack, v) = found?;
+        Some((
+            match flow {
+                Some(nf) => flow_ledger::annotate(v, nf),
+                None => v,
+            },
+            attack,
+        ))
+    }
+
+    /// Flows the engine remembers a verdict for (tests, metrics).
+    pub fn open_flows_with_verdicts(&self) -> usize {
+        self.flow_ledger.lock().len()
     }
 }
 

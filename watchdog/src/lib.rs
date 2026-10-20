@@ -4164,6 +4164,10 @@ mod tests {
                 execq_known_hash_total: None,
                 execq_not_held_total: None,
                 execq_scanner_deaths_total: None,
+                net_connect_verdicts_total: None,
+                net_flow_snapshots_total: None,
+                net_flow_snapshots_deferred_total: None,
+                net_connect_denied_total: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

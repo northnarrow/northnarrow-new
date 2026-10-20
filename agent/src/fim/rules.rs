@@ -2830,6 +2830,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         };
         for rule in fim_rules(TrustedInstallerOverride::inert_arc()) {
             assert!(

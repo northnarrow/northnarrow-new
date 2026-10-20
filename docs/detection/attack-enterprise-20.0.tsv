@@ -81,6 +81,7 @@ T1098	technique	active	Account Manipulation	persistence,privilege-escalation	-
 T1098.004	subtechnique	active	SSH Authorized Keys	persistence,privilege-escalation	-
 T1105	technique	active	Ingress Tool Transfer	command-and-control	-
 T1106	technique	active	Native API	execution	-
+T1110	technique	active	Brute Force	credential-access	-
 T1132	technique	active	Data Encoding	command-and-control	-
 T1136	technique	active	Create Account	persistence	-
 T1136.001	subtechnique	active	Local Account	persistence	-

@@ -351,6 +351,8 @@ mod tests {
             tls_fingerprint: None,
             flow_id: "abc".to_string(),
             close_reason: 0,
+            phase: Default::default(),
+            observed_ns: 0,
         };
         note_flow(&ev);
         let after = encrypted_flows();

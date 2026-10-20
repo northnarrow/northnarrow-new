@@ -224,13 +224,7 @@ impl SensorMultiplexer {
         // Lab PR 164: FLOW_SOCK_MAP's occupancy for `nn-admin net status`.
         crate::sensors::flow_sock::install(&mut ebpf);
 
-        attach_tracepoint(
-            &mut ebpf,
-            "sched_process_exec",
-            "sched",
-            "sched_process_exec",
-        )?;
-        crate::boot::manifest::note_sensor("process_spawn", "tracepoint:sched/sched_process_exec");
+        attach_exec_tracepoint(&mut ebpf)?;
         attach_tracepoint(
             &mut ebpf,
             "sys_enter_openat",
@@ -381,9 +375,11 @@ impl SensorMultiplexer {
         let bpf_syscall_rb = take_ringbuf(&mut ebpf, "BPF_SYSCALL_EVENTS")?;
 
         let (tx, rx) = mpsc::channel::<Event>(CHANNEL_CAPACITY);
-        let flow_tracker_for_tcp = net
-            .as_ref()
-            .map(|w| (Arc::clone(&w.flow_tracker), w.lineage.clone()));
+        let flow_tracker_for_tcp = net.as_ref().map(|w| ConnectWiring {
+            flow_tracker: Arc::clone(&w.flow_tracker),
+            lineage: w.lineage.clone(),
+            dns_cache: Arc::clone(&w.dns_cache),
+        });
         let dns_cache_for_dns = net.as_ref().map(|w| Arc::clone(&w.dns_cache));
         // External audit SNS-014: the DNS pump names a sender through the
         // lineage tracker (its spawn cache, `/proc` checked against the
@@ -582,6 +578,61 @@ fn attach_tracepoint_any(
             names.join("|")
         ))
     })
+}
+
+/// Lab PR 224: R020's evidence lost when `sched_process_exec` is refused.
+pub const STDIO_PROBE_DEGRADED: &str = "R020 (shell or interpreter with its standard streams on a \
+     network socket) cannot fire: this kernel's verifier refused the standard-stream probes of \
+     sched_process_exec, which runs without them (exec records say \"not read\")";
+
+/// The process-spawn sensor: `sched_process_exec`, or — when the kernel's
+/// verifier refuses it — `sched_process_exec_nostdio`, the same program
+/// without R020's standard-stream probes (lab PR 224, `crate::stdio` in the
+/// eBPF crate). The probes are the only part a refusal costs: the exec
+/// record keeps flowing, R020's loss is a signed degradation. An attach
+/// failure is fatal, as before.
+fn attach_exec_tracepoint(ebpf: &mut Ebpf) -> Result<()> {
+    const WITH_STDIO: &str = "sched_process_exec";
+    const WITHOUT_STDIO: &str = "sched_process_exec_nostdio";
+    let program = match load_tracepoint(ebpf, WITH_STDIO).err() {
+        None => WITH_STDIO,
+        Some(e) => {
+            error!(
+                error = %crate::sensors::exe_identity::verifier_tail(&e),
+                "process spawn sensor: `{WITH_STDIO}` refused — loading it without the standard-stream \
+                 probes; R020 cannot fire on this kernel"
+            );
+            load_tracepoint(ebpf, WITHOUT_STDIO)?;
+            crate::boot::degradation::report("stdio_probe", STDIO_PROBE_DEGRADED);
+            WITHOUT_STDIO
+        }
+    };
+    let prog: &mut TracePoint = ebpf
+        .program_mut(program)
+        .ok_or_else(|| anyhow!("program {program} missing from eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {program} is not a tracepoint"))?;
+    prog.attach("sched", "sched_process_exec")
+        .with_context(|| perf_attach_hint("attaching tracepoint sched/sched_process_exec"))?;
+    crate::boot::manifest::note_sensor(
+        "process_spawn",
+        if program == WITH_STDIO {
+            "tracepoint:sched/sched_process_exec"
+        } else {
+            "tracepoint:sched/sched_process_exec (no standard-stream probes: R020 off)"
+        },
+    );
+    Ok(())
+}
+
+fn load_tracepoint(ebpf: &mut Ebpf, program_name: &str) -> Result<()> {
+    let prog: &mut TracePoint = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
+        .try_into()
+        .with_context(|| format!("program {program_name} is not a tracepoint"))?;
+    prog.load()
+        .with_context(|| format!("verifier rejected `{program_name}`"))
 }
 
 fn attach_tracepoint(
@@ -807,9 +858,18 @@ where
 
 // ── Tappa 10 N9 — feeder-aware TcpConnect + DnsQuery pumps ───────────
 
+/// What the connect pump feeds and reads: the flow tracker, the image of
+/// the connecting process, and (lab PR 224) the DNS name of the
+/// destination for the connect-time row.
+struct ConnectWiring {
+    flow_tracker: Arc<Mutex<FlowTracker>>,
+    lineage: AuthSessionTracker,
+    dns_cache: Arc<DnsCache>,
+}
+
 fn spawn_tcp_connect_pump(
     rb: RingBuf<MapData>,
-    flow_tracker: Option<(Arc<Mutex<FlowTracker>>, AuthSessionTracker)>,
+    flow_tracker: Option<ConnectWiring>,
     tx: mpsc::Sender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -821,7 +881,7 @@ fn spawn_tcp_connect_pump(
 
 async fn pump_tcp_connect(
     rb: RingBuf<MapData>,
-    flow_tracker: Option<(Arc<Mutex<FlowTracker>>, AuthSessionTracker)>,
+    flow_tracker: Option<ConnectWiring>,
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
@@ -835,20 +895,10 @@ async fn pump_tcp_connect(
             let bytes: &[u8] = item.as_ref();
             match bytemuck::try_from_bytes::<TcpConnectRaw>(bytes) {
                 Ok(raw) => {
-                    // Feed the userland flow tracker FIRST so the
-                    // matching `tcp_close` fexit (drained on the
-                    // dedicated NET_FLOW_CLOSE_EVENTS task) can
-                    // always find a `PendingFlow` when it looks
-                    // up the corr_id. The send-to-bus below is
-                    // best-effort — losing it doesn't break flow
-                    // correlation.
-                    if let Some((ft, lineage)) = flow_tracker.as_ref() {
-                        // Resolved before the tracker's lock is taken.
-                        let info = tcp_connect_info_from_raw(raw, lineage);
-                        ft.lock().on_tcp_connect(&info);
-                    }
-                    if tx.send(Event::from(raw)).await.is_err() {
-                        return Ok(());
+                    for event in connect_events(raw, flow_tracker.as_ref()) {
+                        if tx.send(event).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
                 Err(_e) => reject.record(
@@ -864,6 +914,44 @@ async fn pump_tcp_connect(
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
+}
+
+/// The events one connect record becomes, in bus order.
+///
+/// - A connect the `socket_connect` deny refused (lab PR 224, CM-02 c):
+///   its [`common::wire::FlowPhase::Denied`] row only — no flow exists,
+///   nothing is pending.
+/// - A connect: the flow tracker is fed FIRST, so the matching
+///   `tcp_close` fexit (drained on the NET_FLOW_CLOSE_EVENTS task) always
+///   finds its pending flow; then `Event::TcpConnect` (posture, canary,
+///   fan-out rules); then (lab PR 224, CM-02 a) the flow's connect-time
+///   row, with the image named now and the DNS name of its destination,
+///   for the rules that need no byte count to judge it while it is open.
+///   Without net wiring (the exec sensor's live test) only the
+///   `TcpConnect`.
+fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Event> {
+    let Some(w) = wiring else {
+        return vec![Event::from(raw)];
+    };
+    // Resolved before the tracker's lock is taken.
+    let info = tcp_connect_info_from_raw(raw, &w.lineage);
+    if raw.flags & common::wire::tcp_connect_flags::DENIED != 0 {
+        crate::sensors::connect_deny::note_denied();
+        let mut row = FlowTracker::denied_row(&info);
+        row.resolved_hostname =
+            w.dns_cache
+                .lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
+        return vec![Event::NetFlow(row)];
+    }
+    let row = w.flow_tracker.lock().on_tcp_connect(&info);
+    let mut out = vec![Event::from(raw)];
+    if let Some(mut row) = row {
+        row.resolved_hostname =
+            w.dns_cache
+                .lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
+        out.push(Event::NetFlow(row));
+    }
+    out
 }
 
 fn tcp_connect_info_from_raw(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) -> TcpConnectInfo {
@@ -882,8 +970,10 @@ fn tcp_connect_info_from_raw(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) 
         dst_port: raw.dst_port,
         // The N2 connect kprobe only fires for TCP, but keep proto
         // explicit so the emitted NetFlowEvent.proto matches the
-        // tracker's caller-supplied input (design §4.1 contract).
-        proto: 6,
+        // tracker's caller-supplied input (design §4.1 contract). Lab PR
+        // 224: a record of the `socket_connect` deny names the socket's
+        // protocol (a connected UDP socket is refused too).
+        proto: if raw.proto != 0 { raw.proto } else { 6 },
         pid: raw.pid,
         uid: raw.uid,
         comm: String::from_utf8_lossy(&raw.comm[..comm_len]).into_owned(),
@@ -1075,6 +1165,76 @@ mod tests {
         }
         assert_eq!(finished(&pumps), vec!["fs_protect", "open_sensor"]);
         pumps[0].1.abort();
+    }
+
+    fn wiring(lineage: AuthSessionTracker) -> ConnectWiring {
+        ConnectWiring {
+            flow_tracker: Arc::new(Mutex::new(FlowTracker::default())),
+            lineage,
+            dns_cache: Arc::new(DnsCache::default()),
+        }
+    }
+
+    /// Lab PR 224 (CM-02 a): a connect becomes its `TcpConnect` and then
+    /// its connect-time row (image and DNS name read now) for the rules,
+    /// with the flow pending for its close. The starting tree sent the
+    /// `TcpConnect` alone: no rule judged an open flow.
+    #[test]
+    fn a_connect_is_a_tcp_connect_then_its_open_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        lineage.ingest_spawn(4500, 1, "/usr/bin/python3.12", 1);
+        let w = wiring(lineage);
+        w.dns_cache.on_dns_query(
+            4500,
+            "c2.example".into(),
+            1,
+            "127.0.0.53".parse().unwrap(),
+            9_000,
+        );
+        let mut raw = TcpConnectRaw::zeroed();
+        raw.pid = 4500;
+        raw.family = common::netaddr::AF_INET;
+        raw.dst_port = 4444;
+        raw.dst_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
+        raw.timestamp_ns = 10_000;
+        raw.sk_ptr = 0xdead;
+        let events = connect_events(&raw, Some(&w));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], Event::TcpConnect { pid: 4500, .. }));
+        let Event::NetFlow(row) = &events[1] else {
+            panic!("{:?}", events[1]);
+        };
+        assert_eq!(row.phase, common::wire::FlowPhase::Connect);
+        assert_eq!(row.exe.as_deref(), Some("/usr/bin/python3.12"));
+        assert_eq!(row.resolved_hostname.as_deref(), Some("c2.example"));
+        assert_eq!(w.flow_tracker.lock().pending_len(), 1);
+        // Without net wiring: the `TcpConnect` alone, as before.
+        assert_eq!(connect_events(&raw, None).len(), 1);
+    }
+
+    /// Lab PR 224 (CM-02 c): a record of the `socket_connect` deny is its
+    /// refused row only — no `TcpConnect`, nothing pending — counted, with
+    /// the socket's protocol.
+    #[test]
+    fn a_refused_connect_is_one_denied_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let w = wiring(AuthSessionTracker::new(tmp.path()));
+        let mut raw = TcpConnectRaw::zeroed();
+        raw.pid = 4600;
+        raw.family = common::netaddr::AF_INET;
+        raw.flags = common::wire::tcp_connect_flags::DENIED;
+        raw.proto = 17;
+        raw.dst_port = 53;
+        raw.dst_addr[..4].copy_from_slice(&[192, 0, 2, 7]);
+        let events = connect_events(&raw, Some(&w));
+        assert_eq!(events.len(), 1);
+        let Event::NetFlow(row) = &events[0] else {
+            panic!("{:?}", events[0]);
+        };
+        assert_eq!(row.phase, common::wire::FlowPhase::Denied);
+        assert_eq!(row.proto, 17);
+        assert_eq!(w.flow_tracker.lock().pending_len(), 0);
     }
 
     /// External audit NETR-008: the connect row names the connecting
