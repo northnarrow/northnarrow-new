@@ -143,6 +143,12 @@ pub struct StatusOutcome {
     pub combat_evidence_unrecorded: Option<u64>,
     pub combat_evidence_pending: Option<u64>,
     pub combat_evidence_dropped: Option<u64>,
+    /// External audit NET-017 (lab PR 207): netflow rows to TCP/853 (DNS
+    /// over TLS) since boot, of those the local resolver's, and rows to
+    /// UDP/443 (QUIC) (`None`: agent predates the counters).
+    pub net_dot_rows_total: Option<u64>,
+    pub net_dot_rows_resolver: Option<u64>,
+    pub net_quic_rows_total: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -283,6 +289,9 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         combat_evidence_unrecorded: resp.combat_evidence_unrecorded,
         combat_evidence_pending: resp.combat_evidence_pending,
         combat_evidence_dropped: resp.combat_evidence_dropped,
+        net_dot_rows_total: resp.net_dot_rows_total,
+        net_dot_rows_resolver: resp.net_dot_rows_resolver,
+        net_quic_rows_total: resp.net_quic_rows_total,
     })
 }
 
@@ -3347,6 +3356,9 @@ mod tests {
                     combat_evidence_unrecorded: Some(2),
                     combat_evidence_pending: Some(1),
                     combat_evidence_dropped: Some(0),
+                    net_dot_rows_total: Some(4),
+                    net_dot_rows_resolver: Some(3),
+                    net_quic_rows_total: Some(9),
                 }),
             );
         });
@@ -3376,6 +3388,15 @@ mod tests {
                 out.combat_evidence_dropped
             ),
             (Some(2), Some(1), Some(0))
+        );
+        // External audit NET-017 (lab PR 207).
+        assert_eq!(
+            (
+                out.net_dot_rows_total,
+                out.net_dot_rows_resolver,
+                out.net_quic_rows_total
+            ),
+            (Some(4), Some(3), Some(9))
         );
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);

@@ -3504,6 +3504,9 @@ mod tests {
                 combat_evidence_unrecorded: None,
                 combat_evidence_pending: None,
                 combat_evidence_dropped: None,
+                net_dot_rows_total: None,
+                net_dot_rows_resolver: None,
+                net_quic_rows_total: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

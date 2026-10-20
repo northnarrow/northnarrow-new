@@ -15,6 +15,7 @@
 //! [`NetFlowEvent`]: northnarrow_common::wire::NetFlowEvent
 //! [`NetListenerEvent`]: northnarrow_common::wire::NetListenerEvent
 
+pub mod blind_spots;
 pub mod blocklist;
 pub mod dns_cache;
 pub mod drain;

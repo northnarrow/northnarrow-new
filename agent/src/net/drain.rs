@@ -535,6 +535,11 @@ async fn process_close_record(
             return;
         }
     };
+    // External audit NET-020 (3) (lab PR 207): one decoding of the kernel's
+    // comm for every branch — up to the first NUL, as the connect, UDP and
+    // listener paths read it — so the same bytes give the same name to the
+    // row, the journal and the comm allowlist.
+    let comm = comm_to_string(&raw.comm);
     let mut event = match raw.proto {
         IPPROTO_TCP => {
             let info = TcpCloseInfo {
@@ -550,9 +555,7 @@ async fn process_close_record(
                 dst_port: raw.dst_port,
                 pid: raw.pid,
                 uid: raw.uid,
-                comm: String::from_utf8_lossy(&raw.comm)
-                    .trim_end_matches('\0')
-                    .to_string(),
+                comm,
             };
             let closed = flow_tracker.lock().on_tcp_close(&info);
             match closed {
@@ -580,16 +583,14 @@ async fn process_close_record(
                     //    genuine gap in netflow.jsonl: WARN with the
                     //    5-tuple (review entry 18).
                     let kernel_lookup_miss = raw.flow_id == [0u8; 16];
-                    let comm = String::from_utf8_lossy(&raw.comm)
-                        .trim_end_matches('\0')
-                        .to_string();
+                    let comm = &info.comm;
                     let dst = format!("{}:{}", decode_addr(raw.family, raw.dst_addr), raw.dst_port);
                     let src = format!("{}:{}", info.src_addr, info.src_port);
                     if kernel_lookup_miss {
                         debug!(
                             target: "net.drain",
                             pid = raw.pid,
-                            comm = %common::log_escape::Escaped(&comm),
+                            comm = %common::log_escape::Escaped(comm),
                             src = %src,
                             dst = %dst,
                             "net drain: TCP close without a connect-side flow (passive or pre-agent socket) — not recorded"
@@ -603,7 +604,7 @@ async fn process_close_record(
                         warn!(
                             target: "net.drain",
                             pid = raw.pid,
-                            comm = %common::log_escape::Escaped(&comm),
+                            comm = %common::log_escape::Escaped(comm),
                             src = %src,
                             dst = %dst,
                             corr_start_ns = corr_start_ns(&raw.flow_id),
@@ -628,7 +629,7 @@ async fn process_close_record(
                 bytes_sent: raw.bytes_sent,
                 pid: raw.pid,
                 uid: raw.uid,
-                comm: comm_to_string(&raw.comm),
+                comm,
                 // External audit NETR-008: the sender's image, read before
                 // the tracker's lock (a datagram record is emitted while
                 // its sender runs).
@@ -658,6 +659,10 @@ async fn process_close_record(
     {
         event.resolved_hostname = Some(qname);
     }
+
+    // External audit NET-017 (lab PR 207): the rows whose names and
+    // handshakes no rule can read (DNS over TLS, QUIC), for `net status`.
+    crate::net::blind_spots::note_flow(&event);
 
     // External audit NET-019 (design §6.5): past its uid's budget a row
     // is held back from the rules — never one a killing rule could match
@@ -1514,5 +1519,179 @@ mod tests {
         // Full-length buffer → no NUL, returns all bytes.
         let buf = [b'x'; 16];
         assert_eq!(comm_to_string(&buf), "xxxxxxxxxxxxxxxx");
+    }
+
+    /// A record path's state for the tests below: a netflow log in a
+    /// temporary directory, an empty tracker, DNS cache and lineage, a gate
+    /// that holds nothing back.
+    struct Harness {
+        dir: tempfile::TempDir,
+        _proc: tempfile::TempDir,
+        db: Arc<Mutex<NetFlowDb>>,
+        tracker: Arc<Mutex<FlowTracker>>,
+        dns: Arc<DnsCache>,
+        lineage: crate::posture::lineage::AuthSessionTracker,
+        gate: RuleGate,
+    }
+
+    fn harness() -> Harness {
+        use crate::decision::correlation::CorrelationStore;
+        use crate::net::limiter::UidPacer;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Mutex::new(
+            NetFlowDb::open(
+                &dir.path().join("netflow.jsonl"),
+                AgentSigningKey::load_or_bootstrap(&dir.path().join("k.sig")).unwrap(),
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap(),
+        ));
+        let proc_root = tempfile::tempdir().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(proc_root.path());
+        Harness {
+            dir,
+            _proc: proc_root,
+            db,
+            tracker: Arc::new(Mutex::new(FlowTracker::default())),
+            dns: Arc::new(DnsCache::default()),
+            lineage,
+            gate: RuleGate::with_pacer(
+                Arc::new(crate::net::blocklist::NetBlocklist::from_entries([])),
+                Arc::new(Mutex::new(CorrelationStore::new())),
+                UidPacer::with_rate(100, 100),
+            ),
+        }
+    }
+
+    impl Harness {
+        async fn close(&mut self, raw: &NetFlowCloseRaw, tx: &mpsc::Sender<Event>) {
+            process_close_record(
+                bytemuck::bytes_of(raw),
+                &self.tracker,
+                &self.dns,
+                &self.db,
+                &self.lineage,
+                &mut self.gate,
+                tx,
+            )
+            .await;
+        }
+    }
+
+    /// `comm` as the kernel can hand it: a name, its NUL, then a byte left
+    /// over from a longer earlier name (`prctl(PR_SET_NAME)` writes the
+    /// new name and its NUL only).
+    const COMM_WITH_TAIL: [u8; 16] = *b"curl\0Xvil\0\0\0\0\0\0\0";
+
+    /// External audit NET-020 (3) (lab PR 207): the TCP close (a row it
+    /// synthesises, and the WARN of one it cannot record), the UDP send and
+    /// the listener give one name for the same comm bytes — the TCP branch
+    /// kept `"curl\0Xvil"` (lossy, then only the trailing NULs trimmed), the
+    /// others `"curl"`, and the comm allowlist saw either.
+    #[tokio::test]
+    async fn comm_decoding_is_identical_across_drain_branches() {
+        let mut h = harness();
+        let (tx, mut rx) = mpsc::channel(16);
+
+        // TCP: a close whose connect was not seen — the tracker
+        // synthesises the row from the close's own fields (NET-012).
+        let mut tcp: NetFlowCloseRaw =
+            bytemuck::pod_read_unaligned(&close_raw(1000, 4242, [100, 64, 0, 1], 8080, 7));
+        tcp.comm = COMM_WITH_TAIL;
+        h.close(&tcp, &tx).await;
+
+        // UDP.
+        let mut udp = tcp;
+        udp.proto = IPPROTO_UDP;
+        udp.flow_id = [0u8; 16];
+        udp.dst_port = 5353;
+        h.close(&udp, &tx).await;
+
+        // Listener.
+        let mut listen = NetListenRaw::zeroed();
+        listen.timestamp_ns = 6_000_000_000;
+        listen.pid = 4242;
+        listen.uid = 1000;
+        listen.family = 2;
+        listen.proto = IPPROTO_TCP;
+        listen.bind_port = 9000;
+        listen.comm = COMM_WITH_TAIL;
+        process_listen_record(bytemuck::bytes_of(&listen), None, &tx).await;
+
+        // TCP close the tracker cannot record (no destination): the WARN.
+        let mut orphan = tcp;
+        orphan.dst_addr = [0u8; 16];
+        orphan.dst_port = 0;
+        orphan.flow_id = [9u8; 16];
+        let out = Captured::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            h.close(&orphan, &tx).await;
+        }
+        drop(tx);
+
+        let mut names = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                Event::NetFlow(nf) => names.push(("flow", nf.proto, nf.comm)),
+                Event::NetListener(l) => names.push(("listener", l.proto, l.comm)),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            names,
+            [
+                ("flow", IPPROTO_TCP, "curl".to_string()),
+                ("flow", IPPROTO_UDP, "curl".to_string()),
+                ("listener", IPPROTO_TCP, "curl".to_string()),
+            ]
+        );
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let warn: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("no pending flow"))
+            .collect();
+        assert_eq!(warn.len(), 1, "{text}");
+        assert!(warn[0].contains("comm=curl "), "{}", warn[0]);
+        // The on-disk rows say the same.
+        let rows: Vec<crate::chainlog::ChainLine<NetFlowPayload>> =
+            std::fs::read_to_string(h.dir.path().join("netflow.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.payload.comm == "curl"), "{rows:?}");
+    }
+
+    /// External audit NET-017 (lab PR 207): the drain counts the rows to
+    /// TCP/853 (DNS over TLS) and UDP/443 (QUIC) it records, a held-back
+    /// one too, for `nn-admin net status`; TCP/443 is not counted.
+    #[tokio::test]
+    async fn drain_counts_dot_and_quic_rows() {
+        let mut h = harness();
+        let (tx, _rx) = mpsc::channel(16);
+        let before = crate::net::blind_spots::encrypted_flows();
+        let dot: NetFlowCloseRaw =
+            bytemuck::pod_read_unaligned(&close_raw(1000, 4243, [1, 1, 1, 1], 853, 11));
+        h.close(&dot, &tx).await;
+        let mut quic = dot;
+        quic.proto = IPPROTO_UDP;
+        quic.flow_id = [0u8; 16];
+        quic.dst_port = 443;
+        h.close(&quic, &tx).await;
+        let after = crate::net::blind_spots::encrypted_flows();
+        // Other tests run at the same time: at least these.
+        assert!(after.dot > before.dot, "{before:?} {after:?}");
+        assert!(after.quic > before.quic, "{before:?} {after:?}");
+        let rows = std::fs::read_to_string(h.dir.path().join("netflow.jsonl")).unwrap();
+        assert_eq!(rows.lines().count(), 2, "both rows recorded");
     }
 }

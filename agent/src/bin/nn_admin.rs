@@ -1007,8 +1007,10 @@ impl From<CanaryDeployKindCmd> for CanaryDeploySpec {
 enum NetCmd {
     /// What the network observation covers now: netflow rows held back
     /// from the rules by the per-uid pacing, pending connects evicted,
-    /// the network rings' drops, and the network rules that cannot fire
-    /// in this build. Reads the unauthenticated `status` reply (no key).
+    /// the network rings' drops, the network rules that cannot fire in
+    /// this build or are blind (a resolver on DNS over TLS), and the rows
+    /// no DNS or TLS reader sees into (DoT, QUIC). Reads the `status` reply
+    /// (no key).
     Status {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
@@ -2186,25 +2188,20 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             .iter()
             .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
             .collect();
-        let inactive: Vec<String> = out
-            .net_inactive_rules
-            .iter()
-            .flatten()
-            .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
-            .collect();
         println!(
-            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{},\"flow_sock_pending\":{},\"flow_sock_capacity\":{},\"flow_sock_forgotten_min\":{}}}",
+            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{},\"flow_sock_pending\":{},\"flow_sock_capacity\":{},\"flow_sock_forgotten_min\":{},\"net_dot_rows_total\":{},\"net_dot_rows_resolver\":{},\"net_quic_rows_total\":{}}}",
             opt(out.netflow_rows_skipped_total),
             opt(out.netflow_pending_evicted_total),
             drops.join(","),
-            if out.net_inactive_rules.is_some() {
-                format!("[{}]", inactive.join(","))
-            } else {
-                "null".to_string()
-            },
+            // Lab PR 207: every control character escaped too (an entry can
+            // name a configuration file).
+            serde_json::to_string(&out.net_inactive_rules).unwrap_or_else(|_| "null".to_string()),
             opt(out.flow_sock_pending),
             opt(out.flow_sock_capacity),
             opt(out.flow_sock_forgotten_min),
+            opt(out.net_dot_rows_total),
+            opt(out.net_dot_rows_resolver),
+            opt(out.net_quic_rows_total),
         );
         return;
     }
@@ -2238,6 +2235,53 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
         }
         None => println!("inactive network rules                : (agent predates the field)"),
     }
+    for line in encrypted_flow_lines(out) {
+        println!("{line}");
+    }
+}
+
+/// External audit NET-017 (lab PR 207): the traffic whose names and
+/// handshakes no rule reads, for `net status`.
+fn encrypted_flow_lines(out: &StatusOutcome) -> Vec<String> {
+    let label = |l: &str| format!("{l:<38}: ");
+    let mut lines = Vec::new();
+    match (out.net_dot_rows_total, out.net_dot_rows_resolver) {
+        (Some(0), _) => lines.push(format!(
+            "{}0 since boot",
+            label("DNS over TLS rows (TCP/853)")
+        )),
+        (Some(total), resolver) => {
+            let resolver = resolver.unwrap_or(0).min(total);
+            lines.push(format!(
+                "{}{total} since boot — {resolver} by the local resolver (its upstream), {} by \
+                 other processes (they resolve names past the resolver); no DNS rule reads \
+                 the names they carry",
+                label("DNS over TLS rows (TCP/853)"),
+                total - resolver
+            ));
+        }
+        (None, _) => lines.push(format!(
+            "{}(agent predates the counter)",
+            label("DNS over TLS rows (TCP/853)")
+        )),
+    }
+    match out.net_quic_rows_total {
+        Some(0) => lines.push(format!("{}0 since boot", label("QUIC rows (UDP/443)"))),
+        Some(n) => lines.push(format!(
+            "{}{n} since boot — HTTP/3: no TLS handshake (JA3, JA4, SNI) can be read from \
+             them; addresses, ports and bytes are recorded",
+            label("QUIC rows (UDP/443)")
+        )),
+        None => lines.push(format!(
+            "{}(agent predates the counter)",
+            label("QUIC rows (UDP/443)")
+        )),
+    }
+    lines.push(format!(
+        "{}not counted — HTTPS to a resolver on TCP/443 looks like any web traffic",
+        label("DNS over HTTPS")
+    ));
+    lines
 }
 
 /// Lab PR 164: the kernel's connect→close socket map, for `net status`.
@@ -3723,7 +3767,7 @@ mod roles_csv_tests {
 
 #[cfg(test)]
 mod flow_sock_line_tests {
-    use super::{combat_evidence_line, flow_sock_line, response_mode_line};
+    use super::{combat_evidence_line, encrypted_flow_lines, flow_sock_line, response_mode_line};
     use northnarrow_agent::admin_cli::StatusOutcome;
 
     fn outcome(
@@ -3752,7 +3796,43 @@ mod flow_sock_line_tests {
             combat_evidence_unrecorded: None,
             combat_evidence_pending: None,
             combat_evidence_dropped: None,
+            net_dot_rows_total: None,
+            net_dot_rows_resolver: None,
+            net_quic_rows_total: None,
         }
+    }
+
+    /// External audit NET-017 (lab PR 207): `net status` says what the DoT
+    /// and QUIC rows mean, splits the resolver's DoT from the others', and
+    /// says DoH is not counted.
+    #[test]
+    fn net_status_reports_the_encrypted_flows() {
+        let mut o = outcome(None, None, None);
+        let l = encrypted_flow_lines(&o);
+        assert_eq!(l.len(), 3);
+        assert!(l[0].starts_with("DNS over TLS rows (TCP/853)           : (agent predates"));
+        assert!(l[1].contains("(agent predates the counter)"));
+        assert!(l[2].starts_with("DNS over HTTPS") && l[2].contains("not counted"));
+        o.net_dot_rows_total = Some(12);
+        o.net_dot_rows_resolver = Some(10);
+        o.net_quic_rows_total = Some(40);
+        let l = encrypted_flow_lines(&o);
+        assert!(
+            l[0].contains(": 12 since boot — 10 by the local resolver")
+                && l[0].contains("2 by other processes")
+                && l[0].contains("no DNS rule reads"),
+            "{}",
+            l[0]
+        );
+        assert!(l[1].contains(": 40 since boot — HTTP/3"), "{}", l[1]);
+        o.net_dot_rows_total = Some(0);
+        o.net_quic_rows_total = Some(0);
+        let l = encrypted_flow_lines(&o);
+        assert!(l[0].ends_with(": 0 since boot") && l[1].ends_with(": 0 since boot"));
+        // A resolver count above the total (never sent) does not underflow.
+        o.net_dot_rows_total = Some(1);
+        o.net_dot_rows_resolver = Some(5);
+        assert!(encrypted_flow_lines(&o)[0].contains("1 by the local resolver"));
     }
 
     /// Lab PR 164: occupancy, and the forgotten sockets once beyond capacity.

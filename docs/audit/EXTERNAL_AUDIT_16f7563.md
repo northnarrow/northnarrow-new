@@ -546,7 +546,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-332 | NET-013 | Low | Network | S | fixed (lab PR 202) |
 | NN-AUD-333 | NET-014 | Low | Network | S | fixed (lab PR 202) |
 | NN-AUD-334 | NET-015 | Low | Network | S | fixed (lab PR 202) |
-| NN-AUD-335 | NET-017 | Low | Network | M | open |
+| NN-AUD-335 | NET-017 | Low | Network | M | fixed (lab PR 207) |
 | NN-AUD-336 | NET-018 | Low | Network | M | fixed (lab PR 202) |
 | NN-AUD-337 | DEC-012 | Low | Deception | S | fixed (lab PR 178) |
 | NN-AUD-338 | DEC-013 | Low | Deception | — | already fixed (lab PR 143, with DEC-011) |
@@ -645,7 +645,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-431 | CMB-028 | Info | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | fixed (lab PR 203) |
 | NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | fixed (lab PR 191) |
-| NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
+| NN-AUD-434 | NET-020 | Info | Network | S | fixed (lab PR 207) |
 | NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | fixed (lab PR 199) |
 | NN-AUD-436 | SNS-015 | Info | Sensors | S | fixed (lab PR 196) |
 | NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | fixed (lab PR 170) |
@@ -9553,3 +9553,91 @@ group, the ones an unprivileged user or a local attacker could use first.
     `filename_truncated`, fixed on `main`). `bash -n` on the changed
     scripts; shellcheck is not installed on this host.
   - Lab: On Ubuntu 24.04: `upgrade-check` (lot 206's check) read the new agent's own line from journald, `anti-tamper: all LSM hooks attached deny_attached=19 deny_expected=19`, own LSM programs 33 → 33, no foreign program; `anti-tamper.sh --only C01` ran C01 alone (denied, OK), `--only` without a value is refused ("takes case ids"), `--only C99` ends in DEVIATIONS, not OK; the anti-tamper suite with this lot's script OK (known gaps listed) on 24.04 and 22.04. The lockdown guest (LAB-024) and the nightly's security steps (LAB-026) were not run here. Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.
+- **Wave 3 — network blind spots and drain consistency, lab PR 207.**
+  NN-AUD-335 (NET-017, Low) and part (3) of NN-AUD-434 (NET-020, Info):
+  batch B9 of the Wave 3 triage of group G4, on the integration tree
+  (`main` with lots up to 195, and lots 196–203). With lab PR 202's part
+  (2), NN-AUD-434 is closed. Files: `net/blind_spots.rs` (new),
+  `net/drain.rs`, `net/blocklist.rs` (`inactive_net_rules`),
+  `decision/rules/net.rs` (`sender_is_forwarder` crate-visible),
+  `common/src/wire/admin_protocol.rs`, `admin_socket.rs`, `admin_cli.rs`,
+  `bin/nn_admin.rs`, `main.rs`, the watchdog's status test.
+  - NET-017 (335, fixed: visibility, no inspection). Re-checked: nothing in
+    the agent named 853, DoT, DoH or QUIC; the DNS rules (NN-L-NET-002,
+    -004, -005, -014) read only the queries sent to UDP/53. Now:
+    - The drain counts every netflow row it records (held back from the
+      rules or not) to TCP/853 and to UDP/443, and, of the TCP/853 ones,
+      those of a known resolver program by image (`KNOWN_RESOLVER_PROGRAMS`
+      of FP-3, never by comm). `status` carries `net_dot_rows_total`,
+      `net_dot_rows_resolver`, `net_quic_rows_total`; `nn-admin net status`
+      prints "DNS over TLS rows (TCP/853)" (the resolver's, its upstream;
+      the other processes', which resolve names past the resolver, and no
+      DNS rule reads the names), "QUIC rows (UDP/443)" (no TLS handshake
+      can be read from them; addresses, ports and bytes are recorded) and
+      "DNS over HTTPS: not counted".
+    - systemd-resolved's `DNSOverTLS=` is read as resolved reads it: the
+      main file is the first of `/etc`, `/run`, `/usr/local/lib`,
+      `/usr/lib` (`systemd/resolved.conf`); the drop-ins of the four
+      `resolved.conf.d` by file name, a name in a higher directory hiding
+      the same name in a lower one, a link to `/dev/null` masking it; the
+      last valid assignment of the `[Resolve]` section wins (systemd's
+      booleans, `opportunistic`), an empty one resets to `no`, an invalid
+      one is ignored. Files are opened `O_NONBLOCK` and read only if
+      regular, up to 64 KiB, 256 entries per directory. `yes` or
+      `opportunistic` adds "NN-L-NET-002/004/005/014 (DNS): blind to the
+      local resolver's upstream — systemd-resolved sends it over TLS on
+      TCP/853 (DNSOverTLS=…; file) …" to `net_inactive_rules` (no wire
+      change for it), and a WARN at boot.
+  - Choices. The setting is read at each status request as well as at boot
+    (the triage says boot): `net status` follows a change without a
+    restart — the agent units refuse a manual stop — for a few small reads
+    per request. The DoT count is split by image because, on a host whose
+    resolver runs DoT, the resolver's rows would hide another process's
+    DoT, the case that bypasses the DNS rules. The entry says what is still
+    seen (a process's own query to the 127.0.0.53 stub) and what is not
+    (names resolved through `nss-resolve`, Varlink or D-Bus, which reach
+    the network only as the resolver's upstream), instead of calling the
+    four rules inactive. `nn-admin net status --json` now escapes the
+    inactive rules with `serde_json` (an entry names a file). Deviations:
+    a per-link DoT setting (networkd `.network`, NetworkManager,
+    `resolvectl dnsovertls`) and a resolved built with another default
+    than `no` are not read (the TCP/853 count shows them); no signed
+    `subsystem_degraded` for the resolver (a host setting, not a degraded
+    agent subsystem); ECH (`0xFE0D`) stays with the ClientHello producer
+    (BUG-025).
+  - NET-020 (3) (434, fixed). Re-checked: the TCP close (the row it
+    synthesises and the WARN of one it cannot record) decoded comm with
+    `from_utf8_lossy` and trimmed the trailing NULs only, the connect, UDP
+    and listener paths stop at the first NUL. `process_close_record` now
+    decodes once with `comm_to_string`, for both protocols and the WARN.
+    On the kernels the lab runs, comm is NUL-padded, so the divergence is
+    shown by the unit test, not by a probe.
+  - Wire. The three fields are appended after lab PR 193's five. An
+    `nn-admin` or watchdog of lab PR 193 reads a newer agent's reply (and
+    the DNS entry, an existing field); a newer one cannot decode an older
+    agent's reply (postcard has no field count): the known follow-up,
+    pinned again. `production_discriminants_do_not_depend_on_debug_trigger`
+    unchanged and green.
+  - Tests: `net::blind_spots` `encrypted_flow_counters_count_dot_and_quic_rows`,
+    `note_flow_feeds_the_status_counters`,
+    `resolved_conf_reader_follows_systemd_precedence`,
+    `resolved_conf_values_parse_like_systemd`,
+    `the_first_main_file_found_is_the_only_one_read`,
+    `odd_files_are_skipped_or_bounded` (a directory, a FIFO, a file over
+    the bound), `dns_blind_rule_names_rules_reason_and_source`;
+    `net::blocklist` `a_resolver_on_dns_over_tls_lists_the_blind_dns_rules`;
+    `net::drain` `comm_decoding_is_identical_across_drain_branches`
+    (`curl\0Xvil`: the TCP row, the UDP row, the listener, the WARN and the
+    rows on disk all say `curl`), `drain_counts_dot_and_quic_rows`;
+    `wire::admin_protocol` `a_lab193_nn_admin_reads_a_lab207_status_reply`,
+    `a_lab207_nn_admin_cannot_read_a_lab193_status_reply`; `nn-admin`
+    `net_status_reports_the_encrypted_flows`; the status round trips, the
+    CLI and dispatcher status tests carry the new fields. On the starting
+    tree the new tests do not compile (new items); with the old comm
+    decoding put back in place, `comm_decoding_is_identical_across_drain_branches`
+    fails (`"curl\0Xvil"` on the TCP row).
+  - Host: `cargo fmt`, clippy `--workspace --all-targets` and the agent
+    with `test-privileged,debug-trigger` clean; `cargo test --workspace`
+    2,658 passed, 0 failed (13 new); `wire::admin_protocol` with
+    `debug-trigger` 45 passed.
+  - Lab: On Ubuntu 24.04 (a resolved drop-in with `DNSOverTLS=yes`, one TCP connect to 1.1.1.1:853 and one UDP datagram to 1.1.1.1:443, restored at the end): before this lot no DNS blind entry and no counters; after it `nn-admin net status` lists NN-L-NET-002/004/005/014 as blind to the resolver's upstream and names the drop-in, QUIC rows 0 → 1, DoT rows by other processes 0 → 1 and by the resolver 0 → 43, and the entry is gone after the restore. The comm step (NET-020 (3)) needs a `net-read` key the guest's install key lacks: unit tests only. The probe's two CHAIN-008 Medium `Log` records (sudo, then egress) are the same before and after. Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.

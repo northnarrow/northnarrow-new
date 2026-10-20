@@ -768,7 +768,9 @@ const DNS_ORIGINATOR_WINDOW_NS: u64 = 2 * 1_000_000_000;
 /// Is the DnsQuery sender a known forwarder/stub resolver? Basename
 /// match on the resolved exe; a `None` exe (resolve miss) is NOT a
 /// forwarder — fail toward today's behaviour (act on the sender).
-fn sender_is_forwarder(exe: Option<&str>) -> bool {
+/// External audit NET-017 (lab PR 207): `net::blind_spots` tells the local
+/// resolver's DNS-over-TLS rows from the other processes' with it.
+pub(crate) fn sender_is_forwarder(exe: Option<&str>) -> bool {
     let Some(path) = exe else { return false };
     let base = path.rsplit('/').next().unwrap_or(path);
     KNOWN_RESOLVER_PROGRAMS.contains(&base)

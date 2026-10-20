@@ -1461,6 +1461,15 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
             "{gap}"
         );
     }
+    // External audit NET-017 (lab PR 207): systemd-resolved on DNS over TLS
+    // hides its upstream queries from the DNS rules. Said at boot; `nn-admin
+    // net status` reads the setting again at each request.
+    if let Some(dot) = northnarrow_agent::net::blind_spots::resolver_dns_over_tls() {
+        warn!(
+            "{}",
+            northnarrow_agent::net::blind_spots::dns_blind_rule(&dot)
+        );
+    }
     let burst_window = Arc::new(parking_lot::Mutex::new(
         northnarrow_agent::decision::rules::net::DnsBurstWindow::new(),
     ));

@@ -706,6 +706,19 @@ pub struct StatusResponse {
     pub combat_evidence_pending: Option<u64>,
     #[serde(default)]
     pub combat_evidence_dropped: Option<u64>,
+    /// External audit NET-017 (lab PR 207): netflow rows recorded since
+    /// boot to TCP/853 (DNS over TLS: the names they carry reach no DNS
+    /// rule), of those the rows of a known local resolver program (by
+    /// image: its upstream), and rows to UDP/443 (QUIC: no TLS handshake
+    /// can be read from them). Appended after lab PR 193's fields; `None`
+    /// from an agent older than the fields (see the compatibility note
+    /// above: a newer `nn-admin` cannot decode an older agent's reply).
+    #[serde(default)]
+    pub net_dot_rows_total: Option<u64>,
+    #[serde(default)]
+    pub net_dot_rows_resolver: Option<u64>,
+    #[serde(default)]
+    pub net_quic_rows_total: Option<u64>,
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -1408,6 +1421,9 @@ mod tests {
             combat_evidence_unrecorded: None,
             combat_evidence_pending: None,
             combat_evidence_dropped: None,
+            net_dot_rows_total: None,
+            net_dot_rows_resolver: None,
+            net_quic_rows_total: None,
         }));
     }
 
@@ -1434,6 +1450,9 @@ mod tests {
             combat_evidence_unrecorded: None,
             combat_evidence_pending: None,
             combat_evidence_dropped: None,
+            net_dot_rows_total: None,
+            net_dot_rows_resolver: None,
+            net_quic_rows_total: None,
         }));
     }
 
@@ -1608,6 +1627,9 @@ mod tests {
             combat_evidence_unrecorded: Some(3),
             combat_evidence_pending: Some(1),
             combat_evidence_dropped: Some(0),
+            net_dot_rows_total: Some(12),
+            net_dot_rows_resolver: Some(10),
+            net_quic_rows_total: Some(40),
         }));
     }
 
@@ -1654,6 +1676,9 @@ mod tests {
             combat_evidence_unrecorded: Some(2),
             combat_evidence_pending: Some(2),
             combat_evidence_dropped: Some(0),
+            net_dot_rows_total: Some(3),
+            net_dot_rows_resolver: Some(2),
+            net_quic_rows_total: Some(5),
         }
     }
 
@@ -1695,6 +1720,83 @@ mod tests {
             flow_sock_pending: None,
             flow_sock_capacity: None,
             flow_sock_forgotten_min: None,
+        };
+        let body = postcard::to_allocvec(&old).unwrap();
+        assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
+    }
+
+    /// The status reply as lab PR 193 left it (its last field
+    /// `combat_evidence_dropped`), for the lab PR 207 pins.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct StatusResponseLabPr193 {
+        posture: PostureKind,
+        network_isolation_engaged: bool,
+        last_admin_action_secs_ago: Option<u64>,
+        ringbuf_drops_total: Option<u64>,
+        ringbuf_drops: Option<Vec<(String, u64)>>,
+        combat_stage: Option<String>,
+        combat_locked: Option<bool>,
+        ringbuf_rejected_total: Option<u64>,
+        ringbuf_rejected: Option<Vec<(String, u64)>>,
+        netflow_rows_skipped_total: Option<u64>,
+        netflow_pending_evicted_total: Option<u64>,
+        net_inactive_rules: Option<Vec<String>>,
+        flow_sock_pending: Option<u64>,
+        flow_sock_capacity: Option<u64>,
+        flow_sock_forgotten_min: Option<u64>,
+        detect_only: Option<bool>,
+        detect_only_source: Option<String>,
+        combat_evidence_unrecorded: Option<u64>,
+        combat_evidence_pending: Option<u64>,
+        combat_evidence_dropped: Option<u64>,
+    }
+
+    /// External audit NET-017 (lab PR 207): the three counters are appended
+    /// after lab PR 193's fields — an `nn-admin` or watchdog of lab PR 193
+    /// reads every field it knows from a newer agent's reply, the DNS
+    /// blind-spot entry of `net_inactive_rules` included (no new field).
+    #[test]
+    fn a_lab193_nn_admin_reads_a_lab207_status_reply() {
+        let mut new = status_with_lab193_fields();
+        new.net_inactive_rules = Some(vec![
+            "NN-L-NET-002/004/005/014 (DNS): blind to the local resolver's upstream".to_string(),
+        ]);
+        let body = postcard::to_allocvec(&new).unwrap();
+        let old: StatusResponseLabPr193 = postcard::from_bytes(&body).unwrap();
+        assert_eq!(old.combat_evidence_dropped, Some(0));
+        assert_eq!(old.detect_only_source.as_deref(), Some("--detect-only"));
+        assert_eq!(old.net_inactive_rules, new.net_inactive_rules);
+        // The new fields are the reply's last bytes.
+        let prefix = postcard::to_allocvec(&old).unwrap();
+        assert!(body.starts_with(&prefix) && body.len() > prefix.len());
+    }
+
+    /// The limit, pinned for these fields too: an `nn-admin` (or watchdog)
+    /// of lab PR 207 cannot decode a lab PR 193 agent's reply.
+    #[test]
+    fn a_lab207_nn_admin_cannot_read_a_lab193_status_reply() {
+        let new = status_with_lab193_fields();
+        let old = StatusResponseLabPr193 {
+            posture: new.posture,
+            network_isolation_engaged: new.network_isolation_engaged,
+            last_admin_action_secs_ago: new.last_admin_action_secs_ago,
+            ringbuf_drops_total: new.ringbuf_drops_total,
+            ringbuf_drops: new.ringbuf_drops.clone(),
+            combat_stage: new.combat_stage.clone(),
+            combat_locked: new.combat_locked,
+            ringbuf_rejected_total: new.ringbuf_rejected_total,
+            ringbuf_rejected: new.ringbuf_rejected.clone(),
+            netflow_rows_skipped_total: new.netflow_rows_skipped_total,
+            netflow_pending_evicted_total: new.netflow_pending_evicted_total,
+            net_inactive_rules: new.net_inactive_rules.clone(),
+            flow_sock_pending: new.flow_sock_pending,
+            flow_sock_capacity: new.flow_sock_capacity,
+            flow_sock_forgotten_min: new.flow_sock_forgotten_min,
+            detect_only: new.detect_only,
+            detect_only_source: new.detect_only_source.clone(),
+            combat_evidence_unrecorded: new.combat_evidence_unrecorded,
+            combat_evidence_pending: new.combat_evidence_pending,
+            combat_evidence_dropped: new.combat_evidence_dropped,
         };
         let body = postcard::to_allocvec(&old).unwrap();
         assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
