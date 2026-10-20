@@ -530,16 +530,16 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-316 | CMB-025 | Low | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-317 | CMB-026 | Low | Combat response | — | already fixed (lab PR 123) |
 | NN-AUD-318 | CMB-027 | Low | Combat response | S–M | partly fixed (lab PR 118; the audit's fail-closed declined); open |
-| NN-AUD-319 | LLMP-005 | Low | LLM prompts | S | open (no consumer: hygiene; revised fix declined) |
+| NN-AUD-319 | LLMP-005 | Low | LLM prompts | S | fixed (lab PR 191) |
 | NN-AUD-320 | LLMP-007 | Low | LLM prompts | M | open (dormant: templates not wired) |
 | NN-AUD-321 | LLMP-008 | Low | LLM prompts | S | open (dormant) |
-| NN-AUD-322 | LLMP-010 | Low | LLM prompts | S | open (wider: a `"` in the preamble does the same) |
+| NN-AUD-322 | LLMP-010 | Low | LLM prompts | S | fixed (lab PR 191) |
 | NN-AUD-323 | LLMP-012 | Low | LLM prompts | S | fixed (lab PR 182) |
 | NN-AUD-324 | LLMP-014 | Low | LLM prompts | S | fixed (lab PR 182) |
-| NN-AUD-325 | LLMR-009 | Low | LLM runtime | S–M | open (the audit's fix changes candle's threading) |
+| NN-AUD-325 | LLMR-009 | Low | LLM runtime | S–M | fixed (lab PR 191) |
 | NN-AUD-326 | LLMR-011 | Low | LLM runtime | S | fixed (lab PR 182) |
 | NN-AUD-327 | LLMR-015 | Low | LLM runtime | M | fixed (lab PR 168) |
-| NN-AUD-328 | LLMR-018 | Low | LLM runtime | S | open (narrowed: mock only behind a signed weakening) |
+| NN-AUD-328 | LLMR-018 | Low | LLM runtime | S | fixed (lab PR 191) |
 | NN-AUD-329 | LLMR-019 | Low | LLM runtime | M (at XAI wiring) | partly fixed (one prompt path, lab PRs 133/144/145; digest not recorded); open |
 | NN-AUD-330 | NET-007 | Low | Network | S | open (latent) |
 | NN-AUD-331 | NET-008 | Low | Network | S | open (latent) |
@@ -562,7 +562,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-348 | XAI-014 | Low | XAI and RAG | S | partly fixed (confidence domain fixed, lab PR 132; encoding left); open |
 | NN-AUD-349 | XAI-015 | Low | XAI and RAG | — | obsolete (on-disk `build_index` removed, lab PR 145) |
 | NN-AUD-350 | XAI-016 | Low | XAI and RAG | S | open (dormant) |
-| NN-AUD-351 | XAI-017 | Low | XAI and RAG | S | open (latent: capacity is a constant today) |
+| NN-AUD-351 | XAI-017 | Low | XAI and RAG | S | fixed (lab PR 191) |
 | NN-AUD-352 | SNS-004 | Low | Sensors | S | open |
 | NN-AUD-353 | SNS-010 | Low | Sensors | S | open |
 | NN-AUD-354 | SNS-011 | Low | Sensors | S | open |
@@ -644,7 +644,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-430 | POS-013 | Info | Posture | S | fixed (lab PR 172) |
 | NN-AUD-431 | CMB-028 | Info | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | open (Info; narrowed to the test: argv is 512 B at the kernel) |
-| NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | open (Info; `is_ready` has no caller) |
+| NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | fixed (lab PR 191) |
 | NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
 | NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | open (Info) |
 | NN-AUD-436 | SNS-015 | Info | Sensors | S | open |
@@ -7763,3 +7763,116 @@ group, the ones an unprivileged user or a local attacker could use first.
     agent with `test-privileged,debug-trigger`) clean, 2,458 passed,
     0 failed.
   - Lab: Debian 12, verifiers190-probe.sh, on copies of the guest's chains only — before: the build of `main` with lab PRs 176–187; after: this lot on top. An empty sealed archive: `chain verify` aborted (exit 134, "sealed archive ends in a terminator") before; after that chain BROKEN, every other one reported, exit 8. A torn last audit line: `audit read` stopped at it with exit 1 before; after every valid row printed, the line named, exit 8. Garbage at line 3, a 96 MiB line under a 64 MiB data limit, an archive numbered past 999,999, an empty audit file: typed errors with exit 8 (or exit 0 for the empty file), the rows after the damage read, the large archive listed. Four cases (`audit verify` on the torn, the large and the repeated-row copies; `chain verify` of a huge detections line) reported instead the older break of this guest's own chains (an old-format row at entry 1947, a detections signature) first — exit 8, no abort. Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.
+- **Wave 3 — ADE runtime hygiene, lab PR 191.** NN-AUD-325 (LLMR-009),
+  NN-AUD-322 (LLMP-010, wider than reported), NN-AUD-319 (LLMP-005),
+  NN-AUD-328 (LLMR-018, narrowed), NN-AUD-433 (LLMR-020), NN-AUD-351
+  (XAI-017): batch D of the Wave 3 triage of the LLM, XAI and deception
+  group, on top of lots 176–187 (lot 182, the ADE prompt inputs, included).
+  No lab probe and no model: the prompt and the scores do not change, and
+  what only a model host shows (the thread line, `ade_smoke` latency) is
+  listed for the gate.
+  - Before: `ade/backend_candle.rs` `configure_threads` called
+    `std::env::set_var("RAYON_NUM_THREADS", …)` from `build_default_backend`
+    → `AdeEngine::new` → `load_ade_engine`, inside `#[tokio::main]`, with
+    the workers and the logging running, under a comment calling it
+    race-free; the only `set_var` outside tests. `ade/streaming_parser.rs`:
+    a `}` before the first `{` took `brace_depth` to -1 for good, a `"`
+    there switched `in_string` on (an odd count read the object's quotes
+    inverted), and a balanced `{ … }` inside the model's `<think>` block
+    (Foundation-Sec-Reasoning writes one before the JSON) completed the
+    detector there: the decode stopped before `</think>` and the parser
+    refused the output (Escalate Tier1, malformed) — not in the report,
+    found reading the detector against the parser; `buffer` filled and
+    never read. `ade/parser.rs`: `let _ = (v.recommended_action.action,
+    v.escalation_tier);` and its twin, dead; nothing aligned the field on
+    `verdict`. `ade/inference.rs` `MockBackend::from_model_path`: the
+    GGUF's stem and `Q4_K_M`. `backend_candle.rs` `warmup`:
+    `warmed_up.swap(true)` before the forward pass; `AdeEngine::is_ready`
+    returned `true`, no caller. `correlation/mod.rs`: `new(0)` never
+    evicted (`len() == capacity`).
+  - Agent: `main.rs`: `fn main()` parses `Cli`, runs the early exits
+    (`--build-features`, `--telemetry-probe`, `--btf-check`,
+    `--sensor-feasibility`, all synchronous), calls `pin_ade_threads`, then
+    `tokio::runtime::Builder::new_multi_thread().enable_all().build()` and
+    `block_on(run(cli, ade_threads))`; `run` is the former body, which logs
+    the pin once the subscriber is up; `ade_config(&cli)` builds the
+    `AdeConfig` for both. `pin_ade_threads`: nothing for `--no-ade` or
+    without a file at the model path (as the old call, after the
+    missing-model check), else
+    `backend_candle::pin_threads_before_runtime(cfg.effective_threads())`:
+    an operator's variable is left (`ThreadPin::Operator`); otherwise the
+    variable is written only when `/proc/self/status` says `Threads: 1` and
+    no runtime is current (`Pinned(n)`), else nothing (`Refused`, WARN).
+    `build_default_backend` calls `log_kernel_threads` (candle's
+    `utils::get_num_threads()`, a WARN when the variable is unset).
+    `configure_threads` removed. Streaming detector: before the object,
+    only a `<think>`/`</think>` marker (matched on an 8-character tail, so
+    across chunks) or the first `{` outside a reasoning block counts; inside
+    it, string and escape rules as before, depth `u32` saturating; no
+    `buffer`, no `buffer()`. `AdeEngine::evaluate`: after a parse,
+    `recommended_action.action = verdict` (debug line when they differed);
+    the parser's module doc names it ("normalised by the engine, not a parse
+    error"). `MockBackend::from_model_path`: `mock-deterministic`, `none`,
+    `declared_path` kept. `WarmOnce` (flag set after the step succeeded);
+    the warmup takes the weights lock, then runs through it.
+    `AdeEngine::is_ready` deleted. `CorrelationBuffer::new`:
+    `capacity.max(1)`, `while q.len() >= capacity`. Examples `ade_demo` and
+    `ade_attacks`: a plain `main` that pins, then builds the runtime their
+    attribute built. `docs/PERFORMANCE.md` (§2, §3) and the upgrade notes
+    (§7) say where the pin is and what the detector reads.
+  - Choices: the variable stays (the triage's correction: candle-core
+    0.10.2 reads it at every `get_num_threads()`; `build_global` alone
+    would change candle's split, which needs a model host). The
+    single-thread condition is checked, not only asserted in debug: a
+    refused pin costs performance, never soundness. The pin runs when the
+    ADE may load, not on every boot, so a host without a model keeps the
+    environment it had. The `<think>` handling goes beyond the triage's fix
+    (which kept a brace in the reasoning as the object's start): the
+    detector now stops where the parser reads, and a reasoning block that
+    never closes runs to the budget, as the parser refuses it either way.
+    Not done: the candle backend's `Q4_K_M` label is a constant whatever
+    GGUF is loaded (outside batch D; the detection record keeps no model
+    metadata).
+  - Tests: `ade::streaming_parser` `stray_closing_brace_before_json_still_completes`,
+    `odd_quote_in_preamble_still_completes`,
+    `braces_in_the_reasoning_block_do_not_stop_the_decode`,
+    `reasoning_markers_split_across_chunks_are_matched`,
+    `unclosed_reasoning_block_never_completes`,
+    `markers_inside_the_object_are_text`,
+    `multibyte_text_before_the_object_is_absorbed` (the 8 existing ones kept,
+    without `buffer()`); `ade::tests` (scripted backends)
+    `the_decode_stops_where_the_verdict_object_closes` (one character at a
+    time, 4 preambles: stopped exactly at the object's close, verdict
+    Allow, 0 malformed), `recommended_action_is_aligned_on_the_verdict`,
+    `mock_never_claims_a_model` (backend, verdict and error escalation
+    metadata), `the_ade_load_never_writes_the_environment` (multi-thread
+    runtime); `ade::parser` `recommended_action_mismatch_is_not_a_parse_error`;
+    `ade::backend_candle` `warm_once_is_done_only_after_a_success`,
+    `the_pin_refuses_a_multi_threaded_process`,
+    `the_pin_refuses_inside_a_runtime`, `process_threads_reads_the_kernel_count`;
+    `correlation` `zero_capacity_is_normalised_and_bounded`. With each
+    production change taken back (the base detector, no alignment, the
+    mock's old labels, the old `set_var` at the load, the flag set first,
+    the old capacity), these fail: the five detector tests on stray brace,
+    odd quote, reasoning braces, split markers and unclosed reasoning,
+    `the_decode_stops_where_the_verdict_object_closes`,
+    `recommended_action_is_aligned_on_the_verdict`,
+    `mock_never_claims_a_model`, `warm_once_is_done_only_after_a_success`,
+    `zero_capacity_is_normalised_and_bounded`, and
+    `the_ade_load_never_writes_the_environment` run alone (in the whole
+    base suite another test that reaches the load may set the variable
+    first); the pin tests do not compile there; the parser pin and the two
+    detector edge tests pass on both. The lot 182 byte-stable tests
+    (`clean_prompt_bytes_are_pinned`,
+    `clean_host_context_renders_byte_identical`,
+    `pinned_titles_render_unchanged`) and
+    `format_rag_block_byte_stable_phase_abcd_contract` unchanged and green.
+    Golden suite on `target/kb` (release): 28/30, as since lab PR 145.
+    Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
+    agent with `test-privileged,debug-trigger`) clean, 2,458 passed, 0
+    failed. The
+    entry point is covered by the privileged suites of the gate; on a model
+    host: the journal's `ADE rayon worker count pinned via
+    RAYON_NUM_THREADS threads=N` with N the effective threads and no
+    "not pinned" WARN, and `ade_smoke` latency unchanged.
+  - Lab: No lab or model run: scripted-backend tests cover the early stop through a reasoning block, the aligned recommended action, the mock's labels and the warm-up; the entry point (the runtime now built in a plain `main` after the thread count is set) ran in every privileged suite of the gate; the real-corpus golden suite 28/30 as before, and lab PR 182's byte-stable prompt tests green. Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.

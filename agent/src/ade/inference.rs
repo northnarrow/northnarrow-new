@@ -18,7 +18,8 @@
 //! support). [`MockBackend`] is now the CI / load-failure fallback
 //! only, NOT the production default. `build_default_backend` in
 //! [`super`] selects candle and falls back to the mock if the GGUF
-//! cannot be loaded.
+//! cannot be loaded, only with `NN_ADE_ALLOW_MOCK=1` (external audit
+//! LLMR-005).
 
 use std::path::{Path, PathBuf};
 
@@ -166,19 +167,16 @@ impl MockBackend {
         }
     }
 
-    /// Builds a MockBackend that *advertises* the GGUF the user
-    /// configured even though it never reads it. This keeps the
-    /// metadata field accurate for the demo run.
+    /// The mock that stands in for the GGUF at `path` (the
+    /// `NN_ADE_ALLOW_MOCK=1` fallback). External audit LLMR-018
+    /// (NN-AUD-328): it advertised that model — the file's stem as
+    /// `model_id`, `Q4_K_M` — in every verdict it wrote, though it never
+    /// reads it; it says what it is, and keeps the path it stands in for
+    /// ([`Self::declared_path`]).
     pub fn from_model_path(path: &Path) -> Self {
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("gemma-4-E4B-it-Q4_K_M")
-            .to_string();
         Self {
-            model_id: id,
-            quantization: "Q4_K_M".into(),
             declared_path: Some(path.to_path_buf()),
+            ..Self::new()
         }
     }
 

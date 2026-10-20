@@ -41,6 +41,126 @@ use common::Event;
 use super::error::AdeError;
 use super::inference::{ChatTemplate, InferenceBackend, StreamControl};
 
+/// The variable that sizes candle's CPU kernels: rayon reads it when its
+/// global pool is built, and candle-core reads it again at every
+/// `utils::get_num_threads()` (its gemm and quantized-op split), falling
+/// back to every logical CPU.
+pub const THREADS_ENV: &str = "RAYON_NUM_THREADS";
+
+/// What [`pin_threads_before_runtime`] did (external audit LLMR-009).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadPin {
+    /// [`THREADS_ENV`] was set to this count.
+    Pinned(usize),
+    /// [`THREADS_ENV`] was already in the environment (an operator
+    /// override): left as it is.
+    Operator(String),
+    /// The process already ran other threads (`running` of them, `None`
+    /// when `/proc/self/status` could not tell) or a tokio runtime: the
+    /// environment was not written, and candle sizes its kernels on every
+    /// logical CPU.
+    Refused { running: Option<usize> },
+}
+
+impl ThreadPin {
+    /// The journal line of the pin, once the subscriber is up.
+    pub fn log(&self) {
+        match self {
+            Self::Pinned(n) => tracing::info!(
+                threads = n,
+                "ADE rayon worker count pinned via RAYON_NUM_THREADS"
+            ),
+            Self::Operator(v) => tracing::info!(
+                threads = %v,
+                "RAYON_NUM_THREADS already set, leaving operator override in place"
+            ),
+            Self::Refused { running } => tracing::warn!(
+                running = ?running,
+                logical_cpus = num_cpus::get(),
+                "RAYON_NUM_THREADS not pinned: other threads or a runtime already ran; candle \
+                 sizes its CPU kernels on every logical CPU"
+            ),
+        }
+    }
+}
+
+/// Sub-tappa 6.8, external audit LLMR-009 (NN-AUD-325): pin candle's
+/// worker count (`threads`, at least 1) in [`THREADS_ENV`] unless an
+/// operator set it — called once from `main`, before the tokio runtime and
+/// any other thread exists.
+///
+/// It was called from the ADE load, inside `#[tokio::main]`: the runtime's
+/// workers and the logging already ran, and `std::env::set_var` racing a
+/// read of the environment by another thread (`getenv` in libc, a DNS
+/// lookup) is undefined behaviour; the comment that called the point
+/// race-free was wrong. The variable stays (a pool sized by
+/// `ThreadPoolBuilder` alone would leave candle splitting its work for
+/// every logical CPU, above); it is written only while this thread is the
+/// process's only one, which is checked here (`/proc/self/status`), not
+/// assumed: otherwise nothing is written ([`ThreadPin::Refused`]).
+pub fn pin_threads_before_runtime(threads: usize) -> ThreadPin {
+    if let Some(v) = std::env::var_os(THREADS_ENV) {
+        return ThreadPin::Operator(v.to_string_lossy().into_owned());
+    }
+    let running = process_threads();
+    if tokio::runtime::Handle::try_current().is_ok() || running != Some(1) {
+        return ThreadPin::Refused { running };
+    }
+    let n = threads.max(1);
+    // Edition 2021: `set_var` is a safe function, and sound here — no other
+    // thread exists to read the environment while it is written.
+    std::env::set_var(THREADS_ENV, n.to_string());
+    ThreadPin::Pinned(n)
+}
+
+/// The kernel's thread count of this process (`Threads:` in
+/// `/proc/self/status`).
+fn process_threads() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Threads:"))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// The worker count candle's kernels use, said once at the ADE load; a
+/// WARN when nothing pinned it (a caller that built its runtime without
+/// [`pin_threads_before_runtime`], or a refused pin).
+pub fn log_kernel_threads() {
+    let threads = candle_core::utils::get_num_threads();
+    if std::env::var_os(THREADS_ENV).is_some() {
+        tracing::debug!(threads, "ADE candle CPU kernels sized by RAYON_NUM_THREADS");
+    } else {
+        tracing::warn!(
+            threads,
+            "RAYON_NUM_THREADS was not pinned before the runtime started: candle sizes its \
+             CPU kernels on every logical CPU"
+        );
+    }
+}
+
+/// External audit LLMR-020 (NN-AUD-433): a step that counts as done once it
+/// has succeeded. The warmup flag was set before the forward pass ran, so
+/// a failed warmup read as done.
+#[derive(Debug, Default)]
+struct WarmOnce(AtomicBool);
+
+impl WarmOnce {
+    fn run(&self, step: impl FnOnce() -> Result<(), AdeError>) -> Result<(), AdeError> {
+        if self.0.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        step()?;
+        self.0.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_done(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// The fixed `LogitsProcessor` seed for the candle decode path. Greedy
 /// decoding (`Sampling::ArgMax`, `temperature == 0`) ignores it, but the
 /// XAI Article-13 path records it verbatim for reproducibility under any
@@ -91,7 +211,7 @@ pub struct CandleBackend {
     model_id: String,
     quantization: String,
     model_path: PathBuf,
-    warmed_up: AtomicBool,
+    warmed_up: WarmOnce,
     /// External audit LLMR-002: how long one generation may run. The
     /// engine sets its own timeout here ([`Self::with_budget`]); a
     /// generation the engine has stopped waiting for must not keep the
@@ -132,34 +252,6 @@ impl CandleBackend {
             ))
         })?;
         Self::load_with_tokenizer(model_path, &tokenizer_path)
-    }
-
-    /// Sub-tappa 6.8: pin the rayon worker count *before* candle does
-    /// any compute. rayon initialises its global pool lazily on first
-    /// use and reads `RAYON_NUM_THREADS` at that moment; once the
-    /// pool exists the env var is ignored, so the call must precede
-    /// any backend operation.
-    ///
-    /// No-op if the env var is already set (operator override) or
-    /// if the rayon pool has already been built (`is_initialized`
-    /// returns true).
-    pub fn configure_threads(num_threads: usize) {
-        if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-            tracing::debug!("RAYON_NUM_THREADS already set, leaving operator override in place");
-            return;
-        }
-        let n = num_threads.max(1);
-        // `set_var` is unsafe on Rust 2024+; we are still on
-        // edition 2021 (pinned in workspace.package) where it is
-        // safe to call before any threads have been spawned that
-        // read the environment. CandleBackend::load is the very
-        // first ADE-side code that touches rayon, so this point is
-        // race-free.
-        std::env::set_var("RAYON_NUM_THREADS", n.to_string());
-        tracing::info!(
-            threads = n,
-            "ADE rayon worker count pinned via RAYON_NUM_THREADS"
-        );
     }
 
     pub fn load_with_tokenizer(model_path: &Path, tokenizer_path: &Path) -> Result<Self, AdeError> {
@@ -213,7 +305,7 @@ impl CandleBackend {
             model_id,
             quantization: "Q4_K_M".to_string(),
             model_path: model_path.to_path_buf(),
-            warmed_up: AtomicBool::new(false),
+            warmed_up: WarmOnce::default(),
             budget: DEFAULT_BUDGET,
         })
     }
@@ -565,26 +657,28 @@ impl InferenceBackend for CandleBackend {
     }
 
     fn warmup(&self) -> Result<(), AdeError> {
-        if self.warmed_up.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
         // Single forward pass with a 1-token input to allocate the
         // KV cache and JIT any lazy quantized matmuls. Keeps the
         // first user-facing inference closer to steady-state latency.
+        // External audit LLMR-020: done once it has succeeded; the lock
+        // is taken first, so a second caller waits for the first one's
+        // outcome instead of running the pass again.
         let mut weights = self.inner.lock();
-        let probe = Tensor::new(&[128000u32], &self.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(|e| AdeError::Backend(format!("warmup tensor: {e}")))?;
-        let _ = weights
-            .weights
-            .forward(&probe, 0)
-            .map_err(|e| AdeError::Backend(format!("warmup forward: {e}")))?;
+        self.warmed_up.run(|| {
+            let probe = Tensor::new(&[128000u32], &self.device)
+                .and_then(|t| t.unsqueeze(0))
+                .map_err(|e| AdeError::Backend(format!("warmup tensor: {e}")))?;
+            let _ = weights
+                .weights
+                .forward(&probe, 0)
+                .map_err(|e| AdeError::Backend(format!("warmup forward: {e}")))?;
+            Ok(())
+        })
         // Reset the model: drop and reload would be expensive, but
         // running the warmup probe leaves a single bogus token in
         // the KV cache. Real inference always starts at index_pos=0
         // with the full prompt, which overwrites that slot — so the
         // warmup leak is harmless for the first real call.
-        Ok(())
     }
 }
 
@@ -645,5 +739,80 @@ mod tests {
         assert_eq!(seen, tokens);
         assert_eq!(last, 600);
         assert!(prefill_chunked(&[], 256, far, |_, _| Ok(())).is_err());
+    }
+
+    /// External audit LLMR-020: a failed warmup leaves the step to do; it
+    /// counts as done once it succeeded, and then runs no more.
+    #[test]
+    fn warm_once_is_done_only_after_a_success() {
+        let warm = WarmOnce::default();
+        let mut runs = 0;
+        let err = warm.run(|| {
+            runs += 1;
+            Err(AdeError::Backend("warmup forward: boom".into()))
+        });
+        assert!(err.is_err());
+        assert!(!warm.is_done(), "a failed attempt must not count as done");
+        warm.run(|| {
+            runs += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(warm.is_done());
+        warm.run(|| {
+            runs += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            runs, 2,
+            "the step runs again after a failure, never after a success"
+        );
+    }
+
+    /// External audit LLMR-009: the pin writes the environment only while
+    /// the process is single-threaded and no runtime is current. A test
+    /// process has other threads (the harness's, this test's), so it is
+    /// refused here, and the environment is left as it was.
+    #[test]
+    fn the_pin_refuses_a_multi_threaded_process() {
+        let before = std::env::var_os(THREADS_ENV);
+        let pin = pin_threads_before_runtime(3);
+        assert_eq!(std::env::var_os(THREADS_ENV), before);
+        match before {
+            Some(v) => assert_eq!(pin, ThreadPin::Operator(v.to_string_lossy().into_owned())),
+            None => match pin {
+                ThreadPin::Refused { running } => {
+                    assert!(running.is_some_and(|n| n > 1), "{running:?}")
+                }
+                other => panic!("pinned in a multi-threaded process: {other:?}"),
+            },
+        }
+    }
+
+    /// Inside a runtime, as the ADE load runs: refused too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pin_refuses_inside_a_runtime() {
+        let before = std::env::var_os(THREADS_ENV);
+        let pin = pin_threads_before_runtime(3);
+        assert_eq!(std::env::var_os(THREADS_ENV), before);
+        assert!(!matches!(pin, ThreadPin::Pinned(_)), "{pin:?}");
+    }
+
+    #[test]
+    fn process_threads_reads_the_kernel_count() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b = std::sync::Arc::clone(&barrier);
+        let before = process_threads().expect("/proc/self/status");
+        let helper = std::thread::spawn(move || {
+            b.wait();
+            b.wait();
+        });
+        barrier.wait();
+        let during = process_threads().expect("/proc/self/status");
+        barrier.wait();
+        helper.join().unwrap();
+        assert!(before >= 1);
+        assert!(during >= 2, "{during}");
     }
 }

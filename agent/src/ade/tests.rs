@@ -1585,3 +1585,169 @@ async fn ignored_model_host_prompt_tokens() {
         "less than 800 tokens left to the user turn"
     );
 }
+
+// ====== External audit Wave 3, ADE runtime hygiene (lab PR 191) ======
+
+/// Streams its output one character at a time, as the candle backend
+/// streams tokens, and counts the characters it generated before the
+/// engine stopped it.
+struct StreamingScriptedBackend {
+    output: String,
+    generated: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl InferenceBackend for StreamingScriptedBackend {
+    fn name(&self) -> &str {
+        "streaming-scripted"
+    }
+    fn quantization(&self) -> &str {
+        "none"
+    }
+    fn model_id(&self) -> &str {
+        "streaming-scripted-model"
+    }
+    fn generate(
+        &self,
+        _: &str,
+        _: &Event,
+        _: usize,
+        _: f32,
+        _: f32,
+    ) -> Result<String, error::AdeError> {
+        Ok(self.output.clone())
+    }
+    fn generate_streaming(
+        &self,
+        _: &str,
+        _: &Event,
+        _: usize,
+        _: f32,
+        _: f32,
+        mut on_token: Box<dyn FnMut(&str) -> StreamControl + Send>,
+    ) -> Result<String, error::AdeError> {
+        let mut out = String::new();
+        for ch in self.output.chars() {
+            let mut buf = [0u8; 4];
+            let piece = ch.encode_utf8(&mut buf);
+            out.push_str(piece);
+            self.generated
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if matches!(on_token(piece), StreamControl::Stop) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// External audit LLMP-010 (NN-AUD-322): the decode stops at the close of
+/// the verdict object whatever precedes it — a stray `}`, an odd quote, a
+/// reasoning block with braces of its own — and the verdict is the
+/// model's. On the base code the stray brace and the quote ran the decode
+/// to its end, and the reasoning block stopped it inside `<think>` (an
+/// Escalate for a malformed output).
+#[tokio::test]
+async fn the_decode_stops_where_the_verdict_object_closes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let event = spawn_event(4242, "cargo", "/home/u/.cargo/bin/cargo");
+    let object = mock_json(&event).to_string();
+    for preamble in [
+        "",
+        "Verdict follows } (one stray brace).\n",
+        "The \"cargo binary is a developer tool.\n",
+        "<think>It reads {pid: 4242}; \"cargo\" is benign, so {\"verdict\": \"Allow\"}.</think>\n",
+    ] {
+        let generated = Arc::new(AtomicUsize::new(0));
+        let backend = StreamingScriptedBackend {
+            output: format!("{preamble}{object}\nAnd the model would go on talking here."),
+            generated: Arc::clone(&generated),
+        };
+        let prompt = write_temp_prompt();
+        let model = write_temp_model();
+        let cfg = cfg_with(prompt.path(), model.path());
+        let engine = AdeEngine::new_with_backend(cfg, Arc::new(backend))
+            .await
+            .unwrap();
+        let out = engine.evaluate(&event, &ctx_with(vec![])).await.unwrap();
+        assert_eq!(out.verdict, AdeAction::Allow, "{preamble:?}");
+        assert_eq!(engine.stats().malformed_outputs, 0, "{preamble:?}");
+        assert_eq!(
+            generated.load(Ordering::SeqCst),
+            preamble.chars().count() + object.chars().count(),
+            "the decode must stop at the object's close: {preamble:?}"
+        );
+    }
+}
+
+/// External audit LLMP-005 (NN-AUD-319): a recommended action that differs
+/// from the verdict is aligned on it, and is not a malformed output. On the
+/// base code the verdict carried `Alert` and `Kill`.
+#[tokio::test]
+async fn recommended_action_is_aligned_on_the_verdict() {
+    let event = spawn_event(4242, "xmrig", "/opt/x/xmrig");
+    let mut v = mock_json(&event);
+    assert_eq!(v["verdict"], "Kill");
+    v["verdict"] = "Alert".into();
+    v["recommended_action"]["action"] = "Kill".into();
+    let (engine, _p, _m) = scripted_engine(v).await;
+    let out = engine.evaluate(&event, &ctx_with(vec![])).await.unwrap();
+    assert_eq!(out.verdict, AdeAction::Alert);
+    assert_eq!(out.recommended_action.action, AdeAction::Alert);
+    assert_eq!(engine.stats().malformed_outputs, 0);
+    assert_eq!(engine.stats().successful_verdicts, 1);
+}
+
+/// External audit LLMR-018 (NN-AUD-328): the mock that stands in for a
+/// GGUF says it is the mock, in the backend and in the verdicts the engine
+/// records. On the base code it claimed the file's stem and `Q4_K_M`.
+#[tokio::test]
+async fn mock_never_claims_a_model() {
+    let gguf = PathBuf::from(AdeConfig::DEFAULT_MODEL_PATH);
+    let mock = MockBackend::from_model_path(&gguf);
+    assert_eq!(mock.model_id(), "mock-deterministic");
+    assert_eq!(mock.quantization(), "none");
+    assert_eq!(mock.declared_path(), Some(gguf.as_path()));
+
+    let prompt = write_temp_prompt();
+    let model = write_temp_model();
+    let cfg = cfg_with(prompt.path(), model.path());
+    let engine =
+        AdeEngine::new_with_backend(cfg, Arc::new(MockBackend::from_model_path(model.path())))
+            .await
+            .unwrap();
+    let event = spawn_event(4242, "cargo", "/home/u/.cargo/bin/cargo");
+    let out = engine.evaluate(&event, &ctx_with(vec![])).await.unwrap();
+    assert_eq!(out.metadata.backend, "mock");
+    assert_eq!(out.metadata.model_id, "mock-deterministic");
+    assert_eq!(out.metadata.model_quantization, "none");
+    let err = engine.escalate_for_error(&event, &AdeError::Timeout { seconds: 1 });
+    assert_eq!(err.metadata.model_id, "mock-deterministic");
+    assert_eq!(err.metadata.model_quantization, "none");
+}
+
+/// External audit LLMR-009 (NN-AUD-325): loading the ADE, which runs inside
+/// the agent's runtime, never writes the environment; `main` pins
+/// `RAYON_NUM_THREADS` before the runtime exists. On the base code
+/// `build_default_backend` set it here (run alone: another base-code test
+/// that reaches the load may have set it first).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ade_load_never_writes_the_environment() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let model = tmp.path().join("m.gguf");
+    let tokenizer = tmp.path().join("m.tokenizer.json");
+    std::fs::write(&model, b"junk").unwrap();
+    std::fs::write(&tokenizer, b"{}").unwrap();
+    for p in [&model, &tokenizer] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let before = std::env::var_os(backend_candle::THREADS_ENV);
+    let _ = AdeEngine::new(AdeConfig::default().with_model_path(model)).await;
+    assert_eq!(
+        std::env::var_os(backend_candle::THREADS_ENV),
+        before,
+        "the ADE load wrote RAYON_NUM_THREADS inside the runtime"
+    );
+}

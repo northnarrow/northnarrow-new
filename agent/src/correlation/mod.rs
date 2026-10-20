@@ -56,7 +56,12 @@ struct Inner {
 }
 
 impl CorrelationBuffer {
+    /// A buffer of `capacity` events, at least one. External audit XAI-017
+    /// (NN-AUD-351): a capacity of 0 never evicted, and the buffer grew
+    /// with every event (only tests build one with `new`; the agent's is
+    /// [`Self::with_default_capacity`]).
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             inner: std::sync::Arc::new(Inner {
                 capacity,
@@ -71,7 +76,7 @@ impl CorrelationBuffer {
 
     pub fn push(&self, event: Event) {
         let mut q = self.inner.queue.write();
-        if q.len() == self.inner.capacity {
+        while q.len() >= self.inner.capacity {
             q.pop_front();
         }
         q.push_back(event);
@@ -385,6 +390,21 @@ mod tests {
         assert!(snap
             .iter()
             .any(|e| matches!(e, Event::ProcessSpawn { pid: 4, .. })));
+    }
+
+    /// External audit XAI-017: a capacity of 0 never evicted.
+    #[test]
+    fn zero_capacity_is_normalised_and_bounded() {
+        let buf = CorrelationBuffer::new(0);
+        assert_eq!(buf.capacity(), 1);
+        for i in 0..5 {
+            buf.push(spawn(i, 0, "/a", u64::from(i)));
+        }
+        assert_eq!(buf.len(), 1);
+        assert!(matches!(
+            buf.snapshot().as_slice(),
+            [Event::ProcessSpawn { pid: 4, .. }]
+        ));
     }
 
     const S: u64 = 1_000_000_000;
