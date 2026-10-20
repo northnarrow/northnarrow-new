@@ -60,12 +60,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use northnarrow_agent::fim::rules::HONEYPOT_PATHS;
 
 mod common;
-use common::EniIptablesGuard;
+use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const VERDICT_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PRIV_BIN_DIR: &str = "/usr/local/bin";
 const REAL_SUDO: &str = "/usr/bin/sudo";
 
 fn agent_bin() -> &'static str {
@@ -87,39 +86,8 @@ fn canary_templates_dir() -> PathBuf {
         .join("canary-templates")
 }
 
-// ── path-safe install (post-T10.6 hotfix: absolute sudo) ────────────
-
-struct InstalledBin {
-    path: PathBuf,
-}
-impl Drop for InstalledBin {
-    fn drop(&mut self) {
-        let _ = Command::new(REAL_SUDO)
-            .arg("rm")
-            .arg("-f")
-            .arg(&self.path)
-            .status();
-    }
-}
-fn install_to_priv_bin(src: &Path) -> InstalledBin {
-    let basename = src.file_name().and_then(|s| s.to_str()).expect("basename");
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dst = PathBuf::from(format!(
-        "{PRIV_BIN_DIR}/{basename}-e2etest-{ts}-{}",
-        std::process::id()
-    ));
-    let status = Command::new(REAL_SUDO)
-        .args(["install", "-m", "755", "-o", "root", "-g", "root"])
-        .arg(src)
-        .arg(&dst)
-        .status()
-        .expect("spawn sudo install");
-    assert!(status.success(), "sudo install of {} failed", src.display());
-    InstalledBin { path: dst }
-}
+// Path-safe install (post-T10.6 hotfix: absolute sudo):
+// `common::install_to_priv_bin`.
 
 /// Stops the agent on drop (`common::quit_agent`: evicts the sudo subtree
 /// from PROTECTED_PIDS, then SIGQUITs it; the task_kill hook refuses every
@@ -498,7 +466,7 @@ impl Fixture {
             |r| r["path"].as_str() == Some(sentinel.as_str()),
         );
         let modified = || {
-            common::jsonl_rows(&self.drift_log)
+            common::read_jsonl_strict(&self.drift_log)
                 .iter()
                 .filter(|r| r["path"].as_str() == Some(sentinel.as_str()) && r["op"] == 1)
                 .count()
@@ -513,7 +481,7 @@ impl Fixture {
             .unwrap_or_else(|| {
                 panic!(
                     "no Modified drift row for the sentinel within {VERDICT_POLL_TIMEOUT:?}; rows: {:?}",
-                    common::jsonl_rows(&self.drift_log)
+                    common::read_jsonl_strict(&self.drift_log)
                 )
             });
         common::exec_barrier(&self.detections_log, VERDICT_POLL_TIMEOUT);

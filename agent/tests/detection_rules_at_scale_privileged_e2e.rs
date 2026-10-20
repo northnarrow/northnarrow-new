@@ -58,10 +58,10 @@ use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 mod common;
-use common::EniIptablesGuard;
+use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const JSONL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,51 +96,17 @@ fn canary_templates_dir() -> PathBuf {
 
 // ── RAII fixtures (same shape as net_privileged_e2e) ────────────────
 
-const PRIV_BIN_DIR: &str = "/usr/local/bin";
-
 /// Off-PATH scratch dir for comm-named helpers (see
 /// `install_named_to_priv_bin`). Deliberately NOT on `$PATH`: an
 /// exact-name install (e.g. comm=="sudo") left behind by an
 /// interrupted run must never shadow a real system binary. Still
-/// outside `/tmp`, so R001..R010 location rules don't match.
+/// outside `/tmp`, so R001..R010 location rules don't match. The
+/// unique-name installs under `/usr/local/bin` (R009-safe; not /tmp so
+/// R001..R010 don't match the agent/admin binaries) are
+/// `common::install_to_priv_bin`; both go through the real sudo by its
+/// absolute path (an interrupted run once left a `sudo`-named helper in
+/// `/usr/local/bin`, bricking `sudo` VM-wide).
 const PRIV_NAMED_DIR: &str = "/usr/local/lib/nn-e2etest";
-
-/// Absolute path to the real sudo. Cleanup and install must never go
-/// through a bare `sudo` PATH lookup — a leaked comm-named helper could
-/// otherwise shadow it and silently no-op the very cleanup meant to
-/// remove it (observed: an interrupted run left a `sudo`-named helper
-/// in `/usr/local/bin`, bricking `sudo` VM-wide).
-const REAL_SUDO: &str = "/usr/bin/sudo";
-
-struct InstalledBin {
-    path: PathBuf,
-}
-impl Drop for InstalledBin {
-    fn drop(&mut self) {
-        let _ = Command::new(REAL_SUDO)
-            .arg("rm")
-            .arg("-f")
-            .arg(&self.path)
-            .status();
-    }
-}
-
-/// Install `src` to a UNIQUE name under `/usr/local/bin` (R009-safe;
-/// not /tmp so R001..R010 don't match the agent/admin binaries).
-fn install_to_priv_bin(src: &Path) -> InstalledBin {
-    let basename = src
-        .file_name()
-        .and_then(|s| s.to_str())
-        .expect("binary path has a UTF-8 basename");
-    let ts_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"));
-    install_file(src, &dst);
-    InstalledBin { path: dst }
-}
 
 /// Install `src` to `<PRIV_NAMED_DIR>/<exact_name>` so the kernel
 /// `comm` (basename, TASK_COMM_LEN-truncated) is exactly `exact_name`
@@ -149,27 +115,13 @@ fn install_to_priv_bin(src: &Path) -> InstalledBin {
 /// is off `$PATH` and outside `/tmp`: the comm is the basename only, so
 /// no rule keys on the location, while keeping the file off `$PATH`
 /// guarantees an interrupted run can't leave a binary that shadows a
-/// system command of the same name (e.g. `sudo`).
+/// system command of the same name (e.g. `sudo`). `install -D` creates
+/// the directory.
 fn install_named_to_priv_bin(src: &Path, exact_name: &str) -> InstalledBin {
-    let dst = PathBuf::from(format!("{PRIV_NAMED_DIR}/{exact_name}"));
-    install_file(src, &dst);
-    InstalledBin { path: dst }
-}
-
-fn install_file(src: &Path, dst: &Path) {
-    // `-D` creates any missing leading directories (PRIV_NAMED_DIR).
-    let status = Command::new(REAL_SUDO)
-        .args(["install", "-D", "-m", "755", "-o", "root", "-g", "root"])
-        .arg(src)
-        .arg(dst)
-        .status()
-        .expect("spawn sudo install");
-    assert!(
-        status.success(),
-        "sudo install of {} to {} failed",
-        src.display(),
-        dst.display()
-    );
+    common::install_bin_at(
+        src,
+        &PathBuf::from(format!("{PRIV_NAMED_DIR}/{exact_name}")),
+    )
 }
 
 /// Stops the agent on drop (`common::quit_agent`: evicts the sudo subtree
@@ -527,24 +479,13 @@ fn wait_for_socket(path: &Path) {
     panic!("agent never opened admin socket at {}", path.display());
 }
 
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => s
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 fn wait_jsonl_matching<F>(path: &Path, n: usize, predicate: F) -> Vec<serde_json::Value>
 where
     F: Fn(&serde_json::Value) -> bool,
 {
     let deadline = Instant::now() + JSONL_POLL_TIMEOUT;
     while Instant::now() < deadline {
-        let matched: Vec<_> = read_jsonl(path)
+        let matched: Vec<_> = common::read_jsonl_strict(path)
             .into_iter()
             .filter(|r| predicate(r))
             .collect();
@@ -556,7 +497,7 @@ where
     panic!(
         "log {} never held {n} matching rows; all rows: {:?}",
         path.display(),
-        read_jsonl(path)
+        common::read_jsonl_strict(path)
     );
 }
 

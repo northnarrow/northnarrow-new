@@ -50,10 +50,10 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 mod common;
-use common::EniIptablesGuard;
+use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const JSONL_POLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -118,53 +118,6 @@ fn canary_templates_dir() -> PathBuf {
 }
 
 // ── R009 avoidance + RAII fixtures (same shape as canary_priv) ───────
-
-const PRIV_BIN_DIR: &str = "/usr/local/bin";
-
-struct InstalledBin {
-    path: PathBuf,
-}
-impl Drop for InstalledBin {
-    fn drop(&mut self) {
-        let _ = Command::new("sudo")
-            .arg("rm")
-            .arg("-f")
-            .arg(&self.path)
-            .status();
-    }
-}
-
-fn install_to_priv_bin(src: &Path) -> InstalledBin {
-    let basename = src
-        .file_name()
-        .and_then(|s| s.to_str())
-        .expect("binary path has a UTF-8 basename");
-    let ts_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"));
-    let status = Command::new("sudo")
-        .arg("install")
-        .arg("-m")
-        .arg("755")
-        .arg("-o")
-        .arg("root")
-        .arg("-g")
-        .arg("root")
-        .arg(src)
-        .arg(&dst)
-        .status()
-        .expect("spawn sudo install");
-    assert!(
-        status.success(),
-        "sudo install of {} to {} failed",
-        src.display(),
-        dst.display()
-    );
-    InstalledBin { path: dst }
-}
 
 /// Stops the agent on drop (`common::quit_agent`: evicts the sudo subtree
 /// from PROTECTED_PIDS, then SIGQUITs it; the task_kill hook refuses every
@@ -449,31 +402,20 @@ fn wait_for_socket(path: &Path) {
     );
 }
 
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    body.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
-}
-
 fn wait_jsonl_matching<F>(path: &Path, n: usize, predicate: F) -> Vec<serde_json::Value>
 where
     F: Fn(&serde_json::Value) -> bool,
 {
     let deadline = Instant::now() + JSONL_POLL_TIMEOUT;
     while Instant::now() < deadline {
-        let rows = read_jsonl(path);
+        let rows = common::read_jsonl_strict(path);
         let matched: Vec<_> = rows.iter().filter(|r| predicate(r)).cloned().collect();
         if matched.len() >= n {
             return matched;
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    let rows = read_jsonl(path);
+    let rows = common::read_jsonl_strict(path);
     panic!(
         "log {} held {} matching rows after {:?} — wanted >= {}; \
          all rows: {:?}",
@@ -889,7 +831,7 @@ s.close()
     // second, so the kernel-side limiter admits 1 row (2 if the burst
     // straddles a second boundary) — never one per datagram.
     let ours = common::wait_count_stable(Duration::from_secs(1), JSONL_POLL_TIMEOUT, || {
-        read_jsonl(&fx.netflow_log)
+        common::read_jsonl_strict(&fx.netflow_log)
             .into_iter()
             .filter(is_ours)
             .count()
@@ -956,7 +898,7 @@ s.close()
     fx.wait_netflow_matching(1, mapped);
     // Counted once settled (NN-AUD-228), not after a fixed sleep.
     let n = common::wait_count_stable(Duration::from_secs(1), JSONL_POLL_TIMEOUT, || {
-        read_jsonl(&fx.netflow_log)
+        common::read_jsonl_strict(&fx.netflow_log)
             .into_iter()
             .filter(mapped)
             .count()
@@ -1035,12 +977,12 @@ u.close()
     // Read once the row count has settled (NN-AUD-228), not after a fixed
     // sleep.
     common::wait_count_stable(Duration::from_secs(1), JSONL_POLL_TIMEOUT, || {
-        read_jsonl(&fx.netflow_log)
+        common::read_jsonl_strict(&fx.netflow_log)
             .into_iter()
             .filter(udp_row)
             .count()
     });
-    let rows: Vec<serde_json::Value> = read_jsonl(&fx.netflow_log)
+    let rows: Vec<serde_json::Value> = common::read_jsonl_strict(&fx.netflow_log)
         .into_iter()
         .filter(udp_row)
         .collect();

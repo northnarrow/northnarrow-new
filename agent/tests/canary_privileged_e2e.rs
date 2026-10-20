@@ -56,10 +56,10 @@ use base64::Engine as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 mod common;
-use common::EniIptablesGuard;
+use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -103,62 +103,11 @@ impl Drop for AgentGuard {
     }
 }
 
-/// K8.1 R009 avoidance: sudo-install agent + nn-admin under
-/// `/usr/local/bin/<basename>-e2etest-<ts>-<pid>` so the
-/// post-spawn nn-admin canary deploy / refresh calls don't
-/// trip the agent's `R009_RootExecFromUserPath` rule (which
-/// kills any root spawn originating from `/home/`, `/tmp/`,
-/// `/var/tmp/`). Ported verbatim from
-/// `agent/tests/privileged_e2e.rs` PHASE_D_003 / commit 18baa66
-/// (and originally from `watchdog/tests/privileged_e2e.rs`
-/// PHASE_D_001 W8). Same pattern, same RAII cleanup.
-const PRIV_BIN_DIR: &str = "/usr/local/bin";
-
-struct InstalledBin {
-    path: PathBuf,
-}
-impl Drop for InstalledBin {
-    fn drop(&mut self) {
-        let _ = Command::new("sudo")
-            .arg("rm")
-            .arg("-f")
-            .arg(&self.path)
-            .status();
-    }
-}
-
-fn install_to_priv_bin(src: &Path) -> InstalledBin {
-    let basename = src
-        .file_name()
-        .and_then(|s| s.to_str())
-        .expect("binary path has a UTF-8 basename");
-    let ts_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"));
-    let status = Command::new("sudo")
-        .arg("install")
-        .arg("-m")
-        .arg("755")
-        .arg("-o")
-        .arg("root")
-        .arg("-g")
-        .arg("root")
-        .arg(src)
-        .arg(&dst)
-        .status()
-        .expect("spawn sudo install");
-    assert!(
-        status.success(),
-        "sudo install of {} to {} failed",
-        src.display(),
-        dst.display()
-    );
-    InstalledBin { path: dst }
-}
-
+/// K8.1 R009 avoidance: agent + nn-admin run from root-owned copies
+/// under `/usr/local/bin/` (`common::install_to_priv_bin`), so the
+/// post-spawn nn-admin canary deploy / refresh calls don't trip the
+/// agent's `R009_RootExecFromUserPath` rule (which kills any root spawn
+/// originating from `/home/`, `/tmp/`, `/var/tmp/`).
 fn install_priv_bins() -> (InstalledBin, InstalledBin) {
     let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
     let installed_admin = install_to_priv_bin(Path::new(nn_admin_bin()));
@@ -522,7 +471,7 @@ impl CanaryFixture {
 
     /// The registry rows of `canary_id`.
     fn registry_rows(&self, canary_id: &str) -> Vec<serde_json::Value> {
-        read_jsonl(&self.canary_registry)
+        common::read_jsonl_strict(&self.canary_registry)
             .into_iter()
             .filter(|r| r["canary_id"].as_str() == Some(canary_id))
             .collect()
@@ -623,13 +572,13 @@ impl CanaryFixture {
     fn wait_access(&self, n: usize) -> Vec<serde_json::Value> {
         let deadline = Instant::now() + ACCESS_LOG_POLL_TIMEOUT;
         while Instant::now() < deadline {
-            let rows = read_jsonl(&self.canary_access_log);
+            let rows = common::read_jsonl_strict(&self.canary_access_log);
             if rows.len() >= n {
                 return rows;
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        let rows = read_jsonl(&self.canary_access_log);
+        let rows = common::read_jsonl_strict(&self.canary_access_log);
         panic!(
             "canary access log {} held {} rows after {:?} — wanted >= {}; \
              current rows: {:?}",
@@ -669,17 +618,6 @@ fn wait_for_socket(path: &Path) {
         path.display(),
         SOCKET_POLL_TIMEOUT
     );
-}
-
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    body.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
 }
 
 // ── Test 1: file canary trip → access-log entry with first_trip ─────
@@ -872,7 +810,7 @@ fn a_decoy_changed_while_the_agent_is_down_is_reported() {
 
     let deadline = Instant::now() + ACCESS_LOG_POLL_TIMEOUT;
     let audit = loop {
-        let found: Vec<_> = read_jsonl(&fx.audit_log)
+        let found: Vec<_> = common::read_jsonl_strict(&fx.audit_log)
             .into_iter()
             .filter(|r| r["op"].as_str() == Some("integrity_drift"))
             .filter(|r| r["extra"]["kind"].as_str() == Some("canary_decoy_tampered"))
@@ -1249,7 +1187,7 @@ fn network_canary_connect_trips_canary_003_and_kills_the_connector() {
         "the trip's own connection drew NN-L-CHAIN-003: {chain:?}"
     );
     assert_eq!(
-        read_jsonl(&fx.canary_access_log).len(),
+        common::read_jsonl_strict(&fx.canary_access_log).len(),
         2,
         "one row per connect to the canary"
     );

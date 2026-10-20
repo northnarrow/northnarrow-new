@@ -65,13 +65,30 @@ pub const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 ///
 /// Drop runs unconditionally (pass / fail / panic) so the host's
 /// network is restored even when the test panics before its
-/// own cleanup path executes. Subprocess errors are swallowed
-/// — the goal is "best-effort cleanup, never blame the guard for
-/// a downstream failure." Tests that need to assert a clean
-/// state can call [`Self::is_clean`] after construction.
+/// own cleanup path executes.
+///
+/// External audit NN-AUD-420 (TST-014): Drop used to discard every
+/// status, removed one jump per base chain (a duplicated jump survived, so
+/// `-X` failed) and never looked at the result; `is_clean()` called a host
+/// where iptables could not run "clean", and nothing called it. Now Drop
+/// removes every jump (bounded), flushes and deletes the chain, on the v4
+/// table and on the v6 one the agent's COMBAT also writes (BUG-031), and
+/// then reads the tables back ([`EniIptablesGuard::tear_down`]): a chain or
+/// a jump left behind, or a table it could not read, fails the test (only
+/// printed when the test is already failing, see [`fail_teardown`]).
 pub struct EniIptablesGuard {
     chain: &'static str,
 }
+
+/// The most `-D <base> -j <chain>` the guard runs per base chain: one per
+/// duplicated jump, bounded so a rule that keeps coming back cannot loop.
+const MAX_JUMP_DELETES: usize = 16;
+
+/// The guard's tables: `(binary, nft family, required)`. v4 is always
+/// cleaned and read back; v6 where `ip6tables` is installed (a host
+/// without it has no v6 chain either).
+const GUARD_TABLES: [(&str, &str, bool); 2] =
+    [("iptables", "ip", true), ("ip6tables", "ip6", false)];
 
 impl EniIptablesGuard {
     /// Install a Drop-on-scope-exit cleanup. Cheap to construct —
@@ -98,54 +115,170 @@ impl EniIptablesGuard {
         Self { chain }
     }
 
-    /// Probe `iptables -S NORTHNARROW_COMBAT` and return `true`
-    /// when the chain is absent (the expected post-Drop state).
-    /// Useful for "did the cleanup actually work?" assertions
-    /// in the guard's self-tests; production callers don't need
-    /// to call this.
-    pub fn is_clean() -> bool {
-        let out = Command::new("iptables")
-            .args(["-S", COMBAT_CHAIN])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output();
-        match out {
-            Ok(o) => !o.status.success(),
-            // Couldn't even spawn iptables — treat as "clean" so
-            // the guard doesn't fail tests on hosts without
-            // iptables installed. The production path runs under
-            // sudo + iptables-present anyway.
-            Err(_) => true,
+    /// Remove the chain the way the agent's release does, then check it:
+    /// on each table, `-D <base> -j <chain>` repeated while iptables
+    /// deletes one (at most [`MAX_JUMP_DELETES`]: a duplicated jump is
+    /// removed too), then `-F` and `-X`. The commands' own statuses do not
+    /// decide (on a clean host each one fails, "no such rule/chain"); the
+    /// table read back does ([`chain_leftovers`]). `Err` names what is
+    /// left, or the table that could not be read.
+    pub fn tear_down(&self) -> Result<(), String> {
+        let chain = self.chain;
+        let mut problems = Vec::new();
+        for (bin, family, required) in GUARD_TABLES {
+            if !required && !installed(bin) {
+                continue;
+            }
+            for base in BASE_CHAINS {
+                for _ in 0..MAX_JUMP_DELETES {
+                    if !run_quiet(bin, &["-D", base, "-j", chain]) {
+                        break;
+                    }
+                }
+            }
+            run_quiet(bin, &["-F", chain]);
+            run_quiet(bin, &["-X", chain]);
+            match chain_leftovers(bin, family, chain) {
+                Ok(left) if left.is_empty() => {}
+                Ok(left) => problems.push(format!("{bin}: still {left:?}")),
+                Err(e) => problems.push(format!("{bin}: {e}")),
+            }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "EniIptablesGuard: {chain} not removed: {}. The host may stay isolated: \
+                 remove it by hand (`-D <INPUT|OUTPUT|FORWARD> -j {chain}` until none is \
+                 left, then `-F {chain}` and `-X {chain}`, with iptables and ip6tables).",
+                problems.join("; ")
+            ))
         }
     }
 }
 
 impl Drop for EniIptablesGuard {
     fn drop(&mut self) {
-        // Step 1: detach the jump rules from each base chain.
-        // `iptables -X` refuses to delete a chain still
-        // referenced anywhere, so detach BEFORE flush/delete.
-        for base in BASE_CHAINS {
-            let _ = Command::new("iptables")
-                .args(["-D", base, "-j", self.chain])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if let Err(msg) = self.tear_down() {
+            fail_teardown(&msg);
         }
-        // Step 2: flush the chain's contents (so a future -X
-        // succeeds even if the rules were partially built).
-        let _ = Command::new("iptables")
-            .args(["-F", self.chain])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        // Step 3: delete the chain itself.
-        let _ = Command::new("iptables")
-            .args(["-X", self.chain])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
     }
+}
+
+/// `bin args…` with its output discarded; `true` when it exited 0.
+fn run_quiet(bin: &str, args: &[&str]) -> bool {
+    Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `bin` can be run at all (not "no such file").
+fn installed(bin: &str) -> bool {
+    !matches!(
+        Command::new(bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// What is left of `chain` in `bin`'s filter table: its `-N` line and every
+/// rule that jumps to it (`-j <chain>`), as `bin -S` lists them; empty when
+/// nothing is, or when the kernel has no such table ("Table does not
+/// exist", "Address family not supported": nothing can be in it). Any
+/// other answer is an `Err`: a table that could not be read is never
+/// "clean". iptables-nft 1.8.9 refuses to list a table it calls
+/// "incompatible" (Debian 12, after some suites): the table is read with
+/// `nft` then.
+pub fn chain_leftovers(bin: &str, family: &str, chain: &str) -> Result<Vec<String>, String> {
+    let out = Command::new(bin)
+        .arg("-S")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run `{bin} -S`: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        return Ok(iptables_leftovers(&text, chain));
+    }
+    if stderr.to_ascii_lowercase().contains("incompatible") {
+        return nft_leftovers(family, chain);
+    }
+    if stderr.contains("Table does not exist") || stderr.contains("Address family not supported") {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "`{bin} -S` ended with {:?}: {}",
+        out.status.code(),
+        stderr.trim()
+    ))
+}
+
+/// The lines of an `iptables -S` listing that are `chain` or jump (or go)
+/// to it.
+pub fn iptables_leftovers(listing: &str, chain: &str) -> Vec<String> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            let toks: Vec<&str> = l.split_whitespace().collect();
+            toks == ["-N", chain]
+                || toks
+                    .windows(2)
+                    .any(|w| (w[0] == "-j" || w[0] == "-g") && w[1] == chain)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// The lines of an `nft list table` listing that declare `chain` or jump
+/// (or go) to it.
+pub fn nft_table_leftovers(listing: &str, chain: &str) -> Vec<String> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            let toks: Vec<&str> = l.split_whitespace().collect();
+            toks.starts_with(&["chain", chain])
+                || toks
+                    .windows(2)
+                    .any(|w| (w[0] == "jump" || w[0] == "goto") && w[1] == chain)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// [`nft_table_leftovers`] of `nft list table <family> filter`; no table
+/// is nothing left.
+fn nft_leftovers(family: &str, chain: &str) -> Result<Vec<String>, String> {
+    let out = Command::new("nft")
+        .args(["list", "table", family, "filter"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("the table is unreadable by iptables and `nft` could not run: {e}"))?;
+    if out.status.success() {
+        return Ok(nft_table_leftovers(
+            &String::from_utf8_lossy(&out.stdout),
+            chain,
+        ));
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("No such file or directory") {
+        return Ok(Vec::new());
+    }
+    Err(format!(
+        "the table is unreadable by iptables, and `nft list table {family} filter` ended \
+         with {:?}: {}",
+        out.status.code(),
+        stderr.trim()
+    ))
 }
 
 // ── Self-tests ────────────────────────────────────────────────────────
@@ -466,6 +599,91 @@ pub fn shutdown_signed(
     }
 }
 
+// ── External audit NN-AUD-423 (TST-017) — binaries the agent runs from ──
+//
+// The agent and nn-admin run from a root-owned copy outside the user's
+// tree: R009 (root exec from a user path) kills a root process started
+// from `target/` under /home, and an agent run from a path its user can
+// rewrite is not the agent under test. Six suites carried their own copy
+// of this; two (map_pin, fim) ran the build path.
+
+/// Where the copies go: root-owned, not under /home or /tmp.
+pub const PRIV_BIN_DIR: &str = "/usr/local/bin";
+
+/// The real sudo, by absolute path: a helper an interrupted run left in
+/// /usr/local/bin must never shadow it (observed: a `sudo`-named helper
+/// bricked sudo on a guest).
+pub const REAL_SUDO: &str = "/usr/bin/sudo";
+
+/// A root-owned copy of a binary; Drop removes it and fails the test (see
+/// [`fail_teardown`]) when it cannot. Keep it alive as long as a process
+/// runs from it, and declare it before the guard that stops that process
+/// (locals drop in reverse order, fields in declaration order).
+pub struct InstalledBin {
+    pub path: PathBuf,
+}
+
+impl Drop for InstalledBin {
+    fn drop(&mut self) {
+        let out = Command::new(REAL_SUDO)
+            .args(["rm", "-f"])
+            .arg(&self.path)
+            .stdin(Stdio::null())
+            .output();
+        let failed = match &out {
+            Ok(o) if o.status.success() => None,
+            Ok(o) => Some(format!("exit {:?}: {}", o.status.code(), brief(o))),
+            Err(e) => Some(format!("could not run sudo: {e}")),
+        };
+        if let Some(why) = failed {
+            fail_teardown(&format!(
+                "InstalledBin: removing {} failed ({why}); remove it by hand",
+                self.path.display()
+            ));
+        }
+    }
+}
+
+/// Install `src` as `dst` (`install -D -m 755 -o root -g root`, through
+/// [`REAL_SUDO`]); panics when that fails.
+pub fn install_bin_at(src: &Path, dst: &Path) -> InstalledBin {
+    let status = Command::new(REAL_SUDO)
+        .args(["install", "-D", "-m", "755", "-o", "root", "-g", "root"])
+        .arg(src)
+        .arg(dst)
+        .stdin(Stdio::null())
+        .status()
+        .expect("spawn sudo install");
+    assert!(
+        status.success(),
+        "sudo install of {} to {} failed",
+        src.display(),
+        dst.display()
+    );
+    InstalledBin {
+        path: dst.to_path_buf(),
+    }
+}
+
+/// Install `src` under [`PRIV_BIN_DIR`] as
+/// `<basename>-e2etest-<ns>-<pid>`, a name no other run uses (the lab's
+/// purge finds leftovers by `-e2etest`).
+pub fn install_to_priv_bin(src: &Path) -> InstalledBin {
+    let basename = src
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("binary path has a UTF-8 basename");
+    let ts_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    install_bin_at(
+        src,
+        &PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}")),
+    )
+}
+
 // ── External audit NN-AUD-227/228/234 — structured waits and barriers ──
 //
 // Added at the end of the file on purpose (other fixes touch the teardown
@@ -492,14 +710,51 @@ pub fn wait_until<T>(
     }
 }
 
-/// The parsed rows of a JSONL chain log (blank or unparsable lines skipped).
-pub fn jsonl_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
+/// How much of a line a JSONL parse error shows.
+const JSONL_SHOWN_BYTES: usize = 200;
+
+/// External audit NN-AUD-419 (TST-013): the rows of a JSONL log, every
+/// complete line a JSON value. The readers of the suites skipped what did
+/// not parse (`filter_map(… .ok())`), so a truncated, interleaved or
+/// garbled record vanished and an assertion on "no such row" passed on it.
+/// `Err` names `what`, the line number (from 1) and its first 200 bytes
+/// for the first newline-terminated line that is not one JSON value (an
+/// empty line included: the agent never writes one). The last line, when
+/// it has no newline yet, is a write in progress: not read, not an error.
+/// Rows of other processes or other kinds are values like any other: the
+/// reader checks the framing, the callers pick the rows they want.
+pub fn parse_jsonl_strict(what: &str, bytes: &[u8]) -> Result<Vec<serde_json::Value>, String> {
+    let mut rows = Vec::new();
+    let mut rest = bytes;
+    let mut number = 0usize;
+    while let Some(end) = rest.iter().position(|&b| b == b'\n') {
+        number += 1;
+        let line = &rest[..end];
+        rest = &rest[end + 1..];
+        match serde_json::from_slice(line) {
+            Ok(v) => rows.push(v),
+            Err(e) => {
+                let shown = String::from_utf8_lossy(&line[..line.len().min(JSONL_SHOWN_BYTES)]);
+                return Err(format!(
+                    "{what}: line {number} is not a JSON record ({e}), {} bytes: {shown:?}",
+                    line.len()
+                ));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// [`parse_jsonl_strict`] of the file at `path`; a file that does not exist
+/// (yet) has no rows. Panics on a malformed line and on any other read
+/// error.
+pub fn read_jsonl_strict(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("reading {}: {e}", path.display()),
+    };
+    parse_jsonl_strict(&path.display().to_string(), &bytes).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The first row of `path` that `pred` accepts, waited for at most
@@ -510,18 +765,21 @@ pub fn wait_jsonl_row(
     what: &str,
     pred: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
-    wait_until(timeout, || jsonl_rows(path).into_iter().find(|r| pred(r))).unwrap_or_else(|| {
+    wait_until(timeout, || {
+        read_jsonl_strict(path).into_iter().find(|r| pred(r))
+    })
+    .unwrap_or_else(|| {
         panic!(
             "no {what} in {} within {timeout:?}; rows: {:?}",
             path.display(),
-            jsonl_rows(path)
+            read_jsonl_strict(path)
         )
     })
 }
 
 /// The detection records of `rule_id` in `detections`.
 pub fn records_of(detections: &std::path::Path, rule_id: &str) -> Vec<serde_json::Value> {
-    jsonl_rows(detections)
+    read_jsonl_strict(detections)
         .into_iter()
         .filter(|r| r["rule_id"].as_str() == Some(rule_id))
         .collect()
@@ -726,8 +984,8 @@ pub fn refuse_if_northnarrow_running(what: &str) {
 
 /// `iptables -S NORTHNARROW_COMBAT`'s outcome read strictly: `Ok(true)`
 /// the chain exists, `Ok(false)` iptables said it does not, `Err` for any
-/// other answer (not root, iptables missing, killed). Unlike
-/// [`EniIptablesGuard::is_clean`], "could not ask" is never "absent".
+/// other answer (not root, iptables missing, killed): "could not ask" is
+/// never "absent".
 pub fn combat_chain_verdict(status: Option<i32>, stderr: &str) -> Result<bool, String> {
     match status {
         Some(0) => Ok(true),

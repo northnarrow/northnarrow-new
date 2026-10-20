@@ -23,10 +23,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 mod common;
-use common::EniIptablesGuard;
+use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 // The agent's start (BTF, the eBPF object, the rules) took ~5 s on a lab
 // host running two other guests: the 5-s wait failed a gate run with the
@@ -569,59 +569,6 @@ fn e2e_status_no_admin_action_initially() {
 // drive admin operations through the documented CLI surface.
 
 const NN_ADMIN_OP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// PHASE_D_003 R009 avoidance: sudo-install a binary under
-/// `/usr/local/bin/<basename>-e2etest-<ts>-<pid>` so the agent's
-/// `R009_RootExecFromUserPath` rule (which kills any root spawn
-/// originating from `/home/`, `/tmp/`, `/var/tmp/`) doesn't
-/// match. Ported from `watchdog/tests/privileged_e2e.rs`
-/// PHASE_D_001 W8 commit; same pattern, same RAII cleanup.
-const PRIV_BIN_DIR: &str = "/usr/local/bin";
-
-struct InstalledBin {
-    path: PathBuf,
-}
-impl Drop for InstalledBin {
-    fn drop(&mut self) {
-        let _ = Command::new("sudo")
-            .arg("rm")
-            .arg("-f")
-            .arg(&self.path)
-            .status();
-    }
-}
-
-fn install_to_priv_bin(src: &Path) -> InstalledBin {
-    let basename = src
-        .file_name()
-        .and_then(|s| s.to_str())
-        .expect("binary path has a UTF-8 basename");
-    let ts_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let dst = PathBuf::from(format!("{PRIV_BIN_DIR}/{basename}-e2etest-{ts_ns}-{pid}"));
-    let status = Command::new("sudo")
-        .arg("install")
-        .arg("-m")
-        .arg("755")
-        .arg("-o")
-        .arg("root")
-        .arg("-g")
-        .arg("root")
-        .arg(src)
-        .arg(&dst)
-        .status()
-        .expect("spawn sudo install");
-    assert!(
-        status.success(),
-        "sudo install of {} to {} failed",
-        src.display(),
-        dst.display()
-    );
-    InstalledBin { path: dst }
-}
 
 /// PHASE_D_003 agent-spawn helper: like `spawn_agent` but threads
 /// the three B5-era CLI flags (`--signing-key-file`,
@@ -1846,4 +1793,114 @@ fn admin_socket_refuses_a_peer_of_another_uid() {
         "{detail}"
     );
     drop(rt);
+}
+
+// ── External audit NN-AUD-423 (TST-017): the agent without its admin key ──
+
+/// AUT-004 made an agent started without `admin.pub` say so: it cannot be
+/// unlocked, shut down or upgraded through its socket, so it logs an ERROR
+/// and writes a signed `subsystem_degraded` record, and runs on. No test
+/// held it — `privileged_map_pin` booted that way for months without
+/// looking. The agent here has every path in the tempdir and no
+/// `admin.pub`: the ERROR line is in its log, no admin socket appears, the
+/// audit chain holds the record (`detail` starting "admin socket
+/// disabled", `at_boot`) and verifies, and the agent is still running.
+#[test]
+fn agent_without_admin_pub_starts_degraded_and_says_so() {
+    // Declared first: removed after the agent stopped and the chain was read.
+    let (installed_agent, installed_admin) = install_priv_bins();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let d = dir.path();
+    let rules = d.join("combat-rules.v4");
+    std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules");
+    let admin_pub = d.join("admin.pub");
+    let socket = d.join("admin.sock");
+    let audit_log = d.join("audit.log");
+    let signing_key = d.join("agent.sig.key");
+    let log_path = d.join("agent.log");
+    let log = std::fs::File::create(&log_path).expect("create agent.log");
+    let log_err = log.try_clone().expect("clone the log handle");
+
+    common::require_bpftool();
+    let child = Command::new("sudo")
+        .arg("env")
+        .arg("NO_COLOR=1")
+        .arg(&installed_agent.path)
+        .arg("--combat-rules")
+        .arg(&rules)
+        .arg("--admin-pub")
+        .arg(&admin_pub)
+        .arg("--admin-socket")
+        .arg(&socket)
+        .arg("--agent-id-file")
+        .arg(d.join("agent_id"))
+        .arg("--signing-key-file")
+        .arg(&signing_key)
+        .arg("--audit-log-file")
+        .arg(&audit_log)
+        .arg("--shutdown-marker-file")
+        .arg(d.join("agent.shutdown_authorised"))
+        .arg("--no-ade")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .expect("spawn northnarrow-agent without admin.pub");
+    let mut guard = AgentGuard(Some(child));
+    let agent_log = || common::strip_ansi(&std::fs::read_to_string(&log_path).unwrap_or_default());
+
+    let record = common::wait_until(Duration::from_secs(60), || {
+        common::read_jsonl_strict(&audit_log).into_iter().find(|r| {
+            r["op"] == "integrity_drift"
+                && r["extra"]["kind"] == "subsystem_degraded"
+                && r["extra"]["detail"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("admin socket disabled"))
+        })
+    })
+    .unwrap_or_else(|| {
+        panic!(
+            "no signed subsystem_degraded \"admin socket disabled\" in {} within 60s; rows: \
+             {:?}\n--- agent log ---\n{}",
+            audit_log.display(),
+            common::read_jsonl_strict(&audit_log),
+            agent_log()
+        )
+    });
+    assert_eq!(record["extra"]["at_boot"], true, "{record}");
+    assert_eq!(record["key_fp"], "agent-self", "{record}");
+
+    let child = guard.0.as_mut().expect("agent child");
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the agent must run on, degraded\n{}",
+        agent_log()
+    );
+    assert!(
+        !socket.exists(),
+        "an agent without admin.pub must not open its admin socket ({})",
+        socket.display()
+    );
+    let text = agent_log();
+    assert!(
+        text.lines().any(|l| l.contains("ERROR")
+            && l.contains("admin pub key file missing or invalid; admin socket disabled")),
+        "no ERROR line for the missing admin.pub in the agent log:\n{text}"
+    );
+
+    // The record is in the signed chain: stop the agent, then verify it.
+    drop(guard);
+    let out = Command::new(&installed_admin.path)
+        .args(["audit", "verify", "--from"])
+        .arg(&audit_log)
+        .arg("--agent-sig-key")
+        .arg(&signing_key)
+        .output()
+        .expect("spawn nn-admin audit verify");
+    assert!(
+        out.status.success(),
+        "audit verify refused the chain: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

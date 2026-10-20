@@ -234,7 +234,7 @@ impl Fixture {
     fn wait_record_of(&self, pid: u32) -> serde_json::Value {
         let pid = u64::from(pid);
         common::wait_until(RECORD_POLL_TIMEOUT, || {
-            common::jsonl_rows(&self.detections_log)
+            common::read_jsonl_strict(&self.detections_log)
                 .into_iter()
                 .find(|r| r["principal"]["pid"].as_u64() == Some(pid))
         })
@@ -242,7 +242,7 @@ impl Fixture {
             panic!(
                 "no detection record of pid {pid} within {RECORD_POLL_TIMEOUT:?}; records: {:?}\n\
                  agent.log tail:\n{}",
-                common::jsonl_rows(&self.detections_log),
+                common::read_jsonl_strict(&self.detections_log),
                 tail(&self.agent_log)
             )
         })
@@ -329,7 +329,7 @@ fn tmp_exec_kill_hits_the_offender_only() {
     );
     // The decoy left no record: the response followed the event, not the name.
     let decoy_pid = u64::from(decoy.0.id());
-    let decoy_records: Vec<_> = common::jsonl_rows(&fx.detections_log)
+    let decoy_records: Vec<_> = common::read_jsonl_strict(&fx.detections_log)
         .into_iter()
         .filter(|r| r["principal"]["pid"].as_u64() == Some(decoy_pid))
         .collect();

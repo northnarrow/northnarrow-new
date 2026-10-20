@@ -630,11 +630,11 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-416 | LAB-026 | Low | Lab scripts | S | partly fixed (lab PR 154 guards some setup); open |
 | NN-AUD-417 | LAB-027 | Low | Lab scripts | S | open |
 | NN-AUD-418 | TST-007 | Low | Privileged tests | — | already fixed (lab PR 138, with NN-AUD-079) |
-| NN-AUD-419 | TST-013 | Low | Privileged tests | S | open (five readers now) |
-| NN-AUD-420 | TST-014 | Low | Privileged tests | S | partly fixed (lab PR 158); open |
-| NN-AUD-421 | TST-015 | Low | Privileged tests | S | partly fixed (lab PRs 138, 153); open |
-| NN-AUD-422 | TST-016 | Low | Privileged tests | S | open |
-| NN-AUD-423 | TST-017 | Low | Privileged tests | M | open (degraded path now an ERROR and signed, AUT-004; not asserted) |
+| NN-AUD-419 | TST-013 | Low | Privileged tests | S | fixed (lab PR 195) |
+| NN-AUD-420 | TST-014 | Low | Privileged tests | S | fixed (lab PR 195) |
+| NN-AUD-421 | TST-015 | Low | Privileged tests | S | fixed (lab PR 195) |
+| NN-AUD-422 | TST-016 | Low | Privileged tests | S | fixed (lab PR 195) |
+| NN-AUD-423 | TST-017 | Low | Privileged tests | M | fixed (lab PR 195) |
 | NN-AUD-424 | ASK-018 | Info | Admin socket | S | open |
 | NN-AUD-425 | AUT-012 | Info | Admin auth | — | obsolete (lab PR 138) |
 | NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | fixed (lab PR 187) |
@@ -8158,3 +8158,88 @@ group, the ones an unprivileged user or a local attacker could use first.
     failed; `bash -n` on both scripts; shellcheck not installed on the
     host.
   - Lab: Debian 12, installsh194-probe.sh with `nn-lab.sh release-check`, `upgrade-check` and `uninstall-check` — before: the build of `main` with lab PRs 176–191; after: this lot on top (the guest put back to both units active each time). `release-check` with a look-alike line first in SHA256SUMS: FAIL before (`install.sh` read the wrong line), PASS after. Units stopped inside a window with the pins left: `install.sh --grant-key` exit 1 with the pins still there before, exit 0 and the pins gone after; `uninstall.sh` the same (exit 1 before, exit 0 and the pins gone after). `uninstall.sh` without a window on a protected running host: refused in both, the units still enabled after. A SHA256SUMS listing the tarball twice with different checksums, or not listing it: refused, with the reason named. Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.
+- **Wave 3 — privileged test assertions, lab PR 195.** NN-AUD-422
+  (TST-016), NN-AUD-419 (TST-013), NN-AUD-420 (TST-014, partly fixed by
+  lab PR 158), NN-AUD-423 (TST-017), NN-AUD-421 (TST-015, partly fixed by
+  lab PRs 138 and 153), all Low: batch 7 of the Wave 3 triage of the
+  supply-chain, lab and tests group, on the integration tree (`main` with
+  lots up to 186, and lots 187–191). Test fixtures, lab script and
+  runbook only; no change to the agent. No probe: the gate is the
+  privileged suites on 6.8 and 5.15.
+  - TST-016 (422, fixed). Re-checked: `exec_sensor_live` waited 1 s for
+    any `ProcessSpawn` with `comm == "echo"`; any `echo` on the host
+    passed it. Now the record must carry the canary's pid, this test
+    process as `ppid` (`real_parent->tgid`, read through the BTF offsets
+    `ExecSensor::start` arms since lab PR 187) and `northnarrow-canary` in
+    argv, within 3 s; the failure lists every `echo` seen. Renamed
+    `the_canary_exec_is_observed_with_its_pid_parent_and_argv`; the
+    module doc names the tracepoint and the offsets.
+  - TST-013 (419, fixed). Re-checked: five readers skipped unparsable
+    lines (the local `read_jsonl` of canary, FIM, net and
+    detection-at-scale, and `common::jsonl_rows` behind `wait_jsonl_row`,
+    `records_of`, `exec_barrier`, the response and honeypot suites), and
+    FIM's `jsonl_row_count` counted non-blank lines. Now
+    `common::read_jsonl_strict` / `parse_jsonl_strict`: a
+    newline-terminated line that is not one JSON value (an empty one
+    included) fails the test with the file, the line number and its first
+    200 bytes; an unterminated last line waits; a missing file is empty;
+    other read errors fail. The framing is checked, not the schema, so
+    rows of other kinds in the same chain stay for the callers' filters.
+    Every caller and both line counters use it; the local copies and
+    `jsonl_rows` are gone.
+  - TST-014 (420, fixed). Re-checked: Drop ignored every status and ran
+    one `-D` per base chain; `is_clean()` was unused and true when
+    iptables could not run. Now `EniIptablesGuard::tear_down`: `-D` while
+    it deletes (at most 16 per base chain), `-F`, `-X`, on iptables and,
+    where installed, ip6tables (the agent's COMBAT writes both since
+    BUG-031; the v6 table was never cleaned), then `chain_leftovers`
+    reads each table back (`-S`; `nft list table <family> filter` when
+    iptables-nft 1.8.9 calls it "incompatible"; "Table does not exist" is
+    empty). A chain or jump left, or a table unreadable, fails the test
+    with what is left and the manual commands (printed only during an
+    unwind, `fail_teardown`). `is_clean()` deleted.
+  - TST-017 (423, fixed). Re-checked: `privileged_map_pin` ran
+    `CARGO_BIN_EXE_northnarrow-agent` with an `admin.pub` never created
+    (the agent it checked had no admin socket); `fim_privileged_e2e` ran
+    the build path too; six suites had their own `install_to_priv_bin`.
+    Now `common::{InstalledBin, install_to_priv_bin, install_bin_at}`
+    (absolute `/usr/bin/sudo`, `install -D`; a failed `rm` fails the
+    test), used by every suite (detection-at-scale keeps its named
+    installs on top of `install_bin_at`); map_pin and FIM run the
+    installed agent, map_pin writes `admin.pub` with `nn-admin init`, and
+    `FimFixture` stops its agent in `impl Drop` before the fields (its
+    tempdir went first, with the agent up). The degraded path is asserted:
+    `privileged_e2e::agent_without_admin_pub_starts_degraded_and_says_so`
+    (ERROR line, no socket, agent alive, a signed `subsystem_degraded`
+    "admin socket disabled…" with `at_boot` and `agent-self`, and
+    `nn-admin audit verify` passes on the chain after the stop).
+  - TST-015 (421, fixed). Re-checked: runbook `:452` "9 tests passing, 2
+    ignored" and an excerpt of 4 tests; of the twelve privileged suites
+    only `privileged_e2e` named; "Future work" still "produces a WARN". `cmd_test_e2e` ran the
+    three suites under `set -e` (standalone: stopped at the first failure;
+    nightly: the step's status was the last suite's). Now
+    `lab_e2e_suite` + `deploy/lab/lib/suite-count.sh`: `-- --list` gives
+    N, the run must end with exactly one `test result: ok. N passed; 0
+    failed; 0 ignored; …; 0 filtered out` (0 listed fails); `count ok:` /
+    `FAIL:` lines, collected by the nightly report; all three suites run,
+    the step fails if any does; `NN_LAB_E2E_TEST_ARGS` for the runs only.
+    Runbook: no counts, a table of the twelve privileged suites (crate and
+    features, ignored or plain, needs, `nn-lab.sh` step), the Future-work
+    line corrected (ERROR, signed record, asserted; the strict flag still
+    open).
+  - Tests: `fixture_selftest` — six strict-reader tests and two
+    leftover-parser tests (unprivileged, in `cargo test --workspace`), two
+    ignored guard tests (`iptables::iptables_guard_removes_every_duplicate_jump`,
+    `iptables::iptables_guard_fails_the_test_when_the_chain_stays`, run
+    first by `test-ignored` with the existing two); `privileged_e2e` +1;
+    `deploy/lab/lib/suite-count-test.sh` (15 cases). On the starting tree
+    the unit tests do not compile (new items); with the old lenient body
+    in `parse_jsonl_strict`, 5 of the 6 reader tests fail (the
+    missing-file one passes on both). Expected in the gate, against the
+    old code: the guard tests fail (the duplicate jump and the chain
+    survive; no panic), the exec test fails without the canary's own
+    exec, the new e2e without the `attest_degraded` call.
+  - Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
+    agent with `test-privileged,debug-trigger`) clean, 2,504 passed,
+    0 failed; `suite-count-test.sh` 15/15.
+  - Lab: The lot is the privileged suites themselves: in the gate, the agent's privileged e2e 10 → 11 (`agent_without_admin_pub_starts_degraded_and_says_so`), `fixture_selftest`'s iptables tests 2 → 4, `exec_sensor_live` now asserting the canary's own pid, parent and argv, every JSONL reader strict — green on all four kernels, Debian 12 included (where the guard reads the tables through `nft`); `suite-count-test.sh` 15/15. Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.
