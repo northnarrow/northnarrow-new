@@ -30,6 +30,21 @@ one of those kept elsewhere, `sudo nn-admin audit verify --from
 exits 8 if the audit chain no longer reaches it — the check that still
 works when every file on the host was rolled back together.
 
+The agent's unit lets journald keep up to 50000 of its lines per 30 s
+(`LogRateLimitBurst=`, external audit DEP-017; journald's default is 10000
+and drops the rest of a burst, head lines included). A line journald did
+drop shows as `Suppressed N messages from northnarrow-agent.service` in
+the same journal. Sealing (optional): `sudo journalctl --setup-keys` writes
+the host's sealing key (`/var/log/journal/<machine-id>/fss`); journald,
+the `northnarrow` namespace's instance included, then seals each persistent
+file it opens afterwards — the next one after `sudo journalctl
+--namespace=northnarrow --rotate` (`Seal=` is on by default and does
+nothing without a key). Keep the verification key it prints off the host,
+and check with `journalctl --namespace=northnarrow --verify
+--verify-key=<key>`. Sealing shows a file changed after the fact; it does
+not stop root from removing the files, which is what the forwarded copy is
+for.
+
 ## When a check fails
 
 1. **Keep the evidence first.** Do not reinstall, restore or delete

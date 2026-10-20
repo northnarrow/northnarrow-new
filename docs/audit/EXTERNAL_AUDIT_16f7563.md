@@ -590,15 +590,15 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-378 | WDG-R12 | Low | Watchdog tooling | S | open |
 | NN-AUD-379 | WDG-R13 | Low | Watchdog tooling | S | open |
 | NN-AUD-380 | WDG-R14 | Low | Watchdog tooling | S | open |
-| NN-AUD-381 | DEP-005 | Low | Deploy | M | open |
-| NN-AUD-382 | DEP-010 | Low | Deploy | S | open |
+| NN-AUD-381 | DEP-005 | Low | Deploy | M | fixed (lab PR 184) |
+| NN-AUD-382 | DEP-010 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-383 | DEP-011 | Low | Deploy | — | declined (prerm already requires the signed trusted-installer window; the proposed default archive would leave `agent.sig.key` on disk after a purge) |
 | NN-AUD-384 | DEP-012 | Low | Deploy | S | partly fixed (lab PR 96); open |
 | NN-AUD-385 | DEP-013 | Low | Deploy | S (docs) | open |
-| NN-AUD-386 | DEP-014 | Low | Deploy | S | open |
+| NN-AUD-386 | DEP-014 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-387 | DEP-015 | Low | Deploy | — | already fixed (lab PR 93) |
 | NN-AUD-388 | DEP-016 | Low | Deploy | S | open |
-| NN-AUD-389 | DEP-017 | Low | Deploy | S | open |
+| NN-AUD-389 | DEP-017 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-390 | DEP-018 | Low | Deploy | S | open |
 | NN-AUD-391 | DEP-019 | Low | Deploy | — | already fixed (lab PR 152) |
 | NN-AUD-392 | SUP-004 | Low | Supply chain | S | fixed (lab PR 171) |
@@ -7064,3 +7064,81 @@ group, the ones an unprivileged user or a local attacker could use first.
     failed; actionlint 1.7.12: no finding; `cargo +nightly-2025-12-01 fuzz
     build` builds the ten targets with `fuzz/Cargo.lock` unchanged.
   - Lab: CI policy, no lab: `cargo audit` 0.22.2 (advisory DB 999ec89) green on the three lockfiles with the four recorded exceptions and red ("1 denied warning") without any one of them; the lock of `main` red on RUSTSEC-2026-0186 (memmap2, bumped); `cargo +nightly fuzz build` of the ten targets green with the lockfiles unchanged; actionlint clean. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.
+- **Wave 3 — units and package hooks, lab PR 184.** NN-AUD-386 (DEP-014),
+  NN-AUD-382 (DEP-010), NN-AUD-381 (DEP-005), NN-AUD-389 (DEP-017), all
+  Low; batch 2 of the Wave 3 watchdog/deploy triage. Built on the
+  integration tree (lab PRs 176–183): the `Environment=PATH=` of lab PR 176
+  and the `UNIT_SEARCH_PATH` of lab PR 180 are kept as they are.
+  - DEP-014 (386): `CapabilityBoundingSet=CAP_BPF CAP_SYS_PTRACE` in the
+    watchdog's unit. Re-checked what it does: `MapData::from_pin`
+    (BPF_OBJ_GET and the info by fd), the role slot and the
+    `PROTECTED_PIDS` insert/delete are `bpf_capable()`; `/proc/<agent>/exe`
+    needs CAP_SYS_PTRACE (kept). Beyond the triage, the respawn's
+    `systemctl start`: systemd 252 and 255 check CAP_SYS_ADMIN for
+    `StartUnit` (`bus_verify_manage_units_async_full`), but
+    `sd_bus_query_sender_privilege` falls back to the uid when the
+    sender's capabilities are not known, and on the private socket
+    (`/run/systemd/private`, which `systemctl` uses as root) the
+    credentials are `SO_PEERCRED` only — uid 0 is enough there, from 249
+    to 257 (257 checks the uid alone). Side effect: the watchdog's
+    permitted set is now inside the agent's.
+  - DEP-005 (381): the unit's sizes stay absolute. `relax_oom_score_adj`
+    (self_integrity.rs, called first thing in `main`): in the unit's own
+    cgroup, when `memory.max` is `max` or at least `MemTotal`
+    (`memory_cap_binds`), a negative `oom_score_adj` is raised to 0 with a
+    WARN; anything unreadable, or outside the unit's cgroup: unchanged.
+    The boot round's expectation comes from the same test on the round's
+    `memory.max` (`expected_limits(cap_binds)`), so a host where the cap
+    binds expects -500 and one where it does not expects 0: neither
+    install gives a finding, and each value on the other host is a
+    `limit_unexpected`. Not the triage on two points: its "8 GiB+ guests
+    unchanged" does not follow from its own rule (11G ≥ ~7.7 GiB): the
+    8 GiB lab guests now run at 0; and no `nn-admin host-check` line — it
+    would be a permanent WARN on every host up to 11 GiB with nothing the
+    operator can fix (host-check exits 2 on any WARN); the boot WARN and
+    the operator guide (§3.5) say it. The lab's C18 restores the value it
+    found instead of -500.
+  - DEP-017 (389): `LogRateLimitIntervalSec=30s`, `LogRateLimitBurst=50000`
+    in the agent's unit; the watchdog keeps journald's default (its few
+    lines, and a bug of its own should not flood at the agent's rate).
+    journald scales either by the free space it may use (with
+    `SystemMaxUse=1G` about ×3). `journald@northnarrow.conf` sets neither
+    a rate limit nor `Seal=` and says why; EVIDENCE_CHAINS.md documents
+    `journalctl --setup-keys` (the key is per host, at
+    `/var/log/journal/<machine-id>/fss`, read by the namespace's journald
+    too; sealing starts at the next file) with the verification key kept
+    off the host.
+  - DEP-010 (382): postinst (`abort-upgrade|abort-remove|abort-deconfigure`)
+    and postrm (`abort-install|abort-upgrade`) share `restart_stopped`
+    (between `# >>> restart_stopped` and `# <<< restart_stopped`, equal in
+    both): agent then watchdog started, then `systemctl is-active` of
+    every listed unit; any not active is named on stderr and at
+    `auth.err` (`logger -t northnarrow-pkg`), the restart list is kept and
+    the hook exits 1 — dpkg reports the rollback as failed (the package
+    half-installed) instead of "installed" with no agent. The list path
+    honours `PKG_RESTART_FILE` like install.sh. Configure is unchanged (it
+    failed loudly already). Not changed: rpm has no rollback scriptlets
+    (a failed transaction after `%pre` leaves the units stopped; the guide
+    says to check them). Recovery after a failed rollback: fix the cause,
+    start the agent (the window can only be opened through it), re-run the
+    package command — install.sh says the same when the agent is down.
+  - Tests: `watchdog/tests/systemd_units.rs`:
+    `watchdog_unit_can_verify_the_agents_executable` (now the exact set,
+    no ambient capabilities), `agent_unit_raises_its_journal_rate_limit`,
+    `package_hooks_share_one_rollback_restart`,
+    `a_rollback_that_leaves_a_unit_down_fails_and_names_it`,
+    `a_rollback_that_brings_the_units_back_succeeds` (the hooks run by
+    `sh` against stub `systemctl`, `logger`, `sleep`; five abort
+    arguments). On the starting tree all five fail (the CAP_SYS_ADMIN, no
+    rate limit, no shared block, rc 0 with the agent down, the list path
+    not honoured). `agent/src/self_integrity.rs`:
+    `oom_adj_relaxed_when_memory_max_exceeds_memtotal`,
+    `expected_limits_follow_the_relaxed_adj` (new API: they do not build on
+    the starting tree), `every_limit_the_units_set_is_understood` (a
+    guard, passes there: a `MemoryMax=70%` or `TasksMax=infinity` fails
+    it).
+  - Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
+    agent with `test-privileged,debug-trigger`) clean; 2,406 passed, 0
+    failed; `anti-tamper.sh --selftest` 40 checks, 0 failed; `sh -n` and
+    `dash -n` of the four hooks.
+  - Lab: Ubuntu 24.04 and Debian 12, unithooks184-probe.sh and `nn-lab.sh respawn-check` — before: the build of `main` with lab PRs 176–183; after: this lot on top. The watchdog's bounding set: `cap_sys_ptrace cap_sys_admin cap_bpf` before, `cap_sys_ptrace cap_bpf` after, and `respawn-check` OK on both guests with it. On the 8 GiB guest (the agent's `MemoryMax` above its RAM) the agent ran at `oom_score_adj` -500 before, 0 after with the memory-cap WARN at boot. The agent unit's journal rate limit: none before, 30 s / 50,000 after; a 40,000-line burst from the agent's cgroup drew no suppression line. The package rollback with both units made to fail (`ExecStartPre=/bin/false`): before the hook exited 0 with systemd's "Job … failed" lines only; after it exited 1 naming both units ("rollback failed … this host is without NorthNarrow") and kept the restart list; the guest restored to both units active. Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.

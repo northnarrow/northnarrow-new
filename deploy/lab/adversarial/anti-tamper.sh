@@ -1041,8 +1041,11 @@ run_case C16 "modprobe dummy (in-tree module load)" allowed "R011_KernelModuleTo
 fi
 # ── OOM and configuration overlays ────────────────────────────────────────
 PID=$(agent_pid)   # the watchdog may have recycled a frozen agent
+# External audit DEP-005 (lab PR 184): put back the agent's own value — the
+# unit's -500, or 0 where the memory cap cannot bind (an 8 GiB guest)
+OOM0=$(cat /proc/$PID/oom_score_adj 2>/dev/null || echo -500)
 WAIT=40 run_case C18 "raise the agent's oom_score_adj to 900" allowed "integrity_drift" 0 -- bash -c "echo 900 > /proc/$PID/oom_score_adj"
-echo -500 > /proc/$PID/oom_score_adj 2>/dev/null || true
+echo "$OOM0" > /proc/$PID/oom_score_adj 2>/dev/null || true
 # a fresh name each run: once the agent has seen an overlay it protects it,
 # so a leftover cannot be removed until the lab purges the pins
 OVL="$ETC/zz-tamper-$(date +%s).local"

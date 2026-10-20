@@ -813,6 +813,10 @@ async fn main() -> Result<()> {
         .init();
 
     info!("NorthNarrow agent starting...");
+    // External audit DEP-005 (NN-AUD-381): on a host where the unit's
+    // memory cap cannot bind, the unit's OOMScoreAdjust=-500 is raised to 0
+    // before anything grows (the self-integrity check expects it there).
+    northnarrow_agent::self_integrity::relax_oom_score_adj();
 
     // Boot preflight: prove the embedded eBPF half is real and intact
     // BEFORE doing any work. The build-time staleness guard
