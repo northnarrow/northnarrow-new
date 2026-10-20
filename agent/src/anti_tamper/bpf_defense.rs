@@ -102,8 +102,9 @@ pub fn retire_program_links(prog_id: u32) -> usize {
     ids.len()
 }
 
-/// `BPF_OBJ_GET` command number (uapi, stable).
-const BPF_OBJ_GET_CMD: libc::c_long = 7;
+/// `BPF_OBJ_GET` (lab PR 215: the number from `common::bpf_cmd`, the one
+/// copy the eBPF hooks use too).
+const OBJ_GET: libc::c_long = common::bpf_cmd::BPF_OBJ_GET as libc::c_long;
 
 /// The `OBJ_GET` variant of `union bpf_attr`; a shorter `size` than the
 /// union is accepted by the kernel (the rest is treated as zero).
@@ -698,7 +699,7 @@ fn obj_get_fd(path: &Path) -> Option<OwnedFd> {
     let fd = unsafe {
         libc::syscall(
             libc::SYS_bpf,
-            BPF_OBJ_GET_CMD,
+            OBJ_GET,
             &attr as *const ObjGetAttr as *const libc::c_void,
             std::mem::size_of::<ObjGetAttr>() as u32,
         )

@@ -278,6 +278,14 @@ its telemetry). A non-zero counter
 is a coverage gap, not a cosmetic number: the lab soak treats it as a
 note and a production host should alert on it.
 
+The same signed status prints `deny fail-open : 0` (lab PR 215): the
+operations an anti-tamper deny hook let through because a kernel read it
+needed failed, per hook (§3.5). `(not counted …)` there means the agent
+reads no counters (an eBPF object without `DENY_FAIL_OPEN`). The two fields
+are appended to the status reply: an `nn-admin` of this release cannot read
+the status of an older agent (exit 5), so upgrade the binaries together, as
+for the fields before them.
+
 ### 3.3 The agent's BPF objects are guarded (`bpf_map`)
 
 Root with `bpftool` could rewrite the maps the anti-tamper reads
@@ -314,16 +322,30 @@ session set `NN_BPF_DEFENSE_OBSERVE=1` (restart required).
 
 **Links (second half).** The only object that can *detach* one of the
 agent's LSM hooks is a handle to its BPF link, and there are two ways to
-get one: `LINK_GET_FD_BY_ID` (`bpftool link detach id N`) and `OBJ_GET` on
-the link's pin (`bpftool link detach pinned /sys/fs/bpf/northnarrow/link_*`).
-In enforce mode the `bpf` hook refuses both to a foreign process
-(`EPERM`, anti-tamper denial `operation=bpf_link`, link id as the target or
-0 for the pinned route). The ids of maps, programs and links are kept with
-their kind, since the kernel numbers the three spaces independently.
-Program handles stay allowed (`bpftool prog show` keeps working; a program
-fd cannot detach anything). Every `LINK_GET_FD_BY_ID` on one of our links
-is refused, so `bpftool link show` stops at the first NorthNarrow link, like
-`map show` above. (For the record: the kernel refuses `LINK_DETACH` on
+get one: `LINK_GET_FD_BY_ID` (`bpftool link show id N`, `bpftool link
+detach id N`) and `OBJ_GET` on the link's pin (`bpftool link detach pinned
+/sys/fs/bpf/northnarrow/link_*`). In enforce mode the `bpf` hook refuses
+both to a foreign process (`EPERM`, anti-tamper denial
+`operation=bpf_link`, link id as the target or 0 for the pinned route); in
+observe mode it grants them and records an `NN-L-BPF-002` alert. The ids
+of maps, programs and links are kept with their kind, since the kernel
+numbers the three spaces independently. Program handles stay allowed
+(`bpftool prog show` keeps working; a program fd cannot detach anything).
+The enumeration of link ids (`LINK_GET_NEXT_ID`) gives no handle: it is
+neither refused nor recorded. `bpftool link list` (`bpftool link show`
+without an argument) enumerates the ids and takes a handle by id on each
+link to print it, so in enforce mode it prints the host's other links and
+stops at the first NorthNarrow link, with one anti-tamper denial (posture
+COMBAT, INVESTIGATE stage), like `map show` above. Until lab PR 215 the
+hook had its own copy of the `bpf` command numbers, with
+`LINK_GET_FD_BY_ID` at 31, which is `LINK_GET_NEXT_ID`: a handle by id on
+one of our links was granted and not recorded, while `bpftool link list`
+printed the first NorthNarrow link and was then refused at the next
+enumeration step, which was recorded as an anti-tamper denial although it
+asks for no handle. The pin route and the detach/update deny (above) did
+not depend on that number. The numbers now come from one module
+(`common/src/bpf_cmd.rs`), checked against the uapi header and the running
+kernel's BTF. (For the record: the kernel refuses `LINK_DETACH` on
 LSM and tracepoint links anyway — `bpftool link detach` answers "Operation
 not supported" — so the handle deny is defence in depth; the route that
 actually dropped the hooks was the pin, below.) The pin-name check is
@@ -454,7 +476,17 @@ Refused attempts — signals to the agent or the watchdog, a ptrace attach,
 writes to protected files and pins, BPF map writes and link handles — are
 recorded as detection `NN-L-AT-001_AntiTamperDenial` in
 `detections.jsonl`, and every ring buffer that loses events is a
-`ringbuf_drop` audit entry. The lab exercises all of this with
+`ringbuf_drop` audit entry. A deny hook that lets an operation through
+because a kernel read it needed failed (it cannot decide, and an LSM
+program cannot wait or retry) is counted too, per hook, since lab PR 215:
+a WARN `deny hook FAILED OPEN` per sample, a signed `deny_fail_open` audit
+entry (`hook`, `fail_open_since_last_entry`, `total`; at the first one of
+a hook, then at most one per hook every 10 minutes carrying every
+fail-open since the previous entry), and the `deny fail-open` line of
+`nn-admin status --key` (`deny_fail_open_total` and `deny_fail_open` in
+`--json`). It should stay at 0; any other value names the hook to report.
+The posture is not raised by it. A NULL the kernel holds where the hook
+looks (the new name of a rename) is not a fail-open. The lab exercises all of this with
 `nn-lab.sh tamper-check`.
 
 ### 3.6 Overlays are signed (`nn-admin config overlay`)

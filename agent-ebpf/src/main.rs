@@ -25,6 +25,7 @@ mod dns_skb;
 mod drops;
 mod exec_check;
 mod exec_lsm;
+mod fail_open;
 mod file_open;
 mod fim_watch;
 mod inet_csk_listen;

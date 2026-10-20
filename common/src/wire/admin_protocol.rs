@@ -731,6 +731,17 @@ pub struct StatusResponse {
     pub net_dot_rows_resolver: Option<u64>,
     #[serde(default)]
     pub net_quic_rows_total: Option<u64>,
+    /// Lab PR 215: operations the anti-tamper deny hooks let through
+    /// undecided since boot (a kernel read a hook needed failed), all
+    /// hooks; `None` when the agent does not read the counters (an eBPF
+    /// object without `DENY_FAIL_OPEN`) and from an agent older than the
+    /// field. Appended after lab PR 207's fields (see the compatibility
+    /// note above).
+    #[serde(default)]
+    pub deny_fail_open_total: Option<u64>,
+    /// `(hook, fail-opens)` for the hooks that failed open.
+    #[serde(default)]
+    pub deny_fail_open: Option<Vec<(String, u64)>>,
 }
 
 impl StatusResponse {
@@ -771,6 +782,8 @@ impl StatusResponse {
             net_dot_rows_total: None,
             net_dot_rows_resolver: None,
             net_quic_rows_total: None,
+            deny_fail_open_total: None,
+            deny_fail_open: None,
         }
     }
 
@@ -1590,6 +1603,8 @@ mod tests {
             net_dot_rows_total: None,
             net_dot_rows_resolver: None,
             net_quic_rows_total: None,
+            deny_fail_open_total: None,
+            deny_fail_open: None,
         }));
     }
 
@@ -1619,6 +1634,8 @@ mod tests {
             net_dot_rows_total: None,
             net_dot_rows_resolver: None,
             net_quic_rows_total: None,
+            deny_fail_open_total: None,
+            deny_fail_open: None,
         }));
     }
 
@@ -1798,6 +1815,8 @@ mod tests {
             net_dot_rows_total: Some(12),
             net_dot_rows_resolver: Some(10),
             net_quic_rows_total: Some(40),
+            deny_fail_open_total: Some(3),
+            deny_fail_open: Some(vec![("file_open".to_string(), 3)]),
         }));
     }
 
@@ -1847,6 +1866,8 @@ mod tests {
             net_dot_rows_total: Some(3),
             net_dot_rows_resolver: Some(2),
             net_quic_rows_total: Some(5),
+            deny_fail_open_total: Some(1),
+            deny_fail_open: Some(vec![("bpf".to_string(), 1)]),
         }
     }
 
@@ -1968,6 +1989,88 @@ mod tests {
         };
         let body = postcard::to_allocvec(&old).unwrap();
         assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
+    }
+
+    /// The status reply as lab PR 207 left it (its last field
+    /// `net_quic_rows_total`), for the lab PR 215 pins.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct StatusResponseLabPr207 {
+        posture: PostureKind,
+        network_isolation_engaged: bool,
+        last_admin_action_secs_ago: Option<u64>,
+        ringbuf_drops_total: Option<u64>,
+        ringbuf_drops: Option<Vec<(String, u64)>>,
+        combat_stage: Option<String>,
+        combat_locked: Option<bool>,
+        ringbuf_rejected_total: Option<u64>,
+        ringbuf_rejected: Option<Vec<(String, u64)>>,
+        netflow_rows_skipped_total: Option<u64>,
+        netflow_pending_evicted_total: Option<u64>,
+        net_inactive_rules: Option<Vec<String>>,
+        flow_sock_pending: Option<u64>,
+        flow_sock_capacity: Option<u64>,
+        flow_sock_forgotten_min: Option<u64>,
+        detect_only: Option<bool>,
+        detect_only_source: Option<String>,
+        combat_evidence_unrecorded: Option<u64>,
+        combat_evidence_pending: Option<u64>,
+        combat_evidence_dropped: Option<u64>,
+        net_dot_rows_total: Option<u64>,
+        net_dot_rows_resolver: Option<u64>,
+        net_quic_rows_total: Option<u64>,
+    }
+
+    /// Lab PR 215: the fail-open counters are appended after lab PR 207's
+    /// fields — an `nn-admin` of lab PR 207 reads every field it knows
+    /// from a newer agent's reply, and the new fields are the last bytes.
+    #[test]
+    fn a_lab207_nn_admin_reads_a_lab215_status_reply() {
+        let new = status_with_lab193_fields();
+        let body = postcard::to_allocvec(&new).unwrap();
+        let old: StatusResponseLabPr207 = postcard::from_bytes(&body).unwrap();
+        assert_eq!(old.net_quic_rows_total, Some(5));
+        assert_eq!(old.combat_stage.as_deref(), Some("ISOLATE"));
+        let prefix = postcard::to_allocvec(&old).unwrap();
+        assert!(body.starts_with(&prefix) && body.len() > prefix.len());
+    }
+
+    /// The limit, pinned for these fields too: an `nn-admin` of lab PR 215
+    /// cannot decode a lab PR 207 agent's reply (the watchdog's ping can:
+    /// it reads the two leading fields only).
+    #[test]
+    fn a_lab215_nn_admin_cannot_read_a_lab207_status_reply() {
+        let new = status_with_lab193_fields();
+        let old = StatusResponseLabPr207 {
+            posture: new.posture,
+            network_isolation_engaged: new.network_isolation_engaged,
+            last_admin_action_secs_ago: new.last_admin_action_secs_ago,
+            ringbuf_drops_total: new.ringbuf_drops_total,
+            ringbuf_drops: new.ringbuf_drops.clone(),
+            combat_stage: new.combat_stage.clone(),
+            combat_locked: new.combat_locked,
+            ringbuf_rejected_total: new.ringbuf_rejected_total,
+            ringbuf_rejected: new.ringbuf_rejected.clone(),
+            netflow_rows_skipped_total: new.netflow_rows_skipped_total,
+            netflow_pending_evicted_total: new.netflow_pending_evicted_total,
+            net_inactive_rules: new.net_inactive_rules.clone(),
+            flow_sock_pending: new.flow_sock_pending,
+            flow_sock_capacity: new.flow_sock_capacity,
+            flow_sock_forgotten_min: new.flow_sock_forgotten_min,
+            detect_only: new.detect_only,
+            detect_only_source: new.detect_only_source.clone(),
+            combat_evidence_unrecorded: new.combat_evidence_unrecorded,
+            combat_evidence_pending: new.combat_evidence_pending,
+            combat_evidence_dropped: new.combat_evidence_dropped,
+            net_dot_rows_total: new.net_dot_rows_total,
+            net_dot_rows_resolver: new.net_dot_rows_resolver,
+            net_quic_rows_total: new.net_quic_rows_total,
+        };
+        let body = postcard::to_allocvec(&old).unwrap();
+        assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
+        assert_eq!(
+            decode_status_liveness(&status_body(&old)).unwrap().posture,
+            PostureKind::Combat
+        );
     }
 
     /// The status reply of the first agents (Tappa 7): three fields.
@@ -2105,6 +2208,8 @@ mod tests {
         assert_eq!(public.detect_only, None);
         assert_eq!(public.combat_evidence_unrecorded, None);
         assert_eq!(public.net_quic_rows_total, None);
+        assert_eq!(public.deny_fail_open_total, None);
+        assert_eq!(public.deny_fail_open, None);
         assert!(!status_with_lab193_fields().telemetry_withheld());
         // Same shape: an older nn-admin or watchdog reads it.
         let body = postcard::to_allocvec(&public).unwrap();

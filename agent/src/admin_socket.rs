@@ -3428,6 +3428,10 @@ fn telemetry_status(
         net_dot_rows_total: Some(encrypted.dot),
         net_dot_rows_resolver: Some(encrypted.dot_resolver),
         net_quic_rows_total: Some(encrypted.quic),
+        // Lab PR 215: operations a deny hook let through undecided.
+        deny_fail_open_total: crate::anti_tamper::fail_open::total(),
+        deny_fail_open: crate::anti_tamper::fail_open::total()
+            .map(|_| crate::anti_tamper::fail_open::snapshot_nonzero()),
     }
 }
 
@@ -5819,6 +5823,8 @@ mod tests {
             net_dot_rows_total: None,
             net_dot_rows_resolver: None,
             net_quic_rows_total: None,
+            deny_fail_open_total: None,
+            deny_fail_open: None,
         });
         emit_audit_for(
             &status_req,
@@ -6842,6 +6848,10 @@ mod tests {
             r.net_quic_rows_total,
         );
         assert!(resolver <= dot && quic.is_some());
+        // Lab PR 215: no eBPF object in a unit test, so the fail-open
+        // counters are not read — "not counted", never a 0.
+        assert_eq!(r.deny_fail_open_total, None);
+        assert_eq!(r.deny_fail_open, None);
 
         // No response state (no executor): not known, not "enforcing".
         let r = status(None);
@@ -6899,6 +6909,7 @@ mod tests {
         assert_eq!(r.detect_only, None, "detect-only is telemetry too");
         assert_eq!(r.combat_evidence_unrecorded, None);
         assert_eq!(r.net_dot_rows_total, None);
+        assert_eq!(r.deny_fail_open_total, None);
         assert!(r.telemetry_withheld());
         assert!(fps.is_empty(), "no signature on the unsigned status");
     }

@@ -108,6 +108,76 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   templates).
 
 ### Fixed
+- BPF self-defence: the `bpf` command numbers and the deny hooks' fail-opens
+  (capability C23, Wave 4, lab PR 215; from the static review of `baf4c25`,
+  P0 C-02 / G-01 / TD-03, not in the audit tracker). The `bpf` LSM hook had
+  its own copy of the uapi `enum bpf_cmd` numbers, with
+  `BPF_LINK_GET_FD_BY_ID = 31`; the uapi value is 30, and 31 is
+  `BPF_LINK_GET_NEXT_ID` (counting the enumerators by hand gives 31, because
+  `BPF_PROG_RUN = BPF_PROG_TEST_RUN` takes no number of its own). A handle
+  on one of the agent's links taken by id (`bpftool link show id N`, the
+  first step of `bpftool link detach id N`) was therefore granted in enforce
+  mode and left no record, in either mode. The enumeration `bpftool link
+  list` steps through (`LINK_GET_NEXT_ID`) was refused when it started from
+  one of the agent's link ids, and recorded as an anti-tamper denial
+  (NN-L-AT-001, posture COMBAT) although it gives no handle. `bpf_cmd_name`
+  repeated the 31, so the real handle by id was "other" in the records, the
+  ADE context and the XAI evidence. Detaching or updating a hook stayed
+  impossible: the detach/update deny (EBPF-010) reads the link from the fd,
+  and the kernel refuses both on these link types. **Fix:** every `bpf_cmd`
+  number is defined once, in `common/src/bpf_cmd.rs` (`no_std`, compiled by
+  the eBPF programs and the agent): the hook, `bpf_cmd_name`, the BPF rules
+  and the agent's `OBJ_GET` and `MAP_FREEZE` wrappers read it, and the
+  hook's set of observed commands is `bpf_cmd::observed`, which the host
+  tests check (no `*_GET_NEXT_ID` in it). Tests: every number against the
+  build host's `/usr/include/linux/bpf.h` (a parser that follows C's enum
+  rules, aliases included) and against `enum bpf_cmd` in the running
+  kernel's BTF; with 31 put back both fail and name it. A source scan fails
+  when anything else in the tree defines one of these numbers as a constant
+  (on the starting tree it lists 22 such constants; the 23rd copy, the match
+  in `bpf_cmd_name`, fails the names test). Now in enforce mode `bpftool
+  link show id N` on one of the agent's links is refused and recorded
+  (`deny=bpf_link`); the enumeration is neither refused nor recorded.
+  `bpftool link list` as a whole still takes a handle by id on every link it
+  prints, so in enforce mode it lists the host's other links and stops at
+  the first NorthNarrow link with one recorded denial, like `bpftool map
+  show` (the documented trade-off; before, it stopped one link later, at the
+  refused enumeration). **Fail-opens counted:** a deny hook that could not
+  read what it needs to decide let the operation through and left no trace
+  (`Err(_) => return 0` in `task_kill`, `ptrace_access_check`, the inode,
+  file and xattr hooks, the map guard, the `bpf` hook's link checks). Each
+  of the 20 hooks now has a slot in a new per-CPU map, `DENY_FAIL_OPEN`
+  (`common/src/fail_open.rs`, append-only). A failed read, an unknown
+  argument position, an unreadable `OBJ_GET` path and a link the
+  detach/update deny cannot read bump it; a NULL the kernel holds there (a
+  negative dentry, an fd that names no link) does not. The agent reads it
+  every 10 s, logs `deny hook FAILED OPEN` at WARN, writes a signed
+  `deny_fail_open` audit entry (the first of a hook at once, then at most
+  one per hook every 10 minutes carrying every fail-open since the previous
+  entry), and reports `deny_fail_open_total` / `deny_fail_open` in the
+  signed `status` (`nn-admin status --key`: `deny fail-open : 0`; "not
+  counted" when the object exports no counters, which is also a signed
+  `subsystem_degraded`). The posture is not raised: a fail-open says a hook
+  could not decide, not that someone tried something. The map is one of the
+  agent's own, so the BPF guard refuses write handles on it (tamper-check
+  C43 asks for one). Lab: `anti-tamper.sh` C63 (a handle by id on one of the
+  agent's links: refused and recorded in enforce mode, granted and
+  NN-L-BPF-002 in observe mode) and C64 (`LINK_GET_NEXT_ID` from each of the
+  agent's link ids and a walk from 0: allowed, no `deny=bpf_link` and no
+  NN-L-BPF-002), through new modes of the link probe (`--own` reads the
+  agent's link ids from `OWN_BPF_IDS` with read-only handles,
+  `--handle-by-id`, `--next-from`; its numbers come from `<linux/bpf.h>`);
+  `--selftest` checks the id parser and the probe's argument handling. The
+  enforce-mode privileged e2e
+  (`bpf_guard_enforce_refuses_protected_pids_write`) also asserts the handle
+  by id refused with `EPERM` and `op=bpf_link` in the log, and the
+  enumeration from each of the agent's link ids not refused. **Regression:**
+  the two status fields are appended after lab PR 207's: an `nn-admin` of
+  this release cannot read an older agent's status (exit 5); upgrade the
+  binaries together (the watchdog's ping reads the two leading fields only
+  and is not affected). Operator guide §3.2, §3.3 (links) and §3.5
+  corrected: the guide said every handle by id on the agent's links was
+  refused, which was not so.
 - External audit, Wave 3, the status split and correlation chain retention
   (Low ASK-009 NN-AUD-237, NETR-014 NN-AUD-297; lab PR 213). Two product
   decisions, taken as the triages recommend, the conservative way that

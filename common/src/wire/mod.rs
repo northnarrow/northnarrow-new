@@ -672,10 +672,14 @@ pub const FS_OP_WRITE: u8 = 6;
 /// carries the map id, `target_dev` is 0.
 pub const FS_OP_BPF_MAP: u8 = 7;
 /// A handle to one of the agent's own BPF *links* refused to a foreign
-/// process (`bpftool link detach id N` / `… pinned <path>`): by id through
-/// `LINK_GET_FD_BY_ID` (`target_ino` = link id) or through `OBJ_GET` on the
-/// link's pin (`target_ino` = 0). Emitted by the `bpf` LSM observer in
-/// enforce mode (Tappa 10.8 BPF self-defence, second half).
+/// process (`bpftool link show id N`, `bpftool link detach id N` / `…
+/// pinned <path>`): by id through `LINK_GET_FD_BY_ID` (`target_ino` = link
+/// id) or through `OBJ_GET` on the link's pin (`target_ino` = 0), or a
+/// `LINK_DETACH` / `LINK_UPDATE` on a handle that names one of them
+/// (`target_ino` = link id). Emitted by the `bpf` LSM observer in enforce
+/// mode (Tappa 10.8 BPF self-defence, second half). The enumeration
+/// (`LINK_GET_NEXT_ID`) gives no handle and is neither refused nor
+/// recorded (lab PR 215).
 pub const FS_OP_BPF_LINK: u8 = 8;
 /// A signal to a protected pid refused by the `task_kill` LSM hook
 /// (`target_ino` = target tgid, `target_dev` = signal number). Rate-limited
@@ -826,22 +830,26 @@ pub struct BpfSyscallRaw {
     pub arg: u32,
 }
 
-/// Name of a uapi `bpf_cmd` value (the ones the observer reports).
+/// Name of a uapi `bpf_cmd` value (the ones the observer reports). Lab PR
+/// 215: the numbers come from [`crate::bpf_cmd`]; this match had its own
+/// copy, with `link_get_fd_by_id` at 31 (`BPF_LINK_GET_NEXT_ID`) and the
+/// real 30 named "other".
 pub const fn bpf_cmd_name(cmd: u32) -> &'static str {
+    use crate::bpf_cmd::*;
     match cmd {
-        0 => "map_create",
-        5 => "prog_load",
-        6 => "obj_pin",
-        7 => "obj_get",
-        8 => "prog_attach",
-        9 => "prog_detach",
-        13 => "prog_get_fd_by_id",
-        14 => "map_get_fd_by_id",
-        18 => "btf_load",
-        28 => "link_create",
-        29 => "link_update",
-        31 => "link_get_fd_by_id",
-        34 => "link_detach",
+        BPF_MAP_CREATE => "map_create",
+        BPF_PROG_LOAD => "prog_load",
+        BPF_OBJ_PIN => "obj_pin",
+        BPF_OBJ_GET => "obj_get",
+        BPF_PROG_ATTACH => "prog_attach",
+        BPF_PROG_DETACH => "prog_detach",
+        BPF_PROG_GET_FD_BY_ID => "prog_get_fd_by_id",
+        BPF_MAP_GET_FD_BY_ID => "map_get_fd_by_id",
+        BPF_BTF_LOAD => "btf_load",
+        BPF_LINK_CREATE => "link_create",
+        BPF_LINK_UPDATE => "link_update",
+        BPF_LINK_GET_FD_BY_ID => "link_get_fd_by_id",
+        BPF_LINK_DETACH => "link_detach",
         BPF_CMD_FOREIGN_MAP_WRITE => "foreign_map_write",
         BPF_CMD_FOREIGN_GET_FD => "foreign_get_fd",
         _ => "other",
@@ -1841,6 +1849,25 @@ mod tests {
         assert_eq!(FS_IOC_SETFLAGS, 0x4008_6602);
         assert_eq!(FS_IOC32_SETFLAGS, 0x4004_6602);
         assert_eq!(FS_IOC_FSSETXATTR, 0x401c_5820);
+    }
+
+    /// Lab PR 215: each command the observer reports has its uapi name,
+    /// the link handle by id included (it was "other", and the
+    /// enumeration `BPF_LINK_GET_NEXT_ID` was named as the handle).
+    #[test]
+    fn bpf_cmd_names_follow_the_uapi_names() {
+        use crate::bpf_cmd::{observed, UAPI};
+        for (name, value) in UAPI {
+            let want = name.trim_start_matches("BPF_").to_ascii_lowercase();
+            if observed(value) {
+                assert_eq!(bpf_cmd_name(value), want, "{name}");
+            } else {
+                assert_eq!(bpf_cmd_name(value), "other", "{name}");
+            }
+        }
+        assert_eq!(bpf_cmd_name(30), "link_get_fd_by_id");
+        assert_eq!(bpf_cmd_name(31), "other");
+        assert_eq!(bpf_cmd_name(BPF_CMD_FOREIGN_GET_FD), "foreign_get_fd");
     }
 
     /// External audit EBPF-015: a new entry is refused only in a NOCREATE

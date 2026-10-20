@@ -1594,6 +1594,8 @@ impl Drop for GuardFixture {
 /// PROTECTED_PIDS nor signal it, the fixtures' teardown recipe fails and
 /// says so, and the signed 2-of-N shutdown stops the agent. Fails if the
 /// guard does not enforce (the mode line, then the eviction succeeds).
+/// Lab PR 215: nor take a handle by id on one of its links, while the
+/// enumeration of the link ids stays allowed.
 #[cfg(feature = "debug-trigger")]
 #[test]
 fn bpf_guard_enforce_refuses_protected_pids_write() {
@@ -1654,8 +1656,29 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
     };
     assert!(alive(&mut fx), "the agent is gone after the refused kill");
 
-    // 4. The agent saw both refusals.
-    for op in ["op=bpf_map", "op=signal"] {
+    // 3b. Lab PR 215: a handle by id on one of the agent's links is refused
+    //     (the hook had BPF_LINK_GET_FD_BY_ID at 31, BPF_LINK_GET_NEXT_ID:
+    //     the handle was granted and not recorded), and the enumeration
+    //     from each of its link ids — the step `bpftool link list` takes —
+    //     is not (it was refused, and recorded as a denial). The ids come
+    //     from OWN_BPF_IDS through read-only map handles.
+    let links = common::raw_bpf::own_link_ids()
+        .unwrap_or_else(|e| panic!("the agent's link ids: {e}\n{}", log_tail(&log)));
+    assert_eq!(
+        common::raw_bpf::link_fd_by_id(links[0]),
+        Err(libc::EPERM),
+        "BPF_LINK_GET_FD_BY_ID on the agent's link {} from root was not refused in enforce \
+         mode (Ok = granted)",
+        links[0]
+    );
+    for id in &links {
+        if let Err(e) = common::raw_bpf::link_next_id(*id) {
+            panic!("BPF_LINK_GET_NEXT_ID from the agent's link {id} failed with errno {e}: the enumeration gives no handle and must not be refused");
+        }
+    }
+
+    // 4. The agent saw the three refusals.
+    for op in ["op=bpf_map", "op=signal", "op=bpf_link"] {
         assert!(
             wait_for_log_line(&log, &["ANTI-TAMPER DENIAL", op], GUARD_LOG_TIMEOUT).is_some(),
             "no ANTI-TAMPER DENIAL {op} in the agent log\n{}",

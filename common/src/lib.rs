@@ -20,12 +20,18 @@ extern crate alloc;
 
 pub mod wire;
 
+/// The uapi `bpf_cmd` numbers, one copy for the eBPF programs and the
+/// agent (lab PR 215). NOT `std`-gated.
+pub mod bpf_cmd;
 /// Hard-coded kernel struct field offsets + the boot-time revalidation
 /// table (BUG-036). `no_std`-clean (consts + a `&'static str` table, no
 /// alloc) so the eBPF crate compiles the SAME values the agent
 /// revalidates against. NOT `std`-gated — the eBPF half needs it with
 /// `default-features = false`.
 pub mod btf_offsets;
+/// Per-hook fail-open counter slots of the deny hooks, shared by the eBPF
+/// programs and the agent (lab PR 215). NOT `std`-gated.
+pub mod fail_open;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 

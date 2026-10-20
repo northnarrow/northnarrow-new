@@ -2350,6 +2350,8 @@ async fn run(cli: Cli) -> Result<()> {
         );
     }
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
+    // Lab PR 215: a deny hook that let an operation through undecided.
+    northnarrow_agent::anti_tamper::fail_open::set_audit_log(audit_log.clone());
     // External audit NN-AUD-120: a full FIM watch set is attested.
     northnarrow_agent::fim::drain::set_audit_log(audit_log.clone());
     // External audit SNS-009: a security ring that loses events raises

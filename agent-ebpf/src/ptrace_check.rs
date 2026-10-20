@@ -114,7 +114,12 @@ unsafe fn try_ptrace_access_check(ctx: &LsmContext) -> i32 {
     let tgid_ptr = (target as *const u8).add(off!(TASK_STRUCT_TGID_OFFSET)) as *const u32;
     let target_tgid = match bpf_probe_read_kernel::<u32>(tgid_ptr) {
         Ok(v) => v,
-        Err(_) => return 0,
+        Err(_) => {
+            // Lab PR 215: the target cannot be told; the access goes
+            // through undecided, and is counted.
+            crate::fail_open::bump(northnarrow_common::fail_open::hook::PTRACE_ACCESS_CHECK);
+            return 0;
+        }
     };
 
     // Single bpf_map_lookup_elem against the shared PROTECTED_PIDS
