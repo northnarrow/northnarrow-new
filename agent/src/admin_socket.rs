@@ -937,6 +937,7 @@ async fn handle_connection(
         // across an `.await`.
         let reply = crate::runtime::off_the_runtime(|| {
             let mut matched_fps: Vec<String> = Vec::new();
+            let mut notes = DispatchNotes::default();
             let reply = dispatch(
                 msg.clone(),
                 &auth,
@@ -952,8 +953,9 @@ async fn handle_connection(
                 read_paths,
                 &client,
                 &mut matched_fps,
+                &mut notes,
             );
-            emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps);
+            emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps, &notes);
             reply
         });
         if !slot.waiting() {
@@ -1316,6 +1318,17 @@ impl ForeignPeers {
     }
 }
 
+/// What a dispatcher learned that neither the request nor the reply
+/// carries, for the audit row. Filled by `dispatch`, read by
+/// [`emit_audit_for`]; next to the signers' fingerprints (`matched_fps`).
+#[derive(Debug, Default)]
+struct DispatchNotes {
+    /// External audit ASK-015: the posture a force-posture left, when the
+    /// transition was applied (also a no-op to the same state). `None`
+    /// when it was refused: the state did not change.
+    force_from: Option<common::posture_types::PostureKind>,
+}
+
 /// Inspect the (request, reply) pair after `dispatch` returns
 /// and append a single audit-log entry if the message was an
 /// auditable admin operation (challenge/status are not
@@ -1333,6 +1346,7 @@ fn emit_audit_for(
     client: &AuditClient,
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
     matched_fps: &[String],
+    notes: &DispatchNotes,
 ) {
     let Some(audit_log) = audit_log else {
         return;
@@ -1358,9 +1372,15 @@ fn emit_audit_for(
                 OperationExtra::ForcePosture(f) => format!("{:?}", f.target),
                 _ => "?".to_string(),
             };
+            // External audit ASK-015: the state left, when the force was
+            // applied; a refused one changed nothing and has no `from`.
+            let mut extra = serde_json::json!({ "target": target });
+            if let Some(from) = notes.force_from {
+                extra["from"] = serde_json::Value::String(format!("{from:?}"));
+            }
             (
                 "force_posture",
-                serde_json::json!({ "target": target }),
+                extra,
                 audit_result_str(*r),
                 req.signatures.len().saturating_sub(1),
             )
@@ -1840,6 +1860,7 @@ fn dispatch(
     read_paths: &AdminReadPaths,
     client: &AuditClient,
     fps_out: &mut Vec<String>,
+    notes: &mut DispatchNotes,
 ) -> AdminMessage {
     match msg {
         AdminMessage::ChallengeRequest(_) => match auth.issue_challenge() {
@@ -1965,9 +1986,9 @@ fn dispatch(
             fps_out,
         )),
 
-        AdminMessage::ForcePostureRequest(req) => {
-            AdminMessage::ForcePostureResult(dispatch_force_posture(req, auth, posture, fps_out))
-        }
+        AdminMessage::ForcePostureRequest(req) => AdminMessage::ForcePostureResult(
+            dispatch_force_posture(req, auth, posture, fps_out, notes),
+        ),
 
         AdminMessage::RotateKeysAddRequest(req) => {
             AdminMessage::RotateKeysAddResult(dispatch_rotate_keys_add(req, auth, fps_out))
@@ -2286,11 +2307,16 @@ fn dispatch_shutdown(
 /// dispatcher and the transition); a refusal answers `RoleDenied`.
 /// Entering COMBAT stays 1-of-N `force-posture` (POS-001: the
 /// administrator forces it).
+///
+/// External audit ASK-015: the journal line and the audit row (through
+/// `notes.force_from`) name the state the force left, as the posture
+/// machine read it under its lock; they named the state it entered.
 fn dispatch_force_posture(
     req: ForcePostureRequest,
     auth: &ConnAuth<'_>,
     posture: &PostureMachine,
     fps_out: &mut Vec<String>,
+    notes: &mut DispatchNotes,
 ) -> AdminResult {
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -2357,15 +2383,17 @@ fn dispatch_force_posture(
 
     // Drive the posture mutation through the capability-gated path.
     // `admin_force_state_with_token` consumes the token, fires
-    // hooks per §12.2, and returns the post-transition state. It
-    // refuses COMBAT → non-COMBAT without `may_release`; any other
-    // error shape maps to InvalidSignature defensively.
+    // hooks per §12.2, and returns the state it left and the
+    // post-transition state. It refuses COMBAT → non-COMBAT without
+    // `may_release`; any other error shape maps to InvalidSignature
+    // defensively.
     match posture.admin_force_state_with_token(signers.token, target, may_release) {
-        Ok(state) => {
+        Ok(outcome) => {
+            notes.force_from = Some(outcome.from);
             info!(
                 target: "admin.force_posture",
-                from = ?state.kind(),
-                to = ?target,
+                from = ?outcome.from,
+                to = ?outcome.state.kind(),
                 "production force-posture applied"
             );
             AdminResult::Success
@@ -4297,7 +4325,7 @@ fn dispatch_detections(
     let mut filter = DetectionFilter {
         since_unix: extra.since_unix_ts.map(|s| s as i64),
         until_unix: extra.until_unix_ts.map(|s| s as i64),
-        comm_substr: extra.path.clone().filter(|s| !s.is_empty()),
+        subject_substr: extra.path.clone().filter(|s| !s.is_empty()),
         ..Default::default()
     };
     if let Some(s) = &extra.min_severity {
@@ -5493,7 +5521,14 @@ mod tests {
             signature: [0; 64],
         });
         let reply = AdminMessage::UnlockResult(UnlockResult::Success);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &[],
+            &DispatchNotes::default(),
+        );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "unlock");
@@ -5528,7 +5563,14 @@ mod tests {
             ],
         });
         let reply = AdminMessage::ShutdownResult(AdminResult::Success);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &[],
+            &DispatchNotes::default(),
+        );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "shutdown");
@@ -5561,7 +5603,14 @@ mod tests {
             signatures: vec![KeyedSignature { signature: [0; 64] }],
         });
         let reply = AdminMessage::ForcePostureResult(AdminResult::RoleDenied);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &[],
+            &DispatchNotes::default(),
+        );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "force_posture");
@@ -5591,6 +5640,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &[],
+            &DispatchNotes::default(),
         );
         // Non-auditable: Status request.
         let status_req = AdminMessage::Status(StatusRequest {});
@@ -5625,6 +5675,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &[],
+            &DispatchNotes::default(),
         );
 
         let after_skips = read_audit_entries(&log_path);
@@ -5656,6 +5707,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["aaaaaaaa".to_string(), "bbbbbbbb".to_string()],
+            &DispatchNotes::default(),
         );
 
         let payload_b = SignedPayload::new_rotate_keys_add(
@@ -5675,6 +5727,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["cccccccc".to_string(), "dddddddd".to_string()],
+            &DispatchNotes::default(),
         );
 
         let entries = read_audit_entries(&log_path);
@@ -5713,7 +5766,14 @@ mod tests {
             signature: [0; 64],
         });
         let reply = AdminMessage::UnlockResult(UnlockResult::Success);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &[],
+            &DispatchNotes::default(),
+        );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key_fp, "");
@@ -5743,6 +5803,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["aaaaaaaa".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -5785,6 +5846,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["bbbbbbbb".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -5835,6 +5897,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["cccccccc".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -5864,7 +5927,14 @@ mod tests {
             signatures: vec![KeyedSignature { signature: [0; 64] }],
         });
         let reply = AdminMessage::FimBaselineResult(AdminResult::RoleDenied);
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &[],
+            &DispatchNotes::default(),
+        );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "fim_baseline");
@@ -5913,6 +5983,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["dddddddd".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -5950,6 +6021,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["eeeeeeee".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -5984,6 +6056,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["ffffffff".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -6019,6 +6092,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["aaaa1111".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -6057,7 +6131,14 @@ mod tests {
             result: AdminResult::RoleDenied,
             canary_id: String::new(),
         });
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &[]);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &[],
+            &DispatchNotes::default(),
+        );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "canary_deploy");
@@ -6547,6 +6628,7 @@ mod tests {
             &AdminReadPaths::default(),
             &fake_client(),
             &mut Vec::new(),
+            &mut DispatchNotes::default(),
         ) {
             AdminMessage::StatusResponse(r) => r,
             other => panic!("{other:?}"),
@@ -6934,7 +7016,14 @@ mod tests {
             released: false,
             message: "pid 77 is not contained by this agent".to_string(),
         });
-        emit_audit_for(&req, &reply, &fake_client(), Some(&audit), &["ab".into()]);
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &["ab".into()],
+            &DispatchNotes::default(),
+        );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].op, "response_release");
@@ -7843,6 +7932,7 @@ mod tests {
             &fake_client(),
             Some(&audit),
             &["aabbccdd".to_string()],
+            &DispatchNotes::default(),
         );
         let entries = read_audit_entries(&log_path);
         assert_eq!(entries.len(), 1);
@@ -8271,6 +8361,7 @@ mod tests {
             &auth,
             &posture,
             &mut Vec::new(),
+            &mut DispatchNotes::default(),
         );
         assert!(matches!(r, AdminResult::Success), "{r:?}");
         assert_eq!(posture.current_kind(), PostureKind::Combat);
@@ -8292,6 +8383,7 @@ mod tests {
             &auth,
             &posture,
             &mut Vec::new(),
+            &mut DispatchNotes::default(),
         );
         assert!(matches!(r, AdminResult::Success), "{r:?}");
 
@@ -8306,6 +8398,7 @@ mod tests {
                 &auth,
                 &posture,
                 &mut fps,
+                &mut DispatchNotes::default(),
             );
             assert!(matches!(r, AdminResult::RoleDenied), "{target:?}: {r:?}");
             assert_eq!(posture.current_kind(), PostureKind::Combat);
@@ -8321,9 +8414,93 @@ mod tests {
             &auth,
             &posture,
             &mut Vec::new(),
+            &mut DispatchNotes::default(),
         );
         assert!(matches!(r, AdminResult::Success), "{r:?}");
         assert_eq!(posture.current_kind(), PostureKind::Engaged);
+    }
+
+    /// External audit ASK-015: leaving COMBAT by force-posture, the
+    /// audit row (and the journal line, from the same value) names COMBAT as `from` — they named
+    /// the state entered (`from=Observing to=Observing`), and the row had
+    /// only the target.
+    #[test]
+    fn force_posture_records_the_state_it_left() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x15; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "force-posture,unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let posture = PostureMachine::new();
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let force = |target: PostureKind| {
+            let req = force_posture_req(&auth, &signing, agent_id, target);
+            let mut fps = Vec::new();
+            let mut notes = DispatchNotes::default();
+            let r = dispatch_force_posture(req.clone(), &auth, &posture, &mut fps, &mut notes);
+            assert!(matches!(r, AdminResult::Success), "{target:?}: {r:?}");
+            emit_audit_for(
+                &AdminMessage::ForcePostureRequest(req),
+                &AdminMessage::ForcePostureResult(r),
+                &fake_client(),
+                Some(&audit),
+                &fps,
+                &notes,
+            );
+        };
+        force(PostureKind::Combat);
+        assert_eq!(posture.current_kind(), PostureKind::Combat);
+
+        // The journal line and the audit row both print `outcome.from`; the
+        // signed row is the evidence, so it is what this test reads (a
+        // captured tracing line was flaky under parallel tests: a callsite's
+        // interest is process-wide).
+        force(PostureKind::Observing);
+        assert_eq!(posture.current_kind(), PostureKind::Observing);
+
+        let entries = read_audit_entries(&log_path);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].extra,
+            serde_json::json!({ "target": "Combat", "from": "Observing" })
+        );
+        assert_eq!(
+            entries[1].extra,
+            serde_json::json!({ "target": "Observing", "from": "Combat" })
+        );
+        assert_eq!(entries[1].result, "success");
+    }
+
+    /// External audit ASK-015: a refused force changed nothing; its row
+    /// has the target and no `from`.
+    #[test]
+    fn a_refused_force_posture_has_no_from() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x15; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "force-posture", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let posture = PostureMachine::new();
+        let mut notes = DispatchNotes::default();
+        let r = dispatch_force_posture(
+            force_posture_req(&auth, &signing, agent_id, PostureKind::Combat),
+            &auth,
+            &posture,
+            &mut Vec::new(),
+            &mut notes,
+        );
+        assert!(matches!(r, AdminResult::Success), "{r:?}");
+        assert_eq!(notes.force_from, Some(PostureKind::Observing));
+
+        let mut notes = DispatchNotes::default();
+        let r = dispatch_force_posture(
+            force_posture_req(&auth, &signing, agent_id, PostureKind::Observing),
+            &auth,
+            &posture,
+            &mut Vec::new(),
+            &mut notes,
+        );
+        assert!(matches!(r, AdminResult::RoleDenied), "{r:?}");
+        assert_eq!(notes.force_from, None);
     }
 
     // ── External audit NN-AUD-084: rotate-keys add confinement ─────

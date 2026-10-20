@@ -452,16 +452,16 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-238 | ASK-012 | Low | Admin socket | S | fixed (lab PR 179) |
 | NN-AUD-239 | ASK-013 | Low | Admin socket | S | fixed (lab PR 179) |
 | NN-AUD-240 | ASK-014 | Low | Admin socket | S | fixed (lab PR 179) |
-| NN-AUD-241 | ASK-015 | Low | Admin socket | S | open |
+| NN-AUD-241 | ASK-015 | Low | Admin socket | S | fixed (lab PR 212) |
 | NN-AUD-242 | ASK-016 | Low | Admin socket | S | fixed (lab PR 170) |
 | NN-AUD-243 | ASK-017 | Low | Admin socket | S | fixed (lab PR 192) |
 | NN-AUD-244 | AUT-001 | Low | Admin auth | S | fixed (lab PR 192) |
 | NN-AUD-245 | AUT-005 | Low | Admin auth | S | fixed (lab PR 192) |
 | NN-AUD-246 | AUT-006 | Low | Admin auth | S | fixed (lab PR 192) |
-| NN-AUD-247 | AUT-007 | Low | Admin auth | S (docs) | partly fixed (escalation closed, lab PR 138); open |
+| NN-AUD-247 | AUT-007 | Low | Admin auth | S (docs) | fixed (escalation lab PR 138, documents lab PR 212; per-signer role declined) |
 | NN-AUD-248 | AUT-010 | Low | Admin auth | — | already fixed (lab PR 115) |
 | NN-AUD-249 | AUT-011 | Low | Admin auth | (S, optional pin test) | declined (premise false: ciborium 0.2.2 caps recursion at 256 levels; the only caller decodes the shutdown marker, not socket input) |
-| NN-AUD-250 | AUT-013 | Low | Admin auth | S | open |
+| NN-AUD-250 | AUT-013 | Low | Admin auth | S | fixed (lab PR 212) |
 | NN-AUD-251 | MAIN-009 | Low | Agent main | S | fixed (lab PR 185) |
 | NN-AUD-252 | MAIN-010 | Low | Agent main | S | fixed (lab PR 185) |
 | NN-AUD-253 | MAIN-011 | Low | Agent main | — | already fixed (lab PR 115) |
@@ -469,7 +469,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-255 | MAIN-013 | Low | Agent main | S | fixed (lab PR 180) |
 | NN-AUD-256 | MAIN-014 | Low | Agent main | M | fixed (lab PR 190) |
 | NN-AUD-257 | MAIN-015 | Low | Agent main | S | fixed (lab PR 180) |
-| NN-AUD-258 | MAIN-016 | Low | Agent main | S | open |
+| NN-AUD-258 | MAIN-016 | Low | Agent main | S | fixed (lab PR 212) |
 | NN-AUD-259 | ATP-006 | Low | Anti-tamper | S | fixed (lab PR 176) |
 | NN-AUD-260 | ATP-007 | Low | Anti-tamper | S | fixed (lab PR 189) |
 | NN-AUD-261 | ATP-011 | Low | Anti-tamper | — | declined (the slot-table test the audit asks for exists, already at 16f7563) |
@@ -635,7 +635,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-421 | TST-015 | Low | Privileged tests | S | fixed (lab PR 195) |
 | NN-AUD-422 | TST-016 | Low | Privileged tests | S | fixed (lab PR 195) |
 | NN-AUD-423 | TST-017 | Low | Privileged tests | M | fixed (lab PR 195) |
-| NN-AUD-424 | ASK-018 | Info | Admin socket | S | open |
+| NN-AUD-424 | ASK-018 | Info | Admin socket | S | fixed (lab PR 212) |
 | NN-AUD-425 | AUT-012 | Info | Admin auth | — | obsolete (lab PR 138) |
 | NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | fixed (lab PR 187) |
 | NN-AUD-427 | EVD-023 | Info | Evidence logs | S | fixed (lab PR 204) |
@@ -10121,3 +10121,110 @@ group, the ones an unprivileged user or a local attacker could use first.
     templates rendered and parsed as YAML, the injected private key matching
     the recorded public key; shellcheck is not installed on this host.
   - Lab: LAB-025 on the lab's four guests: each existing guest's ed25519 key recorded once with `trust-host-key` from its own forwarder, the fingerprint equal to the guest's `ssh-keygen -lf` (24.04, Debian 12, 22.04, Debian 13). A listener of ours on 22.04's port (guest and forwarder stopped, socat to Debian 12's sshd): before this lot `nn-lab.sh ssh` for "ubuntu2204" answered `nn-lab-debian12` / Debian 12; after it `ssh`, `sync` and `trust-host-key` stopped with rc=1 — first "no host key recorded", then, with the key recorded, "does not present guest ubuntu2204's recorded host key … Nothing was sent" — `known_hosts` unchanged and no login on Debian 12 from them. A new guest (Debian 12, `NN_LAB_LOCKDOWN=integrity`): the key generated on the host and injected by cloud-init before the first boot, equal to the guest's, files 600/600/644, `lockdown: OK (integrity …)` (lab PR 206's lockdown guest), `destroy` removed disk and key. LAB-022 on 24.04: a sentinel `~/.aws` kept byte for byte (two sha256, mode 750) through `open-sensor-check` (its checks PASS), a TERM mid-step (rc 143) and a Ctrl-C (rc 130), no `.aws.nn-open-sensor` left; a left-over copy stops the check (rc 1) without touching `~/.aws`; on the WSL host the script refuses with rc 2 ("not an nn-lab guest"). LAB-019 and LAB-027 by their xtask tests (stubs); not run on the VirtualBox range. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.
+- **Wave 3 — operator-facing correctness, lab PR 212.** NN-AUD-241
+  (ASK-015, Low), NN-AUD-424 (ASK-018, Info), NN-AUD-250 (AUT-013, Low),
+  NN-AUD-247 (AUT-007, Low), NN-AUD-258 (MAIN-016, Low), NN-AUD-279
+  (EVD-016, Low): batch 8 of the Wave 3 triage of group G3, on the
+  integration tree (`main` with lots up to 199, and lots 200–207). Files:
+  `posture/mod.rs` (`ForceOutcome`), `admin_socket.rs` (`DispatchNotes`,
+  force-posture journal line and audit row, `--path` filter),
+  `detection_store.rs` (`subject_substr`), `bin/nn_admin.rs` (role list,
+  help texts), `admin_cli.rs` (doc), `sd_notify.rs`, `watchdog/src/lib.rs`,
+  `common/src/sd_notify.rs` (new), `common/src/wire/admin_signed_payload.rs`
+  (doc only), design `TAPPA8_ED25519_ADMIN_OVERRIDE_DESIGN.md` §3.3, §9.1,
+  Appendix B.
+  - ASK-015 (241, fixed). Re-checked: the dispatcher logged `from =
+    state.kind()` with `state` the post-transition value, and the row's
+    `extra` had only `target`. `admin_force_state_with_token` returns
+    `ForceOutcome { from, state }`, `from` read under the same write lock
+    as the transition; the journal line says `from=<left> to=<entered>`,
+    and the dispatcher hands `from` to `emit_audit_for` through
+    `DispatchNotes` (an out-parameter next to `matched_fps`): the row's
+    `extra` is `{"target", "from"}` when the force was applied (a no-op to
+    the same state included), `{"target"}` when refused (the state did not
+    change). Rows written before keep their bytes.
+  - ASK-018 (424, fixed). Re-checked: `comm_substr` was set from `--path`
+    and matched against `comm` only, while records carry `exe` (exec
+    sensors) and `file` (file sensors). `subject_substr` keeps a record
+    when `exe`, `file` or `comm` contains the text — a superset of the old
+    matches; no wire change; the `nn-admin detections --path` help and the
+    `DetectionsExtra` doc say so. Choice: `file` is matched as well as
+    `exe` (the triage named `exe`), so `--path /etc/cron.d/` finds the
+    file detections too; it is the same subject the per-rule budget uses.
+  - AUT-013 (250, fixed). `parse_roles_csv` trims each entry and passes the
+    list to the agent's `parse_role_list`: `unlock,,audit-read`, `unlock,`,
+    `,unlock` are refused with the agent's words ("role list has empty
+    entry (leading/trailing/double comma)"); an empty list keeps its
+    message.
+  - AUT-007 (247, fixed for the docs; per-signer role declined). Re-checked
+    `quorum_decision`: each required role from one of the matched keys.
+    The help of `shutdown` ("each with the `shutdown` role"), of
+    `rotate-keys` ("two distinct admin keys carrying the `rotate-keys`
+    role") and of `rotate-keys add --key`/`--cosign-key` ("also
+    `rotate-keys` role"), and the doc of `run_rotate_keys_add`, now say:
+    one key holds the role, the co-signer may be any installed key. Design
+    §3.3 gains "Who may co-sign" (custody every installed key as a control
+    credential; `add` grants only roles a signer holds, NN-AUD-084);
+    Appendix B qualifies "defeated by 2-of-N quorum". Requiring the role of
+    each signer is declined, as the triage proposes: it would break
+    installs whose co-signer carries the default `unlock,audit-read`.
+  - MAIN-016 (258, fixed). Re-checked: the agent's `ready()`, the
+    watchdog's `sd_notify_ready` and `sd_notify_status` sent to
+    `$NOTIFY_SOCKET` with `send_to(path)`; `@name` named a missing file.
+    Also found: `std::env::var` took a value that is not UTF-8 as unset,
+    so nothing was sent and `Ok` returned. Both now use
+    `common::sd_notify` (`var_os`; `/…` a path, `@…` an abstract name via
+    `SocketAddr::from_abstract_name` + `send_to_addr`, a short send an
+    error; any other value — empty, relative, systemd 254's `vsock:` — an
+    `InvalidInput` error, not a skip). Choice: one shared implementation
+    in `common` instead of two copies (the agent may not depend on the
+    watchdog; both depend on `common`). A relative value, which systemd
+    never sets, was sent relative to the cwd and is now refused.
+  - EVD-016 (279, residual recorded, no code change). The fail-open half is
+    closed (lab PR 148). Remaining: the install manifest is not signed.
+    Signing is declined as proposed: `install.sh` writes it on the host
+    (bin_dir, provenance, `verify_override`), so a release signature cannot
+    cover it, and rewriting it needs the LSM write deny lifted
+    (`ETC_PROTECTED_FILES`, `ETC_WRITE_DENY_FILES`) or an admin-signed
+    window; a degraded LSM is already reported at boot. Open, M, later:
+    record the manifest's SHA-256 in `agent_boot` and report a change no
+    trusted-installer window row explains (the ATP-004 pattern).
+  - Wire. No change to the admin protocol: `DispatchNotes` is internal;
+    the audit row's `extra` is free-form JSON (a new key).
+    `production_discriminants_do_not_depend_on_debug_trigger` unchanged
+    and green.
+  - Tests: `posture::tests` `admin_force_state_reports_the_state_it_left`
+    (and `admin_force_state_with_token_any_to_any`, `debug-trigger`, checks
+    `from`); `admin_socket::tests` `force_posture_records_the_state_it_left`
+    (COMBAT, then OBSERVING with an `unlock` signer: journal `from=Combat
+    to=Observing`, rows `{"target":"Combat","from":"Observing"}` and
+    `{"target":"Observing","from":"Combat"}`),
+    `a_refused_force_posture_has_no_from`; `detection_store::tests`
+    `read_last_n_filters_path_against_exe_and_file`; `nn-admin`
+    `rejects_an_empty_entry_like_the_agent`,
+    `co_signer_help_matches_the_quorum_rule`; `common::sd_notify`
+    `an_abstract_socket_receives_the_message`,
+    `a_path_socket_receives_the_message`, `a_missing_socket_is_an_error`,
+    `values_systemd_does_not_send_are_refused`; agent
+    `ready_reaches_an_abstract_notify_socket`; watchdog
+    `sd_notify_reaches_an_abstract_notify_socket` (`READY=1` and
+    `STATUS=` on `@name`, an error once nobody listens). On the starting
+    tree the tests that use `ForceOutcome`, `DispatchNotes` or
+    `common::sd_notify` do not compile; with the old code put back (journal
+    `from` from the returned state and no `from` on the row, `comm`-only
+    match, old role parser, old help, old senders),
+    `force_posture_records_the_state_it_left`,
+    `a_refused_force_posture_has_no_from`,
+    `read_last_n_filters_path_against_exe_and_file`,
+    `rejects_an_empty_entry_like_the_agent`,
+    `co_signer_help_matches_the_quorum_rule` and both
+    `…_abstract_notify_socket` tests fail.
+  - Host: `cargo fmt` clean; clippy `--workspace --all-targets` and the
+    agent with `debug-trigger` clean; `cargo test --workspace` 2,719
+    passed, 0 failed (12 new); `wire::admin_protocol` with `debug-trigger`
+    45 passed. Not from this lot: clippy of the `posture_demo` example
+    (`--features posture-demo`) fails on the integration tree, its `Event`
+    initialiser lacks the `argv_truncated`/`filename_truncated` fields of
+    the `kernfid` lot. No lab probe (the triage asks for unit tests and a
+    docs review).
+  - Lab: No dedicated lab probe: the force-posture record, `detections --path`, the role-list parser and `sd_notify` to a path and an abstract socket are covered by unit tests; on all four guests both units reached `active (running)` through `READY=1`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.

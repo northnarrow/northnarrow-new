@@ -566,8 +566,9 @@ pub enum RotateKeysOutcome {
 /// rewrites the file + reloads its in-memory key set so the next
 /// challenge already sees the addition (design §7.2).
 ///
-/// Two keys are required — distinct fingerprints, both carrying
-/// `Role::RotateKeys`. Same wire flow as `run_shutdown`: read
+/// Two keys are required — distinct fingerprints, at least one
+/// carrying `Role::RotateKeys`; the other may be any installed key
+/// (design §3.3, external audit AUT-007). Same wire flow as `run_shutdown`: read
 /// keys, get nonce, build SignedPayload, sign with both,
 /// transmit.
 pub fn run_rotate_keys_add(

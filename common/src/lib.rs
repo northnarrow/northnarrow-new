@@ -72,6 +72,11 @@ pub mod posture_types;
 #[cfg(feature = "std")]
 pub mod rag_types;
 
+/// The `sd_notify(3)` datagram of the agent and the watchdog (external
+/// audit MAIN-016: abstract sockets).
+#[cfg(all(feature = "std", target_os = "linux"))]
+pub mod sd_notify;
+
 #[cfg(feature = "std")]
 pub mod shutdown_marker;
 

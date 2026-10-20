@@ -1113,14 +1113,15 @@ pub struct DetectionFilter {
     pub status: Option<DetectionStatus>,
     /// Exact-match the originating sensor.
     pub sensor: Option<Sensor>,
-    /// Substring match on the acting principal's `comm`. The record now
-    /// carries an executable path ([`DetectionRecord::exe`], 9.0.a.1),
-    /// but the `--path` operator filter is STILL applied against `comm`
-    /// — the one subject identifier every sensor populates (only the
-    /// exec sensors have an `exe`). Repointing `--path` to `exe`, or
-    /// adding a separate `--exe` filter, is a filter-semantics change
-    /// deferred to a later step (pending sign-off), out of scope here.
-    pub comm_substr: Option<String>,
+    /// The `--path` operator filter: a substring of what the record says
+    /// the detection is about — its executable
+    /// ([`DetectionRecord::exe`], exec sensors), its file
+    /// ([`DetectionRecord::file`], file sensors) or the acting
+    /// principal's `comm` (every sensor). A record is kept when any of
+    /// the three contains it. External audit ASK-018: it was matched
+    /// against `comm` only, so `--path /usr/bin/curl` found nothing while
+    /// the records named the path; the matches are a superset of before.
+    pub subject_substr: Option<String>,
 }
 
 /// Severity as a comparable rung (`Low` < `Medium` < `High` <
@@ -1253,8 +1254,10 @@ impl DetectionRecord {
                 return false;
             }
         }
-        if let Some(ref sub) = filter.comm_substr {
-            if !self.principal.comm.contains(sub.as_str()) {
+        if let Some(ref sub) = filter.subject_substr {
+            let sub = sub.as_str();
+            let names = |field: &Option<String>| field.as_deref().is_some_and(|v| v.contains(sub));
+            if !(self.principal.comm.contains(sub) || names(&self.exe) || names(&self.file)) {
                 return false;
             }
         }
@@ -2790,11 +2793,62 @@ mod tests {
             ],
         );
         let filter = DetectionFilter {
-            comm_substr: Some("curl".to_string()),
+            subject_substr: Some("curl".to_string()),
             ..Default::default()
         };
         let got = read_last_n(&path, 10, &filter);
         assert_eq!(ids(&got), vec![3, 2], "substring matches both curl* comms");
+    }
+
+    /// External audit ASK-018: `--path` finds a record by the executable
+    /// or the file it names, not only by `comm`.
+    #[test]
+    fn read_last_n_filters_path_against_exe_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let mut curl = mk(
+            1,
+            "2026-06-09T12:00:01.000000Z",
+            Severity::Medium,
+            DetectionStatus::Open,
+            Sensor::Exec,
+            "curl",
+        );
+        curl.exe = Some("/usr/bin/curl".to_string());
+        let mut cron = mk(
+            2,
+            "2026-06-09T12:00:02.000000Z",
+            Severity::Medium,
+            DetectionStatus::Open,
+            Sensor::File,
+            "bash",
+        );
+        cron.file = Some("/etc/cron.d/backdoor".to_string());
+        // A short name the kernel truncated: comm differs from the image.
+        let mut helper = mk(
+            3,
+            "2026-06-09T12:00:03.000000Z",
+            Severity::Medium,
+            DetectionStatus::Open,
+            Sensor::Exec,
+            "systemd-network",
+        );
+        helper.exe = Some("/usr/lib/systemd/systemd-networkd-wait-online".to_string());
+        write_records(&path, &[curl, cron, helper]);
+        let by = |sub: &str| {
+            let filter = DetectionFilter {
+                subject_substr: Some(sub.to_string()),
+                ..Default::default()
+            };
+            ids(&read_last_n(&path, 10, &filter))
+        };
+        assert_eq!(by("/usr/bin/curl"), vec![1], "the executable's path");
+        assert_eq!(by("curl"), vec![1], "the comm still matches");
+        assert_eq!(by("/etc/cron.d/"), vec![2], "the file's path");
+        assert_eq!(by("bash"), vec![2]);
+        assert_eq!(by("wait-online"), vec![3], "beyond the 15-byte comm");
+        assert_eq!(by("/usr/"), vec![3, 1]);
+        assert!(by("/opt/").is_empty());
     }
 
     #[test]
