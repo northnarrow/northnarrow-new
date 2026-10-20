@@ -61,6 +61,39 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, ADE prompt inputs (Low LLMP-012 NN-AUD-323,
+  LLMP-014 NN-AUD-324, LLMR-011 NN-AUD-326; lab PR 182). The trusted block
+  of every ADE prompt (`=== TRUSTED CONTEXT (issued by NorthNarrow,
+  immutable) ===`) printed the hostname, the kernel release and
+  `/etc/machine-id` as they were read, only trimmed: `sethostname(2)`
+  takes any 64 bytes, a newline included, and the machine id was read
+  whole, so root could end the block and add its own "trusted" lines or
+  sections. `HostContext::discover` now makes each one sanitized line
+  (`ade::sanitize::sanitize_line`, over the event sanitizer: control
+  characters, NEL and the Unicode line separators as `?`, zero-width and
+  bidi characters dropped, chat-template tokens masked, `===` neutralised)
+  of at most 64 characters, `unknown` when nothing is left; the machine id
+  is 32 lowercase hex characters, read through a 64-byte window, or
+  `unknown`. The prompt sanitizes every trusted-context line again when it
+  prints it (`host_role` and the language included), and the XAI
+  `environment_hash` takes its hostname from the same function (its
+  `canonical_hostname` was a second raw read). LLMR-011, the part left
+  after lab PR 145: a RAG title goes through the same line sanitizer,
+  capped at 160 characters, before the period rule, and the retrieval
+  query is built from the sanitized event (`build_rag_query`, which
+  replaces `build_rag_query_from_event`). LLMP-012: the unhardened
+  `ade::prompt::build_event_prompt`, with no caller but its own tests, is
+  removed with its helpers. Clean values print byte for byte as before: a
+  whole prompt is pinned as the previous code rendered it, and every title
+  of the pinned corpus (36 seed titles, the 934 of the pinned dumps) renders
+  as before. **Regressions / changes:** a host whose `/etc/machine-id` is
+  not 32 lowercase hex characters (`uninitialized`, upper case, anything
+  else) has `unknown` as host id in the prompt, the XAI snapshot and the
+  verdict metadata; a hostname or kernel release with a control character,
+  a line separator or `===` is shown neutralised (and the XAI
+  `environment_hash` changes with it); a path longer than 256 characters
+  is cut in the RAG query as it already was in the prompt. Nothing an
+  operator sees changes on a host with clean values.
 - External audit, Wave 3, COMBAT guard and self-protection (Low CMB-022
   NN-AUD-313, CMB-024 NN-AUD-315, CMB-025 NN-AUD-316, CMB-028 NN-AUD-431;
   lab PR 181). CMB-022: the COMBAT guard took an unreadable

@@ -68,7 +68,7 @@ pub use escalate::{transform_to_escalate, EscalateMeta};
 pub use inference::{InferenceBackend, MockBackend, StreamControl};
 pub use mem_guard::{check_ade_memory, AdeMemCheck};
 pub use parser::{ValidationError, VerdictParser};
-pub use rag_integration::{build_rag_query_from_event, format_rag_block};
+pub use rag_integration::{build_rag_query, format_rag_block};
 pub use sanitize::{sanitize_event_for_ade, InjectionFlag, SanitizedEvent};
 pub use sanity_check::{verify_verdict_coherence, SanityCheckResult};
 pub use stats::{AdeStats, AdeStatsSnapshot};
@@ -447,9 +447,11 @@ impl AdeEngine {
             return Prepared::Rejected(sanitized);
         }
 
-        // Sub-tappa 6.7: optional RAG retrieval before prompt build.
+        // Sub-tappa 6.7: optional RAG retrieval before prompt build. The
+        // query is built from the sanitized strings (external audit
+        // LLMR-011).
         let mut rag_result: Option<RagResult> = self.inner.rag.as_ref().map(|rag| {
-            let query_text = build_rag_query_from_event(event);
+            let query_text = build_rag_query(&sanitized);
             let r = rag.retrieve(RagQuery::new(&query_text));
             tracing::debug!(
                 hits = r.documents.len(),
