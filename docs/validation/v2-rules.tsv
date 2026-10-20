@@ -1,14 +1,18 @@
 # NorthNarrow — V2 validation campaign — frozen rule denominator.
-# version: 2
+# version: 3
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217, NN-AUD-235).
 # version 2 (2026-10-16, lab PR 163, before any V2 run): NN-L-NET-003 leaves
 # the Critical sub-gate (gate -), inactive until BUG-025 (no sensor produces
 # a TLS fingerprint); it stays in the denominator. NN-L-CANARY-003 stays in
 # the sub-gate: a connect to a network canary now trips it.
+# version 3 (2026-10-20, lab PR 219, before any V2 run): the exploit
+# post-condition guard's two rules, NN-L-EPG-001 (credentials, T1068) and
+# NN-L-EPG-002 (namespaces and root, T1611), issued outside the engine
+# (`direct`), Critical, in the sub-gate: family exploit-guard.
 #
 # One row per rule the agent can record: the 76 rules the production engine
-# loads (decision::rules::default_rules_with_net) and NN-L-AT-001, which
-# process_event issues outside the engine. The rule-coverage headline and the
+# loads (decision::rules::default_rules_with_net) and NN-L-AT-001 and
+# NN-L-EPG-001/002, which process_event issues outside the engine. The rule-coverage headline and the
 # Critical sub-gate are computed over these rows and no others; matrix.md
 # gives the formulas and the sha256 of this file. A change is a new version,
 # recorded there before the family it touches runs.
@@ -106,3 +110,5 @@ NN-L-IOU-002_IoUringFileAndNetwork	io_uring	engine	-	-	in
 NN-L-BPF-001_BpfProgramLoaded	bpf	engine	-	-	in
 NN-L-BPF-002_BpfForeignHandleOrDetach	bpf	engine	-	-	in
 NN-L-AT-001_AntiTamperDenial	anti-tamper	direct	-	-	in
+NN-L-EPG-001_CredentialPostcondition	exploit-guard	direct	critical	-	in
+NN-L-EPG-002_NamespaceRootPostcondition	exploit-guard	direct	critical	-	in

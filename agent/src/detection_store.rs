@@ -128,6 +128,9 @@ pub enum Sensor {
     Canary,
     /// io_uring ring creation / activity (asynchronous I/O channel).
     IoUring,
+    /// Lab PR 219: the exploit post-condition guard (`raw_syscalls` +
+    /// `commit_creds` / `switch_task_namespaces` / `set_fs_root`).
+    ExploitGuard,
 }
 
 impl Sensor {
@@ -141,6 +144,7 @@ impl Sensor {
             Event::ModuleLoad { .. } => Sensor::ModuleLoad,
             Event::IoUring { .. } => Sensor::IoUring,
             Event::BpfSyscall { .. } => Sensor::AntiTamper,
+            Event::ExploitPostcondition { .. } => Sensor::ExploitGuard,
             Event::TcpConnect { .. }
             | Event::DnsQuery { .. }
             | Event::DnsFlood { .. }
@@ -297,14 +301,14 @@ impl Principal {
                 uid: *loader_uid,
                 ppid: None,
             },
-            Event::IoUring { pid, uid, comm, .. } | Event::BpfSyscall { pid, uid, comm, .. } => {
-                Principal {
-                    pid: *pid,
-                    comm: comm.clone(),
-                    uid: *uid,
-                    ppid: None,
-                }
-            }
+            Event::IoUring { pid, uid, comm, .. }
+            | Event::BpfSyscall { pid, uid, comm, .. }
+            | Event::ExploitPostcondition { pid, uid, comm, .. } => Principal {
+                pid: *pid,
+                comm: comm.clone(),
+                uid: *uid,
+                ppid: None,
+            },
             Event::CanaryTripped {
                 accessor_pid,
                 accessor_uid,
@@ -360,6 +364,7 @@ fn exe_from_event(event: &Event) -> Option<String> {
         | Event::ModuleLoad { .. }
         | Event::IoUring { .. }
         | Event::BpfSyscall { .. }
+        | Event::ExploitPostcondition { .. }
         | Event::TcpConnect { .. }
         | Event::DnsQuery { .. }
         | Event::DnsFlood { .. }
@@ -385,6 +390,7 @@ fn file_from_event(event: &Event) -> Option<String> {
         | Event::ExecCheck { .. }
         | Event::IoUring { .. }
         | Event::BpfSyscall { .. }
+        | Event::ExploitPostcondition { .. }
         | Event::TcpConnect { .. }
         | Event::DnsQuery { .. }
         | Event::DnsFlood { .. }
@@ -1121,6 +1127,7 @@ impl Sensor {
             "anti-tamper" | "antitamper" => Some(Sensor::AntiTamper),
             "canary" => Some(Sensor::Canary),
             "io-uring" | "iouring" | "io_uring" => Some(Sensor::IoUring),
+            "exploit-guard" | "exploitguard" | "exploit_guard" => Some(Sensor::ExploitGuard),
             _ => None,
         }
     }

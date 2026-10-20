@@ -20,9 +20,12 @@
 mod btf_offsets;
 mod bpf_defense;
 mod budget;
+mod comm;
 mod dns_query;
 mod dns_skb;
 mod drops;
+mod epg;
+mod epg_lite;
 mod exec_check;
 mod exec_lsm;
 mod fail_open;

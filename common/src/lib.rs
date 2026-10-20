@@ -29,6 +29,9 @@ pub mod bpf_cmd;
 /// revalidates against. NOT `std`-gated — the eBPF half needs it with
 /// `default-features = false`.
 pub mod btf_offsets;
+/// Exploit post-condition guard (lab PR 219): the decision model the eBPF
+/// programs run and the agent tests. `no_std`, like [`btf_offsets`].
+pub mod epg;
 /// Per-hook fail-open counter slots of the deny hooks, shared by the eBPF
 /// programs and the agent (lab PR 215). NOT `std`-gated.
 pub mod fail_open;

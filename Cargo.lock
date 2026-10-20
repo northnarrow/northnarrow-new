@@ -862,6 +862,7 @@ dependencies = [
  "anyhow",
  "aya",
  "aya-log",
+ "aya-obj",
  "base64",
  "bytemuck",
  "chrono",

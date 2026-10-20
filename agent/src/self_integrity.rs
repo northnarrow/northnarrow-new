@@ -130,6 +130,12 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
         crate::decision::engine::ALLOW_DEMO_RULES_ENV,
         crate::decision::engine::allow_demo_rules_weakens,
     ),
+    // Lab PR 219: `off` leaves the exploit post-condition guard unattached
+    // (`detect` and `enforce` do not weaken).
+    (
+        crate::sensors::epg::MODE_ENV,
+        crate::sensors::epg::turns_off,
+    ),
 ];
 
 /// Does this value of the variable weaken the agent?

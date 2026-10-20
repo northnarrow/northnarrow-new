@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 19;
+pub const RING_DROP_SLOTS: u32 = 20;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -50,6 +50,9 @@ pub mod ring_slot {
     /// budget, not recorded (held back before the `fs_protect` ring; the
     /// deny itself still applies).
     pub const TASK_DENIAL_RATE: u32 = 18;
+    /// Lab PR 219: the exploit post-condition guard's ring (an anomaly
+    /// record lost; the guard's kill in enforce mode does not depend on it).
+    pub const EXPLOIT_GUARD: u32 = 19;
 }
 
 /// Human names, indexed by slot.
@@ -73,6 +76,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "listen_rate",
     "io_uring_rate",
     "task_denial_rate",
+    "exploit_guard",
 ];
 
 #[cfg(test)]
@@ -107,7 +111,11 @@ mod tests {
             RING_DROP_NAMES[ring_slot::TASK_DENIAL_RATE as usize],
             "task_denial_rate"
         );
-        assert_eq!(ring_slot::TASK_DENIAL_RATE + 1, RING_DROP_SLOTS);
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::EXPLOIT_GUARD as usize],
+            "exploit_guard"
+        );
+        assert_eq!(ring_slot::EXPLOIT_GUARD + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -135,6 +143,7 @@ mod tests {
             (ring_slot::LISTEN_RATE, "listen_rate"),
             (ring_slot::IOURING_RATE, "io_uring_rate"),
             (ring_slot::TASK_DENIAL_RATE, "task_denial_rate"),
+            (ring_slot::EXPLOIT_GUARD, "exploit_guard"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");

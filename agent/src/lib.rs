@@ -56,4 +56,8 @@ pub mod shutdown_marker;
 pub mod systemd_state;
 pub mod telemetry_probe;
 pub mod trusted_bin;
+/// Lab builds only (`--verifier-check`): every program of the embedded
+/// eBPF object through the kernel's verifier.
+#[cfg(feature = "debug-trigger")]
+pub mod verifier_check;
 pub mod verify_lines;

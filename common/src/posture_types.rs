@@ -115,6 +115,15 @@ pub enum TriggerType {
     // a compromised host must not learn that the files are bait. Appended
     // last to keep variant ordering stable.
     ControlSurfaceTamper,
+
+    // Lab PR 219: the exploit post-condition guard found a task that gained
+    // credentials, or left its namespaces or its root, with no legitimate
+    // mechanism for its system call (NN-L-EPG-001/002). Kernel evidence,
+    // COMBAT tier, but it needs corroboration while the guard is
+    // experimental: a false positive of a new kernel heuristic must not lock
+    // COMBAT and isolate the host on its own (design note, "Response").
+    // Appended last to keep variant ordering stable.
+    ExploitPostcondition,
 }
 
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
@@ -167,7 +176,8 @@ impl TriggerType {
             | TriggerType::PersistenceMechanism => EvidenceClass::FileSystem,
             TriggerType::AntiTamperDenial
             | TriggerType::RelayedTamperAttempt
-            | TriggerType::ControlSurfaceTamper => EvidenceClass::Kernel,
+            | TriggerType::ControlSurfaceTamper
+            | TriggerType::ExploitPostcondition => EvidenceClass::Kernel,
             TriggerType::TelemetryLoss => EvidenceClass::Telemetry,
         }
     }
@@ -193,7 +203,8 @@ impl TriggerType {
             | TriggerType::LateralMovement
             | TriggerType::ExfiltrationPattern
             | TriggerType::AntiTamperDenial
-            | TriggerType::ControlSurfaceTamper => PostureKind::Combat,
+            | TriggerType::ControlSurfaceTamper
+            | TriggerType::ExploitPostcondition => PostureKind::Combat,
         }
     }
 
@@ -238,6 +249,7 @@ impl TriggerType {
             TriggerType::TelemetryLoss => "TelemetryLoss",
             TriggerType::StagingExec => "StagingExec",
             TriggerType::ControlSurfaceTamper => "ControlSurfaceTamper",
+            TriggerType::ExploitPostcondition => "ExploitPostcondition",
         }
     }
 }
@@ -334,6 +346,19 @@ mod tests {
         for banned in ["honeypot", "decoy", "canary", "bait", "trap"] {
             assert!(!name.contains(banned), "{name} names the {banned}");
         }
+    }
+
+    /// Lab PR 219: the guard's finding is kernel evidence of COMBAT tier
+    /// that a second signal of another class must corroborate before it
+    /// locks COMBAT (experimental guard: no isolation on its word alone).
+    #[test]
+    fn exploit_postcondition_is_kernel_evidence_needing_corroboration() {
+        let t = TriggerType::ExploitPostcondition;
+        assert_eq!(t.target_level(), PostureKind::Combat);
+        assert_eq!(t.confidence(), Confidence::NeedsCorroboration);
+        assert_eq!(t.evidence_class(), EvidenceClass::Kernel);
+        assert!(t.is_corroboration());
+        assert_eq!(t.as_str(), "ExploitPostcondition");
     }
 
     #[test]

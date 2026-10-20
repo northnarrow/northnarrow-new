@@ -235,11 +235,11 @@ The agent now reads the prototype of `bpf_lsm_inode_setattr` from the
 running kernel's BTF at boot, takes the position of its only `struct
 dentry *` argument (which must be followed by the `struct iattr *`), and
 writes it into the `BTF_OFFSETS` map (`INODE_SETATTR_DENTRY_ARG`, slot
-89) before anything attaches; both programs read the dentry at that
+106) before anything attaches; both programs read the dentry at that
 position. The same check found a second case: on 5.7 to 5.11 (5.10 LTS
 included) `inode_setxattr` and `inode_removexattr` start with the dentry,
 where the xattr deny read argument 1 (the attribute name); their
-positions are resolved the same way (slots 90 and 91, the name taken
+positions are resolved the same way (slots 107 and 108, the name taken
 right after the dentry).
 
 Hook prototypes per kernel, for the arguments the programs read
@@ -516,6 +516,19 @@ event name):
 A kernel built without `CONFIG_IO_URING` has no such tracepoints: the
 agent logs a WARN and runs without the sensor (nothing to observe there).
 
+## Exploit post-condition guard (lab PR 219)
+
+Lite, the default, runs on every kernel of the matrix (BPF LSM, fentry,
+`tp_btf`, an LRU task map, `bpf_task_pt_regs`: 5.15 and later). Strict
+needs 6.1: its task map is not preallocated, which a raw tracepoint can
+use safely only with the BPF memory allocator of 6.1. Before 6.1 the
+verifier refuses such a map only on a PREEMPT_RT kernel and loads it
+elsewhere with a kernel `WARN`, so the agent checks the version itself:
+`--exploit-guard strict` on 5.15 (or on RHEL 9's 5.14, whose backports it
+does not detect) leaves the guard `unavailable` with a signed
+`subsystem_degraded`; the agent starts. Design:
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXPLOIT_POSTCONDITION_GUARD.md
+
 ## DNS sensor: two static kernel functions (Tappa 10.9 step 3)
 
 The DNS sensor hooks `udp_send_skb` and `udp_v6_send_skb`, where the kernel
@@ -615,6 +628,38 @@ same rules or the 22.04 guest will refuse to load it:
    `inode_dev::stat_dev` does for btrfs' `container_of`) or work on a
    pointer obtained through `bpf_probe_read_kernel`, which is a plain
    scalar.
+9. **No BPF-to-BPF call that a precision mark can reach (5.15 and 6.1).**
+   Up to 6.3 the verifier cannot follow a precision mark back across a
+   subprogram call: the first branch whose outcome it knows past such a
+   call marks every scalar of every state precise, and states stop
+   merging. The calls nobody wrote count too. `bpf_get_current_comm()`
+   zero-initialises a 16-byte stack array, which compiles to the `memset`
+   subprogram: lab PR 219's exploit guard went from a few thousand
+   instructions on 6.8 to the 1M-instruction limit on 6.1 that way. Read
+   `comm` with `agent-ebpf/src/comm.rs` (`comm_into` writes it straight
+   into a ring record zeroed before: 6.1's helper leaves the bytes after
+   the name's NUL unwritten). Check an object with `llvm-objdump -dr
+   --disassemble-symbols=<program>`: no `R_BPF_64_32 memset`.
+10. **Fewer ways through the program (5.15 and 6.1).** Every branch the
+    verifier cannot prove one-sided doubles the paths after it until they
+    merge again, and these verifiers merge fewer. In the exploit guard:
+    a read whose failure means 0 anyway uses the helper's own zeroing
+    (`epg::peek`, no branch on its result); a task's record is looked up
+    once per run, not again inside a shared helper; a finding goes
+    straight into the ring record (`epg::emit_change`), with no struct
+    of 160 bytes on the stack, its words copied with volatile stores (an
+    assignment between two raw places compiles to rule 9's `memmove`
+    subprogram): lite's `commit_creds` program was at 512 of 512 bytes
+    and 802,000 instructions, 384 bytes and 5,400 after, and its use
+    points took 113,000 with that `memmove`, 2,800 without; the
+    allowed-transition verdict is one load from a table built
+    at compile time (`epg::ALLOWED_TABLE`), not a `match` whose arms the
+    verifier walked one by one. Measure with `deploy/lab/nn-lab.sh
+    verifier-check` (every program through the guest's verifier with the
+    agent's own loader setup: OK or REFUSED, instructions processed on
+    6.1 and later, stack per frame and per call chain); keep every
+    program well under the limit on 6.1, which reports the count (5.15
+    does not; there, rule 7's `bpftrace` measure).
 
 Lab notes for 22.04-era userland:
 

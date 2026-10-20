@@ -788,6 +788,35 @@ pub struct StatusResponse {
     /// `None` before the boot signed it.
     #[serde(default)]
     pub capability_manifest: Option<String>,
+    /// Lab PR 219: the exploit post-condition guard — its mode and its
+    /// kernel counters since boot. Appended after lab PR 218's fields
+    /// (which follow lab PR 215's, 217's and 207's); `None` from an older
+    /// agent, and in the unsigned `status` (telemetry).
+    #[serde(default)]
+    pub exploit_guard: Option<ExploitGuardStatus>,
+}
+
+/// Lab PR 219: the exploit post-condition guard in `nn-admin status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExploitGuardStatus {
+    /// `detect`, `enforce`, `off`, `unavailable: <reason>`, `not started`.
+    pub mode: String,
+    /// Calls judged at `sys_exit`.
+    pub checked_total: u64,
+    /// `sys_enter`s of fully privileged tasks (not judged).
+    pub skipped_privileged_total: u64,
+    /// Anomalies found (recorded or over a task's record budget).
+    pub anomalies_total: u64,
+    /// Tasks sent `SIGKILL` (enforce).
+    pub kills_total: u64,
+    /// Tasks the task map could not keep: strict's new tasks a full map
+    /// left untracked, or lite's records its LRU map evicted (re-taken at
+    /// the next hook: degraded evidence). One variant runs at a time.
+    pub untracked_total: u64,
+    /// Lite: privilege uses judged (`capable`, exec, guarded `file_open`).
+    pub use_checks_total: u64,
+    /// Lite enforce: uses refused (`-EPERM`).
+    pub denied_total: u64,
 }
 
 impl StatusResponse {
@@ -845,6 +874,7 @@ impl StatusResponse {
             trust_reasons: None,
             degradations: None,
             capability_manifest: None,
+            exploit_guard: None,
         }
     }
 
@@ -1788,6 +1818,7 @@ mod tests {
             trust_reasons: None,
             degradations: None,
             capability_manifest: None,
+            exploit_guard: None,
         }));
     }
 
@@ -1825,6 +1856,7 @@ mod tests {
             trust_reasons: None,
             degradations: None,
             capability_manifest: None,
+            exploit_guard: None,
         }));
     }
 
@@ -2016,6 +2048,16 @@ mod tests {
             trust_reasons: None,
             degradations: None,
             capability_manifest: None,
+            exploit_guard: Some(ExploitGuardStatus {
+                mode: "lite enforce".to_string(),
+                checked_total: 1_000,
+                skipped_privileged_total: 400,
+                anomalies_total: 1,
+                kills_total: 1,
+                untracked_total: 0,
+                use_checks_total: 0,
+                denied_total: 0,
+            }),
         }));
     }
 
@@ -2073,6 +2115,16 @@ mod tests {
             trust_reasons: Some(vec!["1 degradation(s) recorded".to_string()]),
             degradations: Some(vec!["dns_sensor: IPv6 resolvers not observed".to_string()]),
             capability_manifest: Some("{\"entry_hash\":\"ab\",\"manifest\":{}}".to_string()),
+            exploit_guard: Some(ExploitGuardStatus {
+                mode: "lite enforce".to_string(),
+                checked_total: 1_000,
+                skipped_privileged_total: 400,
+                anomalies_total: 1,
+                kills_total: 1,
+                untracked_total: 0,
+                use_checks_total: 0,
+                denied_total: 0,
+            }),
         }
     }
 
@@ -2524,6 +2576,7 @@ mod tests {
         assert_eq!(public.net_quic_rows_total, None);
         assert_eq!(public.deny_fail_open_total, None);
         assert_eq!(public.deny_fail_open, None);
+        assert_eq!(public.exploit_guard, None);
         assert!(!status_with_lab193_fields().telemetry_withheld());
         // Same shape: an older nn-admin or watchdog reads it.
         let body = postcard::to_allocvec(&public).unwrap();
@@ -2609,8 +2662,8 @@ mod tests {
     /// Lab PR 217: the isolation per IP family is appended to the status —
     /// public, passed through by the unsigned reply — and an `nn-admin` of
     /// lab PR 213 reads every byte before it (the two fields follow lab PR
-    /// 215's; lab PR 218's four fields, `None` in a public reply, come after
-    /// them).
+    /// 215's; lab PR 218's four fields and lab PR 219's one, `None` in a
+    /// public reply, come after them).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -2624,9 +2677,10 @@ mod tests {
         without.network_isolation_v4 = None;
         without.network_isolation_v6 = None;
         let without = postcard::to_allocvec(&without).unwrap();
-        // None is one byte each; Some(bool) two. Lab PR 218's four fields
-        // (one `None` byte each here) are the last bytes of both.
-        let tail = 4;
+        // None is one byte each; Some(bool) two. The fields appended after
+        // them (one `None` byte each here) are the last bytes of both: lab
+        // PR 218's four, lab PR 219's `exploit_guard`.
+        let tail = 4 + 1;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);

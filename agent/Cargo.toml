@@ -123,6 +123,11 @@ ebpf-guard = { path = "../ebpf-guard" }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+# Lab PR 219: parse the embedded eBPF object in unit tests, with the parser
+# aya 0.13.1 itself runs: every map must be of a type aya 0.13 loads (a
+# task-storage map parsed and still stopped the agent), and the exploit
+# guard's maps and programs. Already in the tree through aya.
+aya-obj = "=0.2.1"
 
 # Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
 # builds with -D warnings do not flag it as an unexpected cfg.

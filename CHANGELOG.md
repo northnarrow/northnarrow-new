@@ -6,6 +6,57 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Exploit post-condition guard (lab PR 219, experimental; capabilities C12,
+  C14). Whatever bug a local kernel exploit uses, it ends with a task that
+  holds what it did not hold: root, capabilities, another user namespace,
+  other namespaces or another root. The kernel makes those changes
+  legitimately only through `commit_creds`, `switch_task_namespaces` and
+  `set_fs_root`, on behalf of a few system calls; the guard flags a gain
+  through no mechanism (a `struct cred` written in place) or through a
+  mechanism on behalf of a call that never makes it (`commit_creds` from
+  `ioctl`, `write`, `keyctl`, `bpf`, …), as NN-L-EPG-001 (credentials,
+  T1068) or NN-L-EPG-002 (namespaces and root, T1611), Critical, signed,
+  outside the engine, with the variant and the point that caught it. The
+  allow-list is a table of mechanisms and system calls, never names; fully
+  privileged tasks are not judged. Two variants (`--exploit-guard`,
+  `NN_EXPLOIT_GUARD`): **lite**, the default, with no system-call hook —
+  the mechanism hooks judge the call in progress (`pt_regs.orig_ax`), and a
+  credential changed without a mechanism is caught at its first use (LSM
+  `capable`, exec, `file_open` of a root-owned private file) against a
+  per-task record in an LRU task map (keyed by `task_struct` address, the
+  task's start time in the record against address reuse; deleted at exit;
+  preallocated, so sized `min(pid_max, threads-max)` capped at 65536, or
+  `--exploit-guard-tasks`). A record the map evicts is re-taken at the
+  task's next hook, counted (in the status's untracked count, with the
+  tasks a full map left untracked; a WARN at every rise and a signed
+  `subsystem_degraded`, `exploit_guard_baseline_lost`, at most once per
+  600 s; "task record(s) lost" in `nn-admin status --key`), and a
+  re-taken credential that holds privilege is recorded as degraded
+  evidence (NN-L-EPG-001 at High, never refused or killed): an eviction
+  never makes an in-place write the new baseline in silence. The first
+  build kept the record in BPF task storage, which the agent's aya 0.13
+  cannot load: the agent refused to start on every kernel ("Unsupported
+  map type found 29", lab, Debian 12); a unit test now fails on any map of
+  the embedded object whose type aya 0.13.1's loader does not accept.
+  **Strict**, opt-in, the comparison around every system call (`sys_enter`
+  / `sys_exit`; its task map sized from `pid_max`, `--exploit-guard-tasks`,
+  not preallocated, which needs 6.1: the agent checks the kernel version
+  and below 6.1 strict is unavailable, a signed degradation); `off` is a
+  weakening variable and a signed degradation.
+  `--exploit-guard-response detect|enforce`: detect (default) records;
+  enforce also sends SIGKILL from the hook, delivered before the task
+  returns to user mode, and lite refuses the use (`-EPERM`)
+  (`--detect-only` keeps detect). The posture trigger
+  `ExploitPostcondition` is kernel evidence that needs corroboration while
+  the guard is experimental. `nn-admin status --key` (the signed status)
+  shows the variant, response and counters. The decision model is `common::epg`, the same code in the
+  kernel programs and the unit tests; 17 new optional BTF offsets (slots
+  78–94, later slots renumbered); a kernel missing one leaves the guard off
+  and attested. Validation registry: `v2-rules.tsv` v3 (79 rows, sub-gate
+  27), `v2-techniques.tsv` v2 (TQ60 T1068), `v2-controls.tsv` v2. Lab:
+  `deploy/lab/epg/` (negative suite, debug-build fault injection for both
+  variants, microbenchmark modes `getppid` and `rdzero` in `nn-bench`).
+  Design note: `docs/design/EXPLOIT_POSTCONDITION_GUARD.md`.
 - The privileged suites run in GitHub Actions (Wave 4 Phase 2.1,
   capabilities C01, C29; lab PR 227). Until now CI only compiled them
   (`--no-run`) and they ran nowhere but the self-hosted lab.

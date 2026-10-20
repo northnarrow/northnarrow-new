@@ -15,6 +15,9 @@ pub mod anti_tamper;
 pub mod bpf;
 pub mod canary;
 pub mod chain;
+/// Lab PR 219: the exploit post-condition guard's rules (issued outside
+/// the engine, like `anti_tamper`).
+pub mod epg;
 pub mod iouring;
 pub(crate) mod module_provenance;
 pub mod net;
@@ -492,6 +495,12 @@ pub(crate) fn build_verdict(
             ..
         }
         | Event::BpfSyscall {
+            pid,
+            comm,
+            timestamp_ns,
+            ..
+        }
+        | Event::ExploitPostcondition {
             pid,
             comm,
             timestamp_ns,
