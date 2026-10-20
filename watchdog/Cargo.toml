@@ -63,6 +63,10 @@ serde_json = "1"
 # Tests serialise on the bpffs PROTECTED_PIDS pin (process-global),
 # so --test-threads=1 is mandatory.
 test-privileged = []
+# Lab PR 216: lab-only fault injection (files beside the agent pidfile,
+# as the agent's own debug triggers): a failed pidfd wait, a refused stuck
+# recovery. `nn-lab.sh build` enables it; a release build never does.
+debug-trigger = []
 
 [dev-dependencies]
 tempfile = "3"

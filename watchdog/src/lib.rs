@@ -33,7 +33,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use antitamper_bpf::ProtectedPidsHandle;
 use anyhow::{anyhow, Context, Result};
 use common::wire::admin_protocol::{
-    decode_status_liveness, encode_frame, AdminMessage, StatusRequest, MAX_FRAME_BODY,
+    decode_loop_progress, decode_status_liveness, encode_frame, AdminMessage, LoopProgressRequest,
+    StatusRequest, MAX_FRAME_BODY,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
@@ -137,7 +138,259 @@ pub struct Cli {
     /// This install's id; a shutdown signed for another install is refused.
     #[arg(long = "agent-id-file", value_name = "PATH", default_value = DEFAULT_AGENT_ID_FILE)]
     pub agent_id_file: PathBuf,
+
+    /// Lab PR 216: record that systemd put the watchdog unit in its failed
+    /// state, and exit — what `northnarrow-watchdog-failed.service`, the
+    /// watchdog unit's `OnFailure=` handler, runs. Reads systemd's
+    /// `MONITOR_*` variables ([`unit_failure_record`]) and appends one
+    /// record beside the shutdown marker (`watchdog.hold`), which the agent
+    /// signs at its next round.
+    #[arg(long = "record-unit-failure")]
+    pub record_unit_failure: bool,
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Lab PR 216 (capability C23) — fail-visible exit statuses
+// ────────────────────────────────────────────────────────────────────
+
+/// Why `northnarrow-watchdog` exits, and its exit status. Every failure is
+/// non-zero and has its own status, so `systemctl status` and the journal
+/// say which one, and the unit's `Restart=always` restarts it (static
+/// review C-44 / G-05: "pidfd wait failed" ended the restart loop with a
+/// clean 0, and `Restart=on-failure` left the agent without a supervisor).
+/// The unit keeps 0 from a restart (`RestartPreventExitStatus=0`): a stop
+/// the watchdog was told to make.
+///
+/// | status | reason |
+/// |---|---|
+/// | 0 | stopped: SIGTERM/SIGINT, or a shutdown signed by the admin quorum |
+/// | 1 | an error without a status of its own (none is known) |
+/// | 2 | the command line was refused (clap) |
+/// | 10 | process hardening (`prctl`) failed |
+/// | 11 | no verified agent within the start-up deadline (30 s) |
+/// | 12 | the watchdog's pidfile could not be written |
+/// | 13 | the respawn backend could not be set up |
+/// | 14 | `READY=1` could not be sent to systemd |
+/// | 15 | the signal handlers could not be installed |
+/// | 20 | the wait on the agent's pidfd failed |
+/// | 30 | `--record-unit-failure`: the record could not be written |
+///
+/// Each non-zero exit of the daemon leaves a [`REASON_WATCHDOG_EXIT`]
+/// record ([`exit_record`]) for the agent to sign first.
+///
+/// [`REASON_WATCHDOG_EXIT`]: common::watchdog_hold::REASON_WATCHDOG_EXIT
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    Stopped,
+    Unclassified,
+    Usage,
+    Harden,
+    NoAgent,
+    Pidfile,
+    Backend,
+    Notify,
+    Signals,
+    PidfdWait,
+    RecordFailed,
+}
+
+impl ExitReason {
+    /// Every reason, in the order of the table above.
+    pub const ALL: [ExitReason; 11] = [
+        ExitReason::Stopped,
+        ExitReason::Unclassified,
+        ExitReason::Usage,
+        ExitReason::Harden,
+        ExitReason::NoAgent,
+        ExitReason::Pidfile,
+        ExitReason::Backend,
+        ExitReason::Notify,
+        ExitReason::Signals,
+        ExitReason::PidfdWait,
+        ExitReason::RecordFailed,
+    ];
+
+    /// The exit status.
+    pub fn code(self) -> u8 {
+        match self {
+            ExitReason::Stopped => 0,
+            ExitReason::Unclassified => 1,
+            ExitReason::Usage => 2,
+            ExitReason::Harden => 10,
+            ExitReason::NoAgent => 11,
+            ExitReason::Pidfile => 12,
+            ExitReason::Backend => 13,
+            ExitReason::Notify => 14,
+            ExitReason::Signals => 15,
+            ExitReason::PidfdWait => 20,
+            ExitReason::RecordFailed => 30,
+        }
+    }
+
+    /// A short name for the journal and the record.
+    pub fn name(self) -> &'static str {
+        match self {
+            ExitReason::Stopped => "stopped",
+            ExitReason::Unclassified => "unclassified",
+            ExitReason::Usage => "usage",
+            ExitReason::Harden => "hardening_failed",
+            ExitReason::NoAgent => "no_verified_agent",
+            ExitReason::Pidfile => "pidfile_unwritable",
+            ExitReason::Backend => "respawn_backend_failed",
+            ExitReason::Notify => "sd_notify_failed",
+            ExitReason::Signals => "signal_handlers_failed",
+            ExitReason::PidfdWait => "pidfd_wait_failed",
+            ExitReason::RecordFailed => "record_failed",
+        }
+    }
+}
+
+/// A failure that ends the watchdog: its [`ExitReason`], the agent it was
+/// supervising (0 before one was verified), and the error.
+#[derive(Debug)]
+pub struct Failure {
+    pub reason: ExitReason,
+    pub agent_pid: u32,
+    pub error: anyhow::Error,
+}
+
+impl Failure {
+    pub fn new(reason: ExitReason, error: anyhow::Error) -> Self {
+        Failure {
+            reason,
+            agent_pid: 0,
+            error,
+        }
+    }
+
+    /// The agent supervised when it happened.
+    pub fn agent(mut self, pid: u32) -> Self {
+        self.agent_pid = pid;
+        self
+    }
+}
+
+/// `result.exit_as(reason)`: an error becomes a [`Failure`] with `reason`.
+pub trait ExitAs<T> {
+    fn exit_as(self, reason: ExitReason) -> std::result::Result<T, Failure>;
+}
+
+impl<T> ExitAs<T> for Result<T> {
+    fn exit_as(self, reason: ExitReason) -> std::result::Result<T, Failure> {
+        self.map_err(|e| Failure::new(reason, e))
+    }
+}
+
+/// What the restart loop does when the wait on the agent's pidfd fails
+/// (the AsyncFd registration or its readiness): exit with
+/// [`ExitReason::PidfdWait`] — systemd restarts the watchdog, which opens a
+/// new pidfd on the verified agent. It used to `break` the loop and exit 0.
+pub fn pidfd_wait_failed(error: anyhow::Error, agent_pid: u32) -> Failure {
+    Failure::new(ExitReason::PidfdWait, error).agent(agent_pid)
+}
+
+/// Unix seconds now (0 before 1970).
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The [`common::watchdog_hold::REASON_WATCHDOG_EXIT`] record of `failure`,
+/// written just before the watchdog exits with its status.
+pub fn exit_record(failure: &Failure, at: u64) -> common::watchdog_hold::HoldRecord {
+    common::watchdog_hold::HoldRecord {
+        at,
+        agent_pid: failure.agent_pid,
+        reason: common::watchdog_hold::REASON_WATCHDOG_EXIT.to_string(),
+        detail: format!(
+            "exit status {} ({}): {}",
+            failure.reason.code(),
+            failure.reason.name(),
+            bounded(&format!("{:#}", failure.error), 300)
+        ),
+        unit_state: None,
+    }
+}
+
+/// `text` cut to `max` bytes at a char boundary, control characters as
+/// spaces (one record per line).
+fn bounded(text: &str, max: usize) -> String {
+    let mut out: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if out.len() > max {
+        let mut end = max;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+    }
+    out
+}
+
+/// The variables systemd passes to an `OnFailure=` handler (systemd 251+;
+/// only when exactly one unit names the handler).
+pub const MONITOR_VARS: [&str; 5] = [
+    "MONITOR_UNIT",
+    "MONITOR_SERVICE_RESULT",
+    "MONITOR_EXIT_CODE",
+    "MONITOR_EXIT_STATUS",
+    "MONITOR_INVOCATION_ID",
+];
+
+/// The [`common::watchdog_hold::REASON_WATCHDOG_FAILED`] record the
+/// `OnFailure=` handler writes: systemd put the watchdog unit in its failed
+/// state (a start or stop job of its own failed — a death of the process is
+/// restarted, the unit has no start limit) and no longer restarts it.
+/// `var` reads the handler's environment ([`MONITOR_VARS`]); an older
+/// systemd passes none, and the record says so. `agent_pid` is the agent the pidfile names, 0
+/// when none.
+pub fn unit_failure_record(
+    var: impl Fn(&str) -> Option<String>,
+    agent_pid: u32,
+    at: u64,
+) -> common::watchdog_hold::HoldRecord {
+    let fields: Vec<String> = MONITOR_VARS
+        .iter()
+        .filter_map(|k| {
+            var(k).map(|v| {
+                format!(
+                    "{}={}",
+                    k.trim_start_matches("MONITOR_").to_lowercase(),
+                    bounded(&v, 64)
+                )
+            })
+        })
+        .collect();
+    let unit = var("MONITOR_UNIT").unwrap_or_else(|| DEFAULT_WATCHDOG_UNIT.to_string());
+    let detail = if fields.is_empty() {
+        format!(
+            "{} entered the failed state — systemd no longer restarts it (no MONITOR_* \
+             variables: systemd older than 251)",
+            bounded(&unit, 64)
+        )
+    } else {
+        format!(
+            "{} entered the failed state — systemd no longer restarts it: {}",
+            bounded(&unit, 64),
+            fields.join(" ")
+        )
+    };
+    common::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: common::watchdog_hold::REASON_WATCHDOG_FAILED.to_string(),
+        detail,
+        unit_state: None,
+    }
+}
+
+/// The watchdog's own unit, named in a failure record without
+/// `MONITOR_UNIT`.
+pub const DEFAULT_WATCHDOG_UNIT: &str = "northnarrow-watchdog.service";
 
 /// Apply the W2 process-hardening prctls per design §7.4:
 ///
@@ -416,16 +669,29 @@ pub async fn open_agent_pidfd_with_retry(
 /// agent's AUT-003 writer ([`common::atomic_file::write_pidfile`]): the
 /// temporary name is removed, created exclusively, renamed into place, and
 /// the directory synced.
+///
+/// Lab PR 216 (static review C-43 / G-06): a missing parent is created
+/// 0700, the mode of the units' `RuntimeDirectoryMode=` — it was created
+/// with the process umask (0755 under systemd), like `install.sh`'s
+/// `/run/northnarrow`.
 pub fn write_pidfile_atomic(path: &Path, pid: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(RUN_DIR_MODE)
+                .create(parent)
                 .with_context(|| format!("creating pidfile parent {}", parent.display()))?;
         }
     }
     common::atomic_file::write_pidfile(path, pid)
         .with_context(|| format!("writing pidfile {} (atomic replace)", path.display()))
 }
+
+/// Lab PR 216: the mode of `/run/northnarrow` (the units'
+/// `RuntimeDirectoryMode=`, `install.sh`'s `install -d -m 0700`).
+pub const RUN_DIR_MODE: u32 = 0o700;
 
 /// Manual systemd `sd_notify(READY=1)` — sends a single Unix
 /// datagram to `$NOTIFY_SOCKET` per the `sd_notify(3)` wire
@@ -478,6 +744,90 @@ pub enum HoldOutcome {
 
 /// How often a holding watchdog looks for an agent started again.
 pub const HOLD_POLL: Duration = Duration::from_secs(2);
+
+/// Lab PR 216: how often a holding watchdog refreshes its `STATUS=` line
+/// (`systemctl status`: how long it has held, when it retries).
+pub const HOLD_STATUS_EVERY: Duration = Duration::from_secs(60);
+
+/// Lab PR 216: how often a hold repeats its ERROR line on
+/// `watchdog.tamper` — a hold that lasts is not a single line in the
+/// journal.
+pub const HOLD_REMIND_EVERY: Duration = Duration::from_secs(600);
+
+/// Lab PR 216: the first wait of a hold before it starts the agent once
+/// more, without an operator.
+pub const HOLD_RETRY_FIRST: Duration = Duration::from_secs(600);
+
+/// Lab PR 216: the longest wait between two retries of a hold.
+pub const HOLD_RETRY_MAX: Duration = Duration::from_secs(3600);
+
+/// Lab PR 216 (static review C-44: "after 5 restarts in 60 s the hold is
+/// indefinite"): the hold is bounded. After [`HOLD_RETRY_FIRST`] it starts
+/// the agent once more, then waits twice as long before the next retry, up
+/// to [`HOLD_RETRY_MAX`]; the count carries across the holds of one
+/// watchdog, so an agent that keeps failing is retried at most once an
+/// hour. Each retry is recorded (`hold_retry`) and is what lets an agent
+/// run again to sign the hold — a hold with no agent had no signer.
+#[derive(Debug, Clone)]
+pub struct HoldRetry {
+    first: Duration,
+    max: Duration,
+    retries: u32,
+}
+
+impl HoldRetry {
+    /// [`HOLD_RETRY_FIRST`] doubling up to [`HOLD_RETRY_MAX`].
+    pub fn new() -> Self {
+        Self::with(HOLD_RETRY_FIRST, HOLD_RETRY_MAX)
+    }
+
+    /// Other bounds (tests).
+    pub fn with(first: Duration, max: Duration) -> Self {
+        HoldRetry {
+            first,
+            max,
+            retries: 0,
+        }
+    }
+
+    /// How long to hold before the next retry: `first * 2^retries`, at
+    /// most `max`.
+    pub fn next_wait(&self) -> Duration {
+        let factor = 1u32.checked_shl(self.retries.min(31)).unwrap_or(u32::MAX);
+        self.first
+            .checked_mul(factor)
+            .unwrap_or(self.max)
+            .min(self.max)
+    }
+
+    /// A retry was made.
+    pub fn record(&mut self) {
+        self.retries = self.retries.saturating_add(1);
+    }
+
+    /// Retries made so far.
+    pub fn retries(&self) -> u32 {
+        self.retries
+    }
+}
+
+impl Default for HoldRetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lab PR 216: the `STATUS=` line of a hold — why, for how long, and when
+/// the next retry starts the agent. `systemctl status northnarrow-watchdog`
+/// shows it.
+pub fn hold_status_line(why: &str, held_for: Duration, next_retry_in: Duration) -> String {
+    format!(
+        "DEGRADED: {why} — holding for {} s, not respawning the agent; next retry in {} s \
+         (or start northnarrow-agent once investigated)",
+        held_for.as_secs(),
+        next_retry_in.as_secs()
+    )
+}
 
 /// External audit WDG-004: wait, without respawning anything, until an
 /// agent runs again — an operator started it after investigating, and its
@@ -1616,7 +1966,38 @@ pub enum PingOutcome {
     /// [`STATUS_PING_VANISHED_STUCK_AFTER`] in a row are
     /// [`PingOutcome::StuckDetected`].
     SocketVanished { consecutive: u32 },
+    /// Lab PR 216: the agent answered, and its event loop made no round
+    /// since the previous ping (`consecutive` pings in a row, the last
+    /// round `since_last_ms` before this one). Below
+    /// [`STATUS_PING_STALLED_STUCK_AFTER`]: a WARN.
+    LoopStalled {
+        consecutive: u32,
+        since_last_ms: u64,
+    },
+    /// Lab PR 216: [`STATUS_PING_STALLED_STUCK_AFTER`] answers in a row
+    /// with the event loop standing still — recovered like a hang (stuck
+    /// recovery), and recorded (`event_loop_stalled`).
+    LoopStuck { pings: u32, since_last_ms: u64 },
 }
+
+/// Lab PR 216: what the agent reported of its event loop with its STATUS
+/// answer ([`ping_agent_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopProgress {
+    /// Not reported: an agent older than the request (it closed the
+    /// connection), or not asked. The status answer alone counts.
+    Unreported,
+    /// The loop has gone round `iterations` times (0: not entered yet, the
+    /// agent is starting), the last round `since_last_ms` ago.
+    Reported { iterations: u64, since_last_ms: u64 },
+}
+
+/// Lab PR 216: answers in a row with the event loop standing still before
+/// stuck recovery — three pings 30 s apart, each without a round since the
+/// one before, over a loop that goes round at least every 5 s
+/// (`PUMP_CHECK_PERIOD`): at least 90 s without a round, eighteen times
+/// the loop's idle period, so one slow event is not taken for a hang.
+pub const STATUS_PING_STALLED_STUCK_AFTER: u32 = 3;
 
 /// Why a STATUS ping failed, as far as the stuck-recovery policy cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1736,6 +2117,11 @@ pub struct StatusPingTracker {
     answered: bool,
     consecutive_vanished: u32,
     vanished_threshold: u32,
+    /// Lab PR 216: the loop's round count at the last answer that reported
+    /// one (`None` before, or while the loop was not entered).
+    last_iterations: Option<u64>,
+    consecutive_stalls: u32,
+    stall_threshold: u32,
 }
 
 impl StatusPingTracker {
@@ -1754,6 +2140,9 @@ impl StatusPingTracker {
             answered: false,
             consecutive_vanished: 0,
             vanished_threshold: STATUS_PING_VANISHED_STUCK_AFTER,
+            last_iterations: None,
+            consecutive_stalls: 0,
+            stall_threshold: STATUS_PING_STALLED_STUCK_AFTER,
         }
     }
 
@@ -1817,6 +2206,48 @@ impl StatusPingTracker {
         self.consecutive_absent = 0;
         self.consecutive_vanished = 0;
         self.answered = false;
+        self.last_iterations = None;
+        self.consecutive_stalls = 0;
+    }
+
+    /// Lab PR 216 (static review C-44 / TD-08): a STATUS answer, with what
+    /// the agent reported of its event loop. The answer resets the
+    /// timeout, absent and vanished counters as [`Self::record_ok`] does;
+    /// the loop's round count must also have moved since the previous
+    /// answer that reported one. A count that stands still is
+    /// [`PingOutcome::LoopStalled`], and [`STATUS_PING_STALLED_STUCK_AFTER`]
+    /// in a row [`PingOutcome::LoopStuck`] — even though the socket
+    /// answers. Not reported (an older agent) or 0 (the loop not entered
+    /// yet, the agent starting) is an answer like before.
+    pub fn record_answer(&mut self, progress: LoopProgress) -> PingOutcome {
+        let ok = self.record_ok();
+        let (iterations, since_last_ms) = match progress {
+            LoopProgress::Reported {
+                iterations,
+                since_last_ms,
+            } if iterations > 0 => (iterations, since_last_ms),
+            _ => {
+                self.last_iterations = None;
+                self.consecutive_stalls = 0;
+                return ok;
+            }
+        };
+        if self.last_iterations.replace(iterations) != Some(iterations) {
+            self.consecutive_stalls = 0;
+            return ok;
+        }
+        self.consecutive_stalls = self.consecutive_stalls.saturating_add(1);
+        if self.consecutive_stalls >= self.stall_threshold {
+            PingOutcome::LoopStuck {
+                pings: self.consecutive_stalls,
+                since_last_ms,
+            }
+        } else {
+            PingOutcome::LoopStalled {
+                consecutive: self.consecutive_stalls,
+                since_last_ms,
+            }
+        }
     }
 
     /// Snapshot of the consecutive-timeout counter. Used by log
@@ -1865,11 +2296,30 @@ impl Default for StatusPingTracker {
 /// `listen(2)`); any other server is a [`NotTheAgent`] error before a
 /// byte is sent. A root process that removed the agent's socket could
 /// otherwise bind its own and answer for a frozen agent.
+///
+/// Lab PR 216 (static review C-44 / TD-08): the status reply proves that
+/// the admin socket's task answers, which runs beside the event loop. On the
+/// same connection the ping then asks for the event loop's progress
+/// (`LoopProgress`, unsigned): the agent's reply is the round count the
+/// tracker compares from ping to ping ([`StatusPingTracker::record_answer`]).
+/// An agent older than the request closes the connection
+/// ([`LoopProgress::Unreported`], the status answer alone counts); with
+/// `ask_progress` false (an agent seen not to know it) it is not asked.
 pub async fn ping_agent_status(
     socket_path: &Path,
     timeout: Duration,
     agent_pid: Option<u32>,
-) -> Result<()> {
+) -> Result<LoopProgress> {
+    ping_agent(socket_path, timeout, agent_pid, true).await
+}
+
+/// [`ping_agent_status`], asking for the loop progress or not.
+pub async fn ping_agent(
+    socket_path: &Path,
+    timeout: Duration,
+    agent_pid: Option<u32>,
+    ask_progress: bool,
+) -> Result<LoopProgress> {
     let fut = async {
         let mut stream = UnixStream::connect(socket_path)
             .await
@@ -1916,11 +2366,49 @@ pub async fn ping_agent_status(
             .context("reading reply frame body")?;
 
         decode_status_liveness(&body).map_err(|e| anyhow!("STATUS reply: {e}"))?;
-        Ok::<(), anyhow::Error>(())
+        if !ask_progress {
+            return Ok::<LoopProgress, anyhow::Error>(LoopProgress::Unreported);
+        }
+        let req = AdminMessage::LoopProgress(LoopProgressRequest {});
+        let bytes = encode_frame(&req).map_err(|e| anyhow!("encode_frame: {e}"))?;
+        if stream.write_all(&bytes).await.is_err() {
+            // closed after the status reply: an agent without the request
+            return Ok(LoopProgress::Unreported);
+        }
+        match stream.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(LoopProgress::Unreported)
+            }
+            Err(e) => return Err(e).context("reading the loop progress reply header"),
+        }
+        let body_len = u32::from_be_bytes(header) as usize;
+        if body_len > MAX_FRAME_BODY {
+            return Err(anyhow!(
+                "loop progress reply length {body_len} exceeds MAX_FRAME_BODY {MAX_FRAME_BODY}"
+            ));
+        }
+        let mut body = vec![0u8; body_len];
+        stream
+            .read_exact(&mut body)
+            .await
+            .context("reading the loop progress reply body")?;
+        let p = decode_loop_progress(&body).map_err(|e| anyhow!("loop progress reply: {e}"))?;
+        Ok(LoopProgress::Reported {
+            iterations: p.iterations,
+            since_last_ms: p.since_last_ms,
+        })
     };
 
     match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(progress)) => Ok(progress),
         Ok(Err(e)) => Err(e),
         Err(_elapsed) => Err(anyhow!(
             "STATUS ping timed out after {:?} (socket {})",
@@ -1929,6 +2417,13 @@ pub async fn ping_agent_status(
         )),
     }
 }
+
+/// Lab PR 216: how long stuck recovery waits for the kernel to report the
+/// agent's exit after its SIGKILL. A task in uninterruptible sleep dies
+/// only when it leaves it; the wait was unbounded, and it ran inside the
+/// restart loop's select arm, where neither SIGTERM nor the pidfd were
+/// heard meanwhile.
+pub const STUCK_RECOVERY_REAP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Stuck-agent recovery sequence per design §4.1:
 ///
@@ -1939,12 +2434,23 @@ pub async fn ping_agent_status(
 /// 2. Wait `hardkill_grace` OR pidfd POLLIN, whichever first.
 ///    POLLIN → agent died gracefully, restart path takes over.
 ///    Timeout → agent is wedged past SIGINT response; escalate.
-/// 3. `ProtectedPidsHandle::evict(agent_pid)`, best effort: the
-///    hook already lets the watchdog's SIGKILL through while the
-///    watchdog is a protected pid; the eviction covers the case
-///    where it is not.
-/// 4. SIGKILL through the pidfd.
-/// 5. Wait for pidfd POLLIN — the kernel reaps the agent.
+/// 3. SIGKILL through the pidfd.
+/// 4. Wait for pidfd POLLIN — the kernel reaps the agent — at most
+///    [`STUCK_RECOVERY_REAP_TIMEOUT`].
+/// 5. Only then, the exit confirmed, evict its pid from
+///    `PROTECTED_PIDS` (the pid may be reused).
+///
+/// Lab PR 216 (static review C-44 / G-05): the eviction came before the
+/// SIGKILL ("best effort ... the worst case is the kernel rejects the
+/// kill"), and the caller treated every failure as a death — evict, remove
+/// the pidfile, respawn — so a recovery refused with EPERM, or a SIGKILL
+/// that did not end the agent, left a live agent without its
+/// `PROTECTED_PIDS` entry, which the agent writes only at its start. Now
+/// nothing is evicted before the exit is confirmed: the task_kill hook
+/// lets the watchdog's SIGKILL through for the reason it lets its SIGINT
+/// through (the watchdog is a protected pid; if it is not, the SIGINT is
+/// refused first and nothing is sent). An `Err` leaves the agent as it
+/// was, and the caller decides on its own pidfd ([`stuck_verdict`]).
 ///
 /// Returns Ok when the agent is confirmed dead (pidfd POLLIN
 /// observed) so the W4 caller's restart loop can proceed
@@ -1955,6 +2461,24 @@ pub async fn stuck_recovery(
     agent_pid: u32,
     bpffs_root: &Path,
     hardkill_grace: Duration,
+    agent_bin: &Path,
+) -> Result<()> {
+    stuck_recovery_with(
+        agent_pid,
+        bpffs_root,
+        hardkill_grace,
+        STUCK_RECOVERY_REAP_TIMEOUT,
+        agent_bin,
+    )
+    .await
+}
+
+/// [`stuck_recovery`] with its reap timeout (tests).
+pub async fn stuck_recovery_with(
+    agent_pid: u32,
+    bpffs_root: &Path,
+    hardkill_grace: Duration,
+    reap_timeout: Duration,
     agent_bin: &Path,
 ) -> Result<()> {
     // External audit WDG-003: signal only a process verified to run the
@@ -2004,40 +2528,114 @@ pub async fn stuck_recovery(
         return Ok(());
     }
 
-    // 3-4. Escalate: evict + SIGKILL.
+    // 3. Escalate: SIGKILL, the agent still in PROTECTED_PIDS.
     warn!(
         target: "watchdog.stuck_recovery",
         agent_pid,
         grace_secs = hardkill_grace.as_secs(),
-        "agent did not exit within grace — escalating to evict + SIGKILL"
+        "agent did not exit within grace — escalating to SIGKILL"
     );
-    // Best-effort evict; even on Err we proceed to SIGKILL (the
-    // worst case is the kernel rejects the kill with EPERM and
-    // we surface the error to the caller, who'll log + retry).
+    pidfd_signal(async_fd.get_ref().as_raw_fd(), libc::SIGKILL).with_context(|| {
+        format!("pidfd_send_signal(SIGKILL, pid={agent_pid}); the agent keeps its protection")
+    })?;
+
+    // 4. Wait for the kernel reap, bounded.
+    match tokio::time::timeout(reap_timeout, async_fd.readable()).await {
+        Ok(Ok(guard)) => drop(guard),
+        Ok(Err(e)) => {
+            return Err(anyhow::Error::from(e))
+                .context("awaiting post-SIGKILL pidfd POLLIN; the agent keeps its protection")
+        }
+        Err(_) => {
+            return Err(anyhow!(
+                "agent pid {agent_pid} has not exited {} s after SIGKILL (uninterruptible \
+                 sleep?); it keeps its protection and stays supervised",
+                reap_timeout.as_secs()
+            ))
+        }
+    }
+
+    // 5. The exit is confirmed: its pid leaves PROTECTED_PIDS.
     if let Err(e) = ProtectedPidsHandle::open(bpffs_root).and_then(|mut h| h.evict(agent_pid)) {
         warn!(
             target: "watchdog.stuck_recovery",
             error = %e,
             agent_pid,
             bpffs_root = %bpffs_root.display(),
-            "PROTECTED_PIDS evict failed before SIGKILL — kill may EPERM"
+            "PROTECTED_PIDS evict after the confirmed exit failed (the restart path retries it)"
         );
     }
-    pidfd_signal(async_fd.get_ref().as_raw_fd(), libc::SIGKILL)
-        .with_context(|| format!("pidfd_send_signal(SIGKILL, pid={agent_pid}) after evict"))?;
-
-    // 5. Wait for kernel reap.
-    let guard = async_fd
-        .readable()
-        .await
-        .context("awaiting post-SIGKILL pidfd POLLIN")?;
-    drop(guard);
     info!(
         target: "watchdog.stuck_recovery",
         agent_pid,
-        "agent hard-killed after evict + SIGKILL — restart path takes over"
+        "agent hard-killed (exit confirmed), then evicted — restart path takes over"
     );
     Ok(())
+}
+
+/// Lab PR 216: what the restart loop makes of a stuck recovery, from the
+/// agent's own pidfd — never from the recovery's result alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StuckVerdict {
+    /// The pidfd is readable: the agent exited. Evict, check the shutdown
+    /// marker, respawn.
+    Exited,
+    /// The agent still runs: the recovery failed before or after its
+    /// signals. It keeps its `PROTECTED_PIDS` entry and its pidfile, the
+    /// watchdog keeps watching its pidfd, the failure is recorded
+    /// ([`stuck_recovery_failed_record`]) and the next stuck signal
+    /// tries again.
+    StillRunning,
+}
+
+/// [`StuckVerdict`] of the agent behind `agent_pidfd`.
+pub fn stuck_verdict(agent_pidfd: &OwnedFd) -> StuckVerdict {
+    if pidfd_exited(agent_pidfd) {
+        StuckVerdict::Exited
+    } else {
+        StuckVerdict::StillRunning
+    }
+}
+
+/// The [`common::watchdog_hold::REASON_STUCK_RECOVERY_FAILED`] record.
+pub fn stuck_recovery_failed_record(
+    agent_pid: u32,
+    error: &str,
+    at: u64,
+) -> common::watchdog_hold::HoldRecord {
+    common::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: common::watchdog_hold::REASON_STUCK_RECOVERY_FAILED.to_string(),
+        detail: format!(
+            "the agent did not answer (or its event loop stood still) and could not be stopped: \
+             {} — still protected, its pidfile kept, still supervised",
+            bounded(error, 300)
+        ),
+        unit_state: None,
+    }
+}
+
+/// The [`common::watchdog_hold::REASON_EVENT_LOOP_STALLED`] record:
+/// `pings` STATUS pings in a row answered while the event loop stood still,
+/// its last round `since_last_ms` before the last of them.
+pub fn event_loop_stalled_record(
+    agent_pid: u32,
+    pings: u32,
+    since_last_ms: u64,
+    at: u64,
+) -> common::watchdog_hold::HoldRecord {
+    common::watchdog_hold::HoldRecord {
+        at,
+        agent_pid,
+        reason: common::watchdog_hold::REASON_EVENT_LOOP_STALLED.to_string(),
+        detail: format!(
+            "the admin socket answered {pings} STATUS pings in a row while the event loop made \
+             no round (the last one {} s before); stuck recovery follows",
+            since_last_ms / 1000
+        ),
+        unit_state: None,
+    }
 }
 
 #[cfg(test)]
@@ -3567,7 +4165,7 @@ mod tests {
 
     /// A mock agent that reads one request frame and answers `body` (a
     /// frame body, without its length).
-    async fn ping_against(body: Vec<u8>) -> Result<()> {
+    async fn ping_against(body: Vec<u8>) -> Result<LoopProgress> {
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("mock.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -3610,7 +4208,12 @@ mod tests {
             .is_err(),
             "the full decode refuses the older shape"
         );
-        ping_against(old).await.expect("an older agent is alive");
+        // Lab PR 216: it closes the connection at the progress request — not
+        // reported, the status answer alone counts.
+        assert_eq!(
+            ping_against(old).await.expect("an older agent is alive"),
+            LoopProgress::Unreported
+        );
         // This build's unsigned reply: the telemetry withheld.
         let public = encode_frame(&AdminMessage::StatusResponse(StatusResponse::public(
             PostureKind::Observing,
@@ -3640,5 +4243,352 @@ mod tests {
             "{err:#}"
         );
         assert!(ping_against(Vec::new()).await.is_err(), "an empty body");
+    }
+
+    // ── Lab PR 216 (capability C23): fail-visible supervision ──────────
+
+    /// Every failure has a non-zero status of its own; only a stop the
+    /// watchdog was told to make is 0 (the unit's
+    /// `RestartPreventExitStatus=0`). 2 is clap's own usage status.
+    #[test]
+    fn every_failure_exits_non_zero_with_its_own_status() {
+        let mut codes: Vec<u8> = ExitReason::ALL.iter().map(|r| r.code()).collect();
+        let mut names: Vec<&str> = ExitReason::ALL.iter().map(|r| r.name()).collect();
+        for r in ExitReason::ALL {
+            assert_eq!(r.code() == 0, r == ExitReason::Stopped, "{r:?}");
+            // clear of systemd's own statuses (200-245) and the shell's (126+)
+            assert!(r.code() < 126, "{r:?}");
+        }
+        codes.sort_unstable();
+        codes.dedup();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(codes.len(), ExitReason::ALL.len(), "statuses are distinct");
+        assert_eq!(names.len(), ExitReason::ALL.len(), "names are distinct");
+        let usage = Cli::try_parse_from(["northnarrow-watchdog", "--no-such-flag"]).unwrap_err();
+        assert_eq!(usage.exit_code(), i32::from(ExitReason::Usage.code()));
+        assert_eq!(ExitReason::PidfdWait.code(), 20);
+    }
+
+    /// Static review C-44 / G-05: the wait on the agent's pidfd failing is
+    /// a failure with status 20 — the loop used to `break` and exit 0. A
+    /// real failed wait (an fd epoll cannot watch) maps to it, and its
+    /// record names the status for the agent to sign.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_pidfd_wait_exits_non_zero_and_is_recorded() {
+        let dir = TempDir::new().unwrap();
+        let file = std::fs::File::create(dir.path().join("not-a-pidfd")).unwrap();
+        let fd: OwnedFd = file.into();
+        let err = wait_for_agent_death(&fd)
+            .await
+            .expect_err("a regular file cannot be waited on");
+        let failure = pidfd_wait_failed(err, 4242);
+        assert_eq!(failure.reason, ExitReason::PidfdWait);
+        assert_ne!(failure.reason.code(), 0);
+        assert_eq!(failure.agent_pid, 4242);
+        let rec = exit_record(&failure, 1_800_000_000);
+        assert_eq!(rec.reason, common::watchdog_hold::REASON_WATCHDOG_EXIT);
+        assert_eq!(rec.agent_pid, 4242);
+        assert!(
+            rec.detail
+                .starts_with("exit status 20 (pidfd_wait_failed): ")
+                && rec.detail.contains("AsyncFd"),
+            "{}",
+            rec.detail
+        );
+        // one record per line, bounded
+        let long = Failure::new(ExitReason::NoAgent, anyhow!("a\nb{}", "x".repeat(1000)));
+        let rec = exit_record(&long, 0);
+        assert!(
+            !rec.detail.contains('\n') && rec.detail.len() < 400,
+            "{}",
+            rec.detail
+        );
+        assert!(rec.detail.starts_with("exit status 11 (no_verified_agent)"));
+    }
+
+    /// `result.exit_as(reason)` keeps the error and sets the status.
+    #[test]
+    fn exit_as_sets_the_status() {
+        let r: Result<()> = Err(anyhow!("boom"));
+        let f = r.exit_as(ExitReason::Pidfile).unwrap_err();
+        assert_eq!((f.reason, f.agent_pid), (ExitReason::Pidfile, 0));
+        assert_eq!(format!("{}", f.error), "boom");
+        assert_eq!(f.agent(7).agent_pid, 7);
+    }
+
+    /// The `OnFailure=` handler's record carries systemd's result; without
+    /// the `MONITOR_*` variables (systemd before 251) it says so.
+    #[test]
+    fn the_unit_failure_record_carries_systemds_result() {
+        let vars = |k: &str| match k {
+            "MONITOR_UNIT" => Some("northnarrow-watchdog.service".to_string()),
+            "MONITOR_SERVICE_RESULT" => Some("timeout".to_string()),
+            "MONITOR_EXIT_CODE" => Some("exited".to_string()),
+            "MONITOR_EXIT_STATUS" => Some("20".to_string()),
+            "MONITOR_INVOCATION_ID" => Some("0123\nabcd".to_string()),
+            _ => None,
+        };
+        let rec = unit_failure_record(vars, 4242, 1_800_000_000);
+        assert_eq!(rec.reason, common::watchdog_hold::REASON_WATCHDOG_FAILED);
+        assert_eq!(rec.agent_pid, 4242);
+        for part in [
+            "northnarrow-watchdog.service entered the failed state",
+            "service_result=timeout",
+            "exit_code=exited",
+            "exit_status=20",
+            "invocation_id=0123 abcd",
+        ] {
+            assert!(rec.detail.contains(part), "{part}: {}", rec.detail);
+        }
+        let bare = unit_failure_record(|_| None, 0, 0);
+        assert!(
+            bare.detail.contains("northnarrow-watchdog.service")
+                && bare.detail.contains("systemd older than 251"),
+            "{}",
+            bare.detail
+        );
+        let cli = Cli::try_parse_from(["northnarrow-watchdog", "--record-unit-failure"]).unwrap();
+        assert!(cli.record_unit_failure);
+        assert!(
+            !Cli::try_parse_from(["northnarrow-watchdog"])
+                .unwrap()
+                .record_unit_failure
+        );
+    }
+
+    /// Static review C-44 / G-05: a stuck recovery that fails leaves a
+    /// live agent alive and supervised — the verdict comes from the
+    /// agent's own pidfd, and only an exit is a death. Here the recovery
+    /// refuses a process that does not run the agent binary (no signal is
+    /// sent); before, the loop evicted and respawned it all the same.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_recovery_of_a_live_agent_is_not_a_death() {
+        let (mut child, pidfd) = spawn_sleep_child_and_open_pidfd();
+        let dir = TempDir::new().unwrap();
+        let r = stuck_recovery(
+            child.id(),
+            dir.path(),
+            Duration::from_millis(50),
+            Path::new("/bin/true"),
+        )
+        .await;
+        assert!(r.is_err(), "not the agent: the recovery refuses it");
+        assert_eq!(stuck_verdict(&pidfd), StuckVerdict::StillRunning);
+        assert!(pidfd_signal(pidfd.as_raw_fd(), 0).is_ok(), "it still runs");
+        let rec = stuck_recovery_failed_record(child.id(), &format!("{:#}", r.unwrap_err()), 1);
+        assert_eq!(
+            rec.reason,
+            common::watchdog_hold::REASON_STUCK_RECOVERY_FAILED
+        );
+        assert!(rec.detail.contains("still protected"), "{}", rec.detail);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(stuck_verdict(&pidfd), StuckVerdict::Exited);
+    }
+
+    /// A process that ignores SIGINT is SIGKILLed, its exit awaited (within
+    /// the bound) and confirmed before anything is evicted; an eviction that
+    /// fails after the confirmed exit (no pinned map here) does not fail
+    /// the recovery.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_recovery_confirms_the_exit_before_it_evicts() {
+        let sleep_bin = std::fs::canonicalize("/bin/sleep").unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' INT; exec sleep 60")
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_link(format!("/proc/{}/exe", child.id())).ok()
+            != Some(sleep_bin.clone())
+        {
+            assert!(Instant::now() < deadline, "never exec'd sleep");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // SAFETY: pidfd_open returned this fd to us; we own it.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd_open(child.id()).unwrap()) };
+        let dir = TempDir::new().unwrap();
+        stuck_recovery_with(
+            child.id(),
+            dir.path(),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            &sleep_bin,
+        )
+        .await
+        .expect("SIGINT ignored, SIGKILL confirmed");
+        assert_eq!(stuck_verdict(&pidfd), StuckVerdict::Exited);
+        let _ = child.wait();
+    }
+
+    /// Static review C-44 / TD-08: an answer whose event-loop count does
+    /// not move is a stall, and three in a row a stuck agent — though the
+    /// socket answered. Moving counts, an older agent (not reported) and a
+    /// loop not entered yet (0) are answers.
+    #[test]
+    fn a_loop_that_stands_still_is_stuck_though_the_socket_answers() {
+        let at = |iterations| LoopProgress::Reported {
+            iterations,
+            since_last_ms: 31_000,
+        };
+        let mut t = StatusPingTracker::new();
+        assert_eq!(t.record_answer(at(10)), PingOutcome::Ok, "the baseline");
+        assert_eq!(t.record_answer(at(16)), PingOutcome::Ok, "it moved");
+        assert_eq!(
+            STATUS_PING_STALLED_STUCK_AFTER, 3,
+            "at least 90 s without a round"
+        );
+        for consecutive in 1..STATUS_PING_STALLED_STUCK_AFTER {
+            assert_eq!(
+                t.record_answer(at(16)),
+                PingOutcome::LoopStalled {
+                    consecutive,
+                    since_last_ms: 31_000
+                }
+            );
+        }
+        assert_eq!(
+            t.record_answer(at(16)),
+            PingOutcome::LoopStuck {
+                pings: STATUS_PING_STALLED_STUCK_AFTER,
+                since_last_ms: 31_000
+            }
+        );
+        assert!(t.answered(), "the socket did answer");
+        // a round ends the streak
+        let mut t = StatusPingTracker::new();
+        t.record_answer(at(5));
+        assert!(matches!(
+            t.record_answer(at(5)),
+            PingOutcome::LoopStalled { .. }
+        ));
+        assert_eq!(t.record_answer(at(6)), PingOutcome::Ok);
+        assert!(matches!(
+            t.record_answer(at(6)),
+            PingOutcome::LoopStalled { consecutive: 1, .. }
+        ));
+        // an older agent, and a loop not entered yet, never stall
+        let mut t = StatusPingTracker::new();
+        for _ in 0..5 {
+            assert_eq!(t.record_answer(LoopProgress::Unreported), PingOutcome::Ok);
+            assert_eq!(t.record_answer(at(0)), PingOutcome::Ok);
+        }
+        // the next agent starts without a baseline
+        let mut t = StatusPingTracker::new();
+        t.record_answer(at(9));
+        t.reset();
+        assert_eq!(t.record_answer(at(9)), PingOutcome::Ok);
+        // an answer clears the timeouts, a stall does not count as one
+        let mut t = StatusPingTracker::new();
+        t.record_answer(at(3));
+        assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
+        assert!(matches!(
+            t.record_answer(at(3)),
+            PingOutcome::LoopStalled { .. }
+        ));
+        assert_eq!(t.consecutive_timeouts(), 0);
+        assert_eq!(t.record_timeout(), PingOutcome::TimeoutOnce);
+    }
+
+    /// The ping asks for the loop progress on its connection after the
+    /// status reply and returns the agent's count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_ping_reads_the_loop_progress_after_the_status() {
+        use common::posture_types::PostureKind;
+        use common::wire::admin_protocol::{LoopProgressResponse, StatusResponse};
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("mock.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut asked = Vec::new();
+            for reply in [
+                AdminMessage::StatusResponse(StatusResponse::public(
+                    PostureKind::Observing,
+                    false,
+                    None,
+                    None,
+                    None,
+                )),
+                AdminMessage::LoopProgressResponse(LoopProgressResponse {
+                    iterations: 77,
+                    since_last_ms: 1_500,
+                }),
+            ] {
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).await.expect("read hdr");
+                let mut req = vec![0u8; u32::from_be_bytes(header) as usize];
+                stream.read_exact(&mut req).await.expect("read body");
+                asked.push(req);
+                stream
+                    .write_all(&encode_frame(&reply).unwrap())
+                    .await
+                    .expect("write reply");
+            }
+            asked
+        });
+        let got = ping_agent_status(&socket, Duration::from_secs(2), Some(std::process::id()))
+            .await
+            .expect("ping");
+        assert_eq!(
+            got,
+            LoopProgress::Reported {
+                iterations: 77,
+                since_last_ms: 1_500
+            }
+        );
+        let asked = mock.await.unwrap();
+        assert_eq!(asked[0], vec![2], "the unsigned Status first");
+        assert_eq!(
+            asked[1],
+            encode_frame(&AdminMessage::LoopProgress(LoopProgressRequest {})).unwrap()[4..]
+                .to_vec(),
+            "then the progress query"
+        );
+    }
+
+    /// The hold is bounded: retries after 10, 20, 40 minutes, then at most
+    /// once an hour, counted across the holds of one watchdog.
+    #[test]
+    fn the_hold_retries_on_a_doubling_bounded_schedule() {
+        let mut r = HoldRetry::new();
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            waits.push(r.next_wait().as_secs() / 60);
+            r.record();
+        }
+        assert_eq!(waits, [10, 20, 40, 60, 60, 60]);
+        assert_eq!(r.retries(), 6);
+        let mut r = HoldRetry::with(Duration::from_millis(5), Duration::from_millis(12));
+        assert_eq!(r.next_wait(), Duration::from_millis(5));
+        for _ in 0..40 {
+            r.record();
+        }
+        assert_eq!(r.next_wait(), Duration::from_millis(12), "no overflow");
+        let line = hold_status_line(
+            "agent restart ceiling tripped",
+            Duration::from_secs(125),
+            Duration::from_secs(475),
+        );
+        assert!(
+            line.starts_with("DEGRADED: agent restart ceiling tripped")
+                && line.contains("holding for 125 s")
+                && line.contains("next retry in 475 s"),
+            "{line}"
+        );
+    }
+
+    /// Static review C-43 / G-06: a missing `/run/northnarrow` is created
+    /// 0700 by the watchdog, as the units declare it.
+    #[test]
+    fn a_missing_run_directory_is_created_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let run = dir.path().join("run").join("northnarrow");
+        write_pidfile_atomic(&run.join("watchdog.pid"), 42).unwrap();
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, RUN_DIR_MODE, "{mode:o}");
+        assert_eq!(read_pid_from_file(&run.join("watchdog.pid")).unwrap(), 42);
     }
 }

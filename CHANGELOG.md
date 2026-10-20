@@ -108,6 +108,56 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   templates).
 
 ### Fixed
+- Wave 4, capability C23 (anti-tamper and self-defence): supervision fails
+  visibly, and both daemons are hardened (static review of `baf4c25`:
+  C-43, C-44, G-05, G-06, TD-08, TD-10; lab PR 216). **Exit statuses:**
+  when the wait on the agent's pidfd failed, the watchdog's restart loop
+  ended, `run()` returned `Ok` and the process exited 0 — which the unit's
+  `Restart=on-failure` does not restart: the agent ran on unsupervised,
+  with an `info` line as the only trace. Every failure now exits with a
+  status of its own (`ExitReason`: 10 hardening, 11 no verified agent, 12
+  pidfile, 13 respawn backend, 14 `READY=1`, 15 signal handlers, 20 the
+  pidfd wait; 0 only for a stop it was told to make) after a
+  `watchdog_exit` record the agent signs. **Unit:** `Restart=always` with
+  `RestartPreventExitStatus=0` (a death by SIGHUP was a clean stop),
+  backoff 2 s → 60 s (`RestartSteps=`, systemd 254+) and no start limit
+  (`StartLimitIntervalSec=0`): the watchdog never stays down, each failed
+  run visible through `watchdog_exit` and `watchdog_gone`. `OnFailure=`
+  covers what fails the unit itself: the new
+  `northnarrow-watchdog-failed.service`, which runs
+  `northnarrow-watchdog --record-unit-failure` and records
+  `watchdog_failed` with systemd's `MONITOR_*` result (installed,
+  packaged, protected and drop-in-checked like the other units). The agent
+  signs `watchdog_gone` when the watchdog it verified no longer runs.
+  **Stuck recovery:** a failed recovery was handled as a death — evicted
+  from `PROTECTED_PIDS`, pidfile removed, respawn — with the agent maybe
+  alive, and it re-registers its pid only at its start; the eviction even
+  came before the SIGKILL. The verdict is now the agent's own pidfd: only a
+  confirmed exit is evicted (after it), a live agent keeps its protection
+  and its pidfile and stays supervised (`stuck_recovery_failed`,
+  `DEGRADED` status), and the wait after SIGKILL is bounded (10 s).
+  **Liveness:** the STATUS ping was answered by the admin socket's task,
+  which runs beside the event loop; the ping now also reads the loop's
+  round count (new unsigned `LoopProgress` request, indices 52/53), and
+  three answers in a row without a round since the one before (90 s or
+  more) are a stuck agent (`event_loop_stalled`, then recovery). An agent older than the request
+  closes the connection and is pinged as before. **Hold:** still no
+  respawn loop, but bounded and visible — a `STATUS=` line with its
+  length and next retry, an ERROR every 10 minutes, one retry after 10,
+  20, 40 minutes and then hourly (`hold_retry`; it supersedes WDG-004's
+  "only an operator starts the agent again"), its end recorded
+  (`hold_ended`). **Hardening:** the agent is not dumpable
+  (`PR_SET_DUMPABLE` 0, `RLIMIT_CORE` 0 at its start; the watchdog
+  already was), both units set `LimitCORE=0` and an explicit
+  `TimeoutStartSec=` (agent 180 s, watchdog 60 s, above its own 30-s
+  deadline), `/run/northnarrow` is 0700 whoever creates it (install.sh
+  made it 0755; the watchdog unit and the handler declare the runtime
+  directory too, the watchdog creates a missing one 0700). Tests: exit
+  statuses and their records, a real failed pidfd wait, the recovery
+  verdict on a live and a SIGINT-ignoring process, the loop-stall tracker
+  and the two-frame ping, the hold schedule, the unit contract (with an
+  offline `systemd-analyze verify` of the three units), install.sh's
+  0700 and the handler's shipping.
 - BPF self-defence: the `bpf` command numbers and the deny hooks' fail-opens
   (capability C23, Wave 4, lab PR 215; from the static review of `baf4c25`,
   P0 C-02 / G-01 / TD-03, not in the audit tracker). The `bpf` LSM hook had

@@ -424,7 +424,28 @@ that this whole design assumes against.
 
 ### 7.3 What if the watchdog crashes?
 
-1. systemd reaps it, restarts per `Restart=on-failure RestartSec=2s`.
+> **Lab PR 216 (capability C23).** The unit now has `Restart=always` with
+> `RestartPreventExitStatus=0` (only a stop the watchdog was told to make
+> exits 0), a backoff from 2 s to 60 s and no start limit
+> (`StartLimitIntervalSec=0`, the maintainer's decision: the watchdog never
+> stays down; each failed run is visible through its `watchdog_exit` record
+> and the agent's `watchdog_gone`), and
+> `OnFailure=northnarrow-watchdog-failed.service` for what fails the unit
+> itself, which records `watchdog_failed` for the agent to sign. Every
+> failure exits with a status of its own (`ExitReason` in
+> `watchdog/src/lib.rs`, operator guide §3.9). With `Restart=on-failure`,
+> "pidfd wait failed" exited 0 and was never restarted.
+>
+> **Lab PR 216, the hold (supersedes WDG-004's "only an operator starts the
+> agent again").** After the restart ceiling or a respawn that brought no
+> agent back, the watchdog still holds — no respawn loop — but the hold is
+> bounded: it starts the agent once more after 10 minutes, then 20 and 40,
+> then at most hourly (`hold_retry`), and it stays visible (`STATUS=` with
+> its length and next retry, an ERROR every 10 minutes, `hold_ended` with
+> its length). An operator's start still ends it at once.
+
+1. systemd reaps it, restarts per `Restart=on-failure RestartSec=2s`
+   (since lab PR 216: `Restart=always`, see above).
 2. New watchdog instance starts. Its first action is
    `pidfd_open(agent_pid)` on the (still-live, still-protected)
    agent. The kernel keeps LSM protection on the agent throughout

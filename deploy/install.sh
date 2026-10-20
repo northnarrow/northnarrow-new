@@ -187,6 +187,9 @@ esac
 NN_ADMIN_BIN="$TARGET_DIR/nn-admin"
 AGENT_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-agent.service"
 WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
+# Lab PR 216: the watchdog unit's OnFailure= handler (records that systemd
+# gave up on the watchdog; not enabled, started only by OnFailure=).
+WATCHDOG_FAILED_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog-failed.service"
 # Dedicated journal-namespace config (activated by LogNamespace=northnarrow
 # in both units). Capped, isolated journald instance → no /var/log/syslog
 # amplification, hard SystemMaxUse ceiling, zero customer config.
@@ -590,6 +593,7 @@ fi
 if [[ $MODE != stop ]]; then
 require_file "$AGENT_UNIT_SRC"    "expected at $AGENT_UNIT_SRC (this script's sibling deploy/systemd/)"
 require_file "$WATCHDOG_UNIT_SRC" "expected at $WATCHDOG_UNIT_SRC"
+require_file "$WATCHDOG_FAILED_UNIT_SRC" "expected at $WATCHDOG_FAILED_UNIT_SRC (lab PR 216: the watchdog's OnFailure= handler)"
 require_file "$JOURNALD_NS_CONF_SRC" "expected at $JOURNALD_NS_CONF_SRC (NN journal-namespace cap; the LogNamespace=northnarrow journald config)"
 require_file "$FIM_PATHS_V1_SRC"  "expected at $FIM_PATHS_V1_SRC (Tappa 9 C7 default FIM watched-paths list)"
 require_file "$NETFLOW_BLOCKLIST_V1_SRC"     "expected at $NETFLOW_BLOCKLIST_V1_SRC (Tappa 10 N8 default NetFlow IP/CIDR blocklist)"
@@ -902,7 +906,8 @@ if [[ $MODE == configure ]]; then
             fi
         done
         for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
-                 /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service; do
+                 /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
+                 /etc/systemd/system/northnarrow-watchdog-failed.service; do
             [[ -e "$f" ]] && { echo "install.sh: removing $f (install.sh layout, replaced by the package)"; rm -f "$f"; }
         done
         if (( ${#was_enabled[@]} )); then
@@ -935,6 +940,7 @@ install_unit() {
 }
 install_unit "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service"
 install_unit "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service"
+install_unit "$WATCHDOG_FAILED_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog-failed.service"
 fi
 
 # Debian-family kernels carry a distro patch that makes
@@ -1253,8 +1259,10 @@ install_bait() {
 }
 # <<< install_bait
 RUN_DIR="/run/northnarrow"
-echo "install.sh: ensuring $RUN_DIR (mode 0755, root:root)"
-install -d -m 0755 -o root -g root "$RUN_DIR"
+# Lab PR 216 (static review C-43 / G-06): 0700, the units'
+# RuntimeDirectoryMode= — it was 0755 until the agent's next start.
+echo "install.sh: ensuring $RUN_DIR (mode 0700, root:root)"
+install -d -m 0700 -o root -g root "$RUN_DIR"
 declare -A HONEYPOT_BAIT_DIRS=(
     [agent.dev.lock]="$ETC_DIR"
     [kill_switch.conf]="$ETC_DIR"

@@ -65,9 +65,10 @@ LogRateLimitBurst=50000
 # systemd 255), so the check is a command: without bpffs the unit is failed
 # (Result: exit-code), listed by `systemctl --failed`, the system degraded.
 # Without bpffs the agent would run with its anti-tamper maps unpinned.
-# No OnFailure=: no handler unit ships. The watchdog holds when a queued
-# start brings no agent back, and the agent signs that record at its next
-# start.
+# No OnFailure= here: the watchdog restarts the agent, and holds when a
+# queued start brings no agent back (the agent signs that record at its
+# next start). Lab PR 216: the watchdog's own unit has one
+# (northnarrow-watchdog-failed.service).
 ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf
 # External audit ATP-014 (NN-AUD-262): an explicit search path, without
 # /usr/local. systemd's default for a service starts with
@@ -102,6 +103,18 @@ Restart=no
 # process left in the cgroup systemd refuses to start a second instance.
 TimeoutStopSec=5s
 SendSIGKILL=no
+# Lab PR 216 (static review C-43): READY=1 comes once every subsystem is
+# wired — the eBPF programs attached, the FIM baseline and the ADE loaded
+# (a cold GGUF load measured 17.8 s, docs/ADE_BACKEND_NOTES.md). Explicit,
+# not systemd's 90 s default: a start that has not signalled after 180 s is
+# failed. The task_kill hook refuses the SIGTERM that follows, so the value
+# errs long — a stranded `failed` unit with a running agent is worse than a
+# late verdict.
+TimeoutStartSec=180s
+# Lab PR 216 (static review C-43 / G-06): no core dump — the agent holds its
+# signing key. It is not dumpable either (process_hardening: PR_SET_DUMPABLE
+# 0 and RLIMIT_CORE 0 at its start).
+LimitCORE=0
 RuntimeDirectory=northnarrow
 RuntimeDirectoryMode=0700
 # /run/northnarrow is SHARED with the watchdog (watchdog.pid, the A8

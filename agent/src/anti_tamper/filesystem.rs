@@ -360,6 +360,10 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     "/usr/bin/northnarrow-watchdog",
     "/usr/lib/systemd/system/northnarrow-agent.service",
     "/usr/lib/systemd/system/northnarrow-watchdog.service",
+    // Lab PR 216: the watchdog's `OnFailure=` handler, which records that
+    // systemd gave up on the watchdog — rewritten, it would record nothing.
+    "/etc/systemd/system/northnarrow-watchdog-failed.service",
+    "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
     // External audit DEP-002: the drop-in install.sh writes on a Debian
     // host (a drop-in can replace ExecStart=, add a Condition*= that skips
     // the start, or set a weakening Environment=), and its directory —
@@ -2938,11 +2942,14 @@ mod tests {
                 "/usr/bin/northnarrow-watchdog",
                 "/usr/lib/systemd/system/northnarrow-agent.service",
                 "/usr/lib/systemd/system/northnarrow-watchdog.service",
+                "/etc/systemd/system/northnarrow-watchdog-failed.service",
+                "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
                 "/etc/systemd/system/northnarrow-agent.service.d",
                 "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
             ],
-            "the agent + watchdog binaries and their two systemd units \
-             are the anti-tamper binary/unit pin set"
+            "the agent + watchdog binaries and their systemd units (the \
+             watchdog's failure handler included) are the anti-tamper \
+             binary/unit pin set"
         );
     }
 

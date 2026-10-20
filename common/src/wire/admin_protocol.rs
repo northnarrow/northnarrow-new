@@ -857,6 +857,25 @@ pub fn decode_status_liveness(body: &[u8]) -> Result<StatusLiveness, StatusLiven
         .map_err(StatusLivenessError::Postcard)
 }
 
+/// Lab PR 216: the postcard index of [`AdminMessage::LoopProgressResponse`]
+/// (pinned by `production_discriminants_do_not_depend_on_debug_trigger`).
+pub const LOOP_PROGRESS_RESPONSE_INDEX: u32 = 53;
+
+/// Lab PR 216: the watchdog's read of a [`LoopProgressResponse`] frame
+/// body — the variant index, then the fields it knows; fields a newer agent
+/// appends are trailing bytes, ignored. Another variant is
+/// [`StatusLivenessError::NotAStatusResponse`] with its index.
+pub fn decode_loop_progress(body: &[u8]) -> Result<LoopProgressResponse, StatusLivenessError> {
+    let (index, rest) =
+        postcard::take_from_bytes::<u32>(body).map_err(StatusLivenessError::Postcard)?;
+    if index != LOOP_PROGRESS_RESPONSE_INDEX {
+        return Err(StatusLivenessError::NotAStatusResponse { index });
+    }
+    postcard::take_from_bytes::<LoopProgressResponse>(rest)
+        .map(|(progress, _)| progress)
+        .map_err(StatusLivenessError::Postcard)
+}
+
 /// Debug-only escape hatch: forces the agent's posture state machine
 /// into the named state. Used by the integration test harness; never
 /// available in production builds. Gated by the `debug-trigger`
@@ -1036,6 +1055,28 @@ pub struct TelemetryStatusResponse {
     pub status: Option<StatusResponse>,
 }
 
+/// Lab PR 216 (capability C23): the watchdog's event-loop progress query.
+/// Unsigned, read-only, sent on the connection of its STATUS ping right
+/// after the status reply. The STATUS reply proves only that the admin
+/// socket's task answers; it runs beside the agent's event loop on the
+/// multi-thread runtime, so a loop that stands still behind a blocked
+/// `process_event` answered every ping. Empty, like [`StatusRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LoopProgressRequest {}
+
+/// Reply to [`LoopProgressRequest`]: how many times the agent's event loop
+/// has gone round since the agent started (0 until it is entered: the agent
+/// is still starting), and how long ago (milliseconds) the last round
+/// began — since the agent started while `iterations` is 0. The loop goes
+/// round at least every 5 s on an idle host (its telemetry-task check), so
+/// a counter that does not move over three pings 30 s apart is a loop
+/// that stands still. Fields are only appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LoopProgressResponse {
+    pub iterations: u64,
+    pub since_last_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminMessage {
     // ── client → server ────────────────────────────────────────
@@ -1192,6 +1233,14 @@ pub enum AdminMessage {
     TelemetryStatusRequest(TelemetryStatusRequest),
     /// Reply to [`AdminMessage::TelemetryStatusRequest`].
     TelemetryStatusResponse(TelemetryStatusResponse),
+    /// Lab PR 216 — unsigned event-loop progress query (the watchdog's,
+    /// after its STATUS ping). Triggers
+    /// [`AdminMessage::LoopProgressResponse`]. An agent older than the
+    /// variant cannot decode it and closes the connection; the watchdog
+    /// then relies on the STATUS answer alone, as before.
+    LoopProgress(LoopProgressRequest),
+    /// Reply to [`AdminMessage::LoopProgress`].
+    LoopProgressResponse(LoopProgressResponse),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -1502,7 +1551,20 @@ mod tests {
             result: AdminResult::RoleDenied,
             status: None,
         });
-        assert_eq!(first(&telemetry), 51, "the last production variant");
+        assert_eq!(first(&telemetry), 51, "TelemetryStatusResponse");
+        // Lab PR 216: the watchdog's event-loop progress query, appended.
+        assert_eq!(
+            first(&AdminMessage::LoopProgress(LoopProgressRequest {})),
+            52,
+            "LoopProgress"
+        );
+        assert_eq!(
+            first(&AdminMessage::LoopProgressResponse(
+                LoopProgressResponse::default()
+            )) as u32,
+            LOOP_PROGRESS_RESPONSE_INDEX,
+            "the last production variant, the watchdog's progress decode"
+        );
         assert_eq!(
             first(&AdminMessage::StatusResponse(StatusResponse::public(
                 PostureKind::Observing,
@@ -1518,9 +1580,9 @@ mod tests {
         {
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                52
+                54
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 53);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 55);
         }
     }
 
@@ -1779,7 +1841,9 @@ mod tests {
                 | AdminMessage::ResponseRestoreRequest(_)
                 | AdminMessage::ResponseRestoreResponse(_)
                 | AdminMessage::TelemetryStatusRequest(_)
-                | AdminMessage::TelemetryStatusResponse(_) => {}
+                | AdminMessage::TelemetryStatusResponse(_)
+                | AdminMessage::LoopProgress(_)
+                | AdminMessage::LoopProgressResponse(_) => {}
             }
         }
     }
@@ -2183,6 +2247,43 @@ mod tests {
         ));
         // a posture index no build has
         assert!(decode_status_liveness(&[STATUS_RESPONSE_INDEX as u8, 9, 0]).is_err());
+    }
+
+    /// Lab PR 216: the watchdog reads the loop progress reply by its index
+    /// and the fields it knows; a newer agent's appended fields are
+    /// ignored, any other reply is refused.
+    #[test]
+    fn the_watchdog_reads_the_loop_progress() {
+        let reply = encode_frame(&AdminMessage::LoopProgressResponse(LoopProgressResponse {
+            iterations: 300,
+            since_last_ms: 1_250,
+        }))
+        .unwrap();
+        let got = decode_loop_progress(&reply[4..]).expect("a progress reply");
+        assert_eq!(got.iterations, 300);
+        assert_eq!(got.since_last_ms, 1_250);
+        let mut newer = reply[4..].to_vec();
+        newer.extend([1, 9]);
+        assert_eq!(decode_loop_progress(&newer).unwrap(), got);
+        let status = encode_frame(&AdminMessage::StatusResponse(StatusResponse::public(
+            PostureKind::Observing,
+            false,
+            None,
+            None,
+            None,
+        )))
+        .unwrap();
+        assert!(matches!(
+            decode_loop_progress(&status[4..]),
+            Err(StatusLivenessError::NotAStatusResponse { index }) if index == STATUS_RESPONSE_INDEX
+        ));
+        assert!(decode_loop_progress(&[]).is_err());
+        assert!(decode_loop_progress(&[LOOP_PROGRESS_RESPONSE_INDEX as u8, 1]).is_err());
+        roundtrip(AdminMessage::LoopProgress(LoopProgressRequest {}));
+        roundtrip(AdminMessage::LoopProgressResponse(LoopProgressResponse {
+            iterations: u64::MAX,
+            since_last_ms: 0,
+        }));
     }
 
     /// External audit ASK-009 (lab PR 213): the unsigned reply withholds

@@ -158,3 +158,35 @@ only in the table below, in the same PR as the evidence.
     selftest fails 8 of its checks on the starting tree's probe. With 31
     put back, the header, BTF, names and observed-set tests fail.
   - Lab: On Ubuntu 24.04 before this lot, a handle by id on one of the agent's links was neither denied nor recorded (C63) and the enumeration from its link ids was recorded as an attack (C64); after it, on 24.04, Debian 12, 22.04 (5.15 verifier) and Debian 13 the deny hooks attach (deny_attached = expected), C63 is recorded as NN-L-BPF-002 (observe mode), a walk of 46 links from 0 enumerates them all with no record, the deny fail-open counter stays 0 over the whole run and an injected fail-open gives the WARN, the signed `deny_fail_open` row and the status line. C64's case still deviates: the agent's own-id map held one link id (49) that no live link has on a clean boot — a stale entry, a recorded follow-up. Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.
+- **C23 — fail-visible supervision and process hardening** (static review
+  of `baf4c25`: C-43, C-44, G-05, G-06, TD-08, TD-10; Order item 1, the
+  watchdog exit status).
+  - Watchdog: every failure exits non-zero with a status of its own
+    (`ExitReason`, 10–20; the failed pidfd wait was a clean 0 that
+    `Restart=on-failure` never restarted) and leaves a `watchdog_exit`
+    record. Unit: `Restart=always`, `RestartPreventExitStatus=0`, backoff
+    2 s → 60 s, no start limit (never stays down; each failed run
+    recorded), `OnFailure=` for a unit-level failure: the new
+    `northnarrow-watchdog-failed.service` (`watchdog_failed`, with
+    systemd's result). The agent signs `watchdog_gone`.
+  - Stuck recovery evicts from `PROTECTED_PIDS` only after the pidfd
+    confirms the exit; a live agent stays protected and supervised
+    (`stuck_recovery_failed`). The SIGKILL wait is bounded (10 s).
+  - Liveness: the ping reads the event loop's round count (unsigned
+    `LoopProgress`); a count that stands still over three pings in a row
+    (90 s or more) is a stuck agent (`event_loop_stalled`), even with the
+    admin socket answering.
+  - Hold: bounded retries (10, 20, 40 min, then hourly; they supersede
+    WDG-004's operator-only restart), a `STATUS=` line with its length, an
+    ERROR every 10 min, `hold_retry` / `hold_ended`.
+  - Hardening: the agent is not dumpable (`PR_SET_DUMPABLE` 0,
+    `RLIMIT_CORE` 0), `LimitCORE=0` and `TimeoutStartSec=` in both units,
+    `/run/northnarrow` 0700 from install.sh, the watchdog and every unit.
+  - Evidence so far: unit tests (exit statuses, a real failed pidfd wait,
+    the recovery verdict on live processes, the stall tracker, the
+    two-frame ping, the hold schedule), the unit contract with an offline
+    `systemd-analyze verify`, install.sh's 0700. The guest checks (the
+    pidfd wait made to fail, the watchdog failing repeatedly, a
+    stalled loop, a refused recovery) are owed; the level stays 2 until
+    they pass on the supported kernels.
+  - Lab: On Ubuntu 24.04 (and the unit checks on Debian 12, 22.04, Debian 13): a forced pidfd-wait failure exits the watchdog with status 20 after a signed `watchdog_exit`, systemd restarts it (NRestarts 0 → 1) and the agent keeps its pid; twelve failures in a row never leave it `failed` (`StartLimitIntervalUSec=0`), the OnFailure handler signs `watchdog_failed`; a stalled event loop (debug trigger) is caught after 3 pings and signed `event_loop_stalled`; a refused recovery keeps the agent's pid and pidfile and signs `stuck_recovery_failed`; the bounded hold retries and signs `hold_retry`; SIGKILL restarts with a new pid, SIGTERM stops cleanly, SIGHUP is ignored. No core of either daemon: `Max core file size 0` and no "could not forbid core dumps" line (the SIGSEGV the probe sends through systemd is refused by the agent's own signal protection, so no crash happened to test). Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.

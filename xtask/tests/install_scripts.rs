@@ -773,3 +773,77 @@ fn filetime_back(p: &Path) -> i64 {
     assert!(ok);
     back
 }
+
+// ── Lab PR 216 (capability C23): /run/northnarrow and the failure handler ──
+
+/// Static review C-43 / G-06: install.sh created `/run/northnarrow` 0755
+/// while the units declare `RuntimeDirectoryMode=0700`; the agent's next
+/// start corrected it, every run of install.sh opened it again. The section
+/// runs against a stub `install` that records its arguments.
+#[test]
+fn install_creates_the_run_directory_0700() {
+    let dir = case_dir("run-dir-mode");
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_exec(&bin.join("install"), r#"echo "$*" >> "$NN_TEST_LOG""#);
+    let log = dir.join("install.log");
+    let body = section(
+        "deploy/install.sh",
+        "RUN_DIR=\"/run/northnarrow\"",
+        "declare -A HONEYPOT_BAIT_DIRS",
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(&body)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("NN_TEST_LOG", &log)
+        .output()
+        .expect("bash runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.trim(), "-d -m 0700 -o root -g root /run/northnarrow");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("mode 0700"));
+}
+
+/// The watchdog unit's `OnFailure=` handler ships wherever the units do:
+/// install.sh requires and installs it (rewritten for `BIN_DIR` like the
+/// others) and removes the install.sh copy when a package takes over,
+/// uninstall.sh removes it, the packages carry it, and the tarball's
+/// `deploy/systemd` copy includes it.
+#[test]
+fn the_watchdog_failure_handler_ships_with_the_units() {
+    const UNIT: &str = "northnarrow-watchdog-failed.service";
+    assert!(repo_root().join("deploy/systemd").join(UNIT).is_file());
+    let install = read("deploy/install.sh");
+    assert!(install.contains(&format!(
+        "WATCHDOG_FAILED_UNIT_SRC=\"$REPO_ROOT/deploy/systemd/{UNIT}\""
+    )));
+    assert!(install.contains("require_file \"$WATCHDOG_FAILED_UNIT_SRC\""));
+    assert!(install.contains(&format!(
+        "install_unit \"$WATCHDOG_FAILED_UNIT_SRC\" \"$UNIT_DIR/{UNIT}\""
+    )));
+    assert!(
+        install.contains(&format!("/etc/systemd/system/{UNIT}")),
+        "package migration"
+    );
+    let uninstall = read("deploy/uninstall.sh");
+    assert!(
+        uninstall.contains(
+            "for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do"
+        ),
+        "uninstall.sh removes the handler unit"
+    );
+    let packages = read("deploy/release/mk-packages.sh");
+    assert!(packages.contains(
+        "for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do"
+    ));
+    assert!(
+        packages.contains(&format!("/usr/lib/systemd/system/{UNIT}\n")),
+        "rpm %files"
+    );
+    assert!(read("deploy/release/mk-tarball.sh").contains("deploy/systemd"));
+}

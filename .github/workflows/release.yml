@@ -181,11 +181,14 @@ jobs:
           dpkg-deb -f "$deb" Pre-Depends | grep -qw nftables
           tmp=$(mktemp -d) && dpkg-deb -x "$deb" "$tmp" && dpkg-deb -e "$deb" "$tmp/DEBIAN"
           for f in usr/bin/northnarrow-agent usr/bin/northnarrow-watchdog usr/bin/nn-admin \
-                   usr/lib/systemd/system/northnarrow-agent.service usr/share/northnarrow/deploy/install.sh; do
+                   usr/lib/systemd/system/northnarrow-agent.service \
+                   usr/lib/systemd/system/northnarrow-watchdog-failed.service \
+                   usr/share/northnarrow/deploy/install.sh; do
             test -e "$tmp/$f" || { echo "missing in the .deb: $f"; exit 1; }
           done
           grep -q '^ExecStart=/usr/bin/northnarrow-agent' "$tmp/usr/lib/systemd/system/northnarrow-agent.service"
           grep -q -- '--agent-bin /usr/bin/northnarrow-agent' "$tmp/usr/lib/systemd/system/northnarrow-watchdog.service"
+          grep -q '^ExecStart=/usr/bin/northnarrow-watchdog --record-unit-failure' "$tmp/usr/lib/systemd/system/northnarrow-watchdog-failed.service"
           # the pre-unpack and post-removal hooks carry their own scripts
           grep -q -- '--package-stop' "$tmp/DEBIAN/preinst"
           grep -q -- 'PACKAGE=0' "$tmp/DEBIAN/postrm"

@@ -52,8 +52,14 @@ use crate::audit::{AuditEntryDraft, AuditLog};
 pub const BASE_SECS: u64 = 30;
 pub const AUDIT_OP: &str = "integrity_drift";
 
-/// Units whose drop-ins are checked.
-pub const UNITS: [&str; 2] = ["northnarrow-agent.service", "northnarrow-watchdog.service"];
+/// Units whose drop-ins, copies and masks are checked. Lab PR 216: the
+/// watchdog's `OnFailure=` handler too — masked or overridden, systemd's
+/// giving up on the watchdog would leave no record.
+pub const UNITS: [&str; 3] = [
+    "northnarrow-agent.service",
+    "northnarrow-watchdog.service",
+    "northnarrow-watchdog-failed.service",
+];
 
 /// systemd's system unit load path, highest precedence first
 /// (`systemd.unit(5)`, "Unit File Load Path"). A unit file in an earlier
@@ -369,6 +375,8 @@ const MOUNT_WATCHED: &[&str] = &[
     "/etc/systemd/system/northnarrow-watchdog.service",
     "/usr/lib/systemd/system/northnarrow-agent.service",
     "/usr/lib/systemd/system/northnarrow-watchdog.service",
+    "/etc/systemd/system/northnarrow-watchdog-failed.service",
+    "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
 ];
 
 /// One line of a `mountinfo` text.
@@ -857,6 +865,31 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
                             "respawn_argv_degraded",
                             "the watchdog could not capture the agent's argv for its respawns",
                         ),
+                        // Lab PR 216: the supervisor's own failures.
+                        wh::REASON_WATCHDOG_EXIT => (
+                            "watchdog_exit",
+                            "the watchdog exited on an error (systemd restarts it)",
+                        ),
+                        wh::REASON_WATCHDOG_FAILED => (
+                            "watchdog_failed",
+                            "systemd put the watchdog unit in the failed state and stopped \
+                             restarting it",
+                        ),
+                        wh::REASON_STUCK_RECOVERY_FAILED => (
+                            "stuck_recovery_failed",
+                            "the watchdog could not stop an unresponsive agent; it kept it \
+                             protected and supervised",
+                        ),
+                        wh::REASON_EVENT_LOOP_STALLED => (
+                            "event_loop_stalled",
+                            "the watchdog found the agent's event loop standing still while its \
+                             admin socket answered",
+                        ),
+                        wh::REASON_HOLD_RETRY => (
+                            "watchdog_hold",
+                            "the holding watchdog tried to start the agent again",
+                        ),
+                        wh::REASON_HOLD_ENDED => ("watchdog_hold", "the watchdog's hold ended"),
                         _ => ("watchdog_hold", "the watchdog stopped respawning the agent"),
                     };
                     let mut d = format!(
@@ -885,6 +918,27 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
             Finding { kind, detail }
         })
         .collect()
+}
+
+/// Lab PR 216 (static review TD-10): the watchdog the agent had verified
+/// (`prev`) no longer runs — reported as a signed `integrity_drift`
+/// (`watchdog_gone`, [`report_event`]) instead of the `info` line that was
+/// all the agent left. A crash, a kill or a stop: the watchdog's own record
+/// (`watchdog_exit`, or systemd's `watchdog_failed`) says why, when one
+/// could be written. `now` is what the agent's refresh finds in its place.
+pub fn watchdog_gone(prev: u32, now: &crate::posture::exempt::WatchdogResolution) -> Finding {
+    use crate::posture::exempt::WatchdogResolution as R;
+    let now = match now {
+        R::Verified { pid, .. } => format!("a new watchdog (pid {pid}) is verified"),
+        R::NotPresent => "no watchdog runs now (its pidfile is absent)".to_string(),
+        R::InvalidPidfile { .. } | R::Unverifiable { .. } | R::ExeMismatch { .. } => {
+            "no watchdog is verified now (its pidfile names no running watchdog)".to_string()
+        }
+    };
+    Finding {
+        kind: "watchdog_gone",
+        detail: format!("the verified watchdog (pid {prev}) no longer runs; {now}"),
+    }
 }
 
 /// The last `key=value` of a unit's `[Service]` section, comments skipped.
@@ -1663,6 +1717,36 @@ mod tests {
 
     /// External audit DEP-004: a hold the watchdog recorded becomes a
     /// finding, with the unit state that tells a failed or skipped start.
+    /// Lab PR 216: a vanished watchdog is a finding of its own kind, with
+    /// what replaced it.
+    #[test]
+    fn a_watchdog_gone_is_a_finding() {
+        use crate::posture::exempt::WatchdogResolution as R;
+        let f = watchdog_gone(
+            4242,
+            &R::Verified {
+                pid: 4343,
+                start_ticks: 1,
+            },
+        );
+        assert_eq!(f.kind, "watchdog_gone");
+        assert!(
+            f.detail.contains("pid 4242") && f.detail.contains("pid 4343"),
+            "{}",
+            f.detail
+        );
+        let f = watchdog_gone(4242, &R::NotPresent);
+        assert!(f.detail.contains("absent"), "{}", f.detail);
+        let f = watchdog_gone(
+            4242,
+            &R::Unverifiable {
+                pid: 1,
+                reason: String::new(),
+            },
+        );
+        assert!(f.detail.contains("no watchdog is verified"), "{}", f.detail);
+    }
+
     #[test]
     fn watchdog_holds_become_findings() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1755,6 +1839,51 @@ mod tests {
             !f[1].detail.contains("stopped respawning"),
             "{}",
             f[1].detail
+        );
+    }
+
+    /// Lab PR 216: the supervisor's own failures are signed under their own
+    /// kind; a hold's retries and its end stay `watchdog_hold`.
+    #[test]
+    fn the_supervisors_failures_are_their_own_kind() {
+        use common::watchdog_hold as wh;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("watchdog.hold");
+        let ev = |reason: &str| wh::HoldRecord {
+            at: 1_800_000_000,
+            agent_pid: 77,
+            reason: reason.to_string(),
+            detail: format!("detail of {reason}"),
+            unit_state: None,
+        };
+        let reasons = [
+            (wh::REASON_WATCHDOG_EXIT, "watchdog_exit"),
+            (wh::REASON_WATCHDOG_FAILED, "watchdog_failed"),
+            (wh::REASON_STUCK_RECOVERY_FAILED, "stuck_recovery_failed"),
+            (wh::REASON_EVENT_LOOP_STALLED, "event_loop_stalled"),
+            (wh::REASON_HOLD_RETRY, "watchdog_hold"),
+            (wh::REASON_HOLD_ENDED, "watchdog_hold"),
+        ];
+        let body = reasons
+            .iter()
+            .map(|(r, _)| serde_json::to_string(&ev(r)).unwrap() + "\n")
+            .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+        let f = watchdog_holds(&path);
+        assert_eq!(f.len(), reasons.len());
+        for (finding, (reason, kind)) in f.iter().zip(reasons) {
+            assert_eq!(finding.kind, kind, "{reason}");
+            assert!(
+                finding.detail.contains(&format!("detail of {reason}"))
+                    && finding.detail.contains("last agent pid 77"),
+                "{}",
+                finding.detail
+            );
+        }
+        assert!(
+            f[4].detail.contains("tried to start the agent again"),
+            "{}",
+            f[4].detail
         );
     }
 

@@ -1686,6 +1686,7 @@ at_tty sudo ./deploy/uninstall.sh --purge --yes --grant-key "$key" 2>&1 | grep -
 fail=0
 for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
          /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
+         /etc/systemd/system/northnarrow-watchdog-failed.service \
          /etc/systemd/journald@northnarrow.conf /etc/northnarrow /var/lib/northnarrow /run/northnarrow /sys/fs/bpf/northnarrow \
          /root/northnarrow-admin.key; do
     if sudo test -e "$f"; then echo "FAIL: $f still present"; fail=1; fi

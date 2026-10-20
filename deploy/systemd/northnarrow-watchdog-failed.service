@@ -1,0 +1,37 @@
+[Unit]
+Description=NorthNarrow XDR watchdog failure record
+Documentation=https://github.com/northnarrow/northnarrow-new/blob/main/docs/operator/INSTALL_UPGRADE_UNINSTALL.md
+# Lab PR 216 (capability C23): the OnFailure= handler of
+# northnarrow-watchdog.service. systemd starts it when the watchdog unit
+# enters the failed state. A death of the watchdog process is restarted
+# (Restart=always, no start limit), so this is what fails the unit itself —
+# a start or stop job systemd fails — and leaves the agent without a
+# supervisor until the unit is started again. It appends one
+# `watchdog_failed` record to
+# /run/northnarrow/watchdog.hold, with systemd's MONITOR_SERVICE_RESULT,
+# MONITOR_EXIT_CODE and MONITOR_EXIT_STATUS, and logs an ERROR on
+# `watchdog.tamper`; the running agent signs the record at its next
+# self-integrity round (every 30 s ±20 %) as an `integrity_drift`
+# (`watchdog_failed`). Not enabled and without [Install]: only OnFailure=
+# starts it. Each failed run that systemd restarts is recorded by the
+# watchdog itself (`watchdog_exit`) and by the agent (`watchdog_gone`).
+
+[Service]
+Type=oneshot
+LogNamespace=northnarrow
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/northnarrow-watchdog --record-unit-failure \
+    --agent-pidfile /run/northnarrow/agent.pid
+TimeoutStartSec=30s
+LimitCORE=0
+# A file append under /run/northnarrow, nothing else: no capability (root
+# owns the 0700 directory), no network, a read-only system.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateNetwork=true
+RuntimeDirectory=northnarrow
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/northnarrow
+CapabilityBoundingSet=

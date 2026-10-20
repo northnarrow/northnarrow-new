@@ -704,7 +704,9 @@ The W7 install skeleton (`deploy/install.sh`) ships:
   `Restart=no` so the watchdog owns respawn (design §2.3 — avoids
   the systemd-vs-watchdog double-restart race)
 - `/etc/systemd/system/northnarrow-watchdog.service` — `Type=notify`,
-  `Restart=on-failure RestartSec=2s`,
+  `Restart=on-failure RestartSec=2s` (since lab PR 216 `Restart=always`
+  with `RestartPreventExitStatus=0`, no start limit and
+  `OnFailure=northnarrow-watchdog-failed.service`),
   `After=northnarrow-agent.service`, `BindsTo=northnarrow-agent.service`,
   resource ceilings (`MemoryMax=64M`, `CPUQuota=10%`, `TasksMax=8`),
   hardening (`NoNewPrivileges`, `ProtectSystem=strict`,
@@ -835,7 +837,7 @@ OLD_WPID=$(sudo cat /run/northnarrow/watchdog.pid)
 sudo kill -9 "$OLD_WPID"             # → Operation not permitted
 sudo nn-admin trusted-installer-grant --key <trusted-installer key> --window-secs 120
 sudo systemctl kill --kill-who=main -s SIGKILL northnarrow-watchdog.service
-sleep 4                              # Restart=on-failure, RestartSec=2s
+sleep 4                              # Restart=always, RestartSec=2s (lab PR 216)
 NEW_WPID=$(sudo cat /run/northnarrow/watchdog.pid)
 [[ $NEW_WPID != $OLD_WPID ]] && echo "OK: watchdog restarted by systemd"
 

@@ -1999,6 +1999,12 @@ fn dispatch(
             dispatch_telemetry_status(req, auth, posture, isolator, response_state, fps_out),
         ),
 
+        // Lab PR 216: unsigned, the event loop's round count — the
+        // watchdog's check that the loop moves, not only this socket.
+        AdminMessage::LoopProgress(_) => {
+            AdminMessage::LoopProgressResponse(crate::loop_progress::snapshot())
+        }
+
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
             req,
             auth,
@@ -2128,7 +2134,8 @@ fn dispatch(
         | AdminMessage::ResponseStatusResponse(_)
         | AdminMessage::ResponseReleaseResponse(_)
         | AdminMessage::ResponseRestoreResponse(_)
-        | AdminMessage::TelemetryStatusResponse(_) => {
+        | AdminMessage::TelemetryStatusResponse(_)
+        | AdminMessage::LoopProgressResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }

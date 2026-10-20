@@ -99,6 +99,10 @@ pub const OWN_SYSTEMD_UNITS: &[&str] = &[
     "/usr/lib/systemd/system/northnarrow-watchdog.service",
     "/lib/systemd/system/northnarrow-agent.service",
     "/lib/systemd/system/northnarrow-watchdog.service",
+    // Lab PR 216: the watchdog's `OnFailure=` handler.
+    "/etc/systemd/system/northnarrow-watchdog-failed.service",
+    "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
+    "/lib/systemd/system/northnarrow-watchdog-failed.service",
 ];
 
 /// Userland state of the trusted-installer override. Shared via `Arc`

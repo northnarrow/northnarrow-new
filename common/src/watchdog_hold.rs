@@ -13,8 +13,11 @@
 //!
 //! The same file carries the supervision events the watchdog sees and
 //! cannot sign either, each with its own `reason`
-//! ([`REASON_ADMIN_SOCKET_VANISHED`], [`REASON_RESPAWN_ARGV_DEGRADED`]); the
-//! agent signs them under their own kind.
+//! ([`REASON_ADMIN_SOCKET_VANISHED`], [`REASON_RESPAWN_ARGV_DEGRADED`],
+//! and since lab PR 216 [`REASON_WATCHDOG_EXIT`], [`REASON_WATCHDOG_FAILED`],
+//! [`REASON_STUCK_RECOVERY_FAILED`], [`REASON_EVENT_LOOP_STALLED`],
+//! [`REASON_HOLD_RETRY`], [`REASON_HOLD_ENDED`]); the agent signs them under
+//! their own kind.
 
 use alloc::string::String;
 
@@ -33,6 +36,39 @@ pub const REASON_ADMIN_SOCKET_VANISHED: &str = "admin_socket_vanished";
 /// the agent's argv from /proc; respawns use a recorded or the minimal
 /// argv.
 pub const REASON_RESPAWN_ARGV_DEGRADED: &str = "respawn_argv_degraded";
+
+/// Lab PR 216 (capability C23): the watchdog exited on an error, with its
+/// exit status (`northnarrow-watchdog`'s exit statuses are listed in the
+/// watchdog crate, `ExitReason`). Written by the watchdog itself just
+/// before it exits; systemd restarts it (`Restart=always`).
+pub const REASON_WATCHDOG_EXIT: &str = "watchdog_exit";
+
+/// Lab PR 216: `northnarrow-watchdog.service` entered systemd's failed
+/// state (a start or stop job of its own failed; a death of the process is
+/// restarted, the unit has no start limit) and stays down until it is
+/// started again. Written
+/// by the unit's `OnFailure=` handler (`northnarrow-watchdog-failed.service`,
+/// `northnarrow-watchdog --record-unit-failure`).
+pub const REASON_WATCHDOG_FAILED: &str = "watchdog_failed";
+
+/// Lab PR 216: the agent did not answer (or its event loop stood still) and
+/// the stuck recovery could not confirm that it exited. The watchdog kept
+/// its protection and its pidfile and goes on supervising it; before, it
+/// was treated as dead and lost its `PROTECTED_PIDS` entry while it ran.
+pub const REASON_STUCK_RECOVERY_FAILED: &str = "stuck_recovery_failed";
+
+/// Lab PR 216: the agent answered its STATUS pings, but its event loop made
+/// no progress between them (the admin socket runs on other tasks). Stuck
+/// recovery follows; the agent signs the record once it runs again.
+pub const REASON_EVENT_LOOP_STALLED: &str = "event_loop_stalled";
+
+/// Lab PR 216: a hold made one of its bounded retries (a respawn after
+/// waiting, at intervals that double up to an hour).
+pub const REASON_HOLD_RETRY: &str = "hold_retry";
+
+/// Lab PR 216: a hold ended — an agent runs again — after the time the
+/// detail gives.
+pub const REASON_HOLD_ENDED: &str = "hold_ended";
 
 /// One hold (or supervision event), as the watchdog records it at
 /// [`HOLD_PATH`].
