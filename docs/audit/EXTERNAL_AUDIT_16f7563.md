@@ -574,19 +574,19 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-360 | WDG-010 | Low | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-361 | WDG-012 | Low | Watchdog tooling | S | partly fixed (lab PR 105); open |
 | NN-AUD-362 | WDG-013 | Low | Watchdog tooling | — | already fixed (lab PR 160) |
-| NN-AUD-363 | WDG-014 | Low | Watchdog tooling | S | open |
+| NN-AUD-363 | WDG-014 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-364 | WDG-015 | Low | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-365 | WDG-016 | Low | Watchdog tooling | S | open |
 | NN-AUD-366 | WDG-017 | Low | Watchdog tooling | S | open |
 | NN-AUD-367 | WDG-018 | Low | Watchdog tooling | S | open |
 | NN-AUD-368 | WDG-R02 | Low | Watchdog tooling | S | open |
 | NN-AUD-369 | WDG-R03 | Low | Watchdog tooling | S | open |
-| NN-AUD-370 | WDG-R04 | Low | Watchdog tooling | S | open |
-| NN-AUD-371 | WDG-R05 | Low | Watchdog tooling | S | open |
-| NN-AUD-372 | WDG-R06 | Low | Watchdog tooling | S | open |
-| NN-AUD-373 | WDG-R07 | Low | Watchdog tooling | S | open |
-| NN-AUD-374 | WDG-R08 | Low | Watchdog tooling | S | open |
-| NN-AUD-375 | WDG-R09 | Low | Watchdog tooling | S | open |
+| NN-AUD-370 | WDG-R04 | Low | Watchdog tooling | S | fixed (lab PR 200) |
+| NN-AUD-371 | WDG-R05 | Low | Watchdog tooling | S | fixed (lab PR 200) |
+| NN-AUD-372 | WDG-R06 | Low | Watchdog tooling | S | fixed (lab PR 200) |
+| NN-AUD-373 | WDG-R07 | Low | Watchdog tooling | S | fixed (lab PR 200) |
+| NN-AUD-374 | WDG-R08 | Low | Watchdog tooling | S | fixed (lab PR 200) |
+| NN-AUD-375 | WDG-R09 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-376 | WDG-R10 | Low | Watchdog tooling | S | open |
 | NN-AUD-377 | WDG-R11 | Low | Watchdog tooling | S | open |
 | NN-AUD-378 | WDG-R12 | Low | Watchdog tooling | S | open |
@@ -613,12 +613,12 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-399 | SUP-014 | Low | Supply chain | M | open |
 | NN-AUD-400 | SUP-015 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-401 | SUP-016 | Low | Supply chain | S | fixed (lab PR 171) |
-| NN-AUD-402 | SUP-018 | Low | Supply chain | M | open (10 targets now, none seeded) |
+| NN-AUD-402 | SUP-018 | Low | Supply chain | M | fixed (lab PR 200) |
 | NN-AUD-403 | SUP-019 | Low | Supply chain | S (docs) | open (narrowed: the model is not redistributed) |
 | NN-AUD-404 | SUP-020 | Low | Supply chain | S-M (docs) | open |
 | NN-AUD-405 | SUP-021 | Low | Supply chain | S | open |
 | NN-AUD-406 | SUP-022 | Low | Supply chain | S | fixed (lab PR 171) |
-| NN-AUD-407 | SUP-023 | Low | Supply chain | S | open |
+| NN-AUD-407 | SUP-023 | Low | Supply chain | S | fixed (lab PR 200) |
 | NN-AUD-408 | SUP-024 | Low | Supply chain | M | partly fixed (lab PR 150; two-person review declined for now); open |
 | NN-AUD-409 | LAB-019 | Low | Lab scripts | S | open |
 | NN-AUD-410 | LAB-020 | Low | Lab scripts | S | partly fixed (lab PRs 153, 156); open |
@@ -8641,3 +8641,170 @@ group, the ones an unprivileged user or a local attacker could use first.
     `filename_truncated`, added to `Event::ProcessSpawn` by lot
     `nn-wt-kernfid`): not this batch, to fix with that lot.
   - Lab: No lab or model run: the real-corpus golden suite 28/30 before and after (the triage's 1-in-3 coverage threshold gave 27/30; 1 in 4 kept 28/30, the same two misses as before), the latency bench p50 95–99 → 102–106 µs (budget 50 ms), the ids returned for 60 queries unchanged but for two repeated-word queries reordered below their expected first hit. Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.
+- **Wave 3 — fuzz targets and fuzz/proof gates, lab PR 200.** NN-AUD-371
+  (WDG-R05), NN-AUD-372 (WDG-R06), NN-AUD-370 (WDG-R04), NN-AUD-373
+  (WDG-R07), NN-AUD-374 (WDG-R08), NN-AUD-363 (WDG-014), NN-AUD-375
+  (WDG-R09), all Low: batch 3 of the Wave 3 triage of the watchdog/deploy
+  group; with NN-AUD-402 (SUP-018) and NN-AUD-407 (SUP-023), Low, batch 5
+  of the supply/lab/tests group; on the integration tree (`main` with lots
+  up to 193, plus lots 194–199). Files: `fuzz/fuzz_targets/*` (13 targets,
+  `ade_verdict`, `ade_preparse` and `shutdown_marker` new, a shared
+  `scratch.rs`), `fuzz/Cargo.toml`, `fuzz/Cargo.lock` (three direct
+  dependencies already locked: `serde_json`, `tempfile`, `libc`; no
+  version changes), `fuzz/README.md`, new `fuzz/seeds/` and
+  `fuzz/regressions/`, `agent/src/fuzz_api.rs`, `install_manifest.rs`,
+  `ade/parser.rs`, `net/tls_parser.rs`, `anti_tamper/{combat_allow,btf_revalidate}.rs`,
+  new `common/src/dns_qname.rs` (out of `model.rs`), `common/src/lib.rs`,
+  `common/src/wire/admin_signed_payload.rs` (a test),
+  `.github/workflows/{ci,kani}.yml`, `xtask/tests/supply_chain.rs`, the
+  upgrade notes (§1).
+  - WDG-R05 (371, fixed). Re-checked: the target passed `/proc/self/exe`
+    as the running agent, never `<bin_dir>/northnarrow-agent`, so every
+    input ended `NotApplicable` before the hash loop. Now
+    `fuzz_api::install_manifest_check_in_dir(json, dir, sha)`: the text
+    goes through `parse_manifest` (split out of `check`, same reasons),
+    `bin_dir` is forced to a fixture directory holding the three binaries
+    (`INSTALL_MANIFEST_FIXTURE`, written once per process), nothing is
+    written per input. The target checks the outcome against its own
+    oracle: never `NoManifest`/`NotApplicable`; `Verified` exactly when
+    every name is recorded and its hash is the fixture's; each other
+    entry reported once. Agent fix the harness asked for: `check_with`
+    hashed `bin_dir.join(name)` for any key of `files`, and a join with an
+    absolute name drops `bin_dir` (`/dev/zero` hung the boot check,
+    `../x` or `./northnarrow-agent` reached any file and, its hash
+    recorded, verified). Only `RECORDED_NAMES` (the four `install.sh`
+    writes) are compared; any other is a `Mismatch` with
+    `actual = UNKNOWN_NAME`, never opened. Residual, unchanged: a manifest
+    naming fewer than the four verifies what it names (`install.sh`
+    always writes the four; the manifest sits under `inode_protect`).
+  - WDG-R06 (372) and SUP-018 (402), fixed. Seeds for every target
+    (`fuzz/seeds/<target>/`, 39 files: the shipped
+    `combat-rules.v4`/`.v6` with v4 and v6 entries, the five shipped
+    canary templates, verdicts of each kind, a marker the fixture admins
+    signed, manifests that verify and mismatch, TLS hellos, DNS
+    responses, a BTF subset, tracefs formats, role lists, terminators,
+    admin frames). The ones built with Rust encoders are regenerated and
+    compared byte for byte by `fuzz_api::tests` (`NN_BLESS_FUZZ_SEEDS=1`
+    rewrites them); the same tests check that every seed set reaches what
+    its target asserts. `fuzz/regressions/<target>/` (9 files) holds inputs of fixed
+    bugs, each failing its target with the fix reverted (see below). CI:
+    per target, `-runs=0 -timeout=25` over the seeds and the regressions,
+    then the 20 s smoke from `fuzz/corpus/$t fuzz/seeds/$t` (the corpus
+    first: libFuzzer writes only there); all targets run, the job fails at
+    the end naming each failed one with its log tail. The corpus is
+    cached between runs (`${{ runner.os }}-fuzz-corpus-${{ github.run_id }}`,
+    restored from the latest; a PR's cache is not visible to `main`).
+    The SUP-022 test accepts the run id as a rolling key's suffix (its
+    rule, "only the own key without its end", unchanged). The combat
+    target also asserts two lines per entry of the block's family and,
+    apart from the validator, no carve-out wider than /8 or /48,
+    unspecified or multicast; `canary_template` asserts no `{{` at all
+    (DEC-017 made any `{{` an error), JSON for the three JSON families and
+    a deterministic render. Unit test `accept_rules_shape_holds_on_valid_input`.
+  - WDG-R04 (370, fixed). `ade_verdict` (`String::from_utf8_lossy`): an
+    accepted verdict meets, checked apart from `validate`, the rules a
+    response relies on, and parses again from its own JSON, alone and
+    fenced, to the same verdict, severity, confidence and trace id; a JSON
+    carrying `<think>` is left out of the re-parse until NN-AUD-380
+    (WDG-R14, batch 6) stops the pre-parser matching the marker inside the
+    object. `ade_preparse` through `fuzz_api::ade_preparse` /
+    `ade_first_json_object`: `parser::preparse` is the three steps `parse`
+    ran inline (no behaviour change); the kept text is a slice of the
+    input, only an unclosed `<think>` is an error, an object found is
+    found again whole in itself. Unit test
+    `preparse_cuts_to_the_first_balanced_object`.
+  - WDG-R07 (373, fixed). `dns_records` drives `decode_dns_qname` and
+    `qname_wire_end`: printable ASCII only, `…` only at the end and only
+    for a pointer, and the name read back (`\DDD` unescaped, split on
+    `.`) equals the wire labels byte for byte; the end is just past a root
+    label. Unit test `hostile_names_terminate_in_bounds` (a self-pointer,
+    a 128-pointer chain, a label past the buffer, 255 bytes without a root
+    label).
+  - WDG-R08 (374, fixed). On every accepted hello: JA3's input has five
+    fields, the version and one value per non-GREASE cipher and
+    extension; JA3 is 32 hex digits; JA4 a 10-character prefix and two
+    12-hex hashes; a record-wrapped hello parses as its handshake. Unit
+    tests `zero_cipher_hello_fingerprints`,
+    `zero_extension_hello_fingerprints`, `empty_alpn_reads_as_none`,
+    `four_thousand_extensions_parse_and_cap_the_count`. Noted, not
+    changed: `is_grease_u16` drops 256 values (`0x?A?A`), RFC 8701
+    reserves 16 (`0xNANA`); changing it changes recorded fingerprints.
+  - WDG-014 (363, fixed). `shutdown_marker`: `ShutdownMarker::parse` then
+    `verify` against a fixture (`fuzz_api`: `SHUTDOWN_FIXTURE_ADMIN_PUB`,
+    the public halves of the test seeds `[1; 32]` to `[3; 32]`, only the
+    first with `shutdown`; agent id, pid, start and clock). A marker
+    honoured must carry one of `SHUTDOWN_FIXTURE_SIGNED` (the fuzzer
+    cannot sign), name the pid, hold at most `MAX_SUBMITTED_SIGNATURES`,
+    two signers with key 0, a capped grace, and be `Replayed` once
+    honoured. Seeded with one marker; the seeded replay reaches `verify`
+    and its `Ok` (`shutdown_marker_seed_is_honoured_and_its_replay_refused`).
+    No watchdog dependency (`unit_state_from_show` was optional).
+    AUT-011 (NN-AUD-249) stays declined; its optional pin landed:
+    `decode_cbor_rejects_deeply_nested_input` (10,000 nested arrays,
+    as a value and as a payload's unknown field: ciborium's
+    `RecursionLimitExceeded`), and the target's regression
+    `nested-cbor-payload.json` replays such a payload through the
+    watchdog's check.
+  - WDG-R09 (375, fixed). `fuzz_targets/scratch.rs`: one `tempfile`
+    directory per process (`nn-fuzz-<target>-…`, 0700), files created
+    with `create_new` after an `unlink`, the directory removed at exit
+    (`atexit`). `install_manifest` writes its fixture once; nothing else
+    writes.
+  - SUP-023 (407, fixed). `kani.yml`: `pull_request` on
+    `agent/src/net/tls_parser.rs`, `common/src/admin_quorum.rs`,
+    `common/src/dns_qname.rs` and itself, the weekly run kept, a newer
+    push cancelling a PR's run in progress. `QnameLabels`,
+    `decode_dns_qname`, `qname_wire_end`, their tests and both proofs
+    moved to `common/src/dns_qname.rs`, re-exported at the crate root
+    (`model.rs` only imports them). The proof `qname_wire_end_is_past_a_root_label`
+    (Tappa 10.9, lab PR 57) had no workflow step; it has one. The README
+    named the quorum proof `anti_tamper::admin_auth::kani_proofs`; it is
+    `admin_quorum::kani_proofs`.
+  - Found by the seeded targets: `btf_parse` crashed within 20 s of the
+    first seeded smoke: `field_offset` added an anonymous member's bit
+    offset and the field's offset inside it in `u32` (a panic with debug
+    assertions, a wrapped offset in a release build). Saturating now, as
+    `resolve_path`'s total; the result is refused as not byte-aligned.
+    Unit test `anonymous_member_offset_overflow_is_refused_not_wrapped`
+    (fails on the starting code: "attempt to add with overflow"); the
+    input is `fuzz/regressions/btf_parse/anonymous-member-offset-overflow.btf`.
+  - Tests. xtask: `every_fuzz_target_has_seeds_and_the_ci_replays_them`
+    (every `[[bin]]` has seeds, every seed or regression directory is a
+    target's, none ignored by git, the replay with `-runs=0` and a
+    timeout, the smoke from corpus then seeds, the corpus cached, the
+    README names every target) and `kani_runs_every_proof_on_the_prs_that_touch_it`
+    (the path filter equals the files with a `#[kani::proof]` plus the
+    workflow, the schedule kept, every harness run): both fail on the
+    starting tree. The lot 183 test `security_crates_are_locked_alike_for_the_fuzzer`
+    stays green. Agent: the five `fuzz_api` tests, the unit tests above,
+    `unknown_or_absolute_names_are_a_mismatch`,
+    `fuzz_fixture_reaches_hash_comparison`.
+  - Mutations (local, reverted): a seventh field in `generate_accept_rules`
+    (`-j ACCEPT x`) fails `accept_rules_shape_holds_on_valid_input` and the
+    `combat_allow` replay of the seeds (`parts.len() == 6`, on
+    `172.16.0.0/12`); the name check removed fails
+    `unknown_or_absolute_names_are_a_mismatch`, the `fuzz_api` seed test
+    and the `install_manifest` replay (`relative-alias.json` verified with
+    an unknown name; `absolute-dev-zero.json` a libFuzzer timeout at
+    25 s); the LLMP-006 range check removed fails
+    `confidence_above_one_rejected`, `negative_confidence_rejected`,
+    `kill_with_out_of_range_confidence_is_escalated` and the
+    `ade_verdict` replay (confidence 5); the `.` escape of
+    `decode_dns_qname` removed fails the `dns_records` replay
+    (`login.bank.io.attacker.net` read back as five labels); the quorum
+    verdict ignored in `shutdown_marker::verify` is caught by the seeded
+    `shutdown_marker` smoke in 0.3 s (a marker with one signer honoured).
+  - Host: `cargo fmt --all` (and `cargo fmt` in `fuzz/`), both clippy runs
+    (`--workspace --all-targets --locked`, the agent with
+    `test-privileged,debug-trigger`) clean, 2,595 passed, 0 failed;
+    `cargo +nightly-2025-12-01 fuzz build` (cargo-fuzz 0.13.2) builds the
+    13 targets; the CI step run locally: every replay and every 20 s smoke
+    clean, no `nn-fuzz-*` left in `/tmp`; a 180 s run of each target in
+    parallel from the seeds clean (about 91 million executions);
+    `fuzz/Cargo.lock` gains the three dependency names only and `cargo
+    fetch --locked` accepts it; `cargo kani` 0.68.0 proves both DNS
+    harnesses at their new path (35 s); `Cargo.lock` unchanged.
+    actionlint and shellcheck are not installed; the workflows parse
+    (`workflows_parse_as_yaml`). The CI's `posture_demo` clippy still
+    fails as on the starting tree (lot `nn-wt-kernfid`, fixed on `main`).
+  - Lab: CI and local fuzzing, no lab probe: `cargo +nightly-2025-12-01 fuzz build` of the 13 targets; the CI step's local replay (seeds and regressions, `-runs=0`) green on all 13; 180 s per target with no crash; mutations caught and reverted — a 7th field in `generate_accept_rules`, the manifest name check removed (an alias verified, a timeout on `/dev/zero`), the ADE confidence range check removed, the DNS `.` escape removed, the quorum result ignored (a forged marker found in 0.3 s); the two DNS Kani proofs locally (35 s). The fuzzers found two agent defects fixed here: `install_manifest` hashed any manifest name (`/dev/zero` blocked the boot, `../` reached any file), and an u32 overflow in `btf_parse`'s `field_offset`. Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.

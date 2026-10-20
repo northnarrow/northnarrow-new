@@ -1,8 +1,8 @@
 //! Supply-chain hygiene of the repository itself: what the CI runs, how
 //! releases are verified, what the default build targets, and which RustSEC
 //! advisories are accepted. External audit SUP-001, SUP-002, SUP-004,
-//! SUP-005, SUP-006, SUP-007 to SUP-012, SUP-015, SUP-016, SUP-017, SUP-022
-//! and DEP-008. The tests read committed files; three run a local tool and
+//! SUP-005, SUP-006, SUP-007 to SUP-012, SUP-015, SUP-016, SUP-017, SUP-018,
+//! SUP-022, SUP-023 and DEP-008. The tests read committed files; three run a local tool and
 //! none touches the network: `prune_script_fails_closed` runs the CI prune
 //! script under bash with a stub `cargo`, `advisory_exceptions_expire_in_ci`
 //! runs the CI expiry check under bash with a fixed date, and
@@ -508,7 +508,9 @@ fn no_checkout_persists_the_token() {
 /// SUP-022: a restore key is a prefix match. `${{ runner.os }}-cargo-`
 /// restored any job's cache — another job's `target/`, built with other
 /// features or toolchains — into this one. A restore key may only drop the
-/// hash from the end of the job's own key.
+/// hash from the end of the job's own key, or the run id from the end of a
+/// rolling one (the fuzz corpus, SUP-018: saved by every run, restored
+/// from the latest).
 #[test]
 fn cache_restore_keys_stay_within_their_own_key() {
     let mut seen = 0;
@@ -525,7 +527,10 @@ fn cache_restore_keys_stay_within_their_own_key() {
                 let Some(restore) = with.and_then(|w| str_of(w, "restore-keys")) else {
                     continue;
                 };
-                let own = key.rfind("${{ hashFiles(").map(|i| &key[..i]);
+                let own = key
+                    .rfind("${{ hashFiles(")
+                    .or_else(|| key.strip_suffix("${{ github.run_id }}").map(str::len))
+                    .map(|i| &key[..i]);
                 for entry in restore.lines().map(str::trim).filter(|l| !l.is_empty()) {
                     seen += 1;
                     if own != Some(entry) {
@@ -1649,4 +1654,233 @@ fn security_crates_are_locked_alike_for_the_fuzzer() {
          lockfiles: `cargo update -p <crate> --precise <v>` at the root and in fuzz/):\n{}",
         bad.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// SUP-018 and SUP-023: fuzzing and the proofs as pull-request gates.
+
+/// The `[[bin]]` targets of fuzz/Cargo.toml: name and source path.
+fn fuzz_targets() -> Vec<(String, String)> {
+    let text = read(&repo_root().join("fuzz/Cargo.toml"));
+    let mut out = Vec::new();
+    for block in text.split("[[bin]]").skip(1) {
+        let field = |key: &str| {
+            block
+                .lines()
+                .take_while(|l| !l.trim_start().starts_with('['))
+                .find_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
+                })
+                .unwrap_or_else(|| panic!("fuzz/Cargo.toml: a [[bin]] without `{key}`"))
+        };
+        out.push((field("name"), field("path")));
+    }
+    assert!(out.len() >= 13, "fuzz/Cargo.toml: {} targets", out.len());
+    out
+}
+
+/// The names of the directories under `dir`.
+fn subdirs(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.expect("readable directory entry").path())
+        .filter(|p| p.is_dir())
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    out.sort();
+    out
+}
+
+/// SUP-018 (NN-AUD-402), WDG-R06 (NN-AUD-372): the CI smoke started every
+/// target from an empty directory, and the inputs that reach the targets'
+/// assertions (a CIDR that validates, a template that renders, a marker
+/// that verifies) are rarely found in 20 s. Every target has committed
+/// seeds; every directory of seeds and regressions is a target's; neither
+/// is ignored by git; the fuzz job replays both with `-runs=0` and smokes
+/// from the corpus (written) and the seeds (only read); the README names
+/// every target. That the seeds reach the assertions is
+/// `fuzz_api::tests` in the agent.
+#[test]
+fn every_fuzz_target_has_seeds_and_the_ci_replays_them() {
+    let root = repo_root();
+    let targets = fuzz_targets();
+    let names: Vec<&str> = targets.iter().map(|(n, _)| n.as_str()).collect();
+    let mut bad = Vec::new();
+    for (name, path) in &targets {
+        if !root.join("fuzz").join(path).is_file() {
+            bad.push(format!("{name}: no source at fuzz/{path}"));
+        }
+        let seeds = root.join("fuzz/seeds").join(name);
+        let files = fs::read_dir(&seeds)
+            .map(|d| {
+                d.filter(|e| e.as_ref().is_ok_and(|e| e.path().is_file()))
+                    .count()
+            })
+            .unwrap_or(0);
+        if files == 0 {
+            bad.push(format!("{name}: no seed under fuzz/seeds/{name}/"));
+        }
+    }
+    for kind in ["seeds", "regressions"] {
+        for dir in subdirs(&root.join("fuzz").join(kind)) {
+            if !names.contains(&dir.as_str()) {
+                bad.push(format!("fuzz/{kind}/{dir}/: no such target"));
+            }
+        }
+    }
+    let ignore = read(&root.join("fuzz/.gitignore"));
+    for line in ignore.lines().map(str::trim) {
+        if ["seeds", "regressions", "*", "/*"]
+            .iter()
+            .any(|p| line.trim_end_matches('/') == *p)
+        {
+            bad.push(format!(
+                "fuzz/.gitignore ignores the committed inputs: `{line}`"
+            ));
+        }
+    }
+    let readme = read(&root.join("fuzz/README.md"));
+    for name in &names {
+        if !readme.contains(&format!("`{name}`")) {
+            bad.push(format!("fuzz/README.md does not name `{name}`"));
+        }
+    }
+
+    let ci = workflow_yaml(&root.join(".github/workflows/ci.yml"));
+    let fuzz = jobs(&ci)
+        .into_iter()
+        .find(|(name, _)| name == "fuzz")
+        .expect("ci.yml has the fuzz job")
+        .1;
+    let job_steps = steps(&fuzz);
+    let script = job_steps
+        .iter()
+        .filter_map(|s| str_of(s, "run"))
+        .find(|r| r.contains("fuzz build"))
+        .expect("the fuzz job builds the targets");
+    let lines = script_lines(script);
+    let replay = lines.iter().find(|l| l.contains("-runs=0"));
+    match replay {
+        Some(l) if l.contains("${inputs[@]}") => {}
+        _ => bad.push("ci.yml fuzz: no `-runs=0` replay of the committed inputs".into()),
+    }
+    for want in [
+        r#"inputs=("fuzz/seeds/$t")"#,
+        r#"inputs+=("fuzz/regressions/$t")"#,
+    ] {
+        if !script.contains(want) {
+            bad.push(format!("ci.yml fuzz: the replay misses `{want}`"));
+        }
+    }
+    let smoke = lines.iter().find(|l| l.contains("-max_total_time="));
+    match smoke {
+        Some(l) if l.contains(r#""fuzz/corpus/$t" "fuzz/seeds/$t""#) => {}
+        _ => bad.push(
+            "ci.yml fuzz: the smoke must run from \"fuzz/corpus/$t\" \"fuzz/seeds/$t\" \
+             (the corpus first: libFuzzer writes only into the first directory)"
+                .into(),
+        ),
+    }
+    if !lines
+        .iter()
+        .any(|l| l.contains("-timeout=") && l.contains("-runs=0"))
+    {
+        bad.push("ci.yml fuzz: the replay needs a -timeout (a hang is a failure)".into());
+    }
+    let corpus_cached = job_steps.iter().any(|s| {
+        str_of(s, "uses").is_some_and(|u| u.starts_with("actions/cache@"))
+            && s.get("with")
+                .and_then(|w| str_of(w, "path"))
+                .is_some_and(|p| p.lines().any(|l| l.trim() == "fuzz/corpus"))
+    });
+    if !corpus_cached {
+        bad.push("ci.yml fuzz: fuzz/corpus is not cached between runs".into());
+    }
+    assert!(
+        bad.is_empty(),
+        "fuzz seeds and regressions must be committed and replayed:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// SUP-023 (NN-AUD-407): the proofs ran weekly and on demand, so a PR that
+/// weakened a proved bound merged with the proof red until the next
+/// Monday. kani.yml runs on the pull requests that touch a file holding a
+/// `#[kani::proof]` — those files and the workflow, no more, so the event
+/// model and the rest of the agent do not start it — keeps its schedule,
+/// and runs every harness.
+#[test]
+fn kani_runs_every_proof_on_the_prs_that_touch_it() {
+    let root = repo_root();
+    let mut files = Vec::new();
+    let mut harnesses = Vec::new();
+    for krate in ["agent", "common", "watchdog", "cli", "ebpf-guard", "xtask"] {
+        for file in files_under(&root.join(krate).join("src"), &[".rs"], &[]) {
+            let text = read(&file);
+            let lines: Vec<&str> = text.lines().collect();
+            let mut found = false;
+            for (i, line) in lines.iter().enumerate() {
+                if line.trim() != "#[kani::proof]" {
+                    continue;
+                }
+                found = true;
+                let name = lines[i + 1..]
+                    .iter()
+                    .find_map(|l| {
+                        let l = l.trim();
+                        let rest = l
+                            .strip_prefix("fn ")
+                            .or_else(|| l.strip_prefix("pub fn "))?;
+                        rest.split('(').next().map(str::to_string)
+                    })
+                    .unwrap_or_else(|| panic!("{}: a #[kani::proof] without fn", rel(&file)));
+                harnesses.push(name);
+            }
+            if found {
+                files.push(rel(&file));
+            }
+        }
+    }
+    files.sort();
+    assert!(files.len() >= 3, "proof files found: {files:?}");
+
+    let kani_yml = root.join(".github/workflows/kani.yml");
+    let wf = workflow_yaml(&kani_yml);
+    let on = wf.get("on").expect("kani.yml has `on:`");
+    let mut bad = Vec::new();
+    if !on
+        .get("schedule")
+        .and_then(|s| s.as_sequence())
+        .is_some_and(|s| s.iter().any(|e| str_of(e, "cron").is_some()))
+    {
+        bad.push("kani.yml: the weekly schedule is gone".to_string());
+    }
+    let pr = on.get("pull_request");
+    let mut paths: Vec<String> = pr
+        .and_then(|p| p.get("paths"))
+        .and_then(|p| p.as_sequence())
+        .map(|s| {
+            s.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    let mut want = files.clone();
+    want.push(".github/workflows/kani.yml".to_string());
+    want.sort();
+    if paths != want {
+        bad.push(format!(
+            "kani.yml: `on: pull_request: paths:` must be the proof files and the workflow\n  \
+             have {paths:?}\n  want {want:?}"
+        ));
+    }
+    let text = read(&kani_yml);
+    for h in &harnesses {
+        if !text.contains(&format!("--harness {h}")) {
+            bad.push(format!("kani.yml: no step runs `--harness {h}`"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

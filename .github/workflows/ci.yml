@@ -394,24 +394,57 @@ jobs:
       - name: fuzz/Cargo.lock is authoritative
         run: cd fuzz && cargo +nightly-2025-12-01 fetch --locked
 
-      # Every target must build; each then runs a short smoke so a
-      # trivially reachable panic fails the PR. Long campaigns run from a
-      # developer host (fuzz/README.md).
-      - name: Build and smoke every fuzz target
+      # External audit SUP-018: the working corpus carries over between
+      # runs, saved under this run's id and restored from the latest one.
+      # libFuzzer writes new inputs only into the first directory it is
+      # given, so the committed seeds are read and never written.
+      - name: Cache the fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: ${{ runner.os }}-fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-corpus-
+
+      # Every target must build. External audit SUP-018 / WDG-R06: every
+      # committed input then replays clean (`-runs=0`): the seeds
+      # (fuzz/seeds/<target>/, at least one per target, made to reach the
+      # targets' assertions) and the inputs of fixed bugs
+      # (fuzz/regressions/<target>/, each failing its target's assertions
+      # once its fix is reverted). Each target then runs a short smoke from
+      # the cached corpus and the seeds, so a reachable failure fails the
+      # PR. Long campaigns run from a developer host (fuzz/README.md).
+      - name: Build, replay the committed inputs, smoke every fuzz target
         run: |
           set -euo pipefail
           cargo +nightly-2025-12-01 fuzz build
           # Run the built binaries directly: `cargo fuzz run` re-invokes
           # cargo, and agent/build.rs re-runs whenever .git/refs changes.
+          bin=fuzz/target/x86_64-unknown-linux-gnu/release
+          failed=""
           for t in $(cargo +nightly-2025-12-01 fuzz list); do
             echo "::group::$t"
             mkdir -p "fuzz/corpus/$t" "fuzz/artifacts/$t"
-            "fuzz/target/x86_64-unknown-linux-gnu/release/$t" -max_total_time=20 -max_len=8192 \
-              -artifact_prefix="fuzz/artifacts/$t/" "fuzz/corpus/$t" 2>&1 | tail -3
+            if [ ! -d "fuzz/seeds/$t" ]; then
+              echo "fuzz: $t has no fuzz/seeds/$t"; failed="$failed $t(no-seeds)"
+            else
+              inputs=("fuzz/seeds/$t")
+              if [ -d "fuzz/regressions/$t" ]; then inputs+=("fuzz/regressions/$t"); fi
+              if ! "$bin/$t" -runs=0 -timeout=25 -artifact_prefix="fuzz/artifacts/$t/" \
+                  "${inputs[@]}" > "fuzz/artifacts/$t/replay.log" 2>&1; then
+                tail -n 40 "fuzz/artifacts/$t/replay.log"; failed="$failed $t(replay)"
+              elif ! "$bin/$t" -max_total_time=20 -max_len=8192 -timeout=25 \
+                  -artifact_prefix="fuzz/artifacts/$t/" "fuzz/corpus/$t" "fuzz/seeds/$t" \
+                  > "fuzz/artifacts/$t/smoke.log" 2>&1; then
+                tail -n 40 "fuzz/artifacts/$t/smoke.log"; failed="$failed $t(smoke)"
+              else
+                tail -n 3 "fuzz/artifacts/$t/smoke.log"
+              fi
+            fi
             echo "::endgroup::"
           done
-          if ls fuzz/artifacts/*/crash-* >/dev/null 2>&1; then
-            echo "fuzz: crash artefacts found"; ls -la fuzz/artifacts/*; exit 1
+          if [ -n "$failed" ]; then
+            echo "fuzz: failed:$failed"; ls -la fuzz/artifacts/*; exit 1
           fi
 
       - name: No lockfile changed during the build

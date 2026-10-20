@@ -373,6 +373,41 @@ garbage-line\n\
         assert_eq!(ipv6_raw(&entries), vec!["fd00:1:2::/48".to_string()]);
     }
 
+    /// External audit WDG-R06 (NN-AUD-372): the property the
+    /// `combat_allow` fuzz target asserts, on fixed valid input. Every
+    /// generated line is exactly `-A <chain> -s|-d <entry> -j ACCEPT`, the
+    /// entry one that validates, two lines per entry in its family's
+    /// block, so no allow-file content becomes another rule.
+    #[test]
+    fn accept_rules_shape_holds_on_valid_input() {
+        let text = "10.0.0.0/24\n192.168.1.10\n172.16.0.0/12 # vpn\n2001:db8::/48\nfd00::1\n";
+        let load = parse_allow_text(text);
+        assert_eq!(load.entries.len(), 5, "{:?}", load.warnings);
+        for (block, v6) in [
+            (
+                generate_accept_rules(&load.entries, "NORTHNARROW_COMBAT"),
+                false,
+            ),
+            (
+                generate_accept_rules_v6(&load.entries, "NORTHNARROW_COMBAT"),
+                true,
+            ),
+        ] {
+            let family: Vec<&AllowCidr> = load.entries.iter().filter(|e| e.is_ipv6 == v6).collect();
+            let lines: Vec<&str> = block.lines().collect();
+            assert_eq!(lines.len(), 2 * family.len(), "{block}");
+            for (i, line) in lines.iter().enumerate() {
+                let parts: Vec<&str> = line.split(' ').collect();
+                assert_eq!(parts.len(), 6, "{line:?}");
+                assert_eq!((parts[0], parts[1]), ("-A", "NORTHNARROW_COMBAT"));
+                assert_eq!(parts[2], if i % 2 == 0 { "-s" } else { "-d" });
+                assert_eq!(parts[3], family[i / 2].raw);
+                assert!(validate_entry(parts[3]).is_ok(), "{line:?}");
+                assert_eq!((parts[4], parts[5]), ("-j", "ACCEPT"));
+            }
+        }
+    }
+
     #[test]
     fn empty_input_generates_nothing() {
         assert_eq!(generate_accept_rules(&[], "C"), "");

@@ -1018,6 +1018,96 @@ mod tests {
         // Empty buffer.
         assert!(parse_client_hello(&[]).is_none());
     }
+
+    /// The JA3 and JA4 of `hello` keep their shape whatever the lists hold
+    /// (the `tls_client_hello` fuzz target asserts the same on every
+    /// parsed input, external audit WDG-R08, NN-AUD-374).
+    fn assert_fingerprint_shape(hello: &TlsClientHello) -> (String, String) {
+        let raw = compute_ja3_raw(hello);
+        assert_eq!(raw.split(',').count(), 5, "{raw}");
+        let ja3 = compute_ja3(hello);
+        assert!(
+            ja3.len() == 32 && ja3.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{ja3}"
+        );
+        let ja4 = compute_ja4(hello);
+        let parts: Vec<&str> = ja4.rsplitn(3, '_').collect();
+        assert_eq!(parts.len(), 3, "{ja4}");
+        for hash in &parts[..2] {
+            assert!(
+                hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{ja4}"
+            );
+        }
+        (raw, ja4)
+    }
+
+    /// External audit WDG-R08 (NN-AUD-374): no cipher suite. JA3 keeps an
+    /// empty field, JA4 counts zero and uses the empty-list hash.
+    #[test]
+    fn zero_cipher_hello_fingerprints() {
+        let bytes = build_record(
+            0x0303,
+            [1; 32],
+            &[],
+            &[],
+            &[0],
+            &[(EXT_SERVER_NAME, sni_ext("a.example"))],
+        );
+        let hello = parse_client_hello(&bytes).expect("parses");
+        assert!(hello.cipher_suites.is_empty());
+        let (raw, ja4) = assert_fingerprint_shape(&hello);
+        assert_eq!(raw, "771,,0,,");
+        assert!(ja4.starts_with("t12d0001"), "{ja4}");
+        assert_eq!(ja4.split('_').nth(1), Some(JA4_EMPTY_HASH));
+    }
+
+    /// External audit WDG-R08: an empty extensions block, and none at all
+    /// (TLS 1.0 shape).
+    #[test]
+    fn zero_extension_hello_fingerprints() {
+        let bytes = build_record(0x0301, [2; 32], &[7; 32], &[0x002F], &[0], &[]);
+        let hello = parse_client_hello(&bytes).expect("parses");
+        assert!(hello.extensions.is_empty());
+        let (raw, ja4) = assert_fingerprint_shape(&hello);
+        assert_eq!(raw, "769,47,,,");
+        assert_eq!(ja4, format!("t10n010000_{}_{JA4_EMPTY_HASH}", &ja4[11..23]));
+        // the same hello cut after the compression methods: no block at all
+        let cut = bytes.len() - 2;
+        let hello = parse_client_hello(&bytes[..cut]).expect("parses without a block");
+        assert!(hello.extensions.is_empty());
+        assert_eq!(compute_ja3_raw(&hello), raw);
+    }
+
+    /// External audit WDG-R08: an ALPN extension with an empty list, and
+    /// one whose first protocol is empty, both read as no ALPN ("00").
+    #[test]
+    fn empty_alpn_reads_as_none() {
+        for alpn in [alpn_ext(&[]), alpn_ext(&["", "h2"])] {
+            let bytes = build_record(0x0303, [3; 32], &[], &[0x1301], &[0], &[(EXT_ALPN, alpn)]);
+            let hello = parse_client_hello(&bytes).expect("parses");
+            let (_, ja4) = assert_fingerprint_shape(&hello);
+            assert_eq!(&ja4[..10], "t12n010100", "{ja4}");
+        }
+    }
+
+    /// External audit WDG-R08: 4,096 extensions (16 KiB of the block's
+    /// 64 KiB) parse, and JA4 caps the count at 99.
+    #[test]
+    fn four_thousand_extensions_parse_and_cap_the_count() {
+        // from 0x0100 (none JA3/JA4 reads), the filter's GREASE shape left out
+        let exts: Vec<(u16, Vec<u8>)> = (0x0100u16..)
+            .filter(|t| !is_grease_u16(*t))
+            .take(4096)
+            .map(|t| (t, Vec::new()))
+            .collect();
+        let bytes = build_record(0x0303, [4; 32], &[], &[0x1301], &[0], &exts);
+        let hello = parse_client_hello(&bytes).expect("parses");
+        assert_eq!(hello.extensions.len(), 4096);
+        let (raw, ja4) = assert_fingerprint_shape(&hello);
+        assert_eq!(raw.split(',').nth(2).unwrap().split('-').count(), 4096);
+        assert_eq!(&ja4[..10], "t12n019900", "{ja4}");
+    }
 }
 
 /// Kani proofs (Tappa 10.8, "verifica formale dopo il fuzzing"). Every byte

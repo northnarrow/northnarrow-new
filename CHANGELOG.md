@@ -61,6 +61,63 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, fuzz targets that can fail and fuzzing/proofs as
+  PR gates (Low WDG-014 NN-AUD-363, WDG-R04 NN-AUD-370, WDG-R05 NN-AUD-371,
+  WDG-R06 NN-AUD-372, WDG-R07 NN-AUD-373, WDG-R08 NN-AUD-374, WDG-R09
+  NN-AUD-375, SUP-018 NN-AUD-402, SUP-023 NN-AUD-407; lab PR 200). The fuzz
+  targets mostly asserted "no panic", and several could not reach what
+  they claimed to test. Every target now asserts what its parser promises
+  (`fuzz/README.md` lists the property of each), so a wrong answer fails
+  as a crash does. WDG-R05: the `install_manifest` target passed
+  `/proc/self/exe`, which never runs from a manifest's `bin_dir`, so every
+  input ended "not applicable" before any hash; it now checks against a
+  fixed fixture directory (`fuzz_api::install_manifest_check_in_dir`) and
+  asserts that `Verified` means every recorded hash matches. The harness
+  showed an agent defect: the boot check hashed `bin_dir.join(name)` for
+  any key of the manifest's `files` map, and a join with an absolute name
+  drops `bin_dir` (`/dev/zero` hung the boot check, `../` reached any
+  file); only the four names `install.sh` records are compared now, any
+  other is a mismatch and is never opened (`RECORDED_NAMES`). WDG-R04: new
+  `ade_verdict` and `ade_preparse` targets on the ADE model output (an
+  accepted verdict meets the schema rules a response relies on and parses
+  again from its own JSON; the pre-parser is a separate function,
+  `preparse`). WDG-R07: `dns_records` also drives `decode_dns_qname` and
+  checks that the name reads back as the wire labels byte for byte, with
+  unit tests for a self-pointer, a 128-pointer chain, a label past the
+  buffer and 255 bytes without a root label. WDG-R08: the TLS target
+  computes JA3 and JA4 on every accepted hello and checks their shape,
+  with zero-cipher, zero-extension, empty-ALPN and 4,096-extension tests.
+  WDG-014: a `shutdown_marker` target runs the watchdog's marker check
+  against a fixture (`fuzz_api`): a marker it honours must carry a
+  shutdown the fixture keys signed, at most the signature cap, two signers
+  with the `shutdown` key, and must be refused as a replay. AUT-011
+  (NN-AUD-249, declined) gets the pin its triage offered:
+  `decode_cbor_rejects_deeply_nested_input` (10,000 nested arrays are
+  ciborium's `RecursionLimitExceeded`), and the marker target replays such
+  a payload. WDG-R09: `canary_template` and `install_manifest` wrote
+  `$TMPDIR/nn-fuzz-*-<pid>` with `fs::write` and never removed it; one
+  private `tempfile` directory per process, files created exclusively,
+  removed at exit. SUP-018 / WDG-R06: committed seeds for every target
+  (`fuzz/seeds/<target>/`, checked by `fuzz_api::tests` to reach the
+  assertions) and inputs of fixed bugs (`fuzz/regressions/<target>/`,
+  each failing its target with the fix reverted); the CI fuzz job replays
+  both with `-runs=0` and a 25 s timeout, then smokes from a corpus
+  cached between runs and the seeds; an xtask test requires seeds for
+  every `[[bin]]`. SUP-023: `kani.yml` runs on the pull requests that
+  touch a proved file (`tls_parser.rs`, `admin_quorum.rs`, and the DNS
+  name walk, moved out of `model.rs` into `common/src/dns_qname.rs` so
+  that edits to the event model do not start it), keeps its weekly run,
+  and runs the `qname_wire_end` proof, which no workflow ran; an xtask
+  test keeps the path filter equal to the files with a proof and checks
+  that every harness runs.
+  **Regressions / changes:** an install manifest whose `files` map holds
+  a name other than `northnarrow-agent`, `northnarrow-watchdog`, `nn-admin`
+  or `ebpf_object` is a mismatch, fatal at boot unless
+  `NN_ALLOW_UNVERIFIED_BINARY=1` (`install.sh` writes exactly these four);
+  the CI fuzz job takes a few seconds longer (the replays); `kani.yml`
+  adds minutes of CI to the pull requests that touch the three proved
+  files; `QnameLabels`, `decode_dns_qname` and `qname_wire_end` live in
+  `common::dns_qname`, re-exported at the crate root as before.
 - External audit, Wave 3, RAG retrieval (Low XAI-008 NN-AUD-346, XAI-012
   NN-AUD-347, XAI-019 NN-AUD-435; lab PR 199). Dormant: RAG runs only with
   `NN_ADE_RAG_ENABLED` set, off by default; these points, with Wave 2's

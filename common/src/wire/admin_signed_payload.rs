@@ -2191,4 +2191,32 @@ mod tests {
             assert_eq!(payload.op, payload.extra.op_code());
         }
     }
+
+    /// External audit AUT-011 (NN-AUD-249, declined: ciborium 0.2.2 caps
+    /// recursion at 256 levels in `from_reader`, on values skipped through
+    /// `IgnoredAny` too). This pins the premise of the decline, so a
+    /// ciborium upgrade that drops the limit fails here instead of turning
+    /// a deep marker into a stack overflow of the watchdog: 10,000 nested
+    /// one-element arrays are `RecursionLimitExceeded`, decoded as a value
+    /// and as the unknown field of a payload, which serde skips. The
+    /// `shutdown_marker` fuzz target replays a nested payload through the
+    /// watchdog's marker check (`fuzz/regressions/shutdown_marker/`).
+    #[test]
+    fn decode_cbor_rejects_deeply_nested_input() {
+        let nested = alloc::vec![0x81u8; 10_000];
+        assert!(matches!(
+            ciborium::de::from_reader::<ciborium::Value, _>(&nested[..]),
+            Err(ciborium::de::Error::RecursionLimitExceeded)
+        ));
+        // {"x": [[[…]]]}: a map of one pair, the text key "x", then the arrays
+        let mut payload = alloc::vec![0xA1, 0x61, b'x'];
+        payload.extend_from_slice(&nested);
+        payload.push(0x00);
+        match decode_cbor(&payload) {
+            Err(SignedPayloadError::Cbor(m)) => {
+                assert!(m.contains("RecursionLimitExceeded"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

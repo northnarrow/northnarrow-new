@@ -6,15 +6,34 @@
 #   - net::tls_parser::Cursor — every ClientHello read goes through it
 #     (any buffer ≤ 8 bytes, any position, any length: no panic, the
 #     position never leaves the buffer; by induction any read sequence);
-#   - model::QnameLabels — the DNS name walk behind decode_dns_qname
-#     (any buffer ≤ 16 bytes: in bounds, terminates).
-# Weekly + on demand: the Kani toolchain setup alone takes minutes.
+#   - dns_qname::QnameLabels — the DNS name walk behind decode_dns_qname
+#     (any buffer ≤ 16 bytes: in bounds, terminates), and qname_wire_end
+#     (the end it reports is just past a root label);
+#   - admin_quorum::quorum_decision — the admin multi-signature rule.
+# Weekly, on demand, and (external audit SUP-023) on every pull request
+# that touches a proved file: a PR that weakened a bound merged with the
+# proof red until the next Monday. The filter names the files that hold
+# the proved code (xtask/tests/supply_chain.rs keeps it equal to the files
+# with a #[kani::proof], and every harness run below); the DNS walk has
+# its own module so that edits to the event model do not start it.
 name: kani
 
 on:
   schedule:
     - cron: "41 4 * * 1"
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - agent/src/net/tls_parser.rs
+      - common/src/admin_quorum.rs
+      - common/src/dns_qname.rs
+      - .github/workflows/kani.yml
+
+# A newer push to the same pull request supersedes a run in progress.
+concurrency:
+  group: kani-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # External audit SUP-004: a read-only token, not left in .git/config.
 permissions:
@@ -53,6 +72,9 @@ jobs:
 
       - name: Prove the DNS label walk (common)
         run: cargo kani -p northnarrow-common --harness qname_label_walk_is_in_bounds_and_terminates
+
+      - name: Prove the end of a DNS name (common)
+        run: cargo kani -p northnarrow-common --harness qname_wire_end_is_past_a_root_label
 
       - name: Prove the TLS cursor (agent)
         # A Candle dependency (pulp) carries global asm, which Kani cannot
