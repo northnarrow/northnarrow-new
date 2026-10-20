@@ -189,17 +189,58 @@ pub fn parse_role_keyword(s: &str) -> Result<Role, String> {
     })
 }
 
+/// External audit AUT-005: the most signatures one submission may carry.
+/// Checking a submission costs `signatures × keys` Ed25519 verifications
+/// and the tally ([`quorum_decision`], [`distinct_matches`]) is quadratic
+/// in its length; only the admin frame's 64 KiB bounded it (about 1,000
+/// signatures), and a quorum shortfall does not use up a connection's
+/// failure budget. `nn-admin` sends one or two; no quorum asks for more
+/// than two distinct keys. 8, not the triage's 16: the Kani proof of the
+/// rule (`kani_proofs`) covers every length up to the cap, and at 16 it
+/// needs more memory and time than a CI runner has (8: about 5 minutes,
+/// 7 GB).
+pub const MAX_SUBMITTED_SIGNATURES: usize = 8;
+
+/// A submission with more than [`MAX_SUBMITTED_SIGNATURES`] signatures,
+/// refused before any of them is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManySignatures {
+    pub submitted: usize,
+}
+
+impl core::fmt::Display for TooManySignatures {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} signatures submitted, at most {MAX_SUBMITTED_SIGNATURES} are accepted",
+            self.submitted
+        )
+    }
+}
+
+/// [`MAX_SUBMITTED_SIGNATURES`], for a caller that refuses an oversized
+/// submission before any other work (hashing the payload included).
+pub fn check_submission_size(submitted: usize) -> Result<(), TooManySignatures> {
+    if submitted > MAX_SUBMITTED_SIGNATURES {
+        return Err(TooManySignatures { submitted });
+    }
+    Ok(())
+}
+
 /// Which key each of `signatures` verifies against over `message` (`None`:
 /// no key), with `verify_strict`. Every signature is checked against
 /// every key with no early exit, so the cost is `signatures × keys`
 /// whichever signatures verify; a signature matching two keys (the same
-/// key listed twice) keeps the last.
+/// key listed twice) keeps the last. A submission over
+/// [`MAX_SUBMITTED_SIGNATURES`] is refused without checking any signature,
+/// so no caller can skip the cap.
 pub fn match_signatures(
     keys: &[AdminKey],
     message: &[u8],
     signatures: &[[u8; 64]],
-) -> Vec<Option<usize>> {
-    signatures
+) -> Result<Vec<Option<usize>>, TooManySignatures> {
+    check_submission_size(signatures.len())?;
+    Ok(signatures
         .iter()
         .map(|sig_bytes| {
             let sig = Signature::from_bytes(sig_bytes);
@@ -211,7 +252,7 @@ pub fn match_signatures(
             }
             this_match
         })
-        .collect()
+        .collect())
 }
 
 /// Outcome of [`quorum_decision`]: the distinct-key tally, threshold and
@@ -350,8 +391,29 @@ mod tests {
             sk1.sign(msg).to_bytes(),
             sk1.sign(b"other").to_bytes(),
         ];
-        let m = match_signatures(&[k1, k2], msg, &sigs);
+        let m = match_signatures(&[k1, k2], msg, &sigs).unwrap();
         assert_eq!(m, vec![Some(1), None, Some(0), None]);
+    }
+
+    /// External audit AUT-005: up to the cap every signature is checked;
+    /// one more and none is.
+    #[test]
+    fn match_signatures_refuses_a_submission_over_the_cap() {
+        let (sk1, k1) = key(1, &[Role::Shutdown]);
+        let msg = b"digest";
+        let sig = sk1.sign(msg).to_bytes();
+        let at_cap = vec![sig; MAX_SUBMITTED_SIGNATURES];
+        let m = match_signatures(core::slice::from_ref(&k1), msg, &at_cap).unwrap();
+        assert_eq!(m, vec![Some(0); MAX_SUBMITTED_SIGNATURES]);
+        let over = vec![sig; MAX_SUBMITTED_SIGNATURES + 1];
+        assert_eq!(
+            match_signatures(&[k1], msg, &over),
+            Err(TooManySignatures {
+                submitted: MAX_SUBMITTED_SIGNATURES + 1
+            })
+        );
+        assert!(check_submission_size(MAX_SUBMITTED_SIGNATURES).is_ok());
+        assert!(check_submission_size(0).is_ok());
     }
 
     #[test]
@@ -391,17 +453,19 @@ mod tests {
 
 /// Kani proof of the quorum rule (`.github/workflows/kani.yml`). The
 /// signature checks are abstracted away: any key index (or none) for each
-/// submitted signature, any role assignment for each key.
+/// submitted signature, any role assignment for each key. External audit
+/// AUT-005: the bound is [`MAX_SUBMITTED_SIGNATURES`], so the proof covers
+/// every submission length a verifier accepts.
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
 
-    const SIGS: usize = 4;
+    const SIGS: usize = MAX_SUBMITTED_SIGNATURES;
     const KEYS: usize = 3;
     const ROLES: [Role; 2] = [Role::Unlock, Role::TrustedInstaller];
 
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(10)]
     fn quorum_accepts_only_enough_distinct_keys_carrying_every_role() {
         let n: usize = kani::any();
         kani::assume(n <= SIGS);

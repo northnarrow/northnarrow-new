@@ -15,7 +15,9 @@
 //! host. A marker is honoured only when it is:
 //!
 //! - a shutdown for this install (`agent_id`), signed by
-//!   [`SHUTDOWN_QUORUM`] distinct admin keys, one carrying `shutdown`;
+//!   [`SHUTDOWN_QUORUM`] distinct admin keys, one carrying `shutdown`,
+//!   with no more than [`admin_quorum::MAX_SUBMITTED_SIGNATURES`]
+//!   signatures (external audit AUT-005; the agent refuses more);
 //! - recent: signed no later than [`MAX_SKEW_SECS`] ahead of the
 //!   watchdog's clock, and acted on within the skew plus the requested
 //!   grace (at most [`MAX_GRACE_SECS`]) after it was signed;
@@ -137,11 +139,27 @@ pub enum Rejection {
     UnsupportedVersion(u32),
     NotAShutdown,
     OtherAgent,
-    WrongPid { marker: u32, died: u32 },
-    SignedBeforeAgentStarted { ts: u64, started: u64 },
-    FromTheFuture { ts: u64, now: u64 },
-    Expired { ts: u64, now: u64, grace_secs: u64 },
+    WrongPid {
+        marker: u32,
+        died: u32,
+    },
+    SignedBeforeAgentStarted {
+        ts: u64,
+        started: u64,
+    },
+    FromTheFuture {
+        ts: u64,
+        now: u64,
+    },
+    Expired {
+        ts: u64,
+        now: u64,
+        grace_secs: u64,
+    },
     Quorum(QuorumDecision),
+    /// External audit AUT-005: this many signatures, more than
+    /// [`admin_quorum::MAX_SUBMITTED_SIGNATURES`]; none was checked.
+    TooManySignatures(usize),
     Replayed,
 }
 
@@ -172,6 +190,11 @@ impl fmt::Display for Rejection {
                 "signed at {ts}, too long before the exit ({now}; skew {MAX_SKEW_SECS} s + grace {grace_secs} s)"
             ),
             Rejection::Quorum(d) => write!(f, "the admin signatures do not authorise it ({d:?})"),
+            Rejection::TooManySignatures(submitted) => write!(
+                f,
+                "the marker carries {submitted} signatures, at most {} are accepted",
+                admin_quorum::MAX_SUBMITTED_SIGNATURES
+            ),
             Rejection::Replayed => write!(f, "this authorisation was already honoured (replay)"),
         }
     }
@@ -187,6 +210,9 @@ pub fn verify(
     if marker.version != MARKER_VERSION {
         return Err(Rejection::UnsupportedVersion(marker.version));
     }
+    // External audit AUT-005: bounded before anything is decoded or checked.
+    admin_quorum::check_submission_size(marker.signatures.len())
+        .map_err(|e| Rejection::TooManySignatures(e.submitted))?;
     let cbor = hex::decode(&marker.payload)
         .map_err(|e| Rejection::Malformed(format!("payload is not hex: {e}")))?;
     let payload =
@@ -235,7 +261,8 @@ pub fn verify(
     // encoding is trusted.
     let digest =
         signing_digest(&payload).map_err(|e| Rejection::Malformed(format!("digest: {e:?}")))?;
-    let per_signature = admin_quorum::match_signatures(exp.keys, &digest, &signatures);
+    let per_signature = admin_quorum::match_signatures(exp.keys, &digest, &signatures)
+        .map_err(|e| Rejection::TooManySignatures(e.submitted))?;
     match admin_quorum::quorum_decision(
         &per_signature,
         |idx, role| exp.keys[idx].authorizes(role),
@@ -470,6 +497,57 @@ mod tests {
         assert_eq!(verify(&m, &e, |_| false), Err(Rejection::OtherAgent));
         let unlock = SignedPayload::new_unlock([9; 32], NOW, AGENT);
         let m = signed(&unlock, &by, 4242);
+        assert_eq!(verify(&m, &e, |_| false), Err(Rejection::NotAShutdown));
+    }
+
+    /// External audit AUT-005 / AUT-001: a marker is judged as the agent
+    /// judges the request — at most `MAX_SUBMITTED_SIGNATURES` signatures,
+    /// refused before any is decoded, and a shutdown `op` carrying another
+    /// operation's `extra` is not a shutdown.
+    #[test]
+    fn oversized_or_mismatched_markers_are_refused() {
+        use crate::wire::admin_signed_payload::{OperationExtra, UnlockExtra};
+        let a = admins();
+        let e = exp(&a.keys);
+        let payload = shutdown(NOW, 30);
+        let two = [
+            sign(&payload, &a.sks[0]).unwrap(),
+            sign(&payload, &a.sks[1]).unwrap(),
+        ];
+        let at_cap: Vec<[u8; 64]> = two
+            .iter()
+            .cycle()
+            .take(admin_quorum::MAX_SUBMITTED_SIGNATURES)
+            .copied()
+            .collect();
+        let m = ShutdownMarker::new(&payload, &at_cap, 4242).unwrap();
+        assert!(
+            verify(&m, &e, |_| false).is_ok(),
+            "the cap itself is accepted"
+        );
+        let mut over = at_cap.clone();
+        over.push(two[0]);
+        let m = ShutdownMarker::new(&payload, &over, 4242).unwrap();
+        assert_eq!(
+            verify(&m, &e, |_| false),
+            Err(Rejection::TooManySignatures(
+                admin_quorum::MAX_SUBMITTED_SIGNATURES + 1
+            ))
+        );
+        let mut garbage = m.clone();
+        garbage.signatures = alloc::vec![String::from("zz"); 1000];
+        assert_eq!(
+            verify(&garbage, &e, |_| false),
+            Err(Rejection::TooManySignatures(1000))
+        );
+        assert!(Rejection::TooManySignatures(17)
+            .to_string()
+            .contains("at most 8"));
+        let mismatched = SignedPayload {
+            extra: OperationExtra::Unlock(UnlockExtra {}),
+            ..payload
+        };
+        let m = signed(&mismatched, &[&a.sks[0], &a.sks[1]], 4242);
         assert_eq!(verify(&m, &e, |_| false), Err(Rejection::NotAShutdown));
     }
 }

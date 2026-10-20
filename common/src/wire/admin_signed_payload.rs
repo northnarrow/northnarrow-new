@@ -942,6 +942,12 @@ pub enum SignedPayloadError {
         op: OperationCode,
         extra_op: OperationCode,
     },
+    /// External audit AUT-001: a well-formed payload for another
+    /// operation than the one the verifier expects ([`check_op`]).
+    UnexpectedOperation {
+        expected: OperationCode,
+        got: OperationCode,
+    },
     /// A peer wire byte did not match any known [`OperationCode`]
     /// discriminant. Bubbles up out of `OperationCode::try_from`
     /// during `serde` deserialisation.
@@ -966,6 +972,9 @@ impl core::fmt::Display for SignedPayloadError {
                 f,
                 "op/extra mismatch: payload.op={op:?} but extra is for {extra_op:?}"
             ),
+            Self::UnexpectedOperation { expected, got } => {
+                write!(f, "payload is for {got:?}, expected {expected:?}")
+            }
             Self::UnknownOperationCode(v) => write!(f, "unknown operation code {v}"),
             Self::UnknownRole(v) => write!(f, "unknown role {v}"),
             Self::UnknownCanaryType(v) => write!(f, "unknown canary type {v}"),
@@ -1027,18 +1036,20 @@ pub fn sign(
     Ok(sig.to_bytes())
 }
 
-/// Verify `signature` against `payload` under `verifying_key`.
+/// External audit AUT-001: the one check of a payload's operation, run by
+/// every verifier before any signature work. `payload.op` must agree with
+/// the `extra` variant ([`OperationExtraMismatch`] — the CBOR layer
+/// round-trips both independently, so a hand-built payload can pair a
+/// `Shutdown` op with an `Unlock` extra, and a dispatcher reading the
+/// extra would then act on fields nobody meant for it) and be `expected`,
+/// the operation of the request it came in ([`UnexpectedOperation`]).
+/// [`verify`], which has no expected operation, checks the first alone.
 ///
-/// The verification re-serialises `payload` locally and re-hashes
-/// before calling `ed25519-dalek`'s `verify_strict` — so a peer
-/// cannot alter the wire bytes between hashing and Ed25519 without
-/// breaking the signature. The op/extra invariant is checked first
-/// because a mismatch indicates malformed input regardless of the
-/// signature outcome and surfaces a more actionable error.
-pub fn verify(
+/// [`OperationExtraMismatch`]: SignedPayloadError::OperationExtraMismatch
+/// [`UnexpectedOperation`]: SignedPayloadError::UnexpectedOperation
+pub fn check_op(
     payload: &SignedPayload,
-    signature: &[u8; SIGNATURE_LENGTH],
-    verifying_key: &VerifyingKey,
+    expected: OperationCode,
 ) -> Result<(), SignedPayloadError> {
     let extra_op = payload.extra.op_code();
     if payload.op != extra_op {
@@ -1047,6 +1058,29 @@ pub fn verify(
             extra_op,
         });
     }
+    if payload.op != expected {
+        return Err(SignedPayloadError::UnexpectedOperation {
+            expected,
+            got: payload.op,
+        });
+    }
+    Ok(())
+}
+
+/// Verify `signature` against `payload` under `verifying_key`.
+///
+/// The verification re-serialises `payload` locally and re-hashes
+/// before calling `ed25519-dalek`'s `verify_strict` — so a peer
+/// cannot alter the wire bytes between hashing and Ed25519 without
+/// breaking the signature. The op/extra invariant ([`check_op`]) is
+/// checked first because a mismatch indicates malformed input regardless
+/// of the signature outcome and surfaces a more actionable error.
+pub fn verify(
+    payload: &SignedPayload,
+    signature: &[u8; SIGNATURE_LENGTH],
+    verifying_key: &VerifyingKey,
+) -> Result<(), SignedPayloadError> {
+    check_op(payload, payload.op)?;
     let digest = signing_digest(payload)?;
     let sig = Signature::from_bytes(signature);
     verifying_key
@@ -1925,6 +1959,45 @@ mod tests {
                 assert_eq!(extra_op, OperationCode::Shutdown);
             }
             other => panic!("expected OperationExtraMismatch first, got {other:?}"),
+        }
+    }
+
+    /// External audit AUT-001: `check_op` accepts every constructor's
+    /// payload for its own operation only, and refuses a hand-built
+    /// payload whose `extra` belongs to another operation even when the
+    /// verifier expects `payload.op`.
+    #[test]
+    fn check_op_binds_op_extra_and_the_expected_operation() {
+        for payload in one_payload_per_op() {
+            check_op(&payload, payload.op).expect("constructor payloads hold the invariant");
+            let other = if payload.op == OperationCode::Unlock {
+                OperationCode::Shutdown
+            } else {
+                OperationCode::Unlock
+            };
+            match check_op(&payload, other) {
+                Err(SignedPayloadError::UnexpectedOperation { expected, got }) => {
+                    assert_eq!(expected, other);
+                    assert_eq!(got, payload.op);
+                }
+                r => panic!("expected UnexpectedOperation, got {r:?}"),
+            }
+        }
+        let mismatched = SignedPayload {
+            op: OperationCode::Shutdown,
+            nonce: nonce(),
+            ts: TS,
+            agent_id: agent_id(),
+            extra: OperationExtra::Unlock(UnlockExtra {}),
+        };
+        for expected in [OperationCode::Shutdown, OperationCode::Unlock] {
+            match check_op(&mismatched, expected) {
+                Err(SignedPayloadError::OperationExtraMismatch { op, extra_op }) => {
+                    assert_eq!(op, OperationCode::Shutdown);
+                    assert_eq!(extra_op, OperationCode::Unlock);
+                }
+                r => panic!("expected OperationExtraMismatch, got {r:?}"),
+            }
         }
     }
 

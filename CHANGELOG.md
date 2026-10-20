@@ -61,6 +61,60 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, signed-request verification (Low ASK-017
+  NN-AUD-243, AUT-001 NN-AUD-244, AUT-005 NN-AUD-245, AUT-006 NN-AUD-246;
+  lab PR 192). AUT-001: the live verify of a signed request compared only
+  the payload's `op` tag with the request, while the dispatchers read its
+  `extra`; the two are encoded independently, so a payload pairing the
+  `shutdown` tag with an `unlock` extra, signed by two `shutdown` keys,
+  verified, and `dispatch_shutdown` wrote the marker on a 30 s grace nobody
+  signed (`_ => 30`, under a comment saying the invariant was enforced
+  upstream). `admin_signed_payload::check_op` (the tag is the request's
+  operation, the extra that operation's) is now the one check every
+  verifier runs first — live requests, stored overlay signatures,
+  `admin_signed_payload::verify` — refused as `UnknownOperation` (counted
+  against the connection) before any Ed25519 work, the journal line naming
+  the extra's operation; the shutdown fallback refuses, and the two
+  comments that claimed the check are corrected. Latent: `nn-admin` always
+  builds matching payloads. AUT-005: only the 64 KiB frame bounded the
+  signatures of one submission (about 1,000, each checked against every
+  key, a quadratic tally, and a quorum shortfall is not counted):
+  `admin_quorum::MAX_SUBMITTED_SIGNATURES` = 8, enforced inside
+  `match_signatures` (no caller can skip it) and checked first by the
+  agent's three verify paths and by the watchdog's marker verify. Over it:
+  `InvalidSignature` on the wire, counted (`AdminAuthError::
+  TooManySignatures`, journal reason `too_many_signatures`), and
+  `Rejection::TooManySignatures` for a marker, before its signatures are
+  decoded. The cap is 8, not the triage's 16: the Kani proof of the quorum
+  rule now covers every submission length up to the cap (it stopped at 4),
+  and at 16 it outgrew a CI runner (over 20 minutes and 16 GB before it was
+  stopped; at 8, 5 minutes and 7 GB). AUT-006: `rotate-keys revoke`
+  dropped every `admin.pub` line whose 4-byte fingerprint matched, so with
+  two keys sharing it both went, and `add` refused a different key with a
+  colliding fingerprint as "already present". Revoke now refuses a
+  fingerprint that names two different keys (`RotateKeysError::
+  AmbiguousFingerprint`, the file byte for byte as it was; the lines of one
+  key listed twice still all go), and add tells the same key (its 32 bytes,
+  `KeyAlreadyPresent`) from a collision (`FingerprintCollision`); both stay
+  `InvalidSignature` on the wire, named in the `admin.rotate_keys` journal
+  line and listed in `nn-admin`'s message. ASK-017: a verified `unlock`
+  whose COMBAT release failed for any reason but "not in COMBAT" was
+  answered — and recorded — as `Success`; it is `InvalidSignature` with an
+  ERROR, so the audit row says `failure` (unreachable today: the release
+  refuses only `NotInCombat`; what the release hook does with the token
+  stays unobservable). **Regressions / changes:** the wire format, every
+  existing signature and every `nn-admin` verb are unchanged; a submission
+  of more than 8 signatures is refused (no in-repo client sends more than
+  two), and the watchdog refuses a marker carrying more (the agent never
+  writes one); a revoke of a fingerprint two different keys share removes
+  nothing, and adding a colliding key is reported as a collision (exit 2,
+  as before) — reachable only with a crafted collision; the exit-2 message
+  of `rotate-keys` lists the new refusals; `SignedPayloadError::
+  UnexpectedOperation`, `AdminAuthError::TooManySignatures`,
+  `RotateKeysError::{FingerprintCollision, AmbiguousFingerprint}` and
+  `Rejection::TooManySignatures` are new, and `admin_quorum::
+  match_signatures` returns a `Result`. Upgrade notes §3, design §3.3,
+  §6.3 and §7.2.
 - External audit, Wave 3, ADE runtime hygiene (Low LLMP-005 NN-AUD-319,
   LLMP-010 NN-AUD-322, LLMR-009 NN-AUD-325, LLMR-018 NN-AUD-328, LLMR-020
   NN-AUD-433, XAI-017 NN-AUD-351; lab PR 191). LLMR-009: the ADE load set
