@@ -1387,6 +1387,8 @@ fn enroll_path(
         return false;
     };
     watch_inode(key, path, class, path_map, watched_paths);
+    // External audit EBPF-016: a new watch on overlayfs, FUSE or NFS.
+    crate::fs_type::note_identity(Path::new(path));
     if class == WatchClass::Configured {
         enroll_chain(path, path_map, watched_paths);
     }

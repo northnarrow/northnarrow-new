@@ -77,9 +77,12 @@ use tracing::{debug, error, info, warn};
 // without pulling the rest of `agent`. Re-exported here so
 // every pre-extraction caller (sensors/multiplexer.rs,
 // filesystem.rs, main.rs, tests) keeps compiling byte-identically.
+// External audit EBPF-020 (NN-AUD-271): `attach_lsm` — reuse of any pinned
+// link without an identity check — and `fresh_attach_and_pin`, its only
+// user, are gone; `reattach_fresh` is the one pinned LSM attach.
 pub use antitamper_bpf::{
-    attach_lsm, attach_transient, fresh_attach_and_pin, lsm_pin_paths, prepare_pin_root,
-    purge_stale_pin, read_proc_comm, read_self_comm, reattach_fresh, DEFAULT_BPFFS_ROOT,
+    attach_transient, lsm_pin_paths, pin_root_refusal, prepare_pin_root, purge_stale_pin,
+    read_proc_comm, read_self_comm, reattach_fresh, DEFAULT_BPFFS_ROOT,
     PROTECTED_OBSERVERS_MAP_NAME, PROTECTED_PIDS_MAP_NAME,
 };
 
@@ -241,9 +244,9 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     // kernel 6.8 it does not, leaving the watchdog's
     // `ProtectedPidsHandle::open(bpffs_root)` unable to find the
     // map. Explicit pin here closes the gap. purge_stale_pin +
-    // pin mirrors the W1 attach_lsm idiom: a leftover pin from a
-    // prior wedged boot may point at a dead kernel map, so we
-    // always re-pin against the live map this boot loaded.
+    // pin: a leftover pin from a prior wedged boot may point at a
+    // dead kernel map, so we always re-pin against the live map
+    // this boot loaded.
     if let Some(root) = prepare_pin_root() {
         let map_pin_path = root.join(PROTECTED_PIDS_MAP_NAME);
         purge_stale_pin(&map_pin_path);
@@ -360,6 +363,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
             return deny_shortfall(
                 LSM_DENY_HOOKS_EXPECTED,
                 0,
+                &[],
                 &[format!(
                     "vmlinux BTF unavailable ({e:#}) — no LSM hook can attach: kernel built \
                      without CONFIG_DEBUG_INFO_BTF, or /sys/kernel/btf hidden"
@@ -383,9 +387,18 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     // Audit `ebpf-lsm-1`: every deny-hook attach failure used to be a
     // lone WARN while the agent kept reporting healthy. Collect them all,
     // emit ONE aggregate health line, and fail closed by default.
-    let mut deny_failures: Vec<(&'static str, String)> = Vec::new();
+    // External audit ATP-016 (NN-AUD-264): a missing hook and a failed step
+    // that is not a hook are kept apart, so the line counts hooks.
+    let mut deny = DenyHealth::default();
     if let Err(e) = ptrace_override_zeroed {
-        deny_failures.push(("ptrace_override_boot_zero", format!("{e:#}")));
+        deny.infra_failure("ptrace_override_boot_zero", format!("{e:#}"));
+    }
+    // External audit ATP-007 (NN-AUD-260): a pin root that is a symbolic
+    // link is not used (`prepare_pin_root` returned `None` without touching
+    // its target): every hook below attaches without a pin, and the start
+    // is refused.
+    if let Some(why) = pin_root_refusal() {
+        deny.infra_failure("bpffs pin root", why);
     }
 
     // Review 62: task_kill and ptrace_access_check emit their denials on
@@ -401,7 +414,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
             error = %e,
             "anti-tamper: LSM hook attach FAILED — agent killable by root"
         );
-        deny_failures.push((TASK_KILL_PROGRAM, format!("{e:#}")));
+        deny.missing_hook(TASK_KILL_PROGRAM, format!("{e:#}"));
     }
 
     if let Err(e) = reattach_fresh(ebpf, PTRACE_PROGRAM, PTRACE_HOOK, &btf, pin_root) {
@@ -411,7 +424,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
             error = %e,
             "anti-tamper: LSM hook attach FAILED — agent inspectable by root"
         );
-        deny_failures.push((PTRACE_PROGRAM, format!("{e:#}")));
+        deny.missing_hook(PTRACE_PROGRAM, format!("{e:#}"));
     }
 
     // Tappa 7 task 5: directory + inode protection. A bootstrap failure
@@ -422,21 +435,32 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     // External audit EBPF-015: the optional deny hooks this kernel has
     // count as expected ones.
     let mut deny_expected = LSM_DENY_HOOKS_EXPECTED;
-    match filesystem::attach(ebpf, &btf, pin_root) {
-        Ok(fs) => {
-            deny_failures.extend(fs.deny_failures);
-            observe_failures.extend(fs.observe_failures);
-            deny_expected += fs.optional_present;
-        }
-        Err(e) => {
-            warn!(error = %e, "anti-tamper FS: bootstrap failed — no FS deny hook attached");
-            deny_failures.push(("filesystem::attach", format!("{e:#}")));
-        }
+    // External audit ATP-016: a bootstrap failure is every FS deny hook
+    // missing (thirteen, plus the optional ones this kernel has), not one.
+    let fs = filesystem::attach(ebpf, &btf, pin_root).unwrap_or_else(|e| {
+        warn!(
+            error = format!("{e:#}"),
+            "anti-tamper FS: bootstrap failed — no FS deny hook attached"
+        );
+        filesystem::hooks_lost_to_bootstrap_failure(
+            btf_revalidate::optional_hook_in_kernel,
+            format!("{e:#}"),
+        )
+    });
+    for (program, why) in fs.deny_failures {
+        deny.missing_hook(program, why);
     }
+    for (step, why) in fs.infra_failures {
+        deny.infra_failure(step, why);
+    }
+    observe_failures.extend(fs.observe_failures);
+    deny_expected += fs.optional_present;
 
     // BPF self-defence (Tappa 10.8): map guard (deny) + bpf() observer.
     let bd = bpf_defense::attach(ebpf, &btf, pin_root);
-    deny_failures.extend(bd.deny_failures);
+    for (program, why) in bd.deny_failures {
+        deny.missing_hook(program, why);
+    }
     observe_failures.extend(bd.observe_failures);
     // Every program is loaded now: register the agent's own object ids
     // and arm the mode. A failure leaves the guard with an empty set
@@ -459,12 +483,18 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
             if let Some(why) =
                 bpf_defense::observe_shortfall(o.enforce, cfg!(feature = "debug-trigger"))
             {
-                deny_failures.push(("bpf_map_guard", why));
+                deny.missing_hook(bpf_defense::GUARD_PROGRAM, why);
             }
         }
         Err(e) => {
             warn!(error = format!("{e:#}"), "BPF self-defence: own-object registration FAILED — the map guard has nothing to protect");
-            deny_failures.push(("bpf_defense::register_own_objects", format!("{e:#}")));
+            // External audit ATP-016: a guard with no own object to
+            // recognise refuses nothing — the `bpf_map` deny is missing,
+            // like an observing one (ATP-009), and counted once.
+            deny.missing_hook(
+                bpf_defense::GUARD_PROGRAM,
+                format!("own objects not registered, nothing to protect: {e:#}"),
+            );
         }
     }
     // Review entry 39: now that every pin of this boot exists, protect the
@@ -475,7 +505,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
                 error = format!("{e:#}"),
                 "anti-tamper FS: bpffs pins NOT registered — the pin root stays removable by root"
             );
-            deny_failures.push(("filesystem::register_bpffs_pins", format!("{e:#}")));
+            deny.infra_failure("filesystem::register_bpffs_pins", format!("{e:#}"));
         }
     }
     // Review 63: every inode this boot protects is registered now; the
@@ -492,7 +522,62 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
         ),
     }
 
-    report_lsm_health(deny_expected, &deny_failures, &observe_failures)
+    report_lsm_health(deny_expected, &deny, &observe_failures)
+}
+
+/// External audit ATP-016 (NN-AUD-264): what the boot's deny side lacks,
+/// by kind. `missing` holds one entry per deny program that is not
+/// attached and armed — a bootstrap failure of the FS protection is one
+/// entry per FS deny hook, a BPF guard that refuses nothing (observe mode,
+/// no own object registered) the guard's — and `deny_attached` is the
+/// expected count less these. `infra` holds the steps that are not hooks:
+/// the boot-zeroed ptrace override, the pin registration, a linked agent
+/// directory or pin root. They never lower the hook count, and they refuse
+/// the start like a missing hook. The line used to subtract every entry,
+/// so one bootstrap failure read "15 of 16 attached" with 13 hooks absent.
+#[derive(Debug, Default)]
+pub(crate) struct DenyHealth {
+    pub missing: Vec<(&'static str, String)>,
+    pub infra: Vec<(&'static str, String)>,
+}
+
+impl DenyHealth {
+    /// `program` is not attached or not armed; a second reason for the
+    /// same program is added to the first, not counted again.
+    pub(crate) fn missing_hook(&mut self, program: &'static str, why: String) {
+        match self.missing.iter_mut().find(|(p, _)| *p == program) {
+            Some((_, first)) => {
+                first.push_str("; ");
+                first.push_str(&why);
+            }
+            None => self.missing.push((program, why)),
+        }
+    }
+
+    pub(crate) fn infra_failure(&mut self, step: &'static str, why: String) {
+        self.infra.push((step, why));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.infra.is_empty()
+    }
+}
+
+/// External audit ATP-016: what this boot runs without — a deny shortfall
+/// started under [`ALLOW_DEGRADED_ENV`], a missing observe hook — for one
+/// signed `subsystem_degraded` each once the audit log is open
+/// ([`take_degraded_boot_details`]). The journal line alone was the only
+/// trace of a degraded start.
+static DEGRADED_BOOT: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// The degraded states [`attach`] found this boot (each once), for the
+/// signed chain.
+pub fn take_degraded_boot_details() -> Vec<String> {
+    std::mem::take(&mut *DEGRADED_BOOT.lock())
+}
+
+fn named(entries: &[(&'static str, String)]) -> Vec<String> {
+    entries.iter().map(|(p, e)| format!("{p}: {e}")).collect()
 }
 
 /// The LSM hooks of the deny set, by the hook name their pins carry
@@ -541,67 +626,111 @@ const LSM_DENY_HOOKS_EXPECTED: usize = DENY_HOOKS.len();
 pub const ALLOW_DEGRADED_ENV: &str = "NN_ANTI_TAMPER_ALLOW_DEGRADED";
 
 /// One aggregate, machine-readable health line (audit `ebpf-lsm-1`), then
-/// the fail-closed decision: any missing DENY hook refuses to start unless
-/// [`ALLOW_DEGRADED_ENV`] is `1`. Missing OBSERVE hooks (module-load) are
-/// reported but never fatal — no protection is absent, only R018's input.
+/// the fail-closed decision: any missing DENY hook, or failed protection
+/// step, refuses to start unless [`ALLOW_DEGRADED_ENV`] is `1`. Missing
+/// OBSERVE hooks (module-load, the bpf() observer, the role watch) are
+/// reported but never fatal — no protection is absent, only telemetry.
+/// The line keeps the keys `release-check.sh` reads (`deny_attached=N
+/// deny_expected=N`); `deny_attached` counts hooks (external audit
+/// ATP-016).
 fn report_lsm_health(
     deny_expected: usize,
-    deny_failures: &[(&'static str, String)],
+    deny: &DenyHealth,
     observe_failures: &[(&'static str, String)],
 ) -> Result<()> {
-    let deny_attached = deny_expected.saturating_sub(deny_failures.len());
-    if deny_failures.is_empty() && observe_failures.is_empty() {
+    let deny_attached = deny_expected.saturating_sub(deny.missing.len());
+    if deny.is_empty() && observe_failures.is_empty() {
         info!(
             deny_attached,
             deny_expected, "anti-tamper: all LSM hooks attached"
         );
         return Ok(());
     }
-    let failed: Vec<String> = deny_failures
-        .iter()
-        .chain(observe_failures.iter())
-        .map(|(p, e)| format!("{p}: {e}"))
-        .collect();
-    if deny_failures.is_empty() {
+    let observe_failed = named(observe_failures);
+    if !observe_failed.is_empty() {
+        DEGRADED_BOOT.lock().push(format!(
+            "anti-tamper observe hooks not attached ({}): their telemetry is absent this boot \
+             (module-load records for R018, the bpf() observer, the role liveness watch); no \
+             deny is missing for it",
+            observe_failed.join("; ")
+        ));
+    }
+    if deny.is_empty() {
         warn!(
             deny_attached,
             deny_expected,
-            observe_failed = ?failed,
+            observe_failed = ?observe_failed,
             "anti-tamper: OBSERVE HOOK SHORTFALL — module-load telemetry absent (R018 blind)"
         );
         return Ok(());
     }
-    deny_shortfall(deny_expected, deny_attached, &failed)
+    deny_shortfall(
+        deny_expected,
+        deny_attached,
+        &named(&deny.missing),
+        &named(&deny.infra),
+    )
 }
 
 /// The fail-closed decision on a deny-hook shortfall, shared by the
 /// per-hook report and the no-BTF path (review 53): refuse to start
-/// unless [`ALLOW_DEGRADED_ENV`] is `1`.
-fn deny_shortfall(deny_expected: usize, deny_attached: usize, failed: &[String]) -> Result<()> {
+/// unless [`ALLOW_DEGRADED_ENV`] is `1`. `missing` names the deny hooks
+/// not attached and armed, `infra` the failed steps that are not hooks
+/// (external audit ATP-016).
+fn deny_shortfall(
+    deny_expected: usize,
+    deny_attached: usize,
+    missing: &[String],
+    infra: &[String],
+) -> Result<()> {
     let allow_degraded = std::env::var(ALLOW_DEGRADED_ENV)
         .map(|v| v == "1")
         .unwrap_or(false);
+    decide_shortfall(allow_degraded, deny_expected, deny_attached, missing, infra)
+}
+
+/// [`deny_shortfall`] with the opt-in read: refuse, or record the degraded
+/// start for the signed chain and run.
+fn decide_shortfall(
+    allow_degraded: bool,
+    deny_expected: usize,
+    deny_attached: usize,
+    missing: &[String],
+    infra: &[String],
+) -> Result<()> {
     error!(
         deny_attached,
         deny_expected,
-        failed = ?failed,
+        missing = ?missing,
+        infra_failed = ?infra,
         allow_degraded,
         "anti-tamper: DENY HOOK SHORTFALL — a protection is silently absent"
     );
+    let mut what = format!("{deny_attached} of {deny_expected} deny hooks attached and armed");
+    if !missing.is_empty() {
+        what.push_str(&format!("; missing: {}", missing.join("; ")));
+    }
+    if !infra.is_empty() {
+        what.push_str(&format!(
+            "; {} protection step(s) failed: {}",
+            infra.len(),
+            infra.join("; ")
+        ));
+    }
     if allow_degraded {
         error!(
             "anti-tamper: running DEGRADED because {ALLOW_DEGRADED_ENV}=1 — \
              {} of {} deny hooks attached",
             deny_attached, deny_expected
         );
+        DEGRADED_BOOT.lock().push(format!(
+            "anti-tamper running degraded ({ALLOW_DEGRADED_ENV}=1): {what}"
+        ));
         return Ok(());
     }
     anyhow::bail!(
-        "anti-tamper deny hook shortfall: {} of {} attached ({}). Refusing to run with a \
-         silently-absent protection; set {ALLOW_DEGRADED_ENV}=1 to start degraded.",
-        deny_attached,
-        deny_expected,
-        failed.join("; ")
+        "anti-tamper deny hook shortfall: {what}. Refusing to run with a silently-absent \
+         protection; set {ALLOW_DEGRADED_ENV}=1 to start degraded."
     )
 }
 
@@ -987,11 +1116,13 @@ fn evict_stale_observers(ebpf: &mut Ebpf) -> Result<usize> {
 /// on the multiplexer's Ebpf instance — the timer is its own
 /// independent writer.
 ///
-/// `bpffs_root` is `None` ⇒ no bpffs ⇒ no-op (the pinning step
-/// was also skipped at boot; the map only exists in-process and
-/// the kernel hook has no map binding). Logs degraded-mode at
-/// info; refresh continues to try every tick in case bpffs becomes
-/// available (e.g. operator mounts it post-boot).
+/// `bpffs_root` is `None` ⇒ no bpffs ⇒ no-op, silent here (the
+/// pinning step was also skipped at boot; the map only exists
+/// in-process and the kernel hook has no map binding). The degraded
+/// mode is logged by [`prepare_pin_root`], at WARN, which the refresh
+/// task calls before its loop; the shipped unit does not start without
+/// bpffs (`ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf`). External
+/// audit ATP-015: this comment used to claim an info line of its own.
 pub fn register_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<()> {
     let Some(root) = bpffs_root else {
         // No bpffs ⇒ no pinned map to write. The kernel hook will
@@ -1009,6 +1140,10 @@ pub fn register_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Resul
 /// timer when the watchdog's verification flips from Verified back
 /// to NotPresent / Unverifiable / ExeMismatch — withdraws observer
 /// rights so a recycled or substituted PID can't keep them.
+///
+/// `bpffs_root` is `None` ⇒ a true no-op: without bpffs
+/// [`register_protected_observer`] never wrote a pinned map, so there is
+/// nothing to withdraw (external audit ATP-015).
 pub fn evict_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<()> {
     let Some(root) = bpffs_root else {
         return Ok(());
@@ -1020,11 +1155,11 @@ pub fn evict_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<(
 }
 
 // ISSUE_002 extraction note: read_self_comm, read_proc_comm,
-// lsm_pin_paths, purge_stale_pin, fresh_attach_and_pin,
-// attach_transient, attach_lsm — plus their unit tests — all moved
-// to `northnarrow-antitamper-bpf` and are re-exported via the
-// `pub use` block at the top of this module. Functional behaviour
-// is byte-identical; the only delta is the home crate.
+// lsm_pin_paths, purge_stale_pin, attach_transient,
+// reattach_fresh — plus their unit tests — all moved to
+// `northnarrow-antitamper-bpf` and are re-exported via the
+// `pub use` block at the top of this module (`attach_lsm` and
+// `fresh_attach_and_pin` were removed, external audit EBPF-020).
 
 #[cfg(test)]
 mod tests {
@@ -1066,10 +1201,127 @@ mod tests {
         if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
             return;
         }
-        let failed = [("protected_create_deny", "verifier rejected".to_string())];
-        let err = report_lsm_health(LSM_DENY_HOOKS_EXPECTED + 2, &failed, &[])
+        let mut deny = DenyHealth::default();
+        deny.missing_hook("protected_create_deny", "verifier rejected".to_string());
+        let err = report_lsm_health(LSM_DENY_HOOKS_EXPECTED + 2, &deny, &[])
             .expect_err("a missing create deny must refuse to start");
         assert!(format!("{err:#}").contains("17 of 18"), "{err:#}");
+    }
+
+    /// External audit ATP-016 (NN-AUD-264): an FS bootstrap failure is the
+    /// thirteen FS deny hooks missing (plus the optional ones the kernel
+    /// has), so the line reads 3 of 16 — task_kill, ptrace, the BPF guard —
+    /// where it read 15 of 16.
+    #[test]
+    fn fs_bootstrap_failure_counts_every_fs_hook() {
+        if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
+            return;
+        }
+        for (in_kernel, expected, attached) in
+            [(None, 16, 3), (Some(false), 16, 3), (Some(true), 19, 3)]
+        {
+            let fs = filesystem::hooks_lost_to_bootstrap_failure(
+                |_| in_kernel,
+                "preparing /var/lib/northnarrow: a symbolic link".to_string(),
+            );
+            assert_eq!(fs.observe_failures.len(), 2, "the module-load observers");
+            let mut deny = DenyHealth::default();
+            for (p, w) in fs.deny_failures {
+                deny.missing_hook(p, w);
+            }
+            for (p, w) in fs.infra_failures {
+                deny.infra_failure(p, w);
+            }
+            let err = report_lsm_health(
+                LSM_DENY_HOOKS_EXPECTED + fs.optional_present,
+                &deny,
+                &fs.observe_failures,
+            )
+            .expect_err("an FS bootstrap failure refuses to start");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("{attached} of {expected} deny hooks")),
+                "{msg}"
+            );
+            assert!(msg.contains("protected_create_deny"), "{msg}");
+            assert!(
+                msg.contains("1 protection step(s) failed: filesystem::attach"),
+                "{msg}"
+            );
+            assert!(msg.contains("a symbolic link"), "{msg}");
+        }
+    }
+
+    /// External audit ATP-016: a failed step that is not a hook refuses the
+    /// start without lowering the hook count, and a guard that refuses
+    /// nothing for two reasons is one missing hook.
+    #[test]
+    fn infra_failure_does_not_lower_the_hook_count() {
+        if std::env::var(ALLOW_DEGRADED_ENV).as_deref() == Ok("1") {
+            return;
+        }
+        let mut deny = DenyHealth::default();
+        deny.infra_failure("ptrace_override_boot_zero", "pin failed".to_string());
+        deny.infra_failure("filesystem::register_bpffs_pins", "listing".to_string());
+        let msg = format!(
+            "{:#}",
+            report_lsm_health(LSM_DENY_HOOKS_EXPECTED, &deny, &[]).unwrap_err()
+        );
+        assert!(msg.contains("16 of 16 deny hooks"), "{msg}");
+        assert!(msg.contains("2 protection step(s) failed"), "{msg}");
+        assert!(
+            msg.contains("ptrace_override_boot_zero: pin failed"),
+            "{msg}"
+        );
+
+        deny.missing_hook(bpf_defense::GUARD_PROGRAM, "observe mode".to_string());
+        deny.missing_hook(bpf_defense::GUARD_PROGRAM, "own objects".to_string());
+        assert_eq!(deny.missing.len(), 1, "one hook, two reasons");
+        let msg = format!(
+            "{:#}",
+            report_lsm_health(LSM_DENY_HOOKS_EXPECTED, &deny, &[]).unwrap_err()
+        );
+        assert!(msg.contains("15 of 16 deny hooks"), "{msg}");
+        assert!(
+            msg.contains("bpf_map_guard: observe mode; own objects"),
+            "{msg}"
+        );
+    }
+
+    /// External audit ATP-016: a degraded start and a missing observe hook
+    /// are kept for the signed chain, with what is missing.
+    #[test]
+    fn a_degraded_start_is_kept_for_the_signed_chain() {
+        decide_shortfall(
+            true,
+            16,
+            15,
+            &["protected_link_deny: nn-test-degraded-264".to_string()],
+            &[],
+        )
+        .expect("the opt-in starts degraded");
+        let deny = DenyHealth::default();
+        report_lsm_health(
+            16,
+            &deny,
+            &[(
+                "module_load_data_observe",
+                "nn-test-observe-264".to_string(),
+            )],
+        )
+        .expect("an observe shortfall is not fatal");
+        let kept = take_degraded_boot_details();
+        assert!(
+            kept.iter()
+                .any(|d| d.contains("15 of 16 deny hooks attached and armed")
+                    && d.contains("nn-test-degraded-264")
+                    && d.contains(ALLOW_DEGRADED_ENV)),
+            "{kept:?}"
+        );
+        assert!(
+            kept.iter().any(|d| d.contains("nn-test-observe-264")),
+            "{kept:?}"
+        );
     }
 
     /// Review 53: the no-BTF path and a per-hook shortfall share one
@@ -1083,6 +1335,7 @@ mod tests {
         let err = deny_shortfall(
             LSM_DENY_HOOKS_EXPECTED,
             0,
+            &[],
             &["vmlinux BTF unavailable (test)".to_string()],
         )
         .expect_err("a deny-hook shortfall must refuse to start");

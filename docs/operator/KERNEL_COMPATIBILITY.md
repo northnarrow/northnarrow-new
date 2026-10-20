@@ -323,6 +323,41 @@ and once on a btrfs subvolume, and requires NN-L-FIM-011 both times.
 Limit: a btrfs filesystem first mounted after the agent started
 (module loaded later) keeps the old keys until the agent restarts.
 
+## overlayfs, FUSE and NFS: inode identity unverified (lab PR 189)
+
+btrfs is the only filesystem whose `stat()` the eBPF side reproduces
+(`inode_dev::stat_dev`); everywhere else it takes the superblock's `s_dev`
+and `i_ino`. On three filesystems that is not known to be the pair
+`stat()` gives:
+
+- **overlayfs** (`0x794c7630`): `stat()` reports the device and inode of
+  the layer that holds the file (`ovl_getattr`), the hooks see the overlay
+  inode;
+- **FUSE** (`0x65735546`) and **NFS** (`0x6969`): inode numbers come from
+  a daemon or a server, and the file a hook sees can be another inode than
+  the one `stat()` named.
+
+A key that does not match fails silently both ways: a protected file is
+not denied, a watched one draws no FIM record. The agent does not try to
+prove the match in the kernel (a hook writing back what it sees costs
+verifier budget on 5.15 for an informational answer). It says where it
+cannot vouch: every path it keys by `(dev, ino)` — `PROTECTED_INODES`
+entries, FIM watches at boot and enrolled later — is checked with
+`statfs()`, and a boot that registered any on one of these filesystems
+logs one WARN `inode identity unverified …` and writes one signed
+`subsystem_degraded` with `reason: inode_identity_unverified`, the
+filesystems, their counts and the first five paths of each (external
+audit EBPF-016, NN-AUD-267). A path enrolled after that record, on a
+filesystem it did not name, is a WARN. A host with an overlay root (a
+container image, a live system) gets this record at every boot: put the
+agent's directories and the watched files on a filesystem the hooks key
+the same way (ext4, xfs, btrfs), or accept the limit.
+
+`deploy/lab/nn-lab.sh overlay-check` is the regression check, modelled on
+`btrfs-check`: a watched credential file on an overlay mount
+bind-mounted on `/root/.aws`, an agent restart, one read. NN-L-FIM-011 or
+the boot's signed record naming the file must be there; silence fails.
+
 ## Tracepoint layouts on vendor kernels (RHEL 9)
 
 Tracepoint programs read their arguments at fixed byte offsets inside the

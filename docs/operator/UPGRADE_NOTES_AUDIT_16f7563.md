@@ -285,6 +285,49 @@ packages open it themselves.
   build, `NN_BPF_DEFENSE_OBSERVE=1` makes the agent refuse to start unless
   `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` is also set; the agent's ring buffers
   and drop counters are guarded like its other maps.
+- **The agent's directories are never followed through a link**
+  (NN-AUD-260 ATP-007, lab PR 189). The agent refuses to start when
+  `/var/lib/northnarrow` is a symbolic link, or holds one where it keeps its
+  own entries (`quarantine`, `quarantine/vault`, `detections`, the chain
+  logs); the error names the link and its target, and the target is not
+  touched. It used to chmod the target 0700, chown it to root and — since
+  lab PR 152 — refuse every new entry in it: a link to `/etc` would have
+  made `/etc` refuse new files. `/etc/northnarrow`, the unit drop-in
+  directory and the bpffs pin root as links are not registered (nor, for
+  the pin root, chmodded or pinned into) and refuse the start the same way
+  (`DENY HOOK SHORTFALL`, a failed step `linked agent directory` or `bpffs
+  pin root`); a file of the agent's that is a link is registered as the
+  link, not its target. **Regression:** an install that put the state
+  directory elsewhere with a symbolic link does not start: move the
+  directory back and bind-mount the other location instead
+  (`mount --bind /data/nn-state /var/lib/northnarrow`, or a `.mount` unit
+  ordered before `northnarrow-agent.service`). A pin-root link goes with a
+  remount of `/sys/fs/bpf` (agent stopped).
+- **The anti-tamper health line counts hooks** (NN-AUD-264 ATP-016, lab PR
+  189). `deny_attached=N deny_expected=N` keep their names; a failed FS
+  bootstrap now reads 3 of 16 (task_kill, ptrace, the BPF guard), not 15
+  of 16, and the `DENY HOOK SHORTFALL` line carries `missing=[…]` (the
+  deny hooks not attached and armed) and `infra_failed=[…]` (failed steps
+  that are not hooks: the boot-zeroed ptrace override, the pin
+  registration, a linked directory). Both refuse the start as before. A
+  start under `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, and missing observe hooks
+  (module-load, the bpf() observer, the role watch), are now also in the
+  signed chain: one `subsystem_degraded` for each of the two, with what is
+  missing.
+- **Foreign `link_*` entries in the pin root are reported, not adopted**
+  (NN-AUD-265 ATP-017, lab PR 189). Only pins whose link runs one of the
+  agent's programs are registered as its own; every other `link_*` entry
+  (a stale pin of an earlier build, a planted one) is a WARN and one signed
+  `integrity_drift` (`foreign_pin`) at boot, and is not removed. 64 or more
+  of them no longer refuse the start. Remove them inside a window, or with
+  a remount of `/sys/fs/bpf` with the agent stopped.
+- **overlayfs, FUSE and NFS paths are attested** (NN-AUD-267 EBPF-016, lab
+  PR 189). A boot that protects or watches a path on one of them logs a
+  WARN and writes one signed `subsystem_degraded` (`reason:
+  inode_identity_unverified`): there the agent cannot vouch that a deny or
+  a FIM record follows. A host with an overlay root gets it at every boot.
+  See
+  [KERNEL_COMPATIBILITY.md](KERNEL_COMPATIBILITY.md#overlayfs-fuse-and-nfs-inode-identity-unverified-lab-pr-189).
 
 ## 3. `nn-admin`: new and changed verbs, roles
 

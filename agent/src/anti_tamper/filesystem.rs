@@ -25,7 +25,6 @@
 
 use std::fs::DirBuilder;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -52,7 +51,7 @@ pub(crate) struct AyaInodeKey(pub(crate) InodeKey);
 // padding gaps, and `AyaInodeKey` is `#[repr(transparent)]` over
 // it. Every bit pattern is a valid `AyaInodeKey`.
 unsafe impl aya::Pod for AyaInodeKey {}
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// State directory that the agent owns. Kept in sync with future
 /// Tappa 8 paths that will live here (signed isolation state, audit
@@ -455,6 +454,52 @@ pub(crate) struct FsAttachHealth {
     /// this kernel has — attached or failed, they count as expected deny
     /// hooks.
     pub optional_present: usize,
+    /// External audit ATP-007 / ATP-016: protection steps that are not
+    /// hooks and failed — an agent directory found to be a symbolic link,
+    /// left unregistered; the bootstrap error itself. They refuse the start
+    /// without lowering the hook count.
+    pub infra_failures: Vec<(&'static str, String)>,
+}
+
+/// External audit ATP-016 (NN-AUD-264): the health of an FS bootstrap that
+/// failed before any hook — every deny program of [`LSM_PROGRAMS`], each
+/// of [`OPTIONAL_LSM_PROGRAMS`] whose hook this kernel has, the module-load
+/// observers — with the error as a failed step. `in_kernel` is the boot's
+/// BTF resolution ([`super::btf_revalidate::optional_hook_in_kernel`]); an
+/// optional hook whose presence is unknown is not counted (the attach
+/// finds that out by trying, and nothing was tried).
+pub(crate) fn hooks_lost_to_bootstrap_failure(
+    in_kernel: impl Fn(&str) -> Option<bool>,
+    why: String,
+) -> FsAttachHealth {
+    let lost = "not attached: the FS protection bootstrap failed".to_string();
+    let mut health = FsAttachHealth::default();
+    for (program, _) in LSM_PROGRAMS {
+        health.deny_failures.push((program, lost.clone()));
+    }
+    for (program, hook) in OPTIONAL_LSM_PROGRAMS {
+        if in_kernel(hook) == Some(true) {
+            health.optional_present += 1;
+            health.deny_failures.push((program, lost.clone()));
+        }
+    }
+    for (program, _) in MODULE_LOAD_PROGRAMS {
+        health.observe_failures.push((program, lost.clone()));
+    }
+    health.infra_failures.push(("filesystem::attach", why));
+    health
+}
+
+/// External audit ATP-007 (NN-AUD-260): the agent's directories outside
+/// the state directory that take [`PROTECTED_DIR_FLAGS`]: `/etc/northnarrow`
+/// and the unit drop-in directory. One found to be a symbolic link is not
+/// registered — its target is not known to be the agent's — and the start
+/// is refused (a failed step).
+fn linked_agent_dirs() -> Vec<String> {
+    std::iter::once(CONFIG_DIR)
+        .chain(NOCREATE_UNIT_DIRS.iter().copied())
+        .filter_map(|d| link_at(Path::new(d)))
+        .collect()
 }
 
 pub(crate) fn attach(
@@ -465,8 +510,10 @@ pub(crate) fn attach(
     let mut health = FsAttachHealth::default();
     let dir = Path::new(STATE_DIR);
 
-    // Step 1: ensure dir exists, mode 0700, root-owned.
-    ensure_state_dir(dir).with_context(|| format!("preparing {}", dir.display()))?;
+    // Step 1: ensure dir exists, mode 0700, root-owned — the directory
+    // itself, never a link's target (external audit ATP-007): `meta` is the
+    // repaired descriptor's, and its key is what Step 2 registers.
+    let meta = ensure_state_dir(dir).with_context(|| format!("preparing {}", dir.display()))?;
     // Step 1.5: the response executor's vault, before the dir is `+i`.
     if let Err(e) = ensure_quarantine_dirs(dir) {
         warn!(
@@ -474,8 +521,6 @@ pub(crate) fn attach(
             "anti-tamper FS: quarantine vault directory not created — a quarantine will fail"
         );
     }
-    let meta = std::fs::metadata(dir)
-        .with_context(|| format!("re-stating {} after mkdir", dir.display()))?;
     info!(
         path = %dir.display(),
         mode = format!("{:o}", meta.mode() & 0o7777),
@@ -496,6 +541,7 @@ pub(crate) fn attach(
     // NOCREATE (EBPF-015): `+i` kept new entries out only while root could
     // not clear it, and the agent lifts it for its own creates.
     register_inode(ebpf, &key, PROTECTED_DIR_FLAGS)?;
+    crate::fs_type::note_identity(dir);
     info!(
         path = %dir.display(),
         st_dev = st_dev, kernel_dev = key.dev, ino = key.ino,
@@ -511,6 +557,24 @@ pub(crate) fn attach(
             "anti-tamper FS: chattr +i failed — LSM still protects, but the kernel \
              immutable check is unavailable"
         ),
+    }
+
+    // External audit ATP-007: the other NOCREATE directories are never
+    // registered through a link (`register_etc_files`, `resolve_protected_paths`
+    // skip it); one that is a link refuses the start.
+    for link in linked_agent_dirs() {
+        error!(
+            link = %link,
+            "anti-tamper FS: one of the agent's directories is a symbolic link — not followed, \
+             its directory protection is NOT applied"
+        );
+        health.infra_failures.push((
+            "linked agent directory",
+            format!(
+                "{link}: not followed, the directory is not protected (put the real directory \
+                 back, or bind-mount one there)"
+            ),
+        ));
     }
 
     // Step 3.5 (Tappa 8 A14 / B4): register the six
@@ -750,6 +814,24 @@ pub(crate) fn lsm_hook_absent(err: &anyhow::Error, hook: &str) -> bool {
     })
 }
 
+/// External audit ATP-007 (NN-AUD-260): the metadata of the agent's own
+/// entry at `path` (`lstat`), never of what a link there points to. A link
+/// in one of the agent's directories was planted by a root: the link is
+/// registered (its unlink and rename are refused like the file's), not its
+/// target, which a registration by `stat` would have write-denied — a
+/// `fim_baseline.jsonl -> /etc/passwd` made `/etc/passwd` unwritable.
+fn own_entry_meta(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        warn!(
+            link = %link_at(path).unwrap_or_else(|| path.display().to_string()),
+            "anti-tamper FS: a symbolic link where the agent keeps its own file — the link is \
+             registered, not its target"
+        );
+    }
+    Ok(meta)
+}
+
 /// Tappa 8 A14 (B4): register each of the four [`ETC_PROTECTED_FILES`]
 /// in `PROTECTED_INODES` so the same LSM hooks that defend
 /// `/var/lib/northnarrow` also defend admin.pub / agent_id /
@@ -778,7 +860,9 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     // External audit EBPF-015: NOCREATE too — root could still add any
     // file next to the protected ones (a decoy overlay, a planted `.tmp`
     // name, a second key file).
-    match std::fs::metadata(etc_dir) {
+    // External audit ATP-007: the directory itself (`lstat`); a link is not
+    // registered (`attach` refuses the start for it).
+    match std::fs::symlink_metadata(etc_dir) {
         Ok(meta) if meta.is_dir() => {
             let key = InodeKey {
                 dev: stat_dev_to_kernel_dev(meta.dev()),
@@ -790,6 +874,7 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
                     etc_dir.display()
                 )
             })?;
+            crate::fs_type::note_identity(etc_dir);
             info!(
                 path = %etc_dir.display(),
                 kernel_dev = key.dev,
@@ -798,6 +883,11 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
             );
             registered += 1;
         }
+        Ok(meta) if meta.file_type().is_symlink() => error!(
+            link = %link_at(etc_dir).unwrap_or_default(),
+            "anti-tamper FS: config dir is a symbolic link — not followed, directory inode not \
+             registered"
+        ),
         Ok(_) => warn!(
             path = %etc_dir.display(),
             "anti-tamper FS: config dir path is not a directory — not registered"
@@ -810,7 +900,7 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
     }
     for name in ETC_PROTECTED_FILES {
         let path = etc_dir.join(name);
-        let meta = match std::fs::metadata(&path) {
+        let meta = match own_entry_meta(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
@@ -845,6 +935,7 @@ pub(crate) fn register_etc_files(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<usiz
             | if read_deny { FS_PROTECT_READ } else { 0 };
         register_inode(ebpf, &key, flags)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        crate::fs_type::note_identity(&path);
         if read_deny {
             read_protected.push(key.ino);
         }
@@ -902,7 +993,7 @@ const READ_PROTECTED_INOS_MAP: &str = "READ_PROTECTED_INOS";
 fn register_sealed(ebpf: &mut Ebpf, active: &Path) -> Result<usize> {
     let mut n = 0usize;
     for path in crate::chainlog::sealed_files(active) {
-        let meta = match std::fs::metadata(&path) {
+        let meta = match own_entry_meta(&path) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -912,6 +1003,7 @@ fn register_sealed(ebpf: &mut Ebpf, active: &Path) -> Result<usize> {
         };
         register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        crate::fs_type::note_identity(&path);
         n += 1;
     }
     if n > 0 {
@@ -938,7 +1030,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
     let mut registered = 0usize;
     for name in STATE_PROTECTED_FILES {
         let path = state_dir.join(name);
-        let meta = match std::fs::metadata(&path) {
+        let meta = match own_entry_meta(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
@@ -964,6 +1056,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
         // at-authz-1: the integrity chains are agent-append-only — WRITE+MUTATE.
         register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        crate::fs_type::note_identity(&path);
         info!(
             path = %path.display(),
             kernel_dev = key.dev,
@@ -979,7 +1072,9 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
     for (sub, files) in STATE_PROTECTED_SUBDIRS {
         subdir_total += 1 + files.len();
         let dir = state_dir.join(sub);
-        match std::fs::metadata(&dir) {
+        // External audit ATP-007: the sub-directory itself, never a link's
+        // target (`refuse_linked_state_dir` already refused one at boot).
+        match std::fs::symlink_metadata(&dir) {
             Ok(meta) if meta.is_dir() => {
                 let key = InodeKey {
                     dev: stat_dev_to_kernel_dev(meta.dev()),
@@ -991,6 +1086,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
                         dir.display()
                     )
                 })?;
+                crate::fs_type::note_identity(&dir);
                 info!(
                     path = %dir.display(),
                     kernel_dev = key.dev,
@@ -1002,15 +1098,16 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
             _ => {
                 warn!(
                     path = %dir.display(),
-                    "anti-tamper FS: state sub-directory missing — its chain logs are unprotected \
-                     until the next agent restart with the directory present"
+                    "anti-tamper FS: state sub-directory missing (or not a directory: a link is \
+                     not followed) — its chain logs are unprotected until the next agent restart \
+                     with the directory present"
                 );
                 continue;
             }
         }
         for name in files.iter() {
             let path = dir.join(name);
-            let meta = match std::fs::metadata(&path) {
+            let meta = match own_entry_meta(&path) {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(
@@ -1028,6 +1125,7 @@ pub(crate) fn register_state_files(ebpf: &mut Ebpf, state_dir: &Path) -> Result<
             register_inode(ebpf, &key, FS_PROTECT_MUTATE | FS_PROTECT_WRITE).with_context(
                 || format!("registering {} in {PROTECTED_INODES_MAP}", path.display()),
             )?;
+            crate::fs_type::note_identity(&path);
             info!(
                 path = %path.display(),
                 kernel_dev = key.dev,
@@ -1062,7 +1160,7 @@ pub(crate) fn register_etc_templates(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<
     let templates_dir = etc_dir.join(CANARY_TEMPLATES_SUBDIR);
     for name in ETC_PROTECTED_TEMPLATES {
         let path = templates_dir.join(name);
-        let meta = match std::fs::metadata(&path) {
+        let meta = match own_entry_meta(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 warn!(
@@ -1089,6 +1187,7 @@ pub(crate) fn register_etc_templates(ebpf: &mut Ebpf, etc_dir: &Path) -> Result<
         // MUTATE-only (a live edit must not WRITE-deny-trip COMBAT).
         register_inode(ebpf, &key, FS_PROTECT_MUTATE)
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        crate::fs_type::note_identity(&path);
         info!(
             path = %path.display(),
             kernel_dev = key.dev,
@@ -1122,6 +1221,19 @@ fn resolve_protected_paths(paths: &[&str]) -> Vec<(PathBuf, InodeKey)> {
     let mut resolved = Vec::with_capacity(paths.len());
     for &p in paths {
         let path = PathBuf::from(p);
+        // External audit ATP-007: a NOCREATE directory is the directory
+        // itself or nothing — a link there would give its target the
+        // no-new-entry deny (`attach` refuses the start for it).
+        if NOCREATE_UNIT_DIRS.contains(&p) {
+            if let Some(link) = link_at(&path) {
+                error!(
+                    link = %link,
+                    "anti-tamper FS: the agent's drop-in directory is a symbolic link — not \
+                     followed, not registered"
+                );
+                continue;
+            }
+        }
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1249,6 +1361,7 @@ pub(crate) fn register_binary_and_units(ebpf: &mut Ebpf) -> Result<usize> {
         // (signed self-upgrade, exempt via the trusted-installer window, FS_GRANT) — WRITE+MUTATE.
         register_inode(ebpf, &key, binary_or_unit_flags(&path))
             .with_context(|| format!("registering {} in {PROTECTED_INODES_MAP}", path.display()))?;
+        crate::fs_type::note_identity(&path);
         info!(
             path = %path.display(),
             kernel_dev = key.dev,
@@ -1574,12 +1687,20 @@ pub fn bootstrap_audit_log(audit_log_path: &Path) -> Result<()> {
 fn ensure_quarantine_dirs(dir: &Path) -> Result<()> {
     let quarantine = dir.join("quarantine");
     let vault = quarantine.join("vault");
-    if vault.is_dir() {
+    // External audit ATP-007: a link at either is refused, not followed
+    // (`refuse_linked_state_dir` stops the start before this runs).
+    for p in [&quarantine, &vault] {
+        if let Some(link) = link_at(p) {
+            return Err(anyhow!("{link}: the vault is not created through a link"));
+        }
+    }
+    let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir());
+    if is_dir(&vault) {
         return Ok(());
     }
     // only the state dir itself carries +i: an existing quarantine/ takes
     // its vault without lifting anything
-    let _guard = if quarantine.is_dir() {
+    let _guard = if is_dir(&quarantine) {
         None
     } else {
         Some(ImmutabilityGuard::lift(dir)?)
@@ -1592,43 +1713,131 @@ fn ensure_quarantine_dirs(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_state_dir(dir: &Path) -> Result<()> {
+/// External audit ATP-007 (NN-AUD-260): the entries of the state
+/// directory the agent keeps there itself and registers or writes by path —
+/// the quarantine vault and its parent, the chain sub-directories and their
+/// logs, the flat chain logs. No install makes any of them a symbolic link:
+/// one there was planted by a root before the agent started.
+fn state_dir_own_entries() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = vec![
+        PathBuf::from("quarantine"),
+        PathBuf::from("quarantine/vault"),
+    ];
+    v.extend(STATE_PROTECTED_FILES.iter().map(PathBuf::from));
+    for (sub, files) in STATE_PROTECTED_SUBDIRS {
+        v.push(PathBuf::from(sub));
+        v.extend(files.iter().map(|f| Path::new(sub).join(f)));
+    }
+    v
+}
+
+/// `"<path> -> <target>"` when `path` itself is a symbolic link (its final
+/// component; `lstat`), else `None`.
+fn link_at(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    meta.file_type().is_symlink().then(|| {
+        let target = std::fs::read_link(path)
+            .map(|t| t.display().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        format!("{} -> {target}", path.display())
+    })
+}
+
+/// External audit ATP-007 (NN-AUD-260): refuse a state directory reached
+/// through a symbolic link, or one holding a link where the agent keeps its
+/// own entries ([`state_dir_own_entries`]). The agent repairs the
+/// directory's mode (0700) and owner (root) and registers it with
+/// [`PROTECTED_DIR_FLAGS`] — no new entry, no unlink or rename outside a
+/// trusted-installer window — so a link planted at `/var/lib/northnarrow`
+/// gave all of that to its target (`/etc` would have refused every new
+/// file), and the agent's evidence went into it. Called first thing at
+/// boot, before anything reads or writes the directory, and again by
+/// [`attach`] before the registration. A missing directory is fine: the
+/// attach creates it.
+pub fn refuse_linked_state_dir(dir: &Path) -> Result<()> {
+    let links: Vec<String> = match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow!(e).context(format!("lstat {}", dir.display()))),
+        Ok(m) if m.file_type().is_symlink() => link_at(dir).into_iter().collect(),
+        Ok(m) if !m.is_dir() => {
+            return Err(anyhow!("{} exists and is not a directory", dir.display()))
+        }
+        Ok(_) => state_dir_own_entries()
+            .iter()
+            .filter_map(|e| link_at(&dir.join(e)))
+            .collect(),
+    };
+    if links.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "the state directory {} is reached through a symbolic link, or holds one where the agent \
+         keeps its own entries ({}): refusing to start. The agent does not follow a link there — \
+         it would give the link's target the directory's protection (mode 0700, owner root, no new \
+         entry, no unlink or rename) and write its evidence into it. Put the real directory back; \
+         to keep the state on another filesystem, bind-mount that directory at {} (upgrade notes \
+         of external audit 16f7563, §2)",
+        dir.display(),
+        links.join(", "),
+        dir.display()
+    ))
+}
+
+/// The state directory, ready to register: [`refuse_linked_state_dir`],
+/// then [`ensure_own_dir`] with mode 0700 and owner root.
+fn ensure_state_dir(dir: &Path) -> Result<std::fs::Metadata> {
+    refuse_linked_state_dir(dir)?;
+    ensure_own_dir(dir, STATE_DIR_MODE, 0, 0)
+}
+
+/// Create `dir` (`mode`; an existing one is fine), then open the directory
+/// itself — `O_NOFOLLOW | O_DIRECTORY`, never through a link at its final
+/// component — and repair its mode and owner on that descriptor (`fchmod`,
+/// `fchown`). External audit ATP-007: `metadata`, `set_permissions` and
+/// `chown` by path all followed a link. The metadata returned is the
+/// descriptor's (`fstat`), taken after the repair: the inode the caller
+/// registers is the one repaired, whatever the path names by then.
+fn ensure_own_dir(dir: &Path, mode: u32, uid: u32, gid: u32) -> Result<std::fs::Metadata> {
     // Try to create; tolerate AlreadyExists (idempotent startup).
-    match DirBuilder::new()
-        .mode(STATE_DIR_MODE)
-        .recursive(true)
-        .create(dir)
-    {
+    match DirBuilder::new().mode(mode).recursive(true).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(anyhow!(e).context(format!("mkdir {}", dir.display()))),
     }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| match link_at(dir) {
+            Some(link) => {
+                anyhow!("{link}: the agent does not follow a symbolic link at its own directory")
+            }
+            None => {
+                anyhow!(e).context(format!("open {} (O_NOFOLLOW | O_DIRECTORY)", dir.display()))
+            }
+        })?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("fstat {} after mkdir", dir.display()))?;
 
     // Re-assert ownership + mode unconditionally so a slack umask
     // or a previous-version run with wider perms doesn't persist.
-    let meta =
-        std::fs::metadata(dir).with_context(|| format!("stat {} after mkdir", dir.display()))?;
-    if !meta.is_dir() {
-        return Err(anyhow!("{} exists and is not a directory", dir.display()));
+    let mut repaired = false;
+    if (meta.mode() & 0o7777) != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("fchmod {mode:o} {}", dir.display()))?;
+        repaired = true;
     }
-
-    if (meta.mode() & 0o7777) != STATE_DIR_MODE {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(STATE_DIR_MODE))
-            .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    if meta.uid() != uid || meta.gid() != gid {
+        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+            .with_context(|| format!("fchown {uid}:{gid} {}", dir.display()))?;
+        repaired = true;
     }
-    if meta.uid() != 0 || meta.gid() != 0 {
-        // std::fs has no chown wrapper; reach for libc directly.
-        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
-            .with_context(|| format!("path {} contains NUL byte", dir.display()))?;
-        // SAFETY: c_path is a valid NUL-terminated string; uid/gid
-        // are the root constants; libc::chown only reads the path.
-        let rc = unsafe { libc::chown(c_path.as_ptr(), 0, 0) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("chown root:root {}", dir.display()));
-        }
+    if !repaired {
+        return Ok(meta);
     }
-    Ok(())
+    file.metadata()
+        .with_context(|| format!("fstat {} after the repair", dir.display()))
 }
 
 /// Convert the userland-encoded `dev_t` returned by `stat(2)` /
@@ -2009,6 +2218,167 @@ impl crate::chainlog::ProtectionManager for StateDirProtection {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn ids() -> (u32, u32) {
+        // SAFETY: getuid/getgid cannot fail and touch no memory.
+        unsafe { (libc::getuid(), libc::getgid()) }
+    }
+
+    /// External audit ATP-007 (NN-AUD-260): a state directory that is a
+    /// link is refused, naming the link and its target, and the target is
+    /// left as it was — mode, owner, entries. Before, `ensure_state_dir`
+    /// chmodded it 0700 and the attach registered it NOCREATE.
+    #[test]
+    fn state_dir_symlink_is_refused_and_target_untouched() {
+        let t = TempDir::new().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = std::fs::metadata(&real).unwrap();
+        let link = t.path().join("northnarrow");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = format!("{:#}", ensure_state_dir(&link).unwrap_err());
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(
+            err.contains(&format!("{} -> {}", link.display(), real.display())),
+            "{err}"
+        );
+        assert!(err.contains("bind-mount"), "{err}");
+        let err = format!("{:#}", refuse_linked_state_dir(&link).unwrap_err());
+        assert!(err.contains("refusing to start"), "{err}");
+
+        let after = std::fs::metadata(&real).unwrap();
+        assert_eq!(
+            after.mode() & 0o7777,
+            0o755,
+            "the target's mode is unchanged"
+        );
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(
+            std::fs::read_dir(&real).unwrap().count(),
+            0,
+            "nothing created in it"
+        );
+
+        // a dangling link too: never created through
+        let dangling = t.path().join("dangling");
+        std::os::unix::fs::symlink(t.path().join("nowhere"), &dangling).unwrap();
+        assert!(ensure_state_dir(&dangling).is_err());
+        assert!(!t.path().join("nowhere").exists());
+        // the descriptor-level open refuses a link on its own as well
+        let (uid, gid) = ids();
+        let err = format!("{:#}", ensure_own_dir(&link, 0o700, uid, gid).unwrap_err());
+        assert!(err.contains("does not follow a symbolic link"), "{err}");
+        assert_eq!(std::fs::metadata(&real).unwrap().mode() & 0o7777, 0o755);
+    }
+
+    /// External audit ATP-007: non-regression — a real directory still
+    /// gets its mode repaired (on the descriptor), a missing one is
+    /// created, and the metadata returned is the directory's own.
+    #[test]
+    fn state_dir_mode_and_owner_still_repaired() {
+        let t = TempDir::new().unwrap();
+        let (uid, gid) = ids();
+        let dir = t.path().join("state");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let meta = ensure_own_dir(&dir, 0o700, uid, gid).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o700);
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(meta.ino(), std::fs::symlink_metadata(&dir).unwrap().ino());
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+
+        let fresh = t.path().join("fresh/state");
+        let meta = ensure_own_dir(&fresh, 0o700, uid, gid).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(std::fs::metadata(&fresh).unwrap().mode() & 0o7777, 0o700);
+        // a real directory passes the link check, and so does a missing one
+        refuse_linked_state_dir(&dir).unwrap();
+        refuse_linked_state_dir(&t.path().join("absent")).unwrap();
+        let file = t.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            refuse_linked_state_dir(&file).is_err(),
+            "a file is not a state dir"
+        );
+    }
+
+    /// External audit ATP-007: a link at the quarantine directory, the
+    /// vault, a chain sub-directory or a chain log is refused; the vault is
+    /// not created through one.
+    #[test]
+    fn quarantine_link_is_refused() {
+        let t = TempDir::new().unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let state = t.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, state.join("quarantine")).unwrap();
+        let err = format!("{:#}", refuse_linked_state_dir(&state).unwrap_err());
+        assert!(err.contains("quarantine ->"), "{err}");
+        let err = format!("{:#}", ensure_quarantine_dirs(&state).unwrap_err());
+        assert!(err.contains("not created through a link"), "{err}");
+        assert!(
+            !elsewhere.join("vault").exists(),
+            "no vault in the link's target"
+        );
+
+        for entry in [
+            "detections",
+            "fim_baseline.jsonl",
+            "detections/detections.jsonl",
+        ] {
+            let st = t.path().join(format!("s-{}", entry.replace('/', "-")));
+            std::fs::create_dir(&st).unwrap();
+            if let Some(parent) = Path::new(entry)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+            {
+                std::fs::create_dir(st.join(parent)).unwrap();
+            }
+            let target = elsewhere.join(format!("t-{}", entry.replace('/', "-")));
+            std::fs::write(&target, "x").unwrap();
+            std::os::unix::fs::symlink(&target, st.join(entry)).unwrap();
+            let err = format!("{:#}", refuse_linked_state_dir(&st).unwrap_err());
+            assert!(err.contains(&format!("{entry} ->")), "{entry}: {err}");
+        }
+
+        // the vault is still made in a real state directory
+        let ok = t.path().join("ok");
+        std::fs::create_dir(&ok).unwrap();
+        ensure_quarantine_dirs(&ok).unwrap();
+        assert!(ok.join("quarantine/vault").is_dir());
+        refuse_linked_state_dir(&ok).unwrap();
+    }
+
+    /// External audit ATP-007: an entry of the agent's directories is keyed
+    /// by the link itself, never by the file a link points to.
+    #[test]
+    fn a_linked_own_file_is_keyed_by_the_link_not_its_target() {
+        let t = TempDir::new().unwrap();
+        let target = t.path().join("passwd");
+        std::fs::write(&target, "root:x:0:0::/root:/bin/sh\n").unwrap();
+        let link = t.path().join("fim_baseline.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let meta = own_entry_meta(&link).unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert_ne!(meta.ino(), std::fs::metadata(&target).unwrap().ino());
+        assert_eq!(meta.ino(), std::fs::symlink_metadata(&link).unwrap().ino());
+    }
+
+    /// External audit ATP-016: the hooks a bootstrap failure leaves out.
+    #[test]
+    fn a_bootstrap_failure_loses_every_fs_hook() {
+        let h = hooks_lost_to_bootstrap_failure(|h| Some(h == "inode_set_acl"), "x".into());
+        assert_eq!(h.deny_failures.len(), LSM_PROGRAMS.len() + 1);
+        assert_eq!(h.optional_present, 1);
+        assert_eq!(h.observe_failures.len(), MODULE_LOAD_PROGRAMS.len());
+        assert_eq!(
+            h.infra_failures,
+            vec![("filesystem::attach", "x".to_string())]
+        );
+    }
 
     #[test]
     fn stat_dev_to_kernel_dev_sda2() {

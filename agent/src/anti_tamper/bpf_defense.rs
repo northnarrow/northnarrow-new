@@ -404,9 +404,26 @@ pub(crate) fn register_own_objects(ebpf: &mut Ebpf, pin_root: Option<&Path>) -> 
         pin_root: pin_root.map(Path::to_path_buf),
     });
     // Pin names: the final component of every `link_*` pin under the pin
-    // root, so `OBJ_GET` on a pinned link is recognised without a path
-    // walk in the kernel.
-    let pin_names = link_pin_names(pin_root);
+    // root whose link runs one of our programs, so `OBJ_GET` on a pinned
+    // link is recognised without a path walk in the kernel. External audit
+    // ATP-017 (NN-AUD-265): only those — every `link_*` entry used to go
+    // in, so 64 planted ones (the map's size) refused the start, and a
+    // planted name equal to another product's pin denied that product's
+    // `OBJ_GET`. The others are reported (`foreign_pin`), never registered
+    // or removed.
+    let own_progs: HashSet<u32> = prog_ids.iter().copied().collect();
+    let LinkPins {
+        own: pin_names,
+        foreign,
+    } = link_pins(pin_root, &own_progs);
+    for f in &foreign {
+        warn!(
+            pin = %f,
+            "BPF self-defence: a link_* entry in the pin root is not one of the agent's links — \
+             not registered, not removed"
+        );
+    }
+    *FOREIGN_PINS.lock() = foreign;
     {
         let names = ebpf
             .map_mut(PIN_NAMES_MAP)
@@ -693,35 +710,121 @@ fn obj_get_fd(path: &Path) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }
 
-/// NUL-padded keys for the `link_*` pins under `pin_root` (names that do
-/// not fit the key are skipped with a WARN — none of ours is that long).
-fn link_pin_names(pin_root: Option<&Path>) -> Vec<u64> {
+/// External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
+/// root, split by owner — `own` holds the [`pin_name_key`] of each pin whose
+/// link runs one of the agent's programs, `foreign` a description of each
+/// other entry.
+#[derive(Debug, Default)]
+struct LinkPins {
+    own: Vec<u64>,
+    foreign: Vec<String>,
+}
+
+/// The `link_*` entries found at boot that are not the agent's links, for
+/// one signed `integrity_drift` each once the audit log is open
+/// ([`attest_foreign_pins`]).
+static FOREIGN_PINS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// Kind of the signed `integrity_drift` for a `link_*` entry of the pin
+/// root that is not one of the agent's links.
+pub const FOREIGN_PIN_KIND: &str = "foreign_pin";
+
+/// Whose link a `link_*` entry holds: `link` is its `(link_id, prog_id)`
+/// (`None`: not a link, or not openable as one). `Err` says why it is not
+/// one of the agent's.
+fn link_pin_owner(link: Option<(u32, u32)>, own_progs: &HashSet<u32>) -> Result<(), String> {
+    match link {
+        None => Err("not a BPF link".to_string()),
+        Some((id, 0)) => Err(format!("link {id} holds no program (detached)")),
+        Some((id, prog)) if !own_progs.contains(&prog) => Err(format!(
+            "link {id} runs program {prog}, not one of the agent's"
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The `link_*` entries under `pin_root`, each opened (`OBJ_GET`) and read
+/// from `/proc/self/fdinfo` like [`own_link_ids`] does, split by owner
+/// ([`link_pin_owner`]). Names that do not fit the key are skipped with a
+/// WARN — none of ours is that long.
+fn link_pins(pin_root: Option<&Path>, own_progs: &HashSet<u32>) -> LinkPins {
+    let mut out = LinkPins::default();
     let Some(root) = pin_root else {
-        return Vec::new();
+        return out;
     };
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, path = %root.display(), "BPF self-defence: cannot list the pin root — link pins not registered by name");
-            return Vec::new();
+            return out;
         }
     };
-    let mut keys = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with(LINK_PIN_PREFIX) {
             continue;
         }
+        let link = obj_get_fd(&entry.path()).and_then(|fd| link_from_fdinfo(fd.as_raw_fd()));
+        if let Err(why) = link_pin_owner(link, own_progs) {
+            out.foreign
+                .push(format!("{}: {why}", entry.path().display()));
+            continue;
+        }
         match pin_name_key(name) {
-            Some(k) => keys.push(k),
+            Some(k) => out.own.push(k),
             None => warn!(
                 name,
                 "BPF self-defence: link pin name too long for OWN_PIN_NAMES — not registered"
             ),
         }
     }
-    keys
+    out
+}
+
+/// One signed `integrity_drift` ([`FOREIGN_PIN_KIND`]) per `link_*` entry
+/// of the pin root found at boot that is not one of the agent's links (a
+/// stale pin of an earlier build, or one a root planted). Called from
+/// `main` once the audit log is open.
+pub fn attest_foreign_pins(audit_log: Option<&Arc<parking_lot::Mutex<AuditLog>>>) {
+    let foreign = std::mem::take(&mut *FOREIGN_PINS.lock());
+    if foreign.is_empty() {
+        return;
+    }
+    error!(
+        count = foreign.len(),
+        "INTEGRITY DRIFT — link_* entries in the agent's pin root that are not its links \
+         (not registered as its own, not removed)"
+    );
+    let Some(log) = audit_log else {
+        return;
+    };
+    for detail in foreign {
+        let draft = AuditEntryDraft {
+            op: crate::self_integrity::AUDIT_OP.to_string(),
+            extra: serde_json::json!({
+                "kind": FOREIGN_PIN_KIND,
+                "detail": format!(
+                    "{detail} — a link_* entry in the pin root that is not the agent's: not \
+                     registered as its own, not removed"
+                ),
+                "at_boot": true,
+            }),
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: "detected".to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        };
+        if let Err(e) = log.lock().append(draft) {
+            warn!(
+                error = format!("{e:#}"),
+                "BPF self-defence: audit entry for a foreign pin failed"
+            );
+        }
+    }
 }
 
 /// The key the kernel computes for the final path component (external
@@ -855,6 +958,42 @@ fn map_data(m: &Map) -> &MapData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit ATP-017 (NN-AUD-265): only a pin whose link runs one
+    /// of the agent's programs is its own; anything else named `link_*` is
+    /// reported, not registered — 70 of them no longer overflow the
+    /// 64-entry `OWN_PIN_NAMES` and refuse the start.
+    #[test]
+    fn foreign_link_pin_is_not_registered() {
+        let own: HashSet<u32> = [7u32, 9].into_iter().collect();
+        assert_eq!(link_pin_owner(Some((3, 7)), &own), Ok(()));
+        assert!(link_pin_owner(None, &own)
+            .unwrap_err()
+            .contains("not a BPF link"));
+        assert!(link_pin_owner(Some((3, 0)), &own)
+            .unwrap_err()
+            .contains("detached"));
+        assert!(link_pin_owner(Some((3, 8)), &own)
+            .unwrap_err()
+            .contains("program 8, not one of the agent's"));
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("link_x"), "").unwrap();
+        std::fs::create_dir(root.path().join("link_dir")).unwrap();
+        std::fs::write(root.path().join("prog_task_kill"), "").unwrap();
+        for i in 0..70 {
+            std::fs::write(root.path().join(format!("link_planted_{i}")), "").unwrap();
+        }
+        let pins = link_pins(Some(root.path()), &own);
+        assert!(pins.own.is_empty(), "no planted name is registered");
+        assert_eq!(pins.foreign.len(), 72, "{:?}", pins.foreign);
+        assert!(pins
+            .foreign
+            .iter()
+            .any(|f| f.contains("link_x: not a BPF link")));
+        assert!(!pins.foreign.iter().any(|f| f.contains("prog_task_kill")));
+        assert!(link_pins(None, &own).foreign.is_empty());
+    }
 
     #[test]
     fn fdinfo_parser_reads_link_and_prog_ids() {

@@ -828,6 +828,13 @@ async fn main() -> Result<()> {
     // over-fire when a stale .o was embedded by a workspace build).
     northnarrow_agent::sensors::ebpf_object::preflight()
         .context("eBPF object boot preflight failed — refusing to start")?;
+    // External audit ATP-007 (NN-AUD-260): the state directory, or one of
+    // the agent's own entries in it, is not a symbolic link — checked before
+    // anything below reads or writes there (the bootstraps would create
+    // files in a link's target, the attach would protect it).
+    northnarrow_agent::anti_tamper::filesystem::refuse_linked_state_dir(std::path::Path::new(
+        northnarrow_agent::anti_tamper::filesystem::STATE_DIR,
+    ))?;
 
     // External audit NN-AUD-098: tracepoint fields left on their compiled
     // offset, attested once the audit log is open.
@@ -2303,6 +2310,16 @@ async fn main() -> Result<()> {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
+    // External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
+    // root that are not the agent's links, one signed `integrity_drift` each.
+    northnarrow_agent::anti_tamper::bpf_defense::attest_foreign_pins(audit_log.as_ref());
+    // External audit ATP-016 (NN-AUD-264): a start under
+    // NN_ANTI_TAMPER_ALLOW_DEGRADED=1 and a missing observe hook, in the
+    // signed chain with what is missing — the journal line was the only
+    // trace.
+    for detail in northnarrow_agent::anti_tamper::take_degraded_boot_details() {
+        attest_degraded(audit_log.as_ref(), &detail);
+    }
     // Tappa 10.8 — overlay decisions taken before the audit log existed.
     overlay_gate.attach_audit_log(audit_log.clone());
     // External audit CMB-017: quarantines are recorded in the signed chain.
@@ -3119,6 +3136,16 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    // External audit EBPF-016 (NN-AUD-267): protected inodes and FIM
+    // watches on overlayfs, FUSE or NFS, where the agent cannot vouch that
+    // stat() and the eBPF hooks see the same (dev, ino) — one WARN and one
+    // signed `subsystem_degraded` per boot (registrations and the watch set
+    // are all in by now).
+    if let Some(report) = northnarrow_agent::fs_type::take_identity_report() {
+        warn!("{}", report.detail());
+        attest_identity_unverified(audit_log.as_ref(), &report);
+    }
 
     // ── Tappa 9.5.1 — anti-tamper honeypot integrity sweep ─────────
     //
@@ -5083,6 +5110,33 @@ fn attest_degraded(
     detail: &str,
 ) {
     attest_degraded_at(audit_log, detail, true);
+}
+
+/// External audit EBPF-016: the signed `subsystem_degraded` of
+/// [`northnarrow_agent::fs_type::IdentityReport`] (`reason:
+/// inode_identity_unverified`, the filesystems, their counts and first
+/// paths).
+fn attest_identity_unverified(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    report: &northnarrow_agent::fs_type::IdentityReport,
+) {
+    let Some(log) = audit_log else {
+        return;
+    };
+    let draft = northnarrow_agent::audit::AuditEntryDraft {
+        op: northnarrow_agent::self_integrity::AUDIT_OP.to_string(),
+        extra: report.audit_extra(),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "detected".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "attesting the unverified inode identity failed");
+    }
 }
 
 /// [`attest_degraded`] for a subsystem that stopped after boot (external

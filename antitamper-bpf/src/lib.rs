@@ -6,24 +6,30 @@
 //! the canonical bpffs pin contract WITHOUT pulling the rest of the
 //! agent (tokio, ADE, posture machine, RAG, decision engine, …).
 //! Watchdog needs only a handful of primitives — bpffs presence check,
-//! pin-root prep, LSM hook attach/reuse, and the ability to delete a
+//! pin-root prep, LSM hook attach, and the ability to delete a
 //! PID from the pinned `PROTECTED_PIDS` map by path — and that's
 //! exactly what lives here.
 //!
 //! ## Public surface
 //!
 //! - [`DEFAULT_BPFFS_ROOT`] — `/sys/fs/bpf/northnarrow`
-//! - [`prepare_pin_root`] — verify bpffs + ensure `0700` root dir
+//! - [`prepare_pin_root`] — verify bpffs + ensure `0700` root dir;
+//!   [`pin_root_refusal`] — why a pin root on bpffs is not used (a
+//!   symbolic link, external audit ATP-007)
 //! - [`read_self_comm`] / [`read_proc_comm`] — `/proc/.../comm` reads
 //!   (used by the agent's stale-PID eviction and by the watchdog's
 //!   future PID-tracking work; aya-free but kept here so the
 //!   anti-tamper helpers cluster in one crate).
-//! - [`attach_lsm`] — pin-or-reuse LSM hook attach (the keystone
-//!   helper that gives Tappa 7 task 6 #2b its cross-restart hook
-//!   survival)
-//! - [`fresh_attach_and_pin`], [`attach_transient`] — the two
-//!   sub-paths `attach_lsm` orchestrates, also exported for callers
-//!   that want to drive one disposition directly
+//! - [`reattach_fresh`] — the LSM attach with cross-restart
+//!   persistence: this boot's program attached before the prior boot's
+//!   pins are purged, then pinned (zero-window). It never adopts a
+//!   pinned link. External audit EBPF-020 (NN-AUD-271): `attach_lsm`,
+//!   which reused any `link_<hook>` pin that re-opened without checking
+//!   whose program it held, is removed with `fresh_attach_and_pin`, its
+//!   only user. A consumer that ever needs reuse must check the link's
+//!   `prog_id` and `attach_btf_id` first, in a new function.
+//! - [`attach_transient`] — this boot only (no bpffs, or an observe
+//!   hook that must not outlive the agent)
 //! - [`lsm_pin_paths`], [`purge_stale_pin`] — pin-path helpers
 //!
 //! ## What's intentionally NOT here
@@ -42,7 +48,7 @@
 //!
 //! `agent/src/anti_tamper/mod.rs` `pub use`s every item in this
 //! crate's public surface so existing callers
-//! (`crate::anti_tamper::attach_lsm`, `crate::anti_tamper::prepare_pin_root`,
+//! (`crate::anti_tamper::reattach_fresh`, `crate::anti_tamper::prepare_pin_root`,
 //! `crate::anti_tamper::read_self_comm`, …) compile byte-identically.
 //! This is the "zero functional changes" contract from ISSUE_002.
 
@@ -60,7 +66,7 @@ use aya::{
     },
     Btf, Ebpf,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Name of the pinned `PROTECTED_PIDS` map (mirrors the
 /// `#[map]` declaration in `agent-ebpf/src/task_kill.rs`). The
@@ -149,6 +155,17 @@ pub fn prepare_pin_root() -> Option<&'static Path> {
         return None;
     }
 
+    // External audit ATP-007 (NN-AUD-260): a pin root that is a symbolic
+    // link is never followed — the chmod below and the agent's
+    // registration of every pin under the root would have reached the
+    // link's target (another product's pin directory). Not used: the
+    // hooks attach without pins, and the agent refuses to start
+    // (`pin_root_refusal`).
+    if let Some(why) = pin_root_refusal_at(root) {
+        error!("anti-tamper: {why}");
+        return None;
+    }
+
     match std::fs::DirBuilder::new()
         .mode(PIN_ROOT_MODE)
         .recursive(true)
@@ -169,9 +186,11 @@ pub fn prepare_pin_root() -> Option<&'static Path> {
     // Re-assert mode unconditionally: a pre-existing dir from an
     // older build (or a loosened one) must not keep wider perms.
     // No chown — bpffs inodes are kernel-owned root:root and we
-    // already required root to get this far.
-    if let Ok(meta) = std::fs::metadata(root) {
-        if (meta.permissions().mode() & 0o7777) != PIN_ROOT_MODE {
+    // already required root to get this far. The directory itself
+    // (`lstat`): a link created after the check above is not chmodded
+    // through.
+    if let Ok(meta) = std::fs::symlink_metadata(root) {
+        if meta.is_dir() && (meta.permissions().mode() & 0o7777) != PIN_ROOT_MODE {
             if let Err(e) =
                 std::fs::set_permissions(root, std::fs::Permissions::from_mode(PIN_ROOT_MODE))
             {
@@ -185,6 +204,43 @@ pub fn prepare_pin_root() -> Option<&'static Path> {
     }
 
     Some(root)
+}
+
+/// External audit ATP-007 (NN-AUD-260): why the pin root is not used
+/// although bpffs is mounted — [`DEFAULT_BPFFS_ROOT`] is a symbolic link,
+/// or something other than a directory. `None` when it is a directory, is
+/// absent (created at the first [`prepare_pin_root`]), or bpffs is not
+/// mounted (that degraded mode is logged by [`prepare_pin_root`]). The
+/// agent counts `Some` as a failed protection step and refuses to start.
+pub fn pin_root_refusal() -> Option<String> {
+    let root = Path::new(DEFAULT_BPFFS_ROOT);
+    let mount = root.parent().unwrap_or_else(|| Path::new("/sys/fs/bpf"));
+    if !is_bpffs(mount) {
+        return None;
+    }
+    pin_root_refusal_at(root)
+}
+
+/// [`pin_root_refusal`] for `root`, whatever filesystem holds it.
+pub fn pin_root_refusal_at(root: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(root).ok()?;
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(root)
+            .map(|t| t.display().to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        return Some(format!(
+            "the bpffs pin root {} is a symbolic link (-> {target}): not followed — the agent \
+             would set its mode on, pin into and protect the link's target. Remove the link (it \
+             goes with a remount of /sys/fs/bpf)",
+            root.display()
+        ));
+    }
+    (!meta.is_dir()).then(|| {
+        format!(
+            "the bpffs pin root {} exists and is not a directory: not used",
+            root.display()
+        )
+    })
 }
 
 /// `true` iff `p` resides on a bpffs mount. A `statfs` failure or a
@@ -271,50 +327,6 @@ pub fn purge_stale_pin(path: &Path) {
     }
 }
 
-/// Load → attach → pin-program → take-link → pin-link for one hook.
-/// On success the kernel holds: the program (pinned at `prog_path`)
-/// and its LSM attachment (pinned at `link_path`). The `PinnedLink`
-/// is intentionally dropped at end of scope — that closes only the
-/// agent's dup fd; the bpffs pin file retains the kernel reference,
-/// so the hook keeps firing after this process exits. That is the
-/// entire point of the link-pin design (Tappa 7 task 6 #2b).
-pub fn fresh_attach_and_pin(
-    ebpf: &mut Ebpf,
-    program_name: &str,
-    hook_name: &str,
-    btf: &Btf,
-    prog_path: &Path,
-    link_path: &Path,
-) -> Result<()> {
-    let prog: &mut Lsm = ebpf
-        .program_mut(program_name)
-        .ok_or_else(|| anyhow!("program {program_name} missing from eBPF object"))?
-        .try_into()
-        .with_context(|| format!("program {program_name} is not an LSM program"))?;
-    prog.load(hook_name, btf)
-        .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
-    let link_id = prog
-        .attach()
-        .with_context(|| format!("attaching LSM program `{program_name}` to hook `{hook_name}`"))?;
-    prog.pin(prog_path).with_context(|| {
-        format!(
-            "pinning LSM program `{program_name}` to {}",
-            prog_path.display()
-        )
-    })?;
-    // `take_link` removes the link from the program's `LinkMap` so it
-    // is NOT detached when `Ebpf` drops at agent exit; we then own it
-    // and hand ownership to the bpffs pin.
-    let link = prog
-        .take_link(link_id)
-        .with_context(|| format!("taking ownership of `{hook_name}` LSM link for pinning"))?;
-    let fd_link: FdLink = link.into();
-    let _pinned: PinnedLink = fd_link
-        .pin(link_path)
-        .with_context(|| format!("pinning LSM link `{hook_name}` to {}", link_path.display()))?;
-    Ok(())
-}
-
 /// Transient attach used only when bpffs is unavailable: the hook
 /// works for *this* boot but is detached on agent exit. Mirrors the
 /// "degrade, keep telemetry" stance the rest of anti-tamper takes —
@@ -335,88 +347,6 @@ pub fn attach_transient(
         .with_context(|| format!("verifier rejected LSM program `{program_name}`"))?;
     prog.attach()
         .with_context(|| format!("attaching LSM program `{program_name}` to hook `{hook_name}`"))?;
-    Ok(())
-}
-
-/// Attach an LSM hook with cross-restart persistence, or reuse the
-/// prior boot's still-firing kernel hook if its link pin is present
-/// and valid.
-///
-/// Per hook, given a usable bpffs `pin_root`:
-/// - `link_<hook>` exists and re-opens (`PinnedLink::from_pin`) ⇒
-///   the prior boot's hook never stopped firing (the pin held it
-///   across the death→respawn gap). Validate and return; the program
-///   for this boot is left unloaded. Log: *reused pinned LSM link*.
-/// - `link_<hook>` exists but `from_pin` fails (object gone / pin
-///   corrupt) ⇒ purge both stale pins, then fresh attach+pin. Log:
-///   *purged stale pin and freshly attached*.
-/// - no `link_<hook>` ⇒ fresh attach+pin. Log: *freshly attached +
-///   pinned*.
-///
-/// `pin_root == None` (no bpffs) ⇒ [`attach_transient`]: works this
-/// boot, no persistence. The three success log messages are stable
-/// strings (an operator reads them in the journal; the retired #2b
-/// harness grepped them).
-pub fn attach_lsm(
-    ebpf: &mut Ebpf,
-    program_name: &str,
-    hook_name: &str,
-    btf: &Btf,
-    pin_root: Option<&Path>,
-) -> Result<()> {
-    let Some(root) = pin_root else {
-        attach_transient(ebpf, program_name, hook_name, btf)?;
-        warn!(
-            hook = hook_name,
-            "anti-tamper: LSM hook attached WITHOUT pin (no bpffs) — will \
-             NOT survive agent restart"
-        );
-        return Ok(());
-    };
-
-    let (prog_path, link_path) = lsm_pin_paths(root, hook_name);
-
-    if link_path.exists() {
-        match PinnedLink::from_pin(&link_path) {
-            Ok(pinned) => {
-                // Dropping `pinned` closes only our dup fd; the bpffs
-                // pin file keeps the kernel link (hook) alive. Do NOT
-                // touch the program — the prior boot's is still live
-                // and bound to the (2a-pinned) PROTECTED_PIDS map.
-                drop(pinned);
-                info!(
-                    hook = hook_name,
-                    link_pin = %link_path.display(),
-                    "anti-tamper: reused pinned LSM link"
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                warn!(
-                    hook = hook_name, error = %e,
-                    link_pin = %link_path.display(),
-                    "anti-tamper: pinned LSM link stale/corrupt — purging \
-                     and re-attaching"
-                );
-                purge_stale_pin(&link_path);
-                purge_stale_pin(&prog_path);
-                fresh_attach_and_pin(ebpf, program_name, hook_name, btf, &prog_path, &link_path)?;
-                info!(
-                    hook = hook_name,
-                    "anti-tamper: purged stale pin and freshly attached"
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    fresh_attach_and_pin(ebpf, program_name, hook_name, btf, &prog_path, &link_path)?;
-    info!(
-        hook = hook_name,
-        prog_pin = %prog_path.display(),
-        link_pin = %link_path.display(),
-        "anti-tamper: LSM hook freshly attached + pinned"
-    );
     Ok(())
 }
 
@@ -810,6 +740,37 @@ fn is_not_found_err(e: &aya::maps::MapError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// External audit ATP-007 (NN-AUD-260): a pin root that is a link is
+    /// refused, naming the link, and its target is not touched; a real
+    /// directory and an absent root are used.
+    #[test]
+    fn pin_root_link_is_refused_and_target_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("other-product");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("northnarrow");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let why = pin_root_refusal_at(&link).expect("a link must be refused");
+        assert!(why.contains("symbolic link"), "{why}");
+        assert!(why.contains(&target.display().to_string()), "{why}");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "the target's mode must not change");
+
+        assert_eq!(
+            pin_root_refusal_at(&target),
+            None,
+            "a real directory is used"
+        );
+        assert_eq!(pin_root_refusal_at(&dir.path().join("absent")), None);
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            pin_root_refusal_at(&file).is_some(),
+            "a file is not a pin root"
+        );
+    }
 
     #[test]
     fn read_self_comm_returns_non_empty_string() {

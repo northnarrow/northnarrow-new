@@ -471,18 +471,18 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-257 | MAIN-015 | Low | Agent main | S | fixed (lab PR 180) |
 | NN-AUD-258 | MAIN-016 | Low | Agent main | S | open |
 | NN-AUD-259 | ATP-006 | Low | Anti-tamper | S | fixed (lab PR 176) |
-| NN-AUD-260 | ATP-007 | Low | Anti-tamper | S | open |
+| NN-AUD-260 | ATP-007 | Low | Anti-tamper | S | fixed (lab PR 189) |
 | NN-AUD-261 | ATP-011 | Low | Anti-tamper | — | declined (the slot-table test the audit asks for exists, already at 16f7563) |
 | NN-AUD-262 | ATP-014 | Low | Anti-tamper | S | fixed (lab PR 176) |
-| NN-AUD-263 | ATP-015 | Low | Anti-tamper | S | partly fixed; open |
-| NN-AUD-264 | ATP-016 | Low | Anti-tamper | S | open |
-| NN-AUD-265 | ATP-017 | Low | Anti-tamper | S | open |
+| NN-AUD-263 | ATP-015 | Low | Anti-tamper | S | fixed (lab PR 189) |
+| NN-AUD-264 | ATP-016 | Low | Anti-tamper | S | fixed (lab PR 189) |
+| NN-AUD-265 | ATP-017 | Low | Anti-tamper | S | fixed (lab PR 189) |
 | NN-AUD-266 | EBPF-012 | Low | eBPF kernel | — | declined (root reads the same from the agent's state files) |
-| NN-AUD-267 | EBPF-016 | Low | eBPF kernel | M | open |
+| NN-AUD-267 | EBPF-016 | Low | eBPF kernel | M | fixed (lab PR 189) |
 | NN-AUD-268 | EBPF-017 | Low | eBPF kernel | S/M | fixed (lab PR 187) |
 | NN-AUD-269 | EBPF-018 | Low | eBPF kernel | — | declined (an unreadable tracefs already stops the boot) |
 | NN-AUD-270 | EBPF-019 | Low | eBPF kernel | S | fixed (lab PR 187) |
-| NN-AUD-271 | EBPF-020 | Low | eBPF kernel | S | open |
+| NN-AUD-271 | EBPF-020 | Low | eBPF kernel | S | fixed (lab PR 189) |
 | NN-AUD-272 | EBPF-021 | Low | eBPF kernel | M | fixed (lab PR 187) |
 | NN-AUD-273 | EVD-007 | Low | Evidence logs | M | open |
 | NN-AUD-274 | EVD-008 | Low | Evidence logs | M | partly fixed (audit/canary domains, lab PR 160); open |
@@ -7525,3 +7525,133 @@ group, the ones an unprivileged user or a local attacker could use first.
     Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
     agent with `test-privileged,debug-trigger`) clean, 2,451 passed, 0 failed.
   - Lab: Ubuntu 24.04, followups188-probe.sh — before: the build of `main` with lab PRs 176–187; after: this lot on top. `nn-admin status | head -1` (and six other closed-pipe forms): exit 134 with "failed printing to stdout: Broken pipe" before, exit 141 and no panic after; `status` on an open pipe exit 0 in both. An orphan `NORTHNARROW_COMBAT` chain at start: the signed `combat_reconcile` in both, the `combat-audit.jsonl` line refused (EPERM, the state directory's `+i`) before and written after (0600, one line). The restore links are in `fim-paths.v1` after. The isolation case (the `iptables-restore` alternative pointed at `/usr/bin/true`, COMBAT forced) was run on the before build only: the guest was lost to the probe's guard reboot and the case was not repeated — the post-restore check is covered by unit tests (`isolation_gaps`, `a_restore_that_applies_nothing_is_not_an_isolation`). Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.
+- **Wave 3 — anti-tamper bootstrap trust and honest health, lab PR 189.**
+  NN-AUD-260 (ATP-007, worse than reported), NN-AUD-265 (ATP-017),
+  NN-AUD-271 (EBPF-020), NN-AUD-264 (ATP-016), NN-AUD-263 (ATP-015, the
+  part left), NN-AUD-267 (EBPF-016), all Low; batch D of the Wave 3 triage
+  of group G6.
+  - ATP-007 (260): `ensure_state_dir` did `DirBuilder::create`,
+    `metadata`, `set_permissions` and `chown` by path, and `attach`
+    registered the path's `stat` with `PROTECTED_DIR_FLAGS` — every step
+    followed a final symbolic link. Since lab PR 152 that put NOCREATE on
+    the link's target: `/var/lib/northnarrow -> /etc` gave `/etc` mode
+    0700, owner root, and no new entry outside a window.
+    `refuse_linked_state_dir` refuses the start when the state directory,
+    or one of the agent's own entries in it (`quarantine`,
+    `quarantine/vault`, `detections`, `detections/*.jsonl`, the six flat
+    chain logs), is a link; the error names each link with its target and
+    points to a bind mount. It runs first thing in `main` (after the eBPF
+    preflight, before the chain check and the bootstraps, which created
+    files through the link) and again in `ensure_state_dir`.
+    `ensure_own_dir` opens the directory `O_NOFOLLOW | O_DIRECTORY`,
+    repairs mode and owner on the descriptor (`fchmod`, `fchown`) and
+    returns its `fstat`, the key `attach` registers (the re-stat by path is
+    gone). `ensure_quarantine_dirs` checks with `lstat` and refuses a link.
+    The same class, beyond the triage's list: the bpffs pin root as a link
+    was chmodded 0700 through it (`prepare_pin_root`) and every entry of
+    its target registered MUTATE (`register_bpffs_pins`) —
+    `prepare_pin_root` now returns `None` without touching it and
+    `pin_root_refusal` makes it a failed step; `/etc/northnarrow` and the
+    unit drop-in directory as links are not registered (`lstat`, and
+    `resolve_protected_paths` skips a linked NOCREATE directory), and each
+    is a failed step (`linked agent directory`); the agent's files in its
+    directories (`ETC_PROTECTED_FILES`, the state chain logs, the sealed
+    archives, the templates) are keyed with `lstat` (`own_entry_meta`, a
+    WARN for a link): a `fim_baseline.jsonl -> /etc/passwd` write-denied
+    `/etc/passwd`. The binaries and units of `BINARY_AND_UNIT_PATHS` keep
+    `stat` (a unit linked into `/lib/systemd/system` is protected as its
+    file). Intermediate components are not checked: `/var/lib` itself is
+    the host's.
+  - ATP-016 (264): `deny_attached = deny_expected - deny_failures.len()`
+    counted entries. `DenyHealth` keeps `missing` (one per deny program not
+    attached and armed, a second reason for the same program added to the
+    first) apart from `infra` (failed steps that are not hooks:
+    `ptrace_override_boot_zero`, `filesystem::register_bpffs_pins`, the
+    pin root, a linked directory, the bootstrap error);
+    `deny_attached = deny_expected - missing`. An FS bootstrap failure is
+    `hooks_lost_to_bootstrap_failure`: the thirteen `LSM_PROGRAMS`, the
+    optional ones the boot's BTF says the kernel has (an unknown one not
+    counted), the two module-load observers, and the error as a step — "3
+    of 16" (task_kill, ptrace, guard) where the line read "15 of 16". One
+    deviation from the triage, which listed the observing guard and the
+    `register_own_objects` failure among the non-hook entries: a guard that
+    refuses nothing is the missing `bpf_map` deny, as ATP-009 decided (and
+    the upgrade notes say), counted once with both reasons. Keys
+    `deny_attached=N deny_expected=N` unchanged (`release-check.sh`, the
+    privileged map-pin test); the `DENY HOOK SHORTFALL` line adds
+    `missing=` and `infra_failed=`, the refusal reads "N of M deny hooks
+    attached and armed; missing: …; K protection step(s) failed: …". Also
+    honest health beyond the line: a start under
+    `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` and missing observe hooks were a
+    journal line only; each is now one signed `subsystem_degraded` with
+    what is missing (`take_degraded_boot_details`, attested once the audit
+    log is open).
+  - ATP-017 (265): `link_pin_names` hashed every `link_*` entry into the
+    64-entry `OWN_PIN_NAMES`, each insert failure fatal. `link_pins` opens
+    each entry (`OBJ_GET`) and reads its `link_id`/`prog_id` from
+    `/proc/self/fdinfo`, like `own_link_ids`; only a link running one of
+    the agent's programs is registered (`link_pin_owner`). Every other
+    entry (not a link, detached, another program) is a WARN and, once the
+    audit log is open, one signed `integrity_drift` `foreign_pin`
+    (`attest_foreign_pins`); it is not registered and not removed.
+  - EBPF-020 (271): `attach_lsm` (adopts any `link_<hook>` pin that
+    re-opens) and `fresh_attach_and_pin` (its only user) are removed from
+    `antitamper-bpf`, with the re-export and the crate docs;
+    `reattach_fresh` is the one pinned LSM attach, and the crate doc says a
+    future reuse must check `prog_id` and `attach_btf_id` in a new
+    function. `git grep attach_lsm` in Rust: comments and the private
+    function of `sensors/exe_identity.rs`.
+  - EBPF-016 (267): `fs_type::identity_unverified_fs` names overlayfs
+    (`0x794c7630`), FUSE (`0x65735546`) and NFS (`0x6969`); every path
+    registered in `PROTECTED_INODES` (state directory, `/etc/northnarrow`
+    and its files, chain logs, sealed archives, templates, binaries and
+    units) and every FIM watch (`populate_watched_paths` with its symlink
+    hops, `enroll_path`) goes through `note_identity` (`statfs`). After the
+    FIM set is built, a boot with any such path logs a WARN and writes one
+    signed `subsystem_degraded` (`reason: inode_identity_unverified`, the
+    filesystems with count and first five paths); a path enrolled later on
+    a filesystem the record did not name is a WARN. No kernel probe (the
+    triage's choice: verifier cost on 5.15). `KERNEL_COMPATIBILITY.md` has
+    the section next to btrfs; `deploy/lab/overlay/overlay-check.sh` and
+    `nn-lab.sh overlay-check` (watched credential file on an overlay mount
+    bind-mounted on `/root/.aws`; NN-L-FIM-011 or the signed record naming
+    it, silence fails).
+  - ATP-015 (263): doc comments only — `register_protected_observer` says
+    the no-bpffs mode is logged by `prepare_pin_root` (WARN, called by the
+    refresh task before its loop) and that the unit does not start without
+    bpffs; `evict_protected_observer` is a true no-op without bpffs.
+  - Records and formats: new signed `integrity_drift` kind `foreign_pin`;
+    new `subsystem_degraded` details (degraded start, observe hooks) and
+    one with `reason: inode_identity_unverified` plus `filesystems`; the
+    journal `DENY HOOK SHORTFALL` line's two fields. No chain row format,
+    wire or map change. No eBPF program change (`agent-ebpf` untouched;
+    `antitamper-bpf` is userland): `cargo xtask build-ebpf --release`
+    builds, `.BTF` check passes; no verifier constraint at stake.
+  - Tests: `state_dir_symlink_is_refused_and_target_untouched`,
+    `state_dir_mode_and_owner_still_repaired`, `quarantine_link_is_refused`,
+    `a_linked_own_file_is_keyed_by_the_link_not_its_target`,
+    `a_bootstrap_failure_loses_every_fs_hook` (filesystem);
+    `fs_bootstrap_failure_counts_every_fs_hook`,
+    `infra_failure_does_not_lower_the_hook_count`,
+    `a_degraded_start_is_kept_for_the_signed_chain` (anti_tamper);
+    `foreign_link_pin_is_not_registered` (bpf_defense; 70 planted entries,
+    none registered); `registration_on_overlay_is_attested` (fs_type,
+    injected magic); `pin_root_link_is_refused_and_target_untouched`
+    (antitamper-bpf); updated:
+    `deny_hooks_expected_include_the_new_entry_and_xattr_denies`,
+    `deny_shortfall_refuses_without_the_degraded_opt_in`. None of the new
+    tests builds on the starting tree (no `ensure_own_dir`,
+    `refuse_linked_state_dir`, `DenyHealth`, `link_pins`, ledger,
+    `pin_root_refusal_at`); with each production change taken back alone,
+    its test fails (checked one by one): no link check in
+    `ensure_state_dir`, the open without `O_NOFOLLOW`, no entry scan, `stat`
+    in `own_entry_meta`, no optional hooks in the bootstrap loss, infra
+    entries subtracted from the hook count, no degraded record, every
+    `link_*` registered, overlayfs not flagged, a pin-root link accepted.
+    The privileged restart with 70 planted `link_*` is the lab probe's
+    `pins` case.
+  - Host: `cargo xtask build-ebpf --release`, `cargo fmt --all`, both
+    clippy runs (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean, `cargo test -q --workspace`
+    2,452 passed, 0 failed.
+  - Lab: Ubuntu 24.04, atboot189-probe.sh — before: the build of `main` with lab PRs 176–187; after: this lot on top; every link pointing at scratch copies under `/srv/nn189-*`, undone with SHA-256 checks. `/var/lib/northnarrow` as a symlink: before the start failed with "DENY HOOK SHORTFALL … 15 of 16" (a misleading count); after "the state directory … is reached through a symbolic link … refusing to start", the link and its target named, the target untouched. The drop-in directory as a link: after an ERROR naming it, "19 of 19" hooks attached with `infra_failed=["linked agent directory …"]`, and with `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` the agent running degraded with a signed `subsystem_degraded`. 70 foreign `link_*` pins planted in bpffs: 70 signed `foreign_pin`, none adopted. `nn-lab.sh overlay-check`: PASS, the boot attested the unverified inode identity (FIM-011 once). Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.
