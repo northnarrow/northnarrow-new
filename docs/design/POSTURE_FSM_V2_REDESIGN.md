@@ -142,7 +142,7 @@ sessions.
 ```
 WARN mass-write threshold crossed
      focal_pid=1112  focal_comm="Bun Pool 1"
-     focal_filename=/home/forty/.claude/projects/.../subagents/agent-…jsonl
+     focal_filename=/home/<dev>/.claude/projects/.../subagents/agent-…jsonl
      count_within_window=20
 ```
 

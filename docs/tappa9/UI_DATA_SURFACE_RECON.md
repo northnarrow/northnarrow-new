@@ -2,7 +2,7 @@
 
 **Status:** Read-only recon. No code changed, no dependencies added, no UI scaffolding built.
 **Date:** 2026-06-08
-**Repo:** `/home/forty/dev/northnarrow-new` (workspace members: `agent`, `common`, `watchdog`, `cli`, `antitamper-bpf`, `ebpf-guard`, `xtask`)
+**Repo:** `~/northnarrow-new` (workspace members: `agent`, `common`, `watchdog`, `cli`, `antitamper-bpf`, `ebpf-guard`, `xtask`)
 **Goal:** Map the agent's existing UI-consumable data surface to the reference "threat-detection dashboard" layout, and identify what is MISSING for later Tappa 9 sub-steps.
 
 > **Naming note:** "Tappa 9" is overloaded in this repo. `docs/design/TAPPA9_FIM_DESIGN.md` and `docs/operator/TAPPA9_FIM_TRUST_MODEL.md` use "Tappa 9" for the FIM work. This document uses "Tappa 9" per the current task brief = **the local native desktop GUI** (Tauri 2 + React/TS). Filed under `docs/tappa9/` to avoid colliding with the FIM design docs in `docs/design/`.

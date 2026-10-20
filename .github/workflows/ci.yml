@@ -304,8 +304,7 @@ jobs:
       # used to be installed here was never used. Keep the version
       # PINNED: 0.11.0 dropped the proxy and needs a system LLVM 21+
       # (`-lLLVM` link failure on ubuntu-24.04, which ships LLVM 18).
-      # 0.10.3 is also the version the reference lab runs
-      # (docs/CLAUDE_BRIEFING.md).
+      # 0.10.3 is also the version the reference lab runs.
       - name: Install nightly Rust + rust-src for build-std
         # Same channel as agent-ebpf/rust-toolchain.toml, so rustup
         # does not have to download it again at build time.
