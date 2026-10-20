@@ -95,9 +95,7 @@ impl VerdictParser {
         // means the model exhausted its budget without committing
         // to a verdict → MalformedJson, which the engine folds into
         // an Escalate Tier1.
-        let post_think = strip_thinking_block(raw)?;
-        let trimmed = strip_code_fences(post_think);
-        let json_slice = extract_first_json_object(trimmed).unwrap_or(trimmed);
+        let json_slice = preparse(raw)?;
         let verdict: AdeVerdict = serde_json::from_str(json_slice)
             .map_err(|e| ValidationError::MalformedJson(e.to_string()))?;
         self.validate(&verdict)?;
@@ -239,6 +237,16 @@ impl VerdictParser {
     }
 }
 
+/// The text [`VerdictParser::parse`] hands to serde: the output after a
+/// reasoning block, without code fences, cut to its first balanced JSON
+/// object when it has one. The `ade_preparse` fuzz target drives it
+/// through `fuzz_api` (external audit WDG-R04, NN-AUD-370).
+pub(crate) fn preparse(raw: &str) -> Result<&str, ValidationError> {
+    let post_think = strip_thinking_block(raw)?;
+    let trimmed = strip_code_fences(post_think);
+    Ok(extract_first_json_object(trimmed).unwrap_or(trimmed))
+}
+
 /// Strips `\`\`\`json … \`\`\`` and `\`\`\` … \`\`\`` wrappers if the
 /// model emits one despite the prompt's instructions.
 fn strip_code_fences(raw: &str) -> &str {
@@ -277,7 +285,7 @@ fn strip_thinking_block(raw: &str) -> Result<&str, ValidationError> {
 /// prompt's instructions.
 ///
 /// Returns `None` if no balanced object is found.
-fn extract_first_json_object(s: &str) -> Option<&str> {
+pub(crate) fn extract_first_json_object(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let bytes = s.as_bytes();
     let mut depth = 0i32;
@@ -861,5 +869,29 @@ mod tests {
             "metadata":{"model_id":"x","model_quantization":"Q4","backend":"mock","host_id":"h","agent_version":"v","inference_latency_ms":0}
         }"# + "\n```";
         parser().parse(&raw).expect("fence-stripping parser");
+    }
+
+    /// External audit WDG-R04 (NN-AUD-370): `preparse`, the step the
+    /// `ade_preparse` fuzz target drives, is what `parse` decodes.
+    #[test]
+    fn preparse_cuts_to_the_first_balanced_object() {
+        let obj = r#"{"a":"}{","b":{"c":"\"}"}}"#;
+        for raw in [
+            obj.to_string(),
+            format!("```json\n{obj}\n```"),
+            format!("```\n{obj}\n```"),
+            format!("<think>weigh it {{ }}</think>\nVerdict: {obj} done"),
+            format!("  prose first {obj}{{\"second\":1}}"),
+        ] {
+            assert_eq!(preparse(&raw).unwrap(), obj, "{raw:?}");
+            assert_eq!(extract_first_json_object(obj), Some(obj));
+        }
+        assert!(matches!(
+            preparse("<think>out of budget"),
+            Err(ValidationError::MalformedJson(_))
+        ));
+        // no balanced object: the trimmed text, which serde then refuses
+        assert_eq!(preparse("  {\"open\": 1 ").unwrap(), "{\"open\": 1");
+        assert_eq!(preparse("no json").unwrap(), "no json");
     }
 }

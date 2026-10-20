@@ -1695,9 +1695,12 @@ dependencies = [
 name = "northnarrow-fuzz"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "libfuzzer-sys",
  "northnarrow-agent",
  "northnarrow-common",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

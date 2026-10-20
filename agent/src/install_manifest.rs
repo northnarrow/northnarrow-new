@@ -34,6 +34,17 @@ pub const DEFAULT_INSTALL_MANIFEST_PATH: &str = "/etc/northnarrow/install-manife
 pub const ALLOW_UNVERIFIED_ENV: &str = "NN_ALLOW_UNVERIFIED_BINARY";
 /// Manifest key of the eBPF object hash (`files` map).
 pub const EBPF_OBJECT_KEY: &str = "ebpf_object";
+/// The names `install.sh` records in the `files` map, the only ones
+/// compared (external audit WDG-R05, NN-AUD-371).
+pub const RECORDED_NAMES: [&str; 4] = [
+    "northnarrow-agent",
+    "northnarrow-watchdog",
+    "nn-admin",
+    EBPF_OBJECT_KEY,
+];
+/// [`Mismatch::actual`] of a name outside [`RECORDED_NAMES`]: refused, not
+/// hashed.
+pub const UNKNOWN_NAME: &str = "refused: not a recorded binary name";
 
 /// `install-manifest.json` as written by `install.sh`.
 #[derive(Debug, Clone, Deserialize)]
@@ -186,16 +197,22 @@ pub fn check(manifest_path: &Path, own_exe: &Path, ebpf_object_sha: &str) -> Int
             }
         }
     };
-    let manifest: InstallManifest = match serde_json::from_str(&text) {
+    let manifest = match parse_manifest(&text) {
         Ok(m) => m,
-        Err(e) => {
+        Err(reason) => {
             return IntegrityOutcome::Unreadable {
                 path: manifest_path.to_path_buf(),
-                reason: format!("parse: {e}"),
+                reason,
             }
         }
     };
     check_with(&manifest, own_exe, ebpf_object_sha)
+}
+
+/// Parse a manifest's text, as [`check`] does (the reason of an
+/// [`IntegrityOutcome::Unreadable`] on failure).
+pub fn parse_manifest(text: &str) -> Result<InstallManifest, String> {
+    serde_json::from_str(text).map_err(|e| format!("parse: {e}"))
 }
 
 /// [`check`] on an already-parsed manifest.
@@ -226,6 +243,18 @@ pub fn check_with(
     let mut checked = 0usize;
     for (name, expected) in &manifest.files {
         let expected = expected.trim().to_ascii_lowercase();
+        // External audit WDG-R05 (NN-AUD-371): only the names install.sh
+        // records. Any other key was hashed as `bin_dir.join(name)`, and a
+        // join with an absolute name drops `bin_dir`: `/dev/zero` hung the
+        // boot check, `../` reached any file. Refused, never opened.
+        if !RECORDED_NAMES.contains(&name.as_str()) {
+            mismatches.push(Mismatch {
+                name: name.clone(),
+                expected,
+                actual: UNKNOWN_NAME.to_string(),
+            });
+            continue;
+        }
         let actual = if name == EBPF_OBJECT_KEY {
             ebpf_object_sha.trim().to_ascii_lowercase()
         } else {
@@ -431,6 +460,92 @@ mod tests {
         );
         let parsed: InstallManifest = serde_json::from_str(&empty).unwrap();
         assert!(parsed.prerequisite_overrides.is_empty());
+    }
+
+    /// External audit WDG-R05 (NN-AUD-371): a name outside the four
+    /// install.sh records is a mismatch and is never opened — not an
+    /// absolute path (a join drops `bin_dir`), not a relative one that
+    /// leaves it or names a recorded binary another way. Before the check,
+    /// each of these files was hashed and, its hash recorded, verified
+    /// (`/dev/zero`, which hung the check, is the fuzz regression input
+    /// `fuzz/regressions/install_manifest/absolute-dev-zero.json`).
+    #[test]
+    fn unknown_or_absolute_names_are_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let agent = write(dir.path(), "northnarrow-agent", b"agent-bytes");
+        let secret = write(outside.path(), "secret", b"not a binary");
+        let agent_sha = sha256_file(&agent).unwrap();
+        let secret_sha = sha256_file(&secret).unwrap();
+        let rel = format!(
+            "../{}/secret",
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
+        for (name, sha) in [
+            (secret.display().to_string(), &secret_sha),
+            (rel, &secret_sha),
+            ("./northnarrow-agent".to_string(), &agent_sha),
+        ] {
+            let m = format!(
+                r#"{{"version":"0.0.1","provenance":"attested","bin_dir":"{}",
+                    "files":{{"northnarrow-agent":"{agent_sha}","{name}":"{sha}"}}}}"#,
+                dir.path().display()
+            );
+            let mp = write(dir.path(), "install-manifest.json", m.as_bytes());
+            match check(&mp, &agent, "x") {
+                IntegrityOutcome::Mismatch { mismatches, .. } => {
+                    assert_eq!(mismatches.len(), 1, "{name}: {mismatches:?}");
+                    assert_eq!(mismatches[0].name, name);
+                    assert_eq!(mismatches[0].actual, UNKNOWN_NAME);
+                }
+                other => panic!("{name}: expected Mismatch, got {other:?}"),
+            }
+        }
+    }
+
+    /// External audit WDG-R05 (NN-AUD-371): the fuzz target's fixture (a
+    /// fixed `bin_dir` holding the three binaries, `fuzz_api`) reaches the
+    /// hash comparison. Through `/proc/self/exe` every input ended
+    /// `NotApplicable`, before any hash.
+    #[test]
+    fn fuzz_fixture_reaches_hash_comparison() {
+        use crate::fuzz_api::{
+            install_manifest_check_in_dir, write_install_manifest_fixture,
+            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_install_manifest_fixture(dir.path()).unwrap();
+        let sha = |n: &str| sha256_file(&dir.path().join(n)).unwrap();
+        let good = manifest_json(
+            Path::new("/somewhere/else"),
+            &sha("northnarrow-agent"),
+            &sha("northnarrow-watchdog"),
+            &sha("nn-admin"),
+            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
+        );
+        let (parsed, out) = install_manifest_check_in_dir(
+            good.as_bytes(),
+            dir.path(),
+            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
+        );
+        assert!(parsed.is_some());
+        assert!(
+            matches!(out, IntegrityOutcome::Verified { checked: 4, .. }),
+            "{out:?}"
+        );
+        let bad = good.replacen(&sha("nn-admin"), &"0".repeat(64), 1);
+        let (_, out) = install_manifest_check_in_dir(
+            bad.as_bytes(),
+            dir.path(),
+            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
+        );
+        assert!(matches!(out, IntegrityOutcome::Mismatch { .. }), "{out:?}");
+        let (parsed, out) = install_manifest_check_in_dir(b"{not json", dir.path(), "x");
+        assert!(parsed.is_none());
+        assert!(
+            matches!(out, IntegrityOutcome::Unreadable { .. }),
+            "{out:?}"
+        );
     }
 
     #[test]

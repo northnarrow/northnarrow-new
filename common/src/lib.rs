@@ -39,6 +39,14 @@ mod model;
 #[cfg(feature = "std")]
 pub use model::*;
 
+/// The DNS name walk and its decoder, apart from the event model so the
+/// Kani gate on pull requests (`kani.yml`, external audit SUP-023) follows
+/// this file alone. Re-exported at the crate root, as before.
+#[cfg(feature = "std")]
+mod dns_qname;
+#[cfg(feature = "std")]
+pub use dns_qname::{decode_dns_qname, qname_wire_end, QnameLabel, QnameLabels};
+
 /// Active Defense Engine (ADE) verdict schema (v1.0.0).
 #[cfg(feature = "std")]
 pub mod ade_types;

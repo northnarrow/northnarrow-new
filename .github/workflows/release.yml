@@ -46,7 +46,13 @@ permissions:
 jobs:
   package:
     name: package (x86_64-linux)
-    runs-on: ubuntu-latest
+    # A fixed image, not ubuntu-latest: the image is the release's build
+    # environment (glibc, linker, C toolchain of the -sys crates). When
+    # ubuntu-latest began moving to 26.04 (2026-10-20) the same tree built
+    # there died with SIGILL in the qemu -cpu Nehalem step below, where the
+    # 24.04 build starts. A new image is adopted on purpose, with that step
+    # green, never by the runner rollout.
+    runs-on: ubuntu-24.04
     env:
       # Review 64: a build with target-cpu=native made the release binaries
       # need whatever the runner had. On a runner with AVX-512 the agent

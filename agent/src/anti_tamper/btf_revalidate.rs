@@ -1532,7 +1532,13 @@ trait TypeTable {
                 // Anonymous member — descend into its composite.
                 if let Some(nav) = self.resolve_navigable(m.type_id) {
                     if let Some((inner, tid)) = self.field_offset(nav, name, depth + 1) {
-                        return Some((m.bit_offset + inner, tid));
+                        // Saturating, as `resolve_path`'s total (lab PR 200,
+                        // found by the seeded `btf_parse` fuzz target): the
+                        // sum overflowed `u32` on a crafted blob — a panic
+                        // in a debug build, a wrapped, plausible offset in a
+                        // release one. Saturated, it is refused as not
+                        // byte-aligned.
+                        return Some((m.bit_offset.saturating_add(inner), tid));
                     }
                 }
             }
@@ -2142,6 +2148,32 @@ mod tests {
 
     fn parsed() -> Btf {
         Btf::parse(&fixture()).expect("fixture parses")
+    }
+
+    /// Lab PR 200, found by the seeded `btf_parse` fuzz target
+    /// (`fuzz/regressions/btf_parse/anonymous-member-offset-overflow.btf`):
+    /// an anonymous member's bit offset plus the field's offset inside it
+    /// overflowed `u32`. Refused now, never wrapped to a small offset.
+    #[test]
+    fn anonymous_member_offset_overflow_is_refused_not_wrapped() {
+        let mut b = BtfBuilder::new();
+        let u32_id = b.int("u32");
+        let flags = b.str("flags");
+        let anon = b.composite(None, true, false, &[(flags, u32_id, 64)]);
+        let _task = b.composite(
+            Some("task_struct"),
+            false,
+            false,
+            &[(0, anon, u32::MAX - 31)],
+        );
+        let blob = b.build();
+        let btf = Btf::parse(&blob).expect("parses");
+        assert!(matches!(
+            btf.resolve_path("task_struct", &["flags"]),
+            Err(ResolveError::BitfieldNotByteAligned(_))
+        ));
+        // the fuzz target's whole path: parse, resolve, revalidate
+        assert!(fuzz_parse_and_resolve(&blob));
     }
 
     #[test]

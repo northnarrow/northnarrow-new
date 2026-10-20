@@ -72,6 +72,14 @@ and the tracker note have the details and the lab evidence.
   **Regression:** a host restored without its install manifest does not
   start until `install.sh` runs again (recovery: §5.1 of the install
   guide).
+- **An install manifest that names another file refuses the boot**
+  (NN-AUD-371 WDG-R05, lab PR 200). The boot check compares only the four
+  names `install.sh` writes (`northnarrow-agent`, `northnarrow-watchdog`,
+  `nn-admin`, `ebpf_object`); any other key of `files` is a mismatch
+  (`refused: not a recorded binary name`) and is never opened — it was
+  hashed wherever it pointed, and `/dev/zero` hung the boot. **Regression:**
+  none for a manifest `install.sh` wrote; a hand-edited one with an extra
+  entry stops the agent (exit 78) until `install.sh` runs again.
 - **The upgrade and uninstall drain wait for the agent's own programs
   only** (NN-AUD-197 DEP-006, lab PR 148). The agent lists its BPF program
   ids in `/run/northnarrow/bpf-own-ids`; a second BPF-LSM product on the

@@ -15,6 +15,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 northnarrow-agent = { path = "../agent" }
 northnarrow-common = { path = "../common" }
+# Already in the agent's graph, at the versions fuzz/Cargo.lock locks
+# (xtask/tests/supply_chain.rs keeps the security crates equal to
+# Cargo.lock): the targets' own checks (serde_json), and their one
+# scratch directory per process (tempfile, libc; external audit WDG-R09).
+serde_json = "1"
+tempfile = "3"
+libc = "0.2"
 
 [workspace]
 
@@ -87,6 +94,29 @@ bench = false
 [[bin]]
 name = "canary_template"
 path = "fuzz_targets/canary_template.rs"
+test = false
+doc = false
+bench = false
+
+# External audit WDG-R04 (NN-AUD-370): the ADE model output.
+[[bin]]
+name = "ade_verdict"
+path = "fuzz_targets/ade_verdict.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ade_preparse"
+path = "fuzz_targets/ade_preparse.rs"
+test = false
+doc = false
+bench = false
+
+# External audit WDG-014 (NN-AUD-363): the watchdog's shutdown marker.
+[[bin]]
+name = "shutdown_marker"
+path = "fuzz_targets/shutdown_marker.rs"
 test = false
 doc = false
 bench = false
