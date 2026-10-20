@@ -34,12 +34,19 @@ use super::{Rule, RuleEngine};
 /// External audit PROC-010/PROC-009: R007 is registered twice (its
 /// exact-name pass near the head, its name-fragment pass after the
 /// process kills), so the engine holds 73 rules under 72 ids.
+/// External audit PROC-014: the io_uring (NN-L-IOU-001/002) and BPF
+/// (NN-L-BPF-001/002) rules, which only the production builder had, are
+/// in `default_rules()` too: 77 rules under 76 ids.
 #[test]
-fn default_engine_has_seventy_two_rules_across_all_families() {
+fn default_engine_has_seventy_six_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
     // chain 8 + tappa2 10 (+ R007's second pass) + process 7
-    //   + module-load 1 (R018, BUG-034) + FIM 25 + canary 4 + net 17
-    assert_eq!(engine.rule_count(), 8 + 10 + 1 + 7 + 1 + 25 + 4 + 17);
+    //   + module-load 1 (R018, BUG-034) + io_uring 2 + BPF 2 (PROC-014)
+    //   + FIM 25 + canary 4 + net 17
+    assert_eq!(
+        engine.rule_count(),
+        8 + 10 + 1 + 7 + 1 + 2 + 2 + 25 + 4 + 17
+    );
 }
 
 #[test]
@@ -252,15 +259,18 @@ fn rule_ids_are_pinned() {
 /// cross-PID / N-event chain rules NN-L-CHAIN-004..008. Tappa 9.5.1
 /// lifts 67 → 68 with NN-L-FIM-024 (anti-tamper bait); BUG-034 R018
 /// (module-load) lifts 68 → 69; NN-L-NET-020 → 70; NN-L-FIM-025 → 71;
-/// NN-L-NET-021 (external audit EBPF-013) → 72.
+/// NN-L-NET-021 (external audit EBPF-013) → 72; the io_uring and BPF
+/// rules, until then in the production builder only (external audit
+/// PROC-014) → 76. [`production_engine_pins_all_rule_ids`] holds the
+/// production builder to this same list, in the same order.
 #[test]
-fn default_engine_pins_all_seventy_two_rule_ids() {
+fn default_engine_pins_all_seventy_six_rule_ids() {
     let rules = super::rules::default_rules();
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        73,
-        "engine ships 72 rules after NN-L-NET-021_SensorRecordFlood (external audit EBPF-013), \
+        77,
+        "engine ships 76 rules after the io_uring and BPF rules (external audit PROC-014), \
          R007 in two passes (external audit PROC-010)"
     );
     // External audit PROC-010: R007's two passes share its id; no other
@@ -271,11 +281,13 @@ fn default_engine_pins_all_seventy_two_rule_ids() {
     ids.dedup();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 72, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 76, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
         vec![
+            "NN-L-BPF-001_BpfProgramLoaded",
+            "NN-L-BPF-002_BpfForeignHandleOrDetach",
             "NN-L-CANARY-001_FileAccess",
             "NN-L-CANARY-002_ProcessExec",
             "NN-L-CANARY-003_NetworkConnect",
@@ -313,6 +325,8 @@ fn default_engine_pins_all_seventy_two_rule_ids() {
             "NN-L-FIM-023_SystemdTimerCreated",
             "NN-L-FIM-024_AntiTamperHoneypotModified",
             "NN-L-FIM-025_FileCapabilityGranted",
+            "NN-L-IOU-001_IoUringRingCreated",
+            "NN-L-IOU-002_IoUringFileAndNetwork",
             "NN-L-NET-001_OutboundToBlockedIp",
             "NN-L-NET-002_OutboundToBlockedTld",
             "NN-L-NET-003_BadJa3",
@@ -350,6 +364,292 @@ fn default_engine_pins_all_seventy_two_rule_ids() {
             "R018_KernelModuleLoad",
         ]
     );
+}
+
+// ── External audit PROC-014 / PROC-015: one composition, pinned ──
+
+/// The production engine, built as `main.rs` builds it, over empty
+/// operator state (no blocklist, no allowlist entry, an inert installer
+/// override) and `lineage`.
+fn production_engine(lineage: crate::posture::lineage::AuthSessionTracker) -> RuleEngine {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use crate::config::comm_allowlist::CommAllowlist;
+    use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
+    RuleEngine::with_default_rules_and_net(
+        Arc::new(NetBlocklist::default()),
+        Arc::new(Ja3Blocklist::default()),
+        Arc::new(Mutex::new(super::rules::net::DnsBurstWindow::default())),
+        Arc::new(CommAllowlist::default()),
+        Arc::new(CommAllowlist::default()),
+        Arc::new(Mutex::new(super::rules::net::BeaconWindow::default())),
+        Arc::new(crate::net::dns_cache::DnsCache::default()),
+        crate::anti_tamper::trusted_installer::TrustedInstallerOverride::inert_arc(),
+        lineage,
+        crate::canary::readers::CanaryReaders::default(),
+        Arc::new(Mutex::new(super::correlation::CorrelationStore::new())),
+    )
+}
+
+/// A lineage cache that reads no host `/proc`, with `execs` ingested as
+/// the exec sensor would.
+fn lineage_of(
+    execs: &[(u32, &str)],
+) -> (
+    tempfile::TempDir,
+    crate::posture::lineage::AuthSessionTracker,
+) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let t = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+    for (pid, exe) in execs {
+        t.ingest_spawn_with_argv(*pid, 1, exe, &[exe.to_string()], 1);
+    }
+    (tmp, t)
+}
+
+/// External audit PROC-014 (NN-AUD-429): the production builder
+/// (`default_rules_with_net`, what `main.rs` runs) registers exactly the
+/// rules of `default_rules()`, in the same order. The engine tests above
+/// and below build `default_rules()`; with this one they hold for the
+/// shipped engine too, and a family dropped from either builder (the
+/// io_uring and BPF rules were in the production one only) or a rule
+/// registered twice fails here.
+#[test]
+fn production_engine_pins_all_rule_ids() {
+    let (_tmp, lineage) = lineage_of(&[]);
+    let production = production_engine(lineage);
+    let default = RuleEngine::with_default_rules();
+    assert_eq!(production.rule_count(), 77);
+    assert_eq!(production.rule_ids(), default.rule_ids());
+}
+
+/// The family of a rule id: `R` for the process rules (R001..R018), else
+/// its `NN-L-<FAMILY>` prefix.
+fn family(id: &str) -> &str {
+    if id.starts_with('R') {
+        return "R";
+    }
+    let rest = id.strip_prefix("NN-L-").expect("an NN-L- rule id");
+    let end = "NN-L-".len() + rest.find('-').expect("NN-L-<FAMILY>-<NNN>");
+    &id[..end]
+}
+
+/// External audit PROC-014: the order of the families in both builders.
+/// The chains that observe precursors come first (Tappa 10.5 D5), the
+/// process rules in [`super::rules`]'s `spawn_rules` order (every kill
+/// before any record, PROC-009), then R018 and the families of the other
+/// event kinds; NN-L-CHAIN-008, a Log, comes last so it never shadows a
+/// blocking verdict.
+#[test]
+fn both_builders_keep_the_family_order() {
+    let (_tmp, lineage) = lineage_of(&[]);
+    for (name, ids) in [
+        ("default_rules", RuleEngine::with_default_rules().rule_ids()),
+        ("production", production_engine(lineage).rule_ids()),
+    ] {
+        let mut runs: Vec<(&str, usize)> = Vec::new();
+        for id in &ids {
+            match runs.last_mut() {
+                Some((f, n)) if *f == family(id) => *n += 1,
+                _ => runs.push((family(id), 1)),
+            }
+        }
+        assert_eq!(
+            runs,
+            vec![
+                ("NN-L-CHAIN", 7),
+                ("R", 19),
+                ("NN-L-IOU", 2),
+                ("NN-L-BPF", 2),
+                ("NN-L-FIM", 25),
+                ("NN-L-CANARY", 4),
+                ("NN-L-NET", 17),
+                ("NN-L-CHAIN", 1),
+            ],
+            "{name}"
+        );
+        let process: Vec<&str> = ids.iter().copied().filter(|id| family(id) == "R").collect();
+        assert_eq!(
+            process,
+            vec![
+                "R004_ExecFromProcSelfFd",
+                "R007_CryptoMiner",
+                "R006_ReverseShellTooling",
+                "R009_RootExecFromUserPath",
+                "R010_BinaryInWebroot",
+                "R011_KernelModuleTooling",
+                "R012_SetcapTooling",
+                "R013_NamespaceEscapeTooling",
+                "R017_ShellFromNonstandardPath",
+                "R002_ExecFromDevShm",
+                "R001_ExecFromTmp",
+                "R003_ExecFromVarTmp",
+                "R005_NetcatExec",
+                "R007_CryptoMiner",
+                "R008_HiddenHomeBinary",
+                "R014_AtBatchScheduling",
+                "R015_EncodingToolingServiceUid",
+                "R016_DebuggerServiceUid",
+                "R018_KernelModuleLoad",
+            ],
+            "{name}"
+        );
+        assert_eq!(
+            ids.last().copied(),
+            Some("NN-L-CHAIN-008_CrossPidPrivEscExfil"),
+            "{name}"
+        );
+    }
+}
+
+/// External audit PROC-014: an io_uring ring that drives file and network
+/// I/O, and a BPF program load or a handle on another program's object,
+/// reach their rules through both engines — no other engine test named
+/// NN-L-IOU-00x or NN-L-BPF-00x.
+#[test]
+fn io_uring_and_bpf_events_reach_their_rules_in_both_engines() {
+    use common::wire::{BPF_CMD_FOREIGN_GET_FD, IOURING_CLASS_FILE_RW, IOURING_CLASS_NET_CONNECT};
+    let ring = |created: bool, classes: u32, last_opcode: u8| Event::IoUring {
+        created,
+        pid: 4242,
+        uid: 1000,
+        comm: "loader".into(),
+        classes,
+        count: 32,
+        last_opcode,
+        sq_thread: false,
+        timestamp_ns: 1,
+    };
+    let bpf = |cmd: u32, arg: u32| Event::BpfSyscall {
+        pid: 4343,
+        uid: 0,
+        comm: "loader".into(),
+        cmd,
+        arg,
+        timestamp_ns: 1,
+    };
+    const BPF_PROG_LOAD: u32 = 5;
+    let (_tmp, lineage) = lineage_of(&[(4242, "/tmp/.x/loader"), (4343, "/tmp/.x/loader")]);
+    for (name, engine) in [
+        ("default_rules", RuleEngine::with_default_rules()),
+        ("production", production_engine(lineage)),
+    ] {
+        let cases = [
+            (
+                ring(true, 0, 0),
+                "NN-L-IOU-001_IoUringRingCreated",
+                Severity::Low,
+            ),
+            (
+                // file + network, completed by IORING_OP_CONNECT (16)
+                ring(false, IOURING_CLASS_FILE_RW | IOURING_CLASS_NET_CONNECT, 16),
+                "NN-L-IOU-002_IoUringFileAndNetwork",
+                Severity::High,
+            ),
+            (
+                bpf(BPF_PROG_LOAD, 7),
+                "NN-L-BPF-001_BpfProgramLoaded",
+                Severity::Medium,
+            ),
+            (
+                bpf(BPF_CMD_FOREIGN_GET_FD, 42),
+                "NN-L-BPF-002_BpfForeignHandleOrDetach",
+                Severity::High,
+            ),
+        ];
+        for (event, rule, severity) in cases {
+            let v = engine
+                .evaluate(&event)
+                .unwrap_or_else(|| panic!("{name}: {rule} did not fire"));
+            assert_eq!(v.rule_id, rule, "{name}");
+            assert_eq!(v.severity, severity, "{name}: {rule}");
+            assert_eq!(v.action, ResponseAction::Log, "{name}: {rule}");
+        }
+    }
+}
+
+/// External audit PROC-015 (NN-AUD-302): a `demo-tappa5` build enforces
+/// only in detect-only or with `NN_ALLOW_DEMO_RULES=1`; any other build is
+/// never held back.
+#[test]
+fn a_demo_build_enforces_only_with_the_operators_consent() {
+    use super::engine::{demo_rules_gate, ALLOW_DEMO_RULES_ENV};
+    // demo build, enforcement: refused without the variable, or with any
+    // value other than 1
+    for allow in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("yes"),
+        Some("true"),
+        Some(" 1"),
+    ] {
+        let e = demo_rules_gate(true, false, allow).expect_err(&format!("{allow:?}"));
+        assert!(
+            e.contains("demo-tappa5") && e.contains(ALLOW_DEMO_RULES_ENV),
+            "{e}"
+        );
+        assert!(e.contains("--detect-only"), "{e}");
+    }
+    // demo build: detect-only, or the operator's explicit 1
+    assert_eq!(demo_rules_gate(true, false, Some("1")), Ok(()));
+    assert_eq!(demo_rules_gate(true, true, None), Ok(()));
+    assert_eq!(demo_rules_gate(true, true, Some("0")), Ok(()));
+    // any other build starts whatever the variable says
+    for allow in [None, Some("0"), Some("1")] {
+        for detect_only in [false, true] {
+            assert_eq!(demo_rules_gate(false, detect_only, allow), Ok(()));
+        }
+    }
+}
+
+/// External audit PROC-015: the variable is a weakening variable — in the
+/// build whose demo rules it releases, and only there (elsewhere nothing
+/// reads it).
+#[test]
+fn the_demo_rules_variable_is_a_weakening_variable() {
+    use super::engine::{ALLOW_DEMO_RULES_ENV, DEMO_RULES_BUILD};
+    let (_, weakens) = crate::self_integrity::WEAKENING_ENV
+        .iter()
+        .find(|(name, _)| *name == ALLOW_DEMO_RULES_ENV)
+        .expect("NN_ALLOW_DEMO_RULES is in WEAKENING_ENV");
+    assert_eq!(weakens("1"), DEMO_RULES_BUILD);
+    assert!(!weakens("0"));
+    assert!(!weakens(""));
+    assert_eq!(DEMO_RULES_BUILD, cfg!(feature = "demo-tappa5"));
+}
+
+/// External audit PROC-015 / PROC-014: the demo build is the production
+/// engine with R901..R904 put first, not the demo rules over
+/// `default_rules()` (no operator blocklist or allowlist).
+#[cfg(feature = "demo-tappa5")]
+#[test]
+fn the_demo_engine_is_the_production_engine_behind_r901_to_r904() {
+    let (_tmp, lineage) = lineage_of(&[]);
+    let production = production_engine(lineage.clone()).rule_ids();
+    let demo = production_engine(lineage).with_demo_tappa5_first();
+    let ids = demo.rule_ids();
+    assert_eq!(
+        ids[..4],
+        [
+            "R901_TestBlockOutbound",
+            "R902_TestNetworkIsolation",
+            "R903_TestQuarantine",
+            "R904_TestThrottle",
+        ]
+    );
+    assert_eq!(ids[4..], production[..]);
+    let v = demo
+        .evaluate(&spawn("payload", "/tmp/payload.block-outbound"))
+        .expect("R901");
+    assert_eq!(v.rule_id, "R901_TestBlockOutbound");
+    // no demo suffix: the production rule
+    let v = demo
+        .evaluate(&spawn("nn-test-payload", "/tmp/nn-test-payload"))
+        .expect("R001");
+    assert_eq!(v.rule_id, "R001_ExecFromTmp");
 }
 
 // ── External audit PROC-009 / PROC-010: no record stands in for a kill ──

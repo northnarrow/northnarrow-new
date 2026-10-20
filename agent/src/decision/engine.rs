@@ -27,7 +27,8 @@ impl RuleEngine {
         Self { rules: Vec::new() }
     }
 
-    /// Engine pre-loaded with the Tappa 2 rule set (R001..=R010).
+    /// Engine pre-loaded with [`default_rules`]: the production
+    /// composition over empty operator state (external audit PROC-014).
     pub fn with_default_rules() -> Self {
         let mut e = Self::new();
         for r in default_rules() {
@@ -82,23 +83,33 @@ impl RuleEngine {
         e
     }
 
-    /// Engine pre-loaded with the Tappa 5 demo rules (R901..=R904)
-    /// FIRST, then R001..=R010. Demo rules win over the production
-    /// rules so a `/tmp/payload.block-outbound` exec triggers
-    /// `R901` (BlockOutbound) instead of being killed by `R001`.
-    /// This ordering only ships in the `demo-tappa5` build; the
-    /// regression demo (`/tmp/nn-test-payload`) still goes through
-    /// R001 → KillProcessTree because its filename has no demo suffix.
+    /// This engine with the Tappa 5 demo rules (R901..=R904) put FIRST.
+    /// Demo rules win over the production rules so a
+    /// `/tmp/payload.block-outbound` exec triggers `R901` (BlockOutbound)
+    /// instead of being killed by `R001`. This ordering only ships in the
+    /// `demo-tappa5` build; the regression demo (`/tmp/nn-test-payload`)
+    /// still goes through R001 → KillProcessTree because its filename has
+    /// no demo suffix.
+    ///
+    /// External audit PROC-015 / PROC-014: `main.rs` puts them ahead of
+    /// the production engine ([`Self::with_default_rules_and_net`]), so a
+    /// demo build keeps the operator's blocklists and allowlists; it used
+    /// to run them over [`default_rules`], which has neither. Such a build
+    /// enforces only under [`demo_rules_gate`].
     #[cfg(feature = "demo-tappa5")]
-    pub fn with_default_rules_and_demo_tappa5() -> Self {
+    pub fn with_demo_tappa5_first(self) -> Self {
         let mut e = Self::new();
         for r in super::rules::demo_tappa5_rules() {
             e.add_rule(r);
         }
-        for r in super::rules::default_rules() {
-            e.add_rule(r);
-        }
+        e.rules.extend(self.rules);
         e
+    }
+
+    /// The ids of the registered rules, in evaluation order (a rule
+    /// registered twice appears twice).
+    pub fn rule_ids(&self) -> Vec<&'static str> {
+        self.rules.iter().map(|r| r.id()).collect()
     }
 
     /// Append a rule. Order is preserved.
@@ -127,4 +138,47 @@ impl Default for RuleEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// External audit PROC-015 (NN-AUD-302): the variable that lets a
+/// `demo-tappa5` build enforce. It is a weakening variable
+/// (`self_integrity::WEAKENING_ENV`): set to `1` in such a build, it is a
+/// signed `integrity_drift`.
+pub const ALLOW_DEMO_RULES_ENV: &str = "NN_ALLOW_DEMO_RULES";
+
+/// `true` when this binary carries the demo rules R901..=R904 (the
+/// `demo-tappa5` feature).
+pub const DEMO_RULES_BUILD: bool = cfg!(feature = "demo-tappa5");
+
+/// Does this value of [`ALLOW_DEMO_RULES_ENV`] weaken the agent? Only
+/// `1`, and only in a build whose demo rules it releases: elsewhere
+/// nothing reads it.
+pub fn allow_demo_rules_weakens(value: &str) -> bool {
+    DEMO_RULES_BUILD && value == "1"
+}
+
+/// External audit PROC-015 (NN-AUD-302): may this agent start? A
+/// `demo-tappa5` build (`demo_build`) puts R901..=R904 ahead of every
+/// production rule; they block a process's outbound traffic, quarantine
+/// its file or throttle it on a filename suffix any user chooses. Such a
+/// build starts in detect-only, where no verdict is executed, or with
+/// [`ALLOW_DEMO_RULES_ENV`]`=1` (`allow`, the variable's value), the
+/// operator's explicit consent; in enforcement without it the agent
+/// refuses to start, with the reason. Any other build always starts.
+pub fn demo_rules_gate(
+    demo_build: bool,
+    detect_only: bool,
+    allow: Option<&str>,
+) -> Result<(), String> {
+    if !demo_build || detect_only || allow == Some("1") {
+        return Ok(());
+    }
+    Err(format!(
+        "this agent was built with the demo-tappa5 feature: the demo rules R901..R904 \
+         block, quarantine or throttle any process whose file name ends in a demo suffix, \
+         ahead of every production rule (external audit PROC-015). Refusing to start in \
+         enforcement: run it with --detect-only, set {ALLOW_DEMO_RULES_ENV}=1 to enforce \
+         them on a lab host, or install a release build (`northnarrow-agent \
+         --build-features` prints `none`)"
+    ))
 }

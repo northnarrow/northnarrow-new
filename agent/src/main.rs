@@ -104,10 +104,11 @@ struct Cli {
     sensor_feasibility: bool,
 
     /// Print the test and debug cargo features this binary was built with
-    /// (comma-separated: `debug-trigger`, `demo-tappa5`, `test-privileged`)
-    /// or `none`, and exit. A release build prints `none`; the range
-    /// bootstrap refuses to install anything else (external audit
-    /// NN-AUD-211).
+    /// (comma-separated: `debug-trigger`, `demo-tappa5`, `posture-demo`,
+    /// `test-privileged`) or `none`, and exit. A release build prints
+    /// `none`; the range bootstrap refuses to install anything else
+    /// (external audit NN-AUD-211), and so does the release workflow's
+    /// check of its artefacts (external audit PROC-015).
     #[arg(long = "build-features")]
     build_features: bool,
 
@@ -1547,9 +1548,6 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
     let chain_store = Arc::new(parking_lot::Mutex::new(
         northnarrow_agent::decision::correlation::CorrelationStore::new(),
     ));
-    #[cfg(feature = "demo-tappa5")]
-    let engine = RuleEngine::with_default_rules_and_demo_tappa5();
-    #[cfg(not(feature = "demo-tappa5"))]
     let engine = RuleEngine::with_default_rules_and_net(
         Arc::clone(&netflow_blocklist),
         Arc::clone(&ja3_blocklist),
@@ -1576,6 +1574,11 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
         ),
         Arc::clone(&chain_store),
     );
+    // External audit PROC-015 / PROC-014: a demo build runs R901..R904
+    // ahead of the production engine (operator state included), and
+    // enforces only under the demo-rules gate below.
+    #[cfg(feature = "demo-tappa5")]
+    let engine = engine.with_demo_tappa5_first();
     info!(
         rules = engine.rule_count(),
         demo_tappa5 = cfg!(feature = "demo-tappa5"),
@@ -1620,6 +1623,24 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
         exec_cfg.dry_run = true;
     }
     let detect_only = exec_cfg.dry_run;
+    // External audit PROC-015 (NN-AUD-302): a demo-tappa5 build enforces
+    // R901..R904 on a file-name suffix any user picks; it starts in
+    // enforcement only with NN_ALLOW_DEMO_RULES=1 (a weakening variable,
+    // recorded as a signed integrity_drift). Before any response runs.
+    {
+        use northnarrow_agent::decision::engine as eng;
+        let allow = std::env::var(eng::ALLOW_DEMO_RULES_ENV).ok();
+        eng::demo_rules_gate(eng::DEMO_RULES_BUILD, detect_only, allow.as_deref())
+            .map_err(anyhow::Error::msg)?;
+        if eng::DEMO_RULES_BUILD {
+            warn!(
+                detect_only,
+                allow = allow.as_deref().unwrap_or(""),
+                "demo-tappa5 build: R901..R904 run ahead of every production rule — \
+                 a lab binary, never a release"
+            );
+        }
+    }
     // External audit MAIN-008: the signed agent_boot entry says where
     // detect-only came from.
     let detect_only_source: Option<String> = if cli.detect_only {

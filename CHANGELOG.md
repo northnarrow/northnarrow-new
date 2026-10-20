@@ -61,6 +61,52 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, engine composition and the release build (Info
+  PROC-014 NN-AUD-429, Low PROC-015 NN-AUD-302; lab PR 201). PROC-014:
+  `default_rules()`, the rule set the engine tests build, lacked the
+  io_uring (NN-L-IOU-001/002) and BPF (NN-L-BPF-001/002) rules that only
+  the production builder `default_rules_with_net` registered, so no engine
+  test saw them and nothing held the two builders to one composition. Both
+  families are now in `default_rules()` too, over its empty process
+  allowlist (their built-in known programs still apply), at the production
+  builder's place (after R018, before FIM): 77 rules under 76 ids.
+  `production_engine_pins_all_rule_ids` builds the engine as `main.rs`
+  does, over empty operator state, and requires the id sequence of
+  `default_rules()`, which `default_engine_pins_all_seventy_six_rule_ids`
+  pins; `both_builders_keep_the_family_order` pins the order of the
+  families (the chains that observe first, the process rules in
+  `spawn_rules` order, R018, io_uring, BPF, FIM, canary, net, CHAIN-008
+  last) and the process rules' precedence;
+  `io_uring_and_bpf_events_reach_their_rules_in_both_engines` sends the
+  four rules their events. PROC-015 (what remained): a `demo-tappa5` build
+  refuses to start in enforcement unless `NN_ALLOW_DEMO_RULES=1`
+  (`decision::engine::demo_rules_gate`, checked once detect-only is
+  resolved, before any response runs; detect-only starts), and the
+  variable is a weakening variable (`WEAKENING_ENV`: a signed
+  `integrity_drift` in a demo build, the only one that reads it). The demo
+  engine is the production engine with R901..R904 put first
+  (`RuleEngine::with_demo_tappa5_first`), no longer the demo rules over
+  `default_rules()`, which has no operator blocklist or allowlist.
+  `--build-features` and the signed `agent_boot` entry name `posture-demo`
+  too (`audit::LAB_FEATURES`); `agent/tests/build_features_cli.rs` holds
+  that list to the `[features]` of `agent/Cargo.toml` (every feature
+  named, `default = []`). `release.yml`: a package-job step, "No lab
+  feature in the released binaries", extracts the tarball, the .deb and
+  the .rpm and fails unless each `northnarrow-agent --build-features`
+  prints `none` and each `nn-admin --help` lists no `debug` subcommand,
+  before the artefacts are uploaded;
+  `xtask/tests/supply_chain.rs::the_release_build_carries_no_lab_feature`
+  requires that step, after the packaging and before the upload, and a
+  release build that passes no cargo feature.
+  **Regressions / changes:** an engine built from `default_rules()` (the
+  engine and ADE tests) also records io_uring and BPF events (Log only);
+  tests that count its rules count 77; a `demo-tappa5` agent started
+  without `--detect-only`, `NN_DETECT_ONLY` or `NN_ALLOW_DEMO_RULES=1`
+  exits at start with the reason, and one that starts runs the operator's
+  blocklists and allowlists, the io_uring and BPF rules included; a
+  `posture-demo` build's `--build-features` prints `posture-demo` (the
+  range bootstrap refuses it, as anything but `none`); the release job
+  installs `cpio`.
 - External audit, Wave 3, fuzz targets that can fail and fuzzing/proofs as
   PR gates (Low WDG-014 NN-AUD-363, WDG-R04 NN-AUD-370, WDG-R05 NN-AUD-371,
   WDG-R06 NN-AUD-372, WDG-R07 NN-AUD-373, WDG-R08 NN-AUD-374, WDG-R09

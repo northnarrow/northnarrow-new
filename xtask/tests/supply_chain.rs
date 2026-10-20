@@ -2,7 +2,7 @@
 //! releases are verified, what the default build targets, and which RustSEC
 //! advisories are accepted. External audit SUP-001, SUP-002, SUP-004,
 //! SUP-005, SUP-006, SUP-007 to SUP-012, SUP-015, SUP-016, SUP-017, SUP-018,
-//! SUP-022, SUP-023 and DEP-008. The tests read committed files; three run a local tool and
+//! SUP-022, SUP-023, DEP-008 and PROC-015. The tests read committed files; three run a local tool and
 //! none touches the network: `prune_script_fails_closed` runs the CI prune
 //! script under bash with a stub `cargo`, `advisory_exceptions_expire_in_ci`
 //! runs the CI expiry check under bash with a fixed date, and
@@ -1883,4 +1883,79 @@ fn kani_runs_every_proof_on_the_prs_that_touch_it() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// External audit PROC-015 (NN-AUD-302): a release carries no test, debug
+/// or demo feature. The release job builds with no `--features` (the agent
+/// crate has no default feature: `agent/tests/build_features_cli.rs`), and
+/// before its artefacts are uploaded it reads what each one carries:
+/// `northnarrow-agent --build-features` must print `none` in the tarball,
+/// the .deb and the .rpm, and nn-admin must have no `debug` subcommand.
+#[test]
+fn the_release_build_carries_no_lab_feature() {
+    let file = repo_root().join(".github/workflows/release.yml");
+    let wf = workflow_yaml(&file);
+    let (_, package) = jobs(&wf)
+        .into_iter()
+        .find(|(name, _)| name == "package")
+        .expect("release.yml has a package job");
+    let steps = steps(&package);
+    let runs: Vec<String> = steps
+        .iter()
+        .map(|s| str_of(s, "run").unwrap_or("").to_string())
+        .collect();
+
+    let mut builds = 0;
+    for call in runs.iter().flat_map(|r| cargo_calls(r)) {
+        let is_build = call.sub == "build"
+            || (call.sub == "xtask" && call.args.first().is_some_and(|a| a == "build"));
+        if !is_build {
+            continue;
+        }
+        builds += 1;
+        let featured =
+            call.global.iter().chain(&call.args).any(|a| {
+                a == "--all-features" || a.starts_with("--features") || a.starts_with("-F")
+            });
+        assert!(
+            !featured,
+            "release.yml: the release build must pass no cargo feature: {}",
+            call.line
+        );
+    }
+    assert!(
+        builds >= 1,
+        "release.yml: no release build found in the package job"
+    );
+
+    let check = runs
+        .iter()
+        .position(|r| r.contains("--build-features"))
+        .expect("release.yml: no step checks the artefacts' --build-features");
+    let script = &runs[check];
+    for needle in [
+        "dist/*.tar.gz",
+        "dpkg-deb -x",
+        "rpm2cpio",
+        "!= none",
+        "nn-admin\" --help",
+        "debug( |$)",
+    ] {
+        assert!(
+            script.contains(needle),
+            "release.yml: the artefact check must use `{needle}`:\n{script}"
+        );
+    }
+    let built = runs
+        .iter()
+        .position(|r| r.contains("mk-packages.sh"))
+        .expect("release.yml builds the packages");
+    let upload = steps
+        .iter()
+        .position(|s| str_of(s, "uses").is_some_and(|u| u.starts_with("actions/upload-artifact@")))
+        .expect("the package job uploads its artefacts");
+    assert!(
+        built < check && check < upload,
+        "release.yml: the artefact check runs after the packages are built and before the upload"
+    );
 }

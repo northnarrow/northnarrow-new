@@ -932,20 +932,28 @@ impl AuditLog {
 /// External audit ATP-009: the test and debug features this binary was
 /// built with — none in a release build. Also printed by
 /// `northnarrow-agent --build-features`, which the range bootstrap checks
-/// before it installs a binary (external audit NN-AUD-211).
+/// before it installs a binary (external audit NN-AUD-211) and the release
+/// workflow checks on every artefact it builds (external audit PROC-015).
 pub fn build_features() -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if cfg!(feature = "debug-trigger") {
-        features.push("debug-trigger");
-    }
-    if cfg!(feature = "demo-tappa5") {
-        features.push("demo-tappa5");
-    }
-    if cfg!(feature = "test-privileged") {
-        features.push("test-privileged");
-    }
-    features
+    LAB_FEATURES
+        .iter()
+        .filter(|(_, built)| *built)
+        .map(|(name, _)| *name)
+        .collect()
 }
+
+/// External audit PROC-015 (NN-AUD-302): every cargo feature of this crate
+/// (`agent/Cargo.toml`), with whether this binary was built with it. All
+/// of them are test, debug or demo features, none is a default, and
+/// `agent/tests/build_features_cli.rs` holds this list to the manifest, so
+/// a new feature cannot be added without [`build_features`] naming it.
+pub const LAB_FEATURES: &[(&str, bool)] = &[
+    ("debug-trigger", cfg!(feature = "debug-trigger")),
+    ("demo-tappa5", cfg!(feature = "demo-tappa5")),
+    // POS-013: `PostureMachine::admin_release_combat`, the bool stub.
+    ("posture-demo", cfg!(feature = "posture-demo")),
+    ("test-privileged", cfg!(feature = "test-privileged")),
+];
 
 /// Audit op recording a repaired torn tail of a chain log.
 pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
