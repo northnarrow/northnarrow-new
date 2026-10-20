@@ -22,6 +22,8 @@
 //!   (NEW in Tappa 8 A9 per design §5.3)
 //! - 9  canary burn/refresh: no such canary; response release/restore:
 //!   the agent verified the request and did nothing (reason printed)
+//! - 141 stdout (or stderr) closed before everything was written —
+//!   `nn-admin status | head -1` (128 + SIGPIPE, lab PR 188)
 //!
 //! Air-gapped split flow (`unlock --request-only` writing a
 //! challenge file, plus a separate `nn-admin sign` offline) is on
@@ -45,6 +47,89 @@ use northnarrow_agent::admin_cli::{
     NetResolveOutcome, RotateKeysOutcome, ShutdownOutcome, StatusOutcome,
     TrustedInstallerGrantOutcome, UnlockOutcome, VerifyKeysOutcome,
 };
+
+/// Lab follow-up (lab PR 188): the exit status when stdout (or stderr) was
+/// closed before nn-admin wrote everything — `nn-admin status | head -1`,
+/// `| grep -m1 …`. 128 + SIGPIPE, what a shell reports for a tool the
+/// signal ends; never 0, so `set -o pipefail` does not take a cut-short
+/// `audit verify` for a pass.
+const EXIT_CLOSED_PIPE: u8 = 141;
+
+/// Lab follow-up (lab PR 188): every line nn-admin prints goes through here
+/// (the `println!` family below is shadowed for this crate). Rust ignores
+/// SIGPIPE, so a write to a pipe whose reader has gone fails with EPIPE, and
+/// std's `println!` panics on it — `panic = "abort"` in the release profile:
+/// `nn-admin status | grep -m1 …` exited 134 with a panic message. A closed
+/// pipe now ends the command quietly with [`EXIT_CLOSED_PIPE`]; another
+/// error writing stdout is reported on stderr and exits 1; one writing
+/// stderr has nowhere to be reported and is dropped.
+fn emit(to_stderr: bool, args: std::fmt::Arguments<'_>, newline: bool) {
+    let written = if to_stderr {
+        write_out(&mut std::io::stderr().lock(), args, newline)
+    } else {
+        write_out(&mut std::io::stdout().lock(), args, newline)
+    };
+    match written {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            std::process::exit(EXIT_CLOSED_PIPE.into())
+        }
+        Err(_) if to_stderr => {}
+        Err(e) => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "nn-admin: writing stdout: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// One `print!` / `println!` to `w`, flushed so a closed pipe surfaces at
+/// the write that met it (see [`emit`]).
+fn write_out(
+    w: &mut impl std::io::Write,
+    args: std::fmt::Arguments<'_>,
+    newline: bool,
+) -> std::io::Result<()> {
+    w.write_fmt(args)?;
+    if newline {
+        w.write_all(b"\n")?;
+    }
+    w.flush()
+}
+
+/// Lab follow-up (lab PR 188): the error of a write to a closed pipe — what
+/// [`run_audit_read`] returns when its reader goes — wherever it sits in the
+/// chain.
+fn is_closed_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+// Lab follow-up (lab PR 188): std's printing macros panic on a write error;
+// these shadow them in this crate and write through `emit`.
+macro_rules! println {
+    () => {
+        $crate::emit(false, format_args!(""), true)
+    };
+    ($($arg:tt)*) => {
+        $crate::emit(false, format_args!($($arg)*), true)
+    };
+}
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::emit(false, format_args!($($arg)*), false)
+    };
+}
+macro_rules! eprintln {
+    () => {
+        $crate::emit(true, format_args!(""), true)
+    };
+    ($($arg:tt)*) => {
+        $crate::emit(true, format_args!($($arg)*), true)
+    };
+}
 
 const DEFAULT_SOCKET: &str = "/run/northnarrow/admin.sock";
 const DEFAULT_PUB_PATH: &str = "/etc/northnarrow/admin.pub";
@@ -1343,6 +1428,8 @@ fn main() -> ExitCode {
                 eprintln!("audit: {n} entries read from {}", path.display());
                 ExitCode::SUCCESS
             }
+            // Lab PR 188: `audit read | head` — the reader went.
+            Err(e) if is_closed_pipe(&e) => ExitCode::from(EXIT_CLOSED_PIPE),
             Err(e) => {
                 eprintln!("audit: {e:#}");
                 ExitCode::from(1)

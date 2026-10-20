@@ -162,8 +162,10 @@ entry names the lab PR that fixed it.
   blocked address and keeps the socket open is judged when it closes it or
   exits (the probe of lab PR 168 held its socket: the verdict came at exit,
   `AlreadyGone`).
-- **`nn-admin` aborts on a closed pipe.** `nn-admin status | grep -m1 …`
-  exits 134: a write to a closed stdout panics instead of ending quietly.
+- **`nn-admin` aborts on a closed pipe — fixed (lab PR 188).** `nn-admin
+  status | grep -m1 …` exits 134: a write to a closed stdout panics
+  instead of ending quietly. It now ends with 141 (128 + SIGPIPE), no
+  panic (note below).
 - **To run on a host with the model.** The real `prompt_tokens` of the v1.1
   system prompt (`ignored_model_host_prompt_tokens`, lab PR 133; the
   window budget rests on estimates), `ade_attacks` before and after the
@@ -7422,3 +7424,104 @@ group, the ones an unprivileged user or a local attacker could use first.
     `cargo fmt`, both clippy runs (`--workspace --all-targets`, the agent
     with `test-privileged,debug-trigger`) clean, 2,411 passed, 0 failed.
   - Lab: Ubuntu 24.04, kernfid187-probe.sh — before: the build of `main` with lab PRs 176–183; after: this lot on top. `socat` with 200 filler `-d` options before `EXEC:/bin/sh` (a 635-byte command line): before R006 Log High (the shell past the cut unseen, like a plain relay); after R006 Log **Critical** "not classified — argv truncated at 511 bytes". `base64` as `www-data` with 120 filler options before `-d`: R015 Medium in both, the reason after naming the cut. The task-denial budget: the probe's `kill -s CONT` loop against the agent was stopped by the agent's own response after the first denied signal (COMBAT INVESTIGATE, released by the probe), so the per-CPU budget was not reached in the lab; unit tests cover it. The new programs load on 6.8 (19 deny hooks) and on Ubuntu 22.04's 5.15 verifier (17 of 17, every sensor armed). Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.
+- **Lab follow-ups — reconcile line, isolation binaries' links, nn-admin
+  EPIPE, lab PR 188.** Three follow-ups found in the lab, not audit
+  findings: the residue lab PR 180's lab line names, the one lab PR 176's
+  note names, and the `nn-admin` entry of "Follow-ups found in the lab".
+  On the integration tree (`main` with lab PRs 176–179, lab PRs 180–187
+  on top).
+  - Reconcile line (lab PR 180). Re-checked the cause in the code (the
+    probe records the directory's flags and any denial): at the teardown
+    (`main.rs`, before the audit log opens) the agent is already in the
+    pinned `PROTECTED_PIDS` (EBPF-015's early registration, then the
+    attach), so the predecessor's deny hooks were not what refused the
+    file; the state directory is `chattr +i` from one run to the next
+    (`prepare_state_dir`), and `+i` refuses a new entry to every process,
+    root and the agent included: `combat-audit.jsonl` could be appended
+    when it existed and never created (EPERM, as lab PR 180's lab line
+    records). `combat::reconcile::record_line`: an existing file is
+    appended directly (a content operation, allowed under `+i`), a missing
+    one is created inside the `ProtectionManager` dance — `+i` lifted and
+    put back by `ImmutabilityGuard`, as `record_boot_id` and the log
+    rotations create theirs. `main.rs` writes it once the shared
+    `StateDirProtection` exists (after the audit log opens; the signed
+    `combat_reconcile` row is recorded before it, unchanged);
+    without that protection (`NoProtection`) the old behaviour remains (a
+    WARN when the file is missing). Still `0600`, through the anchored
+    directory, `O_NOFOLLOW|O_NONBLOCK`; the file stays out of
+    `PROTECTED_INODES` (the signed row is the evidence).
+    `COMBAT_RECOVERY.md` §4 updated.
+  - Isolation binaries' links (lab PR 176). (a) `fim-paths.v1` lists
+    `/usr/sbin/iptables-restore` and `/usr/sbin/ip6tables-restore`; the
+    watch follows each link and its `/etc/alternatives` entry to the
+    target (NN-AUD-122), so re-pointing one (`ln -sfn /usr/bin/true
+    /etc/alternatives/iptables-restore`) is `Modified` drift of the
+    watched path once it lands: NN-L-FIM-001, Critical, KillProcessTree,
+    and, through `PackageManaged`, Log Low when the writer descends from a
+    package transaction (a postinst's `update-alternatives`, an iptables
+    upgrade replacing `xtables-nft-multi` — already the case for
+    `/usr/sbin/iptables`, whose chain ends at the same file). An
+    administrator's `update-alternatives --set iptables …` re-points the
+    master and its slaves together: NN-L-FIM-001 on the two new paths, as
+    it already was on `/usr/sbin/iptables`. The list's previous SHA-256
+    moves to `EARLIER_PATHS_V1_SHA256` and `install.sh`'s
+    `SHIPPED_V1_EARLIER` (the previous copy is replaced, not kept as
+    edited); the new paths have no baseline row until `nn-admin fim
+    baseline` (upgrade notes). (b) After the v4 restore `engage` reads the
+    table back (`verify_isolation`: `iptables -S NORTHNARROW_COMBAT` and
+    `-S` of each base chain, the listing shared with the probe and the
+    dedup, `list_rules`): the chain must reach its catch-all DROP — no
+    unconditional ACCEPT or RETURN ahead of it — and INPUT, OUTPUT and,
+    when the ruleset declares it, FORWARD must jump into it
+    (`jump_bases`, `isolation_gaps`). Otherwise ERROR "COMBAT: isolation
+    NOT in place — iptables-restore exited 0 but the table does not hold
+    the COMBAT ruleset …" with `restore_bin` and the gaps, `is_isolated`
+    stored `false` (also for a re-engage that finds the table emptied) and
+    `engage` returns the error, which the actuator logs ("COMBAT isolate
+    failed"); `nn-admin status`: `network_isolation_engaged: false`,
+    consistent with NN-AUD-259 (engaged exactly when the ruleset is in).
+    The v6 leg is read back the same way and stays best-effort: a WARN
+    "IPv6 NOT isolated", v4 kept. The check cannot be fooled by a no-op
+    `iptables` either: an empty listing has no DROP. Not changed: the
+    trusted-binary rules of ATP-014 (`/usr/bin/true` is a root-owned
+    system binary); a partly applied table is left in place (the release
+    and the next start's reconcile remove it).
+  - `nn-admin` on a closed pipe. Rust ignores SIGPIPE, so a write to a
+    pipe whose reader has gone fails with EPIPE, and std's `println!`
+    panics (`panic = "abort"` in release: 134). `nn_admin.rs` shadows
+    `println!`, `print!` and `eprintln!` for the crate with one writer
+    (`emit`: write, newline, flush): a broken pipe on stdout or stderr
+    ends the process with 141 (`EXIT_CLOSED_PIPE`, 128 + SIGPIPE — not 0,
+    so a cut-short `audit verify` is not a pass under `set -o pipefail`);
+    another stdout error is one line on stderr and exit 1; `audit read`,
+    which writes through the library (`writeln!`, an error returned), maps
+    a broken pipe in its error chain to 141. SIGPIPE stays ignored: the
+    admin socket's writes keep returning errors, not killing the client.
+  - Tests: `combat::reconcile` `a_missing_log_is_created_inside_the_state_dir_dance`
+    (a 0500 directory opened only by the dance: the bare `append_line` is
+    refused, `record_line` creates the file `0600` in one dance and
+    appends without one), `record_line_refuses_a_link_without_a_dance`;
+    `network_isolate` `a_restore_that_applies_nothing_is_not_an_isolation`
+    (a restore that exits 0, the chain absent or every listing empty),
+    `a_reengage_that_finds_the_table_empty_clears_the_state`,
+    `a_v6_table_without_the_ruleset_keeps_the_v4_isolation`,
+    `isolation_gaps_read_the_listing`, `jump_bases_follow_the_ruleset`,
+    `the_isolation_binaries_are_on_the_fim_list`; `fim::rules`
+    `package_manager_writes_are_logged_not_killed` gains the re-pointed
+    `/usr/sbin/iptables-restore`; integration `nn_admin_closed_pipe`
+    (`host_check_into_a_closed_pipe_exits_141_without_a_panic`, table and
+    `--json`; `audit_read_into_a_closed_pipe_exits_141_without_a_panic`,
+    stdout closed, `--json`, stderr closed, and unchanged with nothing
+    closed). The mocks of the engage tests list an applied table
+    (`mock_engaged_iptables`; `engage_survives_a_failed_dedup`'s lists
+    the DROP); `the_shipped_lists_are_pinned` pins the new list. On the
+    integration tree (the tests grafted onto it): the three
+    `network_isolate` tests fail (`engage` `Ok` with nothing applied;
+    `/usr/sbin/iptables-restore not in fim-paths.v1`), both
+    `nn_admin_closed_pipe` tests fail (`failed printing to stdout: Broken
+    pipe`, exit 101 in the test build; `audit: writing stdout: Broken
+    pipe`, exit 1); the `record_line`, `isolation_gaps` and `jump_bases`
+    tests call functions new in this lot and do not compile there.
+    Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
+    agent with `test-privileged,debug-trigger`) clean, 2,451 passed, 0 failed.
+  - Lab: Ubuntu 24.04, followups188-probe.sh — before: the build of `main` with lab PRs 176–187; after: this lot on top. `nn-admin status | head -1` (and six other closed-pipe forms): exit 134 with "failed printing to stdout: Broken pipe" before, exit 141 and no panic after; `status` on an open pipe exit 0 in both. An orphan `NORTHNARROW_COMBAT` chain at start: the signed `combat_reconcile` in both, the `combat-audit.jsonl` line refused (EPERM, the state directory's `+i`) before and written after (0600, one line). The restore links are in `fim-paths.v1` after. The isolation case (the `iptables-restore` alternative pointed at `/usr/bin/true`, COMBAT forced) was run on the before build only: the guest was lost to the probe's guard reboot and the case was not repeated — the post-restore check is covered by unit tests (`isolation_gaps`, `a_restore_that_applies_nothing_is_not_an_isolation`). Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.

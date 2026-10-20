@@ -64,6 +64,11 @@
 # ── network / firewall tooling ────────────────────────────────────────
 /usr/sbin/iptables
 /usr/sbin/ip6tables
+# the COMBAT isolation's restore links (lab PR 188): the watch follows each
+# link and its /etc/alternatives entry to the target, so pointing one at
+# another binary is drift of the watched path
+/usr/sbin/iptables-restore
+/usr/sbin/ip6tables-restore
 /usr/sbin/nft
 /usr/sbin/ufw
 /usr/bin/ip
