@@ -66,7 +66,8 @@ VBoxManage startvm kalidev                # install Kali interactively / preseed
 ./06_baseline_snapshot.sh                  # snapshot 'v1-baseline' (revert point)
 
 # ── teardown when done ──
-./07_teardown.sh                           # (FORCE=1 to skip prompt)
+./07_teardown.sh                           # (FORCE=1 to skip prompt; KEEP_DISKS=1 keeps the disks;
+                                           #  a disk outside its VM's folder stops it — lab PR 211)
 ```
 
 ## Configuration

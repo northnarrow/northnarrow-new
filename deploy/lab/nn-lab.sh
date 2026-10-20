@@ -53,6 +53,9 @@
 #   deploy/lab/nn-lab.sh ssh [cmd…]    # shell / command in the guest
 #   deploy/lab/nn-lab.sh snapshot NAME | restore NAME   (guest must be down)
 #   deploy/lab/nn-lab.sh status | down | destroy
+#   deploy/lab/nn-lab.sh trust-host-key  # record the running guest's ssh host key again (a guest recreated
+#                                      # by an older nn-lab.sh); `up` records it for a new guest (generated
+#                                      # here, injected by cloud-init) or once for an existing disk
 #   deploy/lab/nn-lab.sh verify-image  # base image vs its verified download or the vendor's signed lists
 #   deploy/lab/nn-lab.sh nightly       # unattended full run, the security checks included (tamper-check,
 #                                      # pkgmgr-, open-sensor-, fim-reuse-, btrfs-, overlay-check)
@@ -158,7 +161,38 @@ KEY="$ROOT_LAB_DIR/id_ed25519"
 PIDFILE="$LAB_DIR/qemu.pid"
 SERIAL="$LAB_DIR/serial.log"
 GUEST="nn@127.0.0.1"
-SSH_OPTS=(-i "$KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5)
+# >>> ssh-options (xtask/tests/lab_host_safety.rs runs this block)
+# External audit LAB-025 (NN-AUD-415, lab PR 211): every connection to a
+# guest took any host key (StrictHostKeyChecking=no, no known_hosts), so
+# whatever listened on the forwarded 127.0.0.1 port while the guest was down
+# — any local user's process, another guest behind a forwarder — was taken
+# for the guest: `sync` sent it the tree, the checks read its answers. Each
+# guest now has its own known_hosts ($LAB_DIR/known_hosts, one line under
+# the alias nn-lab-<guest>, so a changed NN_LAB_SSH_PORT keeps it), checked
+# strictly from the first connection: a new guest's ed25519 host key is
+# generated here at `up` and injected through cloud-init (`ssh_keys:` in the
+# templates, render_user_data); a guest whose disk predates that has its key
+# recorded once, by `up`, from the port only while it is served by the
+# guest's own QEMU (or its whpx forwarder), and `trust-host-key` records it
+# again on purpose (a guest recreated by an older nn-lab.sh). `destroy`
+# removes both files. Only ed25519 is accepted; the lab key is the only one
+# offered.
+KNOWN_HOSTS="$LAB_DIR/known_hosts"
+HOST_KEY_PUB="$LAB_DIR/ssh_host_ed25519_key.pub"
+HOST_KEY_ALIAS="nn-lab-$GUEST_NAME"
+case "$KEY$KNOWN_HOSTS" in
+    *[\'\"]*) echo "nn-lab: NN_LAB_DIR must not contain a quote: $ROOT_LAB_DIR" >&2; exit 2 ;;
+esac
+SSH_COMMON=(-i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+    -o "UserKnownHostsFile=\"$KNOWN_HOSTS\"" -o GlobalKnownHostsFile=/dev/null
+    -o "HostKeyAlias=$HOST_KEY_ALIAS" -o HostKeyAlgorithms=ssh-ed25519 -o UpdateHostKeys=no
+    -o CheckHostIP=no -o LogLevel=ERROR -o ConnectTimeout=5)
+SSH_OPTS=("${SSH_COMMON[@]}" -p "$SSH_PORT")
+SCP_OPTS=("${SSH_COMMON[@]}" -P "$SSH_PORT")
+# rsync splits its -e string on spaces and honours quotes (not
+# backslashes): every option single-quoted, so a space in a path stays.
+RSYNC_RSH="ssh$(printf " '%s'" "${SSH_OPTS[@]}")"
+# <<< ssh-options
 
 log()  { printf 'nn-lab: %s\n' "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
@@ -175,11 +209,36 @@ source "$SCRIPT_DIR/lib/suite-count.sh"
 # kernel arguments added to the template's lsm= line (__NN_LAB_KARGS__:
 # lockdown=, lab PR 206). A template without the placeholder would boot a
 # guest that is not locked down under a lockdown guest's name: refused.
+#
+# The guest's ssh host key too (external audit LAB-025, lab PR 211): each
+# render is a new cloud-init instance, so it gets a new ed25519 key,
+# generated here, written into the user-data (__NN_LAB_HOST_KEY__, the
+# private half, at that line's indentation; __NN_LAB_HOST_KEY_PUB__) and its
+# public half kept next to it as ssh_host_ed25519_key.pub, from which the
+# guest's known_hosts is written. The private half is only in the user-data
+# (mode 0600, like the seed made from it). A template without both
+# placeholders would boot a guest whose key nobody knows: refused.
 render_user_data() {   # <out>
-    local kargs=${LOCKDOWN:+ lockdown=$LOCKDOWN}
+    local kargs=${LOCKDOWN:+ lockdown=$LOCKDOWN} dir hk
     grep -q 'lsm=[^"]*__NN_LAB_KARGS__"' "$USER_DATA_TMPL" || die "$USER_DATA_TMPL has no __NN_LAB_KARGS__ at the end of its lsm= line"
-    sed -e "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" -e "s|__NN_LAB_KARGS__|$kargs|" "$USER_DATA_TMPL" > "$1"
+    grep -q '^ *__NN_LAB_HOST_KEY__$' "$USER_DATA_TMPL" && grep -q '__NN_LAB_HOST_KEY_PUB__' "$USER_DATA_TMPL" \
+        || die "$USER_DATA_TMPL has no ssh_keys: entry with __NN_LAB_HOST_KEY__ and __NN_LAB_HOST_KEY_PUB__"
+    dir=$(dirname "$1")
+    hk=$(mktemp -d "$dir/.host-key.XXXXXX")
+    if ! ssh-keygen -q -t ed25519 -N '' -C nn-lab-host -f "$hk/key" </dev/null; then
+        rm -rf "$hk"; die "ssh-keygen could not make the guest's host key"
+    fi
+    ( umask 077
+      sed -e "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" -e "s|__NN_LAB_KARGS__|$kargs|" \
+          -e "s|__NN_LAB_HOST_KEY_PUB__|$(cat "$hk/key.pub")|" "$USER_DATA_TMPL" |
+          awk -v kf="$hk/key" '
+              /^ *__NN_LAB_HOST_KEY__$/ { ind = $0; sub(/[^ ].*/, "", ind)
+                                          while ((getline l < kf) > 0) print ind l; next }
+              { print }' > "$1" )
+    mv -f "$hk/key.pub" "$dir/ssh_host_ed25519_key.pub"
+    rm -rf "$hk"
     if grep -q '__[A-Z_]*__' "$1"; then die "$1: a template placeholder is left: $(grep -o '__[A-Z_]*__' "$1" | head -1)"; fi
+    grep -q -- '-----END OPENSSH PRIVATE KEY-----' "$1" || die "$1: the host key was not written"
 }
 # <<< render-user-data
 
@@ -200,8 +259,16 @@ need_host_deps() {
 
 vm_running() {
     if [[ $ACCEL == whpx ]]; then
-        vssh -o BatchMode=yes true 2>/dev/null
-        return
+        # The guest is up when it answers with its own host key (lab PR
+        # 211): a listener on the port with another key is not the guest.
+        if [[ ! -s $KNOWN_HOSTS ]]; then
+            log "$(no_host_key_msg)"
+            return 1
+        fi
+        local rc=0
+        guest_probe || rc=$?
+        ((rc != 2)) || log "$(host_key_mismatch_msg)"
+        return "$((rc == 0 ? 0 : 1))"
     fi
     [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
 }
@@ -269,7 +336,8 @@ whpx_up() {
         local ud="$LAB_DIR/user-data" md="$LAB_DIR/meta-data"
         render_user_data "$ud"
         printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$GUEST_NAME" "$(date +%s)" "$GUEST_NAME" > "$md"
-        cloud-localds "$dir/seed.iso" "$ud" "$md"
+        (umask 077; cloud-localds "$dir/seed.iso" "$ud" "$md")
+        record_injected_host_key
     fi
     echo "$SSH_PORT" > "$LAB_DIR/ssh_port"
     local h; h=$(whpx_host_ip)
@@ -296,6 +364,9 @@ EOF
 }
 
 whpx_down() {
+    # The guest is powered off from inside: not without its host key, or
+    # it would be killed after two minutes (lab PR 211).
+    if [[ ! -s $KNOWN_HOSTS ]] && whpx_qemu_running; then die "$(no_host_key_msg); nothing stopped"; fi
     vssh 'sudo systemctl poweroff' >/dev/null 2>&1 || true
     local _
     for _ in $(seq 1 60); do whpx_qemu_running || break; sleep 2; done
@@ -307,7 +378,111 @@ whpx_down() {
     log "stopped"
 }
 
-vssh() { ssh "${SSH_OPTS[@]}" "$GUEST" "$@"; }
+# >>> host-key (xtask/tests/lab_host_safety.rs runs this block)
+# The guest's known_hosts (external audit LAB-025, lab PR 211; see SSH_OPTS).
+no_host_key_msg() {
+    printf '%s' "no host key recorded for guest $GUEST_NAME ($KNOWN_HOSTS): \`nn-lab.sh up\` records it" \
+        " (generated at the guest's creation, or taken once from the guest's own port for a disk that predates that)," \
+        " \`nn-lab.sh trust-host-key\` takes the running guest's again"
+}
+host_key_mismatch_msg() {
+    printf '%s' "the ssh server on 127.0.0.1:$SSH_PORT does not present guest $GUEST_NAME's recorded host key" \
+        " ($KNOWN_HOSTS): it is not the guest (another process on the port while the guest is down?)," \
+        " or a guest recreated by an older nn-lab.sh — then \`nn-lab.sh trust-host-key\`. Nothing was sent."
+}
+# Without a recorded key nothing connects: the call fails as ssh does
+# (255) and says why, so `|| true` callers go on and the others stop.
+need_known_host() {
+    [[ -s $KNOWN_HOSTS ]] && return 0
+    log "$(no_host_key_msg)"
+    return 255
+}
+vssh() { need_known_host || return; ssh "${SSH_OPTS[@]}" "$GUEST" "$@"; }
+vrsync() { need_known_host || return; rsync -e "$RSYNC_RSH" "$@"; }
+vscp() { need_known_host || return; scp -q "${SCP_OPTS[@]}" "$@"; }
+# One batch connection: 0 the guest answered, 2 a host key that is not the
+# guest's (or no ed25519 key at all), 1 anything else (not up yet).
+guest_probe() {
+    local err
+    err=$(vssh -o BatchMode=yes true 2>&1 >/dev/null) && return 0
+    if grep -qE 'Host key verification failed|no matching host key type|REMOTE HOST IDENTIFICATION HAS CHANGED' <<<"$err"; then
+        return 2
+    fi
+    return 1
+}
+# The processes that may listen on the forwarded port: the guest's QEMU,
+# or under whpx the socat forwarder unit (127.0.0.1 → QEMU for Windows).
+lab_listener_pids() {
+    if [[ $ACCEL == whpx ]]; then
+        local cg
+        systemctl --user show -p MainPID --value "$FWD_UNIT" 2>/dev/null || true
+        cg=$(systemctl --user show -p ControlGroup --value "$FWD_UNIT" 2>/dev/null || true)
+        if [[ -n $cg ]]; then cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null || true; fi
+    else
+        cat "$PIDFILE" 2>/dev/null || true
+    fi
+}
+# Every listener on 127.0.0.1:$SSH_PORT (any address that covers it) is
+# one of lab_listener_pids. ss names the owner of the user's own sockets
+# only: a listener without one is another user's.
+port_is_the_guests() {
+    local lines l pid pids allowed n=0
+    lines=$(ss -Hltnp "sport = :$SSH_PORT" 2>/dev/null) || return 1
+    [[ -n $lines ]] || return 1
+    allowed=" $(lab_listener_pids | tr '\n' ' ') "
+    while IFS= read -r l; do
+        pids=$(grep -o 'pid=[0-9]*' <<<"$l" | cut -d= -f2 || true)
+        [[ -n $pids ]] || return 1
+        for pid in $pids; do [[ $allowed == *" $pid "* ]] || return 1; done
+        n=$((n + 1))
+    done <<<"$lines"
+    ((n > 0))
+}
+# known_hosts from one `ssh-ed25519 <base64>` key, replaced in one rename.
+write_known_hosts() {   # <type> <base64>
+    [[ $1 == ssh-ed25519 && $2 =~ ^[A-Za-z0-9+/]+=*$ ]] || die "not an ed25519 public key: $1 ${2:0:20}…"
+    local tmp
+    tmp=$(mktemp "$KNOWN_HOSTS.XXXXXX")
+    printf '%s %s %s\n' "$HOST_KEY_ALIAS" "$1" "$2" > "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$KNOWN_HOSTS"
+}
+known_host_fingerprint() {
+    [[ -s $KNOWN_HOSTS ]] && ssh-keygen -l -f "$KNOWN_HOSTS" 2>/dev/null | awk '{print $2; exit}'
+}
+# The key render_user_data generated, while the user-data it went into is
+# the guest's: no connection needed.
+known_host_from_seed() {
+    [[ -s $HOST_KEY_PUB && -s $LAB_DIR/user-data ]] || return 1
+    local type b64 _
+    read -r type b64 _ < "$HOST_KEY_PUB"
+    grep -qF "$b64" "$LAB_DIR/user-data" || return 1
+    write_known_hosts "$type" "$b64"
+    log "host key of $GUEST_NAME: $(known_host_fingerprint) (generated at its creation; $KNOWN_HOSTS)"
+}
+# A new seed: its key replaces whatever known_hosts said (a recreated guest).
+record_injected_host_key() {
+    local type b64 _
+    read -r type b64 _ < "$HOST_KEY_PUB"
+    write_known_hosts "$type" "$b64"
+    log "host key of the new $GUEST_NAME instance: $(known_host_fingerprint) (generated here, injected by cloud-init; $KNOWN_HOSTS)"
+}
+# Trust on first use, for a disk that predates injected host keys: only
+# while the port is served by the guest's own QEMU/forwarder, before and
+# after the scan. 0 recorded, 3 the port is not the guest's, 1 no answer.
+record_existing_host_key() {
+    port_is_the_guests || return 3
+    local scan type b64
+    scan=$(ssh-keyscan -T 10 -t ed25519 -p "$SSH_PORT" 127.0.0.1 2>/dev/null || true)
+    read -r type b64 < <(awk '$2 == "ssh-ed25519" && NF >= 3 { print $2, $3; exit }' <<<"$scan") || true
+    [[ -n ${b64:-} ]] || return 1
+    port_is_the_guests || return 3
+    write_known_hosts "$type" "$b64"
+    log "recorded the host key of $GUEST_NAME on first use: $(known_host_fingerprint) ($KNOWN_HOSTS)." \
+        "Its disk predates host keys generated by nn-lab.sh (external audit LAB-025);" \
+        "\`nn-lab.sh destroy\` + \`up\` gives a guest whose key is known before its first boot."
+}
+# <<< host-key
 # Guest shell with rustup's env loaded: `bash -l` does NOT reach the
 # `source ~/.cargo/env` line (~/.bashrc returns early when non-interactive).
 # ssh joins its arguments with spaces and hands the string to the remote
@@ -321,14 +496,28 @@ vcargo() {
 }
 
 wait_ssh() {
-    local deadline=$(( $(date +%s) + ${1:-600} ))
+    local deadline=$(( $(date +%s) + ${1:-600} )) said_key=0 said_port=0
     log "waiting for ssh on 127.0.0.1:$SSH_PORT (up to ${1:-600}s; first boot reboots once)…"
     while (( $(date +%s) < deadline )); do
         if [[ $ACCEL == whpx ]] && ! whpx_qemu_running; then
             log "QEMU exited (a guest reboot: -no-reboot) — starting it again"
             whpx_launch
         fi
-        if vssh -o BatchMode=yes true 2>/dev/null; then
+        # A guest without a recorded host key (its disk predates lab PR
+        # 211): the key render_user_data made for it, or the one its own
+        # port presents (record_existing_host_key), recorded once.
+        if [[ ! -s $KNOWN_HOSTS ]] && ! known_host_from_seed; then
+            local rec=0
+            record_existing_host_key || rec=$?
+            if ((rec == 3 && !said_port)); then
+                log "127.0.0.1:$SSH_PORT is not served by $GUEST_NAME's own QEMU/forwarder (ss -ltnp): not recording a host key from it"
+                said_port=1
+            fi
+            if ((rec != 0)); then sleep 5; continue; fi
+        fi
+        local probe=0
+        guest_probe || probe=$?
+        if ((probe == 0)); then
             # Provisioning done AND we are past the reboot (lsm=bpf active;
             # on a lockdown guest, the lockdown too: Debian's first boot
             # already lists bpf)?
@@ -336,9 +525,13 @@ wait_ssh() {
                 log "guest is up and provisioned"
                 return 0
             fi
+        elif ((probe == 2 && !said_key)); then
+            log "$(host_key_mismatch_msg) Still waiting."
+            said_key=1
         fi
         sleep 5
     done
+    if ((said_key)); then die "$(host_key_mismatch_msg)"; fi
     die "guest did not become reachable; see $SERIAL"
 }
 
@@ -349,7 +542,12 @@ cmd_up() {
     fi
     need_host_deps
     mkdir -p "$LAB_DIR"
-    vm_running && { log "already running (pid $(cat "$PIDFILE"))"; return 0; }
+    if vm_running; then
+        log "already running (pid $(cat "$PIDFILE"))"
+        # A guest started before lab PR 211: record its host key now.
+        [[ -s $KNOWN_HOSTS ]] || wait_ssh 120
+        return 0
+    fi
     if [[ ! -f "$BASE_IMG" ]]; then
         lab_fetch_image "$BASE_IMG"
     fi
@@ -366,7 +564,8 @@ cmd_up() {
         local ud="$LAB_DIR/user-data" md="$LAB_DIR/meta-data"
         render_user_data "$ud"
         printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$GUEST_NAME" "$(date +%s)" "$GUEST_NAME" > "$md"
-        cloud-localds "$SEED" "$ud" "$md"
+        (umask 077; cloud-localds "$SEED" "$ud" "$md")
+        record_injected_host_key
     fi
     if ss -ltn 2>/dev/null | grep -qE "[:.]${SSH_PORT}\b"; then
         die "127.0.0.1:$SSH_PORT is already in use on the host — pick another: NN_LAB_SSH_PORT=2322 $0 up"
@@ -491,7 +690,7 @@ cmd_sync() {
     # can land sources older than the guest's last build: cargo's mtime
     # fingerprint then keeps the stale crate and the build fails, or worse,
     # links the old code.
-    rsync -az --checksum --no-times --delete -e "ssh ${SSH_OPTS[*]}" \
+    vrsync -az --checksum --no-times --delete \
         --exclude='/fuzz/artifacts/' \
         --exclude='/fuzz/corpus/' \
         --exclude='/fuzz/target/' \
@@ -953,10 +1152,10 @@ cmd_release_check() {
     # from here; a /tmp/nn-release another user created first is refused
     # (mkdir without -p), not reused.
     vssh 'rm -rf /tmp/nn-release && mkdir -m 0700 /tmp/nn-release'
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "$tgz" "$sums" "$GUEST:/tmp/nn-release/"
+    vrsync -a "$tgz" "$sums" "$GUEST:/tmp/nn-release/"
     # lab PR 206: release-check reads the agent's own lines through it
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/lib/lab-records.py" "$GUEST:/tmp/nn-release/lab-records.py"
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/release/release-check.sh" "$GUEST:/tmp/nn-release-check.sh"
+    vrsync -a "$REPO/deploy/lab/lib/lab-records.py" "$GUEST:/tmp/nn-release/lab-records.py"
+    vrsync -a "$REPO/deploy/lab/release/release-check.sh" "$GUEST:/tmp/nn-release-check.sh"
     lab_purge_pins >/dev/null
     local rc=0
     vssh 'bash /tmp/nn-release-check.sh' || rc=$?
@@ -1034,7 +1233,7 @@ cmd_btrfs_check() {
     # loaded with the agent stopped: R011 kills module tooling). The guest is
     # put back as it was.
     vm_running || die "guest is not running"
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/btrfs/btrfs-check.sh" "$GUEST:/tmp/nn-btrfs-check.sh"
+    vrsync -a "$REPO/deploy/lab/btrfs/btrfs-check.sh" "$GUEST:/tmp/nn-btrfs-check.sh"
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; bash /tmp/nn-btrfs-check.sh'
 }
 
@@ -1045,7 +1244,7 @@ cmd_overlay_check() {
     # read, or the boot must carry the signed `inode_identity_unverified`
     # record naming it. Silence fails. The guest is put back as it was.
     vm_running || die "guest is not running"
-    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/overlay/overlay-check.sh" "$GUEST:/tmp/nn-overlay-check.sh"
+    vrsync -a "$REPO/deploy/lab/overlay/overlay-check.sh" "$GUEST:/tmp/nn-overlay-check.sh"
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; bash /tmp/nn-overlay-check.sh'
 }
 
@@ -1069,10 +1268,35 @@ cmd_tamper_check() {
 
 cmd_ssh() {
     vm_running || die "guest is not running"
-    if (($#)); then vssh "$@"; else ssh "${SSH_OPTS[@]}" "$GUEST"; fi
+    vssh "$@"
+}
+
+# Record the running guest's host key again, on purpose (lab PR 211): a
+# guest recreated by an nn-lab.sh older than that, or keys changed inside
+# it. Same rule as at `up`: taken only from a port served by the guest's
+# own QEMU (or its whpx forwarder), and checked by a strict connection.
+cmd_trust_host_key() {
+    if [[ $ACCEL == whpx ]]; then
+        whpx_qemu_running || die "guest is not running (nn-lab.sh up)"
+    else
+        vm_running || die "guest is not running (nn-lab.sh up)"
+    fi
+    mkdir -p "$LAB_DIR"
+    local old rc=0
+    old=$(known_host_fingerprint || echo none)
+    record_existing_host_key || rc=$?
+    case $rc in
+        0) ;;
+        3) die "127.0.0.1:$SSH_PORT is not served by $GUEST_NAME's own QEMU/forwarder (ss -ltnp; under whpx \`nn-lab.sh up\` starts the forwarder): no host key recorded" ;;
+        *) die "no ed25519 host key from 127.0.0.1:$SSH_PORT (is the guest's sshd up?)" ;;
+    esac
+    log "previous host key: $old"
+    vssh -o BatchMode=yes true || die "a strict connection with the recorded key failed"
+    log "OK: $HOST_KEY_ALIAS $(known_host_fingerprint)"
 }
 
 cmd_status() {
+    echo "host key: ${HOST_KEY_ALIAS} $(known_host_fingerprint || echo "not recorded (nn-lab.sh up)") ($KNOWN_HOSTS)"
     if [[ $ACCEL == whpx ]]; then
         if whpx_qemu_running; then
             echo "running: QEMU for Windows pid $(whpx_pid), ssh -i $KEY -p $SSH_PORT $GUEST (forwarder $FWD_UNIT: $(systemctl --user is-active "$FWD_UNIT" 2>/dev/null || true))"
@@ -1097,6 +1321,7 @@ cmd_down() {
         return
     fi
     vm_running || { log "not running"; return 0; }
+    [[ -s $KNOWN_HOSTS ]] || die "$(no_host_key_msg); nothing stopped"
     vssh sudo poweroff >/dev/null 2>&1 || true
     local pid; pid=$(cat "$PIDFILE")
     for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || { log "stopped"; rm -f "$PIDFILE"; return 0; }; sleep 1; done
@@ -1138,8 +1363,8 @@ cmd_destroy() {
     if [[ $ACCEL == whpx ]]; then
         rm -f "$(whpx_dir)/disk.qcow2" "$(whpx_dir)/seed.iso" "$(whpx_dir)/serial.log"
     fi
-    rm -f "$DISK" "$SEED" "$LAB_DIR/user-data" "$LAB_DIR/meta-data" "$SERIAL"
-    log "guest disk removed (base image + ssh key kept)"
+    rm -f "$DISK" "$SEED" "$LAB_DIR/user-data" "$LAB_DIR/meta-data" "$SERIAL" "$KNOWN_HOSTS" "$HOST_KEY_PUB"
+    log "guest disk and its host key removed (base image + ssh key kept)"
 }
 
 # ── soak: hours of synthetic load with periodic resource samples ─────
@@ -1171,7 +1396,7 @@ cmd_soak() {
                 die "a soak is already running on the guest (nn-lab.sh soak status | stop)"
             fi
             vssh 'rm -rf ~/soak && mkdir -p ~/soak'
-            scp -q -i "$KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            vscp \
                 "$SOAK_SCRIPTS/generate.sh" "$SOAK_SCRIPTS/sample.sh" "$GUEST:soak/"
             vssh "chmod +x ~/soak/*.sh; echo '$hours' > ~/soak/hours; echo '$interval' > ~/soak/interval; date -u +%s > ~/soak/start_epoch; echo \"\$(uname -r) \$(cat /etc/os-release | sed -n 's/^PRETTY_NAME=//p' | tr -d '\"')\" > ~/soak/host"
             # The sampler runs as root: it must NOT live under /home — the
@@ -1221,7 +1446,7 @@ cmd_soak() {
             stamp=$(date +%Y%m%d-%H%M%S)
             dir="$LAB_DIR/reports/soak-$stamp"; report="$LAB_DIR/reports/soak-$stamp.md"
             mkdir -p "$dir"
-            scp -q -i "$KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+            vscp \
                 "$GUEST:soak/samples.csv" "$GUEST:soak/sample.log" "$GUEST:soak/generate.log" "$GUEST:soak/host" "$GUEST:soak/hours" "$dir/" 2>/dev/null || true
             vssh 'sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" -p 4 --no-pager -q 2>/dev/null | tail -200' > "$dir/journal-warn-err.log" 2>/dev/null || true
             [ -s "$dir/samples.csv" ] || die "no samples.csv on the guest — was the soak started?"
@@ -1577,8 +1802,8 @@ cmd_nightly() {
     rev=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')
     [[ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]] && rev="$rev+dirty"
     log "nightly $stamp @ $rev — logs in $report_dir"
-    if ! vm_running; then
-        log "guest not running — bringing it up"
+    if ! vm_running || [[ ! -s $KNOWN_HOSTS ]]; then
+        log "guest not running (or its host key not recorded) — bringing it up"
         if ! cmd_up >"$report_dir/up.log" 2>&1; then
             printf '# nn-lab nightly %s — FAILED at `up`\n\nSee %s/up.log\n' "$stamp" "$report_dir" > "$report"
             log "up failed; report: $report"
@@ -1654,6 +1879,7 @@ case "${1:-help}" in
     fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;
+    trust-host-key) cmd_trust_host_key ;;
     down)          cmd_down ;;
     snapshot)      cmd_snapshot "${2:-}" ;;
     restore)       cmd_restore "${2:-}" ;;

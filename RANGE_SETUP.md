@@ -59,6 +59,25 @@ provisioned. Remaining, in order:
    CAP_SYS_PTRACE CAP_DAC_OVERRIDE`, dropping near-root `CAP_SYS_ADMIN`),
    enables + starts the real units, re-seeds the FIM baseline, deploys
    canaries, then runs a **health check** (see §6).
+
+   **Before anything is stopped** (external audit LAB-027, lab PR 211) the
+   bootstrap checks the tree it will build and install as root, and stops,
+   with the box unchanged, unless it is: clean (`git status --porcelain`
+   empty, an untracked file counts; no cargo configuration git ignores, in
+   the tree or a `.cargo/config*` in a parent directory), at
+   `NN_EXPECT_COMMIT` when that is set (`NN_EXPECT_COMMIT=<commit>
+   bootstrap-target-prod.sh`), and the build user's (every file owned by
+   them or root, none writable by others or by a group other than their own
+   private group or root's, the same for each parent directory). Commit a
+   work in progress first; `NN_ALLOW_DIRTY_TREE=1` lets a dirty tree through
+   and the provenance file says so. The build runs as the build user with a
+   clean environment and `BUILD_PATH` (default `~/.cargo/bin:/usr/local/bin:
+   /usr/bin:/bin`), not through their login profiles. After the install,
+   `/root/range-provenance.txt` (`RANGE_PROVENANCE`) records the commit,
+   `git describe`, the tree's state, the build user and path, the build
+   features and the sha256 of the three installed binaries — each checked
+   equal to the one just built — as `sha256sum` lines:
+   `grep /usr/local/bin /root/range-provenance.txt | sha256sum -c`.
 2. **Remove the NOPASSWD sudoers entry** on the target (§4) — realistic privilege posture.
 3. **Detach NAT + Tailscale**, verify isolation, snapshot (§5).
 4. **Take the revert snapshots** — target `clean-prod`, attacker `armed` (§5).
@@ -193,8 +212,9 @@ VBoxManage sharedfolder add northnarrowdev --name evidence \
     --hostpath /path/on/fisso/evidence --readonly --automount
 ```
 Inside the target it mounts under `/media/sf_evidence` (read-only). Copy
-the audit-chain + journald slice per run window; hash with `sha256sum` on
-arrival; archive under `docs/validation/evidence/<run-id>/`. Selective
+the audit-chain + journald slice per run window, and the bootstrap's
+`/root/range-provenance.txt` (what was installed, from which commit); hash
+with `sha256sum` on arrival; archive under `docs/validation/evidence/<run-id>/`. Selective
 PCAP (NET + CHAIN families only) per §13 Q6.
 
 ## 8. End-to-end run order

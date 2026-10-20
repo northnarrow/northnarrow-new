@@ -89,6 +89,42 @@ nightly report names the image and its record. Host packages: `gnupg`,
 against its pinned SHA-256 (no `curl | sh`). The self-test runs without
 network or guest: `bash deploy/lab/lib/verify-download-test.sh`.
 
+**Guest host keys are checked** (external audit LAB-025, lab PR 211).
+Every connection to a guest (`ssh`, `rsync`, `scp`) checks the guest's own
+`known_hosts` strictly: `~/.cache/nn-lab/<guest>/known_hosts` (the flat
+directory for `ubuntu2404`), one line under the alias `nn-lab-<guest>`, so a
+changed `NN_LAB_SSH_PORT` keeps it; ed25519 only, the lab key only. Before,
+any process listening on the forwarded `127.0.0.1` port while the guest was
+down (another user's, or a forwarder to another guest) was taken for the
+guest: `sync` sent it the tree.
+
+- A new guest (first `up`, or `up` after `destroy`): `up` generates its
+  ed25519 host key, injects it through cloud-init (`ssh_keys:` in the four
+  templates) and writes `known_hosts` before the first boot — no trust on
+  first use. The private half is only in the guest's user-data and seed
+  (mode 0600); `ssh_host_ed25519_key.pub` stays next to them.
+- A guest whose disk predates this: `up` (also on a running guest) records
+  its key once, from the forwarded port, and only while that port is served
+  by the guest's own QEMU (its pid file) or, under whpx, by its forwarder
+  unit (`nn-fwd-<guest>`), checked with `ss -ltnp` before and after the
+  scan; it says so with the fingerprint. `nn-lab.sh destroy` + `up` gives
+  a guest whose key is known before it boots.
+- `nn-lab.sh trust-host-key` records the running guest's key again, on
+  purpose, by the same rule: for a guest recreated by an `nn-lab.sh` older
+  than lab PR 211 (which neither injects a key nor removes `known_hosts`
+  at `destroy`), the case where every connection fails with "does not
+  present guest …'s recorded host key".
+- Without a recorded key nothing connects: the sub-commands say so
+  (`no host key recorded for guest …`), `down` refuses rather than leave a
+  guest it cannot power off from inside to be killed, and the nightly runs
+  `up` first. `status` prints the recorded fingerprint, `destroy` removes
+  `known_hosts` and the public key with the disk.
+- Scripts outside `nn-lab.sh` that ssh into a guest with
+  `-o StrictHostKeyChecking=no` keep working — they accept any key, so
+  nothing checks them; to check them, use the same options:
+  `-o StrictHostKeyChecking=yes -o UserKnownHostsFile=<guest dir>/known_hosts
+  -o HostKeyAlias=nn-lab-<guest> -o HostKeyAlgorithms=ssh-ed25519`.
+
 ### Other guests: Debian 12, Debian 13, Ubuntu 22.04, AlmaLinux 9
 
 `NN_LAB_DISTRO=<distro> deploy/lab/nn-lab.sh up` boots a separate guest;
@@ -313,7 +349,16 @@ one lookup, the step 1 fast path, and the full observer.
 deploy/lab/nn-lab.sh open-sensor-check   # after sync + install
 ```
 
-Checks the default (LSM) mode end to end on the running agent:
+Checks the default (LSM) mode end to end on the running agent. It runs
+only on a lab guest (`/var/lib/nn-lab-provisioned`) or on a host declared
+disposable with `NN_TEST_DISPOSABLE_HOST=1`, and refuses anywhere else (exit
+2): it writes `~/.aws/credentials`, `/etc/cron.d` and
+`/etc/ssh/sshd_config.d`. An existing `~/.aws` of the lab user (a directory,
+a file or a link, never followed) is moved to `~/.aws.nn-open-sensor` for
+step 2 and put back at its end and on every way out (an error, Ctrl-C,
+TERM, HUP, a closed ssh pipe); only the fixture the check wrote is removed
+(external audit LAB-022, lab PR 211). A `~/.aws.nn-open-sensor` left by a
+run killed with `-9` stops the next run until it is moved back by hand.
 
 - the sensor is armed and `sys_enter_openat` retired, with no
   missing-link report from the BPF self-check;

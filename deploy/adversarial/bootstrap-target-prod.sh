@@ -13,6 +13,9 @@
 # CAP_LINUX_IMMUTABLE / CAP_SYS_PTRACE. This script lands a CLEAN production
 # state — not dev-state-with-a-fresh-agent-on-top:
 #
+#   0. check the tree before anything else  (clean, at NN_EXPECT_COMMIT
+#      when set, owned and writable by the build user only; external audit
+#      LAB-027) — a refusal leaves the box as it was
 #   1. stop the dev agent + watchdog  (through a signed trusted-installer
 #      window: the units refuse `systemctl stop`, external audit EBPF-001)
 #      and drop the bpffs pin root so the deny hooks detach
@@ -22,7 +25,9 @@
 #      test-privileged feature; xtask, NOT bare cargo — eBPF freshness gate)
 #      and refuse it unless it reports no lab feature (--build-features)
 #   4. install via the real path  (install.sh lands the BUG-042 unit +
-#      re-applies +i; it does NOT enable, so we do)
+#      re-applies +i; it does NOT enable, so we do), then record what was
+#      installed from what in $RANGE_PROVENANCE (commit, tree state, the
+#      three binaries' sha256, checked equal to the build)
 #   5. enable + start the real units
 #   6. fresh FIM baseline  (so the baseline reflects prod, not the dev box)
 #   7. deploy canaries     (signed; skipped if the admin key is absent)
@@ -53,9 +58,102 @@ cd "$NN_REPO_DIR"
 # only copies the prebuilt binary, so it still runs as root.
 BUILD_USER="${BUILD_USER:-${SUDO_USER:-$(stat -c %U "$NN_REPO_DIR")}}"
 [ "$BUILD_USER" = root ] && die "refusing to build as root — set BUILD_USER to the repo owner"
-as_build_user() { sudo -u "$BUILD_USER" -H bash -lc "$1"; }
+BUILD_HOME=$(getent passwd "$BUILD_USER" | cut -d: -f6)
+[ -n "$BUILD_HOME" ] && [ -d "$BUILD_HOME" ] || die "build user '$BUILD_USER' has no home directory"
+# External audit LAB-027 (NN-AUD-417, lab PR 211): `bash -lc` ran the build
+# user's login profiles before a build that root then installs. Now a clean
+# environment and an explicit PATH (BUILD_PATH to change it), no profile.
+BUILD_PATH=${BUILD_PATH:-$BUILD_HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin}
+as_build_user() {
+    sudo -u "$BUILD_USER" -H env -i HOME="$BUILD_HOME" USER="$BUILD_USER" LOGNAME="$BUILD_USER" \
+        PATH="$BUILD_PATH" LANG=C.UTF-8 bash -c "$1"
+}
 as_build_user 'command -v cargo >/dev/null' \
-    || die "cargo not found for build user '$BUILD_USER' (rustup not installed for them?)"
+    || die "cargo not found for build user '$BUILD_USER' on $BUILD_PATH (rustup not installed for them? BUILD_PATH)"
+
+# >>> range-tree (xtask/tests/lab_host_safety.rs runs this block)
+# External audit LAB-027 (NN-AUD-417, lab PR 211): the build of whatever
+# the tree held — a work in progress, a file anyone could change — was
+# installed as root, with no record of what it was. Before anything is
+# stopped or built, the tree must be:
+#   - clean: `git status --porcelain` empty (an untracked file counts), and
+#     no cargo configuration git ignores (an untracked `.cargo/*` in the
+#     tree, a `.cargo/config*` in a parent directory: cargo reads both);
+#   - at NN_EXPECT_COMMIT when it is set;
+#   - the build user's: every file and directory owned by them (or root),
+#     none writable by others, none writable by a group other than the
+#     build user's own private group (or root's), and the same for each
+#     parent directory up to / (others-writable only with the sticky bit).
+# NN_ALLOW_DIRTY_TREE=1 lets a dirty tree through (only that check), and
+# the provenance file says so. git runs as the build user, never as root
+# in a tree root does not own.
+TREE_STATE=
+TREE_HEAD=
+range_private_group() {   # <user>: their primary group, when it is theirs alone
+    local gid gname members
+    gid=$(id -g "$1") || return 1
+    gname=$(getent group "$gid" | cut -d: -f1)
+    members=$(getent group "$gid" | cut -d: -f4)
+    [ "$gname" = "$1" ] || return 1
+    case ",$members," in ",,"|",$1,") printf '%s\n' "$gid" ;; *) return 1 ;; esac
+}
+range_unsafe_mode() {   # <path> <user> <private gid or empty>: why the path is unsafe, or nothing
+    local owner mode gid
+    read -r owner mode gid < <(stat -c '%U %a %g' -- "$1") || { echo "cannot stat"; return; }
+    case "$owner" in "$2" | root) ;; *) echo "owned by $owner"; return ;; esac
+    mode=$((8#$mode))
+    if (( mode & 2 )) && ! (( mode & 01000 )); then echo "writable by others"; return; fi
+    if (( mode & 020 )) && [ "$gid" != 0 ] && [ "$gid" != "${3:-x}" ]; then echo "writable by group $gid"; fi
+}
+range_tree_check() {   # <repo> <build user>
+    local repo=$1 user=$2 pgid d f why bad q status head want ign
+    pgid=$(range_private_group "$user" || true)
+    q=$(printf '%q' "$repo")
+    # ownership and modes, the tree (target/ included) and its parents
+    bad=$(find "$repo" \( ! -user "$user" ! -user root \) -print -quit 2>/dev/null)
+    [ -z "$bad" ] || { warn "$bad is owned by $(stat -c %U -- "$bad"), not $user"; return 1; }
+    if [ -n "$pgid" ]; then
+        bad=$(find "$repo" ! -type l \( -perm -0002 -o \( -perm -0020 ! -gid "$pgid" ! -gid 0 \) \) -print -quit 2>/dev/null)
+    else
+        bad=$(find "$repo" ! -type l \( -perm -0002 -o \( -perm -0020 ! -gid 0 \) \) -print -quit 2>/dev/null)
+    fi
+    [ -z "$bad" ] || { warn "$bad is writable by others or by a group not $user's own ($(stat -c '%a %G' -- "$bad"))"; return 1; }
+    d=$repo
+    while [ "$d" != / ]; do
+        d=$(dirname "$d")
+        why=$(range_unsafe_mode "$d" "$user" "$pgid")
+        [ -z "$why" ] || { warn "parent directory $d is $why: the tree can be swapped under the build"; return 1; }
+        for f in "${d%/}/.cargo/config" "${d%/}/.cargo/config.toml"; do
+            if [ -e "$f" ]; then warn "$f exists: cargo would read it in the build"; return 1; fi
+        done
+    done
+    # git state, as the build user
+    status=$(as_build_user "git -C $q status --porcelain=v1 --untracked-files=normal") \
+        || { warn "git status failed in $repo (as $user)"; return 1; }
+    ign=$(as_build_user "git -C $q ls-files --others --ignored --exclude-standard --directory" | grep -E '(^|/)\.cargo/' || true)
+    [ -z "$ign" ] || { warn "cargo configuration git ignores: $(head -3 <<<"$ign" | tr '\n' ' ')"; return 1; }
+    head=$(as_build_user "git -C $q rev-parse --verify HEAD^{commit}") || { warn "no HEAD commit in $repo"; return 1; }
+    if [ -n "${NN_EXPECT_COMMIT:-}" ]; then
+        want=$(as_build_user "git -C $q rev-parse --verify $(printf '%q' "$NN_EXPECT_COMMIT^{commit}")" 2>/dev/null) \
+            || { warn "NN_EXPECT_COMMIT=$NN_EXPECT_COMMIT names no commit in $repo"; return 1; }
+        [ "$head" = "$want" ] || { warn "HEAD is $head, NN_EXPECT_COMMIT is $want"; return 1; }
+    fi
+    if [ -n "$status" ]; then
+        warn "the tree has $(wc -l <<<"$status") uncommitted path(s): $(head -5 <<<"$status" | tr '\n' ';')"
+        if [ "${NN_ALLOW_DIRTY_TREE:-0}" != 1 ]; then
+            warn "commit them (or NN_ALLOW_DIRTY_TREE=1, recorded in the provenance file)"
+            return 1
+        fi
+        TREE_STATE="dirty, allowed by NN_ALLOW_DIRTY_TREE=1 ($(wc -l <<<"$status") paths)"
+    else
+        TREE_STATE=clean
+    fi
+    TREE_HEAD=$head
+}
+# <<< range-tree
+range_tree_check "$NN_REPO_DIR" "$BUILD_USER" \
+    || die "refusing to build and install from $NN_REPO_DIR (external audit LAB-027): nothing was stopped or changed"
+log "Tree: $NN_REPO_DIR at $TREE_HEAD ($TREE_STATE)"
 
 # Containment guard — never run a state-mutating bootstrap while the box is
 # wired to the outside world for a C2 run (see RANGE_SETUP.md §containment).
@@ -172,7 +270,7 @@ journalctl --namespace="$NN_JOURNAL_NS" --vacuum-time=1s 2>/dev/null || true
 # `cargo build` cannot produce an installable agent — agent/build.rs refuses
 # a stale/unstamped eBPF object (the eBPF freshness gate).
 log "Building shipped binary as '$BUILD_USER': cargo xtask build --release (NO test-privileged)..."
-as_build_user "cd '$NN_REPO_DIR' && cargo xtask build --release"
+as_build_user "cd $(printf '%q' "$NN_REPO_DIR") && cargo xtask build --release"
 # Defence in depth: refuse to ship a binary built with a test or debug
 # feature (debug-trigger also puts the BPF guard in observe mode). The
 # positive marker is the binary's own answer: `--build-features` prints
@@ -209,6 +307,34 @@ if ! bash deploy/install.sh --source-tree; then
     warn "binaries + units ARE installed; failure was a pinned-host bait refresh"
     warn "(BUG-020 residual). Continuing — reboot + re-run to refresh stale baits."
 fi
+
+# External audit LAB-027 (NN-AUD-417, lab PR 211): what was installed, from
+# what. The three installed binaries must be the ones just built; their
+# digests, the commit and the tree's state go to $RANGE_PROVENANCE (root's,
+# 0644; kept with each run's evidence, RANGE_SETUP.md §7). The digest lines
+# are sha256sum's: `grep /usr/local/bin range-provenance.txt | sha256sum -c`.
+prov_tmp=$(mktemp)
+{
+    echo "# $(date -u +%FT%TZ) deploy/adversarial/bootstrap-target-prod.sh on $(hostname)"
+    echo "repo: $NN_REPO_DIR"
+    echo "commit: $TREE_HEAD"
+    echo "describe: $(as_build_user "git -C $(printf '%q' "$NN_REPO_DIR") describe --always --tags --dirty" 2>/dev/null || echo '?')"
+    echo "tree: $TREE_STATE"
+    echo "expected_commit: ${NN_EXPECT_COMMIT:-unset}"
+    echo "build_user: $BUILD_USER"
+    echo "build_path: $BUILD_PATH"
+    echo "build_features: $feat"
+    for b in northnarrow-agent northnarrow-watchdog nn-admin; do
+        built=$(sha256sum < "target/release/$b" | cut -d' ' -f1) || die "target/release/$b: cannot read it"
+        inst=$(sha256sum < "$NN_BIN_DIR/$b" | cut -d' ' -f1) || die "$NN_BIN_DIR/$b: not installed"
+        [ "$built" = "$inst" ] || die "$NN_BIN_DIR/$b is not the binary built from $TREE_HEAD (sha256 $inst, built $built)"
+        echo "$inst  $NN_BIN_DIR/$b"
+    done
+} > "$prov_tmp"
+install -m 0644 -o root -g root "$prov_tmp" "$RANGE_PROVENANCE"
+rm -f "$prov_tmp"
+log "Provenance written to $RANGE_PROVENANCE:"
+sed 's/^/  /' "$RANGE_PROVENANCE"
 
 # ── 5. enable + start the real units ─────────────────────────────────
 log "Enabling + starting $NN_AGENT_UNIT and $NN_WATCHDOG_UNIT..."

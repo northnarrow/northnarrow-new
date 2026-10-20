@@ -42,6 +42,9 @@
 : "${NN_AGENT_UNIT:=northnarrow-agent.service}"       # CORRECTED (was northnarrow.service)
 : "${NN_WATCHDOG_UNIT:=northnarrow-watchdog.service}"
 : "${NN_JOURNAL_NS:=northnarrow}"      # LogNamespace — plain journalctl shows nothing
+# What bootstrap-target-prod.sh installed, from which commit (external audit
+# LAB-027): kept with each run's evidence.
+: "${RANGE_PROVENANCE:=/root/range-provenance.txt}"
 # External audit LAB-012 (NN-AUD-217): the engine must load the frozen V2
 # rule registry, so the count is its `engine` rows (76 in version 1), read
 # from docs/validation/v2-rules.tsv rather than kept here (it said 69 while
