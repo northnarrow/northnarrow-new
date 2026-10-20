@@ -3709,6 +3709,35 @@ mod tests {
         );
     }
 
+    /// External audit POS-010, detection level: with a signed overlay
+    /// listing `/`, `/home` and `/home/alice` beside a narrow entry, the
+    /// loader keeps the narrow one only, so a burst in the user's documents
+    /// still raises ConfirmedIntrusion and the narrow tree stays exempt.
+    #[test]
+    fn a_refused_carveout_leaves_the_mass_write_arm_on() {
+        use super::super::mass_write_overlay::{
+            load_mass_write_carveout_extras, DEFAULT_MASS_WRITE_OVERLAY,
+        };
+        let extras =
+            load_mass_write_carveout_extras(&crate::config::overlay_auth::Verified::Content {
+                path: DEFAULT_MASS_WRITE_OVERLAY.into(),
+                text: "/\n+/home\n+/home/alice\n+/var/lib/devtool/cache/\n".to_string(),
+            });
+        let det = TriggerDetector::with_self_pid(AGENT_PID).with_mass_write_extras(extras);
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/home/alice/Documents/report.docx");
+        assert!(
+            det.detect(&focal, &recent)
+                .contains(&TriggerType::ConfirmedIntrusion),
+            "a refused carve-out must not exempt the user's documents"
+        );
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/var/lib/devtool/cache/blob");
+        assert!(
+            !det.detect(&focal, &recent)
+                .contains(&TriggerType::ConfirmedIntrusion),
+            "the accepted entry still exempts its tree"
+        );
+    }
+
     // ── BUG-032: escalation allowlist count-filter (exfil) ──────────
     #[test]
     fn exfil_allowlist_count_filters_mirror_but_not_c2() {

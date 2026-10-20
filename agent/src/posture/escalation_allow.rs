@@ -49,6 +49,18 @@
 //! ```
 //! Missing/unreadable file = empty allowlist (fail-secure, never an open
 //! default). Malformed lines are skipped with a WARN.
+//!
+//! ## Entries too broad to apply (external audit POS-011, lab PR 198)
+//!
+//! A signed file only proves an administrator wrote it: `exfil * 0.0.0.0/0`
+//! took every connection out of the exfil count, with no warning. Refused
+//! now, like a malformed line (a WARN naming it at load, an error for
+//! `nn-admin config overlay set` / `sign`):
+//! - any `/0` network (IPv4 or IPv6), whatever the comm;
+//! - the wildcard comm `*` (an empty prefix: any process) with a network
+//!   wider than /16 (IPv4) or /32 (IPv6).
+//!
+//! `exfil * 140.82.112.0/20 443` (one provider's range, any comm) stays.
 
 use std::net::IpAddr;
 
@@ -134,8 +146,8 @@ impl EscalationAllowList {
     }
 
     /// Fail-secure load of the overlay as the signed-overlay gate verified
-    /// it (external audit LLMR-013). None → empty. Malformed lines →
-    /// skipped with a WARN.
+    /// it (external audit LLMR-013). None → empty. Malformed or too-broad
+    /// lines → skipped with a WARN naming them (the rest applies).
     pub fn load(local: &Verified) -> Self {
         let Some(text) = local.text() else {
             return Self::empty();
@@ -145,25 +157,26 @@ impl EscalationAllowList {
             warn!(
                 path = ?local.source(),
                 reject = %w,
-                "escalation-allow: skipping malformed entry (fail-secure — ignored)"
+                "escalation-allow: entry REFUSED — not applied (fail-secure)"
             );
         }
         list
     }
 
-    /// Parse text → (list, per-line warnings). `pub` for unit tests.
-    /// Blank lines + `#` comments ignored.
+    /// Parse text → (list, per-line refusals, each `line N: …` naming the
+    /// entry). Blank lines + `#` comments ignored. The loader and
+    /// [`crate::config::overlay_auth::validate_content`] share it.
     pub fn parse(text: &str) -> (Self, Vec<String>) {
         let mut entries = Vec::new();
         let mut warnings = Vec::new();
-        for raw in text.lines() {
+        for (i, raw) in text.lines().enumerate() {
             let line = raw.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
             match parse_entry(line) {
                 Ok(e) => entries.push(e),
-                Err(why) => warnings.push(why),
+                Err(why) => warnings.push(format!("line {}: {why}", i + 1)),
             }
         }
         (Self { entries }, warnings)
@@ -218,6 +231,7 @@ fn parse_entry(line: &str) -> Result<AllowEntry, String> {
     if it.next().is_some() {
         return Err(format!("trailing tokens in `{line}`"));
     }
+    too_broad(&comm, &net, prefix).map_err(|why| format!("{why} in `{line}`"))?;
     Ok(AllowEntry {
         trigger,
         comm,
@@ -225,6 +239,34 @@ fn parse_entry(line: &str) -> Result<AllowEntry, String> {
         prefix,
         port,
     })
+}
+
+/// Narrowest network a wildcard comm (`*`, any process) may name
+/// (external audit POS-011): a provider's range, never a whole region of
+/// the address space.
+const WILDCARD_MIN_PREFIX_V4: u8 = 16;
+const WILDCARD_MIN_PREFIX_V6: u8 = 32;
+
+/// Why an entry would take too much out of the count, if it would.
+fn too_broad(comm: &CommMatch, net: &IpAddr, prefix: u8) -> Result<(), String> {
+    if prefix == 0 {
+        return Err(
+            "a `/0` network matches every destination (name the network the traffic goes to)"
+                .to_string(),
+        );
+    }
+    let min = if net.is_ipv6() {
+        WILDCARD_MIN_PREFIX_V6
+    } else {
+        WILDCARD_MIN_PREFIX_V4
+    };
+    if matches!(comm, CommMatch::Prefix(p) if p.is_empty()) && prefix < min {
+        return Err(format!(
+            "the wildcard comm `*` with a /{prefix} network (any process, so at least /{min}: \
+             name the process or narrow the network)"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_cidr(s: &str) -> Result<(IpAddr, u8), String> {
@@ -367,6 +409,61 @@ mod tests {
         );
         assert_eq!(list.len(), 1, "only the valid line is kept");
         assert_eq!(warns.len(), 2, "two malformed lines warned");
+    }
+
+    /// External audit POS-011: `/0` and a wildcard comm over a wide
+    /// network are refused by name; the rest of the file applies.
+    #[test]
+    fn wildcard_with_default_route_is_rejected() {
+        let (list, warns) = EscalationAllowList::parse(
+            "exfil * 0.0.0.0/0 443\n\
+             exfil apt 0.0.0.0/0 443\n\
+             lateral * ::/0 22\n\
+             exfil * 10.0.0.0/8 *\n\
+             lateral * 10.0.0.0/15 22\n\
+             exfil * 2000::/3 443\n\
+             exfil * 2606:4700::/31 443\n\
+             exfil apt 91.189.91.0/24 443\n",
+        );
+        assert_eq!(list.len(), 1, "only the named, narrow entry: {warns:?}");
+        assert_eq!(warns.len(), 7, "{warns:?}");
+        for (i, w) in warns.iter().enumerate() {
+            assert!(w.starts_with(&format!("line {}: ", i + 1)), "{w}");
+        }
+        assert!(warns[..3].iter().all(|w| w.contains("`/0`")), "{warns:?}");
+        assert!(
+            warns[3..].iter().all(|w| w.contains("wildcard comm")),
+            "{warns:?}"
+        );
+        assert!(warns[0].contains("`exfil * 0.0.0.0/0 443`"), "{}", warns[0]);
+        // Nothing of the refused lines is excluded from the count.
+        assert!(!list.excludes(AllowTrigger::Exfil, "curl", &v4(203, 0, 113, 5), 2, 443));
+        assert!(!list.excludes(AllowTrigger::Lateral, "ssh", &v4(10, 0, 0, 5), 2, 22));
+        assert!(list.excludes(AllowTrigger::Exfil, "apt", &v4(91, 189, 91, 7), 2, 443));
+    }
+
+    /// The narrow forms the shipped example and the lab use still parse: a
+    /// wildcard comm over one provider's range (/16 and /32 the limits), a
+    /// prefix glob over the internal network.
+    #[test]
+    fn narrow_wildcard_entry_still_parses() {
+        let (list, warns) = EscalationAllowList::parse(
+            "exfil * 140.82.112.0/20 443\n\
+             exfil * 140.82.0.0/16 443\n\
+             exfil * 2606:4700::/32 443\n\
+             lateral ansible* 10.0.0.0/8 22\n\
+             lateral python3 10.0.0.0/8 22\n\
+             exfil backup 2606::/16 443\n",
+        );
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(list.len(), 6);
+        assert!(list.excludes(
+            AllowTrigger::Exfil,
+            "git-remote-http",
+            &v4(140, 82, 121, 3),
+            2,
+            443
+        ));
     }
 
     #[test]

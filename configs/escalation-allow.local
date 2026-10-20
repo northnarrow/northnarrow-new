@@ -24,6 +24,10 @@
 # excluded). Malformed lines are skipped with a WARN — a bad line does
 # not disable the rest of the file.
 #
+# Too broad to apply (refused like a malformed line, and by
+# `nn-admin config overlay set|sign`): any `/0` network, and the
+# wildcard comm `*` with a network wider than /16 (IPv4) or /32 (IPv6).
+#
 # OWNED LIMIT: because the filter keys on the destination, traffic to an
 # allowlisted destination that an attacker abuses as C2 (e.g. exfil to a
 # GitHub repo when GitHub ranges are listed) rides under the filter.

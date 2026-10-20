@@ -517,8 +517,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-303 | POS-006 | Low | Posture | S | fixed (lab PR 172) |
 | NN-AUD-304 | POS-007 | Low | Posture | S–M | fixed (lab PR 172) |
 | NN-AUD-305 | POS-008 | Low | Posture | S | fixed (lab PR 172) |
-| NN-AUD-306 | POS-010 | Low | Posture | S | partly fixed; open |
-| NN-AUD-307 | POS-011 | Low | Posture | S | open |
+| NN-AUD-306 | POS-010 | Low | Posture | S | fixed (lab PR 198) |
+| NN-AUD-307 | POS-011 | Low | Posture | S | fixed (lab PR 198) |
 | NN-AUD-308 | POS-012 | Low | Posture | — | declined (the ADE parser already refuses Allow with a severity, rule 5b) |
 | NN-AUD-309 | POS-014 | Low | Posture | — | declined (the transition log has no production reader; not in `nn-admin status`) |
 | NN-AUD-310 | CMB-018 | Low | Combat response | S | fixed (lab PR 193) |
@@ -8470,3 +8470,102 @@ group, the ones an unprivileged user or a local attacker could use first.
     `argv_truncated`/`filename_truncated`, added by lot 187's tree,
     `agent/examples/posture_demo.rs` not updated); not touched here.
   - Lab: Debian 12, fimchain197-probe.sh — before: the build of `main` with lab PRs 176–195; after: this lot on top. A drop-in in `/etc/modprobe.d` whose name ends in a byte that is not UTF-8: before one Created row under the lossy name (`nn197-x�`, no hash) and the append not recorded; after a Created and a Modified row, both hashed, named `nn197-x\xff` (the ASCII control the same in both; the probe's own row matcher missed the JSON quoting, its FAIL lines are a probe defect — the rows above are the record). The ten control-surface baits as installed: before all dated `2026-02-15T09:30:00Z` whatever their mtime and sharing one comment line; after each dated at its write (equal to its mtime) with no shared comment, also after the boot sweep re-created the `/run` pair. Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.
+- **Wave 3 — posture overlay validation, lab PR 198.** Batch B8 of the
+  Wave 3 triage of group G4: NN-AUD-306 (POS-010, the remaining part) and
+  NN-AUD-307 (POS-011), both Low, on top of main (lots to 191) and lots
+  192–195. Files: `posture/{mass_write_overlay,escalation_allow,triggers}.rs`,
+  `config/overlay_auth.rs`, `sensors/open_sensor.rs`, `main.rs`, the
+  comments of `configs/escalation-allow.local`, the upgrade notes (§6,
+  "Before you upgrade" 11). No wire change.
+  - Before: `load_mass_write_carveout_extras` accepted any absolute
+    prefix (`/`, `/home`, `/home/alice`), logged an INFO count, and
+    `main.rs` called it twice (the file-open sensor and the posture);
+    `validate_content` kept a copy of its shape rules. `parse_entry` /
+    `parse_cidr` of `escalation-allow.local` accepted the comm `*` with
+    `/0`, without a word. The part of POS-010 about the file's owner and
+    mode was closed by the signed gate (Tappa 10.8) and its single
+    verified read (LLMR-013, lab PR 116).
+  - POS-010: `parse_line` / `parse_text`, shared by the loader and
+    `validate_content`. An entry is refused, its repeated `/` folded,
+    when it is `/`, has a `.` or `..` component, has fewer than two
+    components (the triage's data roots are named in the reason), is a
+    whole user's tree (`/home/<user>`, `/run/user/<uid>`), or covers
+    `/var/tmp`, `/dev/shm` or `/run/user` (the shared trees
+    `MASS_WRITE_CARVEOUT_PREFIXES` documents as counted on purpose; added
+    to the triage's list). An entry without its final `/` is a name
+    prefix where the posture matches it (`starts_with`), so `/home/al`
+    and `/var/t` are judged as what they cover. A refusal is a WARN with
+    path, line and reason naming the entry; the rest applies. The
+    accepted list is one WARN, with the name-prefix entries apart; the
+    overlay is parsed once and cloned for the posture. `config overlay
+    set|sign` refuse the file with ``<label>:<line>: `<entry>`: <why>``.
+  - POS-011: `too_broad` in `parse_entry`: any `/0` refused; the comm `*`
+    (an empty prefix) refused below /16 (IPv4) or /32 (IPv6), as triaged.
+    Every refusal is numbered (`line N: …`), at load and in
+    `validate_content`.
+  - Found while doing it (kernel side of POS-010): `RuleSet::add_path`
+    placed a carve-out with `std::fs::metadata`, which follows links, at
+    boot and at every refresh (60 s). A user who replaced the directory of
+    a signed carve-out in their home (`~/.claude/`, the BUG-017 dev-host
+    entry) with a link to `~` or `/` moved the carve-out onto that inode:
+    the mass-write arm went off for the home or the filesystem within a
+    minute. In `/tmp`, `fs.protected_symlinks` (on by default on Debian
+    and Ubuntu) already kept root from following another user's link.
+    `add_carveout` walks the path from `/` with `openat(O_PATH |
+    O_NOFOLLOW)` per component and takes the inode from the fd it checked
+    (no window between check and use); a link on the way refuses the
+    carve-out (`RuleSet::refused`, copied into `in_maps`; WARN
+    `mass-write carve-out NOT applied — a symbolic link on its path` at
+    boot and when a refresh finds a new one). The other rule classes
+    (sensitive, critical, persistence, homes) are root's paths and keep
+    `add_path`.
+  - Regressions declared (CHANGELOG, upgrade notes §6): an entry of these
+    shapes in an overlay signed before stops applying and `config overlay
+    set|sign` refuses the file; a carve-out through a symbolic link
+    (`/var/run/…`) no longer applies in the kernel sensor; the journal
+    lines `mass-write overlay: load complete` (only when nothing is added
+    now) and `escalation-allow: skipping malformed entry` (now `entry
+    REFUSED — not applied`). Every overlay the repository documents still
+    loads: `+/home/forty/.claude/`, `+/tmp/claude-` (BUG-017), `+/srv/build/`,
+    `lateral python3 10.0.0.0/8 22` (BUG-032 lab), the commented examples
+    of `configs/escalation-allow.local`, the test overlays of `triggers`.
+  - Not done: a deeper name prefix (`/home/alice/D` covers `Documents`) is
+    accepted and listed apart in the WARN; a whole user-data directory
+    (`~/Documents/`) or `/var/lib` is accepted (two components, the
+    triage's rule); a named comm with a wide network short of `/0` is
+    accepted; neither format has a uid to bound. The kernel sensor still
+    reads a name-prefix entry as the directory of that name
+    (`/tmp/claude-` only matches `/tmp/claude-` itself there), unchanged.
+  - Tests: `mass_write_overlay` `root_and_data_roots_are_rejected` (the
+    triage's overlay keeps `/var/lib/devtool/cache/` only),
+    `too_broad_entries_are_refused_by_name` (19 shapes; entry, reason and
+    line), `narrow_entries_still_load`; `triggers`
+    `a_refused_carveout_leaves_the_mass_write_arm_on` (the triage's
+    detect-level test: the burst on `/home/alice/Documents/report.docx`
+    still raises ConfirmedIntrusion, the accepted tree stays exempt);
+    `escalation_allow` `wildcard_with_default_route_is_rejected`,
+    `narrow_wildcard_entry_still_parses` (`exfil * 140.82.112.0/20 443`,
+    the /16 and /32 limits), `parses_and_excludes_mirror_but_not_c2`
+    unchanged; `overlay_auth` `content_validation_uses_the_loader_rules`
+    (extended); `open_sensor` `a_carveout_never_follows_a_symlink` (`.claude`
+    → the home, a link above a carve-out, a dangling link), and
+    `carveouts_are_trees_with_or_without_the_final_slash` on the
+    canonical tempdir. Two loader tests used `/ok/` and `/keep/`, now
+    refused (`/ok/dir/`, `/keep/me/`). On the starting behaviour (the two
+    `too_broad` disabled and no folding behind the new signatures,
+    `add_carveout` calling the old `add_path`) 7 fail:
+    `root_and_data_roots_are_rejected`, `too_broad_entries_are_refused_by_name`,
+    `narrow_entries_still_load` (the folding),
+    `a_refused_carveout_leaves_the_mass_write_arm_on`,
+    `wildcard_with_default_route_is_rejected`,
+    `content_validation_uses_the_loader_rules`,
+    `a_carveout_never_follows_a_symlink` ("the home got a carve-out").
+  - Host: `cargo fmt`, clippy `--workspace --exclude
+    northnarrow-agent-ebpf --all-targets --locked` and the agent with
+    `test-privileged,debug-trigger` clean; `cargo test --workspace`
+    2,543 passed, 0 failed. The `posture_demo` clippy run fails on the
+    starting tree as on this one: `agent/examples/posture_demo.rs:121`
+    builds an `Event::ProcessSpawn` without `argv_truncated` /
+    `filename_truncated` (fields added by the `WIP nn-wt-kernfid` commit,
+    not touched here).
+  - Lab: Unit tests (the triage's call): the mass-write carve-out loader and `config overlay set|sign` share one parser that refuses `/`, top-level directories, a whole user tree and the scratch roots, line-named; escalation-allow refuses `/0` and a wildcard wider than /16 (/32 for IPv6); a carve-out reached through a symlink is refused (`a_carveout_never_follows_a_symlink`). Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.
