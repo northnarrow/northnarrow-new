@@ -56,7 +56,8 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         features: Vec<String>,
     },
-    /// Build, then run the agent with sudo (needs CAP_BPF/root).
+    /// Build, then run the agent with sudo (needs CAP_BPF/root); only
+    /// `RUST_LOG` is passed through.
     Run {
         /// Build everything in release mode.
         #[arg(long)]
@@ -417,16 +418,7 @@ fn run_agent(release: bool, no_sudo: bool, extra: &[String]) -> Result<()> {
         bail!("agent binary missing: {}", agent_bin.display());
     }
 
-    let mut cmd = if no_sudo {
-        let mut c = Command::new(&agent_bin);
-        c.args(extra);
-        c
-    } else {
-        let mut c = Command::new("sudo");
-        // Preserve RUST_LOG so the user can override the level.
-        c.args(["-E", agent_bin.to_str().unwrap()]).args(extra);
-        c
-    };
+    let mut cmd = agent_command(&agent_bin, no_sudo, extra);
     println!("xtask: launching {:?}", cmd);
     let status = cmd.status().with_context(|| "failed to spawn agent")?;
     if !status.success() {
@@ -435,11 +427,68 @@ fn run_agent(release: bool, no_sudo: bool, extra: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The agent's command line for `xtask run`. External audit WDG-018
+/// (NN-AUD-367): under `sudo` it was `sudo -E`, which hands the
+/// developer's shell environment to the root agent (`PATH`, `HOME`, and
+/// the `NN_*` variables the agent reads, escape hatches such as
+/// `NN_AUDIT_ALLOW_UNWRITABLE` among them); only `RUST_LOG` is preserved
+/// now, so the log level can still be overridden. The path is passed as
+/// an `OsStr` (a non-UTF-8 checkout panicked in `to_str().unwrap()`) after
+/// `--`, so sudo never reads it as an option.
+fn agent_command(agent_bin: &Path, no_sudo: bool, extra: &[String]) -> Command {
+    let mut c = if no_sudo {
+        Command::new(agent_bin)
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("--preserve-env=RUST_LOG").arg("--").arg(agent_bin);
+        c
+    };
+    c.args(extra);
+    c
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{lock_if, scrubbed, Cli, Cmd};
+    use super::{agent_command, lock_if, scrubbed, Cli, Cmd};
     use clap::Parser;
+    use std::ffi::OsStr;
+    use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    fn run_agent_preserves_only_rust_log() {
+        let bin = Path::new("/repo/target/release/northnarrow-agent");
+        let extra = ["--config".to_string(), "/etc/northnarrow/agent.toml".into()];
+        let cmd = agent_command(bin, false, &extra);
+        assert_eq!(cmd.get_program(), "sudo");
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "--preserve-env=RUST_LOG",
+                "--",
+                "/repo/target/release/northnarrow-agent",
+                "--config",
+                "/etc/northnarrow/agent.toml",
+            ]
+        );
+        assert!(
+            !args.iter().any(|a| *a == "-E" || *a == "--preserve-env"),
+            "{args:?}"
+        );
+
+        let cmd = agent_command(bin, true, &extra);
+        assert_eq!(cmd.get_program(), bin);
+        assert_eq!(cmd.get_args().count(), 2);
+    }
+
+    #[test]
+    fn run_agent_takes_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let bin = Path::new(OsStr::from_bytes(b"/home/alice/nn-\xff/target/debug/agent"));
+        let cmd = agent_command(bin, false, &[]);
+        assert_eq!(cmd.get_args().nth(2), Some(bin.as_os_str()));
+    }
 
     #[test]
     fn locked_reaches_the_nested_builds() {

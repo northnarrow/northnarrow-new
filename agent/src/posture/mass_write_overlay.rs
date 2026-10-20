@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn narrow_entries_still_load() {
         let (out, refused) = parse_text(
-            "+/home/forty/.claude/\n\
+            "+/home/alice/.claude/\n\
              +/tmp/claude-\n\
              +/srv/build/\n\
              +/root/.cache/tool/\n\
@@ -338,7 +338,7 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                "/home/forty/.claude/",
+                "/home/alice/.claude/",
                 "/tmp/claude-",
                 "/srv/build/",
                 "/root/.cache/tool/",

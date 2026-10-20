@@ -576,10 +576,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-362 | WDG-013 | Low | Watchdog tooling | — | already fixed (lab PR 160) |
 | NN-AUD-363 | WDG-014 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-364 | WDG-015 | Low | Watchdog tooling | S | fixed (lab PR 170) |
-| NN-AUD-365 | WDG-016 | Low | Watchdog tooling | S | open |
+| NN-AUD-365 | WDG-016 | Low | Watchdog tooling | S | fixed (lab PR 208) |
 | NN-AUD-366 | WDG-017 | Low | Watchdog tooling | S | fixed (lab PR 205) |
-| NN-AUD-367 | WDG-018 | Low | Watchdog tooling | S | open |
-| NN-AUD-368 | WDG-R02 | Low | Watchdog tooling | S | open |
+| NN-AUD-367 | WDG-018 | Low | Watchdog tooling | S | fixed (lab PR 208) |
+| NN-AUD-368 | WDG-R02 | Low | Watchdog tooling | S | fixed (lab PR 208) |
 | NN-AUD-369 | WDG-R03 | Low | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-370 | WDG-R04 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-371 | WDG-R05 | Low | Watchdog tooling | S | fixed (lab PR 200) |
@@ -587,8 +587,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-373 | WDG-R07 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-374 | WDG-R08 | Low | Watchdog tooling | S | fixed (lab PR 200) |
 | NN-AUD-375 | WDG-R09 | Low | Watchdog tooling | S | fixed (lab PR 200) |
-| NN-AUD-376 | WDG-R10 | Low | Watchdog tooling | S | open |
-| NN-AUD-377 | WDG-R11 | Low | Watchdog tooling | S | open |
+| NN-AUD-376 | WDG-R10 | Low | Watchdog tooling | S | fixed (lab PR 208) |
+| NN-AUD-377 | WDG-R11 | Low | Watchdog tooling | S | fixed (lab PR 208) |
 | NN-AUD-378 | WDG-R12 | Low | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-379 | WDG-R13 | Low | Watchdog tooling | S | fixed (lab PR 205) |
 | NN-AUD-380 | WDG-R14 | Low | Watchdog tooling | S | fixed (lab PR 205) |
@@ -650,7 +650,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-436 | SNS-015 | Info | Sensors | S | fixed (lab PR 196) |
 | NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | fixed (lab PR 205) |
-| NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | open |
+| NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | fixed (lab PR 208) |
 | NN-AUD-440 | DEP-020 | Info | Deploy | S | fixed (lab PR 194) |
 | NN-AUD-441 | DEP-021 | Info | Deploy | S (docs) | open |
 | NN-AUD-442 | DEP-022 | Info | Deploy | — | already fixed (lab PR 150) |
@@ -9641,3 +9641,101 @@ group, the ones an unprivileged user or a local attacker could use first.
     2,658 passed, 0 failed (13 new); `wire::admin_protocol` with
     `debug-trigger` 45 passed.
   - Lab: On Ubuntu 24.04 (a resolved drop-in with `DNSOverTLS=yes`, one TCP connect to 1.1.1.1:853 and one UDP datagram to 1.1.1.1:443, restored at the end): before this lot no DNS blind entry and no counters; after it `nn-admin net status` lists NN-L-NET-002/004/005/014 as blind to the resolver's upstream and names the drop-in, QUIC rows 0 → 1, DoT rows by other processes 0 → 1 and by the resolver 0 → 43, and the entry is gone after the restore. The comm step (NET-020 (3)) needs a `net-read` key the guest's install key lacks: unit tests only. The probe's two CHAIN-008 Medium `Log` records (sudo, then egress) are the same before and after. Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.
+- **Wave 3 — developer tooling hygiene, lab PR 208.** NN-AUD-365
+  (WDG-016), NN-AUD-367 (WDG-018), NN-AUD-368 (WDG-R02), NN-AUD-376
+  (WDG-R10), NN-AUD-377 (WDG-R11), NN-AUD-439 (WDG-R16), all Low: batch 7
+  of the Wave 3 triage of group G1 (watchdog and deploy), on the
+  integration tree (`main` with lots up to 199, and lots 200–207). Files:
+  `posture/mod.rs`, `audit.rs` (a comment), `agent/Cargo.toml` (the
+  feature's comment), `examples/{posture_demo,ade_smoke,verify_chainlog,diag_hw}.rs`,
+  the fixtures of `posture/{triggers,lineage,mass_write_overlay}.rs`,
+  `cli/src/main.rs` and `cli/tests/stubs.rs` (new), `xtask/src/main.rs`,
+  `xtask/tests/repository_hygiene.rs` (new), `docs/PERFORMANCE_HARDWARE.md`,
+  `docs/operator/{KERNEL_COMPATIBILITY,UPGRADE_NOTES_AUDIT_16f7563}.md`.
+  - WDG-R02 (368, fixed). Re-checked: POS-013 (lab PR 172) had already
+    gated the bool `admin_release_combat` behind `cfg(any(test, feature =
+    "posture-demo"))`, and the doc links of `posture/state.rs` and
+    `posture/transitions.rs` already named `admin_release_combat_with_token`;
+    under the feature the stub was still public API. Now `#[cfg(test)]
+    pub(crate)`; the seven test sites keep it. The demo was broken beyond
+    the build: since POS-015 a plain `/tmp/payload` exec is `StagingExec`
+    (ENGAGED tier), so phase 4 never reached COMBAT and the stub's release
+    would have panicked on `NotInCombat`. It now shows that hold, reaches
+    a locked COMBAT on an `FsProtectDenial` (unlink, decisive), runs
+    `tick_decay_at` a day later (no transition) and ends in COMBAT, naming
+    `nn-admin unlock`. Choice: the `posture-demo` feature stays as the
+    demo's `required-features` (it compiles nothing into the agent now and
+    is still reported by `--build-features`): dropping it would make
+    `--all-targets` build the demo, which does not compile on this tree
+    (its `ProcessSpawn` lacks lab PR 187's `argv_truncated` and
+    `filename_truncated`, added on `main`; not added here). Once both are
+    merged, the feature, the CI step and the `LAB_FEATURES` row can go in
+    one follow-up.
+  - WDG-016 (365, fixed: the fallback). Re-checked: not shipped
+    (`mk-tarball.sh`, `mk-packages.sh`), a workspace member. The triage's
+    first choice, removing the crate, was not applied (deleting the crate
+    from the worktree was refused by the session's permission policy); the
+    fallback is: every stub prints "northnarrow <cmd>: not implemented;
+    nothing was done (the operator CLI is nn-admin)" on stderr, nothing on
+    stdout, and exits 69 (`EX_UNAVAILABLE`); the help says "not
+    implemented". Removing `cli/` stays open as a product choice (members
+    line, `Cargo.lock` entry, the kani test's crate list).
+  - WDG-018 (367, fixed). `agent_command` builds `sudo
+    --preserve-env=RUST_LOG -- <agent> <args>` (or the agent alone with
+    `--no-sudo`); the path is an `OsStr`, so a non-UTF-8 checkout no longer
+    panics.
+  - WDG-R10 (376, fixed). `ade_smoke` takes `ADE_MODEL`, else
+    `AdeConfig::DEFAULT_MODEL_PATH`, and says how to override on a missing
+    model. The fixtures of `triggers.rs` (2), `lineage.rs` (1) and, from
+    lab PR 198's overlay tests, `mass_write_overlay.rs` (2) use `/home/alice`.
+    The lint walks `*.rs`, `*.toml`, `*.sh`, `*.yml`/`*.yaml`, `*.service`,
+    `*.conf`, `*.tmpl` (no `target`, `vendor`, fuzz outputs) and refuses a
+    `/home/<name>` or `/Users/<name>` whose name is not a fixture name
+    (`a`, `al`, `alice`, `b`, `bob`, `carol`, `dave`, `dev`, `eve`,
+    `mallory`, `nn`, `u`, `user`); `/home/`, `/home/$USER`, `/home/.` name
+    nobody. Markdown is out of scope: design notes, the backlog and this
+    tracker quote the developer's paths historically
+    (`docs/ADE_BACKEND_NOTES.md` still lists a model directory under a
+    home: a follow-up for the docs).
+  - WDG-R11 (377, fixed: the "if kept" variant). The triage's first
+    choice, deleting the example (`nn-admin chain verify --log fim-drift
+    [--agent-pubkey]` covers it), was not applied for the same permission
+    reason. Its doc builds as the developer and runs
+    `sudo ./target/release/examples/verify_chainlog`, and points to
+    `nn-admin chain verify --agent-pubkey` for an off-host key; the lint
+    refuses `sudo [opts] [env [opts] [VAR=…]] cargo` in `agent/examples`
+    and `docs/operator` (scoped there: the privileged e2e guidance of
+    `agent/tests` and the runbook run `cargo test` as root on lab VMs). Its
+    one other hit, a lab note of `KERNEL_COMPATIBILITY.md` describing
+    `sudo -E cargo`, is reworded. WDG-013 (362): the residual (the example
+    trusts the host's published half) stays as documented; retiring the
+    example would close it.
+  - WDG-R16 (439, fixed, docs). `diag_hw`'s header and
+    `PERFORMANCE_HARDWARE.md` keep a host's report with the host's records;
+    the document records the reference host only. No `--anon` mode.
+  - Tests: `cli/tests/stubs.rs` `every_stub_fails_and_says_so`; `xtask`
+    `run_agent_preserves_only_rust_log`, `run_agent_takes_a_non_utf8_path`;
+    `xtask/tests/repository_hygiene.rs`
+    `no_developer_home_in_sources_scripts_or_configuration`,
+    `no_cargo_under_sudo_in_examples_or_operator_guides`,
+    `the_hygiene_scanners_flag_what_they_should`.
+    On the starting tree (the tracked changes stashed, the new tests in
+    place) `every_stub_fails_and_says_so` fails (exit 0, the text on
+    stdout), the home lint fails on six lines (`ade_smoke.rs`, two in
+    `triggers.rs`, one in `lineage.rs`, two in `mass_write_overlay.rs`),
+    the sudo lint on `verify_chainlog.rs:8` and the
+    `KERNEL_COMPATIBILITY.md` note; the `agent_command` tests do not
+    compile (new item). The demo's run was checked with lab PR 187's two
+    fields added for the run only, then removed: phases 4–6 print ENGAGED
+    (no transition), COMBAT (locked), COMBAT after `tick_decay_at` a day
+    later.
+  - Host: `cargo fmt`, clippy `--workspace --all-targets --locked` and
+    the agent with `test-privileged,debug-trigger` clean; the posture demo
+    clippy fails only on the two missing fields (known, `main`);
+    `cargo test --workspace` 2,713 passed, 0 failed (6 new). `cargo doc
+    --no-deps` with `-D warnings`: `northnarrow-cli` and `xtask` clean;
+    the workspace run fails before and after on existing broken links in
+    `common` and `antitamper-bpf`, and the agent's 173 doc warnings are the
+    same number before and after (no new one; none names
+    `admin_release_combat`).
+  - Lab: No dedicated lab probe (developer tooling): the CLI stubs' exit status, `cargo xtask run`'s environment and the repository-hygiene lints run in `cargo test --workspace`; the posture demo builds under `--features posture-demo`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.

@@ -2,8 +2,9 @@
 
 Snapshot of the deployment host the founder runs ADE on. Captured by
 `cargo run -p northnarrow-agent --release --example diag_hw`. Re-run
-the diagnostic on every new host before wiring ADE into production
-to keep this document accurate.
+the diagnostic on every new host before wiring ADE into production,
+and keep that report with the host's own records: this document holds
+the reference host only (a report fingerprints its host).
 
 ## Host: Hetzner CCX23 (founder workstation)
 

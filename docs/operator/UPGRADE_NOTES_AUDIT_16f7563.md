@@ -1173,10 +1173,21 @@ checked with its tag-bound attestation.
   would score the mock backend, and names the backend next to the rate.
 - **The range bootstrap** takes the rule count from the validation registry
   (76) instead of a fixed 69 (NN-AUD-217 LAB-012, lab PR 159).
-- **The posture demo** (NN-AUD-430 POS-013, lab PR 172):
-  `cargo run --example posture_demo` needs `--features posture-demo`, which
-  compiles the test-only `admin_release_combat(bool)` it calls; no
-  production build contains that call.
+- **The posture demo** (NN-AUD-430 POS-013, lab PR 172; NN-AUD-368
+  WDG-R02, lab PR 208): `cargo run --example posture_demo` needs
+  `--features posture-demo`. The bool `admin_release_combat` is a
+  crate-private test helper now, the demo no longer calls it and ends in
+  COMBAT (the way out is `nn-admin unlock`), and the feature compiles
+  nothing into the agent.
+- **Developer tools** (NN-AUD-365 WDG-016, NN-AUD-367 WDG-018, NN-AUD-376
+  WDG-R10, NN-AUD-377 WDG-R11, lab PR 208). **Regression:** the unshipped
+  `northnarrow` CLI stubs exit 69 with the message on stderr (they printed
+  "Not implemented yet" and exited 0; the operator CLI is `nn-admin`);
+  `cargo xtask run` keeps only `RUST_LOG` across `sudo` (it was `sudo -E`;
+  to hand the agent another variable, run the built binary yourself:
+  `sudo env NAME=value ./target/release/northnarrow-agent`); `ade_smoke` reads `ADE_MODEL`, else the agent's default
+  model path under `/var/lib/northnarrow/models`; `verify_chainlog` is
+  built as yourself and only its binary runs under sudo.
 
 ## 11. The journal: one event, one line (Wave 3)
 

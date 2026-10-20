@@ -61,9 +61,12 @@ debug-trigger = ["common/debug-trigger"]
 # working iptables binary; CI compiles but does not execute these.
 # See docs/integration-test-runbook.md for the manual run path.
 test-privileged = []
-# External audit POS-013: compiles `PostureMachine::admin_release_combat`,
-# the Sub-tappa 6.5 bool stub that leaves COMBAT without a signed token,
-# for `examples/posture_demo.rs`. Never enabled in production builds.
+# Builds `examples/posture_demo.rs` (`required-features`). External audit
+# POS-013 made it compile `PostureMachine::admin_release_combat`, the
+# Sub-tappa 6.5 bool stub that leaves COMBAT without a signed token, for
+# the demo; WDG-R02 (NN-AUD-368) made the stub a `#[cfg(test)]` helper and
+# the demo no longer calls it, so this feature compiles nothing into the
+# library or the binaries. Never enabled in production builds.
 posture-demo = []
 
 [dependencies]

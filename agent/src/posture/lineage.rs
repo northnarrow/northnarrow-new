@@ -2692,7 +2692,7 @@ mod tests {
         let t = AuthSessionTracker::new("/proc");
         let argv = vec![
             "node".to_string(),
-            "/home/forty/.npm-global/lib/node_modules/npm/bin/npm-cli.js".to_string(),
+            "/home/alice/.npm-global/lib/node_modules/npm/bin/npm-cli.js".to_string(),
         ];
         t.ingest_spawn_with_argv(7004, 50, "/usr/bin/node", &argv, 1);
         assert!(t.is_npm_cli_writer(7004));

@@ -61,6 +61,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, developer tooling hygiene (Low WDG-016
+  NN-AUD-365, WDG-018 NN-AUD-367, WDG-R02 NN-AUD-368, WDG-R10 NN-AUD-376,
+  WDG-R11 NN-AUD-377, WDG-R16 NN-AUD-439; lab PR 208). The developer
+  examples and tools hold no trap. WDG-R02: `PostureMachine::admin_release_combat`,
+  the bool stub that leaves COMBAT without a signed token (no release hook,
+  no admin action recorded), was public API under the `posture-demo`
+  feature; it is a `#[cfg(test)] pub(crate)` helper of the unit tests now.
+  `examples/posture_demo` no longer calls it: it reached ENGAGED only since
+  POS-015 made a plain `/tmp` exec an ENGAGED-tier signal, so its release
+  would have panicked on `NotInCombat`; it now reaches a locked COMBAT on a
+  kernel anti-tamper denial, shows that decay does not leave it a day
+  later, and ends there (the way out is `nn-admin unlock`). WDG-016: the
+  unshipped `northnarrow` CLI stubs printed "Not implemented yet" on
+  stdout and exited 0; they say on stderr that nothing was done and exit
+  69 (`EX_UNAVAILABLE`), naming `nn-admin`. WDG-018: `cargo xtask run`
+  started the agent with `sudo -E` (the developer's whole environment,
+  `NN_AUDIT_ALLOW_UNWRITABLE` and the other `NN_*` variables the agent
+  reads included, handed to root) and `to_str().unwrap()` on its path; it
+  passes `--preserve-env=RUST_LOG --` and the path as an `OsStr`.
+  WDG-R10: `ade_smoke` defaulted its model to a developer's home; it takes
+  `ADE_MODEL`, else `AdeConfig::DEFAULT_MODEL_PATH`, and the test
+  fixtures with that home (`posture/triggers.rs`, `lineage.rs`, and lab PR
+  198's in `mass_write_overlay.rs`) use `/home/alice`. WDG-R11: `verify_chainlog` documented `sudo cargo
+  run`, which compiles and runs the dependency graph's build scripts as
+  root; it is built as the developer and only its binary runs under
+  `sudo`, and its doc points to `nn-admin chain verify --log fim-drift
+  --agent-pubkey` for an off-host key (WDG-013's residual: the example
+  itself still trusts the host's published half). WDG-R16: `diag_hw` and
+  `docs/PERFORMANCE_HARDWARE.md` keep a host's report with the host's
+  records; the document holds the reference host only. Two repository
+  lints (`xtask/tests/repository_hygiene.rs`) keep it so: no `/home/<name>`
+  or `/Users/<name>` outside a list of fixture names in the sources,
+  scripts and configuration (Markdown excluded), and no `cargo` under
+  `sudo` in `agent/examples` and `docs/operator` (a lab note of
+  `KERNEL_COMPATIBILITY.md` reworded).
+  **Regressions / changes:** `northnarrow <cmd>` exits 69 instead of 0;
+  `cargo xtask run` keeps only `RUST_LOG` across `sudo`; `ade_smoke`'s
+  default model path is `/var/lib/northnarrow/models/…`; the posture demo's
+  output ends in COMBAT. The `posture-demo` feature compiles nothing into
+  the agent any more and only builds the demo (kept: the demo's
+  `ProcessSpawn` builds again once lab PR 187's two fields reach it).
+  Tests: `cli/tests/stubs.rs` (1), `xtask` `agent_command` (2),
+  `xtask/tests/repository_hygiene.rs` (3); on the starting tree the CLI
+  test and the two lints fail (exit 0; the developer's home in six lines;
+  `sudo cargo run`), the `agent_command` tests do not compile (new item).
 - External audit, Wave 3, network blind spots and drain consistency (Low
   NET-017 NN-AUD-335, NET-020 NN-AUD-434 part (3); lab PR 207). NET-017:
   the agent never said what its network rules cannot see. The DNS rules

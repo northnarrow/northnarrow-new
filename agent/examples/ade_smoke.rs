@@ -5,6 +5,9 @@
 //! decode timing. This bypasses the system prompt + full event
 //! formatting so the floor of per-prompt latency on the dev VM
 //! (no AVX2/FMA) can actually be measured.
+//!
+//! The model is `ADE_MODEL`, else the agent's own default
+//! (`AdeConfig::DEFAULT_MODEL_PATH`, under `/var/lib/northnarrow/models`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -13,6 +16,7 @@ use std::time::Instant;
 use common::Event;
 use northnarrow_agent::ade::backend_candle::CandleBackend;
 use northnarrow_agent::ade::inference::InferenceBackend;
+use northnarrow_agent::ade::AdeConfig;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,12 +28,16 @@ async fn main() -> ExitCode {
         .with_target(false)
         .try_init();
 
-    let model_path =
-        PathBuf::from(std::env::var("ADE_MODEL").unwrap_or_else(|_| {
-            "/home/forty/models/foundation-sec-8b-reasoning-q4_k_m.gguf".into()
-        }));
+    // External audit WDG-R10 (NN-AUD-376): the default was a developer's
+    // home directory.
+    let model_path = std::env::var_os("ADE_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(AdeConfig::DEFAULT_MODEL_PATH));
     if !model_path.exists() {
-        eprintln!("smoke: model not at {}", model_path.display());
+        eprintln!(
+            "smoke: model not at {} (set ADE_MODEL=/path/to/model.gguf)",
+            model_path.display()
+        );
         return ExitCode::from(2);
     }
 
