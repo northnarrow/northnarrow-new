@@ -1,8 +1,11 @@
 //! Live integration test for the exec sensor.
 //!
-//! This test loads the real eBPF program, attaches it to the kernel
-//! tracepoint, then spawns `/bin/echo test` and asserts that within
-//! 1s an event arrives whose `comm` is `"echo"`. It needs:
+//! This test loads the real eBPF program, attaches it to the
+//! `sched/sched_process_exec` tracepoint (`ExecSensor`, with this kernel's
+//! BTF offsets armed, lab PR 187), then spawns `/bin/echo
+//! northnarrow-canary` and asserts that within 3 s an event arrives for
+//! THAT exec: its pid, its parent (this test process) and the canary
+//! argument. It needs:
 //!
 //! - the eBPF artifact present in `agent-ebpf/target/.../release/`
 //!   (run `cargo xtask build-ebpf` first), and
@@ -23,9 +26,17 @@ use std::time::Duration;
 use common::Event;
 use northnarrow_agent::sensors::ExecSensor;
 
+/// The argument the canary exec carries.
+const CANARY_ARG: &str = "northnarrow-canary";
+
+/// External audit NN-AUD-422 (TST-016): the test matched `comm == "echo"`
+/// alone, so any `echo` on the host passed it, the canary's own exec or
+/// not. The record must be the canary's: its pid, this process as its
+/// parent (`real_parent->tgid`, read through the BTF offsets) and the
+/// canary argument in its argv; every `echo` seen is listed on failure.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires root and a Linux kernel with eBPF"]
-async fn echo_is_observed_within_one_second() {
+async fn the_canary_exec_is_observed_with_its_pid_parent_and_argv() {
     let mut sensor = ExecSensor::start()
         .await
         .expect("ExecSensor::start (need root + built eBPF artifact)");
@@ -33,26 +44,43 @@ async fn echo_is_observed_within_one_second() {
     // Spawn the canary AFTER the sensor is attached so we know the
     // event is captured live, not from before the test.
     let mut child = std::process::Command::new("/bin/echo")
-        .arg("northnarrow-canary")
+        .arg(CANARY_ARG)
+        .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn /bin/echo");
+    let pid = child.id();
+    let me = std::process::id();
     let _ = child.wait();
 
-    let saw_echo = tokio::time::timeout(Duration::from_secs(1), async {
+    // Every `echo` exec seen, for the failure message.
+    let mut seen: Vec<String> = Vec::new();
+    let found = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let evt = sensor.next_event().await.expect("sensor closed");
-            if let Event::ProcessSpawn { comm, .. } = &evt {
-                if comm == "echo" {
-                    return true;
-                }
+            let Event::ProcessSpawn {
+                pid: p,
+                ppid,
+                comm,
+                argv,
+                ..
+            } = &evt
+            else {
+                continue;
+            };
+            if comm == "echo" {
+                seen.push(format!("pid={p} ppid={ppid} argv={argv:?}"));
+            }
+            if *p == pid && *ppid == me && argv.iter().any(|a| a == CANARY_ARG) {
+                return;
             }
         }
     })
     .await;
 
     assert!(
-        matches!(saw_echo, Ok(true)),
-        "did not observe an `echo` exec within 1s"
+        found.is_ok(),
+        "no exec record for the canary (pid {pid}, ppid {me}, argv with {CANARY_ARG:?}) \
+         within 3s; `echo` execs seen: {seen:#?}"
     );
 }
 

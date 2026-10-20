@@ -10,7 +10,7 @@
 //! while a NorthNarrow agent or watchdog runs or when the chain exists.
 //!
 //! The helper tests need no privilege and run in `cargo test --workspace`.
-//! The two iptables tests need root, iptables and the `test-privileged`
+//! The four iptables tests need root, iptables and the `test-privileged`
 //! feature, and are `#[ignore]`d (the lab's `test-ignored` run):
 //!   sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent \
 //!     --features "test-privileged debug-trigger" --test fixture_selftest \
@@ -120,6 +120,110 @@ fn strip_ansi_leaves_the_fields_a_log_check_reads() {
     assert_eq!(
         common::strip_ansi(coloured),
         " INFO anti-tamper: all LSM hooks attached deny_attached=9"
+    );
+}
+
+// ── strict JSONL reader (NN-AUD-419) ──────────────────────────────────
+
+#[test]
+fn a_malformed_line_fails_the_read_naming_its_number_and_bytes() {
+    let body = b"{\"rule_id\":\"R001\"}\nnot json at all\n{\"rule_id\":\"R0";
+    let err = common::parse_jsonl_strict("detections.jsonl", body).expect_err("line 2 is garbage");
+    assert!(err.contains("detections.jsonl"), "{err}");
+    assert!(err.contains("line 2 "), "{err}");
+    assert!(err.contains("not json at all"), "{err}");
+}
+
+#[test]
+fn a_partial_last_line_is_a_write_in_progress_not_a_row() {
+    let rows = common::parse_jsonl_strict("x", b"{\"a\":1}\n{\"a\":2").unwrap();
+    assert_eq!(rows, vec![serde_json::json!({"a": 1})]);
+    // Even a final fragment that happens to parse waits for its newline.
+    let rows = common::parse_jsonl_strict("x", b"{\"a\":1}\n7").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(common::parse_jsonl_strict("x", b"").unwrap().is_empty());
+}
+
+#[test]
+fn rows_of_any_shape_are_kept_and_an_empty_line_is_not_one() {
+    // Rows of other kinds (another process, another op) are values like
+    // any other: the reader checks the framing, not the schema.
+    let rows = common::parse_jsonl_strict("x", b"{\"op\":\"a\"}\n[1,2]\n\"s\"\n").unwrap();
+    assert_eq!(rows.len(), 3);
+    for body in [
+        &b"{\"a\":1}\n\n{\"a\":2}\n"[..],
+        b"{\"a\":1}\n  \n",
+        b"{\"a\":1}{\"a\":2}\n",
+    ] {
+        assert!(
+            common::parse_jsonl_strict("x", body).is_err(),
+            "{:?}",
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
+#[test]
+fn a_long_malformed_line_is_shown_cut_at_200_bytes() {
+    let mut body = b"{\"ok\":true}\n".to_vec();
+    body.extend(std::iter::repeat_n(b'x', 5000));
+    body.push(b'\n');
+    let err = common::parse_jsonl_strict("x", &body).unwrap_err();
+    assert!(err.contains("5000 bytes"), "{err}");
+    assert!(
+        err.contains(&"x".repeat(200)) && !err.contains(&"x".repeat(201)),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_missing_file_has_no_rows_and_a_file_is_read_strictly() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("netflow.jsonl");
+    assert!(common::read_jsonl_strict(&p).is_empty());
+    std::fs::write(&p, b"{\"a\":1}\n{\"a\":2}\n{\"a\"").unwrap();
+    assert_eq!(common::read_jsonl_strict(&p).len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "line 2 ")]
+fn reading_a_file_with_a_malformed_line_panics() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("fim_drift.jsonl");
+    std::fs::write(&p, b"{\"a\":1}\n{\"a\":\n{\"a\":3}\n").unwrap();
+    let _ = common::read_jsonl_strict(&p);
+}
+
+// ── iptables guard: what is left of a chain (NN-AUD-420) ──────────────
+
+#[test]
+fn iptables_listing_leftovers_are_the_chain_and_every_jump_to_it() {
+    let listing = "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N NN_X\n\
+                   -N NN_X_OTHER\n-A INPUT -j NN_X\n-A INPUT -j NN_X\n\
+                   -A OUTPUT -o lo -j NN_X\n-A FORWARD -g NN_X\n-A INPUT -j NN_X_OTHER\n\
+                   -A NN_X -j DROP\n";
+    assert_eq!(
+        common::iptables_leftovers(listing, "NN_X"),
+        vec![
+            "-N NN_X",
+            "-A INPUT -j NN_X",
+            "-A INPUT -j NN_X",
+            "-A OUTPUT -o lo -j NN_X",
+            "-A FORWARD -g NN_X"
+        ]
+    );
+    assert!(common::iptables_leftovers("-P INPUT ACCEPT\n-N NN_X_OTHER\n", "NN_X").is_empty());
+}
+
+#[test]
+fn nft_listing_leftovers_are_the_chain_and_every_jump_to_it() {
+    let listing = "table ip filter {\n\tchain NN_X {\n\t\tcounter packets 0 bytes 0 drop\n\t}\n\
+                   \tchain NN_X_OTHER {\n\t}\n\tchain INPUT {\n\t\ttype filter hook input \
+                   priority filter; policy accept;\n\t\tcounter packets 3 bytes 120 jump NN_X\n\
+                   \t\tcounter packets 0 bytes 0 jump NN_X_OTHER\n\t}\n}\n";
+    assert_eq!(
+        common::nft_table_leftovers(listing, "NN_X"),
+        vec!["chain NN_X {", "counter packets 3 bytes 120 jump NN_X"]
     );
 }
 
@@ -301,9 +405,84 @@ mod iptables {
         );
     }
 
-    /// Drop the guard with no chain: its `-D` / `-F` / `-X` each fail and
-    /// Drop must swallow that, and create nothing. The chain's absence is
-    /// a precondition checked, never made: the test used to delete it.
+    /// `iptables <args>`, which must succeed (a test precondition).
+    fn ipt(args: &[&str]) {
+        let st = Command::new("iptables")
+            .args(args)
+            .status()
+            .expect("spawn iptables");
+        assert!(st.success(), "iptables {args:?} failed (test precondition)");
+    }
+
+    /// External audit NN-AUD-420 (TST-014): two jumps to the chain in
+    /// INPUT (a duplicated jump, BUG-041) and one in OUTPUT. The old Drop
+    /// ran one `-D` per base chain: the second INPUT jump survived, `-X`
+    /// failed, and nothing said so. Every jump and the chain must be gone.
+    #[test]
+    #[ignore = "requires sudo + iptables (run via integration runbook)"]
+    fn iptables_guard_removes_every_duplicate_jump() {
+        require_selftest_chain_absent();
+        let guard = EniIptablesGuard::install_for(SELFTEST_CHAIN);
+        ipt(&["-N", SELFTEST_CHAIN]);
+        ipt(&["-I", "INPUT", "-j", SELFTEST_CHAIN]);
+        ipt(&["-I", "INPUT", "-j", SELFTEST_CHAIN]);
+        ipt(&["-I", "OUTPUT", "-j", SELFTEST_CHAIN]);
+        assert_eq!(
+            common::chain_leftovers("iptables", "ip", SELFTEST_CHAIN)
+                .expect("read the table")
+                .len(),
+            4,
+            "test precondition: the chain and its three jumps"
+        );
+        drop(guard);
+        let input = Command::new("iptables")
+            .args(["-S", "INPUT"])
+            .output()
+            .expect("iptables -S INPUT");
+        let input = String::from_utf8_lossy(&input.stdout);
+        assert!(
+            common::iptables_leftovers(&input, SELFTEST_CHAIN).is_empty(),
+            "a jump to {SELFTEST_CHAIN} survived the guard: {input}"
+        );
+        assert_eq!(common::chain_present(SELFTEST_CHAIN), Ok(false));
+    }
+
+    /// The guard checks its own work: a chain it cannot delete (another
+    /// chain, which it does not touch, still jumps to it) fails the drop
+    /// and names what is left. The old Drop returned in silence.
+    #[test]
+    #[ignore = "requires sudo + iptables (run via integration runbook)"]
+    fn iptables_guard_fails_the_test_when_the_chain_stays() {
+        const REF_CHAIN: &str = "NN_GUARD_SELFTEST_REF";
+        require_selftest_chain_absent();
+        if common::chain_present(REF_CHAIN) == Ok(true) {
+            drop(EniIptablesGuard::install_for(REF_CHAIN));
+        }
+        // Dropped in reverse order: the referencing chain first, then ours.
+        let _cleanup = EniIptablesGuard::install_for(SELFTEST_CHAIN);
+        let _cleanup_ref = EniIptablesGuard::install_for(REF_CHAIN);
+        ipt(&["-N", SELFTEST_CHAIN]);
+        ipt(&["-N", REF_CHAIN]);
+        ipt(&["-A", REF_CHAIN, "-j", SELFTEST_CHAIN]);
+
+        let result =
+            std::panic::catch_unwind(|| drop(EniIptablesGuard::install_for(SELFTEST_CHAIN)));
+        let payload = result.expect_err("the guard must fail when the chain stays");
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains(SELFTEST_CHAIN) && msg.contains("still") && msg.contains(REF_CHAIN),
+            "{msg}"
+        );
+    }
+
+    /// Drop the guard with no chain: its `-D` / `-F` / `-X` each fail, the
+    /// table read back holds nothing, so Drop passes and creates nothing.
+    /// The chain's absence is a precondition checked, never made: the test
+    /// used to delete it.
     #[test]
     #[ignore = "requires sudo + iptables (run via integration runbook)"]
     fn iptables_guard_idempotent_on_clean_state() {

@@ -31,15 +31,14 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 mod common;
-use common::EniIptablesGuard;
+use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const LOG_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PRIV_BIN_DIR: &str = "/usr/local/bin";
 const REAL_SUDO: &str = "/usr/bin/sudo";
 
 const ETC: &str = "/etc/northnarrow";
@@ -60,38 +59,8 @@ fn combat_rules_path() -> PathBuf {
         .join("combat-rules.v4")
 }
 
-// ── path-safe install (R009: no root exec from a user path) ─────────
-
-struct InstalledBin {
-    path: PathBuf,
-}
-impl Drop for InstalledBin {
-    fn drop(&mut self) {
-        let _ = Command::new(REAL_SUDO)
-            .args(["rm", "-f"])
-            .arg(&self.path)
-            .status();
-    }
-}
-fn install_to_priv_bin(src: &Path) -> InstalledBin {
-    let basename = src.file_name().and_then(|s| s.to_str()).expect("basename");
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dst = PathBuf::from(format!(
-        "{PRIV_BIN_DIR}/{basename}-e2etest-{ts}-{}",
-        std::process::id()
-    ));
-    let status = Command::new(REAL_SUDO)
-        .args(["install", "-m", "755", "-o", "root", "-g", "root"])
-        .arg(src)
-        .arg(&dst)
-        .status()
-        .expect("spawn sudo install");
-    assert!(status.success(), "sudo install of {} failed", src.display());
-    InstalledBin { path: dst }
-}
+// Path-safe install (R009: no root exec from a user path):
+// `common::install_to_priv_bin`.
 
 /// SIGQUIT-on-drop (the task_kill hook refuses SIGKILL/SIGTERM).
 struct AgentGuard(Option<Child>);

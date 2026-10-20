@@ -41,6 +41,7 @@
 #![cfg(feature = "test-privileged")]
 
 mod common;
+use common::{install_to_priv_bin, InstalledBin};
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -113,6 +114,21 @@ struct FimFixture {
     /// Returned so the test can SIGQUIT the agent at end-of-test.
     /// `Option` so `Drop` can take ownership.
     _agent_guard: AgentGuard,
+    /// External audit NN-AUD-423 (TST-017): the agent runs from a
+    /// root-owned copy (`common::install_to_priv_bin`), not from
+    /// `target/` under the user's home. Dropped after the agent stops.
+    _installed_agent: InstalledBin,
+}
+
+/// Lab PR 163's lesson, here too: the agent stops before the fields drop.
+/// Fields drop in declaration order, so `_tempdir` went first with the
+/// agent still running on the chains, keys and socket it holds there.
+impl Drop for FimFixture {
+    fn drop(&mut self) {
+        if let Some(mut c) = self._agent_guard.0.take() {
+            common::quit_agent(&mut c);
+        }
+    }
 }
 
 /// Production-pinned bpffs root the agent writes to. Per-test
@@ -154,6 +170,7 @@ impl FimFixture {
     /// state doesn't bleed in.
     fn setup(watched_basename: &str, initial_contents: &[u8]) -> Self {
         wipe_pin_tree();
+        let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path();
 
@@ -210,7 +227,7 @@ impl FimFixture {
         let marker = dir.join("agent.shutdown_authorised");
 
         common::require_bpftool();
-        let child = Command::new(agent_bin())
+        let child = Command::new(&installed_agent.path)
             .env(
                 common::OWN_DEFAULT_LISTS_ENV.0,
                 common::OWN_DEFAULT_LISTS_ENV.1,
@@ -254,6 +271,7 @@ impl FimFixture {
             baseline_log,
             drift_log,
             _agent_guard: guard,
+            _installed_agent: installed_agent,
         }
     }
 
@@ -263,7 +281,7 @@ impl FimFixture {
     fn wait_baseline(&self) {
         let deadline = Instant::now() + BASELINE_POLL_TIMEOUT;
         while Instant::now() < deadline {
-            if jsonl_row_count(&self.baseline_log) >= 1 {
+            if !common::read_jsonl_strict(&self.baseline_log).is_empty() {
                 return;
             }
             std::thread::sleep(POLL_INTERVAL);
@@ -284,7 +302,7 @@ impl FimFixture {
     fn wait_drift_op(&self, path: &str, op: u64) -> serde_json::Value {
         let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
         loop {
-            let rows = read_jsonl(&self.drift_log);
+            let rows = common::read_jsonl_strict(&self.drift_log);
             if let Some(row) = rows
                 .iter()
                 .find(|r| r["path"] == serde_json::json!(path) && r["op"].as_u64() == Some(op))
@@ -302,13 +320,13 @@ impl FimFixture {
     fn wait_drift(&self, n: usize) -> Vec<serde_json::Value> {
         let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
         while Instant::now() < deadline {
-            let rows = read_jsonl(&self.drift_log);
+            let rows = common::read_jsonl_strict(&self.drift_log);
             if rows.len() >= n {
                 return rows;
             }
             std::thread::sleep(POLL_INTERVAL);
         }
-        let rows = read_jsonl(&self.drift_log);
+        let rows = common::read_jsonl_strict(&self.drift_log);
         panic!(
             "drift log {} held {} rows after {:?} — wanted >= {}; \
              current rows: {:?}",
@@ -336,24 +354,6 @@ fn wait_for_socket(path: &Path) {
     );
 }
 
-fn jsonl_row_count(path: &Path) -> usize {
-    match std::fs::read_to_string(path) {
-        Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
-        Err(_) => 0,
-    }
-}
-
-fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
-    let body = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    body.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
-}
-
 // ── Test 1: baseline + modify → Modified drift event ────────────────
 
 /// Tappa 9 C8 e2e #1 — the canonical drift-detection path. After
@@ -367,7 +367,7 @@ fn read_jsonl(path: &Path) -> Vec<serde_json::Value> {
 fn fim_baseline_then_modify_records_drift_event() {
     let fx = FimFixture::setup("sensitive.txt", b"initial-known-good\n");
     fx.wait_baseline();
-    let baseline = read_jsonl(&fx.baseline_log);
+    let baseline = common::read_jsonl_strict(&fx.baseline_log);
     assert_eq!(
         baseline.len(),
         1,
@@ -385,7 +385,7 @@ fn fim_baseline_then_modify_records_drift_event() {
     // never recorded as drift (BUG-012 v2).
     let row = fx.wait_drift_op(&watched_str, OP_MODIFIED);
     assert!(
-        read_jsonl(&fx.drift_log)
+        common::read_jsonl_strict(&fx.drift_log)
             .iter()
             .all(|r| r["op"].as_u64() != Some(OP_OPENED)),
         "a read is not drift"
@@ -524,6 +524,8 @@ fn fim_subprocess_unlink_records_deleted_event() {
 #[test]
 fn fim_subprocess_open_aws_creds_records_opened_event() {
     wipe_pin_tree();
+    // Declared before the agent's guard: dropped after the agent stops.
+    let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
     let tempdir = tempfile::tempdir().expect("tempdir");
     let dir = tempdir.path();
     // Build the .aws/credentials shape so NN-L-FIM-011's
@@ -541,7 +543,7 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     // keeping this test self-contained for now.)
     let admin_pub = dir.join("admin.pub");
     let admin_priv = dir.join("admin.priv");
-    Command::new(nn_admin_bin())
+    let init = Command::new(nn_admin_bin())
         .arg("init")
         .arg("--priv-out")
         .arg(&admin_priv)
@@ -549,6 +551,7 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
         .arg(&admin_pub)
         .status()
         .expect("nn-admin init");
+    assert!(init.success(), "nn-admin init failed");
     let combat = dir.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &combat).expect("copy combat rules");
     let fim_paths_v1 = dir.join("fim-paths.v1");
@@ -573,7 +576,7 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     let status_events_log = dir.join("status_events.jsonl");
 
     common::require_bpftool();
-    let child = Command::new(agent_bin())
+    let child = Command::new(&installed_agent.path)
         .env(
             common::OWN_DEFAULT_LISTS_ENV.0,
             common::OWN_DEFAULT_LISTS_ENV.1,
@@ -614,11 +617,11 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
 
     // Wait for the TOFU baseline.
     let deadline = Instant::now() + BASELINE_POLL_TIMEOUT;
-    while Instant::now() < deadline && jsonl_row_count(&baseline_log) < 1 {
+    while Instant::now() < deadline && common::read_jsonl_strict(&baseline_log).is_empty() {
         std::thread::sleep(POLL_INTERVAL);
     }
     assert!(
-        jsonl_row_count(&baseline_log) >= 1,
+        !common::read_jsonl_strict(&baseline_log).is_empty(),
         "TOFU baseline never populated {}",
         baseline_log.display()
     );
@@ -643,7 +646,7 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     let deadline = Instant::now() + DRIFT_POLL_TIMEOUT;
     let mut hit: Option<serde_json::Value> = None;
     while Instant::now() < deadline && hit.is_none() {
-        hit = read_jsonl(&detections_log)
+        hit = common::read_jsonl_strict(&detections_log)
             .into_iter()
             .find(|r| r["rule_id"] == serde_json::json!("NN-L-FIM-011_AwsCredsRead"));
         if hit.is_none() {
@@ -655,7 +658,7 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
             "no NN-L-FIM-011_AwsCredsRead record in {} within {:?}; records seen: {:?}",
             detections_log.display(),
             DRIFT_POLL_TIMEOUT,
-            read_jsonl(&detections_log)
+            common::read_jsonl_strict(&detections_log)
                 .iter()
                 .map(|r| r["rule_id"].clone())
                 .collect::<Vec<_>>()
@@ -665,10 +668,10 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     // BUG-012 v2: a read is not integrity drift — the drift log must
     // still be empty after the detection was recorded.
     assert_eq!(
-        jsonl_row_count(&drift_log),
+        common::read_jsonl_strict(&drift_log).len(),
         0,
         "a credential read must not produce a drift row (BUG-012 v2): {:?}",
-        read_jsonl(&drift_log)
+        common::read_jsonl_strict(&drift_log)
     );
 }
 
@@ -694,7 +697,7 @@ fn fim_baseline_cache_suppresses_noop_modified() {
     // Sanity: drift log is empty after the TOFU baseline pass —
     // the cache was populated from the chain post-recompute, so
     // no drift entries yet.
-    let pre = read_jsonl(&fx.drift_log);
+    let pre = common::read_jsonl_strict(&fx.drift_log);
     assert!(
         pre.is_empty(),
         "drift log should be empty post-baseline before any touch: {pre:?}"
@@ -741,7 +744,7 @@ fn fim_baseline_cache_suppresses_noop_modified() {
     );
 
     // A no-op touch recorded as Modified would carry an unchanged hash.
-    let rows = read_jsonl(&fx.drift_log);
+    let rows = common::read_jsonl_strict(&fx.drift_log);
     let noop_rows: Vec<_> = rows
         .iter()
         .filter(|r| {

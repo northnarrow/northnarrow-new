@@ -450,18 +450,55 @@ Flags:
 - `--nocapture` is optional but very helpful — failures otherwise
   swallow the agent's stderr.
 
-Expected: **9 tests passing, 2 ignored** (the two COMBAT tests each wait
-for the graduated ladder to reach ISOLATE — ~30 s investigate window —
-before checking the iptables chain). The excerpt below predates the later
-tests:
+The suite passes when **every test it lists runs and passes**: no test
+failed, ignored or filtered out. The runbook carries no count (it drifted:
+"9 passing, 2 ignored" was written for a suite of ten with none ignored,
+external audit NN-AUD-421); `nn-lab.sh test-e2e` checks it on each run.
+For each of its three suites it takes the number of tests from
+`cargo test … -- --list` and compares it with the run's one `test result:`
+line, which must read `ok. N passed; 0 failed; 0 ignored; …; 0 filtered
+out` with that same N (`deploy/lab/lib/suite-count.sh`, self-test
+`bash deploy/lab/lib/suite-count-test.sh`). It prints `count ok: <suite>:
+N of N passed`, or a `FAIL: <suite>: …` line that names what is missing
+(also in the nightly report), and the step fails if any suite does.
+`NN_LAB_E2E_TEST_ARGS` adds libtest arguments to the runs, not to the
+listing: `NN_LAB_E2E_TEST_ARGS="--skip e2e_status_no_admin_action_initially"`
+must fail the agent suite (`… of … passed (0 failed, 0 ignored, 1 filtered
+out)`). The two COMBAT tests each wait for the graduated ladder to reach
+ISOLATE (~30 s investigate window) before checking the iptables chain.
 
-```
-running 4 tests
-test e2e_status_no_admin_action_initially ... ok
-test e2e_force_combat_then_unlock_via_cli ... ok
-test e2e_unlock_with_wrong_key ... ok
-test e2e_failures_on_other_connections_do_not_rate_limit ... ok
-```
+### The privileged suites
+
+Every suite below needs a build with the eBPF object (`cargo xtask
+build-ebpf`) and runs as root, single-threaded:
+`sudo -E env "PATH=$PATH" cargo test --release -p <crate> --features <features> --test <suite> -- --test-threads=1`
+(add `--ignored` where the tests are `#[ignore]`d). The fixtures stop their
+agents through `bpftool` and refuse to start one without it.
+
+| Suite (`--test`) | Crate, features | Run as | Needs besides root and bpftool | `nn-lab.sh` step |
+|---|---|---|---|---|
+| `privileged_e2e` | agent, `test-privileged,debug-trigger` | plain tests | iptables | `test-e2e`; `test-ignored` (last run) |
+| `fim_privileged_e2e` | agent, `test-privileged,debug-trigger` | plain tests | BPF-LSM, bpffs, no agent holding the pin root | `test-e2e`; `test-ignored` (last run) |
+| `privileged_e2e` (watchdog) | watchdog, `test-privileged` | plain tests | BPF-LSM, bpffs | `test-e2e`; `test-ignored` (own run) |
+| `privileged_map_pin` | agent, `test-privileged` | the restart test `#[ignore]`d (it purges the pin root), its parsers plain | BPF-LSM, bpffs, no agent running | `test-ignored` (first, alone) |
+| `fixture_selftest` | agent; `test-privileged` for the iptables tests | iptables tests `#[ignore]`d; the helper tests plain, in `cargo test --workspace` | iptables, no NorthNarrow daemon running | `test-ignored` (first) |
+| `canary_privileged_e2e` | agent, `test-privileged,debug-trigger` | `#[ignore]` | BPF-LSM, bpffs, iptables | `test-ignored` |
+| `net_privileged_e2e` | agent, `test-privileged,debug-trigger` | `#[ignore]` | BPF-LSM with fexit, bpffs, iptables, python3 | `test-ignored` |
+| `detection_rules_at_scale_privileged_e2e` | agent, `test-privileged,debug-trigger` | `#[ignore]` | BPF-LSM, bpffs, iptables, `cc` (it compiles its helpers) | `test-ignored` |
+| `response_privileged_e2e` | agent, `test-privileged,debug-trigger` | `#[ignore]` | BPF-LSM, bpffs, `cc`, `/tmp` mounted exec | `test-ignored` |
+| `fs_deny_privileged_e2e` | agent, `test-privileged,debug-trigger` | `#[ignore]` | BPF-LSM; it uses the real `/etc/northnarrow`, `detections/` and pin root (units stopped, pins purged) | `test-ignored` |
+| `honeypot_tamper_e2e` | agent, `test-privileged,debug-trigger` | `#[ignore]` | BPF-LSM; a disposable host (an nn-lab guest, or `NN_TEST_DISPOSABLE_HOST=1`), no NorthNarrow daemon running; it rewrites the real bait files and puts them back | `test-ignored` |
+| `exec_sensor_live` | agent, no feature | `#[ignore]` | BPF tracepoints (`CAP_BPF` + `CAP_PERFMON` suffice) | `test-ignored` |
+
+What the fixtures guarantee (external audit Wave 3, lab PR 195): the
+agents run from root-owned copies under `/usr/local/bin`
+(`common::install_to_priv_bin`), never from `target/` under a home
+directory, and are stopped before their tempdirs go; the JSONL logs are
+read strictly (`common::read_jsonl_strict`: a malformed complete line fails
+the test with its file, line number and first 200 bytes; only an
+unterminated last line, a write in progress, is left for later); the
+iptables guard removes every jump to `NORTHNARROW_COMBAT` (v4 and v6),
+reads the tables back and fails the test when anything is left.
 
 `bpf_guard_enforce_refuses_protected_pids_write` (external audit TST-001,
 TST-010) starts the agent with `NN_BPF_DEFENSE_ENFORCE=1` — the BPF guard
@@ -581,10 +618,15 @@ sudo iptables -S NORTHNARROW_COMBAT  # → "No chain by that name"
   POS-013 the stub is compiled only for tests and the `posture-demo`
   feature (the example's `required-features`), so no production build
   contains it.
-- **`--strict-anti-tamper` boot flag**: today missing
-  `combat-rules.v4` or `admin.pub` produces a WARN and the agent
-  continues without isolation; production deployment configs will
-  want the inverse default.
+- **`--strict-anti-tamper` boot flag**: a missing `combat-rules.v4` or
+  `admin.pub` is an ERROR, no longer a WARN, and the agent continues:
+  without isolation and without its admin socket for the first (the
+  ERROR says so), without its admin socket for the second, which also
+  writes a signed `subsystem_degraded` record ("admin socket disabled: …",
+  external audit AUT-004; asserted by
+  `privileged_e2e::agent_without_admin_pub_starts_degraded_and_says_so`).
+  A flag that refuses to start instead, for production deployment
+  configs, is still open.
 - **Small-order Ed25519 signature fixture test** for
   `AdminAuth::verify_unlock` — deferred from commit #4 because
   constructing a known small-order curve point as a test fixture is

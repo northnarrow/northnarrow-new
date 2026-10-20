@@ -61,6 +61,88 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, privileged test assertions (Low TST-013
+  NN-AUD-419, TST-014 NN-AUD-420, TST-015 NN-AUD-421, TST-016 NN-AUD-422,
+  TST-017 NN-AUD-423; lab PR 195). The privileged suites now prove what
+  they claim, and their guards check their own cleanup. TST-016:
+  `exec_sensor_live` passed on any `echo` exec on the host
+  (`comm == "echo"`); its test (renamed
+  `the_canary_exec_is_observed_with_its_pid_parent_and_argv`) wants the
+  record of the canary itself: its pid, this test process as the parent
+  (`real_parent->tgid`, read with this kernel's BTF offsets, lab PR 187)
+  and `northnarrow-canary` in argv, within 3 s, and lists every `echo`
+  it saw when it fails. TST-013: five JSONL readers dropped what did not
+  parse (`filter_map(… .ok())` in the canary, FIM, network and
+  detection-at-scale suites, and `common::jsonl_rows`, which
+  `wait_jsonl_row`, `records_of`, `exec_barrier`, the response and the
+  honeypot suites use), and the FIM suite counted any non-blank line as a
+  row. One reader now, `common::read_jsonl_strict` (`parse_jsonl_strict`
+  for bytes): every newline-terminated line must be one JSON value (an
+  empty line included) or the test fails naming the file, the line number
+  and its first 200 bytes; only an unterminated last line, a write in
+  progress, waits; a file that does not exist yet has no rows. It checks
+  the framing, not the schema: rows of other kinds or other processes are
+  kept for the callers to filter. TST-014: `EniIptablesGuard`'s Drop
+  discarded every status, removed one jump per base chain (a duplicated
+  jump survived and `-X` failed) and never looked at the result, and
+  `is_clean()` called a host where iptables could not run "clean"
+  (nobody called it; deleted). Drop now repeats `-D <base> -j <chain>`
+  while iptables deletes one (at most 16), flushes and deletes the chain,
+  on the v4 table and on the v6 one the agent's COMBAT also writes
+  (BUG-031; v6 only where `ip6tables` is installed), then reads each table
+  back (`iptables -S`; `nft list table` when iptables-nft calls the table
+  "incompatible"; a kernel without the table has nothing in it) and fails
+  the test, naming what is left and how to remove it, when the chain or a
+  jump to it remains or a table cannot be read (only printed when the
+  test is already failing). TST-017: `install_to_priv_bin` existed in six
+  suites, and two ran the agent from `target/` under the user's home:
+  `privileged_map_pin` (with an `--admin-pub` that was never created, so
+  it checked an agent without its admin socket) and `fim_privileged_e2e`.
+  `common::install_to_priv_bin` / `install_bin_at` / `InstalledBin` are
+  shared (through `/usr/bin/sudo` by its absolute path; a failed removal
+  fails the test); map_pin and the FIM suite run the installed copy,
+  map_pin creates `admin.pub` with `nn-admin init`, and the FIM fixture
+  stops its agent before its tempdir goes (`impl Drop`, lab PR 163's
+  lesson; its fields dropped the tempdir first). New
+  `privileged_e2e::agent_without_admin_pub_starts_degraded_and_says_so`:
+  an agent without `admin.pub` logs the ERROR line, opens no socket, runs
+  on, and its audit chain holds a signed `subsystem_degraded` whose detail
+  starts "admin socket disabled" (`at_boot`, `agent-self`) and verifies
+  with `nn-admin audit verify`. TST-015: the runbook said "9 tests
+  passing, 2 ignored" for a suite of ten with none ignored, and named one
+  of twelve privileged suites. `nn-lab.sh test-e2e` now counts each suite
+  (`deploy/lab/lib/suite-count.sh`): the tests `cargo test -- --list`
+  names must equal the passed count of the run's one `test result:` line,
+  with nothing failed, ignored or filtered out (a suite built without its
+  feature lists none and fails); it prints `count ok: …` or `FAIL: …`
+  (collected by the nightly report), runs all three suites and fails the
+  step when any does (standalone it stopped at the first failure; in the
+  nightly the step had only the last suite's status).
+  `NN_LAB_E2E_TEST_ARGS` adds libtest arguments to the runs, not the
+  listing (`--skip e2e_status_no_admin_action_initially` must fail it).
+  The runbook drops its counts, lists every privileged suite (features,
+  how it runs, what it needs, the `nn-lab.sh` step) and its "Future work"
+  no longer says a missing `admin.pub` "produces a WARN". Tests:
+  `fixture_selftest` `a_malformed_line_fails_the_read_naming_its_number_and_bytes`,
+  `a_partial_last_line_is_a_write_in_progress_not_a_row`,
+  `rows_of_any_shape_are_kept_and_an_empty_line_is_not_one`,
+  `a_long_malformed_line_is_shown_cut_at_200_bytes`,
+  `a_missing_file_has_no_rows_and_a_file_is_read_strictly`,
+  `reading_a_file_with_a_malformed_line_panics`,
+  `iptables_listing_leftovers_are_the_chain_and_every_jump_to_it`,
+  `nft_listing_leftovers_are_the_chain_and_every_jump_to_it`
+  (unprivileged, in `cargo test --workspace`); ignored, root and iptables:
+  `iptables::iptables_guard_removes_every_duplicate_jump`,
+  `iptables::iptables_guard_fails_the_test_when_the_chain_stays`;
+  `deploy/lab/lib/suite-count-test.sh` (15 cases, no VM). On the starting
+  tree the new unit tests do not compile (new items); with the old
+  lenient reader put back in `parse_jsonl_strict`, 5 of the 6 reader tests
+  fail (the missing-file one passes on both). The two guard tests fail
+  with the old Drop (the second INPUT jump and the chain survive; no
+  panic), the exec test without the canary's own exec, the new e2e
+  without the `attest_degraded` call. Host: `cargo fmt`, both clippy runs
+  (`--workspace --all-targets`, the agent with
+  `test-privileged,debug-trigger`) clean, 2,504 passed, 0 failed.
 - External audit, Wave 3, install and uninstall scripts (Low DEP-012
   NN-AUD-384, DEP-016 NN-AUD-388, DEP-020 NN-AUD-440; lab PR 194).
   DEP-016: `install.sh` looked the tarball up in `SHA256SUMS` with

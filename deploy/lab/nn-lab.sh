@@ -27,7 +27,7 @@
 #   deploy/lab/nn-lab.sh check         # kernel / lsm / bpffs / iptables / cargo in the guest
 #   deploy/lab/nn-lab.sh sync          # build eBPF on host, rsync repo into the guest
 #   deploy/lab/nn-lab.sh build         # cargo build --release (+test-privileged,debug-trigger) in the guest
-#   deploy/lab/nn-lab.sh test-e2e      # docs/integration-test-runbook.md "Run" (privileged_e2e)
+#   deploy/lab/nn-lab.sh test-e2e      # docs/integration-test-runbook.md "Run": the e2e suites, each count checked
 #   deploy/lab/nn-lab.sh test-ignored  # every #[ignore] test, as root, single-threaded
 #   NN_LAB_DISTRO=debian12 deploy/lab/nn-lab.sh up   # second guest (Debian 12, kernel 6.1); every
 #                                                    # sub-command honours NN_LAB_DISTRO (default ubuntu2404;
@@ -139,6 +139,9 @@ die()  { log "ERROR: $*"; exit 1; }
 # vendor's signed list, and a new guest only layered on a verified image.
 # shellcheck source=deploy/lab/lib/verify-download.sh
 source "$SCRIPT_DIR/lib/verify-download.sh"
+# External audit NN-AUD-421: test-e2e counts each suite (nnsc_*).
+# shellcheck source=deploy/lab/lib/suite-count.sh
+source "$SCRIPT_DIR/lib/suite-count.sh"
 
 need_host_deps() {
     local missing=()
@@ -559,6 +562,24 @@ REMOTE
     fi
 }
 
+# External audit NN-AUD-421 (TST-015): one privileged suite, run and
+# counted. `-- --list` gives the tests the suite has; the run must end with
+# its one "test result: ok. N passed; 0 failed; 0 ignored; …; 0 filtered
+# out" with that N (deploy/lab/lib/suite-count.sh). A test skipped, filtered
+# out, ignored or compiled out fails the suite: the runbook carries no
+# counts to drift. NN_LAB_E2E_TEST_ARGS: extra libtest arguments for the
+# runs, not the listing (`--skip <name>` shows the check catching it).
+lab_e2e_suite() {
+    local label=$1 sel=$2 listf runf listed rc=0
+    listf=$(mktemp) runf=$(mktemp)
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release $sel -- --list" >"$listf" || true
+    listed=$(nnsc_listed "$listf")
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release $sel -- --test-threads=1 --nocapture ${NN_LAB_E2E_TEST_ARGS:-}" | tee "$runf" || rc=1
+    nnsc_verdict "$label" "$listed" "$runf" >&2 || rc=1
+    rm -f "$listf" "$runf"
+    return "$rc"
+}
+
 cmd_test_e2e() {
     vm_running || die "guest is not running"
     # docs/integration-test-runbook.md "Run": root + single-threaded (shared iptables chain).
@@ -577,16 +598,20 @@ cmd_test_e2e() {
     # The anti-tamper hooks outlive the agent on purpose (pinned links) and
     # the e2e fixtures' agents are foreign to a stopped enforce agent's map
     # guard: purge the pin root first, the operator way (see lab_purge_pins).
+    # Every suite runs and the step fails when any of them does (the nightly
+    # used to see only the last suite's status).
     guest_require_bpftool
     lab_purge_pins
-    vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e -- --test-threads=1 --nocapture'
-    # The four FIM e2e tests are plain `#[test]` (not ignored), so neither
+    local rc=0
+    lab_e2e_suite "agent privileged_e2e" "-p northnarrow-agent --features test-privileged,debug-trigger --test privileged_e2e" || rc=1
+    # The FIM e2e tests are plain `#[test]` (not ignored), so neither
     # `test-ignored` nor the privileged_e2e run above covered them — the
     # lab never executed them before 2026-10-10 (review entry 33).
     log "agent privileged_e2e done — running the FIM suite"
-    vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test fim_privileged_e2e -- --test-threads=1 --nocapture'
+    lab_e2e_suite "agent fim_privileged_e2e" "-p northnarrow-agent --features test-privileged,debug-trigger --test fim_privileged_e2e" || rc=1
     log "FIM suite done — running the watchdog suite"
-    vcargo 'sudo -E env "PATH=$PATH" cargo test --release -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1 --nocapture'
+    lab_e2e_suite "watchdog privileged_e2e" "-p northnarrow-watchdog --features test-privileged --test privileged_e2e" || rc=1
+    return "$rc"
 }
 
 cmd_test_ignored() {
@@ -1462,7 +1487,7 @@ cmd_nightly() {
             printf '| %s | %s | %s |\n' "$step" "$st" "${NIGHTLY_SECS[$step]:-0}"
         done
         printf '\n## test results\n\n```\n'
-        grep -hE '^test result|panicked at|FAIL:|respawn-check: OK' "$report_dir"/test-e2e.log "$report_dir"/test-ignored.log "$report_dir"/respawn-check.log 2>/dev/null | cut -c1-160 || true
+        grep -hE '^test result|panicked at|FAIL:|^count ok:|respawn-check: OK' "$report_dir"/test-e2e.log "$report_dir"/test-ignored.log "$report_dir"/respawn-check.log 2>/dev/null | cut -c1-160 || true
         printf '```\n\nLogs: `%s/`\n' "$report_dir"
     } > "$report"
     log "report: $report"
