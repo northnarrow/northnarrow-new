@@ -18,8 +18,8 @@ CI compiles this module (bit-rot guard) but does **not** execute it
   ```
 - Sudo access (CAP_NET_ADMIN is required for the iptables shell-outs;
   CAP_BPF/CAP_PERFMON only if the agent's sensor multiplexer is being
-  exercised in the same run, which `--no-ade` plus the debug-trigger
-  posture path avoids).
+  exercised in the same run, which the debug-trigger posture path
+  avoids).
 - BPF-LSM enabled if you want the Tappa 7 LSM hooks active too:
   ```sh
   cat /sys/kernel/security/lsm | tr ',' '\n' | grep -E '^bpf$'
@@ -456,24 +456,8 @@ FIM rules as a modification of the deleted cron file (review 57: it did,
 and NN-L-FIM-007 killed the writer). SKIP when the number is not reused
 within 2000 files.
 
-### RAG release gates need the real corpus
-
-`rag::bench` holds three `#[ignore]` release gates (golden retrieval
-≥ 90 %, retrieve p95 ≤ 50 ms, end-to-end `RAG_CONTEXT:` shape). They
-index `target/kb/*.jsonl`, the pinned ATT&CK + SigmaHQ dumps produced by:
-
-```sh
-cargo xtask rag-kb            # fetches upstream (network), writes target/kb/
-cargo xtask rag-kb --mirror <dir>   # install-time: from a local mirror
-```
-
-Without the dumps the engine silently indexes only the built-in seed, so
-the gates now **fail fast** with that message instead of reporting a
-meaningless pass rate (the "36.7 %" seen on the first lab nightly was
-exactly this). `nn-lab.sh sync` ships `target/kb` to the guest when the
-host has it, and `test-ignored` skips the gates (and says so) when it
-does not. Reference result on the real corpus: golden 28/30 = 93.3 %,
-retrieve p95 ≈ 1.9 ms, cold open ≈ 0.4 s.
+(The RAG release gates, `rag::bench`, and the `target/kb` corpus they
+needed left with the on-host LLM advisor in Wave 4, lab PR 214.)
 
 ## Build
 
@@ -638,8 +622,7 @@ For ad-hoc validation outside the test harness:
 sudo ./target/release/northnarrow-agent \
   --combat-rules /tmp/nn-test/combat-rules.v4 \
   --admin-pub /tmp/nn-test/admin.pub \
-  --admin-socket /tmp/nn-test/admin.sock \
-  --no-ade
+  --admin-socket /tmp/nn-test/admin.sock
 
 # Terminal 2 — admin:
 # 1. Generate keypair (only once per fresh tempdir).

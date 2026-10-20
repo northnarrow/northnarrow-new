@@ -33,6 +33,10 @@ e ambizione.
 
 ## Milestone 3: Corteccia Cerebrale + Anti-Steganografia
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214
+> (le tre voci sull'LLM qui sotto; resta il rilevamento di steganografia e
+> covert channel).
+
 - Candle nativo Rust per inferenza LLM.
 - LLM quantizzato anti-distillation.
 - Prompting contestuale anti-PromptFlux.

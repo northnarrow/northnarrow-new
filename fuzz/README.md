@@ -5,8 +5,10 @@ attacker can shape: admin socket frames, TLS ClientHello and DNS payloads
 from the kernel ring buffers, the BTF blob, tracefs `format` files, role
 lists from `admin.pub` / the CLI, chain-log lines, the install manifest,
 the COMBAT management carve-out (`combat-allow.cidrs` spliced into
-`combat-rules`), the operator canary templates, the ADE model output and
-its pre-parser, and the watchdog's shutdown marker. The base property is
+`combat-rules`), the operator canary templates and the watchdog's
+shutdown marker. (The `ade_verdict` and `ade_preparse` targets, the LLM
+advisor's output and its pre-parser, left with the advisor in Wave 4, lab
+PR 214.) The base property is
 always **never panic** — reject or report. Each target also asserts what
 its parser promises, so a wrong answer fails as a crash does (external
 audit WDG-R04 to WDG-R08, WDG-014):
@@ -23,13 +25,9 @@ audit WDG-R04 to WDG-R08, WDG-014):
 | `install_manifest` | against a fixed fixture directory every parsed manifest reaches the hash comparison; `Verified` exactly when every name is one of the four install.sh records and its hash matches, an unknown name refused without being opened |
 | `combat_allow` | every generated `iptables-restore` line is exactly `-A NORTHNARROW_COMBAT -s\|-d <validated address> -j ACCEPT`, two per entry of the block's family, none wider than /8 (IPv4) or /48 (IPv6), unspecified or multicast; the splice keeps every line of the operator's base ruleset |
 | `canary_template` | a rendered canary keeps no `{{`, a JSON family's is JSON, the same body renders the same |
-| `ade_verdict` | an accepted verdict meets the schema rules a response relies on (confidence and novelty in [0, 1], below 0.40 only Escalate, Isolate at 0.85 and Critical, Allow ⇔ severity None, Escalate ⇔ tier and package, UUID v4), and parses again from its own JSON, alone and fenced, to the same decision |
-| `ade_preparse` | the kept text is a slice of the output; only an unclosed `<think>` is an error; a balanced object found is found again whole in itself |
 | `shutdown_marker` | a marker honoured against the fixture carries a shutdown the fixture keys signed (the fuzzer cannot sign: anything else is a forgery accepted), names the agent that exited, has at most the signature cap, two signers including the `shutdown` key, a capped grace, and is refused as a replay once honoured |
 
-`ade_verdict` leaves out the re-parse of a JSON that carries `<think>`
-until the pre-parser stops matching the marker inside the object
-(NN-AUD-380, batch 6 of the Wave 3 triage). `install_manifest` and
+`install_manifest` and
 `shutdown_marker` check against fixtures in `agent/src/fuzz_api.rs`
 (three fixture binaries; three admin keys whose private halves are the
 test seeds `[1; 32]`, `[2; 32]`, `[3; 32]`). `install_manifest` and
@@ -47,8 +45,7 @@ at exit — WDG-R09).
   `install_manifest` (WDG-R05: a relative alias of the agent, `/dev/zero`,
   which hung the check), `combat_allow` (NN-AUD-095: wide, unspecified,
   multicast entries), `canary_template` (DEC-017: an unclosed
-  placeholder), `ade_verdict` (LLMP-006: a Kill at confidence 5.0),
-  `dns_records` (NN-AUD-185: a dot inside a label), `shutdown_marker`
+  placeholder), `dns_records` (NN-AUD-185: a dot inside a label), `shutdown_marker`
   (AUT-005: nine signatures; AUT-011, declined on ciborium's recursion
   limit: a payload nested 10,000 deep).
 - `fuzz/corpus/<target>/` — the working corpus, not committed: libFuzzer

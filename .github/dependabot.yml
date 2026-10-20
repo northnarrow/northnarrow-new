@@ -14,11 +14,6 @@ updates:
       # together and CI runs once.
       rust-minor:
         update-types: ["minor", "patch"]
-    # candle/tokenizers major bumps change the ADE model path — keep
-    # them as separate, reviewable PRs.
-    ignore:
-      - dependency-name: "candle-*"
-        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: cargo
     directory: /agent-ebpf

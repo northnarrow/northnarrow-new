@@ -4,21 +4,19 @@
 //! programs (process exec, file open, exec validation, TCP v4/v6
 //! connect, UDP/DNS) via [`SensorMultiplexer`].
 //!
-//! Tappa 6 cascades each event through:
+//! Each event cascades through:
 //!
-//!   sensor → posture.observe → rule_engine
-//!     → (match? execute : ade.evaluate → posture.modulate → execute?)
-//!
-//! ADE is invoked only when the rule engine produces no verdict, so
-//! Tappa 3+5 regression behaviour is preserved exactly: `R001` still
-//! kills `/tmp/nn-test-payload` before ADE ever sees the event.
+//!   sensor → posture.observe → rule_engine → (match? execute)
 //!
 //! Sub-tappa 6.5: every event is also fed to the
 //! [`PostureMachine`](northnarrow_agent::posture::PostureMachine), a
-//! 4-tier defensive posture that persists across events. ADE
-//! verdicts are passed through `posture.modulate_verdict` before
-//! execution so an ambiguous `Allow` in `OBSERVING` becomes an
-//! `Alert` once the posture has lifted to `ALERTED+`.
+//! 4-tier defensive posture that persists across events and drives the
+//! COMBAT ladder.
+//!
+//! Detection is deterministic. The on-host LLM advisor of Tappa 6 (the
+//! ADE, which judged the execs no rule matched) was removed in Wave 4
+//! (lab PR 214); its flags are accepted and ignored with a WARN
+//! ([`northnarrow_agent::removed_settings`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,10 +26,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use common::posture_types::PostureKind;
 use common::Event;
-use northnarrow_agent::ade::backend_candle::ThreadPin;
-use northnarrow_agent::ade::{
-    check_ade_memory, AdeConfig, AdeEngine, AdeMemCheck, EventContext, HostContext,
-};
 use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
@@ -65,10 +59,6 @@ use tracing_subscriber::EnvFilter;
     about = "NorthNarrow XDR agent daemon (Linux)."
 )]
 struct Cli {
-    /// Disable the Active Defense Engine (rule engine only).
-    #[arg(long = "no-ade", default_value_t = false)]
-    no_ade: bool,
-
     /// Detect-only / monitor mode (BUG-033). Detection runs in full and
     /// posture still transitions (OBSERVING→ALERTED→COMBAT is logged for
     /// visibility), but NO enforcement touches the system: every
@@ -155,23 +145,20 @@ struct Cli {
     )]
     dns_sensor: DnsSensor,
 
-    /// Override the GGUF model path used by ADE.
-    #[arg(long = "ade-model", value_name = "PATH")]
-    ade_model: Option<PathBuf>,
-
-    /// Override the ADE inference timeout (seconds).
-    #[arg(long = "ade-timeout", value_name = "SECS")]
-    ade_timeout: Option<u64>,
-
-    /// Override the ADE system prompt path.
-    #[arg(long = "ade-prompt", value_name = "PATH")]
-    ade_prompt: Option<PathBuf>,
-
-    /// Override the rayon worker count candle uses for CPU
-    /// inference. Defaults to `physical_cores - 1` (Sub-tappa 6.8).
-    /// Setting `RAYON_NUM_THREADS` in the environment takes priority.
-    #[arg(long = "ade-threads", value_name = "N")]
-    ade_threads: Option<usize>,
+    /// Removed in Wave 4 (lab PR 214) with the on-host LLM advisor, as
+    /// the four below: accepted so that a unit written for an older agent
+    /// still starts, ignored, and named in a WARN at start
+    /// ([`northnarrow_agent::removed_settings`]).
+    #[arg(long = "no-ade", hide = true)]
+    removed_no_ade: bool,
+    #[arg(long = "ade-model", hide = true, value_name = "PATH")]
+    removed_ade_model: Option<std::ffi::OsString>,
+    #[arg(long = "ade-timeout", hide = true, value_name = "SECS")]
+    removed_ade_timeout: Option<std::ffi::OsString>,
+    #[arg(long = "ade-prompt", hide = true, value_name = "PATH")]
+    removed_ade_prompt: Option<std::ffi::OsString>,
+    #[arg(long = "ade-threads", hide = true, value_name = "N")]
+    removed_ade_threads: Option<std::ffi::OsString>,
 
     /// Path to the iptables ruleset NetworkIsolator applies on
     /// COMBAT entry. Production install: /etc/northnarrow/combat-rules.v4.
@@ -795,55 +782,36 @@ fn main() -> Result<()> {
         }
     }
 
-    // External audit LLMR-009 (NN-AUD-325): candle's worker count is pinned
-    // in RAYON_NUM_THREADS here, while this thread is the process's only
-    // one. The ADE load did it inside `#[tokio::main]`, with the runtime's
-    // workers already running. The runtime is the one `#[tokio::main]`
-    // built: multi-thread, every driver.
-    let ade_threads = pin_ade_threads(&cli);
+    // The runtime is the one `#[tokio::main]` built: multi-thread, every
+    // driver. (External audit LLMR-009 built it by hand to pin the LLM
+    // advisor's worker count first; the advisor was removed in lab PR 214.)
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building the tokio runtime")?
-        .block_on(run(cli, ade_threads))
+        .block_on(run(cli))
 }
 
-/// External audit LLMR-009: the pin, when the ADE may load — not
-/// `--no-ade`, a file at the model path — as the ADE load did it (after
-/// its missing-model check), with the rule of
-/// [`AdeConfig::effective_threads`].
-fn pin_ade_threads(cli: &Cli) -> Option<ThreadPin> {
-    if cli.no_ade {
-        return None;
+impl Cli {
+    /// The flags of the removed LLM advisor this command line sets, in
+    /// the order of [`northnarrow_agent::removed_settings::REMOVED_FLAGS`].
+    fn removed_flags(&self) -> Vec<&'static str> {
+        let set = [
+            self.removed_no_ade,
+            self.removed_ade_model.is_some(),
+            self.removed_ade_timeout.is_some(),
+            self.removed_ade_prompt.is_some(),
+            self.removed_ade_threads.is_some(),
+        ];
+        northnarrow_agent::removed_settings::REMOVED_FLAGS
+            .iter()
+            .zip(set)
+            .filter_map(|(flag, on)| on.then_some(*flag))
+            .collect()
     }
-    let cfg = ade_config(cli);
-    if !cfg.model_path.exists() {
-        return None;
-    }
-    Some(
-        northnarrow_agent::ade::backend_candle::pin_threads_before_runtime(cfg.effective_threads()),
-    )
 }
 
-/// The ADE configuration the command line asks for.
-fn ade_config(cli: &Cli) -> AdeConfig {
-    let mut cfg = AdeConfig::default();
-    if let Some(p) = cli.ade_model.clone() {
-        cfg.model_path = p;
-    }
-    if let Some(p) = cli.ade_prompt.clone() {
-        cfg.system_prompt_path = p;
-    }
-    if let Some(secs) = cli.ade_timeout {
-        cfg.timeout = Duration::from_secs(secs);
-    }
-    if let Some(n) = cli.ade_threads {
-        cfg.num_threads = Some(n);
-    }
-    cfg
-}
-
-async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
+async fn run(cli: Cli) -> Result<()> {
     // Lab finding (external audit EBPF-001 work): when the log stream is
     // gone — journald@northnarrow stopped, at shutdown or by root — the
     // fmt layer reported the failed write with `eprintln!`, which panics
@@ -864,9 +832,12 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
         .init();
 
     info!("NorthNarrow agent starting...");
-    if let Some(pin) = &ade_threads {
-        pin.log();
-    }
+    // Wave 4 (lab PR 214): the settings of the removed LLM advisor that an
+    // older unit or drop-in still passes, each named, none fatal.
+    northnarrow_agent::removed_settings::warn_removed(
+        &cli.removed_flags(),
+        &northnarrow_agent::removed_settings::removed_env_in_process(),
+    );
     // External audit DEP-005 (NN-AUD-381): on a host where the unit's
     // memory cap cannot bind, the unit's OOMScoreAdjust=-500 is raised to 0
     // before anything grows (the self-integrity check expects it there).
@@ -1800,47 +1771,7 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
         "response executor ready (KillProcess + KillProcessTree active)"
     );
 
-    // External audit XAI-001/XAI-009: a RAG canary refused at the ADE load
-    // (corpus missing or altered) is recorded once the audit log is open.
-    let mut rag_refused: Option<String> = None;
-    let ade_engine = if cli.no_ade {
-        info!("ADE disabled by --no-ade");
-        None
-    } else {
-        let cfg = ade_config(&cli);
-        // Beta Step 2b: pre-flight RAM guard. Loading the GGUF peaks
-        // ~7 GB RSS; on a VM without that headroom the load OOM-crashes
-        // the agent. Refuse the load when MemAvailable can't cover the
-        // model size + runtime slack and degrade to detection-only,
-        // mirroring the agent's warn-and-continue for an unusable
-        // bpffs. (Step 2a's cgroup ceiling is the backstop; this keeps
-        // us from ever reaching it on an undersized host.)
-        match check_ade_memory(&cfg.model_path) {
-            AdeMemCheck::Insufficient {
-                available_bytes,
-                required_bytes,
-            } => {
-                warn!(
-                    available_mib = available_bytes / (1024 * 1024),
-                    required_mib = required_bytes / (1024 * 1024),
-                    model = %cfg.model_path.display(),
-                    "insufficient free memory to load the ADE model — running \
-                     detection-only (rule engine). Run on a host with more RAM, \
-                     or pass --no-ade to make this explicit."
-                );
-                None
-            }
-            check => {
-                if let AdeMemCheck::Unknown { reason } = &check {
-                    warn!(%reason, "ADE memory pre-check inconclusive; attempting load anyway");
-                }
-                load_ade_engine(cfg, &mut rag_refused).await
-            }
-        }
-    };
-
     let correlation = CorrelationBuffer::with_default_capacity();
-    let host = HostContext::discover();
 
     // Tappa 7 task 7 / Tappa 8: anti-tamper response pipeline. The
     // NetworkIsolator owns the iptables shell-out; engage runs on
@@ -2619,9 +2550,6 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
     // External audit CMB-028: the capabilities the unit does not grant (see
     // the preflight).
     for detail in &caps_degraded {
-        attest_degraded(audit_log.as_ref(), detail);
-    }
-    if let Some(detail) = &rag_refused {
         attest_degraded(audit_log.as_ref(), detail);
     }
     // External audit EBPF-006: on the `udp_sendmsg` sensor (a kernel
@@ -3837,7 +3765,7 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
 
     // T7.10: the unit is `Type=notify`; tell systemd we are ready now
     // that every subsystem is wired (anti-tamper attached, decision
-    // engine + ADE loaded, drains + admin socket spawned, signal
+    // engine loaded, drains + admin socket spawned, signal
     // handlers installed) and we are about to enter the event loop.
     // Without this, systemd holds the unit `activating` until
     // `TimeoutStartSec` then marks it failed — and the agent's own
@@ -3871,9 +3799,7 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
                     process_event(
                     &engine,
                     &executor,
-                    ade_engine.as_deref(),
                     &correlation,
-                    &host,
                     &posture,
                     &ladder,
                     // Tappa 9.5 K6: detector handle wired in. When
@@ -3901,17 +3827,6 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
                 debug_abort_pump(&sensor, &cli.admin_socket);
                 #[cfg(feature = "debug-trigger")]
                 debug_protected_query(&debug_guard, &cli.admin_socket);
-                // Lab PR 162: on a quiet host no event runs this sweep.
-                if let Some(ade) = ade_engine.as_deref() {
-                    escalate_unsettled_exec_checks(
-                        ade,
-                        &executor,
-                        &posture,
-                        &correlation,
-                        &host,
-                        detection_sink.as_ref(),
-                    );
-                }
                 let dead = sensor.finished_pumps();
                 if !dead.is_empty() {
                     // A blind sensor is not hidden behind a silent restart:
@@ -3959,7 +3874,7 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
             // marker the watchdog will honour, and (c) replied
             // Success to the client BEFORE firing this signal.
             // Breaking the loop runs the existing shutdown
-            // sequence (ADE stats, pid_file removal, admin socket
+            // sequence (pid_file removal, admin socket
             // unlink), then main() returns Ok(()) and the
             // process exits 0.
             //
@@ -4013,21 +3928,6 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
                 "chain heads: not anchored at stop"
             ),
         }
-    }
-    if let Some(ade) = &ade_engine {
-        let snap = ade.stats();
-        info!(
-            total = snap.total_inferences,
-            success = snap.successful_verdicts,
-            malformed = snap.malformed_outputs,
-            timeouts = snap.timeouts,
-            backend_errors = snap.backend_errors,
-            avg_ms = snap.avg_latency_ms,
-            p50_ms = snap.p50_latency_ms,
-            p95_ms = snap.p95_latency_ms,
-            p99_ms = snap.p99_latency_ms,
-            "ADE shutdown stats"
-        );
     }
 
     // Tappa 7 task 6 #2b-verify: remove our PID file on GRACEFUL
@@ -4138,16 +4038,6 @@ fn debug_abort_pump(
     );
 }
 
-/// External audit LLMR-002: at most one ADE evaluation in flight, off the
-/// event loop.
-static ADE_SLOT: std::sync::LazyLock<northnarrow_agent::ade::slot::AdeSlot> =
-    std::sync::LazyLock::new(northnarrow_agent::ade::slot::AdeSlot::new);
-
-/// Lab PR 162: the ADE evaluates an exec's `ProcessSpawn`; its `ExecCheck`
-/// is held back, and goes to the ADE only when no spawn follows.
-static ADE_EXECS: std::sync::LazyLock<northnarrow_agent::ade::exec_pairing::ExecPairing> =
-    std::sync::LazyLock::new(northnarrow_agent::ade::exec_pairing::ExecPairing::new);
-
 /// Categorise + log + evaluate + (maybe) execute.
 ///
 /// Tappa 4 ships five sensors; Tappa 2 rules only match `ProcessSpawn`,
@@ -4155,16 +4045,15 @@ static ADE_EXECS: std::sync::LazyLock<northnarrow_agent::ade::exec_pairing::Exec
 /// engine. The kill syscalls + verify retries can sleep up to 50 ms,
 /// so any execution dispatch goes through `spawn_blocking`.
 ///
-/// Tappa 6: every event also lands in the correlation buffer (so ADE
-/// has recent context), and unmatched events get routed through ADE
-/// when the engine is enabled.
+/// Tappa 6: every event also lands in the correlation buffer, the recent
+/// events the posture triggers read. An event no rule matches gets no
+/// verdict: the LLM advisor that judged such execs was removed in Wave 4
+/// (lab PR 214).
 #[allow(clippy::too_many_arguments)]
 async fn process_event(
     engine: &RuleEngine,
     executor: &Executor,
-    ade: Option<&AdeEngine>,
     correlation: &CorrelationBuffer,
-    host: &HostContext,
     posture: &PostureMachine,
     ladder: &northnarrow_agent::combat::CombatLadder,
     canary_detector: Option<&northnarrow_agent::canary::detector::Detector>,
@@ -4468,7 +4357,7 @@ async fn process_event(
             ..
         } => {
             // Short-circuit: a kernel deny is not something the
-            // rule engine or ADE LLM should re-evaluate. The
+            // rule engine should re-evaluate. The
             // posture trigger above is the response. The attempt itself
             // is persisted as a signed detection (NN-L-AT-001, Log only:
             // the kernel already refused it) — the adversarial check found
@@ -4607,15 +4496,6 @@ async fn process_event(
         }
     }
 
-    // Lab PR 162: a ProcessSpawn settles its exec's held-back ExecCheck,
-    // whatever the rules make of it; then the checks nothing settled
-    // within the grace go to the ADE on their own (the pump check sweeps
-    // them too, for a quiet host).
-    if let Some(ade) = ade {
-        ADE_EXECS.note_spawn(&event, Instant::now());
-        escalate_unsettled_exec_checks(ade, executor, posture, correlation, host, detection_sink);
-    }
-
     if let Some(verdict) = engine.evaluate(&event) {
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the rule's budget for the acting uid.
@@ -4690,240 +4570,6 @@ async fn process_event(
                 );
             }
         }
-        return;
-    }
-
-    let Some(ade) = ade else {
-        return;
-    };
-
-    // Only execs warrant ADE evaluation today; FileOpen / TCP / DNS
-    // volumes are too high to feed the LLM and they don't have an
-    // immediate executor mapping anyway. Lab PR 162: an exec is evaluated
-    // as its ProcessSpawn (the child's comm, argv and file); its ExecCheck,
-    // read first with the parent's comm, used to take the only slot.
-    let Some(event) = ADE_EXECS.admit(event, Instant::now()) else {
-        return;
-    };
-
-    debug!("no rule matched, escalating to ADE");
-    escalate_to_ade(
-        ade,
-        executor,
-        posture,
-        correlation,
-        host,
-        detection_sink,
-        event,
-    );
-}
-
-/// Lab PR 162: the held-back `ExecCheck`s no `ProcessSpawn` settled (an
-/// exec that did not complete, or a lost spawn), each offered to the ADE.
-fn escalate_unsettled_exec_checks(
-    ade: &AdeEngine,
-    executor: &Executor,
-    posture: &PostureMachine,
-    correlation: &CorrelationBuffer,
-    host: &HostContext,
-    detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
-) {
-    for event in ADE_EXECS.take_unsettled(Instant::now()) {
-        debug!(
-            event = ?event,
-            "exec check with no process spawn within the grace — offered to ADE on its own"
-        );
-        escalate_to_ade(
-            ade,
-            executor,
-            posture,
-            correlation,
-            host,
-            detection_sink,
-            event,
-        );
-    }
-}
-
-/// Offer `event` to the ADE's evaluation slot.
-fn escalate_to_ade(
-    ade: &AdeEngine,
-    executor: &Executor,
-    posture: &PostureMachine,
-    correlation: &CorrelationBuffer,
-    host: &HostContext,
-    detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
-    event: Event,
-) {
-    // External audit LLMR-002: the evaluation leaves the event loop, one
-    // at a time (`AdeSlot`). Awaited here, an exec no rule matched held
-    // every sensor for up to the inference timeout.
-    let (ade, executor, posture) = (ade.clone(), executor.clone(), posture.clone());
-    let (correlation, host) = (correlation.clone(), host.clone());
-    let detection_sink = detection_sink.cloned();
-    ADE_SLOT.try_spawn(async move {
-        // External audit XAI-013: the correlated context is selected on the
-        // evaluation's task. The selection sanitizes its candidates (about
-        // 50 µs each), too slow for every exec on the event loop; an exec
-        // skipped while ADE is busy costs nothing. Events pushed after the
-        // focal one are not selected, as when it ran at once.
-        let context = EventContext {
-            recent_events: correlation.get_correlated_default(&event),
-            host_context: host,
-        };
-        evaluate_and_respond(
-            &ade,
-            &executor,
-            &posture,
-            detection_sink.as_ref(),
-            event,
-            context,
-        )
-        .await;
-    });
-}
-
-/// External audit LLMR-002: one ADE evaluation and the response to its
-/// verdict, on its own task (see [`ADE_SLOT`]).
-async fn evaluate_and_respond(
-    ade: &AdeEngine,
-    executor: &Executor,
-    posture: &PostureMachine,
-    detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
-    event: Event,
-    context: EventContext,
-) {
-    info!("ADE inference started");
-    let verdict = match ade.evaluate(&event, &context).await {
-        Ok(v) => v,
-        // External audit LLMR-003: a timeout or a backend error is recorded
-        // as an Escalate (`ade_unavailable`), with no response. It used to
-        // leave only this journal line: an event the model never judged
-        // left no detection.
-        Err(e) => {
-            warn!(?e, "ADE error, recording an Escalate with no response");
-            ade.escalate_for_error(&event, &e)
-        }
-    };
-
-    info!(
-        latency_ms = verdict.metadata.inference_latency_ms,
-        "ADE inference completed"
-    );
-    warn!(
-        action = %verdict.verdict,
-        severity = %verdict.severity,
-        confidence = verdict.confidence,
-        trace_id = %verdict.trace_id,
-        // Wave 3 (lab PR 167): the model's text, written from attacker strings.
-        reasoning = %common::log_escape::Escaped(&verdict.reasoning.step_5_decision),
-        "VERDICT (ADE)"
-    );
-
-    let raw_action = verdict.verdict;
-    let raw_severity = verdict.severity;
-    let verdict = posture.modulate_verdict(verdict);
-    if verdict.verdict != raw_action || verdict.severity != raw_severity {
-        info!(
-            posture = %posture.current_kind(),
-            from_action = %raw_action,
-            from_severity = %raw_severity,
-            to_action = %verdict.verdict,
-            to_severity = %verdict.severity,
-            "verdict modulated by posture"
-        );
-    }
-
-    use northnarrow_agent::ade::advisory::{self, Disposition};
-    let disposition = advisory::disposition(&verdict, advisory::enforce());
-    if disposition == Disposition::Record {
-        info!(action = %verdict.verdict, "ADE verdict logged, no execution needed");
-        // Tappa 9.0.a: persist non-benign ADE verdicts even when no
-        // response runs. `Allow` is benign ⇒ not a detection.
-        if let Some(sink) = detection_sink {
-            if verdict.verdict != common::ade_types::AdeAction::Allow {
-                let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
-                if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
-                    sink.record_ade(
-                        &event,
-                        &verdict,
-                        posture.current_kind(),
-                        "none".to_string(),
-                        suppressed_before,
-                    );
-                }
-            }
-        }
-        return;
-    }
-
-    // Lab PR 134: the ADE is a consultant. A verdict that names a response
-    // is recorded as a recommendation — its reasoning in the detection —
-    // and nothing runs: the model's input is attacker-written strings.
-    // `NN_ADE_ENFORCE=1` (a signed weakening) lets it act.
-    if disposition == Disposition::Recommend {
-        warn!(
-            recommended = %verdict.verdict,
-            trace_id = %verdict.trace_id,
-            "ADE advisory: the model recommends a response — recorded, not executed"
-        );
-        if let Some(sink) = detection_sink {
-            let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
-            if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
-                sink.record_ade(
-                    &event,
-                    &verdict,
-                    posture.current_kind(),
-                    advisory::recommended(&verdict),
-                    suppressed_before,
-                );
-            }
-        }
-        return;
-    }
-
-    let exec = executor.clone();
-    let action = verdict.to_response_action();
-    // External audit CMB-004: the verdict comes back seconds after the
-    // event (the model's evaluation): the kill checks the process against
-    // what the event says (its exec's start, or the event's time), so it
-    // does not reach a process that took the PID meanwhile.
-    let target_pid = match &event {
-        Event::ProcessSpawn { pid, .. } | Event::ExecCheck { pid, .. } => *pid,
-        _ => return,
-    };
-    let (target_start_ns, target_seen_ns) =
-        northnarrow_agent::posture::triggers::event_owner_seen(&event);
-    let report = match tokio::task::spawn_blocking(move || {
-        exec.execute_started(action, target_pid, target_start_ns, target_seen_ns)
-    })
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(error = %e, "executor task join failed");
-            return;
-        }
-    };
-    info!(
-        action = ?report.action,
-        primary = ?report.primary,
-        additional_count = report.additional.len(),
-        elapsed_us = report.elapsed.as_micros() as u64,
-        "EXECUTED (from ADE)"
-    );
-    // Tappa 9.0.a: persist the ADE detection (a response ran ⇒ non-benign).
-    if let Some(sink) = detection_sink {
-        let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
-        if let Admit::Record { suppressed_before } = budget_admit("ADE", uid, &event) {
-            sink.record_ade(
-                &event,
-                &verdict,
-                posture.current_kind(),
-                northnarrow_agent::detection_store::describe_response(&report),
-                suppressed_before,
-            );
-        }
     }
 }
 
@@ -4954,51 +4600,6 @@ fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
         common::netaddr::canonical_ip(family, bytes).to_string()
     } else {
         format!("family={family}")
-    }
-}
-
-/// Construct the single shared [`AdeEngine`], applying the optional
-/// env-driven RAG overlay. Returns `None` (rule-only fallback) if the
-/// model fails to load. A RAG canary that was requested but refused
-/// leaves its reason in `rag_refused`, for the signed audit log.
-///
-/// Sub-tappa 6.8 audit: this is the ONLY `AdeEngine::new` call in the
-/// agent's hot path — model weights, tokenizer, KV state machine and
-/// the rayon pool are loaded ONCE at startup and the resulting handle
-/// is shared into `process_event` via `Arc<AdeEngine>` (cheap to
-/// clone). Any future change that constructs a new engine inside the
-/// event loop would silently re-pay the ~5 GiB GGUF mmap and the
-/// warmup pass, so guard this invariant in review.
-async fn load_ade_engine(
-    cfg: AdeConfig,
-    rag_refused: &mut Option<String>,
-) -> Option<Arc<AdeEngine>> {
-    match AdeEngine::new(cfg).await {
-        Ok(engine) => {
-            info!(
-                backend = engine.backend_name(),
-                model_path = %engine.config().model_path.display(),
-                warmup_latency_ms = engine.warmup_latency_ms(),
-                timeout_s = engine.config().timeout.as_secs(),
-                advisory = !northnarrow_agent::ade::advisory::enforce(),
-                "ADE engine ready"
-            );
-            // Tappa 6.9.7 P5 — env-driven RAG canary (default OFF;
-            // graceful no-RAG fallback). Uses the existing 6.7
-            // `with_rag` seam; logging is inside `open_index_from_env`.
-            // External audit XAI-001/XAI-009: only the pinned corpus opens.
-            let canary = northnarrow_agent::rag::open_index_from_env();
-            *rag_refused = canary.refusal().map(str::to_string);
-            let engine = match canary.into_engine() {
-                Some(rag) => engine.with_rag(Arc::new(rag)),
-                None => engine,
-            };
-            Some(Arc::new(engine))
-        }
-        Err(e) => {
-            warn!(?e, "ADE engine unavailable, fallback to rule-only mode");
-            None
-        }
     }
 }
 
@@ -5862,6 +5463,53 @@ fn btf_check(path: &std::path::Path) -> i32 {
         ResolveOutcome::Refuse(RefuseReason::ParseError(e)) => {
             println!("btf-check {}: UNPARSEABLE — {e}", path.display());
             3
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wave 4 (lab PR 214): a unit written for an agent with the LLM
+    /// advisor still parses — its flags are accepted, ignored and named.
+    #[test]
+    fn the_removed_advisor_flags_still_parse_and_are_named() {
+        let cli = Cli::try_parse_from([
+            "northnarrow-agent",
+            "--no-ade",
+            "--ade-model",
+            "/var/lib/northnarrow/models/m.gguf",
+            "--ade-timeout",
+            "15",
+            "--ade-prompt",
+            "dataset/system_prompt_v1.md",
+            "--ade-threads",
+            "3",
+            "--detect-only",
+        ])
+        .expect("an old unit's command line parses");
+        assert_eq!(
+            cli.removed_flags(),
+            northnarrow_agent::removed_settings::REMOVED_FLAGS
+        );
+        assert!(cli.detect_only, "the other flags keep their meaning");
+
+        let cli = Cli::try_parse_from(["northnarrow-agent", "--ade-timeout", "not-a-number"])
+            .expect("a removed flag's value is not parsed");
+        assert_eq!(cli.removed_flags(), ["--ade-timeout"]);
+
+        let cli = Cli::try_parse_from(["northnarrow-agent"]).unwrap();
+        assert!(cli.removed_flags().is_empty());
+    }
+
+    /// The removed flags are hidden: `--help` no longer offers them.
+    #[test]
+    fn the_removed_advisor_flags_are_not_in_the_help() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        for flag in northnarrow_agent::removed_settings::REMOVED_FLAGS {
+            assert!(!help.contains(flag), "{flag} in:\n{help}");
         }
     }
 }

@@ -3,11 +3,6 @@
 use std::sync::Arc;
 use std::thread;
 
-use common::ade_types::{
-    AdeAction, AdeMetadata, AdeSeverity, AdeVerdict, AlternativeExplanations, Evidence, FollowUp,
-    FollowUpPolicy, MitreAttack, ReasoningSteps, RecommendedAction, ThreatClassification,
-    ADE_SCHEMA_VERSION,
-};
 use common::posture_types::{PostureKind, TriggerType};
 use common::Event;
 
@@ -62,61 +57,6 @@ fn lateral_burst(pid: u32) -> (Event, Vec<Event>) {
         tcp_v4(pid, [10, 0, 0, 2], 22, 2),
     ];
     (tcp_v4(pid, [10, 0, 0, 3], 22, 3), recent)
-}
-
-fn baseline_verdict(action: AdeAction, severity: AdeSeverity) -> AdeVerdict {
-    AdeVerdict {
-        schema_version: ADE_SCHEMA_VERSION.to_string(),
-        trace_id: "00000000-0000-4000-8000-000000000000".to_string(),
-        timestamp_utc: "2026-05-09T08:30:00Z".to_string(),
-        language_used: "en-US".to_string(),
-        verdict: action,
-        severity,
-        confidence: 0.70,
-        threat_classification: ThreatClassification {
-            family: "x".to_string(),
-            kind: "x".to_string(),
-            novelty: 0.5,
-        },
-        reasoning: ReasoningSteps {
-            step_1_extract: "x".to_string(),
-            step_2_pattern_match: "x".to_string(),
-            step_3_criticality: "x".to_string(),
-            step_4_alternative_explanations: AlternativeExplanations {
-                legitimate_uses: vec!["dev".to_string()],
-                assessment: "x".to_string(),
-            },
-            step_5_decision: "x".to_string(),
-        },
-        evidence: Evidence {
-            primary_indicators: vec!["x".to_string()],
-            secondary_indicators: vec![],
-            correlation_window_s: None,
-        },
-        mitre_attack: MitreAttack {
-            tactic: vec!["TA0002".to_string()],
-            technique: vec![],
-        },
-        recommended_action: RecommendedAction {
-            action,
-            justification: "x".to_string(),
-            side_effects: vec![],
-        },
-        follow_up: FollowUp {
-            policy: FollowUpPolicy::None,
-            monitoring_duration_s: None,
-        },
-        escalation_tier: None,
-        escalation_package: None,
-        metadata: AdeMetadata {
-            model_id: "test".to_string(),
-            model_quantization: "Q4_K_M".to_string(),
-            backend: "mock".to_string(),
-            host_id: "host-x".to_string(),
-            agent_version: "0.0.1".to_string(),
-            inference_latency_ms: 0,
-        },
-    }
 }
 
 #[test]
@@ -216,33 +156,6 @@ fn full_recon_to_combat_flow() {
 }
 
 #[test]
-fn modulate_verdict_unchanged_in_observing() {
-    let m = PostureMachine::new();
-    let v = baseline_verdict(AdeAction::Allow, AdeSeverity::None);
-    let out = m.modulate_verdict(v);
-    assert_eq!(out.verdict, AdeAction::Allow);
-    assert_eq!(out.severity, AdeSeverity::None);
-}
-
-#[test]
-fn modulate_verdict_promotes_allow_to_alert_in_alerted() {
-    let m = PostureMachine::new();
-    // Push to ALERTED via recon.
-    let recon_recent = vec![
-        tcp_v4(42, [127, 0, 0, 1], 22, 100),
-        tcp_v4(42, [127, 0, 0, 1], 80, 200),
-    ];
-    let recon_focal = tcp_v4(42, [127, 0, 0, 1], 443, 300);
-    m.observe(&recon_focal, &recon_recent);
-    assert_eq!(m.current_kind(), PostureKind::Alerted);
-
-    let v = baseline_verdict(AdeAction::Allow, AdeSeverity::None);
-    let out = m.modulate_verdict(v);
-    assert_eq!(out.verdict, AdeAction::Alert);
-    assert_eq!(out.severity, AdeSeverity::Low);
-}
-
-#[test]
 fn observe_is_idempotent_when_already_at_target_level() {
     let m = PostureMachine::new();
     // First recon transitions OBSERVING -> ALERTED.
@@ -275,7 +188,7 @@ fn observe_ignores_uncorrelated_events() {
 }
 
 #[test]
-fn concurrent_observe_and_modulate_is_safe() {
+fn concurrent_observe_and_read_is_safe() {
     let m = Arc::new(PostureMachine::new());
     let mut handles = Vec::new();
     for _ in 0..4 {
@@ -294,9 +207,8 @@ fn concurrent_observe_and_modulate_is_safe() {
     for _ in 0..4 {
         let m2 = m.clone();
         handles.push(thread::spawn(move || {
-            let v = baseline_verdict(AdeAction::Allow, AdeSeverity::None);
             for _ in 0..50 {
-                let _ = m2.modulate_verdict(v.clone());
+                let _ = m2.current_kind();
             }
         }));
     }

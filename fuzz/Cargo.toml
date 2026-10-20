@@ -98,21 +98,6 @@ test = false
 doc = false
 bench = false
 
-# External audit WDG-R04 (NN-AUD-370): the ADE model output.
-[[bin]]
-name = "ade_verdict"
-path = "fuzz_targets/ade_verdict.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "ade_preparse"
-path = "fuzz_targets/ade_preparse.rs"
-test = false
-doc = false
-bench = false
-
 # External audit WDG-014 (NN-AUD-363): the watchdog's shutdown marker.
 [[bin]]
 name = "shutdown_marker"
@@ -120,10 +105,3 @@ path = "fuzz_targets/shutdown_marker.rs"
 test = false
 doc = false
 bench = false
-
-# The agent's real dependency graph: the same patched candle-core as the
-# workspace (root Cargo.toml, external audit MAIN-006: no Oniguruma; zip 9
-# for RUSTSEC-2026-0367/0368/0369). Without it the fuzz harness built the
-# crates.io candle-core, with onig and zip 7.
-[patch.crates-io]
-candle-core = { path = "../vendor/candle-core" }

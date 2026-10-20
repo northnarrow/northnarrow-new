@@ -92,7 +92,7 @@ impl Drop for AgentGuard {
 }
 
 /// An enforcing agent with every state file in a per-test tempdir, empty
-/// allow/blocklists, no FIM watch, ADE off.
+/// allow/blocklists, no FIM watch.
 struct Fixture {
     _tempdir: tempfile::TempDir,
     agent_log: PathBuf,
@@ -204,7 +204,6 @@ impl Fixture {
         }
         // Responses enforced: no `--detect-only`.
         let child = cmd
-            .arg("--no-ade")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .spawn()

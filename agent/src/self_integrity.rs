@@ -108,15 +108,10 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     ("NN_DETECT_ONLY", crate::response::config::is_truthy),
     ("NORTHNARROW_DRY_RUN", crate::response::config::is_truthy),
     ("NN_OVERLAY_ALLOW_UNSIGNED", is_one),
-    // External audit: the mock ADE backend answers instead of a model
-    // that failed to load.
-    ("NN_ADE_ALLOW_MOCK", is_one),
-    // Lab PR 134: the ADE is a consultant; this lets a model's verdict —
-    // built from strings an attacker writes — kill, quarantine or block.
-    (
-        crate::ade::advisory::ADE_ENFORCE_ENV,
-        crate::response::config::is_truthy,
-    ),
+    // NN_ADE_ALLOW_MOCK and NN_ADE_ENFORCE (the LLM advisor's mock backend
+    // and its licence to act) left with the advisor in Wave 4, lab PR 214:
+    // nothing reads them, the agent names them in a WARN at start
+    // (`crate::removed_settings`).
     // External audit MAIN-004: the evidence logs' rotation caps; any
     // override changes how much evidence survives.
     (crate::chainlog::FIM_DRIFT_CAP_ENV, any_value),
@@ -961,9 +956,10 @@ fn own_cgroup() -> Option<String> {
 
 /// External audit DEP-005 (NN-AUD-381): does the agent's memory cap bind
 /// on this host? `memory_max` as the cgroup file shows it (bytes, or
-/// `max`). The unit's `MemoryMax=` is an absolute size, sized for the
-/// model (11G); at or above the host's memory (`MemTotal`) the cgroup's
-/// own OOM killer can never fire before the host's does.
+/// `max`). The unit's `MemoryMax=` is an absolute size (11G, sized for the
+/// LLM advisor removed in Wave 4, lab PR 214, and not re-sized yet); at or
+/// above the host's memory (`MemTotal`) the cgroup's own OOM killer can
+/// never fire before the host's does.
 pub fn memory_cap_binds(memory_max: &str, mem_total_bytes: u64) -> bool {
     memory_max
         .trim()
@@ -1843,8 +1839,10 @@ mod tests {
             ("NN_TELEMETRY_PROBE_SECS", "86400", true),
             ("NN_TELEMETRY_PROBE_SECS", "60", false),
             ("NN_TELEMETRY_PROBE_SECS", "30", false),
-            ("NN_ADE_ALLOW_MOCK", "1", true),
-            ("NN_ADE_ALLOW_MOCK", "0", false),
+            // Wave 4 (lab PR 214): the removed advisor's variables weaken
+            // nothing any more
+            ("NN_ADE_ALLOW_MOCK", "1", false),
+            ("NN_ADE_ENFORCE", "1", false),
             // MAIN-004: any rotation-cap override is reported
             ("NN_DETECTIONS_CAP_BYTES", "16384", true),
             ("NN_STATUS_EVENTS_CAP_BYTES", "1", true),

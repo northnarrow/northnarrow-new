@@ -1,5 +1,11 @@
 # NorthNarrow — Visione
 
+> Nota del 20 ottobre 2026 (decisione del founder, Wave 4, lab PR 214): l'LLM
+> non gira più dentro l'agente. La detection on-host è deterministica (regole,
+> correlazione, posture, COMBAT); un assistente AI, se ci sarà, starà fuori dal
+> percorso di enforcement (per esempio sul backend, per l'analista). I paragrafi
+> qui sotto sull'LLM interno descrivono la visione di partenza.
+
 NorthNarrow è un XDR ipercompetitivo e superiore a CrowdStrike, scritto in 
 linguaggio Rust nativo. È una fortezza con un LLM al suo interno che sa 
 quando un file è un virus o legit. Ha una grafica accattivante. È preparato 

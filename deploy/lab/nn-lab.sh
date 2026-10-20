@@ -679,12 +679,9 @@ cmd_sync() {
     log "building eBPF object on host (cargo xtask build-ebpf)"
     (cd "$REPO" && cargo xtask build-ebpf >/dev/null)
     [[ -f "$obj" && -f "$obj.buildhash" ]] || die "eBPF object/stamp missing after build: $obj"
-    # target/kb (cargo xtask rag-kb: pinned ATT&CK + Sigma dumps) rides
-    # along when present so the RAG release gates run against the real
-    # corpus on the guest instead of the built-in seed.
-    local kb_note="no target/kb — RAG gates will be skipped"
-    ls "$REPO"/target/kb/*.jsonl >/dev/null 2>&1 && kb_note="target/kb included"
-    log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object included, $kb_note)"
+    # (target/kb, the LLM advisor's knowledge base, rode along until the
+    # advisor was removed in Wave 4, lab PR 214.)
+    log "rsync $REPO → guest:~/northnarrow (target/ excluded, eBPF object included)"
     # Compare by content and let changed files take the guest's clock. With
     # the host's mtimes preserved, a sync from another checkout or worktree
     # can land sources older than the guest's last build: cargo's mtime
@@ -694,11 +691,7 @@ cmd_sync() {
         --exclude='/fuzz/artifacts/' \
         --exclude='/fuzz/corpus/' \
         --exclude='/fuzz/target/' \
-        --include='/target/' \
-        --include='/target/kb/' \
-        --include='/target/kb/*.jsonl' \
-        --exclude='/target/kb/*' \
-        --exclude='/target/*' \
+        --exclude='/target/' \
         --include='/agent-ebpf/target/' \
         --include='/agent-ebpf/target/bpfel-unknown-none/' \
         --include='/agent-ebpf/target/bpfel-unknown-none/release/' \
@@ -879,18 +872,11 @@ cmd_test_ignored() {
     lab_purge_pins >/dev/null
     # --no-fail-fast: one failing test binary must not skip the other
     # targets (the first run stopped at 11 of 56 ignored tests).
-    # NN_LAB_IGNORED_SKIP: substrings of test names to leave out. The RAG
-    # release gates (golden ≥ 90 %, latency, e2e format) need the real
-    # corpus (`cargo xtask rag-kb` → target/kb, shipped by `sync`); without
-    # it they used to run against the built-in seed and report a bogus
-    # 36.7 % — now they fail fast, so skip them when the corpus is absent
-    # and say why. Set NN_LAB_IGNORED_SKIP="" to force everything.
-    local skip_args="" t default_skip=""
-    if ! ls "$REPO"/target/kb/*.jsonl >/dev/null 2>&1; then
-        default_skip="rag::bench"
-        log "no target/kb on host — skipping the RAG release gates (run: cargo xtask rag-kb)"
-    fi
-    for t in ${NN_LAB_IGNORED_SKIP-$default_skip}; do skip_args+=" --skip $t"; done
+    # NN_LAB_IGNORED_SKIP: substrings of test names to leave out (none by
+    # default; the RAG release gates it skipped without target/kb left with
+    # the LLM advisor in Wave 4, lab PR 214).
+    local skip_args="" t
+    for t in ${NN_LAB_IGNORED_SKIP-}; do skip_args+=" --skip $t"; done
     # The map-pin restart test needs a pin root no earlier test agent has
     # left behind: their pins stay protected, so its own purge is refused.
     # It runs first, alone, then the pins are purged again for the rest.

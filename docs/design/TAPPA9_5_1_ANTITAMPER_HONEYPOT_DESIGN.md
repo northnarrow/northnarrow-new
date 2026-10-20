@@ -224,6 +224,8 @@ note** (where it manifests in this doc / commit plan), **Reversibility**.
 
 ### Q2 — ADE second opinion for NN-L-FIM-024
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 - **Decision:** NO ADE second opinion. Deterministic
   Critical/KillProcessTree on the rule alone.
 - **Rationale:** a honeypot path has **zero** legitimate writers by

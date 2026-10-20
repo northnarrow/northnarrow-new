@@ -113,51 +113,45 @@ RuntimeDirectoryMode=0700
 # it is still removed at shutdown (tmpfs).
 RuntimeDirectoryPreserve=yes
 
-# Resource ceilings (Beta Step 2a — confine an ADE runaway to the
-# agent's own cgroup instead of letting the kernel OOM-killer roam
-# the host and reap sshd / other critical services — "Family A"
-# resource-exhaustion cascade).
+# Resource ceilings (Beta Step 2a — confine a runaway to the agent's own
+# cgroup instead of letting the kernel OOM-killer roam the host and reap
+# sshd / other critical services — "Family A" resource-exhaustion
+# cascade).
 #
 #   MemoryHigh — soft throttle. Above this the cgroup is put under
-#     reclaim pressure (and briefly stalled) but NOT killed. Set to
-#     9G: the in-process ADE (Foundation-Sec-8B Q4_K_M) peaks ~7 GB
-#     RSS during steady-state inference (see docs/ADE_BACKEND_NOTES.md
-#     "Peak RSS 7.0 GB"), so 9G leaves the legitimate model + agent
-#     working set unthrottled while applying back-pressure the moment
-#     usage climbs past it.
+#     reclaim pressure (and briefly stalled) but NOT killed.
 #   MemoryMax — hard ceiling. The cgroup's own OOM-killer fires here,
 #     killing ONLY the agent (the watchdog then respawns it per its
-#     own restart policy). Set to 11G: ~1.5× the legitimate peak for
-#     transient spikes, and on the 15.24 GiB reference host (Hetzner
-#     CCX23) it still leaves ~4 GiB for the OS, sshd and the watchdog
-#     — so a runaway can never starve the host into a cascade.
-#     On a smaller VM the agent's pre-ADE RAM guard (Beta Step 2b)
-#     skips model load entirely and runs detection-only, so this
-#     ceiling is never approached there — and cannot bind there
-#     either: see OOMScoreAdjust below. The sizes stay absolute
-#     (external audit DEP-005): the self-integrity check compares
-#     them with the cgroup files, which it cannot do for a percentage.
+#     own restart policy).
+#   The sizes (9G / 11G) were set for the on-host LLM advisor
+#     (Foundation-Sec-8B Q4_K_M, ~7 GB peak RSS), removed in Wave 4 (lab
+#     PR 214). Without the model the agent needs a small fraction of
+#     that; the values stay until the lab has measured the agent's RSS
+#     without it (a smaller cap is a change of its own: the self-integrity
+#     check and the OOMScoreAdjust rule below depend on it). On a host
+#     whose memory is not above MemoryMax the cap cannot bind: see
+#     OOMScoreAdjust below. The sizes stay absolute (external audit
+#     DEP-005): the self-integrity check compares them with the cgroup
+#     files, which it cannot do for a percentage.
 #   TasksMax — fork/thread-leak backstop. The agent runs a tokio
-#     runtime (a few workers), candle's CPU kernels (≈ physical_cores
-#     threads), plus FIM / net / admin tasks — a few dozen at most.
-#     512 is well above any legitimate count yet caps a runaway.
+#     runtime (a few workers) plus FIM / net / admin tasks — a few dozen
+#     at most. 512 is well above any legitimate count yet caps a runaway.
 #
 # NOTE: deliberately NO CPUQuota. Unlike the watchdog (idle until the
 # agent dies, so capped at 10%), the agent does latency-sensitive
-# detection and CPU-bound ADE inference that wants every available
-# core; throttling CPU would slow verdicts without bounding the OOM
+# detection; throttling CPU would slow verdicts without bounding the OOM
 # vector this block exists to contain. Memory is the cascade risk, so
 # memory is what we cap.
 MemoryHigh=9G
 MemoryMax=11G
 TasksMax=512
 # OOMScoreAdjust — on a host under global memory pressure the kernel kills
-# the process with the largest footprint first, and with the ADE model
-# loaded that is the agent. -500 halves its badness against the rest of
-# the host without making it unkillable (-1000 would turn a leak inside
-# MemoryMax into a memcg livelock). Root can still raise it through
-# /proc/<pid>/oom_score_adj: the self-integrity check reports that as
-# `integrity_drift` (limit_unexpected).
+# the process with the largest footprint first; with the LLM advisor's
+# model loaded (before Wave 4) that was the agent. -500 halves its badness
+# against the rest of the host without making it unkillable (-1000 would
+# turn a leak inside MemoryMax into a memcg livelock). Root can still raise
+# it through /proc/<pid>/oom_score_adj: the self-integrity check reports
+# that as `integrity_drift` (limit_unexpected).
 # External audit DEP-005 (NN-AUD-381): on a host whose memory is not above
 # MemoryMax (11G) the cap cannot bind, and -500 would let a leaking agent
 # outlive sshd and the workload. There the agent raises its own value to 0

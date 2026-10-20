@@ -3,8 +3,10 @@
 //! and the packages declare is the one of `LICENSE`; `NOTICES.md` names the
 //! third-party material the tree holds (every file of `LICENSES/`, every
 //! vendored crate with its licence, the eBPF object's own declaration) and
-//! the model it does not distribute, and quotes the ATT&CK designation
-//! verbatim; `SECURITY.md` has the support period, the reporting channel,
+//! no file the tree no longer holds (the knowledge base's ATT&CK and Sigma
+//! terms, the vendored candle-core and the model of the on-host LLM
+//! advisor left with it in Wave 4, lab PR 214); `SECURITY.md` has the
+//! support period, the reporting channel,
 //! the regulatory reporting procedure and an embargo limit; and
 //! `.well-known/security.txt` follows RFC 9116, names the same channel and
 //! has not expired.
@@ -37,8 +39,15 @@ fn flat(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The entries of the directory `rel`, sorted; none when it does not
+/// exist (since Wave 4 the tree has no `LICENSES/` or `vendor/`: their only
+/// files were the LLM advisor's, removed in lab PR 214).
 fn dir_names(rel: &str) -> Vec<String> {
-    let mut v: Vec<String> = fs::read_dir(repo_root().join(rel))
+    let dir = repo_root().join(rel);
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut v: Vec<String> = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("{rel}: {e}"))
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
@@ -143,18 +152,6 @@ fn licence_declarations_agree_with_the_license_file() {
 fn notices_name_the_third_party_material_the_tree_holds() {
     let notices = read("NOTICES.md");
 
-    // The ATT&CK designation, verbatim from the pinned Terms of Use.
-    let tou = read("LICENSES/MITRE_ATTACK_ToU.md");
-    let designation = tou
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("\"©") && l.ends_with('"'))
-        .expect("MITRE_ATTACK_ToU.md: the quoted designation");
-    assert!(
-        notices.contains(designation),
-        "NOTICES.md does not quote the ATT&CK designation verbatim: {designation}"
-    );
-
     for f in dir_names("LICENSES") {
         assert!(
             notices.contains(&format!("`LICENSES/{f}`")),
@@ -202,38 +199,23 @@ fn notices_name_the_third_party_material_the_tree_holds() {
         "NOTICES.md, Licence declarations: the eBPF object's `{decl}`"
     );
 
-    // The model: not distributed, its licence recorded (SUP-019 narrowed).
-    let model = section(&notices, "Model (not distributed)");
-    let config = read("agent/src/ade/config.rs");
-    let default_model = config
-        .split("DEFAULT_MODEL_PATH: &'static str =")
-        .nth(1)
-        .and_then(|r| r.split('"').nth(1))
-        .and_then(|p| p.rsplit('/').next())
-        .expect("ade/config.rs: DEFAULT_MODEL_PATH");
-    for needle in [
-        default_model,
-        "Foundation-Sec-8B-Reasoning",
-        "huggingface.co/fdtn-ai/",
-        "Llama 3.1 Community License",
-        "Acceptable Use Policy",
-        "Pin:",
-        "What the operator takes on",
-    ] {
-        assert!(model.contains(needle), "NOTICES.md, Model: `{needle}`");
+    // Wave 4 (lab PR 214): every file NOTICES.md names under `LICENSES/` or
+    // `vendor/` is in the tree (the knowledge base's licence texts and the
+    // vendored candle-core left with the LLM advisor).
+    for prefix in ["`LICENSES/", "`vendor/"] {
+        for (at, _) in notices.match_indices(prefix) {
+            let named = notices[at + 1..].split('`').next().unwrap();
+            assert!(
+                repo_root().join(named).exists(),
+                "NOTICES.md names `{named}`, which the tree does not hold"
+            );
+        }
     }
-    assert!(
-        flat(&read("docs/ADE_BACKEND_NOTES.md"))
-            .contains("`NOTICES.md`, \"Model (not distributed)\""),
-        "ADE_BACKEND_NOTES.md points to the model's notice"
-    );
 
-    // LOLBAS: the reason given matches the licence the tree is under.
     assert!(
         !notices.to_lowercase().contains("proprietary"),
         "NOTICES.md: NorthNarrow is distributed under Apache-2.0, not proprietary terms"
     );
-    assert!(notices.contains("LOLBAS is deliberately excluded"));
 }
 
 #[test]

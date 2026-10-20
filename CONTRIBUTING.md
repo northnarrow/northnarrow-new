@@ -105,9 +105,10 @@ fonde.
 
 - 100% Rust. No C/C++ in produzione (vedi VISION_TECHNICAL.md, regola 1).
   La CI fallisce se `onig_sys` o `zstd-sys` entrano nel grafo delle
-  dipendenze dell'agente; `vendor/candle-core` esiste per questo (nota
-  `[patch.crates-io]` in `Cargo.toml`): un aggiornamento di candle va rifatto
-  anche lì.
+  dipendenze dell'agente (vi entravano con tokenizers e tantivy, usciti con
+  il consulente LLM on-host nella Wave 4, lab PR 214).
+- Niente modelli generativi nell'agente: la detection on-host resta
+  deterministica (regole, correlazione, posture, COMBAT).
 - `unsafe` solo dove indispensabile, isolato dietro API safe, motivato
   con un commento.
 - Niente dipendenze gratuite. Ogni nuova crate va giustificata.

@@ -12,9 +12,9 @@
 //! - Each rule has a stable, immutable id (`R<NNN>_Name`). Once an id
 //!   ships it never changes meaning; a deprecated rule keeps the slot
 //!   and is retired in code only.
-//! - The first matching rule wins for now. Tappa 6 will introduce a
-//!   second pass that aggregates across multiple matches and feeds
-//!   ambiguity into the LLM.
+//! - The first matching rule wins. (Tappa 6 fed what no rule matched to an
+//!   on-host LLM advisor; it was removed in Wave 4, lab PR 214, and
+//!   detection stays deterministic.)
 
 use common::{Event, Verdict};
 

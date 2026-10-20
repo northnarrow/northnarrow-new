@@ -182,13 +182,25 @@ fn shipped_rule_ids() -> BTreeMap<String, &'static str> {
     ids
 }
 
+/// The Critical FIM rules design §13 Q1 names. They were read from the
+/// LLM advisor's prompt templates (`ade::fim_template`), which routed the
+/// same rules; the list stayed here when the advisor was removed in Wave 4
+/// (lab PR 214).
+const Q1_CRITICAL_FIM_RULE_IDS: &[&str] = &[
+    "NN-L-FIM-001_SystemBinaryModified",
+    "NN-L-FIM-002_NewSuidBinary",
+    "NN-L-FIM-008_KernelModuleModified",
+    "NN-L-FIM-010_RansomwareExtensionRename",
+    "NN-L-FIM-021_PamModuleModified",
+    "NN-L-FIM-022_LdSoPreloadModified",
+];
+
 /// The rules design §13 Q1 names, from the code: the Critical FIM rules
-/// the ADE routes, and every chain rule ("all CHAIN-*").
+/// ([`Q1_CRITICAL_FIM_RULE_IDS`]) and every chain rule ("all CHAIN-*").
 fn q1_rule_ids() -> BTreeSet<String> {
     let chains = rules::chain::chain_rule_set();
-    crate::ade::fim_template::CRITICAL_FIM_RULE_IDS
+    Q1_CRITICAL_FIM_RULE_IDS
         .iter()
-        .chain(crate::ade::chain_template::CRITICAL_CHAIN_RULE_IDS)
         .map(|s| s.to_string())
         .chain(
             chains

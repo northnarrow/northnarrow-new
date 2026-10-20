@@ -44,10 +44,10 @@ jobs:
           persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
-      # plus the candle/gemm build artefacts have pushed the 14 GB
-      # ubuntu-latest root volume to ENOSPC ("No space left on device"
-      # in the ade-build job, June 2026). The preinstalled toolchains
-      # below are never used by this workspace and free ~25 GB.
+      # plus the build artefacts of the LLM advisor (candle/gemm, removed
+      # in Wave 4) pushed the 14 GB ubuntu-latest root volume to ENOSPC
+      # ("No space left on device", June 2026). The preinstalled
+      # toolchains below are never used by this workspace and free ~25 GB.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -120,10 +120,10 @@ jobs:
           persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
-      # plus the candle/gemm build artefacts have pushed the 14 GB
-      # ubuntu-latest root volume to ENOSPC ("No space left on device"
-      # in the ade-build job, June 2026). The preinstalled toolchains
-      # below are never used by this workspace and free ~25 GB.
+      # plus the build artefacts of the LLM advisor (candle/gemm, removed
+      # in Wave 4) pushed the 14 GB ubuntu-latest root volume to ENOSPC
+      # ("No space left on device", June 2026). The preinstalled
+      # toolchains below are never used by this workspace and free ~25 GB.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -170,112 +170,6 @@ jobs:
       - name: Wire discriminants with debug-trigger
         run: cargo test --locked -p northnarrow-common --features debug-trigger --lib wire::admin_protocol
 
-  ade-build:
-    # Tappa 6 — verifies the ADE module compiles cleanly without
-    # ever pulling a GGUF model or any C++ dependency. The default
-    # `MockBackend` is the only backend on the build path.
-    name: ade-build (ubuntu-latest)
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Free runner disk. The cached `target/` trees (one per job key)
-      # plus the candle/gemm build artefacts have pushed the 14 GB
-      # ubuntu-latest root volume to ENOSPC ("No space left on device"
-      # in the ade-build job, June 2026). The preinstalled toolchains
-      # below are never used by this workspace and free ~25 GB.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h / | tail -1
-
-      - name: Install Rust toolchain
-        # rust-toolchain.toml: the pinned release with rustfmt and clippy
-        # (external audit SUP-015). No argument: rustup reads the file.
-        run: |
-          rustup toolchain install
-          rustup show active-toolchain
-
-      - name: Cache cargo registry and target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ade-build-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ade-build-
-
-      - name: Prune workspace crates from the restored cache
-        run: |
-          .github/scripts/prune-workspace-cache.sh target
-
-      - name: cargo build (ADE module)
-        run: cargo build -p northnarrow-agent --lib --locked --verbose
-
-      - name: cargo clippy (ADE-touched crates)
-        run: cargo clippy -p northnarrow-agent -p northnarrow-common --all-targets --locked -- -D warnings
-
-  ade-unit-test:
-    # Tappa 6 — runs every ADE unit test (parser validation, escalate
-    # transform, prompt builder, mock backend, engine end-to-end with
-    # mocks). NEVER downloads a model and NEVER hits the network.
-    name: ade-unit-test (ubuntu-latest)
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # Free runner disk. The cached `target/` trees (one per job key)
-      # plus the candle/gemm build artefacts have pushed the 14 GB
-      # ubuntu-latest root volume to ENOSPC ("No space left on device"
-      # in the ade-build job, June 2026). The preinstalled toolchains
-      # below are never used by this workspace and free ~25 GB.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          sudo docker image prune --all --force >/dev/null 2>&1 || true
-          df -h / | tail -1
-
-      - name: Install Rust toolchain
-        # rust-toolchain.toml: the pinned release with rustfmt and clippy
-        # (external audit SUP-015). No argument: rustup reads the file.
-        run: |
-          rustup toolchain install
-          rustup show active-toolchain
-
-      - name: Cache cargo registry and target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ade-test-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ade-test-
-
-      - name: Prune workspace crates from the restored cache
-        run: |
-          .github/scripts/prune-workspace-cache.sh target
-
-      - name: cargo test (ADE + correlation + ade_types)
-        run: |
-          cargo test -p northnarrow-agent --lib --locked ade::
-          cargo test -p northnarrow-agent --lib --locked correlation::
-          cargo test -p northnarrow-common --lib --locked ade_types::
-
   ebpf-build:
     name: ebpf-build (ubuntu-latest)
     if: github.event_name != 'schedule'
@@ -287,10 +181,10 @@ jobs:
           persist-credentials: false
 
       # Free runner disk. The cached `target/` trees (one per job key)
-      # plus the candle/gemm build artefacts have pushed the 14 GB
-      # ubuntu-latest root volume to ENOSPC ("No space left on device"
-      # in the ade-build job, June 2026). The preinstalled toolchains
-      # below are never used by this workspace and free ~25 GB.
+      # plus the build artefacts of the LLM advisor (candle/gemm, removed
+      # in Wave 4) pushed the 14 GB ubuntu-latest root volume to ENOSPC
+      # ("No space left on device", June 2026). The preinstalled
+      # toolchains below are never used by this workspace and free ~25 GB.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -528,7 +422,9 @@ jobs:
       # tokenizers' `onig` feature) and zstd (`zstd-sys`, through tantivy's
       # default features) are the C libraries the agent has pulled in or
       # nearly did; neither may be in its normal dependency graph, for any
-      # target or feature. The listing is matched, not `cargo tree -i`'s
+      # target or feature. (tokenizers and tantivy left with the LLM
+      # advisor in Wave 4, lab PR 214; the gate stays for whatever comes
+      # next.) The listing is matched, not `cargo tree -i`'s
       # exit status: that fails both for a crate outside the graph and for
       # any other error, so a gate on it would pass when cargo cannot run.
       - name: "Charter: no onig_sys or zstd-sys in the agent's dependency graph"

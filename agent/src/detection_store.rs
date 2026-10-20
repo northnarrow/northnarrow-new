@@ -1,8 +1,9 @@
 //! Tappa 9.0.a — detection persistence.
 //!
-//! Until now the agent was fire-and-forget on detections: both the rule
-//! path and the ADE path in `main::process_event` computed a verdict,
-//! `warn!`-logged it, ran the executor, and DROPPED the record. The
+//! Until now the agent was fire-and-forget on detections: the rule path
+//! in `main::process_event` (and, until Wave 4, the path of the on-host
+//! LLM advisor) computed a verdict, `warn!`-logged it, ran the executor,
+//! and DROPPED the record. The
 //! local dashboard (Tappa 9) needs detections to PERSIST so a later
 //! sub-step (9.0.b) can expose "the last N detections" over the admin
 //! socket and aggregate them for the pipeline/Sankey view.
@@ -10,15 +11,16 @@
 //! This module is the data layer only. It provides:
 //!
 //! - [`DetectionRecord`] — one serializable detection, joining the
-//!   firing sensor, rule (rule path) / ADE verdict (ADE path), severity,
-//!   MITRE tags, principal, posture-at-detection, the response taken,
-//!   and an `Open`/`Acknowledged`/`Closed` lifecycle status. It REUSES
-//!   the existing [`Severity`](common::model::Severity),
-//!   [`ResponseAction`](common::model::ResponseAction),
-//!   [`AdeAction`](common::ade_types::AdeAction),
-//!   [`MitreAttack`](common::ade_types::MitreAttack) and
+//!   firing sensor, rule, severity, MITRE tags, principal,
+//!   posture-at-detection, the response taken, and an
+//!   `Open`/`Acknowledged`/`Closed` lifecycle status. It REUSES the
+//!   existing [`Severity`](common::model::Severity),
+//!   [`ResponseAction`](common::model::ResponseAction) and
 //!   [`PostureKind`](common::posture_types::PostureKind) types rather
-//!   than redefining them.
+//!   than redefining them. Records written before Wave 4 (lab PR 214) can
+//!   also carry a verdict of the removed LLM advisor
+//!   ([`DetectionPath::Ade`], [`AdvisorAction`]); they still decode and
+//!   chain-verify, and nothing writes them any more.
 //! - [`DetectionSink`] — a cheap, cloneable handle the hot event path
 //!   pushes records into. It NEVER blocks on fsync: a record is stamped
 //!   with a monotonic id, pushed onto a bounded in-memory queue, and a
@@ -38,9 +40,9 @@
 //!   restart.
 //!
 //! OUT OF SCOPE for 9.0.a (later sub-steps): a `Detections` socket read
-//! verb (9.0.b), status-change events (9.0.c), and XAI explanation
-//! wiring — [`DetectionRecord::explanation`] is schema-only (`None`)
-//! here (9.0.e).
+//! verb (9.0.b) and status-change events (9.0.c). The XAI `explanation`
+//! field (9.0.e) was schema-only, never written, and left with the LLM
+//! advisor in Wave 4 (lab PR 214).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -49,9 +51,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use common::ade_types::{AdeAction, AdeSeverity, AdeVerdict, MitreAttack};
 use common::posture_types::PostureKind;
-use common::xai_types::XaiEvidenceChain;
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -155,26 +155,59 @@ impl Sensor {
 
 /// Which decision path produced the detection. `path: Rule` ⇒
 /// `rule_id`/`rule_name` are `Some`; `path: Ade` ⇒ they are `None` and
-/// the verdict carries an [`AdeAction`].
+/// the verdict carries an [`AdvisorAction`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DetectionPath {
     /// A compiled `NN-L-*` / `R0*` rule fired.
     Rule,
-    /// No rule matched; the ADE (LLM) fallback returned a verdict.
+    /// No rule matched and the on-host LLM advisor (ADE) returned a
+    /// verdict. Written before Wave 4 only: the advisor was removed in lab
+    /// PR 214. Kept so that older records still decode and chain-verify.
     Ade,
 }
 
-/// The decision itself, reusing the existing per-path enums verbatim.
-/// Kept as one field (rather than two `Option`s) so a record always has
-/// exactly one verdict; the variant matches [`DetectionRecord::path`].
-/// This is a thin sum over the two existing decision enums, not a new
-/// decision taxonomy.
+/// The decision itself. Kept as one field (rather than two `Option`s) so
+/// a record always has exactly one verdict; the variant matches
+/// [`DetectionRecord::path`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DetectionVerdict {
     /// Rule-engine action ([`ResponseAction`]).
     Rule(ResponseAction),
-    /// ADE recommendation ([`AdeAction`]).
-    Ade(AdeAction),
+    /// The removed advisor's recommendation, in a record written before
+    /// Wave 4 (see [`DetectionPath::Ade`]).
+    Ade(AdvisorAction),
+}
+
+/// The recommendation of the on-host LLM advisor in a record written
+/// before Wave 4 (lab PR 214), when the advisor judged the execs no rule
+/// matched (it was `common::ade_types::AdeAction`). Nothing writes it any
+/// more; it stays so that those records still decode, re-serialise byte
+/// for byte and chain-verify. The variant names are the on-disk form:
+/// never rename one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdvisorAction {
+    Allow,
+    Monitor,
+    Alert,
+    Throttle,
+    Kill,
+    KillTree,
+    Quarantine,
+    BlockNetwork,
+    Isolate,
+    Escalate,
+}
+
+/// The MITRE ATT&CK tags of a detection: tactic and technique ids (the
+/// rule path records none today). It was the LLM advisor's
+/// `common::ade_types::MitreAttack` until Wave 4 (lab PR 214); the fields,
+/// their order and their serialised form are unchanged, so older records
+/// keep verifying.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MitreAttack {
+    pub tactic: Vec<String>,
+    #[serde(default)]
+    pub technique: Vec<String>,
 }
 
 /// Triage lifecycle of a detection. A newly-recorded detection is
@@ -418,7 +451,7 @@ pub struct DetectionRecord {
     pub ts: String,
     pub sensor: Sensor,
     pub path: DetectionPath,
-    /// `Some` on the rule path; `None` on the ADE path.
+    /// `Some` on the rule path; `None` on the (pre-Wave 4) advisor path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -426,7 +459,7 @@ pub struct DetectionRecord {
     pub severity: Severity,
     pub verdict: DetectionVerdict,
     /// `1.0` on the (deterministic) rule path; the model's confidence on
-    /// the ADE path.
+    /// the advisor path of a record written before Wave 4.
     pub confidence: f64,
     pub mitre: MitreAttack,
     pub principal: Principal,
@@ -450,14 +483,13 @@ pub struct DetectionRecord {
     /// when it was not (`"KillProcess (already gone)"`, see
     /// [`describe_response`]), `"suppressed (detect-only)"`, or `"none"`.
     pub response: String,
-    /// Detection sub-type: the rule `category` (rule path) or the ADE
-    /// threat-classification `kind` (ADE path).
+    /// Detection sub-type: the rule `category` (rule path) or, in a record
+    /// written before Wave 4, the advisor's threat-classification `kind`.
     pub detection_type: String,
     pub status: DetectionStatus,
-    /// XAI / Article-13 explanation. Schema-only in 9.0.a (always
-    /// `None`); wired by a later sub-step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub explanation: Option<XaiEvidenceChain>,
+    // `explanation` (an XAI evidence chain, Tappa 9.0.e) stood here: it
+    // was never written (always `None`, so absent from every line) and was
+    // removed with the LLM advisor in Wave 4, lab PR 214.
     /// Detections of the same rule and uid acted on but not recorded
     /// since the previous report, because they exceeded the per-rule
     /// budget ([`crate::detection_budget`], review 75). Absent when none.
@@ -505,56 +537,13 @@ impl DetectionRecord {
             confidence: 1.0,
             // Rule path carries no structured MITRE today (technique ids
             // live only in prose `reasoning`), so this is empty.
-            mitre: MitreAttack {
-                tactic: Vec::new(),
-                technique: Vec::new(),
-            },
+            mitre: MitreAttack::default(),
             principal: Principal::from_event(event),
             exe: exe_from_event(event),
             posture_at: posture,
             response,
             detection_type: verdict.category.clone(),
             status: DetectionStatus::Open,
-            explanation: None,
-            suppressed_before: None,
-            file: file_from_event(event),
-            operation: operation_from_event(event),
-        }
-    }
-
-    /// Build a detection from an ADE-path verdict. Pure (see
-    /// [`Self::from_rule`]).
-    pub fn from_ade(
-        id: u64,
-        ts: String,
-        event: &Event,
-        verdict: &AdeVerdict,
-        posture: PostureKind,
-        response: String,
-    ) -> Self {
-        let detection_type = if verdict.threat_classification.kind.is_empty() {
-            "ade".to_string()
-        } else {
-            verdict.threat_classification.kind.clone()
-        };
-        DetectionRecord {
-            id,
-            ts,
-            sensor: Sensor::from_event(event),
-            path: DetectionPath::Ade,
-            rule_id: None,
-            rule_name: None,
-            severity: severity_from_ade(verdict.severity),
-            verdict: DetectionVerdict::Ade(verdict.verdict),
-            confidence: verdict.confidence,
-            mitre: verdict.mitre_attack.clone(),
-            principal: Principal::from_event(event),
-            exe: exe_from_event(event),
-            posture_at: posture,
-            response,
-            detection_type,
-            status: DetectionStatus::Open,
-            explanation: None,
             suppressed_before: None,
             file: file_from_event(event),
             operation: operation_from_event(event),
@@ -630,20 +619,6 @@ impl crate::chainlog::ChainPayload for DetectionRecord {
 /// v3 pre-images.
 impl crate::chainlog::ChainPayload for StatusEvent {
     const KIND: &'static str = "status_events";
-}
-
-/// Map the ADE severity (which has a `None` rung reserved for `Allow`)
-/// onto the rule [`Severity`] so the record carries one severity enum.
-/// `None` collapses to `Low` (the lowest concrete rung) — by the time a
-/// detection is recorded the verdict is never `Allow`, so `None` is only
-/// a defensive fallback.
-fn severity_from_ade(s: AdeSeverity) -> Severity {
-    match s {
-        AdeSeverity::None | AdeSeverity::Low => Severity::Low,
-        AdeSeverity::Medium => Severity::Medium,
-        AdeSeverity::High => Severity::High,
-        AdeSeverity::Critical => Severity::Critical,
-    }
 }
 
 /// Render the executor's outcome into the record's `response` string.
@@ -919,21 +894,6 @@ impl DetectionSink {
     ) {
         let mut record =
             DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response);
-        record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
-        self.enqueue(record);
-    }
-
-    /// Record an ADE-path detection (off the hot path).
-    pub fn record_ade(
-        &self,
-        event: &Event,
-        verdict: &AdeVerdict,
-        posture: PostureKind,
-        response: String,
-        suppressed_before: u64,
-    ) {
-        let mut record =
-            DetectionRecord::from_ade(self.next_id(), now_ts(), event, verdict, posture, response);
         record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         self.enqueue(record);
     }
@@ -1682,7 +1642,7 @@ mod tests {
 
     /// A round-trip is "stable" iff re-serialising the decoded value
     /// yields byte-identical JSON. (We compare JSON rather than deriving
-    /// `PartialEq`, because the reused `MitreAttack` is not `PartialEq`.)
+    /// `PartialEq`: the chain verifiers compare bytes too.)
     fn assert_roundtrip(record: &DetectionRecord) {
         let json = serde_json::to_string(record).expect("serialize");
         let decoded: DetectionRecord = serde_json::from_str(&json).expect("deserialize");
@@ -1703,11 +1663,11 @@ mod tests {
         assert_roundtrip(&record);
     }
 
+    /// Wave 4 (lab PR 214): a record of the removed LLM advisor, written
+    /// by an older agent, still decodes and re-serialises byte for byte
+    /// (the chain verifiers hash the re-serialised record).
     #[test]
-    fn ade_shaped_record_roundtrips() {
-        // Build the ADE-shaped record directly (constructing a full
-        // AdeVerdict is unnecessary to exercise the record's serde): this
-        // covers DetectionVerdict::Ade + a populated MitreAttack.
+    fn pre_wave4_advisor_record_roundtrips() {
         let record = DetectionRecord {
             id: 9,
             ts: "2026-06-08T12:00:01.000000Z".to_string(),
@@ -1716,7 +1676,7 @@ mod tests {
             rule_id: None,
             rule_name: None,
             severity: Severity::High,
-            verdict: DetectionVerdict::Ade(AdeAction::Kill),
+            verdict: DetectionVerdict::Ade(AdvisorAction::Kill),
             confidence: 0.91,
             mitre: MitreAttack {
                 tactic: vec!["TA0002".to_string()],
@@ -1728,12 +1688,43 @@ mod tests {
             response: "suppressed (detect-only)".to_string(),
             detection_type: "reverse_shell".to_string(),
             status: DetectionStatus::Open,
-            explanation: None,
             suppressed_before: None,
             file: None,
             operation: None,
         };
         assert_roundtrip(&record);
+    }
+
+    /// Wave 4 (lab PR 214): the line an agent with the advisor wrote for
+    /// an advisory verdict (`common::ade_types::{AdeAction, MitreAttack}`
+    /// then) decodes into the kept shapes and re-encodes to the same bytes.
+    #[test]
+    fn pre_wave4_advisor_line_decodes_to_the_same_bytes() {
+        let line = r#"{"id":12,"ts":"2026-10-01T08:00:00.000001Z","sensor":"Exec","path":"Ade","severity":"Medium","verdict":{"Ade":"Escalate"},"confidence":0.35,"mitre":{"tactic":["TA0002"],"technique":[]},"principal":{"pid":4242,"comm":"evil","uid":1000,"ppid":1},"exe":"/tmp/payload","posture_at":"Observing","response":"none","detection_type":"process","status":"Open"}"#;
+        let decoded: DetectionRecord = serde_json::from_str(line).expect("an advisor record");
+        assert_eq!(decoded.path, DetectionPath::Ade);
+        assert!(matches!(
+            decoded.verdict,
+            DetectionVerdict::Ade(AdvisorAction::Escalate)
+        ));
+        assert!(!decoded.acted(), "an advisory record ran nothing");
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), line);
+        // Every recommendation the advisor could write still decodes.
+        for a in [
+            "Allow",
+            "Monitor",
+            "Alert",
+            "Throttle",
+            "Kill",
+            "KillTree",
+            "Quarantine",
+            "BlockNetwork",
+            "Isolate",
+            "Escalate",
+        ] {
+            let v: AdvisorAction = serde_json::from_str(&format!("\"{a}\"")).unwrap();
+            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{a}\""));
+        }
     }
 
     #[test]
@@ -2560,7 +2551,6 @@ mod tests {
             response: "none".to_string(),
             detection_type: "test".to_string(),
             status,
-            explanation: None,
             suppressed_before: None,
             file: None,
             operation: None,

@@ -6,8 +6,9 @@
 //! queries. [`AncestryTree`] (D4) adds the cross-PID lineage on top, so
 //! a precursor on an ancestor correlates with a trigger on a descendant.
 //!
-//! Distinct from `crate::correlation` (the ADE-context ring buffer) —
-//! this module is the deterministic chain-rule correlator.
+//! Distinct from `crate::correlation` (the ring buffer of recent events
+//! the posture reads) — this module is the deterministic chain-rule
+//! correlator.
 
 pub mod ancestry;
 pub mod store;

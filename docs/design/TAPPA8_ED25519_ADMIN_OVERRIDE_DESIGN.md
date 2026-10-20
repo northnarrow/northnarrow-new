@@ -716,6 +716,8 @@ signed chain on the host the same way (lab PR 160).
 
 ### 9.4 Article 13 (EU AI Act) cross-reference
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 The audit log dovetails with the existing Tappa 6.9
 Article-13-evidence chain (`docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md`):
 Tappa 8 admin overrides are the "human-in-the-loop intervention"

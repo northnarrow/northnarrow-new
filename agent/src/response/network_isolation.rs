@@ -2,7 +2,8 @@
 //!
 //! Until CMB-006 this module installed a host-wide isolation of its own: a
 //! pair of nftables chains (`isolation_input` / `isolation_output`, policy
-//! drop) in the agent's table, reachable from an ADE verdict. It had no
+//! drop) in the agent's table, reachable from a verdict of the LLM advisor
+//! (removed in Wave 4, lab PR 214). It had no
 //! management carve-out (and no established-traffic rule on output, so an
 //! operator's open SSH session died too), no release verb and no status
 //! line; nothing re-read its flag at boot. Host-wide isolation is the

@@ -188,6 +188,8 @@ What's missing, precisely: (1) a **unified detection record** joining {sensor, r
 
 ## §5 — ADE verdict + XAI — **MISSING** ⛔
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 - **ADE classification:** `AdeAction` (`ade_types.rs:85-97`: `Allow,Monitor,Alert,Throttle,Kill,KillTree,Quarantine,BlockNetwork,Isolate,Escalate`) + `AdeSeverity` + `ThreatClassification{family,kind,novelty}`. There is **no literal Malicious/Suspicious/Benign enum** — that spectrum maps onto `AdeAction`/`AdeSeverity`.
 - **ADE explanation** (`reasoning: ReasoningSteps` 5-step, `evidence`, `escalation_package`): produced transiently in `AdeEngine::evaluate` (`agent/src/ade/mod.rs:188-363`). In the main loop **only `reasoning.step_5_decision` reaches journald** (`main.rs:2413`); steps 1–4, evidence, mitre_attack, escalation_package are never logged or stored. **Not retrievable by a UI.**
 - **XAI / Article-13 `XaiEvidenceChain`** (`common/src/xai_types.rs:77-136`): a full signed evidence-chain schema (`saliency_map: Vec<SaliencyEntry>`, `baseline_verdict`, `XaiSignature{sig,signer_pubkey}`, FK `ade_trace_id` → `AdeVerdict.trace_id`). **`XaiEngine::explain` (`agent/src/xai/engine.rs:217`) is never called outside tests/examples** — the entire XAI subsystem is **dead at runtime** (module doc: explainer for "future Tappa 10.5 synthesized rules"). **No Article-13 evidence is generated or persisted by the running agent.**

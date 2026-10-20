@@ -222,12 +222,12 @@ So after a crash + restart the host comes back on the network on its own.
 ### A second isolation, before CMB-006
 
 Agents before external audit CMB-006 could also isolate the host outside
-COMBAT: an ADE `Isolate` verdict installed two nftables chains,
+COMBAT: an `Isolate` verdict of the LLM advisor (itself removed in Wave 4)
+installed two nftables chains,
 `isolation_input` and `isolation_output` (policy drop), in the
 `inet northnarrow` table. That isolation had no management carve-out (an
 open SSH session died too), no `unlock` and no `status` line. It no longer
-exists — host-wide isolation is the COMBAT ladder's alone, and an ADE
-`Isolate` verdict kills the process tree it names — and the agent removes
+exists — host-wide isolation is the COMBAT ladder's alone — and the agent removes
 the chains at start (WARN, and a `legacy_isolation_removed` entry in the
 signed audit log). By hand, from the console:
 

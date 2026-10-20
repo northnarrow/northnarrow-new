@@ -115,8 +115,6 @@ fn spawn_agent(tempdir: &Path) -> (AgentGuard, AgentHandles) {
         .arg(&pubkey)
         .arg("--admin-socket")
         .arg(&socket)
-        // ADE is heavy and irrelevant here.
-        .arg("--no-ade")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -668,7 +666,6 @@ fn spawn_agent_b5_with_installs(
         .arg(&paths.audit_log_file)
         .arg("--shutdown-marker-file")
         .arg(&paths.shutdown_marker_file)
-        .arg("--no-ade")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -1505,7 +1502,6 @@ impl GuardFixture {
             .arg(d.join(format!("{name}.shutdown_authorised")))
             .arg("--pid-file")
             .arg(&pid_file)
-            .arg("--no-ade")
             .arg("--detect-only")
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
@@ -1840,7 +1836,6 @@ fn agent_without_admin_pub_starts_degraded_and_says_so() {
         .arg(&audit_log)
         .arg("--shutdown-marker-file")
         .arg(d.join("agent.shutdown_authorised"))
-        .arg("--no-ade")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))

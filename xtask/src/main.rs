@@ -15,7 +15,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 mod btf_check;
-mod rag_kb;
 
 const EBPF_TARGET: &str = "bpfel-unknown-none";
 const EBPF_PACKAGE: &str = "northnarrow-agent-ebpf";
@@ -74,30 +73,8 @@ enum Cmd {
     },
     /// Parse the eBPF ELF object via aya-obj and dump diagnostics.
     InspectEbpf,
-    /// Run the ADE demo: 10 synthetic events through the engine on the
-    /// real backend, dump verdicts + p50/p95/p99 latency with the
-    /// backend's name. Needs the GGUF (`ADE_MODEL`); not hermetic.
-    AdeDemo,
-    /// Tappa 6.9.7 P2: acquire + canonicalise the RAG knowledge base
-    /// (MITRE ATT&CK v18.1 + SigmaHQ Linux rules) from pinned refs,
-    /// emit canonical JSONL dumps, per-source provenance, LICENSES/
-    /// and the knowledge-base block of NOTICES.md. Build-time (fetch) or
-    /// install-time (--mirror).
-    RagKb {
-        /// Install-time mode: read the pinned source artifacts from a
-        /// local customer-controlled mirror dir instead of fetching
-        /// upstream. Same canonicalisation + hashes either way.
-        #[arg(long)]
-        mirror: Option<PathBuf>,
-        /// Output dir for the (gitignored) canonical JSONL dumps.
-        #[arg(long, default_value = "target/kb")]
-        out: PathBuf,
-        /// Accept dumps that differ from the committed anchors in
-        /// docs/kb-sources/ and rewrite them (external audit WDG-011:
-        /// without it such a build writes nothing).
-        #[arg(long)]
-        update_anchors: bool,
-    },
+    // `ade-demo` and `rag-kb` (the LLM advisor's demo and its knowledge
+    // base) were removed with the advisor in Wave 4, lab PR 214.
 }
 
 fn main() -> ExitCode {
@@ -135,41 +112,6 @@ fn run(cli: Cli) -> Result<()> {
             run_agent(release, no_sudo, &args)?;
         }
         Cmd::InspectEbpf => inspect_ebpf()?,
-        Cmd::AdeDemo => ade_demo(locked)?,
-        Cmd::RagKb {
-            mirror,
-            out,
-            update_anchors,
-        } => {
-            let root = repo_root()?;
-            rag_kb::build(&root, mirror.as_deref(), &out, update_anchors)?;
-        }
-    }
-    Ok(())
-}
-
-/// ADE demo (`agent/examples/ade_demo.rs`): ten synthetic events through
-/// `AdeEngine::new`, the real backend, verdicts and stats with the
-/// backend's name. It needs the GGUF (exit 2 without it); the mock only
-/// after a failed load with `NN_ADE_ALLOW_MOCK=1`, and then the figures
-/// measure nothing (external audit WDG-R15). No eBPF, no root.
-fn ade_demo(locked: bool) -> Result<()> {
-    let root = repo_root()?;
-    let mut cmd = Command::new("cargo");
-    cmd.current_dir(&root).args([
-        "run",
-        "--quiet",
-        "--release",
-        "--example",
-        "ade_demo",
-        "--package",
-        "northnarrow-agent",
-    ]);
-    lock_if(&mut cmd, locked);
-    scrub_cargo_env(&mut cmd);
-    let status = cmd.status().with_context(|| "failed to spawn ade-demo")?;
-    if !status.success() {
-        bail!("ade-demo exited with {status}");
     }
     Ok(())
 }

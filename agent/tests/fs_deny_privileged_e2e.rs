@@ -192,7 +192,6 @@ impl Fixture {
             .arg(&nca_v1)
             .arg("--netflow-comm-allowlist-local")
             .arg(&nca_local)
-            .arg("--no-ade")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .spawn()

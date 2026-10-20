@@ -563,6 +563,8 @@ deferred (T10.6 chain set) are excluded from the count, keeping the
 
 ## 8. ADE handoff
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 Reuse the Tappa 6 / Tappa 9 C9 / Tappa 10 N10 pattern: **Critical +
 selected High** rules route to the LLM second-opinion via the
 per-domain `Ade*RateLimiter` (10 individual + 1 batched / min;

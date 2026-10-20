@@ -1579,7 +1579,7 @@ pub const STATUS_PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per §4: two consecutive timeouts in a row promote "stuck"
 /// to "dead" and trigger the recovery path. One timeout could
-/// be a CPU steal spike or runaway ADE inference; two in a row
+/// be a CPU steal spike or a long pause of the agent; two in a row
 /// (60 s gap with the 30 s interval) is strong evidence the
 /// agent's main loop is not making progress.
 pub const STATUS_PING_CONSECUTIVE_TIMEOUT_THRESHOLD: u8 = 2;

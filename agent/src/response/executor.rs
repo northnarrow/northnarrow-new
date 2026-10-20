@@ -329,8 +329,8 @@ impl Executor {
         // alone — engaged from locked COMBAT (kernel evidence), through the
         // management carve-out (`combat-allow.cidrs`), released with the
         // signed unlock, reported by `nn-admin status`. This action
-        // installed a second, separate nftables blackout reachable from an
-        // ADE verdict: no carve-out (an open SSH session died too: no
+        // installed a second, separate nftables blackout reachable from a
+        // verdict of the LLM advisor (removed in Wave 4): no carve-out (an open SSH session died too: no
         // established rule on output), no release verb, no status.
         if action == ResponseAction::FullNetworkIsolation {
             warn!(

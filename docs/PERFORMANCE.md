@@ -1,3 +1,8 @@
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+> The build settings of §1 (`target-cpu=x86-64-v2` by default, `lto = "fat"`,
+> `panic = "abort"`, the `release-bench` profile) still apply to the agent;
+> their candle-specific reasons and every figure below do not.
+
 # ADE Performance — Sub-tappa 6.8
 
 Three tuning knobs ship in Sub-tappa 6.8. Each addresses a distinct
