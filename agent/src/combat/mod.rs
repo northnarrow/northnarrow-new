@@ -68,6 +68,7 @@ use common::Event;
 pub mod actuator;
 pub mod evidence;
 pub mod protected;
+pub mod reconcile;
 
 #[cfg(test)]
 mod tests;

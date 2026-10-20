@@ -381,9 +381,12 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 
 | `kind` | Meaning |
 |---|---|
-| `unit_dropin` | a `.conf` drop-in for one of the two units that `install.sh` did not create (also `system.control`, `service.d`), or its own Debian drop-in with content other than the shipped `deploy/systemd/10-debian-perf-paranoid.conf` |
+| `unit_dropin` | a `.conf` drop-in for one of the two units that `install.sh` did not create, in any directory of systemd's unit search path (`/etc`, `/run` and `/usr/lib/systemd/system`, `system.control`, `transient`, `system.attached`, the generator directories; also `northnarrow-.service.d` and `service.d`), or its own Debian drop-in with content other than the shipped `deploy/systemd/10-debian-perf-paranoid.conf` (lab PR 180) |
 | `limit_changed` | `oom_score_adj`, `memory.max`, `pids.max`, `cpu.max` or `cgroup.freeze` differs from boot |
-| `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view) |
+| `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view), or — laid after the agent started — over a directory above them (a tmpfs over `/var/lib`, a bind over `/etc` or `/usr/local/bin`, a second bpffs on `/sys/fs/bpf`: the detail says what it hides; lab PR 180) |
+| `protected_mount_gone` | a mount those paths resolved through when the agent started is no longer mounted (a lazy unmount of a separate `/var`, of `/sys/fs/bpf`): they now resolve through the mount below (lab PR 180) |
+| `mountinfo_unreadable` | neither `/proc/1/mountinfo` nor the agent's own `/proc/self/mountinfo` can be read: the mount checks above are not running (lab PR 180; with only the first unreadable the agent checks its own namespace) |
+| `combat_reconcile` | at start, a `NORTHNARROW_COMBAT` chain left by a run killed or crashed in COMBAT was torn down (`result` `repaired`, with `rules_torn_down`), or could not be checked or torn down (`failed`: the host may still be isolated, [COMBAT_RECOVERY.md](COMBAT_RECOVERY.md)) (lab PR 180) |
 | `bpffs_mount` | a bpffs outside `/sys/fs/bpf` (WARN: Cilium does this legitimately) |
 | `tracefs_mount` | a mount at `/sys/kernel/tracing` or `/sys/kernel/debug/tracing` that is not a whole tracefs, or any mount below them: the tracepoint sensors take their field offsets from there at the next start (external audit NN-AUD-098) |
 | `config_overlay` | a `*.local` overlay in `/etc/northnarrow`, with size and hash |

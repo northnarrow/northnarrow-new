@@ -464,9 +464,9 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-252 | MAIN-010 | Low | Agent main | S | open |
 | NN-AUD-253 | MAIN-011 | Low | Agent main | — | already fixed (lab PR 115) |
 | NN-AUD-254 | MAIN-012 | Low | Agent main | — | already fixed (lab PR 115) |
-| NN-AUD-255 | MAIN-013 | Low | Agent main | S | open |
+| NN-AUD-255 | MAIN-013 | Low | Agent main | S | fixed (lab PR 180) |
 | NN-AUD-256 | MAIN-014 | Low | Agent main | M | open |
-| NN-AUD-257 | MAIN-015 | Low | Agent main | S | open (narrowed; cap declined) |
+| NN-AUD-257 | MAIN-015 | Low | Agent main | S | fixed (lab PR 180) |
 | NN-AUD-258 | MAIN-016 | Low | Agent main | S | open |
 | NN-AUD-259 | ATP-006 | Low | Anti-tamper | S | fixed (lab PR 176) |
 | NN-AUD-260 | ATP-007 | Low | Anti-tamper | S | open |
@@ -485,8 +485,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-273 | EVD-007 | Low | Evidence logs | M | open |
 | NN-AUD-274 | EVD-008 | Low | Evidence logs | M | partly fixed (audit/canary domains, lab PR 160); open |
 | NN-AUD-275 | EVD-010 | Low | Evidence logs | S | fixed (lab PR 179) |
-| NN-AUD-276 | EVD-011 | Low | Evidence logs | S | open (narrowed) |
-| NN-AUD-277 | EVD-014 | Low | Evidence logs | S | open |
+| NN-AUD-276 | EVD-011 | Low | Evidence logs | S | fixed (lab PR 180) |
+| NN-AUD-277 | EVD-014 | Low | Evidence logs | S | fixed (lab PR 180) |
 | NN-AUD-278 | EVD-015 | Low | Evidence logs | S (+lab) | fixed (lab PR 169) |
 | NN-AUD-279 | EVD-016 | Low | Evidence logs | S (docs) | partly fixed (fail-open fixed, lab PR 148; signing declined); open |
 | NN-AUD-280 | EVD-017 | Low | Evidence logs | S | open (now reachable from a shipped command) |
@@ -6686,3 +6686,121 @@ group, the ones an unprivileged user or a local attacker could use first.
     both clippy runs (`--workspace --all-targets`, the agent with
     `test-privileged,debug-trigger`) clean, 2,313 passed, 0 failed.
   - Lab: Ubuntu 24.04, adminsock179-probe.sh — before: the build of `main` 05b5738; after: this lot on top. With the socket's directory widened to 0711 and the socket to 0666, a uid 65534 process sending nn-admin's STATUS frame got a 153-byte reply three times out of three, no row, before; after it was closed without a reply, with an ERROR and one signed `admin_socket_foreign_peer` naming uid, pid, the self-named comm and `/usr/bin/python3.12` (as installed, 0700/0600, the connect is refused in both). A descriptor root connected and passed to a uid 65534 child is answered in both builds (the declared limit). A dangling link at the socket's name: the bind replaces it in both (lab PR 170); at the stop it was left behind before and is gone after. Twenty concurrent `detections --limit 1000 --status resolved` readers for 40 s over a 1.7 MB file: `status` RTT p50 151 ms, p90 242 ms, max 273 ms, 2,723 ring drops and one `telemetry_gap` before; p50 26 ms, p90 42 ms, max 72 ms, no drop, no gap after (2,674 and 2,543 reads completed); the audit row of a read carries `client_exe` after. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.
+- **Wave 3 — unit and mount tampering, lab PR 180.** Batch 2 of the Wave 3
+  triage of the evidence and admin group: what changes the agent's unit or
+  hides its directories stays visible, and the stale COMBAT chain is
+  signed. Four Low findings, on the integration tree (`main` 78fd0f2 with
+  lab PRs 176–179).
+  - EVD-011 (NN-AUD-276, fixed). Re-checked: `collect_round` passed
+    `DROPIN_ROOTS` (8 directories) to `unit_dropins` and
+    `UNIT_SEARCH_PATH` (13) to `unit_shadows`; systemd reads a unit's
+    `.d/` from every directory of its load path, so a drop-in under
+    `/etc/systemd/system.attached` or `/run/systemd/system.attached` (or a
+    generator directory) changed `ExecStart=`, `Environment=` (lab PR 176's
+    `PATH`), `CapabilityBoundingSet=` at the next `daemon-reload` unseen.
+    Now one list: `DROPIN_ROOTS` is gone, `unit_roots(prefix)` maps
+    `UNIT_SEARCH_PATH` and both checks read it; a directory reached by two
+    spellings (merged `/usr`) is read once. `KNOWN_DROPINS` unchanged: the
+    Debian drop-in passes only at `/etc/systemd/system/…` with its content
+    (the same file under `system.attached` is a finding). Stock hosts keep
+    nothing there for the agent's units (checked on the WSL Ubuntu 24.04
+    host: the generator directory holds drop-ins of other units only).
+  - EVD-014 (NN-AUD-277, fixed, widened). Re-checked: `if let Ok(mi) =
+    read_to_string("/proc/1/mountinfo")` with no else. Now
+    `mount_round(primary, fallback, own_files, &mut MountWatch)`, pure:
+    `/proc/1/mountinfo`, else `/proc/self/mountinfo`, else the state
+    finding `mountinfo_unreadable` (ERROR + signed `integrity_drift` while
+    it lasts, cleared after). The fallback is the agent's own namespace,
+    where `ReadWritePaths=`/`RuntimeDirectory=` bind each directory onto
+    itself: such a bind (a writable path of the shipped unit, its own path
+    as root, the device of the mount below) is not a finding there; any
+    other mount over a protected path still is. Widened as the lot asked
+    ("the mount round must see the mounts that hide the agent's
+    directories"): the check matched mount points at or below
+    `PROTECTED_MOUNT_PREFIXES` only, so a tmpfs over `/var/lib`, a bind
+    over `/etc` or `/usr/local/bin`, a second bpffs on `/sys/fs/bpf` (the
+    canonical root, never reported) hid the state directory, the
+    configuration and the units, the binaries or the pins. `MountWatch`
+    records at the agent's start (in `spawn`, before the first round) the
+    chain of mounts each watched path resolves through (`MOUNT_WATCHED`:
+    the four agent directories, `/sys/kernel/btf`, the two units in `/etc`
+    and `/usr/lib`; plus the binaries), walking `mountinfo` by parent id
+    (the shallowest child on the path, the last listed of one mount point:
+    shadowed and stacked mounts follow the kernel's lookup). A mount on the
+    chain that was not there at the start is `mount_over_protected`
+    ("`<mp>` (`<fstype>`, source root `<root>`) hides `<paths>`: mounted
+    over a directory above them after the agent started"), unless the
+    prefix check reports it already (one finding, not two); a mount of the
+    start chain that is gone is `protected_mount_gone`; a read without a
+    root mount is no baseline (the next good one is). Identity is the
+    mount id with device, root and mount point (a re-used id on another
+    filesystem differs); a remount does not change it. A change of source
+    (host view ↔ own namespace) re-baselines with a WARN. Not judged:
+    mounts above the paths that are already in place when the agent starts
+    (the baseline; the prefix check still reports those on the paths), and
+    a host's own late mount there (a remote `/var/lib`, an automount on
+    `/usr/local`) is reported until the agent restarts with it in place
+    (documented).
+  - MAIN-013 (NN-AUD-255, fixed). Re-checked: `audit_combat_reconcile`
+    opened `/var/lib/northnarrow/combat-audit.jsonl` by its literal path
+    (no anchor, follows links, umask mode, blocks on a FIFO), before the
+    audit log opened, and was the only record of the teardown. Now
+    `combat::reconcile`: the outcome (`StaleChain::TornDown { rules_removed
+    }`, or `Failed` when the probe or the teardown failed with a trusted
+    iptables present) is kept and, once the audit log is open, signed as
+    `integrity_drift` kind `combat_reconcile` (result `repaired` /
+    `failed`, `at_boot`), next to `legacy_isolation_removed`; the jsonl
+    line stays (`append_line(path, …)`: through `anchored::anchor`,
+    `O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK`, anything but a regular file refused,
+    truncated in place on the open fd past 8 MiB). Mode `0600`
+    (`STATE_LOG_FILE_MODE`), not the triage's `0644`: lab PR 169 closed the
+    state logs since; an existing file keeps its mode. Unchanged: the
+    state directory is `chattr +i` by then, so a missing jsonl is still not
+    created (the signed row is the evidence; COMBAT_RECOVERY §4 says so,
+    with the manual cleanup for a `failed` row). The stray doc comment of
+    `write_pid_file` above the old writer is back on its function.
+  - MAIN-015 (NN-AUD-257, fixed; cap declined as triaged). `anchor` logs
+    one ERROR per directory it could not open ("writes to files in this
+    directory are not anchored: a mount over the directory would divert
+    them"); a missing parent (`ENOENT`, nothing to divert yet) stays
+    silent. The module doc says `anchor` is for fixed configuration paths.
+  - Not done: the triage's extension of `tamper-check` C14 to the
+    reconcile log (this lot's probe covers the signed row); FIM-009 does
+    not watch `system.attached` (the integrity round reports the drop-in
+    within ~36 s).
+  - Tests: `self_integrity`
+    `dropins_are_read_from_every_directory_of_the_unit_search_path`
+    (13 roots, the `.attached` and generator ones named, an alias counted
+    once), `the_known_dropin_passes_under_the_full_search_path`,
+    `mount_round_reports_unreadable_mountinfo`,
+    `mount_round_on_the_host_view_is_unchanged`,
+    `mount_round_falls_back_to_the_agents_own_namespace`,
+    `a_mount_over_a_directory_above_the_agents_paths_is_reported` (tmpfs
+    over `/var/lib`, bind over `/etc`, self-bind of `/var/lib`; a login
+    tmpfs, a container overlay and a snap are not drift),
+    `a_bpffs_stacked_on_the_canonical_root_is_reported`,
+    `a_mount_gone_from_under_the_agents_paths_is_reported`,
+    `a_mount_over_the_binaries_directory_is_reported`,
+    `a_mount_on_the_protected_path_is_reported_once`,
+    `an_odd_first_read_is_not_a_baseline`,
+    `mount_chain_follows_stacking_and_skips_shadowed_mounts`,
+    `the_unit_sandbox_is_the_shipped_units_writable_paths`; `anchored`
+    `an_unopenable_parent_is_reported_once` (non-root, a 0000 directory,
+    the ERROR captured), `a_missing_parent_is_not_an_error`;
+    `combat::reconcile` `a_new_log_is_created_closed_and_appended`,
+    `an_existing_log_keeps_its_mode_and_is_truncated_past_the_cap`,
+    `a_link_at_the_log_path_is_refused_not_followed`,
+    `a_fifo_at_the_log_path_is_refused_without_waiting`,
+    `the_signed_entry_names_the_outcome`,
+    `the_outcome_is_signed_into_the_audit_log` (the chain verifies). On
+    the integration tree: `an_unopenable_parent_is_reported_once` fails
+    (0 ERROR lines), and the same drop-in test written against its
+    `DROPIN_ROOTS` fails (the `system.attached` drop-in not found, 0 of 1);
+    the mount tests assert that `mount_findings` — unchanged on these
+    inputs — returns nothing for the stacked bpffs and the tmpfs over
+    `/usr/local/bin`; the other tests call functions new in this lot
+    (`unit_roots`, `mount_round`, `combat::reconcile`) and do not compile
+    there. Host: `cargo fmt`, both clippy runs (`--workspace
+    --all-targets`, the agent with `test-privileged,debug-trigger`) clean,
+    2,372 passed, 0 failed.
+  - Lab: Ubuntu 24.04, unittamper180-probe.sh — before: the build of `main` with lab PRs 176–179; after: this lot on top. A drop-in `Environment=NNX180=1` under `/etc/systemd/system.attached/` and `/run/systemd/system.attached/` (honoured by systemd: `DropInPaths`, the variable in the unit's environment): no row before; after, two signed `unit_dropin` at the next round and again at the restart, `integrity_drift_cleared` once removed. An orphan `NORTHNARROW_COMBAT` chain at start: torn down in both builds; before no signed row, after one `combat_reconcile` (`repaired`, rules removed) — the `combat-audit.jsonl` line is still refused at that point of the boot in both builds (EPERM under the previous run's pinned hooks; a recorded follow-up). A bind mount of `/var/lib` over itself after the start: no row before; after one signed `mount_over_protected` ("hides /var/lib/northnarrow"), cleared at the unmount. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.

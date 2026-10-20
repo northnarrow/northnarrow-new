@@ -1953,6 +1953,9 @@ async fn main() -> Result<()> {
     // Tear it down and audit it. If an attack is still under way the
     // posture machine will re-engage COMBAT within seconds; an operator
     // can also force it via the admin socket.
+    // External audit MAIN-013 (lab PR 180): the outcome is signed once the
+    // audit log is open (below); the unsigned jsonl line stays.
+    let mut stale_combat: Option<northnarrow_agent::combat::reconcile::StaleChain> = None;
     if let Some(iso) = isolator.as_ref() {
         if posture.current_kind() == PostureKind::Observing {
             match iso.reconcile_stale_chain() {
@@ -1963,10 +1966,22 @@ async fn main() -> Result<()> {
                          Re-engage via the admin socket if the threat is still active."
                     );
                     audit_combat_reconcile(outcome.rules_removed);
+                    stale_combat =
+                        Some(northnarrow_agent::combat::reconcile::StaleChain::TornDown {
+                            rules_removed: outcome.rules_removed,
+                        });
                 }
                 Ok(_) => debug!("no stale COMBAT chain at boot (clean)"),
                 Err(e) => {
-                    warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed")
+                    warn!(error = %e, "stale COMBAT chain reconcile failed; manual iptables cleanup may be needed");
+                    // Without a trusted iptables there is nothing to probe
+                    // with (the ERROR above names it): not a failed teardown.
+                    if iso.binaries().is_ok() {
+                        stale_combat =
+                            Some(northnarrow_agent::combat::reconcile::StaleChain::Failed {
+                                error: format!("{e:#}"),
+                            });
+                    }
                 }
             }
         }
@@ -2472,6 +2487,9 @@ async fn main() -> Result<()> {
     );
     if legacy_isolation_removed {
         attest_legacy_isolation_removed(audit_log.as_ref());
+    }
+    if let Some(outcome) = &stale_combat {
+        northnarrow_agent::combat::reconcile::attest(audit_log.as_ref(), outcome);
     }
     if let Some(detail) = &tracepoint_degraded {
         attest_degraded(audit_log.as_ref(), detail);
@@ -5408,54 +5426,20 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
     });
 }
 
-/// Atomically publish the current PID to `path` (Tappa 7 task 6
-/// #2b-verify). A sibling tempfile is written then `rename(2)`d over
-/// the target, so the rename is a same-filesystem atomic swap and a
-/// concurrent reader observes either the old file or the complete new
-/// one — never a truncated or empty file. The tempfile name carries
-/// the PID so two agents misconfigured onto one path cannot corrupt
-/// each other's tempfile mid-write. Every error is contextualised and
-/// propagated (never swallowed) so the caller can make it fatal and a
-/// failing harness can pinpoint which syscall failed.
-/// Best-effort audit record for a Beta Step 4a stale-COMBAT reconcile.
-/// Appends one JSONL line to `/var/lib/northnarrow/combat-audit.jsonl`;
-/// a write failure is logged but never fatal — the teardown it records
-/// has already happened.
+/// Best-effort compatibility record for a Beta Step 4a stale-COMBAT
+/// reconcile: one JSONL line in
+/// [`northnarrow_agent::combat::reconcile::LOG_PATH`]; a write failure is
+/// logged but never fatal — the teardown it records has already happened,
+/// and the signed `integrity_drift` (`combat_reconcile`) is the evidence
+/// (external audit MAIN-013).
 fn audit_combat_reconcile(rules_removed: usize) {
-    use std::io::Write;
-    const PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";
+    use northnarrow_agent::combat::reconcile::{append_line, CAP_BYTES, LOG_PATH};
     // BUG-026 B-cap: combat-audit is the lone UNSIGNED / unchained
-    // best-effort log (the forensic upgrade to a signed chainlog is
-    // tracked as BUG-028). `/var/lib/northnarrow` is `chattr +i`, so a
-    // rename-based rotate is a blocked dir-entry op — cap by
-    // TRUNCATE-IN-PLACE (a content op, allowed under `+i`) when the file
-    // exceeds the cap. A full truncate is acceptable for this rare,
-    // unsigned log; keeping the most-recent rows is a BUG-028 nicety.
-    const CAP_BYTES: u64 = 8 * 1024 * 1024;
-    let line = serde_json::json!({
-        "ts": chrono::Utc::now().to_rfc3339(),
-        "event": "combat_reconcile",
-        "reason": "stale_reconcile",
-        "rules_torn_down": rules_removed,
-    });
-    let over_cap = std::fs::metadata(PATH)
-        .map(|m| m.len() > CAP_BYTES)
-        .unwrap_or(false);
-    let open_res = if over_cap {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(PATH)
-    } else {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(PATH)
-    };
-    let res = open_res.and_then(|mut f| writeln!(f, "{line}"));
-    if let Err(e) = res {
-        warn!(error = %e, path = PATH, "could not write COMBAT reconcile audit line (non-fatal)");
+    // best-effort log (BUG-028). `/var/lib/northnarrow` is `chattr +i`, so
+    // a rename-based rotate is a blocked dir-entry op — capped by
+    // TRUNCATE-IN-PLACE (a content op, allowed under `+i`).
+    if let Err(e) = append_line(std::path::Path::new(LOG_PATH), rules_removed, CAP_BYTES) {
+        warn!(error = %e, path = LOG_PATH, "could not write COMBAT reconcile audit line (non-fatal)");
     }
 }
 
@@ -5491,6 +5475,15 @@ fn record_own_prog_ids(path: Option<&std::path::Path>, ebpf: &aya::Ebpf) {
     }
 }
 
+/// Atomically publish the current PID to `path` (Tappa 7 task 6
+/// #2b-verify). A sibling tempfile is written then `rename(2)`d over
+/// the target, so the rename is a same-filesystem atomic swap and a
+/// concurrent reader observes either the old file or the complete new
+/// one — never a truncated or empty file. The tempfile name carries
+/// the PID so two agents misconfigured onto one path cannot corrupt
+/// each other's tempfile mid-write. Every error is contextualised and
+/// propagated (never swallowed) so the caller can make it fatal and a
+/// failing harness can pinpoint which syscall failed.
 fn write_pid_file(path: &std::path::Path) -> Result<()> {
     let pid = std::process::id();
     if path.file_name().is_none() {

@@ -13,8 +13,16 @@
 //!
 //! A mount that is already in place when the agent starts is anchored too;
 //! the boot integrity check reports it, and the journal keeps the ERROR.
+//!
+//! [`anchor`] is for the agent's fixed configuration paths (the logs named
+//! on its command line: a handful of directories), never for a path a
+//! request names: each directory keeps one fd for the life of the process.
+//! External audit MAIN-015 (NN-AUD-257, lab PR 180): a parent that cannot
+//! be opened (other than one that does not exist) leaves the path
+//! unanchored, and that is an ERROR once per directory — it used to be
+//! silent, with the mount-diversion protection off for that log.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,11 +31,15 @@ use std::sync::{Mutex, OnceLock};
 
 static DIRS: OnceLock<Mutex<HashMap<PathBuf, File>>> = OnceLock::new();
 
+/// Parents already reported as unanchored (one ERROR each).
+static UNANCHORED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
 const PROC_FD: &str = "/proc/self/fd/";
 
 /// `path` resolved through a directory fd held since the first call for
 /// its parent. Relative paths, paths already anchored, and parents that do
-/// not exist (yet) are returned unchanged.
+/// not exist (yet) are returned unchanged; a parent that exists but cannot
+/// be opened is returned unchanged too, with an ERROR the first time.
 pub fn anchor(path: &Path) -> PathBuf {
     if !path.is_absolute() || path.starts_with(PROC_FD) {
         return path.to_path_buf();
@@ -49,11 +61,34 @@ pub fn anchor(path: &Path) -> PathBuf {
             Ok(f) => {
                 map.insert(parent.to_path_buf(), f);
             }
-            Err(_) => return path.to_path_buf(),
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    report_unanchored(parent, &e);
+                }
+                return path.to_path_buf();
+            }
         }
     }
     let fd = map[parent].as_raw_fd();
     PathBuf::from(format!("{PROC_FD}{fd}")).join(name)
+}
+
+/// The ERROR for a parent [`anchor`] could not open, once per directory.
+fn report_unanchored(parent: &Path, e: &std::io::Error) {
+    let set = UNANCHORED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut set = match set.lock() {
+        Ok(s) => s,
+        Err(p) => p.into_inner(),
+    };
+    if !set.insert(parent.to_path_buf()) {
+        return;
+    }
+    tracing::error!(
+        dir = %parent.display(),
+        error = %e,
+        "writes to files in this directory are not anchored: a mount over the directory \
+         would divert them (the directory could not be opened)"
+    );
 }
 
 #[cfg(test)]
@@ -74,6 +109,72 @@ mod tests {
         std::fs::write(&n, "b").unwrap();
         std::fs::rename(&n, anchor(&dir.path().join("new2"))).unwrap();
         assert!(dir.path().join("new2").exists());
+    }
+
+    /// A writer for the ERROR lines of one test.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// External audit MAIN-015: a parent that exists but cannot be opened
+    /// leaves the path unanchored, with one ERROR per directory.
+    #[test]
+    fn an_unopenable_parent_is_reported_once() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root opens a directory at mode 000");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shut = dir.path().join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let p = shut.join("log.jsonl");
+        let out = Captured::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .finish();
+        let (a, b) = tracing::subscriber::with_default(sub, || (anchor(&p), anchor(&p)));
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(a, p, "returned unchanged");
+        assert_eq!(b, p);
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let errors: Vec<&str> = text.lines().filter(|l| l.contains("ERROR")).collect();
+        assert_eq!(errors.len(), 1, "{text}");
+        assert!(errors[0].contains("not anchored"), "{text}");
+        assert!(errors[0].contains(&shut.display().to_string()), "{text}");
+    }
+
+    #[test]
+    fn a_missing_parent_is_not_an_error() {
+        let out = Captured::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .finish();
+        let missing = Path::new("/nonexistent-nn-dir-180/x");
+        let a = tracing::subscriber::with_default(sub, || anchor(missing));
+        assert_eq!(a, missing.to_path_buf());
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("ERROR"), "{text}");
     }
 
     #[test]

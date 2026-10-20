@@ -61,6 +61,56 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, unit and mount tampering (Low MAIN-013
+  NN-AUD-255, MAIN-015 NN-AUD-257, EVD-011 NN-AUD-276, EVD-014 NN-AUD-277;
+  lab PR 180). The self-integrity check looked for the agent's drop-ins in
+  8 of the 13 directories of systemd's unit search path: a `.conf` under
+  `/etc/systemd/system.attached/northnarrow-agent.service.d/` (or
+  `/run/systemd/system.attached`, or a generator directory) changed the
+  unit at the next `daemon-reload` — `ExecStart=`, `Environment=` (lab PR
+  176's `PATH` included), `CapabilityBoundingSet=` — and no round saw it.
+  The drop-ins are now read from the one list the unit copies were already
+  read from, the whole search path (a directory reached by two spellings
+  counts once); the shipped Debian drop-in is still accepted only at its
+  path and with its content. EVD-014: a round that could not read
+  `/proc/1/mountinfo` checked no mount and said nothing; it now reads the
+  agent's own namespace (`/proc/self/mountinfo`, where the unit's own
+  `ReadWritePaths=` binds are not findings), and when neither can be read
+  it records `mountinfo_unreadable` (ERROR, signed `integrity_drift`)
+  while that lasts. The mount check also matched only mount points at or
+  below the protected paths: a tmpfs over `/var/lib`, a bind over `/etc`
+  or `/usr/local/bin`, a second bpffs stacked on `/sys/fs/bpf` hid the
+  state directory, the configuration and the unit files, the binaries or
+  the pins from the operator, `nn-admin` and the agent's next start,
+  unseen. Each watched path's mount chain is now recorded at the agent's
+  start (`mount_round`); a mount laid since over a directory above one is
+  `mount_over_protected` ("… hides …"), and a mount it resolved through
+  that is gone `protected_mount_gone`. MAIN-013: a stale
+  `NORTHNARROW_COMBAT` chain torn down at start was recorded only in the
+  unsigned `combat-audit.jsonl`, opened by its literal path with the
+  default mode; the outcome is now kept until the audit log is open and
+  signed there (`integrity_drift`, kind `combat_reconcile`, result
+  `repaired` with `rules_torn_down`, or `failed` when the chain could not
+  be checked or torn down and the host may still be isolated — not when
+  there is no trusted iptables to check with); the jsonl line stays,
+  written through the anchored state directory, `O_NOFOLLOW`, a FIFO or
+  any other non-regular file refused without waiting, created `0600`.
+  MAIN-015: `anchored::anchor` returned the unanchored path in silence when
+  a parent could not be opened, switching off the mount-diversion
+  protection for that log; that is now an ERROR once per directory (a
+  missing parent stays silent); the cap the audit proposed is declined
+  (every caller anchors a fixed path from the command line, now
+  documented). **Regressions / changes:** drop-ins in the newly read
+  directories are `unit_dropin` findings (stock Ubuntu 22.04/24.04 and
+  Debian 12/13 keep none there for the agent's units); a mount laid over
+  a directory above the agent's paths after its start is reported even
+  when it is the host's own (a late remote `/var/lib`, an automount on
+  `/usr/local`) until the agent restarts with it in place; mounts present
+  at the start are not judged by the new check (the check on the paths
+  themselves still runs at boot); new signed kinds `mountinfo_unreadable`,
+  `protected_mount_gone`, `combat_reconcile`; `combat-audit.jsonl` is
+  created `0600` (an existing file keeps its mode, `install.sh` already
+  closes it).
 - External audit, Wave 3, admin socket peers and request cost (Low
   ASK-005 NN-AUD-236, ASK-012 NN-AUD-238, ASK-013 NN-AUD-239, ASK-014
   NN-AUD-240, EVD-010 NN-AUD-275; lab PR 179). The admin socket's only
