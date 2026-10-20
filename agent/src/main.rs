@@ -585,6 +585,74 @@ struct Cli {
     /// exactly as before, no PID file is touched.
     #[arg(long = "pid-file", value_name = "PATH")]
     pid_file: Option<PathBuf>,
+
+    /// Lab PR 223 (EXPERIMENTAL): exec quarantine at first sight
+    /// (docs/design/EXEC_QUARANTINE.md). `off` (default); `observe`: a new
+    /// executable run from a guarded location (/tmp, /var/tmp, /dev/shm, a
+    /// home directory, a world-writable directory, a memfd, an unlinked
+    /// file) is scanned while it runs and the record says what would have
+    /// been done; `enforce`: the kernel holds it before its first
+    /// instruction until the scanner and the rule engine have judged it. A
+    /// detect-only agent observes.
+    #[arg(
+        long = "exec-quarantine",
+        env = "NN_EXEC_QUARANTINE",
+        value_enum,
+        default_value_t = northnarrow_agent::execq::Mode::Off
+    )]
+    exec_quarantine: northnarrow_agent::execq::Mode,
+
+    /// How long a held process waits for its decision before the default
+    /// policy applies (100–10000 ms).
+    #[arg(
+        long = "exec-quarantine-budget-ms",
+        env = "NN_EXEC_QUARANTINE_BUDGET_MS",
+        value_name = "MS",
+        default_value_t = northnarrow_agent::execq::policy::DEFAULT_BUDGET_MS
+    )]
+    exec_quarantine_budget_ms: u64,
+
+    /// The default policy: what a held process without a verdict within the
+    /// budget (or whose file cannot be scanned) gets. Signed either way.
+    #[arg(
+        long = "exec-quarantine-on-expiry",
+        env = "NN_EXEC_QUARANTINE_ON_EXPIRY",
+        value_enum,
+        default_value_t = northnarrow_agent::execq::Action::Resume
+    )]
+    exec_quarantine_on_expiry: northnarrow_agent::execq::Action,
+
+    /// What a held process the scanner calls suspicious (heuristics, not a
+    /// block-list hit) gets.
+    #[arg(
+        long = "exec-quarantine-on-suspicious",
+        env = "NN_EXEC_QUARANTINE_ON_SUSPICIOUS",
+        value_enum,
+        default_value_t = northnarrow_agent::execq::Action::Resume
+    )]
+    exec_quarantine_on_suspicious: northnarrow_agent::execq::Action,
+
+    /// The scanner binary. Default: `northnarrow-scan` next to the agent,
+    /// else /usr/local/bin/northnarrow-scan.
+    #[arg(long = "exec-quarantine-scanner", value_name = "PATH")]
+    exec_quarantine_scanner: Option<PathBuf>,
+
+    /// The account the scanner runs as (install.sh creates it).
+    #[arg(
+        long = "exec-quarantine-scan-user",
+        value_name = "USER",
+        default_value = northnarrow_agent::execq::DEFAULT_SCAN_USER
+    )]
+    exec_quarantine_scan_user: String,
+
+    /// The signed hash list (`block <sha256> [label]` / `allow <sha256>
+    /// [label]`), stored with `nn-admin config overlay set execq-hashes`.
+    #[arg(
+        long = "execq-hashes-local",
+        value_name = "PATH",
+        default_value = northnarrow_agent::execq::DEFAULT_HASHES_LOCAL
+    )]
+    execq_hashes_local: PathBuf,
 }
 
 impl Cli {
@@ -610,6 +678,32 @@ impl Cli {
             status_events: self.status_events_file.clone(),
             netflow: self.netflow_file.clone(),
             fim_drift: self.fim_drift_file.clone(),
+        }
+    }
+
+    /// Lab PR 223: the guard's configuration for this boot; a detect-only
+    /// agent observes.
+    fn execq_config(&self, detect_only: bool) -> northnarrow_agent::execq::Config {
+        use northnarrow_agent::execq::{policy, Config, Mode, Policy};
+        let mode = match self.exec_quarantine {
+            Mode::Enforce if detect_only => Mode::Observe,
+            m => m,
+        };
+        Config {
+            mode,
+            budget: policy::clamp_budget(self.exec_quarantine_budget_ms),
+            policy: Policy {
+                on_suspicious: self.exec_quarantine_on_suspicious,
+                on_expiry: self.exec_quarantine_on_expiry,
+                enforce: mode == Mode::Enforce,
+            },
+            classes: common::wire::execq::class::ALL,
+            scanner: self.exec_quarantine_scanner.clone().unwrap_or_else(|| {
+                let own = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+                northnarrow_agent::execq::sibling_scanner_exe(own.as_deref())
+            }),
+            scan_user: self.exec_quarantine_scan_user.clone(),
+            hashes_local: self.execq_hashes_local.clone(),
         }
     }
 
@@ -1769,6 +1863,14 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     );
     // Tappa 10.9 step 3: which DNS sensor the multiplexer attaches.
     northnarrow_agent::sensors::dns_sensor::want_skb(cli.dns_sensor == DnsSensor::Skb);
+    // Lab PR 223 (EXPERIMENTAL): the exec quarantine's mode, before the
+    // multiplexer writes it into the kernel (the same detect-only inputs
+    // the executor reads further down: a detect-only agent observes).
+    let execq_cfg = cli.execq_config(
+        cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some(),
+    );
+    let execq_mode = execq_cfg.mode;
+    northnarrow_agent::execq::configure(execq_cfg);
     // External audit DEP-006: the previous boot's program-id list goes before
     // this boot loads anything — its programs are replaced now, and a list
     // that cannot be rewritten must not outlive them (the scripts then fall
@@ -2384,6 +2486,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         );
         northnarrow_agent::response::quarantine::set_runtime_deny(deny);
     }
+    // Lab PR 223: the exec quarantine vaults block-listed files.
+    let execq_exec_cfg = exec_cfg.clone();
     let executor = Executor::with_config(exec_cfg);
     // External audit CMB-019: a kill cgroup an earlier agent left in the
     // middle of a kill (its tree frozen) is finished and removed.
@@ -4194,6 +4298,54 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }
     });
 
+    // Lab PR 223 (EXPERIMENTAL): the exec quarantine's controller and
+    // scanner, once the detection chain and the audit log are open (every
+    // decision is a signed record). Until its first heartbeat the kernel
+    // holds nothing; a guard that cannot start is a signed degradation.
+    let execq_handle = if execq_mode == northnarrow_agent::execq::Mode::Off {
+        None
+    } else {
+        let cfg = northnarrow_agent::execq::config()
+            .cloned()
+            .unwrap_or_default();
+        let (hashes, hashes_source) = match overlay_gate
+            .verified(OverlayKind::ExecqHashes, &cfg.hashes_local)
+        {
+            northnarrow_agent::config::overlay_auth::Verified::Content { path, text } => {
+                match common::execq::parse_hash_list(&text) {
+                    Ok(l) => (l, format!("{} (signed)", path.display())),
+                    Err(e) => {
+                        error!(error = %e, path = %path.display(), "exec quarantine hash list unreadable — empty lists");
+                        (
+                            common::execq::HashList::default(),
+                            format!("{}: {e}", path.display()),
+                        )
+                    }
+                }
+            }
+            _ => (common::execq::HashList::default(), "none".to_string()),
+        };
+        let posture_for_execq = posture.clone();
+        let recorder = northnarrow_agent::execq::record::SinkRecorder {
+            sink: detection_sink.clone(),
+            audit: audit_log.clone(),
+            posture: Box::new(move || posture_for_execq.current_kind()),
+        };
+        match northnarrow_agent::execq::start(northnarrow_agent::execq::StartDeps {
+            hashes,
+            hashes_source,
+            recorder: Box::new(recorder),
+            exec_cfg: execq_exec_cfg,
+        }) {
+            Ok(h) => Some(h),
+            Err(why) => {
+                error!(reason = %why, "exec quarantine NOT running — the kernel holds nothing");
+                attest_degraded(audit_log.as_ref(), &format!("exec quarantine: {why}"));
+                None
+            }
+        }
+    };
+
     // Install the three shutdown signals up front, before the loop.
     // Re-creating the future inside `select!` every iteration (the
     // old `signal::ctrl_c()` shorthand) re-runs handler registration
@@ -4417,6 +4569,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             }
         }
     }
+    // Lab PR 223: nothing stays held by an agent that stops.
+    northnarrow_agent::execq::shutdown(execq_handle);
     // The links go with the agent from here on: the self-check stops
     // reporting them (a spurious signed bpf_link_missing otherwise).
     northnarrow_agent::anti_tamper::bpf_defense::mark_stopping();
@@ -4619,6 +4773,10 @@ async fn process_event(
     // consumer reads it (review 61).
     let mut event = event;
     northnarrow_agent::sensors::exe_identity::resolve(&mut event);
+    // Lab PR 223: the exec quarantine resumes a held process only once
+    // this exec has been judged — dropped at the end of this function,
+    // after a kill the rules decided was carried out.
+    let _execq_judged = northnarrow_agent::execq::SpawnGuard::for_event(&event);
     // FIM-009 self-upgrade (§15.1): lazy TTL expiry on the event path —
     // if a trusted-installer window has passed its deadline, close it
     // (re-engage the FS pin + audit) before handling this event. A cheap

@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 20;
+pub const RING_DROP_SLOTS: u32 = 21;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -53,6 +53,10 @@ pub mod ring_slot {
     /// Lab PR 219: the exploit post-condition guard's ring (an anomaly
     /// record lost; the guard's kill in enforce mode does not depend on it).
     pub const EXPLOIT_GUARD: u32 = 19;
+    /// Lab PR 223 (EXPERIMENTAL): an exec quarantine candidate the
+    /// `EXECQ_EVENTS` ring could not hold. It is not stopped (fail-open)
+    /// and nobody scans it; the guard's own counter says the same.
+    pub const EXECQ: u32 = 20;
 }
 
 /// Human names, indexed by slot.
@@ -77,6 +81,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "io_uring_rate",
     "task_denial_rate",
     "exploit_guard",
+    "execq",
 ];
 
 #[cfg(test)]
@@ -115,7 +120,8 @@ mod tests {
             RING_DROP_NAMES[ring_slot::EXPLOIT_GUARD as usize],
             "exploit_guard"
         );
-        assert_eq!(ring_slot::EXPLOIT_GUARD + 1, RING_DROP_SLOTS);
+        assert_eq!(RING_DROP_NAMES[ring_slot::EXECQ as usize], "execq");
+        assert_eq!(ring_slot::EXECQ + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -144,6 +150,7 @@ mod tests {
             (ring_slot::IOURING_RATE, "io_uring_rate"),
             (ring_slot::TASK_DENIAL_RATE, "task_denial_rate"),
             (ring_slot::EXPLOIT_GUARD, "exploit_guard"),
+            (ring_slot::EXECQ, "execq"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");

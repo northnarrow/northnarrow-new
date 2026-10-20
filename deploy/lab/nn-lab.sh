@@ -49,6 +49,7 @@
 #   deploy/lab/nn-lab.sh overlay-check    # lab PR 189: a watched file on overlayfs is detected or its boot attests it
 #   deploy/lab/nn-lab.sh open-sensor-check # Tappa 10.9 step 1: the file-open sensor on LSM file_open, end to end
 #   deploy/lab/nn-lab.sh exec-sensor-check # Tappa 10.9 step 2: the exec sensor on LSM bprm_check_security (review 61)
+#   deploy/lab/nn-lab.sh execq-check     # lab PR 223 (EXPERIMENTAL): exec quarantine at first sight, six cases, guest put back
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
@@ -762,7 +763,7 @@ cmd_build() {
     # build with symbols ('CARGO_PROFILE_RELEASE_STRIP=none
     # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only'); perf can then name the
     # agent's functions (the release profile strips them).
-    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release $LAB_CARGO_LOCKED --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
+    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release $LAB_CARGO_LOCKED --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog -p northnarrow-scan 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
 # Purge the pin root on the guest the way an operator must now do it (review
@@ -1297,6 +1298,16 @@ cmd_exec_sensor_check() {
     # segments, a script, a memfd behind a symlink. Needs a sync + install.
     vm_running || die "guest is not running"
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/exec-sensor/exec-sensor-check.sh'
+}
+
+cmd_execq_check() {
+    # Lab PR 223 (deploy/lab/execq/execq-check.sh, EXPERIMENTAL): the exec
+    # quarantine on, a lab-only signed block list; a new binary held and
+    # resumed, a block-listed one killed before its first instruction and
+    # quarantined, a UPX-packed one flagged, package binaries never held,
+    # the latency, the scanner stopped and killed. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/execq/execq-check.sh'
 }
 
 cmd_dns_sensor_check() {
@@ -1981,6 +1992,7 @@ case "${1:-help}" in
     overlay-check) cmd_overlay_check ;;
     open-sensor-check) cmd_open_sensor_check ;;
     exec-sensor-check) cmd_exec_sensor_check ;;
+    execq-check) cmd_execq_check ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;

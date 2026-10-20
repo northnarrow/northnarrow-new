@@ -184,6 +184,10 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // signature. MUTATE-only like the other overlays.
     "cow-guard.local",
     "cow-guard.local.sig",
+    // Lab PR 223 (EXPERIMENTAL): the exec quarantine's signed hash list
+    // and its signature. MUTATE-only like the other overlays.
+    "execq-hashes.local",
+    "execq-hashes.local.sig",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -376,6 +380,10 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     // exist, a drop-in made with it is reported by the integrity check.
     "/etc/systemd/system/northnarrow-agent.service.d",
     "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
+    // Lab PR 223 (EXPERIMENTAL): the exec quarantine's scanner, in both
+    // layouts — a replaced scanner would call every file clean.
+    "/usr/local/bin/northnarrow-scan",
+    "/usr/bin/northnarrow-scan",
 ];
 
 /// Permission bits applied at create time and re-asserted on every
@@ -2502,6 +2510,8 @@ mod tests {
                 "chain_heads.json",
                 "cow-guard.local",
                 "cow-guard.local.sig",
+                "execq-hashes.local",
+                "execq-hashes.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"
@@ -2952,6 +2962,8 @@ mod tests {
                 "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
                 "/etc/systemd/system/northnarrow-agent.service.d",
                 "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
+                "/usr/local/bin/northnarrow-scan",
+                "/usr/bin/northnarrow-scan",
             ],
             "the agent + watchdog binaries and their systemd units (the \
              watchdog's failure handler included) are the anti-tamper \

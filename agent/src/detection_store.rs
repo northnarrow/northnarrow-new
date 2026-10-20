@@ -530,6 +530,41 @@ pub struct DetectionRecord {
     /// [`Self::file`], so those lines keep their bytes and still verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mitre_version: Option<String>,
+    /// Lab PR 223 (EXPERIMENTAL): the exec quarantine's evidence on its
+    /// own records (`NN-L-EXECQ-001`) — the scan verdict and its reasons,
+    /// the digest, the decision and how long the process was held. Absent
+    /// on every other record (absent-on-`None`, like [`Self::file`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execq: Option<ExecqEvidence>,
+}
+
+/// Lab PR 223: what the exec quarantine found and decided
+/// ([`DetectionRecord::execq`]). Frozen like the record: fields are only
+/// ever appended as `Option`s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecqEvidence {
+    /// `clean`, `trusted`, `suspicious`, `malicious`, `unscanned`, or
+    /// `none` (no verdict: the decision was the default policy's).
+    pub verdict: String,
+    /// SHA-256 of the file, when it was scanned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// `elf64-x86_64-dyn`, `script:/bin/sh`…
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// The scanner's reasons, `code (+weight): detail`, and the
+    /// controller's notes.
+    pub reasons: Vec<String>,
+    /// `resume`, `kill`, or `would resume` / `would kill` in observe mode.
+    pub decision: String,
+    /// Why (`scanned clean`, `decision budget expired (…)`).
+    pub basis: String,
+    /// The guarded classes the file was executed from.
+    pub classes: Vec<String>,
+    /// The kernel held the process.
+    pub held: bool,
+    /// From the kernel's report to the decision (ms).
+    pub held_ms: u64,
 }
 
 impl DetectionRecord {
@@ -567,6 +602,7 @@ impl DetectionRecord {
             file: file_from_event(event),
             operation: operation_from_event(event),
             mitre_version: None,
+            execq: None,
         }
     }
 
@@ -931,6 +967,29 @@ impl DetectionSink {
         let mut record =
             DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
                 .with_attack(attack);
+        record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
+        self.enqueue(record);
+    }
+
+    /// Lab PR 223: record an exec quarantine decision — a rule-path record
+    /// of `verdict`, with its ATT&CK references (lab PR 221: typed, their
+    /// ids in `mitre` and the version in `mitre_version`) and the guard's
+    /// `evidence`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_execq(
+        &self,
+        event: &Event,
+        verdict: &Verdict,
+        posture: PostureKind,
+        response: String,
+        attack: &[AttackRef],
+        evidence: ExecqEvidence,
+        suppressed_before: u64,
+    ) {
+        let mut record =
+            DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
+                .with_attack(attack);
+        record.execq = Some(evidence);
         record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         self.enqueue(record);
     }
@@ -1730,6 +1789,7 @@ mod tests {
             file: None,
             operation: None,
             mitre_version: None,
+            execq: None,
         };
         assert_roundtrip(&record);
     }
@@ -1764,6 +1824,61 @@ mod tests {
             let v: AdvisorAction = serde_json::from_str(&format!("\"{a}\"")).unwrap();
             assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{a}\""));
         }
+    }
+
+    /// Lab PR 223: an exec quarantine record carries its evidence and its
+    /// ATT&CK mapping and round-trips; every other record serialises
+    /// without the field (old lines stay byte-identical).
+    #[test]
+    fn execq_record_roundtrips_and_others_omit_the_field() {
+        let sink = DetectionSink::for_test(8, 0);
+        let event = sample_event();
+        let verdict = Verdict {
+            rule_id: crate::execq::RULE_ID.to_string(),
+            rule_name: crate::execq::RULE_NAME.to_string(),
+            category: crate::execq::CATEGORY.to_string(),
+            action: ResponseAction::Quarantine,
+            severity: Severity::Critical,
+            reasoning: "first sight".to_string(),
+            event_pid: 1,
+            event_filename: "/tmp/payload".to_string(),
+            timestamp_ns: 0,
+        };
+        let evidence = ExecqEvidence {
+            verdict: "malicious".into(),
+            sha256: Some("ab".repeat(32)),
+            format: Some("elf64-x86_64-exec".into()),
+            reasons: vec!["blocklist: nn-lab-test-elf".into()],
+            decision: "kill".into(),
+            basis: "block-listed content".into(),
+            classes: vec!["tmp".into()],
+            held: true,
+            held_ms: 3,
+        };
+        sink.record_execq(
+            &event,
+            &verdict,
+            PostureKind::Observing,
+            "killed while held; quarantined (vault x)".into(),
+            &crate::execq::attack_refs("elf64-x86_64-exec"),
+            evidence.clone(),
+            0,
+        );
+        let record = sink.inner.queue.lock().pop_front().unwrap();
+        assert_eq!(record.execq.as_ref(), Some(&evidence));
+        assert_eq!(record.mitre.technique, ["T1204.002"]);
+        assert_eq!(record.mitre.tactic, ["TA0002"]);
+        assert_eq!(record.mitre_version.as_deref(), Some("20.0"));
+        assert_roundtrip(&record);
+        let plain = DetectionRecord::from_rule(
+            2,
+            "t".into(),
+            &event,
+            &verdict,
+            PostureKind::Observing,
+            "none".into(),
+        );
+        assert!(!serde_json::to_string(&plain).unwrap().contains("execq"));
     }
 
     #[test]
@@ -2713,6 +2828,7 @@ mod tests {
             file: None,
             operation: None,
             mitre_version: None,
+            execq: None,
         }
     }
 

@@ -4154,6 +4154,16 @@ mod tests {
                 capability_manifest: None,
                 exploit_guard: None,
                 cow_guard: None,
+                execq_state: None,
+                execq_held_total: None,
+                execq_resumed_total: None,
+                execq_killed_total: None,
+                execq_quarantined_total: None,
+                execq_defaulted_total: None,
+                execq_known_identity_total: None,
+                execq_known_hash_total: None,
+                execq_not_held_total: None,
+                execq_scanner_deaths_total: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

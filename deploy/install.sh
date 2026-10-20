@@ -11,7 +11,7 @@
 #   sudo ./deploy/install.sh
 #
 # Assumes `cargo xtask build --release` has already run and produced
-# ./target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin}.
+# ./target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}.
 # Use xtask, NOT a bare `cargo build`: xtask compiles the eBPF object
 # (separate nightly/bpfel toolchain) and the userland in one step, and
 # stamps the object so agent/build.rs can prove it is fresh. A plain
@@ -247,6 +247,11 @@ esac
 # It must be on-host so an operator can unlock COMBAT, and install.sh
 # uses it below to bootstrap admin.pub on a fresh install (issue #124).
 NN_ADMIN_BIN="$TARGET_DIR/nn-admin"
+# Lab PR 223 (EXPERIMENTAL): the exec quarantine's confined scanner, which
+# the agent spawns as the `northnarrow-scan` account (created below). Off
+# unless the agent runs with --exec-quarantine.
+SCAN_BIN="$TARGET_DIR/northnarrow-scan"
+SCAN_USER=northnarrow-scan
 AGENT_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-agent.service"
 WATCHDOG_UNIT_SRC="$REPO_ROOT/deploy/systemd/northnarrow-watchdog.service"
 # Lab PR 216: the watchdog unit's OnFailure= handler (records that systemd
@@ -533,10 +538,11 @@ require_provenance_floor() {
 write_install_manifest() {
     local manifest="$ETC_DIR/install-manifest.json" version
     version=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | awk '{print $NF}')
-    local sha_agent sha_wd sha_admin sha_ebpf
+    local sha_agent sha_wd sha_admin sha_scan sha_ebpf
     sha_agent=$(sha256sum "$BIN_DIR/northnarrow-agent" | cut -d' ' -f1)
     sha_wd=$(sha256sum "$BIN_DIR/northnarrow-watchdog" | cut -d' ' -f1)
     sha_admin=$(sha256sum "$BIN_DIR/nn-admin" | cut -d' ' -f1)
+    sha_scan=$(sha256sum "$BIN_DIR/northnarrow-scan" | cut -d' ' -f1)
     sha_ebpf=$(sha256sum "$EBPF_ARTIFACT" | cut -d' ' -f1)
     local tmp
     tmp=$(mktemp)
@@ -552,6 +558,7 @@ write_install_manifest() {
     "northnarrow-agent": "$sha_agent",
     "northnarrow-watchdog": "$sha_wd",
     "nn-admin": "$sha_admin",
+    "northnarrow-scan": "$sha_scan",
     "ebpf_object": "$sha_ebpf"
   },
   "tarball_sha256": $([[ -n "$TARBALL_SHA256" ]] && echo "\"$TARBALL_SHA256\"" || echo null),
@@ -888,7 +895,7 @@ new_ver=unknown
 # COMBAT rulesets and carve-out list) is listed only when it is missing.
 txn_targets() {
     local f
-    for f in northnarrow-agent northnarrow-watchdog nn-admin; do echo "$BIN_DIR/$f"; done
+    for f in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do echo "$BIN_DIR/$f"; done
     for f in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do echo "$UNIT_DIR/$f.service"; done
     echo "$DROPIN_ROOT/northnarrow-agent.service.d/10-debian-perf-paranoid.conf"
     # lab PR 222: the copy-on-first-write drop-in (--cow-guard)
@@ -1255,6 +1262,7 @@ require_provenance_floor
 require_file "$AGENT_BIN"    "run \`cargo xtask build --release\` first (xtask builds the eBPF object + userland atomically; a plain \`cargo build\` cannot produce an installable agent — agent/build.rs refuses a stale/unstamped eBPF object)"
 require_file "$WATCHDOG_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-watchdog\`)"
 require_file "$NN_ADMIN_BIN" "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-agent --bin nn-admin\`)"
+require_file "$SCAN_BIN"     "run \`cargo xtask build --release\` first (or \`cargo build --release -p northnarrow-scan\`)"
 # Refuse a stale agent binary BEFORE we touch the live system.
 require_fresh_ebpf
 fi
@@ -1604,6 +1612,7 @@ if [[ $MODE == configure ]]; then
             fi
         done
         for f in /usr/local/bin/northnarrow-agent /usr/local/bin/northnarrow-watchdog /usr/local/bin/nn-admin \
+                 /usr/local/bin/northnarrow-scan \
                  /etc/systemd/system/northnarrow-agent.service /etc/systemd/system/northnarrow-watchdog.service \
                  /etc/systemd/system/northnarrow-watchdog-failed.service; do
             [[ -e "$f" ]] && { echo "install.sh: removing $f (install.sh layout, replaced by the package)"; rm -f "$f"; }
@@ -1625,6 +1634,7 @@ echo "install.sh: staging binaries in $BIN_DIR/ and systemd unit files in $UNIT_
 install -m 755 -o root -g root "$AGENT_BIN"    "$BIN_DIR/northnarrow-agent.nn-new"
 install -m 755 -o root -g root "$WATCHDOG_BIN" "$BIN_DIR/northnarrow-watchdog.nn-new"
 install -m 755 -o root -g root "$NN_ADMIN_BIN" "$BIN_DIR/nn-admin.nn-new"
+install -m 755 -o root -g root "$SCAN_BIN"     "$BIN_DIR/northnarrow-scan.nn-new"
 # Review 26: the shipped units name /usr/local/bin. With another BIN_DIR
 # (a package layout uses /usr/bin) their ExecStart and the watchdog's
 # --agent-bin must point at the binaries that were actually installed.
@@ -1642,7 +1652,8 @@ install_unit() {
 install_unit "$AGENT_UNIT_SRC"    "$UNIT_DIR/northnarrow-agent.service.nn-new"
 install_unit "$WATCHDOG_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog.service.nn-new"
 install_unit "$WATCHDOG_FAILED_UNIT_SRC" "$UNIT_DIR/northnarrow-watchdog-failed.service.nn-new"
-for staged in "$AGENT_BIN:northnarrow-agent" "$WATCHDOG_BIN:northnarrow-watchdog" "$NN_ADMIN_BIN:nn-admin"; do
+for staged in "$AGENT_BIN:northnarrow-agent" "$WATCHDOG_BIN:northnarrow-watchdog" "$NN_ADMIN_BIN:nn-admin" \
+              "$SCAN_BIN:northnarrow-scan"; do
     if ! cmp -s "${staged%%:*}" "$BIN_DIR/${staged#*:}.nn-new"; then
         TXN_REASON="the staged $BIN_DIR/${staged#*:}.nn-new differs from ${staged%%:*}"
         echo "install.sh: $TXN_REASON" >&2
@@ -1651,11 +1662,36 @@ for staged in "$AGENT_BIN:northnarrow-agent" "$WATCHDOG_BIN:northnarrow-watchdog
 done
 echo "install.sh: switching binaries and units (rename)"
 for f in "$BIN_DIR/northnarrow-agent" "$BIN_DIR/northnarrow-watchdog" "$BIN_DIR/nn-admin" \
-         "$UNIT_DIR/northnarrow-agent.service" "$UNIT_DIR/northnarrow-watchdog.service" \
+         "$BIN_DIR/northnarrow-scan" "$UNIT_DIR/northnarrow-agent.service" "$UNIT_DIR/northnarrow-watchdog.service" \
          "$UNIT_DIR/northnarrow-watchdog-failed.service"; do
     mv -fT "$f.nn-new" "$f"
 done
 fi
+
+# Lab PR 223 (EXPERIMENTAL exec quarantine): the account the agent drops
+# its scanner to — a system user with its own group, no home, no shell,
+# never root. It costs nothing while the guard is off; without it the guard
+# refuses to start (a signed degradation), the agent itself runs.
+# >>> scan_user
+ensure_scan_user() {
+    if getent passwd "$SCAN_USER" >/dev/null; then
+        return 0
+    fi
+    local nologin=/usr/sbin/nologin
+    [[ -x $nologin ]] || nologin=/sbin/nologin
+    if ! command -v useradd >/dev/null 2>&1; then
+        echo "install.sh: WARNING: useradd not found — no $SCAN_USER account; the exec quarantine cannot start its scanner" >&2
+        return 0
+    fi
+    if useradd --system --user-group --no-create-home --home-dir /nonexistent \
+        --shell "$nologin" --comment "NorthNarrow exec quarantine scanner" "$SCAN_USER"; then
+        echo "install.sh: created the system account $SCAN_USER (exec quarantine scanner)"
+    else
+        echo "install.sh: WARNING: could not create $SCAN_USER — the exec quarantine cannot start its scanner" >&2
+    fi
+}
+# <<< scan_user
+ensure_scan_user
 
 # Debian-family kernels carry a distro patch that makes
 # kernel.perf_event_paranoid=3 (their default) require CAP_SYS_ADMIN for

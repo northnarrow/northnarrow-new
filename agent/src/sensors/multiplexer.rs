@@ -253,6 +253,19 @@ impl SensorMultiplexer {
         crate::sensors::exe_identity::attach(&mut ebpf, |ebpf| {
             attach_tracepoint(ebpf, "sys_enter_execve", "syscalls", "sys_enter_execve")
         })?;
+        // Lab PR 223 (EXPERIMENTAL): the exec quarantine's kernel
+        // configuration, once the exec sensor's mode is known — written OFF
+        // too, then frozen — and its maps for the controller. Not fatal:
+        // an unwritten configuration is OFF, the kernel holds nothing.
+        if let Err(e) = crate::execq::install(&mut ebpf) {
+            error!(
+                error = format!("{e:#}"),
+                "exec quarantine: kernel configuration failed — the guard is off"
+            );
+            if crate::execq::config().is_some_and(|c| c.mode != crate::execq::Mode::Off) {
+                crate::execq::fail(format!("kernel configuration failed: {e:#}"));
+            }
+        }
         // io_uring (Tappa 10.8): soft attach — a kernel built without
         // CONFIG_IO_URING has no such tracepoints and nothing to observe.
         // The submit tracepoint was renamed across kernels (`_sqe` ≤ 6.1,

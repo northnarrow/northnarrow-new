@@ -61,6 +61,8 @@ T1055.009	subtechnique	active	Proc Memory	stealth,privilege-escalation	-
 T1057	technique	active	Process Discovery	discovery	-
 T1059	technique	active	Command and Scripting Interpreter	execution	-
 T1059.004	subtechnique	active	Unix Shell	execution	-
+T1059.006	subtechnique	active	Python	execution	-
+T1059.007	subtechnique	active	JavaScript	execution	-
 T1068	technique	active	Exploitation for Privilege Escalation	privilege-escalation	-
 T1070	technique	active	Indicator Removal	stealth	-
 T1070.002	subtechnique	revoked	Clear Linux or Mac System Logs	stealth	T1685.006
@@ -83,6 +85,8 @@ T1132	technique	active	Data Encoding	command-and-control	-
 T1136	technique	active	Create Account	persistence	-
 T1136.001	subtechnique	active	Local Account	persistence	-
 T1140	technique	active	Deobfuscate/Decode Files or Information	stealth	-
+T1204	technique	active	User Execution	execution	-
+T1204.002	subtechnique	active	Malicious File	execution	-
 T1480	technique	active	Execution Guardrails	stealth	-
 T1486	technique	active	Data Encrypted for Impact	impact	-
 T1496	technique	active	Resource Hijacking	impact	-

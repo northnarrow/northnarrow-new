@@ -64,6 +64,11 @@ common = { workspace = true }
 # anti_tamper/mod.rs re-exports its public surface so existing
 # in-agent callers compile byte-identically.
 antitamper-bpf = { workspace = true }
+# Lab PR 223 (EXPERIMENTAL exec quarantine): the agent's end of the scanner
+# channel (SCM_RIGHTS, the supervisor of the child process). The scanner's
+# engine runs in its own confined process; the agent's tests also run it in
+# process.
+northnarrow-scan = { path = "../scan" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

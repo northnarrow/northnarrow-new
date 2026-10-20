@@ -245,7 +245,8 @@ pub struct ShippedRule {
 /// production engine's rules (built as main.rs builds them, over empty
 /// operator state) and NN-L-AT-001 and NN-L-EPG-001/002 (lab PR 219), which
 /// `process_event` issues outside the engine (the denominator of
-/// `docs/validation/v2-rules.tsv`).
+/// `docs/validation/v2-rules.tsv`), then NN-L-EXECQ-001 (lab PR 223), which
+/// the exec quarantine's controller records (not in that denominator).
 pub fn shipped_rules() -> Vec<ShippedRule> {
     use crate::config::comm_allowlist::CommAllowlist;
     use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
@@ -270,7 +271,7 @@ pub fn shipped_rules() -> Vec<ShippedRule> {
         Box::new(rules::epg::NnLEpg002NamespaceRootPostcondition),
     ];
     let mut seen = BTreeSet::new();
-    engine
+    let mut rules: Vec<ShippedRule> = engine
         .iter()
         .chain(direct.iter())
         .filter(|r| seen.insert(r.id()))
@@ -280,7 +281,16 @@ pub fn shipped_rules() -> Vec<ShippedRule> {
             category: r.category(),
             attack: r.attack(),
         })
-        .collect()
+        .collect();
+    // Lab PR 223: the exec quarantine's records are the controller's, not a
+    // `Rule`'s; their references are `execq::ATTACK`.
+    rules.push(ShippedRule {
+        id: crate::execq::RULE_ID,
+        name: crate::execq::RULE_NAME,
+        category: crate::execq::CATEGORY,
+        attack: crate::execq::ATTACK,
+    });
+    rules
 }
 
 /// What the documents say about a rule's validation.
@@ -670,8 +680,8 @@ fn render_coverage(inp: &Inputs) -> String {
 
 /// The id prefixes of the rules the agent issues outside the engine:
 /// NN-L-AT-001 (an anti-tamper denial) and the exploit post-condition
-/// guard's (lab PR 219).
-const OUTSIDE_ENGINE: &[&str] = &["NN-L-AT-", "NN-L-EPG-"];
+/// guard's (lab PR 219); the exec quarantine's controller's (lab PR 223).
+const OUTSIDE_ENGINE: &[&str] = &["NN-L-AT-", "NN-L-EPG-", "NN-L-EXECQ-"];
 
 fn render_catalogue(inp: &Inputs) -> String {
     let p = &inp.pinned;

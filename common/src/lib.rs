@@ -64,6 +64,11 @@ pub mod admin_quorum;
 #[cfg(feature = "std")]
 pub mod atomic_file;
 
+/// Lab PR 223 (EXPERIMENTAL): the exec quarantine's scanner protocol and
+/// signed hash list.
+#[cfg(feature = "std")]
+pub mod execq;
+
 /// Network addresses as the kernel records them, in canonical form
 /// (external audit NET-001: IPv4-mapped IPv6).
 #[cfg(feature = "std")]

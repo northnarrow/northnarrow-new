@@ -1,0 +1,36 @@
+[package]
+name = "northnarrow-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NorthNarrow exec quarantine scanner (lab PR 223, EXPERIMENTAL) — a confined, unprivileged process the agent spawns and supervises: it hashes the executable whose descriptor it is handed, checks the signed hash lists and runs explainable ELF heuristics. No network, no filesystem access (seccomp). Design: docs/design/EXEC_QUARANTINE.md."
+
+[[bin]]
+name = "northnarrow-scan"
+path = "src/main.rs"
+
+[lib]
+name = "northnarrow_scan"
+path = "src/lib.rs"
+
+[dependencies]
+# Protocol, hash-list types and postcard framing (common::execq).
+common = { workspace = true }
+sha2 = "0.10"
+# recvmsg/sendmsg with SCM_RIGHTS, prctl, setrlimit, seccomp(2): raw
+# syscalls, as the watchdog does (no libseccomp: no C in production).
+libc = "0.2"
+
+[features]
+# Reserved for the YARA engine (docs/design/EXEC_QUARANTINE.md §6): no
+# engine is acceptable in this release (yara: C library, against the
+# charter; yara-x: rustc 1.95 over the workspace's 1.89 and a wasmtime JIT
+# that needs executable mappings the seccomp filter refuses). Building with
+# it fails with the reason.
+yara = []
+
+[dev-dependencies]
+tempfile = "3"

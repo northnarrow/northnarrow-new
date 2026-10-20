@@ -1454,6 +1454,8 @@ pub mod admin_signed_payload;
 /// Lab PR 219 — the exploit post-condition guard's record.
 pub mod epg;
 pub mod exe;
+/// Lab PR 223 (EXPERIMENTAL): exec quarantine at first sight.
+pub mod execq;
 pub mod open_sensor;
 pub mod sensor_probe;
 

@@ -235,11 +235,11 @@ The agent now reads the prototype of `bpf_lsm_inode_setattr` from the
 running kernel's BTF at boot, takes the position of its only `struct
 dentry *` argument (which must be followed by the `struct iattr *`), and
 writes it into the `BTF_OFFSETS` map (`INODE_SETATTR_DENTRY_ARG`, slot
-106) before anything attaches; both programs read the dentry at that
+108) before anything attaches; both programs read the dentry at that
 position. The same check found a second case: on 5.7 to 5.11 (5.10 LTS
 included) `inode_setxattr` and `inode_removexattr` start with the dentry,
 where the xattr deny read argument 1 (the attribute name); their
-positions are resolved the same way (slots 107 and 108, the name taken
+positions are resolved the same way (slots 109 and 110, the name taken
 right after the dentry).
 
 Hook prototypes per kernel, for the arguments the programs read
@@ -528,6 +528,22 @@ elsewhere with a kernel `WARN`, so the agent checks the version itself:
 does not detect) leaves the guard `unavailable` with a signed
 `subsystem_degraded`; the agent starts. Design:
 https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXPLOIT_POSTCONDITION_GUARD.md
+
+## Exec quarantine at first sight (lab PR 223)
+
+Off by default (`--exec-quarantine`). What it needs, per kernel of the
+matrix — 5.14 (RHEL 9), 5.15 (Ubuntu 22.04), 6.1 (Debian 12), 6.8 (Ubuntu
+24.04), 6.12 (Debian 13):
+
+| Piece | Kernel interface | 5.14 | 5.15 | 6.1 | 6.8 | 6.12 | Without it |
+|---|---|---|---|---|---|---|---|
+| class of each binfmt pass | LSM `bprm_check_security` (the exec sensor on LSM) | yes | yes | yes | yes | yes | the guard is off, a signed degradation |
+| the hold | tracepoint `sched_process_exec`, `bpf_send_signal(SIGSTOP)` | yes | yes | yes | yes | yes | — |
+| identity cache | inode ctime (`INODE_I_CTIME_SEC/NSEC_OFFSET`, optional) | `i_ctime` | `i_ctime` | `i_ctime` | `__i_ctime` | `i_ctime_sec` / `i_ctime_nsec` | nothing cached: every exec of a guarded file is held |
+
+The ctime field moved twice (`__i_ctime` from 6.6, `i_ctime_sec` and
+`i_ctime_nsec` from 6.11); the agent resolves it from BTF at boot. Design:
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_QUARANTINE.md
 
 ## DNS sensor: two static kernel functions (Tappa 10.9 step 3)
 

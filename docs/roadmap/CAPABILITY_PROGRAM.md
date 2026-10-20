@@ -408,7 +408,8 @@ only in the table below, in the same PR as the evidence.
   - What changed: `Rule::attack()` (required, no default) returns typed
     references — a `Tactic` enum and technique ids whose shape is checked
     when the constant compiles — of ATT&CK Enterprise 20.0 (2026-10-13).
-    All 79 rules (lab PR 219's two included) are mapped: 58 techniques and sub-techniques under 12
+    All 80 rules (lab PR 219's two and 223's NN-L-EXECQ-001 included) are
+    mapped: 61 techniques and sub-techniques under 12
     tactics. A rule detection record carries the ids in `mitre` and
     `mitre_version` `"20.0"` (an additive field: older lines keep their
     bytes and verify). The ids in use are pinned with their v20 names,
@@ -476,3 +477,48 @@ only in the table below, in the same PR as the evidence.
     (`deploy/lab/cow/cow-check.sh`). Open: no deny mode, no pre-delete
     protection, flags from `/proc` rather than the LSM hook.
   - Lab: On Ubuntu 24.04, with the guard on (the lot's cow-check.sh: its drop-in, a signed cow-guard.local, response-manage on the lab key, all put back by its cleanup): on ext4 (mark=dirs) the signed cow_guard row "started" with copy_method copy, on an XFS loop filesystem (mark=mount, reflink=1) copy_method reflink, no integrity drift for its drop-in. The benign simulator, run as the lab user, rewrote and renamed 51 files: on XFS `nn-admin remediate ransomware --pid` recreated all 51 (sha256 51 of 51); on ext4 50 (the 20 MiB file is over the 16 MiB copy cap, unprotected as designed), each a signed cow_restore row; the run drew NN-L-IMP-001 (lab PR 225) with its kill held. With auto_restore = true and the simulator as root tripping the anti-tamper tripwire, COMBAT NEUTRALIZEd it and the guard restored the 50 files itself ("restore done source=COMBAT NEUTRALIZE", 50 cow_restore rows "by auto (COMBAT NEUTRALIZE)", a cow_guard auto_restore row). vim started by a unit as the lab user rewrote 10 files with no copy (trusted opens 0 → 10), `cp` over three took three copies. Cost on ext4 (cow_bench, 2,000 files of 4 KiB): open 4.0 µs mean outside the scope, 302.5 µs on the copy path inside it; 200 files of 1 MiB 6.7 ms; the guard's own counters: fast path avg 79 µs, copy path avg 820 µs, max 8.1 ms (2,203 copies). The first ext4 run copied nothing: the harness re-made the tree's directories after the guard had marked them (with mark=dirs a new directory is marked at the next 60 s rescan), its chown of the tree touched the guard's write-denied journal (four NN-L-AT-001 denials, a locked COMBAT), and it started vim from its own script, an ancestor the guard's trust rule refuses; the harness was fixed in this lot and the ext4 cases run again. After the fix of the guard's fanotify reader (it reads the group only through its own descriptor, under its lock, and ends an orderly stop with an INFO line), a restart of the agent with the guard running on ext4 left the stopping agent's "the fanotify reader ends (the guard stops)" and no "reading the fanotify group failed" ERROR, and the new agent's guard ran. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).
+- **Lab PR 223 — exec quarantine at first sight (EXPERIMENTAL) and a
+  confined scanner.** C13 (malware prevention), C12 (synchronous inline
+  blocking); `docs/design/EXEC_QUARANTINE.md`. Off by default.
+  - C13: a new executable run from a guarded location (`/tmp`, `/var/tmp`,
+    `/dev/shm`, a home directory, a world-writable directory, tmpfs, a
+    memfd, an unlinked file) is held by the kernel before its first
+    instruction (`SIGSTOP` from `sched_process_exec`, past the exec's point
+    of no return), scanned by `northnarrow-scan` — an unprivileged process
+    of its own account under a seccomp filter (no file but the descriptors
+    it is handed, no network, no exec, no executable memory) — against a
+    signed hash list and explainable ELF heuristics, then resumed, or
+    killed and quarantined. Package files are trusted by their recorded
+    digest; an identity judged once is not held again. YARA is left out
+    (libyara is C; yara-x needs rustc 1.95 and a JIT the filter refuses):
+    the `yara` feature is reserved, the packs are a follow-up.
+  - C12: within its budget the controller resumes a held process only
+    after the rule engine has judged its exec, so the exec rules' kills
+    (R001 on a `/tmp` binary…) land on a process that never ran an
+    instruction. A decision has a budget (2 s), then the default policy
+    (resume and alert); a decision is a signed `NN-L-EXECQ-001` record
+    (not a resume on a digest already judged clean, a late clean verdict,
+    or what the per-rule budget holds back), a scanner loss a signed
+    degradation (one per cause per 10 min); fail-open on a stale
+    heartbeat, a full ring or a refused signal, each counted, the last two
+    a signed degradation at most every 10 min.
+  - Evidence so far: unit tests — the decision table and the budget gate,
+    trust by a fixture dpkg database, the heuristics on ELF images built
+    byte by byte, the seccomp filter on forked children (an `open`, a
+    `socket`, an executable `mmap`, a write to stdout kill them), the
+    scanner process configured through a memfd and the supervisor
+    restarting it after a `SIGKILL`, and the controller on real stopped
+    processes (resumed after the rules' verdict, killed and quarantined on
+    a block-list hit, the default policy without a scanner and after a
+    budget, a late block-list verdict, a scanner death, recovery at boot);
+    the three clippy runs, `cargo fmt`, `cargo test --workspace`. Levels
+    unchanged (C13 0, C12 1): the guest checks are owed — the six cases of
+    `deploy/lab/execq/execq-check.sh` on 5.15, 6.1, 6.8 and 6.12 (and RHEL
+    9), the latency numbers.
+    Open: interpreted code handed to an interpreter, a known binary
+    reused, `ld.so <file>`, injection into a running process and
+    kernel-mode code are not seen; a root attacker can kill the scanner
+    (the default policy applies, signed); an interactive shell sees a held
+    job as stopped; the identity cache trusts ctime and size;
+    `NN-L-EXECQ-001` is outside the frozen V2 denominator.
+  - Lab: On Debian 12 and Ubuntu 24.04 the install created the system account northnarrow-scan (home /nonexistent, nologin) and /usr/local/bin/northnarrow-scan (0755 root) in the install manifest, with the guard off in the signed status (withheld from the unsigned one), EXECQ_CONF frozen and EXECQ_STOPPED pinned; on 6.1, 6.8, 6.12 and 5.15, with NN_EXEC_QUARANTINE=enforce, the exec sensor on LSM bprm_check_security, the quarantine armed in the kernel, its programs past the verifier with no rejection, the signed state enforce, no degradation, and the scanner running as northnarrow-scan under a seccomp filter with no_new_privs, no capability and file descriptors 0–3 only. On 24.04 the lot's execq-check.sh passed 11 of 11: a never-seen copy of true in /tmp held before its first instruction and scanned clean, ended while held by R001's kill (a rule that predates the lot), a second run not held (known identity, no new record); a binary in the home held, scanned clean and resumed; a block-listed test binary killed while held (no instruction ran) and quarantined; a UPX-packed ls judged suspicious; package-managed binaries never held; a stopped scanner → after the 2 s budget the default policy resumed the process (signed) and the hung scanner was killed and restarted (signed degradation); a scanner killed mid-scan signed a degradation and the scan finished clean; first sight decided in 3.1 ms. Observe mode let the block-listed marker run with its record "would kill", held false; a process held across an agent killed by SIGKILL was resumed by the next agent with a signed recovered_at_boot row naming it, and one held across a graceful stop by a signed "stopping" row (the first run of this case crashed the agent after the decision budget and launched the held process through runuser, which kept its resumed child a zombie: a probe defect, fixed and run again, 14 of 14). Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).

@@ -3536,6 +3536,7 @@ fn telemetry_status(
     let evidence = response_state.map(|s| (s.combat_evidence)());
     let encrypted = crate::net::blind_spots::encrypted_flows();
     let trust = crate::boot::trust::current();
+    let execq = crate::execq::snapshot();
     StatusResponse {
         posture: posture.current_kind(),
         network_isolation_engaged: isolator.is_engaged(),
@@ -3586,6 +3587,17 @@ fn telemetry_status(
         exploit_guard: Some(crate::sensors::epg::status()),
         // Lab PR 222: the copy-on-first-write guard.
         cow_guard: crate::cow::status(),
+        // Lab PR 223 (EXPERIMENTAL): the exec quarantine.
+        execq_state: Some(execq.state),
+        execq_held_total: Some(execq.held),
+        execq_resumed_total: Some(execq.resumed),
+        execq_killed_total: Some(execq.killed),
+        execq_quarantined_total: Some(execq.quarantined),
+        execq_defaulted_total: Some(execq.defaulted),
+        execq_known_identity_total: Some(execq.known_identity),
+        execq_known_hash_total: Some(execq.known_hash),
+        execq_not_held_total: Some(execq.not_held),
+        execq_scanner_deaths_total: Some(execq.scanner_deaths),
     }
 }
 
@@ -6143,6 +6155,16 @@ mod tests {
             capability_manifest: None,
             exploit_guard: None,
             cow_guard: None,
+            execq_state: None,
+            execq_held_total: None,
+            execq_resumed_total: None,
+            execq_killed_total: None,
+            execq_quarantined_total: None,
+            execq_defaulted_total: None,
+            execq_known_identity_total: None,
+            execq_known_hash_total: None,
+            execq_not_held_total: None,
+            execq_scanner_deaths_total: None,
         });
         emit_audit_for(
             &status_req,
@@ -7170,6 +7192,9 @@ mod tests {
         // counters are not read — "not counted", never a 0.
         assert_eq!(r.deny_fail_open_total, None);
         assert_eq!(r.deny_fail_open, None);
+        // Lab PR 223: the exec quarantine is always reported (off here).
+        assert_eq!(r.execq_state.as_deref(), Some("off"));
+        assert!(r.execq_held_total.is_some());
 
         // No response state (no executor): not known, not "enforcing".
         let r = status(None);

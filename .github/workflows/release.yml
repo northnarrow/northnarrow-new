@@ -181,6 +181,7 @@ jobs:
           dpkg-deb -f "$deb" Pre-Depends | grep -qw nftables
           tmp=$(mktemp -d) && dpkg-deb -x "$deb" "$tmp" && dpkg-deb -e "$deb" "$tmp/DEBIAN"
           for f in usr/bin/northnarrow-agent usr/bin/northnarrow-watchdog usr/bin/nn-admin \
+                   usr/bin/northnarrow-scan \
                    usr/lib/systemd/system/northnarrow-agent.service \
                    usr/lib/systemd/system/northnarrow-watchdog-failed.service \
                    usr/share/northnarrow/deploy/install.sh; do
@@ -196,6 +197,7 @@ jobs:
           rpm -qpi "$rpm" | grep -E "^(Name|Version|Release)"
           rpm -qpR "$rpm" | grep -qx 'glibc >= 2.34'
           rpm -qpR "$rpm" | grep -qx nftables
+          rpm -qpl "$rpm" | grep -qx /usr/bin/northnarrow-scan
           # %pre, %post, %preun, %postun and the %posttrans health check (lab PR 220)
           test "$(rpm -qp --scripts "$rpm" | grep -c 'scriptlet (using /bin/sh)')" = 5
           rpm -qp --scripts "$rpm" | grep -q -- '--package-verify'
@@ -223,6 +225,7 @@ jobs:
           ./target/release/northnarrow-agent --version
           ./target/release/nn-admin --version
           ./target/release/northnarrow-watchdog --version
+          ./target/release/northnarrow-scan --version
 
       # Review 65: the binaries must start on an x86-64-v2 CPU, not only on
       # the runner's. `-cpu Nehalem` has SSE4.2 and POPCNT but no AVX, so an
@@ -234,7 +237,7 @@ jobs:
           set -e
           sudo apt-get install -y --no-install-recommends qemu-user >/dev/null
           tmp=$(mktemp -d) && tar -C "$tmp" -xzf "$(ls dist/*.tar.gz)"
-          for b in northnarrow-agent nn-admin northnarrow-watchdog; do
+          for b in northnarrow-agent nn-admin northnarrow-watchdog northnarrow-scan; do
             qemu-x86_64 -cpu Nehalem "$tmp"/northnarrow-*/target/release/$b --version
           done
 

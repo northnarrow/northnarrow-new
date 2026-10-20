@@ -226,6 +226,13 @@ impl ExeHandle {
         Self::from_file(fs::File::open(path)?)
     }
 
+    /// A file already open (lab PR 223: the exec quarantine vaults the very
+    /// inode its scanner judged, opened through `/proc/<pid>/exe` while the
+    /// process was held).
+    pub fn from_open_file(file: fs::File) -> std::io::Result<Self> {
+        Self::from_file(file)
+    }
+
     fn from_file(file: fs::File) -> std::io::Result<Self> {
         let m = file.metadata()?;
         Ok(Self {

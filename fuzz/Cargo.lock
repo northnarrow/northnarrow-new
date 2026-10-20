@@ -886,6 +886,7 @@ dependencies = [
  "nix",
  "northnarrow-antitamper-bpf",
  "northnarrow-common",
+ "northnarrow-scan",
  "parking_lot",
  "procfs",
  "rand",
@@ -935,6 +936,15 @@ dependencies = [
  "northnarrow-common",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "northnarrow-scan"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "northnarrow-common",
+ "sha2",
 ]
 
 [[package]]

@@ -92,7 +92,11 @@ fn reference_problems(id: &str, refs: &[AttackRef], p: &Pinned) -> Vec<String> {
 fn every_shipped_rule_declares_a_valid_attack_mapping() {
     let p = pinned();
     let rules = render::shipped_rules();
-    assert_eq!(rules.len(), 79, "the rules v2-rules.tsv counts");
+    assert_eq!(
+        rules.len(),
+        79 + 1,
+        "the rules v2-rules.tsv counts, and NN-L-EXECQ-001 (lab PR 223, not in it)"
+    );
     let bad: Vec<String> = rules
         .iter()
         .flat_map(|r| reference_problems(r.id, r.attack, &p))
