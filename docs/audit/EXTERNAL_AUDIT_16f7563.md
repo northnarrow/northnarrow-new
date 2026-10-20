@@ -1819,7 +1819,7 @@ group, the ones an unprivileged user or a local attacker could use first.
     grew to 63 MB by 120 s and stayed there (64.8 MB at the end).
 - **NN-AUD-053 (LLMR-004), lab PR 105.** The ADE loaded whatever GGUF and
   `tokenizer.json` sat at the configured path — no owner, mode or link
-  check — and the default path was `/home/forty/models/…`, a user's home:
+  check — and the default path was `/home/<dev>/models/…`, a user's home:
   the user, or anyone who can write a directory on the path, chose the
   root agent's model (verdicts tailored to `Allow`, or output that keeps
   the escalation busy) and fed candle's GGUF parser a file of their
@@ -1852,7 +1852,7 @@ group, the ones an unprivileged user or a local attacker could use first.
     with `NN_ADE_ALLOW_MOCK=1` (demos, benchmarks).
   - Lab, Debian 12 (6.1), with stand-in files (a few bytes, no model) at
     the default location. Before: a GGUF and tokenizer owned by the
-    unprivileged user in `/home/forty/models/` reached candle's parser
+    unprivileged user in `/home/<dev>/models/` reached candle's parser
     (`reading GGUF metadata: unknown magic`), then the mock backend. After:
     that file is no longer looked at; a GGUF owned by uid 1000 in
     `/var/lib/northnarrow/models/` was refused (`ModelUntrusted … owned by
@@ -8526,7 +8526,7 @@ group, the ones an unprivileged user or a local attacker could use first.
     lines `mass-write overlay: load complete` (only when nothing is added
     now) and `escalation-allow: skipping malformed entry` (now `entry
     REFUSED — not applied`). Every overlay the repository documents still
-    loads: `+/home/forty/.claude/`, `+/tmp/claude-` (BUG-017), `+/srv/build/`,
+    loads: `+/home/<dev>/.claude/`, `+/tmp/claude-` (BUG-017), `+/srv/build/`,
     `lateral python3 10.0.0.0/8 22` (BUG-032 lab), the commented examples
     of `configs/escalation-allow.local`, the test overlays of `triggers`.
   - Not done: a deeper name prefix (`/home/alice/D` covers `Documents`) is

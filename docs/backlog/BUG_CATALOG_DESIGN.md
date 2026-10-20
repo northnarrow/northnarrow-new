@@ -703,7 +703,7 @@ The WARN fires inside `confirmed_intrusion`'s mass-write arm, which runs on ever
 WARN mass-write threshold crossed — posture will escalate to COMBAT
      trigger="ConfirmedIntrusion_MassWrite"
      focal_pid=1112  focal_comm="Bun Pool 1"
-     focal_filename=/home/forty/.claude/projects/.../subagents/agent-…jsonl
+     focal_filename=/home/<dev>/.claude/projects/.../subagents/agent-…jsonl
      count_within_window=20  threshold=20
 ```
 
@@ -721,7 +721,7 @@ The Bun runtime (Claude Code's execution engine) maintains a worker pool; each w
 ```
 # /etc/northnarrow/mass-write-carveout.local
 # DEV-HOST ONLY — DO NOT deploy to operator hosts
-+/home/forty/.claude/
++/home/<dev>/.claude/
 +/tmp/claude-
 ```
 
@@ -731,7 +731,7 @@ Implementation:
 - Wired in `agent/src/main.rs` boot path: file loaded once at agent start, passed via `PostureMachine::new_with_hooks_and_exempt_and_auth_and_extras`.
 - 4 parser tests + 3 detector integration tests (`mass_write_extras_overlay_exempts_listed_prefix`, etc.).
 
-The overlay is **operator deployment artifact**, NOT in repo. The dev-host copy with `/home/forty/.claude/` is documented and clearly DEV-ONLY in its inline comments.
+The overlay is **operator deployment artifact**, NOT in repo. The dev-host copy with `/home/<dev>/.claude/` is documented and clearly DEV-ONLY in its inline comments.
 
 **References.**
 - Cluster: **detection heuristic crudeness** (§15.2) — same class as BUG-014, BUG-018.

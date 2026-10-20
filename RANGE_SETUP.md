@@ -35,7 +35,7 @@ Design of record: [`docs/design/TAPPA10_7_ADVERSARIAL_VALIDATION_DESIGN.md`](doc
       │  eth1 (NM, static)                                  enp0s8 (netplan, static)
       │
       └─ DURING PROVISIONING ONLY: NAT (enp0s3-equiv) + Tailscale (tailscale0,
-         100.108.16.10).  BOTH DETACHED before any attack run — see §5.
+         <tailscale-ip>).  BOTH DETACHED before any attack run — see §5.
 
   Target NEVER carries a NAT adapter during a run. Its only reachable peer
   is kalidev on intnet-adversarial. That is the C2-containment invariant.
@@ -48,7 +48,7 @@ provisioned. Remaining, in order:
 
 1. **Bootstrap the target into production mode** — run, on `northnarrowdev` as root:
    ```bash
-   sudo /home/forty/dev/northnarrow-new/deploy/adversarial/bootstrap-target-prod.sh
+   sudo /home/<build-user>/northnarrow-new/deploy/adversarial/bootstrap-target-prod.sh
    ```
    This takes the box from its current dev/smoke state to a clean prod
    state: stops the dev agent, scrubs dev runtime telemetry (keeps `/etc`
@@ -66,12 +66,12 @@ provisioned. Remaining, in order:
 
 ## 4. Privilege posture — remove passwordless sudo before the sweep
 
-The target currently has `/etc/sudoers.d/forty-claude-session`
-(`forty ALL=(root) NOPASSWD: ALL`). A real target does not hand the
+The target currently has `/etc/sudoers.d/<build-user>-session`
+(`<build-user> ALL=(root) NOPASSWD: ALL`). A real target does not hand the
 attacker passwordless root. **Before arming the range:**
 
 ```bash
-sudo rm /etc/sudoers.d/forty-claude-session     # on northnarrowdev
+sudo rm /etc/sudoers.d/<build-user>-session     # on northnarrowdev
 ```
 
 - Do this **after** `bootstrap-target-prod.sh` (the bootstrap needs root)
@@ -87,7 +87,7 @@ target must reach **only** kalidev on `intnet-adversarial`, nothing
 outbound. Two external channels exist today and **must be detached for runs**:
 
 - **NAT** adapter(s) on both VMs (the provisioning/management path).
-- **Tailscale** on kalidev (`tailscale0`, `100.108.16.10`).
+- **Tailscale** on kalidev (`tailscale0`, `<tailscale-ip>`).
 
 ### Arming (before any attack run), on the VirtualBox host + guests
 ```bash
@@ -202,7 +202,7 @@ PCAP (NET + CHAIN families only) per §13 Q6.
 ```
 # ── target (northnarrowdev), as root ──
 sudo deploy/adversarial/bootstrap-target-prod.sh        # build+install prod, health check
-sudo rm /etc/sudoers.d/forty-claude-session             # realistic privilege posture
+sudo rm /etc/sudoers.d/<build-user>-session             # realistic privilege posture
 
 # ── attacker (kalidev) ──   (toolchain already installed; only on rebuild:)
 # ART_REF=<tag|commit> deploy/adversarial/provision-kali.sh   # NAT attached, then detach;
