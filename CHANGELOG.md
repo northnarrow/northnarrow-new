@@ -61,6 +61,55 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, lab and range host safety (Low LAB-019 NN-AUD-409,
+  LAB-022 NN-AUD-412, LAB-025 NN-AUD-415, LAB-027 NN-AUD-417; lab PR 211).
+  The lab and range scripts no longer harm the host they run on. LAB-025:
+  every connection `nn-lab.sh` made to a guest (ssh, rsync, scp) took any
+  host key, so whatever listened on the forwarded `127.0.0.1` port while
+  the guest was down — another user's process, a forwarder to another
+  guest — was taken for the guest, and `sync` sent it the tree. Each guest
+  now has its own `known_hosts` (alias `nn-lab-<guest>`, ed25519 only, the
+  lab key only offered), checked strictly from the first connection: `up`
+  generates a new guest's host key and injects it through cloud-init
+  (`ssh_keys:` in the four templates; the private half only in the
+  user-data and seed, 0600), so nothing is trusted on first use; a guest
+  whose disk predates this has its key recorded once by `up`, and only
+  while the port is served by the guest's own QEMU (its pid file) or whpx
+  forwarder unit (`ss -ltnp`, before and after the scan);
+  `nn-lab.sh trust-host-key` records the running guest's key again on
+  purpose. Without a recorded key nothing connects and the command says
+  so; a key that is not the guest's is reported as such, not as "not
+  running"; `down` refuses rather than leave the guest to be killed;
+  `destroy` forgets the key. rsync's `-e "ssh ${SSH_OPTS[*]}"` broke on a
+  space in a path: the options are quoted for rsync now. LAB-022:
+  `open-sensor-check.sh` overwrote `~/.aws/credentials` and `rm -rf`-ed
+  `~/.aws` wherever it ran. It refuses a host that is not a lab guest
+  (`/var/lib/nn-lab-provisioned`) unless `NN_TEST_DISPOSABLE_HOST=1`, moves
+  an existing `~/.aws` (never followed if a link) aside and puts it back at
+  the end of the step and on every way out (error, Ctrl-C, TERM, HUP, a
+  closed pipe), removes only its own fixture, and stops before touching
+  anything when a previous run left `~/.aws.nn-open-sensor`. LAB-019: the
+  superseded range teardown (`docs/adversarial/scripts/07_teardown.sh`)
+  printed "disks kept0" for `KEEP_DISKS=0` and deleted them, nothing under
+  `FORCE=1`, and deleted for any other value; `KEEP_DISKS` is 0 or 1, the
+  printed line, the prompt and the branch say the same, and a hard disk
+  outside its VM's folder stops the teardown before anything is powered
+  off. LAB-027: `deploy/adversarial/bootstrap-target-prod.sh` built
+  whatever the tree held, through the build user's login profiles, and
+  installed it as root with no record. Before step 1 stops anything it
+  now refuses a dirty tree (untracked files included; `NN_ALLOW_DIRTY_TREE=1`
+  is recorded), a HEAD other than `NN_EXPECT_COMMIT`, cargo configuration
+  git does not see, and a tree or parent directory not the build user's
+  or writable by others; the build runs with a clean environment and an
+  explicit `BUILD_PATH`; `/root/range-provenance.txt` records the commit,
+  the tree's state and the sha256 of the three installed binaries, each
+  checked equal to the build. Tests: `xtask/tests/lab_host_safety.rs` (16;
+  all fail on the starting scripts).
+  **Regressions / changes:** an existing guest has no recorded host key:
+  run `nn-lab.sh up` (also on a running guest) or `nn-lab.sh trust-host-key`
+  once per guest; a guest recreated by an older `nn-lab.sh` needs
+  `trust-host-key`. `open-sensor-check` exits 2 off a lab guest. The range
+  bootstrap needs a committed tree (or the recorded override).
 - External audit, Wave 3, BTF matrix downloads and release governance (Low
   SUP-013 NN-AUD-398, SUP-014 NN-AUD-399, SUP-021 NN-AUD-405, SUP-024
   NN-AUD-408; lab PR 210). The BTF matrix fed third-party blobs to the

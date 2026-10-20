@@ -14,6 +14,16 @@ users:
     lock_passwd: true
     ssh_authorized_keys:
       - __SSH_PUBKEY__
+# The guest's ssh host key (external audit LAB-025, lab PR 211): a new
+# ed25519 key for each instance, generated on the host by nn-lab.sh, which
+# records its public half in the guest's known_hosts before the first boot,
+# so the lab's first connection is already checked. cloud-init deletes the
+# image's host keys and writes this one.
+ssh_deletekeys: true
+ssh_keys:
+  ed25519_private: |
+    __NN_LAB_HOST_KEY__
+  ed25519_public: __NN_LAB_HOST_KEY_PUB__
 package_update: true
 package_upgrade: false
 packages:

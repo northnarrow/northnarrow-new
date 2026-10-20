@@ -620,15 +620,15 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-406 | SUP-022 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-407 | SUP-023 | Low | Supply chain | S | fixed (lab PR 200) |
 | NN-AUD-408 | SUP-024 | Low | Supply chain | M | partly fixed (lab PRs 150/210; tag verification waits for the maintainer's key in `allowed_signers`; two-person review declined for now); open |
-| NN-AUD-409 | LAB-019 | Low | Lab scripts | S | open |
+| NN-AUD-409 | LAB-019 | Low | Lab scripts | S | fixed (lab PR 211) |
 | NN-AUD-410 | LAB-020 | Low | Lab scripts | S | fixed (lab PR 206) |
 | NN-AUD-411 | LAB-021 | Low | Lab scripts | — | obsolete (verify-2b.sh deleted, lab PR 153) |
-| NN-AUD-412 | LAB-022 | Low | Lab scripts | S | open |
+| NN-AUD-412 | LAB-022 | Low | Lab scripts | S | fixed (lab PR 211) |
 | NN-AUD-413 | LAB-023 | Low | Lab scripts | M | fixed (lab PR 167) |
 | NN-AUD-414 | LAB-024 | Low | Lab scripts | S | fixed (lab PR 206) |
-| NN-AUD-415 | LAB-025 | Low | Lab scripts | S | open |
+| NN-AUD-415 | LAB-025 | Low | Lab scripts | S | fixed (lab PR 211) |
 | NN-AUD-416 | LAB-026 | Low | Lab scripts | S | fixed (lab PR 206) |
-| NN-AUD-417 | LAB-027 | Low | Lab scripts | S | open |
+| NN-AUD-417 | LAB-027 | Low | Lab scripts | S | fixed (lab PR 211) |
 | NN-AUD-418 | TST-007 | Low | Privileged tests | — | already fixed (lab PR 138, with NN-AUD-079) |
 | NN-AUD-419 | TST-013 | Low | Privileged tests | S | fixed (lab PR 195) |
 | NN-AUD-420 | TST-014 | Low | Privileged tests | S | fixed (lab PR 195) |
@@ -10006,3 +10006,118 @@ group, the ones an unprivileged user or a local attacker could use first.
     as expected, nine checked archives and no `.btf` in the cache.
     actionlint and shellcheck are not installed on this host.
   - Lab: No lab guest needed: `deploy/btf-matrix/run-test.sh` (11 offline cases with stubbed curl, gh and agent) and `verify-release-tag.sh selftest` (13 cases on throw-away keys) run in the tests; the BTF matrix dispatch and a tag run happen in CI after the merge, and every tag stops at `verify-tag` until the maintainer's tag-signing key is in `.github/allowed_signers`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.
+- **Wave 3 — lab and range host safety, lab PR 211.** NN-AUD-412
+  (LAB-022), NN-AUD-409 (LAB-019), NN-AUD-415 (LAB-025), NN-AUD-417
+  (LAB-027), all Low: batch 8 of the Wave 3 triage of the supply-chain, lab
+  and tests group, on the integration tree (`main` with lots up to 199, and
+  lots 200–207, on top of lab PR 206's `nn-lab.sh`, templates and
+  `render_user_data`). Lab and range scripts, the guest templates and docs;
+  no change to the agent.
+  - LAB-025 (415, fixed). Re-checked: `SSH_OPTS` had
+    `StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`, used by
+    `vssh`, the five `rsync -e "ssh ${SSH_OPTS[*]}"` (split on a space in
+    `$KEY`) and spelled out again in the two soak `scp`; under whpx
+    `vm_running` was "something on 127.0.0.1:<port> accepts the lab key",
+    and `whpx_down` stops the forwarder, so with the guest down any local
+    process could take the port. Now each guest's
+    `$LAB_DIR/known_hosts` (alias `nn-lab-<guest>`: a changed
+    `NN_LAB_SSH_PORT` keeps it), `StrictHostKeyChecking=yes`,
+    `HostKeyAlgorithms=ssh-ed25519`, `IdentitiesOnly=yes`,
+    `GlobalKnownHostsFile=/dev/null`, `UpdateHostKeys=no`; every guest
+    connection goes through `vssh`, `vrsync` (`RSYNC_RSH`, each option
+    single-quoted for rsync's own splitting) or `vscp`, which fail (255)
+    and say why without a recorded key. `render_user_data` generates an
+    ed25519 host key per render (each render is a new cloud-init instance),
+    fills `__NN_LAB_HOST_KEY__` (the private half, at its line's
+    indentation) and `__NN_LAB_HOST_KEY_PUB__` in the four templates'
+    `ssh_keys:` entry (`ssh_deletekeys: true`; a template without them is
+    refused), writes the user-data and the seed 0600 and keeps only
+    `ssh_host_ed25519_key.pub`; `up` writes `known_hosts` from it before the
+    first boot. For a disk that predates this, `wait_ssh` (from `up`, also
+    on a running guest) rebuilds it from the user-data when that holds the
+    key, else records the key `ssh-keyscan -t ed25519` gets from the port,
+    only while every listener `ss -Hltnp` shows there is the guest's QEMU
+    (pid file) or a process of its whpx forwarder unit (MainPID, cgroup),
+    before and after the scan, with the fingerprint and a clear message;
+    `trust-host-key` does the same on purpose (a guest recreated by an
+    older `nn-lab.sh`, which neither injects a key nor removes
+    `known_hosts`). `guest_probe` tells a host key failure (verification
+    failed, no matching host key type) from a guest not up: `wait_ssh`
+    keeps waiting and says it once, `vm_running` under whpx reports it.
+    `down` refuses without a key ("nothing stopped") rather than leave
+    the guest to be killed, the nightly runs `up` first, `status` prints
+    the fingerprint, `destroy` removes `known_hosts` and the public key.
+  - LAB-022 (412, fixed). Re-checked as reported (`sudo tee` over
+    `~/.aws/credentials`, `sudo rm -rf ~/.aws`, no guard, no trap). Now the
+    `aws-fixture` block: the check exits 2 before anything runs unless
+    `/var/lib/nn-lab-provisioned` exists or `NN_TEST_DISPOSABLE_HOST=1`
+    (the honeypot suite's rule); `~/.aws` (directory, file or link, moved
+    with `mv -T`, never followed) goes to `~/.aws.nn-open-sensor`, the
+    fixture is written in a new 0700 directory, and `aws_fixture_restore`
+    (at the end of step 2 and from the EXIT trap, with INT/TERM/HUP/PIPE
+    turned into exits) removes the fixture only if it still holds the
+    fixture's bytes, the directory only if empty, and moves the saved one
+    back; a leftover `~/.aws.nn-open-sensor` stops the check before it
+    moves anything.
+  - LAB-019 (409, fixed). Re-checked as reported, and any value other than
+    1 deleted. Now `KEEP_DISKS` 0 (default) or 1, else `die`; "disks
+    DELETED"/"disks KEPT" in a line printed also under `FORCE=1`, in the
+    prompt and the branch. Choice beyond the triage: before anything is
+    powered off, every hard-disk image attached to a VM to be deleted must
+    lie in its folder (the `CfgFile` directory, no `..`); a removable
+    drive's image is skipped only if VirtualBox does not open it as a hard
+    disk. The script stays superseded (`docs/adversarial/SUPERSEDED.md`).
+  - LAB-027 (417, fixed). Re-checked as reported. Now the `range-tree`
+    block runs before step 1: ownership (build user or root) and modes (no
+    others-writable path; group-writable only for the build user's private
+    group or root's) of the whole tree and of each parent directory
+    (sticky others-writable allowed), no `.cargo/config*` in a parent and
+    no ignored untracked file under a `.cargo/` of the tree (`.gitignore`
+    ignores `config.toml` everywhere), `git status --porcelain` empty
+    (`NN_ALLOW_DIRTY_TREE=1` lets it through, recorded), HEAD equal to
+    `NN_EXPECT_COMMIT` when set; git runs as the build user (never root in
+    a tree root does not own). `as_build_user` is `sudo -u … env -i HOME
+    USER LOGNAME PATH=$BUILD_PATH LANG bash -c` (no profiles). After the
+    install, the three binaries in `$NN_BIN_DIR` must equal
+    `target/release`'s, and `RANGE_PROVENANCE` (`/root/range-provenance.txt`)
+    gets the commit, `git describe --dirty`, the tree state, the expected
+    commit, the build user, path and features, and `sha256sum` lines.
+    Deviation: a build user who swaps `target/release` between the build
+    and install.sh's copy is not prevented (the digests then describe what
+    was installed); the build user's own `CARGO_HOME` configuration is not
+    checked.
+  - Tests: `xtask/tests/lab_host_safety.rs` (16):
+    `every_guest_template_carries_a_host_key_made_on_the_host` (the key in
+    the rendered user-data is the recorded public half, two renders two
+    keys, user-data 0600, no copy left, a template without `ssh_keys:`
+    refused), `every_guest_connection_checks_the_guests_host_key`
+    (`ssh -G` on the options and on what rsync hands a stub ssh, in a
+    directory with a space), `nn_lab_refuses_a_lab_directory_with_a_quote`,
+    `nn_lab_connects_only_with_the_recorded_host_key` (`nn-lab.sh ssh`,
+    `down`, `status`, `destroy` with a stub ssh first on its PATH),
+    `a_host_key_is_recorded_only_from_the_guests_own_port` (a real
+    listener: another process's port is not asked, a closed port, no
+    ed25519 key), `a_wrong_host_key_is_told_apart_from_a_guest_not_up`,
+    `a_new_guest_is_known_before_its_first_boot`,
+    `nn_lab_has_no_unchecked_guest_connection`,
+    `open_sensor_check_refuses_a_host_that_is_not_a_lab_guest` (only stubs
+    on PATH), `the_aws_fixture_puts_back_what_it_found` (directory, link,
+    none × end of step, error, INT, TERM, HUP),
+    `the_aws_fixture_never_overwrites_a_saved_copy`,
+    `open_sensor_check_uses_the_fixture_block`,
+    `teardown_says_what_it_does_and_does_it`,
+    `teardown_deletes_no_disk_outside_the_vm_folder` (a `VBoxManage` stub),
+    `range_bootstrap_refuses_a_tree_it_cannot_vouch_for` (a scratch git
+    repository outside the worktree: modified, untracked, override, expected
+    commit, others-writable, ignored and parent cargo configuration),
+    `range_bootstrap_checks_first_and_records_what_it_installed`. On the
+    starting scripts all 16 fail; lab PR 206's `lab_scripts.rs` (10) passes
+    unchanged.
+  - Host: `cargo fmt` clean; clippy `--workspace --all-targets` clean (the
+    `posture_demo` clippy of the CI fails on the integration tree before
+    this lot too: `Event::ProcessSpawn` without `argv_truncated` and
+    `filename_truncated`, from lot "kernfid"); `cargo test --workspace`
+    2,723 passed, 0 failed (16 new); `bash -n` on the six scripts; the four
+    templates rendered and parsed as YAML, the injected private key matching
+    the recorded public key; shellcheck is not installed on this host.
+  - Lab: LAB-025 on the lab's four guests: each existing guest's ed25519 key recorded once with `trust-host-key` from its own forwarder, the fingerprint equal to the guest's `ssh-keygen -lf` (24.04, Debian 12, 22.04, Debian 13). A listener of ours on 22.04's port (guest and forwarder stopped, socat to Debian 12's sshd): before this lot `nn-lab.sh ssh` for "ubuntu2204" answered `nn-lab-debian12` / Debian 12; after it `ssh`, `sync` and `trust-host-key` stopped with rc=1 — first "no host key recorded", then, with the key recorded, "does not present guest ubuntu2204's recorded host key … Nothing was sent" — `known_hosts` unchanged and no login on Debian 12 from them. A new guest (Debian 12, `NN_LAB_LOCKDOWN=integrity`): the key generated on the host and injected by cloud-init before the first boot, equal to the guest's, files 600/600/644, `lockdown: OK (integrity …)` (lab PR 206's lockdown guest), `destroy` removed disk and key. LAB-022 on 24.04: a sentinel `~/.aws` kept byte for byte (two sha256, mode 750) through `open-sensor-check` (its checks PASS), a TERM mid-step (rc 143) and a Ctrl-C (rc 130), no `.aws.nn-open-sensor` left; a left-over copy stops the check (rc 1) without touching `~/.aws`; on the WSL host the script refuses with rc 2 ("not an nn-lab guest"). LAB-019 and LAB-027 by their xtask tests (stubs); not run on the VirtualBox range. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.

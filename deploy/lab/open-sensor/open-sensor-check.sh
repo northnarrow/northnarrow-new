@@ -3,6 +3,79 @@
 # lab guest (`nn-lab.sh open-sensor-check`). Run as the lab user with sudo,
 # with the agent installed and running in its default (LSM) mode.
 set -u
+
+# >>> aws-fixture (xtask/tests/lab_host_safety.rs runs this block)
+# External audit LAB-022 (NN-AUD-412, lab PR 211). Step 2 needs a credential
+# file in the lab user's home. The check wrote it over ~/.aws/credentials
+# and then `rm -rf`-ed ~/.aws, wherever it ran: on a workstation, the
+# operator's real AWS credentials were gone. Now the check runs only on a
+# lab guest (cloud-init's marker, as the honeypot suite) or on a host
+# declared disposable (NN_TEST_DISPOSABLE_HOST=1); an existing ~/.aws (a
+# directory, a file or a link, never followed) is moved aside to
+# ~/.aws.nn-open-sensor and put back on every way out (the end of step 2,
+# exit, Ctrl-C, TERM, HUP, a closed pipe); only what the check wrote is
+# removed. A ~/.aws.nn-open-sensor left by a run that could not restore it
+# (killed with -9, a power cut) stops the check before it touches anything.
+NN_LAB_GUEST_MARKER=/var/lib/nn-lab-provisioned
+AWS_FIXTURE='[default]
+aws_access_key_id = NNOPENSENSOR
+'
+AWS_DIR=
+AWS_SAVED=
+AWS_MADE=0
+aws_fixture_allowed() {
+    [[ -e $NN_LAB_GUEST_MARKER || ${NN_TEST_DISPOSABLE_HOST:-} == 1 ]]
+}
+aws_fixture_setup() {   # <home> <user>
+    local dir="$1/.aws" saved="$1/.aws.nn-open-sensor"
+    if [[ -e $saved || -L $saved ]]; then
+        echo "open-sensor check: $saved exists — a run that did not put ~/.aws back; check it, move it back to $dir, and run again" >&2
+        return 1
+    fi
+    AWS_DIR=$dir AWS_SAVED=$saved
+    trap aws_fixture_restore EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    trap 'exit 141' PIPE
+    if [[ -e $dir || -L $dir ]]; then
+        sudo mv -T -- "$dir" "$saved" || return 1
+    fi
+    AWS_MADE=1
+    sudo install -d -o "$2" -m 0700 "$dir" &&
+        printf '%s' "$AWS_FIXTURE" | sudo tee "$dir/credentials" >/dev/null
+}
+aws_fixture_restore() {
+    [[ -n $AWS_DIR ]] || return 0
+    local rc=0
+    if [[ $AWS_MADE == 1 ]]; then
+        # the fixture and the directory made for it, nothing else (the
+        # fixture told by its size: reading it again would be one more
+        # credential read for the agent to report)
+        if [[ -f $AWS_DIR/credentials && ! -L $AWS_DIR/credentials && $(stat -c %s -- "$AWS_DIR/credentials" 2>/dev/null) == "${#AWS_FIXTURE}" ]]; then
+            sudo rm -f -- "$AWS_DIR/credentials"
+        fi
+        if [[ -d $AWS_DIR && ! -L $AWS_DIR ]]; then
+            sudo rmdir -- "$AWS_DIR" 2>/dev/null || { echo "open-sensor check: $AWS_DIR holds files the check did not write: left in place" >&2; rc=1; }
+        fi
+    fi
+    if [[ -e $AWS_SAVED || -L $AWS_SAVED ]]; then
+        if [[ -e $AWS_DIR || -L $AWS_DIR ]]; then
+            echo "open-sensor check: cannot put $AWS_SAVED back: $AWS_DIR exists" >&2
+            rc=1
+        else
+            sudo mv -T -- "$AWS_SAVED" "$AWS_DIR" || rc=1
+        fi
+    fi
+    if ((rc == 0)); then AWS_DIR= AWS_SAVED= AWS_MADE=0; fi
+    return "$rc"
+}
+# <<< aws-fixture
+if ! aws_fixture_allowed; then
+    echo "open-sensor check: refusing to run: not an nn-lab guest ($NN_LAB_GUEST_MARKER missing) and NN_TEST_DISPOSABLE_HOST=1 not set — it writes ~/.aws/credentials, /etc/cron.d and /etc/ssh/sshd_config.d" >&2
+    exit 2
+fi
+
 DET=/var/lib/northnarrow/detections/detections.jsonl
 NNADMIN=$(dirname "$(systemctl show -p ExecStart --value northnarrow-agent | grep -oE 'path=[^ ;]+' | head -1 | cut -d= -f2)")/nn-admin
 IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
@@ -41,7 +114,8 @@ fi
 # process. Reported (High) but not acted on (design Q8): the cat survives.
 # The fixture is written by a process the check does not need afterwards.
 U=$(id -un); H=$(getent passwd "$U" | cut -d: -f6)
-sudo install -d -o "$U" "$H/.aws" && printf '[default]\naws_access_key_id = NNOPENSENSOR\n' | sudo tee "$H/.aws/credentials" >/dev/null
+[[ -n $H && -d $H ]] || { echo "open-sensor check: no home directory for $U" >&2; exit 2; }
+aws_fixture_setup "$H" "$U" || { echo "open-sensor check: FAILED (the ~/.aws fixture)"; exit 1; }
 # Detection records name the reader, the journal's VERDICT line the file.
 fim011() { # $1 = detection count before, $2 = reader comm
     new_dets "$1" | grep '"NN-L-FIM-011_AwsCredsRead"' | grep "\"comm\":\"$2\"" | grep -c '"Log"'
@@ -65,7 +139,7 @@ elif [[ -x $IOU_BIN ]] || { sudo mkdir -p "$(dirname "$IOU_BIN")" && sudo cc -O2
 else
     printf 'SKIP  io_uring probe not built\n'
 fi
-sudo rm -rf "$H/.aws"
+aws_fixture_restore || bad "~/.aws not put back as found (see above)"
 
 # 3. mass write: 25 write-opens counted in the kernel, one event
 mark=$(date '+%Y-%m-%d %H:%M:%S')
