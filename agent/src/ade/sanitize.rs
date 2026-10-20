@@ -156,6 +156,11 @@ pub const ARGV_MAX_ITEMS: usize = 32;
 pub const ARGV_TOTAL_CAP: usize = 1024;
 pub const ENV_VALUE_CAP: usize = 64;
 
+/// External audit LLMP-007: characters of a rule's reasoning an enrichment
+/// template prints. A reasoning quotes the strings its rule fired on (an
+/// argv of up to 512 bytes at the kernel, a path, a correlation summary).
+pub const REASONING_CAP: usize = 1024;
+
 /// Sanitized projection of an [`Event`] suitable for inclusion in
 /// the LLM prompt.
 ///
@@ -833,6 +838,71 @@ pub(crate) fn sanitize_line(input: &str, cap: usize) -> String {
             }
         })
         .collect()
+}
+
+/// A JSON string literal: quotes, backslashes and control characters
+/// escaped, always on one line. One function for the structured prompt
+/// (external audit LLMP-001) and the enrichment templates (LLMP-007), so
+/// that both quote the same way.
+pub(crate) fn json_quote(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"<unencodable>\"".to_string())
+}
+
+/// External audit LLMP-007: one `label: "value"` line of an enrichment
+/// template, for a string an observed process chose (a name, a path, a
+/// host name) or a rule's reasoning that quotes one. [`sanitize_line`] at
+/// `cap` characters ([`sanitize_string`], its flags dropped — the templates
+/// carry no score — then NEL, U+2028 and U+2029 as `?`, which JSON leaves
+/// as they are), then [`json_quote`]: the value can neither end its line
+/// nor pass for a section of the prompt.
+pub(crate) fn push_untrusted_kv(buf: &mut String, label: &str, value: &str, cap: usize) {
+    let safe = sanitize_line(value, cap);
+    buf.push_str(label);
+    buf.push_str(": ");
+    buf.push_str(&json_quote(&safe));
+    buf.push('\n');
+}
+
+/// External audit LLMP-007, LLMP-009: an argv as one `label: [...]` line, a
+/// JSON array of strings sanitized as by [`push_untrusted_kv`], within the
+/// caps of the focal prompt's argv: at most [`ARGV_MAX_ITEMS`] items of at
+/// most [`ARGV_PER_ITEM_CAP`] characters, at most [`ARGV_TOTAL_CAP`] bytes
+/// in all (the item that crosses it is cut on a character boundary, the
+/// rest left out). Returns `true` when anything was cut, for the caller's
+/// `argv_truncated: true`.
+pub(crate) fn push_untrusted_argv(buf: &mut String, label: &str, argv: &[String]) -> bool {
+    let mut items: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut cut = argv.len() > ARGV_MAX_ITEMS;
+    for arg in argv.iter().take(ARGV_MAX_ITEMS) {
+        if arg.chars().count() > ARGV_PER_ITEM_CAP {
+            cut = true;
+        }
+        let mut safe = sanitize_line(arg, ARGV_PER_ITEM_CAP);
+        let room = ARGV_TOTAL_CAP - total;
+        if safe.len() > room {
+            let mut end = room;
+            while !safe.is_char_boundary(end) {
+                end -= 1;
+            }
+            safe.truncate(end);
+            if !safe.is_empty() {
+                items.push(json_quote(&safe));
+            }
+            cut = true;
+            break;
+        }
+        total += safe.len();
+        items.push(json_quote(&safe));
+    }
+    if items.len() < argv.len() {
+        cut = true;
+    }
+    buf.push_str(label);
+    buf.push_str(": [");
+    buf.push_str(&items.join(", "));
+    buf.push_str("]\n");
+    cut
 }
 
 /// Multilingual keyword search.

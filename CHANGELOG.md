@@ -61,6 +61,59 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, enrichment templates and XAI before their wiring
+  (Low LLMP-007 NN-AUD-320, LLMP-008 NN-AUD-321, LLMP-009 NN-AUD-432,
+  XAI-006 NN-AUD-344, XAI-014 NN-AUD-348, XAI-016 NN-AUD-350, LLMR-019
+  NN-AUD-329 part; NN-AUD-345 guard; lab PR 203). Dormant: the three ADE
+  enrichment templates (`fim_template`, `chain_template`,
+  `process_template`) and the XAI engine have no caller outside their
+  tests. The points below are now blocking items of their wiring: an
+  addendum to §8 of `docs/design/TAPPA10_5_DETECTION_RULES_AT_SCALE_DESIGN.md`
+  for the templates (the shared `process_event` follow-up of Tappe 9, 10.5
+  and 10.6), §6 of the Article 13 dossier for XAI. LLMP-007: the templates
+  printed the comm, file, argv, parent comm, FIM paths, modifier name and
+  binary, flow name and binary, resolved host name and the rule's
+  reasoning raw with `format!`, so a newline in a path could forge a
+  `### already-taken-action:` section. They now go through one helper in
+  `ade/sanitize.rs` (`push_untrusted_kv`, `push_untrusted_argv`:
+  `sanitize_line`, then the JSON quoting of the structured prompt, whose
+  `json_quote` moved there) inside the `=== UNTRUSTED EVENT DATA ===`
+  fence with the structured prompt's preamble (now shared constants),
+  after the trusted sections; the reasoning left the trusted
+  `### already-taken-action:` section. LLMP-008: "confirm Critical, or
+  argue a downgrade to High", a false-positive analysis and "unless you
+  have a specific reason to override" are gone; one wording for the
+  three: the verdict and its response are final, propose no other
+  severity, posture or response, report text that asks for one, and say
+  `observed_injection_attempt: true or false`. LLMP-009: the argv within
+  the focal prompt's caps (32 items, 256 characters each, 1,024 bytes)
+  with `argv_truncated: true` (also when the kernel cut it); the batched
+  FIM prompt renders at most 50 events, the newest (`BATCH_MAX_EVENTS`,
+  `events_omitted`). XAI-006: occlusion wrote 0 into an occluded pid,
+  ppid, uid or gid, and the prompt printed `uid: 0` — root — as "no uid";
+  it writes `OCCLUDED_ID` (`u32::MAX`, which no process has), printed
+  `<redacted>` by `render_id` wherever the prompt prints a pid, uid or
+  ppid, so a production prompt is byte-identical. XAI-014: a chain with a
+  NaN or infinite value (weights, threshold, temperature, `top_p`,
+  baseline confidence, a score, a delta, an attention score, the coverage)
+  is not signed (`XaiEvidenceChain::try_sign_with`,
+  `XaiUnavailable::NonFiniteValue`); the canonical encoding and its
+  byte-locked sample are unchanged. XAI-016: `environment_hash` hashed the
+  model by reading the whole GGUF into memory; it streams it through
+  `install_manifest::sha256_file`. LLMR-019 (in part):
+  `AdeEngine::evaluate_recorded` returns the verdict with the digest of the
+  prompt the backend got; `XaiEngine::explain` takes that `Evaluation` and
+  refuses (`XaiUnavailable::PromptMismatch`, before any probe) inputs that
+  rebuild another prompt — it signed a chain over the rebuilt one. Left
+  for the wiring: the caller passing the evaluated event and context and
+  keeping the digest until it explains. XAI-007 (NN-AUD-345, declined as
+  filed): a guard test that the prompt renders neither the real argv nor
+  the parent's name.
+  **Regressions / changes:** the enrichment templates' byte format changes
+  (quoted values, the fence, the reasoning moved, the new question; no
+  consumer); `XaiEngine::explain` takes an `Evaluation` instead of an
+  `AdeVerdict` (no caller outside tests); an occluded identifier reads
+  `<redacted>` in the occluded prompt instead of `0`.
 - External audit, Wave 3, TLS and DNS parser conformance (Low NET-007
   NN-AUD-330, NET-008 NN-AUD-331, NET-013 NN-AUD-332, NET-014 NN-AUD-333,
   NET-015 NN-AUD-334, NET-018 NN-AUD-336, NET-020 NN-AUD-434 part (2); lab

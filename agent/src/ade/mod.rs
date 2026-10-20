@@ -77,6 +77,23 @@ pub use streaming_parser::StreamingJsonDetector;
 use crate::rag::{RagEngine, RagQuery};
 use sanitize::SanitizedCorrelated;
 
+/// External audit LLMR-019: what [`AdeEngine::evaluate_recorded`] returns,
+/// the verdict and the digest of the prompt it was decided on.
+#[derive(Debug, Clone)]
+pub struct Evaluation {
+    pub verdict: AdeVerdict,
+    /// [`prompt_sha256`] of the prompt the backend was given; `None` when
+    /// none was (an injection short-circuit, a prompt over the window).
+    pub prompt_sha256: Option<String>,
+}
+
+/// Lower-case hex SHA-256 of a prompt: the digest `evaluate_recorded`
+/// returns and the XAI chain's `prompt_sha256`, one function for both.
+pub fn prompt_sha256(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(prompt.as_bytes()))
+}
+
 /// What [`AdeEngine::prepare`] makes of an event.
 enum Prepared {
     /// The sanitizer's score keeps the event from the model.
@@ -225,6 +242,38 @@ impl AdeEngine {
         event: &Event,
         context: &EventContext,
     ) -> Result<AdeVerdict, AdeError> {
+        self.evaluate_inner(event, context, &mut None).await
+    }
+
+    /// External audit LLMR-019: [`Self::evaluate`], with the digest of the
+    /// prompt the backend was given beside the verdict
+    /// ([`Evaluation::prompt_sha256`]), for `XaiEngine::explain` to check
+    /// that it explains that prompt and not one rebuilt from other inputs.
+    /// The schema-v1 verdict is unchanged.
+    pub async fn evaluate_recorded(
+        &self,
+        event: &Event,
+        context: &EventContext,
+    ) -> Result<Evaluation, AdeError> {
+        let mut prompt_sha256 = None;
+        let verdict = self
+            .evaluate_inner(event, context, &mut prompt_sha256)
+            .await?;
+        Ok(Evaluation {
+            verdict,
+            prompt_sha256,
+        })
+    }
+
+    /// The body of [`Self::evaluate`] and [`Self::evaluate_recorded`]:
+    /// `sent` is set to the digest of the prompt once it is built, before
+    /// the backend runs.
+    async fn evaluate_inner(
+        &self,
+        event: &Event,
+        context: &EventContext,
+        sent: &mut Option<String>,
+    ) -> Result<AdeVerdict, AdeError> {
         let (prompt, sanitized, correlated) = match self.prepare(event, context) {
             Prepared::Rejected(sanitized) => {
                 tracing::warn!(
@@ -252,7 +301,10 @@ impl AdeEngine {
                 prompt,
                 sanitized,
                 correlated,
-            } => (prompt, sanitized, correlated),
+            } => {
+                *sent = Some(prompt_sha256(&prompt));
+                (prompt, sanitized, correlated)
+            }
         };
 
         let backend = self.inner.backend.clone();
