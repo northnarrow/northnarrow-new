@@ -76,9 +76,15 @@ exposes a `num_threads: Option<usize>` field; when `None`,
 minimum of 1. The CLI flag `--ade-threads N` overrides the
 auto-detection.
 
-`CandleBackend::load` sets `RAYON_NUM_THREADS` from the resolved
-value before any candle code runs, so the rayon global pool starts
-sized correctly.
+The agent's `main` sets `RAYON_NUM_THREADS` from the resolved value
+before it builds the tokio runtime, while the process has one thread
+(`ade::backend_candle::pin_threads_before_runtime`; external audit
+LLMR-009: setting it at the ADE load, inside the runtime, raced the
+other threads' reads of the environment). The rayon global pool starts
+sized correctly, and candle-core, which reads the variable again to
+split its kernels, uses the same count. A `RAYON_NUM_THREADS` already
+in the environment wins; the journal says which (`ADE rayon worker
+count pinned via RAYON_NUM_THREADS`, or the operator override).
 
 ### How to find the optimum
 
@@ -107,7 +113,11 @@ Sub-tappa 6.8 adds:
 - A **`StreamingJsonDetector`** (in `agent/src/ade/streaming_parser.rs`)
   that tracks brace depth across a token stream — string-aware,
   escape-aware — and reports completion the moment the outermost
-  object closes.
+  object closes. It reads the stream as the parser reads the output:
+  a `<think> … </think>` block first, then the first `{`, ignoring
+  every character before it (external audit LLMP-010: a `}` or an odd
+  quote there lost the early stop, and braces in the reasoning stopped
+  the decode before the verdict).
 - Wiring in `AdeEngine::evaluate` that combines the two: as soon as
   the JSON object terminates, `evaluate` calls `Stop` and the
   decoder returns whatever's already buffered.

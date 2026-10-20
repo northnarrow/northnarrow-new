@@ -61,8 +61,21 @@ impl AttackOutcome {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // External audit LLMR-009: candle's worker count is pinned while the
+    // process is single-threaded (the ADE load no longer writes the
+    // environment), then the runtime `#[tokio::main]` built.
+    let pin = northnarrow_agent::ade::backend_candle::pin_threads_before_runtime(
+        AdeConfig::default().effective_threads(),
+    );
+    eprintln!("candle threads: {pin:?}");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     eprintln!("=== NorthNarrow ADE prompt-injection attack suite ===");
     let model_path: PathBuf = env::var_os("ADE_MODEL")
         .map(PathBuf::from)

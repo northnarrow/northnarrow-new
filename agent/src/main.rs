@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use common::posture_types::PostureKind;
 use common::Event;
+use northnarrow_agent::ade::backend_candle::ThreadPin;
 use northnarrow_agent::ade::{
     check_ade_memory, AdeConfig, AdeEngine, AdeMemCheck, EventContext, HostContext,
 };
@@ -763,8 +764,7 @@ fn report_open_rules(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.build_features {
         let features = northnarrow_agent::audit::build_features();
@@ -793,6 +793,55 @@ async fn main() -> Result<()> {
         }
     }
 
+    // External audit LLMR-009 (NN-AUD-325): candle's worker count is pinned
+    // in RAYON_NUM_THREADS here, while this thread is the process's only
+    // one. The ADE load did it inside `#[tokio::main]`, with the runtime's
+    // workers already running. The runtime is the one `#[tokio::main]`
+    // built: multi-thread, every driver.
+    let ade_threads = pin_ade_threads(&cli);
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?
+        .block_on(run(cli, ade_threads))
+}
+
+/// External audit LLMR-009: the pin, when the ADE may load — not
+/// `--no-ade`, a file at the model path — as the ADE load did it (after
+/// its missing-model check), with the rule of
+/// [`AdeConfig::effective_threads`].
+fn pin_ade_threads(cli: &Cli) -> Option<ThreadPin> {
+    if cli.no_ade {
+        return None;
+    }
+    let cfg = ade_config(cli);
+    if !cfg.model_path.exists() {
+        return None;
+    }
+    Some(
+        northnarrow_agent::ade::backend_candle::pin_threads_before_runtime(cfg.effective_threads()),
+    )
+}
+
+/// The ADE configuration the command line asks for.
+fn ade_config(cli: &Cli) -> AdeConfig {
+    let mut cfg = AdeConfig::default();
+    if let Some(p) = cli.ade_model.clone() {
+        cfg.model_path = p;
+    }
+    if let Some(p) = cli.ade_prompt.clone() {
+        cfg.system_prompt_path = p;
+    }
+    if let Some(secs) = cli.ade_timeout {
+        cfg.timeout = Duration::from_secs(secs);
+    }
+    if let Some(n) = cli.ade_threads {
+        cfg.num_threads = Some(n);
+    }
+    cfg
+}
+
+async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
     // Lab finding (external audit EBPF-001 work): when the log stream is
     // gone — journald@northnarrow stopped, at shutdown or by root — the
     // fmt layer reported the failed write with `eprintln!`, which panics
@@ -813,6 +862,9 @@ async fn main() -> Result<()> {
         .init();
 
     info!("NorthNarrow agent starting...");
+    if let Some(pin) = &ade_threads {
+        pin.log();
+    }
     // External audit DEP-005 (NN-AUD-381): on a host where the unit's
     // memory cap cannot bind, the unit's OOMScoreAdjust=-500 is raised to 0
     // before anything grows (the self-integrity check expects it there).
@@ -1724,19 +1776,7 @@ async fn main() -> Result<()> {
         info!("ADE disabled by --no-ade");
         None
     } else {
-        let mut cfg = AdeConfig::default();
-        if let Some(p) = cli.ade_model.clone() {
-            cfg.model_path = p;
-        }
-        if let Some(p) = cli.ade_prompt.clone() {
-            cfg.system_prompt_path = p;
-        }
-        if let Some(secs) = cli.ade_timeout {
-            cfg.timeout = Duration::from_secs(secs);
-        }
-        if let Some(n) = cli.ade_threads {
-            cfg.num_threads = Some(n);
-        }
+        let cfg = ade_config(&cli);
         // Beta Step 2b: pre-flight RAM guard. Loading the GGUF peaks
         // ~7 GB RSS; on a VM without that headroom the load OOM-crashes
         // the agent. Refuse the load when MemAvailable can't cover the

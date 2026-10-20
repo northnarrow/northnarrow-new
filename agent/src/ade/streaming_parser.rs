@@ -12,26 +12,46 @@
 //! engine accumulates the full decoded text separately and feeds it
 //! to [`super::parser::VerdictParser`]; this module's only job is to
 //! say "yes, the JSON is structurally complete — you can stop now".
+//! It reads the stream as the parser reads the output: a `<think> …
+//! </think>` block first, then the first balanced `{ … }` after it.
+
+/// The longer of the two reasoning markers, in characters.
+const MARKER_CHARS: usize = "</think>".len();
 
 /// Brace-depth tracker that recognises a complete top-level JSON
 /// object inside a (possibly noisy) text stream.
 ///
 /// Behaviour:
 ///
-/// - Ignores any text that precedes the first `{`. Foundation-Sec
-///   sometimes emits prose like `"Verdict: {…}"`; the leading
-///   characters are simply absorbed.
-/// - Tracks string mode: `"`-delimited spans don't contribute to
-///   brace depth. Escaped quotes (`\"`) inside strings are honoured.
+/// - Ignores every character before the first `{` — quotes and `}`
+///   included. Foundation-Sec sometimes emits prose like
+///   `Verdict: {…}`; the leading characters are simply absorbed.
+///   External audit LLMP-010 (NN-AUD-322): a `}` there took the depth to
+///   -1 for good, and a `"` switched string mode on before the object,
+///   so that an odd count of quotes read the object's own quotes
+///   inverted; either way the object never closed and the decode ran to
+///   `max_output_tokens`.
+/// - Skips a `<think> … </think>` reasoning block before the object, as
+///   the parser strips it: a balanced `{ … }` in the reasoning stopped
+///   the decode there, before `</think>`, and the parser then refused the
+///   output (an unclosed reasoning block) — an Escalate for a verdict
+///   the model had not written yet. Markers split across chunks are
+///   matched.
+/// - Tracks string mode inside the object: `"`-delimited spans don't
+///   contribute to brace depth. Escaped quotes (`\"`) inside strings
+///   are honoured.
 /// - Returns `true` from [`feed`](Self::feed) the first time the
-///   outermost object closes (`brace_depth == 0` after at least one
-///   `{`). Subsequent calls keep returning `false` so the engine can
-///   safely keep feeding text past the boundary without re-firing.
+///   outermost object closes. Subsequent calls keep returning `false`
+///   so the engine can safely keep feeding text past the boundary
+///   without re-firing.
 #[derive(Debug, Default)]
 pub struct StreamingJsonDetector {
-    buffer: String,
+    /// The last characters before the object, at most
+    /// [`MARKER_CHARS`]: where a reasoning marker is matched.
+    tail: String,
+    in_think: bool,
     in_json: bool,
-    brace_depth: i32,
+    brace_depth: u32,
     in_string: bool,
     escape_next: bool,
     completed: bool,
@@ -42,18 +62,20 @@ impl StreamingJsonDetector {
         Self::default()
     }
 
-    /// Append `chunk` to the rolling buffer and report whether the
-    /// outermost JSON object has just closed. Idempotent after the
-    /// first completion: once `true` is returned, all further
-    /// `feed` calls store the bytes but always return `false`.
+    /// Read `chunk` and report whether the outermost JSON object has
+    /// just closed. Idempotent after the first completion: once `true`
+    /// is returned, all further `feed` calls return `false`. Nothing is
+    /// kept of the text but the few characters a marker needs (the
+    /// engine has the output).
     pub fn feed(&mut self, chunk: &str) -> bool {
         if self.completed {
-            self.buffer.push_str(chunk);
             return false;
         }
         for c in chunk.chars() {
-            self.buffer.push(c);
-
+            if !self.in_json {
+                self.before_object(c);
+                continue;
+            }
             if self.escape_next {
                 self.escape_next = false;
                 continue;
@@ -68,15 +90,10 @@ impl StreamingJsonDetector {
             }
             match c {
                 '"' => self.in_string = true,
-                '{' => {
-                    if !self.in_json {
-                        self.in_json = true;
-                    }
-                    self.brace_depth += 1;
-                }
+                '{' => self.brace_depth += 1,
                 '}' => {
-                    self.brace_depth -= 1;
-                    if self.in_json && self.brace_depth == 0 {
+                    self.brace_depth = self.brace_depth.saturating_sub(1);
+                    if self.brace_depth == 0 {
                         self.completed = true;
                         return true;
                     }
@@ -87,9 +104,29 @@ impl StreamingJsonDetector {
         false
     }
 
-    /// All bytes seen so far, in order.
-    pub fn buffer(&self) -> &str {
-        &self.buffer
+    /// One character before the object: a reasoning marker, the object's
+    /// first `{`, or nothing.
+    fn before_object(&mut self, c: char) {
+        self.tail.push(c);
+        if self.tail.chars().count() > MARKER_CHARS {
+            let first = self.tail.chars().next().map_or(0, char::len_utf8);
+            self.tail.drain(..first);
+        }
+        if self.in_think {
+            if self.tail.ends_with("</think>") {
+                self.in_think = false;
+                self.tail.clear();
+            }
+            return;
+        }
+        if self.tail.ends_with("<think>") {
+            self.in_think = true;
+            self.tail.clear();
+        } else if c == '{' {
+            self.in_json = true;
+            self.brace_depth = 1;
+            self.tail.clear();
+        }
     }
 
     /// `true` if [`feed`](Self::feed) has reported a complete object
@@ -103,12 +140,26 @@ impl StreamingJsonDetector {
 mod tests {
     use super::StreamingJsonDetector;
 
+    /// Feeds `s` one character at a time; the index of the character at
+    /// which the detector fired.
+    fn fires_at(s: &str) -> Option<usize> {
+        let mut d = StreamingJsonDetector::new();
+        let mut at = None;
+        for (i, ch) in s.chars().enumerate() {
+            let mut buf = [0u8; 4];
+            if d.feed(ch.encode_utf8(&mut buf)) {
+                assert!(at.is_none(), "fired twice");
+                at = Some(i);
+            }
+        }
+        at
+    }
+
     #[test]
     fn empty_input_does_not_complete() {
         let mut d = StreamingJsonDetector::new();
         assert!(!d.feed(""));
         assert!(!d.is_complete());
-        assert_eq!(d.buffer(), "");
     }
 
     #[test]
@@ -116,7 +167,6 @@ mod tests {
         let mut d = StreamingJsonDetector::new();
         assert!(d.feed("{\"a\":1}"));
         assert!(d.is_complete());
-        assert_eq!(d.buffer(), "{\"a\":1}");
     }
 
     #[test]
@@ -128,7 +178,6 @@ mod tests {
         // Feed the outer close — now it completes.
         assert!(d.feed("}"));
         assert!(d.is_complete());
-        assert_eq!(d.buffer(), "{\"a\":{\"b\":1}}");
     }
 
     #[test]
@@ -151,17 +200,7 @@ mod tests {
     #[test]
     fn progressive_one_char_at_a_time_completes_at_correct_boundary() {
         let s = "{\"k\":[1,2,3],\"o\":{\"n\":true}}";
-        let mut d = StreamingJsonDetector::new();
-        let mut completed_at = None;
-        for (i, ch) in s.chars().enumerate() {
-            let mut buf = [0u8; 4];
-            let chunk = ch.encode_utf8(&mut buf);
-            if d.feed(chunk) && completed_at.is_none() {
-                completed_at = Some(i);
-            }
-        }
-        assert_eq!(completed_at, Some(s.len() - 1));
-        assert_eq!(d.buffer(), s);
+        assert_eq!(fires_at(s), Some(s.chars().count() - 1));
     }
 
     #[test]
@@ -180,11 +219,84 @@ mod tests {
         let mut d = StreamingJsonDetector::new();
         // First completion fires.
         assert!(d.feed("{\"a\":1}"));
-        // The model keeps emitting tokens; we accumulate them but
-        // must not re-signal completion (the engine has already
-        // told the backend to stop).
+        // The model keeps emitting tokens; they must not re-signal
+        // completion (the engine has already told the backend to stop).
         assert!(!d.feed(" trailing prose {\"b\":2} more"));
         assert!(d.is_complete());
-        assert_eq!(d.buffer(), "{\"a\":1} trailing prose {\"b\":2} more");
+    }
+
+    /// External audit LLMP-010: a `}` before the object took the depth
+    /// to -1 for good.
+    #[test]
+    fn stray_closing_brace_before_json_still_completes() {
+        let mut d = StreamingJsonDetector::new();
+        assert!(!d.feed("Note: } and }} are not the verdict.\n"));
+        assert!(d.feed("{\"verdict\":\"Allow\",\"o\":{\"n\":1}}"));
+        let s = "x}{\"a\":1}";
+        assert_eq!(fires_at(s), Some(s.chars().count() - 1));
+    }
+
+    /// External audit LLMP-010, wider than reported: an odd count of
+    /// quotes before the object read its own quotes inverted.
+    #[test]
+    fn odd_quote_in_preamble_still_completes() {
+        let mut d = StreamingJsonDetector::new();
+        assert!(!d.feed("The process \"xmrig looks like a miner.\n"));
+        assert!(d.feed("{\"verdict\":\"Kill\",\"note\":\"a } in a string\"}"));
+        let s = "\"\"\" {\"a\":\"b\"}";
+        assert_eq!(fires_at(s), Some(s.chars().count() - 1));
+    }
+
+    /// A balanced `{ … }` in the reasoning block is not the verdict: the
+    /// detector completes at the object after `</think>`, as the parser
+    /// reads it.
+    #[test]
+    fn braces_in_the_reasoning_block_do_not_stop_the_decode() {
+        let think = "<think>The event {pid: 4242} has \"comm\" xmrig; the answer is {\"verdict\": …}.</think>\n";
+        let object = "{\"verdict\":\"Kill\"}";
+        let s = format!("{think}{object} trailing");
+        assert_eq!(
+            fires_at(&s),
+            Some(think.chars().count() + object.chars().count() - 1)
+        );
+    }
+
+    /// The markers are matched when the tokenizer splits them.
+    #[test]
+    fn reasoning_markers_split_across_chunks_are_matched() {
+        let mut d = StreamingJsonDetector::new();
+        for chunk in [
+            "<th",
+            "ink",
+            ">{a}",
+            " {\"x\":1} </",
+            "thi",
+            "nk>",
+            "\n{\"v\":",
+        ] {
+            assert!(!d.feed(chunk), "{chunk:?}");
+        }
+        assert!(d.feed("2}"));
+    }
+
+    /// A reasoning block that never closes never completes (the parser
+    /// refuses that output; the decode runs to its budget, as before).
+    #[test]
+    fn unclosed_reasoning_block_never_completes() {
+        assert_eq!(fires_at("<think>{\"a\":1} {b} still thinking"), None);
+    }
+
+    /// A marker inside the object is part of a string, not a marker.
+    #[test]
+    fn markers_inside_the_object_are_text() {
+        let s = "{\"a\":\"<think>\",\"b\":\"}\"}";
+        assert_eq!(fires_at(s), Some(s.chars().count() - 1));
+    }
+
+    #[test]
+    fn multibyte_text_before_the_object_is_absorbed() {
+        let s = "Verdetto è «pronto» → ";
+        let full = format!("{s}{{\"a\":1}}");
+        assert_eq!(fires_at(&full), Some(full.chars().count() - 1));
     }
 }

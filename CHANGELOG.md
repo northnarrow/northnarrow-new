@@ -61,6 +61,60 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, ADE runtime hygiene (Low LLMP-005 NN-AUD-319,
+  LLMP-010 NN-AUD-322, LLMR-009 NN-AUD-325, LLMR-018 NN-AUD-328, LLMR-020
+  NN-AUD-433, XAI-017 NN-AUD-351; lab PR 191). LLMR-009: the ADE load set
+  `RAYON_NUM_THREADS` with `std::env::set_var` inside `#[tokio::main]`,
+  with the runtime's workers and the logging already running — a write of
+  the environment racing their reads, undefined behaviour, under a comment
+  that called the point race-free. The agent's `main` is a plain function:
+  it parses the command line, runs the early exits, pins the variable
+  while its thread is the process's only one (checked in
+  `/proc/self/status`, no runtime current; otherwise nothing is written
+  and a WARN says so), then builds the runtime `#[tokio::main]` built
+  (multi-thread, every driver) and runs the agent in it. Same value and
+  rule as before (`--ade-threads`, else physical cores − 1; an operator's
+  variable wins), set when the ADE may load (not `--no-ade`, a file at the
+  model path); the ADE load now only says the count, a WARN when nothing
+  pinned it. The variable stays (candle-core reads it again at every
+  kernel split; a pool sized by rayon's builder alone would leave candle
+  splitting for every logical CPU). The `ade_demo` and `ade_attacks`
+  examples pin the same way. LLMP-010, wider than reported: the streaming
+  detector that stops the decode at the verdict's close took a `}` before
+  the object to depth -1 for good, and a `"` there switched string mode
+  on, so that with an odd count of quotes the object never closed: the
+  decode ran to `max_output_tokens` (cost only, bounded by the timeout).
+  It also counted braces in the model's `<think>` block: a balanced `{ … }`
+  in the reasoning stopped the decode before `</think>`, and the parser
+  refused the output — a malformed-output Escalate for a verdict the model
+  had not written yet. The detector reads the stream as the parser reads
+  the output: a `<think> … </think>` block first (markers split across
+  tokens matched), every character before the first `{` ignored, the depth
+  saturating at 0; it keeps no copy of the output (the unread `buffer` is
+  gone). LLMP-005: `recommended_action.action` was never checked against
+  `verdict`; nothing decides on it, but a model's `Kill` under an `Alert`
+  was kept as it was: the engine aligns it on the verdict (a debug line
+  when they differed), and the parser's two dead statements are gone.
+  LLMR-018: the mock fallback (`NN_ADE_ALLOW_MOCK=1` only) stamped the
+  configured GGUF's stem and `Q4_K_M` as model and quantization in its
+  verdicts; it says `mock-deterministic` and `none`. LLMR-020: the candle
+  warmup marked itself done before its forward pass ran; it is done once
+  the pass succeeded, and the constant, uncalled `AdeEngine::is_ready` is
+  removed. XAI-017: `CorrelationBuffer::new(0)` never evicted; the
+  capacity is at least 1 and a push evicts while the buffer is full (the
+  agent's buffer is the 1,000-event default). Prompts and scores are
+  unchanged. **Regressions / changes:** the journal line `ADE rayon worker
+  count pinned via RAYON_NUM_THREADS` comes at the start of the boot, not
+  at the ADE load, and is written when the ADE may load even if the
+  memory check then keeps it off; an operator's `RAYON_NUM_THREADS` is
+  said at INFO (it was DEBUG); a tokio runtime that cannot be built ends
+  `main` with an error instead of a panic; on a model host the decode
+  stops sooner after prose with quotes or braces, and a reasoning block
+  with braces gives the model's verdict instead of a malformed-output
+  Escalate (not measured on a model host); the mock fallback's verdicts
+  carry `mock-deterministic` / `none`; `AdeEngine::is_ready`,
+  `StreamingJsonDetector::buffer` and `CandleBackend::configure_threads`
+  are gone from the library API.
 - External audit, Wave 3, verifiers and forensic tools on bad input (Low
   MAIN-014 NN-AUD-256, EVD-017 NN-AUD-280, EVD-022 NN-AUD-283; lab PR
   190). EVD-017: a sealed archive without its terminator line (an empty

@@ -4,10 +4,11 @@
 //! `common::ade_types`. Any violation surfaces as a precise
 //! [`ValidationError`] so the escalation transformer can fold it into
 //! a Tier1 review with full diagnostic detail.
+//!
+//! Not a rule: `recommended_action.action` different from `verdict` is
+//! normalised by the engine, not a parse error (external audit LLMP-005).
 
-use common::ade_types::{
-    AdeAction, AdeSeverity, AdeVerdict, EscalationTier, FollowUpPolicy, ADE_SCHEMA_VERSION,
-};
+use common::ade_types::{AdeAction, AdeSeverity, AdeVerdict, FollowUpPolicy, ADE_SCHEMA_VERSION};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -225,8 +226,10 @@ impl VerdictParser {
         // automatically — `AdeAction`, `AdeSeverity`, etc. are
         // closed enums, so an unknown string surfaces as a
         // `MalformedJson` error.
-        let _ = (v.recommended_action.action, v.escalation_tier);
-        let _: Option<EscalationTier> = v.escalation_tier;
+        //
+        // External audit LLMP-005: `recommended_action.action` different
+        // from `verdict` is not a parse error; the engine aligns it on the
+        // verdict (`AdeEngine::evaluate`), which is all anything decides on.
 
         Ok(())
     }
@@ -354,8 +357,8 @@ fn has_at_most_two_decimals(v: f64) -> bool {
 mod tests {
     use super::*;
     use common::ade_types::{
-        AdeMetadata, AlternativeExplanations, EscalationPackage, Evidence, FollowUp, MitreAttack,
-        ReasoningSteps, RecommendedAction, ThreatClassification,
+        AdeMetadata, AlternativeExplanations, EscalationPackage, EscalationTier, Evidence,
+        FollowUp, MitreAttack, ReasoningSteps, RecommendedAction, ThreatClassification,
     };
 
     fn base_verdict() -> AdeVerdict {
@@ -597,6 +600,22 @@ mod tests {
             err,
             ValidationError::InvalidConfidencePrecision { .. }
         ));
+    }
+
+    /// External audit LLMP-005: a recommended action that differs from the
+    /// verdict is accepted here; the engine aligns it on the verdict.
+    #[test]
+    fn recommended_action_mismatch_is_not_a_parse_error() {
+        let mut v = base_verdict();
+        assert_eq!(v.verdict, AdeAction::Alert);
+        v.recommended_action.action = AdeAction::Kill;
+        parser()
+            .validate(&v)
+            .expect("a mismatch is normalised, not refused");
+        let raw = serde_json::to_string(&v).unwrap();
+        let parsed = parser().parse(&raw).expect("parses");
+        assert_eq!(parsed.verdict, AdeAction::Alert);
+        assert_eq!(parsed.recommended_action.action, AdeAction::Kill);
     }
 
     /// External audit LLMP-006: a Kill at confidence 5.00 has two

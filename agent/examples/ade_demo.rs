@@ -11,10 +11,22 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use common::Event;
+use northnarrow_agent::ade::backend_candle::{pin_threads_before_runtime, ThreadPin};
 use northnarrow_agent::ade::{AdeConfig, AdeEngine, EventContext, HostContext};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // External audit LLMR-009: candle's worker count is pinned while the
+    // process is single-threaded (the ADE load no longer writes the
+    // environment), then the runtime `#[tokio::main]` built.
+    let pin = pin_threads_before_runtime(AdeConfig::default().effective_threads());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(run(pin))
+}
+
+async fn run(pin: ThreadPin) -> ExitCode {
     // Surface backend load + warmup messages so we can tell at a
     // glance whether the real Candle backend or the Mock fallback
     // is in use. Without this the runtime falls back silently.
@@ -25,6 +37,7 @@ async fn main() -> ExitCode {
         )
         .with_target(false)
         .try_init();
+    pin.log();
 
     let model_path = PathBuf::from(
         std::env::var("ADE_MODEL").unwrap_or_else(|_| AdeConfig::DEFAULT_MODEL_PATH.to_string()),

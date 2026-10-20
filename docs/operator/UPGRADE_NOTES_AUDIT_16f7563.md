@@ -787,6 +787,16 @@ Now **killed, or answered, where they were recorded or missed**:
   (the child's name, arguments and file) and its `ExecCheck` only when no
   spawn follows within 2 s; before, the `ExecCheck` (the parent's name)
   took the slot and the spawn was dropped (found in lab PR 144).
+- **Decode stop and threads** (NN-AUD-322 LLMP-010, NN-AUD-325 LLMR-009,
+  lab PR 191). The decode stops at the close of the verdict object after a
+  `<think>` block and after any prose before the object; a stray `}` or an
+  odd quote there ran it to `max_output_tokens`, and braces in the
+  reasoning stopped it before the verdict (a malformed-output Escalate).
+  **Change:** on a model host such outputs now give the model's verdict,
+  sooner (not measured on a model host). The journal line `ADE rayon
+  worker count pinned via RAYON_NUM_THREADS` comes at the start of the
+  boot (the variable is set before the runtime, when the ADE may load); an
+  operator's `RAYON_NUM_THREADS` is said at INFO.
 - **Tokenizer** (NN-AUD-091 MAIN-006, lab PR 151): Rust `fancy-regex`
   instead of the C Oniguruma library; same pieces and ids on the golden
   corpus, a full prompt in about 7.5 ms instead of 6.

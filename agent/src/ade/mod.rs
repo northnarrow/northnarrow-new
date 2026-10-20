@@ -164,8 +164,8 @@ impl AdeEngine {
     /// Returns a fresh handle wired with a [`RagEngine`].
     ///
     /// The previous handle is left untouched (Arc-shared `EngineInner`
-    /// would be cheap to clone but we want to preserve `is_ready`-like
-    /// callers that still hold the no-RAG variant).
+    /// would be cheap to clone, but a caller that still holds the no-RAG
+    /// variant keeps it).
     pub fn with_rag(self, rag: Arc<RagEngine>) -> Self {
         let prev = &self.inner;
         let inner = EngineInner {
@@ -321,6 +321,20 @@ impl AdeEngine {
 
         match self.inner.parser.parse(&raw) {
             Ok(mut v) => {
+                // External audit LLMP-005 (NN-AUD-319): the recommended
+                // action is the verdict. Nothing decides on the field
+                // (`requires_execution`, `to_response_action` and the
+                // advisory switch on `verdict`), but a model that wrote
+                // `Kill` there under an `Alert` left a record that said
+                // both.
+                if v.recommended_action.action != v.verdict {
+                    tracing::debug!(
+                        verdict = %v.verdict,
+                        recommended = %v.recommended_action.action,
+                        "ADE recommended action differs from the verdict: aligned on the verdict"
+                    );
+                    v.recommended_action.action = v.verdict;
+                }
                 v.metadata.model_id = self.inner.backend.model_id().to_string();
                 v.metadata.model_quantization = self.inner.backend.quantization().to_string();
                 v.metadata.backend = self.inner.backend.name().to_string();
@@ -581,10 +595,6 @@ impl AdeEngine {
     pub fn backend_name(&self) -> &str {
         self.inner.backend.name()
     }
-
-    pub fn is_ready(&self) -> bool {
-        true
-    }
 }
 
 /// Injection score at-or-above this threshold causes
@@ -664,10 +674,10 @@ fn build_default_backend(config: &AdeConfig) -> Result<Arc<dyn InferenceBackend>
         });
     }
 
-    // Sub-tappa 6.8: pin rayon worker count before any candle code
-    // initialises the global thread pool. Honours an existing
-    // RAYON_NUM_THREADS so an operator can override at the shell.
-    backend_candle::CandleBackend::configure_threads(config.effective_threads());
+    // Sub-tappa 6.8: candle's worker count is pinned in RAYON_NUM_THREADS
+    // before any thread exists (`main`, external audit LLMR-009); here it is
+    // only said, a WARN when nothing pinned it.
+    backend_candle::log_kernel_threads();
 
     match backend_candle::CandleBackend::load(&config.model_path) {
         // External audit LLMR-002: a generation never outlives the
