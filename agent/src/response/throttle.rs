@@ -47,14 +47,11 @@ pub fn throttle_pid(pid: u32, protected: &HashSet<u32>, cfg: &ExecutorConfig) ->
         };
     }
 
+    // External audit CMB-020: detect-only touches nothing and says so —
+    // `Throttled` with the three limits here was a cap never set.
     if cfg.dry_run {
         info!(pid, "dry-run: would throttle pid");
-        return ExecutionOutcome::Throttled {
-            pid,
-            cpu_max_pct: Some(CPU_MAX_PCT),
-            io_weight: Some(IO_WEIGHT),
-            memory_high_bytes: Some(MEMORY_HIGH_BYTES),
-        };
+        return ExecutionOutcome::WouldExecute { pid };
     }
 
     // A process under the blocked scope — blocked, or in a kill cgroup
@@ -280,21 +277,18 @@ mod tests {
         ExecutorConfig::for_test(tmp.path())
     }
 
+    /// External audit CMB-020: detect-only reports `WouldExecute`, never
+    /// `Throttled` with limits it did not set.
     #[test]
-    fn dry_run_returns_throttled_without_touching_system() {
+    fn dry_run_returns_would_execute_without_touching_system() {
         let tmp = TempDir::new().unwrap();
         let cfg = dry_cfg(&tmp);
         let protected = HashSet::new();
         let out = throttle_pid(4242, &protected, &cfg);
-        assert!(matches!(
-            out,
-            ExecutionOutcome::Throttled {
-                pid: 4242,
-                cpu_max_pct: Some(10),
-                io_weight: Some(10),
-                memory_high_bytes: Some(MEMORY_HIGH_BYTES),
-            }
-        ));
+        assert!(
+            matches!(out, ExecutionOutcome::WouldExecute { pid: 4242 }),
+            "{out:?}"
+        );
         assert!(!cfg.throttled_cgroup_dir().exists());
     }
 

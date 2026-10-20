@@ -521,15 +521,15 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-307 | POS-011 | Low | Posture | S | open |
 | NN-AUD-308 | POS-012 | Low | Posture | — | declined (the ADE parser already refuses Allow with a severity, rule 5b) |
 | NN-AUD-309 | POS-014 | Low | Posture | — | declined (the transition log has no production reader; not in `nn-admin status`) |
-| NN-AUD-310 | CMB-018 | Low | Combat response | S | partly fixed (lab PR 118); open |
-| NN-AUD-311 | CMB-020 | Low | Combat response | S | open |
+| NN-AUD-310 | CMB-018 | Low | Combat response | S | fixed (lab PR 193) |
+| NN-AUD-311 | CMB-020 | Low | Combat response | S | fixed (lab PR 193) |
 | NN-AUD-312 | CMB-021 | Low | Combat response | — | declined (`cgroup_slice` is not configurable in production) |
 | NN-AUD-313 | CMB-022 | Low | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-314 | CMB-023 | Low | Combat response | — | obsolete (lab PR 103) |
 | NN-AUD-315 | CMB-024 | Low | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-316 | CMB-025 | Low | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-317 | CMB-026 | Low | Combat response | — | already fixed (lab PR 123) |
-| NN-AUD-318 | CMB-027 | Low | Combat response | S–M | partly fixed (lab PR 118; the audit's fail-closed declined); open |
+| NN-AUD-318 | CMB-027 | Low | Combat response | S–M | fixed (lab PR 193) |
 | NN-AUD-319 | LLMP-005 | Low | LLM prompts | S | fixed (lab PR 191) |
 | NN-AUD-320 | LLMP-007 | Low | LLM prompts | M | open (dormant: templates not wired) |
 | NN-AUD-321 | LLMP-008 | Low | LLM prompts | S | open (dormant) |
@@ -7985,3 +7985,94 @@ group, the ones an unprivileged user or a local attacker could use first.
     `a_forged_shutdown_marker_is_refused_and_the_agent_respawned`, and the
     unlock e2e must stay green unchanged; no revoke e2e exists.
   - Lab: No lab probe (the triage's call): the signed-verb privileged suites ran unchanged in the gate — `shutdown_signed_round_trip`, `rotate_keys_round_trip`, the unlock e2e, `audit_verify_e2e`, the watchdog's two shutdown-marker e2e; the Kani proof of the signature cap (every length up to 8) VERIFICATION SUCCESSFUL; `revoke` with a real fingerprint collision covered by unit tests only (no e2e exists for it). Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.
+- **Wave 3 — response honesty and status, lab PR 193.** Batch B5 of the
+  Wave 3 triage of group G4: NN-AUD-311 (CMB-020), NN-AUD-318 (CMB-027,
+  the remaining part, with the triage's fix instead of the audit's
+  fail-closed), NN-AUD-310 (CMB-018, the remaining part), all Low, on top
+  of main (lots to 186) and lots 187–191. Files: `response/{block_outbound,
+  throttle,quarantine,tests}.rs`, `combat/{evidence,mod,tests}.rs`,
+  `audit.rs` (`format_ts` crate-visible), `admin_socket.rs`,
+  `admin_cli.rs`, `bin/nn_admin.rs`, `main.rs`,
+  `common/src/wire/admin_protocol.rs`, the watchdog's status fixture. Wire:
+  five fields appended to `StatusResponse`, no `AdminMessage` variant (the
+  discriminant pin is unchanged and green in both feature sets).
+  - Before: `block_outbound_for_pid` returned `Blocked` in detect-only,
+    `throttle_pid` `Throttled` with the three limits, `quarantine_handle`
+    `Quarantined { vault_id: "dry-run" }`, and two tests pinned the first
+    two; no agent path reached them (the dispatcher and
+    `Executor::quarantine_handle` answer `WouldExecute` first).
+    `AuditEvidence::record_stage` returned `()`: an append failure was a
+    WARN and the transition was lost, a run without an audit log recorded
+    nothing and said nothing, and no caller could check "evidence before
+    enforcement". `StatusResponse` had no detect-only field: `nn-admin
+    status` showed an enforcing agent and a detect-only one the same way.
+  - CMB-020: the three branches return `WouldExecute { pid }`; the two
+    tests are inverted and renamed.
+  - CMB-027, the triage's fix: blocking ISOLATE on an audit failure would
+    let whoever breaks the audit log (fills its filesystem) prevent the
+    containment. `record_stage` returns `Result<(), Unrecorded>`
+    (`NoAuditLog`, or `Queued { error, waiting }`); `Inner::record` wraps
+    the five call sites: on `Err` an ERROR line with the whole transition
+    (from, to, trigger, offenders, the reason escaped), and the ladder
+    proceeds. `AuditEvidence` keeps the refused transition with its time
+    in a queue of `RETRY_QUEUE_DEPTH` (64) and writes the queue, oldest
+    first and before the new transition, at the next `record_stage` and at
+    the stand-down (`retry_pending`, on the worker after the releases): a
+    `combat_stage` row with `deferred: true` and `occurred_at`. While the
+    queue cannot be written, a new transition waits behind it (order
+    kept). A full queue drops its oldest (WARN), counts it, and the next
+    row written carries `transitions_lost`. `counts()` (unrecorded since
+    boot, pending, dropped) is lock-free; `CombatLadder::evidence_counts`
+    feeds the status. `client_uid: 0` and `key_fp: "agent-self"` stay:
+    they mark an agent-originated row. Not done: the queue lives in
+    memory — what still waits when the agent stops is lost, its ERROR line
+    stays in the journal.
+  - CMB-018: `StatusResponse` gains `detect_only`, `detect_only_source`,
+    `combat_evidence_unrecorded`, `combat_evidence_pending`,
+    `combat_evidence_dropped` (`Option`, `serde(default)`), filled from
+    `ResponseAdminState` (`config.dry_run`, the new `detect_only_source` —
+    `--detect-only` or `NAME=value`, the value the signed `agent_boot`
+    records — and `combat_evidence`); `None` without a response state.
+    `nn-admin status` prints `response mode` and `combat evidence`, and
+    its JSON the five keys. Declined, as triaged: dropping the environment
+    channel, a signed overlay for detect-only.
+  - Found while adding the fields: postcard carries no field count, so
+    `serde(default)` never fills a trailing field an older agent did not
+    send; the "`None` from an agent older than the field" notes of
+    `StatusResponse` hold only for an older `nn-admin` reading a newer
+    agent (trailing bytes ignored). The struct's doc says so; pinned by
+    `an_older_nn_admin_reads_a_newer_status_reply` and
+    `a_newer_nn_admin_cannot_read_an_older_status_reply`. The watchdog's
+    ping decodes the same reply: a watchdog newer than the agent counts
+    its pings as failed. Declared in the upgrade notes (§3): upgrade the
+    binaries together. Not done here: a ping that checks the variant only.
+  - Tests: `response` `module_dry_run_branches_return_would_execute` (the
+    three functions, nothing touched: no scopes, the file in place, no
+    vault), `block_outbound`/`throttle`
+    `dry_run_returns_would_execute_without_touching_system`;
+    `combat::evidence` `a_refused_transition_is_written_late_in_order_with_its_time`,
+    `retry_pending_writes_what_waits`,
+    `a_full_queue_drops_the_oldest_and_says_so`,
+    `no_audit_log_is_unrecorded` (a real `AuditLog`, made to fail by
+    turning its file into a directory, EISDIR for root too; the chain
+    verifies after); `combat::tests` `a_failing_audit_log_never_holds_the_ladder`
+    (soft block, kill and isolation driven while every append fails;
+    counts 3/3/0, then the stand-down writes INVESTIGATE, NEUTRALIZE,
+    ISOLATE once each, in order, `occurred_at` ≤ `ts`);
+    `admin_socket` `status_reports_detect_only_and_combat_evidence`;
+    `admin_cli` `cli_status_returns_server_response` (extended); `nn-admin`
+    `status_shows_the_response_mode_and_its_source`,
+    `status_shows_the_unrecorded_combat_transitions`; the two wire pins and
+    `roundtrip_status_response_with_combat_stage` (extended). On the
+    starting behaviour (the three old returns, the old `record_stage`
+    behind the new signature, the status fields left `None`) these fail:
+    the three dry-run tests, the four `combat::evidence` tests,
+    `a_failing_audit_log_never_holds_the_ladder` (at the counts: the
+    stages were driven there too) and
+    `status_reports_detect_only_and_combat_evidence`; the `nn-admin` line
+    tests and the wire pins do not compile there. Host: `cargo fmt`, both
+    clippy runs (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean, `cargo test --workspace` 2,507
+    passed, 0 failed; `wire::admin_protocol` with `debug-trigger` 43
+    passed.
+  - Lab: Ubuntu 24.04 (mode) and Ubuntu 22.04 (evidence), resphonest193-probe.sh — before: the build of `main` with lab PRs 176–191; after: this lot on top. `nn-admin status`: no response-mode line before; after `response mode : enforcing`, then `DETECT-ONLY (NN_DETECT_ONLY=1) — no response action and no COMBAT isolation touch the system` under the probe's drop-in, and `combat evidence : complete`. With the agent detect-only and `audit.log` made to refuse appends (a directory at its name, inside a trusted-installer window), COMBAT forced: the ladder reached ISOLATE in ~34 s (the WARN "STAGE 3 reached — would engage", no `NORTHNARROW_COMBAT` chain, the gateway answering), three ERRORs "COMBAT stage transition NOT in the signed audit log — enforcement proceeds" with from/to/reason, and status "3 … not written … 3 queued for a late write, 0 dropped"; with the log put back and the unlock, the three `combat_stage` rows written late (`deferred: true`, each with its `occurred_at`), `audit verify` exit 0. The before run of this step did not start (the probe's detect-only check read `/proc/<pid>/environ`, which the agent's own ptrace hook denies to root; the check now reads systemd's unit environment); the old WARN-only path is pinned by the unit tests that fail on it. Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.

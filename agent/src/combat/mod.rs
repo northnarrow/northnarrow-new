@@ -75,7 +75,7 @@ mod tests;
 
 pub use crate::response::proc_ref::ProcRef;
 pub use actuator::{CombatActuator, NeutralizeOutcome, SoftBlock, SystemActuator};
-pub use evidence::{AuditEvidence, LadderEvidence, StageTransition};
+pub use evidence::{AuditEvidence, EvidenceCounts, LadderEvidence, StageTransition, Unrecorded};
 pub use protected::{NoProtectedProcs, ProtectedProcs, ProtectedReason, SystemProtectedProcs};
 
 /// The active-response stage WITHIN COMBAT posture. Ordered by
@@ -376,6 +376,12 @@ impl CombatLadder {
         } else {
             None
         }
+    }
+
+    /// External audit CMB-027: the stage transitions the signed audit log
+    /// did not get when they happened, for `nn-admin status`.
+    pub fn evidence_counts(&self) -> EvidenceCounts {
+        self.inner.evidence.counts()
     }
 
     /// Snapshot of the offender PID set (test/telemetry helper).
@@ -778,6 +784,27 @@ impl CombatLadder {
 }
 
 impl Inner {
+    /// External audit CMB-027: evidence before enforcement, checked. A
+    /// transition the audit log did not take is logged here whole, at
+    /// ERROR — then the journal line is its record until the sink writes it
+    /// late — and the ladder proceeds: holding the next stage on the audit
+    /// log would let whoever breaks it (fills its filesystem) prevent the
+    /// containment.
+    fn record(&self, t: StageTransition) {
+        if let Err(why) = self.evidence.record_stage(&t) {
+            tracing::error!(
+                target: "combat.audit",
+                from = t.from.map(|s| s.as_str()).unwrap_or("-"),
+                to = %t.to,
+                trigger = ?t.trigger,
+                offenders = ?t.offenders,
+                reason = %common::log_escape::Escaped(&t.reason),
+                why = %why,
+                "COMBAT stage transition NOT in the signed audit log — enforcement proceeds"
+            );
+        }
+    }
+
     /// Run one job (on the worker, or inline).
     fn run(&self, job: Job) {
         let current = |episode: u64| {
@@ -815,7 +842,7 @@ impl Inner {
                 if !notes.is_empty() {
                     reason.push_str(&format!(" | soft egress: {}", notes.join("; ")));
                 }
-                self.evidence.record_stage(&StageTransition {
+                self.record(StageTransition {
                     from: None,
                     to: CombatStage::Investigate,
                     trigger,
@@ -861,6 +888,9 @@ impl Inner {
                 for target in blocked {
                     self.actuator.soft_egress_clear(&target);
                 }
+                // External audit CMB-027: the episode's transitions the
+                // audit log refused do not wait for the next episode.
+                self.evidence.retry_pending();
                 if let Some(done) = done {
                     let _ = done.try_send(());
                 }
@@ -954,7 +984,7 @@ impl Inner {
                     "COMBAT: soft egress block did NOT take effect — the INVESTIGATE window is shortened"
                 );
                 if record && first {
-                    self.evidence.record_stage(&StageTransition {
+                    self.record(StageTransition {
                         from: Some(stage),
                         to: stage,
                         trigger,
@@ -1120,7 +1150,7 @@ impl Inner {
                             fmt_protected(&spared)
                         )
                     };
-                    self.evidence.record_stage(&StageTransition {
+                    self.record(StageTransition {
                         from: Some(from),
                         to: CombatStage::Neutralize,
                         trigger,
@@ -1199,7 +1229,7 @@ impl Inner {
                          (unlocked); containment stays at the process level until the \
                          posture locks COMBAT"
                     );
-                    self.evidence.record_stage(&StageTransition {
+                    self.record(StageTransition {
                         from: Some(from),
                         to: from,
                         trigger,
@@ -1224,7 +1254,7 @@ impl Inner {
                     );
                     // Evidence FIRST — emitted before the iptables DROP,
                     // so isolation never blinds the operator.
-                    self.evidence.record_stage(&StageTransition {
+                    self.record(StageTransition {
                         from: Some(from),
                         to: CombatStage::Isolate,
                         trigger,

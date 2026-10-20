@@ -619,6 +619,18 @@ pub struct StatusRequest {}
 /// `status` reply payload — posture + network state + a rough
 /// "last admin action" timer for the operator. `None` means no
 /// admin action has been observed since the agent started.
+///
+/// Compatibility (lab PR 193, pinned by the tests
+/// `an_older_nn_admin_reads_a_newer_status_reply` and
+/// `a_newer_nn_admin_cannot_read_an_older_status_reply`): fields are only
+/// appended. An `nn-admin` older than the agent reads the fields it knows
+/// (postcard ignores the bytes after them). The reverse does not hold:
+/// postcard carries no field count, so `#[serde(default)]` never fills a
+/// trailing field an older agent did not send — the reply fails to
+/// decode (the watchdog's ping decodes it too, and then fails). The
+/// "`None` from an agent older than the field" notes below describe a
+/// self-describing decoder; over the admin socket, upgrade the agent with
+/// (or before) `nn-admin` and the watchdog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub posture: PostureKind,
@@ -675,6 +687,25 @@ pub struct StatusResponse {
     pub flow_sock_capacity: Option<u64>,
     #[serde(default)]
     pub flow_sock_forgotten_min: Option<u64>,
+    /// External audit CMB-018 (lab PR 193): whether the agent runs
+    /// detect-only — no response action and no COMBAT isolation touches
+    /// the system — and what set it (`--detect-only` or `NAME=value` of the
+    /// environment variable), as its signed `agent_boot` entry records.
+    /// `None` when the agent has no response state (no executor).
+    #[serde(default)]
+    pub detect_only: Option<bool>,
+    #[serde(default)]
+    pub detect_only_source: Option<String>,
+    /// External audit CMB-027 (lab PR 193): COMBAT stage transitions the
+    /// signed audit log did not get when they happened, since boot; of
+    /// those, the ones still queued for a late write, and the ones dropped
+    /// from the full queue (never written). `None` without a COMBAT ladder.
+    #[serde(default)]
+    pub combat_evidence_unrecorded: Option<u64>,
+    #[serde(default)]
+    pub combat_evidence_pending: Option<u64>,
+    #[serde(default)]
+    pub combat_evidence_dropped: Option<u64>,
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -1372,6 +1403,11 @@ mod tests {
             flow_sock_pending: None,
             flow_sock_capacity: None,
             flow_sock_forgotten_min: None,
+            detect_only: None,
+            detect_only_source: None,
+            combat_evidence_unrecorded: None,
+            combat_evidence_pending: None,
+            combat_evidence_dropped: None,
         }));
     }
 
@@ -1393,6 +1429,11 @@ mod tests {
             flow_sock_pending: None,
             flow_sock_capacity: None,
             flow_sock_forgotten_min: None,
+            detect_only: None,
+            detect_only_source: None,
+            combat_evidence_unrecorded: None,
+            combat_evidence_pending: None,
+            combat_evidence_dropped: None,
         }));
     }
 
@@ -1562,7 +1603,101 @@ mod tests {
             flow_sock_pending: Some(70_000),
             flow_sock_capacity: Some(65_536),
             flow_sock_forgotten_min: Some(4_464),
+            detect_only: Some(true),
+            detect_only_source: Some("NN_DETECT_ONLY=1".to_string()),
+            combat_evidence_unrecorded: Some(3),
+            combat_evidence_pending: Some(1),
+            combat_evidence_dropped: Some(0),
         }));
+    }
+
+    /// The status reply as it was before lab PR 193 (lab PR 164's last
+    /// field), for the compatibility pins.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct StatusResponseLabPr164 {
+        posture: PostureKind,
+        network_isolation_engaged: bool,
+        last_admin_action_secs_ago: Option<u64>,
+        ringbuf_drops_total: Option<u64>,
+        ringbuf_drops: Option<Vec<(String, u64)>>,
+        combat_stage: Option<String>,
+        combat_locked: Option<bool>,
+        ringbuf_rejected_total: Option<u64>,
+        ringbuf_rejected: Option<Vec<(String, u64)>>,
+        netflow_rows_skipped_total: Option<u64>,
+        netflow_pending_evicted_total: Option<u64>,
+        net_inactive_rules: Option<Vec<String>>,
+        flow_sock_pending: Option<u64>,
+        flow_sock_capacity: Option<u64>,
+        flow_sock_forgotten_min: Option<u64>,
+    }
+
+    fn status_with_lab193_fields() -> StatusResponse {
+        StatusResponse {
+            posture: PostureKind::Combat,
+            network_isolation_engaged: false,
+            last_admin_action_secs_ago: Some(7),
+            ringbuf_drops_total: Some(0),
+            ringbuf_drops: Some(Vec::new()),
+            combat_stage: Some("ISOLATE".to_string()),
+            combat_locked: Some(true),
+            ringbuf_rejected_total: Some(0),
+            ringbuf_rejected: Some(Vec::new()),
+            netflow_rows_skipped_total: Some(0),
+            netflow_pending_evicted_total: Some(0),
+            net_inactive_rules: Some(Vec::new()),
+            flow_sock_pending: None,
+            flow_sock_capacity: None,
+            flow_sock_forgotten_min: None,
+            detect_only: Some(true),
+            detect_only_source: Some("--detect-only".to_string()),
+            combat_evidence_unrecorded: Some(2),
+            combat_evidence_pending: Some(2),
+            combat_evidence_dropped: Some(0),
+        }
+    }
+
+    /// External audit CMB-018 / CMB-027 (lab PR 193): an `nn-admin` older
+    /// than the agent decodes the reply — the new fields are trailing bytes
+    /// it ignores — inside the frame too.
+    #[test]
+    fn an_older_nn_admin_reads_a_newer_status_reply() {
+        let new = status_with_lab193_fields();
+        let body = postcard::to_allocvec(&new).unwrap();
+        let old: StatusResponseLabPr164 = postcard::from_bytes(&body).unwrap();
+        assert_eq!(old.combat_stage.as_deref(), Some("ISOLATE"));
+        assert_eq!(old.combat_locked, Some(true));
+        assert_eq!(old.last_admin_action_secs_ago, Some(7));
+        assert_eq!(old.flow_sock_forgotten_min, None);
+        // The frame an older client reads: same variant index, same prefix.
+        let frame = encode_frame(&AdminMessage::StatusResponse(new)).unwrap();
+        assert_eq!(&frame[5..], &body[..], "variant byte, then the struct");
+    }
+
+    /// The limit, pinned: postcard has no field count, so an `nn-admin`
+    /// newer than the agent cannot decode an older agent's reply —
+    /// `serde(default)` does not apply to a missing trailing field.
+    #[test]
+    fn a_newer_nn_admin_cannot_read_an_older_status_reply() {
+        let old = StatusResponseLabPr164 {
+            posture: PostureKind::Observing,
+            network_isolation_engaged: false,
+            last_admin_action_secs_ago: None,
+            ringbuf_drops_total: Some(0),
+            ringbuf_drops: Some(Vec::new()),
+            combat_stage: None,
+            combat_locked: Some(false),
+            ringbuf_rejected_total: Some(0),
+            ringbuf_rejected: Some(Vec::new()),
+            netflow_rows_skipped_total: Some(0),
+            netflow_pending_evicted_total: Some(0),
+            net_inactive_rules: Some(Vec::new()),
+            flow_sock_pending: None,
+            flow_sock_capacity: None,
+            flow_sock_forgotten_min: None,
+        };
+        let body = postcard::to_allocvec(&old).unwrap();
+        assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
     }
 
     /// External audit CMB-016: the three response verbs and their replies

@@ -300,16 +300,15 @@ pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> 
         None => return ExecutionOutcome::AlreadyGone { pid: target_pid },
     };
 
+    // External audit CMB-020: detect-only touches nothing and says so —
+    // `Quarantined` with the vault id "dry-run" was a file never moved.
     if cfg.dry_run {
         info!(
             pid = target_pid,
             path = %common::log_escape::Escaped(&original_str),
             "dry-run: would quarantine binary"
         );
-        return ExecutionOutcome::Quarantined {
-            original_path: original_str,
-            vault_id: "dry-run".to_string(),
-        };
+        return ExecutionOutcome::WouldExecute { pid: target_pid };
     }
 
     match quarantine_file(handle, cfg) {

@@ -3499,6 +3499,11 @@ mod tests {
                 flow_sock_pending: None,
                 flow_sock_capacity: None,
                 flow_sock_forgotten_min: None,
+                detect_only: None,
+                detect_only_source: None,
+                combat_evidence_unrecorded: None,
+                combat_evidence_pending: None,
+                combat_evidence_dropped: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");
