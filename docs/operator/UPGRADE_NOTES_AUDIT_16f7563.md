@@ -383,6 +383,20 @@ packages open it themselves.
   A descriptor a root process opens and hands on keeps root's credentials
   — the check is on the process that connected. The journal line names
   the refused uid, pid, `comm` and executable.
+- **Signed requests: one shape, one key per fingerprint** (NN-AUD-244
+  AUT-001, NN-AUD-245 AUT-005, NN-AUD-246 AUT-006, lab PR 192). A signed
+  request carries at most 8 signatures, and its payload names the
+  request's operation in both its tag and its fields; anything else is
+  refused before a signature is checked (exit 2 and 5 respectively). The
+  watchdog refuses a shutdown marker with more than 8 signatures (and
+  respawns the agent). `rotate-keys add` of a key whose 8-hex fingerprint
+  a different installed key already holds is refused as a collision, and
+  `rotate-keys revoke` of a fingerprint shared by two different keys
+  removes nothing (both lines went); both exit 2, and the agent's journal
+  (`admin.rotate_keys`) says which refusal it was. **Regression:** only
+  for such a colliding pair, which `nn-admin` never creates: remove the
+  line you mean by hand. Every `nn-admin` verb, the wire format and every
+  existing signature are unchanged.
 - **`nn-admin` no longer creates `agent_id`** (NN-AUD-252 MAIN-010, lab
   PR 185). Every verb that signs for the agent's identity, and `config
   overlay status`, used to mint `/etc/northnarrow/agent_id` when it was

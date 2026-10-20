@@ -188,6 +188,12 @@ verifies *each* signature against the outstanding nonce and tallies
 from the same key is rejected. Implementation cost is moderate —
 ~150 LOC for the quorum verify + protocol changes.
 
+External audit AUT-005 (lab PR 192): one submission carries at most
+8 signatures (`admin_quorum::MAX_SUBMITTED_SIGNATURES`); more are
+refused before any is checked — `InvalidSignature` on the wire, counted
+against the connection. The watchdog applies the same cap to a shutdown
+marker. `nn-admin` sends one or two.
+
 ### 3.4 No central CA / no PKI
 
 NorthNarrow is sovereign-first. There is **no certificate
@@ -381,6 +387,14 @@ where `domain_sep = b"northnarrow.admin.v1"`. Verification
 re-serialises locally and compares; this avoids signature
 malleability over alternative CBOR encodings.
 
+`op` and the `extra` variant are encoded independently, so a payload
+can pair one operation's tag with another's fields. Every verifier
+(live request, stored overlay signature, `admin_signed_payload::verify`)
+first runs `admin_signed_payload::check_op`: the tag must be the
+request's operation and the extra that operation's, else
+`UnknownOperation` before any signature is checked (external audit
+AUT-001, lab PR 192 — the live path checked the tag only).
+
 ### 6.4 Replay defence
 
 Three layers:
@@ -480,6 +494,17 @@ appended line (per §3.2 format).
 **Old-key revocation:** `nn-admin rotate-keys revoke
 --fingerprint <8-hex> --key ... --cosign-key ...`. Same atomic
 rewrite path; the revoked key is removed from `admin.pub`.
+
+The fingerprint is 4 bytes (SHA-256 prefix), so two keys can share
+it. External audit AUT-006 (lab PR 192): `add` refuses a key whose
+fingerprint a different installed key holds (the same key again is
+"already present"), and `revoke` refuses a fingerprint that matches
+two different keys, leaving `admin.pub` untouched (it used to remove
+both); lines of one key listed twice are still all removed. Both
+answer `InvalidSignature` (exit 2) and the agent's journal
+(`admin.rotate_keys`) names the reason. Revocation by full key is
+not offered (wire and UX change for a case that needs a crafted
+collision).
 
 ### 7.3 Revocation
 

@@ -2440,7 +2440,12 @@ fn exit_from_rotate_keys(outcome: RotateKeysOutcome, op_label: &str) -> ExitCode
             eprintln!(
                 "{}",
                 colorize(
-                    &format!("{op_label}: invalid signature, key-already-present, key-not-found, or last-key guard"),
+                    &format!(
+                        "{op_label}: refused — invalid signature, key already present, \
+                         fingerprint already held by another key, key not found, fingerprint \
+                         matching several keys, or last-key guard (the agent's journal says \
+                         which)"
+                    ),
                     "31",
                     tty
                 )

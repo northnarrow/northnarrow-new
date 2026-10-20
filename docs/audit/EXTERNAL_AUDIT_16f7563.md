@@ -454,10 +454,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-240 | ASK-014 | Low | Admin socket | S | fixed (lab PR 179) |
 | NN-AUD-241 | ASK-015 | Low | Admin socket | S | open |
 | NN-AUD-242 | ASK-016 | Low | Admin socket | S | fixed (lab PR 170) |
-| NN-AUD-243 | ASK-017 | Low | Admin socket | S | open (latent) |
-| NN-AUD-244 | AUT-001 | Low | Admin auth | S | open (latent) |
-| NN-AUD-245 | AUT-005 | Low | Admin auth | S | open |
-| NN-AUD-246 | AUT-006 | Low | Admin auth | S | open |
+| NN-AUD-243 | ASK-017 | Low | Admin socket | S | fixed (lab PR 192) |
+| NN-AUD-244 | AUT-001 | Low | Admin auth | S | fixed (lab PR 192) |
+| NN-AUD-245 | AUT-005 | Low | Admin auth | S | fixed (lab PR 192) |
+| NN-AUD-246 | AUT-006 | Low | Admin auth | S | fixed (lab PR 192) |
 | NN-AUD-247 | AUT-007 | Low | Admin auth | S (docs) | partly fixed (escalation closed, lab PR 138); open |
 | NN-AUD-248 | AUT-010 | Low | Admin auth | — | already fixed (lab PR 115) |
 | NN-AUD-249 | AUT-011 | Low | Admin auth | (S, optional pin test) | declined (premise false: ciborium 0.2.2 caps recursion at 256 levels; the only caller decodes the shutdown marker, not socket input) |
@@ -7876,3 +7876,112 @@ group, the ones an unprivileged user or a local attacker could use first.
     RAYON_NUM_THREADS threads=N` with N the effective threads and no
     "not pinned" WARN, and `ade_smoke` latency unchanged.
   - Lab: No lab or model run: scripted-backend tests cover the early stop through a reasoning block, the aligned recommended action, the mock's labels and the warm-up; the entry point (the runtime now built in a plain `main` after the thread count is set) ran in every privileged suite of the gate; the real-corpus golden suite 28/30 as before, and lab PR 182's byte-stable prompt tests green. Gate: the integration tree of lab PRs 188, 189, 190 and 191 on `main` with lab PRs 176–186 and lab PR 187: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 40 suites, 85 passed, 0 failed each; Debian 13 (6.12) 40 suites, 84 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` and `overlay-check` OK on 24.04; host 2,496 passed, 0 failed.
+- **Wave 3 — signed-request verification, lab PR 192.** NN-AUD-244
+  (AUT-001), NN-AUD-245 (AUT-005), NN-AUD-246 (AUT-006), NN-AUD-243
+  (ASK-017), all Low: batch 4 of the Wave 3 triage of the evidence and
+  admin group, without NN-AUD-242 (ASK-016, fixed in lab PR 170), on the
+  integration tree (`main` baf4c25, lots up to 186, with lots 187–191;
+  lots 179 and 185's `admin_socket.rs` kept as they are). No wire or
+  signature format change; no lab probe beyond the gate.
+  - AUT-001 (244, fixed). Re-checked: `verify_signed_payload_quorum_with_nonce`
+    compared only `payload.op` with the request's operation; the stored
+    path and `admin_signed_payload::verify` also checked the extra. A
+    `ShutdownRequest` whose payload is `op = Shutdown`, `extra = Unlock`,
+    signed by two `shutdown` keys, verified, and `dispatch_shutdown`'s
+    `_ => 30` wrote a marker on a grace nobody signed (a test now shows it);
+    its comment and force-posture's said the invariant was enforced
+    upstream. Now `admin_signed_payload::check_op(payload, expected)` —
+    `OperationExtraMismatch` when the extra is another operation's,
+    `UnexpectedOperation` (new `SignedPayloadError` variant) when the tag is
+    not `expected` — is the first check of the live path, of
+    `verify_stored_payload` and of `verify` (`check_op(p, p.op)`); the
+    agent maps it to `UnknownOperation` (counted), its journal line names
+    `extra`. `dispatch_shutdown` refuses (`UnknownOperation`, ERROR, no
+    marker, no signer recorded) instead of the fallback; both comments
+    corrected. The watchdog's marker verify already matched `(Shutdown,
+    Shutdown)` (`NotAShutdown`), now pinned by a test.
+  - AUT-005 (245, fixed). Re-checked: `match_signatures` checked every
+    submitted signature against every key; only `MAX_FRAME_BODY` (64 KiB)
+    bounded the count; `quorum_decision` and `distinct_matches` are
+    quadratic; `QuorumNotMet` is not counted. Now
+    `admin_quorum::MAX_SUBMITTED_SIGNATURES` = 8, `check_submission_size`,
+    and `match_signatures` returns `Result<_, TooManySignatures>` (the cap
+    inside, so no caller can skip it). The agent checks it right after the
+    operation, before the nonce, the digest or any signature, on the live
+    signed path, the nonce-only quorum path and the stored path:
+    `AdminAuthError::TooManySignatures { submitted }`, journal reason
+    `too_many_signatures`, counted, `InvalidSignature` on the wire (Unlock
+    arm, shutdown, force-posture, `map_admin_auth_error`).
+    `shutdown_marker::verify` checks it after the version, before decoding
+    a signature: `Rejection::TooManySignatures` (the watchdog records its
+    text and respawns). `verify_stored_payload` uses `match_signatures` /
+    `distinct_matches` instead of its own copy of the loop (same results).
+    Kani: the harness's bound is the cap (`SIGS = MAX_SUBMITTED_SIGNATURES`,
+    `unwind(10)`; it was 4).
+  - AUT-006 (246, fixed). Re-checked: `atomic_rewrite_admin_pub_revoke`
+    dropped every parseable line whose 8-hex fingerprint matched, without
+    counting; `atomic_rewrite_admin_pub_add` compared fingerprints only, so
+    a different key with a colliding fingerprint was "already present".
+    Now revoke collects the distinct 32-byte keys that match: none is
+    `KeyNotFound`, two or more `RotateKeysError::AmbiguousFingerprint {
+    fingerprint, matches }` with the file untouched, one removes all its
+    lines (a key listed twice, as before), then the last-key guard. Add
+    compares the 32 bytes (`KeyAlreadyPresent`), then the fingerprint
+    (`FingerprintCollision { fingerprint }`). The dispatchers log each
+    (`admin.rotate_keys`) and answer `InvalidSignature` (exit 2); the
+    `nn-admin` exit-2 message lists the refusals and points to the journal.
+  - ASK-017 (243, fixed). Re-checked: the Unlock arm answered `Success` for
+    any `AdminReleaseError` (three variants since lab PR 138);
+    `admin_release_combat_with_token` returns only `NotInCombat`. Now
+    `unlock_release_result`: `Ok` and `NotInCombat` are `Success`
+    (idempotent), any other refusal an ERROR and `InvalidSignature`, so the
+    audit row reads `failure: invalid_signature`. The release hook's own
+    outcome (`Fn(UnlockToken)`) is still not observable — noted, unchanged.
+  - Choices: the cap is 8, not the triage's 16, so that the Kani proof
+    covers every length the verifiers accept: at 16 the proof had spent 16
+    minutes in symbolic execution and passed 16 GB in the solver when it
+    was stopped (a CI runner has 16 GB); at 8 it takes about 5 minutes and
+    7 GB. 8 is still four times the largest quorum and of what `nn-admin`
+    sends. The cap is a distinct `AdminAuthError` variant (testable, its
+    own journal reason) mapped to the existing wire variant, not a new one.
+    `check_op` keeps the two causes apart in `SignedPayloadError`; the
+    agent's reply stays `UnknownOperation` for both (no more detail on the
+    wire than before). Revoke counts distinct keys, not lines, so a
+    duplicated line is not "ambiguous". The AUT-006 tests use a real
+    collision (two seeds found by a birthday search, prefix `e78e8469`)
+    instead of a test-only fingerprint hook. Not done: longer fingerprints
+    or revoke by full key (wire and UX change, as the triage says);
+    capping the audit row's `cosigner_fps` padding for an oversized
+    refused submission (bounded by the frame and only uid 0 may connect
+    since lab PR 179).
+  - Docs: design §3.3 (cap), §6.3 (`check_op`), §7.2 (fingerprint
+    collisions); upgrade notes §3; CHANGELOG.
+  - Tests: `admin_quorum` `match_signatures_refuses_a_submission_over_the_cap`;
+    `shutdown_marker` `oversized_or_mismatched_markers_are_refused` (8
+    accepted, 9 refused, 1000 undecodable ones refused unread, a
+    `Shutdown`/`Unlock` pair `NotAShutdown`); `admin_signed_payload`
+    `check_op_binds_op_extra_and_the_expected_operation`;
+    `admin_auth` `verify_signed_payload_quorum_rejects_op_extra_mismatch`
+    (live and stored), `verify_quorum_rejects_submission_over_signature_cap`
+    (live, nonce-only and stored; the cap accepted, failures counted),
+    `revoke_refuses_ambiguous_fingerprint`, `add_names_a_fingerprint_collision`;
+    `admin_socket` `unlock_maps_an_unexpected_release_error_to_a_failure`,
+    `dispatch_shutdown_refuses_an_extra_that_is_not_a_shutdown`. With each
+    production change taken back (tag-only check on the live path, no cap,
+    `_ => 30`, `Success` for any release error, fingerprint-only add,
+    no ambiguity check), all nine fail but
+    `check_op_binds_op_extra_and_the_expected_operation`, a pin of the new
+    function (on the base itself the tests naming the new variants and
+    functions do not compile).
+    Kani 0.68.0: `quorum_accepts_only_enough_distinct_keys_carrying_every_role`
+    at the new bound: VERIFICATION SUCCESSFUL, 6 min 19 s, 6.7 GB peak (WSL2
+    host; the CI job's 90-minute budget holds it). Host: `cargo fmt`, both clippy runs
+    (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean; `cargo test --workspace` 2,505
+    passed, 0 failed; `-p northnarrow-common --features debug-trigger` 177
+    passed. Gate: privileged `shutdown_signed_round_trip` and
+    `rotate_keys_round_trip`, the watchdog's
+    `a_quorum_signed_shutdown_marker_stands_the_watchdog_down` and
+    `a_forged_shutdown_marker_is_refused_and_the_agent_respawned`, and the
+    unlock e2e must stay green unchanged; no revoke e2e exists.
+  - Lab: No lab probe (the triage's call): the signed-verb privileged suites ran unchanged in the gate — `shutdown_signed_round_trip`, `rotate_keys_round_trip`, the unlock e2e, `audit_verify_e2e`, the watchdog's two shutdown-marker e2e; the Kani proof of the signature cap (every length up to 8) VERIFICATION SUCCESSFUL; `revoke` with a real fingerprint collision covered by unit tests only (no e2e exists for it). Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.

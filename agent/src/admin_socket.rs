@@ -1750,6 +1750,30 @@ fn unlock_result_str(r: &UnlockResult) -> String {
     }
 }
 
+/// The reply to a verified `unlock`, from what the release did.
+///
+/// Not in COMBAT is idempotent success from the operator's perspective —
+/// there's nothing to release. External audit ASK-017: any other refusal
+/// used to be answered `Success` too, and recorded as one; it is answered
+/// `InvalidSignature` (the legacy reply has no better variant), with an
+/// ERROR, so the audit row says `failure`. Unreachable today
+/// (`admin_release_combat_with_token` refuses only `NotInCombat`). What the
+/// release hook does with the token is not observable here (`Fn(UnlockToken)`).
+fn unlock_release_result(
+    outcome: std::result::Result<crate::posture::PostureState, AdminReleaseError>,
+) -> UnlockResult {
+    match outcome {
+        Ok(_) | Err(AdminReleaseError::NotInCombat) => UnlockResult::Success,
+        Err(other) => {
+            error!(
+                error = %other,
+                "unlock verified but the COMBAT release was refused — answering a failure"
+            );
+            UnlockResult::InvalidSignature
+        }
+    }
+}
+
 /// The audit `result` of a verb that can be verified and still do nothing:
 /// `success` only when it was done.
 fn verified_result_str(r: AdminResult, done: bool, message: &str) -> String {
@@ -1832,21 +1856,7 @@ fn dispatch(
 
         AdminMessage::Unlock(req) => {
             let result = match auth.verify_unlock(&req.signature) {
-                Ok(token) => match posture.admin_release_combat_with_token(token) {
-                    Ok(_) => UnlockResult::Success,
-                    // Admin unlock when not in Combat is idempotent
-                    // success from the operator's perspective —
-                    // there's nothing to release. AdminAuth has
-                    // already cleared its failure counter on the
-                    // successful verify, so this also gives a clean
-                    // path to clear rate-limit state if the operator
-                    // got locked out during a non-Combat scare.
-                    Err(AdminReleaseError::NotInCombat) => UnlockResult::Success,
-                    Err(other) => {
-                        warn!(error = ?other, "admin_release_combat_with_token errored unexpectedly");
-                        UnlockResult::Success
-                    }
-                },
+                Ok(token) => unlock_release_result(posture.admin_release_combat_with_token(token)),
                 Err(AdminAuthError::InvalidSignature) => UnlockResult::InvalidSignature,
                 Err(AdminAuthError::NoPendingChallenge) => UnlockResult::NoPendingChallenge,
                 Err(AdminAuthError::RateLimited { retry_after_secs }) => {
@@ -1892,6 +1902,7 @@ fn dispatch(
                 | Err(AdminAuthError::AgentIdMismatch)
                 | Err(AdminAuthError::NonceMismatch)
                 | Err(AdminAuthError::UnknownOperation { .. })
+                | Err(AdminAuthError::TooManySignatures { .. })
                 | Err(AdminAuthError::PayloadVerify(_)) => UnlockResult::InvalidSignature,
             };
             AdminMessage::UnlockResult(result)
@@ -2150,25 +2161,33 @@ fn dispatch_shutdown(
         Err(AdminAuthError::RateLimited { retry_after_secs }) => {
             return AdminResult::RateLimited { retry_after_secs };
         }
+        Err(AdminAuthError::TooManySignatures { .. }) => return AdminResult::InvalidSignature,
         Err(AdminAuthError::PayloadVerify(e)) => {
             warn!(error = ?e, "shutdown payload verify failed at common layer");
             return AdminResult::InvalidSignature;
         }
     };
-    *fps_out = matched_fps;
 
     // Per §10.3 step 2: the marker carries what the admins signed and
     // this agent's pid, so the watchdog can verify it against admin.pub
     // as we just did (external audit WDG-001) — a marker it cannot
     // verify makes it respawn us.
+    //
+    // External audit AUT-001: the verify above refuses a payload whose
+    // extra is not a shutdown's (`admin_signed_payload::check_op`); it
+    // only checked the op tag, and this fallback stood down with a grace
+    // nobody signed. A payload that reaches here otherwise is refused.
     let grace_secs = match &req.payload.extra {
-        common::wire::admin_signed_payload::OperationExtra::Shutdown(s) => s.grace_secs,
-        // Other extras can't reach here — verify_signed_payload_quorum
-        // already enforced expected_op = Shutdown, which implies the
-        // extra variant via SignedPayload's op/extra invariant.
-        // Belt-and-suspenders default keeps the match exhaustive.
-        _ => 30,
+        OperationExtra::Shutdown(s) => s.grace_secs,
+        other => {
+            error!(
+                extra = ?other.op_code(),
+                "shutdown payload extra is not a shutdown's after verify — refused"
+            );
+            return AdminResult::UnknownOperation;
+        }
     };
+    *fps_out = matched_fps;
     let grace_deadline_unix_ts = server_now.saturating_add(u64::from(grace_secs));
     let marker = match ShutdownMarker::new(&req.payload, &sigs, std::process::id()) {
         Ok(m) => m,
@@ -2281,6 +2300,7 @@ fn dispatch_force_posture(
         Err(AdminAuthError::RateLimited { retry_after_secs }) => {
             return AdminResult::RateLimited { retry_after_secs };
         }
+        Err(AdminAuthError::TooManySignatures { .. }) => return AdminResult::InvalidSignature,
         Err(AdminAuthError::PayloadVerify(e)) => {
             warn!(error = ?e, "force-posture payload verify failed at common layer");
             return AdminResult::InvalidSignature;
@@ -2290,12 +2310,12 @@ fn dispatch_force_posture(
     // External audit NN-AUD-083: may this request release COMBAT?
     let may_release = signers.keys.iter().any(|k| k.authorizes(Role::Unlock));
 
-    // Extract the target from the verified payload. The op/extra
-    // invariant inside verify_signed_payload_quorum already
-    // guarantees this is the ForcePosture variant — but a
-    // belt-and-suspenders match keeps the compiler exhaustive and
-    // surfaces a clear UnknownOperation if a future refactor ever
-    // breaks the invariant.
+    // Extract the target from the verified payload. The verify checks
+    // the op/extra invariant (`admin_signed_payload::check_op`, external
+    // audit AUT-001 — before it, only the op tag was checked and this
+    // match was the only guard), so this is the ForcePosture variant; the
+    // match keeps the compiler exhaustive and refuses with
+    // UnknownOperation if a future refactor ever breaks the invariant.
     let target = match &req.payload.extra {
         OperationExtra::ForcePosture(extra) => extra.target,
         other => {
@@ -2595,6 +2615,19 @@ fn dispatch_rotate_keys_add(
             );
             return AdminResult::InvalidSignature;
         }
+        // External audit AUT-006: a different key already has this
+        // fingerprint; the wire keeps `InvalidSignature`.
+        Err(crate::anti_tamper::admin_auth::RotateKeysError::FingerprintCollision {
+            fingerprint,
+        }) => {
+            warn!(
+                target: "admin.rotate_keys",
+                fingerprint,
+                "rotate-keys-add rejected: a different admin.pub key has the same fingerprint \
+                 (revocation by fingerprint would be ambiguous)"
+            );
+            return AdminResult::InvalidSignature;
+        }
         Err(e) => {
             warn!(error = ?e, "rotate-keys-add: atomic rewrite failed");
             return AdminResult::InvalidSignature;
@@ -2733,6 +2766,21 @@ fn dispatch_rotate_keys_revoke(
                 target: "admin.rotate_keys",
                 "rotate-keys-revoke rejected: would remove the last admin key \
                  (soft-brick guard — add a replacement key first)"
+            );
+            return AdminResult::InvalidSignature;
+        }
+        // External audit AUT-006: the fingerprint names several keys;
+        // nothing was removed.
+        Err(crate::anti_tamper::admin_auth::RotateKeysError::AmbiguousFingerprint {
+            fingerprint,
+            matches,
+        }) => {
+            warn!(
+                target: "admin.rotate_keys",
+                fingerprint,
+                matches,
+                "rotate-keys-revoke rejected: the fingerprint matches several different \
+                 admin.pub keys; admin.pub left untouched"
             );
             return AdminResult::InvalidSignature;
         }
@@ -3452,6 +3500,9 @@ fn map_admin_auth_error(e: AdminAuthError, op_for_log: &str) -> AdminResult {
         AdminAuthError::RateLimited { retry_after_secs } => {
             AdminResult::RateLimited { retry_after_secs }
         }
+        // External audit AUT-005: no wire variant of its own; the journal
+        // line of the verify names it.
+        AdminAuthError::TooManySignatures { .. } => AdminResult::InvalidSignature,
         AdminAuthError::PayloadVerify(pe) => {
             warn!(op = op_for_log, error = ?pe, "payload verify failed at common layer");
             AdminResult::InvalidSignature
@@ -8678,5 +8729,97 @@ mod tests {
         unlink_socket(&socket);
         assert!(std::fs::symlink_metadata(&socket).is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    }
+
+    // ── External audit, Wave 3: signed-request verification (lab PR 192) ──
+
+    /// External audit ASK-017: a verified `unlock` whose release is
+    /// refused for any reason but "not in COMBAT" is answered as a failure
+    /// and recorded as one (it was `Success`).
+    #[test]
+    fn unlock_maps_an_unexpected_release_error_to_a_failure() {
+        use crate::posture::PostureState;
+        assert_eq!(
+            unlock_release_result(Ok(PostureState::Observing)),
+            UnlockResult::Success
+        );
+        assert_eq!(
+            unlock_release_result(Err(AdminReleaseError::NotInCombat)),
+            UnlockResult::Success,
+            "unlock outside COMBAT stays idempotent"
+        );
+        for refused in [
+            AdminReleaseError::Unauthorized,
+            AdminReleaseError::NeedsUnlock,
+        ] {
+            let reply = unlock_release_result(Err(refused));
+            assert_ne!(reply, UnlockResult::Success, "{refused:?}");
+            assert!(
+                unlock_result_str(&reply).starts_with("failure"),
+                "{refused:?}: the audit row must record a failure"
+            );
+        }
+    }
+
+    /// External audit AUT-001: a shutdown request whose payload carries an
+    /// `unlock` extra under the `shutdown` op, signed by two keys holding
+    /// `shutdown`, is refused (`UnknownOperation`), writes no marker and
+    /// names no signer. It used to verify (only the op tag was checked),
+    /// and `dispatch_shutdown` fell back to a 30 s grace nobody signed.
+    #[test]
+    fn dispatch_shutdown_refuses_an_extra_that_is_not_a_shutdown() {
+        use common::wire::admin_protocol::{KeyedSignature, ShutdownRequest};
+        use common::wire::admin_signed_payload::{sign, SignedPayload, UnlockExtra};
+        let agent_id = [0xc4; 16];
+        let sks = [
+            SigningKey::from_bytes(&[0x31; 32]),
+            SigningKey::from_bytes(&[0x32; 32]),
+        ];
+        let dir = TempDir::new().unwrap();
+        let pub_path = dir.path().join("admin.pub");
+        std::fs::write(
+            &pub_path,
+            sks.iter()
+                .map(|sk| {
+                    format!(
+                        "{} shutdown,unlock\n",
+                        hex::encode(sk.verifying_key().to_bytes())
+                    )
+                })
+                .collect::<String>(),
+        )
+        .unwrap();
+        let auth = AdminAuth::load_with_agent_id(&pub_path, agent_id).unwrap();
+        let auth = ConnAuth::new(&auth);
+        let marker_path = dir.path().join("agent.shutdown_authorised");
+
+        let nonce = auth.issue_challenge().unwrap();
+        let payload = SignedPayload {
+            op: OperationCode::Shutdown,
+            nonce,
+            ts: now_unix_secs(),
+            agent_id,
+            extra: OperationExtra::Unlock(UnlockExtra {}),
+        };
+        let signatures = sks
+            .iter()
+            .map(|sk| KeyedSignature {
+                signature: sign(&payload, sk).unwrap(),
+            })
+            .collect();
+        let mut fps = Vec::new();
+        let result = dispatch_shutdown(
+            ShutdownRequest {
+                payload,
+                signatures,
+            },
+            &auth,
+            &marker_path,
+            None,
+            &mut fps,
+        );
+        assert_eq!(result, AdminResult::UnknownOperation);
+        assert!(!marker_path.exists(), "no marker for a mismatched payload");
+        assert!(fps.is_empty());
     }
 }

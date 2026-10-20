@@ -132,11 +132,23 @@ pub enum AdminAuthError {
     /// `AdminResult::UnknownOperation`. Counts against the
     /// connection — a wire-shape mismatch can only come from a
     /// confused or hostile client.
+    ///
+    /// External audit AUT-001: also a payload whose `extra` belongs to
+    /// another operation than its `op`
+    /// ([`admin_signed_payload::check_op`]); `got` is then `payload.op`
+    /// and the journal line names the extra's operation.
     #[error("unknown operation: payload.op={got:?} expected {expected:?}")]
     UnknownOperation {
         expected: common::wire::admin_signed_payload::OperationCode,
         got: common::wire::admin_signed_payload::OperationCode,
     },
+    /// External audit AUT-005: more signatures than
+    /// [`admin_quorum::MAX_SUBMITTED_SIGNATURES`] in one submission,
+    /// refused before any is checked. Counts against the connection: no
+    /// in-repo client sends more than two. Answered `InvalidSignature` on
+    /// the wire (no new variant).
+    #[error("{submitted} signatures submitted, at most {max} accepted", max = admin_quorum::MAX_SUBMITTED_SIGNATURES)]
+    TooManySignatures { submitted: usize },
     /// Tappa 8 A7: signing-payload CBOR / hashing failed during
     /// verify. Wraps the underlying `SignedPayloadError` from
     /// `common::wire::admin_signed_payload`. In practice this
@@ -513,6 +525,10 @@ impl AdminAuth {
              0 would mint a token with no signature"
         );
 
+        // External audit AUT-005: an oversized submission is refused
+        // before any signature is checked.
+        check_signature_count(signatures.len())?;
+
         // A13: snapshot the keys behind a read lock for the
         // duration of the verify; see verify_with_role_with_nonce for
         // the rationale.
@@ -521,7 +537,12 @@ impl AdminAuth {
         // Which key each submitted signature verified against (the
         // constant-time scan keeps the last match, no early break), then
         // the shared quorum rule (`quorum_decision`, proved with Kani).
-        let per_signature = admin_quorum::match_signatures(&pub_keys, nonce, signatures);
+        let per_signature =
+            admin_quorum::match_signatures(&pub_keys, nonce, signatures).map_err(|e| {
+                AdminAuthError::TooManySignatures {
+                    submitted: e.submitted,
+                }
+            })?;
         let distinct = distinct_matches(&per_signature).len().min(u8::MAX as usize) as u8;
         match quorum_decision(
             &per_signature,
@@ -589,7 +610,10 @@ impl AdminAuth {
     /// timestamp skew window applies (the caller orders stored signatures
     /// by `ts` to refuse a rollback), and no connection failure counter
     /// is touched (a bad file at boot is not a brute-force attempt).
-    /// Returns the fingerprints of the matched keys.
+    /// Returns the fingerprints of the matched keys. External audit
+    /// AUT-001 / AUT-005: the same op/extra check
+    /// ([`admin_signed_payload::check_op`]) and signature cap as the live
+    /// path.
     pub fn verify_stored_payload(
         &self,
         payload: &SignedPayload,
@@ -604,32 +628,23 @@ impl AdminAuth {
                 provided: 0,
             });
         }
-        if payload.op != expected_op || payload.extra.op_code() != expected_op {
+        if admin_signed_payload::check_op(payload, expected_op).is_err() {
             return Err(AdminAuthError::UnknownOperation {
                 expected: expected_op,
                 got: payload.op,
             });
         }
+        check_signature_count(signatures.len())?;
         if payload.agent_id != self.agent_id {
             return Err(AdminAuthError::AgentIdMismatch);
         }
         let digest = admin_signed_payload::signing_digest(payload)?;
         let pub_keys = self.pub_keys.read();
-        let mut matched: Vec<usize> = Vec::new();
-        for sig_bytes in signatures {
-            let sig = Signature::from_bytes(sig_bytes);
-            let mut this_match: Option<usize> = None;
-            for (idx, entry) in pub_keys.iter().enumerate() {
-                if entry.key.verify_strict(&digest, &sig).is_ok() {
-                    this_match = Some(idx);
-                }
-            }
-            if let Some(idx) = this_match {
-                if !matched.contains(&idx) {
-                    matched.push(idx);
-                }
-            }
-        }
+        let per_signature = admin_quorum::match_signatures(&pub_keys, &digest, signatures)
+            .map_err(|e| AdminAuthError::TooManySignatures {
+                submitted: e.submitted,
+            })?;
+        let matched = distinct_matches(&per_signature);
         if matched.is_empty() {
             return Err(AdminAuthError::InvalidSignature);
         }
@@ -680,7 +695,12 @@ impl AdminAuth {
     /// - `NonceMismatch` → payload nonce ≠ the connection's challenge
     ///   (counted — attack signal).
     /// - `UnknownOperation` → `payload.op` is not the expected
-    ///   one for this wire variant (counted).
+    ///   one for this wire variant, or its `extra` is another
+    ///   operation's ([`admin_signed_payload::check_op`], external audit
+    ///   AUT-001; counted). Checked first, before any Ed25519 work.
+    /// - `TooManySignatures` → more than
+    ///   [`admin_quorum::MAX_SUBMITTED_SIGNATURES`] signatures (external
+    ///   audit AUT-005; counted), before any signature is checked.
     /// - `AgentIdMismatch` → `payload.agent_id` ≠ `self.agent_id`
     ///   (counted).
     /// - `TimestampSkew` → outside ±60 s window (not counted —
@@ -722,22 +742,29 @@ impl AdminAuth {
              (got {min_distinct}); 0 would mint a token with no signature"
         );
 
-        // Operation tag must match what this wire variant expects.
-        // Cheap field check first — surfaces a clear "wrong wire
+        // Operation tag must match what this wire variant expects, and
+        // the extra must be that operation's (external audit AUT-001: only
+        // the tag was checked here, and the dispatchers took the extra on
+        // trust). Cheap field check first — surfaces a clear "wrong wire
         // shape" error before we burn an Ed25519 verify on it.
-        if payload.op != expected_op {
+        if admin_signed_payload::check_op(payload, expected_op).is_err() {
             warn!(
                 target: "anti_tamper.admin_auth.verify_failure",
                 reason = "unknown_operation",
                 expected = ?expected_op,
                 got = ?payload.op,
-                "signed-payload op tag mismatch"
+                extra = ?payload.extra.op_code(),
+                "signed-payload op tag or extra does not match the request"
             );
             return Err(AdminAuthError::UnknownOperation {
                 expected: expected_op,
                 got: payload.op,
             });
         }
+
+        // External audit AUT-005: an oversized submission is refused
+        // before any hashing or signature check.
+        check_signature_count(signatures.len())?;
 
         // Nonce binding: payload must reference THE nonce the
         // server issued on this connection. A forged payload that
@@ -796,7 +823,10 @@ impl AdminAuth {
         // verify_quorum_with_nonce, except the message bytes are the
         // SignedPayload digest instead of the raw nonce), then the shared
         // quorum rule.
-        let per_signature = admin_quorum::match_signatures(&pub_keys, &digest, signatures);
+        let per_signature = admin_quorum::match_signatures(&pub_keys, &digest, signatures)
+            .map_err(|e| AdminAuthError::TooManySignatures {
+                submitted: e.submitted,
+            })?;
         let matched = distinct_matches(&per_signature);
         let distinct = matched.len().min(u8::MAX as usize) as u8;
         match quorum_decision(
@@ -1094,7 +1124,26 @@ fn counts_as_failure(e: &AdminAuthError) -> bool {
             | AdminAuthError::NonceMismatch
             | AdminAuthError::AgentIdMismatch
             | AdminAuthError::UnknownOperation { .. }
+            | AdminAuthError::TooManySignatures { .. }
     )
+}
+
+/// External audit AUT-005: [`admin_quorum::check_submission_size`] as an
+/// [`AdminAuthError`], with the journal line every refusal of a verify
+/// writes.
+fn check_signature_count(submitted: usize) -> std::result::Result<(), AdminAuthError> {
+    admin_quorum::check_submission_size(submitted).map_err(|e| {
+        warn!(
+            target: "anti_tamper.admin_auth.verify_failure",
+            reason = "too_many_signatures",
+            submitted = e.submitted,
+            max = admin_quorum::MAX_SUBMITTED_SIGNATURES,
+            "admin verify: submission over the signature cap, no signature checked"
+        );
+        AdminAuthError::TooManySignatures {
+            submitted: e.submitted,
+        }
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1172,10 +1221,31 @@ pub enum RotateKeysError {
     /// admins trying to add the same out-of-band-shared key).
     #[error("pubkey {fingerprint} already present in admin.pub")]
     KeyAlreadyPresent { fingerprint: String },
+    /// External audit AUT-006: `rotate-keys add` of a key whose 4-byte
+    /// fingerprint is already held by a DIFFERENT `admin.pub` key. It used
+    /// to be refused as "already present"; it is refused, named: once in,
+    /// `rotate-keys revoke` (which names a key by that fingerprint) could
+    /// not tell the two apart.
+    #[error(
+        "pubkey has fingerprint {fingerprint}, already held by a different admin.pub key \
+         (a fingerprint collision: revocation by fingerprint would be ambiguous)"
+    )]
+    FingerprintCollision { fingerprint: String },
     /// The fingerprint requested by `rotate-keys revoke`
     /// doesn't match any line in `admin.pub`.
     #[error("no admin.pub line matches fingerprint {fingerprint}")]
     KeyNotFound { fingerprint: String },
+    /// External audit AUT-006: the fingerprint requested by `rotate-keys
+    /// revoke` matches `matches` DIFFERENT keys. Every matching line used
+    /// to be dropped; the file is left untouched. Since `add` refuses a
+    /// colliding key, such a pair comes only from a hand-written
+    /// `admin.pub` (or one written before this check), and a hand edit
+    /// settles it.
+    #[error(
+        "fingerprint {fingerprint} matches {matches} different admin.pub keys; \
+         refusing to revoke (the request cannot say which)"
+    )]
+    AmbiguousFingerprint { fingerprint: String, matches: usize },
     /// Refusing to revoke the last remaining key — would
     /// soft-brick the agent (no operator could subsequently
     /// unlock or shutdown). Operators must add a replacement
@@ -1193,6 +1263,11 @@ pub enum RotateKeysError {
 /// fsyncs, then renames over the original. Crash between fsync
 /// and rename is safe (the old file is intact); crash after
 /// rename is safe (the new file is durable).
+///
+/// External audit AUT-006: the same key already in the file is
+/// `KeyAlreadyPresent`; a different key with the same 4-byte fingerprint
+/// is `FingerprintCollision` (the 32 key bytes are compared, not only the
+/// fingerprint).
 pub fn atomic_rewrite_admin_pub_add(
     config_path: &Path,
     new_pubkey: &VerifyingKey,
@@ -1200,18 +1275,25 @@ pub fn atomic_rewrite_admin_pub_add(
 ) -> std::result::Result<(), RotateKeysError> {
     let body = std::fs::read_to_string(config_path).map_err(RotateKeysError::Io)?;
     let new_fp = fingerprint(new_pubkey);
+    let mut collision = false;
     for raw in body.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Ok(entry) = parse_admin_line(line) {
-            if fingerprint(&entry.key) == new_fp {
+            if entry.key.to_bytes() == new_pubkey.to_bytes() {
                 return Err(RotateKeysError::KeyAlreadyPresent {
                     fingerprint: new_fp,
                 });
             }
+            collision |= fingerprint(&entry.key) == new_fp;
         }
+    }
+    if collision {
+        return Err(RotateKeysError::FingerprintCollision {
+            fingerprint: new_fp,
+        });
     }
     let mut new_body = body;
     if !new_body.is_empty() && !new_body.ends_with('\n') {
@@ -1233,6 +1315,11 @@ pub fn atomic_rewrite_admin_pub_add(
 /// `LastKey` is returned if removing the line would leave the
 /// file empty — design §7.2 "operators must `add` a replacement
 /// first" contract.
+///
+/// External audit AUT-006: the fingerprint must name ONE key. Several
+/// lines of that same key are all removed, as before; lines of two
+/// different keys sharing the 4 bytes are `AmbiguousFingerprint`, and the
+/// file is not touched.
 pub fn atomic_rewrite_admin_pub_revoke(
     config_path: &Path,
     target_fp: [u8; 4],
@@ -1241,7 +1328,7 @@ pub fn atomic_rewrite_admin_pub_revoke(
     let target_hex = hex::encode(target_fp);
     let mut out = String::new();
     let mut kept_keys = 0usize;
-    let mut removed = false;
+    let mut removed: Vec<[u8; 32]> = Vec::new();
     for raw in body.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1252,7 +1339,10 @@ pub fn atomic_rewrite_admin_pub_revoke(
         }
         if let Ok(entry) = parse_admin_line(line) {
             if fingerprint(&entry.key) == target_hex {
-                removed = true;
+                let key = entry.key.to_bytes();
+                if !removed.contains(&key) {
+                    removed.push(key);
+                }
                 continue;
             }
             kept_keys += 1;
@@ -1260,9 +1350,15 @@ pub fn atomic_rewrite_admin_pub_revoke(
         out.push_str(raw);
         out.push('\n');
     }
-    if !removed {
+    if removed.is_empty() {
         return Err(RotateKeysError::KeyNotFound {
             fingerprint: target_hex,
+        });
+    }
+    if removed.len() > 1 {
+        return Err(RotateKeysError::AmbiguousFingerprint {
+            fingerprint: target_hex,
+            matches: removed.len(),
         });
     }
     if kept_keys == 0 {
@@ -2736,5 +2832,247 @@ mod tests {
             verified.fingerprints,
             vec![fingerprint(&signers[1].verifying_key())]
         );
+    }
+
+    // ── External audit, Wave 3: signed-request verification (lab PR 192) ──
+
+    /// Two keys whose 4-byte fingerprints collide (SHA-256 prefix
+    /// `e78e8469`), found by a birthday search over these seeds: a real
+    /// collision, no test hook.
+    fn colliding_keys() -> (SigningKey, SigningKey) {
+        let seed = |i: u64| {
+            let mut s = [0x46u8; 32];
+            s[..8].copy_from_slice(&i.to_le_bytes());
+            s
+        };
+        let a = SigningKey::from_bytes(&seed(57_696));
+        let b = SigningKey::from_bytes(&seed(60_119));
+        assert_ne!(a.verifying_key(), b.verifying_key());
+        assert_eq!(
+            fingerprint_bytes(&a.verifying_key()),
+            fingerprint_bytes(&b.verifying_key())
+        );
+        (a, b)
+    }
+
+    fn pub_hex(sk: &SigningKey) -> String {
+        hex::encode(sk.verifying_key().to_bytes())
+    }
+
+    /// External audit AUT-006: a revoke whose fingerprint names two
+    /// different keys removes nothing (both used to go); the file is byte
+    /// for byte as it was and both keys still load. One key listed on two
+    /// lines is still one key: both lines go, as before.
+    #[test]
+    fn revoke_refuses_ambiguous_fingerprint() {
+        let (a, b) = colliding_keys();
+        let c = SigningKey::from_bytes(&[3; 32]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        let body = format!(
+            "# admins\n{} unlock,rotate-keys\n{} unlock\n{} shutdown\n",
+            pub_hex(&a),
+            pub_hex(&b),
+            pub_hex(&c)
+        );
+        std::fs::write(&admin_pub, &body).unwrap();
+        match atomic_rewrite_admin_pub_revoke(&admin_pub, fingerprint_bytes(&a.verifying_key())) {
+            Err(RotateKeysError::AmbiguousFingerprint {
+                fingerprint,
+                matches,
+            }) => {
+                assert_eq!(fingerprint, "e78e8469");
+                assert_eq!(matches, 2);
+            }
+            other => panic!("expected AmbiguousFingerprint, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&admin_pub).unwrap(), body);
+        let auth = AdminAuth::load(&admin_pub).unwrap();
+        assert_eq!(auth.key_fingerprints_snapshot().len(), 3);
+
+        let body = format!(
+            "{} unlock\n{} unlock,audit-read\n{} shutdown\n",
+            pub_hex(&a),
+            pub_hex(&a),
+            pub_hex(&c)
+        );
+        std::fs::write(&admin_pub, &body).unwrap();
+        atomic_rewrite_admin_pub_revoke(&admin_pub, fingerprint_bytes(&a.verifying_key()))
+            .expect("one key on two lines is not ambiguous");
+        let after = std::fs::read_to_string(&admin_pub).unwrap();
+        assert_eq!(after, format!("{} shutdown\n", pub_hex(&c)));
+    }
+
+    /// External audit AUT-006: adding a key whose fingerprint another key
+    /// already holds is refused as a collision, not as "already present";
+    /// adding the very same key is still `KeyAlreadyPresent`. Neither
+    /// touches the file.
+    #[test]
+    fn add_names_a_fingerprint_collision() {
+        let (a, b) = colliding_keys();
+        let dir = tempfile::TempDir::new().unwrap();
+        let admin_pub = dir.path().join("admin.pub");
+        let body = format!("{} unlock,rotate-keys\n", pub_hex(&a));
+        std::fs::write(&admin_pub, &body).unwrap();
+        let err = atomic_rewrite_admin_pub_add(&admin_pub, &b.verifying_key(), &[Role::Unlock])
+            .expect_err("a colliding key must be refused");
+        assert!(
+            matches!(&err, RotateKeysError::FingerprintCollision { fingerprint } if fingerprint == "e78e8469"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("collision"), "{err}");
+        let err = atomic_rewrite_admin_pub_add(&admin_pub, &a.verifying_key(), &[Role::Unlock])
+            .expect_err("the same key twice must be refused");
+        assert!(
+            matches!(err, RotateKeysError::KeyAlreadyPresent { .. }),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&admin_pub).unwrap(), body);
+    }
+
+    /// Two keys holding `shutdown` (and `unlock`), bound to `agent_id`.
+    fn shutdown_pair(agent_id: [u8; 16]) -> (AdminAuth, [SigningKey; 2]) {
+        let sks = [
+            SigningKey::from_bytes(&[0x21; 32]),
+            SigningKey::from_bytes(&[0x22; 32]),
+        ];
+        let entries = sks
+            .iter()
+            .map(|sk| KeyEntry {
+                key: sk.verifying_key(),
+                roles: vec![Role::Shutdown, Role::Unlock],
+            })
+            .collect();
+        (
+            AdminAuth::build_entries_with_agent_id(entries, agent_id),
+            sks,
+        )
+    }
+
+    /// External audit AUT-001: a payload whose `op` is the request's but
+    /// whose `extra` is another operation's is refused before any
+    /// signature is checked — `UnknownOperation`, no token, counted — on
+    /// the live path (only the tag was checked) as on the stored one.
+    #[test]
+    fn verify_signed_payload_quorum_rejects_op_extra_mismatch() {
+        use common::wire::admin_signed_payload::{
+            sign as sign_payload, OperationCode, OperationExtra, UnlockExtra,
+        };
+        const T: u64 = 1_700_000_000;
+        let agent_id = [0x5a; 16];
+        let (auth, sks) = shutdown_pair(agent_id);
+        let conn = ConnAuth::new(&auth);
+        let nonce = conn.issue_challenge().unwrap();
+        let payload = SignedPayload {
+            op: OperationCode::Shutdown,
+            nonce,
+            ts: T,
+            agent_id,
+            extra: OperationExtra::Unlock(UnlockExtra {}),
+        };
+        let sigs: Vec<[u8; 64]> = sks
+            .iter()
+            .map(|sk| sign_payload(&payload, sk).unwrap())
+            .collect();
+        match conn.verify_signed_payload_quorum_keys(
+            &payload,
+            &sigs,
+            2,
+            &[Role::Shutdown],
+            OperationCode::Shutdown,
+            T,
+        ) {
+            Err(AdminAuthError::UnknownOperation { expected, got }) => {
+                assert_eq!(expected, OperationCode::Shutdown);
+                assert_eq!(got, OperationCode::Shutdown);
+            }
+            other => panic!("expected UnknownOperation, got {other:?}"),
+        }
+        assert_eq!(conn.failures.get(), 1, "an op/extra mismatch is counted");
+        assert!(matches!(
+            auth.verify_stored_payload(
+                &payload,
+                &sigs,
+                2,
+                &[Role::Shutdown],
+                OperationCode::Shutdown
+            ),
+            Err(AdminAuthError::UnknownOperation { .. })
+        ));
+    }
+
+    /// External audit AUT-005: more than `MAX_SUBMITTED_SIGNATURES`
+    /// signatures — every one of them valid — are refused before any is
+    /// checked, and the refusal is counted; the cap itself is accepted.
+    /// The same on the nonce-only quorum and the stored-payload paths.
+    #[test]
+    fn verify_quorum_rejects_submission_over_signature_cap() {
+        use common::wire::admin_signed_payload::{sign as sign_payload, OperationCode};
+        const T: u64 = 1_700_000_000;
+        let cap = admin_quorum::MAX_SUBMITTED_SIGNATURES;
+        let agent_id = [0x5b; 16];
+        let (auth, sks) = shutdown_pair(agent_id);
+        let conn = ConnAuth::new(&auth);
+        let submission = |payload: &SignedPayload, n: usize| -> Vec<[u8; 64]> {
+            sks.iter()
+                .map(|sk| sign_payload(payload, sk).unwrap())
+                .cycle()
+                .take(n)
+                .collect()
+        };
+
+        let nonce = conn.issue_challenge().unwrap();
+        let payload = SignedPayload::new_shutdown(nonce, T, agent_id, 10);
+        let over = submission(&payload, cap + 1);
+        match conn.verify_signed_payload_quorum_keys(
+            &payload,
+            &over,
+            2,
+            &[Role::Shutdown],
+            OperationCode::Shutdown,
+            T,
+        ) {
+            Err(AdminAuthError::TooManySignatures { submitted }) => assert_eq!(submitted, cap + 1),
+            other => panic!("expected TooManySignatures, got {other:?}"),
+        }
+        assert_eq!(conn.failures.get(), 1, "the refusal is counted");
+        assert!(matches!(
+            auth.verify_stored_payload(
+                &payload,
+                &over,
+                2,
+                &[Role::Shutdown],
+                OperationCode::Shutdown
+            ),
+            Err(AdminAuthError::TooManySignatures { .. })
+        ));
+
+        let nonce = conn.issue_challenge().unwrap();
+        let payload = SignedPayload::new_shutdown(nonce, T, agent_id, 10);
+        let at_cap = submission(&payload, cap);
+        let verified = conn
+            .verify_signed_payload_quorum_keys(
+                &payload,
+                &at_cap,
+                2,
+                &[Role::Shutdown],
+                OperationCode::Shutdown,
+                T,
+            )
+            .expect("a submission at the cap is checked as before");
+        assert_eq!(verified.keys.len(), 2);
+
+        let nonce = conn.issue_challenge().unwrap();
+        let over: Vec<[u8; 64]> = sks
+            .iter()
+            .map(|sk| sk.sign(&nonce).to_bytes())
+            .cycle()
+            .take(cap + 1)
+            .collect();
+        assert!(matches!(
+            conn.verify_quorum(&over, 2, &[Role::Shutdown]),
+            Err(AdminAuthError::TooManySignatures { .. })
+        ));
+        assert_eq!(conn.failures.get(), 2);
     }
 }
