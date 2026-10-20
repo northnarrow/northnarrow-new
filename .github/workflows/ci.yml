@@ -447,9 +447,15 @@ jobs:
         run: cargo +"$MSRV" check --workspace --all-targets --locked
 
   audit:
-    # RustSEC advisory gate. Fails on a vulnerability;
-    # `unmaintained`/`unsound` warnings are reported but do not fail the
-    # job (they are tracked by dependabot). Runs on every push and pull
+    # RustSEC advisory gate. Fails on a vulnerability, and on an
+    # `unsound` or `unmaintained` advisory too (external audit SUP-007:
+    # they were only warnings, said to be "tracked by dependabot"; but
+    # Dependabot fails no build, bumps the manifests' own dependencies and
+    # has nothing to propose for an archived crate: memmap2 0.9.10, a
+    # transitive one, stayed four months after its fix). An advisory that
+    # cannot be fixed yet is a recorded exception in .cargo/audit.toml —
+    # reason, owner, re-check, expiry — never an `--ignore` here; an
+    # exception past its date fails the job. Runs on every push and pull
     # request and, alone, on the daily schedule above.
     name: cargo audit (ubuntu-latest)
     runs-on: ubuntu-latest
@@ -469,12 +475,19 @@ jobs:
         run: |
           rustup toolchain install   # the pinned release (rust-toolchain.toml)
           cargo install cargo-audit --locked --version 0.22.2
+      # SUP-007: cargo-audit does not know when an exception was meant to
+      # end; this step does (the `Expires:` line of each entry).
+      - name: No expired advisory exception in .cargo/audit.toml
+        run: .github/scripts/check-audit-exceptions.sh .cargo/audit.toml
+      # From the repository root: cargo-audit reads ./.cargo/audit.toml
+      # (the exceptions) relative to where it runs. The --deny flags hold
+      # even if it did not.
       - name: Audit Cargo.lock, fuzz/Cargo.lock, agent-ebpf/Cargo.lock
         run: |
           rc=0
           for lock in Cargo.lock fuzz/Cargo.lock agent-ebpf/Cargo.lock; do
             echo "::group::cargo audit --file $lock"
-            cargo audit --file "$lock" || rc=1
+            cargo audit --file "$lock" --deny unsound --deny unmaintained || rc=1
             echo "::endgroup::"
           done
           exit $rc

@@ -1,12 +1,13 @@
 //! Supply-chain hygiene of the repository itself: what the CI runs, how
-//! releases are verified, and what the default build targets. External
-//! audit SUP-001, SUP-002, SUP-004, SUP-005, SUP-006, SUP-012, SUP-015,
-//! SUP-016, SUP-017, SUP-022 and DEP-008. The tests read committed files;
-//! two run a local tool and none touches the network:
-//! `prune_script_fails_closed` runs the CI prune script under bash with a
-//! stub `cargo`, and `rust_version_covers_every_locked_dependency` runs
-//! `cargo metadata --locked --offline` (the crates a workspace build
-//! downloads are enough).
+//! releases are verified, what the default build targets, and which RustSEC
+//! advisories are accepted. External audit SUP-001, SUP-002, SUP-004,
+//! SUP-005, SUP-006, SUP-007 to SUP-012, SUP-015, SUP-016, SUP-017, SUP-022
+//! and DEP-008. The tests read committed files; three run a local tool and
+//! none touches the network: `prune_script_fails_closed` runs the CI prune
+//! script under bash with a stub `cargo`, `advisory_exceptions_expire_in_ci`
+//! runs the CI expiry check under bash with a fixed date, and
+//! `rust_version_covers_every_locked_dependency` runs `cargo metadata
+//! --locked --offline` (the crates a workspace build downloads are enough).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1014,5 +1015,638 @@ fn advisories_are_checked_on_a_schedule() {
         !str_of(&audit.1, "if").is_some_and(|c| c.contains("schedule")),
         "the audit job ({}) must run on the schedule",
         audit.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SUP-007 to SUP-011: the RustSEC advisory policy (.cargo/audit.toml).
+
+/// The lockfiles the audit job checks (SUP-006).
+const LOCKFILES: [&str; 3] = ["Cargo.lock", "fuzz/Cargo.lock", "agent-ebpf/Cargo.lock"];
+
+/// The longest an advisory exception may be accepted before it is re-checked
+/// and recorded again (about six months).
+const MAX_EXCEPTION_DAYS: i64 = 184;
+
+/// `name -> locked versions` of a Cargo.lock.
+fn locked_versions(lock: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut name: Option<String> = None;
+    for line in read(lock).lines() {
+        if line.trim() == "[[package]]" {
+            name = None;
+        } else if let Some(v) = line.strip_prefix("name = ") {
+            name = Some(v.trim().trim_matches('"').to_string());
+        } else if let Some(v) = line.strip_prefix("version = ") {
+            if let Some(n) = name.take() {
+                out.entry(n)
+                    .or_default()
+                    .push(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    for versions in out.values_mut() {
+        versions.sort();
+    }
+    out
+}
+
+/// One `ignore` entry of .cargo/audit.toml with its comment block.
+#[derive(Debug)]
+struct AdvisoryException {
+    id: String,
+    /// The block's first comment, continuation lines joined.
+    header: String,
+    /// `Field: value` comments, continuation lines (`#   …`) joined.
+    fields: Vec<(String, String)>,
+    /// Comments that are neither the header, a known field nor a continuation.
+    stray: Vec<String>,
+}
+
+const EXCEPTION_FIELDS: [&str; 5] = ["Why", "Owner", "Re-check", "Recorded", "Expires"];
+
+fn advisory_exceptions(text: &str) -> Vec<AdvisoryException> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    let mut header: Option<String> = None;
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut stray = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if !inside {
+            inside = t.starts_with("ignore") && t.ends_with('[');
+            continue;
+        }
+        if t.starts_with(']') {
+            break;
+        }
+        if let Some(c) = t.strip_prefix('#') {
+            if c.starts_with("   ") {
+                let more = c.trim();
+                match (fields.last_mut(), header.as_mut()) {
+                    (Some((_, v)), _) => {
+                        v.push(' ');
+                        v.push_str(more);
+                    }
+                    (None, Some(h)) => {
+                        h.push(' ');
+                        h.push_str(more);
+                    }
+                    (None, None) => stray.push(c.to_string()),
+                }
+                continue;
+            }
+            let c = c.trim();
+            if header.is_none() {
+                header = Some(c.to_string());
+            } else if let Some((k, v)) = c
+                .split_once(':')
+                .filter(|(k, _)| EXCEPTION_FIELDS.contains(k))
+            {
+                fields.push((k.to_string(), v.trim().to_string()));
+            } else {
+                stray.push(c.to_string());
+            }
+            continue;
+        }
+        if t.is_empty() {
+            continue;
+        }
+        out.push(AdvisoryException {
+            id: t.trim_end_matches(',').trim_matches('"').to_string(),
+            header: header.take().unwrap_or_default(),
+            fields: std::mem::take(&mut fields),
+            stray: std::mem::take(&mut stray),
+        });
+    }
+    out
+}
+
+fn is_rustsec_id(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("RUSTSEC-") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('-').collect();
+    parts.len() == 2
+        && parts[0].len() == 4
+        && parts[1].len() == 4
+        && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// SUP-007, SUP-008, SUP-009, SUP-011: an informational advisory that
+/// cannot be fixed is accepted only as a recorded exception — the ID with
+/// the crate and version it was reasoned about, why it is not reachable or
+/// has no fix, who re-checks it, when, and until which date. The crate must
+/// still be locked at that version: the reasoning was about that version
+/// and its dependents' code, so a bump that moves it (tantivy taking
+/// another lru) reopens the entry here instead of leaving an ignore that
+/// accepts the advisory for whatever is locked next.
+#[test]
+fn every_advisory_exception_is_reasoned_and_dated() {
+    let root = repo_root();
+    let path = root.join(".cargo/audit.toml");
+    assert!(
+        path.is_file(),
+        "{}: the advisory policy file is missing (SUP-007)",
+        rel(&path)
+    );
+    let text = read(&path);
+    let entries = advisory_exceptions(&text);
+    let quoted = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#') && l.contains("\"RUSTSEC-"))
+        .count();
+    assert_eq!(
+        entries.len(),
+        quoted,
+        "every RUSTSEC id in .cargo/audit.toml is one line of `ignore = [`, after its \
+         comment block: {entries:#?}"
+    );
+    let locks: Vec<(&str, _)> = LOCKFILES
+        .iter()
+        .map(|l| (*l, locked_versions(&root.join(l))))
+        .collect();
+
+    let mut bad = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for e in &entries {
+        let id = &e.id;
+        if !is_rustsec_id(id) {
+            bad.push(format!("`{id}`: not a RUSTSEC-YYYY-NNNN id"));
+            continue;
+        }
+        if !seen.insert(id.clone()) {
+            bad.push(format!("{id}: listed twice"));
+        }
+        for s in &e.stray {
+            bad.push(format!("{id}: unexpected comment line `{s}`"));
+        }
+        // `<ID>: <crate> <version>, <kind>.`
+        let named = e
+            .header
+            .strip_prefix(id.as_str())
+            .and_then(|h| h.strip_prefix(": "))
+            .map(|h| h.split_whitespace().take(3).collect::<Vec<_>>());
+        match named.as_deref() {
+            Some([krate, version, kind])
+                if version.ends_with(',')
+                    && ["unsound.", "unmaintained.", "notice.", "vulnerability."]
+                        .contains(kind) =>
+            {
+                let version = version.trim_end_matches(',');
+                let locked_in: Vec<&str> = locks
+                    .iter()
+                    .filter(|(_, v)| {
+                        v.get(*krate)
+                            .is_some_and(|vs| vs.iter().any(|x| x == version))
+                    })
+                    .map(|(l, _)| *l)
+                    .collect();
+                if locked_in.is_empty() {
+                    bad.push(format!(
+                        "{id}: {krate} {version} is in no lockfile any more: drop the \
+                         exception, or re-check the advisory against what is locked now"
+                    ));
+                }
+            }
+            _ => bad.push(format!(
+                "{id}: the block must start `# {id}: <crate> <version>, <unsound|unmaintained|\
+                 notice|vulnerability>.`, not `# {}`",
+                e.header
+            )),
+        }
+        let field = |name: &str| -> Option<&str> {
+            let all: Vec<&str> = e
+                .fields
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            match all[..] {
+                [one] if !one.is_empty() => Some(one),
+                _ => None,
+            }
+        };
+        for name in EXCEPTION_FIELDS {
+            if field(name).is_none() {
+                bad.push(format!("{id}: needs exactly one non-empty `{name}:` line"));
+            }
+        }
+        if field("Why").is_some_and(|w| w.len() < 60) {
+            bad.push(format!("{id}: `Why:` is too short to be a reason"));
+        }
+        let date = |name: &str| {
+            field(name).and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        };
+        match (date("Recorded"), date("Expires")) {
+            (Some(from), Some(until)) => {
+                let days = (until - from).num_days();
+                if !(0..=MAX_EXCEPTION_DAYS).contains(&days) {
+                    bad.push(format!(
+                        "{id}: accepted for {days} days ({from} to {until}); at most \
+                         {MAX_EXCEPTION_DAYS}: re-check it and record it again"
+                    ));
+                }
+            }
+            _ => bad.push(format!(
+                "{id}: `Recorded:` and `Expires:` must be dates (YYYY-MM-DD)"
+            )),
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "advisory exceptions in .cargo/audit.toml (format at the top of that file):\n{}",
+        bad.join("\n")
+    );
+}
+
+/// SUP-007: `unsound` and `unmaintained` advisories fail the audit job;
+/// they were warnings nobody had to read. Every `cargo audit` in the
+/// workflows denies them on its command line (it holds even if the config is
+/// not read), ignores nothing there (an exception lives in
+/// .cargo/audit.toml with its reason) and narrows nothing (a stale or
+/// another database, a target filter); the config denies them too, so a
+/// local run gives the CI verdict, and holds nothing else that could narrow
+/// what is reported (a severity threshold, for one). The audit job checks
+/// the exceptions' expiry before it audits.
+#[test]
+fn the_advisory_gate_denies_unsound_and_unmaintained() {
+    let root = repo_root();
+    let mut calls = 0;
+    let mut bad = Vec::new();
+    for file in workflow_files() {
+        let wf = workflow_yaml(&file);
+        for (job, body) in jobs(&wf) {
+            for step in steps(&body) {
+                for call in cargo_calls(str_of(&step, "run").unwrap_or("")) {
+                    if call.sub != "audit" {
+                        continue;
+                    }
+                    calls += 1;
+                    let at = format!("{}: job {job}: {}", rel(&file), call.line);
+                    let denies = |kind: &str| {
+                        call.args
+                            .windows(2)
+                            .any(|w| (w[0] == "--deny" || w[0] == "-D") && w[1] == kind)
+                            || call.args.iter().any(|a| *a == format!("--deny={kind}"))
+                    };
+                    for kind in ["unsound", "unmaintained"] {
+                        if !denies(kind) {
+                            bad.push(format!("{at}: no `--deny {kind}`"));
+                        }
+                    }
+                    if call.args.iter().any(|a| a.starts_with("--ignore")) {
+                        bad.push(format!(
+                            "{at}: `--ignore` on the command line (record the exception in \
+                             .cargo/audit.toml, with its reason)"
+                        ));
+                    }
+                    // What would audit less: an old or another database, or
+                    // one platform's advisories only.
+                    const NARROWING: [&str; 7] = [
+                        "--stale",
+                        "--no-fetch",
+                        "-n",
+                        "--db",
+                        "--url",
+                        "--target-arch",
+                        "--target-os",
+                    ];
+                    for a in &call.args {
+                        let flag = a.split('=').next().unwrap_or("");
+                        if NARROWING.contains(&flag) {
+                            bad.push(format!("{at}: `{a}` narrows the audit"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(calls > 0, "no `cargo audit` in the workflows");
+
+    let ci = workflow_yaml(&root.join(".github/workflows/ci.yml"));
+    let (job, body) = jobs(&ci)
+        .into_iter()
+        .find(|(_, body)| {
+            steps(body)
+                .iter()
+                .any(|s| str_of(s, "run").is_some_and(|r| r.contains("cargo audit --file")))
+        })
+        .expect("ci.yml has the cargo audit job");
+    let runs: Vec<String> = steps(&body)
+        .iter()
+        .map(|s| str_of(s, "run").unwrap_or("").to_string())
+        .collect();
+    let expiry = runs
+        .iter()
+        .position(|r| r.contains(".github/scripts/check-audit-exceptions.sh"));
+    let audit = runs.iter().position(|r| r.contains("cargo audit --file"));
+    if !matches!((expiry, audit), (Some(e), Some(a)) if e < a) {
+        bad.push(format!(
+            "ci.yml: job {job} must run .github/scripts/check-audit-exceptions.sh before \
+             `cargo audit`"
+        ));
+    }
+
+    // Missing, it denies nothing: reported below rather than a panic here.
+    let config = fs::read_to_string(root.join(".cargo/audit.toml")).unwrap_or_default();
+    let deny = toml_string(&config, "output", "deny").unwrap_or_default();
+    for kind in ["unsound", "unmaintained"] {
+        if !deny.contains(&format!("\"{kind}\"")) {
+            bad.push(format!(".cargo/audit.toml: [output] deny lacks \"{kind}\""));
+        }
+    }
+    const ALLOWED: [(&str, &str); 3] = [
+        ("advisories", "ignore"),
+        ("output", "deny"),
+        ("output", "quiet"),
+    ];
+    let mut section = String::new();
+    let mut in_array = false;
+    for line in config.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if in_array {
+            in_array = !l.starts_with(']');
+            continue;
+        }
+        if l.is_empty() {
+            continue;
+        }
+        if l.starts_with('[') {
+            section = l.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+            continue;
+        }
+        let key = l.split('=').next().unwrap_or("").trim();
+        if !ALLOWED.contains(&(section.as_str(), key)) {
+            bad.push(format!(
+                ".cargo/audit.toml: [{section}] {key}: not part of the policy (it can narrow \
+                 what the gate reports; add it to this test with its reason)"
+            ));
+        }
+        in_array = l.ends_with('[');
+    }
+    if toml_string(&config, "output", "quiet").as_deref() != Some("false") {
+        bad.push(".cargo/audit.toml: [output] quiet must be false".to_string());
+    }
+    assert!(
+        bad.is_empty(),
+        "the RustSEC gate must deny unsound and unmaintained advisories:\n{}",
+        bad.join("\n")
+    );
+}
+
+/// SUP-007: cargo-audit has no notion of an exception's end, so the audit
+/// job runs .github/scripts/check-audit-exceptions.sh, which fails the day
+/// after an `Expires:` date (the daily schedule included) and on an entry
+/// without a valid one. Runs the script under bash with a fixed date.
+#[cfg(unix)]
+#[test]
+fn advisory_exceptions_expire_in_ci() {
+    let root = repo_root();
+    let script = root.join(".github/scripts/check-audit-exceptions.sh");
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("check-audit-exceptions");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let run = |config: &Path, today: &str| {
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .arg(config)
+            .arg(today)
+            .output()
+            .expect("bash runs");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+    let fixture = |name: &str, body: &str| {
+        let p = base.join(name);
+        fs::write(&p, body).unwrap();
+        p
+    };
+
+    // The committed policy: accepted on the day the last entry was recorded
+    // and on the day the first expires; refused the day after.
+    let real = root.join(".cargo/audit.toml");
+    let entries = advisory_exceptions(&fs::read_to_string(&real).unwrap_or_default());
+    let dates = |name: &str| -> Vec<chrono::NaiveDate> {
+        entries
+            .iter()
+            .filter_map(|e| e.fields.iter().find(|(k, _)| k == name))
+            .filter_map(|(_, v)| chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d").ok())
+            .collect()
+    };
+    if let (Some(first), Some(last)) = (
+        dates("Recorded").into_iter().max(),
+        dates("Expires").into_iter().min(),
+    ) {
+        for day in [first, last].into_iter().filter(|_| first <= last) {
+            let (ok, text) = run(&real, &day.to_string());
+            assert!(ok, "the committed exceptions on {day}: {text}");
+            assert!(
+                text.contains(&format!("{} exception(s)", entries.len())),
+                "{text}"
+            );
+        }
+        let after = last.succ_opt().unwrap();
+        let (ok, text) = run(&real, &after.to_string());
+        assert!(!ok, "{after} is after an expiry: {text}");
+        assert!(text.contains(&format!("expired on {last}")), "{text}");
+    }
+
+    let entry = |expires: &str| {
+        format!(
+            "[advisories]\nignore = [\n    # RUSTSEC-2024-0436: paste 1.0.15, unmaintained.\n    \
+             # Why: fixture.\n{expires}    \"RUSTSEC-2024-0436\",\n]\n"
+        )
+    };
+    let ok_body = entry("    # Expires: 2027-01-20\n");
+    for (case, body, today, want_ok, needle) in [
+        ("valid", ok_body.as_str(), "2026-12-31", true, "1 exception(s)"),
+        ("last-day", ok_body.as_str(), "2027-01-20", true, "1 exception(s)"),
+        ("expired", ok_body.as_str(), "2027-01-21", false, "expired on 2027-01-20"),
+        ("no-expiry", &entry(""), "2026-12-31", false, "no Expires:"),
+        (
+            "bad-date",
+            &entry("    # Expires: 20 January 2027\n"),
+            "2026-12-31",
+            false,
+            "is not YYYY-MM-DD",
+        ),
+        (
+            "inline",
+            "[advisories]\nignore = [\"RUSTSEC-2024-0436\"]\n",
+            "2026-12-31",
+            false,
+            "one exception per line",
+        ),
+        (
+            "not-closed",
+            "[advisories]\nignore = [\n    # Expires: 2027-01-20\n    \"RUSTSEC-2024-0436\",\n",
+            "2026-12-31",
+            false,
+            "is not closed",
+        ),
+        (
+            "two-ids",
+            "[advisories]\nignore = [\n    # Expires: 2027-01-20\n    \"RUSTSEC-2024-0436\", \"RUSTSEC-2026-0002\",\n]\n",
+            "2026-12-31",
+            false,
+            "not one quoted RUSTSEC id",
+        ),
+        ("empty", "[advisories]\nignore = []\n", "2026-12-31", true, "0 exception(s)"),
+        ("none", "[output]\nquiet = false\n", "2026-12-31", true, "0 exception(s)"),
+    ] {
+        let (ok, text) = run(&fixture(case, body), today);
+        assert_eq!(ok, want_ok, "{case}: {text}");
+        assert!(text.contains(needle), "{case}: `{needle}` not in: {text}");
+    }
+    let (ok, text) = run(&base.join("missing.toml"), "2026-12-31");
+    assert!(!ok && text.contains("not found"), "missing file: {text}");
+}
+
+/// SUP-008: the lru exception rests partly on the release profile aborting
+/// on a panic (no unwinding, so no `catch_unwind` can observe the half-done
+/// `pop()`). The shipped profile, and every profile built from it, keeps
+/// `panic = "abort"`.
+#[test]
+fn release_profile_aborts_on_panic() {
+    let text = read(&repo_root().join("Cargo.toml"));
+    let mut profiles: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let l = line.split('#').next().unwrap_or("").trim();
+        if let Some(name) = l
+            .strip_prefix("[profile.")
+            .and_then(|r| r.strip_suffix(']'))
+        {
+            if !name.contains('.') {
+                profiles.push(name.to_string());
+            }
+        }
+    }
+    assert!(
+        profiles.iter().any(|p| p == "release"),
+        "Cargo.toml has no [profile.release]"
+    );
+    let mut bad = Vec::new();
+    for p in &profiles {
+        // The inheritance chain from `p` (cargo's built-in profiles end it).
+        let mut chain = vec![p.clone()];
+        while let Some(parent) = toml_string(
+            &text,
+            &format!("profile.{}", chain[chain.len() - 1]),
+            "inherits",
+        ) {
+            assert!(
+                chain.len() < 8,
+                "profile inheritance loop from {p}: {chain:?}"
+            );
+            chain.push(parent);
+        }
+        if !chain.iter().any(|c| c == "release") {
+            continue;
+        }
+        let panic = chain
+            .iter()
+            .find_map(|c| toml_string(&text, &format!("profile.{c}"), "panic"));
+        if panic.as_deref() != Some("abort") {
+            bad.push(format!(
+                "[profile.{p}] (from {}): panic = {}",
+                chain.join(" <- "),
+                panic.as_deref().unwrap_or("(default: unwind)")
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the release profile and the profiles that inherit it must keep panic = \"abort\":\n{}",
+        bad.join("\n")
+    );
+}
+
+/// The fuzz harness builds the agent from its own lockfile. A crate locked
+/// at another version there is fuzzed as code the agent does not ship, and a
+/// security bump applied to one lockfile only leaves the other behind
+/// (memmap2: 0.9.11 in fuzz/Cargo.lock, 0.9.10 in Cargo.lock until
+/// SUP-010; tokio 1.53.3 broke the fuzz build while fuzz/Cargo.lock kept
+/// 1.53.2, #365). For the crates that decide a security property, and for
+/// every crate an advisory exception names, both lockfiles lock the same
+/// versions. The rest may drift (the fuzz lock is resolved on its own).
+#[test]
+fn security_crates_are_locked_alike_for_the_fuzzer() {
+    const SECURITY_CRATES: &[&str] = &[
+        // the async runtime the sensors and the admin socket run on
+        "tokio",
+        // the wire and the JSON the fuzz targets decode
+        "serde",
+        "serde_json",
+        "postcard",
+        "ciborium",
+        // signatures, keys and the chains' hashes
+        "ed25519-dalek",
+        "curve25519-dalek",
+        "sha2",
+        "hkdf",
+        "hmac",
+        "aes-gcm",
+        "zeroize",
+        "subtle",
+        // the kernel interface, /proc and the BTF/ELF parsing
+        "libc",
+        "nix",
+        "aya",
+        "aya-obj",
+        "object",
+        "procfs",
+        "procfs-core",
+        // the model and the knowledge base, and what they map from disk
+        "tantivy",
+        "candle-core",
+        "tokenizers",
+        "safetensors",
+        "memmap2",
+        // the crates of the recorded exceptions (also taken from audit.toml)
+        "lru",
+        "paste",
+    ];
+    let root = repo_root();
+    let main = locked_versions(&root.join("Cargo.lock"));
+    let fuzz = locked_versions(&root.join("fuzz/Cargo.lock"));
+    let mut names: Vec<String> = SECURITY_CRATES.iter().map(|s| s.to_string()).collect();
+    let config = fs::read_to_string(root.join(".cargo/audit.toml")).unwrap_or_default();
+    for e in advisory_exceptions(&config) {
+        let krate = e
+            .header
+            .split(": ")
+            .nth(1)
+            .and_then(|h| h.split_whitespace().next());
+        if let Some(k) = krate {
+            if main.contains_key(k) && fuzz.contains_key(k) && !names.iter().any(|n| n == k) {
+                names.push(k.to_string());
+            }
+        }
+    }
+    let mut bad = Vec::new();
+    for name in &names {
+        match (main.get(name), fuzz.get(name)) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some(a), Some(b)) => bad.push(format!(
+                "{name}: Cargo.lock {} / fuzz/Cargo.lock {}",
+                a.join(", "),
+                b.join(", ")
+            )),
+            (a, b) => bad.push(format!(
+                "{name}: not in both lockfiles (Cargo.lock {a:?}, fuzz/Cargo.lock {b:?}); \
+                 if it left the graph, drop it from this list"
+            )),
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "security crates locked differently for the fuzz harness (apply the bump to both \
+         lockfiles: `cargo update -p <crate> --precise <v>` at the root and in fuzz/):\n{}",
+        bad.join("\n")
     );
 }
