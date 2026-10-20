@@ -7,8 +7,9 @@ rotating detection, triage-status, netflow and FIM drift logs under
 `.manifest.jsonl`). From lab PR 160 the agent also proves that rows were
 not removed: rows carry their position (`seq`), the head of every chain is
 anchored in `/etc/northnarrow/chain_heads.json`, and the rotating logs
-checkpoint their active file in their manifest. Design:
-`docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`.
+checkpoint their active file in their manifest. Design (source
+repository, not shipped with the release):
+<https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md>.
 
 ## What runs, and where to look
 

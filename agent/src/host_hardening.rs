@@ -242,7 +242,7 @@ fn bpf_lsm(root: &Path) -> Check {
         name: "BPF LSM in the active LSM list",
         status,
         value,
-        fix: "add `lsm=…,bpf` to the kernel command line (keep the distro list, append bpf) and reboot",
+        fix: "append `bpf` to the LSM list the kernel runs (never a fixed `lsm=` list: it can switch SELinux or AppArmor off; docs/operator/KERNEL_COMPATIBILITY.md, \"Enabling the bpf LSM\") and reboot",
     }
 }
 

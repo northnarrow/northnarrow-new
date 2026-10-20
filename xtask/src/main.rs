@@ -81,7 +81,8 @@ enum Cmd {
     /// Tappa 6.9.7 P2: acquire + canonicalise the RAG knowledge base
     /// (MITRE ATT&CK v18.1 + SigmaHQ Linux rules) from pinned refs,
     /// emit canonical JSONL dumps, per-source provenance, LICENSES/
-    /// and NOTICES.md. Build-time (fetch) or install-time (--mirror).
+    /// and the knowledge-base block of NOTICES.md. Build-time (fetch) or
+    /// install-time (--mirror).
     RagKb {
         /// Install-time mode: read the pinned source artifacts from a
         /// local customer-controlled mirror dir instead of fetching

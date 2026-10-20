@@ -1,7 +1,9 @@
 # NorthNarrow FIM trust model (Tappa 9 C7)
 
-This is the operator-facing companion to
-`docs/design/TAPPA9_FIM_DESIGN.md`. Read it before deploying or
+This is the operator-facing companion to the FIM design note, which is
+in the source repository and not in the release
+(<https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/TAPPA9_FIM_DESIGN.md>;
+the `§13` references below are to it). Read it before deploying or
 customising the File Integrity Monitoring (FIM) module — two of the
 design's RFC resolutions (§13 Q5 trust-on-first-use baselines and
 §13 Q7 operator overlay) bake-in trust assumptions that operators
@@ -209,8 +211,9 @@ the trusted-installer window first, or expect the capability to be removed.
 
 ## See also
 
-- Design doc: `docs/design/TAPPA9_FIM_DESIGN.md` (§5 LSM hooks,
-  §6 userland, §13 RFC resolutions).
+- Design doc (source repository):
+  <https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/TAPPA9_FIM_DESIGN.md>
+  (§5 LSM hooks, §6 userland, §13 RFC resolutions).
 - Rule catalogue: `agent/src/fim/rules.rs` (NN-L-FIM-001..014).
 - Install script: `deploy/install.sh` (Tappa 9 C7 additions —
   drops `fim-paths.v1` + bootstraps the two chained logs).

@@ -19,7 +19,7 @@
 //!   [`SensorMultiplexer`].
 //! - Per-hook failures are logged at WARN and tolerated. The hooks
 //!   require `CONFIG_BPF_LSM=y` plus `bpf` in the kernel's runtime
-//!   `lsm=` chain (see `docs/TAPPA7_PREREQ.md`); on a machine that
+//!   `lsm=` chain (see `docs/operator/KERNEL_COMPATIBILITY.md`); on a machine that
 //!   doesn't have those, the agent still has to run with sensors
 //!   active so we don't hard-fail.
 //! - The map write happens *before* the attach calls so any time

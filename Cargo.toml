@@ -16,6 +16,12 @@ edition = "2021"
 # `rust-version` of the locked dependencies, not above rust-toolchain.toml).
 # A dependency bump that needs a newer rustc raises it in the same PR.
 rust-version = "1.89"
+# External audit SUP-019: the licence of NorthNarrow's own code, the one of
+# `LICENSE`; every member inherits it, and agent-ebpf/Cargo.toml and the .rpm
+# (`License:`) say the same. The tree also holds third-party material under
+# other terms (ATT&CK and Sigma content of the RAG knowledge base, the
+# vendored candle-core): NOTICES.md says which files are under which terms.
+# xtask/tests/compliance_docs.rs checks that these agree.
 license = "Apache-2.0"
 repository = "https://github.com/northnarrow/northnarrow-new"
 authors = ["NorthNarrow"]

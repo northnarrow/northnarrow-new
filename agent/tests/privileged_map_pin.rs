@@ -62,7 +62,7 @@
 //! ## Requirements (Hetzner verify box only)
 //!
 //! - root; `/sys/fs/bpf` mounted as bpffs; `CONFIG_BPF_LSM=y` with
-//!   `bpf` in the boot `lsm=` chain (see `docs/TAPPA7_PREREQ.md`);
+//!   `bpf` in the boot `lsm=` chain (see `docs/operator/KERNEL_COMPATIBILITY.md`);
 //!   `bpftool` on PATH; the eBPF object built (`cargo xtask
 //!   build-ebpf`) so the agent embeds a real program.
 //! - The workspace built with `--features test-privileged`.

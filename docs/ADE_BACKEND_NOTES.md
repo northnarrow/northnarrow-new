@@ -46,6 +46,11 @@ install -o root -g root -m 0644 foundation-sec-8b-reasoning-q4_k_m.gguf \
 (The state directory is immutable while the agent runs: create `models/`
 inside a trusted-installer window, or before the first start.)
 
+Neither file is in the repository or the release: their source, the
+revisions read, the licence (Llama 3.1 Community License for the Llama 3.1
+part, Apache-2.0 for Cisco's changes) and what an operator who installs or
+passes them on takes on are in `NOTICES.md`, "Model (not distributed)".
+
 The development box keeps them in a home, used through `--ade-model` by
 tools run as that user:
 

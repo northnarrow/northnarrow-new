@@ -11,7 +11,13 @@
 //! - the version, row count and sha256 matrix.md records for each frozen
 //!   file match the file, so a change to the denominator is a visible new
 //!   version, never a silent edit;
-//! - the technique and control rows cite shipped rules and existing probes.
+//! - the technique and control rows cite shipped rules and existing probes;
+//! - (external audit NN-AUD-444, LAB-028, the guard only — lab PR 209) the
+//!   campaign's state is told the same way everywhere: while the V2 sweep
+//!   document says HALT there is no result to report; once it no longer
+//!   does, matrix.md holds a data row and an evidence directory holds a
+//!   run, and every row cites a run directory that exists, with its
+//!   `SHA256SUMS`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -526,4 +532,165 @@ fn technique_and_control_rows_cite_shipped_rules_and_existing_probes() {
             "{CONTROLS_TSV}: family {family} needs an evasion and a benign row"
         );
     }
+}
+
+/// External audit NN-AUD-444 (LAB-028): the V2 sweep document, whose HALT
+/// line says the campaign has not been approved to run.
+const SWEEP_MD: &str = "docs/adversarial/V2_ATOMIC_RED_TEAM_SWEEP.md";
+const HALT: &str = "**HALT.**";
+/// Where a run's evidence lands (design §11): `docs/validation/evidence/`,
+/// which matrix.md's `evidence/<run-id>/` cells name. The sweep's open item
+/// 3 also proposes `docs/adversarial/evidence/`; a run there counts too.
+const EVIDENCE_DIRS: [&str; 2] = ["docs/validation/evidence", "docs/adversarial/evidence"];
+
+/// The data rows of matrix.md's `## Matrix` table: the template row (cells
+/// holding only `<!-- … -->` comments, or empty) is not one.
+fn matrix_data_rows(matrix: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut in_matrix = false;
+    let mut header_seen = false;
+    for line in matrix.lines() {
+        if let Some(title) = line.strip_prefix("## ") {
+            in_matrix = title.trim() == "Matrix";
+            continue;
+        }
+        let line = line.trim();
+        if !in_matrix || !line.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<String> = line
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim().to_string())
+            .collect();
+        if !header_seen {
+            header_seen = true;
+            continue;
+        }
+        if cells
+            .iter()
+            .all(|c| c.chars().all(|ch| ch == '-' || ch == ':'))
+        {
+            continue;
+        }
+        let rule_id = &cells[0];
+        if rule_id.is_empty() || rule_id.starts_with("<!--") {
+            continue;
+        }
+        rows.push(cells);
+    }
+    rows
+}
+
+/// One run directory: its name and whether it holds `SHA256SUMS`.
+struct RunDir {
+    name: String,
+    has_sums: bool,
+}
+
+fn run_dirs() -> Vec<RunDir> {
+    let mut out = Vec::new();
+    for dir in EVIDENCE_DIRS {
+        let Ok(entries) = std::fs::read_dir(repo_path(dir)) else {
+            continue;
+        };
+        for e in entries {
+            let e = e.unwrap_or_else(|e| panic!("{dir}: {e}"));
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                out.push(RunDir {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    has_sums: e.path().join("SHA256SUMS").is_file(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// What is inconsistent in the campaign's state (empty: nothing).
+fn campaign_state_problems(sweep: &str, matrix: &str, runs: &[RunDir]) -> Vec<String> {
+    let rows = matrix_data_rows(matrix);
+    let mut bad = Vec::new();
+    if !sweep.contains(HALT) {
+        if rows.is_empty() {
+            bad.push(format!(
+                "{SWEEP_MD} no longer says {HALT}, but {MATRIX_MD} has no data row"
+            ));
+        }
+        if runs.is_empty() {
+            bad.push(format!(
+                "{SWEEP_MD} no longer says {HALT}, but no run directory exists under {}",
+                EVIDENCE_DIRS.join(" or ")
+            ));
+        }
+    }
+    for run in runs.iter().filter(|r| !r.has_sums) {
+        bad.push(format!(
+            "evidence run {} has no SHA256SUMS (design §11)",
+            run.name
+        ));
+    }
+    for row in &rows {
+        // rule_id | mitre | tool | expected | result | latency_ms | evidence | notes
+        let evidence = row.get(6).map(|c| strip_md(c)).unwrap_or("");
+        let run = evidence
+            .strip_prefix("evidence/")
+            .and_then(|r| r.split('/').next())
+            .unwrap_or("");
+        if run.is_empty() || !runs.iter().any(|r| r.name == run) {
+            bad.push(format!(
+                "{MATRIX_MD}: the row of {} cites `{evidence}`, not an existing evidence/<run-id>/",
+                row[0]
+            ));
+        }
+    }
+    bad
+}
+
+#[test]
+fn the_campaign_state_is_consistent_until_the_sweep_runs() {
+    let bad = campaign_state_problems(&read(SWEEP_MD), &read(MATRIX_MD), &run_dirs());
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn removing_the_halt_alone_fails_the_campaign_guard() {
+    let sweep = read(SWEEP_MD);
+    let matrix = read(MATRIX_MD);
+    assert!(
+        sweep.contains(HALT),
+        "{SWEEP_MD}: the HALT line this guard reads"
+    );
+    assert!(
+        campaign_state_problems(&sweep, &matrix, &[]).is_empty(),
+        "today: HALT, no row, no run"
+    );
+    let unhalted = sweep.replace(HALT, "Approved.");
+    assert_eq!(campaign_state_problems(&unhalted, &matrix, &[]).len(), 2);
+
+    // A run with its evidence and a row citing it: consistent.
+    let row = "| NN-L-FIM-022_LdSoPreloadModified | T1574.006 | probe | Critical | PASS | 12 | `evidence/2026-11-01T10-00_fim_family/` | - |";
+    let with_row = matrix.replace(
+        "| <!-- e.g. NN-L-FIM-022_LdSoPreloadModified -->",
+        &format!("{row}\n| <!-- e.g. NN-L-FIM-022_LdSoPreloadModified -->"),
+    );
+    assert_eq!(matrix_data_rows(&with_row).len(), 1);
+    let run = |sums| RunDir {
+        name: "2026-11-01T10-00_fim_family".into(),
+        has_sums: sums,
+    };
+    assert!(campaign_state_problems(&unhalted, &with_row, &[run(true)]).is_empty());
+    // The run without SHA256SUMS, or the row citing a run that is not there.
+    assert_eq!(
+        campaign_state_problems(&unhalted, &with_row, &[run(false)]).len(),
+        1
+    );
+    let other = RunDir {
+        name: "2026-11-02T10-00_net_family".into(),
+        has_sums: true,
+    };
+    assert_eq!(
+        campaign_state_problems(&unhalted, &with_row, &[other]).len(),
+        1
+    );
 }
