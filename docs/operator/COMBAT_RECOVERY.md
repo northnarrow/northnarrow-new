@@ -357,6 +357,7 @@ already won). Crash-resilient persistent COMBAT is on the V1.0+ roadmap.
 | See what the response layer holds | `nn-admin response status --key <audit-read key>` (§6) |
 | Release a contained process | `nn-admin response release --pid <pid> --key <response-manage key>` |
 | Get a quarantined file back | `nn-admin response restore --vault-id <id> [--to <path>] --key <response-manage key>` |
+| Undo what ransomware rewrote (copy on first write, experimental) | `nn-admin remediate ransomware --pid <pid> [--since <time>] [--dry-run] --key <response-manage key>` (§7) |
 
 ---
 
@@ -414,6 +415,38 @@ What the verbs will and will not do:
 
 Exit codes: 0 done, 9 verified but nothing done (the reason is printed),
 7 role denied, 2 bad signature, 5 transport or an agent without the verbs.
+
+## 7. Rolling back ransomware (copy on first write, EXPERIMENTAL)
+
+On a host where the copy-on-first-write guard runs (`install.sh
+--cow-guard` and a signed `cow-guard.local`; off by default, lab PR 222,
+[the design](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/COPY_ON_FIRST_WRITE.md)), the agent keeps a copy of each file a
+process it does not trust opened for writing in a protected scope, taken
+before the first write. Once the process tree is stopped (COMBAT NEUTRALIZE,
+a rule's kill, or by hand) — with `auto_restore = true` in `cow-guard.local`
+(off by default) the guard restores on its own after NEUTRALIZE or
+NN-L-FIM-010's kill, no COMBAT needed for the latter; otherwise:
+
+```sh
+# what would be restored (nothing is written)
+nn-admin remediate ransomware --pid 4242 --dry-run --key <response-manage key>
+# restore the files the tree rewrote (renamed .locked copies go to the
+# journal's evidence/ directory)
+nn-admin remediate ransomware --pid 4242 --key <response-manage key>
+# or, for every writer, each file's earliest copy taken since a time (Unix
+# seconds or RFC 3339): the content before the attack only if the attack
+# began after it. With --pid too, an entry must meet both.
+nn-admin remediate ransomware --since 2026-10-20T14:00:00Z --key <response-manage key>
+```
+
+A file someone else changed after the attack, as far as the guard saw, is
+not overwritten: the original is written beside it
+(`<name>.nn-restored-<entry>`) and both are reported. What the guard saw:
+the write-opens after the copy (kept in memory, the last 8 per file, lost
+when the agent restarts — then only a newer mtime counts), another file or
+a reused inode at the path; a 0-byte file is never copied. A file whose writer still runs is skipped. Every file is a signed
+`cow_restore` row; `nn-admin status --key` shows the guard, its copies and
+what it could not protect. Exit codes as §6.
 
 Related: `configs/combat-rules.v4`,
 `agent/src/anti_tamper/network_isolate.rs`,

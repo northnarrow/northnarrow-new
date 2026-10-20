@@ -149,6 +149,10 @@ PREREQ_OVERRIDES=()
 # and the head anchor besides root — a log shipper's. Empty: each file keeps
 # the group it has (root on a default install); every upgrade keeps it.
 AUDIT_GROUP=${NN_AUDIT_GROUP:-}
+# Lab PR 222: the copy-on-first-write guard's drop-in (CAP_SYS_ADMIN for its
+# fanotify permission events). keep = leave an installed one in place
+# (refreshed), 1 = install it, 0 = remove it.
+COW_GUARD=keep
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upgrade) UPGRADE=1 ;;
@@ -168,6 +172,8 @@ while [[ $# -gt 0 ]]; do
         --no-verify) VERIFY=0 ;;
         --without-nftables) WITHOUT_NFT=1 ;;
         --audit-group) AUDIT_GROUP=$2; shift ;;
+        --cow-guard) COW_GUARD=1 ;;
+        --no-cow-guard) COW_GUARD=0 ;;
         -h|--help)
             echo "usage: sudo $0 [--upgrade --grant-key KEY] [--tarball FILE] [--sums FILE] [--attestation BUNDLE]"
             echo "                 [--source-tree | --allow-unverified | --no-verify] [--without-nftables]"
@@ -189,6 +195,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --source-tree          the tree is a build from source (cargo xtask build --release), not a"
             echo "                         release: install it without MANIFEST.sha256 (recorded as 'source-tree')"
             echo "  --no-verify            skip every release check (dev only; recorded as 'unverified')"
+            echo "  --cow-guard            add the copy-on-first-write drop-in (CAP_SYS_ADMIN, CAP_CHOWN, CAP_FOWNER;"
+            echo "                         EXPERIMENTAL; the guard stays off without a signed cow-guard.local)"
+            echo "  --no-cow-guard         remove that drop-in"
             echo "  --audit-group GROUP    existing group that may read $ETC_DIR/audit.log and chain_heads.json"
             echo "                         besides root (a log shipper; NN_AUDIT_GROUP too). Kept by later upgrades"
             echo "  The flag that accepted a level below 'attested' is logged (auth.warning), recorded in the"
@@ -882,6 +891,8 @@ txn_targets() {
     for f in northnarrow-agent northnarrow-watchdog nn-admin; do echo "$BIN_DIR/$f"; done
     for f in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do echo "$UNIT_DIR/$f.service"; done
     echo "$DROPIN_ROOT/northnarrow-agent.service.d/10-debian-perf-paranoid.conf"
+    # lab PR 222: the copy-on-first-write drop-in (--cow-guard)
+    echo "$DROPIN_ROOT/northnarrow-agent.service.d/20-cow-guard.conf"
     echo "$JOURNALD_NS_CONF"
     echo "$ETC_DIR/install-manifest.json"
     for f in fim-paths netflow-blocklist netflow-ja3-blocklist process-comm-allowlist netflow-comm-allowlist; do
@@ -1673,6 +1684,20 @@ if [[ "$os_id" == debian || ( "$os_like" == *debian* && "$os_id" != ubuntu && "$
 elif [[ -e "$DROPIN_DIR/10-debian-perf-paranoid.conf" ]]; then
     echo "install.sh: removing stale Debian perf drop-in (not a Debian-family host)"
     rm -f "$DROPIN_DIR/10-debian-perf-paranoid.conf"
+fi
+# Lab PR 222: the copy-on-first-write guard (EXPERIMENTAL) answers fanotify
+# permission events, which need CAP_SYS_ADMIN; its restore sets a recreated
+# file's owner and time (CAP_CHOWN, CAP_FOWNER). Only with --cow-guard; an
+# upgrade keeps (and refreshes) a drop-in already there. Self-integrity
+# compares it with this file, as the Debian one.
+if [[ "$COW_GUARD" == 1 || ( "$COW_GUARD" == keep && -e "$DROPIN_DIR/20-cow-guard.conf" ) ]]; then
+    echo "install.sh: copy-on-first-write drop-in (CAP_SYS_ADMIN CAP_CHOWN CAP_FOWNER)"
+    install -d -m 0755 -o root -g root "$DROPIN_DIR"
+    install -m 0644 -o root -g root "$REPO_ROOT/deploy/systemd/20-cow-guard.conf" \
+        "$DROPIN_DIR/20-cow-guard.conf"
+elif [[ "$COW_GUARD" == 0 && -e "$DROPIN_DIR/20-cow-guard.conf" ]]; then
+    echo "install.sh: removing the copy-on-first-write drop-in"
+    rm -f "$DROPIN_DIR/20-cow-guard.conf"
 fi
 # Journal-namespace config goes in /etc/systemd/ (read by the
 # systemd-journald@northnarrow instance), NOT the unit dir. NN-managed

@@ -30,6 +30,8 @@ pub mod chainlog;
 pub mod combat;
 pub mod config;
 pub mod correlation;
+/// Lab PR 222: copy on first write (ransomware rollback, EXPERIMENTAL).
+pub mod cow;
 pub mod decision;
 pub mod detection_budget;
 pub mod detection_store;

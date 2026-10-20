@@ -2811,6 +2811,19 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             let posture = posture.clone();
             move || posture.is_combat_locked()
         })
+        // Lab PR 222: a NEUTRALIZE that contained a ransomware tree lets the
+        // copy-on-first-write guard restore what it rewrote (a no-op
+        // without the guard, or without copies of that tree's writes).
+        .with_neutralize_hook(Box::new(|refs| {
+            northnarrow_agent::cow::on_ladder_neutralized(
+                refs.iter()
+                    .map(|r| northnarrow_agent::cow::trust::ProcId {
+                        pid: r.pid(),
+                        start: r.start_ticks().unwrap_or(0),
+                    })
+                    .collect(),
+            )
+        }))
         // External audit CMB-007: the ladder's side effects (nft, cgroup
         // writes, kills, quarantine, iptables, audit) run on a worker of
         // their own, in order — never on the event loop.
@@ -2853,6 +2866,29 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         "COMBAT graduated-response ladder armed (INVESTIGATE → NEUTRALIZE → ISOLATE; \
          isolation is last resort)"
     );
+
+    // Lab PR 222: copy on first write (EXPERIMENTAL). Off without a signed
+    // `cow-guard.local` that says `enabled = true`; started here, after the
+    // anti-tamper hooks (its journals are registered in their map) and the
+    // audit log (its degradations and restores are signed rows).
+    match northnarrow_agent::cow::boot(
+        &overlay_gate.verified(
+            OverlayKind::CowGuard,
+            std::path::Path::new(northnarrow_agent::cow::config::COW_GUARD_LOCAL),
+        ),
+        lineage.clone(),
+        audit_log.clone(),
+        northnarrow_agent::anti_tamper::prepare_pin_root().map(|p| p.to_path_buf()),
+        detect_only,
+    ) {
+        northnarrow_agent::cow::GuardState::Off => {
+            debug!("copy on first write: off (no signed cow-guard.local enabling it)")
+        }
+        northnarrow_agent::cow::GuardState::Failed(why) => {
+            warn!(why = %why, "copy on first write: configured but not running")
+        }
+        northnarrow_agent::cow::GuardState::Running(_) => {}
+    }
 
     // Fast heartbeat advancing the time-bound INVESTIGATE deadline. The
     // 60 s posture-decay loop is too coarse for the ladder's
@@ -4384,6 +4420,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // The links go with the agent from here on: the self-check stops
     // reporting them (a spurious signed bpf_link_missing otherwise).
     northnarrow_agent::anti_tamper::bpf_defense::mark_stopping();
+    // Lab PR 222: the guard's fanotify group closes first — no open on a
+    // protected scope waits on an agent that is leaving.
+    northnarrow_agent::cow::shutdown();
 
     if let Some(log) = &audit_log {
         let uptime = loop_started.elapsed().as_secs();
@@ -4699,6 +4738,9 @@ async fn process_event(
     if !host_stopping && ladder.current_stage().is_some() {
         ladder.observe(&event, Instant::now());
     }
+    // Lab PR 222: a mass rewrite of existing files flags its writer for the
+    // copy-on-first-write guard (a ransomware verdict's offender).
+    northnarrow_agent::cow::observe_event(&event);
     correlation.push(event.clone());
 
     // Review 71: per-event lines for the frequent events (every exec,
@@ -5120,6 +5162,16 @@ async fn process_event(
             }
         };
 
+        // Lab PR 222: the ransomware rule's kill neutralized its writer.
+        northnarrow_agent::cow::after_rule_response(
+            &verdict.rule_id,
+            target_pid,
+            matches!(
+                report.primary,
+                northnarrow_agent::response::ExecutionOutcome::Killed { .. }
+                    | northnarrow_agent::response::ExecutionOutcome::AlreadyGone { .. }
+            ),
+        );
         if let Admit::Record { suppressed_before } = admit {
             info!(
                 action = ?report.action,

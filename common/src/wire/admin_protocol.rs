@@ -794,6 +794,13 @@ pub struct StatusResponse {
     /// agent, and in the unsigned `status` (telemetry).
     #[serde(default)]
     pub exploit_guard: Option<ExploitGuardStatus>,
+    /// Lab PR 222: the copy-on-first-write guard (its state, scopes, copies
+    /// and skips). Appended after lab PR 219's `exploit_guard` (which
+    /// follows lab PR 218's, 217's, 215's and 207's fields); telemetry
+    /// (`None` in the unsigned reply, and from an agent without the guard's
+    /// code).
+    #[serde(default)]
+    pub cow_guard: Option<CowGuardStatus>,
 }
 
 /// Lab PR 219: the exploit post-condition guard in `nn-admin status`.
@@ -875,6 +882,7 @@ impl StatusResponse {
             degradations: None,
             capability_manifest: None,
             exploit_guard: None,
+            cow_guard: None,
         }
     }
 
@@ -1185,6 +1193,52 @@ pub struct SignedUnlockRequest {
     pub signatures: Vec<KeyedSignature>,
 }
 
+/// Lab PR 222 — the copy-on-first-write guard, as `status --key` shows it
+/// ([`StatusResponse::cow_guard`]). Telemetry: withheld by the unsigned
+/// `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CowGuardStatus {
+    /// `off` (no signed `cow-guard.local`, or `enabled = false`),
+    /// `running`, `failed: <why>` (configured, could not start), `stopped:
+    /// <why>` (it stopped after the start: the group was closed).
+    pub state: String,
+    /// Where the writers' open flags come from (`proc_syscall`, or why
+    /// they cannot be read: every open is then treated as a write).
+    pub flags_source: String,
+    /// Restores run on their own when COMBAT neutralizes ransomware.
+    pub auto_restore: bool,
+    pub scopes: Vec<CowScopeStatus>,
+    /// Counters since the start, by name (copies, skips by reason, answer
+    /// latencies in microseconds, restores) — named, so a counter added
+    /// later needs no new field.
+    pub counters: Vec<(String, u64)>,
+}
+
+/// One protected scope of [`CowGuardStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CowScopeStatus {
+    pub path: String,
+    /// `dirs`, `mount` or `filesystem`.
+    pub mark: String,
+    pub journal: String,
+    /// `reflink` when the journal's filesystem shares extents (`FICLONE`
+    /// worked at the start), else `copy` (files up to the copy cap).
+    pub copy_method: String,
+    /// Directories marked (`dirs`), else 1.
+    pub marks: u64,
+    pub budget_bytes: u64,
+    pub used_bytes: u64,
+    pub entries: u64,
+    pub objects: u64,
+}
+
+/// Signed `remediate ransomware` request (`RemediateRansomwareExtra`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemediateRansomwareRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
 /// Reply to [`SignedUnlockRequest`]. `result` is `Success` only when the
 /// release was carried out and read back — the COMBAT chain gone from both
 /// tables (`iptables -S` / `ip6tables -S`) — and [`AdminResult::ActionFailed`]
@@ -1201,6 +1255,49 @@ pub struct SignedUnlockResponse {
     pub isolation_v6: bool,
     pub message: String,
 }
+
+/// One file of a restore: what was done with it and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CowRestoreRow {
+    pub path: String,
+    /// `restored_in_place`, `recreated`, `kept_both`, `unchanged`,
+    /// `refused`, `skipped` (a dry run says what it would do, prefixed
+    /// `would_`).
+    pub action: String,
+    /// The journal entry restored from.
+    pub entry: u64,
+    pub detail: String,
+    /// Where the original was written when both were kept.
+    pub beside: Option<String>,
+    /// Where an encrypted copy the attack left (renamed) was moved.
+    pub evidence: Option<String>,
+    pub sha256_original: String,
+    /// SHA-256 of the file after the restore (`None`: not written).
+    pub sha256_after: Option<String>,
+}
+
+/// Reply to [`RemediateRansomwareRequest`]. `rows` lists the first files
+/// (at most [`REMEDIATE_ROWS_MAX`]); every file has its own signed audit
+/// row (`cow_restore`) whatever the list shows. `done`: something was
+/// restored (or, in a dry run, would be).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemediateRansomwareResponse {
+    pub result: AdminResult,
+    pub done: bool,
+    pub message: String,
+    pub rows: Vec<CowRestoreRow>,
+    pub rows_total: u32,
+    pub restored: u32,
+    pub recreated: u32,
+    pub kept_both: u32,
+    pub unchanged: u32,
+    pub refused: u32,
+    pub skipped: u32,
+}
+
+/// Files listed in a [`RemediateRansomwareResponse`] (the frame body is
+/// 64 KiB at most).
+pub const REMEDIATE_ROWS_MAX: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminMessage {
@@ -1372,6 +1469,11 @@ pub enum AdminMessage {
     SignedUnlockRequest(SignedUnlockRequest),
     /// Reply to [`AdminMessage::SignedUnlockRequest`].
     SignedUnlockResponse(SignedUnlockResponse),
+    /// Lab PR 222 — signed restore from the copy-on-first-write journal.
+    /// Triggers [`AdminMessage::RemediateRansomwareResponse`].
+    RemediateRansomwareRequest(RemediateRansomwareRequest),
+    /// Reply to [`AdminMessage::RemediateRansomwareRequest`].
+    RemediateRansomwareResponse(RemediateRansomwareResponse),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -1709,7 +1811,35 @@ mod tests {
             isolation_v6: false,
             message: String::new(),
         });
-        assert_eq!(first(&unlock), 55, "the last production variant");
+        assert_eq!(first(&unlock), 55, "SignedUnlockResponse");
+        // Lab PR 222: the signed restore of the copy-on-first-write
+        // journal, appended after lab PR 217's pair.
+        let remediate = AdminMessage::RemediateRansomwareRequest(RemediateRansomwareRequest {
+            payload: SignedPayload::new_remediate_ransomware(
+                [0; 32],
+                0,
+                [0; 16],
+                Some(1),
+                None,
+                true,
+            ),
+            signatures: Vec::new(),
+        });
+        assert_eq!(first(&remediate), 56, "RemediateRansomwareRequest");
+        let remediated = AdminMessage::RemediateRansomwareResponse(RemediateRansomwareResponse {
+            result: AdminResult::RoleDenied,
+            done: false,
+            message: String::new(),
+            rows: Vec::new(),
+            rows_total: 0,
+            restored: 0,
+            recreated: 0,
+            kept_both: 0,
+            unchanged: 0,
+            refused: 0,
+            skipped: 0,
+        });
+        assert_eq!(first(&remediated), 57, "the last production variant");
         assert_eq!(
             first(&AdminMessage::StatusResponse(StatusResponse::public(
                 PostureKind::Observing,
@@ -1725,9 +1855,9 @@ mod tests {
         {
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                56
+                58
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 57);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 59);
         }
     }
 
@@ -1819,6 +1949,7 @@ mod tests {
             degradations: None,
             capability_manifest: None,
             exploit_guard: None,
+            cow_guard: None,
         }));
     }
 
@@ -1857,6 +1988,7 @@ mod tests {
             degradations: None,
             capability_manifest: None,
             exploit_guard: None,
+            cow_guard: None,
         }));
     }
 
@@ -2004,7 +2136,9 @@ mod tests {
                 | AdminMessage::LoopProgress(_)
                 | AdminMessage::LoopProgressResponse(_)
                 | AdminMessage::SignedUnlockRequest(_)
-                | AdminMessage::SignedUnlockResponse(_) => {}
+                | AdminMessage::SignedUnlockResponse(_)
+                | AdminMessage::RemediateRansomwareRequest(_)
+                | AdminMessage::RemediateRansomwareResponse(_) => {}
             }
         }
     }
@@ -2057,6 +2191,23 @@ mod tests {
                 untracked_total: 0,
                 use_checks_total: 0,
                 denied_total: 0,
+            }),
+            cow_guard: Some(CowGuardStatus {
+                state: "running".to_string(),
+                flags_source: "proc_syscall".to_string(),
+                auto_restore: false,
+                scopes: vec![CowScopeStatus {
+                    path: "/srv".to_string(),
+                    mark: "dirs".to_string(),
+                    journal: "/srv/.northnarrow-cow".to_string(),
+                    copy_method: "copy".to_string(),
+                    marks: 12,
+                    budget_bytes: 1 << 30,
+                    used_bytes: 4096,
+                    entries: 3,
+                    objects: 2,
+                }],
+                counters: vec![("copies_reflink".to_string(), 2)],
             }),
         }));
     }
@@ -2125,6 +2276,7 @@ mod tests {
                 use_checks_total: 0,
                 denied_total: 0,
             }),
+            cow_guard: None,
         }
     }
 
@@ -2662,8 +2814,8 @@ mod tests {
     /// Lab PR 217: the isolation per IP family is appended to the status —
     /// public, passed through by the unsigned reply — and an `nn-admin` of
     /// lab PR 213 reads every byte before it (the two fields follow lab PR
-    /// 215's; lab PR 218's four fields and lab PR 219's one, `None` in a
-    /// public reply, come after them).
+    /// 215's; the fields appended after them — lab PR 218's four, 219's
+    /// and 222's one each — are `None` in a public reply).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -2679,8 +2831,9 @@ mod tests {
         let without = postcard::to_allocvec(&without).unwrap();
         // None is one byte each; Some(bool) two. The fields appended after
         // them (one `None` byte each here) are the last bytes of both: lab
-        // PR 218's four, lab PR 219's `exploit_guard`.
-        let tail = 4 + 1;
+        // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
+        // `cow_guard`.
+        let tail = 4 + 1 + 1;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
@@ -2762,6 +2915,56 @@ mod tests {
                 message: String::new(),
             },
         ));
+    }
+
+    /// Lab PR 222: the remediate verb survives the wire, and a full reply
+    /// (the most rows it lists, long paths) fits a frame.
+    #[test]
+    fn roundtrip_remediate_ransomware_and_its_largest_reply_fits() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        roundtrip(AdminMessage::RemediateRansomwareRequest(
+            RemediateRansomwareRequest {
+                payload: SignedPayload::new_remediate_ransomware(
+                    [0x44; 32],
+                    1_700_000_000,
+                    [0x55; 16],
+                    Some(4242),
+                    None,
+                    true,
+                ),
+                signatures: vec![KeyedSignature {
+                    signature: [0x66; 64],
+                }],
+            },
+        ));
+        let row = |i: usize| CowRestoreRow {
+            path: format!("/home/alice/Documents/projects/a-fairly-long-name/file-{i:05}.docx"),
+            action: "restored_in_place".to_string(),
+            entry: i as u64,
+            detail: "the attack's writes only".to_string(),
+            beside: None,
+            evidence: Some(format!(
+                "/srv/.northnarrow-cow/evidence/{i}-file-{i:05}.docx.locked"
+            )),
+            sha256_original: "ab".repeat(32),
+            sha256_after: Some("ab".repeat(32)),
+        };
+        let reply = AdminMessage::RemediateRansomwareResponse(RemediateRansomwareResponse {
+            result: AdminResult::Success,
+            done: true,
+            message: "restored 120 of 5000 files".to_string(),
+            rows: (0..REMEDIATE_ROWS_MAX).map(row).collect(),
+            rows_total: 5000,
+            restored: 4000,
+            recreated: 900,
+            kept_both: 50,
+            unchanged: 40,
+            refused: 5,
+            skipped: 5,
+        });
+        roundtrip(reply.clone());
+        let frame = encode_frame(&reply).expect("the largest reply encodes");
+        assert!(frame.len() <= MAX_FRAME_BODY + 4, "{} bytes", frame.len());
     }
 
     #[test]

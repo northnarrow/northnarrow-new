@@ -1510,3 +1510,42 @@ fn an_isolation_not_applied_is_recorded_and_not_retried() {
     assert!(!last.success);
     assert!(last.summary.contains("not applied"), "{}", last.summary);
 }
+
+/// Lab PR 222: the NEUTRALIZE hook hears the contained offenders after the
+/// kill, and nothing when the kill did not contain them.
+#[test]
+fn the_neutralize_hook_hears_the_contained_offenders_only() {
+    for (outcome, expected) in [
+        (NeutralizeOutcome::Contained, vec![vec![900u32, 901]]),
+        (
+            NeutralizeOutcome::Uncontainable {
+                reason: "respawned".into(),
+            },
+            vec![],
+        ),
+    ] {
+        let heard: Arc<Mutex<Vec<Vec<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let (l, rec) = ladder(outcome, Duration::from_secs(30));
+        let l = {
+            let heard = Arc::clone(&heard);
+            let rec = rec.clone();
+            l.with_neutralize_hook(Box::new(move |refs| {
+                rec.push("hook");
+                heard.lock().push(pids_of(refs));
+            }))
+        };
+        let t0 = Instant::now();
+        l.engage(Some(900), Some(TriggerType::ConfirmedIntrusion), t0);
+        l.engage(Some(901), None, t0);
+        l.tick(t0 + Duration::from_secs(31));
+        assert_eq!(*heard.lock(), expected);
+        let log = rec.log();
+        if let Some(h) = log.iter().position(|e| e == "hook") {
+            let n = log
+                .iter()
+                .position(|e| e.starts_with("neutralize"))
+                .unwrap();
+            assert!(n < h, "the hook runs after the kill: {log:?}");
+        }
+    }
+}

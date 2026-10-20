@@ -199,6 +199,11 @@ pub enum OperationCode {
     /// COMBAT evidence gaps). Read-only; authorised by `Role::AuditRead` or
     /// `Role::TelemetryRead`, 1-of-N.
     TelemetryStatus = 25,
+    /// Lab PR 222 (copy on first write, capability C19) — restore the
+    /// files a process tree rewrote, or every file copied since a time,
+    /// from the guard's journal. Authorised by `Role::ResponseManage`,
+    /// 1-of-N: a restore writes into users' files. `dry_run` only plans.
+    RemediateRansomware = 26,
 }
 
 impl From<OperationCode> for u8 {
@@ -236,6 +241,7 @@ impl TryFrom<u8> for OperationCode {
             23 => Ok(Self::ResponseRelease),
             24 => Ok(Self::ResponseRestore),
             25 => Ok(Self::TelemetryStatus),
+            26 => Ok(Self::RemediateRansomware),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -722,10 +728,14 @@ pub enum OverlayKind {
     /// `rsync` if a backup runs them), on top of the built-in readers:
     /// their read of a File or Credential canary is recorded, not killed.
     CanaryReaders = 11,
+    /// Lab PR 222: `cow-guard.local` — the copy-on-first-write guard's
+    /// configuration (scopes, budgets, trusted writers, auto-restore). Off
+    /// without it: a signed file turns the guard on.
+    CowGuard = 12,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 11] = [
+    pub const ALL: [OverlayKind; 12] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -737,6 +747,7 @@ impl OverlayKind {
         OverlayKind::CombatRulesV6,
         OverlayKind::CombatAllow,
         OverlayKind::CanaryReaders,
+        OverlayKind::CowGuard,
     ];
 
     /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
@@ -753,6 +764,7 @@ impl OverlayKind {
             OverlayKind::CombatRulesV6 => "combat-rules-v6",
             OverlayKind::CombatAllow => "combat-allow",
             OverlayKind::CanaryReaders => "canary-readers",
+            OverlayKind::CowGuard => "cow-guard",
         }
     }
 
@@ -800,6 +812,7 @@ impl TryFrom<u8> for OverlayKind {
             9 => Ok(Self::CombatRulesV6),
             10 => Ok(Self::CombatAllow),
             11 => Ok(Self::CanaryReaders),
+            12 => Ok(Self::CowGuard),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }
@@ -843,6 +856,18 @@ pub struct ResponseRestoreExtra {
 /// Empty, like [`ResponseStatusExtra`]: the response carries the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TelemetryStatusExtra {}
+
+/// Op-specific signed-scope fields for
+/// [`OperationCode::RemediateRansomware`]: the process whose tree is undone
+/// (its writes and its descendants'), and/or the copies taken at or after
+/// `since_unix` (seconds); at least one of the two. `dry_run`: report the
+/// plan, change nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemediateRansomwareExtra {
+    pub pid: Option<u32>,
+    pub since_unix: Option<u64>,
+    pub dry_run: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationExtra {
@@ -891,6 +916,8 @@ pub enum OperationExtra {
     /// External audit ASK-009 (lab PR 213). Pairs with
     /// [`OperationCode::TelemetryStatus`].
     TelemetryStatus(TelemetryStatusExtra),
+    /// Lab PR 222. Pairs with [`OperationCode::RemediateRansomware`].
+    RemediateRansomware(RemediateRansomwareExtra),
 }
 
 impl OperationExtra {
@@ -924,6 +951,7 @@ impl OperationExtra {
             OperationExtra::ResponseRelease(_) => OperationCode::ResponseRelease,
             OperationExtra::ResponseRestore(_) => OperationCode::ResponseRestore,
             OperationExtra::TelemetryStatus(_) => OperationCode::TelemetryStatus,
+            OperationExtra::RemediateRansomware(_) => OperationCode::RemediateRansomware,
         }
     }
 }
@@ -1536,6 +1564,29 @@ impl SignedPayload {
             extra: OperationExtra::TelemetryStatus(TelemetryStatusExtra {}),
         }
     }
+
+    /// Lab PR 222 — `remediate ransomware` signed payload constructor.
+    /// Authorised by `Role::ResponseManage`.
+    pub fn new_remediate_ransomware(
+        nonce: [u8; 32],
+        ts: u64,
+        agent_id: [u8; 16],
+        pid: Option<u32>,
+        since_unix: Option<u64>,
+        dry_run: bool,
+    ) -> Self {
+        Self {
+            op: OperationCode::RemediateRansomware,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::RemediateRansomware(RemediateRansomwareExtra {
+                pid,
+                since_unix,
+                dry_run,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1573,7 +1624,7 @@ mod tests {
     /// `Detections`, bringing it to 19. Tappa 9.0.c added
     /// `DetectionSetStatus`, bringing it to 20. External audit CMB-016
     /// added the three response ops (ConfigOverlaySet has its own test).
-    fn one_payload_per_op() -> [SignedPayload; 24] {
+    fn one_payload_per_op() -> [SignedPayload; 25] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -1649,6 +1700,14 @@ mod tests {
                 Some("/tmp/restored".to_string()),
             ),
             SignedPayload::new_telemetry_status(nonce(), TS, agent_id()),
+            SignedPayload::new_remediate_ransomware(
+                nonce(),
+                TS,
+                agent_id(),
+                Some(4242),
+                Some(TS - 3600),
+                true,
+            ),
         ]
     }
 
@@ -1847,6 +1906,8 @@ mod tests {
             (OperationCode::ResponseRestore, 24),
             // External audit ASK-009 (lab PR 213) — APPENDED, never renumber.
             (OperationCode::TelemetryStatus, 25),
+            // Lab PR 222 — APPENDED, never renumber.
+            (OperationCode::RemediateRansomware, 26),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");
@@ -1911,6 +1972,7 @@ mod tests {
             (OverlayKind::MassWriteCarveout, 6, "mass-write-carveout"),
             (OverlayKind::EscalationAllow, 7, "escalation-allow"),
             (OverlayKind::CanaryReaders, 11, "canary-readers"),
+            (OverlayKind::CowGuard, 12, "cow-guard"),
         ] {
             assert_eq!(u8::from(k), byte);
             assert_eq!(OverlayKind::try_from(byte).unwrap(), k);

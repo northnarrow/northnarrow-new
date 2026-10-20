@@ -4153,6 +4153,7 @@ mod tests {
                 degradations: None,
                 capability_manifest: None,
                 exploit_guard: None,
+                cow_guard: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

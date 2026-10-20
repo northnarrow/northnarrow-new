@@ -45,11 +45,12 @@ use common::wire::admin_protocol::{
     FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
     NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
     NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
-    ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest,
-    ResponseRestoreResponse, ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse,
-    StatusResponse, TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest,
-    UnlockResult, MAX_FRAME_BODY,
+    RemediateRansomwareRequest, RemediateRansomwareResponse, ResponseReleaseRequest,
+    ResponseReleaseResponse, ResponseRestoreRequest, ResponseRestoreResponse,
+    ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest, RotateKeysRevokeRequest,
+    ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse, StatusResponse,
+    TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockResult,
+    MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
@@ -1821,6 +1822,35 @@ fn emit_audit_for(
             audit_result_str(r.result),
             req.signatures.len().saturating_sub(1),
         ),
+        // Lab PR 222: the verb's own row; every file it touched has a
+        // `cow_restore` row of its own, signed before this one.
+        (
+            AdminMessage::RemediateRansomwareRequest(req),
+            AdminMessage::RemediateRansomwareResponse(r),
+        ) => {
+            let (pid, since, dry_run) = match &req.payload.extra {
+                OperationExtra::RemediateRansomware(e) => (e.pid, e.since_unix, e.dry_run),
+                _ => (None, None, false),
+            };
+            (
+                "remediate_ransomware",
+                serde_json::json!({
+                    "pid": pid,
+                    "since_unix": since,
+                    "dry_run": dry_run,
+                    "files": r.rows_total,
+                    "restored": r.restored,
+                    "recreated": r.recreated,
+                    "kept_both": r.kept_both,
+                    "unchanged": r.unchanged,
+                    "refused": r.refused,
+                    "skipped": r.skipped,
+                    "detail": r.message,
+                }),
+                verified_result_str(r.result, r.done, &r.message),
+                req.signatures.len().saturating_sub(1),
+            )
+        }
         // Non-auditable here: ChallengeRequest, the debug path. The unsigned
         // Status is summarised per peer by `StatusPolls` (external audit
         // ASK-009). Server-only reply variants reaching dispatch are
@@ -2187,6 +2217,10 @@ fn dispatch(
         AdminMessage::ResponseRestoreRequest(req) => AdminMessage::ResponseRestoreResponse(
             dispatch_response_restore(req, auth, response_state, fps_out),
         ),
+        // Lab PR 222 — restore from the copy-on-first-write journal.
+        AdminMessage::RemediateRansomwareRequest(req) => AdminMessage::RemediateRansomwareResponse(
+            dispatch_remediate_ransomware(req, auth, fps_out),
+        ),
 
         // Server-only variants — clients sending these are speaking
         // out-of-spec. Reply with a benign sentinel; the connection
@@ -2218,7 +2252,8 @@ fn dispatch(
         | AdminMessage::ResponseRestoreResponse(_)
         | AdminMessage::TelemetryStatusResponse(_)
         | AdminMessage::LoopProgressResponse(_)
-        | AdminMessage::SignedUnlockResponse(_) => {
+        | AdminMessage::SignedUnlockResponse(_)
+        | AdminMessage::RemediateRansomwareResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -3549,6 +3584,8 @@ fn telemetry_status(
         capability_manifest: crate::boot::manifest::current_json(),
         // Lab PR 219: the exploit post-condition guard.
         exploit_guard: Some(crate::sensors::epg::status()),
+        // Lab PR 222: the copy-on-first-write guard.
+        cow_guard: crate::cow::status(),
     }
 }
 
@@ -3801,6 +3838,133 @@ fn dispatch_response_restore(
             warn!(vault_id = %extra.vault_id, error = %e, "response-restore refused");
             refuse(AdminResult::Success, e.to_string())
         }
+    }
+}
+
+/// Lab PR 222: `nn-admin remediate ransomware --pid N | --since TS
+/// [--dry-run]` (`response-manage`): restore, from the copy-on-first-write
+/// journal, the files the process tree rewrote (or every file copied since
+/// the time). The agent does the work under the rules of
+/// [`crate::cow::restore`] and signs one `cow_restore` row per file.
+fn dispatch_remediate_ransomware(
+    req: RemediateRansomwareRequest,
+    auth: &ConnAuth<'_>,
+    fps_out: &mut Vec<String>,
+) -> RemediateRansomwareResponse {
+    let refuse = |result: AdminResult, message: String| RemediateRansomwareResponse {
+        result,
+        done: false,
+        message,
+        rows: Vec::new(),
+        rows_total: 0,
+        restored: 0,
+        recreated: 0,
+        kept_both: 0,
+        unchanged: 0,
+        refused: 0,
+        skipped: 0,
+    };
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::ResponseManage],
+        OperationCode::RemediateRansomware,
+        now_unix_secs(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return refuse(
+                map_admin_auth_error(e, "remediate-ransomware"),
+                String::new(),
+            )
+        }
+    };
+    *fps_out = matched_fps;
+    let OperationExtra::RemediateRansomware(extra) = &req.payload.extra else {
+        warn!("remediate-ransomware payload extra is not RemediateRansomware variant");
+        return refuse(AdminResult::UnknownOperation, String::new());
+    };
+    let key_fp = fps_out.first().cloned().unwrap_or_default();
+    let report = match crate::cow::admin_restore(extra.pid, extra.since_unix, extra.dry_run, key_fp)
+    {
+        Ok(r) => r,
+        Err(why) => return refuse(AdminResult::Success, why),
+    };
+    if let Some(why) = report.refusal.clone() {
+        return refuse(AdminResult::Success, why);
+    }
+    let total = report.rows.len();
+    // Keep the reply inside a frame: at most REMEDIATE_ROWS_MAX rows and
+    // about 48 KiB of them (a path is up to PATH_MAX).
+    let mut budget = 48 * 1024usize;
+    let mut rows = Vec::new();
+    for r in &report.rows {
+        let clip = |s: &str| s.chars().take(512).collect::<String>();
+        let row = common::wire::admin_protocol::CowRestoreRow {
+            path: clip(&r.path),
+            action: r.action.clone(),
+            entry: r.entry,
+            detail: clip(&r.detail),
+            beside: r.beside.as_deref().map(clip),
+            evidence: r.evidence.as_deref().map(clip),
+            sha256_original: r.sha256_original.clone(),
+            sha256_after: r.sha256_after.clone(),
+        };
+        let cost = row.path.len()
+            + row.detail.len()
+            + row.beside.as_ref().map_or(0, |s| s.len())
+            + row.evidence.as_ref().map_or(0, |s| s.len())
+            + 200;
+        if rows.len() >= common::wire::admin_protocol::REMEDIATE_ROWS_MAX || cost > budget {
+            break;
+        }
+        budget -= cost;
+        rows.push(row);
+    }
+    let done = if extra.dry_run {
+        report.restored + report.recreated + report.kept_both > 0
+    } else {
+        report.restored + report.recreated > 0
+    };
+    let message = format!(
+        "{}{} file(s): {} restored in place, {} recreated, {} kept both, {} unchanged, {} refused, {} skipped{}",
+        if extra.dry_run { "dry run — " } else { "" },
+        total,
+        report.restored,
+        report.recreated,
+        report.kept_both,
+        report.unchanged,
+        report.refused,
+        report.skipped,
+        if rows.len() < total {
+            format!(" ({} listed; every file is in the signed audit log)", rows.len())
+        } else {
+            String::new()
+        }
+    );
+    warn!(
+        target: "admin.remediate_ransomware",
+        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        pid = ?extra.pid,
+        since = ?extra.since_unix,
+        dry_run = extra.dry_run,
+        detail = %message,
+        "remediate ransomware"
+    );
+    RemediateRansomwareResponse {
+        result: AdminResult::Success,
+        done,
+        message,
+        rows,
+        rows_total: total as u32,
+        restored: report.restored,
+        recreated: report.recreated,
+        kept_both: report.kept_both,
+        unchanged: report.unchanged,
+        refused: report.refused,
+        skipped: report.skipped,
     }
 }
 
@@ -5978,6 +6142,7 @@ mod tests {
             degradations: None,
             capability_manifest: None,
             exploit_guard: None,
+            cow_guard: None,
         });
         emit_audit_for(
             &status_req,

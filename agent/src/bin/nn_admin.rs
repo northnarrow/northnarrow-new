@@ -544,6 +544,14 @@ enum Cmd {
         sub: ResponseCmd,
     },
 
+    /// Lab PR 222 — undo what ransomware rewrote, from the copy-on-first-
+    /// write journal (`remediate ransomware`, `response-manage`). The agent
+    /// restores and signs one `cow_restore` row per file.
+    Remediate {
+        #[command(subcommand)]
+        sub: RemediateCmd,
+    },
+
     /// Tappa 10.8 — operator configuration the agent loads only when an
     /// admin key signed it (`config overlay set|sign|status`).
     Config {
@@ -558,6 +566,35 @@ enum Cmd {
     Debug {
         #[command(subcommand)]
         sub: DebugCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RemediateCmd {
+    /// Restore the files a process tree rewrote (`--pid`: the process and
+    /// everything it started), and/or the files copied since a time
+    /// (`--since`, Unix seconds or RFC 3339: alone, every writer's earliest
+    /// copy since then; with `--pid`, both must hold), from the copies the
+    /// guard took before each first write. A file someone else changed
+    /// after the attack, as far as the guard saw, is not overwritten: the
+    /// original is written beside it (`<name>.nn-restored-<entry>`).
+    /// `--dry-run` only reports the plan.
+    Ransomware {
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long = "dry-run", default_value_t = false)]
+        dry_run: bool,
+        /// A key with `response-manage`.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -633,7 +670,7 @@ enum OverlayCmd {
     Set {
         /// fim-paths, process-comm-allowlist, netflow-comm-allowlist,
         /// netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout,
-        /// escalation-allow, canary-readers.
+        /// escalation-allow, canary-readers, cow-guard.
         kind: String,
         /// The overlay content to store.
         #[arg(long)]
@@ -1840,6 +1877,7 @@ fn main() -> ExitCode {
         },
 
         Cmd::Response { sub } => run_response_cmd(sub),
+        Cmd::Remediate { sub } => run_remediate_cmd(sub),
         Cmd::Config {
             sub: ConfigCmd::Overlay { sub },
         } => run_overlay_cmd(sub),
@@ -2841,7 +2879,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -2888,6 +2926,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             serde_json::to_string(&out.degradations).unwrap_or_else(|_| "null".to_string()),
             // Lab PR 219.
             serde_json::to_string(&out.exploit_guard).unwrap_or_else(|_| "null".to_string()),
+            serde_json::to_string(&out.cow_guard).unwrap_or_else(|_| "null".to_string()),
             out.telemetry_signed,
         );
         return;
@@ -2985,6 +3024,84 @@ fn print_status(out: &StatusOutcome, json: bool) {
         }
     }
     println!("{}", deny_fail_open_line(out, tty));
+    // Lab PR 222: the copy-on-first-write guard.
+    for line in cow_guard_lines(out.cow_guard.as_ref()) {
+        println!("{line}");
+    }
+}
+
+/// Lab PR 222: the guard's lines of `status --key`.
+fn cow_guard_lines(g: Option<&common::wire::admin_protocol::CowGuardStatus>) -> Vec<String> {
+    let Some(g) = g else {
+        return vec!["copy on write     : (agent predates the guard)".to_string()];
+    };
+    let mut out = vec![format!("copy on write     : {}", g.state)];
+    if g.state != "running" && g.scopes.is_empty() {
+        return out;
+    }
+    out.push(format!(
+        "  open flags from : {}; auto-restore {}",
+        g.flags_source,
+        if g.auto_restore { "on" } else { "off" }
+    ));
+    for s in &g.scopes {
+        out.push(format!(
+            "  scope {} (mark={}, {} mark(s), {}): {} of {} bytes, {} file copies in {} objects, journal {}",
+            s.path, s.mark, s.marks, s.copy_method, s.used_bytes, s.budget_bytes, s.entries, s.objects, s.journal
+        ));
+    }
+    let get = |n: &str| {
+        g.counters
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, v)| *v)
+            .unwrap_or(0)
+    };
+    out.push(format!(
+        "  copies          : {} reflink, {} copied ({} bytes), {} shared",
+        get("copies_reflink"),
+        get("copies_plain"),
+        get("copied_bytes"),
+        get("copies_linked")
+    ));
+    let skipped: Vec<String> = g
+        .counters
+        .iter()
+        .filter(|(k, v)| {
+            (k.starts_with("skipped_") || k.starts_with("late_") || k == "queue_overflows")
+                && *v > 0
+        })
+        .map(|(k, v)| format!("{} {v}", k.trim_start_matches("skipped_")))
+        .collect();
+    out.push(format!(
+        "  not protected   : {}",
+        if skipped.is_empty() {
+            "none".to_string()
+        } else {
+            skipped.join(", ")
+        }
+    ));
+    let avg = |n: &str, t: &str| match get(n) {
+        0 => "-".to_string(),
+        c => format!("{} µs", get(t) / c),
+    };
+    out.push(format!(
+        "  open latency    : fast path avg {} max {} µs ({}), copy path avg {} max {} µs ({})",
+        avg("answer_fast_count", "answer_fast_us_total"),
+        get("answer_fast_us_max"),
+        get("answer_fast_count"),
+        avg("answer_copy_count", "answer_copy_us_total"),
+        get("answer_copy_us_max"),
+        get("answer_copy_count")
+    ));
+    out.push(format!(
+        "  restores        : {} run, {} files restored, {} kept both, {} refused",
+        get("restores"),
+        get("restored_files"),
+        get("restore_conflicts"),
+        get("restore_refused")
+    ));
+    out
 }
 
 fn print_verify_keys(out: &VerifyKeysOutcome) -> ExitCode {
@@ -3321,6 +3438,78 @@ fn run_response_cmd(sub: ResponseCmd) -> ExitCode {
             "response restore",
             run_response_restore(&socket, &key, &agent_id_file, vault_id, to),
         ),
+    }
+}
+
+/// `--since`: Unix seconds, or an RFC 3339 time.
+fn parse_since(s: &str) -> Option<u64> {
+    if let Ok(n) = s.trim().parse::<u64>() {
+        return Some(n);
+    }
+    chrono::DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .and_then(|t| u64::try_from(t.timestamp()).ok())
+}
+
+fn run_remediate_cmd(sub: RemediateCmd) -> ExitCode {
+    use northnarrow_agent::admin_cli::run_remediate_ransomware;
+    match sub {
+        RemediateCmd::Ransomware {
+            pid,
+            since,
+            dry_run,
+            key,
+            agent_id_file,
+            socket,
+            json,
+        } => {
+            let since = match since.as_deref().map(parse_since) {
+                Some(None) => {
+                    eprintln!(
+                        "remediate ransomware: --since takes Unix seconds or an RFC 3339 time"
+                    );
+                    return ExitCode::from(2);
+                }
+                Some(Some(t)) => Some(t),
+                None => None,
+            };
+            if pid.is_none() && since.is_none() {
+                eprintln!("remediate ransomware: name a process (--pid) or a time (--since)");
+                return ExitCode::from(2);
+            }
+            match run_remediate_ransomware(&socket, &key, &agent_id_file, pid, since, dry_run) {
+                Ok(r) if r.result == common::wire::admin_protocol::AdminResult::Success => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&r).unwrap_or_else(|_| "null".into())
+                        );
+                    } else {
+                        println!("remediate ransomware: {}", r.message);
+                        for row in &r.rows {
+                            println!("  {:<22} {}  ({})", row.action, row.path, row.detail);
+                            if let Some(b) = &row.beside {
+                                println!("  {:<22} original written beside: {b}", "");
+                            }
+                            if let Some(e) = &row.evidence {
+                                println!("  {:<22} encrypted copy moved to: {e}", "");
+                            }
+                        }
+                    }
+                    // As the response verbs: 9 = verified, nothing done.
+                    if r.done || (r.rows_total > 0 && r.refused == 0) {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(9)
+                    }
+                }
+                Ok(r) => exit_from_admin_result("remediate ransomware", r.result),
+                Err(e) => {
+                    eprintln!("remediate ransomware: {e:#}");
+                    ExitCode::from(5)
+                }
+            }
+        }
     }
 }
 
@@ -4409,6 +4598,7 @@ mod flow_sock_line_tests {
             degradations: None,
             capability_manifest: None,
             exploit_guard: None,
+            cow_guard: None,
             telemetry_signed: true,
         }
     }
@@ -4695,5 +4885,81 @@ mod flow_sock_line_tests {
         assert!(telemetry_withheld(&u));
         u.exploit_guard = o.exploit_guard.clone();
         assert!(!telemetry_withheld(&u));
+    }
+}
+
+/// Lab PR 222: the guard's `status --key` lines and `--since`.
+#[cfg(test)]
+mod cow_guard_line_tests {
+    use super::{cow_guard_lines, parse_since};
+    use common::wire::admin_protocol::{CowGuardStatus, CowScopeStatus};
+
+    #[test]
+    fn the_guard_is_shown_with_its_scopes_skips_and_latencies() {
+        assert_eq!(
+            cow_guard_lines(None),
+            vec!["copy on write     : (agent predates the guard)".to_string()]
+        );
+        let off = CowGuardStatus {
+            state: "off".into(),
+            flags_source: String::new(),
+            auto_restore: false,
+            scopes: vec![],
+            counters: vec![],
+        };
+        assert_eq!(
+            cow_guard_lines(Some(&off)),
+            vec!["copy on write     : off".to_string()]
+        );
+        let on = CowGuardStatus {
+            state: "running".into(),
+            flags_source: "proc_syscall".into(),
+            auto_restore: true,
+            scopes: vec![CowScopeStatus {
+                path: "/srv/nn-cow-test".into(),
+                mark: "dirs".into(),
+                journal: "/srv/nn-cow-test/.northnarrow-cow".into(),
+                copy_method: "copy".into(),
+                marks: 4,
+                budget_bytes: 1 << 30,
+                used_bytes: 409_600,
+                entries: 50,
+                objects: 50,
+            }],
+            counters: vec![
+                ("copies_plain".into(), 50),
+                ("copied_bytes".into(), 409_600),
+                ("skipped_over_cap".into(), 1),
+                ("skipped_deadline".into(), 0),
+                ("answer_copy_count".into(), 50),
+                ("answer_copy_us_total".into(), 5000),
+                ("answer_copy_us_max".into(), 300),
+                ("restored_files".into(), 50),
+            ],
+        };
+        let lines = cow_guard_lines(Some(&on)).join("\n");
+        assert!(lines.contains("copy on write     : running"), "{lines}");
+        assert!(lines.contains("proc_syscall; auto-restore on"), "{lines}");
+        assert!(
+            lines.contains("scope /srv/nn-cow-test (mark=dirs, 4 mark(s), copy)"),
+            "{lines}"
+        );
+        assert!(lines.contains("not protected   : over_cap 1"), "{lines}");
+        assert!(
+            !lines.contains("deadline"),
+            "zero counters are not listed: {lines}"
+        );
+        assert!(
+            lines.contains("copy path avg 100 µs max 300 µs (50)"),
+            "{lines}"
+        );
+        assert!(lines.contains("50 files restored"), "{lines}");
+    }
+
+    #[test]
+    fn since_takes_seconds_or_rfc3339() {
+        assert_eq!(parse_since("1760000000"), Some(1_760_000_000));
+        assert_eq!(parse_since("2026-10-20T14:00:00Z"), Some(1_792_504_800));
+        assert_eq!(parse_since("yesterday"), None);
     }
 }
