@@ -13,7 +13,7 @@
 //! [`UnlockToken`] capability type so the API can only be used by
 //! code that proved a signature first.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,22 +21,60 @@ use anyhow::{anyhow, Context, Result};
 use tracing::{error, info, warn};
 
 use super::combat_allow;
+use crate::trusted_bin::{self, SystemBin};
 
-/// `iptables-restore` lookup name. Resolved via `PATH` by
-/// [`std::process::Command`]; we do not pin an absolute path because
-/// Ubuntu / Debian / Alpine all install it under different prefixes
-/// (`/usr/sbin/` vs `/sbin/`).
+/// `iptables-restore` lookup name. External audit ATP-014 (NN-AUD-262):
+/// looked up in the system directories only ([`crate::trusted_bin`]), not
+/// on the `PATH` the agent inherited — whose first entries under systemd
+/// are `/usr/local/sbin:/usr/local/bin`. Ubuntu, Debian and the RHEL
+/// family install it in `/usr/sbin` (`/sbin` on a split `/usr`).
 const DEFAULT_RESTORE_BIN: &str = "iptables-restore";
 
 /// `iptables` lookup name. Used by [`NetworkIsolator::release`] to
-/// undo what `iptables-restore` applied. Same PATH-resolution
-/// rationale as [`DEFAULT_RESTORE_BIN`].
+/// undo what `iptables-restore` applied. Looked up like
+/// [`DEFAULT_RESTORE_BIN`].
 const DEFAULT_IPTABLES_BIN: &str = "iptables";
 
 /// BUG-031 — `ip6tables-restore` / `ip6tables` lookup names for the v6
-/// isolation mirror. Same PATH rationale as the v4 binaries.
+/// isolation mirror. Looked up like the v4 binaries.
 const DEFAULT_RESTORE_BIN_V6: &str = "ip6tables-restore";
 const DEFAULT_IPTABLES_BIN_V6: &str = "ip6tables";
+
+/// A binary COMBAT runs. External audit ATP-014 (NN-AUD-262): in
+/// production a name, looked up in the system directories at each use and
+/// run as the verified file ([`trusted_bin::resolve`]); a lookup that fails
+/// is an error of the step (no `PATH` fallback). Tests run a fixed mock.
+#[derive(Debug, Clone)]
+enum Bin {
+    System(&'static str),
+    #[cfg(test)]
+    Fixed(PathBuf),
+}
+
+impl Bin {
+    /// The command to run, and the file it runs (for the log).
+    fn command(&self) -> Result<(Command, PathBuf)> {
+        match self {
+            Bin::System(name) => {
+                let bin: SystemBin = trusted_bin::resolve(name)
+                    .map_err(|e| anyhow!("{e} (external audit ATP-014: no PATH lookup)"))?;
+                Ok((bin.command(), bin.exe().to_path_buf()))
+            }
+            #[cfg(test)]
+            Bin::Fixed(path) => Ok((Command::new(path), path.clone())),
+        }
+    }
+}
+
+impl std::fmt::Display for Bin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Bin::System(name) => f.write_str(name),
+            #[cfg(test)]
+            Bin::Fixed(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
 
 /// Default install path for the v6 ruleset (`--combat-rules-v6`).
 const DEFAULT_RULES_V6: &str = "/etc/northnarrow/combat-rules.v6";
@@ -89,16 +127,16 @@ pub struct NetworkIsolator {
     /// every `engage()` (never cached) so an operator can add an
     /// emergency CIDR from a local console mid-COMBAT.
     allow_cidrs_path: PathBuf,
-    restore_bin: PathBuf,
-    iptables_bin: PathBuf,
+    restore_bin: Bin,
+    iptables_bin: Bin,
     /// BUG-031 — v6 isolation mirror: the `combat-rules.v6` ruleset path
     /// (`--combat-rules-v6`) + the `ip6tables-restore` / `ip6tables`
     /// binaries. The v6 leg is best-effort: a missing ruleset or absent
     /// `ip6tables` leaves IPv6 un-isolated with a loud WARN (v4 still
     /// applies), not a refused COMBAT.
     rules_path_v6: PathBuf,
-    restore_bin_v6: PathBuf,
-    ip6tables_bin: PathBuf,
+    restore_bin_v6: Bin,
+    ip6tables_bin: Bin,
     /// External audit ATP-001 / DEP-003: who vouches for the three files
     /// COMBAT reads ([`Self::trusted_source`]). `None` (tests, tools):
     /// the files are trusted as they are.
@@ -167,13 +205,39 @@ impl NetworkIsolator {
             is_isolated: AtomicBool::new(false),
             rules_path,
             allow_cidrs_path: combat_allow::default_path(),
-            restore_bin: PathBuf::from(DEFAULT_RESTORE_BIN),
-            iptables_bin: PathBuf::from(DEFAULT_IPTABLES_BIN),
+            restore_bin: Bin::System(DEFAULT_RESTORE_BIN),
+            iptables_bin: Bin::System(DEFAULT_IPTABLES_BIN),
             rules_path_v6: PathBuf::from(DEFAULT_RULES_V6),
-            restore_bin_v6: PathBuf::from(DEFAULT_RESTORE_BIN_V6),
-            ip6tables_bin: PathBuf::from(DEFAULT_IPTABLES_BIN_V6),
+            restore_bin_v6: Bin::System(DEFAULT_RESTORE_BIN_V6),
+            ip6tables_bin: Bin::System(DEFAULT_IPTABLES_BIN_V6),
             gate: None,
         })
+    }
+
+    /// External audit ATP-014 (NN-AUD-262): the files COMBAT will run, for
+    /// the boot log — each name with the verified file it resolves to, or
+    /// why there is none. `Err` when a v4 binary (the critical leg) cannot
+    /// be run.
+    pub fn binaries(&self) -> std::result::Result<String, String> {
+        let mut found = Vec::new();
+        let mut missing = Vec::new();
+        for (bin, critical) in [
+            (&self.restore_bin, true),
+            (&self.iptables_bin, true),
+            (&self.restore_bin_v6, false),
+            (&self.ip6tables_bin, false),
+        ] {
+            match bin.command() {
+                Ok((_, exe)) => found.push(format!("{bin}={}", exe.display())),
+                Err(e) if critical => missing.push(format!("{e:#}")),
+                Err(e) => found.push(format!("{bin}: {e:#}")),
+            }
+        }
+        if missing.is_empty() {
+            Ok(found.join(", "))
+        } else {
+            Err(missing.join("; "))
+        }
     }
 
     /// External audit ATP-001 / DEP-003: vouch for the COMBAT files with
@@ -277,12 +341,12 @@ impl NetworkIsolator {
             // (`/bin/true` / `/usr/bin/cat`). v6-specific tests pass the
             // same ctor.
             rules_path_v6: rules_path.clone(),
-            restore_bin_v6: restore_bin.clone(),
-            ip6tables_bin: iptables_bin.clone(),
+            restore_bin_v6: Bin::Fixed(restore_bin.clone()),
+            ip6tables_bin: Bin::Fixed(iptables_bin.clone()),
             rules_path,
             allow_cidrs_path: combat_allow::default_path(),
-            restore_bin,
-            iptables_bin,
+            restore_bin: Bin::Fixed(restore_bin),
+            iptables_bin: Bin::Fixed(iptables_bin),
             gate: None,
         })
     }
@@ -293,18 +357,33 @@ impl NetworkIsolator {
     /// exactly what we want.
     pub fn engage(&self) -> Result<()> {
         let (ruleset, carved) = self.build_engaged_ruleset()?;
-        run_iptables_restore_data(&self.restore_bin, ruleset.as_bytes())
+        let restore_exe = run_iptables_restore_data(&self.restore_bin, ruleset.as_bytes())
             .context("iptables-restore failed during COMBAT engage")?;
+        // External audit ATP-006 (NN-AUD-259): the ruleset is in, so the
+        // host is isolated — recorded before anything else can fail. The
+        // dedup's `?` used to return between the two: `nn-admin status`
+        // then said "not isolated" of an isolated host, and the ladder's
+        // caller logged a failed isolation.
+        self.is_isolated.store(true, Ordering::SeqCst);
         // BUG-041: the restore inserts our jump on top; a re-engage would
         // stack a duplicate. Trim to exactly one — windowless (only
         // deletes extras, always leaves >= 1 jump). Runs AFTER the
         // restore `?`, so it never acts on a zero-jump table from a
-        // failed restore.
-        dedup_jumps(&self.iptables_bin).context("deduplicating v4 COMBAT jumps")?;
-        self.is_isolated.store(true, Ordering::SeqCst);
+        // failed restore. A failure leaves a duplicate jump, which
+        // isolates like the first and which the teardown removes too
+        // (`remove_jumps`): an ERROR, not a failed engage (the v6 mirror
+        // has always treated it so).
+        if let Err(e) = dedup_jumps(&self.iptables_bin) {
+            error!(
+                error = %format!("{e:#}"),
+                "COMBAT: network isolated, but the v4 jump dedup failed — a duplicate jump \
+                 may be left (it isolates too; the release removes every jump)"
+            );
+        }
         if carved.is_empty() {
             info!(
                 rules = %self.rules_path.display(),
+                restore_bin = %restore_exe.display(),
                 "COMBAT: network isolated (loopback only)"
             );
         } else {
@@ -313,6 +392,7 @@ impl NetworkIsolator {
             // of thing an operator reviewing a COMBAT event must see.
             warn!(
                 rules = %self.rules_path.display(),
+                restore_bin = %restore_exe.display(),
                 allow_cidrs = ?carved,
                 count = carved.len(),
                 "COMBAT: network isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
@@ -338,7 +418,7 @@ impl NetworkIsolator {
             ),
             Ok(Some((ruleset, carved))) => {
                 match run_iptables_restore_data(&self.restore_bin_v6, ruleset.as_bytes()) {
-                    Ok(()) => {
+                    Ok(_) => {
                         // BUG-041: dedup our v6 jumps (best-effort — a dup
                         // is harmless, both isolate; v4 already succeeded).
                         if let Err(e) = dedup_jumps(&self.ip6tables_bin) {
@@ -540,14 +620,14 @@ impl NetworkIsolator {
 /// when stderr indicates the rule or chain was already absent. This
 /// makes [`NetworkIsolator::release`] idempotent without needing a
 /// separate "is this chain present?" probe per command.
-#[allow(dead_code)]
-fn run_iptables_idempotent(bin: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new(bin)
+fn run_iptables_idempotent(bin: &Bin, args: &[&str]) -> Result<()> {
+    let (mut cmd, _) = bin.command()?;
+    let output = cmd
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("spawning {} {}", bin.display(), args.join(" ")))?;
+        .with_context(|| format!("spawning {bin} {}", args.join(" ")))?;
     if output.status.success() {
         return Ok(());
     }
@@ -556,8 +636,7 @@ fn run_iptables_idempotent(bin: &Path, args: &[&str]) -> Result<()> {
         return Ok(());
     }
     Err(anyhow!(
-        "{} {} exited {}: {}",
-        bin.display(),
+        "{bin} {} exited {}: {}",
         args.join(" "),
         output.status,
         stderr.trim()
@@ -596,9 +675,9 @@ pub struct ReconcileOutcome {
 /// still-referenced chain), then flush + delete. Each step tolerates
 /// "already gone". Parameterized by `bin` so the v4 (`iptables`) and v6
 /// (`ip6tables`) tables share one implementation.
-fn tear_down_one(bin: &Path) -> Result<()> {
+fn tear_down_one(bin: &Bin) -> Result<()> {
     for base in ["INPUT", "OUTPUT", "FORWARD"] {
-        run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])
+        remove_jumps(bin, base)
             .with_context(|| format!("removing {COMBAT_CHAIN} jump from {base}"))?;
     }
     run_iptables_idempotent(bin, &["-F", COMBAT_CHAIN])
@@ -612,13 +691,14 @@ fn tear_down_one(bin: &Path) -> Result<()> {
 /// `Ok(Some(n))` = present with `n` `-A` rules, `Ok(None)` = absent
 /// (non-zero exit), `Err` = the binary could not be run (BUG-031: the
 /// v6 caller treats that as "no v6 chain").
-fn probe_chain(bin: &Path) -> Result<Option<usize>> {
-    let listed = Command::new(bin)
+fn probe_chain(bin: &Bin) -> Result<Option<usize>> {
+    let (mut cmd, _) = bin.command()?;
+    let listed = cmd
         .args(["-S", COMBAT_CHAIN])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("running {} -S {COMBAT_CHAIN}", bin.display()))?;
+        .with_context(|| format!("running {bin} -S {COMBAT_CHAIN}"))?;
     if !listed.status.success() {
         return Ok(None);
     }
@@ -632,24 +712,49 @@ fn probe_chain(bin: &Path) -> Result<Option<usize>> {
 /// otherwise stack a duplicate). Windowless: only ever DELETEs extras,
 /// leaving >= 1 jump in place at all times — never a no-jump moment.
 /// Must run AFTER a successful restore (so the count is >= 1).
-fn dedup_jumps(bin: &Path) -> Result<()> {
+fn dedup_jumps(bin: &Bin) -> Result<()> {
     for base in ["INPUT", "OUTPUT", "FORWARD"] {
-        let listed = Command::new(bin)
-            .args(["-S", base])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("listing {base} to dedup {COMBAT_CHAIN} jumps"))?;
-        if !listed.status.success() {
+        let Some(n) = list_jumps(bin, base)
+            .with_context(|| format!("listing {base} to dedup {COMBAT_CHAIN} jumps"))?
+        else {
             continue; // base chain unreadable — skip (best-effort)
-        }
-        let n = count_jumps(&String::from_utf8_lossy(&listed.stdout));
+        };
         // Delete (n - 1) extras, keeping exactly one. `1..n` is empty when
         // n <= 1, so this never deletes below one jump.
         for _ in 1..n {
             run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])
                 .with_context(|| format!("removing duplicate {COMBAT_CHAIN} jump from {base}"))?;
         }
+    }
+    Ok(())
+}
+
+/// The `-j COMBAT_CHAIN` jumps in `base` (`iptables -S base`); `None` when
+/// the listing exits non-zero (base chain unreadable).
+fn list_jumps(bin: &Bin, base: &str) -> Result<Option<usize>> {
+    let (mut cmd, _) = bin.command()?;
+    let listed = cmd
+        .args(["-S", base])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("running {bin} -S {base}"))?;
+    if !listed.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(count_jumps(&String::from_utf8_lossy(&listed.stdout))))
+}
+
+/// External audit ATP-006 (NN-AUD-259): remove EVERY jump into
+/// `COMBAT_CHAIN` from `base` — one per jump `-S` lists, at least one
+/// (idempotent: "already gone" is success). A dedup that failed at engage
+/// leaves a second jump, and `-X` refuses a chain still referenced: a
+/// single `-D` let the release flush the chain (the host back on the
+/// network) and then fail, with the isolation still reported.
+fn remove_jumps(bin: &Bin, base: &str) -> Result<()> {
+    let n = list_jumps(bin, base).ok().flatten().unwrap_or(1).max(1);
+    for _ in 0..n {
+        run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])?;
     }
     Ok(())
 }
@@ -718,11 +823,12 @@ fn finish(lines: Vec<String>) -> String {
 }
 
 /// Spawn `bin`, pipe `rules_data` to its stdin, and treat a non-zero
-/// exit as a hard failure.
-fn run_iptables_restore_data(bin: &Path, rules_data: &[u8]) -> Result<()> {
+/// exit as a hard failure. Returns the file that ran (the log names it).
+fn run_iptables_restore_data(bin: &Bin, rules_data: &[u8]) -> Result<PathBuf> {
     use std::io::Write;
 
-    let mut child = Command::new(bin)
+    let (mut cmd, exe) = bin.command()?;
+    let mut child = cmd
         // BUG-041: ADDITIVE — never flush the operator's table. The dump
         // rebuilds only our own declared chain (`:NORTHNARROW_COMBAT`)
         // and inserts our jumps (`-I … 1`); every operator chain/rule is
@@ -732,34 +838,34 @@ fn run_iptables_restore_data(bin: &Path, rules_data: &[u8]) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawning {}", bin.display()))?;
+        .with_context(|| format!("spawning {bin} ({})", exe.display()))?;
 
     {
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| anyhow!("failed to capture {} stdin", bin.display()))?;
+            .ok_or_else(|| anyhow!("failed to capture {bin} stdin"))?;
         // `iptables-restore` reads everything from stdin then exits.
         // A non-reading mock (e.g. `true`) would EPIPE here; we use
         // `cat` in tests precisely because it drains stdin reliably.
         stdin
             .write_all(rules_data)
-            .with_context(|| format!("writing ruleset to {} stdin", bin.display()))?;
+            .with_context(|| format!("writing ruleset to {bin} stdin"))?;
     }
 
     let output = child
         .wait_with_output()
-        .with_context(|| format!("waiting for {}", bin.display()))?;
+        .with_context(|| format!("waiting for {bin}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
-            "{} exited {}: {}",
-            bin.display(),
+            "{bin} ({}) exited {}: {}",
+            exe.display(),
             output.status,
             stderr.trim()
         ));
     }
-    Ok(())
+    Ok(exe)
 }
 
 #[cfg(test)]
@@ -829,6 +935,11 @@ mod tests {
     /// flag (BUG-041) that `cat` rejects as an unknown option, while
     /// still avoiding the EPIPE a non-reading mock (`/bin/true`) hits.
     fn mock_restore_bin() -> Option<PathBuf> {
+        mock_script("#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n")
+    }
+
+    /// A mock binary running the shell `body` (see [`mock_restore_bin`]).
+    fn mock_script(body: &str) -> Option<PathBuf> {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -842,8 +953,7 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let mut f = std::fs::File::create(&path).ok()?;
-        f.write_all(b"#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n")
-            .ok()?;
+        f.write_all(body.as_bytes()).ok()?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).ok()?;
         drop(f);
         // ETXTBSY guard: the test harness runs tests on parallel threads.
@@ -1016,6 +1126,123 @@ mod tests {
             !iso.is_engaged(),
             "engaged flag must stay false after failure"
         );
+    }
+
+    /// External audit ATP-006 (NN-AUD-259): the restore succeeded, so the
+    /// host is isolated — a failed jump dedup (a duplicate listed, its
+    /// `-D` refused) is logged, and `engage` is `Ok` with the state
+    /// isolated. Before, `engage` returned the dedup's error with
+    /// `is_engaged()` false while the ruleset was in.
+    #[test]
+    fn engage_survives_a_failed_dedup() {
+        let (Some(restore), Some(iptables)) = (
+            mock_restore_bin(),
+            mock_script(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 -S) echo \"-A $2 -j NORTHNARROW_COMBAT\"; echo \"-A $2 -j NORTHNARROW_COMBAT\"; exit 0 ;;\n\
+                 -D) echo 'iptables: Resource temporarily unavailable.' >&2; exit 4 ;;\n\
+                 esac\n\
+                 exit 0\n",
+            ),
+        ) else {
+            return;
+        };
+        let iso = NetworkIsolator::new_with_bin(combat_rules_path(), restore, iptables).unwrap();
+        iso.engage().expect("the restore succeeded: engaged");
+        assert!(iso.is_engaged(), "the host is isolated: reported so");
+        // a failed restore is still not engaged
+        let bin = PathBuf::from("/bin/false");
+        if bin.exists() {
+            let failed =
+                NetworkIsolator::new_with_bin(combat_rules_path(), bin, PathBuf::from("/bin/true"))
+                    .unwrap();
+            assert!(failed.engage().is_err());
+            assert!(!failed.is_engaged());
+        }
+    }
+
+    /// External audit ATP-006 (NN-AUD-259): a duplicate jump the dedup left
+    /// is removed by the release, so the chain can be deleted. One `-D` per
+    /// base chain used to leave it, and `-X` failed ("Device or resource
+    /// busy") after the flush had already put the host back on the
+    /// network.
+    #[test]
+    fn release_removes_every_jump() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = dir.path().display().to_string();
+        for base in ["INPUT", "OUTPUT", "FORWARD"] {
+            std::fs::write(dir.path().join(base), "2\n").unwrap();
+        }
+        // a stateful iptables: `-S base` lists the jumps left, `-D` takes
+        // one off or says it is gone, `-X` refuses while one is left
+        let Some(iptables) = mock_script(&format!(
+            "#!/bin/sh\n\
+             st={st}\n\
+             case \"$1\" in\n\
+             -S) [ -f \"$st/$2\" ] || exit 0; i=0; n=$(cat \"$st/$2\");\n\
+                 while [ $i -lt $n ]; do echo \"-A $2 -j NORTHNARROW_COMBAT\"; i=$((i+1)); done; exit 0 ;;\n\
+             -D) n=$(cat \"$st/$2\"); if [ \"$n\" -gt 0 ]; then echo $((n-1)) > \"$st/$2\"; exit 0; fi;\n\
+                 echo 'iptables: Bad rule (does a matching rule exist in that chain?).' >&2; exit 1 ;;\n\
+             -X) for b in INPUT OUTPUT FORWARD; do [ \"$(cat \"$st/$b\")\" -eq 0 ] || \n\
+                 {{ echo 'iptables v1.8.10 (nf_tables): CHAIN_DEL failed (Device or resource busy): chain NORTHNARROW_COMBAT' >&2; exit 1; }}; done; exit 0 ;;\n\
+             esac\n\
+             exit 0\n"
+        )) else {
+            return;
+        };
+        let iso = NetworkIsolator::new_with_bin(
+            combat_rules_path(),
+            PathBuf::from("/usr/bin/cat"),
+            iptables,
+        )
+        .unwrap();
+        iso.release(mint_unlock_token())
+            .expect("every jump removed, the chain deleted");
+        for base in ["INPUT", "OUTPUT", "FORWARD"] {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(base))
+                    .unwrap()
+                    .trim(),
+                "0",
+                "{base}"
+            );
+        }
+        // idempotent: nothing left, the release still succeeds
+        iso.release(mint_unlock_token()).expect("second release");
+    }
+
+    /// External audit ATP-014 (NN-AUD-262): the production isolator runs
+    /// names looked up in the system directories, never a `PATH` search;
+    /// the boot line names the files, or says why one cannot run.
+    #[test]
+    fn production_binaries_are_system_lookups() {
+        let iso = NetworkIsolator::new(combat_rules_path()).unwrap();
+        for (bin, name) in [
+            (&iso.restore_bin, "iptables-restore"),
+            (&iso.iptables_bin, "iptables"),
+            (&iso.restore_bin_v6, "ip6tables-restore"),
+            (&iso.ip6tables_bin, "ip6tables"),
+        ] {
+            assert!(matches!(bin, Bin::System(n) if *n == name), "{bin:?}");
+        }
+        match iso.binaries() {
+            Ok(line) => {
+                for exe in line
+                    .split(", ")
+                    .filter_map(|f| f.split_once('='))
+                    .map(|(_, e)| e)
+                {
+                    assert!(
+                        crate::trusted_bin::SYSTEM_BIN_DIRS
+                            .iter()
+                            .any(|d| exe.starts_with(d)),
+                        "{line}"
+                    );
+                }
+            }
+            Err(why) => assert!(why.contains("/usr/sbin, /usr/bin, /sbin, /bin"), "{why}"),
+        }
     }
 
     #[test]

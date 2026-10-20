@@ -26,8 +26,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, info};
@@ -258,46 +258,48 @@ pub(crate) fn write_pid(path: &Path, pid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The search path `execvp` falls back to when `PATH` is unset.
-const FALLBACK_PATH: &str = "/bin:/usr/bin";
-
-/// The `nft` that [`nft_apply`] would run: the first executable regular
-/// file named `nft` in the directories of `path` (a `PATH` value), in the
-/// order `Command::new("nft")` searches them.
-pub fn find_nft(path: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    path.split(':')
-        .filter(|dir| !dir.is_empty())
-        .map(|dir| Path::new(dir).join("nft"))
-        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
-}
-
 /// Lab follow-up (lab PR 165): the boot check. Without `nft` neither a
 /// BlockOutbound verdict nor the COMBAT soft egress block can drop a
 /// process's traffic, and that used to show only at the first block. The
 /// returned text is the boot ERROR and the signed `subsystem_degraded`
-/// detail; `None` when `nft` is found on `path` (`None`: `PATH` unset).
-pub fn nft_gap(path: Option<&str>) -> Option<String> {
-    let path = path.unwrap_or(FALLBACK_PATH);
-    if find_nft(path).is_some() {
-        return None;
-    }
+/// detail; `None` when `lookup` finds an `nft` [`nft_apply`] would run.
+///
+/// External audit ATP-014 (NN-AUD-262): that is the `nft` of the system
+/// directories ([`crate::trusted_bin`]), not the first one on `PATH`.
+pub fn nft_gap(lookup: &crate::trusted_bin::Lookup) -> Option<String> {
+    let why = lookup.resolve("nft").err()?;
+    let missing = if why.is_missing() {
+        "nft missing"
+    } else {
+        "nft missing (not trusted)"
+    };
     Some(format!(
-        "block_outbound unavailable: nft missing (no executable `nft` on PATH {path}) — a \
-         BlockOutbound verdict and the COMBAT soft egress block cannot drop a process's \
-         traffic; each episode records the failure and shortens INVESTIGATE to 10 s. Install \
-         nftables"
+        "block_outbound unavailable: {missing} ({why}) — a BlockOutbound verdict and the \
+         COMBAT soft egress block cannot drop a process's traffic; each episode records the \
+         failure and shortens INVESTIGATE to 10 s. Install nftables"
     ))
 }
 
-/// [`nft_gap`] for this process's `PATH`, the one `nft_apply` searches.
+/// [`nft_gap`] for this host, where [`nft_apply`] looks.
 pub fn nft_gap_at_boot() -> Option<String> {
-    nft_gap(std::env::var("PATH").ok().as_deref())
+    nft_gap(&crate::trusted_bin::Lookup::system())
+}
+
+/// External audit ATP-014 (NN-AUD-262): the `nft` the agent runs — the
+/// system directories' ([`crate::trusted_bin`]), verified, never a `PATH`
+/// search. None there is `ENOENT`, as a missing `nft` always was (the
+/// ladder's "is nftables installed?"), with the reason logged.
+pub(crate) fn trusted_nft() -> std::io::Result<crate::trusted_bin::SystemBin> {
+    crate::trusted_bin::resolve("nft").map_err(|e| {
+        tracing::warn!(error = %e, "nft not run: none trusted in the system directories");
+        std::io::Error::from_raw_os_error(libc::ENOENT)
+    })
 }
 
 /// Pipe `ruleset` to `nft -f -` and propagate its stderr on failure.
 pub(crate) fn nft_apply(ruleset: &str) -> std::io::Result<()> {
-    let mut child = Command::new("nft")
+    let mut child = trusted_nft()?
+        .command()
         .arg("-f")
         .arg("-")
         .stdin(Stdio::piped())
@@ -430,38 +432,50 @@ mod tests {
 
     /// Lab follow-up (lab PR 165): a host without `nft` is reported at
     /// boot, not only at the first block; only an executable regular file
-    /// named `nft` on the search path counts.
+    /// named `nft` in a system directory counts. External audit ATP-014
+    /// (NN-AUD-262): one in `/usr/local/sbin` (first on systemd's default
+    /// service `PATH`) does not, nor one others can write.
     #[test]
     fn a_missing_nft_is_reported_at_boot() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let tmp = TempDir::new().unwrap();
-        let (a, b, c) = (
-            tmp.path().join("a"),
-            tmp.path().join("b"),
-            tmp.path().join("c"),
-        );
-        for d in [&a, &b, &c] {
-            fs::create_dir(d).unwrap();
+        let r = tmp.path();
+        fs::set_permissions(r, fs::Permissions::from_mode(0o755)).unwrap();
+        for d in ["usr/sbin", "usr/bin", "usr/local/sbin"] {
+            fs::create_dir_all(r.join(d)).unwrap();
+            fs::set_permissions(r.join(d), fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let ab = format!("{}:{}", a.display(), b.display());
-        let gap = nft_gap(Some(&ab)).expect("no nft: reported");
+        fs::set_permissions(r.join("usr"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(r.join("usr/local"), fs::Permissions::from_mode(0o755)).unwrap();
+        let lookup = crate::trusted_bin::Lookup::new(r, fs::metadata(r).unwrap().uid());
+        let gap = nft_gap(&lookup).expect("no nft: reported");
         assert!(
-            gap.starts_with("block_outbound unavailable: nft missing"),
+            gap.starts_with("block_outbound unavailable: nft missing ("),
             "{gap}"
         );
-        assert!(gap.contains(&ab), "names the path searched: {gap}");
-        assert!(nft_gap(Some("")).is_some());
+        assert!(
+            gap.contains("/usr/sbin, /usr/bin, /sbin, /bin"),
+            "names the directories searched: {gap}"
+        );
+        // the first entry of systemd's default PATH: not a system directory
+        let exe = |p: &Path, mode| {
+            fs::write(p, b"#!/bin/sh\n").unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        exe(&r.join("usr/local/sbin/nft"), 0o755);
+        assert!(nft_gap(&lookup).is_some());
         // a file without an execute bit, a directory: nothing `nft -f` runs
-        fs::write(a.join("nft"), b"").unwrap();
-        fs::set_permissions(a.join("nft"), fs::Permissions::from_mode(0o644)).unwrap();
-        fs::create_dir(b.join("nft")).unwrap();
-        assert!(nft_gap(Some(&ab)).is_some());
-        // an executable further down the path is the one found
-        fs::write(c.join("nft"), b"").unwrap();
-        fs::set_permissions(c.join("nft"), fs::Permissions::from_mode(0o755)).unwrap();
-        let abc = format!("{ab}::{}", c.display());
-        assert_eq!(find_nft(&abc), Some(c.join("nft")));
-        assert!(nft_gap(Some(&abc)).is_none());
+        exe(&r.join("usr/sbin/nft"), 0o644);
+        fs::create_dir(r.join("usr/bin/nft")).unwrap();
+        let gap = nft_gap(&lookup).expect("not runnable: reported");
+        assert!(gap.contains("nft missing (not trusted)"), "{gap}");
+        assert!(gap.contains("not executable"), "{gap}");
+        // group-writable: refused
+        exe(&r.join("usr/sbin/nft"), 0o775);
+        assert!(nft_gap(&lookup).is_some());
+        // the system directory's executable, root's (here: the tree's owner)
+        exe(&r.join("usr/sbin/nft"), 0o755);
+        assert!(nft_gap(&lookup).is_none());
     }
 
     /// External audit CMB-010: only a process still in the blocked scope

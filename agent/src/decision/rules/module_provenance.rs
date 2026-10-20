@@ -18,7 +18,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
 
 use parking_lot::Mutex;
@@ -142,9 +141,20 @@ impl ModuleOwners {
 }
 
 /// `rpm -qf --quiet PATH`: owned (`Some(true)`), not owned, or `None` when
-/// rpm cannot be asked.
+/// rpm cannot be asked. External audit ATP-014 (NN-AUD-262): the system
+/// directories' `rpm` ([`crate::trusted_bin`]), not the first on `PATH` —
+/// one planted in `/usr/local/bin` that exits 0 made every module file
+/// "packaged". None trusted: `None`, judged as a host without a database.
 fn rpm_owns(path: &str) -> Option<bool> {
-    let status = Command::new("rpm")
+    let rpm = match crate::trusted_bin::resolve("rpm") {
+        Ok(rpm) => rpm,
+        Err(e) => {
+            tracing::warn!(error = %e, "R018 provenance: rpm not run");
+            return None;
+        }
+    };
+    let status = rpm
+        .command()
         .args(["-qf", "--quiet", path])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

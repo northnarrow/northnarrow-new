@@ -159,3 +159,32 @@ fn agent_unit_asserts_bpffs() {
         "no failure handler unit ships in deploy/systemd"
     );
 }
+
+/// External audit ATP-014 (NN-AUD-262): both units set their search path,
+/// without `/usr/local` — systemd's default for a service puts
+/// `/usr/local/sbin:/usr/local/bin` first, and a binary planted there ran
+/// in place of COMBAT's `iptables-restore`.
+#[test]
+fn both_units_set_a_path_without_usr_local() {
+    for name in ["northnarrow-agent.service", "northnarrow-watchdog.service"] {
+        let d = directives(&unit(name));
+        let env: Vec<&str> = d
+            .iter()
+            .filter(|(k, _)| k == "Environment")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        let path = env
+            .iter()
+            .find_map(|v| v.strip_prefix("PATH="))
+            .unwrap_or_else(|| panic!("{name}: no Environment=PATH= ({env:?})"));
+        assert_eq!(path, "/usr/sbin:/usr/bin:/sbin:/bin", "{name}");
+        assert!(
+            path.split(':').all(|dir| !dir.starts_with("/usr/local")),
+            "{name}: {path}"
+        );
+        assert!(
+            value(&d, "EnvironmentFile").is_none(),
+            "{name}: an EnvironmentFile could set PATH again"
+        );
+    }
+}

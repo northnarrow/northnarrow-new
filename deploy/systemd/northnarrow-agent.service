@@ -60,6 +60,16 @@ LogNamespace=northnarrow
 # start brings no agent back, and the agent signs that record at its next
 # start.
 ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf
+# External audit ATP-014 (NN-AUD-262): an explicit search path, without
+# /usr/local. systemd's default for a service starts with
+# /usr/local/sbin:/usr/local/bin, which the FIM list does not watch, and
+# COMBAT's iptables-restore, `nft` and `rpm` were looked up on it: a copy
+# planted there ran instead. The agent no longer searches PATH for them
+# (agent/src/trusted_bin.rs: /usr/sbin, /usr/bin, /sbin, /bin only, a
+# root-owned file nobody else can write); this line is defence in depth
+# for anything it starts. A drop-in that overrides it is a `unit_dropin`
+# self-integrity finding.
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/bin/northnarrow-agent \
     --combat-rules /etc/northnarrow/combat-rules.v4 \
     --combat-rules-v6 /etc/northnarrow/combat-rules.v6 \

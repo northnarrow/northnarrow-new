@@ -61,6 +61,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, COMBAT isolation integrity (Low ATP-006
+  NN-AUD-259, ATP-014 NN-AUD-262; lab PR 176). COMBAT's isolation ran
+  `iptables-restore`, `iptables` and their v6 pair by bare name, searched
+  on the `PATH` the agent inherited: the unit set none, and systemd's
+  default for a service starts with `/usr/local/sbin:/usr/local/bin`,
+  which the FIM list does not watch and the anti-tamper hooks leave open
+  (lab PR 152). An `iptables-restore` planted there that exits 0 turned
+  every COMBAT isolation into a no-op the agent logged as "network
+  isolated". The same held for `nft` (the per-process egress block, the
+  retired blackout's cleanup) and `rpm` (R018's module provenance: one
+  that exits 0 made every module file "packaged"). A shared helper
+  (`trusted_bin`) now looks a binary up in `/usr/sbin`, `/usr/bin`,
+  `/sbin` and `/bin` only, whatever `PATH` says, follows its links
+  (`/etc/alternatives`) to the real file, and runs that file — with
+  `argv[0]` the name, which a multi-call `xtables-nft-multi` needs — only
+  when it lies in one of those directories, is an executable regular file
+  owned by root that nobody else can write, in directories root owns and
+  nobody else can write, from `/` down. A refused copy gives way to the
+  next directory's, with a WARN. Without a trusted one the step fails as a
+  missing binary did: the engage errors, `nft` is the recorded failure
+  (`ENOENT`, "is nftables installed?"), R018 judges as without a package
+  database. The boot names the files the isolation will run (`COMBAT
+  isolation binaries`) or logs an ERROR when there is no trusted
+  `iptables`; the "network isolated" line names `restore_bin`.
+  `nn-admin host-check`, the boot's `nft` check and `install.sh` look for
+  `nft` the same way. Both units set
+  `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin` (defence in depth for
+  anything they start). NN-AUD-259: after a successful restore `engage()`
+  returned the v4 jump dedup's error before recording the isolation — the
+  host was isolated while `nn-admin status` said
+  `network_isolation_engaged: false` and the ladder logged "COMBAT isolate
+  failed". The state is recorded as soon as the restore succeeds; a failed
+  dedup is an ERROR (the duplicate jump isolates too), not a failed
+  engage, as the v6 mirror already did. The release removes every jump
+  into the chain, one `-D` per jump `iptables -S` lists: with a duplicate
+  left, its single `-D` per base chain let `-X` fail after the flush had
+  put the host back on the network, still reported isolated.
+  **Regressions:** an `iptables`, `ip6tables`, `nft` or `rpm` present only
+  under `/usr/local` (or anywhere outside the four directories) is no
+  longer run — the isolation fails (ERROR at boot, failed STAGE 3), the
+  egress block records its failure, `install.sh` refuses the host without
+  `--without-nftables`, R018 has no rpm provenance; a binary or directory
+  in the chain that is not root's, or that group or others can write, is
+  refused the same way. What the agent and the watchdog start no longer
+  has `/usr/local` on its `PATH`.
 
 - Dependencies: `tokio` 1.53.3 and `serde_json` (Dependabot's `rust-minor`
   group, PR #362, which failed CI). tokio 1.53.3 deprecates

@@ -468,10 +468,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-256 | MAIN-014 | Low | Agent main | M | open |
 | NN-AUD-257 | MAIN-015 | Low | Agent main | S | open (narrowed; cap declined) |
 | NN-AUD-258 | MAIN-016 | Low | Agent main | S | open |
-| NN-AUD-259 | ATP-006 | Low | Anti-tamper | S | open |
+| NN-AUD-259 | ATP-006 | Low | Anti-tamper | S | fixed (lab PR 176) |
 | NN-AUD-260 | ATP-007 | Low | Anti-tamper | S | open |
 | NN-AUD-261 | ATP-011 | Low | Anti-tamper | — | declined (the slot-table test the audit asks for exists, already at 16f7563) |
-| NN-AUD-262 | ATP-014 | Low | Anti-tamper | S | open |
+| NN-AUD-262 | ATP-014 | Low | Anti-tamper | S | fixed (lab PR 176) |
 | NN-AUD-263 | ATP-015 | Low | Anti-tamper | S | partly fixed; open |
 | NN-AUD-264 | ATP-016 | Low | Anti-tamper | S | open |
 | NN-AUD-265 | ATP-017 | Low | Anti-tamper | S | open |
@@ -6363,3 +6363,90 @@ group, the ones an unprivileged user or a local attacker could use first.
     compile on `main` (the names they check do not exist there), the two
     updated ones fail there (two optional hooks, 28 checks).
   - Lab: Ubuntu 24.04 (6.8), ioctlcompat174-probe.sh — before: the build of `main` with lab PRs 167–171; after: this lot on top. `FS_IOC_SETFLAGS` with the file's own flags on `/etc/northnarrow/admin.pub` outside a trusted-installer window: 64-bit refused in both builds; 32-bit allowed before (no denial), refused after with `ANTI-TAMPER DENIAL op=ioctl` (`deny_expected` 18 → 19); inside a window allowed. Ubuntu 22.04's 5.15.0-198 carries the stable backport: the deny attaches there too (17 of 17). Gate: the integration tree of lab PRs 172, 173, 175 and 174 on `main` 1b1353c (with the watchdog e2e teardown fix of #364): Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 83 passed, 0 failed each; Debian 13 (6.12) 38 suites, 82 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 (on 5.15 the new `file_ioctl_compat` deny attaches, 17 of 17), `upgrade-check` OK on 24.04; host 2,300 passed, 0 failed.
+- **Wave 3 — COMBAT isolation integrity, lab PR 176.** NN-AUD-262
+  (ATP-014, with `nft` and `rpm`) and NN-AUD-259 (ATP-006): batch C of the
+  Wave 3 triage, group G6. Both Low; no kernel change.
+  - ATP-014: new `agent/src/trusted_bin.rs`. `Lookup::resolve(name)`
+    searches `SYSTEM_BIN_DIRS` (`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`;
+    a directory that canonicalises to one already searched, the merged-`/usr`
+    `/sbin`, once), never `PATH`; the candidate is canonicalised (the
+    `/etc/alternatives` chain followed) and refused unless the real file's
+    directory is one of those (canonical), the file is regular, executable,
+    owned by root (`Lookup::system`) and without group or other write, and
+    every directory from it — and from the one it was found in — up to `/`
+    is root's and without group or other write. A refused candidate is a
+    WARN when a later directory's copy runs, otherwise part of the error
+    (`NotTrusted`, one reason per candidate; `is_missing` when there was
+    none). `SystemBin::command()` runs the verified file with `arg0` the
+    name: `xtables-nft-multi` (and `xtables-legacy-multi`) pick the
+    personality from `argv[0]`, which `Command::new("iptables-restore")`
+    used to set to the name too. `Lookup::new(root, owner)` and
+    `Lookup::under(root)` (the root's owner) serve fixture trees.
+  - Callers: `NetworkIsolator` keeps a `Bin` (`System(name)`, looked up at
+    each use; `Fixed(path)` for the tests' mocks, `cfg(test)`) for the four
+    binaries — engage, dedup, probe, teardown — and `binaries()` for the
+    boot line `COMBAT isolation binaries` (ERROR "COMBAT isolation cannot
+    run" when a v4 one is missing; the v6 pair stays best-effort); the
+    "network isolated" lines carry `restore_bin`. `block_outbound::trusted_nft`
+    serves `nft_apply` and the retired blackout's `chain_exists`; none
+    trusted is `ENOENT` with a WARN naming the reason, so the ladder's
+    soft-block text ("is nftables installed?") and the recorded failure are
+    unchanged. `nft_gap` (the boot check of lab PR 165, signed
+    `subsystem_degraded`) asks the same lookup and says `nft missing (not
+    trusted)` when copies were refused; `find_nft` and the `PATH` fallback
+    are gone. `module_provenance::rpm_owns` resolves `rpm` the same way
+    (none: `None`, R018 as on a host without a database). `nn-admin
+    host-check`'s `nft` row and `install.sh`'s `find_nft` (`NFT_DIRS`, now
+    the four directories, a root-owned file without group or other write
+    after `readlink -f`) look where the agent looks: an `nft` under
+    `/usr/local` is no longer reported as found.
+  - Both units: `Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin` (defence
+    in depth; a drop-in overriding it is a `unit_dropin` finding). The
+    watchdog runs `systemctl` from `SYSTEMCTL_CANDIDATES` (absolute) and
+    the agent by `--agent-bin`.
+  - FIM: `fim-paths.v1` lists `/usr/sbin/iptables`, `ip6tables`, `nft` and
+    `/usr/bin/rpm`, and the watch follows a link's chain to its target
+    (`plan_path_watches`), so `xtables-nft-multi`, the file the isolation
+    now runs, is watched; the `iptables-restore` / `ip6tables-restore`
+    links and their `/etc/alternatives` entries are not listed: a root
+    process can still point them at another root-owned system binary
+    (`/usr/bin/true`), and the isolation is then a no-op logged with that
+    `restore_bin`. Not changed here; candidates for a follow-up: those
+    links in the FIM list, and a check after the restore that the chain
+    holds its catch-all DROP and its jumps.
+  - ATP-006: `engage()` stores `is_isolated` right after the restore
+    succeeds; a v4 `dedup_jumps` failure is an ERROR ("network isolated,
+    but the v4 jump dedup failed") and `engage()` returns `Ok`, as
+    `engage_v6` does. A failed restore still returns before the store.
+    Found while fixing: `tear_down_one` deleted one jump per base chain, so
+    a duplicate left by a failed dedup made `-X` fail ("Device or resource
+    busy") after `-F` had already emptied the chain — the host back on the
+    network, `release()` failed, still reported isolated. `remove_jumps`
+    deletes one per jump `-S` lists (at least one, "already gone" is
+    success), and `dedup_jumps` shares the listing (`list_jumps`).
+  - Other process spawns reviewed (`Command::new` across the workspace),
+    outside this batch: the watchdog's `systemctl` (absolute candidates,
+    `is_file` only — no owner check) and its `exec`-backend respawn
+    (`argv[0]` from `/proc/<agent>/cmdline` or `--agent-bin`); the
+    telemetry probe re-executes `current_exe()`; `--sensor-feasibility`
+    (lab builds) runs the files it creates; `agent/build.rs` (`git`) and
+    `xtask` (`cargo`, `bpf-linker`, `sudo`) are build-time; every other
+    spawn is in tests. `install.sh` and the lab scripts run tools by name
+    with the operator's `PATH`.
+  - Tests: `trusted_bin_refuses_usr_local`, `trusted_bin_resolves_absolute`
+    (a fixture tree with merged `/usr` and an `/etc/alternatives` chain;
+    the host's `sh` run with `argv[0]` "sh"), `trusted_bin_checks_owner_and_mode`,
+    `engage_survives_a_failed_dedup`, `release_removes_every_jump` (a
+    stateful mock `iptables`), `production_binaries_are_system_lookups`,
+    `both_units_set_a_path_without_usr_local` (watchdog/tests/systemd_units.rs);
+    `a_missing_nft_is_reported_at_boot` and
+    `nft_check_names_the_install_override` rewritten for the system
+    directories. On `main` (052e7d0, the tests grafted onto it):
+    `engage_survives_a_failed_dedup` fails ("deduplicating v4 COMBAT
+    jumps"), `release_removes_every_jump` fails ("deleting chain
+    NORTHNARROW_COMBAT"), `nft_check_names_the_install_override` fails (the
+    `/usr/local/sbin` copy reported `Ok`), `both_units_set_a_path_without_usr_local`
+    fails (no `Environment=PATH=`); the `trusted_bin` tests,
+    `production_binaries_are_system_lookups` and
+    `a_missing_nft_is_reported_at_boot` do not compile there (new API).
+  - Lab: Ubuntu 24.04, trustedbin176-probe.sh — before: the build of `main` 05b5738; after: this lot on top. Harmless wrappers in `/usr/local/sbin` (`iptables-restore`, `ip6tables-restore`, `iptables`, `ip6tables`, `nft`: log a line, then run the real binary), COMBAT forced to ISOLATE, then unlock. Before: the agent ran the wrappers 18 times (`iptables-restore --noflush`, `iptables -S`, the release's `-D`/`-F`/`-X`), from the inherited `PATH`. After: the unit's `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, the boot line "COMBAT isolation binaries" naming `/usr/sbin/xtables-nft-multi`, no wrapper ran, "network isolated … restore_bin=/usr/sbin/xtables-nft-multi". In both builds the host was isolated (chain present, one DROP, one jump per base chain, v4 and v6) with `network_isolation_engaged: true`, and after the unlock the chains were gone and the gateway answered. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.

@@ -46,4 +46,5 @@ pub mod sensors;
 pub mod shutdown_marker;
 pub mod systemd_state;
 pub mod telemetry_probe;
+pub mod trusted_bin;
 pub mod xai;
