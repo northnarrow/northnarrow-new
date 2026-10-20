@@ -75,7 +75,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -606,6 +606,7 @@ impl Registry {
         let mut line =
             serde_json::to_string(entry).map_err(|e| anyhow!("serialising canary entry: {e}"))?;
         line.push('\n');
+        crate::canary::chain_lines::check_row_len(&line)?;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -653,9 +654,11 @@ struct ChainRead {
 /// the tripped flag for the matching canary_id (and records the
 /// decoy written again); each Trip row sets it; each DecoyCheck
 /// row records what the boot found at the decoy. Missing file
-/// → empty (genesis tail + empty live set). Errors propagate
-/// on malformed lines so a corrupted chain surfaces at open
-/// time rather than at first append.
+/// → empty (genesis tail + empty live set). A line that cannot
+/// be read — it does not parse, is not UTF-8 or is over
+/// [`crate::canary::chain_lines::MAX_CHAIN_LINE_BYTES`] — is
+/// skipped and counted (external audit DEC-006, DEC-012); only
+/// a file that cannot be read at all fails the open.
 ///
 /// External audit NN-AUD-174: every row is verified against `pubkey`
 /// (the registry is small). A row that does not verify is not applied —
@@ -677,18 +680,26 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
-    let reader = BufReader::new(f);
+    // External audit DEC-012 (lab PR 178): a line over the cap or not
+    // UTF-8 is skipped and counted like one that does not parse — it used
+    // to fail the open, and the boot ran without deception.
+    let mut reader = crate::canary::chain_lines::ChainLines::new(BufReader::new(f));
     let mut last: Option<String> = None;
     let mut live: BTreeMap<String, CanaryLiveState> = BTreeMap::new();
     let mut skipped = 0usize;
     let mut unverified = 0usize;
     let mut breaks: Vec<String> = Vec::new();
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading line from {}", path.display()))?;
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<CanaryToken>(&line) else {
+    while let Some(line) = reader
+        .next_line()
+        .with_context(|| format!("reading line from {}", path.display()))?
+    {
+        let parsed = match line {
+            crate::canary::chain_lines::ChainLine::Text(l) => {
+                serde_json::from_str::<CanaryToken>(l).ok()
+            }
+            crate::canary::chain_lines::ChainLine::Unreadable => None,
+        };
+        let Some(entry) = parsed else {
             skipped += 1;
             seq.skip();
             continue;
@@ -1168,6 +1179,81 @@ mod tests {
         assert!(repair.is_some(), "the torn tail was repaired");
         assert_eq!(skipped, 1);
         reg.deploy(sample_draft(3)).expect("appends continue");
+    }
+
+    /// External audit DEC-012 (lab PR 178): a complete line that is not
+    /// UTF-8 failed the open — `lines()` returned `InvalidData` — and the
+    /// boot ran without deception. It is skipped and counted now.
+    #[test]
+    fn non_utf8_line_is_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            reg.deploy(sample_draft(1)).unwrap();
+            reg.deploy(sample_draft(2)).unwrap();
+        }
+        let mut body = std::fs::read(&log_path).unwrap();
+        let first_nl = body.iter().position(|&b| b == b'\n').unwrap();
+        body.splice(
+            first_nl + 1..first_nl + 1,
+            b"\xff\xfe{\"seq\":1}\n".iter().copied(),
+        );
+        std::fs::write(&log_path, &body).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).expect("opens");
+        assert_eq!(reg.list().len(), 2, "both canaries still deployed");
+        let (_, skipped) = reg.take_open_findings();
+        assert_eq!(skipped, 1);
+        reg.deploy(sample_draft(3)).expect("appends continue");
+    }
+
+    /// External audit DEC-012 (lab PR 178): a line over the cap is consumed
+    /// without being stored, skipped and counted; the rows around it live.
+    #[test]
+    fn oversized_line_is_skipped_and_counted() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            reg.deploy(sample_draft(1)).unwrap();
+            reg.deploy(sample_draft(2)).unwrap();
+        }
+        let mut body = std::fs::read_to_string(&log_path).unwrap();
+        let big = format!(
+            "{{\"pad\":\"{}\"}}\n",
+            "x".repeat(crate::canary::chain_lines::MAX_CHAIN_LINE_BYTES)
+        );
+        body.insert_str(body.find('\n').unwrap() + 1, &big);
+        std::fs::write(&log_path, &body).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).expect("opens");
+        assert_eq!(reg.list().len(), 2, "both canaries still deployed");
+        assert_eq!(reg.take_open_findings().1, 1);
+        // a line put in between moves the rows after it: reported
+        assert!(reg
+            .take_chain_findings()
+            .iter()
+            .any(|f| f.kind == "chain_sequence_broken"));
+    }
+
+    /// External audit DEC-012: the writer refuses a row the reader would
+    /// skip at the next boot, rather than writing it.
+    #[test]
+    fn a_row_over_the_line_cap_is_not_written() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        let mut draft = sample_draft(1);
+        draft.name = "\u{1}".repeat(crate::canary::chain_lines::MAX_CHAIN_LINE_BYTES / 6 + 1);
+        assert!(reg.deploy(draft).is_err());
+        assert!(reg.is_empty());
+        assert!(!log_path.exists() || std::fs::metadata(&log_path).unwrap().len() == 0);
+        reg.deploy(sample_draft(2))
+            .expect("the next row is written");
     }
 
     // ── K2 test #1: deploy appends + advances tail ────────────────

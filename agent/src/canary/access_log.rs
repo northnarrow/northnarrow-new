@@ -31,7 +31,7 @@
 //! engine's concern.
 
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -203,6 +203,7 @@ impl CanaryAccessDb {
         let mut line = serde_json::to_string(&entry)
             .map_err(|e| anyhow!("serialising canary access entry: {e}"))?;
         line.push('\n');
+        crate::canary::chain_lines::check_row_len(&line)?;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -257,19 +258,27 @@ fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
     };
-    let reader = BufReader::new(f);
+    // External audit DEC-012 (lab PR 178): a line over the cap or not
+    // UTF-8 is skipped and counted like one that does not parse — it used
+    // to fail the open, and trips were not persisted that boot.
+    let mut reader = crate::canary::chain_lines::ChainLines::new(BufReader::new(f));
     let mut skipped = 0usize;
     let mut first_break: Option<String> = None;
     // (row, entry) of the last rows, oldest first.
     let mut window: std::collections::VecDeque<(u64, CanaryAccessEntry)> =
         std::collections::VecDeque::with_capacity(OPEN_VERIFY_ROWS);
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("reading line from {}", path.display()))?;
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<CanaryAccessEntry>(&line) {
-            Ok(entry) => {
+    while let Some(line) = reader
+        .next_line()
+        .with_context(|| format!("reading line from {}", path.display()))?
+    {
+        let parsed = match line {
+            crate::canary::chain_lines::ChainLine::Text(l) => {
+                serde_json::from_str::<CanaryAccessEntry>(l).ok()
+            }
+            crate::canary::chain_lines::ChainLine::Unreadable => None,
+        };
+        match parsed {
+            Some(entry) => {
                 let row = seq.rows();
                 if let Err(b) = seq.push(entry.seq) {
                     first_break.get_or_insert_with(|| b.to_string());
@@ -279,7 +288,7 @@ fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
                 }
                 window.push_back((row, entry));
             }
-            Err(_) => {
+            None => {
                 skipped += 1;
                 seq.skip();
             }
@@ -542,6 +551,39 @@ mod tests {
             accessor_exe: Some(format!("/usr/bin/attacker_{seq}")),
             first_trip: first,
         }
+    }
+
+    /// External audit DEC-012 (lab PR 178): a line that is not UTF-8 failed
+    /// the open, and trips were not persisted that boot; one over the cap
+    /// was read whole. Both are skipped and counted, the rows after them
+    /// kept: the chain continues from the last one.
+    #[test]
+    fn non_utf8_and_oversized_lines_are_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canary_access.jsonl");
+        {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+            db.append(sample_draft(1, true)).unwrap();
+        }
+        let mut body = std::fs::read(&log_path).unwrap();
+        body.extend_from_slice(b"\xff\xfe{\"seq\":1}\n");
+        body.extend(std::iter::repeat_n(
+            b'y',
+            crate::canary::chain_lines::MAX_CHAIN_LINE_BYTES + 1,
+        ));
+        body.push(b'\n');
+        std::fs::write(&log_path, &body).unwrap();
+        let last = {
+            let (key, _) = fresh_signing_key(&dir);
+            let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).expect("opens");
+            assert_eq!(db.take_open_findings().1, 2);
+            db.append(sample_draft(2, false)).expect("appends continue")
+        };
+        assert_eq!(last.seq, Some(3), "the skipped lines keep their positions");
+        let (key, _) = fresh_signing_key(&dir);
+        let db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        assert_eq!(db.last_hash(), last.entry_hash);
     }
 
     /// K3 access-log test #1: first append writes one signed

@@ -546,12 +546,12 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-334 | NET-015 | Low | Network | S | open (latent, dead code) |
 | NN-AUD-335 | NET-017 | Low | Network | M | open |
 | NN-AUD-336 | NET-018 | Low | Network | M | open (latent) |
-| NN-AUD-337 | DEC-012 | Low | Deception | S | partly fixed (echo gone, lab PR 90; no cap; a non-UTF-8 line still disarms deception); open |
+| NN-AUD-337 | DEC-012 | Low | Deception | S | fixed (lab PR 178) |
 | NN-AUD-338 | DEC-013 | Low | Deception | — | already fixed (lab PR 143, with DEC-011) |
 | NN-AUD-339 | DEC-014 | Low | Deception | S (test) | already fixed (lab PR 99, with DEC-005; test gap) |
-| NN-AUD-340 | DEC-015 | Low | Deception | S | open |
-| NN-AUD-341 | DEC-016 | Low | Deception | S | open (live: templates are write-allowed by design) |
-| NN-AUD-342 | DEC-017 | Low | Deception | S | open |
+| NN-AUD-340 | DEC-015 | Low | Deception | S | fixed (lab PR 178) |
+| NN-AUD-341 | DEC-016 | Low | Deception | S | fixed (lab PR 178) |
+| NN-AUD-342 | DEC-017 | Low | Deception | S | fixed (lab PR 178) |
 | NN-AUD-343 | XAI-003 | Low | XAI and RAG | S (one line) | obsolete (the on-disk index is gone, lab PR 145) |
 | NN-AUD-344 | XAI-006 | Low | XAI and RAG | S | open (dormant: XAI not wired) |
 | NN-AUD-345 | XAI-007 | Low | XAI and RAG | S (guard) | declined as filed (argv/parent_comm are not in the prompt); guard test |
@@ -6501,3 +6501,85 @@ group, the ones an unprivileged user or a local attacker could use first.
     1000`) and main's whitelist put back, the 11 new tests fail and the
     others pass.
   - Lab: Ubuntu 24.04, procrules177-probe.sh — before: the build of `main` 05b5738; after: this lot on top. A copy of `/usr/bin/true` run by user nn from `~/.cache/nnx177/`, `~/.config/nnx177/`, `~/.config/systemd/user/` and `~/.config/autostart/`: no record before, R008 Log Medium for each after; `~/.nnx177/` (the control) R008 in both; `~/.cache/go-build/` and `~/.cache/ms-playwright/` exempt in both. `base64 /etc/hostname` and `strace -V` as `nobody` and as a `systemd-run -p DynamicUser=yes` account: nothing before, R015 and R016 after (uids 65534, 64077, 63581); `www-data` (the control) in both; nn, root and uid 100032 nothing in both. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.
+- **Wave 3 — deception readers, lab PR 178.** NN-AUD-337 (DEC-012,
+  wider than reported), NN-AUD-341 (DEC-016), NN-AUD-340 (DEC-015),
+  NN-AUD-342 (DEC-017), plus the NN-AUD-339 (DEC-014) test: batch B of
+  the Wave 3 triage of the LLM, XAI and deception group, on top of lot
+  163 (network canary wiring).
+  - Before: `canary/registry.rs` `read_chain` and `canary/access_log.rs`
+    `read_tail_hash` read with `BufReader::lines()`: no cap on a line, and
+    `Err(InvalidData)` on a line that is not UTF-8, which the `?` turned
+    into a failed open — `main.rs` logged "canary registry open failed"
+    (or "canary access log open failed") and ran the boot with no
+    detector: no canary armed, `nn-admin canary` answered
+    `UnknownOperation`. The DEC-006 skip (lab PR 90) covered a line that
+    did not parse, not this one. Same precondition as DEC-006: root with
+    the agent stopped. The operator templates were read with
+    `read_to_string` (through a link, blocking on a FIFO, no cap) although
+    they are MUTATE-only by design, so root could grow one at run time;
+    the unresolved-placeholder check needed a `}}` after the `{{`; the
+    path policy matched its deny prefixes on the raw string.
+  - Agent: `canary/chain_lines.rs`, one reader for both chains: a line is
+    at most `MAX_CHAIN_LINE_BYTES` (1 MiB; a compile-time assertion keeps
+    it above six times the 64 KiB admin frame plus a `PATH_MAX`, the
+    worst a row the agent writes can be after JSON escaping); a longer
+    line is consumed to its newline through the `BufReader`'s buffer,
+    never stored; a line over the cap or not UTF-8 is
+    `ChainLine::Unreadable`, skipped and counted with `seq.skip()` like a
+    malformed one, so the signed `chain_lines_unreadable` of lab PR 90
+    records it and every row after it is applied. The writers
+    (`Registry::append_row`, `CanaryAccessDb::append`) refuse a row over
+    the cap (`check_row_len`), so the reader never skips a row the agent
+    wrote. `templates.rs` `read_template`: `O_NOFOLLOW | O_NONBLOCK`,
+    regular file, `take(MAX_TEMPLATE_BYTES + 1)` (64 KiB), UTF-8 — the
+    overlay reader's pattern; a template there but refused is
+    `RenderError::TemplateRead`, the deploy or refresh refused with the
+    file named (missing → built-in, as before). `substitute`: any `{{`
+    left is `UnresolvedPlaceholder`, the name up to `}}`, at most 32
+    characters, `escape_debug`; `render` parses the azure, gcp and docker
+    output as JSON (`MalformedOutput`). `path_policy.rs`
+    `normalise_canary_path`: absolute, no `.`/`..`, no control character,
+    at most `PATH_MAX - 1` bytes, rebuilt from its non-empty segments;
+    `check_canary_path` matches the prefixes and walks the ancestors on
+    that form and returns it, and `dispatch_canary_deploy` replaces the
+    deployment's path with it (`normalised_deployment`) before writing, so
+    the decoy, the registry row and the FIM watch name one path.
+  - Choices: the cap is 1 MiB, not the triage's 64 KiB: a deploy's name is
+    bounded only by the frame, and a JSON escape of a control character is
+    six bytes, so a legitimate row can pass 64 KiB. No per-file cap: the
+    memory a file costs is one line whatever its size, and stopping early
+    would leave canaries deployed later unarmed. A path written with `//`
+    is deployed under its normal form rather than refused. Not done: the
+    same `lines()` pattern in `audit.rs`, `net/drain.rs`, `chainlog.rs`
+    and the full verifier `chain_anchor::flat_rows` (evidence group); a
+    torn last write with no newline in its last 8 MiB still fails
+    `chainlog::repair_torn_tail` and with it the open (shared by every
+    chain, DEC-006 path); `canary-templates/` stays without NOCREATE (a
+    product question: operators add a family's template by hand).
+  - Tests: `canary::chain_lines` (cap boundary, an over-cap line consumed
+    without growing the buffer, a non-UTF-8 line, the writers' guard);
+    registry `non_utf8_line_is_skipped_not_fatal`,
+    `oversized_line_is_skipped_and_counted`,
+    `a_row_over_the_line_cap_is_not_written`; access log
+    `non_utf8_and_oversized_lines_are_skipped_not_fatal`; templates
+    `unclosed_placeholder_is_an_error`,
+    `operator_json_template_must_render_json`,
+    `oversized_operator_template_is_refused`,
+    `symlinked_template_is_refused`, `fifo_template_does_not_block`,
+    `non_utf8_template_is_refused`; path policy
+    `rejects_system_trees_and_own_state` (extended with `//lib32/x`,
+    `//etc/cron.d/nn`, `/etc//cron.d/nn`, `///usr/bin/x`,
+    `//var/lib/northnarrow/…`), `denied_prefixes_match_the_normal_form`,
+    `rejects_control_characters_and_overlong_paths`,
+    `deployment_paths_are_normalised`, `write_uses_the_normal_form`;
+    detector `accessor_exe_is_resolved_for_live_process` (NN-AUD-339).
+    Checked against the code of `main` 052e7d0 with these tests: the two
+    non-UTF-8 tests, the writer's guard, the five template tests other
+    than the UTF-8 one (the FIFO test by its 10 s timeout instead of
+    hanging), the extended deny test (`//var/lib/northnarrow/…` on a host
+    without that directory) and the control-character test fail; the
+    oversized-line registry test, the UTF-8 template test,
+    `write_uses_the_normal_form` and the `accessor_exe` test pass (guards);
+    the two normal-form tests call functions new in this lot.
+    `canary_privileged_e2e` unchanged (it compiles).
+  - Lab: Debian 12, decep178-probe.sh — before: the build of `main` 05b5738; after: this lot on top (registry, access log, head anchor and template backed up and put back, SHA-256 checked). A credential template with an unclosed `{{tenant_id`: deployed with the placeholder in the decoy before; refused after ("unresolved placeholder"). The same template grown to 2 MiB in place: a 2 MiB decoy before; refused after ("larger than 65536 bytes"); the original template deploys in both. One non-UTF-8 line appended offline to `canaries.jsonl` and `canary_access.jsonl`: before, "canary registry open failed" and "canary access log open failed", `canary list` refused, a read of a File decoy unseen; after, "unreadable lines skipped" for both files with two signed `chain_lines_unreadable`, `canary list` served, the read tripped NN-L-CANARY-001 Critical and the reader was killed. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.

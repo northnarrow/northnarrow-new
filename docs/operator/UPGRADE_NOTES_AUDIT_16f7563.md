@@ -144,6 +144,19 @@ and the tracker note have the details and the lab evidence.
   directory. Decoys deployed before keep their content, which names the
   product, and are checked only for their presence (a WARN at boot):
   refresh them (`nn-admin canary refresh`, §3) or burn and deploy again.
+- **Canary templates and decoy paths are checked at deploy** (NN-AUD-341
+  DEC-016, NN-AUD-342 DEC-017, NN-AUD-340 DEC-015, Wave 3, lab PR 178).
+  A template in `/etc/northnarrow/canary-templates/` is read only from a
+  regular file of at most 64 KiB, never through a symbolic link or from a
+  FIFO; any `{{` left after rendering, and an `azure`, `gcp` or `docker`
+  template that does not render JSON, are errors. **Regression:** such a
+  template now refuses `nn-admin canary deploy` and `canary refresh` for
+  its family (the journal names the file); it used to deploy, or to block.
+  A decoy path with a control character or of 4096 bytes or more is
+  refused, and one written with `//` is deployed and recorded under its
+  normal form. An unreadable line in `canaries.jsonl` or
+  `canary_access.jsonl` (not UTF-8, or over 1 MiB) no longer switches
+  deception off: it is skipped and recorded (`chain_lines_unreadable`).
 - **Detect-only no longer waives the audit log** (NN-AUD-093 MAIN-008, lab
   PR 118). `NN_DETECT_ONLY=yes` or `true` is reported like `=1`, and an
   agent in detect-only mode no longer starts without a writable audit log

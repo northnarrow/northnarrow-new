@@ -61,6 +61,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, deception readers and deploy inputs (Low DEC-012
+  NN-AUD-337, DEC-015 NN-AUD-340, DEC-016 NN-AUD-341, DEC-017 NN-AUD-342;
+  lab PR 178). One complete line that is not UTF-8 in `canaries.jsonl` or
+  `canary_access.jsonl` still switched deception off at boot: the readers'
+  `BufRead::lines()` returned `InvalidData`, the `?` failed the open, and
+  the agent logged "canary registry open failed" and ran with no canary
+  armed and no trip recorded — the DEC-006 skip of lab PR 90 covered only
+  a line that did not parse. The lines had no cap either: a multi-GiB line
+  was read into memory at boot. Both chains now go through one bounded
+  reader (`canary::chain_lines`): a line is at most 1 MiB (every row the
+  agent writes is far below, its operator strings coming from one signed
+  64 KiB admin frame; the writers refuse a longer row rather than write
+  one the next boot would skip), a longer one is consumed to its newline
+  without being stored, and a line over the cap or not UTF-8 is skipped
+  and counted like a malformed one (the signed `chain_lines_unreadable`
+  at boot); the rows after it are applied. An operator credential template
+  is read without following a link at its name, without blocking on a
+  FIFO, from a regular file of at most 64 KiB (`MAX_TEMPLATE_BYTES`): the
+  templates are write-allowed at run time by design, so one grown in place
+  — or a missing family's file created as a link to `/dev/zero` — was read
+  without limit by the next `canary deploy`; a template there but refused
+  is `TemplateRead`, the deploy (or refresh) refused and the file named,
+  never a silent fall-back to the built-in one. Any `{{` left after the
+  substitution is `UnresolvedPlaceholder` (an unclosed `{{tenant_id`
+  passed and went into the decoy), with the name shown escaped and at most
+  32 characters; an azure, gcp or docker decoy must parse as JSON
+  (`MalformedOutput`). A File / Credential canary path is checked for
+  control characters and a length under `PATH_MAX`, then normalised (`//`
+  and a trailing `/` folded) before the deny prefixes are matched, and the
+  deploy writes, records and watches that normal form: `//lib32/x` missed
+  `/lib32/`, and on a host without `/lib32` the write created the
+  directory. A test now pins `accessor_exe` (NN-AUD-339, fixed in lab PR
+  99). **Regression:** an operator template over 64 KiB, a symbolic link
+  or a non-regular file at a template's name, a template with a literal
+  `{{`, or a JSON family's template that does not render JSON now refuses
+  the deploy and the refresh of that family, naming the file; a canary
+  path with a control character or of `PATH_MAX` bytes or more is refused,
+  and one written with `//` is recorded under its normal form.
 - External audit, Wave 3, process rule precision (Low PROC-012
   NN-AUD-300, PROC-013 NN-AUD-301; lab PR 177). R015 (an encoder:
   `base64`, `xxd`, `openssl`) and R016 (a debugger: `gdb`, `strace`,

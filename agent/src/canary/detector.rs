@@ -952,6 +952,40 @@ mod tests {
         );
     }
 
+    /// External audit DEC-014 (NN-AUD-339, lab PR 99; test added in lab PR
+    /// 178): `accessor_exe` is the executable the kernel ran for the
+    /// accessor — it used to be always `None` — in the trip event and in
+    /// the access row. The other detector tests use a pid that is not
+    /// running, so nothing pinned it.
+    #[test]
+    fn accessor_exe_is_resolved_for_live_process() {
+        let dir = TempDir::new().unwrap();
+        let (detector, registry) = build_detector(&dir);
+        deploy_file_canary(&registry, &detector, "/tmp/decoy-exe.txt", "c");
+        let me = std::fs::read_link("/proc/self/exe")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let out = detector.process_event(&fim_event_on("/tmp/decoy-exe.txt", std::process::id()));
+        match out {
+            Some(Event::CanaryTripped { accessor_exe, .. }) => {
+                assert_eq!(accessor_exe.as_deref(), Some(me.as_str()))
+            }
+            other => panic!("expected Event::CanaryTripped, got {other:?}"),
+        }
+        let rows = access_rows(&dir);
+        assert_eq!(rows[0].accessor_exe.as_deref(), Some(me.as_str()));
+        // a pid that is gone: best-effort, no exe
+        let gone = detector.process_event(&fim_event_on("/tmp/decoy-exe.txt", u32::MAX - 1));
+        assert!(matches!(
+            gone,
+            Some(Event::CanaryTripped {
+                accessor_exe: None,
+                ..
+            })
+        ));
+    }
+
     /// K3 detector test #5: hot-path is_canary_inode/exe/port
     /// return `None` for non-canary keys (the negative-case
     /// short-circuit).
