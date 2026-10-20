@@ -68,6 +68,40 @@ pub(crate) fn tool_kill(image: &str) -> ResponseAction {
     }
 }
 
+/// `nobody`, the kernel's overflow uid: what NFS squashing, `sudo -u
+/// nobody` and daemons that drop to it run as.
+pub(crate) const NOBODY_UID: u32 = 65_534;
+
+/// systemd's range for the transient accounts of `DynamicUser=yes` units
+/// (`SYSTEMD_DYNAMIC_UID_MIN..=SYSTEMD_DYNAMIC_UID_MAX`, systemd's
+/// "Users, Groups, UIDs and GIDs on systemd systems").
+pub(crate) const DYNAMIC_USER_UIDS: std::ops::RangeInclusive<u32> = 61_184..=65_519;
+
+/// External audit PROC-012: the service-account uid class of R015 and
+/// R016 — an account no human logs in as, whose use of an encoder or a
+/// debugger is the anomaly those rules record.
+///
+/// - 1..=999: the system accounts below `UID_MIN` (`/etc/login.defs`),
+///   `www-data`, `mysql`, `_apt` and the like.
+/// - [`NOBODY_UID`] and [`DYNAMIC_USER_UIDS`]: service accounts above
+///   `UID_MIN`. Both rules stopped at 1000, so a web shell under a
+///   `nobody` worker or a hardened `DynamicUser=yes` unit was never
+///   judged.
+///
+/// Not in the class:
+/// - root (0), whose encoder and debugger use is routine administration;
+/// - 1000..=60000, the human accounts, and systemd-homed's 60001..=60513;
+/// - the sub-uid ranges of `/etc/subuid` (100000 and up by default) and
+///   the container ranges of `systemd-nspawn` (524288 and up). A rootless
+///   container's uids belong to the human who owns the range (`podman
+///   unshare` and `newuidmap` let that user become any of them), so they
+///   carry that user's standing, not a daemon's; and from the host's uid
+///   alone a container's daemon is not told apart from its root or its
+///   users.
+pub(crate) fn is_service_uid(uid: u32) -> bool {
+    (1..1000).contains(&uid) || uid == NOBODY_UID || DYNAMIC_USER_UIDS.contains(&uid)
+}
+
 pub use r001_exec_from_tmp::R001ExecFromTmp;
 pub use r002_exec_from_dev_shm::R002ExecFromDevShm;
 pub use r003_exec_from_var_tmp::R003ExecFromVarTmp;
@@ -513,6 +547,35 @@ pub(crate) mod testutil {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_service_uid;
+
+    /// External audit PROC-012: the service-uid class at each boundary.
+    #[test]
+    fn service_uid_class_boundaries() {
+        for uid in [1, 33, 999, 61_184, 61_500, 65_519, 65_534] {
+            assert!(is_service_uid(uid), "{uid} is a service account");
+        }
+        for uid in [
+            0,
+            1000,
+            60_000,
+            60_001,
+            61_183,
+            65_520,
+            65_533,
+            65_535,
+            100_000,
+            100_032,
+            524_288,
+            u32::MAX,
+        ] {
+            assert!(!is_service_uid(uid), "{uid} is not a service account");
         }
     }
 }

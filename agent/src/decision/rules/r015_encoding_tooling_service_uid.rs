@@ -8,13 +8,13 @@
 //! Medium with a Log action (FP-prone for humans, so scoped to
 //! service uids), gated by `process-comm-allowlist`. Design §7.1.
 //!
-//! "Service-class uid" is approximated as a non-root system account:
-//! `uid != 0 && uid < 1000`. The 1000 boundary is the long-standing
-//! Linux `UID_MIN` convention (`/etc/login.defs`) separating system
-//! daemons from human logins. Root (0) and human users (>= 1000) are
-//! deliberately excluded — encoder use by those is too common to flag
-//! at this severity. argv-aware refinement (what is being encoded) is
-//! deferred to T10.6.
+//! "Service-class uid" is [`super::is_service_uid`], shared with R016:
+//! the system accounts below `UID_MIN` (1..999), `nobody` (65534) and
+//! systemd's `DynamicUser=` range (61184..65519) — external audit
+//! PROC-012, the class used to stop at 1000. Root (0), human users
+//! (1000..60000) and container sub-uid ranges are deliberately excluded:
+//! encoder use by those is too common to flag at this severity.
+//! argv-aware refinement (what is being encoded) is deferred to T10.6.
 
 use std::sync::Arc;
 
@@ -26,10 +26,6 @@ use crate::decision::{rules::build_verdict, Rule};
 
 /// Encoding / encryption tool comms (design §7.1).
 const ENCODING_TOOLS: &[&str] = &["base64", "xxd", "openssl"];
-
-/// Linux `UID_MIN` boundary: accounts below this (and non-root) are
-/// system/service accounts.
-const SYSTEM_UID_CEILING: u32 = 1000;
 
 pub struct R015EncodingToolingServiceUid {
     allowlist: Arc<CommAllowlist>,
@@ -62,8 +58,8 @@ impl Rule for R015EncodingToolingServiceUid {
         if !ENCODING_TOOLS.contains(&comm.as_str()) {
             return None;
         }
-        // Service-class uid only: non-root system account.
-        if *uid == 0 || *uid >= SYSTEM_UID_CEILING {
+        // Service-class uid only (PROC-012: nobody and DynamicUser too).
+        if !super::is_service_uid(*uid) {
             return None;
         }
         // External audit NETR-003 class: the allowlist judged on what the
@@ -136,16 +132,43 @@ mod tests {
         }
     }
 
+    /// External audit PROC-012: a `DynamicUser=yes` unit's transient uid.
+    #[test]
+    fn dynamic_user_uid_is_service_class() {
+        let v = rule()
+            .evaluate(&spawn_as(61_500, "base64", "/usr/bin/base64"))
+            .expect("fires");
+        assert_eq!(v.rule_id, "R015_EncodingToolingServiceUid");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert_eq!(v.severity, Severity::Medium);
+    }
+
+    /// External audit PROC-012: `nobody` (65534).
+    #[test]
+    fn nobody_is_service_class() {
+        let v = rule()
+            .evaluate(&spawn_as(65_534, "openssl", "/usr/bin/openssl"))
+            .expect("fires");
+        assert_eq!(v.rule_id, "R015_EncodingToolingServiceUid");
+        assert_eq!(v.action, ResponseAction::Log);
+    }
+
     #[test]
     fn ignores_root_or_human_uid() {
         // Root encoder use is too common to flag here.
         assert!(rule()
             .evaluate(&spawn_as(0, "base64", "/usr/bin/base64"))
             .is_none());
-        // Human user (uid >= 1000) likewise.
-        assert!(rule()
-            .evaluate(&spawn_as(1000, "openssl", "/usr/bin/openssl"))
-            .is_none());
+        // Human user (uid >= 1000) likewise, and a rootless container's
+        // sub-uid (PROC-012: the range's owner's standing).
+        for uid in [1000, 60_000, 100_000, 100_032] {
+            assert!(
+                rule()
+                    .evaluate(&spawn_as(uid, "openssl", "/usr/bin/openssl"))
+                    .is_none(),
+                "{uid}"
+            );
+        }
         // Non-encoder by a service uid is not R015's concern.
         assert!(rule()
             .evaluate(&spawn_as(33, "ls", "/usr/bin/ls"))

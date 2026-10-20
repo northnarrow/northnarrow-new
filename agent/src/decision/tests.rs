@@ -400,6 +400,9 @@ fn spawn_fixtures() -> Vec<Event> {
         "/dev/shm/",
         "/home/alice/",
         "/home/alice/.hidden/",
+        "/home/alice/.cache/x/",
+        "/home/alice/.cache/go-build/",
+        "/home/alice/.config/autostart/",
         "/var/www/html/",
         "/usr/share/nginx/html/",
         "/usr/bin/",
@@ -407,7 +410,7 @@ fn spawn_fixtures() -> Vec<Event> {
         "/opt/tools/",
     ];
     let mut out = Vec::new();
-    for uid in [0, 998, 1000] {
+    for uid in [0, 998, 1000, 61_500, 65_534, 100_032] {
         for comm in comms {
             for dir in dirs {
                 out.push(spawn_as(uid, comm, &format!("{dir}{comm}")));
@@ -567,4 +570,66 @@ fn no_payload_image_rule_kills_a_single_process() {
     let expected: std::collections::BTreeSet<String> =
         PAYLOAD_IMAGE_RULES.iter().map(|r| r.to_string()).collect();
     assert_eq!(killed_a_tree, expected);
+}
+
+/// External audit PROC-012: in the engine, an encoder or a debugger run by
+/// `nobody` or by a `DynamicUser=yes` unit is recorded by R015 or R016; a
+/// human user's, and a rootless container's sub-uid's, are not.
+#[test]
+fn nobody_and_dynamic_user_tools_are_recorded() {
+    let engine = RuleEngine::with_default_rules();
+    for (uid, comm, rule) in [
+        (65_534, "base64", "R015_EncodingToolingServiceUid"),
+        (61_500, "openssl", "R015_EncodingToolingServiceUid"),
+        (65_534, "gdb", "R016_DebuggerServiceUid"),
+        (61_500, "strace", "R016_DebuggerServiceUid"),
+    ] {
+        let path = format!("/usr/bin/{comm}");
+        let v = engine
+            .evaluate(&spawn_as(uid, comm, &path))
+            .unwrap_or_else(|| panic!("{uid} {comm}"));
+        assert_eq!(v.rule_id, rule, "{uid} {comm}");
+        assert_eq!(v.action, ResponseAction::Log, "{uid} {comm}");
+        assert_eq!(v.severity, Severity::Medium, "{uid} {comm}");
+    }
+    for uid in [0, 1000, 100_032] {
+        for comm in ["base64", "gdb"] {
+            let path = format!("/usr/bin/{comm}");
+            assert!(
+                engine.evaluate(&spawn_as(uid, comm, &path)).is_none(),
+                "{uid} {comm}"
+            );
+        }
+    }
+}
+
+/// External audit PROC-013: in the engine, a binary in `~/.cache/<dir>/`
+/// or `~/.config/<dir>/` is R008's record, the named tool directories stay
+/// exempt, and a shell there is still R017's kill.
+#[test]
+fn a_binary_under_cache_or_config_is_r008() {
+    let engine = RuleEngine::with_default_rules();
+    for path in [
+        "/home/alice/.cache/x/payload",
+        "/home/alice/.config/x/payload",
+        "/home/alice/.config/systemd/user/payload",
+        "/home/alice/.config/autostart/payload",
+    ] {
+        let v = engine.evaluate(&spawn("payload", path)).expect(path);
+        assert_eq!(v.rule_id, "R008_HiddenHomeBinary", "{path}");
+        assert_eq!(v.action, ResponseAction::Log, "{path}");
+        assert_eq!(v.severity, Severity::Medium, "{path}");
+    }
+    for path in [
+        "/home/alice/.cache/go-build/3f/3f9a-d/hello",
+        "/home/alice/.cache/ms-playwright/chromium-1140/chrome-linux/chrome",
+        "/home/alice/.config/Code/User/globalStorage/ext/install/bin/clangd",
+    ] {
+        assert!(engine.evaluate(&spawn("x", path)).is_none(), "{path}");
+    }
+    let v = engine
+        .evaluate(&spawn("bash", "/home/alice/.cache/x/bash"))
+        .expect("fires");
+    assert_eq!(v.rule_id, "R017_ShellFromNonstandardPath");
+    assert_eq!(v.action, ResponseAction::KillProcessTree);
 }

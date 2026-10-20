@@ -445,6 +445,24 @@ Now **killed, or answered, where they were recorded or missed**:
   IP address or a listener on this host serves the port; a network canary
   deployed before with such an address trips nothing (burn it and deploy
   it again). Lab PR 163, a follow-up found in the lab.
+- Process rules (Wave 3, lab PR 177): R015 (`base64`, `xxd`, `openssl`)
+  and R016 (`gdb`, `strace`, `ltrace`) record an exec by `nobody` (65534)
+  or by a `DynamicUser=yes` unit's account (61184..65519), as by a system
+  account (1..999); root, users and their containers' sub-uids stay out
+  (NN-AUD-300 PROC-012). R008 records an executable run from anywhere
+  under `~/.cache/` or `~/.config/`, except the directories of named tools
+  that run their own executables there: Go's build cache, Bazel and
+  Bazelisk, Playwright, Puppeteer, Cypress, Selenium Manager, pre-commit,
+  uv, Poetry's virtualenvs, yay, paru, Coursier's JDKs, JetBrains
+  Gateway, and the extension storage of the VS Code-family editors (Code,
+  Code - OSS, VSCodium, Cursor) and coc.nvim; `~/.config/systemd/` and
+  `~/.config/autostart/` are never exempt (NN-AUD-301 PROC-013). These
+  are Medium records: nothing more is killed. **Regression:** another
+  tool's native executable under `~/.cache/` or `~/.config/` (Sublime
+  Text's language servers, NixOS's `appimage-run`) draws an R008 record at
+  each run, with no allowlist to exempt it; a `nobody` or `DynamicUser=`
+  daemon running one of the six tools draws an R015 or R016 record —
+  exempt the program in the signed `process-comm-allowlist.local`.
 
 ## 6. Posture and COMBAT
 

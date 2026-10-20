@@ -509,8 +509,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-297 | NETR-014 | Low | Net rules | M | open (product decision) |
 | NN-AUD-298 | NETR-015 | Low | Net rules | S | open (listener half; C2-port half declined) |
 | NN-AUD-299 | PROC-011 | Low | Process rules | S | fixed (lab PR 166) |
-| NN-AUD-300 | PROC-012 | Low | Process rules | S | open |
-| NN-AUD-301 | PROC-013 | Low | Process rules | S | open |
+| NN-AUD-300 | PROC-012 | Low | Process rules | S | fixed (lab PR 177) |
+| NN-AUD-301 | PROC-013 | Low | Process rules | S | fixed (lab PR 177) |
 | NN-AUD-302 | PROC-015 | Low | Process rules | S | partly fixed; open |
 | NN-AUD-303 | POS-006 | Low | Posture | S | fixed (lab PR 172) |
 | NN-AUD-304 | POS-007 | Low | Posture | S–M | fixed (lab PR 172) |
@@ -6450,3 +6450,54 @@ group, the ones an unprivileged user or a local attacker could use first.
     `production_binaries_are_system_lookups` and
     `a_missing_nft_is_reported_at_boot` do not compile there (new API).
   - Lab: Ubuntu 24.04, trustedbin176-probe.sh — before: the build of `main` 05b5738; after: this lot on top. Harmless wrappers in `/usr/local/sbin` (`iptables-restore`, `ip6tables-restore`, `iptables`, `ip6tables`, `nft`: log a line, then run the real binary), COMBAT forced to ISOLATE, then unlock. Before: the agent ran the wrappers 18 times (`iptables-restore --noflush`, `iptables -S`, the release's `-D`/`-F`/`-X`), from the inherited `PATH`. After: the unit's `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, the boot line "COMBAT isolation binaries" naming `/usr/sbin/xtables-nft-multi`, no wrapper ran, "network isolated … restore_bin=/usr/sbin/xtables-nft-multi". In both builds the host was isolated (chain present, one DROP, one jump per base chain, v4 and v6) with `network_isolation_engaged: true`, and after the unlock the chains were gone and the gateway answered. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.
+- **Wave 3 — process rule precision, lab PR 177.** Batch B2 of the Wave 3
+  triage of group G4 without NN-AUD-299 (PROC-011, fixed with lab PR 166):
+  NN-AUD-300 (PROC-012) and NN-AUD-301 (PROC-013), both Low. No wire,
+  kernel or configuration change; the three rules only record (Log,
+  Medium).
+  - PROC-012: R015 and R016 returned `None` for `uid == 0 || uid >= 1000`,
+    so `nobody` (65534) and systemd's `DynamicUser=` accounts
+    (61184..65519) were never judged. One helper, `is_service_uid` in
+    `decision/rules/mod.rs` (`NOBODY_UID`, `DYNAMIC_USER_UIDS`), is the
+    class of both rules: 1..999, 65534, 61184..65519; the two
+    `SYSTEM_UID_CEILING` constants are gone. Container sub-uids stay out,
+    as the triage proposed: a rootless range (`/etc/subuid`, 100000 and
+    up) belongs to the user who owns it and can become any of its uids,
+    and the host uid does not tell a container's daemon from its root or
+    users (systemd-nspawn's 524288 and up likewise). systemd-homed's
+    60001..60513 are human.
+  - PROC-013, narrower than the triage: it kept `.cache/` whole and
+    checked a never-exempt list (`.config/systemd/`, `.config/autostart/`)
+    first. Here neither `.cache/` nor `.config/` is an entry any more; only
+    named tool directories that run their own executables are, each with
+    its reason in the code: `.cache/` `go-build/` (Go 1.24's `go run` and
+    `go tool`), `bazel/`, `bazelisk/`, `ms-playwright/`, `puppeteer/`,
+    `Cypress/`, `selenium/`, `pre-commit/`, `uv/`, `pypoetry/virtualenvs/`,
+    `yay/`, `paru/`, `coursier/arc/`, `JetBrains/RemoteDev/`; `.config/`
+    `{Code,Code - OSS,VSCodium,Cursor}/User/globalStorage/` and
+    `coc/extensions/`. The two persistence directories are therefore not
+    exempt by construction, and tests pin them. The triage's pip is not
+    listed (pip builds in `/tmp`; nothing runs from its cache), nor IDE
+    caches beyond JetBrains Gateway's backends. The comment describes the
+    prefix match on the home-relative path. R008 judges the executed file
+    (review 61), so the change concerns native executables only; a shell
+    there is still R017's kill.
+  - Not changed, adjacent: R008 has no operator allowlist, and hidden tool
+    directories outside the list record as before (`~/.vscode/extensions/`,
+    `~/.vscode-server/`, `~/.local/share/`): a tuning task with a
+    baseline. R015's argv truncation stays with NN-AUD-272 (group G6).
+  - Tests: `service_uid_class_boundaries` (rules/mod.rs); per rule
+    `dynamic_user_uid_is_service_class` (61500) and
+    `nobody_is_service_class` (65534), and `ignores_root_or_human_uid`
+    with 60000, 100000 and 100032; R008 `cache_and_config_are_not_exempt_as_a_whole`,
+    `user_unit_dir_is_never_exempt`, `autostart_dir_is_never_exempt`,
+    `the_executed_image_is_judged`, `ignores_whitelisted_paths` with the
+    new tool directories (`.cache/yay/build.sh` kept); engine
+    `nobody_and_dynamic_user_tools_are_recorded`,
+    `a_binary_under_cache_or_config_is_r008`, and the fixtures of
+    `the_engine_returns_the_strongest_spawn_verdict` gain uids 61500,
+    65534, 100032 and `~/.cache/x/`, `~/.cache/go-build/`,
+    `~/.config/autostart/`. With main's predicate (`uid != 0 && uid <
+    1000`) and main's whitelist put back, the 11 new tests fail and the
+    others pass.
+  - Lab: Ubuntu 24.04, procrules177-probe.sh — before: the build of `main` 05b5738; after: this lot on top. A copy of `/usr/bin/true` run by user nn from `~/.cache/nnx177/`, `~/.config/nnx177/`, `~/.config/systemd/user/` and `~/.config/autostart/`: no record before, R008 Log Medium for each after; `~/.nnx177/` (the control) R008 in both; `~/.cache/go-build/` and `~/.cache/ms-playwright/` exempt in both. `base64 /etc/hostname` and `strace -V` as `nobody` and as a `systemd-run -p DynamicUser=yes` account: nothing before, R015 and R016 after (uids 65534, 64077, 63581); `www-data` (the control) in both; nn, root and uid 100032 nothing in both. Gate: the integration tree of lab PRs 176, 177, 178 and 179 on `main` 78fd0f2: Ubuntu 24.04 and Debian 12, 38 suites, 81 passed, 0 failed each (the three real-corpus RAG benches skipped there: no knowledge base in the fresh tree); Ubuntu 22.04 (5.15) 38 suites, 84 passed, 0 failed; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); the new `admin_socket_refuses_a_peer_of_another_uid` e2e passed on all four; anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,351 passed, 0 failed.
