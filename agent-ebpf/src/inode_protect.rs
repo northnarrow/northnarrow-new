@@ -37,7 +37,7 @@ use aya_ebpf::{
         bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
     },
     macros::{lsm, map},
-    maps::{Array, HashMap, LruHashMap, RingBuf},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::LsmContext,
     EbpfContext,
 };
@@ -217,15 +217,26 @@ pub(crate) fn override_active() -> bool {
 #[map]
 static TASK_DENIAL_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(1024, 0);
 
-/// Global budget for task-denial records: slot 0 = window start (ns),
-/// slot 1 = records in the window. A loop of fresh `/bin/kill` processes
-/// defeats the per-caller dedup; this caps it at [`TASK_DENIAL_PER_SEC`]
-/// so the denial ring cannot be used to bury other evidence.
+/// Budget for task-denial records, per CPU: `[window start (ns), records
+/// in the window]`. A loop of fresh `/bin/kill` processes defeats the
+/// per-caller dedup; this caps it at [`TASK_DENIAL_PER_SEC`] per CPU so
+/// the denial ring cannot be used to bury other evidence.
+///
+/// External audit EBPF-017: it was one global `Array<u64>` read, changed
+/// and written from every CPU (updates lost under a burst), and a record
+/// over budget left no trace. Per CPU, each program owns its slot while it
+/// runs; a record held back is counted in `RING_DROPS`
+/// (`ring_slot::TASK_DENIAL_RATE`), which the agent reports in the journal,
+/// in a signed `ringbuf_drop` entry and, past the threshold, as telemetry
+/// loss. The deny never depends on the record. On N CPUs at most
+/// 50 × N records a second reach the 64 KiB ring.
 #[map]
-static TASK_DENIAL_RATE: Array<u64> = Array::with_max_entries(2, 0);
+static TASK_DENIAL_RATE: PerCpuArray<[u64; 2]> = PerCpuArray::with_max_entries(1, 0);
 
 const TASK_DENIAL_PER_SEC: u64 = 50;
 const TASK_DENIAL_DEDUP_NS: u64 = 1_000_000_000;
+/// The budget's window.
+const TASK_DENIAL_WINDOW_NS: u64 = 1_000_000_000;
 
 /// Evidence for a refused signal or ptrace attach on a protected pid
 /// (`FS_OP_SIGNAL` / `FS_OP_PTRACE`): same ring and record as the inode
@@ -247,18 +258,20 @@ pub fn emit_task_denial(operation: u8, detail: u64, target_tgid: u32) {
             let _ = TASK_DENIAL_SEEN.insert(&key, &now, 0);
         }
     }
-    let (Some(start), Some(count)) = (TASK_DENIAL_RATE.get_ptr_mut(0), TASK_DENIAL_RATE.get_ptr_mut(1)) else {
+    let Some(rate) = TASK_DENIAL_RATE.get_ptr_mut(0) else {
         return;
     };
     unsafe {
-        if now.wrapping_sub(*start) >= TASK_DENIAL_DEDUP_NS {
-            *start = now;
-            *count = 0;
+        // SAFETY: this CPU's slot, owned by the program while it runs.
+        if now.wrapping_sub((*rate)[0]) >= TASK_DENIAL_WINDOW_NS {
+            (*rate)[0] = now;
+            (*rate)[1] = 0;
         }
-        if *count >= TASK_DENIAL_PER_SEC {
+        if (*rate)[1] >= TASK_DENIAL_PER_SEC {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::TASK_DENIAL_RATE);
             return;
         }
-        *count += 1;
+        (*rate)[1] += 1;
     }
     emit_denial(
         operation,
@@ -383,7 +396,6 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
         if deny_if_protected(FS_OP_UNLINK, target_inode) {
             return -EPERM;
         }
-    } else {
     }
     0
 }
@@ -405,19 +417,12 @@ unsafe fn try_inode_rmdir(ctx: &LsmContext) -> i32 {
         if deny_if_protected(FS_OP_RMDIR, target_inode) {
             return -EPERM;
         }
-    } else {
     }
     0
 }
 
 #[lsm(hook = "inode_rename")]
 pub fn inode_rename(ctx: LsmContext) -> i32 {
-    // Unconditional entry marker — fires the instant the kernel
-    // dispatches this BPF program, BEFORE any ctx.arg() access or
-    // verifier-visible logic. Used to disambiguate "kernel called
-    // security_inode_rename but our BPF prog didn't run" vs
-    // "our prog ran but its logic didn't match" during 2026-05-12
-    // Tappa 7 task 5 diagnosis.
     unsafe { try_inode_rename(&ctx) }
 }
 
@@ -440,23 +445,20 @@ unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
         if deny_if_protected(FS_OP_RENAME, old_inode) {
             return -EPERM;
         }
-    } else {
     }
     let new_dentry: *const c_void = ctx.arg(3);
     if let Some(new_inode) = inode_from_dentry(new_dentry) {
         if deny_if_protected(FS_OP_RENAME, new_inode) {
             return -EPERM;
         }
-    } else {
     }
     0
 }
 
 #[lsm(hook = "inode_setattr")]
 pub fn inode_setattr(ctx: LsmContext) -> i32 {
-    // Body marker covers chmod / chown / truncate paths. `touch` on
-    // an existing file routes through notify_change → security_inode_setattr
-    // so we expect this marker for `touch existingfile` too.
+    // chmod / chown / truncate, and `touch` of an existing file
+    // (notify_change → security_inode_setattr).
     unsafe { try_inode_setattr(&ctx) }
 }
 

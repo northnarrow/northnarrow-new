@@ -243,6 +243,8 @@ mod tests {
             start_ns,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 

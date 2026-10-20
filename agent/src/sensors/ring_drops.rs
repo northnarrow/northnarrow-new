@@ -122,7 +122,7 @@ fn merge_sample(prev: &[u64], now: &[Option<u64>], failing: &mut [bool]) -> Vec<
 
 /// External audit SNS-009: the rings whose loss hides security evidence.
 /// A drop there raises `TriggerType::TelemetryLoss` (ALERTED).
-pub const SECURITY_RINGS: [u32; 7] = [
+pub const SECURITY_RINGS: [u32; 8] = [
     ring_slot::EXEC,
     ring_slot::FS_PROTECT,
     ring_slot::OPEN_SENSOR,
@@ -132,6 +132,11 @@ pub const SECURITY_RINGS: [u32; 7] = [
     // External audit EBPF-009: a refused write-then-close marker hides an
     // in-place modification of a watched file.
     ring_slot::FIM_DIRTY_FULL,
+    // External audit EBPF-017: anti-tamper task denials (signals, ptrace
+    // on a protected pid) the kernel held back over its per-CPU budget.
+    // The first denial already raised the decisive trigger; a burst past
+    // the budget is a loss of evidence the operator must see.
+    ring_slot::TASK_DENIAL_RATE,
 ];
 
 /// Events a security ring may lose within one sample before the posture
@@ -367,6 +372,7 @@ mod tests {
         assert_eq!(s[10].0, "dns");
         assert_eq!(s[15].0, "fim_dirty_full");
         assert_eq!(s[17].0, "io_uring_rate");
+        assert_eq!(s[18].0, "task_denial_rate");
         // totals start at zero in a fresh process
         assert!(snapshot_nonzero().is_empty());
         assert_eq!(total(), 0);
@@ -401,6 +407,20 @@ mod tests {
             vec![("exec", TELEMETRY_LOSS_THRESHOLD + 1)]
         );
         assert!(security_losses(&prev, &prev).is_empty());
+    }
+
+    /// External audit EBPF-017: task denials held back over the kernel's
+    /// budget are a security loss, like a full `fs_protect` ring.
+    #[test]
+    fn task_denials_over_budget_are_a_security_loss() {
+        let slots = RING_DROP_SLOTS as usize;
+        let prev = vec![0u64; slots];
+        let mut cur = prev.clone();
+        cur[ring_slot::TASK_DENIAL_RATE as usize] = 4_500;
+        assert_eq!(
+            security_losses(&prev, &cur),
+            vec![("task_denial_rate", 4_500)]
+        );
     }
 
     fn fake_proc(root: &std::path::Path, pid: u32, euid: u32, exe: &str, cmdline: &[&str]) {

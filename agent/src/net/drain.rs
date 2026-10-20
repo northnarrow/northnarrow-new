@@ -498,6 +498,16 @@ fn group_commit(netflow_db: &Mutex<NetFlowDb>, listener_db: Option<&Arc<Mutex<Ne
     }
 }
 
+/// External audit EBPF-019: the half of a kernel flow correlator that may
+/// be logged — the connect's `start_ns` (bytes 0..8, little-endian,
+/// `FlowTracker::corr_id`). Bytes 8..16 are the socket's kernel address,
+/// which nothing outside the agent sees.
+fn corr_start_ns(corr: &[u8; 16]) -> u64 {
+    let mut ts = [0u8; 8];
+    ts.copy_from_slice(&corr[..8]);
+    u64::from_le_bytes(ts)
+}
+
 async fn process_close_record(
     bytes: &[u8],
     flow_tracker: &Arc<Mutex<FlowTracker>>,
@@ -579,13 +589,18 @@ async fn process_close_record(
                             "net drain: TCP close without a connect-side flow (passive or pre-agent socket) — not recorded"
                         );
                     } else {
+                        // External audit EBPF-019: the kernel correlator is
+                        // the connect's timestamp then the socket's kernel
+                        // address (bytes 8..16); only the timestamp half
+                        // reaches the journal, which the `adm` and
+                        // `systemd-journal` groups read.
                         warn!(
                             target: "net.drain",
                             pid = raw.pid,
                             comm = %common::log_escape::Escaped(&comm),
                             src = %src,
                             dst = %dst,
-                            corr_id = %hex::encode(raw.flow_id),
+                            corr_start_ns = corr_start_ns(&raw.flow_id),
                             close_reason = raw.close_reason,
                             bytes_sent = raw.bytes_sent,
                             bytes_recv = raw.bytes_recv,
@@ -1306,6 +1321,103 @@ mod tests {
             .unwrap()
             .verifying_key();
         crate::chainlog::verify_log_set::<NetFlowPayload>(&path, &pk).unwrap();
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// External audit EBPF-019: a TCP close with a kernel correlator and
+    /// no pending flow is a WARN; its fields carry the connect's timestamp
+    /// (the correlator's first half), never the socket's kernel address
+    /// (the second half), which the journal's readers must not learn.
+    #[tokio::test]
+    async fn close_without_pending_flow_logs_no_kernel_pointer() {
+        use crate::decision::correlation::CorrelationStore;
+        use crate::net::limiter::UidPacer;
+        const SK_PTR: u64 = 0xffff_8881_2345_6780;
+        const START_NS: u64 = 5_123_456_789;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Mutex::new(
+            NetFlowDb::open(
+                &dir.path().join("netflow.jsonl"),
+                AgentSigningKey::load_or_bootstrap(&dir.path().join("k.sig")).unwrap(),
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap(),
+        ));
+        let tracker = Arc::new(Mutex::new(FlowTracker::default()));
+        let dns = Arc::new(DnsCache::default());
+        let proc_root = tempfile::tempdir().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(proc_root.path());
+        let mut gate = RuleGate::with_pacer(
+            Arc::new(crate::net::blocklist::NetBlocklist::from_entries([])),
+            Arc::new(Mutex::new(CorrelationStore::new())),
+            UidPacer::with_rate(100, 100),
+        );
+        let (tx, _rx) = mpsc::channel(4);
+        // No destination either: the tracker cannot synthesise a row
+        // (NET-012), the path that logs the WARN.
+        let mut raw: NetFlowCloseRaw =
+            bytemuck::pod_read_unaligned(&close_raw(1000, 4242, [0, 0, 0, 0], 0, 1));
+        raw.flow_id = FlowTracker::corr_id(START_NS, SK_PTR);
+        let bytes = bytemuck::bytes_of(&raw).to_vec();
+
+        let out = Captured::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(out.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(sub);
+            process_close_record(&bytes, &tracker, &dns, &db, &lineage, &mut gate, &tx).await;
+        }
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let warn: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("no pending flow"))
+            .collect();
+        assert_eq!(warn.len(), 1, "{text}");
+        let line = warn[0];
+        assert!(
+            line.contains(&format!("corr_start_ns={START_NS}")),
+            "{line}"
+        );
+        // No field value is a kernel address (0xffff_8000_0000_0000 and
+        // up), in decimal or as 16 hex digits, nor the correlator's second
+        // half in its byte order.
+        for token in line.split(|c: char| !c.is_ascii_hexdigit()) {
+            if let Ok(v) = token.parse::<u64>() {
+                assert!(v < 0xffff_8000_0000_0000, "decimal {token} in {line}");
+            }
+            for w in 0..token.len().saturating_sub(15) {
+                if let Ok(v) = u64::from_str_radix(&token[w..w + 16], 16) {
+                    assert!(v < 0xffff_8000_0000_0000, "hex {token} in {line}");
+                }
+            }
+        }
+        assert!(!line.contains(&hex::encode(raw.flow_id)), "{line}");
+        assert!(!line.contains(&hex::encode(SK_PTR.to_le_bytes())), "{line}");
+        assert!(!line.contains(&format!("{SK_PTR:x}")), "{line}");
     }
 
     /// N9 drain test #5 — `NetListenerDb::append` produces a

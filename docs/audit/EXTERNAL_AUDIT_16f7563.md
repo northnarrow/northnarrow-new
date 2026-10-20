@@ -477,11 +477,11 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-265 | ATP-017 | Low | Anti-tamper | S | open |
 | NN-AUD-266 | EBPF-012 | Low | eBPF kernel | — | declined (root reads the same from the agent's state files) |
 | NN-AUD-267 | EBPF-016 | Low | eBPF kernel | M | open |
-| NN-AUD-268 | EBPF-017 | Low | eBPF kernel | S/M | open |
+| NN-AUD-268 | EBPF-017 | Low | eBPF kernel | S/M | fixed (lab PR 187) |
 | NN-AUD-269 | EBPF-018 | Low | eBPF kernel | — | declined (an unreadable tracefs already stops the boot) |
-| NN-AUD-270 | EBPF-019 | Low | eBPF kernel | S | partly fixed; open |
+| NN-AUD-270 | EBPF-019 | Low | eBPF kernel | S | fixed (lab PR 187) |
 | NN-AUD-271 | EBPF-020 | Low | eBPF kernel | S | open |
-| NN-AUD-272 | EBPF-021 | Low | eBPF kernel | M | open |
+| NN-AUD-272 | EBPF-021 | Low | eBPF kernel | M | fixed (lab PR 187) |
 | NN-AUD-273 | EVD-007 | Low | Evidence logs | M | open |
 | NN-AUD-274 | EVD-008 | Low | Evidence logs | M | partly fixed (audit/canary domains, lab PR 160); open |
 | NN-AUD-275 | EVD-010 | Low | Evidence logs | S | fixed (lab PR 179) |
@@ -635,7 +635,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-423 | TST-017 | Low | Privileged tests | M | open (degraded path now an ERROR and signed, AUT-004; not asserted) |
 | NN-AUD-424 | ASK-018 | Info | Admin socket | S | open |
 | NN-AUD-425 | AUT-012 | Info | Admin auth | — | obsolete (lab PR 138) |
-| NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | partly fixed; open |
+| NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | fixed (lab PR 187) |
 | NN-AUD-427 | EVD-023 | Info | Evidence logs | S | open |
 | NN-AUD-428 | NETR-016 | Info | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-429 | PROC-014 | Info | Process rules | S | open |
@@ -7310,3 +7310,115 @@ group, the ones an unprivileged user or a local attacker could use first.
     `test-privileged,debug-trigger`) clean, `cargo test --workspace`
     2,409 passed, 0 failed.
   - Lab: Ubuntu 24.04, netstate186-probe.sh — before: the build of `main` with lab PRs 176–183; after: this lot on top; local traffic only. Four DNS lookups of long high-entropy names from one process: 7 records before (NET-004 four, NET-014 three), 4 after (NET-014 three, NET-004 one). Listeners: before one record (the uncommon port only); after `python3 -m http.server` on 8080, a script on 8443 and a home copy of python3 on 8080 recorded, the same server run from `/usr/lib/python3.12` quiet; the host's own listeners (systemd, sshd, systemd-resolved) exempt as installed programs. Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.
+- **Wave 3 — kernel record fidelity, lab PR 187.** NN-AUD-272 (EBPF-021),
+  NN-AUD-268 (EBPF-017), NN-AUD-270 (EBPF-019, the part left), NN-AUD-426
+  (EBPF-022, the part lab PR 164 left), all Low; batch B of the Wave 3
+  triage of group G6.
+  - EBPF-021 (272): `sched_process_exec` clamps the argv block to 511
+    bytes and the tracepoint's `filename` to 256, and the record said
+    nothing: `argv_len` is the copied length. An unprivileged user put
+    the argument a rule decides on past the cut with filler options. The
+    first byte of `ProcessSpawnRaw._pad` is now `trunc_flags`
+    (`common::wire::spawn_trunc`): `ARGV` when `arg_end - arg_start` is
+    over 512 (at exec the block ends with the last argument's NUL, so 512
+    bytes lose that NUL only) or when the user read fails (argv then
+    empty, which is not an empty command line), `FILENAME` when the
+    `__data_loc` length with its NUL is over 256. Size 1,400, every offset
+    unchanged (`process_spawn_raw_layout_is_stable` pins `trunc_flags` at
+    835 and `_pad` at 836); an older object leaves the byte 0. Decoded
+    into `Event::ProcessSpawn { argv_truncated, filename_truncated }`,
+    `#[serde(default)]` (an older record: "not known to be cut").
+  - The rules: R006 is the one whose verdict depends on an argument — a
+    distribution socat is recorded (Log High) unless an address runs a
+    shell (lab PR 140). With the argv cut and no shell in the part kept,
+    the rule does not conclude "no shell": Log at Critical, the severity
+    of the shell case, reasoning `not classified: argv truncated at 511
+    bytes…; an address past the cut may run a shell`. Not killed: a long
+    relay command line is legitimate, and a socat exec raises the
+    posture's ExploitAttempt trigger either way. R013, R015 and R017 read argv only to
+    enrich the reasoning (the verdict is the same); they, and R006's kill,
+    end the reasoning with `[argv truncated at 511 bytes: arguments past
+    the cut were not seen]` (`[argv not read by the kernel…]` when unread),
+    one helper (`rules::argv_cut_note`). Not changed: R011, R012, R014,
+    R016 (enrichment only, as R013), and the lineage's `script_of`, where
+    a cut argv can only lose the script (no client match: fail-closed).
+  - The cut path: `exe_identity::resolve` normalised the caller's string
+    lexically when the kernel's path was missing (PROC-002/003); a cut
+    string is never normalised (`/usr/bin/` and a run of `./` cut before
+    `../../tmp/sh` normalised to `/usr/bin`): the running image
+    (`/proc/<pid>/exe`) names it, and when the process is already gone
+    the caller's string stays as it is. With BPF LSM the kernel's path is
+    there; this is the fallback only.
+  - The adjacent exe identity: a path component of 31 bytes (the kernel's
+    string read keeps 31 and the NUL) ends in `…`
+    (`wire::exe::EXE_NAME_CUT_MARK`), as lab PR 137's open-sensor paths;
+    an exact comparison then fails closed.
+  - EBPF-017 (268): `TASK_DENIAL_RATE` is a `PerCpuArray<[u64; 2]>` (one
+    entry, not pinned): window and count per CPU, no lost update between
+    CPUs; 50 records a second per CPU. A record over budget bumps the new
+    `RING_DROPS` slot `task_denial_rate` (18, appended, 19 slots), added
+    to `SECURITY_RINGS`: the sampler's WARN, the signed `ringbuf_drop`
+    (once per 10 min per ring) and, past 64 in a sample, `TelemetryLoss`.
+    The per-caller dedup (1 s, `TASK_DENIAL_SEEN`) is unchanged and not
+    counted (a dedup is not a loss). The deny never depended on the
+    record. Note: `kill -0` is not denied (an existence probe); the lab
+    loop sends SIGCONT.
+  - EBPF-019 (270): `net/drain.rs` logged `corr_id = hex(raw.flow_id)` at
+    WARN for a close with a kernel correlator and no pending flow; bytes
+    8..16 are `sk_ptr`. The field is `corr_start_ns` (bytes 0..8, the
+    connect's timestamp). No other log carries the correlator; the kernel
+    and lab PR 164's `FLOW_SOCK_MAP` are unchanged.
+  - EBPF-022 (426): (a) the four empty `else {}` of `inode_protect.rs`
+    (unlink, rmdir, rename ×2) and the marker comments of `inode_rename`
+    and `inode_setattr` removed (`try_inode_setattr` was lab PR 164's);
+    (b) `combined_emitted_for_old_inode` removed; (c) `module_load.rs`
+    says 512 bytes; (d) `kdbx_suffix` from position 0, moved to
+    `common::wire::open_sensor` (safe, on `&[u8; 32]`, the same loop) so a
+    test reaches it; (e) `debug = 2` in both eBPF profiles (the object
+    differs from `debug = false` only in `.debug_str`, measured), and
+    `cargo xtask build-ebpf` refuses an object without a non-empty `.BTF`
+    (`xtask/src/btf_check.rs`, ELF64 section headers, no dependency);
+    (f) the matrix rows of `KERNEL_COMPATIBILITY.md` carry their counts
+    "at the date shown", with a sentence on `--btf-check`.
+  - Wire and record formats: `ProcessSpawnRaw` (pad byte → `trunc_flags`,
+    same size), the `Event::ProcessSpawn` JSON (two fields, serde
+    default), `RING_DROPS` (19 slots; `nn-admin status` lists one more
+    ring), the rendered exe path (`…`), the journal field (`corr_id` →
+    `corr_start_ns`). No chain row format changes.
+  - eBPF (static size, BPF instruction slots): `sched_process_exec` 512 →
+    524 (one compare and three or-stores), `fim_file_open_sensor` 2,148 →
+    2,153 (one more step of the bounded `.kdbx` scan), `task_kill` 677 and
+    `ptrace_access_check` 609 unchanged (one map lookup instead of two,
+    plus the drop bump); the hygiene of (a) and (b) leaves the code
+    unchanged; no loop added. The verified count is measured in the lab:
+    on 5.15 with `bpftrace` on `do_check_common`, from 5.16 with
+    `verified_insns`.
+  - Tests: `trunc_flags_decode`, `kdbx_suffix_matches_bare_name`,
+    `a_full_length_name_is_marked_as_possibly_cut` (common);
+    `r006_socat_with_truncated_argv_is_logged`, `r013_cut_argv_is_named`,
+    `r015_cut_argv_is_named`, `r017_c_payload_past_the_cut_is_logged`,
+    `a_cut_callers_string_is_not_normalised`,
+    `task_denials_over_budget_are_a_security_loss`,
+    `close_without_pending_flow_logs_no_kernel_pointer` (agent; the WARN
+    captured, no value at or above `0xffff_8000_0000_0000` in decimal or
+    as 16 hex digits, nor the pointer's bytes);
+    `build_refuses_object_without_btf`, `the_built_object_carries_btf`
+    (xtask); updated: `process_spawn_raw_layout_is_stable`,
+    `process_spawn_raw_round_trips_via_bytes`,
+    `process_spawn_event_deserializes_old_record_via_serde_default`,
+    `names_cover_every_slot_in_order`, `ring_drop_slots_append_only`,
+    `snapshot_names_match_slots_and_nonzero_filters`, and the argv
+    enrichment tests of R013 and R017 (no mark on a whole argv); ignored,
+    privileged: `long_argv_and_filename_are_marked_cut` (`/bin/true` with
+    2.5 KiB of arguments, and by a 289-byte path). None of the new tests
+    builds on the starting tree (no `trunc_flags`, fields, slot or
+    helper); with each production change taken back alone, its test
+    fails: the WARN's `corr_id`, R006 without the cut branch, the note
+    helper returning nothing (R013, R015, R017), the lexical fallback for
+    a cut string, `task_denial_rate` out of `SECURITY_RINGS`, the scan
+    from 1, no `…`, the decode ignoring `trunc_flags`, a BTF check that
+    accepts anything.
+  - Host: `cargo xtask build-ebpf --release` (".BTF" check passes),
+    `cargo fmt`, both clippy runs (`--workspace --all-targets`, the agent
+    with `test-privileged,debug-trigger`) clean, 2,411 passed, 0 failed.
+  - Lab: Ubuntu 24.04, kernfid187-probe.sh — before: the build of `main` with lab PRs 176–183; after: this lot on top. `socat` with 200 filler `-d` options before `EXEC:/bin/sh` (a 635-byte command line): before R006 Log High (the shell past the cut unseen, like a plain relay); after R006 Log **Critical** "not classified — argv truncated at 511 bytes". `base64` as `www-data` with 120 filler options before `-d`: R015 Medium in both, the reason after naming the cut. The task-denial budget: the probe's `kill -s CONT` loop against the agent was stopped by the agent's own response after the first denied signal (COMBAT INVESTIGATE, released by the probe), so the per-CPU budget was not reached in the lab; unit tests cover it. The new programs load on 6.8 (19 deny hooks) and on Ubuntu 22.04's 5.15 verifier (17 of 17, every sensor armed). Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.

@@ -582,11 +582,9 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
     if let Some(moved) = old_inode_opt {
         crate::open_sensor::on_rename(moved as *const u8);
     }
-    let mut combined_emitted_for_old_inode = false;
     if let Some(old_inode) = old_inode_opt {
         if let Some(key) = should_emit(old_inode) {
             emit_drift_with_dest(FIM_OP_RENAMED, key, new_dir_key, 0);
-            combined_emitted_for_old_inode = true;
         }
     }
 
@@ -601,7 +599,6 @@ unsafe fn try_fim_rename_observe(ctx: &LsmContext) -> i32 {
         let new_dentry_for_child: *const c_void = ctx.arg(3);
         emit_drift_with_child(FIM_OP_RENAMED, key, new_dentry_for_child);
     }
-    let _ = combined_emitted_for_old_inode; // verifier-friendly no-op
     let new_dentry: *const c_void = ctx.arg(3);
     if let Some(new_inode) = inode_from_dentry(new_dentry) {
         if let Some(key) = should_emit(new_inode) {

@@ -59,6 +59,8 @@ async fn engine_evaluates_and_returns_valid_verdict() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -122,6 +124,8 @@ async fn engine_synthesises_escalate_on_malformed_output() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -188,6 +192,8 @@ async fn engine_surfaces_timeout_as_error() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -258,6 +264,8 @@ async fn rule_engine_short_circuits_before_ade_for_tmp_payload() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
 
     let v = rule_engine
@@ -344,6 +352,8 @@ async fn ignored_candle_real_inference() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -383,6 +393,8 @@ async fn engine_with_rag_evaluates_successfully() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -532,6 +544,8 @@ async fn evaluate_produces_identical_verdict_with_or_without_streaming() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = || EventContext {
         recent_events: vec![],
@@ -582,6 +596,8 @@ async fn rag_none_prompt_is_byte_identical_to_pre_6_7() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -718,6 +734,8 @@ async fn with_rag_splices_block_into_assembled_prompt() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -780,6 +798,8 @@ async fn low_confidence_kill_tree_is_escalated_not_executed() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let raw = MockBackend::new()
         .generate("", &event, 512, 0.0, 1.0)
@@ -886,6 +906,8 @@ async fn timeout_stops_the_generation_and_frees_the_backend() {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     };
     let ctx = EventContext {
         recent_events: vec![],
@@ -1021,6 +1043,8 @@ fn spawn_event(pid: u32, comm: &str, filename: &str) -> Event {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     }
 }
 

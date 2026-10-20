@@ -132,6 +132,8 @@ fn spawn(pid: u32, ppid: u32, comm: &str, filename: &str, ts: u64) -> Event {
         start_ns: 0,
         parent_is_kthread: false,
         exe: Default::default(),
+        argv_truncated: false,
+        filename_truncated: false,
     }
 }
 

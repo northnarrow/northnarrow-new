@@ -69,6 +69,19 @@ pub enum Event {
         /// opened it (review 61). Empty in tracepoint mode.
         #[serde(default)]
         exe: ExeIdentity,
+        /// External audit EBPF-021: `argv` is not the whole command line —
+        /// the kernel's was longer than `wire::ARGV_LEN - 1` bytes (the
+        /// last argument kept may itself be cut), or it could not be read
+        /// (`argv` empty). A rule that decides on an argument must not
+        /// read its absence as "not there". `false` on older records and
+        /// from an older eBPF object ("not known to be cut").
+        #[serde(default)]
+        argv_truncated: bool,
+        /// External audit EBPF-021: `filename` (the caller's string) was
+        /// cut at `wire::FILENAME_LEN` bytes; it names no path (a `..`
+        /// past the cut may lead anywhere). `false` on older records.
+        #[serde(default)]
+        filename_truncated: bool,
     },
     /// File open event (LSM `file_open`).
     FileOpen {
@@ -603,6 +616,8 @@ impl From<&ProcessSpawnRaw> for Event {
             // field) decodes to `false` → R011 fail-secure path.
             parent_is_kthread: raw.parent_is_kthread != 0,
             exe: ExeIdentity::from_raw(&raw.exe),
+            argv_truncated: raw.trunc_flags & crate::wire::spawn_trunc::ARGV != 0,
+            filename_truncated: raw.trunc_flags & crate::wire::spawn_trunc::FILENAME != 0,
         }
     }
 }
@@ -1530,14 +1545,58 @@ mod tests {
                 argv,
                 parent_comm,
                 parent_start_ns,
+                argv_truncated,
+                filename_truncated,
                 ..
             } => {
                 assert!(argv.is_empty());
                 assert_eq!(parent_comm, "");
                 assert_eq!(parent_start_ns, 0);
+                // External audit EBPF-021: an older record is "not known
+                // to be cut".
+                assert!(!argv_truncated);
+                assert!(!filename_truncated);
             }
             _ => panic!("expected ProcessSpawn"),
         }
+    }
+
+    /// External audit EBPF-021: the kernel's cut marks reach the event and
+    /// survive a round trip; a record without them reads as whole.
+    #[test]
+    fn trunc_flags_decode() {
+        use crate::wire::spawn_trunc;
+        let decode = |flags: u8| {
+            let mut raw = ProcessSpawnRaw::zeroed();
+            raw.comm[..5].copy_from_slice(b"socat");
+            let blob = b"socat\0-d\0-d\0";
+            raw.argv[..blob.len()].copy_from_slice(blob);
+            raw.argv_len = blob.len() as u16;
+            raw.trunc_flags = flags;
+            let evt: Event = (&raw).into();
+            let back: Event = serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
+            match back {
+                Event::ProcessSpawn {
+                    argv,
+                    argv_truncated,
+                    filename_truncated,
+                    ..
+                } => (argv, argv_truncated, filename_truncated),
+                _ => panic!("expected ProcessSpawn"),
+            }
+        };
+        let (argv, a, f) = decode(0);
+        assert_eq!(argv, vec!["socat", "-d", "-d"]);
+        assert_eq!((a, f), (false, false));
+        let (_, a, f) = decode(spawn_trunc::ARGV);
+        assert_eq!((a, f), (true, false));
+        let (_, a, f) = decode(spawn_trunc::FILENAME);
+        assert_eq!((a, f), (false, true));
+        let (_, a, f) = decode(spawn_trunc::ARGV | spawn_trunc::FILENAME);
+        assert_eq!((a, f), (true, true));
+        // Bits the decoder does not know are ignored.
+        let (_, a, f) = decode(0x80);
+        assert_eq!((a, f), (false, false));
     }
 
     /// External audit EBPF-013: a ring-creation record with held counts

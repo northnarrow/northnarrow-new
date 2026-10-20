@@ -14,6 +14,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+mod btf_check;
 mod rag_kb;
 
 const EBPF_TARGET: &str = "bpfel-unknown-none";
@@ -256,6 +257,15 @@ fn build_ebpf(release: bool, locked: bool) -> Result<()> {
     // from its own rust-toolchain.toml / .cargo/config.toml without
     // interference (notably CARGO_TARGET_DIR and CARGO_*).
     scrub_cargo_env(&mut cmd);
+    // The eBPF target's flags (`-C debuginfo=2`, `--btf`, `panic=abort`)
+    // live in agent-ebpf/.cargo/config.toml. A RUSTFLAGS from the
+    // environment REPLACES them (cargo does not merge the two), so CI's
+    // workflow-wide `RUSTFLAGS: -D warnings` built an object without its
+    // .BTF section — which the LSM programs need and which the check below
+    // now refuses (external audit EBPF-022, lab PR 187).
+    for k in ebpf_build_dropped_env() {
+        cmd.env_remove(k);
+    }
     let status = cmd
         .status()
         .with_context(|| "failed to spawn cargo for eBPF build")?;
@@ -279,6 +289,12 @@ fn build_ebpf(release: bool, locked: bool) -> Result<()> {
         );
     }
     println!("xtask: eBPF artifact at {}", bpf_obj.display());
+    // External audit EBPF-022: an object without `.BTF` loads no LSM
+    // program; refuse it here rather than at the agent's start on a host.
+    let built = std::fs::read(&bpf_obj)
+        .with_context(|| format!("reading {} for the BTF check", bpf_obj.display()))?;
+    btf_check::require_btf(&built).with_context(|| format!("refusing {}", bpf_obj.display()))?;
+    println!("xtask: eBPF artifact carries .BTF");
 
     // Stamp the RELEASE artifact (the one `agent/build.rs` embeds) with
     // the source-closure hash. This is the writer half of the staleness
@@ -363,6 +379,13 @@ fn scrub_cargo_env(cmd: &mut Command) {
     for k in to_drop {
         cmd.env_remove(k);
     }
+}
+
+/// The environment flags the nested eBPF build drops on top of
+/// [`scrub_cargo_env`]: they would replace the target's rustflags of
+/// agent-ebpf/.cargo/config.toml (lab PR 187).
+fn ebpf_build_dropped_env() -> [&'static str; 2] {
+    ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"]
 }
 
 /// Whether [`scrub_cargo_env`] drops `name`.
@@ -463,5 +486,13 @@ mod tests {
             assert!(scrubbed(name), "{name}");
         }
         assert!(!scrubbed("RUSTFLAGS") && !scrubbed("PATH"));
+    }
+
+    /// Lab PR 187: the nested eBPF build drops the environment rustflags,
+    /// which would replace the target's `-C debuginfo=2` and `--btf`.
+    #[test]
+    fn the_ebpf_build_drops_environment_rustflags() {
+        assert!(super::ebpf_build_dropped_env().contains(&"RUSTFLAGS"));
+        assert!(super::ebpf_build_dropped_env().contains(&"CARGO_ENCODED_RUSTFLAGS"));
     }
 }

@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 18;
+pub const RING_DROP_SLOTS: u32 = 19;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -45,6 +45,11 @@ pub mod ring_slot {
     /// External audit EBPF-013: io_uring ring creations over a process's or
     /// a user's record budget, not recorded (held back before the ring).
     pub const IOURING_RATE: u32 = 17;
+    /// External audit EBPF-017: anti-tamper task denials (a refused
+    /// signal or ptrace attach on a protected pid) over the per-CPU record
+    /// budget, not recorded (held back before the `fs_protect` ring; the
+    /// deny itself still applies).
+    pub const TASK_DENIAL_RATE: u32 = 18;
 }
 
 /// Human names, indexed by slot.
@@ -67,6 +72,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "fim_dirty_full",
     "listen_rate",
     "io_uring_rate",
+    "task_denial_rate",
 ];
 
 #[cfg(test)]
@@ -97,7 +103,11 @@ mod tests {
             RING_DROP_NAMES[ring_slot::IOURING_RATE as usize],
             "io_uring_rate"
         );
-        assert_eq!(ring_slot::IOURING_RATE + 1, RING_DROP_SLOTS);
+        assert_eq!(
+            RING_DROP_NAMES[ring_slot::TASK_DENIAL_RATE as usize],
+            "task_denial_rate"
+        );
+        assert_eq!(ring_slot::TASK_DENIAL_RATE + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -124,6 +134,7 @@ mod tests {
             (ring_slot::FIM_DIRTY_FULL, "fim_dirty_full"),
             (ring_slot::LISTEN_RATE, "listen_rate"),
             (ring_slot::IOURING_RATE, "io_uring_rate"),
+            (ring_slot::TASK_DENIAL_RATE, "task_denial_rate"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");

@@ -15,6 +15,8 @@
 //! (1000..60000) and container sub-uid ranges are deliberately excluded:
 //! encoder use by those is too common to flag at this severity.
 //! argv-aware refinement (what is being encoded) is deferred to T10.6.
+//! The argv flags only enrich the reasoning; external audit EBPF-021: when
+//! the kernel cut the argv, the reasoning says so.
 
 use std::sync::Arc;
 
@@ -84,6 +86,8 @@ impl Rule for R015EncodingToolingServiceUid {
                 argv.join(" ")
             );
         }
+        // External audit EBPF-021: a flag past a cut argv was not seen.
+        let reasoning = super::with_argv_cut_note(reasoning, event);
         Some(judgement.apply(
             build_verdict(
                 self,
@@ -100,7 +104,7 @@ impl Rule for R015EncodingToolingServiceUid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::rules::testutil::{spawn_as, spawn_full};
+    use crate::decision::rules::testutil::{argv_cut, spawn_as, spawn_full};
 
     fn rule() -> R015EncodingToolingServiceUid {
         R015EncodingToolingServiceUid::new(Arc::new(CommAllowlist::default()))
@@ -117,6 +121,29 @@ mod tests {
         );
         let v = rule().evaluate(&ev).expect("fires");
         assert!(v.reasoning.contains("decode/cipher flags in argv"));
+    }
+
+    /// External audit EBPF-021: a decode flag past a cut argv was not seen;
+    /// the reasoning says so, the verdict is the same.
+    #[test]
+    fn r015_cut_argv_is_named() {
+        let ev = argv_cut(spawn_full(
+            "base64",
+            "/usr/bin/base64",
+            33,
+            &["base64", "-w", "0"],
+            "sh",
+        ));
+        let v = rule().evaluate(&ev).expect("fires");
+        assert_eq!(
+            (v.action, v.severity),
+            (ResponseAction::Log, Severity::Medium)
+        );
+        assert!(
+            v.reasoning.contains("argv truncated at 511 bytes"),
+            "{}",
+            v.reasoning
+        );
     }
 
     #[test]

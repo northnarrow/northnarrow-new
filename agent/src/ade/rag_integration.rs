@@ -289,6 +289,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         }
     }
 
@@ -347,6 +349,8 @@ mod tests {
             start_ns: 0,
             parent_is_kthread: false,
             exe: Default::default(),
+            argv_truncated: false,
+            filename_truncated: false,
         };
         let q = build_rag_query(&sanitize_event_for_ade(&e));
         assert!(q.contains("xmrig"));

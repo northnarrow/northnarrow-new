@@ -537,6 +537,19 @@ Now **killed, or answered, where they were recorded or missed**:
   reasoning on a common port reads `on port 8080, a common service port,
   from a program not installed in a root-owned system tree …`. Nothing is
   killed.
+- Cut command lines (Wave 3, lab PR 187): the exec record keeps 511 bytes
+  of the command line and now says when it cut it. R006 records the
+  distribution's `socat` with a longer command line, whose first 511
+  bytes run no shell, at **Critical** (Log, not killed; High before):
+  filler options can push the shell address past the cut. R006, R013,
+  R015 and R017 end their reasoning on such an exec with `[argv truncated
+  at 511 bytes: arguments past the cut were not seen]` (NN-AUD-272
+  EBPF-021). An executable path whose component is 31 bytes long — the
+  most the kernel's read keeps — reads with `…` after it (`/opt/x/<31
+  bytes>…`), as the file-open sensor's paths do: **an allowlist entry or
+  a process canary naming a file whose name is exactly 31 bytes no longer
+  equals the kernel's path** (a canary still matches the path the caller
+  passed).
 
 ## 6. Posture and COMBAT
 
@@ -662,6 +675,14 @@ Now **killed, or answered, where they were recorded or missed**:
     destinations. A binary that grows past `quarantine_max_bytes` while it
     is read is refused (EFBIG, nothing vaulted or removed); a vault
     entry's `size_bytes` is the bytes read.
+- **Refused signals and ptrace attaches are counted when the kernel holds
+  their records back** (NN-AUD-268 EBPF-017, lab PR 187). The kernel
+  keeps at most 50 such records a second per CPU (one budget for the host
+  before, updated from every CPU); the excess is counted in the new ring
+  `task_denial_rate` of `nn-admin status`, with a journal WARN, a signed
+  `ringbuf_drop` and, past 64 in 10 s, telemetry loss (ALERTED) — the
+  first refused attempt has locked COMBAT already. The deny itself is
+  unchanged.
 
 ## 7. The model (ADE) and RAG
 
@@ -887,6 +908,12 @@ checked with its tag-bound attestation.
   …), absent on every other record. **Regression:** an `nn-admin` older
   than the agent reports those records as broken: upgrade the three
   binaries together.
+- **`corr_id` is now `corr_start_ns`** (NN-AUD-270 EBPF-019, lab PR 187)
+  on the WARN `net drain: TCP close had a kernel flow id but no pending
+  flow — row NOT recorded`: the kernel correlator's second half is the
+  socket's kernel address, which the journal's readers (`adm`,
+  `systemd-journal`) must not learn; the field is the connect's
+  timestamp. Update a search on `corr_id=`.
 - **Lab:** `tamper-check` reads its evidence from the signed records: the
   column reads `deny=signal×1` (detections) where it read `op=signal×1`
   (journal), and its journal part only `errors=`.
