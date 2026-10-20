@@ -935,7 +935,7 @@ done
 # EARLIER_*_SHA256 tables next to each built-in copy (a unit test keeps the
 # two equal, config::overlay::tests::install_sh_knows_the_same_shipped_lists).
 declare -A SHIPPED_V1_EARLIER=(
-    [fim-paths.v1]="6baec5b5f0dfc92bdf91a0426b8d3693bd4b4a7b25df79e6ff9aa2298b906659 99e3364b81cf77ccd51cda88e80bc71a45b13e7b75c7ff480b195e157ab3011a"
+    [fim-paths.v1]="6baec5b5f0dfc92bdf91a0426b8d3693bd4b4a7b25df79e6ff9aa2298b906659 99e3364b81cf77ccd51cda88e80bc71a45b13e7b75c7ff480b195e157ab3011a 3fc62222695e595a26069123393850cfe917c614d863947248240a3b41810c9b"
     [netflow-blocklist.v1]="b50d821782e5ab9d8ab3e27aa7c3dfb3ea0aec87001c16b2eea758d94e8a7866"
     [netflow-ja3-blocklist.v1]="0340417224f37515e1c2a1ed24bc3f530c4bdb910f6bf65dee9793152efc6a24"
     [process-comm-allowlist.v1]="4a3a973fff7875d6050b458778031c1e69f2ed0181bbde9da52854a1f16fe730 e99ae04a743682c471899cc997e7d5da6c055c043706d398e55aa976f0669b94"

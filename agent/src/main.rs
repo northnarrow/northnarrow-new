@@ -1998,7 +1998,8 @@ async fn main() -> Result<()> {
                         "stale COMBAT chain detected at boot — torn down (likely crash-orphaned). \
                          Re-engage via the admin socket if the threat is still active."
                     );
-                    audit_combat_reconcile(outcome.rules_removed);
+                    // Lab follow-up (lab PR 188): the jsonl line is written
+                    // once the state directory protection exists (below).
                     stale_combat =
                         Some(northnarrow_agent::combat::reconcile::StaleChain::TornDown {
                             rules_removed: outcome.rules_removed,
@@ -2614,6 +2615,15 @@ async fn main() -> Result<()> {
             Some(p) => p.clone(),
             None => std::sync::Arc::new(northnarrow_agent::chainlog::NoProtection),
         };
+    // Lab follow-up (lab PR 188): the stale chain's compatibility line, now
+    // that the state directory's protection exists — a missing file is
+    // created with the directory's `chattr +i` lifted for that moment (a
+    // plain open at the teardown was refused with EPERM).
+    if let Some(northnarrow_agent::combat::reconcile::StaleChain::TornDown { rules_removed }) =
+        &stale_combat
+    {
+        audit_combat_reconcile(rotation_protection.as_ref(), *rules_removed);
+    }
     let rotation_on = state_protection.is_some();
     let cap = |bytes: u64| if rotation_on { bytes } else { u64::MAX };
     // Lab PR 160: the head anchor is created inside the same dance when
@@ -5496,15 +5506,29 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
 /// [`northnarrow_agent::combat::reconcile::LOG_PATH`]; a write failure is
 /// logged but never fatal — the teardown it records has already happened,
 /// and the signed `integrity_drift` (`combat_reconcile`) is the evidence
-/// (external audit MAIN-013).
-fn audit_combat_reconcile(rules_removed: usize) {
-    use northnarrow_agent::combat::reconcile::{append_line, CAP_BYTES, LOG_PATH};
+/// (external audit MAIN-013). Lab follow-up (lab PR 188): written once the
+/// state directory's protection exists, a missing file created inside
+/// `protection`'s dance ([`northnarrow_agent::combat::reconcile::record_line`]).
+fn audit_combat_reconcile(
+    protection: &dyn northnarrow_agent::chainlog::ProtectionManager,
+    rules_removed: usize,
+) {
+    use northnarrow_agent::combat::reconcile::{record_line, CAP_BYTES, LOG_PATH};
     // BUG-026 B-cap: combat-audit is the lone UNSIGNED / unchained
     // best-effort log (BUG-028). `/var/lib/northnarrow` is `chattr +i`, so
     // a rename-based rotate is a blocked dir-entry op — capped by
     // TRUNCATE-IN-PLACE (a content op, allowed under `+i`).
-    if let Err(e) = append_line(std::path::Path::new(LOG_PATH), rules_removed, CAP_BYTES) {
-        warn!(error = %e, path = LOG_PATH, "could not write COMBAT reconcile audit line (non-fatal)");
+    if let Err(e) = record_line(
+        std::path::Path::new(LOG_PATH),
+        rules_removed,
+        CAP_BYTES,
+        protection,
+    ) {
+        warn!(
+            error = format!("{e:#}"),
+            path = LOG_PATH,
+            "could not write COMBAT reconcile audit line (non-fatal)"
+        );
     }
 }
 

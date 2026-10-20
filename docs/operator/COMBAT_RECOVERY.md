@@ -204,9 +204,10 @@ posture state behind it (the "split-brain"). NorthNarrow handles this
 - For compatibility a line is also appended to
   `/var/lib/northnarrow/combat-audit.jsonl`
   (`{"event":"combat_reconcile","reason":"stale_reconcile",
-  "rules_torn_down":N,…}`), unsigned; the state directory is immutable
-  (`chattr +i`), so the line is added only to a file that already exists
-  (created `0600` where the directory is not immutable).
+  "rules_torn_down":N,…}`), unsigned; a missing file is created
+  `0600`, the state directory's `chattr +i` lifted for that moment and
+  put back (lab PR 188 — before, the line was refused with EPERM when the
+  file did not exist).
 
 So after a crash + restart the host comes back on the network on its own.
 

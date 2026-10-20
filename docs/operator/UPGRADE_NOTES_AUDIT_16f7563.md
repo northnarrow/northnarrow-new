@@ -364,6 +364,11 @@ packages open it themselves.
   and `admin_key` (lab PR 96); **`nn-admin status`** shows `ringbuf
   rejected` for malformed open-sensor records (NN-AUD-190 SNS-008, lab PR
   128).
+- **A closed pipe** (lab PR 188, a follow-up found in the lab): `nn-admin
+  status | head -1` and every other command whose stdout or stderr closes
+  early end quietly with exit 141 (128 + SIGPIPE; it aborted with 134 and
+  a panic message). Under `set -o pipefail` such a pipeline fails, as with
+  any tool the signal ends.
 
 ## 4. Detection records: the response as it happened
 
@@ -645,6 +650,24 @@ Now **killed, or answered, where they were recorded or missed**:
   ruleset was applied, also when the jump dedup failed afterwards (it
   used to say `false` of an isolated host), and the release removes a
   duplicate jump that dedup left.
+- **The isolation is read back** (lab PR 188, follow-ups of lab PR 176).
+  An `iptables-restore` that exits 0 is no longer taken for an isolation:
+  the agent lists the table (`iptables -S`) and wants the
+  `NORTHNARROW_COMBAT` chain to reach its catch-all DROP (no
+  unconditional ACCEPT or RETURN ahead of it) and INPUT, OUTPUT and the
+  ruleset's FORWARD to jump into it. Otherwise: ERROR `COMBAT: isolation
+  NOT in place` (with `restore_bin` and the gaps), "COMBAT isolate
+  failed", `network_isolation_engaged: false`; for IPv6 a WARN, the v4
+  isolation kept. `fim-paths.v1` adds `/usr/sbin/iptables-restore` and
+  `/usr/sbin/ip6tables-restore`: re-pointing either link or its
+  `/etc/alternatives` entry is NN-L-FIM-001 (Critical, KillProcessTree;
+  Log Low inside a package transaction). **Action:** run `nn-admin fim
+  baseline` after the upgrade so the two paths get a baseline row.
+  **Detection change:** an administrator's `update-alternatives --set
+  iptables …` outside a package transaction is NN-L-FIM-001 on the two
+  links, as it already was on `/usr/sbin/iptables`. A stale COMBAT
+  chain's `combat-audit.jsonl` line is now written, the file created when
+  missing ([COMBAT_RECOVERY.md §4](COMBAT_RECOVERY.md#4-recovering-from-an-agent-crash-mid-combat)).
 - **The COMBAT guard, the capability preflight, the quarantine's own
   files** (NN-AUD-313 CMB-022, NN-AUD-431 CMB-028, NN-AUD-315 CMB-024,
   NN-AUD-316 CMB-025, lab PR 181). Hosts whose drop-in removes a

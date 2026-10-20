@@ -4737,6 +4737,16 @@ mod tests {
                 200,
                 "dpkg",
             ),
+            // Lab PR 188: the COMBAT restore link (watched with its
+            // /etc/alternatives entry) re-pointed by a postinst's
+            // update-alternatives — recorded; by anyone else, killed.
+            (
+                "NN-L-FIM-001_SystemBinaryModified",
+                FimOp::Modified,
+                "/usr/sbin/iptables-restore",
+                300,
+                "update-alternat",
+            ),
         ];
         for (id, op, path, pid, comm) in cases {
             let rule = rules.get(id).unwrap_or_else(|| panic!("{id} missing"));

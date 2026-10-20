@@ -61,6 +61,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- Lab follow-ups of lab PRs 176 and 180, and nn-admin on a closed pipe
+  (lab PR 188). A stale `NORTHNARROW_COMBAT` chain torn down at start was
+  signed (`combat_reconcile`), but its compatibility line in
+  `/var/lib/northnarrow/combat-audit.jsonl` was refused with EPERM
+  whenever the file did not exist: it was written at the teardown, and
+  the state directory is `chattr +i` from one run to the next, which
+  refuses a new entry to everyone. The line is now written once the state
+  directory's protection is set up, an existing file appended as before,
+  a missing one created `0600` with the directory's `+i` lifted for that
+  moment and put back, as for the agent's other state files. The COMBAT isolation
+  trusted any `iptables-restore` that exited 0: root could point the
+  `iptables-restore` link or its `/etc/alternatives` entry at another
+  root-owned system binary (`/usr/bin/true`), and COMBAT logged "network
+  isolated" with nothing applied. After the restore the agent reads the
+  table back (`iptables -S`): the chain must reach its catch-all DROP (no
+  unconditional ACCEPT or RETURN ahead of it) and INPUT, OUTPUT and the
+  ruleset's FORWARD must jump into it; otherwise an ERROR "COMBAT:
+  isolation NOT in place …" naming the restore binary and the gaps, the
+  engage fails ("COMBAT isolate failed") and `nn-admin status` says
+  `network_isolation_engaged: false`. The v6 leg is read back too and
+  stays best-effort (a WARN, v4 kept). `fim-paths.v1` watches
+  `/usr/sbin/iptables-restore` and `/usr/sbin/ip6tables-restore`, and
+  with them each link and `/etc/alternatives` entry up to the target, so
+  re-pointing one is NN-L-FIM-001 drift (Critical, KillProcessTree; Log
+  Low inside a package transaction, as for every system binary). `nn-admin`
+  aborted (exit 134, a panic message) when its stdout was a pipe closed
+  early (`nn-admin status | grep -m1 …`): every line it prints goes
+  through one writer, and a closed stdout or stderr ends the command
+  quietly with 141 (128 + SIGPIPE), `audit read` included. **Regressions /
+  changes:** a host whose `iptables-restore` exits 0 without applying the
+  ruleset is no longer reported isolated; an engage whose read-back finds
+  the table emptied clears the isolated state; the shipped `fim-paths.v1`
+  changed (`install.sh` replaces the previous copy; run `nn-admin fim
+  baseline` so the two new paths have a baseline row — until then each
+  change of their target is drift without a baseline); an admin's own
+  `update-alternatives --set iptables …` outside a package transaction
+  is NN-L-FIM-001 on the two links, as it already was on
+  `/usr/sbin/iptables`; `nn-admin … | head` exits 141 instead of 134.
 - External audit, Wave 3, kernel record fidelity (Low EBPF-017
   NN-AUD-268, EBPF-019 NN-AUD-270, EBPF-021 NN-AUD-272, EBPF-022
   NN-AUD-426; lab PR 187). EBPF-021: the exec record keeps the first 511

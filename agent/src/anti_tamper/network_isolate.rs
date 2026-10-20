@@ -359,6 +359,30 @@ impl NetworkIsolator {
         let (ruleset, carved) = self.build_engaged_ruleset()?;
         let restore_exe = run_iptables_restore_data(&self.restore_bin, ruleset.as_bytes())
             .context("iptables-restore failed during COMBAT engage")?;
+        // Lab follow-up (lab PR 188): a restore that exits 0 is not proof
+        // that the ruleset is in. Root can point the `iptables-restore`
+        // link (or its `/etc/alternatives` entry) at another root-owned
+        // system binary — `/usr/bin/true` passes the trusted-binary checks
+        // of ATP-014 — and the isolation was a no-op logged as "network
+        // isolated", visible only in `restore_bin`. The table is read back
+        // (`iptables -S`): the chain must hold its catch-all DROP and every
+        // base chain the ruleset jumps from must jump into it. Otherwise the
+        // host is not isolated, and is not reported so.
+        if let Err(gaps) = verify_isolation(&self.iptables_bin, &ruleset) {
+            self.is_isolated.store(false, Ordering::SeqCst);
+            error!(
+                restore_bin = %restore_exe.display(),
+                gaps = %gaps,
+                "COMBAT: isolation NOT in place — iptables-restore exited 0 but the table does \
+                 not hold the COMBAT ruleset (an iptables-restore link pointed at another \
+                 binary?); the host is NOT isolated"
+            );
+            return Err(anyhow!(
+                "COMBAT isolation not in place after {} exited 0: {gaps} — the host is NOT \
+                 isolated",
+                restore_exe.display()
+            ));
+        }
         // External audit ATP-006 (NN-AUD-259): the ruleset is in, so the
         // host is isolated — recorded before anything else can fail. The
         // dedup's `?` used to return between the two: `nn-admin status`
@@ -418,7 +442,18 @@ impl NetworkIsolator {
             ),
             Ok(Some((ruleset, carved))) => {
                 match run_iptables_restore_data(&self.restore_bin_v6, ruleset.as_bytes()) {
-                    Ok(_) => {
+                    Ok(exe) => {
+                        // Lab follow-up (lab PR 188): read back, as for v4.
+                        if let Err(gaps) = verify_isolation(&self.ip6tables_bin, &ruleset) {
+                            warn!(
+                                restore_bin = %exe.display(),
+                                gaps = %gaps,
+                                "COMBAT: ip6tables-restore exited 0 but the table does not hold \
+                                 the COMBAT ruleset — IPv6 NOT isolated this COMBAT (v4 applied; \
+                                 an ip6tables-restore link pointed at another binary?)"
+                            );
+                            return;
+                        }
                         // BUG-041: dedup our v6 jumps (best-effort — a dup
                         // is harmless, both isolate; v4 already succeeded).
                         if let Err(e) = dedup_jumps(&self.ip6tables_bin) {
@@ -692,19 +727,96 @@ fn tear_down_one(bin: &Bin) -> Result<()> {
 /// (non-zero exit), `Err` = the binary could not be run (BUG-031: the
 /// v6 caller treats that as "no v6 chain").
 fn probe_chain(bin: &Bin) -> Result<Option<usize>> {
+    Ok(list_rules(bin, COMBAT_CHAIN)?.map(|listed| count_chain_rules(&listed)))
+}
+
+/// `bin -S chain`: the rules listed, `None` when the listing exits non-zero
+/// (no such chain); `Err` when the binary could not be run.
+fn list_rules(bin: &Bin, chain: &str) -> Result<Option<String>> {
     let (mut cmd, _) = bin.command()?;
     let listed = cmd
-        .args(["-S", COMBAT_CHAIN])
+        .args(["-S", chain])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("running {bin} -S {COMBAT_CHAIN}"))?;
+        .with_context(|| format!("running {bin} -S {chain}"))?;
     if !listed.status.success() {
         return Ok(None);
     }
-    Ok(Some(count_chain_rules(&String::from_utf8_lossy(
-        &listed.stdout,
-    ))))
+    Ok(Some(String::from_utf8_lossy(&listed.stdout).into_owned()))
+}
+
+/// Lab follow-up (lab PR 188): the base chains the applied ruleset jumps
+/// from into [`COMBAT_CHAIN`] — INPUT and OUTPUT always (what
+/// [`validate_ruleset`] requires of any ruleset COMBAT applies, the built-in
+/// one included), FORWARD when the ruleset declares its jump.
+fn jump_bases(ruleset: &str) -> Vec<&'static str> {
+    let jump = format!("-j {COMBAT_CHAIN}");
+    let declared = |base: &str| {
+        ruleset.lines().map(str::trim).any(|l| {
+            !l.starts_with('#') && l.ends_with(&jump) && l.split_whitespace().nth(1) == Some(base)
+        })
+    };
+    ["INPUT", "OUTPUT", "FORWARD"]
+        .into_iter()
+        .filter(|base| *base != "FORWARD" || declared(base))
+        .collect()
+}
+
+/// Lab follow-up (lab PR 188): what keeps a restored COMBAT ruleset from
+/// isolating, read from `iptables -S`: `chain` is the listing of
+/// [`COMBAT_CHAIN`] (`None`: no such chain), `jumps` the jumps into it
+/// counted per base chain (`None`: the base chain could not be listed).
+/// The chain must reach its catch-all DROP — no unconditional ACCEPT or
+/// RETURN ahead of it — and every base chain must jump into it. `Err`
+/// names each gap.
+fn isolation_gaps(
+    chain: Option<&str>,
+    jumps: &[(&str, Option<usize>)],
+) -> std::result::Result<(), String> {
+    let mut gaps = Vec::new();
+    match chain {
+        None => gaps.push(format!("no {COMBAT_CHAIN} chain")),
+        Some(listing) => {
+            let prefix = format!("-A {COMBAT_CHAIN} -j ");
+            let unconditional = listing
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix(prefix.as_str()))
+                .find(|target| matches!(*target, "DROP" | "ACCEPT" | "RETURN"));
+            match unconditional {
+                Some("DROP") => {}
+                Some(other) => gaps.push(format!(
+                    "an unconditional {other} ahead of the catch-all DROP in {COMBAT_CHAIN}"
+                )),
+                None => gaps.push(format!("no catch-all DROP in {COMBAT_CHAIN}")),
+            }
+        }
+    }
+    for (base, n) in jumps {
+        match n {
+            None => gaps.push(format!("{base} could not be listed")),
+            Some(0) => gaps.push(format!("no {base} jump into {COMBAT_CHAIN}")),
+            Some(_) => {}
+        }
+    }
+    if gaps.is_empty() {
+        Ok(())
+    } else {
+        Err(gaps.join("; "))
+    }
+}
+
+/// Lab follow-up (lab PR 188): read the table back after a restore of
+/// `ruleset` ([`isolation_gaps`]). `Err` names the gaps, or why the table
+/// could not be read (not isolated either: nothing shows that it is).
+fn verify_isolation(bin: &Bin, ruleset: &str) -> std::result::Result<(), String> {
+    let read = |chain: &str| list_rules(bin, chain).map_err(|e| format!("{e:#}"));
+    let chain = read(COMBAT_CHAIN)?;
+    let mut jumps = Vec::new();
+    for base in jump_bases(ruleset) {
+        jumps.push((base, read(base)?.map(|listed| count_jumps(&listed))));
+    }
+    isolation_gaps(chain.as_deref(), &jumps)
 }
 
 /// BUG-041 — after an additive `-I … 1` engage, ensure exactly ONE
@@ -732,17 +844,7 @@ fn dedup_jumps(bin: &Bin) -> Result<()> {
 /// The `-j COMBAT_CHAIN` jumps in `base` (`iptables -S base`); `None` when
 /// the listing exits non-zero (base chain unreadable).
 fn list_jumps(bin: &Bin, base: &str) -> Result<Option<usize>> {
-    let (mut cmd, _) = bin.command()?;
-    let listed = cmd
-        .args(["-S", base])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("running {bin} -S {base}"))?;
-    if !listed.status.success() {
-        return Ok(None);
-    }
-    Ok(Some(count_jumps(&String::from_utf8_lossy(&listed.stdout))))
+    Ok(list_rules(bin, base)?.map(|listed| count_jumps(&listed)))
 }
 
 /// External audit ATP-006 (NN-AUD-259): remove EVERY jump into
@@ -980,14 +1082,198 @@ mod tests {
         Some(path)
     }
 
+    /// A mock `iptables` whose `-S` lists the table an applied COMBAT
+    /// ruleset leaves (the chain with its catch-all DROP, one jump per base
+    /// chain) and whose other calls succeed: the read-back after the restore
+    /// (lab PR 188) finds the isolation in place.
+    fn mock_engaged_iptables() -> Option<PathBuf> {
+        mock_script(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             -S) case \"$2\" in\n\
+                 NORTHNARROW_COMBAT) echo '-N NORTHNARROW_COMBAT'; echo '-A NORTHNARROW_COMBAT -i lo -j ACCEPT';\n\
+                     echo '-A NORTHNARROW_COMBAT -j DROP' ;;\n\
+                 *) echo \"-P $2 ACCEPT\"; echo \"-A $2 -j NORTHNARROW_COMBAT\" ;;\n\
+                 esac ;;\n\
+             esac\n\
+             exit 0\n",
+        )
+    }
+
     fn mock_success_isolator() -> Option<NetworkIsolator> {
         let restore = mock_restore_bin()?;
+        let iptables = mock_engaged_iptables()?;
+        Some(NetworkIsolator::new_with_bin(combat_rules_path(), restore, iptables).unwrap())
+    }
+
+    /// Lab follow-up (lab PR 188): a restore that exits 0 and applies
+    /// nothing — the `iptables-restore` link pointed at `/usr/bin/true`
+    /// (here a script that drains its stdin and exits 0) — is not an
+    /// isolation: `engage` fails naming the gaps, and the host is not
+    /// reported isolated. Before, `engage` was `Ok` and `is_engaged` true.
+    #[test]
+    fn a_restore_that_applies_nothing_is_not_an_isolation() {
+        let (Some(restore), Some(no_chain)) = (
+            mock_restore_bin(),
+            mock_script(
+                "#!/bin/sh\n\
+                 case \"$1 $2\" in\n\
+                 '-S NORTHNARROW_COMBAT') echo \"iptables: chain 'NORTHNARROW_COMBAT' does not exist\" >&2; exit 1 ;;\n\
+                 -S*) echo \"-P $2 ACCEPT\"; echo \"-A $2 -p tcp --dport 22 -j ACCEPT\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+            ),
+        ) else {
+            return;
+        };
+        let iso =
+            NetworkIsolator::new_with_bin(combat_rules_path(), restore.clone(), no_chain).unwrap();
+        let err = format!("{:#}", iso.engage().unwrap_err());
+        assert!(err.contains("NOT isolated"), "{err}");
+        for gap in [
+            "no NORTHNARROW_COMBAT chain",
+            "no INPUT jump",
+            "no OUTPUT jump",
+            "no FORWARD jump",
+        ] {
+            assert!(err.contains(gap), "{gap}: {err}");
+        }
+        assert!(!iso.is_engaged());
+        // `iptables` itself pointed at a no-op: every listing empty
+        let truebin = PathBuf::from("/bin/true");
+        if truebin.exists() {
+            let iso = NetworkIsolator::new_with_bin(combat_rules_path(), restore, truebin).unwrap();
+            let err = format!("{:#}", iso.engage().unwrap_err());
+            assert!(err.contains("no catch-all DROP"), "{err}");
+            assert!(!iso.is_engaged());
+        }
+    }
+
+    /// Lab follow-up (lab PR 188): an engaged isolator whose re-engage finds
+    /// the table emptied (flushed, and the restore a no-op) no longer
+    /// reports the host isolated.
+    #[test]
+    fn a_reengage_that_finds_the_table_empty_clears_the_state() {
+        let Some(iso) = mock_success_isolator() else {
+            return;
+        };
+        iso.engage().expect("engaged");
+        assert!(iso.is_engaged());
         let truebin = PathBuf::from("/bin/true");
         if !truebin.exists() {
-            eprintln!("/bin/true missing; skipping");
-            return None;
+            return;
         }
-        Some(NetworkIsolator::new_with_bin(combat_rules_path(), restore, truebin).unwrap())
+        let iso = NetworkIsolator {
+            iptables_bin: Bin::Fixed(truebin),
+            ..iso
+        };
+        assert!(iso.engage().is_err());
+        assert!(!iso.is_engaged(), "the host is no longer isolated");
+    }
+
+    /// Lab follow-up (lab PR 188): the v6 leg is read back too, and stays
+    /// best-effort — a v6 table without the ruleset leaves the v4 isolation
+    /// engaged.
+    #[test]
+    fn a_v6_table_without_the_ruleset_keeps_the_v4_isolation() {
+        let Some(iso) = mock_success_isolator() else {
+            return;
+        };
+        let truebin = PathBuf::from("/bin/true");
+        if !truebin.exists() {
+            return;
+        }
+        let iso = NetworkIsolator {
+            ip6tables_bin: Bin::Fixed(truebin),
+            ..iso
+        };
+        iso.engage().expect("v4 isolated");
+        assert!(iso.is_engaged());
+    }
+
+    /// Lab follow-up (lab PR 188): what the read-back accepts and refuses.
+    #[test]
+    fn isolation_gaps_read_the_listing() {
+        let all = [
+            ("INPUT", Some(1)),
+            ("OUTPUT", Some(2)),
+            ("FORWARD", Some(1)),
+        ];
+        let applied = "-N NORTHNARROW_COMBAT\n\
+                       -A NORTHNARROW_COMBAT -i lo -j ACCEPT\n\
+                       -A NORTHNARROW_COMBAT -s 10.0.0.0/8 -j ACCEPT\n\
+                       -A NORTHNARROW_COMBAT -j LOG\n\
+                       -A NORTHNARROW_COMBAT -j DROP\n";
+        assert_eq!(isolation_gaps(Some(applied), &all), Ok(()));
+        let no_drop = "-N NORTHNARROW_COMBAT\n-A NORTHNARROW_COMBAT -i lo -j ACCEPT\n";
+        assert_eq!(
+            isolation_gaps(Some(no_drop), &all),
+            Err("no catch-all DROP in NORTHNARROW_COMBAT".to_string())
+        );
+        let accept_first = "-N NORTHNARROW_COMBAT\n\
+                            -A NORTHNARROW_COMBAT -j ACCEPT\n\
+                            -A NORTHNARROW_COMBAT -j DROP\n";
+        let gaps = isolation_gaps(Some(accept_first), &all).unwrap_err();
+        assert!(gaps.contains("unconditional ACCEPT ahead"), "{gaps}");
+        let return_first = "-A NORTHNARROW_COMBAT -j RETURN\n-A NORTHNARROW_COMBAT -j DROP\n";
+        assert!(isolation_gaps(Some(return_first), &all).is_err());
+        let gaps = isolation_gaps(
+            Some(applied),
+            &[("INPUT", Some(0)), ("OUTPUT", None), ("FORWARD", Some(1))],
+        )
+        .unwrap_err();
+        assert_eq!(
+            gaps,
+            "no INPUT jump into NORTHNARROW_COMBAT; OUTPUT could not be listed"
+        );
+        assert_eq!(
+            isolation_gaps(None, &[]),
+            Err("no NORTHNARROW_COMBAT chain".to_string())
+        );
+    }
+
+    /// Lab follow-up (lab PR 188): the base chains checked are the ones the
+    /// ruleset jumps from — INPUT and OUTPUT whatever it says.
+    #[test]
+    fn jump_bases_follow_the_ruleset() {
+        assert_eq!(
+            jump_bases(BUILTIN_RULES_V4),
+            vec!["INPUT", "OUTPUT", "FORWARD"]
+        );
+        assert_eq!(
+            jump_bases(BUILTIN_RULES_V6),
+            vec!["INPUT", "OUTPUT", "FORWARD"]
+        );
+        let no_forward = "*filter\n:NORTHNARROW_COMBAT - [0:0]\n-A NORTHNARROW_COMBAT -j DROP\n\
+                          -I INPUT 1 -j NORTHNARROW_COMBAT\n-I OUTPUT 1 -j NORTHNARROW_COMBAT\n\
+                          # -I FORWARD 1 -j NORTHNARROW_COMBAT\nCOMMIT\n";
+        assert_eq!(jump_bases(no_forward), vec!["INPUT", "OUTPUT"]);
+    }
+
+    /// Lab follow-up of lab PR 176 (lab PR 188): every binary COMBAT runs is
+    /// on the shipped FIM list, under the name the isolation looks up — the
+    /// `iptables-restore` / `ip6tables-restore` links included, so a link or
+    /// `/etc/alternatives` entry re-pointed at another binary is drift of a
+    /// watched path (the watch follows the chain to its target).
+    #[test]
+    fn the_isolation_binaries_are_on_the_fim_list() {
+        let listed: std::collections::BTreeSet<&str> = crate::fim::paths_config::BUILTIN_PATHS_V1
+            .lines()
+            .map(str::trim)
+            .collect();
+        let iso = NetworkIsolator::new(combat_rules_path()).unwrap();
+        for bin in [
+            &iso.restore_bin,
+            &iso.iptables_bin,
+            &iso.restore_bin_v6,
+            &iso.ip6tables_bin,
+        ] {
+            let Bin::System(name) = bin else {
+                panic!("{bin:?}")
+            };
+            let path = format!("/usr/sbin/{name}");
+            assert!(listed.contains(path.as_str()), "{path} not in fim-paths.v1");
+        }
     }
 
     /// External audit ATP-001 / DEP-003: with the overlay gate, a ruleset
@@ -1139,9 +1425,10 @@ mod tests {
             mock_restore_bin(),
             mock_script(
                 "#!/bin/sh\n\
-                 case \"$1\" in\n\
-                 -S) echo \"-A $2 -j NORTHNARROW_COMBAT\"; echo \"-A $2 -j NORTHNARROW_COMBAT\"; exit 0 ;;\n\
-                 -D) echo 'iptables: Resource temporarily unavailable.' >&2; exit 4 ;;\n\
+                 case \"$1 $2\" in\n\
+                 '-S NORTHNARROW_COMBAT') echo '-A NORTHNARROW_COMBAT -j DROP'; exit 0 ;;\n\
+                 -S*) echo \"-A $2 -j NORTHNARROW_COMBAT\"; echo \"-A $2 -j NORTHNARROW_COMBAT\"; exit 0 ;;\n\
+                 -D*) echo 'iptables: Resource temporarily unavailable.' >&2; exit 4 ;;\n\
                  esac\n\
                  exit 0\n",
             ),

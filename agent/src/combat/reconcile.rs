@@ -11,6 +11,12 @@
 //! failed); the jsonl line stays for compatibility, written through the
 //! directory fd taken at start ([`crate::anchored::anchor`]), `O_NOFOLLOW`,
 //! created `0600` like the other state logs ([`append_line`]).
+//!
+//! Lab follow-up (lab PR 188): the line is written once the state
+//! directory's protection exists, and a missing file is created with the
+//! directory's `chattr +i` lifted for that moment ([`record_line`]). Written
+//! at the teardown with a plain open, it was refused with EPERM whenever the
+//! file did not exist yet.
 
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
@@ -76,6 +82,34 @@ pub fn append_line(path: &Path, rules_removed: usize, cap: u64) -> std::io::Resu
         f.set_len(0)?;
     }
     writeln!(f, "{line}")
+}
+
+/// Lab follow-up (lab PR 188): append the compatibility line, creating the
+/// file the way the agent creates its other state files. The state
+/// directory is `chattr +i` from one run to the next, and `+i` refuses a new
+/// entry to everyone, root and the agent included: an existing file takes
+/// the line directly (a content operation, allowed under `+i`), a missing
+/// one is created inside `protection`'s dance (`+i` lifted for the moment it
+/// takes, restored after — [`crate::anti_tamper::filesystem::StateDirProtection`]).
+/// The agent must be registered with the deny hooks a previous run left
+/// pinned (the early registration and the anti-tamper attach do it, both
+/// before the teardown): the hooks then let it through, and `+i` was what
+/// refused the line in lab PR 180's probe (EPERM, the file missing). The
+/// file stays out of `PROTECTED_INODES`, as before: the signed
+/// `combat_reconcile` row is the evidence.
+pub fn record_line(
+    path: &Path,
+    rules_removed: usize,
+    cap: u64,
+    protection: &dyn crate::chainlog::ProtectionManager,
+) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(append_line(path, rules_removed, cap)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            protection.with_mutable_dir(&mut || Ok(append_line(path, rules_removed, cap)?))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The signed entry for `outcome` (`integrity_drift`, kind
@@ -207,6 +241,96 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the writer must not block on a FIFO");
         assert!(refused);
+    }
+
+    /// A state directory that refuses new entries outside the dance: mode
+    /// 0500, opened to 0700 for the dance only (the shape of `chattr +i`
+    /// for a process without CAP_DAC_OVERRIDE).
+    struct ClosedDir {
+        dir: std::path::PathBuf,
+        dances: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ClosedDir {
+        fn new(dir: &Path) -> Self {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            Self {
+                dir: dir.to_path_buf(),
+                dances: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn dances(&self) -> usize {
+            self.dances.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::chainlog::ProtectionManager for ClosedDir {
+        fn with_mutable_dir(
+            &self,
+            f: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            self.dances
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+            let r = f();
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o500))?;
+            r
+        }
+        fn register_active(&self, _path: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Lab follow-up (lab PR 188): in a directory that takes no new entry
+    /// (the state directory under `chattr +i`), the line used to be refused
+    /// when the file was missing — the lab's "could not write COMBAT
+    /// reconcile audit line … Operation not permitted". It is created inside
+    /// the dance, once; an existing file is appended without one.
+    #[test]
+    fn a_missing_log_is_created_inside_the_state_dir_dance() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root writes into a 0500 directory");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("combat-audit.jsonl");
+        let closed = ClosedDir::new(dir.path());
+        let refused = append_line(&p, 1, CAP_BYTES).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        record_line(&p, 2, CAP_BYTES, &closed).expect("created inside the dance");
+        assert_eq!(closed.dances(), 1);
+        record_line(&p, 3, CAP_BYTES, &closed).expect("appended");
+        assert_eq!(closed.dances(), 1, "an existing file needs no dance");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&p)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["rules_torn_down"], 2);
+        assert_eq!(rows[1]["rules_torn_down"], 3);
+    }
+
+    /// Lab follow-up (lab PR 188): a link at the log path is still refused,
+    /// and the dance is not entered for it.
+    #[test]
+    fn record_line_refuses_a_link_without_a_dance() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        let p = dir.path().join("combat-audit.jsonl");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        let open = ClosedDir {
+            dir: dir.path().to_path_buf(),
+            dances: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(record_line(&p, 1, CAP_BYTES, &open).is_err());
+        assert_eq!(open.dances(), 0);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
     }
 
     #[test]
