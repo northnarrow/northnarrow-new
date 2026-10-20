@@ -24,6 +24,26 @@ path = "src/lib.rs"
 name = "posture_demo"
 required-features = ["posture-demo"]
 
+# External audit WDG-017, WDG-R13, WDG-R14, WDG-R03, WDG-012, WDG-R12,
+# WDG-R15: the ADE measurement examples carry `#[cfg(test)]` tests of what
+# they measure and report; `test = true` makes `cargo test --workspace` run
+# them (the examples themselves need a model and are run by hand).
+[[example]]
+name = "ade_attacks"
+test = true
+
+[[example]]
+name = "ade_with_rag"
+test = true
+
+[[example]]
+name = "bench_threads"
+test = true
+
+[[example]]
+name = "ade_demo"
+test = true
+
 [features]
 default = []
 # Enables R901..=R904, four hardcoded demo rules whose only job is to

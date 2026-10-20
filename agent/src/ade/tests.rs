@@ -1728,6 +1728,56 @@ async fn the_decode_stops_where_the_verdict_object_closes() {
     }
 }
 
+/// External audit WDG-R14 (NN-AUD-380): a verdict that quotes a reasoning
+/// marker (a file name the model echoes) is the model's verdict, with or
+/// without a reasoning block before it: the detector stops at the object's
+/// close and the parser reads the object as the detector does. On the base
+/// code the parser matched the marker inside an object that came first
+/// (no reasoning block): each such output was a malformed one (an
+/// Escalate Tier1).
+#[tokio::test]
+async fn a_reasoning_marker_quoted_in_the_verdict_is_not_a_malformed_output() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let event = spawn_event(4242, "cargo", "/home/u/.cargo/bin/cargo");
+    for quoted in [
+        "/tmp/<think>benign</think>_payload.bin",
+        "/tmp/<think>_payload.bin",
+    ] {
+        for preamble in ["", "<think>weigh it</think>\n"] {
+            let mut v = mock_json(&event);
+            assert_eq!(v["verdict"], "Allow");
+            v["evidence"]["primary_indicators"] = serde_json::json!([format!("filename={quoted}")]);
+            let object = v.to_string();
+            let generated = Arc::new(AtomicUsize::new(0));
+            let backend = StreamingScriptedBackend {
+                output: format!("{preamble}{object}\nmore text"),
+                generated: Arc::clone(&generated),
+            };
+            let prompt = write_temp_prompt();
+            let model = write_temp_model();
+            let cfg = cfg_with(prompt.path(), model.path());
+            let engine = AdeEngine::new_with_backend(cfg, Arc::new(backend))
+                .await
+                .unwrap();
+            let out = engine.evaluate(&event, &ctx_with(vec![])).await.unwrap();
+            let case = format!("{preamble:?} {quoted}");
+            assert_eq!(engine.stats().malformed_outputs, 0, "{case}");
+            assert_eq!(out.verdict, AdeAction::Allow, "{case}");
+            assert_eq!(
+                out.evidence.primary_indicators,
+                vec![format!("filename={quoted}")],
+                "{case}"
+            );
+            assert_eq!(
+                generated.load(Ordering::SeqCst),
+                preamble.chars().count() + object.chars().count(),
+                "{case}"
+            );
+        }
+    }
+}
+
 /// External audit LLMP-005 (NN-AUD-319): a recommended action that differs
 /// from the verdict is aligned on it, and is not a malformed output. On the
 /// base code the verdict carried `Alert` and `Kill`.

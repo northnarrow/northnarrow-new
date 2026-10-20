@@ -932,6 +932,15 @@ Now **killed, or answered, where they were recorded or missed**:
   worker count pinned via RAYON_NUM_THREADS` comes at the start of the
   boot (the variable is set before the runtime, when the ADE may load); an
   operator's `RAYON_NUM_THREADS` is said at INFO.
+- **Reasoning markers inside a verdict** (NN-AUD-380 WDG-R14, lab PR 205).
+  A `<think> … </think>` block is stripped only when it opens before the
+  first `{` of the output, as the decode stop reads it; a marker inside the
+  verdict object (a file name such as `/tmp/<think>x.bin` that the model
+  quotes) is text. Such a verdict used to be refused, an Escalate Tier1
+  `ade_malformed_output` for any file so named. **Regression:** an output
+  that writes a `{` before its `<think>` block is read from that `{` and
+  refused (not expected from Foundation-Sec-Reasoning, whose template does
+  not prefill `<think>`; not measured on a model host).
 - **Tokenizer** (NN-AUD-091 MAIN-006, lab PR 151): Rust `fancy-regex`
   instead of the C Oniguruma library; same pieces and ids on the golden
   corpus, a full prompt in about 7.5 ms instead of 6.

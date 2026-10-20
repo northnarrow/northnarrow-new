@@ -78,7 +78,10 @@ their template via `InferenceBackend::chat_template`:
 
 Foundation-Sec-Reasoning emits a `<think>...</think>` reasoning chain
 before the JSON answer. The parser strips it before `serde_json`
-parsing:
+parsing, when it opens before the first `{` of the output (external
+audit WDG-R14: a `<think>` inside the verdict object, e.g. in a file
+name the model quotes, is text; the streaming detector reads the
+output the same way):
 
 ```
 <think>let me consider the alternatives...</think>
