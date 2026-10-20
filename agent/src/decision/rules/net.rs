@@ -54,10 +54,10 @@
 //! empty blocklists + a fresh burst window for boot + tests.
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, RandomState};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
@@ -127,8 +127,13 @@ pub const NETFLOW_COMM_ALLOWLIST_DEFAULTS: &[&str] = &[
     "yum",
 ];
 
-/// Common-ports allowlist for NN-L-NET-006 / -019: a listener on any
-/// of these ports is NEVER flagged regardless of comm.
+/// Common ports for NN-L-NET-006 / -019: a listener on one of these is
+/// not flagged when its program is one root installed
+/// ([`common_port_service`]).
+///
+/// External audit NETR-015 (NN-AUD-298): the port alone used to exempt
+/// it, so any process of any user serving 8080 or 8443 — a binary from
+/// `/tmp`, `python3 /tmp/x.py` — was never recorded.
 const LISTENER_COMMON_PORTS: &[u16] = &[22, 53, 80, 443, 8080, 8443];
 
 /// Blocked TLD list for NN-L-NET-002. Hard-coded V1.0 set;
@@ -150,6 +155,12 @@ const HIGH_VOLUME_BYTES_SENT: u64 = 100 * 1024 * 1024;
 /// one of these from a non-allowlisted comm is a strong C2 indicator
 /// (T1571 Non-Standard Port). 4444 Metasploit default, 1080 SOCKS,
 /// 6667/6697 IRC (classic botnet C2), 9001 Tor OR.
+///
+/// External audit NETR-015 asked for 443 here too. Not done: this rule
+/// kills, so 443 (or any common port) would kill every client outside the
+/// comm allowlist. C2 over 443 is answered by the destination (-001,
+/// -002), the image (-008), the beacon (-013) and the chains
+/// (NN-L-CHAIN-002/005/007).
 const HIGH_RISK_C2_PORTS: &[u16] = &[4444, 1080, 6667, 6697, 9001];
 
 /// NN-L-NET-011 — plaintext-credential service ports: FTP (21) +
@@ -838,11 +849,13 @@ fn attribute_dns_query(
 // split-resolver host each of those has TWO legs — the originator's own
 // stub query to 127.0.0.53 AND the forwarder's upstream leg, which FP-3
 // back-correlates to the SAME originator. The qname-shape rules
-// (-004 long/base64, -014 entropy) inspect only the qname, so every one
+// (-014 entropy, -004 long name) inspect only the qname, so every one
 // of those events yields an IDENTICAL verdict targeting the originator —
 // the live finding saw ONE `getent` raise 8 NN-L-NET-004 verdicts (4
 // direct+forwarded pairs ~130 ms apart). This layer collapses them: at
-// most ONE verdict per (attributed originator, qname) per window.
+// most ONE verdict per (attributed originator, qname) per window, from
+// the two rules together (external audit NETR-016: [`net_rules`] hands
+// both the same window).
 //
 // Per-qname, NOT per-pid: distinct qnames each still fire, so a DGA
 // spraying many distinct names stays fully visible (that IS the signal),
@@ -858,35 +871,62 @@ fn attribute_dns_query(
 /// seconds later still surfaces.
 const DNS_QNAME_DEDUP_WINDOW_NS: u64 = 2 * 1_000_000_000;
 
-/// Hash a qname to the `u64` half of the dedup key. The qname is dynamic
-/// (unlike FP-4's `&'static` cron-directory bucket), so keying on a hash
-/// keeps the key `Copy` and allocation-free on the hot path — no owned
-/// `String` per suspicious event. `DefaultHasher` is fixed-seeded, so the
-/// mapping is stable within the process; cross-process stability is
-/// irrelevant (the state is in-memory and per-engine). A 64-bit collision
-/// inside one pid's 2 s window is astronomically unlikely.
+/// External audit NETR-012: `(pid, qname)` pairs the dedup window holds
+/// at once.
+pub const DNS_QNAME_DEDUP_MAX_PAIRS: usize = 4096;
+
+/// External audit NETR-012: the keys of [`hash_qname`], drawn once per
+/// process.
+static QNAME_HASH_KEYS: OnceLock<RandomState> = OnceLock::new();
+
+/// Hash a qname (or one of its labels) to a `u64` key half: the dedup
+/// window's, and NN-L-NET-014's corroboration's for the parent domain and
+/// the first label. Keying on a hash keeps the keys `Copy` and
+/// allocation-free on the hot path — no owned `String` per suspicious
+/// event.
+///
+/// External audit NETR-012: this was `DefaultHasher::new()`, SipHash with
+/// fixed keys, so anyone could compute offline a name that collides with
+/// another and have its verdict dropped as a repeat. The keys are now
+/// random, drawn once per process ([`RandomState`]): the mapping is stable
+/// within the process and cannot be computed outside it. The state is
+/// in-memory and per-engine, so nothing needs it stable across restarts.
 fn hash_qname(qname: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    qname.hash(&mut h);
-    h.finish()
+    QNAME_HASH_KEYS
+        .get_or_init(RandomState::new)
+        .hash_one(qname)
 }
 
-/// FP-5 dedup state for the per-qname shape rules (NN-L-NET-004/-014).
+/// FP-5 dedup state for the qname-shape rules (NN-L-NET-004/-014).
 /// Mirrors the [`DnsBurstWindow`] / `CronEditWindow` stateful-rule
 /// precedent: `&mut self` behind an `Arc<Mutex<_>>`, clocked by the
 /// event-carried `timestamp_ns` (no syscall clock — the rule stays a pure
 /// function of the event + its own state).
 ///
-/// Each rule holds its OWN window: a qname that trips both -004 and -014
-/// must still yield one verdict from EACH, so the two rules deliberately
-/// never share a window (no cross-suppression).
-#[derive(Debug, Default)]
+/// External audit NETR-016: the two rules share ONE window
+/// ([`net_rules`]). Since lab PR 140 -014 runs before -004, so when -014
+/// dropped a repeated leg as a duplicate it returned `None` and the
+/// first-match engine handed the leg to -004, which recorded it: two
+/// records per lookup for a long high-entropy name. With one window, a
+/// name either rule answered is not answered again within the window.
+///
+/// External audit NETR-012: the map used to be swept in full on every
+/// call and had no bound but the window. It is swept every
+/// [`STATEFUL_EVICT_EVERY`] calls, a lookup compares the stored time (an
+/// entry past the window never suppresses a verdict), and at
+/// [`DNS_QNAME_DEDUP_MAX_PAIRS`] the pair fired least recently goes
+/// ([`LazyLru`]). Losing a pair costs at most one repeated record, never
+/// a verdict, so the evictions are not counted with the windows' losses
+/// ([`net_window_evictions_total`]).
+#[derive(Default)]
 pub struct DnsQnameDedupWindow {
     /// `(attributed_originator_pid, qname_hash)` → ns of the last verdict
-    /// we FIRED for it. The value is the `u64` hash, not the qname
-    /// `String`, so the key is `Copy` and never allocates.
+    /// FIRED for it. The value is the `u64` hash, not the qname `String`,
+    /// so the key is `Copy` and never allocates.
     last_fired: HashMap<(u32, u64), u64>,
+    /// The pairs of `last_fired`, least recently fired first.
+    order: LazyLru<(u32, u64)>,
+    observes: u32,
 }
 
 impl DnsQnameDedupWindow {
@@ -900,21 +940,43 @@ impl DnsQnameDedupWindow {
     /// repeat inside the window. The window is anchored on the last FIRE
     /// (a suppressed repeat does NOT extend it), so a sustained drip still
     /// surfaces roughly once per [`DNS_QNAME_DEDUP_WINDOW_NS`] rather than
-    /// being silenced outright. Prunes aged pairs on every call, so the
-    /// map only ever holds pairs touched within the last window
-    /// (suspicious qnames are rare — in steady state it is empty).
+    /// being silenced outright.
     pub fn observe(&mut self, pid: u32, qname_hash: u64, ts_ns: u64) -> bool {
-        // Drop pairs whose last fire is older than the window. This both
-        // bounds the map AND makes "present after prune ⇒ still within the
-        // window ⇒ suppress" hold, so the check below is a plain lookup.
-        self.last_fired
-            .retain(|_, &mut last| ts_ns.saturating_sub(last) < DNS_QNAME_DEDUP_WINDOW_NS);
+        let in_window = |last: u64| ts_ns.saturating_sub(last) < DNS_QNAME_DEDUP_WINDOW_NS;
+        self.observes = self.observes.wrapping_add(1);
+        if self.observes % STATEFUL_EVICT_EVERY == 0 {
+            let Self {
+                last_fired, order, ..
+            } = self;
+            last_fired.retain(|k, &mut last| {
+                let keep = in_window(last);
+                if !keep {
+                    order.remove(k);
+                }
+                keep
+            });
+        }
         let key = (pid, qname_hash);
-        if self.last_fired.contains_key(&key) {
-            return false;
+        match self.last_fired.get(&key) {
+            Some(&last) if in_window(last) => return false,
+            Some(_) => {}
+            None => {
+                while self.last_fired.len() >= DNS_QNAME_DEDUP_MAX_PAIRS {
+                    let Some(victim) = self.order.pop_oldest() else {
+                        break;
+                    };
+                    self.last_fired.remove(&victim);
+                }
+            }
         }
         self.last_fired.insert(key, ts_ns);
+        self.order.touch(key);
         true
+    }
+
+    /// Pairs currently held (test/metrics hook).
+    pub fn tracked_pairs(&self) -> usize {
+        self.last_fired.len()
     }
 }
 
@@ -1049,7 +1111,8 @@ impl DnsTunnelCorroboration {
 
 // ── NN-L-NET-004 — Suspicious DNS qname ──────────────────────────────
 
-/// Unusually long DNS qname (> 60 chars), recorded. Per design §7.
+/// Unusually long DNS qname (> 60 chars), or a name sent in pieces,
+/// recorded. Per design §7.
 ///
 /// External audit NETR-002: this rule used to KILL the sender of any name
 /// over 60 characters or whose first label was 20+ characters of the
@@ -1059,21 +1122,32 @@ impl DnsTunnelCorroboration {
 /// `getent`. A label that carries an encoded payload is NN-L-NET-014's
 /// (Shannon entropy over a ≥ 25-char label); length alone is recorded.
 ///
+/// External audit NETR-016: -014 runs first (lab PR 140, PROC-009), so
+/// this rule sees only the names -014 did not answer — a long name whose
+/// first label is under 25 characters or of low entropy, a name sent in
+/// pieces — and shares -014's dedup window, so one lookup gets one
+/// verdict from the two.
+///
 /// FP-3: holds the shared `Arc<DnsCache>` so a forwarded-leg trip can be
-/// back-correlated to the originating process — a `KillProcess` verdict
-/// must never land on the local stub resolver.
+/// back-correlated to the originating process — a verdict is never
+/// attributed to the local stub resolver.
 pub struct NnLNet004SuspiciousDnsQname {
     dns_cache: Arc<DnsCache>,
-    /// FP-5: rule-private dedup of repeated (originator, qname) verdicts.
+    /// FP-5: dedup of repeated (originator, qname) verdicts, shared with
+    /// NN-L-NET-014 in [`net_rules`] (NETR-016).
     dedup: Arc<Mutex<DnsQnameDedupWindow>>,
 }
 
 impl NnLNet004SuspiciousDnsQname {
+    /// The rule with a dedup window of its own (tests).
     pub fn new(dns_cache: Arc<DnsCache>) -> Self {
-        Self {
-            dns_cache,
-            dedup: Arc::new(Mutex::new(DnsQnameDedupWindow::new())),
-        }
+        Self::with_dedup(dns_cache, Arc::new(Mutex::new(DnsQnameDedupWindow::new())))
+    }
+
+    /// External audit NETR-016: the rule over `dedup`, the window
+    /// NN-L-NET-014 holds too.
+    pub fn with_dedup(dns_cache: Arc<DnsCache>, dedup: Arc<Mutex<DnsQnameDedupWindow>>) -> Self {
+        Self { dns_cache, dedup }
     }
 }
 
@@ -1148,6 +1222,8 @@ impl Rule for NnLNet004SuspiciousDnsQname {
         // verdict. Key on the ATTRIBUTED pid so the direct and forwarded
         // legs — both routed to the originator — dedup together; distinct
         // qnames/pids, or the same pair after the window, still fire.
+        // NETR-016: the window is -014's too, so a leg -014 dropped as a
+        // repeat of its own verdict is dropped here as well.
         if !self.dedup.lock().observe(
             attribution.target_pid(),
             hash_qname(query_name),
@@ -1258,19 +1334,89 @@ impl Rule for NnLNet005DnsBurst {
     }
 }
 
+// ── NN-L-NET-006 / -019 — the common-port exemption (NETR-015) ───────
+
+/// External audit NETR-015 (NN-AUD-298): whether a listener on one of the
+/// [`LISTENER_COMMON_PORTS`] is a service a root-owned tree installed
+/// ([`ExecIdentity::is_installed_program`]: the executable, and the script
+/// an interpreter runs, in a system tree), so NN-L-NET-006 and -019 leave
+/// it alone. `None`: not a common port. `Some(false)`: a common port
+/// served by any other program — a binary from `/tmp` or a home,
+/// `python3 /tmp/x.py`, `python3 -m http.server`, a program whose
+/// executable cannot be read — which the rules judge as on any other
+/// port. nginx, sshd or named on their usual ports stay quiet.
+///
+/// The identity is read from the process lineage (the spawn cache, else
+/// `/proc`; the listener record carries no executable). With no lineage
+/// (tests, the boot-time rule set) the record's own `exe` is judged, and
+/// with none either the port alone exempts, as before.
+///
+/// [`ExecIdentity::is_installed_program`]: crate::posture::lineage::ExecIdentity::is_installed_program
+fn common_port_service(
+    nl: &common::wire::NetListenerEvent,
+    lineage: Option<&crate::posture::lineage::AuthSessionTracker>,
+) -> Option<bool> {
+    if !LISTENER_COMMON_PORTS.contains(&nl.bind_port) {
+        return None;
+    }
+    let identity = match lineage {
+        Some(t) => t.exec_identity(nl.pid),
+        None => match nl.exe.as_deref() {
+            Some(exe) => Some(crate::posture::lineage::ExecIdentity {
+                exe: exe.into(),
+                script: None,
+            }),
+            None => return Some(true),
+        },
+    };
+    Some(identity.is_some_and(|id| id.is_installed_program()))
+}
+
+/// Where NN-L-NET-006 / -019 say the listener is: on a common port, why
+/// that did not exempt it (NETR-015).
+fn listener_port_text(nl: &common::wire::NetListenerEvent, common: bool) -> String {
+    if common {
+        format!(
+            "on port {}, a common service port, from a program not installed in a \
+             root-owned system tree (its executable, or the script an interpreter runs, \
+             lies elsewhere or cannot be read)",
+            nl.bind_port
+        )
+    } else {
+        "on an uncommon port".to_string()
+    }
+}
+
 // ── NN-L-NET-006 — New listener on uncommon port ─────────────────────
 
-/// New TCP listener on a port outside the common-ports allowlist
-/// AND from a comm outside the listener-allowlist. Forensic
-/// signal (Q6 lock-in: track every listener; rule-side filter
-/// here).
+/// New TCP listener on a port outside the common ports — or on one of
+/// them from a program outside the root-owned system trees (external
+/// audit NETR-015, [`common_port_service`]) — AND from a comm outside the
+/// listener-allowlist. Forensic signal (Q6 lock-in: track every listener;
+/// rule-side filter here).
 pub struct NnLNet006UncommonListener {
     allowlist: Arc<CommAllowlist>,
+    /// NETR-015: where the common-port exemption reads the listener's
+    /// program. `None`: the record's `exe`.
+    lineage: Option<crate::posture::lineage::AuthSessionTracker>,
 }
 
 impl NnLNet006UncommonListener {
     pub fn new(allowlist: Arc<CommAllowlist>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            lineage: None,
+        }
+    }
+
+    /// External audit NETR-015: the common-port exemption judged on the
+    /// program `lineage` reports for the listener.
+    pub fn with_lineage(
+        mut self,
+        lineage: Option<crate::posture::lineage::AuthSessionTracker>,
+    ) -> Self {
+        self.lineage = lineage;
+        self
     }
 }
 
@@ -1288,7 +1434,8 @@ impl Rule for NnLNet006UncommonListener {
         let Event::NetListener(nl) = event else {
             return None;
         };
-        if LISTENER_COMMON_PORTS.contains(&nl.bind_port) {
+        let common = common_port_service(nl, self.lineage.as_ref());
+        if common == Some(true) {
             return None;
         }
         let judged = self.allowlist.judge(nl.pid, &nl.comm);
@@ -1300,8 +1447,11 @@ impl Rule for NnLNet006UncommonListener {
                 self,
                 ResponseAction::Log,
                 Severity::Medium,
-                "Process opened a TCP listener on an uncommon port \
-             without operator allowlist coverage — posture → ALERTED",
+                &format!(
+                    "Process opened a TCP listener {} without operator allowlist coverage \
+                     — posture → ALERTED",
+                    listener_port_text(nl, common.is_some())
+                ),
                 nl.pid,
                 nl.comm.clone(),
                 nl.timestamp_ns,
@@ -1849,11 +1999,26 @@ impl Rule for NnLNet018Rfc1918LateralPort {
 /// wildcard bind attributes here.
 pub struct NnLNet019WildcardListener {
     allowlist: Arc<CommAllowlist>,
+    /// NETR-015: as NN-L-NET-006's.
+    lineage: Option<crate::posture::lineage::AuthSessionTracker>,
 }
 
 impl NnLNet019WildcardListener {
     pub fn new(allowlist: Arc<CommAllowlist>) -> Self {
-        Self { allowlist }
+        Self {
+            allowlist,
+            lineage: None,
+        }
+    }
+
+    /// External audit NETR-015: as
+    /// [`NnLNet006UncommonListener::with_lineage`].
+    pub fn with_lineage(
+        mut self,
+        lineage: Option<crate::posture::lineage::AuthSessionTracker>,
+    ) -> Self {
+        self.lineage = lineage;
+        self
     }
 
     fn is_wildcard(addr: &IpAddr) -> bool {
@@ -1881,7 +2046,8 @@ impl Rule for NnLNet019WildcardListener {
         if !Self::is_wildcard(&nl.bind_addr) {
             return None;
         }
-        if LISTENER_COMMON_PORTS.contains(&nl.bind_port) {
+        let common = common_port_service(nl, self.lineage.as_ref());
+        if common == Some(true) {
             return None;
         }
         let judged = self.allowlist.judge(nl.pid, &nl.comm);
@@ -1893,9 +2059,11 @@ impl Rule for NnLNet019WildcardListener {
                 self,
                 ResponseAction::Log,
                 Severity::Medium,
-                "New listener bound to the wildcard address on an uncommon \
-             port from a non-allowlisted comm — network-exposed backdoor \
-             surface (T1571); posture → ALERTED",
+                &format!(
+                    "New listener bound to the wildcard address {} from a non-allowlisted \
+                     comm — network-exposed backdoor surface (T1571); posture → ALERTED",
+                    listener_port_text(nl, common.is_some())
+                ),
                 nl.pid,
                 nl.comm.clone(),
                 nl.timestamp_ns,
@@ -2107,13 +2275,19 @@ impl Rule for NnLNet021SensorRecordFlood {
 
 // ── NN-L-NET-014 — DNS qname high-entropy label (tunnelling) ────────
 
-/// DNS-tunnelling refinement (MITRE T1071.004). Where NN-L-NET-004
-/// keys on the *base64 charset* + raw length, this rule measures the
-/// **Shannon entropy** of the leftmost label, so it also catches
-/// hex / base32 / custom-alphabet encodings that 004's charset gate
-/// misses. Encoded/compressed exfil payloads pack near-maximal
-/// per-character entropy; ordinary hostnames (even long CDN ones) sit
-/// well below the threshold.
+/// DNS-tunnelling detector (MITRE T1071.004). It measures the **Shannon
+/// entropy** of the leftmost label (25 characters or more), whatever its
+/// alphabet: hex, base32, base64 or a custom one. Encoded/compressed exfil
+/// payloads pack near-maximal per-character entropy; ordinary hostnames
+/// (even long CDN ones) sit well below the threshold.
+///
+/// External audit NETR-016: since lab PR 140 (PROC-009) this rule runs
+/// before NN-L-NET-004, whatever the name's length. It records a single
+/// high-entropy label and kills the sender of a tunnel's shape
+/// ([`DNS_TUNNEL_DISTINCT_LABELS`] distinct labels under one parent domain
+/// within [`DNS_TUNNEL_WINDOW_NS`]); -004 records the long names and the
+/// names sent in pieces it did not answer. The two share one dedup window
+/// ([`DnsQnameDedupWindow`]), so a lookup's legs give one verdict.
 ///
 /// Unblocked by the Tappa 4.1 DNS observability refit — the kprobe now
 /// extracts the QNAME for connected-UDP resolution (glibc), so this
@@ -2126,9 +2300,8 @@ impl Rule for NnLNet021SensorRecordFlood {
 /// leg must be re-routed to the originator, never the stub resolver.
 pub struct NnLNet014DnsTunnelEntropy {
     dns_cache: Arc<DnsCache>,
-    /// FP-5: rule-private dedup of repeated (originator, qname) verdicts.
-    /// Separate from -004's window — a qname that trips both must still
-    /// raise one verdict from EACH rule.
+    /// FP-5: dedup of repeated (originator, qname) verdicts, shared with
+    /// NN-L-NET-004 in [`net_rules`] (NETR-016).
     dedup: Arc<Mutex<DnsQnameDedupWindow>>,
     /// External audit NETR-002: distinct high-entropy labels per
     /// (originator, parent domain) — the kill needs a tunnel's volume.
@@ -2136,10 +2309,17 @@ pub struct NnLNet014DnsTunnelEntropy {
 }
 
 impl NnLNet014DnsTunnelEntropy {
+    /// The rule with a dedup window of its own (tests).
     pub fn new(dns_cache: Arc<DnsCache>) -> Self {
+        Self::with_dedup(dns_cache, Arc::new(Mutex::new(DnsQnameDedupWindow::new())))
+    }
+
+    /// External audit NETR-016: the rule over `dedup`, the window
+    /// NN-L-NET-004 holds too.
+    pub fn with_dedup(dns_cache: Arc<DnsCache>, dedup: Arc<Mutex<DnsQnameDedupWindow>>) -> Self {
         Self {
             dns_cache,
-            dedup: Arc::new(Mutex::new(DnsQnameDedupWindow::new())),
+            dedup,
             corroboration: Arc::new(Mutex::new(DnsTunnelCorroboration::default())),
         }
     }
@@ -2224,8 +2404,10 @@ impl Rule for NnLNet014DnsTunnelEntropy {
         // FP-5: -014 is a per-qname shape rule (one verdict per scored
         // qname), structurally identical to -004 — the SAME logical-lookup
         // fan-out applies, so dedup it the same way, keyed on the
-        // attributed pid + qname. (-014 owns its window; a qname tripping
-        // both -004 and -014 still fires once per rule.)
+        // attributed pid + qname. NETR-016: the window is -004's too —
+        // the repeated leg this drops falls through to -004, which drops
+        // it as well instead of recording it. A repeat adds no label to
+        // the corroboration, so dropping it before costs the kill nothing.
         if !self.dedup.lock().observe(
             attribution.target_pid(),
             hash_qname(query_name),
@@ -2351,6 +2533,7 @@ pub fn net_rules(
     // fallback and no carve-out.
     lineage: Option<crate::posture::lineage::AuthSessionTracker>,
 ) -> Vec<Box<dyn Rule>> {
+    let dns_shape_dedup = Arc::new(Mutex::new(DnsQnameDedupWindow::new()));
     vec![
         // Critical first.
         Box::new(NnLNet001OutboundToBlockedIp::new(blocklist)),
@@ -2365,8 +2548,16 @@ pub fn net_rules(
         // ahead of -004 and -005, which only record. Behind -004 it never
         // saw a name over 60 characters — most tunnels' — so its
         // corroboration never reached the kill.
-        Box::new(NnLNet014DnsTunnelEntropy::new(Arc::clone(&dns_cache))),
-        Box::new(NnLNet004SuspiciousDnsQname::new(dns_cache)),
+        // External audit NETR-016: one dedup window for the two, so one
+        // lookup's legs give one verdict, not one from each.
+        Box::new(NnLNet014DnsTunnelEntropy::with_dedup(
+            Arc::clone(&dns_cache),
+            Arc::clone(&dns_shape_dedup),
+        )),
+        Box::new(NnLNet004SuspiciousDnsQname::with_dedup(
+            dns_cache,
+            dns_shape_dedup,
+        )),
         Box::new(NnLNet005DnsBurst::new(burst_window)),
         // Tappa 10.5 D4 additions — specific refinements ordered
         // BEFORE the broad Tappa 10 catch-alls (-006 / -007).
@@ -2381,7 +2572,7 @@ pub fn net_rules(
         Box::new(NnLNet018Rfc1918LateralPort::new(Arc::clone(
             &comm_allowlist,
         ))),
-        Box::new(NnLNet008OutboundFromTmpExec::new(lineage)),
+        Box::new(NnLNet008OutboundFromTmpExec::new(lineage.clone())),
         Box::new(NnLNet011PlaintextCredService::new(Arc::clone(
             &comm_allowlist,
         ))),
@@ -2389,14 +2580,17 @@ pub fn net_rules(
             beacon_window,
             Arc::clone(&comm_allowlist),
         )),
-        Box::new(NnLNet019WildcardListener::new(Arc::clone(&comm_allowlist))),
+        Box::new(
+            NnLNet019WildcardListener::new(Arc::clone(&comm_allowlist))
+                .with_lineage(lineage.clone()),
+        ),
         // Review 78: no comm allowlist — the kernel exempts the resolvers.
         Box::new(NnLNet020DnsQueryFlood::new()),
         // External audit EBPF-013: no comm allowlist either — the budget
         // keeps every real listener and ring creation.
         Box::new(NnLNet021SensorRecordFlood::new()),
         // Broad Tappa 10 catch-alls last among the comm-gated rules.
-        Box::new(NnLNet006UncommonListener::new(Arc::clone(&comm_allowlist))),
+        Box::new(NnLNet006UncommonListener::new(Arc::clone(&comm_allowlist)).with_lineage(lineage)),
         Box::new(NnLNet007Rfc1918FromUnusualProc::new(Arc::clone(
             &comm_allowlist,
         ))),
@@ -3129,19 +3323,86 @@ mod tests {
         assert_eq!(fired, 1, "-014 collapses the A+AAAA+retry burst too");
     }
 
-    /// FP-5 — -004 and -014 hold SEPARATE dedup windows: a qname that
-    /// trips both still yields one verdict from EACH (no cross-suppression).
+    /// External audit NETR-016 (this test said the reverse before): -004
+    /// and -014 share ONE dedup window in [`net_rules`]. A qname that trips
+    /// both is answered by -014, which runs first; the next leg, which -014
+    /// drops as a repeat and the first-match engine hands to -004, is
+    /// dropped there too instead of becoming a second record.
     #[test]
-    fn fp5_004_and_014_do_not_cross_suppress() {
-        let r4 = net_004();
-        let r14 = net_014();
+    fn fp5_004_and_014_share_one_window() {
+        let cache = Arc::new(DnsCache::default());
+        let window = Arc::new(Mutex::new(DnsQnameDedupWindow::new()));
+        let r14 = NnLNet014DnsTunnelEntropy::with_dedup(Arc::clone(&cache), Arc::clone(&window));
+        let r4 = NnLNet004SuspiciousDnsQname::with_dedup(cache, window);
         // First label is long (>60 total) AND high-entropy → trips both.
         let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6.exfil.example.com";
-        let e = dns_event_full(1122, q, 1, "getent", Some("/usr/bin/getent"), 0);
-        assert!(r4.evaluate(&e).is_some(), "-004 fires");
+        let leg = |ts| dns_event_full(1122, q, 1, "getent", Some("/usr/bin/getent"), ts);
+        assert!(r14.evaluate(&leg(0)).is_some(), "-014 answers the lookup");
+        assert!(r14.evaluate(&leg(5_000_000)).is_none(), "its repeat leg");
         assert!(
-            r14.evaluate(&e).is_some(),
-            "-014 fires on the same event — the windows are independent"
+            r4.evaluate(&leg(5_000_000)).is_none(),
+            "-004 does not record the leg -014 dropped"
+        );
+        // Each rule alone still records the name (separate windows).
+        assert!(net_004().evaluate(&leg(0)).is_some());
+        assert!(net_014().evaluate(&leg(0)).is_some());
+    }
+
+    // ── External audit NETR-012 — keyed hash, bounded dedup window ──────
+
+    /// The qname hash is keyed per process: not the fixed-key mapping
+    /// anyone can compute offline (`DefaultHasher::new()`), stable within
+    /// the process, different under other keys.
+    #[test]
+    fn qname_hash_is_keyed_per_process() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        for q in [
+            "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6.exfil.example.com",
+            "example.com",
+            "",
+        ] {
+            let mut fixed = DefaultHasher::new();
+            q.hash(&mut fixed);
+            assert_ne!(hash_qname(q), fixed.finish(), "fixed keys for {q:?}");
+            assert_eq!(hash_qname(q), hash_qname(q), "stable for {q:?}");
+            let (a, b) = (RandomState::new(), RandomState::new());
+            assert_ne!(a.hash_one(q), b.hash_one(q), "two key sets for {q:?}");
+        }
+    }
+
+    /// A spray of distinct suspicious names keeps the window at its cap;
+    /// a repeat inside the window is still dropped, one after it fires,
+    /// and the periodic sweep empties what the window left behind.
+    #[test]
+    fn dedup_window_is_bounded_under_a_name_spray() {
+        let mut w = DnsQnameDedupWindow::new();
+        let t0 = 1_000_000_000u64;
+        let n = 100_000u64;
+        for i in 0..n {
+            assert!(w.observe(7, hash_qname(&format!("{i}.spray.example")), t0 + i));
+        }
+        assert_eq!(w.tracked_pairs(), DNS_QNAME_DEDUP_MAX_PAIRS);
+        let last = hash_qname(&format!("{}.spray.example", n - 1));
+        let t_last = t0 + n - 1;
+        assert!(!w.observe(7, last, t_last + 1), "a repeat inside 2 s");
+        assert!(
+            !w.observe(7, last, t_last + DNS_QNAME_DEDUP_WINDOW_NS - 1),
+            "still inside"
+        );
+        assert!(
+            w.observe(7, last, t_last + DNS_QNAME_DEDUP_WINDOW_NS),
+            "a repeat after 2 s fires"
+        );
+        // Past the window, the next sweep drops every stale pair.
+        let later = t_last + 3 * DNS_QNAME_DEDUP_WINDOW_NS;
+        for i in 0..u64::from(STATEFUL_EVICT_EVERY) {
+            w.observe(8, hash_qname(&format!("{i}.later.example")), later);
+        }
+        assert!(
+            w.tracked_pairs() <= STATEFUL_EVICT_EVERY as usize,
+            "{}",
+            w.tracked_pairs()
         );
     }
 
@@ -3856,6 +4117,153 @@ mod tests {
             .is_none());
     }
 
+    // ── External audit NETR-015 — the common-port exemption ─────────
+
+    /// A lineage that saw `execs` (pid, exe, argv) executed; any other pid
+    /// has no readable executable.
+    fn lineage_of(
+        execs: &[(u32, &str, &[&str])],
+    ) -> (
+        tempfile::TempDir,
+        crate::posture::lineage::AuthSessionTracker,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let t = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        for (pid, exe, argv) in execs {
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            t.ingest_spawn_with_argv(*pid, 1, exe, &argv, 1);
+        }
+        (tmp, t)
+    }
+
+    /// The production rule set over `lineage`: the allowlist judged on
+    /// exec identity, as `default_rules_with_net` builds it.
+    fn rules_over(lineage: &crate::posture::lineage::AuthSessionTracker) -> Vec<Box<dyn Rule>> {
+        net_rules(
+            Arc::new(NetBlocklist::empty()),
+            Arc::new(Ja3Blocklist::empty()),
+            Arc::new(Mutex::new(DnsBurstWindow::new())),
+            Arc::new(al().as_ref().clone().with_identity(lineage.clone())),
+            Arc::new(Mutex::new(BeaconWindow::new())),
+            Arc::new(DnsCache::default()),
+            Some(lineage.clone()),
+        )
+    }
+
+    fn listener_of(pid: u32, addr: IpAddr, port: u16, comm: &str) -> Event {
+        let mut e = listener_bind(addr, port, comm);
+        if let Event::NetListener(nl) = &mut e {
+            nl.pid = pid;
+            // As the drain fills it: the listener record names no image.
+            nl.exe = None;
+        }
+        e
+    }
+
+    /// External audit NETR-015: a program outside the root-owned trees on
+    /// 8080 or 8443 — a staging image, a script from `/tmp`, a module run
+    /// with `-m`, one named like nginx, one whose image cannot be read —
+    /// is recorded by -019 (wildcard) or -006 (loopback), as on any other
+    /// port. Before, the port alone exempted it.
+    #[test]
+    fn a_common_port_listener_from_a_staging_image_is_recorded() {
+        let (_tmp, lineage) = lineage_of(&[
+            (700, "/tmp/backdoor", &["/tmp/backdoor"]),
+            (701, "/usr/bin/python3.12", &["python3", "/tmp/x.py"]),
+            (
+                702,
+                "/usr/bin/python3.12",
+                &["python3", "-m", "http.server", "8080"],
+            ),
+            (703, "/tmp/nginx", &["nginx"]),
+            (
+                704,
+                "/home/dev/.nvm/versions/node/v22.11.0/bin/node",
+                &["node", "server.js"],
+            ),
+        ]);
+        let rules = rules_over(&lineage);
+        for (pid, comm) in [
+            (700, "backdoor"),
+            (701, "python3"),
+            (702, "python3"),
+            (703, "nginx"),
+            (704, "node"),
+            (799, "gone"),
+        ] {
+            for port in [8080, 8443, 80] {
+                for (addr, rule) in [
+                    (v4(0, 0, 0, 0), "NN-L-NET-019_WildcardListener"),
+                    (v4(127, 0, 0, 1), "NN-L-NET-006_UncommonListener"),
+                ] {
+                    let v = first_match(&rules, &listener_of(pid, addr, port, comm))
+                        .unwrap_or_else(|| panic!("pid {pid} {comm} on {addr}:{port}"));
+                    assert_eq!(v.rule_id, rule, "pid {pid} on {addr}:{port}");
+                    assert_eq!(v.action, ResponseAction::Log);
+                    assert_eq!(v.severity, Severity::Medium);
+                    assert!(
+                        v.reasoning
+                            .contains(&format!("on port {port}, a common service port")),
+                        "{}",
+                        v.reasoning
+                    );
+                }
+            }
+        }
+    }
+
+    /// External audit NETR-015: a program a root-owned tree installed stays
+    /// quiet on its usual port, whatever its name; and on an uncommon port
+    /// nothing changed.
+    #[test]
+    fn a_system_daemon_on_a_common_port_is_quiet() {
+        let (_tmp, lineage) = lineage_of(&[
+            (800, "/usr/sbin/nginx", &["nginx"]),
+            (801, "/usr/sbin/sshd", &["sshd"]),
+            (
+                802,
+                "/usr/bin/python3.12",
+                &["python3", "/usr/bin/gunicorn"],
+            ),
+            (804, "/tmp/backdoor", &["/tmp/backdoor"]),
+        ]);
+        let rules = rules_over(&lineage);
+        for (pid, port, comm) in [
+            (800, 8080, "nginx"),
+            (800, 443, "nginx"),
+            (801, 22, "sshd"),
+            (802, 8443, "gunicorn"),
+        ] {
+            for addr in [v4(0, 0, 0, 0), v4(127, 0, 0, 1)] {
+                assert!(
+                    first_match(&rules, &listener_of(pid, addr, port, comm)).is_none(),
+                    "pid {pid} {comm} on {addr}:{port}"
+                );
+            }
+        }
+        // An uncommon port: the allowlist decides, as before.
+        assert!(first_match(&rules, &listener_of(800, v4(0, 0, 0, 0), 9999, "nginx")).is_none());
+        let v = first_match(&rules, &listener_of(804, v4(0, 0, 0, 0), 9999, "backdoor"))
+            .expect("recorded");
+        assert!(
+            v.reasoning.contains("on an uncommon port"),
+            "{}",
+            v.reasoning
+        );
+        // Without a lineage (tests, the boot-time set) the record's own
+        // image is judged; with none either, the port exempts as before.
+        let r = NnLNet019WildcardListener::new(al());
+        let mut e = listener_bind(v4(0, 0, 0, 0), 8080, "backdoor");
+        if let Event::NetListener(nl) = &mut e {
+            nl.exe = Some("/tmp/backdoor".into());
+        }
+        assert!(r.evaluate(&e).is_some());
+        if let Event::NetListener(nl) = &mut e {
+            nl.exe = None;
+        }
+        assert!(r.evaluate(&e).is_none());
+    }
+
     // ── NN-L-NET-013 — beacon detector (bespoke stateful pairs) ─────
 
     const SEC: u64 = 1_000_000_000;
@@ -4269,6 +4677,134 @@ mod tests {
         .expect("recorded");
         assert_eq!(v.rule_id, "NN-L-NET-004_SuspiciousDnsQname");
         assert_eq!(v.action, ResponseAction::Log);
+    }
+
+    // ── External audit NETR-016 / NETR-011 — the DNS name-shape family ──
+
+    /// External audit NETR-016: one `getent` on a split-resolver host —
+    /// A and AAAA, each as the originator's stub query and the resolver's
+    /// forwarded leg, and a retry — gives ONE verdict from -014 and -004
+    /// together, attributed to the originator. For a long high-entropy
+    /// name it gave two: -014 dropped the repeat legs, and the first-match
+    /// engine handed one of them to -004, which recorded it.
+    #[test]
+    fn one_lookup_fanout_yields_one_dns_shape_verdict() {
+        let cache = Arc::new(DnsCache::default());
+        let rules = net_rules(
+            Arc::new(NetBlocklist::empty()),
+            Arc::new(Ja3Blocklist::empty()),
+            Arc::new(Mutex::new(DnsBurstWindow::new())),
+            al(),
+            Arc::new(Mutex::new(BeaconWindow::new())),
+            Arc::clone(&cache),
+            None,
+        );
+        let names = [
+            // long AND a high-entropy first label: both shapes
+            (
+                "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6.exfil.example.com",
+                "NN-L-NET-014_DnsTunnelEntropy",
+            ),
+            // long only
+            (
+                "www.internal-payments-api-production.eu-west-1.elb.amazonaws.com",
+                "NN-L-NET-004_SuspiciousDnsQname",
+            ),
+            // a high-entropy label in a short name
+            (
+                "q7v3k9x2m4p8r6t1w5y0z3b7c9d2.example.com",
+                "NN-L-NET-014_DnsTunnelEntropy",
+            ),
+        ];
+        for (n, (q, rule)) in names.iter().enumerate() {
+            let t = (n as u64 + 1) * 10 * DNS_QNAME_DEDUP_WINDOW_NS;
+            // (stub leg?, qtype, offset): getent's A and AAAA, the
+            // resolver forwarding each, and an A retry with its leg.
+            let legs = [
+                (true, 1u16, 0u64),
+                (true, 28, 5_000_000),
+                (false, 1, 6_000_000),
+                (false, 28, 11_000_000),
+                (true, 1, 130_000_000),
+                (false, 1, 131_000_000),
+            ];
+            let mut verdicts = Vec::new();
+            for (stub, qtype, off) in legs {
+                let ts = t + off;
+                let e = if stub {
+                    cache.on_dns_query(1122, q.to_string(), qtype, [127, 0, 0, 53].into(), ts);
+                    dns_event_full(1122, q, qtype, "getent", Some("/usr/bin/getent"), ts)
+                } else {
+                    dns_event_full(673, q, qtype, "systemd-resolved", Some(RESOLVER_EXE), ts)
+                };
+                verdicts.extend(first_match(&rules, &e));
+            }
+            let got: Vec<_> = verdicts
+                .iter()
+                .map(|v| (v.rule_id.as_str(), v.event_pid))
+                .collect();
+            assert_eq!(got, [(*rule, 1122)], "{q}");
+        }
+    }
+
+    /// External audit NETR-016: a hex label (4 bits per character, outside
+    /// the base64-shaped gate -004 once had) is -014's, in a long name as in
+    /// a short one: -004 never answers it first.
+    #[test]
+    fn a_hex_label_is_answered_by_014_first() {
+        let rules = net_rules_empty();
+        let hex = "0123456789abcdef".repeat(2);
+        for (i, q) in [
+            format!("{hex}.exfil.attacker-tunnel.example.com"),
+            format!("{hex}.t.example"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let v = first_match(&rules, &dns_event(50 + i as u32, q, 1)).expect("answered");
+            assert_eq!(v.rule_id, "NN-L-NET-014_DnsTunnelEntropy", "{q}");
+            assert_eq!(v.action, ResponseAction::Log, "{q}");
+        }
+    }
+
+    /// External audit NETR-011 (fixed in lab PR 140; the audit's case): a
+    /// process already over NN-L-NET-005's TXT burst threshold still gets
+    /// -014's tunnel kill — the burst record never stands in for it.
+    #[test]
+    fn a_txt_burst_never_shadows_the_tunnel_kill() {
+        let rules = net_rules_empty();
+        let mut burst = 0;
+        for i in 0..60u64 {
+            let e = dns_event_full(
+                61,
+                &format!("t{i}.example.com"),
+                DNS_QTYPE_TXT,
+                "curl",
+                Some("/usr/bin/curl"),
+                1 + i,
+            );
+            if first_match(&rules, &e).is_some_and(|v| v.rule_id == "NN-L-NET-005_DnsTxtNullBurst")
+            {
+                burst += 1;
+            }
+        }
+        assert!(burst > 0, "the burst is recorded");
+        let mut last = None;
+        for i in 0..DNS_TUNNEL_DISTINCT_LABELS {
+            let q = format!("{i:02}q7v3k9x2m4p8r6t1w5y0z3b7c9d2f4h6.t.attacker-tunnel.example");
+            let e = dns_event_full(
+                61,
+                &q,
+                DNS_QTYPE_TXT,
+                "curl",
+                Some("/usr/bin/curl"),
+                100 + i as u64,
+            );
+            let v = first_match(&rules, &e).expect("answered");
+            assert_eq!(v.rule_id, "NN-L-NET-014_DnsTunnelEntropy", "{q}");
+            last = Some(v.action);
+        }
+        assert_eq!(last, Some(ResponseAction::KillProcess));
     }
 
     /// External audit NET-019: every NetFlow verdict that kills is on a
