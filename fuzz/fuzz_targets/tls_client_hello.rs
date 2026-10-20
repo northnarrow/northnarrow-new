@@ -12,8 +12,10 @@ use northnarrow_agent::net::tls_parser::{
     compute_ja3, compute_ja3_raw, compute_ja4, parse_client_hello,
 };
 
+/// RFC 8701 §2: the sixteen values 0x0A0A, 0x1A1A, …, 0xFAFA (both bytes
+/// equal, low nibble A), written out here rather than taken from the parser.
 fn is_grease(v: u16) -> bool {
-    (v & 0x0F0F) == 0x0A0A
+    (v & 0x0F0F) == 0x0A0A && (v >> 8) == (v & 0xFF)
 }
 
 fn count(field: &str) -> usize {

@@ -442,12 +442,22 @@ fn is_local_stub(server: &IpAddr) -> bool {
 // RFC 1035 wire format walker. V1.0 doesn't have a DNS-response
 // observer; these parsers ship now as a standalone utility so the
 // V1.1 commit that wires up the observer is a pure plumbing change.
+// Kept, not deleted, though nothing in production calls it (external
+// audit NET-013, NET-015): the `dns_records` fuzz target exercises it,
+// and it now reads names as the system resolver does, so the observer
+// that lands on it inherits a conforming parser.
 //
 // We handle:
 //   * the 12-byte header,
 //   * a single QUESTION section (compressed-name + qtype + qclass),
 //   * the ANSWER section with name (label OR pointer per §4.1.4),
 //     16-bit TYPE / CLASS, 32-bit TTL, 16-bit RDLENGTH, RDATA.
+//
+// Names are held to RFC 1035: a length octet is a label (top bits
+// `00`, so at most 63 bytes) or a pointer (`11`) into the message; `01`
+// and `10` are reserved and refused; a name is at most 255 octets on
+// the wire (external audit NET-015, NN-AUD-334). Read past, they would
+// shift the walk off the records the resolver applies.
 //
 // We DON'T handle:
 //   * Multi-question messages (V1.0+ resolvers always send 1
@@ -466,6 +476,16 @@ const DNS_HEADER_LEN: usize = 12;
 /// next byte together encode a 14-bit offset to elsewhere in
 /// the message.
 const DNS_NAME_POINTER_MASK: u8 = 0xC0;
+/// The top two bits of a length octet: `00` label, `11` pointer, `01`
+/// and `10` reserved (RFC 1035 §4.1.4; the `01` extended labels of
+/// RFC 2671 are deprecated by RFC 6891 §5).
+const DNS_LABEL_KIND_MASK: u8 = 0xC0;
+/// RFC 1035 §2.3.4 / §3.1: a name is at most 255 octets in wire form,
+/// its length octets and the root label included.
+const DNS_MAX_NAME_WIRE_LEN: usize = 255;
+/// The shortest resource record: a one-octet name (the root, or half of
+/// nothing — a pointer is two) and TYPE, CLASS, TTL, RDLENGTH.
+const DNS_MIN_RR_LEN: usize = 1 + 2 + 2 + 4 + 2;
 
 /// Parser cursor + state. Wraps the byte stream so the
 /// `advance_*` helpers stay bounded — every helper rejects
@@ -480,8 +500,15 @@ impl<'a> DnsPacket<'a> {
         Self { bytes, pos: 0 }
     }
 
+    /// Bytes left after `pos`. The bounds are `need > remaining()`, as in
+    /// the TLS parser's cursor: `pos + need` can wrap (external audit
+    /// NET-015).
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
     fn read_u16(&mut self) -> Option<u16> {
-        if self.pos + 2 > self.bytes.len() {
+        if 2 > self.remaining() {
             return None;
         }
         let v = u16::from_be_bytes([self.bytes[self.pos], self.bytes[self.pos + 1]]);
@@ -490,7 +517,7 @@ impl<'a> DnsPacket<'a> {
     }
 
     fn read_u32(&mut self) -> Option<u32> {
-        if self.pos + 4 > self.bytes.len() {
+        if 4 > self.remaining() {
             return None;
         }
         let v = u32::from_be_bytes([
@@ -504,7 +531,7 @@ impl<'a> DnsPacket<'a> {
     }
 
     fn read_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.pos + n > self.bytes.len() {
+        if n > self.remaining() {
             return None;
         }
         let b = &self.bytes[self.pos..self.pos + n];
@@ -519,31 +546,41 @@ impl<'a> DnsPacket<'a> {
     ///     earlier name in the message — consumes 2 bytes and
     ///     advances no further (we don't follow the pointer
     ///     because we don't need the decoded name for A/AAAA
-    ///     RDATA).
+    ///     RDATA), but it must point inside the message.
+    ///
+    /// `None` for a reserved length octet (`0x40..=0xBF`: a label over
+    /// 63 bytes or the `01` / `10` prefixes), a name over 255 octets, or
+    /// a read past the message (external audit NET-015, NN-AUD-334).
     fn skip_name(&mut self) -> Option<()> {
+        let mut wire_len = 0usize;
         loop {
-            if self.pos >= self.bytes.len() {
-                return None;
-            }
-            let b = self.bytes[self.pos];
-            if b == 0 {
-                self.pos += 1;
-                return Some(());
-            }
-            if (b & DNS_NAME_POINTER_MASK) == DNS_NAME_POINTER_MASK {
-                // 2-byte pointer; we don't follow it.
-                if self.pos + 2 > self.bytes.len() {
-                    return None;
+            let b = *self.bytes.get(self.pos)?;
+            match b & DNS_LABEL_KIND_MASK {
+                0x00 => {
+                    // Label: 1-byte length (at most 63 by its prefix) +
+                    // that many bytes; the zero length is the root.
+                    let label_len = b as usize;
+                    wire_len += 1 + label_len;
+                    if wire_len > DNS_MAX_NAME_WIRE_LEN || 1 + label_len > self.remaining() {
+                        return None;
+                    }
+                    self.pos += 1 + label_len;
+                    if label_len == 0 {
+                        return Some(());
+                    }
                 }
-                self.pos += 2;
-                return Some(());
+                DNS_NAME_POINTER_MASK => {
+                    // 2-byte pointer; we don't follow it.
+                    let lo = *self.bytes.get(self.pos + 1)?;
+                    let offset = (usize::from(b & !DNS_LABEL_KIND_MASK) << 8) | usize::from(lo);
+                    if offset >= self.bytes.len() {
+                        return None;
+                    }
+                    self.pos += 2;
+                    return Some(());
+                }
+                _ => return None,
             }
-            // Plain label: 1-byte length + that many bytes.
-            let label_len = b as usize;
-            if self.pos + 1 + label_len > self.bytes.len() {
-                return None;
-            }
-            self.pos += 1 + label_len;
         }
     }
 }
@@ -612,8 +649,10 @@ fn try_parse_answers(packet: &[u8]) -> Option<Vec<DnsAnswer>> {
         let _qtype = p.read_u16()?;
         let _qclass = p.read_u16()?;
     }
-    // Parse ANSWER section.
-    let mut out = Vec::with_capacity(ancount as usize);
+    // Parse ANSWER section. External audit NET-013 (NN-AUD-332):
+    // `ancount` comes off the wire; sized by it, a 12-byte message
+    // reserved over a megabyte.
+    let mut out = Vec::with_capacity(answer_capacity(ancount, p.remaining()));
     for _ in 0..ancount {
         p.skip_name()?;
         let rtype = p.read_u16()?;
@@ -634,6 +673,11 @@ fn try_parse_answers(packet: &[u8]) -> Option<Vec<DnsAnswer>> {
         });
     }
     Some(out)
+}
+
+/// The answers `remaining` bytes can hold, at most `ancount`.
+fn answer_capacity(ancount: u16, remaining: usize) -> usize {
+    usize::from(ancount).min(remaining / DNS_MIN_RR_LEN)
 }
 
 #[cfg(test)]
@@ -826,6 +870,103 @@ mod tests {
         let pkt = build_response_aaaa("example.com", v6);
         assert_eq!(parse_aaaa_records(&pkt), vec![v6]);
         assert!(parse_a_records(&pkt).is_empty());
+    }
+
+    /// A response for `1.2.3.4` whose question and answer names are
+    /// `name_wire` (raw wire bytes, root label included).
+    fn response_with_name(name_wire: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        write_header(&mut p, 1);
+        p.extend_from_slice(name_wire);
+        p.extend_from_slice(&1u16.to_be_bytes()); // qtype=A
+        p.extend_from_slice(&1u16.to_be_bytes()); // qclass=IN
+        p.extend_from_slice(name_wire);
+        p.extend_from_slice(&1u16.to_be_bytes()); // type=A
+        p.extend_from_slice(&1u16.to_be_bytes()); // class=IN
+        p.extend_from_slice(&60u32.to_be_bytes()); // ttl
+        p.extend_from_slice(&4u16.to_be_bytes()); // rdlen
+        p.extend_from_slice(&[1, 2, 3, 4]);
+        p
+    }
+
+    /// Wire form of labels of the given lengths (filled with `a`), then
+    /// the root label.
+    fn name_of_labels(lengths: &[u8]) -> Vec<u8> {
+        let mut n = Vec::new();
+        for &len in lengths {
+            n.push(len);
+            n.extend(std::iter::repeat_n(b'a', usize::from(len)));
+        }
+        n.push(0);
+        n
+    }
+
+    /// External audit NET-015 (NN-AUD-334): a length octet with the
+    /// reserved prefixes `01` and `10` is refused, not read as a label of
+    /// up to 191 bytes — the walk would leave the records the resolver
+    /// applies. The same packet with a legal label parses.
+    #[test]
+    fn reserved_label_prefix_is_rejected() {
+        let ok = response_with_name(&name_of_labels(&[7, 3]));
+        assert_eq!(parse_a_records(&ok), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+        for prefix in [0x41u8, 0x7F, 0x80, 0xBF] {
+            let name = name_of_labels(&[prefix]);
+            let pkt = response_with_name(&name);
+            assert!(parse_a_records(&pkt).is_empty(), "{prefix:#04x}");
+            assert!(try_parse_answers(&pkt).is_none(), "{prefix:#04x}");
+        }
+    }
+
+    /// External audit NET-015: a label is at most 63 bytes (64 is the
+    /// first value of the reserved `01` prefix) and a name at most 255
+    /// octets on the wire.
+    #[test]
+    fn label_over_63_is_rejected() {
+        let max_label = response_with_name(&name_of_labels(&[63]));
+        assert_eq!(parse_a_records(&max_label).len(), 1);
+        let over = response_with_name(&name_of_labels(&[64]));
+        assert!(parse_a_records(&over).is_empty());
+
+        // 3 × (1 + 63) + (1 + 62) + 1 = 256 octets; one byte less is 255.
+        let too_long = response_with_name(&name_of_labels(&[63, 63, 63, 62]));
+        assert!(parse_a_records(&too_long).is_empty());
+        let longest = response_with_name(&name_of_labels(&[63, 63, 63, 61]));
+        assert_eq!(parse_a_records(&longest).len(), 1);
+    }
+
+    /// A compressed answer name (`0xC00C`, the question's name: the usual
+    /// response form) parses; a pointer outside the message does not.
+    #[test]
+    fn answer_name_pointers_must_point_inside_the_message() {
+        let mut pkt = build_response_a("example.com", Ipv4Addr::new(9, 9, 9, 9));
+        let answer_at = DNS_HEADER_LEN + "example.com".len() + 2 + 4;
+        let rest = pkt.split_off(answer_at + "example.com".len() + 2);
+        pkt.truncate(answer_at);
+        pkt.extend_from_slice(&[0xC0, 0x0C]);
+        pkt.extend_from_slice(&rest);
+        assert_eq!(parse_a_records(&pkt), vec![Ipv4Addr::new(9, 9, 9, 9)]);
+        pkt[answer_at..answer_at + 2].copy_from_slice(&[0xFF, 0xFF]);
+        assert!(parse_a_records(&pkt).is_empty());
+    }
+
+    /// External audit NET-013 (NN-AUD-332): the answer vector is sized by
+    /// what the message can hold, not by `ancount`. A 12-byte header
+    /// claiming 65,535 answers reserves nothing; a short message claiming
+    /// them is malformed.
+    #[test]
+    fn huge_ancount_in_a_short_packet_allocates_little() {
+        assert_eq!(answer_capacity(u16::MAX, 0), 0);
+        assert_eq!(answer_capacity(u16::MAX, 3 * DNS_MIN_RR_LEN + 10), 3);
+        assert_eq!(answer_capacity(2, 4096), 2);
+
+        let mut header_only = vec![0u8; DNS_HEADER_LEN];
+        header_only[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(parse_a_records(&header_only).is_empty());
+        assert!(try_parse_answers(&header_only).is_none());
+
+        let mut one_answer = build_response_a("example.com", Ipv4Addr::new(1, 1, 1, 1));
+        one_answer[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(parse_a_records(&one_answer).is_empty());
     }
 
     /// N4 test #6 — concurrent insert/lookup is safe. Spawn N
