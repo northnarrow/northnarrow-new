@@ -34,6 +34,10 @@
 //! (`mountinfo_unreadable`); a mount laid after the start over a directory
 //! above the agent's paths is reported like one on the paths themselves
 //! ([`mount_round`]).
+//!
+//! Lab PR 184 (external audit DEP-005): where the unit's memory cap is at
+//! or above the host's memory, the agent raises its own `oom_score_adj` to
+//! 0 at boot ([`relax_oom_score_adj`]), and the limits round expects 0 there.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -776,13 +780,7 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
             v.push((LIMIT_WATCHDOG_OOM.to_string(), x));
         }
     }
-    if let Some(cg) = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
-        })
-    {
+    if let Some(cg) = own_cgroup() {
         // External audit NN-AUD-113: the path itself, so a move to another
         // cgroup (the root has none of the files below) is drift.
         v.push((LIMIT_CGROUP.to_string(), cg.clone()));
@@ -929,6 +927,114 @@ fn systemd_bytes(v: &str) -> Option<String> {
         .map(|b| b.to_string())
 }
 
+/// `MemTotal` of `/proc/meminfo` (reported in kB), in bytes.
+fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| {
+        let kb: u64 = l
+            .strip_prefix("MemTotal:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kb.saturating_mul(1024))
+    })
+}
+
+fn mem_total_bytes() -> Option<u64> {
+    parse_mem_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// The agent's own cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
+fn own_cgroup() -> Option<String> {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("0::").map(str::to_string))
+}
+
+/// External audit DEP-005 (NN-AUD-381): does the agent's memory cap bind
+/// on this host? `memory_max` as the cgroup file shows it (bytes, or
+/// `max`). The unit's `MemoryMax=` is an absolute size, sized for the
+/// model (11G); at or above the host's memory (`MemTotal`) the cgroup's
+/// own OOM killer can never fire before the host's does.
+pub fn memory_cap_binds(memory_max: &str, mem_total_bytes: u64) -> bool {
+    memory_max
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|cap| cap < mem_total_bytes)
+}
+
+/// The `oom_score_adj` the agent runs with where its cap does not bind:
+/// the unit's value raised to 0, never lowered.
+fn relaxed_oom_adj(unit_adj: i32) -> i32 {
+    unit_adj.max(0)
+}
+
+/// External audit DEP-005: the `oom_score_adj` to write at boot, if any.
+/// Only in the unit's own cgroup, where the unit set both values; with any
+/// input unreadable, nothing (the unit's value stands, and so does the
+/// check's expectation).
+fn boot_oom_adj(
+    cgroup: Option<&str>,
+    memory_max: Option<&str>,
+    mem_total: Option<u64>,
+    current: Option<i32>,
+) -> Option<i32> {
+    if cgroup? != AGENT_UNIT_CGROUP || memory_cap_binds(memory_max?, mem_total?) {
+        return None;
+    }
+    let current = current?;
+    let relaxed = relaxed_oom_adj(current);
+    (relaxed != current).then_some(relaxed)
+}
+
+/// External audit DEP-005 (NN-AUD-381), at the agent's start: where the
+/// unit's memory cap cannot bind, `OOMScoreAdjust=-500` would make the
+/// agent — leaking past what the host has — the last process the host's
+/// OOM killer picks, after sshd and the workload. There the agent raises
+/// its own `oom_score_adj` to 0 (raising needs no capability): an ordinary
+/// candidate, which the watchdog (-900) respawns. The self-integrity check
+/// expects that value on such a host ([`expected_limits`]). Not done with
+/// a percentage in the unit: [`systemd_bytes`] cannot compare `N%` with
+/// the cgroup file (the expectation would be dropped), and 70 % of a large
+/// host is far above 11G.
+pub fn relax_oom_score_adj() {
+    let cgroup = own_cgroup();
+    let memory_max = cgroup.as_deref().and_then(|cg| {
+        read_trim(
+            &PathBuf::from("/sys/fs/cgroup")
+                .join(cg.trim_start_matches('/'))
+                .join("memory.max"),
+        )
+    });
+    let mem_total = mem_total_bytes();
+    let path = Path::new("/proc/self/oom_score_adj");
+    let current = read_trim(path).and_then(|v| v.parse::<i32>().ok());
+    let Some(to) = boot_oom_adj(cgroup.as_deref(), memory_max.as_deref(), mem_total, current)
+    else {
+        return;
+    };
+    let memory_max = memory_max.unwrap_or_default();
+    let mem_total = mem_total.unwrap_or_default();
+    match std::fs::write(path, to.to_string()) {
+        Ok(()) => warn!(
+            memory_max,
+            mem_total,
+            from = current.unwrap_or_default(),
+            to,
+            "memory cap at or above the host's memory: the agent's cgroup limit cannot bind, \
+             oom_score_adj raised so a leak is an ordinary OOM candidate (external audit DEP-005)"
+        ),
+        Err(e) => warn!(
+            memory_max,
+            mem_total,
+            error = %e,
+            "memory cap at or above the host's memory, and oom_score_adj could not be raised: \
+             the self-integrity check will report the value (external audit DEP-005)"
+        ),
+    }
+}
+
 /// One limit the units set, as [`limits`] names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedLimit {
@@ -940,8 +1046,12 @@ struct ExpectedLimit {
 }
 
 /// External audit NN-AUD-113: the limits the shipped units set. A
-/// directive the parser does not understand is left out (never a guess).
-fn expected_limits() -> Vec<ExpectedLimit> {
+/// directive the parser does not understand is left out (never a guess);
+/// a test keeps every one the units set understood. External audit DEP-005:
+/// where the agent's memory cap does not bind (`cap_binds` false, from
+/// [`memory_cap_binds`]) the agent raised its `oom_score_adj` at boot
+/// ([`relax_oom_score_adj`]), and that value is the expected one.
+fn expected_limits(cap_binds: bool) -> Vec<ExpectedLimit> {
     let mut out = Vec::new();
     let mut push = |name: &str, value: Option<String>, required: bool| {
         if let Some(value) = value {
@@ -955,7 +1065,10 @@ fn expected_limits() -> Vec<ExpectedLimit> {
     push(LIMIT_CGROUP, Some(AGENT_UNIT_CGROUP.to_string()), true);
     push(
         "agent oom_score_adj",
-        unit_directive(AGENT_UNIT, "OOMScoreAdjust").map(str::to_string),
+        unit_directive(AGENT_UNIT, "OOMScoreAdjust")
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|v| if cap_binds { v } else { relaxed_oom_adj(v) })
+            .map(|v| v.to_string()),
         true,
     );
     push(
@@ -1353,7 +1466,18 @@ impl Checker {
                 .join(AGENT_UNIT_CGROUP.trim_start_matches('/'))
                 .is_dir();
             if in_unit || unit_exists {
-                expected_limits()
+                // External audit DEP-005: the same test the boot took
+                // (`relax_oom_score_adj`); unreadable is "binds", as there.
+                let cap_binds = match (
+                    now.iter()
+                        .find(|(n, _)| n == "agent memory.max")
+                        .map(|(_, v)| v.as_str()),
+                    mem_total_bytes(),
+                ) {
+                    (Some(max), Some(total)) => memory_cap_binds(max, total),
+                    _ => true,
+                };
+                expected_limits(cap_binds)
             } else {
                 Vec::new()
             }
@@ -2442,7 +2566,7 @@ mod tests {
 
     #[test]
     fn expected_limits_match_the_shipped_units() {
-        let e: Vec<(String, String, bool)> = expected_limits()
+        let e: Vec<(String, String, bool)> = expected_limits(true)
             .into_iter()
             .map(|e| (e.name, e.value, e.required))
             .collect();
@@ -2480,7 +2604,7 @@ mod tests {
             ("agent cpu.max", "max 100000"),
             ("agent cgroup.freeze", "0"),
         ]);
-        let f = w.observe(&boot, &expected_limits());
+        let f = w.observe(&boot, &expected_limits(true));
         let got: Vec<(&str, &str)> = f.iter().map(|x| (x.kind, x.detail.as_str())).collect();
         assert_eq!(
             got,
@@ -2500,7 +2624,7 @@ mod tests {
             .filter(|(n, _)| n != "agent cpu.max")
             .cloned()
             .collect();
-        assert!(w.observe(&no_cpu, &expected_limits()).is_empty());
+        assert!(w.observe(&no_cpu, &expected_limits(true)).is_empty());
     }
 
     /// External audit NN-AUD-113: the watchdog registers after the agent;
@@ -2524,7 +2648,7 @@ mod tests {
             v.extend(lim(extra));
             v
         };
-        assert!(w.observe(&full(&[]), &expected_limits()).is_empty());
+        assert!(w.observe(&full(&[]), &expected_limits(true)).is_empty());
         let f = w.observe(&full(&[("watchdog oom_score_adj", "1000")]), &[]);
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].kind, "limit_unexpected");
@@ -2549,5 +2673,127 @@ mod tests {
         v[2].1 = "1000".to_string();
         let f = w.observe(&v, &[]);
         assert_eq!(f[0].kind, "limit_changed");
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// External audit DEP-005 (NN-AUD-381): the unit's 11G cap on a host
+    /// with no more memory than that cannot bind; there the agent raises
+    /// its own -500 to 0 at boot, and only there.
+    #[test]
+    fn oom_adj_relaxed_when_memory_max_exceeds_memtotal() {
+        let cap = systemd_bytes(unit_directive(AGENT_UNIT, "MemoryMax").unwrap()).unwrap();
+        let unit = Some(AGENT_UNIT_CGROUP);
+        let at =
+            |total: u64, current: i32| boot_oom_adj(unit, Some(&cap), Some(total), Some(current));
+        // a 4 GiB and an 8 GiB guest (MemTotal a little under the RAM)
+        assert_eq!(at(3_900_000 * 1024, -500), Some(0));
+        assert_eq!(at(8_000_000 * 1024, -500), Some(0));
+        // exactly the cap: it cannot fire before the host's OOM killer
+        assert_eq!(at(11 * GIB, -500), Some(0));
+        // 16 GiB (the reference host has 15.24 GiB): the cap binds
+        assert_eq!(at(15_980_000 * 1024, -500), None);
+        assert_eq!(at(12 * GIB, -500), None);
+        // never lowered; already at or above 0: nothing to write
+        assert_eq!(at(4 * GIB, 0), None);
+        assert_eq!(at(4 * GIB, 300), None);
+        // no cap at all
+        assert_eq!(
+            boot_oom_adj(unit, Some("max"), Some(64 * GIB), Some(-500)),
+            Some(0)
+        );
+        // outside the unit's cgroup, or anything unreadable: unchanged
+        let small = Some(4 * GIB);
+        assert_eq!(
+            boot_oom_adj(Some("/user.slice/x.scope"), Some(&cap), small, Some(-500)),
+            None
+        );
+        assert_eq!(boot_oom_adj(None, Some(&cap), small, Some(-500)), None);
+        assert_eq!(boot_oom_adj(unit, None, small, Some(-500)), None);
+        assert_eq!(boot_oom_adj(unit, Some(&cap), None, Some(-500)), None);
+        assert_eq!(boot_oom_adj(unit, Some(&cap), small, None), None);
+        assert!(memory_cap_binds("11811160064", 12 * GIB));
+        assert!(!memory_cap_binds("11811160064", 11 * GIB));
+        assert!(!memory_cap_binds("max", u64::MAX));
+        let meminfo = "MemTotal:        8025360 kB\nMemFree:  12 kB\nMemAvailable: 9 kB\n";
+        assert_eq!(parse_mem_total(meminfo), Some(8_025_360 * 1024));
+        assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
+    }
+
+    /// External audit DEP-005: the check expects what the boot did — 0 on
+    /// a host the cap does not bind, the unit's -500 elsewhere — so neither
+    /// install gives a finding, and each value on the other host does.
+    #[test]
+    fn expected_limits_follow_the_relaxed_adj() {
+        let adj = |binds: bool| {
+            expected_limits(binds)
+                .into_iter()
+                .find(|e| e.name == "agent oom_score_adj")
+                .map(|e| (e.value, e.required))
+        };
+        assert_eq!(adj(true), Some(("-500".to_string(), true)));
+        assert_eq!(adj(false), Some(("0".to_string(), true)));
+        let rest = |binds: bool| {
+            expected_limits(binds)
+                .into_iter()
+                .filter(|e| e.name != "agent oom_score_adj")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rest(true), rest(false), "only the agent's adj follows");
+
+        let host = |oom: &str| {
+            lim(&[
+                ("agent oom_score_adj", oom),
+                ("agent cgroup", AGENT_UNIT_CGROUP),
+                ("agent memory.max", "11811160064"),
+                ("agent memory.high", "9663676416"),
+                ("agent pids.max", "512"),
+            ])
+        };
+        for (binds, ok, other) in [(false, "0", "-500"), (true, "-500", "0")] {
+            let mut w = LimitWatch::default();
+            assert!(
+                w.observe(&host(ok), &expected_limits(binds)).is_empty(),
+                "binds={binds}: {ok} is the expected value"
+            );
+            let mut w = LimitWatch::default();
+            let f = w.observe(&host(other), &expected_limits(binds));
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert_eq!(
+                f[0].detail,
+                format!("agent oom_score_adj: expected {ok} (unit), found {other}")
+            );
+        }
+    }
+
+    /// External audit DEP-005 (the triage's note): every limit the units set
+    /// is one [`expected_limits`] understands. A `MemoryMax=70%`, a
+    /// `TasksMax=infinity` or an `OOMScoreAdjust` that is not a number
+    /// would drop its expectation without a word.
+    #[test]
+    fn every_limit_the_units_set_is_understood() {
+        for key in ["MemoryHigh", "MemoryMax"] {
+            let v = unit_directive(AGENT_UNIT, key).unwrap_or_else(|| panic!("{key}"));
+            assert!(systemd_bytes(v).is_some(), "{key}={v}");
+        }
+        let tasks = unit_directive(AGENT_UNIT, "TasksMax").expect("TasksMax");
+        assert!(
+            tasks.chars().all(|c| c.is_ascii_digit()),
+            "TasksMax={tasks}"
+        );
+        for unit in [AGENT_UNIT, WATCHDOG_UNIT] {
+            let adj = unit_directive(unit, "OOMScoreAdjust").expect("OOMScoreAdjust");
+            assert!(adj.parse::<i32>().is_ok(), "OOMScoreAdjust={adj}");
+        }
+        let names: Vec<String> = expected_limits(true).into_iter().map(|e| e.name).collect();
+        for want in [
+            "agent oom_score_adj",
+            "agent memory.high",
+            "agent memory.max",
+            "agent pids.max",
+            "watchdog oom_score_adj",
+        ] {
+            assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+        }
     }
 }

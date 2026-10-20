@@ -394,6 +394,13 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
 | `watchdog_hold` | while the agent was down the watchdog stopped respawning it: a start that brought no agent back within 30 s (the unit failed — its `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` without bpffs — or was stopped or skipped; the record carries systemd's `ActiveState`/`SubState`/`Result`/`ConditionResult`/`AssertResult`), a failed `systemctl start`, or the restart ceiling. Signed at the agent's next start (external audit DEP-004) |
 
+The memory limits are absolute (`MemoryHigh=9G`, `MemoryMax=11G`, sized
+for the model). On a host with no more memory than `MemoryMax` the cap
+cannot bind, so the agent starts there with `oom_score_adj` 0 instead of
+the unit's -500 — an ordinary OOM candidate, which the watchdog respawns —
+and says so in a WARN (`memory cap at or above the host's memory`); 0 is
+then the value the check expects (external audit DEP-005).
+
 **How the previous run ended.** Some kills cannot be refused at all: a write
 to the unit's `cgroup.kill`, the OOM killer — and a crash or a power loss look
 the same. The watchdog brings the agent back; the evidence is in the chain:
@@ -774,6 +781,20 @@ This applies to unattended upgrades too: without the key they fail
 cleanly and leave the agent running. Neither an attacker nor an
 automatic job can replace or remove the agent through the package manager
 without a key that carries the `trusted-installer` role.
+
+**A failed operation restarts what it stopped (external audit DEP-010).**
+When a `.deb` operation fails after the pre-unpack hook stopped the units
+(a file conflict in the unpack, a full disk), dpkg's rollback starts them
+again, agent first. A unit that is not active afterwards is named on the
+terminal (`northnarrow: rollback failed: not running after the restart:
+northnarrow-agent.service (failed) - this host is without NorthNarrow`)
+and in the system log (`auth.err`, tag `northnarrow-pkg`), and the hook
+fails: dpkg reports the rollback as failed and leaves the package
+half-installed instead of "installed" with no agent running. Find the
+cause (`systemctl status northnarrow-agent`), start the agent, then the
+watchdog, and run the package command again. `rpm` has no rollback
+scripts: after a failed `rpm -U` check `systemctl is-active
+northnarrow-agent northnarrow-watchdog` yourself.
 
 ### 6.1 Verify a package before installing it
 

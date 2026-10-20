@@ -47,6 +47,15 @@ Type=notify
 # amplification vectors with one knob, zero customer config. Read NN logs:
 #   journalctl --namespace=northnarrow -u northnarrow-agent
 LogNamespace=northnarrow
+# External audit DEP-017 (NN-AUD-389): journald's rate limit for this unit.
+# The default (10000 lines per 30 s, scaled by free disk) drops the rest of
+# a burst — a debug log level, a detection storm — and the chain heads
+# (`chain head anchored`, lab PR 160) are lines of this journal, the copy
+# an operator forwards off the host. Raised, not 0 (no limit): the
+# namespace keeps SystemMaxUse=1G, and an unbounded flood would vacuum the
+# older lines faster. The watchdog's few lines keep the default.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=50000
 # External audit DEP-004: the bpffs pre-flight fails the unit. It was
 # ConditionPathIsMountPoint=/sys/fs/bpf: unmet, systemd skipped the agent
 # and reported its start job done — "inactive (dead)", nothing in
@@ -124,7 +133,10 @@ RuntimeDirectoryPreserve=yes
 #     — so a runaway can never starve the host into a cascade.
 #     On a smaller VM the agent's pre-ADE RAM guard (Beta Step 2b)
 #     skips model load entirely and runs detection-only, so this
-#     ceiling is never approached there.
+#     ceiling is never approached there — and cannot bind there
+#     either: see OOMScoreAdjust below. The sizes stay absolute
+#     (external audit DEP-005): the self-integrity check compares
+#     them with the cgroup files, which it cannot do for a percentage.
 #   TasksMax — fork/thread-leak backstop. The agent runs a tokio
 #     runtime (a few workers), candle's CPU kernels (≈ physical_cores
 #     threads), plus FIM / net / admin tasks — a few dozen at most.
@@ -146,6 +158,11 @@ TasksMax=512
 # MemoryMax into a memcg livelock). Root can still raise it through
 # /proc/<pid>/oom_score_adj: the self-integrity check reports that as
 # `integrity_drift` (limit_unexpected).
+# External audit DEP-005 (NN-AUD-381): on a host whose memory is not above
+# MemoryMax (11G) the cap cannot bind, and -500 would let a leaking agent
+# outlive sshd and the workload. There the agent raises its own value to 0
+# at start (an ordinary candidate; the watchdog respawns it), and the
+# self-integrity check expects 0.
 OOMScoreAdjust=-500
 
 # Hardening — `ProtectSystem=strict` makes the entire filesystem

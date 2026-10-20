@@ -61,6 +61,47 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, units and package hooks (Low DEP-005 NN-AUD-381,
+  DEP-010 NN-AUD-382, DEP-014 NN-AUD-386, DEP-017 NN-AUD-389; lab PR 184).
+  DEP-014: the watchdog's unit kept `CAP_SYS_ADMIN` "for the historical
+  bpf(2) shape"; nothing it does needs it — opening the pinned maps,
+  claiming its role slot and the `PROTECTED_PIDS` insert/delete are
+  `bpf_capable()` (CAP_BPF from 5.8, the floor), and the respawn's
+  `systemctl start` is authorised by uid 0 on systemd's private socket,
+  which carries no capabilities. The bounding set is `CAP_BPF
+  CAP_SYS_PTRACE`. DEP-005: `MemoryMax=11G` with `OOMScoreAdjust=-500` on a
+  host with no more memory than that: the cap cannot bind, and a leaking
+  agent would outlive sshd and the workload. The sizes stay absolute
+  (the self-integrity check cannot compare `N%` with the cgroup and would
+  drop the expectation; a test now keeps every limit the units set
+  understood); instead, at start, an agent in its unit's cgroup whose
+  `memory.max` is at or above `MemTotal` raises its own `oom_score_adj`
+  to 0 (raising needs no capability) with a WARN, and the limits round
+  expects 0 on such a host, -500 elsewhere. DEP-017: the agent's unit sets
+  `LogRateLimitIntervalSec=30s` / `LogRateLimitBurst=50000` — journald's
+  default of 10000 per 30 s dropped the rest of a burst, the
+  `chain head anchored` lines forwarded off the host included — bounded,
+  not 0, with the namespace capped at 1 GiB; the journald config says why
+  it sets neither a rate limit nor `Seal=`, and EVIDENCE_CHAINS.md how to
+  seal the journal with `journalctl --setup-keys`. DEP-010: the `.deb`
+  rollback (postinst `abort-upgrade|abort-remove|abort-deconfigure`,
+  postrm `abort-install|abort-upgrade`) started the stopped units with
+  `|| true` and exited 0 whatever came back; the two hooks share one
+  `restart_stopped` (a test keeps the copies equal), which checks
+  `systemctl is-active` after the starts, names every unit left down on
+  stderr and at `auth.err` (`northnarrow-pkg`), keeps the restart list
+  and fails the hook. The lab's tamper case C18 puts back the agent's own
+  `oom_score_adj` instead of -500. **Regressions / changes:** a failed
+  rollback that leaves a unit down is a failed package operation, the
+  package half-installed; on hosts up to 11 GiB of `MemTotal` (the 8 GiB
+  lab guests included) the agent runs at `oom_score_adj` 0, an ordinary
+  OOM candidate the watchdog respawns, and an install that kept -500
+  there is a `limit_unexpected` finding; an agent log burst can take
+  50000 lines per 30 s of the namespace; the watchdog's `exec` backend
+  inside its unit (unsupported) loses `CAP_SYS_ADMIN` too. Not changed:
+  `rpm` has no rollback scripts; `nn-admin host-check` gets no memory line
+  (the triage's WARN would be permanent on every small host, with no fix
+  for the operator).
 - External audit, Wave 3, dependency advisory policy (Low SUP-007
   NN-AUD-393, SUP-008 NN-AUD-394, SUP-009 NN-AUD-395, SUP-010 NN-AUD-396,
   SUP-011 NN-AUD-443; lab PR 183). The RustSEC job failed on

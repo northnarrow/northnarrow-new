@@ -98,6 +98,24 @@ and the tracker note have the details and the lab evidence.
   start (`integrity_drift`, `watchdog_hold`). **Regression:** a host
   without bpffs shows a failed agent unit; a host without
   `/usr/bin/mountpoint` cannot start the agent.
+- **Units and package hooks** (Wave 3: NN-AUD-386 DEP-014, NN-AUD-381
+  DEP-005, NN-AUD-389 DEP-017, NN-AUD-382 DEP-010, lab PR 184). The
+  watchdog's bounding set is `CAP_BPF CAP_SYS_PTRACE` (no
+  `CAP_SYS_ADMIN`). On a host with no more memory than the agent's
+  `MemoryMax=11G` the agent starts with `oom_score_adj` 0, not -500, with a
+  WARN `memory cap at or above the host's memory`, and the integrity check
+  expects 0 there; larger hosts keep -500. The agent's unit sets
+  `LogRateLimitIntervalSec=30s` and `LogRateLimitBurst=50000` (journald's
+  default is 10000). A `.deb` operation that fails after the units were
+  stopped, and whose rollback leaves one of them down, now fails its
+  rollback hook with the unit named on the terminal and at `auth.err`
+  (tag `northnarrow-pkg`). **Regression:** such a failed rollback leaves
+  the package half-installed (it used to read "installed" with no agent);
+  on small hosts the agent is an ordinary OOM candidate (the watchdog
+  brings it back); an agent burst can now take 50000 lines per 30 s of the
+  namespace's 1 GiB; the watchdog's `exec` respawn backend inside its
+  unit, already unsupported, now starts the agent without `CAP_SYS_ADMIN`
+  too.
 - **A removed admin socket comes back, and no longer hides a frozen
   agent** (Wave 3: NN-AUD-358 WDG-007, NN-AUD-364 WDG-015, NN-AUD-359
   WDG-008, NN-AUD-360 WDG-010, lab PR 170). The agent checks
