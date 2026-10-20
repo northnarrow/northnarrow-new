@@ -1848,6 +1848,51 @@ impl AuthSessionTracker {
         Some(exe.to_string_lossy().into_owned())
     }
 
+    /// External audit SNS-014: the image `pid` ran at `at_ns`
+    /// (CLOCK_MONOTONIC), for a record read after the fact — a DNS query's
+    /// sender, drained from its ring after the send. Only the sender's:
+    /// - `None` when `/proc` no longer shows the pid (it exited), or shows a
+    ///   process that started after `at_ns` (the pid was reused since);
+    /// - the spawn cache's exec when it is that process's (its start is the
+    ///   one `/proc/<pid>/stat` shows, live checks on) and ran no later
+    ///   than `at_ns`; `None` when that process executed another image
+    ///   after `at_ns` (what it ran then is not known);
+    /// - else `/proc/<pid>/exe`, as [`Self::image_path`] reads it (a
+    ///   deleted image keeps its ` (deleted)` suffix).
+    ///
+    /// `/proc` shows a start in ticks of the boot clock, so a process that
+    /// started less than two ticks plus the host's suspended time after
+    /// `at_ns` cannot be told from one started just before, and is taken
+    /// for the sender; so is an exec after `at_ns` not yet in the cache.
+    pub fn image_at(&self, pid: u32, at_ns: u64) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        let ticks = self.proc_start_ticks(pid)?;
+        let tick = tick_ns();
+        let floor = ticks
+            .saturating_mul(tick)
+            .saturating_sub(self.suspended_ns() + 2 * tick);
+        if floor > at_ns {
+            return None;
+        }
+        let cached = {
+            let s = self.inner.state.read();
+            s.map
+                .get(&pid)
+                .or_else(|| s.daemons.get(&pid))
+                .map(|e| (e.exe.clone(), e.spawn_ns, e.start_ns))
+        };
+        if let Some((exe, exec_ns, start_ns)) = cached {
+            // An earlier holder's exec says nothing about this process.
+            if !self.inner.live || self.ticks_show_start(ticks, start_ns) {
+                return (exec_ns <= at_ns).then(|| exe.to_string_lossy().into_owned());
+            }
+        }
+        let exe = fs::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        Some(exe.to_string_lossy().into_owned())
+    }
+
     fn lookup_cache(&self, pid: u32) -> Option<(u32, PathBuf)> {
         let s = self.inner.state.read();
         s.map
@@ -3053,6 +3098,73 @@ mod tests {
         fs::remove_dir_all(tmp.path().join("100")).unwrap();
         assert_eq!(t.start_floor_ns(100), None);
         assert_eq!(t.start_floor_ns(0), None);
+    }
+
+    /// External audit SNS-014: a DNS query's sender, named after the fact:
+    /// the cached exec of the process that sent it, `/proc` for one with
+    /// no exec event, and nothing for a later holder of the pid, for an
+    /// image executed after the query, or for a process gone.
+    #[test]
+    fn the_image_at_a_time_is_the_sender_s_only() {
+        let tmp = TempDir::new().unwrap();
+        let ticks = |ns: u64| ns / tick_ns();
+        let t = AuthSessionTracker::live_on(tmp.path(), 0);
+        // a resolver started before the agent: no exec event, /proc
+        write_started(tmp.path(), "100", 1, ticks(10 * S));
+        write_exe(tmp.path(), 100, "/usr/lib/systemd/systemd-resolved");
+        assert_eq!(
+            t.image_at(100, 1000 * S).as_deref(),
+            Some("/usr/lib/systemd/systemd-resolved")
+        );
+        // a later process holds the pid now: the query was not its own
+        write_started(tmp.path(), "100", 1, ticks(2000 * S));
+        assert_eq!(t.image_at(100, 1000 * S), None);
+        // the cached exec of the process that sent it, not what /proc
+        // shows after a later exec
+        t.ingest_exec(200, 1, "/usr/bin/curl", &[], 500 * S, 499 * S, 0);
+        write_started(tmp.path(), "200", 1, ticks(499 * S));
+        write_exe(tmp.path(), 200, "/usr/sbin/dnsmasq");
+        assert_eq!(t.image_at(200, 600 * S).as_deref(), Some("/usr/bin/curl"));
+        // it executed a forwarder's image after the query: not known, and
+        // never that image
+        t.ingest_exec(200, 1, "/usr/sbin/dnsmasq", &[], 700 * S, 499 * S, 0);
+        assert_eq!(t.image_at(200, 600 * S), None);
+        assert_eq!(
+            t.image_at(200, 800 * S).as_deref(),
+            Some("/usr/sbin/dnsmasq")
+        );
+        // an earlier holder's entry: /proc names the current process
+        t.ingest_exec(300, 1, "/usr/sbin/unbound", &[], 100 * S, 100 * S, 0);
+        write_started(tmp.path(), "300", 1, ticks(900 * S));
+        write_exe(tmp.path(), 300, "/tmp/x");
+        assert_eq!(t.image_at(300, 950 * S).as_deref(), Some("/tmp/x"));
+        // gone: the cache alone cannot tell whose entry it is
+        fs::remove_dir_all(tmp.path().join("300")).unwrap();
+        assert_eq!(t.image_at(300, 950 * S), None);
+        assert_eq!(t.image_at(0, 950 * S), None);
+    }
+
+    /// External audit SNS-014: the start is field 22 counted after the last
+    /// `)`: a command name holding spaces and parentheses cannot move it.
+    #[test]
+    fn stat_start_parses_comm_with_parens() {
+        let tmp = TempDir::new().unwrap();
+        let late = 5000 * S / tick_ns();
+        let early = 10 * S / tick_ns();
+        let dir = tmp.path().join("400");
+        fs::create_dir_all(&dir).unwrap();
+        // the name ends like a stat line whose start is late
+        fs::write(
+            dir.join("stat"),
+            format!(
+                "400 (my) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {late} 0 0 (prog) \
+                 S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {early} 0 0\n"
+            ),
+        )
+        .unwrap();
+        write_exe(tmp.path(), 400, "/opt/my prog");
+        let t = AuthSessionTracker::live_on(tmp.path(), 0);
+        assert_eq!(t.image_at(400, 1000 * S).as_deref(), Some("/opt/my prog"));
     }
 
     /// External audit POS-002: a credential read is the PAM stack's when

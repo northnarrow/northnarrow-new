@@ -131,27 +131,23 @@ impl SensorMultiplexer {
         // sensors still run. Only maps declared `#[map]` with a
         // `::pinned(..)` constructor are affected.
         //
-        // Event RINGBUFS must stay process-local: a ringbuf carries
-        // its consumer/producer position state in the kernel map
-        // object, so pinning + reusing one across a restart desyncs
-        // the new process's fresh consumer (0-length decode flood —
-        // see `FS_FIM_EVENTS` in agent-ebpf/src/fim_watch.rs). The
-        // sensor ringbufs (EVENTS, FILE_OPEN_EVENTS, EXEC_CHECK_EVENTS,
-        // TCP_CONNECT_EVENTS, DNS_QUERY_EVENTS) and FS_FIM_EVENTS are
-        // all `with_byte_size` (unpinned).
+        // Event RINGBUFS are process-local, one per boot of the agent:
+        // a ringbuf carries its consumer/producer positions in the
+        // kernel map object, so pinning + reusing one across a restart
+        // desyncs the new process's fresh consumer (0-length decode
+        // flood — see `FS_FIM_EVENTS` in agent-ebpf/src/fim_watch.rs).
+        // Every `*_EVENTS` ring in agent-ebpf is `with_byte_size`
+        // (unpinned); `tests::no_event_ring_is_pinned` holds that.
         //
-        // EXCEPTION: `FS_PROTECT_EVENTS` (agent-ebpf/src/inode_protect.rs)
-        // is STILL `::pinned` and so is reused here. It has the same
-        // reuse hazard, BUT its producer is the filesystem anti-tamper
-        // LSM program attached via a REUSED pinned link (non-transient,
-        // anti_tamper/mod.rs `filesystem::attach`), so unpinning the ring
-        // alone would split producer (old reused prog → old ring) from
-        // consumer (new ring) — a SILENT fs-protect blackout instead of a
-        // loud flood. Fixing it means dropping the ring-pin AND the
-        // program-link-pin together so both reattach fresh; that is a
-        // separate change with anti-tamper-persistence implications and is
-        // deliberately deferred. Do not unpin FS_PROTECT_EVENTS in
-        // isolation.
+        // External audit SNS-015: `FS_PROTECT_EVENTS`
+        // (agent-ebpf/src/inode_protect.rs) is one of them since the
+        // BUG-024 fix. Until then it was pinned and reused, and replayed
+        // stale denials after a restart (BUG-024). Its producers — the
+        // `inode_*` deny hooks, and `task_kill` / `ptrace_access_check`
+        // through `emit_task_denial` (review 62) — are attached fresh
+        // every boot (`reattach_fresh`, from `anti_tamper::attach` and
+        // `filesystem::attach`), bound to this boot's ring, so no
+        // program of an earlier boot writes into a ring nobody reads.
         let pin_root = crate::anti_tamper::prepare_pin_root();
         let mut loader = EbpfLoader::new();
         loader.btf(None);
@@ -182,7 +178,12 @@ impl SensorMultiplexer {
                 "BTF_OFFSETS map armed with runtime-resolved kernel offsets"
             );
         } else {
-            warn!("BTF_OFFSETS map NOT armed — eBPF programs use compiled-in offsets");
+            let btf = std::path::Path::new("/sys/kernel/btf/vmlinux").exists();
+            warn!(
+                vmlinux_btf = btf,
+                "{}",
+                btf_offsets_unarmed_warning(btf, net.is_some())
+            );
         }
         // External audit EBPF-004: read-only from here on, for every process.
         if let Err(e) = crate::anti_tamper::btf_revalidate::freeze_btf_offsets(&ebpf) {
@@ -301,6 +302,12 @@ impl SensorMultiplexer {
             .as_ref()
             .map(|w| (Arc::clone(&w.flow_tracker), w.lineage.clone()));
         let dns_cache_for_dns = net.as_ref().map(|w| Arc::clone(&w.dns_cache));
+        // External audit SNS-014: the DNS pump names a sender through the
+        // lineage tracker (its spawn cache, `/proc` checked against the
+        // query's time); without net wiring, a tracker of its own on `/proc`.
+        let lineage_for_dns = net
+            .as_ref()
+            .map_or_else(AuthSessionTracker::for_host, |w| w.lineage.clone());
 
         let pumps = vec![
             (
@@ -321,7 +328,7 @@ impl SensorMultiplexer {
             ),
             (
                 "dns_query",
-                spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, tx.clone()),
+                spawn_dns_query_pump(dns_query_rb, dns_cache_for_dns, lineage_for_dns, tx.clone()),
             ),
             (
                 "fs_protect",
@@ -490,6 +497,36 @@ fn attach_tracepoint(
     prog.attach(category, name)
         .with_context(|| perf_attach_hint(&format!("attaching tracepoint {category}/{name}")))?;
     Ok(())
+}
+
+/// External audit SNS-012 (NN-AUD-355): the WARN when nothing armed
+/// `BTF_OFFSETS`, exact about why and about what the start does next. It
+/// said only "compiled-in offsets", as if the agent then ran: a start
+/// without BTF does not complete. With the net sensor (the agent's start)
+/// its `tcp_close` fexit cannot load, and the start fails there at the
+/// latest; without it (tests, tools) no LSM hook can attach, so
+/// `attach_anti_tamper` refuses unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`
+/// (review 53).
+fn btf_offsets_unarmed_warning(vmlinux_btf: bool, with_net: bool) -> &'static str {
+    match (vmlinux_btf, with_net) {
+        (true, _) => {
+            "BTF_OFFSETS map NOT armed — /sys/kernel/btf/vmlinux exists but no offset was \
+             resolved from it before this load (a caller without the boot-time resolution, or a \
+             read that failed: see `BTF unavailable` above); the programs read kernel structures \
+             at their compiled-in offsets"
+        }
+        (false, true) => {
+            "BTF_OFFSETS map NOT armed — no vmlinux BTF on this kernel, so no offset was \
+             resolved; this start fails at the latest when the net sensor's tcp_close fexit \
+             loads BTF below (BTF is a prerequisite: docs/operator/KERNEL_COMPATIBILITY.md)"
+        }
+        (false, false) => {
+            "BTF_OFFSETS map NOT armed — no vmlinux BTF on this kernel, so no offset was \
+             resolved and the programs read kernel structures at their compiled-in offsets; no \
+             LSM hook can attach, so attach_anti_tamper refuses unless \
+             NN_ANTI_TAMPER_ALLOW_DEGRADED=1"
+        }
+    }
 }
 
 /// Context for a perf_event_open-based attach failure. EACCES under the
@@ -764,31 +801,84 @@ fn decode_addr(family: u8, bytes: [u8; 16]) -> std::net::IpAddr {
     common::netaddr::canonical_ip(family, &bytes)
 }
 
-/// FP-3 best-effort resolve of a DNS sender's `/proc/<pid>/exe`.
-/// Kernel-resolved symlink (never `comm`, which is
-/// `prctl(PR_SET_NAME)`-spoofable — and a comm match here would grant a
-/// forged resolver kill-immunity, the exact bypass the attribution layer
-/// must avoid). Returns `None` when the process has already exited, the
-/// link is unreadable, or the path is non-UTF-8; a miss is fail-toward-
-/// today (the rule treats a `None` sender as a non-forwarder and acts on
-/// it as before). Racy by nature (the PID may be reused between the BPF
-/// event and this read) — the same caveat as the FIM drain's
-/// `resolve_pid_exe`; the consuming rule only ever uses a positive
-/// resolver match to REDIRECT a kill off the forwarder, never to silence
-/// detection.
-fn resolve_pid_exe(pid: u32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
+/// FP-3: the image of a DNS query's sender — never `comm`, which is
+/// `prctl(PR_SET_NAME)`-spoofable (a comm match here would grant a forged
+/// resolver kill-immunity, the exact bypass the attribution layer must
+/// avoid). External audit SNS-014: the ring is drained after the send, and
+/// a bare `/proc/<pid>/exe` read then named whatever held the pid at that
+/// moment — a later process, or the image the sender executed since. The
+/// lineage tracker answers for the sender only
+/// ([`AuthSessionTracker::image_at`]): its cached exec when it ran no later
+/// than the query, else `/proc/<pid>/exe` when the process `/proc` shows
+/// started no later than it. `None` otherwise (gone, reused, executed
+/// since): the rule treats an unnamed sender as a non-forwarder and acts on
+/// it as before. A positive resolver match only ever REDIRECTS a kill off
+/// the forwarder, never silences detection.
+fn dns_sender_exe(lineage: &AuthSessionTracker, pid: u32, timestamp_ns: u64) -> Option<String> {
+    lineage.image_at(pid, timestamp_ns)
+}
+
+/// One DNS record: its `Event::DnsQuery` (the sender's image named, the
+/// DNS cache fed), then the `Event::DnsFlood` it carries, if any.
+fn dns_events(
+    raw: &DnsQueryRaw,
+    lineage: &AuthSessionTracker,
+    dns_cache: Option<&DnsCache>,
+) -> (Event, Option<Event>) {
+    let mut event = Event::from(raw);
+    let mut flood = None;
+    if let Event::DnsQuery {
+        pid,
+        uid,
+        comm,
+        exe,
+        query_name,
+        query_type,
+        dns_server,
+        family,
+        timestamp_ns,
+        ..
+    } = &mut event
+    {
+        // FP-3: the UDP/53 SENDER's image. The DNS rule family uses it to
+        // tell an originator-issued query apart from a forwarder's relayed
+        // leg so a KillProcess verdict never lands on the local stub
+        // resolver.
+        *exe = dns_sender_exe(lineage, *pid, *timestamp_ns);
+        if let Some(cache) = dns_cache {
+            cache.on_dns_query(
+                *pid,
+                query_name.clone(),
+                *query_type,
+                common::netaddr::canonical_ip(*family, dns_server),
+                *timestamp_ns,
+            );
+        }
+        // Review 78: queries the kernel's DNS budgets held back since this
+        // process's previous record.
+        if raw.held != 0 {
+            flood = Some(Event::DnsFlood {
+                pid: *pid,
+                uid: *uid,
+                comm: comm.clone(),
+                exe: exe.clone(),
+                held: u32::from(raw.held),
+                uid_level: raw.flags & dns_flags::RATE_HELD_UID != 0,
+                timestamp_ns: *timestamp_ns,
+            });
+        }
+    }
+    (event, flood)
 }
 
 fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
+    lineage: AuthSessionTracker,
     tx: mpsc::Sender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = pump_dns_query(rb, dns_cache, tx).await {
+        if let Err(e) = pump_dns_query(rb, dns_cache, lineage, tx).await {
             error!(error = %e, "dns_query pump failed");
         }
     })
@@ -797,6 +887,7 @@ fn spawn_dns_query_pump(
 async fn pump_dns_query(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
+    lineage: AuthSessionTracker,
     tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
@@ -810,51 +901,7 @@ async fn pump_dns_query(
             let bytes: &[u8] = item.as_ref();
             match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
                 Ok(raw) => {
-                    let mut event = Event::from(raw);
-                    let mut flood = None;
-                    if let Event::DnsQuery {
-                        pid,
-                        uid,
-                        comm,
-                        exe,
-                        query_name,
-                        query_type,
-                        dns_server,
-                        family,
-                        timestamp_ns,
-                        ..
-                    } = &mut event
-                    {
-                        // FP-3: resolve the UDP/53 SENDER's
-                        // `/proc/<pid>/exe` (best-effort, kernel-resolved
-                        // symlink — never comm). The DNS rule family uses
-                        // it to tell an originator-issued query apart from
-                        // a forwarder's relayed leg so a KillProcess
-                        // verdict never lands on the local stub resolver.
-                        *exe = resolve_pid_exe(*pid);
-                        if let Some(cache) = dns_cache.as_ref() {
-                            cache.on_dns_query(
-                                *pid,
-                                query_name.clone(),
-                                *query_type,
-                                common::netaddr::canonical_ip(*family, dns_server),
-                                *timestamp_ns,
-                            );
-                        }
-                        // Review 78: queries the kernel's DNS budgets held
-                        // back since this process's previous record.
-                        if raw.held != 0 {
-                            flood = Some(Event::DnsFlood {
-                                pid: *pid,
-                                uid: *uid,
-                                comm: comm.clone(),
-                                exe: exe.clone(),
-                                held: u32::from(raw.held),
-                                uid_level: raw.flags & dns_flags::RATE_HELD_UID != 0,
-                                timestamp_ns: *timestamp_ns,
-                            });
-                        }
-                    }
+                    let (event, flood) = dns_events(raw, &lineage, dns_cache.as_deref());
                     if tx.send(event).await.is_err() {
                         return Ok(());
                     }
@@ -982,5 +1029,129 @@ mod tests {
 
         raw.pid = 4301; // gone
         assert_eq!(tcp_connect_info_from_raw(&raw, &lineage).proc_start_ns, 0);
+    }
+
+    /// External audit SNS-014: the DNS pump read `/proc/<pid>/exe` when it
+    /// drained the record, so a process that took the pid after the query
+    /// named the sender — a forwarder's image there redirected the verdict
+    /// off the real sender. A later process's image is not used: the
+    /// sender is unnamed (a non-forwarder for the rule), and the flood
+    /// record it carries says the same.
+    #[test]
+    fn exe_of_a_later_process_is_not_used() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("4242");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink("/usr/sbin/dnsmasq", dir.join("exe")).unwrap();
+        let stat = |ticks: u64| {
+            std::fs::write(
+                dir.join("stat"),
+                format!(
+                    "4242 (dnsmasq) S 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"
+                ),
+            )
+            .unwrap()
+        };
+        // started far later than the query (field 22, in ticks)
+        stat(1_000_000_000_000);
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.pid = 4242;
+        raw.held = 3;
+        raw.timestamp_ns = 5_000_000_000;
+        let (event, flood) = dns_events(&raw, &lineage, None);
+        assert!(
+            matches!(event, Event::DnsQuery { exe: None, .. }),
+            "{event:?}"
+        );
+        assert!(matches!(
+            flood,
+            Some(Event::DnsFlood {
+                exe: None,
+                held: 3,
+                ..
+            })
+        ));
+        // the process that holds the pid started before the query: its own
+        stat(1);
+        let (event, _) = dns_events(&raw, &lineage, None);
+        let Event::DnsQuery { exe, .. } = event else {
+            panic!()
+        };
+        assert_eq!(exe.as_deref(), Some("/usr/sbin/dnsmasq"));
+        // gone
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (event, _) = dns_events(&raw, &lineage, None);
+        assert!(matches!(event, Event::DnsQuery { exe: None, .. }));
+    }
+
+    /// External audit SNS-015: every event ring of the eBPF object is
+    /// process-local, `FS_PROTECT_EVENTS` included (it was pinned and
+    /// reused before the BUG-024 fix, and comments here still said so).
+    #[test]
+    fn no_event_ring_is_pinned() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ebpf/src");
+        let mut rings = Vec::new();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !text.contains("RingBuf::pinned"),
+                "{}: a pinned ring buffer",
+                path.display()
+            );
+            for line in text.lines().map(str::trim) {
+                if line.starts_with("//") || !line.contains(": RingBuf =") {
+                    continue;
+                }
+                assert!(
+                    line.contains("RingBuf::with_byte_size("),
+                    "{}: {line}",
+                    path.display()
+                );
+                let name = line
+                    .split(": RingBuf")
+                    .next()
+                    .and_then(|l| l.split_whitespace().last())
+                    .unwrap_or_default();
+                rings.push(name.to_string());
+            }
+        }
+        for ring in [
+            "FS_PROTECT_EVENTS",
+            "OPEN_SENSOR_EVENTS",
+            "DNS_QUERY_EVENTS",
+            "EVENTS",
+        ] {
+            assert!(
+                rings.iter().any(|r| r == ring),
+                "{ring} not found in {rings:?}"
+            );
+        }
+        assert!(rings.iter().all(|r| r.ends_with("EVENTS")), "{rings:?}");
+    }
+
+    /// External audit SNS-012 (NN-AUD-355): the WARN for an unarmed
+    /// `BTF_OFFSETS` says what the start does next, not only that the
+    /// compiled-in offsets apply.
+    #[test]
+    fn the_unarmed_btf_warning_says_what_the_start_does() {
+        let agent = btf_offsets_unarmed_warning(false, true);
+        assert!(agent.contains("no vmlinux BTF") && agent.contains("start fails"));
+        assert!(agent.contains("tcp_close fexit"));
+        let no_net = btf_offsets_unarmed_warning(false, false);
+        assert!(no_net.contains("attach_anti_tamper refuses"));
+        assert!(no_net.contains("NN_ANTI_TAMPER_ALLOW_DEGRADED=1"));
+        for net in [true, false] {
+            let w = btf_offsets_unarmed_warning(true, net);
+            assert!(w.contains("exists") && w.contains("compiled-in offsets"));
+            assert!(!w.contains("start fails"));
+        }
+        for w in [agent, no_net] {
+            assert!(w.starts_with("BTF_OFFSETS map NOT armed"));
+        }
     }
 }

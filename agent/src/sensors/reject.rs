@@ -35,12 +35,19 @@ pub fn total() -> u64 {
 }
 
 /// Coalesces malformed-ringbuf-entry WARNs to at most one per second with a
-/// running dropped-count. A desynced / garbage ring — e.g. the
-/// FS_PROTECT_EVENTS pinned-reuse desync (catalog BUG-024) — otherwise rejects
-/// every entry and floods the journal at hundreds/sec, filling the
-/// LogNamespace `SystemMaxUse` cap and vacuuming real telemetry out of the
-/// retention window. A sensor fault must never DoS its own log. Used by every
-/// ringbuf pump, the open-sensor pump included.
+/// running dropped-count. A ring whose records this pump cannot decode
+/// rejects every entry and would flood the journal at hundreds/sec, filling
+/// the LogNamespace `SystemMaxUse` cap and vacuuming real telemetry out of
+/// the retention window. A sensor fault must never DoS its own log. Used by
+/// every ringbuf pump, the open-sensor pump included.
+///
+/// External audit SNS-015: the case this was written for, catalog BUG-024
+/// (`FS_PROTECT_EVENTS` pinned and reused across a restart, its positions
+/// out of step with the new consumer), is history: every event ring is
+/// process-local per boot, and its producers are attached fresh with it
+/// (`sensors::multiplexer`, `no_event_ring_is_pinned`). The eBPF object is
+/// embedded in the agent, so its records and this agent's decoders come
+/// from one build: a rejected record is a defect to report.
 pub(crate) struct RejectThrottle {
     count: u64,
     last_log: Option<std::time::Instant>,
@@ -86,8 +93,10 @@ impl RejectThrottle {
             rejected = self.count,
             expected,
             got = self.last_got,
-            "ringbuf entries rejected (malformed; rate-limited to <=1/s — a sustained \
-             count means a desynced ring, e.g. BUG-024 FS_PROTECT_EVENTS)"
+            "ringbuf entries rejected — records of a size this pump does not decode, \
+             dropped and counted (nn-admin status); one WARN per second at most per ring, \
+             `rejected` = entries since the previous WARN. The kernel program and the agent \
+             come from one build, so any count is a defect to report"
         );
         self.count = 0;
         self.last_log = Some(std::time::Instant::now());

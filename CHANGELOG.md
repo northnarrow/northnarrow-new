@@ -61,6 +61,60 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, open-sensor and DNS userland (Low SNS-004
+  NN-AUD-352, SNS-010 NN-AUD-353, SNS-011 NN-AUD-354, SNS-014 NN-AUD-357,
+  SNS-015 NN-AUD-436; lab PR 196). The userland half of the file-open
+  sensor and of the DNS sensor puts each event where it happened, and its
+  WARNs say what is true. No eBPF program changes. SNS-004: the mount table
+  that puts a record's mount-relative path on its mount point was re-read
+  on a miss only; a tmpfs unmounted and another mounted elsewhere reuses
+  the anonymous device and root inode, and on a quiet host the new
+  filesystem's files kept the old mount point. The open `mountinfo` is now
+  polled (`POLLPRI`, no wait) at every lookup and the table re-read after a
+  change (at most every 2 s; until then a hit is answered only while a
+  `stat()` of its mount point still shows that root, else the path is
+  unplaced, `mnt[maj:min:ino]/…`), and in any case when it is 30 s old
+  (the module-load pump uses the same table). SNS-010: home trees (the
+  `TREE_HOME` checks for `Login Data`, `logins.json`, `key4.db`,
+  `*.kdbx`, …) were `/root` and uid 1000–65533 only; now uid 0's declared
+  home and every account's home, except the overflow uids (65534,
+  4294967294, 4294967295, any `nobody`) and shared system directories
+  (`/`, `/nonexistent`, `/var/lib`, `/var/mail`, `/usr/share`, … exactly;
+  anything under `/bin`, `/etc`, `/dev`, `/proc`, `/usr/lib`,
+  `/var/empty`, …), judged on the declared path and on the path it
+  resolves to. SNS-011: the generation bump read 0 on a map error and
+  wrote 1, taking the generation back; a read error is now an error
+  (nothing written, the rule write reports `generation_failed`, degraded),
+  and the value written is the later of the slot and this process's last
+  write (serial order) plus one, never 0; a concurrent kernel bump that
+  merges with it is documented as harmless. SNS-014: the DNS pump read
+  `/proc/<pid>/exe` when it drained the record, so a process that took the
+  pid since (or the image the sender executed since) named the sender;
+  the lineage tracker now answers for the sender only
+  (`AuthSessionTracker::image_at`: its cached exec when it ran no later
+  than the query, else `/proc/<pid>/exe` when the process `/proc` shows
+  started no later than it, field 22 read after the last `)`), and an
+  unconfirmed sender is unnamed — a non-forwarder for NN-L-NET-004/-014,
+  as before on a miss. SNS-015: the comments that called `FS_PROTECT_EVENTS`
+  still pinned ("Do not unpin") and cited BUG-024 as live are rewritten;
+  the reject WARN no longer names BUG-024 as a cause. NN-AUD-355 (declined,
+  the boot is already fail-closed): the `BTF_OFFSETS map NOT armed` WARN
+  now says why and what the start does next (with the net sensor it fails
+  at the latest at the `tcp_close` fexit; without it `attach_anti_tamper`
+  refuses unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`; with BTF present, that
+  nothing was resolved before this load). **Regressions / changes:** more
+  home trees, so NN-L-FIM-015/-016 can report a credential-store name read
+  in a service account's home (Jenkins, GitLab Runner, PostgreSQL); a
+  file-open path right after a remount may read `mnt[…]/…` for up to 2 s
+  instead of the old mount point; the reject WARN and the unarmed-BTF WARN
+  have new texts (same first words); a DNS sender whose start or exec
+  `/proc` shows after the query is unnamed. Also: the `posture_demo`
+  example builds again (its `ProcessSpawn` lacked `argv_truncated` and
+  `filename_truncated`, added by lab PR 187). Tests: `open_sensor` +6
+  (and `home_roots_read_every_account_s_own_home` replaces
+  `home_roots_reads_regular_accounts_only`), `lineage` +2, `multiplexer`
+  +3; on the starting tree they do not compile (new items), and with the
+  old logic put back 8 of them fail.
 - External audit, Wave 3, privileged test assertions (Low TST-013
   NN-AUD-419, TST-014 NN-AUD-420, TST-015 NN-AUD-421, TST-016 NN-AUD-422,
   TST-017 NN-AUD-423; lab PR 195). The privileged suites now prove what

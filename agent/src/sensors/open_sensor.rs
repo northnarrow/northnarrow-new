@@ -170,8 +170,8 @@ pub struct RuleInputs {
 
 impl RuleInputs {
     /// The agent's own lists, the probe directory, `/root` and the home
-    /// of every account with a uid of 1000 or more, and the runtime
-    /// directories under `/run/user`.
+    /// of every account ([`home_roots`]), and the runtime directories
+    /// under `/run/user`.
     pub fn from_host(carveout_extras: &[String]) -> Self {
         use crate::posture::triggers::{
             CRITICAL_FILES_PREFIXES, MASS_WRITE_CARVEOUT_PREFIXES, PERSISTENCE_PREFIXES,
@@ -192,9 +192,74 @@ impl RuleInputs {
     }
 }
 
-/// `/root` plus the home of every `/etc/passwd` account with uid ≥ 1000
-/// (`nobody`'s 65534 excluded), each once.
+/// External audit SNS-010: declared homes that are directories every
+/// account shares, never one account's tree.
+const SHARED_HOMES: &[&str] = &[
+    "/",
+    "/nonexistent",
+    "/home",
+    "/mnt",
+    "/media",
+    "/opt",
+    "/run",
+    "/srv",
+    "/tmp",
+    "/usr",
+    "/usr/games",
+    "/usr/local",
+    "/usr/share",
+    "/var",
+    "/var/cache",
+    "/var/lib",
+    "/var/lib/misc",
+    "/var/log",
+    "/var/mail",
+    "/var/run",
+    "/var/spool",
+    "/var/tmp",
+];
+
+/// External audit SNS-010: trees no account's home lies in — programs and
+/// libraries, configuration, kernel interfaces (`/dev/null`, `/proc`) and
+/// the empty chroots under `/var/empty`.
+const SYSTEM_TREES: &[&str] = &[
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/proc",
+    "/sbin",
+    "/sys",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/sbin",
+    "/var/empty",
+];
+
+/// External audit SNS-010: whether `home` is a shared system directory
+/// ([`SHARED_HOMES`], [`SYSTEM_TREES`]) rather than one account's home.
+/// Compared by component, so `/var/lib/` and `//var/lib` are `/var/lib`.
+pub fn is_shared_system_dir(home: &Path) -> bool {
+    SHARED_HOMES.iter().any(|s| home == Path::new(s))
+        || SYSTEM_TREES.iter().any(|t| home.starts_with(t))
+}
+
+/// The home of every `/etc/passwd` account, each once, and `/root`.
+/// External audit SNS-010: it was `/root` and the accounts with uid 1000 to
+/// 65533 only — uid 0's declared home and the service accounts' homes
+/// (Jenkins, GitLab Runner, PostgreSQL) had no `TREE_HOME` name checks.
+/// Now every uid except the overflow ones (`nobody`/`nfsnobody`, 65534,
+/// 4294967294, 4294967295, and any account named `nobody`), unless the
+/// home is a shared system directory ([`is_shared_system_dir`]).
+/// [`RuleSet::build`] keeps the ones that resolve to an existing directory
+/// that is not one either.
 pub fn home_roots(passwd: &str) -> Vec<PathBuf> {
+    const OVERFLOW_UIDS: [u32; 3] = [65534, 4_294_967_294, 4_294_967_295];
     let mut out = vec![PathBuf::from("/root")];
     for line in passwd.lines() {
         let f: Vec<&str> = line.split(':').collect();
@@ -204,13 +269,14 @@ pub fn home_roots(passwd: &str) -> Vec<PathBuf> {
         let Ok(uid) = f[2].parse::<u32>() else {
             continue;
         };
-        if !(1000..65534).contains(&uid) || !f[5].starts_with('/') || f[5] == "/" {
+        if OVERFLOW_UIDS.contains(&uid) || f[0] == "nobody" || !f[5].starts_with('/') {
             continue;
         }
         let p = PathBuf::from(f[5]);
-        if !out.contains(&p) {
-            out.push(p);
+        if is_shared_system_dir(&p) || out.contains(&p) {
+            continue;
         }
+        out.push(p);
     }
     out
 }
@@ -246,7 +312,16 @@ impl RuleSet {
         let probe = format!("{}/", inputs.probe_dir.display());
         set.add_path(&probe, 0, CHILDREN_PROBE);
         for h in &inputs.homes {
-            if let Ok(m) = std::fs::metadata(h) {
+            // External audit SNS-010: a home that resolves (a symbolic
+            // link, `..`) into a shared system directory is not one
+            // account's tree either.
+            let Ok(real) = std::fs::canonicalize(h) else {
+                continue;
+            };
+            if is_shared_system_dir(&real) {
+                continue;
+            }
+            if let Ok(m) = std::fs::metadata(&real) {
                 if m.is_dir() {
                     *set.inodes.entry(key_of(&m)).or_default() |= TREE_HOME;
                 }
@@ -350,8 +425,64 @@ pub struct OpenSensorMaps {
     names: BpfHashMap<MapData, [u8; 2 * OPEN_NAME_LEN], u32>,
     runtime: BpfHashMap<MapData, AyaInodeKey, u32>,
     generation: Array<MapData, u32>,
+    /// External audit SNS-011: the generation this process last wrote
+    /// (0: none yet), so a bump never goes back below it.
+    last_generation: u32,
     armed: Array<MapData, u32>,
     depth_capped: PerCpuArray<MapData, u64>,
+}
+
+/// External audit SNS-011: the slot that holds the directory-class
+/// generation (`DIR_CLASS_GEN`), as [`bump_generation_in`] reads and writes
+/// it (a trait, so a test can stand in a map that fails).
+pub trait GenerationSlot {
+    fn read_generation(&self) -> Result<u32>;
+    fn write_generation(&mut self, value: u32) -> Result<()>;
+}
+
+impl GenerationSlot for Array<MapData, u32> {
+    fn read_generation(&self) -> Result<u32> {
+        Ok(self.get(&0, 0)?)
+    }
+    fn write_generation(&mut self, value: u32) -> Result<()> {
+        Ok(self.set(0, value, 0)?)
+    }
+}
+
+/// External audit SNS-011: the generation after `read` (the slot's value)
+/// when this process last wrote `last_written` (0: never). The later of the
+/// two, in serial-number order (RFC 1982: the slot wraps), plus one, and
+/// never 0, the slot's value before any rule was written. A slot read back
+/// lower than this process wrote it — something else reset it — does not
+/// take the generation back to a value classes may still be cached under.
+pub fn next_generation(read: u32, last_written: u32) -> u32 {
+    let ahead = last_written != 0 && (last_written.wrapping_sub(read) as i32) > 0;
+    match (if ahead { last_written } else { read }).wrapping_add(1) {
+        0 => 1,
+        n => n,
+    }
+}
+
+/// External audit SNS-011: invalidate every cached directory class. A read
+/// that fails is an error (the bump used to read 0 and write 1, which could
+/// take the generation back); nothing is written then. The kernel bumps the
+/// same slot on a directory rename without coordination
+/// (`agent-ebpf/src/open_sensor.rs`, `bump_generation`): the only property
+/// needed is that the value changes after the rules are written, and a
+/// kernel bump between this read and this write may merge with this one
+/// (both write N + 1). That is accepted: the rules were written before the
+/// read, so every class cached before the write is still stale, and a
+/// class cached in between was built under the new rules. An atomic add in
+/// the kernel would cost verifier budget in `fim_file_open_sensor` for
+/// nothing more.
+pub fn bump_generation_in(slot: &mut impl GenerationSlot, last_written: &mut u32) -> Result<()> {
+    let read = slot
+        .read_generation()
+        .map_err(|e| anyhow!("reading DIR_CLASS_GEN: {e:#}"))?;
+    let next = next_generation(read, *last_written);
+    slot.write_generation(next)?;
+    *last_written = next;
+    Ok(())
 }
 
 fn take(ebpf: &mut Ebpf, name: &str) -> Result<aya::maps::Map> {
@@ -367,6 +498,7 @@ impl OpenSensorMaps {
             names: BpfHashMap::try_from(take(ebpf, "OPEN_NAME_RULES")?)?,
             runtime: BpfHashMap::try_from(take(ebpf, "RUNTIME_UIDS")?)?,
             generation: Array::try_from(take(ebpf, "DIR_CLASS_GEN")?)?,
+            last_generation: 0,
             armed: Array::try_from(take(ebpf, "OPEN_SENSOR")?)?,
             depth_capped: PerCpuArray::try_from(take(ebpf, "OPEN_DEPTH_CAPPED")?)?,
         })
@@ -384,11 +516,9 @@ impl OpenSensorMaps {
         Ok(self.depth_capped.get(&0, 0)?.iter().sum())
     }
 
-    /// Invalidate every cached directory class.
+    /// Invalidate every cached directory class ([`bump_generation_in`]).
     pub fn bump_generation(&mut self) -> Result<()> {
-        let cur = self.generation.get(&0, 0).unwrap_or(0);
-        self.generation.set(0, cur.wrapping_add(1), 0)?;
-        Ok(())
+        bump_generation_in(&mut self.generation, &mut self.last_generation)
     }
 
     /// Switch the kernel side on (or off): from now on the FIM
@@ -668,24 +798,93 @@ pub fn take_ringbuf(ebpf: &mut Ebpf) -> Result<RingBuf<MapData>> {
 /// Filesystem roots → mount points, from `/proc/self/mountinfo` and a
 /// `stat()` of each mount point (the key the kernel records for the top
 /// of a path walk).
-#[derive(Debug, Default)]
+///
+/// External audit SNS-004: the table was re-read on a miss only, so a hit
+/// was never checked again. An anonymous device is reused (a tmpfs
+/// unmounted and another mounted elsewhere gets the same `0:N` and root
+/// inode 1), and on a quiet host the old mount point kept naming the new
+/// filesystem's files. A hit is now checked:
+/// - the open `mountinfo` is polled (`POLLPRI`, no wait) at every lookup:
+///   the kernel flags it whenever a mount or an unmount changes this
+///   namespace's table. After a change the table is re-read, at most once
+///   per [`MOUNT_REFRESH_MIN`]; until then a hit is answered only while a
+///   `stat()` of its mount point still shows that root, and dropped (the
+///   path is then unplaced, never another mount's) when it does not;
+/// - whatever the poll says, the table is re-read when it is older than
+///   [`MOUNT_HIT_TTL`].
+///
+/// The kernel's record names the filesystem root, not the mount: a record
+/// queued before an unmount and read after the device was reused is put
+/// on the new mount point (a window of the ring's latency; a mount id in
+/// the record would be a kernel change).
+#[derive(Debug)]
 pub struct MountTable {
     roots: HashMap<(u64, u64), String>,
     loaded: Option<Instant>,
+    /// The `mountinfo` a refresh reads (`/proc/self/mountinfo`; a fixture
+    /// in tests).
+    source: PathBuf,
+    /// `source`, open for the change poll (`None`: not opened, or not
+    /// pollable; the TTL alone then bounds the table's age).
+    watch: Option<std::fs::File>,
+    /// A change was polled and the table not re-read yet.
+    changed: bool,
 }
 
-/// Refresh on a miss at most this often.
+impl Default for MountTable {
+    fn default() -> Self {
+        MountTable {
+            roots: HashMap::new(),
+            loaded: None,
+            source: PathBuf::from("/proc/self/mountinfo"),
+            watch: None,
+            changed: false,
+        }
+    }
+}
+
+/// Re-read the table, on a miss or after a polled change, at most this
+/// often.
 const MOUNT_REFRESH_MIN: Duration = Duration::from_secs(2);
+
+/// External audit SNS-004: re-read the table when it is older than this,
+/// whatever the lookups found.
+pub const MOUNT_HIT_TTL: Duration = Duration::from_secs(30);
+
+/// Whether the kernel flagged a change of the mount table `mountinfo`
+/// shows since the last poll (`POLLPRI`; the poll itself clears it). A
+/// regular file never reports one.
+fn mounts_changed(mountinfo: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut p = libc::pollfd {
+        fd: mountinfo.as_raw_fd(),
+        events: libc::POLLPRI,
+        revents: 0,
+    };
+    // SAFETY: one valid, initialised pollfd for a descriptor `mountinfo`
+    // keeps open; a zero timeout never blocks.
+    let n = unsafe { libc::poll(&mut p, 1, 0) };
+    n > 0 && p.revents & (libc::POLLPRI | libc::POLLERR) != 0
+}
 
 impl MountTable {
     pub fn load() -> Self {
-        let mut t = MountTable::default();
+        Self::load_from(Path::new("/proc/self/mountinfo"))
+    }
+
+    /// [`Self::load`] from another `mountinfo` (tests: a fixture file).
+    pub fn load_from(source: &Path) -> Self {
+        let mut t = MountTable {
+            source: source.to_path_buf(),
+            watch: std::fs::File::open(source).ok(),
+            ..MountTable::default()
+        };
         t.refresh();
         t
     }
 
     pub fn refresh(&mut self) {
-        let text = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let text = std::fs::read_to_string(&self.source).unwrap_or_default();
         let mut roots = HashMap::new();
         for mp in mount_points(&text) {
             if let Ok(m) = std::fs::metadata(&mp) {
@@ -704,18 +903,43 @@ impl MountTable {
         }
         self.roots = roots;
         self.loaded = Some(Instant::now());
+        self.changed = false;
+    }
+
+    /// Whether the mount point `mp` still shows the filesystem root `root`.
+    fn still_shows(mp: &str, root: (u64, u64)) -> bool {
+        std::fs::metadata(mp).is_ok_and(|m| {
+            let k = key_of(&m);
+            (k.dev, k.ino) == root
+        })
     }
 
     /// Absolute path of `rel` (mount-relative, starting with `/`) under
-    /// the filesystem root `root`, refreshing the table on a miss.
+    /// the filesystem root `root`: re-reading the table on a miss, after a
+    /// change of the mounts, and when it is older than [`MOUNT_HIT_TTL`].
     pub fn absolute(&mut self, root: (u64, u64), rel: &str) -> Option<String> {
         if root == (0, 0) {
             return None;
         }
-        if !self.roots.contains_key(&root)
-            && self.loaded.is_none_or(|t| t.elapsed() >= MOUNT_REFRESH_MIN)
-        {
+        if self.watch.as_ref().is_some_and(mounts_changed) {
+            self.changed = true;
+        }
+        let hit = self.roots.contains_key(&root);
+        let age = self.loaded.map(|t| t.elapsed());
+        let refresh = match age {
+            None => true,
+            Some(age) => {
+                age >= MOUNT_HIT_TTL || ((!hit || self.changed) && age >= MOUNT_REFRESH_MIN)
+            }
+        };
+        if refresh {
             self.refresh();
+        } else if hit && self.changed {
+            if let Some(mp) = self.roots.get(&root) {
+                if !Self::still_shows(mp, root) {
+                    self.roots.remove(&root);
+                }
+            }
         }
         let mp = self.roots.get(&root)?;
         Some(if mp == "/" {
@@ -1169,22 +1393,89 @@ mod tests {
         assert_eq!(rejected, vec![16, 0]);
     }
 
+    /// External audit SNS-010: uid 0's declared home and the service
+    /// accounts' own homes are home trees; shared system directories and
+    /// the overflow accounts are not.
     #[test]
-    fn home_roots_reads_regular_accounts_only() {
-        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+    fn home_roots_read_every_account_s_own_home() {
+        let passwd = "root:x:0:0:root:/srv/root-home:/bin/bash\n\
                       daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n\
+                      bin:x:2:2:bin:/bin:/usr/sbin/nologin\n\
+                      mail:x:8:8:mail:/var/mail:/usr/sbin/nologin\n\
+                      rtkit:x:107:113::/proc:/usr/sbin/nologin\n\
+                      tss:x:59:59::/dev/null:/sbin/nologin\n\
+                      sshd:x:74:74::/var/empty/sshd:/sbin/nologin\n\
+                      unbound:x:995:993::/etc/unbound:/sbin/nologin\n\
+                      dnsmasq:x:116:65534::/var/lib/misc:/usr/sbin/nologin\n\
+                      postgres:x:113:120:PostgreSQL administrator:/var/lib/postgresql:/bin/bash\n\
+                      jenkins:x:114:121::/var/lib/jenkins:/bin/bash\n\
                       alice:x:1000:1000::/home/alice:/bin/bash\n\
-                      bob:x:1001:1001::/srv/bob:/bin/sh\n\
+                      bob:x:1001:1001::/srv/bob/:/bin/sh\n\
+                      carol:x:200000:200000::/home/carol:/bin/bash\n\
+                      twin:x:1002:1002::/home/alice:/bin/bash\n\
+                      rel:x:1003:1003::home/rel:/bin/bash\n\
                       nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n\
+                      nobody:x:99:99:Nobody:/srv/nobody:/sbin/nologin\n\
+                      nfsnobody:x:4294967294:4294967294::/var/lib/nfs:/sbin/nologin\n\
                       broken line\n";
         assert_eq!(
             home_roots(passwd),
             vec![
                 PathBuf::from("/root"),
+                PathBuf::from("/srv/root-home"),
+                PathBuf::from("/var/lib/postgresql"),
+                PathBuf::from("/var/lib/jenkins"),
                 PathBuf::from("/home/alice"),
-                PathBuf::from("/srv/bob")
+                PathBuf::from("/srv/bob"),
+                PathBuf::from("/home/carol"),
             ]
         );
+        for shared in [
+            "/",
+            "//var/lib",
+            "/var/lib/",
+            "/usr/sbin",
+            "/etc/x",
+            "/dev/null",
+        ] {
+            assert!(is_shared_system_dir(Path::new(shared)), "{shared}");
+        }
+        for own in [
+            "/var/lib/postgresql",
+            "/home/alice",
+            "/srv/bob",
+            "/etcetera",
+        ] {
+            assert!(!is_shared_system_dir(Path::new(own)), "{own}");
+        }
+    }
+
+    /// External audit SNS-010: a declared home becomes a home tree only
+    /// where it resolves to an existing directory that is not a shared
+    /// system one (a symbolic link to `/etc` is not a home).
+    #[test]
+    fn a_home_is_a_tree_where_it_resolves_to_an_account_s_own_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let own = t.path().join("svc");
+        std::fs::create_dir(&own).unwrap();
+        let to_etc = t.path().join("to-etc");
+        std::os::unix::fs::symlink("/etc", &to_etc).unwrap();
+        let to_own = t.path().join("to-svc");
+        std::os::unix::fs::symlink(&own, &to_own).unwrap();
+        let file = t.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let set = RuleSet::build(&RuleInputs {
+            homes: vec![own.clone(), to_etc, to_own, file, t.path().join("missing")],
+            probe_dir: t.path().join("probe"),
+            ..RuleInputs::default()
+        });
+        let homes: Vec<&InodeKey> = set
+            .inodes
+            .iter()
+            .filter(|(_, b)| **b & TREE_HOME != 0)
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(homes, vec![&key_of(&std::fs::metadata(&own).unwrap())]);
     }
 
     /// Lab PR 175: an unplaced path names its filesystem as mountinfo does.
@@ -1211,6 +1502,172 @@ mod tests {
             mount_points(mi),
             vec!["/".to_string(), "/mnt/with space".to_string()]
         );
+    }
+
+    /// A `mountinfo` fixture with one mount at `mp`, and the root key a
+    /// `stat()` of `mp` gives.
+    fn one_mount(info: &Path, mp: &Path) {
+        std::fs::write(
+            info,
+            format!("40 22 0:45 / {} rw - tmpfs tmpfs rw\n", mp.display()),
+        )
+        .unwrap();
+    }
+
+    fn root_of(p: &Path) -> (u64, u64) {
+        let k = key_of(&std::fs::metadata(p).unwrap());
+        (k.dev, k.ino)
+    }
+
+    /// External audit SNS-004: a hit was never checked again — a
+    /// filesystem root that moved to another mount point (an anonymous
+    /// device reused by the next tmpfs) kept its old mount point. The
+    /// table is re-read once it is older than the TTL, hit or not.
+    #[test]
+    fn stale_hit_is_refreshed_after_ttl() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b, info) = (t.path().join("a"), t.path().join("b"), t.path().join("mi"));
+        std::fs::create_dir(&a).unwrap();
+        one_mount(&info, &a);
+        let mut mounts = MountTable::load_from(&info);
+        let root = root_of(&a);
+        let under = |p: &Path| Some(format!("{}/f", p.display()));
+        assert_eq!(mounts.absolute(root, "/f"), under(&a));
+        // the same root (dev, inode) now at another mount point
+        std::fs::rename(&a, &b).unwrap();
+        one_mount(&info, &b);
+        // a fixture file never polls a change: inside the TTL the table
+        // answers as read
+        assert_eq!(mounts.absolute(root, "/f"), under(&a));
+        mounts.loaded = Instant::now().checked_sub(MOUNT_HIT_TTL);
+        assert_eq!(mounts.absolute(root, "/f"), under(&b));
+    }
+
+    /// External audit SNS-004: after a polled change, while the re-read
+    /// waits for the throttle, a hit whose mount point no longer shows its
+    /// root is dropped (unplaced), never answered with that mount point.
+    #[test]
+    fn a_changed_table_never_answers_with_a_mount_point_that_lost_its_root() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b, info) = (t.path().join("a"), t.path().join("b"), t.path().join("mi"));
+        std::fs::create_dir(&a).unwrap();
+        one_mount(&info, &a);
+        let mut mounts = MountTable::load_from(&info);
+        let root = root_of(&a);
+        // a change polled, the mount point still shows the root: answered
+        mounts.changed = true;
+        assert_eq!(
+            mounts.absolute(root, "/f"),
+            Some(format!("{}/f", a.display()))
+        );
+        std::fs::rename(&a, &b).unwrap();
+        one_mount(&info, &b);
+        assert_eq!(mounts.absolute(root, "/f"), None);
+        let r = record(open_reason::PERSIST, &["f", "/"], root);
+        let Event::FileOpen { filename, .. } = &events_of(&r, &mut mounts)[0] else {
+            panic!()
+        };
+        assert!(filename.starts_with("mnt["), "{filename}");
+        // the throttle passed: the re-read table places it again
+        mounts.loaded = Instant::now().checked_sub(MOUNT_REFRESH_MIN);
+        assert_eq!(
+            mounts.absolute(root, "/f"),
+            Some(format!("{}/f", b.display()))
+        );
+        assert!(!mounts.changed);
+    }
+
+    /// External audit SNS-004: a change of the mount table is polled on
+    /// the open `mountinfo` without waiting; a regular file never reports
+    /// one.
+    #[test]
+    fn a_regular_file_never_polls_a_mount_change() {
+        let t = tempfile::tempdir().unwrap();
+        let info = t.path().join("mi");
+        std::fs::write(&info, "").unwrap();
+        let f = std::fs::File::open(&info).unwrap();
+        assert!(!mounts_changed(&f));
+        assert!(MountTable::load_from(&info).watch.is_some());
+        assert!(MountTable::load_from(&t.path().join("none"))
+            .watch
+            .is_none());
+    }
+
+    /// A generation slot that can fail its read.
+    #[derive(Default)]
+    struct StubSlot {
+        value: u32,
+        fail_read: bool,
+        writes: Vec<u32>,
+    }
+
+    impl GenerationSlot for StubSlot {
+        fn read_generation(&self) -> Result<u32> {
+            if self.fail_read {
+                return Err(anyhow!("EFAULT: lookup failed"));
+            }
+            Ok(self.value)
+        }
+        fn write_generation(&mut self, value: u32) -> Result<()> {
+            self.value = value;
+            self.writes.push(value);
+            Ok(())
+        }
+    }
+
+    /// External audit SNS-011: a failed read took the generation to 1 (read
+    /// as 0, plus one), back to a value classes may still be cached under.
+    /// It is an error now, nothing is written, and the rule write reports
+    /// the generation as not bumped (degraded).
+    #[test]
+    fn bump_generation_propagates_read_error() {
+        let mut slot = StubSlot {
+            value: 7,
+            fail_read: true,
+            ..StubSlot::default()
+        };
+        let mut last = 5;
+        let e = bump_generation_in(&mut slot, &mut last).unwrap_err();
+        assert!(format!("{e:#}").contains("DIR_CLASS_GEN"), "{e:#}");
+        assert!(slot.writes.is_empty());
+        assert_eq!((slot.value, last), (7, 5));
+        let mut maps = FakeMaps {
+            cap: 8,
+            ..FakeMaps::default()
+        };
+        maps.slot.fail_read = true;
+        let a = apply_rules(&mut maps, &busy_set(), None);
+        assert!(a.generation_failed && a.degraded());
+        assert!(a
+            .first_error
+            .as_deref()
+            .is_some_and(|e| e.contains("DIR_CLASS_GEN")));
+    }
+
+    /// External audit SNS-011: the generation moves forward from the later
+    /// of the slot and this process's last write, in serial order, and is
+    /// never 0.
+    #[test]
+    fn generation_never_moves_back() {
+        let mut slot = StubSlot::default();
+        let mut last = 0;
+        bump_generation_in(&mut slot, &mut last).unwrap();
+        assert_eq!(slot.value, 1);
+        slot.value = 41; // kernel bumps (directory renames)
+        bump_generation_in(&mut slot, &mut last).unwrap();
+        assert_eq!((slot.value, last), (42, 42));
+        slot.value = 0; // reset behind this process's back
+        bump_generation_in(&mut slot, &mut last).unwrap();
+        assert_eq!(slot.value, 43, "not back to 1");
+        slot.value = 100; // the kernel is ahead
+        bump_generation_in(&mut slot, &mut last).unwrap();
+        assert_eq!(slot.value, 101);
+        // the wrap skips 0, and the kernel's small values after it are
+        // still later than this process's last write
+        assert_eq!(next_generation(u32::MAX, u32::MAX - 1), 1);
+        assert_eq!(next_generation(5, u32::MAX), 6);
+        assert_eq!(next_generation(u32::MAX - 3, 2), 3);
+        assert_eq!(next_generation(0, 0), 1);
     }
 
     #[test]
@@ -1551,7 +2008,11 @@ mod tests {
         children: HashMap<ChildRuleKey, u32>,
         names: HashMap<[u8; 2 * OPEN_NAME_LEN], u32>,
         runtime: HashMap<InodeKey, u32>,
+        /// Generation bumps that went through.
         generation: u32,
+        /// External audit SNS-011: the slot behind them.
+        slot: StubSlot,
+        last: u32,
     }
 
     fn put<K: std::hash::Hash + Eq>(
@@ -1597,6 +2058,7 @@ mod tests {
             Ok(())
         }
         fn bump_generation(&mut self) -> Result<()> {
+            bump_generation_in(&mut self.slot, &mut self.last)?;
             self.generation += 1;
             Ok(())
         }

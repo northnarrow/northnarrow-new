@@ -563,12 +563,12 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-349 | XAI-015 | Low | XAI and RAG | — | obsolete (on-disk `build_index` removed, lab PR 145) |
 | NN-AUD-350 | XAI-016 | Low | XAI and RAG | S | open (dormant) |
 | NN-AUD-351 | XAI-017 | Low | XAI and RAG | S | fixed (lab PR 191) |
-| NN-AUD-352 | SNS-004 | Low | Sensors | S | open |
-| NN-AUD-353 | SNS-010 | Low | Sensors | S | open |
-| NN-AUD-354 | SNS-011 | Low | Sensors | S | open |
+| NN-AUD-352 | SNS-004 | Low | Sensors | S | fixed (lab PR 196) |
+| NN-AUD-353 | SNS-010 | Low | Sensors | S | fixed (lab PR 196) |
+| NN-AUD-354 | SNS-011 | Low | Sensors | S | fixed (lab PR 196) |
 | NN-AUD-355 | SNS-012 | Low | Sensors | — | declined (a boot without BTF already fails closed, review 53) |
 | NN-AUD-356 | SNS-013 | Low | Sensors | — | already fixed (lab PR 115) |
-| NN-AUD-357 | SNS-014 | Low | Sensors | M | open |
+| NN-AUD-357 | SNS-014 | Low | Sensors | M | fixed (lab PR 196) |
 | NN-AUD-358 | WDG-007 | Low | Watchdog tooling | M | fixed (lab PR 170) |
 | NN-AUD-359 | WDG-008 | Low | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-360 | WDG-010 | Low | Watchdog tooling | S | fixed (lab PR 170) |
@@ -647,7 +647,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | fixed (lab PR 191) |
 | NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
 | NN-AUD-435 | XAI-019 | Info | XAI and RAG | S | open (Info) |
-| NN-AUD-436 | SNS-015 | Info | Sensors | S | open |
+| NN-AUD-436 | SNS-015 | Info | Sensors | S | fixed (lab PR 196) |
 | NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | open |
 | NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | open |
@@ -8243,3 +8243,110 @@ group, the ones an unprivileged user or a local attacker could use first.
     agent with `test-privileged,debug-trigger`) clean, 2,504 passed,
     0 failed; `suite-count-test.sh` 15/15.
   - Lab: The lot is the privileged suites themselves: in the gate, the agent's privileged e2e 10 → 11 (`agent_without_admin_pub_starts_degraded_and_says_so`), `fixture_selftest`'s iptables tests 2 → 4, `exec_sensor_live` now asserting the canary's own pid, parent and argv, every JSONL reader strict — green on all four kernels, Debian 12 included (where the guard reads the tables through `nft`); `suite-count-test.sh` 15/15. Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.
+- **Wave 3 — open-sensor and DNS userland, lab PR 196.** NN-AUD-352
+  (SNS-004), NN-AUD-353 (SNS-010), NN-AUD-354 (SNS-011), NN-AUD-357
+  (SNS-014), NN-AUD-436 (SNS-015), all Low, with the WARN wording of
+  NN-AUD-355 (SNS-012, declined): batch E of the Wave 3 triage of the
+  kernel, sensors and FIM group, on the integration tree (`main` with lots
+  up to 191, and lots 192–195). Userland only
+  (`sensors/{open_sensor,multiplexer,reject}.rs`, one method in
+  `posture/lineage.rs`); no eBPF program changes.
+  - SNS-004 (352, fixed). Re-checked: `MountTable::absolute` re-read
+    `mountinfo` on a miss only (throttled to 2 s); a tmpfs unmounted and
+    another mounted elsewhere gets the same anonymous `0:N` and root inode
+    1, and the hit kept the old mount point. Now the open `mountinfo` is
+    polled (`POLLPRI`, zero timeout) at every lookup; after a change the
+    table is re-read at most every 2 s, and until then a hit is answered
+    only while a `stat()` of its mount point still shows that root (else
+    dropped: the path is unplaced, never another mount's); the table is
+    re-read anyway when 30 s old (`MOUNT_HIT_TTL`). `MountTable::load_from`
+    takes a fixture `mountinfo`. Residual, documented: a record queued
+    before an unmount and drained after the reuse goes on the new mount
+    point (a mount id in the record would be a kernel change).
+  - SNS-010 (353, fixed). Re-checked: `home_roots` gave `/root` and uid
+    1000–65533. Now uid 0's declared home and every account's, except uid
+    65534, 4294967294, 4294967295 and any `nobody`, and shared system
+    directories (`SHARED_HOMES`, exact: the triage's list plus `/home`,
+    `/tmp`, `/var/tmp`, `/var/mail`, `/var/lib/misc`, `/usr/share`, …;
+    `SYSTEM_TREES`, prefix: `/bin`, `/sbin`, `/etc`, `/dev`, `/proc`,
+    `/sys`, `/boot`, `/lib*`, `/usr/{bin,sbin,lib,libexec}`,
+    `/var/empty`); `RuleSet::build` applies the same test to the
+    canonical path (a home that is a link to `/etc` is no home tree).
+    Only the leaf names (`Login Data`, `logins.json`, `key4.db`,
+    `key3.db`, `signons.sqlite`, `*.kdbx`) depend on a home tree; the
+    credential directory names already applied anywhere.
+  - SNS-011 (354, fixed). Re-checked: `get(&0, 0).unwrap_or(0)` then
+    `cur + 1`. Now `bump_generation_in` over a `GenerationSlot` (the aya
+    `Array`, a stub in tests): a read error is returned (nothing written;
+    `apply_rules` reports `generation_failed`, degraded, one ERROR and
+    one signed record through `RuleHealth`), and `next_generation` writes
+    the later of the slot and the last value this process wrote, in
+    serial order (RFC 1982), plus one, never 0. The merge with a
+    concurrent kernel rename bump is documented as harmless (the rules are
+    written before the read). No kernel atomic.
+  - SNS-014 (357, fixed). Re-checked: `resolve_pid_exe` read
+    `/proc/<pid>/exe` per query when the record was drained. Now the DNS
+    pump gets the lineage tracker (the net wiring's, or its own on
+    `/proc`) and `AuthSessionTracker::image_at(pid, query_ns)`: `None`
+    when `/proc` shows no process or one whose start floor is later than
+    the query; the cached exec when it is the current process's (start
+    checked against `/proc/<pid>/stat`, field 22 after the last `)`) and
+    ran no later than the query, `None` when it executed another image
+    after it; else `/proc/<pid>/exe`. An unnamed sender is a
+    non-forwarder for NN-L-NET-004/-014, as on a miss before. Residual,
+    documented: `/proc`'s tick resolution (two ticks plus the suspended
+    time) and an exec after the query not yet in the cache. The per-record
+    work moved to `dns_events` (testable). Observation, not in this lot:
+    `sender_is_forwarder` matches the exe's basename, so an image named
+    `dnsmasq` anywhere is a forwarder for the rule.
+  - SNS-015 (436, fixed). Re-checked: the multiplexer still said
+    `FS_PROTECT_EVENTS` "is STILL `::pinned`… Do not unpin", and
+    `reject.rs` cited the BUG-024 desync as live (comment and WARN). Both
+    rewritten (every event ring per boot, its producers attached fresh by
+    `reattach_fresh`; BUG-024 as history); the reject WARN now says what a
+    rejection is (a size this pump does not decode; the object and the
+    agent come from one build, so a defect to report). Guard:
+    `no_event_ring_is_pinned` reads `agent-ebpf/src/*.rs` at test time
+    (new files included): no `RingBuf::pinned`, every `: RingBuf =` is
+    `with_byte_size`. Left: `agent-ebpf/src/inode_protect.rs:126-128`
+    still has the old "Pinned by-name" paragraph above the BUG-024 note
+    (kernel tree not touched in this lot).
+  - NN-AUD-355 wording. The WARN said only "compiled-in offsets". Now
+    `btf_offsets_unarmed_warning`: without vmlinux BTF and with the net
+    sensor (the agent), the start fails at the latest at the `tcp_close`
+    fexit — the override does not help there, unlike the triage's
+    suggested text; without the net sensor, `attach_anti_tamper` refuses
+    unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`; with BTF present, nothing
+    was resolved before this load.
+  - Also: `agent/examples/posture_demo.rs` did not build on the base tree
+    (its `ProcessSpawn` lacked `argv_truncated` and `filename_truncated`,
+    added by lab PR 187), so the CI's `posture_demo` clippy run failed;
+    the two fields are set.
+  - Tests: `open_sensor` +6 (`a_home_is_a_tree_where_it_resolves_to_an_account_s_own_directory`,
+    `stale_hit_is_refreshed_after_ttl`,
+    `a_changed_table_never_answers_with_a_mount_point_that_lost_its_root`,
+    `a_regular_file_never_polls_a_mount_change`,
+    `bump_generation_propagates_read_error`, `generation_never_moves_back`;
+    `home_roots_read_every_account_s_own_home` replaces
+    `home_roots_reads_regular_accounts_only`), `lineage` +2
+    (`the_image_at_a_time_is_the_sender_s_only`,
+    `stat_start_parses_comm_with_parens`), `multiplexer` +3
+    (`exe_of_a_later_process_is_not_used`, `no_event_ring_is_pinned`,
+    `the_unarmed_btf_warning_says_what_the_start_does`). On the starting
+    tree they do not compile (new items). With the old logic put back in
+    the new code (refresh on a miss only, the old `home_roots` and home
+    loop, `unwrap_or(0)` + 1, a bare `/proc/<pid>/exe`), 8 fail: the two
+    home tests, the two mount-table tests, the two generation tests,
+    `the_image_at_a_time_is_the_sender_s_only` and
+    `exe_of_a_later_process_is_not_used`. `no_event_ring_is_pinned` and
+    `stat_start_parses_comm_with_parens` pass on the old code too
+    (guards).
+  - Host: `cargo fmt`, the three clippy runs (`--workspace --exclude
+    northnarrow-agent-ebpf --all-targets --locked`, `posture_demo` with
+    `posture-demo`, the agent with `test-privileged,debug-trigger`) clean;
+    `cargo test --workspace` 2,547 passed, 0 failed, 21 ignored.
+  - Probe: `opensensor196-probe.sh all` after a fresh install, on the
+    starting tree and on this one (warns, the tmpfs remount cases A–D with
+    the device reuse checked, a service account's `logins.json`, the
+    DNS forwarder attribution, then `nn-lab.sh open-sensor-check`).
+  - Lab: Ubuntu 24.04, opensensor196-probe.sh and `nn-lab.sh open-sensor-check` — before: the build of `main` with lab PRs 176–195; after: this lot on top. A tmpfs written at `/mnt/nn196-a`, then remounted at `/mnt/nn196-b`, `-c` and `-d` (the same device 0:45): every write was still named under `/mnt/nn196-a` before; after the current mount point each time, and `mnt[0:45:1]/…` (unplaced, not a wrong path) for the remount made at once. A `logins.json` under a service account's home: no rule before, NN-L-FIM-015 (Log, High) after. `open-sensor-check` PASS in both (31 inode rules before, 39 after: the homes added). Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.

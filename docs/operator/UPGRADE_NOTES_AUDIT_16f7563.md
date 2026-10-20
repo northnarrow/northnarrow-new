@@ -656,6 +656,21 @@ Now **killed, or answered, where they were recorded or missed**:
   a process canary naming a file whose name is exactly 31 bytes no longer
   equals the kernel's path** (a canary still matches the path the caller
   passed).
+- Credential stores in service accounts' homes (Wave 3, lab PR 196,
+  NN-AUD-353 SNS-010): the file-open sensor's home trees — where a
+  `Login Data`, `logins.json`, `key4.db`, `key3.db`, `signons.sqlite` or
+  `*.kdbx` is reported by name — were `/root` and the accounts with uid
+  1000 to 65533. They are now uid 0's declared home and **every
+  account's home** (Jenkins `/var/lib/jenkins`, GitLab Runner,
+  PostgreSQL `/var/lib/postgresql`, uids above 65534), except `nobody`
+  and the overflow uids, and homes that are shared system directories
+  (`/`, `/nonexistent`, `/var/lib`, `/var/mail`, `/usr/share`, `/tmp`, …,
+  or anything under `/bin`, `/etc`, `/dev`, `/proc`, `/usr/lib`,
+  `/var/empty`). **Regression:** NN-L-FIM-015/-016 can now report such a
+  file read in a service account's home by a process that is not its own
+  client (the reader's own browser or password manager stays exempt; a
+  root reader is recorded, not killed, as before). The new homes are
+  picked up at the next rule refresh (every minute).
 
 ## 6. Posture and COMBAT
 
@@ -1059,6 +1074,18 @@ checked with its tag-bound attestation.
   socket's kernel address, which the journal's readers (`adm`,
   `systemd-journal`) must not learn; the field is the connect's
   timestamp. Update a search on `corr_id=`.
+- **Two WARN texts changed** (lab PR 196; the first words are the same):
+  `ringbuf entries rejected — records of a size this pump does not
+  decode, …` no longer names BUG-024 as a cause (every event ring is
+  per boot; any count is a defect to report), and `BTF_OFFSETS map NOT
+  armed — …` says why (no vmlinux BTF, or nothing resolved before the
+  load) and that a start without BTF does not complete (NN-AUD-355).
+- **File-open paths after a remount** (lab PR 196, NN-AUD-352 SNS-004): a
+  path the sensor cannot place on a mount point it still sees reads
+  `mnt[<major>:<minor>:<root inode>]/…`; for up to 2 s after a mount or
+  an unmount this can be a path that used to read with the old mount
+  point (which was wrong after a device reuse). Search on the path's
+  tail, not only on its mount point.
 - **Lab:** `tamper-check` reads its evidence from the signed records: the
   column reads `deny=signal×1` (detections) where it read `op=signal×1`
   (journal), and its journal part only `errors=`.
