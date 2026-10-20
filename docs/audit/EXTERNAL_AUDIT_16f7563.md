@@ -595,11 +595,11 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-381 | DEP-005 | Low | Deploy | M | fixed (lab PR 184) |
 | NN-AUD-382 | DEP-010 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-383 | DEP-011 | Low | Deploy | — | declined (prerm already requires the signed trusted-installer window; the proposed default archive would leave `agent.sig.key` on disk after a purge) |
-| NN-AUD-384 | DEP-012 | Low | Deploy | S | partly fixed (lab PR 96); open |
+| NN-AUD-384 | DEP-012 | Low | Deploy | S | fixed (lab PR 194) |
 | NN-AUD-385 | DEP-013 | Low | Deploy | S (docs) | open |
 | NN-AUD-386 | DEP-014 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-387 | DEP-015 | Low | Deploy | — | already fixed (lab PR 93) |
-| NN-AUD-388 | DEP-016 | Low | Deploy | S | open |
+| NN-AUD-388 | DEP-016 | Low | Deploy | S | fixed (lab PR 194) |
 | NN-AUD-389 | DEP-017 | Low | Deploy | S | fixed (lab PR 184) |
 | NN-AUD-390 | DEP-018 | Low | Deploy | S | open |
 | NN-AUD-391 | DEP-019 | Low | Deploy | — | already fixed (lab PR 152) |
@@ -651,7 +651,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-437 | WDG-019 | Info | Watchdog tooling | S | fixed (lab PR 170) |
 | NN-AUD-438 | WDG-R15 | Info | Watchdog tooling | S | open |
 | NN-AUD-439 | WDG-R16 | Info | Watchdog tooling | S (docs) | open |
-| NN-AUD-440 | DEP-020 | Info | Deploy | S | open |
+| NN-AUD-440 | DEP-020 | Info | Deploy | S | fixed (lab PR 194) |
 | NN-AUD-441 | DEP-021 | Info | Deploy | S (docs) | open |
 | NN-AUD-442 | DEP-022 | Info | Deploy | — | already fixed (lab PR 150) |
 | NN-AUD-443 | SUP-011 | Info | Supply chain | S | fixed (lab PR 183) |
@@ -8076,3 +8076,85 @@ group, the ones an unprivileged user or a local attacker could use first.
     passed, 0 failed; `wire::admin_protocol` with `debug-trigger` 43
     passed.
   - Lab: Ubuntu 24.04 (mode) and Ubuntu 22.04 (evidence), resphonest193-probe.sh — before: the build of `main` with lab PRs 176–191; after: this lot on top. `nn-admin status`: no response-mode line before; after `response mode : enforcing`, then `DETECT-ONLY (NN_DETECT_ONLY=1) — no response action and no COMBAT isolation touch the system` under the probe's drop-in, and `combat evidence : complete`. With the agent detect-only and `audit.log` made to refuse appends (a directory at its name, inside a trusted-installer window), COMBAT forced: the ladder reached ISOLATE in ~34 s (the WARN "STAGE 3 reached — would engage", no `NORTHNARROW_COMBAT` chain, the gateway answering), three ERRORs "COMBAT stage transition NOT in the signed audit log — enforcement proceeds" with from/to/reason, and status "3 … not written … 3 queued for a late write, 0 dropped"; with the log put back and the unlock, the three `combat_stage` rows written late (`deferred: true`, each with its `occurred_at`), `audit verify` exit 0. The before run of this step did not start (the probe's detect-only check read `/proc/<pid>/environ`, which the agent's own ptrace hook denies to root; the check now reads systemd's unit environment); the old WARN-only path is pinned by the unit tests that fail on it. Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.
+- **Wave 3 — install and uninstall scripts, lab PR 194.** NN-AUD-388
+  (DEP-016, Low), NN-AUD-440 (DEP-020, Info), NN-AUD-384 (DEP-012, Low, the
+  part left after lab PR 96); batch 4 of the Wave 3 triage of the
+  watchdog/deploy group, on the integration tree (`main` with lots up to
+  186, plus lots 187–191). Files: `deploy/install.sh`,
+  `deploy/uninstall.sh`, new `xtask/tests/install_scripts.rs`.
+  - DEP-016 (388, fixed). Re-checked: `verify_release` took the expected
+    checksum from `grep -E " \*?$(basename "$tgz")\$" | head -1`, the
+    tarball's name as a pattern. Its dots matched any character, so a line
+    for `northnarrow-1X2.3-…` listed first was taken for
+    `northnarrow-1.2.3-…` (a spurious REFUSED, never a bypass: the hash is
+    still compared), and a name with a `+` was never found. `sums_expected
+    NAME FILE` (awk, field 2 compared as a string, a leading `*` removed;
+    mawk and gawk) prints the checksum; 1 when no line names the file, 3
+    when lines name it with different checksums (the first one used to be
+    taken), awk's status when the file cannot be read; each case is its own
+    REFUSED line.
+  - DEP-020 (440, fixed). Re-checked: with both units inactive and the pin
+    root still there, the branch for that case opened the window only
+    `if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet
+    northnarrow-agent.service` — never true there (no unit active is the
+    branch's own condition) — and `open_trusted_installer_window` refuses
+    an inactive agent anyway: `--upgrade --grant-key` ended in "PROTECTED".
+    The stale case now runs before the stop path: a pin root nothing
+    protects is removed; a protected one without a key is refused with both
+    ways out named (`--grant-key`; disable the units, reboot, re-run,
+    enable); with a readable key the installed agent is started (its unit
+    only, `start_agent_for_window`: `systemctl start`, then its admin socket
+    within `ADMIN_SOCKET_WAIT`, 30 s) and the run takes the normal path
+    (window, watchdog then agent stopped, purge, drain). That agent is kept
+    out of `UNITS_TO_RESTART` (and so of the package's restart list in
+    `--package-stop`): the units end as they were. A failed start, a
+    refused grant (the started agent keeps running — its stop needs the
+    window — and the message says so) or no socket are explicit failures.
+    The same block (`stale_pin_root`, equal in both scripts, a test keeps
+    it so) serves `uninstall.sh`, whose `--grant-key` was skipped the same
+    way: there the case runs before step 1, not under `--package`. The same
+    class in `uninstall.sh` step 1: each unit was disabled, then stopped;
+    on a protected host without the window the stop is refused (EBPF-001),
+    so both units stayed running but disabled and the script stopped at the
+    pin root. Both are stopped first, checked (5 s), and disabled only when
+    neither runs; otherwise exit 1 with "nothing was disabled or removed"
+    (`--package`: reported, the removal goes on, as before). `install.sh`
+    takes `BPFFS_ROOT` like `uninstall.sh` (the tests' pin root).
+  - DEP-012 (384, fixed, the remaining part). `kept_report` names every
+    private admin key an uninstall without `--purge` leaves:
+    `/root/northnarrow-admin.key` and the legacy `$ETC_DIR/admin.key` of
+    installs before lab PR 96 (host-check knew that path; the summary did
+    not, and host-check goes with nn-admin). `--purge` logs the legacy key
+    by name before removing `$ETC_DIR`. No `--forget-key` (triage).
+    `uninstall.sh --help` printed lines 2–30 of the file, which cut the
+    usage; it prints the whole header now, `--grant-key` included.
+  - Tests: `xtask/tests/install_scripts.rs` (12). The function blocks
+    (`sums_expected`, `kept_report`) and the stop sections of both scripts
+    (install.sh from `stop_nn_unit` to the end of the running-install part,
+    uninstall.sh from `log` to step 2) run under bash with stub
+    `systemctl` (states and cgroup files in a temporary directory), `rm`
+    refusing the pin root until the stub `nn-admin` opens the window,
+    `bpftool`, `sleep`: `sums_expected_matches_the_name_as_a_string`,
+    `verify_release_uses_the_string_lookup`,
+    `both_scripts_share_the_stale_pin_root_block`,
+    `install_starts_the_agent_for_the_window_on_stale_pins` (full and stop
+    modes: one start of the agent unit, none of the watchdog, grant after
+    it, pin root gone, nothing restarted, no restart list),
+    `install_on_stale_pins_without_a_key_names_the_ways_out`,
+    `install_removes_unprotected_stale_pins_without_starting_the_agent`,
+    `install_on_stale_pins_reports_a_refused_grant_or_a_failed_start`,
+    `install_on_a_running_host_is_unchanged`,
+    `uninstall_starts_the_agent_for_the_window_on_stale_pins`,
+    `uninstall_disables_nothing_when_the_stop_is_refused`,
+    `uninstall_names_every_private_key_it_leaves`,
+    `uninstall_help_names_the_grant_key`. On the starting scripts all 12
+    fail (no blocks; the stop sections ignore `BPFFS_ROOT`); with only the
+    pin root path made overridable there, 10 fail — every one but the two
+    regression guards (`install_on_a_running_host_is_unchanged`,
+    `install_removes_unprotected_stale_pins_without_starting_the_agent`).
+    Also run with mawk as `awk`.
+  - Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
+    agent with `test-privileged,debug-trigger`) clean, 2,508 passed, 0
+    failed; `bash -n` on both scripts; shellcheck not installed on the
+    host.
+  - Lab: Debian 12, installsh194-probe.sh with `nn-lab.sh release-check`, `upgrade-check` and `uninstall-check` — before: the build of `main` with lab PRs 176–191; after: this lot on top (the guest put back to both units active each time). `release-check` with a look-alike line first in SHA256SUMS: FAIL before (`install.sh` read the wrong line), PASS after. Units stopped inside a window with the pins left: `install.sh --grant-key` exit 1 with the pins still there before, exit 0 and the pins gone after; `uninstall.sh` the same (exit 1 before, exit 0 and the pins gone after). `uninstall.sh` without a window on a protected running host: refused in both, the units still enabled after. A SHA256SUMS listing the tarball twice with different checksums, or not listing it: refused, with the reason named. Gate: the integration tree of lab PRs 192, 193, 194 and 195 on `main` with lab PRs 176–191: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 88 passed, 0 failed each; Debian 13 (6.12) 41 suites, 87 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,536 passed, 0 failed.

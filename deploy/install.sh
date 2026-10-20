@@ -58,6 +58,8 @@ UNIT_DIR=${UNIT_DIR:-/etc/systemd/system}
 DROPIN_ROOT=${DROPIN_ROOT:-/etc/systemd/system}
 ETC_DIR=${ETC_DIR:-/etc/northnarrow}
 STATE_DIR=${STATE_DIR:-/var/lib/northnarrow}
+# The agent's bpffs pin root (the same override as uninstall.sh).
+BPFFS_ROOT=${BPFFS_ROOT:-/sys/fs/bpf/northnarrow}
 
 AGENT_BIN="$TARGET_DIR/northnarrow-agent"
 WATCHDOG_BIN="$TARGET_DIR/northnarrow-watchdog"
@@ -276,6 +278,30 @@ PROVENANCE="source-tree"
 TARBALL_SHA256=""
 ATTEST_METHOD="none"
 ATTEST_VERIFIED=0
+# >>> sums_expected (run by xtask/tests/install_scripts.rs)
+# External audit DEP-016 (NN-AUD-388): the checksum SHA256SUMS lists for a
+# file NAME. The name used to be pasted into a `grep -E` pattern: its dots
+# matched any character, so a line for another file (`…-1X2.3-…`) listed
+# first was taken for it (a spurious REFUSED), and a name with a `+` was
+# never found. The name is now compared as a string with the second field,
+# a leading `*` (binary mode) removed. Prints the checksum; exit 1 when no
+# line names the file, 3 when lines name it with different checksums (the
+# first one is no longer picked), awk's own status (2) when FILE cannot be
+# read.
+sums_expected() {
+    NN_SUMS_NAME=$1 awk '
+        { n = $2; sub(/^\*/, "", n) }
+        NF == 2 && n == ENVIRON["NN_SUMS_NAME"] {
+            h = tolower($1)
+            if (!(h in seen)) { seen[h] = 1; distinct++; found = h }
+        }
+        END {
+            if (distinct == 0) exit 1
+            if (distinct > 1) exit 3
+            print found
+        }' "$2"
+}
+# <<< sums_expected
 verify_release() {
     if (( ! VERIFY )); then
         PROVENANCE="unverified"
@@ -316,12 +342,17 @@ verify_release() {
     TARBALL_SHA256=$(sha256sum "$tgz" | cut -d' ' -f1)
     sums=${SUMS:-"$(dirname "$tgz")/SHA256SUMS"}
     if [[ -f "$sums" ]]; then
-        local expected
-        expected=$(grep -E " \*?$(basename "$tgz")\$" "$sums" | head -1 | cut -d' ' -f1 || true)
-        if [[ -z "$expected" ]]; then
-            echo "install.sh: REFUSED — $(basename "$tgz") is not listed in $sums" >&2
-            exit 1
-        fi
+        local expected rc=0
+        expected=$(sums_expected "$(basename "$tgz")" "$sums") || rc=$?
+        case $rc in
+            0) ;;
+            1) echo "install.sh: REFUSED — $(basename "$tgz") is not listed in $sums" >&2
+               exit 1 ;;
+            3) echo "install.sh: REFUSED — $sums lists $(basename "$tgz") more than once, with different checksums" >&2
+               exit 1 ;;
+            *) echo "install.sh: REFUSED — $sums could not be read (awk exit $rc)" >&2
+               exit 1 ;;
+        esac
         if [[ "$expected" != "$TARBALL_SHA256" ]]; then
             echo "install.sh: REFUSED — tarball sha256 $TARBALL_SHA256 does not match SHA256SUMS ($expected)" >&2
             exit 1
@@ -669,7 +700,7 @@ wait_own_programs_unloaded() {
             sleep 1
         done
         if nn_unit_has_procs northnarrow-agent || nn_unit_has_procs northnarrow-watchdog \
-           || [[ -d /sys/fs/bpf/northnarrow ]]; then
+           || [[ -d "$BPFFS_ROOT" ]]; then
             echo "install.sh: a NorthNarrow unit still has processes, or the pin root is still there — stop them and re-run" >&2
             return 1
         fi
@@ -717,17 +748,55 @@ open_trusted_installer_window() {
     fi
 }
 purge_pin_root() {
-    [[ -d /sys/fs/bpf/northnarrow ]] || return 0
-    echo "install.sh: dropping /sys/fs/bpf/northnarrow so the LSM programs detach (the new agent re-pins fresh)"
-    rm -rf /sys/fs/bpf/northnarrow 2>/dev/null || true
-    if [[ -d /sys/fs/bpf/northnarrow ]]; then
-        echo "install.sh: /sys/fs/bpf/northnarrow is PROTECTED by the anti-tamper and no trusted-installer window" >&2
-        echo "install.sh: is open (review entry 39). Start the agent again (systemctl start northnarrow-agent)" >&2
-        echo "install.sh: and re-run with --grant-key <admin.key carrying the trusted-installer role>, or open" >&2
-        echo "install.sh: the window yourself: nn-admin trusted-installer-grant --key <key> --window-secs 300" >&2
+    [[ -d "$BPFFS_ROOT" ]] || return 0
+    echo "install.sh: dropping $BPFFS_ROOT so the LSM programs detach (the new agent re-pins fresh)"
+    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+    if [[ -d "$BPFFS_ROOT" ]]; then
+        echo "install.sh: $BPFFS_ROOT is PROTECTED by the anti-tamper and no trusted-installer window" >&2
+        echo "install.sh: is open (review entry 39). Re-run with --grant-key <admin.key carrying the trusted-installer" >&2
+        echo "install.sh: role> (a stopped agent is started for the window), or open the window yourself while the" >&2
+        echo "install.sh: agent runs: nn-admin trusted-installer-grant --key <key> --window-secs 300" >&2
         return 1
     fi
 }
+
+NN_SELF=install.sh
+# >>> stale_pin_root (the same text in install.sh and uninstall.sh; xtask/tests/install_scripts.rs keeps them equal)
+# External audit DEP-020 (NN-AUD-440): both units inactive and the pin root
+# of an agent that is gone still there. Its deny hooks outlive it on purpose,
+# so the pin root, the binaries and the units stay protected, and the
+# trusted-installer window opens only through a running agent's socket: the
+# branch meant for this case asked for an active agent, never true there,
+# and --grant-key was ignored. With the key, the installed agent is started
+# (its unit only; the watchdog stays as it was) until its admin socket is
+# up; the caller opens the window, stops it again and does not restart it.
+ADMIN_SOCKET=${ADMIN_SOCKET:-/run/northnarrow/admin.sock}
+ADMIN_SOCKET_WAIT=${ADMIN_SOCKET_WAIT:-30}
+stale_pin_root_help() {
+    echo "$NN_SELF: the pin root of a stopped agent is PROTECTED by its hooks, and the trusted-installer window"
+    echo "$NN_SELF: opens only through a running agent. Either:"
+    echo "$NN_SELF:   - re-run with --grant-key <admin key carrying the trusted-installer role>: the installed"
+    echo "$NN_SELF:     agent is started for the window, then stopped again; or"
+    echo "$NN_SELF:   - systemctl disable northnarrow-agent northnarrow-watchdog, reboot (bpffs does not survive"
+    echo "$NN_SELF:     a reboot), re-run, then enable the units again."
+}
+start_agent_for_window() {
+    local i
+    echo "$NN_SELF: starting the installed agent (its unit only) to open the trusted-installer window"
+    if ! systemctl start northnarrow-agent.service; then
+        echo "$NN_SELF: the installed agent did not start (systemctl status northnarrow-agent.service)." >&2
+        stale_pin_root_help >&2
+        return 1
+    fi
+    for ((i = 0; i < ADMIN_SOCKET_WAIT; i++)); do
+        [[ -S "$ADMIN_SOCKET" ]] && return 0
+        sleep 1
+    done
+    echo "$NN_SELF: the agent started but $ADMIN_SOCKET did not appear within ${ADMIN_SOCKET_WAIT}s;" >&2
+    echo "$NN_SELF: it keeps running — re-run once nn-admin status answers." >&2
+    return 1
+}
+# <<< stale_pin_root
 
 UNITS_TO_RESTART=()
 if [[ $MODE == configure ]]; then
@@ -753,15 +822,38 @@ if [[ $MODE == stop ]]; then
         UPGRADE=1
     fi
 fi
-if (( ${#UNITS_TO_RESTART[@]} )); then
-    if (( ! UPGRADE )); then
+# Units inactive but the previous install's hooks still pinned: they deny
+# the copy below. A pin root nothing protects any more (or an open window)
+# is removed here; a protected one needs the window, hence a running agent
+# (external audit DEP-020, the stale_pin_root block above). The agent
+# started for it is stopped on the path below and stays out of
+# UNITS_TO_RESTART (and of the package's restart list): the units end as
+# they were.
+STARTED_FOR_WINDOW=0
+if (( ! ${#UNITS_TO_RESTART[@]} )) && [[ -d "$BPFFS_ROOT" ]]; then
+    echo "install.sh: units inactive but $BPFFS_ROOT exists — purging the stale pins first"
+    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+    if [[ -d "$BPFFS_ROOT" ]]; then
+        if [[ -z "$GRANT_KEY" ]]; then
+            stale_pin_root_help >&2
+            exit 1
+        fi
+        [[ -r "$GRANT_KEY" ]] || { echo "install.sh: --grant-key $GRANT_KEY is not readable" >&2; exit 1; }
+        start_agent_for_window || exit 1
+        STARTED_FOR_WINDOW=1
+    fi
+fi
+if (( ${#UNITS_TO_RESTART[@]} || STARTED_FOR_WINDOW )); then
+    if (( ! UPGRADE && ! STARTED_FOR_WINDOW )); then
         echo "install.sh: NorthNarrow is RUNNING (${UNITS_TO_RESTART[*]}) — with the anti-tamper hooks" >&2
         echo "install.sh: active every write below is denied. Re-run with --upgrade to stop, replace and" >&2
         echo "install.sh: restart the units in the right order (keys, audit chain and state are kept)." >&2
         exit 1
     fi
     old_ver=$("$BIN_DIR/northnarrow-agent" --version 2>/dev/null | head -1 || echo "unknown")
-    if [[ $MODE == full ]]; then
+    if (( STARTED_FOR_WINDOW )); then
+        echo "install.sh: $old_ver started only for the window — stopped again below, not restarted"
+    elif [[ $MODE == full ]]; then
         new_ver=$("$AGENT_BIN" --version 2>/dev/null | head -1 || echo "unknown")
         echo "install.sh: UPGRADE — installed: $old_ver → new: $new_ver"
     else
@@ -771,7 +863,11 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     # only a protected pid or an open trusted-installer window may remove it.
     # Open the window now, while the agent still answers on its socket.
     if [[ -n "$GRANT_KEY" ]]; then
-        open_trusted_installer_window "$GRANT_KEY" || exit 1
+        if ! open_trusted_installer_window "$GRANT_KEY"; then
+            (( STARTED_FOR_WINDOW )) &&
+                echo "install.sh: the agent started for the window keeps running (its stop needs the window)" >&2
+            exit 1
+        fi
     fi
     # External audit DEP-006: the ids of the running agent's programs,
     # read while it still runs.
@@ -783,16 +879,6 @@ if (( ${#UNITS_TO_RESTART[@]} )); then
     done
     purge_pin_root || exit 1
     wait_own_programs_unloaded "$own_ids" || exit 1
-fi
-
-if (( ! ${#UNITS_TO_RESTART[@]} )) && [[ -d /sys/fs/bpf/northnarrow ]]; then
-    # Units inactive but the previous install's hooks are still pinned: they
-    # deny the binary copy below. Same purge path (window needed if protected).
-    echo "install.sh: units inactive but /sys/fs/bpf/northnarrow exists — purging the stale pins first"
-    if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet northnarrow-agent.service; then
-        open_trusted_installer_window "$GRANT_KEY" || exit 1
-    fi
-    purge_pin_root || exit 1
 fi
 fi
 
