@@ -29,7 +29,8 @@
 //! - **data line** — [`ChainLine<P>`]: the payload `P` flattened inline
 //!   plus `fmt_ver?`,`prev_hash`,`entry_hash`,`agent_sig`. `fmt_ver` is
 //!   ABSENT on legacy pre-BUG-026 lines (so they still verify
-//!   byte-for-byte) and `Some(`[`CHAINLOG_FMT_V2`]`)` on new lines.
+//!   byte-for-byte), [`CHAINLOG_FMT_V2`] on the lines written up to lab
+//!   PR 204 and [`CHAINLOG_FMT_V3`] on new lines.
 //! - **terminator line** — [`TerminatorLine`]: identified by its
 //!   `rotate` key (a data line never has one). Its `prev_hash` is the
 //!   sealed file's last data line's `entry_hash`; its `entry_hash`
@@ -44,6 +45,13 @@
 //! **Versioning:** the terminator, the manifest entry, and the data
 //! envelope each carry an `fmt_ver`, so the on-disk shape can evolve
 //! without breaking already-rotated files (a verifier dispatches on it).
+//! External audit EVD-007/EVD-008 (lab PR 204): v1/v2 lines are signed over
+//! `SHA-256(prev_hash ‖ json)`, the same for every log and line type; v3
+//! lines over `SHA-256(domain ‖ prev_hash ‖ json)` with a domain per log
+//! ([`ChainPayload::KIND`]) and line type ([`LineRole`]), and must be
+//! byte-canonical ([`CHAINLOG_FMT_V3`]). The writer writes v3 only; the old
+//! lines keep verifying with their own pre-image, and none may follow a v3
+//! line.
 //!
 //! ## Anti-tamper interaction (the reason rotation is not a plain rename)
 //!
@@ -75,9 +83,94 @@ use tracing::{error, warn};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
 
-/// On-disk format version this module writes. v1 (the legacy flat line
-/// with NO `fmt_ver`) is still read + verified; we never write it.
+/// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
+/// line (the legacy flat line, NO `fmt_ver`) and a v2 line are read and
+/// verified with the untagged pre-image they were signed with; never
+/// written again.
 pub const CHAINLOG_FMT_V2: u32 = 2;
+
+/// External audit EVD-007, EVD-008, EVD-023 (NN-AUD-273, NN-AUD-274,
+/// NN-AUD-427, lab PR 204): the format this module writes, for data lines,
+/// terminators and manifest lines alike. Its pre-image is
+/// `SHA-256(domain ‖ prev_hash ‖ json)` with `domain` =
+/// `northnarrow/chainlog/<kind>/<role>/v3\0` ([`chain_domain`]): `<kind>` the
+/// log ([`ChainPayload::KIND`]), `<role>` the line type ([`LineRole`]). The
+/// same agent key signs every log, and a line signed for one log or one line
+/// type no longer verifies in another. A v3 line must also be byte-canonical:
+/// the verifier re-serialises the decoded line, hash and signature included,
+/// and the result must be the bytes on disk ([`LogSetError::NonCanonicalLine`];
+/// a key added, a key order or a spelling of a value the writer does not
+/// produce is refused, where the hash alone covered only the modelled fields).
+/// Once a set holds a v3 line, a later line in the old format is refused
+/// ([`LogSetError::LegacyAfterV3`]).
+pub const CHAINLOG_FMT_V3: u32 = 3;
+
+/// The payload of one rotating log. External audit EVD-008 (NN-AUD-274, lab
+/// PR 204).
+pub trait ChainPayload {
+    /// The log's name in every v3 pre-image ([`chain_domain`]). PERSISTENT:
+    /// part of the signed bytes of every line written, `[a-z0-9_]`, 3 to 32
+    /// characters, never given to another payload type.
+    const KIND: &'static str;
+}
+
+/// The line types of a rotating log, each signed under its own domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineRole {
+    /// [`ChainLine`].
+    Data,
+    /// [`TerminatorLine`].
+    Terminator,
+    /// [`ManifestLine`].
+    Manifest,
+}
+
+impl LineRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LineRole::Data => "data",
+            LineRole::Terminator => "terminator",
+            LineRole::Manifest => "manifest",
+        }
+    }
+}
+
+/// The v3 pre-image prefix of a `role` line of the log `kind`:
+/// `northnarrow/chainlog/<kind>/<role>/v3\0`. At least 33 bytes, so it never
+/// lines up with an untagged pre-image (32 bytes of `prev_hash`, then the
+/// row's `{`), and distinct from the flat chains'
+/// (`northnarrow/audit/v2\0`, `northnarrow/canary-…`).
+pub fn chain_domain(kind: &str, role: LineRole) -> Result<Vec<u8>> {
+    let ok = (3..=32).contains(&kind.len())
+        && kind
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !ok {
+        return Err(anyhow!(
+            "chain log kind {kind:?} is not 3 to 32 characters of [a-z0-9_]"
+        ));
+    }
+    Ok(format!("northnarrow/chainlog/{kind}/{}/v3\0", role.as_str()).into_bytes())
+}
+
+/// Which pre-image a line was signed with, from its version field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreImage {
+    /// v1/v2: `SHA-256(prev_hash ‖ json)`, untagged.
+    Legacy,
+    /// [`CHAINLOG_FMT_V3`].
+    V3,
+}
+
+fn pre_image(fmt_ver: Option<u32>) -> std::result::Result<PreImage, String> {
+    match fmt_ver {
+        None | Some(0..=CHAINLOG_FMT_V2) => Ok(PreImage::Legacy),
+        Some(CHAINLOG_FMT_V3) => Ok(PreImage::V3),
+        Some(v) => Err(format!(
+            "fmt_ver {v}: a format this reader does not know (it reads up to {CHAINLOG_FMT_V3})"
+        )),
+    }
+}
 
 /// Width of the zero-padded archive sequence suffix (`.NNNNNN`).
 const SEQ_WIDTH: usize = 6;
@@ -213,17 +306,280 @@ pub struct ManifestLine {
 
 // ── hashing / signing (shared pre-image rule) ───────────────────────
 
-/// `SHA-256(prev_hash_bytes ‖ canonical_json(body))` where `body` is the
-/// line struct with `entry_hash`/`agent_sig` already empty. Mirrors
-/// `audit::compute_entry_hash` so the rule is identical across every
-/// chain in the system.
-fn chain_digest<T: Serialize>(body: &T, prev_hash: &str) -> Result<[u8; 32]> {
-    let prev = hex::decode(prev_hash).map_err(|e| anyhow!("prev_hash not hex: {e}"))?;
-    let json = serde_json::to_vec(body).map_err(|e| anyhow!("serialising chain pre-image: {e}"))?;
+/// One line type of a rotating log: its chain fields and the version field
+/// that selects its pre-image.
+trait Frame: Serialize {
+    const ROLE: LineRole;
+    fn fmt_ver(&self) -> Option<u32>;
+    fn prev(&self) -> &str;
+    /// `(entry_hash, agent_sig)`.
+    fn seal(&self) -> (&str, &str);
+    fn seal_mut(&mut self) -> (&mut String, &mut String);
+}
+
+impl<P: Serialize> Frame for ChainLine<P> {
+    const ROLE: LineRole = LineRole::Data;
+    fn fmt_ver(&self) -> Option<u32> {
+        self.fmt_ver
+    }
+    fn prev(&self) -> &str {
+        &self.prev_hash
+    }
+    fn seal(&self) -> (&str, &str) {
+        (&self.entry_hash, &self.agent_sig)
+    }
+    fn seal_mut(&mut self) -> (&mut String, &mut String) {
+        (&mut self.entry_hash, &mut self.agent_sig)
+    }
+}
+
+impl Frame for TerminatorLine {
+    const ROLE: LineRole = LineRole::Terminator;
+    fn fmt_ver(&self) -> Option<u32> {
+        Some(self.rotate.fmt_ver)
+    }
+    fn prev(&self) -> &str {
+        &self.prev_hash
+    }
+    fn seal(&self) -> (&str, &str) {
+        (&self.entry_hash, &self.agent_sig)
+    }
+    fn seal_mut(&mut self) -> (&mut String, &mut String) {
+        (&mut self.entry_hash, &mut self.agent_sig)
+    }
+}
+
+impl Frame for ManifestLine {
+    const ROLE: LineRole = LineRole::Manifest;
+    fn fmt_ver(&self) -> Option<u32> {
+        Some(self.manifest.fmt_ver)
+    }
+    fn prev(&self) -> &str {
+        &self.prev_hash
+    }
+    fn seal(&self) -> (&str, &str) {
+        (&self.entry_hash, &self.agent_sig)
+    }
+    fn seal_mut(&mut self) -> (&mut String, &mut String) {
+        (&mut self.entry_hash, &mut self.agent_sig)
+    }
+}
+
+/// The digest a line of the log `kind` is signed over: `SHA-256(prev_hash
+/// ‖ json)` for a v1/v2 line, `SHA-256(domain ‖ prev_hash ‖ json)` for a v3
+/// one ([`CHAINLOG_FMT_V3`]), `json` the line with `entry_hash` and
+/// `agent_sig` empty, `prev_hash` its own.
+///
+/// External audit EVD-023 (NN-AUD-427, lab PR 204): a line that still
+/// carries its `entry_hash` or `agent_sig` is an error, in every build — the
+/// rule was a comment, and a caller that forgot to clear them hashed a
+/// pre-image no verifier reproduces.
+fn chain_digest<T: Frame>(line: &T, kind: &str) -> Result<[u8; 32]> {
+    let (hash, sig) = line.seal();
+    if !hash.is_empty() || !sig.is_empty() {
+        return Err(anyhow!(
+            "chain pre-image carries its own entry_hash or agent_sig: refused"
+        ));
+    }
+    let domain = match pre_image(line.fmt_ver()).map_err(|e| anyhow!(e))? {
+        PreImage::Legacy => None,
+        PreImage::V3 => Some(chain_domain(kind, T::ROLE)?),
+    };
+    let prev = hex::decode(line.prev()).map_err(|e| anyhow!("prev_hash not hex: {e}"))?;
+    let json = serde_json::to_vec(line).map_err(|e| anyhow!("serialising chain pre-image: {e}"))?;
     let mut h = Sha256::new();
+    if let Some(d) = &domain {
+        h.update(d);
+    }
     h.update(&prev);
     h.update(&json);
     Ok(h.finalize().into())
+}
+
+/// Hash and sign `line` (its seal empty) for the log `kind`, in the format
+/// its version field names.
+fn seal_line<T: Frame>(mut line: T, key: &AgentSigningKey, kind: &str) -> Result<T> {
+    let digest = chain_digest(&line, kind)?;
+    let (hash, sig) = line.seal_mut();
+    *hash = hex::encode(digest);
+    *sig = B64.encode(key.sign(&digest).to_bytes());
+    Ok(line)
+}
+
+/// Why one line of a rotating log does not verify on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LineFault {
+    /// It does not decode as its line type, names a format this reader does
+    /// not know, or its `prev_hash` is not hex.
+    Malformed(String),
+    EntryHash {
+        recomputed: String,
+        stored: String,
+    },
+    /// `agent_sig` is not 64 bytes of base64.
+    SigMalformed(String),
+    SigInvalid,
+    /// External audit EVD-007: a v3 line whose hash and signature verify but
+    /// whose bytes are not its canonical serialisation.
+    NonCanonical,
+}
+
+/// A line that verified on its own (its link is the caller's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineOk {
+    prev_hash: String,
+    entry_hash: String,
+    pre_image: PreImage,
+    /// A v1/v2 line whose bytes differ from its canonical serialisation:
+    /// counted, not refused (it verifies as it always did).
+    non_canonical_legacy: bool,
+}
+
+/// Verify one decoded line against `raw`, its bytes on disk (without the
+/// newline): the pre-image its version names, its hash, its signature
+/// (strict, NN-AUD-292), and for v3 that `raw` is its canonical
+/// serialisation (external audit EVD-007).
+fn verify_frame<T: Frame>(
+    mut line: T,
+    raw: &[u8],
+    kind: &str,
+    pk: &VerifyingKey,
+) -> std::result::Result<(LineOk, T), LineFault> {
+    let pre = pre_image(line.fmt_ver()).map_err(LineFault::Malformed)?;
+    let (stored, sig) = {
+        let (h, s) = line.seal_mut();
+        (std::mem::take(h), std::mem::take(s))
+    };
+    let digest = chain_digest(&line, kind).map_err(|e| LineFault::Malformed(format!("{e:#}")))?;
+    let recomputed = hex::encode(digest);
+    if recomputed != stored {
+        return Err(LineFault::EntryHash { recomputed, stored });
+    }
+    let sig_bytes = B64
+        .decode(&sig)
+        .map_err(|e| LineFault::SigMalformed(format!("agent_sig b64: {e}")))?;
+    let sig_arr = <[u8; 64]>::try_from(sig_bytes.as_slice())
+        .map_err(|_| LineFault::SigMalformed(format!("agent_sig len {} != 64", sig_bytes.len())))?;
+    // External audit NN-AUD-292 (FIMP-013): strict.
+    if pk
+        .verify_strict(&digest, &Signature::from_bytes(&sig_arr))
+        .is_err()
+    {
+        return Err(LineFault::SigInvalid);
+    }
+    {
+        let (h, s) = line.seal_mut();
+        *h = stored;
+        *s = sig;
+    }
+    let canonical = serde_json::to_vec(&line).is_ok_and(|b| b == raw);
+    if pre == PreImage::V3 && !canonical {
+        return Err(LineFault::NonCanonical);
+    }
+    let ok = LineOk {
+        prev_hash: line.prev().to_string(),
+        entry_hash: line.seal().0.to_string(),
+        pre_image: pre,
+        non_canonical_legacy: pre == PreImage::Legacy && !canonical,
+    };
+    Ok((ok, line))
+}
+
+/// A data line or a terminator of an active file or archive.
+enum ActiveLine {
+    Data,
+    Terminator(RotateTerminator),
+}
+
+/// Whether a raw line is a terminator: it has a top-level `rotate` key,
+/// which no data line may carry ([`RESERVED_LINE_KEYS`]).
+fn has_rotate_key(raw: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()
+        .is_some_and(|v| v.get("rotate").is_some())
+}
+
+/// Decode and verify one raw line of an active file or archive of the log
+/// of `P` ([`verify_frame`]).
+fn verify_active_line<P: Serialize + DeserializeOwned + ChainPayload>(
+    raw: &[u8],
+    pk: &VerifyingKey,
+) -> std::result::Result<(LineOk, ActiveLine), LineFault> {
+    if has_rotate_key(raw) {
+        let t: TerminatorLine = serde_json::from_slice(raw)
+            .map_err(|e| LineFault::Malformed(format!("terminator decode: {e}")))?;
+        let (ok, t) = verify_frame(t, raw, P::KIND, pk)?;
+        Ok((ok, ActiveLine::Terminator(t.rotate)))
+    } else {
+        let d: ChainLine<P> = serde_json::from_slice(raw)
+            .map_err(|e| LineFault::Malformed(format!("data decode: {e}")))?;
+        let (ok, _) = verify_frame(d, raw, P::KIND, pk)?;
+        Ok((ok, ActiveLine::Data))
+    }
+}
+
+/// Decode and verify one raw manifest line of the log `kind`.
+fn verify_manifest_line(
+    raw: &[u8],
+    kind: &str,
+    pk: &VerifyingKey,
+) -> std::result::Result<(LineOk, ManifestLine), LineFault> {
+    let m: ManifestLine = serde_json::from_slice(raw)
+        .map_err(|e| LineFault::Malformed(format!("manifest decode: {e}")))?;
+    verify_frame(m, raw, kind, pk)
+}
+
+impl LineFault {
+    /// The verifier's error for this fault at line `idx` of `file`.
+    fn at(self, file: &str, idx: usize) -> LogSetError {
+        let file = file.to_string();
+        match self {
+            LineFault::Malformed(reason) | LineFault::SigMalformed(reason) => {
+                LogSetError::Malformed { file, idx, reason }
+            }
+            LineFault::EntryHash { recomputed, stored } => LogSetError::EntryHashMismatch {
+                file,
+                idx,
+                recomputed,
+                stored,
+            },
+            LineFault::SigInvalid => LogSetError::SignatureInvalid { file, idx },
+            LineFault::NonCanonical => LogSetError::NonCanonicalLine { file, idx },
+        }
+    }
+
+    /// The tail recovery's view of it ([`LineCheck`]).
+    fn check(&self) -> LineCheck {
+        match self {
+            LineFault::SigMalformed(_) | LineFault::SigInvalid => LineCheck::BadSignature,
+            LineFault::Malformed(_) | LineFault::EntryHash { .. } | LineFault::NonCanonical => {
+                LineCheck::Invalid
+            }
+        }
+    }
+}
+
+/// External audit EVD-008 (lab PR 204): once a v3 line has been seen in a
+/// set (or a manifest), a later line in the old format is refused — the
+/// untagged pre-image is accepted only for what was written before the
+/// upgrade.
+fn track_format(
+    ok: &LineOk,
+    seen_v3: &mut bool,
+    file: &str,
+    idx: usize,
+) -> std::result::Result<(), LogSetError> {
+    match ok.pre_image {
+        PreImage::V3 => {
+            *seen_v3 = true;
+            Ok(())
+        }
+        PreImage::Legacy if *seen_v3 => Err(LogSetError::LegacyAfterV3 {
+            file: file.to_string(),
+            idx,
+        }),
+        PreImage::Legacy => Ok(()),
+    }
 }
 
 fn now_ts() -> String {
@@ -268,51 +624,66 @@ fn check_reserved_keys<P: Serialize>(payload: &P) -> Result<()> {
     Ok(())
 }
 
-impl<P: Serialize> ChainLine<P> {
-    /// Build a fully-signed v2 data line chained off `prev_hash`.
+impl<P: Serialize + ChainPayload> ChainLine<P> {
+    /// Build a fully-signed v3 data line chained off `prev_hash`.
     fn sealed(payload: P, key: &AgentSigningKey, prev_hash: &str) -> Result<Self> {
-        let mut line = ChainLine {
+        Self::sealed_as(payload, Some(CHAINLOG_FMT_V3), key, prev_hash)
+    }
+
+    /// A data line in the format `fmt_ver` names (the writer: v3; the
+    /// tests' legacy fixtures: `None` or v2).
+    fn sealed_as(
+        payload: P,
+        fmt_ver: Option<u32>,
+        key: &AgentSigningKey,
+        prev_hash: &str,
+    ) -> Result<Self> {
+        let line = ChainLine {
             payload,
-            fmt_ver: Some(CHAINLOG_FMT_V2),
+            fmt_ver,
             prev_hash: prev_hash.to_string(),
             entry_hash: String::new(),
             agent_sig: String::new(),
         };
-        let digest = chain_digest(&line, prev_hash)?;
-        line.entry_hash = hex::encode(digest);
-        line.agent_sig = B64.encode(key.sign(&digest).to_bytes());
-        Ok(line)
+        seal_line(line, key, P::KIND)
     }
 }
 
 impl TerminatorLine {
-    fn sealed(rotate: RotateTerminator, key: &AgentSigningKey, prev_hash: &str) -> Result<Self> {
-        let mut line = TerminatorLine {
+    /// The seal of the log `kind`, in the format `rotate.fmt_ver` names.
+    fn sealed(
+        rotate: RotateTerminator,
+        key: &AgentSigningKey,
+        prev_hash: &str,
+        kind: &str,
+    ) -> Result<Self> {
+        let line = TerminatorLine {
             rotate,
             ts: now_ts(),
             prev_hash: prev_hash.to_string(),
             entry_hash: String::new(),
             agent_sig: String::new(),
         };
-        let digest = chain_digest(&line, prev_hash)?;
-        line.entry_hash = hex::encode(digest);
-        line.agent_sig = B64.encode(key.sign(&digest).to_bytes());
-        Ok(line)
+        seal_line(line, key, kind)
     }
 }
 
 impl ManifestLine {
-    fn sealed(manifest: ManifestEntry, key: &AgentSigningKey, prev_hash: &str) -> Result<Self> {
-        let mut line = ManifestLine {
+    /// A manifest row of the log `kind`, in the format `manifest.fmt_ver`
+    /// names.
+    fn sealed(
+        manifest: ManifestEntry,
+        key: &AgentSigningKey,
+        prev_hash: &str,
+        kind: &str,
+    ) -> Result<Self> {
+        let line = ManifestLine {
             manifest,
             prev_hash: prev_hash.to_string(),
             entry_hash: String::new(),
             agent_sig: String::new(),
         };
-        let digest = chain_digest(&line, prev_hash)?;
-        line.entry_hash = hex::encode(digest);
-        line.agent_sig = B64.encode(key.sign(&digest).to_bytes());
-        Ok(line)
+        seal_line(line, key, kind)
     }
 }
 
@@ -545,7 +916,7 @@ pub const CHECKPOINT_EVERY_RECORDS: u64 = 1000;
 /// ...or after this long with records appended since the last one.
 pub const CHECKPOINT_EVERY_SECS: u64 = 600;
 
-impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
+impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
     /// Open (or initialise) the log at `active_path`. Scans existing
     /// archives to recover `next_seq`, walks the (bounded) active file
     /// for its tail/size/count, and completes a half-finished rotation
@@ -567,7 +938,7 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         // chain continues from it or a rotation is completed on its word.
         let pubkey = key.verifying_key();
         let check_active = |l: &[u8]| check_active_line::<P>(l, &pubkey);
-        let check_manifest = |l: &[u8]| check_manifest_line(l, &pubkey);
+        let check_manifest = |l: &[u8]| check_manifest_line(l, P::KIND, &pubkey);
         // Recover the manifest tail O(1). If a prior crash tore its last
         // line, truncate the fragment so the next manifest line can't fuse
         // with it; the repair is attested below (once the log can sign one).
@@ -672,7 +1043,7 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         // manifest already says exactly that. Non-fatal.
         if log.pending_seal.is_none() && log.active_bytes > 0 {
             let current = (log.next_seq, log.active_bytes, log.last_hash.clone());
-            let anchored = manifest_tail_events(&log.active_path, &pubkey)
+            let anchored = manifest_tail_events(&log.active_path, P::KIND, &pubkey)
                 .into_iter()
                 .find_map(|e| match e {
                     ManifestEvent::ActiveCheckpoint {
@@ -894,7 +1265,7 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
         self.next_seq = seq;
         let term = TerminatorLine::sealed(
             RotateTerminator {
-                fmt_ver: CHAINLOG_FMT_V2,
+                fmt_ver: CHAINLOG_FMT_V3,
                 this_seq: seq,
                 next_seq: seq + 1,
                 record_count: self.active_records,
@@ -902,6 +1273,7 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
             },
             &self.key,
             &self.last_hash,
+            P::KIND,
         )?;
         let terminator_hash = term.entry_hash.clone();
         let sealed_bytes = self.active_bytes;
@@ -1162,11 +1534,11 @@ impl<P: Serialize + DeserializeOwned> RotatingChainLog<P> {
 
     fn manifest_append(&mut self, event: ManifestEvent) -> Result<()> {
         let entry = ManifestEntry {
-            fmt_ver: CHAINLOG_FMT_V2,
+            fmt_ver: CHAINLOG_FMT_V3,
             ts: now_ts(),
             event,
         };
-        let line = ManifestLine::sealed(entry, &self.key, &self.manifest_last_hash)?;
+        let line = ManifestLine::sealed(entry, &self.key, &self.manifest_last_hash, P::KIND)?;
         append_and_fsync(&self.manifest_path, &to_jsonl(&line)?, self.cfg.file_mode)?;
         self.manifest_last_hash = line.entry_hash;
         Ok(())
@@ -1670,84 +2042,53 @@ fn is_chain_hash(h: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Recompute `stored` from the stripped line and verify `sig` over it.
-fn check_digest(digest: Result<[u8; 32]>, stored: &str, sig: &str, pk: &VerifyingKey) -> LineCheck {
-    let Ok(digest) = digest else {
-        return LineCheck::Invalid;
-    };
-    if hex::encode(digest) != stored {
-        return LineCheck::Invalid;
-    }
-    let sig_ok = B64
-        .decode(sig)
-        .ok()
-        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
-        // External audit NN-AUD-292 (FIMP-013): strict.
-        .is_some_and(|b| {
-            pk.verify_strict(&digest, &Signature::from_bytes(&b))
-                .is_ok()
-        });
-    if sig_ok {
-        LineCheck::Verified {
-            terminator_seq: None,
-        }
-    } else {
-        LineCheck::BadSignature
-    }
-}
-
 /// Typed check of an active-file line (data line or terminator), with the
-/// same pre-image rule as [`verify_one_file`].
-fn check_active_line<P: Serialize + DeserializeOwned>(line: &[u8], pk: &VerifyingKey) -> LineCheck {
-    let is_terminator = serde_json::from_slice::<serde_json::Value>(line)
-        .ok()
-        .is_some_and(|v| v.get("rotate").is_some());
-    if is_terminator {
-        let Ok(mut t) = serde_json::from_slice::<TerminatorLine>(line) else {
-            return LineCheck::Invalid;
-        };
-        let (stored, sig) = (
-            std::mem::take(&mut t.entry_hash),
-            std::mem::take(&mut t.agent_sig),
-        );
-        match check_digest(chain_digest(&t, &t.prev_hash), &stored, &sig, pk) {
-            LineCheck::Verified { .. } => LineCheck::Verified {
-                terminator_seq: Some(t.rotate.this_seq),
-            },
-            other => other,
-        }
-    } else {
-        let Ok(mut d) = serde_json::from_slice::<ChainLine<P>>(line) else {
-            return LineCheck::Invalid;
-        };
-        let (stored, sig) = (
-            std::mem::take(&mut d.entry_hash),
-            std::mem::take(&mut d.agent_sig),
-        );
-        check_digest(chain_digest(&d, &d.prev_hash), &stored, &sig, pk)
+/// same rule as [`verify_one_file`] (external audit EVD-007/EVD-008: the
+/// pre-image its version names, and for v3 its canonical bytes).
+fn check_active_line<P: Serialize + DeserializeOwned + ChainPayload>(
+    line: &[u8],
+    pk: &VerifyingKey,
+) -> LineCheck {
+    match verify_active_line::<P>(line, pk) {
+        Ok((_, ActiveLine::Terminator(rotate))) => LineCheck::Verified {
+            terminator_seq: Some(rotate.this_seq),
+        },
+        Ok((_, ActiveLine::Data)) => LineCheck::Verified {
+            terminator_seq: None,
+        },
+        Err(fault) => fault.check(),
     }
 }
 
 /// External audit NN-AUD-112: whether one raw line of an active file or
 /// archive is a genuine line of this log (data line or terminator: it
-/// decodes, its hash recomputes, its signature verifies). Its link to the
-/// line before is the verifier's.
-pub fn line_is_genuine<P: Serialize + DeserializeOwned>(line: &[u8], pk: &VerifyingKey) -> bool {
+/// decodes, its hash recomputes, its signature verifies, and a v3 line is
+/// one of this log, in its canonical bytes). Its link to the line before is
+/// the verifier's.
+pub fn line_is_genuine<P: Serialize + DeserializeOwned + ChainPayload>(
+    line: &[u8],
+    pk: &VerifyingKey,
+) -> bool {
     matches!(check_active_line::<P>(line, pk), LineCheck::Verified { .. })
 }
 
-/// Whether one raw manifest line is genuine.
-pub fn manifest_line_is_genuine(line: &[u8], pk: &VerifyingKey) -> bool {
-    matches!(check_manifest_line(line, pk), LineCheck::Verified { .. })
+/// Whether one raw manifest line is a genuine row of the manifest of the
+/// log `kind` ([`ChainPayload::KIND`]).
+pub fn manifest_line_is_genuine(line: &[u8], kind: &str, pk: &VerifyingKey) -> bool {
+    matches!(
+        check_manifest_line(line, kind, pk),
+        LineCheck::Verified { .. }
+    )
 }
 
 /// Bytes read from the end of a manifest by [`manifest_tail_events`].
 const MANIFEST_TAIL_WINDOW: u64 = 256 * 1024;
 
 /// External audit NN-AUD-109: the genuine events in the last
-/// [`MANIFEST_TAIL_WINDOW`] bytes of the manifest of `active`, newest
-/// first. Lines that do not verify are left out.
-pub fn manifest_tail_events(active: &Path, pk: &VerifyingKey) -> Vec<ManifestEvent> {
+/// [`MANIFEST_TAIL_WINDOW`] bytes of the manifest of `active`, the log
+/// `kind` ([`ChainPayload::KIND`]), newest first. Lines that do not verify
+/// are left out.
+pub fn manifest_tail_events(active: &Path, kind: &str, pk: &VerifyingKey) -> Vec<ManifestEvent> {
     let path = manifest_path_for(active);
     let mut f = match OpenOptions::new()
         .read(true)
@@ -1777,8 +2118,9 @@ pub fn manifest_tail_events(active: &Path, pk: &VerifyingKey) -> Vec<ManifestEve
         .rev()
         .filter(|l| !l.is_empty())
         .filter_map(|l| {
-            let m: ManifestLine = serde_json::from_slice(l).ok()?;
-            manifest_line_is_genuine(l, pk).then_some(m.manifest.event)
+            verify_manifest_line(l, kind, pk)
+                .ok()
+                .map(|(_, m)| m.manifest.event)
         })
         .collect()
 }
@@ -1804,16 +2146,14 @@ pub fn active_missing(active: &Path, tail: &[ManifestEvent]) -> Option<String> {
         })
 }
 
-/// Typed check of a manifest line.
-fn check_manifest_line(line: &[u8], pk: &VerifyingKey) -> LineCheck {
-    let Ok(mut m) = serde_json::from_slice::<ManifestLine>(line) else {
-        return LineCheck::Invalid;
-    };
-    let (stored, sig) = (
-        std::mem::take(&mut m.entry_hash),
-        std::mem::take(&mut m.agent_sig),
-    );
-    check_digest(chain_digest(&m, &m.prev_hash), &stored, &sig, pk)
+/// Typed check of a manifest line of the log `kind`.
+fn check_manifest_line(line: &[u8], kind: &str, pk: &VerifyingKey) -> LineCheck {
+    match verify_manifest_line(line, kind, pk) {
+        Ok(_) => LineCheck::Verified {
+            terminator_seq: None,
+        },
+        Err(fault) => fault.check(),
+    }
 }
 
 /// Find the last complete, chain-shaped line in `buf` (= file bytes
@@ -2005,6 +2345,15 @@ pub struct LogSetReport {
     pub total_records: u64,
     /// External audit NN-AUD-109: manifest checkpoints found reachable.
     pub checkpoints_verified: usize,
+    /// External audit EVD-008 (lab PR 204): lines in the format from before
+    /// v3 (data lines, terminators and manifest rows), verified with the
+    /// untagged pre-image they were signed with. Every line after them is v3.
+    pub legacy_lines: u64,
+    /// External audit EVD-007 (lab PR 204): of those, the lines whose bytes
+    /// are not their canonical serialisation (a key the type does not have,
+    /// another key order or spelling): they verify as they always did, but
+    /// the signature does not cover those bytes.
+    pub non_canonical_legacy: u64,
 }
 
 /// Why a chainlog set failed verification.
@@ -2028,6 +2377,24 @@ pub enum LogSetError {
     },
     #[error("file {file}: entry {idx}: signature invalid")]
     SignatureInvalid { file: String, idx: usize },
+    /// External audit EVD-007 (NN-AUD-273, lab PR 204): a v3 line whose hash
+    /// and signature verify, but whose bytes are not the serialisation of
+    /// what they decode to — a key added, keys reordered, a value spelled
+    /// another way. The signature covers the decoded line, not those bytes.
+    #[error(
+        "file {file}: entry {idx}: a v3 line not in its canonical form (the bytes on disk are \
+         not what the agent wrote: a key added, reordered or re-spelled)"
+    )]
+    NonCanonicalLine { file: String, idx: usize },
+    /// External audit EVD-008 (NN-AUD-274, lab PR 204): a line in the format
+    /// from before v3 after a v3 line of the same set or manifest. The
+    /// agent writes only v3; the untagged pre-image is accepted only for
+    /// the lines written before the upgrade.
+    #[error(
+        "file {file}: entry {idx}: a line in the old format (v1/v2, untagged pre-image) after \
+         v3 lines"
+    )]
+    LegacyAfterV3 { file: String, idx: usize },
     #[error("archive sequence gap: expected seq {expected}, found {found}")]
     SequenceGap { expected: u64, found: u64 },
     #[error("archive {seq}: terminator this_seq {got} != {seq}")]
@@ -2077,6 +2444,10 @@ struct ManifestFacts {
     rotated: std::collections::BTreeSet<u64>,
     /// `ActiveCheckpoint` rows: (generation, bytes, tail_hash).
     checkpoints: Vec<(u64, u64, String)>,
+    /// Manifest rows in the format from before v3, and those of them not in
+    /// canonical form (see [`LogSetReport`]).
+    legacy_lines: u64,
+    non_canonical_legacy: u64,
 }
 
 /// Verify the entire rotation set for `active_path` end-to-end against
@@ -2091,7 +2462,13 @@ struct ManifestFacts {
 /// of its generation, and the active file may be absent only when the
 /// newest archive has no `Rotated` row yet (the crash window between the
 /// rename and the create).
-pub fn verify_log_set<P: Serialize + DeserializeOwned>(
+///
+/// External audit EVD-007/EVD-008 (lab PR 204): every line is checked with
+/// the pre-image its version names ([`CHAINLOG_FMT_V3`] for new lines, the
+/// untagged one for v1/v2 lines) and, for v3, its canonical bytes; no line in
+/// the old format may follow a v3 line of the set (data lines and
+/// terminators) or of the manifest.
+pub fn verify_log_set<P: Serialize + DeserializeOwned + ChainPayload>(
     active_path: &Path,
     pubkey: &VerifyingKey,
 ) -> Result<LogSetReport, LogSetError> {
@@ -2115,7 +2492,7 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
     // External audit NN-AUD-109: the manifest is read whole every time —
     // its checkpoints and `Rotated` rows bound the suffix of the set.
-    let facts = verify_manifest(active_path, pubkey)?;
+    let facts = verify_manifest(active_path, P::KIND, pubkey)?;
     let evicted = &facts.evicted;
     if earliest_retained_seq > 1 {
         // External audit EVD-022 (lab PR 190): the first seq below the
@@ -2140,6 +2517,10 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
     }
 
     let mut total_records = 0u64;
+    let mut legacy_lines = facts.legacy_lines;
+    let mut non_canonical_legacy = facts.non_canonical_legacy;
+    // External audit EVD-008: one format history for the whole set.
+    let mut seen_v3 = false;
     let active_gen = seqs.last().map_or(1, |m| m + 1);
     let mut checkpoints_verified = 0usize;
     // Checkpoints of generations past the active one: newer archives gone.
@@ -2179,8 +2560,17 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
         }
         let path = archive_path(active_path, seq);
         let wanted = checkpoints_of(seq);
-        let walk = verify_one_file::<P>(&path, &expected_prev, pubkey, Some(seq), &wanted)?;
+        let walk = verify_one_file::<P>(
+            &path,
+            &expected_prev,
+            pubkey,
+            Some(seq),
+            &wanted,
+            &mut seen_v3,
+        )?;
         total_records += walk.records;
+        legacy_lines += walk.legacy_lines;
+        non_canonical_legacy += walk.non_canonical_legacy;
         checkpoints_verified += reach_checkpoints(&path, seq, &wanted, &walk)?;
         expected_prev = walk
             .terminator
@@ -2206,8 +2596,17 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
         }
     }
     let wanted = checkpoints_of(active_gen);
-    let walk = verify_one_file::<P>(active_path, &expected_prev, pubkey, None, &wanted)?;
+    let walk = verify_one_file::<P>(
+        active_path,
+        &expected_prev,
+        pubkey,
+        None,
+        &wanted,
+        &mut seen_v3,
+    )?;
     total_records += walk.records;
+    legacy_lines += walk.legacy_lines;
+    non_canonical_legacy += walk.non_canonical_legacy;
     checkpoints_verified += reach_checkpoints(active_path, active_gen, &wanted, &walk)?;
 
     Ok(LogSetReport {
@@ -2215,6 +2614,8 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
         archives_verified: seqs.len(),
         total_records,
         checkpoints_verified,
+        legacy_lines,
+        non_canonical_legacy,
     })
 }
 
@@ -2235,7 +2636,7 @@ pub struct RecentReport {
 /// the active file must verify (hash and signature) and link to the line
 /// before it. The full check of the set is [`verify_log_set`]
 /// (`nn-admin chain verify`).
-pub fn verify_recent<P: Serialize + DeserializeOwned>(
+pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload>(
     active: &Path,
     pubkey: &VerifyingKey,
     max_bytes: u64,
@@ -2300,40 +2701,27 @@ pub fn verify_recent<P: Serialize + DeserializeOwned>(
         .rposition(|&c| c == b'\n')
         .map_or(&body[..0], |i| &body[..i]);
     let mut lines = 0u64;
+    // External audit EVD-008: no old-format line after a v3 one.
+    let mut seen_v3 = false;
     for (idx, line) in complete.split(|&c| c == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_slice(line)
+        serde_json::from_slice::<serde_json::Value>(line)
             .map_err(|e| malformed(idx, format!("line {idx} of the last {covered} bytes: {e}")))?;
-        let field = |k: &str| v.get(k).and_then(|h| h.as_str()).unwrap_or("").to_string();
-        let (prev, hash) = (field("prev_hash"), field("entry_hash"));
-        match check_active_line::<P>(line, pubkey) {
-            LineCheck::Verified { .. } => {}
-            LineCheck::BadSignature => {
-                return Err(LogSetError::SignatureInvalid {
-                    file: file.clone(),
-                    idx,
-                })
-            }
-            LineCheck::Invalid => {
-                return Err(malformed(
-                    idx,
-                    "the line does not decode or its entry_hash does not recompute".to_string(),
-                ))
-            }
-        }
+        let (ok, _) = verify_active_line::<P>(line, pubkey).map_err(|f| f.at(&file, idx))?;
+        track_format(&ok, &mut seen_v3, &file, idx)?;
         if let Some(want) = &expected {
-            if &prev != want {
+            if &ok.prev_hash != want {
                 return Err(LogSetError::PrevHashMismatch {
                     file: file.clone(),
                     idx,
-                    got: prev,
+                    got: ok.prev_hash,
                     expected: want.clone(),
                 });
             }
         }
-        expected = Some(hash);
+        expected = Some(ok.entry_hash);
         lines += 1;
     }
     Ok(RecentReport {
@@ -2387,6 +2775,10 @@ struct FileWalk {
     line_ends: std::collections::HashMap<u64, String>,
     /// Bytes read (0 for a missing file).
     len: u64,
+    /// External audit EVD-007/EVD-008: lines in the old format, and those of
+    /// them not in canonical form.
+    legacy_lines: u64,
+    non_canonical_legacy: u64,
 }
 
 /// Verify one file's chain from `expected_prev`: its terminator hash if
@@ -2398,12 +2790,13 @@ struct FileWalk {
 /// External audit EVD-017 (lab PR 190): one line in memory at a time
 /// ([`crate::verify_lines`]): a line over the cap or not UTF-8 is
 /// [`LogSetError::Malformed`], never read whole.
-fn verify_one_file<P: Serialize + DeserializeOwned>(
+fn verify_one_file<P: Serialize + DeserializeOwned + ChainPayload>(
     path: &Path,
     expected_prev: &str,
     pubkey: &VerifyingKey,
     archive_seq: Option<u64>,
     checkpoints: &[(u64, String)],
+    seen_v3: &mut bool,
 ) -> Result<FileWalk, LogSetError> {
     let file = path.display().to_string();
     let f = match OpenOptions::new().read(true).open(path) {
@@ -2417,6 +2810,8 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
                 records: 0,
                 line_ends: std::collections::HashMap::new(),
                 len: 0,
+                legacy_lines: 0,
+                non_canonical_legacy: 0,
             });
         }
         Err(e) => {
@@ -2433,6 +2828,8 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
     let mut records = 0u64;
     let mut term_hash = None;
     let mut line_ends = std::collections::HashMap::new();
+    let mut legacy_lines = 0u64;
+    let mut non_canonical_legacy = 0u64;
     let mut reader = crate::verify_lines::VerifyLines::new(BufReader::new(f));
     let mut lines_read = 0usize;
     loop {
@@ -2455,132 +2852,47 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
         if line.is_empty() {
             continue;
         }
-        let is_terminator = serde_json::from_str::<serde_json::Value>(&line)
-            .ok()
-            .and_then(|v| v.get("rotate").cloned())
-            .is_some();
-
-        let (prev, stored_hash) = if is_terminator {
-            let t: TerminatorLine =
-                serde_json::from_str(&line).map_err(|e| LogSetError::Malformed {
-                    file: file.clone(),
-                    idx,
-                    reason: format!("terminator decode: {e}"),
-                })?;
-            if let Some(seq) = archive_seq {
-                if t.rotate.this_seq != seq {
-                    return Err(LogSetError::TerminatorSeqMismatch {
-                        seq,
-                        got: t.rotate.this_seq,
-                    });
-                }
+        let (ok, kind) =
+            verify_active_line::<P>(line.as_bytes(), pubkey).map_err(|f| f.at(&file, idx))?;
+        // An archive's terminator must name the archive.
+        if let (Some(seq), ActiveLine::Terminator(rotate)) = (archive_seq, &kind) {
+            if rotate.this_seq != seq {
+                return Err(LogSetError::TerminatorSeqMismatch {
+                    seq,
+                    got: rotate.this_seq,
+                });
             }
-            let mut stripped = t.clone();
-            stripped.entry_hash.clear();
-            stripped.agent_sig.clear();
-            let recomputed = recompute_hex(&stripped, &t.prev_hash, &file, idx)?;
-            check_entry(&file, idx, &recomputed, &t.entry_hash, &t.agent_sig, pubkey)?;
-            term_hash = Some(t.entry_hash.clone());
-            (t.prev_hash, t.entry_hash)
-        } else {
-            let mut d: ChainLine<P> =
-                serde_json::from_str(&line).map_err(|e| LogSetError::Malformed {
-                    file: file.clone(),
-                    idx,
-                    reason: format!("data decode: {e}"),
-                })?;
-            let prev = d.prev_hash.clone();
-            let stored_hash = d.entry_hash.clone();
-            let sig = d.agent_sig.clone();
-            d.entry_hash.clear();
-            d.agent_sig.clear();
-            let recomputed = recompute_hex(&d, &prev, &file, idx)?;
-            check_entry(&file, idx, &recomputed, &stored_hash, &sig, pubkey)?;
-            records += 1;
-            (prev, stored_hash)
-        };
-        if prev != expected {
+        }
+        track_format(&ok, seen_v3, &file, idx)?;
+        if ok.pre_image == PreImage::Legacy {
+            legacy_lines += 1;
+            non_canonical_legacy += u64::from(ok.non_canonical_legacy);
+        }
+        match kind {
+            ActiveLine::Terminator(_) => term_hash = Some(ok.entry_hash.clone()),
+            ActiveLine::Data => records += 1,
+        }
+        if ok.prev_hash != expected {
             return Err(LogSetError::PrevHashMismatch {
                 file,
                 idx,
-                got: prev,
+                got: ok.prev_hash,
                 expected,
             });
         }
         if newline && wanted.contains(&end) {
-            line_ends.insert(end, stored_hash.clone());
+            line_ends.insert(end, ok.entry_hash.clone());
         }
-        expected = stored_hash;
+        expected = ok.entry_hash;
     }
     Ok(FileWalk {
         terminator: term_hash,
         records,
         line_ends,
         len: reader.offset(),
+        legacy_lines,
+        non_canonical_legacy,
     })
-}
-
-fn recompute_hex<T: Serialize>(
-    body: &T,
-    prev_hash: &str,
-    file: &str,
-    idx: usize,
-) -> Result<String, LogSetError> {
-    chain_digest(body, prev_hash)
-        .map(hex::encode)
-        .map_err(|e| LogSetError::Malformed {
-            file: file.to_string(),
-            idx,
-            reason: e.to_string(),
-        })
-}
-
-fn check_entry(
-    file: &str,
-    idx: usize,
-    recomputed_hex: &str,
-    stored_hex: &str,
-    sig_b64: &str,
-    pubkey: &VerifyingKey,
-) -> Result<(), LogSetError> {
-    if recomputed_hex != stored_hex {
-        return Err(LogSetError::EntryHashMismatch {
-            file: file.to_string(),
-            idx,
-            recomputed: recomputed_hex.to_string(),
-            stored: stored_hex.to_string(),
-        });
-    }
-    let digest = hex::decode(stored_hex).map_err(|e| LogSetError::Malformed {
-        file: file.to_string(),
-        idx,
-        reason: format!("entry_hash hex: {e}"),
-    })?;
-    let sig_bytes = B64.decode(sig_b64).map_err(|e| LogSetError::Malformed {
-        file: file.to_string(),
-        idx,
-        reason: format!("agent_sig b64: {e}"),
-    })?;
-    if sig_bytes.len() != 64 {
-        return Err(LogSetError::Malformed {
-            file: file.to_string(),
-            idx,
-            reason: format!("agent_sig len {} != 64", sig_bytes.len()),
-        });
-    }
-    let mut arr = [0u8; 64];
-    arr.copy_from_slice(&sig_bytes);
-    // External audit NN-AUD-292 (FIMP-013): strict.
-    if pubkey
-        .verify_strict(&digest, &Signature::from_bytes(&arr))
-        .is_err()
-    {
-        return Err(LogSetError::SignatureInvalid {
-            file: file.to_string(),
-            idx,
-        });
-    }
-    Ok(())
 }
 
 /// First line's `prev_hash` of a file. Test-only: the verifier roots the
@@ -2613,6 +2925,7 @@ fn first_line_prev_hash(path: &Path) -> Result<String> {
 /// informational.
 fn verify_manifest(
     active_path: &Path,
+    kind: &str,
     pubkey: &VerifyingKey,
 ) -> Result<ManifestFacts, LogSetError> {
     let path = manifest_path_for(active_path);
@@ -2630,6 +2943,8 @@ fn verify_manifest(
         }
     };
     let mut expected = GENESIS_PREV_HASH.to_string();
+    // External audit EVD-008: the manifest's own format history.
+    let mut seen_v3 = false;
     // External audit EVD-017 (lab PR 190): one bounded line at a time.
     let mut reader = crate::verify_lines::VerifyLines::new(BufReader::new(f));
     let mut lines_read = 0usize;
@@ -2652,28 +2967,22 @@ fn verify_manifest(
         if line.is_empty() {
             continue;
         }
-        let mut entry: ManifestLine =
-            serde_json::from_str(line).map_err(|e| LogSetError::Malformed {
-                file: file.clone(),
-                idx,
-                reason: format!("manifest decode: {e}"),
-            })?;
-        let prev = entry.prev_hash.clone();
-        let stored = entry.entry_hash.clone();
-        let sig = entry.agent_sig.clone();
-        entry.entry_hash.clear();
-        entry.agent_sig.clear();
-        let recomputed = recompute_hex(&entry, &prev, &file, idx)?;
-        check_entry(&file, idx, &recomputed, &stored, &sig, pubkey)?;
-        if prev != expected {
+        let (ok, entry) =
+            verify_manifest_line(line.as_bytes(), kind, pubkey).map_err(|f| f.at(&file, idx))?;
+        track_format(&ok, &mut seen_v3, &file, idx)?;
+        if ok.pre_image == PreImage::Legacy {
+            facts.legacy_lines += 1;
+            facts.non_canonical_legacy += u64::from(ok.non_canonical_legacy);
+        }
+        if ok.prev_hash != expected {
             return Err(LogSetError::PrevHashMismatch {
                 file,
                 idx,
-                got: prev,
+                got: ok.prev_hash,
                 expected,
             });
         }
-        expected = stored;
+        expected = ok.entry_hash;
         match entry.manifest.event {
             ManifestEvent::Evicted {
                 seq,
@@ -2717,6 +3026,10 @@ mod tests {
         ts: String,
         seq: u64,
         data: String,
+    }
+
+    impl ChainPayload for TestPayload {
+        const KIND: &'static str = "test_payload";
     }
 
     fn key() -> AgentSigningKey {
@@ -3164,6 +3477,9 @@ mod tests {
             rotate: u32,
             ts: String,
         }
+        impl ChainPayload for Evil {
+            const KIND: &'static str = "test_evil";
+        }
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("evil.jsonl");
         let k = key();
@@ -3201,16 +3517,9 @@ mod tests {
     /// the caller can chain the next line. Same byte-compat invariant as
     /// `drain::bug026_legacy_v1_drift_line_still_verifies`.
     fn append_v1(path: &Path, p: TestPayload, k: &AgentSigningKey, prev_hash: &str) -> String {
-        let mut line = ChainLine {
-            payload: p,
-            fmt_ver: None, // v1: omitted on the wire (skip_serializing_if)
-            prev_hash: prev_hash.to_string(),
-            entry_hash: String::new(),
-            agent_sig: String::new(),
-        };
-        let digest = chain_digest(&line, prev_hash).unwrap();
-        line.entry_hash = hex::encode(digest);
-        line.agent_sig = B64.encode(k.sign(&digest).to_bytes());
+        // v1: `fmt_ver` omitted on the wire (skip_serializing_if), untagged
+        // pre-image.
+        let line = ChainLine::sealed_as(p, None, k, prev_hash).unwrap();
         append_and_fsync(path, &to_jsonl(&line).unwrap(), 0o600).unwrap();
         line.entry_hash
     }
@@ -3534,7 +3843,7 @@ mod tests {
         let k = key_at(&kp);
         let term = TerminatorLine::sealed(
             RotateTerminator {
-                fmt_ver: CHAINLOG_FMT_V2,
+                fmt_ver: CHAINLOG_FMT_V3,
                 this_seq: 1,
                 next_seq: 2,
                 record_count: 3,
@@ -3542,6 +3851,7 @@ mod tests {
             },
             &k,
             &tail,
+            TestPayload::KIND,
         )
         .unwrap();
         append_and_fsync(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
@@ -3600,7 +3910,7 @@ mod tests {
         let k = key_at(&kp);
         let term = TerminatorLine::sealed(
             RotateTerminator {
-                fmt_ver: CHAINLOG_FMT_V2,
+                fmt_ver: CHAINLOG_FMT_V3,
                 this_seq: 1,
                 next_seq: 2,
                 record_count: 3,
@@ -3608,6 +3918,7 @@ mod tests {
             },
             &k,
             &tail,
+            TestPayload::KIND,
         )
         .unwrap();
         append_and_fsync(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
@@ -3832,7 +4143,7 @@ mod tests {
         let other = key_at(&dir.path().join("other"));
         let term = TerminatorLine::sealed(
             RotateTerminator {
-                fmt_ver: CHAINLOG_FMT_V2,
+                fmt_ver: CHAINLOG_FMT_V3,
                 this_seq: 7,
                 next_seq: 8,
                 record_count: 3,
@@ -3840,6 +4151,7 @@ mod tests {
             },
             &other,
             &tail,
+            TestPayload::KIND,
         )
         .unwrap();
         append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
@@ -3875,7 +4187,7 @@ mod tests {
         drop(log);
         assert!(manifest_events(&active).iter().any(|e| matches!(e,
             ManifestEvent::TornTailRepaired { role, .. } if role == "manifest")));
-        verify_manifest(&active, &pk).expect("manifest chain intact");
+        verify_manifest(&active, TestPayload::KIND, &pk).expect("manifest chain intact");
         assert_eq!(
             verify_log_set::<TestPayload>(&active, &pk)
                 .unwrap()
@@ -3953,7 +4265,7 @@ mod tests {
         };
         let term = TerminatorLine::sealed(
             RotateTerminator {
-                fmt_ver: CHAINLOG_FMT_V2,
+                fmt_ver: CHAINLOG_FMT_V3,
                 this_seq: 3,
                 next_seq: 4,
                 record_count: 1,
@@ -3961,6 +4273,7 @@ mod tests {
             },
             &key_at(&kp),
             &tail,
+            TestPayload::KIND,
         )
         .unwrap();
         append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
@@ -4057,7 +4370,7 @@ mod tests {
         };
         let term = TerminatorLine::sealed(
             RotateTerminator {
-                fmt_ver: CHAINLOG_FMT_V2,
+                fmt_ver: CHAINLOG_FMT_V3,
                 this_seq: 1,
                 next_seq: 2,
                 record_count: 3,
@@ -4065,6 +4378,7 @@ mod tests {
             },
             &key_at(&kp),
             &tail,
+            TestPayload::KIND,
         )
         .unwrap();
         append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
@@ -4252,7 +4566,7 @@ mod tests {
         fs::remove_file(&active).unwrap();
         let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
         assert!(matches!(err, LogSetError::ActiveMissing { .. }), "{err:?}");
-        let tail = manifest_tail_events(&active, &pk);
+        let tail = manifest_tail_events(&active, TestPayload::KIND, &pk);
         assert!(active_missing(&active, &tail).is_some());
     }
 
@@ -4497,5 +4811,814 @@ mod tests {
             matches!(&err, LogSetError::CheckpointUnreachable { reason, .. } if reason.contains("cut")),
             "{err:?}"
         );
+    }
+
+    // ── External audit, Wave 3, lab PR 204: pre-image v3 ────────────────
+
+    /// A payload of the same shape as [`TestPayload`] written to another
+    /// log: the transplant target of the EVD-008 tests.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TwinPayload {
+        ts: String,
+        seq: u64,
+        data: String,
+    }
+
+    impl ChainPayload for TwinPayload {
+        const KIND: &'static str = "test_twin";
+    }
+
+    fn twin(i: u64) -> TwinPayload {
+        let p = payload(i);
+        TwinPayload {
+            ts: p.ts,
+            seq: p.seq,
+            data: p.data,
+        }
+    }
+
+    /// Every line of `path` (archives, active file or manifest), as on disk.
+    fn raw_lines(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every file of the set of `active`: archives ascending, the active
+    /// file, the manifest.
+    fn set_files(active: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = list_archive_seqs(active)
+            .unwrap()
+            .into_iter()
+            .map(|s| archive_path(active, s))
+            .collect();
+        v.push(active.to_path_buf());
+        v.push(manifest_path_for(active));
+        v
+    }
+
+    /// The version field of one raw line of any type.
+    fn line_fmt_ver(raw: &str) -> Option<u64> {
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        if let Some(r) = v.get("rotate") {
+            r.get("fmt_ver").and_then(|f| f.as_u64())
+        } else if let Some(m) = v.get("manifest") {
+            m.get("fmt_ver").and_then(|f| f.as_u64())
+        } else {
+            v.get("fmt_ver").and_then(|f| f.as_u64())
+        }
+    }
+
+    /// Replace line `n` (0-based, empty lines excluded) of `path`.
+    fn rewrite_line(path: &Path, n: usize, f: impl Fn(&str) -> String) {
+        let mut lines = raw_lines(path);
+        lines[n] = f(&lines[n]);
+        fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    /// `"injected":"x"` before the closing brace of a JSON object line.
+    fn inject_key(line: &str) -> String {
+        format!("{},\"injected\":\"x\"}}", line.strip_suffix('}').unwrap())
+    }
+
+    /// EVD-007/EVD-008 (NN-AUD-273/274): every line type the writer
+    /// produces — data lines, terminators, manifest rows (Rotated,
+    /// Evicted, ActiveCheckpoint, TornTailRepaired) — is v3, and is its own
+    /// canonical serialisation, byte for byte. On the starting code the
+    /// lines were v2.
+    #[test]
+    fn every_line_the_writer_produces_is_v3_and_byte_canonical() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        {
+            let mut log =
+                RotatingChainLog::<TestPayload>::open(&active, key_at(&kp), cfg(900, 3), {
+                    std::sync::Arc::new(NoProtection)
+                })
+                .unwrap();
+            for i in 0..60 {
+                log.append(payload(i)).unwrap();
+                if i % 9 == 0 {
+                    log.checkpoint().unwrap();
+                }
+            }
+        }
+        // A torn last write: repaired and attested at the next open.
+        append_raw(&active, b"{\"ts\":\"torn");
+        drop(open_log(&active, &kp, 900));
+        let events = manifest_events(&active);
+        for want in [
+            "rotated",
+            "evicted",
+            "active_checkpoint",
+            "torn_tail_repaired",
+        ] {
+            assert!(
+                events
+                    .iter()
+                    .any(|e| serde_json::to_value(e).unwrap()["kind"] == want),
+                "{want} row written"
+            );
+        }
+        let mut terminators = 0;
+        for file in set_files(&active) {
+            for raw in raw_lines(&file) {
+                assert_eq!(line_fmt_ver(&raw), Some(3), "{}: {raw}", file.display());
+                let canonical = if is_terminator_line(&raw) {
+                    terminators += 1;
+                    serde_json::to_string(&serde_json::from_str::<TerminatorLine>(&raw).unwrap())
+                } else if raw.starts_with("{\"manifest\":") {
+                    serde_json::to_string(&serde_json::from_str::<ManifestLine>(&raw).unwrap())
+                } else {
+                    serde_json::to_string(
+                        &serde_json::from_str::<ChainLine<TestPayload>>(&raw).unwrap(),
+                    )
+                }
+                .unwrap();
+                assert_eq!(canonical, raw, "round trip of {}", file.display());
+            }
+        }
+        assert!(terminators >= 3, "rotated: {terminators}");
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!((r.legacy_lines, r.non_canonical_legacy), (0, 0));
+        assert!(r.earliest_retained_seq > 1, "evicted: {r:?}");
+    }
+
+    /// EVD-007 (NN-AUD-273): a v3 line rewritten with a key the type does
+    /// not have, its keys reordered, whitespace, or a value spelled with an
+    /// escape decodes to the same line, so its hash and signature still
+    /// verify; the bytes on disk are not what the agent wrote and the line
+    /// is refused — by the full verifier, the boot check of the tail and the
+    /// one-line check of the read verbs. On the starting code every one of
+    /// these verified.
+    #[test]
+    fn a_v3_line_not_in_canonical_form_is_refused_everywhere() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..4 {
+                log.append(payload(i)).unwrap();
+            }
+        }
+        let pristine = fs::read(&active).unwrap();
+        let line1 = raw_lines(&active)[1].clone();
+        assert!(line_is_genuine::<TestPayload>(line1.as_bytes(), &pk));
+        let rewrites: Vec<(&str, String)> = vec![
+            ("an injected key", inject_key(&line1)),
+            (
+                "keys reordered",
+                line1
+                    .replacen("{\"ts\":", "{\"seq\":1,\"ts\":", 1)
+                    .replacen(",\"seq\":1,", ",", 1),
+            ),
+            ("whitespace", line1.replacen("\"seq\":", "\"seq\": ", 1)),
+            (
+                "an escaped spelling",
+                line1.replacen("record-", "\\u0072ecord-", 1),
+            ),
+        ];
+        for (what, forged) in rewrites {
+            assert_ne!(forged, line1, "{what}");
+            let decoded: ChainLine<TestPayload> = serde_json::from_str(&forged).unwrap();
+            assert_eq!(decoded.payload.data, payload(1).data, "{what}: same row");
+            assert!(
+                !line_is_genuine::<TestPayload>(forged.as_bytes(), &pk),
+                "{what}: one-line check"
+            );
+            fs::write(&active, &pristine).unwrap();
+            rewrite_line(&active, 1, |_| forged.clone());
+            let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+            assert_eq!(
+                err,
+                LogSetError::NonCanonicalLine {
+                    file: active.display().to_string(),
+                    idx: 1
+                },
+                "{what}"
+            );
+            assert!(
+                matches!(
+                    verify_recent::<TestPayload>(&active, &pk, 1 << 20),
+                    Err(LogSetError::NonCanonicalLine { idx: 1, .. })
+                ),
+                "{what}: boot check"
+            );
+        }
+        // A terminator and a manifest row are held to the same rule.
+        fs::write(&active, &pristine).unwrap();
+        {
+            let mut log = open_log(&active, &kp, 900);
+            for i in 4..30 {
+                log.append(payload(i)).unwrap();
+            }
+        }
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        let archive = archive_path(&active, 1);
+        let n = raw_lines(&archive).len();
+        rewrite_line(&archive, n - 1, inject_key);
+        assert!(matches!(
+            verify_log_set::<TestPayload>(&active, &pk),
+            Err(LogSetError::NonCanonicalLine { idx, .. }) if idx == n - 1
+        ));
+        rewrite_line(&archive, n - 1, |l| l.replace(",\"injected\":\"x\"", ""));
+        verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        let manifest = manifest_path_for(&active);
+        let m0 = raw_lines(&manifest)[0].clone();
+        assert!(manifest_line_is_genuine(
+            m0.as_bytes(),
+            TestPayload::KIND,
+            &pk
+        ));
+        rewrite_line(&manifest, 0, inject_key);
+        assert!(!manifest_line_is_genuine(
+            inject_key(&m0).as_bytes(),
+            TestPayload::KIND,
+            &pk
+        ));
+        assert!(matches!(
+            verify_log_set::<TestPayload>(&active, &pk),
+            Err(LogSetError::NonCanonicalLine { idx: 0, .. })
+        ));
+    }
+
+    /// EVD-007: a v1/v2 line keeps the check it was written under — a key
+    /// added to it still verifies (its signature never covered the bytes),
+    /// and is counted, not refused.
+    #[test]
+    fn a_legacy_line_not_in_canonical_form_verifies_and_is_counted() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let k = key_at(&kp);
+        let pk = k.verifying_key();
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        for i in 0..3 {
+            prev = append_v1(&active, payload(i), &k, &prev);
+        }
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!((r.legacy_lines, r.non_canonical_legacy), (3, 0));
+        rewrite_line(&active, 1, inject_key);
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(
+            (r.total_records, r.legacy_lines, r.non_canonical_legacy),
+            (3, 3, 1)
+        );
+        assert!(line_is_genuine::<TestPayload>(
+            raw_lines(&active)[1].as_bytes(),
+            &pk
+        ));
+    }
+
+    /// EVD-008 (NN-AUD-274): the same agent key signs every rotating log.
+    /// A line of one log moved into another whose payload has the same
+    /// shape, at a position where `prev_hash` matches (the first line of
+    /// both roots at GENESIS), no longer verifies; nor does one log's
+    /// manifest put in place of another's. Two identical payloads hash
+    /// differently in two logs. On the starting code the transplant
+    /// verified.
+    #[test]
+    fn a_line_transplanted_between_logs_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let a = dir.path().join("a.jsonl");
+        let b = dir.path().join("b.jsonl");
+        {
+            let mut la = open_log(&a, &kp, 1 << 30);
+            let mut lb = RotatingChainLog::<TwinPayload>::open(
+                &b,
+                key_at(&kp),
+                cfg(1 << 30, 50),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
+            for i in 0..3 {
+                la.append(payload(i)).unwrap();
+                lb.append(twin(i)).unwrap();
+            }
+            la.checkpoint().unwrap();
+            lb.checkpoint().unwrap();
+        }
+        verify_log_set::<TestPayload>(&a, &pk).unwrap();
+        verify_log_set::<TwinPayload>(&b, &pk).unwrap();
+        let a0 = raw_lines(&a)[0].clone();
+        let b0 = raw_lines(&b)[0].clone();
+        // Same payload, same prev_hash, same key: two digests.
+        assert_eq!(
+            serde_json::from_str::<ChainLine<TestPayload>>(&a0)
+                .unwrap()
+                .prev_hash,
+            serde_json::from_str::<ChainLine<TwinPayload>>(&b0)
+                .unwrap()
+                .prev_hash
+        );
+        assert_ne!(a0, b0, "the entry_hash differs");
+        assert!(line_is_genuine::<TestPayload>(a0.as_bytes(), &pk));
+        assert!(!line_is_genuine::<TwinPayload>(a0.as_bytes(), &pk));
+        // a's first line put in place of b's first line (b's file only).
+        let b_body = fs::read(&b).unwrap();
+        fs::write(&b, format!("{a0}\n")).unwrap();
+        fs::remove_file(manifest_path_for(&b)).unwrap();
+        assert!(matches!(
+            verify_log_set::<TwinPayload>(&b, &pk),
+            Err(LogSetError::EntryHashMismatch { idx: 0, .. })
+        ));
+        // a's manifest in place of b's.
+        fs::write(&b, &b_body).unwrap();
+        fs::copy(manifest_path_for(&a), manifest_path_for(&b)).unwrap();
+        let err = verify_log_set::<TwinPayload>(&b, &pk).unwrap_err();
+        assert!(
+            matches!(&err, LogSetError::EntryHashMismatch { file, idx: 0, .. }
+                if file.ends_with(".manifest.jsonl")),
+            "{err:?}"
+        );
+        assert!(manifest_tail_events(&b, TwinPayload::KIND, &pk).is_empty());
+        assert!(!manifest_tail_events(&b, TestPayload::KIND, &pk).is_empty());
+    }
+
+    /// EVD-008: the three line types are signed under three domains, per
+    /// log; a kind outside `[a-z0-9_]{3,32}` has none.
+    #[test]
+    fn each_log_and_line_type_has_its_own_domain() {
+        let mut seen = std::collections::HashSet::new();
+        for kind in ["detections", "status_events", "netflow", "fim_drift"] {
+            for role in [LineRole::Data, LineRole::Terminator, LineRole::Manifest] {
+                let d = chain_domain(kind, role).unwrap();
+                assert!(d.len() > 32 && d.ends_with(b"/v3\0"), "{d:?}");
+                assert!(seen.insert(d), "{kind}/{role:?} unique");
+            }
+        }
+        assert_eq!(
+            chain_domain("detections", LineRole::Data).unwrap(),
+            b"northnarrow/chainlog/detections/data/v3\0"
+        );
+        for bad in [
+            "",
+            "ab",
+            "Detections",
+            "a/b",
+            "x".repeat(33).as_str(),
+            "fim-drift",
+        ] {
+            assert!(chain_domain(bad, LineRole::Data).is_err(), "{bad:?}");
+        }
+        // The kinds of the shipped payload types, pinned: they are part of
+        // every v3 line on disk.
+        assert_eq!(crate::detection_store::DetectionRecord::KIND, "detections");
+        assert_eq!(crate::detection_store::StatusEvent::KIND, "status_events");
+        assert_eq!(crate::net::drain::NetFlowPayload::KIND, "netflow");
+        assert_eq!(crate::fim::drain::FimDriftPayload::KIND, "fim_drift");
+    }
+
+    /// EVD-008: once a set holds a v3 line, a later v2 line — even one the
+    /// agent's key signed and that links — is refused, by the full verifier
+    /// and the boot check. On the starting code it verified.
+    #[test]
+    fn an_old_format_line_after_v3_lines_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let tail = {
+            let mut log = open_log(&active, &kp, 1 << 30);
+            for i in 0..3 {
+                log.append(payload(i)).unwrap();
+            }
+            log.last_hash().to_string()
+        };
+        let v2 =
+            ChainLine::sealed_as(payload(3), Some(CHAINLOG_FMT_V2), &key_at(&kp), &tail).unwrap();
+        append_raw(&active, to_jsonl(&v2).unwrap().as_bytes());
+        assert!(line_is_genuine::<TestPayload>(
+            to_jsonl(&v2).unwrap().trim_end().as_bytes(),
+            &pk
+        ));
+        let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert!(
+            matches!(err, LogSetError::LegacyAfterV3 { idx: 3, .. }),
+            "{err:?}"
+        );
+        assert!(matches!(
+            verify_recent::<TestPayload>(&active, &pk, 1 << 20),
+            Err(LogSetError::LegacyAfterV3 { idx: 3, .. })
+        ));
+    }
+
+    /// A version this reader does not know is refused as such, not hashed
+    /// as an old line.
+    #[test]
+    fn an_unknown_format_version_is_named() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        drop(open_log(&active, &kp, 1 << 30));
+        let line = ChainLine {
+            payload: payload(0),
+            fmt_ver: Some(4),
+            prev_hash: GENESIS_PREV_HASH.to_string(),
+            entry_hash: "00".repeat(32),
+            agent_sig: B64.encode([0u8; 64]),
+        };
+        fs::write(&active, to_jsonl(&line).unwrap()).unwrap();
+        let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert!(
+            matches!(&err, LogSetError::Malformed { reason, .. } if reason.contains("fmt_ver 4")),
+            "{err:?}"
+        );
+        assert!(seal_line(line.clone(), &key_at(&kp), TestPayload::KIND).is_err());
+    }
+
+    /// EVD-023 (NN-AUD-427): a pre-image that still carries its
+    /// `entry_hash` or `agent_sig` is refused in every build (the invariant
+    /// was a `debug_assert!`: a release build hashed it).
+    #[test]
+    fn a_pre_image_that_carries_its_seal_is_refused() {
+        let k = key();
+        let line = ChainLine::sealed(payload(0), &k, GENESIS_PREV_HASH).unwrap();
+        let err = chain_digest(&line, TestPayload::KIND).unwrap_err();
+        assert!(err.to_string().contains("carries its own"), "{err}");
+        let mut half = line.clone();
+        half.entry_hash.clear();
+        assert!(chain_digest(&half, TestPayload::KIND).is_err());
+        assert!(seal_line(line, &k, TestPayload::KIND).is_err());
+    }
+
+    /// Fixed key for the frozen vectors.
+    fn frozen_key(dir: &Path) -> AgentSigningKey {
+        let p = dir.join("frozen.key");
+        fs::write(&p, format!("{}\n", "42".repeat(32))).unwrap();
+        crate::audit::read_signing_key(&p).unwrap()
+    }
+
+    const FROZEN_ROW: &str =
+        "{\"ts\":\"2026-10-09T00:00:00.000000Z\",\"seq\":7,\"data\":\"caf\u{e9} \\\"q\\\" \\\\ \\n\"";
+
+    /// Frozen vectors. A v2 line built by hand, as the 0.0.1 writer did
+    /// (`SHA-256(prev ‖ json)`, untagged), verifies byte for byte; a v3
+    /// line's `entry_hash` is pinned (domain, layout and canonical bytes of
+    /// the format). Both hashes were computed independently (Python
+    /// `hashlib`) from the bytes below.
+    #[test]
+    fn frozen_v2_and_v3_vectors() {
+        let dir = TempDir::new().unwrap();
+        let k = frozen_key(dir.path());
+        let pk = k.verifying_key();
+        let prev = GENESIS_PREV_HASH;
+        let sign = |pre: &[u8]| -> (String, String) {
+            let d: [u8; 32] = Sha256::digest(pre).into();
+            (hex::encode(d), B64.encode(k.sign(&d).to_bytes()))
+        };
+        let prev_bytes = hex::decode(prev).unwrap();
+        // v2, by hand.
+        let body = format!(
+            "{FROZEN_ROW},\"fmt_ver\":2,\"prev_hash\":\"{prev}\",\"entry_hash\":\"\",\"agent_sig\":\"\"}}"
+        );
+        let (h2, s2) = sign(&[prev_bytes.as_slice(), body.as_bytes()].concat());
+        assert_eq!(h2, FROZEN_V2_HASH);
+        let v2 = format!(
+            "{FROZEN_ROW},\"fmt_ver\":2,\"prev_hash\":\"{prev}\",\"entry_hash\":\"{h2}\",\"agent_sig\":\"{s2}\"}}"
+        );
+        let active = dir.path().join("frozen.jsonl");
+        fs::write(&active, format!("{v2}\n")).unwrap();
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!((r.total_records, r.legacy_lines), (1, 1));
+        // v3, by hand: the domain of `test_payload` data lines.
+        let body3 = format!(
+            "{FROZEN_ROW},\"fmt_ver\":3,\"prev_hash\":\"{prev}\",\"entry_hash\":\"\",\"agent_sig\":\"\"}}"
+        );
+        let (h3, s3) = sign(
+            &[
+                b"northnarrow/chainlog/test_payload/data/v3\0".as_slice(),
+                prev_bytes.as_slice(),
+                body3.as_bytes(),
+            ]
+            .concat(),
+        );
+        assert_eq!(h3, FROZEN_V3_HASH);
+        let v3 = format!(
+            "{FROZEN_ROW},\"fmt_ver\":3,\"prev_hash\":\"{prev}\",\"entry_hash\":\"{h3}\",\"agent_sig\":\"{s3}\"}}"
+        );
+        let decoded: ChainLine<TestPayload> = serde_json::from_str(&v3).unwrap();
+        let written = ChainLine::sealed(decoded.payload, &k, prev).unwrap();
+        assert_eq!(
+            to_jsonl(&written).unwrap(),
+            format!("{v3}\n"),
+            "the writer's bytes"
+        );
+        fs::write(&active, format!("{v3}\n")).unwrap();
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!((r.total_records, r.legacy_lines), (1, 0));
+        // The v2 line's signature does not make a v3 line (nor the reverse).
+        let swapped = v2.replace("\"fmt_ver\":2", "\"fmt_ver\":3");
+        assert!(!line_is_genuine::<TestPayload>(swapped.as_bytes(), &pk));
+        let swapped = v3.replace("\"fmt_ver\":3", "\"fmt_ver\":2");
+        assert!(!line_is_genuine::<TestPayload>(swapped.as_bytes(), &pk));
+    }
+
+    const FROZEN_V2_HASH: &str = "0435d58b4dd033a649fe3776d97df54399435a6a235b072b787e5d6ca8772dc0";
+    const FROZEN_V3_HASH: &str = "84a1b49dca9cd4ef0622ccb78a9f5e62ac694524b20973471b89ceb9f0342bed";
+
+    /// EVD-007/EVD-008, the upgrade: a set written by 0.0.1 (v2 data lines,
+    /// a v2 terminator, a v2 manifest row — built here as that writer built
+    /// them) is opened by this version and written on. The old lines keep
+    /// their bytes and verify with their pre-image; every line written
+    /// after them is v3; the set verifies end to end across the boundary.
+    #[test]
+    fn a_0_0_1_set_upgraded_keeps_its_lines_and_continues_in_v3() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let k = key_at(&kp);
+        let pk = k.verifying_key();
+        let kind = TestPayload::KIND;
+        // 0.0.1: archive 1 (3 data lines + terminator), its Rotated row,
+        // an active file of 2 lines chained off the terminator.
+        let archive1 = archive_path(&active, 1);
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        let mut bytes = 0u64;
+        for i in 0..3 {
+            let l = ChainLine::sealed_as(payload(i), Some(CHAINLOG_FMT_V2), &k, &prev).unwrap();
+            let s = to_jsonl(&l).unwrap();
+            bytes += s.len() as u64;
+            append_and_fsync(&archive1, &s, 0o600).unwrap();
+            prev = l.entry_hash;
+        }
+        let rotate = RotateTerminator {
+            fmt_ver: CHAINLOG_FMT_V2,
+            this_seq: 1,
+            next_seq: 2,
+            record_count: 3,
+            bytes,
+        };
+        let term = TerminatorLine::sealed(rotate, &k, &prev, kind).unwrap();
+        append_and_fsync(&archive1, &to_jsonl(&term).unwrap(), 0o600).unwrap();
+        let rotated = ManifestEntry {
+            fmt_ver: CHAINLOG_FMT_V2,
+            ts: now_ts(),
+            event: ManifestEvent::Rotated {
+                seq: 1,
+                terminator_hash: term.entry_hash.clone(),
+                bytes,
+                records: 3,
+            },
+        };
+        let m = ManifestLine::sealed(rotated, &k, GENESIS_PREV_HASH, kind).unwrap();
+        append_and_fsync(&manifest_path_for(&active), &to_jsonl(&m).unwrap(), 0o600).unwrap();
+        let mut prev = term.entry_hash.clone();
+        for i in 3..5 {
+            let l = ChainLine::sealed_as(payload(i), Some(CHAINLOG_FMT_V2), &k, &prev).unwrap();
+            append_and_fsync(&active, &to_jsonl(&l).unwrap(), 0o600).unwrap();
+            prev = l.entry_hash;
+        }
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!((r.total_records, r.legacy_lines), (5, 7));
+        let old: Vec<(PathBuf, Vec<u8>)> = set_files(&active)
+            .into_iter()
+            .map(|f| {
+                let b = fs::read(&f).unwrap();
+                (f, b)
+            })
+            .collect();
+        // This version opens it and writes on, rotating twice.
+        {
+            let mut log = open_log(&active, &kp, 1500);
+            for i in 5..30 {
+                log.append(payload(i)).unwrap();
+            }
+            log.checkpoint().unwrap();
+        }
+        assert!(list_archive_seqs(&active).unwrap().len() >= 3, "rotated");
+        // The old bytes are where they were: archive 1 and the manifest
+        // unchanged up to their old end, the old active file the head of
+        // archive 2.
+        for (f, b) in &old {
+            let now = if *f == active {
+                fs::read(archive_path(&active, 2)).unwrap()
+            } else {
+                fs::read(f).unwrap()
+            };
+            assert!(now.starts_with(b), "{} keeps its old lines", f.display());
+            let tail = String::from_utf8(now[b.len()..].to_vec()).unwrap();
+            for raw in tail.lines().filter(|l| !l.is_empty()) {
+                assert_eq!(
+                    line_fmt_ver(raw),
+                    Some(3),
+                    "new line in {}: {raw}",
+                    f.display()
+                );
+            }
+        }
+        for raw in raw_lines(&active) {
+            assert_eq!(line_fmt_ver(&raw), Some(3));
+        }
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(
+            (r.total_records, r.legacy_lines, r.non_canonical_legacy),
+            (30, 7, 0)
+        );
+    }
+
+    /// EVD-007, round trip over the shipped payload types: every line the
+    /// writer produces for detections, status events, netflow and FIM drift
+    /// rows with random strings (escapes, control characters, non-ASCII,
+    /// astral), integers and floats verifies under v3 — which includes the
+    /// byte-canonical check — and is its own re-serialisation. A payload
+    /// type whose `Serialize`/`Deserialize` were asymmetric would fail its
+    /// own new rows here, before a release.
+    #[test]
+    fn every_shipped_payload_type_round_trips_byte_exactly() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x204);
+        fn text(rng: &mut rand::rngs::StdRng) -> String {
+            const POOL: &[char] = &[
+                'a',
+                'Z',
+                '0',
+                ' ',
+                '"',
+                '\\',
+                '/',
+                '\n',
+                '\t',
+                '\r',
+                '\u{0}',
+                '\u{1f}',
+                '\u{7f}',
+                '\u{e9}',
+                '\u{20ac}',
+                '\u{2028}',
+                '\u{fffd}',
+                '\u{1d11e}',
+                '{',
+                '}',
+                ':',
+                ',',
+            ];
+            let n = rng.gen_range(0..24);
+            (0..n).map(|_| POOL[rng.gen_range(0..POOL.len())]).collect()
+        }
+        fn opt(rng: &mut rand::rngs::StdRng) -> Option<String> {
+            rng.gen_bool(0.5).then(|| text(rng))
+        }
+        fn check<P: Serialize + DeserializeOwned + ChainPayload>(rows: Vec<P>) {
+            let dir = TempDir::new().unwrap();
+            let active = dir.path().join("log.jsonl");
+            let kp = dir.path().join("key");
+            let pk = key_at(&kp).verifying_key();
+            let mut log = RotatingChainLog::<P>::open(
+                &active,
+                key_at(&kp),
+                cfg(16 * 1024, 64),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
+            let n = rows.len() as u64;
+            for p in rows {
+                log.append(p).unwrap();
+            }
+            drop(log);
+            let r = verify_log_set::<P>(&active, &pk).unwrap();
+            assert_eq!((r.total_records, r.legacy_lines), (n, 0), "{}", P::KIND);
+            for file in set_files(&active) {
+                for raw in raw_lines(&file) {
+                    if is_terminator_line(&raw) || raw.starts_with("{\"manifest\":") {
+                        continue;
+                    }
+                    let d: ChainLine<P> = serde_json::from_str(&raw).unwrap();
+                    assert_eq!(serde_json::to_string(&d).unwrap(), raw, "{}", P::KIND);
+                    assert!(line_is_genuine::<P>(raw.as_bytes(), &pk));
+                }
+            }
+        }
+        use crate::detection_store::{DetectionRecord, DetectionStatus, Principal, StatusEvent};
+        let detections: Vec<DetectionRecord> = (0..120)
+            .map(|i| {
+                let event = common::Event::ProcessSpawn {
+                    pid: rng.gen(),
+                    ppid: rng.gen(),
+                    uid: rng.gen(),
+                    gid: rng.gen(),
+                    comm: text(&mut rng),
+                    filename: text(&mut rng),
+                    timestamp_ns: rng.gen(),
+                    argv: Vec::new(),
+                    parent_comm: text(&mut rng),
+                    parent_start_ns: 0,
+                    start_ns: 0,
+                    parent_is_kthread: false,
+                    exe: Default::default(),
+                    argv_truncated: false,
+                    filename_truncated: false,
+                };
+                let verdict = common::Verdict {
+                    rule_id: text(&mut rng),
+                    rule_name: text(&mut rng),
+                    category: text(&mut rng),
+                    action: common::ResponseAction::Log,
+                    severity: common::Severity::High,
+                    reasoning: text(&mut rng),
+                    event_pid: 1,
+                    event_filename: text(&mut rng),
+                    timestamp_ns: 1,
+                };
+                let mut d = DetectionRecord::from_rule(
+                    i,
+                    text(&mut rng),
+                    &event,
+                    &verdict,
+                    common::posture_types::PostureKind::Engaged,
+                    text(&mut rng),
+                );
+                d.confidence = loop {
+                    let f = f64::from_bits(rng.gen());
+                    if f.is_finite() {
+                        break f;
+                    }
+                };
+                d.suppressed_before = rng.gen_bool(0.3).then(|| rng.gen());
+                d.file = opt(&mut rng);
+                d.operation = opt(&mut rng);
+                d
+            })
+            .collect();
+        check(detections);
+        let statuses: Vec<StatusEvent> = (0..120)
+            .map(|_| StatusEvent {
+                detection_id: rng.gen(),
+                new_status: DetectionStatus::Investigating,
+                ts: text(&mut rng),
+                principal: Principal {
+                    pid: rng.gen(),
+                    comm: text(&mut rng),
+                    uid: rng.gen(),
+                    ppid: rng.gen_bool(0.5).then(|| rng.gen()),
+                },
+                note: opt(&mut rng),
+                principal_exe: opt(&mut rng),
+            })
+            .collect();
+        check(statuses);
+        let flows: Vec<crate::net::drain::NetFlowPayload> = (0..120)
+            .map(|_| crate::net::drain::NetFlowPayload {
+                ts: text(&mut rng),
+                flow_id: text(&mut rng),
+                start_ns: rng.gen(),
+                end_ns: rng.gen(),
+                family: rng.gen(),
+                src_addr: text(&mut rng),
+                src_port: rng.gen(),
+                dst_addr: text(&mut rng),
+                dst_port: rng.gen(),
+                proto: rng.gen(),
+                pid: rng.gen(),
+                uid: rng.gen(),
+                comm: text(&mut rng),
+                exe: opt(&mut rng),
+                bytes_sent: rng.gen(),
+                bytes_recv: rng.gen(),
+                resolved_hostname: opt(&mut rng),
+                ja3: opt(&mut rng),
+                ja4: opt(&mut rng),
+                sni: opt(&mut rng),
+                close_reason: rng.gen(),
+                agent_id: text(&mut rng),
+                decision_engine_skipped: rng.gen(),
+            })
+            .collect();
+        check(flows);
+        let drifts: Vec<crate::fim::drain::FimDriftPayload> = (0..120)
+            .map(|_| crate::fim::drain::FimDriftPayload {
+                ts: text(&mut rng),
+                path: text(&mut rng),
+                op: common::wire::FimOp::AttrChanged,
+                baseline_sha256: opt(&mut rng),
+                new_sha256: opt(&mut rng),
+                modifier_pid: rng.gen(),
+                modifier_uid: rng.gen(),
+                modifier_comm: text(&mut rng),
+                severity: crate::fim::drain::DriftSeverity::High,
+                decision_engine_skipped: rng.gen(),
+                skip_reason: text(&mut rng),
+                agent_id: text(&mut rng),
+                attrs: rng.gen_bool(0.5).then(|| common::wire::FileAttrChange {
+                    mode_before: rng.gen(),
+                    mode_after: rng.gen(),
+                    uid_before: rng.gen(),
+                    uid_after: rng.gen(),
+                    gid_before: rng.gen(),
+                    gid_after: rng.gen(),
+                }),
+            })
+            .collect();
+        check(drifts);
     }
 }

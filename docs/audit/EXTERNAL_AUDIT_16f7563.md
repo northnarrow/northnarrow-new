@@ -484,8 +484,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-270 | EBPF-019 | Low | eBPF kernel | S | fixed (lab PR 187) |
 | NN-AUD-271 | EBPF-020 | Low | eBPF kernel | S | fixed (lab PR 189) |
 | NN-AUD-272 | EBPF-021 | Low | eBPF kernel | M | fixed (lab PR 187) |
-| NN-AUD-273 | EVD-007 | Low | Evidence logs | M | open |
-| NN-AUD-274 | EVD-008 | Low | Evidence logs | M | partly fixed (audit/canary domains, lab PR 160); open |
+| NN-AUD-273 | EVD-007 | Low | Evidence logs | M | fixed (lab PR 204) |
+| NN-AUD-274 | EVD-008 | Low | Evidence logs | M | fixed (lab PR 204) |
 | NN-AUD-275 | EVD-010 | Low | Evidence logs | S | fixed (lab PR 179) |
 | NN-AUD-276 | EVD-011 | Low | Evidence logs | S | fixed (lab PR 180) |
 | NN-AUD-277 | EVD-014 | Low | Evidence logs | S | fixed (lab PR 180) |
@@ -638,7 +638,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-424 | ASK-018 | Info | Admin socket | S | open |
 | NN-AUD-425 | AUT-012 | Info | Admin auth | — | obsolete (lab PR 138) |
 | NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | fixed (lab PR 187) |
-| NN-AUD-427 | EVD-023 | Info | Evidence logs | S | open |
+| NN-AUD-427 | EVD-023 | Info | Evidence logs | S | fixed (lab PR 204) |
 | NN-AUD-428 | NETR-016 | Info | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-429 | PROC-014 | Info | Process rules | S | fixed (lab PR 201) |
 | NN-AUD-430 | POS-013 | Info | Posture | S | fixed (lab PR 172) |
@@ -9170,3 +9170,158 @@ group, the ones an unprivileged user or a local attacker could use first.
     `filename_truncated`, the known lot `nn-wt-kernfid` cause fixed on
     `main`).
   - Lab: No lab or model run (dormant code): unit and saliency tests (a probe that kills on `uid=0`), the byte-locked canonical sample unchanged, lab PRs 182/191's byte-stable prompt tests green, the real-corpus golden suite 28/30. Gate: the integration tree of lab PRs 200, 201, 202 and 203 on `main` with lab PRs 176–199: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,645 passed, 0 failed; fuzz build of the 13 targets OK on the tree.
+- **Wave 3 — chain pre-image v3, lab PR 204.** NN-AUD-273 (EVD-007),
+  NN-AUD-274 (EVD-008, the part left after lab PR 160), NN-AUD-427
+  (EVD-023, Informational): batch 7 of the Wave 3 triage of the evidence
+  and admin group, "before the next release", on the integration tree
+  (`main` with lots up to 195, and lots 196–203). One format step for the
+  rotating logs; the flat chains get the canonical check without a format
+  change (lab PR 160's numbered rows are unreleased). It is also the
+  per-chain tag lab PR 197 left open for the rotating logs (FIMP-013); the
+  FIM baseline and `netflow_listeners.jsonl` (flat, unnumbered, not
+  anchored) stay out of this lot, each a format step of its own.
+  - Before: `chainlog::chain_digest` = `SHA-256(prev ‖ json)` for every
+    `RotatingChainLog` (detections, status events, netflow, FIM drift), its
+    terminators and its manifest rows, under one key: a status-event line
+    verified in a log of another payload type of the same shape, and one
+    log's manifest verified as another's. `verify_one_file`,
+    `verify_recent`, `line_is_genuine`, the tail check at open and
+    `audit::verify_entry` (and the canary verifiers) decoded the line and
+    hashed its re-serialisation (`#[serde(flatten)]`, no
+    `deny_unknown_fields`): a key added, keys reordered, whitespace or an
+    escaped spelling verified. `compute_entry_hash` (audit, canary
+    registry, canary access, FIM baseline, listener log) relied on empty
+    `entry_hash`/`agent_sig` through `debug_assert!`; `chain_digest` had no
+    check.
+  - Agent: `chainlog.rs`: `CHAINLOG_FMT_V3`; `ChainPayload` (`KIND`:
+    `detections`, `status_events`, `netflow`, `fim_drift`, implemented by
+    the four payload types, pinned by a test); `LineRole`; `chain_domain`
+    = `northnarrow/chainlog/<kind>/<role>/v3\0` (kind `[a-z0-9_]{3,32}`, so
+    the domain is at least 33 bytes and never lines up with an untagged
+    pre-image). A `Frame` trait over `ChainLine<P>`, `TerminatorLine` and
+    `ManifestLine` gives one `chain_digest` (the format from the line's own
+    `fmt_ver`; refused when the line carries its seal, EVD-023), one
+    `seal_line` for the writers (data lines, terminators and manifest rows
+    are written v3) and one `verify_frame` for every reader: pre-image by
+    version (v1/v2 untagged, v3 tagged, any other `fmt_ver` named as a
+    format this reader does not know), hash, strict signature, then for v3
+    the bytes (`NonCanonicalLine`); a v1/v2 line that is not canonical is
+    counted. `verify_one_file`, `verify_recent`, `verify_manifest`,
+    `check_active_line` (tail check at open), `line_is_genuine`,
+    `manifest_line_is_genuine` and `manifest_tail_events` all use it; the
+    manifest functions take the log's kind. `track_format`: once a set
+    (archives then active) or a manifest holds a v3 line, a v1/v2 line
+    after it is `LegacyAfterV3`. `LogSetReport` gains `legacy_lines` and
+    `non_canonical_legacy`. A terminator's `this_seq` is now checked after
+    its hash (one decode). `chain_anchor.rs`: `check_unsealed`,
+    `is_canonical`; `ChainTarget::rotating::<P>` and `payload_kind` (the
+    manifest checks of `collect_heads` and `check_rotating` use the log's
+    domain); `full_rotating`'s summary names the old-format lines;
+    `full_canary_*` require numbered rows canonical (raw lines kept by
+    `flat_rows`). `audit.rs`: `compute_entry_hash` refuses a sealed entry;
+    `ChainVerifier::push_line` (raw bytes: a numbered row not canonical is
+    `AuditVerifyError::NonCanonical`, a row without `seq` counted) used by
+    `verify_chain_file`; `row_is_genuine` requires numbered rows canonical.
+    `canary/registry.rs`, `canary/access_log.rs`: the same at open (a
+    numbered row not canonical is not applied / not continued from, a
+    `chain_lines_unverified` finding) and in `row_is_genuine`;
+    `fim/baseline.rs`, `net/drain.rs` (listener log): the runtime seal
+    check. `agent/Cargo.toml`: `serde_json` with `float_roundtrip` — the
+    round-trip test found that the default parser lands one ULP off some
+    17-digit floats (`confidence` 2.5301126739304903e-45 came back
+    …906e-45), so such a detection, or an audit row with such a float in
+    `extra`, failed its own hash (v2) and would fail its canonical check
+    (v3); no row on disk verified before that does not now. No version
+    bump in `Cargo.lock`.
+  - Format and compatibility: no line on disk changes. v1/v2 lines, rows
+    without `seq`, and numbered rows keep their pre-image and verify byte
+    for byte (frozen vectors: a v2 line built by hand as the 0.0.1 writer
+    did and a v3 line, both `entry_hash` computed independently with Python
+    `hashlib`; the lot 160/179/185/190/197 legacy tests unchanged). Upgrade
+    from 0.0.1 data (a v2 archive with its v2 terminator, a v2 `Rotated`
+    row, a v2 active file): the old bytes stay where they were, every line
+    after them is v3, the set verifies across the boundary
+    (`legacy_lines` 7). An older reader facing v3 lines: an `nn-admin`
+    built before this lot reports each rotating log with v3 lines `BROKEN`
+    `entry_hash mismatch` at its first v3 line or manifest row, exit 8
+    (seen in the dry run: `netflow.jsonl.manifest.jsonl: entry 0`);
+    `nn-admin` 0.0.1 has no rotating-log reader (its `audit verify`
+    already needs the newer binary since lab PR 160). An older agent put
+    back over v3 files: its tail check refuses v3 lines, cuts up to 16
+    trailing ones of an active file or manifest that still ends in v2
+    lines (attested `torn_tail_repaired`) or keeps the tail as
+    `tail_unverified`; its background check reports
+    `chain_verify_failed`; its read verbs leave v3 rows out. Declared in
+    the upgrade notes (§ before you upgrade 1–2, §8): binaries together,
+    no downgrade.
+  - Residual: lines written before v3 (rotating logs until retention
+    drops them; the flat chains' rows without `seq`, kept) can still be
+    moved between logs of the same shape or rewritten in bytes without
+    breaking their signature (counted, named); the FIM baseline and the
+    listener log keep the untagged pre-image (not numbered, not anchored).
+    The row binding of the rotating logs is `prev_hash` (position) and the
+    terminator's `this_seq` (archive): no per-line sequence number was
+    added, the chain link already fixes the order.
+  - Tests: `chainlog` `every_line_the_writer_produces_is_v3_and_byte_canonical`
+    (data, terminators, `rotated`/`evicted`/`active_checkpoint`/
+    `torn_tail_repaired` rows: `fmt_ver` 3 and their own
+    re-serialisation), `a_v3_line_not_in_canonical_form_is_refused_everywhere`
+    (injected key, keys reordered, whitespace, `r` spelling: full
+    verifier, boot check, one-line check; a terminator and a manifest row
+    too), `a_legacy_line_not_in_canonical_form_verifies_and_is_counted`,
+    `a_line_transplanted_between_logs_is_refused` (two payload types of the
+    same shape: first line moved at a matching GENESIS `prev_hash`, and a
+    whole manifest), `each_log_and_line_type_has_its_own_domain`,
+    `an_old_format_line_after_v3_lines_is_refused`,
+    `an_unknown_format_version_is_named`,
+    `a_pre_image_that_carries_its_seal_is_refused`,
+    `frozen_v2_and_v3_vectors`,
+    `a_0_0_1_set_upgraded_keeps_its_lines_and_continues_in_v3`,
+    `every_shipped_payload_type_round_trips_byte_exactly` (120 random rows
+    of each of the four payload types: escapes, control and astral
+    characters, random integers and finite floats; seeded); `audit`
+    `a_numbered_row_not_in_canonical_form_is_refused_a_legacy_row_is_counted`,
+    `compute_entry_hash_refuses_an_entry_that_carries_its_seal`,
+    `every_row_the_writer_produces_round_trips_byte_exactly` (150 random
+    drafts); `canary::registry`
+    `a_numbered_registry_row_not_in_canonical_form_is_not_applied`,
+    `registry_compute_entry_hash_refuses_a_sealed_row`;
+    `canary::access_log` `a_numbered_access_row_not_in_canonical_form_is_refused`,
+    `access_compute_entry_hash_refuses_a_sealed_row`; `chain_anchor`
+    `the_full_checks_refuse_a_row_not_in_canonical_form` (audit, registry,
+    access, a rotating log; not a head). Existing tests: the five forged
+    terminators of the chainlog tests are v3 (they stand for this writer's),
+    `netflow_db_append_writes_one_chained_row` expects v3. On the starting
+    tree the new tests do not compile (new items); with each fix inverted
+    in place: canonical check off, 6 fail (the four canonical tests, the
+    legacy count, the full checks); domain off, 2 (transplant, frozen
+    vectors); order rule off, 1; seal check off, 4 (the four seal tests);
+    `float_roundtrip` off, the payload round trip (`EntryHashMismatch` at
+    the first detection line). Guards that pass either way:
+    `each_log_and_line_type_has_its_own_domain`,
+    `an_unknown_format_version_is_named`, the 0.0.1 upgrade, the audit round
+    trip.
+  - Host: `cargo fmt`, clippy `--workspace --exclude
+    northnarrow-agent-ebpf --all-targets --locked` and the agent with
+    `test-privileged,debug-trigger` clean; `cargo test --workspace` 2,664 passed, 0 failed, 21
+    ignored (2,645 on the starting tree, a `git archive` copy whose three
+    `install_scripts` socket tests fail there only because its scratch path
+    is longer than `SUN_LEN`).
+    The `posture_demo` clippy fails on the starting tree as on this one
+    (`agent/examples/posture_demo.rs:121`, the known cause fixed on `main`).
+  - Probe: `chainv3204-probe.sh` (`activity`, `before` on the older
+    install, `nn-lab.sh upgrade-check` with this tree, then `after` and
+    `copies`; all on copies of the chains): A old bytes kept, B new lines
+    v3 and none old after them, C `chain verify` per chain with the
+    old-format count equal to the probe's own, D1/D2 a v3 manifest row and
+    a v3 data line with two keys swapped (same length) refused, D2b/D3 the
+    same on an old-format line and a row without `seq` counted, D3 a
+    numbered audit row with a key added refused, E1 one log's manifest as
+    another's refused at row 0. Dry run off the lab (fixture chains: a v2
+    netflow log and unnumbered audit rows, then this tree's writers on
+    them): this tree 23 PASS, 0 FAIL; the starting tree's `nn-admin` on the
+    same upgraded files reports netflow and FIM drift `BROKEN` at their
+    first v3 manifest row; on the files as the older build leaves them
+    (old-format only) 5 FAIL: no v3 line, no new audit row (no newer agent
+    ran), and nothing named or counted (C, D2b, D3).
+  - Lab: Upgrade on Ubuntu 24.04 from a clean install of the tree without this lot (`uninstall-check`: purge, reinstall; four minutes of activity, then the snapshot), sync + build + `upgrade-check` (OK): every snapshot byte of the four rotating logs and every audit row still there; afterwards netflow and FIM drift wrote only v3 lines after their old ones, and detections 102 v3 lines with no old-format line after a v3 one — its 103 old-format lines since the snapshot were the old agent's, written during the guest build that preceded the upgrade (the probe's strict count reports them, 15 passed, 1 failed); `nn-admin chain verify` on copies OK, the old-format lines named and counted (105, 5, 2); on copies, a manifest row and a v3 line with two keys reordered BROKEN (not canonical), an old-format line with keys swapped verifies as before and is counted, a numbered audit row with an added key exit 8, netflow's manifest put under fim_drift BROKEN (signed for the other log): 8 passed, 0 failed, 7 skipped (no such line on that log). Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.

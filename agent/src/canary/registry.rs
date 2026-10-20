@@ -695,11 +695,14 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
     {
         let parsed = match line {
             crate::canary::chain_lines::ChainLine::Text(l) => {
-                serde_json::from_str::<CanaryToken>(l).ok()
+                serde_json::from_str::<CanaryToken>(l).ok().map(|e| {
+                    let canonical = crate::chain_anchor::is_canonical(&e, l.as_bytes());
+                    (e, canonical)
+                })
             }
             crate::canary::chain_lines::ChainLine::Unreadable => None,
         };
-        let Some(entry) = parsed else {
+        let Some((entry, canonical)) = parsed else {
             skipped += 1;
             seq.skip();
             continue;
@@ -708,7 +711,10 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
         if let Err(b) = seq.push(entry.seq) {
             breaks.push(b.to_string());
         }
-        if verify_row(&entry, pubkey).is_err() {
+        // External audit EVD-007 (lab PR 204): a numbered row whose bytes are
+        // not its canonical serialisation is not applied, like one that does
+        // not verify.
+        if verify_row(&entry, pubkey).is_err() || (entry.seq.is_some() && !canonical) {
             unverified += 1;
             continue;
         }
@@ -862,9 +868,11 @@ fn build_signed_entry(
 ///
 /// External audit NN-AUD-174: a numbered row (`seq` set) prefixes the
 /// pre-image with [`crate::chain_anchor::CANARY_REGISTRY_DOMAIN_V2`].
+///
+/// External audit EVD-023 (NN-AUD-427, lab PR 204): a row that still
+/// carries `entry_hash` or `agent_sig` is an error in every build.
 fn compute_entry_hash(entry: &CanaryToken) -> Result<[u8; 32]> {
-    debug_assert!(entry.entry_hash.is_empty());
-    debug_assert!(entry.agent_sig.is_empty());
+    crate::chain_anchor::check_unsealed(&entry.entry_hash, &entry.agent_sig)?;
     let body =
         serde_json::to_vec(entry).map_err(|e| anyhow!("serialising canary pre-image: {e}"))?;
     let domain = entry
@@ -903,9 +911,13 @@ fn verify_row(entry: &CanaryToken, pubkey: &VerifyingKey) -> Result<(), Registry
 }
 
 /// External audit NN-AUD-174: whether one raw line is a genuine registry
-/// row.
+/// row. External audit EVD-007 (lab PR 204): a numbered row must also be in
+/// its canonical bytes.
 pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
-    serde_json::from_slice::<CanaryToken>(line).is_ok_and(|e| verify_row(&e, pubkey).is_ok())
+    serde_json::from_slice::<CanaryToken>(line).is_ok_and(|e| {
+        verify_row(&e, pubkey).is_ok()
+            && (e.seq.is_none() || crate::chain_anchor::is_canonical(&e, line))
+    })
 }
 
 /// Per-canary stable ID — `SHA-256(name || ":" ||
@@ -1935,5 +1947,60 @@ mod tests {
                 &pk
             ));
         }
+    }
+
+    // ── External audit, Wave 3, lab PR 204 ─────────────────────────────
+
+    /// EVD-007 (NN-AUD-273): a numbered registry row rewritten with a key
+    /// the type does not have (`"burned":true` reads like a retirement)
+    /// still decodes to the genuine row and verifies; its bytes are not
+    /// what the agent wrote. It is not applied at open, not a head, and
+    /// `chain verify` refuses it. On the starting code it verified.
+    #[test]
+    fn a_numbered_registry_row_not_in_canonical_form_is_not_applied() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        let (key, pk) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        reg.deploy(sample_draft(1)).unwrap();
+        let second = reg.deploy(sample_draft(2)).unwrap();
+        drop(reg);
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(row_is_genuine(lines[1].as_bytes(), &pk));
+        let forged = format!("{},\"burned\":true}}", lines[1].strip_suffix('}').unwrap());
+        let decoded: CanaryToken = serde_json::from_str(&forged).unwrap();
+        assert!(
+            verify_row(&decoded, &pk).is_ok(),
+            "the decoded row verifies"
+        );
+        assert!(!row_is_genuine(forged.as_bytes(), &pk));
+        std::fs::write(&log_path, format!("{}\n{forged}\n", lines[0])).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        assert!(reg.get(&second.canary_id).is_none(), "not applied");
+        assert!(reg
+            .take_chain_findings()
+            .iter()
+            .any(|f| f.kind == "chain_lines_unverified"));
+    }
+
+    /// EVD-023 (NN-AUD-427): a pre-image that carries its seal is refused
+    /// in every build.
+    #[test]
+    fn registry_compute_entry_hash_refuses_a_sealed_row() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        let (key, _) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        let row = reg.deploy(sample_draft(1)).unwrap();
+        assert!(compute_entry_hash(&row).is_err());
+        let mut stripped = row.clone();
+        stripped.entry_hash.clear();
+        stripped.agent_sig.clear();
+        assert_eq!(
+            hex::encode(compute_entry_hash(&stripped).unwrap()),
+            row.entry_hash
+        );
     }
 }

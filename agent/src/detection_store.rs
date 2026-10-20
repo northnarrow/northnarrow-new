@@ -620,6 +620,18 @@ pub struct StatusEvent {
     pub principal_exe: Option<String>,
 }
 
+/// External audit EVD-008 (lab PR 204): the detection log's name in its v3
+/// pre-images.
+impl crate::chainlog::ChainPayload for DetectionRecord {
+    const KIND: &'static str = "detections";
+}
+
+/// External audit EVD-008 (lab PR 204): the status-event log's name in its
+/// v3 pre-images.
+impl crate::chainlog::ChainPayload for StatusEvent {
+    const KIND: &'static str = "status_events";
+}
+
 /// Map the ADE severity (which has a `None` rung reserved for `Allow`)
 /// onto the rule [`Severity`] so the record carries one severity enum.
 /// `None` collapses to `Low` (the lowest concrete rung) — by the time a

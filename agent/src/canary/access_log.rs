@@ -264,8 +264,8 @@ fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
     let mut reader = crate::canary::chain_lines::ChainLines::new(BufReader::new(f));
     let mut skipped = 0usize;
     let mut first_break: Option<String> = None;
-    // (row, entry) of the last rows, oldest first.
-    let mut window: std::collections::VecDeque<(u64, CanaryAccessEntry)> =
+    // (row, entry, canonical bytes) of the last rows, oldest first.
+    let mut window: std::collections::VecDeque<(u64, CanaryAccessEntry, bool)> =
         std::collections::VecDeque::with_capacity(OPEN_VERIFY_ROWS);
     while let Some(line) = reader
         .next_line()
@@ -273,12 +273,15 @@ fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
     {
         let parsed = match line {
             crate::canary::chain_lines::ChainLine::Text(l) => {
-                serde_json::from_str::<CanaryAccessEntry>(l).ok()
+                serde_json::from_str::<CanaryAccessEntry>(l).ok().map(|e| {
+                    let canonical = crate::chain_anchor::is_canonical(&e, l.as_bytes());
+                    (e, canonical)
+                })
             }
             crate::canary::chain_lines::ChainLine::Unreadable => None,
         };
         match parsed {
-            Some(entry) => {
+            Some((entry, canonical)) => {
                 let row = seq.rows();
                 if let Err(b) = seq.push(entry.seq) {
                     first_break.get_or_insert_with(|| b.to_string());
@@ -286,7 +289,7 @@ fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
                 if window.len() == OPEN_VERIFY_ROWS {
                     window.pop_front();
                 }
-                window.push_back((row, entry));
+                window.push_back((row, entry, canonical));
             }
             None => {
                 skipped += 1;
@@ -297,8 +300,11 @@ fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
     let mut last: Option<String> = None;
     let mut unverified = 0usize;
     let mut prev: Option<&str> = None;
-    for (row, entry) in &window {
-        if verify_row(entry, pubkey).is_err() {
+    for (row, entry, canonical) in &window {
+        // External audit EVD-007 (lab PR 204): a numbered row not in its
+        // canonical bytes is not continued from, like one that does not
+        // verify.
+        if verify_row(entry, pubkey).is_err() || (entry.seq.is_some() && !canonical) {
             unverified += 1;
             continue;
         }
@@ -334,7 +340,7 @@ fn read_tail_hash(path: &Path, pubkey: &VerifyingKey) -> Result<TailRead> {
     }
     // Nothing in the window verifies: continue from the newest parsed row,
     // as before (its failure is reported above).
-    let last = last.or_else(|| window.back().map(|(_, e)| e.entry_hash.clone()));
+    let last = last.or_else(|| window.back().map(|(_, e, _)| e.entry_hash.clone()));
     Ok(TailRead {
         last_hash: last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
         skipped,
@@ -380,9 +386,11 @@ fn build_signed_entry(
 /// External audit NN-AUD-174: a numbered row (`seq` set) prefixes the
 /// pre-image with [`crate::chain_anchor::CANARY_ACCESS_DOMAIN_V2`]; a row
 /// without `seq` keeps the pre-image it was signed with.
+///
+/// External audit EVD-023 (NN-AUD-427, lab PR 204): a row that still
+/// carries `entry_hash` or `agent_sig` is an error in every build.
 fn compute_entry_hash(entry: &CanaryAccessEntry) -> Result<[u8; 32]> {
-    debug_assert!(entry.entry_hash.is_empty());
-    debug_assert!(entry.agent_sig.is_empty());
+    crate::chain_anchor::check_unsealed(&entry.entry_hash, &entry.agent_sig)?;
     let body = serde_json::to_vec(entry)
         .map_err(|e| anyhow!("serialising canary access pre-image: {e}"))?;
     let domain = entry
@@ -424,8 +432,13 @@ fn verify_row(
 }
 
 /// External audit NN-AUD-174: whether one raw line is a genuine access row.
+/// External audit EVD-007 (lab PR 204): a numbered row must also be in its
+/// canonical bytes.
 pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
-    serde_json::from_slice::<CanaryAccessEntry>(line).is_ok_and(|e| verify_row(&e, pubkey).is_ok())
+    serde_json::from_slice::<CanaryAccessEntry>(line).is_ok_and(|e| {
+        verify_row(&e, pubkey).is_ok()
+            && (e.seq.is_none() || crate::chain_anchor::is_canonical(&e, line))
+    })
 }
 
 fn format_ts(t: DateTime<Utc>) -> String {
@@ -765,5 +778,62 @@ mod tests {
             verify_chain(&[e], &pk),
             Err(AccessLogVerifyError::EntryHashMismatch { idx: 0, .. })
         ));
+    }
+
+    // ── External audit, Wave 3, lab PR 204 ─────────────────────────────
+
+    /// EVD-007 (NN-AUD-273): a numbered access row with a key added still
+    /// decodes to the genuine row and verifies; its bytes are not what the
+    /// agent wrote. The open does not continue from it, it is not a head,
+    /// and the full check refuses it. On the starting code it verified.
+    #[test]
+    fn a_numbered_access_row_not_in_canonical_form_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canary_access.jsonl");
+        let (key, pk) = fresh_signing_key(&dir);
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let first = db.append(sample_draft(1, true)).unwrap();
+        db.append(sample_draft(2, false)).unwrap();
+        drop(db);
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        let forged = format!(
+            "{},\"injected\":\"x\"}}",
+            lines[1].strip_suffix('}').unwrap()
+        );
+        let decoded: CanaryAccessEntry = serde_json::from_str(&forged).unwrap();
+        assert!(
+            verify_row(&decoded, &pk).is_ok(),
+            "the decoded row verifies"
+        );
+        assert!(row_is_genuine(lines[1].as_bytes(), &pk));
+        assert!(!row_is_genuine(forged.as_bytes(), &pk));
+        std::fs::write(&log_path, format!("{}\n{forged}\n", lines[0])).unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        assert!(db
+            .take_chain_findings()
+            .iter()
+            .any(|f| f.kind == "chain_lines_unverified"));
+        assert_eq!(db.last_hash(), first.entry_hash);
+    }
+
+    /// EVD-023 (NN-AUD-427): a pre-image that carries its seal is refused
+    /// in every build.
+    #[test]
+    fn access_compute_entry_hash_refuses_a_sealed_row() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canary_access.jsonl");
+        let (key, _) = fresh_signing_key(&dir);
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let row = db.append(sample_draft(1, true)).unwrap();
+        assert!(compute_entry_hash(&row).is_err());
+        let mut stripped = row.clone();
+        stripped.entry_hash.clear();
+        stripped.agent_sig.clear();
+        assert_eq!(
+            hex::encode(compute_entry_hash(&stripped).unwrap()),
+            row.entry_hash
+        );
     }
 }

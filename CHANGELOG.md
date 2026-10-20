@@ -61,6 +61,58 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, chain pre-image v3 (Low EVD-007 NN-AUD-273,
+  EVD-008 NN-AUD-274, EVD-023 NN-AUD-427; lab PR 204). One agent key signs
+  every chain. EVD-008: the rotating logs (detections, status events,
+  netflow, FIM drift) hashed every line, data line, terminator or manifest
+  row, as `SHA-256(prev_hash ‖ json)`, the same for every log: a line or a
+  whole manifest moved from one log to another whose payload has the same
+  shape verified there. Every line the agent now writes is format v3
+  (`chainlog::CHAINLOG_FMT_V3`, `fmt_ver` 3 in the line, the terminator's
+  `rotate` and the manifest entry), signed over `SHA-256(domain ‖ prev_hash
+  ‖ json)` with `domain` = `northnarrow/chainlog/<log>/<line type>/v3\0`
+  (`chain_domain`; `<log>` from the payload type, `ChainPayload::KIND`:
+  `detections`, `status_events`, `netflow`, `fim_drift`; `<line type>`
+  `data`, `terminator`, `manifest`); the verifiers dispatch on `fmt_ver` in
+  `verify_log_set`, `verify_recent`, `line_is_genuine`, the manifest checks
+  and the tail check at open. This is the per-chain tag lab PR 197 left for
+  the rotating logs (FIMP-013). EVD-007: the verifiers hashed the decoded
+  line, so a key the type does not have, another key order, spaces or an
+  escaped spelling decoded to the same line and verified — the signature
+  covered the modelled fields, not the bytes on disk. A v3 line, and a
+  numbered row (`seq`) of `audit.log` and the canary chains, must be byte
+  for byte its own re-serialisation: `LogSetError::NonCanonicalLine`,
+  `AuditVerifyError::NonCanonical`, `ChainVerifier::push_line`; at open a
+  canary row in that state is not applied, an access row not continued
+  from, and no such line is a head. Lines and rows from before keep the
+  check they were written under and are counted (`legacy_lines`,
+  `non_canonical_legacy`, named in `nn-admin chain verify`'s summary); once
+  a log or manifest holds a v3 line, a later line in the old format is
+  refused (`LegacyAfterV3`); an unknown `fmt_ver` is named, not hashed.
+  EVD-023: the pre-image rule (`entry_hash` and `agent_sig` empty) was a
+  `debug_assert!` in `audit::compute_entry_hash`, the canary chains, the
+  FIM baseline and the listener log, and nothing in `chain_digest`: a
+  release build hashed a row that still carried them. It is an error in
+  every build (`chain_anchor::check_unsealed`, the frame check of
+  `chain_digest`). Found by the new round-trip test: `serde_json`'s default
+  float parser lands one ULP off some 17-digit floats, so a detection whose
+  `confidence` (or an audit row whose `extra`) held one did not recompute
+  its own hash; the agent builds `serde_json` with `float_roundtrip`.
+  **Regressions / compatibility:** no line on disk changes, the v1/v2
+  lines and the rows without `seq` verify byte for byte as before (frozen
+  v2 and v3 vectors, a 0.0.1-shaped set upgraded in the tests); new lines
+  are v3. An `nn-admin` older than the agent reports each rotating log with
+  v3 lines `BROKEN` (`entry_hash mismatch`, exit 8): upgrade them together.
+  An older agent put back over v3 files cuts up to 16 trailing v3 lines of
+  an active file or manifest that still ends in old-format lines (attested
+  `torn_tail_repaired`), and reports `chain_verify_failed`: no downgrade.
+  `nn-admin chain verify` prints `…, N line(s) in the old format
+  (untagged pre-image) before the v3 ones` on an upgraded host. A crafted
+  terminator that fails both its hash and its `this_seq` is now reported by
+  its hash. Residual: the old-format lines, the FIM baseline and
+  `netflow_listeners.jsonl` keep the untagged pre-image. Documented in
+  `docs/operator/EVIDENCE_CHAINS.md` (line formats),
+  `UPGRADE_NOTES_AUDIT_16f7563.md` §8 and the completeness design.
 - External audit, Wave 3, enrichment templates and XAI before their wiring
   (Low LLMP-007 NN-AUD-320, LLMP-008 NN-AUD-321, LLMP-009 NN-AUD-432,
   XAI-006 NN-AUD-344, XAI-014 NN-AUD-348, XAI-016 NN-AUD-350, LLMR-019

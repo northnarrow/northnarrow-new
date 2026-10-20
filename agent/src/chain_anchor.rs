@@ -172,6 +172,31 @@ pub fn flat_digest(domain: Option<&[u8]>, prev_hash: &str, body: &[u8]) -> Resul
     Ok(h.finalize().into())
 }
 
+/// External audit EVD-023 (NN-AUD-427, lab PR 204): a pre-image is the row
+/// with its `entry_hash` and `agent_sig` empty. A row that still carries
+/// either is refused in every build (it was a `debug_assert!`): its digest
+/// is one no verifier reproduces.
+pub fn check_unsealed(entry_hash: &str, agent_sig: &str) -> Result<()> {
+    if entry_hash.is_empty() && agent_sig.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "chain pre-image carries its own entry_hash or agent_sig: refused"
+        ))
+    }
+}
+
+/// External audit EVD-007 (NN-AUD-273, lab PR 204): whether `raw`, one line
+/// as it is on disk (without its newline), is the serialisation of `row`,
+/// the value decoded from it. The hash covers the decoded row only: a key
+/// the type does not have, another key order, whitespace or another
+/// spelling of a value decode to the same row and verify. Numbered rows
+/// (`seq`) and v3 rotating-log lines must be canonical; older rows are
+/// counted when they are not.
+pub fn is_canonical<T: Serialize>(row: &T, raw: &[u8]) -> bool {
+    serde_json::to_vec(row).is_ok_and(|b| b == raw)
+}
+
 /// `entry_hash` shape every chain writes: 64 lowercase hex characters.
 pub fn is_chain_hash(h: &str) -> bool {
     h.len() == 64
@@ -381,41 +406,120 @@ pub struct ChainTarget {
     /// The full verification (`nn-admin chain verify`): a one-line
     /// summary, or why the chain is broken.
     pub full: FullCheck,
+    /// Rotating logs: the log's [`crate::chainlog::ChainPayload::KIND`],
+    /// the domain its manifest rows are checked under (external audit
+    /// EVD-008, lab PR 204).
+    pub payload_kind: Option<&'static str>,
+}
+
+impl ChainTarget {
+    /// The target of the rotating log of `P` at `path`.
+    pub fn rotating<P>(chain: &'static str, path: &Path) -> Self
+    where
+        P: Serialize + serde::de::DeserializeOwned + crate::chainlog::ChainPayload,
+    {
+        ChainTarget {
+            chain,
+            path: path.to_path_buf(),
+            kind: ChainKind::Rotating,
+            genuine: crate::chainlog::line_is_genuine::<P>,
+            recent: Some(crate::chainlog::verify_recent::<P>),
+            full: full_rotating::<P>,
+            payload_kind: Some(P::KIND),
+        }
+    }
 }
 
 /// Full verification of one chain.
 pub type FullCheck = fn(&Path, &VerifyingKey) -> Result<String, String>;
 
 /// [`crate::chainlog::verify_log_set`] for one payload type.
-fn full_rotating<P: Serialize + serde::de::DeserializeOwned>(
+fn full_rotating<P: Serialize + serde::de::DeserializeOwned + crate::chainlog::ChainPayload>(
     active: &Path,
     pk: &VerifyingKey,
 ) -> Result<String, String> {
     crate::chainlog::verify_log_set::<P>(active, pk)
         .map(|r| {
-            format!(
+            let mut s = format!(
                 "{} records, {} archive(s) from seq {}, {} checkpoint(s) reachable",
                 r.total_records,
                 r.archives_verified,
                 r.earliest_retained_seq,
                 r.checkpoints_verified
-            )
+            );
+            // External audit EVD-007/EVD-008 (lab PR 204).
+            s.push_str(&legacy_summary(r.legacy_lines, r.non_canonical_legacy));
+            s
         })
         .map_err(|e| e.to_string())
 }
 
-/// The rows of a flat chain file; a line that does not parse is an error.
-fn flat_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, String> {
+/// External audit EVD-007/EVD-008 (lab PR 204): what a chain still holds in
+/// the format from before v3, for the one-line summaries: nothing when it
+/// holds none.
+fn legacy_summary(legacy: u64, non_canonical: u64) -> String {
+    match (legacy, non_canonical) {
+        (0, _) => String::new(),
+        (n, 0) => {
+            format!(", {n} line(s) in the old format (untagged pre-image) before the v3 ones")
+        }
+        (n, c) => format!(
+            ", {n} line(s) in the old format (untagged pre-image) before the v3 ones, {c} of them \
+             not in canonical form (bytes the signature does not cover)"
+        ),
+    }
+}
+
+/// The rows of a flat chain file, and each row's line as on disk (external
+/// audit EVD-007, lab PR 204); a line that does not parse is an error.
+fn flat_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Result<(Vec<T>, Vec<String>), String> {
     let body = match std::fs::read_to_string(path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(format!("unreadable: {e}")),
     };
-    body.lines()
-        .enumerate()
-        .filter(|(_, l)| !l.is_empty())
-        .map(|(i, l)| serde_json::from_str(l).map_err(|e| format!("line {}: {e}", i + 1)))
-        .collect()
+    let mut rows = Vec::new();
+    let mut raws = Vec::new();
+    for (i, l) in body.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
+        rows.push(serde_json::from_str(l).map_err(|e| format!("line {}: {e}", i + 1))?);
+        raws.push(l.to_string());
+    }
+    Ok((rows, raws))
+}
+
+/// External audit EVD-007 (NN-AUD-273, lab PR 204): every numbered row of a
+/// flat chain is in its canonical bytes; returns how many rows without
+/// `seq` are not (they verify as before).
+fn canonical_rows<T: Serialize>(
+    rows: &[T],
+    raws: &[String],
+    numbered: impl Fn(&T) -> bool,
+) -> Result<usize, String> {
+    let mut legacy = 0;
+    for (idx, (row, raw)) in rows.iter().zip(raws).enumerate() {
+        if is_canonical(row, raw.as_bytes()) {
+            continue;
+        }
+        if numbered(row) {
+            return Err(format!(
+                "entry {idx}: a numbered row not in its canonical form (the bytes on disk are not \
+                 what the agent wrote: a key added, reordered or re-spelled)"
+            ));
+        }
+        legacy += 1;
+    }
+    Ok(legacy)
+}
+
+/// The summary's note on rows without `seq` not in canonical bytes.
+fn non_canonical_note(n: usize) -> String {
+    if n == 0 {
+        String::new()
+    } else {
+        format!(
+            ", {n} old-format row(s) not in canonical form (bytes the signature does not cover)"
+        )
+    }
 }
 
 /// External audit MAIN-014 (NN-AUD-256, lab PR 190): the audit chain in one
@@ -428,25 +532,27 @@ fn full_audit(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
     if let Some(e) = r.broken {
         return Err(e.to_string());
     }
-    Ok(numbered_summary(r.rows, r.first_numbered))
+    Ok(numbered_summary(r.rows, r.first_numbered) + &non_canonical_note(r.non_canonical_legacy))
 }
 
 fn full_canary_registry(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
-    let rows: Vec<crate::canary::registry::CanaryToken> = flat_rows(path)?;
+    let (rows, raws) = flat_rows::<crate::canary::registry::CanaryToken>(path)?;
     crate::canary::registry::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
-    Ok(numbered_summary(
-        rows.len(),
-        rows.iter().position(|r| r.seq.is_some()),
-    ))
+    let legacy = canonical_rows(&rows, &raws, |r| r.seq.is_some())?;
+    Ok(
+        numbered_summary(rows.len(), rows.iter().position(|r| r.seq.is_some()))
+            + &non_canonical_note(legacy),
+    )
 }
 
 fn full_canary_access(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
-    let rows: Vec<crate::canary::access_log::CanaryAccessEntry> = flat_rows(path)?;
+    let (rows, raws) = flat_rows::<crate::canary::access_log::CanaryAccessEntry>(path)?;
     crate::canary::access_log::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
-    Ok(numbered_summary(
-        rows.len(),
-        rows.iter().position(|r| r.seq.is_some()),
-    ))
+    let legacy = canonical_rows(&rows, &raws, |r| r.seq.is_some())?;
+    Ok(
+        numbered_summary(rows.len(), rows.iter().position(|r| r.seq.is_some()))
+            + &non_canonical_note(legacy),
+    )
 }
 
 fn numbered_summary(rows: usize, first_numbered: Option<usize>) -> String {
@@ -493,7 +599,6 @@ impl Default for ChainPaths {
 impl ChainPaths {
     /// Every chain the agent anchors, in a fixed order.
     pub fn targets(&self) -> Vec<ChainTarget> {
-        use crate::chainlog::{line_is_genuine, verify_recent};
         let flat = |chain, path: &PathBuf, genuine, full| ChainTarget {
             chain,
             path: path.clone(),
@@ -501,14 +606,7 @@ impl ChainPaths {
             genuine,
             recent: None,
             full,
-        };
-        let rotating = |chain, path: &PathBuf, genuine, recent, full| ChainTarget {
-            chain,
-            path: path.clone(),
-            kind: ChainKind::Rotating,
-            genuine,
-            recent: Some(recent),
-            full,
+            payload_kind: None,
         };
         vec![
             flat(
@@ -529,33 +627,18 @@ impl ChainPaths {
                 crate::canary::access_log::row_is_genuine,
                 full_canary_access,
             ),
-            rotating(
+            ChainTarget::rotating::<crate::detection_store::DetectionRecord>(
                 "detections",
                 &self.detections,
-                line_is_genuine::<crate::detection_store::DetectionRecord>,
-                verify_recent::<crate::detection_store::DetectionRecord>,
-                full_rotating::<crate::detection_store::DetectionRecord>,
             ),
-            rotating(
+            ChainTarget::rotating::<crate::detection_store::StatusEvent>(
                 "status_events",
                 &self.status_events,
-                line_is_genuine::<crate::detection_store::StatusEvent>,
-                verify_recent::<crate::detection_store::StatusEvent>,
-                full_rotating::<crate::detection_store::StatusEvent>,
             ),
-            rotating(
-                "netflow",
-                &self.netflow,
-                line_is_genuine::<crate::net::drain::NetFlowPayload>,
-                verify_recent::<crate::net::drain::NetFlowPayload>,
-                full_rotating::<crate::net::drain::NetFlowPayload>,
-            ),
-            rotating(
+            ChainTarget::rotating::<crate::net::drain::NetFlowPayload>("netflow", &self.netflow),
+            ChainTarget::rotating::<crate::fim::drain::FimDriftPayload>(
                 "fim_drift",
                 &self.fim_drift,
-                line_is_genuine::<crate::fim::drain::FimDriftPayload>,
-                verify_recent::<crate::fim::drain::FimDriftPayload>,
-                full_rotating::<crate::fim::drain::FimDriftPayload>,
             ),
         ]
     }
@@ -751,7 +834,8 @@ pub fn collect_heads(targets: &[ChainTarget], pk: &VerifyingKey) -> Vec<Anchored
                     });
                 }
                 let manifest = crate::chainlog::manifest_path(&t.path);
-                let mcheck = |l: &[u8]| crate::chainlog::manifest_line_is_genuine(l, pk);
+                let kind = t.payload_kind.unwrap_or_default();
+                let mcheck = |l: &[u8]| crate::chainlog::manifest_line_is_genuine(l, kind, pk);
                 if let Some(h) = head(&manifest, &mcheck) {
                     out.push(AnchoredHead {
                         chain: format!("{}.manifest", t.chain),
@@ -1055,7 +1139,8 @@ fn report_head(
 /// The newest manifest checkpoint, and a missing active file, of one
 /// rotating log.
 fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFinding>) {
-    let tail = crate::chainlog::manifest_tail_events(&t.path, pk);
+    let tail =
+        crate::chainlog::manifest_tail_events(&t.path, t.payload_kind.unwrap_or_default(), pk);
     if let Some((seq, head)) = tail.iter().find_map(|e| match e {
         crate::chainlog::ManifestEvent::ActiveCheckpoint {
             seq,
@@ -1760,15 +1845,12 @@ mod tests {
         n: u64,
     }
 
+    impl crate::chainlog::ChainPayload for P {
+        const KIND: &'static str = "test_log";
+    }
+
     fn rotating_target(path: &Path) -> ChainTarget {
-        ChainTarget {
-            chain: "test_log",
-            path: path.to_path_buf(),
-            kind: ChainKind::Rotating,
-            genuine: crate::chainlog::line_is_genuine::<P>,
-            recent: Some(crate::chainlog::verify_recent::<P>),
-            full: full_rotating::<P>,
-        }
+        ChainTarget::rotating::<P>("test_log", path)
     }
 
     fn rotating_log(
@@ -1867,7 +1949,7 @@ mod tests {
             log.append(p(n)).unwrap();
         }
         drop(log);
-        assert!(crate::chainlog::manifest_tail_events(&active, &pk).is_empty());
+        assert!(crate::chainlog::manifest_tail_events(&active, "test_log", &pk).is_empty());
         Anchor::new(
             heads.clone(),
             k,
@@ -1915,5 +1997,103 @@ mod tests {
         );
         // full verification agrees
         assert!((rotating_target(&active).full)(&active, &pk).is_err());
+    }
+
+    // ── External audit, Wave 3, lab PR 204 ─────────────────────────────
+
+    /// Rewrite line `n` (0-based) of `path` with `"injected":"x"` added.
+    fn inject_at(path: &Path, n: usize) {
+        let body = std::fs::read_to_string(path).unwrap();
+        let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+        lines[n] = format!(
+            "{},\"injected\":\"x\"}}",
+            lines[n].strip_suffix('}').unwrap()
+        );
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    /// EVD-007 (NN-AUD-273): `nn-admin chain verify` refuses a numbered row
+    /// not in its canonical bytes in every flat chain (audit, canary
+    /// registry, canary access) and a v3 line of a rotating log; the head of
+    /// a chain is never such a row. Rows in the old format are named in the
+    /// summary. On the starting code all of them verified.
+    #[test]
+    fn the_full_checks_refuse_a_row_not_in_canonical_form() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let cp = paths(&dir);
+        let mut log = AuditLog::open(&cp.audit, k, [1; 16]).unwrap();
+        for n in 0..3 {
+            log.append(draft(n)).unwrap();
+        }
+        drop(log);
+        let mut reg =
+            crate::canary::registry::Registry::open(&cp.canary_registry, key(&dir), [1; 16])
+                .unwrap();
+        for n in 0..2 {
+            reg.deploy(crate::canary::registry::CanaryTokenDraft {
+                name: format!("c{n}"),
+                canary_type: common::wire::admin_signed_payload::CanaryTypeWire::File,
+                deployment: common::wire::admin_signed_payload::CanaryDeploymentWire::File {
+                    path: format!("/tmp/c{n}"),
+                    template: None,
+                },
+                deployed_by_fp: "00000000".to_string(),
+                content: None,
+            })
+            .unwrap();
+        }
+        drop(reg);
+        let mut acc =
+            crate::canary::access_log::CanaryAccessDb::open(&cp.canary_access, key(&dir), [1; 16])
+                .unwrap();
+        for n in 0..2 {
+            acc.append(crate::canary::access_log::CanaryAccessDraft {
+                canary_id: format!("id{n}"),
+                canary_name: format!("c{n}"),
+                canary_type: common::CanaryTypeTag::File,
+                access_kind: common::CanaryAccessKind::FileOpen,
+                accessor_pid: 1,
+                accessor_uid: 0,
+                accessor_comm: "cat".to_string(),
+                accessor_exe: None,
+                first_trip: n == 0,
+            })
+            .unwrap();
+        }
+        drop(acc);
+        let mut rot = rotating_log(&cp.detections, key(&dir), 1 << 20);
+        for n in 0..3 {
+            rot.append(p(n)).unwrap();
+        }
+        drop(rot);
+        let mut targets = cp.targets();
+        targets[3] = rotating_target(&cp.detections);
+        let full = |t: &ChainTarget| (t.full)(&t.path, &pk);
+        for t in &targets[..4] {
+            let ok = full(t).unwrap();
+            assert!(!ok.contains("old format"), "{}: {ok}", t.chain);
+        }
+        for (i, line) in [(0usize, 1usize), (1, 1), (2, 1), (3, 1)] {
+            let t = &targets[i];
+            let before = std::fs::read(&t.path).unwrap();
+            let head = read_file_head(&t.path, &|l: &[u8]| (t.genuine)(l, &pk))
+                .unwrap()
+                .unwrap();
+            inject_at(&t.path, line);
+            let err = full(t).unwrap_err();
+            assert!(err.contains("canonical"), "{}: {err}", t.chain);
+            if line + 1 == String::from_utf8_lossy(&before).lines().count() {
+                assert_ne!(
+                    read_file_head(&t.path, &|l: &[u8]| (t.genuine)(l, &pk)).unwrap(),
+                    Some(head),
+                    "{}: not a head",
+                    t.chain
+                );
+            }
+            std::fs::write(&t.path, before).unwrap();
+            full(t).unwrap();
+        }
     }
 }

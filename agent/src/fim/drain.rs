@@ -716,6 +716,12 @@ pub struct FimDriftPayload {
     pub attrs: Option<FileAttrChange>,
 }
 
+/// External audit EVD-008 (lab PR 204): the FIM drift log's name in its v3
+/// pre-images.
+impl crate::chainlog::ChainPayload for FimDriftPayload {
+    const KIND: &'static str = "fim_drift";
+}
+
 /// Caller-supplied fields for [`FimDriftDb::append`].
 #[derive(Debug, Clone)]
 pub struct FimDriftDraft {
@@ -739,8 +745,9 @@ pub struct FimDriftDraft {
 /// over the shared [`crate::chainlog::RotatingChainLog`] — it builds the
 /// [`FimDriftPayload`] and the core handles chaining, signing, rotation
 /// (size cap + retention), and the chattr dance via the shared
-/// `StateDirProtection`. New lines are v2 (`fmt_ver`); existing v1 lines
-/// stay valid (see `bug026_legacy_v1_drift_line_still_verifies`).
+/// `StateDirProtection`. New lines are v3 (`fmt_ver`, lab PR 204); existing
+/// v1 and v2 lines stay valid (see
+/// `bug026_legacy_v1_drift_line_still_verifies`).
 pub struct FimDriftDb {
     inner: crate::chainlog::RotatingChainLog<FimDriftPayload>,
     agent_id: [u8; 16],

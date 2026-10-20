@@ -85,7 +85,13 @@ rand = "0.8"
 zeroize = { version = "1.8", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# External audit EVD-007 (lab PR 204): `float_roundtrip` parses a float to
+# the exact value written. The chain verifiers re-serialise each decoded row
+# and hash it; the default parser can land one ULP off a 17-digit float (a
+# detection's `confidence`, an XAI weight, an f64 in an audit row's `extra`),
+# so such a row did not verify, and a v3 row would also fail its canonical
+# check (`chainlog::tests::every_shipped_payload_type_round_trips_byte_exactly`).
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # Tappa 6: ADE
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
