@@ -27,8 +27,14 @@ use super::sanitize::{sanitize_line, SanitizedEvent};
 ///
 /// Different event kinds project to different surface forms — e.g.
 /// for a process spawn we use `comm` and `filename`, for a DNS
-/// query we use the domain. Keep the query under ~120 chars to
-/// stay within the embedder's hot path.
+/// query we use the domain.
+///
+/// External audit XAI-012: nothing here caps the length (it used to say
+/// "under ~120 chars", which nothing enforced). The strings are bounded
+/// by the sanitizer and the wire (`safe_filename` at 256 chars, `comm`
+/// 16 bytes, QNAME 253), and the BM25 path searches at most
+/// [`crate::rag::index_tantivy::MAX_QUERY_TERMS`] distinct terms of the
+/// query. The text is not truncated: a cut would split a path.
 ///
 /// External audit LLMR-011: the strings come from the sanitizer's
 /// `safe_*` fields (capped, control characters, homoglyphs and

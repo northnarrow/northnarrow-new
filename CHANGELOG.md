@@ -61,6 +61,45 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, RAG retrieval (Low XAI-008 NN-AUD-346, XAI-012
+  NN-AUD-347, XAI-019 NN-AUD-435; lab PR 199). Dormant: RAG runs only with
+  `NN_ADE_RAG_ENABLED` set, off by default; these points, with Wave 2's
+  corpus pinning (lab PR 145), are now blocking items of the §13
+  default-flip checklist (an addendum below the owner's eight points in
+  `docs/TAPPA6_9_7_RAG_KB_PLAN.md`). XAI-008: on the BM25 path the scores
+  are divided by the top hit's before the `min_similarity` floor, so the
+  top hit was always 1.0 and always kept, whatever it shared with the
+  query. The top hit must now carry at least one in four of the query's
+  distinct terms (in its title, author or content, analysed as the index
+  does; `COVERAGE_ONE_IN`, `required_terms`, `matched_terms`), else the
+  result is empty. The triage proposed one in three: on the pinned corpus
+  that emptied the golden query "xmrig miner pool stratum", whose hits
+  ("Linux Crypto Mining Pool Connections" first) are relevant and each
+  share one of its four terms, and the suite fell to 27/30. `RagQuery`
+  is unchanged, so `min_similarity: 0.0` still means the 0.15 default:
+  the golden suite, the end-to-end format test and three unit tests that
+  meant "no floor" measured with 0.15; they pass `f32::MIN_POSITIVE`, as
+  the `RagQuery` doc now says. XAI-012: three `TermQuery` per analysed
+  term, without a limit; the terms are now deduplicated in first-seen
+  order, then cut at 32 (`MAX_QUERY_TERMS`, at most 96 clauses), and the
+  query text is not truncated (it would cut a path). The
+  `build_rag_query` doc promised "under ~120 chars", which nothing
+  enforced; it says what bounds the query. XAI-019: `SecTokenStream`
+  stops its cursor at the end and clamps `token()` / `token_mut()` (an
+  empty token for an empty text): a read past the end returns a token
+  instead of panicking. XAI-003 (NN-AUD-343, obsolete since lab PR 145,
+  the triage's one line): the field lookup in `bm25_query` returns an
+  error instead of `unwrap()`. On `target/kb` (970 documents): golden
+  28/30 before and after, the same two failures; retrieve p50 95–99 µs
+  before, 102–106 µs after, p95 120–130 µs before, 127–131 µs after
+  (budget 50 ms).
+  **Regressions / changes:** a query whose top BM25 hit carries less than
+  a quarter of its distinct terms gets no RAG block (none of the 30
+  golden queries, none of 30 production-shaped ones measured); a word
+  repeated in a query counts once, so the ranking of such queries changes
+  (two golden queries reorder below their wanted ids, which stay); the
+  golden suite runs without the relative floor (28/30 with it or
+  without).
 - External audit, Wave 3, posture overlay validation (Low POS-010
   NN-AUD-306, POS-011 NN-AUD-307; lab PR 198). The two signed overlays
   that widen a posture exemption are checked for breadth, not only for

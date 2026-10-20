@@ -308,7 +308,8 @@ mod tests {
         let r = rag.retrieve(RagQuery {
             query_text: "zqxjmarker",
             top_k: 3,
-            min_similarity: 0.0,
+            // No floor (`0.0` would mean the default, external audit XAI-008).
+            min_similarity: f32::MIN_POSITIVE,
         });
         let titles: Vec<&str> = r.documents.iter().map(|d| d.title.as_str()).collect();
         assert_eq!(titles.first(), Some(&"PowerShell"), "{titles:?}");

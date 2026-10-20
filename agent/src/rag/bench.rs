@@ -256,7 +256,8 @@ impl GoldenReport {
     }
 }
 
-/// Run the golden suite against an open engine (top-`k` = 10).
+/// Run the golden suite against an open engine (top-`k` = 10, no relative
+/// floor; the coverage floor on the top hit applies).
 pub fn run_golden(engine: &RagEngine) -> GoldenReport {
     let mut passed = 0;
     let mut failures = Vec::new();
@@ -265,7 +266,10 @@ pub fn run_golden(engine: &RagEngine) -> GoldenReport {
         let r = engine.retrieve(RagQuery {
             query_text: c.q,
             top_k: 10,
-            min_similarity: 0.0,
+            // No relative floor: `0.0` means the 0.15 default, which this
+            // suite measured until external audit XAI-008. The coverage
+            // floor on the top hit applies.
+            min_similarity: f32::MIN_POSITIVE,
         });
         let ids: Vec<&str> = r.documents.iter().map(|d| d.id.as_str()).collect();
         let want_ok = c.want.iter().all(|w| ids.contains(w));
@@ -399,7 +403,8 @@ mod tests {
         let r = engine.retrieve(RagQuery {
             query_text: "powershell encoded command",
             top_k: 3,
-            min_similarity: 0.0,
+            // No floor (`0.0` would mean the default, external audit XAI-008).
+            min_similarity: f32::MIN_POSITIVE,
         });
         assert!(!r.documents.is_empty(), "expected real hits");
         let block = crate::ade::format_rag_block(&r).expect("non-empty ⇒ Some");
