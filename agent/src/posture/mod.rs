@@ -784,8 +784,12 @@ impl PostureMachine {
     /// actual transition — surfaced via
     /// [`Self::last_admin_action_secs_ago`] for `nn-admin status`.
     ///
-    /// Returns the post-transition [`PostureState`] (or the unchanged
-    /// state when before == target).
+    /// Returns a [`ForceOutcome`]: the state before the call and the
+    /// post-transition [`PostureState`] (the unchanged state when
+    /// before == target). External audit ASK-015: the caller logged the
+    /// returned state as `from`, so every force-posture line said it left
+    /// the state it entered; `from` is read under the same write lock as
+    /// the transition, so no concurrent change can slip between them.
     ///
     /// External audit NN-AUD-083: COMBAT → non-COMBAT releases the
     /// containment exactly like an unlock, so it needs `may_release`
@@ -798,7 +802,7 @@ impl PostureMachine {
         token: UnlockToken,
         target: PostureKind,
         may_release: bool,
-    ) -> Result<PostureState, AdminReleaseError> {
+    ) -> Result<ForceOutcome, AdminReleaseError> {
         let now = Instant::now();
         let mut guard = self.inner.state.write();
         let before = guard.kind();
@@ -837,7 +841,10 @@ impl PostureMachine {
             // has no Drop impl so an explicit `drop()` would be a
             // no-op (clippy::drop_non_drop).
             let _ = token;
-            return Ok(next);
+            return Ok(ForceOutcome {
+                from: before,
+                state: next,
+            });
         }
 
         *self.inner.last_admin_action.lock() = Some(now);
@@ -872,7 +879,10 @@ impl PostureMachine {
             let _ = token;
         }
 
-        Ok(next)
+        Ok(ForceOutcome {
+            from: before,
+            state: next,
+        })
     }
 
     /// Test-only hatch used by the `nn-admin debug --force-posture`
@@ -953,6 +963,19 @@ impl Default for PostureMachine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What [`PostureMachine::admin_force_state_with_token`] did. External
+/// audit ASK-015: the state the agent was in before the force is what the
+/// journal line and the audit row record as `from`; the in-memory
+/// transition log that also has it is capped and not persisted.
+#[derive(Debug, Clone)]
+pub struct ForceOutcome {
+    /// The state before the call, read under the transition's write lock.
+    pub from: PostureKind,
+    /// The state after it (the target; unchanged when `from` was already
+    /// the target).
+    pub state: PostureState,
 }
 
 /// Reasons [`PostureMachine::admin_release_combat_with_token`],

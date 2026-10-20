@@ -61,6 +61,38 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, operator-facing correctness (Low ASK-015
+  NN-AUD-241, AUT-007 NN-AUD-247, AUT-013 NN-AUD-250, MAIN-016 NN-AUD-258,
+  EVD-016 NN-AUD-279; Info ASK-018 NN-AUD-424; lab PR 212). ASK-015: a
+  production `force-posture` logged the state it entered as `from`
+  (`from=Observing to=Observing` when it left COMBAT) and its audit row
+  had only the target. The posture machine returns the state it left, read
+  under the transition's lock (`ForceOutcome`); the journal line names it
+  and the row's `extra` gains `"from"` when the force was applied (a
+  refused force changed nothing and has none). ASK-018: `nn-admin
+  detections --path` matched the process name (`comm`) only, so `--path
+  /usr/bin/curl` found nothing; a record is now kept when its executable
+  (`exe`), its file (`file`) or its `comm` contains the text — a superset
+  of before, no wire change, and the help says so. AUT-013: `rotate-keys
+  add --new-roles unlock,,audit-read` skipped the empty entry the agent
+  refuses in `admin.pub`; the list goes through the agent's parser and is
+  refused with its words (spaces around an entry are still trimmed).
+  AUT-007: the help of `shutdown` and `rotate-keys` said both signers need
+  the role; the agent asks it of one, the co-signer may be any installed
+  key (design §3.3). The help, `admin_cli` and design §3.3/Appendix B say
+  so and ask that every installed key be kept as a control credential;
+  requiring the role of each signer is declined (installs whose co-signer
+  carries the default `unlock,audit-read` would stop working). MAIN-016:
+  the agent's `READY=1` and the watchdog's `READY=1`/`STATUS=` were sent
+  to `$NOTIFY_SOCKET` as a path, so an abstract socket (`@name`) never got
+  them and a `Type=notify` start would time out. One sender shared by both
+  (`common::sd_notify`) sends to `/path` and to `@name`, reads a value that
+  is not UTF-8 instead of taking it as unset (nothing was sent, and
+  nothing said so), and refuses any other value (`vsock:`, a relative
+  path) with an error. EVD-016: no code change, the residual is recorded:
+  the install manifest is not signed (`install.sh` writes it on the host,
+  so a release signature cannot cover it); recording its SHA-256 in
+  `agent_boot` stays a later option.
 - External audit, Wave 3, lab and range host safety (Low LAB-019 NN-AUD-409,
   LAB-022 NN-AUD-412, LAB-025 NN-AUD-415, LAB-027 NN-AUD-417; lab PR 211).
   The lab and range scripts no longer harm the host they run on. LAB-025:

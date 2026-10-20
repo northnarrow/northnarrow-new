@@ -692,10 +692,13 @@ fn admin_force_state_with_token_any_to_any() {
             m.force_state_for_test(from);
             assert_eq!(m.current_kind(), from);
             let token = crate::anti_tamper::_test_mint_unlock_token();
-            let next = m
+            let out = m
                 .admin_force_state_with_token(token, to, true)
                 .expect("any-to-any allowed");
-            assert_eq!(next.kind(), to);
+            assert_eq!(out.state.kind(), to);
+            // External audit ASK-015: `from` is the state left, not the
+            // state entered.
+            assert_eq!(out.from, from);
             assert_eq!(m.current_kind(), to);
         }
     }
@@ -804,6 +807,27 @@ fn admin_force_state_out_of_combat_needs_may_release() {
         .expect("with an unlock signer the release goes through");
     assert_eq!(m.current_kind(), PostureKind::Engaged);
     assert_eq!(released.load(Ordering::SeqCst), 1);
+}
+
+/// External audit ASK-015: the outcome names the state the force left —
+/// without the `debug-trigger` setter, so the default build checks it too.
+#[test]
+fn admin_force_state_reports_the_state_it_left() {
+    let m = PostureMachine::new();
+    let force = |to, may_release| {
+        let token = crate::anti_tamper::_test_mint_unlock_token();
+        m.admin_force_state_with_token(token, to, may_release)
+            .expect("allowed")
+    };
+    let out = force(PostureKind::Combat, false);
+    assert_eq!(out.from, PostureKind::Observing);
+    assert_eq!(out.state.kind(), PostureKind::Combat);
+    let out = force(PostureKind::Observing, true);
+    assert_eq!(out.from, PostureKind::Combat);
+    assert_eq!(out.state.kind(), PostureKind::Observing);
+    let out = force(PostureKind::Observing, true);
+    assert_eq!(out.from, PostureKind::Observing, "a no-op names its state");
+    assert_eq!(out.state.kind(), PostureKind::Observing);
 }
 
 // ─── T7.13 (Beta Step 5) — end-to-end lineage exemption tests ──────

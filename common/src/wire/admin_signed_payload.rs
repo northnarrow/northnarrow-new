@@ -556,9 +556,11 @@ pub struct TrustedInstallerGrantExtra {
 ///   / `closed`).
 /// - `sensor` — exact-match the originating sensor (`exec` / `file` /
 ///   `module-load` / `network` / `anti-tamper` / `canary`).
-/// - `path` — substring match on the acting principal (see the agent's
-///   `DetectionFilter`; 9.0.a's record carries no filesystem path, so
-///   this matches the principal `comm`).
+/// - `path` — substring match on what the record names: its executable
+///   (`exe`), its file (`file`) or the acting principal's `comm`; a record
+///   is kept when any of them contains it (the agent's
+///   `DetectionFilter::subject_substr`, external audit ASK-018 — it was
+///   `comm` only).
 ///
 /// The enum-valued filters are carried as lowercase strings rather than
 /// wire bytes so the wire shape never has to track the agent-side

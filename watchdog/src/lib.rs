@@ -429,44 +429,41 @@ pub fn write_pidfile_atomic(path: &Path, pid: u32) -> Result<()> {
 
 /// Manual systemd `sd_notify(READY=1)` — sends a single Unix
 /// datagram to `$NOTIFY_SOCKET` per the `sd_notify(3)` wire
-/// protocol. Cheap and no new dep vs `libsystemd-rs` /
-/// `sd-notify` crates.
+/// protocol ([`common::sd_notify`], shared with the agent): a path,
+/// or `@name` in the abstract namespace (external audit MAIN-016:
+/// it was sent to `@name` as a path, and never arrived). Cheap and
+/// no new dep vs `libsystemd-rs` / `sd-notify` crates.
 ///
 /// Returns Ok WHEN `NOTIFY_SOCKET` is unset (watchdog not running
 /// under `Type=notify`) — that's a normal dev-shell invocation,
-/// not an error.
+/// not an error. A value it cannot send to is an error.
 pub fn sd_notify_ready() -> Result<()> {
-    let sock_path = match std::env::var("NOTIFY_SOCKET") {
-        Ok(p) => p,
-        Err(_) => {
-            debug!(
-                target: "watchdog.sd_notify",
-                "NOTIFY_SOCKET unset — not running under systemd Type=notify; skipping"
-            );
-            return Ok(());
-        }
-    };
-    let sock = std::os::unix::net::UnixDatagram::unbound()
-        .context("creating sd_notify datagram socket")?;
-    sock.send_to(b"READY=1\n", &sock_path)
-        .with_context(|| format!("sending READY=1 to NOTIFY_SOCKET={sock_path}"))?;
-    info!(
-        target: "watchdog.sd_notify",
-        socket = %sock_path,
-        "systemd READY=1 sent"
-    );
+    let sent = common::sd_notify::notify(b"READY=1\n").with_context(|| {
+        format!(
+            "sending READY=1 to NOTIFY_SOCKET={}",
+            std::env::var_os("NOTIFY_SOCKET")
+                .unwrap_or_default()
+                .to_string_lossy()
+        )
+    })?;
+    match sent {
+        Some(socket) => info!(
+            target: "watchdog.sd_notify",
+            socket = %socket.to_string_lossy(),
+            "systemd READY=1 sent"
+        ),
+        None => debug!(
+            target: "watchdog.sd_notify",
+            "NOTIFY_SOCKET unset — not running under systemd Type=notify; skipping"
+        ),
+    }
     Ok(())
 }
 
 /// External audit WDG-004: `STATUS=<status>` to systemd, best effort (a
 /// no-op outside `Type=notify`). `systemctl status` shows it.
 pub fn sd_notify_status(status: &str) {
-    let Ok(sock_path) = std::env::var("NOTIFY_SOCKET") else {
-        return;
-    };
-    let sent = std::os::unix::net::UnixDatagram::unbound()
-        .and_then(|sock| sock.send_to(format!("STATUS={status}\n").as_bytes(), &sock_path));
-    if let Err(e) = sent {
+    if let Err(e) = common::sd_notify::notify(format!("STATUS={status}\n").as_bytes()) {
         warn!(target: "watchdog.sd_notify", error = %e, status, "sd_notify STATUS failed");
     }
 }
@@ -2205,8 +2202,51 @@ mod tests {
     /// sd_notify_ready is a no-op when NOTIFY_SOCKET is unset
     /// (the common dev-shell case). Anchors the "not under
     /// systemd is not an error" contract.
+    /// `NOTIFY_SOCKET` is process-global: the sd_notify tests take turns.
+    static NOTIFY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// External audit MAIN-016: under an abstract `NOTIFY_SOCKET`
+    /// (`@name`), `READY=1` and `STATUS=` arrive; a socket nobody listens
+    /// on makes `sd_notify_ready` fail, not succeed.
+    #[test]
+    fn sd_notify_reaches_an_abstract_notify_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+        let _env = NOTIFY_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let name = format!("nn-watchdog-notify-{}", std::process::id());
+        let addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = UnixDatagram::bind_addr(&addr).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // SAFETY: the tests that touch NOTIFY_SOCKET hold NOTIFY_ENV; no
+        // other test of this crate reads it.
+        unsafe {
+            std::env::set_var("NOTIFY_SOCKET", format!("@{name}"));
+        }
+        let ready = sd_notify_ready();
+        sd_notify_status("supervising agent pid 42");
+        let mut buf = [0u8; 128];
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            got.push(listener.recv(&mut buf).map(|n| buf[..n].to_vec()));
+        }
+        drop(listener);
+        let refused = sd_notify_ready();
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("NOTIFY_SOCKET");
+        }
+        ready.expect("READY=1 sent");
+        let got: Vec<Vec<u8>> = got.into_iter().map(|r| r.expect("a datagram")).collect();
+        assert_eq!(got[0], b"READY=1\n");
+        assert_eq!(got[1], b"STATUS=supervising agent pid 42\n");
+        assert!(refused.is_err(), "nobody listens any more");
+    }
+
     #[test]
     fn sd_notify_ready_is_ok_when_notify_socket_unset() {
+        let _env = NOTIFY_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // Test runs outside systemd; NOTIFY_SOCKET is unset.
         // Defensively unset in case CI sets it for the test
         // binary itself — the public API contract is "Ok when

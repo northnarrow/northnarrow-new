@@ -188,6 +188,20 @@ verifies *each* signature against the outstanding nonce and tallies
 from the same key is rejected. Implementation cost is moderate —
 ~150 LOC for the quorum verify + protocol changes.
 
+**Who may co-sign (external audit AUT-007).** The role column is a
+requirement on the quorum, not on each signer: one of the signing keys
+must carry the role, and the second signature may come from **any key
+installed in `admin.pub`**, whatever its roles — a key installed with the
+default `unlock,audit-read` co-signs a `shutdown` or a `rotate-keys` as
+well as a `shutdown` key does. Custody every installed key as a control
+credential, not only the keys holding the destructive roles. What a
+co-signer cannot do is lend roles it lacks: `rotate-keys add` grants only
+roles one of the signers holds (`all` only by a key holding `all`; lab PR
+138, NN-AUD-084), so a `rotate-keys` key and a read-only key cannot mint a
+broader key. Requiring the role of every signer is declined for now: it
+would break installs whose second key carries the default roles and is
+used as the co-signer.
+
 External audit AUT-005 (lab PR 192): one submission carries at most
 8 signatures (`admin_quorum::MAX_SUBMITTED_SIGNATURES`); more are
 refused before any is checked — `InvalidSignature` on the wire, counted
@@ -652,6 +666,14 @@ describe, and how far to trust each:
   rows written before, carry no `client_exe`, keep their bytes and verify
   as before. The triage status events carry the same as `principal_exe`.
 
+Lab PR 212 (external audit ASK-015): a `force_posture` row's `extra` is
+`{"target": "<state>", "from": "<state>"}` when the force was applied
+(also a force to the state already held), so the row says what the
+operator moved the agent out of; a refused force changed nothing and has
+only `target`. The journal line `production force-posture applied` names
+the same `from`; it used to name the state entered, and rows written
+before carry no `from`.
+
 ### 9.2 Tamper evidence
 
 An attacker with root who wants to hide an unauthorised operation
@@ -1032,7 +1054,10 @@ attempting to silently stop the agent** (defeated by watchdog +
 signed-shutdown marker chain), **replay of captured signatures**
 (defeated by nonce + timestamp + agent_id), **insider abuse of a
 single key** (defeated by 2-of-N quorum on destructive operations
-+ tamper-evident audit log), **history rewriting after the fact**
++ tamper-evident audit log: one key holding the role, the second any
+installed key — §3.3, so every installed key is custodied as a
+control credential; an insider who holds two installed keys meets
+the quorum alone), **history rewriting after the fact**
 (defeated by hash-chained signed log).
 
 It does **not** defend against: **compromised operator workstation

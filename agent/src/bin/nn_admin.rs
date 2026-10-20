@@ -251,9 +251,11 @@ enum Cmd {
         /// Exact-match the originating sensor.
         #[arg(long, value_enum)]
         sensor: Option<SensorArg>,
-        /// Substring filter on the acting principal's `comm`. (9.0.a's
-        /// detection record carries no filesystem path, so `--path`
-        /// matches the process name — the available subject id.)
+        /// Substring filter on what a detection names: its executable
+        /// (exec sensors), its file (file sensors) or the acting
+        /// process's name (`comm`, every sensor). A record is kept when
+        /// any of them contains the text, e.g. `--path /usr/bin/curl`,
+        /// `--path /etc/cron.d/` or `--path curl`.
         #[arg(long)]
         path: Option<String>,
         #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
@@ -309,8 +311,10 @@ enum Cmd {
     /// than respawning.
     ///
     /// BOTH keys are required — the quorum requires two distinct
-    /// admin keys, each with the `shutdown` role (per admin.pub
-    /// allowlist). Same key for both args fails server-side as
+    /// admin keys installed in admin.pub, at least one of them with
+    /// the `shutdown` role; the other may be any installed key,
+    /// whatever its roles (design §3.3), so every installed key is a
+    /// control credential. Same key for both args fails server-side as
     /// QuorumNotMet { required: 2, provided: 1 } because the
     /// server tallies distinct fingerprints. The `--agent-id-file`
     /// path defaults to the design's canonical location; override
@@ -322,9 +326,9 @@ enum Cmd {
         #[arg(long)]
         key: PathBuf,
         /// Path to a second, DISTINCT admin private key
-        /// (co-signer). The quorum verify requires distinct
-        /// fingerprints — passing the same key as both arms
-        /// will be rejected by the agent.
+        /// (co-signer): any key installed in admin.pub. The quorum
+        /// verify requires distinct fingerprints — passing the same
+        /// key as both arms will be rejected by the agent.
         #[arg(long = "cosign-key")]
         cosign_key: PathBuf,
         /// Path to the agent's per-install UUID file (design §6.5).
@@ -379,7 +383,11 @@ enum Cmd {
     /// Tappa 8 A13 — atomically add or revoke an admin key in
     /// `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both
     /// `add` and `revoke` need a 2-of-N quorum signed by two
-    /// distinct admin keys carrying the `rotate-keys` role. On
+    /// distinct installed admin keys, at least one of them carrying
+    /// the `rotate-keys` role; the other may be any installed key,
+    /// whatever its roles (design §3.3) — custody every installed
+    /// key as a control credential. `add` grants only roles one of
+    /// the two signers holds. On
     /// success the agent rewrites the file via tmpfile +
     /// `rename(2)` and reloads its in-memory key set so the next
     /// challenge already sees the change.
@@ -651,12 +659,12 @@ enum RotateKeysCmd {
         /// by a key holding `all`).
         #[arg(long = "new-roles", default_value = "unlock,audit-read")]
         new_roles: String,
-        /// Path to the operator's primary admin private key
-        /// (must carry the `rotate-keys` role).
+        /// Path to the operator's primary admin private key. This
+        /// key or the co-signer must carry the `rotate-keys` role.
         #[arg(long)]
         key: PathBuf,
-        /// Path to a SECOND, DISTINCT admin private key
-        /// (cosigner; also `rotate-keys` role).
+        /// Path to a SECOND, DISTINCT admin private key (co-signer):
+        /// any key installed in admin.pub, whatever its roles.
         #[arg(long = "cosign-key")]
         cosign_key: PathBuf,
         #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
@@ -2494,28 +2502,25 @@ fn colorize(s: &str, sgr: &str, tty: bool) -> String {
 /// Parse a CSV role list (`unlock,audit-read`, …) into the wire
 /// [`common::wire::admin_signed_payload::Role`] enum. Empty input
 /// is rejected — A13's `add` flow requires at least one role.
+///
+/// External audit AUT-013: the list is checked by the agent's own
+/// admin.pub parser, so an empty entry (`unlock,,audit-read`,
+/// `unlock,`) is refused with the agent's words instead of being
+/// skipped; spaces around an entry are still trimmed (a convenience
+/// of the command line, the agent writes the list without them).
 fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<common::wire::admin_signed_payload::Role>> {
     use anyhow::bail;
+    if s.trim().is_empty() {
+        bail!("--new-roles must list at least one role keyword");
+    }
     // Review `admin-cli-roles-1`: delegate to the agent's admin.pub
     // keyword table so `rotate-keys add --new-roles` can grant EVERY
     // role the agent understands (fim-*, canary-*, net-*, triage, …),
     // not the five-keyword subset this CLI used to hard-code — which
     // made canary-manage / fim-manage ungrantable from the CLI.
-    let mut out = Vec::new();
-    for raw in s.split(',') {
-        let token = raw.trim();
-        if token.is_empty() {
-            continue;
-        }
-        let role = northnarrow_agent::anti_tamper::admin_auth::parse_role_keyword(token)?;
-        if !out.contains(&role) {
-            out.push(role);
-        }
-    }
-    if out.is_empty() {
-        bail!("--new-roles must list at least one role keyword");
-    }
-    Ok(out)
+    let tight: Vec<&str> = s.split(',').map(str::trim).collect();
+    northnarrow_agent::anti_tamper::admin_auth::parse_role_list(&tight.join(","))
+        .map_err(|e| anyhow::anyhow!("--new-roles: {e}"))
 }
 
 /// Map a [`RotateKeysOutcome`] to a stable exit code (mirrors
@@ -3758,9 +3763,82 @@ mod roles_csv_tests {
     fn rejects_unknown_empty_and_dedupes() {
         assert!(parse_roles_csv("canary-admin").is_err());
         assert!(parse_roles_csv(" , ").is_err());
+        assert!(parse_roles_csv("").is_err());
         assert_eq!(
             parse_roles_csv("unlock,unlock").unwrap(),
             vec![Role::Unlock]
+        );
+    }
+
+    /// External audit AUT-013: an empty entry is refused, as the agent
+    /// refuses it in admin.pub, with the agent's words; it was skipped.
+    #[test]
+    fn rejects_an_empty_entry_like_the_agent() {
+        for list in [
+            "unlock,,audit-read",
+            "unlock,",
+            ",unlock",
+            "unlock, ,audit-read",
+        ] {
+            let e = parse_roles_csv(list).expect_err(list).to_string();
+            assert!(
+                e.contains("role list has empty entry (leading/trailing/double comma)"),
+                "{list}: {e}"
+            );
+            let agent =
+                common::admin_quorum::parse_role_list(&list.replace(' ', "")).expect_err(list);
+            assert!(e.ends_with(&agent), "{list}: {e} / {agent}");
+        }
+        assert_eq!(
+            parse_roles_csv(" unlock , audit-read ").unwrap(),
+            vec![Role::Unlock, Role::AuditRead],
+            "spaces around an entry are trimmed"
+        );
+    }
+}
+
+/// External audit AUT-007: the quorum help says what the agent checks —
+/// one signer holds the role, the co-signer may be any installed key.
+#[cfg(test)]
+mod quorum_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    fn long_help(path: &[&str]) -> String {
+        let mut cmd = Cli::command();
+        let mut sub = &mut cmd;
+        for name in path {
+            sub = sub.find_subcommand_mut(name).expect(name);
+        }
+        let text = sub.render_long_help().to_string();
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn co_signer_help_matches_the_quorum_rule() {
+        let add = long_help(&["rotate-keys", "add"]);
+        assert!(!add.contains("also `rotate-keys` role"), "{add}");
+        assert!(
+            !add.contains("(must carry the `rotate-keys` role)"),
+            "{add}"
+        );
+        assert!(
+            add.contains("any key installed in admin.pub, whatever its roles"),
+            "{add}"
+        );
+        let rotate = long_help(&["rotate-keys"]);
+        assert!(
+            rotate.contains("at least one of them carrying the `rotate-keys` role"),
+            "{rotate}"
+        );
+        let shutdown = long_help(&["shutdown"]);
+        assert!(
+            !shutdown.contains("each with the `shutdown` role"),
+            "{shutdown}"
+        );
+        assert!(
+            shutdown.contains("at least one of them with the `shutdown` role"),
+            "{shutdown}"
         );
     }
 }
