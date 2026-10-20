@@ -1,7 +1,7 @@
 # NorthNarrow Agent - Maintenance Mode Configuration
 # Suspends active response during scheduled maintenance windows.
-# WARNING: modifying this file requires admin authorization
+# Window times are UTC, ISO 8601, start/end.
 maintenance_active=false
 scheduled_window=
 disable_until=
-last_modified=2026-02-15T09:30:00Z
+last_modified=

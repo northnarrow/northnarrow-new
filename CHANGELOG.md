@@ -61,6 +61,53 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, FIM pipeline and signed-chain hygiene (Low
+  FIMR-015 NN-AUD-289, FIMR-016 NN-AUD-290, FIMP-012 NN-AUD-291, FIMP-013
+  NN-AUD-292, FIMP-014 NN-AUD-293; lab PR 197). FIMP-012: the FIM drain
+  decoded the name of a file dropped into a watched directory lossily
+  (U+FFFD for each byte that is not UTF-8), a name no file has: the new
+  file was never watched (its later in-place edits went unseen) and its
+  drift row named a file that does not exist. The name is kept as bytes:
+  a UTF-8 name is itself, backslashes included; any other is spelled with
+  `\xNN` for those bytes and `\\` for a backslash (`/etc/cron.d/x\xff`), so
+  distinct names stay distinct, and the drain stats, hashes, enrolls and
+  sweeps the file by its bytes (a UTF-8 file spelled like the escape is the
+  one under that name). An empty leaf, `.` and `..` are refused. FIMP-014:
+  `DriftRateLimiter` held a `std::sync::Mutex` locked with `.expect("…
+  poisoned")`, against its own note: a panic under the lock made every
+  later drift panic (`panic = "abort"`). It is a `parking_lot::Mutex`.
+  FIMP-013 (the strict half): the agent's chain verifiers — audit log,
+  rotating logs (detections, status events, netflow, FIM drift, their
+  terminators and manifests), FIM baseline, canary registry and access
+  log, the head anchor — checked signatures with Ed25519 `verify`, which
+  accepts a signature valid for any message under a small-order public
+  key. They use `verify_strict`; the admin path already did. Every row the
+  agent signed passes; no row, field or pre-image changed, and every
+  existing v1 row verifies as before. FIMR-015: the bait paths were a list
+  in `fim::rules` and their contents a `match` in `fim::honeypot`, paired
+  by a test, and the boot sweep took a bait without a template with
+  `.expect` (a panic). One table, `honeypot::BAITS` (path, content);
+  `HONEYPOT_PATHS` is derived from it. FIMR-016 (the S part): the ten
+  templates shared one warning line and `last_modified=2026-02-15T09:30:00Z`,
+  which a bait restored by the sweep contradicted with its fresh mtime. The
+  templates' comment lines now differ and their `last_modified=` is empty;
+  `install.sh` (`install_bait`) and the sweep (`render_bait`) fill it with
+  the time of the write, UTC to the second, and set the file's mtime to
+  that second. A reinstall leaves a file that holds its template, the date
+  line aside, alone (BUG-020's skip). Not in this lot: the per-chain domain
+  tag and row format v2 of FIMP-013 (the rotating logs, the FIM baseline
+  and drift log still hash `prev ‖ row` untagged; a format change with
+  `nn-admin` and the chain documentation, its own PR), and the L part of
+  FIMR-016 (per-install bait names, a product decision). **Regressions /
+  notes:** drift rows and FIM detections name a file whose name is not
+  UTF-8 with `\xNN` (it read `�`); the ten control-surface files are
+  rewritten once by the first upgrade (inside the trusted-installer window
+  `install.sh --upgrade --grant-key` opens) and then carry their own date —
+  a byte-for-byte comparison with `configs/honeypot-baits/*` must leave the
+  `last_modified=` line out; a verifier given a small-order
+  `--agent-pubkey` reports the chain broken at its first row. Documented
+  in `docs/operator/EVIDENCE_CHAINS.md`, `anti-tamper-honeypots.md` §3 and
+  `UPGRADE_NOTES_AUDIT_16f7563.md` §§1, 4, 8.
 - External audit, Wave 3, open-sensor and DNS userland (Low SNS-004
   NN-AUD-352, SNS-010 NN-AUD-353, SNS-011 NN-AUD-354, SNS-014 NN-AUD-357,
   SNS-015 NN-AUD-436; lab PR 196). The userland half of the file-open

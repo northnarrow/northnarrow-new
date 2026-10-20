@@ -875,7 +875,6 @@ fn compute_entry_hash(entry: &CanaryToken) -> Result<[u8; 32]> {
 
 /// External audit NN-AUD-174: one row's own hash and signature.
 fn verify_row(entry: &CanaryToken, pubkey: &VerifyingKey) -> Result<(), RegistryVerifyError> {
-    use ed25519_dalek::Verifier;
     let idx = 0;
     let mut stripped = entry.clone();
     stripped.entry_hash.clear();
@@ -897,8 +896,9 @@ fn verify_row(entry: &CanaryToken, pubkey: &VerifyingKey) -> Result<(), Registry
         .ok()
         .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
         .ok_or(RegistryVerifyError::SignatureInvalid { idx })?;
+    // External audit NN-AUD-292 (FIMP-013): strict.
     pubkey
-        .verify(&recomputed, &Signature::from_bytes(&sig))
+        .verify_strict(&recomputed, &Signature::from_bytes(&sig))
         .map_err(|_| RegistryVerifyError::SignatureInvalid { idx })
 }
 
@@ -1069,7 +1069,6 @@ pub fn verify_chain(
     entries: &[CanaryToken],
     pubkey: &VerifyingKey,
 ) -> Result<(), RegistryVerifyError> {
-    use ed25519_dalek::Verifier;
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
     let mut seq = crate::chain_anchor::RowSeq::default();
     for (idx, entry) in entries.iter().enumerate() {
@@ -1116,7 +1115,7 @@ pub fn verify_chain(
         let mut sig_arr = [0u8; 64];
         sig_arr.copy_from_slice(&sig_bytes);
         let sig = Signature::from_bytes(&sig_arr);
-        if pubkey.verify(&recomputed, &sig).is_err() {
+        if pubkey.verify_strict(&recomputed, &sig).is_err() {
             return Err(RegistryVerifyError::SignatureInvalid { idx });
         }
         expected_prev = entry.entry_hash.clone();
@@ -1153,6 +1152,39 @@ mod tests {
             deployed_by_fp: format!("{seq:08x}"),
             content: None,
         }
+    }
+
+    /// External audit NN-AUD-292 (FIMP-013): the registry's rows pass the
+    /// strict check with the agent's key (whole chain and one row at a
+    /// time); rows carrying a small-order signature, under a small-order
+    /// key, passed the lax one and are refused now.
+    #[test]
+    fn registry_chain_is_verified_strictly() {
+        use crate::chain_anchor::small_order;
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("canaries.jsonl");
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        for i in 1..=8 {
+            reg.deploy(sample_draft(i)).unwrap();
+        }
+        let parse = |text: &str| -> Vec<CanaryToken> {
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        verify_chain(&parse(&text), &pubkey).expect("strict accepts the agent's rows");
+        assert!(text.lines().all(|l| row_is_genuine(l.as_bytes(), &pubkey)));
+        let forged_text = small_order::forge(&text);
+        let forged = parse(&forged_text);
+        small_order::assert_premise(&hex::decode(&forged[0].entry_hash).unwrap());
+        assert!(matches!(
+            verify_chain(&forged, &small_order::key()),
+            Err(RegistryVerifyError::SignatureInvalid { idx: 0 })
+        ));
+        let first = forged_text.lines().next().unwrap();
+        assert!(!row_is_genuine(first.as_bytes(), &small_order::key()));
     }
 
     /// External audit DEC-006: an unreadable line no longer switches the

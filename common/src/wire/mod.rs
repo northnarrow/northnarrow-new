@@ -1147,8 +1147,10 @@ pub struct FimEvent {
     /// Monotonic-clock ns since boot — same source as
     /// [`ProcessSpawnRaw::timestamp_ns`].
     pub timestamp_ns: u64,
-    /// The watched path that drifted. UTF-8 lossy — non-UTF-8
-    /// paths are escaped (`\xNN`) rather than dropped.
+    /// The watched path that drifted. A file name that is not UTF-8
+    /// is spelled with `\xNN` for each byte that is not, and `\\` for
+    /// a backslash in that name; any other name is itself (external
+    /// audit NN-AUD-291: the drain decoded it lossily, U+FFFD).
     pub path: alloc::string::String,
     pub op: FimOp,
     /// SHA-256 of the file's content AFTER the modification.

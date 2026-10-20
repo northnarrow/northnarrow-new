@@ -53,6 +53,15 @@ Contents are realistic config-style (`key=value`) but completely inert.
 agent verifies all ten at every boot and recreates any missing one
 (including the tmpfs `/run` pair after a reboot) — see §6.
 
+Each file's `last_modified=` line is the time it was written, UTC to the
+second, and equals its mtime: `install.sh` and the boot sweep fill it from
+the template (`configs/honeypot-baits/*`, where the line is empty), and a
+reinstall of the same release leaves a file that still holds its template
+alone, date included. No two files share a comment line (external audit
+FIMR-016, lab PR 197; they all said `2026-02-15T09:30:00Z` under one
+warning line). The ten names are still fixed in the release; choosing them
+per install is a product decision, not scheduled.
+
 **Two protection tiers:**
 - The five `/etc` baits and the two `/run` baits are externally
   reachable: tampering them is what NN-L-FIM-024 detects (§4).

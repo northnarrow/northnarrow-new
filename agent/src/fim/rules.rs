@@ -1871,19 +1871,10 @@ impl Rule for NnLFim023SystemdTimerCreated {
 /// suggest a way to disable the agent (kill switches, maintenance flags,
 /// override tokens); NN never reads them and no operator workflow writes
 /// them, across the config (`/etc`), state (`/var/lib`) and runtime
-/// (`/run`) dirs an attacker inspects for agent state.
-pub const HONEYPOT_PATHS: &[&str] = &[
-    "/etc/northnarrow/agent.dev.lock",
-    "/etc/northnarrow/kill_switch.conf",
-    "/etc/northnarrow/maintenance.mode",
-    "/etc/northnarrow/debug_disable.flag",
-    "/etc/northnarrow/agent.legacy.conf",
-    "/var/lib/northnarrow/shutdown.signal",
-    "/var/lib/northnarrow/disable.token",
-    "/var/lib/northnarrow/override.config",
-    "/run/northnarrow/pause.flag",
-    "/run/northnarrow/unload.signal",
-];
+/// (`/run`) dirs an attacker inspects for agent state. External audit
+/// NN-AUD-289 (FIMR-015): the paths of the bait table
+/// ([`crate::fim::honeypot::BAITS`]), which holds each with its content.
+pub const HONEYPOT_PATHS: &[&str] = &crate::fim::honeypot::BAIT_PATHS;
 
 /// NN-L-FIM-024's match: a mutation — create, modify, delete, rename, a
 /// chmod or chown (Wave 2, TST-004) — of one of the [`HONEYPOT_PATHS`].

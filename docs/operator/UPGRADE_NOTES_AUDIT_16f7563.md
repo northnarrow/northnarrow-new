@@ -152,6 +152,18 @@ and the tracker note have the details and the lab evidence.
   (it used to disable the units first and exit 1 at the pin root), and
   scripts that read its output see `stopping <unit>` and `disabling
   <unit>` where it printed `stopping + disabling <unit>`.
+- **The control-surface files are rewritten once** (NN-AUD-290 FIMR-016,
+  lab PR 197). The ten files of
+  [`anti-tamper-honeypots.md`](anti-tamper-honeypots.md) no longer share a
+  comment line, and their `last_modified=` is the time they were written
+  (by `install.sh`, or by the agent's boot sweep for a missing one), equal
+  to their mtime to the second; it was `2026-02-15T09:30:00Z` in every
+  file. The first upgrade to this release rewrites them, inside the
+  trusted-installer window `install.sh --upgrade --grant-key` opens; a
+  reinstall of the same release leaves them, date included. **Note:** a
+  configuration-management check that compares these files with the
+  shipped `configs/honeypot-baits/*` byte for byte must leave the
+  `last_modified=` line out.
 - **The model moved** (NN-AUD-053 LLMR-004, lab PR 105). The model and its
   tokenizer are loaded only when root owns them and every directory above
   them, closed to others; the default location is
@@ -498,6 +510,13 @@ packages open it themselves.
   NN-AUD-188 SNS-006, NN-AUD-189 SNS-007, lab PR 137); a change undone
   before the FIM drain looked is a drift row flagged `content_restored`
   (NN-AUD-121 FIMP-009, lab PR 135).
+- **File names that are not UTF-8** (NN-AUD-291 FIMP-012, lab PR 197). A
+  file dropped into a watched directory under such a name is named in its
+  drift row and detection with `\xNN` for each byte that is not UTF-8 and
+  `\\` for a backslash in that name (`/etc/cron.d/x\xff`); every other
+  name is spelled as before, backslashes included. The name was decoded
+  with U+FFFD (`x�`): the row named a file that does not exist, and the
+  file's later in-place edits were not watched. They are now.
 
 ## 5. Rules: recorded instead of killed, and the reverse
 
@@ -986,6 +1005,14 @@ Now **killed, or answered, where they were recorded or missed**:
   those directories hold no drop-in for the agent's units, and the
   shipped Debian drop-in is still accepted only where `install.sh` puts
   it, with its content.
+- **Signatures are checked strictly** (NN-AUD-292 FIMP-013, lab PR 197).
+  Every verifier of the agent's chains — `nn-admin audit verify` and
+  `chain verify`, the agent's checks at open and in the background, the
+  head anchor — uses Ed25519 `verify_strict`: a public key or a signature
+  `R` of small order is refused. Every row the agent ever signed passes; no
+  row, field or pre-image changes. **Note:** a verifier given a weak
+  (small-order) `--agent-pubkey` now reports the chain broken at its first
+  row, where the lax check accepted rows signed for any content.
 - **Findings that come back are reported again** (NN-AUD-114 EVD-013,
   NN-AUD-113 EVD-012, NN-AUD-111 EVD-006, lab PR 130): a finding that goes
   away is signed as `integrity_drift_cleared`; detections dropped from a

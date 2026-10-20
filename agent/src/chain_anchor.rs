@@ -60,7 +60,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
@@ -179,12 +179,13 @@ pub fn is_chain_hash(h: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Check `sig_b64` over `digest` with `pk`.
+/// Check `sig_b64` over `digest` with `pk`, strictly (external audit
+/// NN-AUD-292, FIMP-013: a small-order key or `R` is refused).
 pub fn signature_ok(digest: &[u8; 32], sig_b64: &str, pk: &VerifyingKey) -> bool {
     B64.decode(sig_b64)
         .ok()
         .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
-        .is_some_and(|b| pk.verify(digest, &Signature::from_bytes(&b)).is_ok())
+        .is_some_and(|b| pk.verify_strict(digest, &Signature::from_bytes(&b)).is_ok())
 }
 
 // ── file heads ──────────────────────────────────────────────────────
@@ -1465,6 +1466,57 @@ pub fn numbering_started_draft(first: &HeadsSnapshot, heads_file: &Path) -> Audi
     }
 }
 
+/// External audit NN-AUD-292 (FIMP-013), for the tests of every chain
+/// verifier: a public key of small order (the identity point, which
+/// `VerifyingKey::from_bytes` takes) and a signature (`R` the identity,
+/// `s = 0`) that the lax `verify` accepts under that key for every
+/// message. `verify_strict` refuses both; a signature the agent made
+/// passes either.
+#[cfg(test)]
+pub(crate) mod small_order {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    pub(crate) fn key() -> VerifyingKey {
+        let mut b = [0u8; 32];
+        b[0] = 1;
+        VerifyingKey::from_bytes(&b).expect("the identity point decompresses")
+    }
+
+    pub(crate) fn signature() -> Signature {
+        let mut b = [0u8; 64];
+        b[0] = 1;
+        Signature::from_bytes(&b)
+    }
+
+    /// The premise of each test: the lax check accepts the pair over
+    /// `msg`, the strict one does not.
+    pub(crate) fn assert_premise(msg: &[u8]) {
+        use ed25519_dalek::Verifier as _;
+        assert!(key().verify(msg, &signature()).is_ok(), "lax verify");
+        assert!(key().verify_strict(msg, &signature()).is_err());
+    }
+
+    /// `text` with every `agent_sig` value replaced by the small-order
+    /// signature; nothing else changed (the hashes still recompute).
+    pub(crate) fn forge(text: &str) -> String {
+        const MARK: &str = "\"agent_sig\":\"";
+        let sig = B64.encode(signature().to_bytes());
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(i) = rest.find(MARK) {
+            let start = i + MARK.len();
+            out.push_str(&rest[..start]);
+            out.push_str(&sig);
+            let end = start + rest[start..].find('"').expect("a closed string");
+            rest = &rest[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
 /// Append raw bytes to `path` (tests only).
 #[cfg(test)]
 pub(crate) fn append_raw(path: &Path, bytes: &[u8]) {
@@ -1495,6 +1547,21 @@ mod tests {
 
     fn key(dir: &TempDir) -> AgentSigningKey {
         AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap()
+    }
+
+    /// External audit NN-AUD-292 (FIMP-013): the heads snapshot's signature
+    /// is checked strictly — the agent's passes, a small-order pair the lax
+    /// check took does not.
+    #[test]
+    fn signature_ok_refuses_a_small_order_pair_and_takes_the_agents() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let digest = [7u8; 32];
+        small_order::assert_premise(&digest);
+        let weak = B64.encode(small_order::signature().to_bytes());
+        assert!(!signature_ok(&digest, &weak, &small_order::key()));
+        let genuine = B64.encode(k.sign(&digest).to_bytes());
+        assert!(signature_ok(&digest, &genuine, &k.verifying_key()));
     }
 
     fn paths(dir: &TempDir) -> ChainPaths {
