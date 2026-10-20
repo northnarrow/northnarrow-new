@@ -1208,7 +1208,42 @@ done
 # every install — they are NN-managed, not operator configuration. The
 # tmpfs /run/northnarrow pair vanishes on reboot; the agent's boot
 # HoneypotIntegrityCheck recreates it (and any deleted persistent bait)
-# from the same embedded bytes.
+# from the same embedded templates.
+# >>> install_bait (run by xtask/tests/install_scripts.rs)
+# Write control-surface file DST from template SRC. External audit FIMR-016
+# (NN-AUD-290): the template's `last_modified=` line is set to the time of
+# the write, UTC to the second, and the file's mtime to that same second —
+# every template carried one frozen date, which a file written later
+# contradicted. The agent's boot sweep writes a missing one the same way
+# (fim::honeypot::render_bait).
+# BUG-020 tactical (idempotent skip-if-identical). These baits are
+# PROTECTED_INODES. Once the agent has pinned the anti-tamper LSM hooks,
+# `install` (which REPLACES the file) is denied EPERM outside a
+# trusted-installer window — and under `set -e` that aborts the whole
+# reinstall before daemon-reload. A file that already holds its template,
+# the date line aside, is left as it is (date and mtime kept); a missing or
+# divergent one is (re)written.
+install_bait() {
+    local src=$1 dst=$2 epoch stamp tmp
+    if [[ -f "$dst" ]] && cmp -s <(grep -v '^last_modified=' "$src") \
+        <(grep -v '^last_modified=' "$dst"); then
+        echo "install.sh: control-surface file $dst already matches — skip (BUG-020)"
+        return 0
+    fi
+    echo "install.sh: writing control-surface file $dst"
+    epoch=$(date -u +%s)
+    stamp=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)
+    tmp=$(mktemp)
+    if ! sed "s/^last_modified=.*/last_modified=$stamp/" "$src" >"$tmp" \
+        || ! install -m 0644 -o root -g root "$tmp" "$dst" \
+        || ! touch -m -d "@$epoch" "$dst"; then
+        rm -f "$tmp"
+        echo "install.sh: could not write control-surface file $dst" >&2
+        return 1
+    fi
+    rm -f "$tmp"
+}
+# <<< install_bait
 RUN_DIR="/run/northnarrow"
 echo "install.sh: ensuring $RUN_DIR (mode 0755, root:root)"
 install -d -m 0755 -o root -g root "$RUN_DIR"
@@ -1225,27 +1260,10 @@ declare -A HONEYPOT_BAIT_DIRS=(
     [unload.signal]="$RUN_DIR"
 )
 for bait in "${!HONEYPOT_BAIT_DIRS[@]}"; do
-    dst_dir="${HONEYPOT_BAIT_DIRS[$bait]}"
-    src="$HONEYPOT_BAITS_SRC_DIR/$bait"
-    dst="$dst_dir/$bait"
-    # BUG-020 tactical (idempotent skip-if-identical). These baits are
-    # PROTECTED_INODES. Once the agent has pinned the anti-tamper LSM hooks,
-    # `install` (which REPLACES the file) is denied EPERM — and under
-    # `set -e` that aborts the whole reinstall before daemon-reload. The
-    # deny hook is pinned, so this fires even with the agent stopped; its
-    # only write-exemption is the live agent PID. The baits are
-    # content-stable across installs, so if the on-disk copy already matches
-    # the shipped bytes, skip the rewrite entirely. A missing or divergent
-    # bait is still (re)written (fresh install; a tampered one is also
-    # recreated from the same embedded bytes by the agent's boot
-    # HoneypotIntegrityCheck). The STRUCTURAL fix — a key-gated trusted-local
-    # installer that can suspend the pin — stays a design call (see §15.1).
-    if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then
-        echo "install.sh: control-surface file $dst already matches — skip (BUG-020)"
-    else
-        echo "install.sh: writing control-surface file $dst"
-        install -m 0644 -o root -g root "$src" "$dst"
-    fi
+    # The deny hook is pinned, so a rewrite is refused even with the agent
+    # stopped (its only write-exemptions are the live agent PID and the
+    # trusted-installer window): see install_bait for what is skipped.
+    install_bait "$HONEYPOT_BAITS_SRC_DIR/$bait" "${HONEYPOT_BAIT_DIRS[$bait]}/$bait"
 done
 
 # Tappa 9.5 K7: pre-touch the two canary chain files for the same

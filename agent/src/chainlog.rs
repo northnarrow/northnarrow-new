@@ -67,7 +67,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::Utc;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1682,7 +1682,11 @@ fn check_digest(digest: Result<[u8; 32]>, stored: &str, sig: &str, pk: &Verifyin
         .decode(sig)
         .ok()
         .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
-        .is_some_and(|b| pk.verify(&digest, &Signature::from_bytes(&b)).is_ok());
+        // External audit NN-AUD-292 (FIMP-013): strict.
+        .is_some_and(|b| {
+            pk.verify_strict(&digest, &Signature::from_bytes(&b))
+                .is_ok()
+        });
     if sig_ok {
         LineCheck::Verified {
             terminator_seq: None,
@@ -2566,8 +2570,9 @@ fn check_entry(
     }
     let mut arr = [0u8; 64];
     arr.copy_from_slice(&sig_bytes);
+    // External audit NN-AUD-292 (FIMP-013): strict.
     if pubkey
-        .verify(&digest, &Signature::from_bytes(&arr))
+        .verify_strict(&digest, &Signature::from_bytes(&arr))
         .is_err()
     {
         return Err(LogSetError::SignatureInvalid {
@@ -2774,6 +2779,54 @@ mod tests {
         log.sync().unwrap();
         let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
         assert_eq!(report.total_records, 200);
+    }
+
+    /// External audit NN-AUD-292 (FIMP-013): the rotating logs' data lines,
+    /// terminators and manifest lines verify strictly with the agent's key
+    /// (the full verifier and the line check of a recovery). The same set
+    /// with every signature replaced by a small-order one, under a
+    /// small-order key, verified with the lax `verify`; it is refused now.
+    #[test]
+    fn rotating_logs_are_verified_strictly() {
+        use crate::chain_anchor::small_order;
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let k = key();
+        let pk = k.verifying_key();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(2000, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        for i in 0..40 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        assert!(!list_archive_seqs(&active).unwrap().is_empty(), "rotated");
+        let report = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(report.total_records, 40);
+        let text = std::fs::read_to_string(&active).unwrap();
+        let line = text.lines().next().unwrap();
+        assert!(line_is_genuine::<TestPayload>(line.as_bytes(), &pk));
+
+        let first: ChainLine<TestPayload> = serde_json::from_str(line).unwrap();
+        small_order::assert_premise(&hex::decode(&first.entry_hash).unwrap());
+        let forged = small_order::forge(line);
+        assert!(!line_is_genuine::<TestPayload>(
+            forged.as_bytes(),
+            &small_order::key()
+        ));
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let body = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, small_order::forge(&body)).unwrap();
+        }
+        assert!(matches!(
+            verify_log_set::<TestPayload>(&active, &small_order::key()),
+            Err(LogSetError::SignatureInvalid { .. })
+        ));
     }
 
     /// REAL rotation: a small byte cap makes a handful of appends spill

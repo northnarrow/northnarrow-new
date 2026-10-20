@@ -500,11 +500,11 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-286 | FIMR-012 | Low | FIM rules | S | fixed (lab PR 173) |
 | NN-AUD-287 | FIMR-013 | Low | FIM rules | S | fixed (lab PR 173) |
 | NN-AUD-288 | FIMR-014 | Low | FIM rules | S | fixed (lab PR 173) |
-| NN-AUD-289 | FIMR-015 | Low | FIM rules | S | open |
-| NN-AUD-290 | FIMR-016 | Low | FIM rules | S (+L) | open (S part; L part a product decision) |
-| NN-AUD-291 | FIMP-012 | Low | FIM pipeline | S/M | open |
-| NN-AUD-292 | FIMP-013 | Low | FIM pipeline | M | open |
-| NN-AUD-293 | FIMP-014 | Low | FIM pipeline | S | open |
+| NN-AUD-289 | FIMR-015 | Low | FIM rules | S | fixed (lab PR 197) |
+| NN-AUD-290 | FIMR-016 | Low | FIM rules | S (+L) | fixed (lab PR 197) |
+| NN-AUD-291 | FIMP-012 | Low | FIM pipeline | S/M | fixed (lab PR 197) |
+| NN-AUD-292 | FIMP-013 | Low | FIM pipeline | M | fixed (lab PR 197) |
+| NN-AUD-293 | FIMP-014 | Low | FIM pipeline | S | fixed (lab PR 197) |
 | NN-AUD-294 | NETR-011 | Low | Net rules | — | already fixed (lab PR 140) |
 | NN-AUD-295 | NETR-012 | Low | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-296 | NETR-013 | Low | Net rules | — | already fixed (lab PR 146) |
@@ -8350,3 +8350,123 @@ group, the ones an unprivileged user or a local attacker could use first.
     the device reuse checked, a service account's `logins.json`, the
     DNS forwarder attribution, then `nn-lab.sh open-sensor-check`).
   - Lab: Ubuntu 24.04, opensensor196-probe.sh and `nn-lab.sh open-sensor-check` — before: the build of `main` with lab PRs 176–195; after: this lot on top. A tmpfs written at `/mnt/nn196-a`, then remounted at `/mnt/nn196-b`, `-c` and `-d` (the same device 0:45): every write was still named under `/mnt/nn196-a` before; after the current mount point each time, and `mnt[0:45:1]/…` (unplaced, not a wrong path) for the remount made at once. A `logins.json` under a service account's home: no rule before, NN-L-FIM-015 (Log, High) after. `open-sensor-check` PASS in both (31 inode rules before, 39 after: the homes added). Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.
+- **Wave 3 — FIM pipeline and signed-chain hygiene, lab PR 197.** NN-AUD-291
+  (FIMP-012), NN-AUD-292 (FIMP-013, the `verify_strict` part), NN-AUD-293
+  (FIMP-014), NN-AUD-289 (FIMR-015), NN-AUD-290 (FIMR-016, the S part), all
+  Low: batch F of the Wave 3 triage of the kernel, sensors and FIM group, on
+  the integration tree (`main` with lots up to 191, and lots 192–195).
+  - FIMP-012 (291, fixed). Re-checked: `reconstruct_child_path` built the
+    leaf with `String::from_utf8_lossy` and checked only for `/`; the lossy
+    path went to `enroll_path`, whose `stat` failed, so the child waited in
+    the retry queue and was dropped: its later in-place edits were not
+    watched, and its drift row named a file that does not exist (hash
+    null). Now the leaf is kept as bytes and named by `leaf_display`: a
+    UTF-8 name is itself (backslashes included: `mnt-data\x2dvol.mount`
+    stays), any other is spelled with `\xNN` for each byte that is not
+    UTF-8 and `\\` for a backslash, so distinct names stay distinct.
+    `fs_path` turns a component spelled so back into its bytes (only an
+    exact spelling that decodes to something not UTF-8; a UTF-8 file under
+    the name as written wins), and every place of the drain that stats,
+    hashes, enrolls or sweeps a path by its name goes through it
+    (`enroll_path`, `content_after`, `child_ident`, `forget_if_gone`,
+    `gc_runtime_children`, `settle_rename`, `returned_paths`,
+    `replacement_raw`, the directory look). An empty leaf, `.` and `..` are
+    refused (the VFS never hands them: defence in depth). Not changed: paths
+    from the configuration (text), and the baseline's own walk (it hashes
+    configured paths only).
+  - FIMP-014 (293, fixed). `DriftRateLimiter` is a `parking_lot::Mutex`, as
+    its note said; both `.expect("DriftRateLimiter mutex poisoned")` are
+    gone (`git grep -n 'mutex poisoned' agent/src/fim/drain.rs` is empty).
+  - FIMP-013 (292, the strict part fixed). Re-checked: eight lax `verify`
+    calls as listed (`fim/baseline.rs`, `audit.rs`, `chainlog.rs` twice:
+    the line check of recovery and the full verifier, `canary/registry.rs`
+    and `canary/access_log.rs` twice each), and a ninth beyond the triage:
+    `chain_anchor::signature_ok`, the head anchor's. All nine use
+    `verify_strict`; the `Verifier` imports are gone. With a small-order
+    public key (the identity point, which `VerifyingKey::from_bytes` takes)
+    the lax check accepted `R` = identity, `s` = 0 for any message: a chain
+    of forged rows verified under such an `--agent-pubkey`. Not in this lot
+    (follow-up, its own PR with `nn-admin audit verify` and
+    `docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`): the domain tag
+    and row version v2 for the chains that still hash `prev ‖ row`
+    untagged — the rotating logs (detections, status events, netflow, FIM
+    drift), the FIM baseline, and the rows of `audit.log` and the canary
+    chains written before lab PR 160 (their numbered rows are tagged since
+    then, `chain_anchor::*_DOMAIN_V2`).
+  - FIMR-015 (289, fixed). One table, `fim::honeypot::BAITS` (path,
+    content); `BAIT_PATHS` is derived from it in a `const` block and
+    `fim::rules::HONEYPOT_PATHS` is that array; `bait_content` looks the
+    table up, and `check_and_restore` iterates it — the `match` and the
+    `.expect("every HONEYPOT_PATH has a template")` are gone (`git grep
+    'has a template")'` is empty).
+  - FIMR-016 (290, the S part fixed). The ten templates no longer share a
+    comment line (each has its own third line instead of `# WARNING:
+    modifying this file requires admin authorization`) and their
+    `last_modified=` is empty. `honeypot::render_bait` fills it with the
+    time of the write, UTC to the second, and `create_bait` sets the file's
+    mtime to that second (`File::set_modified`); `install.sh` does the same
+    in `install_bait` (a `# >>> install_bait` block: `sed` into a
+    `mktemp` file, `install`, `touch -m -d @epoch`). BUG-020's skip
+    compares the template and the file with the `last_modified=` line left
+    out, so a reinstall leaves the file, date included. The leak tests
+    pass unchanged. The L part (per-install names) is not scheduled: a
+    product decision for the FIM group, as triaged.
+  - Format: no row, field or pre-image changed; every existing v1 row
+    verifies as before (`strict_accepts_every_signed_row`: 24 rows of the
+    pre-160 format and 40 numbered ones, both verifiers; the legacy-row
+    tests of lab PRs 160/179/185/190 unchanged). For readers: drift rows
+    and FIM detections spell a name that is not UTF-8 with `\xNN` (it read
+    `�`); a small-order `--agent-pubkey` breaks the chain at its first row;
+    the first upgrade rewrites the ten control-surface files (inside the
+    window `install.sh --upgrade --grant-key` opens), a byte-for-byte
+    comparison with `configs/honeypot-baits/*` must leave the
+    `last_modified=` line out. Documented: `docs/operator/EVIDENCE_CHAINS.md`
+    (strict signatures, the untagged chains), `anti-tamper-honeypots.md`
+    §3, `UPGRADE_NOTES_AUDIT_16f7563.md` §§1, 4, 8, and the doc of
+    `common::wire::FimEvent::path` (it promised `\xNN` escapes the code
+    did not make).
+  - Tests: `drain.rs`: `reconstruct_child_path_rejects_dot_dot_and_keeps_raw_bytes`,
+    `a_child_with_a_non_utf8_name_is_watched_and_its_edit_reported` (a
+    real file `ev\xffil`: Created hashed, enrolled at once, Modified
+    reported, kept by the sweep; a UTF-8 twin spelled like the escape is
+    the one under that name), `rate_limiter_keeps_working_after_a_panic_under_its_lock`;
+    `honeypot.rs`: `honeypot_paths_are_the_bait_table`,
+    `every_bait_template_leaves_its_date_to_the_write`,
+    `bait_timestamp_matches_its_mtime`, `bait_headers_differ`,
+    `render_fills_only_the_date_line`, `recreated_file_matches_template_exactly`
+    (now: the template with its date filled); strict checks over chains
+    each writer produces (`chain_anchor::small_order` holds the
+    small-order pair and asserts the premise, lax accepts and strict
+    refuses): `audit.rs` `strict_accepts_every_signed_row` and
+    `verify_chain_rejects_small_order_signature`, `chainlog.rs`
+    `rotating_logs_are_verified_strictly` (data lines, terminators,
+    manifest), `fim/baseline.rs` `baseline_chain_is_verified_strictly`,
+    `canary/registry.rs` `registry_chain_is_verified_strictly`,
+    `canary/access_log.rs` `access_chain_is_verified_strictly`,
+    `chain_anchor.rs` `signature_ok_refuses_a_small_order_pair_and_takes_the_agents`;
+    `xtask/tests/install_scripts.rs`
+    `install_bait_dates_the_file_by_its_write_and_skips_an_unchanged_one`;
+    `fim_privileged_e2e` +1,
+    `fim_child_with_a_non_utf8_name_is_watched_and_its_append_recorded`
+    (a watched directory in the fixture, `FimFixture::setup_watching_dir`).
+    On the starting tree the new tests do not compile (new items). With the
+    starting bodies under them (lax `verify`, the lossy leaf, the
+    `std::sync::Mutex`, the template written as is, the old templates; a
+    scratch copy), 13 of the 17 unit tests fail: the two FIMP-012 tests,
+    the limiter test (it panics at the `expect`), `bait_headers_differ`,
+    `every_bait_template_leaves_its_date_to_the_write`,
+    `bait_timestamp_matches_its_mtime`,
+    `recreated_file_matches_template_exactly`, and the seven small-order
+    tests (each passes its premise and then accepts the forged chain);
+    `strict_accepts_every_signed_row`, `honeypot_paths_are_the_bait_table`
+    and `render_fills_only_the_date_line` pass on both (guards). Expected
+    in the lab against the old code: the new e2e times out on the Created
+    row with the escaped name (the row says `ev�il`); the xtask test
+    finds no `install_bait` block.
+  - Host: `cargo fmt`; clippy `--workspace --all-targets --locked` and the
+    agent with `test-privileged,debug-trigger` clean; 2,552 passed,
+    0 failed, 21 ignored. The `posture_demo` clippy run fails on the
+    integration tree before this lot (`Event::ProcessSpawn` without
+    `argv_truncated`/`filename_truncated`, added by lot 187's tree,
+    `agent/examples/posture_demo.rs` not updated); not touched here.
+  - Lab: Debian 12, fimchain197-probe.sh — before: the build of `main` with lab PRs 176–195; after: this lot on top. A drop-in in `/etc/modprobe.d` whose name ends in a byte that is not UTF-8: before one Created row under the lossy name (`nn197-x�`, no hash) and the append not recorded; after a Created and a Modified row, both hashed, named `nn197-x\xff` (the ASCII control the same in both; the probe's own row matcher missed the JSON quoting, its FAIL lines are a probe defect — the rows above are the record). The ten control-surface baits as installed: before all dated `2026-02-15T09:30:00Z` whatever their mtime and sharing one comment line; after each dated at its write (equal to its mtime) with no shared comment, also after the boot sweep re-created the `/run` pair. Gate: the integration tree of lab PRs 196, 197, 198 and 199 on `main` with lab PRs 176–195: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 41 suites, 89 passed, 0 failed each; Debian 13 (6.12) 41 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,577 passed, 0 failed.

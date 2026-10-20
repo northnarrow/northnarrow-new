@@ -396,7 +396,6 @@ fn verify_row(
     entry: &CanaryAccessEntry,
     pubkey: &VerifyingKey,
 ) -> Result<(), AccessLogVerifyError> {
-    use ed25519_dalek::Verifier;
     let idx = 0;
     let mut stripped = entry.clone();
     stripped.entry_hash.clear();
@@ -418,8 +417,9 @@ fn verify_row(
         .ok()
         .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
         .ok_or(AccessLogVerifyError::SignatureInvalid { idx })?;
+    // External audit NN-AUD-292 (FIMP-013): strict.
     pubkey
-        .verify(&recomputed, &Signature::from_bytes(&sig))
+        .verify_strict(&recomputed, &Signature::from_bytes(&sig))
         .map_err(|_| AccessLogVerifyError::SignatureInvalid { idx })
 }
 
@@ -475,7 +475,6 @@ pub fn verify_chain(
     entries: &[CanaryAccessEntry],
     pubkey: &VerifyingKey,
 ) -> Result<(), AccessLogVerifyError> {
-    use ed25519_dalek::Verifier;
     let mut expected_prev = GENESIS_PREV_HASH.to_string();
     let mut seq = crate::chain_anchor::RowSeq::default();
     for (idx, entry) in entries.iter().enumerate() {
@@ -519,7 +518,7 @@ pub fn verify_chain(
         let mut sig_arr = [0u8; 64];
         sig_arr.copy_from_slice(&sig_bytes);
         let sig = Signature::from_bytes(&sig_arr);
-        if pubkey.verify(&recomputed, &sig).is_err() {
+        if pubkey.verify_strict(&recomputed, &sig).is_err() {
             return Err(AccessLogVerifyError::SignatureInvalid { idx });
         }
         expected_prev = entry.entry_hash.clone();
@@ -584,6 +583,39 @@ mod tests {
         let (key, _) = fresh_signing_key(&dir);
         let db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
         assert_eq!(db.last_hash(), last.entry_hash);
+    }
+
+    /// External audit NN-AUD-292 (FIMP-013): the access log's rows pass the
+    /// strict check with the agent's key (whole chain and one row at a
+    /// time); rows carrying a small-order signature, under a small-order
+    /// key, passed the lax one and are refused now.
+    #[test]
+    fn access_chain_is_verified_strictly() {
+        use crate::chain_anchor::small_order;
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canary_access.jsonl");
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        for i in 1..=8 {
+            db.append(sample_draft(i, i == 1)).unwrap();
+        }
+        let parse = |text: &str| -> Vec<CanaryAccessEntry> {
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        verify_chain(&parse(&text), &pubkey).expect("strict accepts the agent's rows");
+        assert!(text.lines().all(|l| row_is_genuine(l.as_bytes(), &pubkey)));
+        let forged_text = small_order::forge(&text);
+        let forged = parse(&forged_text);
+        small_order::assert_premise(&hex::decode(&forged[0].entry_hash).unwrap());
+        assert!(matches!(
+            verify_chain(&forged, &small_order::key()),
+            Err(AccessLogVerifyError::SignatureInvalid { idx: 0 })
+        ));
+        let first = forged_text.lines().next().unwrap();
+        assert!(!row_is_genuine(first.as_bytes(), &small_order::key()));
     }
 
     /// K3 access-log test #1: first append writes one signed

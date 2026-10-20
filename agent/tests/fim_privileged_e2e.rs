@@ -58,7 +58,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// here to avoid pulling the workspace dep just for the
 /// assertions.
 const OP_MODIFIED: u64 = 1;
-#[allow(dead_code)]
 const OP_CREATED: u64 = 2;
 const OP_DELETED: u64 = 3;
 #[allow(dead_code)]
@@ -107,6 +106,9 @@ struct FimFixture {
     /// Path the test watches (single-file watched set — keeps
     /// the e2e blast radius small).
     watched_file: PathBuf,
+    /// A watched directory next to it, when the test asked for one
+    /// ([`FimFixture::setup_watching_dir`]).
+    watched_dir: Option<PathBuf>,
     fim_paths_v1: PathBuf,
     fim_paths_local: PathBuf,
     baseline_log: PathBuf,
@@ -169,6 +171,17 @@ impl FimFixture {
     /// Wipes `/sys/fs/bpf/northnarrow` so prior-test pinned LSM
     /// state doesn't bleed in.
     fn setup(watched_basename: &str, initial_contents: &[u8]) -> Self {
+        Self::setup_watching_dir(watched_basename, initial_contents, None)
+    }
+
+    /// [`Self::setup`], plus the directory `dir_name` (created empty in the
+    /// tempdir) on the watch list: files dropped into it are its runtime
+    /// children.
+    fn setup_watching_dir(
+        watched_basename: &str,
+        initial_contents: &[u8],
+        dir_name: Option<&str>,
+    ) -> Self {
         wipe_pin_tree();
         let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -203,16 +216,22 @@ impl FimFixture {
         // isolation; basename uniqueness is belt + braces).
         let watched_file = dir.join(watched_basename);
         std::fs::write(&watched_file, initial_contents).expect("seed watched file");
+        let watched_dir = dir_name.map(|name| {
+            let d = dir.join(name);
+            std::fs::create_dir(&d).expect("create watched dir");
+            d
+        });
 
-        // fim-paths.v1: ONLY our watched file (single-line list).
-        // No defaults — keeps the WATCHED_PATHS map small enough
-        // that map dumps are readable in test failure output.
+        // fim-paths.v1: ONLY our watched file (single-line list), and the
+        // directory when asked for. No defaults — keeps the WATCHED_PATHS
+        // map small enough that map dumps are readable in test failure
+        // output.
         let fim_paths_v1 = dir.join("fim-paths.v1");
-        std::fs::write(
-            &fim_paths_v1,
-            format!("{}\n", watched_file.to_string_lossy()),
-        )
-        .expect("write fim-paths.v1");
+        let mut list = format!("{}\n", watched_file.to_string_lossy());
+        if let Some(d) = &watched_dir {
+            list.push_str(&format!("{}\n", d.to_string_lossy()));
+        }
+        std::fs::write(&fim_paths_v1, list).expect("write fim-paths.v1");
         // fim-paths.local empty — exercises the "no overlay"
         // branch of paths_config::load_watched_paths.
         let fim_paths_local = dir.join("fim-paths.local");
@@ -266,6 +285,7 @@ impl FimFixture {
         Self {
             _tempdir: tempdir,
             watched_file,
+            watched_dir,
             fim_paths_v1,
             fim_paths_local,
             baseline_log,
@@ -435,6 +455,43 @@ fn fim_chmod_setuid_records_attribute_drift() {
         row["baseline_sha256"], row["new_sha256"],
         "the content did not change"
     );
+}
+
+// ── Test 1c: a child whose name is not UTF-8 ────────────────────────
+
+/// External audit NN-AUD-291 (FIMP-012): a file dropped into a watched
+/// directory under a name that is not UTF-8 (`ev\xffil`) is named with a
+/// `\xNN` escape, enrolled by its own bytes, and its later append is a
+/// `Modified` row. Before, the leaf was decoded lossily (U+FFFD): the
+/// `Created` row named a file that does not exist, the file was never
+/// watched, and the append left no row.
+#[test]
+fn fim_child_with_a_non_utf8_name_is_watched_and_its_append_recorded() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let fx = FimFixture::setup_watching_dir("anchor.txt", b"anchor\n", Some("drop.d"));
+    fx.wait_baseline();
+    let dir = fx.watched_dir.clone().expect("watched dir");
+    let file = dir.join(std::ffi::OsStr::from_bytes(b"ev\xffil"));
+    let shown = format!("{}/ev\\xffil", dir.to_string_lossy());
+    std::fs::write(&file, b"first line\n").expect("drop the child");
+    // The hook fires before the create: the row's hash may be of no file
+    // yet. Its name is the escaped one.
+    let created = fx.wait_drift_op(&shown, OP_CREATED);
+    // Let the enrollment land before the in-place edit.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .expect("open the child");
+    f.write_all(b"appended\n").expect("append");
+    drop(f);
+    // The child is watched: an edit in place is a Modified row (the first
+    // write's close may already give one; on the code before, none came).
+    let modified = fx.wait_drift_op(&shown, OP_MODIFIED);
+    assert!(modified["new_sha256"].is_string(), "{modified}");
+    assert_eq!(created["path"], modified["path"]);
+    std::fs::remove_file(&file).expect("clean up the child");
 }
 
 // ── Test 2: subprocess unlink → Deleted drift event ─────────────────

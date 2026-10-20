@@ -84,7 +84,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, SECRET_KEY_LENGTH};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1411,7 +1411,9 @@ pub fn verify_entry(
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(&sig_bytes);
     let sig = Signature::from_bytes(&sig_arr);
-    if pubkey.verify(&recomputed, &sig).is_err() {
+    // External audit NN-AUD-292 (FIMP-013): strict — a small-order key or
+    // `R` is refused; every signature the agent made passes.
+    if pubkey.verify_strict(&recomputed, &sig).is_err() {
         return Err(AuditVerifyError::SignatureInvalid { idx });
     }
     Ok(())
@@ -1869,6 +1871,54 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    /// External audit NN-AUD-292 (FIMP-013): every row the agent signs —
+    /// rows from before lab PR 160 (no `seq`, untagged pre-image) and
+    /// numbered ones — passes the strict check, through both verifiers.
+    #[test]
+    fn strict_accepts_every_signed_row() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        write_legacy_rows(&log_path, &key, 24);
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        for i in 0..40 {
+            log.append(sample_draft(100 + i)).unwrap();
+        }
+        let all = rows(&log_path);
+        assert_eq!(all.len(), 64);
+        verify_chain(&all, &pk).expect("strict accepts the agent's rows");
+        let report = verify_chain_file(&log_path, &pk, None).unwrap();
+        assert_eq!((report.rows, report.broken), (64, None));
+    }
+
+    /// External audit NN-AUD-292 (FIMP-013): a chain whose rows carry a
+    /// small-order signature, under a small-order key, verified with the
+    /// lax `verify` — whatever the rows said. The strict check refuses the
+    /// first row.
+    #[test]
+    fn verify_chain_rejects_small_order_signature() {
+        use crate::chain_anchor::small_order;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        write_legacy_rows(&log_path, &key, 2);
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        log.append(sample_draft(10)).unwrap();
+        let first = rows(&log_path).remove(0);
+        small_order::assert_premise(&hex::decode(&first.entry_hash).unwrap());
+        let forged = small_order::forge(&fs::read_to_string(&log_path).unwrap());
+        fs::write(&log_path, forged).unwrap();
+        assert!(matches!(
+            verify_chain(&rows(&log_path), &small_order::key()),
+            Err(AuditVerifyError::SignatureInvalid { idx: 0 })
+        ));
+        let report = verify_chain_file(&log_path, &small_order::key(), None).unwrap();
+        assert_eq!(report.rows, 0);
+        assert!(matches!(
+            report.broken,
+            Some(AuditVerifyError::SignatureInvalid { idx: 0 })
+        ));
     }
 
     /// An existing chain (no `seq`) still verifies; numbering starts at

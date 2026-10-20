@@ -660,3 +660,116 @@ fn uninstall_help_names_the_grant_key() {
     }
     assert!(!text.contains("set -euo pipefail"), "{text}");
 }
+
+// ── FIMR-016: control-surface files dated by their write ─────────────────
+
+/// `install_bait SRC DST` from install.sh, with a stub `install` first on
+/// PATH that drops the `-o`/`-g` owner (the test is not root): (exit
+/// status, stdout).
+fn install_bait(case: &Path, src: &Path, dst: &Path) -> (i32, String) {
+    let bin = case.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_exec(
+        &bin.join("install"),
+        "args=''\nwhile [ $# -gt 0 ]; do\n  case $1 in -o|-g) shift 2 ;; *) args=\"$args '$1'\"; shift ;; esac\ndone\neval \"exec /usr/bin/install $args\"",
+    );
+    let script = format!(
+        "set -euo pipefail\n{}\ninstall_bait \"$1\" \"$2\"\n",
+        block("deploy/install.sh", "install_bait")
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .arg("bash")
+        .arg(src)
+        .arg(dst)
+        .env("PATH", path)
+        .output()
+        .expect("bash runs");
+    assert!(out.stderr.is_empty() || out.status.success(), "{out:?}");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+    )
+}
+
+fn mtime_secs(p: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(p).unwrap().mtime()
+}
+
+/// External audit FIMR-016 (NN-AUD-290): every bait said
+/// `last_modified=2026-02-15T09:30:00Z` whenever it was written. The
+/// install fills the template's empty `last_modified=` line with the time
+/// of the write, and the file's mtime is that same second; every other
+/// line is the template's. A reinstall over a file that holds its template
+/// (the date aside) leaves it alone — BUG-020's skip, date and mtime kept —
+/// and a file that differs is written again.
+#[test]
+fn install_bait_dates_the_file_by_its_write_and_skips_an_unchanged_one() {
+    let case = case_dir("install-bait");
+    for name in ["kill_switch.conf", "pause.flag"] {
+        let src = repo_root().join("configs/honeypot-baits").join(name);
+        let template = fs::read_to_string(&src).unwrap();
+        assert!(template.lines().any(|l| l == "last_modified="), "{name}");
+        let dst = case.join(name);
+        let before = chrono::Utc::now().timestamp();
+        let (rc, out) = install_bait(&case, &src, &dst);
+        assert_eq!(rc, 0, "{out}");
+        assert!(out.contains("writing control-surface file"), "{out}");
+        let written = fs::read_to_string(&dst).unwrap();
+        let stamp = written
+            .lines()
+            .find_map(|l| l.strip_prefix("last_modified="))
+            .unwrap()
+            .to_string();
+        let dated = chrono::DateTime::parse_from_rfc3339(&stamp)
+            .unwrap_or_else(|e| panic!("{name}: {stamp:?}: {e}"))
+            .timestamp();
+        assert!(stamp.ends_with('Z') && stamp.len() == 20, "{stamp}");
+        assert_eq!(dated, mtime_secs(&dst), "{name}: the date is the mtime");
+        assert!(dated >= before && dated <= chrono::Utc::now().timestamp());
+        let undated = |t: &str| {
+            t.lines()
+                .filter(|l| !l.starts_with("last_modified="))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(undated(&written), undated(&template), "{name}");
+
+        // Reinstall of the same template: skipped, date and mtime kept.
+        let old = filetime_back(&dst);
+        let (rc, out) = install_bait(&case, &src, &dst);
+        assert_eq!(rc, 0, "{out}");
+        assert!(out.contains("already matches — skip (BUG-020)"), "{out}");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), written);
+        assert_eq!(mtime_secs(&dst), old);
+
+        // A file in an older wording is written again.
+        fs::write(&dst, template.replace("# NorthNarrow", "# Northnarrow")).unwrap();
+        let (rc, out) = install_bait(&case, &src, &dst);
+        assert_eq!(rc, 0, "{out}");
+        assert!(out.contains("writing control-surface file"), "{out}");
+        assert_eq!(
+            undated(&fs::read_to_string(&dst).unwrap()),
+            undated(&template)
+        );
+    }
+}
+
+/// Moves `p`'s mtime one hour back (`touch -d`), so that a rewrite would
+/// show; returns it in seconds.
+fn filetime_back(p: &Path) -> i64 {
+    let back = mtime_secs(p) - 3600;
+    let ok = Command::new("touch")
+        .arg("-m")
+        .arg("-d")
+        .arg(format!("@{back}"))
+        .arg(p)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    back
+}

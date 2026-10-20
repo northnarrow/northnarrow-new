@@ -80,6 +80,18 @@ The verifiers read one line at a time: a large chain costs the memory of
 its longest line, not of the file. `audit read` does not verify signatures;
 use `audit verify` or `chain verify` for that.
 
+Signatures are checked strictly (Ed25519 `verify_strict`; external audit
+FIMP-013, lab PR 197) by every verifier of these chains — `nn-admin audit
+verify` and `chain verify`, the agent's checks at open and in the
+background, the head anchor, the FIM baseline: a public key or a signature
+`R` of small order is refused. Every row the agent signed passes; the rows
+and their pre-images did not change. A `--agent-pubkey` of small order makes
+the first row fail (`agent_sig invalid`): check that the key given is the
+agent's (`agent.sig.pub`, or the hex kept off the host). Rows without `seq`
+(from before lab PR 160) and the rotating logs, the FIM baseline and drift
+log still hash `prev ‖ row` without a per-chain tag; a tag for those is a
+format change of its own, not made yet.
+
 ## When a check fails
 
 1. **Keep the evidence first.** Do not reinstall, restore or delete

@@ -802,7 +802,6 @@ fn verify_entry(
     entry: &BaselineEntry,
     pubkey: &VerifyingKey,
 ) -> Result<(), BaselineVerifyError> {
-    use ed25519_dalek::Verifier;
     // Recompute against a stripped copy (entry_hash + agent_sig
     // cleared), matching the pre-image build_signed_entry hashed.
     let mut stripped = entry.clone();
@@ -836,7 +835,8 @@ fn verify_entry(
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(&sig_bytes);
     let sig = Signature::from_bytes(&sig_arr);
-    if pubkey.verify(&recomputed, &sig).is_err() {
+    // External audit NN-AUD-292 (FIMP-013): strict.
+    if pubkey.verify_strict(&recomputed, &sig).is_err() {
         return Err(BaselineVerifyError::SignatureInvalid { idx });
     }
     Ok(())
@@ -1064,6 +1064,35 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 2);
         verify_chain(&entries, &pubkey).expect("two-entry chain verifies");
+    }
+
+    /// External audit NN-AUD-292 (FIMP-013): the baseline's rows pass the
+    /// strict check with the agent's key; rows carrying a small-order
+    /// signature, under a small-order key, passed the lax one and are
+    /// refused now.
+    #[test]
+    fn baseline_chain_is_verified_strictly() {
+        use crate::chain_anchor::small_order;
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("baseline.jsonl");
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+        for i in 1..=32 {
+            db.append(sample_draft(i)).unwrap();
+        }
+        let parse = |text: &str| -> Vec<BaselineEntry> {
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        };
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        verify_chain(&parse(&text), &pubkey).expect("strict accepts the agent's rows");
+        let forged = parse(&small_order::forge(&text));
+        small_order::assert_premise(&hex::decode(&forged[0].entry_hash).unwrap());
+        assert!(matches!(
+            verify_chain(&forged, &small_order::key()),
+            Err(BaselineVerifyError::SignatureInvalid { idx: 0 })
+        ));
     }
 
     // ── C3 test #7: payload tamper detected ───────────────────────

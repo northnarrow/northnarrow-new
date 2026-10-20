@@ -71,7 +71,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -527,11 +527,14 @@ fn is_user_writable_prefix(path: &str) -> bool {
 ///
 /// Thread-safety: a single `Mutex` wraps the bucket state. The
 /// async drain loop holds the lock for microseconds per drift
-/// — sub-millisecond contention even under burst load. parking
-/// _lot::Mutex chosen over std for fairness + no poisoning
-/// (a panicked drain task shouldn't lock out a future restart).
+/// — sub-millisecond contention even under burst load. A
+/// `parking_lot::Mutex`, for fairness and no poisoning: a panic
+/// while it was held cannot turn every later drift into a second
+/// one (external audit NN-AUD-293 FIMP-014: it was a
+/// `std::sync::Mutex` with `.expect("… poisoned")` on each lock,
+/// against this note).
 pub struct DriftRateLimiter {
-    state: Mutex<BucketState>,
+    state: parking_lot::Mutex<BucketState>,
     high_per_min: u32,
     medium_per_min: u32,
 }
@@ -553,7 +556,7 @@ impl DriftRateLimiter {
     /// override-friendly.
     pub fn with_caps(high_per_min: u32, medium_per_min: u32) -> Self {
         Self {
-            state: Mutex::new(BucketState {
+            state: parking_lot::Mutex::new(BucketState {
                 high_remaining: high_per_min,
                 medium_remaining: medium_per_min,
                 window_started: Instant::now(),
@@ -575,7 +578,7 @@ impl DriftRateLimiter {
         severity: DriftSeverity,
         now: Instant,
     ) -> Result<(), String> {
-        let mut s = self.state.lock().expect("DriftRateLimiter mutex poisoned");
+        let mut s = self.state.lock();
         // Window roll-over — when 60s elapsed since the window
         // started, refill both buckets to full and reset the
         // anchor. Single mutex lock window keeps this race-free.
@@ -618,7 +621,7 @@ impl DriftRateLimiter {
     /// arithmetic on `Instant`); same lock-contention budget as
     /// `try_consume`.
     pub fn snapshot(&self) -> (u32, u32, u32) {
-        let s = self.state.lock().expect("DriftRateLimiter mutex poisoned");
+        let s = self.state.lock();
         let elapsed = Instant::now().duration_since(s.window_started);
         let remaining_secs = Duration::from_secs(60)
             .checked_sub(elapsed)
@@ -859,23 +862,117 @@ fn format_ts(t: DateTime<Utc>) -> String {
 
 /// BUG-022 — rebuild a watched directory's child path from the bare
 /// dir path + the kernel-carried leaf in [`FimDriftRaw::child_name`]
-/// (NUL-terminated, UTF-8 lossy). Returns `None` when the leaf is
-/// empty or (defensively) contains a `/` — the kernel hands a single
-/// dentry component, so a slash means a crafted / garbled record.
+/// (NUL-terminated), named by [`leaf_display`]. Returns `None` when the
+/// leaf is empty, `.` or `..`, or contains a `/` — the kernel hands a
+/// single dentry component, so a slash means a crafted / garbled record
+/// (external audit NN-AUD-291: the VFS never hands `.` or `..` either;
+/// refused all the same).
 fn reconstruct_child_path(dir: &str, raw: &FimDriftRaw) -> Option<String> {
     let end = raw
         .child_name
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(raw.child_name.len());
-    if end == 0 {
+    let leaf = &raw.child_name[..end];
+    if leaf.is_empty() || leaf == b"." || leaf == b".." || leaf.contains(&b'/') {
         return None;
     }
-    let leaf = String::from_utf8_lossy(&raw.child_name[..end]);
-    if leaf.contains('/') {
+    Some(format!(
+        "{}/{}",
+        dir.trim_end_matches('/'),
+        leaf_display(leaf)
+    ))
+}
+
+/// External audit NN-AUD-291 (FIMP-012): a file name as the drain names it.
+/// A UTF-8 name is itself. Any other is spelled with `\xNN` for each byte
+/// that is not UTF-8 and `\\` for each backslash, so that two names stay
+/// two and [`fs_path`] finds the file again. It was decoded lossily
+/// (U+FFFD for each such byte): a name no file has, so the new file was
+/// never watched — its later in-place edits went unseen — and its drift
+/// row named a file that does not exist.
+fn leaf_display(leaf: &[u8]) -> String {
+    use std::fmt::Write as _;
+    if let Ok(name) = std::str::from_utf8(leaf) {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(leaf.len() * 2);
+    for chunk in leaf.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c == '\\' {
+                out.push_str("\\\\");
+            } else {
+                out.push(c);
+            }
+        }
+        for b in chunk.invalid() {
+            let _ = write!(out, "\\x{b:02x}");
+        }
+    }
+    out
+}
+
+/// External audit NN-AUD-291: the bytes of a name [`leaf_display`]
+/// escaped; `None` for any other text. Only its exact spelling counts: a
+/// name that decodes to UTF-8 is not one it escaped (a UTF-8 name is
+/// itself, backslashes included — `mnt-data\x2dvol.mount`).
+fn leaf_bytes(name: &str) -> Option<Vec<u8>> {
+    if !name.contains('\\') {
         return None;
     }
-    Some(format!("{}/{}", dir.trim_end_matches('/'), leaf))
+    let text = name.as_bytes();
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] != b'\\' {
+            out.push(text[i]);
+            i += 1;
+            continue;
+        }
+        match text.get(i + 1) {
+            Some(b'\\') => {
+                out.push(b'\\');
+                i += 2;
+            }
+            Some(b'x') => {
+                let hex = name.get(i + 2..i + 4)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 4;
+            }
+            _ => return None,
+        }
+    }
+    (std::str::from_utf8(&out).is_err() && leaf_display(&out) == name).then_some(out)
+}
+
+/// External audit NN-AUD-291: the file a path the drain names stands for.
+/// Each component [`leaf_display`] escaped is turned back into its bytes —
+/// unless a file is there under the name as written: a UTF-8 name may hold
+/// the same characters, and that file is the one.
+fn fs_path(path: &str) -> std::borrow::Cow<'_, Path> {
+    use std::os::unix::ffi::OsStringExt;
+    if !path.contains('\\') || std::fs::symlink_metadata(path).is_ok() {
+        return std::borrow::Cow::Borrowed(Path::new(path));
+    }
+    let mut decoded = false;
+    let mut out = Vec::with_capacity(path.len());
+    for (i, component) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        match leaf_bytes(component) {
+            Some(bytes) => {
+                decoded = true;
+                out.extend_from_slice(&bytes);
+            }
+            None => out.extend_from_slice(component.as_bytes()),
+        }
+    }
+    if decoded {
+        std::borrow::Cow::Owned(std::ffi::OsString::from_vec(out).into())
+    } else {
+        std::borrow::Cow::Borrowed(Path::new(path))
+    }
 }
 
 /// The drain's pending work, between events. External audit NN-AUD-119
@@ -1113,7 +1210,7 @@ fn replacement_raws() -> Vec<FimDriftRaw> {
 
 /// A replacement as a modification event of the file now at `path`.
 fn replacement_raw(path: &str, mut raw: FimDriftRaw) -> Option<FimDriftRaw> {
-    let key = key_for_path(Path::new(path)).ok()?;
+    let key = key_for_path(&fs_path(path)).ok()?;
     // the rename has landed: read what is there now
     raw.timestamp_ns = monotonic_ns();
     raw.target_dev = key.dev;
@@ -1237,7 +1334,7 @@ fn settle_rename(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> bool {
-    if matches!(key_for_path(Path::new(path)), Ok(k) if k == *key) {
+    if matches!(key_for_path(&fs_path(path)), Ok(k) if k == *key) {
         return false;
     }
     forget_if_gone(key, path, path_map, watched_paths);
@@ -1281,7 +1378,7 @@ fn returned_paths(
     let todo = queues(|q| std::mem::take(&mut q.awaiting_return));
     let mut back = Vec::new();
     for (path, class) in todo {
-        match key_for_path(Path::new(&path)) {
+        match key_for_path(&fs_path(&path)) {
             Ok(key) if enroll_path(&path, class, path_map, watched_paths) => back.push(key),
             _ => await_return(&path, class),
         }
@@ -1383,12 +1480,14 @@ fn enroll_path(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) -> bool {
-    let Ok(key) = key_for_path(Path::new(path)) else {
+    // External audit NN-AUD-291: by the file's own name.
+    let file = fs_path(path);
+    let Ok(key) = key_for_path(&file) else {
         return false;
     };
     watch_inode(key, path, class, path_map, watched_paths);
     // External audit EBPF-016: a new watch on overlayfs, FUSE or NFS.
-    crate::fs_type::note_identity(Path::new(path));
+    crate::fs_type::note_identity(&file);
     if class == WatchClass::Configured {
         enroll_chain(path, path_map, watched_paths);
     }
@@ -1634,7 +1733,7 @@ fn gc_runtime_children(
 ) -> usize {
     let mut gone = 0;
     for (key, path) in path_map.runtime_children() {
-        if !matches!(key_for_path(Path::new(&path)), Ok(k) if k == key) {
+        if !matches!(key_for_path(&fs_path(&path)), Ok(k) if k == key) {
             path_map.remove(&key);
             if let Some(wp) = watched_paths {
                 wp.lock().unenroll(key);
@@ -1656,7 +1755,7 @@ fn forget_if_gone(
     path_map: &InodePathMap,
     watched_paths: Option<&parking_lot::Mutex<WatchedPathsHandle>>,
 ) {
-    let now = key_for_path(Path::new(path));
+    let now = key_for_path(&fs_path(path));
     if matches!(now, Ok(k) if k == *key) {
         return;
     }
@@ -1920,7 +2019,7 @@ pub fn process_drift(
     // a file's. A directory is never hashed, so only an event without
     // content needs the look.
     if content.is_none() && !child_read {
-        ident.is_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+        ident.is_dir = std::fs::symlink_metadata(fs_path(&path)).is_ok_and(|m| m.is_dir());
     }
     let new_sha256 = content.as_ref().map(|c| c.sha256.clone());
     let new_size = content.as_ref().map(|c| c.size);
@@ -2129,7 +2228,7 @@ struct FileIdent {
 /// either.
 fn child_ident(child: &str, moved_in: bool, path_map: &InodePathMap) -> FileIdent {
     use std::os::unix::fs::MetadataExt;
-    let Ok(meta) = std::fs::symlink_metadata(child) else {
+    let Ok(meta) = std::fs::symlink_metadata(fs_path(child)) else {
         return FileIdent {
             key: None,
             is_dir: false,
@@ -2479,7 +2578,7 @@ fn content_after(path: &str, event_ns: u64) -> Option<Content> {
         }
     }
     let began_ns = monotonic_ns();
-    let content = match compute_baseline(Path::new(path)) {
+    let content = match compute_baseline(&fs_path(path)) {
         Ok(drafts) => drafts.into_iter().find(|d| !d.is_symlink).map(|d| Content {
             mode: parse_mode(&d.mode).unwrap_or(0),
             sha256: d.sha256,
@@ -2806,6 +2905,147 @@ mod tests {
         assert!(ev.path.starts_with(&format!("{dir_str}/")));
     }
 
+    fn raw_with_leaf(leaf: &[u8]) -> FimDriftRaw {
+        let mut raw = fake_raw(0x77, 7, FimOp::Created as u8);
+        raw.child_name[..leaf.len()].copy_from_slice(leaf);
+        raw
+    }
+
+    /// External audit NN-AUD-291 (FIMP-012): the leaf was decoded lossily
+    /// (U+FFFD), a name no file has. It is kept as bytes: a UTF-8 name is
+    /// itself (backslashes included), any other is spelled with `\xNN` and
+    /// `\\`, distinct names stay distinct, and the spelling leads back to
+    /// the bytes. An empty leaf, `.`, `..` and a slash are refused.
+    #[test]
+    fn reconstruct_child_path_rejects_dot_dot_and_keeps_raw_bytes() {
+        let child = |leaf: &[u8]| reconstruct_child_path("/etc/cron.d/", &raw_with_leaf(leaf));
+        for refused in [&b""[..], b".", b"..", b"a/b"] {
+            assert_eq!(child(refused), None, "{refused:?}");
+        }
+        assert_eq!(child(b"job").as_deref(), Some("/etc/cron.d/job"));
+        assert_eq!(
+            child(b"mnt-data\\x2dvol.mount").as_deref(),
+            Some("/etc/cron.d/mnt-data\\x2dvol.mount"),
+            "a UTF-8 name is itself"
+        );
+        assert_eq!(child(b"ev\xffil").as_deref(), Some("/etc/cron.d/ev\\xffil"));
+        assert_ne!(child(b"ev\xffil"), child(b"ev\xfeil"));
+        assert_eq!(
+            child(b"a\\\xc3").as_deref(),
+            Some("/etc/cron.d/a\\\\\\xc3"),
+            "a backslash in a name that is not UTF-8 is doubled"
+        );
+        for name in [&b"ev\xffil"[..], b"a\\\xc3", b"\xe2\x82", b"x\\xff\xff"] {
+            assert_eq!(
+                leaf_bytes(&leaf_display(name)).as_deref(),
+                Some(name),
+                "{name:?}"
+            );
+        }
+        // Text the escape did not produce is not decoded.
+        for text in [
+            "job",
+            "mnt-data\\x2dvol.mount",
+            "\\xc3\\xa9",
+            "a\\q",
+            "a\\x+f\\xff",
+        ] {
+            assert_eq!(leaf_bytes(text), None, "{text:?}");
+        }
+    }
+
+    /// External audit NN-AUD-291 (FIMP-012): a file dropped into a watched
+    /// directory under a name that is not UTF-8 is enrolled by its own
+    /// bytes, hashed, kept by the sweep of children gone, and its later
+    /// in-place edit is reported under the escaped name. On the code before,
+    /// the lossy path did not exist: no enrollment, no hash, no edit.
+    #[test]
+    fn a_child_with_a_non_utf8_name_is_watched_and_its_edit_reported() {
+        use sha2::Digest as _;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new().unwrap();
+        let signing = fresh_signing_key(&dir);
+        let mut drift_db = FimDriftDb::open(
+            &dir.path().join("drift.jsonl"),
+            signing,
+            [0u8; 16],
+            std::sync::Arc::new(crate::chainlog::NoProtection),
+            crate::chainlog::RotationConfig::default(),
+        )
+        .unwrap();
+        let watched_dir = dir.path().join("cron.d");
+        std::fs::create_dir(&watched_dir).unwrap();
+        let dir_str = watched_dir.to_string_lossy().into_owned();
+        let leaf = b"ev\xffil";
+        let file = watched_dir.join(std::ffi::OsStr::from_bytes(leaf));
+        std::fs::write(&file, b"* * * * * root true\n").unwrap();
+        let shown = format!("{dir_str}/ev\\xffil");
+
+        let dir_key = InodeKey { dev: 0x77, ino: 7 };
+        let path_map = InodePathMap::new();
+        path_map.insert(dir_key, dir_str.clone());
+        let classifier = DriftClassifier::new();
+        let rate_limiter = DriftRateLimiter::new();
+        let mut run = |raw: &FimDriftRaw| {
+            let mut out = Vec::new();
+            assert!(process_drift(
+                raw,
+                &path_map,
+                None,
+                &mut drift_db,
+                &classifier,
+                &rate_limiter,
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap());
+            match out.remove(0) {
+                Event::Fim(fe) => fe,
+                other => panic!("expected Event::Fim, got {other:?}"),
+            }
+        };
+        let sha = |bytes: &[u8]| -> [u8; 32] { sha2::Sha256::digest(bytes).into() };
+
+        let mut created = fake_raw(dir_key.dev, dir_key.ino, FimOp::Created as u8);
+        created.child_name[..leaf.len()].copy_from_slice(leaf);
+        let ev = run(&created);
+        assert_eq!(ev.path, shown);
+        assert_eq!(ev.op, FimOp::Created);
+        assert_eq!(
+            ev.new_sha256,
+            Some(sha(b"* * * * * root true\n")),
+            "hashed by its bytes"
+        );
+        let key = key_for_path(&file).unwrap();
+        assert_eq!(
+            path_map.lookup(&key).as_deref(),
+            Some(shown.as_str()),
+            "enrolled at once, not queued for a path that does not exist"
+        );
+
+        std::fs::write(&file, b"* * * * * root true\n* * * * * root id\n").unwrap();
+        let ev = run(&fake_raw(key.dev, key.ino, FimOp::Modified as u8));
+        assert_eq!(ev.path, shown);
+        assert_eq!(ev.op, FimOp::Modified);
+        assert_eq!(
+            ev.new_sha256,
+            Some(sha(b"* * * * * root true\n* * * * * root id\n"))
+        );
+        assert_eq!(
+            gc_runtime_children(&path_map, None),
+            0,
+            "a child still there is not swept"
+        );
+
+        // A UTF-8 file spelled like the escape is the one under that name.
+        let literal = watched_dir.join("ev\\xffil");
+        std::fs::write(&literal, b"x").unwrap();
+        assert_eq!(fs_path(&shown).as_ref(), literal.as_path());
+        std::fs::remove_file(&literal).unwrap();
+        assert_eq!(fs_path(&shown).as_ref(), file.as_path());
+    }
+
     /// Wave 2 (TST-004): `chmod u+s` on a watched file leaves its content
     /// as it was; the drain used to drop the event as a no-op touch. A
     /// mode or owner that differs from the baseline is drift of its own;
@@ -3078,6 +3318,27 @@ mod tests {
         for _ in 0..50 {
             rl.try_consume_with_now(DriftSeverity::Medium, t0).unwrap();
         }
+    }
+
+    /// External audit NN-AUD-293 (FIMP-014): a panic while the limiter's
+    /// lock was held poisoned the `std::sync::Mutex`, and every later drift
+    /// panicked at `.expect("… poisoned")` (with `panic = "abort"`, the
+    /// agent). The lock is a `parking_lot::Mutex`: released on the unwind,
+    /// never poisoned.
+    #[test]
+    fn rate_limiter_keeps_working_after_a_panic_under_its_lock() {
+        let rl = Arc::new(DriftRateLimiter::with_caps(2, 2));
+        let held = Arc::clone(&rl);
+        let died = std::thread::spawn(move || {
+            let _guard = held.state.lock();
+            panic!("a drain task dies holding the limiter (expected by this test)");
+        })
+        .join();
+        assert!(died.is_err());
+        rl.try_consume(DriftSeverity::High)
+            .expect("the limiter still answers");
+        let (high, medium, _) = rl.snapshot();
+        assert_eq!((high, medium), (1, 2));
     }
 
     // ── C4 test 6: FimDriftEntry serde round-trip with Q4 fields ───
