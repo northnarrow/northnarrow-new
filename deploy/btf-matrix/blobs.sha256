@@ -1,0 +1,19 @@
+# The BTFHub blobs deploy/btf-matrix/run.sh checks (external audit SUP-014).
+#
+#   ref <commit of aquasecurity/btfhub-archive the blobs are downloaded at>
+#   <distro/version> <archive name> <sha256 of the archive>
+#
+# The newest non-cloud kernel of each distro/version of expected.tsv at
+# that commit. Written by `deploy/btf-matrix/run.sh --refresh [COMMIT]`:
+# a bump is a PR that replaces this file, and the BTF matrix workflow
+# checks the new blobs on it. Never edit a digest by hand.
+ref ed9772c5dd129eb20a9a870da55e11cfcbbe8c79
+ubuntu/20.04 5.8.0-63-generic.btf.tar.xz d00037ea649e2ac209267619c88dceecc31f5bbf4ef9f2d139dddeabc2c0f2a6
+ubuntu/18.04 5.4.0-91-generic.btf.tar.xz 0f819370fc42469c85bbc26f29fa183992b1bd2eac2298c39119568488fad1aa
+centos/8 4.18.0-147.el8.x86_64.btf.tar.xz 88c227f1707b4103c26e0f927d30b528a60599d7c77a4b5c1b99687841b329a7
+rhel/8 4.18.0-147.el8.x86_64.btf.tar.xz b1c92bca2bf4a9974f3c6e7d81a59c503bce1341a83f176ea651ac8edb2571aa
+ol/8 5.4.17-2122.el8uek.x86_64.btf.tar.xz 3fbbd34c25d87896fc671f144930e0232975042334e123c9ca4d3d6c47c49948
+amzn/2 4.14.355-287.753.amzn2.x86_64.btf.tar.xz a1806553d2e91a213cedc9652ad46bbe7d46a20f0a21849c5b0a25fde1ba8d16
+fedora/31 5.3.7-301.fc31.x86_64.btf.tar.xz 4cdf89272ff3cc6390e35010250078e0f7f6c960641d6eb190a82ba52057f5a3
+sles/15.3 5.3.18-150300.59.87-default.btf.tar.xz 745e3892959b3b7c549f1663e3295a5de9732c78fcfaf32434ea0dfd584fd4fa
+centos/7 5.4.28-200.el7.x86_64.btf.tar.xz 67ed4dc0a63f332855262907509b6d80a3732a492e08ae791cdb82ebc2334259

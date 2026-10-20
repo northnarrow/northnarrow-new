@@ -67,6 +67,40 @@ fonde.
   `security_crates_are_locked_alike_for_the_fuzzer`) va applicato sia a
   `Cargo.lock` sia a `fuzz/Cargo.lock`, e il job fuzz deve compilare.
 
+## Rilasci (audit esterno SUP-024)
+
+- Un rilascio parte solo da un tag `v*` annotato e firmato con una chiave
+  SSH elencata in `.github/allowed_signers` (formato "allowed signers" di
+  `ssh-keygen`, `namespaces="git"`). Il job `verify-tag` di `release.yml`
+  lo controlla prima di qualsiasi build
+  (`.github/scripts/verify-release-tag.sh`): un tag leggero, non firmato,
+  firmato con OpenPGP o con una chiave non elencata, rinominato o che non
+  punta al commit compilato si ferma lì, e non viene compilato, firmato,
+  attestato né pubblicato nulla. Finché il file non elenca nessuna chiave,
+  ogni tag si ferma lì: aggiungere la propria chiave pubblica è il primo
+  passo del maintainer.
+- Firmare e controllare un tag prima del push (con `.pub` la chiave privata
+  sta nell'ssh-agent; in alternativa il percorso della chiave privata):
+
+  ```sh
+  git -c gpg.format=ssh -c user.signingkey="$HOME/.ssh/<chiave>.pub" tag -s vX.Y.Z -m "vX.Y.Z"
+  git -c gpg.ssh.allowedSignersFile=.github/allowed_signers verify-tag vX.Y.Z
+  .github/scripts/verify-release-tag.sh verify vX.Y.Z "$(git rev-parse 'vX.Y.Z^{commit}')"
+  ```
+
+- Aggiungere, ruotare o revocare una chiave è una PR su
+  `.github/allowed_signers`; conta la lista committata nel commit taggato.
+  Ruotando, la vecchia chiave resta con `valid-before="AAAAMMGG"`, così i
+  tag precedenti si verificano ancora; una chiave compromessa si toglie.
+  Le firme dei commit non sono richieste.
+- La pubblicazione (job `publish`, l'unico con `contents: write`) non
+  sostituisce mai un asset già pubblicato: se la release ha già degli
+  asset il job fallisce. Per ripubblicare, il maintainer cancella prima la
+  release (`gh release delete vX.Y.Z`, il tag resta) e rilancia il job.
+- Revisione obbligatoria da una seconda persona (CODEOWNERS): rinviata
+  finché c'è un solo maintainer, perché GitHub non permette di approvare
+  le proprie PR e bloccherebbe ogni merge.
+
 ## Stile
 
 - 100% Rust. No C/C++ in produzione (vedi VISION_TECHNICAL.md, regola 1).

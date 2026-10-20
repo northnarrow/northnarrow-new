@@ -6,7 +6,9 @@ name: release
 # (deploy/release/mk-packages.sh), emits a CycloneDX SBOM and SHA256SUMS,
 # signs the .rpm on a tag, attaches a SLSA build-provenance attestation to
 # every artefact and, on a tag push, uploads everything to the GitHub
-# release. Verify (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5):
+# release — only from a tag signed with a key of .github/allowed_signers,
+# and never over an asset already published. Verify
+# (docs/operator/INSTALL_UPGRADE_UNINSTALL.md §5):
 #   gh attestation verify <file> --repo northnarrow/northnarrow-new \
 #     --cert-identity-regex '^https://github\.com/northnarrow/northnarrow-new/\.github/workflows/release\.yml@refs/tags/v' \
 #     --deny-self-hosted-runners
@@ -24,8 +26,16 @@ name: release
 # read-only token, not persisted in .git/config, and no OIDC token.
 # `rpm-sign` (tags only) holds the rpm signing key and compiles nothing;
 # `sign` holds the OIDC token, compiles nothing and checks nothing out: it
-# downloads the artefacts, attests them and, on a tag, publishes them. The
-# signing key and the OIDC token never share a job.
+# downloads the artefacts and attests them. The signing key and the OIDC
+# token never share a job.
+#
+# External audit SUP-024: on a tag, `verify-tag` runs first and `package`
+# waits for it: the tag must be annotated, name itself, point to the commit
+# built, and carry an SSH signature by a key of .github/allowed_signers
+# (.github/scripts/verify-release-tag.sh). Until the maintainer lists a key
+# there, every tag stops at verify-tag. `publish` (tags only) is the one job
+# with `contents: write`; it holds no OIDC token and no key, and fails
+# rather than replace an asset already published (no --clobber).
 #
 # External audit SUP-002: every action is pinned by commit SHA (the
 # version in the comment); Dependabot (github-actions) proposes updates.
@@ -44,8 +54,41 @@ permissions:
   contents: read
 
 jobs:
+  # External audit SUP-024: who may start a release is decided by the tag's
+  # signature, before any build. The list is the one committed at the
+  # tagged commit; adding a key is a reviewed PR (CONTRIBUTING.md). The job
+  # compiles nothing, so its read-only checkout is all it holds.
+  verify-tag:
+    name: verify the tag signature (tag only)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The tag is signed by a key of .github/allowed_signers
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # actions/checkout leaves a lightweight tag at the commit
+          # (actions/checkout#290): fetch the tag object as pushed. The
+          # repository is public, so no token is needed for it.
+          git fetch --no-tags --force --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"
+          .github/scripts/verify-release-tag.sh verify "$TAG" "$GITHUB_SHA"
+
   package:
     name: package (x86_64-linux)
+    needs: verify-tag
+    # A tag is built only once verify-tag accepted it; on a pull request or
+    # a branch dispatch verify-tag is skipped and the build runs.
+    if: >-
+      !cancelled()
+      && (needs.verify-tag.result == 'success'
+      || (needs.verify-tag.result == 'skipped' && !startsWith(github.ref, 'refs/tags/v')))
     # A fixed image, not ubuntu-latest: the image is the release's build
     # environment (glibc, linker, C toolchain of the -sys crates). When
     # ubuntu-latest began moving to 26.04 (2026-10-20) the same tree built
@@ -332,7 +375,7 @@ jobs:
           if-no-files-found: error
 
   sign:
-    name: attest + publish
+    name: attest
     needs: [package, rpm-sign]
     # A pull request is a dry run: nothing is attested or published. On a
     # tag the .rpm must have been signed (rpm-sign succeeded); on a
@@ -345,7 +388,7 @@ jobs:
       || (needs.rpm-sign.result == 'skipped' && !startsWith(github.ref, 'refs/tags/v')))
     runs-on: ubuntu-latest
     permissions:
-      contents: write        # upload release assets on a tag
+      contents: read         # SUP-024: publishing is the publish job's
       id-token: write        # sign the provenance attestation (OIDC)
       attestations: write
     steps:
@@ -372,12 +415,53 @@ jobs:
             dist/*.rpm
             dist/*.sbom.cdx.json
 
-      - name: Publish to the GitHub release (tag only)
-        if: startsWith(github.ref, 'refs/tags/v')
+  # External audit SUP-024: the only job that writes to the repository. Tags
+  # only, after verify-tag and sign, in the release-signing environment
+  # (restricted by the maintainer to v* tags); no OIDC token, no key, no
+  # checkout, no build. It publishes the artefacts sign attested and never
+  # replaces one: a release that already has assets fails the job, and an
+  # upload never overwrites a name (no --clobber). Publishing again is an
+  # explicit step of the maintainer: delete the release, re-run the job.
+  publish:
+    name: publish (tag only)
+    needs: [verify-tag, sign]
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      && needs.verify-tag.result == 'success' && needs.sign.result == 'success'
+    runs-on: ubuntu-latest
+    environment: release-signing
+    permissions:
+      contents: write        # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: northnarrow-release-signed-${{ github.sha }}
+          path: dist
+
+      - name: Checksums match (the files sign attested)
+        run: |
+          cd dist && sha256sum -c SHA256SUMS
+          if [ ! -s RPM-GPG-KEY-northnarrow.asc ]; then
+            echo "::error::a tag release without the signed .rpm"; exit 1
+          fi
+
+      - name: Publish to the GitHub release (never over a published asset)
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
-          tag=${GITHUB_REF#refs/tags/}
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --generate-notes
-          gh release upload "$tag" dist/* --clobber
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            assets=$(gh release view "$TAG" --json assets --jq '.assets | length')
+            if [ "$assets" != 0 ]; then
+              echo "::error::release $TAG already has $assets asset(s); a published asset is never replaced. To publish again, the maintainer deletes the release (gh release delete $TAG; the tag stays) and re-runs this job."
+              exit 1
+            fi
+          else
+            # a draft until every asset is up: a failed upload leaves no
+            # half-filled public release (and fits immutable releases)
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/*
+          gh release edit "$TAG" --draft=false

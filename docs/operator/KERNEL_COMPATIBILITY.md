@@ -174,8 +174,20 @@ without root and without loading any eBPF program. Exit 0 = SUPPORTED
 archive (newest non-cloud kernel per distro/version) and compares it with
 `deploy/btf-matrix/expected.tsv`; the `BTF matrix` workflow runs it on
 every PR touching the offset tables or the resolver, weekly, and on
-demand, and fails on a verdict worse than the baseline or on a BTF the
-parser cannot read. BTFHub archives only kernels shipped **without**
+demand, and fails on a verdict worse than the baseline, on a BTF the
+parser cannot read, or on a distro/version of the baseline left without
+a blob (external audit SUP-013). The blobs are pinned (SUP-014):
+`deploy/btf-matrix/blobs.sha256` names the archive commit and the sha256
+of each archive; the run downloads them at that commit, refuses one that
+does not match (a cached copy included) or that holds anything but
+`<kernel>.btf`, and calls no GitHub API, so it needs no token (SUP-021).
+The trade-off: a kernel archived after the pin reaches the weekly run
+through a bump PR — `deploy/btf-matrix/run.sh --refresh` lists the
+archive at its current head, checks the new blobs and prints the new
+`blobs.sha256` — not by itself. The pin of 2026-10-20 is
+`aquasecurity/btfhub-archive@ed9772c5dd12`, and gives the BTFHub rows
+below. `deploy/btf-matrix/run-test.sh` tests the script offline. BTFHub
+archives only kernels shipped **without**
 native BTF, so the lab guests (table above) cover 5.14, 5.15, 6.1, 6.8
 and, with the Debian 13 guest, 6.12.
 

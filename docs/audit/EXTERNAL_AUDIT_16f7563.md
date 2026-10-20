@@ -609,17 +609,17 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-395 | SUP-009 | Low | Supply chain | S | fixed (lab PR 183) |
 | NN-AUD-396 | SUP-010 | Low | Supply chain | S | fixed (lab PR 183) |
 | NN-AUD-397 | SUP-012 | Low | Supply chain | S | fixed (lab PR 171) |
-| NN-AUD-398 | SUP-013 | Low | Supply chain | S | open |
-| NN-AUD-399 | SUP-014 | Low | Supply chain | M | open |
+| NN-AUD-398 | SUP-013 | Low | Supply chain | S | fixed (lab PR 210) |
+| NN-AUD-399 | SUP-014 | Low | Supply chain | M | fixed (lab PR 210) |
 | NN-AUD-400 | SUP-015 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-401 | SUP-016 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-402 | SUP-018 | Low | Supply chain | M | fixed (lab PR 200) |
 | NN-AUD-403 | SUP-019 | Low | Supply chain | S (docs) | fixed (lab PR 209) |
 | NN-AUD-404 | SUP-020 | Low | Supply chain | S-M (docs) | partly fixed (lab PR 209; the second encrypted channel and the 24-hour drill are the maintainer's); open |
-| NN-AUD-405 | SUP-021 | Low | Supply chain | S | open |
+| NN-AUD-405 | SUP-021 | Low | Supply chain | S | fixed (lab PR 210) |
 | NN-AUD-406 | SUP-022 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-407 | SUP-023 | Low | Supply chain | S | fixed (lab PR 200) |
-| NN-AUD-408 | SUP-024 | Low | Supply chain | M | partly fixed (lab PR 150; two-person review declined for now); open |
+| NN-AUD-408 | SUP-024 | Low | Supply chain | M | partly fixed (lab PRs 150/210; tag verification waits for the maintainer's key in `allowed_signers`; two-person review declined for now); open |
 | NN-AUD-409 | LAB-019 | Low | Lab scripts | S | open |
 | NN-AUD-410 | LAB-020 | Low | Lab scripts | S | fixed (lab PR 206) |
 | NN-AUD-411 | LAB-021 | Low | Lab scripts | — | obsolete (verify-2b.sh deleted, lab PR 153) |
@@ -9893,3 +9893,116 @@ group, the ones an unprivileged user or a local attacker could use first.
     `/proc/cmdline`, `CONFIG_LSM` and running lists (Ubuntu 24.04, an el9
     `lsm=`, a list without `selinux`, which prints MISSING).
   - Lab: The "Enabling the `bpf` LSM" procedure run as written on Ubuntu 22.04 (5.15) booted without an `lsm=`: the new list came from `CONFIG_LSM` plus `bpf` (`landlock,lockdown,yama,integrity,apparmor,bpf`, no MISSING), the drop-in path was taken, `update-grub` wrote that one value on all three entries; after the reboot `bpf` was active, the diff of the lists was `> bpf` only, AppArmor stayed enabled (37 profiles) and `nn-admin host-check` said OK; the lab's own drop-in was then put back. Not run on an AlmaLinux 9 guest. The document tests run in `cargo test --workspace`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.
+- **Wave 3 — BTF matrix downloads and release governance, lab PR 210.**
+  NN-AUD-398 (SUP-013), NN-AUD-399 (SUP-014), NN-AUD-405 (SUP-021) and the
+  versioned part of NN-AUD-408 (SUP-024), all Low: batches 4 and 2 of the
+  Wave 3 triage of group G2, on the integration tree (`main` with lots up
+  to 199, and lots 200–207). Files: `deploy/btf-matrix/run.sh`,
+  `blobs.sha256` and `run-test.sh` (new), `.github/workflows/btf-matrix.yml`,
+  `.github/workflows/release.yml`, `.github/scripts/verify-release-tag.sh`
+  and `.github/allowed_signers` (new), `CONTRIBUTING.md`,
+  `docs/operator/KERNEL_COMPATIBILITY.md`, the upgrade notes §9,
+  `xtask/tests/supply_chain.rs`.
+  - SUP-014 (399, fixed). Re-checked: names from the API listing of `main`,
+    downloads from `raw/main`, `tar -xJf` with no member check, a cached
+    `.btf` never checked again, the cache restored from any `btfhub-blobs-`
+    key. Now `blobs.sha256` pins `ref ed9772c5dd129eb20a9a870da55e11cfcbbe8c79`
+    (the archive's head, 2026-10-01) and the sha256 of nine archives — the
+    kernels the weekly run already picked; each download also matched the
+    git blob id of its listing entry. A download goes to a temp directory,
+    is checked, then moved into the cache; a cached archive is checked at
+    every run (mismatch: deleted, downloaded again); `curl --proto =https
+    --max-filesize 64M`. The archive must list exactly `<kernel>.btf`, a
+    regular file, read with `tar -xJOf` (1 B to 512 MiB). `--refresh
+    [COMMIT]` (default: the head, resolved with `Accept:
+    application/vnd.github.sha`) accepts only names matching
+    `^[A-Za-z0-9][A-Za-z0-9._+-]*\.btf\.tar\.xz$`, checks the new blobs the
+    same way, writes their matrix and prints a new pin file; it never fills
+    the cache. Cache key `btfhub-blobs-v2-<hashFiles(blobs.sha256)>`, no
+    restore key. Bump trade-off stated in the script, the workflow and
+    KERNEL_COMPATIBILITY.md.
+  - SUP-013 (398, fixed): a baseline label without a pin (normal run) or
+    without a blob in the listing (refresh) gives `**REGRESSION** (baseline
+    <verdict>, no blob found)` and exit 1; `n/a` stays for labels without a
+    baseline.
+  - SUP-021 (405, fixed): the matrix step gets no `GH_TOKEN`/`GITHUB_TOKEN`
+    (it calls no API). `--refresh` through curl sends the token with
+    `-H @<(printf …)`, through `gh` with gh's own token.
+  - SUP-024 (408, versioned part fixed; stays open until the maintainer's
+    key is listed). `verify-tag` (tags only, `contents: read`, no secret)
+    re-fetches the tag object (actions/checkout leaves a lightweight tag)
+    and runs `verify-release-tag.sh verify "$TAG" "$GITHUB_SHA"`: an
+    annotated tag, whose object names it, pointing to the commit built,
+    with an SSH signature `git verify-tag` accepts against the
+    `allowed_signers` of the tagged commit (namespace `git`, validity at
+    the tag's date); an empty list refuses every tag. `package` needs it
+    (skipped is accepted only off a tag), so every later job depends on it.
+    `sign` keeps `contents: read`, `id-token`, `attestations`; the new
+    `publish` (tags only, `release-signing`, `contents: write` alone, no
+    checkout) checks `SHA256SUMS`, fails on a release that already has
+    assets, creates a draft with `--verify-tag`, uploads without
+    `--clobber`, then publishes the draft. CONTRIBUTING.md "Rilasci":
+    signing, checking, rotation (`valid-before`), re-publishing.
+    `.github/allowed_signers` holds the format and instructions and **no
+    key**: none was in the repository, none was made up. Declined as in
+    the triage: CODEOWNERS with required review (one maintainer).
+  - Choices. The distro/version list comes from `expected.tsv` (the
+    `KERNELS` array is gone): one list, and the label set the tests
+    control. One digest per archive: the cache keeps the archive, not the
+    `.btf`, and the BTF is read again from the checked archive at every
+    run, so one digest covers the download and the cache. `tar -O` rather
+    than `--no-same-owner --no-same-permissions`: nothing from the
+    archive's metadata reaches the disk. SSH signatures only: git's own
+    allowed-signers check, one committed file is the whole policy, no
+    keyring on the runner (a hardware key works). `publish` in
+    `release-signing` rather than a new environment: its `v*` restriction
+    and any reviewers apply to publishing, with no new setting. Draft,
+    upload, publish: a failed upload leaves no half-filled public release,
+    and the flow fits GitHub's immutable releases. Limit, stated in the
+    check notes: a tag runs the release.yml committed at the tag, so
+    verify-tag stops an unsigned tag on existing history and a mistake;
+    against someone able to push a commit with another release.yml, the
+    protections remain the `v*` tag ruleset and the environment (§9).
+  - Tests (`xtask/tests/supply_chain.rs`):
+    `btf_matrix_blobs_are_pinned_by_commit_and_digest`,
+    `btf_matrix_sends_no_token_on_a_command_line`,
+    `btf_matrix_cache_is_keyed_by_the_pins`,
+    `btf_matrix_script_passes_its_offline_tests` (runs `run-test.sh`: 11
+    cases — pinned blobs and cache reuse; a mismatched download refused,
+    nothing cached, the agent never called; a tampered cached archive
+    replaced; a baseline without a pin; a failed download; nine malformed
+    pin files (`../`, `x/../../`, a hidden name, short digest, extra
+    column, duplicate, `ref main`, no ref, bad label) refused before any
+    download; seven bad archives (`../<kernel>.btf`, `sub/`, two members,
+    a symlink, another name, not xz, empty) refused with nothing written;
+    a refresh whose listing has only cloud names, three odd names ignored;
+    refresh round trip at the head; the sentinel token in no argv, through
+    curl and gh; a failed listing),
+    `tag_signature_is_verified_before_package`,
+    `release_publish_does_not_clobber`,
+    `no_job_holds_contents_write_and_id_token`,
+    `allowed_signers_lists_only_git_namespaced_ssh_keys`,
+    `release_tag_check_accepts_only_listed_signers` (the selftest: 13
+    cases; with the committed list empty, a real `verify` refuses with
+    "lists no key"); `every_workflow_token_is_read_only_unless_it_publishes`
+    updated (`publish` writes contents, `sign` attestations). On the
+    starting tree the nine new tests and the updated one fail. The old
+    `run.sh`, driven with stubs, gives exit 0 with nine `n/a` rows for a
+    listing of only `*-azure` names, puts the sentinel token in curl's argv
+    nine times, and takes an arbitrary archive from `raw/main` into the
+    cache and a tampered cached `.btf` without a download or a check.
+    Eight mutants of `run.sh` (digest check off, SUP-013 row off, token back
+    in argv, member check off, file-type check off, name filter off, cache
+    check off, `main` instead of the commit) each fail `run-test.sh`.
+  - Host: `cargo fmt`; clippy `--workspace --exclude northnarrow-agent-ebpf
+    --all-targets` clean; the `posture_demo` clippy fails on the starting
+    tree as well (E0063: `argv_truncated`, `filename_truncated` missing in
+    `agent/examples/posture_demo.rs`, from lot `nn-wt-kernfid`), not
+    touched here; `cargo test --workspace` 2,716 passed, 0 failed (9 new).
+    `run.sh --refresh` at the pinned commit, against a local copy of the
+    real archive (listing and nine archives) with this tree's agent,
+    printed the committed `blobs.sha256`, nine rows as expected; one real
+    run (nine downloads at the commit, no API call, no token): exit 0, nine
+    as expected, nine checked archives and no `.btf` in the cache.
+    actionlint and shellcheck are not installed on this host.
+  - Lab: No lab guest needed: `deploy/btf-matrix/run-test.sh` (11 offline cases with stubbed curl, gh and agent) and `verify-release-tag.sh selftest` (13 cases on throw-away keys) run in the tests; the BTF matrix dispatch and a tag run happen in CI after the merge, and every tag stops at `verify-tag` until the maintainer's tag-signing key is in `.github/allowed_signers`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.
