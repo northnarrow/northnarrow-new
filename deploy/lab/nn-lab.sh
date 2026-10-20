@@ -32,6 +32,8 @@
 #   NN_LAB_DISTRO=debian12 deploy/lab/nn-lab.sh up   # second guest (Debian 12, kernel 6.1); every
 #                                                    # sub-command honours NN_LAB_DISTRO (default ubuntu2404;
 #                                                    # also debian13 = 6.12, ubuntu2204 = 5.15, alma9 = 5.14 el9)
+#   NN_LAB_LOCKDOWN=integrity deploy/lab/nn-lab.sh up  # a separate guest of NN_LAB_DISTRO booted with
+#                                                    # lockdown=integrity (anti-tamper C27; ssh port +1000)
 #   deploy/lab/nn-lab.sh upgrade-check    # install.sh --upgrade on the running install (keys/chains kept)
 #   deploy/lab/nn-lab.sh uninstall-check  # uninstall.sh --purge leaves nothing, then reinstall
 #   deploy/lab/nn-lab.sh tamper-check     # adversarial anti-tamper cases: outcome + chain-log evidence per case
@@ -52,7 +54,9 @@
 #   deploy/lab/nn-lab.sh snapshot NAME | restore NAME   (guest must be down)
 #   deploy/lab/nn-lab.sh status | down | destroy
 #   deploy/lab/nn-lab.sh verify-image  # base image vs its verified download or the vendor's signed lists
-#   deploy/lab/nn-lab.sh nightly       # unattended full run → $LAB_DIR/reports/<stamp>.md (exit 1 on any failure)
+#   deploy/lab/nn-lab.sh nightly       # unattended full run, the security checks included (tamper-check,
+#                                      # pkgmgr-, open-sensor-, fim-reuse-, btrfs-, overlay-check)
+#                                      # → $LAB_DIR/reports/<stamp>.md (exit 1 on any failure)
 #   deploy/lab/nn-lab.sh soak start [HOURS] [INTERVAL_S] | status | stop | wait | report
 #                                      # hours of synthetic load + resource samples → $LAB_DIR/reports/soak-<stamp>.md
 #
@@ -62,7 +66,8 @@
 #   NN_LAB_DIR (~/.cache/nn-lab), NN_LAB_CPUS (4), NN_LAB_MEM (8192),
 #   NN_LAB_SSH_PORT (2222, remembered after `up`), NN_LAB_DISK (30G), NN_LAB_LTO (thin),
 #   NN_REPO (git toplevel of this script), NN_LAB_NIGHTLY_DOWN=1 (power the guest off at the end),
-#   NN_LAB_NIGHTLY_SKIP (space-separated steps to skip, e.g. "test-ignored").
+#   NN_LAB_NIGHTLY_SKIP (space-separated steps to skip, e.g. "test-ignored"),
+#   NN_LAB_LOCKDOWN (integrity: the lockdown guest of the distro, above).
 set -euo pipefail
 
 # cron / Task Scheduler invocations come with a minimal PATH: make sure
@@ -120,11 +125,33 @@ case "$DISTRO" in
         LAB_DIR="$ROOT_LAB_DIR/alma9" ;;
     *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12 | debian13 | ubuntu2204 | alma9)" >&2; exit 2 ;;
 esac
+# The base image stays with the distro: a lockdown guest is layered on it.
+IMG_DIR=$LAB_DIR
+# External audit LAB-024 (NN-AUD-414, lab PR 206): no guest set lockdown=,
+# so the anti-tamper suite's C27 (an unsigned module refused by the kernel)
+# never ran. NN_LAB_LOCKDOWN=integrity gives a separate guest of the distro
+# — its own disk, seed, ssh port (the distro's + 1000) and reports under
+# $ROOT_LAB_DIR/<distro>-lockdown-integrity/ — booted with
+# lockdown=integrity added to the template's lsm= line (__NN_LAB_KARGS__);
+# `check` fails when the running kernel is not locked down. confidentiality
+# is not offered: it closes BPF reads of kernel memory, which the sensors use.
+LOCKDOWN=${NN_LAB_LOCKDOWN:-}
+case "$LOCKDOWN" in
+    "" | none) LOCKDOWN= ;;
+    integrity) ;;
+    *) echo "nn-lab: unknown NN_LAB_LOCKDOWN=$LOCKDOWN (integrity, or unset)" >&2; exit 2 ;;
+esac
+GUEST_NAME=$DISTRO
+if [[ -n $LOCKDOWN ]]; then
+    GUEST_NAME="$DISTRO-lockdown-$LOCKDOWN"
+    LAB_DIR="$ROOT_LAB_DIR/$GUEST_NAME"
+    DEFAULT_SSH_PORT=$((DEFAULT_SSH_PORT + 1000))
+fi
 # The ssh port is remembered in $LAB_DIR/ssh_port after `up`, so every
 # later sub-command talks to the same guest without re-exporting it.
 SSH_PORT=${NN_LAB_SSH_PORT:-$(cat "$LAB_DIR/ssh_port" 2>/dev/null || echo "$DEFAULT_SSH_PORT")}
 
-BASE_IMG="$LAB_DIR/$BASE_IMG_NAME"
+BASE_IMG="$IMG_DIR/$BASE_IMG_NAME"
 DISK="$LAB_DIR/disk.qcow2"
 SEED="$LAB_DIR/seed.iso"
 KEY="$ROOT_LAB_DIR/id_ed25519"
@@ -142,6 +169,19 @@ source "$SCRIPT_DIR/lib/verify-download.sh"
 # External audit NN-AUD-421: test-e2e counts each suite (nnsc_*).
 # shellcheck source=deploy/lab/lib/suite-count.sh
 source "$SCRIPT_DIR/lib/suite-count.sh"
+
+# >>> render-user-data (xtask/tests/lab_scripts.rs runs this block)
+# The guest's cloud-init user-data from its template: the lab key, and the
+# kernel arguments added to the template's lsm= line (__NN_LAB_KARGS__:
+# lockdown=, lab PR 206). A template without the placeholder would boot a
+# guest that is not locked down under a lockdown guest's name: refused.
+render_user_data() {   # <out>
+    local kargs=${LOCKDOWN:+ lockdown=$LOCKDOWN}
+    grep -q 'lsm=[^"]*__NN_LAB_KARGS__"' "$USER_DATA_TMPL" || die "$USER_DATA_TMPL has no __NN_LAB_KARGS__ at the end of its lsm= line"
+    sed -e "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" -e "s|__NN_LAB_KARGS__|$kargs|" "$USER_DATA_TMPL" > "$1"
+    if grep -q '__[A-Z_]*__' "$1"; then die "$1: a template placeholder is left: $(grep -o '__[A-Z_]*__' "$1" | head -1)"; fi
+}
+# <<< render-user-data
 
 need_host_deps() {
     local missing=()
@@ -176,9 +216,9 @@ vm_running() {
 WIN_LAB_DIR=${NN_LAB_WIN_DIR:-'C:\nn-lab'}
 WIN_QEMU=${NN_LAB_WIN_QEMU:-'C:\Program Files\qemu\qemu-system-x86_64w.exe'}
 WIN_QEMU_IMG=${NN_LAB_WIN_QEMU_IMG:-'C:\Program Files\qemu\qemu-img.exe'}
-FWD_UNIT="nn-fwd-$DISTRO"
+FWD_UNIT="nn-fwd-$GUEST_NAME"
 
-whpx_dir_win() { printf '%s\\%s' "$WIN_LAB_DIR" "$DISTRO"; }
+whpx_dir_win() { printf '%s\\%s' "$WIN_LAB_DIR" "$GUEST_NAME"; }
 whpx_dir() { wslpath -u "$(whpx_dir_win)"; }
 # A Windows program, from a Windows working directory (a WSL one makes it
 # warn about UNC paths); a user unit has no interop dirs on PATH.
@@ -227,8 +267,8 @@ whpx_up() {
     fi
     if [[ ! -f "$dir/seed.iso" || $fresh == 1 ]]; then
         local ud="$LAB_DIR/user-data" md="$LAB_DIR/meta-data"
-        sed "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" "$USER_DATA_TMPL" > "$ud"
-        printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$DISTRO" "$(date +%s)" "$DISTRO" > "$md"
+        render_user_data "$ud"
+        printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$GUEST_NAME" "$(date +%s)" "$GUEST_NAME" > "$md"
         cloud-localds "$dir/seed.iso" "$ud" "$md"
     fi
     echo "$SSH_PORT" > "$LAB_DIR/ssh_port"
@@ -245,7 +285,7 @@ EOF
     if whpx_qemu_running; then
         log "already running (QEMU for Windows pid $(whpx_pid))"
     else
-        log "booting $DISTRO (whpx): ${CPUS} vCPU, ${MEM} MiB, ssh → $h:$SSH_PORT → 127.0.0.1:$SSH_PORT"
+        log "booting $GUEST_NAME (whpx): ${CPUS} vCPU, ${MEM} MiB, ssh → $h:$SSH_PORT → 127.0.0.1:$SSH_PORT"
         whpx_launch
     fi
     whpx_forward
@@ -289,8 +329,10 @@ wait_ssh() {
             whpx_launch
         fi
         if vssh -o BatchMode=yes true 2>/dev/null; then
-            # Provisioning done AND we are past the reboot (lsm=bpf active)?
-            if vssh 'test -f /var/lib/nn-lab-provisioned && grep -q bpf /sys/kernel/security/lsm' 2>/dev/null; then
+            # Provisioning done AND we are past the reboot (lsm=bpf active;
+            # on a lockdown guest, the lockdown too: Debian's first boot
+            # already lists bpf)?
+            if vssh "test -f /var/lib/nn-lab-provisioned && grep -q bpf /sys/kernel/security/lsm${LOCKDOWN:+ && grep -q '\\[$LOCKDOWN\\]' /sys/kernel/security/lockdown}" 2>/dev/null; then
                 log "guest is up and provisioned"
                 return 0
             fi
@@ -322,8 +364,8 @@ cmd_up() {
     fi
     if [[ ! -f "$SEED" || $fresh == 1 ]]; then
         local ud="$LAB_DIR/user-data" md="$LAB_DIR/meta-data"
-        sed "s|__SSH_PUBKEY__|$(cat "$KEY.pub")|" "$USER_DATA_TMPL" > "$ud"
-        printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$DISTRO" "$(date +%s)" "$DISTRO" > "$md"
+        render_user_data "$ud"
+        printf 'instance-id: nn-lab-%s-%s\nlocal-hostname: nn-lab-%s\n' "$GUEST_NAME" "$(date +%s)" "$GUEST_NAME" > "$md"
         cloud-localds "$SEED" "$ud" "$md"
     fi
     if ss -ltn 2>/dev/null | grep -qE "[:.]${SSH_PORT}\b"; then
@@ -332,7 +374,7 @@ cmd_up() {
     echo "$SSH_PORT" > "$LAB_DIR/ssh_port"
     local accel_args=(-enable-kvm -machine q35,accel=kvm -cpu host)
     [[ $ACCEL == tcg ]] && accel_args=(-machine q35 -accel tcg,thread=multi,tb-size=1024 -cpu max)
-    log "booting $DISTRO ($ACCEL): ${CPUS} vCPU, ${MEM} MiB, ssh → 127.0.0.1:$SSH_PORT"
+    log "booting $GUEST_NAME ($ACCEL): ${CPUS} vCPU, ${MEM} MiB, ssh → 127.0.0.1:$SSH_PORT"
     qemu-system-x86_64 \
         "${accel_args[@]}" -smp "$CPUS" -m "$MEM" \
         -drive "file=$DISK,if=virtio,format=qcow2" \
@@ -350,12 +392,22 @@ cmd_up() {
 
 cmd_check() {
     vm_running || die "guest is not running (nn-lab.sh up)"
-    vssh bash -s <<'REMOTE'
+    vssh "NN_WANT_LOCKDOWN=$LOCKDOWN bash -s" <<'REMOTE'
 set -e
 export PATH="$PATH:/usr/sbin:/sbin"
 echo "kernel      : $(uname -r)"
 echo "lsm         : $(cat /sys/kernel/security/lsm)"
 grep -q '\bbpf\b' /sys/kernel/security/lsm && echo "bpf-lsm     : OK" || { echo "bpf-lsm     : MISSING"; exit 1; }
+# lab PR 206: a NN_LAB_LOCKDOWN guest that is not locked down would turn the
+# anti-tamper suite's C27 into a known gap under the lockdown guest's name
+ld=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo "not available")
+echo "lockdown    : $ld"
+if [ -n "${NN_WANT_LOCKDOWN:-}" ]; then
+    case "$ld" in
+        *"[$NN_WANT_LOCKDOWN]"*) echo "lockdown    : OK ($NN_WANT_LOCKDOWN, NN_LAB_LOCKDOWN guest)" ;;
+        *) echo "lockdown    : NOT $NN_WANT_LOCKDOWN on a NN_LAB_LOCKDOWN guest"; exit 1 ;;
+    esac
+fi
 mount | grep -q ' /sys/fs/bpf ' && echo "bpffs       : mounted" || echo "bpffs       : NOT mounted"
 command -v iptables-restore >/dev/null && echo "iptables    : $(iptables --version)" || { echo "iptables    : MISSING"; exit 1; }
 command -v nft >/dev/null && echo "nft         : $(nft --version 2>/dev/null)" || echo "nft         : MISSING (install.sh refuses; nn-lab.sh install provisions it)"
@@ -819,7 +871,10 @@ cmd_pkgmgr_check() {
     # 0, the package database is consistent, and no destructive verdict was
     # issued while it ran (the writes must show up as Low log-only ones).
     vm_running || die "guest is not running"
-    vssh 'systemctl is-active --quiet northnarrow-agent' || die "agent not running on the guest (nn-lab.sh install)"
+    # A gate (or an earlier check) can leave the units stopped: start them,
+    # as the other checks do; an agent that does not start is not installed.
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent && sleep 4; }; sudo systemctl is-active --quiet northnarrow-watchdog || sudo systemctl start northnarrow-watchdog; systemctl is-active --quiet northnarrow-agent' \
+        || die "agent not running on the guest (nn-lab.sh install)"
     vssh 'bash -s' <<'REMOTE'
 set -u
 fail=0
@@ -899,6 +954,8 @@ cmd_release_check() {
     # (mkdir without -p), not reused.
     vssh 'rm -rf /tmp/nn-release && mkdir -m 0700 /tmp/nn-release'
     rsync -a -e "ssh ${SSH_OPTS[*]}" "$tgz" "$sums" "$GUEST:/tmp/nn-release/"
+    # lab PR 206: release-check reads the agent's own lines through it
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/lib/lab-records.py" "$GUEST:/tmp/nn-release/lab-records.py"
     rsync -a -e "ssh ${SSH_OPTS[*]}" "$REPO/deploy/lab/release/release-check.sh" "$GUEST:/tmp/nn-release-check.sh"
     lab_purge_pins >/dev/null
     local rc=0
@@ -1293,7 +1350,9 @@ key=$(for k in /root/northnarrow-admin.key /etc/northnarrow/admin.key; do sudo t
 # another product's LSM programs (bpftrace in the lab) are left alone.
 own_before=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null | tr '\n' ' ')
 foreign_before=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "^(${own_before// /|}x):" || true)
-echo "before: own program ids=[${own_before% }] foreign LSM programs=$foreign_before"
+n_before=0
+for id in $own_before; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q " lsm " && n_before=$((n_before + 1)); done
+echo "before: own program ids=[${own_before% }] own LSM programs=$n_before foreign LSM programs=$foreign_before"
 at_tty sudo ./deploy/install.sh --source-tree --upgrade --grant-key "$key" 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|BPF program|window|PROTECTED|grant" | cut -c1-140
 sleep 2
 pid_after=$(sudo cat /run/northnarrow/agent.pid)
@@ -1310,7 +1369,46 @@ fail=0
 own_after=$(sudo awk '$1 ~ /^[0-9]+$/ {print $1}' /run/northnarrow/bpf-own-ids 2>/dev/null)
 n=0
 for id in $own_after; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q " lsm " && n=$((n + 1)); done
-(( n >= 7 )) || { echo "FAIL: only $n own LSM programs after upgrade (bpf-own-ids)"; fail=1; }
+# External audit LAB-020 (NN-AUD-410, lab PR 206): seven own LSM programs
+# passed, against 16 deny hooks plus the observers. Now the new agent's own
+# health line — logged only when every deny and observe hook attached —
+# read from the journal's trusted fields (its unit's stdout, its pid; the
+# message itself, never a field of another line: a file named like the line
+# is not it, deploy/lab/lib/lab-records.py), with deny_attached equal to
+# deny_expected and at least the 16 deny hooks of DENY_HOOKS
+# (agent/src/anti_tamper/mod.rs; xtask/tests/lab_scripts.rs keeps the two
+# equal); no fewer own LSM programs than before the upgrade (an observer
+# lost fails too) nor than the deny hooks; and no anti-tamper
+# `subsystem_degraded` signed at the upgraded boot (a start under
+# NN_ANTI_TAMPER_ALLOW_DEGRADED=1, a missing observe hook).
+deny_hooks_min=16
+if [[ -n "$own_before" ]] && (( n < n_before )); then
+    echo "FAIL: $n own LSM programs after the upgrade, $n_before before (a hook the new agent did not load)"; fail=1
+fi
+health=""
+for i in $(seq 1 15); do
+    health=$(sudo journalctl --namespace=northnarrow -u northnarrow-agent _PID="$pid_after" --no-pager -o json 2>/dev/null \
+        | python3 -I deploy/lab/lib/lab-records.py journal northnarrow-agent.service "$pid_after" INFO "anti-tamper: all LSM hooks attached " | tail -1)
+    [[ -n "$health" ]] && break
+    sleep 1
+done
+health_re='^anti-tamper: all LSM hooks attached deny_attached=([0-9]+) deny_expected=([0-9]+)$'
+if [[ "$health" =~ $health_re ]]; then
+    da=${BASH_REMATCH[1]} de=${BASH_REMATCH[2]}
+    (( da == de && de >= deny_hooks_min )) || { echo "FAIL: deny hooks $da of $de (at least $deny_hooks_min expected)"; fail=1; }
+    (( n >= de )) || { echo "FAIL: $n own LSM programs, fewer than the $de deny hooks the agent counted"; fail=1; }
+    echo "after : $health"
+else
+    echo "FAIL: the new agent (pid $pid_after) did not log that every LSM hook attached${health:+ (read: $health)}"; fail=1
+fi
+degraded=$(sudo tail -n "+$((audit_before + 1))" /etc/northnarrow/audit.log | python3 -I deploy/lab/lib/lab-records.py degraded)
+while IFS= read -r l; do
+    case "$l" in
+        "degraded: anti-tamper"*) echo "FAIL: signed at the upgraded boot: ${l#degraded: }"; fail=1 ;;
+        degraded:*) echo "note: signed at the upgraded boot: ${l#degraded: }" ;;
+        unparsed=*) echo "FAIL: audit.log after the upgrade: ${l#unparsed=} line(s) not one JSON object"; fail=1 ;;
+    esac
+done <<<"$degraded"
 for id in $own_before; do
     if sudo bpftool prog show id "$id" >/dev/null 2>&1; then echo "FAIL: old program id $id still loaded"; fail=1; fi
 done
@@ -1319,7 +1417,7 @@ foreign_after=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "^
 if [[ -n "$own_before" ]] && (( foreign_after < foreign_before )); then
     echo "FAIL: foreign LSM programs $foreign_before -> $foreign_after"; fail=1
 fi
-echo "after : own LSM programs=$n foreign LSM programs=$foreign_after"
+echo "after : own LSM programs=$n (before: $n_before) foreign LSM programs=$foreign_after"
 sudo ls /sys/fs/bpf/northnarrow/PROTECTED_PIDS >/dev/null || { echo "FAIL: PROTECTED_PIDS not re-pinned"; fail=1; }
 # External audit DEC-007: a template an earlier release shipped named the
 # product in every decoy rendered from it; the upgrade replaces it (an
@@ -1406,7 +1504,12 @@ exit $fail
 REMOTE
 }
 
-NIGHTLY_STEPS="check sync build test-e2e test-ignored install respawn-check upgrade-check uninstall-check"
+# External audit LAB-026 (NN-AUD-416, lab PR 206): the nightly ran none of
+# the security checks. They run on the fresh install, before the steps that
+# replace or remove it; each one starts the units it finds stopped (a gate
+# leaves the agent stopped), and NN_LAB_NIGHTLY_SKIP skips any of them.
+NIGHTLY_SECURITY_STEPS="tamper-check pkgmgr-check open-sensor-check fim-reuse-check btrfs-check overlay-check"
+NIGHTLY_STEPS="check sync build test-e2e test-ignored install $NIGHTLY_SECURITY_STEPS respawn-check upgrade-check uninstall-check"
 
 nightly_run_step() {
     local step=$1 logf=$2 t0 rc
@@ -1421,6 +1524,12 @@ nightly_run_step() {
         test-e2e)      cmd_test_e2e ;;
         test-ignored)  cmd_test_ignored ;;
         install)       cmd_install ;;
+        tamper-check)  cmd_tamper_check ;;
+        pkgmgr-check)  cmd_pkgmgr_check ;;
+        open-sensor-check) cmd_open_sensor_check ;;
+        fim-reuse-check) cmd_fim_reuse_check ;;
+        btrfs-check)   cmd_btrfs_check ;;
+        overlay-check) cmd_overlay_check ;;
         respawn-check) cmd_respawn_check ;;
         upgrade-check) cmd_upgrade_check ;;
         uninstall-check) cmd_uninstall_check ;;
@@ -1432,6 +1541,26 @@ nightly_run_step() {
     NIGHTLY_SECS[$step]=$(( $(date +%s) - t0 ))
     return 0
 }
+
+# The lines of each step's log the report collects: test summaries and
+# counts, every check's own verdict, and the anti-tamper rows that are not
+# OK (a deviation, a known gap, a case not applicable here).
+NIGHTLY_RESULT_LINES='^test result|panicked at|FAIL:|^FAIL |^count ok:|(respawn|upgrade|uninstall|pkgmgr)-check: |^anti-tamper check:|^\| [^|]+ \|.*\| (DEVIATION|KNOWN GAP|N/A)[^|]*\|$|^open-sensor check:|^(PASS|NOT RUN) |^(btrfs|overlay)-check: (PASS|FAIL|N/A|NOT RUN)'
+
+# >>> nightly-status (xtask/tests/lab_scripts.rs runs this block)
+# A step's status (lab PR 206): exit 0 is "ok" only for a step that ran. A
+# check that says it does not apply here (btrfs-check on a kernel without
+# btrfs: "btrfs-check: N/A …", exit 0) is N/A, and a NOT RUN fails whatever
+# its exit status.
+nightly_status() {   # <rc> <step log>
+    local rc=$1 log=$2 na
+    if [[ $rc == -1 ]]; then echo '⏭ skipped'; return; fi
+    if grep -qE '(^|: )NOT RUN' "$log" 2>/dev/null; then echo "❌ not run (rc=$rc)"; return; fi
+    if [[ $rc != 0 ]]; then echo "❌ rc=$rc"; return; fi
+    na=$(grep -m1 -oE '^[a-z-]+( check)?: N/A.*' "$log" 2>/dev/null | tr '|' '/' | cut -c1-80 || true)
+    if [[ -n $na ]]; then echo "➖ $na"; else echo '✅ ok'; fi
+}
+# <<< nightly-status
 
 cmd_nightly() {
     local stamp report_dir report
@@ -1473,21 +1602,21 @@ cmd_nightly() {
     {
         printf '# nn-lab nightly %s\n\n' "$stamp"
         printf -- '- repo: `%s` @ `%s`\n' "$REPO" "$rev"
-        printf -- '- distro: `%s`\n' "$DISTRO"
+        printf -- '- distro: `%s`%s\n' "$DISTRO" "${LOCKDOWN:+ (NN_LAB_LOCKDOWN=$LOCKDOWN)}"
         printf -- '- base image: %s\n' "$(lab_image_summary)"
-        printf -- '- guest: `%s`\n\n' "$(vssh 'uname -r; cat /sys/kernel/security/lsm' 2>/dev/null | tr '\n' ' ')"
+        printf -- '- guest: `%s`\n\n' "$(vssh 'uname -r; cat /sys/kernel/security/lsm; echo; cat /sys/kernel/security/lockdown' 2>/dev/null | tr '\n' ' ')"
         printf '| step | status | seconds |\n|---|---|---|\n'
         for step in $NIGHTLY_STEPS; do
             local rc=${NIGHTLY_RC[$step]:--1} st
-            case $rc in
-                0)  st='✅ ok' ;;
-                -1) st='⏭ skipped' ;;
-                *)  st="❌ rc=$rc"; failed=1 ;;
-            esac
+            st=$(nightly_status "$rc" "$report_dir/$step.log")
+            [[ $st == ❌* ]] && failed=1
             printf '| %s | %s | %s |\n' "$step" "$st" "${NIGHTLY_SECS[$step]:-0}"
         done
         printf '\n## test results\n\n```\n'
-        grep -hE '^test result|panicked at|FAIL:|^count ok:|respawn-check: OK' "$report_dir"/test-e2e.log "$report_dir"/test-ignored.log "$report_dir"/respawn-check.log 2>/dev/null | cut -c1-160 || true
+        for step in $NIGHTLY_STEPS; do
+            [[ -f "$report_dir/$step.log" ]] || continue
+            grep -E "$NIGHTLY_RESULT_LINES" "$report_dir/$step.log" 2>/dev/null | cut -c1-160 | sed "s/^/$step: /" || true
+        done
         printf '```\n\nLogs: `%s/`\n' "$report_dir"
     } > "$report"
     log "report: $report"
@@ -1496,7 +1625,9 @@ cmd_nightly() {
     return $failed
 }
 
-cmd_help() { sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# The header comment, line 2 up to the first line that is not a comment
+# (external audit LAB-026: a fixed `2,36p` cut the usage block in half).
+cmd_help() { awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 case "${1:-help}" in
     up)            cmd_up ;;

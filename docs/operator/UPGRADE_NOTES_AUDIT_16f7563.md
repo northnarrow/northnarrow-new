@@ -1124,6 +1124,19 @@ checked with its tag-bound attestation.
 - **`tamper-check`** (NN-AUD-208 LAB-003, NN-AUD-209 LAB-004, NN-AUD-210
   LAB-005, NN-AUD-212 LAB-007, lab PR 154). **Regression:** the run deletes
   the agent journal namespace's archived files (case C57c).
+- **Lab verdicts** (NN-AUD-410 LAB-020, NN-AUD-414 LAB-024, NN-AUD-416
+  LAB-026, lab PR 206). `upgrade-check` wants the new agent's own health
+  line with every deny hook, no fewer of its LSM programs than before and
+  no degraded start in the signed chain (it passed with seven programs);
+  the nightly runs `tamper-check`, `pkgmgr-check`, `open-sensor-check`,
+  `fim-reuse-check`, `btrfs-check` and `overlay-check`; `anti-tamper.sh
+  --only` takes case ids only and runs nothing else; a case that cannot
+  run is a table row (C27 a KNOWN GAP without lockdown; the lockdown guest:
+  `NN_LAB_LOCKDOWN=integrity nn-lab.sh up`). **Regression:** a nightly
+  tens of minutes longer; a run that passed on an agent with a hook
+  missing, a typo in `--only` or a probe missing now fails; the suite and
+  `release-check` need `deploy/lab/lib/lab-records.py` (in the tree;
+  `release-check` copies it).
 - **Privileged fixtures** (NN-AUD-232 TST-011, NN-AUD-233 TST-012,
   NN-AUD-230 TST-009, lab PR 158). The honeypot e2e suite refuses to run
   without root, outside an nn-lab guest unless

@@ -621,13 +621,13 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-407 | SUP-023 | Low | Supply chain | S | fixed (lab PR 200) |
 | NN-AUD-408 | SUP-024 | Low | Supply chain | M | partly fixed (lab PR 150; two-person review declined for now); open |
 | NN-AUD-409 | LAB-019 | Low | Lab scripts | S | open |
-| NN-AUD-410 | LAB-020 | Low | Lab scripts | S | partly fixed (lab PRs 153, 156); open |
+| NN-AUD-410 | LAB-020 | Low | Lab scripts | S | fixed (lab PR 206) |
 | NN-AUD-411 | LAB-021 | Low | Lab scripts | — | obsolete (verify-2b.sh deleted, lab PR 153) |
 | NN-AUD-412 | LAB-022 | Low | Lab scripts | S | open |
 | NN-AUD-413 | LAB-023 | Low | Lab scripts | M | fixed (lab PR 167) |
-| NN-AUD-414 | LAB-024 | Low | Lab scripts | S | partly fixed (C17 fixed in `4672283`); open |
+| NN-AUD-414 | LAB-024 | Low | Lab scripts | S | fixed (lab PR 206) |
 | NN-AUD-415 | LAB-025 | Low | Lab scripts | S | open |
-| NN-AUD-416 | LAB-026 | Low | Lab scripts | S | partly fixed (lab PR 154 guards some setup); open |
+| NN-AUD-416 | LAB-026 | Low | Lab scripts | S | fixed (lab PR 206) |
 | NN-AUD-417 | LAB-027 | Low | Lab scripts | S | open |
 | NN-AUD-418 | TST-007 | Low | Privileged tests | — | already fixed (lab PR 138, with NN-AUD-079) |
 | NN-AUD-419 | TST-013 | Low | Privileged tests | S | fixed (lab PR 195) |
@@ -9449,3 +9449,107 @@ group, the ones an unprivileged user or a local attacker could use first.
     (`agent/examples/posture_demo.rs:121` lacks `argv_truncated` and
     `filename_truncated`, fixed on `main`).
   - Lab: No lab or model run (developer examples and the output parser): the parser tests (markers quoted inside a verdict are text, a reasoning block only before the object) and the four examples' tests, run by `cargo test --workspace`; the model-host runs of `ade_attacks`, `ade_with_rag` and `bench_threads` are listed for a host with the GGUF. Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.
+- **Wave 3 — lab verdict integrity, lab PR 206.** NN-AUD-410 (LAB-020,
+  partly fixed by lab PRs 153 and 156), NN-AUD-414 (LAB-024, partly fixed
+  by `4672283`), NN-AUD-416 (LAB-026, partly fixed by lab PR 154), all Low:
+  batch 6 of the Wave 3 triage of the supply-chain, lab and tests group,
+  without NN-AUD-413 (LAB-023, fixed by lab PR 167), on the integration
+  tree (`main` with lots up to 195, and lots 196–203). Lab scripts, the
+  guest templates, a lab helper and docs; no change to the agent.
+  - LAB-020 (410, fixed). Re-checked: `upgrade-check` passed with `n >= 7`
+    of the new agent's own LSM programs (16 deny hooks plus the observers
+    on every kernel), so a hook the new agent did not load, or a start
+    under `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, passed; `release-check`'s
+    "every deny hook attached" grepped `all LSM hooks attached
+    deny_attached=` anywhere in the journal text, which a file named like
+    the line, run from `/tmp` by any user, puts in the agent's VERDICT
+    line (lab PR 167 quotes it on one line; the substring stays). Now
+    `upgrade-check` wants the new agent's own health line with
+    `deny_attached` equal to `deny_expected` and at least `DENY_HOOKS`
+    (16; `deny_hooks_min`, kept equal by
+    `upgrade_check_wants_every_deny_hook_of_the_agent`), no fewer own LSM
+    programs than before the upgrade nor than `deny_expected`, and no
+    `subsystem_degraded` whose detail starts with "anti-tamper" after the
+    pre-upgrade line of `audit.log` (others printed as notes; a line that
+    does not parse fails, an unterminated last one waits). The line is read
+    by `deploy/lab/lib/lab-records.py journal UNIT PID LEVEL PREFIX`
+    (stdlib, `python3 -I`, as the lab user, on `sudo journalctl -o json`):
+    `_SYSTEMD_UNIT` and `_TRANSPORT=stdout`, which journald sets, the
+    process's `_PID`, one fmt-layer event `<time> <LEVEL> <message>` whose
+    message starts with the prefix. `release-check.sh` reads its three
+    agent lines the same way (`agent_event`; `nn-lab.sh release-check`
+    copies the helper next to the tarball).
+  - LAB-024 (414, fixed). Re-checked: no template sets `lockdown=` (four
+    now: Debian 13 joined), so `KGAP=1` and C27 never ran, with no row; its
+    `syscall(313, …)` is x86_64's on every machine; and C17 runs only when
+    `kexec` is installed, which no template does, with no row otherwise.
+    Now `NN_LAB_LOCKDOWN=integrity` (`integrity` or unset; anything else
+    exits 2): a separate guest `<distro>-lockdown-integrity` (its own
+    `LAB_DIR`, seed, pid, serial, reports, whpx directory and forwarder,
+    ssh port the distro's + 1000, layered on the distro's base image),
+    `render_user_data` fills the `__NN_LAB_KARGS__` the four templates put
+    at the end of their `lsm=` line (` lockdown=integrity`, or nothing; a
+    template without it is refused), `wait_ssh` waits for the lockdown too
+    (Debian's first boot already lists bpf), `check` prints
+    `/sys/kernel/security/lockdown` and fails on that guest when it is not
+    `[integrity]`. C27 without lockdown is a KNOWN GAP row; with it, the
+    machine's `finit_module` number (x86_64 313, arm64 273; elsewhere a
+    not-run deviation) through the python helper (`finit`, `strip-sig`; a
+    missing input is a `setup:` line, never read as a refusal). C17 without
+    the tool calls `kexec_file_load(2)` (x86_64 320, arm64 294) on the
+    running kernel and its initrd; a loaded image is unloaded with
+    `KEXEC_FILE_UNLOAD` (no file read, so no hook in the way), then the
+    tool, also by the trap.
+  - LAB-026 (416, fixed). Re-checked: `NIGHTLY_STEPS` had none of the
+    security checks; outside `run_case`, unconditionally, C11's and C25's
+    drop-in removals and three `daemon-reload`, C12's drop-in removal (and
+    no reload with `--only C12`: the 4G cap stayed in force), `mkdir
+    /mnt/nn-bpf2` (never removed), C18's restore (with `-500` when the
+    value could not be read), C49's file in `/etc`, the four probe builds
+    and C34's fresh agent binary; `skipped_case` rows for cases `--only`
+    left out (a probe that did not build failed `--only C01`), C43 missing
+    from C34-C37's; `--only` without a value ran every case, and an id that
+    names no case printed OK; C15 and C16 silent when they could not run;
+    C30 `0 → 0` OK when bpftool could not dump the map; `cmd_help` printed
+    `2,36p` of a header that ran to line 65. Now `NIGHTLY_SECURITY_STEPS`
+    (`tamper-check`, `pkgmgr-check`, `open-sensor-check`,
+    `fim-reuse-check`, `btrfs-check`, `overlay-check`) after `install`,
+    `pkgmgr-check` starting the units like the others, `nightly_status`
+    (N/A from a step's own `<check>: N/A` line, `not run` for a NOT RUN
+    whatever the exit status) and the report's verdict lines per step;
+    `--only` takes `C<nn>[a-z]` lists only and `report_unreported` adds a
+    DEVIATION row for every id no row names; each setup and cleanup sits
+    behind `selected`/`selected_any`; `restored` fails the run with a
+    `(cleanup)` row when C11's drop-in, C12's `MemoryMax` and
+    `memory.max`, C25's `FragmentPath` or C18's `oom_score_adj` (written
+    back only to the same process, pid and start time, also by the trap)
+    do not read as found; C15 and C16 rows (N/A without cgroup v2 or the
+    module); C30 a deviation on an unreadable map; `cmd_help` prints the
+    header to its first non-comment line.
+  - Same defence in the suite (journal state lines): the BPF guard mode,
+    the open-window wait, C11's registration and C38's (the watchdog's own
+    event with `_PID` the new watchdog: a forged name made C38 pass, and
+    `pid=12` matched `pid=1234`) go through `jentry` (the helper); `jlines`
+    is gone.
+  - Tests: `xtask/tests/lab_scripts.rs` (10: the whole help, an unknown
+    lockdown mode refused, the four templates rendered with and without
+    lockdown and a template without the placeholder refused, the nightly
+    steps and their runner arms, `nightly_status` under `set -euo
+    pipefail`, the upgrade-check floor equal to `DENY_HOOKS`, no lab
+    verdict grepping journal text for an agent line, the forged health line
+    through the helper, `--only` refused without case ids under an empty
+    PATH, `skipped_case`/`report_unreported`); all 10 fail on the starting
+    scripts. `anti-tamper.sh --selftest` 64 checks (40 on the starting
+    tree; python helper 43, from 38), `lab-records.py --selftest` 7. A
+    trace of `--only C01` in a user namespace with stubbed tools: the
+    starting script makes `/mnt/nn-bpf2`, tries four probe builds, writes
+    and removes `/etc/.nn-lab-c49-src`, removes the three drop-ins and runs
+    `daemon-reload` three times; this one does none of it. The same harness
+    runs C12 (a sticky `MemoryMax`: a `(cleanup)` DEVIATION row), C18 (900,
+    then 0 again), C99 (a DEVIATION row) and C27 (KNOWN GAP).
+  - Host: `cargo fmt`, the workspace clippy clean, 2,655 passed, 0 failed.
+    The CI's `posture_demo` clippy fails as on the starting tree
+    (`agent/examples/posture_demo.rs:121`, `argv_truncated` and
+    `filename_truncated`, fixed on `main`). `bash -n` on the changed
+    scripts; shellcheck is not installed on this host.
+  - Lab: On Ubuntu 24.04: `upgrade-check` (lot 206's check) read the new agent's own line from journald, `anti-tamper: all LSM hooks attached deny_attached=19 deny_expected=19`, own LSM programs 33 → 33, no foreign program; `anti-tamper.sh --only C01` ran C01 alone (denied, OK), `--only` without a value is refused ("takes case ids"), `--only C99` ends in DEVIATIONS, not OK; the anti-tamper suite with this lot's script OK (known gaps listed) on 24.04 and 22.04. The lockdown guest (LAB-024) and the nightly's security steps (LAB-026) were not run here. Gate: the integration tree of lab PRs 204, 205, 206 and 207 on `main` with lab PRs 176–203: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 46 suites, 89 passed, 0 failed each; Debian 13 (6.12) 46 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04 with lot 206's script; `upgrade-check` from a clean install of the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,707 passed, 0 failed.

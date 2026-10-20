@@ -110,6 +110,18 @@ agent ran for a long time, `sync` can be refused on a file whose inode
 number an earlier, deleted protected file had (candidate review 80): the
 next `install` purges the pins, and a second `sync` goes through.
 
+**Lockdown guest** (lab PR 206). `NN_LAB_LOCKDOWN=integrity
+NN_LAB_DISTRO=<distro> deploy/lab/nn-lab.sh up` boots a separate guest of
+that distro with `lockdown=integrity` added to its `lsm=` line (the
+templates end that line in `__NN_LAB_KARGS__`): its own disk, seed and
+reports under `~/.cache/nn-lab/<distro>-lockdown-integrity/`, the
+distro's ssh port + 1000 (3222 for 24.04, 3522 for 22.04), layered on the
+distro's base image. `check` prints the lockdown state and fails on that
+guest when the kernel is not locked down. It is the guest where the
+anti-tamper suite's C27 (an unsigned module refused by the kernel) runs;
+elsewhere C27 is a listed KNOWN GAP. Prefix every sub-command with both
+variables to target it.
+
 The verified matrix and the per-kernel findings are in
 `docs/operator/KERNEL_COMPATIBILITY.md`. Memory: each guest takes
 `NN_LAB_MEM` (8 GiB); on a 32 GiB host keep at most two guests up during
@@ -118,13 +130,20 @@ long runs — four at once starved the host (2026-10-10).
 ### Nightly, unattended
 
 `deploy/lab/nn-lab.sh nightly` runs check → sync → build → test-e2e →
-test-ignored → install → respawn-check → upgrade-check → uninstall-check
-(the last two exercise `install.sh --upgrade` on the running install and
-`uninstall.sh --purge`, then reinstall — see
+test-ignored → install → the security checks (tamper-check → pkgmgr-check
+→ open-sensor-check → fim-reuse-check → btrfs-check → overlay-check, on
+the fresh install; lab PR 206) → respawn-check → upgrade-check →
+uninstall-check (the last two exercise `install.sh --upgrade` on the
+running install and `uninstall.sh --purge`, then reinstall — see
 `docs/operator/INSTALL_UPGRADE_UNINSTALL.md`) without stopping at the first
 failure, writes `~/.cache/nn-lab/reports/<stamp>.md` (status, duration
-and every `test result:` line per step; `latest.md` points at the newest)
-and exits 1 if any step failed. The privileged tests only *compile* in
+and, per step, its verdict lines: every `test result:`, each check's own
+verdict, the anti-tamper rows that are a DEVIATION, a KNOWN GAP or N/A;
+`latest.md` points at the newest) and exits 1 if any step failed. A step
+that says it does not apply (btrfs-check on a kernel without btrfs) is
+`N/A`, not ok; a `NOT RUN` fails whatever its exit status. Each security
+check starts the units it finds stopped. The security checks add tens of
+minutes; `NN_LAB_NIGHTLY_SKIP` takes their names too. The privileged tests only *compile* in
 GitHub CI, so this is the run that catches a test or a kernel-side
 behaviour drifting from the product — the 2026-10-08 lab rounds found
 two detection gaps and a dozen stale tests that CI had been green on
