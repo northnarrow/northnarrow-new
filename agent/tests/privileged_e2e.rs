@@ -1213,6 +1213,8 @@ fn audit_verify_e2e() {
             // agent's id at boot, signed before `agent_boot`.
             ("agent_id_minted", "success"),
             ("agent_boot", "success"),
+            // Lab PR 218: every boot signs its capability manifest.
+            ("capability_manifest", "success"),
             ("unlock", "success"),
             ("unlock", "failure: invalid_signature"),
             ("rotate_keys_add", "success"),

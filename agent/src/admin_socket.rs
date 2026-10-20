@@ -3500,6 +3500,7 @@ fn telemetry_status(
 ) -> StatusResponse {
     let evidence = response_state.map(|s| (s.combat_evidence)());
     let encrypted = crate::net::blind_spots::encrypted_flows();
+    let trust = crate::boot::trust::current();
     StatusResponse {
         posture: posture.current_kind(),
         network_isolation_engaged: isolator.is_engaged(),
@@ -3540,6 +3541,12 @@ fn telemetry_status(
         deny_fail_open_total: crate::anti_tamper::fail_open::total(),
         deny_fail_open: crate::anti_tamper::fail_open::total()
             .map(|_| crate::anti_tamper::fail_open::snapshot_nonzero()),
+        // Lab PR 218: the trust level now, the degradations of this run and
+        // the boot's signed capability manifest.
+        trust_level: trust.as_ref().map(|t| t.level.as_u8()),
+        trust_reasons: trust.map(|t| t.reasons),
+        degradations: Some(crate::boot::degradation::snapshot()),
+        capability_manifest: crate::boot::manifest::current_json(),
     }
 }
 
@@ -5964,6 +5971,10 @@ mod tests {
             deny_fail_open: None,
             network_isolation_v4: None,
             network_isolation_v6: None,
+            trust_level: None,
+            trust_reasons: None,
+            degradations: None,
+            capability_manifest: None,
         });
         emit_audit_for(
             &status_req,
@@ -7090,6 +7101,8 @@ mod tests {
                 AdminResult::Success => {
                     let st = r.status.as_ref().expect("the whole status");
                     assert!(st.ringbuf_drops_total.is_some(), "{roles}");
+                    // Lab PR 218: the degradations are the signed verb's.
+                    assert!(st.degradations.is_some(), "{roles}");
                     assert_eq!(st.detect_only, Some(false));
                     assert_eq!(st.combat_stage.as_deref(), Some("NEUTRALIZE"));
                 }

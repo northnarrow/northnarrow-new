@@ -19,6 +19,9 @@ pub mod anti_tamper;
 pub mod async_fd;
 pub mod atomic_file;
 pub mod audit;
+/// Lab PR 218: the start as typed phases, the BPF LSM gate, the deny
+/// self-test, the degradations, the trust level and the capability manifest.
+pub mod boot;
 pub mod bounded_cmd;
 pub mod canary;
 pub mod chain_anchor;

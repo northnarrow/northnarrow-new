@@ -224,7 +224,7 @@ missing and how to fix it:
 
 | Check | Expected | Why |
 |---|---|---|
-| BPF LSM in the LSM list | `bpf` present | the deny hooks cannot attach otherwise |
+| BPF LSM in the LSM list | `bpf` present | otherwise the deny hooks attach and never run: the agent refuses to start (exit 78) unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, which starts it at trust level L0 (lab PR 218, `BOOT_INTEGRITY.md`) |
 | Kernel lockdown | `[integrity]` or stronger | blocks unsigned modules, kexec of unsigned kernels, `/dev/mem` |
 | Unprivileged BPF | `kernel.unprivileged_bpf_disabled` = 1 or 2 | only privileged processes load BPF |
 | Module signature | `module.sig_enforce` = Y, or lockdown `[integrity]`/`[confidentiality]` (refuses unsigned modules whatever the parameter says) | an unsigned module is the classic way to blind a kernel sensor |
@@ -413,6 +413,15 @@ of answering or forwarding it upstream (external audit EVD-015). A silent sensor
 events trips a rule (root-owned binary from its install path, a dedicated
 probe directory, a reserved `.invalid` name). `NN_TELEMETRY_PROBE_SECS`
 in the unit environment changes the period; `0` disables the probe.
+
+At boot the agent also proves its deny hooks run (lab PR 218): right
+after they attach, a child of its binary (`--deny-self-test`, hidden flag)
+signals the agent and must be refused. Every degradation of the run (a
+sensor on its fallback, a hook missing, a log not persisted) is signed
+within 60 s and listed by `nn-admin status --key`, with the **trust level**
+(L0 no enforcement … L3 every mandatory deny hook attached and self-tested,
+nothing degraded); `nn-admin capabilities --key` reads the capability
+manifest the agent signs at every boot. See `BOOT_INTEGRITY.md`.
 
 ### 3.5 What root can still change, and how the agent proves it
 

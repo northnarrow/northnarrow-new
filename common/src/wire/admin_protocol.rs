@@ -768,6 +768,26 @@ pub struct StatusResponse {
     pub network_isolation_v4: Option<bool>,
     #[serde(default)]
     pub network_isolation_v6: Option<bool>,
+    /// Lab PR 218 (external review G-12): the trust level, 0 to 3 (L0 no
+    /// enforcement … L3 every mandatory deny hook attached and
+    /// self-tested, nothing degraded), recomputed with the degradations
+    /// recorded since the boot, and why it is below L3. `None` before the
+    /// boot measured it. Appended after lab PR 215's and 217's fields
+    /// (which follow lab PR 207's); telemetry (the signed verb only).
+    #[serde(default)]
+    pub trust_level: Option<u8>,
+    #[serde(default)]
+    pub trust_reasons: Option<Vec<String>>,
+    /// Lab PR 218 (external review P0 C-13 / G-11): every degradation of
+    /// this run (a sensor on its fallback, a hook not attached, a stream not
+    /// persisted…), each also signed in the audit chain.
+    #[serde(default)]
+    pub degradations: Option<Vec<String>>,
+    /// Lab PR 218: this boot's signed capability manifest, one JSON object
+    /// `{"entry_hash": …, "manifest": {…}}` (`nn-admin capabilities`).
+    /// `None` before the boot signed it.
+    #[serde(default)]
+    pub capability_manifest: Option<String>,
 }
 
 impl StatusResponse {
@@ -821,6 +841,10 @@ impl StatusResponse {
             deny_fail_open: None,
             network_isolation_v4: None,
             network_isolation_v6: None,
+            trust_level: None,
+            trust_reasons: None,
+            degradations: None,
+            capability_manifest: None,
         }
     }
 
@@ -1760,6 +1784,10 @@ mod tests {
             deny_fail_open: None,
             network_isolation_v4: None,
             network_isolation_v6: None,
+            trust_level: None,
+            trust_reasons: None,
+            degradations: None,
+            capability_manifest: None,
         }));
     }
 
@@ -1793,6 +1821,10 @@ mod tests {
             deny_fail_open: None,
             network_isolation_v4: None,
             network_isolation_v6: None,
+            trust_level: None,
+            trust_reasons: None,
+            degradations: None,
+            capability_manifest: None,
         }));
     }
 
@@ -1980,6 +2012,10 @@ mod tests {
             deny_fail_open: Some(vec![("file_open".to_string(), 3)]),
             network_isolation_v4: None,
             network_isolation_v6: None,
+            trust_level: None,
+            trust_reasons: None,
+            degradations: None,
+            capability_manifest: None,
         }));
     }
 
@@ -2033,7 +2069,83 @@ mod tests {
             deny_fail_open: Some(vec![("bpf".to_string(), 1)]),
             network_isolation_v4: None,
             network_isolation_v6: None,
+            trust_level: Some(2),
+            trust_reasons: Some(vec!["1 degradation(s) recorded".to_string()]),
+            degradations: Some(vec!["dns_sensor: IPv6 resolvers not observed".to_string()]),
+            capability_manifest: Some("{\"entry_hash\":\"ab\",\"manifest\":{}}".to_string()),
         }
+    }
+
+    /// Lab PR 218: the trust level, its reasons, the degradations and the
+    /// capability manifest are appended after lab PR 215's and 217's
+    /// fields, which follow lab PR 207's — an
+    /// `nn-admin` or watchdog of lab PR 207 reads every field it knows from
+    /// a newer agent's reply, and the new fields are its last bytes.
+    #[test]
+    fn a_lab207_nn_admin_reads_a_lab218_status_reply() {
+        let new = status_with_lab193_fields();
+        let body = postcard::to_allocvec(&new).unwrap();
+        let old: StatusResponseLabPr207 = postcard::from_bytes(&body).unwrap();
+        assert_eq!(old.net_quic_rows_total, Some(5));
+        assert_eq!(old.detect_only_source.as_deref(), Some("--detect-only"));
+        let prefix = postcard::to_allocvec(&old).unwrap();
+        assert!(body.starts_with(&prefix) && body.len() > prefix.len());
+        let back: StatusResponse = postcard::from_bytes(&body).unwrap();
+        assert_eq!(back.trust_level, Some(2));
+        assert_eq!(back.degradations, new.degradations);
+        assert_eq!(back.capability_manifest, new.capability_manifest);
+    }
+
+    /// The limit, pinned for these fields too: an `nn-admin` of lab PR 218
+    /// cannot decode a lab PR 207 agent's reply (upgrade the agent first).
+    #[test]
+    fn a_lab218_nn_admin_cannot_read_a_lab207_status_reply() {
+        let new = status_with_lab193_fields();
+        let old = StatusResponseLabPr207 {
+            posture: new.posture,
+            network_isolation_engaged: new.network_isolation_engaged,
+            last_admin_action_secs_ago: new.last_admin_action_secs_ago,
+            ringbuf_drops_total: new.ringbuf_drops_total,
+            ringbuf_drops: new.ringbuf_drops.clone(),
+            combat_stage: new.combat_stage.clone(),
+            combat_locked: new.combat_locked,
+            ringbuf_rejected_total: new.ringbuf_rejected_total,
+            ringbuf_rejected: new.ringbuf_rejected.clone(),
+            netflow_rows_skipped_total: new.netflow_rows_skipped_total,
+            netflow_pending_evicted_total: new.netflow_pending_evicted_total,
+            net_inactive_rules: new.net_inactive_rules.clone(),
+            flow_sock_pending: new.flow_sock_pending,
+            flow_sock_capacity: new.flow_sock_capacity,
+            flow_sock_forgotten_min: new.flow_sock_forgotten_min,
+            detect_only: new.detect_only,
+            detect_only_source: new.detect_only_source.clone(),
+            combat_evidence_unrecorded: new.combat_evidence_unrecorded,
+            combat_evidence_pending: new.combat_evidence_pending,
+            combat_evidence_dropped: new.combat_evidence_dropped,
+            net_dot_rows_total: new.net_dot_rows_total,
+            net_dot_rows_resolver: new.net_dot_rows_resolver,
+            net_quic_rows_total: new.net_quic_rows_total,
+        };
+        let body = postcard::to_allocvec(&old).unwrap();
+        assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
+    }
+
+    /// Lab PR 218: the new fields are telemetry — the unsigned reply sends
+    /// none of them.
+    #[test]
+    fn the_trust_level_and_degradations_are_withheld_from_the_public_status() {
+        let public = StatusResponse::public(PostureKind::Observing, false, None, None, Some(false));
+        assert_eq!(public.trust_level, None);
+        assert_eq!(public.degradations, None);
+        assert_eq!(public.capability_manifest, None);
+        assert!(public.telemetry_withheld());
+        let mut full = status_with_lab193_fields();
+        assert!(!full.telemetry_withheld());
+        full = StatusResponse {
+            trust_level: Some(3),
+            ..StatusResponse::public(full.posture, false, None, None, Some(false))
+        };
+        assert!(!full.telemetry_withheld(), "a trust level is telemetry");
     }
 
     /// External audit CMB-018 / CMB-027 (lab PR 193): an `nn-admin` older
@@ -2157,7 +2269,7 @@ mod tests {
     }
 
     /// The status reply as lab PR 207 left it (its last field
-    /// `net_quic_rows_total`), for the lab PR 215 pins.
+    /// `net_quic_rows_total`), for the lab PR 215 and lab PR 218 pins.
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct StatusResponseLabPr207 {
         posture: PostureKind,
@@ -2496,8 +2608,9 @@ mod tests {
 
     /// Lab PR 217: the isolation per IP family is appended to the status —
     /// public, passed through by the unsigned reply — and an `nn-admin` of
-    /// lab PR 213 reads every byte before it (the two fields are the reply's
-    /// last bytes).
+    /// lab PR 213 reads every byte before it (the two fields follow lab PR
+    /// 215's; lab PR 218's four fields, `None` in a public reply, come after
+    /// them).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -2511,10 +2624,13 @@ mod tests {
         without.network_isolation_v4 = None;
         without.network_isolation_v6 = None;
         let without = postcard::to_allocvec(&without).unwrap();
-        // None is one byte each; Some(bool) two.
-        let prefix = without.len() - 2;
-        assert_eq!(with.len(), prefix + 4);
+        // None is one byte each; Some(bool) two. Lab PR 218's four fields
+        // (one `None` byte each here) are the last bytes of both.
+        let tail = 4;
+        let prefix = without.len() - 2 - tail;
+        assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
+        assert_eq!(&with[with.len() - tail..], &without[without.len() - tail..]);
         let old: StatusResponseLabPr164 = postcard::from_bytes(&with).unwrap();
         assert!(old.network_isolation_engaged);
         roundtrip(AdminMessage::StatusResponse(public));

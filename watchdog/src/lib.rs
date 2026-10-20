@@ -4148,6 +4148,10 @@ mod tests {
                 deny_fail_open: None,
                 network_isolation_v4: None,
                 network_isolation_v6: None,
+                trust_level: None,
+                trust_reasons: None,
+                degradations: None,
+                capability_manifest: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

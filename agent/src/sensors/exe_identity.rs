@@ -66,6 +66,7 @@ pub fn attach(
     if !LSM_WANTED.load(Ordering::Relaxed) {
         info!("exec sensor: tracepoint mode (--exec-sensor tracepoint) — sys_enter_execve");
         attach_tracepoint(ebpf)?;
+        tracepoint_fallback("chosen with --exec-sensor tracepoint");
         return Ok("sys_enter_execve");
     }
     if let Some(missing) = offsets_resolved() {
@@ -74,6 +75,7 @@ pub fn attach(
             "exec sensor: an offset the LSM program needs is missing — attaching sys_enter_execve"
         );
         attach_tracepoint(ebpf)?;
+        tracepoint_fallback(&format!("the LSM program needs {missing}, not resolved"));
         return Ok("sys_enter_execve");
     }
     match attach_lsm(ebpf) {
@@ -83,6 +85,7 @@ pub fn attach(
                 program = EXEC_LSM_PROGRAM,
                 "exec sensor armed on LSM bprm_check_security (Tappa 10.9 step 2)"
             );
+            crate::boot::manifest::note_sensor("exec", "lsm:bprm_check_security");
             Ok(EXEC_LSM_PROGRAM)
         }
         Err(e) => {
@@ -91,9 +94,28 @@ pub fn attach(
                 "exec sensor: the LSM program was refused — attaching sys_enter_execve"
             );
             attach_tracepoint(ebpf)?;
+            tracepoint_fallback("the LSM program was refused by the kernel");
             Ok("sys_enter_execve")
         }
     }
+}
+
+/// Lab PR 218 (external review P0 C-13): the exec sensor on
+/// `sys_enter_execve` reads the path from the caller's memory, which the
+/// caller can rewrite before the kernel opens the file — a degradation,
+/// signed and in `nn-admin status`, not only a WARN.
+pub const EXEC_TRACEPOINT_DEGRADED: &str = "exec sensor on sys_enter_execve: the executed path is \
+     read from the caller's memory (it can differ from the file the kernel runs)";
+
+fn tracepoint_fallback(why: &str) {
+    crate::boot::manifest::note_sensor(
+        "exec",
+        "tracepoint:syscalls/sys_enter_execve (user memory)",
+    );
+    crate::boot::degradation::report(
+        "exec_sensor",
+        &format!("{EXEC_TRACEPOINT_DEGRADED} — {why}"),
+    );
 }
 
 fn attach_lsm(ebpf: &mut Ebpf) -> Result<()> {

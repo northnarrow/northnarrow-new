@@ -33,6 +33,7 @@ use northnarrow_agent::anti_tamper::btf_revalidate::{
     publish_resolved, resolve_offsets, resolve_tracepoint_fields, RefuseReason, ResolveOutcome,
 };
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
+use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::detection_budget::{self, Admit};
@@ -75,6 +76,12 @@ struct Cli {
     /// `NN_TELEMETRY_PROBE_SECS`; never meant for operators.
     #[arg(long = "telemetry-probe", hide = true, value_name = "NONCE")]
     telemetry_probe: Option<String>,
+
+    /// Internal (lab PR 218): run as the deny self-test child — send one
+    /// SIGURG to the parent, exit with what kill(2) said. Spawned by the
+    /// agent itself once per boot, right after the deny hooks attach.
+    #[arg(long = "deny-self-test", hide = true)]
+    deny_self_test: bool,
 
     /// Compatibility check only: resolve every kernel struct offset and
     /// enumerator the eBPF programs need against the given BTF file
@@ -588,6 +595,24 @@ enum DnsSensor {
     Sendmsg,
 }
 
+/// Lab PR 218 (external review P0 C-13): the file-open sensor stays on
+/// `sys_enter_openat` — every open goes to userland and its path is read
+/// from the caller's memory. Signed and in `nn-admin status`, not only a
+/// WARN.
+fn open_sensor_on_tracepoint(why: &str) {
+    northnarrow_agent::boot::manifest::note_sensor(
+        "file_open",
+        "tracepoint:syscalls/sys_enter_openat (user memory)",
+    );
+    northnarrow_agent::boot::degradation::report(
+        "file_open_sensor",
+        &format!(
+            "file-open sensor on sys_enter_openat: every open goes to userland and its path is \
+             read from the caller's memory — {why}"
+        ),
+    );
+}
+
 /// Review 69: the LSM file-open sensor could not be armed, so
 /// `sys_enter_openat` (attached, inert until now) starts emitting.
 fn open_tracepoint_fallback(sensor: &mut SensorMultiplexer) {
@@ -617,6 +642,7 @@ fn start_open_sensor(
     };
     if mode == FileOpenSensor::Tracepoint {
         info!("file-open sensor: tracepoint mode (--file-open-sensor tracepoint) — every open reaches userland");
+        open_sensor_on_tracepoint("chosen with --file-open-sensor tracepoint");
         return;
     }
     if !fim_attached.contains(&northnarrow_agent::fim::attach::OPEN_SENSOR_PROGRAM) {
@@ -624,6 +650,7 @@ fn start_open_sensor(
             "file-open sensor: its file_open observer is not attached — keeping sys_enter_openat"
         );
         open_tracepoint_fallback(sensor);
+        open_sensor_on_tracepoint("its file_open observer is not attached");
         return;
     }
     let rules = RuleSet::build(&RuleInputs::from_host(carveout));
@@ -633,6 +660,7 @@ fn start_open_sensor(
         Err(e) => {
             warn!(error = %e, "file-open sensor: rule maps unavailable — keeping sys_enter_openat");
             open_tracepoint_fallback(sensor);
+            open_sensor_on_tracepoint(&format!("its rule maps are unavailable ({e})"));
             return;
         }
     };
@@ -647,6 +675,7 @@ fn start_open_sensor(
         Err(e) => {
             warn!(error = %e, "file-open sensor: ring unavailable — keeping sys_enter_openat");
             open_tracepoint_fallback(sensor);
+            open_sensor_on_tracepoint(&format!("its ring is unavailable ({e})"));
             return;
         }
     };
@@ -655,8 +684,10 @@ fn start_open_sensor(
     if let Err(e) = maps.arm(true) {
         warn!(error = %e, "file-open sensor: arming failed — keeping sys_enter_openat");
         open_tracepoint_fallback(sensor);
+        open_sensor_on_tracepoint(&format!("arming failed ({e})"));
         return;
     }
+    northnarrow_agent::boot::manifest::note_sensor("file_open", "lsm:file_open (FIM observer)");
     northnarrow_agent::posture::triggers::set_kernel_mass_write(true);
     // Armed: the old tracepoint (every openat to userland) goes. Its link
     // is retired first, or the BPF self-defence would report its absence
@@ -767,6 +798,9 @@ fn main() -> Result<()> {
     if let Some(nonce) = cli.telemetry_probe.as_deref() {
         std::process::exit(northnarrow_agent::telemetry_probe::run_child(nonce));
     }
+    if cli.deny_self_test {
+        std::process::exit(northnarrow_agent::boot::deny_selftest::run_child());
+    }
     if let Some(path) = &cli.btf_check {
         std::process::exit(btf_check(path));
     }
@@ -858,6 +892,12 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // before anything grows (the self-integrity check expects it there).
     northnarrow_agent::self_integrity::relax_oom_score_adj();
 
+    // Lab PR 218 (external review G-09 / Q11-03): the start's phases, in an
+    // order the code enforces (`northnarrow_agent::boot`). Preflight —
+    // checks only — until `enter_attach` hands out the permit the sensor
+    // and anti-tamper attach take; a step out of its phase stops the start.
+    let mut boot = BootSequence::new();
+
     // Boot preflight: prove the embedded eBPF half is real and intact
     // BEFORE doing any work. The build-time staleness guard
     // (agent/build.rs) refuses to embed a *stale* object; this refuses
@@ -868,6 +908,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // over-fire when a stale .o was embedded by a workspace build).
     northnarrow_agent::sensors::ebpf_object::preflight()
         .context("eBPF object boot preflight failed — refusing to start")?;
+    boot.done(BootStep::EbpfObject)?;
     // External audit ATP-007 (NN-AUD-260): the state directory, or one of
     // the agent's own entries in it, is not a symbolic link — checked before
     // anything below reads or writes there (the bootstraps would create
@@ -875,6 +916,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     northnarrow_agent::anti_tamper::filesystem::refuse_linked_state_dir(std::path::Path::new(
         northnarrow_agent::anti_tamper::filesystem::STATE_DIR,
     ))?;
+    boot.done(BootStep::StateDir)?;
 
     // External audit NN-AUD-098: tracepoint fields left on their compiled
     // offset, attested once the audit log is open.
@@ -1032,6 +1074,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             std::process::exit(EX_CONFIG);
         }
     }
+    boot.done(BootStep::BtfOffsets)?;
 
     // The COMBAT ladder holds a pidfd per attributed offender (external
     // audit CMB-004), up to its cap of 1 024, on top of the agent's own
@@ -1076,26 +1119,35 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         Some(why) => rollback_floor.reset_because(why),
         None => rollback_floor,
     };
+    boot.done(BootStep::ChainHeads)?;
 
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
     // registered — the files bootstrapped below when one is missing, a map
     // pin the eBPF load makes. Register in the pinned PROTECTED_PIDS first;
     // anti_tamper::attach does it again, with the stale-pid scan.
-    match northnarrow_agent::anti_tamper::preregister_self(std::path::Path::new(
-        northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT,
-    )) {
-        Ok(true) => info!(
-            "anti-tamper: registered in the pinned PROTECTED_PIDS before the bootstraps \
-             (a previous agent's hooks are attached)"
-        ),
-        Ok(false) => {}
-        Err(e) => warn!(
-            error = format!("{e:#}"),
-            "anti-tamper: early registration in PROTECTED_PIDS failed — a file or map pin \
-             this boot must recreate before the attach is refused by the previous hooks"
-        ),
-    }
+    // Lab PR 218: whether the previous hooks may close the agent's files to
+    // this process until the attach registers it (the audit preflight).
+    let early_registration_failed = match northnarrow_agent::anti_tamper::preregister_self(
+        std::path::Path::new(northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT),
+    ) {
+        Ok(true) => {
+            info!(
+                "anti-tamper: registered in the pinned PROTECTED_PIDS before the bootstraps \
+                 (a previous agent's hooks are attached)"
+            );
+            false
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                "anti-tamper: early registration in PROTECTED_PIDS failed — a file or map pin \
+                 this boot must recreate before the attach is refused by the previous hooks"
+            );
+            true
+        }
+    };
 
     // Tappa 8 A14 (B4): bootstrap the four /etc/northnarrow/ files
     // BEFORE the sensor multiplexer attaches the LSM hooks, so the
@@ -1271,6 +1323,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // last row is signed there too (EVD-020, `attest_identity`).
     let identity = agent_id::resolve(&cli.agent_id_file);
     let agent_id = identity.id;
+    boot.done(BootStep::Identity)?;
 
     // Tappa 10.8 — signed operator overlays: every `*.local` below is read
     // only if an admin key with `config-manage` signed its exact content
@@ -1282,6 +1335,314 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         rollback_floor,
     ));
     use common::wire::admin_signed_payload::OverlayKind;
+
+    // Lab PR 218: resolved before the attach — the capability gate below
+    // depends on it.
+    // BUG-033 detect-only: resolve the one no-enforcement gate from the
+    // CLI flag OR-ed with the env inputs (`from_env` reads
+    // `NN_DETECT_ONLY` / legacy `NORTHNARROW_DRY_RUN`). The resolved
+    // value drives BOTH the response Executor (via the config) and the
+    // COMBAT engage-hook below, so there is exactly one switch.
+    let mut exec_cfg = ExecutorConfig::from_env();
+    if cli.detect_only {
+        exec_cfg.dry_run = true;
+    }
+    let detect_only = exec_cfg.dry_run;
+    // External audit PROC-015 (NN-AUD-302): a demo-tappa5 build enforces
+    // R901..R904 on a file-name suffix any user picks; it starts in
+    // enforcement only with NN_ALLOW_DEMO_RULES=1 (a weakening variable,
+    // recorded as a signed integrity_drift). Before any response runs.
+    {
+        use northnarrow_agent::decision::engine as eng;
+        let allow = std::env::var(eng::ALLOW_DEMO_RULES_ENV).ok();
+        eng::demo_rules_gate(eng::DEMO_RULES_BUILD, detect_only, allow.as_deref())
+            .map_err(anyhow::Error::msg)?;
+        if eng::DEMO_RULES_BUILD {
+            warn!(
+                detect_only,
+                allow = allow.as_deref().unwrap_or(""),
+                "demo-tappa5 build: R901..R904 run ahead of every production rule — \
+                 a lab binary, never a release"
+            );
+        }
+    }
+    // External audit MAIN-008: the signed agent_boot entry says where
+    // detect-only came from.
+    let detect_only_source: Option<String> = if cli.detect_only {
+        Some("--detect-only".to_string())
+    } else {
+        northnarrow_agent::response::config::detect_only_env()
+            .map(|(name, v)| format!("{name}={v}"))
+    };
+    // Capability preflight (before anything attaches since lab PR 218,
+    // external review G-09 / Q11-03): the systemd CapabilityBoundingSet is the
+    // hard ceiling on what this root process can do. Without CAP_KILL,
+    // kill(2) only reaches uid-0 targets, so every KillProcess verdict
+    // against a user-owned process would EPERM — in enforcement mode
+    // that is a refuse-to-start, not a warning, and so is a set that
+    // cannot be verified (external audit CMB-028). The other caps only
+    // degrade a secondary surface: in enforcement an ERROR each here and
+    // a signed `subsystem_degraded` each once the audit log is open
+    // (below); in detect-only a WARN.
+    let caps_degraded: Vec<String> = {
+        use northnarrow_agent::response::caps_preflight as caps;
+        let reading = caps::read_effective();
+        if let caps::CapsReading::Read {
+            note: Some(note), ..
+        } = &reading
+        {
+            warn!("capability preflight: {note}");
+        }
+        match caps::boot_gate(&reading, detect_only) {
+            caps::BootGate::Refuse(why) => anyhow::bail!("{why}"),
+            caps::BootGate::Start { degraded } if degraded.is_empty() => {
+                debug!("capability preflight: all required caps present");
+                Vec::new()
+            }
+            caps::BootGate::Start { degraded } if detect_only => {
+                for d in &degraded {
+                    warn!("capability preflight: {d}");
+                }
+                Vec::new()
+            }
+            caps::BootGate::Start { degraded } => {
+                for d in &degraded {
+                    error!("capability preflight: {d}");
+                }
+                degraded
+            }
+        }
+    };
+    boot.done(BootStep::Capabilities)?;
+
+    // Supply chain, runtime half: the binaries running now must be the
+    // ones install.sh verified and recorded. Checked before the audit
+    // log opens so the agent_boot entry carries the result — and, since
+    // lab PR 218 (external review G-09 / Q11-03), before anything attaches.
+    let integrity = {
+        use northnarrow_agent::install_manifest::{
+            self, BootHistory, IntegrityOutcome, ALLOW_UNVERIFIED_ENV,
+        };
+        let own_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
+        let outcome = install_manifest::check(
+            &cli.install_manifest,
+            &own_exe,
+            northnarrow_agent::sensors::ebpf_object::OBJECT_SHA,
+        );
+        // External audit DEP-009: a missing manifest is a removal once a
+        // boot of this install verified against it — the signed chain is
+        // the sentinel, read (only in that case) before the decision.
+        let history = match &outcome {
+            IntegrityOutcome::NoManifest { .. } => {
+                match northnarrow_agent::audit::verified_boot_recorded(&cli.audit_log_file) {
+                    Ok(true) => BootHistory::VerifiedBefore,
+                    Ok(false) => BootHistory::NeverVerified,
+                    Err(e) => {
+                        error!(
+                            error = format!("{e:#}"),
+                            path = %cli.audit_log_file.display(),
+                            "audit chain unreadable — cannot show that this install never had a \
+                             verified boot; the missing install manifest counts as removed"
+                        );
+                        BootHistory::Unknown
+                    }
+                }
+            }
+            _ => BootHistory::NeverVerified,
+        };
+        match &outcome {
+            IntegrityOutcome::Verified {
+                provenance,
+                checked,
+            } => info!(
+                provenance,
+                checked,
+                manifest = %cli.install_manifest.display(),
+                "binary integrity verified against the install manifest"
+            ),
+            IntegrityOutcome::NoManifest { path } if history == BootHistory::NeverVerified => {
+                info!(
+                    path = %path.display(),
+                    "no install manifest and no verified boot in the audit chain — not installed \
+                     by install.sh (a developer run): binaries not re-verified at boot"
+                )
+            }
+            IntegrityOutcome::NoManifest { path } => error!(
+                path = %path.display(),
+                "install manifest MISSING after a verified boot of this install — it was removed \
+                 (install.sh writes it on every install, source trees included)"
+            ),
+            IntegrityOutcome::NotApplicable { own_exe, bin_dir } => info!(
+                own_exe = %own_exe.display(),
+                bin_dir,
+                "install manifest describes another copy (this binary runs outside bin_dir) — \
+                 not compared"
+            ),
+            IntegrityOutcome::Unreadable { path, reason } => error!(
+                path = %path.display(),
+                reason,
+                "install manifest unreadable — it sits under inode_protect, a broken one is a signal"
+            ),
+            IntegrityOutcome::Mismatch {
+                provenance,
+                mismatches,
+            } => {
+                for m in mismatches {
+                    error!(
+                        file = %m.name,
+                        expected = %m.expected,
+                        actual = %m.actual,
+                        provenance,
+                        "binary integrity MISMATCH — the running file is not the one install.sh \
+                         verified and recorded"
+                    );
+                }
+            }
+        }
+        let allow = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
+        if outcome.is_fatal(allow.as_deref(), history) {
+            error!(
+                "refusing to start: install-manifest check = {} (set {ALLOW_UNVERIFIED_ENV}=1 to \
+                 override on a dev host; re-run install.sh to restore a verified install)",
+                outcome.label()
+            );
+            // Leave the refusal in the signed audit chain before exiting.
+            let detail = match &outcome {
+                IntegrityOutcome::Mismatch { mismatches, .. } => mismatches
+                    .iter()
+                    .map(|m| format!("{}: expected {} got {}", m.name, m.expected, m.actual))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                IntegrityOutcome::Unreadable { reason, .. } => reason.clone(),
+                IntegrityOutcome::NoManifest { path } => format!(
+                    "{} missing ({}) — re-run install.sh",
+                    path.display(),
+                    if history == BootHistory::VerifiedBefore {
+                        "removed after a verified boot of this install"
+                    } else {
+                        "audit chain unreadable"
+                    }
+                ),
+                _ => String::new(),
+            };
+            record_refused_boot(
+                &cli,
+                &identity,
+                &overlay_gate,
+                "install_manifest",
+                (outcome.label(), outcome.provenance()),
+                None,
+                &detail,
+            );
+            std::process::exit(78);
+        } else if matches!(
+            outcome,
+            IntegrityOutcome::Mismatch { .. } | IntegrityOutcome::Unreadable { .. }
+        ) || (matches!(outcome, IntegrityOutcome::NoManifest { .. })
+            && history != BootHistory::NeverVerified)
+        {
+            warn!(
+                "install-manifest check = {} but {ALLOW_UNVERIFIED_ENV}=1 — continuing (dev override)",
+                outcome.label()
+            );
+        }
+        outcome
+    };
+    boot.done(BootStep::InstallManifest)?;
+
+    // Lab PR 218 (external review G-09 / Q11-03): the audit log's
+    // writability before anything attaches — a read-only mount or an
+    // immutable file refuses the start while the host is untouched. The
+    // signed `agent_boot` after the attach still proves it with a row.
+    match northnarrow_agent::audit::preflight_writable(
+        &cli.audit_log_file,
+        early_registration_failed,
+    ) {
+        northnarrow_agent::audit::AuditPreflight::Writable => {
+            debug!(path = %cli.audit_log_file.display(), "audit log writable (preflight)")
+        }
+        northnarrow_agent::audit::AuditPreflight::Deferred(why) => info!(
+            why,
+            "audit log closed to this process until the attach registers it — the boot probe \
+             decides"
+        ),
+        northnarrow_agent::audit::AuditPreflight::Unwritable(why) => {
+            let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+                std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+                    .ok()
+                    .as_deref(),
+            );
+            error!(
+                why,
+                fatal,
+                "audit log NOT writable — found before anything attached (is the directory in \
+                 the unit's ReadWritePaths?)"
+            );
+            if fatal {
+                anyhow::bail!(
+                    "audit log {} is not writable: {why}. Refusing to run unaudited; set {}=1 to \
+                     start anyway.",
+                    cli.audit_log_file.display(),
+                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                );
+            }
+        }
+    }
+    boot.done(BootStep::AuditWritable)?;
+
+    // Host hardening (Tappa 10.8): the anti-tamper holds only while root
+    // cannot rewrite the kernel at runtime. One WARN per missing setting,
+    // with the fix; `nn-admin host-check` prints the same table.
+    // Lab PR 218: before the attach, and kept for the capability manifest
+    // (signed at every boot, next to the trust level).
+    let host_checks = {
+        let checks = northnarrow_agent::host_hardening::run();
+        let warns = northnarrow_agent::host_hardening::warn_count(&checks);
+        for c in &checks {
+            if c.status == northnarrow_agent::host_hardening::Status::Warn {
+                warn!(check = c.id, value = %c.value, fix = c.fix, "host hardening: {}", c.name);
+            }
+        }
+        info!(
+            checks = checks.len(),
+            warnings = warns,
+            "host hardening checks done (nn-admin host-check for the table)"
+        );
+        checks
+    };
+    boot.done(BootStep::HostHardening)?;
+
+    // Lab PR 218 (external review AR-09 / G-11): without `bpf` in the
+    // active LSM list the deny hooks attach and never run. Refused before
+    // anything attaches, unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1; signed
+    // either way (`northnarrow_agent::boot::lsm`).
+    let allow_degraded = northnarrow_agent::boot::lsm::allow_degraded_from_env();
+    let bpf_lsm_state = northnarrow_agent::boot::lsm::read_in(std::path::Path::new("/"));
+    match northnarrow_agent::boot::lsm::gate(&bpf_lsm_state, allow_degraded) {
+        northnarrow_agent::boot::lsm::LsmGate::Proceed => info!(
+            lsms = bpf_lsm_state.list().unwrap_or(""),
+            "BPF LSM active — the deny hooks will run"
+        ),
+        northnarrow_agent::boot::lsm::LsmGate::Degraded { detail } => {
+            error!("{detail}");
+            northnarrow_agent::boot::degradation::report("bpf_lsm", &detail);
+        }
+        northnarrow_agent::boot::lsm::LsmGate::Refuse { detail } => {
+            error!("refusing to start: {detail}. Exiting 78.");
+            record_refused_boot(
+                &cli,
+                &identity,
+                &overlay_gate,
+                "bpf_lsm",
+                (integrity.label(), integrity.provenance()),
+                Some(("bpf_lsm", detail.as_str())),
+                &detail,
+            );
+            std::process::exit(78);
+        }
+    }
+    boot.done(BootStep::BpfLsm)?;
+    let attach_permit = boot.enter_attach()?;
 
     // Process-lineage cache shared by the posture triggers and the FIM
     // rules' package-manager carve-out (review 49): "does this writer
@@ -1327,9 +1688,10 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             }
         }
     }
-    let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring)
+    let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring, &attach_permit)
         .await
         .context("starting the sensor multiplexer (with net observation)")?;
+    boot.done(BootStep::Sensors)?;
     info!(
         sensors =
             "process_spawn, file_open, exec_check, tcp_connect_v4, tcp_connect_v6, dns_query, \
@@ -1365,16 +1727,245 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     let pids = vec![agent_pid];
     // Audit `ebpf-lsm-1`: a deny-hook shortfall is fail-closed (the
     // escape hatch is NN_ANTI_TAMPER_ALLOW_DEGRADED=1, handled inside
-    // anti_tamper::attach). A kernel without BPF-LSM is NOT an error
-    // here — attach returns Ok after logging that anti-tamper is off.
-    sensor.attach_anti_tamper(&pids, &keep).with_context(|| {
-        format!(
-            "anti-tamper setup failed (agent_pid={agent_pid}) — \
+    // anti_tamper::attach). A kernel without `bpf` in its active LSMs was
+    // refused by the preflight above (lab PR 218), or runs under that same
+    // opt-in; hooks that attach and never run are the self-test's below.
+    sensor
+        .attach_anti_tamper(&attach_permit, &pids, &keep)
+        .with_context(|| {
+            format!(
+                "anti-tamper setup failed (agent_pid={agent_pid}) — \
                  refusing to start with a silently-absent protection"
-        )
-    })?;
+            )
+        })?;
+    boot.done(BootStep::AntiTamper)?;
     // External audit DEP-006: the ids install.sh / uninstall.sh wait for.
     record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
+
+    // Lab PR 218 (external review AR-09 / G-12): one deny hook exercised
+    // against the agent itself — an unprotected child signals it and must
+    // be refused. Hooks attached but not run (`bpf` missing from the active
+    // LSMs, Ubuntu) refuse the start unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1;
+    // an unmeasured test is signed and lowers the trust level to L1.
+    boot.enter(BootPhase::SelfTest)?;
+    let self_test =
+        northnarrow_agent::boot::deny_selftest::run(std::path::Path::new("/proc/self/exe"));
+    let self_test_detail = northnarrow_agent::boot::deny_selftest::report(&self_test);
+    if self_test == northnarrow_agent::boot::deny_selftest::SelfTestOutcome::NotDenied
+        && !allow_degraded
+    {
+        let detail = self_test_detail.clone().unwrap_or_default();
+        error!(
+            "refusing to start: {detail}; set {}=1 to start without enforcement. Exiting 78.",
+            northnarrow_agent::anti_tamper::ALLOW_DEGRADED_ENV
+        );
+        record_refused_boot(
+            &cli,
+            &identity,
+            &overlay_gate,
+            "deny_self_test",
+            (integrity.label(), integrity.provenance()),
+            Some(("deny_self_test", detail.as_str())),
+            &detail,
+        );
+        std::process::exit(78);
+    }
+    if let Some(detail) = &self_test_detail {
+        northnarrow_agent::boot::degradation::report("deny_self_test", detail);
+    }
+    {
+        let deny = northnarrow_agent::anti_tamper::deny_report().unwrap_or_default();
+        northnarrow_agent::boot::trust::set_boot_inputs(
+            northnarrow_agent::boot::trust::TrustInputs {
+                bpf_lsm: bpf_lsm_state.clone(),
+                deny_expected: deny.expected,
+                deny_attached: deny.attached,
+                self_test: self_test.clone(),
+                detect_only,
+            },
+        );
+    }
+    boot.done(BootStep::DenySelfTest)?;
+
+    // Lab PR 218: the signed audit log right after the self-test, before
+    // the subsystems below load (the blocklists, the rules, the response
+    // executor, the posture, FIM): every degradation found so far is signed
+    // now, and later ones within `boot::degradation::FLUSH_PERIOD`.
+    boot.enter(BootPhase::Attest)?;
+    // ── Shared audit log + COMBAT graduated-response ladder ─────────
+    //
+    // The signed, hash-chained audit log is opened ONCE here (now that
+    // agent_id is ready) and shared by both the COMBAT ladder (per-stage
+    // signed transitions) and the admin socket (admin-op audit). A `None`
+    // audit log (open/key failure) degrades to log-only, exactly as the
+    // admin-op path already tolerates.
+    let mut chain_anchor: Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>> =
+        None;
+    let audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>> =
+        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+            Ok(key) => {
+                match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
+                    // Boot write probe (etc-readonly-audit-1): a signed
+                    // `agent_boot` entry proves the chain is writable NOW
+                    // instead of failing silently at the first COMBAT
+                    // transition. Fail-closed in enforcement mode.
+                    Ok(mut log) => {
+                        // Lab PR 160: anchor the heads as this boot found
+                        // them before it appends anything (the snapshot is on
+                        // disk before the first numbered row of an upgrade).
+                        // A row-number break in the audit chain counts as
+                        // lost history there too (ATP-004 fails closed).
+                        for f in log.take_open_findings(&cli.audit_log_file) {
+                            boot_chains.findings.push(f);
+                        }
+                        chain_anchor = start_chain_anchor(
+                            &cli,
+                            &heads_file,
+                            &chain_targets,
+                            &mut boot_chains,
+                            agent_id,
+                            &log,
+                        );
+                        // External audit LLMR-014: the rollback floor's
+                        // reset / anchor come first in this boot's entries.
+                        overlay_gate.attest_floor(&mut log);
+                        // Lab PR 160: what the chain checks found, then the
+                        // one-time record of where numbering starts.
+                        for f in &boot_chains.findings {
+                            f.attest(Some(&mut log));
+                        }
+                        if let Some(marker) =
+                            chain_anchor.as_ref().and_then(|a| a.lock().take_marker())
+                        {
+                            if let Err(e) = log.append(marker) {
+                                warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
+                            }
+                        }
+                        // External audit EVD-020 / MAIN-009: a minted id, an
+                        // id other than the one the chain's last row carries,
+                        // or a per-boot id (the file unusable) is signed
+                        // before the boot's own entry.
+                        if let Err(e) = log.attest_identity(&identity) {
+                            warn!(error = format!("{e:#}"), "agent identity not recorded");
+                        }
+                        match log.boot_probe(
+                            detect_only_source.as_deref(),
+                            integrity.label(),
+                            integrity.provenance(),
+                        ) {
+                            Ok(entry) => {
+                                info!(
+                                    path = %cli.audit_log_file.display(),
+                                    entry_hash = %entry.entry_hash,
+                                    "audit log writable — agent_boot entry appended"
+                                );
+                                if let northnarrow_agent::audit::PreviousRun::Abrupt {
+                                    booted_at,
+                                    last_entry_at,
+                                } = log.previous_run()
+                                {
+                                    warn!(
+                                        booted_at = %booted_at,
+                                        last_entry_at = %last_entry_at,
+                                        "PREVIOUS RUN ENDED ABRUPTLY — the agent that booted then never \
+                                         wrote agent_stop: SIGKILL (systemctl kill, cgroup.kill), OOM, \
+                                         crash or power loss; recorded in this boot's audit entry"
+                                    );
+                                }
+                                Some(Arc::new(parking_lot::Mutex::new(log)))
+                            }
+                            Err(e) => {
+                                let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+                                    std::env::var(
+                                        northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV,
+                                    )
+                                    .ok()
+                                    .as_deref(),
+                                );
+                                error!(
+                                    error = format!("{e:#}"),
+                                    path = %cli.audit_log_file.display(),
+                                    fatal,
+                                    "audit log NOT writable — the signed audit chain would stop here \
+                                     (is the directory in the unit's ReadWritePaths?)"
+                                );
+                                if fatal {
+                                    anyhow::bail!(
+                                    "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
+                                     set {}=1 to start anyway.",
+                                    cli.audit_log_file.display(),
+                                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                                );
+                                }
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+                            std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+                                .ok()
+                                .as_deref(),
+                        );
+                        error!(error = format!("{e:#}"), fatal, "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED");
+                        if fatal {
+                            anyhow::bail!(
+                                "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway.",
+                                cli.audit_log_file.display(),
+                                northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = format!("{e:#}"), "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
+                None
+            }
+        };
+    boot.done(BootStep::AgentBoot)?;
+    // External audit ATP-016 (NN-AUD-264): a start under
+    // NN_ANTI_TAMPER_ALLOW_DEGRADED=1 and a missing observe hook, in the
+    // signed chain with what is missing — the journal line was the only
+    // trace.
+    for detail in northnarrow_agent::anti_tamper::take_degraded_boot_details() {
+        northnarrow_agent::boot::degradation::report("anti_tamper", &detail);
+    }
+    // External audit NN-AUD-098 / lab PR 164 / CMB-028: found before the
+    // attach, signed here (lab PR 218: they waited for the subsystems'
+    // setup).
+    if let Some(detail) = &tracepoint_degraded {
+        northnarrow_agent::boot::degradation::report("tracepoint_offsets", detail);
+    }
+    if let Some(detail) = &hook_args_degraded {
+        northnarrow_agent::boot::degradation::report("lsm_hook_args", detail);
+    }
+    for detail in &caps_degraded {
+        northnarrow_agent::boot::degradation::report("capabilities", detail);
+    }
+    // External audit EBPF-006: on the `udp_sendmsg` sensor (a kernel
+    // without what the socket-buffer programs need, or `--dns-sensor
+    // sendmsg`) a query's name is read from the sender's memory before the
+    // kernel copies it: the sender can change it in between, so the name
+    // recorded and the one sent may differ.
+    if !northnarrow_agent::sensors::dns_sensor::skb_active() {
+        northnarrow_agent::boot::degradation::report(
+            "dns_sensor",
+            "DNS sensor on udp_sendmsg: query names read from the sender's memory, which it \
+             can rewrite before the kernel sends them (IPv4 only)",
+        );
+    }
+    let signed = northnarrow_agent::boot::degradation::attach_audit_log(audit_log.clone());
+    northnarrow_agent::boot::degradation::spawn_flusher();
+    if signed > 0 {
+        info!(
+            degradations = signed,
+            "boot degradations signed in the audit chain (nn-admin status --key lists them)"
+        );
+    }
+    boot.done(BootStep::BootDegradations)?;
+    boot.enter(BootPhase::Subsystems)?;
 
     // Tappa 10 N9 — load operator-curated netflow blocklists from
     // disk + thread them into the decision engine. Load failures
@@ -1446,6 +2037,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             local = %cli.netflow_ja3_blocklist_local.display(),
             "{gap}"
         );
+        // External audit NET-009: the JA3 list with no producer.
+        attest_degraded(audit_log.as_ref(), gap);
     }
     // External audit NET-017 (lab PR 207): systemd-resolved on DNS over TLS
     // hides its upstream queries from the DNS rules. Said at boot; `nn-admin
@@ -1608,42 +2201,6 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         debug!("no --pid-file provided; PID file write skipped (production default)");
     }
 
-    // BUG-033 detect-only: resolve the one no-enforcement gate from the
-    // CLI flag OR-ed with the env inputs (`from_env` reads
-    // `NN_DETECT_ONLY` / legacy `NORTHNARROW_DRY_RUN`). The resolved
-    // value drives BOTH the response Executor (via the config) and the
-    // COMBAT engage-hook below, so there is exactly one switch.
-    let mut exec_cfg = ExecutorConfig::from_env();
-    if cli.detect_only {
-        exec_cfg.dry_run = true;
-    }
-    let detect_only = exec_cfg.dry_run;
-    // External audit PROC-015 (NN-AUD-302): a demo-tappa5 build enforces
-    // R901..R904 on a file-name suffix any user picks; it starts in
-    // enforcement only with NN_ALLOW_DEMO_RULES=1 (a weakening variable,
-    // recorded as a signed integrity_drift). Before any response runs.
-    {
-        use northnarrow_agent::decision::engine as eng;
-        let allow = std::env::var(eng::ALLOW_DEMO_RULES_ENV).ok();
-        eng::demo_rules_gate(eng::DEMO_RULES_BUILD, detect_only, allow.as_deref())
-            .map_err(anyhow::Error::msg)?;
-        if eng::DEMO_RULES_BUILD {
-            warn!(
-                detect_only,
-                allow = allow.as_deref().unwrap_or(""),
-                "demo-tappa5 build: R901..R904 run ahead of every production rule — \
-                 a lab binary, never a release"
-            );
-        }
-    }
-    // External audit MAIN-008: the signed agent_boot entry says where
-    // detect-only came from.
-    let detect_only_source: Option<String> = if cli.detect_only {
-        Some("--detect-only".to_string())
-    } else {
-        northnarrow_agent::response::config::detect_only_env()
-            .map(|(name, v)| format!("{name}={v}"))
-    };
     // External audit CMB-006: an older agent's host-wide nftables blackout
     // (no carve-out, no release, no status) is removed before anything
     // else; host-wide isolation is the COMBAT ladder's alone.
@@ -1716,68 +2273,13 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
              isolation will touch the system — verdicts are logged as \"would execute\" only"
         );
     }
-    // Capability preflight: the systemd CapabilityBoundingSet is the
-    // hard ceiling on what this root process can do. Without CAP_KILL,
-    // kill(2) only reaches uid-0 targets, so every KillProcess verdict
-    // against a user-owned process would EPERM — in enforcement mode
-    // that is a refuse-to-start, not a warning, and so is a set that
-    // cannot be verified (external audit CMB-028). The other caps only
-    // degrade a secondary surface: in enforcement an ERROR each here and
-    // a signed `subsystem_degraded` each once the audit log is open
-    // (below); in detect-only a WARN.
-    let caps_degraded: Vec<String> = {
-        use northnarrow_agent::response::caps_preflight as caps;
-        let reading = caps::read_effective();
-        if let caps::CapsReading::Read {
-            note: Some(note), ..
-        } = &reading
-        {
-            warn!("capability preflight: {note}");
-        }
-        match caps::boot_gate(&reading, detect_only) {
-            caps::BootGate::Refuse(why) => anyhow::bail!("{why}"),
-            caps::BootGate::Start { degraded } if degraded.is_empty() => {
-                debug!("capability preflight: all required caps present");
-                Vec::new()
-            }
-            caps::BootGate::Start { degraded } if detect_only => {
-                for d in &degraded {
-                    warn!("capability preflight: {d}");
-                }
-                Vec::new()
-            }
-            caps::BootGate::Start { degraded } => {
-                for d in &degraded {
-                    error!("capability preflight: {d}");
-                }
-                degraded
-            }
-        }
-    };
-
-    // Host hardening (Tappa 10.8): the anti-tamper holds only while root
-    // cannot rewrite the kernel at runtime. One WARN per missing setting,
-    // with the fix; `nn-admin host-check` prints the same table.
-    {
-        let checks = northnarrow_agent::host_hardening::run();
-        let warns = northnarrow_agent::host_hardening::warn_count(&checks);
-        for c in &checks {
-            if c.status == northnarrow_agent::host_hardening::Status::Warn {
-                warn!(check = c.id, value = %c.value, fix = c.fix, "host hardening: {}", c.name);
-            }
-        }
-        info!(
-            checks = checks.len(),
-            warnings = warns,
-            "host hardening checks done (nn-admin host-check for the table)"
-        );
-    }
     // Lab follow-up (lab PR 165): without `nft` the per-process outbound
     // block cannot work. Said once here, and in the signed chain once the
     // audit log is open (below), instead of only at the first block.
     let nft_gap = northnarrow_agent::response::block_outbound::nft_gap_at_boot();
     if let Some(gap) = &nft_gap {
         error!("{gap}");
+        attest_degraded(audit_log.as_ref(), gap);
     }
     info!(
         own_pid = executor.own_pid(),
@@ -2072,285 +2574,6 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }
     }
 
-    // Supply chain, runtime half: the binaries running now must be the
-    // ones install.sh verified and recorded. Checked before the audit
-    // log opens so the agent_boot entry carries the result.
-    let integrity = {
-        use northnarrow_agent::install_manifest::{
-            self, BootHistory, IntegrityOutcome, ALLOW_UNVERIFIED_ENV,
-        };
-        let own_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
-        let outcome = install_manifest::check(
-            &cli.install_manifest,
-            &own_exe,
-            northnarrow_agent::sensors::ebpf_object::OBJECT_SHA,
-        );
-        // External audit DEP-009: a missing manifest is a removal once a
-        // boot of this install verified against it — the signed chain is
-        // the sentinel, read (only in that case) before the decision.
-        let history = match &outcome {
-            IntegrityOutcome::NoManifest { .. } => {
-                match northnarrow_agent::audit::verified_boot_recorded(&cli.audit_log_file) {
-                    Ok(true) => BootHistory::VerifiedBefore,
-                    Ok(false) => BootHistory::NeverVerified,
-                    Err(e) => {
-                        error!(
-                            error = format!("{e:#}"),
-                            path = %cli.audit_log_file.display(),
-                            "audit chain unreadable — cannot show that this install never had a \
-                             verified boot; the missing install manifest counts as removed"
-                        );
-                        BootHistory::Unknown
-                    }
-                }
-            }
-            _ => BootHistory::NeverVerified,
-        };
-        match &outcome {
-            IntegrityOutcome::Verified {
-                provenance,
-                checked,
-            } => info!(
-                provenance,
-                checked,
-                manifest = %cli.install_manifest.display(),
-                "binary integrity verified against the install manifest"
-            ),
-            IntegrityOutcome::NoManifest { path } if history == BootHistory::NeverVerified => {
-                info!(
-                    path = %path.display(),
-                    "no install manifest and no verified boot in the audit chain — not installed \
-                     by install.sh (a developer run): binaries not re-verified at boot"
-                )
-            }
-            IntegrityOutcome::NoManifest { path } => error!(
-                path = %path.display(),
-                "install manifest MISSING after a verified boot of this install — it was removed \
-                 (install.sh writes it on every install, source trees included)"
-            ),
-            IntegrityOutcome::NotApplicable { own_exe, bin_dir } => info!(
-                own_exe = %own_exe.display(),
-                bin_dir,
-                "install manifest describes another copy (this binary runs outside bin_dir) — \
-                 not compared"
-            ),
-            IntegrityOutcome::Unreadable { path, reason } => error!(
-                path = %path.display(),
-                reason,
-                "install manifest unreadable — it sits under inode_protect, a broken one is a signal"
-            ),
-            IntegrityOutcome::Mismatch {
-                provenance,
-                mismatches,
-            } => {
-                for m in mismatches {
-                    error!(
-                        file = %m.name,
-                        expected = %m.expected,
-                        actual = %m.actual,
-                        provenance,
-                        "binary integrity MISMATCH — the running file is not the one install.sh \
-                         verified and recorded"
-                    );
-                }
-            }
-        }
-        let allow = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
-        if outcome.is_fatal(allow.as_deref(), history) {
-            error!(
-                "refusing to start: install-manifest check = {} (set {ALLOW_UNVERIFIED_ENV}=1 to \
-                 override on a dev host; re-run install.sh to restore a verified install)",
-                outcome.label()
-            );
-            // Leave the refusal in the signed audit chain before exiting.
-            let detail = match &outcome {
-                IntegrityOutcome::Mismatch { mismatches, .. } => mismatches
-                    .iter()
-                    .map(|m| format!("{}: expected {} got {}", m.name, m.expected, m.actual))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-                IntegrityOutcome::Unreadable { reason, .. } => reason.clone(),
-                IntegrityOutcome::NoManifest { path } => format!(
-                    "{} missing ({}) — re-run install.sh",
-                    path.display(),
-                    if history == BootHistory::VerifiedBefore {
-                        "removed after a verified boot of this install"
-                    } else {
-                        "audit chain unreadable"
-                    }
-                ),
-                _ => String::new(),
-            };
-            if let Ok(key) =
-                northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
-            {
-                if let Ok(mut log) =
-                    northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id)
-                {
-                    overlay_gate.attest_floor(&mut log);
-                    // External audit EVD-020: a refused boot records its
-                    // identity too.
-                    if let Err(e) = log.attest_identity(&identity) {
-                        warn!(error = format!("{e:#}"), "agent identity not recorded");
-                    }
-                    match log.boot_refused(outcome.label(), outcome.provenance(), &detail) {
-                        Ok(e) => {
-                            info!(entry_hash = %e.entry_hash, "refused boot recorded in the audit chain")
-                        }
-                        Err(e) => error!(
-                            error = format!("{e:#}"),
-                            "could not record the refused boot in the audit chain"
-                        ),
-                    }
-                }
-            }
-            std::process::exit(78);
-        } else if matches!(
-            outcome,
-            IntegrityOutcome::Mismatch { .. } | IntegrityOutcome::Unreadable { .. }
-        ) || (matches!(outcome, IntegrityOutcome::NoManifest { .. })
-            && history != BootHistory::NeverVerified)
-        {
-            warn!(
-                "install-manifest check = {} but {ALLOW_UNVERIFIED_ENV}=1 — continuing (dev override)",
-                outcome.label()
-            );
-        }
-        outcome
-    };
-
-    // ── Shared audit log + COMBAT graduated-response ladder ─────────
-    //
-    // The signed, hash-chained audit log is opened ONCE here (now that
-    // agent_id is ready) and shared by both the COMBAT ladder (per-stage
-    // signed transitions) and the admin socket (admin-op audit). A `None`
-    // audit log (open/key failure) degrades to log-only, exactly as the
-    // admin-op path already tolerates.
-    let mut chain_anchor: Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>> =
-        None;
-    let audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>> =
-        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
-            Ok(key) => {
-                match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
-                    // Boot write probe (etc-readonly-audit-1): a signed
-                    // `agent_boot` entry proves the chain is writable NOW
-                    // instead of failing silently at the first COMBAT
-                    // transition. Fail-closed in enforcement mode.
-                    Ok(mut log) => {
-                        // Lab PR 160: anchor the heads as this boot found
-                        // them before it appends anything (the snapshot is on
-                        // disk before the first numbered row of an upgrade).
-                        // A row-number break in the audit chain counts as
-                        // lost history there too (ATP-004 fails closed).
-                        for f in log.take_open_findings(&cli.audit_log_file) {
-                            boot_chains.findings.push(f);
-                        }
-                        chain_anchor = start_chain_anchor(
-                            &cli,
-                            &heads_file,
-                            &chain_targets,
-                            &mut boot_chains,
-                            agent_id,
-                            &log,
-                        );
-                        // External audit LLMR-014: the rollback floor's
-                        // reset / anchor come first in this boot's entries.
-                        overlay_gate.attest_floor(&mut log);
-                        // Lab PR 160: what the chain checks found, then the
-                        // one-time record of where numbering starts.
-                        for f in &boot_chains.findings {
-                            f.attest(Some(&mut log));
-                        }
-                        if let Some(marker) =
-                            chain_anchor.as_ref().and_then(|a| a.lock().take_marker())
-                        {
-                            if let Err(e) = log.append(marker) {
-                                warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
-                            }
-                        }
-                        // External audit EVD-020 / MAIN-009: a minted id, an
-                        // id other than the one the chain's last row carries,
-                        // or a per-boot id (the file unusable) is signed
-                        // before the boot's own entry.
-                        if let Err(e) = log.attest_identity(&identity) {
-                            warn!(error = format!("{e:#}"), "agent identity not recorded");
-                        }
-                        match log.boot_probe(
-                            detect_only_source.as_deref(),
-                            integrity.label(),
-                            integrity.provenance(),
-                        ) {
-                            Ok(entry) => {
-                                info!(
-                                    path = %cli.audit_log_file.display(),
-                                    entry_hash = %entry.entry_hash,
-                                    "audit log writable — agent_boot entry appended"
-                                );
-                                if let northnarrow_agent::audit::PreviousRun::Abrupt {
-                                    booted_at,
-                                    last_entry_at,
-                                } = log.previous_run()
-                                {
-                                    warn!(
-                                        booted_at = %booted_at,
-                                        last_entry_at = %last_entry_at,
-                                        "PREVIOUS RUN ENDED ABRUPTLY — the agent that booted then never \
-                                         wrote agent_stop: SIGKILL (systemctl kill, cgroup.kill), OOM, \
-                                         crash or power loss; recorded in this boot's audit entry"
-                                    );
-                                }
-                                Some(Arc::new(parking_lot::Mutex::new(log)))
-                            }
-                            Err(e) => {
-                                let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                                    std::env::var(
-                                        northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV,
-                                    )
-                                    .ok()
-                                    .as_deref(),
-                                );
-                                error!(
-                                    error = format!("{e:#}"),
-                                    path = %cli.audit_log_file.display(),
-                                    fatal,
-                                    "audit log NOT writable — the signed audit chain would stop here \
-                                     (is the directory in the unit's ReadWritePaths?)"
-                                );
-                                if fatal {
-                                    anyhow::bail!(
-                                    "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
-                                     set {}=1 to start anyway.",
-                                    cli.audit_log_file.display(),
-                                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
-                                );
-                                }
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                            std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
-                                .ok()
-                                .as_deref(),
-                        );
-                        error!(error = format!("{e:#}"), fatal, "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED");
-                        if fatal {
-                            anyhow::bail!(
-                                "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway.",
-                                cli.audit_log_file.display(),
-                                northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
-                            );
-                        }
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = format!("{e:#}"), "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
-                None
-            }
-        };
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
@@ -2359,13 +2582,6 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
     // root that are not the agent's links, one signed `integrity_drift` each.
     northnarrow_agent::anti_tamper::bpf_defense::attest_foreign_pins(audit_log.as_ref());
-    // External audit ATP-016 (NN-AUD-264): a start under
-    // NN_ANTI_TAMPER_ALLOW_DEGRADED=1 and a missing observe hook, in the
-    // signed chain with what is missing — the journal line was the only
-    // trace.
-    for detail in northnarrow_agent::anti_tamper::take_degraded_boot_details() {
-        attest_degraded(audit_log.as_ref(), &detail);
-    }
     // Tappa 10.8 — overlay decisions taken before the audit log existed.
     overlay_gate.attach_audit_log(audit_log.clone());
     // External audit CMB-017: quarantines are recorded in the signed chain.
@@ -2579,38 +2795,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     if let Some(outcome) = &stale_combat {
         northnarrow_agent::combat::reconcile::attest(audit_log.as_ref(), outcome);
     }
-    if let Some(detail) = &tracepoint_degraded {
-        attest_degraded(audit_log.as_ref(), detail);
-    }
-    if let Some(detail) = &hook_args_degraded {
-        attest_degraded(audit_log.as_ref(), detail);
-    }
-    // External audit NET-009: the JA3 list with no producer (see its load).
-    if let Some(gap) = &ja3_gap {
-        attest_degraded(audit_log.as_ref(), gap);
-    }
-    // Lab follow-up (lab PR 165): no `nft` for the outbound block (see its
-    // check).
-    if let Some(gap) = &nft_gap {
-        attest_degraded(audit_log.as_ref(), gap);
-    }
-    // External audit CMB-028: the capabilities the unit does not grant (see
-    // the preflight).
-    for detail in &caps_degraded {
-        attest_degraded(audit_log.as_ref(), detail);
-    }
-    // External audit EBPF-006: on the `udp_sendmsg` sensor (a kernel
-    // without what the socket-buffer programs need, or `--dns-sensor
-    // sendmsg`) a query's name is read from the sender's memory before the
-    // kernel copies it: the sender can change it in between, so the name
-    // recorded and the one sent may differ.
-    if !northnarrow_agent::sensors::dns_sensor::skb_active() {
-        attest_degraded(
-            audit_log.as_ref(),
-            "DNS sensor on udp_sendmsg: query names read from the sender's memory, which it \
-             can rewrite before the kernel sends them (IPv4 only)",
-        );
-    }
+    // Lab PR 218: the tracepoint offsets, the hook arguments, the
+    // capabilities and the DNS sensor are signed at the audit log's open
+    // (above); the JA3 gap and `nft` where they are found.
     // External audit FIMR-001: FIM watching nothing used to show only as
     // `effective=0` in an INFO line.
     if watched_paths_load.effective.is_empty() {
@@ -3005,6 +3192,14 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                         Arc::new(InodePathMap::new())
                     }
                 };
+                northnarrow_agent::boot::manifest::note_sensor(
+                    "fim_observers",
+                    &format!(
+                        "lsm: {} of {} observe programs",
+                        fim_attached.len(),
+                        northnarrow_agent::fim::attach::FIM_OBSERVE_PROGRAMS.len()
+                    ),
+                );
                 // External audit FIMP-011: a FIM that attached no observer, or
                 // watches nothing, sees no file change at all. Said in the
                 // signed audit chain, not only in an INFO among the boot lines.
@@ -3540,11 +3735,24 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }) {
             Ok(db) => Some(Arc::new(parking_lot::Mutex::new(db))),
             Err(e) => {
-                warn!(
+                // Lab PR 218 (external review P0 C-14): the drain no longer
+                // stays off for the whole boot (TCP, UDP and listeners
+                // blind): it runs without the log, signed.
+                error!(
                     error = %e,
                     path = %cli.netflow_file.display(),
-                    "netflow DB open failed — net drain loop will not spawn; \
-                     kernel flow close events will be dropped this boot"
+                    "netflow log cannot be opened — flows are evaluated by the rules but not \
+                     persisted this boot"
+                );
+                northnarrow_agent::boot::degradation::report_signed(
+                    audit_log.as_ref(),
+                    "net_drain",
+                    &format!(
+                        "netflow log {} cannot be opened ({e:#}): flows reach the rules, not \
+                         persisted this boot",
+                        cli.netflow_file.display()
+                    ),
+                    true,
                 );
                 None
             }
@@ -3575,10 +3783,22 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     "netflow_listeners log cannot be opened — listener events are \
                      evaluated but not persisted this boot"
                 );
+                // Lab PR 218: signed, not only an ERROR.
+                northnarrow_agent::boot::degradation::report_signed(
+                    audit_log.as_ref(),
+                    "net_drain",
+                    &format!(
+                        "netflow_listeners log {} cannot be opened ({e:#}): listener events \
+                         reach the rules, not persisted this boot",
+                        cli.netflow_listeners_file.display()
+                    ),
+                    true,
+                );
                 None
             }
         };
-        if let Some(netflow_db) = netflow_db_opt {
+        {
+            let netflow_db = netflow_db_opt;
             let listener_db = listener_db_opt;
             let flow_tracker_for_drain = Arc::clone(&flow_tracker);
             let dns_cache_for_drain = Arc::clone(&dns_cache);
@@ -3612,11 +3832,6 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             });
             sensor.register_pump_handle("net_drain", handle);
             info!("net: drain loop spawned (NET_FLOW_CLOSE_EVENTS + NET_LISTEN_EVENTS)");
-        } else {
-            warn!(
-                "net: drain loop not spawned — see prior warnings for failed \
-                 db open(s); kernel net events will accumulate in ringbufs"
-            );
         }
     }
 
@@ -3809,6 +4024,71 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
     let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+
+    // Lab PR 218 (external review G-12): every attach of this boot is done.
+    // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
+    // sensors, host hardening, degradations — and the trust level are
+    // signed before systemd hears the agent is ready.
+    boot.enter(BootPhase::Run)?;
+    {
+        use northnarrow_agent::boot::manifest;
+        let deny = northnarrow_agent::anti_tamper::deny_report().unwrap_or_default();
+        let resolved = northnarrow_agent::anti_tamper::btf_revalidate::resolved();
+        let trust = northnarrow_agent::boot::trust::current().unwrap_or_else(|| {
+            northnarrow_agent::boot::trust::Trust {
+                level: northnarrow_agent::boot::trust::TrustLevel::L0,
+                reasons: vec!["the boot measured nothing".to_string()],
+            }
+        });
+        let m = manifest::CapabilityManifest {
+            manifest_version: manifest::MANIFEST_VERSION,
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            kernel: manifest::kernel_release(),
+            btf: std::path::Path::new("/sys/kernel/btf/vmlinux").exists(),
+            btf_offsets_resolved: resolved.map_or(0, |r| r.values.len()),
+            btf_offsets_drifted: resolved.map_or(0, |r| r.drifted.len()),
+            btf_offsets_absent: resolved
+                .map(|r| r.absent.iter().map(|m| m.name.to_string()).collect())
+                .unwrap_or_default(),
+            active_lsms: bpf_lsm_state.list().map(str::to_string),
+            bpf_lsm: bpf_lsm_state.label().to_string(),
+            deny_hooks: manifest::DenyHooks {
+                expected: deny.expected,
+                attached: deny.attached,
+                missing: deny.missing,
+                observe_missing: deny.observe_missing,
+            },
+            deny_self_test: self_test.describe(),
+            bpf_guard: if northnarrow_agent::anti_tamper::bpf_defense::enforce_mode() {
+                "enforce"
+            } else {
+                "observe"
+            }
+            .to_string(),
+            sensors: manifest::sensors(),
+            host_hardening: manifest::host_checks(&host_checks),
+            detect_only,
+            degradations: northnarrow_agent::boot::degradation::snapshot(),
+            trust_level: trust.level.as_u8(),
+            trust_reasons: trust.reasons.clone(),
+        };
+        if trust.level < northnarrow_agent::boot::trust::TrustLevel::L3 {
+            warn!(
+                trust_level = trust.level.name(),
+                meaning = trust.level.meaning(),
+                reasons = %trust.reasons.join("; "),
+                "trust level below L3"
+            );
+        } else {
+            info!(
+                trust_level = trust.level.name(),
+                "trust level L3: every mandatory deny hook attached and self-tested, nothing degraded"
+            );
+        }
+        northnarrow_agent::boot::manifest::sign(audit_log.as_ref(), m);
+    }
+    boot.done(BootStep::CapabilityManifest)?;
+    northnarrow_agent::boot::degradation::mark_boot_over();
 
     // T7.10: the unit is `Type=notify`; tell systemd we are ready now
     // that every subsystem is wired (anti-tamper attached, decision
@@ -4141,6 +4421,12 @@ async fn process_event(
     detection_sink: Option<&northnarrow_agent::detection_store::DetectionSink>,
     event: Event,
 ) {
+    // Lab PR 218: the deny self-test's own refused signal is the boot's
+    // measurement, not an attempt on the agent — taken before the posture
+    // (it would raise COMBAT) and the rules; any other denial goes on.
+    if northnarrow_agent::boot::deny_selftest::take_expected_denial(&event) {
+        return;
+    }
     // Tappa 10.9 step 2: an exec event's path made absolute before any
     // consumer reads it (review 61).
     let mut event = event;
@@ -4903,27 +5189,58 @@ fn attest_identity_unverified(
 /// [`attest_degraded`] for a subsystem that stopped after boot (external
 /// audit MAIN-007: a drain loop that returns ends a telemetry stream for
 /// the rest of the run).
+///
+/// Lab PR 218: through the degradation registry — signed now as before, and
+/// listed by `nn-admin status --key` and counted against the trust level.
 fn attest_degraded_at(
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
     detail: &str,
     at_boot: bool,
 ) {
-    let Some(log) = audit_log else {
+    northnarrow_agent::boot::degradation::report_signed(audit_log, "", detail, at_boot);
+}
+
+/// Lab PR 218: a start refused by a boot gate (`install_manifest`,
+/// `bpf_lsm`, `deny_self_test`) leaves the refusal in the signed chain
+/// before the process exits — the rollback floor, the identity, then the
+/// `subsystem_degraded` (`degraded`: source and detail) and the `agent_boot`
+/// `refused` naming the gate — so root cannot quietly remove the trace
+/// (lab PR 21).
+fn record_refused_boot(
+    cli: &Cli,
+    identity: &agent_id::AgentIdentity,
+    overlay_gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
+    gate: &str,
+    (integrity, provenance): (&str, &str),
+    degraded: Option<(&str, &str)>,
+    detail: &str,
+) {
+    let Ok(key) =
+        northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
+    else {
         return;
     };
-    let draft = northnarrow_agent::audit::AuditEntryDraft {
-        op: northnarrow_agent::self_integrity::AUDIT_OP.to_string(),
-        extra: serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": at_boot }),
-        key_fp: "agent-self".to_string(),
-        cosigner_fps: Vec::new(),
-        result: "detected".to_string(),
-        client_pid: std::process::id(),
-        client_uid: 0,
-        client_comm: "northnarrow-agent".to_string(),
-        client_exe: None,
+    let Ok(mut log) =
+        northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, identity.id)
+    else {
+        return;
     };
-    if let Err(e) = log.lock().append(draft) {
-        warn!(error = %e, "attesting a degraded subsystem failed");
+    overlay_gate.attest_floor(&mut log);
+    // External audit EVD-020: a refused boot records its identity too.
+    if let Err(e) = log.attest_identity(identity) {
+        warn!(error = format!("{e:#}"), "agent identity not recorded");
+    }
+    if let Some((source, what)) = degraded {
+        northnarrow_agent::boot::degradation::sign_into(&mut log, source, what, true);
+    }
+    match log.boot_refused_by(gate, integrity, provenance, detail) {
+        Ok(e) => {
+            info!(entry_hash = %e.entry_hash, gate, "refused boot recorded in the audit chain")
+        }
+        Err(e) => error!(
+            error = format!("{e:#}"),
+            "could not record the refused boot in the audit chain"
+        ),
     }
 }
 

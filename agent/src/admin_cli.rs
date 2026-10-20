@@ -194,6 +194,14 @@ pub struct StatusOutcome {
     /// agent, or an agent older than the field).
     pub deny_fail_open_total: Option<u64>,
     pub deny_fail_open: Vec<(String, u64)>,
+    /// Lab PR 218: the trust level (0..=3) and why it is below L3, every
+    /// degradation of this run, the boot's signed capability manifest
+    /// (`None`: withheld from the unsigned status, or an agent older than
+    /// the fields).
+    pub trust_level: Option<u8>,
+    pub trust_reasons: Vec<String>,
+    pub degradations: Option<Vec<String>>,
+    pub capability_manifest: Option<String>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -414,6 +422,10 @@ fn status_outcome(
         net_quic_rows_total: resp.net_quic_rows_total,
         deny_fail_open_total: resp.deny_fail_open_total,
         deny_fail_open: resp.deny_fail_open.unwrap_or_default(),
+        trust_level: resp.trust_level,
+        trust_reasons: resp.trust_reasons.unwrap_or_default(),
+        degradations: resp.degradations,
+        capability_manifest: resp.capability_manifest,
         telemetry_signed: signed,
     }
 }
@@ -3608,6 +3620,10 @@ mod tests {
                     deny_fail_open: Some(vec![("inode_rename".to_string(), 2)]),
                     network_isolation_v4: None,
                     network_isolation_v6: None,
+                    trust_level: None,
+                    trust_reasons: None,
+                    degradations: None,
+                    capability_manifest: None,
                 }),
             );
         });

@@ -232,6 +232,23 @@ enum Cmd {
         agent_id_file: PathBuf,
     },
 
+    /// Lab PR 218: this boot's signed capability manifest — kernel, BTF,
+    /// active LSMs, deny hooks and their self-test, each sensor's attach
+    /// point, host hardening, degradations, the trust level — with the row
+    /// of the audit chain that signs it. A key with `audit-read` or
+    /// `telemetry-read` (the signed telemetry read). Exit 1 when the agent
+    /// has not signed one yet.
+    Capabilities {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+
     /// Host hardening checks (Tappa 10.8): kernel lockdown, module
     /// signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA,
     /// BPF LSM, single bpffs mount — the settings that keep root from
@@ -1382,6 +1399,15 @@ fn main() -> ExitCode {
             }
             Err(code) => code,
         },
+        Cmd::Capabilities {
+            key,
+            json,
+            agent_id_file,
+            socket,
+        } => match read_status(&socket, Some(&key), &agent_id_file, "capabilities") {
+            Ok(out) => print_capabilities(&out, json),
+            Err(code) => code,
+        },
         Cmd::VerifyKeys { path } => match run_verify_keys(&path) {
             Ok(out) => print_verify_keys(&out),
             Err(e) => {
@@ -2348,6 +2374,8 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.net_dot_rows_total.is_none()
         && out.net_quic_rows_total.is_none()
         && out.deny_fail_open_total.is_none()
+        && out.trust_level.is_none()
+        && out.degradations.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2571,6 +2599,180 @@ fn deny_fail_open_line(out: &StatusOutcome, tty: bool) -> String {
     }
 }
 
+/// A string from the agent as one terminal line: the control, line and bidi
+/// characters written as `\u{..}` (a degradation can carry a path or a
+/// verifier message).
+fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '\u{2028}' | '\u{2029}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+            {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Lab PR 218: the trust level line of `status --key`.
+fn trust_line(out: &StatusOutcome, tty: bool) -> String {
+    let Some(level) = out.trust_level else {
+        return "trust level       : (not reported: the agent predates it, or its boot has not \
+                measured it yet)"
+            .to_string();
+    };
+    let meaning = match level {
+        0 => "no enforcement",
+        1 => "enforcement partial or not verified",
+        2 => "enforcing and verified, degraded",
+        _ => "enforcing and verified",
+    };
+    let colour = match level {
+        0 | 1 => "31",
+        2 => "33",
+        _ => "32",
+    };
+    let mut line = format!(
+        "trust level       : {} ({meaning})",
+        colorize(&format!("L{level}"), colour, tty)
+    );
+    if !out.trust_reasons.is_empty() {
+        line.push_str(&format!(" — {}", out.trust_reasons.join("; ")));
+    }
+    line
+}
+
+/// Lab PR 218: every degradation of this run, each also signed in the audit
+/// chain (`subsystem_degraded`).
+fn degradation_lines(out: &StatusOutcome) -> Vec<String> {
+    match &out.degradations {
+        None => vec!["degradations      : (not reported: the agent predates them)".to_string()],
+        Some(d) if d.is_empty() => vec!["degradations      : none".to_string()],
+        Some(d) => {
+            let mut lines = vec![format!(
+                "degradations      : {} this run (each signed in the audit log)",
+                d.len()
+            )];
+            lines.extend(d.iter().map(|l| format!("  - {}", clean(l))));
+            lines
+        }
+    }
+}
+
+/// Lab PR 218: `nn-admin capabilities` — the boot's signed capability
+/// manifest. `Err` with the exit code when there is none to print.
+fn print_capabilities(out: &StatusOutcome, json: bool) -> ExitCode {
+    let Some(text) = out.capability_manifest.as_deref() else {
+        eprintln!(
+            "capabilities: no capability manifest (the agent predates it, or its boot has not \
+             signed it yet)"
+        );
+        return ExitCode::from(1);
+    };
+    if json {
+        println!("{text}");
+        return ExitCode::SUCCESS;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        eprintln!("capabilities: the agent sent a manifest that is not JSON");
+        return ExitCode::from(1);
+    };
+    for line in capability_lines(&v) {
+        println!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// The manifest as `nn-admin capabilities` prints it.
+fn capability_lines(v: &serde_json::Value) -> Vec<String> {
+    let m = &v["manifest"];
+    let s = |k: &str| match &m[k] {
+        serde_json::Value::String(t) => clean(t),
+        serde_json::Value::Null => "(none)".to_string(),
+        other => other.to_string(),
+    };
+    let list = |k: &str| -> Vec<String> {
+        m[k].as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(clean)).collect())
+            .unwrap_or_default()
+    };
+    let mut lines = vec![
+        format!(
+            "signed row        : {} (audit chain, op capability_manifest)",
+            v["entry_hash"]
+                .as_str()
+                .unwrap_or("(not signed: no audit log)")
+        ),
+        format!("trust level       : L{}", s("trust_level")),
+    ];
+    for r in list("trust_reasons") {
+        lines.push(format!("  - {r}"));
+    }
+    lines.push(format!(
+        "agent / kernel    : {} / {}",
+        s("agent_version"),
+        s("kernel")
+    ));
+    lines.push(format!(
+        "BTF               : {} — {} offsets resolved, {} drifted, absent: [{}]",
+        if m["btf"] == true {
+            "vmlinux"
+        } else {
+            "absent"
+        },
+        s("btf_offsets_resolved"),
+        s("btf_offsets_drifted"),
+        list("btf_offsets_absent").join(", ")
+    ));
+    lines.push(format!(
+        "active LSMs       : {} (bpf {})",
+        s("active_lsms"),
+        s("bpf_lsm")
+    ));
+    let deny = &m["deny_hooks"];
+    lines.push(format!(
+        "deny hooks        : {} of {} attached; self-test {}; BPF guard {}",
+        deny["attached"],
+        deny["expected"],
+        s("deny_self_test"),
+        s("bpf_guard")
+    ));
+    for k in ["missing", "observe_missing"] {
+        for x in deny[k].as_array().into_iter().flatten() {
+            if let Some(t) = x.as_str() {
+                lines.push(format!("  - {k}: {}", clean(t)));
+            }
+        }
+    }
+    lines.push(format!("detect-only       : {}", s("detect_only")));
+    for e in m["sensors"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "sensor            : {:<14} {}",
+            e["sensor"].as_str().unwrap_or("?"),
+            clean(e["attach"].as_str().unwrap_or("?"))
+        ));
+    }
+    for c in m["host_hardening"].as_array().into_iter().flatten() {
+        if c["status"] == "warn" {
+            lines.push(format!(
+                "host hardening    : {} WARN ({})",
+                c["id"].as_str().unwrap_or("?"),
+                clean(c["value"].as_str().unwrap_or(""))
+            ));
+        }
+    }
+    let d = list("degradations");
+    lines.push(format!("degradations      : {}", d.len()));
+    lines.extend(d.into_iter().map(|l| format!("  - {l}")));
+    lines
+}
+
 fn print_status(out: &StatusOutcome, json: bool) {
     if json {
         // Hand-rolled JSON to avoid a serde_json dep at the binary
@@ -2592,7 +2794,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -2632,6 +2834,11 @@ fn print_status(out: &StatusOutcome, json: bool) {
             // Lab PR 215.
             opt(out.deny_fail_open_total),
             fail_open.join(","),
+            // Lab PR 218.
+            out.trust_level
+                .map_or_else(|| "null".to_string(), |l| l.to_string()),
+            serde_json::to_string(&out.trust_reasons).unwrap_or_else(|_| "[]".to_string()),
+            serde_json::to_string(&out.degradations).unwrap_or_else(|_| "null".to_string()),
             out.telemetry_signed,
         );
         return;
@@ -2670,6 +2877,12 @@ fn print_status(out: &StatusOutcome, json: bool) {
     if !withheld {
         println!("{}", response_mode_line(out, tty));
         println!("{}", combat_evidence_line(out, tty));
+        // Lab PR 218: how far the protection is measured, and what is
+        // degraded.
+        println!("{}", trust_line(out, tty));
+        for line in degradation_lines(out) {
+            println!("{line}");
+        }
     }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
@@ -2682,7 +2895,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             withheld_line(
                 "telemetry         ",
                 "response mode, COMBAT evidence, ring drops and rejected records, deny \
-                 fail-opens",
+                 fail-opens, trust level, degradations",
                 "status"
             )
         );
@@ -4102,8 +4315,9 @@ mod quorum_help_tests {
 #[cfg(test)]
 mod flow_sock_line_tests {
     use super::{
-        combat_evidence_line, deny_fail_open_line, encrypted_flow_lines, flow_sock_line,
-        response_mode_line, telemetry_withheld, withheld_line,
+        capability_lines, combat_evidence_line, degradation_lines, deny_fail_open_line,
+        encrypted_flow_lines, flow_sock_line, response_mode_line, telemetry_withheld, trust_line,
+        withheld_line,
     };
     use northnarrow_agent::admin_cli::StatusOutcome;
 
@@ -4140,6 +4354,10 @@ mod flow_sock_line_tests {
             deny_fail_open: Vec::new(),
             network_isolation_v4: None,
             network_isolation_v6: None,
+            trust_level: None,
+            trust_reasons: Vec::new(),
+            degradations: None,
+            capability_manifest: None,
             telemetry_signed: true,
         }
     }
@@ -4282,5 +4500,86 @@ mod flow_sock_line_tests {
                 && l.contains("1 queued for a late write, 0 dropped"),
             "{l}"
         );
+    }
+
+    /// Lab PR 218: `status --key` says the trust level with its meaning and
+    /// reasons, and lists every degradation; an unsigned reply withholds
+    /// both.
+    #[test]
+    fn status_shows_the_trust_level_and_the_degradations() {
+        let mut o = outcome(None, None, None);
+        assert!(trust_line(&o, false).contains("not reported"));
+        assert!(degradation_lines(&o)[0].contains("not reported"));
+        o.trust_level = Some(3);
+        assert_eq!(
+            trust_line(&o, false),
+            "trust level       : L3 (enforcing and verified)"
+        );
+        o.trust_level = Some(0);
+        o.trust_reasons = vec!["`bpf` is not in the active LSM list (capability,apparmor)".into()];
+        let l = trust_line(&o, false);
+        assert!(
+            l.contains("L0 (no enforcement)") && l.contains("apparmor"),
+            "{l}"
+        );
+        o.degradations = Some(Vec::new());
+        assert_eq!(degradation_lines(&o), ["degradations      : none"]);
+        o.degradations = Some(vec![
+            "exec_sensor: on sys_enter_execve".to_string(),
+            "net_drain: netflow log not persisted\n".to_string(),
+        ]);
+        let d = degradation_lines(&o);
+        assert_eq!(d.len(), 3);
+        assert!(d[0].contains("2 this run"), "{d:?}");
+        assert!(!d[2].contains('\n'), "escaped: {d:?}");
+        // withheld only when every telemetry field is
+        let mut unsigned = outcome(None, None, None);
+        unsigned.telemetry_signed = false;
+        assert!(telemetry_withheld(&unsigned));
+        unsigned.trust_level = Some(2);
+        assert!(!telemetry_withheld(&unsigned));
+    }
+
+    /// Lab PR 218: `nn-admin capabilities` prints the signed row, the level,
+    /// the deny side, each sensor, the host hardening warnings and the
+    /// degradations.
+    #[test]
+    fn capabilities_prints_the_signed_manifest() {
+        let v: serde_json::Value = serde_json::json!({
+            "entry_hash": "abcd",
+            "manifest": {
+                "manifest_version": 1, "agent_version": "0.0.1", "kernel": "6.8.0",
+                "btf": true, "btf_offsets_resolved": 41, "btf_offsets_drifted": 0,
+                "btf_offsets_absent": [],
+                "active_lsms": "lockdown,capability,landlock,yama,apparmor",
+                "bpf_lsm": "absent",
+                "deny_hooks": {"expected": 18, "attached": 18, "missing": [], "observe_missing": []},
+                "deny_self_test": "not_denied", "bpf_guard": "enforce",
+                "sensors": [{"sensor": "exec", "attach": "lsm:bprm_check_security"}],
+                "host_hardening": [
+                    {"id": "lockdown", "status": "warn", "value": "[none]"},
+                    {"id": "bpffs", "status": "ok", "value": "1"}
+                ],
+                "detect_only": false,
+                "degradations": ["bpf_lsm: anti-tamper: no enforcement"],
+                "trust_level": 0,
+                "trust_reasons": ["deny self-test: the signal was delivered"]
+            }
+        });
+        let lines = capability_lines(&v);
+        let text = lines.join("\n");
+        for want in [
+            "signed row        : abcd",
+            "trust level       : L0",
+            "  - deny self-test: the signal was delivered",
+            "(bpf absent)",
+            "deny hooks        : 18 of 18 attached; self-test not_denied; BPF guard enforce",
+            "sensor            : exec",
+            "host hardening    : lockdown WARN ([none])",
+            "degradations      : 1",
+        ] {
+            assert!(text.contains(want), "missing `{want}` in:\n{text}");
+        }
+        assert!(!text.contains("bpffs"), "only the warnings: {text}");
     }
 }
