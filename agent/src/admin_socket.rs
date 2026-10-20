@@ -1917,6 +1917,7 @@ fn dispatch(
 
         AdminMessage::Status(_) => {
             let evidence = response_state.map(|s| (s.combat_evidence)());
+            let encrypted = crate::net::blind_spots::encrypted_flows();
             AdminMessage::StatusResponse(StatusResponse {
                 posture: posture.current_kind(),
                 network_isolation_engaged: isolator.is_engaged(),
@@ -1948,6 +1949,11 @@ fn dispatch(
                 combat_evidence_unrecorded: evidence.map(|c| c.unrecorded),
                 combat_evidence_pending: evidence.map(|c| c.pending),
                 combat_evidence_dropped: evidence.map(|c| c.dropped),
+                // External audit NET-017 (lab PR 207): the rows no DNS or TLS
+                // reader sees into.
+                net_dot_rows_total: Some(encrypted.dot),
+                net_dot_rows_resolver: Some(encrypted.dot_resolver),
+                net_quic_rows_total: Some(encrypted.quic),
             })
         }
 
@@ -5609,6 +5615,9 @@ mod tests {
             combat_evidence_unrecorded: None,
             combat_evidence_pending: None,
             combat_evidence_dropped: None,
+            net_dot_rows_total: None,
+            net_dot_rows_resolver: None,
+            net_quic_rows_total: None,
         });
         emit_audit_for(
             &status_req,
@@ -6567,6 +6576,15 @@ mod tests {
         assert_eq!(r.detect_only, Some(false));
         assert_eq!(r.detect_only_source, None);
         assert_eq!(r.combat_evidence_unrecorded, Some(0));
+        // External audit NET-017 (lab PR 207): the encrypted-flow counters
+        // are always reported (the resolver's DoT rows are among the DoT
+        // rows).
+        let (dot, resolver, quic) = (
+            r.net_dot_rows_total.expect("dot"),
+            r.net_dot_rows_resolver.expect("resolver"),
+            r.net_quic_rows_total,
+        );
+        assert!(resolver <= dot && quic.is_some());
 
         // No response state (no executor): not known, not "enforcing".
         let r = status(None);

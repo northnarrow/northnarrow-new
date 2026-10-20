@@ -490,6 +490,23 @@ packages open it themselves.
   agent (its ping decodes the same reply, and fails): upgrade the binaries
   together; an older `nn-admin` or watchdog reads a newer agent's reply
   without these fields.
+- **`nn-admin net status` names the network blind spots** (NN-AUD-335
+  NET-017, lab PR 207). Three new lines: `DNS over TLS rows (TCP/853)` —
+  the netflow rows since boot, how many the local resolver made (its
+  upstream) and how many other processes made (they resolve names past
+  the resolver, and no DNS rule reads them); `QUIC rows (UDP/443)` — no
+  TLS handshake can be read from them; `DNS over HTTPS` — not counted.
+  When systemd-resolved runs `DNSOverTLS=yes` or `opportunistic` (in
+  `resolved.conf` or a drop-in), `inactive network rule` lists
+  `NN-L-NET-002/004/005/014 (DNS): blind to the local resolver's upstream`
+  with the file that set it, and the agent logs it as a WARN at boot; the
+  setting is read again at each request, so no restart is needed after a
+  change. A per-link DoT setting (networkd, NetworkManager, `resolvectl
+  dnsovertls`) is not read: watch the TCP/853 line. `--json` gains
+  `net_dot_rows_total`, `net_dot_rows_resolver` and `net_quic_rows_total`.
+  **Regression:** as for lab PR 193's fields, an `nn-admin` or watchdog
+  newer than the agent cannot read its `status`: upgrade the binaries
+  together.
 - **A closed pipe** (lab PR 188, a follow-up found in the lab): `nn-admin
   status | head -1` and every other command whose stdout or stderr closes
   early end quietly with exit 141 (128 + SIGPIPE; it aborted with 134 and

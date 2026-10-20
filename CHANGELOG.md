@@ -61,6 +61,47 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, network blind spots and drain consistency (Low
+  NET-017 NN-AUD-335, NET-020 NN-AUD-434 part (3); lab PR 207). NET-017:
+  the agent never said what its network rules cannot see. The DNS rules
+  (NN-L-NET-002, -004, -005, -014) read the queries sent to UDP/53 and
+  nothing else; they are now declared blind where they are, without
+  inspecting the traffic (`net/blind_spots.rs`). The drain counts the
+  netflow rows to TCP/853 (DNS over TLS), split into the local resolver's
+  (systemd-resolved, unbound, stubby…, by image, never by comm) and the
+  other processes' (which resolve names past the resolver whose queries
+  the rules read), and the rows to UDP/443 (QUIC, whose TLS handshake no
+  fingerprint reader can see); `nn-admin net status` prints them with
+  what they mean, and says DNS over HTTPS is not counted (HTTPS to a
+  resolver looks like any web traffic). When systemd-resolved's
+  `DNSOverTLS=` is `yes` or `opportunistic` — read from `resolved.conf`
+  and its drop-ins as resolved reads them (the first main file of `/etc`,
+  `/run`, `/usr/local/lib`, `/usr/lib`; drop-ins by name, a higher
+  directory hiding a lower one, a `/dev/null` link masking; the last valid
+  `[Resolve]` assignment wins, an empty one resets), files capped at 64
+  KiB, a FIFO or device skipped without blocking — `net status` lists
+  "NN-L-NET-002/004/005/014 (DNS): blind to the local resolver's upstream"
+  with the file, and the agent says so in a WARN at boot. The setting is
+  read again at each status request, so the list follows a change without
+  a restart. Not covered, and said in the code: per-link DoT (networkd,
+  NetworkManager, `resolvectl dnsovertls`), which the TCP/853 count still
+  shows; ECH (with the ClientHello producer, BUG-025). NET-020 (3): the TCP
+  close decoded the kernel's comm with `from_utf8_lossy` and trimmed only
+  the trailing NULs, while the connect, UDP and listener paths stop at the
+  first NUL, so `curl\0Xvil` (a byte left after a shorter
+  `PR_SET_NAME`) gave the TCP row and its journal line another name than
+  the other rows, and the comm allowlist saw either. Every branch now
+  decodes once, up to the first NUL; with lab PR 202's part (2),
+  NN-AUD-434 is closed.
+  **Regressions / changes:** the `status` reply gains three trailing
+  fields (`net_dot_rows_total`, `net_dot_rows_resolver`,
+  `net_quic_rows_total`, after lab PR 193's): an older `nn-admin` or
+  watchdog reads a newer agent's reply, but a newer `nn-admin` or watchdog
+  cannot decode an older agent's (postcard has no field count; a known
+  follow-up): upgrade them together. `nn-admin net status` prints three
+  more lines and its `--json` three more keys; `net_inactive_rules` can
+  hold a second entry; a TCP row's `comm` can be shorter than before for a
+  comm with bytes after its NUL.
 - External audit, Wave 3, lab verdict integrity (Low LAB-020 NN-AUD-410,
   LAB-024 NN-AUD-414, LAB-026 NN-AUD-416; lab PR 206). The lab's verdicts
   are what it saw. LAB-020: `nn-lab.sh upgrade-check` passed with seven of
