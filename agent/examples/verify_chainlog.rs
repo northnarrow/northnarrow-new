@@ -3,9 +3,16 @@
 //! boundaries (`verify_log_set`). Superseded by `nn-admin chain verify`
 //! (external audit NN-AUD-112, lab PR 160), which covers every chain; kept
 //! for development. Reads the published public half (`agent.sig.pub` next
-//! to the key path), never the private key, and never mints one.
+//! to the key path), never the private key, and never mints one. That
+//! public half is the host's own: to verify against a key kept off the
+//! host, use `nn-admin chain verify --log fim-drift --agent-pubkey <hex>`.
 //!
-//!   sudo cargo run -p northnarrow-agent --example verify_chainlog -- \
+//! Build it as yourself and run only the built binary as root (external
+//! audit WDG-R11, NN-AUD-377): a `cargo` run under `sudo` compiles, and
+//! runs the build scripts of the whole dependency graph, as root.
+//!
+//!   cargo build --release -p northnarrow-agent --example verify_chainlog
+//!   sudo ./target/release/examples/verify_chainlog \
 //!       /var/lib/northnarrow/fim_drift.jsonl [/etc/northnarrow/agent.sig.key]
 //!
 //! Exits 0 + prints the `LogSetReport` on success; 1 + the error on failure.

@@ -509,9 +509,9 @@ Lab notes for 22.04-era userland:
   bash starts background jobs with SIGINT and SIGQUIT ignored.
 - systemd 249 (22.04) knows `systemctl kill --kill-who=`, not the newer
   `--kill-whom=` spelling; the lab uses the old one, accepted by both.
-- RHEL-family sudo sets `HOME=/root` (`always_set_home`), so `sudo -E cargo`
-  resolves root's own rustup and downloads a second toolchain on first
-  use; harmless, just slow once.
+- RHEL-family sudo sets `HOME=/root` (`always_set_home`), so the root `cargo test`
+  of the lab's privileged suites resolves root's own rustup and downloads a
+  second toolchain on first use; harmless, just slow once.
 
 ## Adding a distro to the lab
 

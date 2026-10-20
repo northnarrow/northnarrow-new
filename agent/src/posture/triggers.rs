@@ -2896,7 +2896,7 @@ mod tests {
                 file_open(
                     7000,
                     1000,
-                    "/home/forty/.npm-global/lib/node_modules/left-pad/index.js",
+                    "/home/alice/.npm-global/lib/node_modules/left-pad/index.js",
                     1,
                     i + 10,
                 )
@@ -2905,7 +2905,7 @@ mod tests {
         let focal = file_open(
             7000,
             1000,
-            "/home/forty/.npm-global/lib/node_modules/left-pad/package.json",
+            "/home/alice/.npm-global/lib/node_modules/left-pad/package.json",
             1,
             MASS_WRITE_MIN as u64 + 11,
         );

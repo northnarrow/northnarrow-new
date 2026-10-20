@@ -950,7 +950,7 @@ pub fn build_features() -> Vec<&'static str> {
 pub const LAB_FEATURES: &[(&str, bool)] = &[
     ("debug-trigger", cfg!(feature = "debug-trigger")),
     ("demo-tappa5", cfg!(feature = "demo-tappa5")),
-    // POS-013: `PostureMachine::admin_release_combat`, the bool stub.
+    // POS-013, WDG-R02: builds `examples/posture_demo.rs` only.
     ("posture-demo", cfg!(feature = "posture-demo")),
     ("test-privileged", cfg!(feature = "test-privileged")),
 ];

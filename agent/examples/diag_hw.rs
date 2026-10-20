@@ -12,9 +12,11 @@
 //! cargo run -p northnarrow-agent --release --example diag_hw
 //! ```
 //!
-//! The output is meant to be pasted into
-//! `docs/PERFORMANCE_HARDWARE.md` so each deployment captures its
-//! own baseline before applying the Sub-tappa 6.8 tuning knobs.
+//! Each deployment captures its own baseline with it before applying the
+//! Sub-tappa 6.8 tuning knobs. Keep that report with the host's own
+//! records, not in the repository: it fingerprints the host (CPU model,
+//! ISA flags, core and memory sizes). `docs/PERFORMANCE_HARDWARE.md`
+//! records the reference host only (external audit WDG-R16, NN-AUD-439).
 
 use std::time::Instant;
 

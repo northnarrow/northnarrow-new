@@ -1,6 +1,6 @@
 //! Posture state machine demo (Sub-tappa 6.5).
 //!
-//! Drives a [`PostureMachine`] through three transitions and one
+//! Drives a [`PostureMachine`] through four transitions and one
 //! verdict modulation to show the state machine end-to-end without
 //! needing eBPF / a live host. Run with:
 //!
@@ -16,17 +16,26 @@
 //! 3. Modulates an `Allow + None` ADE verdict against the new
 //!    posture and shows it become `Alert + Low`.
 //! 4. Spawns a netcat process → posture lifts to `ENGAGED`.
-//! 5. Spawns a `/tmp/payload` exec → posture lifts to `COMBAT`.
-//! 6. Confirms automatic decay won't leave `COMBAT`, then shows the
-//!    admin-override stub returning posture to `ENGAGED`.
+//! 5. Spawns a `/tmp/payload` exec → posture holds at `ENGAGED`: a
+//!    staging-directory exec without a second factor is `StagingExec`,
+//!    an ENGAGED-tier signal (external audit POS-015).
+//! 6. The kernel refuses that process's unlink of a protected agent file
+//!    (an anti-tamper denial, a decisive signal) → posture lifts to a
+//!    locked `COMBAT`.
+//! 7. Confirms decay won't leave a locked `COMBAT`, even a day later, and
+//!    ends there: the way out is the signed unlock (`nn-admin unlock`,
+//!    which the agent applies through
+//!    `PostureMachine::admin_release_combat_with_token`), and the demo
+//!    holds no admin key (external audit WDG-R02).
 
 use common::ade_types::{
     AdeAction, AdeMetadata, AdeSeverity, AdeVerdict, AlternativeExplanations, Evidence, FollowUp,
     FollowUpPolicy, MitreAttack, ReasoningSteps, RecommendedAction, ThreatClassification,
     ADE_SCHEMA_VERSION,
 };
-use common::Event;
+use common::{Event, FsProtectOperation};
 use northnarrow_agent::posture::PostureMachine;
+use std::time::{Duration, Instant};
 
 fn main() {
     println!("=== NorthNarrow posture state machine demo ===\n");
@@ -74,33 +83,54 @@ fn main() {
     }
     println!("  posture: {}\n", machine.current_kind());
 
-    // ---- Phase 4: confirmed intrusion ------------------------------
-    println!("[phase 4] simulate exec from /tmp/payload (confirmed intrusion)");
-    let intrusion = spawn(100, 1, "evil", "/tmp/payload", 500);
-    if let Some(state) = machine.observe(&intrusion, &[]) {
-        println!(
-            "  POSTURE TRANSITION → {} (trigger: confirmed intrusion / persistence)",
-            state.0.kind()
-        );
+    // ---- Phase 4: staging exec -------------------------------------
+    println!("[phase 4] simulate exec from /tmp/payload (staging directory)");
+    let staged = spawn(100, 1, "evil", "/tmp/payload", 500);
+    match machine.observe(&staged, &[]) {
+        Some(state) => println!("  POSTURE TRANSITION → {}", state.0.kind()),
+        None => println!(
+            "  no transition: without a second factor (an unlinked or memfd image, \
+             a mass write) a staging exec is an ENGAGED-tier signal"
+        ),
     }
     println!("  posture: {}\n", machine.current_kind());
 
-    // ---- Phase 5: COMBAT lock and admin override -------------------
-    println!("[phase 5] confirm COMBAT does not auto-decay, then admin override");
-    let auto = machine.tick_decay();
+    // ---- Phase 5: anti-tamper denial -------------------------------
+    println!("[phase 5] the kernel refuses an unlink of a protected agent file");
+    let denial = Event::FsProtectDenial {
+        pid: 100,
+        uid: 1000,
+        comm: "evil".into(),
+        target_dev: 1,
+        target_ino: 2,
+        operation: FsProtectOperation::Unlink,
+        timestamp_ns: 600,
+    };
+    if let Some(state) = machine.observe(&denial, &[]) {
+        println!(
+            "  POSTURE TRANSITION → {} (trigger: anti-tamper denial, decisive)",
+            state.0.kind()
+        );
+    }
     println!(
-        "  tick_decay returned: {:?}",
+        "  posture: {} (locked: {})\n",
+        machine.current_kind(),
+        machine.is_combat_locked()
+    );
+
+    // ---- Phase 6: COMBAT lock ---------------------------------------
+    println!("[phase 6] confirm a locked COMBAT does not decay");
+    let a_day_later = Instant::now() + Duration::from_secs(24 * 3600);
+    let auto = machine.tick_decay_at(a_day_later);
+    println!(
+        "  tick_decay a day later returned: {:?}",
         auto.map(|s| s.kind().to_string())
     );
     println!("  posture (still): {}", machine.current_kind());
-    let unauth = machine.admin_release_combat(false);
-    println!("  admin_release(false): {:?}", unauth.err());
-    let auth = machine.admin_release_combat(true).expect("authorized");
     println!(
-        "  admin_release(true): posture {} (admin override required)",
-        auth.kind()
+        "  leaving COMBAT takes the signed unlock (`nn-admin unlock`, \
+         applied by admin_release_combat_with_token); this demo holds no admin key\n"
     );
-    println!("  posture: {}\n", machine.current_kind());
 
     println!("=== transition log ===");
     for (i, t) in machine.transition_log().iter().enumerate() {
@@ -111,7 +141,7 @@ fn main() {
             t.to,
             t.trigger
                 .map(|x| x.as_str().to_string())
-                .unwrap_or_else(|| "decay/override".to_string()),
+                .unwrap_or_else(|| "decay".to_string()),
             t.reason
         );
     }

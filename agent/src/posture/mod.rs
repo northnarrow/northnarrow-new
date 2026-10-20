@@ -623,18 +623,19 @@ impl PostureMachine {
     }
 
     /// Force a down-transition from `Combat`. Sub-tappa 6.5 stub
-    /// kept around so `agent/examples/posture_demo.rs` and the older
-    /// unit tests keep building; production code uses
-    /// [`Self::admin_release_combat_with_token`], wired from
+    /// kept for the older unit tests of the state machine; production
+    /// code uses [`Self::admin_release_combat_with_token`], wired from
     /// `ConnAuth::verify_unlock` in the admin socket.
     ///
-    /// External audit POS-013: compiled only for the unit tests and the
-    /// `posture-demo` feature (the demo example's). It leaves COMBAT on a
-    /// `bool`, without the release hook (no isolation lift, no ladder
-    /// stand-down) and without recording an admin action; a production
-    /// build has no such door.
-    #[cfg(any(test, feature = "posture-demo"))]
-    pub fn admin_release_combat(
+    /// It leaves COMBAT on a `bool`, without the release hook (no
+    /// isolation lift, no ladder stand-down) and without recording an
+    /// admin action. External audit POS-013 compiled it only for the unit
+    /// tests and the `posture-demo` feature; WDG-R02 (NN-AUD-368) makes it
+    /// a crate-private test helper: no build of the library, the demo
+    /// example's included, has such a door, and `examples/posture_demo.rs`
+    /// ends in COMBAT, whose exit is the signed unlock.
+    #[cfg(test)]
+    pub(crate) fn admin_release_combat(
         &self,
         admin_authorized: bool,
     ) -> Result<PostureState, AdminReleaseError> {
@@ -685,9 +686,9 @@ impl PostureMachine {
     ///
     /// The legacy `admin_release_combat` bool stub returns to
     /// Engaged instead, for state-machine-exercise reasons that
-    /// predate the Tappa 7/8 work. That stub is compiled only for the
-    /// unit tests and the `posture-demo` feature (external audit
-    /// POS-013); the asymmetry is intentional and deliberate.
+    /// predate the Tappa 7/8 work. That stub is a crate-private helper
+    /// of the unit tests (external audit POS-013, WDG-R02); the asymmetry
+    /// is intentional and deliberate.
     ///
     /// Idempotent w.r.t. "already out of Combat" only at the socket
     /// layer — this method itself errors with `NotInCombat` if the
