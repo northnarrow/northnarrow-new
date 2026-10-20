@@ -605,11 +605,19 @@ pub struct StatusEvent {
     /// Who made the change — the admin caller's SO_PEERCRED identity
     /// (pid / comm / uid). Reuses [`Principal`] so the event records
     /// the acting local operator process, not just the signing key
-    /// (the matched key fingerprint is in the audit log).
+    /// (the matched key fingerprint is in the audit log). Its `comm` is
+    /// self-reported (external audit ASK-013): the name the peer gave
+    /// itself; [`Self::principal_exe`] is the kernel's record.
     pub principal: Principal,
     /// Optional operator triage note.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// External audit ASK-013 (NN-AUD-239, lab PR 179): the admin caller's
+    /// executable, `/proc/<pid>/exe`, read while the caller was known to be
+    /// alive. Absent on events written before lab PR 179 (their bytes and
+    /// pre-image unchanged) and when the link could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_exe: Option<String>,
 }
 
 /// Map the ADE severity (which has a `None` rung reserved for `Allow`)
@@ -876,6 +884,7 @@ impl DetectionSink {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         };
         if let Err(e) = log.lock().append(draft) {
             warn!(
@@ -1284,9 +1293,17 @@ pub fn read_last_n_verified(
     // (record, raw line, already verified)
     let mut collected: Vec<(DetectionRecord, String, bool)> = Vec::new();
     let mut unverified = 0usize;
+    // External audit EVD-010 (NN-AUD-275): what one file can contribute.
+    // Without a key, the newest `limit` matches; with one, the newest
+    // `limit` that verify within MAX_UNVERIFIED_PER_READ failures — so the
+    // newest `limit + MAX_UNVERIFIED_PER_READ` matches by id suffice. The
+    // collector keeps only those, never the whole file.
+    let cap = match pubkey {
+        Some(_) => limit.saturating_add(MAX_UNVERIFIED_PER_READ),
+        None => limit,
+    };
     let mut fill = |collected: &mut Vec<(DetectionRecord, String, bool)>, path: &Path| {
-        let mut found = Vec::new();
-        collect_matching_from_file(path, filter, &mut found);
+        let found = collect_matching_from_file(path, filter, cap, pubkey.is_some());
         collected.extend(found.into_iter().map(|(r, l)| (r, l, false)));
         // Newest first; with a key, keep the newest `limit` rows that
         // verify (a forged row does not count towards `limit`). At most
@@ -1330,32 +1347,105 @@ pub fn read_last_n_verified(
 /// Rows that fail verification tried by one [`read_last_n_verified`].
 const MAX_UNVERIFIED_PER_READ: usize = 1000;
 
-/// Append the matching [`DetectionRecord`]s from one chainlog file
-/// (active or sealed archive) to `out`, each with its raw line. Best-
-/// effort: a missing / unreadable file contributes nothing; lines that
-/// don't parse as a `DetectionRecord` (terminators, blanks) are skipped.
-/// The file is size-capped (≤ rotation cap), so this is a bounded read.
+/// One match held by [`collect_matching_from_file`], ordered as the
+/// read's sort orders it: higher id first, and for equal ids (a forged
+/// copy) the earlier line first.
+struct Held {
+    id: u64,
+    line_no: usize,
+    record: DetectionRecord,
+    line: String,
+}
+
+impl Held {
+    /// Larger = served first.
+    fn rank(&self) -> (u64, std::cmp::Reverse<usize>) {
+        (self.id, std::cmp::Reverse(self.line_no))
+    }
+}
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+impl Eq for Held {}
+impl PartialOrd for Held {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Held {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most matches [`collect_matching_from_file`] held at once on
+    /// this thread (external audit EVD-010's test).
+    static HELD_HIGH_WATER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The matching [`DetectionRecord`]s of one chainlog file (active or
+/// sealed archive), at most `cap` of them: the ones the read serves first
+/// (highest id, then earliest line), in that order, each with its raw
+/// line when `keep_lines` (the signature check needs it). Best-effort: a
+/// missing / unreadable file contributes nothing; lines that don't parse
+/// as a `DetectionRecord` (terminators, blanks) are skipped.
+///
+/// External audit EVD-010 (NN-AUD-275): a bounded min-heap of `cap`
+/// entries — the file is still read line by line (≤ the rotation cap),
+/// but no longer held in memory whole with every raw line.
 fn collect_matching_from_file(
     path: &Path,
     filter: &DetectionFilter,
-    out: &mut Vec<(DetectionRecord, String)>,
-) {
+    cap: usize,
+    keep_lines: bool,
+) -> Vec<(DetectionRecord, String)> {
+    use std::collections::BinaryHeap;
     use std::io::{BufRead, BufReader};
+    if cap == 0 {
+        return Vec::new();
+    }
     let f = match std::fs::OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
-    for line in BufReader::new(f).lines() {
+    // Min-heap on the rank: the root is the first to give way.
+    let mut held: BinaryHeap<std::cmp::Reverse<Held>> = BinaryHeap::new();
+    for (line_no, line) in BufReader::new(f).lines().enumerate() {
         let Ok(line) = line else { continue };
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(record) = serde_json::from_str::<DetectionRecord>(&line) {
-            if record.matches(filter) {
-                out.push((record, line));
-            }
+        let Ok(record) = serde_json::from_str::<DetectionRecord>(&line) else {
+            continue;
+        };
+        if !record.matches(filter) {
+            continue;
         }
+        let entry = Held {
+            id: record.id,
+            line_no,
+            record,
+            line: if keep_lines { line } else { String::new() },
+        };
+        if held.len() < cap {
+            held.push(std::cmp::Reverse(entry));
+        } else if held.peek().is_some_and(|least| entry > least.0) {
+            held.pop();
+            held.push(std::cmp::Reverse(entry));
+        }
+        #[cfg(test)]
+        HELD_HIGH_WATER.with(|h| h.set(h.get().max(held.len())));
     }
+    // Ascending in `Reverse` = descending in rank: served first, first.
+    held.into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse(h)| (h.record, h.line))
+        .collect()
 }
 
 // ── Tappa 9.0.c — status-event chain: open + max-id guard + overlay ──
@@ -2850,6 +2940,222 @@ mod tests {
         );
     }
 
+    // ── External audit EVD-010 (NN-AUD-275, lab PR 179) ─────────────
+
+    /// The read as it was before lab PR 179: every match of a file held
+    /// with its raw line, sorted, then cut — the reference the bounded
+    /// collector must agree with.
+    fn reference_read(
+        active_path: &Path,
+        limit: usize,
+        filter: &DetectionFilter,
+        pubkey: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> (Vec<u64>, usize) {
+        let all_of = |path: &Path| -> Vec<(DetectionRecord, String)> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| {
+                    serde_json::from_str::<DetectionRecord>(l)
+                        .ok()
+                        .map(|r| (r, l.to_string()))
+                })
+                .filter(|(r, _)| r.matches(filter))
+                .collect()
+        };
+        let mut collected: Vec<(DetectionRecord, String, bool)> = Vec::new();
+        let mut unverified = 0usize;
+        let mut fill = |collected: &mut Vec<(DetectionRecord, String, bool)>, path: &Path| {
+            collected.extend(all_of(path).into_iter().map(|(r, l)| (r, l, false)));
+            collected.sort_by_key(|(r, _, _)| std::cmp::Reverse(r.id));
+            let Some(pk) = pubkey else {
+                collected.truncate(limit);
+                return;
+            };
+            let mut kept = Vec::new();
+            for (r, line, checked) in collected.drain(..) {
+                if kept.len() >= limit || unverified >= MAX_UNVERIFIED_PER_READ {
+                    break;
+                }
+                if checked
+                    || crate::chainlog::line_is_genuine::<DetectionRecord>(line.as_bytes(), pk)
+                {
+                    kept.push((r, line, true));
+                } else {
+                    unverified += 1;
+                }
+            }
+            *collected = kept;
+        };
+        fill(&mut collected, active_path);
+        if collected.len() < limit {
+            for archive in crate::chainlog::archives_newest_first(active_path) {
+                fill(&mut collected, &archive);
+                if collected.len() >= limit {
+                    break;
+                }
+            }
+        }
+        (collected.iter().map(|(r, _, _)| r.id).collect(), unverified)
+    }
+
+    fn high_water_reset() {
+        HELD_HIGH_WATER.with(|h| h.set(0));
+    }
+
+    fn high_water() -> usize {
+        HELD_HIGH_WATER.with(|h| h.get())
+    }
+
+    /// A forged detection line: chain-shaped, signed by no one.
+    fn forged_line(r: DetectionRecord) -> String {
+        let mut fake = serde_json::to_value(r).unwrap();
+        fake["fmt_ver"] = serde_json::json!(2);
+        fake["prev_hash"] = serde_json::json!("00".repeat(32));
+        fake["entry_hash"] = serde_json::json!("11".repeat(32));
+        fake["agent_sig"] = serde_json::json!("AAAA");
+        serde_json::to_string(&fake).unwrap()
+    }
+
+    /// External audit EVD-010 (NN-AUD-275): `detections` held every
+    /// matching record of a file, with its raw line, before cutting to
+    /// `limit`. Without a key the collector now holds at most `limit`
+    /// rows of a 20,000-row file, and serves what the full scan served.
+    #[test]
+    fn detections_collector_is_bounded_without_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let records: Vec<DetectionRecord> = (1..=20_000u64)
+            .map(|id| {
+                let sensor = if id % 3 == 0 {
+                    Sensor::File
+                } else {
+                    Sensor::Exec
+                };
+                mk(
+                    id,
+                    "2026-06-09T12:00:00.000000Z",
+                    Severity::Medium,
+                    DetectionStatus::Open,
+                    sensor,
+                    "proc",
+                )
+            })
+            .collect();
+        write_records(&path, &records);
+        let selective = DetectionFilter {
+            sensor: Some(Sensor::File),
+            ..Default::default()
+        };
+        for filter in [DetectionFilter::default(), selective] {
+            for limit in [1usize, 10, 1000] {
+                high_water_reset();
+                let (got, unverified) = read_last_n_verified(&path, limit, &filter, None);
+                assert!(
+                    high_water() <= limit,
+                    "held {} rows for limit {limit}",
+                    high_water()
+                );
+                assert_eq!(unverified, 0);
+                assert_eq!(
+                    (ids(&got), 0),
+                    reference_read(&path, limit, &filter, None),
+                    "limit {limit}"
+                );
+            }
+        }
+    }
+
+    /// External audit EVD-010 (NN-AUD-275): with the agent key, the
+    /// collector holds at most `limit + MAX_UNVERIFIED_PER_READ` rows of a
+    /// file and returns what the full scan returned — the same rows and
+    /// the same count of rows that do not verify — with forged rows mixed
+    /// in: newer ids at the end, many copies of genuine ids after them
+    /// (1,300 matches in all, more than the bound). Then a flood of newer
+    /// forgeries: both reads give up after the same 1,000 failures.
+    #[test]
+    fn detections_collector_is_bounded_with_a_key_and_forged_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let key = test_key();
+        let pk = key.verifying_key();
+        {
+            let mut log = RotatingChainLog::<DetectionRecord>::open(
+                &path,
+                key,
+                RotationConfig::default(),
+                std::sync::Arc::new(NoProtection),
+            )
+            .unwrap();
+            for id in 1..=60u64 {
+                log.append_deferred(mk_id(id)).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        let genuine = std::fs::read_to_string(&path).unwrap();
+        let mut body = genuine.clone();
+        // 20 forged copies of every genuine id, after the genuine rows
+        for round in 0..20 {
+            for id in 1..=60u64 {
+                let mut r = mk_id(id);
+                r.detection_type = format!("forged-{round}");
+                body.push_str(&forged_line(r));
+                body.push('\n');
+            }
+        }
+        // forged rows newer than any genuine one, at the end
+        for id in 61..=100u64 {
+            body.push_str(&forged_line(mk_id(id)));
+            body.push('\n');
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        let filter = DetectionFilter::default();
+        for limit in [1usize, 10, 40] {
+            high_water_reset();
+            let (got, unverified) = read_last_n_verified(&path, limit, &filter, Some(&pk));
+            assert!(
+                high_water() <= limit + MAX_UNVERIFIED_PER_READ,
+                "held {} rows for limit {limit}",
+                high_water()
+            );
+            assert_eq!(
+                (ids(&got), unverified),
+                reference_read(&path, limit, &filter, Some(&pk)),
+                "limit {limit}"
+            );
+            assert_eq!(got.len(), limit, "genuine rows fill the limit");
+            assert!(
+                got.iter().all(|r| r.detection_type == "test"),
+                "no forged row served"
+            );
+        }
+        let (got, unverified) = read_last_n_verified(&path, 10, &filter, Some(&pk));
+        assert_eq!(ids(&got), (51..=60u64).rev().collect::<Vec<_>>());
+        assert_eq!(
+            unverified,
+            40 + 20 * 9,
+            "the 40 newer forgeries, the copies of 60 to 52"
+        );
+
+        // A flood: 1,500 forged rows newer than every genuine one.
+        let mut flood = genuine;
+        for id in 61..=1_560u64 {
+            flood.push_str(&forged_line(mk_id(id)));
+            flood.push('\n');
+        }
+        std::fs::write(&path, &flood).unwrap();
+        high_water_reset();
+        let (got, unverified) = read_last_n_verified(&path, 10, &filter, Some(&pk));
+        assert!(high_water() <= 10 + MAX_UNVERIFIED_PER_READ);
+        assert_eq!(
+            (ids(&got), unverified),
+            reference_read(&path, 10, &filter, Some(&pk))
+        );
+        assert_eq!(unverified, MAX_UNVERIFIED_PER_READ);
+    }
+
     /// External audit NN-AUD-112: before lab PR 160 any well-formed JSON
     /// line in `detections.jsonl` was served as a detection. With the agent
     /// key the read leaves out a line that does not verify, and counts it.
@@ -2979,6 +3285,7 @@ mod tests {
                 ppid: None,
             },
             note: None,
+            principal_exe: None,
         }
     }
 

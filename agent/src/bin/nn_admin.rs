@@ -598,6 +598,12 @@ enum AuditCmd {
     /// timestamp. Default output is a compact human-readable
     /// summary; `--json` emits one canonical JSON object per line
     /// (matches the on-disk JSONL exactly).
+    ///
+    /// Who acted: the key fingerprint (`key_fp`, `cosigner_fps`) is the
+    /// operator's identity. `client_pid`/`client_uid` come from the
+    /// kernel (SO_PEERCRED); `client_comm` is the name the connecting
+    /// process gave itself, which any process chooses; `client_exe`
+    /// (rows from lab PR 179 on) is the program the kernel says it ran.
     Read {
         /// Path to the audit log file (default
         /// /etc/northnarrow/audit.log).

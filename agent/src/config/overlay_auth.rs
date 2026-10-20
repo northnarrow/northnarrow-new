@@ -743,6 +743,7 @@ pub(crate) fn entry(op: &str, result: &str, extra: serde_json::Value) -> AuditEn
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     }
 }
 

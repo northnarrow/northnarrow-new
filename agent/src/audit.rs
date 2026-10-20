@@ -397,8 +397,20 @@ pub struct AuditEntry {
     /// UID of the connecting client (`SO_PEERCRED`).
     pub client_uid: u32,
     /// Comm of the connecting client (best-effort read from
-    /// `/proc/<pid>/comm`).
+    /// `/proc/<pid>/comm`). Self-reported (external audit ASK-013,
+    /// NN-AUD-239): the name the peer gave itself (`prctl(PR_SET_NAME)`,
+    /// or the name of whatever it executed) — any process can call itself
+    /// `nn-admin`. The operator's identity is the key fingerprint;
+    /// [`Self::client_exe`] is the kernel's record of the program.
     pub client_comm: String,
+    /// External audit ASK-013 (NN-AUD-239): the executable of the
+    /// connecting client, `/proc/<pid>/exe` as the kernel resolves it, read
+    /// while the peer was known to be alive (a pidfd checked after the
+    /// read). Absent on rows the agent writes for itself, on rows written
+    /// before lab PR 179 (which keep their bytes and their pre-image) and
+    /// when the link could not be read (a peer gone, a kernel thread).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_exe: Option<String>,
     /// External audit NN-AUD-108: the row's 0-based position in the log.
     /// Absent on rows written before lab PR 160, which keep their exact
     /// bytes and their untagged pre-image; present on every row after,
@@ -437,6 +449,8 @@ pub struct AuditEntryDraft {
     pub client_pid: u32,
     pub client_uid: u32,
     pub client_comm: String,
+    /// The admin socket's peers only (external audit ASK-013).
+    pub client_exe: Option<String>,
 }
 
 // ── audit log writer ────────────────────────────────────────────────
@@ -592,6 +606,7 @@ impl AuditLog {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         })
         .map(|_| ())
         .context("audit log: chain_tail_repaired entry")
@@ -619,6 +634,7 @@ impl AuditLog {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         })
         .map(|_| ())
         .context("audit log: chain_lines_unreadable entry")
@@ -675,6 +691,7 @@ impl AuditLog {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         })
         .context("audit log stop entry (agent_stop)")
     }
@@ -751,6 +768,7 @@ impl AuditLog {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         })
     }
 
@@ -795,6 +813,7 @@ impl AuditLog {
             client_pid: std::process::id(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
         })
         .context("audit log boot probe (agent_boot entry)")
     }
@@ -973,6 +992,7 @@ fn build_signed_entry(
         client_pid: draft.client_pid,
         client_uid: draft.client_uid,
         client_comm: draft.client_comm.clone(),
+        client_exe: draft.client_exe.clone(),
         seq: Some(seq),
         prev_hash: prev_hash.to_string(),
         // Filled below — empty here so they are excluded from the
@@ -1304,6 +1324,7 @@ mod tests {
             client_pid: 12345,
             client_uid: 0,
             client_comm: "nn-admin".to_string(),
+            client_exe: None,
         }
     }
 
@@ -1612,6 +1633,40 @@ mod tests {
         .unwrap()
         .take_open_findings(&log_path)
         .is_empty());
+    }
+
+    /// External audit ASK-013 (NN-AUD-239, lab PR 179): an admin peer's
+    /// executable is signed with its row, right after `client_comm`; a row
+    /// without one (the agent's own, every row written before) has no
+    /// `client_exe` key — the bytes and pre-image it always had — and both
+    /// kinds verify in one chain. Changing the recorded program breaks it.
+    #[test]
+    fn client_exe_is_signed_and_rows_without_it_keep_their_bytes() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        log.append(sample_draft(0)).unwrap();
+        let mut with_exe = sample_draft(1);
+        with_exe.client_exe = Some("/usr/local/bin/nn-admin".to_string());
+        log.append(with_exe).unwrap();
+        let body = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(!lines[0].contains("client_exe"), "{}", lines[0]);
+        assert!(
+            lines[1].contains(
+                r#""client_comm":"nn-admin","client_exe":"/usr/local/bin/nn-admin","seq":1,"#
+            ),
+            "{}",
+            lines[1]
+        );
+        let mut all = rows(&log_path);
+        verify_chain(&all, &pk).expect("rows with and without client_exe verify");
+        all[1].client_exe = Some("/tmp/nn-admin".to_string());
+        assert!(matches!(
+            verify_chain(&all, &pk),
+            Err(AuditVerifyError::EntryHashMismatch { idx: 1, .. })
+        ));
     }
 
     /// External audit NN-AUD-108: a row removed before the end, or an

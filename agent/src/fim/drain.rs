@@ -85,6 +85,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::posture::lineage::AuthSessionTracker;
+// The drain's synchronous work (hashing, the drift log, `/proc` reads)
+// runs where it does not hold up the runtime's other tasks.
+use crate::runtime::off_the_runtime;
 use tracing::{debug, info, warn};
 
 use crate::audit::AgentSigningKey;
@@ -1613,6 +1616,7 @@ fn watch_map_full_draft(
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
     }
 }
 
@@ -2516,18 +2520,6 @@ fn monotonic_ns() -> u64 {
     // SAFETY: a valid clock id and a timespec to fill.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-/// Run the drain's synchronous work (hashing, the drift log, `/proc`
-/// reads) where it does not hold up the runtime's other tasks. Also R018's
-/// package-database lookups.
-pub(crate) fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
 }
 
 fn decode_sha_hex(hex_str: &str) -> Option<[u8; 32]> {

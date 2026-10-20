@@ -1744,3 +1744,103 @@ fn bpf_guard_enforce_refuses_protected_pids_write() {
         panic!("signed shutdown of the enforce-mode agent failed: {e}\n{tail}");
     }
 }
+
+// ── Lab PR 179 — external audit ASK-012 (NN-AUD-238) ────────────────
+
+/// External audit ASK-012 (NN-AUD-238): the admin socket's only gate was
+/// its mode 0600; a peer of another uid was served when the mode or the
+/// directory had been widened. The serve loop now checks `SO_PEERCRED`:
+/// uid 65534, on a socket chmod-ed 0666 in a 0711 directory, connects
+/// and is closed without a reply, one signed `integrity_drift`
+/// (`admin_socket_foreign_peer`) names it, and root is still answered.
+/// In process (no agent binary): the serve loop is the agent's; the
+/// foreign peer is a thread whose credentials alone drop to 65534 (raw
+/// `setres[ug]id`, which change the calling thread only).
+#[test]
+fn admin_socket_refuses_a_peer_of_another_uid() {
+    use northnarrow_agent::admin_cli::run_status;
+    use northnarrow_agent::admin_socket::{serve_with_audit_log, FOREIGN_PEER_KIND};
+    use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
+    use northnarrow_agent::anti_tamper::network_isolate::NetworkIsolator;
+    use northnarrow_agent::audit::{AgentSigningKey, AuditLog};
+    use northnarrow_agent::posture::PostureMachine;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    // SAFETY: geteuid has no preconditions.
+    assert_eq!(unsafe { libc::geteuid() }, 0, "this test needs root");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("admin.sock");
+    let log_path = dir.path().join("audit.log");
+    let pub_path = dir.path().join("admin.pub");
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    std::fs::write(
+        &pub_path,
+        format!("{}\n", hex::encode(key.verifying_key().to_bytes())),
+    )
+    .unwrap();
+    let auth = Arc::new(AdminAuth::load(&pub_path).unwrap());
+    let isolator = Arc::new(NetworkIsolator::new(combat_rules_path()).unwrap());
+    let posture = Arc::new(PostureMachine::new());
+    let sig = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+    let audit = Arc::new(parking_lot::Mutex::new(
+        AuditLog::open(&log_path, sig, [0u8; 16]).unwrap(),
+    ));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.spawn(serve_with_audit_log(
+        socket.clone(),
+        auth,
+        posture,
+        isolator,
+        dir.path().join("marker"),
+        None,
+        Arc::clone(&audit),
+    ));
+    wait_for_socket(&socket);
+    run_status(&socket).expect("root is answered");
+
+    // The widened modes a mistaken chmod leaves: anyone may connect.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let s = socket.clone();
+    let foreign = std::thread::spawn(move || {
+        // SAFETY: raw syscalls on this thread's own credentials.
+        unsafe {
+            assert_eq!(
+                libc::syscall(libc::SYS_setgroups, 0usize, std::ptr::null::<libc::gid_t>()),
+                0
+            );
+            assert_eq!(libc::syscall(libc::SYS_setresgid, 65534, 65534, 65534), 0);
+            assert_eq!(libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534), 0);
+        }
+        run_status(&s).map(|_| ()).map_err(|e| format!("{e:#}"))
+    })
+    .join()
+    .unwrap();
+    let err = foreign.expect_err("uid 65534 must not be answered");
+    assert!(
+        !err.contains("connecting to"),
+        "the peer must have connected (mode 0666) and been closed: {err}"
+    );
+    run_status(&socket).expect("root is still answered");
+
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| {
+            v["op"] == "integrity_drift" && v["extra"]["kind"] == FOREIGN_PEER_KIND
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let detail = rows[0]["extra"]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("a connection from uid 65534 gid 65534"),
+        "{detail}"
+    );
+    drop(rt);
+}

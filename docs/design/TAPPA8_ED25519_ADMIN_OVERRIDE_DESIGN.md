@@ -579,6 +579,8 @@ Every admin operation — success or failure — appends one record to
   "client_pid":     12345,
   "client_uid":     0,
   "client_comm":    "nn-admin",
+  "client_exe":     "/usr/local/bin/nn-admin",
+  "seq":            41,
   "prev_hash":      "abc...",
   "entry_hash":     "def...",
   "agent_sig":      "..."
@@ -601,6 +603,29 @@ log, and their `entry_hash` is `SHA-256("northnarrow/audit/v2\0" ‖
 prev_hash ‖ record)`. Rows written before carry no `seq`, keep their bytes
 and verify as above; numbering starts at their count. See
 `docs/design/EVIDENCE_CHAIN_COMPLETENESS_DESIGN.md`.
+
+Lab PR 179 (external audit ASK-012, ASK-013). Who the `client_*` fields
+describe, and how far to trust each:
+
+- `client_pid`, `client_uid` come from the kernel (`SO_PEERCRED`, fixed at
+  `connect()`). Only uid 0 — and the agent's own euid, the same uid in
+  production — may use the socket: another uid, or credentials the kernel
+  does not return whole, is closed without a reply and recorded as a signed
+  `integrity_drift` (`admin_socket_foreign_peer`, at most one per 10
+  minutes with the count of the others). The socket's mode 0600 stays the
+  first gate; this one holds when the mode or the directory was widened.
+  A descriptor passed on by the process that connected keeps that
+  process's credentials: the check is on who connected.
+- `client_comm` is **self-reported**: `/proc/<pid>/comm`, which any
+  process sets (`prctl(PR_SET_NAME)`). The operator's identity is the key
+  fingerprint.
+- `client_exe` (after `client_comm`, rows of admin operations only):
+  `/proc/<pid>/exe`, the program the kernel says the peer runs. Both are
+  read while a pidfd on the peer (`SO_PEERPIDFD` from 6.5, `pidfd_open`
+  before) shows it alive; a peer gone before the check is `<exited>`, never
+  whatever holds its pid by then. Rows the agent writes for itself, and
+  rows written before, carry no `client_exe`, keep their bytes and verify
+  as before. The triage status events carry the same as `principal_exe`.
 
 ### 9.2 Tamper evidence
 

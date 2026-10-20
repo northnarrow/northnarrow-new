@@ -61,6 +61,42 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, admin socket peers and request cost (Low
+  ASK-005 NN-AUD-236, ASK-012 NN-AUD-238, ASK-013 NN-AUD-239, ASK-014
+  NN-AUD-240, EVD-010 NN-AUD-275; lab PR 179). The admin socket's only
+  gate was its mode 0600: `SO_PEERCRED` fed the audit fields alone, a
+  failed `getsockopt` was recorded as uid 0 and the returned length was
+  not checked, so a socket or directory whose mode had been widened served
+  any local user (`status` and its drop counters, challenges, the
+  unauthenticated plumbing). The accept loop now checks the peer before it
+  gets a slot: uid 0, or the agent's own euid (the same in production),
+  is served; another uid, credentials that cannot be read or a short
+  reply is closed without a reply, an ERROR at most every 10 s and one
+  signed `integrity_drift` `admin_socket_foreign_peer` per 10 minutes
+  (with the count of the others). ASK-013: `client_comm` is the name the
+  peer gave itself; rows of admin operations now also carry
+  `client_exe`, `/proc/<pid>/exe`, and the triage status events
+  `principal_exe`, both read while a pidfd on the peer (`SO_PEERPIDFD`
+  from 6.5, `pidfd_open` before) shows it alive — a peer gone by then is
+  `<exited>`, not whatever holds its pid. ASK-005: each request's work
+  (the bounded reads, the per-row signature checks, the chain appends,
+  the audit row's fsync under its mutex) runs through `block_in_place`
+  (the FIM drain's helper, moved to `crate::runtime`) instead of holding
+  a runtime worker; the reply still follows its audit row, one request
+  at a time per connection. EVD-010: `detections` kept every matching
+  record of a file with its raw line before cutting; the collector now
+  keeps the newest `limit` (`limit` + 1,000 with the agent key) in a
+  bounded heap, same rows returned. ASK-014: the stop-time unlink of the
+  socket uses `lstat` + `unlink` (a dangling link was left behind; the
+  bind at start was fixed in lab PR 170). **Regressions / changes:** a
+  non-root process can no longer use the admin socket even if its mode
+  is widened (root, `sudo nn-admin`, the watchdog unaffected); a
+  descriptor passed on by a root process keeps root's credentials (the
+  check is on who connected); new rows carry `client_exe` /
+  `principal_exe`, which an `nn-admin` older than the agent reports as a
+  broken row (as with lab PR 160's `seq`; upgrade the binaries together);
+  rows written before keep their bytes and verify; new signed kind
+  `admin_socket_foreign_peer`.
 - External audit, Wave 3, deception readers and deploy inputs (Low DEC-012
   NN-AUD-337, DEC-015 NN-AUD-340, DEC-016 NN-AUD-341, DEC-017 NN-AUD-342;
   lab PR 178). One complete line that is not UTF-8 in `canaries.jsonl` or
