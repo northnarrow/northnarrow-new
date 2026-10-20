@@ -134,6 +134,24 @@ and the tracker note have the details and the lab evidence.
   zombies. **Regression:** an agent that cannot bind its socket again (a
   directory left at the path) is restarted once; an agent without admin
   plane next to a stale socket file is no longer restarted every minute.
+- **Install and uninstall scripts** (Wave 3: NN-AUD-388 DEP-016,
+  NN-AUD-440 DEP-020, NN-AUD-384 DEP-012, lab PR 194). `install.sh` finds
+  the tarball's line in `SHA256SUMS` by its exact name (it was a regular
+  expression) and refuses a file that lists it with two different
+  checksums. With both units stopped and the last agent's pin root still
+  protected, `install.sh --grant-key` and `uninstall.sh --grant-key` start
+  the installed agent for the trusted-installer window and stop it again
+  (it is not restarted); without a key they name the two ways out
+  (`--grant-key`, or disable the units and reboot). `uninstall.sh` stops
+  the units before disabling them and, when a stop is refused (no
+  window), ends there with nothing disabled or removed; its summary also
+  names `/etc/northnarrow/admin.key`, the private key installs before lab
+  PR 96 left. **Regression:** a `SHA256SUMS` with two different lines for
+  the tarball no longer installs (it used the first); `uninstall.sh`
+  without `--grant-key` on a running, protected host exits 1 at the stop
+  (it used to disable the units first and exit 1 at the pin root), and
+  scripts that read its output see `stopping <unit>` and `disabling
+  <unit>` where it printed `stopping + disabling <unit>`.
 - **The model moved** (NN-AUD-053 LLMR-004, lab PR 105). The model and its
   tokenizer are loaded only when root owns them and every directory above
   them, closed to others; the default location is

@@ -61,6 +61,53 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, install and uninstall scripts (Low DEP-012
+  NN-AUD-384, DEP-016 NN-AUD-388, DEP-020 NN-AUD-440; lab PR 194).
+  DEP-016: `install.sh` looked the tarball up in `SHA256SUMS` with
+  `grep -E " \*?<name>$"`, the name as a pattern: its dots matched any
+  character, so the line of a look-alike file listed first
+  (`northnarrow-1X2.3-…`) was taken for `northnarrow-1.2.3-…` and the
+  install was refused (a spurious REFUSED, never a bypass: the hash is
+  still compared), and a name with a `+` was never found. `sums_expected
+  NAME FILE` compares the second field as a string (a leading `*` removed,
+  `awk`, run by the test with the shell's own `awk`, mawk included); a
+  name listed with two different checksums is refused (the first line was
+  used) and an unreadable file is named. DEP-020: with both units inactive
+  and the pin root of the last agent still there, the branch that should
+  open the trusted-installer window required an active agent — never true
+  there — so `--grant-key` was ignored and `install.sh --upgrade
+  --grant-key` ended in "PROTECTED". A pin root nothing protects is
+  removed; a protected one, with the key: the installed agent is started
+  (its unit only), its admin socket awaited (30 s), the window opened, the
+  agent stopped again on the normal path (stop, purge, drain) and left out
+  of the units to restart and of the package's restart list, so the units
+  end as they were; without a key nothing is started and both ways out are
+  named (`--grant-key`; disable, reboot, re-run, enable). A failed start,
+  a refused grant (the agent keeps running, said so) or a socket that does
+  not appear are explicit failures. The same case in `uninstall.sh` (the
+  same text, one block both scripts carry, kept equal by a test), before
+  anything is disabled; not under `--package`. `uninstall.sh` also
+  disabled each unit before stopping it: on a protected host without the
+  window the stop was refused, the units stayed running but disabled, and
+  the script stopped at the pin root. It stops both now, disables them
+  once both are stopped, and otherwise exits 1 with nothing disabled or
+  removed. DEP-012, the part left after lab PR 96: an install older than
+  it wrote the bootstrap private key to `/etc/northnarrow/admin.key`, which
+  an uninstall without `--purge` keeps; the summary named only
+  `/root/northnarrow-admin.key`. It names both (`kept_report`), and
+  `--purge` says it removes the legacy one. `install.sh` takes
+  `BPFFS_ROOT` like `uninstall.sh`; `uninstall.sh --help` prints the whole
+  usage, `--grant-key` included. New `xtask/tests/install_scripts.rs` (12
+  tests: the two blocks, and the stop sections of both scripts under bash
+  with stub `systemctl`, `rm` refusing the pin root until the stub
+  `nn-admin` opens the window, `bpftool` and `sleep`). **Regression:** a
+  `SHA256SUMS` with two different lines for the tarball is refused;
+  `uninstall.sh` without `--grant-key` on a running, protected host exits
+  1 at the stop instead of at the pin root, with the units still enabled;
+  its log reads `stopping <unit>` and `disabling <unit>` (was `stopping +
+  disabling <unit>`); on stale protected pins with `--grant-key`, the audit
+  chain gets an `agent_boot` and an `agent_stop` of the agent started for
+  the window.
 - External audit, Wave 3, response honesty and status (Low CMB-018
   NN-AUD-310, CMB-020 NN-AUD-311, CMB-027 NN-AUD-318; lab PR 193).
   CMB-020: the detect-only branches of `block_outbound_for_pid`,

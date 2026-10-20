@@ -25,14 +25,23 @@
 #      to live in /etc/northnarrow and went with it).
 #
 # Usage:
-#   sudo ./deploy/uninstall.sh            # binaries + units, keep config/state
-#   sudo ./deploy/uninstall.sh --purge    # also /etc/northnarrow, /var/lib/northnarrow,
+#   sudo ./deploy/uninstall.sh --grant-key KEY          # binaries + units, keep config/state
+#   sudo ./deploy/uninstall.sh --purge --grant-key KEY  # also /etc/northnarrow, /var/lib/northnarrow,
 #                                         # the namespace journal — NOTHING is kept
-#   sudo ./deploy/uninstall.sh --yes      # no confirmation prompt
+#   --grant-key KEY  admin key with the trusted-installer role: the window
+#               the stop and the pin root's removal need while the hooks
+#               are attached. With both units stopped and the pin root of
+#               the last agent still protected, the installed agent is
+#               started for the window, then stopped again (external
+#               audit DEP-020)
+#   --yes       no confirmation prompt
 #   --package   run from a package's post-removal hook: the package manager
 #               already removed binaries and units and the pre-removal hook
 #               stopped the agent; a pin root that is still protected is
 #               reported instead of failing the package operation
+#
+# A unit that does not stop (no window on a protected host) stops the
+# script before anything is disabled or removed.
 #
 # Same BIN_DIR / UNIT_DIR / ETC_DIR / STATE_DIR overrides as install.sh.
 
@@ -63,7 +72,7 @@ for arg in "$@"; do
         --yes|-y) YES=1 ;;
         --package) PACKAGE=1 ;;
         --grant-key) expect_key=1 ;;
-        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) echo "uninstall.sh: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -95,6 +104,44 @@ nn_unit_has_procs() {
     cg=${cg:-/system.slice/$1.service}
     [[ -n "$(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null)" ]]
 }
+
+NN_SELF=uninstall.sh
+# >>> stale_pin_root (the same text in install.sh and uninstall.sh; xtask/tests/install_scripts.rs keeps them equal)
+# External audit DEP-020 (NN-AUD-440): both units inactive and the pin root
+# of an agent that is gone still there. Its deny hooks outlive it on purpose,
+# so the pin root, the binaries and the units stay protected, and the
+# trusted-installer window opens only through a running agent's socket: the
+# branch meant for this case asked for an active agent, never true there,
+# and --grant-key was ignored. With the key, the installed agent is started
+# (its unit only; the watchdog stays as it was) until its admin socket is
+# up; the caller opens the window, stops it again and does not restart it.
+ADMIN_SOCKET=${ADMIN_SOCKET:-/run/northnarrow/admin.sock}
+ADMIN_SOCKET_WAIT=${ADMIN_SOCKET_WAIT:-30}
+stale_pin_root_help() {
+    echo "$NN_SELF: the pin root of a stopped agent is PROTECTED by its hooks, and the trusted-installer window"
+    echo "$NN_SELF: opens only through a running agent. Either:"
+    echo "$NN_SELF:   - re-run with --grant-key <admin key carrying the trusted-installer role>: the installed"
+    echo "$NN_SELF:     agent is started for the window, then stopped again; or"
+    echo "$NN_SELF:   - systemctl disable northnarrow-agent northnarrow-watchdog, reboot (bpffs does not survive"
+    echo "$NN_SELF:     a reboot), re-run, then enable the units again."
+}
+start_agent_for_window() {
+    local i
+    echo "$NN_SELF: starting the installed agent (its unit only) to open the trusted-installer window"
+    if ! systemctl start northnarrow-agent.service; then
+        echo "$NN_SELF: the installed agent did not start (systemctl status northnarrow-agent.service)." >&2
+        stale_pin_root_help >&2
+        return 1
+    fi
+    for ((i = 0; i < ADMIN_SOCKET_WAIT; i++)); do
+        [[ -S "$ADMIN_SOCKET" ]] && return 0
+        sleep 1
+    done
+    echo "$NN_SELF: the agent started but $ADMIN_SOCKET did not appear within ${ADMIN_SOCKET_WAIT}s;" >&2
+    echo "$NN_SELF: it keeps running — re-run once nn-admin status answers." >&2
+    return 1
+}
+# <<< stale_pin_root
 
 echo "NorthNarrow uninstall"
 echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin}"
@@ -134,6 +181,35 @@ own_progs_loaded() {
     done
     echo "${left[*]:-}"
 }
+# ── 0. stale pins (external audit DEP-020) ───────────────────────────
+# Both units inactive and the pin root of the last agent still there: one
+# nothing protects any more goes now (step 2 would remove it anyway); a
+# protected one needs the window, which opens only through a running agent
+# — before nothing is disabled or removed. Not for --package: the package
+# manager already removed the agent.
+STARTED_FOR_WINDOW=0
+units_inactive() {
+    local u state
+    for u in northnarrow-watchdog northnarrow-agent; do
+        state=$(systemctl is-active "$u.service" 2>/dev/null || true)
+        [[ -z "$state" || "$state" == inactive ]] || return 1
+    done
+    return 0
+}
+if (( ! PACKAGE )) && [[ -d "$BPFFS_ROOT" ]] && units_inactive; then
+    log "units inactive but $BPFFS_ROOT exists — removing the stale pins first"
+    rm -rf "$BPFFS_ROOT" 2>/dev/null || true
+    if [[ -d "$BPFFS_ROOT" ]]; then
+        if [[ -z "$GRANT_KEY" ]]; then
+            stale_pin_root_help >&2
+            exit 1
+        fi
+        [[ -r "$GRANT_KEY" ]] || { echo "uninstall.sh: --grant-key $GRANT_KEY is not readable" >&2; exit 1; }
+        start_agent_for_window || exit 1
+        STARTED_FOR_WINDOW=1
+    fi
+fi
+
 own_ids=$(read_own_prog_ids)
 
 # ── 1. units ──────────────────────────────────────────────────────────
@@ -141,14 +217,46 @@ own_ids=$(read_own_prog_ids)
 # trusted-installer window first, while the agent still answers.
 if [[ -n "$GRANT_KEY" ]] && systemctl is-active --quiet northnarrow-agent.service; then
     log "opening the trusted-installer window (300 s) with $GRANT_KEY"
-    "$BIN_DIR/nn-admin" trusted-installer-grant --key "$GRANT_KEY" --window-secs 300 || {
-        echo "uninstall.sh: trusted-installer grant REFUSED (key without the trusted-installer role?)" >&2; exit 1; }
+    if ! "$BIN_DIR/nn-admin" trusted-installer-grant --key "$GRANT_KEY" --window-secs 300; then
+        echo "uninstall.sh: trusted-installer grant REFUSED (key without the trusted-installer role?)" >&2
+        (( STARTED_FOR_WINDOW )) &&
+            echo "uninstall.sh: the agent started for the window keeps running (its stop needs the window)" >&2
+        exit 1
+    fi
+fi
+# Stopped first, disabled once both are stopped. Outside a window the
+# anti-tamper refuses systemd's signals (external audit EBPF-001): the units
+# used to be disabled anyway, still running, and the script stopped at the
+# pin root with the host half-uninstalled. Now it stops here, before any
+# disable or removal (--package: the pre-removal hook already stopped the
+# units; reported, the removal goes on).
+for u in northnarrow-watchdog northnarrow-agent; do
+    if systemctl list-unit-files "$u.service" >/dev/null 2>&1; then
+        log "stopping $u"
+        stop_nn_unit "$u"
+    fi
+done
+still=()
+for u in northnarrow-watchdog northnarrow-agent; do
+    for ((i = 0; i < 10; i++)); do
+        nn_unit_has_procs "$u" || break
+        sleep 0.5
+    done
+    if nn_unit_has_procs "$u"; then still+=("$u"); fi
+done
+if (( ${#still[@]} )); then
+    echo "uninstall.sh: still running: ${still[*]} — the anti-tamper refuses their stop outside a trusted-installer" >&2
+    echo "uninstall.sh: window (external audit EBPF-001)." >&2
+    if (( ! PACKAGE )); then
+        echo "uninstall.sh: nothing was disabled or removed. Re-run with --grant-key <admin key carrying the" >&2
+        echo "uninstall.sh: trusted-installer role>." >&2
+        exit 1
+    fi
 fi
 for u in northnarrow-watchdog northnarrow-agent; do
     if systemctl list-unit-files "$u.service" >/dev/null 2>&1; then
-        log "stopping + disabling $u"
+        log "disabling $u"
         systemctl disable "$u.service" 2>/dev/null || true
-        stop_nn_unit "$u"
     fi
 done
 
@@ -245,7 +353,35 @@ systemctl daemon-reload
 
 # ── 5. config + state ─────────────────────────────────────────────────
 BOOTSTRAP_KEY=/root/northnarrow-admin.key
+# >>> kept_report (run by xtask/tests/install_scripts.rs)
+# External audit DEP-012 (NN-AUD-384): an install older than external audit
+# DEP-001 (lab PR 96) wrote the bootstrap private key into $ETC_DIR, which an
+# uninstall without --purge keeps. The summary named only the current path:
+# it names every private admin key it leaves (host-check, which knows both,
+# is gone with nn-admin).
+LEGACY_KEY=$ETC_DIR/admin.key
+kept_report() {
+    echo ""
+    echo "Kept (evidence + identity — remove with --purge if this host is being retired):"
+    if [[ -e "$ETC_DIR" ]]; then
+        echo "  $ETC_DIR    (admin.pub, agent.sig.key, audit.log, agent_id, rule files)"
+    fi
+    if [[ -e "$STATE_DIR" ]]; then
+        echo "  $STATE_DIR  (FIM / canary / netflow / detections chain logs)"
+    fi
+    local k
+    for k in "$BOOTSTRAP_KEY" "$LEGACY_KEY"; do
+        if [[ -f "$k" ]]; then
+            echo "  $k  (admin PRIVATE key still on this host — move it offline)"
+        fi
+    done
+    return 0
+}
+# <<< kept_report
 if (( PURGE )); then
+    if [[ -f "$LEGACY_KEY" ]]; then
+        log "PURGE: removing the admin private key $LEGACY_KEY (an install before external audit DEP-001)"
+    fi
     for d in "$ETC_DIR" "$STATE_DIR"; do
         [[ -e "$d" ]] && { log "PURGE: removing $d"; rm -rf "$d"; }
     done
@@ -256,11 +392,7 @@ if (( PURGE )); then
         [[ -e "$j" ]] && { log "PURGE: removing namespace journal $j"; rm -rf "$j"; }
     done
 else
-    echo ""
-    echo "Kept (evidence + identity — remove with --purge if this host is being retired):"
-    [[ -e "$ETC_DIR" ]]   && echo "  $ETC_DIR    (admin.pub, agent.sig.key, audit.log, agent_id, rule files)"
-    [[ -e "$STATE_DIR" ]] && echo "  $STATE_DIR  (FIM / canary / netflow / detections chain logs)"
-    [[ -f "$BOOTSTRAP_KEY" ]] && echo "  $BOOTSTRAP_KEY  (admin PRIVATE key still on this host — move it offline)"
+    kept_report
 fi
 
 echo ""

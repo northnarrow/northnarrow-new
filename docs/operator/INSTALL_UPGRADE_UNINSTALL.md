@@ -67,6 +67,24 @@ If the units are already active, `install.sh` refuses with
 `Re-run with --upgrade`: with the hooks up every copy below would fail
 with `Operation not permitted` halfway through.
 
+**Both units stopped, the pin root still there** (external audit DEP-020,
+lab PR 194). The deny hooks outlive the agent through their pins: after a
+stop inside a window that has since closed, the binaries, the units and
+`/sys/fs/bpf/northnarrow` stay protected, and the trusted-installer window
+opens only through a running agent's socket. A pin root nothing protects
+any more is removed. A protected one: with `--grant-key`, `install.sh`
+(and `uninstall.sh`, below) starts the installed agent — its unit only,
+the watchdog stays as it was — waits for its admin socket (30 s), opens
+the window, stops it again and goes on; the units end as they were (not
+restarted; the audit chain carries that agent's `agent_boot` and
+`agent_stop`). Without a key nothing is started or changed and the script
+names the two ways out: `--grant-key`, or `systemctl disable
+northnarrow-agent northnarrow-watchdog`, reboot (bpffs does not survive
+it), re-run, enable the units again. Before, `--grant-key` was ignored
+in this state and the run ended in `PROTECTED`. An agent that does not
+start, a refused grant (the agent then keeps running: its stop needs the
+window) or a socket that does not come up is an explicit failure.
+
 The five `.v1` lists (`fim-paths`, `netflow-blocklist`,
 `netflow-ja3-blocklist`, `process-comm-allowlist`,
 `netflow-comm-allowlist`) are the shipped defaults, not configuration:
@@ -161,10 +179,13 @@ sudo ./deploy/uninstall.sh --grant-key /path/to/admin.key            # keep /etc
 sudo ./deploy/uninstall.sh --purge --grant-key /path/to/admin.key    # remove them too (and the namespace journal)
 ```
 
-Order: open the trusted-installer window (`--grant-key`, same key and
-role as the upgrade; without it the pin root cannot be removed and the
-script stops with the recovery line) → disable + stop watchdog then agent
-→ drop the pin root and wait for
+Order: with both units stopped and a protected pin root left, start the
+installed agent for the window (§1, "Both units stopped") → open the
+trusted-installer window (`--grant-key`, same key and
+role as the upgrade) → stop watchdog then agent, then disable both — a
+unit whose stop is refused (no window on a protected host) stops the
+script before anything is disabled or removed (lab PR 194; the units used
+to be disabled first and left running) → drop the pin root and wait for
 the agent's own BPF programs to unload (the ids in
 `/run/northnarrow/bpf-own-ids`, read before the stop, as in the upgrade;
 other products' LSM programs are left alone) → `chattr -R -i` on state and
@@ -173,7 +194,11 @@ binaries, units, `journald@northnarrow.conf`, `/run/northnarrow` and the
 ten bait files → `daemon-reload`. Without `--purge` the admin key, the
 signed audit chain and the chain logs stay on disk: they are evidence and
 identity, and a later reinstall picks them up (`install.sh` leaves an
-existing `admin.pub` untouched). `--yes` skips the confirmation prompt.
+existing `admin.pub` untouched). The summary names every private admin
+key left on the host: `/root/northnarrow-admin.key`, and
+`/etc/northnarrow/admin.key` that installs before external audit DEP-001
+(lab PR 96) wrote (external audit DEP-012, lab PR 194); move them offline,
+or `--purge` removes both. `--yes` skips the confirmation prompt.
 
 If an unrelated NorthNarrow process (an e2e test, a manual
 `northnarrow-agent` run) still holds the LSM programs, the script stops
@@ -611,7 +636,11 @@ performs the checks and refuses to touch the host when one fails:
    extracted tree. A corrupted or edited tree is refused.
 2. **SHA256SUMS** — if the tarball is next to the tree (`../<tree>.tar.gz`,
    or `--tarball FILE`) and `SHA256SUMS` is next to it (or `--sums FILE`),
-   the tarball hash is checked against it.
+   the tarball hash is checked against it. The line is found by the
+   tarball's exact name (a leading `*`, binary mode, allowed); a file that
+   lists the name with two different checksums is refused (external audit
+   DEP-016, lab PR 194: the name used to be a regular expression, so a
+   line for a look-alike name listed first was taken for it).
 3. **SLSA attestation** — with `gh` 2.49+ (online, or offline with
    `--attestation BUNDLE` from `gh attestation download`) or `cosign`
    plus a bundle, the provenance is verified and bound to this
