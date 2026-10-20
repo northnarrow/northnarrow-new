@@ -61,6 +61,66 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, lab verdict integrity (Low LAB-020 NN-AUD-410,
+  LAB-024 NN-AUD-414, LAB-026 NN-AUD-416; lab PR 206). The lab's verdicts
+  are what it saw. LAB-020: `nn-lab.sh upgrade-check` passed with seven of
+  the new agent's own LSM programs, against 16 deny hooks plus the
+  observers. It now wants the new agent's own health line (`anti-tamper:
+  all LSM hooks attached`, `deny_attached` equal to `deny_expected`, at
+  least the 16 of `DENY_HOOKS`; an xtask test keeps the two numbers equal),
+  no fewer own LSM programs than before the upgrade (an observer lost fails
+  too) nor than the deny hooks, and no anti-tamper `subsystem_degraded`
+  signed at the upgraded boot (a start under
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, a missing observe hook; other degraded
+  records are printed). The line is read with
+  `deploy/lab/lib/lab-records.py` (`python3 -I`, as the lab user, on what
+  `sudo journalctl -o json` gives it): an event journald attributes to the
+  unit's own stdout and to the agent's pid, with the text at the start of
+  its message, never a match anywhere in a line — any user can make the
+  agent log a file name that holds the line, and `release-check.sh`'s greps
+  counted one. The same helper reads `release-check`'s three agent lines and
+  the anti-tamper suite's state lines: the BPF guard mode, an open
+  trusted-installer window, C11's drop-in registration and C38's watchdog
+  registration (a file named "… watchdog PID registered in PROTECTED_PIDS
+  pid=<n>" made C38 pass, and `pid=12` matched `pid=1234`). LAB-024: no
+  guest template set `lockdown=`, so C27 never ran and left no row.
+  `NN_LAB_LOCKDOWN=integrity nn-lab.sh up` boots a separate guest of the
+  distro (its own disk, seed, reports and ssh port, the distro's + 1000, on
+  the distro's base image) with `lockdown=integrity` added to the `lsm=`
+  line of the four templates (`__NN_LAB_KARGS__`; a template without it is
+  refused), and `check` fails on it when the kernel is not locked down.
+  Without lockdown C27 is a listed KNOWN GAP; its `finit_module` number is
+  the machine's (x86_64 313, arm64 273; elsewhere a not-run deviation),
+  where it was 313 everywhere. C17 left no row without kexec-tools, which no
+  template installs: it then loads the running kernel with
+  `kexec_file_load(2)` itself (the agent refuses both calls, review 82), and
+  an image that did load is unloaded, by the trap too. LAB-026: the nightly
+  ran none of the security checks; `tamper-check`, `pkgmgr-check`,
+  `open-sensor-check`, `fim-reuse-check`, `btrfs-check` and `overlay-check`
+  run after `install` (each starts the units it finds stopped;
+  `pkgmgr-check` gave up), a step that says N/A reads N/A and a NOT RUN
+  fails whatever its exit status, and the report gives each step's verdict
+  lines (the anti-tamper rows that are a deviation, a known gap or N/A) and
+  the guest's lockdown. `anti-tamper.sh --only` without a value ran every
+  case, the destructive ones too, and an id that names no case printed OK:
+  it takes case ids only, each must end up as a row, and a run that leaves
+  a case out does none of its setup or cleanup (the drop-in removals and
+  three `daemon-reload` of C11, C12 and C25, C13's `/mnt/nn-bpf2`, C18's
+  `oom_score_adj` write, the probe builds, C34's fresh agent binary, C49's
+  file in `/etc`); a probe that did not build is a row only for the cases
+  selected, and C43 is listed with C34-C37. The restores hold or fail the
+  run: C11's drop-in gone (and its directory when the case made it), C12's
+  runtime `MemoryMax` taken back with a `daemon-reload` (`--only C12` left
+  the 4G cap in force) and the unit's `MemoryMax` and the cgroup's
+  `memory.max` as found, C25's unit back at the installed path, C18's value
+  written back to the same process (pid and start time; it wrote -500 when
+  it could not read the value) and read back, by the trap too, and
+  `/mnt/nn-bpf2` removed. C15 and C16 are rows when they cannot run, and C30
+  a deviation when bpftool cannot dump the map (`0 → 0` passed). `nn-lab.sh
+  help` printed lines 2–36 of a header that ran to line 65 (it stopped at
+  `uninstall-check`); it prints the header to its end. Tests: `xtask/tests/lab_scripts.rs` (10; all fail on the
+  starting scripts), `anti-tamper.sh --selftest` 64 checks (40 before),
+  `lab-records.py --selftest` 7.
 - External audit, Wave 3, ADE measurement and output parser (Low WDG-012
   NN-AUD-361, WDG-017 NN-AUD-366, WDG-R03 NN-AUD-369, WDG-R12 NN-AUD-378,
   WDG-R13 NN-AUD-379, WDG-R14 NN-AUD-380, WDG-R15 NN-AUD-438; lab PR 205).

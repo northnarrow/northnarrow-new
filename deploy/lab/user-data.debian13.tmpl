@@ -2,6 +2,9 @@
 # NorthNarrow local lab guest — Debian 13 "trixie" (kernel 6.12) variant
 # of user-data.debian12.tmpl. Rendered once per `NN_LAB_DISTRO=debian13
 # nn-lab.sh up`; __SSH_PUBKEY__ is substituted by the script.
+# The lsm= line ends in the placeholder for extra kernel arguments:
+# " lockdown=integrity" on an NN_LAB_LOCKDOWN=integrity guest (lab PR 206),
+# nothing otherwise.
 #
 # The lab's first guest on a kernel from 6.9, where the inode_setattr LSM
 # hook takes `struct mnt_idmap *` before the dentry (lab PR 164).
@@ -47,7 +50,7 @@ write_files:
   - path: /etc/default/grub.d/99-nn-bpf-lsm.cfg
     permissions: "0644"
     content: |
-      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=lockdown,capability,landlock,yama,apparmor,bpf"
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT lsm=lockdown,capability,landlock,yama,apparmor,bpf__NN_LAB_KARGS__"
 runcmd:
   - update-grub
   # rustup (stable, minimal) for the guest-side userland build. External

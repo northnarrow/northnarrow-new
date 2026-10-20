@@ -3,6 +3,9 @@
 # native BTF) variant of user-data.tmpl. Rendered once per
 # `NN_LAB_DISTRO=alma9 nn-lab.sh up`; __SSH_PUBKEY__ is substituted by
 # the script.
+# The lsm= line ends in the placeholder for extra kernel arguments:
+# " lockdown=integrity" on an NN_LAB_LOCKDOWN=integrity guest (lab PR 206),
+# nothing otherwise.
 #
 # Differences from the Ubuntu / Debian templates:
 #   - dnf package names (`iptables-nft` provides iptables, `bpftool` is a
@@ -45,7 +48,7 @@ packages:
   - e2fsprogs
   - policycoreutils-python-utils
 runcmd:
-  - grubby --update-kernel=ALL --args="lsm=lockdown,capability,yama,integrity,selinux,bpf"
+  - grubby --update-kernel=ALL --args="lsm=lockdown,capability,yama,integrity,selinux,bpf__NN_LAB_KARGS__"
   # rustup (stable, minimal) for the guest-side userland build. External
   # audit LAB-009: no `curl | sh`; a pinned rustup-init is checked against
   # its pinned SHA-256 before it runs (rustup then checks each toolchain

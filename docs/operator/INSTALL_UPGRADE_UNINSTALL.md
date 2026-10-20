@@ -167,10 +167,14 @@ boot; it is the same window a reboot has.
 
 The lab verifies this path on every nightly (`nn-lab.sh upgrade-check`):
 refusal without the flag, pid change, new audit entry, identity files
-unchanged, ≥ 7 of the new agent's own LSM programs, none of the old ones,
-no foreign LSM program lost, `PROTECTED_PIDS` re-pinned afterwards, and
-the five `.v1` lists equal to the release's with no edited or left-over
-list reported by the new agent.
+unchanged, the new agent's own health line (`anti-tamper: all LSM hooks
+attached`, every deny hook of the kernel — at least the 16 of every
+supported kernel — read as that agent's own journal event, lab PR 206), no
+fewer of its own LSM programs than before the upgrade and none of the old
+ones, no anti-tamper `subsystem_degraded` signed at the upgraded boot, no
+foreign LSM program lost, `PROTECTED_PIDS` re-pinned afterwards, and the
+five `.v1` lists equal to the release's with no edited or left-over list
+reported by the new agent.
 
 ## 3. Uninstall
 
@@ -231,7 +235,8 @@ missing and how to fix it:
 
 The agent runs unchanged under `lockdown=integrity` (verified on Ubuntu
 22.04 / 5.15: every deny hook attached, and `tamper-check` saw kexec and
-an unsigned module refused by the kernel). `confidentiality` mode is not
+an unsigned module refused by the kernel; the lab's lockdown guest,
+`NN_LAB_LOCKDOWN=integrity nn-lab.sh up`, repeats it, lab PR 206). `confidentiality` mode is not
 verified: it restricts BPF reads of kernel memory, which the sensors rely
 on.
 

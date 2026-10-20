@@ -8,10 +8,19 @@ fail=0
 ok()  { echo "ok    $*"; }
 bad() { echo "FAIL  $*"; fail=1; }
 check() { local what=$1; shift; if "$@"; then ok "$what"; else bad "$what"; fi; }
-journal() {
-    sudo journalctl --namespace northnarrow -u northnarrow-agent --since "$T0" -o cat --no-pager \
-        | sed 's/\x1b\[[0-9;]*m//g'
+# External audit LAB-020 (NN-AUD-410, lab PR 206): an agent line counts
+# only as an event of the running agent itself — its unit's stdout and pid,
+# the message at the start of the line (deploy/lab/lib/lab-records.py,
+# copied next to the tarball by nn-lab.sh) — never as text in another line
+# (a file named like it, run from /tmp by any user, is logged in a VERDICT).
+RECORDS=${NN_LAB_RECORDS:-/tmp/nn-release/lab-records.py}
+agent_event() {   # <level> <message prefix>
+    local pid
+    pid=$(sudo cat /run/northnarrow/agent.pid 2>/dev/null) || return 1
+    sudo journalctl --namespace northnarrow -u northnarrow-agent _PID="$pid" --since "$T0" -o json --no-pager 2>/dev/null \
+        | python3 -I "$RECORDS" journal northnarrow-agent.service "$pid" "$1" "$2" >/dev/null
 }
+[ -r "$RECORDS" ] || { bad "lab-records.py not found at $RECORDS (nn-lab.sh release-check copies it)"; exit 1; }
 
 sudo rm -rf /opt/nn-release && sudo mkdir -p /opt/nn-release && sudo cp /tmp/nn-release/* /opt/nn-release/
 cd /opt/nn-release || exit 1
@@ -37,11 +46,11 @@ check "  install manifest provenance=checksums" sudo grep -q '"provenance": "che
 sudo systemctl daemon-reload
 sudo systemctl start northnarrow-agent; sleep 3; sudo systemctl start northnarrow-watchdog; sleep 25
 check "units active" test "$(systemctl is-active northnarrow-agent northnarrow-watchdog | tr '\n' ' ')" = "active active "
-check "binary integrity verified (checksums manifest)" bash -c "$(declare -f journal); T0='$T0'; journal | grep -q 'binary integrity verified against the install manifest provenance=\"checksums\"'"
-# logged only when every deny hook of this kernel attached (16 on 5.15 and
-# 6.1, 18 where the kernel has the ACL hooks, 6.2+)
-check "every deny hook attached" bash -c "$(declare -f journal); T0='$T0'; journal | grep -q 'all LSM hooks attached deny_attached='"
-check "telemetry probe armed" bash -c "$(declare -f journal); T0='$T0'; journal | grep -q 'telemetry probe armed'"
+check "binary integrity verified (checksums manifest)" agent_event INFO 'binary integrity verified against the install manifest provenance="checksums" '
+# logged only when every deny and observe hook of this kernel attached (16
+# deny hooks on 5.15 and 6.1, 18 where the kernel has the ACL hooks, 6.2+)
+check "every deny hook attached" agent_event INFO 'anti-tamper: all LSM hooks attached deny_attached='
+check "telemetry probe armed" agent_event INFO 'telemetry probe armed'
 # a detection end to end: exec from /tmp (R001)
 cp /bin/true /tmp/nn-release-probe && chmod +x /tmp/nn-release-probe
 /tmp/nn-release-probe 2>/dev/null; sleep 3; rm -f /tmp/nn-release-probe

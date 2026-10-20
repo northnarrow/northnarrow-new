@@ -24,6 +24,16 @@
 # Every mount the run makes is undone by a trap, and a mount left behind
 # after its case fails the run and stops it.
 #
+# External audit LAB-020/LAB-024/LAB-026 (lab PR 206): `--only` runs the
+# setup and cleanup of the cases it names and nothing else, and every id it
+# names is a row of the table; a case that cannot run here is a row too (N/A
+# when the kernel lacks the interface, KNOWN GAP for C27 without lockdown, a
+# DEVIATION otherwise), never a silent omission; what a case changes and the
+# suite puts back (C11's drop-in, C12's MemoryMax, C25's unit, C18's
+# oom_score_adj) must read as before, or the run fails; the state lines read
+# from the journal (BPF guard mode, an open window, C11, C38) are events of
+# the unit and process that wrote them (deploy/lab/lib/lab-records.py).
+#
 # Reboot persistence: after `nn-lab.sh tamper-check`, boot the guest again
 # (`nn-lab.sh down && nn-lab.sh up`, or `sudo systemctl reboot` in it), then
 # `nn-lab.sh ssh 'cd ~/northnarrow && sudo bash deploy/lab/adversarial/anti-tamper.sh --persistence'`.
@@ -38,15 +48,26 @@ AUDIT=$ETC/audit.log
 DETS=$STATE/detections/detections.jsonl
 ONLY=
 MODE=run
+# External audit LAB-026 (NN-AUD-416, lab PR 206): `--only` without a value
+# ran every case, the destructive ones too, and an id that names no case ran
+# nothing and printed OK. It takes a list of case ids now, and each one must
+# end up as a row of the table (only_unreported, at the end).
+only_list_ok() { [[ ${1:-} =~ ^C[0-9]{2}[a-z]?(,C[0-9]{2}[a-z]?)*$ ]]; }
 while (( $# )); do
     case "$1" in
-        --only) ONLY=${2:-}; shift ;;
+        --only)
+            only_list_ok "${2:-}" || { echo "anti-tamper.sh: --only takes case ids, e.g. --only C01,C55a (got '${2:-}')" >&2; exit 2; }
+            ONLY=$2; shift ;;
         --persistence) MODE=persistence ;;
         --selftest) MODE=selftest ;;
         *) echo "usage: anti-tamper.sh [--only C01,C02 | --persistence | --selftest]" >&2; exit 2 ;;
     esac
     shift
 done
+# deploy/lab/lib/lab-records.py: the journal lines the suite reads for state
+# (the BPF guard mode, an open trusted-installer window, C11's registration,
+# C38's), as events of the unit and process that wrote them (lab PR 206)
+LABREC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/lab-records.py"
 # External audit LAB-008: root's scratch files live in a fresh 0700
 # directory, never at a fixed /tmp name another user could create first (C14
 # would bind that user's directory over /etc/northnarrow, C24 sign that
@@ -64,7 +85,7 @@ rows=()
 # when the process it was given is not the one it was told to expect, and
 # never prints the content of a file it reads.
 NNPY_SRC=$(cat <<'PY'
-import errno, hashlib, io, json, os, re, signal, subprocess, sys, tempfile, time
+import ctypes, errno, hashlib, io, json, os, re, signal, subprocess, sys, tempfile, time
 from contextlib import redirect_stdout
 
 PROTECTED_COMMS = ("northnarrow-age", "northnarrow-wat")
@@ -252,6 +273,118 @@ def cmd_map_pids():
         return 1
     print("total=%d stale=%d%s" % (len(pids), len(stale),
                                    " pids=" + ",".join(map(str, stale)) if stale else ""))
+    return 0
+
+# ── kernel loads through the bare syscall (external audit LAB-024, lab PR
+# 206): the numbers of the machine the suite runs on — x86_64's own table,
+# the generic one (asm-generic/unistd.h) of arm64 — where C27 used x86_64's
+# 313 everywhere; on another machine the case is not run (a deviation).
+SYSCALLS = {
+    "x86_64": {"finit_module": 313, "kexec_file_load": 320},
+    "aarch64": {"finit_module": 273, "kexec_file_load": 294},
+}
+KEXEC_FILE_UNLOAD, KEXEC_FILE_NO_INITRAMFS = 0x1, 0x4
+MODULE_SIG_MAGIC = b"~Module signature appended~\n"
+
+def syscall_nr(name, machine=None):
+    return SYSCALLS.get(machine or os.uname().machine, {}).get(name)
+
+def cmd_syscall_nr(name):
+    nr = syscall_nr(name)
+    if nr is None:
+        return 1
+    print(nr)
+    return 0
+
+def open_input(path):
+    # a file the case needs, not the operation under test: a failure here is
+    # "setup:", never an errno=/strerror text outcome_of would read as a refusal
+    try:
+        return os.open(path, os.O_RDONLY)
+    except OSError as e:
+        print("setup: cannot open %s (%s); nothing loaded" % (path, ename(e.errno)))
+        return None
+
+def raw_syscall(nr, *args):
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    ctypes.set_errno(0)
+    r = libc.syscall(ctypes.c_long(nr), *args)
+    return r, ctypes.get_errno()
+
+def cmd_finit(path):
+    nr = syscall_nr("finit_module")
+    if nr is None:
+        print("setup: no finit_module number for %s; nothing loaded" % os.uname().machine)
+        return 2
+    fd = open_input(path)
+    if fd is None:
+        return 2
+    try:
+        r, e = raw_syscall(nr, ctypes.c_int(fd), ctypes.c_char_p(b""), ctypes.c_int(0))
+    finally:
+        os.close(fd)
+    if r != 0:
+        print("finit_module: errno=" + ename(e))
+        return 1
+    print("finit_module: loaded")
+    return 0
+
+def cmd_kexec_file(kernel, initrd):
+    nr = syscall_nr("kexec_file_load")
+    if nr is None:
+        print("setup: no kexec_file_load number for %s; nothing loaded" % os.uname().machine)
+        return 2
+    with open("/proc/cmdline", "rb") as f:
+        cmdline = f.read().strip()
+    kfd = open_input(kernel)
+    if kfd is None:
+        return 2
+    ifd, flags = -1, KEXEC_FILE_NO_INITRAMFS
+    if initrd and os.path.exists(initrd):
+        ifd, flags = open_input(initrd), 0
+        if ifd is None:
+            os.close(kfd)
+            return 2
+    try:
+        r, e = raw_syscall(nr, ctypes.c_int(kfd), ctypes.c_int(ifd), ctypes.c_ulong(len(cmdline) + 1),
+                           ctypes.c_char_p(cmdline), ctypes.c_ulong(flags))
+    finally:
+        os.close(kfd)
+        if ifd >= 0:
+            os.close(ifd)
+    if r != 0:
+        print("kexec_file_load: errno=" + ename(e))
+        return 1
+    print("kexec_file_load: image loaded")
+    return 0
+
+def cmd_kexec_unload():
+    # KEXEC_FILE_UNLOAD frees the loaded image whichever call loaded it,
+    # and reads no file: no kexec hook stands in its way
+    nr = syscall_nr("kexec_file_load")
+    if nr is None:
+        return 2
+    r, e = raw_syscall(nr, ctypes.c_int(-1), ctypes.c_int(-1), ctypes.c_ulong(0),
+                       ctypes.c_char_p(None), ctypes.c_ulong(KEXEC_FILE_UNLOAD))
+    if r != 0:
+        print("kexec unload: errno=" + ename(e))
+        return 1
+    return 0
+
+def strip_signature(data):
+    # an appended module signature: <module><sig><12-byte module_signature
+    # with the big-endian sig length last><magic>
+    if data.endswith(MODULE_SIG_MAGIC):
+        sig_len = int.from_bytes(data[-len(MODULE_SIG_MAGIC) - 4:-len(MODULE_SIG_MAGIC)], "big")
+        data = data[:-len(MODULE_SIG_MAGIC) - 12 - sig_len]
+    return data
+
+def cmd_strip_sig(src, dst):
+    with open(src, "rb") as f:
+        data = strip_signature(f.read())
+    with open(dst, "wb") as f:
+        f.write(data)
     return 0
 
 # ── evidence (external audit NN-AUD-413, lab PR 167) ─────────────────────
@@ -491,6 +624,19 @@ def selftest():
         check("op=signal" not in ev and ev.count("deny=signal") == 1, "no forged denial counted")
         check(evidence_line(os.path.join(d, "none"), "0", os.path.join(d, "none"), "0", [])
               == "journal:[errors=0] audit:[] detections:[]", "evidence with no records")
+    # the machine's own syscall numbers (LAB-024, lab PR 206), and none for
+    # a machine without a table
+    check(syscall_nr("finit_module", "x86_64") == 313 and syscall_nr("kexec_file_load", "x86_64") == 320,
+          "x86_64 numbers")
+    check(syscall_nr("finit_module", "aarch64") == 273 and syscall_nr("kexec_file_load", "aarch64") == 294,
+          "arm64 numbers")
+    check(syscall_nr("finit_module", "s390x") is None, "no number for an unknown machine")
+    body = b"\x7fELF module"
+    signed = body + b"S" * 7 + bytes(8) + (7).to_bytes(4, "big") + MODULE_SIG_MAGIC
+    check(strip_signature(signed) == body and strip_signature(body) == body, "module signature stripped")
+    rc, out = quiet(cmd_finit, "/nonexistent/nn.ko")
+    check(rc == 2 and out.startswith("setup:") and "errno=" not in out and "denied" not in out,
+          "a missing input is a setup failure, not a refusal: %r" % out)
     print("python helper selftest: %d checks, %d failed%s" % (
         checks, len(fails), "".join("\n  FAIL: " + x for x in fails)))
     return 1 if fails else 0
@@ -500,7 +646,9 @@ def main(argv):
         "ident": (cmd_ident, 1), "signal": (cmd_signal, 4),
         "procopen": (cmd_procopen, 5), "fileid": (cmd_fileid, 2),
         "map-pids": (cmd_map_pids, 0), "selftest": (selftest, 0),
-        "evidence": (cmd_evidence, 4),
+        "evidence": (cmd_evidence, 4), "syscall-nr": (cmd_syscall_nr, 1),
+        "finit": (cmd_finit, 1), "kexec-file": (cmd_kexec_file, 2),
+        "kexec-unload": (cmd_kexec_unload, 0), "strip-sig": (cmd_strip_sig, 2),
     }
     if argv and argv[0] == "file" and len(argv) in (3, 4):
         return cmd_file(*argv[1:])
@@ -527,6 +675,22 @@ nnpy() { python3 -I -c "$NNPY_SRC" "$@"; }
 journal_json() { journalctl --namespace=northnarrow -u northnarrow-agent --since "$1" --no-pager -o json 2>/dev/null; }
 evidence() {
     journal_json "$1" | nnpy evidence "$AUDIT" "${2:-0}" "$DETS" "${3:-0}"
+}
+# jentry <unit> <pid> <LEVEL> <message prefix> [since]: the messages of the
+# events process <pid> of <unit> wrote at <LEVEL> in this boot whose message
+# starts with the prefix (deploy/lab/lib/lab-records.py: journald's own
+# _SYSTEMD_UNIT, _TRANSPORT and _PID fields, the message at the start of the
+# line). External audit LAB-020/LAB-026 (lab PR 206): the state lines — the
+# BPF guard mode, an open trusted-installer window, C11's registration and
+# C38's — were grepped anywhere in the text of both units' lines, and a file
+# named "… watchdog PID registered in PROTECTED_PIDS pid=<n>", run from /tmp
+# by any user, is logged by the agent in a VERDICT line: C38 passed on it.
+journal_entries() {   # <unit> <pid> [since]: `journalctl -o json`, this boot
+    journalctl --namespace=northnarrow -b -u "$1" _PID="$2" ${3:+--since "$3"} --no-pager -o json 2>/dev/null
+}
+jentry() {
+    [[ ${2:-} =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+    journal_entries "$1" "$2" "${5:-}" | python3 -I "$LABREC" journal "$1.service" "$2" "$3" "$4"
 }
 
 # valid_pid <pid> <comm>: a decimal PID above 1 whose /proc/<pid>/comm is
@@ -668,12 +832,53 @@ restore_missing() {   # <path> <backup>
     [[ -e "$1" || ! -s "$2" ]] && return 0
     cp -p "$2" "$1" && echo "restored $1 from $2" >&2
 }
+# restored <case> <what> <before> <now> (lab PR 206): a state a case changed
+# and the suite put back must read as it did before the case; otherwise the
+# run fails with a row naming what was left.
+restored() {
+    [[ "$3" == "$4" ]] && return 0
+    fail=1
+    rows+=("| $1 | (cleanup) $2 not put back | $(tr -d '|' <<<"${3:-?} → ${4:-?}" | cut -c1-80) | — | DEVIATION (state left behind) |")
+    echo "$1: $2 not put back: '$3' → '$4'" >&2
+    return 1
+}
+# C18's agent, as found: "<pid> <start time> <oom_score_adj>". Written back
+# to that same process only (a recycled agent sets its own value at boot).
+OOM_RESTORE=
+oom_restore() {
+    [[ -n "$OOM_RESTORE" ]] || return 0
+    local pid st val cst comm
+    read -r pid st val <<<"$OOM_RESTORE"
+    OOM_RESTORE=
+    read -r cst _ comm <<<"$(nnpy ident "$pid" 2>/dev/null)"
+    if [[ "$cst" != "$st" || "$comm" != northnarrow-age ]]; then
+        echo "C18: the agent it changed (pid $pid) is gone; a new agent sets its own oom_score_adj" >&2
+        return 0
+    fi
+    echo "$val" > "/proc/$pid/oom_score_adj" 2>/dev/null
+    restored C18 "the agent's oom_score_adj" "$val" "$(cat "/proc/$pid/oom_score_adj" 2>/dev/null)"
+}
+# A kexec image C17 let in is unloaded, by the syscall (no file is read, so
+# no hook stands in the way), else the tool; one still loaded fails the run.
+KEXEC_UNLOAD=0
+kexec_unload() {
+    (( KEXEC_UNLOAD )) || return 0
+    KEXEC_UNLOAD=0
+    [[ "$(cat /sys/kernel/kexec_loaded 2>/dev/null)" == 1 ]] || return 0
+    nnpy kexec-unload >/dev/null 2>&1 || kexec -u 2>/dev/null
+    if [[ "$(cat /sys/kernel/kexec_loaded 2>/dev/null)" == 1 ]]; then
+        echo "WARNING: a kexec image is still loaded — unload it by hand (kexec -u)" >&2
+        fail=1
+    fi
+}
 cleanup_done=0
 cleanup_all() {   # idempotent; 1 when a mount could not be undone
     (( cleanup_done )) && return 0
     cleanup_done=1
     local r rc=0
     [[ -n "$CG_FROZEN" ]] && echo 0 > "$CG_FROZEN" 2>/dev/null
+    oom_restore
+    kexec_unload
     if (( WD_MASKED )); then
         systemctl unmask --runtime northnarrow-watchdog >/dev/null 2>&1
         WD_MASKED=0
@@ -693,7 +898,48 @@ on_exit() {
     exit 1
 }
 
+# >>> case-selection (xtask/tests/lab_scripts.rs runs this block)
 selected() { [[ -z "$ONLY" || ",$ONLY," == *",$1,"* ]]; }
+# selected_any C34,C35,…: one of the cases is selected (the setup they share)
+selected_any() {
+    local id
+    for id in ${1//,/ }; do selected "$id" && return 0; done
+    return 1
+}
+# The --only ids no row of the table names (lab PR 206): a case that does
+# not exist, or that a condition skipped without a row, must not read as OK.
+only_unreported() {
+    local id
+    [[ -n "$ONLY" ]] || return 0
+    for id in ${ONLY//,/ }; do
+        printf '%s\n' ${rows[@]+"${rows[@]}"} | grep -qE "^\| ([^|]*,)?$id(,[^|]*)? \|" || echo "$id"
+    done
+}
+report_unreported() {
+    local id
+    for id in $(only_unreported); do
+        fail=1
+        rows+=("| $id | (not run) | no such case, or it did not run | — | DEVIATION (--only $id: no row) |")
+        echo "$id: asked for with --only, and no row names it → DEVIATION" >&2
+    done
+}
+# External audit NN-AUD-222 (LAB-017): a case that does not run is a table
+# row, never just a line on stderr. "Not applicable" (the kernel has the
+# feature switched off: kernel.io_uring_disabled=2) is N/A; anything else
+# (a probe that did not build) is a DEVIATION, so the run fails.
+# External audit LAB-026 (lab PR 206): <ids> is a comma-separated list of
+# the cases that did not run (C43 was missing from C34-C37's), and the row is
+# made only for a run that selected one of them (--only C01 failed on a probe
+# another case needs).
+skipped_case() { # ids reason na(0|1)
+    local v why
+    selected_any "$1" || return 0
+    why=$(tr -d '|' <<<"$2")
+    if [[ "$3" == 1 ]]; then v="N/A ($why)"; else v="DEVIATION (not run: $why)"; fail=1; fi
+    rows+=("| $1 | (not run) | SKIPPED ($why) | — | $v |")
+    echo "$1 skipped: $2 → $v" >&2
+}
+# <<< case-selection
 
 # ── --selftest: the helpers above, unprivileged, on this host ─────────────
 selftest() {
@@ -754,6 +1000,34 @@ selftest() {
         | grep -oE 'C[0-9]+[a-z]?$')
     dup=$(sort <<<"$ids" | uniq -d | tr '\n' ' ')
     t eq "$dup" ""
+    # lab PR 206: --only takes case ids only (without a value it ran them all)
+    for p in C01 C01,C55a C59a,C59b,C59c; do t only_list_ok "$p"; done
+    for p in "" C1 c01 C01, ,C01 "C01 C02" "C01;id" C001 --persistence; do t eval "! only_list_ok '$p'"; done
+    # a skipped case is a row only for a run that selected it; an --only id
+    # no row names is reported; a restore that did not hold is a deviation
+    t eval '(ONLY=C01; rows=(); fail=0; skipped_case C22,C59a "x" 0 2>/dev/null; (( ${#rows[@]} == 0 && fail == 0 )))'
+    t eval '(ONLY=C59a; rows=(); fail=0; skipped_case C22,C59a "x" 0 2>/dev/null; (( ${#rows[@]} == 1 && fail == 1 )) && [[ ${rows[0]} == "| C22,C59a | (not run) | SKIPPED (x) | — | DEVIATION (not run: x) |" ]])'
+    t eval '(ONLY=; rows=(); fail=0; skipped_case C22 "io|uring" 1 2>/dev/null; (( ${#rows[@]} == 1 && fail == 0 )) && [[ ${rows[0]} == "| C22 | (not run) | SKIPPED (iouring) | — | N/A (iouring) |" ]])'
+    t eval '(ONLY=C01,C43,C99,C5; rows=("| C01 | a | denied | e | OK |" "| C34,C35,C43 | (not run) | x | — | N/A (x) |" "| C55a | b | c | d | OK |"); [[ "$(only_unreported | tr "\n" " ")" == "C99 C5 " ]])'
+    t eval '(ONLY=C99; rows=(); fail=0; report_unreported 2>/dev/null; (( fail == 1 )) && [[ ${rows[0]} == "| C99 | (not run) |"* ]])'
+    t eval '(ONLY=; rows=(); fail=0; report_unreported; (( ${#rows[@]} == 0 && fail == 0 )))'
+    t eval '(rows=(); fail=0; restored C12 "x" infinity infinity && (( ${#rows[@]} == 0 && fail == 0 )))'
+    t eval '(rows=(); fail=0; ! restored C12 "MemoryMax" infinity 4294967296 2>/dev/null && (( fail == 1 )) && [[ ${rows[0]} == "| C12 | (cleanup) MemoryMax not put back | infinity → 4294967296 | — | DEVIATION (state left behind) |" ]])'
+    # the journal's state lines: lab-records.py, and jentry's plumbing with
+    # a stubbed journal — a forged file name in a VERDICT line never counts
+    t eval "python3 -I '$LABREC' --selftest >/dev/null"
+    t eval '(journal_entries() {
+            printf "%s\n" "{\"_SYSTEMD_UNIT\":\"northnarrow-watchdog.service\",\"_TRANSPORT\":\"stdout\",\"_PID\":\"$2\",\"MESSAGE\":\"2026-10-20T00:00:00.000000Z  INFO watchdog: watchdog PID registered in PROTECTED_PIDS pid=4242 bpffs_root=/sys/fs/bpf/northnarrow\"}"
+        }
+        jentry northnarrow-watchdog 4242 INFO "watchdog: watchdog PID registered in PROTECTED_PIDS pid=4242 " >/dev/null \
+            && ! jentry northnarrow-watchdog 4242 INFO "watchdog: watchdog PID registered in PROTECTED_PIDS pid=424 " >/dev/null \
+            && ! jentry northnarrow-watchdog "" INFO "watchdog:" >/dev/null)'
+    t eval '(journal_entries() {
+            printf "%s\n" "{\"_SYSTEMD_UNIT\":\"northnarrow-watchdog.service\",\"_TRANSPORT\":\"stdout\",\"_PID\":\"$2\",\"MESSAGE\":\"2026-10-20T00:00:00.000000Z  INFO VERDICT (rule) target_filename=\\\"/tmp/watchdog: watchdog PID registered in PROTECTED_PIDS pid=4242 \\\"\"}"
+        }
+        ! jentry northnarrow-watchdog 4242 INFO "watchdog: watchdog PID registered in PROTECTED_PIDS pid=4242 " >/dev/null)'
+    # this machine's syscall numbers exist (C17's fallback, C27)
+    t eval '[[ "$(nnpy syscall-nr finit_module)" =~ ^[0-9]+$ && "$(nnpy syscall-nr kexec_file_load)" =~ ^[0-9]+$ ]]'
     # the io_uring probe builds and its tamper modes behave on scratch files
     src="$(dirname "$0")/iouring-probe.c"
     if command -v cc >/dev/null && [[ -f "$src" ]] && [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) != 2 ]]; then
@@ -778,6 +1052,7 @@ if [[ "$MODE" == selftest ]]; then
 fi
 
 command -v python3 >/dev/null || { echo "python3 is required (identity-checked signals, errno helpers)"; exit 2; }
+[[ -r "$LABREC" ]] || { echo "lab-records.py not found at $LABREC (run the suite from the repository: deploy/lab/adversarial/anti-tamper.sh)"; exit 2; }
 trap on_exit EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
@@ -827,9 +1102,6 @@ restart_agent() {
 }
 export -f grant_window restart_agent
 export NNADMIN ETC ADMIN_KEY
-# The journal text, for state lines only (the BPF guard mode, C38's
-# registration line), never for a case's evidence (NN-AUD-413).
-jlines() { journalctl --namespace=northnarrow -u northnarrow-agent -u northnarrow-watchdog --since "$1" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -v "process spawn detected"; }
 audit_count() { wc -l < "$AUDIT" 2>/dev/null || echo 0; }
 dets_count() { wc -l < "$DETS" 2>/dev/null || echo 0; }
 
@@ -884,16 +1156,18 @@ PID=$(agent_pid)
 # the pins. Wait until this agent closes it (a restart ends it too: the
 # grants are bound to the boot's session nonce).
 window_open() {
-    journalctl --namespace=northnarrow _PID="$(agent_pid 0)" --since "-30min" --no-pager -o cat 2>/dev/null \
-        | grep -oE 'trusted-installer override (ARMED|CLOSED)' | tail -1 | grep -q ARMED
+    jentry northnarrow-agent "$(agent_pid 0)" INFO "trusted-installer override " "-30min" \
+        | tail -1 | grep -q '^trusted-installer override ARMED'
 }
 for i in $(seq 1 130); do
     window_open || break
     (( i == 1 )) && echo "a trusted-installer window is open: waiting for it to close" >&2
     sleep 1
 done
-# BPF guard mode of the running agent (lab builds observe unless forced)
-BPF_MODE=$(jlines "-2h" | grep -o 'own objects registered.*mode="[a-z]*"' | tail -1 | grep -o 'mode="[a-z]*"' | cut -d'"' -f2)
+# BPF guard mode of the running agent (lab builds observe unless forced),
+# from its own registration line (jentry)
+BPF_MODE=$(jentry northnarrow-agent "$PID" INFO "BPF self-defence: own objects registered " | tail -1 \
+    | grep -oE ' mode="(enforce|observe)"' | cut -d'"' -f2)
 BPF_MODE=${BPF_MODE:-enforce}
 if [[ "$BPF_MODE" == enforce ]]; then BPF_EXPECT=denied; else BPF_EXPECT=allowed; fi
 echo "agent pid $PID, kernel $(uname -r), bpf guard mode $BPF_MODE, $(date -u +%FT%TZ)" >&2
@@ -924,16 +1198,6 @@ state_row() {   # <id> <title> <detail> <check...>
     rows+=("| $id | $title | $detail | — | $v |")
     echo "$id $title → $detail; $v" >&2
 }
-# External audit NN-AUD-222 (LAB-017): a case that does not run is a table
-# row, never just a line on stderr. "Not applicable" (the kernel has the
-# feature switched off: kernel.io_uring_disabled=2) is N/A; anything else
-# (a probe that did not build) is a DEVIATION, so the run fails.
-skipped_case() { # ids reason na(0|1)
-    local v
-    if [[ "$3" == 1 ]]; then v="N/A ($2)"; else v="DEVIATION (not run: $2)"; fail=1; fi
-    rows+=("| $1 | (not run) | SKIPPED ($2) | — | $v |")
-    echo "$1 skipped: $2 → $v" >&2
-}
 print_table() {
     echo
     echo "| case | action | outcome | evidence | verdict |"
@@ -956,6 +1220,7 @@ if [[ "$MODE" == persistence ]]; then
     state_row C62e "after a boot: the pins are back" "PROTECTED_PIDS, link_task_kill" \
         test -e "$PINS/PROTECTED_PIDS" -a -e "$PINS/link_task_kill"
     cleanup_all
+    report_unreported
     print_table
     (( fail == 0 )) && echo "anti-tamper check: OK (known gaps listed)" || echo "anti-tamper check: DEVIATIONS"
     exit $fail
@@ -978,7 +1243,7 @@ POST=$(post post_flag "$STATE" i present) \
 run_case C05 "chattr -i on the state dir" denied "deny=ioctl" 0 -- chattr -i "$STATE"
 POST=$(post post_same "$UNIT" ino "$(nnpy fileid "$UNIT" ino)") \
 run_case C06 "unlink the agent unit (systemctl mask)" denied "deny=unlink" 0 -- bash -c "rm -f $UNIT"
-pin_list > "$SCRATCH/pins.before"
+selected C07 && pin_list > "$SCRATCH/pins.before"
 POST=$(post post_pins_kept "$SCRATCH/pins.before") \
 run_case C07 "rm -rf the bpffs pin root" denied "deny=unlink" 0 -- bash -c "rm -rf $PINS"
 run_case C08 "bpftool map update on PROTECTED_PIDS (pinned)" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- bpftool map update pinned "$PINS/PROTECTED_PIDS" key 1 0 0 0 value 1
@@ -989,63 +1254,119 @@ run_case C10 "bpftool feature probe (loads test programs)" allowed "NN-L-BPF-001
 # External audit EBPF-015: where the agent registered its drop-in directory
 # at boot (install.sh makes it on Debian-family hosts) a new drop-in is
 # refused; elsewhere it is made beside the unit and reported.
-C11_EXP=allowed; C11_EV="integrity_drift"
-if journalctl --namespace=northnarrow _PID="$PID" --no-pager -o cat 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' \
-    | grep -qE "registered in PROTECTED_INODES path=/etc/systemd/system/northnarrow-agent\.service\.d( |$)"; then
-    C11_EXP=denied; C11_EV="deny=create"
+DROPIN_DIR=/etc/systemd/system/northnarrow-agent.service.d
+if selected C11; then
+    C11_EXP=allowed; C11_EV="integrity_drift"
+    if jentry northnarrow-agent "$PID" INFO "anti-tamper FS: agent binary/unit registered in PROTECTED_INODES path=$DROPIN_DIR " >/dev/null; then
+        C11_EXP=denied; C11_EV="deny=create"
+    fi
+    DROPIN_NEW=0; [[ -e $DROPIN_DIR ]] || DROPIN_NEW=1
+    WAIT=40 run_case C11 "unit drop-in with a hostile Environment=" "$C11_EXP" "$C11_EV" 0 -- bash -c "mkdir -p $DROPIN_DIR && printf '[Service]\nEnvironment=NN_ANTI_TAMPER_ALLOW_DEGRADED=1\n' > $DROPIN_DIR/zz-tamper.conf"
+    rm -f "$DROPIN_DIR/zz-tamper.conf"
+    (( DROPIN_NEW )) && rmdir "$DROPIN_DIR" 2>/dev/null
+    systemctl daemon-reload
+    restored C11 "$DROPIN_DIR/zz-tamper.conf" "absent" "$([[ -e $DROPIN_DIR/zz-tamper.conf ]] && echo present || echo absent)"
 fi
-WAIT=40 run_case C11 "unit drop-in with a hostile Environment=" "$C11_EXP" "$C11_EV" 0 -- bash -c "mkdir -p /etc/systemd/system/northnarrow-agent.service.d && printf '[Service]\nEnvironment=NN_ANTI_TAMPER_ALLOW_DEGRADED=1\n' > /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf"
-rm -rf /etc/systemd/system/northnarrow-agent.service.d/zz-tamper.conf; systemctl daemon-reload
-WAIT=40 run_case C12 "systemctl set-property --runtime MemoryMax (OOM path)" allowed "integrity_drift" 0 -- systemctl set-property --runtime northnarrow-agent.service MemoryMax=4G
-# resetting the property still leaves an (empty) runtime drop-in behind
-rm -f /run/systemd/system.control/northnarrow-agent.service.d/50-MemoryMax.conf
+# External audit LAB-026 (lab PR 206): the runtime property is taken back
+# here (its drop-in removed, then a daemon-reload), and the unit's MemoryMax
+# and its cgroup's memory.max must read as before; `--only C12` used to
+# leave the 4G cap in force until some later reload.
+if selected C12; then
+    CG_MEMMAX=/sys/fs/cgroup/system.slice/northnarrow-agent.service/memory.max
+    MM0=$(systemctl show -p MemoryMax --value northnarrow-agent.service 2>/dev/null)
+    CGMM0=$(cat "$CG_MEMMAX" 2>/dev/null)
+    WAIT=40 run_case C12 "systemctl set-property --runtime MemoryMax (OOM path)" allowed "integrity_drift" 0 -- systemctl set-property --runtime northnarrow-agent.service MemoryMax=4G
+    # resetting the property still leaves an (empty) runtime drop-in behind
+    rm -f /run/systemd/system.control/northnarrow-agent.service.d/50-MemoryMax.conf
+    systemctl daemon-reload
+    # a systemd that does not apply the unit's value to a running cgroup at
+    # a reload: write it back where the case changed it
+    if [[ -n $CGMM0 && "$(cat "$CG_MEMMAX" 2>/dev/null)" != "$CGMM0" ]]; then
+        echo "$CGMM0" > "$CG_MEMMAX" 2>/dev/null
+    fi
+    restored C12 "MemoryMax of the unit" "$MM0" "$(systemctl show -p MemoryMax --value northnarrow-agent.service 2>/dev/null)"
+    restored C12 "memory.max of its cgroup" "$CGMM0" "$(cat "$CG_MEMMAX" 2>/dev/null)"
+fi
 # Review 26: a copy of the unit in a higher-precedence directory of the
 # systemd load path (tmpfs, outside the FIM watch) replaces the installed
 # unit at the next daemon-reload, for either install layout.
 SHADOW=/run/systemd/transient/northnarrow-agent.service
-WAIT=40 run_case C25 "shadow the agent unit from /run/systemd/transient" allowed "unit_shadowed" 0 -- bash -c "mkdir -p /run/systemd/transient && cp $UNIT $SHADOW && systemctl daemon-reload && systemctl show -p FragmentPath --value northnarrow-agent"
-rm -f "$SHADOW"; systemctl daemon-reload
-systemctl daemon-reload
+if selected C25; then
+    WAIT=40 run_case C25 "shadow the agent unit from /run/systemd/transient" allowed "unit_shadowed" 0 -- bash -c "mkdir -p /run/systemd/transient && cp $UNIT $SHADOW && systemctl daemon-reload && systemctl show -p FragmentPath --value northnarrow-agent"
+    rm -f "$SHADOW"; systemctl daemon-reload
+    systemctl daemon-reload
+    restored C25 "the agent unit's FragmentPath" "$UNIT" "$(systemctl show -p FragmentPath --value northnarrow-agent 2>/dev/null)"
+fi
 # ── mounts ────────────────────────────────────────────────────────────────
 # External audit LAB-007: each mount point is registered before its case,
 # so the trap undoes it whatever happens (Ctrl-C in the 40 s, a lost ssh
 # session, an umount refused with EBUSY); after the case it must be gone,
 # or the run fails and stops (the next cases would run on the fake one).
-mkdir -p /mnt/nn-bpf2 "$TMPD/fake-etc"
-MOUNTS+=(/mnt/nn-bpf2)
-WAIT=40 run_case C13 "second bpffs mount" allowed "integrity_drift" 0 -- mount -t bpf bpf /mnt/nn-bpf2
-unmount_one /mnt/nn-bpf2
+# (lab PR 206) the mount point C13 makes is removed again, and nothing is
+# made for a case --only leaves out
+if selected C13; then
+    BPF2_NEW=0; [[ -e /mnt/nn-bpf2 ]] || BPF2_NEW=1
+    mkdir -p /mnt/nn-bpf2
+    MOUNTS+=(/mnt/nn-bpf2)
+    WAIT=40 run_case C13 "second bpffs mount" allowed "integrity_drift" 0 -- mount -t bpf bpf /mnt/nn-bpf2
+    unmount_one /mnt/nn-bpf2
+    (( BPF2_NEW )) && ! mountpoint -q /mnt/nn-bpf2 && rmdir /mnt/nn-bpf2 2>/dev/null
+fi
 # mounted, held for one check, unmounted BEFORE the evidence is read: while
 # it is mounted the host's /etc/northnarrow/audit.log is the fake one
-MOUNTS+=("$ETC")
-run_case C14 "bind mount over /etc/northnarrow for 40 s" allowed "integrity_drift" 0 -- bash -c "mount --bind $TMPD/fake-etc $ETC && sleep 40; umount $ETC"
-mount_gone C14 "$ETC" || { print_table; echo "anti-tamper check: DEVIATIONS (stopped: $ETC still mounted)"; exit 1; }
+if selected C14; then
+    mkdir -p "$TMPD/fake-etc"
+    MOUNTS+=("$ETC")
+    run_case C14 "bind mount over /etc/northnarrow for 40 s" allowed "integrity_drift" 0 -- bash -c "mount --bind $TMPD/fake-etc $ETC && sleep 40; umount $ETC"
+    mount_gone C14 "$ETC" || { print_table; echo "anti-tamper check: DEVIATIONS (stopped: $ETC still mounted)"; exit 1; }
+fi
 # Review 53: hiding the kernel BTF keeps every LSM hook from attaching at
 # the agent's next start (which now refuses to start); the mount itself is
 # reported while the agent runs.
-MOUNTS+=(/sys/kernel/btf)
-run_case C26 "tmpfs over /sys/kernel/btf for 40 s" allowed "integrity_drift" 0 -- bash -c "mount -t tmpfs tmpfs /sys/kernel/btf && sleep 40; umount /sys/kernel/btf"
-mount_gone C26 /sys/kernel/btf || { print_table; echo "anti-tamper check: DEVIATIONS (stopped: /sys/kernel/btf still mounted)"; exit 1; }
+if selected C26; then
+    MOUNTS+=(/sys/kernel/btf)
+    run_case C26 "tmpfs over /sys/kernel/btf for 40 s" allowed "integrity_drift" 0 -- bash -c "mount -t tmpfs tmpfs /sys/kernel/btf && sleep 40; umount /sys/kernel/btf"
+    mount_gone C26 /sys/kernel/btf || { print_table; echo "anti-tamper check: DEVIATIONS (stopped: /sys/kernel/btf still mounted)"; exit 1; }
+fi
 # ── cgroup freezer ────────────────────────────────────────────────────────
+# External audit LAB-017/LAB-026 (lab PR 206): a case whose interface is
+# missing is a row (skipped_case), never left out of the table.
 CG=/sys/fs/cgroup/system.slice/northnarrow-agent.service/cgroup.freeze
 if [[ -w "$CG" ]]; then
     selected C15 && CG_FROZEN=$CG   # thawed by the trap if the run stops here
     WAIT=40 run_case C15 "cgroup v2 freeze of the agent for 45 s" allowed "integrity_drift|agent_boot" 0 -- bash -c "echo 1 > $CG && sleep 45 && echo 0 > $CG"
     CG_FROZEN=
+elif [[ ! -e /sys/fs/cgroup/cgroup.controllers ]]; then
+    skipped_case C15 "no cgroup v2 hierarchy" 1
+else
+    skipped_case C15 "no writable $CG" 0
 fi
 # ── kernel modules / kexec ────────────────────────────────────────────────
 if modinfo dummy >/dev/null 2>&1; then
     # R011 kills modprobe within ~10 ms: either the load is prevented (R011)
-# or it lands first and is recorded (R018) — both are evidence
-run_case C16 "modprobe dummy (in-tree module load)" allowed "R011_KernelModuleTooling|R018_KernelModuleLoad" 0 -- bash -c "rmmod dummy 2>/dev/null; modprobe dummy && rmmod dummy"
+    # or it lands first and is recorded (R018) — both are evidence
+    run_case C16 "modprobe dummy (in-tree module load)" allowed "R011_KernelModuleTooling|R018_KernelModuleLoad" 0 -- bash -c "rmmod dummy 2>/dev/null; modprobe dummy && rmmod dummy"
+else
+    skipped_case C16 "this kernel has no dummy module" 1
 fi
 # ── OOM and configuration overlays ────────────────────────────────────────
-PID=$(agent_pid)   # the watchdog may have recycled a frozen agent
 # External audit DEP-005 (lab PR 184): put back the agent's own value — the
-# unit's -500, or 0 where the memory cap cannot bind (an 8 GiB guest)
-OOM0=$(cat /proc/$PID/oom_score_adj 2>/dev/null || echo -500)
-WAIT=40 run_case C18 "raise the agent's oom_score_adj to 900" allowed "integrity_drift" 0 -- bash -c "echo 900 > /proc/$PID/oom_score_adj"
-echo "$OOM0" > /proc/$PID/oom_score_adj 2>/dev/null || true
+# unit's -500, or 0 where the memory cap cannot bind (an 8 GiB guest).
+# External audit LAB-026 (lab PR 206): only when C18 runs (`--only C01` used
+# to rewrite the agent's value too, and wrote -500 when it could not read
+# it), to the process C18 changed (pid and start time), by the trap if the
+# run stops in its 40 s, and the value read back must be the one found.
+PID=$(agent_pid)   # the watchdog may have recycled a frozen agent
+if selected C18; then
+    OOM0=$(cat "/proc/${PID:-0}/oom_score_adj" 2>/dev/null)
+    if [[ -z $PID || ! $OOM0 =~ ^-?[0-9]+$ ]]; then
+        skipped_case C18 "the agent's oom_score_adj could not be read" 0
+    else
+        OOM_RESTORE="$PID $(proc_start "$PID") $OOM0"
+        WAIT=40 run_case C18 "raise the agent's oom_score_adj to 900" allowed "integrity_drift" 0 -- bash -c "echo 900 > /proc/$PID/oom_score_adj"
+        oom_restore
+    fi
+fi
 # a fresh name each run: once the agent has seen an overlay it protects it,
 # so a leftover cannot be removed until the lab purges the pins
 OVL="$ETC/zz-tamper-$(date +%s).local"
@@ -1065,12 +1386,18 @@ fi
 WAIT=12 run_case C21 "exec flood (20k) hiding an exec from /tmp" allowed "R001_ExecFromTmp|R009_RootExecFromUserPath|ringbuf_drop" 0 -- bash -c 'cp /bin/true "$TMPD/nn-sat" && { for i in $(seq 1 20000); do /bin/true; done & sleep 2; "$TMPD/nn-sat"; wait; rm -f "$TMPD/nn-sat"; }'
 # open + read + connect through an io_uring ring: no openat/connect syscall
 # from userland (the openat tracepoint is blind to it by construction).
+# Built here when C22 or C59 runs (lab PR 206: C59 used whatever an earlier
+# run had left at that path when only it was selected).
 IOU_SRC="$(dirname "$0")/iouring-probe.c"
 IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
+IOU_BUILT=0
 if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
     # RHEL 9 ships kernel.io_uring_disabled=2: no ring, not even for root.
     skipped_case C22 "io_uring_disabled=2" 1
+elif ! selected_any C22,C59a,C59b,C59c; then
+    :
 elif [[ -f "$IOU_SRC" ]] && mkdir -p "$(dirname "$IOU_BIN")" && cc -O2 -o "$IOU_BIN" "$IOU_SRC" 2>"$TMPD/iou-cc.log"; then
+    IOU_BUILT=1
     WAIT=8 run_case C22 "io_uring: openat + read + connect through a ring" allowed "NN-L-IOU-00[12]" 0 -- "$IOU_BIN" /etc/hostname 127.0.0.1 9
 else
     skipped_case C22 "cannot build the io_uring probe: $(head -1 "$TMPD/iou-cc.log" 2>/dev/null)" 0
@@ -1116,12 +1443,15 @@ if [[ "$BPF_MODE" == enforce ]]; then
         echo "${c%% *} skipped: the BPF guard is in enforce mode (bpftool cannot open the map)" >&2
     done
 elif selected C30 || selected C61; then
-    pi_count() { bpftool -j map dump pinned /sys/fs/bpf/northnarrow/PROTECTED_INODES 2>/dev/null | grep -o '"key":' | wc -l; }
+    # (lab PR 206) a map bpftool could not dump reads as no count, not as
+    # 0 entries: "0 -> 0" passed C30 with nothing read
+    pi_count() { local j; j=$(bpftool -j map dump pinned /sys/fs/bpf/northnarrow/PROTECTED_INODES 2>/dev/null) && [[ $j == \[* ]] && grep -o '"key":' <<<"$j" | wc -l; }
     pp_scan() { bpftool -j map dump pinned "$PINS/PROTECTED_PIDS" 2>/dev/null | nnpy map-pids; }
     n1=$(pi_count); p1=$(pp_scan); restart_agent; sleep 20; n2=$(pi_count); p2=$(pp_scan); PID=$(agent_pid)
     if selected C30; then
-        if (( n2 > n1 )); then v="DEVIATION (grew by $(( n2 - n1 )))"; fail=1; else v="OK"; fi
-        rows+=("| C30 | PROTECTED_INODES across an agent restart | $n1 → $n2 entries | — | $v |")
+        if [[ -z "$n1" || -z "$n2" ]]; then v="DEVIATION (map unreadable)"; fail=1
+        elif (( n2 > n1 )); then v="DEVIATION (grew by $(( n2 - n1 )))"; fail=1; else v="OK"; fi
+        rows+=("| C30 | PROTECTED_INODES across an agent restart | ${n1:-?} → ${n2:-?} entries | — | $v |")
         echo "C30 PROTECTED_INODES across an agent restart → $n1 → $n2 entries; $v" >&2
     fi
     if selected C61; then
@@ -1148,46 +1478,55 @@ KGAP=1
 # on RHEL: a missing one made kexec fail before the load, read as "allowed".
 KINITRD=/boot/initrd.img-$(uname -r)
 [[ -f $KINITRD ]] || KINITRD=/boot/initramfs-$(uname -r).img
-if command -v kexec >/dev/null 2>&1; then
+# External audit LAB-024 (NN-AUD-414, lab PR 206): without kexec-tools
+# (no lab template installs it) C17 left no row at all. The same load is
+# made then with the kexec_file_load(2) syscall itself (the agent refuses
+# both, review 82), and an image that did load is unloaded by the trap too.
+if selected C17; then
+    KEXEC_UNLOAD=1
+    if command -v kexec >/dev/null 2>&1; then
+        K17_HOW="kexec -l"; K17=(kexec -l "/boot/vmlinuz-$(uname -r)" --initrd="$KINITRD" --reuse-cmdline)
+    else
+        K17_HOW="kexec_file_load(2)"; K17=(nnpy kexec-file "/boot/vmlinuz-$(uname -r)" "$KINITRD")
+    fi
     POST=$(post post_kexec_empty) \
-    run_case C17 "kexec -l of the running kernel (lockdown: ${LOCKDOWN:-none})" denied "NN-L-AT-001" 0 -- kexec -l /boot/vmlinuz-$(uname -r) --initrd="$KINITRD" --reuse-cmdline
-    kexec -u 2>/dev/null || true
+    run_case C17 "$K17_HOW of the running kernel (lockdown: ${LOCKDOWN:-none})" denied "NN-L-AT-001" 0 -- "${K17[@]}"
+    kexec_unload
 fi
 # An unsigned module (dummy.ko with its signature stripped), loaded with a
 # bare finit_module() so the refusal is the kernel's, not R011 killing a
 # module tool. Only under lockdown: without it the load would succeed and
 # taint the kernel. Livepatches are modules too and take the same check.
-ko=$(modinfo -n dummy 2>/dev/null)
-case "$ko" in
-    *.ko)     cp "$ko" "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
-    *.ko.zst) zstd -qdc "$ko" > "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
-    *.ko.xz)  xz -dc "$ko" > "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
-    *)        rm -f "$TMPD/nn_signed_dummy.ko" ;;
-esac
-if (( ! KGAP )) && [[ -s "$TMPD/nn_signed_dummy.ko" ]]; then
-    python3 - "$TMPD/nn_signed_dummy.ko" "$TMPD/nn_unsigned_dummy.ko" <<'PY'
-import sys
-data = open(sys.argv[1], "rb").read()
-magic = b"~Module signature appended~\n"
-if data.endswith(magic):
-    sig_len = int.from_bytes(data[-len(magic) - 4:-len(magic)], "big")
-    data = data[:-len(magic) - 12 - sig_len]
-open(sys.argv[2], "wb").write(data)
-PY
-    rmmod dummy 2>/dev/null
-    POST=$(post post_module_absent dummy) \
-    run_case C27 "load an unsigned module (finit_module, lockdown: $LOCKDOWN)" denied "" 0 -- python3 -I -c '
-import ctypes, errno, os
-libc = ctypes.CDLL(None, use_errno=True)
-fd = os.open(os.environ["TMPD"] + "/nn_unsigned_dummy.ko", os.O_RDONLY)
-if libc.syscall(313, fd, b"", 0) != 0:
-    print("finit_module: errno=" + errno.errorcode.get(ctypes.get_errno(), "?"))
-else:
-    print("loaded")
-'
-    rmmod dummy 2>/dev/null
+# External audit LAB-024 (lab PR 206): without lockdown it is a listed known
+# gap (it left no row), the syscall number is the machine's (it was
+# x86_64's 313 on every machine), and nothing is copied for a run --only
+# leaves it out. `NN_LAB_LOCKDOWN=integrity nn-lab.sh up` boots a guest
+# where it runs.
+if ! selected C27; then
+    :
+elif (( KGAP )); then
+    rows+=("| C27 | load an unsigned module (finit_module) | not run: kernel lockdown ${LOCKDOWN:-none} | — | KNOWN GAP (an unsigned module loads without lockdown: a host setting, nn-admin host-check; the lockdown guest: NN_LAB_LOCKDOWN=integrity) |")
+    echo "C27 not run: no kernel lockdown → KNOWN GAP" >&2
+elif [[ -z "$(nnpy syscall-nr finit_module)" ]]; then
+    skipped_case C27 "no finit_module syscall number for $(uname -m)" 0
+else
+    ko=$(modinfo -n dummy 2>/dev/null)
+    case "$ko" in
+        *.ko)     cp "$ko" "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
+        *.ko.zst) zstd -qdc "$ko" > "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
+        *.ko.xz)  xz -dc "$ko" > "$TMPD/nn_signed_dummy.ko" 2>/dev/null ;;
+        *)        rm -f "$TMPD/nn_signed_dummy.ko" ;;
+    esac
+    if [[ -s "$TMPD/nn_signed_dummy.ko" ]] && nnpy strip-sig "$TMPD/nn_signed_dummy.ko" "$TMPD/nn_unsigned_dummy.ko"; then
+        rmmod dummy 2>/dev/null
+        POST=$(post post_module_absent dummy) \
+        run_case C27 "load an unsigned module (finit_module, lockdown: $LOCKDOWN)" denied "" 0 -- nnpy finit "$TMPD/nn_unsigned_dummy.ko"
+        rmmod dummy 2>/dev/null
+    else
+        skipped_case C27 "no dummy module to strip (${ko:-none})" 1
+    fi
+    rm -f "$TMPD/nn_signed_dummy.ko" "$TMPD/nn_unsigned_dummy.ko"
 fi
-rm -f "$TMPD/nn_signed_dummy.ko" "$TMPD/nn_unsigned_dummy.ko"
 
 # ── systemd as the relay (external audit EBPF-001) ───────────────────────
 # Outside a trusted-installer window PID 1's signals are refused like a root
@@ -1282,14 +1621,15 @@ fi
 # must refuse them like the syscalls (C22 covers the sensors' blind spot).
 # The rename, if it went through, is renamed back by the probe; the
 # unlinked file is put back from a copy.
-IOU_BIN=/usr/local/libexec/nn-lab/nn-iou-probe
 IOU_TGT=$ETC/netflow-blocklist.v1
 if [[ $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0) == 2 ]]; then
-    skipped_case C59a-C59c "io_uring_disabled=2" 1
-elif [[ -x "$IOU_BIN" ]] && "$IOU_BIN" --modes 2>/dev/null | grep -qw rename; then
+    skipped_case C59a,C59b,C59c "io_uring_disabled=2" 1
+elif ! selected_any C59a,C59b,C59c; then
+    :
+elif (( IOU_BUILT )) && "$IOU_BIN" --modes 2>/dev/null | grep -qw rename; then
     POST=$(post post_not_shrunk "$AUDIT" "$(nnpy fileid "$AUDIT" size)") \
     run_case C59a "io_uring: open audit.log for writing through a ring" denied "deny=write" 0 -- "$IOU_BIN" --open-write "$AUDIT"
-    if cp -p "$IOU_TGT" "$SCRATCH/iou-target"; then
+    if selected_any C59b,C59c && cp -p "$IOU_TGT" "$SCRATCH/iou-target"; then
         RESTORE+=("$IOU_TGT|$SCRATCH/iou-target")
         IOU_ID=$(nnpy fileid "$IOU_TGT" ino)
         POST=$(post post_same "$IOU_TGT" ino "$IOU_ID") \
@@ -1299,7 +1639,7 @@ elif [[ -x "$IOU_BIN" ]] && "$IOU_BIN" --modes 2>/dev/null | grep -qw rename; th
         run_case C59c "io_uring: rename a protected file through a ring" denied "deny=rename" 0 -- "$IOU_BIN" --rename "$IOU_TGT" "$IOU_TGT.nn-lab-c59c"
     fi
 else
-    skipped_case C59a-C59c "no io_uring probe with the tamper modes (see C22)" 0
+    skipped_case C59a,C59b,C59c "no io_uring probe with the tamper modes (see C22)" 0
 fi
 # C60: masking the watchdog. `systemctl mask` cannot replace an installed
 # unit file (systemd refuses: the file exists), and in /etc/systemd/system
@@ -1333,14 +1673,20 @@ PBF_SRC="$(dirname "$0")/bpf-handle-probe.c"
 PBF_LIB=/usr/local/libexec/nn-lab/nn-bpf-probe.so
 AGENT_BIN=${AGENT_EXE:-/usr/local/bin/northnarrow-agent}
 WATCHDOG_BIN=$(dirname "$AGENT_BIN")/northnarrow-watchdog
-if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -O2 -o "$PBF_LIB" "$PBF_SRC" 2>"$TMPD/pbf-cc.log"; then
-    env LD_PRELOAD="$PBF_LIB" NNX_SLEEP=20 "$AGENT_BIN" >/dev/null 2>&1 &
-    FRESH=$!
-    sleep 1
-    FRESH_START=$(proc_start "$FRESH")
-    run_case C34 "ptrace attach: /proc/<pid>/mem of a fresh agent binary" denied "deny=ptrace" 0 -- nnpy procopen "$FRESH" northnarrow-age "${FRESH_START:-0}" mem 4194304
-    # our own child, still unreaped; signalled only if it is still that process
-    nnpy signal "$FRESH" northnarrow-age "${FRESH_START:-0}" TERM >/dev/null 2>&1; wait "$FRESH" 2>/dev/null
+# (lab PR 206) built, and C34's fresh agent binary started, only for a run
+# that selects one of these cases
+if ! selected_any C34,C35,C36,C37,C43; then
+    :
+elif [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -O2 -o "$PBF_LIB" "$PBF_SRC" 2>"$TMPD/pbf-cc.log"; then
+    if selected C34; then
+        env LD_PRELOAD="$PBF_LIB" NNX_SLEEP=20 "$AGENT_BIN" >/dev/null 2>&1 &
+        FRESH=$!
+        sleep 1
+        FRESH_START=$(proc_start "$FRESH")
+        run_case C34 "ptrace attach: /proc/<pid>/mem of a fresh agent binary" denied "deny=ptrace" 0 -- nnpy procopen "$FRESH" northnarrow-age "${FRESH_START:-0}" mem 4194304
+        # our own child, still unreaped; signalled only if it is still that process
+        nnpy signal "$FRESH" northnarrow-age "${FRESH_START:-0}" TERM >/dev/null 2>&1; wait "$FRESH" 2>/dev/null
+    fi
     run_case C35 "nn-admin, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$NNADMIN" --version
     run_case C36 "a second agent binary, preloaded: write handle on PROTECTED_PIDS" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" "$AGENT_BIN" --version
     run_case C37 "a second watchdog binary, preloaded: handle on link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_TARGET="$PINS/link_task_kill" "$WATCHDOG_BIN" --version
@@ -1349,7 +1695,7 @@ if [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC -
     # foreign root process got a writable handle on each.
     run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
 else
-    skipped_case C34-C37 "cannot build the probe library: $(head -1 "$TMPD/pbf-cc.log" 2>/dev/null)" 0
+    skipped_case C34,C35,C36,C37,C43 "cannot build the probe library: $(head -1 "$TMPD/pbf-cc.log" 2>/dev/null)" 0
 fi
 # The way in that stays open: a watchdog restarted inside a window is the
 # fresh successor of its role and registers itself (the agent's restart is
@@ -1372,8 +1718,10 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C38,"* ]]; then
         [[ -n "$new" && "$new" != 0 && "$new" != "$old" ]] && break
     done
     sleep 5
+    # its own line (jentry: the watchdog unit's stdout, its pid, the message
+    # at the start), not text anywhere in either unit's lines (lab PR 206)
     if [[ -n "$new" && "$new" != 0 && "$new" != "$old" ]] \
-       && jlines "$t0" | grep -q "watchdog PID registered in PROTECTED_PIDS pid=$new"; then
+       && jentry northnarrow-watchdog "$new" INFO "watchdog: watchdog PID registered in PROTECTED_PIDS pid=$new " >/dev/null; then
         v="OK"; st="restarted $old → $new, registered"
     else
         v="DEVIATION (the restarted watchdog did not register)"; fail=1; st="restarted $old → ${new:-?}"
@@ -1393,7 +1741,9 @@ fi
 # EINVAL in observe mode).
 LNK_SRC="$(dirname "$0")/link-detach-probe.c"
 LNK_BIN=/usr/local/libexec/nn-lab/nn-link-probe
-if [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BIN" "$LNK_SRC" 2>"$TMPD/lnk-cc.log"; then
+if ! selected_any C39,C40; then
+    :
+elif [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BIN" "$LNK_SRC" 2>"$TMPD/lnk-cc.log"; then
     long="$PINS/"
     while (( ${#long} < 280 )); do long+="./"; done
     long+="link_task_kill"
@@ -1402,7 +1752,7 @@ if [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BI
     run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- "$LNK_BIN" "$TMPD/link-alias"
     rm -f "$TMPD/link-alias"
 else
-    skipped_case C39-C40 "cannot build the link probe: $(head -1 "$TMPD/lnk-cc.log" 2>/dev/null)" 0
+    skipped_case C39,C40 "cannot build the link probe: $(head -1 "$TMPD/lnk-cc.log" 2>/dev/null)" 0
 fi
 
 # External audit EVD-001: the agent's private signing key — every evidence
@@ -1419,13 +1769,15 @@ run_case C42 "verify the audit chain from the public half" allowed "" 0 -- \
 # to the agent. ATP-008: the shipped `.v1` lists were mutation-denied only.
 FSX_SRC="$(dirname "$0")/fsxattr-probe.c"
 FSX_BIN=/usr/local/libexec/nn-lab/nn-fsxattr-probe
-if [[ -f "$FSX_SRC" ]] && mkdir -p "$(dirname "$FSX_BIN")" && cc -O2 -o "$FSX_BIN" "$FSX_SRC" 2>"$TMPD/fsx-cc.log"; then
+if ! selected_any C44,C45; then
+    :
+elif [[ -f "$FSX_SRC" ]] && mkdir -p "$(dirname "$FSX_BIN")" && cc -O2 -o "$FSX_BIN" "$FSX_SRC" 2>"$TMPD/fsx-cc.log"; then
     POST=$(post post_flag "$STATE" i present) \
     run_case C44 "fsxattr: clear the immutable flag of the state directory" denied "deny=ioctl" 0 -- "$FSX_BIN" "$STATE" -i
     POST=$(post post_flag "$ETC/audit.log" a absent) \
     run_case C45 "fsxattr: make audit.log append-only" denied "deny=ioctl" 0 -- "$FSX_BIN" "$ETC/audit.log" +a
 else
-    skipped_case C44-C45 "cannot build the fsxattr probe: $(head -1 "$TMPD/fsx-cc.log" 2>/dev/null)" 0
+    skipped_case C44,C45 "cannot build the fsxattr probe: $(head -1 "$TMPD/fsx-cc.log" 2>/dev/null)" 0
 fi
 POST=$(post post_same "$ETC/netflow-blocklist.v1" hash "$(nnpy fileid "$ETC/netflow-blocklist.v1" hash)") \
 run_case C46 "append to the shipped netflow blocklist" denied "deny=write" 0 -- \
@@ -1438,7 +1790,7 @@ run_case C46 "append to the shipped netflow blocklist" denied "deny=write" 0 -- 
 # trusted-installer window the same is allowed (C54).
 PID=$(agent_pid)
 LSRC=/etc/.nn-lab-c49-src
-echo nn-lab > "$LSRC"
+selected C49 && echo nn-lab > "$LSRC"
 run_case C47 "mkdir in /etc/northnarrow" denied "deny=mkdir" 0 -- mkdir "$ETC/.nn-lab-c47"
 run_case C48 "symlink in /etc/northnarrow" denied "deny=symlink" 0 -- ln -s /etc/hostname "$ETC/.nn-lab-c48"
 run_case C49 "hard link into /etc/northnarrow" denied "deny=link" 0 -- ln "$LSRC" "$ETC/.nn-lab-c49"
@@ -1447,7 +1799,7 @@ run_case C51 "new file in the state chain directory" denied "deny=create" 0 -- b
 run_case C52 "a directory among the bpffs pins" denied "deny=mkdir" 0 -- mkdir "$PINS/nn-lab-c52"
 run_case C53 "user.* xattr on admin.pub" denied "deny=xattr" 0 -- \
     python3 -c "import os; os.setxattr('$ETC/admin.pub', 'user.nn_lab', b'1')"
-rm -f "$LSRC"
+selected C49 && rm -f "$LSRC"
 if [[ -z "$ONLY" || ",$ONLY," == *",C54,"* ]]; then
     t0=$(date -u +"%Y-%m-%d %H:%M:%S"); a0=$(audit_count); d0=$(dets_count)
     grant_window 30; sleep 2
@@ -1464,11 +1816,8 @@ if [[ -z "$ONLY" || ",$ONLY," == *",C54,"* ]]; then
     for i in $(seq 1 40); do window_open || break; sleep 1; done
 fi
 
-echo
-echo "| case | action | outcome | evidence | verdict |"
-echo "|---|---|---|---|---|"
-printf '%s\n' "${rows[@]}"
-echo
+report_unreported
+print_table
 echo "agent pid now $(agent_pid) (was $PID); units: $(systemctl is-active northnarrow-agent northnarrow-watchdog | tr '\n' ' ')"
 (( fail == 0 )) && echo "anti-tamper check: OK (known gaps listed)" || echo "anti-tamper check: DEVIATIONS"
 exit $fail
