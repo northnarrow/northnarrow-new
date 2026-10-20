@@ -48,4 +48,5 @@ pub mod shutdown_marker;
 pub mod systemd_state;
 pub mod telemetry_probe;
 pub mod trusted_bin;
+pub mod verify_lines;
 pub mod xai;

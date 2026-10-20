@@ -417,13 +417,17 @@ fn flat_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, Stri
         .collect()
 }
 
+/// External audit MAIN-014 (NN-AUD-256, lab PR 190): the audit chain in one
+/// streaming pass ([`crate::audit::verify_chain_file`]); it was read whole
+/// and kept row by row, and a line that is not a row was named only by its
+/// parse error.
 fn full_audit(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
-    let rows: Vec<crate::audit::AuditEntry> = flat_rows(path)?;
-    crate::audit::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
-    Ok(numbered_summary(
-        rows.len(),
-        rows.iter().position(|r| r.seq.is_some()),
-    ))
+    let r =
+        crate::audit::verify_chain_file(path, pk, None).map_err(|e| format!("unreadable: {e}"))?;
+    if let Some(e) = r.broken {
+        return Err(e.to_string());
+    }
+    Ok(numbered_summary(r.rows, r.first_numbered))
 }
 
 fn full_canary_registry(path: &Path, pk: &VerifyingKey) -> Result<String, String> {

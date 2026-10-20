@@ -45,6 +45,41 @@ and check with `journalctl --namespace=northnarrow --verify
 not stop root from removing the files, which is what the forwarded copy is
 for.
 
+## Exit codes of the verifiers
+
+Stable (scripts may rely on them; external audit MAIN-014, EVD-017, lab
+PR 190):
+
+| Command | 0 | 1 | 8 |
+|---|---|---|---|
+| `nn-admin chain verify` | every chain verifies (and the anchor, when there is one) | the agent public key could not be loaded | at least one `BROKEN` line; every chain is still reported, one damaged chain does not hide the others |
+| `nn-admin audit verify --from F` | the chain is intact (a missing or empty file is 0 rows) | `F` or the key cannot be read (I/O, permissions) | the first row that does not verify, or the first line that is not a row, with its line number and the rows verified before it; or `--expect-head`/`--min-seq` not reached |
+| `nn-admin audit read` | every line was a row | the log cannot be read, or stdout was closed | some lines are not audit rows: each is named on stderr (`audit: line N of F skipped: …`, the first 100, then the count), and every row before and after them was printed |
+
+What the verifiers report instead of stopping (before lab PR 190 they
+aborted or stopped at the first bad line):
+
+- **A line that is not a row** — cut short (`the last line, cut short (no
+  newline)`), not JSON, not UTF-8, or longer than 16 MiB (`… bytes, longer
+  than 16777216 bytes: not read`; no row the agent writes comes near it,
+  and such a line is never read into memory). `audit verify` and `chain
+  verify` report a broken chain at that line (`line N: not an audit row
+  (…); K row(s) verified before it` for the audit chain, `malformed line
+  N` for the rotating logs and their manifests, N counted from 0 there);
+  `audit read` skips it and prints the rest — read the rows after it,
+  they may be the ones that matter.
+- **A sealed archive without its terminator** (`archive N (…) has no
+  terminator: it is empty or was cut before its last line`): that rotating
+  log is `BROKEN`; the next chains are verified and reported as usual.
+- **Archives past seq 999,999** are named with seven or more digits
+  (`detections.jsonl.1000000`) and are listed, rotated out and verified
+  like the others. Any other spelling of a number (`.00099`, `.0123456`)
+  is not an archive of the log.
+
+The verifiers read one line at a time: a large chain costs the memory of
+its longest line, not of the file. `audit read` does not verify signatures;
+use `audit verify` or `chain verify` for that.
+
 ## When a check fails
 
 1. **Keep the evidence first.** Do not reinstall, restore or delete

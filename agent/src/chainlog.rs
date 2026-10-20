@@ -1231,16 +1231,31 @@ fn archive_path(active: &Path, seq: u64) -> PathBuf {
 
 /// Parse the `.NNNNNN` seq suffix of an archive path whose stem equals
 /// `active`'s file name. `None` if `name` is not an archive of `active`.
+///
+/// External audit EVD-022 (NN-AUD-283, lab PR 190): the suffix is the one
+/// [`archive_path`] writes for its value — six digits with leading zeros,
+/// or more digits without one (`.1000000` from seq 1,000,000 on). Exactly
+/// six digits were accepted, so an archive past seq 999,999 was invisible
+/// to listing, eviction, verification and the read verbs. Any other
+/// spelling of a number (`.00099`, `.0123456`) is not an archive, nor is a
+/// seq of more than [`MAX_SEQ_DIGITS`] digits: every seq listed leaves room
+/// for the `+ 1` of the next one.
 fn parse_archive_seq(active: &Path, name: &std::ffi::OsStr) -> Option<u64> {
     let base = active.file_name()?.to_str()?;
     let name = name.to_str()?;
     let suffix = name.strip_prefix(base)?.strip_prefix('.')?;
-    if suffix.len() == SEQ_WIDTH && suffix.bytes().all(|b| b.is_ascii_digit()) {
-        suffix.parse::<u64>().ok()
-    } else {
-        None
+    if !(SEQ_WIDTH..=MAX_SEQ_DIGITS).contains(&suffix.len())
+        || !suffix.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
     }
+    let seq = suffix.parse::<u64>().ok()?;
+    (format!("{:0w$}", seq, w = SEQ_WIDTH) == suffix).then_some(seq)
 }
+
+/// Longest archive seq suffix: 19 digits, below `u64::MAX` (20 digits) by
+/// more than any number of rotations (one a second for 10^11 years).
+const MAX_SEQ_DIGITS: usize = 19;
 
 /// All present archive seqs for `active`, ascending.
 fn list_archive_seqs(active: &Path) -> Result<Vec<u64>> {
@@ -2025,6 +2040,14 @@ pub enum LogSetError {
     /// rotation (see [`active_missing`]).
     #[error("active file {file} is missing: {reason}")]
     ActiveMissing { file: String, reason: String },
+    /// External audit EVD-017 (NN-AUD-280, lab PR 190): a sealed archive
+    /// without its terminator line — empty, or cut before its last line.
+    /// The verifier hit an `expect` here and `nn-admin chain verify`
+    /// aborted before it reported any chain.
+    #[error(
+        "archive {seq} ({file}) has no terminator: it is empty or was cut before its last line"
+    )]
+    ArchiveWithoutTerminator { file: String, seq: u64 },
     /// External audit NN-AUD-109: a manifest checkpoint names a line that
     /// is no longer there — the file was deleted, emptied, cut or
     /// rewritten below it.
@@ -2091,10 +2114,19 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
     let facts = verify_manifest(active_path, pubkey)?;
     let evicted = &facts.evicted;
     if earliest_retained_seq > 1 {
-        for seq in 1..earliest_retained_seq {
-            if !evicted.contains_key(&seq) {
-                return Err(LogSetError::UncorroboratedEviction { seq });
+        // External audit EVD-022 (lab PR 190): the first seq below the
+        // earliest archive without an `Evicted` row, found over the
+        // manifest's rows — not by counting up to a seq an archive name may
+        // put at 10^18.
+        let mut next = 1u64;
+        for &seq in evicted.range(1..earliest_retained_seq).map(|(s, _)| s) {
+            if seq != next {
+                break;
             }
+            next += 1;
+        }
+        if next < earliest_retained_seq {
+            return Err(LogSetError::UncorroboratedEviction { seq: next });
         }
         expected_prev = evicted.get(&(earliest_retained_seq - 1)).cloned().ok_or(
             LogSetError::UncorroboratedEviction {
@@ -2142,13 +2174,16 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
             }
         }
         let path = archive_path(active_path, seq);
-        let walk = verify_one_file::<P>(&path, &expected_prev, pubkey, Some(seq))?;
+        let wanted = checkpoints_of(seq);
+        let walk = verify_one_file::<P>(&path, &expected_prev, pubkey, Some(seq), &wanted)?;
         total_records += walk.records;
-        checkpoints_verified += reach_checkpoints(&path, seq, &checkpoints_of(seq), &walk)?;
+        checkpoints_verified += reach_checkpoints(&path, seq, &wanted, &walk)?;
         expected_prev = walk
             .terminator
-            .clone()
-            .expect("sealed archive ends in a terminator");
+            .ok_or_else(|| LogSetError::ArchiveWithoutTerminator {
+                file: path.display().to_string(),
+                seq,
+            })?;
         prev_seq = Some(seq);
     }
 
@@ -2166,10 +2201,10 @@ pub fn verify_log_set<P: Serialize + DeserializeOwned>(
             });
         }
     }
-    let walk = verify_one_file::<P>(active_path, &expected_prev, pubkey, None)?;
+    let wanted = checkpoints_of(active_gen);
+    let walk = verify_one_file::<P>(active_path, &expected_prev, pubkey, None, &wanted)?;
     total_records += walk.records;
-    checkpoints_verified +=
-        reach_checkpoints(active_path, active_gen, &checkpoints_of(active_gen), &walk)?;
+    checkpoints_verified += reach_checkpoints(active_path, active_gen, &wanted, &walk)?;
 
     Ok(LogSetReport {
         earliest_retained_seq,
@@ -2313,17 +2348,16 @@ fn reach_checkpoints(
     walk: &FileWalk,
 ) -> Result<usize, LogSetError> {
     for (bytes, tail_hash) in checkpoints {
-        let found = walk.line_ends.binary_search_by_key(bytes, |(end, _)| *end);
-        let reason = match found {
-            Ok(i) if &walk.line_ends[i].1 == tail_hash => continue,
-            Ok(i) => format!("the line ending there is {}", walk.line_ends[i].1),
-            Err(_) if walk.len < *bytes => {
+        let reason = match walk.line_ends.get(bytes) {
+            Some(h) if h == tail_hash => continue,
+            Some(h) => format!("the line ending there is {h}"),
+            None if walk.len < *bytes => {
                 format!(
                     "the file is {} bytes: it was emptied, deleted or cut",
                     walk.len
                 )
             }
-            Err(_) => "no line ends there: the file was rewritten".to_string(),
+            None => "no line ends there: the file was rewritten".to_string(),
         };
         return Err(LogSetError::CheckpointUnreachable {
             file: file.display().to_string(),
@@ -2342,21 +2376,30 @@ struct FileWalk {
     terminator: Option<String>,
     /// Data lines.
     records: u64,
-    /// (offset past the line's newline, its `entry_hash`), ascending.
-    line_ends: Vec<(u64, String)>,
+    /// The `entry_hash` of the line ending (newline included) at each
+    /// offset a checkpoint names, when one does. External audit EVD-017
+    /// (lab PR 190): only those offsets are kept — every line's was, so the
+    /// memory of a verification grew with the file.
+    line_ends: std::collections::HashMap<u64, String>,
     /// Bytes read (0 for a missing file).
     len: u64,
 }
 
 /// Verify one file's chain from `expected_prev`: its terminator hash if
-/// sealed, its data record count, and where each line ends (for the
-/// manifest checkpoints). `archive_seq` is `Some` for sealed archives
-/// (asserts the terminator's `this_seq`).
+/// sealed, its data record count, and the lines ending where the manifest
+/// checkpoints `checkpoints` (end offset, hash) say a line ends.
+/// `archive_seq` is `Some` for sealed archives (asserts the terminator's
+/// `this_seq`).
+///
+/// External audit EVD-017 (lab PR 190): one line in memory at a time
+/// ([`crate::verify_lines`]): a line over the cap or not UTF-8 is
+/// [`LogSetError::Malformed`], never read whole.
 fn verify_one_file<P: Serialize + DeserializeOwned>(
     path: &Path,
     expected_prev: &str,
     pubkey: &VerifyingKey,
     archive_seq: Option<u64>,
+    checkpoints: &[(u64, String)],
 ) -> Result<FileWalk, LogSetError> {
     let file = path.display().to_string();
     let f = match OpenOptions::new().read(true).open(path) {
@@ -2368,7 +2411,7 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
             return Ok(FileWalk {
                 terminator: None,
                 records: 0,
-                line_ends: Vec::new(),
+                line_ends: std::collections::HashMap::new(),
                 len: 0,
             });
         }
@@ -2381,41 +2424,30 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
         }
     };
 
+    let wanted: std::collections::HashSet<u64> = checkpoints.iter().map(|(b, _)| *b).collect();
     let mut expected = expected_prev.to_string();
     let mut records = 0u64;
     let mut term_hash = None;
-    let mut line_ends = Vec::new();
-    let mut offset = 0u64;
-    let mut reader = BufReader::new(f);
-    let mut raw = Vec::new();
-    let mut idx = 0usize;
+    let mut line_ends = std::collections::HashMap::new();
+    let mut reader = crate::verify_lines::VerifyLines::new(BufReader::new(f));
+    let mut lines_read = 0usize;
     loop {
-        raw.clear();
-        let n = reader
-            .read_until(b'\n', &mut raw)
-            .map_err(|e| LogSetError::Malformed {
-                file: file.clone(),
-                idx,
-                reason: e.to_string(),
-            })?;
-        if n == 0 {
+        let read = reader.next_line().map_err(|e| LogSetError::Malformed {
+            file: file.clone(),
+            idx: lines_read,
+            reason: e.to_string(),
+        })?;
+        let Some(raw) = read else {
             break;
-        }
-        offset += n as u64;
-        let this = idx;
-        idx += 1;
-        let body = raw.strip_suffix(b"\n").unwrap_or(&raw);
-        let line = match std::str::from_utf8(body) {
-            Ok(l) => l.to_string(),
-            Err(e) => {
-                return Err(LogSetError::Malformed {
-                    file,
-                    idx: this,
-                    reason: e.to_string(),
-                })
-            }
         };
-        let idx = this;
+        // 0-based line index, empty lines counted (as before).
+        let idx = lines_read;
+        lines_read += 1;
+        let (end, newline) = (raw.end, raw.newline);
+        let line = match raw.text() {
+            Ok(l) => l.to_string(),
+            Err(reason) => return Err(LogSetError::Malformed { file, idx, reason }),
+        };
         if line.is_empty() {
             continue;
         }
@@ -2471,8 +2503,8 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
                 expected,
             });
         }
-        if raw.ends_with(b"\n") {
-            line_ends.push((offset, stored_hash.clone()));
+        if newline && wanted.contains(&end) {
+            line_ends.insert(end, stored_hash.clone());
         }
         expected = stored_hash;
     }
@@ -2480,7 +2512,7 @@ fn verify_one_file<P: Serialize + DeserializeOwned>(
         terminator: term_hash,
         records,
         line_ends,
-        len: offset,
+        len: reader.offset(),
     })
 }
 
@@ -2593,17 +2625,30 @@ fn verify_manifest(
         }
     };
     let mut expected = GENESIS_PREV_HASH.to_string();
-    for (idx, line) in BufReader::new(f).lines().enumerate() {
-        let line = line.map_err(|e| LogSetError::Malformed {
+    // External audit EVD-017 (lab PR 190): one bounded line at a time.
+    let mut reader = crate::verify_lines::VerifyLines::new(BufReader::new(f));
+    let mut lines_read = 0usize;
+    loop {
+        let raw = reader.next_line().map_err(|e| LogSetError::Malformed {
+            file: file.clone(),
+            idx: lines_read,
+            reason: e.to_string(),
+        })?;
+        let Some(raw) = raw else {
+            break;
+        };
+        let idx = lines_read;
+        lines_read += 1;
+        let line = raw.text().map_err(|reason| LogSetError::Malformed {
             file: file.clone(),
             idx,
-            reason: e.to_string(),
+            reason,
         })?;
         if line.is_empty() {
             continue;
         }
         let mut entry: ManifestLine =
-            serde_json::from_str(&line).map_err(|e| LogSetError::Malformed {
+            serde_json::from_str(line).map_err(|e| LogSetError::Malformed {
                 file: file.clone(),
                 idx,
                 reason: format!("manifest decode: {e}"),
@@ -4213,5 +4258,191 @@ mod tests {
         append_raw(&active, forged.as_bytes());
         assert!(verify_recent::<TestPayload>(&active, &pk, 1 << 20).is_err());
         assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
+    }
+
+    // ── External audit, Wave 3, lab PR 190 ─────────────────────────────
+
+    /// EVD-017 (NN-AUD-280): an empty `<base>.000001` next to a valid
+    /// active file, or an archive cut before its terminator, made
+    /// `verify_log_set` hit `.expect("sealed archive ends in a terminator")`
+    /// (an abort in a release build, so `nn-admin chain verify` reported no
+    /// chain at all). It is a typed error naming the archive.
+    #[test]
+    fn an_archive_without_terminator_is_a_typed_error_not_a_panic() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let k = key();
+        let pk = k.verifying_key();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(1 << 30, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        for i in 0..3 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        verify_log_set::<TestPayload>(&active, &pk).expect("the active file alone verifies");
+        let empty = archive_path(&active, 1);
+        fs::File::create(&empty).unwrap();
+        let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert_eq!(
+            err,
+            LogSetError::ArchiveWithoutTerminator {
+                file: empty.display().to_string(),
+                seq: 1,
+            }
+        );
+        assert!(err.to_string().contains("no terminator"), "{err}");
+
+        // A real archive cut before its terminator: the data lines left
+        // verify, the terminator is gone.
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let k = key();
+        let pk = k.verifying_key();
+        let mut log = RotatingChainLog::<TestPayload>::open(
+            &active,
+            k,
+            cfg(2000, 50),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        for i in 0..40 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        verify_log_set::<TestPayload>(&active, &pk).expect("the set verifies");
+        let arch = archive_path(&active, 1);
+        let body = fs::read_to_string(&arch).unwrap();
+        let cut: String = body
+            .lines()
+            .filter(|l| !is_terminator_line(l))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(!cut.is_empty() && cut.len() < body.len());
+        fs::write(&arch, cut).unwrap();
+        assert!(matches!(
+            verify_log_set::<TestPayload>(&active, &pk),
+            Err(LogSetError::ArchiveWithoutTerminator { seq: 1, .. })
+        ));
+    }
+
+    /// EVD-022 (NN-AUD-283): an archive name is the canonical spelling of
+    /// its seq — six digits with leading zeros, or more digits without one.
+    /// Exactly six digits were accepted, so from seq 1,000,000 on the
+    /// archives were invisible to listing, eviction, verification and the
+    /// read verbs.
+    #[test]
+    fn archive_names_past_seq_999999_are_listed_and_other_spellings_are_not() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("log.jsonl");
+        for name in [
+            "log.jsonl.000999",
+            "log.jsonl.1000000",
+            "log.jsonl.00099",
+            "log.jsonl.0123456",
+            "log.jsonl.+00001",
+            "log.jsonl.000998x",
+            "log.jsonl.99999999999999999999999",
+            "log.jsonl.18446744073709551615",
+            "log.jsonl.manifest.jsonl",
+            "other.jsonl.000997",
+        ] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        assert_eq!(list_archive_seqs(&active).unwrap(), vec![999, 1_000_000]);
+        assert_eq!(scan_max_archive_seq(&active).unwrap(), Some(1_000_000));
+        assert_eq!(current_generation(&active), 1_000_001);
+        assert_eq!(earliest_archive(&active), Some(999));
+        assert_eq!(
+            archive_path(&active, 1_000_000),
+            dir.path().join("log.jsonl.1000000")
+        );
+        assert_eq!(
+            archive_path(&active, 1_000_001),
+            dir.path().join("log.jsonl.1000001")
+        );
+        assert_eq!(
+            archives_newest_first(&active),
+            vec![
+                dir.path().join("log.jsonl.1000000"),
+                dir.path().join("log.jsonl.000999")
+            ]
+        );
+        // What the writer names, the lister reads back, up to 19 digits.
+        for seq in [
+            1,
+            999_999,
+            1_000_000,
+            123_456_789,
+            9_999_999_999_999_999_999,
+        ] {
+            let p = archive_path(&active, seq);
+            assert_eq!(
+                parse_archive_seq(&active, p.file_name().unwrap()),
+                Some(seq)
+            );
+        }
+    }
+
+    /// EVD-022 (lab PR 190): with names past six digits listed, an archive
+    /// named with a 19-digit seq must not make the verifier count up to it
+    /// (the evicted-prefix check walked every seq below the earliest one):
+    /// it answers at once, naming seq 1 as uncorroborated.
+    #[test]
+    fn a_huge_archive_seq_is_reported_at_once() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let pk = key().verifying_key();
+        fs::write(dir.path().join("test.jsonl.9000000000000000000"), b"").unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(
+            verify_log_set::<TestPayload>(&active, &pk),
+            Err(LogSetError::UncorroboratedEviction { seq: 1 })
+        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(current_generation(&active), 9_000_000_000_000_000_001);
+    }
+
+    /// EVD-017 (lab PR 190): the manifest checkpoints are reached by the
+    /// offsets they name, without a list of every line's end (which grew
+    /// with the file): checkpoints in archives and in the active file are
+    /// all reached, and a cut below the last one is still found.
+    #[test]
+    fn checkpoints_are_reached_without_keeping_every_line_end() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("test.jsonl");
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let mut log = open_log(&active, &kp, 2000);
+        for i in 0..40 {
+            log.append(payload(i)).unwrap();
+            if i % 7 == 3 {
+                log.checkpoint().unwrap();
+            }
+        }
+        let mut i = 40;
+        while fs::read_to_string(&active).unwrap().lines().count() < 2 {
+            log.append(payload(i)).unwrap();
+            i += 1;
+        }
+        log.checkpoint().unwrap();
+        drop(log);
+        assert!(list_archive_seqs(&active).unwrap().len() >= 2);
+        let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
+        assert_eq!(r.checkpoints_verified, checkpoints(&active).len());
+        assert!(r.checkpoints_verified >= 2, "{r:?}");
+        // Cut the active file at a line boundary below its checkpoint.
+        let body = fs::read_to_string(&active).unwrap();
+        let first = body.lines().next().unwrap();
+        fs::write(&active, format!("{first}\n")).unwrap();
+        let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert!(
+            matches!(&err, LogSetError::CheckpointUnreachable { reason, .. } if reason.contains("cut")),
+            "{err:?}"
+        );
     }
 }

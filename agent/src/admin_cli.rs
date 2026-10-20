@@ -749,6 +749,19 @@ pub struct ExpectedHead {
     pub min_seq: Option<u64>,
 }
 
+/// What `nn-admin audit read` read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditReadReport {
+    /// Rows written to stdout (those `since` kept).
+    pub rows: usize,
+    /// Lines that are not audit rows, skipped; each is named on stderr. Any
+    /// is exit 8: the file is not an intact chain.
+    pub skipped: usize,
+}
+
+/// Skipped lines named one by one on stderr; past this only the count.
+pub const AUDIT_READ_SKIPS_LISTED: usize = 100;
+
 /// `nn-admin audit read` — stream the audit log to stdout. Reads
 /// the on-disk JSONL log at `log_path` (default
 /// `/etc/northnarrow/audit.log`), optionally filtered by `since`
@@ -766,37 +779,82 @@ pub struct ExpectedHead {
 ///   line. Matches the on-disk JSONL exactly; the field set
 ///   round-trips with [`crate::audit::AuditEntry`].
 ///
-/// Returns the number of entries written so the binary can print
-/// `audit: N entries read`.
-pub fn run_audit_read(log_path: &Path, since: Option<&str>, json: bool) -> Result<usize> {
-    use std::io::{BufRead, BufReader, Write};
+/// External audit MAIN-014 (NN-AUD-256, lab PR 190): a line that is not an
+/// audit row (cut, not JSON, not UTF-8, over
+/// [`crate::verify_lines::MAX_VERIFY_LINE_BYTES`]) stopped the read with an
+/// error, and every row after it went unseen. It is skipped, named on stderr
+/// with its number (the first [`AUDIT_READ_SKIPS_LISTED`]), and counted in
+/// [`AuditReadReport::skipped`]; the read goes on to the end of the file,
+/// one bounded line in memory at a time. The rows are not verified here
+/// (`audit verify` does that).
+pub fn run_audit_read(log_path: &Path, since: Option<&str>, json: bool) -> Result<AuditReadReport> {
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    audit_read_into(
+        log_path,
+        since,
+        json,
+        &mut stdout.lock(),
+        &mut stderr.lock(),
+    )
+}
+
+/// [`run_audit_read`] into `out` (the rows) and `err` (the skipped lines).
+pub fn audit_read_into(
+    log_path: &Path,
+    since: Option<&str>,
+    json: bool,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Result<AuditReadReport> {
+    let mut report = AuditReadReport::default();
     let f = match std::fs::OpenOptions::new().read(true).open(log_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Empty/absent log is a valid state (fresh install,
             // no admin ops yet). Print nothing, return 0 — the
             // binary's summary line communicates the count.
-            return Ok(0);
+            return Ok(report);
         }
         Err(e) => return Err(anyhow!(e).context(format!("opening {}", log_path.display()))),
     };
-    let reader = BufReader::new(f);
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut count = 0usize;
-    for (idx, line) in reader.lines().enumerate() {
-        let line =
-            line.with_context(|| format!("reading line {} of {}", idx + 1, log_path.display()))?;
+    let mut lines = crate::verify_lines::VerifyLines::new(std::io::BufReader::new(f));
+    loop {
+        let at = lines.offset();
+        let line = lines
+            .next_line()
+            .with_context(|| format!("reading {} after byte {at}", log_path.display()))?;
+        let Some(line) = line else {
+            break;
+        };
         if line.is_empty() {
             continue;
         }
-        let entry: crate::audit::AuditEntry = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "parsing audit-log line {} of {} as JSON",
-                idx + 1,
-                log_path.display()
-            )
-        })?;
+        let entry = line.text().and_then(|t| {
+            serde_json::from_str::<crate::audit::AuditEntry>(t).map_err(|e| {
+                if line.newline {
+                    format!("not an audit row: {e}")
+                } else {
+                    format!("the last line, cut short (no newline): {e}")
+                }
+            })
+        });
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(reason) => {
+                report.skipped += 1;
+                if report.skipped <= AUDIT_READ_SKIPS_LISTED {
+                    writeln!(
+                        err,
+                        "audit: line {} of {} skipped: {reason}",
+                        line.number,
+                        log_path.display()
+                    )
+                    .context("writing stderr")?;
+                }
+                continue;
+            }
+        };
         if let Some(threshold) = since {
             if entry.ts.as_str() < threshold {
                 continue;
@@ -819,13 +877,13 @@ pub fn run_audit_read(log_path: &Path, since: Option<&str>, json: bool) -> Resul
             )
             .context("writing stdout")?;
         }
-        count += 1;
+        report.rows += 1;
     }
-    Ok(count)
+    Ok(report)
 }
 
 /// `nn-admin audit verify` — replay the chain in `from_path`
-/// through [`crate::audit::verify_chain`] using `pubkey`.
+/// through [`crate::audit::verify_chain_file`] using `pubkey`.
 /// Returns [`AuditVerifyOutcome::Success`] with the entry count
 /// or [`AuditVerifyOutcome::ChainBroken`] carrying the typed
 /// failure.
@@ -839,74 +897,41 @@ pub fn run_audit_verify(from_path: &Path, pubkey: &VerifyingKey) -> Result<Audit
 }
 
 /// [`run_audit_verify`], then the chain must still reach `expect`.
+///
+/// External audit MAIN-014 (NN-AUD-256, lab PR 190): one streaming pass
+/// ([`crate::audit::ChainVerifier`]) with the expected-head checks folded
+/// in. Every row was kept in memory, and the file was read a second time
+/// whole for `expect`; a line that is not a row was an error (exit 1), and
+/// is now [`AuditVerifyOutcome::ChainBroken`] with
+/// [`crate::audit::AuditVerifyError::UnreadableLine`] (exit 8).
 pub fn run_audit_verify_expecting(
     from_path: &Path,
     pubkey: &VerifyingKey,
     expect: &ExpectedHead,
 ) -> Result<AuditVerifyOutcome> {
-    let outcome = run_audit_verify_chain(from_path, pubkey)?;
-    let AuditVerifyOutcome::Success { entries } = outcome else {
-        return Ok(outcome);
-    };
-    if expect.entry_hash.is_none() && expect.min_seq.is_none() {
-        return Ok(outcome);
+    let report = crate::audit::verify_chain_file(from_path, pubkey, expect.entry_hash.as_deref())
+        .with_context(|| format!("reading {}", from_path.display()))?;
+    if let Some(e) = report.broken {
+        return Ok(AuditVerifyOutcome::ChainBroken(e));
     }
-    let body = std::fs::read_to_string(from_path).unwrap_or_default();
-    let rows: Vec<crate::audit::AuditEntry> = body
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
     if let Some(h) = &expect.entry_hash {
-        if !rows.iter().any(|r| &r.entry_hash == h) {
+        if !report.head_seen {
             return Ok(AuditVerifyOutcome::HeadNotReached(format!(
                 "no entry has entry_hash {h}: the chain ends before that head"
             )));
         }
     }
     if let Some(min) = expect.min_seq {
-        let last = rows.iter().rev().find_map(|r| r.seq);
+        let last = report.last_seq;
         if last.is_none_or(|s| s < min) {
             return Ok(AuditVerifyOutcome::HeadNotReached(format!(
                 "the last numbered row is {last:?}, below the expected {min}: rows were cut"
             )));
         }
     }
-    Ok(AuditVerifyOutcome::Success { entries })
-}
-
-fn run_audit_verify_chain(from_path: &Path, pubkey: &VerifyingKey) -> Result<AuditVerifyOutcome> {
-    use std::io::{BufRead, BufReader};
-    let f = match std::fs::OpenOptions::new().read(true).open(from_path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AuditVerifyOutcome::Success { entries: 0 });
-        }
-        Err(e) => return Err(anyhow!(e).context(format!("opening {}", from_path.display()))),
-    };
-    let reader = BufReader::new(f);
-    let mut entries: Vec<crate::audit::AuditEntry> = Vec::new();
-    for (idx, line) in reader.lines().enumerate() {
-        let line =
-            line.with_context(|| format!("reading line {} of {}", idx + 1, from_path.display()))?;
-        if line.is_empty() {
-            continue;
-        }
-        let entry: crate::audit::AuditEntry = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "parsing audit-log line {} of {} as JSON",
-                idx + 1,
-                from_path.display()
-            )
-        })?;
-        entries.push(entry);
-    }
-    match crate::audit::verify_chain(&entries, pubkey) {
-        Ok(()) => Ok(AuditVerifyOutcome::Success {
-            entries: entries.len(),
-        }),
-        Err(e) => Ok(AuditVerifyOutcome::ChainBroken(e)),
-    }
+    Ok(AuditVerifyOutcome::Success {
+        entries: report.rows,
+    })
 }
 
 /// One chain's result in `nn-admin chain verify`.
@@ -3746,7 +3771,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let nowhere = dir.path().join("does-not-exist.jsonl");
         let n = run_audit_read(&nowhere, None, false).expect("missing log is not an error");
-        assert_eq!(n, 0);
+        assert_eq!(n, AuditReadReport::default());
     }
 
     // ── Test 2 (A12 #2): read with --since filter drops entries
@@ -3758,16 +3783,23 @@ mod tests {
         // since == third entry's ts → exactly one kept (>=, not >);
         // entries[2] passes, entries[0..=1] are dropped.
         let threshold = entries[2].ts.clone();
-        let n = run_audit_read(&log_path, Some(&threshold), true).unwrap();
+        let read = |since: &str| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let r = audit_read_into(&log_path, Some(since), true, &mut out, &mut err).unwrap();
+            assert_eq!(r.skipped, 0);
+            assert_eq!(String::from_utf8(out).unwrap().lines().count(), r.rows);
+            r.rows
+        };
+        let n = read(&threshold);
         assert_eq!(
             n, 1,
             "since-threshold equal to entries[2].ts should keep exactly entries[2]"
         );
         // since == "9999-..." → all dropped.
-        let n_none = run_audit_read(&log_path, Some("9999-99-99T99:99:99Z"), true).unwrap();
+        let n_none = read("9999-99-99T99:99:99Z");
         assert_eq!(n_none, 0);
         // since == "0001-..." → all kept.
-        let n_all = run_audit_read(&log_path, Some("0001-01-01T00:00:00Z"), true).unwrap();
+        let n_all = read("0001-01-01T00:00:00Z");
         assert_eq!(n_all, 3);
     }
 
@@ -3855,6 +3887,148 @@ mod tests {
             ) => {} // expected
             other => panic!("expected EntryHashMismatch on entry 0; got: {other:?}"),
         }
+    }
+
+    /// External audit MAIN-014 (NN-AUD-256, lab PR 190): three rows, the
+    /// last torn. `read` stopped at it with an error; it prints the two
+    /// rows, names line 3 and reports one skipped line (exit 8 in the
+    /// binary). `verify` reported an I/O-style error (exit 1); it reports
+    /// two rows verified and the break at line 3.
+    #[test]
+    fn three_rows_with_the_last_torn_read_two_and_verify_two() {
+        let dir = TempDir::new().unwrap();
+        let (_key_path, log_path, pubkey, _) = build_audit_log(&dir, 3);
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        let rows: Vec<&str> = body.lines().collect();
+        let torn = format!(
+            "{}\n{}\n{}",
+            rows[0],
+            rows[1],
+            &rows[2][..rows[2].len() / 2]
+        );
+        std::fs::write(&log_path, torn).unwrap();
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let r = audit_read_into(&log_path, None, true, &mut out, &mut err).unwrap();
+        assert_eq!(
+            r,
+            AuditReadReport {
+                rows: 2,
+                skipped: 1
+            }
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(out.lines().collect::<Vec<_>>(), rows[..2].to_vec());
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains("line 3 of") && err.contains("cut short"),
+            "{err}"
+        );
+
+        match run_audit_verify(&log_path, &pubkey).unwrap() {
+            AuditVerifyOutcome::ChainBroken(crate::audit::AuditVerifyError::UnreadableLine {
+                line: 3,
+                verified: 2,
+                ..
+            }) => {}
+            other => panic!("expected the break at line 3 after 2 rows, got {other:?}"),
+        }
+    }
+
+    /// MAIN-014: lines that are not rows anywhere in the file — not JSON,
+    /// not UTF-8, blank lines between rows — hide none of the rows after
+    /// them; past [`AUDIT_READ_SKIPS_LISTED`] only the count grows.
+    #[test]
+    fn audit_read_skips_damaged_lines_and_prints_every_row() {
+        let dir = TempDir::new().unwrap();
+        let (_key_path, log_path, pubkey, entries) = build_audit_log(&dir, 4);
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        let rows: Vec<&str> = body.lines().collect();
+        let mut damaged = Vec::new();
+        damaged.extend_from_slice(format!("{}\n\n", rows[0]).as_bytes());
+        for _ in 0..AUDIT_READ_SKIPS_LISTED + 5 {
+            damaged.extend_from_slice(b"{\"not\":\"a row\"}\n");
+        }
+        damaged.extend_from_slice(format!("{}\n", rows[1]).as_bytes());
+        damaged.extend_from_slice(b"\xff\xfe\n");
+        damaged.extend_from_slice(format!("{}\n{}\n", rows[2], rows[3]).as_bytes());
+        std::fs::write(&log_path, &damaged).unwrap();
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let r = audit_read_into(&log_path, None, false, &mut out, &mut err).unwrap();
+        assert_eq!(
+            r,
+            AuditReadReport {
+                rows: 4,
+                skipped: AUDIT_READ_SKIPS_LISTED + 6
+            }
+        );
+        let out = String::from_utf8(out).unwrap();
+        for e in &entries {
+            assert!(out.contains(&e.entry_hash), "row {} not printed", e.op);
+        }
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(err.lines().count(), AUDIT_READ_SKIPS_LISTED);
+        assert!(err.starts_with("audit: line 3 of"), "{err}");
+
+        // `since` still filters the rows; the skipped lines are counted
+        // whatever their time (they have none).
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let r = audit_read_into(&log_path, Some(&entries[3].ts), true, &mut out, &mut err).unwrap();
+        assert_eq!(r.rows, 1);
+        assert_eq!(r.skipped, AUDIT_READ_SKIPS_LISTED + 6);
+
+        // `verify` stops at the first of them, line 3, after one row; an
+        // expected head does not hide the break.
+        let expect = ExpectedHead {
+            entry_hash: Some(entries[3].entry_hash.clone()),
+            min_seq: None,
+        };
+        assert!(matches!(
+            run_audit_verify_expecting(&log_path, &pubkey, &expect).unwrap(),
+            AuditVerifyOutcome::ChainBroken(crate::audit::AuditVerifyError::UnreadableLine {
+                line: 3,
+                verified: 1,
+                ..
+            })
+        ));
+    }
+
+    /// EVD-017 (NN-AUD-280): `chain verify` over every chain with an empty
+    /// archive in the detection log reports that chain and goes on — the
+    /// others and the anchor comparison are still reported.
+    #[test]
+    fn chain_verify_reports_the_chains_after_an_archive_without_terminator() {
+        let dir = TempDir::new().unwrap();
+        let (_key_path, audit, pubkey, _) = build_audit_log(&dir, 2);
+        let det = dir.path().join("detections");
+        std::fs::create_dir_all(&det).unwrap();
+        std::fs::File::create(det.join("detections.jsonl.000001")).unwrap();
+        let paths = crate::chain_anchor::ChainPaths {
+            audit,
+            canary_registry: dir.path().join("canaries.jsonl"),
+            canary_access: dir.path().join("canary_access.jsonl"),
+            detections: det.join("detections.jsonl"),
+            status_events: det.join("status_events.jsonl"),
+            netflow: dir.path().join("netflow.jsonl"),
+            fim_drift: dir.path().join("fim_drift.jsonl"),
+        };
+        let lines = run_chain_verify(&paths, &dir.path().join("heads.json"), &[], &pubkey);
+        let by = |c: &str| lines.iter().find(|l| l.chain == c).cloned();
+        let d = by("detections").expect("detections reported");
+        assert!(!d.ok && d.detail.contains("no terminator"), "{d:?}");
+        for c in [
+            "audit",
+            "canary_registry",
+            "canary_access",
+            "status_events",
+            "netflow",
+            "fim_drift",
+            "heads",
+        ] {
+            assert!(by(c).is_some_and(|l| l.ok), "{c}: {lines:?}");
+        }
+        assert_eq!(by("audit").unwrap().detail, "2 rows, all numbered");
     }
 
     // ── Test 5 (A12 #5): load_audit_pubkey accepts explicit

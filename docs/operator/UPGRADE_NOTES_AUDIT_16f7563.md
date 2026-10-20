@@ -393,6 +393,17 @@ packages open it themselves.
   pre-seed `agent_id` yourself (32 hex characters and a newline, mode
   0644, not all zeros). `install.sh` already does nothing of the kind
   before the first start.
+- **The verifiers on a damaged or large file** (NN-AUD-256 MAIN-014,
+  NN-AUD-280 EVD-017, NN-AUD-283 EVD-022, lab PR 190). `nn-admin chain
+  verify` reports an empty or cut sealed archive as that chain's `BROKEN`
+  line and goes on (it aborted before printing any chain); `audit read`
+  prints every row and names each line that is not a row on stderr;
+  `audit verify` names the first such line and the rows verified before
+  it; all of them read one line at a time (a line over 16 MiB is reported,
+  not read), and archives past seq 999,999 are seen. **Regression:**
+  `audit read` exits 8 (was 1) on a log with lines that are not rows, and
+  `audit verify` exits 8 (was 1) on such a line. The exit codes:
+  [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#exit-codes-of-the-verifiers).
 - **`nn-admin canary refresh`** (NN-AUD-172 DEC-010, NN-AUD-173 DEC-011,
   lab PR 143) writes a decoy again from a new random seed, in place, and
   records it. A trip is a signed `trip` row read back at boot.
