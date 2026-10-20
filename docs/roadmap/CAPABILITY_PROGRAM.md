@@ -190,3 +190,45 @@ only in the table below, in the same PR as the evidence.
     stalled loop, a refused recovery) are owed; the level stays 2 until
     they pass on the supported kernels.
   - Lab: On Ubuntu 24.04 (and the unit checks on Debian 12, 22.04, Debian 13): a forced pidfd-wait failure exits the watchdog with status 20 after a signed `watchdog_exit`, systemd restarts it (NRestarts 0 → 1) and the agent keeps its pid; twelve failures in a row never leave it `failed` (`StartLimitIntervalUSec=0`), the OnFailure handler signs `watchdog_failed`; a stalled event loop (debug trigger) is caught after 3 pings and signed `event_loop_stalled`; a refused recovery keeps the agent's pid and pidfile and signs `stuck_recovery_failed`; the bounded hold retries and signs `hold_retry`; SIGKILL restarts with a new pid, SIGTERM stops cleanly, SIGHUP is ignored. No core of either daemon: `Max core file size 0` and no "could not forbid core dumps" line (the SIGSEGV the probe sends through systemd is refused by the agent's own signal protection, so no crash happened to test). Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.
+- **Lab PR 217 — truthful response outcomes: the COMBAT ladder, the
+  isolation, the unlock.** C17 (response on processes and files), C18 (host
+  network isolation); static review of `baf4c25` P0 C-30, C-32, C-35, G-02,
+  G-03, TD-07, TD-11; the NN-AUD-243 residue
+  (`docs/operator/COMBAT_RECOVERY.md` §3).
+  - C17: NEUTRALIZE handles every offender — it returned at the first one it
+    could not contain, the others left running with their binaries in
+    place — and signs one `combat_outcome` row with each offender's kill
+    and quarantine outcome and the host-critical ones spared (`success`
+    only when all are contained).
+  - C18: the isolation state is per IP family, set and cleared only from
+    the tables read back (`iptables -S` / `ip6tables -S`) after an engage
+    or a release, public in `nn-admin status`; every iptables, ip6tables
+    and nft invocation is bounded (10 s, then killed). ISOLATE is no longer
+    marked done before it runs: the stage reads ISOLATE once IPv4 is
+    isolated, each attempt's per-family outcome is signed, and an attempt
+    that left a family not isolated is retried (5 s, 10 s; three attempts).
+  - C17 / C18: the release hook returns the read-back and runs before the
+    posture changes: an unlock (or a force-posture out of COMBAT) whose
+    teardown did not leave the tables clear is answered `ActionFailed`
+    (`nn-admin` exit 9), recorded `failure: release_failed`, and COMBAT
+    stays. The unlock is a signed `OperationCode::Unlock` payload whose row
+    names the signer; the legacy nonce signature is refused (no
+    compatibility flag: a downgrade switch on the release of the isolation,
+    and `nn-admin` ships with the agent).
+  - Evidence so far: unit tests with fake actuators and fake filter tables
+    — an offender uncontainable first and the others still killed (real
+    processes), an `ip6tables-restore` that fails, a teardown whose `-X` is
+    refused, a hung `iptables`, an ISOLATE failing then partial then done,
+    retries exhausted, a release hook that fails (posture, reply and audit
+    row), the legacy unlock refused — six of them ported to the base tree
+    fail there; the three clippy runs and `cargo fmt` clean, `cargo test
+    --workspace` 2,811 passed, 0 failed, 21 ignored. Levels unchanged (C17
+    2, C18 1): the guest checks are owed — COMBAT forced to ISOLATE on
+    Ubuntu 24.04 and Debian 12, `ip6tables` made to fail, the chain held
+    during an unlock, the signed unlock and the older `nn-admin` refused.
+    Open: an IPv6 hole that a retry cannot close (no `ip6tables`, no IPv6
+    filter table) is recorded, not closed; offenders attributed after the
+    NEUTRALIZE are soft-blocked, not killed; an admin operation still
+    proceeds when its audit row cannot be written (G-02, by design — only
+    the COMBAT records are queued and counted).
+  - Lab: On Ubuntu 24.04, a COMBAT driven to ISOLATE: status per family (IPv4 and IPv6 isolated), both tables with the chain, its DROP and one jump per base chain, the signed rows in order (INVESTIGATE, NEUTRALIZE outcome, ISOLATE outcome attempt 1 of 3 v4 done v6 done); with ip6tables made to fail (an unparsable nft rule), IPv4 isolated and IPv6 FAILED were reported and signed, three attempts at 0, 10 and 25 s ending in "ISOLATE did not take after every attempt" (journal and row; the probe read before the third); the signed unlock released both families (read back), recorded `key_fp` and `protocol: signed`, a second unlock said "not in COMBAT"; the legacy unlock is refused; this nn-admin against the previous agent exits 5 and says which nn-admin to use. Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.

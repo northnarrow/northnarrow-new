@@ -161,8 +161,9 @@ to that build. What changes then is in `UPGRADE_NOTES_WAVE4.md`.
   a clean stop); a watchdog that keeps failing is restarted every minute
   with one signed `watchdog_exit` per run; an agent stuck for 90 s behind
   one event is now restarted. The `LoopProgress` variants take the admin protocol's indices
-  52 and 53 (the debug-only variants move to 54 and 55): upgrade the agent,
-  the watchdog and `nn-admin` together, as before. A watchdog newer than
+  52 and 53 (lab PR 217's signed unlock pair follows at 54 and 55; the
+  debug-only variants of a `debug-trigger` build move to 56 and 57):
+  upgrade the agent, the watchdog and `nn-admin` together, as before. A watchdog newer than
   the agent falls back to the STATUS answer alone.
 - **A removed admin socket comes back, and no longer hides a frozen
   agent** (Wave 3: NN-AUD-358 WDG-007, NN-AUD-364 WDG-015, NN-AUD-359

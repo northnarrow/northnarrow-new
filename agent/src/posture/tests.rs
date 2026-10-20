@@ -24,7 +24,7 @@ fn workload_proc(dir: &std::path::Path, pid: u32, cgroup: &str) {
 fn machine_on(dir: &std::path::Path) -> PostureMachine {
     PostureMachine::new_with_hooks_and_exempt_and_auth(
         Arc::new(|| {}),
-        Arc::new(|_| {}),
+        Arc::new(|_, _| Ok(String::new())),
         ExemptPids::default(),
         AuthSessionTracker::new(dir),
     )
@@ -523,23 +523,26 @@ fn admin_release_with_token_transitions_combat_to_alerted() {
     assert_eq!(m.current_kind(), PostureKind::Combat);
 
     let token = crate::anti_tamper::_test_mint_unlock_token();
-    let new_state = m
+    let out = m
         .admin_release_combat_with_token(token)
         .expect("token release should succeed from Combat");
-    assert_eq!(new_state.kind(), PostureKind::Alerted);
+    assert!(out.left_combat);
+    assert_eq!(out.state.kind(), PostureKind::Alerted);
     assert_eq!(m.current_kind(), PostureKind::Alerted);
     // last_admin_action populated.
     assert!(m.last_admin_action_secs_ago().is_some());
 }
 
+/// Outside COMBAT there is no posture to leave: the release reports so
+/// (`left_combat: false`), changes nothing and stamps no admin action.
 #[test]
-fn admin_release_with_token_fails_when_not_in_combat() {
+fn admin_release_with_token_outside_combat_leaves_the_posture() {
     let m = PostureMachine::new();
     assert_eq!(m.current_kind(), PostureKind::Observing);
     let token = crate::anti_tamper::_test_mint_unlock_token();
-    let err = m.admin_release_combat_with_token(token).unwrap_err();
-    assert_eq!(err, super::AdminReleaseError::NotInCombat);
-    // last_admin_action stays None — failed releases must not stamp it.
+    let out = m.admin_release_combat_with_token(token).unwrap();
+    assert!(!out.left_combat);
+    assert_eq!(out.state.kind(), PostureKind::Observing);
     assert!(m.last_admin_action_secs_ago().is_none());
 }
 
@@ -549,10 +552,12 @@ fn release_hook_fires_with_token_on_successful_release() {
     let count = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::clone(&count);
     let entry_hook: super::CombatEntryHook = Arc::new(|| {});
-    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token, scope| {
         // The token is consumed by-value into the closure body —
         // dropping it here exercises the production ownership flow.
+        assert_eq!(scope, super::ReleaseScope::Combat);
         c2.fetch_add(1, Ordering::SeqCst);
+        Ok("released".to_string())
     });
     let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
     let intrusion = fs_protect_denial(100, 500);
@@ -565,20 +570,73 @@ fn release_hook_fires_with_token_on_successful_release() {
     assert_eq!(count.load(Ordering::SeqCst), 1);
 }
 
+/// Lab PR 217: outside COMBAT the hook runs scoped to an isolation left in
+/// place (no ladder episode to stand down), and the posture is untouched.
 #[test]
-fn release_hook_does_not_fire_on_not_in_combat() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let count = Arc::new(AtomicUsize::new(0));
-    let c2 = Arc::clone(&count);
+fn release_hook_outside_combat_is_scoped_to_the_isolation() {
+    let scopes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let s2 = Arc::clone(&scopes);
     let entry_hook: super::CombatEntryHook = Arc::new(|| {});
-    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
-        c2.fetch_add(1, Ordering::SeqCst);
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token, scope| {
+        s2.lock().push(scope);
+        Ok("nothing engaged".to_string())
     });
     let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
-    // Never entered Combat — release must reject + leave hook untouched.
     let token = crate::anti_tamper::_test_mint_unlock_token();
-    assert!(m.admin_release_combat_with_token(token).is_err());
-    assert_eq!(count.load(Ordering::SeqCst), 0);
+    let out = m.admin_release_combat_with_token(token).unwrap();
+    assert!(!out.left_combat);
+    assert_eq!(out.detail, "nothing engaged");
+    assert_eq!(*scopes.lock(), vec![super::ReleaseScope::IsolationOnly]);
+    assert_eq!(m.current_kind(), PostureKind::Observing);
+}
+
+/// Lab PR 217 (NN-AUD-243 residue, C-25): a release whose teardown fails
+/// is a failure, and the posture stays COMBAT. The state was written
+/// ALERTED before the hook ran and the hook's outcome was dropped: the
+/// operator read `Success` with the host still isolated.
+#[test]
+fn a_failed_release_keeps_combat_and_says_why() {
+    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let f2 = Arc::clone(&fail);
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token, _scope| {
+        if f2.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("IPv6: FAILED (read back: the NORTHNARROW_COMBAT chain is still listed)".into())
+        } else {
+            Ok("IPv4: cleared; IPv6: cleared".into())
+        }
+    });
+    let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
+    m.observe(&fs_protect_denial(100, 500), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    match m.admin_release_combat_with_token(token) {
+        Err(AdminReleaseError::ReleaseFailed(why)) => assert!(why.contains("IPv6"), "{why}"),
+        other => panic!("a failed teardown must not be a release: {other:?}"),
+    }
+    assert_eq!(m.current_kind(), PostureKind::Combat, "the posture stays");
+    assert!(m.is_combat_locked());
+    assert!(m.last_admin_action_secs_ago().is_none());
+    assert!(
+        !m.transition_log()
+            .iter()
+            .any(|t| t.from == PostureKind::Combat),
+        "no transition out of COMBAT was logged"
+    );
+    // the same through force-posture
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    assert!(matches!(
+        m.admin_force_state_with_token(token, PostureKind::Observing, true),
+        Err(AdminReleaseError::ReleaseFailed(_))
+    ));
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    // the teardown works now: a new unlock releases
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    let out = m.admin_release_combat_with_token(token).unwrap();
+    assert!(out.left_combat);
+    assert_eq!(out.detail, "IPv4: cleared; IPv6: cleared");
+    assert_eq!(m.current_kind(), PostureKind::Alerted);
 }
 
 #[test]
@@ -653,8 +711,9 @@ fn admin_force_state_with_token_combat_to_non_combat_fires_release_hook() {
     use std::sync::atomic::{AtomicU32, Ordering};
     let counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
-    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token, _scope| {
         c.fetch_add(1, Ordering::SeqCst);
+        Ok(String::new())
     });
     // Build a PostureMachine with both hooks present so the
     // combat-entry path also works for state setup.
@@ -684,8 +743,9 @@ fn admin_force_state_out_of_combat_needs_may_release() {
     use std::sync::atomic::{AtomicU32, Ordering};
     let released = Arc::new(AtomicU32::new(0));
     let r = Arc::clone(&released);
-    let release_hook: super::CombatReleaseHook = Arc::new(move |_token| {
+    let release_hook: super::CombatReleaseHook = Arc::new(move |_token, _scope| {
         r.fetch_add(1, Ordering::SeqCst);
+        Ok(String::new())
     });
     let m = PostureMachine::new_with_hooks(Arc::new(|| {}), release_hook);
     let token = crate::anti_tamper::_test_mint_unlock_token();
@@ -755,7 +815,7 @@ fn admin_force_state_reports_the_state_it_left() {
 /// the test explicitly ingests via ProcessSpawn events.
 fn machine_with_isolated_auth() -> PostureMachine {
     let entry_hook: super::CombatEntryHook = Arc::new(|| {});
-    let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
     PostureMachine::new_with_hooks_and_exempt_and_auth(
         entry_hook,
         release_hook,
@@ -906,7 +966,7 @@ fn own_runtime_dir_burst_is_not_mass_write_but_home_burst_is() {
     std::fs::write(pid_dir.join("loginuid"), "1000\n").unwrap();
     let mk = || {
         let entry_hook: super::CombatEntryHook = Arc::new(|| {});
-        let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+        let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
         PostureMachine::new_with_hooks_and_exempt_and_auth(
             entry_hook,
             release_hook,
@@ -957,7 +1017,7 @@ fn corroboration_is_scoped_to_the_login_session() {
     }
     let mk = || {
         let entry_hook: super::CombatEntryHook = Arc::new(|| {});
-        let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+        let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
         PostureMachine::new_with_hooks_and_exempt_and_auth(
             entry_hook,
             release_hook,
@@ -1005,7 +1065,7 @@ fn corroboration_is_scoped_to_the_login_session() {
 fn agent_self_writes_still_exempt() {
     const AGENT_PID: u32 = 4242;
     let entry_hook: super::CombatEntryHook = Arc::new(|| {});
-    let release_hook: super::CombatReleaseHook = Arc::new(|_| {});
+    let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
     let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
         entry_hook,
         release_hook,
@@ -1275,7 +1335,7 @@ fn admin_session_machine() -> (tempfile::TempDir, PostureMachine) {
     }
     let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
         Arc::new(|| {}),
-        Arc::new(|_| {}),
+        Arc::new(|_, _| Ok(String::new())),
         ExemptPids::default(),
         AuthSessionTracker::new(tmp.path()),
     );
@@ -1899,7 +1959,7 @@ fn the_trigger_fires_exactly_where_fim024_does() {
 fn the_agents_own_write_of_a_control_surface_file_raises_nothing() {
     let exempt = PostureMachine::new_with_hooks_and_exempt_and_auth(
         Arc::new(|| {}),
-        Arc::new(|_| {}),
+        Arc::new(|_, _| Ok(String::new())),
         ExemptPids::with_agent(4242),
         AuthSessionTracker::default(),
     );

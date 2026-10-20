@@ -88,16 +88,35 @@ pub struct PostureMachine {
 /// Sync>` so the machine itself can stay `Clone + Send + Sync`.
 pub type CombatEntryHook = Arc<dyn Fn() + Send + Sync>;
 
-/// Hook invoked when the admin successfully releases COMBAT via
-/// [`PostureMachine::admin_release_combat_with_token`]. Receives the
-/// validated [`UnlockToken`] by value so the implementation can pass
-/// it straight into `NetworkIsolator::release`.
+/// What a release hook did with the containment (lab PR 217, NN-AUD-243
+/// residue): `Ok` with what was released — the tables read back clear —
+/// or `Err` with what is still in place, or could not be checked.
+pub type ReleaseResult = std::result::Result<String, String>;
+
+/// What a release covers (lab PR 217).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseScope {
+    /// Leaving COMBAT: stand the ladder down, then lift the isolation.
+    Combat,
+    /// The posture is not in COMBAT: no ladder episode is touched; the
+    /// tables are torn down and read back (an isolation is never legitimate
+    /// outside COMBAT — a stale chain the boot teardown could not remove is
+    /// lifted).
+    IsolationOnly,
+}
+
+/// Hook invoked when the admin releases COMBAT via
+/// [`PostureMachine::admin_release_combat_with_token`] (or forces the
+/// posture out of it). Receives the validated [`UnlockToken`] by value so
+/// the implementation can pass it straight into `NetworkIsolator::release`.
 ///
-/// Fires AFTER the posture state transition and AFTER the write
-/// lock is dropped — keep that contract so the hook is free to
-/// shell out to `iptables` (which can take tens of ms) without
-/// blocking other observers.
-pub type CombatReleaseHook = Arc<dyn Fn(UnlockToken) + Send + Sync>;
+/// Lab PR 217 (NN-AUD-243 residue, capability C17): it returns what it did,
+/// and runs BEFORE the posture leaves COMBAT, with no lock held (it shells
+/// out to `iptables`) — the posture changes only after a verified release.
+/// It used to return nothing and run after the state had already been
+/// written ALERTED, so a teardown that failed was answered `Success` and
+/// recorded as one.
+pub type CombatReleaseHook = Arc<dyn Fn(UnlockToken, ReleaseScope) -> ReleaseResult + Send + Sync>;
 
 /// Pre-#6 alias retained so any in-flight references keep building.
 pub type CombatHook = CombatEntryHook;
@@ -658,12 +677,13 @@ impl PostureMachine {
         Ok(next)
     }
 
-    /// Production path out of Combat — invoked from the agent's
-    /// admin socket handler after `ConnAuth::verify_unlock` returns
-    /// a token. Drops the posture down to `Alerted` (NOT `Engaged`
-    /// like the legacy bool stub), then fires the combat-release
-    /// hook with the consumed token so `NetworkIsolator::release`
-    /// can tear down the iptables ruleset.
+    /// Production path out of Combat — invoked from the agent's admin
+    /// socket handler after a signed `unlock` verified (lab PR 217:
+    /// `OperationCode::Unlock`). Runs the combat-release hook with the
+    /// consumed token — the ladder stood down, then `NetworkIsolator::release`
+    /// tears down the iptables ruleset and reads the tables back — and only
+    /// once that succeeded drops the posture down to `Alerted` (NOT `Engaged`
+    /// like the legacy bool stub).
     ///
     /// ## Target-state rationale (Alerted, not Engaged)
     ///
@@ -684,10 +704,22 @@ impl PostureMachine {
     /// of the unit tests (external audit POS-013, WDG-R02); the asymmetry
     /// is intentional and deliberate.
     ///
-    /// Idempotent w.r.t. "already out of Combat" only at the socket
-    /// layer — this method itself errors with `NotInCombat` if the
-    /// state isn't Combat, leaving caller-side policy to map that to
-    /// `UnlockResult::Success`.
+    /// ## Truthful outcome (lab PR 217, NN-AUD-243 residue, C-25)
+    ///
+    /// The hook ran after the state was written ALERTED and returned
+    /// nothing: an iptables teardown that failed still answered the
+    /// operator `Success`, recorded "success", and left the host isolated
+    /// in ALERTED. Now:
+    /// - in COMBAT, a hook that fails returns
+    ///   [`AdminReleaseError::ReleaseFailed`] and the posture stays COMBAT
+    ///   (the ladder's episode is closed — its soft blocks lifted — and the
+    ///   isolation still in place is what `nn-admin status` shows); a new
+    ///   signed unlock retries the teardown;
+    /// - outside COMBAT the hook still runs, without the ladder
+    ///   ([`ReleaseScope::IsolationOnly`]: the tables torn down and read
+    ///   back, e.g. a stale chain the boot teardown could not remove), and
+    ///   its outcome is returned the same way — an unlock outside COMBAT is
+    ///   idempotent when the tables read back clear.
     ///
     /// On success records `Instant::now()` in `last_admin_action`,
     /// surfaced via [`Self::last_admin_action_secs_ago`] for the
@@ -695,11 +727,42 @@ impl PostureMachine {
     pub fn admin_release_combat_with_token(
         &self,
         token: UnlockToken,
-    ) -> Result<PostureState, AdminReleaseError> {
+    ) -> Result<ReleaseOutcome, AdminReleaseError> {
+        let in_combat = matches!(*self.inner.state.read(), PostureState::Combat { .. });
+        let scope = if in_combat {
+            ReleaseScope::Combat
+        } else {
+            ReleaseScope::IsolationOnly
+        };
+        // No lock held: the hook shells out to iptables.
+        let detail = match self.inner.combat_release_hook.as_ref() {
+            Some(hook) => hook(token, scope).map_err(AdminReleaseError::ReleaseFailed)?,
+            // In the no-hook configuration the token falls out of scope
+            // here; UnlockToken has no Drop impl. The capability invariant
+            // is intact because the token's *constructor* is what's
+            // visibility-gated.
+            None => "no isolation to release in this configuration".to_string(),
+        };
+        if !in_combat {
+            return Ok(ReleaseOutcome {
+                left_combat: false,
+                state: self.current(),
+                detail,
+            });
+        }
         let now = Instant::now();
         let mut guard = self.inner.state.write();
         if !matches!(*guard, PostureState::Combat { .. }) {
-            return Err(AdminReleaseError::NotInCombat);
+            // COMBAT ended while the release ran (an unlocked COMBAT that
+            // decayed): the containment is released, the newer state stays.
+            let state = guard.clone();
+            drop(guard);
+            *self.inner.last_admin_action.lock() = Some(now);
+            return Ok(ReleaseOutcome {
+                left_combat: false,
+                state,
+                detail,
+            });
         }
         let next = PostureState::Alerted {
             since: now,
@@ -713,20 +776,13 @@ impl PostureMachine {
             PostureKind::Combat,
             PostureKind::Alerted,
             None,
-            "admin token release".into(),
+            "admin token release (isolation released, read back)".into(),
         );
-
-        // Hook runs *after* state mutation + lock drop + log so it
-        // can shell out to iptables without blocking other observers.
-        if let Some(hook) = self.inner.combat_release_hook.as_ref() {
-            hook(token);
-        }
-        // In the no-hook configuration the token falls out of scope
-        // here; UnlockToken has no Drop impl, so the explicit
-        // `drop()` clippy nagged about was a no-op anyway. The
-        // capability invariant is intact because the token's
-        // *constructor* is what's visibility-gated.
-        Ok(next)
+        Ok(ReleaseOutcome {
+            left_combat: true,
+            state: next,
+            detail,
+        })
     }
 
     /// Seconds since the last successful admin release, or `None` if
@@ -797,17 +853,60 @@ impl PostureMachine {
         target: PostureKind,
         may_release: bool,
     ) -> Result<ForceOutcome, AdminReleaseError> {
+        let leaving_combat = {
+            let guard = self.inner.state.read();
+            let before = guard.kind();
+            if before == PostureKind::Combat && target != PostureKind::Combat && !may_release {
+                drop(guard);
+                let _ = token;
+                tracing::warn!(
+                    to = ?target,
+                    "force-posture out of COMBAT refused: it needs the unlock role"
+                );
+                return Err(AdminReleaseError::NeedsUnlock);
+            }
+            before == PostureKind::Combat && target != PostureKind::Combat
+        };
+        // Lab PR 217 (NN-AUD-243 residue): COMBAT → non-COMBAT releases the
+        // containment exactly like an unlock — the release runs first, with
+        // no lock held, and the posture changes only if it was verified. A
+        // failed release leaves COMBAT in place and returns why.
+        let (token, release) = if leaving_combat {
+            match self.inner.combat_release_hook.as_ref() {
+                Some(hook) => {
+                    let detail = hook(token, ReleaseScope::Combat)
+                        .map_err(AdminReleaseError::ReleaseFailed)?;
+                    (None, Some(detail))
+                }
+                None => (Some(token), None),
+            }
+        } else {
+            (Some(token), None)
+        };
         let now = Instant::now();
         let mut guard = self.inner.state.write();
         let before = guard.kind();
-        if before == PostureKind::Combat && target != PostureKind::Combat && !may_release {
-            drop(guard);
-            let _ = token;
-            tracing::warn!(
-                to = ?target,
-                "force-posture out of COMBAT refused: it needs the unlock role"
-            );
-            return Err(AdminReleaseError::NeedsUnlock);
+        if before == PostureKind::Combat && target != PostureKind::Combat {
+            // External audit NN-AUD-083: checked under the write lock too —
+            // an autonomous COMBAT entry may have landed since the read.
+            if !may_release {
+                drop(guard);
+                tracing::warn!(
+                    to = ?target,
+                    "force-posture out of COMBAT refused: it needs the unlock role"
+                );
+                return Err(AdminReleaseError::NeedsUnlock);
+            }
+            if !leaving_combat {
+                // COMBAT was entered while the request ran: its containment
+                // was not released, so the posture does not leave it.
+                drop(guard);
+                return Err(AdminReleaseError::ReleaseFailed(
+                    "COMBAT was entered while the request ran — nothing was changed; send it \
+                     again"
+                        .to_string(),
+                ));
+            }
         }
         let next = match target {
             PostureKind::Observing => PostureState::Observing,
@@ -838,6 +937,7 @@ impl PostureMachine {
             return Ok(ForceOutcome {
                 from: before,
                 state: next,
+                release,
             });
         }
 
@@ -856,17 +956,10 @@ impl PostureMachine {
             }
             let _ = token;
         } else if before == PostureKind::Combat && target != PostureKind::Combat {
-            // COMBAT → non-COMBAT: same ledger reset as the release verbs.
+            // COMBAT → non-COMBAT: same ledger reset as the release verbs;
+            // the release itself ran above, before the transition.
             self.clear_corroboration_on_release();
-            // Release hook consumes the token
-            // when present (identical to admin_release_combat_with_token).
-            // When no hook is configured, the token binding falls
-            // out of scope on return.
-            if let Some(hook) = self.inner.combat_release_hook.as_ref() {
-                hook(token);
-            } else {
-                let _ = token;
-            }
+            let _ = token;
         } else {
             // Lateral non-COMBAT transition (e.g., Alerted →
             // Engaged). No hook fires.
@@ -876,6 +969,7 @@ impl PostureMachine {
         Ok(ForceOutcome {
             from: before,
             state: next,
+            release,
         })
     }
 
@@ -970,18 +1064,38 @@ pub struct ForceOutcome {
     /// The state after it (the target; unchanged when `from` was already
     /// the target).
     pub state: PostureState,
+    /// Lab PR 217: what the release hook released, when the force left
+    /// COMBAT (`None` otherwise, or without a hook).
+    pub release: Option<String>,
+}
+
+/// What [`PostureMachine::admin_release_combat_with_token`] did (lab PR
+/// 217).
+#[derive(Debug, Clone)]
+pub struct ReleaseOutcome {
+    /// The posture left COMBAT (to ALERTED) — `false` when it was not in
+    /// COMBAT, or left it on its own while the release ran.
+    pub left_combat: bool,
+    /// The posture after the call.
+    pub state: PostureState,
+    /// What the release hook released (the tables read back clear).
+    pub detail: String,
 }
 
 /// Reasons [`PostureMachine::admin_release_combat_with_token`],
 /// [`PostureMachine::admin_force_state_with_token`] and the test-only
 /// `admin_release_combat` can refuse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminReleaseError {
     Unauthorized,
     NotInCombat,
     /// External audit NN-AUD-083: a force-posture out of COMBAT signed
     /// without the `unlock` role.
     NeedsUnlock,
+    /// Lab PR 217 (NN-AUD-243 residue): the release ran and did not leave
+    /// the tables clear (read back), or could not be checked — what is
+    /// still in place. The posture stayed COMBAT.
+    ReleaseFailed(String),
 }
 
 impl core::fmt::Display for AdminReleaseError {
@@ -991,6 +1105,12 @@ impl core::fmt::Display for AdminReleaseError {
             AdminReleaseError::NotInCombat => f.write_str("posture is not in COMBAT"),
             AdminReleaseError::NeedsUnlock => {
                 f.write_str("leaving COMBAT needs a signer holding the unlock role")
+            }
+            AdminReleaseError::ReleaseFailed(why) => {
+                write!(
+                    f,
+                    "the isolation was not released (posture stays COMBAT): {why}"
+                )
             }
         }
     }

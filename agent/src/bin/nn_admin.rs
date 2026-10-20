@@ -19,7 +19,8 @@
 //! - 6  shutdown: quorum not met (too few distinct valid sigs)
 //!   (NEW in Tappa 8 A9 per design §5.3)
 //! - 7  shutdown: role check failed (key valid but lacks `shutdown`)
-//!   (NEW in Tappa 8 A9 per design §5.3)
+//!   (NEW in Tappa 8 A9 per design §5.3); unlock: the key lacks `unlock`
+//!   (lab PR 217, the signed unlock)
 //! - 8  evidence missing or altered: `audit verify` (a row that does not
 //!   verify, a line that is not a row, a head not reached), `chain verify`
 //!   (any BROKEN line; every chain is still reported), `audit read` (lines
@@ -27,7 +28,10 @@
 //!   printed; external audit MAIN-014, lab PR 190). See
 //!   docs/operator/EVIDENCE_CHAINS.md, "Exit codes of the verifiers".
 //! - 9  canary burn/refresh: no such canary; response release/restore:
-//!   the agent verified the request and did nothing (reason printed)
+//!   the agent verified the request and did nothing (reason printed);
+//!   unlock, force-posture out of COMBAT: the agent verified the request
+//!   and could not release the isolation — the tables read back still hold
+//!   the COMBAT chain, the posture stays COMBAT (lab PR 217; reason printed)
 //! - 141 stdout (or stderr) closed before everything was written —
 //!   `nn-admin status | head -1` (128 + SIGPIPE, lab PR 188)
 //!
@@ -35,6 +39,9 @@
 //! challenge file, plus a separate `nn-admin sign` offline) is on
 //! the V1.1 roadmap. Today only the inline `unlock --key <PATH>`
 //! shape is supported; see the --help text on the unlock subcommand.
+//! Since lab PR 217 it signs an `OperationCode::Unlock` payload (the agent
+//! refuses the older signature over the bare nonce): this `nn-admin`
+//! cannot unlock an agent older than lab PR 217 — use that agent's own.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -185,16 +192,23 @@ enum Cmd {
         force: bool,
     },
 
-    /// Sign a server-issued challenge and submit the result.
+    /// Release COMBAT: sign an `unlock` payload over a server-issued
+    /// challenge (with this install's agent_id and the time) and submit it.
+    /// Succeeds only when the agent tore the isolation down and read the
+    /// tables back clear; otherwise exit 9 with what is still in place (the
+    /// posture stays COMBAT).
     ///
     /// V1.1 will add a split offline flow; for now this command
     /// must run on a host with both the private key and a route
-    /// to the agent's admin socket.
+    /// to the agent's admin socket. An agent older than lab PR 217
+    /// needs the nn-admin of its own release.
     Unlock {
         /// Path to the hex-encoded private key file written by
-        /// `nn-admin init`.
+        /// `nn-admin init`. Its admin.pub line needs the `unlock` role.
         #[arg(long)]
         key: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
@@ -1263,7 +1277,11 @@ fn main() -> ExitCode {
             pub_append,
             force,
         } => exit_from_anyhow(handle_init(&priv_out, &pub_append, force)),
-        Cmd::Unlock { key, socket } => match run_unlock(&socket, &key) {
+        Cmd::Unlock {
+            key,
+            agent_id_file,
+            socket,
+        } => match run_unlock(&socket, &key, &agent_id_file) {
             Ok(outcome) => exit_from_unlock(outcome),
             Err(e) => {
                 eprintln!("unlock: {e:#}");
@@ -1998,6 +2016,20 @@ fn exit_from_force_posture(
             );
             ExitCode::from(5)
         }
+        ForcePostureOutcome::ActionFailed => {
+            // Lab PR 217 (NN-AUD-243 residue).
+            eprintln!(
+                "{}",
+                colorize(
+                    "force-posture: verified, but leaving COMBAT failed — the isolation was NOT \
+                     released (read back) and the posture stays COMBAT; see `nn-admin status` \
+                     and the agent journal, then retry or use `nn-admin unlock`",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(9)
+        }
         ForcePostureOutcome::ProtocolVersionUnsupported { server_version } => {
             eprintln!(
                 "{}",
@@ -2162,12 +2194,54 @@ fn exit_from_shutdown(outcome: ShutdownOutcome, grace_secs: u32) -> ExitCode {
     }
 }
 
+/// `IPv4 isolated, IPv6 clear` — the agent's per-family state (lab PR 217).
+fn families_line(v4: bool, v6: bool) -> String {
+    let one = |isolated: bool| if isolated { "isolated" } else { "clear" };
+    format!("IPv4 {}, IPv6 {}", one(v4), one(v6))
+}
+
 fn exit_from_unlock(outcome: UnlockOutcome) -> ExitCode {
     let tty = std::io::stdout().is_terminal();
     match outcome {
-        UnlockOutcome::Success => {
+        UnlockOutcome::Success {
+            message,
+            isolation_v4,
+            isolation_v6,
+        } => {
             println!("{}", colorize("unlock: success", "32", tty));
+            println!("  {message}");
+            println!(
+                "  network isolation: {}",
+                families_line(isolation_v4, isolation_v6)
+            );
             ExitCode::SUCCESS
+        }
+        UnlockOutcome::ReleaseFailed {
+            message,
+            isolation_v4,
+            isolation_v6,
+        } => {
+            // Lab PR 217 (NN-AUD-243 residue): verified, not carried out.
+            eprintln!(
+                "{}",
+                colorize(
+                    "unlock: verified, but the isolation was NOT released — the posture stays \
+                     COMBAT",
+                    "31",
+                    tty
+                )
+            );
+            eprintln!("  {message}");
+            eprintln!(
+                "  network isolation: {}",
+                families_line(isolation_v4, isolation_v6)
+            );
+            eprintln!(
+                "  retry the unlock; if the teardown keeps failing, remove the \
+                 NORTHNARROW_COMBAT chain by hand (docs/operator/COMBAT_RECOVERY.md) and unlock \
+                 again"
+            );
+            ExitCode::from(9)
         }
         UnlockOutcome::InvalidSignature => {
             eprintln!("{}", colorize("unlock: invalid signature", "31", tty));
@@ -2194,6 +2268,31 @@ fn exit_from_unlock(outcome: UnlockOutcome) -> ExitCode {
                 )
             );
             ExitCode::from(4)
+        }
+        UnlockOutcome::RoleDenied => {
+            eprintln!(
+                "{}",
+                colorize(
+                    "unlock: role denied — the key's admin.pub line does not carry `unlock`",
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(7)
+        }
+        UnlockOutcome::Refused(result) => {
+            eprintln!(
+                "{}",
+                colorize(
+                    &format!(
+                        "unlock: refused ({result:?}) — check the host clock and that \
+                         --agent-id-file is this agent's"
+                    ),
+                    "31",
+                    tty
+                )
+            );
+            ExitCode::from(5)
         }
     }
 }
@@ -2493,9 +2592,14 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
+            // Lab PR 217 (capability C18).
+            out.network_isolation_v4
+                .map_or_else(|| "null".to_string(), |b| b.to_string()),
+            out.network_isolation_v6
+                .map_or_else(|| "null".to_string(), |b| b.to_string()),
             match out.last_admin_action_secs_ago {
                 Some(s) => s.to_string(),
                 None => "null".to_string(),
@@ -2539,7 +2643,14 @@ fn print_status(out: &StatusOutcome, json: bool) {
     } else {
         colorize("clear", "32", tty)
     };
-    println!("network isolation : {iso}");
+    // Lab PR 217 (capability C18): per IP family, as read back — an IPv6
+    // hole no longer hides behind "ENGAGED".
+    match (out.network_isolation_v4, out.network_isolation_v6) {
+        (Some(v4), Some(v6)) => {
+            println!("network isolation : {iso} ({})", families_line(v4, v6))
+        }
+        _ => println!("network isolation : {iso}"),
+    }
     // External audit CMB-016: where the COMBAT ladder stands.
     match (&out.combat_stage, out.combat_locked) {
         (Some(st), locked) => println!(
@@ -4027,6 +4138,8 @@ mod flow_sock_line_tests {
             net_quic_rows_total: None,
             deny_fail_open_total: None,
             deny_fail_open: Vec::new(),
+            network_isolation_v4: None,
+            network_isolation_v6: None,
             telemetry_signed: true,
         }
     }

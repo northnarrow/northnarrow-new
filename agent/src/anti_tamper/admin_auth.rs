@@ -1050,6 +1050,13 @@ impl<'a> ConnAuth<'a> {
         self.count(outcome)
     }
 
+    /// Lab PR 217: spend the connection's challenge without a verify — a
+    /// request the agent refuses outright (the legacy unlock) still uses it
+    /// up, as every request does.
+    pub fn discard_challenge(&self) {
+        let _ = self.nonce.take();
+    }
+
     /// `true` once the connection has failed
     /// [`MAX_AUTH_FAILURES_PER_CONNECTION`] signature checks: the server
     /// closes it after the reply.

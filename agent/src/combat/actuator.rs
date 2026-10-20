@@ -11,6 +11,10 @@
 //! [`WouldExecute`](crate::response::ExecutionOutcome::WouldExecute);
 //! [`SystemActuator::isolate`] adds the matching guard for the isolator,
 //! which has no internal dry-run gate (V1 gated it in `main.rs`).
+//!
+//! Lab PR 217 (capability C17): NEUTRALIZE and ISOLATE report what they did
+//! — per offender ([`NeutralizeReport`]) and per IP family, read back
+//! ([`IsolateOutcome`]) — and the ladder signs it.
 
 use std::sync::Arc;
 
@@ -18,7 +22,7 @@ use tracing::{info, warn};
 
 use common::ResponseAction;
 
-use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::anti_tamper::network_isolate::{IsolationReport, NetworkIsolator};
 use crate::response::proc_ref::ProcRef;
 use crate::response::quarantine::ExeHandle;
 use crate::response::{block_outbound, ExecutionOutcome, Executor};
@@ -37,6 +41,88 @@ pub enum NeutralizeOutcome {
     /// SIGKILL + verify (respawning / unkillable), or no offender could
     /// be attributed at all. The host must be isolated (STAGE 3).
     Uncontainable { reason: String },
+}
+
+/// Lab PR 217 (capability C17): what NEUTRALIZE did to one offender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffenderOutcome {
+    pub pid: u32,
+    /// The process and its tree are contained: killed, already gone, or —
+    /// detect-only — would have been.
+    pub contained: bool,
+    /// The kill's outcome, or why the offender is not contained.
+    pub kill: String,
+    /// What became of its binary: quarantined, nothing to quarantine, or
+    /// why not.
+    pub quarantine: String,
+}
+
+/// Lab PR 217 (capability C17): NEUTRALIZE's outcome for EVERY offender it
+/// was handed. It stopped at the first one it could not contain: the
+/// offenders after it were neither killed nor had their binary
+/// quarantined, and nothing said so.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NeutralizeReport {
+    pub offenders: Vec<OffenderOutcome>,
+}
+
+impl NeutralizeReport {
+    /// What the ladder decides on: contained only when every offender is
+    /// (and there was one); otherwise why, for each one that is not.
+    pub fn outcome(&self) -> NeutralizeOutcome {
+        if self.offenders.is_empty() {
+            // No process attributed — we cannot contain a threat at the
+            // process level, so isolation is the proportionate fallback.
+            return NeutralizeOutcome::Uncontainable {
+                reason: "no offending process attributed — cannot contain at process level"
+                    .to_string(),
+            };
+        }
+        let not: Vec<String> = self
+            .offenders
+            .iter()
+            .filter(|o| !o.contained)
+            .map(|o| format!("pid {}: {}", o.pid, o.kill))
+            .collect();
+        if not.is_empty() {
+            NeutralizeOutcome::Contained
+        } else {
+            NeutralizeOutcome::Uncontainable {
+                reason: not.join("; "),
+            }
+        }
+    }
+
+    /// Every offender with the same verdict (test actuators).
+    pub fn uniform(pids: &[u32], outcome: &NeutralizeOutcome) -> Self {
+        let (contained, kill) = match outcome {
+            NeutralizeOutcome::Contained => (true, "killed".to_string()),
+            NeutralizeOutcome::Uncontainable { reason } => (false, reason.clone()),
+        };
+        Self {
+            offenders: pids
+                .iter()
+                .map(|&pid| OffenderOutcome {
+                    pid,
+                    contained,
+                    kill: kill.clone(),
+                    quarantine: "quarantined".to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Lab PR 217 (capability C17): what STAGE 3 did. ISOLATE was marked done
+/// before it acted and its outcome was only logged; it is now this, read
+/// back from the tables, and the ladder records and retries from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsolateOutcome {
+    /// The isolator ran; per IP family, what the tables hold after it.
+    Applied(IsolationReport),
+    /// Nothing was applied, and nothing will be: detect-only, or no
+    /// isolator in this build.
+    NotApplied(String),
 }
 
 /// Outcome of a STAGE-1 soft egress block. External audit CMB-014: it
@@ -83,12 +169,14 @@ pub trait CombatActuator: Send + Sync {
     /// reported blocked.
     fn soft_egress_clear(&self, target: &ProcRef);
 
-    /// STAGE 2: kill (tree) + quarantine the offending process(es); report
-    /// whether the threat is contained at the process level.
-    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome;
+    /// STAGE 2: kill (tree) + quarantine EVERY offending process; report,
+    /// for each one, whether it is contained at the process level (lab PR
+    /// 217: one that cannot be contained no longer spares the others).
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeReport;
 
-    /// STAGE 3 (last resort): engage full host network isolation.
-    fn isolate(&self);
+    /// STAGE 3 (last resort): engage full host network isolation, and
+    /// report what the tables hold afterwards (lab PR 217).
+    fn isolate(&self) -> IsolateOutcome;
 
     /// Whether enforcement is globally suppressed (`--detect-only`).
     fn is_dry_run(&self) -> bool;
@@ -129,10 +217,10 @@ impl SystemActuator {
         )
     }
 
-    /// External audit CMB-002: why the descendants of `root` (a kill
-    /// tree's `additional` outcomes) are not contained, or `None` when
-    /// every one is.
-    fn tree_not_contained(root: u32, descendants: &[ExecutionOutcome]) -> Option<String> {
+    /// External audit CMB-002: why the descendants of a kill tree (its
+    /// `additional` outcomes) are not contained, or `None` when every one
+    /// is.
+    fn tree_not_contained(descendants: &[ExecutionOutcome]) -> Option<String> {
         let mut spared = Vec::new();
         let mut alive = Vec::new();
         let mut truncated = None;
@@ -163,7 +251,7 @@ impl SystemActuator {
                 "the tree walk stopped at {limit} descendants; the rest were not reached"
             ));
         }
-        Some(format!("pid {root}: {}", parts.join("; ")))
+        Some(parts.join("; "))
     }
 }
 
@@ -237,14 +325,10 @@ impl CombatActuator for SystemActuator {
         }
     }
 
-    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome {
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeReport {
         if offenders.is_empty() {
-            // No process attributed — we cannot contain a threat at the
-            // process level, so isolation is the proportionate fallback.
-            return NeutralizeOutcome::Uncontainable {
-                reason: "no offending process attributed — cannot contain at process level"
-                    .to_string(),
-            };
+            // `NeutralizeReport::outcome` says why that is uncontainable.
+            return NeutralizeReport::default();
         }
 
         // Review 87: the binaries are looked up before the kill. After
@@ -262,95 +346,140 @@ impl CombatActuator for SystemActuator {
             })
             .collect();
 
-        // First pass: kill the offending tree(s). Any non-contained
-        // outcome means the threat is uncontainable → isolate.
+        // First pass: kill every offending tree. Lab PR 217: an offender
+        // that cannot be contained is recorded and the next one is still
+        // killed — this returned at the first one, leaving the others
+        // running and their binaries in place.
+        let mut outcomes: Vec<OffenderOutcome> = Vec::with_capacity(offenders.len());
         for r in offenders {
             let pid = r.pid();
             let report = self.executor.execute_on(ResponseAction::KillProcessTree, r);
-            if !Self::contained(&report.primary) {
-                return NeutralizeOutcome::Uncontainable {
-                    reason: format!("pid {pid}: kill outcome {:?}", report.primary),
-                };
-            }
-            // External audit CMB-002: the whole tree, not only its root. A
-            // descendant still running — not killed, spared by the
-            // host-critical guard, or beyond a walk cut short — is a
-            // threat the process level did not contain.
-            if let Some(reason) = Self::tree_not_contained(pid, &report.additional) {
-                return NeutralizeOutcome::Uncontainable { reason };
-            }
-            info!(
-                target: "combat.actuator",
-                pid,
-                outcome = ?report.primary,
-                children = report.additional.len(),
-                "NEUTRALIZE: killed offending process tree"
-            );
-        }
-
-        // Second pass (best-effort): quarantine the binaries so a
-        // surviving parent / supervisor cannot re-exec them. A
-        // quarantine failure does NOT force isolation — the process is
-        // already dead — but it is logged.
-        let mut done: Vec<(u64, u64)> = Vec::new();
-        for (pid, binary) in binaries {
-            let Some(handle) = binary else {
+            let (contained, kill) = if !Self::contained(&report.primary) {
+                (false, format!("kill outcome {:?}", report.primary))
+            } else if let Some(reason) = Self::tree_not_contained(&report.additional) {
+                // External audit CMB-002: the whole tree, not only its root.
+                // A descendant still running — not killed, spared by the
+                // host-critical guard, or beyond a walk cut short — is a
+                // threat the process level did not contain.
+                (false, reason)
+            } else {
+                (
+                    true,
+                    format!(
+                        "{:?} ({} descendant(s) handled)",
+                        report.primary,
+                        report.additional.len()
+                    ),
+                )
+            };
+            if contained {
+                info!(
+                    target: "combat.actuator",
+                    pid,
+                    outcome = ?report.primary,
+                    children = report.additional.len(),
+                    "NEUTRALIZE: killed offending process tree"
+                );
+            } else {
                 warn!(
                     target: "combat.actuator",
                     pid,
-                    "NEUTRALIZE: no binary on disk to quarantine (exited before NEUTRALIZE, or \
-                     deleted while running)"
+                    why = %kill,
+                    "NEUTRALIZE: offender NOT contained — the other offenders are still handled"
                 );
-                continue;
-            };
-            if done.contains(&handle.key()) {
-                continue;
             }
-            let report = self.executor.quarantine_handle(&handle, pid);
-            done.push(handle.key());
-            match report.primary {
-                ExecutionOutcome::Quarantined { .. }
-                | ExecutionOutcome::AlreadyGone { .. }
-                | ExecutionOutcome::WouldExecute { .. } => {}
-                other => {
-                    warn!(
-                        target: "combat.actuator",
-                        pid,
-                        outcome = ?other,
-                        "NEUTRALIZE: binary quarantine did not complete (process already killed; \
-                         re-exec prevention degraded)"
-                    );
-                }
-            }
+            outcomes.push(OffenderOutcome {
+                pid,
+                contained,
+                kill,
+                quarantine: String::new(),
+            });
         }
 
-        NeutralizeOutcome::Contained
+        // Second pass: quarantine the binaries so a surviving parent /
+        // supervisor cannot re-exec them — every offender's, contained or
+        // not. A quarantine failure does NOT force isolation (a contained
+        // process is already dead), but it is in the offender's outcome.
+        let mut done: Vec<((u64, u64), u32)> = Vec::new();
+        for (slot, (pid, binary)) in outcomes.iter_mut().zip(binaries) {
+            slot.quarantine = match binary {
+                None => "no binary on disk to quarantine (exited before NEUTRALIZE, or deleted \
+                         while running)"
+                    .to_string(),
+                Some(handle) => match done.iter().find(|(k, _)| *k == handle.key()) {
+                    Some((_, first)) => format!("same binary as pid {first}"),
+                    None => {
+                        let report = self.executor.quarantine_handle(&handle, pid);
+                        done.push((handle.key(), pid));
+                        match report.primary {
+                            ExecutionOutcome::Quarantined { .. } => "quarantined".to_string(),
+                            ExecutionOutcome::AlreadyGone { .. } => {
+                                "binary already gone".to_string()
+                            }
+                            ExecutionOutcome::WouldExecute { .. } => {
+                                "detect-only: would be quarantined".to_string()
+                            }
+                            other => {
+                                warn!(
+                                    target: "combat.actuator",
+                                    pid,
+                                    outcome = ?other,
+                                    "NEUTRALIZE: binary quarantine did not complete (re-exec \
+                                     prevention degraded)"
+                                );
+                                format!("NOT quarantined: {other:?} (re-exec prevention degraded)")
+                            }
+                        }
+                    }
+                },
+            };
+        }
+
+        NeutralizeReport {
+            offenders: outcomes,
+        }
     }
 
-    fn isolate(&self) {
+    fn isolate(&self) -> IsolateOutcome {
         if self.detect_only {
             warn!(
                 target: "combat.actuator",
                 "DETECT-ONLY: STAGE 3 reached — would engage full network isolation; \
                  iptables NOT applied (no enforcement)"
             );
-            return;
+            return IsolateOutcome::NotApplied(
+                "detect-only: iptables NOT applied (no enforcement)".to_string(),
+            );
         }
         match &self.isolator {
             Some(iso) => {
-                if let Err(e) = iso.engage() {
+                let report = iso.engage();
+                if !report.engaged() {
                     tracing::error!(
                         target: "combat.actuator",
-                        error = %e,
-                        "COMBAT isolate failed; agent continues in degraded mode"
+                        outcome = %report.summary("isolated"),
+                        "COMBAT isolate failed — the host is NOT isolated (the ladder retries)"
+                    );
+                } else if !report.complete() {
+                    tracing::error!(
+                        target: "combat.actuator",
+                        outcome = %report.summary("isolated"),
+                        "COMBAT isolate partial — a family is NOT isolated (the ladder retries)"
                     );
                 }
+                IsolateOutcome::Applied(report)
             }
-            None => warn!(
-                target: "combat.actuator",
-                "STAGE 3 reached but no network isolator configured — cannot isolate \
-                 (dev build without /etc/northnarrow/ provisioned)"
-            ),
+            None => {
+                warn!(
+                    target: "combat.actuator",
+                    "STAGE 3 reached but no network isolator configured — cannot isolate \
+                     (dev build without /etc/northnarrow/ provisioned)"
+                );
+                IsolateOutcome::NotApplied(
+                    "no network isolator in this build (combat ruleset not provisioned)"
+                        .to_string(),
+                )
+            }
         }
     }
 
@@ -378,47 +507,35 @@ mod tests {
     fn tree_containment_counts_every_descendant() {
         use ExecutionOutcome as O;
         assert_eq!(
-            SystemActuator::tree_not_contained(
-                7,
-                &[
-                    O::Killed { pid: 8 },
-                    O::AlreadyGone { pid: 9 },
-                    O::WouldExecute { pid: 10 }
-                ]
-            ),
+            SystemActuator::tree_not_contained(&[
+                O::Killed { pid: 8 },
+                O::AlreadyGone { pid: 9 },
+                O::WouldExecute { pid: 10 }
+            ]),
             None
         );
-        let r = SystemActuator::tree_not_contained(
-            7,
-            &[
-                O::Killed { pid: 8 },
-                O::PermissionDenied { pid: 9, errno: 1 },
-            ],
-        )
+        let r = SystemActuator::tree_not_contained(&[
+            O::Killed { pid: 8 },
+            O::PermissionDenied { pid: 9, errno: 1 },
+        ])
         .unwrap();
         assert!(r.contains("not killed") && r.contains("pid: 9"), "{r}");
-        let r = SystemActuator::tree_not_contained(
-            7,
-            &[O::Refused {
-                pid: 11,
-                reason: "ssh-service(sshd)",
-            }],
-        )
+        let r = SystemActuator::tree_not_contained(&[O::Refused {
+            pid: 11,
+            reason: "ssh-service(sshd)",
+        }])
         .unwrap();
         assert!(
             r.contains("spared") && r.contains("11 (ssh-service(sshd))"),
             "{r}"
         );
-        let r = SystemActuator::tree_not_contained(
-            7,
-            &[
-                O::Killed { pid: 8 },
-                O::TreeTruncated {
-                    pid: 7,
-                    limit: 1000,
-                },
-            ],
-        )
+        let r = SystemActuator::tree_not_contained(&[
+            O::Killed { pid: 8 },
+            O::TreeTruncated {
+                pid: 7,
+                limit: 1000,
+            },
+        ])
         .unwrap();
         assert!(r.contains("stopped at 1000"), "{r}");
     }
@@ -449,7 +566,9 @@ mod tests {
             (pid == child).then_some("test-guard")
         }));
         let actuator = SystemActuator::new(exec, None, false);
-        let outcome = actuator.neutralize(&[Arc::new(ProcRef::open(parent.id()))]);
+        let outcome = actuator
+            .neutralize(&[Arc::new(ProcRef::open(parent.id()))])
+            .outcome();
         let _ = parent.wait();
         // SAFETY: plain kill(2) on our own child.
         unsafe { libc::kill(child as i32, libc::SIGKILL) };
@@ -464,6 +583,86 @@ mod tests {
         }
     }
 
+    /// Lab PR 217 (capability C17): the first offender cannot be contained
+    /// (the guard spares its child) — the second is still killed, and the
+    /// report has an outcome for each. NEUTRALIZE used to return at the
+    /// first one: the second kept running and nothing recorded it.
+    #[test]
+    fn neutralize_handles_every_offender_past_one_it_cannot_contain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut first = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(first.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let spared: u32 = line.trim().parse().unwrap();
+        let mut second = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let cfg = ExecutorConfig {
+            dry_run: false,
+            ..ExecutorConfig::for_test(&tmp.path().join("state"))
+        };
+        let exec = Executor::with_config(cfg);
+        exec.set_tree_guard(std::sync::Arc::new(move |pid: u32| {
+            (pid == spared).then_some("test-guard")
+        }));
+        let actuator = SystemActuator::new(exec, None, false);
+        let report = actuator.neutralize(&[
+            Arc::new(ProcRef::open(first.id())),
+            Arc::new(ProcRef::open(second.id())),
+        ]);
+        let _ = first.wait();
+        // the second offender was killed: it is reaped at once
+        let mut reaped = None;
+        for _ in 0..200 {
+            reaped = second.try_wait().unwrap();
+            if reaped.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if reaped.is_none() {
+            let _ = second.kill();
+        }
+        // SAFETY: plain kill(2) on our own grandchild.
+        unsafe { libc::kill(spared as i32, libc::SIGKILL) };
+        assert!(
+            reaped.is_some(),
+            "the second offender must be killed: {report:?}"
+        );
+        assert_eq!(report.offenders.len(), 2, "{report:?}");
+        assert!(!report.offenders[0].contained, "{report:?}");
+        assert!(
+            report.offenders[0]
+                .kill
+                .contains(&format!("{spared} (test-guard)")),
+            "{report:?}"
+        );
+        assert!(report.offenders[1].contained, "{report:?}");
+        assert_eq!(report.offenders[1].pid, second.id());
+        match report.outcome() {
+            NeutralizeOutcome::Uncontainable { reason } => {
+                assert!(
+                    reason.starts_with(&format!("pid {}:", first.id())),
+                    "{reason}"
+                );
+                assert!(
+                    !reason.contains(&format!("pid {}:", second.id())),
+                    "{reason}"
+                );
+            }
+            other => panic!("one offender is not contained: {other:?}"),
+        }
+    }
+
     /// Review 87: NEUTRALIZE kills the offender, then quarantines the
     /// binary it ran, looked up before the kill. The quarantine by pid
     /// that ran after the kill found `/proc/<pid>/exe` gone every time.
@@ -472,7 +671,20 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mal = tmp.path().join("mal");
         std::fs::copy("/bin/sleep", &mal).unwrap();
-        let mut child = std::process::Command::new(&mal).arg("60").spawn().unwrap();
+        // ETXTBSY: another test thread's fork may still hold the copy's
+        // write descriptor for an instant.
+        let mut child = (0..200)
+            .find_map(
+                |_| match std::process::Command::new(&mal).arg("60").spawn() {
+                    Ok(c) => Some(c),
+                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        None
+                    }
+                    Err(e) => panic!("spawn {}: {e}", mal.display()),
+                },
+            )
+            .expect("the copied binary runs");
         let pid = child.id();
         // the exec has replaced the image before NEUTRALIZE reads it
         for _ in 0..100 {
@@ -489,11 +701,12 @@ mod tests {
         };
         let vault = cfg.quarantine_dir.join("vault");
         let actuator = SystemActuator::new(Executor::with_config(cfg), None, false);
-        let outcome = actuator.neutralize(&[Arc::new(ProcRef::open(pid))]);
+        let report = actuator.neutralize(&[Arc::new(ProcRef::open(pid))]);
         assert!(
-            matches!(outcome, NeutralizeOutcome::Contained),
-            "{outcome:?}"
+            matches!(report.outcome(), NeutralizeOutcome::Contained),
+            "{report:?}"
         );
+        assert_eq!(report.offenders[0].quarantine, "quarantined");
         let _ = child.wait();
         assert!(!mal.exists(), "the offender's binary must be quarantined");
         let bins = std::fs::read_dir(&vault)

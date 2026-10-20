@@ -14,7 +14,6 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::process::Stdio;
 
 use super::{block_outbound::nft_apply, config::ExecutorConfig};
 
@@ -59,12 +58,16 @@ fn chain_exists(table: &str, chain: &str) -> bool {
     let Ok(nft) = super::block_outbound::trusted_nft() else {
         return false;
     };
-    nft.command()
-        .args(["list", "chain", "inet", table, chain])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    let mut cmd = nft.command();
+    cmd.args(["list", "chain", "inet", table, chain]);
+    // Lab PR 217: bounded, like every nft invocation.
+    crate::bounded_cmd::run_bounded(
+        cmd,
+        None,
+        crate::bounded_cmd::EXTERNAL_CMD_TIMEOUT,
+        "nft list chain",
+    )
+    .is_ok_and(|o| o.status.success())
 }
 
 #[cfg(test)]

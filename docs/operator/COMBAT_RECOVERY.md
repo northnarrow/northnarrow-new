@@ -171,13 +171,100 @@ admin socket:
 # Check current posture + isolation state first:
 nn-admin status
 
-# Release COMBAT (preferred path — signs a server-issued challenge):
-nn-admin unlock --key /path/to/admin.key
+# Release COMBAT (preferred path — signs an `unlock` payload over a
+# server-issued challenge, bound to this install's agent_id):
+nn-admin unlock --key /path/to/admin.key [--agent-id-file /etc/northnarrow/agent_id]
 ```
 
-`unlock` drops posture out of COMBAT and tears down the
-`NORTHNARROW_COMBAT` chain. (`nn-admin force-posture` exists too but
-`unlock` is the preferred COMBAT-release path.)
+`unlock` stands the ladder down (the per-process egress blocks lifted),
+tears down the `NORTHNARROW_COMBAT` chain in both tables and reads them back
+(`iptables -S`, `ip6tables -S`); **only once both read back clear** does the
+posture leave COMBAT (to ALERTED) and `unlock` print `success`, with what was
+released and the isolation per IP family. (`nn-admin force-posture` exists
+too but `unlock` is the preferred COMBAT-release path; out of COMBAT it
+releases the same way.)
+
+### 3.1 When the release does not take (lab PR 217)
+
+Before lab PR 217 a teardown that failed — `iptables -X` refused, an
+`ip6tables` that errored — was answered `success` and recorded as one, and
+the posture went to ALERTED with the host still isolated (NN-AUD-243
+residue). Now:
+
+- the reply is a failure, **exit 9**: `unlock: verified, but the isolation
+  was NOT released — the posture stays COMBAT`, followed by the agent's
+  reason per family (`IPv4: FAILED (… read back: the NORTHNARROW_COMBAT chain
+  is still listed)`) and its state (`network isolation: IPv4 isolated, IPv6
+  clear`);
+- the posture **stays COMBAT** (locked); the ladder's episode is closed
+  (its egress blocks lifted), so nothing is re-isolated behind you;
+- the audit row is `op` `unlock`, `result` `failure: release_failed (…)`,
+  with the signer's `key_fp` and `extra.released: false`;
+- `nn-admin status` says, per family, whether the table still drops:
+  `network isolation : ENGAGED (IPv4 isolated, IPv6 clear)` when the jumps
+  could not be removed; a chain left listed without its jumps (an
+  `iptables -X` refused) no longer drops and reads `clear`, but the release
+  is still a failure until the table reads back without it.
+
+Run `unlock` again (each attempt retries the teardown and the read-back). If
+it keeps failing, remove the chain by hand from the console — `iptables -D
+INPUT -j NORTHNARROW_COMBAT` (and `OUTPUT`, `FORWARD`, until it fails), then
+`iptables -F NORTHNARROW_COMBAT; iptables -X NORTHNARROW_COMBAT`, the same
+with `ip6tables` — and `unlock` once more: it then reads the tables back
+clear and the posture leaves COMBAT. A `force-posture` out of COMBAT whose
+release fails is the same failure (exit 9, `failure: release_failed`, COMBAT
+stays). An `unlock` outside COMBAT succeeds when there is nothing to release;
+when a stale chain is still in place (a boot teardown that failed, §4) it
+tears that down and answers from the read-back.
+
+### 3.2 Signed unlock only; compatibility
+
+`unlock` signs a `SignedPayload` with `op = Unlock` (the challenge, the
+time, the install's `agent_id`), 1-of-N, role `unlock`, like every other
+admin operation; the audit row names the signer (`key_fp`). The older
+signature over the bare challenge (no operation, install or time bound to
+it, no signer in the row) is **refused** by the agent whatever it carries:
+reply `LegacyProtocolRefused`, an ERROR in the journal, the row `failure:
+legacy_protocol_refused` (`extra.protocol: legacy`). There is deliberately
+no switch to accept it again — it would be a downgrade of the one
+operation that lifts the isolation, and the `nn-admin` that signs the
+payload ships in the same release as the agent.
+
+- An **older `nn-admin`** against this agent: it cannot decode the refusal
+  and exits 5 (a protocol error); it never reads a success. Use the
+  `nn-admin` of the agent's release.
+- **This `nn-admin`** against an agent older than lab PR 217: the agent does
+  not know the signed unlock and closes the connection; `unlock` exits 5
+  saying so. Use the `nn-admin` of that agent's release (or restart the
+  agent on the new release: the stale chain is torn down at boot, §4).
+- `nn-admin status` against an agent older than lab PR 217 fails to decode
+  (the status reply gained two fields, as with every field appended since
+  lab PR 193): upgrade the agent with `nn-admin`. The watchdog's ping is
+  unaffected (it reads the two leading fields only).
+
+### 3.3 What ISOLATE reports (lab PR 217)
+
+- **Per IP family.** The isolation state is kept per family: a family is
+  isolated only once its table was read back holding the COMBAT chain, its
+  catch-all DROP and every jump into it; it is clear only once a release
+  read it back without them. `nn-admin status` shows both (`--json`:
+  `network_isolation_v4`, `network_isolation_v6`; `network_isolation_engaged`
+  is either). An `ip6tables` that fails no longer hides behind "ENGAGED".
+- **Bounded.** Every `iptables`, `ip6tables` and `nft` invocation is waited
+  for at most 10 s, then killed; the step fails with the timeout as its
+  reason instead of holding the ladder (and the stand-down of an unlock).
+- **Signed and retried.** The ladder records the decision to isolate before
+  it acts (`combat_stage` → ISOLATE) and, after each attempt, what the tables
+  hold (`combat_outcome`, `stage` ISOLATE, per family, `result` `success`
+  only when both families are isolated, else `failure: …` — a family this
+  host cannot isolate, e.g. without `ip6tables`, is named there as a hole). The stage reads ISOLATE only once IPv4 is isolated; an
+  attempt that left a family not isolated is retried after 5 s, then 10 s —
+  three attempts per episode — each one signed. `nn-admin audit read --key …
+  | grep combat_outcome` lists them.
+- **NEUTRALIZE** handles every offender — one it cannot contain no longer
+  stops the kill of the others — and signs one `combat_outcome` row (`stage`
+  NEUTRALIZE) with each offender's kill and quarantine outcome and the
+  host-critical ones spared.
 
 ---
 
@@ -195,10 +282,12 @@ posture state behind it (the "split-brain"). NorthNarrow handles this
   external audit MAIN-013): an `integrity_drift` row of kind
   `combat_reconcile`, `result` `repaired` with `rules_torn_down` — or
   `failed` when the chain could not be checked or torn down, in which case
-  the host may still be isolated (by hand, from the console:
+  the host may still be isolated — `nn-admin status` then says which family
+  (lab PR 217: the boot state follows the table read back), and a signed
+  `unlock` retries the teardown (§3.1) — or by hand, from the console:
   `iptables -D INPUT -j NORTHNARROW_COMBAT` — and `OUTPUT`, `FORWARD`,
   until it fails — then `iptables -F NORTHNARROW_COMBAT; iptables -X
-  NORTHNARROW_COMBAT`, the same with `ip6tables`). Check it with
+  NORTHNARROW_COMBAT`, the same with `ip6tables`. Check it with
   `sudo nn-admin audit verify && sudo grep '"kind":"combat_reconcile"'
   /etc/northnarrow/audit.log`.
 - For compatibility a line is also appended to
@@ -258,8 +347,10 @@ already won). Crash-resilient persistent COMBAT is on the V1.0+ roadmap.
 |-----------|--------|
 | Provision admin key | `install.sh` auto-bootstraps; **move `/root/northnarrow-admin.key` offline** |
 | Avoid remote lockout | `nn-admin config overlay set combat-allow --file <cidrs> --key <config-manage key>` |
-| Check state | `nn-admin status` |
-| Release COMBAT | `nn-admin unlock --key <admin.key>` |
+| Check state | `nn-admin status` (isolation per IP family) |
+| Release COMBAT | `nn-admin unlock --key <admin.key>` — exit 0 only once the tables read back clear |
+| Release failed (exit 9) | COMBAT stays; retry `unlock`, or remove the chain by hand and `unlock` (§3.1) |
+| An older `nn-admin` | refused (exit 5): use the `nn-admin` of the agent's release (§3.2) |
 | Re-engage after crash | `nn-admin force-posture combat --key <admin.key>` |
 | Crash mid-COMBAT | automatic stale-chain reconcile on restart (see §4) |
 | Host cut off by an older agent's nftables isolation | agent restart removes it; by hand see §4 |

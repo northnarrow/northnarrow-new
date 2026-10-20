@@ -108,6 +108,66 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   templates).
 
 ### Fixed
+- Truthful COMBAT outcomes: what an unlock, a NEUTRALIZE and an ISOLATE
+  report and record is now the state of the host (capabilities C17, C18;
+  static review of `baf4c25` P0 C-30, C-32, C-35, G-02, G-03, TD-07, TD-11;
+  the NN-AUD-243 residue; lab PR 217).
+  - **Unlock.** A release whose iptables teardown failed was answered
+    `Success` and recorded "success": the release hook returned nothing and
+    ran after the posture had already been written ALERTED. The hook now
+    returns what the tables hold after the teardown, read back per family
+    (`iptables -S` / `ip6tables -S`: neither the `NORTHNARROW_COMBAT` chain
+    nor a jump into it), and runs before the posture changes; the posture
+    leaves COMBAT only after a verified release. A failure is answered
+    `AdminResult::ActionFailed` with the reason and the per-family state
+    (`nn-admin unlock` exit 9), the posture stays COMBAT, and the audit row
+    is `failure: release_failed (…)`. The same for `force-posture` out of
+    COMBAT. An unlock outside COMBAT runs the teardown and the read-back
+    without touching the ladder — lifting a stale chain the boot teardown
+    could not remove (the boot state now follows the table read back) —
+    and is idempotent when the tables read back clear.
+  - **Signed unlock.** `unlock` is a `SignedPayload` with
+    `OperationCode::Unlock` (challenge, time, `agent_id`, 1-of-N, role
+    `unlock`), like every other admin operation — new wire variants
+    `SignedUnlockRequest` / `SignedUnlockResponse`, appended before the
+    debug-only ones (indices 54/55, after lab PR 216's `LoopProgress`
+    pair; the debug-only variants move to 56/57) — and its audit row names the signer (`key_fp`, it was
+    empty). The legacy signature over the bare nonce is refused,
+    `UnlockResult::LegacyProtocolRefused` (appended), audited as `failure:
+    legacy_protocol_refused`. Decision: refused outright, no compatibility
+    flag — a flag would be a downgrade switch on the one operation that
+    lifts the isolation, and `nn-admin` ships in the same release as the
+    agent. `nn-admin unlock` gains `--agent-id-file` (default
+    `/etc/northnarrow/agent_id`).
+  - **NEUTRALIZE** stopped at the first offender it could not contain: the
+    others were neither killed nor had their binary quarantined. Every
+    offender is now handled, and one signed `combat_outcome` row (stage
+    NEUTRALIZE) lists each one's kill and quarantine outcome and the
+    host-critical ones spared; `result` is `success` only when all are
+    contained.
+  - **ISOLATE** was marked done before it ran, its failure only logged and
+    never retried. `NetworkIsolator::engage` returns the per-family
+    read-back; the stage reads ISOLATE only once IPv4 is isolated; each
+    attempt's outcome is a signed `combat_outcome` row (stage ISOLATE, per
+    family); an attempt that left a family not isolated is retried after
+    5 s and 10 s, three attempts per episode.
+  - **Isolation state per IP family.** One flag covered IPv4 and IPv6 and
+    was true with IPv6 open. The isolator keeps a flag per family, set and
+    cleared only from the tables read back after an engage or a release
+    (isolated: the chain reaches its DROP and INPUT and OUTPUT jump into
+    it; a chain left without its jumps is a failed release, not an
+    isolation); the status reply carries both (`network_isolation_v4` /
+    `_v6`, appended, public; `network_isolation_engaged` is either), and
+    `nn-admin status` prints them. Every `iptables`, `ip6tables` and `nft` invocation
+    is waited for at most 10 s, then killed (`bounded_cmd`).
+  - Compatibility: an older `nn-admin` cannot decode the new replies
+    (`LegacyProtocolRefused`, `ActionFailed`) and exits 5 — never a
+    success; this `nn-admin` cannot unlock an agent older than lab PR 217
+    (the agent closes the connection; exit 5 says to use that agent's
+    `nn-admin`), and, as with every status field appended since lab PR 193,
+    cannot read its `status`. The watchdog's ping reads the two leading
+    status fields only and is unaffected. `docs/operator/COMBAT_RECOVERY.md`
+    §3.
 - Wave 4, capability C23 (anti-tamper and self-defence): supervision fails
   visibly, and both daemons are hardened (static review of `baf4c25`:
   C-43, C-44, G-05, G-06, TD-08, TD-10; lab PR 216). **Exit statuses:**

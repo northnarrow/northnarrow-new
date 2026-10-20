@@ -644,14 +644,20 @@ sudo ./target/release/northnarrow-agent \
 # 4. Confirm Combat / ENGAGED.
 ./target/release/nn-admin status --socket /tmp/nn-test/admin.sock
 
-# 5. Unlock.
+# 5. Unlock — a signed `OperationCode::Unlock` payload (lab PR 217), bound
+#    to the agent's install id: `--agent-id-file` defaults to the agent's
+#    default, /etc/northnarrow/agent_id. Exit 0 only once the agent read
+#    both tables back clear; exit 9 when the teardown did not take (the
+#    posture stays COMBAT, the reason is printed).
 ./target/release/nn-admin unlock \
   --key /tmp/nn-test/admin.priv \
   --socket /tmp/nn-test/admin.sock
 
-# 6. Confirm Alerted / clear. Chain should now be gone.
+# 6. Confirm Alerted / clear (IPv4 clear, IPv6 clear). Chain should now be
+#    gone.
 ./target/release/nn-admin status --socket /tmp/nn-test/admin.sock
 sudo iptables -S NORTHNARROW_COMBAT  # → "No chain by that name"
+sudo ip6tables -S NORTHNARROW_COMBAT # → "No chain by that name"
 
 # Cleanup: the task_kill hook refuses every signal from a root shell,
 # SIGQUIT included. Stop it with a signed shutdown: two keys carrying the

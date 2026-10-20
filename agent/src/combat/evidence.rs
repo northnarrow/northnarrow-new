@@ -25,6 +25,18 @@
 //! is counted in the next entry written (`transitions_lost`). The counts
 //! are in `nn-admin status` ([`EvidenceCounts`]).
 //!
+//! ## Lab PR 217: the outcome of each action, signed after it ran
+//!
+//! A stage transition is recorded BEFORE its enforcement; what the
+//! enforcement did was only logged — a kill that left an offender running,
+//! an isolation whose iptables did not take, read as a stage reached.
+//! [`LadderEvidence::record_outcome`] writes an [`ActionOutcome`] after the
+//! action, under op `"combat_outcome"`: per offender for NEUTRALIZE (killed,
+//! not contained and why, its binary quarantined or why not), per IP family
+//! for ISOLATE (read back from the tables), with `result` `success` only
+//! when the action achieved its purpose. It shares the stage transitions'
+//! retry queue and order.
+//!
 //! ## Phase 3 (next): multi-sink dossier
 //!
 //! [`LadderEvidence`] is the seam the Panopticon work plugs into: a
@@ -62,6 +74,25 @@ pub struct StageTransition {
     /// Human-readable reason (deadline, jump-ahead, neutralization
     /// failure, …).
     pub reason: String,
+}
+
+/// Lab PR 217 (capability C17): what a COMBAT enforcement action did — the
+/// payload of a signed `combat_outcome` entry, written after the action.
+#[derive(Debug, Clone)]
+pub struct ActionOutcome {
+    /// The stage whose action this is.
+    pub stage: CombatStage,
+    /// `kill+quarantine`, `isolate`.
+    pub action: &'static str,
+    /// The posture trigger that drove COMBAT (context).
+    pub trigger: Option<TriggerType>,
+    /// The action achieved its purpose: every offender contained, every
+    /// family isolated.
+    pub success: bool,
+    /// One line: what happened.
+    pub summary: String,
+    /// Per offender / per family detail, for the entry's `extra`.
+    pub detail: serde_json::Value,
 }
 
 /// External audit CMB-027: why a stage transition is not in the signed
@@ -107,6 +138,10 @@ pub struct EvidenceCounts {
 pub trait LadderEvidence: Send + Sync {
     fn record_stage(&self, transition: &StageTransition) -> Result<(), Unrecorded>;
 
+    /// Lab PR 217: the outcome of an action, after it ran. Same contract as
+    /// [`Self::record_stage`]: never blocks the ladder.
+    fn record_outcome(&self, outcome: &ActionOutcome) -> Result<(), Unrecorded>;
+
     /// Write the transitions that wait for the audit log, if any (the
     /// stand-down: an episode's last ones would otherwise wait for the
     /// next episode).
@@ -124,9 +159,26 @@ pub trait LadderEvidence: Send + Sync {
 /// ERROR line stays in the journal) and counted.
 pub const RETRY_QUEUE_DEPTH: usize = 64;
 
-/// A transition the audit log refused, with the time it happened.
+/// What waits for the audit log: a stage transition, or (lab PR 217) an
+/// action's outcome.
+#[derive(Clone)]
+enum Record {
+    Stage(StageTransition),
+    Outcome(ActionOutcome),
+}
+
+impl Record {
+    fn label(&self) -> String {
+        match self {
+            Record::Stage(t) => format!("stage {}", t.to.as_str()),
+            Record::Outcome(o) => format!("outcome of {} ({})", o.stage.as_str(), o.action),
+        }
+    }
+}
+
+/// A record the audit log refused, with the time it happened.
 struct Waiting {
-    transition: StageTransition,
+    record: Record,
     occurred_at: String,
 }
 
@@ -166,7 +218,7 @@ impl AuditEvidence {
     fn drain(&self, backlog: &mut Backlog, log: &mut AuditLog) -> Result<(), String> {
         let mut written = 0usize;
         while let Some(w) = backlog.waiting.front() {
-            let draft = draft(&w.transition, Some(&w.occurred_at), backlog.lost_unsaid);
+            let draft = draft(&w.record, Some(&w.occurred_at), backlog.lost_unsaid);
             if let Err(e) = log.append(draft) {
                 if written > 0 {
                     self.after_drain(written, backlog);
@@ -195,14 +247,14 @@ impl AuditEvidence {
     }
 
     /// Queue `t` behind the waiting ones; a full queue drops its oldest.
-    fn enqueue(&self, backlog: &mut Backlog, t: &StageTransition, occurred_at: String) -> usize {
+    fn enqueue(&self, backlog: &mut Backlog, t: &Record, occurred_at: String) -> usize {
         if backlog.waiting.len() >= RETRY_QUEUE_DEPTH {
             if let Some(old) = backlog.waiting.pop_front() {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 backlog.lost_unsaid += 1;
                 warn!(
                     target: "combat.audit",
-                    to = %old.transition.to,
+                    what = %old.record.label(),
                     occurred_at = %old.occurred_at,
                     depth = RETRY_QUEUE_DEPTH,
                     "COMBAT evidence retry queue full — the oldest waiting transition is dropped \
@@ -211,7 +263,7 @@ impl AuditEvidence {
             }
         }
         backlog.waiting.push_back(Waiting {
-            transition: t.clone(),
+            record: t.clone(),
             occurred_at,
         });
         self.pending
@@ -220,16 +272,39 @@ impl AuditEvidence {
     }
 }
 
-/// The audit entry of `t`; `deferred` is the time it happened when it is
+/// The audit entry of `r`; `deferred` is the time it happened when it is
 /// written late.
-fn draft(t: &StageTransition, deferred: Option<&str>, lost: u64) -> AuditEntryDraft {
-    let mut extra = serde_json::json!({
-        "from": t.from.map(|s| s.as_str()),
-        "to": t.to.as_str(),
-        "trigger": t.trigger.map(|x| x.as_str()),
-        "offenders": t.offenders,
-        "reason": t.reason,
-    });
+fn draft(r: &Record, deferred: Option<&str>, lost: u64) -> AuditEntryDraft {
+    let (op, mut extra, result) = match r {
+        Record::Stage(t) => (
+            "combat_stage",
+            serde_json::json!({
+                "from": t.from.map(|s| s.as_str()),
+                "to": t.to.as_str(),
+                "trigger": t.trigger.map(|x| x.as_str()),
+                "offenders": t.offenders,
+                "reason": t.reason,
+            }),
+            "success".to_string(),
+        ),
+        // Lab PR 217: `result` says whether the action achieved its
+        // purpose — a failed kill or isolation is a `failure` row.
+        Record::Outcome(o) => (
+            "combat_outcome",
+            serde_json::json!({
+                "stage": o.stage.as_str(),
+                "action": o.action,
+                "trigger": o.trigger.map(|x| x.as_str()),
+                "summary": o.summary,
+                "detail": o.detail,
+            }),
+            if o.success {
+                "success".to_string()
+            } else {
+                format!("failure: {}", o.summary)
+            },
+        ),
+    };
     if let Some(at) = deferred {
         extra["deferred"] = serde_json::Value::Bool(true);
         extra["occurred_at"] = serde_json::Value::String(at.to_string());
@@ -238,7 +313,7 @@ fn draft(t: &StageTransition, deferred: Option<&str>, lost: u64) -> AuditEntryDr
         extra["transitions_lost"] = serde_json::Value::from(lost);
     }
     AuditEntryDraft {
-        op: "combat_stage".to_string(),
+        op: op.to_string(),
         extra,
         // Agent-internal transition: not an admin-signed op, but
         // signed by the agent's audit key like every other entry.
@@ -246,11 +321,39 @@ fn draft(t: &StageTransition, deferred: Option<&str>, lost: u64) -> AuditEntryDr
         // human admin key fingerprint.
         key_fp: "agent-self".to_string(),
         cosigner_fps: Vec::new(),
-        result: "success".to_string(),
+        result,
         client_pid: std::process::id(),
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
         client_exe: None,
+    }
+}
+
+impl AuditEvidence {
+    /// Append `r`, after what waits; queued when the log refuses it.
+    fn append(&self, r: Record) -> Result<(), Unrecorded> {
+        let Some(log) = &self.audit_log else {
+            self.unrecorded.fetch_add(1, Ordering::Relaxed);
+            return Err(Unrecorded::NoAuditLog);
+        };
+        let occurred_at = crate::audit::format_ts(chrono::Utc::now());
+        let mut backlog = self.backlog.lock();
+        let mut guard = log.lock();
+        // In order: what waits goes first; while it cannot, this one waits
+        // behind it.
+        let res = match self.drain(&mut backlog, &mut guard) {
+            Err(e) => Err(e),
+            Ok(()) => guard
+                .append(draft(&r, None, backlog.lost_unsaid))
+                .map(|_| backlog.lost_unsaid = 0)
+                .map_err(|e| format!("{e:#}")),
+        };
+        drop(guard);
+        res.map_err(|error| {
+            self.unrecorded.fetch_add(1, Ordering::Relaxed);
+            let waiting = self.enqueue(&mut backlog, &r, occurred_at);
+            Unrecorded::Queued { error, waiting }
+        })
     }
 }
 
@@ -265,29 +368,19 @@ impl LadderEvidence for AuditEvidence {
             reason = %t.reason,
             "COMBAT stage transition (signed audit entry)"
         );
+        self.append(Record::Stage(t.clone()))
+    }
 
-        let Some(log) = &self.audit_log else {
-            self.unrecorded.fetch_add(1, Ordering::Relaxed);
-            return Err(Unrecorded::NoAuditLog);
-        };
-        let occurred_at = crate::audit::format_ts(chrono::Utc::now());
-        let mut backlog = self.backlog.lock();
-        let mut guard = log.lock();
-        // In order: what waits goes first; while it cannot, this one waits
-        // behind it.
-        let res = match self.drain(&mut backlog, &mut guard) {
-            Err(e) => Err(e),
-            Ok(()) => guard
-                .append(draft(t, None, backlog.lost_unsaid))
-                .map(|_| backlog.lost_unsaid = 0)
-                .map_err(|e| format!("{e:#}")),
-        };
-        drop(guard);
-        res.map_err(|error| {
-            self.unrecorded.fetch_add(1, Ordering::Relaxed);
-            let waiting = self.enqueue(&mut backlog, t, occurred_at);
-            Unrecorded::Queued { error, waiting }
-        })
+    fn record_outcome(&self, o: &ActionOutcome) -> Result<(), Unrecorded> {
+        info!(
+            target: "combat.audit",
+            stage = %o.stage,
+            action = o.action,
+            success = o.success,
+            summary = %common::log_escape::Escaped(&o.summary),
+            "COMBAT action outcome (signed audit entry)"
+        );
+        self.append(Record::Outcome(o.clone()))
     }
 
     fn retry_pending(&self) {
@@ -493,6 +586,49 @@ mod tests {
         assert_eq!(rows[0].extra["reason"], "t2", "t0 and t1 dropped");
         assert_eq!(rows[0].extra["transitions_lost"], 2);
         assert!(rows[1].extra.get("transitions_lost").is_none());
+    }
+
+    /// Lab PR 217 (capability C17): an action's outcome is a signed row of
+    /// its own, `failure` when the action did not achieve its purpose, and
+    /// it waits behind the transitions the log refused, in order.
+    #[test]
+    fn an_action_outcome_is_signed_with_its_result() {
+        let lab = Lab::new();
+        let ev = AuditEvidence::new(Some(Arc::clone(&lab.log)));
+        let outcome = |success: bool| ActionOutcome {
+            stage: CombatStage::Isolate,
+            action: "isolate",
+            trigger: None,
+            success,
+            summary: if success {
+                "attempt 1 of 3: IPv4: isolated; IPv6: isolated".to_string()
+            } else {
+                "attempt 1 of 3: IPv4: FAILED (iptables-restore exited 4)".to_string()
+            },
+            detail: serde_json::json!({ "attempt": 1 }),
+        };
+        ev.record_stage(&transition(CombatStage::Isolate, "t1"))
+            .unwrap();
+        lab.fail();
+        assert!(ev.record_outcome(&outcome(false)).is_err());
+        lab.recover();
+        ev.record_outcome(&outcome(true)).unwrap();
+        let all = rows(&lab.path);
+        crate::audit::verify_chain(&all, &lab.pubkey).expect("the chain verifies");
+        let outcomes: Vec<_> = all.iter().filter(|e| e.op == "combat_outcome").collect();
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes[0]
+                .result
+                .starts_with("failure: attempt 1 of 3: IPv4: FAILED"),
+            "{}",
+            outcomes[0].result
+        );
+        assert_eq!(outcomes[0].extra["deferred"], true);
+        assert_eq!(outcomes[0].extra["stage"], "ISOLATE");
+        assert_eq!(outcomes[0].extra["detail"]["attempt"], 1);
+        assert_eq!(outcomes[1].result, "success");
+        assert_eq!(outcomes[1].key_fp, "agent-self");
     }
 
     /// Without an audit log every transition is unrecorded — and said so.

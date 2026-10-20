@@ -44,7 +44,7 @@ use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
 use northnarrow_agent::posture::{
     resolve_verified_watchdog_pid, AuthSessionTracker, CombatEntryHook, CombatReleaseHook,
-    ExemptPids, PostureMachine, WatchdogResolution,
+    ExemptPids, PostureMachine, ReleaseResult, ReleaseScope, WatchdogResolution,
 };
 use northnarrow_agent::response::{Executor, ExecutorConfig};
 use northnarrow_agent::sensors::SensorMultiplexer;
@@ -1884,23 +1884,41 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         let auth_tracker = lineage.clone();
         let iso_release = Arc::clone(iso);
         let ladder_for_release = Arc::clone(&ladder_slot);
-        let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
-            // Admin released COMBAT: stand the ladder down (clears the
-            // episode + lifts the surgical per-PID soft-egress blocks),
-            // THEN tear down any full isolation STAGE 3 had engaged.
-            // External audit CMB-012: after every step queued before the
-            // stand-down has run, so an ISOLATE taken just before the
-            // unlock cannot land after the release.
-            if let Some(ladder) = ladder_for_release.get() {
-                ladder.stand_down_and_wait(Instant::now(), LADDER_RELEASE_WAIT);
-            }
-            if let Err(e) = iso_release.release(token) {
-                tracing::error!(
-                    error = %e,
-                    "admin release failed; iptables state may need manual cleanup"
-                );
-            }
-        });
+        let release_hook: CombatReleaseHook = Arc::new(
+            move |token: UnlockToken, scope: ReleaseScope| -> ReleaseResult {
+                // Admin released COMBAT: stand the ladder down (clears the
+                // episode + lifts the surgical per-PID soft-egress blocks),
+                // THEN tear down any full isolation STAGE 3 had engaged.
+                // External audit CMB-012: after every step queued before the
+                // stand-down has run, so an ISOLATE taken just before the
+                // unlock cannot land after the release. Outside COMBAT no
+                // ladder episode is touched, and the teardown is still run
+                // and read back: no isolation is legitimate there (the
+                // ladder isolates only in a locked COMBAT, which never
+                // decays), and a stale chain the boot teardown could not
+                // remove is lifted — the answer is the tables, not a flag.
+                if scope == ReleaseScope::Combat {
+                    if let Some(ladder) = ladder_for_release.get() {
+                        ladder.stand_down_and_wait(Instant::now(), LADDER_RELEASE_WAIT);
+                    }
+                }
+                // Lab PR 217 (NN-AUD-243 residue): the outcome is the tables
+                // read back, and it goes back to the operator — a failed
+                // teardown keeps the posture in COMBAT and answers a failure.
+                let report = iso_release.release(token);
+                if report.complete() {
+                    Ok(report.summary("cleared (read back)"))
+                } else {
+                    tracing::error!(
+                        outcome = %report.summary("cleared (read back)"),
+                        "admin release: the COMBAT isolation is NOT released — the posture stays \
+                         COMBAT; retry the signed unlock, or remove the chain by hand (see \
+                         docs/operator) and unlock"
+                    );
+                    Err(report.summary("cleared (read back)"))
+                }
+            },
+        );
         // Exempt the NorthNarrow stack's own PIDs from posture
         // triggers. The agent's own PID is fixed here; the watchdog's
         // verified PID is filled in by the refresh task spawned below.
@@ -1960,13 +1978,18 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         // so STAGE 3 degrades to a loud warning instead of an iptables
         // DROP — but INVESTIGATE + NEUTRALIZE still run.
         let ladder_for_release = Arc::clone(&ladder_slot);
-        let release_hook: CombatReleaseHook = Arc::new(move |token: UnlockToken| {
-            if let Some(ladder) = ladder_for_release.get() {
-                ladder.stand_down(Instant::now());
-            }
-            // No isolator to release in this build; consume the token.
-            let _ = token;
-        });
+        let release_hook: CombatReleaseHook = Arc::new(
+            move |token: UnlockToken, scope: ReleaseScope| -> ReleaseResult {
+                if scope == ReleaseScope::Combat {
+                    if let Some(ladder) = ladder_for_release.get() {
+                        ladder.stand_down(Instant::now());
+                    }
+                }
+                // No isolator to release in this build; consume the token.
+                let _ = token;
+                Ok("no network isolator in this build: nothing to release".to_string())
+            },
+        );
         // Same defaults as `new_with_hooks`, but on the shared lineage
         // cache so the FIM package-manager carve-out is fed here too.
         PostureMachine::new_with_hooks_and_exempt_and_auth(

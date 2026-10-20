@@ -27,7 +27,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, info};
@@ -299,19 +298,18 @@ pub(crate) fn trusted_nft() -> std::io::Result<crate::trusted_bin::SystemBin> {
 }
 
 /// Pipe `ruleset` to `nft -f -` and propagate its stderr on failure.
+/// Lab PR 217 (capability C18): waited for at most
+/// [`crate::bounded_cmd::EXTERNAL_CMD_TIMEOUT`] — a hung `nft` fails the
+/// block (`ETIMEDOUT`) instead of holding the ladder's worker.
 pub(crate) fn nft_apply(ruleset: &str) -> std::io::Result<()> {
-    let mut child = trusted_nft()?
-        .command()
-        .arg("-f")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(ruleset.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
+    let mut cmd = trusted_nft()?.command();
+    cmd.arg("-f").arg("-");
+    let out = crate::bounded_cmd::run_bounded(
+        cmd,
+        Some(ruleset.as_bytes()),
+        crate::bounded_cmd::EXTERNAL_CMD_TIMEOUT,
+        "nft -f -",
+    )?;
     if !out.status.success() {
         return Err(std::io::Error::other(format!(
             "nft -f failed (exit {:?}): {}",
