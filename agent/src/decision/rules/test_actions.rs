@@ -13,7 +13,7 @@
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
-use crate::decision::{rules::build_verdict, Rule};
+use crate::decision::{attack::AttackRef, rules::build_verdict, Rule};
 
 pub struct R901TestBlockOutbound;
 pub struct R902TestNetworkIsolation;
@@ -36,6 +36,10 @@ impl Rule for R901TestBlockOutbound {
     }
     fn category(&self) -> &'static str {
         "demo_tappa5"
+    }
+    /// A demo trigger, evidence of no ATT&CK technique.
+    fn attack(&self) -> &'static [AttackRef] {
+        &[]
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         if !matches_suffix(event, ".block-outbound") {
@@ -61,6 +65,10 @@ impl Rule for R902TestNetworkIsolation {
     fn category(&self) -> &'static str {
         "demo_tappa5"
     }
+    /// A demo trigger, evidence of no ATT&CK technique.
+    fn attack(&self) -> &'static [AttackRef] {
+        &[]
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         if !matches_suffix(event, ".isolate-network") {
             return None;
@@ -85,6 +93,10 @@ impl Rule for R903TestQuarantine {
     fn category(&self) -> &'static str {
         "demo_tappa5"
     }
+    /// A demo trigger, evidence of no ATT&CK technique.
+    fn attack(&self) -> &'static [AttackRef] {
+        &[]
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         if !matches_suffix(event, ".quarantine-me") {
             return None;
@@ -108,6 +120,10 @@ impl Rule for R904TestThrottle {
     }
     fn category(&self) -> &'static str {
         "demo_tappa5"
+    }
+    /// A demo trigger, evidence of no ATT&CK technique.
+    fn attack(&self) -> &'static [AttackRef] {
+        &[]
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         if !matches_suffix(event, ".throttle-me") {

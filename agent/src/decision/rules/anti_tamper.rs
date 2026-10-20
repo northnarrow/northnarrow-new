@@ -15,6 +15,7 @@
 
 use common::{Event, FsProtectOperation, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 pub struct NnLAt001AntiTamperDenial;
@@ -28,6 +29,15 @@ impl Rule for NnLAt001AntiTamperDenial {
     }
     fn category(&self) -> &'static str {
         "anti_tamper"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::DefenseImpairment, "T1685"),
+            AttackRef::new(Tactic::Stealth, "T1055.008"),
+            AttackRef::new(Tactic::Stealth, "T1055.009"),
+            AttackRef::new(Tactic::CredentialAccess, "T1552.004"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::FsProtectDenial {

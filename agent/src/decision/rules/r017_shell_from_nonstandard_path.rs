@@ -33,6 +33,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Interactive shell comms (design §7.1).
@@ -79,6 +80,10 @@ impl Rule for R017ShellFromNonstandardPath {
     }
     fn category(&self) -> &'static str {
         "execution"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Execution, "T1059.004")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

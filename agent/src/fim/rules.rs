@@ -47,6 +47,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::{TrustedInstallerOverride, OWN_SYSTEMD_UNITS};
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::Rule;
 use crate::posture::lineage::AuthSessionTracker;
 
@@ -249,6 +250,13 @@ impl Rule for NnLFim001SystemBinaryModified {
     fn category(&self) -> &'static str {
         "fim_persistence"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Persistence, "T1554"),
+            AttackRef::new(Tactic::PrivilegeEscalation, "T1548.001"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
         // Wave 2 (TST-004): a permission or ownership change that hands out
@@ -311,6 +319,10 @@ impl Rule for NnLFim002NewSuidBinary {
     fn category(&self) -> &'static str {
         "fim_evasion"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::PrivilegeEscalation, "T1548.001")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
         if !matches!(fe.op, FimOp::Created | FimOp::Linked) {
@@ -359,6 +371,15 @@ impl Rule for NnLFim003SensitiveConfigModified {
     fn category(&self) -> &'static str {
         "fim_credential_access"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Persistence, "T1098"),
+            AttackRef::new(Tactic::Persistence, "T1136.001"),
+            AttackRef::new(Tactic::Persistence, "T1556.003"),
+            AttackRef::new(Tactic::PrivilegeEscalation, "T1548.003"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
         // Wave 2 (TST-004): `chmod o+r /etc/shadow` exposes every hash
@@ -405,6 +426,10 @@ impl Rule for NnLFim004AuthorizedKeysModified {
     }
     fn category(&self) -> &'static str {
         "fim_persistence"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Persistence, "T1098.004")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -547,6 +572,10 @@ impl Rule for NnLFim005LogTruncated {
     fn category(&self) -> &'static str {
         "fim_defense_evasion"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::DefenseImpairment, "T1685.006")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
         if fe.op != FimOp::Modified {
@@ -600,6 +629,10 @@ impl Rule for NnLFim006OperatorBinaryModified {
     }
     fn category(&self) -> &'static str {
         "fim_supply_chain"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Persistence, "T1554")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -808,6 +841,10 @@ impl Rule for NnLFim007CronDropInCreated {
     fn category(&self) -> &'static str {
         "fim_persistence"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Persistence, "T1053.003")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
         // Either Created (new drop-in file) OR Modified
@@ -855,6 +892,13 @@ impl Rule for NnLFim008KernelModuleModified {
     }
     fn category(&self) -> &'static str {
         "fim_rootkit"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Persistence, "T1547.006"),
+            AttackRef::new(Tactic::Stealth, "T1014"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -916,6 +960,10 @@ impl Rule for NnLFim009SystemdUnitDropped {
     }
     fn category(&self) -> &'static str {
         "fim_persistence"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Persistence, "T1543.002")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -1035,6 +1083,10 @@ impl Rule for NnLFim010RansomwareExtensionRename {
     }
     fn category(&self) -> &'static str {
         "fim_impact_ransomware"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Impact, "T1486")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -1158,6 +1210,10 @@ impl Rule for NnLFim011AwsCredsRead {
     fn category(&self) -> &'static str {
         "fim_credential_access"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1552.001")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_cred_read(
             self,
@@ -1182,6 +1238,10 @@ impl Rule for NnLFim012AzureCredsRead {
     }
     fn category(&self) -> &'static str {
         "fim_credential_access"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1552.001")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_cred_read(
@@ -1208,6 +1268,10 @@ impl Rule for NnLFim013GcpCredsRead {
     }
     fn category(&self) -> &'static str {
         "fim_credential_access"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1552.001")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_cred_read(
@@ -1236,6 +1300,10 @@ impl Rule for NnLFim014DockerCredsRead {
     }
     fn category(&self) -> &'static str {
         "fim_credential_access"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1552.001")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_cred_read(
@@ -1587,6 +1655,10 @@ impl Rule for NnLFim015BrowserCredsAccessed {
     fn category(&self) -> &'static str {
         "fim_credential_access"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1555.003")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_cred_store_access(
             self,
@@ -1615,6 +1687,10 @@ impl Rule for NnLFim016PasswordManagerDbAccessed {
     fn category(&self) -> &'static str {
         "fim_credential_access"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1555.005")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_cred_store_access(
             self,
@@ -1641,6 +1717,10 @@ impl Rule for NnLFim017GpgKeyringAccessed {
     }
     fn category(&self) -> &'static str {
         "fim_credential_access"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1552.004")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_cred_store_access(
@@ -1669,6 +1749,10 @@ impl Rule for NnLFim018LastlogTampered {
     fn category(&self) -> &'static str {
         "fim_defense_evasion"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::DefenseImpairment, "T1685.006")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_login_record_tamper(
             self,
@@ -1695,6 +1779,10 @@ impl Rule for NnLFim019WtmpBtmpTampered {
     }
     fn category(&self) -> &'static str {
         "fim_defense_evasion"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::DefenseImpairment, "T1685.006")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         evaluate_login_record_tamper(
@@ -1723,6 +1811,10 @@ impl Rule for NnLFim020ShellHistoryCleared {
     }
     fn category(&self) -> &'static str {
         "fim_defense_evasion"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Stealth, "T1070.003")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -1760,6 +1852,13 @@ impl Rule for NnLFim021PamModuleModified {
     }
     fn category(&self) -> &'static str {
         "fim_persistence"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Persistence, "T1556.003"),
+            AttackRef::new(Tactic::CredentialAccess, "T1556.003"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -1804,6 +1903,13 @@ impl Rule for NnLFim022LdSoPreloadModified {
     fn category(&self) -> &'static str {
         "fim_persistence"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Execution, "T1574.006"),
+            AttackRef::new(Tactic::Stealth, "T1574.006"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
         if !matches!(fe.op, FimOp::Created | FimOp::Modified) {
@@ -1840,6 +1946,10 @@ impl Rule for NnLFim023SystemdTimerCreated {
     }
     fn category(&self) -> &'static str {
         "fim_persistence"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Persistence, "T1053.006")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -1930,6 +2040,10 @@ impl Rule for NnLFim024AntiTamperHoneypotModified {
     }
     fn category(&self) -> &'static str {
         "fim_anti_tamper"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::DefenseImpairment, "T1685")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
@@ -2068,6 +2182,10 @@ impl Rule for NnLFim025FileCapabilityGranted {
     fn category(&self) -> &'static str {
         "fim_privilege_escalation"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::PrivilegeEscalation, "T1548")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let fe = as_fim(event)?;
         if fe.op != FimOp::CapabilitySet {
@@ -2185,6 +2303,9 @@ impl Rule for PackageManaged {
     fn category(&self) -> &'static str {
         self.inner.category()
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let verdict = self.inner.evaluate(event)?;
         if verdict.action == ResponseAction::Log {
@@ -2259,6 +2380,9 @@ impl Rule for InteractiveAdmin {
     fn category(&self) -> &'static str {
         self.inner.category()
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let verdict = self.inner.evaluate(event)?;
         if verdict.action == ResponseAction::Log {
@@ -2332,6 +2456,9 @@ impl Rule for OwnClient {
     }
     fn category(&self) -> &'static str {
         self.inner.category()
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let verdict = self.inner.evaluate(event)?;
@@ -2409,6 +2536,9 @@ impl Rule for AccountTool {
     }
     fn category(&self) -> &'static str {
         self.inner.category()
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        self.inner.attack()
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let verdict = self.inner.evaluate(event)?;
@@ -4807,6 +4937,9 @@ mod tests {
             }
             fn category(&self) -> &'static str {
                 "test"
+            }
+            fn attack(&self) -> &'static [AttackRef] {
+                &[]
             }
             fn evaluate(&self, event: &Event) -> Option<Verdict> {
                 let fe = as_fim(event)?;

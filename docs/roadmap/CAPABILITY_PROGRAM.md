@@ -394,3 +394,43 @@ only in the table below, in the same PR as the evidence.
     the RPM key file are still not attested (C-50 / G-08); a package
     upgrade that fails its health check is reported, not restored.
   - Lab: On Ubuntu 24.04, the upgrade from `main` (origin/main c29527a) to this tree through `nn-lab.sh upgrade-check` (install.sh --source-tree --upgrade over the running units): the health check of both units passed, "UPGRADE complete", the transaction directory empty, no upgrade_rolled_back row, the install manifest naming northnarrow-scan and the running version, northnarrow-watchdog-failed.service staged with the other two, the --source-tree override in the system log, the audit chain verified. A broken new agent (a copy of the tree whose agent exits 1) rolled back by itself on Debian 12 and 24.04: exit 3 after 104–110 s, "UPGRADE FAILED — health_check: northnarrow-watchdog.service is activating; northnarrow-agent.service is failed", the previous files back byte for byte (55–56 snapshot lines: bytes, mode, owner, mtime), both units active with every deny hook (17/17 on 6.1, 19/19 on 6.8), one upgrade_rolled_back row signed by the restored agent (stage health_check, failed_version northnarrow-agent 0.0.0-broken). A broken new watchdog beside a healthy new agent first ended in exit 4 on 24.04 — the new agent had set chattr +i on /var/lib/northnarrow again, and three control-surface files could not be put back ("Operation not permitted"); fixed in this lot (the restore lifts the flag as the install does, rollback.sh receives STATE_DIR) and run again: exit 3, "lifting it for the restore", 31 files restored, the previous units healthy (19/19), the row signed. Before the fix the failure line named only the first unit not active (the watchdog the broken agent left activating); it now names every one. install.sh with no flag in a source tree was refused ("REFUSED — no MANIFEST.sha256") with nothing changed and the agent untouched. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).
+- **Lab PR 221 — structured ATT&CK mapping, a coverage manifest and the
+  rule catalogue.** C16 (structured ATT&CK mapping); groundwork for C15
+  (a declarative rule will carry the same typed references) and C29 (the
+  coverage a third party would check is generated, not written).
+  - What was wrong: ATT&CK lived only in prose (doc comments, reasoning
+    text; many of the 76 engine rule ids named no technique), the rule-path
+    detection record's `mitre` was always empty, and several of the ids in
+    prose are revoked in ATT&CK 20.0, the version pinned here (the T1562
+    Impair Defenses family, replaced by T1685 and its siblings under the
+    Defense Impairment tactic, TA0112; TA0005 is now Stealth), or did not
+    describe what the rule sees (R016's T1622).
+  - What changed: `Rule::attack()` (required, no default) returns typed
+    references — a `Tactic` enum and technique ids whose shape is checked
+    when the constant compiles — of ATT&CK Enterprise 20.0 (2026-10-13).
+    All 79 rules (lab PR 219's two included) are mapped: 58 techniques and sub-techniques under 12
+    tactics. A rule detection record carries the ids in `mitre` and
+    `mitre_version` `"20.0"` (an additive field: older lines keep their
+    bytes and verify). The ids in use are pinned with their v20 names,
+    tactics and status in `docs/detection/attack-enterprise-20.0.tsv`,
+    extracted from MITRE's STIX bundle by commit and sha256 (`cargo xtask
+    attack-coverage --pin-ids --mirror`), with the Terms of Use and the
+    designation (`NOTICES.md`). Tests fail on a rule without a mapping, an
+    id outside the list, a revoked or deprecated id, a technique filed
+    under a tactic it does not have, a catalogue entry missing or citing a
+    test that does not exist, Critical severities that disagree with the V2
+    sub-gate, and committed documents that differ from the generated ones.
+    `cargo xtask attack-coverage` renders `docs/detection/ATTACK_COVERAGE.md`
+    (technique → rules → sensor and ATT&CK data components → validation
+    status, with the V2 rows and their v20 ids), an ATT&CK Navigator 4.5
+    layer and `docs/detection/RULE_CATALOGUE.md`.
+  - Level unchanged (1): the evidence so far is in-process (the mapping and
+    catalogue tests, the record and chain tests, the engine's attribution
+    test). Owed on a guest: a few rules fired, their records' `mitre` and
+    `mitre_version` read back through `nn-admin detections`. Open: the
+    partial fits the catalogue's ATT&CK notes name (CANARY-002 the weakest:
+    no technique names running a decoy), the reasoning ids kept as they
+    were (FIM-024's is pinned by a test), and the frozen
+    `v2-techniques.tsv`, which keeps its pre-v19 ids (the coverage document
+    reads them in v20).
+  - Lab: On Ubuntu 24.04: a record written by `main` before this lot (R001_ExecFromTmp, `"mitre":{"tactic":[],"technique":[]}`, no mitre_version) was byte-identical after the upgrade, and `nn-admin chain verify` found nothing broken since the run began (its one break, a manifest entry written on 20/10 with another key, predates the run and the agent had signed it then as tail_unverified). R001, R014 (an `at` job), NN-L-FIM-007 (a file in /etc/cron.d from a unit) and NN-L-NET-004 (a long name under example.com) were recorded with the typed ids RULE_CATALOGUE.md gives them, in order, mitre_version 20.0 — R001 {TA0002 / T1059}, R014 {TA0003, TA0002 / T1053.002}, NN-L-FIM-007 {TA0003 / T1053.003}, NN-L-NET-004 {TA0011 / T1071.004} — and no rule record written by the upgraded agent had an empty mitre (the 105 written between the mark and its first start were the base agent's); tamper-check's 94 NN-L-AT-001 records carried {TA0112, TA0005, TA0006 / T1685, T1055.008, T1055.009, T1552.004}. Across every step of the lab, on the four guests, the records of 44 rules passed the typed check and none failed (exec quarantine, exec policy and security-tool records within their catalogue entry). The operator read-back (`nn-admin detections --key`) was not run: the lab key holds no telemetry-read role. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).

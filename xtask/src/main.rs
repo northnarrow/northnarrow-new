@@ -14,6 +14,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+mod attack;
 mod btf_check;
 mod gate_report;
 
@@ -127,6 +128,28 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Lab PR 221 (capability C16): render docs/detection/ATTACK_COVERAGE.md,
+    /// RULE_CATALOGUE.md and attack-navigator-layer.json from the rules'
+    /// ATT&CK mapping and the catalogue table (agent library, through the
+    /// `attack_coverage` example). With `--pin-ids`, first rebuild the
+    /// pinned ATT&CK id list (docs/detection/attack-enterprise-20.0.tsv)
+    /// and its licence from a local copy of MITRE's STIX bundle, checked
+    /// against its pinned SHA-256.
+    AttackCoverage {
+        /// Write nothing; fail when a committed document differs from the
+        /// rendered one.
+        #[arg(long, conflicts_with = "pin_ids")]
+        check: bool,
+        /// Rebuild the pinned id list first, keeping the ids it lists and
+        /// adding these (comma-separated, e.g. `T1053.003,DC0039`).
+        #[arg(long, num_args = 0.., value_delimiter = ',', requires = "mirror")]
+        pin_ids: Option<Vec<String>>,
+        /// With `--pin-ids`: the directory holding the pinned
+        /// `enterprise-attack-20.0.json` and `LICENSE.txt` of
+        /// mitre-attack/attack-stix-data (the example prints their URLs).
+        #[arg(long, requires = "pin_ids")]
+        mirror: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -197,6 +220,19 @@ fn run(cli: Cli) -> Result<()> {
                 Some(path) => write_creating_dirs(&path, &md)?,
                 None => print!("{md}"),
             }
+        }
+        Cmd::AttackCoverage {
+            check,
+            pin_ids,
+            mirror,
+        } => {
+            let root = repo_root()?;
+            let req = attack::Request {
+                check,
+                pin_ids: pin_ids.as_deref(),
+                mirror: mirror.as_deref(),
+            };
+            attack::run(&root, &req, locked)?;
         }
     }
     Ok(())

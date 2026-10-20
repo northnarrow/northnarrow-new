@@ -91,6 +91,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::correlation::{
     retention_ns, ChainAge, CorrelationStore, EgressNote, PrecursorKind, ProcKey,
     CORRELATION_WINDOW_NS,
@@ -257,6 +258,15 @@ impl Rule for NnLChain001CredReadThenEgress {
     fn category(&self) -> &'static str {
         "chain_exfiltration"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::CredentialAccess, "T1555.003"),
+            AttackRef::new(Tactic::CredentialAccess, "T1555.005"),
+            AttackRef::new(Tactic::CredentialAccess, "T1552.004"),
+            AttackRef::new(Tactic::Exfiltration, "T1041"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
             // Precursor: record + fall through (FIM-015/016/017 fires).
@@ -362,6 +372,13 @@ impl Rule for NnLChain002TmpExecThenEgress {
     fn category(&self) -> &'static str {
         "chain_c2"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Execution, "T1059"),
+            AttackRef::new(Tactic::CommandAndControl, "T1571"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
             // Every spawn feeds the shared ancestry tree (D4) — this is
@@ -445,6 +462,10 @@ impl Rule for NnLChain003CanaryThenEgress {
     }
     fn category(&self) -> &'static str {
         "chain_exfiltration"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Exfiltration, "T1041")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
@@ -531,6 +552,15 @@ impl Rule for NnLChain004CrossPidCredExfil {
     fn category(&self) -> &'static str {
         "chain_exfiltration"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::CredentialAccess, "T1555.003"),
+            AttackRef::new(Tactic::CredentialAccess, "T1555.005"),
+            AttackRef::new(Tactic::CredentialAccess, "T1552.004"),
+            AttackRef::new(Tactic::Exfiltration, "T1041"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
             return None;
@@ -592,6 +622,13 @@ impl Rule for NnLChain005CrossPidTmpC2 {
     fn category(&self) -> &'static str {
         "chain_c2"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Execution, "T1059"),
+            AttackRef::new(Tactic::CommandAndControl, "T1571"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
             return None;
@@ -641,6 +678,10 @@ impl Rule for NnLChain006CrossPidCanaryExfil {
     }
     fn category(&self) -> &'static str {
         "chain_exfiltration"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Exfiltration, "T1041")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
@@ -705,6 +746,16 @@ impl Rule for NnLChain007TmpCredExfilSequence {
     }
     fn category(&self) -> &'static str {
         "chain_exfiltration"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Execution, "T1059"),
+            AttackRef::new(Tactic::CredentialAccess, "T1555.003"),
+            AttackRef::new(Tactic::CredentialAccess, "T1555.005"),
+            AttackRef::new(Tactic::CredentialAccess, "T1552.004"),
+            AttackRef::new(Tactic::Exfiltration, "T1041"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
@@ -819,6 +870,13 @@ impl Rule for NnLChain008CrossPidPrivEscExfil {
     }
     fn category(&self) -> &'static str {
         "chain_exfiltration"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::PrivilegeEscalation, "T1548"),
+            AttackRef::new(Tactic::Exfiltration, "T1041"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {

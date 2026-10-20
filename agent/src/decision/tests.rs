@@ -1002,3 +1002,20 @@ fn a_staging_listener_on_8080_is_recorded() {
         .evaluate(&listen("/usr/sbin/lighttpd", "lighttpd"))
         .is_none());
 }
+
+/// Lab PR 221: the engine hands back the ATT&CK references of the rule
+/// that fired, for its detection record — R001's, for an exec from /tmp —
+/// and nothing when no rule fires.
+#[test]
+fn the_engine_returns_the_attack_references_of_the_rule_that_fired() {
+    let engine = RuleEngine::with_default_rules();
+    let (v, refs) = engine
+        .evaluate_with_attack(&spawn("payload", "/tmp/payload"))
+        .expect("R001 fires");
+    assert_eq!(v.rule_id, "R001_ExecFromTmp");
+    assert_eq!(refs, R001ExecFromTmp.attack());
+    assert!(!refs.is_empty());
+    assert!(engine
+        .evaluate_with_attack(&spawn("ls", "/usr/bin/ls"))
+        .is_none());
+}

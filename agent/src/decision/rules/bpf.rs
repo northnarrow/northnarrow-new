@@ -29,6 +29,7 @@ use common::wire::{bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRI
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Programs that legitimately drive BPF on a server, matched on the
@@ -81,6 +82,10 @@ impl Rule for NnLBpf001BpfProgramLoaded {
     fn category(&self) -> &'static str {
         "defense_evasion"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Stealth, "T1014")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::BpfSyscall {
             pid,
@@ -106,7 +111,7 @@ impl Rule for NnLBpf001BpfProgramLoaded {
         };
         let reasoning = format!(
             "`{comm}` {what}: a kernel-resident component outside the known tooling — the \
-             rootkit / sensor-blinding shape (T1014, T1562). Alert only; add the comm to \
+             rootkit / sensor-blinding shape (T1014). Alert only; add the comm to \
              process-comm-allowlist.local if this is your observability stack."
         );
         Some(judgement.apply(
@@ -141,6 +146,10 @@ impl Rule for NnLBpf002BpfForeignHandleOrDetach {
     }
     fn category(&self) -> &'static str {
         "anti_tamper"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::DefenseImpairment, "T1685")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::BpfSyscall {

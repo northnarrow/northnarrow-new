@@ -5,6 +5,7 @@
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 const WEBROOTS: &[&str] = &[
@@ -26,6 +27,10 @@ impl Rule for R010BinaryInWebroot {
     }
     fn category(&self) -> &'static str {
         "execution"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Persistence, "T1505.003")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

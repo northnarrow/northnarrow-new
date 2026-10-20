@@ -18,7 +18,9 @@
 
 use common::{Event, Verdict};
 
+pub mod attack;
 pub mod bounded;
+pub mod catalogue;
 pub mod correlation;
 pub mod engine;
 pub mod rules;
@@ -41,6 +43,14 @@ pub trait Rule: Send + Sync {
     /// `"privilege_escalation"`, etc. Used for grouping in the UI and
     /// for future correlation passes.
     fn category(&self) -> &'static str;
+
+    /// Lab PR 221 (capability C16): the MITRE ATT&CK tactics and
+    /// techniques the rule's detection is evidence of, as data — ids of
+    /// ATT&CK Enterprise [`attack::ATTACK_VERSION`]. A detection record
+    /// carries them in its `mitre` field. Every shipped rule declares at
+    /// least one (`decision/catalogue` tests); a rule wrapping another
+    /// returns the inner rule's.
+    fn attack(&self) -> &'static [attack::AttackRef];
 
     /// Returns `Some(verdict)` if the rule fires, `None` otherwise.
     /// Implementations must keep this hot-path cheap — no allocations

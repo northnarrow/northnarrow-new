@@ -28,7 +28,10 @@ point would be a single point of failure. The bait turns that
 reconnaissance step into a high-confidence detonation: the moment the
 attacker tampers with one, NorthNarrow reacts.
 
-MITRE ATT&CK: **T1562.001** — Impair Defenses: Disable or Modify Tools.
+MITRE ATT&CK (Enterprise 20.0): **T1685** — Disable or Modify Tools, tactic
+Defense Impairment (TA0112); NN-L-FIM-024's detection records carry it in
+`mitre`. Until ATT&CK v19 this was T1562.001 (Impair Defenses: Disable or
+Modify Tools), the id the rule's reasoning text still names.
 
 Builds on the Tappa-7 anti-tamper layer and the Tappa-9.5 deception
 layer.

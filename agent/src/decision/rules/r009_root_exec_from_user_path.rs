@@ -2,6 +2,7 @@
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 use crate::posture::AuthSessionTracker;
 
@@ -57,6 +58,13 @@ impl Rule for R009RootExecFromUserPath {
     }
     fn category(&self) -> &'static str {
         "privilege_escalation"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::PrivilegeEscalation, "T1548"),
+            AttackRef::new(Tactic::PrivilegeEscalation, "T1068"),
+        ];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

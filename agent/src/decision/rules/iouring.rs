@@ -29,6 +29,7 @@ use common::wire::{
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 const FILE_CLASSES: u32 = IOURING_CLASS_FILE_OPEN | IOURING_CLASS_FILE_RW;
@@ -71,6 +72,10 @@ impl Rule for NnLIou001IoUringRingCreated {
     fn category(&self) -> &'static str {
         "defense_evasion"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Execution, "T1106")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::IoUring {
             created: true,
@@ -90,7 +95,7 @@ impl Rule for NnLIou001IoUringRingCreated {
         let reasoning = format!(
             "io_uring ring set up by `{comm}` (sq_entries={count}, flags={classes:#x}): the process \
              can now perform file and network I/O without the syscalls the other sensors hook \
-             (T1562 defense evasion shape). Logged as baseline; NN-L-IOU-002 scores the usage."
+             (a sensor-evasion shape). Logged as baseline; NN-L-IOU-002 scores the usage."
         );
         Some(judgement.apply(
             build_verdict(self, event, ResponseAction::Log, Severity::Low, &reasoning),
@@ -118,6 +123,10 @@ impl Rule for NnLIou002IoUringFileAndNetwork {
     }
     fn category(&self) -> &'static str {
         "defense_evasion"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Execution, "T1106")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::IoUring {
@@ -150,7 +159,7 @@ impl Rule for NnLIou002IoUringFileAndNetwork {
         let reasoning = format!(
             "`{comm}` drives both file I/O and network I/O through io_uring rings ({}){}: \
              reads, writes and connections that never pass through openat/connect/sendto — \
-             the blind-channel exfiltration/implant shape (RingReaper class, T1562). \
+             the blind-channel exfiltration/implant shape (RingReaper class). \
              Alert only: legitimate io_uring servers are exempted by executable.",
             names.join(", "),
             if *sq_thread {

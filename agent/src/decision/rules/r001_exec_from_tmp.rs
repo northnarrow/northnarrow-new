@@ -7,6 +7,7 @@
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Filenames inside `/tmp/` that are NOT considered suspicious.
@@ -26,6 +27,10 @@ impl Rule for R001ExecFromTmp {
     }
     fn category(&self) -> &'static str {
         "execution"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Execution, "T1059")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

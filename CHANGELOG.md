@@ -6,6 +6,37 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Every rule declares its MITRE ATT&CK tactics and techniques as data
+  (lab PR 221, capability C16): `Rule::attack()` returns typed
+  references (a `Tactic` enum, technique ids checked for shape when they
+  compile) of ATT&CK Enterprise 20.0. All 79 rules the agent can record
+  (lab PR 219's two included) are mapped — 58 techniques and
+  sub-techniques under 12 tactics — and a rule detection record now
+  carries their ids in `mitre` (it was always empty
+  on the rule path) and the version in a new `mitre_version` field
+  (`"20.0"`). Records written before keep their bytes and still verify:
+  the field is absent on them and on ADE records. The ids are pinned in
+  `docs/detection/attack-enterprise-20.0.tsv`, extracted from MITRE's STIX
+  bundle by commit and sha256 with the ATT&CK Terms of Use
+  (`LICENSES/MITRE_ATTACK_ToU-20.0.md`, `NOTICES.md`); a test fails on a
+  rule without a mapping, an id not in the list, an id revoked or
+  deprecated in 20.0 (the T1562 family and T1070.002, which the pinned 20.0
+  data replace with T1685, its sub-techniques and T1686) or a technique filed under a
+  tactic it does not have. Ids the code named in prose and v20 revoked or contradicts were
+  replaced in the mapping: NN-L-NET-021 (T1562.006 → T1685), NN-L-FIM-024
+  (T1562.001 → T1685), NN-L-FIM-018/019 (T1070 → T1685.006), NN-L-FIM-021
+  (T1543/T1556 → T1556.003), NN-L-IOU-001/002 (T1562 → T1106), NN-L-BPF-001
+  (T1562 dropped, T1014 kept), R016 (T1622 → T1055.008); the revoked or
+  wrong ids are gone from the reasoning text of NET-021, IOU-001/002,
+  BPF-001 and R016 (FIM-024's stays: a test pins it). `cargo xtask
+  attack-coverage` renders
+  `docs/detection/ATTACK_COVERAGE.md` (technique → rules → sensor and
+  ATT&CK data components → validation status, the V2 rows), an ATT&CK
+  Navigator layer (`attack-navigator-layer.json`, layer format 4.5) and
+  `docs/detection/RULE_CATALOGUE.md` (each rule's severities, responses,
+  ATT&CK, what it observes, known false positives, how to test); a test
+  holds the committed files to the generated ones. The anti-tamper
+  honeypot guide names T1685.
 - Exploit post-condition guard (lab PR 219, experimental; capabilities C12,
   C14). Whatever bug a local kernel exploit uses, it ends with a task that
   holds what it did not hold: root, capabilities, another user namespace,

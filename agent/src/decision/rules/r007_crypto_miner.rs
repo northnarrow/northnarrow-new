@@ -28,6 +28,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Miner program names, lower case. All fit in `TASK_COMM_LEN`.
@@ -74,6 +75,10 @@ impl Rule for R007CryptoMiner {
     }
     fn category(&self) -> &'static str {
         "resource_abuse"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Impact, "T1496.001")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

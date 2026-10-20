@@ -11,6 +11,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// One-shot scheduling tool comms (design §7.1).
@@ -35,6 +36,13 @@ impl Rule for R014AtBatchScheduling {
     }
     fn category(&self) -> &'static str {
         "persistence"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Persistence, "T1053.002"),
+            AttackRef::new(Tactic::Execution, "T1053.002"),
+        ];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

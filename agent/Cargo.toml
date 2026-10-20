@@ -24,6 +24,13 @@ path = "src/lib.rs"
 name = "posture_demo"
 required-features = ["posture-demo"]
 
+# Lab PR 221: the generator of docs/detection/ behind `cargo xtask
+# attack-coverage`; its tests (the pinned-id extraction) run with the
+# workspace's.
+[[example]]
+name = "attack_coverage"
+test = true
+
 [features]
 default = []
 # Enables R901..=R904, four hardcoded demo rules whose only job is to

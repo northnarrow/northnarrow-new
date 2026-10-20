@@ -23,6 +23,7 @@
 
 use common::{EpgKind, Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Credential post-condition (T1068).
@@ -254,6 +255,10 @@ impl Rule for NnLEpg001CredentialPostcondition {
     fn category(&self) -> &'static str {
         "privilege_escalation"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::PrivilegeEscalation, "T1068")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
             Event::ExploitPostcondition { kind, .. } if kind.is_credential() => {
@@ -273,6 +278,10 @@ impl Rule for NnLEpg002NamespaceRootPostcondition {
     }
     fn category(&self) -> &'static str {
         "escape_to_host"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::PrivilegeEscalation, "T1611")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         match event {
