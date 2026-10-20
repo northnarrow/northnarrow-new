@@ -61,6 +61,60 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, response honesty and status (Low CMB-018
+  NN-AUD-310, CMB-020 NN-AUD-311, CMB-027 NN-AUD-318; lab PR 193).
+  CMB-020: the detect-only branches of `block_outbound_for_pid`,
+  `throttle_pid` and `quarantine_handle` (which `quarantine_process_binary`
+  calls) answered `Blocked`, `Throttled` with the three limits, and
+  `Quarantined { vault_id: "dry-run" }` — a containment that never
+  happened, counted as done by whoever read it. They answer
+  `WouldExecute`, as the dispatcher and `Executor::quarantine_handle`
+  already did before them (which is why no agent path reached them: a
+  library-level fix, nothing changes on a host). CMB-027, the triage's fix
+  and not the audit's fail-closed (holding ISOLATE until the audit log can
+  be written would let whoever breaks the log — fills its filesystem —
+  prevent the containment): `LadderEvidence::record_stage` returns
+  `Result<(), Unrecorded>` and the ladder checks it at its five call sites.
+  A stage transition the audit log refuses is logged whole at ERROR
+  (`COMBAT stage transition NOT in the signed audit log — enforcement
+  proceeds`, with from, to, trigger, offenders and reason), and the ladder
+  carries on; `AuditEvidence` keeps it in a bounded queue (64) and writes
+  it, in order and before any newer transition, at the next append or at
+  the stand-down, as a `combat_stage` row with `deferred: true` and
+  `occurred_at` (when it happened); a transition dropped from the full
+  queue is counted, and the next row written says `transitions_lost: N`.
+  Without an audit log (`NN_AUDIT_ALLOW_UNWRITABLE=1`) every transition
+  is counted as unrecorded (it was silent). CMB-018: `nn-admin status`
+  shows `response mode` — `enforcing`, or `DETECT-ONLY (<source>)` with
+  `--detect-only` or the variable's `NAME=value`, as the signed
+  `agent_boot` entry records it — and `combat evidence`: complete, or the
+  transitions not written when they happened since boot, how many are
+  queued, how many were dropped; `--json` gains `detect_only`,
+  `detect_only_source`, `combat_evidence_unrecorded`,
+  `combat_evidence_pending`, `combat_evidence_dropped`. `StatusResponse`
+  gains these five fields at its end (`#[serde(default)]`); no
+  `AdminMessage` variant is added, the discriminants are unchanged. Found
+  while adding them: postcard carries no field count, so `serde(default)`
+  never fills a trailing field an older agent did not send — the "`None`
+  from an agent older than the field" notes of `StatusResponse` (since
+  Tappa 10.8) hold only for an older `nn-admin` reading a newer agent; the
+  struct's doc says so and two tests pin both directions.
+  **Regressions / changes:** `nn-admin status` prints two more lines and
+  its JSON five more keys; an `nn-admin` newer than the agent cannot
+  decode the agent's `status` reply (a decode error, as with every field
+  added to it since Tappa 10.8), and neither can a watchdog newer than
+  the agent, whose ping decodes the same reply and then counts as failed —
+  upgrade the binaries together; an `nn-admin` or a watchdog older than
+  the agent reads the reply without the new fields;
+  a COMBAT audit append failure is an ERROR line naming the whole
+  transition (a WARN `failed to append COMBAT stage transition to audit
+  log` before): update journal searches; `combat_stage` rows can carry
+  `deferred`, `occurred_at` and `transitions_lost` (inside `extra`: an
+  older `nn-admin` verifies them); library API: `record_stage` returns a
+  `Result`, `LadderEvidence` gains `retry_pending` and `counts`,
+  `CombatLadder` gains `evidence_counts`, `ResponseAdminState` gains
+  `detect_only_source` and `combat_evidence`, and the three module
+  functions return `WouldExecute` in detect-only.
 - External audit, Wave 3, signed-request verification (Low ASK-017
   NN-AUD-243, AUT-001 NN-AUD-244, AUT-005 NN-AUD-245, AUT-006 NN-AUD-246;
   lab PR 192). AUT-001: the live verify of a signed request compared only

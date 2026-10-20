@@ -17,7 +17,7 @@ use common::posture_types::TriggerType;
 use common::Event;
 
 use super::actuator::{CombatActuator, NeutralizeOutcome, SoftBlock};
-use super::evidence::{LadderEvidence, StageTransition};
+use super::evidence::{AuditEvidence, LadderEvidence, StageTransition, Unrecorded};
 use super::ProcRef;
 use super::{
     CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason,
@@ -113,9 +113,10 @@ struct MockEvidence {
 }
 
 impl LadderEvidence for MockEvidence {
-    fn record_stage(&self, t: &StageTransition) {
+    fn record_stage(&self, t: &StageTransition) -> Result<(), Unrecorded> {
         let from = t.from.map(|s| s.as_str()).unwrap_or("-");
         self.rec.push(format!("audit:{}->{}", from, t.to.as_str()));
+        Ok(())
     }
 }
 
@@ -157,10 +158,11 @@ impl ProtectedProcs for StubProtected {
 struct ReasonEvidence(Arc<Mutex<Vec<(String, String)>>>);
 
 impl LadderEvidence for ReasonEvidence {
-    fn record_stage(&self, t: &StageTransition) {
+    fn record_stage(&self, t: &StageTransition) -> Result<(), Unrecorded> {
         self.0
             .lock()
             .push((t.to.as_str().to_string(), t.reason.clone()));
+        Ok(())
     }
 }
 
@@ -1114,4 +1116,81 @@ fn stand_down_releases_only_what_this_episode_blocked() {
         .filter(|e| e.starts_with("soft_clear:"))
         .collect();
     assert_eq!(clears, vec!["soft_clear:9".to_string()]);
+}
+
+/// External audit CMB-027: the audit log refuses the transitions (here its
+/// file is a directory for a while, as an I/O error or a full filesystem
+/// would) — the ladder still drives every stage, kill and isolation
+/// included, the counts say what the signed log lacks, and once the log
+/// takes appends again the stand-down writes the waiting transitions, each
+/// once, in order, marked `deferred` with the time it happened.
+#[test]
+fn a_failing_audit_log_never_holds_the_ladder() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let log_path = dir.path().join("audit.log");
+    let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+    let pubkey = key.verifying_key();
+    let audit = Arc::new(Mutex::new(
+        crate::audit::AuditLog::open(&log_path, key, [0u8; 16]).unwrap(),
+    ));
+    let rec = Recorder::new();
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Uncontainable {
+                reason: "respawns".to_string(),
+            },
+            failing_blocks: Vec::new(),
+        }),
+        Box::new(AuditEvidence::new(Some(Arc::clone(&audit)))),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    // Break the log: appends fail (EISDIR) even for root.
+    let away = dir.path().join("audit.log.away");
+    if log_path.exists() {
+        std::fs::rename(&log_path, &away).unwrap();
+    }
+    std::fs::create_dir(&log_path).unwrap();
+
+    let t0 = Instant::now();
+    l.engage(Some(1234), Some(TriggerType::PersistenceMechanism), t0);
+    l.tick(t0 + LadderConfig::default().investigate_window + Duration::from_secs(1));
+    assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
+    let log = rec.log();
+    for step in ["soft_block:1234", "neutralize:[1234]", "isolate"] {
+        assert!(log.iter().any(|e| e == step), "{step} not driven: {log:?}");
+    }
+    let c = l.evidence_counts();
+    assert_eq!((c.unrecorded, c.pending, c.dropped), (3, 3, 0), "{c:?}");
+
+    // The log is back; the stand-down writes what waited.
+    std::fs::remove_dir(&log_path).unwrap();
+    if away.exists() {
+        std::fs::rename(&away, &log_path).unwrap();
+    }
+    l.stand_down(t0 + Duration::from_secs(120));
+    let c = l.evidence_counts();
+    assert_eq!((c.unrecorded, c.pending, c.dropped), (3, 0, 0), "{c:?}");
+    let all: Vec<crate::audit::AuditEntry> = std::fs::read_to_string(&log_path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    crate::audit::verify_chain(&all, &pubkey).expect("the chain verifies");
+    let stages: Vec<_> = all.iter().filter(|e| e.op == "combat_stage").collect();
+    let to: Vec<_> = stages
+        .iter()
+        .map(|e| e.extra["to"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        to,
+        ["INVESTIGATE", "NEUTRALIZE", "ISOLATE"],
+        "once each, in order"
+    );
+    for e in &stages {
+        assert_eq!(e.extra["deferred"], true, "{e:?}");
+        let at = e.extra["occurred_at"].as_str().unwrap();
+        assert!(at <= e.ts.as_str(), "happened {at}, written {}", e.ts);
+    }
 }

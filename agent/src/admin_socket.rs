@@ -267,6 +267,13 @@ pub struct ResponseAdminState {
     pub config: crate::response::ExecutorConfig,
     /// The ladder's stage while a COMBAT episode is open, else `None`.
     pub combat_stage: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// External audit CMB-018: what set detect-only (`--detect-only` or
+    /// `NAME=value`), as the signed `agent_boot` entry records it; `None`
+    /// when enforcing. `config.dry_run` is the mode itself.
+    pub detect_only_source: Option<String>,
+    /// External audit CMB-027: the ladder's transitions the signed audit
+    /// log did not get when they happened.
+    pub combat_evidence: Arc<dyn Fn() -> crate::combat::EvidenceCounts + Send + Sync>,
 }
 
 /// External audit NN-AUD-082 — the files the read verbs serve, from the
@@ -1908,27 +1915,41 @@ fn dispatch(
             AdminMessage::UnlockResult(result)
         }
 
-        AdminMessage::Status(_) => AdminMessage::StatusResponse(StatusResponse {
-            posture: posture.current_kind(),
-            network_isolation_engaged: isolator.is_engaged(),
-            last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
-            ringbuf_drops_total: Some(crate::sensors::ring_drops::total()),
-            ringbuf_drops: Some(crate::sensors::ring_drops::snapshot_nonzero()),
-            // External audit CMB-016: where the COMBAT ladder stands.
-            combat_stage: response_state.and_then(|s| (s.combat_stage)()),
-            combat_locked: Some(posture.is_combat_locked()),
-            // External audit SNS-008: malformed records the pumps rejected.
-            ringbuf_rejected_total: Some(crate::sensors::reject::total()),
-            ringbuf_rejected: Some(crate::sensors::reject::snapshot()),
-            // External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
-            netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
-            netflow_pending_evicted_total: Some(crate::net::flow_tracker::pending_evictions_total()),
-            net_inactive_rules: Some(crate::net::blocklist::inactive_net_rules()),
-            // Lab PR 164: the kernel's connect→close socket map.
-            flow_sock_pending: crate::sensors::flow_sock::snapshot().map(|o| o.pending),
-            flow_sock_capacity: crate::sensors::flow_sock::snapshot().map(|o| o.capacity),
-            flow_sock_forgotten_min: crate::sensors::flow_sock::snapshot().map(|o| o.forgotten_min),
-        }),
+        AdminMessage::Status(_) => {
+            let evidence = response_state.map(|s| (s.combat_evidence)());
+            AdminMessage::StatusResponse(StatusResponse {
+                posture: posture.current_kind(),
+                network_isolation_engaged: isolator.is_engaged(),
+                last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
+                ringbuf_drops_total: Some(crate::sensors::ring_drops::total()),
+                ringbuf_drops: Some(crate::sensors::ring_drops::snapshot_nonzero()),
+                // External audit CMB-016: where the COMBAT ladder stands.
+                combat_stage: response_state.and_then(|s| (s.combat_stage)()),
+                combat_locked: Some(posture.is_combat_locked()),
+                // External audit SNS-008: malformed records the pumps rejected.
+                ringbuf_rejected_total: Some(crate::sensors::reject::total()),
+                ringbuf_rejected: Some(crate::sensors::reject::snapshot()),
+                // External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
+                netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
+                netflow_pending_evicted_total: Some(
+                    crate::net::flow_tracker::pending_evictions_total(),
+                ),
+                net_inactive_rules: Some(crate::net::blocklist::inactive_net_rules()),
+                // Lab PR 164: the kernel's connect→close socket map.
+                flow_sock_pending: crate::sensors::flow_sock::snapshot().map(|o| o.pending),
+                flow_sock_capacity: crate::sensors::flow_sock::snapshot().map(|o| o.capacity),
+                flow_sock_forgotten_min: crate::sensors::flow_sock::snapshot()
+                    .map(|o| o.forgotten_min),
+                // External audit CMB-018: an enforcing agent and a detect-only
+                // one no longer look the same.
+                detect_only: response_state.map(|s| s.config.dry_run),
+                detect_only_source: response_state.and_then(|s| s.detect_only_source.clone()),
+                // External audit CMB-027: what the signed audit log lacks.
+                combat_evidence_unrecorded: evidence.map(|c| c.unrecorded),
+                combat_evidence_pending: evidence.map(|c| c.pending),
+                combat_evidence_dropped: evidence.map(|c| c.dropped),
+            })
+        }
 
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
             req,
@@ -5583,6 +5604,11 @@ mod tests {
             flow_sock_pending: None,
             flow_sock_capacity: None,
             flow_sock_forgotten_min: None,
+            detect_only: None,
+            detect_only_source: None,
+            combat_evidence_unrecorded: None,
+            combat_evidence_pending: None,
+            combat_evidence_dropped: None,
         });
         emit_audit_for(
             &status_req,
@@ -6419,6 +6445,8 @@ mod tests {
                 ..crate::response::ExecutorConfig::for_test(dir.path())
             },
             combat_stage: Arc::new(|| Some("NEUTRALIZE".to_string())),
+            detect_only_source: None,
+            combat_evidence: Arc::new(crate::combat::EvidenceCounts::default),
         }
     }
 
@@ -6480,6 +6508,70 @@ mod tests {
             payload,
             signatures,
         }
+    }
+
+    /// External audit CMB-018 / CMB-027 (lab PR 193): `status` tells an
+    /// enforcing agent from a detect-only one, names what set detect-only,
+    /// and says what the signed audit log lacks of the COMBAT ladder.
+    #[test]
+    fn status_reports_detect_only_and_combat_evidence() {
+        use common::wire::admin_protocol::StatusRequest;
+        let signing = SigningKey::generate(&mut OsRng);
+        let dir = TempDir::new().unwrap();
+        let (auth, _d) = build_auth_with_roles(&signing, "audit-read", [0x1c; 16]);
+        let auth = ConnAuth::new(&auth);
+        let isolator = NetworkIsolator::new(rules_path()).unwrap();
+        let posture = PostureMachine::new();
+        let marker = dir.path().join("marker");
+        let status = |state: Option<&ResponseAdminState>| match dispatch(
+            AdminMessage::Status(StatusRequest {}),
+            &auth,
+            &posture,
+            &isolator,
+            &marker,
+            None,
+            None,
+            None,
+            None,
+            None,
+            state,
+            &AdminReadPaths::default(),
+            &fake_client(),
+            &mut Vec::new(),
+        ) {
+            AdminMessage::StatusResponse(r) => r,
+            other => panic!("{other:?}"),
+        };
+
+        let mut detect = response_state(&dir);
+        detect.config.dry_run = true;
+        detect.detect_only_source = Some("NN_DETECT_ONLY=1".to_string());
+        detect.combat_evidence = Arc::new(|| crate::combat::EvidenceCounts {
+            unrecorded: 3,
+            pending: 1,
+            dropped: 0,
+        });
+        let r = status(Some(&detect));
+        assert_eq!(r.detect_only, Some(true));
+        assert_eq!(r.detect_only_source.as_deref(), Some("NN_DETECT_ONLY=1"));
+        assert_eq!(
+            (
+                r.combat_evidence_unrecorded,
+                r.combat_evidence_pending,
+                r.combat_evidence_dropped
+            ),
+            (Some(3), Some(1), Some(0))
+        );
+
+        let r = status(Some(&response_state(&dir)));
+        assert_eq!(r.detect_only, Some(false));
+        assert_eq!(r.detect_only_source, None);
+        assert_eq!(r.combat_evidence_unrecorded, Some(0));
+
+        // No response state (no executor): not known, not "enforcing".
+        let r = status(None);
+        assert_eq!(r.detect_only, None);
+        assert_eq!(r.combat_evidence_unrecorded, None);
     }
 
     /// External audit CMB-016: `response status` is read-only, for

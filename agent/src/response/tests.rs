@@ -71,6 +71,46 @@ fn detect_only_suppresses_every_action_with_would_execute() {
     }
 }
 
+/// External audit CMB-020: the modules' own detect-only branches — reached
+/// by a caller that skips the dispatcher's gate — report `WouldExecute`
+/// and touch nothing. They used to answer `Blocked`, `Throttled` with the
+/// three limits, and `Quarantined { vault_id: "dry-run" }`: a containment
+/// that never happened, counted as done by whoever read the outcome.
+#[test]
+fn module_dry_run_branches_return_would_execute() {
+    use std::collections::HashSet;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let cfg = super::ExecutorConfig::for_test(tmp.path());
+    assert!(cfg.dry_run);
+    let payload = tmp.path().join("payload");
+    std::fs::write(&payload, b"bad bytes").unwrap();
+    let handle = super::quarantine::ExeHandle::open(&payload).unwrap();
+    let none = HashSet::new();
+    let pid = 4242;
+    let table: [(&str, ExecutionOutcome); 3] = [
+        (
+            "block_outbound_for_pid",
+            super::block_outbound::block_outbound_for_pid(pid, &none, &cfg),
+        ),
+        (
+            "throttle_pid",
+            super::throttle::throttle_pid(pid, &none, &cfg),
+        ),
+        (
+            "quarantine_handle",
+            super::quarantine::quarantine_handle(&handle, pid, &cfg),
+        ),
+    ];
+    for (what, out) in table {
+        assert_eq!(out, ExecutionOutcome::WouldExecute { pid }, "{what}");
+    }
+    assert!(!cfg.blocked_cgroup_dir().exists());
+    assert!(!cfg.throttled_cgroup_dir().exists());
+    assert!(payload.exists(), "the file is where it was");
+    assert!(!cfg.quarantine_dir.exists(), "nothing in the vault");
+}
+
 /// External audit CMB-006: host-wide isolation is the COMBAT ladder's; the
 /// executor refuses it from any other source, enforcing or not, and
 /// touches nothing.

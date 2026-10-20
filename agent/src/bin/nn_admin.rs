@@ -2262,6 +2262,45 @@ fn flow_sock_line(out: &StatusOutcome) -> String {
     }
 }
 
+/// External audit CMB-018 (lab PR 193): whether the agent enforces, and
+/// what set detect-only. The signed `agent_boot` entry records the same.
+fn response_mode_line(out: &StatusOutcome, tty: bool) -> String {
+    match (out.detect_only, &out.detect_only_source) {
+        (Some(true), source) => format!(
+            "response mode     : {} ({}) — no response action and no COMBAT isolation touch the system",
+            colorize("DETECT-ONLY", "33", tty),
+            source.as_deref().unwrap_or("source not reported")
+        ),
+        (Some(false), _) => format!("response mode     : {}", colorize("enforcing", "32", tty)),
+        (None, _) => "response mode     : (not reported: the agent has no response executor)".to_string(),
+    }
+}
+
+/// External audit CMB-027 (lab PR 193): the COMBAT stage transitions the
+/// signed audit log did not get when they happened.
+fn combat_evidence_line(out: &StatusOutcome, tty: bool) -> String {
+    match (
+        out.combat_evidence_unrecorded,
+        out.combat_evidence_pending,
+        out.combat_evidence_dropped,
+    ) {
+        (None, _, _) => {
+            "combat evidence   : (not reported: the agent has no COMBAT ladder)".to_string()
+        }
+        (Some(0), _, _) => format!(
+            "combat evidence   : {} — every COMBAT stage transition is in the signed audit log",
+            colorize("complete", "32", tty)
+        ),
+        (Some(n), pending, dropped) => format!(
+            "combat evidence   : {} stage transition(s) not written to the signed audit log when they \
+             happened — {} queued for a late write, {} dropped (never written); see the agent ERRORs",
+            colorize(&n.to_string(), "31", tty),
+            pending.unwrap_or(0),
+            dropped.unwrap_or(0)
+        ),
+    }
+}
+
 fn print_status(out: &StatusOutcome, json: bool) {
     if json {
         // Hand-rolled JSON to avoid a serde_json dep at the binary
@@ -2276,8 +2315,9 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .iter()
             .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
             .collect();
+        let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             match out.last_admin_action_secs_ago {
@@ -2302,6 +2342,13 @@ fn print_status(out: &StatusOutcome, json: bool) {
                 None => "null".to_string(),
             },
             rejected.join(","),
+            // External audit CMB-018 / CMB-027 (lab PR 193).
+            out.detect_only
+                .map_or_else(|| "null".to_string(), |d| d.to_string()),
+            serde_json::to_string(&out.detect_only_source).unwrap_or_else(|_| "null".to_string()),
+            opt(out.combat_evidence_unrecorded),
+            opt(out.combat_evidence_pending),
+            opt(out.combat_evidence_dropped),
         );
         return;
     }
@@ -2328,6 +2375,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
         (None, Some(false)) => println!("combat stage      : (no episode)"),
         (None, None) => println!("combat stage      : (agent predates the field)"),
     }
+    println!("{}", response_mode_line(out, tty));
+    println!("{}", combat_evidence_line(out, tty));
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
         None => println!("last admin action : (none since agent start)"),
@@ -3674,7 +3723,7 @@ mod roles_csv_tests {
 
 #[cfg(test)]
 mod flow_sock_line_tests {
-    use super::flow_sock_line;
+    use super::{combat_evidence_line, flow_sock_line, response_mode_line};
     use northnarrow_agent::admin_cli::StatusOutcome;
 
     fn outcome(
@@ -3698,6 +3747,11 @@ mod flow_sock_line_tests {
             flow_sock_pending: pending,
             flow_sock_capacity: capacity,
             flow_sock_forgotten_min: forgotten,
+            detect_only: None,
+            detect_only_source: None,
+            combat_evidence_unrecorded: None,
+            combat_evidence_pending: None,
+            combat_evidence_dropped: None,
         }
     }
 
@@ -3717,5 +3771,43 @@ mod flow_sock_line_tests {
         );
         let l = flow_sock_line(&outcome(None, None, None));
         assert!(l.contains("unknown"), "{l}");
+    }
+
+    /// External audit CMB-018 (lab PR 193): `nn-admin status` tells an
+    /// enforcing agent from a detect-only one and names the source.
+    #[test]
+    fn status_shows_the_response_mode_and_its_source() {
+        let mut o = outcome(None, None, None);
+        o.detect_only = Some(true);
+        o.detect_only_source = Some("NN_DETECT_ONLY=1".to_string());
+        let l = response_mode_line(&o, false);
+        assert!(
+            l.contains("DETECT-ONLY (NN_DETECT_ONLY=1)") && l.contains("no response action"),
+            "{l}"
+        );
+        o.detect_only = Some(false);
+        o.detect_only_source = None;
+        assert!(response_mode_line(&o, false).ends_with(": enforcing"));
+        o.detect_only = None;
+        assert!(response_mode_line(&o, false).contains("not reported"));
+    }
+
+    /// External audit CMB-027 (lab PR 193): what the signed audit log lacks.
+    #[test]
+    fn status_shows_the_unrecorded_combat_transitions() {
+        let mut o = outcome(None, None, None);
+        assert!(combat_evidence_line(&o, false).contains("not reported"));
+        o.combat_evidence_unrecorded = Some(0);
+        o.combat_evidence_pending = Some(0);
+        o.combat_evidence_dropped = Some(0);
+        assert!(combat_evidence_line(&o, false).contains("complete"));
+        o.combat_evidence_unrecorded = Some(3);
+        o.combat_evidence_pending = Some(1);
+        let l = combat_evidence_line(&o, false);
+        assert!(
+            l.contains("3 stage transition(s)")
+                && l.contains("1 queued for a late write, 0 dropped"),
+            "{l}"
+        );
     }
 }

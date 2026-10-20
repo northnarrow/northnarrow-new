@@ -92,9 +92,11 @@ pub fn block_outbound_for_pid(
         };
     }
 
+    // External audit CMB-020: detect-only touches nothing and says so —
+    // `Blocked` here was a containment that never happened.
     if cfg.dry_run {
         info!(pid, "dry-run: would block outbound for pid");
-        return ExecutionOutcome::Blocked { pid };
+        return ExecutionOutcome::WouldExecute { pid };
     }
 
     if let Err(e) = ensure_blocked_cgroup(cfg) {
@@ -354,13 +356,18 @@ mod tests {
         assert!(r.contains("drop comment \"NN-BlockOutbound\""));
     }
 
+    /// External audit CMB-020: detect-only reports `WouldExecute`, never
+    /// `Blocked`.
     #[test]
-    fn dry_run_returns_blocked_without_touching_system() {
+    fn dry_run_returns_would_execute_without_touching_system() {
         let tmp = TempDir::new().unwrap();
         let cfg = cfg_for(&tmp);
         let protected: HashSet<u32> = HashSet::new();
         let out = block_outbound_for_pid(1234, &protected, &cfg);
-        assert!(matches!(out, ExecutionOutcome::Blocked { pid: 1234 }));
+        assert!(
+            matches!(out, ExecutionOutcome::WouldExecute { pid: 1234 }),
+            "{out:?}"
+        );
         // No cgroup directories touched in dry-run mode.
         assert!(!cfg.blocked_cgroup_dir().exists());
     }

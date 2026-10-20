@@ -3686,6 +3686,14 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
                         let ladder = Arc::clone(&ladder);
                         Arc::new(move || ladder.current_stage().map(|s| s.as_str().to_string()))
                     },
+                    // External audit CMB-018 / CMB-027 (lab PR 193): `status`
+                    // says detect-only and its source, and what the signed
+                    // audit log lacks of the ladder.
+                    detect_only_source: detect_only_source.clone(),
+                    combat_evidence: {
+                        let ladder = Arc::clone(&ladder);
+                        Arc::new(move || ladder.evidence_counts())
+                    },
                 }));
                 // External audit NN-AUD-077: the loop now outlives a
                 // transient accept error; if it still ends, the admin plane

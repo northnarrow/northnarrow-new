@@ -1157,7 +1157,7 @@ pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
     serde_json::from_slice::<AuditEntry>(line).is_ok_and(|e| verify_entry(0, &e, pubkey).is_ok())
 }
 
-fn format_ts(t: DateTime<Utc>) -> String {
+pub(crate) fn format_ts(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 

@@ -132,6 +132,17 @@ pub struct StatusOutcome {
     pub flow_sock_pending: Option<u64>,
     pub flow_sock_capacity: Option<u64>,
     pub flow_sock_forgotten_min: Option<u64>,
+    /// External audit CMB-018 (lab PR 193): detect-only, and what set it
+    /// (`None`: no response state on the agent).
+    pub detect_only: Option<bool>,
+    pub detect_only_source: Option<String>,
+    /// External audit CMB-027 (lab PR 193): COMBAT stage transitions the
+    /// signed audit log did not get when they happened (since boot), the
+    /// ones still queued for a late write, the ones dropped (`None`: no
+    /// COMBAT ladder on the agent).
+    pub combat_evidence_unrecorded: Option<u64>,
+    pub combat_evidence_pending: Option<u64>,
+    pub combat_evidence_dropped: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -267,6 +278,11 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         flow_sock_pending: resp.flow_sock_pending,
         flow_sock_capacity: resp.flow_sock_capacity,
         flow_sock_forgotten_min: resp.flow_sock_forgotten_min,
+        detect_only: resp.detect_only,
+        detect_only_source: resp.detect_only_source,
+        combat_evidence_unrecorded: resp.combat_evidence_unrecorded,
+        combat_evidence_pending: resp.combat_evidence_pending,
+        combat_evidence_dropped: resp.combat_evidence_dropped,
     })
 }
 
@@ -3326,6 +3342,11 @@ mod tests {
                     flow_sock_pending: Some(70_000),
                     flow_sock_capacity: Some(65_536),
                     flow_sock_forgotten_min: Some(4_464),
+                    detect_only: Some(true),
+                    detect_only_source: Some("--detect-only".to_string()),
+                    combat_evidence_unrecorded: Some(2),
+                    combat_evidence_pending: Some(1),
+                    combat_evidence_dropped: Some(0),
                 }),
             );
         });
@@ -3345,6 +3366,17 @@ mod tests {
             Some(&["NN-L-NET-003 (JA3)".to_string()][..])
         );
         assert_eq!(out.ringbuf_rejected, vec![("open_sensor".to_string(), 2)]);
+        // External audit CMB-018 / CMB-027 (lab PR 193).
+        assert_eq!(out.detect_only, Some(true));
+        assert_eq!(out.detect_only_source.as_deref(), Some("--detect-only"));
+        assert_eq!(
+            (
+                out.combat_evidence_unrecorded,
+                out.combat_evidence_pending,
+                out.combat_evidence_dropped
+            ),
+            (Some(2), Some(1), Some(0))
+        );
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);
         assert_eq!(out.last_admin_action_secs_ago, Some(123));

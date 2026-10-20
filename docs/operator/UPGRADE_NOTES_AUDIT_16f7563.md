@@ -432,6 +432,21 @@ packages open it themselves.
   and `admin_key` (lab PR 96); **`nn-admin status`** shows `ringbuf
   rejected` for malformed open-sensor records (NN-AUD-190 SNS-008, lab PR
   128).
+- **`nn-admin status` says detect-only and what the audit log lacks**
+  (NN-AUD-310 CMB-018, NN-AUD-318 CMB-027, lab PR 193). Two new lines:
+  `response mode` — `enforcing`, or `DETECT-ONLY (NN_DETECT_ONLY=1)` /
+  `(--detect-only)`: no response action and no COMBAT isolation touch the
+  system — and `combat evidence` — `complete`, or the COMBAT stage
+  transitions the signed audit log did not get when they happened (since
+  boot), how many still wait to be written, how many were dropped (§6).
+  `--json` gains `detect_only`, `detect_only_source`,
+  `combat_evidence_unrecorded`, `combat_evidence_pending` and
+  `combat_evidence_dropped`. **Regression:** an `nn-admin` newer than the
+  agent cannot read the agent's `status` (a decode error, as for every
+  field added to it since Tappa 10.8), nor can a watchdog newer than the
+  agent (its ping decodes the same reply, and fails): upgrade the binaries
+  together; an older `nn-admin` or watchdog reads a newer agent's reply
+  without these fields.
 - **A closed pipe** (lab PR 188, a follow-up found in the lab): `nn-admin
   status | head -1` and every other command whose stdout or stderr closes
   early end quietly with exit 141 (128 + SIGPIPE; it aborted with 134 and
@@ -677,6 +692,17 @@ Now **killed, or answered, where they were recorded or missed**:
   on a worker thread; a stand-down waits for a step already under way. A
   soft egress block that did not take effect (no `nft`) is recorded and
   shortens INVESTIGATE to 10 s; a tree past 1,024 processes escalates.
+- **An audit log that refuses a COMBAT transition does not hold the
+  ladder** (NN-AUD-318 CMB-027, lab PR 193). The transition is logged
+  whole at ERROR (`COMBAT stage transition NOT in the signed audit log —
+  enforcement proceeds`; a WARN `failed to append COMBAT stage transition
+  to audit log` before: **update journal searches**), the ladder goes on,
+  and the transition is written late — in order, at the next transition
+  or at the stand-down — as a `combat_stage` row with `deferred: true` and
+  `occurred_at`; 64 wait at most, past that the oldest is dropped and the
+  next row says `transitions_lost`. `nn-admin status` counts them (§3). A
+  reader of `combat_stage` rows takes the time of a `deferred` one from
+  `occurred_at`, not `ts`; an older `nn-admin` verifies these rows.
 - **Containment** (NN-AUD-142 CMB-010, NN-AUD-145 CMB-013, NN-AUD-147
   CMB-015, NN-AUD-149 CMB-017, lab PR 121; NN-AUD-138 CMB-004, NN-AUD-150
   CMB-019, lab PR 120). A released process goes back to its systemd unit,
