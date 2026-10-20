@@ -200,12 +200,22 @@ enum Cmd {
     },
 
     /// Print current posture + network isolation state. Add --json
-    /// to get a machine-readable response for scripting.
+    /// to get a machine-readable response for scripting. Without --key the
+    /// agent answers the posture, the isolation, the last admin action and
+    /// the COMBAT stage and lock (external audit ASK-009); --key signs the
+    /// request and adds the telemetry: ring drops and rejected records, the
+    /// response mode (detect-only), the COMBAT evidence gaps.
     Status {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
         #[arg(long)]
         json: bool,
+        /// A key with `audit-read` or `telemetry-read`: the signed read,
+        /// telemetry included (one audit row per request).
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
     },
 
     /// Host hardening checks (Tappa 10.8): kernel lockdown, module
@@ -1017,13 +1027,19 @@ enum NetCmd {
     /// from the rules by the per-uid pacing, pending connects evicted,
     /// the network rings' drops, the network rules that cannot fire in
     /// this build or are blind (a resolver on DNS over TLS), and the rows
-    /// no DNS or TLS reader sees into (DoT, QUIC). Reads the `status` reply
-    /// (no key).
+    /// no DNS or TLS reader sees into (DoT, QUIC). Signed since external
+    /// audit ASK-009: give --key (without it the agent withholds them).
     Status {
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
         #[arg(long)]
         json: bool,
+        /// A key with `audit-read` or `telemetry-read` (one audit row per
+        /// request).
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
     },
 
     /// Stream the chained netflow log, newest rows first (rotated
@@ -1323,7 +1339,12 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         }
-        Cmd::Status { socket, json } => match run_status(&socket) {
+        Cmd::Status {
+            socket,
+            json,
+            key,
+            agent_id_file,
+        } => match read_status(&socket, key.as_deref(), &agent_id_file, "status") {
             Ok(out) => {
                 print_status(&out, json);
                 if !json {
@@ -1341,10 +1362,7 @@ fn main() -> ExitCode {
                 }
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("status: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(code) => code,
         },
         Cmd::VerifyKeys { path } => match run_verify_keys(&path) {
             Ok(out) => print_verify_keys(&out),
@@ -1692,16 +1710,19 @@ fn main() -> ExitCode {
 
         // ── Tappa 10 N7 — net subcommands ─────────────────────────
         Cmd::Net {
-            sub: NetCmd::Status { socket, json },
-        } => match run_status(&socket) {
+            sub:
+                NetCmd::Status {
+                    socket,
+                    json,
+                    key,
+                    agent_id_file,
+                },
+        } => match read_status(&socket, key.as_deref(), &agent_id_file, "net status") {
             Ok(out) => {
                 print_net_status(&out, json);
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("net status: {e:#}");
-                ExitCode::from(5)
-            }
+            Err(code) => code,
         },
         Cmd::Net {
             sub:
@@ -2177,6 +2198,66 @@ fn exit_from_unlock(outcome: UnlockOutcome) -> ExitCode {
     }
 }
 
+/// External audit ASK-009 (lab PR 213): the unsigned `status`, or with
+/// `key` the signed telemetry verb. `Err` is the exit code, the reason
+/// already printed: 5 transport, 7 a key with neither read role, the
+/// usual codes of a refused signed request otherwise.
+fn read_status(
+    socket: &std::path::Path,
+    key: Option<&std::path::Path>,
+    agent_id_file: &std::path::Path,
+    op: &str,
+) -> Result<StatusOutcome, ExitCode> {
+    use common::wire::admin_protocol::AdminResult;
+    let Some(key) = key else {
+        return run_status(socket).map_err(|e| {
+            eprintln!("{op}: {e:#}");
+            ExitCode::from(5)
+        });
+    };
+    match northnarrow_agent::admin_cli::run_telemetry_status(socket, key, agent_id_file) {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(AdminResult::RoleDenied)) => {
+            eprintln!(
+                "{op}: role denied (the key holds neither `audit-read` nor `telemetry-read`)"
+            );
+            Err(ExitCode::from(7))
+        }
+        Ok(Err(refused)) => Err(exit_from_admin_result(op, refused)),
+        Err(e) => {
+            eprintln!("{op}: {e:#}");
+            Err(ExitCode::from(5))
+        }
+    }
+}
+
+/// External audit ASK-009 (lab PR 213): an unsigned reply whose telemetry
+/// the agent withheld (an agent older than lab PR 213 still fills it in).
+fn telemetry_withheld(out: &StatusOutcome) -> bool {
+    !out.telemetry_signed
+        && out.ringbuf_drops_total.is_none()
+        && out.ringbuf_rejected_total.is_none()
+        && out.netflow_rows_skipped_total.is_none()
+        && out.netflow_pending_evicted_total.is_none()
+        && out.net_inactive_rules.is_none()
+        && out.flow_sock_pending.is_none()
+        && out.flow_sock_capacity.is_none()
+        && out.flow_sock_forgotten_min.is_none()
+        && out.detect_only.is_none()
+        && out.detect_only_source.is_none()
+        && out.combat_evidence_unrecorded.is_none()
+        && out.net_dot_rows_total.is_none()
+        && out.net_quic_rows_total.is_none()
+}
+
+/// The line that replaces the telemetry in an unsigned reply.
+fn withheld_line(label: &str, what: &str, cmd: &str) -> String {
+    format!(
+        "{label}: withheld from the unsigned status ({what}) — `nn-admin {cmd} --key <key>` \
+         with `audit-read` or `telemetry-read` reads them, signed"
+    )
+}
+
 /// External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
 fn print_net_status(out: &StatusOutcome, json: bool) {
     let net_ring = |name: &str| {
@@ -2197,7 +2278,7 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
             .collect();
         println!(
-            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{},\"flow_sock_pending\":{},\"flow_sock_capacity\":{},\"flow_sock_forgotten_min\":{},\"net_dot_rows_total\":{},\"net_dot_rows_resolver\":{},\"net_quic_rows_total\":{}}}",
+            "{{\"netflow_rows_skipped_total\":{},\"netflow_pending_evicted_total\":{},\"ringbuf_drops\":{{{}}},\"net_inactive_rules\":{},\"flow_sock_pending\":{},\"flow_sock_capacity\":{},\"flow_sock_forgotten_min\":{},\"net_dot_rows_total\":{},\"net_dot_rows_resolver\":{},\"net_quic_rows_total\":{},\"telemetry_signed\":{}}}",
             opt(out.netflow_rows_skipped_total),
             opt(out.netflow_pending_evicted_total),
             drops.join(","),
@@ -2210,6 +2291,19 @@ fn print_net_status(out: &StatusOutcome, json: bool) {
             opt(out.net_dot_rows_total),
             opt(out.net_dot_rows_resolver),
             opt(out.net_quic_rows_total),
+            out.telemetry_signed,
+        );
+        return;
+    }
+    if telemetry_withheld(out) {
+        println!(
+            "{}",
+            withheld_line(
+                "network telemetry                     ",
+                "netflow pacing and evictions, FLOW_SOCK_MAP, network ring drops, inactive \
+                 network rules, DNS over TLS and QUIC rows",
+                "net status"
+            )
         );
         return;
     }
@@ -2369,7 +2463,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             match out.last_admin_action_secs_ago {
@@ -2401,6 +2495,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             opt(out.combat_evidence_unrecorded),
             opt(out.combat_evidence_pending),
             opt(out.combat_evidence_dropped),
+            out.telemetry_signed,
         );
         return;
     }
@@ -2427,11 +2522,26 @@ fn print_status(out: &StatusOutcome, json: bool) {
         (None, Some(false)) => println!("combat stage      : (no episode)"),
         (None, None) => println!("combat stage      : (agent predates the field)"),
     }
-    println!("{}", response_mode_line(out, tty));
-    println!("{}", combat_evidence_line(out, tty));
+    let withheld = telemetry_withheld(out);
+    if !withheld {
+        println!("{}", response_mode_line(out, tty));
+        println!("{}", combat_evidence_line(out, tty));
+    }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
         None => println!("last admin action : (none since agent start)"),
+    }
+    if withheld {
+        // External audit ASK-009 (lab PR 213).
+        println!(
+            "{}",
+            withheld_line(
+                "telemetry         ",
+                "response mode, COMBAT evidence, ring drops and rejected records",
+                "status"
+            )
+        );
+        return;
     }
     match out.ringbuf_drops_total {
         None => println!("ringbuf drops     : (agent predates the counter)"),
@@ -3845,7 +3955,10 @@ mod quorum_help_tests {
 
 #[cfg(test)]
 mod flow_sock_line_tests {
-    use super::{combat_evidence_line, encrypted_flow_lines, flow_sock_line, response_mode_line};
+    use super::{
+        combat_evidence_line, encrypted_flow_lines, flow_sock_line, response_mode_line,
+        telemetry_withheld, withheld_line,
+    };
     use northnarrow_agent::admin_cli::StatusOutcome;
 
     fn outcome(
@@ -3877,7 +3990,34 @@ mod flow_sock_line_tests {
             net_dot_rows_total: None,
             net_dot_rows_resolver: None,
             net_quic_rows_total: None,
+            telemetry_signed: true,
         }
+    }
+
+    /// External audit ASK-009 (lab PR 213): an unsigned reply of this agent
+    /// carries no telemetry — said as withheld, with the command that reads
+    /// it, not as "agent predates the counter". A signed reply, or an older
+    /// agent's unsigned one that still fills the counters, is printed as
+    /// before.
+    #[test]
+    fn an_unsigned_reply_says_the_telemetry_is_withheld() {
+        let mut o = outcome(None, None, None);
+        o.telemetry_signed = false;
+        assert!(telemetry_withheld(&o));
+        let l = withheld_line("telemetry         ", "ring drops", "status");
+        assert!(
+            l.starts_with("telemetry         : withheld from the unsigned status (ring drops)")
+                && l.contains("`nn-admin status --key <key>`")
+                && l.contains("`audit-read` or `telemetry-read`"),
+            "{l}"
+        );
+        // signed: printed as the agent sent it, even with fields unset
+        o.telemetry_signed = true;
+        assert!(!telemetry_withheld(&o));
+        // an agent older than lab PR 213 answers the unsigned status in full
+        o.telemetry_signed = false;
+        o.ringbuf_drops_total = Some(0);
+        assert!(!telemetry_withheld(&o));
     }
 
     /// External audit NET-017 (lab PR 207): `net status` says what the DoT

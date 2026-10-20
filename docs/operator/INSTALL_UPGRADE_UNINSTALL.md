@@ -269,8 +269,10 @@ Every kernel sensor hands events to the agent through a ring buffer; when
 the agent falls behind the producer cannot reserve an entry and the event
 is lost. Each of the eleven rings now counts its own losses; the agent
 reads the counters every 10 s, logs every increase at WARN naming the
-ring, and `nn-admin status` prints the running total with the per-ring
-breakdown (`ringbuf drops : 0` is the healthy line). A non-zero counter
+ring, and `nn-admin status --key <admin key>` prints the running total with
+the per-ring breakdown (`ringbuf drops : 0` is the healthy line; signed
+since external audit ASK-009, lab PR 213 — without a key the agent withholds
+its telemetry). A non-zero counter
 is a coverage gap, not a cosmetic number: the lab soak treats it as a
 note and a production host should alert on it.
 
@@ -285,8 +287,8 @@ the agent or the watchdog: `bpftool map update/delete` fails with
 (`operation=bpf_map`, map id as the target) in the audit chain and the
 posture ladder, like an unlink attempt on `/etc/northnarrow`. Read-only
 handles are allowed in principle, but `bpftool` opens every map read-write,
-so `bpftool map dump` on the agent's maps fails too: use `nn-admin status`
-and the agent's own telemetry instead. Running one of the agent's binaries
+so `bpftool map dump` on the agent's maps fails too: use `nn-admin status
+--key <admin key>` and the agent's own telemetry instead. Running one of the agent's binaries
 is not an exemption (external audit EBPF-002: root could preload its own
 library into one). Only the successor of an agent or a watchdog that
 exited may take write handles before it is a protected pid — while no live

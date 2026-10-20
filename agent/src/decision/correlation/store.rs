@@ -25,6 +25,17 @@
 //! - **Per-rule window.** Each query passes its own `window_ns`
 //!   (§13 Q4 — 300 s default, configurable per rule).
 //!
+//! External audit NETR-014 (lab PR 213): retention per precursor kind
+//! ([`retention_ns`]). A credential read and a canary trip are kept
+//! [`LONG_RETENTION_NS`] (30 min), a staging-directory exec and a
+//! `sudo`/`su` [`CORRELATION_WINDOW_NS`] (300 s), as before. An egress
+//! within 300 s of its precursor is the chain's Critical verdict, as
+//! before; past it and within the retention it is one High record with no
+//! response, once per precursor ([`CorrelationStore::chain_age`]): waiting
+//! out five minutes no longer hides a slow exfiltration, and a long-lived
+//! process that reads its own credentials and talks to the network much
+//! later (a backup client, an agent-style helper) is not killed for it.
+//!
 //! External audit NETR-004: memory is bounded by a per-process ring
 //! capped at [`MAX_EVENTS_PER_PROC`] and a hard cap of
 //! [`MAX_TRACKED_PROCS`] keys, enforced in O(1) per insert with
@@ -43,6 +54,37 @@ use crate::decision::bounded::{LazyLru, LossCounter};
 /// `window_ns`; this is the value the migrated CHAIN-001..003 use,
 /// matching the T10.5 5-minute precedent.
 pub const CORRELATION_WINDOW_NS: u64 = 300 * 1_000_000_000;
+
+/// External audit NETR-014 (lab PR 213): how long a credential read and a
+/// canary trip are kept — 30 minutes. Past [`CORRELATION_WINDOW_NS`] they
+/// give a record, never a response ([`ChainAge::Aged`]).
+pub const LONG_RETENTION_NS: u64 = 30 * 60 * 1_000_000_000;
+
+/// External audit NETR-014: how long a precursor of `kind` is kept, the
+/// longest window any query of that kind may use. The high-confidence
+/// precursors whose chain an attacker could outwait — a credential-store
+/// read, a canary trip — are kept 30 minutes; a staging-directory exec
+/// (package scriptlets, builds) and a `sudo`/`su` (routine admin work), as
+/// common as they are short-lived, stay at 300 s.
+pub fn retention_ns(kind: PrecursorKind) -> u64 {
+    match kind {
+        PrecursorKind::CredRead | PrecursorKind::CanaryTrip => LONG_RETENTION_NS,
+        PrecursorKind::TmpExec | PrecursorKind::PrivEsc => CORRELATION_WINDOW_NS,
+    }
+}
+
+/// External audit NETR-014: what a precursor of the queried kind is to an
+/// egress ([`CorrelationStore::chain_age`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainAge {
+    /// Within [`CORRELATION_WINDOW_NS`]: the chain's Critical verdict and
+    /// its response, as before.
+    Fresh,
+    /// Older, within the kind's retention, and not reported yet: one High
+    /// record without a response. `age_ns` is the age of the most recent
+    /// such precursor; every aged one of the kind is then marked reported.
+    Aged { age_ns: u64 },
+}
 
 /// Per-process precursor ring cap. A process that re-triggers the same
 /// precursor many times only needs the most recent few to answer
@@ -118,6 +160,25 @@ pub enum PrecursorKind {
 struct Precursor {
     kind: PrecursorKind,
     ts_ns: u64,
+    /// External audit NETR-014: an aged correlation was already recorded
+    /// for it — no second record, and it no longer keeps its process's
+    /// flows from the netflow pacing.
+    aged_reported: bool,
+}
+
+impl Precursor {
+    /// Kept at `now_ns`: within its kind's retention, or within `window_ns`
+    /// when a query asks for more.
+    fn kept(&self, now_ns: u64, window_ns: u64) -> bool {
+        self.ts_ns >= now_ns.saturating_sub(retention_ns(self.kind).max(window_ns))
+    }
+
+    /// Could still complete a chain with an egress at `now_ns`: fresh, or
+    /// aged within its retention and not reported yet.
+    fn can_complete(&self, now_ns: u64) -> bool {
+        self.ts_ns >= now_ns.saturating_sub(CORRELATION_WINDOW_NS)
+            || (!self.aged_reported && self.kept(now_ns, 0))
+    }
 }
 
 /// Shared correlation state. `Arc<Mutex<_>>`-wrapped by the engine and
@@ -170,6 +231,20 @@ impl CorrelationStore {
     /// Record a `kind` precursor for an explicit [`ProcKey`] (an exec
     /// precursor, keyed with the start its event carries).
     pub fn record(&mut self, key: ProcKey, kind: PrecursorKind, ts_ns: u64) {
+        self.push(
+            key,
+            Precursor {
+                kind,
+                ts_ns,
+                aged_reported: false,
+            },
+        );
+    }
+
+    /// [`Self::record`] of a whole precursor (its reported mark kept when
+    /// an exec hands it to a new incarnation).
+    fn push(&mut self, key: ProcKey, precursor: Precursor) {
+        let Precursor { kind, ts_ns, .. } = precursor;
         if !self.per_proc.contains_key(&key) {
             self.new_keys = self.new_keys.wrapping_add(1);
             if self.new_keys % SWEEP_EVERY == 0 {
@@ -182,7 +257,7 @@ impl CorrelationStore {
             }
         }
         let q = self.per_proc.entry(key).or_default();
-        q.push_back(Precursor { kind, ts_ns });
+        q.push_back(precursor);
         while q.len() > MAX_EVENTS_PER_PROC {
             q.pop_front();
         }
@@ -336,6 +411,72 @@ impl CorrelationStore {
         self.has_sequence(self.current_key(pid), kinds, now_ns, window_ns)
     }
 
+    /// External audit NETR-014 (lab PR 213): what `key`'s precursors of
+    /// `kind` are to an egress at `now_ns` — [`ChainAge::Fresh`] when one is
+    /// within [`CORRELATION_WINDOW_NS`], else [`ChainAge::Aged`] for the
+    /// first query that finds one within the kind's [`retention_ns`] (they
+    /// are then marked reported), else `None`. Prunes like
+    /// [`Self::has_recent`].
+    pub fn chain_age(
+        &mut self,
+        key: ProcKey,
+        kind: PrecursorKind,
+        now_ns: u64,
+    ) -> Option<ChainAge> {
+        let retention = retention_ns(kind);
+        let q = self.per_proc.get_mut(&key)?;
+        q.retain(|e| e.kept(now_ns, retention));
+        let fresh_cutoff = now_ns.saturating_sub(CORRELATION_WINDOW_NS);
+        let retention_cutoff = now_ns.saturating_sub(retention);
+        let age = if q.iter().any(|e| e.kind == kind && e.ts_ns >= fresh_cutoff) {
+            Some(ChainAge::Fresh)
+        } else {
+            let mut newest: Option<u64> = None;
+            for e in q
+                .iter_mut()
+                .filter(|e| e.kind == kind && !e.aged_reported && e.ts_ns >= retention_cutoff)
+            {
+                e.aged_reported = true;
+                newest = Some(newest.map_or(e.ts_ns, |n| n.max(e.ts_ns)));
+            }
+            newest.map(|ts| ChainAge::Aged {
+                age_ns: now_ns.saturating_sub(ts),
+            })
+        };
+        self.drop_if_empty(&key);
+        age
+    }
+
+    /// [`Self::chain_age`] for `pid`'s current incarnation.
+    pub fn chain_age_for_pid(
+        &mut self,
+        pid: u32,
+        kind: PrecursorKind,
+        now_ns: u64,
+    ) -> Option<ChainAge> {
+        self.chain_age(self.current_key(pid), kind, now_ns)
+    }
+
+    /// [`Self::chain_age`] over `pid`'s strict ancestors (CHAIN-004/006): a
+    /// fresh precursor in any of them first (the Critical verdict), else
+    /// the nearest ancestor with an aged, unreported one.
+    pub fn chain_age_in_ancestors(
+        &mut self,
+        pid: u32,
+        kind: PrecursorKind,
+        now_ns: u64,
+    ) -> Option<ChainAge> {
+        if self.has_recent_in_ancestors(pid, kind, now_ns, CORRELATION_WINDOW_NS) {
+            return Some(ChainAge::Fresh);
+        }
+        for ancestor in self.tree.get_ancestors(pid) {
+            if let Some(age) = self.chain_age(ancestor, kind, now_ns) {
+                return Some(age);
+            }
+        }
+        None
+    }
+
     // ── D4: cross-PID lineage ────────────────────────────────────────
 
     /// Observe the exec of `child_pid` (own start `start_ns`, 0 when the
@@ -379,7 +520,7 @@ impl CorrelationStore {
             if let Some(q) = self.per_proc.get(&old).cloned() {
                 self.remove_key(&old);
                 for p in q.iter().filter(|p| p.ts_ns >= start_ns) {
-                    self.record(new_key, p.kind, p.ts_ns);
+                    self.push(new_key, *p);
                 }
             }
             if let Some(q) = self.egress.get(&old).cloned() {
@@ -425,15 +566,16 @@ impl CorrelationStore {
     }
 
     /// External audit NET-019: whether `pid` or one of its ancestors
-    /// holds a precursor of any kind within [`CORRELATION_WINDOW_NS`] of
-    /// `now_ns` — a flow of it could complete a chain, so the netflow
-    /// limiter never holds it back. Read-only: nothing is pruned.
+    /// holds a precursor that could still complete a chain with a flow at
+    /// `now_ns` — so the netflow limiter never holds it back. External
+    /// audit NETR-014: within [`CORRELATION_WINDOW_NS`], or within its
+    /// kind's retention while its aged correlation is not recorded yet.
+    /// Read-only: nothing is pruned.
     pub fn has_precursor_in_lineage(&self, pid: u32, now_ns: u64) -> bool {
-        let cutoff = now_ns.saturating_sub(CORRELATION_WINDOW_NS);
         let live = |key: &ProcKey| {
             self.per_proc
                 .get(key)
-                .is_some_and(|q| q.iter().any(|p| p.ts_ns >= cutoff))
+                .is_some_and(|q| q.iter().any(|p| p.can_complete(now_ns)))
         };
         live(&self.current_key(pid)) || self.tree.get_ancestors(pid).iter().any(live)
     }
@@ -452,12 +594,12 @@ impl CorrelationStore {
     // ── internals ────────────────────────────────────────────────────
 
     /// TTL-prune `key`'s entries, then run `f` over the survivors with
-    /// the query's match-cutoff. Pruning uses the **larger** of the
-    /// query window and [`CORRELATION_WINDOW_NS`] so a short-window
-    /// query never evicts precursors a longer-window rule sharing this
-    /// store still needs; `f` then filters to the query's own window
-    /// via the `match_cutoff` it receives. Returns `f`'s result (or its
-    /// default when `key` is absent).
+    /// the query's match-cutoff. Each entry is pruned past the **larger**
+    /// of its kind's [`retention_ns`] and the query window (external audit
+    /// NETR-014: per kind, so a short-window query of one kind never evicts
+    /// a precursor of another kind kept longer); `f` then filters to the
+    /// query's own window via the `match_cutoff` it receives. Returns `f`'s
+    /// result (or its default when `key` is absent).
     fn with_in_window<R: Default>(
         &mut self,
         key: ProcKey,
@@ -465,12 +607,9 @@ impl CorrelationStore {
         window_ns: u64,
         f: impl FnOnce(&VecDeque<Precursor>, u64) -> R,
     ) -> R {
-        let prune_cutoff = now_ns.saturating_sub(window_ns.max(CORRELATION_WINDOW_NS));
         let match_cutoff = now_ns.saturating_sub(window_ns);
         if let Some(q) = self.per_proc.get_mut(&key) {
-            while q.front().is_some_and(|e| e.ts_ns < prune_cutoff) {
-                q.pop_front();
-            }
+            q.retain(|e| e.kept(now_ns, window_ns));
             f(q, match_cutoff)
         } else {
             R::default()
@@ -507,11 +646,10 @@ impl CorrelationStore {
                 None => return false,
             },
         };
-        let cutoff = now_ns.saturating_sub(CORRELATION_WINDOW_NS);
         let lost = self.per_proc.remove(&victim).is_some_and(|q| {
             protected
                 && q.iter()
-                    .any(|p| p.kind != PrecursorKind::PrivEsc && p.ts_ns >= cutoff)
+                    .any(|p| p.kind != PrecursorKind::PrivEsc && p.can_complete(now_ns))
         });
         if lost && self.lost.bump() {
             tracing::warn!(
@@ -525,15 +663,13 @@ impl CorrelationStore {
         true
     }
 
-    /// Drop processes whose every precursor is out of the *default*
-    /// window relative to `now_ns`. Run every [`SWEEP_EVERY`] new keys.
+    /// Drop the precursors past their kind's retention relative to
+    /// `now_ns` (external audit NETR-014), and the processes left with
+    /// none. Run every [`SWEEP_EVERY`] new keys.
     fn prune_stale(&mut self, now_ns: u64) {
-        let cutoff = now_ns.saturating_sub(CORRELATION_WINDOW_NS);
         let (low, high) = (&mut self.privesc_only, &mut self.protected);
         self.per_proc.retain(|k, q| {
-            while q.front().is_some_and(|e| e.ts_ns < cutoff) {
-                q.pop_front();
-            }
+            q.retain(|e| e.kept(now_ns, 0));
             if q.is_empty() {
                 low.remove(k);
                 high.remove(k);
@@ -574,11 +710,173 @@ mod tests {
     #[test]
     fn evicts_after_ttl() {
         let mut s = CorrelationStore::new();
-        s.record_for_pid(42, PrecursorKind::CredRead, 10 * SEC);
+        s.record_for_pid(42, PrecursorKind::TmpExec, 10 * SEC);
         // 6 minutes later — past the 5-minute window.
-        assert!(!s.has_recent_for_pid(42, PrecursorKind::CredRead, 10 * SEC + 360 * SEC, W));
+        assert!(!s.has_recent_for_pid(42, PrecursorKind::TmpExec, 10 * SEC + 360 * SEC, W));
         // And the now-empty key was dropped.
         assert_eq!(s.tracked_procs(), 0);
+        // External audit NETR-014: a credential read is past the 300 s
+        // window then too, but kept for its 30 minutes.
+        s.record_for_pid(43, PrecursorKind::CredRead, 10 * SEC);
+        assert!(!s.has_recent_for_pid(43, PrecursorKind::CredRead, 10 * SEC + 360 * SEC, W));
+        assert_eq!(s.tracked_procs(), 1);
+        assert!(!s.has_recent_for_pid(
+            43,
+            PrecursorKind::CredRead,
+            10 * SEC + LONG_RETENTION_NS + SEC,
+            LONG_RETENTION_NS
+        ));
+        assert_eq!(s.tracked_procs(), 0);
+    }
+
+    /// External audit NETR-014 (lab PR 213): the triage's pins, at the
+    /// store. A credential read correlates for 30 minutes (fresh within
+    /// 300 s, aged after, nothing past 30 min); so does a canary trip.
+    #[test]
+    fn a_cred_read_correlates_for_thirty_minutes() {
+        for kind in [PrecursorKind::CredRead, PrecursorKind::CanaryTrip] {
+            let t0 = 100 * SEC;
+            let mut s = CorrelationStore::new();
+            s.record_for_pid(42, kind, t0);
+            assert_eq!(
+                s.chain_age_for_pid(42, kind, t0 + 60 * SEC),
+                Some(ChainAge::Fresh)
+            );
+            assert_eq!(
+                s.chain_age_for_pid(42, kind, t0 + 20 * 60 * SEC),
+                Some(ChainAge::Aged {
+                    age_ns: 20 * 60 * SEC
+                })
+            );
+            let mut s = CorrelationStore::new();
+            s.record_for_pid(42, kind, t0);
+            assert_eq!(s.chain_age_for_pid(42, kind, t0 + 31 * 60 * SEC), None);
+            assert_eq!(s.tracked_procs(), 0, "pruned past its retention");
+        }
+    }
+
+    /// A staging exec (and a sudo/su) still expires after five minutes.
+    #[test]
+    fn a_tmp_exec_still_expires_after_five_minutes() {
+        for kind in [PrecursorKind::TmpExec, PrecursorKind::PrivEsc] {
+            let mut s = CorrelationStore::new();
+            s.record_for_pid(42, kind, 10 * SEC);
+            assert_eq!(
+                s.chain_age_for_pid(42, kind, 10 * SEC + 299 * SEC),
+                Some(ChainAge::Fresh)
+            );
+            assert_eq!(s.chain_age_for_pid(42, kind, 10 * SEC + 301 * SEC), None);
+            assert_eq!(s.tracked_procs(), 0);
+        }
+        assert_eq!(retention_ns(PrecursorKind::TmpExec), CORRELATION_WINDOW_NS);
+        assert_eq!(retention_ns(PrecursorKind::PrivEsc), CORRELATION_WINDOW_NS);
+        assert_eq!(retention_ns(PrecursorKind::CredRead), 30 * 60 * SEC);
+        assert_eq!(retention_ns(PrecursorKind::CanaryTrip), 30 * 60 * SEC);
+    }
+
+    /// An aged correlation is given once per precursor: every aged one of
+    /// the kind is marked; a fresh one still answers Fresh; a newer read is
+    /// a new record. The mark follows an exec to the new incarnation.
+    #[test]
+    fn an_aged_precursor_is_reported_once() {
+        let mut s = CorrelationStore::new();
+        let k = key(42, 5 * SEC);
+        s.record(k, PrecursorKind::CredRead, 10 * SEC);
+        s.record(k, PrecursorKind::CredRead, 20 * SEC);
+        assert_eq!(
+            s.chain_age(k, PrecursorKind::CredRead, 20 * SEC + 400 * SEC),
+            Some(ChainAge::Aged { age_ns: 400 * SEC }),
+            "the most recent aged read's age"
+        );
+        assert_eq!(
+            s.chain_age(k, PrecursorKind::CredRead, 20 * SEC + 401 * SEC),
+            None
+        );
+        s.record(k, PrecursorKind::CredRead, 500 * SEC);
+        assert_eq!(
+            s.chain_age(k, PrecursorKind::CredRead, 600 * SEC),
+            Some(ChainAge::Fresh)
+        );
+        assert_eq!(
+            s.chain_age(k, PrecursorKind::CredRead, 600 * SEC),
+            Some(ChainAge::Fresh)
+        );
+        assert_eq!(
+            s.chain_age(k, PrecursorKind::CredRead, 900 * SEC),
+            Some(ChainAge::Aged { age_ns: 400 * SEC })
+        );
+        assert_eq!(s.chain_age(k, PrecursorKind::CredRead, 901 * SEC), None);
+        // another kind of the same process is its own
+        s.record(k, PrecursorKind::CanaryTrip, 30 * SEC);
+        assert!(matches!(
+            s.chain_age(k, PrecursorKind::CanaryTrip, 902 * SEC),
+            Some(ChainAge::Aged { .. })
+        ));
+        // A re-exec under the same PID (a new start) inherits the marked
+        // reads processed before it: no second record.
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(77, PrecursorKind::CredRead, 10 * SEC);
+        assert!(s
+            .chain_age_for_pid(77, PrecursorKind::CredRead, 400 * SEC)
+            .is_some());
+        s.observe_spawn(77, 1, 9 * SEC);
+        assert_eq!(
+            s.chain_age_for_pid(77, PrecursorKind::CredRead, 410 * SEC),
+            None
+        );
+    }
+
+    /// The pruning is per kind: a short query of one kind never removes a
+    /// precursor of a kind kept longer, nor does the periodic sweep.
+    #[test]
+    fn a_short_query_or_the_sweep_keeps_a_long_kind() {
+        let mut s = CorrelationStore::new();
+        let k = key(42, 1);
+        s.record(k, PrecursorKind::CredRead, 10 * SEC);
+        s.record(k, PrecursorKind::TmpExec, 11 * SEC);
+        assert!(!s.has_recent(k, PrecursorKind::TmpExec, 611 * SEC, W));
+        assert_eq!(
+            s.per_proc.get(&k).map(|q| q.len()),
+            Some(1),
+            "the exec went"
+        );
+        assert!(matches!(
+            s.chain_age(k, PrecursorKind::CredRead, 611 * SEC),
+            Some(ChainAge::Aged { .. })
+        ));
+        let mut s = CorrelationStore::new();
+        s.record(key(1, 1), PrecursorKind::CredRead, 10 * SEC);
+        s.record(key(2, 1), PrecursorKind::TmpExec, 10 * SEC);
+        s.prune_stale(10 * SEC + 600 * SEC);
+        assert_eq!(s.tracked_procs(), 1);
+        assert!(s.per_proc.contains_key(&key(1, 1)));
+        s.prune_stale(10 * SEC + LONG_RETENTION_NS + SEC);
+        assert_eq!(s.tracked_procs(), 0);
+    }
+
+    /// External audit NET-019 / NETR-014: the netflow limiter keeps
+    /// evaluating the flows of a process whose credential read could still
+    /// give its aged record — not once it was given, nor past 30 minutes.
+    #[test]
+    fn the_limiter_guard_follows_the_retention() {
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(42, PrecursorKind::CredRead, 10 * SEC);
+        s.observe_spawn(43, 42, 11 * SEC);
+        assert!(s.has_precursor_in_lineage(42, 20 * 60 * SEC));
+        assert!(s.has_precursor_in_lineage(43, 20 * 60 * SEC), "a child too");
+        assert!(!s.has_precursor_in_lineage(42, 10 * SEC + LONG_RETENTION_NS + SEC));
+        assert!(s
+            .chain_age_for_pid(42, PrecursorKind::CredRead, 20 * 60 * SEC)
+            .is_some());
+        assert!(
+            !s.has_precursor_in_lineage(42, 20 * 60 * SEC + SEC),
+            "reported"
+        );
+        // a staging exec: 300 s, as before
+        let mut s = CorrelationStore::new();
+        s.record_for_pid(50, PrecursorKind::TmpExec, 10 * SEC);
+        assert!(s.has_precursor_in_lineage(50, 300 * SEC));
+        assert!(!s.has_precursor_in_lineage(50, 311 * SEC));
     }
 
     #[test]
@@ -845,8 +1143,10 @@ mod tests {
         let mut s = CorrelationStore::new();
         for pid in 0..10_000u32 {
             s.record(key(pid, 1), PrecursorKind::CredRead, SEC);
-            // Out of window by now: the query drops the key.
-            assert!(!s.has_recent(key(pid, 1), PrecursorKind::CredRead, 400 * SEC, W));
+            // Past its retention by now (external audit NETR-014: 30 min
+            // for a credential read): the query drops the key.
+            let later = 2 * SEC + LONG_RETENTION_NS;
+            assert!(!s.has_recent(key(pid, 1), PrecursorKind::CredRead, later, W));
         }
         assert_eq!(s.tracked_procs(), 0);
         assert!(

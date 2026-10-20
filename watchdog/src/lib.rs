@@ -33,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use antitamper_bpf::ProtectedPidsHandle;
 use anyhow::{anyhow, Context, Result};
 use common::wire::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, StatusRequest, MAX_FRAME_BODY,
+    decode_status_liveness, encode_frame, AdminMessage, StatusRequest, MAX_FRAME_BODY,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
@@ -1851,6 +1851,15 @@ impl Default for StatusPingTracker {
 /// not contents. The match against `StatusResponse` is purely
 /// for protocol-shape validation — content fields are ignored.
 ///
+/// External audit ASK-009 (lab PR 213): the reply is read only as far as
+/// its variant and its two leading fields
+/// ([`decode_status_liveness`]), so the ping does not depend on the fields
+/// appended to the status reply: a watchdog newer than the agent no longer
+/// fails on an older agent's reply (postcard has no field count, so the
+/// full decode did), and the agent withholding its telemetry from the
+/// unsigned reply changes nothing here. The request stays the unsigned
+/// `Status`.
+///
 /// External audit WDG-007: with `agent_pid`, the server must be that
 /// process (`SO_PEERCRED`, recorded by the kernel when the server called
 /// `listen(2)`); any other server is a [`NotTheAgent`] error before a
@@ -1906,17 +1915,7 @@ pub async fn ping_agent_status(
             .await
             .context("reading reply frame body")?;
 
-        let mut full = Vec::with_capacity(4 + body_len);
-        full.extend_from_slice(&header);
-        full.extend_from_slice(&body);
-        let (msg, _consumed) = decode_frame(&full)
-            .map_err(|e| anyhow!("decode_frame: {e}"))?
-            .ok_or_else(|| anyhow!("decode_frame returned None on full buffer"))?;
-        if !matches!(msg, AdminMessage::StatusResponse(_)) {
-            return Err(anyhow!(
-                "unexpected reply variant (wanted StatusResponse): {msg:?}"
-            ));
-        }
+        decode_status_liveness(&body).map_err(|e| anyhow!("STATUS reply: {e}"))?;
         Ok::<(), anyhow::Error>(())
     };
 
@@ -3562,5 +3561,82 @@ mod tests {
             .expect("ping must succeed against mock server");
 
         mock.await.expect("mock task");
+    }
+
+    /// A mock agent that reads one request frame and answers `body` (a
+    /// frame body, without its length).
+    async fn ping_against(body: Vec<u8>) -> Result<()> {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("mock.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await.expect("read hdr");
+            let mut req = vec![0u8; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut req).await.expect("read body");
+            assert_eq!(req, vec![2], "the ping is the unsigned Status, unchanged");
+            let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+            frame.extend(body);
+            stream.write_all(&frame).await.expect("write reply");
+        });
+        let out = ping_agent_status(&socket, Duration::from_secs(2), None).await;
+        mock.await.expect("mock task");
+        out
+    }
+
+    /// External audit ASK-009 (lab PR 213): the ping reads the reply's
+    /// variant and its two leading fields only. An agent older than the
+    /// fields this watchdog knows — here one that sends only the first three
+    /// fields, and lab PR 193's shape — is alive: the full decode failed on
+    /// them (postcard has no field count), so a watchdog upgraded before
+    /// the agent counted every ping as a timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ping_does_not_depend_on_the_status_fields() {
+        use common::posture_types::PostureKind;
+        use common::wire::admin_protocol::{StatusResponse, STATUS_RESPONSE_INDEX};
+        // The first agents' reply, as postcard writes it: the variant, then
+        // posture Combat (3), isolation engaged (1), last admin action
+        // Some(4) — and nothing after.
+        let old = vec![STATUS_RESPONSE_INDEX as u8, 3, 1, 1, 4];
+        assert!(
+            common::wire::admin_protocol::decode_frame(&{
+                let mut f = (old.len() as u32).to_be_bytes().to_vec();
+                f.extend(&old);
+                f
+            })
+            .is_err(),
+            "the full decode refuses the older shape"
+        );
+        ping_against(old).await.expect("an older agent is alive");
+        // This build's unsigned reply: the telemetry withheld.
+        let public = encode_frame(&AdminMessage::StatusResponse(StatusResponse::public(
+            PostureKind::Observing,
+            false,
+            None,
+            None,
+            Some(false),
+        )))
+        .unwrap();
+        ping_against(public[4..].to_vec())
+            .await
+            .expect("the public reply is a ping answer");
+        // Fields a newer agent appends: trailing bytes, ignored.
+        let mut newer = public[4..].to_vec();
+        newer.extend([1, 42, 1, 7]);
+        ping_against(newer).await.expect("a newer agent is alive");
+    }
+
+    /// Another reply than a status reply is still a failed ping.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ping_answered_with_another_variant_fails() {
+        use common::wire::admin_protocol::UnlockResult;
+        let other = encode_frame(&AdminMessage::UnlockResult(UnlockResult::Success)).unwrap();
+        let err = ping_against(other[4..].to_vec()).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("wanted StatusResponse"),
+            "{err:#}"
+        );
+        assert!(ping_against(Vec::new()).await.is_err(), "an empty body");
     }
 }

@@ -3725,6 +3725,11 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
                         Arc::new(move || ladder.evidence_counts())
                     },
                 }));
+                // External audit ASK-009 (lab PR 213): the unsigned status
+                // polling is summarised per peer in the signed audit log;
+                // the verified watchdog (the pid in PROTECTED_PIDS) is not.
+                let status_polls_for_serve =
+                    Arc::new(admin_socket::StatusPolls::new(exempt.clone()));
                 // External audit NN-AUD-077: the loop now outlives a
                 // transient accept error; if it still ends, the admin plane
                 // is gone until a restart — an ERROR and a signed record.
@@ -3744,6 +3749,7 @@ async fn run(cli: Cli, ade_threads: Option<ThreadPin>) -> Result<()> {
                         detection_state_for_serve,
                         response_state_for_serve,
                         read_paths_for_serve,
+                        status_polls_for_serve,
                     )
                     .await
                     {

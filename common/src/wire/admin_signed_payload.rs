@@ -192,6 +192,13 @@ pub enum OperationCode {
     /// External audit CMB-016 — write one quarantined file back out of
     /// the vault. Authorised by `Role::ResponseManage`.
     ResponseRestore = 24,
+    /// External audit ASK-009 (lab PR 213) — read the telemetry counters
+    /// the unsigned `status` no longer carries (ring drops and rejected
+    /// records, the netflow pacing and evictions, `FLOW_SOCK_MAP`, the
+    /// inactive network rules, the encrypted-flow counts, detect-only, the
+    /// COMBAT evidence gaps). Read-only; authorised by `Role::AuditRead` or
+    /// `Role::TelemetryRead`, 1-of-N.
+    TelemetryStatus = 25,
 }
 
 impl From<OperationCode> for u8 {
@@ -228,6 +235,7 @@ impl TryFrom<u8> for OperationCode {
             22 => Ok(Self::ResponseStatus),
             23 => Ok(Self::ResponseRelease),
             24 => Ok(Self::ResponseRestore),
+            25 => Ok(Self::TelemetryStatus),
             other => Err(SignedPayloadError::UnknownOperationCode(other)),
         }
     }
@@ -831,6 +839,11 @@ pub struct ResponseRestoreExtra {
     pub to: Option<String>,
 }
 
+/// Op-specific signed-scope fields for [`OperationCode::TelemetryStatus`].
+/// Empty, like [`ResponseStatusExtra`]: the response carries the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TelemetryStatusExtra {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationExtra {
     Unlock(UnlockExtra),
@@ -875,6 +888,9 @@ pub enum OperationExtra {
     ResponseRelease(ResponseReleaseExtra),
     /// External audit CMB-016. Pairs with [`OperationCode::ResponseRestore`].
     ResponseRestore(ResponseRestoreExtra),
+    /// External audit ASK-009 (lab PR 213). Pairs with
+    /// [`OperationCode::TelemetryStatus`].
+    TelemetryStatus(TelemetryStatusExtra),
 }
 
 impl OperationExtra {
@@ -907,6 +923,7 @@ impl OperationExtra {
             OperationExtra::ResponseStatus(_) => OperationCode::ResponseStatus,
             OperationExtra::ResponseRelease(_) => OperationCode::ResponseRelease,
             OperationExtra::ResponseRestore(_) => OperationCode::ResponseRestore,
+            OperationExtra::TelemetryStatus(_) => OperationCode::TelemetryStatus,
         }
     }
 }
@@ -1506,6 +1523,19 @@ impl SignedPayload {
             extra: OperationExtra::ResponseRestore(ResponseRestoreExtra { vault_id, to }),
         }
     }
+
+    /// External audit ASK-009 (lab PR 213) — `status --key` /
+    /// `net status --key` signed payload constructor. Read-only;
+    /// authorised by `Role::AuditRead` or `Role::TelemetryRead`.
+    pub fn new_telemetry_status(nonce: [u8; 32], ts: u64, agent_id: [u8; 16]) -> Self {
+        Self {
+            op: OperationCode::TelemetryStatus,
+            nonce,
+            ts,
+            agent_id,
+            extra: OperationExtra::TelemetryStatus(TelemetryStatusExtra {}),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1543,7 +1573,7 @@ mod tests {
     /// `Detections`, bringing it to 19. Tappa 9.0.c added
     /// `DetectionSetStatus`, bringing it to 20. External audit CMB-016
     /// added the three response ops (ConfigOverlaySet has its own test).
-    fn one_payload_per_op() -> [SignedPayload; 23] {
+    fn one_payload_per_op() -> [SignedPayload; 24] {
         [
             SignedPayload::new_unlock(nonce(), TS, agent_id()),
             SignedPayload::new_shutdown(nonce(), TS, agent_id(), 30),
@@ -1618,6 +1648,7 @@ mod tests {
                 "0123456789abcdef0123456789abcdef".to_string(),
                 Some("/tmp/restored".to_string()),
             ),
+            SignedPayload::new_telemetry_status(nonce(), TS, agent_id()),
         ]
     }
 
@@ -1814,6 +1845,8 @@ mod tests {
             (OperationCode::ResponseStatus, 22),
             (OperationCode::ResponseRelease, 23),
             (OperationCode::ResponseRestore, 24),
+            // External audit ASK-009 (lab PR 213) — APPENDED, never renumber.
+            (OperationCode::TelemetryStatus, 25),
         ];
         for (op, expected) in cases {
             assert_eq!(u8::from(op), expected, "{op:?}");

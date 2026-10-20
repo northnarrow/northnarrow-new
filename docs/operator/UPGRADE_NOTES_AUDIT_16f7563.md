@@ -45,6 +45,9 @@ and the tracker note have the details and the lab evidence.
     `/home/<user>`, `/var/tmp`, …) or `escalation-allow.local` (`/0`, the
     comm `*` over a wide network) is no longer applied, and `nn-admin
     config overlay set` refuses the file: narrow it (§6).
+12. A script or monitor that reads the ring drops, detect-only or `nn-admin
+    net status` without a key gets nothing: give it `--key` with a key
+    holding `audit-read` — the install key does (§3).
 
 ## 1. Installation and upgrade
 
@@ -383,7 +386,7 @@ packages open it themselves.
   and `--min-seq`; `nn-admin detections` leaves out rows that do not
   verify. Runbook: [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md).
 - **`nn-admin net status`** (NN-AUD-168 NET-019, NN-AUD-166 NET-012,
-  NN-AUD-165 NET-009, lab PR 142), no key: the netflow rows held back from
+  NN-AUD-165 NET-009, lab PR 142; with `--key` since lab PR 213): the netflow rows held back from
   the rules by the per-uid pacing, the pending connects evicted, the
   network rings' drops and the network rules that cannot fire in this
   build (NN-L-NET-003).
@@ -509,6 +512,28 @@ packages open it themselves.
   **Regression:** as for lab PR 193's fields, an `nn-admin` or watchdog
   newer than the agent cannot read its `status`: upgrade the binaries
   together.
+- **`nn-admin status` and `net status`: the telemetry is signed**
+  (NN-AUD-237 ASK-009, lab PR 213). Without a key the agent answers what
+  the watchdog and COMBAT recovery need — posture, network isolation, the
+  COMBAT stage and lock, the last admin action — and withholds the rest:
+  `status` ends with `telemetry : withheld from the unsigned status (…)`,
+  `net status` prints only that line (exit 0), and in `--json` the
+  counters are `null` with `"telemetry_signed":false`. `--key <key>` (a
+  key with `audit-read` — the default role, the install key's — or
+  `telemetry-read`) signs the request and prints everything as before
+  (`response mode`, `combat evidence`, `ringbuf drops`, `ringbuf rejected`,
+  every `net status` line; `"telemetry_signed":true`); a key with neither
+  role exits 7. Each signed read is a `telemetry_status` row in the audit
+  log, and each process that polls the unsigned `status` gets one signed
+  `status_polled` row per hour (its uid and name, and how many requests it
+  made in its previous hour); the watchdog's pings are not recorded.
+  **Regression:** dashboards and scripts that read the counters from the
+  unsigned `status` (`ringbuf_drops_total`, `detect_only`, `net_*`) must
+  pass `--key`, and their reads are now in the audit log. An `nn-admin`
+  of this release cannot use `--key` against an older agent (exit 5): run
+  it without the key there. The watchdog no longer depends on the fields
+  of the reply, so a watchdog newer than the agent keeps its pings
+  answered; for `nn-admin` the rule stays: upgrade the binaries together.
 - **A closed pipe** (lab PR 188, a follow-up found in the lab): `nn-admin
   status | head -1` and every other command whose stdout or stderr closes
   early end quietly with exit 141 (128 + SIGPIPE; it aborted with 134 and
@@ -644,6 +669,19 @@ Now **killed, or answered, where they were recorded or missed**:
   unprivileged LXC or LXD) is no transaction; a process a transaction left
   behind that calls out from a staging directory or executes from a user
   path as root after the window is killed.
+- Correlation chains past five minutes (Wave 3, lab PR 213, NN-AUD-297
+  NETR-014): a credential read (a FIM-watched store such as
+  `/root/.gnupg`, not a wide-coverage open) or a canary trip is kept 30
+  minutes, where every precursor expired after 300 s. An egress within
+  300 s is killed as before (NN-L-CHAIN-001/003/004/006, Critical);
+  between 300 s and 30 minutes it is now **recorded**: one High record per
+  read or trip (`action: Log`, the age in the reasoning, a `VERDICT (rule)`
+  WARN), no response and no COMBAT. A staging-directory exec and a
+  `sudo`/`su` keep 300 s (NN-L-CHAIN-002/005/007/008). **Regression:** a
+  long-lived process that reads a watched credential store and talks to
+  the network minutes later (`dirmngr` after a root keyring read, a backup
+  agent) draws such a High record once per read; until it does, its flows
+  are not held back by the per-uid netflow pacing, for up to 30 minutes.
 - New rule NN-L-NET-021 names a process that floods `listen()` or
   `io_uring_setup()` (NN-AUD-103 EBPF-009, NN-AUD-105 EBPF-013, lab PR
   129).
@@ -1180,6 +1218,12 @@ checked with its tag-bound attestation.
   dev, lab and range builds decode with candle at the x86-64-v2 ISA unless
   they opt into `native` (§1 of
   <https://github.com/northnarrow/northnarrow-new/blob/main/docs/PERFORMANCE.md>).
+- **The soak reads the ring drops signed** (NN-AUD-237 ASK-009, lab PR
+  213). `deploy/lab/soak/sample.sh` calls `nn-admin status --key` with
+  `$SOAK_ADMIN_KEY` or the guest's install key (`/root/northnarrow-admin.key`):
+  one `telemetry_status` audit row per sample. **Regression:** a guest
+  without an `audit-read` key leaves the column empty, and `nn-lab.sh soak
+  report` fails the run ("ring-buffer drops not read"; it counted 0).
 - **`ade_attacks`** (NN-AUD-195 WDG-R01, lab PR 149) exits non-zero when it
   would score the mock backend, and names the backend next to the rate.
 - **The range bootstrap** takes the rule count from the validation registry
