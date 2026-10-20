@@ -61,6 +61,79 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, the status split and correlation chain retention
+  (Low ASK-009 NN-AUD-237, NETR-014 NN-AUD-297; lab PR 213). Two product
+  decisions, taken as the triages recommend, the conservative way that
+  keeps what works. ASK-009: `status` was served without a signature or a
+  record and, since the audit, also gave the ring drops and rejected
+  records, the netflow pacing and evictions, `FLOW_SOCK_MAP`, the inactive
+  network rules, detect-only, the COMBAT evidence gaps and the
+  encrypted-flow counts — with the agent's maps closed to root by the BPF
+  guard, the easy feedback of a ring flood. **Decision:** the unsigned
+  `status` keeps what the watchdog and COMBAT recovery read (the posture,
+  the isolation, the last admin action, the COMBAT stage and lock) and
+  sends `None` for the rest (same shape, `StatusResponse::public`); the
+  rest comes from a new signed verb, `TelemetryStatusRequest` (op 25,
+  appended before the debug-only variants), 1-of-N, `audit-read` or
+  `telemetry-read` (`triage` and `all` imply it), one `telemetry_status`
+  audit row per request without the counters. `nn-admin status --key` and
+  `nn-admin net status --key` use it; without a key `status` prints the
+  public fields and a line saying the telemetry is withheld and how to read
+  it, `net status` that line only, and `--json` gains `telemetry_signed`.
+  The unsigned polling is recorded: one signed `status_polled` row per peer
+  (uid and the comm it gives itself) per hour, at its first request, with
+  the count of its previous hour; the registered watchdog is left out by
+  the pid the agent verified (pidfile, executable, start time: the one it
+  puts in `PROTECTED_PIDS`), never by comm; 64 peers are tracked, the rest
+  share one window. The watchdog's ping is still the unsigned `Status` and
+  still judges latency only, but reads just the reply's variant and its two
+  leading fields (`decode_status_liveness`): it no longer depends on the
+  fields appended to the status, and a watchdog newer than the agent reads
+  an older agent's reply (the known follow-up, closed for the watchdog).
+  `deploy/lab/soak/sample.sh` reads the drops with the lab's key; a sample
+  it could not read is left empty and `nn-lab.sh soak report` fails the run
+  (it wrote 0). Alternatives not taken: `telemetry-read` alone (the
+  triage's wording) — the default allowlist and the key `install.sh`
+  bootstraps hold `audit-read`, not it, and adding it takes a `rotate-keys`
+  quorum the install key cannot sign: every existing install and the lab
+  soak would have lost the counters, which are no more than what an
+  `audit-read` key reads in the signed audit log; detect-only left public —
+  it tells a local root whether a kill will follow (the signed `agent_boot`
+  entry and `--key` keep it for the operator); one row per unsigned request
+  — the watchdog pings every few seconds. NETR-014: every chain precursor
+  expired after 300 s, so a credential read or a canary trip followed by an
+  egress five minutes later gave nothing. **Decision:** retention per
+  precursor kind — a credential read and a canary trip are kept 30 minutes,
+  a staging-directory exec and a `sudo`/`su` 300 s as before; CHAIN-001,
+  -003, -004 and -006 grade by age: within 300 s the Critical
+  `KillProcessTree` verdict, unchanged; from 300 s to 30 min one **High
+  `Log`** record per precursor (no response, no COMBAT; its reasoning gives
+  the age). CHAIN-002, -005, -007 (whose first step is the staging exec)
+  and -008, and the review-70 late completions, keep 300 s; the 4096-process
+  and 16-precursor caps are unchanged; the netflow limiter keeps evaluating
+  a process whose read could still give its record, not once it has.
+  Alternative not taken: the Critical kill for the whole 30 minutes (the
+  triage's risk: a backup client or an agent-style helper killed up to 30
+  minutes after it read its own credentials, with no false-positive
+  baseline yet). The triage's one-hour false-positive baseline on Ubuntu
+  24.04 is owed to the lab before merge.
+  **Regressions / changes:** an unsigned `nn-admin status` no longer prints
+  `response mode`, `combat evidence`, `ringbuf drops` and `ringbuf
+  rejected` (`--json`: `null`), and `nn-admin net status` without `--key`
+  prints one line (exit 0): a script or monitor that reads them needs
+  `--key` with an `audit-read` key, one `telemetry_status` audit row per
+  call; the audit log gains at most one `status_polled` row per polling
+  peer per hour. An `nn-admin` older than this agent reads its unsigned
+  status (same shape) and shows the withheld counters as absent; this
+  `nn-admin --key` against an older agent fails (exit 5: no such verb), and
+  a newer `nn-admin` still cannot decode an older agent's status. In
+  `debug-trigger` builds the two debug-only variants move from 50/51 to
+  52/53: build the lab's `nn-admin` and agent together. A credential read
+  (FIM-watched store, not wide-coverage) or a canary trip followed by an
+  egress 5 to 30 minutes later now draws one High record and a `VERDICT
+  (rule)` WARN where nothing was; within 300 s nothing changes; such a
+  process's flows skip the netflow pacing for up to 30 minutes instead of 5
+  until its record is given.
 - External audit, Wave 3, operator-facing correctness (Low ASK-015
   NN-AUD-241, AUT-007 NN-AUD-247, AUT-013 NN-AUD-250, MAIN-016 NN-AUD-258,
   EVD-016 NN-AUD-279; Info ASK-018 NN-AUD-424; lab PR 212). ASK-015: a

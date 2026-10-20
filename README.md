@@ -101,7 +101,7 @@ flowchart TD
 process execution with argv and parent lineage, file integrity against a signed baseline,
 and every TCP/UDP flow, DNS query and listener — kernel-side, with no userland polling.
 TLS fingerprints (JA3/JA4) have a parser but no sensor yet, so the JA3 rule is inactive
-and `nn-admin net status` says so. The DNS rules read plain DNS on UDP/53: flows to DNS
+and `nn-admin net status --key` says so. The DNS rules read plain DNS on UDP/53: flows to DNS
 over TLS (TCP/853) and QUIC (UDP/443) are counted, not read, a systemd-resolved on DNS
 over TLS is listed as a blind spot, and DNS over HTTPS looks like any HTTPS.
 

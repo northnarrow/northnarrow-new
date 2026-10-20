@@ -448,7 +448,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | ID | Audit ref | Severity | Area | Effort | Status |
 |---|---|---|---|---|---|
 | NN-AUD-236 | ASK-005 | Low | Admin socket | S | fixed (lab PR 179) |
-| NN-AUD-237 | ASK-009 | Low | Admin socket | M | open |
+| NN-AUD-237 | ASK-009 | Low | Admin socket | M | fixed (lab PR 213) |
 | NN-AUD-238 | ASK-012 | Low | Admin socket | S | fixed (lab PR 179) |
 | NN-AUD-239 | ASK-013 | Low | Admin socket | S | fixed (lab PR 179) |
 | NN-AUD-240 | ASK-014 | Low | Admin socket | S | fixed (lab PR 179) |
@@ -508,7 +508,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-294 | NETR-011 | Low | Net rules | — | already fixed (lab PR 140) |
 | NN-AUD-295 | NETR-012 | Low | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-296 | NETR-013 | Low | Net rules | — | already fixed (lab PR 146) |
-| NN-AUD-297 | NETR-014 | Low | Net rules | M | open (product decision) |
+| NN-AUD-297 | NETR-014 | Low | Net rules | M | fixed (lab PR 213) |
 | NN-AUD-298 | NETR-015 | Low | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-299 | PROC-011 | Low | Process rules | S | fixed (lab PR 166) |
 | NN-AUD-300 | PROC-012 | Low | Process rules | S | fixed (lab PR 177) |
@@ -10228,3 +10228,212 @@ group, the ones an unprivileged user or a local attacker could use first.
     the `kernfid` lot. No lab probe (the triage asks for unit tests and a
     docs review).
   - Lab: No dedicated lab probe: the force-posture record, `detections --path`, the role-list parser and `sd_notify` to a path and an abstract socket are covered by unit tests; on all four guests both units reached `active (running)` through `READY=1`. Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.
+- **Wave 3 — status split and chain retention, lab PR 213.** NN-AUD-237
+  (ASK-009, Low; batch 9 of the Wave 3 triage of group G3) and NN-AUD-297
+  (NETR-014, Low; batch B7 of group G4), the two findings that waited for a
+  product decision, on the integration tree (`main` with lots up to 199,
+  and lots 200–207). The decisions follow the triages' recommendation, the
+  option most conservative for security that keeps what works; the
+  alternatives not taken are below. Files: `common/src/wire/admin_protocol.rs`,
+  `common/src/wire/admin_signed_payload.rs`, `agent/src/admin_socket.rs`,
+  `agent/src/admin_socket/status_polls.rs` (new), `agent/src/admin_cli.rs`,
+  `agent/src/bin/nn_admin.rs`, `agent/src/main.rs`, `watchdog/src/lib.rs`,
+  `agent/src/decision/correlation/{store,mod}.rs`,
+  `agent/src/decision/rules/chain.rs`, `deploy/lab/soak/sample.sh`,
+  `deploy/lab/nn-lab.sh` (soak report), the upgrade notes (§3, §5, §10,
+  "Before you upgrade" 12), the install guide (§3.2, §3.3), the README.
+  - ASK-009 (237, fixed). Re-checked: `Status` was dispatched without a
+    verification and was not auditable, and its reply carried, besides the
+    posture, the ring drops and rejected records, the netflow pacing and
+    evictions, `FLOW_SOCK_MAP`, the inactive network rules, detect-only,
+    the COMBAT evidence gaps and the DoT/QUIC counts — to any root peer,
+    while the BPF guard keeps root from reading the maps. **Decision:**
+    - The unsigned `Status` answers `StatusResponse::public` (common): the
+      posture, `network_isolation_engaged`, `last_admin_action_secs_ago`,
+      `combat_stage`, `combat_locked` — what the watchdog, COMBAT recovery
+      (`COMBAT_RECOVERY.md`) and the privileged e2e read — and `None` for
+      every other field (wire shape unchanged; the agent does not even
+      compute them, `inactive_net_rules()` reads files). `public` names
+      every field, so a field appended later must be placed on one side.
+    - New signed verb `TelemetryStatusRequest` / `TelemetryStatusResponse
+      { result, status: Option<StatusResponse> }` (`status` last, so the
+      fields appended to the status stay at the end of the body), appended
+      after `ResponseRestoreResponse` (production indices 50/51; the
+      debug-only variants move to 52/53), `OperationCode::TelemetryStatus
+      = 25`, `TelemetryStatusExtra {}`. 1-of-N; the signer must hold
+      `audit-read` or `telemetry-read` (`triage`, `all` imply the latter):
+      the quorum is checked without a role (it would want each listed
+      role), then the matched keys (`VerifiedSigners.keys`, as NN-AUD-084)
+      against the two; `RoleDenied` otherwise, with the journal's
+      `verify_failure reason=role_denied` line and the signer's fingerprint
+      in the audit row. One `telemetry_status` row per request (extra `{}`:
+      the counters are not copied).
+    - `nn-admin status [--key K --agent-id-file F]` and `nn-admin net
+      status [--key …]`: without a key the public fields and `telemetry :
+      withheld from the unsigned status (…) — nn-admin status --key <key>
+      … reads them, signed` (`net status`: that line only, exit 0); a
+      reply that still carries counters (an agent older than this lot) is
+      printed as before. `--json` gains `telemetry_signed`. With a key the
+      lot-207 output; exit 7 for a key with neither role, the usual codes
+      of a refused signed request otherwise, 5 against an agent without
+      the verb.
+    - The unsigned polling, recorded (`StatusPolls`): the first unsigned
+      `status` of a peer — its uid and the comm it gives itself — in an
+      hour appends a signed `status_polled` row (client pid, uid, comm and
+      exe as every row; extra `window_secs`, `previous_window_polls` (null
+      for its first row), `peers_over_cap`); the rest of the hour is
+      counted. The registered watchdog is left out by the pid and start
+      time the agent verified (`ExemptPids`, fed by the 30 s refresh that
+      also registers it in `PROTECTED_PIDS`), never by comm: a process
+      named `northnarrow-wat` is a peer like any other. 64 peers tracked;
+      past them, after a sweep of the expired windows, the newcomers share
+      one window: renaming itself at each request buys a peer one row per
+      hour, not silence nor memory. The row is appended off the runtime,
+      after the reply's audit hook, like the other rows; a failed append is
+      a WARN.
+    - Watchdog (the follow-up of lab PRs 193/207): the ping is still the
+      unsigned `Status` with the same latency judgement, but reads only the
+      reply's variant and its two leading fields
+      (`decode_status_liveness`, `STATUS_RESPONSE_INDEX = 5`, pinned in
+      `production_discriminants_do_not_depend_on_debug_trigger`): a
+      watchdog newer than the agent no longer fails on the reply of an
+      agent older than the fields it knows (it did, on every ping, since
+      Tappa 10.8), nor would the split itself have mattered to it. Another
+      variant, an empty or cut body still fail the ping. Not done for
+      `nn-admin`: its full decode stays (the known follow-up, unchanged).
+    - `deploy/lab/soak/sample.sh` reads the drops with `nn-admin status
+      --key` (`$SOAK_ADMIN_KEY`, else `/root/northnarrow-admin.key` or
+      `/etc/northnarrow/admin.key`); without a key or on a failed read the
+      column is empty (it was `0`) and `soak report` fails the run
+      ("ring-buffer drops not read in N sample(s)"); `sample.err` is
+      fetched with the report.
+    - Alternatives not taken. `telemetry-read` alone, the triage's
+      wording: the default allowlist and the key `install.sh` bootstraps
+      (`unlock,audit-read,trusted-installer,config-manage`) do not hold it,
+      and giving it takes a `rotate-keys` quorum the install key cannot
+      sign — every existing install and the lab soak would have lost the
+      counters; what they show is no more than an `audit-read` key reads in
+      the signed audit log. Detect-only left public: it tells a local root
+      whether a kill will follow; the operator has it with `--key` and in
+      the signed `agent_boot` entry. A row per unsigned request: the
+      watchdog pings every few seconds. Refusing the unsigned `status`
+      outright: the watchdog's ping and COMBAT recovery need it without a
+      key.
+    - Regressions: the counters, the response mode and the COMBAT evidence
+      leave the unsigned `status` (scripts need `--key`, one audit row per
+      read); `status_polled` rows (≤ one per polling peer per hour); an
+      older `nn-admin` reads this agent's unsigned reply (same shape) with
+      the withheld counters absent; this `nn-admin --key` cannot talk to an
+      older agent; the debug-only discriminants moved (lab builds of
+      `nn-admin` and agent together, as ever).
+  - NETR-014 (297, fixed: decision taken). Re-checked: every chain query
+    and the store's sweeps (`with_in_window`, `prune_stale`, `evict_one`,
+    `has_precursor_in_lineage`) cut at `CORRELATION_WINDOW_NS` (300 s); the
+    lineage keys carry the incarnation since NETR-009 (lab PR 125), so the
+    audit's objection to a longer window (a precursor surviving onto a
+    recycled PID) no longer holds. **Decision:**
+    - `retention_ns(kind)`: `CredRead` and `CanaryTrip`
+      `LONG_RETENTION_NS` (30 min), `TmpExec` and `PrivEsc` 300 s.
+      Pruning is per entry and per kind (`Precursor::kept`: past the larger
+      of its kind's retention and the query's window), in
+      `with_in_window`, `chain_age` and `prune_stale`; `evict_one`'s lost
+      count and the NET-019 limiter guard ask `can_complete` (fresh, or
+      aged within its retention and not reported yet).
+    - Graded by age (`ChainAge`, `chain_age`, `chain_age_for_pid`,
+      `chain_age_in_ancestors`): CHAIN-001/003 (same PID) and CHAIN-004/006
+      (an ancestor; a fresh precursor in any ancestor first) give the
+      Critical `KillProcessTree` verdict within 300 s, unchanged, and one
+      **High `Log`** record from 300 s to 30 min, "… N min before this
+      outbound flow — past the 300 s window that kills the process tree,
+      within the 30 min a credential read is kept: recorded for the
+      analyst, no response, once per precursor"; every aged precursor of
+      the kind is then marked (`aged_reported`, kept when an exec hands it
+      to a new incarnation), so a process that reads once and connects a
+      hundred times is one record, and its flows go back to the netflow
+      pacing.
+    - Unchanged: CHAIN-002/005/008 and the three-step CHAIN-007 (its first
+      step is the staging exec, kept 300 s), the review-70 late
+      completions (`take_egress_after` at 300 s), the 4096-process and
+      16-precursor caps, the rule ids.
+    - Alternative not taken: the Critical kill for the whole 30 minutes
+      (the triage's open question; the risk it names is a long-lived
+      process — backup client, agent-style helper, `dirmngr` after a root
+      keyring read — killed up to 30 minutes after it read its own
+      credentials, with no false-positive baseline yet).
+    - Regressions: a CredRead (FIM-watched store, not wide-coverage) or a
+      canary trip followed by an egress 5–30 min later draws one High
+      record and a `VERDICT (rule)` WARN where nothing was; such a
+      process's flows skip the netflow pacing for up to 30 min until its
+      record is given; more keys may stay in the store (same caps).
+    - Owed to the lab before merge, as the triage asks: the probe (a
+      `/root/.gnupg` read, 10 min, a connect to 100.64.0.1: nothing on the
+      base tree, a CHAIN-001 High `Log` record here) and the one-hour
+      false-positive baseline on Ubuntu 24.04 (SSH, git/curl, apt under
+      sudo, root gpg and dirmngr, a backup with tar and rsync; chain
+      verdicts per rule and severity, kills, posture, netflow pacing,
+      store pressure, CPU/RSS, audit rows; base against this tree).
+  - Tests (26 new). `wire::admin_protocol`
+    `the_watchdog_reads_every_status_reply_shape` (this build's public and
+    full reply, lab PR 193's shape, the first agents' three fields,
+    trailing bytes), `the_watchdog_refuses_what_is_not_a_status_reply`,
+    `the_public_status_withholds_the_telemetry`,
+    `roundtrip_telemetry_status_verb`;
+    `production_discriminants_do_not_depend_on_debug_trigger` gains the new
+    verb (51, the last production variant; 52/53 with `debug-trigger`) and
+    `STATUS_RESPONSE_INDEX`, the rest unchanged; the signed payload's
+    op-code pin and per-op round trip gain op 25. Watchdog
+    `a_ping_does_not_depend_on_the_status_fields`,
+    `a_ping_answered_with_another_variant_fails`. `admin_socket`
+    `the_unsigned_status_withholds_the_telemetry`,
+    `the_signed_telemetry_status_needs_a_read_role` (`audit-read`,
+    `telemetry-read`, `triage`, `all` accepted; `unlock,force-posture,
+    config-manage` RoleDenied without a status; the audit rows),
+    `the_signed_telemetry_status_refuses_another_operation`,
+    `a_burst_of_unsigned_status_is_one_signed_row` (100 requests, one row;
+    20 pings of the verified watchdog, none);
+    `status_reports_detect_only_and_combat_evidence` now through the signed
+    verb. `status_polls` `a_burst_from_one_peer_is_one_row_per_window`,
+    `each_peer_has_its_own_window`,
+    `the_registered_watchdog_is_not_recorded_a_namesake_is`,
+    `peers_past_the_cap_share_one_window`. `admin_cli`
+    `cli_telemetry_status_signs_and_maps_the_reply`; `nn-admin`
+    `an_unsigned_reply_says_the_telemetry_is_withheld`. Store
+    `a_cred_read_correlates_for_thirty_minutes`,
+    `a_tmp_exec_still_expires_after_five_minutes`,
+    `an_aged_precursor_is_reported_once`,
+    `a_short_query_or_the_sweep_keeps_a_long_kind`,
+    `the_limiter_guard_follows_the_retention`; `evicts_after_ttl` and
+    `eviction_queue_stays_bounded_under_query_churn` follow the per-kind
+    retention (the NETR-004 cap tests unchanged). Chain
+    `chain001_does_not_kill_after_the_window` (was
+    `chain001_does_not_fire_after_ttl`), `a_cred_read_correlates_for_thirty_minutes`
+    (the triage's pin: t0 + 20 min a CHAIN-001 record, t0 + 31 min nothing,
+    t0 + 299 s the kill), `an_aged_read_is_recorded_once`,
+    `chain003_records_an_aged_trip_without_killing`,
+    `cross_pid_chains_grade_by_age`, `chain007_keeps_the_five_minute_window`.
+    On the starting tree the protocol, status, CLI and store tests do not
+    compile (new items); the chain tests compile and these fail there:
+    `chain001_does_not_kill_after_the_window`,
+    `a_cred_read_correlates_for_thirty_minutes`,
+    `an_aged_read_is_recorded_once`,
+    `chain003_records_an_aged_trip_without_killing`,
+    `cross_pid_chains_grade_by_age`,
+    `chain007_keeps_the_five_minute_window`. With the starting behaviour
+    put back in this tree (every kind kept 300 s; the unsigned `Status`
+    answering in full; the watchdog's full decode), those six fail, with
+    the store's `a_cred_read_correlates_for_thirty_minutes`,
+    `a_short_query_or_the_sweep_keeps_a_long_kind`,
+    `a_tmp_exec_still_expires_after_five_minutes`,
+    `an_aged_precursor_is_reported_once`, `evicts_after_ttl`,
+    `the_limiter_guard_follows_the_retention`,
+    `the_unsigned_status_withholds_the_telemetry` and the watchdog's
+    `a_ping_does_not_depend_on_the_status_fields`.
+  - Host: `cargo fmt --all` clean; clippy `--workspace --exclude
+    northnarrow-agent-ebpf --all-targets --locked -D warnings` and the
+    agent with `test-privileged,debug-trigger` clean; the CI's
+    `posture_demo` clippy fails as on the starting tree
+    (`agent/examples/posture_demo.rs:121`, `argv_truncated` and
+    `filename_truncated`; file not touched). `cargo test -q --workspace`
+    2,733 passed, 0 failed, 21 ignored; `wire::admin_protocol` with
+    `debug-trigger` 49 passed. `bash -n` on the two lab scripts. No VM.
+  - Lab: On Ubuntu 24.04, before (the tree without this lot) and after (`upgrade-check` OK): the unsigned `nn-admin status` showed the ring drops and rejected records before and only posture, isolation, combat stage and last admin action after ("telemetry: withheld …", the counters `null` in `--json`); `status --key` and `net status --key` read them signed after (`--key` did not exist before); four unsigned calls of one peer in one hour left one `status_polled` row and three `--key` calls three `telemetry_status` rows, none for the watchdog, 0 ping failures. One hour of ordinary activity (ssh to localhost, git ls-remote and curl over https, gpg on root's keyring, apt update, a tar of /root, rsync over ssh) on each tree: 12 CHAIN-008 Medium `Log`, 45 FIM-017 High `Log` and 3 NET-013 High `Log` on both, no CHAIN-001/003/004/006 record, 0 kills after (the one kill before was R011 on `kmod` started by systemd, a recorded follow-up), no correlation-store pressure, the agent at 7.7 s of CPU and 31 MB RSS for the hour. The soak reads the drops signed (PASS) and fails with "drops not read" without the key, as intended. The aged CHAIN-001 record could not be shown on the guest: a keyring read reported by the wide-coverage open sensor registers no credential-read precursor, so no CHAIN-001 fired even 120 s after it on either tree (a read of a FIM-watched inode is killed by FIM-017 first); the 30-minute retention is covered by the unit tests, and the precursor gap is a recorded follow-up (credential reads as chain precursors). Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.

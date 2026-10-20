@@ -620,6 +620,18 @@ pub struct StatusRequest {}
 /// "last admin action" timer for the operator. `None` means no
 /// admin action has been observed since the agent started.
 ///
+/// External audit ASK-009 (lab PR 213): the unsigned `status` carries only
+/// what the watchdog and COMBAT recovery need — `posture`,
+/// `network_isolation_engaged`, `last_admin_action_secs_ago`,
+/// `combat_stage`, `combat_locked` ([`StatusResponse::public`]). Every
+/// other field (the ring drops and rejected records, the netflow pacing and
+/// evictions, `FLOW_SOCK_MAP`, the inactive network rules, detect-only, the
+/// COMBAT evidence gaps, the encrypted-flow counts) is `None` there and is
+/// served by the signed [`TelemetryStatusRequest`] (`audit-read` or
+/// `telemetry-read`): a local root without an admin key no longer reads how
+/// much the agent is losing. The shape is unchanged; a field appended later
+/// is telemetry unless decided otherwise.
+///
 /// Compatibility (lab PR 193, pinned by the tests
 /// `an_older_nn_admin_reads_a_newer_status_reply` and
 /// `a_newer_nn_admin_cannot_read_an_older_status_reply`): fields are only
@@ -719,6 +731,117 @@ pub struct StatusResponse {
     pub net_dot_rows_resolver: Option<u64>,
     #[serde(default)]
     pub net_quic_rows_total: Option<u64>,
+}
+
+impl StatusResponse {
+    /// External audit ASK-009 (lab PR 213): the reply to the unsigned
+    /// `status` — the posture, the isolation, the last admin action and the
+    /// COMBAT stage and lock, the telemetry withheld (`None`; the signed
+    /// [`TelemetryStatusRequest`] serves it). Every field is named here, so
+    /// a field appended to the struct must be placed on one side or the
+    /// other.
+    pub fn public(
+        posture: PostureKind,
+        network_isolation_engaged: bool,
+        last_admin_action_secs_ago: Option<u64>,
+        combat_stage: Option<String>,
+        combat_locked: Option<bool>,
+    ) -> Self {
+        Self {
+            posture,
+            network_isolation_engaged,
+            last_admin_action_secs_ago,
+            combat_stage,
+            combat_locked,
+            ringbuf_drops_total: None,
+            ringbuf_drops: None,
+            ringbuf_rejected_total: None,
+            ringbuf_rejected: None,
+            netflow_rows_skipped_total: None,
+            netflow_pending_evicted_total: None,
+            net_inactive_rules: None,
+            flow_sock_pending: None,
+            flow_sock_capacity: None,
+            flow_sock_forgotten_min: None,
+            detect_only: None,
+            detect_only_source: None,
+            combat_evidence_unrecorded: None,
+            combat_evidence_pending: None,
+            combat_evidence_dropped: None,
+            net_dot_rows_total: None,
+            net_dot_rows_resolver: None,
+            net_quic_rows_total: None,
+        }
+    }
+
+    /// The fields [`Self::public`] withholds are all `None` (an unsigned
+    /// reply of this build, or of an agent older than all of them).
+    pub fn telemetry_withheld(&self) -> bool {
+        let public = Self::public(
+            self.posture,
+            self.network_isolation_engaged,
+            self.last_admin_action_secs_ago,
+            self.combat_stage.clone(),
+            self.combat_locked,
+        );
+        *self == public
+    }
+}
+
+/// External audit ASK-009 (lab PR 213): the postcard index of
+/// [`AdminMessage::StatusResponse`], the first byte of its frame body. The
+/// same with and without `debug-trigger` (pinned by
+/// `production_discriminants_do_not_depend_on_debug_trigger`).
+pub const STATUS_RESPONSE_INDEX: u32 = 5;
+
+/// The two leading fields of a [`StatusResponse`]: every agent has sent
+/// them first and always will (fields are only appended).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusLiveness {
+    pub posture: PostureKind,
+    pub network_isolation_engaged: bool,
+}
+
+/// Why a reply body is not a status reply ([`decode_status_liveness`]).
+#[derive(Debug)]
+pub enum StatusLivenessError {
+    /// The body does not start with a variant index and the two leading
+    /// fields.
+    Postcard(postcard::Error),
+    /// Another variant than [`AdminMessage::StatusResponse`].
+    NotAStatusResponse { index: u32 },
+}
+
+impl core::fmt::Display for StatusLivenessError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Postcard(e) => write!(f, "not a status reply: {e}"),
+            Self::NotAStatusResponse { index } => write!(
+                f,
+                "unexpected reply variant {index} (wanted StatusResponse, {STATUS_RESPONSE_INDEX})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StatusLivenessError {}
+
+/// External audit ASK-009 (lab PR 213): the watchdog's view of a `status`
+/// reply — its variant index and its two leading fields, the rest ignored.
+/// A ping then does not depend on the fields appended to [`StatusResponse`]
+/// since the agent was built: a watchdog newer than the agent reads an
+/// older agent's reply (a full decode fails on the fields the older agent
+/// did not send: postcard has no field count), and one older reads a newer
+/// agent's. `body` is the frame body, after the 4-byte length.
+pub fn decode_status_liveness(body: &[u8]) -> Result<StatusLiveness, StatusLivenessError> {
+    let (index, rest) =
+        postcard::take_from_bytes::<u32>(body).map_err(StatusLivenessError::Postcard)?;
+    if index != STATUS_RESPONSE_INDEX {
+        return Err(StatusLivenessError::NotAStatusResponse { index });
+    }
+    postcard::take_from_bytes::<StatusLiveness>(rest)
+        .map(|(liveness, _)| liveness)
+        .map_err(StatusLivenessError::Postcard)
 }
 
 /// Debug-only escape hatch: forces the agent's posture state machine
@@ -881,6 +1004,25 @@ pub struct ResponseRestoreResponse {
     pub message: String,
 }
 
+/// External audit ASK-009 (lab PR 213) — signed `status --key` /
+/// `net status --key`: the telemetry the unsigned `status` withholds.
+/// 1-of-N, `audit-read` or `telemetry-read`; one audit row per request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryStatusRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Reply to [`TelemetryStatusRequest`]: `status` is the whole
+/// [`StatusResponse`], the telemetry filled in, when `result` is
+/// `Success`, else `None`. Last field, so the fields later appended to
+/// [`StatusResponse`] stay at the end of the body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryStatusResponse {
+    pub result: AdminResult,
+    pub status: Option<StatusResponse>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminMessage {
     // ── client → server ────────────────────────────────────────
@@ -1031,6 +1173,12 @@ pub enum AdminMessage {
     ResponseRestoreRequest(ResponseRestoreRequest),
     /// Reply to [`AdminMessage::ResponseRestoreRequest`].
     ResponseRestoreResponse(ResponseRestoreResponse),
+    /// External audit ASK-009 (lab PR 213) — signed read of the telemetry
+    /// the unsigned `status` withholds. Triggers
+    /// [`AdminMessage::TelemetryStatusResponse`].
+    TelemetryStatusRequest(TelemetryStatusRequest),
+    /// Reply to [`AdminMessage::TelemetryStatusRequest`].
+    TelemetryStatusResponse(TelemetryStatusResponse),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -1334,14 +1482,32 @@ mod tests {
             path: String::new(),
             message: String::new(),
         });
-        assert_eq!(first(&restore), 49, "the last production variant");
+        assert_eq!(first(&restore), 49, "ResponseRestoreResponse");
+        // External audit ASK-009 (lab PR 213): the signed telemetry verb,
+        // appended after it.
+        let telemetry = AdminMessage::TelemetryStatusResponse(TelemetryStatusResponse {
+            result: AdminResult::RoleDenied,
+            status: None,
+        });
+        assert_eq!(first(&telemetry), 51, "the last production variant");
+        assert_eq!(
+            first(&AdminMessage::StatusResponse(StatusResponse::public(
+                PostureKind::Observing,
+                false,
+                None,
+                None,
+                None
+            ))) as u32,
+            STATUS_RESPONSE_INDEX,
+            "the watchdog's liveness decode"
+        );
         #[cfg(feature = "debug-trigger")]
         {
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                50
+                52
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 51);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 53);
         }
     }
 
@@ -1594,7 +1760,9 @@ mod tests {
                 | AdminMessage::ResponseReleaseRequest(_)
                 | AdminMessage::ResponseReleaseResponse(_)
                 | AdminMessage::ResponseRestoreRequest(_)
-                | AdminMessage::ResponseRestoreResponse(_) => {}
+                | AdminMessage::ResponseRestoreResponse(_)
+                | AdminMessage::TelemetryStatusRequest(_)
+                | AdminMessage::TelemetryStatusResponse(_) => {}
             }
         }
     }
@@ -1800,6 +1968,176 @@ mod tests {
         };
         let body = postcard::to_allocvec(&old).unwrap();
         assert!(postcard::from_bytes::<StatusResponse>(&body).is_err());
+    }
+
+    /// The status reply of the first agents (Tappa 7): three fields.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct StatusResponseTappa7 {
+        posture: PostureKind,
+        network_isolation_engaged: bool,
+        last_admin_action_secs_ago: Option<u64>,
+    }
+
+    /// A frame body as an agent of that shape sends it: the variant index,
+    /// then the struct.
+    fn status_body<T: Serialize>(status: &T) -> Vec<u8> {
+        let mut body = vec![STATUS_RESPONSE_INDEX as u8];
+        body.extend(postcard::to_allocvec(status).unwrap());
+        body
+    }
+
+    /// External audit ASK-009 (lab PR 213): the watchdog's ping reads the
+    /// variant and the two leading fields only, so it reads the reply of an
+    /// agent older than the fields this build knows (where the full decode
+    /// fails, `a_lab207_nn_admin_cannot_read_a_lab193_status_reply`), of
+    /// this build (public or full) and of the first agents.
+    #[test]
+    fn the_watchdog_reads_every_status_reply_shape() {
+        let full = status_with_lab193_fields();
+        let current = encode_frame(&AdminMessage::StatusResponse(full.clone())).unwrap();
+        let lab193 = StatusResponseLabPr193 {
+            posture: PostureKind::Engaged,
+            network_isolation_engaged: true,
+            last_admin_action_secs_ago: None,
+            ringbuf_drops_total: Some(4),
+            ringbuf_drops: Some(vec![("exec".to_string(), 4)]),
+            combat_stage: None,
+            combat_locked: Some(false),
+            ringbuf_rejected_total: Some(0),
+            ringbuf_rejected: Some(Vec::new()),
+            netflow_rows_skipped_total: Some(0),
+            netflow_pending_evicted_total: Some(0),
+            net_inactive_rules: Some(Vec::new()),
+            flow_sock_pending: None,
+            flow_sock_capacity: None,
+            flow_sock_forgotten_min: None,
+            detect_only: Some(false),
+            detect_only_source: None,
+            combat_evidence_unrecorded: Some(0),
+            combat_evidence_pending: Some(0),
+            combat_evidence_dropped: Some(0),
+        };
+        let first = StatusResponseTappa7 {
+            posture: PostureKind::Alerted,
+            network_isolation_engaged: false,
+            last_admin_action_secs_ago: Some(3),
+        };
+        let public = encode_frame(&AdminMessage::StatusResponse(StatusResponse::public(
+            PostureKind::Observing,
+            false,
+            None,
+            None,
+            Some(false),
+        )))
+        .unwrap();
+        let read = |body: &[u8]| decode_status_liveness(body).expect("a status reply");
+        assert_eq!(
+            read(&current[4..]),
+            StatusLiveness {
+                posture: PostureKind::Combat,
+                network_isolation_engaged: false
+            }
+        );
+        assert_eq!(read(&public[4..]).posture, PostureKind::Observing);
+        let old = read(&status_body(&lab193));
+        assert_eq!(old.posture, PostureKind::Engaged);
+        assert!(old.network_isolation_engaged);
+        assert_eq!(read(&status_body(&first)).posture, PostureKind::Alerted);
+        // Trailing bytes of fields appended after this build: ignored.
+        let mut longer = current[4..].to_vec();
+        longer.extend([1, 7, 1, 9]);
+        assert_eq!(read(&longer).posture, PostureKind::Combat);
+    }
+
+    /// Anything else is not an answer to the ping: another variant (the
+    /// signed telemetry reply included), an empty or cut body.
+    #[test]
+    fn the_watchdog_refuses_what_is_not_a_status_reply() {
+        let other = encode_frame(&AdminMessage::UnlockResult(UnlockResult::Success)).unwrap();
+        assert!(matches!(
+            decode_status_liveness(&other[4..]),
+            Err(StatusLivenessError::NotAStatusResponse { index: 4 })
+        ));
+        let telemetry = encode_frame(&AdminMessage::TelemetryStatusResponse(
+            TelemetryStatusResponse {
+                result: AdminResult::Success,
+                status: Some(status_with_lab193_fields()),
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            decode_status_liveness(&telemetry[4..]),
+            Err(StatusLivenessError::NotAStatusResponse { index: 51 })
+        ));
+        assert!(matches!(
+            decode_status_liveness(&[]),
+            Err(StatusLivenessError::Postcard(_))
+        ));
+        // the index and the posture, without the isolation flag
+        assert!(matches!(
+            decode_status_liveness(&[STATUS_RESPONSE_INDEX as u8, 0]),
+            Err(StatusLivenessError::Postcard(_))
+        ));
+        // a posture index no build has
+        assert!(decode_status_liveness(&[STATUS_RESPONSE_INDEX as u8, 9, 0]).is_err());
+    }
+
+    /// External audit ASK-009 (lab PR 213): the unsigned reply withholds
+    /// every telemetry field; the public ones pass through.
+    #[test]
+    fn the_public_status_withholds_the_telemetry() {
+        let public = StatusResponse::public(
+            PostureKind::Combat,
+            true,
+            Some(12),
+            Some("ISOLATE".to_string()),
+            Some(true),
+        );
+        assert!(public.telemetry_withheld());
+        assert_eq!(public.posture, PostureKind::Combat);
+        assert!(public.network_isolation_engaged);
+        assert_eq!(public.last_admin_action_secs_ago, Some(12));
+        assert_eq!(public.combat_stage.as_deref(), Some("ISOLATE"));
+        assert_eq!(public.combat_locked, Some(true));
+        assert_eq!(public.ringbuf_drops_total, None);
+        assert_eq!(public.ringbuf_rejected_total, None);
+        assert_eq!(public.net_inactive_rules, None);
+        assert_eq!(public.detect_only, None);
+        assert_eq!(public.combat_evidence_unrecorded, None);
+        assert_eq!(public.net_quic_rows_total, None);
+        assert!(!status_with_lab193_fields().telemetry_withheld());
+        // Same shape: an older nn-admin or watchdog reads it.
+        let body = postcard::to_allocvec(&public).unwrap();
+        let old: StatusResponseLabPr164 = postcard::from_bytes(&body).unwrap();
+        assert_eq!(old.ringbuf_drops_total, None);
+        assert_eq!(old.combat_locked, Some(true));
+    }
+
+    /// External audit ASK-009 (lab PR 213): the signed telemetry verb and
+    /// its reply survive a wire round-trip.
+    #[test]
+    fn roundtrip_telemetry_status_verb() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        roundtrip(AdminMessage::TelemetryStatusRequest(
+            TelemetryStatusRequest {
+                payload: SignedPayload::new_telemetry_status([0x44; 32], 1_700_000_000, [0x55; 16]),
+                signatures: vec![KeyedSignature {
+                    signature: [0x66; 64],
+                }],
+            },
+        ));
+        roundtrip(AdminMessage::TelemetryStatusResponse(
+            TelemetryStatusResponse {
+                result: AdminResult::Success,
+                status: Some(status_with_lab193_fields()),
+            },
+        ));
+        roundtrip(AdminMessage::TelemetryStatusResponse(
+            TelemetryStatusResponse {
+                result: AdminResult::RoleDenied,
+                status: None,
+            },
+        ));
     }
 
     /// External audit CMB-016: the three response verbs and their replies

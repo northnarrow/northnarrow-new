@@ -1447,7 +1447,7 @@ cmd_soak() {
             dir="$LAB_DIR/reports/soak-$stamp"; report="$LAB_DIR/reports/soak-$stamp.md"
             mkdir -p "$dir"
             vscp \
-                "$GUEST:soak/samples.csv" "$GUEST:soak/sample.log" "$GUEST:soak/generate.log" "$GUEST:soak/host" "$GUEST:soak/hours" "$dir/" 2>/dev/null || true
+                "$GUEST:soak/samples.csv" "$GUEST:soak/sample.log" "$GUEST:soak/sample.err" "$GUEST:soak/generate.log" "$GUEST:soak/host" "$GUEST:soak/hours" "$dir/" 2>/dev/null || true
             vssh 'sudo journalctl -u northnarrow-agent -u northnarrow-watchdog --since "$(cat ~/soak/start)" -p 4 --no-pager -q 2>/dev/null | tail -200' > "$dir/journal-warn-err.log" 2>/dev/null || true
             [ -s "$dir/samples.csv" ] || die "no samples.csv on the guest — was the soak started?"
             local max_rss_mb_h=${NN_LAB_SOAK_MAX_RSS_MB_H:-5}
@@ -1463,6 +1463,9 @@ cmd_soak() {
                 n++; t[n]=$1; pid[n]=$2; rss[n]=$3; vsz[n]=$4; cpu[n]=$5; thr[n]=$6; fds[n]=$7; wd[n]=$8
                 ar[n]=$9; wr[n]=$10; jw[n]=$11; je[n]=$12; cb[n]=$13; det[n]=$14; sts[n]=$15; aud[n]=$16; fim[n]=$17
                 fs[n]=$18; us[n]=$19; fdm[n]=$20; pp[n]=$21; dr[n]=$22; gi[n]=$23
+                # External audit ASK-009 (lab PR 213): an empty drop column is
+                # a sample whose signed `status --key` read failed (no key)
+                if ($22 == "") unread++
                 # NN-AUD-216: liveness per sample (a sampler without the column
                 # counts as alive when it found a pid); one dead sample is a
                 # respawn gap, two in a row or the last one is a dead agent
@@ -1492,6 +1495,7 @@ cmd_soak() {
                 if (maxdead >= 2 || al[n] == 0) fail = fail "; agent down (" maxdead " consecutive sample(s) without a live agent" (al[n] == 0 ? ", down at the end" : "") ")"
                 if (maxwd >= 2 || wa[n] == 0) fail = fail "; watchdog missing (" maxwd " consecutive sample(s))"
                 if (mpmax >= 90) fail = fail "; a BPF map at " mpmax "% of max_entries"
+                if (unread > 0) fail = fail "; ring-buffer drops not read in " unread " sample(s) (nn-admin status --key: no admin key on the guest, see sample.log / sample.err)"
                 if (dr[n] - dr[1] > maxdrops) fail = fail "; ring-buffer drops +" (dr[n]-dr[1]) " > " maxdrops
                 else if (dr[n] - dr[1] > 0) warn = warn "; ring-buffer drops +" (dr[n]-dr[1])
                 if (cb[n] > 0) warn = warn "; " cb[n] " COMBAT journal line(s)"

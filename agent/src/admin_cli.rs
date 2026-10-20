@@ -149,6 +149,10 @@ pub struct StatusOutcome {
     pub net_dot_rows_total: Option<u64>,
     pub net_dot_rows_resolver: Option<u64>,
     pub net_quic_rows_total: Option<u64>,
+    /// External audit ASK-009 (lab PR 213): the reply of the signed
+    /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
+    /// telemetry fields the agent leaves `None` — withheld, not unknown.
+    pub telemetry_signed: bool,
 }
 
 #[derive(Debug)]
@@ -260,7 +264,10 @@ pub fn run_unlock(socket: &Path, key_path: &Path) -> Result<UnlockOutcome> {
     })
 }
 
-/// Status query — round-trip a `StatusRequest`/`StatusResponse`.
+/// Status query — round-trip a `StatusRequest`/`StatusResponse`. Since
+/// external audit ASK-009 (lab PR 213) the agent answers only the posture,
+/// the isolation, the last admin action and the COMBAT stage and lock;
+/// [`run_telemetry_status`] reads the rest.
 pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
     let mut stream = connect_socket(socket)?;
     write_frame(&mut stream, &AdminMessage::Status(StatusRequest {}))?;
@@ -268,7 +275,54 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         AdminMessage::StatusResponse(s) => s,
         other => bail!("unexpected server reply to StatusRequest: {other:?}"),
     };
-    Ok(StatusOutcome {
+    Ok(status_outcome(resp, false))
+}
+
+/// External audit ASK-009 (lab PR 213): `nn-admin status --key` /
+/// `net status --key` — the signed read of the whole status, telemetry
+/// included (`audit-read` or `telemetry-read`, 1-of-N). `Ok(Err(result))`
+/// when the agent refused the request.
+pub fn run_telemetry_status(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+) -> Result<std::result::Result<StatusOutcome, AdminResult>> {
+    use common::wire::admin_protocol::TelemetryStatusRequest;
+    match signed_request(
+        socket,
+        key_path,
+        agent_id_path,
+        SignedPayload::new_telemetry_status,
+        |payload, signatures| {
+            AdminMessage::TelemetryStatusRequest(TelemetryStatusRequest {
+                payload,
+                signatures,
+            })
+        },
+    )? {
+        AdminMessage::TelemetryStatusResponse(r) => match (r.result, r.status) {
+            (AdminResult::Success, Some(status)) => Ok(Ok(status_outcome(status, true))),
+            (AdminResult::Success, None) => {
+                bail!("the agent accepted the telemetry request but sent no status")
+            }
+            (refused, _) => Ok(Err(refused)),
+        },
+        // An agent older than the verb cannot decode it: it closes the
+        // connection, or answers with a sentinel.
+        other => bail!(
+            "unexpected reply to TelemetryStatusRequest: {other:?} (an agent older than \
+             lab PR 213 has no signed telemetry verb: run `status` without --key)"
+        ),
+    }
+}
+
+/// A status reply as the CLI prints it; `signed` says which verb it came
+/// from.
+fn status_outcome(
+    resp: common::wire::admin_protocol::StatusResponse,
+    signed: bool,
+) -> StatusOutcome {
+    StatusOutcome {
         posture: resp.posture,
         network_isolation_engaged: resp.network_isolation_engaged,
         last_admin_action_secs_ago: resp.last_admin_action_secs_ago,
@@ -292,7 +346,8 @@ pub fn run_status(socket: &Path) -> Result<StatusOutcome> {
         net_dot_rows_total: resp.net_dot_rows_total,
         net_dot_rows_resolver: resp.net_dot_rows_resolver,
         net_quic_rows_total: resp.net_quic_rows_total,
-    })
+        telemetry_signed: signed,
+    }
 }
 
 /// Tappa 8 A9 — full signed-shutdown CLI flow.
@@ -3647,6 +3702,83 @@ mod tests {
         let o = outcome.expect("client should not error");
         assert!(o.done);
         assert_eq!(o.path.as_deref(), Some("/tmp/out"));
+    }
+
+    /// External audit ASK-009 (lab PR 213): `status --key` signs a
+    /// `TelemetryStatus` payload over the challenge and returns the whole
+    /// status, marked signed; a refusal is returned as the agent's result.
+    #[test]
+    fn cli_telemetry_status_signs_and_maps_the_reply() {
+        use common::wire::admin_protocol::{StatusResponse, TelemetryStatusResponse};
+        use common::wire::admin_signed_payload::{OperationCode, OperationExtra};
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("admin.sock");
+        let key = dir.path().join("admin.key");
+        let signing = SigningKey::generate(&mut OsRng);
+        write_priv_key_file(&key, &signing);
+        let agent_id_path = write_agent_id_file(&dir, &[0x5Au8; 16]);
+        for refuse in [false, true] {
+            let vk = signing.verifying_key();
+            let socket_for_client = socket.clone();
+            let _ = std::fs::remove_file(&socket);
+            let outcome = run_with_mock_server(
+                &socket,
+                move |stream| {
+                    let _ = server_read_frame(stream);
+                    server_write_frame(
+                        stream,
+                        &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                            nonce: [9u8; 32],
+                        }),
+                    );
+                    let req = match server_read_frame(stream) {
+                        AdminMessage::TelemetryStatusRequest(r) => r,
+                        other => panic!("expected TelemetryStatusRequest, got {other:?}"),
+                    };
+                    verify(&req.payload, &req.signatures[0].signature, &vk).expect("signed");
+                    assert_eq!(req.payload.op, OperationCode::TelemetryStatus);
+                    assert_eq!(req.payload.nonce, [9u8; 32]);
+                    assert!(matches!(
+                        req.payload.extra,
+                        OperationExtra::TelemetryStatus(_)
+                    ));
+                    let mut status = StatusResponse::public(
+                        PostureKind::Alerted,
+                        false,
+                        None,
+                        None,
+                        Some(false),
+                    );
+                    status.ringbuf_drops_total = Some(17);
+                    status.detect_only = Some(false);
+                    server_write_frame(
+                        stream,
+                        &AdminMessage::TelemetryStatusResponse(if refuse {
+                            TelemetryStatusResponse {
+                                result: AdminResult::RoleDenied,
+                                status: None,
+                            }
+                        } else {
+                            TelemetryStatusResponse {
+                                result: AdminResult::Success,
+                                status: Some(status),
+                            }
+                        }),
+                    );
+                },
+                || run_telemetry_status(&socket_for_client, &key, &agent_id_path),
+            );
+            let outcome = outcome.expect("client should not error");
+            if refuse {
+                assert_eq!(outcome.unwrap_err(), AdminResult::RoleDenied);
+            } else {
+                let out = outcome.expect("signed status");
+                assert!(out.telemetry_signed);
+                assert_eq!(out.ringbuf_drops_total, Some(17));
+                assert_eq!(out.detect_only, Some(false));
+                assert_eq!(out.posture, PostureKind::Alerted);
+            }
+        }
     }
 
     /// Required A9 test 2 (server quorum-not-met → client outcome):

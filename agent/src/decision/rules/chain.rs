@@ -55,6 +55,22 @@
 //! (`has_recent_in_ancestors`) + N-event (`has_sequence`) chains
 //! CHAIN-004..008 over the same shared store.
 //!
+//! ## Retention per precursor kind (external audit NETR-014, lab PR 213)
+//!
+//! A credential read and a canary trip are kept 30 minutes
+//! ([`crate::decision::correlation::LONG_RETENTION_NS`]); a staging-directory exec and a `sudo`/`su`
+//! stay at [`CORRELATION_WINDOW_NS`] (300 s). CHAIN-001/003/004/006 grade
+//! the correlation by age ([`ChainAge`]): an egress within 300 s of the
+//! precursor is the Critical `KillProcessTree` verdict, unchanged; past
+//! 300 s and within 30 minutes it is one **High `Log`** record, once per
+//! precursor, with no response and no COMBAT. Waiting out five minutes no
+//! longer hides the chain from the analyst, and a long-lived process that
+//! opens a credential store and talks to the network much later (a backup
+//! client, an agent-style helper) is not killed for it. CHAIN-002/005/008
+//! (staging exec, `sudo`/`su`) and the three-step CHAIN-007 (its first step
+//! is the staging exec) keep the 300 s window; so do the review-70 late
+//! completions (`take_egress_after`).
+//!
 //! ## Rate limiting (§13 Q4)
 //!
 //! All chain rules are Critical and fire the deterministic
@@ -76,7 +92,8 @@ use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::decision::correlation::{
-    CorrelationStore, EgressNote, PrecursorKind, ProcKey, CORRELATION_WINDOW_NS,
+    retention_ns, ChainAge, CorrelationStore, EgressNote, PrecursorKind, ProcKey,
+    CORRELATION_WINDOW_NS,
 };
 use crate::decision::Rule;
 use crate::fim::rules::is_credential_store_access;
@@ -92,6 +109,40 @@ fn chain_verdict(rule: &dyn Rule, nf: &common::wire::NetFlowEvent, reasoning: &s
         ResponseAction::KillProcessTree,
         Severity::Critical,
         reasoning,
+    )
+}
+
+/// External audit NETR-014 (lab PR 213): the record of a chain whose
+/// precursor is older than [`CORRELATION_WINDOW_NS`] and within its 30-minute
+/// retention — High, `Log`: no response, no COMBAT. `what` says what the
+/// process (or its ancestor) did; the age is in minutes.
+fn aged_chain_verdict(
+    rule: &dyn Rule,
+    nf: &common::wire::NetFlowEvent,
+    age_ns: u64,
+    kind: PrecursorKind,
+    what: &str,
+    technique: &str,
+) -> Verdict {
+    let kept = match kind {
+        PrecursorKind::CredRead => "credential read",
+        PrecursorKind::CanaryTrip => "canary trip",
+        PrecursorKind::TmpExec | PrecursorKind::PrivEsc => "precursor",
+    };
+    chain_verdict_with(
+        rule,
+        nf,
+        ResponseAction::Log,
+        Severity::High,
+        &format!(
+            "{what} {} min before this outbound flow — past the {} s window that \
+             kills the process tree, within the {} min a {kept} is kept: recorded \
+             for the analyst, no response, once per precursor ({technique}; external \
+             audit NETR-014)",
+            age_ns / 60_000_000_000,
+            CORRELATION_WINDOW_NS / 1_000_000_000,
+            retention_ns(kind) / 60_000_000_000,
+        ),
     )
 }
 
@@ -233,15 +284,21 @@ impl Rule for NnLChain001CredReadThenEgress {
                 ))
             }
             // Trigger: same-PID egress after a recorded cred access.
+            // External audit NETR-014: graded by the read's age.
             Event::NetFlow(nf) => {
                 let mut store = self.buf.lock();
-                if !store.has_recent_for_pid(
-                    nf.pid,
-                    PrecursorKind::CredRead,
-                    nf.start_ns,
-                    CORRELATION_WINDOW_NS,
-                ) {
-                    return None;
+                match store.chain_age_for_pid(nf.pid, PrecursorKind::CredRead, nf.start_ns)? {
+                    ChainAge::Fresh => {}
+                    ChainAge::Aged { age_ns } => {
+                        return Some(aged_chain_verdict(
+                            self,
+                            nf,
+                            age_ns,
+                            PrecursorKind::CredRead,
+                            "Process accessed a credential store",
+                            "T1555 → T1041",
+                        ))
+                    }
                 }
                 // Review 70: completed in order; no late read may reuse it.
                 let key = store.current_key(nf.pid);
@@ -404,15 +461,23 @@ impl Rule for NnLChain003CanaryThenEgress {
                 );
                 None
             }
-            // Trigger: same-PID egress after the trip.
+            // Trigger: same-PID egress after the trip. External audit
+            // NETR-014: graded by the trip's age.
             Event::NetFlow(nf) => {
-                if !self.buf.lock().has_recent_for_pid(
+                let age = self.buf.lock().chain_age_for_pid(
                     nf.pid,
                     PrecursorKind::CanaryTrip,
                     nf.start_ns,
-                    CORRELATION_WINDOW_NS,
-                ) {
-                    return None;
+                )?;
+                if let ChainAge::Aged { age_ns } = age {
+                    return Some(aged_chain_verdict(
+                        self,
+                        nf,
+                        age_ns,
+                        PrecursorKind::CanaryTrip,
+                        "Process tripped a deception canary",
+                        "deception → T1041",
+                    ));
                 }
                 Some(chain_verdict(
                     self,
@@ -470,13 +535,20 @@ impl Rule for NnLChain004CrossPidCredExfil {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        if !self.buf.lock().has_recent_in_ancestors(
-            nf.pid,
-            PrecursorKind::CredRead,
-            nf.start_ns,
-            CORRELATION_WINDOW_NS,
-        ) {
-            return None;
+        // External audit NETR-014: graded by the read's age.
+        let age =
+            self.buf
+                .lock()
+                .chain_age_in_ancestors(nf.pid, PrecursorKind::CredRead, nf.start_ns)?;
+        if let ChainAge::Aged { age_ns } = age {
+            return Some(aged_chain_verdict(
+                self,
+                nf,
+                age_ns,
+                PrecursorKind::CredRead,
+                "A process ancestor read a credential store",
+                "T1555 → T1041, cross-PID",
+            ));
         }
         Some(chain_verdict(
             self,
@@ -574,13 +646,21 @@ impl Rule for NnLChain006CrossPidCanaryExfil {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        if !self.buf.lock().has_recent_in_ancestors(
+        // External audit NETR-014: graded by the trip's age.
+        let age = self.buf.lock().chain_age_in_ancestors(
             nf.pid,
             PrecursorKind::CanaryTrip,
             nf.start_ns,
-            CORRELATION_WINDOW_NS,
-        ) {
-            return None;
+        )?;
+        if let ChainAge::Aged { age_ns } = age {
+            return Some(aged_chain_verdict(
+                self,
+                nf,
+                age_ns,
+                PrecursorKind::CanaryTrip,
+                "A process ancestor tripped a deception canary",
+                "deception → T1041, cross-PID",
+            ));
         }
         Some(chain_verdict(
             self,
@@ -1009,12 +1089,86 @@ mod tests {
         assert!(r.evaluate(&flow(42, 443, 100 * SEC)).is_none());
     }
 
+    /// External audit NETR-014 (lab PR 213): past the 300 s window the
+    /// correlation no longer kills — it is one High record, no response —
+    /// and nothing past the 30-minute retention (it used to be nothing past
+    /// 300 s).
     #[test]
-    fn chain001_does_not_fire_after_ttl() {
+    fn chain001_does_not_kill_after_the_window() {
         let r = chain001();
         r.evaluate(&cred_fim(42, 10 * SEC));
-        // Egress 6 minutes later — precursor expired.
-        assert!(r.evaluate(&flow(42, 443, 10 * SEC + 360 * SEC)).is_none());
+        // Egress 6 minutes later: recorded, not killed.
+        let v = r
+            .evaluate(&flow(42, 443, 10 * SEC + 360 * SEC))
+            .expect("an aged correlation is recorded");
+        assert_eq!(v.rule_id, "NN-L-CHAIN-001_CredReadThenEgress");
+        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            v.reasoning.contains("6 min before") && v.reasoning.contains("no response"),
+            "{}",
+            v.reasoning
+        );
+        let r = chain001();
+        r.evaluate(&cred_fim(43, 10 * SEC));
+        assert!(r
+            .evaluate(&flow(43, 443, 10 * SEC + 31 * 60 * SEC))
+            .is_none());
+    }
+
+    /// External audit NETR-014: the triage's pin — a credential read at t0
+    /// and an egress at t0 + 20 min give CHAIN-001 (the record), at
+    /// t0 + 31 min nothing; within 300 s it is still the Critical kill.
+    #[test]
+    fn a_cred_read_correlates_for_thirty_minutes() {
+        let t0 = 100 * SEC;
+        let r = chain001();
+        r.evaluate(&cred_fim(42, t0));
+        let v = r
+            .evaluate(&flow(42, 443, t0 + 20 * 60 * SEC))
+            .expect("CHAIN-001");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::Log)
+        );
+        let r = chain001();
+        r.evaluate(&cred_fim(42, t0));
+        assert!(r.evaluate(&flow(42, 443, t0 + 31 * 60 * SEC)).is_none());
+        let r = chain001();
+        r.evaluate(&cred_fim(42, t0));
+        let v = r
+            .evaluate(&flow(42, 443, t0 + 299 * SEC))
+            .expect("CHAIN-001");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::Critical, ResponseAction::KillProcessTree),
+            "unchanged within 300 s"
+        );
+    }
+
+    /// External audit NETR-014: one record per read — a backup client that
+    /// read its credentials and then makes a hundred connections is one
+    /// record, not a hundred; a new read is a new record (and a fresh one
+    /// is the kill again).
+    #[test]
+    fn an_aged_read_is_recorded_once() {
+        let t0 = 100 * SEC;
+        let r = chain001();
+        r.evaluate(&cred_fim(42, t0));
+        let fired = (0..100)
+            .filter_map(|i| r.evaluate(&flow(42, 443, t0 + 400 * SEC + i * SEC)))
+            .count();
+        assert_eq!(fired, 1);
+        r.evaluate(&cred_fim(42, t0 + 600 * SEC));
+        let v = r
+            .evaluate(&flow(42, 443, t0 + 1000 * SEC))
+            .expect("the new read");
+        assert_eq!(v.severity, Severity::High);
+        r.evaluate(&cred_fim(42, t0 + 1100 * SEC));
+        let v = r
+            .evaluate(&flow(42, 443, t0 + 1110 * SEC))
+            .expect("a fresh read");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
     #[test]
@@ -1219,6 +1373,35 @@ mod tests {
         assert_eq!(v.action, ResponseAction::KillProcessTree);
     }
 
+    /// External audit NETR-014: a canary trip is kept 30 minutes too —
+    /// past 300 s, one High record.
+    #[test]
+    fn chain003_records_an_aged_trip_without_killing() {
+        let r = chain003();
+        r.evaluate(&canary_trip(42, 10 * SEC));
+        let v = r
+            .evaluate(&flow(42, 443, 10 * SEC + 12 * 60 * SEC))
+            .expect("an aged trip is recorded");
+        assert_eq!(v.rule_id, "NN-L-CHAIN-003_CanaryThenEgress");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::Log)
+        );
+        assert!(
+            v.reasoning.contains("canary trip is kept"),
+            "{}",
+            v.reasoning
+        );
+        assert!(r
+            .evaluate(&flow(42, 443, 10 * SEC + 13 * 60 * SEC))
+            .is_none());
+        let r = chain003();
+        r.evaluate(&canary_trip(42, 10 * SEC));
+        assert!(r
+            .evaluate(&flow(42, 443, 10 * SEC + 31 * 60 * SEC))
+            .is_none());
+    }
+
     #[test]
     fn chain003_does_not_fire_without_precursor_or_cross_pid() {
         let r = chain003();
@@ -1415,6 +1598,91 @@ mod tests {
             fired.contains(&"NN-L-CHAIN-004_CrossPidCredExfil".to_string()),
             "{fired:?}"
         );
+    }
+
+    /// External audit NETR-014: the cross-PID chains grade by age too — an
+    /// ancestor's read 10 minutes old is one High record for a descendant's
+    /// egress; a fresh read in any ancestor is the kill, before an aged one
+    /// in a nearer ancestor. The staging chains keep 300 s.
+    #[test]
+    fn cross_pid_chains_grade_by_age() {
+        let c004 = "NN-L-CHAIN-004_CrossPidCredExfil";
+        let verdict_of = |rules: &[Box<dyn Rule>], e: &Event, id: &str| {
+            rules
+                .iter()
+                .filter_map(|r| r.evaluate(e))
+                .find(|v| v.rule_id == id)
+        };
+        let rules = chain_rules();
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 10 * SEC),
+        );
+        fire_ids(
+            &rules,
+            &proc_spawn(300, 200, "curl", "/usr/bin/curl", 11 * SEC),
+        );
+        fire_ids(&rules, &cred_fim(100, 12 * SEC));
+        let v = verdict_of(&rules, &flow(300, 443, 12 * SEC + 600 * SEC), c004)
+            .expect("an aged ancestor read is recorded");
+        assert_eq!(
+            (v.severity, v.action),
+            (Severity::High, ResponseAction::Log)
+        );
+        assert!(verdict_of(&rules, &flow(300, 443, 12 * SEC + 601 * SEC), c004).is_none());
+        // aged in the parent (200), fresh in the grandparent (100)
+        let rules = chain_rules();
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 10 * SEC),
+        );
+        fire_ids(
+            &rules,
+            &proc_spawn(300, 200, "curl", "/usr/bin/curl", 11 * SEC),
+        );
+        fire_ids(&rules, &cred_fim(200, 12 * SEC));
+        fire_ids(&rules, &cred_fim(100, 700 * SEC));
+        let v = verdict_of(&rules, &flow(300, 443, 710 * SEC), c004).expect("CHAIN-004");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        // CHAIN-006: an ancestor's canary trip
+        let rules = chain_rules();
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 10 * SEC),
+        );
+        fire_ids(&rules, &canary_trip(100, 12 * SEC));
+        let v = verdict_of(
+            &rules,
+            &flow(200, 443, 12 * SEC + 900 * SEC),
+            "NN-L-CHAIN-006_CrossPidCanaryExfil",
+        )
+        .expect("CHAIN-006 record");
+        assert_eq!(v.severity, Severity::High);
+        // CHAIN-005 (staging exec) still ends at 300 s
+        let rules = chain_rules();
+        fire_ids(
+            &rules,
+            &proc_spawn(100, 1, "dropper", "/tmp/dropper", 10 * SEC),
+        );
+        fire_ids(
+            &rules,
+            &proc_spawn(200, 100, "bash", "/usr/bin/bash", 11 * SEC),
+        );
+        let fired = fire_ids(&rules, &flow(200, 4444, 10 * SEC + 360 * SEC));
+        assert!(fired.is_empty(), "{fired:?}");
+    }
+
+    /// External audit NETR-014: the three-step chain's first step is the
+    /// staging exec, kept 300 s — CHAIN-007 does not stretch; the read alone
+    /// still gives CHAIN-001's record.
+    #[test]
+    fn chain007_keeps_the_five_minute_window() {
+        let rules = chain_rules();
+        fire_ids(&rules, &tmp_spawn(42, 10 * SEC));
+        fire_ids(&rules, &cred_fim(42, 11 * SEC));
+        let v = first_verdict(&rules, &flow(42, 443, 10 * SEC + 400 * SEC)).expect("a verdict");
+        assert_eq!(v.rule_id, C001, "not CHAIN-007");
+        assert_eq!(v.action, ResponseAction::Log);
     }
 
     #[test]

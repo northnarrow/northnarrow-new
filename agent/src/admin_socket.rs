@@ -47,8 +47,8 @@ use common::wire::admin_protocol::{
     NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
     ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest,
     ResponseRestoreResponse, ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, TrustedInstallerGrantRequest,
-    UnlockResult, MAX_FRAME_BODY,
+    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, TelemetryStatusRequest,
+    TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
@@ -74,6 +74,11 @@ use tokio::sync::Notify;
 
 /// External audit WDG-007: the socket's identity and its watch.
 pub mod socket_watch;
+
+/// External audit ASK-009 (lab PR 213): the unsigned `status` polling,
+/// summarised in the signed audit log.
+pub mod status_polls;
+pub use status_polls::StatusPolls;
 
 /// Cross-task signal that an admin-authorised shutdown has been
 /// accepted by the dispatcher. Tappa 8 A8 wires this between the
@@ -339,6 +344,7 @@ pub async fn serve(
         None,
         None,
         Arc::default(),
+        Arc::default(),
     )
     .await
 }
@@ -371,6 +377,7 @@ pub async fn serve_with_audit_log(
         None,
         None,
         None,
+        Arc::default(),
         Arc::default(),
     )
     .await
@@ -409,6 +416,7 @@ pub async fn serve_with_fim_state(
         None,
         None,
         Arc::default(),
+        Arc::default(),
     )
     .await
 }
@@ -443,6 +451,7 @@ pub async fn serve_with_canary_state(
         None,
         None,
         None,
+        Arc::default(),
         Arc::default(),
     )
     .await
@@ -480,6 +489,9 @@ pub async fn serve_with_marker_path(
     response_state: Option<Arc<ResponseAdminState>>,
     // External audit NN-AUD-082: the files the read verbs serve.
     read_paths: Arc<AdminReadPaths>,
+    // External audit ASK-009 (lab PR 213): the unsigned status polling, per
+    // peer, and the registered watchdog it leaves out.
+    status_polls: Arc<StatusPolls>,
 ) -> Result<()> {
     // A stale socket (or anything else but a directory) at the path is
     // removed without following a link; the mode is forced to 0600 so a
@@ -571,6 +583,7 @@ pub async fn serve_with_marker_path(
         let detection_state = detection_state.clone();
         let response_state = response_state.clone();
         let read_paths = Arc::clone(&read_paths);
+        let status_polls = Arc::clone(&status_polls);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -588,6 +601,7 @@ pub async fn serve_with_marker_path(
                 detection_state.as_ref(),
                 response_state.as_ref(),
                 &read_paths,
+                &status_polls,
             )
             .await
             {
@@ -886,6 +900,7 @@ async fn handle_connection(
     detection_state: Option<&Arc<DetectionAdminState>>,
     response_state: Option<&Arc<ResponseAdminState>>,
     read_paths: &AdminReadPaths,
+    status_polls: &StatusPolls,
 ) -> Result<()> {
     // The peer's identity once per connection — the audit log wants
     // pid/uid/comm/exe of the caller, and a single connection never
@@ -956,6 +971,11 @@ async fn handle_connection(
                 &mut notes,
             );
             emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps, &notes);
+            // External audit ASK-009 (lab PR 213): the unsigned status, one
+            // signed row per peer per hour.
+            if matches!(msg, AdminMessage::Status(_)) {
+                note_status_poll(status_polls, &client, audit_log);
+            }
             reply
         });
         if !slot.waiting() {
@@ -981,6 +1001,29 @@ async fn handle_connection(
             );
             return Ok(());
         }
+    }
+}
+
+/// External audit ASK-009 (lab PR 213): count an unsigned `status` and
+/// append the `status_polled` row that opens its peer's window. A failed
+/// append is a WARN; the reply is sent anyway, as for the other rows.
+fn note_status_poll(
+    polls: &StatusPolls,
+    client: &AuditClient,
+    audit_log: Option<&Arc<Mutex<AuditLog>>>,
+) {
+    let Some(audit_log) = audit_log else {
+        return;
+    };
+    let Some(draft) = polls.note(client, Instant::now()) else {
+        return;
+    };
+    if let Err(e) = audit_log.lock().append(draft) {
+        warn!(
+            error = %e,
+            op = status_polls::STATUS_POLLED_OP,
+            "audit log append failed — status_polled row missing"
+        );
     }
 }
 
@@ -1724,8 +1767,18 @@ fn emit_audit_for(
                 req.signatures.len().saturating_sub(1),
             )
         }
-        // Non-auditable: ChallengeRequest, Status, the debug
-        // path. Server-only reply variants reaching dispatch are
+        // External audit ASK-009 (lab PR 213): who read the telemetry the
+        // unsigned status withholds. The counters themselves are not copied
+        // into the row.
+        (AdminMessage::TelemetryStatusRequest(req), AdminMessage::TelemetryStatusResponse(r)) => (
+            "telemetry_status",
+            serde_json::json!({}),
+            audit_result_str(r.result),
+            req.signatures.len().saturating_sub(1),
+        ),
+        // Non-auditable here: ChallengeRequest, the debug path. The unsigned
+        // Status is summarised per peer by `StatusPolls` (external audit
+        // ASK-009). Server-only reply variants reaching dispatch are
         // out-of-spec and already logged; no audit row.
         _ => return,
     };
@@ -1936,47 +1989,15 @@ fn dispatch(
             AdminMessage::UnlockResult(result)
         }
 
+        // External audit ASK-009 (lab PR 213): unsigned, what the watchdog
+        // and COMBAT recovery need; the telemetry is the signed verb's.
         AdminMessage::Status(_) => {
-            let evidence = response_state.map(|s| (s.combat_evidence)());
-            let encrypted = crate::net::blind_spots::encrypted_flows();
-            AdminMessage::StatusResponse(StatusResponse {
-                posture: posture.current_kind(),
-                network_isolation_engaged: isolator.is_engaged(),
-                last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
-                ringbuf_drops_total: Some(crate::sensors::ring_drops::total()),
-                ringbuf_drops: Some(crate::sensors::ring_drops::snapshot_nonzero()),
-                // External audit CMB-016: where the COMBAT ladder stands.
-                combat_stage: response_state.and_then(|s| (s.combat_stage)()),
-                combat_locked: Some(posture.is_combat_locked()),
-                // External audit SNS-008: malformed records the pumps rejected.
-                ringbuf_rejected_total: Some(crate::sensors::reject::total()),
-                ringbuf_rejected: Some(crate::sensors::reject::snapshot()),
-                // External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
-                netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
-                netflow_pending_evicted_total: Some(
-                    crate::net::flow_tracker::pending_evictions_total(),
-                ),
-                net_inactive_rules: Some(crate::net::blocklist::inactive_net_rules()),
-                // Lab PR 164: the kernel's connect→close socket map.
-                flow_sock_pending: crate::sensors::flow_sock::snapshot().map(|o| o.pending),
-                flow_sock_capacity: crate::sensors::flow_sock::snapshot().map(|o| o.capacity),
-                flow_sock_forgotten_min: crate::sensors::flow_sock::snapshot()
-                    .map(|o| o.forgotten_min),
-                // External audit CMB-018: an enforcing agent and a detect-only
-                // one no longer look the same.
-                detect_only: response_state.map(|s| s.config.dry_run),
-                detect_only_source: response_state.and_then(|s| s.detect_only_source.clone()),
-                // External audit CMB-027: what the signed audit log lacks.
-                combat_evidence_unrecorded: evidence.map(|c| c.unrecorded),
-                combat_evidence_pending: evidence.map(|c| c.pending),
-                combat_evidence_dropped: evidence.map(|c| c.dropped),
-                // External audit NET-017 (lab PR 207): the rows no DNS or TLS
-                // reader sees into.
-                net_dot_rows_total: Some(encrypted.dot),
-                net_dot_rows_resolver: Some(encrypted.dot_resolver),
-                net_quic_rows_total: Some(encrypted.quic),
-            })
+            AdminMessage::StatusResponse(public_status(posture, isolator, response_state))
         }
+
+        AdminMessage::TelemetryStatusRequest(req) => AdminMessage::TelemetryStatusResponse(
+            dispatch_telemetry_status(req, auth, posture, isolator, response_state, fps_out),
+        ),
 
         AdminMessage::ShutdownRequest(req) => AdminMessage::ShutdownResult(dispatch_shutdown(
             req,
@@ -2106,7 +2127,8 @@ fn dispatch(
         | AdminMessage::ConfigOverlaySetResponse(_)
         | AdminMessage::ResponseStatusResponse(_)
         | AdminMessage::ResponseReleaseResponse(_)
-        | AdminMessage::ResponseRestoreResponse(_) => {
+        | AdminMessage::ResponseRestoreResponse(_)
+        | AdminMessage::TelemetryStatusResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -3361,6 +3383,133 @@ fn dispatch_response_status(
         quarantined_total,
         combat_stage: (state.combat_stage)(),
         combat_locked: Some(posture.is_combat_locked()),
+    }
+}
+
+/// The whole status, telemetry included: the reply to the signed
+/// [`TelemetryStatusRequest`] (external audit ASK-009, lab PR 213).
+fn telemetry_status(
+    posture: &PostureMachine,
+    isolator: &NetworkIsolator,
+    response_state: Option<&ResponseAdminState>,
+) -> StatusResponse {
+    let evidence = response_state.map(|s| (s.combat_evidence)());
+    let encrypted = crate::net::blind_spots::encrypted_flows();
+    StatusResponse {
+        posture: posture.current_kind(),
+        network_isolation_engaged: isolator.is_engaged(),
+        last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
+        ringbuf_drops_total: Some(crate::sensors::ring_drops::total()),
+        ringbuf_drops: Some(crate::sensors::ring_drops::snapshot_nonzero()),
+        // External audit CMB-016: where the COMBAT ladder stands.
+        combat_stage: response_state.and_then(|s| (s.combat_stage)()),
+        combat_locked: Some(posture.is_combat_locked()),
+        // External audit SNS-008: malformed records the pumps rejected.
+        ringbuf_rejected_total: Some(crate::sensors::reject::total()),
+        ringbuf_rejected: Some(crate::sensors::reject::snapshot()),
+        // External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
+        netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
+        netflow_pending_evicted_total: Some(crate::net::flow_tracker::pending_evictions_total()),
+        net_inactive_rules: Some(crate::net::blocklist::inactive_net_rules()),
+        // Lab PR 164: the kernel's connect→close socket map.
+        flow_sock_pending: crate::sensors::flow_sock::snapshot().map(|o| o.pending),
+        flow_sock_capacity: crate::sensors::flow_sock::snapshot().map(|o| o.capacity),
+        flow_sock_forgotten_min: crate::sensors::flow_sock::snapshot().map(|o| o.forgotten_min),
+        // External audit CMB-018: an enforcing agent and a detect-only
+        // one no longer look the same.
+        detect_only: response_state.map(|s| s.config.dry_run),
+        detect_only_source: response_state.and_then(|s| s.detect_only_source.clone()),
+        // External audit CMB-027: what the signed audit log lacks.
+        combat_evidence_unrecorded: evidence.map(|c| c.unrecorded),
+        combat_evidence_pending: evidence.map(|c| c.pending),
+        combat_evidence_dropped: evidence.map(|c| c.dropped),
+        // External audit NET-017 (lab PR 207): the rows no DNS or TLS
+        // reader sees into.
+        net_dot_rows_total: Some(encrypted.dot),
+        net_dot_rows_resolver: Some(encrypted.dot_resolver),
+        net_quic_rows_total: Some(encrypted.quic),
+    }
+}
+
+/// External audit ASK-009 (lab PR 213): the reply to the unsigned `status`
+/// — the posture, the isolation, the last admin action and where the COMBAT
+/// ladder stands, what the watchdog and COMBAT recovery read. The
+/// telemetry (ring drops and rejected records, netflow pacing and
+/// evictions, `FLOW_SOCK_MAP`, the inactive network rules, detect-only, the
+/// COMBAT evidence gaps, the encrypted-flow counts) is not even computed:
+/// it told a local root without an admin key how much the agent was losing
+/// — the feedback of a ring flood — and is the signed verb's.
+fn public_status(
+    posture: &PostureMachine,
+    isolator: &NetworkIsolator,
+    response_state: Option<&ResponseAdminState>,
+) -> StatusResponse {
+    StatusResponse::public(
+        posture.current_kind(),
+        isolator.is_engaged(),
+        posture.last_admin_action_secs_ago(),
+        response_state.and_then(|s| (s.combat_stage)()),
+        Some(posture.is_combat_locked()),
+    )
+}
+
+/// The read roles the signed telemetry verb accepts, either one: the
+/// `audit-read` every key carries by default (the bootstrap key of
+/// `install.sh` included), and the `telemetry-read` of a dashboard key
+/// (`triage` and `all` imply it). The counters are no more than what an
+/// `audit-read` key already reads in the signed audit log.
+const TELEMETRY_STATUS_ROLES: [Role; 2] = [Role::AuditRead, Role::TelemetryRead];
+
+/// `nn-admin status --key` / `nn-admin net status --key` (external audit
+/// ASK-009, lab PR 213): the whole status, 1-of-N, `audit-read` or
+/// `telemetry-read` ([`TELEMETRY_STATUS_ROLES`]); one audit row per request.
+fn dispatch_telemetry_status(
+    req: TelemetryStatusRequest,
+    auth: &ConnAuth<'_>,
+    posture: &PostureMachine,
+    isolator: &NetworkIsolator,
+    response_state: Option<&ResponseAdminState>,
+    fps_out: &mut Vec<String>,
+) -> TelemetryStatusResponse {
+    let refuse = |result| TelemetryStatusResponse {
+        result,
+        status: None,
+    };
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    // No role in the quorum check (it would want each listed role): the
+    // signer's roles are checked below, any one of the two.
+    let signers = match auth.verify_signed_payload_quorum_keys(
+        &req.payload,
+        &sigs,
+        1,
+        &[],
+        OperationCode::TelemetryStatus,
+        now_unix_secs(),
+    ) {
+        Ok(v) => v,
+        Err(e) => return refuse(map_admin_auth_error(e, "telemetry-status")),
+    };
+    *fps_out = signers.fingerprints;
+    if !signers
+        .keys
+        .iter()
+        .any(|k| TELEMETRY_STATUS_ROLES.iter().any(|r| k.authorizes(*r)))
+    {
+        warn!(
+            target: "anti_tamper.admin_auth.verify_failure",
+            reason = "role_denied",
+            required = "audit-read or telemetry-read",
+            "telemetry-status refused: the signer holds neither read role"
+        );
+        return refuse(AdminResult::RoleDenied);
+    }
+    if !matches!(&req.payload.extra, OperationExtra::TelemetryStatus(_)) {
+        warn!("telemetry-status payload extra is not TelemetryStatus variant");
+        return refuse(AdminResult::UnknownOperation);
+    }
+    TelemetryStatusResponse {
+        result: AdminResult::Success,
+        status: Some(telemetry_status(posture, isolator, response_state)),
     }
 }
 
@@ -5158,6 +5307,7 @@ mod tests {
                 None,
                 None,
                 Arc::default(),
+                Arc::default(),
             )
             .await;
         });
@@ -5413,6 +5563,7 @@ mod tests {
                 None,
                 None,
                 None,
+                Arc::default(),
                 Arc::default(),
             )
             .await;
@@ -6600,12 +6751,33 @@ mod tests {
         }
     }
 
+    /// External audit ASK-009 (lab PR 213): a signed `status --key`
+    /// request.
+    fn telemetry_req(
+        signing: &SigningKey,
+        auth: &ConnAuth<'_>,
+        agent_id: [u8; 16],
+    ) -> TelemetryStatusRequest {
+        use common::wire::admin_signed_payload::SignedPayload;
+        let payload = SignedPayload::new_telemetry_status(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+        );
+        let signatures = keyed(&payload, signing);
+        TelemetryStatusRequest {
+            payload,
+            signatures,
+        }
+    }
+
     /// External audit CMB-018 / CMB-027 (lab PR 193): `status` tells an
     /// enforcing agent from a detect-only one, names what set detect-only,
-    /// and says what the signed audit log lacks of the COMBAT ladder.
+    /// and says what the signed audit log lacks of the COMBAT ladder —
+    /// through the signed telemetry verb since external audit ASK-009
+    /// (lab PR 213).
     #[test]
     fn status_reports_detect_only_and_combat_evidence() {
-        use common::wire::admin_protocol::StatusRequest;
         let signing = SigningKey::generate(&mut OsRng);
         let dir = TempDir::new().unwrap();
         let (auth, _d) = build_auth_with_roles(&signing, "audit-read", [0x1c; 16]);
@@ -6614,7 +6786,7 @@ mod tests {
         let posture = PostureMachine::new();
         let marker = dir.path().join("marker");
         let status = |state: Option<&ResponseAdminState>| match dispatch(
-            AdminMessage::Status(StatusRequest {}),
+            AdminMessage::TelemetryStatusRequest(telemetry_req(&signing, &auth, [0x1c; 16])),
             &auth,
             &posture,
             &isolator,
@@ -6630,7 +6802,10 @@ mod tests {
             &mut Vec::new(),
             &mut DispatchNotes::default(),
         ) {
-            AdminMessage::StatusResponse(r) => r,
+            AdminMessage::TelemetryStatusResponse(TelemetryStatusResponse {
+                result: AdminResult::Success,
+                status: Some(r),
+            }) => r,
             other => panic!("{other:?}"),
         };
 
@@ -6672,6 +6847,196 @@ mod tests {
         let r = status(None);
         assert_eq!(r.detect_only, None);
         assert_eq!(r.combat_evidence_unrecorded, None);
+    }
+
+    /// External audit ASK-009 (lab PR 213): the unsigned `status` answers
+    /// the posture, the isolation, the last admin action and the COMBAT
+    /// stage and lock — what the watchdog and COMBAT recovery read — and
+    /// withholds the telemetry (`ringbuf_drops_total == None`), whatever
+    /// the agent holds.
+    #[test]
+    fn the_unsigned_status_withholds_the_telemetry() {
+        use common::wire::admin_protocol::StatusRequest;
+        let signing = SigningKey::generate(&mut OsRng);
+        let dir = TempDir::new().unwrap();
+        let (auth, _d) = build_auth_with_roles(&signing, "audit-read", [0x1d; 16]);
+        let auth = ConnAuth::new(&auth);
+        let isolator = NetworkIsolator::new(rules_path()).unwrap();
+        let posture = PostureMachine::new();
+        let marker = dir.path().join("marker");
+        let mut detect = response_state(&dir);
+        detect.config.dry_run = true;
+        detect.detect_only_source = Some("--detect-only".to_string());
+        let mut fps = Vec::new();
+        let r = match dispatch(
+            AdminMessage::Status(StatusRequest {}),
+            &auth,
+            &posture,
+            &isolator,
+            &marker,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&detect),
+            &AdminReadPaths::default(),
+            &fake_client(),
+            &mut fps,
+            &mut DispatchNotes::default(),
+        ) {
+            AdminMessage::StatusResponse(r) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(r.posture, common::posture_types::PostureKind::Observing);
+        assert!(!r.network_isolation_engaged);
+        assert_eq!(r.combat_stage.as_deref(), Some("NEUTRALIZE"));
+        assert_eq!(r.combat_locked, Some(false));
+        assert_eq!(r.ringbuf_drops_total, None);
+        assert_eq!(r.ringbuf_rejected_total, None);
+        assert_eq!(r.netflow_rows_skipped_total, None);
+        assert_eq!(r.net_inactive_rules, None);
+        assert_eq!(r.detect_only, None, "detect-only is telemetry too");
+        assert_eq!(r.combat_evidence_unrecorded, None);
+        assert_eq!(r.net_dot_rows_total, None);
+        assert!(r.telemetry_withheld());
+        assert!(fps.is_empty(), "no signature on the unsigned status");
+    }
+
+    /// External audit ASK-009 (lab PR 213): the signed telemetry verb
+    /// accepts `audit-read` (every key's default, the install key's) or
+    /// `telemetry-read` (and `triage`, `all`, which imply it); a key with
+    /// neither is RoleDenied and gets no status. Each request is one audit
+    /// row naming the signer, the counters not copied.
+    #[test]
+    fn the_signed_telemetry_status_needs_a_read_role() {
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let isolator = NetworkIsolator::new(rules_path()).unwrap();
+        let posture = PostureMachine::new();
+        let state = response_state(&dir);
+        let agent_id = [0x1e; 16];
+        let cases = [
+            ("audit-read", AdminResult::Success),
+            ("telemetry-read", AdminResult::Success),
+            ("triage", AdminResult::Success),
+            ("all", AdminResult::Success),
+            (
+                "unlock,force-posture,config-manage",
+                AdminResult::RoleDenied,
+            ),
+        ];
+        for (roles, expected) in cases {
+            let signing = SigningKey::generate(&mut OsRng);
+            let (auth, _d) = build_auth_with_roles(&signing, roles, agent_id);
+            let auth = ConnAuth::new(&auth);
+            let req = telemetry_req(&signing, &auth, agent_id);
+            let msg = AdminMessage::TelemetryStatusRequest(req.clone());
+            let mut fps = Vec::new();
+            let r =
+                dispatch_telemetry_status(req, &auth, &posture, &isolator, Some(&state), &mut fps);
+            assert_eq!(r.result, expected, "{roles}");
+            match expected {
+                AdminResult::Success => {
+                    let st = r.status.as_ref().expect("the whole status");
+                    assert!(st.ringbuf_drops_total.is_some(), "{roles}");
+                    assert_eq!(st.detect_only, Some(false));
+                    assert_eq!(st.combat_stage.as_deref(), Some("NEUTRALIZE"));
+                }
+                _ => assert!(r.status.is_none(), "{roles}: nothing on a refusal"),
+            }
+            assert_eq!(fps.len(), 1, "{roles}: the signer is named");
+            emit_audit_for(
+                &msg,
+                &AdminMessage::TelemetryStatusResponse(r),
+                &fake_client(),
+                Some(&audit),
+                &fps,
+                &DispatchNotes::default(),
+            );
+        }
+        let rows = read_audit_entries(&log_path);
+        assert_eq!(rows.len(), cases.len());
+        for (row, (roles, expected)) in rows.iter().zip(cases) {
+            assert_eq!(row.op, "telemetry_status");
+            assert_eq!(
+                row.extra,
+                serde_json::json!({}),
+                "the counters are not copied"
+            );
+            assert!(!row.key_fp.is_empty(), "{roles}");
+            let want = if expected == AdminResult::Success {
+                "success"
+            } else {
+                "failure: role_denied"
+            };
+            assert_eq!(row.result, want, "{roles}");
+        }
+    }
+
+    /// The signed verb refuses a payload signed for another operation (a
+    /// `response status` signature replayed as a telemetry read).
+    #[test]
+    fn the_signed_telemetry_status_refuses_another_operation() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x1f; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "audit-read", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let other = status_req(&signing, &auth, agent_id);
+        let req = TelemetryStatusRequest {
+            payload: other.payload,
+            signatures: other.signatures,
+        };
+        let isolator = NetworkIsolator::new(rules_path()).unwrap();
+        let posture = PostureMachine::new();
+        let mut fps = Vec::new();
+        let r = dispatch_telemetry_status(req, &auth, &posture, &isolator, None, &mut fps);
+        assert_eq!(r.result, AdminResult::UnknownOperation);
+        assert!(r.status.is_none());
+    }
+
+    /// External audit ASK-009 (lab PR 213): a burst of 100 unsigned
+    /// `status` from one peer is one signed `status_polled` row; the
+    /// registered watchdog's pings are none.
+    #[test]
+    fn a_burst_of_unsigned_status_is_one_signed_row() {
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let me = std::process::id();
+        let exempt = crate::posture::ExemptPids::with_agent(1);
+        let start = std::fs::read_to_string(format!("/proc/{me}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(')').map(|(_, r)| r.to_string()))
+            .and_then(|r| r.split_whitespace().nth(19).map(str::to_string))
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("own start time");
+        exempt.set_watchdog(me, start);
+        let polls = StatusPolls::new(exempt);
+        for _ in 0..100 {
+            note_status_poll(&polls, &fake_client(), Some(&audit));
+        }
+        let watchdog = AuditClient {
+            pid: me,
+            uid: 0,
+            comm: "northnarrow-wat".to_string(),
+            exe: None,
+        };
+        for _ in 0..20 {
+            note_status_poll(&polls, &watchdog, Some(&audit));
+        }
+        let rows = read_audit_entries(&log_path);
+        assert_eq!(
+            rows.len(),
+            1,
+            "one row for the burst, none for the watchdog"
+        );
+        assert_eq!(rows[0].op, "status_polled");
+        assert_eq!(rows[0].client_pid, 12345);
+        assert_eq!(rows[0].client_comm, "nn-admin");
+        assert_eq!(rows[0].result, "success");
+        assert!(rows[0].key_fp.is_empty());
+        // Without an audit log nothing is counted or written.
+        note_status_poll(&polls, &fake_client(), None);
     }
 
     /// External audit CMB-016: `response status` is read-only, for
@@ -8049,6 +8414,7 @@ mod tests {
                 None,
                 None,
                 &AdminReadPaths::default(),
+                &StatusPolls::default(),
             )
             .await
         });
