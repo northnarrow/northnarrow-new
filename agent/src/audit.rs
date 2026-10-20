@@ -526,6 +526,11 @@ pub struct AuditLog {
     /// The chain holds the row recording that numbering and head anchoring
     /// started ([`crate::chain_anchor::NUMBERING_STARTED_OP`]).
     anchoring_started: bool,
+    /// External audit EVD-020: the `agent_id` of the chain's last row when
+    /// it was opened (`None` for an empty chain), compared once by
+    /// [`Self::attest_identity`].
+    previous_agent_id: Option<String>,
+    identity_attested: bool,
 }
 
 impl AuditLog {
@@ -574,6 +579,8 @@ impl AuditLog {
             numbered: tail.seq.numbered(),
             seq_break: tail.seq_break,
             anchoring_started: tail.anchoring_started,
+            previous_agent_id: tail.last_agent_id,
+            identity_attested: false,
         };
         if let Some(r) = repair {
             log.attest_tail_repair(path, &r)?;
@@ -677,6 +684,109 @@ impl AuditLog {
             })
             .into_iter()
             .collect()
+    }
+
+    /// External audit EVD-020 (NN-AUD-282) and MAIN-009 (NN-AUD-251): the
+    /// identity this boot signs as, in the signed chain, once per open.
+    ///
+    /// - minted ([`IdentitySource::Minted`]): an `agent_id_minted` row;
+    /// - unusable ([`IdentitySource::Unavailable`]): `integrity_drift`
+    ///   `subsystem_degraded` naming the reason and the per-boot id;
+    /// - an id other than the one the chain's last row carries (the file
+    ///   removed and re-minted, replaced, or unusable while the agent was
+    ///   not running): ERROR and `integrity_drift` `agent_id_changed` with
+    ///   `from` and `to`, signed with the agent key that signed the rows
+    ///   before — the link between the two identities.
+    ///
+    /// An unchanged identity loaded from the file adds nothing.
+    ///
+    /// [`IdentitySource::Minted`]: crate::agent_id::IdentitySource::Minted
+    /// [`IdentitySource::Unavailable`]: crate::agent_id::IdentitySource::Unavailable
+    pub fn attest_identity(&mut self, identity: &crate::agent_id::AgentIdentity) -> Result<()> {
+        use crate::agent_id::IdentitySource;
+        if std::mem::replace(&mut self.identity_attested, true) {
+            return Ok(());
+        }
+        let file = identity.path.display().to_string();
+        let to = hex::encode(self.agent_id);
+        let from = self.previous_agent_id.clone();
+        let self_row = |op: &str, extra: serde_json::Value, result: &str| AuditEntryDraft {
+            op: op.to_string(),
+            extra,
+            key_fp: "agent-self".to_string(),
+            cosigner_fps: Vec::new(),
+            result: result.to_string(),
+            client_pid: std::process::id(),
+            client_uid: 0,
+            client_comm: "northnarrow-agent".to_string(),
+            client_exe: None,
+        };
+        match &identity.source {
+            IdentitySource::Loaded => {}
+            IdentitySource::Minted => {
+                self.append(self_row(
+                    AGENT_ID_MINTED_OP,
+                    serde_json::json!({
+                        "file": file,
+                        "agent_id": to,
+                        "previous": from,
+                    }),
+                    "success",
+                ))
+                .context("audit log: agent_id_minted entry")?;
+            }
+            IdentitySource::Unavailable(reason) => {
+                self.append(self_row(
+                    crate::self_integrity::AUDIT_OP,
+                    serde_json::json!({
+                        "kind": "subsystem_degraded",
+                        "detail": format!(
+                            "agent_id unavailable ({file}: {reason}): this boot signs as the \
+                             per-boot id {to}, never written; signed admin requests and overlays \
+                             made for the install's id are refused until the file is repaired"
+                        ),
+                        "at_boot": true,
+                    }),
+                    "detected",
+                ))
+                .context("audit log: agent_id subsystem_degraded entry")?;
+            }
+        }
+        if let Some(from) = from.filter(|f| *f != to) {
+            let source = identity.source.label();
+            let how = match &identity.source {
+                IdentitySource::Loaded => "replaced",
+                IdentitySource::Minted => "removed and minted again",
+                IdentitySource::Unavailable(_) => "unusable",
+            };
+            tracing::error!(
+                from = %common::log_escape::Escaped(&from),
+                to = %to,
+                source,
+                path = %file,
+                "AGENT IDENTITY CHANGED — the audit chain's last row was signed as another \
+                 agent_id: the file was {how} while the agent was not running; admin \
+                 signatures and overlays made for the old id no longer verify"
+            );
+            self.append(self_row(
+                crate::self_integrity::AUDIT_OP,
+                serde_json::json!({
+                    "kind": AGENT_ID_CHANGED_KIND,
+                    "from": from,
+                    "to": to,
+                    "source": source,
+                    "file": file,
+                    "detail": format!(
+                        "the chain's last row was signed as {from}, this boot signs as {to}: \
+                         {file} was {how} while the agent was not running"
+                    ),
+                    "at_boot": true,
+                }),
+                "detected",
+            ))
+            .context("audit log: agent_id_changed entry")?;
+        }
+        Ok(())
     }
 
     /// `agent_stop` entry: the event loop is over and the process is about
@@ -840,6 +950,14 @@ pub fn build_features() -> Vec<&'static str> {
 /// Audit op recording a repaired torn tail of a chain log.
 pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
 
+/// External audit EVD-020: the agent minted its identity
+/// ([`AuditLog::attest_identity`]).
+pub const AGENT_ID_MINTED_OP: &str = "agent_id_minted";
+
+/// External audit EVD-020: the `integrity_drift` kind of an identity other
+/// than the one the chain's last row carries.
+pub const AGENT_ID_CHANGED_KIND: &str = "agent_id_changed";
+
 /// Escape hatch: run with an unwritable / unopenable audit log.
 pub const AUDIT_ALLOW_UNWRITABLE_ENV: &str = "NN_AUDIT_ALLOW_UNWRITABLE";
 
@@ -875,6 +993,8 @@ struct TailState {
     anchoring_started: bool,
     /// External audit DEP-009, see [`verified_boot_recorded`].
     verified_boot: bool,
+    /// External audit EVD-020: the last row's `agent_id`.
+    last_agent_id: Option<String>,
 }
 
 /// Read the final `entry_hash` from `path`, or
@@ -901,6 +1021,7 @@ fn read_tail(path: &Path) -> Result<TailState> {
                 seq_break,
                 anchoring_started: false,
                 verified_boot: false,
+                last_agent_id: None,
             });
         }
         Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
@@ -912,6 +1033,7 @@ fn read_tail(path: &Path) -> Result<TailState> {
     let mut second_key_added = false;
     let mut verified_boot = false;
     let mut anchoring_started = false;
+    let mut last_agent_id = None;
     for line in reader.lines() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
@@ -954,6 +1076,7 @@ fn read_tail(path: &Path) -> Result<TailState> {
         }
         last_ts = entry.ts.clone();
         last = Some(entry.entry_hash);
+        last_agent_id = Some(entry.agent_id);
     }
     if let PreviousRun::Abrupt { last_entry_at, .. } = &mut previous {
         *last_entry_at = last_ts;
@@ -966,6 +1089,7 @@ fn read_tail(path: &Path) -> Result<TailState> {
         seq_break,
         anchoring_started,
         verified_boot,
+        last_agent_id,
     })
 }
 
@@ -1740,5 +1864,188 @@ mod tests {
                 Err(AuditVerifyError::EntryHashMismatch { idx: 0, .. })
             ));
         }
+    }
+
+    // ── External audit EVD-020 / MAIN-009: the identity in the chain ──
+
+    fn identity(
+        id: [u8; 16],
+        source: crate::agent_id::IdentitySource,
+    ) -> crate::agent_id::AgentIdentity {
+        crate::agent_id::AgentIdentity {
+            id,
+            source,
+            path: PathBuf::from("/etc/northnarrow/agent_id"),
+        }
+    }
+
+    fn drifts<'a>(rows: &'a [AuditEntry], kind: &str) -> Vec<&'a AuditEntry> {
+        rows.iter()
+            .filter(|r| {
+                r.op == crate::self_integrity::AUDIT_OP
+                    && r.extra.get("kind").and_then(|k| k.as_str()) == Some(kind)
+            })
+            .collect()
+    }
+
+    fn whole_chain_verifies(path: &Path, key: &AgentSigningKey) {
+        let all = rows(path);
+        verify_chain(&all, &key.verifying_key()).expect("the whole chain verifies");
+    }
+
+    /// EVD-020: the file replaced while the agent was down — the chain's
+    /// last row carries A, this boot loads B. One signed `agent_id_changed`
+    /// row binds the two (same agent key as the rows before), once; the
+    /// next boot with B is quiet.
+    #[test]
+    fn a_chain_last_signed_as_another_id_reports_the_change_once() {
+        use crate::agent_id::IdentitySource;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let (a, b) = ([0xAAu8; 16], [0xBBu8; 16]);
+        let mut log = AuditLog::open(&log_path, key(), a).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        drop(log);
+
+        let mut log = AuditLog::open(&log_path, key(), b).unwrap();
+        log.attest_identity(&identity(b, IdentitySource::Loaded))
+            .unwrap();
+        log.attest_identity(&identity(b, IdentitySource::Loaded))
+            .unwrap();
+        drop(log);
+        let all = rows(&log_path);
+        let changed = drifts(&all, AGENT_ID_CHANGED_KIND);
+        assert_eq!(changed.len(), 1, "{all:#?}");
+        let x = &changed[0].extra;
+        assert_eq!(x["from"], hex::encode(a));
+        assert_eq!(x["to"], hex::encode(b));
+        assert_eq!(x["source"], "loaded");
+        assert_eq!(x["at_boot"], true);
+        assert_eq!(changed[0].agent_id, hex::encode(b));
+        assert_eq!(changed[0].result, "detected");
+        assert!(all.iter().all(|r| r.op != AGENT_ID_MINTED_OP));
+        whole_chain_verifies(&log_path, &key());
+
+        let mut log = AuditLog::open(&log_path, key(), b).unwrap();
+        log.attest_identity(&identity(b, IdentitySource::Loaded))
+            .unwrap();
+        drop(log);
+        assert_eq!(
+            rows(&log_path).len(),
+            all.len(),
+            "an unchanged id adds nothing"
+        );
+    }
+
+    /// EVD-020: a first start (empty chain) records the mint, no drift.
+    #[test]
+    fn a_fresh_chain_with_a_minted_id_records_the_mint_and_no_drift() {
+        use crate::agent_id::IdentitySource;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let id = [0x42u8; 16];
+        let mut log = AuditLog::open(&log_path, key(), id).unwrap();
+        log.attest_identity(&identity(id, IdentitySource::Minted))
+            .unwrap();
+        drop(log);
+        let all = rows(&log_path);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].op, AGENT_ID_MINTED_OP);
+        assert_eq!(all[0].extra["agent_id"], hex::encode(id));
+        assert!(all[0].extra["previous"].is_null());
+        assert_eq!(all[0].extra["file"], "/etc/northnarrow/agent_id");
+        assert!(drifts(&all, AGENT_ID_CHANGED_KIND).is_empty());
+        whole_chain_verifies(&log_path, &key());
+    }
+
+    /// EVD-020: `agent_id` removed while the agent was down — the boot
+    /// mints B over a chain last signed as A: the mint and the change.
+    #[test]
+    fn a_mint_over_an_existing_chain_records_the_mint_and_the_change() {
+        use crate::agent_id::IdentitySource;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let (a, b) = ([0x0Au8; 16], [0x0Bu8; 16]);
+        let mut log = AuditLog::open(&log_path, key(), a).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        drop(log);
+        let mut log = AuditLog::open(&log_path, key(), b).unwrap();
+        log.attest_identity(&identity(b, IdentitySource::Minted))
+            .unwrap();
+        drop(log);
+        let all = rows(&log_path);
+        let minted: Vec<_> = all.iter().filter(|r| r.op == AGENT_ID_MINTED_OP).collect();
+        assert_eq!(minted.len(), 1);
+        assert_eq!(minted[0].extra["previous"], hex::encode(a));
+        let changed = drifts(&all, AGENT_ID_CHANGED_KIND);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].extra["source"], "minted");
+        assert!(changed[0].extra["detail"]
+            .as_str()
+            .unwrap()
+            .contains("removed and minted again"));
+        whole_chain_verifies(&log_path, &key());
+    }
+
+    /// MAIN-009: an unusable file is a signed `subsystem_degraded` naming
+    /// the reason and the per-boot id; over a chain signed as A it is a
+    /// change too.
+    #[test]
+    fn an_unusable_identity_is_a_signed_degradation() {
+        use crate::agent_id::IdentitySource;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let (a, per_boot) = ([0x0Au8; 16], [0x77u8; 16]);
+        let mut log = AuditLog::open(&log_path, key(), a).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        drop(log);
+        let mut log = AuditLog::open(&log_path, key(), per_boot).unwrap();
+        log.attest_identity(&identity(
+            per_boot,
+            IdentitySource::Unavailable("agent_id is all zeros".into()),
+        ))
+        .unwrap();
+        drop(log);
+        let all = rows(&log_path);
+        let degraded = drifts(&all, "subsystem_degraded");
+        assert_eq!(degraded.len(), 1);
+        let detail = degraded[0].extra["detail"].as_str().unwrap();
+        assert!(detail.contains("agent_id is all zeros"), "{detail}");
+        assert!(detail.contains(&hex::encode(per_boot)), "{detail}");
+        let changed = drifts(&all, AGENT_ID_CHANGED_KIND);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].extra["source"], "unavailable");
+        whole_chain_verifies(&log_path, &key());
+    }
+
+    /// Format: the identity rows are ordinary numbered rows; a chain whose
+    /// rows predate `seq` (lab PR 160) and the `agent_id` of the old zero
+    /// fallback keeps verifying, and the first boot with the real id names
+    /// the change.
+    #[test]
+    fn legacy_rows_keep_verifying_and_an_old_zero_fallback_is_named() {
+        use crate::agent_id::IdentitySource;
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        // write_legacy_rows signs as the all-zero id, as the old fallback did
+        write_legacy_rows(&log_path, &key(), 3);
+        let before = fs::read(&log_path).unwrap();
+        let id = [0x5Cu8; 16];
+        let mut log = AuditLog::open(&log_path, key(), id).unwrap();
+        log.attest_identity(&identity(id, IdentitySource::Loaded))
+            .unwrap();
+        drop(log);
+        let after = fs::read(&log_path).unwrap();
+        assert_eq!(
+            &after[..before.len()],
+            &before[..],
+            "old rows keep their bytes"
+        );
+        let all = rows(&log_path);
+        let changed = drifts(&all, AGENT_ID_CHANGED_KIND);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].extra["from"], hex::encode([0u8; 16]));
+        assert_eq!(changed[0].seq, Some(3));
+        whole_chain_verifies(&log_path, &key());
     }
 }

@@ -61,6 +61,56 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, agent identity (Low MAIN-009 NN-AUD-251,
+  MAIN-010 NN-AUD-252, EVD-020 NN-AUD-282; lab PR 185). MAIN-009: the
+  agent read `/etc/northnarrow/agent_id` twice at boot — before the attach
+  for the overlay gate, after it for the audit log, the chains and the
+  admin plane — and each read fell back with a WARN to the all-zero id,
+  the one the test fixtures sign with, when the file could not be used.
+  Now one read (`agent_id::resolve`) feeds all of them; a file that
+  cannot be used (corrupted, all zeros, unreadable, a mint that cannot be
+  written) gives a per-boot random id, never written: an ERROR, and a
+  signed `integrity_drift` `subsystem_degraded` naming the reason and the
+  id once the audit log is open. Nothing signed for another install or
+  for zero verifies; signed admin requests and overlays made for the
+  install's id are refused for that boot (the legacy unlock does not bind
+  the id); one signed for the per-boot id — the `agent_id` of that boot's
+  audit rows, in a file passed with `--agent-id-file` — opens the
+  trusted-installer window that repairs the file. An all-zero `agent_id`
+  on disk is corruption. EVD-020: a missing `agent_id` was minted and
+  written with an INFO line only, and its rename was not synced. The mint
+  now goes through `atomic_file::replace` (`.agent_id.tmp` removed, never
+  followed, mode on the descriptor, file and directory synced: a
+  leftover `agent_id.tmp` no longer blocks it), and the boot signs it:
+  `agent_id_minted` (the file, the id, the id the chain's last row
+  carried). An id other than the one the audit chain's last row carries
+  — the file removed and minted again, replaced, or unusable while the
+  agent was not running — is an ERROR (`AGENT IDENTITY CHANGED`) and a
+  signed `integrity_drift` `agent_id_changed` with `from`, `to` and
+  `source` (`loaded`, `minted`, `unavailable`), written with the agent key
+  that signed the rows before it, ahead of the boot's `agent_boot` (a
+  refused boot records it too). MAIN-010: 21 `nn-admin` paths and `config
+  overlay status` read the id with the agent's `load_or_bootstrap`, which
+  minted and wrote one when the file was missing: a read-only command run
+  before the agent's first start created the identity the agent then
+  adopted without a trace, and `config overlay sign` signed an overlay
+  for it. They now use `agent_id::load_existing`: "agent_id not found at
+  …: the agent creates it at its first start", and nothing is created.
+  Format: no field changes; the new rows are ordinary numbered rows (op
+  `agent_id_minted`, `integrity_drift` kind `agent_id_changed`), existing
+  rows keep their bytes and verify, and an `nn-admin` older than the
+  agent verifies the new rows too (unlike lab PRs 160 and 179, nothing
+  changes for older readers). **Regressions / changes:** `nn-admin` run
+  before the agent's first start fails (exit 5) instead of minting
+  `agent_id`; overlays can no longer be signed before it unless
+  `agent_id` is pre-seeded (32 hex characters and a newline, mode 0644);
+  the first start after `agent_id` is deliberately removed, replaced or
+  restored from a backup reports `agent_id_changed` once (intended); a
+  host whose `agent_id` is all zeros, or unusable, boots on a per-boot id
+  and refuses zero-id signed requests; a restart under the previous
+  instance's pinned hooks whose early registration failed (EBPF-015) and
+  whose `agent_id` is missing cannot mint it and boots on a per-boot id
+  (the old second read minted it after the attach).
 - External audit, Wave 3, units and package hooks (Low DEP-005 NN-AUD-381,
   DEP-010 NN-AUD-382, DEP-014 NN-AUD-386, DEP-017 NN-AUD-389; lab PR 184).
   DEP-014: the watchdog's unit kept `CAP_SYS_ADMIN` "for the historical

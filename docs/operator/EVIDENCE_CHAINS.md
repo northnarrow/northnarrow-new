@@ -71,6 +71,7 @@ for.
    | `chain_verify_failed` | the background check of a rotating log failed; the detail names the line |
    | `chain_heads_unverified` | the anchor file holds no genuine snapshot (replaced or altered) |
    | `chain_heads_missing` | the anchor file was removed after anchoring had started |
+   | `agent_id_changed` | the agent signs as another `agent_id` than the chain's last row (`from`, `to`): `/etc/northnarrow/agent_id` was removed, replaced or unusable while the agent was stopped (`source`: `minted`, `loaded`, `unavailable`) |
 
 4. **Find the window.** These files can only be changed with the
    anti-tamper hooks out of the way: look in the audit chain, just before
@@ -108,6 +109,10 @@ for.
   makes every earlier signature unverifiable, the anchor's included:
   `chain_heads_unverified` once, and `chain verify` fails on the old rows.
   Archive the old chains with the old public key before reusing the host.
+- A deliberately removed or restored `agent_id` (a re-mint, a backup put
+  back) is `agent_id_changed` once; the first start of an install signs
+  `agent_id_minted` only. Overlays and admin signatures made for the old
+  id no longer verify: sign them again for the new one.
 - After an upgrade from a version before lab PR 160 the audit chain gets a
   `chain_numbering_started` entry; older rows keep verifying as before.
 - Use the `nn-admin` shipped with the agent: an older one reports numbered

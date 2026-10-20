@@ -460,8 +460,8 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-248 | AUT-010 | Low | Admin auth | — | already fixed (lab PR 115) |
 | NN-AUD-249 | AUT-011 | Low | Admin auth | (S, optional pin test) | declined (premise false: ciborium 0.2.2 caps recursion at 256 levels; the only caller decodes the shutdown marker, not socket input) |
 | NN-AUD-250 | AUT-013 | Low | Admin auth | S | open |
-| NN-AUD-251 | MAIN-009 | Low | Agent main | S | open |
-| NN-AUD-252 | MAIN-010 | Low | Agent main | S | open |
+| NN-AUD-251 | MAIN-009 | Low | Agent main | S | fixed (lab PR 185) |
+| NN-AUD-252 | MAIN-010 | Low | Agent main | S | fixed (lab PR 185) |
 | NN-AUD-253 | MAIN-011 | Low | Agent main | — | already fixed (lab PR 115) |
 | NN-AUD-254 | MAIN-012 | Low | Agent main | — | already fixed (lab PR 115) |
 | NN-AUD-255 | MAIN-013 | Low | Agent main | S | fixed (lab PR 180) |
@@ -491,7 +491,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-279 | EVD-016 | Low | Evidence logs | S (docs) | partly fixed (fail-open fixed, lab PR 148; signing declined); open |
 | NN-AUD-280 | EVD-017 | Low | Evidence logs | S | open (now reachable from a shipped command) |
 | NN-AUD-281 | EVD-019 | Low | Evidence logs | S | fixed (lab PR 169) |
-| NN-AUD-282 | EVD-020 | Low | Evidence logs | S | open |
+| NN-AUD-282 | EVD-020 | Low | Evidence logs | S | fixed (lab PR 185) |
 | NN-AUD-283 | EVD-022 | Low | Evidence logs | S | partly fixed (overwrite closed, lab PR 131); open |
 | NN-AUD-284 | FIMR-010 | Low | FIM rules | M | fixed (lab PR 173) |
 | NN-AUD-285 | FIMR-011 | Low | FIM rules | M | fixed (lab PR 173) |
@@ -7142,3 +7142,93 @@ group, the ones an unprivileged user or a local attacker could use first.
     failed; `anti-tamper.sh --selftest` 40 checks, 0 failed; `sh -n` and
     `dash -n` of the four hooks.
   - Lab: Ubuntu 24.04 and Debian 12, unithooks184-probe.sh and `nn-lab.sh respawn-check` — before: the build of `main` with lab PRs 176–183; after: this lot on top. The watchdog's bounding set: `cap_sys_ptrace cap_sys_admin cap_bpf` before, `cap_sys_ptrace cap_bpf` after, and `respawn-check` OK on both guests with it. On the 8 GiB guest (the agent's `MemoryMax` above its RAM) the agent ran at `oom_score_adj` -500 before, 0 after with the memory-cap WARN at boot. The agent unit's journal rate limit: none before, 30 s / 50,000 after; a 40,000-line burst from the agent's cgroup drew no suppression line. The package rollback with both units made to fail (`ExecStartPre=/bin/false`): before the hook exited 0 with systemd's "Job … failed" lines only; after it exited 1 naming both units ("rollback failed … this host is without NorthNarrow") and kept the restart list; the guest restored to both units active. Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.
+- **Wave 3 — agent identity, lab PR 185.** Batch 5 of the Wave 3 triage
+  of the evidence and admin group: NN-AUD-251 (MAIN-009), NN-AUD-282
+  (EVD-020), NN-AUD-252 (MAIN-010), all Low, on the integration tree
+  (`main` 78fd0f2 with lots 176–183).
+  - MAIN-009 (251, fixed). Re-checked: `main.rs` read `agent_id` before
+    the attach (`boot_agent_id`, the overlay gate) and again after the
+    install-manifest check (the audit log, the chain anchor, the FIM,
+    netflow and listener chains, `AdminAuth`), both with a WARN and the
+    all-zero fallback the test fixtures sign with; the two could differ.
+    Now `agent_id::resolve(path) -> AgentIdentity { id, source: Loaded |
+    Minted | Unavailable(reason), path }` is the one read, before the
+    attach, and every consumer takes `identity.id`. `Unavailable`
+    (corrupted, all zeros, unreadable, a mint that cannot be written) is
+    an ERROR with the reason and `boot_agent_id`, and a per-boot `OsRng`
+    id (a SHA-256 of `boot_id`, pid and time if `OsRng` fails; never
+    zero), never written; once the audit log is open, a signed
+    `integrity_drift` `subsystem_degraded` names the reason and the id.
+    Not a refusal to start, as the triage reasoned. Beyond the triage: an
+    all-zero file is corruption (`parse`), so a hand-written zero cannot
+    bring the fixtures' identity back; and the way out is written down —
+    a request signed for the per-boot id (the `agent_id` of the boot's
+    audit rows, in a file given to `--agent-id-file`) opens the
+    trusted-installer window that repairs the file. Residual, declared:
+    a restart under the previous instance's pinned hooks whose early
+    registration failed (EBPF-015) cannot mint a missing `agent_id` and
+    boots on a per-boot id (the old second read minted it after the
+    attach).
+  - EVD-020 (282, fixed). Re-checked: `NotFound` minted with an INFO,
+    `persist_atomically` (`agent_id.tmp`, `create_new`) renamed without
+    syncing the directory, and a leftover `agent_id.tmp` blocked every
+    later mint (EEXIST). Now the mint is `crate::atomic_file::replace`
+    (lab PR 115/WDG-015's writer: `.agent_id.tmp` removed, never
+    followed, mode 0644 on the descriptor, file and directory synced).
+    `read_tail` keeps the last row's `agent_id` (`TailState`), and
+    `AuditLog::attest_identity` — called once, after the boot's chain
+    findings and the numbering marker, before `agent_boot`, and on a
+    refused boot after the floor attestation — signs `agent_id_minted`
+    (`file`, `agent_id`, `previous`) for a mint, the `subsystem_degraded`
+    above for `Unavailable`, and, when the chain's last row carries
+    another id, an ERROR `AGENT IDENTITY CHANGED` and `integrity_drift`
+    `agent_id_changed` (`from`, `to`, `source`, `file`, `detail`,
+    `at_boot`), signed with the agent key of the rows before it: the row
+    that links the two identities. Not pushed into the boot's chain
+    findings: an identity change is not lost history and must not close
+    the one-key bootstrap (ATP-004). Format: no field added; existing rows
+    keep their bytes and pre-image; the new rows are numbered rows like
+    any other, so an older `nn-admin` verifies them (nothing changes for
+    older readers, unlike lab PRs 160/179). Runbook:
+    `docs/operator/EVIDENCE_CHAINS.md` gains the kind and the expected
+    once-only case.
+  - MAIN-010 (252, fixed). Re-checked: 21 `agent_id::load_or_bootstrap`
+    calls in `admin_cli.rs` (`signed_request` and 20 verbs) and one in
+    `nn_admin.rs` (`config overlay status`). All now call
+    `agent_id::load_existing` ("agent_id not found at …: the agent
+    creates it at its first start"; corrupted or zero refused);
+    `load_or_bootstrap` stays the agent's, behind `resolve`. The two
+    `trusted-installer-grant` tests that relied on the implicit mint
+    write the file with `write_agent_id_file`; three shutdown tests that
+    wrote a zero id use `0x21`. `install.sh` calls `config overlay status`
+    and `sign` only under `[[ -s agent_id ]]`, and the lab and e2e suites
+    run `nn-admin` after the agent's start: unaffected.
+  - Tests: `agent_id.rs`: `an_all_zero_agent_id_is_refused_as_corruption`,
+    `an_all_zero_agent_id_is_unavailable_at_boot`,
+    `resolve_reports_the_source_and_never_falls_back_to_zero` (two calls
+    on a corrupted file: two ids, neither zero, the file untouched),
+    `resolve_without_a_writable_place_is_unavailable_not_zero`,
+    `load_existing_never_mints`,
+    `leftovers_at_the_temporary_names_neither_block_nor_redirect_the_mint`,
+    `the_agent_reads_its_identity_once` (a scan of `main.rs`: one
+    `resolve`, no `load_or_bootstrap`, no `[0u8; 16]`, the overlay gate,
+    the audit log and `AdminAuth` on the one binding, `attest_identity`
+    on both open paths); `audit.rs`:
+    `a_chain_last_signed_as_another_id_reports_the_change_once`,
+    `a_fresh_chain_with_a_minted_id_records_the_mint_and_no_drift`,
+    `a_mint_over_an_existing_chain_records_the_mint_and_the_change`,
+    `an_unusable_identity_is_a_signed_degradation`,
+    `legacy_rows_keep_verifying_and_an_old_zero_fallback_is_named` (rows
+    without `seq` signed as zero: bytes kept, the change named, the whole
+    chain verifies); `admin_cli.rs`:
+    `cli_verbs_before_the_first_start_fail_and_mint_nothing` (`fim
+    status`, `fim report`, `canary list`, `net flows`, `net listeners`,
+    `detections`, `trusted-installer-grant`, `config overlay sign`). On
+    the starting tree: the zero-id test fails (the zero id loads), the
+    leftovers test fails (`creating tmpfile …/agent_id.tmp`: EEXIST), the
+    CLI test fails (`config overlay sign` mints `agent_id` and signs for
+    it); the others do not compile there (`resolve`, `load_existing`,
+    `attest_identity`). Host: `cargo fmt`, both clippy runs
+    (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean, 2,412 passed, 0 failed.
+  - Lab: Debian 12, agentid185-probe.sh — before: the build of `main` with lab PRs 176–183; after: this lot on top (`agent_id` backed up and put back, SHA-256 checked). `agent_id` removed with the agent stopped: before a fresh id minted and every row signed with it, nothing said; after an ERROR "AGENT IDENTITY CHANGED", a signed `agent_id_minted` (with the previous id) and an `integrity_drift` `agent_id_changed` {from, to, source: minted}. Another valid id written in place: silent before; after `agent_id_changed` (source: loaded), and the overlay signed for the old id refused at the next start. Read-only verbs (`fim status`, `canary list`, `detections`, `net flows`, `config overlay status`, `config overlay sign`) with no `agent_id` at their path: after, exit 5 "agent_id not found …: the agent creates it at its first start", nothing created. Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.

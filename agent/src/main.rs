@@ -1208,21 +1208,22 @@ async fn main() -> Result<()> {
              lazily created on first listener event (and unprotected this boot)"
         );
     }
-    // agent_id bootstrap moved up from line ~360 so its inode is
-    // present in PROTECTED_INODES from boot. The post-attach
-    // re-read at line ~360 stays for the SignedPayload wiring path
-    // (it just sees the same value we minted here).
-    let boot_agent_id = agent_id::load_or_bootstrap(&cli.agent_id_file)
-        .map_err(|e| {
-            warn!(
-                error = %e,
-                path = %cli.agent_id_file.display(),
-                "pre-attach agent_id bootstrap failed — post-attach re-read will \
-                 surface the same error and fall back to zero UUID"
-            );
-            e
-        })
-        .unwrap_or([0u8; 16]);
+    // Tappa 8 A3 + A8: the per-install agent UUID, the third anti-replay
+    // layer of the signed-payload verify path (design §6.4 layer 3). Read
+    // (or, on the first start, minted) here, before the attach, so its
+    // inode is in PROTECTED_INODES from boot.
+    //
+    // External audit MAIN-009 (NN-AUD-251): the one read of this boot. The
+    // overlay gate, the audit log, the chains and the admin plane all take
+    // `agent_id` from it (a second read used to feed the admin plane, and
+    // both fell back to the all-zero id the test fixtures sign with). A file
+    // that cannot be used gives a per-boot random id — ERROR now, a signed
+    // `subsystem_degraded` once the audit log is open — so nothing signed
+    // for another install or for zero verifies; the legacy unlock does not
+    // bind the id. A minted id or one that differs from the audit chain's
+    // last row is signed there too (EVD-020, `attest_identity`).
+    let identity = agent_id::resolve(&cli.agent_id_file);
+    let agent_id = identity.id;
 
     // Tappa 10.8 — signed operator overlays: every `*.local` below is read
     // only if an admin key with `config-manage` signed its exact content
@@ -1230,7 +1231,7 @@ async fn main() -> Result<()> {
     // list and the refusal is recorded once the audit log is open.
     let overlay_gate = Arc::new(northnarrow_agent::config::overlay_auth::OverlayGate::new(
         &cli.admin_pub,
-        boot_agent_id,
+        agent_id,
         rollback_floor,
     ));
     use common::wire::admin_signed_payload::OverlayKind;
@@ -2019,37 +2020,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Tappa 8 A3 + A8: bootstrap (or read) the per-install agent
-    // UUID. The value becomes the third anti-replay layer for the
-    // signed-payload verify path (design §6.4 layer 3, plumbed in
-    // commit A7 via `verify_signed_payload_quorum`). A failure
-    // here is non-fatal: the agent falls back to a zero UUID,
-    // which means signed-payload submissions whose `agent_id`
-    // field is `[0; 16]` will still verify but every other
-    // submission will fail `AgentIdMismatch`. We log loudly so
-    // the operator sees the bootstrap problem; the legacy
-    // unlock/force-posture/status paths are unaffected because
-    // they don't touch agent_id.
-    let agent_id = match agent_id::load_or_bootstrap(&cli.agent_id_file) {
-        Ok(id) => {
-            info!(
-                target: "agent_id",
-                path = %cli.agent_id_file.display(),
-                "agent_id ready"
-            );
-            id
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                path = %cli.agent_id_file.display(),
-                "agent_id bootstrap failed; falling back to zero UUID — \
-                 signed-payload admin operations will reject all clients"
-            );
-            [0u8; 16]
-        }
-    };
-
     // Supply chain, runtime half: the binaries running now must be the
     // ones install.sh verified and recorded. Checked before the audit
     // log opens so the agent_boot entry carries the result.
@@ -2166,6 +2136,11 @@ async fn main() -> Result<()> {
                     northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id)
                 {
                     overlay_gate.attest_floor(&mut log);
+                    // External audit EVD-020: a refused boot records its
+                    // identity too.
+                    if let Err(e) = log.attest_identity(&identity) {
+                        warn!(error = format!("{e:#}"), "agent identity not recorded");
+                    }
                     match log.boot_refused(outcome.label(), outcome.provenance(), &detail) {
                         Ok(e) => {
                             info!(entry_hash = %e.entry_hash, "refused boot recorded in the audit chain")
@@ -2240,6 +2215,13 @@ async fn main() -> Result<()> {
                             if let Err(e) = log.append(marker) {
                                 warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
                             }
+                        }
+                        // External audit EVD-020 / MAIN-009: a minted id, an
+                        // id other than the one the chain's last row carries,
+                        // or a per-boot id (the file unusable) is signed
+                        // before the boot's own entry.
+                        if let Err(e) = log.attest_identity(&identity) {
+                            warn!(error = format!("{e:#}"), "agent identity not recorded");
                         }
                         match log.boot_probe(
                             detect_only_source.as_deref(),
