@@ -61,6 +61,44 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, dependency advisory policy (Low SUP-007
+  NN-AUD-393, SUP-008 NN-AUD-394, SUP-009 NN-AUD-395, SUP-010 NN-AUD-396,
+  SUP-011 NN-AUD-443; lab PR 183). The RustSEC job failed on
+  vulnerabilities only: `unsound` and `unmaintained` advisories were
+  warnings that ci.yml said Dependabot tracked — it fails no build and
+  bumps the manifests' own dependencies only — and nothing recorded why
+  the five on today's lockfiles were let through. The audit job now runs
+  `cargo audit --deny unsound --deny unmaintained` on the three
+  lockfiles, and the new `.cargo/audit.toml` denies the same, so a local
+  `cargo audit` from the repository root gives the CI verdict. An advisory that cannot be fixed
+  is a recorded exception there: the ID with the crate and the locked
+  version it was reasoned about, why it cannot be reached or has no fix,
+  an owner, the event that reopens it, the day it was recorded and an
+  expiry at most 184 days later; a new step of the audit job
+  (`.github/scripts/check-audit-exceptions.sh`, on the daily schedule
+  too) fails once an expiry has passed. Accepted until 2027-01-20: lru
+  0.12.5, RUSTSEC-2026-0253 and RUSTSEC-2026-0002 (SUP-008/009: only
+  tantivy 0.25.0 depends on it, with `usize` keys and no `iter_mut`; the
+  fixed releases are beyond its `^0.12`, and the release profile aborts
+  on panic); paste 1.0.15, RUSTSEC-2024-0436 (SUP-011: archived, a
+  build-time proc-macro of the candle/tokenizers chain); and
+  unsafe-libyaml 0.2.11, RUSTSEC-2024-0449, found by the new gate
+  (published 2026-10-12, after the triage): archived, reached only
+  through xtask's `serde_yaml_ng`, which parses the committed workflows
+  and the sha256-pinned Sigma tarball; moving xtask to a YAML parser in
+  safe Rust is a follow-up. SUP-010: memmap2 0.9.10 → 0.9.11 in
+  `Cargo.lock` (RUSTSEC-2026-0186; `fuzz/Cargo.lock` had it already),
+  lockfile only. **Regressions / changes:** a newly published unsound or
+  unmaintained advisory turns the audit job red, on the daily run of an
+  unchanged `main` too, until it is fixed or recorded; from 2027-01-21
+  the job is red until the four exceptions are re-checked and recorded
+  again, or dropped; a tantivy, candle or tokenizers bump that moves lru
+  or paste off the recorded version fails `xtask/tests/supply_chain.rs`
+  until the entry is dropped or rewritten; a bump of one of 27 security
+  crates (tokio, serde, serde_json, postcard, ciborium, the signature and
+  hash crates, libc, nix, aya, object, procfs, tantivy, candle-core,
+  tokenizers, safetensors, memmap2, lru, paste) must land in `Cargo.lock`
+  and `fuzz/Cargo.lock` alike, or the same test file fails.
 - External audit, Wave 3, ADE prompt inputs (Low LLMP-012 NN-AUD-323,
   LLMP-014 NN-AUD-324, LLMR-011 NN-AUD-326; lab PR 182). The trusted block
   of every ADE prompt (`=== TRUSTED CONTEXT (issued by NorthNarrow,

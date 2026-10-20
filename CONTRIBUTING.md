@@ -53,6 +53,19 @@ fonde.
   `xtask/tests/supply_chain.rs` fallisce se una dipendenza del lockfile ne
   chiede una più alta. Chi aggiorna una dipendenza così alza `rust-version`
   nella stessa PR.
+- Advisory RustSEC (SUP-007): il job `audit` fallisce anche sugli advisory
+  `unsound` e `unmaintained`, non solo sulle vulnerabilità;
+  `cargo audit --file Cargo.lock` lanciato dalla radice del repository dà
+  lo stesso esito (legge `.cargo/audit.toml`). Un advisory si corregge
+  (bump del lockfile) oppure si registra come eccezione in
+  `.cargo/audit.toml`, con il blocco di commento descritto in testa al
+  file: motivo, responsabile, evento di riesame, data e scadenza (al
+  massimo 184 giorni). Mai `--ignore` sulla riga di comando. Dal giorno
+  dopo la scadenza il job è rosso finché l'eccezione non viene
+  riesaminata e registrata di nuovo, o tolta. Il bump di una crate di
+  sicurezza (elenco in `xtask/tests/supply_chain.rs`,
+  `security_crates_are_locked_alike_for_the_fuzzer`) va applicato sia a
+  `Cargo.lock` sia a `fuzz/Cargo.lock`, e il job fuzz deve compilare.
 
 ## Stile
 

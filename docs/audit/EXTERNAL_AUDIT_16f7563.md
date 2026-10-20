@@ -602,10 +602,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-390 | DEP-018 | Low | Deploy | S | open |
 | NN-AUD-391 | DEP-019 | Low | Deploy | — | already fixed (lab PR 152) |
 | NN-AUD-392 | SUP-004 | Low | Supply chain | S | fixed (lab PR 171) |
-| NN-AUD-393 | SUP-007 | Low | Supply chain | S | open |
-| NN-AUD-394 | SUP-008 | Low | Supply chain | S | open (not reachable; accept with a recorded exception) |
-| NN-AUD-395 | SUP-009 | Low | Supply chain | S | open (not reachable; accept with a recorded exception) |
-| NN-AUD-396 | SUP-010 | Low | Supply chain | S | open (root lockfile only) |
+| NN-AUD-393 | SUP-007 | Low | Supply chain | S | fixed (lab PR 183) |
+| NN-AUD-394 | SUP-008 | Low | Supply chain | S | fixed (lab PR 183) |
+| NN-AUD-395 | SUP-009 | Low | Supply chain | S | fixed (lab PR 183) |
+| NN-AUD-396 | SUP-010 | Low | Supply chain | S | fixed (lab PR 183) |
 | NN-AUD-397 | SUP-012 | Low | Supply chain | S | fixed (lab PR 171) |
 | NN-AUD-398 | SUP-013 | Low | Supply chain | S | open |
 | NN-AUD-399 | SUP-014 | Low | Supply chain | M | open |
@@ -652,7 +652,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-440 | DEP-020 | Info | Deploy | S | open |
 | NN-AUD-441 | DEP-021 | Info | Deploy | S (docs) | open |
 | NN-AUD-442 | DEP-022 | Info | Deploy | — | already fixed (lab PR 150) |
-| NN-AUD-443 | SUP-011 | Info | Supply chain | S | open (no fix exists; accept with a recorded exception) |
+| NN-AUD-443 | SUP-011 | Info | Supply chain | S | fixed (lab PR 183) |
 | NN-AUD-444 | LAB-028 | Info | Lab scripts | S gate / L campaign | open (methodology frozen in lab PR 159; no run yet) |
 
 ## Notes on the fixes
@@ -6971,3 +6971,96 @@ group, the ones an unprivileged user or a local attacker could use first.
     (`--workspace --all-targets`, the agent with
     `test-privileged,debug-trigger`) clean, 2,363 passed, 0 failed.
   - Lab: No lab or model run (the prompt is unchanged for clean values): unit tests pin the clean prompt bytes as the code before rendered them, 970 RAG titles (the seed's 36 and the 934 of the verified dumps) unchanged, and a hostile hostname that closed the trusted block and opened a fake `=== YOUR TASK ===` section now staying on one neutralised line; the real-corpus golden suite 28/30 as before. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.
+- **Wave 3 — dependency advisory policy, lab PR 183.** NN-AUD-393
+  (SUP-007), NN-AUD-394 (SUP-008), NN-AUD-395 (SUP-009), NN-AUD-396
+  (SUP-010), NN-AUD-443 (SUP-011), all Low; batch 3 of the Wave 3 supply,
+  lab and tests triage.
+  - SUP-007 (393): the audit job ran plain `cargo audit --file`, which
+    reports `unsound` and `unmaintained` advisories as warnings and exits
+    0; ci.yml said Dependabot tracked them, and nothing did (it fails no
+    build and bumps the manifests' own dependencies only). No `audit.toml`
+    existed. cargo-audit stays the pinned 0.22.2 (no cargo-deny in the
+    chain). Every `cargo audit` of the workflows has `--deny unsound
+    --deny unmaintained`, and the new `.cargo/audit.toml` has `[output]
+    deny` with both, so a local run from the root (cargo-audit reads
+    `./.cargo/audit.toml` relative to where it runs) gives the CI verdict.
+    Each `ignore` entry has its comment block: `<ID>: <crate> <locked
+    version>, <kind>.`, `Why:`, `Owner:`, `Re-check:`, `Recorded:`,
+    `Expires:` (at most 184 days after `Recorded:`). cargo-audit has no
+    expiry, so the audit job first runs
+    `.github/scripts/check-audit-exceptions.sh`, which fails the day after
+    an `Expires:` date (the daily schedule of lab PR 171 included) and on
+    an entry without a valid one, one entry per line. The comment of the
+    job is corrected.
+  - SUP-008, SUP-009 (394, 395): lru 0.12.5, RUSTSEC-2026-0253 (`pop()`
+    not panic-safe) and RUSTSEC-2026-0002 (`IterMut`), both accepted until
+    2027-01-20. Re-checked in tantivy 0.25.0, the only dependent (`=0.25.0`
+    in agent/Cargo.toml, lru `^0.12`; the fixes are in 0.18.2 and 0.16.3,
+    out of reach, and a `[patch]` cannot cross the major version):
+    `store/reader.rs` keeps `LruCache<usize, Block>` and calls
+    `get`/`put`/`len`/`peek_lru` only — a `usize` key cannot panic in
+    Drop, and there is no `iter_mut`. The release profile aborts on panic;
+    a test keeps it so for `release` and every profile that inherits it.
+    Re-check at each tantivy bump (`cargo tree -i lru`).
+  - SUP-010 (396): memmap2 0.9.10 → 0.9.11 in `Cargo.lock` (`cargo update
+    -p memmap2 --precise 0.9.11`; same checksum as `fuzz/Cargo.lock`,
+    which had it; no manifest change; rust-version 1.65). Not reachable
+    before either (tantivy advises the whole map, candle-core maps
+    safetensors), but free.
+  - SUP-011 (443): paste 1.0.15, RUSTSEC-2024-0436, accepted until
+    2027-01-20: archived, no fixed release; a proc-macro (build time only)
+    of the gemm/pulp/macro_rules_attribute/tokenizers chain. In
+    `fuzz/Cargo.lock` macro_rules_attribute 0.2.3 already uses pastey;
+    the root lock keeps 0.2.2. Re-check at each candle or tokenizers bump
+    (`cargo tree -i paste`).
+  - Found by the new gate, not in the triage: unsafe-libyaml 0.2.11,
+    RUSTSEC-2024-0449 (unmaintained, added to the database on 2026-10-12),
+    root lock only, through `serde_yaml_ng` 0.10.0, a dependency of xtask
+    alone (`publish = false`; not in the agent, the CLI, the watchdog or a
+    release asset). xtask parses with it the committed workflows (its
+    tests) and the Sigma rules of the sha256-pinned tarball (`rag_kb.rs`).
+    Recorded as an exception until 2027-01-20, not hidden; moving xtask
+    to a YAML parser in safe Rust (serde-saphyr, as the advisory suggests)
+    is a follow-up that drops it. Its RUSTSEC-2023-0075 (unsound) is fixed
+    in 0.2.10.
+  - Fuzz lockfile: after #365 (tokio 1.53.3 had to go into
+    `fuzz/Cargo.lock` too, or the fuzz build failed), a guard: 27 security
+    crates (tokio, serde, serde_json, postcard, ciborium, ed25519-dalek,
+    curve25519-dalek, sha2, hkdf, hmac, aes-gcm, zeroize, subtle, libc,
+    nix, aya, aya-obj, object, procfs, procfs-core, tantivy, candle-core,
+    tokenizers, safetensors, memmap2, lru, paste), plus every crate an
+    exception names, must lock the same versions in both lockfiles. 82 of
+    the 310 shared crates differ (the fuzz lock is resolved on its own),
+    none of them in that list; they are left alone. `fuzz/` is not touched
+    by this lot.
+  - Tests: `xtask/tests/supply_chain.rs`:
+    `every_advisory_exception_is_reasoned_and_dated` (the block, the
+    dates, the 184 days, the crate still locked at the recorded version),
+    `the_advisory_gate_denies_unsound_and_unmaintained` (the flags on
+    every `cargo audit`, no `--ignore` and no narrowing flag such as
+    `--stale` or `--target-os`, the expiry step before the audit,
+    `[output] deny`, and no other key in the config — a
+    `severity_threshold` would narrow the gate),
+    `advisory_exceptions_expire_in_ci` (bash, fixed dates: the committed
+    file on its last day and the day after; expired, no date, a malformed
+    date, ids inline or two on a line, an unclosed list, an empty list, a
+    missing file), `release_profile_aborts_on_panic`,
+    `security_crates_are_locked_alike_for_the_fuzzer`. On the starting
+    tree the first four fail (no `.cargo/audit.toml`, no script; the gate
+    test lists both missing `--deny` flags and the missing expiry step;
+    the fuzz guard reports memmap2 0.9.10 against 0.9.11);
+    `release_profile_aborts_on_panic` passes there (a guard: with `panic
+    = "unwind"` in `release-bench` it fails). Mutations checked: an
+    `Expires:` removed, the recorded lru version changed, a 224-day
+    window, a `severity_threshold` added — each fails its test.
+  - cargo-audit 0.22.2 on the host (advisory database 999ec89,
+    2026-10-17), the job's command from the root: the three lockfiles
+    pass; with any one exception removed, its lockfiles fail ("1 denied
+    warning found!"; unsafe-libyaml's only `Cargo.lock`); the starting
+    `Cargo.lock` with the new policy fails on RUSTSEC-2026-0186; the old
+    command on it passed with "5 allowed warnings".
+  - Host: `cargo fmt`, both clippy runs (`--workspace --all-targets`, the
+    agent with `test-privileged,debug-trigger`) clean, 2,356 passed, 0
+    failed; actionlint 1.7.12: no finding; `cargo +nightly-2025-12-01 fuzz
+    build` builds the ten targets with `fuzz/Cargo.lock` unchanged.
+  - Lab: CI policy, no lab: `cargo audit` 0.22.2 (advisory DB 999ec89) green on the three lockfiles with the four recorded exceptions and red ("1 denied warning") without any one of them; the lock of `main` red on RUSTSEC-2026-0186 (memmap2, bumped); `cargo +nightly fuzz build` of the ten targets green with the lockfiles unchanged; actionlint clean. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.
