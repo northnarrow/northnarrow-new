@@ -184,7 +184,7 @@ gh attestation verify northnarrow-<ver>-x86_64-linux.tar.gz --repo northnarrow/n
 
 # 2. Install (does NOT start anything; bootstraps an admin key at /root/northnarrow-admin.key
 #    that you must move off-host). install.sh checks the tree's MANIFEST.sha256, the tarball
-#    against SHA256SUMS (both found in ..) and, with gh or cosign, the attestation.
+#    against SHA256SUMS (both found in ..) and the attestation (gh, or cosign with --attestation).
 tar xzf northnarrow-<ver>-x86_64-linux.tar.gz && cd northnarrow-<ver>-x86_64-linux
 sudo ./deploy/install.sh
 sudo systemctl enable --now northnarrow-agent northnarrow-watchdog
@@ -199,11 +199,14 @@ sudo ./deploy/install.sh --upgrade --grant-key <admin.key>     # in place, keys 
 sudo ./deploy/uninstall.sh [--purge] --grant-key <admin.key>   # the only order the anti-tamper layer allows
 ```
 
-The installer does not step its checks down on its own: a tree without `MANIFEST.sha256`
-is refused unless `--source-tree` is given, and a tree vouched for only by its own
-manifest (no tarball and `SHA256SUMS`, no attestation) unless `--allow-manifest-only`;
-either flag is recorded in `/etc/northnarrow/install-manifest.json` and reported by
-`nn-admin host-check`. At every boot the agent compares its binaries and its eBPF object
+The installer does not step its checks down on its own: a release tree installs only when
+its tarball's SLSA provenance attestation verifies (`gh`, or an offline bundle) and the tree
+is the tarball's; a tree without `MANIFEST.sha256` is refused unless `--source-tree` is
+given; anything less needs `--allow-unverified` (lab and development). Each flag is logged
+(`auth.warning`), recorded in `/etc/northnarrow/install-manifest.json` and reported by
+`nn-admin host-check`. An upgrade is a transaction: the files it replaces are backed up,
+the new units must pass a health check, and any failure restores the previous version and
+starts it again (`docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §2). At every boot the agent compares its binaries and its eBPF object
 with that manifest and refuses to start on a mismatch, or when the manifest was removed
 after a verified boot. Upgrading from `v0.0.1-tappa9.0`: read
 [`docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md`](docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md)

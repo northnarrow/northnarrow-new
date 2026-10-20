@@ -40,13 +40,26 @@ sudo tar --no-same-owner --no-same-permissions -xzf "$tgz" || { bad "extract"; e
 tree=/opt/nn-release/${tgz%.tar.gz}
 check "release binaries run here (glibc)" "$tree/target/release/northnarrow-agent" --version
 T0=$(date "+%F %T")
-check "install.sh verifies and installs the tree" \
-    bash -c "cd '$tree' && sudo ./deploy/install.sh --tarball '/opt/nn-release/$tgz' --sums /opt/nn-release/SHA256SUMS >/tmp/nn-release-install.log 2>&1"
-check "  install manifest provenance=checksums" sudo grep -q '"provenance": "checksums"' /etc/northnarrow/install-manifest.json
+# Lab PR 220: a release tree installs only when its provenance attestation
+# verifies. The tarball of a CI run is attested (if at all) for its branch,
+# not for a v* tag: refused with nothing installed, then installed with
+# --allow-unverified, which is logged and recorded with the level reached.
+prov=checksums
+if (cd "$tree" && sudo ./deploy/install.sh --tarball "/opt/nn-release/$tgz" --sums /opt/nn-release/SHA256SUMS >/tmp/nn-release-install.log 2>&1); then
+    prov=attested   # a tag's tarball
+    check "install.sh verifies the tag attestation and installs the tree" sudo grep -q '"provenance": "attested"' /etc/northnarrow/install-manifest.json
+else
+    check "install.sh refuses the tree without a tag attestation" grep -q "REFUSED — the release's SLSA provenance attestation did not verify" /tmp/nn-release-install.log
+    check "install.sh verifies and installs the tree (--allow-unverified)" \
+        bash -c "cd '$tree' && sudo ./deploy/install.sh --tarball '/opt/nn-release/$tgz' --sums /opt/nn-release/SHA256SUMS --allow-unverified >/tmp/nn-release-install.log 2>&1"
+    check "  install manifest provenance=checksums" sudo grep -q '"provenance": "checksums"' /etc/northnarrow/install-manifest.json
+    check "  install manifest verify_override=--allow-unverified" sudo grep -q '"verify_override": "--allow-unverified"' /etc/northnarrow/install-manifest.json
+    check "  the override is in the system log" bash -c "sudo journalctl -t northnarrow-install --since '$T0' --no-pager -o cat | grep -q -- '--allow-unverified'"
+fi
 sudo systemctl daemon-reload
 sudo systemctl start northnarrow-agent; sleep 3; sudo systemctl start northnarrow-watchdog; sleep 25
 check "units active" test "$(systemctl is-active northnarrow-agent northnarrow-watchdog | tr '\n' ' ')" = "active active "
-check "binary integrity verified (checksums manifest)" agent_event INFO 'binary integrity verified against the install manifest provenance="checksums" '
+check "binary integrity verified ($prov manifest)" agent_event INFO "binary integrity verified against the install manifest provenance=\"$prov\" "
 # logged only when every deny and observe hook of this kernel attached (16
 # deny hooks on 5.15 and 6.1, 18 where the kernel has the ACL hooks, 6.2+)
 check "every deny hook attached" agent_event INFO 'anti-tamper: all LSM hooks attached deny_attached='

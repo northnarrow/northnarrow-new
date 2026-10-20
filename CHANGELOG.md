@@ -208,6 +208,98 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   templates).
 
 ### Fixed
+- Transactional upgrade with rollback, and blocking provenance verification
+  (capabilities C27, C28; static review of `baf4c25` P0 C-45 / G-07 / TD-09,
+  App.D C-46, G-36; lab PR 220).
+  - **`install.sh --upgrade` is a transaction.** It stopped the units,
+    dropped the pins and overwrote binaries, units and configuration with
+    no copy, no trap and no health check: a failure halfway (the binaries
+    replaced and not the units, a new agent that does not start) left the
+    host without a working agent. Before anything is stopped, every file the
+    run may create or replace — the binaries, the units, the Debian drop-in,
+    the journald config, the install manifest, the `.v1` lists, the overlay
+    template, the control-surface files, the canary templates, the overlay
+    signatures it may add — is copied (`cp -a`) into
+    `/var/lib/northnarrow-upgrade/<time>-<pid>/`, and the files that do not
+    exist yet are listed; a backup that fails is a refusal with nothing
+    stopped. Binaries, units and the manifest are staged next to the
+    installed ones and switched by `rename(2)`. After the restart the units
+    must pass a health check (60 s, `HEALTH_TIMEOUT`): both active (Type=
+    notify), the agent's own `anti-tamper: all LSM hooks attached` event
+    with every deny hook, read as an event of the unit's main process
+    (`_SYSTEMD_UNIT`, `_PID`, `_TRANSPORT=stdout`, the whole line — a file
+    named like it in another event is not it), its pid file and an answer on
+    its admin socket, the watchdog's own PROTECTED_PIDS registration with
+    its main pid; a deny-hook shortfall fails, a missing observe hook is a
+    WARNING. Any failure after the stop (an EXIT trap, Ctrl-C included)
+    rolls back: the new units stopped through the new agent's own window
+    (the same `--grant-key`, now required by `--upgrade` over running units,
+    checked before anything is stopped), the previous files renamed back
+    byte for byte — checked against the SHA-256 taken before the stop — and
+    the new ones removed, the previous units started and
+    checked, exit 3 with the stage and the reason on stderr and at
+    `auth.err` (tag `northnarrow-install`). A unit that does not start is
+    reported at the stage `health_check` (the start itself is not checked).
+    Exit 4 (`auth.crit`) when the rollback cannot finish: below, or a
+    restored file that is not the one backed up, or a restored version that
+    fails its own health check (no `rollback.sh` then). The audit chain and the chain
+    logs are not rolled back. A unit the stop did not reach now stops the
+    run before its pin root goes.
+  - **The previous agent signs the rollback.** Before restarting it,
+    install.sh leaves `/run/northnarrow/upgrade-rolled-back.json`; the agent
+    records it at its boot as an `upgrade_rolled_back` row (stage, reason,
+    both versions, the transaction, `reported_by: install.sh`, its own
+    version) and removes it (`agent/src/upgrade_rollback.rs`: read without
+    following a link, root's, not writable by others, 4 KiB, strings only,
+    200 characters, controls as `?`; anything else recorded as `failure:
+    marker refused (…)`). install.sh reads the row back and names it; an
+    agent older than the marker is reported as such and the marker removed.
+  - **When the new hooks block the rollback** (a new agent that pinned them
+    and died, or that does not answer on its socket), install.sh starts it
+    once more for its window and otherwise stops with exit 4 (`auth.crit`)
+    and `rollback.sh` in the transaction directory: after `systemctl
+    disable` of both units and a reboot it restores the files, enables and
+    starts the previous units and checks them. `uninstall.sh --purge`
+    removes `/var/lib/northnarrow-upgrade`.
+  - **Provenance verification blocks.** A release tree installed as
+    `checksums` with an unsigned `SHA256SUMS` when the attestation failed or
+    no verifier was there (`--require-attestation` was opt-in). A release
+    tree now installs only at `attested`; a failed `gh attestation verify`
+    (its last lines shown), no tarball, or no verifier is a refusal. The tree
+    must also be the tarball's: its `MANIFEST.sha256` is compared with the
+    one inside the tarball (a tree edited after extraction, manifest
+    rewritten, passed every check). `--allow-unverified` accepts less — for
+    the lab and development — and covers a source tree as `--source-tree`
+    does; `--allow-manifest-only` is its former name. Each override is a
+    WARNING, a line at `auth.warning`, `verify_override` (and
+    `attestation.failure`) in the install manifest; `nn-admin host-check`
+    now warns on `checksums` too. `--require-attestation` is the default
+    (`REQUIRE_ATTESTATION=1` in install.sh, cleared only by
+    `--allow-unverified` or `--no-verify`; the flag with either: exit 2).
+    cosign verifies only with an offline bundle (`--attestation`); that path
+    has no automated test. The lab keeps
+    `--source-tree`; `release-check` expects the refusal of a CI run's
+    tarball, then installs it with `--allow-unverified`.
+  - **Packages report an unhealthy upgrade.** The configure step runs the
+    same health check on the units it restarted: the `.deb` `postinst`
+    fails (dpkg: half-configured), the `.rpm` checks in a new `%posttrans`
+    (`install.sh --package-verify`, after the whole transaction) and fails
+    it; the restart list stays for `dpkg --configure -a`. Neither package
+    manager restores the previous version at that point; what each one can
+    roll back is in `docs/operator/INSTALL_UPGRADE_UNINSTALL.md` §6.2. The
+    release workflow's smoke test counts five rpm scriptlets.
+  - Tests: `xtask/tests/install_scripts.rs` runs install.sh whole against
+    stub `systemctl`, `journalctl` and fake agents that keep the
+    anti-tamper's rules — a health check that fails rolls back byte for
+    byte (mode and mtime) and restarts the previous agent, which signs the
+    record; a failure at each stage (programs that do not unload, a unit
+    rename that fails after the binaries were switched, `daemon-reload`, a
+    unit that does not start (reported at `health_check`), a deny-hook
+    shortfall, a forged health line); the pinned-and-dead
+    agent finished by `rollback.sh`; an unattested release refused without
+    the flag, the flag logged; the tree not from its tarball; the package
+    configure and verify steps. `agent/src/upgrade_rollback.rs` tests the
+    marker against install.sh's writer.
 - Wave 4, boot integrity: checks before the attach, the deny self-test,
   signed degradations, a trust level and a capability manifest (external
   review G-09, G-11, G-12, AR-09, P0 C-13, P0 C-14; capability program C01,

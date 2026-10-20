@@ -75,12 +75,13 @@ pub fn run_in(root: &Path) -> Vec<Check> {
 pub const INSTALL_MANIFEST_REL: &str = "etc/northnarrow/install-manifest.json";
 
 /// External audit DEP-007: how far `install.sh` could verify the release
-/// the installed binaries came from. Only `checksums` (the tarball against
-/// the release's `SHA256SUMS`) and `attested` (the SLSA attestation) rest
-/// on something outside the tree; `manifest` is the tree vouching for
-/// itself, and `source-tree`, `unverified` and `package` verified nothing
-/// on this host. The agent boots at every level (a lab or a developer host
-/// must keep working), so the level is reported here.
+/// the installed binaries came from. Lab PR 220: only `attested` (the SLSA
+/// attestation, bound to a release tag) says where they were built —
+/// `checksums` (the tarball against an unsigned `SHA256SUMS`, swapped with
+/// the tarball as easily) is a warning now, like `manifest` (the tree
+/// vouching for itself) and `source-tree`, `unverified` and `package`, which
+/// verified nothing on this host. The agent boots at every level (a lab or
+/// a developer host must keep working), so the level is reported here.
 fn install_provenance(root: &Path) -> Check {
     let path = root.join(INSTALL_MANIFEST_REL);
     let (status, value) = match std::fs::read_to_string(&path) {
@@ -93,7 +94,7 @@ fn install_provenance(root: &Path) -> Check {
             Err(e) => (Status::Warn, format!("install manifest unparsable: {e}")),
             Ok(m) => {
                 let status = match m.provenance.as_str() {
-                    "attested" | "checksums" => Status::Ok,
+                    "attested" => Status::Ok,
                     _ => Status::Warn,
                 };
                 let mut value = m.provenance.clone();
@@ -112,7 +113,7 @@ fn install_provenance(root: &Path) -> Check {
         name: "release verified at install",
         status,
         value,
-        fix: "install from the release tarball with its SHA256SUMS (next to the tree, or `--tarball` + `--sums`), and `gh` or `cosign` for the attestation: `manifest`, `source-tree`, `unverified` and `package` mean nothing outside the installed tree vouched for these binaries",
+        fix: "install from the release tarball (next to the tree, or `--tarball`) with `gh` or `cosign` for its tag-bound attestation (install.sh refuses less without `--allow-unverified`): `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built",
     }
 }
 
@@ -487,7 +488,7 @@ mod tests {
         // admin.pub only: the private key went offline
         w(r, "etc/northnarrow/admin.pub", b"ab unlock\n");
         nft_at(r, "usr/sbin/nft");
-        w(r, INSTALL_MANIFEST_REL, &manifest("checksums", None));
+        w(r, INSTALL_MANIFEST_REL, &manifest("attested", None));
         let checks = run_in(r);
         assert_eq!(checks.len(), 11);
         assert_eq!(warn_count(&checks), 0, "{:?}", checks);
@@ -510,17 +511,20 @@ mod tests {
         .into_bytes()
     }
 
-    /// External audit DEP-007: anything below `checksums` is a warning, and
-    /// the flag that accepted it is named.
+    /// External audit DEP-007, lab PR 220: anything below `attested` is a
+    /// warning, and the flag that accepted it is named.
     #[test]
-    fn install_provenance_warns_below_checksums() {
+    fn install_provenance_warns_below_attested() {
         let d = tempfile::tempdir().unwrap();
         let r = d.path();
         assert_eq!(install_provenance(r).status, Status::Unknown);
         for (prov, flag, status) in [
             ("attested", None, Status::Ok),
-            ("checksums", None, Status::Ok),
+            ("checksums", Some("--allow-unverified"), Status::Warn),
+            ("checksums", None, Status::Warn),
             ("manifest", Some("--allow-manifest-only"), Status::Warn),
+            ("manifest", Some("--allow-unverified"), Status::Warn),
+            ("source-tree", Some("--allow-unverified"), Status::Warn),
             ("source-tree", Some("--source-tree"), Status::Warn),
             ("unverified", Some("--no-verify"), Status::Warn),
             ("package", None, Status::Warn),

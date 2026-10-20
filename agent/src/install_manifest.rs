@@ -56,8 +56,9 @@ pub struct InstallManifest {
     /// | `package`.
     pub provenance: String,
     /// External audit DEP-007: the `install.sh` flag that accepted a level
-    /// below `checksums` (`--allow-manifest-only`, `--source-tree`,
-    /// `--no-verify`); absent when none was needed.
+    /// below `attested` (lab PR 220: `--allow-unverified`, its former name
+    /// `--allow-manifest-only`, `--source-tree`, `--no-verify`); absent when
+    /// none was needed.
     #[serde(default)]
     pub verify_override: Option<String>,
     /// Lab follow-up (lab PR 165): the `install.sh` flags that accepted a
