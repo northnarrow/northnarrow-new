@@ -517,6 +517,26 @@ Now **killed, or answered, where they were recorded or missed**:
   each run, with no allowlist to exempt it; a `nobody` or `DynamicUser=`
   daemon running one of the six tools draws an R015 or R016 record —
   exempt the program in the signed `process-comm-allowlist.local`.
+- Network rules (Wave 3, lab PR 186): a listener on 22, 53, 80, 443,
+  8080 or 8443 is exempt from NN-L-NET-006 and -019 only when its program
+  is installed in a root-owned tree (`/usr`, `/opt`, `/snap`, `/bin`,
+  `/sbin`, `/lib`, `/lib64`, `/nix/store`) — the executable and, for an
+  interpreter, the script it runs by an absolute path; nginx, sshd,
+  systemd's socket units and systemd-resolved stay quiet. Any other
+  listener there is judged as on any other port (NN-AUD-298 NETR-015).
+  One DNS lookup of a long name with a high-entropy label gives one
+  record, NN-L-NET-014's, where NN-L-NET-004 added a second (NN-AUD-428
+  NETR-016). NN-L-NET-010 keeps its five C2 ports: 443 is not added.
+  **Regression:** a developer server on 8080 or 8443 — `python3 -m
+  http.server`, a script or binary in a home (node under `~/.nvm`), an
+  inline program — draws a Medium record (NN-L-NET-019 on `0.0.0.0` or
+  `::`, NN-L-NET-006 on another address) and the posture goes to ALERTED,
+  as it already did on 8000 or 3000; so does a listener whose program
+  exited before it was judged. The netflow comm allowlist cannot exempt
+  such a program (its entries name programs in the system trees). The
+  reasoning on a common port reads `on port 8080, a common service port,
+  from a program not installed in a root-owned system tree …`. Nothing is
+  killed.
 
 ## 6. Posture and COMBAT
 

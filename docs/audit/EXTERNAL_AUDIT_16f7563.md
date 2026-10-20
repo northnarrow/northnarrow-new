@@ -504,10 +504,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-292 | FIMP-013 | Low | FIM pipeline | M | open |
 | NN-AUD-293 | FIMP-014 | Low | FIM pipeline | S | open |
 | NN-AUD-294 | NETR-011 | Low | Net rules | — | already fixed (lab PR 140) |
-| NN-AUD-295 | NETR-012 | Low | Net rules | S | open |
+| NN-AUD-295 | NETR-012 | Low | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-296 | NETR-013 | Low | Net rules | — | already fixed (lab PR 146) |
 | NN-AUD-297 | NETR-014 | Low | Net rules | M | open (product decision) |
-| NN-AUD-298 | NETR-015 | Low | Net rules | S | open (listener half; C2-port half declined) |
+| NN-AUD-298 | NETR-015 | Low | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-299 | PROC-011 | Low | Process rules | S | fixed (lab PR 166) |
 | NN-AUD-300 | PROC-012 | Low | Process rules | S | fixed (lab PR 177) |
 | NN-AUD-301 | PROC-013 | Low | Process rules | S | fixed (lab PR 177) |
@@ -637,7 +637,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-425 | AUT-012 | Info | Admin auth | — | obsolete (lab PR 138) |
 | NN-AUD-426 | EBPF-022 | Info | eBPF kernel | S | partly fixed; open |
 | NN-AUD-427 | EVD-023 | Info | Evidence logs | S | open |
-| NN-AUD-428 | NETR-016 | Info | Net rules | S | open (docs + an adjacent defect) |
+| NN-AUD-428 | NETR-016 | Info | Net rules | S | fixed (lab PR 186) |
 | NN-AUD-429 | PROC-014 | Info | Process rules | S | open |
 | NN-AUD-430 | POS-013 | Info | Posture | S | fixed (lab PR 172) |
 | NN-AUD-431 | CMB-028 | Info | Combat response | S | fixed (lab PR 181) |
@@ -7232,3 +7232,81 @@ group, the ones an unprivileged user or a local attacker could use first.
     (`--workspace --all-targets`, the agent with
     `test-privileged,debug-trigger`) clean, 2,412 passed, 0 failed.
   - Lab: Debian 12, agentid185-probe.sh — before: the build of `main` with lab PRs 176–183; after: this lot on top (`agent_id` backed up and put back, SHA-256 checked). `agent_id` removed with the agent stopped: before a fresh id minted and every row signed with it, nothing said; after an ERROR "AGENT IDENTITY CHANGED", a signed `agent_id_minted` (with the previous id) and an `integrity_drift` `agent_id_changed` {from, to, source: minted}. Another valid id written in place: silent before; after `agent_id_changed` (source: loaded), and the overlay signed for the old id refused at the next start. Read-only verbs (`fim status`, `canary list`, `detections`, `net flows`, `config overlay status`, `config overlay sign`) with no `agent_id` at their path: after, exit 5 "agent_id not found …: the agent creates it at its first start", nothing created. Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.
+- **Wave 3 — network rule state, lab PR 186.** Batch B4 of the Wave 3
+  triage of group G4: NN-AUD-298 (NETR-015, the listener half; the C2-port
+  half declined), NN-AUD-295 (NETR-012), NN-AUD-428 (NETR-016, with the
+  adjacent defect the triage found), all Low, and the optional test of
+  NN-AUD-294 (NETR-011, FIXED in lab PR 140). Files: `decision/rules/net.rs`,
+  `posture/lineage.rs` (one method), `decision/tests.rs`. No wire, kernel
+  or configuration change.
+  - NETR-015, the triage's fix, not the audit's. `LISTENER_COMMON_PORTS`
+    returned before the allowlist judgement in -006 and -019. Now
+    `common_port_service`: on a common port the listener's exec identity
+    (`AuthSessionTracker::exec_identity`: the spawn cache, else `/proc`;
+    the drain's listener record has `exe: None`) must pass the new
+    `ExecIdentity::is_installed_program` — the exe in `in_system_tree`
+    and, for an `is_interpreter` exe, a script that is an absolute path in
+    a system tree (`-c`, `-m`, a relative path or no script fail, as
+    `is_client` treats them). An unreadable identity is not exempt. The
+    production set passes the lineage (`net_rules`'s `lineage`, now also
+    given to -006/-019 through `with_lineage`); without one (tests, the
+    boot-time set) the record's own `exe` is judged, and with none either
+    the port exempts as before. The reasoning names the port. Declined,
+    as triaged: 443 in `HIGH_RISK_C2_PORTS` (NN-L-NET-010 kills; the doc
+    comment says why). Not done: an operator-tunable port set; a JVM
+    (`java -jar`) is not an interpreter for `is_interpreter`, so its
+    exe alone decides.
+  - NETR-012. `hash_qname` is `RandomState::hash_one` over one
+    `OnceLock<RandomState>` per process (SipHash, random keys), for the
+    dedup and for -014's corroboration (parent, label).
+    `DnsQnameDedupWindow` is swept every `STATEFUL_EVICT_EVERY` (256)
+    observes instead of on each one, a lookup compares the stored time
+    against the 2 s window, and `DNS_QNAME_DEDUP_MAX_PAIRS` (4,096) is a
+    hard cap through `LazyLru` (least recently fired first). Its
+    evictions are not added to `net_window_evictions_total`: losing a pair
+    costs at most one repeated record, never a verdict.
+  - NETR-016. Re-checked: one lookup (A + AAAA, retries, the stub and the
+    forwarded leg) of a name tripping both shapes gave -014's record and
+    then -004's, because -014's dedup returns `None` and first match moves
+    on. `net_rules` now builds one `DnsQnameDedupWindow` and hands it to
+    both (`with_dedup`; `new` keeps a private window for unit tests). A
+    name -004 recorded is never one -014 trips (its shape test runs on the
+    name before the dedup), so the shared window cannot suppress -014's
+    record or its tunnel kill. The -014 doc, the -004 doc and the dedup
+    comments describe the order since lab PR 140.
+  - Tests: `qname_hash_is_keyed_per_process` (not `DefaultHasher::new()`,
+    stable, distinct under other keys), `dedup_window_is_bounded_under_a_name_spray`
+    (100,000 names in 0.1 ms: 4,096 pairs; a repeat inside 2 s dropped,
+    at 2 s it fires; the next sweep empties stale pairs),
+    `fp5_004_and_014_share_one_window` (replaces
+    `fp5_004_and_014_do_not_cross_suppress`, which asserted the separate
+    windows), `one_lookup_fanout_yields_one_dns_shape_verdict` (stub and
+    forwarded legs, A, AAAA and a retry, over `net_rules` with a shared
+    DNS cache: one verdict, attributed to the originator, for a
+    both-shapes, a long-only and a short high-entropy name),
+    `a_hex_label_is_answered_by_014_first`,
+    `a_txt_burst_never_shadows_the_tunnel_kill` (NETR-011: past -005's
+    threshold, the 8th label is -014's KillProcess),
+    `a_common_port_listener_from_a_staging_image_is_recorded` (`/tmp/backdoor`,
+    `python3 /tmp/x.py`, `python3 -m http.server`, `/tmp/nginx`, node
+    under `~/.nvm`, an unreadable pid; 8080, 8443 and 80; -019 on
+    `0.0.0.0`, -006 on loopback), `a_system_daemon_on_a_common_port_is_quiet`
+    (nginx, sshd, `python3 /usr/bin/gunicorn`; an uncommon port unchanged;
+    no lineage: the record's `exe`), `an_installed_program_is_the_trees_exe_and_script`
+    (lineage.rs); engine (`decision/tests.rs`):
+    `one_lookup_of_a_tunnel_shaped_name_is_one_record`,
+    `a_staging_listener_on_8080_is_recorded`. On the starting tree (the
+    new tests with API shims only: `tracked_pairs`, the cap constant,
+    `with_dedup`) these fail: `qname_hash_is_keyed_per_process` (equal to
+    the fixed-key hash), `dedup_window_is_bounded_under_a_name_spray`
+    (100,000 pairs, 67.7 s against 0.37 s: the per-call sweep),
+    `one_lookup_fanout_yields_one_dns_shape_verdict` and
+    `one_lookup_of_a_tunnel_shaped_name_is_one_record` (-014 then -004),
+    both listener tests and `a_staging_listener_on_8080_is_recorded`
+    (nothing recorded on 8080). `fp5_004_and_014_share_one_window` (the
+    shim shares the window), the hex-label and TXT-burst tests pass there:
+    pins of lab PR 140's order. Host: `cargo fmt`, both clippy runs
+    (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean, `cargo test --workspace`
+    2,409 passed, 0 failed.
+  - Lab: Ubuntu 24.04, netstate186-probe.sh — before: the build of `main` with lab PRs 176–183; after: this lot on top; local traffic only. Four DNS lookups of long high-entropy names from one process: 7 records before (NET-004 four, NET-014 three), 4 after (NET-014 three, NET-004 one). Listeners: before one record (the uncommon port only); after `python3 -m http.server` on 8080, a script on 8443 and a home copy of python3 on 8080 recorded, the same server run from `/usr/lib/python3.12` quiet; the host's own listeners (systemd, sshd, systemd-resolved) exempt as installed programs. Gate: the integration tree of lab PRs 184, 185, 186 and 187 on `main` with lab PRs 176–183: Ubuntu 24.04, 38 suites, 85 passed, 0 failed, anti-tamper suite OK, `upgrade-check` OK (with the 19-slot `RING_DROPS`); Debian 12 38 suites, 84 passed, 1 failed; Ubuntu 22.04 (5.15) 38 suites, 84 passed, 1 failed, anti-tamper suite OK; Debian 13 (6.12) 38 suites, 83 passed, 2 failed. The one failure on 22.04, Debian 12 and Debian 13 was lab PR 187's new `long_argv_and_filename_are_marked_cut`: the test-only `ExecSensor` wrapper never resolved the running kernel's BTF offsets (the agent's boot does), so its argv read used the build kernel's layout — fixed in this tree, and `exec_sensor_live` then 2 of 2 on 22.04 and Debian 13; the second on Debian 13 is `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up). A first run had also caught two e2e expectations this tree changes (the signed `agent_id_minted` row, the 8443 listener of a program outside the system trees), updated and passing in the second; `respawn-check` OK on 24.04 and Debian 12; host 2,441 passed, 0 failed.

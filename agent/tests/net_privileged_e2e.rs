@@ -700,8 +700,10 @@ fn net_listener_on_uncommon_port_records_event() {
     let _eni = EniIptablesGuard::install();
     let fx = NetFixture::setup();
 
-    // Negative twin first: a listener on an allowlisted port. The positive
-    // listener below comes later on the same ring and is its barrier.
+    // Twin first: a listener on a common port (8443). Since lab PR 186 the
+    // port alone exempts nothing — this test binary is outside the system
+    // trees, so it is recorded too. The listener below comes later on the
+    // same ring and is its barrier.
     // Skipped (said so) when the port is taken on this host.
     let allowlisted = match TcpListener::bind(("127.0.0.1", ALLOWLISTED_PORT)) {
         Ok(l) => {
@@ -710,7 +712,7 @@ fn net_listener_on_uncommon_port_records_event() {
             true
         }
         Err(e) => {
-            eprintln!("127.0.0.1:{ALLOWLISTED_PORT} not bindable ({e}): negative twin skipped");
+            eprintln!("127.0.0.1:{ALLOWLISTED_PORT} not bindable ({e}): common-port twin skipped");
             false
         }
     };
@@ -779,11 +781,21 @@ fn net_listener_on_uncommon_port_records_event() {
     assert_eq!(rec["sensor"], "Network", "record: {rec}");
     assert_eq!(rec["response"], "none", "record: {rec}");
     if allowlisted {
+        // Lab PR 186 (NETR-015): a common port alone no longer exempts a
+        // listener; only a program installed in a root-owned system tree
+        // does. This test binary is not one, so its 8443 listener is
+        // recorded too (the record names no port; the verdict's reasoning
+        // in the journal does).
         let records = common::records_of(&fx.detections_log, NET_006);
+        let mine: Vec<_> = records
+            .iter()
+            .filter(|r| r["principal"]["pid"].as_u64() == Some(me))
+            .collect();
         assert_eq!(
-            records.len(),
-            1,
-            "a listener on allowlisted port {ALLOWLISTED_PORT} must not fire NN-L-NET-006: {records:?}"
+            mine.len(),
+            2,
+            "both listeners of this test binary fire NN-L-NET-006, the one on \
+             {ALLOWLISTED_PORT} as a program outside the system trees: {records:?}"
         );
     }
 

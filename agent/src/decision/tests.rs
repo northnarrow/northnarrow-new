@@ -633,3 +633,70 @@ fn a_binary_under_cache_or_config_is_r008() {
     assert_eq!(v.rule_id, "R017_ShellFromNonstandardPath");
     assert_eq!(v.action, ResponseAction::KillProcessTree);
 }
+
+/// External audit NETR-016: in the engine, one lookup of a long name with
+/// a high-entropy first label (A, AAAA, a retry) is ONE record, -014's;
+/// -004 no longer records the leg -014 dropped as a repeat. A name sent
+/// again after the dedup window is answered again.
+#[test]
+fn one_lookup_of_a_tunnel_shaped_name_is_one_record() {
+    let engine = RuleEngine::with_default_rules();
+    let q = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6.exfil.example.com";
+    let leg = |qtype: u16, ts_ns: u64| Event::DnsQuery {
+        pid: 4321,
+        uid: 1000,
+        comm: "getent".into(),
+        exe: Some("/usr/bin/getent".into()),
+        query_name: q.into(),
+        query_type: qtype,
+        dns_server: [0; 16],
+        family: 2,
+        timestamp_ns: ts_ns,
+        qname_partial: false,
+    };
+    let t = 1_000_000_000u64;
+    let got: Vec<String> = [(1u16, t), (28, t + 5_000_000), (1, t + 130_000_000)]
+        .into_iter()
+        .filter_map(|(qt, ts)| engine.evaluate(&leg(qt, ts)))
+        .map(|v| {
+            assert_eq!(v.action, ResponseAction::Log);
+            assert_eq!(v.event_pid, 4321);
+            v.rule_id
+        })
+        .collect();
+    assert_eq!(got, ["NN-L-NET-014_DnsTunnelEntropy"]);
+    let again = engine
+        .evaluate(&leg(1, t + 3_000_000_000))
+        .expect("a lookup after the window");
+    assert_eq!(again.rule_id, "NN-L-NET-014_DnsTunnelEntropy");
+}
+
+/// External audit NETR-015: in the boot-time engine (no lineage) a
+/// listener record that names its image is judged on it: a staging image
+/// on 8080 is recorded, a system daemon's is not.
+#[test]
+fn a_staging_listener_on_8080_is_recorded() {
+    let engine = RuleEngine::with_default_rules();
+    let listen = |exe: &str, comm: &str| {
+        Event::NetListener(common::wire::NetListenerEvent {
+            timestamp_ns: 100,
+            family: 2,
+            bind_addr: std::net::Ipv4Addr::UNSPECIFIED.into(),
+            bind_port: 8080,
+            proto: 6,
+            pid: 4400,
+            uid: 1000,
+            comm: comm.into(),
+            exe: Some(exe.into()),
+        })
+    };
+    let v = engine
+        .evaluate(&listen("/tmp/backdoor", "backdoor"))
+        .expect("recorded");
+    assert_eq!(v.rule_id, "NN-L-NET-019_WildcardListener");
+    assert_eq!(v.action, ResponseAction::Log);
+    assert_eq!(v.severity, Severity::Medium);
+    assert!(engine
+        .evaluate(&listen("/usr/sbin/lighttpd", "lighttpd"))
+        .is_none());
+}

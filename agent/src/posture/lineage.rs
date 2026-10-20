@@ -401,6 +401,24 @@ impl ExecIdentity {
         Self { exe: path, script }
     }
 
+    /// External audit NETR-015 (NN-AUD-298): a program root installed. The
+    /// executed file lies in a root-owned system tree ([`in_system_tree`])
+    /// and, for an interpreter, so does the script it runs, named by an
+    /// absolute path: an inline program (`-c`, `-e`), a module (`-m`,
+    /// found through the caller's working directory and `PYTHONPATH`), a
+    /// relative path or standard input is the caller's, not the tree's.
+    pub fn is_installed_program(&self) -> bool {
+        if !in_system_tree(&self.exe.to_string_lossy()) {
+            return false;
+        }
+        if !is_interpreter(&self.exe) {
+            return true;
+        }
+        self.script
+            .as_deref()
+            .is_some_and(|s| s.starts_with('/') && in_system_tree(s))
+    }
+
     /// A rule's built-in client: the executed file itself is one of
     /// `programs` ([`names`]), in a root-owned system tree — whatever
     /// script an interpreter among them runs.
@@ -3225,6 +3243,33 @@ mod tests {
         assert!(is_interpreter(Path::new("/usr/bin/perl5.36")));
         assert!(!is_interpreter(Path::new("/usr/bin/shred")));
         assert!(!is_interpreter(Path::new("/usr/bin/pythonista")));
+    }
+
+    /// External audit NETR-015: what NN-L-NET-006/-019 take for a service
+    /// on a common port.
+    #[test]
+    fn an_installed_program_is_the_trees_exe_and_script() {
+        let id = |exe: &str, a: &[&str]| ExecIdentity::of_exec(exe, &argv(a));
+        assert!(id("/usr/sbin/nginx", &["nginx"]).is_installed_program());
+        assert!(id("/usr/bin/python3.12", &["python3", "/usr/bin/gunicorn"]).is_installed_program());
+        for (exe, a) in [
+            ("/tmp/backdoor", &["backdoor"][..]),
+            (
+                "/home/dev/.nvm/versions/node/v22/bin/node",
+                &["node", "app.js"],
+            ),
+            ("/usr/bin/python3.12", &["python3", "/tmp/x.py"]),
+            (
+                "/usr/bin/python3.12",
+                &["python3", "-m", "http.server", "8080"],
+            ),
+            ("/usr/bin/python3.12", &["python3", "-c", "import socket"]),
+            ("/usr/bin/python3.12", &["python3", "server.py"]),
+            ("/usr/bin/node", &["node"]),
+            ("/usr/sbin/nginx (deleted)", &["nginx"]),
+        ] {
+            assert!(!id(exe, a).is_installed_program(), "{exe} {a:?}");
+        }
     }
 
     #[test]

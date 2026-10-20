@@ -61,6 +61,50 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, network rule state (Low NETR-012 NN-AUD-295,
+  NETR-015 NN-AUD-298, NETR-016 NN-AUD-428; lab PR 186). NETR-015:
+  NN-L-NET-006 and -019 left alone every listener on 22, 53, 80, 443,
+  8080 and 8443 before judging it, so any process of any user serving
+  8080 or 8443 — a binary from `/tmp` or a home, `python3 /tmp/x.py` —
+  was never recorded. A common port now exempts a listener only when its
+  program is one a root-owned tree installed: the executable (from the
+  process lineage, else `/proc`; the listener record names none) and, for
+  an interpreter, the script it runs, by an absolute path, in `/usr`,
+  `/opt`, `/snap`, `/bin`, `/sbin`, `/lib`, `/lib64` or `/nix/store`.
+  nginx, sshd, systemd's socket units or systemd-resolved stay quiet on
+  their ports; any other program is judged as on any other port (the comm
+  allowlist, then a Medium record), and the reasoning names the port. The
+  audit's other half, 443 among NN-L-NET-010's C2 ports, is declined: that
+  rule kills, so it would kill every client outside the comm allowlist;
+  C2 over 443 is answered by -001/-002, -008, -013 and the chains.
+  NETR-012: the DNS name-shape dedup hashed names with
+  `DefaultHasher::new()`, whose keys are fixed, so a name that collides
+  with another could be computed offline and have its verdict dropped as
+  a repeat; and it swept its whole map on every suspicious query, with no
+  bound but the 2 s window. The hash (NN-L-NET-014's corroboration keys
+  too) is SipHash keyed once per process; the map is swept every 256
+  calls, a lookup compares the stored time (a pair past the window never
+  suppresses a verdict), and at 4,096 pairs the one fired least recently
+  goes. NETR-016: since lab PR 140, -014 runs before -004; when -014
+  dropped a lookup's repeated leg (the AAAA, a retry, the resolver's
+  forwarded leg) as a duplicate, the first-match engine handed it to
+  -004, which recorded it — two records per lookup of a long name with a
+  high-entropy label. The two rules now share one dedup window, so a
+  lookup gives one verdict from the family, and their documentation
+  describes the current order. NETR-011 (fixed in lab PR 140) gains the
+  audit's case as a test. **Regressions / changes:** a listener on 22,
+  53, 80, 443, 8080 or 8443 whose program lies outside those trees, is a
+  module run with `-m` or an inline program, or whose executable cannot
+  be read (it exited first) is a Medium record (NN-L-NET-019 on a
+  wildcard address, -006 otherwise) and moves the posture to ALERTED — a
+  developer server on 8080 (`python3 -m http.server`, node under
+  `~/.nvm`) included, as on 8000 or 3000 before; the comm allowlist
+  cannot exempt such a program (its entries name system-tree programs);
+  -006/-019 reasoning on a common port reads `on port 8080, a common
+  service port, from a program not installed in a root-owned system
+  tree …`; a long high-entropy DNS name gives one record (NN-L-NET-014)
+  per lookup where it gave two; the qname hash changes at every agent
+  start (in-memory state only).
 - External audit, Wave 3, agent identity (Low MAIN-009 NN-AUD-251,
   MAIN-010 NN-AUD-252, EVD-020 NN-AUD-282; lab PR 185). MAIN-009: the
   agent read `/etc/northnarrow/agent_id` twice at boot — before the attach
