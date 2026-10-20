@@ -528,6 +528,9 @@ mod tests {
             ts: String,
             n: u64,
         }
+        impl crate::chainlog::ChainPayload for P {
+            const KIND: &'static str = "test_rot";
+        }
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("rot.jsonl");
         let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();

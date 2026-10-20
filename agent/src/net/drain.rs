@@ -160,6 +160,12 @@ pub struct NetFlowPayload {
     pub decision_engine_skipped: bool,
 }
 
+/// External audit EVD-008 (lab PR 204): the netflow log's name in its v3
+/// pre-images.
+impl crate::chainlog::ChainPayload for NetFlowPayload {
+    const KIND: &'static str = "netflow";
+}
+
 /// One on-disk JSONL row in `netflow_listeners.jsonl`. Same chain
 /// shape as [`NetFlowEntry`]; thinner body (no five-tuple, no
 /// bytes counters, no TLS fingerprint).
@@ -791,9 +797,10 @@ fn compute_flow_entry_hash(entry: &NetFlowEntry) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// External audit EVD-023 (NN-AUD-427, lab PR 204): an entry that still
+/// carries `entry_hash` or `agent_sig` is an error in every build.
 fn compute_listener_entry_hash(entry: &NetListenerEntry) -> Result<[u8; 32]> {
-    debug_assert!(entry.entry_hash.is_empty());
-    debug_assert!(entry.agent_sig.is_empty());
+    crate::chain_anchor::check_unsealed(&entry.entry_hash, &entry.agent_sig)?;
     let prev_bytes =
         hex::decode(&entry.prev_hash).map_err(|e| anyhow!("prev_hash is not valid hex: {e}"))?;
     let body =
@@ -974,7 +981,7 @@ mod tests {
     #[test]
     fn netflow_db_append_writes_one_chained_row() {
         use crate::chainlog::{
-            verify_log_set, ChainLine, NoProtection, RotationConfig, CHAINLOG_FMT_V2,
+            verify_log_set, ChainLine, NoProtection, RotationConfig, CHAINLOG_FMT_V3,
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("netflow.jsonl");
@@ -1009,7 +1016,11 @@ mod tests {
         assert_eq!(line.prev_hash.len(), 64);
         assert_eq!(line.entry_hash.len(), 64);
         assert!(!line.agent_sig.is_empty());
-        assert_eq!(line.fmt_ver, Some(CHAINLOG_FMT_V2), "new lines are v2");
+        assert_eq!(
+            line.fmt_ver,
+            Some(CHAINLOG_FMT_V3),
+            "new lines are v3 (lab PR 204)"
+        );
 
         let report = verify_log_set::<NetFlowPayload>(&path, &pk).unwrap();
         assert_eq!(report.total_records, 1);

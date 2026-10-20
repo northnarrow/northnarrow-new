@@ -14,9 +14,10 @@ and the tracker note have the details and the lab evidence.
 
 1. Upgrade the three binaries together (`install.sh --upgrade` and the
    packages do). An `nn-admin` older than the agent reports the agent's
-   numbered chain rows as broken (§8).
+   numbered chain rows, and the rotating logs' v3 lines, as broken (§8).
 2. Downgrading the agent is not supported once this build has run: an
-   older agent misreads the numbered chains and the new canary rows (§8).
+   older agent misreads the numbered chains and the new canary rows, and
+   cuts trailing v3 lines of the rotating logs at its start (§8).
 3. A build from source installs only with `--source-tree`; an extracted
    release without its tarball and `SHA256SUMS` needs `--tarball`/`--sums`
    or `--allow-manifest-only` (§1).
@@ -961,6 +962,31 @@ Now **killed, or answered, where they were recorded or missed**:
   an `nn-admin` older than the agent reports numbered rows as broken;
   downgrading the agent is not supported. Runbook:
   [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md).
+- **Rotating logs in format v3; signed bytes are the bytes on disk**
+  (NN-AUD-273 EVD-007, NN-AUD-274 EVD-008, NN-AUD-427 EVD-023, lab PR 204).
+  Every line the agent now writes to the detection, status-event, netflow
+  and FIM drift logs — data lines, terminators, manifest rows — carries
+  `fmt_ver` 3 and is signed over a pre-image tagged with its log and line
+  type (`northnarrow/chainlog/<log>/<line type>/v3\0`): a line or manifest
+  moved from one log to another no longer verifies. A v3 line and a
+  numbered row of `audit.log` and the canary chains must be the canonical
+  serialisation of what they decode to: a key added, keys reordered,
+  spaces or an escaped spelling are refused (`… not in its canonical
+  form`), where the hash covered only the decoded fields. The lines written
+  before keep their bytes and verify with their own pre-image; the summary
+  of `nn-admin chain verify` names them (`N line(s) in the old format …`),
+  and an old-format line after a v3 line is refused. A float that needs 17
+  digits (a detection's `confidence`) now parses to the value written
+  (`serde_json` `float_roundtrip`): such a row no longer fails its own
+  hash. **Regressions:** upgrade `nn-admin` and the agent together — an
+  `nn-admin` older than the agent reports each rotating log with v3 lines
+  `BROKEN` (`entry_hash mismatch`, exit 8); an older agent put back over
+  v3 files cuts up to 16 trailing v3 lines of an active file or manifest
+  that ends in old-format lines (attested `torn_tail_repaired`) and its
+  background check reports `chain_verify_failed`: downgrading is not
+  supported. The old lines, the FIM baseline and `netflow_listeners.jsonl`
+  keep the untagged pre-image (residual). Runbook:
+  [EVIDENCE_CHAINS.md](EVIDENCE_CHAINS.md#line-formats-what-a-signature-covers-lab-pr-204).
 - **The caller's executable in the audit log** (NN-AUD-239 ASK-013, lab
   PR 179). `client_comm` is the name the connecting process gave itself
   (any process can call itself `nn-admin`); the operator's identity is

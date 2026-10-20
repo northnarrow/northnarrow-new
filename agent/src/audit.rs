@@ -1150,9 +1150,11 @@ fn build_signed_entry(
 /// External audit NN-AUD-108 / NN-AUD-174: a numbered row (`seq` set)
 /// prefixes the pre-image with [`crate::chain_anchor::AUDIT_DOMAIN_V2`];
 /// a row without `seq` keeps the pre-image it was signed with.
+///
+/// External audit EVD-023 (NN-AUD-427, lab PR 204): an entry that still
+/// carries `entry_hash` or `agent_sig` is an error in every build.
 pub(crate) fn compute_entry_hash(entry: &AuditEntry) -> Result<[u8; 32]> {
-    debug_assert!(entry.entry_hash.is_empty());
-    debug_assert!(entry.agent_sig.is_empty());
+    crate::chain_anchor::check_unsealed(&entry.entry_hash, &entry.agent_sig)?;
     let body =
         serde_json::to_vec(entry).map_err(|e| anyhow!("serialising audit pre-image: {e}"))?;
     let domain = entry.seq.map(|_| crate::chain_anchor::AUDIT_DOMAIN_V2);
@@ -1160,9 +1162,13 @@ pub(crate) fn compute_entry_hash(entry: &AuditEntry) -> Result<[u8; 32]> {
 }
 
 /// External audit NN-AUD-108: whether one raw line is a genuine audit row
-/// (decodes, its hash recomputes, its signature verifies).
+/// (decodes, its hash recomputes, its signature verifies). External audit
+/// EVD-007 (lab PR 204): a numbered row must also be in its canonical bytes.
 pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
-    serde_json::from_slice::<AuditEntry>(line).is_ok_and(|e| verify_entry(0, &e, pubkey).is_ok())
+    serde_json::from_slice::<AuditEntry>(line).is_ok_and(|e| {
+        verify_entry(0, &e, pubkey).is_ok()
+            && (e.seq.is_none() || crate::chain_anchor::is_canonical(&e, line))
+    })
 }
 
 pub(crate) fn format_ts(t: DateTime<Utc>) -> String {
@@ -1198,6 +1204,15 @@ pub enum AuditVerifyError {
         idx: usize,
         reason: crate::chain_anchor::SeqBreak,
     },
+    /// External audit EVD-007 (NN-AUD-273, lab PR 204): a numbered row whose
+    /// hash and signature verify, but whose bytes on disk are not its
+    /// canonical serialisation (a key added, keys reordered, a value spelled
+    /// another way): the signature does not cover those bytes.
+    #[error(
+        "entry {idx}: a numbered row not in its canonical form (the bytes on disk are not what \
+         the agent wrote: a key added, reordered or re-spelled)"
+    )]
+    NonCanonical { idx: usize },
     /// External audit MAIN-014 (NN-AUD-256, lab PR 190): a line of the file
     /// that is not an audit row — cut, not JSON, not UTF-8, or over the line
     /// cap ([`crate::verify_lines::MAX_VERIFY_LINE_BYTES`]). The chain is
@@ -1222,6 +1237,7 @@ pub struct ChainVerifier<'k> {
     rows: usize,
     first_numbered: Option<usize>,
     last_seq: Option<u64>,
+    non_canonical_legacy: usize,
 }
 
 impl<'k> ChainVerifier<'k> {
@@ -1234,6 +1250,7 @@ impl<'k> ChainVerifier<'k> {
             rows: 0,
             first_numbered: None,
             last_seq: None,
+            non_canonical_legacy: 0,
         }
     }
 
@@ -1241,6 +1258,23 @@ impl<'k> ChainVerifier<'k> {
     /// signature. On `Err` the chain is broken at this row and the verifier
     /// must not be fed further.
     pub fn push(&mut self, entry: &AuditEntry) -> Result<(), AuditVerifyError> {
+        self.push_checked(entry, None)
+    }
+
+    /// [`Self::push`] for a row read from a file: `raw` is its line as on
+    /// disk (without the newline). External audit EVD-007 (NN-AUD-273, lab
+    /// PR 204): a numbered row must be its canonical serialisation
+    /// ([`AuditVerifyError::NonCanonical`]); a row without `seq` that is not
+    /// is counted ([`Self::non_canonical_legacy`]).
+    pub fn push_line(&mut self, entry: &AuditEntry, raw: &[u8]) -> Result<(), AuditVerifyError> {
+        self.push_checked(entry, Some(raw))
+    }
+
+    fn push_checked(
+        &mut self,
+        entry: &AuditEntry,
+        raw: Option<&[u8]>,
+    ) -> Result<(), AuditVerifyError> {
         let idx = self.rows;
         self.seq
             .push(entry.seq)
@@ -1253,6 +1287,14 @@ impl<'k> ChainVerifier<'k> {
             });
         }
         verify_entry(idx, entry, self.pubkey)?;
+        if let Some(raw) = raw {
+            if !crate::chain_anchor::is_canonical(entry, raw) {
+                if entry.seq.is_some() {
+                    return Err(AuditVerifyError::NonCanonical { idx });
+                }
+                self.non_canonical_legacy += 1;
+            }
+        }
         self.prev.clone_from(&entry.entry_hash);
         if entry.seq.is_some() {
             self.first_numbered.get_or_insert(idx);
@@ -1276,6 +1318,13 @@ impl<'k> ChainVerifier<'k> {
     /// `seq` of the last numbered row verified.
     pub fn last_seq(&self) -> Option<u64> {
         self.last_seq
+    }
+
+    /// Rows without `seq` (the format from before lab PR 160) whose bytes
+    /// are not their canonical serialisation: they verify as they always
+    /// did; the signature does not cover those bytes.
+    pub fn non_canonical_legacy(&self) -> usize {
+        self.non_canonical_legacy
     }
 }
 
@@ -1307,6 +1356,9 @@ pub struct ChainFileReport {
     pub first_numbered: Option<usize>,
     /// `seq` of the last numbered row verified.
     pub last_seq: Option<u64>,
+    /// External audit EVD-007 (lab PR 204): rows without `seq` not in their
+    /// canonical bytes ([`ChainVerifier::non_canonical_legacy`]).
+    pub non_canonical_legacy: usize,
     /// The `entry_hash` asked for is one of the rows verified.
     pub head_seen: bool,
     /// Where and why the chain is broken (the first break; the file is not
@@ -1330,6 +1382,7 @@ pub fn verify_chain_file(
         rows: 0,
         first_numbered: None,
         last_seq: None,
+        non_canonical_legacy: 0,
         head_seen: false,
         broken: None,
     };
@@ -1355,7 +1408,7 @@ pub fn verify_chain_file(
         });
         let pushed = match entry {
             Ok(entry) => v
-                .push(&entry)
+                .push_line(&entry, line.text().unwrap_or_default().as_bytes())
                 .map(|()| head == Some(entry.entry_hash.as_str())),
             Err(reason) => Err(AuditVerifyError::UnreadableLine {
                 line: line.number,
@@ -1374,6 +1427,7 @@ pub fn verify_chain_file(
     report.rows = v.rows();
     report.first_numbered = v.first_numbered();
     report.last_seq = v.last_seq();
+    report.non_canonical_legacy = v.non_canonical_legacy();
     Ok(report)
 }
 
@@ -2073,6 +2127,7 @@ mod tests {
                 rows: 6,
                 first_numbered: Some(3),
                 last_seq: Some(5),
+                non_canonical_legacy: 0,
                 head_seen: true,
                 broken: None,
             }
@@ -2117,7 +2172,8 @@ mod tests {
                 | AuditVerifyError::EntryHashMismatch { idx, .. }
                 | AuditVerifyError::SignatureInvalid { idx }
                 | AuditVerifyError::MalformedField { idx, .. }
-                | AuditVerifyError::Sequence { idx, .. } => idx,
+                | AuditVerifyError::Sequence { idx, .. }
+                | AuditVerifyError::NonCanonical { idx } => idx,
                 AuditVerifyError::UnreadableLine { .. } => unreachable!("{what}"),
             };
             assert_eq!(got.rows, at, "{what}: rows verified before the break");
@@ -2334,5 +2390,176 @@ mod tests {
         assert_eq!(changed[0].extra["from"], hex::encode([0u8; 16]));
         assert_eq!(changed[0].seq, Some(3));
         whole_chain_verifies(&log_path, &key());
+    }
+
+    // ── External audit, Wave 3, lab PR 204 ─────────────────────────────
+
+    /// `"injected":"x"` before the closing brace of a row.
+    fn inject_key(line: &str) -> String {
+        format!("{},\"injected\":\"x\"}}", line.strip_suffix('}').unwrap())
+    }
+
+    /// EVD-007 (NN-AUD-273): a numbered row rewritten with a key the type
+    /// does not have, keys reordered, whitespace or an escaped spelling
+    /// decodes to the same entry — its hash and signature verify — but the
+    /// bytes are not what the agent wrote: `audit verify`, `chain verify`
+    /// and the head check refuse it. A row without `seq` (before lab PR
+    /// 160) keeps its old check and is counted. On the starting code every
+    /// one of these rewrites verified.
+    #[test]
+    fn a_numbered_row_not_in_canonical_form_is_refused_a_legacy_row_is_counted() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        write_legacy_rows(&log_path, &key, 2);
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        for i in 0..3 {
+            log.append(sample_draft(10 + i)).unwrap();
+        }
+        drop(log);
+        let pristine = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = pristine.lines().collect();
+        let r = verify_chain_file(&log_path, &pk, None).unwrap();
+        assert_eq!((r.rows, r.non_canonical_legacy, r.broken), (5, 0, None));
+        let row3 = lines[3];
+        assert!(row_is_genuine(row3.as_bytes(), &pk));
+        let reordered = {
+            let e: AuditEntry = serde_json::from_str(row3).unwrap();
+            let rest = row3.replacen(&format!("{{\"ts\":\"{}\",", e.ts), "{", 1);
+            format!("{},\"ts\":\"{}\"}}", rest.strip_suffix('}').unwrap(), e.ts)
+        };
+        let rewrites = [
+            ("an injected key", inject_key(row3)),
+            ("keys reordered", reordered),
+            ("whitespace", row3.replacen("\"op\":", "\"op\": ", 1)),
+            (
+                "an escaped spelling",
+                row3.replacen("test_op_", "\\u0074est_op_", 1),
+            ),
+        ];
+        for (what, forged) in rewrites {
+            assert_ne!(forged, row3, "{what}");
+            let e: AuditEntry = serde_json::from_str(&forged).unwrap();
+            assert!(
+                verify_entry(3, &e, &pk).is_ok(),
+                "{what}: the entry still verifies"
+            );
+            assert!(
+                !row_is_genuine(forged.as_bytes(), &pk),
+                "{what}: head check"
+            );
+            let mut body: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            body[3] = forged;
+            fs::write(&log_path, body.join("\n") + "\n").unwrap();
+            let r = verify_chain_file(&log_path, &pk, None).unwrap();
+            assert_eq!(
+                r.broken,
+                Some(AuditVerifyError::NonCanonical { idx: 3 }),
+                "{what}"
+            );
+            assert_eq!(r.rows, 3, "{what}: rows verified before it");
+        }
+        // The same on a legacy row: verifies, counted.
+        let mut body: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        body[1] = inject_key(lines[1]);
+        fs::write(&log_path, body.join("\n") + "\n").unwrap();
+        let r = verify_chain_file(&log_path, &pk, None).unwrap();
+        assert_eq!((r.rows, r.non_canonical_legacy, r.broken), (5, 1, None));
+        assert!(row_is_genuine(body[1].as_bytes(), &pk));
+    }
+
+    /// EVD-023 (NN-AUD-427): `compute_entry_hash` relied on empty
+    /// `entry_hash`/`agent_sig` through `debug_assert!` — a release build
+    /// hashed an entry that carried them. It is an error in every build; the
+    /// rows written before keep their hashes (the legacy-row tests).
+    #[test]
+    fn compute_entry_hash_refuses_an_entry_that_carries_its_seal() {
+        let (_d, key_path, _log) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let e =
+            build_signed_entry(&sample_draft(1), &key, &[0u8; 16], GENESIS_PREV_HASH, 0).unwrap();
+        let err = compute_entry_hash(&e).unwrap_err();
+        assert!(err.to_string().contains("carries its own"), "{err}");
+        let mut only_sig = e.clone();
+        only_sig.entry_hash.clear();
+        assert!(compute_entry_hash(&only_sig).is_err());
+        let mut stripped = e.clone();
+        stripped.entry_hash.clear();
+        stripped.agent_sig.clear();
+        assert_eq!(
+            hex::encode(compute_entry_hash(&stripped).unwrap()),
+            e.entry_hash
+        );
+    }
+
+    /// EVD-007, round trip: every row `AuditLog::append` writes — `extra`
+    /// with nested objects, arrays, floats, escapes, control characters,
+    /// non-ASCII and astral text, `client_exe` set or not — is its own
+    /// canonical serialisation and verifies with the canonical check.
+    #[test]
+    fn every_row_the_writer_produces_round_trips_byte_exactly() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x204a);
+        let text = |rng: &mut rand::rngs::StdRng| -> String {
+            const POOL: &[char] = &[
+                'a',
+                '0',
+                ' ',
+                '"',
+                '\\',
+                '/',
+                '\n',
+                '\t',
+                '\u{0}',
+                '\u{1f}',
+                '\u{7f}',
+                '\u{e9}',
+                '\u{2028}',
+                '\u{1d11e}',
+                '{',
+                '}',
+            ];
+            let n = rng.gen_range(0..16);
+            (0..n).map(|_| POOL[rng.gen_range(0..POOL.len())]).collect()
+        };
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let mut log = AuditLog::open(&log_path, key, [7u8; 16]).unwrap();
+        for _ in 0..150 {
+            let f = loop {
+                let f = f64::from_bits(rng.gen());
+                if f.is_finite() {
+                    break f;
+                }
+            };
+            let k1 = text(&mut rng);
+            let draft = AuditEntryDraft {
+                op: text(&mut rng),
+                extra: serde_json::json!({
+                    k1: text(&mut rng),
+                    "f": f,
+                    "n": rng.gen::<i64>(),
+                    "u": rng.gen::<u64>(),
+                    "nested": { "list": [text(&mut rng), null, true, f], "z": {} },
+                }),
+                key_fp: text(&mut rng),
+                cosigner_fps: vec![text(&mut rng)],
+                result: text(&mut rng),
+                client_pid: rng.gen(),
+                client_uid: rng.gen(),
+                client_comm: text(&mut rng),
+                client_exe: rng.gen_bool(0.5).then(|| text(&mut rng)),
+            };
+            log.append(draft).unwrap();
+        }
+        drop(log);
+        for line in fs::read_to_string(&log_path).unwrap().lines() {
+            let e: AuditEntry = serde_json::from_str(line).unwrap();
+            assert_eq!(serde_json::to_string(&e).unwrap(), line);
+            assert!(row_is_genuine(line.as_bytes(), &pk));
+        }
+        let r = verify_chain_file(&log_path, &pk, None).unwrap();
+        assert_eq!((r.rows, r.broken), (150, None));
     }
 }

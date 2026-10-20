@@ -87,10 +87,69 @@ background, the head anchor, the FIM baseline: a public key or a signature
 `R` of small order is refused. Every row the agent signed passes; the rows
 and their pre-images did not change. A `--agent-pubkey` of small order makes
 the first row fail (`agent_sig invalid`): check that the key given is the
-agent's (`agent.sig.pub`, or the hex kept off the host). Rows without `seq`
-(from before lab PR 160) and the rotating logs, the FIM baseline and drift
-log still hash `prev ‖ row` without a per-chain tag; a tag for those is a
-format change of its own, not made yet.
+agent's (`agent.sig.pub`, or the hex kept off the host).
+
+## Line formats: what a signature covers (lab PR 204)
+
+One agent key signs every chain. What its signature binds, per chain (external
+audit EVD-007, EVD-008, EVD-023):
+
+| Lines | Pre-image signed | The bytes on disk |
+|---|---|---|
+| rotating logs (detections, status events, netflow, FIM drift): data lines, terminators and manifest rows with `fmt_ver` 3 — every line this version writes | `SHA-256("northnarrow/chainlog/<log>/<line type>/v3\0" ‖ prev_hash ‖ line)`, `<log>` one of `detections`, `status_events`, `netflow`, `fim_drift`, `<line type>` `data`, `terminator` or `manifest` | must be the canonical serialisation of the line |
+| the same logs, lines without `fmt_ver` or with `fmt_ver` 2 (written before this version) | `SHA-256(prev_hash ‖ line)`, the same for every log and line type | not checked; counted |
+| `audit.log`, `canaries.jsonl`, `canary_access.jsonl`, numbered rows (`seq`, lab PR 160 on) | `SHA-256("northnarrow/audit/v2\0"` (or `canary-registry`, `canary-access`) `‖ prev_hash ‖ row)` | must be the canonical serialisation of the row |
+| the same files, rows without `seq` | `SHA-256(prev_hash ‖ row)` | not checked; counted |
+| FIM baseline, `netflow_listeners.jsonl` | `SHA-256(prev_hash ‖ row)` | not checked |
+
+*Canonical* means: the verifier decodes the line, serialises it again (hash and
+signature included) and finds the same bytes. The hash is computed over the
+decoded line, so before this version a line with a key the agent never writes
+(`"injected":"x"`), its keys in another order, spaces, or a value spelled with an
+escape (`\u0072ecord`) decoded to the same line and verified. Such a v3 line or
+numbered row is now refused; an older line still verifies as it always did and is
+named in the summary.
+
+What `nn-admin chain verify` / `audit verify` print for it (exit 8):
+
+- `file F: entry N: a v3 line not in its canonical form (the bytes on disk are
+  not what the agent wrote: a key added, reordered or re-spelled)` — a rotating
+  log, its archives or manifest (N counted from 0, empty lines included).
+- `entry N: a numbered row not in its canonical form (…)` — the audit chain or a
+  canary chain (N counted from 0 over the rows).
+- `file F: entry N: a line in the old format (v1/v2, untagged pre-image) after v3
+  lines` — the agent writes v3 only; an old-format line after the first v3 line
+  of a log (or of its manifest) was put there.
+- `file F: malformed line N: fmt_ver K: a format this reader does not know (it
+  reads up to 3)` — a line from a newer agent, or a forged version.
+- `entry_hash mismatch` at a line that decodes fine: a line signed for another
+  log or another line type (a manifest copied from another log, a line moved
+  between logs) recomputes to another hash.
+
+On a host upgraded from an earlier build the `OK` lines say what is still in
+the old format: `…, 12 line(s) in the old format (untagged pre-image) before the
+v3 ones` for a rotating log, `…, 3 old-format row(s) not in canonical form
+(bytes the signature does not cover)` when some of those were rewritten. The
+old lines leave with retention (the rotating logs) or stay (the flat chains,
+which are not rotated); they are the residual: an old line can still be moved
+between two logs of the same shape, or rewritten in bytes, without breaking its
+signature. The agent's checks at open (the tail of a rotating log, the canary
+chains, the head anchor) apply the same rules: a v3 line not in canonical form
+is not a head, is cut from a torn tail like a line whose hash fails, and a
+canary row in that state is not applied.
+
+**Readers older than the agent.** Upgrade `nn-admin` with the agent
+(`install.sh --upgrade` and the packages do). An `nn-admin` built before this
+version reports every rotating log that holds a v3 line `BROKEN` (`entry_hash
+mismatch` at its first v3 line or manifest row, exit 8); the flat chains are
+unaffected. `nn-admin` 0.0.1 has no reader of the rotating logs (its `audit
+verify` already needs the newer `nn-admin` since lab PR 160). An agent older
+than this version, put back over v3 files, does not verify v3 lines: at its
+start it cuts up to 16 trailing v3 lines of an active file or manifest that
+still ends in old-format lines (attested as `torn_tail_repaired` in the
+manifest), or keeps the tail as `tail_unverified`; its background check reports
+`chain_verify_failed`; its read verbs leave v3 rows out. Downgrading the agent
+after this version has written is not supported.
 
 ## When a check fails
 
@@ -163,4 +222,5 @@ format change of its own, not made yet.
 - After an upgrade from a version before lab PR 160 the audit chain gets a
   `chain_numbering_started` entry; older rows keep verifying as before.
 - Use the `nn-admin` shipped with the agent: an older one reports numbered
-  rows as broken. Downgrading the agent is not supported.
+  rows, and the rotating logs' v3 lines (lab PR 204), as broken. Downgrading
+  the agent is not supported.

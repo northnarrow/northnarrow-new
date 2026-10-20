@@ -39,8 +39,20 @@ unreadable line still takes a position (an inserted line is a break).
 `northnarrow/canary-access/v2\0`. A row without `seq` keeps
 `SHA-256(prev_hash ‖ row)`. Removing `seq` from a numbered row changes its
 hash, so a row cannot be downgraded to the old pre-image. The rotating
-logs keep their pre-image: their line kinds are told apart by `fmt_ver`,
-the reserved `rotate`/`manifest` keys and their payloads.
+logs took the same step with their format v3 (lab PR 204, external audit
+EVD-008): data lines, terminators and manifest rows with `fmt_ver` 3 are
+hashed as `SHA-256("northnarrow/chainlog/<log>/<line type>/v3\0" ‖
+prev_hash ‖ line)` (`chainlog::chain_domain`, `ChainPayload::KIND`); lines
+without `fmt_ver` or with 2 keep `SHA-256(prev_hash ‖ line)`, and none may
+follow a v3 line.
+
+**Canonical bytes** (lab PR 204, EVD-007). The hash is computed over the
+decoded row, so it covers the modelled fields only. A numbered row and a v3
+line must also be byte-equal to their own re-serialisation (hash and
+signature included); an older row that is not is counted, not refused. The
+writers' rows are canonical by construction (`serde_json` with struct order,
+`float_roundtrip` for floats); the round-trip tests hold every payload type
+to it.
 
 **File head.** `(bytes, tail_hash, seq?)`: the offset just past the last
 complete line that verifies, and that line's `entry_hash`. Checking a head
@@ -119,7 +131,10 @@ the anchor must exist.
   re-serialises a row, so the hash no longer recomputes): use the
   `nn-admin` shipped with the agent. An older agent downgraded onto these
   files reads numbered rows but its NN-AUD-110 tail check refuses the new
-  manifest rows: downgrades are not supported.
+  manifest rows: downgrades are not supported. The same holds for the v3
+  lines of lab PR 204: an older `nn-admin` reports them as `entry_hash
+  mismatch`, an older agent's tail check cuts up to 16 of them from an
+  active file or manifest that ends in old-format lines.
 - Cost at start: unchanged O(file) walk of `audit.log` and of the canary
   chains (as before), O(1) per head and checkpoint; signature work bounded
   (registry rows, 256 access rows, 4 MiB per rotating log in the

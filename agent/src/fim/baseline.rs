@@ -727,9 +727,11 @@ fn build_signed_entry(
 /// stays free of those fields' eventual contents — verifiers
 /// reproduce the same bytes by clearing those fields before
 /// recomputing.
+///
+/// External audit EVD-023 (NN-AUD-427, lab PR 204): an entry that still
+/// carries `entry_hash` or `agent_sig` is an error in every build.
 fn compute_entry_hash(entry: &BaselineEntry) -> Result<[u8; 32]> {
-    debug_assert!(entry.entry_hash.is_empty());
-    debug_assert!(entry.agent_sig.is_empty());
+    crate::chain_anchor::check_unsealed(&entry.entry_hash, &entry.agent_sig)?;
     let prev_bytes =
         hex::decode(&entry.prev_hash).map_err(|e| anyhow!("prev_hash is not valid hex: {e}"))?;
     let body =
