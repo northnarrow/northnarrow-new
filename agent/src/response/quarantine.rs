@@ -83,10 +83,107 @@ const QUARANTINE_DENY_PREFIXES: &[&str] = &[
 
 /// `true` when `path` must never be vaulted + unlinked. Lexical check on
 /// the path of the inode itself ([`ExeHandle::current_path`]: absolute and
-/// symlink-free at the moment it is read).
+/// symlink-free at the moment it is read). External audit CMB-025: also
+/// the agent's own files where this host keeps them ([`RuntimeDeny`], set
+/// at boot).
 pub fn is_quarantine_denied(path: &Path) -> bool {
     let p = path.to_string_lossy();
     QUARANTINE_DENY_PREFIXES.iter().any(|d| p.starts_with(d))
+        || RUNTIME_DENY.get().is_some_and(|r| r.denies(path))
+}
+
+/// External audit CMB-025: the agent's own files, wherever this host keeps
+/// them. [`QUARANTINE_DENY_PREFIXES`] names the default install paths
+/// only, while `--watchdog-exe`, the binary's own location and the
+/// executor's files are configurable — and the agent, a protected PID, is
+/// not stopped by the kernel's deny on its own binaries. Not `/opt/`
+/// wholesale: a dropper there would become unquarantinable (a false
+/// positive on an `/opt` application is reversible with `nn-admin response
+/// restore`).
+#[derive(Debug, Default, Clone)]
+pub struct RuntimeDeny {
+    /// Files: the running binary, the watchdog's, the master key, the
+    /// containment record.
+    files: Vec<PathBuf>,
+    /// Subtrees: the quarantine vault.
+    dirs: Vec<PathBuf>,
+    /// The running binary's directory: its siblings `northnarrow-*` and
+    /// `nn-admin`, as the default prefixes do for `/usr/local/bin`.
+    install_dirs: Vec<PathBuf>,
+}
+
+/// The names of the agent's binaries next to it ([`RuntimeDeny`]).
+const OWN_BINARY_PREFIXES: &[&str] = &["northnarrow-", "nn-admin"];
+
+/// Each path as given and, where it differs, as it resolves now.
+fn with_canonical(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for p in paths {
+        if let Ok(c) = p.canonicalize() {
+            if c != p {
+                out.push(c);
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
+impl RuntimeDeny {
+    /// The set for this run: `own_exe` (`current_exe()`), `watchdog_exe`
+    /// (`--watchdog-exe`, or the sibling default) and `cfg`'s master key,
+    /// vault and containment record.
+    pub fn new(cfg: &ExecutorConfig, own_exe: Option<&Path>, watchdog_exe: &Path) -> Self {
+        let own = own_exe.map(Path::to_path_buf);
+        let files = with_canonical(own.iter().cloned().chain([
+            watchdog_exe.to_path_buf(),
+            cfg.master_key_file.clone(),
+            cfg.containment_file.clone(),
+        ]));
+        let install_dirs =
+            with_canonical(own.iter().filter_map(|p| p.parent().map(Path::to_path_buf)));
+        Self {
+            files,
+            dirs: with_canonical([cfg.quarantine_dir.clone()]),
+            install_dirs,
+        }
+    }
+
+    /// `path` is one of the agent's own files.
+    pub fn denies(&self, path: &Path) -> bool {
+        if self.files.iter().any(|f| f == path) || self.dirs.iter().any(|d| path.starts_with(d)) {
+            return true;
+        }
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        self.install_dirs.iter().any(|d| d == parent)
+            && OWN_BINARY_PREFIXES.iter().any(|p| name.starts_with(p))
+    }
+
+    /// The paths, for the boot line.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self
+            .files
+            .iter()
+            .chain(&self.dirs)
+            .map(|p| p.display().to_string())
+            .collect();
+        for d in &self.install_dirs {
+            parts.push(format!("{}/{{northnarrow-*,nn-admin*}}", d.display()));
+        }
+        parts.join(", ")
+    }
+}
+
+/// External audit CMB-025: [`RuntimeDeny`] of this run, set once at boot.
+static RUNTIME_DENY: std::sync::OnceLock<RuntimeDeny> = std::sync::OnceLock::new();
+
+/// Set the agent's own files the quarantine refuses (once, at boot).
+/// `false` when they were already set.
+pub fn set_runtime_deny(deny: RuntimeDeny) -> bool {
+    RUNTIME_DENY.set(deny).is_ok()
 }
 
 /// External audit CMB-001: a binary to quarantine, held open — the inode a
@@ -488,6 +585,16 @@ impl From<std::io::Error> for QuarantineError {
 }
 
 fn quarantine_file(handle: &ExeHandle, cfg: &ExecutorConfig) -> Result<String, QuarantineError> {
+    quarantine_file_after_check(handle, cfg, || {})
+}
+
+/// [`quarantine_file`], running `after_check` between the size check and
+/// the read (tests: a file that grows in between).
+fn quarantine_file_after_check(
+    handle: &ExeHandle,
+    cfg: &ExecutorConfig,
+    after_check: impl FnOnce(),
+) -> Result<String, QuarantineError> {
     let original_buf = handle.current_path().ok_or(QuarantineError::Gone)?;
     let original = original_buf.as_path();
     if is_quarantine_denied(original) {
@@ -502,11 +609,23 @@ fn quarantine_file(handle: &ExeHandle, cfg: &ExecutorConfig) -> Result<String, Q
         });
     }
 
-    // Read once, from the inode the handle holds.
+    after_check();
+
+    // Read once, from the inode the handle holds. External audit CMB-024:
+    // bounded as the check was — a file that grew since (a script is not
+    // write-protected while it runs) is refused, not read whole into
+    // memory and encrypted there. Nothing is removed.
+    let max = cfg.quarantine_max_bytes;
     let mut content = Vec::with_capacity(size as usize + 16);
     let mut reader = &handle.file;
     reader.seek(SeekFrom::Start(0))?;
-    reader.read_to_end(&mut content)?;
+    reader
+        .take(max.saturating_add(1))
+        .read_to_end(&mut content)?;
+    let size = content.len() as u64;
+    if size > max {
+        return Err(QuarantineError::TooLarge { size, max });
+    }
     let sha = Sha256::digest(&content);
 
     // Encrypt.
@@ -1091,6 +1210,96 @@ mod tests {
         }
         // Original file untouched on refusal.
         assert!(p.exists());
+    }
+
+    /// External audit CMB-024: the file grows past the maximum between the
+    /// size check and the read — refused, nothing vaulted, the original
+    /// intact.
+    #[test]
+    fn a_file_that_grows_after_the_check_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = cfg_for(&tmp);
+        cfg.quarantine_max_bytes = 64;
+        let p = tmp.path().join("growing.sh");
+        fs::write(&p, vec![b'a'; 32]).unwrap();
+        let handle = ExeHandle::open(&p).unwrap();
+        let err = quarantine_file_after_check(&handle, &cfg, || {
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(&[b'b'; 4096]).unwrap();
+        })
+        .unwrap_err();
+        match err {
+            QuarantineError::TooLarge { size, max } => {
+                assert_eq!(max, 64);
+                assert_eq!(size, 65, "the read stops one byte past the maximum");
+            }
+            e => panic!("expected TooLarge, got {e:?}"),
+        }
+        assert_eq!(
+            fs::metadata(&p).unwrap().len(),
+            32 + 4096,
+            "original intact"
+        );
+        assert!(
+            !cfg.quarantine_dir.join("vault").exists(),
+            "nothing vaulted"
+        );
+        // Grown but still within the maximum: vaulted as read.
+        cfg.quarantine_max_bytes = 8192;
+        let id = quarantine_file_after_check(&ExeHandle::open(&p).unwrap(), &cfg, || {
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(b"c").unwrap();
+        })
+        .unwrap();
+        let meta = vault_meta(&id, &cfg).unwrap();
+        assert_eq!(meta["size_bytes"], 32 + 4096 + 1);
+    }
+
+    /// External audit CMB-025: the agent's own files wherever this host
+    /// keeps them — a watchdog under `/opt`, the running binary and its
+    /// siblings, the executor's key, vault and containment record — and
+    /// nothing else of `/opt`.
+    #[test]
+    fn denylist_covers_the_runtime_own_binaries() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = cfg_for(&tmp);
+        let own = std::env::current_exe().unwrap();
+        let deny = RuntimeDeny::new(
+            &cfg,
+            Some(&own),
+            Path::new("/opt/nn/bin/northnarrow-watchdog"),
+        );
+        let dir = own.parent().unwrap();
+        for p in [
+            own.clone(),
+            PathBuf::from("/opt/nn/bin/northnarrow-watchdog"),
+            dir.join("northnarrow-watchdog"),
+            dir.join("nn-admin"),
+            cfg.master_key_file.clone(),
+            cfg.containment_file.clone(),
+            cfg.quarantine_dir.clone(),
+            cfg.quarantine_dir.join("vault/0123.bin"),
+        ] {
+            assert!(deny.denies(&p), "{} must be denied", p.display());
+        }
+        for p in [
+            PathBuf::from("/opt/nn/bin/tool"),
+            PathBuf::from("/opt/app/bin/northnarrow-agent"),
+            dir.join("evil"),
+            tmp.path().join("quarantine-other/x"),
+            PathBuf::from("/tmp/payload"),
+        ] {
+            assert!(!deny.denies(&p), "{} must be allowed", p.display());
+        }
+        // Set for the process: the quarantine's and the restore's check.
+        assert!(set_runtime_deny(deny));
+        assert!(is_quarantine_denied(&own));
+        assert!(is_quarantine_denied(Path::new(
+            "/opt/nn/bin/northnarrow-watchdog"
+        )));
+        assert!(!is_quarantine_denied(Path::new("/opt/nn/bin/tool")));
+        assert!(check_restore_destination(&cfg.master_key_file).is_err());
+        assert!(!set_runtime_deny(RuntimeDeny::default()), "set once");
     }
 
     #[test]

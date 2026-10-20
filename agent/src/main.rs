@@ -1587,6 +1587,22 @@ async fn main() -> Result<()> {
                 false
             }
         };
+    // External audit CMB-025: the quarantine never takes the agent's own
+    // files, wherever this host keeps them (`--watchdog-exe`, the running
+    // binary, the executor's key, vault and containment record).
+    {
+        let own_exe = std::env::current_exe().ok();
+        let deny = northnarrow_agent::response::quarantine::RuntimeDeny::new(
+            &exec_cfg,
+            own_exe.as_deref(),
+            &cli.resolved_watchdog_exe(),
+        );
+        info!(
+            paths = %deny.describe(),
+            "quarantine: the agent's own files are never quarantined"
+        );
+        northnarrow_agent::response::quarantine::set_runtime_deny(deny);
+    }
     let executor = Executor::with_config(exec_cfg);
     // External audit CMB-019: a kill cgroup an earlier agent left in the
     // middle of a kill (its tree frozen) is finished and removed.
@@ -1623,28 +1639,40 @@ async fn main() -> Result<()> {
     // hard ceiling on what this root process can do. Without CAP_KILL,
     // kill(2) only reaches uid-0 targets, so every KillProcess verdict
     // against a user-owned process would EPERM — in enforcement mode
-    // that is a refuse-to-start, not a warning. The other caps only
-    // degrade a secondary surface and are reported for the journal.
-    match northnarrow_agent::response::caps_preflight::current_missing() {
-        Some(missing) if !missing.is_empty() => {
-            for name in &missing.names {
-                warn!(
-                    cap = name,
-                    breaks = northnarrow_agent::response::caps_preflight::impact_of(name),
-                    "capability missing from effective set"
-                );
+    // that is a refuse-to-start, not a warning, and so is a set that
+    // cannot be verified (external audit CMB-028). The other caps only
+    // degrade a secondary surface: in enforcement an ERROR each here and
+    // a signed `subsystem_degraded` each once the audit log is open
+    // (below); in detect-only a WARN.
+    let caps_degraded: Vec<String> = {
+        use northnarrow_agent::response::caps_preflight as caps;
+        let reading = caps::read_effective();
+        if let caps::CapsReading::Read {
+            note: Some(note), ..
+        } = &reading
+        {
+            warn!("capability preflight: {note}");
+        }
+        match caps::boot_gate(&reading, detect_only) {
+            caps::BootGate::Refuse(why) => anyhow::bail!("{why}"),
+            caps::BootGate::Start { degraded } if degraded.is_empty() => {
+                debug!("capability preflight: all required caps present");
+                Vec::new()
             }
-            if missing.kill_missing && !detect_only {
-                anyhow::bail!(
-                    "CAP_KILL missing from the effective capability set: KillProcess would \
-                     EPERM on every non-root target. Add CAP_KILL to CapabilityBoundingSet= \
-                     in northnarrow-agent.service, or start with --detect-only."
-                );
+            caps::BootGate::Start { degraded } if detect_only => {
+                for d in &degraded {
+                    warn!("capability preflight: {d}");
+                }
+                Vec::new()
+            }
+            caps::BootGate::Start { degraded } => {
+                for d in &degraded {
+                    error!("capability preflight: {d}");
+                }
+                degraded
             }
         }
-        Some(_) => debug!("capability preflight: all required caps present"),
-        None => warn!("capability preflight: /proc/self/status unreadable; cannot verify caps"),
-    }
+    };
 
     // Host hardening (Tappa 10.8): the anti-tamper holds only while root
     // cannot rewrite the kernel at runtime. One WARN per missing setting,
@@ -2393,6 +2421,14 @@ async fn main() -> Result<()> {
             guard.protected_reason(pid).map(|r| r.as_str())
         }));
     }
+    // Lab PR 181 (debug-trigger builds only): the same guard answers the
+    // PIDs written to `debug-protected-query` next to the admin socket.
+    #[cfg(feature = "debug-trigger")]
+    let debug_guard = northnarrow_agent::combat::SystemProtectedProcs::new(
+        executor.own_pid(),
+        exempt.clone(),
+        cli.resolved_watchdog_exe(),
+    );
     if ladder_slot.set(Arc::clone(&ladder)).is_err() {
         warn!("COMBAT ladder slot already set — unexpected double-init");
     }
@@ -2505,6 +2541,11 @@ async fn main() -> Result<()> {
     // check).
     if let Some(gap) = &nft_gap {
         attest_degraded(audit_log.as_ref(), gap);
+    }
+    // External audit CMB-028: the capabilities the unit does not grant (see
+    // the preflight).
+    for detail in &caps_degraded {
+        attest_degraded(audit_log.as_ref(), detail);
     }
     if let Some(detail) = &rag_refused {
         attest_degraded(audit_log.as_ref(), detail);
@@ -3751,6 +3792,8 @@ async fn main() -> Result<()> {
             _ = pump_check.tick() => {
                 #[cfg(feature = "debug-trigger")]
                 debug_abort_pump(&sensor, &cli.admin_socket);
+                #[cfg(feature = "debug-trigger")]
+                debug_protected_query(&debug_guard, &cli.admin_socket);
                 // Lab PR 162: on a quiet host no event runs this sweep.
                 if let Some(ade) = ade_engine.as_deref() {
                     escalate_unsettled_exec_checks(
@@ -3926,6 +3969,42 @@ async fn main() -> Result<()> {
 /// External audit SNS-001: how often the main loop checks that every
 /// telemetry task still runs.
 const PUMP_CHECK_PERIOD: Duration = Duration::from_secs(5);
+
+/// `debug-trigger` builds only: a file `debug-protected-query` next to the
+/// admin socket, holding PIDs, is answered with one WARN per PID — what the
+/// COMBAT guard decides for it, and what `/proc/<pid>/exe` gave. Lab check
+/// of CMB-022 (lab PR 181): with `CAP_SYS_PTRACE` removed, sshd and the
+/// watchdog spared by their uid-0 unit, a session's root process not.
+#[cfg(feature = "debug-trigger")]
+fn debug_protected_query(
+    guard: &dyn northnarrow_agent::combat::ProtectedProcs,
+    admin_socket: &std::path::Path,
+) {
+    let Some(dir) = admin_socket.parent() else {
+        return;
+    };
+    let trigger = dir.join("debug-protected-query");
+    let Ok(text) = std::fs::read_to_string(&trigger) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&trigger);
+    for pid in text
+        .split_whitespace()
+        .filter_map(|p| p.parse::<u32>().ok())
+        .take(64)
+    {
+        let exe = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(p) => p.display().to_string(),
+            Err(e) => format!("unreadable ({e})"),
+        };
+        warn!(
+            pid,
+            exe = %common::log_escape::Escaped(&exe),
+            spared = guard.protected_reason(pid).map_or("no", |r| r.as_str()),
+            "debug-trigger: COMBAT guard query (lab test of CMB-022)"
+        );
+    }
+}
 
 /// `debug-trigger` builds only: a file `debug-abort-pump` next to the admin
 /// socket, holding a pump label (`fs_protect`), aborts that pump; the next
