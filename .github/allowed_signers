@@ -1,0 +1,24 @@
+# .github/allowed_signers — the keys whose signature on a v* tag starts a
+# release (external audit SUP-024). release.yml's `verify-tag` job checks
+# the pushed tag against this file, as committed at the tagged commit, with
+# .github/scripts/verify-release-tag.sh (`git verify-tag` with
+# gpg.ssh.allowedSignersFile); `package` and every later job wait for it.
+#
+# NO KEY IS LISTED YET. Until the maintainer adds the public half of a
+# tag-signing key below, verify-tag refuses every tag: nothing is built,
+# signed, attested or published from a tag (fail closed). Adding the key is
+# the maintainer's step; nobody else's key belongs here.
+#
+# Format: ssh-keygen(1) "ALLOWED SIGNERS", one key per line:
+#   <principal> namespaces="git" <key type> <base64 public key>
+# for instance (the shape only — not a key):
+#   maintainer@example.org namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+# - principal: the maintainer's e-mail (informational; the key decides);
+# - namespaces="git" limits the key to git signatures, as xtask's
+#   supply_chain tests require;
+# - a hardware-backed key (sk-ssh-ed25519@openssh.com) is welcome;
+# - rotation: add the new key, and give the old one
+#   valid-before="YYYYMMDD" (namespaces="git",valid-before="20271231")
+#   rather than deleting it, so older tags still verify; a compromised key
+#   is deleted.
+# Signing and checking a tag: CONTRIBUTING.md, "Rilasci".

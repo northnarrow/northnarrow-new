@@ -61,6 +61,54 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, BTF matrix downloads and release governance (Low
+  SUP-013 NN-AUD-398, SUP-014 NN-AUD-399, SUP-021 NN-AUD-405, SUP-024
+  NN-AUD-408; lab PR 210). The BTF matrix fed third-party blobs to the
+  product's BTF parser as the archive's moving `main` served them, and a
+  release could start from any `v*` tag and overwrite published assets.
+  SUP-014: `deploy/btf-matrix/blobs.sha256` pins one BTFHub archive commit
+  (`ed9772c5dd12`, the archive's head of 2026-10-01) and the sha256 of each
+  of the nine archives (the kernels the weekly run already used).
+  `run.sh` downloads them at that commit only (`https` only, 64 MiB at
+  most) and checks the digest before anything opens the file; a cached
+  copy is checked again at every run (one that no longer matches is
+  deleted and downloaded again), and nothing that fails a check is left in
+  the cache. The archive must hold exactly one regular file,
+  `<kernel>.btf`, read through `tar -O` (no member name, owner, mode or
+  link from the archive reaches the disk; 512 MiB at most).
+  `run.sh --refresh [COMMIT]` lists the archive (default: its head,
+  resolved to a commit), refuses names outside `[A-Za-z0-9._+-]`, checks
+  the newest non-cloud blobs the same way and prints a new `blobs.sha256`
+  for a bump PR. The workflow's blob cache is keyed by that file and is no
+  longer restored from any `btfhub-blobs-` key. SUP-013: a distro/version
+  of `expected.tsv` left without a blob (none pinned, or none in a
+  refreshed listing) was a green `n/a` row; it is now a REGRESSION row and
+  fails the run. SUP-021: `GITHUB_TOKEN` was on curl's command line; the
+  matrix now calls no API and gets no token, and `--refresh` passes the
+  token in a header curl reads from a file descriptor (or lets `gh` use
+  its own). `deploy/btf-matrix/run-test.sh` tests all of this offline (stub
+  curl, gh and agent, a local directory as the archive), in the CI test
+  job and before each matrix run. SUP-024: a new `verify-tag` job runs
+  first on a tag, and `package` — hence every later job — waits for it:
+  the tag must be annotated, name itself, point to the commit built and
+  carry an SSH signature that `git verify-tag` accepts against
+  `.github/allowed_signers` (`.github/scripts/verify-release-tag.sh`,
+  whose selftest runs on throwaway keys). Publishing moved out of `sign`
+  into a `publish` job (tags only, `release-signing` environment,
+  `contents: write` and nothing else), so no job holds both
+  `contents: write` and the OIDC token; it creates the release as a draft,
+  refuses a release that already has assets, uploads without `--clobber`
+  and publishes the draft last. CONTRIBUTING.md says how a tag is signed
+  and checked. Two-person review (CODEOWNERS) stays declined while there
+  is one maintainer.
+  **Regressions / changes:** `.github/allowed_signers` lists no key yet, so
+  every tag stops at `verify-tag`, before any build, until the maintainer
+  adds the public half of a tag-signing SSH key (upgrade notes §9); an
+  OpenPGP-signed tag is refused. Publishing a release again needs its
+  deletion first. Kernels archived after the pin reach the weekly matrix
+  only through a bump PR. `run.sh` takes its distro/version list from
+  `expected.tsv` (the `KERNELS` array is gone) and gains `--pins`,
+  `--expected`, `--no-host` and `--refresh`.
 - External audit, Wave 3, operator documentation and compliance (Low
   DEP-013 NN-AUD-385, DEP-018 NN-AUD-390, DEP-021 NN-AUD-441, SUP-019
   NN-AUD-403, SUP-020 NN-AUD-404, LAB-028 NN-AUD-444 guard; lab PR 209).

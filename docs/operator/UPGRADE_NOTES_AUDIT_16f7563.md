@@ -1126,9 +1126,17 @@ not exist yet. Before the next `v*` tag:
    `RPM_SIGNING_PASSPHRASE`, if any) in the `release-signing` environment,
    with deployments limited to `v*` tags.
 3. Protect the creation of `v*` tags with a ruleset.
+4. Add the public half of a tag-signing SSH key to `.github/allowed_signers`
+   (one line, `namespaces="git"`; "Rilasci" in
+   <https://github.com/northnarrow/northnarrow-new/blob/main/CONTRIBUTING.md>)
+   and sign
+   every `v*` tag with it (NN-AUD-408 SUP-024, lab PR 210).
 
 **Regression:** until then a tag release stops at the `rpm-sign` job and
-nothing is attested or published. A signed apt repository for the `.deb`
+nothing is attested or published; until step 4, every tag stops earlier,
+at `verify-tag`, before anything is built. A release that already has
+assets is never overwritten (lab PR 210): to publish again, delete the
+release first. A signed apt repository for the `.deb`
 is the other part of the same residual; until there is one, the `.deb` is
 checked with its tag-bound attestation.
 

@@ -1,13 +1,17 @@
 //! Supply-chain hygiene of the repository itself: what the CI runs, how
 //! releases are verified, what the default build targets, and which RustSEC
 //! advisories are accepted. External audit SUP-001, SUP-002, SUP-004,
-//! SUP-005, SUP-006, SUP-007 to SUP-012, SUP-015, SUP-016, SUP-017, SUP-018,
-//! SUP-022, SUP-023, DEP-008 and PROC-015. The tests read committed files; three run a local tool and
+//! SUP-005, SUP-006, SUP-007 to SUP-018, SUP-021 to SUP-024, DEP-008 and
+//! PROC-015. The tests read committed files; five run a local tool and
 //! none touches the network: `prune_script_fails_closed` runs the CI prune
 //! script under bash with a stub `cargo`, `advisory_exceptions_expire_in_ci`
-//! runs the CI expiry check under bash with a fixed date, and
+//! runs the CI expiry check under bash with a fixed date,
 //! `rust_version_covers_every_locked_dependency` runs `cargo metadata
-//! --locked --offline` (the crates a workspace build downloads are enough).
+//! --locked --offline` (the crates a workspace build downloads are enough),
+//! `btf_matrix_script_passes_its_offline_tests` runs
+//! `deploy/btf-matrix/run-test.sh` (bash, tar, xz, sha256sum; stub curl, gh
+//! and agent) and `release_tag_check_accepts_only_listed_signers` runs the
+//! tag check's selftest (git and ssh-keygen, throwaway keys).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -419,11 +423,12 @@ fn str_of<'a>(v: &'a serde_yaml_ng::Value, key: &str) -> Option<&'a str> {
 
 /// SUP-004: without a `permissions:` block the token gets the repository's
 /// default, which can be read/write. Every workflow starts read-only; a
-/// job asks for more only where it publishes (release.yml's `sign`).
+/// job asks for more only where it publishes: release.yml's `publish`
+/// writes the release, `sign` the attestations (SUP-024: never both).
 #[test]
 fn every_workflow_token_is_read_only_unless_it_publishes() {
     const WRITE_ALLOWED: [(&str, &str, &str); 3] = [
-        (".github/workflows/release.yml", "sign", "contents"),
+        (".github/workflows/release.yml", "publish", "contents"),
         (".github/workflows/release.yml", "sign", "id-token"),
         (".github/workflows/release.yml", "sign", "attestations"),
     ];
@@ -1958,4 +1963,577 @@ fn the_release_build_carries_no_lab_feature() {
         built < check && check < upload,
         "release.yml: the artefact check runs after the packages are built and before the upload"
     );
+}
+
+// ---------------------------------------------------------------------------
+// SUP-013, SUP-014, SUP-021: the BTF matrix and its third-party downloads.
+
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A BTFHub archive name run.sh accepts: `[A-Za-z0-9][A-Za-z0-9._+-]*.btf.tar.xz`.
+fn is_btf_archive_name(s: &str) -> bool {
+    s.strip_suffix(".btf.tar.xz").is_some_and(|stem| {
+        stem.bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+            && stem
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+    })
+}
+
+/// The distro/version labels of deploy/btf-matrix/expected.tsv (not `host`).
+fn btf_baseline_labels() -> Vec<String> {
+    read(&repo_root().join("deploy/btf-matrix/expected.tsv"))
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split('\t').next())
+        .filter(|k| *k != "host")
+        .map(str::to_string)
+        .collect()
+}
+
+/// SUP-014 (NN-AUD-399): the blobs fed to the product's BTF parser came
+/// from the archive's moving `main`, chosen by whatever the API listed, and
+/// a cached `.btf` was never checked again. blobs.sha256 pins one archive
+/// commit and the sha256 of one archive per distro/version of the
+/// baseline; run.sh downloads at that commit only and checks the digest.
+#[test]
+fn btf_matrix_blobs_are_pinned_by_commit_and_digest() {
+    let root = repo_root();
+    let pins = read(&root.join("deploy/btf-matrix/blobs.sha256"));
+    let mut refs = Vec::new();
+    let mut labels = Vec::new();
+    let mut bad = Vec::new();
+    for (i, line) in pins.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        match t.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["ref", commit] => {
+                if !is_lower_hex(commit, 40) {
+                    bad.push(format!("line {}: ref `{commit}` is not a commit id", i + 1));
+                }
+                refs.push(commit.to_string());
+            }
+            [label, file, sha] => {
+                if !label.contains('/') || label.contains("..") {
+                    bad.push(format!("line {}: label `{label}`", i + 1));
+                }
+                if !is_btf_archive_name(file) {
+                    bad.push(format!("line {}: archive name `{file}`", i + 1));
+                }
+                if !is_lower_hex(sha, 64) {
+                    bad.push(format!("line {}: `{sha}` is not a sha256", i + 1));
+                }
+                if labels.contains(&label.to_string()) {
+                    bad.push(format!("line {}: {label} pinned twice", i + 1));
+                }
+                labels.push(label.to_string());
+            }
+            _ => bad.push(format!("line {}: `{t}`", i + 1)),
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "deploy/btf-matrix/blobs.sha256:\n{}",
+        bad.join("\n")
+    );
+    assert_eq!(
+        refs.len(),
+        1,
+        "blobs.sha256 needs exactly one `ref <commit>` line"
+    );
+    let mut pinned = labels.clone();
+    pinned.sort();
+    let mut baseline = btf_baseline_labels();
+    baseline.sort();
+    assert!(baseline.len() >= 9, "expected.tsv: {baseline:?}");
+    assert_eq!(
+        pinned, baseline,
+        "every distro/version of expected.tsv has one pin, and no pin lacks a baseline"
+    );
+
+    let run = read(&root.join("deploy/btf-matrix/run.sh"));
+    for needle in [
+        "$ARCHIVE_RAW/$ARCHIVE_REF/",
+        "?ref=$ARCHIVE_REF",
+        "sha256sum",
+        "tar -xJOf",
+    ] {
+        assert!(
+            run.contains(needle),
+            "deploy/btf-matrix/run.sh must use `{needle}`"
+        );
+    }
+    for needle in ["raw/main", "tar -xJf"] {
+        assert!(
+            !run.contains(needle),
+            "deploy/btf-matrix/run.sh must not use `{needle}`"
+        );
+    }
+}
+
+/// SUP-021 (NN-AUD-405): `-H "Authorization: Bearer $GITHUB_TOKEN"` put the
+/// token in curl's argv, readable by any local user in /proc/<pid>/cmdline.
+/// run.sh passes it as `-H @<(printf …)`, and only `--refresh` needs it: the
+/// workflow gives the matrix step no token at all.
+#[test]
+fn btf_matrix_sends_no_token_on_a_command_line() {
+    let root = repo_root();
+    let run = read(&root.join("deploy/btf-matrix/run.sh"));
+    let mut auth = 0;
+    for (i, line) in run.lines().enumerate() {
+        let code = line.split(" #").next().unwrap_or(line);
+        if code.trim_start().starts_with('#') || !code.contains("Authorization") {
+            continue;
+        }
+        auth += 1;
+        assert!(
+            code.contains("-H @<(printf 'Authorization: Bearer %s\\n' \"$GITHUB_TOKEN\")"),
+            "run.sh:{}: the token goes in a header curl reads from a file descriptor: {line}",
+            i + 1
+        );
+    }
+    assert_eq!(auth, 1, "run.sh: one place sends the token");
+    assert!(
+        !run.contains("${GITHUB_TOKEN:+-H"),
+        "run.sh: the old argv header is back"
+    );
+
+    let wf = workflow_yaml(&root.join(".github/workflows/btf-matrix.yml"));
+    for (job, body) in jobs(&wf) {
+        for step in steps(&body) {
+            let env = serde_yaml_ng::to_string(&step.get("env").cloned().unwrap_or_default())
+                .unwrap_or_default();
+            assert!(
+                !env.contains("GITHUB_TOKEN") && !env.contains("GH_TOKEN"),
+                "btf-matrix.yml: job {job}: a step is given a token it does not need:\n{env}"
+            );
+        }
+    }
+}
+
+/// SUP-014 with SUP-022: the blob cache was restored from any
+/// `btfhub-blobs-` key. It is keyed by the pin file, never restored from
+/// another key, and run.sh checks every cached archive anyway; the workflow
+/// runs run.sh's offline tests before the matrix.
+#[test]
+fn btf_matrix_cache_is_keyed_by_the_pins() {
+    let wf = workflow_yaml(&repo_root().join(".github/workflows/btf-matrix.yml"));
+    let (_, matrix) = jobs(&wf)
+        .into_iter()
+        .find(|(name, _)| name == "matrix")
+        .expect("btf-matrix.yml has a matrix job");
+    let steps = steps(&matrix);
+    let cache = steps
+        .iter()
+        .find(|s| {
+            s.get("with")
+                .and_then(|w| str_of(w, "path"))
+                .is_some_and(|p| p.contains("nn-btf-matrix"))
+        })
+        .expect("btf-matrix.yml caches the BTFHub blobs");
+    let with = cache.get("with").unwrap();
+    let key = str_of(with, "key").unwrap_or("");
+    assert!(
+        key.contains("hashFiles('deploy/btf-matrix/blobs.sha256')"),
+        "the blob cache key must hash the pin file: {key}"
+    );
+    assert!(
+        with.get("restore-keys").is_none(),
+        "the blob cache must not be restored from another key"
+    );
+    let runs: Vec<&str> = steps
+        .iter()
+        .map(|s| str_of(s, "run").unwrap_or(""))
+        .collect();
+    let selftest = runs
+        .iter()
+        .position(|r| r.contains("deploy/btf-matrix/run-test.sh"))
+        .expect("btf-matrix.yml runs deploy/btf-matrix/run-test.sh");
+    let matrix_run = runs
+        .iter()
+        .position(|r| r.contains("deploy/btf-matrix/run.sh"))
+        .expect("btf-matrix.yml runs deploy/btf-matrix/run.sh");
+    assert!(selftest < matrix_run, "run-test.sh runs before the matrix");
+}
+
+/// SUP-013 (NN-AUD-398), SUP-014, SUP-021: run.sh's behaviour, offline:
+/// stub curl, gh and agent first on PATH, a local directory as the archive.
+/// Among its cases: a distro/version of the baseline without a blob fails
+/// the run (it was a green "n/a"); a blob or a cached copy whose digest is
+/// not the pinned one is refused and leaves nothing in the cache; a name
+/// with `/`, `..` or a space is refused; an archive with any member but
+/// `<kernel>.btf` (`../x`, a link, a second file) is refused; the token is
+/// on no command line.
+#[cfg(unix)]
+#[test]
+fn btf_matrix_script_passes_its_offline_tests() {
+    use std::os::unix::fs::PermissionsExt;
+    let script = repo_root().join("deploy/btf-matrix/run-test.sh");
+    for f in ["deploy/btf-matrix/run-test.sh", "deploy/btf-matrix/run.sh"] {
+        let mode = fs::metadata(repo_root().join(f))
+            .unwrap_or_else(|e| panic!("{f}: {e}"))
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "{f} must be executable (the workflow runs it)"
+        );
+    }
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("bash runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "deploy/btf-matrix/run-test.sh failed:\n{stdout}\n{stderr}"
+    );
+    let cases = stdout.lines().filter(|l| l.starts_with("ok - ")).count();
+    assert!(cases >= 11, "run-test.sh ran {cases} cases:\n{stdout}");
+    assert!(stdout.contains("0 assertion(s) failed"), "{stdout}");
+}
+
+// ---------------------------------------------------------------------------
+// SUP-024: release governance.
+
+fn release_jobs() -> serde_yaml_ng::Value {
+    workflow_yaml(&repo_root().join(".github/workflows/release.yml"))
+        .get("jobs")
+        .cloned()
+        .expect("release.yml has jobs")
+}
+
+fn needs_of(job: &serde_yaml_ng::Value) -> Vec<String> {
+    match job.get("needs") {
+        Some(serde_yaml_ng::Value::String(s)) => vec![s.clone()],
+        Some(serde_yaml_ng::Value::Sequence(v)) => v
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn job_runs(job: &serde_yaml_ng::Value) -> String {
+    steps(job)
+        .iter()
+        .filter_map(|s| str_of(s, "run").map(str::to_string))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// SUP-024 (NN-AUD-408): nothing checked who made the tag. `verify-tag`
+/// (tags only, read-only) runs .github/scripts/verify-release-tag.sh on the
+/// tag object as pushed; `package` waits for it on a tag, and every other
+/// job depends on it through `needs`.
+#[test]
+fn tag_signature_is_verified_before_package() {
+    let root = repo_root();
+    let jobs = release_jobs();
+    let vt = jobs
+        .get("verify-tag")
+        .expect("release.yml has a verify-tag job");
+    assert!(
+        str_of(vt, "if").is_some_and(|c| c.contains("startsWith(github.ref, 'refs/tags/v')")),
+        "verify-tag runs on v* tags"
+    );
+    let perms = vt
+        .get("permissions")
+        .expect("verify-tag declares its permissions");
+    assert_eq!(str_of(perms, "contents"), Some("read"));
+    assert!(
+        perms.get("id-token").is_none(),
+        "verify-tag needs no OIDC token"
+    );
+    assert!(
+        vt.get("environment").is_none(),
+        "verify-tag needs no secret"
+    );
+    let script = job_runs(vt);
+    for needle in [
+        "refs/tags/$TAG:refs/tags/$TAG",
+        ".github/scripts/verify-release-tag.sh verify \"$TAG\" \"$GITHUB_SHA\"",
+    ] {
+        assert!(
+            script.contains(needle),
+            "verify-tag must run `{needle}`:\n{script}"
+        );
+    }
+
+    let package = jobs.get("package").expect("release.yml has a package job");
+    assert!(
+        needs_of(package).contains(&"verify-tag".to_string()),
+        "package needs verify-tag"
+    );
+    let cond = str_of(package, "if").unwrap_or("");
+    for needle in [
+        "needs.verify-tag.result == 'success'",
+        "needs.verify-tag.result == 'skipped' && !startsWith(github.ref, 'refs/tags/v')",
+    ] {
+        assert!(
+            cond.contains(needle),
+            "package's `if` must hold `{needle}`, got `{cond}`"
+        );
+    }
+
+    // every job but verify-tag reaches it through needs
+    let names: Vec<String> = jobs
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .filter_map(|k| k.as_str().map(str::to_string))
+        .collect();
+    for name in names.iter().filter(|n| *n != "verify-tag") {
+        let mut seen = Vec::new();
+        let mut stack = needs_of(jobs.get(name.as_str()).unwrap());
+        while let Some(n) = stack.pop() {
+            if seen.contains(&n) {
+                continue;
+            }
+            stack.extend(needs_of(
+                jobs.get(n.as_str()).unwrap_or(&serde_yaml_ng::Value::Null),
+            ));
+            seen.push(n);
+        }
+        assert!(
+            seen.contains(&"verify-tag".to_string()),
+            "release.yml: job {name} does not depend on verify-tag"
+        );
+    }
+    let publish_if = jobs
+        .get("publish")
+        .and_then(|j| str_of(j, "if"))
+        .unwrap_or("");
+    assert!(
+        publish_if.contains("needs.verify-tag.result == 'success'"),
+        "publish requires a verified tag, got `{publish_if}`"
+    );
+
+    let check = root.join(".github/scripts/verify-release-tag.sh");
+    assert!(
+        check.is_file(),
+        ".github/scripts/verify-release-tag.sh is missing"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&check).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "verify-release-tag.sh must be executable"
+        );
+    }
+    assert!(
+        root.join(".github/allowed_signers").is_file(),
+        ".github/allowed_signers is missing"
+    );
+}
+
+/// SUP-024: `gh release upload … --clobber` replaced published assets
+/// without a trace. No workflow passes --clobber; only `publish` touches a
+/// release, creates it as a draft with the tag required to exist, refuses
+/// a release that already has assets, and holds `contents: write` alone.
+#[test]
+fn release_publish_does_not_clobber() {
+    for file in workflow_files() {
+        let wf = workflow_yaml(&file);
+        for (job, body) in jobs(&wf) {
+            let runs = job_runs(&body);
+            assert!(
+                !runs.contains("--clobber"),
+                "{}: job {job} passes --clobber",
+                rel(&file)
+            );
+            let is_publish = rel(&file) == ".github/workflows/release.yml" && job == "publish";
+            assert!(
+                is_publish || !runs.contains("gh release"),
+                "{}: job {job} touches a release; only release.yml's publish may",
+                rel(&file)
+            );
+        }
+    }
+    let jobs = release_jobs();
+    let publish = jobs.get("publish").expect("release.yml has a publish job");
+    assert!(
+        str_of(publish, "if").is_some_and(|c| c.contains("startsWith(github.ref, 'refs/tags/v')")),
+        "publish runs on v* tags only"
+    );
+    assert_eq!(str_of(publish, "environment"), Some("release-signing"));
+    let perms = publish
+        .get("permissions")
+        .and_then(|p| p.as_mapping())
+        .expect("publish declares its permissions");
+    assert_eq!(
+        perms.len(),
+        1,
+        "publish holds `contents: write` and nothing else"
+    );
+    assert_eq!(
+        str_of(publish.get("permissions").unwrap(), "contents"),
+        Some("write")
+    );
+    assert!(
+        needs_of(publish).contains(&"sign".to_string()),
+        "publish waits for sign"
+    );
+    let runs = job_runs(publish);
+    for needle in [
+        "--json assets --jq '.assets | length'",
+        "gh release create \"$TAG\" --verify-tag --draft",
+        "gh release upload \"$TAG\" dist/*",
+        "gh release edit \"$TAG\" --draft=false",
+        "sha256sum -c SHA256SUMS",
+    ] {
+        assert!(
+            runs.contains(needle),
+            "publish must run `{needle}`:\n{runs}"
+        );
+    }
+    assert!(
+        !steps(publish)
+            .iter()
+            .any(|s| str_of(s, "uses").is_some_and(|u| u.starts_with("actions/checkout@"))),
+        "publish checks nothing out"
+    );
+}
+
+/// SUP-024: `sign` held `contents: write` next to `id-token: write` for
+/// the publish step alone. No job of any workflow holds both.
+#[test]
+fn no_job_holds_contents_write_and_id_token() {
+    let mut seen = 0;
+    for file in workflow_files() {
+        let wf = workflow_yaml(&file);
+        let top = wf.get("permissions").cloned().unwrap_or_default();
+        for (job, body) in jobs(&wf) {
+            let perms = body
+                .get("permissions")
+                .cloned()
+                .unwrap_or_else(|| top.clone());
+            let level = |scope: &str| perms.get(scope).and_then(|v| v.as_str()).unwrap_or("");
+            if level("id-token") == "write" {
+                seen += 1;
+            }
+            assert!(
+                !(level("contents") == "write" && level("id-token") == "write"),
+                "{}: job {job} holds contents: write and id-token: write",
+                rel(&file)
+            );
+            assert!(
+                perms.as_str().is_none_or(|p| p != "write-all"),
+                "{}: job {job}: write-all",
+                rel(&file)
+            );
+        }
+    }
+    assert!(
+        seen >= 1,
+        "no job asks for an OIDC token (release.yml's sign should)"
+    );
+}
+
+/// SUP-024: .github/allowed_signers is git's gpg.ssh.allowedSignersFile.
+/// Each key is an SSH public key limited to the "git" namespace; the file
+/// says so when it lists none (every tag then stops at verify-tag), and
+/// stops saying so once it lists one.
+#[test]
+fn allowed_signers_lists_only_git_namespaced_ssh_keys() {
+    const KEY_TYPES: [&str; 7] = [
+        "ssh-ed25519",
+        "sk-ssh-ed25519@openssh.com",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+        "ssh-rsa",
+    ];
+    let text = read(&repo_root().join(".github/allowed_signers"));
+    let mut keys = 0;
+    let mut bad = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        keys += 1;
+        let f: Vec<&str> = t.split_whitespace().collect();
+        let ok = f.len() >= 4
+            && f[1].split(',').any(|o| o == "namespaces=\"git\"")
+            && KEY_TYPES.contains(&f[2])
+            && f[3].starts_with("AAAA")
+            && f[3]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
+        if !ok {
+            bad.push(format!(
+                "line {}: expected `<principal> namespaces=\"git\" <key type> <base64 key>`: {t}",
+                i + 1
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        ".github/allowed_signers:\n{}",
+        bad.join("\n")
+    );
+    assert_eq!(
+        keys == 0,
+        text.contains("NO KEY IS LISTED YET"),
+        ".github/allowed_signers: the `NO KEY IS LISTED YET` note must match the file ({keys} key(s))"
+    );
+}
+
+/// SUP-024: the tag check itself, on a scratch repository with throwaway
+/// keys: a tag signed by the listed key passes; another key, an unsigned,
+/// lightweight, renamed or altered tag, a tag of another commit, an
+/// expired key, a key of another namespace and an empty list are refused.
+/// With the committed list empty, the real check refuses every tag.
+#[cfg(unix)]
+#[test]
+fn release_tag_check_accepts_only_listed_signers() {
+    let root = repo_root();
+    let script = root.join(".github/scripts/verify-release-tag.sh");
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("selftest")
+        .output()
+        .expect("bash runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "verify-release-tag.sh selftest failed:\n{stdout}\n{stderr}"
+    );
+    assert!(stdout.contains("selftest: all cases passed"), "{stdout}");
+    let cases = stdout.lines().filter(|l| l.starts_with("ok - ")).count();
+    assert!(cases >= 13, "the selftest ran {cases} cases:\n{stdout}");
+
+    let signers = read(&root.join(".github/allowed_signers"));
+    if signers
+        .lines()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
+    {
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .args(["verify", "v0.0.0", &"0".repeat(40)])
+            .current_dir(&root)
+            .output()
+            .expect("bash runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "an empty list must refuse: {stderr}"
+        );
+        assert!(stderr.contains("lists no key"), "{stderr}");
+    }
 }
