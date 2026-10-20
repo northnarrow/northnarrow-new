@@ -584,6 +584,36 @@ Now **killed, or answered, where they were recorded or missed**:
   ruleset was applied, also when the jump dedup failed afterwards (it
   used to say `false` of an isolated host), and the release removes a
   duplicate jump that dedup left.
+- **The COMBAT guard, the capability preflight, the quarantine's own
+  files** (NN-AUD-313 CMB-022, NN-AUD-431 CMB-028, NN-AUD-315 CMB-024,
+  NN-AUD-316 CMB-025, lab PR 181). Hosts whose drop-in removes a
+  capability from the agent's `CapabilityBoundingSet=`:
+  - in enforcement each missing capability other than `CAP_KILL` is now
+    an ERROR at boot, `capability preflight: CAP_… missing from the
+    effective capability set: … unavailable`, and a signed
+    `subsystem_degraded` (a WARN `capability missing from effective set`
+    before: **update journal searches**); in detect-only a WARN;
+  - an agent in enforcement whose capability set can be read neither with
+    `capget(2)` nor from `/proc/thread-self/status` (a seccomp filter
+    denying `capget` on a hidden procfs) **no longer starts**, as without
+    `CAP_KILL`; `--detect-only` starts;
+  - without `CAP_SYS_PTRACE` the agent cannot read `/proc/<pid>/exe` of
+    sshd, the watchdog or another user's process. COMBAT then spares a
+    process whose executable it cannot read only as uid 0 in an SSH unit
+    or in `northnarrow-watchdog.service` (or as the watchdog verified by
+    the refresh task), with a WARN at most once a minute (`COMBAT guard:
+    /proc/<pid>/exe unreadable`); every other process is acted on as
+    before. The watchdog itself cannot be verified then (`watchdog exe
+    verification failed`): no posture exemption, no kernel protection.
+    Keep `CAP_SYS_PTRACE` in the set.
+  - The quarantine also refuses the agent's own files where this host
+    keeps them — the running binary and its `northnarrow-*` / `nn-admin*`
+    siblings, `--watchdog-exe`, the master key, the vault, the containment
+    record (listed at boot: `quarantine: the agent's own files are never
+    quarantined`) — and `nn-admin response restore --to` refuses them as
+    destinations. A binary that grows past `quarantine_max_bytes` while it
+    is read is refused (EFBIG, nothing vaulted or removed); a vault
+    entry's `size_bytes` is the bytes read.
 
 ## 7. The model (ADE) and RAG
 

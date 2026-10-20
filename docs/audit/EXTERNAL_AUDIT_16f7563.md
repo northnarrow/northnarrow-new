@@ -522,10 +522,10 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-310 | CMB-018 | Low | Combat response | S | partly fixed (lab PR 118); open |
 | NN-AUD-311 | CMB-020 | Low | Combat response | S | open |
 | NN-AUD-312 | CMB-021 | Low | Combat response | — | declined (`cgroup_slice` is not configurable in production) |
-| NN-AUD-313 | CMB-022 | Low | Combat response | S | open (the audit's fix is unsafe) |
+| NN-AUD-313 | CMB-022 | Low | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-314 | CMB-023 | Low | Combat response | — | obsolete (lab PR 103) |
-| NN-AUD-315 | CMB-024 | Low | Combat response | S | partly fixed (CMB-001); open |
-| NN-AUD-316 | CMB-025 | Low | Combat response | S | open |
+| NN-AUD-315 | CMB-024 | Low | Combat response | S | fixed (lab PR 181) |
+| NN-AUD-316 | CMB-025 | Low | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-317 | CMB-026 | Low | Combat response | — | already fixed (lab PR 123) |
 | NN-AUD-318 | CMB-027 | Low | Combat response | S–M | partly fixed (lab PR 118; the audit's fail-closed declined); open |
 | NN-AUD-319 | LLMP-005 | Low | LLM prompts | S | open (no consumer: hygiene; revised fix declined) |
@@ -640,7 +640,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-428 | NETR-016 | Info | Net rules | S | open (docs + an adjacent defect) |
 | NN-AUD-429 | PROC-014 | Info | Process rules | S | open |
 | NN-AUD-430 | POS-013 | Info | Posture | S | fixed (lab PR 172) |
-| NN-AUD-431 | CMB-028 | Info | Combat response | S | open |
+| NN-AUD-431 | CMB-028 | Info | Combat response | S | fixed (lab PR 181) |
 | NN-AUD-432 | LLMP-009 | Info | LLM prompts | S | open (Info; narrowed to the test: argv is 512 B at the kernel) |
 | NN-AUD-433 | LLMR-020 | Info | LLM runtime | S | open (Info; `is_ready` has no caller) |
 | NN-AUD-434 | NET-020 | Info | Network | S | partly fixed (lab PR 142); open |
@@ -6804,3 +6804,83 @@ group, the ones an unprivileged user or a local attacker could use first.
     --all-targets`, the agent with `test-privileged,debug-trigger`) clean,
     2,372 passed, 0 failed.
   - Lab: Ubuntu 24.04, unittamper180-probe.sh — before: the build of `main` with lab PRs 176–179; after: this lot on top. A drop-in `Environment=NNX180=1` under `/etc/systemd/system.attached/` and `/run/systemd/system.attached/` (honoured by systemd: `DropInPaths`, the variable in the unit's environment): no row before; after, two signed `unit_dropin` at the next round and again at the restart, `integrity_drift_cleared` once removed. An orphan `NORTHNARROW_COMBAT` chain at start: torn down in both builds; before no signed row, after one `combat_reconcile` (`repaired`, rules removed) — the `combat-audit.jsonl` line is still refused at that point of the boot in both builds (EPERM under the previous run's pinned hooks; a recorded follow-up). A bind mount of `/var/lib` over itself after the start: no row before; after one signed `mount_over_protected` ("hides /var/lib/northnarrow"), cleared at the unmount. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.
+- **Wave 3 — COMBAT guard and self-protection, lab PR 181.** Batch B3 of
+  the Wave 3 triage of group G4: NN-AUD-313 (CMB-022), NN-AUD-315
+  (CMB-024, the rest after CMB-001), NN-AUD-316 (CMB-025), all Low, and
+  NN-AUD-431 (CMB-028, Info). No wire or kernel change; the shipped unit
+  is unchanged.
+  - CMB-022, the triage's fix, not the audit's. Re-checked:
+    `resolve_exe` mapped every `read_link` error to `None`, so "could not
+    check" was "not protected" in the watchdog branch and for sshd.
+    Without `CAP_SYS_PTRACE`, `ptrace_may_access` (FSCREDS) refuses the
+    link for any other uid, any non-dumpable process and any root process
+    whose permitted set is not inside the agent's effective one: sshd
+    (every capability) and the watchdog (`CAP_SYS_ADMIN`). "Unreadable
+    means protected" would make the whole host immune there. Now
+    `resolve_exe` returns `io::Result<Option<PathBuf>>` (`ENOENT`, `ESRCH`
+    and ` (deleted)` are `Ok(None)`), and an `Err` is spared only as the
+    watchdog slot's PID with its recorded start (`ExemptPids::is_exempt`,
+    POS-009) or as real uid 0 in a unit of the system manager
+    (`/system.slice/…`): an SSH unit (`SSH_UNIT_PREFIXES`) or, beyond the
+    triage, `northnarrow-watchdog.service`. That second watchdog anchor is
+    needed because the slot one never holds there: the refresh task reads
+    the same link, gets `EACCES`, and clears the slot (`watchdog exe
+    verification failed`). `/system.slice/` keeps out a unit a user's
+    manager named `ssh.service` (uid 0 in it needs root anyway). A WARN at
+    most once a minute (`WarnEvery`, with `anchor` and `held_back`). The
+    readable path is unchanged (CMB-003 rules), resolved once instead of
+    twice. Not changed, noted: without `CAP_SYS_PTRACE` the watchdog also
+    loses its posture exemption and `PROTECTED_PIDS` (exempt.rs and the
+    refresh task, outside this batch); the boot now says so.
+  - CMB-028. The `CAP_NET_ADMIN` text names the nft egress block; the
+    `CAP_SYS_PTRACE` text lists what it takes. The set is read with raw
+    `capget(2)` (version 3, the calling thread; `libc` has no wrapper),
+    cross-checked with `CapEff` of `/proc/thread-self/status`
+    (`combine`: equal, or only the common bits with a WARN; one source
+    alone with a WARN; none is `Unverifiable`). `boot_gate`: in
+    enforcement, `Unverifiable` and a missing `CAP_KILL` refuse the start;
+    every other missing capability is an ERROR line and, once the audit
+    log is open, a signed `subsystem_degraded` (`attest_degraded`, next to
+    lab PR 165's nft gap); in detect-only WARN lines and no record. The
+    triage asked the record for `CAP_SYS_PTRACE`; every missing
+    capability gets one, as each disables a response.
+  - CMB-024. `take(max + 1)` on the held inode, then `TooLarge` past the
+    maximum: nothing written to the vault, nothing removed. `size_bytes`
+    (meta and index) is the length read, no longer the size at the check.
+  - CMB-025. `RuntimeDeny`, set once at boot (`OnceLock`) and consulted by
+    `is_quarantine_denied` — so also by `check_restore_destination` and
+    restore's directory check: `current_exe()` and its directory's
+    `northnarrow-*` / `nn-admin*`, `--watchdog-exe` (resolved as the
+    refresh task resolves it), `master_key_file`, `containment_file` as
+    files, `quarantine_dir` as a subtree, each as given and canonical.
+    Not `/opt/` wholesale, as the triage said. The INFO line lists them.
+  - Lab hook (`debug-trigger` builds only): PIDs written to
+    `/run/northnarrow/debug-protected-query` are answered on the 5-s pump
+    check with one WARN each (`debug-trigger: COMBAT guard query`, `exe`,
+    `spared`), from a guard built as the ladder's.
+  - Tests: `an_unreadable_exe_with_the_watchdog_identity_is_spared` (a
+    recycled start and an empty slot are not),
+    `an_unreadable_exe_of_a_root_sshd_unit_is_spared` (ssh, sshd, an
+    `sshd@` instance, the watchdog's unit),
+    `an_unreadable_exe_elsewhere_is_not_spared` (other uids, root in a
+    session scope, in cron, in a user manager's `ssh.service`, at `/`,
+    no status), `a_gone_pid_is_not_unreadable`,
+    `the_unreadable_warning_is_rate_limited`, through a `readlink` seam
+    answering `EACCES`; `unparsable_cap_eff_is_unverifiable`,
+    `boot_gate_refuses_what_cannot_kill_and_declares_the_rest`,
+    `capget_and_cap_eff_agree_on_the_live_thread`,
+    `net_admin_names_both_tools`; `a_file_that_grows_after_the_check_is_refused`
+    (grows by 4 KiB past 64 bytes between check and read: `TooLarge`
+    with 65 read, original intact, no vault; within the maximum,
+    `size_bytes` is what was read), `denylist_covers_the_runtime_own_binaries`
+    (`/opt/nn/bin/northnarrow-watchdog`, `current_exe()` and its siblings,
+    key, vault, containment record; `/opt/nn/bin/tool` allowed; the
+    restore destination refused). With main's logic put back: an `Err`
+    taken for `None` fails the first two; "unreadable means protected"
+    (the audit's fix) fails those and the third; the unbounded read fails
+    the growth test; the static denylist alone fails the runtime one;
+    an unverifiable set that only warns fails the gate test. Host: `cargo
+    fmt`, both clippy runs (`--workspace --all-targets`, the agent with
+    `test-privileged,debug-trigger`) clean, `cargo test --workspace`
+    2,361 passed, 0 failed.
+  - Lab: Ubuntu 24.04, combatguard181-probe.sh — before: the build of `main` with lab PRs 176–179; after: this lot on top. A drop-in `CapabilityBoundingSet=~CAP_SYS_PTRACE` (the agent's effective set without it): before a WARN only; after an ERROR "capability preflight: CAP_SYS_PTRACE missing" and one signed `subsystem_degraded`, plus the boot line naming the files never quarantined. The guard asked (debug-trigger hook) about init, sshd, the watchdog, cron and a session's root and user processes, all with `/proc/<pid>/exe` unreadable: init, sshd (uid 0 in `ssh.service`) and the watchdog spared, cron and the session's processes not. COMBAT from an SSH session: the offender (root, non-dumpable, in the session scope) killed in both builds, sshd, the watchdog and cron untouched (same MainPIDs), released by unlock; the drop-in removed and `CAP_SYS_PTRACE` back at the end. Gate: the integration tree of lab PRs 180, 181, 182 and 183 on `main` with lab PRs 176–179: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 38 suites, 84 passed, 0 failed each; Debian 13 (6.12) 38 suites, 83 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04, `upgrade-check` OK on 24.04; host 2,399 passed, 0 failed.

@@ -61,6 +61,56 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   sub-gate) are brought up to date. No change to the agent.
 
 ### Fixed
+- External audit, Wave 3, COMBAT guard and self-protection (Low CMB-022
+  NN-AUD-313, CMB-024 NN-AUD-315, CMB-025 NN-AUD-316, CMB-028 NN-AUD-431;
+  lab PR 181). CMB-022: the COMBAT guard took an unreadable
+  `/proc/<pid>/exe` for "not protected". Without `CAP_SYS_PTRACE` (a
+  drop-in narrowing the unit's bounding set) the kernel refuses that link
+  for every process of another uid, every non-dumpable one and every root
+  process holding a capability the agent lacks — sshd and the watchdog
+  among them — so there the ladder would kill or net-cut the SSH service.
+  The audit's "unreadable means protected" is not what was done (any
+  process could buy immunity with `PR_SET_DUMPABLE=0` and push the ladder
+  to ISOLATE): an unreadable executable is spared only on an anchor the
+  process cannot forge — the watchdog slot's PID with its verified start
+  time, or real uid 0 in an SSH unit (`ssh.service`, `sshd.service`,
+  `ssh@`/`sshd@` instances) or in `northnarrow-watchdog.service` of the
+  system manager (`/system.slice/…`, never a unit a user's manager
+  named); any other PID is fair game. A WARN at most once a minute says
+  which way each went (`COMBAT guard: /proc/<pid>/exe unreadable`, with
+  the anchor and the count held back). CMB-028: the capability preflight
+  reads the effective set with `capget(2)`, `CapEff` of
+  `/proc/thread-self/status` as the cross-check (where they differ, only
+  what both report counts); a set readable neither way refuses the start
+  in enforcement, as a missing `CAP_KILL` does. Every other missing
+  capability is, in enforcement, an ERROR (`capability preflight: CAP_…
+  missing from the effective capability set: … unavailable`) and a signed
+  `subsystem_degraded` at each boot — `CAP_SYS_PTRACE` names what it takes
+  (quarantine targets, lineage, the watchdog's verification, the COMBAT
+  guard's exe check, `/proc/1/root`); in detect-only a WARN. The
+  `CAP_NET_ADMIN` text names the nft egress block next to
+  iptables/ip6tables-restore. CMB-024: the quarantine's read is bounded
+  by `quarantine_max_bytes` as its size check was — a file that grew in
+  between (a running script) is refused (`TooLarge`, nothing vaulted or
+  removed); `size_bytes` is what was read. CMB-025: besides the default
+  install paths, the quarantine (and `nn-admin response restore` as a
+  destination) refuses the agent's own files where this host keeps them,
+  set once at boot: the running binary and its `northnarrow-*` /
+  `nn-admin*` siblings, `--watchdog-exe`, the master key, the vault and
+  the containment record (an INFO line lists them); `/opt` is not denied
+  wholesale. Lab builds (`debug-trigger`) answer the PIDs written to
+  `/run/northnarrow/debug-protected-query` with the guard's decision.
+  **Regressions / changes:** an agent in enforcement whose capability set
+  can be read neither by `capget(2)` nor from procfs no longer starts
+  (WARN before; `--detect-only` still starts); a missing capability other
+  than `CAP_KILL` is an ERROR and a signed `subsystem_degraded` at every
+  boot in enforcement (a WARN `capability missing from effective set`
+  before — update journal searches); without `CAP_SYS_PTRACE`, root
+  processes of the SSH and watchdog units whose executable cannot be read
+  are spared (skipped, the ladder escalating as for any spared offender)
+  where they were killed; a binary that grows past the maximum while it is
+  read is no longer quarantined; a vault entry's `size_bytes` is the bytes
+  read; restore refuses the agent's own files as destinations.
 - External audit, Wave 3, unit and mount tampering (Low MAIN-013
   NN-AUD-255, MAIN-015 NN-AUD-257, EVD-011 NN-AUD-276, EVD-014 NN-AUD-277;
   lab PR 180). The self-integrity check looked for the agent's drop-ins in
