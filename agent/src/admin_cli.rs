@@ -238,6 +238,18 @@ pub struct StatusOutcome {
     pub defense_tamper_total: Option<u64>,
     pub defense_tamper_sanctioned_total: Option<u64>,
     pub defense_tools_watched: Option<u64>,
+    /// Lab PR 226 (EXPERIMENTAL): the exec policy's state and counts
+    /// (`StatusResponse::execpol_*`).
+    pub execpol_state: Option<String>,
+    pub execpol_denied_total: Option<u64>,
+    pub execpol_would_deny_total: Option<u64>,
+    pub execpol_quarantine_total: Option<u64>,
+    pub execpol_quarantine_inactive_total: Option<u64>,
+    pub execpol_env_denied_total: Option<u64>,
+    pub execpol_env_recorded_total: Option<u64>,
+    pub execpol_map_denied_total: Option<u64>,
+    pub execpol_map_recorded_total: Option<u64>,
+    pub execq_script_refused_total: Option<u64>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -485,6 +497,16 @@ fn status_outcome(
         defense_tamper_total: resp.defense_tamper_total,
         defense_tamper_sanctioned_total: resp.defense_tamper_sanctioned_total,
         defense_tools_watched: resp.defense_tools_watched,
+        execpol_state: resp.execpol_state,
+        execpol_denied_total: resp.execpol_denied_total,
+        execpol_would_deny_total: resp.execpol_would_deny_total,
+        execpol_quarantine_total: resp.execpol_quarantine_total,
+        execpol_quarantine_inactive_total: resp.execpol_quarantine_inactive_total,
+        execpol_env_denied_total: resp.execpol_env_denied_total,
+        execpol_env_recorded_total: resp.execpol_env_recorded_total,
+        execpol_map_denied_total: resp.execpol_map_denied_total,
+        execpol_map_recorded_total: resp.execpol_map_recorded_total,
+        execq_script_refused_total: resp.execq_script_refused_total,
         telemetry_signed: signed,
     }
 }
@@ -3764,6 +3786,16 @@ mod tests {
                     defense_tamper_total: Some(5),
                     defense_tamper_sanctioned_total: Some(6),
                     defense_tools_watched: Some(7),
+                    execpol_state: Some("enforce; 1 partial".to_string()),
+                    execpol_denied_total: Some(11),
+                    execpol_would_deny_total: Some(12),
+                    execpol_quarantine_total: Some(13),
+                    execpol_quarantine_inactive_total: Some(14),
+                    execpol_env_denied_total: Some(15),
+                    execpol_env_recorded_total: Some(16),
+                    execpol_map_denied_total: Some(17),
+                    execpol_map_recorded_total: Some(18),
+                    execq_script_refused_total: Some(19),
                 }),
             );
         });
@@ -3772,6 +3804,10 @@ mod tests {
         assert_eq!(out.execq_state.as_deref(), Some("enforce"));
         assert_eq!(out.execq_held_total, Some(1));
         assert_eq!(out.execq_scanner_deaths_total, Some(9));
+        // Lab PR 226: the exec policy's fields.
+        assert_eq!(out.execpol_state.as_deref(), Some("enforce; 1 partial"));
+        assert_eq!(out.execpol_denied_total, Some(11));
+        assert_eq!(out.execpol_map_recorded_total, Some(18));
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.ringbuf_rejected_total, Some(2));

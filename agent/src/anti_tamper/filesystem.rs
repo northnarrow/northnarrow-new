@@ -191,6 +191,9 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // Lab PR 225: the shipped list of security tools NN-L-EVA-001..004
     // read (`crate::impair`). Write-denied like the other shipped lists.
     "security-tools.v1",
+    // Lab PR 226 (EXPERIMENTAL): the exec policy and its signature.
+    "exec-policy.local",
+    "exec-policy.local.sig",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -2519,6 +2522,8 @@ mod tests {
                 "execq-hashes.local.sig",
                 // Lab PR 225 — APPENDED.
                 "security-tools.v1",
+                "exec-policy.local",
+                "exec-policy.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"

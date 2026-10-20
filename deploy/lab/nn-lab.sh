@@ -50,6 +50,7 @@
 #   deploy/lab/nn-lab.sh open-sensor-check # Tappa 10.9 step 1: the file-open sensor on LSM file_open, end to end
 #   deploy/lab/nn-lab.sh exec-sensor-check # Tappa 10.9 step 2: the exec sensor on LSM bprm_check_security (review 61)
 #   deploy/lab/nn-lab.sh execq-check     # lab PR 223 (EXPERIMENTAL): exec quarantine at first sight, six cases, guest put back
+#   deploy/lab/nn-lab.sh malsim-exec-check # lab PR 226 (EXPERIMENTAL): exec policy and exec environment, MS-01/02/03/32 before and after, negatives, guest put back
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
 #   deploy/lab/nn-lab.sh ransom-check [--only MS23|MS25] # lab PR 225: MS-23 ransomware recorded (kill held, ENGAGED), negatives; MS-25 security tools
@@ -1327,6 +1328,16 @@ cmd_ransom_check() {
     vssh "sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/ransom-check.sh $args"
 }
 
+cmd_malsim_exec_check() {
+    # Lab PR 226 (deploy/lab/malsim/exec-check.sh, EXPERIMENTAL): the exec
+    # policy off, then enforce, audit and the desktop profile (unit drop-ins
+    # in a signed trusted-installer window); benign simulations MS-01
+    # (/dev/shm), MS-02 (memfd), MS-03 (deleted file), MS-32 (LD_PRELOAD from
+    # /tmp) from a service context, and the negatives. Needs a sync + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/exec-check.sh'
+}
+
 cmd_dns_sensor_check() {
     # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
     # sensor reads the kernel's copy of the query. NET-004 kills a sender
@@ -2020,6 +2031,7 @@ case "${1:-help}" in
     exec-sensor-check) cmd_exec_sensor_check ;;
     execq-check) cmd_execq_check ;;
     net-check)     cmd_net_check ;;
+    malsim-exec-check) cmd_malsim_exec_check ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;
     fim-reuse-check) cmd_fim_reuse_check ;;

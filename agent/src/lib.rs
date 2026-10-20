@@ -35,6 +35,7 @@ pub mod cow;
 pub mod decision;
 pub mod detection_budget;
 pub mod detection_store;
+pub mod execpol;
 pub mod execq;
 pub mod fim;
 pub mod fs_type;

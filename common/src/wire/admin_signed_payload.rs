@@ -736,10 +736,15 @@ pub enum OverlayKind {
     /// quarantine's SHA-256 block and allow lists (`block <sha256> [label]`,
     /// `allow <sha256> [label]`), handed to the confined scanner.
     ExecqHashes = 13,
+    /// Lab PR 226 (EXPERIMENTAL): `exec-policy.local` — the exec policy's
+    /// table over a built-in profile (`exec <class> <tier> <action>`,
+    /// `audit <class>`, `preload <tier> <action>`, `map <class> <tier>
+    /// <action>`, `exempt <path> [classes]`, `profile server|desktop`).
+    ExecPolicy = 14,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 13] = [
+    pub const ALL: [OverlayKind; 14] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -753,6 +758,7 @@ impl OverlayKind {
         OverlayKind::CanaryReaders,
         OverlayKind::CowGuard,
         OverlayKind::ExecqHashes,
+        OverlayKind::ExecPolicy,
     ];
 
     /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
@@ -771,6 +777,7 @@ impl OverlayKind {
             OverlayKind::CanaryReaders => "canary-readers",
             OverlayKind::CowGuard => "cow-guard",
             OverlayKind::ExecqHashes => "execq-hashes",
+            OverlayKind::ExecPolicy => "exec-policy",
         }
     }
 
@@ -820,6 +827,7 @@ impl TryFrom<u8> for OverlayKind {
             11 => Ok(Self::CanaryReaders),
             12 => Ok(Self::CowGuard),
             13 => Ok(Self::ExecqHashes),
+            14 => Ok(Self::ExecPolicy),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }
@@ -1981,6 +1989,7 @@ mod tests {
             (OverlayKind::CanaryReaders, 11, "canary-readers"),
             (OverlayKind::CowGuard, 12, "cow-guard"),
             (OverlayKind::ExecqHashes, 13, "execq-hashes"),
+            (OverlayKind::ExecPolicy, 14, "exec-policy"),
         ] {
             assert_eq!(u8::from(k), byte);
             assert_eq!(OverlayKind::try_from(byte).unwrap(), k);

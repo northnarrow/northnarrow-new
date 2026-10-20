@@ -4175,6 +4175,16 @@ mod tests {
                 defense_tamper_total: None,
                 defense_tamper_sanctioned_total: None,
                 defense_tools_watched: None,
+                execpol_state: None,
+                execpol_denied_total: None,
+                execpol_would_deny_total: None,
+                execpol_quarantine_total: None,
+                execpol_quarantine_inactive_total: None,
+                execpol_env_denied_total: None,
+                execpol_env_recorded_total: None,
+                execpol_map_denied_total: None,
+                execpol_map_recorded_total: None,
+                execq_script_refused_total: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

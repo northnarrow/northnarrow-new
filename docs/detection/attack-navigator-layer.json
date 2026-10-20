@@ -169,29 +169,51 @@
       "techniqueID": "T1106"
     },
     {
-      "comment": "NN-L-EXECQ-001_FirstSightQuarantine",
+      "comment": "NN-L-EXECENV-003_ExecMappingFromStaging",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
-          "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
+          "value": "NN-L-EXECENV-003_ExecMappingFromStaging (no proof)"
         }
       ],
       "score": 1,
       "showSubtechniques": false,
       "tactic": "execution",
+      "techniqueID": "T1129"
+    },
+    {
+      "comment": "NN-L-EXECQ-001_FirstSightQuarantine, NN-L-EXECPOL-001_StagingExecDenied",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECPOL-001_StagingExecDenied (no proof)"
+        }
+      ],
+      "score": 2,
+      "showSubtechniques": false,
+      "tactic": "execution",
       "techniqueID": "T1204.002"
     },
     {
-      "comment": "NN-L-FIM-022_LdSoPreloadModified",
+      "comment": "NN-L-FIM-022_LdSoPreloadModified, NN-L-EXECENV-001_PreloadFromStaging",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "NN-L-FIM-022_LdSoPreloadModified (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECENV-001_PreloadFromStaging (no proof)"
         }
       ],
-      "score": 1,
+      "score": 2,
       "showSubtechniques": false,
       "tactic": "execution",
       "techniqueID": "T1574.006"
@@ -367,7 +389,7 @@
       "techniqueID": "T1556.003"
     },
     {
-      "comment": "R009_RootExecFromUserPath, NN-L-EPG-001_CredentialPostcondition",
+      "comment": "R009_RootExecFromUserPath, NN-L-EPG-001_CredentialPostcondition, NN-L-EXECENV-002_ExecEnvironmentTrick",
       "enabled": true,
       "metadata": [
         {
@@ -377,9 +399,13 @@
         {
           "name": "rule",
           "value": "NN-L-EPG-001_CredentialPostcondition (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECENV-002_ExecEnvironmentTrick (no proof)"
         }
       ],
-      "score": 2,
+      "score": 3,
       "showSubtechniques": false,
       "tactic": "privilege-escalation",
       "techniqueID": "T1068"
@@ -543,18 +569,36 @@
       "techniqueID": "T1055.009"
     },
     {
-      "comment": "NN-L-FIM-020_ShellHistoryCleared",
+      "comment": "NN-L-FIM-020_ShellHistoryCleared, NN-L-EXECENV-002_ExecEnvironmentTrick",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "NN-L-FIM-020_ShellHistoryCleared (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECENV-002_ExecEnvironmentTrick (no proof)"
+        }
+      ],
+      "score": 2,
+      "showSubtechniques": false,
+      "tactic": "stealth",
+      "techniqueID": "T1070.003"
+    },
+    {
+      "comment": "NN-L-EXECPOL-001_StagingExecDenied",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-EXECPOL-001_StagingExecDenied (no proof)"
         }
       ],
       "score": 1,
       "showSubtechniques": false,
       "tactic": "stealth",
-      "techniqueID": "T1070.003"
+      "techniqueID": "T1070.004"
     },
     {
       "comment": "R015_EncodingToolingServiceUid",
@@ -571,43 +615,67 @@
       "techniqueID": "T1140"
     },
     {
-      "comment": "R008_HiddenHomeBinary",
+      "comment": "R008_HiddenHomeBinary, NN-L-EXECPOL-001_StagingExecDenied",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "R008_HiddenHomeBinary (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECPOL-001_StagingExecDenied (no proof)"
         }
       ],
-      "score": 1,
+      "score": 2,
       "showSubtechniques": false,
       "tactic": "stealth",
       "techniqueID": "T1564.001"
     },
     {
-      "comment": "NN-L-FIM-022_LdSoPreloadModified",
+      "comment": "NN-L-FIM-022_LdSoPreloadModified, NN-L-EXECENV-001_PreloadFromStaging, NN-L-EXECENV-002_ExecEnvironmentTrick, NN-L-EXECENV-003_ExecMappingFromStaging",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "NN-L-FIM-022_LdSoPreloadModified (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECENV-001_PreloadFromStaging (no proof)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECENV-002_ExecEnvironmentTrick (no proof)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECENV-003_ExecMappingFromStaging (no proof)"
         }
       ],
-      "score": 1,
+      "score": 4,
       "showSubtechniques": false,
       "tactic": "stealth",
       "techniqueID": "T1574.006"
     },
     {
-      "comment": "R004_ExecFromProcSelfFd",
+      "comment": "R004_ExecFromProcSelfFd, NN-L-EXECPOL-001_StagingExecDenied, NN-L-EXECENV-003_ExecMappingFromStaging",
       "enabled": true,
       "metadata": [
         {
           "name": "rule",
           "value": "R004_ExecFromProcSelfFd (e2e)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECPOL-001_StagingExecDenied (no proof)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECENV-003_ExecMappingFromStaging (no proof)"
         }
       ],
-      "score": 1,
+      "score": 3,
       "showSubtechniques": false,
       "tactic": "stealth",
       "techniqueID": "T1620"

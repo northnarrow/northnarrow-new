@@ -28,6 +28,7 @@ mod epg;
 mod epg_lite;
 mod exec_check;
 mod exec_lsm;
+mod execpol;
 mod execq;
 mod fail_open;
 mod file_open;

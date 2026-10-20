@@ -250,6 +250,8 @@ pub struct Counters {
     pub scanner_deaths: AtomicU64,
     /// Found stopped at boot and resumed.
     pub recovered: AtomicU64,
+    /// Lab PR 226: scripts refused at exec (enforce mode).
+    pub script_refused: AtomicU64,
 }
 
 pub static COUNTERS: LazyLock<Counters> = LazyLock::new(Counters::default);
@@ -267,6 +269,7 @@ pub struct Snapshot {
     pub known_identity: u64,
     pub not_held: u64,
     pub scanner_deaths: u64,
+    pub script_refused: u64,
 }
 
 pub fn snapshot() -> Snapshot {
@@ -283,6 +286,7 @@ pub fn snapshot() -> Snapshot {
         known_identity: g(&c.known_identity),
         not_held: g(&c.not_held),
         scanner_deaths: g(&c.scanner_deaths),
+        script_refused: g(&c.script_refused),
     }
 }
 

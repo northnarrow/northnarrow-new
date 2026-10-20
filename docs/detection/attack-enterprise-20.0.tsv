@@ -82,6 +82,7 @@ T1098.004	subtechnique	active	SSH Authorized Keys	persistence,privilege-escalati
 T1105	technique	active	Ingress Tool Transfer	command-and-control	-
 T1106	technique	active	Native API	execution	-
 T1110	technique	active	Brute Force	credential-access	-
+T1129	technique	active	Shared Modules	execution	-
 T1132	technique	active	Data Encoding	command-and-control	-
 T1136	technique	active	Create Account	persistence	-
 T1136.001	subtechnique	active	Local Account	persistence	-

@@ -13,7 +13,7 @@
 //! Slot order is wire-stable: append only.
 
 /// Number of counted ring buffers (map size).
-pub const RING_DROP_SLOTS: u32 = 21;
+pub const RING_DROP_SLOTS: u32 = 22;
 
 /// Slot of each ring buffer in `RING_DROPS`.
 pub mod ring_slot {
@@ -57,6 +57,11 @@ pub mod ring_slot {
     /// `EXECQ_EVENTS` ring could not hold. It is not stopped (fail-open)
     /// and nobody scans it; the guard's own counter says the same.
     pub const EXECQ: u32 = 20;
+    /// Lab PR 226 (EXPERIMENTAL): an exec policy report (a deny, a "would
+    /// deny", an environment finding, an executable mapping) the
+    /// `EXECPOL_EVENTS` ring could not hold. The decision still applied;
+    /// its record is lost.
+    pub const EXECPOL: u32 = 21;
 }
 
 /// Human names, indexed by slot.
@@ -82,6 +87,7 @@ pub const RING_DROP_NAMES: [&str; RING_DROP_SLOTS as usize] = [
     "task_denial_rate",
     "exploit_guard",
     "execq",
+    "execpol",
 ];
 
 #[cfg(test)]
@@ -121,7 +127,8 @@ mod tests {
             "exploit_guard"
         );
         assert_eq!(RING_DROP_NAMES[ring_slot::EXECQ as usize], "execq");
-        assert_eq!(ring_slot::EXECQ + 1, RING_DROP_SLOTS);
+        assert_eq!(RING_DROP_NAMES[ring_slot::EXECPOL as usize], "execpol");
+        assert_eq!(ring_slot::EXECPOL + 1, RING_DROP_SLOTS);
     }
 
     /// Slot order is wire-stable: the lab soak and older status readers
@@ -151,6 +158,7 @@ mod tests {
             (ring_slot::TASK_DENIAL_RATE, "task_denial_rate"),
             (ring_slot::EXPLOIT_GUARD, "exploit_guard"),
             (ring_slot::EXECQ, "execq"),
+            (ring_slot::EXECPOL, "execpol"),
         ];
         for (i, (slot, name)) in pinned.iter().enumerate() {
             assert_eq!(*slot as usize, i, "slot {name} moved");

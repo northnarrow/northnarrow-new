@@ -671,7 +671,7 @@ enum OverlayCmd {
         /// fim-paths, process-comm-allowlist, netflow-comm-allowlist,
         /// netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout,
         /// escalation-allow, canary-readers, cow-guard,
-        /// execq-hashes.
+        /// execq-hashes, exec-policy.
         kind: String,
         /// The overlay content to store.
         #[arg(long)]
@@ -2421,6 +2421,7 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.net_flow_snapshots_total.is_none()
         && out.ransomware_decisive_total.is_none()
         && out.defense_tamper_total.is_none()
+        && out.execpol_state.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2927,7 +2928,7 @@ fn execq_line(out: &StatusOutcome, tty: bool) -> String {
         return format!("exec quarantine   : {shown}");
     }
     format!(
-        "exec quarantine   : {shown} — held {}, resumed {}, killed {} ({} quarantined), default policy {}, known identity {}, known content {}, not held {}, scanner deaths {}",
+        "exec quarantine   : {shown} — held {}, resumed {}, killed {} ({} quarantined), default policy {}, known identity {}, known content {}, not held {}, scanner deaths {}, scripts refused {}",
         n(out.execq_held_total),
         n(out.execq_resumed_total),
         n(out.execq_killed_total),
@@ -2937,6 +2938,7 @@ fn execq_line(out: &StatusOutcome, tty: bool) -> String {
         n(out.execq_known_hash_total),
         n(out.execq_not_held_total),
         n(out.execq_scanner_deaths_total),
+        n(out.execq_script_refused_total),
     )
 }
 
@@ -2947,7 +2949,7 @@ fn execq_json(out: &StatusOutcome) -> String {
     };
     let n = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
     format!(
-        "{{\"state\":{},\"held\":{},\"resumed\":{},\"killed\":{},\"quarantined\":{},\"defaulted\":{},\"known_identity\":{},\"known_hash\":{},\"not_held\":{},\"scanner_deaths\":{}}}",
+        "{{\"state\":{},\"held\":{},\"resumed\":{},\"killed\":{},\"quarantined\":{},\"defaulted\":{},\"known_identity\":{},\"known_hash\":{},\"not_held\":{},\"scanner_deaths\":{},\"script_refused\":{}}}",
         serde_json::to_string(state).unwrap_or_else(|_| "null".to_string()),
         n(out.execq_held_total),
         n(out.execq_resumed_total),
@@ -2958,6 +2960,55 @@ fn execq_json(out: &StatusOutcome) -> String {
         n(out.execq_known_hash_total),
         n(out.execq_not_held_total),
         n(out.execq_scanner_deaths_total),
+        n(out.execq_script_refused_total),
+    )
+}
+
+/// Lab PR 226 (EXPERIMENTAL): the exec policy's state and counts.
+fn execpol_line(out: &StatusOutcome, tty: bool) -> String {
+    let Some(state) = &out.execpol_state else {
+        return "exec policy       : (not reported: the agent predates the policy)".to_string();
+    };
+    let n = |v: Option<u64>| v.unwrap_or(0);
+    let shown = if state.starts_with("degraded") || state.contains("partial") {
+        colorize(state, "31", tty)
+    } else {
+        state.clone()
+    };
+    if state == "off" {
+        return format!("exec policy       : {shown}");
+    }
+    format!(
+        "exec policy       : {shown} — denied {}, would deny {}, quarantine {} ({} inactive), \
+         environment denied {} / reported {}, mappings denied {} / reported {}",
+        n(out.execpol_denied_total),
+        n(out.execpol_would_deny_total),
+        n(out.execpol_quarantine_total),
+        n(out.execpol_quarantine_inactive_total),
+        n(out.execpol_env_denied_total),
+        n(out.execpol_env_recorded_total),
+        n(out.execpol_map_denied_total),
+        n(out.execpol_map_recorded_total),
+    )
+}
+
+/// The exec policy's fields as a JSON object (`null` when absent).
+fn execpol_json(out: &StatusOutcome) -> String {
+    let Some(state) = &out.execpol_state else {
+        return "null".to_string();
+    };
+    let n = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
+    format!(
+        "{{\"state\":{},\"denied\":{},\"would_deny\":{},\"quarantine\":{},\"quarantine_inactive\":{},\"env_denied\":{},\"env_recorded\":{},\"map_denied\":{},\"map_recorded\":{}}}",
+        serde_json::to_string(state).unwrap_or_else(|_| "null".to_string()),
+        n(out.execpol_denied_total),
+        n(out.execpol_would_deny_total),
+        n(out.execpol_quarantine_total),
+        n(out.execpol_quarantine_inactive_total),
+        n(out.execpol_env_denied_total),
+        n(out.execpol_env_recorded_total),
+        n(out.execpol_map_denied_total),
+        n(out.execpol_map_recorded_total),
     )
 }
 
@@ -3019,7 +3070,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"execpol\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -3068,6 +3119,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             serde_json::to_string(&out.exploit_guard).unwrap_or_else(|_| "null".to_string()),
             serde_json::to_string(&out.cow_guard).unwrap_or_else(|_| "null".to_string()),
             execq_json(out),
+            execpol_json(out),
             out.telemetry_signed,
         );
         return;
@@ -3116,6 +3168,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
         println!("{}", execq_line(out, tty));
         println!("{}", ransomware_line(out, tty));
         println!("{}", defense_line(out, tty));
+        println!("{}", execpol_line(out, tty));
     }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
@@ -4728,6 +4781,28 @@ mod flow_sock_line_tests {
         assert!(j["resumed"].is_null());
     }
 
+    /// Lab PR 226: the exec policy's line and JSON object.
+    #[test]
+    fn the_exec_policy_line() {
+        let mut o = outcome(None, None, None);
+        assert!(super::execpol_line(&o, false).contains("predates the policy"));
+        assert_eq!(super::execpol_json(&o), "null");
+        o.execpol_state = Some("off".into());
+        assert_eq!(super::execpol_line(&o, false), "exec policy       : off");
+        o.execpol_state = Some("enforce".into());
+        o.execpol_denied_total = Some(2);
+        o.execpol_quarantine_inactive_total = Some(4);
+        let l = super::execpol_line(&o, false);
+        assert!(
+            l.contains("enforce — denied 2") && l.contains("(4 inactive)"),
+            "{l}"
+        );
+        let j: serde_json::Value = serde_json::from_str(&super::execpol_json(&o)).unwrap();
+        assert_eq!(j["state"], "enforce");
+        assert_eq!(j["denied"], 2);
+        assert!(j["map_denied"].is_null());
+    }
+
     fn outcome(
         pending: Option<u64>,
         capacity: Option<u64>,
@@ -4788,6 +4863,16 @@ mod flow_sock_line_tests {
             defense_tamper_total: None,
             defense_tamper_sanctioned_total: None,
             defense_tools_watched: None,
+            execpol_state: None,
+            execpol_denied_total: None,
+            execpol_would_deny_total: None,
+            execpol_quarantine_total: None,
+            execpol_quarantine_inactive_total: None,
+            execpol_env_denied_total: None,
+            execpol_env_recorded_total: None,
+            execpol_map_denied_total: None,
+            execpol_map_recorded_total: None,
+            execq_script_refused_total: None,
             telemetry_signed: true,
         }
     }

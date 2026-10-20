@@ -43,6 +43,10 @@ pub mod mode {
 }
 
 /// Guarded classes: why a file is a candidate (`ExecqStopRaw::class`).
+/// Lab PR 226 split `/var/tmp` and `/dev/shm` out of `TMP` and `TMPFS`
+/// (the exec policy gives them their own rules) and added the home of
+/// another user; the exec quarantine guards them all by default, as
+/// before.
 pub mod class {
     /// A `memfd_create` file.
     pub const MEMFD: u32 = 1 << 0;
@@ -52,15 +56,52 @@ pub mod class {
     pub const TMPFS: u32 = 1 << 2;
     /// Its directory is writable by every user (`S_IWOTH`).
     pub const WORLD_WRITABLE_DIR: u32 = 1 << 3;
-    /// Under `/tmp` or `/var/tmp` (the task's own view).
+    /// Under `/tmp` (the task's own view), or on a filesystem mounted at
+    /// `/tmp`.
     pub const TMP: u32 = 1 << 4;
-    /// Under `/home` or `/root` (the task's own view).
+    /// Under `/home` or `/root` (the task's own view), or on a filesystem
+    /// mounted there.
     pub const HOME: u32 = 1 << 5;
     /// On a filesystem the agent mounted guarded (`EXECQ_ROOTS`: a separate
     /// `/home`, `/tmp`, `/var/tmp`, `/dev/shm` or `/run/user/*`).
     pub const GUARDED_MOUNT: u32 = 1 << 6;
+    /// Lab PR 226: under `/dev/shm`, or on the filesystem mounted there.
+    pub const DEV_SHM: u32 = 1 << 7;
+    /// Lab PR 226: under `/var/tmp`, or on a filesystem mounted there
+    /// (`TMP` until lab PR 226).
+    pub const VAR_TMP: u32 = 1 << 8;
+    /// Lab PR 226: in a home directory (`HOME`) and owned by a user who is
+    /// neither the caller (real uid) nor root: code another account
+    /// controls.
+    pub const OTHER_HOME: u32 = 1 << 9;
+    /// Classes (bits).
+    pub const COUNT: u32 = 10;
     /// Every class.
-    pub const ALL: u32 = MEMFD | DELETED | TMPFS | WORLD_WRITABLE_DIR | TMP | HOME | GUARDED_MOUNT;
+    pub const ALL: u32 = MEMFD
+        | DELETED
+        | TMPFS
+        | WORLD_WRITABLE_DIR
+        | TMP
+        | HOME
+        | GUARDED_MOUNT
+        | DEV_SHM
+        | VAR_TMP
+        | OTHER_HOME;
+}
+
+/// `EXECQ_ROOTS` value bits (lab PR 226): which guarded point a mounted
+/// filesystem's root is at, so a file on it gets that point's class too.
+pub mod root_kind {
+    /// A guarded mount ([`super::class::GUARDED_MOUNT`]).
+    pub const GUARDED: u32 = 1 << 0;
+    /// Mounted at (or below) `/tmp`.
+    pub const TMP: u32 = 1 << 1;
+    /// At (or below) `/var/tmp`.
+    pub const VAR_TMP: u32 = 1 << 2;
+    /// At (or below) `/dev/shm`.
+    pub const DEV_SHM: u32 = 1 << 3;
+    /// At (or below) `/home` or `/root`.
+    pub const HOME: u32 = 1 << 4;
 }
 
 /// `ExecqStopRaw::flags` / `ExecqCandRaw::flags`.
@@ -80,6 +121,12 @@ pub mod stop_flags {
     /// The ctime offsets are absent on this kernel: the identity cache
     /// cannot vouch for the content, every exec of the file is a candidate.
     pub const NO_CTIME: u32 = 1 << 5;
+    /// Lab PR 226: the candidate is a `#!` script (or a binfmt_misc input)
+    /// and the guard enforces: refused at the interpreter's pass
+    /// (`-EACCES`), not stopped. The interpreter opens the script by its
+    /// path once it runs, so a scan made while it is held cannot vouch for
+    /// what it reads (the file can be rewritten or replaced in between).
+    pub const SCRIPT_REFUSED: u32 = 1 << 6;
 }
 
 /// `EXECQ_COUNTERS` slots (per-CPU `u64`, summed by the agent).
@@ -98,6 +145,8 @@ pub mod counter {
     pub const SIGNAL_FAILED: u32 = 5;
     /// Candidates the `EXECQ_CAND` map could not hold.
     pub const CAND_DROPPED: u32 = 6;
+    /// Lab PR 226: scripts refused at exec (enforce mode).
+    pub const SCRIPT_REFUSED: u32 = 7;
     /// Slots in the map.
     pub const SLOTS: u32 = 8;
 }
@@ -235,7 +284,11 @@ impl ExecqStopRaw {
 
     /// Whether the kernel stopped the process (enforce mode, signal sent).
     pub const fn stopped(&self) -> bool {
-        self.flags & (stop_flags::OBSERVE | stop_flags::SIGNAL_FAILED | stop_flags::HEARTBEAT_STALE)
+        self.flags
+            & (stop_flags::OBSERVE
+                | stop_flags::SIGNAL_FAILED
+                | stop_flags::HEARTBEAT_STALE
+                | stop_flags::SCRIPT_REFUSED)
             == 0
             && self.stop_rc == 0
     }
@@ -253,6 +306,9 @@ pub fn class_names(bits: u32) -> alloc::vec::Vec<&'static str> {
         (class::TMP, "tmp"),
         (class::HOME, "home"),
         (class::GUARDED_MOUNT, "guarded_mount"),
+        (class::DEV_SHM, "dev_shm"),
+        (class::VAR_TMP, "var_tmp"),
+        (class::OTHER_HOME, "other_home"),
     ] {
         if bits & bit != 0 {
             v.push(name);
@@ -286,12 +342,21 @@ mod tests {
         assert!(r.stopped());
         r.stop_rc = -1;
         assert!(!r.stopped());
+        // lab PR 226: a refused script was never stopped
+        r.stop_rc = 0;
+        r.flags = stop_flags::SCRIPT | stop_flags::SCRIPT_REFUSED;
+        assert!(!r.stopped());
     }
 
     #[test]
     fn class_names_follow_the_bits() {
         assert_eq!(class_names(class::MEMFD | class::HOME), ["memfd", "home"]);
-        assert_eq!(class_names(class::ALL).len(), 7);
+        assert_eq!(class_names(class::ALL).len(), class::COUNT as usize);
+        assert_eq!(class::ALL, (1 << class::COUNT) - 1);
+        assert_eq!(
+            class_names(class::DEV_SHM | class::VAR_TMP | class::OTHER_HOME),
+            ["dev_shm", "var_tmp", "other_home"]
+        );
         assert!(class_names(0).is_empty());
     }
 }

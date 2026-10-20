@@ -6,6 +6,79 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Synchronous exec policies, EXPERIMENTAL and off by default (capabilities
+  C12, C13; countermeasure CM-01; lab PR 226; `docs/design/EXEC_POLICY.md`).
+  `bprm_check_security` no longer returns 0 for every exec: with
+  `--exec-policy enforce` the LSM exec sensor refuses (`-EACCES`, before the
+  exec's point of no return) an exec whose file class (memfd, deleted file,
+  `/dev/shm`, `/tmp`, `/var/tmp`, a world-writable directory, tmpfs, a
+  home, another user's home, a guarded mount) and caller lineage tier
+  (`admin`: an interactive admin session — `user.slice`, uid 0, a
+  terminal, a login uid, a root login or sudo/su/doas/pkexec/run0 in the
+  lineage; `session`; `service`: `system.slice`; `unknown`), both computed
+  in the kernel, meet a deny cell; a quarantine cell hands the exec to the
+  exec quarantine (lab PR 223), an audit cell — or a class in audit mode,
+  or `--exec-policy audit`, and every detect-only agent — records "would
+  deny". Default `server` profile: memfd, deleted files and `/dev/shm`
+  refused for services and every non-admin session, `/tmp`, `/var/tmp`,
+  world-writable directories and tmpfs quarantined, an admin allowed (memfd
+  and deleted recorded); `desktop` profile: a login session's own staging
+  locations allowed (AppImage, Flatpak, build trees), memfd and deleted
+  "would deny", services as on a server. Exemptions: init (tgid 1) is never
+  refused; init's own image (which covers the child it forks before its
+  exec), the caller re-executing its own image, root-owned container
+  runtimes (runc, crun, lxc) re-executing a sealed self-copy and the
+  policy's `exempt` lines lift memfd and deleted only. Every deny and "would
+  deny" is a signed
+  `NN-L-EXECPOL-001_StagingExecDenied` record (field `execpol`: decision,
+  tier and its signals, classes; ATT&CK v20 T1620, T1070.004, T1204.002,
+  T1564.001 as fits — lab PR 221's typed mapping, every id in the pinned
+  list, T1204.002 checked active in the v20 bundle) and is
+  counted in `nn-admin status --key` (`execpol_*`, appended fields). The
+  kernel configuration is frozen; the programs detach with the agent.
+- Exec environment and executable-mapping checks (CM-25, lab PR 226):
+  `sys_enter_execve{,at}` read a bounded prefix of the new environment (64
+  variables, the loader variables' values only): `LD_PRELOAD` / `LD_AUDIT`
+  naming `/tmp`, `/var/tmp`, `/dev/shm`, anything under `/proc/` or
+  `/dev/fd` is refused (server profile) for services and unknown callers and
+  for a root caller in a session, recorded otherwise — an admin-tier root
+  caller included (`NN-L-EXECENV-001_PreloadFromStaging`); at a
+  set-id target it is only recorded — the kernel's `AT_SECURE` already
+  makes the loader ignore it; `GLIBC_TUNABLES` at a set-id target (Critical
+  in the CVE-2023-4911 shape), a staging `LD_LIBRARY_PATH`, history disabled
+  for a shell are recorded (`NN-L-EXECENV-002_ExecEnvironmentTrick`). The
+  LSM `mmap_file` program judges executable mappings of files in a class
+  by tier — `/dev/shm` refused for services, `/tmp`, `/var/tmp` and the
+  others recorded, memfd never (JIT double mapping)
+  (`NN-L-EXECENV-003_ExecMappingFromStaging`: T1574.006, T1129 — checked
+  active in the v20 bundle — and T1620). A part that cannot start is a
+  signed `subsystem_degraded`.
+- The exec quarantine refuses a `#!` script it would hold (lab PR 226,
+  design review): in enforce mode the interpreter's pass returns `-EACCES`
+  (the interpreter would open the script by path after the scan, a TOCTOU);
+  a Medium `NN-L-EXECQ-001` record, decision `refuse`,
+  `execq_script_refused_total` in the status; observe mode records "would
+  refuse". The exec classes split `/var/tmp` (`var_tmp`) out of `tmp`, add
+  `dev_shm` and `other_home`, and a file on a filesystem mounted at a
+  guarded point gets that point's class.
+- Overlay kind `exec-policy` (`/etc/northnarrow/exec-policy.local`: `exec
+  <class> <tier> <action>`, `audit <class>`, `preload <tier> <action>`, `map
+  <class> <tier> <action>`, `exempt <path> [classes]`, `profile
+  server|desktop`), signed and verified like every overlay, MUTATE-protected
+  with its signature. `overlay set` refuses a file with a bad line; such a
+  file found at boot leaves the built-in profile in force and is a signed
+  degradation (`exec_policy`). Flags `--exec-policy`, `--exec-policy-profile`,
+  `--exec-policy-local`, `--exec-policy-no-env`, `--exec-policy-no-map`.
+  New optional BTF offsets `TASK_STRUCT_SIGNAL_OFFSET`,
+  `SIGNAL_STRUCT_TTY_OFFSET` (slots 98 and 99; `INODE_I_UID_OFFSET`, which
+  it reads too, is lab PR 219's slot 94) and tracepoint fields
+  `sys_enter_execve.envp`, `sys_enter_execveat.envp` (the enum, tracepoint
+  and hook-argument slots move up); ring-drop slot `execpol` (21, a
+  security ring); `OverlayKind::ExecPolicy` 14 (after lab PR 222's
+  `CowGuard` 12 and lab PR 223's `ExecqHashes` 13).
+- Lab check `deploy/lab/malsim/exec-check.sh` (`nn-lab.sh
+  malsim-exec-check`): MS-01, MS-02, MS-03, MS-32 before and after, audit
+  mode, the desktop profile, the negatives.
 - Ransomware recorded on its own evidence (lab PR 225, countermeasure
   CM-16, capabilities C14, C17, C19; `docs/design/RANSOMWARE_DECISIVE.md`).
   NN-L-IMP-001_RansomwareEncryption: two of four shapes of one actor's file
@@ -327,10 +400,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 - Every rule declares its MITRE ATT&CK tactics and techniques as data
   (lab PR 221, capability C16): `Rule::attack()` returns typed
   references (a `Tactic` enum, technique ids checked for shape when they
-  compile) of ATT&CK Enterprise 20.0. All 89 rules the agent can record
-  (lab PR 219's two, lab PR 223's NN-L-EXECQ-001, lab PR 224's three and
-  lab PR 225's six included) are mapped — 64 techniques and
-  sub-techniques under 12 tactics — and a rule detection
+  compile) of ATT&CK Enterprise 20.0. All 93 rules the agent can record
+  (lab PR 219's two, lab PR 223's NN-L-EXECQ-001, lab PR 224's three, lab
+  PR 225's six and lab PR 226's four included) are mapped — 66 techniques
+  and sub-techniques under 12 tactics — and a rule detection
   record now carries their ids in `mitre` (it was always empty on the rule
   path) and the version in a new `mitre_version` field
   (`"20.0"`). Records written before keep their bytes and still verify:

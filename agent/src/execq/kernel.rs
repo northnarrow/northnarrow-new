@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use anyhow::{anyhow, Context, Result};
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 use aya::Ebpf;
-use common::wire::execq::{conf_slot, counter, ExecqKey, ExecqKnown, ExecqStopped};
+use common::wire::execq::{conf_slot, counter, root_kind, ExecqKey, ExecqKnown, ExecqStopped};
 
 /// `ExecqKey` for aya (its own `Pod` marker; the orphan rule forbids
 /// implementing it on the `common` type).
@@ -50,7 +50,9 @@ impl std::fmt::Debug for Kernel {
 /// `common::bpf_cmd`).
 const BPF_MAP_FREEZE_CMD: libc::c_long = common::bpf_cmd::BPF_MAP_FREEZE as libc::c_long;
 
-fn freeze(map: &MapData) -> Result<()> {
+/// `BPF_MAP_FREEZE` on `map` (the exec policy freezes its own
+/// configuration the same way).
+pub(crate) fn freeze(map: &MapData) -> Result<()> {
     #[repr(C)]
     struct FreezeAttr {
         map_fd: u32,
@@ -170,9 +172,28 @@ pub fn guarded_mount_point(mp: &str) -> bool {
         .any(|g| mp == *g || mp.strip_prefix(g).is_some_and(|r| r.starts_with('/')))
 }
 
+/// Lab PR 226: which guarded point `mp` is at ([`root_kind`]), so a file
+/// on that filesystem gets the point's class (a tmpfs `/tmp` is `tmp`, a
+/// separate `/home` is `home`).
+pub fn root_kind_of(mp: &str) -> u32 {
+    let under = |g: &str| mp == g || mp.strip_prefix(g).is_some_and(|r| r.starts_with('/'));
+    let mut k = root_kind::GUARDED;
+    if under("/tmp") {
+        k |= root_kind::TMP;
+    } else if under("/var/tmp") {
+        k |= root_kind::VAR_TMP;
+    } else if under("/dev/shm") {
+        k |= root_kind::DEV_SHM;
+    } else if under("/home") || under("/root") {
+        k |= root_kind::HOME;
+    }
+    k
+}
+
 /// The roots of the guarded mounts in a `mountinfo` text: mounts of a
 /// filesystem's own root (field 4 is `/`; a bind mount of a directory is
-/// not the root the kernel's walk ends on) at a guarded mount point.
+/// not the root the kernel's walk ends on) at a guarded mount point, with
+/// the point's kind ([`root_kind_of`]).
 pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
     let mut out = Vec::new();
     for line in mountinfo.lines() {
@@ -193,7 +214,7 @@ pub fn guarded_roots(mountinfo: &str) -> Vec<(ExecqKey, u32)> {
                 ino: m.ino(),
             };
             if !out.iter().any(|(k, _)| *k == key) {
-                out.push((key, 1));
+                out.push((key, root_kind_of(&mp)));
             }
         }
     }
@@ -234,5 +255,30 @@ mod tests {
         assert_eq!(roots.len(), 1, "{roots:?}");
         let m = std::fs::metadata("/tmp").unwrap();
         assert_eq!(roots[0].0.ino, m.ino());
+        // lab PR 226: the kind of point it is mounted at
+        assert_eq!(roots[0].1, root_kind::GUARDED | root_kind::TMP);
+    }
+
+    /// Lab PR 226: a file on a filesystem mounted at a guarded point gets
+    /// that point's class.
+    #[test]
+    fn root_kinds() {
+        assert_eq!(root_kind_of("/tmp"), root_kind::GUARDED | root_kind::TMP);
+        assert_eq!(
+            root_kind_of("/var/tmp"),
+            root_kind::GUARDED | root_kind::VAR_TMP
+        );
+        assert_eq!(
+            root_kind_of("/dev/shm"),
+            root_kind::GUARDED | root_kind::DEV_SHM
+        );
+        assert_eq!(root_kind_of("/home"), root_kind::GUARDED | root_kind::HOME);
+        assert_eq!(
+            root_kind_of("/home/u/data"),
+            root_kind::GUARDED | root_kind::HOME
+        );
+        assert_eq!(root_kind_of("/root"), root_kind::GUARDED | root_kind::HOME);
+        assert_eq!(root_kind_of("/run/user/1000"), root_kind::GUARDED);
+        assert_eq!(root_kind_of("/tmpx"), root_kind::GUARDED);
     }
 }
