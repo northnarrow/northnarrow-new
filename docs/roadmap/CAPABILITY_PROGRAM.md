@@ -106,3 +106,55 @@ only in the table below, in the same PR as the evidence.
   contents. The unit's memory limits (9G/11G, sized for the model) are not
   re-sized until that RSS is measured.
   - Lab: On Ubuntu 24.04 the upgrade from the tree without this lot kept an old unit drop-in with the five advisor flags and four variables: after it the agent started with one WARN per removed setting (9), no "unexpected argument", no `weakening_env` for them, `--help` without the flags, and a respawn by the watchdog behaved the same; RSS 30.6 MB after against 33.2 MB before (no growth), the agent binary 18.9 MB → 11.1 MB; the tarball (66 entries) and the .deb (73) hold no model path and NOTICES no advisor section (the agent unit's comment, embedded for the self-integrity check, still names the old model: wording only). Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.
+- **C23 — BPF command numbers and the deny hooks' fail-opens, lab PR 215.**
+  Order item 1, correct before extending: P0 C-02 / G-01 / TD-03 and
+  Q9-06 of the static review of `baf4c25`, still on `main` and not in the
+  audit tracker. The level stays 2: a correction, not an extension.
+  - What was wrong: the `bpf` LSM hook had its own copy of the uapi
+    `bpf_cmd` numbers with `BPF_LINK_GET_FD_BY_ID = 31`. The uapi value is
+    30; 31 is `BPF_LINK_GET_NEXT_ID` (a hand count goes wrong at the alias
+    `BPF_PROG_RUN = BPF_PROG_TEST_RUN`). `bpf_cmd_name` had the same 31. A
+    handle by id on one of the agent's links was granted in enforce mode and
+    left no record in either mode. The enumeration `bpftool link list`
+    steps through was refused when it started from one of the agent's link
+    ids, and recorded as an anti-tamper denial (a false NN-L-AT-001, COMBAT).
+    Detaching or updating a hook stayed refused (EBPF-010 reads the link
+    from the fd). The operator guide said every handle by id was refused.
+    Separately, a deny hook whose kernel read failed let the operation
+    through and left no trace (`Err(_) => return 0`).
+  - What changed: one copy of the numbers, `common/src/bpf_cmd.rs`
+    (`no_std`), for the eBPF programs and userland; the hook's command set
+    is `bpf_cmd::observed`. Tests compare every number with
+    `/usr/include/linux/bpf.h` and with `enum bpf_cmd` in the running
+    kernel's BTF, and both fail with 31. A scan fails on any other constant
+    copy; it lists 22 on the starting tree. A per-CPU `DENY_FAIL_OPEN` map
+    (20 hook slots) is bumped on every path where a hook cannot decide. The
+    agent samples it every 10 s: a WARN, a signed `deny_fail_open` entry
+    (paced, none lost), and `deny_fail_open_total` / `deny_fail_open` in
+    the signed status. The posture is not raised. `anti-tamper.sh` has C63
+    and C64, C43 also asks for a write handle on `DENY_FAIL_OPEN`, and the
+    enforce-mode privileged e2e checks the link deny and the enumeration.
+  - What the lab must verify: every LSM program still loads and attaches
+    on the five gate kernels (the `bpf` hook grew from 502 to 641
+    instructions, the other deny hooks by 10 to 70) and the boot logs
+    `deny fail-open counters armed hooks=20`. In observe mode C63 is
+    granted and recorded as NN-L-BPF-002; in enforce mode it is refused and
+    recorded (`deny=bpf_link`). C64 is allowed with neither `deny=bpf_link`
+    nor NN-L-BPF-002 in both modes, and both rows deviate on the base agent.
+    `bpf_guard_enforce_refuses_protected_pids_write` passes.
+    `nn-admin status --key` shows `deny fail-open : 0` after the whole run
+    on every kernel. A counter written by hand in observe mode gives the
+    WARN, one signed entry and the status line. In enforce mode
+    `bpftool link list` stops at the first NorthNarrow link with one
+    recorded denial (the documented trade-off, as `bpftool map show`).
+  - Host: `cargo xtask build-ebpf --release`; `cargo fmt --all -- --check`
+    and the three clippy runs (workspace, the agent with
+    `test-privileged,debug-trigger`, `posture_demo`) are clean.
+    `cargo test -q --workspace`: 2,810 passed, 0 failed, 21 ignored, with
+    18 new tests. `anti-tamper.sh --selftest`: 77 checks, 0 failed (64 on
+    the starting tree). On the starting tree the new tests do not compile
+    (new modules). Run against it, the source scan lists the 22 copies and
+    the names test fails (`link_get_fd_by_id` named "other"). The new
+    selftest fails 8 of its checks on the starting tree's probe. With 31
+    put back, the header, BTF, names and observed-set tests fail.
+  - Lab: On Ubuntu 24.04 before this lot, a handle by id on one of the agent's links was neither denied nor recorded (C63) and the enumeration from its link ids was recorded as an attack (C64); after it, on 24.04, Debian 12, 22.04 (5.15 verifier) and Debian 13 the deny hooks attach (deny_attached = expected), C63 is recorded as NN-L-BPF-002 (observe mode), a walk of 46 links from 0 enumerates them all with no record, the deny fail-open counter stays 0 over the whole run and an injected fail-open gives the WARN, the signed `deny_fail_open` row and the status line. C64's case still deviates: the agent's own-id map held one link id (49) that no live link has on a clean boot — a stale entry, a recorded follow-up. Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.

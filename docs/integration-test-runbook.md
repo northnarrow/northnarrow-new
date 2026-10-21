@@ -554,7 +554,10 @@ as in production — and `--detect-only`, then asserts: the registration
 line says `mode="enforce"`; `bpftool map delete pinned …/PROTECTED_PIDS
 key <agent pid>` and `kill -9 <agent pid>` from root both fail with
 `Operation not permitted` and leave `ANTI-TAMPER DENIAL op=bpf_map` /
-`op=signal` in the agent log; the fixtures' own teardown
+`op=signal` in the agent log; `BPF_LINK_GET_FD_BY_ID` on one of the
+agent's link ids (read from `OWN_BPF_IDS` through read-only map handles)
+fails with `EPERM` and leaves `op=bpf_link`, while `BPF_LINK_GET_NEXT_ID`
+from each of them is not refused (lab PR 215); the fixtures' own teardown
 (`common::try_quit_agent`: eviction, then SIGQUIT) fails and says the
 eviction was refused; a signed 2-of-N `nn-admin shutdown` stops the agent.
 The guard outlives the agent and would refuse the next fixture's agent (a

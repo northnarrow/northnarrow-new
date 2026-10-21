@@ -3546,6 +3546,8 @@ mod tests {
                 net_dot_rows_total: None,
                 net_dot_rows_resolver: None,
                 net_quic_rows_total: None,
+                deny_fail_open_total: None,
+                deny_fail_open: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

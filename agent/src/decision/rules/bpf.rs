@@ -20,6 +20,11 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use common::bpf_cmd::BPF_MAP_CREATE;
+use common::bpf_cmd::{
+    BPF_LINK_CREATE, BPF_LINK_DETACH, BPF_PROG_ATTACH, BPF_PROG_DETACH, BPF_PROG_LOAD,
+};
 use common::wire::{bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
 use common::{Event, ResponseAction, Severity, Verdict};
 
@@ -48,14 +53,6 @@ pub const KNOWN_BPF_PROGRAMS: &[&str] = &[
     "falco",
     "northnarrow-wat",
 ];
-
-#[cfg(test)]
-const BPF_MAP_CREATE: u32 = 0;
-const BPF_PROG_LOAD: u32 = 5;
-const BPF_PROG_ATTACH: u32 = 8;
-const BPF_PROG_DETACH: u32 = 9;
-const BPF_LINK_CREATE: u32 = 28;
-const BPF_LINK_DETACH: u32 = 34;
 
 /// External audit NETR-003 class: the known tooling and the operator
 /// allowlist judged on what the kernel ran, not on the `comm` a process

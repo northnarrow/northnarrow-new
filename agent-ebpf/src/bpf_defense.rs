@@ -13,14 +13,22 @@
 //!   handles are left alone (`bpftool map dump` keeps working; the pid
 //!   list is not a secret, its integrity is).
 //! * `bpf(int cmd, union bpf_attr *attr, unsigned int size)` — the
-//!   syscall itself, observe-only: program load, map create, attach,
-//!   link create / update / detach, `*_GET_FD_BY_ID` on the agent's own
-//!   object ids, pinned-object open, BTF load by any non-protected
-//!   process become `BpfSyscallRaw` records (the baseline of who drives
-//!   BPF on this host). Nothing is denied here in this version: legitimate
-//!   tooling (systemd, container runtimes, Cilium) loads and detaches BPF
-//!   programs, and a blanket deny would break the host; the rules score
-//!   the shape and the operator allowlist exempts known tooling.
+//!   syscall itself: program load, map create, attach, link create /
+//!   update / detach, `*_GET_FD_BY_ID` on the agent's own object ids,
+//!   pinned-object open, BTF load by any non-protected process become
+//!   `BpfSyscallRaw` records (the baseline of who drives BPF on this
+//!   host; the commands are `northnarrow_common::bpf_cmd::observed`, the
+//!   numbers that crate's only copy, lab PR 215). Third-party BPF is not
+//!   denied: legitimate tooling (systemd, container runtimes, Cilium)
+//!   loads and detaches BPF programs, and a blanket deny would break the
+//!   host; the rules score the shape and the operator allowlist exempts
+//!   known tooling. In enforce mode this hook refuses a handle on one of
+//!   the agent's own LINKS (by id, `LINK_GET_FD_BY_ID`, or through a pin,
+//!   `OBJ_GET`) and a `LINK_DETACH` / `LINK_UPDATE` of one of them. The
+//!   enumeration (`*_GET_NEXT_ID`) gives no handle and is let through.
+//!
+//! A read either hook needs that fails is a fail-open, counted in
+//! `DENY_FAIL_OPEN` (`crate::fail_open`, lab PR 215).
 //!
 //! Mode ([`BPF_DEFENSE_MODE`][0]): 1 = enforce, 0 = observe. Test builds
 //! and `NN_BPF_DEFENSE_OBSERVE=1` run in observe mode — the lab fixtures
@@ -37,6 +45,11 @@ use aya_ebpf::{
     maps::{Array, HashMap, LruHashMap, RingBuf, PerCpuArray},
     programs::{LsmContext, RawTracePointContext},
 };
+use northnarrow_common::bpf_cmd::{
+    observed, BPF_LINK_CREATE, BPF_LINK_DETACH, BPF_LINK_GET_FD_BY_ID, BPF_LINK_UPDATE,
+    BPF_MAP_GET_FD_BY_ID, BPF_OBJ_GET, BPF_PROG_ATTACH,
+};
+use northnarrow_common::fail_open::hook as fail_open_hook;
 use northnarrow_common::ring_drops::ring_slot;
 use northnarrow_common::wire::{
     BpfSyscallRaw, FsProtectDenialRaw, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE, FS_OP_BPF_LINK,
@@ -55,20 +68,10 @@ const EPERM: c_int = 1;
 /// `FMODE_WRITE` (include/linux/fs.h).
 const FMODE_WRITE: u32 = 0x2;
 
-/// uapi `enum bpf_cmd` values the observer reports.
-const BPF_MAP_CREATE: c_int = 0;
-const BPF_PROG_LOAD: c_int = 5;
-const BPF_OBJ_PIN: c_int = 6;
-const BPF_OBJ_GET: c_int = 7;
-const BPF_PROG_ATTACH: c_int = 8;
-const BPF_PROG_DETACH: c_int = 9;
-const BPF_PROG_GET_FD_BY_ID: c_int = 13;
-const BPF_MAP_GET_FD_BY_ID: c_int = 14;
-const BPF_BTF_LOAD: c_int = 18;
-const BPF_LINK_CREATE: c_int = 28;
-const BPF_LINK_UPDATE: c_int = 29;
-const BPF_LINK_GET_FD_BY_ID: c_int = 31;
-const BPF_LINK_DETACH: c_int = 34;
+// The uapi `enum bpf_cmd` numbers come from `northnarrow_common::bpf_cmd`
+// (lab PR 215): the copy here had `BPF_LINK_GET_FD_BY_ID = 31`, which is
+// `BPF_LINK_GET_NEXT_ID` — handles by id on the agent's links were granted
+// unrecorded, and `bpftool link list`'s enumeration was refused.
 
 /// Object kinds in [`OWN_BPF_IDS`] values (written by userland: 1 = map,
 /// 2 = program, 3 = link). The hooks only test membership.
@@ -222,73 +225,104 @@ fn is_own_kind(id: u32, kind: u8) -> bool {
 /// trailing slash: a truncated `OBJ_GET` path under it counts as ours.
 const PIN_ROOT: &[u8; 24] = b"/sys/fs/bpf/northnarrow/";
 
+/// [`nn_link_id_of_fd`]: the fd names no link here (out of range,
+/// closed, not a link) — the kernel refuses the command itself.
+const LINK_NONE: u64 = u64::MAX;
+/// [`nn_link_id_of_fd`]: the link could not be read (an optional offset
+/// absent on this kernel, a failed read) — the hook cannot decide (lab PR
+/// 215: a fail-open, counted).
+const LINK_UNREADABLE: u64 = u64::MAX - 1;
+
 /// [`link_id_of_fd`] as a global BPF function (exported, never inlined,
 /// scalar argument): the verifier checks it once, on its own, and the hook
-/// sees one unknown return value — `u64::MAX` for "no link". Inlined, its
-/// six optional offsets multiplied the hook's states.
+/// sees one unknown return value — the link id, [`LINK_NONE`] or
+/// [`LINK_UNREADABLE`]. Inlined, its six optional offsets multiplied the
+/// hook's states.
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_link_id_of_fd(fd: u64) -> u64 {
     match unsafe { link_id_of_fd(fd as u32) } {
-        Some(id) => u64::from(id),
-        None => u64::MAX,
+        Ok(Some(id)) => u64::from(id),
+        Ok(None) => LINK_NONE,
+        Err(()) => LINK_UNREADABLE,
     }
 }
 
 /// External audit EBPF-010: the id of the BPF link `fd` names in the
-/// caller's file table (`task->files->fdt->fd[fd]->private_data`), or
-/// `None` when it cannot be read (an optional offset absent on this
-/// kernel, an fd out of range or closed). The file is not checked to be a
-/// link: ids are unique, so another link never matches one of ours, and a
-/// non-link fd fails in the kernel whatever is read here.
+/// caller's file table (`task->files->fdt->fd[fd]->private_data`).
+/// `Ok(None)`: the fd is out of range or closed, or the file has no
+/// private data — nothing the kernel would detach. `Err`: a read failed or
+/// an optional offset is absent on this kernel (lab PR 215: the deny
+/// cannot decide). The file is not checked to be a link: ids are unique,
+/// so another link never matches one of ours, and a non-link fd fails in
+/// the kernel whatever is read here.
 #[inline(always)]
-unsafe fn link_id_of_fd(fd: u32) -> Option<u32> {
-    let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET)?;
-    let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET)?;
-    let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET)?;
-    let o_fd = off_opt!(FDTABLE_FD_OFFSET)?;
-    let o_priv = off_opt!(FILE_PRIVATE_DATA_OFFSET)?;
-    let o_id = off_opt!(BPF_LINK_ID_OFFSET)?;
+unsafe fn link_id_of_fd(fd: u32) -> Result<Option<u32>, ()> {
+    let o_files = off_opt!(TASK_STRUCT_FILES_OFFSET).ok_or(())?;
+    let o_fdt = off_opt!(FILES_STRUCT_FDT_OFFSET).ok_or(())?;
+    let o_max = off_opt!(FDTABLE_MAX_FDS_OFFSET).ok_or(())?;
+    let o_fd = off_opt!(FDTABLE_FD_OFFSET).ok_or(())?;
+    let o_priv = off_opt!(FILE_PRIVATE_DATA_OFFSET).ok_or(())?;
+    let o_id = off_opt!(BPF_LINK_ID_OFFSET).ok_or(())?;
     let task = bpf_get_current_task() as *const u8;
     if task.is_null() {
-        return None;
+        return Err(());
     }
-    let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).ok()?;
+    let files = bpf_probe_read_kernel::<u64>(task.add(o_files) as *const u64).map_err(|_| ())?;
     if files == 0 {
-        return None;
+        return Ok(None);
     }
-    let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64).ok()?;
+    let fdt = bpf_probe_read_kernel::<u64>((files as *const u8).add(o_fdt) as *const u64)
+        .map_err(|_| ())?;
     if fdt == 0 {
-        return None;
+        return Err(());
     }
-    let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32).ok()?;
+    let max = bpf_probe_read_kernel::<u32>((fdt as *const u8).add(o_max) as *const u32)
+        .map_err(|_| ())?;
     if fd >= max {
-        return None;
+        return Ok(None);
     }
-    let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64).ok()?;
+    let arr = bpf_probe_read_kernel::<u64>((fdt as *const u8).add(o_fd) as *const u64)
+        .map_err(|_| ())?;
     if arr == 0 {
-        return None;
+        return Err(());
     }
-    let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).ok()?;
+    let file = bpf_probe_read_kernel::<u64>((arr + 8 * fd as u64) as *const u64).map_err(|_| ())?;
     if file == 0 {
-        return None;
+        return Ok(None);
     }
-    let link = bpf_probe_read_kernel::<u64>((file as *const u8).add(o_priv) as *const u64).ok()?;
+    let link = bpf_probe_read_kernel::<u64>((file as *const u8).add(o_priv) as *const u64)
+        .map_err(|_| ())?;
     if link == 0 {
-        return None;
+        return Ok(None);
     }
-    bpf_probe_read_kernel::<u32>((link as *const u8).add(o_id) as *const u32).ok()
+    bpf_probe_read_kernel::<u32>((link as *const u8).add(o_id) as *const u32)
+        .map(Some)
+        .map_err(|_| ())
 }
+
+/// [`nn_obj_get_own_link`]: the path names one of the agent's link pins.
+const PIN_OWN: u64 = 1;
+/// [`nn_obj_get_own_link`]: the path could not be read from the caller's
+/// memory (lab PR 215: the name check cannot decide, a fail-open counted;
+/// the kernel may still read it later, after a page fault this program
+/// cannot take).
+const PIN_UNREADABLE: u64 = 2;
 
 /// [`obj_get_names_own_link`] as a global BPF function (exported, never
 /// inlined, scalar argument): the verifier checks its loops once, on its
 /// own. Inlined, they multiplied with the rest of the hook past the
 /// million-instruction budget once the detach/update deny was added (lab,
-/// 6.8: "BPF program is too large").
+/// 6.8: "BPF program is too large"). 0: not ours, [`PIN_OWN`],
+/// [`PIN_UNREADABLE`].
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
-    u64::from(unsafe { obj_get_names_own_link(user_ptr) })
+    match unsafe { obj_get_names_own_link(user_ptr) } {
+        Ok(true) => PIN_OWN,
+        Ok(false) => 0,
+        Err(()) => PIN_UNREADABLE,
+    }
 }
 
 /// `OBJ_GET` whose pathname's final component is one of the agent's own
@@ -304,13 +338,13 @@ pub extern "C" fn nn_obj_get_own_link(user_ptr: u64) -> u64 {
 /// negative" on 5.15), no 256-byte scan (minutes of verification), no
 /// stack array (memset subprogram).
 #[inline(always)]
-unsafe fn obj_get_names_own_link(user_ptr: u64) -> bool {
+unsafe fn obj_get_names_own_link(user_ptr: u64) -> Result<bool, ()> {
     if user_ptr == 0 {
-        return false;
+        return Ok(false);
     }
     let buf: *mut [u8; PATH_BUF_LEN] = match OBJ_GET_PATH_SCRATCH.get_ptr_mut(0) {
         Some(p) => p,
-        None => return false,
+        None => return Err(()),
     };
     // pass 1: length only. A path that does not fit the buffer (truncated
     // read: PATH_BUF_LEN - 1 bytes, the NUL takes the last slot) is not
@@ -320,10 +354,10 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> bool {
     // protection (review entry 39).
     let n = match bpf_probe_read_user_str_bytes(user_ptr as *const u8, &mut *buf) {
         Ok(s) => s.len(),
-        Err(_) => return false,
+        Err(_) => return Err(()),
     };
     if n == 0 {
-        return false;
+        return Ok(false);
     }
     // External audit EBPF-010: a path that does not fit the buffer is not
     // let through when it starts at the agent's pin root — padding a pin's
@@ -336,11 +370,11 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> bool {
         let mut i: usize = 0;
         while i < PIN_ROOT.len() {
             if (*buf)[i] != PIN_ROOT[i] {
-                return false;
+                return Ok(false);
             }
             i += 1;
         }
-        return true;
+        return Ok(true);
     }
     // pass 2: the last PIN_NAME_LEN bytes plus the terminator (user-pointer
     // arithmetic is a plain scalar add for the verifier)
@@ -352,10 +386,10 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> bool {
     let win: &mut [u8] = core::slice::from_raw_parts_mut(buf as *mut u8, PIN_NAME_LEN + 1);
     let m = match bpf_probe_read_user_str_bytes(win_ptr as *const u8, win) {
         Ok(s) => s.len(),
-        Err(_) => return false,
+        Err(_) => return Err(()),
     };
     if m == 0 || m > PIN_NAME_LEN {
-        return false;
+        return Ok(false);
     }
     // External audit EBPF-010: the final component, hashed in one pass —
     // the hash restarts after every '/'. An empty component (trailing '/')
@@ -375,10 +409,10 @@ unsafe fn obj_get_names_own_link(user_ptr: u64) -> bool {
         }
         j += 1;
     }
-    match OWN_PIN_NAMES.get(&h) {
+    Ok(match OWN_PIN_NAMES.get(&h) {
         Some(kind) => *kind == OWN_KIND_LINK,
         None => false,
-    }
+    })
 }
 
 /// `(dev, ino)` of the calling task's executable (`mm->exe_file`).
@@ -522,7 +556,11 @@ unsafe fn try_bpf_map_guard(ctx: &LsmContext) -> i32 {
     let id_slot = (map as *const u8).add(off!(BPF_MAP_ID_OFFSET)) as *const u32;
     let id = match bpf_probe_read_kernel::<u32>(id_slot) {
         Ok(v) => v,
-        Err(_) => return 0,
+        Err(_) => {
+            // Lab PR 215: a write handle the guard could not judge.
+            crate::fail_open::bump(fail_open_hook::BPF_MAP);
+            return 0;
+        }
     };
     if !is_own_kind(id, OWN_KIND_MAP) || caller_is_protected() || fresh_instance_may_load() {
         return 0;
@@ -542,45 +580,45 @@ pub fn bpf_syscall_observe(ctx: LsmContext) -> i32 {
 
 #[inline(always)]
 unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
-    let cmd: c_int = ctx.arg(0);
+    let cmd = ctx.arg::<c_int>(0) as u32;
     let attr: *const c_void = ctx.arg(1);
-    // Only the commands worth a record; the hot ones (MAP_LOOKUP/UPDATE
-    // from bpftool, OBJ_GET_INFO, PROG_RUN) are not reported.
-    let interesting = matches!(
-        cmd,
-        BPF_MAP_CREATE
-            | BPF_PROG_LOAD
-            | BPF_OBJ_PIN
-            | BPF_OBJ_GET
-            | BPF_PROG_ATTACH
-            | BPF_PROG_DETACH
-            | BPF_PROG_GET_FD_BY_ID
-            | BPF_MAP_GET_FD_BY_ID
-            | BPF_BTF_LOAD
-            | BPF_LINK_CREATE
-            | BPF_LINK_UPDATE
-            | BPF_LINK_GET_FD_BY_ID
-            | BPF_LINK_DETACH
-    );
-    if !interesting || caller_is_protected() {
+    // Only the commands worth a record (`bpf_cmd::observed`); the hot ones
+    // (MAP_LOOKUP/UPDATE from bpftool, OBJ_GET_INFO, PROG_RUN) and the
+    // `*_GET_NEXT_ID` enumerations, which give no handle, are not reported.
+    if !observed(cmd) || caller_is_protected() {
         return 0;
     }
     // bpf_attr is uapi-stable: the first u32 of the union is prog_type
     // (PROG_LOAD), map_type (MAP_CREATE), target_fd (PROG_ATTACH /
     // LINK_CREATE — attach_type sits at +8), start_id / prog_id / map_id /
     // link_id (*_GET_FD_BY_ID).
+    // Lab PR 215: the commands whose argument decides a deny here (a link
+    // handle by id, a detach or update of one of our links); for them an
+    // unreadable argument is a fail-open, counted. A map handle's deny is
+    // the `bpf_map` guard's, on the handle's mode.
+    let decides = matches!(
+        cmd,
+        BPF_LINK_GET_FD_BY_ID | BPF_LINK_DETACH | BPF_LINK_UPDATE
+    );
     let mut arg: u32 = 0;
     if !attr.is_null() {
         let off: usize = match cmd {
             BPF_PROG_ATTACH | BPF_LINK_CREATE => 8,
             _ => 0,
         };
-        if let Ok(v) = bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
-            arg = v;
+        match bpf_probe_read_kernel::<u32>((attr as *const u8).add(off) as *const u32) {
+            Ok(v) => arg = v,
+            Err(_) => {
+                if decides {
+                    crate::fail_open::bump(fail_open_hook::BPF);
+                }
+            }
         }
     }
     // A handle to one of the agent's own MAPS or LINKS taken by id: the
-    // shape of `bpftool map update id N` / `bpftool link detach id N`.
+    // shape of `bpftool map update id N` / `bpftool link show id N` /
+    // `bpftool link detach id N` (and of each NorthNarrow entry `bpftool
+    // link list` reaches: it takes a handle by id on every link it prints).
     // Program handles are not reported (`bpftool prog list` takes one per
     // program and a prog fd cannot modify the agent); the map hook decides
     // the deny on the write path.
@@ -589,8 +627,18 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     let own_link_pin = cmd == BPF_OBJ_GET
         && !attr.is_null()
         && match bpf_probe_read_kernel::<u64>(attr as *const u64) {
-            Ok(p) => nn_obj_get_own_link(p) == 1,
-            Err(_) => false,
+            Ok(p) => match nn_obj_get_own_link(p) {
+                PIN_OWN => true,
+                PIN_UNREADABLE => {
+                    crate::fail_open::bump(fail_open_hook::BPF);
+                    false
+                }
+                _ => false,
+            },
+            Err(_) => {
+                crate::fail_open::bump(fail_open_hook::BPF);
+                false
+            }
         };
     // Second half of the self-defence: a link handle is the only thing
     // that can DETACH or UPDATE one of our LSM hooks (`bpftool link detach
@@ -613,7 +661,9 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     // kernel that adds them. `arg` is the link fd for both commands.
     if matches!(cmd, BPF_LINK_DETACH | BPF_LINK_UPDATE) && enforce() {
         let id = nn_link_id_of_fd(u64::from(arg));
-        if id <= u64::from(u32::MAX) && is_own_kind(id as u32, OWN_KIND_LINK) {
+        if id == LINK_UNREADABLE {
+            crate::fail_open::bump(fail_open_hook::BPF);
+        } else if id <= u64::from(u32::MAX) && is_own_kind(id as u32, OWN_KIND_LINK) {
             emit_denial(FS_OP_BPF_LINK, id as u32);
             return -EPERM;
         }
@@ -623,7 +673,7 @@ unsafe fn try_bpf_syscall_observe(ctx: &LsmContext) -> i32 {
     let report_cmd = if foreign_handle {
         BPF_CMD_FOREIGN_GET_FD
     } else {
-        cmd as u32
+        cmd
     };
     if should_report(pid, report_cmd) {
         emit_syscall(report_cmd, arg);

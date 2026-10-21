@@ -926,8 +926,8 @@ pub fn arm_btf_offsets(ebpf: &mut aya::Ebpf) -> anyhow::Result<usize> {
     Ok(r.values.len())
 }
 
-/// `BPF_MAP_FREEZE` command number (uapi, stable).
-const BPF_MAP_FREEZE_CMD: libc::c_long = 22;
+/// `BPF_MAP_FREEZE` (lab PR 215: the number from `common::bpf_cmd`).
+const MAP_FREEZE: libc::c_long = common::bpf_cmd::BPF_MAP_FREEZE as libc::c_long;
 
 /// External audit EBPF-004: once armed, `BTF_OFFSETS` is frozen — no
 /// process, root included, can write it again (`BPF_MAP_FREEZE`); the
@@ -956,7 +956,7 @@ pub fn freeze_btf_offsets(ebpf: &aya::Ebpf) -> anyhow::Result<()> {
     let rc = unsafe {
         libc::syscall(
             libc::SYS_bpf,
-            BPF_MAP_FREEZE_CMD,
+            MAP_FREEZE,
             &attr as *const FreezeAttr as *const libc::c_void,
             std::mem::size_of::<FreezeAttr>() as u32,
         )
@@ -2080,6 +2080,20 @@ mod tests {
             self.plain(None, KIND_PTR, to)
         }
 
+        /// A 32-bit `enum name { (enumerator, value)… }`.
+        fn enumeration(&mut self, name: &str, values: &[(&str, i32)]) -> u32 {
+            let n = self.str(name);
+            let named: Vec<(u32, i32)> = values.iter().map(|(v, x)| (self.str(v), *x)).collect();
+            self.push_common(n, KIND_ENUM, named.len() as u32, false, 4);
+            for (vn, x) in named {
+                self.types.extend_from_slice(&vn.to_le_bytes());
+                self.types.extend_from_slice(&x.to_le_bytes());
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
         /// `name(params…)` returning `ret`: a FUNC_PROTO and its FUNC.
         fn func(&mut self, name: &str, ret: u32, params: &[u32]) -> u32 {
             self.push_common(0, KIND_FUNC_PROTO, params.len() as u32, false, ret);
@@ -2961,5 +2975,73 @@ mod tests {
             HOOK_ARG_CHECKS.len()
         );
         assert!(checked > 0);
+    }
+
+    // ── Lab PR 215: the bpf_cmd numbers against the kernel's BTF ──────
+
+    /// Our values that `enum bpf_cmd` in `btf` gives otherwise, or does
+    /// not have: `(name, ours, the kernel's)`.
+    fn bpf_cmd_mismatches(
+        btf: &Btf,
+        ours: &[(&'static str, u32)],
+    ) -> Vec<(&'static str, u32, Option<i32>)> {
+        ours.iter()
+            .filter_map(|(name, value)| {
+                let theirs = btf.resolve_enum("bpf_cmd", name).ok();
+                (theirs != i32::try_from(*value).ok()).then_some((*name, *value, theirs))
+            })
+            .collect()
+    }
+
+    /// The check reads the kernel's enumerators and names a drift: the
+    /// value lab PR 215 fixed (31 for `BPF_LINK_GET_FD_BY_ID`) fails here.
+    #[test]
+    fn a_bpf_cmd_number_that_drifts_from_the_btf_is_named() {
+        let mut b = BtfBuilder::new();
+        b.enumeration(
+            "bpf_cmd",
+            &[
+                ("BPF_PROG_TEST_RUN", 10),
+                ("BPF_PROG_RUN", 10),
+                ("BPF_LINK_GET_FD_BY_ID", 30),
+                ("BPF_LINK_GET_NEXT_ID", 31),
+            ],
+        );
+        let btf = Btf::parse(&b.build()).expect("fixture parses");
+        assert!(bpf_cmd_mismatches(&btf, &[("BPF_LINK_GET_FD_BY_ID", 30)]).is_empty());
+        assert_eq!(
+            bpf_cmd_mismatches(
+                &btf,
+                &[("BPF_LINK_GET_FD_BY_ID", 31), ("BPF_LINK_GET_NEXT_ID", 31)]
+            ),
+            vec![("BPF_LINK_GET_FD_BY_ID", 31, Some(30))]
+        );
+        assert_eq!(
+            bpf_cmd_mismatches(&btf, &[("BPF_LINK_DETACH", 34)]),
+            vec![("BPF_LINK_DETACH", 34, None)]
+        );
+    }
+
+    /// Lab PR 215: every bpf_cmd number the tree uses (`common::bpf_cmd`,
+    /// the one copy) is the running kernel's, read from `enum bpf_cmd` in
+    /// its BTF. Skipped on a host without BTF; the uapi header check in
+    /// `common` runs everywhere.
+    #[test]
+    fn bpf_cmd_numbers_match_the_running_kernels_btf() {
+        let Ok(data) = fs::read(VMLINUX_BTF) else {
+            eprintln!("no {VMLINUX_BTF}: skipped");
+            return;
+        };
+        let btf = Btf::parse(&data).expect("host BTF parses");
+        let wrong = bpf_cmd_mismatches(&btf, &common::bpf_cmd::UAPI);
+        assert!(
+            wrong.is_empty(),
+            "bpf_cmd numbers that differ from the running kernel's BTF (name, ours, the \
+             kernel's): {wrong:?}"
+        );
+        eprintln!(
+            "{} bpf_cmd numbers checked against {VMLINUX_BTF}",
+            common::bpf_cmd::UAPI.len()
+        );
     }
 }

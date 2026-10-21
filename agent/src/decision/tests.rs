@@ -530,7 +530,7 @@ fn io_uring_and_bpf_events_reach_their_rules_in_both_engines() {
         arg,
         timestamp_ns: 1,
     };
-    const BPF_PROG_LOAD: u32 = 5;
+    use common::bpf_cmd::BPF_PROG_LOAD;
     let (_tmp, lineage) = lineage_of(&[(4242, "/tmp/.x/loader"), (4343, "/tmp/.x/loader")]);
     for (name, engine) in [
         ("default_rules", RuleEngine::with_default_rules()),

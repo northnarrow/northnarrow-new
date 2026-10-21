@@ -700,6 +700,19 @@ valid_pid() {
     [[ "$(cat "/proc/$1/comm" 2>/dev/null)" == "$2" ]]
 }
 proc_start() { nnpy ident "${1:-0}" 2>/dev/null | cut -d' ' -f1; }
+# own_link_ids <link probe output> (lab PR 215): the ids of its "own links:
+# <id> …" line, each a decimal above 0; nothing (status 1) for any other
+# output, or one token that is not an id.
+own_link_ids() {
+    local line id ids=()
+    line=$(grep -m1 '^own links: ' <<<"${1:-}") || return 1
+    for id in ${line#own links: }; do
+        [[ $id =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+        ids+=("$id")
+    done
+    (( ${#ids[@]} )) || return 1
+    echo "${ids[*]}"
+}
 
 # External audit LAB-003: the agent's PID from its pidfile only when it
 # names a live agent process. A stale pidfile (the watchdog recycling the
@@ -1026,6 +1039,27 @@ selftest() {
             printf "%s\n" "{\"_SYSTEMD_UNIT\":\"northnarrow-watchdog.service\",\"_TRANSPORT\":\"stdout\",\"_PID\":\"$2\",\"MESSAGE\":\"2026-10-20T00:00:00.000000Z  INFO VERDICT (rule) target_filename=\\\"/tmp/watchdog: watchdog PID registered in PROTECTED_PIDS pid=4242 \\\"\"}"
         }
         ! jentry northnarrow-watchdog 4242 INFO "watchdog: watchdog PID registered in PROTECTED_PIDS pid=4242 " >/dev/null)'
+    # lab PR 215: the agent's link ids from the link probe's --own line
+    t eq "$(own_link_ids $'x\nown links: 12 40 41')" "12 40 41"
+    t eval '! own_link_ids "own links: 12 4x" >/dev/null'
+    t eval '! own_link_ids "own links: " >/dev/null'
+    t eval '! own_link_ids "own links: 0" >/dev/null'
+    t eval '! own_link_ids "setup: no OWN_BPF_IDS map readable on this host; no link id read" >/dev/null'
+    # the link probe builds and refuses what is not an id (C39, C40, C63, C64)
+    src="$(dirname "$0")/link-detach-probe.c"
+    if command -v cc >/dev/null && [[ -f "$src" ]]; then
+        local ld; ld=$(mktemp -d)
+        if cc -O2 -o "$ld/lnk" "$src" 2>"$ld/cc.log"; then
+            for p in "--handle-by-id 0" "--handle-by-id 0x1" "--next-from 1,,x" "--next-from" "--own x" "--bogus"; do
+                t eval "'$ld/lnk' $p >/dev/null 2>&1; (( \$? == 2 ))"
+            done
+            t eval "'$ld/lnk' --next-from 1,2 | grep -q '^BPF_LINK_GET_NEXT_ID after 2: '"
+            t eval "'$ld/lnk' --handle-by-id 4294967295 | grep -q '^BPF_LINK_GET_FD_BY_ID 4294967295: '"
+        else
+            t eval "false # link-detach-probe.c does not build: $(head -1 "$ld/cc.log")"
+        fi
+        rm -rf "$ld"
+    fi
     # this machine's syscall numbers exist (C17's fallback, C27)
     t eval '[[ "$(nnpy syscall-nr finit_module)" =~ ^[0-9]+$ && "$(nnpy syscall-nr kexec_file_load)" =~ ^[0-9]+$ ]]'
     # the io_uring probe builds and its tamper modes behave on scratch files
@@ -1692,7 +1726,9 @@ elif [[ -f "$PBF_SRC" ]] && mkdir -p "$(dirname "$PBF_LIB")" && cc -shared -fPIC
     run_case C37 "a second watchdog binary, preloaded: handle on link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_TARGET="$PINS/link_task_kill" "$WATCHDOG_BIN" --version
     # External audit ATP-013: the twelve ring buffers and RING_DROPS left
     # the eBPF object before the guard listed the agent's maps; by id, a
-    # foreign root process got a writable handle on each.
+    # foreign root process got a writable handle on each. Lab PR 215: the
+    # deny hooks' fail-open counters (DENY_FAIL_OPEN) leave it the same way
+    # and are asked for too: zeroing them would hide a fail-open.
     run_case C43 "a foreign root process: write handles on the agent's ring buffers, by id" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_map" 0 -- env LD_PRELOAD="$PBF_LIB" NNX_RINGS=1 /bin/true
 else
     skipped_case C34,C35,C36,C37,C43 "cannot build the probe library: $(head -1 "$TMPD/pbf-cc.log" 2>/dev/null)" 0
@@ -1741,9 +1777,15 @@ fi
 # EINVAL in observe mode).
 LNK_SRC="$(dirname "$0")/link-detach-probe.c"
 LNK_BIN=/usr/local/libexec/nn-lab/nn-link-probe
-if ! selected_any C39,C40; then
+LNK_BUILT=0
+if ! selected_any C39,C40,C63,C64; then
     :
 elif [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_BIN" "$LNK_SRC" 2>"$TMPD/lnk-cc.log"; then
+    LNK_BUILT=1
+else
+    skipped_case C39,C40,C63,C64 "cannot build the link probe: $(head -1 "$TMPD/lnk-cc.log" 2>/dev/null)" 0
+fi
+if (( LNK_BUILT )) && selected_any C39,C40; then
     long="$PINS/"
     while (( ${#long} < 280 )); do long+="./"; done
     long+="link_task_kill"
@@ -1751,8 +1793,35 @@ elif [[ -f "$LNK_SRC" ]] && mkdir -p "$(dirname "$LNK_BIN")" && cc -O2 -o "$LNK_
     ln -sfn "$PINS/link_task_kill" "$TMPD/link-alias"
     run_case C40 "link detach/update through a symlink to link_task_kill" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- "$LNK_BIN" "$TMPD/link-alias"
     rm -f "$TMPD/link-alias"
-else
-    skipped_case C39,C40 "cannot build the link probe: $(head -1 "$TMPD/lnk-cc.log" 2>/dev/null)" 0
+fi
+# Lab PR 215: the agent's links by id. The `bpf` hook's own copy of the
+# command numbers had BPF_LINK_GET_FD_BY_ID = 31, which is
+# BPF_LINK_GET_NEXT_ID in the uapi: a handle by id on one of the agent's
+# links (`bpftool link show id N`, the first step of `bpftool link detach id
+# N`) was granted and left no record, while the enumeration step `bpftool
+# link list` takes before each entry (LINK_GET_NEXT_ID) was refused from one
+# of the agent's link ids and recorded as an anti-tamper denial (COMBAT).
+# C64: the enumeration from each of the agent's link ids, and a walk of
+# every link id from 0, are let through and leave no record. C63: the
+# handle by id is refused and recorded (observe mode: granted and recorded,
+# NN-L-BPF-002). `bpftool link list` as a whole still takes a handle by id
+# on each link it prints, so in enforce mode it stops at the first
+# NorthNarrow link with a recorded denial, like `bpftool map show` (the
+# documented trade-off); C64 checks the enumeration alone. The ids come from
+# the agent's OWN_BPF_IDS map through read-only map handles (the probe's
+# --own: the guard refuses write handles only), which the observer records
+# as NN-L-BPF-002 before the cases; C64 runs first, after a pause, so no
+# record of the setup or of C63 lands in its window.
+if (( LNK_BUILT )) && selected_any C63,C64; then
+    OWN_OUT=$("$LNK_BIN" --own 2>&1)
+    if OWN_LINKS=$(own_link_ids "$OWN_OUT"); then
+        sleep 5
+        EV_FORBID="deny=bpf_link|NN-L-BPF-002" \
+        run_case C64 "enumerate the links from each of the agent's link ids (LINK_GET_NEXT_ID, bpftool link list's step)" allowed "" 0 -- "$LNK_BIN" --next-from "${OWN_LINKS// /,}"
+        run_case C63 "link handle by id on the agent's link ${OWN_LINKS%% *} (bpftool link show id)" "$BPF_EXPECT" "NN-L-BPF-002|deny=bpf_link" 0 -- bpftool link show id "${OWN_LINKS%% *}"
+    else
+        skipped_case C63,C64 "the agent's link ids could not be read: $(head -1 <<<"$OWN_OUT" | cut -c1-100)" 0
+    fi
 fi
 
 # External audit EVD-001: the agent's private signing key — every evidence

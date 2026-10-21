@@ -198,6 +198,8 @@ impl SensorMultiplexer {
             debug!(?e, "aya-log not initialised (no logger map exported)");
         }
         crate::sensors::ring_drops::install(&mut ebpf);
+        // Lab PR 215: the deny hooks' fail-open counters.
+        crate::anti_tamper::fail_open::install(&mut ebpf);
         // Lab PR 164: FLOW_SOCK_MAP's occupancy for `nn-admin net status`.
         crate::sensors::flow_sock::install(&mut ebpf);
 

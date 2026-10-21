@@ -2248,6 +2248,7 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.combat_evidence_unrecorded.is_none()
         && out.net_dot_rows_total.is_none()
         && out.net_quic_rows_total.is_none()
+        && out.deny_fail_open_total.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2447,6 +2448,30 @@ fn combat_evidence_line(out: &StatusOutcome, tty: bool) -> String {
     }
 }
 
+/// Lab PR 215: operations the anti-tamper deny hooks let through
+/// undecided (a kernel read a hook needed failed), for `status`.
+fn deny_fail_open_line(out: &StatusOutcome, tty: bool) -> String {
+    match out.deny_fail_open_total {
+        None => "deny fail-open    : (not counted: the agent reads no DENY_FAIL_OPEN counters)"
+            .to_string(),
+        Some(0) => format!("deny fail-open    : {}", colorize("0", "32", tty)),
+        Some(t) => {
+            let per: Vec<String> = out
+                .deny_fail_open
+                .iter()
+                .map(|(n, c)| format!("{n} {c}"))
+                .collect();
+            format!(
+                "deny fail-open    : {} ({}) — operations a deny hook let through undecided \
+                 since boot (a kernel read it needed failed); see the agent WARNs and the signed \
+                 deny_fail_open entries",
+                colorize(&t.to_string(), "31", tty),
+                per.join(", ")
+            )
+        }
+    }
+}
+
 fn print_status(out: &StatusOutcome, json: bool) {
     if json {
         // Hand-rolled JSON to avoid a serde_json dep at the binary
@@ -2461,9 +2486,14 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .iter()
             .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
             .collect();
+        let fail_open: Vec<String> = out
+            .deny_fail_open
+            .iter()
+            .map(|(n, c)| format!("\"{}\":{c}", n.replace('"', "")))
+            .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             match out.last_admin_action_secs_ago {
@@ -2495,6 +2525,9 @@ fn print_status(out: &StatusOutcome, json: bool) {
             opt(out.combat_evidence_unrecorded),
             opt(out.combat_evidence_pending),
             opt(out.combat_evidence_dropped),
+            // Lab PR 215.
+            opt(out.deny_fail_open_total),
+            fail_open.join(","),
             out.telemetry_signed,
         );
         return;
@@ -2537,7 +2570,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
             "{}",
             withheld_line(
                 "telemetry         ",
-                "response mode, COMBAT evidence, ring drops and rejected records",
+                "response mode, COMBAT evidence, ring drops and rejected records, deny \
+                 fail-opens",
                 "status"
             )
         );
@@ -2576,6 +2610,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             );
         }
     }
+    println!("{}", deny_fail_open_line(out, tty));
 }
 
 fn print_verify_keys(out: &VerifyKeysOutcome) -> ExitCode {
@@ -3956,8 +3991,8 @@ mod quorum_help_tests {
 #[cfg(test)]
 mod flow_sock_line_tests {
     use super::{
-        combat_evidence_line, encrypted_flow_lines, flow_sock_line, response_mode_line,
-        telemetry_withheld, withheld_line,
+        combat_evidence_line, deny_fail_open_line, encrypted_flow_lines, flow_sock_line,
+        response_mode_line, telemetry_withheld, withheld_line,
     };
     use northnarrow_agent::admin_cli::StatusOutcome;
 
@@ -3990,8 +4025,35 @@ mod flow_sock_line_tests {
             net_dot_rows_total: None,
             net_dot_rows_resolver: None,
             net_quic_rows_total: None,
+            deny_fail_open_total: None,
+            deny_fail_open: Vec::new(),
             telemetry_signed: true,
         }
+    }
+
+    /// Lab PR 215: `status` reports the operations the deny hooks let
+    /// through undecided, per hook, and says when the agent counts none.
+    #[test]
+    fn status_reports_the_deny_fail_opens() {
+        let mut o = outcome(None, None, None);
+        assert!(
+            deny_fail_open_line(&o, false).contains("not counted"),
+            "{}",
+            deny_fail_open_line(&o, false)
+        );
+        o.deny_fail_open_total = Some(0);
+        assert_eq!(deny_fail_open_line(&o, false), "deny fail-open    : 0");
+        o.deny_fail_open_total = Some(3);
+        o.deny_fail_open = vec![("file_open".to_string(), 2), ("bpf".to_string(), 1)];
+        let l = deny_fail_open_line(&o, false);
+        assert!(
+            l.starts_with("deny fail-open    : 3 (file_open 2, bpf 1) — operations a deny hook")
+                && l.contains("deny_fail_open entries"),
+            "{l}"
+        );
+        // the unsigned reply of an agent older than lab PR 213 fills it in
+        o.telemetry_signed = false;
+        assert!(!telemetry_withheld(&o));
     }
 
     /// External audit ASK-009 (lab PR 213): an unsigned reply of this agent

@@ -10,9 +10,10 @@
  *   NNX_SLEEP=<seconds>    instead: stay alive that long, so the case can
  *                          try ptrace on a process running the binary
  *   NNX_RINGS=1            instead (tamper-check C43, external audit
- *                          ATP-013): find the agent's ring buffers and
- *                          RING_DROPS by name among every map of the host
- *                          and ask for a read-write handle on each by id
+ *                          ATP-013): find the agent's ring buffers,
+ *                          RING_DROPS and (lab PR 215) DENY_FAIL_OPEN by
+ *                          name among every map of the host and ask for a
+ *                          read-write handle on each by id
  *
  * Output: "granted" or the errno text ("Operation not permitted" is what
  * the check reads as a refusal).
@@ -27,13 +28,13 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-/* The agent's ring buffers and its drop counters (kernel names are cut at
- * 15 bytes). */
+/* The agent's ring buffers, its drop counters and (lab PR 215) its deny
+ * hooks' fail-open counters (kernel names are cut at 15 bytes). */
 static const char *const RINGS[] = {
     "NET_FLOW_CLOSE_EVENTS", "NET_LISTEN_EVENTS", "NET_UDP_EVENTS", "EVENTS",
     "FILE_OPEN_EVENTS", "EXEC_CHECK_EVENTS", "TCP_CONNECT_EVENTS",
     "DNS_QUERY_EVENTS", "FS_PROTECT_EVENTS", "MODULE_LOAD_EVENTS",
-    "IOURING_EVENTS", "BPF_SYSCALL_EVENTS", "RING_DROPS", NULL,
+    "IOURING_EVENTS", "BPF_SYSCALL_EVENTS", "RING_DROPS", "DENY_FAIL_OPEN", NULL,
 };
 
 static int is_ring(const char *name)

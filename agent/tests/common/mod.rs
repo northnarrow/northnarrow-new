@@ -1215,3 +1215,135 @@ pub fn strip_ansi(s: &str) -> String {
     }
     out
 }
+
+/// Lab PR 215: raw `bpf(2)` calls for the link checks of the enforce-mode
+/// guard test. The command numbers are `common::bpf_cmd`'s, the one copy
+/// the hooks compile; the `bpf_attr` fields are placed by hand in a zeroed
+/// buffer (the kernel reads the union's first bytes and zero-fills the
+/// rest of a shorter `size`).
+pub mod raw_bpf {
+    use ::common::bpf_cmd::{
+        BPF_LINK_GET_FD_BY_ID, BPF_LINK_GET_NEXT_ID, BPF_MAP_GET_FD_BY_ID, BPF_MAP_GET_NEXT_ID,
+        BPF_MAP_GET_NEXT_KEY, BPF_OBJ_GET_INFO_BY_FD,
+    };
+
+    /// uapi `BPF_F_RDONLY` (`open_flags` of `*_GET_FD_BY_ID`): a read-only
+    /// map handle, which the BPF guard does not refuse.
+    const BPF_F_RDONLY: u32 = 1 << 3;
+    /// Kind 3 (link) in `OWN_BPF_IDS` keys, `(kind << 32) | id`.
+    const OWN_KIND_LINK: u64 = 3;
+
+    /// A `union bpf_attr` as 32 words.
+    type Attr = [u32; 32];
+
+    fn set_ptr(attr: &mut Attr, word: usize, ptr: u64) {
+        attr[word] = ptr as u32;
+        attr[word + 1] = (ptr >> 32) as u32;
+    }
+
+    /// The return value, or the errno.
+    fn sys_bpf(cmd: u32, attr: &mut Attr) -> Result<i64, i32> {
+        // SAFETY: `attr` is a valid, initialised buffer of the size passed;
+        // the pointers it carries (if any) point at live locals of the
+        // caller for the duration of the call.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                cmd as libc::c_long,
+                attr.as_mut_ptr() as *mut libc::c_void,
+                std::mem::size_of::<Attr>() as u32,
+            )
+        };
+        if r < 0 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        } else {
+            Ok(r)
+        }
+    }
+
+    fn close(fd: i64) {
+        // SAFETY: a descriptor this module opened and owns.
+        unsafe { libc::close(fd as i32) };
+    }
+
+    /// The agent's link ids: the keys of kind 3 in every map named
+    /// `OWN_BPF_IDS`, read through read-only handles (no link handle).
+    pub fn own_link_ids() -> Result<Vec<u32>, String> {
+        let mut ids = Vec::new();
+        let mut maps = 0;
+        let mut id = 0u32;
+        loop {
+            let mut a: Attr = [0; 32];
+            a[0] = id;
+            match sys_bpf(BPF_MAP_GET_NEXT_ID, &mut a) {
+                Ok(_) => id = a[1],
+                Err(libc::ENOENT) => break,
+                Err(e) => return Err(format!("BPF_MAP_GET_NEXT_ID after {id}: errno {e}")),
+            }
+            let mut a: Attr = [0; 32];
+            a[0] = id;
+            a[2] = BPF_F_RDONLY;
+            let Ok(fd) = sys_bpf(BPF_MAP_GET_FD_BY_ID, &mut a) else {
+                continue;
+            };
+            // struct bpf_map_info: type, id, key_size, value_size,
+            // max_entries, map_flags, then name[16] at byte 24.
+            let mut info = [0u8; 128];
+            let mut a: Attr = [0; 32];
+            a[0] = fd as u32;
+            a[1] = info.len() as u32;
+            set_ptr(&mut a, 2, info.as_mut_ptr() as u64);
+            let named = sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &mut a).is_ok()
+                && info[8..12] == 8u32.to_le_bytes()
+                && info[24..36] == *b"OWN_BPF_IDS\0";
+            if named {
+                maps += 1;
+                let mut key = 0u64;
+                let mut next = 0u64;
+                let mut first = true;
+                loop {
+                    let mut a: Attr = [0; 32];
+                    a[0] = fd as u32;
+                    if !first {
+                        set_ptr(&mut a, 2, &mut key as *mut u64 as u64);
+                    }
+                    set_ptr(&mut a, 4, &mut next as *mut u64 as u64);
+                    if sys_bpf(BPF_MAP_GET_NEXT_KEY, &mut a).is_err() {
+                        break;
+                    }
+                    first = false;
+                    key = next;
+                    if key >> 32 == OWN_KIND_LINK && !ids.contains(&(key as u32)) {
+                        ids.push(key as u32);
+                    }
+                }
+            }
+            close(fd);
+        }
+        if maps == 0 {
+            return Err("no OWN_BPF_IDS map readable".to_string());
+        }
+        if ids.is_empty() {
+            return Err(format!("OWN_BPF_IDS ({maps} map(s)) lists no link"));
+        }
+        Ok(ids)
+    }
+
+    /// `BPF_LINK_GET_FD_BY_ID` on `id` (a granted handle is closed at once).
+    pub fn link_fd_by_id(id: u32) -> Result<(), i32> {
+        let mut a: Attr = [0; 32];
+        a[0] = id;
+        sys_bpf(BPF_LINK_GET_FD_BY_ID, &mut a).map(close)
+    }
+
+    /// `BPF_LINK_GET_NEXT_ID` from `start`: the next id, `None` at the end.
+    pub fn link_next_id(start: u32) -> Result<Option<u32>, i32> {
+        let mut a: Attr = [0; 32];
+        a[0] = start;
+        match sys_bpf(BPF_LINK_GET_NEXT_ID, &mut a) {
+            Ok(_) => Ok(Some(a[1])),
+            Err(libc::ENOENT) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}

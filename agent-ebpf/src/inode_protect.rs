@@ -49,6 +49,7 @@ use aya_ebpf::{
 // whole host, and the kernel's "trace_printk() being used" banner on every
 // agent host. Do not put printk back in a hot hook; count in a map instead.
 
+use northnarrow_common::fail_open::hook;
 use northnarrow_common::wire::{
     fs_protect_required, FsGrant, FsProtectDenialRaw, InodeKey, FS_OP_CREATE, FS_OP_IOCTL,
     FS_OP_LINK, FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
@@ -150,26 +151,46 @@ pub static FS_PROTECT_EVENTS: RingBuf = RingBuf::with_byte_size(64 * 1024, 0);
 // Helpers — common pointer-chase logic for every hook.
 // ---------------------------------------------------------------------------
 
-/// Dereference a `*dentry` and return its `d_inode` pointer.
+/// Dereference a `*dentry` and return its `d_inode` pointer. `None` for a
+/// negative dentry (no inode: the new name of a rename, say), and for a
+/// read that failed, which is a fail-open of `hook` (lab PR 215: counted
+/// in `DENY_FAIL_OPEN`).
 #[inline(always)]
-unsafe fn inode_from_dentry(dentry: *const c_void) -> Option<*const c_void> {
+unsafe fn inode_from_dentry(dentry: *const c_void, hook: u32) -> Option<*const c_void> {
     if dentry.is_null() {
         return None;
     }
     let slot = (dentry as *const u8).add(off!(DENTRY_D_INODE_OFFSET)) as *const *const c_void;
     match bpf_probe_read_kernel::<*const c_void>(slot) {
         Ok(p) if !p.is_null() => Some(p),
-        _ => None,
+        Ok(_) => None,
+        Err(_) => {
+            crate::fail_open::bump(hook);
+            None
+        }
     }
 }
 
 /// Read `(device, inode->i_ino)` for the given inode, the device as
-/// `stat(2)` reports it ([`crate::inode_dev::stat_dev`], review 55).
+/// `stat(2)` reports it ([`crate::inode_dev::stat_dev`], review 55). A
+/// read that fails is a fail-open of `hook` (lab PR 215): the caller lets
+/// the operation through without knowing whether the inode is protected.
 #[inline(always)]
-unsafe fn inode_key(inode: *const c_void) -> Option<InodeKey> {
+unsafe fn inode_key(inode: *const c_void, hook: u32) -> Option<InodeKey> {
     if inode.is_null() {
         return None;
     }
+    let key = read_inode_key(inode);
+    if key.is_none() {
+        crate::fail_open::bump(hook);
+    }
+    key
+}
+
+/// [`inode_key`]'s reads: `None` when one fails (or the inode has no
+/// superblock, which no live inode lacks).
+#[inline(always)]
+unsafe fn read_inode_key(inode: *const c_void) -> Option<InodeKey> {
     let sb_slot = (inode as *const u8).add(off!(INODE_I_SB_OFFSET)) as *const *const c_void;
     let sb_ptr = bpf_probe_read_kernel::<*const c_void>(sb_slot).ok()?;
     if sb_ptr.is_null() {
@@ -321,10 +342,11 @@ fn emit_denial(operation: u8, key: InodeKey) {
 
 /// Standard "should we deny?" decision used by every hook once it
 /// has the target inode key. Returns `true` if the operation must
-/// be blocked; emits the audit record as a side effect.
+/// be blocked; emits the audit record as a side effect. `hook` is the
+/// caller's `DENY_FAIL_OPEN` slot (lab PR 215).
 #[inline(always)]
-unsafe fn deny_if_protected(operation: u8, target: *const c_void) -> bool {
-    let key = match inode_key(target) {
+unsafe fn deny_if_protected(operation: u8, target: *const c_void, hook: u32) -> bool {
+    let key = match inode_key(target, hook) {
         Some(k) => k,
         None => {
             return false;
@@ -388,12 +410,12 @@ unsafe fn try_inode_unlink(ctx: &LsmContext) -> i32 {
     // protected set — that covers both "rm somefile inside dir" and
     // "rm /the/protected/file".
     let parent: *const c_void = ctx.arg(0);
-    if deny_if_protected(FS_OP_UNLINK, parent) {
+    if deny_if_protected(FS_OP_UNLINK, parent, hook::INODE_UNLINK) {
         return -EPERM;
     }
     let dentry: *const c_void = ctx.arg(1);
-    if let Some(target_inode) = inode_from_dentry(dentry) {
-        if deny_if_protected(FS_OP_UNLINK, target_inode) {
+    if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_UNLINK) {
+        if deny_if_protected(FS_OP_UNLINK, target_inode, hook::INODE_UNLINK) {
             return -EPERM;
         }
     }
@@ -409,12 +431,12 @@ pub fn inode_rmdir(ctx: LsmContext) -> i32 {
 unsafe fn try_inode_rmdir(ctx: &LsmContext) -> i32 {
     // No prev-retval read — see task_kill.rs.
     let parent: *const c_void = ctx.arg(0);
-    if deny_if_protected(FS_OP_RMDIR, parent) {
+    if deny_if_protected(FS_OP_RMDIR, parent, hook::INODE_RMDIR) {
         return -EPERM;
     }
     let dentry: *const c_void = ctx.arg(1);
-    if let Some(target_inode) = inode_from_dentry(dentry) {
-        if deny_if_protected(FS_OP_RMDIR, target_inode) {
+    if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_RMDIR) {
+        if deny_if_protected(FS_OP_RMDIR, target_inode, hook::INODE_RMDIR) {
             return -EPERM;
         }
     }
@@ -432,23 +454,23 @@ unsafe fn try_inode_rename(ctx: &LsmContext) -> i32 {
     // No prev-retval read — see task_kill.rs for rationale.
 
     let old_dir: *const c_void = ctx.arg(0);
-    if deny_if_protected(FS_OP_RENAME, old_dir) {
+    if deny_if_protected(FS_OP_RENAME, old_dir, hook::INODE_RENAME) {
         return -EPERM;
     }
     let new_dir: *const c_void = ctx.arg(2);
-    if deny_if_protected(FS_OP_RENAME, new_dir) {
+    if deny_if_protected(FS_OP_RENAME, new_dir, hook::INODE_RENAME) {
         return -EPERM;
     }
 
     let old_dentry: *const c_void = ctx.arg(1);
-    if let Some(old_inode) = inode_from_dentry(old_dentry) {
-        if deny_if_protected(FS_OP_RENAME, old_inode) {
+    if let Some(old_inode) = inode_from_dentry(old_dentry, hook::INODE_RENAME) {
+        if deny_if_protected(FS_OP_RENAME, old_inode, hook::INODE_RENAME) {
             return -EPERM;
         }
     }
     let new_dentry: *const c_void = ctx.arg(3);
-    if let Some(new_inode) = inode_from_dentry(new_dentry) {
-        if deny_if_protected(FS_OP_RENAME, new_inode) {
+    if let Some(new_inode) = inode_from_dentry(new_dentry, hook::INODE_RENAME) {
+        if deny_if_protected(FS_OP_RENAME, new_inode, hook::INODE_RENAME) {
             return -EPERM;
         }
     }
@@ -470,10 +492,15 @@ unsafe fn try_inode_setattr(ctx: &LsmContext) -> i32 {
     // task_kill.rs.
     let dentry = match setattr_dentry(ctx) {
         Some(d) => d,
-        None => return 0,
+        None => {
+            // Lab PR 215: the dentry's position is not known here (the
+            // agent attaches the hook only once it is) or its read failed.
+            crate::fail_open::bump(hook::INODE_SETATTR);
+            return 0;
+        }
     };
-    if let Some(target_inode) = inode_from_dentry(dentry) {
-        if deny_if_protected(FS_OP_SETATTR, target_inode) {
+    if let Some(target_inode) = inode_from_dentry(dentry, hook::INODE_SETATTR) {
+        if deny_if_protected(FS_OP_SETATTR, target_inode, hook::INODE_SETATTR) {
             return -EPERM;
         }
     }
@@ -501,7 +528,7 @@ pub(crate) unsafe fn setattr_dentry(ctx: &LsmContext) -> Option<*const c_void> {
 
 #[lsm(hook = "file_ioctl")]
 pub fn file_ioctl(ctx: LsmContext) -> i32 {
-    unsafe { try_file_ioctl(&ctx) }
+    unsafe { try_file_ioctl(&ctx, hook::FILE_IOCTL) }
 }
 
 /// Lab PR 174: the `ioctl(2)` of a 32-bit process. Since upstream commit
@@ -517,12 +544,13 @@ pub fn file_ioctl(ctx: LsmContext) -> i32 {
 /// through `file_ioctl`.
 #[lsm(hook = "file_ioctl_compat")]
 pub fn protected_ioctl_compat_deny(ctx: LsmContext) -> i32 {
-    unsafe { try_file_ioctl(&ctx) }
+    unsafe { try_file_ioctl(&ctx, hook::FILE_IOCTL_COMPAT) }
 }
 
-/// The chattr-family deny of `file_ioctl` and `file_ioctl_compat`.
+/// The chattr-family deny of `file_ioctl` and `file_ioctl_compat` (`hook`:
+/// the caller's `DENY_FAIL_OPEN` slot).
 #[inline(always)]
-unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
+unsafe fn try_file_ioctl(ctx: &LsmContext, hook: u32) -> i32 {
     // Kernel signature of both hooks: (file, cmd, arg). No prev-retval
     // read — see task_kill.rs.
     //
@@ -544,10 +572,11 @@ unsafe fn try_file_ioctl(ctx: &LsmContext) -> i32 {
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) => p,
         Err(_) => {
+            crate::fail_open::bump(hook);
             return 0;
         }
     };
-    if deny_if_protected(FS_OP_IOCTL, inode) {
+    if deny_if_protected(FS_OP_IOCTL, inode, hook) {
         return -EPERM;
     }
     0
@@ -593,21 +622,27 @@ unsafe fn try_protected_open_deny(ctx: &LsmContext) -> i32 {
     let mode_slot = (file as *const u8).add(off!(FILE_F_MODE_OFFSET)) as *const u32;
     let f_mode = match bpf_probe_read_kernel::<u32>(mode_slot) {
         Ok(m) => m,
-        Err(_) => return 0,
+        Err(_) => {
+            crate::fail_open::bump(hook::FILE_OPEN);
+            return 0;
+        }
     };
 
     let inode_slot = (file as *const u8).add(off!(FILE_F_INODE_OFFSET)) as *const *const c_void;
     let inode = match bpf_probe_read_kernel::<*const c_void>(inode_slot) {
         Ok(p) => p,
-        Err(_) => return 0,
+        Err(_) => {
+            crate::fail_open::bump(hook::FILE_OPEN);
+            return 0;
+        }
     };
     if f_mode & FMODE_WRITE == 0 {
-        if read_protected_ino(inode) && deny_if_protected(FS_OP_READ, inode) {
+        if read_protected_ino(inode) && deny_if_protected(FS_OP_READ, inode, hook::FILE_OPEN) {
             return -EPERM;
         }
         return 0;
     }
-    if deny_if_protected(FS_OP_WRITE, inode) {
+    if deny_if_protected(FS_OP_WRITE, inode, hook::FILE_OPEN) {
         return -EPERM;
     }
     0
@@ -622,7 +657,11 @@ unsafe fn read_protected_ino(inode: *const c_void) -> bool {
     }
     let ino = match bpf_probe_read_kernel::<u64>((inode as *const u8).add(off!(INODE_I_INO_OFFSET)) as *const u64) {
         Ok(i) => i,
-        Err(_) => return false,
+        Err(_) => {
+            // Lab PR 215: a read-only open the key's deny could not judge.
+            crate::fail_open::bump(hook::FILE_OPEN);
+            return false;
+        }
     };
     let mut slot = 0u32;
     while slot < READ_PROTECTED_SLOTS {
@@ -661,8 +700,8 @@ unsafe fn read_protected_ino(inode: *const c_void) -> bool {
 /// (the agent's own directories only), outside the trusted-installer
 /// window, for a caller outside the agent's family.
 #[inline(always)]
-unsafe fn deny_new_entry(operation: u8, dir: *const c_void) -> i32 {
-    if deny_if_protected(operation, dir) {
+unsafe fn deny_new_entry(operation: u8, dir: *const c_void, hook: u32) -> i32 {
+    if deny_if_protected(operation, dir, hook) {
         -EPERM
     } else {
         0
@@ -673,26 +712,26 @@ unsafe fn deny_new_entry(operation: u8, dir: *const c_void) -> i32 {
 /// (`vfs_mkobj`). Kernel signature: `(dir, dentry, mode)`.
 #[lsm(hook = "inode_create")]
 pub fn protected_create_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_CREATE, ctx.arg(0)) }
+    unsafe { deny_new_entry(FS_OP_CREATE, ctx.arg(0), hook::INODE_CREATE) }
 }
 
 /// Kernel signature: `(dir, dentry, mode)`.
 #[lsm(hook = "inode_mkdir")]
 pub fn protected_mkdir_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_MKDIR, ctx.arg(0)) }
+    unsafe { deny_new_entry(FS_OP_MKDIR, ctx.arg(0), hook::INODE_MKDIR) }
 }
 
 /// A device node, FIFO or socket. Kernel signature: `(dir, dentry, mode,
 /// dev)`.
 #[lsm(hook = "inode_mknod")]
 pub fn protected_mknod_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_MKNOD, ctx.arg(0)) }
+    unsafe { deny_new_entry(FS_OP_MKNOD, ctx.arg(0), hook::INODE_MKNOD) }
 }
 
 /// Kernel signature: `(dir, dentry, old_name)`.
 #[lsm(hook = "inode_symlink")]
 pub fn protected_symlink_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_SYMLINK, ctx.arg(0)) }
+    unsafe { deny_new_entry(FS_OP_SYMLINK, ctx.arg(0), hook::INODE_SYMLINK) }
 }
 
 /// A hard link made in a NOCREATE directory — also the way an `O_TMPFILE`
@@ -703,7 +742,7 @@ pub fn protected_symlink_deny(ctx: LsmContext) -> i32 {
 /// backup's or a deduplicator's link into a COMBAT trigger.
 #[lsm(hook = "inode_link")]
 pub fn protected_link_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_new_entry(FS_OP_LINK, ctx.arg(1)) }
+    unsafe { deny_new_entry(FS_OP_LINK, ctx.arg(1), hook::INODE_LINK) }
 }
 
 /// `security.selinux` with its terminator, as the three words a
@@ -744,22 +783,31 @@ unsafe fn xattr_is_selinux(name: u64) -> bool {
 /// An extended attribute set, removed or (6.2+) an ACL changed on a
 /// protected inode: the dentry is argument `dentry_arg`, the attribute
 /// name the next one. `None` (the position was not resolved): nothing is
-/// read.
+/// read. Lab PR 215: that, and a dentry that could not be read, are
+/// fail-opens of `hook` (the agent attaches the hook only once the
+/// position is known, and these hooks always get a dentry).
 #[inline(always)]
-unsafe fn deny_xattr(ctx: &LsmContext, dentry_arg: Option<usize>) -> i32 {
+unsafe fn deny_xattr(ctx: &LsmContext, dentry_arg: Option<usize>, hook: u32) -> i32 {
     let i = match dentry_arg {
         Some(i) => i,
-        None => return 0,
+        None => {
+            crate::fail_open::bump(hook);
+            return 0;
+        }
     };
     let dentry = raw_arg(ctx, i) as *const c_void;
-    let inode = match inode_from_dentry(dentry) {
+    if dentry.is_null() {
+        crate::fail_open::bump(hook);
+        return 0;
+    }
+    let inode = match inode_from_dentry(dentry, hook) {
         Some(i) => i,
         None => return 0,
     };
     if xattr_is_selinux(raw_arg(ctx, i + 1)) {
         return 0;
     }
-    if deny_if_protected(FS_OP_XATTR, inode) {
+    if deny_if_protected(FS_OP_XATTR, inode, hook) {
         return -EPERM;
     }
     0
@@ -775,6 +823,7 @@ pub fn protected_setxattr_deny(ctx: LsmContext) -> i32 {
         deny_xattr(
             &ctx,
             crate::btf_offsets::hook_arg(INODE_SETXATTR_DENTRY_ARG_SLOT),
+            hook::INODE_SETXATTR,
         )
     }
 }
@@ -787,6 +836,7 @@ pub fn protected_removexattr_deny(ctx: LsmContext) -> i32 {
         deny_xattr(
             &ctx,
             crate::btf_offsets::hook_arg(INODE_REMOVEXATTR_DENTRY_ARG_SLOT),
+            hook::INODE_REMOVEXATTR,
         )
     }
 }
@@ -796,11 +846,11 @@ pub fn protected_removexattr_deny(ctx: LsmContext) -> i32 {
 /// (checked at boot). Attached only where the kernel has the hook.
 #[lsm(hook = "inode_set_acl")]
 pub fn protected_set_acl_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_xattr(&ctx, Some(1)) }
+    unsafe { deny_xattr(&ctx, Some(1), hook::INODE_SET_ACL) }
 }
 
 /// 6.2+. Kernel signature: `(idmap, dentry, acl_name)`.
 #[lsm(hook = "inode_remove_acl")]
 pub fn protected_remove_acl_deny(ctx: LsmContext) -> i32 {
-    unsafe { deny_xattr(&ctx, Some(1)) }
+    unsafe { deny_xattr(&ctx, Some(1), hook::INODE_REMOVE_ACL) }
 }

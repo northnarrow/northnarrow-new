@@ -149,6 +149,11 @@ pub struct StatusOutcome {
     pub net_dot_rows_total: Option<u64>,
     pub net_dot_rows_resolver: Option<u64>,
     pub net_quic_rows_total: Option<u64>,
+    /// Lab PR 215: operations the anti-tamper deny hooks let through
+    /// undecided since boot, and per hook (`None`: not counted by the
+    /// agent, or an agent older than the field).
+    pub deny_fail_open_total: Option<u64>,
+    pub deny_fail_open: Vec<(String, u64)>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -346,6 +351,8 @@ fn status_outcome(
         net_dot_rows_total: resp.net_dot_rows_total,
         net_dot_rows_resolver: resp.net_dot_rows_resolver,
         net_quic_rows_total: resp.net_quic_rows_total,
+        deny_fail_open_total: resp.deny_fail_open_total,
+        deny_fail_open: resp.deny_fail_open.unwrap_or_default(),
         telemetry_signed: signed,
     }
 }
@@ -3415,6 +3422,8 @@ mod tests {
                     net_dot_rows_total: Some(4),
                     net_dot_rows_resolver: Some(3),
                     net_quic_rows_total: Some(9),
+                    deny_fail_open_total: Some(2),
+                    deny_fail_open: Some(vec![("inode_rename".to_string(), 2)]),
                 }),
             );
         });
@@ -3454,6 +3463,9 @@ mod tests {
             ),
             (Some(4), Some(3), Some(9))
         );
+        // Lab PR 215.
+        assert_eq!(out.deny_fail_open_total, Some(2));
+        assert_eq!(out.deny_fail_open, vec![("inode_rename".to_string(), 2)]);
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);
         assert_eq!(out.last_admin_action_secs_ago, Some(123));

@@ -43,6 +43,8 @@ pub mod bpf_defense;
 /// offsets against the running kernel's BTF (refuse-to-start on drift).
 pub mod btf_revalidate;
 pub mod combat_allow;
+/// Lab PR 215: the deny hooks' fail-open counters (`DENY_FAIL_OPEN`).
+pub mod fail_open;
 pub mod filesystem;
 pub mod network_isolate;
 /// FIM-009 self-upgrade (§15.1): userland arming path for the
