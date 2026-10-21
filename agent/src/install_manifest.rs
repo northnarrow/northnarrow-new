@@ -562,4 +562,80 @@ mod tests {
         assert!(out.is_fatal(None, BootHistory::NeverVerified));
         assert!(!out.is_fatal(Some("1"), BootHistory::NeverVerified));
     }
+
+    /// Lab PR 230 (D0 of the dependency plan): SHA-256 as the boot check
+    /// computes it today, pinned before the sha2 0.11 bump. `install.sh`
+    /// records the hashes with coreutils' `sha256sum`, so these are also the
+    /// values `sha256sum` prints.
+    mod crypto_vectors {
+        use super::*;
+
+        const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        const MSG: &[u8] = b"NorthNarrow quarantine KAT v1\n";
+        const MSG_SHA256: &str = "c40f026076e81e6e596843a2720c1e41b979956ccd86188de96cfd725c4e1f0f";
+        /// One million `a` (FIPS 180-2): 15 full 64 KiB reads and a partial one.
+        const MILLION_A: &str = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0";
+
+        fn million_a() -> Vec<u8> {
+            vec![b'a'; 1_000_000]
+        }
+
+        /// Protects: the boot check hashes a binary as `install.sh` recorded it before the bump.
+        #[test]
+        fn sha256_file_is_pinned() {
+            let dir = tempfile::tempdir().unwrap();
+            for (name, bytes, want) in [
+                ("empty", &b""[..], EMPTY),
+                ("abc", &b"abc"[..], ABC),
+                ("msg", MSG, MSG_SHA256),
+                ("million", &million_a()[..], MILLION_A),
+            ] {
+                let p = write(dir.path(), name, bytes);
+                assert_eq!(sha256_file(&p).unwrap(), want, "{name}");
+            }
+        }
+
+        /// Protects: an install manifest written before the bump must verify after it.
+        #[test]
+        fn a_manifest_written_before_the_bump_verifies() {
+            let dir = tempfile::tempdir().unwrap();
+            let agent = write(dir.path(), "northnarrow-agent", b"abc");
+            write(dir.path(), "northnarrow-watchdog", b"");
+            write(dir.path(), "nn-admin", MSG);
+            write(dir.path(), "northnarrow-scan", &million_a());
+            let m = format!(
+                r#"{{
+  "version": "0.0.1",
+  "installed_at": "2026-10-21T00:00:00Z",
+  "provenance": "checksums",
+  "verify_override": null,
+  "prerequisite_overrides": [],
+  "bin_dir": "{}",
+  "files": {{
+    "northnarrow-agent": "{ABC}",
+    "northnarrow-watchdog": "{EMPTY}",
+    "nn-admin": "{MSG_SHA256}",
+    "northnarrow-scan": "{MILLION_A}",
+    "ebpf_object": "{ABC}"
+  }},
+  "tarball_sha256": null,
+  "attestation": {{"verified": false, "method": "none", "signer_workflow": "", "failure": null}}
+}}
+"#,
+                dir.path().display()
+            );
+            let mp = write(dir.path(), "install-manifest.json", m.as_bytes());
+            match check(&mp, &agent, ABC) {
+                IntegrityOutcome::Verified {
+                    provenance,
+                    checked,
+                } => {
+                    assert_eq!(provenance, "checksums");
+                    assert_eq!(checked, 5);
+                }
+                other => panic!("expected Verified, got {other:?}"),
+            }
+        }
+    }
 }

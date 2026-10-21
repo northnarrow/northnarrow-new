@@ -1207,4 +1207,85 @@ mod tests {
             validate_content(OverlayKind::ProcessCommAllowlist, "# comment\n+backupd\n").is_ok()
         );
     }
+
+    /// Lab PR 230 (D0 of the dependency plan): an overlay signed before the
+    /// ed25519-dalek 3 / sha2 0.11 bump, stored as `nn-admin config overlay
+    /// set` stores it (`agent/tests/fixtures/overlay-v1/`: the overlay, its
+    /// `.sig`, the `admin.pub` line of the seed `[0x42; 32]`). Signature
+    /// recomputed outside the repository (OpenSSL).
+    mod crypto_vectors {
+        use super::*;
+
+        const FIXTURE_PUB: &str = include_str!("../../tests/fixtures/overlay-v1/admin.pub");
+        const FIXTURE_BODY: &str =
+            include_str!("../../tests/fixtures/overlay-v1/process-comm-allowlist.local");
+        const FIXTURE_SIG: &str =
+            include_str!("../../tests/fixtures/overlay-v1/process-comm-allowlist.local.sig");
+        const SIGNED_TS: u64 = 1_792_540_800;
+        /// SHA-256 of the overlay (`+backupd\n`).
+        const BODY_SHA256: &str =
+            "19ede2fd3fc149f229d9cd15f9b1b86ee1c45885965955e2d36c6b2f62e377bc";
+        /// The first 4 bytes of the SHA-256 of the key `2152f8…db12`.
+        const KEY_FP: &str = "3097e2de";
+
+        fn fixture_dir() -> (tempfile::TempDir, PathBuf, PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir
+                .path()
+                .join(OverlayKind::ProcessCommAllowlist.file_name());
+            std::fs::write(&p, FIXTURE_BODY).unwrap();
+            std::fs::write(sig_path(&p), FIXTURE_SIG).unwrap();
+            let admin_pub = dir.path().join("admin.pub");
+            std::fs::write(&admin_pub, FIXTURE_PUB).unwrap();
+            (dir, p, admin_pub)
+        }
+
+        /// Protects: an overlay signed before the bump must still load after it.
+        #[test]
+        fn an_overlay_signed_before_the_bump_is_accepted() {
+            let (_dir, p, admin_pub) = fixture_dir();
+            let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
+            assert_eq!(
+                gate.check(OverlayKind::ProcessCommAllowlist, &p),
+                Decision::Accepted {
+                    sha256: BODY_SHA256.to_string(),
+                    signed_ts: SIGNED_TS,
+                    key_fps: vec![KEY_FP.to_string()],
+                    new: true,
+                }
+            );
+            // an edit is still refused
+            std::fs::write(&p, "+backupd\n+evil-implant\n").unwrap();
+            assert!(matches!(
+                gate.check(OverlayKind::ProcessCommAllowlist, &p),
+                Decision::Refused { .. }
+            ));
+        }
+
+        /// Protects: the overlay fixture is what the signing code writes today, byte for byte.
+        #[test]
+        fn the_stored_overlay_signature_is_pinned() {
+            let key = SigningKey::from_bytes(&[0x42; 32]);
+            assert_eq!(
+                format!("{} config-manage\n", hex(key.verifying_key().as_bytes())),
+                FIXTURE_PUB
+            );
+            let payload = SignedPayload::new_config_overlay_set(
+                [9; 32],
+                SIGNED_TS,
+                AGENT,
+                OverlayKind::ProcessCommAllowlist,
+                content_sha256(FIXTURE_BODY.as_bytes()),
+                FIXTURE_BODY.len() as u32,
+            );
+            let s = sign(&payload, &key).unwrap();
+            assert_eq!(
+                OverlaySignature::new(payload, &[s])
+                    .unwrap()
+                    .to_json()
+                    .unwrap(),
+                FIXTURE_SIG
+            );
+        }
+    }
 }

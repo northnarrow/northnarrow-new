@@ -2440,6 +2440,25 @@ mod tests {
             }
         }
     }
+
+    /// Lab PR 230 (D0 of the dependency plan): JA3's MD5 as computed today,
+    /// pinned before the md-5 0.11 bump (the reference vectors above pin it
+    /// too; this is the value `compute_ja3_matches_published_chrome_120_value`
+    /// only recomputes).
+    mod crypto_vectors {
+        use super::*;
+
+        /// Protects: a JA3 a rule or a feed recorded before the bump still matches after it.
+        #[test]
+        fn ja3_md5_is_pinned() {
+            let hello = parse_client_hello(&chrome_shaped_hello()).expect("parse");
+            assert_eq!(
+                compute_ja3_raw(&hello),
+                "771,4865-4866-4867,0-10-11-13-16-43,29-23,0"
+            );
+            assert_eq!(compute_ja3(&hello), "7c8b1b3287298e5d9d59f8e6cb769274");
+        }
+    }
 }
 
 /// Kani proofs (Tappa 10.8, "verifica formale dopo il fuzzing"). Every byte

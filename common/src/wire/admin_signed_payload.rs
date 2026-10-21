@@ -2333,4 +2333,73 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
+
+    /// Lab PR 230 (D0 of the dependency plan): Ed25519 and the admin
+    /// signing digest as computed today, pinned before the ed25519-dalek 3
+    /// and sha2 0.11 bump. The bump must pass these unchanged. Values
+    /// recomputed outside the repository (OpenSSL).
+    mod crypto_vectors {
+        use super::*;
+
+        const VK_0X42: &str = "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12";
+        const RAW_MSG: &[u8] = b"NorthNarrow KAT v1";
+        const RAW_SIG: &str = concat!(
+            "cb2798ed67378e667e1df74103527815c1d4908f1d71014cd34ac4381789103677e1038bde9bab20",
+            "fb1048cb8dd70e6db44f86fe49abe2c0acc0f9e84b09d20a",
+        );
+        /// `new_unlock([0xAB; 32], 1_710_000_000, [0xCD; 16])`.
+        const UNLOCK_CBOR: &str = concat!(
+            "a5626f7001656e6f6e6365982018ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab",
+            "18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab18ab6274731a65",
+            "ec8780686167656e745f69649018cd18cd18cd18cd18cd18cd18cd18cd18cd18cd18cd18cd18cd18cd",
+            "18cd18cd656578747261a166556e6c6f636ba0",
+        );
+        /// SHA-512(`northnarrow.admin.v1` ‖ [`UNLOCK_CBOR`]).
+        const UNLOCK_DIGEST: &str = concat!(
+            "dd03d00b2e323336a5fecf4c45cca505011a917df2591b88de966795ecee33b4dca2433713675e4b",
+            "a82631838c672ee22596c78997d2953c9492bc5b0149396d",
+        );
+        const UNLOCK_SIG: &str = concat!(
+            "d4ba7643b191d41519cd437ca54f3629c3ece62fdd25fae2a9422eafab15d70620643a4d1e83918d",
+            "dbbc765290524fc1aca6d3a73487a4f88eb9b58a96a7fa00",
+        );
+
+        fn sig_bytes(h: &str) -> [u8; SIGNATURE_LENGTH] {
+            hex::decode(h).unwrap().try_into().unwrap()
+        }
+
+        /// Protects: a seed's key and its signatures are the same bytes before and after the bump.
+        #[test]
+        fn ed25519_seed_vector_is_pinned() {
+            let (signing, verifying) = fixed_keypair();
+            assert_eq!(hex::encode(verifying.to_bytes()), VK_0X42);
+            // RFC 8032 signs deterministically; the stored signature verifies
+            // under `verify_strict`, a flipped bit does not.
+            let sig: Signature = signing.sign(RAW_MSG);
+            assert_eq!(hex::encode(sig.to_bytes()), RAW_SIG);
+            let stored = Signature::from_bytes(&sig_bytes(RAW_SIG));
+            verifying.verify_strict(RAW_MSG, &stored).unwrap();
+            let mut bad = sig_bytes(RAW_SIG);
+            bad[0] ^= 1;
+            assert!(verifying
+                .verify_strict(RAW_MSG, &Signature::from_bytes(&bad))
+                .is_err());
+        }
+
+        /// Protects: a signed admin payload stored before the bump must verify after it.
+        #[test]
+        fn admin_payload_signature_is_pinned() {
+            let (signing, verifying) = fixed_keypair();
+            let payload = SignedPayload::new_unlock(nonce(), TS, agent_id());
+            // the CBOR, the SHA-512 signing digest, the signature; then the stored pair verifies
+            assert_eq!(hex::encode(encode_cbor(&payload).unwrap()), UNLOCK_CBOR);
+            assert_eq!(
+                hex::encode(signing_digest(&payload).unwrap()),
+                UNLOCK_DIGEST
+            );
+            assert_eq!(hex::encode(sign(&payload, &signing).unwrap()), UNLOCK_SIG);
+            let stored = decode_cbor(&hex::decode(UNLOCK_CBOR).unwrap()).unwrap();
+            verify(&stored, &sig_bytes(UNLOCK_SIG), &verifying).unwrap();
+        }
+    }
 }

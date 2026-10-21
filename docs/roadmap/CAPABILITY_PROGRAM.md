@@ -312,10 +312,10 @@ only in the table below, in the same PR as the evidence.
     security checks and the rest of the nightly stay in the self-hosted
     lab; the image cache shares the repository's 10 GB with the cargo
     caches.
-  - Lab: the verification is the VM job's first run on this pull request
-    (`lab-vm.yml`, Ubuntu 24.04 and 22.04 guests); its link is added here
-    once the run exists.
-  - Lab: @LAB218@
+  - Lab: the VM job's first run on its pull request
+    (https://github.com/northnarrow/northnarrow-new/actions/runs/39551564149):
+    Ubuntu 22.04 (5.15) and 24.04 (6.8) guests, 48 suites, 79 passed and
+    0 failed each, about 26–28 minutes per guest.
 - **Lab PR 219 — exploit post-condition guard (C12, C14; experimental).**
   The kernel exploit's end state checked against the kernel's own
   mechanisms (`commit_creds`, `switch_task_namespaces`, `set_fs_root`) and
@@ -683,3 +683,38 @@ only in the table below, in the same PR as the evidence.
   cases are written in the agent's event format, shaped on the lab
   scenarios).
   - Lab: On Ubuntu 24.04 (kernel 6.8.0-147, 4 vCPU of a Ryzen 9 3900XT, 7.8 GiB, QEMU for Windows with WHPX), the agent of `main` 8180540 (the run's tree 40fd666, no build input changed, lab build test-privileged+debug-trigger, thin LTO, agent sha256 93308a27… in every run): `nn-lab.sh perf --fresh --quick` complete in ~3 min; three full runs A (21:11 UTC), B (21:19, the committed baseline) and C (21:27), each complete with no note, ~7.5 min. Baseline B, agent off → on, ns per operation: getppid 176 → 176 (−0.3 %, the control), read of /dev/zero 327 → 449 (+37.3 %), open unwatched 3,706 → 5,149 (+38.9 %), open FIM-watched 3,794 → 5,717 (+50.7 %), write open 4,527 → 6,538 (+44.4 %), fork + exec 795,868 → 879,135 (+10.5 %), TCP connect 42,076 → 59,113 (+40.5 %), UDP send 3,730 → 4,753 (+27.4 %), DNS sent 4,967 → 6,063 (+22.1 %), DNS to the resolver 92,464 → 98,136 (+6.1 %); a credential read signed in 0.23 ms (on disk 2.50 ms); agent CPU 0.20 % idle, 7.40 % under the burst at 455 processes/s; RSS 34,352 KiB idle, 44,008 KiB under load; 0 ring drops, rejections, evicted connects, forgotten sockets; READY 4,506 ms after the start. A/A spread over the three runs (largest move of the median between two runs): workloads agent on 0.1–2.9 % except TCP connect 15.3 %, agent off 0.3–8.6 % (another job's test suite ran on the host during A's and C's agent-off phases); latency 7.5 % / 2.7 %; CPU 25 % / 19.6 % (0.05 / 1.45 points, inside the 0.5 / 2-point floors); RSS 2.5 % / 10.6 %; boot 0.1 %; no loss in any run; the overhead of a workload moved by at most 6.5 points between runs, TCP connect's by 26.5. Thresholds by the rule (≥ 10 %, ≥ twice the move, ≥ move + 5): 10 % for every workload but fork + exec and the resolver query (20 %) and TCP connect (35 %); latency 20 / 10 %; CPU 50 / 40 %; RSS 10 / 25 %; boot 10 %; loss counters floor 0. `cargo xtask perf-compare` B against A and against C with them: PASS (0 regressions); B against itself with fork + exec 25 % slower and 3 ring drops: exit 1, both REGRESSION. Golden replay: 12 cases, 4 tests, the same bytes on 5 separate test processes and 4 threads at once; a golden line edited by hand fails with the line that differs; `cargo xtask golden --update` under CI=1 is refused. Gates on the host: `cargo xtask build-ebpf --release`, the four clippy runs with `-D warnings`, `cargo fmt --check`, `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` (52 suites, 2,886 passed, 0 failed), `cargo xtask attack-coverage --check`, `cargo xtask golden`: all pass.
+- **Lab PR 230 — cryptographic test vectors before the RustCrypto bump.**
+  C27 (product supply-chain security), C17 (the quarantine vault), C23
+  (signed admin payloads and overlays); Wave 4 Phase 2, D0 of the
+  dependency plan.
+  - What was wrong: D2 moves aes-gcm, hkdf/hmac, sha2, md-5, ed25519-dalek
+    and rand to their next generation in one step. Outside the reference
+    vectors of JA3/JA4 and the fuzz seeds (which a bless run rewrites), no
+    test fixed the bytes those crates produce through our formats: a vault
+    sealed, a manifest recorded or an overlay signed before the bump could
+    stop restoring, verifying or loading after it with every test green.
+  - What changed: tests only, each in a `crypto_vectors` module next to the
+    code it pins (`cargo test crypto_vectors`). The vault: the HKDF-SHA256
+    file key, the record `nonce ‖ ciphertext ‖ tag` (no header: the format
+    is the salt's `-v1`), the refusal of a changed nonce, ciphertext, tag or
+    vault id, what `quarantine_file` writes (`.bin`, the `.meta` SHA-256),
+    and a vault written by `main` at 8180540 — master key, `.bin` as hex,
+    `.meta`, `index.json` in `agent/tests/fixtures/vault-v1/` — listed and
+    restored. SHA-256: `install_manifest::sha256_file` (empty, `abc`, 30
+    bytes, a million `a` across the 64 KiB reads), a manifest in the shape
+    `install.sh` writes with the hashes as literals, the self-integrity
+    report's short overlay hash. MD5: JA3, and a dpkg `.md5sums` line. Ed25519:
+    the seed `[0x42; 32]` (key, signature, `verify_strict`), an admin
+    payload's CBOR, SHA-512 signing digest and signature, and an overlay
+    signed and stored as `nn-admin config overlay set` stores it
+    (`agent/tests/fixtures/overlay-v1/`) accepted by the gate with its
+    content hash and key fingerprint. The vault's encryption and decryption
+    became `seal` and `open` (bytes, errors and their order unchanged).
+    HMAC has no call site of its own: it is HKDF's, covered by the file key.
+  - Evidence: the plan's eight vectors (`w4-deps-plan.md` §2.4) are what the
+    code produces; all twenty recomputed outside the repository (Python
+    `cryptography` 41 on OpenSSL, coreutils `sha256sum`), the vault fixture
+    decrypted there too; the four clippy runs, `cargo fmt`, `cargo test
+    --workspace`. Levels unchanged: D2 must pass these tests with no value
+    changed.
+  - Lab: none — host tests only (plain `cargo test`, no root, no network): 20 vectors pinned in 14 tests.
