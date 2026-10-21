@@ -162,7 +162,9 @@ fixes change for an operator, regressions included, is in
 What is **not** verified yet, said plainly: the adversarial campaign on the Kali range
 (Tappa 10.7: its denominator is frozen in `docs/validation/`, no rule has campaign proof
 yet, and two Critical rules cannot fire in this build), soak runs longer than 24 h,
-overhead on guests other than Ubuntu 24.04, and kernels from 6.9. They are on
+the agent's overhead on guests other than Ubuntu 24.04 (the one committed
+baseline: [`docs/validation/PERF_BASELINE.md`](docs/validation/PERF_BASELINE.md)),
+and kernels from 6.9. They are on
 [`ROADMAP.md`](ROADMAP.md) (Tappe 10.7 and 10.8) and in the tracker's follow-ups.
 
 ---

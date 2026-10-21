@@ -60,6 +60,9 @@ pub trait Rule: Send + Sync {
     fn evaluate(&self, event: &Event) -> Option<Verdict>;
 }
 
+/// Lab PR 228: the golden replay of recorded event streams.
+#[cfg(test)]
+mod golden;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

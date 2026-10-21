@@ -690,7 +690,12 @@ Pianificato, in quest'ordine:
   ufficiali a tre giri su host a riposo, Ubuntu 24.04, 12 ottobre (lab PR
   69): open +25,4 %, scrittura +29,1 %, exec +8,6 %, connect +34,1 %, udp
   +25,2 %, dns +14,2 %; restano gli altri guest. Dato grezzo dal soak:
-  ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s)
+  ~34 % di una vCPU a 20 exec/s + 10 file/s + 5 tcp/s. Cifre ritirate con
+  il lab PR 228: i dati grezzi non erano stati conservati; ora le cifre
+  vengono solo dai file di risultato di `nn-lab.sh perf`, committati in
+  `docs/validation/results/` (il primo: Ubuntu 24.04, kernel 6.8, 21
+  ottobre, con il controllo A/A e le soglie del gate,
+  `docs/validation/PERF_BASELINE.md`); restano gli altri guest)
 - Pacchetti `.deb`/`.rpm`. Prerequisiti fatti l'11 ottobre:
   - binari fuori da `/usr/local/bin` (lab PR 39, rilievi 26 e 51): l'agent
     protegge e riconosce sia il layout di `install.sh` sia `/usr/bin` +

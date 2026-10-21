@@ -11,6 +11,9 @@ Range setup + run procedure: [`../../RANGE_SETUP.md`](../../RANGE_SETUP.md).
 | `templates/result.md` | the per-result capture template (§6.2) | copied per test into `evidence/<run-id>/` |
 | `REPORT.md` | the assembled validation report skeleton (§8) | V6 (metrics), V8 (publication) |
 | `evidence/<run-id>/` | logs, screencaps, PCAP, hashes per run | every executed test |
+| `results/perf-<date>-<guest>-<commit>.json` + `.md` | performance baselines: every raw sample with the host, the tree and the method — the only source of a performance figure ([`../PERFORMANCE.md`](../PERFORMANCE.md) §2); `-aa` the A/A run the thresholds rest on ([`PERF_BASELINE.md`](PERF_BASELINE.md)) | `nn-lab.sh perf`, committed after the A/A check (lab PR 228) |
+| `PERF_BASELINE.md` | how to read the committed baseline, its A/A check and the regression thresholds of `deploy/lab/perf/thresholds.tsv` | the lot that commits a baseline |
+| `GOLDEN_REPLAY.md` | the golden replay of the decision engine: recorded streams (`agent/tests/golden/`), how to read and update the golden files | the lot that moves a verdict (`cargo xtask golden --update`, reviewed) |
 
 **Scope note (§7 / §13):** the matrix is the *progressive product* of
 V2–V4 — it ships empty here (schema + headers only) and grows one row per

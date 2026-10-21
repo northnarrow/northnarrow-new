@@ -1,0 +1,14 @@
+{
+  "about": "NN-L-IMP-001, encryption in place (lab MS-22): a login shell's unpackaged program rewrites 20 existing files and what it leaves is ciphertext-like — two shapes of one actor, decisive; the kill of its tree is held (Critical, action Log). Then rsync, a packaged program under the same shell, rewrites 20 files: a trusted writer, nothing.",
+  "fires": ["NN-L-IMP-001_RansomwareEncryption"],
+  "held": ["NN-L-IMP-001_RansomwareEncryption"],
+  "entropy": [{"prefix": "/home/u/docs/", "examined": 4, "high": 4}, {"prefix": "/home/u/backup/", "examined": 4, "high": 4}],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 5200001, "ppid": 1, "uid": 0, "gid": 0, "comm": "sshd", "filename": "/usr/sbin/sshd", "timestamp_ns": 100000000000, "argv": ["sshd: u [priv]"], "parent_comm": "", "start_ns": 99999000000, "exe": {"path": "/usr/sbin/sshd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5200002, "ppid": 5200001, "uid": 1000, "gid": 1000, "comm": "bash", "filename": "/usr/bin/bash", "timestamp_ns": 101000000000, "argv": ["-bash"], "parent_comm": "sshd", "start_ns": 100999000000, "exe": {"path": "/usr/bin/bash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5200003, "ppid": 5200002, "uid": 1000, "gid": 1000, "comm": "nn-ms-enc", "filename": "/home/u/.local/bin/nn-ms-enc", "timestamp_ns": 3600000000000, "argv": ["nn-ms-enc", "/home/u/docs"], "parent_comm": "bash", "start_ns": 3599999000000, "exe": {"path": "/home/u/.local/bin/nn-ms-enc"}}}},
+    {"event": {"MassWrite": {"pid": 5200003, "uid": 1000, "comm": "nn-ms-enc", "count": 20, "filename": "/home/u/docs/f19.odt", "timestamp_ns": 3602000000000, "overwrites": true, "cgroup_window": false}}},
+    {"event": {"ProcessSpawn": {"pid": 5200013, "ppid": 5200002, "uid": 1000, "gid": 1000, "comm": "rsync", "filename": "/usr/bin/rsync", "timestamp_ns": 3630000000000, "argv": ["rsync", "-a", "--inplace", "/srv/src/", "/home/u/backup/"], "parent_comm": "bash", "start_ns": 3629999000000, "exe": {"path": "/usr/bin/rsync"}}}},
+    {"event": {"MassWrite": {"pid": 5200013, "uid": 1000, "comm": "rsync", "count": 20, "filename": "/home/u/backup/f19.bin", "timestamp_ns": 3632000000000, "overwrites": true, "cgroup_window": false}}}
+  ]
+}

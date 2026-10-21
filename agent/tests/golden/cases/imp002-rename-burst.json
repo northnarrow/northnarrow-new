@@ -1,0 +1,10 @@
+{
+  "about": "NN-L-IMP-002: a burst of 20 renames appending one new extension (.zz7, not in NN-L-FIM-010's list), plain content beside them — one shape of ransomware, a High record; NN-L-IMP-001 would need a second shape.",
+  "fires": ["NN-L-IMP-002_RenameExtensionBurst"],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 5200001, "ppid": 1, "uid": 0, "gid": 0, "comm": "sshd", "filename": "/usr/sbin/sshd", "timestamp_ns": 100000000000, "argv": ["sshd: u [priv]"], "parent_comm": "", "start_ns": 99999000000, "exe": {"path": "/usr/sbin/sshd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5200002, "ppid": 5200001, "uid": 1000, "gid": 1000, "comm": "bash", "filename": "/usr/bin/bash", "timestamp_ns": 101000000000, "argv": ["-bash"], "parent_comm": "sshd", "start_ns": 100999000000, "exe": {"path": "/usr/bin/bash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5350003, "ppid": 5200002, "uid": 1000, "gid": 1000, "comm": "nn-ms-ren", "filename": "/home/u/.local/bin/nn-ms-ren", "timestamp_ns": 3600000000000, "argv": ["nn-ms-ren"], "parent_comm": "bash", "start_ns": 3599999000000, "exe": {"path": "/home/u/.local/bin/nn-ms-ren"}}}},
+    {"event": {"FileBurst": {"pid": 5350003, "uid": 1000, "comm": "nn-ms-ren", "kind": "RenameExtension", "count": 20, "appended": 20, "sources": 3, "filename": "/home/u/docs/f19.odt.zz7", "timestamp_ns": 3602000000000}}}
+  ]
+}

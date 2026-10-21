@@ -1,0 +1,11 @@
+{
+  "about": "NN-L-NET-026 (lab PR 224): an unpackaged program of a user's shell connects to 520 addresses on port 445 within 6 s (lab MS-21 shape): a High record at the 64th address, and past the kill threshold (512 addresses) the kill is held — High, action Log.",
+  "fires": ["NN-L-NET-026_ScanFanOut"],
+  "held": ["NN-L-NET-026_ScanFanOut"],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 5200001, "ppid": 1, "uid": 0, "gid": 0, "comm": "sshd", "filename": "/usr/sbin/sshd", "timestamp_ns": 100000000000, "argv": ["sshd: u [priv]"], "parent_comm": "", "start_ns": 99999000000, "exe": {"path": "/usr/sbin/sshd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5200002, "ppid": 5200001, "uid": 1000, "gid": 1000, "comm": "bash", "filename": "/usr/bin/bash", "timestamp_ns": 101000000000, "argv": ["-bash"], "parent_comm": "sshd", "start_ns": 100999000000, "exe": {"path": "/usr/bin/bash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5500002, "ppid": 5200002, "uid": 1000, "gid": 1000, "comm": "nn-ms-scan", "filename": "/home/u/bin/nn-ms-scan", "timestamp_ns": 3600000000000, "argv": ["nn-ms-scan", "10.20.0.0/22"], "parent_comm": "bash", "start_ns": 3599999000000, "exe": {"path": "/home/u/bin/nn-ms-scan"}}}},
+    {"tcp_sweep": {"pid": 5500002, "uid": 1000, "comm": "nn-ms-scan", "first": "10.20.0.1", "hosts": 520, "ports": [445], "count": 520, "start_ns": 3601000000000, "step_ns": 10000000}}
+  ]
+}

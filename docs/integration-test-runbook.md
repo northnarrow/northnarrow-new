@@ -434,14 +434,39 @@ hooked operation, so real services lose far less. Run it on an otherwise
 idle host, with no other guest busy: the off/on alternation cancels slow
 drift, not a neighbour's load.
 
-Official numbers, Ubuntu 24.04 (6.8), idle host, 3 rounds, `main` 1777e6f
-(2026-10-12): open +25.4 %, wopen +29.1 %, exec +8.6 %, connect +34.1 %,
-udp +25.2 %, dns +14.2 %. The agent's own CPU was 0 ms for open and wopen
-(the cost is in the kernel hooks, review 59), 220 ms for exec, 240 ms for
-connect, 120 ms for udp and 20 ms for dns. The dns workload is one process,
-so beyond its budget its queries are counted, not recorded. The benchmark binary is built under
+The dns workload is one process, so beyond its budget its queries are
+counted, not recorded. The benchmark binary is built under
 `/usr/local/libexec/nn-lab` and runs as root, because the agent kills a
 root exec from a user-writable path (R009).
+
+This is the quick check. Figures come only from the committed results of
+the performance baseline below (`docs/PERFORMANCE.md`); the figures this
+section used to quote (`main` 1777e6f, 2026-10-12, no raw data kept) are
+withdrawn.
+
+### Performance baseline (`nn-lab.sh perf`, lab PR 228)
+
+```
+deploy/lab/nn-lab.sh perf --fresh       # sync + install the checkout, then measure (~10 min, idle host)
+deploy/lab/nn-lab.sh perf --quick       # the whole path in ~3 min: a smoke run, never a baseline
+cargo xtask perf-compare BASE.json NEW.json   # the gate (committed thresholds): exit 1 on a regression
+```
+
+`deploy/lab/perf/perf-run.sh` runs on the guest as root: the hooked
+operations with the agent off (stopped through the trusted-installer
+window with the lab key, pin root purged) and on, ten measured passes
+after a warm-up, pinned to one vCPU; the latency from a probe read of a
+`.aws/credentials` fixture to its signed NN-L-FIM-011 record; the ring
+drops and the other loss counters under the soak generator at a high rate
+(60 s); the agent's CPU and RSS idle and under the load; the cold start to
+READY. The report (`$LAB_DIR/reports/perf-<stamp>.json` with every raw
+sample, and `.md`: `~/.cache/nn-lab/reports/` for Ubuntu 24.04,
+`~/.cache/nn-lab/<distro>/reports/` for the other guests) records the
+kernel, CPU, vCPUs, memory, the tree commit, its branch point on
+`origin/main` and which build inputs differ from it, and the agent's
+configuration. Method, metrics and the gate's rule: `docs/PERFORMANCE.md`
+§2; the committed baseline, its A/A check and the thresholds:
+`docs/validation/PERF_BASELINE.md`.
 
 ### Sensor feasibility (Tappa 10.9 step 0)
 

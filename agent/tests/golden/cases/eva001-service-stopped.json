@@ -1,0 +1,16 @@
+{
+  "about": "NN-L-EVA-001: auditd's unit stopped three ways — by a maintainer script of a package transaction run by root (sanctioned: Low record); by a root shell outside a package transaction and an interactive admin session (unsanctioned: High record); by a lineage holding a program from /tmp (the kill of that program's tree, new in lab PR 225, held: High, action Log). The /tmp program's own exec, root's from a user-writable path, is R009's kill (it predates the hold).",
+  "fires": ["NN-L-EVA-001_SecurityServiceStopped", "R009_RootExecFromUserPath"],
+  "held": ["NN-L-EVA-001_SecurityServiceStopped"],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 5400001, "ppid": 1, "uid": 0, "gid": 0, "comm": "apt", "filename": "/usr/bin/apt", "timestamp_ns": 1000000000000, "argv": ["apt", "upgrade", "-y"], "parent_comm": "", "start_ns": 999999000000, "exe": {"path": "/usr/bin/apt"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400002, "ppid": 5400001, "uid": 0, "gid": 0, "comm": "dpkg", "filename": "/usr/bin/dpkg", "timestamp_ns": 1001000000000, "argv": ["/usr/bin/dpkg", "--configure", "-a"], "parent_comm": "apt", "start_ns": 1000999000000, "exe": {"path": "/usr/bin/dpkg"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400003, "ppid": 5400002, "uid": 0, "gid": 0, "comm": "auditd.prerm", "filename": "/usr/bin/dash", "timestamp_ns": 1002000000000, "argv": ["/bin/sh", "/var/lib/dpkg/info/auditd.prerm", "upgrade"], "parent_comm": "dpkg", "start_ns": 1001999000000, "exe": {"path": "/usr/bin/dash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400004, "ppid": 5400003, "uid": 0, "gid": 0, "comm": "systemctl", "filename": "/usr/bin/systemctl", "timestamp_ns": 1003000000000, "argv": ["systemctl", "stop", "auditd.service"], "parent_comm": "auditd.prerm", "start_ns": 1002999000000, "exe": {"path": "/usr/bin/systemctl"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400011, "ppid": 1, "uid": 0, "gid": 0, "comm": "sshd", "filename": "/usr/sbin/sshd", "timestamp_ns": 2000000000000, "argv": ["sshd: root [priv]"], "parent_comm": "", "start_ns": 1999999000000, "exe": {"path": "/usr/sbin/sshd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400012, "ppid": 5400011, "uid": 0, "gid": 0, "comm": "bash", "filename": "/usr/bin/bash", "timestamp_ns": 2001000000000, "argv": ["-bash"], "parent_comm": "sshd", "start_ns": 2000999000000, "exe": {"path": "/usr/bin/bash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400013, "ppid": 5400012, "uid": 0, "gid": 0, "comm": "systemctl", "filename": "/usr/bin/systemctl", "timestamp_ns": 2002000000000, "argv": ["systemctl", "stop", "auditd"], "parent_comm": "bash", "start_ns": 2001999000000, "exe": {"path": "/usr/bin/systemctl"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400021, "ppid": 5400012, "uid": 0, "gid": 0, "comm": "upd", "filename": "/tmp/.x/upd", "timestamp_ns": 3000000000000, "argv": ["/tmp/.x/upd"], "parent_comm": "bash", "start_ns": 2999999000000, "exe": {"path": "/tmp/.x/upd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5400022, "ppid": 5400021, "uid": 0, "gid": 0, "comm": "systemctl", "filename": "/usr/bin/systemctl", "timestamp_ns": 3001000000000, "argv": ["systemctl", "disable", "--now", "auditd"], "parent_comm": "upd", "start_ns": 3000999000000, "exe": {"path": "/usr/bin/systemctl"}}}}
+  ]
+}
