@@ -5518,6 +5518,7 @@ mod tests {
                     exe: Default::default(),
                     argv_truncated: false,
                     filename_truncated: false,
+                    stdio: Default::default(),
                 };
                 let verdict = common::Verdict {
                     rule_id: text(&mut rng),

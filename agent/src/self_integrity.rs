@@ -143,6 +143,50 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
         crate::sensors::epg::MODE_ENV,
         crate::sensors::epg::turns_off,
     ),
+    // Lab PR 224 (CM-14, CM-02 b): a fan-out threshold above its default,
+    // a shorter window, a kill tier turned off; an open-flow snapshot
+    // interval or age above the default, or no snapshots at all.
+    ("NN_NET_SCAN_HOSTS", |v| {
+        crate::decision::rules::net_fanout::FanoutConfig::value_weakens("NN_NET_SCAN_HOSTS", v)
+    }),
+    ("NN_NET_SCAN_PAIRS", |v| {
+        crate::decision::rules::net_fanout::FanoutConfig::value_weakens("NN_NET_SCAN_PAIRS", v)
+    }),
+    ("NN_NET_SCAN_KILL_HOSTS", |v| {
+        crate::decision::rules::net_fanout::FanoutConfig::value_weakens("NN_NET_SCAN_KILL_HOSTS", v)
+    }),
+    ("NN_NET_SCAN_WINDOW_SECS", |v| {
+        crate::decision::rules::net_fanout::FanoutConfig::value_weakens(
+            "NN_NET_SCAN_WINDOW_SECS",
+            v,
+        )
+    }),
+    ("NN_NET_BRUTE_CONNECTS", |v| {
+        crate::decision::rules::net_fanout::FanoutConfig::value_weakens("NN_NET_BRUTE_CONNECTS", v)
+    }),
+    ("NN_NET_BRUTE_KILL_CONNECTS", |v| {
+        crate::decision::rules::net_fanout::FanoutConfig::value_weakens(
+            "NN_NET_BRUTE_KILL_CONNECTS",
+            v,
+        )
+    }),
+    ("NN_NET_BRUTE_WINDOW_SECS", |v| {
+        crate::decision::rules::net_fanout::FanoutConfig::value_weakens(
+            "NN_NET_BRUTE_WINDOW_SECS",
+            v,
+        )
+    }),
+    // Any program exempt from the fan-out rules is a blind spot.
+    ("NN_NET_FANOUT_EXEMPT", |v| !v.trim().is_empty()),
+    ("NN_NET_SNAPSHOT_INTERVAL_SECS", |v| {
+        crate::net::flow_tracker::snapshot_value_weakens(v)
+    }),
+    ("NN_NET_SNAPSHOT_MIN_AGE_SECS", |v| {
+        crate::net::flow_tracker::snapshot_value_weakens(v)
+    }),
+    ("NN_NET_SNAPSHOT_MAX", |v| {
+        v.trim().parse::<u64>().map_or(true, |n| n == 0)
+    }),
 ];
 
 /// Does this value of the variable weaken the agent?
@@ -247,6 +291,64 @@ pub fn weakening_env(vars: &[(String, String)]) -> Vec<Finding> {
                 });
             }
         }
+    }
+    out
+}
+
+/// Lab PR 224: the agent flags that set what a [`WEAKENING_ENV`] variable
+/// sets (clap reads either). A weaker value given on the command line —
+/// `ExecStart` of a unit, a drop-in, a manual start — is as much a
+/// weakening as the variable, and is reported the same way, as
+/// `weakening_flag`.
+pub const WEAKENING_FLAGS: &[(&str, &str)] = &[
+    ("--net-scan-hosts", "NN_NET_SCAN_HOSTS"),
+    ("--net-scan-pairs", "NN_NET_SCAN_PAIRS"),
+    ("--net-scan-kill-hosts", "NN_NET_SCAN_KILL_HOSTS"),
+    ("--net-scan-window-secs", "NN_NET_SCAN_WINDOW_SECS"),
+    ("--net-brute-connects", "NN_NET_BRUTE_CONNECTS"),
+    ("--net-brute-kill-connects", "NN_NET_BRUTE_KILL_CONNECTS"),
+    ("--net-brute-window-secs", "NN_NET_BRUTE_WINDOW_SECS"),
+    ("--net-fanout-exempt", "NN_NET_FANOUT_EXEMPT"),
+    (
+        "--net-snapshot-interval-secs",
+        "NN_NET_SNAPSHOT_INTERVAL_SECS",
+    ),
+    (
+        "--net-snapshot-min-age-secs",
+        "NN_NET_SNAPSHOT_MIN_AGE_SECS",
+    ),
+    ("--net-snapshot-max", "NN_NET_SNAPSHOT_MAX"),
+];
+
+/// The flags of [`WEAKENING_FLAGS`] in this process's command line (`args`,
+/// the program first) whose value weakens it, by the test of the variable
+/// they stand for: `--flag value` and `--flag=value`, each occurrence.
+pub fn weakening_flags(args: &[String]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        for (flag, env) in WEAKENING_FLAGS {
+            let value = if arg == *flag {
+                i += 1;
+                args.get(i).map(String::as_str)
+            } else {
+                arg.strip_prefix(flag).and_then(|r| r.strip_prefix('='))
+            };
+            let Some(value) = value else { continue };
+            let weakens = WEAKENING_ENV
+                .iter()
+                .find(|(name, _)| name == env)
+                .is_some_and(|(_, w)| w(value));
+            if weakens {
+                out.push(Finding {
+                    kind: "weakening_flag",
+                    detail: format!("{flag}={value}"),
+                });
+            }
+            break;
+        }
+        i += 1;
     }
     out
 }
@@ -1664,6 +1766,10 @@ pub fn spawn(
     for f in weakening_env(&vars) {
         checker.report_once(f, true);
     }
+    let args: Vec<String> = std::env::args().collect();
+    for f in weakening_flags(&args) {
+        checker.report_once(f, true);
+    }
     // External audit EVD-014: the mount baseline is the agent's start, not
     // the first round 15 s later (the round reports what it finds then).
     let _ = checker.read_mounts();
@@ -1940,6 +2046,47 @@ mod tests {
         for _ in 0..200 {
             let d = jittered(Duration::from_secs(30)).as_millis();
             assert!((24_000..=36_000).contains(&d), "{d}");
+        }
+    }
+
+    /// Lab PR 224: a weaker fan-out or snapshot value given as a flag is a
+    /// weakening as the variable is; a stronger one, or another flag's
+    /// value that looks like one, is not.
+    #[test]
+    fn weakening_flags_are_reported_like_the_variables() {
+        let args: Vec<String> = [
+            "northnarrow-agent",
+            "--net-scan-hosts",
+            "1000",
+            "--net-brute-kill-connects=0",
+            "--net-scan-pairs",
+            "10",
+            "--net-fanout-exempt",
+            "nmap",
+            "--pid-file",
+            "--net-scan-hosts=5",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let d: Vec<String> = weakening_flags(&args)
+            .into_iter()
+            .map(|f| {
+                assert_eq!(f.kind, "weakening_flag");
+                f.detail
+            })
+            .collect();
+        assert_eq!(
+            d,
+            vec![
+                "--net-scan-hosts=1000",
+                "--net-brute-kill-connects=0",
+                "--net-fanout-exempt=nmap"
+            ]
+        );
+        // Every flag stands for a variable the environment check knows.
+        for (_, env) in WEAKENING_FLAGS {
+            assert!(WEAKENING_ENV.iter().any(|(n, _)| n == env), "{env}");
         }
     }
 

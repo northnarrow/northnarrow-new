@@ -59,6 +59,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use common::wire::FlowPhase;
 use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
@@ -141,11 +142,6 @@ const LISTENER_COMMON_PORTS: &[u16] = &[22, 53, 80, 443, 8080, 8443];
 /// operator-tunable in V1.1.
 const BLOCKED_TLDS: &[&str] = &[".onion", ".bit"];
 
-/// NN-L-NET-008 — dst_port whitelist (DNS-only path is the
-/// LEGITIMATE outbound from a staging directory — a dropper resolving
-/// alongside its own DNS-tunneling). All other ports trip.
-const TMP_EXEC_ALLOWED_PORTS: &[u16] = &[53];
-
 /// NN-L-NET-009 — byte-count threshold for "anomalously
 /// large flow." 100 MiB = 104_857_600 bytes.
 const HIGH_VOLUME_BYTES_SENT: u64 = 100 * 1024 * 1024;
@@ -226,6 +222,8 @@ pub fn net_window_evictions_total() -> u64 {
         + BEACON_LIVE_EVICTIONS.load(Ordering::Relaxed)
         + BEACON_QUOTA_EVICTIONS.load(Ordering::Relaxed)
         + DNS_TUNNEL_LIVE_EVICTIONS.load(Ordering::Relaxed)
+        // Lab PR 224: the fan-out windows (NN-L-NET-026/027).
+        + super::net_fanout::fanout_window_evictions_total()
 }
 
 /// Per-key sliding windows of sample timestamps, in recency order.
@@ -666,6 +664,11 @@ impl Rule for NnLNet002OutboundToBlockedTld {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: every phase of a flow (connect, open snapshot,
+        // close); a refused connect is NN-L-NET-001's alone.
+        if nf.phase == FlowPhase::Denied {
+            return None;
+        }
         let host = nf.resolved_hostname.as_deref()?;
         let host_lower = host.to_ascii_lowercase();
         let matched = BLOCKED_TLDS.iter().any(|tld| host_lower.ends_with(tld));
@@ -718,6 +721,11 @@ impl Rule for NnLNet003BadJa3 {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: judged on the closed flow only (byte counts, or a
+        // record the netflow pacing applies to), once.
+        if nf.phase != FlowPhase::Closed {
+            return None;
+        }
         let fp = nf.tls_fingerprint.as_ref()?;
         if !self.blocklist.contains(&fp.ja3) {
             return None;
@@ -1534,6 +1542,11 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: judged on the closed flow only (byte counts, or a
+        // record the netflow pacing applies to), once.
+        if nf.phase != FlowPhase::Closed {
+            return None;
+        }
         if !Self::is_internal(&nf.dst_addr) {
             return None;
         }
@@ -1585,13 +1598,33 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
 /// ([`AuthSessionTracker::in_package_transaction`](crate::posture::lineage::AuthSessionTracker::in_package_transaction)):
 /// a package manager proper executed by root whose run covers the
 /// connect.
+///
+/// Lab PR 224 (CM-02 d, research defect D1): the one flow left alone used
+/// to be any flow to port 53, whatever the protocol and the server — an
+/// implant with its C2 on TCP/53 passed. It is now a flow to the DNS port
+/// (UDP or TCP) of a resolver the host is configured with
+/// ([`crate::net::resolvers::is_resolver_flow`]). Judged at the connect
+/// and on open-flow snapshots too. The new match — port 53 of a server
+/// that is no configured resolver — has its kill held behind the per-rule
+/// policy ([`crate::decision::response_policy::PORT_53_KILL`], off).
 pub struct NnLNet008OutboundFromTmpExec {
     lineage: Option<crate::posture::lineage::AuthSessionTracker>,
+    resolvers: Arc<crate::net::resolvers::HostResolvers>,
 }
 
 impl NnLNet008OutboundFromTmpExec {
+    /// With no configured resolver: no port-53 flow is exempt.
     pub fn new(lineage: Option<crate::posture::lineage::AuthSessionTracker>) -> Self {
-        Self { lineage }
+        Self {
+            lineage,
+            resolvers: crate::net::resolvers::HostResolvers::none(),
+        }
+    }
+
+    /// Lab PR 224: the resolvers whose DNS port a staged image may reach.
+    pub fn with_resolvers(mut self, resolvers: Arc<crate::net::resolvers::HostResolvers>) -> Self {
+        self.resolvers = resolvers;
+        self
     }
 }
 
@@ -1613,7 +1646,12 @@ impl Rule for NnLNet008OutboundFromTmpExec {
         let Event::NetFlow(nf) = event else {
             return None;
         };
-        if TMP_EXEC_ALLOWED_PORTS.contains(&nf.dst_port) {
+        // Lab PR 224: every phase of a flow (connect, open snapshot,
+        // close); a refused connect is NN-L-NET-001's alone.
+        if nf.phase == FlowPhase::Denied {
+            return None;
+        }
+        if crate::net::resolvers::is_resolver_flow(nf, &self.resolvers) {
             return None;
         }
         let looked_up;
@@ -1637,7 +1675,8 @@ impl Rule for NnLNet008OutboundFromTmpExec {
                 ResponseAction::Log,
                 Severity::High,
                 "Process running from a staging directory (/tmp, /var/tmp, /dev/shm) \
-                 opened a non-DNS outbound flow; it runs in a package transaction \
+                 opened an outbound flow other than a lookup at a configured resolver; \
+                 it runs in a package transaction \
                  (a package manager executed by root, still running or just ended), \
                  so it is recorded, not killed",
                 nf.pid,
@@ -1645,17 +1684,21 @@ impl Rule for NnLNet008OutboundFromTmpExec {
                 nf.start_ns,
             ));
         }
-        Some(net_verdict(
+        let v = net_verdict(
             self,
             ResponseAction::KillProcess,
             Severity::High,
             "Process running from a staging directory (/tmp, /var/tmp, /dev/shm) \
-             initiated outbound to a non-DNS port — likely dropper fetching \
-             second-stage payload; kill the process + posture → ENGAGED",
+             initiated outbound other than a lookup at a configured resolver — likely \
+             dropper fetching second-stage payload or C2 (TCP/53 to its own server \
+             included); kill the process + posture → ENGAGED",
             nf.pid,
             nf.comm.clone(),
             nf.start_ns,
-        ))
+        );
+        // Port 53 was exempt before lab PR 224: its kill there is held behind
+        // the per-rule policy (off by default); the other ports kill as before.
+        Some(crate::decision::response_policy::hold_port_53(nf, v))
     }
 }
 
@@ -1746,6 +1789,11 @@ impl Rule for NnLNet009ByteAnomaly {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: judged on the closed flow only (byte counts, or a
+        // record the netflow pacing applies to), once.
+        if nf.phase != FlowPhase::Closed {
+            return None;
+        }
         if nf.proto == 17 {
             // Review 74: sum the UDP rows of this (pid, destination). The
             // allowlist is judged once the sum crosses the threshold
@@ -1839,6 +1887,11 @@ impl Rule for NnLNet010OutboundToHighRiskC2Port {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: every phase of a flow (connect, open snapshot,
+        // close); a refused connect is NN-L-NET-001's alone.
+        if nf.phase == FlowPhase::Denied {
+            return None;
+        }
         if !HIGH_RISK_C2_PORTS.contains(&nf.dst_port) {
             return None;
         }
@@ -1900,6 +1953,11 @@ impl Rule for NnLNet011PlaintextCredService {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: judged on the closed flow only (byte counts, or a
+        // record the netflow pacing applies to), once.
+        if nf.phase != FlowPhase::Closed {
+            return None;
+        }
         if !PLAINTEXT_CRED_PORTS.contains(&nf.dst_port) {
             return None;
         }
@@ -1968,6 +2026,11 @@ impl Rule for NnLNet013Beacon {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: judged on the closed flow only (byte counts, or a
+        // record the netflow pacing applies to), once.
+        if nf.phase != FlowPhase::Closed {
+            return None;
+        }
         let is_beacon = self.window.lock().observe(nf.pid, nf.dst_addr, nf.start_ns);
         if !is_beacon {
             return None;
@@ -2039,6 +2102,11 @@ impl Rule for NnLNet018Rfc1918LateralPort {
         let Event::NetFlow(nf) = event else {
             return None;
         };
+        // Lab PR 224: every phase of a flow (connect, open snapshot,
+        // close); a refused connect is NN-L-NET-001's alone.
+        if nf.phase == FlowPhase::Denied {
+            return None;
+        }
         if !NnLNet007Rfc1918FromUnusualProc::is_internal(&nf.dst_addr) {
             return None;
         }
@@ -2570,9 +2638,9 @@ impl Rule for NnLNet014DnsTunnelEntropy {
 /// External audit NET-019: whether a flow meets the predicate of a
 /// NetFlow rule that kills — NN-L-NET-001 (blocklisted destination),
 /// -002 (blocked TLD), -003 (any TLS fingerprint), -008 (image in a
-/// staging directory), -010 (high-risk C2 port), -018 (internal host on
-/// a lateral-movement port) — allowlists and carve-outs aside, so a
-/// superset. The netflow drain never holds such a row back from the
+/// staging directory, a lookup at a configured resolver included), -010
+/// (high-risk C2 port), -018 (internal host on a lateral-movement port) —
+/// allowlists and carve-outs aside, so a superset. The netflow drain never holds such a row back from the
 /// rules (`net::limiter`). Kept next to the rules so a change to one of
 /// these predicates is made here too; the test
 /// `every_killing_netflow_verdict_is_guarded` checks the superset.
@@ -2592,14 +2660,35 @@ pub fn may_meet_a_kill_rule(nf: &common::wire::NetFlowEvent, blocklist: &NetBloc
     if LATERAL_MOVEMENT_PORTS.contains(&nf.dst_port) && common::netaddr::is_internal(nf.dst_addr) {
         return true;
     }
-    !TMP_EXEC_ALLOWED_PORTS.contains(&nf.dst_port)
-        && nf
-            .exe
-            .as_deref()
-            .is_some_and(crate::decision::rules::is_staging_path)
+    // Lab PR 224: a superset — the resolver exemption of NN-L-NET-008 is
+    // not applied here, so a staged image's DNS flow is never held back.
+    nf.exe
+        .as_deref()
+        .is_some_and(crate::decision::rules::is_staging_path)
 }
 
 // ── Factory ──────────────────────────────────────────────────────────
+
+/// Lab PR 224: the host state and the thresholds the network and chain
+/// rules read besides the operator lists: the configured resolvers (the
+/// port-53 exemption of NN-L-NET-008 and NN-L-CHAIN-002/005) and the
+/// fan-out thresholds (NN-L-NET-026/027).
+#[derive(Clone)]
+pub struct NetRuleConfig {
+    pub resolvers: Arc<crate::net::resolvers::HostResolvers>,
+    pub fanout: Arc<super::net_fanout::FanoutConfig>,
+}
+
+impl Default for NetRuleConfig {
+    /// No configured resolver (no port-53 flow exempt) and the default
+    /// thresholds: the boot-time and test rule sets.
+    fn default() -> Self {
+        Self {
+            resolvers: crate::net::resolvers::HostResolvers::none(),
+            fanout: Arc::new(super::net_fanout::FanoutConfig::default()),
+        }
+    }
+}
 
 /// Build the NN-L-NET rules with operator-loaded blocklists, the
 /// per-family comm allowlist (Tappa 10.5 D4), and freshly-allocated
@@ -2626,9 +2715,19 @@ pub fn net_rules(
     // package-manager carve-out. `None` (tests, boot-before-load): no
     // fallback and no carve-out.
     lineage: Option<crate::posture::lineage::AuthSessionTracker>,
+    // Lab PR 224: the resolvers and the fan-out thresholds.
+    config: NetRuleConfig,
+    // Lab PR 224: the ancestry the fan-out rules count a parent's children
+    // through (the chains' store). `None`: per process only.
+    correlation: Option<Arc<Mutex<crate::decision::correlation::CorrelationStore>>>,
 ) -> Vec<Box<dyn Rule>> {
     let dns_shape_dedup = Arc::new(Mutex::new(DnsQnameDedupWindow::new()));
-    vec![
+    let fanout = super::net_fanout::fanout_rules(super::net_fanout::FanoutContext::new(
+        Arc::clone(&config.fanout),
+        correlation,
+        lineage.clone(),
+    ));
+    let mut rules: Vec<Box<dyn Rule>> = vec![
         // Critical first.
         Box::new(NnLNet001OutboundToBlockedIp::new(blocklist)),
         Box::new(NnLNet003BadJa3::new(ja3_blocklist)),
@@ -2666,7 +2765,16 @@ pub fn net_rules(
         Box::new(NnLNet018Rfc1918LateralPort::new(Arc::clone(
             &comm_allowlist,
         ))),
-        Box::new(NnLNet008OutboundFromTmpExec::new(lineage.clone())),
+        Box::new(
+            NnLNet008OutboundFromTmpExec::new(lineage.clone())
+                .with_resolvers(Arc::clone(&config.resolvers)),
+        ),
+    ];
+    // Lab PR 224 (CM-14): the fan-out rules, which kill at their kill
+    // tier, before the record-only rules; they read connect attempts and
+    // UDP rows, which no rule above answers but for a kill.
+    rules.extend(fanout);
+    rules.extend::<Vec<Box<dyn Rule>>>(vec![
         Box::new(NnLNet011PlaintextCredService::new(Arc::clone(
             &comm_allowlist,
         ))),
@@ -2689,7 +2797,8 @@ pub fn net_rules(
             &comm_allowlist,
         ))),
         Box::new(NnLNet009ByteAnomaly::new(comm_allowlist)),
-    ]
+    ]);
+    rules
 }
 
 /// Empty-blocklist / default-allowlist convenience for boot + tests.
@@ -2711,6 +2820,8 @@ pub fn net_rules_empty() -> Vec<Box<dyn Rule>> {
         )),
         Arc::new(Mutex::new(BeaconWindow::new())),
         Arc::new(DnsCache::default()),
+        None,
+        NetRuleConfig::default(),
         None,
     )
 }
@@ -2760,6 +2871,8 @@ mod tests {
             tls_fingerprint: None,
             flow_id: "abc".to_string(),
             close_reason: 0,
+            phase: Default::default(),
+            observed_ns: 0,
         })
     }
 
@@ -3602,12 +3715,58 @@ mod tests {
         assert_eq!(v.severity, Severity::High);
     }
 
+    /// Lab PR 224: a lookup at a configured resolver stays allowed.
     #[test]
-    fn net_008_does_not_fire_on_tmp_exec_to_dns() {
-        let rule = NnLNet008OutboundFromTmpExec::new(None);
+    fn net_008_does_not_fire_on_tmp_exec_to_a_configured_resolver() {
+        let rule = NnLNet008OutboundFromTmpExec::new(None).with_resolvers(
+            crate::net::resolvers::HostResolvers::fixed([v4(1, 2, 3, 4)]),
+        );
         let mut e = flow(v4(1, 2, 3, 4), 53, "payload");
         if let Event::NetFlow(nf) = &mut e {
             nf.exe = Some("/tmp/payload".to_string());
+        }
+        assert!(rule.evaluate(&e).is_none());
+    }
+
+    /// Lab PR 224 (research defect D1): TCP/53 from a staged image to a
+    /// server the host is not configured with — an implant's C2 on the DNS
+    /// port — fires; the starting tree let every port-53 flow through. That
+    /// match is new: its kill is held behind the per-rule policy (High,
+    /// recorded, `Log`); another port still kills.
+    #[test]
+    fn net_008_fires_on_port_53_to_a_server_that_is_no_configured_resolver() {
+        let rule = NnLNet008OutboundFromTmpExec::new(None).with_resolvers(
+            crate::net::resolvers::HostResolvers::fixed([v4(127, 0, 0, 53)]),
+        );
+        let mut e = flow(v4(127, 0, 0, 1), 53, "payload");
+        if let Event::NetFlow(nf) = &mut e {
+            nf.exe = Some("/var/tmp/nn-ms/c53".to_string());
+        }
+        let v = rule.evaluate(&e).expect("TCP/53 to its own server");
+        assert_eq!(v.severity, Severity::High);
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            v.reasoning
+                .contains("[held back: the kill for a flow to port 53"),
+            "{}",
+            v.reasoning
+        );
+        let mut other = e.clone();
+        if let Event::NetFlow(nf) = &mut other {
+            nf.dst_port = 8053;
+        }
+        assert_eq!(
+            rule.evaluate(&other).unwrap().action,
+            ResponseAction::KillProcess
+        );
+        // and at the connect, while the flow is open
+        if let Event::NetFlow(nf) = &mut e {
+            nf.phase = FlowPhase::Connect;
+        }
+        assert!(rule.evaluate(&e).is_some());
+        // a refused connect is NN-L-NET-001's alone
+        if let Event::NetFlow(nf) = &mut e {
+            nf.phase = FlowPhase::Denied;
         }
         assert!(rule.evaluate(&e).is_none());
     }
@@ -3656,8 +3815,9 @@ mod tests {
             .expect("the staged image connects");
         assert_eq!(v.action, ResponseAction::KillProcess);
         assert_eq!(v.event_pid, 4242);
-        // DNS stays allowed; an unknown process is not guessed at
-        assert!(rule.evaluate(&flow_from(None, 4242, 53)).is_none());
+        // Lab PR 224: port 53 to a server that is no configured resolver is
+        // judged like any port; an unknown process is not guessed at
+        assert!(rule.evaluate(&flow_from(None, 4242, 53)).is_some());
         assert!(rule.evaluate(&flow_from(None, 4243, 8080)).is_none());
     }
 
@@ -3964,12 +4124,13 @@ mod tests {
     /// external audit EBPF-013 adds NN-L-NET-021).
     /// Future rule additions must update this assertion.
     #[test]
-    fn net_rules_builder_returns_17_rules() {
+    fn net_rules_builder_returns_19_rules() {
         let rules = net_rules_empty();
         assert_eq!(
             rules.len(),
-            17,
-            "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 + DNS flood 1 + sensor flood 1 = 17 net rules"
+            19,
+            "N6 9 + D4 5 + T4.1 DNS-tunnel-entropy 1 + DNS flood 1 + sensor flood 1 \
+             + lab PR 224 fan-out 2 = 19 net rules"
         );
     }
 
@@ -4077,6 +4238,8 @@ mod tests {
             tls_fingerprint: None,
             flow_id: "abc".to_string(),
             close_reason: 0,
+            phase: Default::default(),
+            observed_ns: 0,
         })
     }
 
@@ -4230,6 +4393,51 @@ mod tests {
         (tmp, t)
     }
 
+    /// Lab PR 224 (CM-02 d, research defect D9): an allowlisted transfer
+    /// tool keeps its exemption while its lineage is clean and loses it
+    /// when a precursor is there — the dropper's `curl` to a C2 port is
+    /// recorded at the rule's severity (its kill held behind the per-rule
+    /// policy: the starting tree exempted both), the administrator's is not.
+    #[test]
+    fn a_transfer_tool_is_exempt_only_while_its_lineage_is_clean() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        lineage.ingest_spawn(8100, 1, "/usr/bin/curl", 1);
+        lineage.ingest_spawn(8101, 1, "/usr/bin/curl", 1);
+        let allow = Arc::new(
+            al().as_ref()
+                .clone()
+                .with_identity(lineage)
+                .with_conditional(
+                    super::super::transfer_tools::TRANSFER_TOOLS,
+                    Arc::new(|pid| (pid == 8101).then_some("an exec from a staging directory")),
+                ),
+        );
+        let rule = NnLNet010OutboundToHighRiskC2Port::new(allow);
+        let row = |pid: u32| {
+            let mut e = flow(v4(198, 51, 100, 9), 4444, "curl");
+            if let Event::NetFlow(nf) = &mut e {
+                nf.pid = pid;
+            }
+            e
+        };
+        assert!(rule.evaluate(&row(8100)).is_none(), "the tool itself");
+        let v = rule.evaluate(&row(8101)).expect("the dropper's tool");
+        assert_eq!(v.action, ResponseAction::Log);
+        assert!(
+            v.reasoning
+                .contains("[held back: the kill of an allowlisted transfer tool"),
+            "{}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning
+                .contains("transfer tool, but its lineage holds an exec from a staging"),
+            "{}",
+            v.reasoning
+        );
+    }
+
     /// The production rule set over `lineage`: the allowlist judged on
     /// exec identity, as `default_rules_with_net` builds it.
     fn rules_over(lineage: &crate::posture::lineage::AuthSessionTracker) -> Vec<Box<dyn Rule>> {
@@ -4241,6 +4449,8 @@ mod tests {
             Arc::new(Mutex::new(BeaconWindow::new())),
             Arc::new(DnsCache::default()),
             Some(lineage.clone()),
+            NetRuleConfig::default(),
+            None,
         )
     }
 
@@ -4792,6 +5002,8 @@ mod tests {
             Arc::new(Mutex::new(BeaconWindow::new())),
             Arc::clone(&cache),
             None,
+            NetRuleConfig::default(),
+            None,
         );
         let names = [
             // long AND a high-entropy first label: both shapes
@@ -4918,6 +5130,8 @@ mod tests {
             Arc::new(CommAllowlist::default()),
             Arc::new(Mutex::new(BeaconWindow::new())),
             Arc::new(DnsCache::default()),
+            None,
+            NetRuleConfig::default(),
             None,
         );
         let addrs = [

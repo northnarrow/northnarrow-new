@@ -44,10 +44,29 @@
 //!   §6.1 burst-window stitcher is N3.1 / V1.1 territory, NOT
 //!   N3 scope — V1.0 emits per-send).
 //!
+//! ## Open flows (lab PR 224, CM-02)
+//!
+//! A TCP row used to exist only once its socket closed, so a reverse
+//! shell or a C2 session that stays open had no verdict while it lived.
+//! The tracker now hands out two kinds of rows for an open flow, both
+//! marked by [`FlowPhase`] and never written to `netflow.jsonl`:
+//!
+//! - at the connect ([`FlowTracker::on_tcp_connect`]): the row the rules
+//!   that need no byte count judge at once ([`FlowPhase::Connect`]);
+//! - periodically ([`FlowTracker::due_snapshots`]): a flow still pending
+//!   past [`SnapshotPolicy::min_age_ns`] is handed out again every
+//!   [`SnapshotPolicy::interval_ns`], at most
+//!   [`SnapshotPolicy::max_per_tick`] per tick (the least recently
+//!   snapshotted first, the rest counted as deferred), so a precursor
+//!   recorded after the connect, or an image the process executed since,
+//!   is judged while the session is open ([`FlowPhase::Snapshot`]). The
+//!   snapshot carries no byte counters: the kernel's are read at close.
+//!
 //! ## Bounded memory
 //!
 //! Per §6.1: a `PendingFlow` open > 24 h gets emitted as a
-//! long-lived snapshot (N3.1, not done). V1.0 bounds the pending
+//! long-lived snapshot (lab PR 224: every snapshot interval instead,
+//! above). V1.0 bounds the pending
 //! map at a capacity instead. Default capacity = 65,536 pending
 //! flows — generous enough that ordinary hosts never evict, small
 //! enough that pathological kernel-leak / sk_ptr-reuse scenarios
@@ -68,7 +87,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::wire::{NetFlowEvent, TlsFingerprint};
+use common::wire::{FlowPhase, NetFlowEvent, TlsFingerprint};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -84,6 +103,73 @@ static PENDING_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 /// Pending connects evicted at capacity since boot (status surface).
 pub fn pending_evictions_total() -> u64 {
     PENDING_EVICTIONS.load(Ordering::Relaxed)
+}
+
+/// Lab PR 224: open-flow snapshots handed to the rules since boot.
+static SNAPSHOTS_SENT: AtomicU64 = AtomicU64::new(0);
+/// Lab PR 224: snapshots due but left for a later tick (the per-tick bound).
+static SNAPSHOTS_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Lab PR 224: open-flow snapshots the rules re-judged since boot.
+pub fn snapshots_total() -> u64 {
+    SNAPSHOTS_SENT.load(Ordering::Relaxed)
+}
+
+/// Lab PR 224: snapshots deferred by the per-tick bound since boot.
+pub fn snapshots_deferred_total() -> u64 {
+    SNAPSHOTS_DEFERRED.load(Ordering::Relaxed)
+}
+
+/// Lab PR 224: count one snapshot handed to the rules (the drain, after
+/// its liveness check).
+pub fn note_snapshot_sent() {
+    SNAPSHOTS_SENT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Lab PR 224 (CM-02 b): which open flows [`FlowTracker::due_snapshots`]
+/// hands out again, and how many at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotPolicy {
+    /// A flow is re-judged every this long while open.
+    pub interval_ns: u64,
+    /// It is not snapshotted before it has been open this long (the
+    /// connect-time verdict covers the start).
+    pub min_age_ns: u64,
+    /// At most this many snapshots per tick; the others are deferred,
+    /// least recently snapshotted first.
+    pub max_per_tick: usize,
+}
+
+/// Default snapshot interval and minimum age: 60 s.
+pub const DEFAULT_SNAPSHOT_SECS: u64 = 60;
+/// Default bound on snapshots per tick.
+pub const DEFAULT_SNAPSHOT_MAX: usize = 512;
+
+/// Lab PR 224: an interval or minimum age (seconds, `NN_NET_SNAPSHOT_*`)
+/// above the default, or unreadable, re-judges open flows less often.
+pub fn snapshot_value_weakens(v: &str) -> bool {
+    v.trim()
+        .parse::<u64>()
+        .map_or(true, |n| n > DEFAULT_SNAPSHOT_SECS)
+}
+
+impl Default for SnapshotPolicy {
+    fn default() -> Self {
+        Self {
+            interval_ns: DEFAULT_SNAPSHOT_SECS * 1_000_000_000,
+            min_age_ns: DEFAULT_SNAPSHOT_SECS * 1_000_000_000,
+            max_per_tick: DEFAULT_SNAPSHOT_MAX,
+        }
+    }
+}
+
+/// What one [`FlowTracker::due_snapshots`] tick hands out.
+#[derive(Debug, Default)]
+pub struct SnapshotBatch {
+    /// The snapshots, oldest-snapshotted first.
+    pub flows: Vec<NetFlowEvent>,
+    /// Flows that were due and are left for a later tick.
+    pub deferred: usize,
 }
 
 /// Canonical correlation key — exactly the 16 bytes the N2
@@ -175,6 +261,9 @@ pub struct UdpSendInfo {
 
 #[derive(Debug, Clone)]
 struct PendingFlow {
+    /// Lab PR 224: when [`FlowTracker::due_snapshots`] last handed this
+    /// flow out (0 never).
+    last_snapshot_ns: u64,
     start_ns: u64,
     family: u8,
     src_addr: IpAddr,
@@ -274,12 +363,16 @@ impl FlowTracker {
     /// Register a TCP connect observation. The pending entry
     /// stays in the map until a matching [`Self::on_tcp_close`]
     /// arrives (or an eviction takes it past `capacity`).
-    pub fn on_tcp_connect(&mut self, info: &TcpConnectInfo) {
+    ///
+    /// Lab PR 224 (CM-02 a): returns the flow's [`FlowPhase::Connect`]
+    /// row for the rules to judge now, while it is open; `None` when the
+    /// close was already seen (its row is out).
+    pub fn on_tcp_connect(&mut self, info: &TcpConnectInfo) -> Option<NetFlowEvent> {
         let key = Self::corr_id(info.start_ns, info.sk_ptr);
         if self.recent_synth.contains(&key) {
             // The close already produced this flow's row (see
             // `on_tcp_close`): a pending entry now would never close.
-            return;
+            return None;
         }
         // If the same corr_id is re-inserted (kernel sk_ptr
         // re-use + same start_ns — extremely unlikely but
@@ -292,6 +385,7 @@ impl FlowTracker {
         self.pending.insert(
             key,
             PendingFlow {
+                last_snapshot_ns: 0,
                 start_ns: info.start_ns,
                 family: info.family,
                 src_addr: info.src_addr,
@@ -308,6 +402,100 @@ impl FlowTracker {
         );
         self.link(info.pid, key);
         self.evict_to_capacity();
+        Some(Self::open_row(info, FlowPhase::Connect, info.start_ns))
+    }
+
+    /// Lab PR 224 (CM-02 c): the row of a connect the `socket_connect`
+    /// deny refused — no flow, nothing pending.
+    pub fn denied_row(info: &TcpConnectInfo) -> NetFlowEvent {
+        let mut row = Self::open_row(info, FlowPhase::Denied, info.start_ns);
+        row.end_ns = info.start_ns;
+        row
+    }
+
+    /// An open-phase row of a connect (the fields the close adds unset).
+    fn open_row(info: &TcpConnectInfo, phase: FlowPhase, observed_ns: u64) -> NetFlowEvent {
+        NetFlowEvent {
+            start_ns: info.start_ns,
+            end_ns: 0,
+            family: info.family,
+            src_addr: info.src_addr,
+            src_port: info.src_port,
+            dst_addr: info.dst_addr,
+            dst_port: info.dst_port,
+            proto: info.proto,
+            pid: info.pid,
+            uid: info.uid,
+            comm: info.comm.clone(),
+            exe: info.exe.clone(),
+            proc_start_ns: info.proc_start_ns,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            resolved_hostname: None,
+            tls_fingerprint: None,
+            flow_id: String::new(),
+            close_reason: 0,
+            phase,
+            observed_ns,
+        }
+    }
+
+    /// Lab PR 224 (CM-02 b): the pending flows open at least
+    /// `policy.min_age_ns` at `now_ns` and not handed out within
+    /// `policy.interval_ns`, as [`FlowPhase::Snapshot`] rows, at most
+    /// `policy.max_per_tick` (the least recently snapshotted first; the
+    /// others are counted as deferred and come first next time). Each
+    /// one handed out is stamped `now_ns`. The image and the DNS name are
+    /// the connect's: the caller refreshes them.
+    pub fn due_snapshots(&mut self, now_ns: u64, policy: &SnapshotPolicy) -> SnapshotBatch {
+        let mut due: Vec<(u64, u64, CorrId)> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| {
+                now_ns.saturating_sub(p.start_ns) >= policy.min_age_ns
+                    && (p.last_snapshot_ns == 0
+                        || now_ns.saturating_sub(p.last_snapshot_ns) >= policy.interval_ns)
+            })
+            .map(|(k, p)| (p.last_snapshot_ns, p.start_ns, *k))
+            .collect();
+        let deferred = due.len().saturating_sub(policy.max_per_tick);
+        if deferred > 0 {
+            due.select_nth_unstable(policy.max_per_tick);
+            due.truncate(policy.max_per_tick);
+            SNAPSHOTS_DEFERRED.fetch_add(deferred as u64, Ordering::Relaxed);
+        }
+        due.sort_unstable();
+        let mut flows = Vec::with_capacity(due.len());
+        for (_, _, key) in due {
+            let Some(p) = self.pending.get_mut(&key) else {
+                continue;
+            };
+            p.last_snapshot_ns = now_ns;
+            flows.push(NetFlowEvent {
+                start_ns: p.start_ns,
+                end_ns: 0,
+                family: p.family,
+                src_addr: p.src_addr,
+                src_port: p.src_port,
+                dst_addr: p.dst_addr,
+                dst_port: p.dst_port,
+                proto: p.proto,
+                pid: p.pid,
+                uid: p.uid,
+                comm: p.comm.clone(),
+                exe: p.exe.clone(),
+                proc_start_ns: p.proc_start_ns,
+                bytes_sent: 0,
+                bytes_recv: 0,
+                resolved_hostname: None,
+                tls_fingerprint: None,
+                flow_id: String::new(),
+                close_reason: 0,
+                phase: FlowPhase::Snapshot,
+                observed_ns: now_ns,
+            });
+        }
+        SnapshotBatch { flows, deferred }
     }
 
     /// Resolve a TCP close observation against the pending map.
@@ -367,6 +555,8 @@ impl FlowTracker {
             tls_fingerprint: None,
             flow_id,
             close_reason: info.close_reason,
+            phase: FlowPhase::Closed,
+            observed_ns: 0,
         })
     }
 
@@ -418,6 +608,8 @@ impl FlowTracker {
             tls_fingerprint: None,
             flow_id,
             close_reason: info.close_reason,
+            phase: FlowPhase::Closed,
+            observed_ns: 0,
         })
     }
 
@@ -459,6 +651,8 @@ impl FlowTracker {
             flow_id,
             // UDP has no close-reason semantics.
             close_reason: 0,
+            phase: FlowPhase::Closed,
+            observed_ns: 0,
         }
     }
 
@@ -1085,5 +1279,116 @@ mod tests {
         assert!(t
             .on_tcp_close(&close_fixture(2, [0x55u8; 16], 0, 0, 0))
             .is_none());
+    }
+
+    const S: u64 = 1_000_000_000;
+
+    /// Lab PR 224 (CM-02 a): the connect hands out the flow's connect-time
+    /// row — open, no bytes, the image named at the connect — and the close
+    /// still produces the closed row with the same start (the key the
+    /// engine's per-flow ledger uses). On the starting tree the connect
+    /// returned nothing: an open flow had no row at all.
+    #[test]
+    fn the_connect_hands_out_an_open_row_and_the_close_a_closed_one() {
+        let mut t = FlowTracker::default();
+        let conn = connect_fixture(10 * S, 0xA1, 77, v4(127, 0, 0, 1), 4444);
+        let row = t.on_tcp_connect(&conn).expect("connect-time row");
+        assert_eq!(row.phase, FlowPhase::Connect);
+        assert_eq!(row.observed_ns, 10 * S);
+        assert_eq!((row.end_ns, row.bytes_sent, row.bytes_recv), (0, 0, 0));
+        assert_eq!(row.exe.as_deref(), Some("/usr/bin/curl"));
+        assert_eq!((row.dst_port, row.pid), (4444, 77));
+        assert!(row.flow_id.is_empty(), "no canonical id before the close");
+        let corr = FlowTracker::corr_id(conn.start_ns, conn.sk_ptr);
+        let closed = t
+            .on_tcp_close(&close_fixture(20 * S, corr, 5, 6, 0))
+            .unwrap();
+        assert_eq!(closed.phase, FlowPhase::Closed);
+        assert_eq!(closed.start_ns, row.start_ns);
+        assert_eq!(closed.bytes_sent, 5);
+    }
+
+    /// Lab PR 224 (CM-02 b): a flow is snapshotted once open `min_age`,
+    /// then every `interval`, never before; closed flows never.
+    #[test]
+    fn snapshots_follow_the_age_and_the_interval() {
+        let mut t = FlowTracker::default();
+        let p = SnapshotPolicy::default();
+        let conn = connect_fixture(100 * S, 0xB1, 88, v4(127, 0, 0, 2), 8443);
+        t.on_tcp_connect(&conn);
+        assert!(t.due_snapshots(130 * S, &p).flows.is_empty(), "30 s old");
+        let b = t.due_snapshots(160 * S, &p);
+        assert_eq!(b.flows.len(), 1);
+        let row = &b.flows[0];
+        assert_eq!(row.phase, FlowPhase::Snapshot);
+        assert_eq!((row.start_ns, row.observed_ns), (100 * S, 160 * S));
+        assert_eq!(row.bytes_sent, 0, "no byte counters in a snapshot");
+        assert!(
+            t.due_snapshots(200 * S, &p).flows.is_empty(),
+            "within the interval"
+        );
+        assert_eq!(t.due_snapshots(220 * S, &p).flows.len(), 1);
+        let corr = FlowTracker::corr_id(conn.start_ns, conn.sk_ptr);
+        t.on_tcp_close(&close_fixture(230 * S, corr, 0, 0, 0));
+        assert!(t.due_snapshots(400 * S, &p).flows.is_empty(), "closed");
+    }
+
+    /// Lab PR 224: at most `max_per_tick` per tick, the least recently
+    /// snapshotted first; the others are counted and come next.
+    #[test]
+    fn snapshots_are_bounded_per_tick_oldest_first() {
+        let mut t = FlowTracker::default();
+        let p = SnapshotPolicy {
+            max_per_tick: 2,
+            ..SnapshotPolicy::default()
+        };
+        for i in 0..5u64 {
+            t.on_tcp_connect(&connect_fixture(
+                i * S,
+                0xC0 + i,
+                90,
+                v4(10, 0, 0, i as u8),
+                443,
+            ));
+        }
+        let before = snapshots_deferred_total();
+        let first = t.due_snapshots(100 * S, &p);
+        assert_eq!((first.flows.len(), first.deferred), (2, 3));
+        assert!(snapshots_deferred_total() >= before + 3);
+        let second = t.due_snapshots(101 * S, &p);
+        assert_eq!(second.flows.len(), 2);
+        let third = t.due_snapshots(102 * S, &p);
+        assert_eq!((third.flows.len(), third.deferred), (1, 0));
+        let mut seen: Vec<u64> = first
+            .flows
+            .iter()
+            .chain(&second.flows)
+            .chain(&third.flows)
+            .map(|f| f.start_ns)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, S, 2 * S, 3 * S, 4 * S], "every flow, once");
+    }
+
+    /// Lab PR 224 (CM-02 c): a refused connect's row; nothing pending.
+    #[test]
+    fn a_denied_connect_is_a_row_and_nothing_pending() {
+        let t = FlowTracker::default();
+        let conn = connect_fixture(5 * S, 0, 99, v4(192, 0, 2, 7), 443);
+        let row = FlowTracker::denied_row(&conn);
+        assert_eq!(row.phase, FlowPhase::Denied);
+        assert_eq!(
+            (row.start_ns, row.end_ns, row.observed_ns),
+            (5 * S, 5 * S, 5 * S)
+        );
+        assert_eq!(t.pending_len(), 0);
+    }
+
+    #[test]
+    fn a_longer_snapshot_interval_weakens() {
+        assert!(snapshot_value_weakens("120"));
+        assert!(snapshot_value_weakens("never"));
+        assert!(!snapshot_value_weakens("30"));
+        assert!(!snapshot_value_weakens("60"));
     }
 }

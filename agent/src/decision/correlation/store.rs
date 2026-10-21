@@ -297,6 +297,12 @@ impl CorrelationStore {
             }
         }
         let q = self.egress.entry(key).or_default();
+        // Lab PR 224: a flow is judged at its connect, in snapshots and at
+        // its close, all under its connect's timestamp: one note.
+        if q.iter().any(|n| n.start_ns == note.start_ns) {
+            self.egress_order.touch(key);
+            return;
+        }
         q.push_back(note);
         while q.len() > MAX_EGRESS_PER_PROC {
             q.pop_front();
@@ -578,6 +584,25 @@ impl CorrelationStore {
                 .is_some_and(|q| q.iter().any(|p| p.can_complete(now_ns)))
         };
         live(&self.current_key(pid)) || self.tree.get_ancestors(pid).iter().any(live)
+    }
+
+    /// Lab PR 224 (CM-02 d): the first of `kinds` that `pid` or one of its
+    /// ancestors holds and that could still complete a chain at `now_ns`
+    /// (as [`Self::has_precursor_in_lineage`] reads it). Read-only.
+    pub fn precursor_in_lineage(
+        &self,
+        pid: u32,
+        kinds: &[PrecursorKind],
+        now_ns: u64,
+    ) -> Option<PrecursorKind> {
+        let held = |key: &ProcKey| {
+            self.per_proc.get(key).and_then(|q| {
+                q.iter()
+                    .find(|p| kinds.contains(&p.kind) && p.can_complete(now_ns))
+                    .map(|p| p.kind)
+            })
+        };
+        held(&self.current_key(pid)).or_else(|| self.tree.get_ancestors(pid).iter().find_map(held))
     }
 
     /// Read-only view of the ancestry tree (lineage queries / tests).

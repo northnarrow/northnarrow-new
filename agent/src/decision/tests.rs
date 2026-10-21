@@ -36,16 +36,17 @@ use super::{Rule, RuleEngine};
 /// process kills), so the engine holds 73 rules under 72 ids.
 /// External audit PROC-014: the io_uring (NN-L-IOU-001/002) and BPF
 /// (NN-L-BPF-001/002) rules, which only the production builder had, are
-/// in `default_rules()` too: 77 rules under 76 ids.
+/// in `default_rules()` too: 77 rules under 76 ids. Lab PR 224: R020
+/// (shell with socket stdio) and NN-L-NET-026/027 (fan-out): 80 under 79.
 #[test]
-fn default_engine_has_seventy_six_rules_across_all_families() {
+fn default_engine_has_seventy_nine_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
-    // chain 8 + tappa2 10 (+ R007's second pass) + process 7
+    // chain 8 + tappa2 10 (+ R007's second pass) + process 7 + R020
     //   + module-load 1 (R018, BUG-034) + io_uring 2 + BPF 2 (PROC-014)
-    //   + FIM 25 + canary 4 + net 17
+    //   + FIM 25 + canary 4 + net 19
     assert_eq!(
         engine.rule_count(),
-        8 + 10 + 1 + 7 + 1 + 2 + 2 + 25 + 4 + 17
+        8 + 10 + 1 + 7 + 1 + 1 + 2 + 2 + 25 + 4 + 19
     );
 }
 
@@ -107,6 +108,7 @@ fn proc_self_fd_takes_priority_over_other_matches() {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         })
         .expect("should fire");
     assert_eq!(v.rule_id, "R004_ExecFromProcSelfFd");
@@ -264,12 +266,12 @@ fn rule_ids_are_pinned() {
 /// PROC-014) → 76. [`production_engine_pins_all_rule_ids`] holds the
 /// production builder to this same list, in the same order.
 #[test]
-fn default_engine_pins_all_seventy_six_rule_ids() {
+fn default_engine_pins_all_seventy_nine_rule_ids() {
     let rules = super::rules::default_rules();
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        77,
+        80,
         "engine ships 76 rules after the io_uring and BPF rules (external audit PROC-014), \
          R007 in two passes (external audit PROC-010)"
     );
@@ -281,7 +283,7 @@ fn default_engine_pins_all_seventy_six_rule_ids() {
     ids.dedup();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 76, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 79, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
@@ -344,6 +346,8 @@ fn default_engine_pins_all_seventy_six_rule_ids() {
             "NN-L-NET-019_WildcardListener",
             "NN-L-NET-020_DnsQueryFlood",
             "NN-L-NET-021_SensorRecordFlood",
+            "NN-L-NET-026_ScanFanOut",
+            "NN-L-NET-027_OutboundAuthBruteforce",
             "R001_ExecFromTmp",
             "R002_ExecFromDevShm",
             "R003_ExecFromVarTmp",
@@ -362,6 +366,7 @@ fn default_engine_pins_all_seventy_six_rule_ids() {
             "R016_DebuggerServiceUid",
             "R017_ShellFromNonstandardPath",
             "R018_KernelModuleLoad",
+            "R020_ShellWithSocketStdio",
         ]
     );
 }
@@ -390,6 +395,7 @@ fn production_engine(lineage: crate::posture::lineage::AuthSessionTracker) -> Ru
         lineage,
         crate::canary::readers::CanaryReaders::default(),
         Arc::new(Mutex::new(super::correlation::CorrelationStore::new())),
+        super::rules::net::NetRuleConfig::default(),
     )
 }
 
@@ -421,7 +427,7 @@ fn production_engine_pins_all_rule_ids() {
     let (_tmp, lineage) = lineage_of(&[]);
     let production = production_engine(lineage);
     let default = RuleEngine::with_default_rules();
-    assert_eq!(production.rule_count(), 77);
+    assert_eq!(production.rule_count(), 80);
     assert_eq!(production.rule_ids(), default.rule_ids());
 }
 
@@ -460,12 +466,12 @@ fn both_builders_keep_the_family_order() {
             runs,
             vec![
                 ("NN-L-CHAIN", 7),
-                ("R", 19),
+                ("R", 20),
                 ("NN-L-IOU", 2),
                 ("NN-L-BPF", 2),
                 ("NN-L-FIM", 25),
                 ("NN-L-CANARY", 4),
-                ("NN-L-NET", 17),
+                ("NN-L-NET", 19),
                 ("NN-L-CHAIN", 1),
             ],
             "{name}"
@@ -475,6 +481,7 @@ fn both_builders_keep_the_family_order() {
             process,
             vec![
                 "R004_ExecFromProcSelfFd",
+                "R020_ShellWithSocketStdio",
                 "R007_CryptoMiner",
                 "R006_ReverseShellTooling",
                 "R009_RootExecFromUserPath",
@@ -1018,4 +1025,291 @@ fn the_engine_returns_the_attack_references_of_the_rule_that_fired() {
     assert!(engine
         .evaluate_with_attack(&spawn("ls", "/usr/bin/ls"))
         .is_none());
+}
+// ── Lab PR 224 (CM-02): a flow judged in its phases ─────────────────────
+
+/// A TCP row of `pid` to `dst:port` in `phase`, connected at `start_ns`.
+fn tcp_row(
+    pid: u32,
+    exe: &str,
+    dst: &str,
+    port: u16,
+    start_ns: u64,
+    phase: common::wire::FlowPhase,
+) -> Event {
+    use common::wire::FlowPhase;
+    let open = phase != FlowPhase::Closed;
+    Event::NetFlow(common::wire::NetFlowEvent {
+        start_ns,
+        end_ns: if open { 0 } else { start_ns + 5_000_000_000 },
+        family: 2,
+        src_addr: "0.0.0.0".parse().unwrap(),
+        src_port: 0,
+        dst_addr: dst.parse().unwrap(),
+        dst_port: port,
+        proto: 6,
+        pid,
+        uid: 1000,
+        comm: exe.rsplit('/').next().unwrap().into(),
+        exe: Some(exe.into()),
+        proc_start_ns: 0,
+        bytes_sent: if open { 0 } else { 200 * 1024 * 1024 },
+        bytes_recv: 0,
+        resolved_hostname: None,
+        tls_fingerprint: None,
+        flow_id: String::new(),
+        close_reason: 0,
+        phase,
+        observed_ns: match phase {
+            FlowPhase::Snapshot => start_ns + 90_000_000_000,
+            FlowPhase::Closed => 0,
+            _ => start_ns,
+        },
+    })
+}
+
+/// MS-04: a connection to a C2 port is judged at its connect — the
+/// starting tree had no row for an open flow — and NN-L-NET-010 does not
+/// answer it a second time at the close, where NN-L-NET-009 (its volume,
+/// known only then) still does.
+#[test]
+fn a_c2_port_flow_is_judged_at_the_connect_once() {
+    use common::wire::FlowPhase;
+    let (_tmp, lineage) = lineage_of(&[]);
+    let engine = production_engine(lineage);
+    let before = super::engine::connect_verdicts_total();
+    let at = 7_000_000_000;
+    let v = engine
+        .evaluate(&tcp_row(
+            4100,
+            "/usr/bin/python3.12",
+            "127.0.0.1",
+            4444,
+            at,
+            FlowPhase::Connect,
+        ))
+        .expect("judged at the connect");
+    assert_eq!(v.rule_id, "NN-L-NET-010_OutboundToHighRiskC2Port");
+    assert_eq!(v.action, ResponseAction::KillProcess);
+    assert!(
+        v.reasoning.contains("judged at the connect"),
+        "{}",
+        v.reasoning
+    );
+    assert!(super::engine::connect_verdicts_total() > before);
+    assert_eq!(engine.open_flows_with_verdicts(), 1);
+    let at_close = engine
+        .evaluate(&tcp_row(
+            4100,
+            "/usr/bin/python3.12",
+            "127.0.0.1",
+            4444,
+            at,
+            FlowPhase::Closed,
+        ))
+        .expect("the volume is judged at the close");
+    assert_eq!(at_close.rule_id, "NN-L-NET-009_ByteAnomaly");
+    assert_eq!(
+        engine.open_flows_with_verdicts(),
+        0,
+        "forgotten at the close"
+    );
+    // Another flow of the same process is a new flow.
+    let again = engine
+        .evaluate(&tcp_row(
+            4100,
+            "/usr/bin/python3.12",
+            "127.0.0.1",
+            4444,
+            at + 1,
+            FlowPhase::Connect,
+        ))
+        .expect("a new flow");
+    assert_eq!(again.rule_id, "NN-L-NET-010_OutboundToHighRiskC2Port");
+}
+
+/// The record-only rules judge the closed row alone: an open flow to an
+/// internal host is recorded once, at the close.
+#[test]
+fn record_rules_wait_for_the_close() {
+    use common::wire::FlowPhase;
+    let engine = RuleEngine::with_default_rules();
+    let row = |phase| tcp_row(4200, "/opt/app/bin/client", "10.0.0.5", 8080, 1, phase);
+    assert!(engine.evaluate(&row(FlowPhase::Connect)).is_none());
+    assert!(engine.evaluate(&row(FlowPhase::Snapshot)).is_none());
+    let v = engine
+        .evaluate(&row(FlowPhase::Closed))
+        .expect("recorded at close");
+    assert_eq!(v.action, ResponseAction::Log);
+}
+
+/// CM-02 b: a credential read made after the connect of a session that
+/// stays open completes CHAIN-001 at the next snapshot, once — the close
+/// gives no second chain verdict. The starting tree judged it only when
+/// the session closed.
+#[test]
+fn a_snapshot_completes_a_chain_while_the_session_is_open() {
+    use common::wire::{FimEvent, FimOp, FlowPhase};
+    let engine = RuleEngine::with_default_rules();
+    let start = 100_000_000_000;
+    let row = |phase| {
+        tcp_row(
+            4300,
+            "/usr/bin/python3.12",
+            "203.0.113.20",
+            443,
+            start,
+            phase,
+        )
+    };
+    assert!(engine.evaluate(&row(FlowPhase::Connect)).is_none());
+    let read = Event::Fim(FimEvent {
+        timestamp_ns: start + 30_000_000_000,
+        path: "/root/.password-store/bank.gpg".into(),
+        op: FimOp::Opened,
+        new_sha256: None,
+        baseline_sha256: None,
+        new_size: None,
+        baseline_size: None,
+        modifier_exe: None,
+        modifier_pid: 4300,
+        modifier_uid: 0,
+        modifier_comm: "python3".into(),
+        dest_path: None,
+        child_truncated: false,
+        wide_coverage: false,
+        owner_uid: None,
+        reader_dac_capable: false,
+        capability: None,
+        attrs: None,
+        file_key: None,
+        is_dir: false,
+        moved_in: false,
+    });
+    // The read's own record (the FIM rule) — a late chain completion on
+    // the open flow's connect would also do; either way one chain verdict.
+    let first = engine.evaluate(&read);
+    let snap = engine.evaluate(&row(FlowPhase::Snapshot));
+    let chains: Vec<String> = [first, snap]
+        .into_iter()
+        .flatten()
+        .map(|v| v.rule_id)
+        .filter(|id| id.starts_with("NN-L-CHAIN-"))
+        .collect();
+    assert_eq!(chains, ["NN-L-CHAIN-001_CredReadThenEgress"], "{chains:?}");
+    let close = engine.evaluate(&row(FlowPhase::Closed));
+    assert!(
+        close
+            .as_ref()
+            .is_none_or(|v| !v.rule_id.starts_with("NN-L-CHAIN-")),
+        "{close:?}"
+    );
+}
+
+/// CM-02 c: a connect the kernel refused is NN-L-NET-001's alone, and its
+/// reasoning says no connection was made; a port rule does not judge it.
+#[test]
+fn a_refused_connect_is_net_001s_record() {
+    use common::wire::FlowPhase;
+    use std::sync::Arc;
+    let mut engine = RuleEngine::new();
+    let bl = crate::net::blocklist::NetBlocklist::from_entries([
+        crate::net::blocklist::NetBlocklistEntry::parse("192.0.2.0/24").unwrap(),
+    ]);
+    for r in super::rules::net::net_rules(
+        Arc::new(bl),
+        Arc::new(crate::net::blocklist::Ja3Blocklist::empty()),
+        Arc::new(parking_lot::Mutex::new(
+            super::rules::net::DnsBurstWindow::new(),
+        )),
+        Arc::new(crate::config::comm_allowlist::CommAllowlist::default()),
+        Arc::new(parking_lot::Mutex::new(
+            super::rules::net::BeaconWindow::new(),
+        )),
+        Arc::new(crate::net::dns_cache::DnsCache::default()),
+        None,
+        super::rules::net::NetRuleConfig::default(),
+        None,
+    ) {
+        engine.add_rule(r);
+    }
+    let v = engine
+        .evaluate(&tcp_row(
+            4400,
+            "/tmp/x",
+            "192.0.2.7",
+            4444,
+            9,
+            FlowPhase::Denied,
+        ))
+        .expect("recorded");
+    assert_eq!(v.rule_id, "NN-L-NET-001_OutboundToBlockedIp");
+    assert!(
+        v.reasoning.contains("no connection was made"),
+        "{}",
+        v.reasoning
+    );
+    assert!(engine
+        .evaluate(&tcp_row(
+            4401,
+            "/tmp/x",
+            "198.51.100.7",
+            4444,
+            9,
+            FlowPhase::Denied
+        ))
+        .is_none());
+}
+
+/// Lab PR 224: the cost of judging a flow at its connect, in the production
+/// engine (chains, process, FIM, canary and network rules), against the
+/// closed row's. A unit benchmark: it prints the cost per row and fails
+/// only past a bound no build should reach (a lock or a scan per flow
+/// would). `cargo test -p northnarrow-agent --lib connect_time_evaluation_cost -- --nocapture`.
+#[test]
+fn connect_time_evaluation_cost() {
+    use common::wire::FlowPhase;
+    let (_tmp, lineage) = lineage_of(&[]);
+    let engine = production_engine(lineage);
+    const N: u32 = 20_000;
+    let rows = |phase: FlowPhase| -> Vec<Event> {
+        (0..N)
+            .map(|i| {
+                let dst = format!("198.18.{}.{}", (i >> 8) & 0xff, i & 0xff);
+                tcp_row(
+                    50_000 + (i % 5_000),
+                    "/usr/bin/python3.12",
+                    &dst,
+                    443,
+                    u64::from(i) * 1_000_000,
+                    phase,
+                )
+            })
+            .collect()
+    };
+    let connects = rows(FlowPhase::Connect);
+    let closes = rows(FlowPhase::Closed);
+    let t = std::time::Instant::now();
+    for e in &connects {
+        std::hint::black_box(engine.evaluate(e));
+    }
+    let connect_ns = t.elapsed().as_nanos() / u128::from(N);
+    let t = std::time::Instant::now();
+    for e in &closes {
+        std::hint::black_box(engine.evaluate(e));
+    }
+    let close_ns = t.elapsed().as_nanos() / u128::from(N);
+    eprintln!(
+        "connect-time evaluation: {connect_ns} ns/row, closed-row evaluation: {close_ns} ns/row \
+         ({N} rows, {} build)",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    assert!(
+        connect_ns < 500_000,
+        "connect-time evaluation {connect_ns} ns/row: something scans or blocks per flow"
+    );
 }

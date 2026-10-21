@@ -450,6 +450,20 @@ mod tests {
         }
     }
 
+    /// Lab PR 224: the resolv.conf seeds name resolvers (both families,
+    /// a zone index, an IPv4-mapped one) and skip what is no nameserver.
+    #[test]
+    fn resolv_conf_seeds_name_resolvers() {
+        let mut all = Vec::new();
+        for (_, bytes) in inputs("seeds", "resolv_conf") {
+            all.extend(crate::net::resolvers::parse_resolv_conf(text(&bytes)));
+        }
+        assert!(all.iter().any(|ip| ip.is_ipv4()) && all.iter().any(|ip| ip.is_ipv6()));
+        assert!(all.contains(&"198.51.100.53".parse().unwrap()), "{all:?}");
+        assert!(all.contains(&"fe80::1".parse().unwrap()), "{all:?}");
+        assert!(!all.contains(&"10.0.0.9".parse().unwrap()), "{all:?}");
+    }
+
     #[test]
     fn text_and_binary_seeds_reach_the_asserted_paths() {
         use crate::anti_tamper::combat_allow::{

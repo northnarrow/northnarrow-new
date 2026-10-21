@@ -247,6 +247,7 @@ mod tests {
             exe,
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         };
         for (raw, want) in [
             ("/usr/bin/../../tmp/nsenter", "/tmp/nsenter"),

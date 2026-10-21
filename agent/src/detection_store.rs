@@ -404,10 +404,60 @@ fn file_from_event(event: &Event) -> Option<String> {
 }
 
 /// The refused operation of an anti-tamper denial
-/// ([`DetectionRecord::operation`]); `None` for every other event.
+/// ([`DetectionRecord::operation`]); lab PR 224: `connect` for a connect
+/// the `socket_connect` deny refused; `None` for every other event.
 fn operation_from_event(event: &Event) -> Option<String> {
     match event {
         Event::FsProtectDenial { operation, .. } => Some(operation.to_string()),
+        Event::NetFlow(nf) if nf.phase == common::wire::FlowPhase::Denied => {
+            Some("connect".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Lab PR 224: the network side of a detection ([`DetectionRecord::network`]):
+/// for a flow `"<tcp|udp> <dst>:<port> <phase>"` (`connect`, `snapshot
+/// open=<N>s`, `closed`, `denied`), for a connect attempt `"tcp <dst>:<port>
+/// attempt"`, for an exec whose standard streams are an inet socket
+/// `"stdio <tcp|udp> <peer>:<port> <outbound|inbound>"` or, when only its
+/// parent's are one connected out, `"parent-stdio … outbound"`. `None`
+/// otherwise.
+pub fn network_from_event(event: &Event) -> Option<String> {
+    use common::wire::FlowPhase;
+    let proto = |p: u8| match p {
+        6 => "tcp",
+        17 => "udp",
+        _ => "ip",
+    };
+    match event {
+        Event::NetFlow(nf) => {
+            let phase = match nf.phase {
+                FlowPhase::Snapshot => format!(
+                    "snapshot open={}s",
+                    nf.observed_ns.saturating_sub(nf.start_ns) / 1_000_000_000
+                ),
+                p => p.as_str().to_string(),
+            };
+            Some(format!(
+                "{} {} {phase}",
+                proto(nf.proto),
+                std::net::SocketAddr::new(nf.dst_addr, nf.dst_port)
+            ))
+        }
+        Event::TcpConnect { .. } => crate::decision::rules::net_fanout::attempt_text(event),
+        Event::ProcessSpawn { stdio, .. } => {
+            let (label, s) = if stdio.own.stdin_or_stdout_inet() {
+                ("stdio", &stdio.own)
+            } else if stdio.parent.stdin_or_stdout_inet() && stdio.parent.outbound {
+                ("parent-stdio", &stdio.parent)
+            } else {
+                return None;
+            };
+            let peer = s.peer.map_or_else(|| "?".to_string(), |p| p.to_string());
+            let dir = if s.outbound { "outbound" } else { "inbound" };
+            Some(format!("{label} {} {peer} {dir}", s.proto_name()))
+        }
         _ => None,
     }
 }
@@ -536,6 +586,14 @@ pub struct DetectionRecord {
     /// on every other record (absent-on-`None`, like [`Self::file`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execq: Option<ExecqEvidence>,
+    /// Lab PR 224: the network side of the detection ([`network_from_event`]):
+    /// the flow and its phase — whether it was judged at the connect,
+    /// while open, at the close, or refused in the kernel — the connect
+    /// attempt of a fan-out record, the socket on a shell's standard
+    /// streams. The lab reads a connect-time verdict from this signed
+    /// record, not from the journal. Absent-on-`None`, like [`Self::file`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 /// Lab PR 223: what the exec quarantine found and decided
@@ -603,6 +661,7 @@ impl DetectionRecord {
             operation: operation_from_event(event),
             mitre_version: None,
             execq: None,
+            network: network_from_event(event),
         }
     }
 
@@ -1720,6 +1779,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -1790,6 +1850,7 @@ mod tests {
             operation: None,
             mitre_version: None,
             execq: None,
+            network: None,
         };
         assert_roundtrip(&record);
     }
@@ -2032,6 +2093,86 @@ mod tests {
             "FileOpen.filename is the opened file, not an exe"
         );
         assert_eq!(file.principal.comm, "cat");
+    }
+
+    fn flow_event(phase: common::wire::FlowPhase, proto: u8) -> Event {
+        Event::NetFlow(common::wire::NetFlowEvent {
+            start_ns: 10_000_000_000,
+            end_ns: 0,
+            family: 2,
+            src_addr: "0.0.0.0".parse().unwrap(),
+            src_port: 0,
+            dst_addr: "127.0.0.1".parse().unwrap(),
+            dst_port: 4444,
+            proto,
+            pid: 4100,
+            uid: 1000,
+            comm: "python3".into(),
+            exe: Some("/usr/bin/python3.12".into()),
+            proc_start_ns: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            resolved_hostname: None,
+            tls_fingerprint: None,
+            flow_id: String::new(),
+            close_reason: 0,
+            phase,
+            observed_ns: 75_000_000_000,
+        })
+    }
+
+    /// Lab PR 224: a network detection says in the signed record where the
+    /// flow went and in which phase it was judged — the lab reads a
+    /// connect-time verdict from it — and a connect the kernel refused is
+    /// the refused operation `connect`. The starting tree's records named
+    /// neither.
+    #[test]
+    fn network_detections_record_the_flow_and_its_phase() {
+        use common::wire::FlowPhase;
+        let rec = |e: &Event| {
+            DetectionRecord::from_rule(
+                1,
+                now_ts(),
+                e,
+                &sample_verdict(),
+                PostureKind::Observing,
+                "none".to_string(),
+            )
+        };
+        let r = rec(&flow_event(FlowPhase::Connect, 6));
+        assert_eq!(r.network.as_deref(), Some("tcp 127.0.0.1:4444 connect"));
+        assert_eq!(r.operation, None);
+        assert_eq!(
+            rec(&flow_event(FlowPhase::Snapshot, 6)).network.as_deref(),
+            Some("tcp 127.0.0.1:4444 snapshot open=65s")
+        );
+        assert_eq!(
+            rec(&flow_event(FlowPhase::Closed, 17)).network.as_deref(),
+            Some("udp 127.0.0.1:4444 closed")
+        );
+        let denied = rec(&flow_event(FlowPhase::Denied, 6));
+        assert_eq!(denied.network.as_deref(), Some("tcp 127.0.0.1:4444 denied"));
+        assert_eq!(denied.operation.as_deref(), Some("connect"));
+        // An exec whose stdio is a connected socket (R020's evidence).
+        let mut spawn = sample_event();
+        if let Event::ProcessSpawn { stdio, .. } = &mut spawn {
+            stdio.own = common::StdioSocket {
+                read: true,
+                inet_fds: 0b111,
+                outbound: true,
+                proto: 6,
+                peer: Some("127.0.0.1:44401".parse().unwrap()),
+            };
+        }
+        assert_eq!(
+            rec(&spawn).network.as_deref(),
+            Some("stdio tcp 127.0.0.1:44401 outbound")
+        );
+        // Nothing for an exec on a terminal; the field is absent on disk.
+        let plain = rec(&sample_event());
+        assert_eq!(plain.network, None);
+        assert!(!serde_json::to_string(&plain).unwrap().contains("network"));
+        assert_roundtrip(&denied);
     }
 
     #[test]
@@ -2829,6 +2970,7 @@ mod tests {
             operation: None,
             mitre_version: None,
             execq: None,
+            network: None,
         }
     }
 

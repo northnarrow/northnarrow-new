@@ -132,8 +132,12 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree],
         sensors: &[Sensor::Network, Sensor::Exec],
         data_components: &["DC0078", "DC0032"],
-        observes: "An outbound flow to a port other than 53 from a process whose image is in \
-                   a staging directory (/tmp, /var/tmp, /dev/shm), within 300 s of its exec.",
+        observes: "An outbound flow (at its connect, while it is open, at its close), other \
+                   than one to port 53 of a configured resolver, from a process whose image \
+                   is in a staging directory (/tmp, /var/tmp, /dev/shm), within 300 s of its \
+                   exec. To port 53 of a server that is no configured resolver — a match new in lab PR 224, \
+                   which exempts only the host's resolvers — the kill is held behind the \
+                   per-rule response policy (off by default): recorded at the same severity.",
         false_positives: "An installer or a test binary run from a temporary directory that \
                           talks to the network. A process of a package transaction is spared \
                           (NETR-008, lab PR 175); its flow falls to NN-L-NET-008.",
@@ -199,12 +203,15 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree],
         sensors: &[Sensor::Network, Sensor::Exec],
         data_components: &["DC0078", "DC0032"],
-        observes: "An outbound flow to a port other than 53 from a process whose ancestor (not \
-                   itself) was executed from a staging directory within 300 s.",
+        observes: "An outbound flow (at its connect, while it is open, at its close), other \
+                   than one to port 53 of a configured resolver, from a process whose ancestor \
+                   (not itself) was executed from a staging directory within 300 s. To port 53 of a server that is no configured resolver — a match new in lab PR 224, \
+                   which exempts only the host's resolvers — the kill is held behind the \
+                   per-rule response policy (off by default): recorded at the same severity.",
         false_positives: "As NN-L-CHAIN-002, through a child (an installer run from /tmp whose \
                           helper downloads); a package transaction is spared.",
-        how_to_test: "A program run from /tmp forks a child that connects out to a non-DNS \
-                      port; the e2e builds one.",
+        how_to_test: "A program run from /tmp forks a child that connects out to a port other \
+                      than 53; the e2e builds one.",
         tests: &[
             "agent/src/decision/rules/chain.rs::chain005_cross_pid_tmp_c2_fires",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_parent_then_descendant_egress_trips_chain_005",

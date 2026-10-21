@@ -1,8 +1,13 @@
 # NorthNarrow — V2 validation campaign — pre-registered ATT&CK technique rows.
 # version: 2
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-218).
-# version 2 (2026-10-20, lab PR 219, before any V2 run): TQ60 (T1068, the
-# exploit guard's NN-L-EPG-001) and NN-L-EPG-002 added to TQ57 (T1611).
+# version 2 (2026-10-20/21, lab PRs 219 and 224, before any V2 run; one
+# version for both, integrated in that order): TQ60 (T1068, the exploit
+# guard's NN-L-EPG-001) and NN-L-EPG-002 added to TQ57 (T1611) — lab PR 219;
+# R020 added to TQ19 (T1059.004), TQ61 T1046 (NN-L-NET-026) and TQ62 T1110
+# (NN-L-NET-027) — lab PR 224, its ids checked against the pinned ATT&CK
+# Enterprise 20.0 list of lab PR 221 (both active: T1046 discovery, T1110
+# credential-access).
 #
 # The techniques the campaign measures, fixed before it runs: those a
 # shipped rule names, those the design names, and those the external audit
@@ -50,7 +55,7 @@ TQ15	T1055.009	Process Injection: Proc Memory (the agent as target)	-	audit	deni
 TQ16	T1055.009	Process Injection: Proc Memory (another process as target)	-	audit	known-gap	-	No rule.
 TQ17	T1057	Process Discovery	-	audit	known-gap	-	No discovery rule (DETECT_ONLY_VALIDATION_2026-06-05).
 TQ18	T1059	Command and Scripting Interpreter	R001_ExecFromTmp,R002_ExecFromDevShm,R003_ExecFromVarTmp,NN-L-CHAIN-002_TmpExecThenEgress,NN-L-CHAIN-005_CrossPidTmpC2	design+code	rule	deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp	Design §7.1 maps R001-R004 to T1059/T1620.
-TQ19	T1059.004	Command and Scripting Interpreter: Unix Shell	R017_ShellFromNonstandardPath	code	rule	-	-
+TQ19	T1059.004	Command and Scripting Interpreter: Unix Shell	R017_ShellFromNonstandardPath,R020_ShellWithSocketStdio	code	rule	deploy/lab/malsim/net-check.sh::MS06	R020: a reverse or bind shell (stdin/stdout on an inet socket).
 TQ20	T1070	Indicator Removal	NN-L-FIM-018_LastlogTampered,NN-L-FIM-019_WtmpBtmpTampered	code	rule	-	-
 TQ21	T1070.002	Indicator Removal: Clear Linux or Mac System Logs	NN-L-FIM-005_LogTruncated	audit	rule	-	-
 TQ22	T1070.003	Indicator Removal: Clear Command History	NN-L-FIM-020_ShellHistoryCleared	code	rule	-	-
@@ -92,3 +97,5 @@ TQ57	T1611	Escape to Host	R013_NamespaceEscapeTooling,NN-L-EPG-002_NamespaceRoot
 TQ58	T1620	Reflective Code Loading	R004_ExecFromProcSelfFd	design	rule	deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd	-
 TQ59	T1622	Debugger Evasion	R016_DebuggerServiceUid	code	rule	-	-
 TQ60	T1068	Exploitation for Privilege Escalation	NN-L-EPG-001_CredentialPostcondition	code	rule	-	the post-condition of a local kernel exploit, whatever its bug
+TQ61	T1046	Network Service Discovery	NN-L-NET-026_ScanFanOut	code	rule	deploy/lab/malsim/net-check.sh::MS21	A connect scan: many hosts, or many ports of one host, within the window.
+TQ62	T1110	Brute Force	NN-L-NET-027_OutboundAuthBruteforce	code	rule	deploy/lab/malsim/net-check.sh::MS21	Outbound: repeated connects to SSH, Telnet, RDP or VNC ports.

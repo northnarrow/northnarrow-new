@@ -221,6 +221,14 @@ pub struct StatusOutcome {
     pub execq_known_hash_total: Option<u64>,
     pub execq_not_held_total: Option<u64>,
     pub execq_scanner_deaths_total: Option<u64>,
+    /// Lab PR 224 (CM-02): verdicts given at connect, open-flow snapshots
+    /// judged and deferred, connects refused by the `socket_connect` deny
+    /// (`None`: agent predates the counters; the last one also when the
+    /// deny is off).
+    pub net_connect_verdicts_total: Option<u64>,
+    pub net_flow_snapshots_total: Option<u64>,
+    pub net_flow_snapshots_deferred_total: Option<u64>,
+    pub net_connect_denied_total: Option<u64>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -457,6 +465,10 @@ fn status_outcome(
         execq_known_hash_total: resp.execq_known_hash_total,
         execq_not_held_total: resp.execq_not_held_total,
         execq_scanner_deaths_total: resp.execq_scanner_deaths_total,
+        net_connect_verdicts_total: resp.net_connect_verdicts_total,
+        net_flow_snapshots_total: resp.net_flow_snapshots_total,
+        net_flow_snapshots_deferred_total: resp.net_flow_snapshots_deferred_total,
+        net_connect_denied_total: resp.net_connect_denied_total,
         telemetry_signed: signed,
     }
 }
@@ -3725,6 +3737,10 @@ mod tests {
                     execq_known_hash_total: Some(7),
                     execq_not_held_total: Some(8),
                     execq_scanner_deaths_total: Some(9),
+                    net_connect_verdicts_total: Some(11),
+                    net_flow_snapshots_total: Some(60),
+                    net_flow_snapshots_deferred_total: Some(1),
+                    net_connect_denied_total: None,
                 }),
             );
         });
@@ -3774,6 +3790,16 @@ mod tests {
         // Lab PR 219: the exploit guard.
         let g = out.exploit_guard.as_ref().expect("exploit guard");
         assert_eq!((g.mode.as_str(), g.checked_total), ("lite detect", 50));
+        // Lab PR 224 (CM-02).
+        assert_eq!(
+            (
+                out.net_connect_verdicts_total,
+                out.net_flow_snapshots_total,
+                out.net_flow_snapshots_deferred_total,
+                out.net_connect_denied_total
+            ),
+            (Some(11), Some(60), Some(1), None)
+        );
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);
         assert_eq!(out.last_admin_action_secs_ago, Some(123));

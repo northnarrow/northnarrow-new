@@ -3598,6 +3598,14 @@ fn telemetry_status(
         execq_known_hash_total: Some(execq.known_hash),
         execq_not_held_total: Some(execq.not_held),
         execq_scanner_deaths_total: Some(execq.scanner_deaths),
+        // Lab PR 224 (CM-02): connect-time verdicts, open-flow snapshots,
+        // the optional kernel connect deny.
+        net_connect_verdicts_total: Some(crate::decision::engine::connect_verdicts_total()),
+        net_flow_snapshots_total: Some(crate::net::flow_tracker::snapshots_total()),
+        net_flow_snapshots_deferred_total: Some(
+            crate::net::flow_tracker::snapshots_deferred_total(),
+        ),
+        net_connect_denied_total: crate::sensors::connect_deny::denied_total(),
     }
 }
 
@@ -5451,6 +5459,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         };
         h.posture.observe(&intrusion, &[]);
         assert_eq!(h.posture.current_kind(), PostureKind::Combat);
@@ -6165,6 +6174,10 @@ mod tests {
             execq_known_hash_total: None,
             execq_not_held_total: None,
             execq_scanner_deaths_total: None,
+            net_connect_verdicts_total: None,
+            net_flow_snapshots_total: None,
+            net_flow_snapshots_deferred_total: None,
+            net_connect_denied_total: None,
         });
         emit_audit_for(
             &status_req,

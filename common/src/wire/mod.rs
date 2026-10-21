@@ -132,6 +132,70 @@ pub struct ProcessSpawnRaw {
     /// the clock of `timestamp_ns`; exec keeps it): with `timestamp_ns`,
     /// what the lineage tracker orders an ancestor's exec against.
     pub start_ns: u64,
+    // ── Lab PR 224 (CM-03) APPENDED (never reorder the above) ──
+    /// The new image's standard streams (fds 0..2) as `sched_process_exec`
+    /// found them: which are inet sockets, and the first one's peer
+    /// ([`StdioRaw`]). Zero from an older eBPF object ("not read").
+    pub stdio: StdioRaw,
+    /// The same for the exec'ing task's real parent: a shell spawned on a
+    /// pty by a process whose own stdio is a connected socket (the
+    /// `pty.spawn` reverse shell: connect, `dup2` onto 0..2, spawn).
+    pub parent_stdio: StdioRaw,
+}
+
+/// Lab PR 224 (CM-03): `StdioRaw::flags`.
+pub mod stdio_flags {
+    /// The task's file table was read (every offset resolved, the table
+    /// reachable): the other bits are meaningful. Unset = unknown.
+    pub const READ: u8 = 1 << 0;
+    /// fd 0 (stdin) is an `AF_INET` / `AF_INET6` socket.
+    pub const FD0_INET: u8 = 1 << 1;
+    /// fd 1 (stdout) is an inet socket.
+    pub const FD1_INET: u8 = 1 << 2;
+    /// fd 2 (stderr) is an inet socket.
+    pub const FD2_INET: u8 = 1 << 3;
+    /// One of those sockets was connected out by a local process: its
+    /// `struct sock` is in `FLOW_SOCK_MAP` (the `tcp_v[46]_connect`
+    /// kprobe put it there). An accepted socket, a UDP socket, or a
+    /// connect older than the agent is not.
+    pub const OUTBOUND: u8 = 1 << 4;
+    /// Any of fds 0..2 is an inet socket.
+    pub const ANY_INET: u8 = FD0_INET | FD1_INET | FD2_INET;
+}
+
+/// Lab PR 224 (CM-03): one task's standard streams at an exec, read by
+/// `sched_process_exec` through `task->files->fdt->fd[0..2]`: for a socket
+/// (`S_IFSOCK`), `file->private_data` is the `struct socket`, whose `sk`
+/// names the family, the protocol and the peer. 24 bytes, no implicit
+/// padding.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct StdioRaw {
+    /// [`stdio_flags`] bits.
+    pub flags: u8,
+    /// `sk_family` of the first inet socket on fds 0..2 (2 or 10), else 0.
+    pub family: u8,
+    /// Its peer port, host order (0 when not connected).
+    pub peer_port: u16,
+    /// Its `sk_protocol` (6 TCP, 17 UDP), 0 when unread.
+    pub proto: u8,
+    pub _pad: [u8; 3],
+    /// Its peer address (IPv4 in the first four bytes).
+    pub peer_addr: [u8; ADDR_LEN],
+}
+
+impl StdioRaw {
+    pub const fn zeroed() -> Self {
+        Self {
+            flags: 0,
+            family: 0,
+            peer_port: 0,
+            proto: 0,
+            _pad: [0u8; 3],
+            peer_addr: [0u8; ADDR_LEN],
+        }
+    }
 }
 
 impl ProcessSpawnRaw {
@@ -155,6 +219,8 @@ impl ProcessSpawnRaw {
             _pad: [0u8; 4],
             exe: exe::ExeIdentityRaw::zeroed(),
             start_ns: 0,
+            stdio: StdioRaw::zeroed(),
+            parent_stdio: StdioRaw::zeroed(),
         }
     }
 }
@@ -265,10 +331,16 @@ pub struct TcpConnectRaw {
     pub pid: u32,
     pub uid: u32,
     pub family: u8,
-    pub _pad0: [u8; 1],
+    /// Lab PR 224: [`tcp_connect_flags`] (the former `_pad0`; 0 from the
+    /// connect kprobe).
+    pub flags: u8,
     pub src_port: u16,
     pub dst_port: u16,
-    pub _pad1: [u8; 2],
+    /// Lab PR 224: the socket's protocol for a record of the
+    /// `socket_connect` deny (6, 17), 0 from the kprobe (TCP by
+    /// construction). The former `_pad1[0]`.
+    pub proto: u8,
+    pub _pad1: [u8; 1],
     pub src_addr: [u8; ADDR_LEN],
     pub dst_addr: [u8; ADDR_LEN],
     pub comm: [u8; TASK_COMM_LEN],
@@ -285,10 +357,11 @@ impl TcpConnectRaw {
             pid: 0,
             uid: 0,
             family: 0,
-            _pad0: [0; 1],
+            flags: 0,
             src_port: 0,
             dst_port: 0,
-            _pad1: [0; 2],
+            proto: 0,
+            _pad1: [0; 1],
             src_addr: [0; ADDR_LEN],
             dst_addr: [0; ADDR_LEN],
             comm: [0u8; TASK_COMM_LEN],
@@ -296,6 +369,19 @@ impl TcpConnectRaw {
             sk_ptr: 0,
         }
     }
+}
+
+/// Lab PR 224 (CM-02 c): entries of each of the `socket_connect` deny's
+/// LPM tries (`NET_BLOCK_V4`, `NET_BLOCK_V6`). A blocklist with more is
+/// loaded up to the bound (the rest is judged by NN-L-NET-001 at connect).
+pub const NET_BLOCK_MAX_ENTRIES: u32 = 16_384;
+
+/// Lab PR 224 (CM-02 c): `TcpConnectRaw::flags`.
+pub mod tcp_connect_flags {
+    /// The LSM `socket_connect` program refused this connect (`-EPERM`):
+    /// its destination is in the operator blocklist and
+    /// `--net-connect-deny` is on. No flow exists (`sk_ptr` is 0).
+    pub const DENIED: u8 = 1 << 0;
 }
 
 // ── Tappa 10 (N2) — Network Observability BPF wire types ──────────────
@@ -1593,6 +1679,62 @@ pub struct NetFlowEvent {
     /// which matches the most common "graceful" case anyway.
     #[serde(default)]
     pub close_reason: u8,
+    /// Lab PR 224 (CM-02): what this row is — the closed flow (the
+    /// netflow log's row, as before), the flow judged at its connect, a
+    /// periodic snapshot of a long-lived open flow, or a connect the
+    /// `socket_connect` LSM refused. Rows of the open phases carry no
+    /// byte counters, no close reason and no source end (the connect
+    /// hook runs before the bind), and `flow_id` is empty: the canonical
+    /// id needs the source the close reports. Rows written before the
+    /// field read as [`FlowPhase::Closed`].
+    #[serde(default)]
+    pub phase: FlowPhase,
+    /// Lab PR 224: when an open-phase row was observed (`CLOCK_MONOTONIC`
+    /// ns): the connect for [`FlowPhase::Connect`] and
+    /// [`FlowPhase::Denied`], the snapshot's time for
+    /// [`FlowPhase::Snapshot`]; 0 for a closed row.
+    #[serde(default)]
+    pub observed_ns: u64,
+}
+
+/// Lab PR 224 (CM-02): the phase of a [`NetFlowEvent`].
+#[cfg(feature = "std")]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowPhase {
+    /// The flow is over (TCP close; a UDP send). The only phase written
+    /// to `netflow.jsonl` and the only one the byte, beacon and
+    /// record-only rules judge.
+    #[default]
+    Closed,
+    /// Emitted at the TCP connect: the rules that need no byte count
+    /// judge the flow while it is open (a reverse shell, a C2 session).
+    Connect,
+    /// A periodic re-evaluation of a TCP flow still open past the
+    /// snapshot age, with the process's current image.
+    Snapshot,
+    /// A connect the `socket_connect` LSM refused (`--net-connect-deny`,
+    /// destination in the operator blocklist): no flow exists.
+    Denied,
+}
+
+#[cfg(feature = "std")]
+impl FlowPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Connect => "connect",
+            Self::Snapshot => "snapshot",
+            Self::Denied => "denied",
+        }
+    }
+
+    /// The flow is (or was refused while) open: no byte counters.
+    pub fn is_open(&self) -> bool {
+        !matches!(self, Self::Closed)
+    }
 }
 
 /// Tappa 10 (N1) — userland-decoded `inet_csk_listen` event.
@@ -1674,8 +1816,14 @@ mod tests {
         // T10.6 APPEND). Appended: parent_comm 16 + parent_start_ns 8 +
         // argv 512 + argv_len 2 + _pad 6 = 544. Total 840, align 8.
         // The trailing _pad keeps the Pod free of implicit padding.
-        // Tappa 10.9 step 2 appended `exe` (552) at 840: 1,392.
-        assert_eq!(size_of::<ProcessSpawnRaw>(), 1400);
+        // Tappa 10.9 step 2 appended `exe` (552) at 840: 1,392; POS-003
+        // `start_ns` at 1,392: 1,400. Lab PR 224 appended `stdio` and
+        // `parent_stdio` (24 each) at 1,400: 1,448.
+        assert_eq!(size_of::<ProcessSpawnRaw>(), 1448);
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, start_ns), 1392);
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, stdio), 1400);
+        assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, parent_stdio), 1424);
+        assert_eq!(size_of::<StdioRaw>(), 24);
         assert_eq!(align_of::<ProcessSpawnRaw>(), 8);
         // The existing-field prefix must not have shifted (strict APPEND).
         assert_eq!(core::mem::offset_of!(ProcessSpawnRaw, parent_comm), 296);
@@ -1740,6 +1888,15 @@ mod tests {
             trunc_flags: spawn_trunc::ARGV,
             _pad: [0u8; 4],
             exe: exe::ExeIdentityRaw::zeroed(),
+            stdio: StdioRaw {
+                flags: stdio_flags::READ | stdio_flags::FD0_INET | stdio_flags::OUTBOUND,
+                family: 2,
+                peer_port: 44401,
+                proto: 6,
+                _pad: [0; 3],
+                peer_addr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            },
+            parent_stdio: StdioRaw::zeroed(),
         };
 
         let bytes: &[u8] = bytemuck::bytes_of(&original);
@@ -1757,6 +1914,8 @@ mod tests {
         assert_eq!(restored.argv, original.argv);
         assert_eq!(restored.argv_len, original.argv_len);
         assert_eq!(restored.trunc_flags, spawn_trunc::ARGV);
+        assert_eq!(restored.stdio, original.stdio);
+        assert_eq!(restored.parent_stdio, StdioRaw::zeroed());
     }
 
     #[test]
@@ -2209,8 +2368,11 @@ mod tests {
             }),
             flow_id: "9f3c1a2b4d5e6f70a1b2c3d4e5f60718".to_string(),
             close_reason: 0,
+            phase: FlowPhase::Snapshot,
+            observed_ns: 1_700_000_000_400_000_000,
         };
         let json = serde_json::to_string(&original).expect("serialize");
+        assert!(json.contains(r#""phase":"snapshot""#), "{json}");
         let restored: NetFlowEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, original);
         // Spot-check field presence so a reorder/rename in §4.1
@@ -2283,10 +2445,11 @@ mod tests {
             pid: 12345,
             uid: 1000,
             family: 2, // AF_INET
-            _pad0: [0; 1],
+            flags: tcp_connect_flags::DENIED,
             src_port: 0,
             dst_port: 443,
-            _pad1: [0; 2],
+            proto: 6,
+            _pad1: [0; 1],
             src_addr: [0; ADDR_LEN],
             dst_addr: {
                 let mut a = [0u8; ADDR_LEN];
@@ -2307,6 +2470,14 @@ mod tests {
         assert_eq!(restored.dst_port, original.dst_port);
         assert_eq!(restored.dst_addr, original.dst_addr);
         assert_eq!(restored.timestamp_ns, original.timestamp_ns);
+        // Lab PR 224: the former pad bytes carry the deny flag and the
+        // protocol; nothing else moved.
+        assert_eq!(restored.flags, tcp_connect_flags::DENIED);
+        assert_eq!(restored.proto, 6);
+        assert_eq!(core::mem::offset_of!(TcpConnectRaw, flags), 9);
+        assert_eq!(core::mem::offset_of!(TcpConnectRaw, dst_port), 12);
+        assert_eq!(core::mem::offset_of!(TcpConnectRaw, proto), 14);
+        assert_eq!(core::mem::offset_of!(TcpConnectRaw, src_addr), 16);
         assert_eq!(
             restored.sk_ptr, original.sk_ptr,
             "sk_ptr round-trip MUST preserve the kernel pointer bits"

@@ -5,12 +5,16 @@
 # the Critical sub-gate (gate -), inactive until BUG-025 (no sensor produces
 # a TLS fingerprint); it stays in the denominator. NN-L-CANARY-003 stays in
 # the sub-gate: a connect to a network canary now trips it.
-# version 3 (2026-10-20, lab PR 219, before any V2 run): the exploit
-# post-condition guard's two rules, NN-L-EPG-001 (credentials, T1068) and
+# version 3 (2026-10-20/21, lab PRs 219 and 224, before any V2 run; one
+# version for both, integrated in that order): the exploit post-condition
+# guard's two rules (lab PR 219), NN-L-EPG-001 (credentials, T1068) and
 # NN-L-EPG-002 (namespaces and root, T1611), issued outside the engine
-# (`direct`), Critical, in the sub-gate: family exploit-guard.
+# (`direct`), Critical, in the sub-gate: family exploit-guard; R020 (lab PR
+# 224: a shell or interpreter with its stdio on a network socket, Critical,
+# in the sub-gate, family process), NN-L-NET-026 (scan fan-out) and
+# NN-L-NET-027 (outbound brute force), both High, family net.
 #
-# One row per rule the agent can record: the 76 rules the production engine
+# One row per rule the agent can record: the 79 rules the production engine
 # loads (decision::rules::default_rules_with_net) and NN-L-AT-001 and
 # NN-L-EPG-001/002, which process_event issues outside the engine. The rule-coverage headline and the
 # Critical sub-gate are computed over these rows and no others; matrix.md
@@ -59,6 +63,7 @@ R015_EncodingToolingServiceUid	process	engine	-	-	in
 R016_DebuggerServiceUid	process	engine	-	-	in
 R017_ShellFromNonstandardPath	process	engine	-	-	in
 R018_KernelModuleLoad	process	engine	critical	-	in
+R020_ShellWithSocketStdio	process	engine	critical	-	in
 NN-L-FIM-001_SystemBinaryModified	fim	engine	critical	yes	in
 NN-L-FIM-002_NewSuidBinary	fim	engine	critical	yes	in
 NN-L-FIM-003_SensitiveConfigModified	fim	engine	-	-	in
@@ -105,6 +110,8 @@ NN-L-NET-018_Rfc1918LateralPort	net	engine	-	-	in
 NN-L-NET-019_WildcardListener	net	engine	-	-	in
 NN-L-NET-020_DnsQueryFlood	net	engine	-	-	in
 NN-L-NET-021_SensorRecordFlood	net	engine	-	-	in
+NN-L-NET-026_ScanFanOut	net	engine	-	-	in
+NN-L-NET-027_OutboundAuthBruteforce	net	engine	-	-	in
 NN-L-IOU-001_IoUringRingCreated	io_uring	engine	-	-	in
 NN-L-IOU-002_IoUringFileAndNetwork	io_uring	engine	-	-	in
 NN-L-BPF-001_BpfProgramLoaded	bpf	engine	-	-	in

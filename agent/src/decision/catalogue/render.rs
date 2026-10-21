@@ -264,6 +264,8 @@ pub fn shipped_rules() -> Vec<ShippedRule> {
         Arc::new(Mutex::new(
             crate::decision::correlation::CorrelationStore::new(),
         )),
+        // Lab PR 224: no configured resolver, the default fan-out thresholds.
+        rules::net::NetRuleConfig::default(),
     );
     let direct: [Box<dyn Rule>; 3] = [
         Box::new(rules::anti_tamper::NnLAt001AntiTamperDenial),

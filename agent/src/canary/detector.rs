@@ -348,8 +348,12 @@ impl Detector {
             .iter()
             .position(|&(pid, ts)| pid == nf.pid && ts == nf.start_ns)
         {
+            // Lab PR 224: the connection's open-phase rows (its connect,
+            // its snapshots) belong to the trip as well; its close ends it.
             Some(i) => {
-                flows.remove(i);
+                if !nf.phase.is_open() {
+                    flows.remove(i);
+                }
                 true
             }
             None => false,
@@ -756,6 +760,7 @@ mod tests {
             exe: Default::default(),
             argv_truncated: false,
             filename_truncated: false,
+            stdio: Default::default(),
         }
     }
 
@@ -1360,6 +1365,8 @@ mod tests {
             tls_fingerprint: None,
             flow_id: String::new(),
             close_reason: 111,
+            phase: Default::default(),
+            observed_ns: 0,
         })
     }
 

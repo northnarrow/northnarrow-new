@@ -83,6 +83,12 @@ pub enum Event {
         /// past the cut may lead anywhere). `false` on older records.
         #[serde(default)]
         filename_truncated: bool,
+        /// Lab PR 224 (CM-03): the new image's standard streams and its
+        /// parent's, as the kernel found them at the exec: which are inet
+        /// sockets, connected out or not, and to which peer. Unread
+        /// (`read: false`) on older records and older eBPF objects.
+        #[serde(default)]
+        stdio: StdioSockets,
     },
     /// File open event (LSM `file_open`).
     FileOpen {
@@ -1048,6 +1054,10 @@ impl From<&ProcessSpawnRaw> for Event {
             exe: ExeIdentity::from_raw(&raw.exe),
             argv_truncated: raw.trunc_flags & crate::wire::spawn_trunc::ARGV != 0,
             filename_truncated: raw.trunc_flags & crate::wire::spawn_trunc::FILENAME != 0,
+            stdio: StdioSockets {
+                own: StdioSocket::from_raw(&raw.stdio),
+                parent: StdioSocket::from_raw(&raw.parent_stdio),
+            },
         }
     }
 }
@@ -1078,6 +1088,80 @@ impl From<&ExecCheckRaw> for Event {
             filename: crate::wire::cstr_lossy(&raw.filename).into_owned(),
             timestamp_ns: raw.timestamp_ns,
             exe: ExeIdentity::from_raw(&raw.exe),
+        }
+    }
+}
+
+/// Lab PR 224 (CM-03): the standard streams of an exec's process and of
+/// its parent ([`Event::ProcessSpawn::stdio`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StdioSockets {
+    #[serde(default)]
+    pub own: StdioSocket,
+    #[serde(default)]
+    pub parent: StdioSocket,
+}
+
+/// Lab PR 224 (CM-03): one task's fds 0..2 at an exec, decoded from
+/// [`crate::wire::StdioRaw`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StdioSocket {
+    /// The kernel read the task's file table: the fields below say what
+    /// is there. `false`: unknown (an offset missing on this kernel, an
+    /// older eBPF object), never "no socket".
+    #[serde(default)]
+    pub read: bool,
+    /// Bit `n` set: fd `n` (0 stdin, 1 stdout, 2 stderr) is an
+    /// `AF_INET` / `AF_INET6` socket.
+    #[serde(default)]
+    pub inet_fds: u8,
+    /// One of those sockets was connected out by a local process (the
+    /// connect kprobe recorded it).
+    #[serde(default)]
+    pub outbound: bool,
+    /// `sk_protocol` of the first one (6 TCP, 17 UDP), 0 when unknown.
+    #[serde(default)]
+    pub proto: u8,
+    /// The first one's peer, when it has one.
+    #[serde(default)]
+    pub peer: Option<std::net::SocketAddr>,
+}
+
+impl StdioSocket {
+    pub fn from_raw(raw: &crate::wire::StdioRaw) -> Self {
+        use crate::wire::stdio_flags;
+        if raw.flags & stdio_flags::READ == 0 {
+            return Self::default();
+        }
+        let inet_fds = (raw.flags & stdio_flags::ANY_INET) >> 1;
+        let peer =
+            (inet_fds != 0 && raw.peer_port != 0 && matches!(raw.family, 2 | 10)).then(|| {
+                std::net::SocketAddr::new(
+                    crate::netaddr::canonical_ip(raw.family, &raw.peer_addr),
+                    raw.peer_port,
+                )
+            });
+        Self {
+            read: true,
+            inet_fds,
+            outbound: inet_fds != 0 && raw.flags & stdio_flags::OUTBOUND != 0,
+            proto: raw.proto,
+            peer,
+        }
+    }
+
+    /// stdin or stdout is an inet socket: the shell's input or output
+    /// is the network.
+    pub fn stdin_or_stdout_inet(&self) -> bool {
+        self.read && self.inet_fds & 0b011 != 0
+    }
+
+    /// `tcp`, `udp`, or `inet` when the protocol is unknown.
+    pub fn proto_name(&self) -> &'static str {
+        match self.proto {
+            6 => "tcp",
+            17 => "udp",
+            _ => "inet",
         }
     }
 }

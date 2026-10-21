@@ -235,11 +235,11 @@ The agent now reads the prototype of `bpf_lsm_inode_setattr` from the
 running kernel's BTF at boot, takes the position of its only `struct
 dentry *` argument (which must be followed by the `struct iattr *`), and
 writes it into the `BTF_OFFSETS` map (`INODE_SETATTR_DENTRY_ARG`, slot
-108) before anything attaches; both programs read the dentry at that
+109) before anything attaches; both programs read the dentry at that
 position. The same check found a second case: on 5.7 to 5.11 (5.10 LTS
 included) `inode_setxattr` and `inode_removexattr` start with the dentry,
 where the xattr deny read argument 1 (the attribute name); their
-positions are resolved the same way (slots 109 and 110, the name taken
+positions are resolved the same way (slots 110 and 111, the name taken
 right after the dentry).
 
 Hook prototypes per kernel, for the arguments the programs read
@@ -561,6 +561,25 @@ Both plain names are present on 5.15, 6.1 and 6.8. To check a kernel:
   `--dns-sensor sendmsg`. The fallback is logged at WARN.
 - **No `udp_v6_send_skb`:** IPv4 stays on the socket buffer. Queries to
   IPv6 resolvers are not observed, and a WARN says so.
+
+## Standard streams at exec and the connect deny (lab PR 224)
+
+`sched_process_exec` reads the new image's fds 0..2 and its parent's
+(`agent-ebpf/src/stdio.rs`, a global function: `task->files->fdt->fd[i]`,
+`file->private_data`, `socket->sk`) for R020. All its offsets are optional:
+`task_struct.files`, `files_struct.fdt`, `fdtable.max_fds` / `fd`,
+`file.private_data` and the new `socket.sk` (`SOCKET_SK_OFFSET`, byte 24 on
+5.3 and later). Without one of them the record says "not read" and R020
+cannot fire; the `--btf-check` report lists the absent slot. The optional
+`--net-connect-deny` attaches `socket_connect_deny` on LSM `socket_connect`
+(`(sock, address, addrlen)`, a fixed prototype checked at boot with the
+other `HOOK_ARG_CHECKS`). Both load on 5.15, 6.1, 6.8 and 6.12
+(`deploy/lab/nn-lab.sh verifier-check`; end to end:
+`deploy/lab/malsim/net-check.sh`). Should a kernel's verifier refuse the
+standard-stream probes, the agent loads `sched_process_exec_nostdio`, the
+same program without them: the exec records keep flowing, their streams
+say "not read", and R020's loss is a signed degradation (`stdio_probe`,
+in `nn-admin status`) — never the process-spawn sensor's.
 
 ## Older verifiers (5.15): constructs the eBPF code avoids
 

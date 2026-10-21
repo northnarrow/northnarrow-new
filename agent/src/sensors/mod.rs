@@ -9,6 +9,7 @@
 //! [`ExecSensor`] is preserved as a thin compatibility wrapper so the
 //! existing live integration test keeps working.
 
+pub mod connect_deny;
 pub mod dns_sensor;
 pub mod ebpf_object;
 /// Lab PR 219: the exploit post-condition guard (loader, mode, counters).

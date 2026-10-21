@@ -97,9 +97,13 @@
       "techniqueID": "T1059"
     },
     {
-      "comment": "R006_ReverseShellTooling, R017_ShellFromNonstandardPath, NN-L-EXECQ-001_FirstSightQuarantine",
+      "comment": "R020_ShellWithSocketStdio, R006_ReverseShellTooling, R017_ShellFromNonstandardPath, NN-L-EXECQ-001_FirstSightQuarantine",
       "enabled": true,
       "metadata": [
+        {
+          "name": "rule",
+          "value": "R020_ShellWithSocketStdio (unit)"
+        },
         {
           "name": "rule",
           "value": "R006_ReverseShellTooling (unit)"
@@ -113,7 +117,7 @@
           "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
         }
       ],
-      "score": 3,
+      "score": 4,
       "showSubtechniques": false,
       "tactic": "execution",
       "techniqueID": "T1059.004"
@@ -657,6 +661,20 @@
       "techniqueID": "T1685.006"
     },
     {
+      "comment": "NN-L-NET-027_OutboundAuthBruteforce",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-NET-027_OutboundAuthBruteforce (unit+lab)"
+        }
+      ],
+      "score": 1,
+      "showSubtechniques": false,
+      "tactic": "credential-access",
+      "techniqueID": "T1110"
+    },
+    {
       "comment": "NN-L-FIM-011_AwsCredsRead, NN-L-FIM-012_AzureCredsRead, NN-L-FIM-013_GcpCredsRead, NN-L-FIM-014_DockerCredsRead, NN-L-CANARY-004_CredentialRead",
       "enabled": true,
       "metadata": [
@@ -783,7 +801,7 @@
       "techniqueID": "T1556.003"
     },
     {
-      "comment": "NN-L-CANARY-003_NetworkConnect, NN-L-NET-007_Rfc1918FromUnusualProc",
+      "comment": "NN-L-CANARY-003_NetworkConnect, NN-L-NET-026_ScanFanOut, NN-L-NET-007_Rfc1918FromUnusualProc",
       "enabled": true,
       "metadata": [
         {
@@ -792,10 +810,14 @@
         },
         {
           "name": "rule",
+          "value": "NN-L-NET-026_ScanFanOut (unit+lab)"
+        },
+        {
+          "name": "rule",
           "value": "NN-L-NET-007_Rfc1918FromUnusualProc (unit)"
         }
       ],
-      "score": 2,
+      "score": 3,
       "showSubtechniques": false,
       "tactic": "discovery",
       "techniqueID": "T1046"
@@ -993,9 +1015,13 @@
       "techniqueID": "T1090.003"
     },
     {
-      "comment": "R006_ReverseShellTooling, R005_NetcatExec, NN-L-NET-001_OutboundToBlockedIp",
+      "comment": "R020_ShellWithSocketStdio, R006_ReverseShellTooling, R005_NetcatExec, NN-L-NET-001_OutboundToBlockedIp",
       "enabled": true,
       "metadata": [
+        {
+          "name": "rule",
+          "value": "R020_ShellWithSocketStdio (unit)"
+        },
         {
           "name": "rule",
           "value": "R006_ReverseShellTooling (unit)"
@@ -1009,7 +1035,7 @@
           "value": "NN-L-NET-001_OutboundToBlockedIp (unit)"
         }
       ],
-      "score": 3,
+      "score": 4,
       "showSubtechniques": false,
       "tactic": "command-and-control",
       "techniqueID": "T1095"

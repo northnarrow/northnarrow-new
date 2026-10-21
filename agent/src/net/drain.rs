@@ -57,7 +57,7 @@ use tracing::{debug, warn};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
 use crate::net::dns_cache::DnsCache;
-use crate::net::flow_tracker::{FlowTracker, TcpCloseInfo, UdpSendInfo};
+use crate::net::flow_tracker::{FlowTracker, SnapshotPolicy, TcpCloseInfo, UdpSendInfo};
 use crate::net::limiter::RuleGate;
 
 /// External audit NET-019: the longest a netflow or listener row waits for
@@ -413,6 +413,8 @@ pub async fn drain_loop(
     lineage: crate::posture::lineage::AuthSessionTracker,
     // External audit NET-019: which rows reach the rules.
     mut gate: RuleGate,
+    // Lab PR 224 (CM-02 b): which open flows are re-judged, how often.
+    snapshot: SnapshotPolicy,
     event_tx: mpsc::Sender<Event>,
 ) -> std::io::Result<()> {
     let mut close_fd = crate::async_fd::register(close_rb)?;
@@ -423,10 +425,29 @@ pub async fn drain_loop(
     // External audit NET-019: commits the rows of a quiet period too.
     let mut commit_tick = tokio::time::interval(NETFLOW_SYNC_INTERVAL);
     commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Lab PR 224 (CM-02 b): the open-flow snapshots, checked every tick
+    // (each flow is due once per interval).
+    let mut snapshot_tick = tokio::time::interval(snapshot_tick_period(&snapshot));
+    snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = commit_tick.tick() => {
                 group_commit(netflow_db.as_ref(), listener_db.as_ref());
+            }
+            _ = snapshot_tick.tick() => {
+                let rows = due_snapshot_rows(
+                    &flow_tracker,
+                    &dns_cache,
+                    &lineage,
+                    &snapshot,
+                    monotonic_ns(),
+                );
+                for row in rows {
+                    crate::net::flow_tracker::note_snapshot_sent();
+                    if event_tx.send(Event::NetFlow(row)).await.is_err() {
+                        return Ok(());
+                    }
+                }
             }
             r = udp_fd.readable_mut() => {
                 let mut guard = r?;
@@ -490,6 +511,62 @@ pub async fn drain_loop(
             }
         }
     }
+}
+
+/// Lab PR 224: how often the drain looks for due snapshots — every 10 s, or
+/// the interval when shorter (at least 1 s).
+fn snapshot_tick_period(policy: &SnapshotPolicy) -> Duration {
+    Duration::from_nanos(policy.interval_ns.clamp(1_000_000_000, 10_000_000_000))
+}
+
+/// CLOCK_MONOTONIC in ns: `bpf_ktime_get_ns`'s clock, the flows' clock.
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock id and a timespec to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Lab PR 224 (CM-02 b): the snapshots due at `now_ns`, for the rules.
+/// A flow whose process is gone, or whose pid another process holds now
+/// (it started after the connect), is not handed out: its socket may live
+/// on in a child, but nothing names it. The image is read again — the
+/// process may have executed another since its connect — and so is the
+/// DNS name.
+pub(crate) fn due_snapshot_rows(
+    flow_tracker: &Mutex<FlowTracker>,
+    dns_cache: &DnsCache,
+    lineage: &crate::posture::lineage::AuthSessionTracker,
+    policy: &SnapshotPolicy,
+    now_ns: u64,
+) -> Vec<NetFlowEvent> {
+    let batch = flow_tracker.lock().due_snapshots(now_ns, policy);
+    if batch.deferred > 0 {
+        debug!(
+            target: "net.drain",
+            deferred = batch.deferred,
+            max = policy.max_per_tick,
+            "open-flow snapshots deferred to a later tick (per-tick bound)"
+        );
+    }
+    let mut out = Vec::with_capacity(batch.flows.len());
+    for mut row in batch.flows {
+        match lineage.start_floor_ns(row.pid) {
+            None => continue,
+            Some(floor) if floor > row.start_ns => continue,
+            Some(_) => {}
+        }
+        if let Some(image) = lineage.image_path(row.pid) {
+            row.exe = Some(image);
+        }
+        row.resolved_hostname =
+            dns_cache.lookup_for_connect(row.pid, row.start_ns, row.proc_start_ns);
+        out.push(row);
+    }
+    out
 }
 
 /// External audit NET-019: one fsync for the netflow rows, and one for the
@@ -860,7 +937,67 @@ mod tests {
             tls_fingerprint: None,
             flow_id: "abc".to_string(),
             close_reason: 0,
+            phase: Default::default(),
+            observed_ns: 0,
         }
+    }
+
+    /// Lab PR 224 (CM-02 b): the snapshots handed to the rules name the
+    /// image the process runs now (it executed another since its connect),
+    /// and a flow whose process is gone, or whose pid a later process
+    /// holds, is not handed out.
+    #[test]
+    fn snapshot_rows_name_the_current_image_and_skip_the_gone() {
+        use crate::net::flow_tracker::TcpConnectInfo;
+        let tmp = tempfile::tempdir().unwrap();
+        let ticks: u64 = 1_000; // a start long before the connects below
+        for pid in [4700u32, 4702] {
+            let dir = tmp.path().join(pid.to_string());
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("stat"),
+                format!("{pid} (p) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {ticks} 0 0\n"),
+            )
+            .unwrap();
+        }
+        // pid 4702 is held by a process started after its connect.
+        std::fs::write(
+            tmp.path().join("4702/stat"),
+            "4702 (p) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 999999999999 0 0\n",
+        )
+        .unwrap();
+        let lineage = crate::posture::lineage::AuthSessionTracker::new(tmp.path());
+        lineage.ingest_spawn(4700, 1, "/var/tmp/nn-ms/stage2", 1);
+        let tracker = Mutex::new(FlowTracker::default());
+        let start = 100_000_000_000u64;
+        for (pid, sk) in [(4700u32, 1u64), (4701, 2), (4702, 3)] {
+            tracker.lock().on_tcp_connect(&TcpConnectInfo {
+                start_ns: start,
+                sk_ptr: sk,
+                family: 2,
+                src_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                src_port: 0,
+                dst_addr: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                dst_port: 8443,
+                proto: 6,
+                pid,
+                uid: 0,
+                comm: "python3".into(),
+                exe: Some("/usr/bin/python3.12".into()),
+                proc_start_ns: 0,
+            });
+        }
+        let rows = due_snapshot_rows(
+            &tracker,
+            &DnsCache::default(),
+            &lineage,
+            &SnapshotPolicy::default(),
+            start + 61_000_000_000,
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].pid, 4700);
+        assert_eq!(rows[0].exe.as_deref(), Some("/var/tmp/nn-ms/stage2"));
+        assert_eq!(rows[0].phase, common::wire::FlowPhase::Snapshot);
     }
 
     fn fresh_key() -> AgentSigningKey {

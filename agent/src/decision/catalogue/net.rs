@@ -12,8 +12,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcessTree],
         sensors: &[Sensor::Network],
         data_components: &["DC0082", "DC0078"],
-        observes: "A finished outbound flow whose destination address is in the operator's \
-                   netflow blocklist (`/etc/northnarrow/netflow-blocklist.{v1,local}`, \
+        observes: "An outbound flow — at its connect, while it is open, at its close, or a \
+                   connect refused by `--net-connect-deny` — whose destination address is in \
+                   the operator's netflow blocklist (`/etc/northnarrow/netflow-blocklist.{v1,local}`, \
                    addresses and CIDRs). Never held back by the netflow rate limiter.",
         false_positives: "Only as good as the blocklist: an entry that covers a shared address \
                           (a CDN, a cloud load balancer) kills every client of it. The shipped \
@@ -173,10 +174,13 @@ pub(super) const DOCS: &[RuleDoc] = &[
         actions: &[ResponseAction::KillProcess, ResponseAction::Log],
         sensors: &[Sensor::Network, Sensor::Exec],
         data_components: &["DC0082", "DC0078", "DC0034"],
-        observes: "An outbound flow to a port other than 53 from a process whose image lies in \
-                   `/tmp`, `/var/tmp` or `/dev/shm` (named at connect time from the spawn \
-                   cache or `/proc`). A process of a root package transaction is recorded \
-                   (Log), not killed.",
+        observes: "An outbound flow (at its connect, while it is open, at its close) from a \
+                   process whose image lies in `/tmp`, `/var/tmp` or `/dev/shm` (named from \
+                   the spawn cache or `/proc`), other than one to port 53 of a configured \
+                   resolver. A process of a root package transaction is recorded (Log), not \
+                   killed. To port 53 of a server that is no configured resolver — a match new in lab PR 224, \
+                   which exempts only the host's resolvers — the kill is held behind the \
+                   per-rule response policy (off by default): recorded at the same severity.",
         false_positives: "Installers and self-extracting archives that run a helper from a \
                           staging directory and call out; package-manager transactions are \
                           carved out. A staged exec followed by egress within 5 minutes is \
@@ -228,7 +232,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
         observes: "An outbound flow to port 4444 (Metasploit's default), 1080 (SOCKS), 6667 or \
                    6697 (IRC) or 9001 (Tor relays) from a process outside the netflow comm \
                    allowlist. A process named like an allowlisted program whose executable \
-                   could not be read is recorded (Log), not killed.",
+                   could not be read is recorded (Log), not killed. An allowlisted transfer \
+                   tool (curl, wget, ssh, scp, sftp, rsync, git) whose lineage holds a \
+                   precursor is judged as any program (lab PR 224); it was exempt before, so \
+                   its kill is held behind the per-rule response policy (off by default).",
         false_positives: "IRC clients, SOCKS proxies and Tor run by a user, and services that \
                           happen to use these ports; 443 is deliberately not in the set (the \
                           rule kills).",
@@ -317,7 +324,10 @@ pub(super) const DOCS: &[RuleDoc] = &[
         observes: "An outbound flow to an internal address (RFC 1918, IPv6 unique-local or \
                    link-local) on 445 (SMB), 3389 (RDP), 5985 (WinRM) or 5900 (VNC) from a \
                    process outside the netflow comm allowlist. A process named like an \
-                   allowlisted program whose executable could not be read is recorded (Log).",
+                   allowlisted program whose executable could not be read is recorded (Log). \
+                   An allowlisted transfer tool whose lineage holds a precursor is judged as \
+                   any program (lab PR 224), its kill held behind the per-rule response \
+                   policy (off by default).",
         false_positives: "Administration clients (`smbclient`, RDP and VNC viewers) and \
                           monitoring of Windows hosts from this one, when not in the allowlist. \
                           SSH (22) is not watched (V2 row TQ04, a known gap).",
@@ -407,5 +417,52 @@ pub(super) const DOCS: &[RuleDoc] = &[
         attack_note: "The code named T1562.006 Indicator Blocking, revoked in v19, until lab \
                       PR 221; its replacement T1685 Disable or Modify Tools (Defense \
                       Impairment) covers blocking the telemetry a sensor collects.",
+    },
+    // ── outbound fan-out (lab PR 224, CM-14) ────────────────────────
+    RuleDoc {
+        id: "NN-L-NET-026_ScanFanOut",
+        severities: &[Severity::High],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Network],
+        data_components: &["DC0082"],
+        observes: "Connect attempts and UDP sends of one process, or of the direct children \
+                   of one parent, in a sliding window: 64 distinct hosts or 256 (host, port) \
+                   pairs within 60 s is recorded; 512 hosts from one process is a second \
+                   record, whose kill (`KillProcess`) is held behind the per-rule response \
+                   policy, off by default (`--net-scan-*`).",
+        false_positives: "Monitoring and orchestration (Prometheus, Zabbix, Nagios, kubelet, \
+                          Ansible, … and `--net-fanout-exempt`) are exempt by lineage: the \
+                          name of the executable the kernel ran, in a root-owned system tree, \
+                          never the comm a process sets; a raised threshold (flag or \
+                          environment) is a signed weakening.",
+        how_to_test: "`net-check.sh --only MS21`: a sweep of a loopback /24 from one process, \
+                      a port scan of one host.",
+        tests: &[
+            "agent/src/decision/rules/net_fanout.rs::\
+             a_sweep_is_recorded_then_killed_at_the_kill_threshold",
+            "agent/src/decision/rules/net_fanout.rs::a_port_scan_of_one_host_is_recorded_on_the_pairs",
+            "deploy/lab/malsim/net-check.sh::MS21",
+        ],
+        attack_note: "",
+    },
+    RuleDoc {
+        id: "NN-L-NET-027_OutboundAuthBruteforce",
+        severities: &[Severity::High],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Network],
+        data_components: &["DC0082"],
+        observes: "Connects of one process (or of one parent's children) to authentication \
+                   services — SSH, Telnet, RDP, VNC ports — in a sliding window: 20 within \
+                   300 s is recorded; 100 from one process is a second record, whose kill \
+                   (`KillProcess`) is held behind the per-rule response policy, off by default \
+                   (`--net-brute-*`).",
+        false_positives: "Configuration management that opens many SSH sessions (Ansible and \
+                          the other exempt programs, by lineage); a jump host's own users.",
+        how_to_test: "`net-check.sh --only MS21`: repeated connects to a loopback SSH port.",
+        tests: &[
+            "agent/src/decision/rules/net_fanout.rs::repeated_ssh_connects_are_a_brute_force",
+            "deploy/lab/malsim/net-check.sh::MS21",
+        ],
+        attack_note: "Outbound only: the connects are counted, not the credentials tried.",
     },
 ];
