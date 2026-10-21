@@ -71,8 +71,8 @@ pub struct InstallManifest {
     pub prerequisite_overrides: Vec<String>,
     /// Directory the binaries were installed into.
     pub bin_dir: String,
-    /// `name → sha256 hex`. Names: `northnarrow-agent`, `northnarrow-watchdog`,
-    /// `nn-admin`, [`EBPF_OBJECT_KEY`].
+    /// `name → sha256 hex`. Names: [`RECORDED_NAMES`] (the binaries and
+    /// [`EBPF_OBJECT_KEY`]).
     pub files: BTreeMap<String, String>,
     #[serde(default)]
     pub tarball_sha256: Option<String>,
@@ -466,11 +466,12 @@ mod tests {
         assert!(parsed.prerequisite_overrides.is_empty());
     }
 
-    /// External audit WDG-R05 (NN-AUD-371): a name outside the four
-    /// install.sh records is a mismatch and is never opened — not an
-    /// absolute path (a join drops `bin_dir`), not a relative one that
-    /// leaves it or names a recorded binary another way. Before the check,
-    /// each of these files was hashed and, its hash recorded, verified
+    /// External audit WDG-R05 (NN-AUD-371): a name outside the ones
+    /// install.sh records ([`RECORDED_NAMES`]) is a mismatch and is never
+    /// opened — not an absolute path (a join drops `bin_dir`), not a
+    /// relative one that leaves it or names a recorded binary another way.
+    /// Before the check, each of these files was hashed and, its hash
+    /// recorded, verified
     /// (`/dev/zero`, which hung the check, is the fuzz regression input
     /// `fuzz/regressions/install_manifest/absolute-dev-zero.json`).
     #[test]
@@ -508,9 +509,9 @@ mod tests {
     }
 
     /// External audit WDG-R05 (NN-AUD-371): the fuzz target's fixture (a
-    /// fixed `bin_dir` holding the three binaries, `fuzz_api`) reaches the
-    /// hash comparison. Through `/proc/self/exe` every input ended
-    /// `NotApplicable`, before any hash.
+    /// fixed `bin_dir` holding a binary for each recorded file name,
+    /// `fuzz_api`) reaches the hash comparison. Through `/proc/self/exe`
+    /// every input ended `NotApplicable`, before any hash.
     #[test]
     fn fuzz_fixture_reaches_hash_comparison() {
         use crate::fuzz_api::{

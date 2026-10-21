@@ -189,24 +189,45 @@ fn wait_state(pid: u32, want: impl Fn(Option<char>) -> bool) -> bool {
     false
 }
 
-/// A copy of `sleep` at `dir/name`, started and stopped.
-fn held_copy(dir: &Path, name: &str) -> Held {
-    let exe = dir.join(name);
-    std::fs::copy("/bin/sleep", &exe).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // ETXTBSY: another test thread's fork may still hold the copy's write
-    // descriptor until its own exec; retry briefly.
+/// `exe arg`, retried on ETXTBSY: another test thread's fork may still
+/// hold the copy's write descriptor until its own exec.
+fn spawn(exe: &Path, arg: &str) -> Child {
     let mut tries = 0;
-    let child = loop {
-        match Command::new(&exe).arg("30").spawn() {
-            Ok(c) => break c,
+    loop {
+        match Command::new(exe).arg(arg).spawn() {
+            Ok(c) => return c,
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 100 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => panic!("spawn {}: {e}", exe.display()),
         }
-    };
+    }
+}
+
+/// A copy of `sleep` at `dir/name/sleep`, started and stopped.
+///
+/// The copy keeps the name `sleep`, in a directory of its own per case:
+/// `/bin/sleep` may be a multi-call binary that picks its utility from
+/// the name it is run by (uutils coreutils on Ubuntu 26.04, the hosted CI
+/// runner, reads it from the path given to `execve`; busybox from
+/// `argv[0]`). A copy under another name printed "unknown program" and
+/// exited at once, so a case that resumed it found it gone, which read
+/// as a kill in observe mode and as "already ended" for a late verdict.
+fn held_copy(dir: &Path, name: &str) -> Held {
+    let home = dir.join(name);
+    std::fs::create_dir(&home).unwrap();
+    let exe = home.join("sleep");
+    std::fs::copy("/bin/sleep", &exe).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // the fixture's own precondition: the copy runs as sleep
+    let probe = spawn(&exe, "0").wait().unwrap();
+    assert!(
+        probe.success(),
+        "the copy of /bin/sleep at {} does not run as sleep: {probe}",
+        exe.display()
+    );
+    let child = spawn(&exe, "30");
     let pid = child.id();
     // SAFETY: stopping our own child.
     unsafe { libc::kill(pid as i32, libc::SIGSTOP) };

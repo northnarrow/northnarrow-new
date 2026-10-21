@@ -65,6 +65,7 @@ on:
       - cli/**
       - common/**
       - ebpf-guard/**
+      - scan/**
       - watchdog/**
       - xtask/**
       - configs/**
