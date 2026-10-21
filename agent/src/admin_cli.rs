@@ -205,6 +205,9 @@ pub struct StatusOutcome {
     /// Lab PR 219: the exploit post-condition guard's mode and counters
     /// (`None`: agent predates it, or the unsigned `status`).
     pub exploit_guard: Option<common::wire::admin_protocol::ExploitGuardStatus>,
+    /// Lab PR 222: the copy-on-first-write guard (`None`: withheld, or an
+    /// agent without it).
+    pub cow_guard: Option<common::wire::admin_protocol::CowGuardStatus>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -430,6 +433,7 @@ fn status_outcome(
         degradations: resp.degradations,
         capability_manifest: resp.capability_manifest,
         exploit_guard: resp.exploit_guard,
+        cow_guard: resp.cow_guard,
         telemetry_signed: signed,
     }
 }
@@ -2791,6 +2795,19 @@ fn signed_request(
     build: impl FnOnce([u8; 32], u64, [u8; 16]) -> SignedPayload,
     wrap: impl FnOnce(SignedPayload, Vec<KeyedSignature>) -> AdminMessage,
 ) -> Result<AdminMessage> {
+    signed_request_waiting(socket, key_path, agent_id_path, build, wrap, None)
+}
+
+/// [`signed_request`], waiting up to `reply_timeout` for the reply to the
+/// request itself (a restore of many files takes longer than 5 s).
+fn signed_request_waiting(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    build: impl FnOnce([u8; 32], u64, [u8; 16]) -> SignedPayload,
+    wrap: impl FnOnce(SignedPayload, Vec<KeyedSignature>) -> AdminMessage,
+    reply_timeout: Option<Duration>,
+) -> Result<AdminMessage> {
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut stream = connect_socket(socket)?;
@@ -2812,7 +2829,43 @@ fn signed_request(
         &mut stream,
         &wrap(payload, vec![KeyedSignature { signature: sig }]),
     )?;
+    if let Some(t) = reply_timeout {
+        stream.set_read_timeout(Some(t)).ok();
+    }
     read_frame(&mut stream)
+}
+
+/// Lab PR 222: `nn-admin remediate ransomware --pid N | --since TS
+/// [--dry-run]` (role `response-manage`): the agent restores the files from
+/// the copy-on-first-write journal. Waits up to 10 minutes for the reply.
+pub fn run_remediate_ransomware(
+    socket: &Path,
+    key_path: &Path,
+    agent_id_path: &Path,
+    pid: Option<u32>,
+    since_unix: Option<u64>,
+    dry_run: bool,
+) -> Result<common::wire::admin_protocol::RemediateRansomwareResponse> {
+    use common::wire::admin_protocol::RemediateRansomwareRequest;
+    match signed_request_waiting(
+        socket,
+        key_path,
+        agent_id_path,
+        |n, ts, id| SignedPayload::new_remediate_ransomware(n, ts, id, pid, since_unix, dry_run),
+        |payload, signatures| {
+            AdminMessage::RemediateRansomwareRequest(RemediateRansomwareRequest {
+                payload,
+                signatures,
+            })
+        },
+        Some(Duration::from_secs(600)),
+    )? {
+        AdminMessage::RemediateRansomwareResponse(r) => Ok(r),
+        other => bail!(
+            "unexpected reply to RemediateRansomwareRequest: {other:?} (an agent older than lab PR \
+             222 has no remediate verb)"
+        ),
+    }
 }
 
 /// `nn-admin response status` (role `audit-read`):
@@ -3638,6 +3691,7 @@ mod tests {
                         use_checks_total: 0,
                         denied_total: 0,
                     }),
+                    cow_guard: None,
                 }),
             );
         });

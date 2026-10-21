@@ -434,3 +434,45 @@ only in the table below, in the same PR as the evidence.
     `v2-techniques.tsv`, which keeps its pre-v19 ids (the coverage document
     reads them in v20).
   - Lab: On Ubuntu 24.04: a record written by `main` before this lot (R001_ExecFromTmp, `"mitre":{"tactic":[],"technique":[]}`, no mitre_version) was byte-identical after the upgrade, and `nn-admin chain verify` found nothing broken since the run began (its one break, a manifest entry written on 20/10 with another key, predates the run and the agent had signed it then as tail_unverified). R001, R014 (an `at` job), NN-L-FIM-007 (a file in /etc/cron.d from a unit) and NN-L-NET-004 (a long name under example.com) were recorded with the typed ids RULE_CATALOGUE.md gives them, in order, mitre_version 20.0 — R001 {TA0002 / T1059}, R014 {TA0003, TA0002 / T1053.002}, NN-L-FIM-007 {TA0003 / T1053.003}, NN-L-NET-004 {TA0011 / T1071.004} — and no rule record written by the upgraded agent had an empty mitre (the 105 written between the mark and its first start were the base agent's); tamper-check's 94 NN-L-AT-001 records carried {TA0112, TA0005, TA0006 / T1685, T1055.008, T1055.009, T1552.004}. Across every step of the lab, on the four guests, the records of 44 rules passed the typed check and none failed (exec quarantine, exec policy and security-tool records within their catalogue entry). The operator read-back (`nn-admin detections --key`) was not run: the lab key holds no telemetry-read role. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).
+- **Lab PR 222 — copy on first write: ransomware rollback for Linux
+  (EXPERIMENTAL, off by default).** C19 (rollback and remediation), C17
+  (response on processes and files); `docs/design/COPY_ON_FIRST_WRITE.md`.
+  - C19: before a writer whose trust is not established opens an existing
+    file for writing in a protected scope, the agent copies it while the open
+    waits in a fanotify permission event (`FAN_OPEN_PERM`, answered
+    `FAN_ALLOW` by the reader, the copier or a backstop — a copy within
+    50 + 25 ms of the reader reading the event, any other open once the
+    reader has decided; never denied). Reflink (`FICLONE`) where the
+    filesystem shares extents, else a bounded copy (16 MiB), into a
+    root-only journal per scope (by default on the scope's filesystem)
+    under the anti-tamper inode protections, with a content index, a byte
+    budget, LRU eviction past a 15 min floor and 24 h retention, both from
+    a copy's last use. The guard's own threads open no journal file while
+    holding a lock its reader takes (a scope marked by mount or filesystem
+    has its journal under the mark). Trust by exec identity
+    and ordered lineage (a root package transaction, or a trusted writer
+    with no foreign ancestor), never by `comm`; the writer's open flags from
+    `/proc/<tid>/syscall`.
+  - C17 / C19: `nn-admin remediate ransomware [--pid] [--since]
+    [--dry-run]` (signed, `response-manage`; together they narrow each
+    other, `--since` alone takes every writer's copies since then) restores
+    a tree's files; with `auto_restore = true` (off by default) the COMBAT
+    ladder's NEUTRALIZE or NN-L-FIM-010's kill (no COMBAT needed) of a tree
+    a ransomware signal named restores them on its own. One signed
+    `cow_restore` row per file; a file someone else changed after the
+    attack, as far as the guard saw (its write-open records are in memory,
+    8 per inode, and only the mtime counts after a restart), is not
+    overwritten (the original is written beside it).
+  - Not protected, stated: files over the cap without reflink, writers
+    already trusted, the journal against root with the anti-tamper hooks
+    off, descriptors opened before the guard watched (an `mmap` write is
+    seen at its open), encryption into new files with unlink or rename-over.
+    Pure ransomware raises ENGAGED, not COMBAT (BUG-032, POS-001): there the
+    restore is the operator's signed verb.
+  - Levels unchanged (C19 1, C17 2): the evidence is the lab's, owed on
+    Ubuntu 24.04 — ext4 (copy path), an XFS loop filesystem with
+    `reflink=1` (reflink path), the automatic restore after a NEUTRALIZE,
+    the trusted-writer negative run and the open-for-write overhead
+    (`deploy/lab/cow/cow-check.sh`). Open: no deny mode, no pre-delete
+    protection, flags from `/proc` rather than the LSM hook.
+  - Lab: On Ubuntu 24.04, with the guard on (the lot's cow-check.sh: its drop-in, a signed cow-guard.local, response-manage on the lab key, all put back by its cleanup): on ext4 (mark=dirs) the signed cow_guard row "started" with copy_method copy, on an XFS loop filesystem (mark=mount, reflink=1) copy_method reflink, no integrity drift for its drop-in. The benign simulator, run as the lab user, rewrote and renamed 51 files: on XFS `nn-admin remediate ransomware --pid` recreated all 51 (sha256 51 of 51); on ext4 50 (the 20 MiB file is over the 16 MiB copy cap, unprotected as designed), each a signed cow_restore row; the run drew NN-L-IMP-001 (lab PR 225) with its kill held. With auto_restore = true and the simulator as root tripping the anti-tamper tripwire, COMBAT NEUTRALIZEd it and the guard restored the 50 files itself ("restore done source=COMBAT NEUTRALIZE", 50 cow_restore rows "by auto (COMBAT NEUTRALIZE)", a cow_guard auto_restore row). vim started by a unit as the lab user rewrote 10 files with no copy (trusted opens 0 → 10), `cp` over three took three copies. Cost on ext4 (cow_bench, 2,000 files of 4 KiB): open 4.0 µs mean outside the scope, 302.5 µs on the copy path inside it; 200 files of 1 MiB 6.7 ms; the guard's own counters: fast path avg 79 µs, copy path avg 820 µs, max 8.1 ms (2,203 copies). The first ext4 run copied nothing: the harness re-made the tree's directories after the guard had marked them (with mark=dirs a new directory is marked at the next 60 s rescan), its chown of the tree touched the guard's write-denied journal (four NN-L-AT-001 denials, a locked COMBAT), and it started vim from its own script, an ancestor the guard's trust rule refuses; the harness was fixed in this lot and the ext4 cases run again. After the fix of the guard's fanotify reader (it reads the group only through its own descriptor, under its lock, and ends an orderly stop with an INFO line), a restart of the agent with the guard running on ext4 left the stopping agent's "the fanotify reader ends (the guard stops)" and no "reading the fanotify group failed" ERROR, and the new agent's guard ran. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).

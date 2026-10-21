@@ -70,6 +70,19 @@ If the units are already active, `install.sh` refuses with
 `Re-run with --upgrade`: with the hooks up every copy below would fail
 with `Operation not permitted` halfway through.
 
+**Copy on first write** (lab PR 222, experimental, off by default).
+`install.sh --cow-guard` installs the drop-in
+`northnarrow-agent.service.d/20-cow-guard.conf`, which adds
+`CAP_SYS_ADMIN` (fanotify permission events), `CAP_CHOWN` and `CAP_FOWNER`
+(the restore's owner and mode) to the agent's unit; the guard runs only
+when a signed `cow-guard.local` enables it as well
+([the design](https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/COPY_ON_FIRST_WRITE.md)).
+`--no-cow-guard` removes the
+drop-in; without either flag a run keeps the drop-in as it is. The guard's
+journals (`<scope>/.northnarrow-cow` by default) are not under
+`/etc/northnarrow` or `/var/lib/northnarrow`: `uninstall.sh`, `--purge`
+included, leaves them where they are.
+
 **Both units stopped, the pin root still there** (external audit DEP-020,
 lab PR 194). The deny hooks outlive the agent through their pins: after a
 stop inside a window that has since closed, the binaries, the units and
@@ -134,7 +147,8 @@ start — left the host without a working agent. What it does now, in order:
    owner, times, extended attributes; mode `0700`, outside the agent's own
    directories), and lists the ones that do not exist yet. That is the two
    binaries and `nn-admin`, the three units (the agent's, the watchdog's
-   and its `OnFailure=` handler, lab PR 216), the Debian drop-in,
+   and its `OnFailure=` handler, lab PR 216), the Debian drop-in and the
+   copy-on-first-write one (lab PR 222),
    `journald@northnarrow.conf`, `install-manifest.json`, the five `.v1`
    lists, the overlay template, the ten control-surface files, the five
    canary templates, the overlay signatures the run may add and, when
@@ -462,7 +476,8 @@ name-based on purpose (no path walk in the kernel): a path longer than
 acceptable for a handle that cannot detach or update anything, while the
 pin files themselves are protected by inode. Independently of the mode,
 the agent re-checks every registered link every 10 s through its own fd or
-its pin (no `CAP_SYS_ADMIN` needed, the unit does not have it) and, if one
+its pin (no `CAP_SYS_ADMIN` needed: the unit has it only with the
+copy-on-first-write drop-in) and, if one
 is gone or has no program any more, logs an ERROR and appends a signed
 audit entry (`op=bpf_link_missing`): a detached hook is an alert even when
 the deny path is off (observe mode, tests).

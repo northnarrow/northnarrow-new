@@ -6,6 +6,63 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Copy on first write: ransomware rollback for Linux (lab PR 222,
+  EXPERIMENTAL, off by default; capabilities C19, C17;
+  `docs/design/COPY_ON_FIRST_WRITE.md`). Before a writer whose trust is not
+  established opens an existing file for writing in a protected scope, the
+  agent copies the file while the open waits in a fanotify permission event
+  (`FAN_OPEN_PERM`, `FAN_REPORT_TID`; answered `FAN_ALLOW` by the reader,
+  the copier or a backstop — never denied, never waited on indefinitely: a
+  copy within `event_budget_ms` (50 ms) + 25 ms of the reader reading the
+  event, any other open once the reader has decided; a reader stalled 3 s
+  closes the group and the kernel allows everything). No thread of the
+  guard opens a journal file while holding a lock the reader takes, so a
+  scope marked by mount or filesystem, its journal under the mark, does not
+  make the guard wait on itself. The writer's open flags come from
+  `/proc/<tid>/syscall` (the fanotify metadata has none; `openat2`, `io_uring`
+  and anything unknown count as writes). Trust is by exec identity and
+  ordered lineage (`AuthSessionTracker::lineage_identities`, new): a root
+  package transaction, or a trusted writer — editors and `git`, plus the
+  overlay's `trusted_writer` entries, by `ExecIdentity::is_client` — with no
+  foreign ancestor; never by `comm`. The copy is a reflink (`FICLONE`: XFS,
+  btrfs) or a bounded copy (`copy_file_range`, at most `copy_cap`, 16 MiB),
+  into a root-only journal per scope, by default on the scope's filesystem
+  (`<scope>/.northnarrow-cow`, registered in `PROTECTED_INODES`: MUTATE |
+  NOCREATE on its directories, MUTATE | WRITE on `index.jsonl`), with a
+  content index (path, inode, size, times, birth time, owner, SHA-256, writer
+  and lineage), a byte budget per scope, LRU eviction that never evicts a copy
+  used (taken or shared) in the last 15 min, and 24 h retention from last
+  use. Restore: `nn-admin remediate ransomware [--pid <pid>] [--since <ts>]
+  [--dry-run] --key <key>` (at least one; together, an entry meets both;
+  `--since` alone restores every writer's earliest copy since then)
+  (`OperationCode::RemediateRansomware` 26, `AdminMessage::RemediateRansomware{Request,Response}`
+  appended at indices 56/57 after lab PR 217's signed unlock pair, the
+  debug-only variants moving to 58/59, role `response-manage`), and on its own when the COMBAT ladder's
+  NEUTRALIZE (new `CombatLadder::with_neutralize_hook`) or NN-L-FIM-010's kill
+  neutralizes a tree a ransomware signal named, with `auto_restore = true`
+  (default false; never in detect-only; NN-L-FIM-010's kill restores without
+  COMBAT). One signed `cow_restore` audit row per file; a file someone else
+  changed after the attack, as far as the guard saw (a write-open seen after
+  the copy — kept in memory, the last 8 per inode, 0-byte files not copied
+  — another inode or a reused inode number, a copy older than this run and a
+  newer mtime), is not overwritten — the original is written beside it.
+  Paths are reached with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`.
+  Configuration is the signed overlay `cow-guard.local`
+  (`OverlayKind::CowGuard`, 12; protected like the others); the drop-in
+  `deploy/systemd/20-cow-guard.conf` (`install.sh --cow-guard`, known to
+  self-integrity) adds `CAP_SYS_ADMIN`, `CAP_CHOWN`, `CAP_FOWNER`.
+  `status --key` shows the guard (`StatusResponse::cow_guard`, appended
+  after lab PR 219's `exploit_guard`, telemetry). A degradation is a signed
+  `integrity_drift` (`subsystem_degraded`): per reason the first at once,
+  then a summary at most every 10 min; through the guard's work queue, so a
+  full queue can lose one. Not
+  protected, and said so: files over the cap without reflink, writers
+  already trusted, the journal against root when the anti-tamper hooks are
+  off, descriptors opened before the guard watched (an `mmap` write is
+  covered: its writable descriptor's open is seen), encryption into new
+  files with unlink or rename-over. Microbenchmark `agent/examples/cow_bench.rs`;
+  lab harness `deploy/lab/cow/cow-check.sh` with a benign simulator
+  (`ransom-sim.py`).
 - Every rule declares its MITRE ATT&CK tactics and techniques as data
   (lab PR 221, capability C16): `Rule::attack()` returns typed
   references (a `Tactic` enum, technique ids checked for shape when they
@@ -456,7 +513,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
     `unlock`), like every other admin operation — new wire variants
     `SignedUnlockRequest` / `SignedUnlockResponse`, appended before the
     debug-only ones (indices 54/55, after lab PR 216's `LoopProgress`
-    pair; the debug-only variants move to 56/57) — and its audit row names the signer (`key_fp`, it was
+    pair; lab PR 222's `RemediateRansomware` pair follows at 56/57, and the
+    debug-only variants move to 58/59) — and its audit row names the signer (`key_fp`, it was
     empty). The legacy signature over the bare nonce is refused,
     `UnlockResult::LegacyProtocolRefused` (appended), audited as `failure:
     legacy_protocol_refused`. Decision: refused outright, no compatibility

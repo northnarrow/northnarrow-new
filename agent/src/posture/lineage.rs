@@ -1522,6 +1522,29 @@ impl AuthSessionTracker {
         .map(|hop| hop.exe)
     }
 
+    /// Lab PR 222 (copy on first write): what the kernel executed for `pid`
+    /// and for each ancestor on the walk of [`Self::actor_in_lineage`]
+    /// (ordered, POS-003: it ends at PID 1, at a hop that started after the
+    /// one below it, or at [`LINEAGE_DEPTH_CAP`]), nearest first, `pid`'s
+    /// own identity at index 0. `None` when a hop can be read neither from
+    /// the spawn cache nor from `/proc`: the lineage is not known.
+    ///
+    /// Reads only the spawn cache and `/proc` — never a file elsewhere, so
+    /// the guard's fanotify reader may call it (an open on a marked
+    /// filesystem from that thread would wait on itself).
+    pub fn lineage_identities(&self, pid: u32) -> Option<Vec<(u32, ExecIdentity)>> {
+        let hops = std::cell::RefCell::new(Vec::new());
+        self.lineage_walk(
+            pid,
+            |hop| {
+                hops.borrow_mut().push((hop.pid, self.hop_identity(hop)));
+                false
+            },
+            LINEAGE_DEPTH_CAP,
+        )?;
+        Some(hops.into_inner())
+    }
+
     /// What the kernel executed for a hop: the spawn cache's record, else
     /// `/proc` (`cmdline` names the script an interpreter runs).
     fn hop_identity(&self, hop: &Hop) -> ExecIdentity {
@@ -2007,7 +2030,7 @@ fn is_node_exe(exe: &Path) -> bool {
 
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
 /// what they run is named by their arguments, not by their exe.
-fn is_interpreter(exe: &Path) -> bool {
+pub(crate) fn is_interpreter(exe: &Path) -> bool {
     let base = exe
         .file_name()
         .map(|b| b.to_string_lossy())

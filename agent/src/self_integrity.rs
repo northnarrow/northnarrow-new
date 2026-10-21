@@ -93,10 +93,17 @@ const UNIT_SEARCH_PATH: &[&str] = &[
 /// Drop-ins `install.sh` lays down itself, with the content it writes.
 /// External audit DEP-002: matched on content, not on path alone — the
 /// path used to be skipped whatever the file said.
-const KNOWN_DROPINS: &[(&str, &str)] = &[(
-    "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
-    include_str!("../../deploy/systemd/10-debian-perf-paranoid.conf"),
-)];
+const KNOWN_DROPINS: &[(&str, &str)] = &[
+    (
+        "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
+        include_str!("../../deploy/systemd/10-debian-perf-paranoid.conf"),
+    ),
+    // Lab PR 222: `install.sh --cow-guard` (the guard's fanotify group).
+    (
+        "/etc/systemd/system/northnarrow-agent.service.d/20-cow-guard.conf",
+        include_str!("../../deploy/systemd/20-cow-guard.conf"),
+    ),
+];
 
 /// Environment variables that switch a protection off, into observe mode,
 /// or cut the evidence the agent keeps. Each comes with the test its

@@ -300,7 +300,15 @@ struct Inner {
     /// administrator. On heuristics alone the ladder stops at the process
     /// level. Default: always (tests, callers without a posture).
     isolation_gate: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Lab PR 222: told the processes a NEUTRALIZE contained (killed and
+    /// verified gone) — the copy-on-first-write guard restores what a
+    /// ransomware tree among them rewrote. Runs on the ladder's worker
+    /// after the kill; must not block (the guard spawns its own thread).
+    neutralize_hook: Option<NeutralizeHook>,
 }
+
+/// Lab PR 222: see [`Inner::neutralize_hook`].
+pub type NeutralizeHook = Box<dyn Fn(&[Arc<ProcRef>]) + Send + Sync>;
 
 /// A side effect of the ladder, run in order by [`Runner`].
 enum Job {
@@ -369,6 +377,7 @@ impl CombatLadder {
                 protected,
                 cfg,
                 isolation_gate: Box::new(|| true),
+                neutralize_hook: None,
             }),
             runner: Runner::Inline,
         }
@@ -382,6 +391,19 @@ impl CombatLadder {
             None => warn!(
                 target: "combat.ladder",
                 "isolation gate set after the worker started — ignored"
+            ),
+        }
+        self
+    }
+
+    /// Lab PR 222: tell `hook` which processes each NEUTRALIZE contained.
+    /// Call before [`Self::with_worker`].
+    pub fn with_neutralize_hook(mut self, hook: NeutralizeHook) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.neutralize_hook = Some(hook),
+            None => warn!(
+                target: "combat.ladder",
+                "neutralize hook set after the worker started — ignored"
             ),
         }
         self
@@ -1385,7 +1407,15 @@ impl Inner {
                     // each one's outcome signed after the kill.
                     let report = self.actuator.neutralize(&actionable);
                     self.record_outcome(neutralize_outcome(trigger, &report, &spared));
-                    match report.outcome() {
+                    let outcome = report.outcome();
+                    // Lab PR 222: the copy-on-first-write guard hears the
+                    // offenders a NEUTRALIZE contained.
+                    if matches!(outcome, NeutralizeOutcome::Contained) {
+                        if let Some(hook) = &self.neutralize_hook {
+                            hook(&actionable);
+                        }
+                    }
+                    match outcome {
                         NeutralizeOutcome::Contained if spared.is_empty() => {
                             info!(
                                 target: "combat.ladder",

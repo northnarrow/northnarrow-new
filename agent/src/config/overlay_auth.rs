@@ -207,6 +207,10 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         OverlayKind::CanaryReaders => {
             parse_overlay_text(&label, text, &crate::canary::readers::validate_reader)?;
         }
+        // Lab PR 222: the guard's own strict parser.
+        OverlayKind::CowGuard => {
+            crate::cow::config::CowConfig::validate(text)?;
+        }
         OverlayKind::NetflowBlocklist => {
             crate::net::blocklist::parse_blocklist_overlay_text(&label, text)?;
         }

@@ -180,6 +180,10 @@ pub const ETC_PROTECTED_FILES: &[&str] = &[
     // External audit NN-AUD-108 (lab PR 160): the signed head anchor of the
     // chains (`crate::chain_anchor`), next to the audit log it anchors.
     "chain_heads.json",
+    // Lab PR 222: the copy-on-first-write guard's configuration and its
+    // signature. MUTATE-only like the other overlays.
+    "cow-guard.local",
+    "cow-guard.local.sig",
 ];
 
 /// External audit EVD-001: the subset of [`ETC_WRITE_DENY_FILES`] no
@@ -2496,6 +2500,8 @@ mod tests {
                 "canary-readers.local.sig",
                 "agent.sig.pub",
                 "chain_heads.json",
+                "cow-guard.local",
+                "cow-guard.local.sig",
             ],
             "design §9 / commit A14 + Tappa 9 C7 + Tappa 10 N8 + \
              Tappa 10.5 D1 specify these files in this order"
