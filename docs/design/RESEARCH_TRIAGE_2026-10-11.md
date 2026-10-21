@@ -1,5 +1,10 @@
 # Triage della ricerca esterna dell'11 ottobre 2026
 
+> Wave 4 (lab PR 214, 20 ottobre 2026): il consulente LLM on-host (ADE) è
+> stato rimosso. Le righe sull'LLM e sull'ADE qui sotto (verdetto non
+> abbassabile, separazione del processo ADE, benchmark di prompt injection,
+> dipendenze sotto Candle) sono storiche.
+
 Fonte: `northnarrow_repo_audit_frontier_and_defence.md` (founder, 11 ottobre
 2026) — Parte A (gap rispetto allo stato dell'arte), Parte B (verifica del
 repository al commit `86ee590`), Parte 4 (standard militari e governativi).

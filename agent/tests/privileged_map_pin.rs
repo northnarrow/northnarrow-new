@@ -188,8 +188,7 @@ fn init_admin_pub(tempdir: &Path) {
 
 /// Spawn the agent at `agent_exe` (a root-owned copy, see
 /// `common::install_to_priv_bin`) against per-test tempdir paths. Mirrors
-/// `privileged_e2e::spawn_agent`'s flag set; `--no-ade` keeps the
-/// model/inference path out of a test that only exercises eBPF load.
+/// `privileged_e2e::spawn_agent`'s flag set.
 /// Its log goes to `<tempdir>/agent.log`, uncoloured, for the attach line.
 fn spawn_agent(agent_exe: &Path, tempdir: &Path) -> AgentGuard {
     let rules = tempdir.join("combat-rules.v4");
@@ -206,7 +205,6 @@ fn spawn_agent(agent_exe: &Path, tempdir: &Path) -> AgentGuard {
         .arg(tempdir.join("admin.pub"))
         .arg("--admin-socket")
         .arg(tempdir.join("admin.sock"))
-        .arg("--no-ade")
         .env("NO_COLOR", "1")
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))

@@ -540,7 +540,7 @@ group, the ones an unprivileged user or a local attacker could use first.
 | NN-AUD-326 | LLMR-011 | Low | LLM runtime | S | fixed (lab PR 182) |
 | NN-AUD-327 | LLMR-015 | Low | LLM runtime | M | fixed (lab PR 168) |
 | NN-AUD-328 | LLMR-018 | Low | LLM runtime | S | fixed (lab PR 191) |
-| NN-AUD-329 | LLMR-019 | Low | LLM runtime | M (at XAI wiring) | partly fixed (one prompt path, lab PRs 133/144/145; digest not recorded); open |
+| NN-AUD-329 | LLMR-019 | Low | LLM runtime | M (at XAI wiring) | obsolete (the on-host LLM advisor removed, Wave 4 lab PR 214) |
 | NN-AUD-330 | NET-007 | Low | Network | S | fixed (lab PR 202) |
 | NN-AUD-331 | NET-008 | Low | Network | S | fixed (lab PR 202) |
 | NN-AUD-332 | NET-013 | Low | Network | S | fixed (lab PR 202) |
@@ -10437,3 +10437,9 @@ group, the ones an unprivileged user or a local attacker could use first.
     2,733 passed, 0 failed, 21 ignored; `wire::admin_protocol` with
     `debug-trigger` 49 passed. `bash -n` on the two lab scripts. No VM.
   - Lab: On Ubuntu 24.04, before (the tree without this lot) and after (`upgrade-check` OK): the unsigned `nn-admin status` showed the ring drops and rejected records before and only posture, isolation, combat stage and last admin action after ("telemetry: withheld …", the counters `null` in `--json`); `status --key` and `net status --key` read them signed after (`--key` did not exist before); four unsigned calls of one peer in one hour left one `status_polled` row and three `--key` calls three `telemetry_status` rows, none for the watchdog, 0 ping failures. One hour of ordinary activity (ssh to localhost, git ls-remote and curl over https, gpg on root's keyring, apt update, a tar of /root, rsync over ssh) on each tree: 12 CHAIN-008 Medium `Log`, 45 FIM-017 High `Log` and 3 NET-013 High `Log` on both, no CHAIN-001/003/004/006 record, 0 kills after (the one kill before was R011 on `kmod` started by systemd, a recorded follow-up), no correlation-store pressure, the agent at 7.7 s of CPU and 31 MB RSS for the hour. The soak reads the drops signed (PASS) and fails with "drops not read" without the key, as intended. The aged CHAIN-001 record could not be shown on the guest: a keyring read reported by the wide-coverage open sensor registers no credential-read precursor, so no CHAIN-001 fired even 120 s after it on either tree (a read of a FIM-watched inode is killed by FIM-017 first); the 30-minute retention is covered by the unit tests, and the precursor gap is a recorded follow-up (credential reads as chain precursors). Gate: the integration tree of lab PRs 208–213 on `main` with lab PRs 176–207: Ubuntu 24.04, Debian 12 and Ubuntu 22.04 (5.15), 51 suites, 89 passed, 0 failed each; Debian 13 (6.12) 51 suites, 88 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, which fails the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite OK on 24.04 and 22.04; `upgrade-check` from the tree without these lots to this one OK on 24.04 (all LSM hooks attached, deny 19 of 19, 33 own LSM programs before and after, the agent identity kept); host 2,792 passed, 0 failed.
+
+- **Wave 4, lab PR 214 — the on-host LLM advisor removed.** The ADE, the RAG
+  knowledge base, the XAI explanations and the vendored candle fork left the
+  agent (docs/roadmap/CAPABILITY_PROGRAM.md). NN-AUD-329 (LLMR-019, the
+  wiring left open) is obsolete; the findings fixed earlier in that code stay
+  as recorded, with the lab PRs that fixed them.

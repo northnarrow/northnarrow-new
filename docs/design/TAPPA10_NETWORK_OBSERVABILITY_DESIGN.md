@@ -590,6 +590,8 @@ documented C2 indicators and must not be suppressible.
 
 ## 8. ADE handoff
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 `severity = Critical` AND `severity = High` NetFlow events
 route to the LLM second-brain per the existing Tappa 6 ADE
 pipeline. The ADE prompt template — `agent/src/ade/net_template.rs`
@@ -941,6 +943,8 @@ below: **Decision**, **Rationale**, **Implementation note**
   rotated chains stay verifiable forever).
 
 ### Q9 — ADE prompt cost ceiling
+
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
 
 - **Decision:** PORT VERBATIM the Tappa 9 §13 Q9 tiered
   cap. 10 individual prompts / minute + 1 batched

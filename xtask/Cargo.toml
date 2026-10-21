@@ -22,21 +22,14 @@ aya-obj = "0.2"
 # computed identically (see ebpf-guard crate docs).
 ebpf-guard = { path = "../ebpf-guard" }
 
-# Tappa 6.9.7 P2 — RAG KB acquisition pipeline (build/release-time
-# tooling only; the agent never fetches at runtime, so the sovereign
-# "no external fetch" rule binds the agent, not xtask). Owner-endorsed
-# set: ureq (pure-Rust blocking HTTP, rustls — no OpenSSL FFI),
-# serde/serde_json (STIX 2.1), sha2, chrono.
-ureq = "3"
-serde = { version = "1", features = ["derive"] }
+[dev-dependencies]
+# The tests' own parsers and clock: JSON fixtures of the lab records, the
+# committed workflow files (YAML), the dates of the advisory exceptions,
+# of security.txt and of the install stamps. (ureq, serde, sha2, flate2 and tar, and
+# these three as normal dependencies, served `cargo xtask rag-kb`, the LLM
+# advisor's knowledge base, removed in Wave 4 with lab PR 214.)
 serde_json = "1"
-sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # serde_yaml (dtolnay) was archived 2024-11; serde_yaml_ng is the
 # actively-maintained drop-in fork (owner ruling, 2026-05-17).
 serde_yaml_ng = "0.10"
-# Sigma ships as a git repo; we fetch the pinned-commit codeload
-# tarball and extract in-process. flate2 default backend = miniz_oxide
-# (pure Rust, no zlib FFI — charter-compliant); tar is pure Rust.
-flate2 = "1"
-tar = "0.4"

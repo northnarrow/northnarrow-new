@@ -1,3 +1,5 @@
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 # ADE Active Defender — Canonical Vision
 
 > *"The defender that knows the ground, prepares it, and watches it — without ever surrendering it."*

@@ -247,7 +247,7 @@ struct Fixture {
 
 impl Fixture {
     /// Spawn an agent watching the given `fim_watch_paths` and the
-    /// sentinel. Empty allow/blocklists; ADE off; COMBAT rules wired;
+    /// sentinel. Empty allow/blocklists; COMBAT rules wired;
     /// responses enforced (no `--detect-only`).
     fn setup(fim_watch_paths: &[&str]) -> Self {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -389,7 +389,6 @@ impl Fixture {
             .arg(&nca_v1)
             .arg("--netflow-comm-allowlist-local")
             .arg(&nca_local)
-            .arg("--no-ade")
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
             .spawn()

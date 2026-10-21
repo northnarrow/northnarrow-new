@@ -505,6 +505,8 @@ workflows.
 
 ## 8. ADE handoff
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 `severity = Critical` FIM events route to the LLM second-brain per
 the existing Tappa 6 ADE pipeline. The ADE prompt template gets a
 new `fim_event` field carrying the `FimEvent` JSON; the LLM is
@@ -817,6 +819,8 @@ below: **Decision**, **Rationale**, **Implementation note**
   rotated chains stay verifiable forever).
 
 ### Q9 — ADE prompt cost ceiling
+
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
 
 - **Decision:** TIERED CAP — 10 individual ADE prompts /
   min + 1 batched overflow prompt / min summarising

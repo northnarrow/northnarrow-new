@@ -340,7 +340,6 @@ impl Fixture {
             .arg(&netflow_comm_allowlist_v1)
             .arg("--netflow-comm-allowlist-local")
             .arg(&netflow_comm_allowlist_local)
-            .arg("--no-ade")
             // Detection only: every assertion in this file is on the
             // VERDICT log line / the jsonl rows, never on an executed
             // response — and with enforcement on, R001/R009 SIGKILL the

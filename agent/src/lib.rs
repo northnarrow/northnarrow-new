@@ -3,12 +3,14 @@
 //! - [`sensors`]   — eBPF-driven event sources.
 //! - [`decision`]  — deterministic rule engine (Tappa 2).
 //! - [`response`]  — concrete executors (Tappa 3 + Tappa 5).
-//! - [`ade`]       — Active Defense Engine, LLM second brain (Tappa 6).
-//! - [`correlation`] — bounded buffer of recent events fed into ADE.
-//! - [`rag`]       — retrieval-augmented generation knowledge base
-//!   feeding ADE (Sub-tappa 6.7).
+//! - [`posture`]   — the defensive posture and its COMBAT ladder.
+//! - [`correlation`] — bounded buffer of recent events the posture
+//!   triggers read.
+//!
+//! Detection is deterministic: rules, correlation, posture and COMBAT.
+//! The on-host LLM advisor of Tappa 6 (ADE, its RAG knowledge base and
+//! XAI explanations) was removed in Wave 4 (lab PR 214).
 
-pub mod ade;
 pub mod admin_cli;
 pub mod admin_socket;
 pub mod agent_id;
@@ -35,7 +37,7 @@ pub mod host_hardening;
 pub mod install_manifest;
 pub mod net;
 pub mod posture;
-pub mod rag;
+pub mod removed_settings;
 pub mod response;
 pub(crate) mod runtime;
 pub mod sd_notify;
@@ -49,4 +51,3 @@ pub mod systemd_state;
 pub mod telemetry_probe;
 pub mod trusted_bin;
 pub mod verify_lines;
-pub mod xai;

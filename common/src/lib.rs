@@ -47,10 +47,6 @@ mod dns_qname;
 #[cfg(feature = "std")]
 pub use dns_qname::{decode_dns_qname, qname_wire_end, QnameLabel, QnameLabels};
 
-/// Active Defense Engine (ADE) verdict schema (v1.0.0).
-#[cfg(feature = "std")]
-pub mod ade_types;
-
 #[cfg(feature = "std")]
 pub mod admin_quorum;
 
@@ -68,10 +64,6 @@ pub mod netaddr;
 #[cfg(feature = "std")]
 pub mod posture_types;
 
-/// RAG knowledge-base types (Sub-tappa 6.7).
-#[cfg(feature = "std")]
-pub mod rag_types;
-
 /// The `sd_notify(3)` datagram of the agent and the watchdog (external
 /// audit MAIN-016: abstract sockets).
 #[cfg(all(feature = "std", target_os = "linux"))]
@@ -82,7 +74,3 @@ pub mod shutdown_marker;
 
 #[cfg(feature = "std")]
 pub mod watchdog_hold;
-
-/// XAI Saliency Mapping forensic evidence schema (Tappa 6.9, v1.0.0).
-#[cfg(feature = "std")]
-pub mod xai_types;

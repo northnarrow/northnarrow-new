@@ -368,7 +368,9 @@ backlog (not a V2 FAIL); config gap → config fix + re-run.
 - FIM-024 priv-e2e: `agent/tests/honeypot_tamper_e2e.rs` (the synthetic
   baseline this sweep supersedes with real `rm`).
 - ADE context blocks checked as row evidence: `agent/src/ade/fim_template.rs`,
-  `agent/src/ade/chain_template.rs` (D8 `rule-context`).
+  `agent/src/ade/chain_template.rs` (D8 `rule-context`). (Historical: the
+  on-host LLM advisor was removed in Wave 4, lab PR 214; those files are
+  gone.)
 - Backlog bounding the N/A set: **T10.6** (argv + correlation refit),
   **T4 DNS refit** (NET-004/005/014 N/A).
 

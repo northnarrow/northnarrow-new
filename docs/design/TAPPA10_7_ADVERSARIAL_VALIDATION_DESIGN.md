@@ -1,5 +1,11 @@
 # Tappa 10.7 — Adversarial Validation via Kali Linux Design
 
+> Wave 4 (lab PR 214): the on-host LLM advisor (ADE) was removed. Every
+> ADE item below (Critical-tier routing, the D8 `fim_template` /
+> `chain_template` context blocks as row evidence, the Active Defender
+> questions) is historical: a row's evidence is the deterministic verdict
+> and the signed records alone.
+
 **Status:** RFC RESOLVED 2026-05-21 (§13 — all 10 owner-accepted
 engineering recommendations applied verbatim as resolved decision
 blocks). V1 (range setup automation) unblocked; sequenced per the §12
@@ -428,9 +434,10 @@ same shape.
   → T1070.
 - **FIM-021** (PAM module): write `.so` under `/lib/.../security/` →
   **Critical**; ADE `fim_template` `rule-context` (D8) should attach
-  the T1543/T1556 block — validated as part of the row evidence.
+  the T1543/T1556 block — validated as part of the row evidence
+  (historical: the advisor was removed in Wave 4, lab PR 214).
 - **FIM-022** (ld.so.preload): `echo … > /etc/ld.so.preload` →
-  **Critical** + D8 ADE T1574.006 context.
+  **Critical** + D8 ADE T1574.006 context (historical, as above).
 - **FIM-023** (systemd `.timer`): drop a `.timer` unit.
 
 ### 7.3 Network family (NN-L-NET-*) — Sliver / Metasploit / manual

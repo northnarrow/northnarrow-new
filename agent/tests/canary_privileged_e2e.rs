@@ -342,7 +342,6 @@ impl CanaryFixture {
             dir.join("netflow.jsonl").into_os_string(),
             "--netflow-listeners-file".into(),
             dir.join("netflow_listeners.jsonl").into_os_string(),
-            "--no-ade".into(),
         ]
         .to_vec();
         common::require_bpftool();

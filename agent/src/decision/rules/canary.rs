@@ -35,8 +35,9 @@
 //!    credential canary trip → also rotate cloud control-plane
 //!    keys; file canary trip → also snapshot the host's
 //!    process tree for forensics).
-//! 3. ADE prompt variation per type (Credential trips get the
-//!    richest enrichment).
+//!
+//! (A third reason, the prompt variation per type of the on-host LLM
+//! advisor, left with the advisor in Wave 4, lab PR 214.)
 //!
 //! ## Source-event filter
 //!

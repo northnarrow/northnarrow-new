@@ -1,3 +1,5 @@
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 # XDR Roadmap — New Tappe (Delta for Merge into XDR_ROADMAP.md)
 
 This document specifies two new Tappe to be merged into `docs/XDR_ROADMAP.md`:

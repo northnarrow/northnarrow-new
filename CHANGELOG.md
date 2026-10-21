@@ -13,6 +13,7 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The model reads strings an attacker writes; responses stay with the
   deterministic rules and the COMBAT ladder. `NN_ADE_ENFORCE=1` lets the
   verdicts act again and is reported as a weakening in the signed chain.
+  (Superseded by the removal of the advisor, lab PR 214: see Removed.)
 
 ### Documentation
 
@@ -59,6 +60,52 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `docs/CLAUDE_BRIEFING.md`, `docs/operator/KERNEL_COMPATIBILITY.md`
   (6.9+ and `nft`) and `docs/validation/README.md` (the Critical
   sub-gate) are brought up to date. No change to the agent.
+
+### Removed
+- The on-host LLM advisor (Wave 4, lab PR 214): the ADE (`agent/src/ade`,
+  the Foundation-Sec-8B GGUF model the agent ran on the execs no rule
+  matched), its RAG knowledge base (`agent/src/rag`, `cargo xtask rag-kb`,
+  `docs/kb-sources/`, `target/kb`, the ATT&CK and Sigma licence texts of
+  `LICENSES/`), the XAI explanations (`agent/src/xai`, `common::xai_types`,
+  the never-written `explanation` field of a detection, the `BUILD_SHA`
+  stamp only they read), `common::{ade_types, rag_types}`, the vendored
+  `candle-core` and its `[patch.crates-io]`, every model and tokenizer
+  dependency (candle-core/-nn/-transformers, tokenizers, tantivy, num_cpus
+  in the agent; ureq, sha2, flate2, tar and serde in xtask), the system
+  prompts of `dataset/`, the examples `ade_attacks`, `ade_demo`,
+  `ade_smoke`, `ade_with_rag`, `bench_threads`, `rag_demo` and `diag_hw`,
+  `cargo xtask ade-demo`, the `ade_verdict` and `ade_preparse` fuzz targets
+  with their seeds and regressions, the `ade-build` and `ade-unit-test` CI
+  jobs, the advisory exceptions of lru and paste (RUSTSEC-2026-0253,
+  RUSTSEC-2026-0002, RUSTSEC-2024-0436: those crates left both lockfiles),
+  the posture's modulation of model verdicts, the correlated-context
+  selection of the prompt, the NOTICES.md sections of that material, and
+  `docs/ADE_BACKEND_NOTES.md`, `docs/PERFORMANCE_THREADS.md` and the
+  Article 13 dossier. Why: a multi-GB model inside the root agent process,
+  fed with strings an attacker writes, was the largest attack surface of
+  the agent; its accuracy was never measured; it cost gigabytes of RAM on a
+  server (about 7 GB of peak RSS); mature EDRs keep on-host detection
+  deterministic, and an AI assistant, if any, belongs off the enforcement
+  path (a future analyst assistant on the backend). Detection stays
+  deterministic: rules, correlation, posture and COMBAT; an exec no rule
+  matches gets no detection, as on every host without the model, which no
+  release shipped. **Upgrade:** the flags `--no-ade`, `--ade-model`,
+  `--ade-timeout`, `--ade-prompt`, `--ade-threads` and the variables
+  `NN_ADE_ENFORCE`, `NN_ADE_ALLOW_MOCK`, `NN_ADE_RAG_ENABLED`,
+  `NN_ADE_RAG_INDEX_DIR`, `NN_ADE_RAG_JSONL_DIR`, `NN_ADE_TOKENIZER` are
+  accepted and ignored, one WARN each at start naming it
+  (`agent/src/removed_settings.rs`); the two weakening variables among them
+  are no longer reported by the self-integrity check; `install.sh` names a
+  leftover `/var/lib/northnarrow/models/` and leaves it; detection records
+  the advisor wrote still decode and chain-verify, byte for byte
+  (`DetectionPath::Ade`, `AdvisorAction`). The unit's memory limits are
+  unchanged until the lab measures the agent's RSS without the model.
+  `docs/operator/UPGRADE_NOTES_WAVE4.md` is new; the design documents of
+  the advisor are marked historical. `Cargo.lock` and `fuzz/Cargo.lock`
+  lose about 150 packages each; no locked version changed (cargo's own
+  pruning, no `cargo update`). The validation registry keeps the Critical
+  FIM rules of design §13 Q1 as its own list (they came from the advisor's
+  templates).
 
 ### Fixed
 - External audit, Wave 3, the status split and correlation chain retention

@@ -52,7 +52,7 @@ const KDF_SALT: &[u8] = b"northnarrow-quarantine-v1";
 /// `sshd`), a kernel image, a config tree, or NorthNarrow's own
 /// binaries/state, that unlink makes the host unbootable, locks the
 /// operator out, or disables the agent itself — a self-inflicted
-/// denial of service that a malformed event, an LLM verdict or an
+/// denial of service that a malformed event, a wrong rule or an
 /// upstream bug can trigger. Malware living under these prefixes is
 /// still handled by KillProcess / KillProcessTree; it just cannot be
 /// removed from disk by the executor. A prefix ending in `/` matches

@@ -15,7 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 # aya is the load-bearing dep. The whole reason this crate exists is
 # so the watchdog binary can consume it WITHOUT pulling the rest of
-# `agent` (tokio, ADE, posture machine, RAG, …).
+# `agent` (tokio, posture machine, decision engine, …).
 aya = { workspace = true }
 anyhow = { workspace = true }
 libc = "0.2"

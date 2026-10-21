@@ -77,8 +77,10 @@ jobs:
         run: cargo kani -p northnarrow-common --harness qname_wire_end_is_past_a_root_label
 
       - name: Prove the TLS cursor (agent)
-        # A Candle dependency (pulp) carries global asm, which Kani cannot
-        # model; the proved code never reaches it.
+        # The flag was added for a Candle dependency (pulp) carrying global
+        # asm, which Kani cannot model; pulp left with the LLM advisor in
+        # Wave 4 (lab PR 214). Kept until a run without it is confirmed
+        # (another dependency may carry some; the proved code reaches none).
         run: >
           cargo kani -p northnarrow-agent
           --harness cursor_operations_never_panic_and_keep_pos_in_bounds

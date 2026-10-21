@@ -65,26 +65,6 @@ fn main() {
     println!("cargo:rerun-if-changed={}", stamp_path.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Tappa 6.9 (XAI / Art. 13): stamp the build's git commit into
-    // `BUILD_SHA` so it can feed the deployment `environment_hash`.
-    // `unknown` keeps non-git builds (release tarballs, shallow CI
-    // checkouts) compiling — the hash still binds binary/model/rules/
-    // host, only the commit field degrades.
-    let build_sha = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=BUILD_SHA={build_sha}");
-    // `.git/HEAD` covers branch switches / detached HEAD; the refs dir
-    // covers a commit on the current branch (HEAD then still points at
-    // the same ref file) so BUILD_SHA re-evaluates on every commit (F4).
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs/heads/");
-
     if ebpf_artifact.is_file() {
         // The object exists → it MUST be provably fresh. Read it once:
         // the bytes checked against the stamp are the bytes staged for

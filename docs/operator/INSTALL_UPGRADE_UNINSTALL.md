@@ -48,7 +48,9 @@ Upgrading across the remediation of the external audit of `16f7563`
 (anything newer than `v0.0.1-tappa9.0`)? Read
 [`UPGRADE_NOTES_AUDIT_16f7563.md`](UPGRADE_NOTES_AUDIT_16f7563.md) first:
 the changes of behaviour and the regressions it brings, grouped by what an
-operator touches, each with its finding and lab PR.
+operator touches, each with its finding and lab PR. Upgrading to a Wave 4
+build (the on-host LLM advisor removed)? Read
+[`UPGRADE_NOTES_WAVE4.md`](UPGRADE_NOTES_WAVE4.md) too.
 
 ## 1. Fresh install
 
@@ -422,12 +424,13 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `bpffs_mount` | a bpffs outside `/sys/fs/bpf` (WARN: Cilium does this legitimately) |
 | `tracefs_mount` | a mount at `/sys/kernel/tracing` or `/sys/kernel/debug/tracing` that is not a whole tracefs, or any mount below them: the tracepoint sensors take their field offsets from there at the next start (external audit NN-AUD-098) |
 | `config_overlay` | a `*.local` overlay in `/etc/northnarrow`, with size and hash |
-| `weakening_env` | the agent started with a variable that turns a protection off or cuts the evidence it keeps (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, `NN_DETECT_ONLY=1/true/yes`, `NN_ADE_ALLOW_MOCK=1`, a `NN_TELEMETRY_PROBE_SECS` of 0 or above 60, any `NN_*_CAP_BYTES` override, …) |
+| `weakening_env` | the agent started with a variable that turns a protection off or cuts the evidence it keeps (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, `NN_DETECT_ONLY=1/true/yes`, a `NN_TELEMETRY_PROBE_SECS` of 0 or above 60, any `NN_*_CAP_BYTES` override, …) |
 | `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
 | `watchdog_hold` | while the agent was down the watchdog stopped respawning it: a start that brought no agent back within 30 s (the unit failed — its `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` without bpffs — or was stopped or skipped; the record carries systemd's `ActiveState`/`SubState`/`Result`/`ConditionResult`/`AssertResult`), a failed `systemctl start`, or the restart ceiling. Signed at the agent's next start (external audit DEP-004) |
 
 The memory limits are absolute (`MemoryHigh=9G`, `MemoryMax=11G`, sized
-for the model). On a host with no more memory than `MemoryMax` the cap
+for the model of the LLM advisor, removed in Wave 4, and not re-sized yet:
+[`UPGRADE_NOTES_WAVE4.md`](UPGRADE_NOTES_WAVE4.md) §2). On a host with no more memory than `MemoryMax` the cap
 cannot bind, so the agent starts there with `oom_score_adj` 0 instead of
 the unit's -500 — an ordinary OOM candidate, which the watchdog respawns —
 and says so in a WARN (`memory cap at or above the host's memory`); 0 is

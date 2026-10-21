@@ -4,7 +4,7 @@
 //! This crate exists so the forthcoming **watchdog binary**
 //! (`docs/design/TAPPA7_TASK6_WATCHDOG_DESIGN.md` §2.2) can consume
 //! the canonical bpffs pin contract WITHOUT pulling the rest of the
-//! agent (tokio, ADE, posture machine, RAG, decision engine, …).
+//! agent (tokio, posture machine, decision engine, …).
 //! Watchdog needs only a handful of primitives — bpffs presence check,
 //! pin-root prep, LSM hook attach, and the ability to delete a
 //! PID from the pinned `PROTECTED_PIDS` map by path — and that's
@@ -35,7 +35,7 @@
 //! ## What's intentionally NOT here
 //!
 //! - `AdminAuth`, `NetworkIsolator`, posture machine, decision rules,
-//!   sensors, ADE — all stay in `agent`.
+//!   sensors — all stay in `agent`.
 //! - The agent's eBPF-object program / map name constants
 //!   (`PROTECTED_PIDS_MAP`, `TASK_KILL_PROGRAM`, etc) — they belong
 //!   alongside the agent-side orchestration that knows about the

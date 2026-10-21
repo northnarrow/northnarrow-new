@@ -13,7 +13,7 @@ Quella è la stella polare. Questa è la marcia operativa.
 | Tappa | Stato | Riferimento |
 |---|---|---|
 | 0 – 5 | chiuse | workspace, sensori eBPF, decision engine, KillProcess, response engine |
-| 6 (6.1 → 6.9.7) | chiuse | ADE su Candle, posture adattiva, anti prompt-injection, RAG KB, performance |
+| 6 (6.1 → 6.9.7) | chiuse; ADE rimosso | posture adattiva (resta); ADE su Candle, anti prompt-injection, RAG KB, XAI e performance rimossi nella Wave 4 (lab PR 214) |
 | 7 | chiusa | anti-tamper (task_kill, ptrace, inode_protect, watchdog respawn v2) |
 | 8 | chiusa | sblocco COMBAT con firma Ed25519, audit log firmato |
 | 9 (FIM) + 9.0.a/b/c | chiuse | File Integrity Monitoring, detections su chainlog firmato, triage |
@@ -38,6 +38,18 @@ Isolate) è registrato come raccomandazione, con il ragionamento del modello, e 
 eseguito; le risposte restano alle regole deterministiche e alla scala COMBAT.
 `NN_ADE_ENFORCE=1` riabilita l'esecuzione ed è registrata come variabile
 d'indebolimento nell'audit log firmato.
+
+Decisione di prodotto del 20 ottobre 2026 (Wave 4, lab PR 214): il consulente
+LLM on-host è rimosso — l'ADE, la RAG KB, l'XAI, il fork di candle e ogni
+dipendenza di modello e tokenizer. Un modello di più GB dentro il processo root
+dell'agente, alimentato con stringhe scritte dall'attaccante, era la superficie
+d'attacco più grande dell'agente; la sua accuratezza non è mai stata misurata;
+costava GB di RAM sui server; gli EDR maturi tengono deterministica la
+detection on-host (un assistente AI, se ci sarà, sta fuori dal percorso di
+enforcement, per esempio un futuro assistente per l'analista sul backend). La
+detection resta deterministica: regole, correlazione, posture, COMBAT. I flag e
+le variabili dell'ADE sono ignorati con un WARN
+(`docs/operator/UPGRADE_NOTES_WAVE4.md`).
 
 ---
 
@@ -132,6 +144,9 @@ Tutto in <500ms.
 
 ## Tappa 6 — Cervello LLM locale (Candle)
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214. Della Tappa 6 resta la
+> Sub-tappa 6.5 (posture adattiva), senza la modulazione dei verdetti del modello.
+
 Obiettivo: decisioni euristiche su casi ambigui.
 
 - Crate candle-core + candle-transformers (100% Rust, zero C/C++)
@@ -161,7 +176,8 @@ raccomandazione registrata, non un'azione: vedi lo stato di avanzamento.
 - `agent::posture::PostureMachine` come handle Arc-backed,
   Send + Sync. `observe(event, recent_events)` notifica eventi e
   ritorna Some(stato) sulle transizioni; `modulate_verdict(v)`
-  applica severity-inflation + Allow→Alert in ALERTED+; `tick_decay`
+  applicava severity-inflation + Allow→Alert in ALERTED+ ai verdetti
+  dell'ADE (rimosso con l'ADE nella Wave 4, lab PR 214); `tick_decay`
   fa decadere la posture (1h ALERTED→OBSERVING, 24h ENGAGED→
   ALERTED, COMBAT mai).
 - `common::posture_types` per i tipi serializable (audit log).
@@ -182,8 +198,8 @@ prove si accumulano.
 
 Demo: `cargo run -p northnarrow-agent --release --example
 posture_demo --features posture-demo` mostra le transizioni OBSERVING→ALERTED→ENGAGED→
-COMBAT, una modulazione Allow→Alert in ALERTED, e l'admin override
-che riporta a ENGAGED.
+COMBAT e il COMBAT bloccato (la modulazione Allow→Alert è uscita con l'ADE
+nella Wave 4).
 
 ### Sub-tappa 6.6 — ADE Hardening contro Prompt Injection (chiusa)
 
@@ -1031,3 +1047,7 @@ regole, profondità, avversariale), la 10.8 raccoglie il lavoro
 trasversale di affidabilità; "UI locale" e "Scout proattivo" restano in
 roadmap, slittate dopo la 10.8, con numerazione definitiva da assegnare
 dal founder.
+
+Aggiornamento del 20 ottobre 2026 su decisione del founder (Wave 4, lab PR
+214): rimosso il consulente LLM on-host (Tappa 6 tranne la 6.5); vedi la
+decisione di prodotto in testa al file.

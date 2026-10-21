@@ -6,10 +6,13 @@
 //! shifts up as evidence accumulates (recon → exploit → confirmed
 //! intrusion) and:
 //!
-//! - tightens ADE confidence floors / severity inflation,
-//! - lifts ambiguous `Allow` verdicts into `Alert` so OBSERVING-era
-//!   noise becomes signal once the posture is hot,
+//! - engages the COMBAT active-response ladder ([`crate::combat`]) when
+//!   it reaches `COMBAT`,
 //! - blocks automatic exit from `COMBAT` (admin-signed release only).
+//!
+//! It also used to modulate the verdicts of the on-host LLM advisor
+//! (an ambiguous `Allow` became an `Alert` once the posture was hot); the
+//! advisor and that modulation were removed in Wave 4 (lab PR 214).
 //!
 //! Public surface:
 //!
@@ -36,7 +39,6 @@ pub mod escalation_allow;
 pub mod exempt;
 pub mod lineage;
 pub mod mass_write_overlay;
-pub mod modulation;
 pub mod state;
 pub mod transitions;
 pub mod triggers;
@@ -49,7 +51,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 
-use common::ade_types::AdeVerdict;
 use common::posture_types::{
     Confidence, EvidenceClass, PostureKind, PostureTransition, TriggerType,
 };
@@ -325,8 +326,8 @@ impl PostureMachine {
     /// Notify the machine of a new event. Returns `Some(new_state)`
     /// when the event drove a transition, `None` otherwise.
     ///
-    /// `recent_events` should be the correlated context the agent
-    /// already maintains (the same slice that ADE consumes).
+    /// `recent_events` should be the recent events the agent already
+    /// keeps ([`crate::correlation::CorrelationBuffer`]).
     pub fn observe<'a>(
         &self,
         event: &Event,
@@ -558,13 +559,6 @@ impl PostureMachine {
         } else {
             None
         }
-    }
-
-    /// Modulate `verdict` according to the current posture. See
-    /// [`modulation`] for the table.
-    pub fn modulate_verdict(&self, verdict: AdeVerdict) -> AdeVerdict {
-        let kind = self.inner.state.read().kind();
-        modulation::modulate(&verdict, kind)
     }
 
     /// Apply decay if the appropriate window has elapsed. Returns

@@ -292,7 +292,6 @@ impl E2eFixture {
             // a watchdog running the binary it expects — here the test's.
             .arg("--watchdog-exe")
             .arg(self.watchdog_priv_path())
-            .arg("--no-ade")
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()

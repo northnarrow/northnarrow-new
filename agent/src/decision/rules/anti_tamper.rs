@@ -10,8 +10,8 @@
 //! already failed, and killing the actor is the ladder's call.
 //!
 //! Not in the engine's rule list: `process_event` short-circuits every
-//! `FsProtectDenial` before the engine and the ADE (a kernel deny is not
-//! re-evaluated) and calls this rule directly in that arm.
+//! `FsProtectDenial` before the engine (a kernel deny is not re-evaluated)
+//! and calls this rule directly in that arm.
 
 use common::{Event, FsProtectOperation, ResponseAction, Severity, Verdict};
 

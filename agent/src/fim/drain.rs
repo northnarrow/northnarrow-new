@@ -2,8 +2,8 @@
 //! `Event::Fim` emit.
 //!
 //! Bridges C2's kernel-side `FS_FIM_EVENTS` ringbuf to the
-//! agent's existing `Event` channel that the decision engine +
-//! ADE consume. Per design §6.3 + §6.5:
+//! agent's existing `Event` channel that the decision engine
+//! consumes. Per design §6.3 + §6.5:
 //!
 //! 1. Drain `FS_FIM_EVENTS` via aya's `RingBuf::poll` (the
 //!    pattern matches `agent/src/sensors/multiplexer.rs::pump`).

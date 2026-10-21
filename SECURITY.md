@@ -72,11 +72,10 @@ through ENISA's single reporting platform:
   found in the lab (`docs/audit/EXTERNAL_AUDIT_16f7563.md`, which also
   gives the status of each finding); a report that adds a working
   reproduction or a different impact is still useful.
-- The local model (ADE) is advisory: a verdict that names a response is
-  recorded as a recommendation and not executed, unless the host runs with
-  `NN_ADE_ENFORCE=1`, a weakening the agent records in its signed audit
-  log. A prompt injection that changes a recommendation is in scope; say
-  whether the host had that variable set.
+- The agent runs no language model: the on-host LLM advisor (ADE) was
+  removed in Wave 4 (lab PR 214), and detection is deterministic. A report
+  against the advisor of an earlier build is still welcome for that build;
+  say which build it is.
 - Testing must be done on hosts you own or are authorised to test.
   Do not test against third-party systems running NorthNarrow.
 

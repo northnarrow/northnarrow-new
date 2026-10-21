@@ -12,6 +12,11 @@ what the operator touches. Each names the finding (`NN-AUD-xxx`, with the
 audit's own reference) and the lab PR that fixed it; the CHANGELOG entry
 and the tracker note have the details and the lab evidence.
 
+**Wave 4:** the on-host LLM advisor (the ADE, its RAG knowledge base and
+its XAI explanations) was removed in lab PR 214; what this file says about
+the model (item 4 below, §7 and the items that point to it) applies only up
+to that build. What changes then is in `UPGRADE_NOTES_WAVE4.md`.
+
 ## Before you upgrade
 
 1. Upgrade the three binaries together (`install.sh --upgrade` and the
@@ -24,7 +29,8 @@ and the tracker note have the details and the lab evidence.
    release without its tarball and `SHA256SUMS` needs `--tarball`/`--sums`
    or `--allow-manifest-only` (§1).
 4. A model kept outside a root-owned directory is not loaded: move it to
-   `/var/lib/northnarrow/models/` (§7).
+   `/var/lib/northnarrow/models/` (§7). From Wave 4 no model is loaded at
+   all (`UPGRADE_NOTES_WAVE4.md` §2).
 5. The host needs `/usr/bin/mountpoint` (util-linux) to start the agent
    (§1), and `nft` for the COMBAT soft egress block (§6): `install.sh`
    refuses a host without it unless `--without-nftables` (§1).
@@ -189,7 +195,9 @@ and the tracker note have the details and the lab evidence.
   off; the mock backend is no longer a fallback (NN-AUD-157 LLMR-005) and
   comes back only with `NN_ADE_ALLOW_MOCK=1`, for demos. **Upgrade note:**
   move a model kept elsewhere (or pass `--ade-model` with a root-owned
-  path), or the agent runs on its rules alone.
+  path), or the agent runs on its rules alone. **Wave 4:** the advisor is
+  removed; `--ade-model` and `NN_ADE_ALLOW_MOCK` are ignored with a WARN
+  (`UPGRADE_NOTES_WAVE4.md` §1).
 - **The bootstrap admin key leaves `/etc`** (NN-AUD-072 DEP-001, lab PR
   96). A fresh install writes it to `/root/northnarrow-admin.key`
   (`--admin-key-out`); the package hooks open the trusted-installer window
@@ -553,7 +561,8 @@ packages open it themselves.
   bare action only.
 - **Model recommendations** (lab PR 134). A model verdict that names a
   response is a detection whose response reads `advisory: <action>
-  recommended by the model, not executed` (§7).
+  recommended by the model, not executed` (§7). None is written from Wave 4;
+  the records already written still verify (`UPGRADE_NOTES_WAVE4.md` §3).
 - **A model that does not answer leaves a record** (NN-AUD-156 LLMR-003,
   lab PR 133): a timeout or a backend error is an ADE Escalate of kind
   `ade_unavailable`, with no response, instead of a journal line.
@@ -955,6 +964,10 @@ Now **killed, or answered, where they were recorded or missed**:
 
 ## 7. The model (ADE) and RAG
 
+**Wave 4:** this section no longer applies once the build of lab PR 214 is
+installed: the advisor, its knowledge base and its settings are removed
+(`UPGRADE_NOTES_WAVE4.md`). It stays for an upgrade to an earlier build.
+
 - **The ADE is a consultant** (product decision, lab PR 134). A model
   verdict that names a response (Kill, KillTree, Quarantine, BlockNetwork,
   Isolate) is recorded as a recommendation and nothing runs; responses
@@ -1218,6 +1231,8 @@ checked with its tag-bound attestation.
   dev, lab and range builds decode with candle at the x86-64-v2 ISA unless
   they opt into `native` (§1 of
   <https://github.com/northnarrow/northnarrow-new/blob/main/docs/PERFORMANCE.md>).
+  From Wave 4 there is no candle decode: the ISA no longer matters to the
+  agent's speed.
 - **The soak reads the ring drops signed** (NN-AUD-237 ASK-009, lab PR
   213). `deploy/lab/soak/sample.sh` calls `nn-admin status --key` with
   `$SOAK_ADMIN_KEY` or the guest's install key (`/root/northnarrow-admin.key`):
@@ -1226,6 +1241,7 @@ checked with its tag-bound attestation.
   report` fails the run ("ring-buffer drops not read"; it counted 0).
 - **`ade_attacks`** (NN-AUD-195 WDG-R01, lab PR 149) exits non-zero when it
   would score the mock backend, and names the backend next to the rate.
+  (Removed with the advisor in Wave 4.)
 - **The range bootstrap** takes the rule count from the validation registry
   (76) instead of a fixed 69 (NN-AUD-217 LAB-012, lab PR 159).
 - **The posture demo** (NN-AUD-430 POS-013, lab PR 172; NN-AUD-368
@@ -1241,7 +1257,8 @@ checked with its tag-bound attestation.
   `cargo xtask run` keeps only `RUST_LOG` across `sudo` (it was `sudo -E`;
   to hand the agent another variable, run the built binary yourself:
   `sudo env NAME=value ./target/release/northnarrow-agent`); `ade_smoke` reads `ADE_MODEL`, else the agent's default
-  model path under `/var/lib/northnarrow/models`; `verify_chainlog` is
+  model path under `/var/lib/northnarrow/models` (removed with the advisor
+  in Wave 4); `verify_chainlog` is
   built as yourself and only its binary runs under sudo.
 
 ## 11. The journal: one event, one line (Wave 3)
@@ -1258,7 +1275,8 @@ checked with its tag-bound attestation.
     a space, `"`, `=`, `\` or a control character, with those escaped:
     `target_filename="/tmp/x\nANTI-TAMPER DENIAL …"`. **Regression:**
     `reasoning` on `VERDICT (rule)` and `VERDICT (ADE)` lines is a
-    sentence, so it is always quoted now (`reasoning="…"`);
+    sentence, so it is always quoted now (`reasoning="…"`; no `VERDICT
+    (ADE)` line from Wave 4);
   - a control character anywhere in a line (an error quoting a path)
     reads `\n`, `\r`, `\t` or `\xNN`, and a line over 16 KiB ends in
     `[cut: N more bytes]`.

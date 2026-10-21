@@ -102,22 +102,6 @@ pub fn install_manifest_check_in_dir(
     (Some(manifest), outcome)
 }
 
-// ── ADE model output (external audit WDG-R04, NN-AUD-370) ────────────
-
-/// The text the verdict parser hands to serde: after a reasoning block,
-/// without code fences, cut to the first balanced JSON object when there
-/// is one. `Err` when a reasoning block is opened and never closed.
-#[doc(hidden)]
-pub fn ade_preparse(raw: &str) -> Result<&str, String> {
-    crate::ade::parser::preparse(raw).map_err(|e| e.to_string())
-}
-
-/// The first balanced `{ … }` of `s`, as the pre-parser finds it.
-#[doc(hidden)]
-pub fn ade_first_json_object(s: &str) -> Option<&str> {
-    crate::ade::parser::extract_first_json_object(s)
-}
-
 // ── shutdown marker (external audit WDG-014, NN-AUD-363) ─────────────
 
 /// `admin.pub` of the `shutdown_marker` target: the public halves of the
@@ -466,20 +450,6 @@ mod tests {
             rendered.insert(family.as_wire());
         }
         assert_eq!(rendered.len(), families.len(), "{rendered:?}");
-        // ade_verdict: a verdict that passes the 14 rules; ade_preparse: each is cut
-        let parser = crate::ade::parser::VerdictParser::new();
-        let ok = inputs("seeds", "ade_verdict")
-            .iter()
-            .filter(|(_, b)| parser.parse(&String::from_utf8_lossy(b)).is_ok())
-            .count();
-        assert!(ok >= 2, "{ok} verdict seeds parse");
-        for (name, bytes) in inputs("seeds", "ade_preparse") {
-            let out = ade_preparse(text(&bytes)).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(
-                out.starts_with('{') && out.ends_with('}'),
-                "{name}: {out:?}"
-            );
-        }
         // tls_client_hello: parses, with SNI and ALPN
         for (name, bytes) in inputs("seeds", "tls_client_hello") {
             let hello = crate::net::tls_parser::parse_client_hello(&bytes)

@@ -1148,8 +1148,8 @@ fn is_rustsec_id(s: &str) -> bool {
 /// the crate and version it was reasoned about, why it is not reachable or
 /// has no fix, who re-checks it, when, and until which date. The crate must
 /// still be locked at that version: the reasoning was about that version
-/// and its dependents' code, so a bump that moves it (tantivy taking
-/// another lru) reopens the entry here instead of leaving an ignore that
+/// and its dependents' code, so a bump that moves it (a dependent taking
+/// another version) reopens the entry here instead of leaving an ignore that
 /// accepts the advisory for whatever is locked next.
 #[test]
 fn every_advisory_exception_is_reasoned_and_dated() {
@@ -1517,10 +1517,11 @@ fn advisory_exceptions_expire_in_ci() {
     assert!(!ok && text.contains("not found"), "missing file: {text}");
 }
 
-/// SUP-008: the lru exception rests partly on the release profile aborting
-/// on a panic (no unwinding, so no `catch_unwind` can observe the half-done
-/// `pop()`). The shipped profile, and every profile built from it, keeps
-/// `panic = "abort"`.
+/// SUP-008: the lru exception rested partly on the release profile aborting
+/// on a panic (no unwinding, so no `catch_unwind` could observe the
+/// half-done `pop()`); lru left with the LLM advisor in Wave 4 (lab PR 214),
+/// and the property stays: the shipped profile, and every profile built
+/// from it, keeps `panic = "abort"`.
 #[test]
 fn release_profile_aborts_on_panic() {
     let text = read(&repo_root().join("Cargo.toml"));
@@ -1611,15 +1612,11 @@ fn security_crates_are_locked_alike_for_the_fuzzer() {
         "object",
         "procfs",
         "procfs-core",
-        // the model and the knowledge base, and what they map from disk
-        "tantivy",
-        "candle-core",
-        "tokenizers",
-        "safetensors",
-        "memmap2",
-        // the crates of the recorded exceptions (also taken from audit.toml)
-        "lru",
-        "paste",
+        // (tantivy, candle-core, tokenizers, safetensors and memmap2, the LLM
+        // advisor's model and knowledge base and what they mapped from disk,
+        // left the graph with the advisor in Wave 4, lab PR 214; so did lru
+        // and paste, the crates of its advisory exceptions.)
+        // The crates of the recorded exceptions are taken from audit.toml.
     ];
     let root = repo_root();
     let main = locked_versions(&root.join("Cargo.lock"));
@@ -1681,7 +1678,9 @@ fn fuzz_targets() -> Vec<(String, String)> {
         };
         out.push((field("name"), field("path")));
     }
-    assert!(out.len() >= 13, "fuzz/Cargo.toml: {} targets", out.len());
+    // 11 since Wave 4: `ade_verdict` and `ade_preparse` left with the LLM
+    // advisor (lab PR 214).
+    assert!(out.len() >= 11, "fuzz/Cargo.toml: {} targets", out.len());
     out
 }
 

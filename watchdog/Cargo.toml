@@ -20,7 +20,7 @@ path = "src/lib.rs"
 # antitamper-bpf is the LOAD-BEARING dep — it gives us
 # ProtectedPidsHandle::open(bpffs_root) for the W3 layer-2 evict
 # AND the bpffs/pin helpers without dragging the agent's
-# tokio/ADE/posture/RAG transitive cone.
+# tokio/posture/decision transitive cone.
 antitamper-bpf = { workspace = true }
 # common: posture/wire types the W5 STATUS-ping path will need.
 # Imported now so the cargo graph settles in W2; W2 itself only

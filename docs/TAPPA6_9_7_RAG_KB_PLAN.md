@@ -1,3 +1,5 @@
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 # Tappa 6.9.7 — RAG Local Knowledge Base — Implementation Plan
 
 Status: **P1.5 frozen · P2✅ P3✅ P4✅ P5✅ P6✅ P7✅ COMPLETE (merged `75855c6`) · P5.1✅ DELIVERED (Tappa 6.9.7.1 amendment — pending owner gate).**

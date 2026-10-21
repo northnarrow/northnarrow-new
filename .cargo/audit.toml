@@ -23,54 +23,23 @@
 # (.github/scripts/check-audit-exceptions.sh, also on the daily schedule).
 # Never pass `--ignore` on the command line: an exception without its reason
 # is what this file replaces.
+#
+# Wave 4 (lab PR 214): the exceptions RUSTSEC-2026-0253 and RUSTSEC-2026-0002
+# (lru 0.12.5, through tantivy) and RUSTSEC-2024-0436 (paste 1.0.15, through
+# candle and tokenizers) were dropped: those crates left both lockfiles with
+# the on-host LLM advisor.
 
 [advisories]
 ignore = [
-    # RUSTSEC-2026-0253: lru 0.12.5, unsound. NN-AUD-394 (SUP-008).
-    # Why: the only dependent is tantivy 0.25.0 (`=0.25.0` in
-    #   agent/Cargo.toml), which requires lru ^0.12; the fix is in 0.18.2,
-    #   out of reach of `cargo update`, and a `[patch]` cannot cross the major
-    #   version. The advisory needs a key whose Drop panics, caught by
-    #   catch_unwind; tantivy's store reader keeps `LruCache<usize, Block>`
-    #   (get/put/len/peek_lru only), and a usize key cannot panic in Drop. The
-    #   release profile is panic = "abort" as well (tested).
-    # Owner: the maintainer.
-    # Re-check: at every tantivy bump (`cargo tree -i lru`); drop the entry
-    #   when tantivy takes lru >= 0.18.2.
-    # Recorded: 2026-10-20
-    # Expires: 2027-01-20
-    "RUSTSEC-2026-0253",
-    # RUSTSEC-2026-0002: lru 0.12.5, unsound. NN-AUD-395 (SUP-009).
-    # Why: the Stacked Borrows violation is in `IterMut`; tantivy never calls
-    #   `iter_mut` on its LruCache (store/reader.rs), and no crate of this
-    #   repository depends on lru itself. Fixed in 0.16.3, out of reach for the
-    #   same reason as RUSTSEC-2026-0253.
-    # Owner: the maintainer.
-    # Re-check: at every tantivy bump (`cargo tree -i lru`); drop the entry
-    #   when tantivy takes lru >= 0.16.3.
-    # Recorded: 2026-10-20
-    # Expires: 2027-01-20
-    "RUSTSEC-2026-0002",
-    # RUSTSEC-2024-0436: paste 1.0.15, unmaintained. NN-AUD-443 (SUP-011).
-    # Why: archived upstream, no fixed release exists. It is a proc-macro
-    #   (build time only, nothing of it in a shipped binary), reached only
-    #   through the candle/tokenizers chain (gemm, pulp,
-    #   macro_rules_attribute, tokenizers); no crate of this repository uses
-    #   it directly.
-    # Owner: the maintainer.
-    # Re-check: at every candle or tokenizers bump (`cargo tree -i paste`);
-    #   drop the entry when that chain moves to pastey or drops it.
-    # Recorded: 2026-10-20
-    # Expires: 2027-01-20
-    "RUSTSEC-2024-0436",
     # RUSTSEC-2024-0449: unsafe-libyaml 0.2.11, unmaintained. Found by this
     #   policy (advisory published 2026-10-12, after the Wave 3 triage).
     # Why: archived upstream, no fixed release exists. Its only dependent is
     #   serde_yaml_ng 0.10.0, a dependency of xtask alone (`publish = false`;
     #   not in the agent, the CLI, the watchdog or any release asset:
-    #   `cargo tree -i unsafe-libyaml`). xtask parses with it the committed
-    #   workflow files (its tests) and the Sigma rules of a sha256-pinned
-    #   tarball (rag_kb.rs), never input chosen at run time.
+    #   `cargo tree -i unsafe-libyaml`); since Wave 4 (lab PR 214, which
+    #   removed `cargo xtask rag-kb` and its Sigma parsing) a dev-dependency
+    #   of the xtask tests only, which parse the committed workflow files
+    #   with it, never input chosen at run time.
     # Owner: the maintainer.
     # Re-check: before any new YAML input reaches xtask, and at the move of
     #   xtask to a YAML parser in safe Rust (serde-saphyr, as the advisory

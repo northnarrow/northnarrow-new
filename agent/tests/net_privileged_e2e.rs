@@ -311,7 +311,6 @@ impl NetFixture {
             .arg(&netflow_ja3_blocklist_v1)
             .arg("--netflow-ja3-blocklist-local")
             .arg(&netflow_ja3_blocklist_local)
-            .arg("--no-ade")
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()

@@ -3,14 +3,15 @@ resolver = "2"
 members = ["agent", "antitamper-bpf", "common", "cli", "ebpf-guard", "watchdog", "xtask"]
 # `agent-ebpf` is a separate cargo project: nightly toolchain,
 # bpfel-unknown-none target, build-std=core. The xtask runner builds it.
-exclude = ["agent-ebpf", "fuzz", "vendor/candle-core"]
+exclude = ["agent-ebpf", "fuzz"]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
 # External audit SUP-015: the oldest rustc that builds this workspace with
 # the committed Cargo.lock. It was "1.83", which no build could meet:
-# uuid 1.28.0 declares 1.89 (time 0.3.47, through tantivy, 1.88). Checked by
+# uuid 1.28.0 declares 1.89 (and time 0.3.47, 1.88, until it left with
+# tantivy and the LLM advisor in Wave 4). Checked by
 # the `msrv` CI job (`cargo +<this> check --workspace --all-targets
 # --locked`) and by xtask/tests/supply_chain.rs (not below the highest
 # `rust-version` of the locked dependencies, not above rust-toolchain.toml).
@@ -18,10 +19,10 @@ edition = "2021"
 rust-version = "1.89"
 # External audit SUP-019: the licence of NorthNarrow's own code, the one of
 # `LICENSE`; every member inherits it, and agent-ebpf/Cargo.toml and the .rpm
-# (`License:`) say the same. The tree also holds third-party material under
-# other terms (ATT&CK and Sigma content of the RAG knowledge base, the
-# vendored candle-core): NOTICES.md says which files are under which terms.
-# xtask/tests/compliance_docs.rs checks that these agree.
+# (`License:`) say the same. NOTICES.md says which files are under which
+# terms (the third-party material of the on-host LLM advisor, removed in
+# Wave 4 with lab PR 214, went with it). xtask/tests/compliance_docs.rs
+# checks that these agree.
 license = "Apache-2.0"
 repository = "https://github.com/northnarrow/northnarrow-new"
 authors = ["NorthNarrow"]
@@ -44,14 +45,10 @@ aya = "0.13"
 aya-log = "0.2"
 
 [profile.release]
-# Sub-tappa 6.8 (performance pass) bumps LTO from "thin" to "fat":
-# cross-crate inlining lets candle's hot quantized matmul be folded
-# into the engine's spawn_blocking caller, gaining ~10-20% on CPU
-# decode on AVX2 hosts. The trade-off is build time: ~30s → ~90-120s
-# on the Hetzner CCX23 reference host. Acceptable because production
-# builds are infrequent and CI runs `--release` only on the final
-# job. Fall back to `lto = "thin"` if a host lacks the RAM (LTO fat
-# can peak ~6-8 GiB during link).
+# Sub-tappa 6.8 bumped LTO from "thin" to "fat" for the on-host LLM
+# advisor's CPU kernels (candle); the advisor was removed in Wave 4 (lab
+# PR 214). Fat LTO is kept: cross-crate inlining still applies to the
+# rest of the agent, and without candle the link is short.
 opt-level = 3
 codegen-units = 1
 lto = "fat"
@@ -59,28 +56,9 @@ panic = "abort"
 strip = "symbols"
 
 # Same as `release` but keeps debug symbols so `perf record` / flame
-# graphs can name candle internals when bench_threads runs against
-# the real Foundation-Sec model. Built explicitly with
+# graphs can name the agent's functions. Built explicitly with
 # `cargo build --profile release-bench`.
 [profile.release-bench]
 inherits = "release"
 debug = true
 strip = "none"
-
-# External audit MAIN-006: candle-core 0.10.x (to 0.11.0) depends on
-# `tokenizers` with `features = ["onig"]` unconditionally, so Oniguruma (C,
-# `onig_sys`) was in the agent whatever the agent asked for, and with both
-# backends on, tokenizers uses onig. `vendor/candle-core` is the crates.io
-# 0.10.2 package (sha256 6bd98954…2a4a, the checksum Cargo.lock recorded)
-# with changes marked "NorthNarrow": in its Cargo.toml that dependency
-# asks for `fancy-regex`, the deprecation warnings of its unchanged code are
-# allowed (a path dependency gets no --cap-lints), and `zip` is 9.0.4
-# (RUSTSEC-2026-0367/0368/0369 on 7.x: extraction to disk, which candle does
-# not call — it reads `.npz`/`.pth` entries in memory); in `src/npy.rs` and
-# `src/pickle.rs` three lines follow zip 9's `Result` names. Check: `diff -r`
-# against the extracted .crate shows only those lines. fuzz/Cargo.toml
-# carries the same patch. A candle
-# bump must redo it: the patch does not apply to another version, and the
-# CI charter step (onig_sys in the graph) fails until it is redone.
-[patch.crates-io]
-candle-core = { path = "vendor/candle-core" }

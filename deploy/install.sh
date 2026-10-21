@@ -41,7 +41,8 @@
 #     map, pin, or LSM hook, so the bpffs / `lsm=…,bpf` prerequisites
 #     (steps 3-4 below) are unchanged.
 #   - D3-D7 are userland-only (correlation store, CHAIN-004..008, the
-#     ADE process_template). They add NO new config file: R011-R017 reuse
+#     LLM advisor's process_template, removed in Wave 4). They add NO new
+#     config file: R011-R017 reuse
 #     `process-comm-allowlist.v1` and the chain rules need none.
 #   Engine grew 62 → 67 rules; that is internal to the agent binary and
 #   needs no operator action.
@@ -1192,6 +1193,13 @@ while IFS= read -r -d '' evidence; do
     echo "install.sh: closing $evidence to other users (mode $(stat -c %a "$evidence"))"
     chmod go-rwx "$evidence"
 done < <(find "$STATE_DIR" -maxdepth 2 -xdev -type f -name '*.jsonl*' -perm /077 -print0)
+# Wave 4 (lab PR 214): the on-host LLM advisor was removed, and the agent no
+# longer reads $STATE_DIR/models (the GGUF model and tokenizer an operator
+# installed for it). They are the operator's files, possibly several GB:
+# named here, left in place.
+if [[ -d "$STATE_DIR/models" ]]; then
+    echo "install.sh: $STATE_DIR/models holds the model of the removed LLM advisor; the agent no longer reads it — delete it to free the space (docs/operator/UPGRADE_NOTES_WAVE4.md)"
+fi
 
 for fim_log in fim_baseline.jsonl fim_drift.jsonl; do
     if [[ -f "$STATE_DIR/$fim_log" ]]; then

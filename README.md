@@ -4,18 +4,18 @@
 
 # NorthNarrow
 
-**Sovereign, AI-native XDR for Linux — written in Rust, enforced in the kernel, verified in a lab you can rerun.**
+**Sovereign XDR for Linux — written in Rust, enforced in the kernel, deterministic on the host, verified in a lab you can rerun.**
 
 [![CI](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml/badge.svg)](https://github.com/northnarrow/northnarrow-new/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/northnarrow/northnarrow-new?include_prereleases&label=release&color=1e3a5f)](https://github.com/northnarrow/northnarrow-new/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-27ae60)](LICENSE)
 [![Rust](https://img.shields.io/badge/100%25-Rust-93450a)]()
 [![eBPF](https://img.shields.io/badge/kernel-eBPF_%2B_BPF--LSM-blue)]()
-[![Inference](https://img.shields.io/badge/inference-on--device_LLM-5e2a82)]()
+[![Detection](https://img.shields.io/badge/detection-deterministic-5e2a82)]()
 [![Sovereignty](https://img.shields.io/badge/telemetry-never_leaves_the_host-1e3a5f)]()
-[![Compliance](https://img.shields.io/badge/NIS2_·_GDPR_·_DORA_·_CRA_·_AI_Act-by_design-27ae60)]()
+[![Compliance](https://img.shields.io/badge/NIS2_·_GDPR_·_DORA_·_CRA-by_design-27ae60)]()
 
-*Deterministic rules decide in microseconds. A local model reviews the ambiguous rest and recommends; it does not act.<br/>
+*Deterministic rules decide in microseconds; correlation and an adaptive posture carry the evidence from one event to the next.<br/>
 The host hardens, engages and isolates on its own — and nobody can switch it off, root included.*
 
 [Why NorthNarrow](#why-northnarrow) ·
@@ -42,7 +42,7 @@ NorthNarrow inverts it:
 | | Cloud-first EDR/XDR | **NorthNarrow** |
 |---|---|---|
 | Where telemetry goes | vendor cloud | **stays on the host** — no outbound path exists in the code |
-| Who decides | remote models + SOC | **the agent's deterministic rules**, in microseconds; a local LLM adds a recommendation, in seconds, for what no rule matched |
+| Who decides | remote models + SOC | **the agent's deterministic rules**, correlation and posture, in microseconds — no model on the host's enforcement path |
 | Who responds | a human, later | **the host itself**, with a graduated ladder and a signed human override |
 | Can root disable it? | usually | **no** — BPF-LSM denies signals, ptrace and file tampering, root included |
 | Works air-gapped? | degraded | **first-class** |
@@ -59,20 +59,17 @@ flowchart TD
     NET[Network telemetry<br/>TCP · UDP · DNS · listeners]
     CE[Correlation engine<br/>per-host sliding windows · chains]
 
-    subgraph CO["Cascading oracle"]
+    subgraph CO["Decision engine"]
         HO[Rule engine<br/>76 curated rules · sub-millisecond]
-        LO[Local LLM, advisory<br/>8B-class security model, in-process]
-        HO -->|no rule matched| LO
     end
 
-    subgraph ADE["Active Defender"]
+    subgraph AD["Active Defender"]
         STATE[Adaptive posture<br/>OBSERVING → ALERTED → ENGAGED → COMBAT]
         LADDER[COMBAT ladder<br/>INVESTIGATE → NEUTRALIZE → ISOLATE]
         STATE -->|corroborated evidence| LADDER
     end
 
     AT[Anti-tamper<br/>BPF-LSM: task_kill · ptrace · inode_* · watchdog]
-    KB[(Signed knowledge base<br/>ATT&CK + Sigma, local RAG)]
     AUD[Signed, hash-chained logs<br/>audit · detections · FIM · netflow · canaries]
     ADM[nn-admin<br/>Ed25519 roles · quorum · signed unlock]
 
@@ -80,21 +77,18 @@ flowchart TD
     FIM --> CE
     NET --> CE
     CE --> CO
-    KB -.-> LO
-    HO --> ADE
-    LO -.recommendation.-> AUD
-    ADE --> AUD
-    AT -.protects.-> ADE
+    HO --> AD
+    HO --> AUD
+    AD --> AUD
+    AT -.protects.-> AD
     ADM -.releases.-> LADDER
 
     style CO fill:#1e3a5f,stroke:#4a90e2,stroke-width:3px,color:#fff
     style HO fill:#2a5298,stroke:#4a90e2,color:#fff
-    style LO fill:#5e2a82,stroke:#9b59b6,color:#fff
-    style ADE fill:#3a1a1a,stroke:#e74c3c,stroke-width:3px,color:#fff
+    style AD fill:#3a1a1a,stroke:#e74c3c,stroke-width:3px,color:#fff
     style STATE fill:#5a2a2a,stroke:#e74c3c,color:#fff
     style LADDER fill:#7a1a1a,stroke:#e74c3c,color:#fff
     style AT fill:#1a3a1a,stroke:#27ae60,color:#fff
-    style KB fill:#1a3a1a,stroke:#27ae60,color:#fff
 ```
 
 **Sense.** eBPF programs (tracepoints, kprobes, fexit and BPF-LSM hooks) watch
@@ -106,15 +100,13 @@ over TLS (TCP/853) and QUIC (UDP/443) are counted, not read, a systemd-resolved 
 over TLS is listed as a blind spot, and DNS over HTTPS looks like any HTTPS.
 
 **Decide.** A rule engine with 76 curated rules across process, file, network and
-deception families gives a deterministic verdict in microseconds, and every response
-comes from it or from the COMBAT ladder. An exec no rule matched can go to an 8B-class
-security language model running *inside the agent process* (Candle, pure Rust, no
-inference server, no network), optionally with a local RAG over a pinned MITRE ATT&CK
-and Sigma corpus. The model is a consultant: its input includes strings an attacker
-writes, so a verdict that names a response (kill, quarantine, block, isolate) is recorded
-as a recommendation, with the model's reasoning, and nothing is executed.
-`NN_ADE_ENFORCE=1` lets the verdicts act again and is recorded in the signed audit log
-as a weakening.
+deception families gives a deterministic verdict in microseconds; chain rules correlate
+events of one process tree over time, and every response comes from a rule or from the
+COMBAT ladder. Detection on the host is deterministic by design: the on-host language
+model that used to review execs no rule matched was removed in Wave 4 (a multi-GB model
+inside the root agent, fed with strings an attacker writes, was the largest attack
+surface of the agent; its accuracy was never measured; it cost gigabytes of RAM). Any AI
+assistant belongs off the enforcement path, on a future backend for analysts.
 
 **Act.** An adaptive posture machine moves the host from OBSERVING to COMBAT only on
 corroborated evidence (signals from one login session, service or container never vouch
@@ -133,8 +125,8 @@ kill switch.
 **Prove.** Every admin operation, posture transition and detection lands in a signed,
 hash-chained log whose rows are numbered and whose heads are anchored, so a cut or
 emptied chain is reported too; `nn-admin chain verify` checks every chain. A detection
-records the response as it happened (`KillProcess (already gone)`, `advisory: … not
-executed`). Nothing is sent anywhere.
+records the response as it happened (`KillProcess (already gone)`, `suppressed
+(detect-only)`). Nothing is sent anywhere.
 
 ---
 
@@ -170,8 +162,7 @@ fixes change for an operator, regressions included, is in
 What is **not** verified yet, said plainly: the adversarial campaign on the Kali range
 (Tappa 10.7: its denominator is frozen in `docs/validation/`, no rule has campaign proof
 yet, and two Critical rules cannot fire in this build), soak runs longer than 24 h,
-overhead on guests other than Ubuntu 24.04, kernels from 6.9, and the model's behaviour
-after the audit's prompt and context changes (no lab guest has the model). They are on
+overhead on guests other than Ubuntu 24.04, and kernels from 6.9. They are on
 [`ROADMAP.md`](ROADMAP.md) (Tappe 10.7 and 10.8) and in the tracker's follow-ups.
 
 ---
@@ -216,7 +207,9 @@ either flag is recorded in `/etc/northnarrow/install-manifest.json` and reported
 with that manifest and refuses to start on a mismatch, or when the manifest was removed
 after a verified boot. Upgrading from `v0.0.1-tappa9.0`: read
 [`docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md`](docs/operator/UPGRADE_NOTES_AUDIT_16f7563.md)
-first.
+first, then
+[`docs/operator/UPGRADE_NOTES_WAVE4.md`](docs/operator/UPGRADE_NOTES_WAVE4.md) (the
+on-host LLM advisor removed: its flags are ignored with a WARN).
 
 Building from source: `cargo xtask build --release` (compiles the eBPF object with a
 pinned nightly toolchain and embeds it, stamped with its source hash and its own
@@ -254,7 +247,8 @@ FIM trust model, container hosts, honeypots. Lab and test runbook:
 - **Dependencies** are audited in CI (`cargo audit`, every lockfile, the fuzz harness and
   the eBPF crate included) on every change and daily, and kept current by Dependabot. A
   CI step fails when the C libraries `onig_sys` or `zstd-sys` enter the agent's
-  dependency graph.
+  dependency graph. Removing the on-host LLM advisor (Wave 4) took about 150 crates out
+  of `Cargo.lock`, the vendored `candle-core` among them.
 - **Vulnerability disclosure:** [`SECURITY.md`](SECURITY.md). Please do not file
   security-sensitive reports as public issues.
 - **No telemetry, no phone-home, no update channel the agent reaches out to.** Updates
@@ -268,7 +262,7 @@ FIM trust model, container hosts, honeypots. Lab and test runbook:
 |---|---|
 | Language | Rust, end to end — userland, CLI, watchdog and the eBPF programs ([aya](https://aya-rs.dev)) |
 | Kernel side | eBPF tracepoints, kprobes, fexit and BPF-LSM hooks; pinned maps and links survive agent restarts |
-| AI inference | 8B-class security LLM, Q4 GGUF, run in-process by [Candle](https://github.com/huggingface/candle), advisory; optional local RAG over a pinned ATT&CK + Sigma corpus, indexed in memory at start (tantivy) |
+| Detection | deterministic: compiled rules, chain correlation, an adaptive posture and the COMBAT ladder; no model on the host |
 | Cryptography | Ed25519 (admin keys, agent signing key), SHA-256 hash chains |
 | Runtime | Tokio; structured `tracing` logs in a capped journald namespace |
 | Deployment | three static binaries (`northnarrow-agent`, `northnarrow-watchdog`, `nn-admin`), two hardened systemd units |
@@ -281,9 +275,10 @@ The operating roadmap is [`ROADMAP.md`](ROADMAP.md) (Italian; fixed order, one T
 time), the long-term technical vision is [`VISION_TECHNICAL.md`](VISION_TECHNICAL.md).
 Where we stand:
 
-- **Closed:** eBPF sensors, rule engine, response engine, local LLM + RAG, adaptive
-  posture, anti-tamper, signed COMBAT release, FIM, deception, network observability,
-  detection at scale and depth.
+- **Closed:** eBPF sensors, rule engine, response engine, adaptive posture,
+  anti-tamper, signed COMBAT release, FIM, deception, network observability, detection
+  at scale and depth. (The on-host LLM advisor and its RAG knowledge base, built in
+  Tappa 6, were removed in Wave 4: on-host detection stays deterministic.)
 - **In progress:** adversarial validation on a Kali range; reliability — multi-kernel
   support, soak testing, fuzzing, packaging; the external audit's follow-ups and its
   Wave 3 (Low and Informational findings).
@@ -302,7 +297,7 @@ No calendar dates are published; milestones ship in milestone order.
 | **GDPR** | no telemetry leaves the controller's perimeter; no processor relationship to declare |
 | **DORA** | fully operational under degraded or absent connectivity; no vendor dependency for continued protection |
 | **CRA** | signed artefacts, SBOM, provenance attestation, disclosure process |
-| **EU AI Act** | on-device inference that is advisory by default: a model verdict that names a response is recorded, with its reasoning, as a recommendation for the operator and not executed; responses come from deterministic rules. Dossier: [`docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md`](docs/TAPPA6_9_ARTICLE_13_COMPLIANCE.md) |
+| **EU AI Act** | no AI system on the host: detection and response are deterministic rules, correlation and posture (the on-host LLM advisor was removed in Wave 4). A future AI assistant would sit off the enforcement path, on the backend |
 
 ---
 
@@ -323,15 +318,15 @@ structured detection feedback and co-authored incident retrospectives.
 ## For investors
 
 Pre-revenue, pre-Beta, building toward first paid deployments in regulated EU markets.
-Three asymmetric bets: EU sovereignty as a hard procurement requirement; local AI
-inference removing the cloud-telemetry trade-off that is the incumbents' moat; active
-defence as the next category after fifteen years of alert generation. Open an *investor
+Three asymmetric bets: EU sovereignty as a hard procurement requirement; on-host,
+deterministic detection removing the cloud-telemetry trade-off that is the incumbents'
+moat; active defence as the next category after fifteen years of alert generation. Open an *investor
 inquiry* issue for diligence materials.
 
 ## For engineers
 
 Not hiring yet — single-founder by design during Pre-Beta. If you work on systems Rust,
-eBPF, kernel security or applied AI for infosec and want to be on the early list, open a
+eBPF or kernel security and want to be on the early list, open a
 *general inquiry* issue with a short note.
 
 ## For press and media
@@ -343,8 +338,7 @@ time-sensitive requests within the working day.
 
 ## License
 
-[Apache License 2.0](LICENSE). Third-party attributions (MITRE ATT&CK, SigmaHQ and
-others) in [`NOTICES.md`](NOTICES.md) and [`LICENSES/`](LICENSES/).
+[Apache License 2.0](LICENSE). Third-party attributions in [`NOTICES.md`](NOTICES.md).
 
 ## Disclaimer
 

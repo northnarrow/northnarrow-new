@@ -24,26 +24,6 @@ path = "src/lib.rs"
 name = "posture_demo"
 required-features = ["posture-demo"]
 
-# External audit WDG-017, WDG-R13, WDG-R14, WDG-R03, WDG-012, WDG-R12,
-# WDG-R15: the ADE measurement examples carry `#[cfg(test)]` tests of what
-# they measure and report; `test = true` makes `cargo test --workspace` run
-# them (the examples themselves need a model and are run by hand).
-[[example]]
-name = "ade_attacks"
-test = true
-
-[[example]]
-name = "ade_with_rag"
-test = true
-
-[[example]]
-name = "bench_threads"
-test = true
-
-[[example]]
-name = "ade_demo"
-test = true
-
 [features]
 default = []
 # Enables R901..=R904, four hardcoded demo rules whose only job is to
@@ -111,38 +91,20 @@ serde = { version = "1", features = ["derive"] }
 # External audit EVD-007 (lab PR 204): `float_roundtrip` parses a float to
 # the exact value written. The chain verifiers re-serialise each decoded row
 # and hash it; the default parser can land one ULP off a 17-digit float (a
-# detection's `confidence`, an XAI weight, an f64 in an audit row's `extra`),
+# detection's `confidence`, an f64 in an audit row's `extra`),
 # so such a row did not verify, and a v3 row would also fail its canonical
 # check (`chainlog::tests::every_shipped_payload_type_round_trips_byte_exactly`).
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
-# Tappa 6: ADE
+# chrono: the evidence logs' UTC timestamps; clap: the command lines;
+# parking_lot: the agent's locks. (They came with Tappa 6, the on-host LLM
+# advisor removed in Wave 4, lab PR 214, and stayed with the rest.)
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 clap = { workspace = true }
 parking_lot = "0.12"
 
-# Sub-tappa 6.8: physical-core auto-detection for AdeConfig.effective_threads.
-# Already a transitive dep of tokio/rayon; declaring it here pins the API.
-num_cpus = "1.16"
-
-# Sub-tappa 6.1: real LLM inference backend (candle, Llama 3.1 GGUF).
-# CPU-only by default; CUDA/Metal can be enabled via candle features
-# behind an `ade-gpu` flag in a follow-up sub-tappa.
-candle-core = { version = "0.10", default-features = false }
-candle-transformers = { version = "0.10", default-features = false }
-candle-nn = { version = "0.10", default-features = false }
-# CHARTER (external audit MAIN-006): the regex backend is `fancy-regex`
-# (Rust). `onig` (tokenizers' default) builds Oniguruma, a C library
-# (`onig_sys`), into the agent, the same class of dependency as zstd-sys
-# below. candle-core 0.10 asks for `onig` too, and with both features on
-# tokenizers uses it: the root Cargo.toml patches candle-core
-# (`vendor/candle-core`). CI fails if `onig_sys` or `zstd-sys` enters the
-# agent's graph; `ade::tokenizer_golden` pins the tokenization (recorded
-# with Oniguruma).
-tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
-
-# Sub-tappa 6.6: ADE prompt-injection hardening (base64 encoding of
-# untrusted strings inside the structured prompt).
+# The evidence logs' signatures (`agent_sig`) are base64 in their JSONL
+# lines; the canary templates render base64-shaped secrets.
 base64 = "0.23"
 
 # Tappa 7 task 7 / Tappa 8: nn-admin Ed25519 challenge-response.
@@ -150,26 +112,6 @@ base64 = "0.23"
 # down); `rand_core` lets us feed rand 0.8's OsRng into key generation.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
 hex = "0.4"
-# <<<VERBATIM — Owner ruling §12.1, 2026-05-17>>>
-# Tappa 6.9.7: tantivy is pinned exact-version to ensure deterministic
-# BM25 scoring across rebuilds. A version bump invalidates the golden
-# retrieval test suite and the KB index format compatibility, so it is
-# a deliberate commit with golden-test refresh and KB rebuild, never a
-# silent cargo update. Bump-if-verified path: 0.26.0 may be adopted if
-# `cargo search tantivy` confirms GA (not RC) AND no breaking BM25
-# scoring changes vs 0.25.x are noted in the changelog.
-# <<<END VERBATIM>>>
-# CHARTER NOTE (P3, 2026-05-17): default-features=false is MANDATORY —
-# tantivy's default `columnar-zstd-compression` pulls `zstd-sys` (C FFI),
-# which violates the 100%-Rust/no-FFI charter. The pure-Rust set below
-# (mmap = memmap2 on-disk index; lz4-compression = lz4_flex store) keeps
-# zstd-sys out of the tree (verified via `cargo tree`). Do NOT re-enable
-# default features or add `zstd-compression`/`columnar-zstd-compression`.
-# `stopwords` dropped in P4 (audit F-P3-2): the nn_sec analyzer does not
-# use a stop-word filter — verified the full rag suite green without it
-# (minimal surface). 0.26.1 is GA as of P3 but a bump stays deliberate
-# (see verbatim above).
-tantivy = { version = "=0.25.0", default-features = false, features = ["mmap", "lz4-compression"] }
 
 [build-dependencies]
 # Staleness guard: build.rs verifies the embedded eBPF `.o` was built

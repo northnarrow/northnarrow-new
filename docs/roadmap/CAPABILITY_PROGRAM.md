@@ -65,3 +65,44 @@ only in the table below, in the same PR as the evidence.
    platforms (C01, C04, then C02), product trust (C25–C27, C29, C30).
 
 ## Notes on the lab PRs
+
+- **Wave 4 — the on-host LLM advisor removed, lab PR 214 (C30, C14).**
+  Removed: the ADE (`agent/src/ade`, a Foundation-Sec-8B GGUF model run
+  inside the agent on the execs no rule matched), its RAG knowledge base
+  (`agent/src/rag`, `cargo xtask rag-kb`, `docs/kb-sources`, the ATT&CK and
+  Sigma licence texts), the XAI explanations (`agent/src/xai`,
+  `common::xai_types`), the vendored `candle-core`, every model and tokenizer
+  dependency (candle, tokenizers, tantivy, num_cpus; about 150 crates out of
+  `Cargo.lock` and `fuzz/Cargo.lock`, no version changed), the ADE examples
+  and `diag_hw`, the `ade_verdict` and `ade_preparse` fuzz targets, the
+  `ade-build` and `ade-unit-test` CI jobs, the posture's modulation of
+  model verdicts and the operator documents of the model. Why: a multi-GB
+  model inside the root agent process, fed with strings an attacker writes,
+  was the largest attack surface of the agent; its accuracy was never
+  measured; it cost gigabytes of RAM on a server; mature EDRs keep on-host
+  detection deterministic, and an AI assistant, if any, belongs off the
+  enforcement path (a future analyst assistant on the backend). What
+  replaces it: nothing on the enforcement path — detection is the rules,
+  their correlation, the posture and the COMBAT ladder, as on every host
+  without the model (which no release shipped); an exec no rule matches gets
+  no detection. The removed flags (`--no-ade`, `--ade-model`,
+  `--ade-timeout`, `--ade-prompt`, `--ade-threads`) and variables
+  (`NN_ADE_*`) are accepted and ignored with one WARN each
+  (`agent/src/removed_settings.rs`, `docs/operator/UPGRADE_NOTES_WAVE4.md`);
+  detection records the advisor wrote before still decode and chain-verify
+  (`DetectionPath::Ade`, `AdvisorAction`, byte-exact tests). Capability
+  effect: **C30 changes meaning** — it no longer covers an on-host
+  generative model: there is no generative AI on the host, by design, and
+  C30 now tracks the governance of data and of any future AI assistant off
+  the host. Its level is not changed by this note (nothing was measured
+  under the new meaning); C14 is unchanged (its detection was deterministic
+  already). Verified on the host: `cargo fmt`, the three clippy runs
+  (workspace, the agent with `test-privileged,debug-trigger`, the posture
+  demo) clean; `cargo test --workspace` 2,388 passed, 0 failed, 11 ignored
+  (about 420 tests left with the removed code); the fuzz build, 11 targets,
+  every committed seed and regression replayed. On a guest,
+  still open: the start with an old unit and drop-in (WARN, no crash), the
+  agent's RSS before and after, the rules and COMBAT acting, the package
+  contents. The unit's memory limits (9G/11G, sized for the model) are not
+  re-sized until that RSS is measured.
+  - Lab: On Ubuntu 24.04 the upgrade from the tree without this lot kept an old unit drop-in with the five advisor flags and four variables: after it the agent started with one WARN per removed setting (9), no "unexpected argument", no `weakening_env` for them, `--help` without the flags, and a respawn by the watchdog behaved the same; RSS 30.6 MB after against 33.2 MB before (no growth), the agent binary 18.9 MB → 11.1 MB; the tarball (66 entries) and the .deb (73) hold no model path and NOTICES no advisor section (the agent unit's comment, embedded for the self-integrity check, still names the old model: wording only). Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.

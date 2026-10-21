@@ -1,3 +1,5 @@
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 # Tappa 6.9 — XAI Saliency Mapping — Implementation Plan
 
 Status: **SHIPPED — P0…P5 complete** (2026-05-17). Phase ledger: P0

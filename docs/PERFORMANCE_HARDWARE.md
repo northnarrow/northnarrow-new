@@ -1,3 +1,5 @@
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 # ADE — Hardware baseline (Sub-tappa 6.8)
 
 Snapshot of the deployment host the founder runs ADE on. Captured by

@@ -1,3 +1,5 @@
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 # ADE Doctrine — Doctrine-Driven Adaptive Cyber-Defense
 
 > *"Endpoint security is a sustained campaign, not a sequence of isolated detections."*

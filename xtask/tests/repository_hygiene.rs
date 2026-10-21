@@ -24,14 +24,13 @@ const FIXTURE_HOMES: &[&str] = &[
 
 /// What the home-directory scan reads: sources, scripts and configuration.
 /// Markdown is left out (the design notes and the audit tracker quote
-/// historical paths), and so are the build outputs and the vendored crate.
+/// historical paths), and so are the build outputs.
 const SCANNED_EXTENSIONS: &[&str] = &[
     ".rs", ".toml", ".sh", ".yml", ".yaml", ".service", ".conf", ".tmpl",
 ];
 const SKIPPED: &[&str] = &[
     ".git",
     "target",
-    "vendor",
     "agent-ebpf/target",
     "fuzz/target",
     "fuzz/corpus",
@@ -160,7 +159,7 @@ fn no_developer_home_in_sources_scripts_or_configuration() {
     assert!(
         files
             .iter()
-            .any(|f| rel(f) == "agent/examples/ade_smoke.rs"),
+            .any(|f| rel(f) == "agent/examples/verify_chainlog.rs"),
         "the scan must reach the examples"
     );
     let mut bad = Vec::new();
@@ -190,7 +189,7 @@ fn no_cargo_under_sudo_in_examples_or_operator_guides() {
     let examples = files.len();
     files.extend(files_under(&root.join("docs/operator"), &[".md"], &[]));
     assert!(
-        examples >= 5 && files.len() > examples,
+        examples >= 2 && files.len() > examples,
         "the scan must reach the examples and the operator guides: {files:?}"
     );
     let mut bad = Vec::new();
@@ -242,7 +241,7 @@ fn the_hygiene_scanners_flag_what_they_should() {
         "sudo -E cargo test --release",
         "`sudo -E env \"PATH=$PATH\" cargo test --release`",
         "sudo env -u HOME RUSTUP_HOME=/x cargo build",
-        "sudo -u root -E cargo run --example ade_smoke",
+        "sudo -u root -E cargo run --example posture_demo",
     ] {
         assert!(runs_cargo_under_sudo(command), "{command}");
     }

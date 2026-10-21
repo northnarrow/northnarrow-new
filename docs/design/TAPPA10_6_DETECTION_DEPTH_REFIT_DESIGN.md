@@ -378,6 +378,8 @@ path. No schema break, no version bump (Q5).
 
 ## 7. RAG corpus updates (offline)
 
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
+
 Extend the RAG knowledge base (offline data job, no agent change — the
 retrieval path is unchanged):
 - argv-aware ATT&CK technique mappings (T1059.x sub-techniques keyed on
@@ -387,6 +389,8 @@ Delivered via the existing `xtask rag-kb` offline workflow (D10), shipped
 as a corpus data extension — decoupled from the code commits.
 
 ## 8. ADE template extension
+
+> Historical: the on-host LLM advisor was removed in Wave 4, lab PR 214.
 
 - Reuse the `fim_template` / `chain_template` patterns.
 - **`process_template`** — deferred from T10.5 D8 *because there was no
