@@ -5,6 +5,55 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 
 ## [Unreleased]
 
+### Added
+- The privileged suites run in GitHub Actions (Wave 4 Phase 2.1,
+  capabilities C01, C29; lab PR 227). Until now CI only compiled them
+  (`--no-run`) and they ran nowhere but the self-hosted lab.
+  `.github/workflows/lab-vm.yml` boots one KVM guest per matrix entry on a
+  GitHub-hosted `ubuntu-24.04` runner with `deploy/lab/nn-lab.sh` — the
+  vendor's cloud image checked against its list, the guest's host key
+  generated on the runner — syncs, builds and installs the tree under test
+  in it and runs `test-ignored`: every privileged and `#[ignore]` suite, as
+  root, single-threaded, as the lab's gate does. A pull request to `main`
+  that touches a tree the suites are built or run from gets Ubuntu 24.04
+  (6.8) and Ubuntu 22.04 (5.15); the nightly schedule and a manual dispatch
+  run the lab's four guests (and Debian 12, 6.1; Debian 13, 6.12). On a
+  pull request the job is informational (its own workflow, not a required
+  check, `continue-on-error`); the nightly and a dispatch are the gate. A
+  runner without a usable `/dev/kvm` boots nothing and reports "skipped: no
+  KVM": a pass on a pull request, a failure on the nightly and a dispatch.
+  No `pull_request_target`: a fork's pull request gets the read-only token
+  and no secret.
+  `NN_LAB_CI=1` is nn-lab.sh's CI mode: KVM only (whpx and tcg refused),
+  every cargo build `--locked`, ssh in batch mode with keepalives, the tail
+  of the guest's serial console when a boot fails; unset, the lab is
+  unchanged, and `$CI` is never read. New sub-commands: `image-info` (the
+  digest the vendor's signed list gives for its current image: the
+  workflow's cache key) and `fetch-image` (the base image without a guest;
+  one restored from the cache is checked against that list again and, in CI
+  mode only, replaced when it is another image). `test-ignored` frames each
+  of its five cargo runs with a start and an end line. `cargo xtask
+  gate-summary` judges a run from its log: it passes only when every step
+  succeeded, nothing failed to build, every cargo run finished, every
+  failed test binary printed its summary (a crash or a kill does not) and
+  every failed test is an expected one, and it writes `gate-summary.json`
+  (suites, passed, failed, ignored, the expected failures, per kernel) and
+  the job summary. `deploy/lab/expected-failures.tsv` lists the recorded
+  follow-ups expected to fail on one guest — today Debian 13's DNS
+  attribution under `nss-resolve` — counted in `failed`, shown with their
+  outcome, and failing the run when they pass or do not run. `cargo xtask
+  gate-report` turns a run's artefacts (`gh run download`) into a Markdown
+  table to commit under `docs/validation/results/`; CI never pushes. A
+  read-only token not left in `.git/config`, actions pinned by SHA, the
+  credential check of external audit SUP-003 after the host build;
+  `xtask/tests/lab_ci.rs` checks the workflow (path filters derived from the
+  repository, the matrix, the pins and permissions, the policy above, the
+  time bounds, KVM, the image cache, the evidence kept), the CI switches
+  and the summary. `NN_LAB_IGNORED_SKIP` now logs what it leaves out, and
+  the summary keeps that line as a note.
+  `docs/integration-test-runbook.md`, "The CI VM gate", says how it relates
+  to the self-hosted lab and what stays there.
+
 ### Changed
 - The ADE is a consultant: a model verdict that names a response (Kill,
   KillTree, Quarantine, BlockNetwork, Isolate) is recorded as a

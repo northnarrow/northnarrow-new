@@ -1,0 +1,19 @@
+# Privileged tests EXPECTED TO FAIL on one lab guest (lab PR 227).
+#
+# Each line is a failure the lab has recorded as a follow-up: the test fails
+# the same on `main`, the fix is owed, and until it lands the gate must not
+# turn red on it nor lose sight of it. `cargo xtask gate-summary` (the CI
+# job summary, its gate-summary.json, `cargo xtask gate-report`) lists every
+# line that applies to the guest with its outcome, next to the totals: an
+# expected failure is never folded into "passed" nor dropped. The run fails
+# when such a test passes (the follow-up is fixed: remove its line) or does
+# not run (renamed, skipped, its suite crashed), and on any failure not
+# listed here. A line applies to its distro only (NN_LAB_DISTRO).
+#
+# Columns, tab-separated: distro, suite (the test target, as cargo's
+# "Running" line names it), test (as libtest prints it), the follow-up.
+# xtask/tests/lab_ci.rs checks that every distro is a guest of nn-lab.sh and
+# every test exists in its suite.
+#
+# distro	suite	test	follow-up
+debian13	net_privileged_e2e	net_outbound_connect_records_flow_with_dns_attribution	DNS attribution on hosts that resolve through systemd-resolved: Debian 13's nsswitch.conf puts `resolve` before `dns`, so systemd-resolved sends the query over varlink, not the test's process, and the query and the connect never share a pid (docs/audit/EXTERNAL_AUDIT_16f7563.md, "Follow-ups found in the lab"; fails on `main` too since lab PR 164)

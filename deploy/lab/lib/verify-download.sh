@@ -211,7 +211,7 @@ nnv_history() {
 }
 
 # ── nn-lab.sh glue: uses its DISTRO, IMAGE_URL, BASE_IMG, BASE_IMG_NAME,
-# LAB_DIR, ROOT_LAB_DIR, ACCEL, log, die and whpx_dir ─────────────────────
+# LAB_DIR, ROOT_LAB_DIR, ACCEL, CI_MODE, log, die and whpx_dir ────────────
 
 # The record of an image lives next to it (WHPX keeps its own copy).
 lab_image_record() { printf '%s.verified\n' "$1"; }
@@ -242,7 +242,10 @@ _lab_fetch_image() {
     nnv_sum_for_name "$tmp/$NNV_SUMS" "$name" >/dev/null ||
         { nnv_err "$name is not listed exactly once in ${IMAGE_URL%/*}/$NNV_SUMS"; return 1; }
     log "downloading $IMAGE_URL"
-    nnv_fetch "$IMAGE_URL" "$dest.part" --progress-bar || return 1
+    # CI mode (lab PR 227): no progress bar in a job log
+    local progress=--progress-bar
+    if [[ ${CI_MODE:-0} == 1 ]]; then progress=-sS; fi
+    nnv_fetch "$IMAGE_URL" "$dest.part" "$progress" || return 1
     digest=$(nnv_verify_listed "$dest.part" "$tmp/$NNV_SUMS" "$name" "$NNV_ALGO") || return 1
     mv -f "$dest.part" "$dest" || return 1
     nnv_record_write "$(lab_image_record "$dest")" "$dest" "$NNV_ALGO" "$digest" "$IMAGE_URL" \
@@ -346,4 +349,96 @@ cmd_verify_image() {
         rm -rf "$tmp"
     done
     return "$rc"
+}
+
+# ── CI glue (lab PR 227): the base image of a GitHub-hosted runner ───────
+# The workflow (.github/workflows/lab-vm.yml) keys its image cache by the
+# digest the vendor's list gives now (`image-info`, which downloads the
+# list, never the image), and `fetch-image` checks a restored image against
+# that list before a guest is layered on it: a cache entry is never trusted
+# for what it says it holds.
+
+# _lab_current_digest TMP: the digest that the vendor's current list, its
+# signature checked, gives for IMAGE_URL's image.
+_lab_current_digest() {
+    local tmp=$1 name=${IMAGE_URL##*/} signer
+    signer=$(lab_fetch_list "${IMAGE_URL%/*}" "$tmp") || return 1
+    if [[ $signer == unsigned ]]; then
+        log "WARNING: $DISTRO publishes no signature for its cloud images: $NNV_SUMS is trusted over HTTPS only"
+    fi
+    nnv_sum_for_name "$tmp/$NNV_SUMS" "$name" ||
+        { nnv_err "$name is not listed exactly once in ${IMAGE_URL%/*}/$NNV_SUMS"; return 1; }
+}
+
+# _lab_check_current IMG TMP: IMG is the image the vendor's current list
+# names. 0: it is, and its record is written; 3: it is another image; 1: no
+# usable list.
+_lab_check_current() {
+    local img=$1 tmp=$2 name=${IMAGE_URL##*/} signer want got
+    signer=$(lab_fetch_list "${IMAGE_URL%/*}" "$tmp") || return 1
+    want=$(nnv_sum_for_name "$tmp/$NNV_SUMS" "$name") ||
+        { nnv_err "$name is not listed exactly once in ${IMAGE_URL%/*}/$NNV_SUMS"; return 1; }
+    log "hashing $img ($NNV_ALGO)"
+    got=$(nnv_digest "$NNV_ALGO" "$img") || return 1
+    if [[ $got != "$want" ]]; then
+        log "$img ($NNV_ALGO $got) is not the image ${IMAGE_URL%/*}/$NNV_SUMS lists now ($want)"
+        return 3
+    fi
+    nnv_record_write "$(lab_image_record "$img")" "$img" "$NNV_ALGO" "$got" "$IMAGE_URL" \
+        "${IMAGE_URL%/*}/$NNV_SUMS ($(nnv_digest sha256 "$tmp/$NNV_SUMS" | cut -c1-16))" "$signer" || return 1
+    log "base image is the vendor's current one: $NNV_ALGO $got, $(lab_signer_text "$signer")"
+}
+
+# KEY=VALUE lines for the workflow ($GITHUB_OUTPUT): the KVM base image's
+# path, the guest's directory (its serial log), the digest and its source.
+lab_image_lines() {   # <algo> <digest>
+    printf 'path=%s\nlab_dir=%s\nalgo=%s\ndigest=%s\nurl=%s\n' "$BASE_IMG" "$LAB_DIR" "$1" "$2" "$IMAGE_URL"
+}
+
+# nn-lab.sh image-info: the image the vendor's current list names.
+cmd_image_info() {
+    local tmp digest rc=0
+    nnv_require_tools || die "cannot verify"
+    nnv_meta "$DISTRO" "$IMAGE_URL" || die "cannot verify"
+    tmp=$(mktemp -d) || die "mktemp failed"
+    digest=$(_lab_current_digest "$tmp") || rc=1
+    rm -rf "$tmp"
+    ((rc == 0)) || die "no verified list for $IMAGE_URL: no digest to report"
+    lab_image_lines "$NNV_ALGO" "$digest"
+}
+
+# nn-lab.sh fetch-image: the KVM base image, without a guest. Absent, it is
+# downloaded as `up` does. Present, it is checked: in the lab as
+# verify-image does (never replaced: guests are layered on it); in CI mode
+# (NN_LAB_CI=1: an image restored from the workflow's cache, no guest on it)
+# against the list the vendor publishes now, and downloaded again when it is
+# another image. Prints image-info's lines for the image now in place.
+cmd_fetch_image() {
+    local tmp rc=0 rec algo
+    [[ $ACCEL != whpx ]] || die "fetch-image is for a KVM host (under whpx, \`up\` copies the image to Windows)"
+    nnv_require_tools || die "cannot verify"
+    nnv_meta "$DISTRO" "$IMAGE_URL" || die "cannot verify"
+    mkdir -p "$(dirname "$BASE_IMG")"
+    if [[ ! -f $BASE_IMG ]]; then
+        lab_fetch_image "$BASE_IMG"
+    elif [[ ${CI_MODE:-0} == 1 ]]; then
+        tmp=$(mktemp -d) || die "mktemp failed"
+        (_lab_check_current "$BASE_IMG" "$tmp") || rc=$?
+        rm -rf "$tmp"
+        case $rc in
+            0) ;;
+            3)
+                log "discarding it (NN_LAB_CI=1: no guest is layered on it) and downloading the current image"
+                rm -f "$BASE_IMG" "$(lab_image_record "$BASE_IMG")"
+                lab_fetch_image "$BASE_IMG" ;;
+            *) die "the base image present could not be checked against the vendor's list: not used" ;;
+        esac
+    else
+        cmd_verify_image || die "$BASE_IMG did not verify (see above): it is kept, the guests on it need it"
+    fi
+    rec=$(lab_image_record "$BASE_IMG")
+    [[ -f $rec ]] || die "$BASE_IMG has no verification record"
+    algo=$(awk -F= '$1 == "sha256" || $1 == "sha512" { print $1; exit }' "$rec")
+    [[ -n $algo ]] || die "unreadable record $rec"
+    lab_image_lines "$algo" "$(nnv_record_field "$rec" "$algo")"
 }

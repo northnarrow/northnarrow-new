@@ -1,0 +1,366 @@
+# The privileged suites in KVM guests on GitHub-hosted runners (Wave 4
+# Phase 2.1, lab PR 227).
+#
+# ci.yml only compiles the privileged tests (test-privileged: `--no-run`);
+# they ran nowhere but the self-hosted lab (`deploy/lab/nn-lab.sh
+# test-ignored` on four guests). This workflow runs the same script in CI
+# mode (NN_LAB_CI=1: KVM only, every cargo build --locked, ssh in batch mode
+# with keepalives, bounded waits; deploy/lab/nn-lab.sh's header) on a
+# GitHub-hosted runner, ONE guest per matrix entry: the vendor's cloud image
+# checked against its list (signed for Ubuntu), the guest booted with a host
+# key generated here (lab PR 211), the tree under test synced, built and
+# installed in it, then every privileged suite as root, single-threaded.
+# Each job uploads the gate log, the guest's serial console and
+# gate-summary.json (suites, passed, failed, ignored, the expected failures
+# with their outcome, the kernel) and writes the summary to the job summary;
+# `cargo xtask gate-report` turns the artefacts of a run into a Markdown
+# table the maintainer commits. CI never pushes.
+#
+# Matrix: a pull request that touches a tree the privileged suites are built
+# or run from (paths below) gets Ubuntu 24.04 (6.8) and Ubuntu 22.04 (5.15);
+# the nightly schedule and a manual dispatch run the lab's four guests (and
+# Debian 12, 6.1; Debian 13, 6.12). AlmaLinux 9, the lockdown guests, the
+# nightly's other steps (test-e2e's counts, the security checks, respawn,
+# upgrade, uninstall) and the soak stay in the self-hosted lab
+# (docs/integration-test-runbook.md, "The CI VM gate").
+#
+# Policy. On a pull request the job is informational: it is not a required
+# check, and `continue-on-error` keeps a red guest from failing the run
+# (the job summary and the artefact still say what failed). The nightly
+# schedule and a manual dispatch are the gate: there a failure fails the
+# run. A runner without a usable /dev/kvm boots nothing: the job reports
+# "skipped: no KVM" in its summary and annotations, passes on a pull
+# request and fails on the nightly and a dispatch (a gate that did not run
+# is not a pass). Never `pull_request_target`: a pull request from a fork
+# runs its own code with the read-only token below and no secret (the
+# workflow reads none).
+#
+# A workflow of its own rather than a job of ci.yml: it has path filters, a
+# nightly matrix and hours-long jobs of its own, where ci.yml runs every job
+# on every push in minutes and its schedule runs the advisory gate alone
+# (kani.yml and btf-matrix.yml follow the same pattern).
+#
+# Supply chain (external audit SUP-002, SUP-003, SUP-004, SUP-016): actions
+# pinned by commit SHA, a read-only token that is not left in .git/config
+# and that no step is given, no OIDC token, every cargo build --locked (the
+# host's here, the guest's through NN_LAB_CI), and after the host build of
+# the dependency tree the credential check of release.yml. The guest gets
+# the tree without .git. xtask/tests/lab_ci.rs checks this file.
+name: lab VM gate
+
+on:
+  pull_request:
+    branches: [main]
+    # The trees the privileged suites are built or run from: the workspace
+    # crates (the guest compiles every test target of the workspace) and the
+    # eBPF crate, the files the agent embeds (configs/, deploy/systemd/, the
+    # COMBAT recovery guide) or the tests read (configs/, deploy/), the
+    # toolchain and lockfile, the lab scripts, and this workflow.
+    # xtask/tests/lab_ci.rs derives that list from the repository and fails
+    # when a filter is missing or names a path that no longer exists.
+    paths:
+      - agent/**
+      - agent-ebpf/**
+      - antitamper-bpf/**
+      - cli/**
+      - common/**
+      - ebpf-guard/**
+      - watchdog/**
+      - xtask/**
+      - configs/**
+      - deploy/**
+      - docs/operator/COMBAT_RECOVERY.md
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .cargo/**
+      - .github/workflows/lab-vm.yml
+  schedule:
+    - cron: "17 1 * * *" # 01:17 UTC every night: all four guests
+  workflow_dispatch:
+
+# A newer push to a pull request supersedes its run; the nightly and a
+# dispatch each queue in a group of their own.
+concurrency:
+  group: lab-vm-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# External audit SUP-004: the token reads the repository and nothing else.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guest:
+    name: privileged suites (${{ matrix.distro }} guest, KVM)
+    runs-on: ubuntu-24.04
+    # GitHub's ceiling is 6 h a job (docs.github.com/en/actions/reference/limits).
+    # Expected: 1.5-3 h (the host build, the guest's boot, two release builds
+    # on 4 vCPUs, then the suites); every step below has its own bound.
+    timeout-minutes: 330
+    # Informational on a pull request, the gate on the nightly and a dispatch.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # pull_request: the two Ubuntu kernels; schedule, workflow_dispatch: the lab's four guests
+        distro: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu2404", "ubuntu2204"]' || '["ubuntu2404", "ubuntu2204", "debian12", "debian13"]') }}
+    env:
+      NN_LAB_CI: "1"
+      NN_LAB_ACCEL: kvm
+      NN_LAB_DISTRO: ${{ matrix.distro }}
+      # The runner of a public repository has 4 vCPUs and 16 GB. The lab's
+      # guests have 8 GiB; the fat-LTO links of the test build get headroom.
+      NN_LAB_CPUS: "4"
+      NN_LAB_MEM: "12288"
+      NN_LAB_BOOT_TIMEOUT: "1200"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Outside the checkout: `sync` sends the checkout to the guest.
+      - name: Lab and gate directories
+        run: |
+          echo "NN_LAB_DIR=$RUNNER_TEMP/nn-lab" >> "$GITHUB_ENV"
+          echo "GATE_OUT=$RUNNER_TEMP/lab-gate" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/nn-lab" "$RUNNER_TEMP/lab-gate"
+
+      # KVM for the guest, checked before anything else is spent on the job.
+      # "GitHub-hosted Linux runners support hardware acceleration for
+      # Android SDK tools"
+      # (https://docs.github.com/en/actions/reference/runners/github-hosted-runners):
+      # /dev/kvm is there, closed to the runner's user, and GitHub's documented
+      # step opens it with a udev rule —
+      # https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-on-actions-windows-and-linux-larger-hosted-runners/
+      # and, for the standard runners,
+      # https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/
+      # (looked up 2026-10-21). The runner is a single-use VM: the mode lasts the job.
+      # Without a usable /dev/kvm: "skipped: no KVM" (summary, annotation,
+      # the artefact), every later step skipped; a pass on a pull request, a
+      # failure on the nightly and a dispatch.
+      - name: Open /dev/kvm to the runner user (udev rule) and check it
+        id: kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle --timeout=30 || true
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            ls -l /dev/kvm
+            echo "vCPUs with vmx/svm: $(grep -cE 'vmx|svm' /proc/cpuinfo || true)"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -e /dev/kvm ]; then
+            why="/dev/kvm is not usable by $(id -un) after the udev rule"
+          else
+            why="no /dev/kvm on this runner: it exposes no hardware virtualization"
+          fi
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "skipped: no KVM ($why)" > "$GATE_OUT/skipped-no-kvm.txt"
+          {
+            echo "### Privileged suites on a CI guest: \`$NN_LAB_DISTRO\` — skipped: no KVM"
+            echo
+            echo "$why. No guest was booted and no privileged suite ran: this is not a pass."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            echo "::warning title=lab VM gate skipped: no KVM::$why. Informational on a pull request: the job does not fail."
+            exit 0
+          fi
+          echo "::error title=lab VM gate skipped: no KVM::$why. The $GITHUB_EVENT_NAME run is the gate: it fails without a guest."
+          exit 1
+
+      # The guest's disk (two release target trees) grows on the runner's
+      # root volume; the preinstalled toolchains below are never used here.
+      - name: Free disk space
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Install QEMU and the cloud-image tools
+        if: steps.kvm.outputs.available == 'true'
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            qemu-system-x86 qemu-utils seabios ipxe-qemu cloud-image-utils \
+            gnupg gpgv openssh-client rsync curl iproute2 >/dev/null
+          qemu-system-x86_64 --version | head -1
+
+      # Same pins as ci.yml's ebpf-build job: the eBPF object is built on the
+      # host (nightly + bpf-linker 0.10.x, which links against rustc's own
+      # LLVM), the guest builds the userland only.
+      - name: Install nightly Rust + rust-src, the pinned release, bpf-linker (pinned)
+        if: steps.kvm.outputs.available == 'true'
+        timeout-minutes: 25
+        run: |
+          rustup toolchain install nightly-2025-12-01 --profile minimal --component rust-src
+          rustup toolchain install   # the pinned userland release (rust-toolchain.toml)
+          cargo install bpf-linker --version 0.10.3 --locked
+
+      # The host's share of `nn-lab.sh sync`, first: an eBPF build that
+      # breaks fails here, before a guest boots, and the summary step finds
+      # xtask built. The first --locked builds xtask against Cargo.lock, the
+      # second holds agent-ebpf/Cargo.lock (SUP-016).
+      - name: Build the eBPF object and xtask on the host
+        if: steps.kvm.outputs.available == 'true'
+        id: host
+        timeout-minutes: 40
+        run: cargo --locked xtask build-ebpf --locked
+
+      # External audit SUP-003: whatever ran in the build above — every
+      # build script and proc-macro of the dependency tree — found no
+      # credential to take, and the guest gets nothing more.
+      - name: No credential reached the build
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          if git config --get-regexp '^http\..*\.extraheader' >/dev/null; then
+            echo "a token is persisted in .git/config"; exit 1
+          fi
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "the build job can request an OIDC token"; exit 1
+          fi
+          echo "no credential in the build job"
+
+      # Ubuntu's image-signing key, fetched once from keyserver.ubuntu.com
+      # and kept only when its primary fingerprint is the one pinned in
+      # verify-download.sh; a list counts only with a good signature by that
+      # key, cached or not. Keyed by the file that pins it. (Debian signs no
+      # cloud image list.)
+      - name: Cache the pinned image-signing key
+        if: steps.kvm.outputs.available == 'true' && startsWith(matrix.distro, 'ubuntu')
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NN_LAB_DIR }}/keys
+          key: nn-lab-vendor-keys-${{ hashFiles('deploy/lab/lib/verify-download.sh') }}
+
+      # The cache key: the digest the vendor's list gives for its current
+      # image (signature checked; the image itself is not downloaded here).
+      - name: The base image the vendor lists now (nn-lab.sh image-info)
+        if: steps.kvm.outputs.available == 'true'
+        id: image
+        timeout-minutes: 10
+        run: deploy/lab/nn-lab.sh image-info | tee -a "$GITHUB_OUTPUT"
+
+      # Keyed by that digest and never restored from another key: a new
+      # image starts empty. What comes back is not trusted for what its key
+      # says: fetch-image checks it against the vendor's list again.
+      - name: Restore the base image (cache)
+        if: steps.kvm.outputs.available == 'true'
+        id: image-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.image.outputs.path }}
+          key: nn-lab-image-${{ matrix.distro }}-${{ steps.image.outputs.algo }}-${{ steps.image.outputs.digest }}
+
+      - name: The base image checked against the vendor's list (nn-lab.sh fetch-image)
+        if: steps.kvm.outputs.available == 'true'
+        id: fetch
+        timeout-minutes: 20
+        run: deploy/lab/nn-lab.sh fetch-image | tee -a "$GITHUB_OUTPUT"
+
+      # Saved by the runs on main only, the nightly and a dispatch (a pull
+      # request restores them), and only the image whose digest the key names.
+      - name: Save the verified base image (cache)
+        if: >-
+          steps.kvm.outputs.available == 'true'
+          && github.ref == 'refs/heads/main'
+          && steps.image-cache.outputs.cache-hit != 'true'
+          && steps.fetch.outputs.digest == steps.image.outputs.digest
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.image.outputs.path }}
+          key: nn-lab-image-${{ matrix.distro }}-${{ steps.image.outputs.algo }}-${{ steps.image.outputs.digest }}
+
+      - name: nn-lab.sh up (boot, cloud-init, check)
+        if: steps.kvm.outputs.available == 'true'
+        id: up
+        timeout-minutes: 30
+        run: deploy/lab/nn-lab.sh up
+
+      - name: nn-lab.sh sync (the tree and the eBPF object into the guest)
+        if: steps.kvm.outputs.available == 'true'
+        id: sync
+        timeout-minutes: 20
+        run: deploy/lab/nn-lab.sh sync
+
+      - name: nn-lab.sh build (release, test-privileged + debug-trigger, in the guest)
+        if: steps.kvm.outputs.available == 'true'
+        id: build
+        timeout-minutes: 100
+        run: deploy/lab/nn-lab.sh build
+
+      - name: nn-lab.sh install (install.sh, both units started)
+        if: steps.kvm.outputs.available == 'true'
+        id: install
+        timeout-minutes: 45
+        run: deploy/lab/nn-lab.sh install
+
+      # The verdict is the next step's: it tells expected failures from the
+      # others, and a crash or a build error from a failed test.
+      - name: nn-lab.sh test-ignored (every privileged suite, as root, single-threaded)
+        if: steps.kvm.outputs.available == 'true'
+        id: ignored
+        timeout-minutes: 200
+        run: |
+          deploy/lab/nn-lab.sh ssh 'uname -r' > "$GATE_OUT/kernel" || true
+          set +e
+          deploy/lab/nn-lab.sh test-ignored 2>&1 | tee "$GATE_OUT/gate.log"
+          echo "${PIPESTATUS[0]}" > "$GATE_OUT/gate.rc"
+          exit 0
+
+      # Whatever happened after the KVM check, unless it found no KVM (that
+      # step wrote the summary).
+      - name: Gate summary (job summary, gate-summary.json, the verdict)
+        if: always() && steps.kvm.outputs.available != 'false'
+        timeout-minutes: 20
+        env:
+          OUTCOMES: >-
+            kvm=${{ steps.kvm.outcome }}
+            host-build=${{ steps.host.outcome }}
+            image-info=${{ steps.image.outcome }}
+            fetch-image=${{ steps.fetch.outcome }}
+            up=${{ steps.up.outcome }}
+            sync=${{ steps.sync.outcome }}
+            build=${{ steps.build.outcome }}
+            install=${{ steps.install.outcome }}
+            test-ignored=${{ steps.ignored.outcome }}
+          GUEST_DIR: ${{ steps.image.outputs.lab_dir }}
+        run: |
+          cp "$GUEST_DIR/serial.log" "$GATE_OUT/serial.log" 2>/dev/null || true
+          steps=()
+          for s in $OUTCOMES; do steps+=(--step "$s"); done
+          rc=$(cat "$GATE_OUT/gate.rc" 2>/dev/null || true)
+          status=0
+          cargo --locked xtask gate-summary --locked \
+            --log "$GATE_OUT/gate.log" --distro "$NN_LAB_DISTRO" \
+            --kernel "$(cat "$GATE_OUT/kernel" 2>/dev/null || true)" \
+            ${rc:+--rc "$rc"} "${steps[@]}" \
+            --commit "$GITHUB_SHA" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --json "$GATE_OUT/gate-summary.json" --markdown "$GATE_OUT/gate-summary.md" || status=$?
+          if [ -s "$GATE_OUT/gate-summary.md" ]; then
+            cat "$GATE_OUT/gate-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Privileged suites on a CI guest: \`$NN_LAB_DISTRO\` — no summary (see this step's log)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      # gate.log, gate.rc, kernel, gate-summary.json/.md, serial.log (or
+      # skipped-no-kvm.txt alone). Not the guest's user-data or seed: they
+      # hold its private host key.
+      - name: Upload the gate's evidence (always)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lab-gate-${{ matrix.distro }}
+          path: ${{ env.GATE_OUT }}/
+          if-no-files-found: warn

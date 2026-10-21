@@ -112,8 +112,10 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     # Tappa 3 ships ignored integration tests that actually kill
-    # processes (need root or CAP_KILL). CI cannot run them, but it
-    # still verifies they compile so they can never silently rot.
+    # processes (need root or CAP_KILL). This job cannot run them (no
+    # root, no BPF-LSM on the runner's kernel), but it still verifies they
+    # compile on every push so they can never silently rot; lab-vm.yml
+    # runs them in KVM guests (lab PR 227).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -158,9 +160,9 @@ jobs:
 
       # Tappa 7 task 7 / Tappa 8: agent/tests/privileged_e2e.rs is gated
       # behind --features test-privileged. Running it needs root +
-      # iptables (see docs/integration-test-runbook.md), so CI compiles
-      # without executing — same bit-rot guard pattern as the rest of
-      # this job.
+      # iptables (see docs/integration-test-runbook.md), so this job
+      # compiles without executing — same bit-rot guard pattern as the
+      # rest of this job; lab-vm.yml executes it.
       - name: Compile privileged_e2e module (test-privileged)
         run: cargo test --workspace --no-run --locked --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger --verbose
 
