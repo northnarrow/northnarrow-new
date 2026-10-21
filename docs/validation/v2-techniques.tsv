@@ -1,6 +1,8 @@
 # NorthNarrow — V2 validation campaign — pre-registered ATT&CK technique rows.
-# version: 1
+# version: 2
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-218).
+# version 2 (2026-10-20, lab PR 219, before any V2 run): TQ60 (T1068, the
+# exploit guard's NN-L-EPG-001) and NN-L-EPG-002 added to TQ57 (T1611).
 #
 # The techniques the campaign measures, fixed before it runs: those a
 # shipped rule names, those the design names, and those the external audit
@@ -86,6 +88,7 @@ TQ53	T1562.012	Impair Defenses: Disable or Modify Linux Audit System	-	audit	kno
 TQ54	T1564.001	Hide Artifacts: Hidden Files and Directories	R008_HiddenHomeBinary	registry	rule	-	-
 TQ55	T1571	Non-Standard Port	NN-L-NET-010_OutboundToHighRiskC2Port,NN-L-NET-019_WildcardListener,NN-L-CHAIN-002_TmpExecThenEgress,NN-L-CHAIN-005_CrossPidTmpC2	code	rule	-	-
 TQ56	T1574.006	Hijack Execution Flow: Dynamic Linker Hijacking	NN-L-FIM-022_LdSoPreloadModified	code	rule	-	-
-TQ57	T1611	Escape to Host	R013_NamespaceEscapeTooling	code	rule	-	-
+TQ57	T1611	Escape to Host	R013_NamespaceEscapeTooling,NN-L-EPG-002_NamespaceRootPostcondition	code	rule	-	-
 TQ58	T1620	Reflective Code Loading	R004_ExecFromProcSelfFd	design	rule	deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd	-
 TQ59	T1622	Debugger Evasion	R016_DebuggerServiceUid	code	rule	-	-
+TQ60	T1068	Exploitation for Privilege Escalation	NN-L-EPG-001_CredentialPostcondition	code	rule	-	the post-condition of a local kernel exploit, whatever its bug

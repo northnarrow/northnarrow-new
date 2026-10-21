@@ -315,3 +315,31 @@ only in the table below, in the same PR as the evidence.
   - Lab: the verification is the VM job's first run on this pull request
     (`lab-vm.yml`, Ubuntu 24.04 and 22.04 guests); its link is added here
     once the run exists.
+  - Lab: @LAB218@
+- **Lab PR 219 — exploit post-condition guard (C12, C14; experimental).**
+  The kernel exploit's end state checked against the kernel's own
+  mechanisms (`commit_creds`, `switch_task_namespaces`, `set_fs_root`) and
+  the system call each ran for; NN-L-EPG-001 (T1068) and NN-L-EPG-002
+  (T1611). Default **lite**: no system-call hooks; the mechanisms judged on
+  the call in progress, a credential changed without one caught at its
+  first use (`capable`, exec, a root-private open) against a per-task
+  record in an LRU task map (aya 0.13 cannot load task storage: the first
+  build stopped the agent on every kernel; a test now holds every map to
+  the types aya loads); an evicted record is re-taken, counted, attested
+  (at most once per 600 s), and recorded as degraded evidence (High) when
+  it holds privilege. Opt-in **strict**: the comparison around every call
+  (the agent refuses it below Linux 6.1, a version check). Detect by
+  default; enforce sends SIGKILL in the kernel before the return to user
+  mode, and lite refuses the use (C12: inline responses that do not depend
+  on a userland round trip). Verified so far: the decision model's unit
+  tests, the embedded object's maps and programs (aya-obj; every map type
+  against aya 0.13.1's loader), the rules, the posture, the status and both
+  builds. Open: the lab run of `deploy/lab/epg/epg-check.sh` on 5.15, 6.1,
+  6.8 and 6.12 — the agent's start, the negative suite's zero records in each
+  variant, the injected records and kills, the lite map under a task flood
+  (evictions counted and attested), the measured cost per call; a real
+  kernel credential
+  write is not exercised in the lab (only the debug-build injection);
+  supplementary groups, the bounding set and the fork-inherited baseline
+  are follow-ups. Levels unchanged until then.
+  - Lab: Every program of the eBPF object passed `nn-lab.sh verifier-check` (exit 0) on the four guests — 76 of 76 OK on Ubuntu 24.04 (6.8) and Debian 13 (6.12); 74 OK on Debian 12 (6.1) and Ubuntu 22.04 (5.15), where the two optional ACL deny hooks are absent from the kernel (not counted) — and the agent then started with both units active, no "refused", "attach FAILED" or "NOT running" in its journal (the deny self-test's own refused signal aside) and 0 degradations in the signed status. The exploit post-condition guard attached lite by default on all four (detect; the signed status `lite detect (experimental)`, withheld from the unsigned one; no exploit_guard degradation; no verifier rejection); `--btf-check` SUPPORTED with no w4b slot absent (the slots that drift from the compiled values — not all one kernel's — resolved at boot). Strict attached on 6.1, 6.8 and 6.12 (`strict detect … calls judged`) and was refused on 5.15 by the agent's 6.1 check ("strict needs Linux 6.1 or later … this kernel is 5.15.216"), a signed subsystem_degraded exploit_guard and the status `unavailable: …`. The negative suite (sudo, su, passwd, sg / newgrp, setpriv, capsh, unshare -U / -r / -rm / -rpf, chroot in a user namespace, systemd-run --uid; on 24.04 the `unshare -r` cases are refused by AppArmor before they run) left zero guard journal lines and zero NN-L-EPG records in lite and strict, detect and enforce (Debian 12: lite detect). On 24.04 the lab build's injection (the probe named nn-epg-probe): lite exec and strict getppid in detect — the probe continued, one Critical NN-L-EPG-001 recorded only (caught at exec / at sys_exit), {TA0004 / T1068}, 20.0; in enforce — killed (137) before it could print, the record "refused (-EPERM) and killed in kernel" (lite) / "killed in kernel" (strict), the anomaly, kill and refusal counters +1; the lite capable() case was skipped by the harness (its user-namespace probe refused before the hook by AppArmor on 24.04). Cost per call (best of 3, 2,000,000 calls): getppid as root 235.4 ns off, 235.5 lite, 469.1 strict; as the lab user 235.6 off, 237.3 lite, 883.8 strict; rdzero as root 511.3 / 511.3 / 785.0, as the lab user 476.7 / 511.1 / 1110.1 ns. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).

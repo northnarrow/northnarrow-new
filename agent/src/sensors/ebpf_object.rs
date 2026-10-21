@@ -117,4 +117,102 @@ mod tests {
             );
         }
     }
+
+    /// Set where the eBPF object was built: [`every_map_is_one_the_agents_aya_loads`]
+    /// fails on a build that embeds none.
+    const REQUIRE_OBJECT_ENV: &str = "NN_REQUIRE_EBPF_OBJECT";
+
+    /// The map types aya 0.13.1's loader turns into a `Map` it can hand
+    /// out: `parse_map` in aya-0.13.1/src/bpf.rs. Any other type is
+    /// `Map::Unsupported`, and `EbpfLoader::load` then fails the WHOLE
+    /// object ("Unsupported map type found N") after the kernel created the
+    /// map. Re-derive the list from that function when aya is upgraded
+    /// ([`aya_is_the_version_the_list_was_read_from`]).
+    const AYA_0_13_MAP_TYPES: &[aya_obj::generated::bpf_map_type] = {
+        use aya_obj::generated::bpf_map_type::*;
+        &[
+            BPF_MAP_TYPE_ARRAY,
+            BPF_MAP_TYPE_PERCPU_ARRAY,
+            BPF_MAP_TYPE_PROG_ARRAY,
+            BPF_MAP_TYPE_HASH,
+            BPF_MAP_TYPE_LRU_HASH,
+            BPF_MAP_TYPE_PERCPU_HASH,
+            BPF_MAP_TYPE_LRU_PERCPU_HASH,
+            BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+            BPF_MAP_TYPE_RINGBUF,
+            BPF_MAP_TYPE_SOCKHASH,
+            BPF_MAP_TYPE_SOCKMAP,
+            BPF_MAP_TYPE_BLOOM_FILTER,
+            BPF_MAP_TYPE_LPM_TRIE,
+            BPF_MAP_TYPE_STACK,
+            BPF_MAP_TYPE_STACK_TRACE,
+            BPF_MAP_TYPE_QUEUE,
+            BPF_MAP_TYPE_CPUMAP,
+            BPF_MAP_TYPE_DEVMAP,
+            BPF_MAP_TYPE_DEVMAP_HASH,
+            BPF_MAP_TYPE_XSKMAP,
+        ]
+    };
+
+    /// The class of lab PR 219's boot failure (Debian 12: "loading eBPF
+    /// object (BTF, maps, programs) / map error: Unsupported map type found
+    /// 29", a hand-declared task-storage map): every map of the embedded
+    /// object — `#[map]`, BTF `.maps`, global data — read by aya-obj 0.2.1,
+    /// the parser aya 0.13.1 itself runs, must have a type aya 0.13 hands
+    /// out. Parsing alone is not enough: aya-obj accepts any type the
+    /// kernel knows.
+    ///
+    /// A userland-only build (CI's `test` job) embeds no object and skips;
+    /// where the object is built (CI's `ebpf` job, after `cargo xtask
+    /// build-ebpf`) [`REQUIRE_OBJECT_ENV`] is set and a build without it
+    /// fails instead of passing as skipped.
+    #[test]
+    fn every_map_is_one_the_agents_aya_loads() {
+        if EMBEDDED != "1" || EBPF_BYTES.is_empty() {
+            assert!(
+                std::env::var_os(REQUIRE_OBJECT_ENV).is_none(),
+                "{REQUIRE_OBJECT_ENV} is set but this build embeds no eBPF object: \
+                 run `cargo xtask build-ebpf` before the test"
+            );
+            eprintln!(
+                "no embedded eBPF object in this build: skipped \
+                 ({REQUIRE_OBJECT_ENV}=1 fails instead)"
+            );
+            return;
+        }
+        let obj = aya_obj::Object::parse(EBPF_BYTES).expect("the eBPF object parses");
+        assert!(!obj.maps.is_empty(), "the object declares maps");
+        let mut refused: Vec<String> = Vec::new();
+        for (name, map) in &obj.maps {
+            let t = map.map_type();
+            match aya_obj::generated::bpf_map_type::try_from(t) {
+                Ok(ty) if AYA_0_13_MAP_TYPES.contains(&ty) => {}
+                Ok(ty) => refused.push(format!("{name}: {ty:?} ({t})")),
+                Err(_) => refused.push(format!("{name}: unknown map type {t}")),
+            }
+        }
+        refused.sort();
+        assert!(
+            refused.is_empty(),
+            "maps aya 0.13 cannot load — the agent would refuse to start on every kernel: {refused:?}"
+        );
+    }
+
+    /// [`AYA_0_13_MAP_TYPES`] was read from aya 0.13.1: an upgrade of the
+    /// agent's aya must re-read it (a newer aya may load more types).
+    #[test]
+    fn aya_is_the_version_the_list_was_read_from() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock"),
+        )
+        .expect("the workspace Cargo.lock");
+        let aya = lock
+            .split("[[package]]")
+            .find(|p| p.contains("\nname = \"aya\"\n"))
+            .expect("aya in Cargo.lock");
+        assert!(
+            aya.contains("\nversion = \"0.13.1\"\n"),
+            "aya changed: re-derive AYA_0_13_MAP_TYPES from its src/bpf.rs parse_map: {aya}"
+        );
+    }
 }

@@ -100,6 +100,15 @@ struct Cli {
     #[arg(long = "sensor-feasibility", hide = true)]
     sensor_feasibility: bool,
 
+    /// Lab only: load the embedded eBPF object with the agent's loader setup
+    /// (maps, BTF offsets armed and frozen), put every program through the
+    /// kernel's verifier without attaching any, print per program OK or
+    /// REFUSED (the verifier log's tail, instruction counts, stack) and exit
+    /// — 0 when every program the agent needs loads. Root and a
+    /// `debug-trigger` build (`deploy/lab/nn-lab.sh verifier-check`).
+    #[arg(long = "verifier-check", hide = true)]
+    verifier_check: bool,
+
     /// Print the test and debug cargo features this binary was built with
     /// (comma-separated: `debug-trigger`, `demo-tappa5`, `posture-demo`,
     /// `test-privileged`) or `none`, and exit. A release build prints
@@ -151,6 +160,45 @@ struct Cli {
         default_value_t = DnsSensor::Skb
     )]
     dns_sensor: DnsSensor,
+
+    /// Exploit post-condition guard (lab PR 219, experimental): a gain of
+    /// credentials, namespaces or root the kernel's own mechanisms did not
+    /// make for the call (NN-L-EPG-001/002). `lite` (default): no
+    /// system-call hooks — the mechanisms are judged on the call in
+    /// progress, and a credential changed without one is caught at its
+    /// first use (`capable`, exec, a root-only file open). `strict`: the
+    /// comparison around every system call (opt-in: hundreds of ns per call
+    /// of an unprivileged task; refused below Linux 6.1, a version check).
+    /// `off`: not attached, attested
+    /// as a degradation (also `NN_EXPLOIT_GUARD=off`, a weakening variable).
+    #[arg(
+        long = "exploit-guard",
+        env = "NN_EXPLOIT_GUARD",
+        value_enum,
+        default_value_t = ExploitGuard::Lite
+    )]
+    exploit_guard: ExploitGuard,
+
+    /// What the exploit guard does on a finding. `detect` (default): signed
+    /// record, the task continues. `enforce`: SIGKILL in the kernel before
+    /// the task returns to user mode (lite's use points also refuse the
+    /// use, -EPERM), then the record. `--detect-only` keeps it at detect.
+    #[arg(
+        long = "exploit-guard-response",
+        env = "NN_EXPLOIT_GUARD_RESPONSE",
+        value_enum,
+        default_value_t = ExploitGuardResponse::Detect
+    )]
+    exploit_guard_response: ExploitGuardResponse,
+
+    /// Exploit guard: the size of the running variant's task map. Strict:
+    /// default `/proc/sys/kernel/pid_max` (every live task fits; not
+    /// preallocated). Lite: default `min(pid_max, threads-max)` capped at
+    /// 65536 (an LRU map, preallocated, ~150 bytes an entry; up to
+    /// 1048576); records it evicts are re-taken, counted and attested (at
+    /// most once per 600 s).
+    #[arg(long = "exploit-guard-tasks", env = "NN_EXPLOIT_GUARD_TASKS")]
+    exploit_guard_tasks: Option<u32>,
 
     /// Removed in Wave 4 (lab PR 214) with the on-host LLM advisor, as
     /// the four below: accepted so that a unit written for an older agent
@@ -613,6 +661,42 @@ fn open_sensor_on_tracepoint(why: &str) {
     );
 }
 
+/// `--exploit-guard` (lab PR 219).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ExploitGuard {
+    Off,
+    Lite,
+    Strict,
+}
+
+impl ExploitGuard {
+    fn variant(self) -> northnarrow_agent::sensors::epg::Variant {
+        use northnarrow_agent::sensors::epg::Variant;
+        match self {
+            Self::Off => Variant::Off,
+            Self::Lite => Variant::Lite,
+            Self::Strict => Variant::Strict,
+        }
+    }
+}
+
+/// `--exploit-guard-response` (lab PR 219).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ExploitGuardResponse {
+    Detect,
+    Enforce,
+}
+
+impl ExploitGuardResponse {
+    fn response(self) -> northnarrow_agent::sensors::epg::Response {
+        use northnarrow_agent::sensors::epg::Response;
+        match self {
+            Self::Detect => Response::Detect,
+            Self::Enforce => Response::Enforce,
+        }
+    }
+}
+
 /// Review 69: the LSM file-open sensor could not be armed, so
 /// `sys_enter_openat` (attached, inert until now) starts emitting.
 fn open_tracepoint_fallback(sensor: &mut SensorMultiplexer) {
@@ -812,6 +896,17 @@ fn main() -> Result<()> {
         #[cfg(not(feature = "test-privileged"))]
         {
             eprintln!("--sensor-feasibility exists only in lab builds (feature test-privileged)");
+            std::process::exit(2);
+        }
+    }
+    if cli.verifier_check {
+        #[cfg(feature = "debug-trigger")]
+        {
+            std::process::exit(northnarrow_agent::verifier_check::run());
+        }
+        #[cfg(not(feature = "debug-trigger"))]
+        {
+            eprintln!("--verifier-check exists only in lab builds (feature debug-trigger)");
             std::process::exit(2);
         }
     }
@@ -1688,6 +1783,11 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             }
         }
     }
+    // Lab PR 219: the exploit guard's task maps, sized at load.
+    northnarrow_agent::sensors::epg::set_task_map_entries(
+        cli.exploit_guard_tasks,
+        cli.exploit_guard.variant(),
+    );
     let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring, &attach_permit)
         .await
         .context("starting the sensor multiplexer (with net observation)")?;
@@ -1739,6 +1839,23 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             )
         })?;
     boot.done(BootStep::AntiTamper)?;
+    // Lab PR 219: the exploit post-condition guard, attached before the
+    // agent's programs are recorded as its own (DEP-006), in detect mode
+    // until the no-enforcement gate is resolved below. Off or unavailable
+    // is attested once the audit log is open.
+    let exploit_guard_degraded: Option<String> =
+        match sensor.attach_exploit_guard(cli.exploit_guard.variant()) {
+            Ok(()) => None,
+            Err(_) if cli.exploit_guard == ExploitGuard::Off => Some(
+                "exploit post-condition guard off (--exploit-guard off / NN_EXPLOIT_GUARD=off): \
+                 kernel exploit post-conditions are not watched"
+                    .to_string(),
+            ),
+            Err(e) => Some(format!(
+                "exploit post-condition guard unavailable on this kernel: {e} — kernel exploit \
+                 post-conditions are not watched"
+            )),
+        };
     // External audit DEP-006: the ids install.sh / uninstall.sh wait for.
     record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
 
@@ -1941,6 +2058,10 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     if let Some(detail) = &hook_args_degraded {
         northnarrow_agent::boot::degradation::report("lsm_hook_args", detail);
     }
+    // Lab PR 219: the exploit guard off or unavailable (found at its attach).
+    if let Some(detail) = &exploit_guard_degraded {
+        northnarrow_agent::boot::degradation::report("exploit_guard", detail);
+    }
     for detail in &caps_degraded {
         northnarrow_agent::boot::degradation::report("capabilities", detail);
     }
@@ -1956,6 +2077,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
              can rewrite before the kernel sends them (IPv4 only)",
         );
     }
+    // Lab PR 219: the exploit guard sampler's saturation entries from now on.
+    northnarrow_agent::sensors::epg::set_audit_log(audit_log.clone());
     let signed = northnarrow_agent::boot::degradation::attach_audit_log(audit_log.clone());
     northnarrow_agent::boot::degradation::spawn_flusher();
     if signed > 0 {
@@ -2201,6 +2324,26 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         debug!("no --pid-file provided; PID file write skipped (production default)");
     }
 
+    // Lab PR 219: the exploit guard enforces only when asked to and outside
+    // detect-only (the one no-enforcement switch wins).
+    if cli.exploit_guard != ExploitGuard::Off {
+        use northnarrow_agent::sensors::epg::{effective_response, set_response, Response};
+        let requested = cli.exploit_guard_response.response();
+        match effective_response(requested, detect_only) {
+            Response::Enforce => match set_response(Response::Enforce) {
+                Ok(()) => warn!(
+                    "exploit post-condition guard ENFORCING: a task found holding what no \
+                     legitimate transition gave it is sent SIGKILL in the kernel (lite: and \
+                     the use is refused)"
+                ),
+                Err(e) => warn!(reason = %e, "exploit guard: enforce requested, not applied"),
+            },
+            Response::Detect if requested == Response::Enforce => {
+                info!("exploit guard: enforce requested, detect-only in force — detect mode")
+            }
+            Response::Detect => {}
+        }
+    }
     // External audit CMB-006: an older agent's host-wide nftables blackout
     // (no carve-out, no release, no status) is removed before anything
     // else; host-wide isolation is the COMBAT ladder's alone.
@@ -4757,6 +4900,61 @@ async fn process_event(
                             &verdict,
                             posture.current_kind(),
                             "denied in kernel (anti-tamper LSM hook)".to_string(),
+                            suppressed_before,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        // Lab PR 219: the exploit post-condition guard. The kernel already
+        // did what the mode asks (enforce: SIGKILL before the return to user
+        // mode; detect: nothing), so neither the rule engine nor the
+        // executor runs: the finding is recorded as a signed detection
+        // (NN-L-EPG-001/002) within the rule's budget, and the posture
+        // trigger above observed it.
+        Event::ExploitPostcondition {
+            pid,
+            tid,
+            uid,
+            comm,
+            kind,
+            killed,
+            abi,
+            syscall,
+            ..
+        } => {
+            use northnarrow_agent::decision::rules::epg;
+            let verdict = epg::rule_for(&event).and_then(|r| r.evaluate(&event));
+            let admit = match &verdict {
+                Some(v) => budget_admit(&v.rule_id, *uid, &event),
+                None => Admit::Record {
+                    suppressed_before: 0,
+                },
+            };
+            if admit.record() {
+                error!(
+                    pid, tid, uid, comm = %Escaped(comm),
+                    kind = kind.as_str(),
+                    call = %abi.describe_call(*syscall),
+                    killed,
+                    "EXPLOIT POST-CONDITION"
+                );
+            }
+            if let Some(verdict) = verdict {
+                if let Admit::Record { suppressed_before } = admit {
+                    warn!(
+                        rule = %verdict.rule_id,
+                        severity = ?verdict.severity,
+                        reasoning = %Escaped(&verdict.reasoning),
+                        "VERDICT (rule)"
+                    );
+                    if let Some(sink) = detection_sink {
+                        sink.record_rule(
+                            &event,
+                            &verdict,
+                            posture.current_kind(),
+                            epg::response_line(&event),
                             suppressed_before,
                         );
                     }

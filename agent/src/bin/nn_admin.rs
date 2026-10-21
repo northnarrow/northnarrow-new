@@ -2376,6 +2376,7 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.deny_fail_open_total.is_none()
         && out.trust_level.is_none()
         && out.degradations.is_none()
+        && out.exploit_guard.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2648,6 +2649,52 @@ fn trust_line(out: &StatusOutcome, tty: bool) -> String {
     line
 }
 
+/// Lab PR 219: the exploit post-condition guard — its mode, what it
+/// judged, what it found and killed, and whether its task map is full.
+fn exploit_guard_line(out: &StatusOutcome, tty: bool) -> String {
+    let Some(g) = &out.exploit_guard else {
+        return "exploit guard     : (agent predates the guard)".to_string();
+    };
+    let m = g.mode.as_str();
+    let mode = if m.ends_with(" enforce") {
+        colorize(m, "32", tty)
+    } else if m.ends_with(" detect") {
+        colorize(m, "33", tty)
+    } else {
+        colorize(m, "31", tty)
+    };
+    let work = if m.starts_with("strict") {
+        format!(
+            "{} calls judged, {} skipped (fully privileged)",
+            g.checked_total, g.skipped_privileged_total
+        )
+    } else {
+        format!(
+            "{} privilege uses judged, {} refused",
+            g.use_checks_total, g.denied_total
+        )
+    };
+    let mut line = format!(
+        "exploit guard     : {mode} (experimental) — {work}, {} anomalies, {} killed",
+        g.anomalies_total, g.kills_total
+    );
+    if g.untracked_total > 0 && m.starts_with("lite") {
+        line.push_str(&format!(
+            "; {} task record(s) {} (task map full: re-taken at the next hook, degraded \
+             evidence — raise --exploit-guard-tasks)",
+            g.untracked_total,
+            colorize("lost", "31", tty)
+        ));
+    } else if g.untracked_total > 0 {
+        line.push_str(&format!(
+            "; {} task(s) {} (task map full: their calls are not judged)",
+            g.untracked_total,
+            colorize("untracked", "31", tty)
+        ));
+    }
+    line
+}
+
 /// Lab PR 218: every degradation of this run, each also signed in the audit
 /// chain (`subsystem_degraded`).
 fn degradation_lines(out: &StatusOutcome) -> Vec<String> {
@@ -2794,7 +2841,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -2839,6 +2886,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
                 .map_or_else(|| "null".to_string(), |l| l.to_string()),
             serde_json::to_string(&out.trust_reasons).unwrap_or_else(|_| "[]".to_string()),
             serde_json::to_string(&out.degradations).unwrap_or_else(|_| "null".to_string()),
+            // Lab PR 219.
+            serde_json::to_string(&out.exploit_guard).unwrap_or_else(|_| "null".to_string()),
             out.telemetry_signed,
         );
         return;
@@ -2883,6 +2932,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
         for line in degradation_lines(out) {
             println!("{line}");
         }
+        println!("{}", exploit_guard_line(out, tty));
     }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
@@ -4316,8 +4366,8 @@ mod quorum_help_tests {
 mod flow_sock_line_tests {
     use super::{
         capability_lines, combat_evidence_line, degradation_lines, deny_fail_open_line,
-        encrypted_flow_lines, flow_sock_line, response_mode_line, telemetry_withheld, trust_line,
-        withheld_line,
+        encrypted_flow_lines, exploit_guard_line, flow_sock_line, response_mode_line,
+        telemetry_withheld, trust_line, withheld_line,
     };
     use northnarrow_agent::admin_cli::StatusOutcome;
 
@@ -4358,6 +4408,7 @@ mod flow_sock_line_tests {
             trust_reasons: Vec::new(),
             degradations: None,
             capability_manifest: None,
+            exploit_guard: None,
             telemetry_signed: true,
         }
     }
@@ -4581,5 +4632,68 @@ mod flow_sock_line_tests {
             assert!(text.contains(want), "missing `{want}` in:\n{text}");
         }
         assert!(!text.contains("bpffs"), "only the warnings: {text}");
+    }
+
+    /// Lab PR 219: the exploit guard's line, a full task map said loudly.
+    #[test]
+    fn status_shows_the_exploit_guard() {
+        let mut o = outcome(None, None, None);
+        assert!(exploit_guard_line(&o, false).contains("predates"));
+        o.exploit_guard = Some(common::wire::admin_protocol::ExploitGuardStatus {
+            mode: "strict detect".to_string(),
+            checked_total: 12,
+            skipped_privileged_total: 30,
+            anomalies_total: 1,
+            kills_total: 0,
+            untracked_total: 0,
+            use_checks_total: 0,
+            denied_total: 0,
+        });
+        let l = exploit_guard_line(&o, false);
+        assert!(
+            l.contains("strict detect (experimental)") && l.contains("12 calls judged"),
+            "{l}"
+        );
+        assert!(l.contains("1 anomalies") && !l.contains("untracked"), "{l}");
+        if let Some(g) = o.exploit_guard.as_mut() {
+            g.untracked_total = 5;
+            g.mode = "unavailable: cred.uid not resolved".to_string();
+        }
+        let l = exploit_guard_line(&o, false);
+        assert!(
+            l.contains("5 task(s) untracked") && l.contains("unavailable"),
+            "{l}"
+        );
+        if let Some(g) = o.exploit_guard.as_mut() {
+            g.mode = "lite enforce".to_string();
+            g.untracked_total = 0;
+            g.use_checks_total = 40;
+            g.denied_total = 1;
+        }
+        let l = exploit_guard_line(&o, false);
+        assert!(
+            l.contains("lite enforce") && l.contains("40 privilege uses judged, 1 refused"),
+            "{l}"
+        );
+        assert!(!l.contains("lost") && !l.contains("untracked"), "{l}");
+        // lite's map evicts rather than refuses: its records are lost
+        if let Some(g) = o.exploit_guard.as_mut() {
+            g.untracked_total = 3;
+        }
+        let l = exploit_guard_line(&o, false);
+        assert!(
+            l.contains("3 task record(s) lost") && l.contains("degraded evidence"),
+            "{l}"
+        );
+        assert!(!l.contains("untracked"), "{l}");
+        if let Some(g) = o.exploit_guard.as_mut() {
+            g.untracked_total = 0;
+        }
+        // an unsigned reply withholds it with the rest of the telemetry
+        let mut u = outcome(None, None, None);
+        u.telemetry_signed = false;
+        assert!(telemetry_withheld(&u));
+        u.exploit_guard = o.exploit_guard.clone();
+        assert!(!telemetry_withheld(&u));
     }
 }

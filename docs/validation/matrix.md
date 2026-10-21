@@ -9,9 +9,9 @@ The matrix itself is empty by design — V2–V4 populate it.
 
 | File | What it fixes | Version | Rows | sha256 (LF line endings) |
 |---|---|---|---|---|
-| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 2 | 77 | `fdd097941ea801e199de2fb2bc9f2c5e7328fce6b3021183121221e252b77791` |
-| [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 1 | 59 | `c9304cd3d732d7067f41dfe5e981bffeac14cd3e5cd82e0b69f162d174e2a7ab` |
-| [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 1 | 16 | `d376c91f1c0a9af751d790b2f854127466efd5906ea9a4910baa987e8d2da974` |
+| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 3 | 79 | `18a7222b1fe1be8e321f096642bb3360d9259dbacdc09e9ef9b3326918748c5a` |
+| [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 2 | 60 | `1afd1ac52b1d2c04569c2ca3e7e386ba6f5f90dec86e4e6c8e8bbc9d34f6192b` |
+| [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 2 | 18 | `5cf990f1e163a823523d4e0af410966c53f716d1eef9ec7b91146d3524ecb9e9` |
 
 Version 1 was frozen on 2026-10-15, before any V2 run. Its rule rows are
 the 76 rules the production engine loads plus NN-L-AT-001 (issued outside
@@ -45,6 +45,12 @@ Change log:
   counts against the headline. It returns to the sub-gate with the version
   that follows BUG-025. NN-L-CANARY-003 stays in the sub-gate: a connect to
   a network canary trips it since lab PR 163. Sub-gate: 25 rules.
+- `v2-rules.tsv` version 3, `v2-techniques.tsv` version 2,
+  `v2-controls.tsv` version 2 (2026-10-20, lab PR 219, before any V2 run):
+  the exploit post-condition guard's NN-L-EPG-001 (credentials, T1068) and
+  NN-L-EPG-002 (namespaces and root, T1611), issued outside the engine,
+  Critical, in the sub-gate (family `exploit-guard`, 79 rows, sub-gate 27);
+  TQ60 for T1068 and NN-L-EPG-002 in TQ57; CV17 / CV18 for the family.
 
 ## Gate formulas (§13 Q1, as frozen)
 
@@ -136,6 +142,8 @@ brings each one back:
 | R006_ReverseShellTooling | - | `agent/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool` | no proof | no proof | no proof | unit | Critical with KillProcessTree since lab PR 166 (the shell `socat EXEC:` runs is its child). |
 | R007_CryptoMiner | - | `agent/src/decision/rules/r007_crypto_miner.rs::match_is_case_insensitive` | no proof | no proof | no proof | unit | - |
 | R018_KernelModuleLoad | - | `agent/src/decision/rules/r018_kernel_module_load.rs::fire_nonstandard_path_is_critical_killtree` | no proof | no proof | no proof | unit | Critical only for a module outside the module directories; anti-tamper.sh C16 loads an in-tree module. |
+| NN-L-EPG-001_CredentialPostcondition | - | `agent/src/decision/rules/epg.rs::credential_write_in_detect_mode_is_a_critical_log` | no proof | no proof | no proof | unit | Lab PR 219, experimental. Issued outside the engine; Critical in both responses (detect: Log; enforce: the kernel's SIGKILL, and in lite the use refused), except lite's degraded evidence — a task record the LRU task map evicted, re-taken holding privilege — at High, Log only in either response (`agent/src/decision/rules/epg.rs::a_lost_baseline_is_degraded_evidence`). Lite (default) catches it at the mechanism or at the first use (`capable`, exec, a root-private open), strict around every call; the record names the variant and the point. The lab probe exercises the record and the response through the debug-build injection, not a real kernel credential write. |
+| NN-L-EPG-002_NamespaceRootPostcondition | - | `agent/src/decision/rules/epg.rs::namespace_escape_is_epg_002` | no proof | no proof | no proof | unit | Lab PR 219, experimental. As NN-L-EPG-001, for namespaces, the fs_struct and the root. |
 | NN-L-FIM-001_SystemBinaryModified | yes | `agent/src/fim/rules.rs::fim001_fires_on_system_binary_modified` | no proof | no proof | no proof | unit | - |
 | NN-L-FIM-002_NewSuidBinary | yes | `agent/src/fim/rules.rs::fim002_kills_a_watched_inode_linked_into_a_user_writable_dir` | no proof | no proof | no proof | unit | - |
 | NN-L-FIM-008_KernelModuleModified | yes | `agent/src/fim/rules.rs::fim008_fires_on_kmod_modified` | no proof | no proof | no proof | unit | - |
@@ -170,5 +178,6 @@ brings each one back:
 | `io_uring` (NN-L-IOU-001/002) | 2 | | | | | | |
 | `bpf` (NN-L-BPF-001/002) | 2 | | | | | | |
 | `anti-tamper` (NN-L-AT-001) | 1 | | | | | | |
-| **Total** | **77** | | | | | | |
-| **Critical sub-gate** | **25** | | | | | | |
+| `exploit-guard` (NN-L-EPG-001/002) | 2 | | | | | | |
+| **Total** | **79** | | | | | | |
+| **Critical sub-gate** | **27** | | | | | | |

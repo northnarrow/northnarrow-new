@@ -3547,6 +3547,8 @@ fn telemetry_status(
         trust_reasons: trust.map(|t| t.reasons),
         degradations: Some(crate::boot::degradation::snapshot()),
         capability_manifest: crate::boot::manifest::current_json(),
+        // Lab PR 219: the exploit post-condition guard.
+        exploit_guard: Some(crate::sensors::epg::status()),
     }
 }
 
@@ -5975,6 +5977,7 @@ mod tests {
             trust_reasons: None,
             degradations: None,
             capability_manifest: None,
+            exploit_guard: None,
         });
         emit_audit_for(
             &status_req,

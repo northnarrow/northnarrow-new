@@ -11,6 +11,8 @@
 
 pub mod dns_sensor;
 pub mod ebpf_object;
+/// Lab PR 219: the exploit post-condition guard (loader, mode, counters).
+pub mod epg;
 pub mod exe_identity;
 pub mod exec;
 pub mod flow_sock;

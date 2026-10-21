@@ -240,6 +240,14 @@ jobs:
           test -f agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
           file agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
 
+      # Lab PR 219: every map of the object just built must be one the
+      # agent's aya loads. The `test` job embeds no object and skips this
+      # test; here NN_REQUIRE_EBPF_OBJECT makes a missing object a failure.
+      - name: eBPF object map types (aya loader)
+        env:
+          NN_REQUIRE_EBPF_OBJECT: "1"
+        run: cargo test --locked -p northnarrow-agent --lib sensors::ebpf_object::tests::every_map_is_one_the_agents_aya_loads -- --exact
+
   fuzz:
     name: fuzz (smoke, nightly)
     if: github.event_name != 'schedule'

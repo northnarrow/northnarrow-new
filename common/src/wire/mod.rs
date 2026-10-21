@@ -1451,6 +1451,8 @@ pub mod admin_protocol;
 pub mod admin_signed_payload;
 
 /// Tappa 10.9 step 0 — sensor-feasibility probe records.
+/// Lab PR 219 — the exploit post-condition guard's record.
+pub mod epg;
 pub mod exe;
 pub mod open_sensor;
 pub mod sensor_probe;

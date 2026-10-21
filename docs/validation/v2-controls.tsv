@@ -1,6 +1,8 @@
 # NorthNarrow — V2 validation campaign — pre-registered controls.
-# version: 1
+# version: 2
 # frozen: 2026-10-15, before any V2 run (external audit NN-AUD-217).
+# version 2 (2026-10-20, lab PR 219, before any V2 run): CV17 / CV18 for the
+# new family exploit-guard.
 #
 # One evasion row and one benign control per family of v2-rules.tsv. The
 # evasion row runs a variant of a technique the family is meant to catch,
@@ -41,3 +43,5 @@ CV13	bpf	evasion	A foreign process reaches the agent's link_task_kill pin throug
 CV14	bpf	benign	bpftool feature probe (loads test programs)	NN-L-BPF-001_BpfProgramLoaded	no-kill	deploy/lab/adversarial/anti-tamper.sh::case C10
 CV15	anti-tamper	evasion	SIGKILL of the agent through systemctl kill, outside a trusted-installer window	NN-L-AT-001_AntiTamperDenial	denied	deploy/lab/adversarial/anti-tamper.sh::case C31
 CV16	anti-tamper	benign	nn-admin audit verify from the public half of the signing key	-	no-verdict	deploy/lab/adversarial/anti-tamper.sh::case C42
+CV17	exploit-guard	evasion	A credential gain made in kernel on behalf of a system call outside the allowed table, by a process whose comm is set to sudo (an allow-list by name would pass it; the guard's is by mechanism)	NN-L-EPG-001_CredentialPostcondition	fire	-
+CV18	exploit-guard	benign	sudo, su, newgrp, passwd, setpriv, capsh, unshare -U / -r, podman or docker, systemd-run --uid, a cron job	-	no-verdict	deploy/lab/epg/epg-check.sh::negative suite

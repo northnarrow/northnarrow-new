@@ -676,6 +676,13 @@ impl TriggerDetector {
                 hits.push(TriggerType::ControlSurfaceTamper);
             }
         }
+        // Lab PR 219: the exploit post-condition guard's finding — kernel
+        // evidence of COMBAT tier that needs a second signal of another
+        // class while the guard is experimental (the shared predicate of
+        // NN-L-EPG-001/002, so the rules and the trigger cannot drift).
+        if crate::decision::rules::epg::is_exploit_postcondition(event) {
+            hits.push(TriggerType::ExploitPostcondition);
+        }
         let mass_write = confirmed_intrusion(
             event,
             recent,
@@ -746,7 +753,8 @@ pub fn event_uid(event: &Event) -> Option<u32> {
         | Event::FileOpen { uid, .. }
         | Event::MassWrite { uid, .. }
         | Event::TcpConnect { uid, .. }
-        | Event::DnsQuery { uid, .. } => Some(*uid),
+        | Event::DnsQuery { uid, .. }
+        | Event::ExploitPostcondition { uid, .. } => Some(*uid),
         _ => None,
     }
 }
@@ -762,7 +770,8 @@ pub fn event_owner_pid(event: &Event) -> Option<u32> {
         | Event::ExecCheck { pid, .. }
         | Event::TcpConnect { pid, .. }
         | Event::DnsQuery { pid, .. }
-        | Event::FsProtectDenial { pid, .. } => Some(*pid),
+        | Event::FsProtectDenial { pid, .. }
+        | Event::ExploitPostcondition { pid, .. } => Some(*pid),
         // Lab PR 162: the writer, so the stack exemption applies to it and
         // a control-surface tamper's COMBAT names it as the offender.
         Event::Fim(fe) => Some(fe.modifier_pid),
@@ -785,7 +794,8 @@ pub fn event_owner_seen(event: &Event) -> (u64, u64) {
         | Event::ExecCheck { timestamp_ns, .. }
         | Event::TcpConnect { timestamp_ns, .. }
         | Event::DnsQuery { timestamp_ns, .. }
-        | Event::FsProtectDenial { timestamp_ns, .. } => (0, *timestamp_ns),
+        | Event::FsProtectDenial { timestamp_ns, .. }
+        | Event::ExploitPostcondition { timestamp_ns, .. } => (0, *timestamp_ns),
         _ => (0, 0),
     }
 }

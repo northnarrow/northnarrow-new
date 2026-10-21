@@ -148,8 +148,8 @@ fn strip_md(cell: &str) -> &str {
 
 /// Every rule id the agent can record, with where it is issued: the
 /// production engine's rules (built as main.rs builds them, with empty
-/// operator state) and NN-L-AT-001, which `process_event` issues outside
-/// the engine.
+/// operator state), NN-L-AT-001 and NN-L-EPG-001/002, which
+/// `process_event` issues outside the engine.
 fn shipped_rule_ids() -> BTreeMap<String, &'static str> {
     use crate::config::comm_allowlist::CommAllowlist;
     use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
@@ -179,6 +179,14 @@ fn shipped_rule_ids() -> BTreeMap<String, &'static str> {
     }
     let direct = rules::anti_tamper::NnLAt001AntiTamperDenial;
     assert!(ids.insert(direct.id().to_string(), "direct").is_none());
+    // Lab PR 219: the exploit guard's rules, issued outside the engine too.
+    let guard: [&dyn crate::decision::Rule; 2] = [
+        &rules::epg::NnLEpg001CredentialPostcondition,
+        &rules::epg::NnLEpg002NamespaceRootPostcondition,
+    ];
+    for r in guard {
+        assert!(ids.insert(r.id().to_string(), "direct").is_none());
+    }
     ids
 }
 

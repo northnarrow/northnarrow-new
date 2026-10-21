@@ -404,7 +404,7 @@ pub const ENUM_VALUES: &[EnumSpec] = &[
 
 /// Every offset the boot-time revalidator checks against running-kernel
 /// BTF. `PF_KTHREAD` is intentionally absent (a flag bitmask, not a
-/// layout offset). 55 entries — kept in lockstep with the consts above
+/// layout offset). 94 entries — kept in lockstep with the consts above
 /// by `revalidate_table_is_complete` (test).
 pub const REVALIDATE: &[OffsetSpec] = &[
     OffsetSpec {
@@ -1031,6 +1031,142 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: false,
     },
+    OffsetSpec {
+        name: "TASK_STRUCT_CRED_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["cred"],
+        expected: TASK_STRUCT_CRED_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "TASK_STRUCT_NSPROXY_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["nsproxy"],
+        expected: TASK_STRUCT_NSPROXY_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "TASK_STRUCT_TI_STATUS_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["thread_info", "status"],
+        expected: TASK_STRUCT_TI_STATUS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "CRED_UID_OFFSET",
+        struct_name: "cred",
+        field_path: &["uid"],
+        expected: CRED_UID_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "CRED_FSGID_OFFSET",
+        struct_name: "cred",
+        field_path: &["fsgid"],
+        expected: CRED_FSGID_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "CRED_CAP_PERMITTED_OFFSET",
+        struct_name: "cred",
+        field_path: &["cap_permitted"],
+        expected: CRED_CAP_PERMITTED_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "CRED_CAP_EFFECTIVE_OFFSET",
+        struct_name: "cred",
+        field_path: &["cap_effective"],
+        expected: CRED_CAP_EFFECTIVE_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "CRED_USER_NS_OFFSET",
+        struct_name: "cred",
+        field_path: &["user_ns"],
+        expected: CRED_USER_NS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "NSPROXY_MNT_NS_OFFSET",
+        struct_name: "nsproxy",
+        field_path: &["mnt_ns"],
+        expected: NSPROXY_MNT_NS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "NSPROXY_PID_NS_FOR_CHILDREN_OFFSET",
+        struct_name: "nsproxy",
+        field_path: &["pid_ns_for_children"],
+        expected: NSPROXY_PID_NS_FOR_CHILDREN_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "NSPROXY_NET_NS_OFFSET",
+        struct_name: "nsproxy",
+        field_path: &["net_ns"],
+        expected: NSPROXY_NET_NS_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "MNT_NAMESPACE_INUM_OFFSET",
+        struct_name: "mnt_namespace",
+        field_path: &["ns", "inum"],
+        expected: MNT_NAMESPACE_INUM_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "PID_NAMESPACE_INUM_OFFSET",
+        struct_name: "pid_namespace",
+        field_path: &["ns", "inum"],
+        expected: PID_NAMESPACE_INUM_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "NET_INUM_OFFSET",
+        struct_name: "net",
+        field_path: &["ns", "inum"],
+        expected: NET_INUM_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "USER_NAMESPACE_INUM_OFFSET",
+        struct_name: "user_namespace",
+        field_path: &["ns", "inum"],
+        expected: USER_NAMESPACE_INUM_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "TASK_STRUCT_REAL_CRED_OFFSET",
+        struct_name: "task_struct",
+        field_path: &["real_cred"],
+        expected: TASK_STRUCT_REAL_CRED_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "INODE_I_UID_OFFSET",
+        struct_name: "inode",
+        field_path: &["i_uid"],
+        expected: INODE_I_UID_OFFSET,
+        alt_paths: &[],
+        optional: true,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -1135,16 +1271,33 @@ pub mod slot {
     pub const BPF_LINK_ID_OFFSET: u32 = 75;
     pub const INET_SOCK_INET_SPORT_OFFSET: u32 = 76;
     pub const INODE_I_SIZE_OFFSET: u32 = 77;
-    // enum slots 78–79 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 80;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 81;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 82;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 83;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 84;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 85;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 86;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 87;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 88;
+    pub const TASK_STRUCT_CRED_OFFSET: u32 = 78;
+    pub const TASK_STRUCT_NSPROXY_OFFSET: u32 = 79;
+    pub const TASK_STRUCT_TI_STATUS_OFFSET: u32 = 80;
+    pub const CRED_UID_OFFSET: u32 = 81;
+    pub const CRED_FSGID_OFFSET: u32 = 82;
+    pub const CRED_CAP_PERMITTED_OFFSET: u32 = 83;
+    pub const CRED_CAP_EFFECTIVE_OFFSET: u32 = 84;
+    pub const CRED_USER_NS_OFFSET: u32 = 85;
+    pub const NSPROXY_MNT_NS_OFFSET: u32 = 86;
+    pub const NSPROXY_PID_NS_FOR_CHILDREN_OFFSET: u32 = 87;
+    pub const NSPROXY_NET_NS_OFFSET: u32 = 88;
+    pub const MNT_NAMESPACE_INUM_OFFSET: u32 = 89;
+    pub const PID_NAMESPACE_INUM_OFFSET: u32 = 90;
+    pub const NET_INUM_OFFSET: u32 = 91;
+    pub const USER_NAMESPACE_INUM_OFFSET: u32 = 92;
+    pub const TASK_STRUCT_REAL_CRED_OFFSET: u32 = 93;
+    pub const INODE_I_UID_OFFSET: u32 = 94;
+    // enum slots 95–96 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 97;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 98;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 99;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 100;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 101;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 102;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 103;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 104;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 105;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -1227,6 +1380,23 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("BPF_LINK_ID_OFFSET", 75),
     ("INET_SOCK_INET_SPORT_OFFSET", 76),
     ("INODE_I_SIZE_OFFSET", 77),
+    ("TASK_STRUCT_CRED_OFFSET", 78),
+    ("TASK_STRUCT_NSPROXY_OFFSET", 79),
+    ("TASK_STRUCT_TI_STATUS_OFFSET", 80),
+    ("CRED_UID_OFFSET", 81),
+    ("CRED_FSGID_OFFSET", 82),
+    ("CRED_CAP_PERMITTED_OFFSET", 83),
+    ("CRED_CAP_EFFECTIVE_OFFSET", 84),
+    ("CRED_USER_NS_OFFSET", 85),
+    ("NSPROXY_MNT_NS_OFFSET", 86),
+    ("NSPROXY_PID_NS_FOR_CHILDREN_OFFSET", 87),
+    ("NSPROXY_NET_NS_OFFSET", 88),
+    ("MNT_NAMESPACE_INUM_OFFSET", 89),
+    ("PID_NAMESPACE_INUM_OFFSET", 90),
+    ("NET_INUM_OFFSET", 91),
+    ("USER_NAMESPACE_INUM_OFFSET", 92),
+    ("TASK_STRUCT_REAL_CRED_OFFSET", 93),
+    ("INODE_I_UID_OFFSET", 94),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -1271,6 +1441,57 @@ pub const INODE_I_MODE_OFFSET: usize = 0;
 /// existing file of a few KiB, read at open, before any `O_TRUNC`.
 /// `bits_offset=768` = byte 96 on 6.8 (80 on 6.1, resolved at boot).
 pub const INODE_I_SIZE_OFFSET: usize = 96;
+
+// ── Lab PR 219 — exploit post-condition guard (`agent-ebpf/src/epg.rs`) ──
+//
+// The guard reads a task's credential, namespaces and root around every
+// system call. All optional: on a kernel missing one, the guard does not
+// start (it never runs on compiled values: its programs wait for the armed
+// map) and the agent attests the degradation. Compiled values follow the
+// 6.8 definitions (`atomic_long_t cred.usage` from 6.8, `CONFIG_KEYS`,
+// `CONFIG_SECURITY`, `CONFIG_IO_URING`); the namespace `inum`s sit after
+// layouts with many options and are resolved at boot like the rest.
+
+/// `task_struct.cred` — the subjective credential (`current_cred()`, what
+/// permission checks use). 3016 on 6.8 (`comm` at 3032 follows `cred`
+/// and `cached_requested_key`).
+pub const TASK_STRUCT_CRED_OFFSET: usize = 3016;
+/// `task_struct.nsproxy` (after `fs`, `files`, `io_uring`).
+pub const TASK_STRUCT_NSPROXY_OFFSET: usize = 3120;
+/// `task_struct.thread_info.status` (x86: `TS_COMPAT` during a 32-bit
+/// call; `thread_info` is the first member of `task_struct`).
+pub const TASK_STRUCT_TI_STATUS_OFFSET: usize = 16;
+/// `cred.uid`: the first of `uid, gid, suid, sgid, euid, egid, fsuid,
+/// fsgid`, read as one block of 32 bytes (the agent checks that `fsgid` is
+/// at `uid + 28` before it arms the guard).
+pub const CRED_UID_OFFSET: usize = 8;
+/// `cred.fsgid` — only for that layout check.
+pub const CRED_FSGID_OFFSET: usize = 36;
+/// `cred.cap_permitted` and `cred.cap_effective`, read as one block of 16
+/// bytes (checked adjacent at boot). `kernel_cap_t` is 64 bits on every
+/// supported kernel (`u32 cap[2]` before 6.3, `u64 val` since).
+pub const CRED_CAP_PERMITTED_OFFSET: usize = 56;
+pub const CRED_CAP_EFFECTIVE_OFFSET: usize = 64;
+/// `cred.user_ns`.
+pub const CRED_USER_NS_OFFSET: usize = 144;
+/// `nsproxy.mnt_ns`, `.pid_ns_for_children`, `.net_ns`.
+pub const NSPROXY_MNT_NS_OFFSET: usize = 24;
+pub const NSPROXY_PID_NS_FOR_CHILDREN_OFFSET: usize = 32;
+pub const NSPROXY_NET_NS_OFFSET: usize = 40;
+/// `ns.inum` (the `/proc/<pid>/ns/*` inode number) of each namespace
+/// structure, for the record.
+pub const MNT_NAMESPACE_INUM_OFFSET: usize = 16;
+pub const PID_NAMESPACE_INUM_OFFSET: usize = 128;
+pub const NET_INUM_OFFSET: usize = 136;
+pub const USER_NAMESPACE_INUM_OFFSET: usize = 232;
+/// `task_struct.real_cred` — the objective credential, the one the lite
+/// mode compares at its use points: `override_creds` (overlayfs, io_uring
+/// personalities, `access(2)`, NFS) changes only `cred`. 3008 on 6.8.
+pub const TASK_STRUCT_REAL_CRED_OFFSET: usize = 3008;
+/// `inode.i_uid` — the lite mode's `file_open` filter (a file owned by uid
+/// 0, not world-readable). Byte 4 on every supported kernel (after
+/// `i_mode` and `i_opflags`).
+pub const INODE_I_UID_OFFSET: usize = 4;
 /// `task_struct.loginuid` — the mass-write counter skips a writer's own
 /// runtime directory (`/run/user/<loginuid>`), as the posture arm did.
 /// Optional: a kernel without `CONFIG_AUDIT` has no login uid, and that
@@ -1470,24 +1691,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 80),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 81),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 82),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 83),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 84),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 85),
-    ("TP_IOURING_CREATE_FD_OFFSET", 86),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 87),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 88),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 97),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 98),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 99),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 100),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 101),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 102),
+    ("TP_IOURING_CREATE_FD_OFFSET", 103),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 104),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 105),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 78), ("ITER_IOVEC_VALUE", 79)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 95), ("ITER_IOVEC_VALUE", 96)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 78;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 95;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 79;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 96;
 
 // ───────────────────────────────────────
 //  LSM hook prototypes (lab PR 164).
@@ -1557,20 +1778,20 @@ pub const HOOK_ARGS: &[HookArgSpec] = &[
 
 /// Hook-argument slots follow the tracepoint slots.
 pub const HOOK_ARG_SLOT_TABLE: &[(&str, u32)] = &[
-    ("INODE_SETATTR_DENTRY_ARG", 89),
-    ("INODE_SETXATTR_DENTRY_ARG", 90),
-    ("INODE_REMOVEXATTR_DENTRY_ARG", 91),
+    ("INODE_SETATTR_DENTRY_ARG", 106),
+    ("INODE_SETXATTR_DENTRY_ARG", 107),
+    ("INODE_REMOVEXATTR_DENTRY_ARG", 108),
 ];
 
 /// Slot of the position of `inode_setattr`'s dentry: 0 up to 6.8, 1 from
 /// 6.9.
-pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 89;
+pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 106;
 /// Slot of the position of `inode_setxattr`'s dentry: 0 on 5.7 to 5.11,
 /// 1 from 5.12. The attribute name follows it.
-pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 90;
+pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 107;
 /// Slot of the position of `inode_removexattr`'s dentry (as
 /// `inode_setxattr`).
-pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 91;
+pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 108;
 
 /// Upper bound on a resolved position: every hook the agent attaches has
 /// at most six arguments. The eBPF reader bounds the slot value by it.
@@ -1662,7 +1883,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 77, "REVALIDATE must cover all 77 offsets");
+        assert_eq!(REVALIDATE.len(), 94, "REVALIDATE must cover all 94 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1682,7 +1903,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 92);
+        assert_eq!(BTF_OFFSETS_SLOTS, 109);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1712,8 +1933,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 80);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 83);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 97);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 100);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 
@@ -1734,12 +1955,15 @@ mod tests {
             assert!(spec.compiled < HOOK_ARG_MAX);
             assert!(spec.func.starts_with("bpf_lsm_"));
         }
-        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 89);
-        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 90);
-        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 91);
-        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 89));
-        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 90));
-        assert_eq!(HOOK_ARG_SLOT_TABLE[2], ("INODE_REMOVEXATTR_DENTRY_ARG", 91));
+        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 106);
+        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 107);
+        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 108);
+        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 106));
+        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 107));
+        assert_eq!(
+            HOOK_ARG_SLOT_TABLE[2],
+            ("INODE_REMOVEXATTR_DENTRY_ARG", 108)
+        );
         // a position and the argument after it stay below the bound
         assert!(HOOK_ARGS.iter().all(|h| h.compiled + 1 < HOOK_ARG_MAX));
     }

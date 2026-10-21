@@ -16,6 +16,11 @@
  *            (udp_send_skb kprobe, Tappa 10.9 step 3)
  *   dns      sendto() of a DNS query (A, 30-byte name) to 127.0.0.1:53 — one
  *            DNS record per query and the agent's userland DNS pass
+ *   getppid  getppid(2), the cheapest call there is: raw_syscalls sys_enter
+ *            and sys_exit and nothing else (the exploit post-condition
+ *            guard's cost per call, lab PR 219)
+ *   rdzero   read(2) of 64 bytes from /dev/zero (the same, on a call that
+ *            does a little work)
  *
  * usage: nn-bench <mode> <iterations> <workdir>   → prints "<mode> <ops/s>"
  */
@@ -28,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -185,10 +191,33 @@ static int bench_udp(long n, int dns)
     return 0;
 }
 
+static int bench_getppid(long n)
+{
+    for (long i = 0; i < n; i++)
+        (void)syscall(SYS_getppid);
+    return 0;
+}
+
+static int bench_rdzero(long n)
+{
+    char buf[64];
+    int fd = open("/dev/zero", O_RDONLY);
+    if (fd < 0)
+        return -1;
+    for (long i = 0; i < n; i++) {
+        if (read(fd, buf, sizeof buf) != (ssize_t)sizeof buf) {
+            close(fd);
+            return -1;
+        }
+    }
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 4) {
-        fprintf(stderr, "usage: %s open|wopen|exec|connect|udp|dns <iterations> <workdir>\n", argv[0]);
+        fprintf(stderr, "usage: %s open|wopen|exec|connect|udp|dns|getppid|rdzero <iterations> <workdir>\n", argv[0]);
         return 2;
     }
     const char *mode = argv[1];
@@ -209,6 +238,10 @@ int main(int argc, char **argv)
         rc = bench_udp(n, 0);
     else if (!strcmp(mode, "dns"))
         rc = bench_udp(n, 1);
+    else if (!strcmp(mode, "getppid"))
+        rc = bench_getppid(n);
+    else if (!strcmp(mode, "rdzero"))
+        rc = bench_rdzero(n);
     else
         return 2;
     double dt = now() - t0;

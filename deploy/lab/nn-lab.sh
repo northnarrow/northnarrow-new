@@ -42,6 +42,9 @@
 #   deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm: migrate, upgrade, refused upgrade, remove, purge, fresh install
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
 #   deploy/lab/nn-lab.sh sensor-feasibility [BASE] # Tappa 10.9 step 0: the new sensor attach points on this kernel
+#   deploy/lab/nn-lab.sh verifier-check [synced] # every program of the eBPF object through this kernel's verifier
+#                                      # (OK / REFUSED per program, logs of the refused ones); `synced`: the
+#                                      # object `sync` copied instead of the one the agent embeds
 #   deploy/lab/nn-lab.sh btrfs-check      # review 55: a watched file on a btrfs subvolume is still detected
 #   deploy/lab/nn-lab.sh overlay-check    # lab PR 189: a watched file on overlayfs is detected or its boot attests it
 #   deploy/lab/nn-lab.sh open-sensor-check # Tappa 10.9 step 1: the file-open sensor on LSM file_open, end to end
@@ -1213,6 +1216,46 @@ cmd_release_check() {
     return "$rc"
 }
 
+cmd_verifier_check() {
+    # Every program of the eBPF object through this guest's verifier, with
+    # the agent's own loader setup (northnarrow-agent --verifier-check, from
+    # the lab build: run `build` first). Nothing is attached. A running agent
+    # is stopped first (its bpf() observer would score the loads; its pin
+    # root purged, as for sensor-feasibility) and started again afterwards.
+    # `synced` checks the object `sync` copied (agent-ebpf/target/…) instead
+    # of the embedded one: an eBPF change without rebuilding the agent.
+    # Report and the refused programs' full verifier logs: $LAB_DIR/reports.
+    vm_running || die "guest is not running"
+    local stamp out logs remote was_active=0 rc=0 obj_env=""
+    stamp=$(date -u +%Y%m%d-%H%M%S)
+    out="$LAB_DIR/reports/verifier-check-$DISTRO-$stamp.md"
+    logs="$LAB_DIR/reports/verifier-check-$DISTRO-$stamp.logs"
+    mkdir -p "$LAB_DIR/reports"
+    case "${1:-}" in
+        "") ;;
+        synced) obj_env='NN_VERIFIER_CHECK_OBJECT=$HOME/northnarrow/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf ' ;;
+        *) die "verifier-check: unknown argument ${1} (expected: synced)" ;;
+    esac
+    local only=${NN_VERIFIER_CHECK_ONLY:-}
+    if vssh 'systemctl is-active --quiet northnarrow-agent'; then
+        was_active=1
+        lab_purge_pins >/dev/null
+    fi
+    vssh "sudo ${obj_env}${only:+NN_VERIFIER_CHECK_ONLY=$(printf %q "$only") }\$HOME/northnarrow/target/release/northnarrow-agent --verifier-check" | tee "$out" || rc=$?
+    remote=$(sed -n 's|^verifier logs: \(/var/tmp/nn-verifier-check\.[A-Za-z0-9]*\)$|\1|p' "$out" | tail -1)
+    if [[ -n $remote ]]; then
+        mkdir -p "$logs"
+        vssh "sudo tar -C $(printf %q "$remote") -cf - . && sudo rm -rf $(printf %q "$remote")" | tar -xf - -C "$logs" \
+            && log "verifier logs: $logs"
+    fi
+    if [[ $was_active == 1 ]]; then
+        vssh 'sudo systemctl start northnarrow-agent && sleep 3 && sudo systemctl start northnarrow-watchdog' \
+            || { log "agent restart failed — run nn-lab.sh install"; rc=1; }
+    fi
+    log "verifier-check report: $out"
+    return "$rc"
+}
+
 cmd_sensor_feasibility() {
     # Tappa 10.9 step 0 — load the throw-away probes of
     # agent-ebpf/src/sensor_probe.rs on this guest's kernel and exercise them
@@ -1925,6 +1968,7 @@ case "${1:-help}" in
     pkg-check)     cmd_pkg_check ;;
     release-check) shift; cmd_release_check "$@" ;;
     sensor-feasibility) shift; cmd_sensor_feasibility "$@" ;;
+    verifier-check) shift; cmd_verifier_check "$@" ;;
     btrfs-check)   cmd_btrfs_check ;;
     overlay-check) cmd_overlay_check ;;
     open-sensor-check) cmd_open_sensor_check ;;

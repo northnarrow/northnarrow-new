@@ -161,6 +161,17 @@ impl SensorMultiplexer {
         let pin_root = crate::anti_tamper::prepare_pin_root();
         let mut loader = EbpfLoader::new();
         loader.btf(None);
+        // Lab PR 219: the exploit guard's task maps. Strict's sized from
+        // pid_max (or --exploit-guard-tasks), not preallocated; lite's (an
+        // LRU map, always preallocated) bounded, one entry unless lite runs.
+        loader.set_max_entries(
+            crate::sensors::epg::STRICT_TASKS_MAP,
+            crate::sensors::epg::task_map_entries_for_load(),
+        );
+        loader.set_max_entries(
+            crate::sensors::epg::LITE_TASKS_MAP,
+            crate::sensors::epg::lite_task_map_entries_for_load(),
+        );
         if let Some(root) = pin_root {
             loader.map_pin_path(root);
             debug!(
@@ -467,6 +478,23 @@ impl SensorMultiplexer {
     /// [`Self::finished_pumps`] instead).
     pub async fn next_event(&mut self) -> Option<Event> {
         self.rx.recv().await
+    }
+
+    /// Lab PR 219: attach the exploit post-condition guard (detect mode)
+    /// and pump its records into the event channel. `Err(reason)` when it
+    /// does not run; nothing of it is attached then.
+    pub fn attach_exploit_guard(
+        &mut self,
+        variant: crate::sensors::epg::Variant,
+    ) -> std::result::Result<(), String> {
+        let ring = crate::sensors::epg::attach(&mut self.ebpf, variant)?;
+        let handle = spawn_pump::<common::wire::epg::EpgEventRaw>(
+            crate::sensors::epg::PUMP_LABEL,
+            ring,
+            self.event_tx.clone(),
+        );
+        self.register_pump_handle(crate::sensors::epg::PUMP_LABEL, handle);
+        Ok(())
     }
 
     /// Wire up the Tappa 7 anti-tamper LSM hooks: register the

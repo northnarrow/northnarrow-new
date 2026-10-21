@@ -202,6 +202,9 @@ pub struct StatusOutcome {
     pub trust_reasons: Vec<String>,
     pub degradations: Option<Vec<String>>,
     pub capability_manifest: Option<String>,
+    /// Lab PR 219: the exploit post-condition guard's mode and counters
+    /// (`None`: agent predates it, or the unsigned `status`).
+    pub exploit_guard: Option<common::wire::admin_protocol::ExploitGuardStatus>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -426,6 +429,7 @@ fn status_outcome(
         trust_reasons: resp.trust_reasons.unwrap_or_default(),
         degradations: resp.degradations,
         capability_manifest: resp.capability_manifest,
+        exploit_guard: resp.exploit_guard,
         telemetry_signed: signed,
     }
 }
@@ -3624,6 +3628,16 @@ mod tests {
                     trust_reasons: None,
                     degradations: None,
                     capability_manifest: None,
+                    exploit_guard: Some(common::wire::admin_protocol::ExploitGuardStatus {
+                        mode: "lite detect".to_string(),
+                        checked_total: 50,
+                        skipped_privileged_total: 20,
+                        anomalies_total: 0,
+                        kills_total: 0,
+                        untracked_total: 0,
+                        use_checks_total: 0,
+                        denied_total: 0,
+                    }),
                 }),
             );
         });
@@ -3666,6 +3680,9 @@ mod tests {
         // Lab PR 215.
         assert_eq!(out.deny_fail_open_total, Some(2));
         assert_eq!(out.deny_fail_open, vec![("inode_rename".to_string(), 2)]);
+        // Lab PR 219: the exploit guard.
+        let g = out.exploit_guard.as_ref().expect("exploit guard");
+        assert_eq!((g.mode.as_str(), g.checked_total), ("lite detect", 50));
         assert_eq!(out.posture, PostureKind::Combat);
         assert!(out.network_isolation_engaged);
         assert_eq!(out.last_admin_action_secs_ago, Some(123));

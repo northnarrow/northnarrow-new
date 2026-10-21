@@ -381,6 +381,37 @@ fn cross_class_pair_reaches_unlocked_combat() {
     assert!(!m.is_combat_locked(), "heuristic COMBAT must not be locked");
 }
 
+fn exploit_postcondition(pid: u32) -> Event {
+    let mut ev =
+        crate::decision::rules::epg::tests::epg_event(common::EpgKind::CredFromSyscall, false);
+    if let Event::ExploitPostcondition { pid: p, tid, .. } = &mut ev {
+        *p = pid;
+        *tid = pid;
+    }
+    ev
+}
+
+/// Lab PR 219: the exploit post-condition guard's finding is kernel
+/// evidence of COMBAT tier, but alone it stops at ENGAGED while the guard
+/// is experimental (no isolation on the word of a new heuristic).
+#[test]
+fn exploit_postcondition_alone_stops_at_engaged() {
+    let (_tmp, m) = machine_with_pid_42_in_a_unit();
+    m.observe(&exploit_postcondition(42), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+}
+
+/// Lab PR 219: corroborated by a signal of another class in the same
+/// scope (an offensive tool run, execution evidence), it reaches COMBAT.
+#[test]
+fn exploit_postcondition_corroborated_reaches_combat() {
+    let (_tmp, m) = machine_with_pid_42_in_a_unit();
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Engaged);
+    m.observe(&exploit_postcondition(42), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+}
+
 /// External audit POS-001: a kernel-adjudicated denial still reaches a
 /// locked COMBAT, and a heuristic after it keeps it locked.
 #[test]

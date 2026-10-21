@@ -372,6 +372,435 @@ pub enum Event {
         uid_level: bool,
         timestamp_ns: u64,
     },
+    /// Lab PR 219 — an exploit post-condition found by the guard at the
+    /// system-call boundary (`raw_syscalls/sys_enter`, `sys_exit` and the
+    /// `commit_creds` / `switch_task_namespaces` / `set_fs_root` hooks): a
+    /// task that was not fully privileged gained credentials, or left its
+    /// namespaces or its root, with no legitimate mechanism for that call.
+    /// Recorded by NN-L-EPG-001 (credentials) and NN-L-EPG-002 (namespaces
+    /// and root) outside the engine: in enforce mode the kernel already
+    /// sent `SIGKILL` before the task returned to user mode.
+    ExploitPostcondition {
+        kind: EpgKind,
+        /// Enforce mode: `SIGKILL` was sent at the hook (`false` in detect
+        /// mode, and when the signal could not be sent: `kill_failed`).
+        killed: bool,
+        #[serde(default)]
+        kill_failed: bool,
+        /// Thread group and thread.
+        pid: u32,
+        tid: u32,
+        /// Host real uid at the snapshot.
+        uid: u32,
+        comm: String,
+        /// The call the change happened in, by number in its ABI.
+        abi: SyscallAbi,
+        syscall: u32,
+        /// `epg::mech` bits seen during the call.
+        mechanisms: u32,
+        before: CredView,
+        after: CredView,
+        /// `ns.inum` before → after (0 when not read).
+        mnt_ns: (u32, u32),
+        pid_ns: (u32, u32),
+        net_ns: (u32, u32),
+        /// Another `struct cred` (a replaced pointer) rather than a write
+        /// into the same one.
+        cred_replaced: bool,
+        root_changed: bool,
+        fs_changed: bool,
+        /// Found at the next `sys_enter`: the call never reached `sys_exit`.
+        exit_bypassed: bool,
+        timestamp_ns: u64,
+        /// Lab fault injection (`debug-trigger` build): nothing changed.
+        #[serde(default)]
+        injected: bool,
+        /// Which guard caught it (lite, the default, or strict).
+        #[serde(default)]
+        variant: GuardVariant,
+        /// Where: a system-call boundary (strict), a mechanism hook, or a
+        /// use point (lite: `capable`, exec, `file_open`).
+        #[serde(default)]
+        caught_at: CatchPoint,
+        /// Lite, degraded evidence: the task's record was lost (task map
+        /// eviction) and re-taken here, and what it holds (`after`, equal
+        /// to `before`) holds privilege no mechanism is known to have
+        /// given. Recorded only, never refused or killed.
+        #[serde(default)]
+        baseline_lost: bool,
+        /// Lite: `before` is a snapshot re-taken after a lost record (here
+        /// or earlier), not the one fork and the mechanisms kept.
+        #[serde(default)]
+        rebaselined: bool,
+    },
+}
+
+/// Lab PR 219: what the exploit post-condition guard found (`epg::kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpgKind {
+    CredNoMechanism,
+    CredFromSyscall,
+    NsNoMechanism,
+    NsFromSyscall,
+    RootNoMechanism,
+    RootFromSyscall,
+    FsSwapped,
+    CredBetweenSyscalls,
+    CredOutsideSyscall,
+    Unknown(u8),
+}
+
+impl EpgKind {
+    pub fn from_wire(k: u8) -> Self {
+        use crate::epg::kind as k_;
+        match k {
+            k_::CRED_NO_MECHANISM => Self::CredNoMechanism,
+            k_::CRED_FROM_SYSCALL => Self::CredFromSyscall,
+            k_::NS_NO_MECHANISM => Self::NsNoMechanism,
+            k_::NS_FROM_SYSCALL => Self::NsFromSyscall,
+            k_::ROOT_NO_MECHANISM => Self::RootNoMechanism,
+            k_::ROOT_FROM_SYSCALL => Self::RootFromSyscall,
+            k_::FS_SWAPPED => Self::FsSwapped,
+            k_::CRED_BETWEEN_SYSCALLS => Self::CredBetweenSyscalls,
+            k_::CRED_OUTSIDE_SYSCALL => Self::CredOutsideSyscall,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Credentials (NN-L-EPG-001, T1068) rather than namespaces or root
+    /// (NN-L-EPG-002, T1611). An unknown byte counts as credentials: the
+    /// stronger rule records it.
+    pub fn is_credential(&self) -> bool {
+        !matches!(
+            self,
+            Self::NsNoMechanism
+                | Self::NsFromSyscall
+                | Self::RootNoMechanism
+                | Self::RootFromSyscall
+                | Self::FsSwapped
+        )
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CredNoMechanism => "cred_no_mechanism",
+            Self::CredFromSyscall => "cred_from_syscall",
+            Self::NsNoMechanism => "ns_no_mechanism",
+            Self::NsFromSyscall => "ns_from_syscall",
+            Self::RootNoMechanism => "root_no_mechanism",
+            Self::RootFromSyscall => "root_from_syscall",
+            Self::FsSwapped => "fs_swapped",
+            Self::CredBetweenSyscalls => "cred_between_syscalls",
+            Self::CredOutsideSyscall => "cred_outside_syscall",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// One line for the verdict's reasoning.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::CredNoMechanism => {
+                "credentials gained with no commit_creds during the call (a write into the \
+                 task's struct cred, or its pointer replaced)"
+            }
+            Self::CredFromSyscall => {
+                "commit_creds gave privileges on behalf of a system call that never changes \
+                 them (the commit_creds(prepare_kernel_cred(...)) of a kernel exploit)"
+            }
+            Self::NsNoMechanism => "namespaces replaced with no switch_task_namespaces",
+            Self::NsFromSyscall => {
+                "switch_task_namespaces on behalf of a system call that never switches them"
+            }
+            Self::RootNoMechanism => {
+                "filesystem root changed with no set_fs_root, no pivot_root and no root change \
+                 elsewhere on the host"
+            }
+            Self::RootFromSyscall => {
+                "set_fs_root on behalf of a system call that never sets a root"
+            }
+            Self::FsSwapped => "the task's fs_struct replaced outside unshare(CLONE_FS)",
+            Self::CredBetweenSyscalls => {
+                "credentials gained between two system calls, or in a call that never reached \
+                 its exit (an exploit's return path)"
+            }
+            Self::CredOutsideSyscall => {
+                "commit_creds gave privileges outside any system call of a task that was not \
+                 fully privileged"
+            }
+            Self::Unknown(_) => "an anomaly this agent does not know (newer eBPF object)",
+        }
+    }
+}
+
+/// Lab PR 219: which guard ran ([`Event::ExploitPostcondition`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardVariant {
+    #[default]
+    Lite,
+    Strict,
+}
+
+impl GuardVariant {
+    pub fn from_wire(v: u8) -> Self {
+        if v == crate::epg::variant::STRICT {
+            Self::Strict
+        } else {
+            Self::Lite
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Lite => "lite",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+/// Lab PR 219: where the guard caught it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchPoint {
+    SysEnter,
+    SysExit,
+    CommitCreds,
+    SwitchNs,
+    SetFsRoot,
+    Capable,
+    Exec,
+    FileOpen,
+    #[default]
+    Unknown,
+}
+
+impl CatchPoint {
+    pub fn from_wire(p: u8) -> Self {
+        use crate::epg::point as p_;
+        match p {
+            p_::SYS_ENTER => Self::SysEnter,
+            p_::SYS_EXIT => Self::SysExit,
+            p_::COMMIT_CREDS => Self::CommitCreds,
+            p_::SWITCH_NS => Self::SwitchNs,
+            p_::SET_FS_ROOT => Self::SetFsRoot,
+            p_::CAPABLE => Self::Capable,
+            p_::EXEC => Self::Exec,
+            p_::FILE_OPEN => Self::FileOpen,
+            _ => Self::Unknown,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SysEnter => "sys_enter",
+            Self::SysExit => "sys_exit",
+            Self::CommitCreds => "commit_creds",
+            Self::SwitchNs => "switch_task_namespaces",
+            Self::SetFsRoot => "set_fs_root",
+            Self::Capable => "capable()",
+            Self::Exec => "exec (bprm_check_security)",
+            Self::FileOpen => "file_open",
+            Self::Unknown => "unknown",
+        }
+    }
+    /// A lite use point: in enforce the use itself was refused.
+    pub fn is_use_point(&self) -> bool {
+        matches!(self, Self::Capable | Self::Exec | Self::FileOpen)
+    }
+}
+
+/// Lab PR 219: the system-call ABI of [`Event::ExploitPostcondition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyscallAbi {
+    X64,
+    Ia32,
+    X32,
+    /// No system call (task work, interrupt context).
+    None,
+}
+
+impl SyscallAbi {
+    pub fn from_wire(a: u8) -> Self {
+        match a {
+            crate::epg::abi::X64 => Self::X64,
+            crate::epg::abi::IA32 => Self::Ia32,
+            crate::epg::abi::X32 => Self::X32,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::X64 => "x86_64",
+            Self::Ia32 => "i386",
+            Self::X32 => "x32",
+            Self::None => "none",
+        }
+    }
+
+    fn wire(&self) -> u8 {
+        match self {
+            Self::X64 => crate::epg::abi::X64,
+            Self::Ia32 => crate::epg::abi::IA32,
+            Self::X32 => crate::epg::abi::X32,
+            Self::None => crate::epg::abi::NONE,
+        }
+    }
+
+    /// The name of a call the guard knows, else `None`.
+    pub fn syscall_name(&self, nr: u32) -> Option<&'static str> {
+        use crate::epg::{nr as n, nr32 as n32};
+        let name = match (self, nr) {
+            (Self::X64 | Self::X32, n::READ) => "read",
+            (Self::X64 | Self::X32, n::WRITE) => "write",
+            (Self::X64 | Self::X32, n::IOCTL) => "ioctl",
+            (Self::X64 | Self::X32, n::SETSOCKOPT) => "setsockopt",
+            (Self::X64 | Self::X32, n::CLONE) => "clone",
+            (Self::X64 | Self::X32, n::FORK) => "fork",
+            (Self::X64 | Self::X32, n::VFORK) => "vfork",
+            (Self::X64, n::EXECVE) | (Self::X32, crate::epg::X32_EXECVE) => "execve",
+            (Self::X64 | Self::X32, n::SETUID) => "setuid",
+            (Self::X64 | Self::X32, n::SETGID) => "setgid",
+            (Self::X64 | Self::X32, n::SETREUID) => "setreuid",
+            (Self::X64 | Self::X32, n::SETREGID) => "setregid",
+            (Self::X64 | Self::X32, n::SETGROUPS) => "setgroups",
+            (Self::X64 | Self::X32, n::SETRESUID) => "setresuid",
+            (Self::X64 | Self::X32, n::SETRESGID) => "setresgid",
+            (Self::X64 | Self::X32, n::SETFSUID) => "setfsuid",
+            (Self::X64 | Self::X32, n::SETFSGID) => "setfsgid",
+            (Self::X64 | Self::X32, n::CAPSET) => "capset",
+            (Self::X64 | Self::X32, n::PIVOT_ROOT) => "pivot_root",
+            (Self::X64 | Self::X32, n::PRCTL) => "prctl",
+            (Self::X64 | Self::X32, n::CHROOT) => "chroot",
+            (Self::X64 | Self::X32, n::KEYCTL) => "keyctl",
+            (Self::X64 | Self::X32, n::UNSHARE) => "unshare",
+            (Self::X64 | Self::X32, n::SETNS) => "setns",
+            (Self::X64 | Self::X32, n::BPF) => "bpf",
+            (Self::X64, n::EXECVEAT) | (Self::X32, crate::epg::X32_EXECVEAT) => "execveat",
+            (Self::X64 | Self::X32, n::IO_URING_ENTER) => "io_uring_enter",
+            (Self::X64 | Self::X32, n::CLONE3) => "clone3",
+            (Self::Ia32, n32::IOCTL) => "ioctl",
+            (Self::Ia32, n32::EXECVE) => "execve",
+            (Self::Ia32, n32::SETUID | n32::SETUID16) => "setuid",
+            (Self::Ia32, n32::SETRESUID | n32::SETRESUID16) => "setresuid",
+            (Self::Ia32, n32::CAPSET) => "capset",
+            (Self::Ia32, n32::UNSHARE) => "unshare",
+            (Self::Ia32, n32::SETNS) => "setns",
+            _ => return None,
+        };
+        Some(name)
+    }
+
+    /// `name(nr)` or `nr <n> (<abi>)` for the reasoning.
+    pub fn describe_call(&self, nr: u32) -> String {
+        if *self == Self::None || nr == crate::epg::NO_SYSCALL {
+            return "no system call".to_string();
+        }
+        match self.syscall_name(nr) {
+            Some(name) if *self == Self::X64 => format!("{name} ({nr})"),
+            Some(name) => format!("{name} ({nr}, {})", self.as_str()),
+            None => format!("system call {nr} ({})", self.as_str()),
+        }
+    }
+
+    /// The changes this call may make legitimately (`epg::allowed`).
+    pub fn allowed_changes(&self, nr: u32) -> u32 {
+        crate::epg::allowed(self.wire(), nr)
+    }
+}
+
+/// Lab PR 219: the credential the guard compares, as recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredView {
+    pub uid: u32,
+    pub gid: u32,
+    pub suid: u32,
+    pub sgid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub fsuid: u32,
+    pub fsgid: u32,
+    pub cap_permitted: u64,
+    pub cap_effective: u64,
+    /// `ns.inum` of the user namespace (0 when not read).
+    pub user_ns: u32,
+}
+
+impl CredView {
+    fn from_wire(ids: &[u32; 8], cap_permitted: u64, cap_effective: u64, user_ns: u32) -> Self {
+        Self {
+            uid: ids[0],
+            gid: ids[1],
+            suid: ids[2],
+            sgid: ids[3],
+            euid: ids[4],
+            egid: ids[5],
+            fsuid: ids[6],
+            fsgid: ids[7],
+            cap_permitted,
+            cap_effective,
+            user_ns,
+        }
+    }
+
+    /// `uid=…/euid=…/suid=…/fsuid=… caps=…` for the reasoning.
+    pub fn summary(&self) -> String {
+        format!(
+            "uid={} euid={} suid={} fsuid={} gid={} egid={} cap_eff={:#x} cap_prm={:#x} userns={}",
+            self.uid,
+            self.euid,
+            self.suid,
+            self.fsuid,
+            self.gid,
+            self.egid,
+            self.cap_effective,
+            self.cap_permitted,
+            self.user_ns
+        )
+    }
+}
+
+impl From<&crate::wire::epg::EpgEventRaw> for Event {
+    fn from(raw: &crate::wire::epg::EpgEventRaw) -> Self {
+        use crate::wire::epg::flags as f;
+        Event::ExploitPostcondition {
+            kind: EpgKind::from_wire(raw.kind),
+            killed: raw.action == crate::epg::action::KILLED,
+            kill_failed: raw.action == crate::epg::action::KILL_FAILED,
+            pid: raw.pid,
+            tid: raw.tid,
+            uid: raw.before_ids[0],
+            comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
+            abi: SyscallAbi::from_wire(raw.abi),
+            syscall: raw.nr,
+            mechanisms: raw.mechanisms,
+            before: CredView::from_wire(
+                &raw.before_ids,
+                raw.before_cap_permitted,
+                raw.before_cap_effective,
+                raw.before_user_ns,
+            ),
+            after: CredView::from_wire(
+                &raw.after_ids,
+                raw.after_cap_permitted,
+                raw.after_cap_effective,
+                raw.after_user_ns,
+            ),
+            mnt_ns: (raw.before_mnt_ns, raw.after_mnt_ns),
+            pid_ns: (raw.before_pid_ns, raw.after_pid_ns),
+            net_ns: (raw.before_net_ns, raw.after_net_ns),
+            cred_replaced: raw.flags & f::CRED_REPLACED != 0,
+            root_changed: raw.flags & f::ROOT_CHANGED != 0,
+            fs_changed: raw.flags & f::FS_CHANGED != 0,
+            exit_bypassed: raw.flags & f::EXIT_BYPASSED != 0,
+            timestamp_ns: raw.timestamp_ns,
+            injected: raw.flags & f::INJECTED != 0,
+            variant: GuardVariant::from_wire(raw.variant),
+            caught_at: CatchPoint::from_wire(raw.point),
+            baseline_lost: raw.flags & f::BASELINE_LOST != 0,
+            rebaselined: raw.flags & f::REBASELINED != 0,
+        }
+    }
 }
 
 /// External audit EBPF-013: the sensor whose kernel record budget held
