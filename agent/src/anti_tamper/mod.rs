@@ -362,15 +362,12 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     let btf = match Btf::from_sys_fs() {
         Ok(b) => b,
         Err(e) => {
-            return deny_shortfall(
-                LSM_DENY_HOOKS_EXPECTED,
-                0,
-                &[],
-                &[format!(
-                    "vmlinux BTF unavailable ({e:#}) — no LSM hook can attach: kernel built \
-                     without CONFIG_DEBUG_INFO_BTF, or /sys/kernel/btf hidden"
-                )],
-            );
+            let infra = [format!(
+                "vmlinux BTF unavailable ({e:#}) — no LSM hook can attach: kernel built \
+                 without CONFIG_DEBUG_INFO_BTF, or /sys/kernel/btf hidden"
+            )];
+            note_deny_report(LSM_DENY_HOOKS_EXPECTED, 0, &infra, &[]);
+            return deny_shortfall(LSM_DENY_HOOKS_EXPECTED, 0, &[], &infra);
         }
     };
 
@@ -578,6 +575,55 @@ pub fn take_degraded_boot_details() -> Vec<String> {
     std::mem::take(&mut *DEGRADED_BOOT.lock())
 }
 
+/// Lab PR 218: the deny side of this boot's attach, for the trust level and
+/// the capability manifest (`crate::boot`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DenyReport {
+    /// Deny hooks expected (the 16 of [`DENY_HOOKS`] plus the optional ones
+    /// this kernel has) and attached and armed.
+    pub expected: usize,
+    pub attached: usize,
+    /// The missing hooks and the failed protection steps, each with why.
+    pub missing: Vec<String>,
+    /// The observe hooks that did not attach.
+    pub observe_missing: Vec<String>,
+}
+
+impl DenyReport {
+    /// The report of a health line: `deny_attached` counts hooks, as the
+    /// line does (external audit ATP-016).
+    pub(crate) fn of(
+        expected: usize,
+        deny: &DenyHealth,
+        observe_failures: &[(&'static str, String)],
+    ) -> Self {
+        let mut missing = named(&deny.missing);
+        missing.extend(named(&deny.infra));
+        DenyReport {
+            expected,
+            attached: expected.saturating_sub(deny.missing.len()),
+            missing,
+            observe_missing: named(observe_failures),
+        }
+    }
+}
+
+static DENY_REPORT: parking_lot::Mutex<Option<DenyReport>> = parking_lot::Mutex::new(None);
+
+fn note_deny_report(expected: usize, attached: usize, missing: &[String], observe: &[String]) {
+    *DENY_REPORT.lock() = Some(DenyReport {
+        expected,
+        attached,
+        missing: missing.to_vec(),
+        observe_missing: observe.to_vec(),
+    });
+}
+
+/// What [`attach`] found on the deny side (`None` before it ran).
+pub fn deny_report() -> Option<DenyReport> {
+    DENY_REPORT.lock().clone()
+}
+
 fn named(entries: &[(&'static str, String)]) -> Vec<String> {
     entries.iter().map(|(p, e)| format!("{p}: {e}")).collect()
 }
@@ -641,6 +687,7 @@ fn report_lsm_health(
     observe_failures: &[(&'static str, String)],
 ) -> Result<()> {
     let deny_attached = deny_expected.saturating_sub(deny.missing.len());
+    *DENY_REPORT.lock() = Some(DenyReport::of(deny_expected, deny, observe_failures));
     if deny.is_empty() && observe_failures.is_empty() {
         info!(
             deny_attached,
@@ -1166,6 +1213,26 @@ pub fn evict_protected_observer(bpffs_root: Option<&Path>, pid: u32) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab PR 218: the trust level and the manifest read the deny side as
+    /// the health line counts it — hooks, not failed steps.
+    #[test]
+    fn the_deny_report_counts_hooks_and_names_every_gap() {
+        let mut deny = DenyHealth::default();
+        deny.missing_hook(TASK_KILL_PROGRAM, "verifier".to_string());
+        deny.infra_failure("bpffs pin root", "a link".to_string());
+        let r = DenyReport::of(
+            LSM_DENY_HOOKS_EXPECTED,
+            &deny,
+            &[("module_load_observe", "absent".to_string())],
+        );
+        assert_eq!(r.expected, 16);
+        assert_eq!(r.attached, 15, "a failed step is not a missing hook");
+        assert_eq!(r.missing, ["task_kill: verifier", "bpffs pin root: a link"]);
+        assert_eq!(r.observe_missing, ["module_load_observe: absent"]);
+        let healthy = DenyReport::of(18, &DenyHealth::default(), &[]);
+        assert_eq!((healthy.attached, healthy.expected), (18, 18));
+    }
 
     /// External audit ATP-002: a protected pid is told by the file it
     /// runs, not by the name it gives itself.

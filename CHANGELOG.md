@@ -108,6 +108,108 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   templates).
 
 ### Fixed
+- Wave 4, boot integrity: checks before the attach, the deny self-test,
+  signed degradations, a trust level and a capability manifest (external
+  review G-09, G-11, G-12, AR-09, P0 C-13, P0 C-14; capability program C01,
+  C23; lab PR 218; `docs/operator/BOOT_INTEGRITY.md`). Without `bpf` in the
+  active LSM list (`/sys/kernel/security/lsm`, Ubuntu's default) every deny
+  hook attached and none ran, behind one WARN. **Decision:** such a start is
+  refused before anything attaches (exit 78) unless
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, the degraded-mode opt-in of the
+  deny-hook shortfall (trust level L0); a signed `subsystem_degraded`
+  (`source: bpf_lsm`) either way, and a refusal adds `agent_boot`
+  `refused` with `refused_by` naming the gate (`install_manifest` for the
+  manifest refusal of lab PR 21). Detect-only does not change it; an
+  unreadable list is left to the self-test. Right after the attach a child
+  of the agent's binary (`--deny-self-test`, hidden) sends `SIGURG` to the
+  agent and must get `EPERM` from `task_kill`: a delivered signal (hooks
+  attached, not run) refuses the start the same way (`refused_by:
+  deny_self_test`), an unmeasured one is signed (L1); the self-test's own
+  denial — its pid, signal, target and a kernel timestamp between spawn and
+  reap — is taken before the posture (no COMBAT, no NN-L-AT-001). The
+  capability, install-manifest and audit checks ran after the eBPF programs
+  were loaded, attached and pinned: they now run in a preflight phase (the
+  audit log's writability by an open for append that writes nothing), in
+  typed phases — `boot::BootSequence` (preflight, attach, self-test, attest,
+  subsystems, run), a step out of its phase or a phase left incomplete
+  stops the start, and `SensorMultiplexer::start_with_net` /
+  `attach_anti_tamper` take an `AttachPermit` only `enter_attach` gives; a
+  test holds `main.rs`'s order. The audit log opens right after the
+  self-test, before the blocklists and the rule engine. When the netflow log
+  cannot be opened the network drain no longer stays off for the boot (TCP,
+  UDP and listeners blind): it runs without the log, signed (`net_drain`).
+  Every degradation goes through one registry (`boot::degradation`):
+  signed at once when its finder holds the audit log, at the log's open
+  for the earlier ones, otherwise within 15 s (60 s bound), and listed by
+  `nn-admin status --key`; new records for the exec sensor on
+  `sys_enter_execve`, the file-open sensor on `sys_enter_openat` (its four
+  fallbacks and the tracepoint mode), `udp_v6_send_skb` and `udpv6_sendmsg`
+  not attached, io_uring without its tracepoints, the netflow and listener
+  logs, the self-test. Trust levels: L3 every mandatory deny hook attached
+  and self-tested, `bpf` active, enforcing, nothing degraded; L2 the same
+  with a degradation or detect-only; L1 a deny hook missing or the
+  self-test inconclusive; L0 no enforcement. A capability manifest (kernel,
+  BTF, LSMs, deny hooks, self-test, each sensor's attach point, host
+  hardening, degradations, level) is signed at every boot as a
+  `capability_manifest` audit row, read with `nn-admin capabilities --key`.
+  The status reply appends `trust_level`, `trust_reasons`, `degradations`
+  and `capability_manifest` after lab PR 215's and 217's fields, which
+  follow lab PR 207's (telemetry: the signed verb only). Alternatives not taken: a variable of its own for the missing
+  `bpf` (one more weakening switch; the opt-in already means "below the
+  expected protection" and is a signed `weakening_env`); per-hook
+  self-tests (one hook proves the kernel runs the agent's LSM programs;
+  per-hook checks are a follow-up); the full split of `main()` into one
+  function per phase (follow-up: the permit and the sequence fix the order
+  now).
+  **Regressions / changes:** a host without `bpf` in its active LSMs no
+  longer starts the agent (exit 78), an upgraded one included — add `bpf`
+  (`KERNEL_COMPATIBILITY.md`) or set the opt-in; `install.sh` says so. A
+  refusal before the attach is signed only when the early registration in
+  the pinned `PROTECTED_PIDS` worked (otherwise the previous hooks close the
+  key: the journal keeps it). The boot's signed rows change order
+  (`agent_boot` before the blocklist records) and gain
+  `subsystem_degraded` rows with `source`, one `capability_manifest` row,
+  `refused_by` on a refused `agent_boot`. One exec of the agent's binary per
+  boot (the self-test child). An `nn-admin` of this PR cannot read an older
+  agent's status reply (as before: upgrade the agent first).
+  Tests: `boot` `no_attach_permit_before_every_preflight_check`,
+  `a_check_after_the_attach_is_refused`,
+  `phases_cannot_be_skipped_or_repeated`,
+  `phases_are_in_order_and_each_step_in_one_phase`,
+  `main_runs_the_phases_in_order`, `main_runs_the_net_drain_without_its_log`;
+  `boot::lsm` `a_missing_bpf_lsm_refuses_unless_opted_in`,
+  `bpf_is_found_anywhere_in_the_list`,
+  `an_unreadable_list_is_left_to_the_self_test`; `boot::deny_selftest`
+  `exit_statuses_map_to_outcomes`, `only_the_self_tests_own_denial_is_taken`,
+  `a_not_denied_signal_is_an_anti_tamper_record`,
+  `the_parent_reads_the_childs_status`; `boot::degradation`
+  `every_report_is_signed_once_and_listed`,
+  `a_record_without_a_source_keeps_the_old_shape`,
+  `without_an_audit_log_reports_are_kept_unsigned`,
+  `past_the_cap_reports_are_counted`; `boot::trust` (L3, L2, L1, L0, order);
+  `boot::manifest` `the_manifest_is_a_signed_row_of_the_audit_chain`,
+  `a_later_note_moves_a_sensor`; `audit`
+  `the_audit_preflight_writes_nothing_and_finds_an_unwritable_log`,
+  `a_refused_boot_names_its_gate`; `anti_tamper`
+  `the_deny_report_counts_hooks_and_names_every_gap`; `net::drain`
+  `flows_reach_the_rules_without_the_netflow_log`; `admin_protocol`
+  `a_lab207_nn_admin_reads_a_lab218_status_reply`,
+  `a_lab218_nn_admin_cannot_read_a_lab207_status_reply`,
+  `the_trust_level_and_degradations_are_withheld_from_the_public_status`;
+  `nn-admin` `status_shows_the_trust_level_and_the_degradations`,
+  `capabilities_prints_the_signed_manifest`; `agent_id`
+  `the_agent_reads_its_identity_once` follows the refusal helper. On the
+  starting tree: the order assertions (capabilities and install manifest
+  before `start_with_net`) and the drain one, run against its `main.rs`,
+  fail (`caps::boot_gate(` after the attach; the drain spawned only with
+  the netflow log); the other tests call types and functions new in this
+  lot and do not compile there. Host: `cargo xtask build-ebpf --release`,
+  `cargo fmt`, the three clippy runs (`--workspace --all-targets`, the
+  agent with `test-privileged,debug-trigger`, `posture_demo`) clean,
+  2,825 passed, 0 failed (one earlier full run lost
+  `admin_socket::tests::force_posture_records_the_state_it_left`, a journal
+  capture this lot does not touch; it passes alone and in the two later
+  runs).
 - Truthful COMBAT outcomes: what an unlock, a NEUTRALIZE and an ISOLATE
   report and record is now the state of the host (capabilities C17, C18;
   static review of `baf4c25` P0 C-30, C-32, C-35, G-02, G-03, TD-07, TD-11;

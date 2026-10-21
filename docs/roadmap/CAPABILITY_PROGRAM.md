@@ -232,3 +232,31 @@ only in the table below, in the same PR as the evidence.
     proceeds when its audit row cannot be written (G-02, by design — only
     the COMBAT records are queued and counted).
   - Lab: On Ubuntu 24.04, a COMBAT driven to ISOLATE: status per family (IPv4 and IPv6 isolated), both tables with the chain, its DROP and one jump per base chain, the signed rows in order (INVESTIGATE, NEUTRALIZE outcome, ISOLATE outcome attempt 1 of 3 v4 done v6 done); with ip6tables made to fail (an unparsable nft rule), IPv4 isolated and IPv6 FAILED were reported and signed, three attempts at 0, 10 and 25 s ending in "ISOLATE did not take after every attempt" (journal and row; the probe read before the third); the signed unlock released both families (read back), recorded `key_fp` and `protocol: signed`, a second unlock said "not in COMBAT"; the legacy unlock is refused; this nn-admin against the previous agent exits 5 and says which nn-admin to use. Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.
+- **Lab PR 218 — boot integrity: checks before the attach, the deny
+  self-test, signed degradations, a trust level and a capability
+  manifest.** C01 (Linux sensor), C23 (anti-tamper and self-defence);
+  external review G-09, G-11, G-12, AR-09, P0 C-13, P0 C-14
+  (`docs/operator/BOOT_INTEGRITY.md`).
+  - C23: without `bpf` in the active LSM list the deny hooks attached and
+    never ran, behind one WARN. The start is now refused before anything
+    attaches (exit 78) unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, signed
+    either way; after the attach a child of the agent signals it and must be
+    refused (`task_kill`), so hooks attached but not run refuse the start
+    too. The self-test's own denial never reaches the posture.
+  - C01 / C23: the capability, install-manifest and audit checks run before
+    any attach, in typed phases (`BootSequence`, an `AttachPermit` the
+    attach takes, a test on `main.rs`'s order); every sensor fallback and
+    degradation is signed within 60 s and listed by `nn-admin status --key`;
+    the network drain runs without its log instead of staying off.
+  - Trust level L0–L3 and a capability manifest (kernel, BTF, LSMs, deny
+    hooks and self-test, each sensor's attach point, host hardening,
+    degradations) signed at every boot, read with `nn-admin capabilities
+    --key`.
+  - Levels unchanged (C01 2, C23 2): the evidence is the lab's, owed on
+    Ubuntu 24.04 and Debian 12 — a guest booted without `bpf` in `lsm=`
+    (refusal, then L0 under the opt-in), the self-test's refusal with the
+    LSM list hidden, a netflow log made unopenable, the forced fallbacks.
+    Open: the self-test exercises one deny hook, not each of the 16; the
+    host's hardening is listed, not scored; `main()` is still one body (one
+    function per phase is the follow-up).
+  - Lab: On Ubuntu 24.04, Debian 12, 22.04 and Debian 13: the five boot phases in order (preflight steps through bpf_lsm, attach, self-test, attest, subsystems), the deny self-test refused and its signal consumed (no NN-L-AT-001 for it), trust level L3, the signed capability manifest equal to `nn-admin capabilities`, the unsigned status withholding the trust level; NetFlowDb made unopenable: the drain ran without persistence and signed `net_drain`; three sensor fallbacks signed within 60 s; a read-only audit log and a dropped CAP_KILL refused before any attach. On 22.04 booted without `bpf` in `lsm=`: the start refused with exit 78 and signed rows, the opt-in start at L0, a hidden LSM list caught by the self-test (`refused_by deny_self_test`), the guest restored (39 of 39 checks). Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.

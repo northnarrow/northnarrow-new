@@ -70,6 +70,14 @@ The anti-tamper hooks are BPF LSM programs: `bpf` must be in
 default list (matrix above); Ubuntu 22.04 and 24.04 do not, nor does a host
 whose command line already sets an `lsm=` without it.
 
+Without it the hooks attach and the kernel never runs them. Since lab PR
+218 the agent refuses to start there (exit 78, before anything attaches,
+with a signed `subsystem_degraded` and a refused `agent_boot`), unless
+`NN_ANTI_TAMPER_ALLOW_DEGRADED=1`, which starts it at trust level L0 (no
+enforcement). After the attach a deny self-test checks that a deny hook
+really refuses; hooks attached but not run refuse the start the same way.
+See `BOOT_INTEGRITY.md`.
+
 **Add `bpf` to the list the kernel runs; never write a fixed list.** `lsm=`
 replaces the kernel's built-in list (`CONFIG_LSM`) as a whole: a module it
 does not name is not started (`capability` always is). A list copied from another host can therefore

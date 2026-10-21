@@ -39,6 +39,10 @@ pub fn skb_active() -> bool {
     SKB_ACTIVE.load(Ordering::Relaxed)
 }
 
+/// Lab PR 218: the degradation when `udp_v6_send_skb` does not attach.
+pub const IPV6_NOT_OBSERVED: &str =
+    "udp_v6_send_skb not attached: DNS queries to IPv6 resolvers are not observed";
+
 /// Whether queries to IPv6 resolvers are observed at all.
 pub fn ipv6_observed() -> bool {
     SKB6_ACTIVE.load(Ordering::Relaxed)
@@ -86,8 +90,11 @@ pub fn attach(
     attach_kprobe: impl Fn(&mut Ebpf, &str, &str) -> Result<()>,
 ) -> Result<&'static str> {
     exempt_resolvers(ebpf);
+    // The `udp_sendmsg` fallback's own signed record is `main.rs`'s
+    // (external audit EBPF-006, `!skb_active()`); the manifest names it.
     let sendmsg = |ebpf: &mut Ebpf| -> Result<&'static str> {
         attach_kprobe(ebpf, SENDMSG_PROGRAM, SENDMSG_PROGRAM)?;
+        crate::boot::manifest::note_sensor("dns", "kprobe:udp_sendmsg (user memory, IPv4 only)");
         Ok(SENDMSG_PROGRAM)
     };
     if !SKB_WANTED.load(Ordering::Relaxed) {
@@ -120,12 +127,18 @@ pub fn attach(
                 "DNS sensor armed on {SKB4_SYMBOL} + {SKB6_SYMBOL}: the kernel's copy of the \
                  query, IPv4 and IPv6 (Tappa 10.9 step 3)"
             );
+            crate::boot::manifest::note_sensor("dns", "kprobe:udp_send_skb+udp_v6_send_skb");
         }
-        Err(e) => warn!(
-            error = %verifier_tail(&e),
-            "DNS sensor armed on {SKB4_SYMBOL} only: {SKB6_SYMBOL} could not be attached — DNS \
-             queries to IPv6 resolvers are NOT observed"
-        ),
+        Err(e) => {
+            warn!(
+                error = %verifier_tail(&e),
+                "DNS sensor armed on {SKB4_SYMBOL} only: {SKB6_SYMBOL} could not be attached — DNS \
+                 queries to IPv6 resolvers are NOT observed"
+            );
+            crate::boot::manifest::note_sensor("dns", "kprobe:udp_send_skb (IPv4 only)");
+            // Lab PR 218 (external audit App.D C-13): signed, not only a WARN.
+            crate::boot::degradation::report("dns_sensor", IPV6_NOT_OBSERVED);
+        }
     }
     Ok(SKB4_PROGRAM)
 }

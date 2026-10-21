@@ -401,7 +401,11 @@ pub async fn drain_loop(
     udp_rb: RingBuf<MapData>,
     flow_tracker: Arc<Mutex<FlowTracker>>,
     dns_cache: Arc<DnsCache>,
-    netflow_db: Arc<Mutex<NetFlowDb>>,
+    // Lab PR 218 (external review P0 C-14): `None` when the netflow log
+    // cannot be opened — the drain runs all the same, the flows reach the
+    // rules unpersisted (the drain used to stay off for the whole boot:
+    // TCP, UDP and listeners blind).
+    netflow_db: Option<Arc<Mutex<NetFlowDb>>>,
     // External audit NET-003: `None` when the listener log cannot be
     // opened — listener events still reach the rules, unpersisted.
     listener_db: Option<Arc<Mutex<NetListenerDb>>>,
@@ -422,7 +426,7 @@ pub async fn drain_loop(
     loop {
         tokio::select! {
             _ = commit_tick.tick() => {
-                group_commit(&netflow_db, listener_db.as_ref());
+                group_commit(netflow_db.as_ref(), listener_db.as_ref());
             }
             r = udp_fd.readable_mut() => {
                 let mut guard = r?;
@@ -434,13 +438,13 @@ pub async fn drain_loop(
                         item.as_ref(),
                         &flow_tracker,
                         &dns_cache,
-                        &netflow_db,
+                        netflow_db.as_ref(),
                         &lineage,
                         &mut gate,
                         &event_tx,
                     )
                     .await;
-                    group_commit(&netflow_db, listener_db.as_ref());
+                    group_commit(netflow_db.as_ref(), listener_db.as_ref());
                 }
                 guard.clear_ready();
                 if drained == 0 {
@@ -457,13 +461,13 @@ pub async fn drain_loop(
                         item.as_ref(),
                         &flow_tracker,
                         &dns_cache,
-                        &netflow_db,
+                        netflow_db.as_ref(),
                         &lineage,
                         &mut gate,
                         &event_tx,
                     )
                     .await;
-                    group_commit(&netflow_db, listener_db.as_ref());
+                    group_commit(netflow_db.as_ref(), listener_db.as_ref());
                 }
                 guard.clear_ready();
                 if drained == 0 {
@@ -477,7 +481,7 @@ pub async fn drain_loop(
                 while let Some(item) = inner.next() {
                     drained += 1;
                     process_listen_record(item.as_ref(), listener_db.as_ref(), &event_tx).await;
-                    group_commit(&netflow_db, listener_db.as_ref());
+                    group_commit(netflow_db.as_ref(), listener_db.as_ref());
                 }
                 guard.clear_ready();
                 if drained == 0 {
@@ -492,10 +496,15 @@ pub async fn drain_loop(
 /// listener rows, written since their last commit, at most every
 /// [`NETFLOW_SYNC_INTERVAL`]. Called after each record and on a timer, so
 /// no row waits longer than the interval (plus one record's processing).
-fn group_commit(netflow_db: &Mutex<NetFlowDb>, listener_db: Option<&Arc<Mutex<NetListenerDb>>>) {
+fn group_commit(
+    netflow_db: Option<&Arc<Mutex<NetFlowDb>>>,
+    listener_db: Option<&Arc<Mutex<NetListenerDb>>>,
+) {
     let now = Instant::now();
-    if let Err(e) = netflow_db.lock().sync_if_due(now) {
-        warn!(error = %format!("{e:#}"), "netflow log: group commit (fsync) failed; retried");
+    if let Some(db) = netflow_db {
+        if let Err(e) = db.lock().sync_if_due(now) {
+            warn!(error = %format!("{e:#}"), "netflow log: group commit (fsync) failed; retried");
+        }
     }
     if let Some(db) = listener_db {
         if let Err(e) = db.lock().sync_if_due(now) {
@@ -518,7 +527,7 @@ async fn process_close_record(
     bytes: &[u8],
     flow_tracker: &Arc<Mutex<FlowTracker>>,
     dns_cache: &Arc<DnsCache>,
-    netflow_db: &Arc<Mutex<NetFlowDb>>,
+    netflow_db: Option<&Arc<Mutex<NetFlowDb>>>,
     lineage: &crate::posture::lineage::AuthSessionTracker,
     gate: &mut RuleGate,
     event_tx: &mpsc::Sender<Event>,
@@ -674,8 +683,12 @@ async fn process_close_record(
     // record; the rule engine emission is the live-defense path).
     // Append failures are warn-logged + we still emit on the bus
     // so the deterministic rule never silently misses a flow.
-    if let Err(e) = netflow_db.lock().append(&event, skipped) {
-        warn!(error = %e, "appending NetFlowEntry to netflow log failed");
+    // Lab PR 218: without the log (it could not be opened at boot, a
+    // signed `subsystem_degraded` says so) the row goes to the rules only.
+    if let Some(db) = netflow_db {
+        if let Err(e) = db.lock().append(&event, skipped) {
+            warn!(error = %e, "appending NetFlowEntry to netflow log failed");
+        }
     }
     if skipped {
         return;
@@ -1302,10 +1315,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         for corr in 1..=5u8 {
             let raw = close_raw(1000, 4242, [100, 64, 0, 1], 8080, corr);
-            process_close_record(&raw, &tracker, &dns, &db, &lineage, &mut gate, &tx).await;
+            process_close_record(&raw, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
         }
         let raw = close_raw(1000, 4242, [192, 0, 2, 10], 8080, 6);
-        process_close_record(&raw, &tracker, &dns, &db, &lineage, &mut gate, &tx).await;
+        process_close_record(&raw, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
         drop(tx);
         let mut sent = Vec::new();
         while let Some(Event::NetFlow(nf)) = rx.recv().await {
@@ -1405,7 +1418,7 @@ mod tests {
             .finish();
         {
             let _guard = tracing::subscriber::set_default(sub);
-            process_close_record(&bytes, &tracker, &dns, &db, &lineage, &mut gate, &tx).await;
+            process_close_record(&bytes, &tracker, &dns, Some(&db), &lineage, &mut gate, &tx).await;
         }
         let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         let warn: Vec<&str> = text
@@ -1527,7 +1540,7 @@ mod tests {
     struct Harness {
         dir: tempfile::TempDir,
         _proc: tempfile::TempDir,
-        db: Arc<Mutex<NetFlowDb>>,
+        db: Option<Arc<Mutex<NetFlowDb>>>,
         tracker: Arc<Mutex<FlowTracker>>,
         dns: Arc<DnsCache>,
         lineage: crate::posture::lineage::AuthSessionTracker,
@@ -1553,7 +1566,7 @@ mod tests {
         Harness {
             dir,
             _proc: proc_root,
-            db,
+            db: Some(db),
             tracker: Arc::new(Mutex::new(FlowTracker::default())),
             dns: Arc::new(DnsCache::default()),
             lineage,
@@ -1571,7 +1584,7 @@ mod tests {
                 bytemuck::bytes_of(raw),
                 &self.tracker,
                 &self.dns,
-                &self.db,
+                self.db.as_ref(),
                 &self.lineage,
                 &mut self.gate,
                 tx,
@@ -1693,5 +1706,50 @@ mod tests {
         assert!(after.quic > before.quic, "{before:?} {after:?}");
         let rows = std::fs::read_to_string(h.dir.path().join("netflow.jsonl")).unwrap();
         assert_eq!(rows.lines().count(), 2, "both rows recorded");
+    }
+
+    /// Lab PR 218 (external review P0 C-14): without the netflow log the
+    /// drain still hands every flow and listener to the rules — the TCP
+    /// close, the UDP send, the listener — and writes nothing.
+    #[tokio::test]
+    async fn flows_reach_the_rules_without_the_netflow_log() {
+        let mut h = harness();
+        h.db = None;
+        let (tx, mut rx) = mpsc::channel(16);
+        let tcp: NetFlowCloseRaw =
+            bytemuck::pod_read_unaligned(&close_raw(1000, 4244, [100, 64, 0, 2], 8443, 12));
+        h.close(&tcp, &tx).await;
+        let mut udp = tcp;
+        udp.proto = IPPROTO_UDP;
+        udp.flow_id = [0u8; 16];
+        udp.dst_port = 5353;
+        h.close(&udp, &tx).await;
+        let mut listen = NetListenRaw::zeroed();
+        listen.timestamp_ns = 7_000_000_000;
+        listen.pid = 4244;
+        listen.family = 2;
+        listen.proto = IPPROTO_TCP;
+        listen.bind_port = 9001;
+        process_listen_record(bytemuck::bytes_of(&listen), None, &tx).await;
+        group_commit(None, None);
+        drop(tx);
+        let mut seen = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                Event::NetFlow(nf) => seen.push(("flow", nf.proto, nf.dst_port)),
+                Event::NetListener(l) => seen.push(("listener", l.proto, l.bind_port)),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                ("flow", IPPROTO_TCP, 8443),
+                ("flow", IPPROTO_UDP, 5353),
+                ("listener", IPPROTO_TCP, 9001),
+            ]
+        );
+        let rows = std::fs::read_to_string(h.dir.path().join("netflow.jsonl")).unwrap_or_default();
+        assert_eq!(rows.lines().count(), 0, "nothing written");
     }
 }

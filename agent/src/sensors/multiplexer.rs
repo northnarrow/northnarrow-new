@@ -99,7 +99,10 @@ impl SensorMultiplexer {
     /// will already be flowing into the channel by the time it
     /// returns. Net observation programs (Tappa 10 N2) are NOT
     /// attached — use [`Self::start_with_net`] for those.
-    pub async fn start() -> Result<Self> {
+    ///
+    /// Lab PR 218: `_permit` is the proof that every preflight check ran
+    /// ([`crate::boot::BootSequence::enter_attach`]).
+    pub async fn start(_permit: &crate::boot::AttachPermit) -> Result<Self> {
         let (mux, _) = Self::do_start(None).await?;
         Ok(mux)
     }
@@ -108,7 +111,14 @@ impl SensorMultiplexer {
     /// N2 network programs. Returns the multiplexer alongside the
     /// two new ringbufs the caller should hand to
     /// [`crate::net::drain::drain_loop`].
-    pub async fn start_with_net(net: NetWiring) -> Result<(Self, NetRingBufs)> {
+    ///
+    /// Lab PR 218: `_permit` is the proof that every preflight check ran
+    /// (capabilities, install manifest, audit log, BPF LSM —
+    /// [`crate::boot::BootSequence::enter_attach`]).
+    pub async fn start_with_net(
+        net: NetWiring,
+        _permit: &crate::boot::AttachPermit,
+    ) -> Result<(Self, NetRingBufs)> {
         let (mux, bufs) = Self::do_start(Some(net)).await?;
         let bufs =
             bufs.ok_or_else(|| anyhow!("start_with_net must yield NetRingBufs (invariant)"))?;
@@ -209,6 +219,7 @@ impl SensorMultiplexer {
             "sched",
             "sched_process_exec",
         )?;
+        crate::boot::manifest::note_sensor("process_spawn", "tracepoint:sched/sched_process_exec");
         attach_tracepoint(
             &mut ebpf,
             "sys_enter_openat",
@@ -220,6 +231,10 @@ impl SensorMultiplexer {
         if crate::sensors::open_sensor::tracepoint_wanted() {
             crate::sensors::open_sensor::set_tracepoint_emitting(&mut ebpf, true)?;
         }
+        crate::boot::manifest::note_sensor(
+            "file_open",
+            "tracepoint:syscalls/sys_enter_openat (user memory)",
+        );
         // Tappa 10.9 step 2: the exec sensor on LSM `bprm_check_security`
         // (`--exec-sensor`), or `sys_enter_execve` when the LSM program
         // is not wanted, lacks an offset or is refused. Attached here, so
@@ -238,16 +253,46 @@ impl SensorMultiplexer {
                 "io_uring",
                 &["io_uring_submit_req", "io_uring_submit_sqe"],
             ) {
-                Ok(name) => info!(submit_event = name, "io_uring sensor attached (create + submit tracepoints)"),
-                Err(e) => warn!(error = format!("{e:#}"), "io_uring submit tracepoint not attached — ring creations are still observed"),
+                Ok(name) => {
+                    info!(
+                        submit_event = name,
+                        "io_uring sensor attached (create + submit tracepoints)"
+                    );
+                    crate::boot::manifest::note_sensor(
+                        "io_uring",
+                        &format!("tracepoint:io_uring/io_uring_create+{name}"),
+                    );
+                }
+                Err(e) => {
+                    warn!(error = format!("{e:#}"), "io_uring submit tracepoint not attached — ring creations are still observed");
+                    crate::boot::manifest::note_sensor(
+                        "io_uring",
+                        "tracepoint:io_uring/io_uring_create only",
+                    );
+                    // Lab PR 218 (P0 C-13): a fallback is signed, not only a WARN.
+                    crate::boot::degradation::report(
+                        "io_uring_sensor",
+                        "the io_uring submit tracepoint is not attached: ring creations are observed, \
+                         the operations submitted through them are not",
+                    );
+                }
             },
-            Err(e) => warn!(
-                error = format!("{e:#}"),
-                "io_uring tracepoints not available (CONFIG_IO_URING off?) — the asynchronous I/O channel is NOT observed on this kernel"
-            ),
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    "io_uring tracepoints not available (CONFIG_IO_URING off?) — the asynchronous I/O channel is NOT observed on this kernel"
+                );
+                crate::boot::manifest::note_sensor("io_uring", "not attached");
+                crate::boot::degradation::report(
+                    "io_uring_sensor",
+                    "no io_uring tracepoint on this kernel: the asynchronous I/O channel is not \
+                     observed",
+                );
+            }
         }
         attach_kprobe(&mut ebpf, "tcp_v4_connect", "tcp_v4_connect")?;
         attach_kprobe(&mut ebpf, "tcp_v6_connect", "tcp_v6_connect")?;
+        crate::boot::manifest::note_sensor("tcp_connect", "kprobe:tcp_v4_connect+tcp_v6_connect");
         // Tappa 10.9 step 3: the socket-buffer DNS sensor, or `udp_sendmsg`.
         crate::sensors::dns_sensor::attach(&mut ebpf, attach_kprobe)?;
 
@@ -268,12 +313,24 @@ impl SensorMultiplexer {
             attach_kprobe(&mut ebpf, "udp_sendmsg_outbound", "udp_sendmsg")?;
             // Review 68: datagrams to IPv6 destinations. Soft: a kernel
             // without IPv6 has nothing to observe there.
-            if let Err(e) = attach_kprobe(&mut ebpf, "udpv6_sendmsg_outbound", "udpv6_sendmsg") {
-                warn!(
-                    error = format!("{e:#}"),
-                    "net: udpv6_sendmsg not attached — UDP flows to IPv6 destinations are NOT observed"
-                );
-            }
+            let udp6 = match attach_kprobe(&mut ebpf, "udpv6_sendmsg_outbound", "udpv6_sendmsg") {
+                Ok(()) => "+udpv6_sendmsg",
+                Err(e) => {
+                    warn!(
+                        error = format!("{e:#}"),
+                        "net: udpv6_sendmsg not attached — UDP flows to IPv6 destinations are NOT observed"
+                    );
+                    crate::boot::degradation::report(
+                        "net_sensor",
+                        "udpv6_sendmsg not attached: UDP flows to IPv6 destinations are not observed",
+                    );
+                    ""
+                }
+            };
+            crate::boot::manifest::note_sensor(
+                "net_flows",
+                &format!("kprobe:inet_csk_listen_start, fexit:tcp_close, kprobe:udp_sendmsg{udp6}"),
+            );
             let close_rb = take_ringbuf(&mut ebpf, "NET_FLOW_CLOSE_EVENTS")?;
             let listen_rb = take_ringbuf(&mut ebpf, "NET_LISTEN_EVENTS")?;
             let udp_rb = take_ringbuf(&mut ebpf, "NET_UDP_EVENTS")?;
@@ -421,8 +478,11 @@ impl SensorMultiplexer {
     /// `pids` is a slice (not a single PID) so the watchdog can be
     /// registered alongside the agent in the same call once Tappa 7
     /// task 6 commits #3-4 land.
+    ///
+    /// Lab PR 218: `_permit` as for [`Self::start_with_net`].
     pub fn attach_anti_tamper(
         &mut self,
+        _permit: &crate::boot::AttachPermit,
         pids: &[u32],
         keep: &[crate::anti_tamper::ExeIdentity],
     ) -> Result<()> {
