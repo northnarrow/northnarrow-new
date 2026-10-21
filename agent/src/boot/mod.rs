@@ -300,6 +300,27 @@ impl BootSequence {
     }
 }
 
+/// Lab PR 231: give the kernel back the heap the boot freed, once, after
+/// READY. The attach parses the vmlinux BTF several times (aya's loader, the
+/// LSM, fentry and FIM attaches), each a transient of about 15 MB; from aya
+/// 0.14 (aya-obj 0.3, whose `BtfType` grew from 48 to 72 bytes) glibc keeps
+/// those pages after the free, and the idle agent's RSS rose by about 17 MB
+/// (perf gate: `agent_rss_idle_kib` +47 %, `agent_rss_load_kib` +38 %
+/// against the same guest's `main`). `malloc_trim(0)` releases only free
+/// memory. Returns whether glibc released any; `false` off glibc.
+pub fn release_boot_heap() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: malloc_trim takes glibc's own arena locks and touches only
+        // free chunks; no Rust allocation or invariant is involved.
+        unsafe { libc::malloc_trim(0) == 1 }
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +466,33 @@ mod tests {
         assert!(manifest > at("boot.enter(BootPhase::Run)"));
         assert!(manifest < at("sd_notify::ready()"));
         assert!(at("boot.done(BootStep::CapabilityManifest)") > manifest);
+    }
+
+    /// Lab PR 231: the boot's heap is released once, after READY — after
+    /// every attach (the BTF parses whose pages glibc kept) and only once.
+    #[test]
+    fn main_releases_the_boot_heap_after_ready() {
+        let main = include_str!("../main.rs");
+        let release = main
+            .find("boot::release_boot_heap()")
+            .expect("main.rs releases the boot heap");
+        assert_eq!(main.matches("boot::release_boot_heap()").count(), 1);
+        assert!(release > main.find("sd_notify::ready()").expect("READY"));
+        assert!(release > main.find("boot::manifest::sign(").expect("manifest"));
+    }
+
+    /// Lab PR 231: only free memory goes back: what is still allocated is
+    /// intact after the release.
+    #[test]
+    fn releasing_the_boot_heap_keeps_live_allocations() {
+        let live: Vec<u64> = (0..200_000).collect();
+        let freed: Vec<Vec<u8>> = (0..64).map(|i| vec![i as u8; 64 * 1024]).collect();
+        drop(freed);
+        let released = release_boot_heap();
+        if cfg!(not(all(target_os = "linux", target_env = "gnu"))) {
+            assert!(!released);
+        }
+        assert!(live.iter().enumerate().all(|(i, v)| *v == i as u64));
     }
 
     /// External review P0 C-14: the network drain is spawned whatever the

@@ -71,7 +71,7 @@ use tracing::{error, info, warn};
 /// Name of the pinned `PROTECTED_PIDS` map (mirrors the
 /// `#[map]` declaration in `agent-ebpf/src/task_kill.rs`). The
 /// agent's eBPF object pins this map under [`DEFAULT_BPFFS_ROOT`]
-/// via `EbpfLoader::map_pin_path`, and the watchdog opens it by
+/// via `EbpfLoader::default_map_pin_directory`, and the watchdog opens it by
 /// joining this name onto the bpffs root.
 pub const PROTECTED_PIDS_MAP_NAME: &str = "PROTECTED_PIDS";
 
@@ -115,7 +115,7 @@ pub const PROTECTED_OBSERVERS_MAP_NAME: &str = "PROTECTED_OBSERVERS";
 /// six anti-tamper maps + the seven LSM programs + links here. One
 /// self-contained namespace lets the watchdog and `nn-admin`
 /// enumerate the pinned set by listing it, and keeps
-/// `EbpfLoader::map_pin_path` (maps) and `FdLink::pin` (links)
+/// `EbpfLoader::default_map_pin_directory` (maps) and `FdLink::pin` (links)
 /// sharing one root.
 pub const DEFAULT_BPFFS_ROOT: &str = "/sys/fs/bpf/northnarrow";
 
@@ -133,7 +133,7 @@ const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
 const PIN_ROOT_MODE: u32 = 0o700;
 
 /// Prepare the bpffs pin directory and return the path to hand to
-/// [`aya::EbpfLoader::map_pin_path`]. Returns `None` when bpffs is
+/// [`aya::EbpfLoader::default_map_pin_directory`]. Returns `None` when bpffs is
 /// unavailable: the caller then loads the eBPF object WITHOUT
 /// pinning so the sensor half of the agent still runs (anti-tamper
 /// cross-restart persistence is forfeited until the host gains a
@@ -556,7 +556,7 @@ where
         match self.map.remove(&pid) {
             Ok(()) => Ok(()),
             Err(e) => {
-                // aya 0.13 surfaces "key not found" via a
+                // aya (0.13 and 0.14) surfaces "key not found" via a
                 // SyscallError carrying io_error == NotFound.
                 // Treat that as idempotent success.
                 if is_not_found_err(&e) {
@@ -722,7 +722,7 @@ where
 }
 
 /// Helper: does this aya `MapError` represent "key not found"?
-/// aya 0.13 surfaces `ENOENT` from the kernel BPF syscalls
+/// aya (0.13 and 0.14) surfaces `ENOENT` from the kernel BPF syscalls
 /// through `MapError::SyscallError { io_error, .. }` where
 /// `io_error.kind() == NotFound`. Centralised here so both
 /// `evict` and `contains` share one check and a future aya

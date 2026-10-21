@@ -13,7 +13,7 @@
 //!
 //! ## Why we parse BTF ourselves
 //!
-//! aya 0.13 / aya-obj 0.2 expose no public way to read a struct
+//! aya 0.14 / aya-obj 0.3 (as 0.13 / 0.2) expose no public way to read a struct
 //! member's offset: there is no `type_by_id`, and `Struct.members` /
 //! `member_bit_offset` are `pub(crate)`. `id_by_type_name_kind` proves
 //! a type *exists* but reveals nothing about its layout. The BTF binary

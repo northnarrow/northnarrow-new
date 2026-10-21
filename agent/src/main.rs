@@ -4878,6 +4878,10 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     if let Err(e) = northnarrow_agent::sd_notify::ready() {
         warn!(error = %e, "sd_notify(READY=1) failed; systemd may report the unit as not-ready");
     }
+    // Lab PR 231: the boot's transient heap (the vmlinux BTF parses of the
+    // attach) back to the kernel; under aya 0.14 glibc kept it.
+    let released = northnarrow_agent::boot::release_boot_heap();
+    debug!(released, "boot heap released after READY (malloc_trim)");
 
     // Why the event loop ended — written as the signed `agent_stop` entry
     // below; a run that never writes it is reported by the next boot.

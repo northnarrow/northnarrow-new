@@ -292,7 +292,7 @@ fn execute(rep: &mut Report, work: &Path) -> Result<()> {
     fs::create_dir_all(PIN_DIR).with_context(|| format!("creating {PIN_DIR}"))?;
     let mut ebpf = EbpfLoader::new()
         .btf(None)
-        .map_pin_path(PIN_DIR)
+        .default_map_pin_directory(PIN_DIR)
         .load(EBPF_BYTES)
         .context("loading the eBPF object (is the installed agent still running? stop it first)")?;
     btf_revalidate::arm_btf_offsets(&mut ebpf).context("arming BTF_OFFSETS")?;

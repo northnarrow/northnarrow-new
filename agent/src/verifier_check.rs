@@ -371,15 +371,15 @@ fn load_object(bytes: &[u8], level: VerifierLogLevel) -> Result<Ebpf> {
     fs::create_dir_all(PIN_DIR).with_context(|| format!("creating {PIN_DIR}"))?;
     let mut loader = EbpfLoader::new();
     loader.btf(None);
-    loader.set_max_entries(
+    loader.map_max_entries(
         crate::sensors::epg::STRICT_TASKS_MAP,
         crate::sensors::epg::task_map_entries_for_load(),
     );
-    loader.set_max_entries(
+    loader.map_max_entries(
         crate::sensors::epg::LITE_TASKS_MAP,
         crate::sensors::epg::lite_task_map_entries_for_load(),
     );
-    loader.map_pin_path(PIN_DIR);
+    loader.default_map_pin_directory(PIN_DIR);
     loader.verifier_log_level(level);
     let mut ebpf = loader
         .load(bytes)

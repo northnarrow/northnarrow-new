@@ -241,7 +241,8 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
 
     // PHASE_D_001: pin PROTECTED_PIDS by name to bpffs. The eBPF
     // source declares `HashMap::pinned(16, 0)` and the loader
-    // calls `map_pin_path(root)`, which is documented to handle
+    // calls `default_map_pin_directory(root)` (aya 0.13's
+    // `map_pin_path(root)`), which is documented to handle
     // by-name pinning automatically — empirically on aya 0.13.1 +
     // kernel 6.8 it does not, leaving the watchdog's
     // `ProtectedPidsHandle::open(bpffs_root)` unable to find the
@@ -372,7 +373,7 @@ pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()>
     };
 
     // Commit #2b: the bpffs root that holds the prog/link pins. Same
-    // root the multiplexer handed to `map_pin_path`; `prepare_pin_root`
+    // root the multiplexer handed to `default_map_pin_directory`; `prepare_pin_root`
     // is idempotent (dir already created) and silent on the happy
     // path, so re-deriving it here keeps the change inside
     // `anti_tamper/` without threading a new param through the

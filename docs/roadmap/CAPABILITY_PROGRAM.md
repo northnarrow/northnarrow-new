@@ -734,3 +734,27 @@ only in the table below, in the same PR as the evidence.
   `(3, 3)`). Open: in a shared directory the burst's own directory's
   copies count whoever owns them (an owner match is a follow-up).
   - Lab: host tests only. Before: the unchanged `sample_copies_reads_the_copies_not_the_originals` failed `(4, 4)` on every run with one decoy `.locked` copy planted beside its `TempDir` (TMPDIR set to a private directory) and passed without it; the impact tests alone in that directory failed 36 of 200 runs; the two new tests failed on the old walk (the script's job decisive, three shapes, "3 of 4 copies under .part"). After: `cargo test -p northnarrow-agent --lib impact` 20 times in a row, 20 green (27 tests); 200 runs in the private non-sticky directory (the sandbox alone) and 200 in `/tmp`, 0 failures; golden replay byte-identical, no golden file changed (its sampler answers by path, the walk is not on its path); fmt and the four clippy runs clean; host 2,898 passed, 0 failed (on `main` 381fac6).
+- **Lab PR 231 — aya 0.14 in userland (D1a of the Wave 4 phase 2
+  dependency plan; every capability, no level changes).** aya 0.13.1 →
+  0.14.0 and aya-obj 0.2.1 → 0.3.0 (the agent's dev pin `=0.3.0`, xtask
+  `0.3`), one copy of each in `Cargo.lock` and `fuzz/Cargo.lock`
+  (supersedes Dependabot #363, which left aya-log at 0.2, so two aya in
+  the graph, and did not update `fuzz/Cargo.lock`). aya-log removed: the
+  object exports no `AYA_LOGS` map and its init only ever failed. The
+  loader keeps its meaning under 0.14's names: `map_max_entries` (the
+  exploit guard's task maps) and `default_map_pin_directory` (by-name pins
+  under `/sys/fs/bpf/northnarrow`, an existing pin reused); `map_data` in
+  the BPF guard covers the nine new `Map` variants (`Map` is not
+  `#[non_exhaustive]`: the next new variant fails the build there); the map
+  types the object is held to (`ebpf_object::tests`) are re-read from
+  0.14's `parse_map`, 29 instead of 20, task storage still not one of them
+  (that stays the separate EPG task-storage lot). The kernel side, aya-ebpf
+  0.1.1, is lot D1b: the object is the same bytes as on `main`, so a
+  verifier or load difference could only come from the loader — aya-obj
+  0.3 now hands the kernel the full `line_info` of programs with
+  subprograms (0.2.1 truncated it to the `func_info` count), the risk this
+  lot's lab run was for. One fix rides along: `boot::release_boot_heap()`,
+  a `malloc_trim(0)` once after READY (glibc only), because with aya-obj
+  0.3 glibc kept the freed pages of the boot's vmlinux BTF parses and the
+  perf gate failed on the agent's RSS (Lab, below).
+  - Lab: QEMU for Windows guests with WHPX, the tree 3326d4f (on `main` 381fac6). The eBPF object is the same bytes as `main`'s: sha256 243a806b… from clean builds at the same path on the host (`main` 1f6bc4f and this tree), and the same object embedded on every guest. `verifier-check` of `main` (1f6bc4f; 381fac6 on 24.04) and of this tree, every row equal (result, instructions, instructions verified, stack): Ubuntu 22.04 (5.15.0-198) 74 OK and 2 ABSENT (`inode_set_acl`, `inode_remove_acl`: optional hooks this kernel lacks), no verified count in 5.15's log; Debian 12 (6.1.0-54) 74 OK and the same 2 ABSENT, 1,344,125 instructions verified in both; Ubuntu 24.04 (6.8.0-147) 76 OK, 898,196; Debian 13 (6.12.113) 76 OK, 914,070. The full `line_info` aya-obj 0.3 hands the kernel changed no load and no count. The agent of this tree installed on the four: L3, no degradation, deny hooks 17 of 17 (5.15, 6.1) and 19 of 19 (6.8, 6.12), 8 sensors. On 24.04: `upgrade-check` from `main` installed and running OK (deny 19 of 19, 36 own LSM programs before and after, identity kept, no rollback; `install.sh --upgrade` drops the pin root, so the 12 pinned maps are created again rather than taken over from the 0.13 agent); `test-ignored` 56 suites, 80 passed, 0 failed (the map-pin restart test included). Perf (`nn-lab.sh perf --fresh`): the bump alone regressed the agent's RSS — against `main` measured on the same guest the same night, idle 35,328 → 52,104 KiB (+47.5 %) and under load 46,000 → 63,320 KiB (+37.7 %), both REGRESSION, every other metric ok; a build that logged a `malloc_trim(0)` after READY saw the anonymous memory go from 28,340 to 3,720 KiB: pages glibc kept after the boot's vmlinux BTF parses (about 8 per boot, a 15 MB transient each with aya-obj 0.3, whose `BtfType` grew from 48 to 72 bytes), not a leak — in isolation aya 0.14's loader and its `Ebpf` hold what 0.13's do (10.8 MB after `load()`, 7 MB after a trim, both versions). With `boot::release_boot_heap()` against the committed baseline `perf-2026-10-21-ubuntu2404-40fd666`: 0 regressions (RSS idle 33,876 KiB −1.4 %, load 46,976 KiB +6.7 %, READY 4,508 ms, no ring drop or tracker loss); `perf-compare` needs `--allow-host-mismatch`: the guest's MemTotal reads 8,131,768 KiB, 8,131,764 at the baseline. Host: `cargo xtask build-ebpf --release`, the four clippy runs with `-D warnings`, `cargo fmt --check`, `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` (51 suites, 2,898 passed on 3326d4f, 2,900 after the rebase onto lab PR 232, 0 failed; the golden replay unchanged), `cargo xtask attack-coverage --check`, `cargo +1.89.0 check --workspace --all-targets --locked`, the fuzz job's build (nightly-2025-12-01, cargo-fuzz 0.13.2) and the replay of the 12 targets' seeds and regressions: all pass.
