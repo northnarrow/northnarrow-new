@@ -477,9 +477,22 @@ fn the_units_pass_systemd_analyze_verify() {
         .expect("systemd-analyze runs");
     let text =
         String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    // The host's vendor units are copied as they are: a unit that is an
+    // absolute symlink into a tree outside it (dracut's on hosts that build
+    // the initramfs with dracut, systemd 259 on the CI runner) dangles under
+    // --root. That is the copy, not one of ours.
+    let dangling = format!(
+        ": Failed to open {}/usr/lib/systemd/system/",
+        root.path().display()
+    );
     let complaints: Vec<&str> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
+        .filter(|l| {
+            !(l.contains(&dangling)
+                && l.ends_with("No such file or directory")
+                && !l.starts_with("northnarrow"))
+        })
         .filter(|l| {
             !(major < 254
                 && (l.contains("Unknown key name 'RestartSteps'")
