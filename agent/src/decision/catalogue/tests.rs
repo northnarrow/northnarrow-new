@@ -94,7 +94,7 @@ fn every_shipped_rule_declares_a_valid_attack_mapping() {
     let rules = render::shipped_rules();
     assert_eq!(
         rules.len(),
-        82 + 1,
+        88 + 1,
         "the rules v2-rules.tsv counts, and NN-L-EXECQ-001 (lab PR 223, not in it)"
     );
     let bad: Vec<String> = rules

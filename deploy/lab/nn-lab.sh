@@ -52,6 +52,7 @@
 #   deploy/lab/nn-lab.sh execq-check     # lab PR 223 (EXPERIMENTAL): exec quarantine at first sight, six cases, guest put back
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
+#   deploy/lab/nn-lab.sh ransom-check [--only MS23|MS25] # lab PR 225: MS-23 ransomware recorded (kill held, ENGAGED), negatives; MS-25 security tools
 #   deploy/lab/nn-lab.sh fim-reuse-check  # review 57: a deleted watched file's reused inode is not attributed to it
 #   deploy/lab/nn-lab.sh install       # deploy/install.sh + start both units
 #   deploy/lab/nn-lab.sh respawn-check # agent death via systemd in a window, assert respawn v2 invariants
@@ -1311,6 +1312,21 @@ cmd_execq_check() {
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/execq/execq-check.sh'
 }
 
+cmd_ransom_check() {
+    # Lab PR 225 (deploy/lab/malsim/ransom-check.sh): MS-23 — the benign
+    # simulator (deploy/lab/malsim/ransom-sim.py, /srv/nn-malsim only) draws
+    # NN-L-IMP-001, its kill held behind the per-rule response policy (off
+    # by default), and the posture reaches ENGAGED; tar, rsync, git
+    # checkout and an apt install draw no NN-L-IMP-001. MS-25 — stopping,
+    # switching off, signalling or reconfiguring auditd and ufw leaves the
+    # NN-L-EVA records (auditd must be installed in the guest). Needs a sync
+    # + install.
+    vm_running || die "guest is not running"
+    local args
+    args=$(printf '%q ' "$@")
+    vssh "sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/ransom-check.sh $args"
+}
+
 cmd_dns_sensor_check() {
     # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
     # sensor reads the kernel's copy of the query. NET-004 kills a sender
@@ -2005,6 +2021,7 @@ case "${1:-help}" in
     execq-check) cmd_execq_check ;;
     net-check)     cmd_net_check ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
+    ransom-check)  shift; cmd_ransom_check "$@" ;;
     fim-reuse-check) cmd_fim_reuse_check ;;
     ssh)           shift; cmd_ssh "$@" ;;
     status)        cmd_status ;;

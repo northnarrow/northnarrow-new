@@ -1,4 +1,5 @@
-//! The canary, chain, io_uring, BPF, anti-tamper and exploit guard rules.
+//! The canary, chain, io_uring, BPF, anti-tamper, exploit guard and security-tool
+//! rules.
 
 use common::{ResponseAction, Severity};
 
@@ -459,5 +460,98 @@ pub(super) const DOCS: &[RuleDoc] = &[
         ],
         attack_note: "Escape to Host (T1611) by its result; a credential gain in the same \
                       call is NN-L-EPG-001's.",
+    },
+    // ── security tools switched off (lab PR 225, CM-18) ─────────────
+    RuleDoc {
+        id: "NN-L-EVA-001_SecurityServiceStopped",
+        severities: &[Severity::High, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032"],
+        observes: "A listed security tool's unit stopped, disabled, masked or killed \
+                   (`systemctl stop/disable/mask/kill`, `service … stop`, `invoke-rc.d`, \
+                   `update-rc.d`, `chkconfig`, `rc-service`, `rc-update`, `/etc/init.d/<name> \
+                   stop`); the tools are the shipped list `security-tools.v1`.",
+        false_positives: "Low in a package transaction, an administrator's interactive session \
+                          or under a configuration-management actor, and — for the agent's own \
+                          units only — a stop or restart inside a valid signed trusted-installer \
+                          window (the record's `sanction` names its key id and deadline; the \
+                          posture does not move). Another tool stopped inside the window, or the \
+                          agent's units outside it or after it expired, stay High. Asked by a \
+                          program run from a staging directory or a deleted executable, the kill \
+                          of that program's tree is held behind the per-rule response policy \
+                          (off by default, new in lab PR 225): a High record.",
+        how_to_test: "`ransom-check.sh` MS-25: `systemctl stop auditd` (auditd installed).",
+        tests: &[
+            "agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
+            "agent/src/decision/rules/evasion.rs::eva_kills_a_staged_script_that_asks",
+            "agent/src/decision/rules/evasion.rs::eva_001_inside_the_installer_window_is_low_for_the_agents_own_units_only",
+            "agent/src/impair/tests.rs::a_valid_window_sanctions_a_stop_or_restart_of_the_agents_own_units",
+            "agent/src/impair/tests.rs::an_expired_window_sanctions_nothing",
+            "agent/src/impair/tests.rs::a_valid_window_never_sanctions_another_tool",
+            "deploy/lab/malsim/ransom-check.sh::MS-25",
+        ],
+        attack_note: "T1685 for a tool, T1685.004 for the audit system, T1686 for the \
+                      firewall; the record's reasoning names the one of its tool.",
+    },
+    RuleDoc {
+        id: "NN-L-EVA-002_SecurityToolSwitchedOff",
+        severities: &[Severity::High, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032"],
+        observes: "A listed tool switched off by its own command: `auditctl -e 0` and `-D`, \
+                   `ufw disable`, `setenforce 0`, `nft flush ruleset`, `iptables -F`, \
+                   `aa-teardown`, cloud-agent uninstallers.",
+        false_positives: "As NN-L-EVA-001. One record per command and process tree (the \
+                          children of one parent) within 10 s: `ufw disable` runs dozens of \
+                          `iptables -F` through `ufw-init`; the repeats are counted \
+                          (`detections_held`, the next record's `suppressed_before`), never on \
+                          the kill path.",
+        how_to_test: "`ransom-check.sh` MS-25: `auditctl -e 0`, `ufw disable`.",
+        tests: &[
+            "agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
+            "agent/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable",
+            "agent/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget",
+            "deploy/lab/malsim/ransom-check.sh::MS-25",
+        ],
+        attack_note: "As NN-L-EVA-001.",
+    },
+    RuleDoc {
+        id: "NN-L-EVA-003_SecurityToolKilled",
+        severities: &[Severity::High, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::AntiTamper, Sensor::Exec],
+        data_components: &["DC0021", "DC0032"],
+        observes: "A stop or end signal to a listed tool's process: on `task_kill` \
+                   (`DEFENDER_PIDS`, filled at boot and from the tools' execs, and from \
+                   `/proc` scans after each for the daemon it forks; reported, never \
+                   refused — a shell's builtin `kill` included), or a `kill`, `pkill`, \
+                   `killall` exec.",
+        false_positives: "As NN-L-EVA-001; a service manager's own stop of a unit it restarts.",
+        how_to_test: "`ransom-check.sh` MS-25: `kill -STOP` of auditd from a shell.",
+        tests: &[
+            "agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
+            "agent/src/impair/tests.rs::a_forking_daemons_own_pid_is_registered_after_its_exec",
+            "deploy/lab/malsim/ransom-check.sh::kill -STOP of auditd",
+        ],
+        attack_note: "As NN-L-EVA-001.",
+    },
+    RuleDoc {
+        id: "NN-L-EVA-004_SecurityToolConfigChanged",
+        severities: &[Severity::High, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::File],
+        data_components: &["DC0061"],
+        observes: "A listed tool's configuration file changed (the files `security-tools.v1` \
+                   names, watched by FIM).",
+        false_positives: "As NN-L-EVA-001: a package upgrade or an administrator's edit is \
+                          Low.",
+        how_to_test: "`ransom-check.sh` MS-25: an edit of auditd's configuration.",
+        tests: &[
+            "agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
+            "deploy/lab/malsim/ransom-check.sh::MS-25",
+        ],
+        attack_note: "As NN-L-EVA-001.",
     },
 ];

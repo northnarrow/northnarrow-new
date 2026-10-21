@@ -61,7 +61,7 @@ pub const FAMILIES: [(&str, &[RuleDoc]); 4] = [
     ("File integrity and file access", fim::DOCS),
     ("Network", net::DOCS),
     (
-        "Canary, chain, io_uring, BPF, anti-tamper and exploit guard",
+        "Canary, chain, io_uring, BPF, anti-tamper, exploit guard and security tools",
         other::DOCS,
     ),
 ];

@@ -41,6 +41,8 @@ pub mod fs_type;
 #[doc(hidden)]
 pub mod fuzz_api;
 pub mod host_hardening;
+pub mod impact;
+pub mod impair;
 pub mod install_manifest;
 pub mod loop_progress;
 pub mod net;

@@ -28,7 +28,7 @@
 use aya_ebpf::{
     cty::c_void,
     helpers::{
-        bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
+        bpf_get_current_cgroup_id, bpf_get_current_pid_tgid,
         bpf_get_current_task, bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_kernel_buf, bpf_probe_read_kernel_str_bytes, gen,
     },
@@ -43,11 +43,12 @@ use northnarrow_common::wire::open_sensor::{
         FILE_CRITICAL, FILE_PERSIST, FILE_SENSITIVE, LEAF_CRED, LEAVES_CRED, SUBTREE,
         TREE_CARVEOUT, TREE_CRED, TREE_CRITICAL, TREE_HOME, TREE_PERSIST, TREE_RUNTIME,
     },
-    cgroup_step, kdbx_suffix, open_reason, write_step, ChildRuleKey, DirClass, OpenCgKey,
-    OpenCgWindow,
-    OpenRecordRaw, OpenWriteWindow, CHILD_RULES_MAX, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN,
-    OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED,
-    RUNTIME_UIDS_MAX,
+    cgroup_step, kdbx_suffix, name_ext, open_reason, rename_shape_with, rename_step, unlink_step,
+    write_step, ChildRuleKey, DirClass, NameParts, OpenCgKey, OpenCgWindow, OpenRecordRaw,
+    OpenWriteWindow, RenameNames, RenameWindow, UnlinkWindow, CHILD_RULES_MAX, NAME_HEAD_LEN,
+    NAME_TAIL_LEN, OPEN_CLASSIFY_DEPTH, OPEN_NAME_LEN, OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS,
+    OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED, RENAME_APPENDED, RENAME_OTHER,
+    RUNTIME_UIDS_MAX, UNLINK_MIN_BYTES,
 };
 use northnarrow_common::wire::{InodeKey, FIM_OP_OPENED};
 
@@ -55,7 +56,7 @@ use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_FLAGS_OFFSET,
     FILE_F_INODE_OFFSET, FILE_F_MODE_OFFSET, FILE_F_PATH_OFFSET, INODE_I_INO_OFFSET, INODE_I_MODE_OFFSET,
     INODE_I_SIZE_OFFSET,
-    INODE_I_SB_OFFSET, PATH_DENTRY_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
+    INODE_I_SB_OFFSET, PATH_DENTRY_OFFSET, QSTR_LEN_OFFSET, QSTR_NAME_OFFSET, SUPER_BLOCK_S_DEV_OFFSET,
     SUPER_BLOCK_S_MAGIC_OFFSET, TASK_STRUCT_LOGINUID_OFFSET,
 };
 use crate::read_repeat::ReadSeenKey;
@@ -152,6 +153,22 @@ static OPEN_WIN: PerCpuArray<[u8; FILE_WIN + INODE_WIN]> = PerCpuArray::with_max
 /// Interesting opens only: a few per second on a busy host.
 #[map]
 pub static OPEN_SENSOR_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+/// Lab PR 225: per-tgid windows of renames to one new extension.
+#[map]
+static OPEN_RENAMES: LruHashMap<u32, RenameWindow> = LruHashMap::with_max_entries(4096, 0);
+/// Lab PR 225: per-tgid unlink windows.
+#[map]
+static OPEN_UNLINKS: LruHashMap<u32, UnlinkWindow> = LruHashMap::with_max_entries(4096, 0);
+/// Lab PR 225: both names of a rename, never on the stack.
+#[map]
+static RENAME_SCRATCH: PerCpuArray<RenameNames> = PerCpuArray::with_max_entries(1, 0);
+/// Lab PR 225: the two names' extensions ([`name_ext`]), slots
+/// [`EXT_NEW`] and [`EXT_OLD`]: `[hash, length]` each, written by
+/// [`nn_rename_ext`], read by [`nn_rename_shape`] and the window.
+#[map]
+static RENAME_EXT: PerCpuArray<[u64; 4]> = PerCpuArray::with_max_entries(1, 0);
+const EXT_NEW: usize = 0;
+const EXT_OLD: usize = 2;
 
 #[inline(always)]
 pub fn armed() -> bool {
@@ -809,9 +826,7 @@ unsafe fn emit_record(reason: u32, key: &InodeKey, dentry: *const u8, flags: u32
     let uid_gid = bpf_get_current_uid_gid();
     (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
     (*raw).gid = (uid_gid >> 32) as u32;
-    if let Ok(comm) = bpf_get_current_comm() {
-        (*raw).comm = comm;
-    }
+    crate::comm::comm_into(&mut (*raw).comm);
     (*raw).dev = key.dev;
     (*raw).ino = key.ino;
     (*raw).flags = flags;
@@ -900,6 +915,242 @@ unsafe fn try_open_sensor_rmdir(ctx: &LsmContext) -> i32 {
     0
 }
 
+/// Lab PR 225: the name of `dentry` into `p` — its first
+/// [`NAME_HEAD_LEN`] − 1 bytes, NUL-padded, its last [`NAME_TAIL_LEN`] and
+/// its length. An unreadable name stays empty (length 0), which no rename
+/// shape counts.
+#[inline(always)]
+unsafe fn read_parts(dentry: *const u8, p: *mut NameParts) {
+    let head = core::ptr::addr_of_mut!((*p).head) as *mut u8;
+    let tail = core::ptr::addr_of_mut!((*p).tail) as *mut u8;
+    let mut i = 0;
+    while i < NAME_HEAD_LEN {
+        core::ptr::write_volatile(head.add(i), 0);
+        i += 1;
+    }
+    (*p).len = 0;
+    (*p).tail_len = 0;
+    let name = read_ptr(dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET)));
+    if name.is_null() {
+        return;
+    }
+    let len = match bpf_probe_read_kernel::<u32>(
+        dentry.add(off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_LEN_OFFSET)) as *const u32,
+    ) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let _ = bpf_probe_read_kernel_str_bytes(name, core::slice::from_raw_parts_mut(head, NAME_HEAD_LEN));
+    if len as usize > NAME_TAIL_LEN {
+        let dst = core::slice::from_raw_parts_mut(tail, NAME_TAIL_LEN);
+        if bpf_probe_read_kernel_buf(name.add(len as usize - NAME_TAIL_LEN), dst).is_err() {
+            return;
+        }
+        (*p).tail_len = NAME_TAIL_LEN as u32;
+    } else {
+        let mut j = 0;
+        while j < NAME_TAIL_LEN {
+            core::ptr::write_volatile(tail.add(j), core::ptr::read_volatile(head.add(j)));
+            j += 1;
+        }
+        (*p).tail_len = len;
+    }
+    (*p).len = len;
+}
+
+/// `(mode, size)` of `inode`, zeros when unreadable.
+#[inline(always)]
+unsafe fn mode_size(inode: *const u8) -> (u16, u64) {
+    let mode = bpf_probe_read_kernel::<u16>(inode.add(off!(INODE_I_MODE_OFFSET)) as *const u16).unwrap_or(0);
+    let size = bpf_probe_read_kernel::<u64>(inode.add(off!(INODE_I_SIZE_OFFSET)) as *const u64).unwrap_or(0);
+    (mode, size)
+}
+
+/// Lab PR 225, from `inode_rename` (`fim_watch::fim_rename_observe`): a
+/// rename of a regular file to a new extension
+/// ([`rename_shape`]) counts in its tgid's window ([`rename_step`]); the
+/// crossing reports [`open_reason::MASS_RENAME`] once per window, the new
+/// name as its path. Ransomware renames what it encrypted
+/// (`a.pdf` → `a.pdf.locked`) one file after another; the burst is seen
+/// wherever the files are, not only under a watched FIM directory. The
+/// agent's own renames do not count.
+///
+/// A global BPF function, like [`nn_open_walk`]: verified once, on its own,
+/// with plain values for arguments (the dentries, read from the context
+/// array with [`raw_arg`]).
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_rename_burst(old_dentry: u64, new_dentry: u64) -> u64 {
+    unsafe { rename_burst(old_dentry as *const u8, new_dentry as *const u8) };
+    0
+}
+
+#[inline(always)]
+unsafe fn rename_burst(old: *const u8, new: *const u8) {
+    if !armed() || old.is_null() || new.is_null() {
+        return;
+    }
+    let inode = read_ptr(old.add(off!(DENTRY_D_INODE_OFFSET)));
+    if inode.is_null() {
+        return;
+    }
+    let (mode, _) = mode_size(inode);
+    if mode & S_IFMT != S_IFREG {
+        return;
+    }
+    let sc = match RENAME_SCRATCH.get_ptr_mut(0) {
+        Some(p) => p,
+        None => return,
+    };
+    read_parts(old, &mut (*sc).old);
+    read_parts(new, &mut (*sc).new);
+    // Each extension scan, then the shape, in a global function of its
+    // own, the results in map memory: inlined here together, the scans'
+    // dot positions and the head comparisons multiplied the verifier's
+    // paths past the 1M-instruction limit of 5.15 and 6.1 (lab PR 225;
+    // KERNEL_COMPATIBILITY "Older verifiers", rule 11).
+    let _ = nn_rename_ext(EXT_NEW as u64);
+    let _ = nn_rename_ext(EXT_OLD as u64);
+    let shape = nn_rename_shape() as u32;
+    if shape == RENAME_OTHER {
+        return;
+    }
+    if crate::fim_watch::caller_is_in_family() {
+        return;
+    }
+    let (ext, src) = match RENAME_EXT.get_ptr(0) {
+        Some(e) => (
+            core::ptr::read_volatile(&(*e)[EXT_NEW]),
+            core::ptr::read_volatile(&(*e)[EXT_OLD]),
+        ),
+        None => return,
+    };
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let now = bpf_ktime_get_ns();
+    let appended = shape == RENAME_APPENDED;
+    let crossed = match OPEN_RENAMES.get_ptr_mut(&tgid) {
+        Some(w) => rename_step(&mut *w, ext, src, appended, now),
+        None => {
+            let _ = OPEN_RENAMES.insert(&tgid, &RenameWindow::fresh(now, ext, src, appended), 0);
+            false
+        }
+    };
+    if !crossed {
+        return;
+    }
+    let (count, appended, sources) = match OPEN_RENAMES.get(&tgid) {
+        Some(w) => (w.count, w.appended, w.sources),
+        None => return,
+    };
+    let key = key_of(inode);
+    emit(open_reason::MASS_RENAME, &key, new, appended, sources, count);
+}
+
+/// Lab PR 225: [`name_ext`] of the rename's new name (`slot`
+/// [`EXT_NEW`]) or old name ([`EXT_OLD`]) in [`RENAME_SCRATCH`], written
+/// to that slot of [`RENAME_EXT`]. A global function: verified once.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_rename_ext(slot: u64) -> u64 {
+    unsafe {
+        let sc = match RENAME_SCRATCH.get_ptr(0) {
+            Some(p) => p,
+            None => return 0,
+        };
+        let out = match RENAME_EXT.get_ptr_mut(0) {
+            Some(p) => p,
+            None => return 0,
+        };
+        if slot == EXT_NEW as u64 {
+            let (h, len) = name_ext(&(*sc).new);
+            core::ptr::write_volatile(&mut (*out)[EXT_NEW], h);
+            core::ptr::write_volatile(&mut (*out)[EXT_NEW + 1], len as u64);
+        } else {
+            let (h, len) = name_ext(&(*sc).old);
+            core::ptr::write_volatile(&mut (*out)[EXT_OLD], h);
+            core::ptr::write_volatile(&mut (*out)[EXT_OLD + 1], len as u64);
+        }
+    }
+    0
+}
+
+/// Lab PR 225: [`rename_shape_with`] of the names in [`RENAME_SCRATCH`]
+/// and the extensions [`nn_rename_ext`] left in [`RENAME_EXT`]. A global
+/// function: verified once.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_rename_shape() -> u64 {
+    unsafe {
+        let sc = match RENAME_SCRATCH.get_ptr(0) {
+            Some(p) => p,
+            None => return RENAME_OTHER as u64,
+        };
+        let e = match RENAME_EXT.get_ptr(0) {
+            Some(p) => p,
+            None => return RENAME_OTHER as u64,
+        };
+        let new_ext = (
+            core::ptr::read_volatile(&(*e)[EXT_NEW]),
+            core::ptr::read_volatile(&(*e)[EXT_NEW + 1]) as u32,
+        );
+        let old_ext = (
+            core::ptr::read_volatile(&(*e)[EXT_OLD]),
+            core::ptr::read_volatile(&(*e)[EXT_OLD + 1]) as u32,
+        );
+        rename_shape_with(&(*sc).old, &(*sc).new, new_ext, old_ext) as u64
+    }
+}
+
+/// Lab PR 225, from `inode_unlink` (`fim_watch::fim_unlink_observe`): an
+/// unlink of a regular file of at least [`UNLINK_MIN_BYTES`] counts in its
+/// tgid's window ([`unlink_step`]); the crossing reports
+/// [`open_reason::MASS_UNLINK`] once per window. Ransomware that writes an
+/// encrypted copy deletes the original. The agent's own unlinks do not
+/// count. A global BPF function, as [`nn_rename_burst`].
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn nn_unlink_burst(dentry: u64) -> u64 {
+    unsafe { unlink_burst(dentry as *const u8) };
+    0
+}
+
+#[inline(always)]
+unsafe fn unlink_burst(dentry: *const u8) {
+    if !armed() || dentry.is_null() {
+        return;
+    }
+    let inode = read_ptr(dentry.add(off!(DENTRY_D_INODE_OFFSET)));
+    if inode.is_null() {
+        return;
+    }
+    let (mode, size) = mode_size(inode);
+    if mode & S_IFMT != S_IFREG || size < UNLINK_MIN_BYTES {
+        return;
+    }
+    if crate::fim_watch::caller_is_in_family() {
+        return;
+    }
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let now = bpf_ktime_get_ns();
+    let count = match OPEN_UNLINKS.get_ptr_mut(&tgid) {
+        Some(w) => unlink_step(&mut *w, now),
+        None => {
+            let w = UnlinkWindow {
+                start_ns: now,
+                count: 1,
+                fired: 0,
+            };
+            let _ = OPEN_UNLINKS.insert(&tgid, &w, 0);
+            0
+        }
+    };
+    if count == 0 {
+        return;
+    }
+    let key = key_of(inode);
+    emit(open_reason::MASS_UNLINK, &key, dentry, 0, 0, count);
+}
+
 /// Review 86: a file capability set by any route — `setcap`, a direct
 /// `setxattr(2)`, `cp --preserve=xattr`, `tar --xattrs`, io_uring. On
 /// `inode_post_setxattr`, so only a grant the kernel stored is reported,
@@ -923,7 +1174,7 @@ const XATTR_NAME_CAPS: [u8; 20] = *b"security.capability\0";
 /// of a `void *` argument (`arg2 type UNKNOWN is not a struct`, AlmaLinux
 /// 9's 5.14), and `value` is one.
 #[inline(always)]
-unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
+pub(crate) unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
     let args = ctx.as_ptr() as *const u64;
     bpf_probe_read_kernel(args.add(i)).unwrap_or(0)
 }

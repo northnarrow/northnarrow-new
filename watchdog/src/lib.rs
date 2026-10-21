@@ -4168,6 +4168,13 @@ mod tests {
                 net_flow_snapshots_total: None,
                 net_flow_snapshots_deferred_total: None,
                 net_connect_denied_total: None,
+                ransomware_decisive_total: None,
+                ransomware_signals_total: None,
+                ransomware_trusted_total: None,
+                ransomware_samplings_total: None,
+                defense_tamper_total: None,
+                defense_tamper_sanctioned_total: None,
+                defense_tools_watched: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

@@ -118,6 +118,26 @@ pub const REVOKED_TRANSFER_TOOL_KILL: PolicySwitch = PolicySwitch::off(
      (exempt before lab PR 224)",
 );
 
+/// NN-L-IMP-001 (lab PR 225, new rule): the kill of the actor's tree. Its
+/// posture trigger's COMBAT without corroboration is held likewise
+/// ([`common::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`]).
+pub const IMP_001_KILL: PolicySwitch =
+    PolicySwitch::off("the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)");
+
+/// NN-L-EVA-001..004 (lab PR 225, new rules): the kill of a staged,
+/// deleted or memory-only program that asked a security tool off.
+pub const EVA_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)",
+);
+
+/// NN-L-FIM-010: a rename seen as the watched directory's creation of the
+/// new name (`moved_in`), a match lab PR 225 added. The kill of a watched
+/// file's own rename to a ransomware extension is the rule's from before.
+pub const FIM_010_MOVED_IN_KILL: PolicySwitch = PolicySwitch::off(
+    "the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a \
+     match added by lab PR 225)",
+);
+
 /// Every switch, for the tests and the documents.
 pub const ALL: &[PolicySwitch] = &[
     R020_KILL,
@@ -125,6 +145,9 @@ pub const ALL: &[PolicySwitch] = &[
     NET_027_KILL,
     PORT_53_KILL,
     REVOKED_TRANSFER_TOOL_KILL,
+    IMP_001_KILL,
+    EVA_KILL,
+    FIM_010_MOVED_IN_KILL,
 ];
 
 #[cfg(test)]
@@ -154,6 +177,8 @@ mod tests {
             assert!(!s.on, "{} is on by default", s.held);
             assert!(!s.held.is_empty());
         }
+        // The posture half of NN-L-IMP-001's hold.
+        const { assert!(!common::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
     }
 
     /// Off: the action is `Log`, severity and the rest kept, the reasoning

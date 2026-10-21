@@ -139,6 +139,19 @@ pub struct TrustedInstallerOverride {
 struct Inner {
     /// Real-time deadline of the current window, or `None` when closed.
     deadline: Option<Instant>,
+    /// Who opened the current window and until when (lab PR 225).
+    grant: Option<WindowGrant>,
+}
+
+/// Lab PR 225: who opened the current window and when it ends — named in
+/// the records the window sanctions (a stop or restart of the agent's own
+/// units, NN-L-EVA-001 at Low: [`crate::impair`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowGrant {
+    /// Fingerprint of the admin key whose signed grant opened the window.
+    pub key_id: String,
+    /// The window's deadline, wall clock (UTC, RFC 3339 to the second).
+    pub expires_at: String,
 }
 
 impl TrustedInstallerOverride {
@@ -231,6 +244,13 @@ impl TrustedInstallerOverride {
     /// The ARM is recorded in the audit chain by the dispatch path
     /// (`emit_audit_for`), not here.
     pub fn arm(&self, window_secs: u32, now: Instant) -> Duration {
+        self.arm_by(window_secs, now, "(no key id)")
+    }
+
+    /// [`Self::arm`] for the signed grant of the admin key `key_id` (its
+    /// fingerprint): the window remembers who opened it, and until when
+    /// ([`Self::grant_at`]).
+    pub fn arm_by(&self, window_secs: u32, now: Instant, key_id: &str) -> Duration {
         let max = self.max_window.as_secs().min(u32::MAX as u64) as u32;
         let secs = window_secs.clamp(1, max.max(1));
         let window = Duration::from_secs(secs as u64);
@@ -297,7 +317,23 @@ impl TrustedInstallerOverride {
             false
         };
 
-        self.inner.lock().deadline = Some(now + window);
+        // The deadline on the wall clock, from the monotonic one (`now` may
+        // lie in the past: a test of an expired window).
+        let deadline = now + window;
+        let mono_now = Instant::now();
+        let wall = if deadline >= mono_now {
+            chrono::Utc::now() + chrono::Duration::from_std(deadline - mono_now).unwrap_or_default()
+        } else {
+            chrono::Utc::now() - chrono::Duration::from_std(mono_now - deadline).unwrap_or_default()
+        };
+        {
+            let mut inner = self.inner.lock();
+            inner.deadline = Some(deadline);
+            inner.grant = Some(WindowGrant {
+                key_id: key_id.to_string(),
+                expires_at: wall.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            });
+        }
         self.armed.store(true, Ordering::SeqCst);
         info!(
             target: "anti_tamper.trusted_installer",
@@ -330,6 +366,16 @@ impl TrustedInstallerOverride {
         self.is_active_at(Instant::now())
     }
 
+    /// Lab PR 225: the grant of the window open as of `now` — its key id
+    /// and its deadline — or `None` when no window is open (never armed,
+    /// closed, or past its deadline).
+    pub fn grant_at(&self, now: Instant) -> Option<WindowGrant> {
+        if !self.is_active_at(now) {
+            return None;
+        }
+        self.inner.lock().grant.clone()
+    }
+
     /// Lazy expiry on the event path. If a window is open but `now` is
     /// at/after its deadline, close it (zero the kernel map + audit) and
     /// return `true`. Cheap no-op (single atomic load) when disarmed —
@@ -359,7 +405,11 @@ impl TrustedInstallerOverride {
     /// "closed"; the kernel's own deadline still ends the window.
     pub fn close(&self, reason: &str) {
         let was_armed = self.armed.swap(false, Ordering::SeqCst);
-        self.inner.lock().deadline = None;
+        {
+            let mut inner = self.inner.lock();
+            inner.deadline = None;
+            inner.grant = None;
+        }
         let zeroed =
             write_fs_grant(self.bpffs_root.as_deref(), FsGrant::default()).and_then(|()| {
                 match read_fs_grant(self.bpffs_root.as_deref()) {
@@ -636,6 +686,28 @@ mod tests {
         ov.arm(10, t1);
         assert!(ov.is_active_at(t1 + Duration::from_secs(5)));
         assert!(!ov.is_active_at(t1 + Duration::from_secs(10)));
+    }
+
+    /// Lab PR 225: the open window names its key and its deadline; once
+    /// past it (or closed) there is no grant.
+    #[test]
+    fn the_open_window_names_its_key_and_deadline() {
+        let ov = test_override(600);
+        assert!(ov.grant_at(Instant::now()).is_none());
+        let t0 = Instant::now();
+        ov.arm_by(120, t0, "c2e8f3da");
+        let g = ov
+            .grant_at(t0 + Duration::from_secs(1))
+            .expect("open window");
+        assert_eq!(g.key_id, "c2e8f3da");
+        assert!(
+            g.expires_at.ends_with('Z') && g.expires_at.len() == 20,
+            "{}",
+            g.expires_at
+        );
+        assert!(ov.grant_at(t0 + Duration::from_secs(121)).is_none());
+        ov.close("test");
+        assert!(ov.grant_at(t0 + Duration::from_secs(1)).is_none());
     }
 
     #[test]

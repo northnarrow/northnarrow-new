@@ -2419,6 +2419,8 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.execq_state.is_none()
         && out.net_connect_verdicts_total.is_none()
         && out.net_flow_snapshots_total.is_none()
+        && out.ransomware_decisive_total.is_none()
+        && out.defense_tamper_total.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2959,6 +2961,43 @@ fn execq_json(out: &StatusOutcome) -> String {
     )
 }
 
+/// Lab PR 225 (CM-16): the ransomware signal since boot.
+fn ransomware_line(out: &StatusOutcome, tty: bool) -> String {
+    match out.ransomware_decisive_total {
+        None => "ransomware        : (agent predates the counters)".to_string(),
+        Some(d) => format!(
+            "ransomware        : {} decisive (NN-L-IMP-001), {} shapes counted, {} trusted \
+             bursts not counted, {} entropy samplings",
+            if d == 0 {
+                colorize("0", "32", tty)
+            } else {
+                colorize(&d.to_string(), "31", tty)
+            },
+            out.ransomware_signals_total.unwrap_or(0),
+            out.ransomware_trusted_total.unwrap_or(0),
+            out.ransomware_samplings_total.unwrap_or(0)
+        ),
+    }
+}
+
+/// Lab PR 225 (CM-18): security tools switched off since boot.
+fn defense_line(out: &StatusOutcome, tty: bool) -> String {
+    match out.defense_tamper_total {
+        None => "security tools    : (agent predates the counters)".to_string(),
+        Some(n) => format!(
+            "security tools    : {} switched off (NN-L-EVA-*), {} sanctioned (package, admin \
+             session); {} tool processes watched for signals",
+            if n == 0 {
+                colorize("0", "32", tty)
+            } else {
+                colorize(&n.to_string(), "31", tty)
+            },
+            out.defense_tamper_sanctioned_total.unwrap_or(0),
+            out.defense_tools_watched.unwrap_or(0)
+        ),
+    }
+}
+
 fn print_status(out: &StatusOutcome, json: bool) {
     if json {
         // Hand-rolled JSON to avoid a serde_json dep at the binary
@@ -3075,6 +3114,8 @@ fn print_status(out: &StatusOutcome, json: bool) {
         }
         println!("{}", exploit_guard_line(out, tty));
         println!("{}", execq_line(out, tty));
+        println!("{}", ransomware_line(out, tty));
+        println!("{}", defense_line(out, tty));
     }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
@@ -4740,6 +4781,13 @@ mod flow_sock_line_tests {
             net_flow_snapshots_total: None,
             net_flow_snapshots_deferred_total: None,
             net_connect_denied_total: None,
+            ransomware_decisive_total: None,
+            ransomware_signals_total: None,
+            ransomware_trusted_total: None,
+            ransomware_samplings_total: None,
+            defense_tamper_total: None,
+            defense_tamper_sanctioned_total: None,
+            defense_tools_watched: None,
             telemetry_signed: true,
         }
     }

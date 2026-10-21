@@ -1,0 +1,101 @@
+# NorthNarrow — security tools whose disabling is detected (default, v1)
+#
+# Lab PR 225, countermeasure CM-18 (ATT&CK v20 Defense Impairment: T1685
+# Disable or Modify Tools, T1685.004 Disable or Modify Linux Audit System,
+# T1686 Disable or Modify System Firewall). The rules NN-L-EVA-001..004 and
+# the posture's DefenseImpairment read this list; no tool name is written in
+# the code.
+#
+#   NN-L-EVA-001  a listed unit stopped, disabled, masked or killed
+#                 (systemctl, service, invoke-rc.d, update-rc.d, chkconfig,
+#                 rc-service, rc-update, /etc/init.d/<name>)
+#   NN-L-EVA-002  a listed switch-off command (`cmd` lines below)
+#   NN-L-EVA-003  a listed process killed or stopped (kill, pkill, killall)
+#   NN-L-EVA-004  a listed configuration file changed (watched by FIM:
+#                 files, and the files a directory holds at boot)
+#
+# Outside a package transaction and an administrator's interactive sudo/su
+# session each is High (recorded), and the program that asked is killed with
+# its tree when its lineage holds a program no package installed (a script
+# from /tmp or a home, a dropped binary). Inside, Low.
+#
+# The shipped list is content of the release: the agent applies the copy it
+# was built with whenever /etc/northnarrow/security-tools.v1 is not that copy
+# (an edit is an ERROR and a signed `default_list_modified` at every boot);
+# install.sh installs it.
+#
+# Format, one entry per line; `#` starts a comment:
+#
+#   tool <name> class=<audit|mac|firewall|log|ids|edr|cloud> [unit=<u>[,<u>…]]
+#        [proc=<p>[,<p>…]] [config=<c>[,<c>…]]
+#     unit    systemd unit or SysV service name (`.service` may be left out)
+#     proc    the tool's executable (or the script an interpreter runs), an
+#             absolute path; a path ending in `/` is a tree: any program in it
+#     config  an absolute path; a path ending in `/` is a directory, whose
+#             files present at boot are watched with it
+#
+#   cmd <name> <program> [<arg>…]
+#     the program (a basename, or an absolute path for a script) run with
+#     these arguments, in this order and next to each other, switches <name>
+#     off; no argument: running the program does
+#
+# Audit, MAC, firewall, logging
+tool auditd      class=audit    unit=auditd proc=/usr/sbin/auditd,/sbin/auditd config=/etc/audit/,/etc/audit/rules.d/
+tool apparmor    class=mac      unit=apparmor config=/etc/apparmor/,/etc/apparmor.d/
+tool selinux     class=mac      config=/etc/selinux/config
+tool ufw         class=firewall unit=ufw config=/etc/ufw/,/etc/default/ufw
+tool firewalld   class=firewall unit=firewalld proc=/usr/sbin/firewalld config=/etc/firewalld/
+tool nftables    class=firewall unit=nftables config=/etc/nftables.conf,/etc/sysconfig/nftables.conf
+tool iptables    class=firewall unit=netfilter-persistent,iptables,ip6tables config=/etc/iptables/,/etc/sysconfig/iptables,/etc/sysconfig/ip6tables
+tool rsyslog     class=log      unit=rsyslog proc=/usr/sbin/rsyslogd config=/etc/rsyslog.conf,/etc/rsyslog.d/
+tool journald    class=log      unit=systemd-journald,systemd-journald.socket config=/etc/systemd/journald.conf,/etc/systemd/journald.conf.d/
+tool fail2ban    class=ids      unit=fail2ban proc=/usr/bin/fail2ban-server config=/etc/fail2ban/
+# Host sensors and EDR agents
+tool northnarrow class=edr      unit=northnarrow-agent,northnarrow-watchdog
+tool falco       class=edr      unit=falco,falco-modern-bpf,falco-bpf,falco-kmod proc=/usr/bin/falco config=/etc/falco/
+tool osquery     class=edr      unit=osqueryd proc=/opt/osquery/bin/osqueryd,/usr/bin/osqueryd config=/etc/osquery/
+tool wazuh       class=edr      unit=wazuh-agent,ossec,ossec-hids proc=/var/ossec/bin/ config=/var/ossec/etc/
+tool crowdstrike class=edr      unit=falcon-sensor proc=/opt/CrowdStrike/
+tool sentinelone class=edr      unit=sentinelone proc=/opt/sentinelone/
+tool mdatp       class=edr      unit=mdatp proc=/opt/microsoft/mdatp/ config=/etc/opt/microsoft/mdatp/
+tool elastic     class=edr      unit=elastic-agent,ElasticEndpoint proc=/opt/Elastic/
+tool sophos      class=edr      unit=sophos-spl proc=/opt/sophos-spl/
+tool trendmicro  class=edr      unit=ds_agent proc=/opt/ds_agent/
+tool carbonblack class=edr      unit=cbagentd proc=/opt/carbonblack/
+tool qualys      class=edr      unit=qualys-cloud-agent proc=/usr/local/qualys/ config=/etc/qualys/
+tool tanium      class=edr      unit=taniumclient proc=/opt/Tanium/
+tool datadog     class=edr      unit=datadog-agent,datadog-agent-sysprobe,datadog-agent-security proc=/opt/datadog-agent/ config=/etc/datadog-agent/
+# Cloud host agents (the targets of cryptojacking scripts)
+tool aliyun-aegis      class=cloud unit=aegis,AliYunDun,aliyun proc=/usr/local/aegis/
+tool aliyun-monitor    class=cloud unit=cloudmonitor proc=/usr/local/cloudmonitor/
+tool tencent-yunjing   class=cloud unit=YDService,yunjing proc=/usr/local/qcloud/YunJing/
+tool tencent-monitor   class=cloud unit=tat_agent proc=/usr/local/qcloud/stargate/,/usr/local/qcloud/monitor/
+tool huawei-hostguard  class=cloud unit=hostguard proc=/usr/local/hostguard/
+tool amazon-ssm        class=cloud unit=amazon-ssm-agent,snap.amazon-ssm-agent.amazon-ssm-agent proc=/usr/bin/amazon-ssm-agent,/snap/amazon-ssm-agent/
+tool amazon-cloudwatch class=cloud unit=amazon-cloudwatch-agent proc=/opt/aws/amazon-cloudwatch-agent/
+tool google-ops-agent  class=cloud unit=google-cloud-ops-agent,google-cloud-ops-agent-fluent-bit,google-cloud-ops-agent-opentelemetry-collector,stackdriver-agent proc=/opt/google-cloud-ops-agent/ config=/etc/google-cloud-ops-agent/
+tool azure-monitor     class=cloud unit=azuremonitoragent,mdsd,omsagent proc=/opt/microsoft/azuremonitoragent/ config=/etc/opt/microsoft/azuremonitoragent/
+#
+# Switch-off commands
+cmd auditd    auditctl -e 0
+cmd auditd    auditctl -e0
+cmd auditd    auditctl -D
+cmd auditd    auditctl --signal stop
+cmd auditd    auditctl --signal TERM
+cmd apparmor  aa-teardown
+cmd apparmor  aa-disable
+cmd selinux   setenforce 0
+cmd selinux   setenforce Permissive
+cmd selinux   setenforce permissive
+cmd ufw       ufw disable
+cmd ufw       ufw reset
+cmd firewalld firewall-cmd --set-default-zone=trusted
+cmd nftables  nft flush ruleset
+cmd iptables  iptables -F
+cmd iptables  iptables --flush
+cmd iptables  iptables -P INPUT ACCEPT
+cmd iptables  ip6tables -F
+cmd iptables  ip6tables --flush
+cmd tencent-yunjing /usr/local/qcloud/YunJing/uninst.sh
+cmd tencent-monitor /usr/local/qcloud/stargate/admin/uninstall.sh
+cmd tencent-monitor /usr/local/qcloud/monitor/barad/admin/uninstall.sh

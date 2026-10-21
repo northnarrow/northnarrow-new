@@ -9,9 +9,9 @@ The matrix itself is empty by design — V2–V4 populate it.
 
 | File | What it fixes | Version | Rows | sha256 (LF line endings) |
 |---|---|---|---|---|
-| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 3 | 82 | `d0dbf3eaccd99468243f203f769bef32f3d091f27857b3fa31819d2116f7208b` |
+| [`v2-rules.tsv`](v2-rules.tsv) | the rule denominator and the Critical sub-gate | 3 | 88 | `d1187bf6e2e7f8d236350f29a591bdc083b6e64c51a6f431845db980561fd1a6` |
 | [`v2-techniques.tsv`](v2-techniques.tsv) | the ATT&CK technique rows and their expected outcome | 2 | 62 | `f22ae7a6cf96db925177c4cf1d10ed3af0b70b53587e4b9d4f179cf4f767dbb9` |
-| [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 2 | 18 | `5cf990f1e163a823523d4e0af410966c53f716d1eef9ec7b91146d3524ecb9e9` |
+| [`v2-controls.tsv`](v2-controls.tsv) | one evasion row and one benign control per family | 2 | 22 | `f07c7a7f7cd83059f9bdc2f4993e98f87bd27b39a50277b7144b3f7f186162bd` |
 
 Version 1 was frozen on 2026-10-15, before any V2 run. Its rule rows are
 the 76 rules the production engine loads plus NN-L-AT-001 (issued outside
@@ -46,17 +46,22 @@ Change log:
   that follows BUG-025. NN-L-CANARY-003 stays in the sub-gate: a connect to
   a network canary trips it since lab PR 163. Sub-gate: 25 rules.
 - `v2-rules.tsv` version 3, `v2-techniques.tsv` version 2,
-  `v2-controls.tsv` version 2 (2026-10-20/21, lab PRs 219 and 224, before
-  any V2 run; one version for both, integrated in that order): the exploit
-  post-condition guard's NN-L-EPG-001 (credentials, T1068) and NN-L-EPG-002
-  (namespaces and root, T1611), issued outside the engine, Critical, in the
-  sub-gate (family `exploit-guard`); TQ60 for T1068 and NN-L-EPG-002 in
-  TQ57; CV17 / CV18 for the family (lab PR 219). R020 (a shell or
-  interpreter with its stdio on a network socket, Critical, in the
+  `v2-controls.tsv` version 2 (2026-10-20/21, lab PRs 219, 224 and 225,
+  before any V2 run; one version for the three, integrated in that order):
+  the exploit post-condition guard's NN-L-EPG-001 (credentials, T1068) and
+  NN-L-EPG-002 (namespaces and root, T1611), issued outside the engine,
+  Critical, in the sub-gate (family `exploit-guard`); TQ60 for T1068 and
+  NN-L-EPG-002 in TQ57; CV17 / CV18 for the family (lab PR 219). R020 (a
+  shell or interpreter with its stdio on a network socket, Critical, in the
   sub-gate, family `process`), NN-L-NET-026 (scan fan-out) and NN-L-NET-027
   (outbound brute force), High, family `net`; R020 in TQ19 (T1059.004), TQ61
   T1046 and TQ62 T1110, both checked in the pinned ATT&CK 20.0 list (lab PR
-  224; no new family, no new control). 82 rows, sub-gate 28.
+  224; no new family, no new control). The ransomware rules NN-L-IMP-001
+  (Critical, KillProcessTree: in the sub-gate) and NN-L-IMP-002 (family
+  `impact`), and the security-tool rules NN-L-EVA-001..004 (family
+  `evasion`, High at most: out of the sub-gate), with an evasion and a
+  benign control for each new family, CV19..CV22 (lab PR 225, which numbered
+  them CV17..CV20). 88 rows, sub-gate 29.
 
 ## Gate formulas (§13 Q1, as frozen)
 
@@ -158,6 +163,7 @@ brings each one back:
 | NN-L-FIM-021_PamModuleModified | yes | `agent/src/fim/rules.rs::d3_fim_rules_table` | `agent/tests/detection_rules_at_scale_privileged_e2e.rs::fim_pam_module_modify_trips_fim_021_combat` | no proof | no proof | e2e | The e2e writes a module in a temporary `security/` directory, not the system PAM directory. |
 | NN-L-FIM-022_LdSoPreloadModified | yes | `agent/src/fim/rules.rs::d3_fim_rules_table` | no proof | no proof | no proof | unit | The predicate is the exact path `/etc/ld.so.preload`; no e2e writes it. |
 | NN-L-FIM-024_AntiTamperHoneypotModified | - | `agent/src/fim/rules.rs::fim024_fires_on_every_honeypot_path` | `agent/tests/honeypot_tamper_e2e.rs::delete_kill_switch_conf_trips_fim024_and_kills_the_tamperer` | no proof | no proof | e2e | The e2e checks one signed record (Critical, KillProcessTree, the tamperer's pid) and the tamperer killed; FIM-024 does not move the posture (no trigger reads FIM events). |
+| NN-L-IMP-001_RansomwareEncryption | - | `agent/src/decision/rules/impact.rs::imp001_kills_the_actors_tree_on_two_shapes` | no proof | `deploy/lab/malsim/ransom-check.sh::NN-L-IMP-001_RansomwareEncryption` | no proof | unit | Lab PR 225: two shapes of one actor (rewrites, ciphertext, renames to a new extension, deleted originals); the lab probe (MS-23) awaits its first run. |
 | NN-L-FIM-025_FileCapabilityGranted | - | `agent/src/fim/rules.rs::fim025_strips_a_granted_capability` | no proof | no proof | no proof | unit | Critical for a root-equivalent capability; the response strips it. |
 | NN-L-CANARY-001_FileAccess | - | `agent/src/decision/rules/canary.rs::canary001_fires_on_file_canary_file_open` | `agent/tests/canary_privileged_e2e.rs::file_canary_open_triggers_canary_tripped_event_and_combat` | no proof | no proof | e2e-event | The e2e asserts the signed access row, not the verdict. |
 | NN-L-CANARY-002_ProcessExec | - | `agent/src/decision/rules/canary.rs::canary002_fires_on_process_canary_exec` | `agent/tests/canary_privileged_e2e.rs::process_canary_exec_triggers_canary_tripped_event_and_combat` | no proof | no proof | e2e-event | The e2e asserts the signed access row, not the verdict. |
@@ -186,5 +192,7 @@ brings each one back:
 | `bpf` (NN-L-BPF-001/002) | 2 | | | | | | |
 | `anti-tamper` (NN-L-AT-001) | 1 | | | | | | |
 | `exploit-guard` (NN-L-EPG-001/002) | 2 | | | | | | |
-| **Total** | **82** | | | | | | |
-| **Critical sub-gate** | **28** | | | | | | |
+| `impact` (NN-L-IMP-001/002) | 2 | | | | | | |
+| `evasion` (NN-L-EVA-001..004) | 4 | | | | | | |
+| **Total** | **88** | | | | | | |
+| **Critical sub-gate** | **29** | | | | | | |

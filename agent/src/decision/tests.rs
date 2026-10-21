@@ -38,15 +38,17 @@ use super::{Rule, RuleEngine};
 /// (NN-L-BPF-001/002) rules, which only the production builder had, are
 /// in `default_rules()` too: 77 rules under 76 ids. Lab PR 224: R020
 /// (shell with socket stdio) and NN-L-NET-026/027 (fan-out): 80 under 79.
+/// Lab PR 225 adds the ransomware rules (NN-L-IMP-001/002) and the
+/// security-tool rules (NN-L-EVA-001..004): 86 rules under 85 ids.
 #[test]
 fn default_engine_has_seventy_nine_rules_across_all_families() {
     let engine = RuleEngine::with_default_rules();
     // chain 8 + tappa2 10 (+ R007's second pass) + process 7 + R020
     //   + module-load 1 (R018, BUG-034) + io_uring 2 + BPF 2 (PROC-014)
-    //   + FIM 25 + canary 4 + net 19
+    //   + FIM 25 + impact 2 + evasion 4 (lab PR 225) + canary 4 + net 19
     assert_eq!(
         engine.rule_count(),
-        8 + 10 + 1 + 7 + 1 + 1 + 2 + 2 + 25 + 4 + 19
+        8 + 10 + 1 + 7 + 1 + 1 + 2 + 2 + 25 + 2 + 4 + 4 + 19
     );
 }
 
@@ -271,8 +273,8 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
     let mut ids: Vec<&str> = rules.iter().map(|r| r.id()).collect();
     assert_eq!(
         ids.len(),
-        80,
-        "engine ships 76 rules after the io_uring and BPF rules (external audit PROC-014), \
+        86,
+        "engine ships 85 rules after the impact and evasion rules (lab PR 225), \
          R007 in two passes (external audit PROC-010)"
     );
     // External audit PROC-010: R007's two passes share its id; no other
@@ -283,7 +285,7 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
     ids.dedup();
 
     let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 79, "all rule IDs must be unique");
+    assert_eq!(unique.len(), 85, "all rule IDs must be unique");
 
     assert_eq!(
         ids,
@@ -302,6 +304,10 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
             "NN-L-CHAIN-006_CrossPidCanaryExfil",
             "NN-L-CHAIN-007_TmpCredExfilSequence",
             "NN-L-CHAIN-008_CrossPidPrivEscExfil",
+            "NN-L-EVA-001_SecurityServiceStopped",
+            "NN-L-EVA-002_SecurityToolSwitchedOff",
+            "NN-L-EVA-003_SecurityToolKilled",
+            "NN-L-EVA-004_SecurityToolConfigChanged",
             "NN-L-FIM-001_SystemBinaryModified",
             "NN-L-FIM-002_NewSuidBinary",
             "NN-L-FIM-003_SensitiveConfigModified",
@@ -327,6 +333,8 @@ fn default_engine_pins_all_seventy_nine_rule_ids() {
             "NN-L-FIM-023_SystemdTimerCreated",
             "NN-L-FIM-024_AntiTamperHoneypotModified",
             "NN-L-FIM-025_FileCapabilityGranted",
+            "NN-L-IMP-001_RansomwareEncryption",
+            "NN-L-IMP-002_RenameExtensionBurst",
             "NN-L-IOU-001_IoUringRingCreated",
             "NN-L-IOU-002_IoUringFileAndNetwork",
             "NN-L-NET-001_OutboundToBlockedIp",
@@ -392,10 +400,16 @@ fn production_engine(lineage: crate::posture::lineage::AuthSessionTracker) -> Ru
         Arc::new(Mutex::new(super::rules::net::BeaconWindow::default())),
         Arc::new(crate::net::dns_cache::DnsCache::default()),
         crate::anti_tamper::trusted_installer::TrustedInstallerOverride::inert_arc(),
-        lineage,
+        lineage.clone(),
         crate::canary::readers::CanaryReaders::default(),
         Arc::new(Mutex::new(super::correlation::CorrelationStore::new())),
         super::rules::net::NetRuleConfig::default(),
+        Arc::new(crate::impact::RansomTracker::new(lineage.clone())),
+        Arc::new(crate::impair::DefenseDetector::new(
+            Arc::new(crate::impair::SecurityTools::builtin()),
+            lineage,
+            None,
+        )),
     )
 }
 
@@ -427,7 +441,7 @@ fn production_engine_pins_all_rule_ids() {
     let (_tmp, lineage) = lineage_of(&[]);
     let production = production_engine(lineage);
     let default = RuleEngine::with_default_rules();
-    assert_eq!(production.rule_count(), 80);
+    assert_eq!(production.rule_count(), 86);
     assert_eq!(production.rule_ids(), default.rule_ids());
 }
 
@@ -470,6 +484,8 @@ fn both_builders_keep_the_family_order() {
                 ("NN-L-IOU", 2),
                 ("NN-L-BPF", 2),
                 ("NN-L-FIM", 25),
+                ("NN-L-IMP", 2),
+                ("NN-L-EVA", 4),
                 ("NN-L-CANARY", 4),
                 ("NN-L-NET", 19),
                 ("NN-L-CHAIN", 1),

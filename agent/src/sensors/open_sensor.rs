@@ -1257,6 +1257,17 @@ pub(crate) fn unplaced_root_dev(path: &str) -> Option<(u32, u32)> {
 
 /// The events one record stands for.
 pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
+    // Lab PR 225: a signal to a security tool's process carries no path.
+    if r.reason & open_reason::DEFENDER_SIGNAL != 0 {
+        return vec![Event::DefenderSignal {
+            pid: r.pid,
+            uid: r.uid,
+            comm: comm_of(r),
+            target_pid: r.flags,
+            signal: r.count,
+            timestamp_ns: r.timestamp_ns,
+        }];
+    }
     let rel = relative_path(r);
     let filename = match mounts.absolute((r.root_dev, r.root_ino), &rel) {
         Some(abs) => abs,
@@ -1344,12 +1355,40 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
         out.push(Event::MassWrite {
             pid: r.pid,
             uid: r.uid,
-            comm,
+            comm: comm.clone(),
             count: r.count,
-            filename,
+            filename: filename.clone(),
             timestamp_ns: r.timestamp_ns,
             overwrites: r.reason & overwrites != 0,
             cgroup_window: r.reason & open_reason::MASS_OVERWRITE_CGROUP != 0,
+        });
+    }
+    // Lab PR 225: the rename and unlink bursts (`inode_rename`,
+    // `inode_unlink`), one record each, never combined with an open.
+    if r.reason & open_reason::MASS_RENAME != 0 {
+        out.push(Event::FileBurst {
+            pid: r.pid,
+            uid: r.uid,
+            comm: comm.clone(),
+            kind: common::FileBurstKind::RenameExtension,
+            count: r.count,
+            appended: r.flags,
+            sources: r.mode,
+            filename: filename.clone(),
+            timestamp_ns: r.timestamp_ns,
+        });
+    }
+    if r.reason & open_reason::MASS_UNLINK != 0 {
+        out.push(Event::FileBurst {
+            pid: r.pid,
+            uid: r.uid,
+            comm,
+            kind: common::FileBurstKind::Unlink,
+            count: r.count,
+            appended: 0,
+            sources: 0,
+            filename,
+            timestamp_ns: r.timestamp_ns,
         });
     }
     out
@@ -1976,6 +2015,59 @@ mod tests {
         r.path_n = comps.len() as u16;
         (r.root_dev, r.root_ino) = root;
         r
+    }
+
+    /// Lab PR 225: the rename and unlink bursts and the signal to a
+    /// security tool, as the kernel reports them.
+    #[test]
+    fn burst_and_defender_records_become_their_events() {
+        let mut mounts = MountTable::default();
+        mounts.roots.insert((7, 2), "/".into());
+        mounts.loaded = Some(Instant::now());
+        let mut r = record(
+            open_reason::MASS_RENAME,
+            &["f020.locked", "nn-malsim", "srv", "/"],
+            (7, 2),
+        );
+        r.flags = 18;
+        r.mode = 4;
+        let ev = events_of(&r, &mut mounts);
+        assert!(
+            matches!(&ev[..], [Event::FileBurst {
+                kind: common::FileBurstKind::RenameExtension,
+                count: 20,
+                appended: 18,
+                sources: 4,
+                filename,
+                ..
+            }] if filename == "/srv/nn-malsim/f020.locked"),
+            "{ev:?}"
+        );
+        let r = record(
+            open_reason::MASS_UNLINK,
+            &["f020", "nn-malsim", "srv", "/"],
+            (7, 2),
+        );
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[..],
+            [Event::FileBurst {
+                kind: common::FileBurstKind::Unlink,
+                count: 20,
+                ..
+            }]
+        ));
+        let mut r = record(open_reason::DEFENDER_SIGNAL, &[], (0, 0));
+        r.count = 9;
+        r.flags = 777;
+        assert!(matches!(
+            &events_of(&r, &mut mounts)[..],
+            [Event::DefenderSignal {
+                pid: 42,
+                target_pid: 777,
+                signal: 9,
+                ..
+            }]
+        ));
     }
 
     #[test]

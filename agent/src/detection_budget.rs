@@ -17,6 +17,12 @@
 //! uid, which an unprivileged user cannot vary: a flood by one user leaves
 //! every other (rule, uid) its own budget.
 //!
+//! A rule that coalesces the repeats of one action into its first record
+//! (NN-L-EVA-002: one switch-off command by one process tree, lab PR 225)
+//! counts them here too ([`count_coalesced`]), without spending the pair's
+//! budget: the next record carries them in `suppressed_before`, the
+//! reporter's signed entry in its count.
+//!
 //! A flood must not hide what it is made of either: while a pair is held
 //! back, the budget keeps up to [`MAX_SAMPLES`] distinct subjects (the file
 //! or the executable the detection is about; the `comm` only when there is
@@ -116,6 +122,18 @@ impl Bucket {
         }
     }
 
+    /// One more held back, its subject kept while there is room.
+    fn hold(&mut self, sample: impl FnOnce() -> (String, String)) {
+        self.held_since_record += 1;
+        self.held_since_report += 1;
+        if self.samples.len() < MAX_SAMPLES {
+            let (key, text) = sample();
+            if !self.samples.iter().any(|(k, _)| *k == key) {
+                self.samples.push((key, text));
+            }
+        }
+    }
+
     /// Nothing left to report, nothing spent: safe to forget.
     fn idle(&self) -> bool {
         self.tokens == BURST && self.held_since_report == 0
@@ -129,6 +147,29 @@ struct Inner {
 }
 
 impl Inner {
+    /// The pair's bucket, refilled to `now`; `None` when it is new and no
+    /// pair has room.
+    fn bucket(&mut self, rule: &str, uid: u32, now: Instant) -> Option<&mut Bucket> {
+        let known = self.rules.get(rule).is_some_and(|u| u.contains_key(&uid));
+        if !known {
+            if self.keys >= MAX_KEYS {
+                self.prune(now);
+            }
+            if self.keys >= MAX_KEYS {
+                return None;
+            }
+            self.keys += 1;
+        }
+        let bucket = self
+            .rules
+            .entry(rule.to_string())
+            .or_default()
+            .entry(uid)
+            .or_insert_with(|| Bucket::new(now));
+        bucket.refill(now);
+        Some(bucket)
+    }
+
     /// Forget the pairs with nothing to report and a full bucket.
     fn prune(&mut self, now: Instant) {
         let mut keys = 0;
@@ -162,43 +203,37 @@ impl DetectionBudget {
         sample: impl FnOnce() -> (String, String),
     ) -> Admit {
         let mut g = self.inner.lock();
-        let inner = &mut *g;
-        let known = inner.rules.get(rule).is_some_and(|u| u.contains_key(&uid));
-        if !known {
-            if inner.keys >= MAX_KEYS {
-                inner.prune(now);
-            }
-            if inner.keys >= MAX_KEYS {
-                return Admit::Record {
-                    suppressed_before: 0,
-                };
-            }
-            inner.keys += 1;
-        }
-        let bucket = inner
-            .rules
-            .entry(rule.to_string())
-            .or_default()
-            .entry(uid)
-            .or_insert_with(|| Bucket::new(now));
-        bucket.refill(now);
+        let Some(bucket) = g.bucket(rule, uid, now) else {
+            return Admit::Record {
+                suppressed_before: 0,
+            };
+        };
         if bucket.tokens > 0 {
             bucket.tokens -= 1;
             Admit::Record {
                 suppressed_before: std::mem::take(&mut bucket.held_since_record),
             }
         } else {
-            bucket.held_since_record += 1;
-            bucket.held_since_report += 1;
-            if bucket.samples.len() < MAX_SAMPLES {
-                let (key, text) = sample();
-                if !bucket.samples.iter().any(|(k, _)| *k == key) {
-                    bucket.samples.push((key, text));
-                }
-            }
+            bucket.hold(sample);
             let first = !bucket.throttled;
             bucket.throttled = true;
             Admit::Hold { first }
+        }
+    }
+
+    /// A detection its rule coalesced into an earlier record of the same
+    /// action: counted as one held back (the next record of the pair, the
+    /// reporter's entry), the pair's budget not spent. Not counted when
+    /// no pair has room ([`MAX_KEYS`]).
+    pub fn count_coalesced_at(
+        &self,
+        rule: &str,
+        uid: u32,
+        now: Instant,
+        sample: impl FnOnce() -> (String, String),
+    ) {
+        if let Some(bucket) = self.inner.lock().bucket(rule, uid, now) {
+            bucket.hold(sample);
         }
     }
 
@@ -233,6 +268,11 @@ pub fn admit(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) ->
     BUDGET.admit_at(rule, uid, Instant::now(), sample)
 }
 
+/// [`DetectionBudget::count_coalesced_at`] on the process-wide budget, now.
+pub fn count_coalesced(rule: &str, uid: u32, sample: impl FnOnce() -> (String, String)) {
+    BUDGET.count_coalesced_at(rule, uid, Instant::now(), sample)
+}
+
 /// Report held-back detections every [`REPORT_SECS`]: one WARN per
 /// (rule, uid) and one signed audit entry for all of them. External audit
 /// NN-AUD-111: in the same window, the records the detection store's queue
@@ -259,7 +299,8 @@ pub fn spawn_reporter(
                     uid = h.uid,
                     held = h.count,
                     samples = ?h.samples,
-                    "detections acted on but not logged or stored (per-rule budget)"
+                    "detections acted on but not logged or stored (per-rule budget, or repeats \
+                     coalesced into a record)"
                 );
             }
             let Some(log) = audit_log.as_ref() else {
@@ -387,6 +428,41 @@ mod tests {
             let _ = b.admit_at("FIM-011", 0, t0, || (format!("k{i}"), format!("t{i}")));
         }
         assert_eq!(b.take_held()[0].samples.len(), MAX_SAMPLES);
+    }
+
+    /// Lab PR 225 (NN-L-EVA-002): repeats a rule coalesced into its record
+    /// are counted for the next record and the reporter, and spend nothing
+    /// of the pair's budget.
+    #[test]
+    fn coalesced_repeats_are_counted_without_spending_the_budget() {
+        let b = DetectionBudget::default();
+        let t0 = Instant::now();
+        assert!(b.admit_at("EVA-002", 0, t0, nos).record());
+        let sample = || {
+            (
+                "iptables iptables -F 601".to_string(),
+                "iptables -F again by the children of pid 601".to_string(),
+            )
+        };
+        for _ in 0..30 {
+            b.count_coalesced_at("EVA-002", 0, t0, sample);
+        }
+        let held = b.take_held();
+        assert_eq!(held.len(), 1);
+        assert_eq!((held[0].rule.as_str(), held[0].count), ("EVA-002", 30));
+        assert_eq!(
+            held[0].samples,
+            vec!["iptables -F again by the children of pid 601".to_string()]
+        );
+        // The next record carries the thirty; the budget lost only the two
+        // records' tokens.
+        assert_eq!(
+            b.admit_at("EVA-002", 0, t0, nos),
+            Admit::Record {
+                suppressed_before: 30
+            }
+        );
+        assert_eq!(records(&b, "EVA-002", 0, BURST, t0), BURST - 2);
     }
 
     #[test]

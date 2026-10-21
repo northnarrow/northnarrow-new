@@ -29,7 +29,7 @@ use aya_ebpf::{
     cty::{c_int, c_void},
     helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel},
     macros::{lsm, map},
-    maps::{Array, HashMap},
+    maps::{Array, HashMap, LruHashMap},
     programs::LsmContext,
 };
 
@@ -96,6 +96,66 @@ pub static SHUTDOWN_EXE: Array<InodeKey> = Array::pinned(1, 0);
 /// pinned by an earlier run is dead after a restart.
 #[map]
 pub static AGENT_SESSION: Array<u32> = Array::pinned(1, 0);
+
+/// Lab PR 225 (CM-18): the main processes of the host's other security
+/// tools (auditd, rsyslogd, an EDR agent — the list `security-tools.v1`),
+/// by tgid, written by the agent from `/proc` at boot and from their execs.
+/// A stop or kill signal to one of them is reported, never refused
+/// ([`observe_defender`]). Not pinned: the program is attached fresh every
+/// boot and the agent fills the map after the load.
+#[map]
+pub static DEFENDER_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(256, 0);
+
+/// Lab PR 225: the last report per (sender, target), to report a loop of
+/// signals once a second.
+#[map]
+static DEFENDER_SEEN: LruHashMap<u64, u64> = LruHashMap::with_max_entries(1024, 0);
+
+/// Signals that stop or end a process: SIGINT, SIGQUIT, SIGABRT, SIGKILL,
+/// SIGTERM, SIGSTOP, SIGTSTP. Not SIGHUP and the user signals, which
+/// logrotate and the tools' own clients send to reopen logs or reload.
+#[inline(always)]
+fn stops_or_ends(sig: c_int) -> bool {
+    matches!(sig, 2 | 3 | 6 | 9 | 15 | 19 | 20)
+}
+
+/// Lab PR 225 (CM-18): `sig` to `target_tgid`, a registered security tool,
+/// from anyone but PID 1 (systemd stopping a unit: NN-L-EVA-001 reads the
+/// `systemctl` that asked), the tool itself, another registered tool or the
+/// agent's family. One record on the file-open sensor's ring
+/// (`open_reason::DEFENDER_SIGNAL`: `count` the signal, `flags` the target).
+/// The signal is not refused: these tools are not the agent's to defend in
+/// the kernel; a shell's builtin `kill`, which no exec shows, is seen here.
+#[inline(always)]
+unsafe fn observe_defender(target_tgid: u32, sig: c_int) {
+    if !stops_or_ends(sig) || DEFENDER_PIDS.get(&target_tgid).is_none() {
+        return;
+    }
+    let caller = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if caller == 1
+        || caller == target_tgid
+        || DEFENDER_PIDS.get(&caller).is_some()
+        || PROTECTED_PIDS.get(&caller).is_some()
+    {
+        return;
+    }
+    let key = (u64::from(caller) << 32) | u64::from(target_tgid);
+    let now = bpf_ktime_get_ns();
+    if let Some(last) = DEFENDER_SEEN.get(&key) {
+        if now.saturating_sub(*last) < 1_000_000_000 {
+            return;
+        }
+    }
+    let _ = DEFENDER_SEEN.insert(&key, &now, 0);
+    let _ = crate::open_sensor::nn_open_emit(
+        u64::from(northnarrow_common::wire::open_sensor::open_reason::DEFENDER_SIGNAL)
+            | (u64::from(sig as u32) << 32),
+        0,
+        0,
+        0,
+        u64::from(target_tgid),
+    );
+}
 
 #[lsm(hook = "task_kill")]
 pub fn task_kill(ctx: LsmContext) -> i32 {
@@ -168,6 +228,8 @@ unsafe fn try_task_kill(ctx: &LsmContext) -> i32 {
     // it, so the invalidation window is irrelevant here.
     let is_protected = PROTECTED_PIDS.get(&target_tgid).is_some();
     if !is_protected {
+        // Lab PR 225: a stop or kill of another security tool, reported.
+        observe_defender(target_tgid, sig);
         return 0;
     }
 

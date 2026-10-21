@@ -30,7 +30,8 @@ put back is a signed audit row.
    │ writes (encrypts)                                    └─▶ index worker: SHA-256,
    │                                                         index.jsonl, budget, LRU
    ▼
- response kills the tree (COMBAT NEUTRALIZE, or NN-L-FIM-010's KillProcessTree)
+ response kills the tree (COMBAT NEUTRALIZE, or NN-L-FIM-010's / NN-L-IMP-001's KillProcessTree,
+   the latter once the per-rule response policy turns it on)
    └─▶ auto_restore = true: restore its files ── or ── `nn-admin remediate ransomware --pid N`
 ```
 
@@ -225,10 +226,12 @@ RESOLVE_NO_XDEV)` from the scope's root: a directory swapped for a link to
   verb's own `remediate_ransomware` row. The reply lists up to 120 files.
 - **Automatic** (`auto_restore = true`, default **false**; never in
   detect-only): when the COMBAT ladder's NEUTRALIZE contains a tree
-  (`CombatLadder::with_neutralize_hook`), or NN-L-FIM-010's
-  `KillProcessTree` kills its writer, and a ransomware signal named one of
-  those processes — a mass rewrite of existing files (`Event::MassWrite`
-  with `overwrites`) or NN-L-FIM-010 — the guard restores that tree's files
+  (`CombatLadder::with_neutralize_hook`), or NN-L-FIM-010's or (lab PR
+  225, once the per-rule response policy turns that kill on: it is held,
+  off by default) NN-L-IMP-001's `KillProcessTree` kills its writer, and a ransomware
+  signal named one of those processes — a mass rewrite of existing files
+  (`Event::MassWrite` with `overwrites`), NN-L-FIM-010 or NN-L-IMP-001 — the
+  guard restores that tree's files
   on a thread of its own, once the processes are gone. With the policy off it
   signs `cow_guard` `restore_available` and logs the command.
 
@@ -389,7 +392,8 @@ paths (`open latency`).
   the encrypt-into-new-file shape and rename-over.
 - The writers' flags from the BPF LSM `file_open` hook (a per-task record
   read at the permission event) instead of `/proc/<tid>/syscall`.
-- NN-L-FIM-010 matches the ransomware extension on a rename's destination
-  path, which the drain resolves to the destination *directory*: a watched
-  `x` renamed `x.locked` in place may not match. To be checked in the lab
-  (the check plan says how); the automatic restore does not depend on it.
+- NN-L-FIM-010 matched the ransomware extension on a rename's destination
+  path, which the drain resolved to the destination *directory*: a watched
+  `x` renamed `x.locked` never matched. Lab PR 225 names the new file
+  (`docs/design/RANSOMWARE_DECISIVE.md` §2); the automatic restore does not
+  depend on it.

@@ -87,6 +87,26 @@ pub mod open_reason {
     /// in the window (a writer forking a fresh worker every few files).
     /// `count` carries the cgroup's overwrites.
     pub const MASS_OVERWRITE_CGROUP: u32 = 1 << 8;
+    /// Lab PR 225: a tgid's renames of regular files to one new extension
+    /// — appended to the whole old name (`a.pdf` → `a.pdf.locked`) or in
+    /// place of the old one (`a.pdf` → `a.locked`) — crossed
+    /// [`super::OPEN_RENAME_EXT_MIN`] in the window ([`super::rename_step`]).
+    /// `count` carries the renames of the streak, `flags` those that
+    /// appended, `mode` how often the old extension changed from one
+    /// counted rename to the next (originals of different kinds). The path
+    /// is the file's new name. Seen on `inode_rename` (regular files, LSM file-open sensor armed).
+    pub const MASS_RENAME: u32 = 1 << 9;
+    /// Lab PR 225: a tgid's unlinks of regular files of at least
+    /// [`super::UNLINK_MIN_BYTES`] crossed [`super::OPEN_UNLINK_MIN`] in the
+    /// window ([`super::unlink_step`]). `count` carries them; the path is the
+    /// unlinked file's. Seen on `inode_unlink` (LSM file-open sensor armed).
+    pub const MASS_UNLINK: u32 = 1 << 10;
+    /// Lab PR 225 (CM-18): a signal that stops or ends a process, sent to
+    /// the main process of another security tool (`DEFENDER_PIDS`, filled
+    /// by the agent from `security-tools.v1`) by anyone but PID 1, the tool
+    /// itself or the agent. Seen on `task_kill`, never refused. `count`
+    /// carries the signal, `flags` the target's tgid; no path.
+    pub const DEFENDER_SIGNAL: u32 = 1 << 11;
 }
 
 /// Names in the rule maps: NUL-padded, at most 31 bytes kept.
@@ -114,6 +134,26 @@ pub const OPEN_CG_OVERWRITE_MIN: u32 = 40;
 /// a worker that rewrites three files or more does.
 pub const OPEN_CG_PROC_MIN: u32 = 3;
 const _: () = assert!(OPEN_CG_PROC_MIN >= 2 && OPEN_CG_PROC_MIN < OPEN_CG_OVERWRITE_MIN);
+/// Lab PR 225: renames of one streak (one new extension) per tgid within
+/// [`OPEN_BURST_WINDOW_NS`] that report [`open_reason::MASS_RENAME`]: the
+/// mass-write threshold's value.
+pub const OPEN_RENAME_EXT_MIN: u32 = 20;
+/// Lab PR 225: unlinks per tgid within [`OPEN_BURST_WINDOW_NS`] that report
+/// [`open_reason::MASS_UNLINK`].
+pub const OPEN_UNLINK_MIN: u32 = 20;
+/// Lab PR 225: the window of the rename and unlink counts, the mass-write
+/// window.
+pub const OPEN_BURST_WINDOW_NS: u64 = OPEN_MASS_WRITE_WINDOW_NS;
+/// Lab PR 225: an unlink counts for a file of at least this size, the
+/// overwrite's minimum: originals are documents; a build's and a
+/// compiler's temporary files are mostly smaller.
+pub const UNLINK_MIN_BYTES: u64 = 4096;
+/// Lab PR 225: bytes of a name's end read for its extension. A longer
+/// extension is no extension to the counter.
+pub const NAME_TAIL_LEN: usize = 16;
+/// Lab PR 225: bytes of a name's start kept (NUL-padded), as in the rule
+/// maps.
+pub const NAME_HEAD_LEN: usize = 32;
 /// Rule map capacities (external audit SNS-007): one inode rule per
 /// posture path, home and `/run/user/<uid>` directory; one runtime owner
 /// per runtime directory; child rules for posture paths missing at
@@ -289,6 +329,256 @@ pub struct OpenRecordRaw {
     pub path: [u8; OPEN_PATH_SLOTS * OPEN_PATH_SLOT_LEN],
 }
 
+/// Lab PR 225: a leaf name as the rename counter reads it from a dentry:
+/// its first [`NAME_HEAD_LEN`] − 1 bytes (NUL-padded), its last
+/// `tail_len` bytes (at most [`NAME_TAIL_LEN`]) and its length.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct NameParts {
+    pub head: [u8; NAME_HEAD_LEN],
+    pub tail: [u8; NAME_TAIL_LEN],
+    pub len: u32,
+    pub tail_len: u32,
+}
+
+/// Lab PR 225: both names of a rename, the per-CPU scratch of the counter.
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct RenameNames {
+    pub old: NameParts,
+    pub new: NameParts,
+}
+
+/// Lab PR 225: FNV-1a 64 offset basis and prime.
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Lab PR 225: a name's extension — the bytes after its last dot — as a
+/// hash and a length, `(0, 0)` when it has none: no dot in the tail (or an
+/// extension longer than [`NAME_TAIL_LEN`] − 1), a dot that ends it, the
+/// leading dot of a hidden name with no other (`.bashrc`), or digits only
+/// (`syslog.1`, a rotation). Every loop has a constant bound and every
+/// index is below it: shared with the eBPF program (5.15 rule 5).
+#[inline(always)]
+pub fn name_ext(n: &NameParts) -> (u64, u32) {
+    let tail_len = if n.tail_len > NAME_TAIL_LEN as u32 {
+        NAME_TAIL_LEN as u32
+    } else {
+        n.tail_len
+    };
+    let mut dot = NAME_TAIL_LEN as u32;
+    let mut i = 0;
+    while i < NAME_TAIL_LEN {
+        if (i as u32) < tail_len && n.tail[i] == b'.' {
+            dot = i as u32;
+        }
+        i += 1;
+    }
+    if dot >= tail_len || dot + 1 == tail_len {
+        return (0, 0);
+    }
+    // The tail is the whole name: a dot at its start is a hidden name's.
+    if dot == 0 && n.len <= NAME_TAIL_LEN as u32 {
+        return (0, 0);
+    }
+    let mut h = FNV_BASIS;
+    let mut digits = true;
+    let mut j = 0;
+    while j < NAME_TAIL_LEN {
+        let jj = j as u32;
+        if jj > dot && jj < tail_len {
+            let b = n.tail[j];
+            if !b.is_ascii_digit() {
+                digits = false;
+            }
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        j += 1;
+    }
+    if digits || h == 0 {
+        return (0, 0);
+    }
+    (h, tail_len - dot - 1)
+}
+
+/// Lab PR 225: the first `n` bytes (at most [`NAME_HEAD_LEN`] − 1) of two
+/// heads agree.
+#[inline(always)]
+fn heads_agree(a: &[u8; NAME_HEAD_LEN], b: &[u8; NAME_HEAD_LEN], n: u32) -> bool {
+    let mut same = true;
+    let mut i = 0;
+    while i < NAME_HEAD_LEN - 1 {
+        if (i as u32) < n && a[i] != b[i] {
+            same = false;
+        }
+        i += 1;
+    }
+    same
+}
+
+/// [`rename_shape`]: the rename is not counted.
+pub const RENAME_OTHER: u32 = 0;
+/// [`rename_shape`]: the new extension replaces the old one (`a.pdf` →
+/// `a.locked`).
+pub const RENAME_REPLACED: u32 = 1;
+/// [`rename_shape`]: the new extension is appended to the whole old name
+/// (`a.pdf` → `a.pdf.locked`, `README` → `README.locked`).
+pub const RENAME_APPENDED: u32 = 2;
+
+/// Lab PR 225: what a rename of a regular file is to the burst counter.
+/// Counted: the old name with an extension appended, or with its own
+/// extension replaced by another; never a rotation's digits. Not counted,
+/// by construction: a temporary file renamed to its final name (`x.py.dpkg-new` → `x.py`,
+/// rsync's `.x.c.AbC123` → `x.c`, `sed -i`'s `sedAbc12` → `x.conf`, the
+/// interpreter's `x.pyc.140234` → `x.pyc`), a move to another directory
+/// under the same name, a random new name. Names longer than
+/// [`NAME_HEAD_LEN`] − 1 are compared on that prefix.
+#[inline(always)]
+pub fn rename_shape(old: &NameParts, new: &NameParts) -> u32 {
+    rename_shape_with(old, new, name_ext(new), name_ext(old))
+}
+
+/// [`rename_shape`] with the two names' [`name_ext`] already computed
+/// (`new_ext`, `old_ext`). The eBPF counter computes each extension in a
+/// global function of its own and passes them here: the two extension
+/// scans and the head comparisons inlined in one function took
+/// `nn_rename_burst` past the 1M-instruction limit of the 5.15 and 6.1
+/// verifiers (lab PR 225; KERNEL_COMPATIBILITY "Older verifiers", rule 11).
+#[inline(always)]
+pub fn rename_shape_with(
+    old: &NameParts,
+    new: &NameParts,
+    new_ext: (u64, u32),
+    old_ext: (u64, u32),
+) -> u32 {
+    let (new_ext, new_ext_len) = new_ext;
+    if new_ext_len == 0 {
+        return RENAME_OTHER;
+    }
+    let max = NAME_HEAD_LEN as u32 - 1;
+    if new.len == old.len.saturating_add(1).saturating_add(new_ext_len) {
+        let n = if old.len < max { old.len } else { max };
+        if heads_agree(&old.head, &new.head, n) {
+            return RENAME_APPENDED;
+        }
+    }
+    let (old_ext, old_ext_len) = old_ext;
+    if old_ext_len == 0 || old_ext == new_ext || old.len <= old_ext_len + 1 {
+        return RENAME_OTHER;
+    }
+    let stem = old.len - old_ext_len - 1;
+    if new.len <= new_ext_len || new.len - new_ext_len - 1 != stem {
+        return RENAME_OTHER;
+    }
+    let n = if stem < max { stem } else { max };
+    if heads_agree(&old.head, &new.head, n) {
+        RENAME_REPLACED
+    } else {
+        RENAME_OTHER
+    }
+}
+
+/// Lab PR 225: per-tgid rename window: the streak of renames to one new
+/// extension.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct RenameWindow {
+    pub start_ns: u64,
+    /// The streak's new extension ([`name_ext`]'s hash).
+    pub ext: u64,
+    /// The previous counted rename's old extension (0: none).
+    pub last_src: u64,
+    pub count: u32,
+    /// Renames of the streak that appended ([`RENAME_APPENDED`]).
+    pub appended: u32,
+    /// Changes of the old extension along the streak.
+    pub sources: u32,
+    /// 1 once the window reported.
+    pub fired: u32,
+}
+
+impl RenameWindow {
+    #[inline(always)]
+    pub fn fresh(now: u64, ext: u64, src: u64, appended: bool) -> Self {
+        RenameWindow {
+            start_ns: now,
+            ext,
+            last_src: src,
+            count: 1,
+            appended: appended as u32,
+            sources: 0,
+            fired: 0,
+        }
+    }
+}
+
+/// Lab PR 225: one more counted rename to extension `ext` (from old
+/// extension `src`) in a tgid's window `w` at `now`. `true` once per
+/// window, when the streak reaches [`OPEN_RENAME_EXT_MIN`]. Another
+/// extension starts a new streak in the same window.
+#[inline(always)]
+pub fn rename_step(w: &mut RenameWindow, ext: u64, src: u64, appended: bool, now: u64) -> bool {
+    if now.saturating_sub(w.start_ns) > OPEN_BURST_WINDOW_NS {
+        *w = RenameWindow::fresh(now, ext, src, appended);
+        return false;
+    }
+    if ext != w.ext {
+        w.ext = ext;
+        w.last_src = src;
+        w.count = 1;
+        w.appended = appended as u32;
+        w.sources = 0;
+        return false;
+    }
+    w.count += 1;
+    w.appended += appended as u32;
+    if src != w.last_src {
+        w.sources += 1;
+        w.last_src = src;
+    }
+    if w.count >= OPEN_RENAME_EXT_MIN && w.fired == 0 {
+        w.fired = 1;
+        return true;
+    }
+    false
+}
+
+/// Lab PR 225: per-tgid unlink window.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+#[cfg_attr(feature = "std", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct UnlinkWindow {
+    pub start_ns: u64,
+    pub count: u32,
+    /// 1 once the window reported.
+    pub fired: u32,
+}
+
+/// Lab PR 225: one more counted unlink in a tgid's window `w` at `now`;
+/// the window's unlinks once per window, when they reach
+/// [`OPEN_UNLINK_MIN`], else 0.
+#[inline(always)]
+pub fn unlink_step(w: &mut UnlinkWindow, now: u64) -> u32 {
+    if now.saturating_sub(w.start_ns) > OPEN_BURST_WINDOW_NS {
+        *w = UnlinkWindow {
+            start_ns: now,
+            count: 1,
+            fired: 0,
+        };
+        return 0;
+    }
+    w.count += 1;
+    if w.count >= OPEN_UNLINK_MIN && w.fired == 0 {
+        w.fired = 1;
+        return w.count;
+    }
+    0
+}
+
 /// `name` (a NUL-padded leaf name, as the file-open sensor reads it) ends
 /// in `.kdbx`: `.kdbx` followed by the NUL, scanned at constant-bounded
 /// positions (no `len - 5`, 5.15 rule 5). A name cut at 31 bytes is judged
@@ -349,6 +639,10 @@ mod tests {
         assert_eq!(core::mem::size_of::<OpenWriteWindow>(), 24);
         assert_eq!(core::mem::size_of::<OpenCgKey>(), 16);
         assert_eq!(core::mem::size_of::<OpenCgWindow>(), 16);
+        assert_eq!(core::mem::size_of::<NameParts>(), 56);
+        assert_eq!(core::mem::size_of::<RenameNames>(), 112);
+        assert_eq!(core::mem::size_of::<RenameWindow>(), 40);
+        assert_eq!(core::mem::size_of::<UnlinkWindow>(), 16);
     }
 
     #[test]
@@ -453,5 +747,121 @@ mod tests {
         for i in 0..100u64 {
             assert_eq!(cgroup_step(&mut cg, 3, i * 61 * S), 0);
         }
+    }
+
+    /// Lab PR 225: a name as the eBPF counter reads it.
+    fn parts(s: &str) -> NameParts {
+        let b = s.as_bytes();
+        let mut p = NameParts {
+            head: [0; NAME_HEAD_LEN],
+            tail: [0; NAME_TAIL_LEN],
+            len: b.len() as u32,
+            tail_len: 0,
+        };
+        let h = b.len().min(NAME_HEAD_LEN - 1);
+        p.head[..h].copy_from_slice(&b[..h]);
+        let t = b.len().min(NAME_TAIL_LEN);
+        p.tail[..t].copy_from_slice(&b[b.len() - t..]);
+        p.tail_len = t as u32;
+        p
+    }
+
+    #[test]
+    fn name_ext_reads_the_last_extension() {
+        let ext = |s: &str| name_ext(&parts(s)).1;
+        assert_eq!(ext("report.pdf"), 3);
+        assert_eq!(ext("report.pdf.locked"), 6);
+        assert_eq!(ext("a-very-long-document-name-of-a-user.docx.lockbit3"), 8);
+        assert_eq!(ext("README"), 0);
+        assert_eq!(ext(".bashrc"), 0, "a hidden name has no extension");
+        assert_eq!(ext("syslog.1"), 0, "a rotation's digits are not one");
+        assert_eq!(ext("trailing."), 0);
+        assert_eq!(ext("x.an-extension-too-long"), 0);
+        assert_eq!(
+            name_ext(&parts("a.locked")).0,
+            name_ext(&parts("b.locked")).0
+        );
+        assert_ne!(
+            name_ext(&parts("a.locked")).0,
+            name_ext(&parts("a.crypt")).0
+        );
+    }
+
+    /// Lab PR 225: what the rename counter counts — the shapes of an
+    /// encryptor renaming its output — and what it never counts: the
+    /// temporary-file renames of package managers, rsync, sed and the
+    /// interpreters, rotations, plain moves.
+    #[test]
+    fn rename_shape_counts_appends_and_replacements_only() {
+        let shape = |a: &str, b: &str| rename_shape(&parts(a), &parts(b));
+        assert_eq!(shape("report.pdf", "report.pdf.locked"), RENAME_APPENDED);
+        assert_eq!(shape("README", "README.locked"), RENAME_APPENDED);
+        assert_eq!(
+            shape(
+                "Quarterly figures for the board 2026.xlsx",
+                "Quarterly figures for the board 2026.xlsx.lockbit"
+            ),
+            RENAME_APPENDED
+        );
+        assert_eq!(shape("report.pdf", "report.locked"), RENAME_REPLACED);
+        for (a, b) in [
+            ("x.py.dpkg-new", "x.py"),
+            (".x.c.AbC123", "x.c"),
+            ("sedAbc123", "x.conf"),
+            ("x.cpython-312.pyc.140234", "x.cpython-312.pyc"),
+            ("syslog", "syslog.1"),
+            ("syslog.1", "syslog.2"),
+            ("report.pdf", "report.pdf"),
+            ("report.pdf", "Xk3fA9.lockbit"),
+            ("report.locked", "report.locked"),
+            (".x.locked", "x"),
+        ] {
+            assert_eq!(shape(a, b), RENAME_OTHER, "{a} -> {b}");
+        }
+    }
+
+    #[test]
+    fn rename_step_reports_one_streak_once_per_window() {
+        const S: u64 = 1_000_000_000;
+        let locked = name_ext(&parts("a.locked")).0;
+        let other = name_ext(&parts("a.bak")).0;
+        let (pdf, doc) = (name_ext(&parts("a.pdf")).0, name_ext(&parts("a.doc")).0);
+        let mut w = RenameWindow::fresh(0, locked, pdf, true);
+        for i in 1..OPEN_RENAME_EXT_MIN - 1 {
+            let src = if i % 2 == 0 { pdf } else { doc };
+            assert!(!rename_step(&mut w, locked, src, true, i as u64));
+        }
+        assert!(rename_step(&mut w, locked, pdf, true, 30 * S));
+        assert_eq!(w.count, OPEN_RENAME_EXT_MIN);
+        assert_eq!(w.appended, OPEN_RENAME_EXT_MIN);
+        assert!(w.sources >= OPEN_RENAME_EXT_MIN - 2);
+        assert!(
+            !rename_step(&mut w, locked, pdf, true, 31 * S),
+            "once per window"
+        );
+        // Another extension starts its own streak.
+        assert!(!rename_step(&mut w, other, pdf, false, 32 * S));
+        assert_eq!(w.count, 1);
+        // A new window.
+        let mut w = RenameWindow::fresh(0, locked, pdf, false);
+        assert!(!rename_step(&mut w, locked, pdf, false, 61 * S));
+        assert_eq!((w.count, w.start_ns), (1, 61 * S));
+    }
+
+    #[test]
+    fn unlink_step_reports_once_per_window() {
+        const S: u64 = 1_000_000_000;
+        let mut w = UnlinkWindow {
+            start_ns: 0,
+            count: 1,
+            fired: 0,
+        };
+        for i in 1..OPEN_UNLINK_MIN - 1 {
+            assert_eq!(unlink_step(&mut w, i as u64), 0);
+        }
+        assert_eq!(unlink_step(&mut w, S), OPEN_UNLINK_MIN);
+        assert_eq!(unlink_step(&mut w, 2 * S), 0);
+        assert_eq!(unlink_step(&mut w, 62 * S), 0, "a new window");
+        assert_eq!(w.count, 1);
     }
 }

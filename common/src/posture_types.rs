@@ -124,7 +124,39 @@ pub enum TriggerType {
     // COMBAT and isolate the host on its own (design note, "Response").
     // Appended last to keep variant ordering stable.
     ExploitPostcondition,
+
+    // Lab PR 225: one process's file activity has two of the four shapes of
+    // ransomware at once — rewrites of existing files, high-entropy content
+    // over them, renames to one new extension, deletion of originals after
+    // writing new files — from a writer whose trust (a package transaction,
+    // or a packaged program with no foreign program in its lineage) is not
+    // established (NN-L-IMP-001). The combination is its own corroboration:
+    // straight to COMBAT. It does not lock COMBAT (any user can encrypt
+    // their own files: external audit POS-001), so the ladder contains at the
+    // process level and the posture decays once quiet. Appended last to keep
+    // variant ordering stable.
+    RansomwareEncryption,
+
+    // Lab PR 225: a security tool of the host — auditd, AppArmor, the
+    // firewall, an EDR or cloud agent of the signed list
+    // `security-tools.v1` — stopped, disabled, masked, killed, switched off
+    // by its own command or its configuration changed, outside a package
+    // transaction and an administrator's interactive session
+    // (NN-L-EVA-001..004). ENGAGED: it vouches for a later COMBAT-tier
+    // heuristic of another kind from the same actor. Appended last to keep
+    // variant ordering stable.
+    DefenseImpairment,
 }
+
+/// Lab PR 225, held by the decision of 21/10/2026 (no new destructive
+/// automation on by default until the signed per-rule response policy,
+/// Phase 2): whether [`TriggerType::RansomwareEncryption`] — two shapes of
+/// one actor's file activity — reaches COMBAT without corroboration
+/// ([`Confidence::Decisive`]). Off: it needs corroboration like the other
+/// heuristics — ENGAGED alone, COMBAT when a signal of another class in its
+/// scope vouches for it. NN-L-IMP-001's kill is held with it
+/// (`decision::response_policy::IMP_001_KILL` in the agent).
+pub const RANSOMWARE_COMBAT_WITHOUT_CORROBORATION: bool = false;
 
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
 ///
@@ -173,7 +205,9 @@ impl TriggerType {
             | TriggerType::StagingExec => EvidenceClass::Execution,
             TriggerType::SensitiveFileAccess
             | TriggerType::CriticalFileModification
-            | TriggerType::PersistenceMechanism => EvidenceClass::FileSystem,
+            | TriggerType::PersistenceMechanism
+            | TriggerType::RansomwareEncryption => EvidenceClass::FileSystem,
+            TriggerType::DefenseImpairment => EvidenceClass::Execution,
             TriggerType::AntiTamperDenial
             | TriggerType::RelayedTamperAttempt
             | TriggerType::ControlSurfaceTamper
@@ -196,7 +230,8 @@ impl TriggerType {
             | TriggerType::HeavyReconnaissance
             | TriggerType::CriticalFileModification
             | TriggerType::RelayedTamperAttempt
-            | TriggerType::StagingExec => PostureKind::Engaged,
+            | TriggerType::StagingExec
+            | TriggerType::DefenseImpairment => PostureKind::Engaged,
 
             TriggerType::ConfirmedIntrusion
             | TriggerType::PersistenceMechanism
@@ -204,7 +239,8 @@ impl TriggerType {
             | TriggerType::ExfiltrationPattern
             | TriggerType::AntiTamperDenial
             | TriggerType::ControlSurfaceTamper
-            | TriggerType::ExploitPostcondition => PostureKind::Combat,
+            | TriggerType::ExploitPostcondition
+            | TriggerType::RansomwareEncryption => PostureKind::Combat,
         }
     }
 
@@ -221,13 +257,35 @@ impl TriggerType {
     /// Trust class for COMBAT-targeting triggers (BUG-032). Only
     /// [`Confidence::Decisive`] escalates straight to COMBAT; every
     /// heuristic pattern is [`Confidence::NeedsCorroboration`].
+    /// [`TriggerType::RansomwareEncryption`] is decisive only with
+    /// [`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`] (off by default).
     pub fn confidence(&self) -> Confidence {
         match self {
             TriggerType::AntiTamperDenial | TriggerType::ControlSurfaceTamper => {
                 Confidence::Decisive
             }
+            TriggerType::RansomwareEncryption if RANSOMWARE_COMBAT_WITHOUT_CORROBORATION => {
+                Confidence::Decisive
+            }
             _ => Confidence::NeedsCorroboration,
         }
+    }
+
+    /// Lab PR 225: whether this trigger alone LOCKS the COMBAT it reaches
+    /// (external audit POS-001: no decay, a signed release, the ladder may
+    /// isolate the host). Only evidence an unprivileged user cannot produce:
+    /// a kernel-adjudicated denial, a tamper of the anti-tamper control
+    /// surface. [`TriggerType::RansomwareEncryption`] is decisive — it
+    /// reaches COMBAT without corroboration — but it does not lock: any user
+    /// can encrypt their own files, and a lock would let them have the host
+    /// isolated. Its COMBAT locks only as POS-001 says for every other
+    /// signal (corroborated in its scope by root's change outside an
+    /// administrator's session).
+    pub fn locks_combat(&self) -> bool {
+        matches!(
+            self,
+            TriggerType::AntiTamperDenial | TriggerType::ControlSurfaceTamper
+        )
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -250,6 +308,8 @@ impl TriggerType {
             TriggerType::StagingExec => "StagingExec",
             TriggerType::ControlSurfaceTamper => "ControlSurfaceTamper",
             TriggerType::ExploitPostcondition => "ExploitPostcondition",
+            TriggerType::RansomwareEncryption => "RansomwareEncryption",
+            TriggerType::DefenseImpairment => "DefenseImpairment",
         }
     }
 }
@@ -359,6 +419,32 @@ mod tests {
         assert_eq!(t.evidence_class(), EvidenceClass::Kernel);
         assert!(t.is_corroboration());
         assert_eq!(t.as_str(), "ExploitPostcondition");
+    }
+
+    /// Lab PR 225: the ransomware combination targets COMBAT, file-system
+    /// evidence, never locking it (POS-001); it reaches COMBAT on its own
+    /// only once the per-rule policy turns that on — until then it needs
+    /// corroboration. The security-tool tamper raises ENGAGED as execution
+    /// evidence that can corroborate. The kernel-adjudicated triggers keep
+    /// their lock.
+    #[test]
+    fn ransomware_is_decisive_without_locking_and_defense_impairment_engages() {
+        let r = TriggerType::RansomwareEncryption;
+        assert_eq!(r.target_level(), PostureKind::Combat);
+        const { assert!(!RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
+        assert_eq!(r.confidence(), Confidence::NeedsCorroboration);
+        assert_eq!(r.evidence_class(), EvidenceClass::FileSystem);
+        assert!(!r.locks_combat());
+        assert!(r.is_corroboration());
+        assert_eq!(r.as_str(), "RansomwareEncryption");
+        let d = TriggerType::DefenseImpairment;
+        assert_eq!(d.target_level(), PostureKind::Engaged);
+        assert_eq!(d.evidence_class(), EvidenceClass::Execution);
+        assert!(d.is_corroboration());
+        assert!(!d.locks_combat());
+        assert_eq!(d.as_str(), "DefenseImpairment");
+        assert!(TriggerType::AntiTamperDenial.locks_combat());
+        assert!(TriggerType::ControlSurfaceTamper.locks_combat());
     }
 
     #[test]

@@ -5,7 +5,14 @@
 //! with a SECOND distinct escalation signal within
 //! [`CORROBORATION_WINDOW`]. Decisive triggers (kernel-adjudicated,
 //! [`common::posture_types::Confidence::Decisive`]) bypass this and
-//! reach COMBAT immediately. This makes the FSM ladder
+//! reach COMBAT immediately. Lab PR 225: so would the ransomware
+//! combination (`RansomwareEncryption`: two independent shapes of one
+//! actor's file activity, its own corroboration), decisive without being
+//! kernel-adjudicated — reaching COMBAT without locking it
+//! (`TriggerType::locks_combat`, external audit POS-001) — once the signed
+//! per-rule policy turns that on
+//! (`posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`, off by
+//! default: until then it needs corroboration). This makes the FSM ladder
 //! (Observing→Alerted→Engaged→Combat) mean what it says, instead of a
 //! single blunt heuristic jumping straight to locked isolation.
 //!
@@ -32,12 +39,13 @@ pub const CORROBORATION_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// External audit POS-008: the entries one scope keeps. A repeat of a
 /// signal refreshes its entry instead of adding one
 /// ([`LedgerEntry::same_signal`]), so a scope holds at most one entry per
-/// trigger, evidence class and privilege — 15 with today's triggers —
-/// plus the configuration changes still waiting for their writer to be
-/// placed. Above the bound the scope's own least useful entry goes
-/// ([`LedgerEntry::keep_rank`]): a flood from one actor never evicts
-/// another actor's evidence.
-const SCOPE_CAP: usize = 16;
+/// trigger, evidence class and privilege — 18 with today's triggers (lab
+/// PR 225 added `RansomwareEncryption`, file system with and without
+/// privilege, and `DefenseImpairment`, execution) — plus the configuration
+/// changes still waiting for their writer to be placed. Above the bound the
+/// scope's own least useful entry goes ([`LedgerEntry::keep_rank`]): a
+/// flood from one actor never evicts another actor's evidence.
+const SCOPE_CAP: usize = 19;
 
 /// Defensive bound on the whole ledger against a trigger flood spread
 /// over many scopes (external audit POS-008: was one FIFO of 64 shared by

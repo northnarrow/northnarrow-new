@@ -229,6 +229,15 @@ pub struct StatusOutcome {
     pub net_flow_snapshots_total: Option<u64>,
     pub net_flow_snapshots_deferred_total: Option<u64>,
     pub net_connect_denied_total: Option<u64>,
+    /// Lab PR 225: the ransomware signal and the security tools
+    /// (`StatusResponse`'s fields of the same names).
+    pub ransomware_decisive_total: Option<u64>,
+    pub ransomware_signals_total: Option<u64>,
+    pub ransomware_trusted_total: Option<u64>,
+    pub ransomware_samplings_total: Option<u64>,
+    pub defense_tamper_total: Option<u64>,
+    pub defense_tamper_sanctioned_total: Option<u64>,
+    pub defense_tools_watched: Option<u64>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -469,6 +478,13 @@ fn status_outcome(
         net_flow_snapshots_total: resp.net_flow_snapshots_total,
         net_flow_snapshots_deferred_total: resp.net_flow_snapshots_deferred_total,
         net_connect_denied_total: resp.net_connect_denied_total,
+        ransomware_decisive_total: resp.ransomware_decisive_total,
+        ransomware_signals_total: resp.ransomware_signals_total,
+        ransomware_trusted_total: resp.ransomware_trusted_total,
+        ransomware_samplings_total: resp.ransomware_samplings_total,
+        defense_tamper_total: resp.defense_tamper_total,
+        defense_tamper_sanctioned_total: resp.defense_tamper_sanctioned_total,
+        defense_tools_watched: resp.defense_tools_watched,
         telemetry_signed: signed,
     }
 }
@@ -3741,6 +3757,13 @@ mod tests {
                     net_flow_snapshots_total: Some(60),
                     net_flow_snapshots_deferred_total: Some(1),
                     net_connect_denied_total: None,
+                    ransomware_decisive_total: Some(1),
+                    ransomware_signals_total: Some(2),
+                    ransomware_trusted_total: Some(3),
+                    ransomware_samplings_total: Some(4),
+                    defense_tamper_total: Some(5),
+                    defense_tamper_sanctioned_total: Some(6),
+                    defense_tools_watched: Some(7),
                 }),
             );
         });

@@ -847,6 +847,30 @@ pub struct StatusResponse {
     pub net_flow_snapshots_deferred_total: Option<u64>,
     #[serde(default)]
     pub net_connect_denied_total: Option<u64>,
+    /// Lab PR 225 (CM-16): the ransomware signal since boot — decisive
+    /// assessments (NN-L-IMP-001; one per actor and window), shapes counted
+    /// toward an actor, bursts of trusted writers not counted, entropy
+    /// samplings run. Appended after lab PR 224's counters (lab PRs 215 to
+    /// 224 append after lab PR 207's fields); `None` from an agent older
+    /// than the fields.
+    #[serde(default)]
+    pub ransomware_decisive_total: Option<u64>,
+    #[serde(default)]
+    pub ransomware_signals_total: Option<u64>,
+    #[serde(default)]
+    pub ransomware_trusted_total: Option<u64>,
+    #[serde(default)]
+    pub ransomware_samplings_total: Option<u64>,
+    /// Lab PR 225 (CM-18): security tools switched off since boot
+    /// (NN-L-EVA-001..004) outside a package transaction or an
+    /// administrator's session, the sanctioned ones, and the tools'
+    /// processes `task_kill` watches now. `None` from an older agent.
+    #[serde(default)]
+    pub defense_tamper_total: Option<u64>,
+    #[serde(default)]
+    pub defense_tamper_sanctioned_total: Option<u64>,
+    #[serde(default)]
+    pub defense_tools_watched: Option<u64>,
 }
 
 /// Lab PR 219: the exploit post-condition guard in `nn-admin status`.
@@ -943,6 +967,13 @@ impl StatusResponse {
             net_flow_snapshots_total: None,
             net_flow_snapshots_deferred_total: None,
             net_connect_denied_total: None,
+            ransomware_decisive_total: None,
+            ransomware_signals_total: None,
+            ransomware_trusted_total: None,
+            ransomware_samplings_total: None,
+            defense_tamper_total: None,
+            defense_tamper_sanctioned_total: None,
+            defense_tools_watched: None,
         }
     }
 
@@ -2024,6 +2055,13 @@ mod tests {
             net_flow_snapshots_total: None,
             net_flow_snapshots_deferred_total: None,
             net_connect_denied_total: None,
+            ransomware_decisive_total: None,
+            ransomware_signals_total: None,
+            ransomware_trusted_total: None,
+            ransomware_samplings_total: None,
+            defense_tamper_total: None,
+            defense_tamper_sanctioned_total: None,
+            defense_tools_watched: None,
         }));
     }
 
@@ -2077,6 +2115,13 @@ mod tests {
             net_flow_snapshots_total: None,
             net_flow_snapshots_deferred_total: None,
             net_connect_denied_total: None,
+            ransomware_decisive_total: None,
+            ransomware_signals_total: None,
+            ransomware_trusted_total: None,
+            ransomware_samplings_total: None,
+            defense_tamper_total: None,
+            defense_tamper_sanctioned_total: None,
+            defense_tools_watched: None,
         }));
     }
 
@@ -2311,6 +2356,13 @@ mod tests {
             net_flow_snapshots_total: Some(120),
             net_flow_snapshots_deferred_total: Some(0),
             net_connect_denied_total: Some(2),
+            ransomware_decisive_total: None,
+            ransomware_signals_total: None,
+            ransomware_trusted_total: None,
+            ransomware_samplings_total: None,
+            defense_tamper_total: None,
+            defense_tamper_sanctioned_total: None,
+            defense_tools_watched: None,
         }));
     }
 
@@ -2393,6 +2445,13 @@ mod tests {
             net_flow_snapshots_total: None,
             net_flow_snapshots_deferred_total: None,
             net_connect_denied_total: None,
+            ransomware_decisive_total: None,
+            ransomware_signals_total: None,
+            ransomware_trusted_total: None,
+            ransomware_samplings_total: None,
+            defense_tamper_total: None,
+            defense_tamper_sanctioned_total: None,
+            defense_tools_watched: None,
         }
     }
 
@@ -2959,8 +3018,8 @@ mod tests {
     /// public, passed through by the unsigned reply — and an `nn-admin` of
     /// lab PR 213 reads every byte before it (the two fields follow lab PR
     /// 215's; the fields appended after them — lab PR 218's four, 219's
-    /// and 222's one each, 223's ten, 224's four — are `None` in a public
-    /// reply).
+    /// and 222's one each, 223's ten, 224's four, 225's seven — are `None`
+    /// in a public reply).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -2978,8 +3037,8 @@ mod tests {
         // them (one `None` byte each here) are the last bytes of both: lab
         // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
         // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
-        // counters.
-        let tail = 4 + 1 + 1 + 10 + 4;
+        // counters, lab PR 225's seven.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);
