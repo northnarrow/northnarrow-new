@@ -137,13 +137,15 @@ entry names the lab PR that fixed it.
   167: an entry starting `ANTI-TAMPER DENIAL op=signal`, which the
   anti-tamper suite counted as evidence). Found by the Wave 3 re-check;
   fixed with NN-AUD-413 (lab PR 167).
-- **DNS attribution on hosts that resolve through systemd-resolved.** On
+- **DNS attribution on hosts that resolve through systemd-resolved —
+  fixed (lab PR 229).** On
   Debian 13 `nsswitch.conf` puts `resolve` before `dns`: `getaddrinfo`
   asks systemd-resolved over varlink and resolved sends the query, so the
   query and the connect never share a pid
   (`net_outbound_connect_records_flow_with_dns_attribution` fails there,
   on `main` too). Distributions with `nss-resolve` (Debian 13, Fedora)
-  lose the hostname on their flows.
+  lose the hostname on their flows. Fixed with a uprobe on the NSS
+  module's lookups, whose names feed the attribution (lab PR 229).
 - **A burst of TCP closes overflows the `tcp_close` ring.** 20,000 sockets
   closed at one process exit: 16,079 close events dropped by the 256 KiB
   ring (counted in `nn-admin net status` and the journal) — lab PR 164's

@@ -31,6 +31,7 @@ today's counts on a host.
 | Debian 12 (bookworm) | 6.1.0-53-cloud-amd64 | yes (default list includes `bpf`) | yes | **supported** — full suites green (e2e, detection, canary, net, honeypot, FIM, map pinning) with 20 of 42 offsets (at the date shown) resolved differently from the build, `iov_iter` via alternative paths, `ITER_UBUF` = 6, QNAME via `ITER_IOVEC`. Under the systemd unit the agent needs `CAP_SYS_ADMIN` (Debian's `perf_event_paranoid=3` patch); `install.sh` adds it through a drop-in on Debian-family hosts | 2026-10-09 |
 | Ubuntu 22.04 LTS | 5.15.0-198-generic | needs `lsm=…,bpf` (grub) | yes | **supported (degraded)** — all 27 programs and the 8 FIM observe hooks load and attach after three rewrites for the older verifier (see below); 5.15 has no `ITER_UBUF` / `iov_iter.ubuf`, so the DNS QNAME is decoded through the `ITER_IOVEC` path only (`--btf-check` says `SUPPORTED (degraded)`); e2e + ignored suites green | 2026-10-10 (lab PR 17) |
 | AlmaLinux 9 (RHEL / Rocky 9 family) | 5.14.0-687 el9_8 | yes (default list includes `bpf`) | yes | **supported** — e2e agent 6/6, FIM 4/4, watchdog 4/4 with SELinux **enforcing** (no AVC denial); `--btf-check` = SUPPORTED, 0 absent (RHEL backports `iov_iter.ubuf`); the vendor tracepoint header (`common_preempt_lazy_count`) is handled by resolving tracepoint field offsets from tracefs at boot (see below) | 2026-10-10 (lab PR 20) |
+| Ubuntu 26.04 LTS | 7.0.0-38-generic | needs `lsm=…,bpf` (the lab template sets it) | yes | the hosted CI runners' release, with uutils coreutils (lab PR 229): `verifier-check` 77 of 77 OK, privileged suites 80 of 80 (the gate's `test-ignored`); `install.sh --upgrade` needed the immutable state directory unlocked before `install -d` (fixed); `malsim/exec-check.sh` passes except its two NN-L-EXECENV-002 cases (`HISTFILE=/dev/null bash`, `GLIBC_TUNABLES` at su), which drew no record — a follow-up | 2026-10-22 (lab PR 229) |
 | Debian 13 (trixie) | 6.12 | `lsm=…,bpf` set by the lab template | yes | the first guest from 6.9: `inode_setattr`'s dentry is argument 1, read from the prototype (see "Kernels from 6.9" below); verified there: chmod, chown and touch of a protected file refused (allowed on `main`), the FIM setattr observer records; privileged suites 81 of 82 — DNS attribution fails on `main` too, the guest resolves through `nss-resolve` | 2026-10-16 (lab PR 164) |
 
 Prerequisites common to every row: `CONFIG_DEBUG_INFO_BTF=y` (the
@@ -561,6 +562,29 @@ Both plain names are present on 5.15, 6.1 and 6.8. To check a kernel:
   `--dns-sensor sendmsg`. The fallback is logged at WARN.
 - **No `udp_v6_send_skb`:** IPv4 stays on the socket buffer. Queries to
   IPv6 resolvers are not observed, and a WARN says so.
+
+## DNS names asked through systemd-resolved's NSS module (lab PR 229)
+
+Where `/etc/nsswitch.conf` puts `resolve` before `dns` (Debian 13, Fedora,
+Arch), glibc's lookups go through `libnss_resolve.so.2`, which asks
+systemd-resolved over varlink: the process sends no datagram to port 53,
+and the DNS sensor sees only systemd-resolved's own upstream query. For the
+DNS attribution of the process's flows (`resolved_hostname`), the agent
+attaches a uprobe (`dns_nss_resolve`) to the module's
+`_nss_resolve_gethostbyname4_r` and `_nss_resolve_gethostbyname3_r` (the
+other entry points are systemd's fallbacks onto `…3_r`), in each root-owned
+copy of the module in the system library directories. It reads the name the
+process passed, under the DNS sensor's budgets; the name feeds the
+attribution only (the DNS rules judge the queries on the wire).
+
+- **Optional.** No module, or a probe that does not attach, is logged and
+  named in the boot manifest (`dns_nss`); those processes' flows carry no
+  name, as before. Uprobes need `CONFIG_UPROBES` (set on every supported
+  distribution kernel).
+- **A module replaced after boot** (an upgrade of systemd) is a new file:
+  the probe stays on the old one until the agent restarts.
+- **Not seen:** a program that asks systemd-resolved itself (varlink or
+  D-Bus, not through glibc), a statically linked resolver.
 
 ## Standard streams at exec and the connect deny (lab PR 224)
 

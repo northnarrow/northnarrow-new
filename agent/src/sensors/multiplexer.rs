@@ -18,6 +18,7 @@
 //! query observation BEFORE the corresponding `Event::*` lands on
 //! the bus.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -331,6 +332,9 @@ impl SensorMultiplexer {
         // and the kernel-side observation would waste cycles. Keep
         // start() lean for the existing exec_sensor_live test.
         let net_bufs = if net.is_some() {
+            // Lab PR 229: names resolved through systemd-resolved's NSS
+            // module, for the DNS attribution (optional).
+            crate::sensors::dns_sensor::attach_nss(&mut ebpf);
             // `tcp_close` is fexit — needs vmlinux BTF for the
             // function signature. Without BTF this fails the start, like
             // the anti-tamper deny hooks do (review 53): BTF is a hard
@@ -897,6 +901,7 @@ async fn pump_tcp_connect(
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
+    let mut batch: Vec<TcpConnectRaw> = Vec::new();
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -905,13 +910,7 @@ async fn pump_tcp_connect(
             drained += 1;
             let bytes: &[u8] = item.as_ref();
             match bytemuck::try_from_bytes::<TcpConnectRaw>(bytes) {
-                Ok(raw) => {
-                    for event in connect_events(raw, flow_tracker.as_ref()) {
-                        if tx.send(event).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
+                Ok(raw) => batch.push(*raw),
                 Err(_e) => reject.record(
                     "tcp_connect",
                     std::mem::size_of::<TcpConnectRaw>(),
@@ -920,6 +919,22 @@ async fn pump_tcp_connect(
             }
         }
         guard.clear_ready();
+        // Lab PR 229: the connect-time rows name the destination's DNS name
+        // once the DNS pump has read the queries made before these
+        // connects (`DnsIngest`); read later, a query was not there yet.
+        if let (Some(w), Some(newest)) = (
+            flow_tracker.as_ref(),
+            batch.iter().map(|r| r.timestamp_ns).max(),
+        ) {
+            w.dns_cache.ingest().caught_up(newest).await;
+        }
+        for raw in batch.drain(..) {
+            for event in connect_events(&raw, flow_tracker.as_ref()) {
+                if tx.send(event).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
         if drained == 0 {
             reject.flush_idle("tcp_connect", std::mem::size_of::<TcpConnectRaw>());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -1075,13 +1090,55 @@ fn dns_events(
     (event, flood)
 }
 
+/// Lab PR 229: one [`dns_flags::NSS`] record — a name the process asked
+/// systemd-resolved for through its NSS module. It feeds the DNS cache
+/// only, for the attribution of the process's connects: no
+/// `Event::DnsQuery` (no datagram was sent, and the DNS rules judge the
+/// queries that go on the wire — systemd-resolved's own for this name),
+/// and no server, so the forwarder back-correlation (`originator_for`,
+/// local stubs only) does not count it. The `Event::DnsFlood` of the
+/// queries the DNS budgets held back, which this record carries as any
+/// other would, still goes out.
+fn nss_events(
+    raw: &DnsQueryRaw,
+    lineage: &AuthSessionTracker,
+    dns_cache: Option<&DnsCache>,
+) -> Option<Event> {
+    if let (Some(cache), Some(name)) = (dns_cache, common::nss_query_name(raw)) {
+        cache.on_dns_query(
+            raw.pid,
+            name,
+            0,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            raw.timestamp_ns,
+        );
+    }
+    (raw.held != 0).then(|| Event::DnsFlood {
+        pid: raw.pid,
+        uid: raw.uid,
+        comm: common::wire::cstr_lossy(&raw.comm).into_owned(),
+        exe: dns_sender_exe(lineage, raw.pid, raw.timestamp_ns),
+        held: u32::from(raw.held),
+        uid_level: raw.flags & dns_flags::RATE_HELD_UID != 0,
+        timestamp_ns: raw.timestamp_ns,
+    })
+}
+
 fn spawn_dns_query_pump(
     rb: RingBuf<MapData>,
     dns_cache: Option<Arc<DnsCache>>,
     lineage: AuthSessionTracker,
     tx: mpsc::Sender<Event>,
 ) -> JoinHandle<()> {
+    // Lab PR 229: the DNS attributions of the net drain and the connect
+    // pump wait for this pump's passes while it runs (`DnsIngest`) —
+    // claimed here, before any of them can read a record, and released
+    // when the pump ends.
+    let claim = dns_cache
+        .as_ref()
+        .map(|c| crate::net::dns_cache::IngestClaim::new(Arc::clone(c)));
     tokio::spawn(async move {
+        let _claim = claim;
         if let Err(e) = pump_dns_query(rb, dns_cache, lineage, tx).await {
             error!(error = %e, "dns_query pump failed");
         }
@@ -1096,36 +1153,122 @@ async fn pump_dns_query(
 ) -> std::io::Result<()> {
     let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
+    // Lab PR 229: a pass feeds the cache with every record it reads; the
+    // events wait here for the bus, in ring order. A full bus held each
+    // record — and the cache — behind the send of the one before it, so a
+    // connect and a close were attributed while their process's query was
+    // still in the ring. The ring is read on, and a lookup's pass served,
+    // while events wait, up to [`DNS_OUTBOX_MAX`] of them.
+    let mut outbox: VecDeque<Event> = VecDeque::new();
     loop {
-        let mut guard = async_fd.readable_mut().await?;
-        let inner = guard.get_inner_mut();
-        let mut drained = 0u32;
-        while let Some(item) = inner.next() {
-            drained += 1;
-            let bytes: &[u8] = item.as_ref();
-            match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
-                Ok(raw) => {
-                    let (event, flood) = dns_events(raw, &lineage, dns_cache.as_deref());
-                    if tx.send(event).await.is_err() {
-                        return Ok(());
+        let room = outbox.len() < DNS_OUTBOX_MAX;
+        let step = tokio::select! {
+            r = async_fd.readable_mut(), if room => {
+                let mut guard = r?;
+                let drained = dns_pass(
+                    guard.get_inner_mut(),
+                    &lineage,
+                    dns_cache.as_deref(),
+                    &mut reject,
+                    &mut outbox,
+                );
+                guard.clear_ready();
+                if drained == 0 { DnsStep::Idle } else { DnsStep::Read }
+            }
+            () = async {
+                match dns_cache.as_deref() {
+                    Some(c) => c.ingest().wanted().await,
+                    None => std::future::pending().await,
+                }
+            }, if room => DnsStep::Asked,
+            permit = tx.reserve(), if !outbox.is_empty() => match permit {
+                Ok(permit) => {
+                    if let Some(event) = outbox.pop_front() {
+                        permit.send(event);
                     }
-                    if let Some(flood) = flood {
-                        if tx.send(flood).await.is_err() {
-                            return Ok(());
+                    // and whatever else the bus takes now, in order
+                    while let Some(event) = outbox.pop_front() {
+                        match tx.try_send(event) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(event)) => {
+                                outbox.push_front(event);
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                         }
                     }
+                    DnsStep::Read
                 }
-                Err(_e) => {
-                    reject.record("dns_query", std::mem::size_of::<DnsQueryRaw>(), bytes.len())
-                }
+                Err(_) => return Ok(()),
+            },
+        };
+        match step {
+            // a lookup asked for a pass: the ring is read, ready or not
+            DnsStep::Asked => {
+                dns_pass(
+                    async_fd.get_mut(),
+                    &lineage,
+                    dns_cache.as_deref(),
+                    &mut reject,
+                    &mut outbox,
+                );
             }
-        }
-        guard.clear_ready();
-        if drained == 0 {
-            reject.flush_idle("dns_query", std::mem::size_of::<DnsQueryRaw>());
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            DnsStep::Idle => {
+                reject.flush_idle("dns_query", std::mem::size_of::<DnsQueryRaw>());
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            DnsStep::Read => {}
         }
     }
+}
+
+/// Lab PR 229: what one turn of the DNS pump did.
+enum DnsStep {
+    /// Read records, or sent events.
+    Read,
+    /// Woken with nothing to read.
+    Idle,
+    /// A lookup asked for a pass.
+    Asked,
+}
+
+/// Lab PR 229: the most DNS events the pump holds for a full bus. Past it
+/// the ring is left to fill (the kernel counts what it then drops), as it
+/// was while the pump waited on each send.
+const DNS_OUTBOX_MAX: usize = 8192;
+
+/// One pass over the DNS ring, to empty: each record's events into
+/// `outbox`, the cache fed. Returns the records read. Lab PR 229: the pass
+/// is marked in the cache's [`crate::net::dns_cache::DnsIngest`] with the
+/// time it began — every record submitted before it has been read.
+fn dns_pass(
+    ring: &mut RingBuf<MapData>,
+    lineage: &AuthSessionTracker,
+    dns_cache: Option<&DnsCache>,
+    reject: &mut RejectThrottle,
+    outbox: &mut VecDeque<Event>,
+) -> u32 {
+    let began_ns = crate::net::dns_cache::monotonic_ns();
+    let mut drained = 0u32;
+    while let Some(item) = ring.next() {
+        drained += 1;
+        let bytes: &[u8] = item.as_ref();
+        match bytemuck::try_from_bytes::<DnsQueryRaw>(bytes) {
+            Ok(raw) if raw.flags & dns_flags::NSS != 0 => {
+                outbox.extend(nss_events(raw, lineage, dns_cache));
+            }
+            Ok(raw) => {
+                let (event, flood) = dns_events(raw, lineage, dns_cache);
+                outbox.push_back(event);
+                outbox.extend(flood);
+            }
+            Err(_e) => reject.record("dns_query", std::mem::size_of::<DnsQueryRaw>(), bytes.len()),
+        }
+    }
+    if let Some(cache) = dns_cache {
+        cache.ingest().pass_ended(began_ns);
+    }
+    drained
 }
 
 #[cfg(test)]
@@ -1357,6 +1500,50 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         let (event, _) = dns_events(&raw, &lineage, None);
         assert!(matches!(event, Event::DnsQuery { exe: None, .. }));
+    }
+
+    /// Lab PR 229: a name asked through systemd-resolved's NSS module (no
+    /// datagram: the Debian 13 shape) attributes the asking process's
+    /// connect. It is no `Event::DnsQuery`, and the forwarder
+    /// back-correlation does not count it; held queries still flag a flood.
+    #[test]
+    fn an_nss_lookup_feeds_the_attribution_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        let cache = DnsCache::default();
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.pid = 4700;
+        raw.flags = dns_flags::NSS;
+        raw.timestamp_ns = 7_000;
+        let name = b"foo.northnarrow-e2etest.invalid.";
+        raw.query_name[..name.len()].copy_from_slice(name);
+        raw.qname_len = name.len() as u16;
+        assert!(nss_events(&raw, &lineage, Some(&cache)).is_none());
+        assert_eq!(
+            cache.lookup_for_connect(4700, 8_000, 0).as_deref(),
+            Some("foo.northnarrow-e2etest.invalid")
+        );
+        assert_eq!(
+            cache.originator_for("foo.northnarrow-e2etest.invalid", 8_000, 2_000_000_000, 1),
+            None,
+            "not a query to a local stub"
+        );
+        raw.held = 5;
+        raw.flags |= dns_flags::RATE_HELD;
+        assert!(matches!(
+            nss_events(&raw, &lineage, Some(&cache)),
+            Some(Event::DnsFlood {
+                pid: 4700,
+                held: 5,
+                ..
+            })
+        ));
+        // an empty name feeds nothing
+        let mut empty = DnsQueryRaw::zeroed();
+        empty.pid = 4701;
+        empty.flags = dns_flags::NSS;
+        assert!(nss_events(&empty, &lineage, Some(&cache)).is_none());
+        assert_eq!(cache.lookup_for_connect(4701, 8_000, 0), None);
     }
 
     /// External audit SNS-015: every event ring of the eBPF object is

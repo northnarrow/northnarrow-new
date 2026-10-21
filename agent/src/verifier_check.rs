@@ -6,8 +6,8 @@
 //! as the agent sizes them), the `BTF_OFFSETS` table resolved from this
 //! kernel's BTF, armed and frozen — then puts every program of the object
 //! through `BPF_PROG_LOAD`, with the attach target its ELF section names
-//! (`lsm/<hook>`, `fentry/<function>`, `tp_btf/<tracepoint>`; kprobes and
-//! tracepoints need none at load). Nothing is attached: the programs and
+//! (`lsm/<hook>`, `fentry/<function>`, `tp_btf/<tracepoint>`; kprobes,
+//! uprobes and tracepoints need none at load). Nothing is attached: the programs and
 //! maps go away with the process. Maps the object pins by name land in
 //! [`PIN_DIR`], away from the agent's pin root, and are removed at the end.
 //!
@@ -398,6 +398,8 @@ fn load_one(prog: &mut Program, section: &str, btf: &Btf) -> Outcome {
         Program::FExit(p) => p.load(target, btf),
         Program::BtfTracePoint(p) => p.load(target, btf),
         Program::KProbe(p) => p.load(),
+        // Lab PR 229: the DNS sensor's uprobe on systemd-resolved's NSS module.
+        Program::UProbe(p) => p.load(),
         Program::TracePoint(p) => p.load(),
         Program::RawTracePoint(p) => p.load(),
         other => {

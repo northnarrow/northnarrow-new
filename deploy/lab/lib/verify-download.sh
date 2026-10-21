@@ -50,7 +50,7 @@ nnv_meta() {
     name=${url##*/}
     NNV_SIG="" NNV_KEY="" NNV_FPR="" NNV_KEY_URL="" NNV_HISTORY_BASE="" NNV_HISTORY_RE=""
     case "$distro" in
-        ubuntu2404 | ubuntu2204)
+        ubuntu2404 | ubuntu2204 | ubuntu2604)
             NNV_SUMS=SHA256SUMS NNV_SIG=SHA256SUMS.gpg NNV_ALGO=sha256
             NNV_KEY=ubuntu-cloud NNV_FPR=$NNV_UBUNTU_CLOUD_FPR
             NNV_KEY_URL="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x$NNV_UBUNTU_CLOUD_FPR"

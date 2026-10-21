@@ -429,6 +429,9 @@ pub async fn drain_loop(
     // (each flow is due once per interval).
     let mut snapshot_tick = tokio::time::interval(snapshot_tick_period(&snapshot));
     snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Lab PR 229: the records of one readiness, read before any is
+    // processed, so that one wait for the DNS pump serves them all.
+    let mut batch: Vec<NetFlowCloseRaw> = Vec::new();
     loop {
         tokio::select! {
             _ = commit_tick.tick() => {
@@ -455,8 +458,28 @@ pub async fn drain_loop(
                 let mut drained = 0u32;
                 while let Some(item) = inner.next() {
                     drained += 1;
+                    match bytemuck::try_from_bytes::<NetFlowCloseRaw>(item.as_ref()) {
+                        Ok(raw) => batch.push(*raw),
+                        // refused (and said so) by the record's processing
+                        Err(_) => {
+                            process_close_record(
+                                item.as_ref(),
+                                &flow_tracker,
+                                &dns_cache,
+                                netflow_db.as_ref(),
+                                &lineage,
+                                &mut gate,
+                                &event_tx,
+                            )
+                            .await
+                        }
+                    }
+                }
+                guard.clear_ready();
+                attribution_barrier(&batch, &dns_cache).await;
+                for raw in batch.drain(..) {
                     process_close_record(
-                        item.as_ref(),
+                        bytemuck::bytes_of(&raw),
                         &flow_tracker,
                         &dns_cache,
                         netflow_db.as_ref(),
@@ -467,7 +490,6 @@ pub async fn drain_loop(
                     .await;
                     group_commit(netflow_db.as_ref(), listener_db.as_ref());
                 }
-                guard.clear_ready();
                 if drained == 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
@@ -478,8 +500,28 @@ pub async fn drain_loop(
                 let mut drained = 0u32;
                 while let Some(item) = inner.next() {
                     drained += 1;
+                    match bytemuck::try_from_bytes::<NetFlowCloseRaw>(item.as_ref()) {
+                        Ok(raw) => batch.push(*raw),
+                        // refused (and said so) by the record's processing
+                        Err(_) => {
+                            process_close_record(
+                                item.as_ref(),
+                                &flow_tracker,
+                                &dns_cache,
+                                netflow_db.as_ref(),
+                                &lineage,
+                                &mut gate,
+                                &event_tx,
+                            )
+                            .await
+                        }
+                    }
+                }
+                guard.clear_ready();
+                attribution_barrier(&batch, &dns_cache).await;
+                for raw in batch.drain(..) {
                     process_close_record(
-                        item.as_ref(),
+                        bytemuck::bytes_of(&raw),
                         &flow_tracker,
                         &dns_cache,
                         netflow_db.as_ref(),
@@ -490,7 +532,6 @@ pub async fn drain_loop(
                     .await;
                     group_commit(netflow_db.as_ref(), listener_db.as_ref());
                 }
-                guard.clear_ready();
                 if drained == 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
@@ -510,6 +551,17 @@ pub async fn drain_loop(
                 }
             }
         }
+    }
+}
+
+/// Lab PR 229: wait until the DNS pump has read the queries made before
+/// the newest record of `batch` (`DnsIngest`), so that each record's DNS
+/// attribution finds its process's query. A close read before the pump had
+/// read the query of the same process attributed no name — the CI flake of
+/// `net_outbound_connect_records_flow_with_dns_attribution`.
+async fn attribution_barrier(batch: &[NetFlowCloseRaw], dns_cache: &DnsCache) {
+    if let Some(ts) = batch.iter().map(|r| r.timestamp_ns).max() {
+        dns_cache.ingest().caught_up(ts).await;
     }
 }
 

@@ -41,6 +41,13 @@ pub mod dns_flags {
     /// because the user's DNS budget ran out (counted on whichever of its
     /// processes records next).
     pub const RATE_HELD_UID: u8 = 1 << 3;
+    /// Lab PR 229: a name the process asked systemd-resolved for through
+    /// its NSS module (`agent-ebpf/src/dns_nss.rs`, a uprobe on
+    /// `libnss_resolve.so.2`): `query_name` holds `qname_len` bytes of the
+    /// name as the process passed it (text, not wire labels); no datagram
+    /// was sent, so there is no server, family or type. It feeds the DNS
+    /// attribution of the process's connects only.
+    pub const NSS: u8 = 1 << 4;
 }
 
 /// IPv6 / padded-IPv4 address byte length.

@@ -31,7 +31,8 @@
 #   deploy/lab/nn-lab.sh test-ignored  # every #[ignore] test, as root, single-threaded
 #   NN_LAB_DISTRO=debian12 deploy/lab/nn-lab.sh up   # second guest (Debian 12, kernel 6.1); every
 #                                                    # sub-command honours NN_LAB_DISTRO (default ubuntu2404;
-#                                                    # also debian13 = 6.12, ubuntu2204 = 5.15, alma9 = 5.14 el9)
+#                                                    # also debian13 = 6.12, ubuntu2204 = 5.15, alma9 = 5.14 el9,
+#                                                    # ubuntu2604 = 7.0, uutils coreutils)
 #   NN_LAB_LOCKDOWN=integrity deploy/lab/nn-lab.sh up  # a separate guest of NN_LAB_DISTRO booted with
 #                                                    # lockdown=integrity (anti-tamper C27; ssh port +1000)
 #   deploy/lab/nn-lab.sh upgrade-check    # install.sh --upgrade on the running install (keys/chains kept)
@@ -156,6 +157,15 @@ case "$DISTRO" in
         BASE_IMG_NAME="jammy-base.img"; DEFAULT_SSH_PORT=2522
         USER_DATA_TMPL="$SCRIPT_DIR/user-data.tmpl"
         LAB_DIR="$ROOT_LAB_DIR/ubuntu2204" ;;
+    ubuntu2604)
+        # Kernel 7.0 (lab PR 229): Ubuntu 26.04 LTS, the release of the
+        # hosted CI runners, whose coreutils are the uutils multi-call
+        # binary (`/bin/sleep`, `/usr/bin/true`: the utility is picked from
+        # the name it is run by). Same template as 24.04, same signing key.
+        IMAGE_URL="https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+        BASE_IMG_NAME="resolute-base.img"; DEFAULT_SSH_PORT=2822
+        USER_DATA_TMPL="$SCRIPT_DIR/user-data.tmpl"
+        LAB_DIR="$ROOT_LAB_DIR/ubuntu2604" ;;
     alma9)
         # RHEL 9 family: kernel 5.14 + backports with native BTF (not in
         # BTFHub — only a guest can tell), SELinux enforcing, dnf.
@@ -163,7 +173,7 @@ case "$DISTRO" in
         BASE_IMG_NAME="alma9-base.qcow2"; DEFAULT_SSH_PORT=2622
         USER_DATA_TMPL="$SCRIPT_DIR/user-data.alma9.tmpl"
         LAB_DIR="$ROOT_LAB_DIR/alma9" ;;
-    *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12 | debian13 | ubuntu2204 | alma9)" >&2; exit 2 ;;
+    *) echo "nn-lab: unknown NN_LAB_DISTRO=$DISTRO (ubuntu2404 | debian12 | debian13 | ubuntu2204 | ubuntu2604 | alma9)" >&2; exit 2 ;;
 esac
 # The base image stays with the distro: a lockdown guest is layered on it.
 IMG_DIR=$LAB_DIR
