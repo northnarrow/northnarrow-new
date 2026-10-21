@@ -55,6 +55,9 @@ STATE_DIR=${STATE_DIR:-/var/lib/northnarrow}
 RUN_DIR=${RUN_DIR:-/run/northnarrow}
 BPFFS_ROOT=${BPFFS_ROOT:-/sys/fs/bpf/northnarrow}
 JOURNALD_NS_CONF=/etc/systemd/journald@northnarrow.conf
+# install.sh's upgrade transactions (lab PR 220): the copies of a run that
+# could not finish its rollback; --purge removes them with the rest.
+UPGRADE_TXN_ROOT=${UPGRADE_TXN_ROOT:-/var/lib/northnarrow-upgrade}
 LSM_DRAIN_TIMEOUT=${LSM_DRAIN_TIMEOUT:-30}
 # External audit DEP-006: the ids of the agent's loaded BPF programs, written
 # by the agent next to its pid file (anti_tamper/bpf_defense.rs).
@@ -382,7 +385,7 @@ if (( PURGE )); then
     if [[ -f "$LEGACY_KEY" ]]; then
         log "PURGE: removing the admin private key $LEGACY_KEY (an install before external audit DEP-001)"
     fi
-    for d in "$ETC_DIR" "$STATE_DIR"; do
+    for d in "$ETC_DIR" "$STATE_DIR" "$UPGRADE_TXN_ROOT"; do
         [[ -e "$d" ]] && { log "PURGE: removing $d"; rm -rf "$d"; }
     done
     # Its admin.pub line went with $ETC_DIR: the key opens nothing here any

@@ -20,9 +20,10 @@ with `rm -f` or `kill -9`, they are denied by design.
 
 All three assume `cargo xtask build --release` (or the release tarball)
 produced `target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin}`.
-A tree built from source has no `MANIFEST.sha256`: `install.sh` installs it
-only with `--source-tree` (section 5.1), e.g.
-`sudo ./deploy/install.sh --source-tree --upgrade --grant-key <admin.key>`.
+A release tree installs only when its tarball's provenance attestation
+verifies (section 5.1). A tree built from source has no `MANIFEST.sha256`:
+`install.sh` installs it only with `--source-tree` (or `--allow-unverified`),
+e.g. `sudo ./deploy/install.sh --source-tree --upgrade --grant-key <admin.key>`.
 The `.deb` / `.rpm` packages wrap the same steps for the package manager:
 see section 6.
 
@@ -114,23 +115,44 @@ From `v0.0.1-tappa9.0` or an earlier `main`, see
 changes (its "Before you upgrade" list first).
 
 The key must carry the `trusted-installer` role (the one `install.sh`
-bootstraps does; see `COMBAT_RECOVERY.md` §1.1 for older keys). Without
-`--grant-key` the upgrade stops at step 3 with the recovery line, because
-the pin root is protected (review entry 39).
+bootstraps does; see `COMBAT_RECOVERY.md` §1.1 for older keys). Over running
+units `--upgrade` refuses to start without `--grant-key`, before anything is
+stopped (lab PR 220): the window opened with the key stops the running
+units, and a rollback needs the *new* agent's window too — a window you
+opened by hand before the run covers the stop, not that.
 
-What it does, in order:
+The upgrade is a transaction (lab PR 220; static review of `baf4c25` P0
+C-45 / G-07 / TD-09). It used to stop the units, drop the pins and overwrite
+binaries, units and configuration with no copy and no trap: a failure
+halfway — the binaries replaced and not the units, a new agent that does not
+start — left the host without a working agent. What it does now, in order:
 
-1. records which units are active and prints installed → new version;
-2. opens the **trusted-installer window** (300 s) through the running
-   agent's socket with `--grant-key` — a signed, audited grant that lets
-   the next steps touch what the anti-tamper protects (binaries, units,
+1. checks the release (§5.1), the tree and `nft` — nothing on the host has
+   changed when one of them refuses;
+2. **backs up** every file the run may create or replace into
+   `/var/lib/northnarrow-upgrade/<time>-<pid>/` (`cp -a`: bytes, mode,
+   owner, times, extended attributes; mode `0700`, outside the agent's own
+   directories), and lists the ones that do not exist yet. That is the two
+   binaries and `nn-admin`, the three units (the agent's, the watchdog's
+   and its `OnFailure=` handler, lab PR 216), the Debian drop-in,
+   `journald@northnarrow.conf`, `install-manifest.json`, the five `.v1`
+   lists, the overlay template, the ten control-surface files, the five
+   canary templates, the overlay signatures the run may add and, when
+   missing, `admin.pub`, the bootstrap key and the COMBAT files. The eBPF
+   object travels inside the agent binary; its pins are re-created by
+   whichever agent starts. A backup that fails (a full disk) is a refusal,
+   with nothing stopped;
+3. records which units are active, prints installed → new version, opens
+   the **trusted-installer window** (300 s) through the running agent's
+   socket with `--grant-key` — a signed, audited grant that lets the next
+   steps touch what the anti-tamper protects (binaries, units,
    `/etc/northnarrow`, the pin root); then stops the **watchdog first**
-   (stopping the agent alone makes the watchdog respawn it), then the
-   agent;
-3. removes `/sys/fs/bpf/northnarrow`: the LSM programs survive agent
+   (stopping the agent alone makes the watchdog respawn it), then the agent,
+   and checks that neither still runs;
+4. removes `/sys/fs/bpf/northnarrow`: the LSM programs survive agent
    restarts only through their pinned links, so dropping the pin root
    detaches them; the pin root is in the protected-inode set, so this
-   needs the window of step 2 (or a reboot); waits until the agent's own
+   needs the window of step 3 (or a reboot); waits until the agent's own
    BPF programs are unloaded (30 s budget, `LSM_DRAIN_TIMEOUT`; fails
    loudly, naming the ids, otherwise). The agent lists their ids in
    `/run/northnarrow/bpf-own-ids` at every boot and the script reads the
@@ -141,16 +163,97 @@ What it does, in order:
    predates the list falls back to that count and names what is left;
    without `bpftool` the script checks that the units' processes and the
    pin root are gone and says the unload itself is not confirmed;
-4. runs the normal install (binaries, units, configs — the shipped `.v1`
-   lists replaced by the release's, an edited one kept as
-   `<list>.v1.operator` (§1); `chattr +i` on the state dir is lifted and
-   re-applied by the new agent at boot), then
-   adopts the `*.local` overlays already present: each one without a valid
-   signature is signed with `--grant-key` (`nn-admin config overlay
-   sign`); one that cannot be — the key lacks `config-manage` — is listed
-   with the command to sign it, and the new agent boots on the shipped
-   defaults for that list until it is (§3.6);
-5. starts the agent, waits 3 s, starts the watchdog, prints their state.
+5. **switches** the binaries and units: each new file is staged next to
+   the installed one (`<path>.nn-new`, same directory, same file system),
+   compared with its source, then renamed over it (`rename(2)`): every path
+   is the old file or the new one, never half of either, and the six
+   change together. `install-manifest.json` is written the same way. Then
+   the rest of the install (configs — the shipped `.v1` lists replaced by
+   the release's, an edited one kept as `<list>.v1.operator` (§1);
+   `chattr +i` on the state dir is lifted and re-applied by the new agent
+   at boot), and the adoption of the `*.local` overlays already present:
+   each one without a valid signature is signed with `--grant-key`
+   (`nn-admin config overlay sign`); one that cannot be — the key lacks
+   `config-manage` — is listed with the command to sign it, and the new
+   agent boots on the shipped defaults for that list until it is (§3.6);
+6. starts the agent, waits 3 s, starts the watchdog;
+7. runs the **health check** (up to 60 s, `HEALTH_TIMEOUT`): every unit
+   that ran before is `active` (both are `Type=notify`: active means the
+   process sent `READY=1`); the agent's own journal event `anti-tamper: all
+   LSM hooks attached` with `deny_attached` equal to `deny_expected`, read as
+   an event of the unit's main process (`_SYSTEMD_UNIT`, `_PID`,
+   `_TRANSPORT=stdout`, fields journald sets, and the whole line matched — a
+   file named like the line, logged in another event, is not it); the pid
+   file names that process and it answers `nn-admin status` on its admin
+   socket; the watchdog's own event `watchdog PID registered in
+   PROTECTED_PIDS` with its main pid. A deny-hook shortfall
+   (`NN_ANTI_TAMPER_ALLOW_DEGRADED=1` included) fails the check; every deny
+   hook with an observe hook missing passes with a WARNING (the agent signs
+   the missing telemetry as `subsystem_degraded`). Passed: the backup is
+   removed and the run ends `UPGRADE complete — health check passed`.
+
+**Any failure after step 3 rolls back** (an EXIT trap; Ctrl-C included).
+The new units, if they ran, are stopped through the new agent's own window
+(the same key) and its pin root dropped; every backed-up file is copied
+beside its path and renamed over it, so the previous files are back byte for
+byte (mode, owner, times too) — checked against the SHA-256 taken before the
+stop, a copy changed in the meantime is named and stops the rollback (exit
+4); what the run created (a new list's
+`.operator` copy, a new signature, a staged `.nn-new`) is removed; the units
+that ran are started again and pass the same health check. Before that
+start the script leaves `/run/northnarrow/upgrade-rolled-back.json` (what
+failed, at which stage, both versions, the transaction): the restored agent
+signs it at its boot as an `upgrade_rolled_back` row of the audit chain
+(`extra`: `stage`, `reason`, `failed_version`, `restored_version`, `txn`,
+`at`, `reported_by: install.sh` — root's installer reported it, the agent
+did not see it — and `agent_version`) and removes it. A marker that is a
+link, not root's, writable by others, larger than 4 KiB or not one JSON
+object of strings is recorded as `failure: marker refused (…)` and removed.
+The script then reads the row back and names it; an agent older than lab
+PR 220 does not read the marker — the script says so and removes it. The
+evidence is not rolled back: what the new agent appended to the audit chain,
+its head anchor and the chain logs stays (`nn-admin audit verify`), and so
+does what it migrated at its boot, if a release ever does. The run ends with
+exit status **3**:
+
+```
+install.sh: UPGRADE FAILED — health_check: the agent (pid 4242) logged no 'anti-tamper: all LSM hooks attached'
+install.sh: rolling back to northnarrow-agent 0.0.1 from /var/lib/northnarrow-upgrade/20261020T100000Z-1234
+…
+install.sh: UPGRADE ROLLED BACK — northnarrow-agent 0.0.2 failed (health_check: …).
+install.sh:   running again: northnarrow-agent 0.0.1 (northnarrow-watchdog northnarrow-agent: health check passed)
+install.sh:   signed record: upgrade_rolled_back, signed by the restored agent in /etc/northnarrow/audit.log
+```
+
+and the same in the system log (`auth.err`, tag `northnarrow-install`). The
+stages are `stop` (step 3–4), `switch` (step 5), `start` and `health_check`
+(steps 6–7). The start step does not check what it started: a unit that
+does not start is found, and reported, at `health_check`.
+
+**When the rollback cannot finish: exit 4.** A new agent that pinned its
+hooks and then died (a refused boot, exit 78) or that runs without answering
+on its socket keeps the files protected, and its window opens only through
+that socket; the script starts it once more for the window (as in §1) and,
+when that fails too, stops with `ROLLBACK INCOMPLETE` (on the terminal and
+at `auth.crit`) and leaves `rollback.sh` in the transaction directory: the
+copies and the functions that restore them. Then:
+
+```sh
+sudo systemctl disable northnarrow-agent northnarrow-watchdog
+sudo reboot                                      # bpffs does not survive it
+sudo bash /var/lib/northnarrow-upgrade/<time>-<pid>/rollback.sh
+```
+
+It refuses while a unit runs or the pin root exists, then restores the
+previous files, enables the units that were enabled, starts the ones that
+ran (the previous agent signs `upgrade_rolled_back`) and runs the health
+check. When the new agent was refused for its install manifest (exit 78),
+"Recovering from a refused boot" in §5.1 opens its window without a reboot:
+start it once with the override, then re-run `install.sh --upgrade` from the
+previous release's tree. Exit 4 is also the answer when the previous version, restored, does
+not pass the health check itself; the copies stay for inspection. A later
+`install.sh` run warns while a `rollback.sh` is pending; `uninstall.sh
+--purge` removes `/var/lib/northnarrow-upgrade`.
 
 Preserved across the upgrade: `admin.pub`, `agent.sig.key`, `agent_id`,
 `audit.log` (the new agent appends a signed `agent_boot` entry — review
@@ -164,7 +267,7 @@ logs under `/var/lib/northnarrow` `0600`. A log shipper that reads
 existing group; `NN_AUDIT_GROUP` too) gives both files that group, and
 every later upgrade keeps it. On a package install, open a
 trusted-installer window and `chgrp GROUP` the two files yourself. The window with no
-hooks attached is the few seconds between step 3 and the new agent's
+hooks attached is the few seconds between step 4 and the new agent's
 boot; it is the same window a reboot has.
 
 The lab verifies this path on every nightly (`nn-lab.sh upgrade-check`):
@@ -176,7 +279,12 @@ fewer of its own LSM programs than before the upgrade and none of the old
 ones, no anti-tamper `subsystem_degraded` signed at the upgraded boot, no
 foreign LSM program lost, `PROTECTED_PIDS` re-pinned afterwards, and the
 five `.v1` lists equal to the release's with no edited or left-over list
-reported by the new agent.
+reported by the new agent. The rollback paths are exercised by
+`xtask/tests/install_scripts.rs` against stub `systemctl`, journal and
+agents that keep the anti-tamper's rules (a failure at each stage, a forged
+health line, a deny-hook shortfall, the pinned-and-dead agent finished by
+`rollback.sh`); on a guest, with a deliberately broken new build, the check
+is owed (lab PR 220).
 
 ## 3. Uninstall
 
@@ -738,9 +846,11 @@ locked lockfile and pinned toolchains, and attaches to the GitHub release:
 | `northnarrow-<ver>-x86_64-linux.{agent,watchdog}.sbom.cdx.json` | CycloneDX SBOMs of the two daemons (the agent one covers `nn-admin` too) |
 | `SHA256SUMS` | checksums of the files above |
 
-Each artefact carries a SLSA build-provenance attestation signed by
-GitHub's OIDC identity for this repository and workflow. Verify before
-installing:
+The tarball, the packages and the SBOMs carry a SLSA build-provenance
+attestation signed by GitHub's OIDC identity for this repository and
+workflow (`SHA256SUMS` and the key file do not: their files are listed in
+`SHA256SUMS`, which itself is not signed — the attestation is what says
+where a file was built). Verify before installing:
 
 ```sh
 sha256sum -c SHA256SUMS
@@ -774,7 +884,9 @@ kani) by version with `--locked` (external audit SUP-002, SUP-005).
 ### 5.1 `install.sh` verifies the release itself
 
 The manual commands above stay valid, but since lab PR 21 the installer
-performs the checks and refuses to touch the host when one fails:
+performs the checks and refuses to touch the host when one fails — and
+since lab PR 220 (static review of `baf4c25` P0 C-45 / G-07) a release
+tree installs only when step 4 verifies:
 
 1. **Tree manifest** — the tarball ships `MANIFEST.sha256` (every file
    hashed by `mk-tarball`); `install.sh` runs `sha256sum -c` on the
@@ -786,13 +898,27 @@ performs the checks and refuses to touch the host when one fails:
    lists the name with two different checksums is refused (external audit
    DEP-016, lab PR 194: the name used to be a regular expression, so a
    line for a look-alike name listed first was taken for it).
-3. **SLSA attestation** — with `gh` 2.49+ (online, or offline with
+3. **The tree is the tarball's** (lab PR 220) — its `MANIFEST.sha256` must
+   be the one inside the tarball, byte for byte (the tarball's one
+   top-level directory). The checks of steps 2 and 4 vouch for the
+   tarball, step 1 binds the tree to its own manifest; a tree edited after
+   extraction with its manifest rewritten, next to a genuine tarball, used
+   to pass both. Refused whatever the flags.
+4. **SLSA attestation** — with `gh` 2.49+ (online, or offline with
    `--attestation BUNDLE` from `gh attestation download`) or `cosign`
-   plus a bundle, the provenance is verified and bound to this
+   plus a bundle, the tarball's provenance is verified and bound to this
    repository's release workflow run for a `v*` tag (the identity regex
    above, and `--deny-self-hosted-runners` with gh). An artefact of a
-   dispatch run on a branch fails this step. Without a verifier the
-   installer says so; `--require-attestation` turns that into a refusal.
+   dispatch run on a branch fails this step. A failed verification, no
+   tarball next to the tree, or no verifier at all is a **refusal**
+   (it used to be a line and a lower level): the message says why — the
+   verifier's own last lines included — and how to get there. A host
+   without network access verifies offline: download the bundle on a
+   machine that has it (`gh attestation download <tarball> --repo
+   northnarrow/northnarrow-new`) and pass `--attestation <bundle.jsonl>`
+   (gh, or cosign: cosign is used only with that bundle, and its path has
+   no automated test yet). `--require-attestation` is accepted and is the
+   default.
 
 The strongest level reached — `attested`, `checksums`, `manifest`,
 `source-tree` or `unverified` — is written with the SHA-256 of every
@@ -800,23 +926,37 @@ installed binary and of the eBPF object to
 `/etc/northnarrow/install-manifest.json`, which the anti-tamper hook
 protects like the rest of `/etc/northnarrow`.
 
-**No silent downgrade (external audit DEP-007).** The checks used to step
-down on their own: a tree without `MANIFEST.sha256` installed as a
-"source tree", so removing that one file from an altered release turned
-every check off. A level below `checksums` now needs an explicit flag,
-which is recorded in the manifest (`verify_override`) and shown by
-`nn-admin host-check` (§3.1):
+**No silent downgrade (external audit DEP-007, lab PR 220).** The checks
+used to step down on their own: a tree without `MANIFEST.sha256` installed
+as a "source tree", so removing that one file from an altered release
+turned every check off; and an unsigned `SHA256SUMS` next to the tarball
+was enough for `checksums` — whoever swaps the tarball swaps it too. A level
+below `attested` now needs an explicit flag. The flag is **logged**: a
+WARNING on the terminal and a line in the system log (`auth.warning`, tag
+`northnarrow-install`: `journalctl -t northnarrow-install`); it is
+**recorded** in the manifest (`verify_override`, and `attestation.failure`
+says why the attestation did not verify) and **reported** by `nn-admin
+host-check` (§3.1: anything below `attested` is a WARN, `checksums`
+included):
 
 | Situation | Without a flag | Flag that accepts it | Recorded as |
 |---|---|---|---|
-| No `MANIFEST.sha256` (a build from source, the lab) | refused | `--source-tree` | `source-tree` |
-| Only the tree's own `MANIFEST.sha256` checked (no tarball + `SHA256SUMS`, no attestation) — it travels inside the tree it vouches for | refused | `--allow-manifest-only` | `manifest` |
+| The attestation did not verify (or no verifier), the tarball matched `SHA256SUMS` | refused | `--allow-unverified` | `checksums` |
+| Only the tree's own `MANIFEST.sha256` checked (no tarball next to it) — it travels inside the tree it vouches for | refused | `--allow-unverified` (`--allow-manifest-only`, its former name, still accepted) | `manifest` |
+| No `MANIFEST.sha256` (a build from source, the lab, a developer) | refused | `--source-tree` or `--allow-unverified` | `source-tree` |
 | Every release check skipped | — | `--no-verify` (development only) | `unverified` |
 
-`--source-tree` only permits a missing `MANIFEST.sha256`: on a tree that
-has one, it is ignored and the tree is verified as a release. Keep the
-tarball and `SHA256SUMS` next to the extracted tree (or pass `--tarball`
-and `--sums`) and a release installs with no flag.
+`--allow-unverified` is for the lab and for development, where nothing
+attested exists: the lab installs its synced source tree with
+`--source-tree` (`nn-lab.sh install`, `upgrade-check`), and its
+`release-check` installs a CI run's tarball — attested, if at all, for a
+branch, not a `v*` tag — with `--allow-unverified` after checking that
+it is refused without. `--source-tree` only permits a missing
+`MANIFEST.sha256`: on a tree that has one, it is ignored and the tree is
+verified as a release. Keep the tarball next to the extracted tree (or
+pass `--tarball`), with `gh` or an offline bundle, and a release installs
+with no flag. `--require-attestation` with `--allow-unverified` or
+`--no-verify` is a usage error (exit 2).
 
 **At every boot the agent closes the loop**: it hashes its own executable,
 the watchdog and `nn-admin` under the recorded `bin_dir` and compares the
@@ -861,7 +1001,7 @@ sudo ./deploy/install.sh --upgrade --grant-key /path/to/admin.key   # + --source
 
 ```sh
 tar xzf northnarrow-<ver>-x86_64-linux.tar.gz && cd northnarrow-<ver>-x86_64-linux
-sudo ./deploy/install.sh --require-attestation          # tarball + SHA256SUMS found in ..
+sudo ./deploy/install.sh                                # tarball + SHA256SUMS found in .., gh online
 sudo ./deploy/install.sh --upgrade --tarball /path/to/northnarrow-<ver>-x86_64-linux.tar.gz \
     --sums /path/to/SHA256SUMS --attestation /path/to/bundle.jsonl
 nn-admin audit verify --from /etc/northnarrow/audit.log --agent-sig-key /etc/northnarrow/agent.sig.key
@@ -967,8 +1107,23 @@ fails: dpkg reports the rollback as failed and leaves the package
 half-installed instead of "installed" with no agent running. Find the
 cause (`systemctl status northnarrow-agent`), start the agent, then the
 watchdog, and run the package command again. `rpm` has no rollback
-scripts: after a failed `rpm -U` check `systemctl is-active
-northnarrow-agent northnarrow-watchdog` yourself.
+scripts; what it reports instead, and what each package manager can and
+cannot roll back, is in §6.2.
+
+**An upgrade that does not pass its health check fails (lab PR 220).** The
+package's configure step restarts the units the pre-unpack hook stopped and
+runs `install.sh`'s health check on them (§2, step 7: active, every deny hook
+attached, the admin socket answering, the watchdog registered in
+`PROTECTED_PIDS`). On the `.deb` it runs in the `postinst`: an upgrade that
+does not pass fails the hook — the reason on the terminal and in the system
+log (`auth.err`, tag `northnarrow-pkg`) — and dpkg reports the package
+half-configured instead of installed. The `.rpm` restarts the units in
+`%post` and checks them in a `%posttrans` (`install.sh --package-verify`),
+once its whole transaction is over, the old package's `%preun` and
+`%postun` included: an upgrade that does not pass fails that scriptlet. In
+both, the restart list stays in `/run/northnarrow-pkg-restart`, so running
+the configure step again (`dpkg --configure -a`) starts and checks the units
+again. A first install restarts and checks nothing.
 
 ### 6.1 Verify a package before installing it
 
@@ -1022,3 +1177,24 @@ gh attestation verify northnarrow_<ver>-<rel>_amd64.deb --repo northnarrow/north
 A package copied through an internal mirror or a configuration-management
 cache is checked the same way on the host that installs it, or the mirror
 re-serves it from a repository signed with a key the hosts trust.
+
+### 6.2 What each package manager can roll back (lab PR 220)
+
+`install.sh --upgrade` rolls back on its own (§2): it keeps the copies. A
+package manager owns the files of a package upgrade, and the package's
+scripts cannot put the previous version back behind its back. What each
+one does when a NorthNarrow upgrade fails:
+
+| Failure | dpkg / apt (`.deb`) | rpm / dnf (`.rpm`) |
+|---|---|---|
+| No usable `NN_GRANT_KEY` (the pre-unpack hook cannot stop the agent) | refused before any file changes; the previous version keeps running | the same (`%pre` fails, the package is not installed) |
+| The unpack fails (a file conflict, a full disk) | dpkg restores the previous files itself and its abort hooks start the stopped units again, failing loudly if one does not come back (DEP-010) | no rollback: check the units yourself (`systemctl is-active northnarrow-agent northnarrow-watchdog`) |
+| The new units do not pass the health check | **not restored**: the new files stay, the `postinst` fails, the package is half-configured; the units are as the failed start left them | **not restored**: the new package stays installed, the `%posttrans` fails |
+| Putting the previous version back | `sudo NN_GRANT_KEY=<key> dpkg -i northnarrow_<previous>_amd64.deb` (or `apt-get install northnarrow=<previous>` from a repository that has it) | `sudo NN_GRANT_KEY=<key> rpm -Uvh --oldpackage northnarrow-<previous>.x86_64.rpm`, or `dnf history undo` / `dnf downgrade northnarrow` when the previous package is still in a repository or dnf's cache |
+
+Keep the previous release's package until the upgraded host has passed its
+health check. The previous version's own scripts stop the failed one through
+its window (the same key), so a downgrade is an upgrade in the other
+direction. Where a host must roll back on its own, install it from the
+release tarball (`install.sh`, §1) and upgrade it with `install.sh
+--upgrade` (§2).

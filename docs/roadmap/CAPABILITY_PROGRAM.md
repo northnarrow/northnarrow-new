@@ -343,3 +343,54 @@ only in the table below, in the same PR as the evidence.
   supplementary groups, the bounding set and the fork-inherited baseline
   are follow-ups. Levels unchanged until then.
   - Lab: Every program of the eBPF object passed `nn-lab.sh verifier-check` (exit 0) on the four guests — 76 of 76 OK on Ubuntu 24.04 (6.8) and Debian 13 (6.12); 74 OK on Debian 12 (6.1) and Ubuntu 22.04 (5.15), where the two optional ACL deny hooks are absent from the kernel (not counted) — and the agent then started with both units active, no "refused", "attach FAILED" or "NOT running" in its journal (the deny self-test's own refused signal aside) and 0 degradations in the signed status. The exploit post-condition guard attached lite by default on all four (detect; the signed status `lite detect (experimental)`, withheld from the unsigned one; no exploit_guard degradation; no verifier rejection); `--btf-check` SUPPORTED with no w4b slot absent (the slots that drift from the compiled values — not all one kernel's — resolved at boot). Strict attached on 6.1, 6.8 and 6.12 (`strict detect … calls judged`) and was refused on 5.15 by the agent's 6.1 check ("strict needs Linux 6.1 or later … this kernel is 5.15.216"), a signed subsystem_degraded exploit_guard and the status `unavailable: …`. The negative suite (sudo, su, passwd, sg / newgrp, setpriv, capsh, unshare -U / -r / -rm / -rpf, chroot in a user namespace, systemd-run --uid; on 24.04 the `unshare -r` cases are refused by AppArmor before they run) left zero guard journal lines and zero NN-L-EPG records in lite and strict, detect and enforce (Debian 12: lite detect). On 24.04 the lab build's injection (the probe named nn-epg-probe): lite exec and strict getppid in detect — the probe continued, one Critical NN-L-EPG-001 recorded only (caught at exec / at sys_exit), {TA0004 / T1068}, 20.0; in enforce — killed (137) before it could print, the record "refused (-EPERM) and killed in kernel" (lite) / "killed in kernel" (strict), the anomaly, kill and refusal counters +1; the lite capable() case was skipped by the harness (its user-namespace probe refused before the hook by AppArmor on 24.04). Cost per call (best of 3, 2,000,000 calls): getppid as root 235.4 ns off, 235.5 lite, 469.1 strict; as the lab user 235.6 off, 237.3 lite, 883.8 strict; rdzero as root 511.3 / 511.3 / 785.0, as the lab user 476.7 / 511.1 / 1110.1 ns. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).
+- **Lab PR 220 — transactional upgrade with rollback, blocking provenance
+  verification.** C27 (product supply-chain security), C28 (safe content
+  release); static review of `baf4c25` P0 C-45, G-07, TD-09, App.D C-46,
+  G-36.
+  - C28: `install.sh --upgrade` is a transaction. Every file it may create
+    or replace is copied before anything stops; binaries, units and the
+    install manifest are staged beside the installed ones and switched by
+    rename; the restarted units must pass a health check (active, the
+    agent's own every-deny-hook-attached event from its main pid, its pid
+    file and admin socket, the watchdog's own PROTECTED_PIDS registration);
+    any failure after the stop restores the previous files byte for byte
+    through the new agent's own window, starts the previous units, checks
+    them (exit 3), and the previous agent signs `upgrade_rolled_back`. A
+    rollback the new hooks block (after install.sh started the new agent
+    once more for its window) ends with exit 4 and a `rollback.sh` for after
+    a reboot; a restored file that is not the one backed up, or a restored
+    version that fails its own health check, is exit 4 too (the latter
+    without `rollback.sh`). `--upgrade` over running units needs
+    `--grant-key`.
+    The `.deb` configure step and a new `.rpm` `%posttrans` fail an upgrade
+    whose units do not pass the same check; neither package manager
+    restores the previous version then (documented per manager).
+  - C27: a release tree installs only at `attested` (the tag-bound SLSA
+    attestation of its tarball: gh, or cosign with an offline bundle,
+    `--attestation`; the cosign path has no automated test) and only when it is the
+    tarball's tree (the `MANIFEST.sha256` inside the tarball); an unsigned
+    `SHA256SUMS` is no longer enough. `--allow-unverified` (lab,
+    development) accepts less and is logged at `auth.warning`, recorded in
+    the install manifest and reported by `nn-admin host-check`, which now
+    warns on `checksums`.
+  - Evidence so far: `xtask/tests/install_scripts.rs` runs install.sh
+    whole against stub `systemctl`, journal and fake agents that keep the
+    anti-tamper's rules — rollback byte for byte (mode, mtime) after a
+    failed health check, a failure at each stage (a unit that does not
+    start is caught, and reported, at `health_check`), a forged health line, a
+    deny-hook shortfall, the pinned-and-dead new agent finished by
+    `rollback.sh`, a healthy upgrade committed, an agent older than the
+    marker, an unattested release refused and the flag logged, a tree not
+    from its tarball, the package configure and verify steps; agent unit
+    tests of the marker against install.sh's writer; the three clippy runs,
+    `cargo fmt`, `cargo test --workspace`. Levels unchanged (C27 1, C28 1):
+    the guest checks are owed — an upgrade over a running install with a
+    deliberately broken new build rolled back, a good upgrade, `nn-lab.sh
+    upgrade-check` and `release-check`.
+    Open: the evidence a new agent wrote at its boot (audit rows, chain
+    heads, any state migration) is kept, not rolled back; a new agent that
+    pins its hooks, dies and cannot be started again for its window leaves
+    the rollback to a reboot; SHA256SUMS and
+    the RPM key file are still not attested (C-50 / G-08); a package
+    upgrade that fails its health check is reported, not restored.
+  - Lab: On Ubuntu 24.04, the upgrade from `main` (origin/main c29527a) to this tree through `nn-lab.sh upgrade-check` (install.sh --source-tree --upgrade over the running units): the health check of both units passed, "UPGRADE complete", the transaction directory empty, no upgrade_rolled_back row, the install manifest naming northnarrow-scan and the running version, northnarrow-watchdog-failed.service staged with the other two, the --source-tree override in the system log, the audit chain verified. A broken new agent (a copy of the tree whose agent exits 1) rolled back by itself on Debian 12 and 24.04: exit 3 after 104–110 s, "UPGRADE FAILED — health_check: northnarrow-watchdog.service is activating; northnarrow-agent.service is failed", the previous files back byte for byte (55–56 snapshot lines: bytes, mode, owner, mtime), both units active with every deny hook (17/17 on 6.1, 19/19 on 6.8), one upgrade_rolled_back row signed by the restored agent (stage health_check, failed_version northnarrow-agent 0.0.0-broken). A broken new watchdog beside a healthy new agent first ended in exit 4 on 24.04 — the new agent had set chattr +i on /var/lib/northnarrow again, and three control-surface files could not be put back ("Operation not permitted"); fixed in this lot (the restore lifts the flag as the install does, rollback.sh receives STATE_DIR) and run again: exit 3, "lifting it for the restore", 31 files restored, the previous units healthy (19/19), the row signed. Before the fix the failure line named only the first unit not active (the watchdog the broken agent left activating); it now names every one. install.sh with no flag in a source tree was refused ("REFUSED — no MANIFEST.sha256") with nothing changed and the agent untouched. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).

@@ -2725,6 +2725,12 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
     // root that are not the agent's links, one signed `integrity_drift` each.
     northnarrow_agent::anti_tamper::bpf_defense::attest_foreign_pins(audit_log.as_ref());
+    // Lab PR 220: an upgrade install.sh rolled back to this agent, signed
+    // as `upgrade_rolled_back` before the agent says it is ready.
+    northnarrow_agent::upgrade_rollback::attest(
+        audit_log.as_ref(),
+        std::path::Path::new(northnarrow_agent::upgrade_rollback::DEFAULT_MARKER_PATH),
+    );
     // Tappa 10.8 — overlay decisions taken before the audit log existed.
     overlay_gate.attach_audit_log(audit_log.clone());
     // External audit CMB-017: quarantines are recorded in the signed chain.

@@ -21,6 +21,10 @@
 # uninstall.sh in their package modes. The pre-unpack and post-removal hooks
 # run when the package's own files are not on disk, so each carries an
 # inlined copy of the script it needs (@INSTALL_SH@ / @UNINSTALL_SH@).
+# Lab PR 220: the configure step fails when the units it restarted do not
+# pass install.sh's health check; the .rpm checks in a %posttrans instead,
+# once its whole transaction is over. dpkg has no such hook (posttrans.sh is
+# the .rpm's only).
 #
 # Dependencies: nftables besides libc and systemd (lab PR 165). The agent's
 # per-process outbound block is an nftables rule applied with `nft`, and
@@ -97,7 +101,7 @@ render() {
     chmod 0755 "$2"
 }
 mkdir -p "$work/scripts"
-for s in preinst postinst prerm postrm; do
+for s in preinst postinst prerm postrm posttrans; do
     render "deploy/release/pkg/$s.sh" "$work/scripts/$s"
 done
 
@@ -175,6 +179,9 @@ $(body prerm)
 
 %postun -p /bin/sh
 $(body postrm)
+
+%posttrans -p /bin/sh
+$(body posttrans)
 
 %files
 %defattr(-,root,root,-)

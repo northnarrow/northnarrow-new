@@ -1674,13 +1674,21 @@ foreign_before=$(sudo bpftool prog show 2>/dev/null | grep " lsm " | grep -vcE "
 n_before=0
 for id in $own_before; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q " lsm " && n_before=$((n_before + 1)); done
 echo "before: own program ids=[${own_before% }] own LSM programs=$n_before foreign LSM programs=$foreign_before"
-at_tty sudo ./deploy/install.sh --source-tree --upgrade --grant-key "$key" 2>&1 | grep -E "UPGRADE|stopping|starting|waiting|is active|is inactive|is failed|LSM|BPF program|window|PROTECTED|grant" | cut -c1-140
+# Lab PR 220: the upgrade is a transaction; a run that rolled back also
+# restarts an agent (a new pid, a new agent_boot) — it must say it completed.
+at_tty sudo ./deploy/install.sh --source-tree --upgrade --grant-key "$key" >/tmp/nn-upgrade.log 2>&1 || true
+grep -E "UPGRADE|ROLLBACK|stopping|starting|waiting|is active|is inactive|is failed|LSM|BPF program|window|PROTECTED|grant|health check" /tmp/nn-upgrade.log | cut -c1-140
 sleep 2
 pid_after=$(sudo cat /run/northnarrow/agent.pid)
 audit_after=$(sudo wc -l /etc/northnarrow/audit.log | cut -d" " -f1)
 fp_after=$(sudo sha256sum $idfiles | sha256sum | cut -c1-16)
 echo "after : agent pid=$pid_after audit_lines=$audit_after identity=$fp_after"
 fail=0
+grep -q "UPGRADE complete — health check passed" /tmp/nn-upgrade.log || { echo "FAIL: install.sh did not report a completed upgrade (rolled back? /tmp/nn-upgrade.log)"; fail=1; }
+if sudo tail -n "+$((audit_before + 1))" /etc/northnarrow/audit.log | grep -q '"op":"upgrade_rolled_back"'; then
+    echo "FAIL: an upgrade_rolled_back row was signed during the upgrade"; fail=1
+fi
+sudo test -z "$(sudo ls -A /var/lib/northnarrow-upgrade 2>/dev/null)" || { echo "FAIL: /var/lib/northnarrow-upgrade not empty after the upgrade"; fail=1; }
 [[ "$(systemctl is-active northnarrow-agent)" == active ]] || { echo "FAIL: agent unit not active after upgrade"; fail=1; }
 [[ "$(systemctl is-active northnarrow-watchdog)" == active ]] || { echo "FAIL: watchdog unit not active after upgrade"; fail=1; }
 [[ "$pid_after" != "$pid_before" ]] || { echo "FAIL: agent pid unchanged — binary not restarted"; fail=1; }

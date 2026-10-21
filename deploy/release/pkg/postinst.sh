@@ -38,10 +38,19 @@ restart_stopped() {
     rm -f "$list"
 }
 # <<< restart_stopped
+# Lab PR 220: the configure step checks the health of the units it restarted
+# (install.sh pkg_health_or_fail) and fails the hook when they do not pass:
+# dpkg reports the package half-configured. The rpm runs the same check in
+# its %posttrans, once the whole transaction — the old package's scriptlets
+# included — is over (posttrans.sh).
 case "${1:-}" in
-    configure|1|2)
+    configure)
         BIN_DIR=/usr/bin UNIT_DIR=/usr/lib/systemd/system REPO_ROOT=/usr/share/northnarrow \
             bash /usr/share/northnarrow/deploy/install.sh --package-configure
+        ;;
+    1|2)
+        BIN_DIR=/usr/bin UNIT_DIR=/usr/lib/systemd/system REPO_ROOT=/usr/share/northnarrow \
+            bash /usr/share/northnarrow/deploy/install.sh --package-configure --defer-health-check
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)
         # the operation failed after the units were stopped: bring them back
