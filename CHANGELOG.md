@@ -325,6 +325,18 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   fuzz target `resolv_conf`. Registry: `v2-rules.tsv` version 3 (shared
   with lab PR 219's rows: 82 rows, sub-gate 28), `v2-techniques.tsv`
   version 2 (TQ61 T1046, TQ62 T1110, after lab PR 219's TQ60).
+- Cryptographic test vectors pinned before the RustCrypto bump (Wave 4
+  Phase 2, D0 of the dependency plan; lab PR 230): 20 vectors in 14 host
+  tests (`cargo test crypto_vectors`) fix the bytes produced today through
+  our own formats — the quarantine vault's HKDF file key and `nonce ‖
+  ciphertext ‖ tag` record, and a vault written by `main` restored
+  (`agent/tests/fixtures/vault-v1/`); SHA-256 of the install manifest's
+  boot check and of the self-integrity overlay report; MD5 of JA3 and of
+  dpkg's `.md5sums`; Ed25519 from a fixed seed and a signed admin payload
+  (CBOR, SHA-512 digest, signature); an overlay signed and stored before
+  the bump accepted by the overlay gate (`agent/tests/fixtures/overlay-v1/`).
+  The vault's encryption and decryption are two functions the tests call
+  (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
 - NN-L-FIM-010 named a rename's destination DIRECTORY, so a watched file

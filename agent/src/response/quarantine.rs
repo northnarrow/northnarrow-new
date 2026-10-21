@@ -473,30 +473,14 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
         .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidData, "the entry records no sha256"))?
         .to_ascii_lowercase();
 
-    let mut bin = fs::read(&bin_path)?;
+    let bin = fs::read(&bin_path)?;
     if bin.len() < NONCE_LEN {
         return Err(std::io::Error::other("vault file too short"));
     }
-    let nonce_bytes: [u8; NONCE_LEN] = bin[..NONCE_LEN]
-        .try_into()
-        .map_err(|_| std::io::Error::other("nonce slice"))?;
-    let ciphertext = bin.split_off(NONCE_LEN);
-    drop(bin);
 
     let master = load_or_init_master_key(cfg)?;
-    let key = derive_file_key(&master, vault_id);
-    let cipher = Aes256Gcm::new((&*key).into());
-    let plaintext = Zeroizing::new(
-        cipher
-            .decrypt(
-                Nonce::from_slice(&nonce_bytes),
-                Payload {
-                    msg: &ciphertext,
-                    aad: vault_id.as_bytes(),
-                },
-            )
-            .map_err(|e| std::io::Error::other(format!("decrypt: {e}")))?,
-    );
+    let plaintext = open(&master, vault_id, &bin)?;
+    drop(bin);
     let got_sha = format!("{:x}", Sha256::digest(&*plaintext));
     if got_sha != want_sha {
         return Err(std::io::Error::new(
@@ -637,18 +621,9 @@ fn quarantine_file_after_check(
     // Encrypt.
     let vault_id = uuid::Uuid::new_v4().simple().to_string();
     let master = load_or_init_master_key(cfg)?;
-    let file_key = derive_file_key(&master, &vault_id);
     let mut nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let cipher = Aes256Gcm::new((&*file_key).into());
-    let ciphertext = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &content,
-                aad: vault_id.as_bytes(),
-            },
-        )
+    let ciphertext = seal(&master, &vault_id, &nonce, &content)
         .map_err(|e| QuarantineError::Crypto(format!("encrypt: {e}")))?;
 
     // Lay out the vault.
@@ -965,6 +940,52 @@ fn derive_file_key(master: &Zeroizing<[u8; 32]>, vault_id: &str) -> Zeroizing<[u
     hk.expand(vault_id.as_bytes(), &mut *out)
         .expect("HKDF 32-byte expand cannot fail");
     out
+}
+
+/// AES-256-GCM of `content` for the vault entry `vault_id`, under its
+/// [`derive_file_key`] with the vault id as associated data: ciphertext ‖
+/// tag (16 bytes). The `.bin` of the entry is `nonce (12) ‖` this, with no
+/// header; [`open`] reads it back. Lab PR 230 pins these bytes
+/// (`crypto_vectors`).
+fn seal(
+    master: &Zeroizing<[u8; 32]>,
+    vault_id: &str,
+    nonce: &[u8; NONCE_LEN],
+    content: &[u8],
+) -> Result<Vec<u8>, aes_gcm::Error> {
+    let key = derive_file_key(master, vault_id);
+    let cipher = Aes256Gcm::new((&*key).into());
+    cipher.encrypt(
+        Nonce::from_slice(nonce),
+        Payload {
+            msg: content,
+            aad: vault_id.as_bytes(),
+        },
+    )
+}
+
+/// The content of the `.bin` of the vault entry `vault_id` ([`seal`]),
+/// refused when its tag, its nonce or its vault id do not match.
+fn open(
+    master: &Zeroizing<[u8; 32]>,
+    vault_id: &str,
+    bin: &[u8],
+) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let (nonce, ciphertext) = bin
+        .split_at_checked(NONCE_LEN)
+        .ok_or_else(|| std::io::Error::other("vault file too short"))?;
+    let key = derive_file_key(master, vault_id);
+    let cipher = Aes256Gcm::new((&*key).into());
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: vault_id.as_bytes(),
+            },
+        )
+        .map_err(|e| std::io::Error::other(format!("decrypt: {e}")))?;
+    Ok(Zeroizing::new(plaintext))
 }
 
 #[cfg(test)]
@@ -1533,5 +1554,140 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Lab PR 230 (D0 of the dependency plan): the vault's bytes as the
+    /// crypto crates of today produce them, pinned before the RustCrypto
+    /// bump (aes-gcm 0.11, hkdf 0.13, sha2 0.11). The bump must pass these
+    /// unchanged. Values recomputed outside the repository (OpenSSL).
+    mod crypto_vectors {
+        use super::*;
+
+        const VAULT_ID: &str = "00112233445566778899aabbccddeeff";
+        const NONCE: [u8; NONCE_LEN] = [
+            0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab,
+        ];
+        const MSG: &[u8] = b"NorthNarrow quarantine KAT v1\n";
+        const FILE_KEY: &str = "fea604d8c1e07187f19e324a0171a9d8baef3a6f8ce8e5d0a01d58cf5296ea2f";
+        /// nonce ‖ ciphertext (30) ‖ tag (16).
+        const VAULT_BIN: &str = concat!(
+            "a0a1a2a3a4a5a6a7a8a9aaab",
+            "df7852d98195bb82f42e822715c7fc1b60fbcfabb758bfd48d03170636c6b114",
+            "0f83e8fc3597da8b8ef04c1da52a",
+        );
+        const MSG_SHA256: &str = "c40f026076e81e6e596843a2720c1e41b979956ccd86188de96cfd725c4e1f0f";
+
+        /// The master key 00 01 … 1f.
+        fn master() -> Zeroizing<[u8; 32]> {
+            let mut k = Zeroizing::new([0u8; 32]);
+            for (i, b) in k.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            k
+        }
+
+        fn unhex(s: &str) -> Vec<u8> {
+            hex::decode(s.trim()).unwrap()
+        }
+
+        /// Protects: the per-entry key a vault written before the bump was sealed under.
+        #[test]
+        fn hkdf_file_key_is_pinned() {
+            assert_eq!(hex::encode(*derive_file_key(&master(), VAULT_ID)), FILE_KEY);
+        }
+
+        /// Protects: a vault record sealed before the bump is the record sealed after it.
+        #[test]
+        fn vault_record_v1_is_pinned() {
+            let mut bin = NONCE.to_vec();
+            bin.extend(seal(&master(), VAULT_ID, &NONCE, MSG).unwrap());
+            assert_eq!(bin.len(), NONCE_LEN + MSG.len() + 16);
+            assert_eq!(hex::encode(&bin), VAULT_BIN);
+            assert_eq!(&*open(&master(), VAULT_ID, &unhex(VAULT_BIN)).unwrap(), MSG);
+        }
+
+        /// Protects: a record with a wrong tag, nonce or vault id stays refused after the bump.
+        #[test]
+        fn a_vault_record_that_does_not_match_is_refused() {
+            let good = unhex(VAULT_BIN);
+            // a bit of the nonce, of the ciphertext, of the tag
+            for at in [0, NONCE_LEN, good.len() - 1] {
+                let mut bad = good.clone();
+                bad[at] ^= 1;
+                assert!(open(&master(), VAULT_ID, &bad).is_err(), "byte {at}");
+            }
+            assert!(open(&master(), "00112233445566778899aabbccddeefe", &good).is_err());
+            assert!(open(&master(), VAULT_ID, &good[..NONCE_LEN + 15]).is_err());
+            assert!(open(&master(), VAULT_ID, &good[..NONCE_LEN - 1]).is_err());
+        }
+
+        /// Protects: what the quarantine writes is the format the vectors above pin.
+        #[test]
+        fn the_quarantine_writes_the_pinned_format() {
+            let tmp = TempDir::new().unwrap();
+            let cfg = cfg_for(&tmp);
+            fs::write(&cfg.master_key_file, *master()).unwrap();
+            let src = tmp.path().join("kat-sample");
+            fs::write(&src, MSG).unwrap();
+            let id = quarantine_file(&ExeHandle::open(&src).unwrap(), &cfg).expect("quarantine");
+            // `.bin` = nonce ‖ seal(…); `.meta` = the SHA-256 in lowercase hex.
+            let bin = fs::read(cfg.quarantine_dir.join("vault").join(format!("{id}.bin"))).unwrap();
+            assert_eq!(bin.len(), NONCE_LEN + MSG.len() + 16);
+            let nonce: [u8; NONCE_LEN] = bin[..NONCE_LEN].try_into().unwrap();
+            assert_eq!(
+                bin[NONCE_LEN..],
+                seal(&master(), &id, &nonce, MSG).unwrap()[..]
+            );
+            let meta = vault_meta(&id, &cfg).unwrap();
+            assert_eq!(meta["sha256"], MSG_SHA256);
+            assert_eq!(meta["size_bytes"], MSG.len() as u64);
+        }
+
+        /// The vault `quarantine_file` of `main` at 8180540 wrote for
+        /// `/tmp/nn-vault-v1/kat-sample` (content [`MSG`]) under the master
+        /// key 00 01 … 1f: `agent/tests/fixtures/vault-v1/`, binary files
+        /// as hex.
+        const FIXTURE_ID: &str = "1b3e9723638c4980bfe76816eafc1081";
+        const FIXTURE_MASTER: &str = include_str!("../../tests/fixtures/vault-v1/master.key.hex");
+        const FIXTURE_BIN: &str =
+            include_str!("../../tests/fixtures/vault-v1/1b3e9723638c4980bfe76816eafc1081.bin.hex");
+        const FIXTURE_META: &str =
+            include_str!("../../tests/fixtures/vault-v1/1b3e9723638c4980bfe76816eafc1081.meta");
+        const FIXTURE_INDEX: &str = include_str!("../../tests/fixtures/vault-v1/index.json");
+
+        /// Protects: a vault written before the bump must restore after it.
+        #[test]
+        fn a_vault_written_before_the_bump_restores() {
+            let tmp = TempDir::new().unwrap();
+            let cfg = cfg_for(&tmp);
+            let vault = cfg.quarantine_dir.join("vault");
+            fs::create_dir_all(&vault).unwrap();
+            fs::write(&cfg.master_key_file, unhex(FIXTURE_MASTER)).unwrap();
+            fs::write(vault.join(format!("{FIXTURE_ID}.bin")), unhex(FIXTURE_BIN)).unwrap();
+            fs::write(vault.join(format!("{FIXTURE_ID}.meta")), FIXTURE_META).unwrap();
+            fs::write(cfg.quarantine_dir.join("index.json"), FIXTURE_INDEX).unwrap();
+            assert_eq!(*load_or_init_master_key(&cfg).unwrap(), *master());
+
+            // the index and the `.meta` as written, the `.bin` opens, restore writes it
+            assert_eq!(
+                list_vault(&cfg),
+                vec![VaultEntry {
+                    vault_id: FIXTURE_ID.to_string(),
+                    original_path: "/tmp/nn-vault-v1/kat-sample".to_string(),
+                    size_bytes: MSG.len() as u64,
+                    captured_at: 1_792_620_126,
+                }]
+            );
+            assert_eq!(vault_meta(FIXTURE_ID, &cfg).unwrap()["sha256"], MSG_SHA256);
+            assert_eq!(
+                &*open(&master(), FIXTURE_ID, &unhex(FIXTURE_BIN)).unwrap(),
+                MSG
+            );
+
+            let out = tmp.path().join("restored");
+            let to = out.to_string_lossy().into_owned();
+            assert_eq!(restore_entry(FIXTURE_ID, Some(&to), &cfg).unwrap(), out);
+            assert_eq!(fs::read(&out).unwrap(), MSG);
+        }
     }
 }

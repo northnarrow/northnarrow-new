@@ -3090,4 +3090,26 @@ mod tests {
             assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
         }
     }
+
+    /// Lab PR 230 (D0 of the dependency plan): the overlay hash the
+    /// self-integrity round reports, pinned before the sha2 0.11 bump.
+    mod crypto_vectors {
+        use super::*;
+
+        /// Protects: an overlay's short SHA-256 in the self-integrity report survives the bump.
+        #[test]
+        fn overlay_short_sha256_is_pinned() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("process-comm-allowlist.local"), "abc").unwrap();
+            let f = config_overlays(dir.path());
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert_eq!(
+                f[0].detail,
+                format!(
+                    "{} (3 bytes, sha256 ba7816bf8f01cfea…)",
+                    dir.path().join("process-comm-allowlist.local").display()
+                )
+            );
+        }
+    }
 }

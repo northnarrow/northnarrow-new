@@ -366,4 +366,28 @@ mod tests {
         );
         assert_eq!(parse_rpm_digest(out, "/usr/bin/z"), None);
     }
+
+    /// Lab PR 230 (D0 of the dependency plan): MD5 as the package check
+    /// computes it today, pinned before the md-5 0.11 bump.
+    mod crypto_vectors {
+        use super::*;
+
+        /// Protects: a file whose MD5 dpkg recorded before the bump is still trusted after it.
+        #[test]
+        fn dpkg_md5_is_pinned() {
+            let t = tree("900150983cd24fb0d6963f7d28e17f72  opt/kat/abc\n");
+            let trust = PackageTrust::new(t.path(), false);
+            let (_keep, f) = file_with(b"abc");
+            assert_eq!(
+                trust.check("/opt/kat/abc", &f),
+                PkgOutcome::Trusted { manager: "dpkg" }
+            );
+            // an edited file still is not
+            let (_keep2, edited) = file_with(b"abd");
+            assert_eq!(
+                trust.check("/opt/kat/abc", &edited),
+                PkgOutcome::Modified { manager: "dpkg" }
+            );
+        }
+    }
 }
