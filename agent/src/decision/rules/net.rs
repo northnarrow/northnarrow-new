@@ -63,6 +63,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::bounded::{LazyLru, LossCounter};
 use crate::decision::Rule;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
@@ -612,6 +613,13 @@ impl Rule for NnLNet001OutboundToBlockedIp {
     fn category(&self) -> &'static str {
         CATEGORY_CRITICAL
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::CommandAndControl, "T1071"),
+            AttackRef::new(Tactic::CommandAndControl, "T1095"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
             return None;
@@ -649,6 +657,10 @@ impl Rule for NnLNet002OutboundToBlockedTld {
     }
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1090.003")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
@@ -697,6 +709,10 @@ impl Rule for NnLNet003BadJa3 {
     }
     fn category(&self) -> &'static str {
         CATEGORY_CRITICAL
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1573.002")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
@@ -1163,6 +1179,10 @@ impl Rule for NnLNet004SuspiciousDnsQname {
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1071.004")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::DnsQuery {
             pid,
@@ -1289,6 +1309,10 @@ impl Rule for NnLNet005DnsBurst {
     }
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1071.004")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::DnsQuery {
@@ -1432,6 +1456,10 @@ impl Rule for NnLNet006UncommonListener {
     fn category(&self) -> &'static str {
         CATEGORY_MEDIUM
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1571")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetListener(nl) = event else {
             return None;
@@ -1494,6 +1522,13 @@ impl Rule for NnLNet007Rfc1918FromUnusualProc {
     }
     fn category(&self) -> &'static str {
         CATEGORY_MEDIUM
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::LateralMovement, "T1021"),
+            AttackRef::new(Tactic::Discovery, "T1046"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
@@ -1569,6 +1604,10 @@ impl Rule for NnLNet008OutboundFromTmpExec {
     }
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1105")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
@@ -1696,6 +1735,13 @@ impl Rule for NnLNet009ByteAnomaly {
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Exfiltration, "T1048"),
+            AttackRef::new(Tactic::Exfiltration, "T1041"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
             return None;
@@ -1782,6 +1828,13 @@ impl Rule for NnLNet010OutboundToHighRiskC2Port {
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::CommandAndControl, "T1571"),
+            AttackRef::new(Tactic::CommandAndControl, "T1090"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
             return None;
@@ -1835,6 +1888,13 @@ impl Rule for NnLNet011PlaintextCredService {
     }
     fn category(&self) -> &'static str {
         CATEGORY_MEDIUM
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::CommandAndControl, "T1071.002"),
+            AttackRef::new(Tactic::LateralMovement, "T1021"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
@@ -1897,6 +1957,13 @@ impl Rule for NnLNet013Beacon {
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::CommandAndControl, "T1071"),
+            AttackRef::new(Tactic::Exfiltration, "T1029"),
+        ];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
             return None;
@@ -1958,6 +2025,15 @@ impl Rule for NnLNet018Rfc1918LateralPort {
     }
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::LateralMovement, "T1021.002"),
+            AttackRef::new(Tactic::LateralMovement, "T1021.001"),
+            AttackRef::new(Tactic::LateralMovement, "T1021.006"),
+            AttackRef::new(Tactic::LateralMovement, "T1021.005"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetFlow(nf) = event else {
@@ -2040,6 +2116,10 @@ impl Rule for NnLNet019WildcardListener {
     }
     fn category(&self) -> &'static str {
         CATEGORY_MEDIUM
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1571")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::NetListener(nl) = event else {
@@ -2158,6 +2238,10 @@ impl Rule for NnLNet020DnsQueryFlood {
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1071.004")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::DnsFlood {
             pid,
@@ -2201,7 +2285,8 @@ impl Rule for NnLNet020DnsQueryFlood {
 /// call within the budget (64, then 128 per second, per process; 512,
 /// then 256 per second, per user), holds back the rest, and the next
 /// record carries the count. This rule names the process that floods
-/// (MITRE T1562.006, indicator blocking).
+/// (ATT&CK T1685 Disable or Modify Tools, its `attack()`: T1562.006
+/// Indicator Blocking until v19).
 ///
 /// One rule for both sensors: the mechanism, the threshold and the
 /// response are the same, and the verdict names the sensor. Kept apart
@@ -2235,6 +2320,10 @@ impl Rule for NnLNet021SensorRecordFlood {
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::DefenseImpairment, "T1685")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::SensorFlood {
             source,
@@ -2265,8 +2354,7 @@ impl Rule for NnLNet021SensorRecordFlood {
             &format!(
                 "{comm} (pid {pid}, uid {uid}) made at least {sum} {calls} beyond {scope} \
                  record budget within 10 seconds: those calls were not recorded, and a flood \
-                 like this can push other processes' {records} out of the kernel ring \
-                 (T1562.006)"
+                 like this can push other processes' {records} out of the kernel ring"
             ),
             *pid,
             comm.clone(),
@@ -2371,6 +2459,10 @@ impl Rule for NnLNet014DnsTunnelEntropy {
     }
     fn category(&self) -> &'static str {
         CATEGORY_HIGH
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1071.004")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let Event::DnsQuery {

@@ -1,9 +1,11 @@
 //! R016 — Debugger / tracer exec by a non-developer uid (Tappa 10.5
 //! D2).
 //!
-//! MITRE T1622 (Debugger Evasion) — and the adjacent credential-dump
-//! prep use (`gdb`/`strace` attaching to a process to read its
-//! memory). A debugger run by a *service account* (not a human dev,
+//! The tracer of ptrace injection (ATT&CK T1055.008, its `attack()`;
+//! lab PR 221 — the T1622 Debugger Evasion this rule used to name is a
+//! payload detecting a debugger, not running one) — and the adjacent
+//! credential-dump prep use (`gdb`/`strace` attaching to a process to
+//! read its memory). A debugger run by a *service account* (not a human dev,
 //! not root) is the anomaly: daemons don't normally trace processes.
 //! Medium + Log, scoped to the service-account uid class it shares
 //! with R015 ([`super::is_service_uid`]: 1..999, `nobody`, systemd's
@@ -18,6 +20,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Debugger / tracer tool comms (design §7.1).
@@ -42,6 +45,10 @@ impl Rule for R016DebuggerServiceUid {
     }
     fn category(&self) -> &'static str {
         "defense_evasion"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Stealth, "T1055.008")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
@@ -68,8 +75,8 @@ impl Rule for R016DebuggerServiceUid {
         // / live-tamper tell vs launching a target. Additive.
         let mut reasoning = String::from(
             "Debugger/tracer (gdb/strace/ltrace) exec by a service \
-             account — debugger-evasion / credential-dump prep \
-             (T1622); posture → ALERTED",
+             account — ptrace-injection / credential-dump prep; \
+             posture → ALERTED",
         );
         if argv
             .iter()

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 const OFFSEC_COMMS: &[&str] = &["socat", "msfvenom", "meterpreter", "sliver", "havoc"];
@@ -87,6 +88,13 @@ impl Rule for R006ReverseShellTooling {
     }
     fn category(&self) -> &'static str {
         "lateral_movement"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::CommandAndControl, "T1095"),
+            AttackRef::new(Tactic::Execution, "T1059.004"),
+        ];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

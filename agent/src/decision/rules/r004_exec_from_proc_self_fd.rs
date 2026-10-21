@@ -31,6 +31,7 @@
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// R004 rule. `lineage` resolves a `systemd --user` parent by what the
@@ -140,6 +141,10 @@ impl Rule for R004ExecFromProcSelfFd {
     }
     fn category(&self) -> &'static str {
         "execution"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Stealth, "T1620")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

@@ -2,6 +2,7 @@
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 const NETCAT_COMMS: &[&str] = &["nc", "ncat", "netcat", "nc.openbsd", "nc.traditional"];
@@ -17,6 +18,10 @@ impl Rule for R005NetcatExec {
     }
     fn category(&self) -> &'static str {
         "lateral_movement"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CommandAndControl, "T1095")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

@@ -4874,8 +4874,8 @@ async fn process_event(
             // the kernel already refused it) — the adversarial check found
             // refused attempts that left no record in the chain logs.
             use northnarrow_agent::decision::Rule as _;
-            let verdict = northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial
-                .evaluate(&event);
+            let at001 = northnarrow_agent::decision::rules::anti_tamper::NnLAt001AntiTamperDenial;
+            let verdict = at001.evaluate(&event);
             // Review 75: a loop of denied attempts is logged and stored
             // within the rule's budget for that uid.
             let admit = match &verdict {
@@ -4904,6 +4904,7 @@ async fn process_event(
                         sink.record_rule(
                             &event,
                             &verdict,
+                            at001.attack(),
                             posture.current_kind(),
                             "denied in kernel (anti-tamper LSM hook)".to_string(),
                             suppressed_before,
@@ -4931,7 +4932,8 @@ async fn process_event(
             ..
         } => {
             use northnarrow_agent::decision::rules::epg;
-            let verdict = epg::rule_for(&event).and_then(|r| r.evaluate(&event));
+            let rule = epg::rule_for(&event);
+            let verdict = rule.and_then(|r| r.evaluate(&event));
             let admit = match &verdict {
                 Some(v) => budget_admit(&v.rule_id, *uid, &event),
                 None => Admit::Record {
@@ -4959,6 +4961,7 @@ async fn process_event(
                         sink.record_rule(
                             &event,
                             &verdict,
+                            rule.map_or(&[][..], |r| r.attack()),
                             posture.current_kind(),
                             epg::response_line(&event),
                             suppressed_before,
@@ -5062,7 +5065,7 @@ async fn process_event(
         }
     }
 
-    if let Some(verdict) = engine.evaluate(&event) {
+    if let Some((verdict, attack)) = engine.evaluate_with_attack(&event) {
         // Review 75: every verdict is acted on; its log lines and its
         // record count against the rule's budget for the acting uid.
         let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
@@ -5130,6 +5133,7 @@ async fn process_event(
                 sink.record_rule(
                     &event,
                     &verdict,
+                    attack,
                     posture.current_kind(),
                     northnarrow_agent::detection_store::describe_response(&report),
                     suppressed_before,

@@ -35,6 +35,7 @@ use std::sync::Arc;
 use common::{Event, ModuleLoadMethod, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::rules::module_provenance::{ModuleOwners, Provenance};
 use crate::decision::{rules::build_verdict, Rule};
 
@@ -78,6 +79,13 @@ impl Rule for R018KernelModuleLoad {
     }
     fn category(&self) -> &'static str {
         "rootkit"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Persistence, "T1547.006"),
+            AttackRef::new(Tactic::Stealth, "T1014"),
+        ];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

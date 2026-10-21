@@ -1,0 +1,142 @@
+# MITRE ATT&CK® Enterprise 20.0: the identifiers NorthNarrow's rule mapping uses
+# (lab PR 221). Written by `cargo xtask attack-coverage --pin-ids <ids> --mirror <dir>`
+# (agent/examples/attack_coverage.rs) from the pinned bundle; edit it there.
+# "© 2026 The MITRE Corporation. This work is reproduced and distributed with the permission of The MITRE Corporation."
+# Terms: LICENSES/MITRE_ATTACK_ToU-20.0.md, verbatim from the same commit (NOTICES.md).
+# source: https://github.com/mitre-attack/attack-stix-data
+# file: enterprise-attack/enterprise-attack-20.0.json
+# commit: 20664a889568dce884a1dac0ec7b12ae3a199f51
+# sha256: 81113ba98afa2928f3dcff62022539f7ce30c315c32e14422f11ff95ce534352
+# version: 20.0 (collection modified 2026-10-13T17:53:10.145Z)
+#
+# Columns (tab-separated):
+#   id           TA#### tactic, T#### technique, T####.### sub-technique, DC#### data component
+#   kind         tactic | technique | subtechnique | data-component
+#   status       active | revoked | deprecated, in this version
+#   name         the ATT&CK name
+#   tactics      a technique's tactics (kill-chain phase short names, comma-separated);
+#                a tactic's own short name; - for a data component
+#   replaced_by  the id a revoked object is revoked by; - otherwise
+id	kind	status	name	tactics	replaced_by
+TA0043	tactic	active	Reconnaissance	reconnaissance	-
+TA0042	tactic	active	Resource Development	resource-development	-
+TA0001	tactic	active	Initial Access	initial-access	-
+TA0002	tactic	active	Execution	execution	-
+TA0003	tactic	active	Persistence	persistence	-
+TA0004	tactic	active	Privilege Escalation	privilege-escalation	-
+TA0005	tactic	active	Stealth	stealth	-
+TA0112	tactic	active	Defense Impairment	defense-impairment	-
+TA0006	tactic	active	Credential Access	credential-access	-
+TA0007	tactic	active	Discovery	discovery	-
+TA0008	tactic	active	Lateral Movement	lateral-movement	-
+TA0009	tactic	active	Collection	collection	-
+TA0011	tactic	active	Command and Control	command-and-control	-
+TA0010	tactic	active	Exfiltration	exfiltration	-
+TA0040	tactic	active	Impact	impact	-
+T1003	technique	active	OS Credential Dumping	credential-access	-
+T1003.008	subtechnique	active	/etc/passwd and /etc/shadow	credential-access	-
+T1005	technique	active	Data from Local System	collection	-
+T1014	technique	active	Rootkit	stealth	-
+T1021	technique	active	Remote Services	lateral-movement	-
+T1021.001	subtechnique	active	Remote Desktop Protocol	lateral-movement	-
+T1021.002	subtechnique	active	SMB/Windows Admin Shares	lateral-movement	-
+T1021.004	subtechnique	active	SSH	lateral-movement	-
+T1021.005	subtechnique	active	VNC	lateral-movement	-
+T1021.006	subtechnique	active	Windows Remote Management	lateral-movement	-
+T1027	technique	active	Obfuscated Files or Information	stealth	-
+T1027.011	subtechnique	active	Fileless Storage	stealth	-
+T1029	technique	active	Scheduled Transfer	exfiltration	-
+T1033	technique	active	System Owner/User Discovery	discovery	-
+T1041	technique	active	Exfiltration Over C2 Channel	exfiltration	-
+T1046	technique	active	Network Service Discovery	discovery	-
+T1048	technique	active	Exfiltration Over Alternative Protocol	exfiltration	-
+T1049	technique	active	System Network Connections Discovery	discovery	-
+T1053	technique	active	Scheduled Task/Job	execution,persistence,privilege-escalation	-
+T1053.002	subtechnique	active	At	execution,persistence,privilege-escalation	-
+T1053.003	subtechnique	active	Cron	execution,persistence,privilege-escalation	-
+T1053.006	subtechnique	active	Systemd Timers	execution,persistence,privilege-escalation	-
+T1055	technique	active	Process Injection	stealth,privilege-escalation	-
+T1055.008	subtechnique	active	Ptrace System Calls	stealth,privilege-escalation	-
+T1055.009	subtechnique	active	Proc Memory	stealth,privilege-escalation	-
+T1057	technique	active	Process Discovery	discovery	-
+T1059	technique	active	Command and Scripting Interpreter	execution	-
+T1059.004	subtechnique	active	Unix Shell	execution	-
+T1068	technique	active	Exploitation for Privilege Escalation	privilege-escalation	-
+T1070	technique	active	Indicator Removal	stealth	-
+T1070.002	subtechnique	revoked	Clear Linux or Mac System Logs	stealth	T1685.006
+T1070.003	subtechnique	active	Clear Command History	stealth	-
+T1070.004	subtechnique	active	File Deletion	stealth	-
+T1070.006	subtechnique	active	Timestomp	stealth	-
+T1071	technique	active	Application Layer Protocol	command-and-control	-
+T1071.002	subtechnique	active	File Transfer Protocols	command-and-control	-
+T1071.004	subtechnique	active	DNS	command-and-control	-
+T1082	technique	active	System Information Discovery	discovery	-
+T1083	technique	active	File and Directory Discovery	discovery	-
+T1090	technique	active	Proxy	command-and-control	-
+T1090.003	subtechnique	active	Multi-hop Proxy	command-and-control	-
+T1095	technique	active	Non-Application Layer Protocol	command-and-control	-
+T1098	technique	active	Account Manipulation	persistence,privilege-escalation	-
+T1098.004	subtechnique	active	SSH Authorized Keys	persistence,privilege-escalation	-
+T1105	technique	active	Ingress Tool Transfer	command-and-control	-
+T1106	technique	active	Native API	execution	-
+T1132	technique	active	Data Encoding	command-and-control	-
+T1136	technique	active	Create Account	persistence	-
+T1136.001	subtechnique	active	Local Account	persistence	-
+T1140	technique	active	Deobfuscate/Decode Files or Information	stealth	-
+T1480	technique	active	Execution Guardrails	stealth	-
+T1486	technique	active	Data Encrypted for Impact	impact	-
+T1496	technique	active	Resource Hijacking	impact	-
+T1496.001	subtechnique	active	Compute Hijacking	impact	-
+T1497	technique	active	Virtualization/Sandbox Evasion	stealth,discovery	-
+T1499	technique	active	Endpoint Denial of Service	impact	-
+T1505	technique	active	Server Software Component	persistence	-
+T1505.003	subtechnique	active	Web Shell	persistence	-
+T1543	technique	active	Create or Modify System Process	persistence,privilege-escalation	-
+T1543.002	subtechnique	active	Systemd Service	persistence,privilege-escalation	-
+T1547	technique	active	Boot or Logon Autostart Execution	persistence,privilege-escalation	-
+T1547.006	subtechnique	active	Kernel Modules and Extensions	persistence,privilege-escalation	-
+T1547.013	subtechnique	active	XDG Autostart Entries	persistence,privilege-escalation	-
+T1548	technique	active	Abuse Elevation Control Mechanism	privilege-escalation	-
+T1548.001	subtechnique	active	Setuid and Setgid	privilege-escalation	-
+T1548.003	subtechnique	active	Sudo and Sudo Caching	privilege-escalation	-
+T1552	technique	active	Unsecured Credentials	credential-access	-
+T1552.001	subtechnique	active	Credentials In Files	credential-access	-
+T1552.004	subtechnique	active	Private Keys	credential-access	-
+T1554	technique	active	Compromise Host Software Binary	persistence	-
+T1555	technique	active	Credentials from Password Stores	credential-access	-
+T1555.003	subtechnique	active	Credentials from Web Browsers	credential-access	-
+T1555.005	subtechnique	active	Password Managers	credential-access	-
+T1556	technique	active	Modify Authentication Process	defense-impairment,persistence,credential-access	-
+T1556.003	subtechnique	active	Pluggable Authentication Modules	defense-impairment,persistence,credential-access	-
+T1562	technique	revoked	Impair Defenses	stealth	T1685
+T1562.001	subtechnique	revoked	Disable or Modify Tools	stealth	T1685
+T1562.004	subtechnique	revoked	Disable or Modify System Firewall	stealth	T1686
+T1562.006	subtechnique	revoked	Indicator Blocking	stealth	T1685
+T1562.012	subtechnique	revoked	Disable or Modify Linux Audit System	stealth	T1685.004
+T1564	technique	active	Hide Artifacts	stealth	-
+T1564.001	subtechnique	active	Hidden Files and Directories	stealth	-
+T1571	technique	active	Non-Standard Port	command-and-control	-
+T1573	technique	active	Encrypted Channel	command-and-control	-
+T1573.002	subtechnique	active	Asymmetric Cryptography	command-and-control	-
+T1574	technique	active	Hijack Execution Flow	stealth,execution	-
+T1574.006	subtechnique	active	Dynamic Linker Hijacking	stealth,execution	-
+T1611	technique	active	Escape to Host	privilege-escalation	-
+T1620	technique	active	Reflective Code Loading	stealth	-
+T1622	technique	active	Debugger Evasion	stealth,discovery	-
+T1685	technique	active	Disable or Modify Tools	defense-impairment	-
+T1685.004	subtechnique	active	Disable or Modify Linux Audit System Log	defense-impairment	-
+T1685.006	subtechnique	active	Clear Linux or Mac System Logs	defense-impairment	-
+T1686	technique	active	Disable or Modify System Firewall	defense-impairment	-
+DC0021	data-component	active	OS API Execution	-	-
+DC0031	data-component	active	Kernel Module Load	-	-
+DC0032	data-component	active	Process Creation	-	-
+DC0034	data-component	active	Process Metadata	-	-
+DC0035	data-component	active	Process Access	-	-
+DC0039	data-component	active	File Creation	-	-
+DC0040	data-component	active	File Deletion	-	-
+DC0055	data-component	active	File Access	-	-
+DC0059	data-component	active	File Metadata	-	-
+DC0061	data-component	active	File Modification	-	-
+DC0078	data-component	active	Network Traffic Flow	-	-
+DC0082	data-component	active	Network Connection Creation	-	-
+DC0085	data-component	active	Network Traffic Content	-	-

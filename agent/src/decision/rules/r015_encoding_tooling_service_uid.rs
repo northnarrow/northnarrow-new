@@ -24,6 +24,7 @@ use common::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Encoding / encryption tool comms (design §7.1).
@@ -48,6 +49,14 @@ impl Rule for R015EncodingToolingServiceUid {
     }
     fn category(&self) -> &'static str {
         "defense_evasion"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Stealth, "T1027"),
+            AttackRef::new(Tactic::Stealth, "T1140"),
+            AttackRef::new(Tactic::CommandAndControl, "T1132"),
+        ];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

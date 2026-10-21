@@ -16,6 +16,7 @@ use common::{Event, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 pub struct R012SetcapTooling {
@@ -37,6 +38,10 @@ impl Rule for R012SetcapTooling {
     }
     fn category(&self) -> &'static str {
         "privilege_escalation"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::PrivilegeEscalation, "T1548")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

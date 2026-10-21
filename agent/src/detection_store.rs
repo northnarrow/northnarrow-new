@@ -61,6 +61,7 @@ use tracing::{info, warn};
 
 use crate::audit::AgentSigningKey;
 use crate::chainlog::{ProtectionManager, RotatingChainLog, RotationConfig};
+use crate::decision::attack::{mitre_of, AttackRef, ATTACK_VERSION};
 use crate::response::{ExecutionOutcome, ExecutionReport};
 
 /// Default on-disk location of the detection chainlog. Lives under the
@@ -517,6 +518,18 @@ pub struct DetectionRecord {
     /// that looked like the agent's. Absent-on-`None`, like [`Self::file`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<String>,
+    /// Lab PR 221 (capability C16): the ATT&CK Enterprise version
+    /// ([`ATTACK_VERSION`], `"20.0"`) the ids of [`Self::mitre`] are from,
+    /// on a rule-path record whose rule declares its ATT&CK references
+    /// ([`Rule::attack`](crate::decision::Rule::attack), set by
+    /// [`Self::with_attack`]). Version 19 renumbered techniques (T1562
+    /// Impair Defenses is revoked, T1685 took its place), so an id is read
+    /// with its version. Absent on records written before lab PR 221, whose
+    /// rule-path `mitre` is empty, and on ADE-path records, whose ids are
+    /// the model's and name no version; absent-on-`None`, like
+    /// [`Self::file`], so those lines keep their bytes and still verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mitre_version: Option<String>,
 }
 
 impl DetectionRecord {
@@ -541,8 +554,8 @@ impl DetectionRecord {
             severity: verdict.severity,
             verdict: DetectionVerdict::Rule(verdict.action.clone()),
             confidence: 1.0,
-            // Rule path carries no structured MITRE today (technique ids
-            // live only in prose `reasoning`), so this is empty.
+            // The verdict names no ATT&CK reference: the rule that issued
+            // it does ([`Self::with_attack`], lab PR 221). Empty until then.
             mitre: MitreAttack::default(),
             principal: Principal::from_event(event),
             exe: exe_from_event(event),
@@ -553,7 +566,21 @@ impl DetectionRecord {
             suppressed_before: None,
             file: file_from_event(event),
             operation: operation_from_event(event),
+            mitre_version: None,
         }
+    }
+
+    /// Lab PR 221 (capability C16): this rule-path record with the ATT&CK
+    /// references of the rule that fired — their tactic and technique ids
+    /// in [`Self::mitre`] ([`mitre_of`]), their version in
+    /// [`Self::mitre_version`]. No reference (a demo rule) leaves both as
+    /// they were: empty, absent.
+    pub fn with_attack(mut self, refs: &[AttackRef]) -> Self {
+        if !refs.is_empty() {
+            self.mitre = mitre_of(refs);
+            self.mitre_version = Some(ATTACK_VERSION.to_string());
+        }
+        self
     }
 }
 
@@ -889,17 +916,21 @@ impl DetectionSink {
     }
 
     /// Record a rule-path detection (off the hot path).
+    /// `attack`: the ATT&CK references of the rule that issued `verdict`
+    /// ([`DetectionRecord::with_attack`]).
     /// `suppressed_before`: see [`DetectionRecord::suppressed_before`].
     pub fn record_rule(
         &self,
         event: &Event,
         verdict: &Verdict,
+        attack: &[AttackRef],
         posture: PostureKind,
         response: String,
         suppressed_before: u64,
     ) {
         let mut record =
-            DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response);
+            DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
+                .with_attack(attack);
         record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         self.enqueue(record);
     }
@@ -1698,6 +1729,7 @@ mod tests {
             suppressed_before: None,
             file: None,
             operation: None,
+            mitre_version: None,
         };
         assert_roundtrip(&record);
     }
@@ -1911,6 +1943,117 @@ mod tests {
         assert_eq!(decoded.exe, None, "absent exe deserialises to None");
     }
 
+    /// Lab PR 221: a rule-path line written before the ATT&CK mapping
+    /// (empty `mitre`, no `mitre_version`), byte for byte as such an agent
+    /// wrote it, decodes and re-serialises to the same bytes — the
+    /// pre-image the chain verifier recomputes.
+    #[test]
+    fn a_rule_line_written_before_the_attack_mapping_keeps_its_bytes() {
+        const LEGACY: &str = concat!(
+            r#"{"id":7,"ts":"2026-06-08T12:00:00.000000Z","sensor":"Exec","path":"Rule","#,
+            r#""rule_id":"R001_ExecFromTmp","rule_name":"Exec from /tmp/","severity":"Medium","#,
+            r#""verdict":{"Rule":"KillProcess"},"confidence":1.0,"mitre":{"tactic":[],"technique":[]},"#,
+            r#""principal":{"pid":4242,"comm":"evil","uid":0,"ppid":1},"exe":"/tmp/payload","#,
+            r#""posture_at":"Engaged","response":"KillProcess","detection_type":"execution","#,
+            r#""status":"Open"}"#,
+        );
+        let decoded: DetectionRecord = serde_json::from_str(LEGACY).expect("legacy line decodes");
+        assert_eq!(decoded.mitre_version, None);
+        assert!(decoded.mitre.tactic.is_empty() && decoded.mitre.technique.is_empty());
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), LEGACY);
+        // A record built today without references has that shape too.
+        let today = DetectionRecord::from_rule(
+            7,
+            "2026-06-08T12:00:00.000000Z".to_string(),
+            &sample_event(),
+            &sample_verdict(),
+            PostureKind::Engaged,
+            "KillProcess".to_string(),
+        )
+        .with_attack(&[]);
+        assert_eq!(serde_json::to_string(&today).unwrap(), LEGACY);
+    }
+
+    /// Lab PR 221: the rule's references fill `mitre` (tactic ids, then
+    /// technique ids, each once) and `mitre_version`, and the record
+    /// round-trips.
+    #[test]
+    fn a_rule_record_carries_its_rules_attack_ids_and_version() {
+        use crate::decision::attack::Tactic;
+        const REFS: &[AttackRef] = &[
+            AttackRef::new(Tactic::Persistence, "T1053.003"),
+            AttackRef::new(Tactic::PrivilegeEscalation, "T1053.003"),
+            AttackRef::new(Tactic::Execution, "T1059.004"),
+        ];
+        let record = DetectionRecord::from_rule(
+            7,
+            "2026-06-08T12:00:00.000000Z".to_string(),
+            &sample_event(),
+            &sample_verdict(),
+            PostureKind::Engaged,
+            "KillProcess".to_string(),
+        )
+        .with_attack(REFS);
+        assert_eq!(record.mitre.tactic, ["TA0003", "TA0004", "TA0002"]);
+        assert_eq!(record.mitre.technique, ["T1053.003", "T1059.004"]);
+        assert_eq!(record.mitre_version.as_deref(), Some(ATTACK_VERSION));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains(
+            r#""mitre":{"tactic":["TA0003","TA0004","TA0002"],"technique":["T1053.003","T1059.004"]}"#
+        ));
+        assert!(json.ends_with(r#","mitre_version":"20.0"}"#), "{json}");
+        assert_roundtrip(&record);
+    }
+
+    /// Lab PR 221: through the real signed chain, a record with the
+    /// rule's ATT&CK ids and one without (the pre-221 shape) verify
+    /// together.
+    #[tokio::test]
+    async fn chain_verifies_with_attack_ids_and_without() {
+        use crate::decision::attack::Tactic;
+        const REFS: &[AttackRef] = &[AttackRef::new(Tactic::Execution, "T1059")];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("detections.jsonl");
+        let key = test_key();
+        let pubkey = key.verifying_key();
+        let (sink, _writer) = open(
+            &path,
+            key,
+            RotationConfig::default(),
+            Arc::new(NoProtection),
+            DEFAULT_QUEUE_CAP,
+        )
+        .expect("open detection store");
+        for refs in [REFS, &[]] {
+            sink.record_rule(
+                &sample_event(),
+                &sample_verdict(),
+                refs,
+                PostureKind::Observing,
+                "KillProcess".to_string(),
+                0,
+            );
+        }
+        let mut flushed = 0usize;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            flushed = count_data_lines(&path);
+            if flushed >= 2 {
+                break;
+            }
+        }
+        assert_eq!(flushed, 2, "writer appended both records");
+        let report =
+            verify_log_set::<DetectionRecord>(&path, &pubkey).expect("detection chain verifies");
+        assert_eq!(report.total_records, 2);
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert!(lines[0].contains(r#""mitre":{"tactic":["TA0002"],"technique":["T1059"]}"#));
+        assert!(lines[0].contains(r#""mitre_version":"20.0""#));
+        assert!(lines[1].contains(r#""mitre":{"tactic":[],"technique":[]}"#));
+        assert!(!lines[1].contains("mitre_version"));
+    }
+
     #[tokio::test]
     async fn chain_verifies_across_exe_present_and_absent() {
         // The load-bearing safety test for 9.0.a.1 (recon Q2). Write two
@@ -1943,6 +2086,7 @@ mod tests {
         sink.record_rule(
             &sample_event(),
             &sample_verdict(),
+            &[],
             PostureKind::Observing,
             "KillProcess".to_string(),
             0,
@@ -1950,6 +2094,7 @@ mod tests {
         sink.record_rule(
             &sample_file_open(),
             &sample_verdict(),
+            &[],
             PostureKind::Observing,
             "none".to_string(),
             0,
@@ -2003,6 +2148,7 @@ mod tests {
             sink.record_rule(
                 &sample_event(),
                 &sample_verdict(),
+                &[],
                 PostureKind::Observing,
                 "none".to_string(),
                 0,
@@ -2025,6 +2171,7 @@ mod tests {
             sink.record_rule(
                 &sample_event(),
                 v,
+                &[],
                 PostureKind::Observing,
                 response.to_string(),
                 0,
@@ -2062,6 +2209,7 @@ mod tests {
             sink.record_rule(
                 &sample_event(),
                 v,
+                &[],
                 PostureKind::Observing,
                 "none".to_string(),
                 0,
@@ -2110,6 +2258,7 @@ mod tests {
             sink.record_rule(
                 &sample_event(),
                 &sample_verdict(),
+                &[],
                 PostureKind::Observing,
                 "KillProcess".to_string(),
                 0,
@@ -2193,6 +2342,7 @@ mod tests {
             sink.record_rule(
                 &sample_event(),
                 &sample_verdict(),
+                &[],
                 PostureKind::Observing,
                 "KillProcess".to_string(),
                 held,
@@ -2479,6 +2629,7 @@ mod tests {
             sink.record_rule(
                 &sample_event(),
                 &sample_verdict(),
+                &[],
                 PostureKind::Observing,
                 "KillProcess".to_string(),
                 0,
@@ -2561,6 +2712,7 @@ mod tests {
             suppressed_before: None,
             file: None,
             operation: None,
+            mitre_version: None,
         }
     }
 

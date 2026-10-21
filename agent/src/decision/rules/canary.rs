@@ -53,6 +53,7 @@
 use common::{CanaryAccessKind, CanaryTypeTag, Event, ResponseAction, Severity, Verdict};
 
 use crate::canary::readers::CanaryReaders;
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::Rule;
 
 // ── helpers ────────────────────────────────────────────────────────
@@ -275,6 +276,10 @@ impl Rule for NnLCanary001FileAccess {
     fn category(&self) -> &'static str {
         "canary_deception"
     }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Collection, "T1005")];
+        ATTACK
+    }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let view = as_canary(event)?;
         if view.canary_type != CanaryTypeTag::File {
@@ -322,6 +327,10 @@ impl Rule for NnLCanary002ProcessExec {
     }
     fn category(&self) -> &'static str {
         "canary_deception"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Discovery, "T1083")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let view = as_canary(event)?;
@@ -374,6 +383,13 @@ impl Rule for NnLCanary003NetworkConnect {
     }
     fn category(&self) -> &'static str {
         "canary_deception"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[
+            AttackRef::new(Tactic::Discovery, "T1046"),
+            AttackRef::new(Tactic::LateralMovement, "T1021"),
+        ];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let view = as_canary(event)?;
@@ -432,6 +448,10 @@ impl Rule for NnLCanary004CredentialRead {
     }
     fn category(&self) -> &'static str {
         "canary_deception"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::CredentialAccess, "T1552.001")];
+        ATTACK
     }
     fn evaluate(&self, event: &Event) -> Option<Verdict> {
         let view = as_canary(event)?;

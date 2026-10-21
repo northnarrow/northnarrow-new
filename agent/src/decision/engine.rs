@@ -6,6 +6,7 @@ use std::sync::Arc;
 use common::{Event, Verdict};
 use parking_lot::Mutex;
 
+use super::attack::AttackRef;
 use super::rules::net::DnsBurstWindow;
 use super::rules::{default_rules, default_rules_with_net};
 use super::Rule;
@@ -125,9 +126,15 @@ impl RuleEngine {
     /// First-match wins. Returns the verdict from the earliest rule
     /// that fires, or `None` if every rule abstains.
     pub fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        self.evaluate_with_attack(event).map(|(v, _)| v)
+    }
+
+    /// [`Self::evaluate`], with the ATT&CK references of the rule that
+    /// fired ([`Rule::attack`]) for its detection record (lab PR 221).
+    pub fn evaluate_with_attack(&self, event: &Event) -> Option<(Verdict, &'static [AttackRef])> {
         for rule in &self.rules {
             if let Some(v) = rule.evaluate(event) {
-                return Some(v);
+                return Some((v, rule.attack()));
             }
         }
         None

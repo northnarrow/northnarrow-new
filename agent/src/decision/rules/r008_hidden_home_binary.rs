@@ -12,6 +12,7 @@
 
 use common::{Event, ResponseAction, Severity, Verdict};
 
+use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
 
 /// Dot-prefixed user directories whose binaries are legitimately
@@ -98,6 +99,10 @@ impl Rule for R008HiddenHomeBinary {
     }
     fn category(&self) -> &'static str {
         "persistence"
+    }
+    fn attack(&self) -> &'static [AttackRef] {
+        const ATTACK: &[AttackRef] = &[AttackRef::new(Tactic::Stealth, "T1564.001")];
+        ATTACK
     }
 
     fn evaluate(&self, event: &Event) -> Option<Verdict> {

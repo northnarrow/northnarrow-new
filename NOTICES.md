@@ -10,6 +10,7 @@ tarball's tree, and in `/usr/share/doc/northnarrow/` from a package.
 | Material | Where it is | Terms |
 |---|---|---|
 | NorthNarrow's own code, configuration and documentation | everything not named below | Apache-2.0 — `LICENSE` |
+| MITRE ATT&CK® identifiers and names, Enterprise 20.0 | the pinned id list `docs/detection/attack-enterprise-20.0.tsv` and the documents rendered from it (`docs/detection/ATTACK_COVERAGE.md`, `RULE_CATALOGUE.md`, `attack-navigator-layer.json`); the tactic ids and names and the technique ids built into the agent (`agent/src/decision/attack.rs`, the rules' `attack()`) and written in its detection records | MITRE ATT&CK Terms of Use — `LICENSES/MITRE_ATTACK_ToU-20.0.md` |
 | Rust crates from crates.io | compiled into `northnarrow-agent`, `northnarrow-watchdog` and `nn-admin` | each crate's own licence (below) |
 
 Wave 4 (lab PR 214): the third-party material of the on-host LLM advisor
@@ -20,6 +21,23 @@ with their licence texts; the vendored, modified `candle-core` 0.10.2; and
 the note on its model (Foundation-Sec-8B-Reasoning, which no release ever
 distributed). A release made before Wave 4 carries its own `NOTICES.md`
 for what it held.
+
+## MITRE ATT&CK® identifiers (Enterprise 20.0)
+
+The rules' structured ATT&CK mapping (lab PR 221) and the documents of
+`docs/detection/` use the identifiers, tactic names and technique names of
+ATT&CK Enterprise 20.0, extracted with `cargo xtask attack-coverage
+--pin-ids` into `docs/detection/attack-enterprise-20.0.tsv` (only the ids in
+use, their tactics and status). The agent carries the tactic ids and names
+and the technique ids, and writes the ids in its detection records.
+
+- Source: https://github.com/mitre-attack/attack-stix-data, file
+  `enterprise-attack/enterprise-attack-20.0.json`
+- Pin: 20.0 (commit 20664a889568dce884a1dac0ec7b12ae3a199f51, sha256
+  `81113ba98afa2928f3dcff62022539f7ce30c315c32e14422f11ff95ce534352`)
+- License: MITRE ATT&CK Terms of Use, from the same commit, verbatim —
+  `LICENSES/MITRE_ATTACK_ToU-20.0.md`
+- Designation (verbatim, as the Terms of Use require in every copy): "© 2026 The MITRE Corporation. This work is reproduced and distributed with the permission of The MITRE Corporation."
 
 ## Rust crates (crates.io)
 
