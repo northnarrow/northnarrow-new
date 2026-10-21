@@ -1331,7 +1331,8 @@ pub struct FimEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<FileCapability>,
     /// Wave 2 (TST-004): the mode, owner and group before and after, for
-    /// [`FimOp::AttrChanged`].
+    /// [`FimOp::AttrChanged`], and (lab PR 229) for a [`FimOp::Modified`]
+    /// whose mode or owner changed with its content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attrs: Option<FileAttrChange>,
     /// External audit NN-AUD-285 (FIMR-011): the file the event is about,

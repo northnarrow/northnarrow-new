@@ -199,16 +199,15 @@ pub async fn run_recompute_task<F>(
                     }
                     let mut db = baseline_db.lock();
                     for draft in drafts {
-                        match db.append(draft) {
-                            Ok(entry) => {
+                        // Tappa 9 polish #2: keep the cache synced with the
+                        // chain tail so the drain compares the next kernel
+                        // event for this path with the freshly computed
+                        // baseline. Lab PR 229: the cache takes the entry
+                        // before its row is written — whoever sees the row
+                        // can rely on the drain having it.
+                        match db.append_cached(draft, &baseline_cache) {
+                            Ok(_) => {
                                 entries_written += 1;
-                                // Tappa 9 polish #2: keep the cache
-                                // synced with the chain tail so the
-                                // drain loop's no-op-event
-                                // suppression uses the freshly-
-                                // computed SHA on the next kernel
-                                // event for this path.
-                                baseline_cache.upsert(entry);
                             }
                             Err(e) => {
                                 errors += 1;

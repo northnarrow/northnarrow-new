@@ -710,8 +710,10 @@ pub struct FimDriftPayload {
     pub skip_reason: String,
     pub agent_id: String,
     /// Wave 2 (TST-004): mode, owner and group before and after, on an
-    /// [`FimOp::AttrChanged`] row. Absent on every other row, so a line
-    /// written before it existed serialises (and verifies) as it did.
+    /// [`FimOp::AttrChanged`] row, and (lab PR 229) on a
+    /// [`FimOp::Modified`] row whose mode or owner changed with its
+    /// content. Absent on every other row, so a line written before it
+    /// existed serialises (and verifies) as it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attrs: Option<FileAttrChange>,
 }
@@ -1003,6 +1005,10 @@ struct DrainQueues {
     /// unlinked, renamed or replaced — waiting for the change to land, with
     /// the event (its writer is the change's).
     chain: RetryQueue<String, (Instant, FimDriftRaw)>,
+    /// Lab PR 229: watched files whose setattr (chmod, chown, truncate)
+    /// the drain read before it landed, waiting for it. See
+    /// [`await_setattr`].
+    setattr: RetryQueue<InodeKey, PendingSetattr>,
     /// See [`queue_replacement`].
     replacements: Vec<(String, FimDriftRaw)>,
     /// See [`settle_rename`] and [`returned_paths`].
@@ -1017,6 +1023,7 @@ impl DrainQueues {
             enroll: RetryQueue::new("child enrollment", PENDING_MAX),
             rename: RetryQueue::new("rename", PENDING_MAX),
             chain: RetryQueue::new("symlink chain", PENDING_MAX),
+            setattr: RetryQueue::new("setattr", PENDING_MAX),
             replacements: Vec::new(),
             awaiting_return: Vec::new(),
             chain_awaiting: Vec::new(),
@@ -1069,6 +1076,78 @@ struct PendingRename {
     class: WatchClass,
     since: Instant,
     replaced: Option<FimDriftRaw>,
+}
+
+/// Lab PR 229: a setattr event whose re-read found the file as baselined —
+/// its path, the event (its writer is the change's), what a `stat` showed
+/// before that re-read, and when to look again.
+#[derive(Debug, Clone)]
+struct PendingSetattr {
+    path: String,
+    raw: FimDriftRaw,
+    seen: ChangeMark,
+    since: Instant,
+    next: Instant,
+    gap: Duration,
+}
+
+/// Lab PR 229: the longest wait between two looks at a pending setattr.
+/// The looks start [`RETRY_EVERY`] apart and double: a change that lands
+/// at once (all of them, short of a preempted writer) is caught on the
+/// first, and a file waited on for [`ENROLL_RETRY_FOR`] costs about ten
+/// `stat`s.
+const SETATTR_GAP_MAX: Duration = Duration::from_millis(250);
+
+/// Lab PR 229: the `inode_setattr` hook fires before the change it reports
+/// (`notify_change` runs the LSM hooks, then the filesystem's `setattr`),
+/// and a drain that re-reads the file first finds it as it was: a `chmod
+/// u+s` of a watched binary was dropped as a no-op touch, and nothing else
+/// would report it. The event waits, as a rename or an enrollment does,
+/// until a `stat` shows the file changed since that re-read — then it is
+/// checked again as a modification by its writer ([`queue_replacement`])
+/// — or for [`ENROLL_RETRY_FOR`]: a setattr that changed nothing (a touch,
+/// a chmod to the same mode) or was refused. An entry already waiting for
+/// the inode keeps its event and its `stat`: a change since either is seen.
+fn await_setattr(key: InodeKey, path: &str, raw: &FimDriftRaw, seen: ChangeMark) {
+    let now = Instant::now();
+    let pending = PendingSetattr {
+        path: path.to_string(),
+        raw: *raw,
+        seen,
+        since: now,
+        next: now + RETRY_EVERY,
+        gap: RETRY_EVERY,
+    };
+    queues(|q| q.setattr.push(key, pending));
+}
+
+/// Lab PR 229: the waiting setattrs; `true` while some still wait.
+fn retry_setattrs(examined: &mut usize) -> bool {
+    let todo = queues(|q| q.setattr.take());
+    let now = Instant::now();
+    let mut left = Vec::new();
+    for (key, mut p) in todo {
+        if now < p.next {
+            left.push((key, p));
+            continue;
+        }
+        *examined += 1;
+        match change_mark(&p.path) {
+            // Gone: its unlink or rename reports it.
+            None => {}
+            Some(mark) if mark != p.seen => queue_replacement(&p.path, &p.raw),
+            Some(_) if p.since.elapsed() >= ENROLL_RETRY_FOR => {}
+            Some(_) => {
+                p.gap = (p.gap * 2).min(SETATTR_GAP_MAX);
+                p.next = now + p.gap;
+                left.push((key, p));
+            }
+        }
+    }
+    queues(|q| {
+        q.setattr.put_back(left);
+        !q.setattr.is_empty()
+    })
 }
 
 /// External audit NN-AUD-119 (FIMP-007): a retry queue keyed by what it
@@ -1240,7 +1319,8 @@ struct RetryPass {
     examined: usize,
 }
 
-/// Retry the pending renames, enrollments and symlink-chain checks.
+/// Retry the pending renames, enrollments, symlink-chain checks and
+/// setattrs (lab PR 229).
 /// External audit NN-AUD-119 (FIMP-007): each queue is taken out under its
 /// lock and worked on without it — the `stat`s ran under the lock, entry
 /// by entry — and what is still pending is put back.
@@ -1267,8 +1347,9 @@ fn retry_pending_enrollments(
     });
     let enrolls_waiting = retry_enrollments(path_map, watched_paths, &mut examined);
     let chains_waiting = retry_chain_checks(path_map, watched_paths, &mut examined);
+    let setattrs_waiting = retry_setattrs(&mut examined);
     RetryPass {
-        waiting: renames_waiting || enrolls_waiting || chains_waiting,
+        waiting: renames_waiting || enrolls_waiting || chains_waiting || setattrs_waiting,
         examined,
     }
 }
@@ -1323,7 +1404,9 @@ fn retry_chain_checks(
 
 /// `true` while a retry queue holds entries.
 fn retries_waiting() -> bool {
-    queues(|q| !q.rename.is_empty() || !q.enroll.is_empty() || !q.chain.is_empty())
+    queues(|q| {
+        !q.rename.is_empty() || !q.enroll.is_empty() || !q.chain.is_empty() || !q.setattr.is_empty()
+    })
 }
 
 /// External audit FIMP-005: a watched file renamed away keeps its inode,
@@ -2042,14 +2125,19 @@ pub fn process_drift(
     // and an unchanged hash used to drop it as a no-op below — `chmod u+s`
     // on a watched binary, `chmod o+r /etc/shadow`, left no trace. The
     // baseline holds the mode and ownership too: a change there is drift
-    // of its own.
+    // of its own. Lab PR 229: with the content changed as well (a write
+    // and a chmod read together, or a file replaced by one with the
+    // set-uid bit) the row stays `Modified` and names the attribute change
+    // too: it was dropped, and the set-uid bit left no trace on the row.
     let attrs = match (op, last_baseline, &content) {
-        (FimOp::Modified, Some(base), Some(now)) if base.sha256 == now.sha256 => {
-            attr_change(base, now)
-        }
+        (FimOp::Modified, Some(base), Some(now)) => attr_change(base, now),
         _ => None,
     };
-    let op = if attrs.is_some() {
+    let content_same = matches!(
+        (last_baseline, &content),
+        (Some(base), Some(now)) if base.sha256 == now.sha256
+    );
+    let op = if attrs.is_some() && content_same {
         FimOp::AttrChanged
     } else {
         op
@@ -2073,6 +2161,13 @@ pub fn process_drift(
     // entry in this set.
     let suppress_on_match = matches!(op, FimOp::Modified | FimOp::Created | FimOp::Linked);
     if !real_drift && suppress_on_match {
+        // Lab PR 229: the setattr hook fires before the change lands; the
+        // read above may have come first. The event waits for it.
+        if op == FimOp::Modified {
+            if let Some(seen) = content.as_ref().and_then(|c| c.mark) {
+                await_setattr(key, &path, raw, seen);
+            }
+        }
         // External audit NN-AUD-121 (FIMP-009): the kernel saw a write, and
         // the re-hash — which runs after it — found the baseline content: a
         // touch, or a write undone before the drain looked (write, use,
@@ -2407,9 +2502,10 @@ fn resolve_pid_exe(pid: u32) -> Option<String> {
 /// compare the kernel-observed event against the previously-
 /// baselined SHA, suppressing no-op events (`touch -t`,
 /// permission-set-to-same-value) before they hit the drift log.
-/// The recompute task updates the cache after each successful
-/// `BaselineDb::append` so on-disk and in-memory views stay
-/// consistent.
+/// The recompute task puts each new entry in the cache before its row
+/// is written (`BaselineDb::append_cached`, lab PR 229), so on-disk and
+/// in-memory views stay consistent: no event meets a baseline row that
+/// the cache does not hold yet.
 ///
 /// The `event_tx` is the same channel
 /// [`crate::sensors::SensorMultiplexer`] funnels its events into;
@@ -2623,6 +2719,37 @@ struct Content {
     mode: u32,
     uid: u32,
     gid: u32,
+    /// Lab PR 229: what a `stat` showed just before the read.
+    mark: Option<ChangeMark>,
+}
+
+/// Lab PR 229: what a `stat` of a watched file (its final target) shows of
+/// its last change. The inode change time moves with every chmod, chown,
+/// truncate and write; the mode, owner and size are compared too, for a
+/// change within the clock tick of the one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChangeMark {
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+}
+
+fn change_mark(path: &str) -> Option<ChangeMark> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(fs_path(path)).ok()?;
+    Some(ChangeMark {
+        ino: m.ino(),
+        ctime: m.ctime(),
+        ctime_nsec: m.ctime_nsec(),
+        mode: m.mode(),
+        uid: m.uid(),
+        gid: m.gid(),
+        size: m.size(),
+    })
 }
 
 /// The content of `path` as of an event at `event_ns`: the last hash when
@@ -2636,6 +2763,9 @@ fn content_after(path: &str, event_ns: u64) -> Option<Content> {
         }
     }
     let began_ns = monotonic_ns();
+    // Lab PR 229: taken before the read, so a change landing during it is
+    // a change since.
+    let mark = change_mark(path);
     let content = match compute_baseline(&fs_path(path)) {
         Ok(drafts) => drafts.into_iter().find(|d| !d.is_symlink).map(|d| Content {
             mode: parse_mode(&d.mode).unwrap_or(0),
@@ -2643,6 +2773,7 @@ fn content_after(path: &str, event_ns: u64) -> Option<Content> {
             size: d.size_bytes,
             uid: d.uid,
             gid: d.gid,
+            mark,
         }),
         Err(e) => {
             debug!(
@@ -3178,6 +3309,179 @@ mod tests {
         let row: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
         assert_eq!(row["op"], FimOp::AttrChanged as u8);
         assert_eq!(row["attrs"]["mode_after"], 0o4755);
+    }
+
+    /// A watched `sshd` (0755) with its baseline, a drift log and the
+    /// inode map naming it, for the lab PR 229 tests.
+    struct SetattrFixture {
+        dir: TempDir,
+        file: std::path::PathBuf,
+        path: String,
+        key: InodeKey,
+        baseline: BaselineEntry,
+        path_map: InodePathMap,
+        drift_db: FimDriftDb,
+    }
+
+    impl SetattrFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let dir = TempDir::new().unwrap();
+            let signing = fresh_signing_key(&dir);
+            let drift_db = FimDriftDb::open(
+                &dir.path().join("drift.jsonl"),
+                signing,
+                [0u8; 16],
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+                crate::chainlog::RotationConfig::default(),
+            )
+            .unwrap();
+            let file = dir.path().join("sshd");
+            std::fs::write(&file, b"ELF binary").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = file.to_string_lossy().into_owned();
+            let drafts = compute_baseline(&file).unwrap();
+            let meta = std::fs::metadata(&file).unwrap();
+            let mut baseline = dummy_baseline(&path, &drafts[0].sha256);
+            baseline.mode = "0o755".to_string();
+            baseline.uid = meta.uid();
+            baseline.gid = meta.gid();
+            // the real inode: a re-check names the file by its path
+            let key = key_for_path(&file).unwrap();
+            let path_map = InodePathMap::new();
+            path_map.insert(key, path.clone());
+            Self {
+                dir,
+                file,
+                path,
+                key,
+                baseline,
+                path_map,
+                drift_db,
+            }
+        }
+
+        fn check(&mut self, raw: &FimDriftRaw) -> (bool, Vec<Event>) {
+            let mut out: Vec<Event> = Vec::new();
+            let emitted = process_drift(
+                raw,
+                &self.path_map,
+                Some(&self.baseline),
+                &mut self.drift_db,
+                &DriftClassifier::new(),
+                &DriftRateLimiter::new(),
+                None,
+                None,
+                Some(&mut out),
+            )
+            .unwrap();
+            (emitted, out)
+        }
+
+        fn rows(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(self.dir.path().join("drift.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        }
+    }
+
+    /// Lab PR 229: the `inode_setattr` hook fires before the change lands.
+    /// A drain that re-read the file first found it as baselined and
+    /// dropped the event as a no-op touch: a `chmod u+s` left no trace.
+    /// The event now waits for the change, and is checked as its writer's
+    /// modification once a `stat` shows it: the set-uid bit is recorded.
+    #[test]
+    fn a_setattr_read_before_it_lands_is_recorded_once_it_lands() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fx = SetattrFixture::new();
+        let raw = fake_raw(fx.key.dev, fx.key.ino, FimOp::Modified as u8);
+        // the re-read comes first: nothing to see yet
+        let (emitted, out) = fx.check(&raw);
+        assert!(!emitted && out.is_empty() && fx.rows().is_empty());
+        assert_eq!(queues(|q| q.setattr.len()), 1, "the event waits");
+        // a look before anything landed keeps it waiting
+        std::thread::sleep(RETRY_EVERY + Duration::from_millis(1));
+        assert!(retry_pending_enrollments(&fx.path_map, None).waiting);
+        assert!(replacement_raws().is_empty());
+        // the chmod lands
+        std::fs::set_permissions(&fx.file, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        std::thread::sleep(2 * RETRY_EVERY + Duration::from_millis(1));
+        let pass = retry_pending_enrollments(&fx.path_map, None);
+        assert!(!pass.waiting && pass.examined == 1, "{pass:?}");
+        let raws = replacement_raws();
+        assert_eq!(raws.len(), 1);
+        let (emitted, mut out) = fx.check(&raws[0]);
+        assert!(emitted);
+        let Event::Fim(ev) = out.remove(0) else {
+            panic!("expected Event::Fim")
+        };
+        assert_eq!(ev.op, FimOp::AttrChanged);
+        assert_eq!(ev.path, fx.path);
+        assert_eq!(ev.modifier_pid, raw.modifier_pid, "the writer of the event");
+        let attrs = ev.attrs.expect("what changed");
+        assert_eq!((attrs.mode_before, attrs.mode_after), (0o755, 0o4755));
+        let rows = fx.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["op"], FimOp::AttrChanged as u8);
+        assert_eq!(rows[0]["attrs"]["mode_after"], 0o4755);
+        assert_eq!(queues(|q| q.setattr.len()), 0);
+    }
+
+    /// Lab PR 229: a setattr that changes nothing (a touch, a chmod to the
+    /// same mode, one refused) waits out [`ENROLL_RETRY_FOR`] and goes,
+    /// recorded nowhere, as before; and one wait per inode.
+    #[test]
+    fn a_setattr_that_changes_nothing_is_let_go() {
+        let mut fx = SetattrFixture::new();
+        let raw = fake_raw(fx.key.dev, fx.key.ino, FimOp::Modified as u8);
+        for _ in 0..3 {
+            let (emitted, _) = fx.check(&raw);
+            assert!(!emitted);
+        }
+        assert_eq!(queues(|q| q.setattr.len()), 1, "one wait per inode");
+        queues(|q| {
+            for p in q.setattr.entries.values_mut() {
+                p.since -= ENROLL_RETRY_FOR;
+                p.next = Instant::now();
+            }
+        });
+        assert!(!retry_pending_enrollments(&fx.path_map, None).waiting);
+        assert!(replacement_raws().is_empty());
+        assert!(fx.rows().is_empty());
+        assert_eq!(queues(|q| q.setattr.len()), 0);
+    }
+
+    /// Lab PR 229: a content change read together with a mode change (a
+    /// write and a `chmod u+s`, or a file replaced by a set-uid one) is a
+    /// `Modified` row that names the mode change too; it used to drop it.
+    #[test]
+    fn a_content_change_names_the_mode_change_with_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fx = SetattrFixture::new();
+        std::fs::write(&fx.file, b"ELF backdoor").unwrap();
+        std::fs::set_permissions(&fx.file, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let raw = fake_raw(fx.key.dev, fx.key.ino, FimOp::Modified as u8);
+        let (emitted, mut out) = fx.check(&raw);
+        assert!(emitted);
+        let Event::Fim(ev) = out.remove(0) else {
+            panic!("expected Event::Fim")
+        };
+        assert_eq!(ev.op, FimOp::Modified);
+        assert_ne!(ev.new_sha256, ev.baseline_sha256);
+        let attrs = ev.attrs.expect("the mode change rides on the row");
+        assert_eq!((attrs.mode_before, attrs.mode_after), (0o755, 0o4755));
+        let rows = fx.rows();
+        assert_eq!(rows[0]["op"], FimOp::Modified as u8);
+        assert_eq!(rows[0]["attrs"]["mode_after"], 0o4755);
+        // the content alone: no attributes on the row
+        std::fs::set_permissions(&fx.file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (emitted, _) = fx.check(&raw);
+        assert!(emitted);
+        let rows = fx.rows();
+        assert_eq!(rows[1]["op"], FimOp::Modified as u8);
+        assert!(rows[1].get("attrs").is_none(), "{}", rows[1]);
     }
 
     fn dummy_baseline(path: &str, sha256: &str) -> BaselineEntry {
