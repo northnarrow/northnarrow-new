@@ -1,0 +1,13 @@
+{
+  "about": "NN-L-EVA-002..004 (lab PR 225): `auditctl -e 0` by a root shell (High; its repeat by the same parent within 10 s is coalesced: nothing); auditd started (registered as a defender, nothing) then sent SIGTERM by that shell (NN-L-EVA-003); its configuration modified by the shell (NN-L-EVA-004).",
+  "fires": ["NN-L-EVA-002_SecurityToolSwitchedOff", "NN-L-EVA-003_SecurityToolKilled", "NN-L-EVA-004_SecurityToolConfigChanged"],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 5450001, "ppid": 1, "uid": 0, "gid": 0, "comm": "sshd", "filename": "/usr/sbin/sshd", "timestamp_ns": 2000000000000, "argv": ["sshd: root [priv]"], "parent_comm": "", "start_ns": 1999999000000, "exe": {"path": "/usr/sbin/sshd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5450002, "ppid": 5450001, "uid": 0, "gid": 0, "comm": "bash", "filename": "/usr/bin/bash", "timestamp_ns": 2001000000000, "argv": ["-bash"], "parent_comm": "sshd", "start_ns": 2000999000000, "exe": {"path": "/usr/bin/bash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5450003, "ppid": 5450002, "uid": 0, "gid": 0, "comm": "auditctl", "filename": "/usr/sbin/auditctl", "timestamp_ns": 2002000000000, "argv": ["auditctl", "-e", "0"], "parent_comm": "bash", "start_ns": 2001999000000, "exe": {"path": "/usr/sbin/auditctl"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5450004, "ppid": 5450002, "uid": 0, "gid": 0, "comm": "auditctl", "filename": "/usr/sbin/auditctl", "timestamp_ns": 2004000000000, "argv": ["auditctl", "-e", "0"], "parent_comm": "bash", "start_ns": 2003999000000, "exe": {"path": "/usr/sbin/auditctl"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5450011, "ppid": 1, "uid": 0, "gid": 0, "comm": "auditd", "filename": "/usr/sbin/auditd", "timestamp_ns": 2010000000000, "argv": ["/sbin/auditd"], "parent_comm": "", "start_ns": 2009999000000, "exe": {"path": "/usr/sbin/auditd"}}}},
+    {"event": {"DefenderSignal": {"pid": 5450002, "uid": 0, "comm": "bash", "target_pid": 5450011, "signal": 15, "timestamp_ns": 2020000000000}}},
+    {"event": {"Fim": {"timestamp_ns": 2030000000000, "path": "/etc/audit/auditd.conf", "op": 1, "new_sha256": null, "baseline_sha256": null, "modifier_exe": "/usr/bin/bash", "modifier_pid": 5450002, "modifier_uid": 0, "modifier_comm": "bash"}}}
+  ]
+}

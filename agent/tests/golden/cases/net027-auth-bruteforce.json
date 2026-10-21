@@ -1,0 +1,11 @@
+{
+  "about": "NN-L-NET-027 (lab PR 224): an unpackaged program connects 105 times to one host's SSH port within 11 s (an outbound brute force): a High record at the 20th connect, and past the kill threshold (100) the kill is held — High, action Log.",
+  "fires": ["NN-L-NET-027_OutboundAuthBruteforce"],
+  "held": ["NN-L-NET-027_OutboundAuthBruteforce"],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 5200001, "ppid": 1, "uid": 0, "gid": 0, "comm": "sshd", "filename": "/usr/sbin/sshd", "timestamp_ns": 100000000000, "argv": ["sshd: u [priv]"], "parent_comm": "", "start_ns": 99999000000, "exe": {"path": "/usr/sbin/sshd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5200002, "ppid": 5200001, "uid": 1000, "gid": 1000, "comm": "bash", "filename": "/usr/bin/bash", "timestamp_ns": 101000000000, "argv": ["-bash"], "parent_comm": "sshd", "start_ns": 100999000000, "exe": {"path": "/usr/bin/bash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5600002, "ppid": 5200002, "uid": 1000, "gid": 1000, "comm": "nn-ms-brute", "filename": "/home/u/bin/nn-ms-brute", "timestamp_ns": 3600000000000, "argv": ["nn-ms-brute", "10.30.0.5"], "parent_comm": "bash", "start_ns": 3599999000000, "exe": {"path": "/home/u/bin/nn-ms-brute"}}}},
+    {"tcp_sweep": {"pid": 5600002, "uid": 1000, "comm": "nn-ms-brute", "first": "10.30.0.5", "hosts": 1, "ports": [22], "count": 105, "start_ns": 3601000000000, "step_ns": 100000000}}
+  ]
+}

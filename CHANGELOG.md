@@ -6,6 +6,83 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Performance baseline, regression gate and golden replay (lab PR 228,
+  Wave 4 phase 2). **Baseline.** `nn-lab.sh perf [--fresh] [--quick]` runs
+  `deploy/lab/perf/perf-run.sh` on a lab guest, as root: the hooked
+  operations (`getppid`, a `read` of `/dev/zero`, open + read + close in a
+  watched and in an unwatched directory, open for write + write + close,
+  fork + exec of `/bin/true`, TCP connect + close, a UDP send, a DNS query
+  sent, a DNS query to the guest's resolver) with the agent stopped (the
+  trusted-installer window with the lab key, the pin root purged: the
+  operator path, nothing bypassed) and running, 10 measured passes after a
+  warm-up, pinned to one vCPU; the latency from a probe read of a
+  `.aws/credentials` fixture to its signed NN-L-FIM-011 record; the ring
+  drops and the network trackers' losses under the soak generator at a
+  high rate for 60 s, read signed, and the process-creation rate the host
+  kept up with (`burst_forks_per_s`, events per second); the agent's CPU
+  and RSS idle and under that load; the cold start to READY. One JSON keeps
+  every raw sample with the kernel, CPU, vCPUs, memory, clocksource, the
+  tree commit, its branch point on `origin/main` and which build inputs
+  differ from it, the binaries' hashes and the agent's configuration, with
+  a Markdown summary. The first baseline is committed:
+  `docs/validation/results/perf-2026-10-21-ubuntu2404-40fd666.{json,md}`
+  (Ubuntu 24.04, 6.8.0-147, 4 vCPU, 7.8 GiB, QEMU for Windows with WHPX;
+  the agent of `main` 8180540, no build input changed): overhead of the
+  agent exec +10.5 %, open +38.9 % (unwatched) / +50.7 % (watched), write
+  open +44.4 %, TCP connect +40.5 %, UDP send +27.4 %, DNS query sent
+  +22.1 %, to the resolver +6.1 %; a detection signed 0.23 ms after the
+  read (on disk 2.5 ms); the agent at 0.2 % of one CPU idle and 7.4 % under
+  the burst (455 processes/s), RSS 34 MiB idle and 43 MiB under load; no
+  ring drop, rejection or tracker loss; READY 4.5 s after the start.
+  **Gate.** `cargo xtask perf-compare BASE.json NEW.json` compares the
+  medians: a gated metric regresses when it is worse by more than its
+  threshold, by more than the noise of the repetitions ((p95 − p5) / 2
+  over the median, at least 1 %) and by more than its absolute floor (the
+  measurement's resolution); exit 1 on a regression or a missing metric,
+  2 on unreadable input or runs from different hosts. The thresholds are
+  committed, one reasoned line per gated metric
+  (`deploy/lab/perf/thresholds.tsv`), from an A/A check of three full runs
+  of the same tree (the baseline and two partners, `-aa.json`, `-aa2.json`,
+  committed): each at least 10 %, twice the largest move of its median
+  between two runs (with the agent on, and off for a workload: what the
+  host alone moved) and five points above it, over the measurement's floor.
+  The moves: the workloads 0.1–2.9 % agent on except TCP connect 15.3 %,
+  agent off up to 8.6 % (exec; the host was shared with another job's test
+  suite during two of the agent-off phases); the signed-record latency
+  7.5 % (0.017 ms); CPU 25 % idle and 19.6 % under load (0.05 and 1.45
+  points, inside the floors); RSS 2.5 % idle, 10.6 % under load; the boot
+  0.1 %; no loss in any run. The thresholds: 10 % for every workload but
+  exec and the resolver query (20 %) and TCP connect (35 %), the latency
+  20 %, CPU 50 / 40 %, RSS 10 / 25 %, the boot 10 %, the loss counters
+  floor 0. `xtask/tests/perf_baseline.rs` holds the committed runs to
+  them: the baseline passes against both partners, every gated metric has
+  a line, each threshold is twice that pair's move and five points above
+  it. **Golden replay.** `agent/src/decision/golden.rs`
+  replays recorded event streams (`agent/tests/golden/cases`, twelve cases)
+  through the decision path of `process_event` on an engine built as
+  `main.rs` builds it, over host state of the case's own (an empty `/proc`,
+  a fixture package database, scripted entropy, the case's resolvers), and
+  compares every decision byte for byte with `agent/tests/golden/expected`;
+  each case is replayed three times and on four threads at once, the same
+  bytes each time. It covers the rules of lots 219–226 — NN-L-EPG-001/002,
+  NN-L-FIM-010 (the watched file's own rename kills, the moved-in match is
+  held), NN-L-IMP-001 in place and by copy-delete, NN-L-IMP-002,
+  NN-L-EVA-001 sanctioned, unsanctioned and from a staged program,
+  NN-L-EVA-002..004, NN-L-NET-026/027, R020, the port-53 hold (here
+  NN-L-CHAIN-002's, and NN-L-NET-001's older kill winning over it),
+  NN-L-EXECPOL-001 and NN-L-EXECENV-001..003 — and every kill
+  `response_policy` holds shows as action `Log`; each case names the rules
+  it must fire and show held, so an update that loses one fails. It runs in `cargo test`
+  (no root, no network); `cargo xtask golden --update` rewrites the golden
+  files for review and is refused under CI, where a stale file fails
+  (`docs/validation/GOLDEN_REPLAY.md`). **Documents.**
+  `docs/PERFORMANCE.md` loses the on-host advisor's tuning (removed in lab
+  PR 214) and says that a performance figure comes only from a committed
+  result file; the figures without raw data — the advisor's expected
+  speed-ups and the May 2026 table there, the agent overhead of 2026-10-12
+  in the runbook and the roadmap — are withdrawn, with a one-line history.
+  `docs/validation/PERF_BASELINE.md` says how to read the baseline, the A/A
+  check and the thresholds.
 - Synchronous exec policies, EXPERIMENTAL and off by default (capabilities
   C12, C13; countermeasure CM-01; lab PR 226; `docs/design/EXEC_POLICY.md`).
   `bprm_check_security` no longer returns 0 for every exec: with

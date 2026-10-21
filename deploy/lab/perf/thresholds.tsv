@@ -1,0 +1,36 @@
+# Lab PR 228: the regression thresholds of `cargo xtask perf-compare`
+# (docs/validation/PERF_BASELINE.md §5), one line per gated metric of the
+# committed baseline docs/validation/results/perf-2026-10-21-ubuntu2404-40fd666.json:
+#
+#   metric <TAB> threshold, % worse <TAB> floor, in the metric's unit <TAB> why
+#
+# Set from its A/A check (three full runs of the same tree on the same guest,
+# the baseline and its partners -aa.json and -aa2.json): each threshold is at
+# least 10 %, twice the largest move of the metric's median between two of
+# the runs and five points above it — for a workload, the move of its
+# agent-off reference too, what the host alone moved — rounded up to a
+# multiple of 5. The floor is the measurement's resolution (0 for the loss
+# counters: from 0 any loss fails). xtask/tests/perf_baseline.rs holds the
+# committed runs to these lines. A new baseline (another guest, another
+# kernel) comes with its own A/A check and new lines by the same rule.
+syscall_getppid_ns	10	0	A/A move on 1.7 %, agent off 3.3 % (3 runs, 2026-10-21); the default 10 % is more than twice that (the larger) and five points above it
+syscall_read_devzero_ns	10	0	A/A move on 1.6 %, agent off 2.1 % (3 runs, 2026-10-21); the default 10 % is more than twice that (the larger) and five points above it
+open_unwatched_ns	10	0	A/A move on 0.1 %, agent off 0.3 % (3 runs, 2026-10-21); the default 10 % is more than twice that (the larger) and five points above it
+open_watched_ns	10	0	A/A move on 0.4 %, agent off 3.8 % (3 runs, 2026-10-21); the default 10 % is more than twice that (the larger) and five points above it
+write_open_ns	10	0	A/A move on 1.2 %, agent off 2.8 % (3 runs, 2026-10-21); the default 10 % is more than twice that (the larger) and five points above it
+exec_true_ns	20	0	A/A move on 2.8 %, agent off 8.6 % (3 runs, 2026-10-21); twice the larger, five points above it, at least 10 %, to a multiple of 5
+tcp_connect_close_ns	35	0	A/A move on 15.3 %, agent off 4.0 % (3 runs, 2026-10-21); twice the larger, five points above it, at least 10 %, to a multiple of 5
+udp_send_ns	10	0	A/A move on 0.9 %, agent off 4.7 % (3 runs, 2026-10-21); the default 10 % is more than twice that (the larger) and five points above it
+dns_send_ns	10	0	A/A move on 1.6 %, agent off 3.6 % (3 runs, 2026-10-21); the default 10 % is more than twice that (the larger) and five points above it
+dns_resolver_query_ns	20	0	A/A move on 2.9 %, agent off 7.5 % (3 runs, 2026-10-21); twice the larger, five points above it, at least 10 %, to a multiple of 5
+event_to_record_ms	20	1	A/A move on 7.5 % (3 runs, 2026-10-21); twice that, five points above it, at least 10 %, to a multiple of 5; the largest move (0.017 ms) is within the floor 1
+event_to_disk_ms	10	2	A/A move on 2.7 % (3 runs, 2026-10-21); the default 10 % is more than twice that and five points above it; the largest move (0.067 ms) is within the floor 2
+agent_cpu_idle_pct	50	0.5	A/A move on 25.0 % (3 runs, 2026-10-21); twice that, five points above it, at least 10 %, to a multiple of 5; the largest move (0.05 % of one CPU) is within the floor 0.5
+agent_cpu_load_pct	40	2	A/A move on 19.6 % (3 runs, 2026-10-21); twice that, five points above it, at least 10 %, to a multiple of 5; the largest move (1.45 % of one CPU) is within the floor 2
+agent_rss_idle_kib	10	2048	A/A move on 2.5 % (3 runs, 2026-10-21); the default 10 % is more than twice that and five points above it; the largest move (844 KiB) is within the floor 2048
+agent_rss_load_kib	25	4096	A/A move on 10.6 % (3 runs, 2026-10-21); twice that, five points above it, at least 10 %, to a multiple of 5
+burst_ring_drops	10	0	a loss counter: one total per run, 0 in every A/A run (3 runs, 2026-10-21); from 0 any loss fails (floor 0)
+burst_ring_rejected	10	0	a loss counter: one total per run, 0 in every A/A run (3 runs, 2026-10-21); from 0 any loss fails (floor 0)
+burst_netflow_pending_evicted	10	0	a loss counter: one total per run, 0 in every A/A run (3 runs, 2026-10-21); from 0 any loss fails (floor 0)
+burst_flow_sock_forgotten	10	0	a loss counter: one total per run, 0 in every A/A run (3 runs, 2026-10-21); from 0 any loss fails (floor 0)
+boot_to_ready_ms	10	100	A/A move on 0.1 % (3 runs, 2026-10-21); the default 10 % is more than twice that and five points above it; the largest move (5.18 ms) is within the floor 100

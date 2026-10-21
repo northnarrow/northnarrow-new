@@ -38,6 +38,9 @@
 #   deploy/lab/nn-lab.sh uninstall-check  # uninstall.sh --purge leaves nothing, then reinstall
 #   deploy/lab/nn-lab.sh tamper-check     # adversarial anti-tamper cases: outcome + chain-log evidence per case
 #   deploy/lab/nn-lab.sh overhead [ROUNDS] # agent off/on throughput of the hooked operations (idle host!)
+#   deploy/lab/nn-lab.sh perf [--fresh] [ARGS…] # the performance baseline (docs/PERFORMANCE.md §2; idle host!):
+#                                      # → $LAB_DIR/reports/perf-<stamp>.{json,md}; --fresh: sync + install first;
+#                                      # ARGS go to deploy/lab/perf/perf-run.sh (--quick, --reps N, …)
 #   deploy/lab/nn-lab.sh pkgmgr-check     # dpkg/rpm survive the agent: probe package install/remove + real reinstall
 #   deploy/lab/nn-lab.sh pkg-check        # our .deb/.rpm: migrate, upgrade, refused upgrade, remove, purge, fresh install
 #   deploy/lab/nn-lab.sh release-check DIR # the CI release tarball (gh run download) installed and verified here
@@ -756,6 +759,9 @@ cmd_sync() {
         "$REPO/" "$GUEST:northnarrow/"
 }
 
+# The features of the lab's agent build (the e2e fixtures need both); the
+# perf baseline records them (lab PR 228).
+LAB_AGENT_FEATURES=test-privileged,debug-trigger
 cmd_build() {
     vm_running || die "guest is not running"
     # LTO "fat" (Cargo.toml release profile) can peak 6-8 GiB at link;
@@ -766,7 +772,7 @@ cmd_build() {
     # build with symbols ('CARGO_PROFILE_RELEASE_STRIP=none
     # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only'); perf can then name the
     # agent's functions (the release profile strips them).
-    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release $LAB_CARGO_LOCKED --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog -p northnarrow-scan 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
+    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release $LAB_CARGO_LOCKED --features $LAB_AGENT_FEATURES -p northnarrow-agent -p northnarrow-watchdog -p northnarrow-scan 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
 # Purge the pin root on the guest the way an operator must now do it (review
@@ -1116,6 +1122,72 @@ print(f"\nMedians of {n} round{'s' if n != 1 else ''}; overhead = throughput los
 PY
     cat "$out/overhead.md"
     log "overhead report: $out/overhead.md"
+}
+
+# The paths the agent, the watchdog and the scanner are built from, and the
+# configuration install.sh puts beside them (cmd_perf records which of them
+# differ from the branch point).
+PERF_BUILD_INPUTS="agent agent-ebpf antitamper-bpf common ebpf-guard scan watchdog Cargo.toml Cargo.lock rust-toolchain.toml .cargo configs deploy/install.sh deploy/systemd"
+cmd_perf() {
+    # Lab PR 228 — the performance baseline (deploy/lab/perf/perf-run.sh,
+    # docs/PERFORMANCE.md §2): the hooked operations with the agent off
+    # (stopped through the trusted-installer window, pin root purged) and
+    # on, the event → signed record latency, the loss counters under the
+    # soak generator at a high rate, the agent's CPU and RSS, the cold start
+    # to READY; raw samples and statistics in one JSON, compared with
+    # `cargo xtask perf-compare BASE.json NEW.json`. The tree is the host
+    # checkout's commit; with --fresh it is synced and installed first, so
+    # the installed agent is that commit (without it the run says so).
+    # Run it on an otherwise idle host: other guests' load is noise.
+    vm_running || die "guest is not running"
+    local fresh=0
+    if [[ ${1:-} == --fresh ]]; then fresh=1; shift; fi
+    if vssh 'test -f ~/soak/sample.pid && ! test -e ~/soak/stop' 2>/dev/null; then
+        die "a soak is running on the guest: its load would be measured too (nn-lab.sh soak stop)"
+    fi
+    local commit dirty tree_src features=unknown lto=unknown base changed
+    commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+    dirty=$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+    # What the measured binaries and their installed configuration are
+    # built from, against the branch point on origin/main: no path listed
+    # means the agent measured is that commit's, whatever else the tree
+    # changes (lab tooling, documents).
+    base=$(git -C "$REPO" merge-base HEAD origin/main 2>/dev/null || echo unknown)
+    changed=$(git -C "$REPO" diff --name-only "$base" -- $PERF_BUILD_INPUTS 2>/dev/null | paste -sd, -)
+    tree_src="host checkout, installed before this run (not checked)"
+    if ((fresh)); then
+        cmd_sync
+        cmd_install
+        tree_src="host checkout, synced and installed by this run"
+        features=$LAB_AGENT_FEATURES lto=${NN_LAB_LTO:-thin}
+    fi
+    # Root runs them: root-owned copies outside the lab user's home (R009
+    # kills a root exec from a user-writable path).
+    vssh 'rm -rf ~/nn-perf && mkdir -p ~/nn-perf'
+    vrsync -a "$REPO/deploy/lab/perf/perf-run.sh" "$REPO/deploy/lab/perf/perf_lib.py" \
+        "$REPO/deploy/lab/perf/nn-perf-probe.c" "$REPO/deploy/lab/overhead/nn-bench.c" \
+        "$REPO/deploy/lab/soak/generate.sh" "$REPO/deploy/lab/lib/lab-records.py" "$GUEST:nn-perf/"
+    vssh 'sudo rm -rf /usr/local/libexec/nn-lab/perf && sudo install -d -m 0755 /usr/local/libexec/nn-lab/perf && sudo install -m 0644 ~/nn-perf/* /usr/local/libexec/nn-lab/perf/ && sudo chmod 0755 /usr/local/libexec/nn-lab/perf/perf-run.sh && rm -rf ~/nn-perf'
+    local stamp gdir rc=0 args=""
+    stamp=$(date -u +%Y%m%d-%H%M%S)
+    gdir="/var/lib/nn-perf/$stamp"
+    if (($#)); then args=$(printf ' %q' "$@"); fi
+    mkdir -p "$LAB_DIR/reports"
+    vssh "sudo env NN_PERF_TREE_COMMIT=$(printf %q "$commit") NN_PERF_TREE_DIRTY=$(printf %q "$dirty") \
+NN_PERF_TREE_SOURCE=$(printf %q "$tree_src") NN_PERF_GUEST=$(printf %q "$GUEST_NAME") \
+NN_PERF_BUILD_FEATURES=$(printf %q "$features") NN_PERF_BUILD_LTO=$(printf %q "$lto") \
+NN_PERF_TREE_BASE=$(printf %q "$base") NN_PERF_TREE_BUILD_CHANGES=$(printf %q "${changed:-none}") \
+/usr/local/libexec/nn-lab/perf/perf-run.sh --out $gdir$args" || rc=$?
+    local json="$LAB_DIR/reports/perf-$stamp.json" md="$LAB_DIR/reports/perf-$stamp.md"
+    if ! vssh "sudo cat $gdir/perf.json" > "$json" 2>/dev/null || [[ ! -s $json ]]; then
+        rm -f "$json"
+        die "no perf.json on the guest ($gdir, perf-run.sh exit $rc)"
+    fi
+    vssh "sudo cat $gdir/perf.md" > "$md" 2>/dev/null || true
+    cat "$md"
+    log "perf report: $md; raw samples and statistics: $json (perf-run.sh exit $rc)"
+    log "gate: cargo xtask perf-compare BASE.json $json"
+    return "$rc"
 }
 
 cmd_pkgmgr_check() {
@@ -2020,6 +2092,7 @@ case "${1:-help}" in
     uninstall-check) cmd_uninstall_check ;;
     tamper-check)  cmd_tamper_check ;;
     overhead)      shift; cmd_overhead "$@" ;;
+    perf)          shift; cmd_perf "$@" ;;
     pkgmgr-check)  cmd_pkgmgr_check ;;
     pkg-check)     cmd_pkg_check ;;
     release-check) shift; cmd_release_check "$@" ;;

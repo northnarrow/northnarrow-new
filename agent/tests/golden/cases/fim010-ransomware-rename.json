@@ -1,0 +1,10 @@
+{
+  "about": "NN-L-FIM-010: a watched file renamed to a ransomware extension (the kill the rule had before lab PR 225, not held); the same rename's second record, the watched directory's moved-in entry (one verdict per rename); a rename seen only as the directory's new entry (lab PR 225's match: its kill is held, a Critical record with action Log).",
+  "fires": ["NN-L-FIM-010_RansomwareExtensionRename"],
+  "held": ["NN-L-FIM-010_RansomwareExtensionRename"],
+  "items": [
+    {"event": {"Fim": {"timestamp_ns": 3600000000000, "path": "/srv/data/report.docx", "op": 4, "new_sha256": null, "baseline_sha256": null, "modifier_exe": "/home/u/.local/bin/nn-ms-enc", "modifier_pid": 5100101, "modifier_uid": 1000, "modifier_comm": "nn-ms-enc", "dest_path": "/srv/data/report.docx.locked"}}},
+    {"event": {"Fim": {"timestamp_ns": 3600001000000, "path": "/srv/data/report.docx.locked", "op": 2, "new_sha256": null, "baseline_sha256": null, "modifier_exe": "/home/u/.local/bin/nn-ms-enc", "modifier_pid": 5100101, "modifier_uid": 1000, "modifier_comm": "nn-ms-enc", "moved_in": true}}},
+    {"event": {"Fim": {"timestamp_ns": 3605000000000, "path": "/srv/data/budget.xlsx.locked", "op": 2, "new_sha256": null, "baseline_sha256": null, "modifier_exe": "/home/u/.local/bin/nn-ms-enc", "modifier_pid": 5100101, "modifier_uid": 1000, "modifier_comm": "nn-ms-enc", "moved_in": true}}}
+  ]
+}

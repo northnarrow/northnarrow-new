@@ -1,0 +1,14 @@
+{
+  "about": "NN-L-IMP-001, encrypt into new files then delete the originals (lab MS-23): 20 new files written, then 20 originals of 4 KiB or more deleted while their encrypted copies (<name>.crypt) sit beside them — deletion of originals, renames by copy and ciphertext, decisive; the kill of the tree is held (Critical, action Log).",
+  "fires": ["NN-L-IMP-001_RansomwareEncryption"],
+  "held": ["NN-L-IMP-001_RansomwareEncryption"],
+  "files": ["@ROOT@/home/u/docs/f00.pdf.crypt", "@ROOT@/home/u/docs/f01.pdf.crypt", "@ROOT@/home/u/docs/f02.pdf.crypt", "@ROOT@/home/u/docs/f03.pdf.crypt"],
+  "entropy": [{"prefix": "@ROOT@/home/u/docs/", "examined": 4, "high": 4}],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 5200001, "ppid": 1, "uid": 0, "gid": 0, "comm": "sshd", "filename": "/usr/sbin/sshd", "timestamp_ns": 100000000000, "argv": ["sshd: u [priv]"], "parent_comm": "", "start_ns": 99999000000, "exe": {"path": "/usr/sbin/sshd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5200002, "ppid": 5200001, "uid": 1000, "gid": 1000, "comm": "bash", "filename": "/usr/bin/bash", "timestamp_ns": 101000000000, "argv": ["-bash"], "parent_comm": "sshd", "start_ns": 100999000000, "exe": {"path": "/usr/bin/bash"}}}},
+    {"event": {"ProcessSpawn": {"pid": 5300003, "ppid": 5200002, "uid": 1000, "gid": 1000, "comm": "nn-ms-cpdel", "filename": "/home/u/.local/bin/nn-ms-cpdel", "timestamp_ns": 3600000000000, "argv": ["nn-ms-cpdel", "/home/u/docs"], "parent_comm": "bash", "start_ns": 3599999000000, "exe": {"path": "/home/u/.local/bin/nn-ms-cpdel"}}}},
+    {"event": {"MassWrite": {"pid": 5300003, "uid": 1000, "comm": "nn-ms-cpdel", "count": 20, "filename": "@ROOT@/home/u/docs/f19.pdf.crypt", "timestamp_ns": 3602000000000, "overwrites": false, "cgroup_window": false}}},
+    {"event": {"FileBurst": {"pid": 5300003, "uid": 1000, "comm": "nn-ms-cpdel", "kind": "Unlink", "count": 20, "appended": 0, "sources": 0, "filename": "@ROOT@/home/u/docs/f00.pdf", "timestamp_ns": 3603000000000}}}
+  ]
+}

@@ -1,0 +1,5 @@
+Package: golden-fixture
+Status: install ok installed
+Description: the package database of the golden replay's fixture host
+ (lab PR 228): the programs listed in info/golden-fixture.list are the
+ ones a package installed.

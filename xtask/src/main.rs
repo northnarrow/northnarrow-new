@@ -17,6 +17,8 @@ use clap::{Parser, Subcommand};
 mod attack;
 mod btf_check;
 mod gate_report;
+mod golden;
+mod perf_compare;
 
 const EBPF_TARGET: &str = "bpfel-unknown-none";
 const EBPF_PACKAGE: &str = "northnarrow-agent-ebpf";
@@ -150,12 +152,27 @@ enum Cmd {
         #[arg(long, requires = "pin_ids")]
         mirror: Option<PathBuf>,
     },
+    /// Lab PR 228: the regression gate of the performance baseline. Compares
+    /// two `nn-lab.sh perf` results (docs/PERFORMANCE.md §2.4) metric by
+    /// metric on the medians; exit 0 pass, 1 a regression or a missing
+    /// metric, 2 unreadable input or runs from different hosts.
+    PerfCompare(perf_compare::Args),
+    /// Lab PR 228: the golden replay of the decision engine — recorded
+    /// event streams (agent/tests/golden/cases) through the decision path,
+    /// the verdicts compared byte for byte with agent/tests/golden/expected
+    /// (the agent's `decision::golden` tests, which `cargo test` runs too).
+    /// `--update` rewrites the golden files for review; refused under CI.
+    Golden {
+        /// Write the golden files from the replay instead of comparing.
+        #[arg(long)]
+        update: bool,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("xtask: {e:#}");
             ExitCode::FAILURE
@@ -163,7 +180,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli) -> Result<ExitCode> {
     let locked = cli.locked;
     match cli.cmd {
         Cmd::BuildEbpf { release } => {
@@ -234,8 +251,11 @@ fn run(cli: Cli) -> Result<()> {
             };
             attack::run(&root, &req, locked)?;
         }
+        // Its own exit status: 1 is a verdict (a regression), 2 an error.
+        Cmd::PerfCompare(args) => return Ok(perf_compare::main(&args)),
+        Cmd::Golden { update } => golden::run(&repo_root()?, update, locked)?,
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn write_creating_dirs(path: &Path, text: &str) -> Result<()> {
