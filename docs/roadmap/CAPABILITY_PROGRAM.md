@@ -718,3 +718,19 @@ only in the table below, in the same PR as the evidence.
     --workspace`. Levels unchanged: D2 must pass these tests with no value
     changed.
   - Lab: none — host tests only (plain `cargo test`, no root, no network): 20 vectors pinned in 14 tests.
+- **Lab PR 232 — the copy walk stays out of shared directories (C14;
+  follow-up of lab PR 225; no level changes).** NN-L-IMP-001's
+  copy-delete evidence (`sample_copies_dir`) looked for the copies below
+  and beside the burst's directory whoever shared it: a user's script
+  with one plain copy in `/tmp/job` was decisive on another tree's fresh
+  copies of ciphertext under the same suffix in `/tmp` — another user's,
+  or planted. The walk no longer crosses a world-writable sticky
+  directory (`/tmp`, `/var/tmp`, `/dev/shm`): not below one, not beside a
+  directory in one, not into one met beside or below; that directory's
+  own copies, and the trees of ordinary directories (a `0777` share
+  included), still count. The impact tests each work in a directory of
+  their own inside their `TempDir` (CI of PR 427: one test's walk read
+  another's `.locked` copies beside it in `/tmp`, `(4, 4)` for
+  `(3, 3)`). Open: in a shared directory the burst's own directory's
+  copies count whoever owns them (an owner match is a follow-up).
+  - Lab: host tests only. Before: the unchanged `sample_copies_reads_the_copies_not_the_originals` failed `(4, 4)` on every run with one decoy `.locked` copy planted beside its `TempDir` (TMPDIR set to a private directory) and passed without it; the impact tests alone in that directory failed 36 of 200 runs; the two new tests failed on the old walk (the script's job decisive, three shapes, "3 of 4 copies under .part"). After: `cargo test -p northnarrow-agent --lib impact` 20 times in a row, 20 green (27 tests); 200 runs in the private non-sticky directory (the sandbox alone) and 200 in `/tmp`, 0 failures; golden replay byte-identical, no golden file changed (its sampler answers by path, the walk is not on its path); fmt and the four clippy runs clean; host 2,898 passed, 0 failed (on `main` 381fac6).

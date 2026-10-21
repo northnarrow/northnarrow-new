@@ -2,6 +2,7 @@
 //! decisive, one is not, trusted writers never count.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,6 +124,17 @@ impl Host {
     }
 }
 
+/// A test's own tree: `w` inside its own `TempDir`, so that what the copy
+/// sampler reads beside a copy in `w` (the `TempDir`) and below it is this
+/// test's alone — never the trees of the tests running beside it in the
+/// shared temporary directory ([`super::entropy::sample_copies_dir`]).
+fn sandbox() -> (TempDir, PathBuf) {
+    let t = TempDir::new().unwrap();
+    let w = t.path().join("w");
+    std::fs::create_dir(&w).unwrap();
+    (t, w)
+}
+
 fn rewrites(pid: u32, ts: u64, file: &str) -> Event {
     Event::MassWrite {
         pid,
@@ -228,9 +240,9 @@ fn one_shape_is_not_decisive_and_a_second_one_is() {
 fn new_copies_then_deleted_originals_are_decisive() {
     let h = Host::new();
     h.exec(300, 200, "/usr/bin/python3", &["python3", SIM]);
-    let dir = TempDir::new().unwrap();
-    let d = dir.path().to_str().unwrap().to_string();
-    std::fs::write(dir.path().join("f017.locked"), b"ciphertext").unwrap();
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    std::fs::write(dir.join("f017.locked"), b"ciphertext").unwrap();
     let t = h.tracker(Fixed::high(&d));
     let a = t
         .assess(&new_files(300, T0, &format!("{d}/f003.locked")))
@@ -257,9 +269,9 @@ fn new_copies_then_deleted_originals_are_decisive() {
 fn plain_copies_and_deletions_are_one_shape() {
     let h = Host::new();
     h.exec(300, 200, "/usr/bin/bash", &["bash", "/home/u/archive.sh"]);
-    let dir = TempDir::new().unwrap();
-    let d = dir.path().to_str().unwrap().to_string();
-    std::fs::write(dir.path().join("app.log.old"), b"plain").unwrap();
+    let (_dir, dir) = sandbox();
+    let d = dir.to_str().unwrap().to_string();
+    std::fs::write(dir.join("app.log.old"), b"plain").unwrap();
     let t = h.tracker(Fixed::low());
     t.assess(&new_files(300, T0, &format!("{d}/x.old")))
         .unwrap();
@@ -501,8 +513,8 @@ fn shapes_of(a: &Assessment) -> Vec<Signal> {
 fn copy_delete_beside_fresh_originals_is_decisive() {
     let h = Host::new();
     h.exec(300, 200, "/usr/bin/python3", &["python3", SIM]);
-    let dir = TempDir::new().unwrap();
-    let deleted = copy_delete(dir.path(), 300, 20);
+    let (_dir, dir) = sandbox();
+    let deleted = copy_delete(&dir, 300, 20);
     let t = fs_tracker(&h);
     let a = t
         .assess(&new_files(300, T0, &format!("{deleted}.locked")))
@@ -534,10 +546,10 @@ fn copy_delete_beside_fresh_originals_is_decisive() {
 fn copy_delete_in_a_tree_of_small_directories_is_decisive() {
     let h = Host::new();
     h.exec(300, 200, "/home/u/.cache/x/enc", &["enc"]);
-    let root = TempDir::new().unwrap();
+    let (_root, root) = sandbox();
     let mut deleted = String::new();
     for i in 0..25 {
-        let d = root.path().join(format!("project-{i:02}"));
+        let d = root.join(format!("project-{i:02}"));
         std::fs::create_dir(&d).unwrap();
         let p = d.join("notes.odt");
         std::fs::write(&p, plain(6000)).unwrap();
@@ -566,11 +578,11 @@ fn copy_delete_in_a_tree_of_small_directories_is_decisive() {
 fn copy_delete_whose_crossing_write_was_a_ransom_note_is_decisive() {
     let h = Host::new();
     h.exec(300, 200, "/usr/bin/python3", &["python3", SIM]);
-    let dir = TempDir::new().unwrap();
+    let (_dir, dir) = sandbox();
     let kinds = ["docx", "pdf", "xlsx"];
     let mut deleted = String::new();
     for i in 0..40 {
-        let p = dir.path().join(format!("f{i:03}.{}", kinds[i % 3]));
+        let p = dir.join(format!("f{i:03}.{}", kinds[i % 3]));
         std::fs::write(&p, plain(5000)).unwrap();
         if i < 20 {
             let c = format!(
@@ -582,7 +594,7 @@ fn copy_delete_whose_crossing_write_was_a_ransom_note_is_decisive() {
             deleted = p.to_str().unwrap().to_string();
         }
     }
-    let note = dir.path().join("HOW_TO_RESTORE.txt");
+    let note = dir.join("HOW_TO_RESTORE.txt");
     std::fs::write(&note, b"your files are encrypted (lab text)").unwrap();
     let t = fs_tracker(&h);
     t.assess(&new_files(300, T0, note.to_str().unwrap()))
@@ -618,17 +630,17 @@ fn benign_copy_delete_shapes_are_not_decisive() {
             "{label}: {b:?}"
         );
     };
-    let p = |d: &TempDir, rel: &str| d.path().join(rel).to_str().unwrap().to_string();
+    let p = |d: &Path, rel: &str| d.join(rel).to_str().unwrap().to_string();
 
     // `mv` across filesystems: the copy keeps its name in another tree,
     // then the original goes (random content: the worst case).
-    let src = TempDir::new().unwrap();
-    let dst = TempDir::new().unwrap();
+    let (_src, src) = sandbox();
+    let (_dst, dst) = sandbox();
     for i in 0..20 {
-        std::fs::write(dst.path().join(format!("f{i:02}.bin")), cipher(8192, i)).unwrap();
+        std::fs::write(dst.join(format!("f{i:02}.bin")), cipher(8192, i)).unwrap();
     }
     for i in 20..40 {
-        std::fs::write(src.path().join(format!("f{i:02}.bin")), cipher(8192, i)).unwrap();
+        std::fs::write(src.join(format!("f{i:02}.bin")), cipher(8192, i)).unwrap();
     }
     run(
         "mv across filesystems",
@@ -639,11 +651,11 @@ fn benign_copy_delete_shapes_are_not_decisive() {
 
     // `rsync --remove-source-files`: a temporary `.name.XXXXXX` renamed to
     // the name in the destination, then the source removed.
-    let src = TempDir::new().unwrap();
-    let dst = TempDir::new().unwrap();
+    let (_src, src) = sandbox();
+    let (_dst, dst) = sandbox();
     for i in 0..20 {
-        std::fs::write(dst.path().join(format!("f{i:02}.bin")), cipher(8192, i)).unwrap();
-        std::fs::write(src.path().join(format!("g{i:02}.bin")), cipher(8192, i)).unwrap();
+        std::fs::write(dst.join(format!("f{i:02}.bin")), cipher(8192, i)).unwrap();
+        std::fs::write(src.join(format!("g{i:02}.bin")), cipher(8192, i)).unwrap();
     }
     run(
         "rsync --remove-source-files",
@@ -655,10 +667,10 @@ fn benign_copy_delete_shapes_are_not_decisive() {
     // A package manager's unpack: `x.dpkg-new` written beside `x`, the old
     // file removed, the new one renamed over it — the copy beside the
     // deleted file is a shared object (ELF), not ciphertext.
-    let lib = TempDir::new().unwrap();
+    let (_lib, lib) = sandbox();
     for i in 0..20 {
         std::fs::write(
-            lib.path().join(format!("libx{i}.so.dpkg-new")),
+            lib.join(format!("libx{i}.so.dpkg-new")),
             container(b"\x7fELF", 16384, i + 40),
         )
         .unwrap();
@@ -672,10 +684,10 @@ fn benign_copy_delete_shapes_are_not_decisive() {
 
     // A compiler: assembly written then deleted, objects written then
     // deleted once linked.
-    let tmp = TempDir::new().unwrap();
+    let (_tmp, tmp) = sandbox();
     for i in 0..20 {
         std::fs::write(
-            tmp.path().join(format!("cc{i:02}.o")),
+            tmp.join(format!("cc{i:02}.o")),
             container(b"\x7fELF", 8192, i),
         )
         .unwrap();
@@ -689,9 +701,9 @@ fn benign_copy_delete_shapes_are_not_decisive() {
 
     // An editor's safe write: `x.tmp` written beside `x`, `x` removed, the
     // temporary renamed — the copy beside is the edited text.
-    let docs = TempDir::new().unwrap();
+    let (_docs, docs) = sandbox();
     for i in 0..20 {
-        std::fs::write(docs.path().join(format!("notes{i:02}.md.tmp")), plain(6000)).unwrap();
+        std::fs::write(docs.join(format!("notes{i:02}.md.tmp")), plain(6000)).unwrap();
     }
     run(
         "editor temporary then unlink",
@@ -702,16 +714,16 @@ fn benign_copy_delete_shapes_are_not_decisive() {
 
     // `git gc`: packs written (`PACK` is no known signature: random
     // bytes after it), loose objects deleted — no copy beside an object.
-    let git = TempDir::new().unwrap();
-    std::fs::create_dir_all(git.path().join("objects/pack")).unwrap();
-    std::fs::create_dir_all(git.path().join("objects/3f")).unwrap();
+    let (_git, git) = sandbox();
+    std::fs::create_dir_all(git.join("objects/pack")).unwrap();
+    std::fs::create_dir_all(git.join("objects/3f")).unwrap();
     std::fs::write(
-        git.path().join("objects/pack/pack-0c1d.pack"),
+        git.join("objects/pack/pack-0c1d.pack"),
         container(b"PACK\0\0\0\x02", 65536, 77),
     )
     .unwrap();
     std::fs::write(
-        git.path().join("objects/pack/pack-0c1d.idx"),
+        git.join("objects/pack/pack-0c1d.idx"),
         container(b"\xfftOc", 8192, 78),
     )
     .unwrap();
@@ -725,10 +737,10 @@ fn benign_copy_delete_shapes_are_not_decisive() {
     // Log rotation with compression: `app.log.1.gz` written, `app.log.1`
     // removed — the copy beside is compressed (gzip, zstd), a container.
     for (ext, head) in [("gz", &b"\x1f\x8b"[..]), ("zst", &b"\x28\xb5\x2f\xfd"[..])] {
-        let logs = TempDir::new().unwrap();
+        let (_logs, logs) = sandbox();
         for i in 0..20 {
             std::fs::write(
-                logs.path().join(format!("app{i:02}.log.1.{ext}")),
+                logs.join(format!("app{i:02}.log.1.{ext}")),
                 container(head, 8192, i + 9),
             )
             .unwrap();
@@ -741,4 +753,41 @@ fn benign_copy_delete_shapes_are_not_decisive() {
         );
     }
     assert_eq!(t.counts().decisive, 0);
+}
+
+/// A job of a user's script in a directory of its own under a shared
+/// temporary directory (world-writable, sticky: `/tmp`): its copy-then-
+/// delete leaves one plain copy beside the original it deleted, and
+/// another tree of that directory — another user's, another program's —
+/// holds fresh copies of ciphertext under the same suffix whose originals
+/// are gone. Those are not this burst's evidence (and anyone can plant
+/// them): one shape, the deletion, never decisive.
+#[test]
+fn another_tree_of_a_shared_directory_is_no_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Host::new();
+    h.exec(300, 200, "/usr/bin/bash", &["bash", "/home/u/etl.sh"]);
+    let (_w, w) = sandbox();
+    let tmp = w.join("tmp");
+    let job = tmp.join("etl-4711");
+    let other = tmp.join("u2-export");
+    std::fs::create_dir_all(&job).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(job.join("orders.csv.part"), plain(8192)).unwrap();
+    for i in 0..6 {
+        std::fs::write(
+            other.join(format!("blob{i}.bin.part")),
+            cipher(8192, i + 90),
+        )
+        .unwrap();
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let deleted = job.join("orders.csv").to_str().unwrap().to_string();
+    let t = fs_tracker(&h);
+    t.assess(&new_files(300, T0, &format!("{deleted}.part")))
+        .unwrap();
+    let b = t.assess(&unlinks(300, T0 + S, &deleted)).unwrap();
+    assert!(!b.decisive, "{b:?}");
+    assert_eq!(b.added, vec![Signal::DeleteOriginals], "{b:?}");
+    assert_eq!(t.counts().samplings, 1);
 }

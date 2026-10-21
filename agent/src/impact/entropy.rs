@@ -147,8 +147,10 @@ pub fn sample_dir(path: &Path, since: Duration, host: &dyn Fn(&Path) -> PathBuf)
 /// within `since`, named `<original>.<suffix>` whose original is gone — in
 /// `copy`'s directory and, while fewer than [`SAMPLE_FILES_MAX`] are found
 /// there, in the directories below and beside it (an encryptor walking a
-/// tree of small directories); at most [`COPY_SCAN_MAX`] entries looked at
-/// in all, each reached through `host`.
+/// tree of small directories) but never across a world-writable sticky
+/// directory (below `/tmp`, beside `/tmp/x`: other users' trees); at most
+/// [`COPY_SCAN_MAX`] entries looked at in all, each reached through
+/// `host`.
 ///
 /// The originals that still wait their turn are never sampled: what sits
 /// beside the copies says nothing about what the burst wrote. In the lab's
@@ -175,13 +177,18 @@ pub fn sample_copies_dir(
         budget: COPY_SCAN_MAX,
     };
     // Below it and beside it — never under the root (`/proc`, `/sys`,
-    // `/dev` are no tree an encryptor walks).
+    // `/dev` are no tree an encryptor walks), nor across a shared
+    // directory ([`shared_dir`]): what lies below `/tmp` or beside
+    // `/tmp/x` are other users' and other programs' trees.
     let mut below: Vec<PathBuf> = Vec::new();
-    let below_wanted = dir.parent().is_some();
+    let below_wanted = dir.parent().is_some() && !shared_dir(dir, host);
     scan.dir(dir, &mut files, below_wanted.then_some(&mut below));
     if files.len() < SAMPLE_FILES_MAX {
         let mut beside: Vec<PathBuf> = Vec::new();
-        if let Some(parent) = dir.parent().filter(|p| p.parent().is_some()) {
+        if let Some(parent) = dir
+            .parent()
+            .filter(|p| p.parent().is_some() && !shared_dir(p, host))
+        {
             scan.dir(parent, &mut files, Some(&mut beside));
         }
         for d in below
@@ -191,10 +198,25 @@ pub fn sample_copies_dir(
             if files.len() >= SAMPLE_FILES_MAX || scan.budget == 0 {
                 break;
             }
-            scan.dir(d, &mut files, None);
+            if !shared_dir(d, host) {
+                scan.dir(d, &mut files, None);
+            }
         }
     }
     examine(files, host)
+}
+
+/// A world-writable directory with the sticky bit (`/tmp`, `/var/tmp`,
+/// `/dev/shm`, `/run/lock`): the trees of unrelated users and programs
+/// side by side, where anyone can leave files. Fresh copies of ciphertext
+/// in another of its trees — same suffix, originals gone — say nothing of
+/// the burst being judged (and can be planted to make a benign job look
+/// like an encryptor), so the copy walk does not cross one. A
+/// world-writable directory without the sticky bit is not one: a share's
+/// tree (`0777`) is where an encryptor walks.
+fn shared_dir(dir: &Path, host: &dyn Fn(&Path) -> PathBuf) -> bool {
+    let shared = libc::S_ISVTX | libc::S_IWOTH;
+    std::fs::metadata(host(dir)).is_ok_and(|m| m.is_dir() && m.mode() & shared == shared)
 }
 
 /// The walk of [`sample_copies_dir`].
@@ -414,6 +436,18 @@ pub fn known_container(head: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// A test's own tree: `w` inside its own `TempDir`, so that what the
+    /// copy sampler reads beside a copy in `w` (the `TempDir`) and below it
+    /// is this test's alone — never the trees of the tests running beside
+    /// it in the shared temporary directory, whose fresh `.locked` copies
+    /// of ciphertext (originals gone) are what [`sample_copies_dir`] counts.
+    fn sandbox() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::TempDir::new().unwrap();
+        let w = t.path().join("w");
+        std::fs::create_dir(&w).unwrap();
+        (t, w)
+    }
+
     fn random(n: usize, seed: u64) -> Vec<u8> {
         // xorshift: deterministic, uniform enough for an entropy test.
         let mut x = seed | 1;
@@ -456,9 +490,9 @@ mod tests {
     /// bytes hold the signal, text, a gzip archive and small files do not.
     #[test]
     fn sample_dir_counts_ciphertext_like_siblings() {
-        let t = tempfile::TempDir::new().unwrap();
+        let (_t, d) = sandbox();
+        let d = d.as_path();
         let host = |p: &Path| p.to_path_buf();
-        let d = t.path();
         let enc = |name: &str, seed: u64| {
             let mut b = random(3 * BLOCK, seed);
             b[0] = 0x42; // no signature by accident
@@ -471,8 +505,8 @@ mod tests {
         assert!(s.holds(), "{s:?}");
         assert_eq!(s.examined, 3);
 
-        let t2 = tempfile::TempDir::new().unwrap();
-        let d2 = t2.path();
+        let (_t2, d2) = sandbox();
+        let d2 = d2.as_path();
         let text = "plain report text, nothing encrypted here. ".repeat(300);
         std::fs::write(d2.join("r1.txt"), &text).unwrap();
         std::fs::write(d2.join("r2.txt"), &text).unwrap();
@@ -495,8 +529,8 @@ mod tests {
 
     #[test]
     fn intermittent_encryption_is_seen_in_the_middle() {
-        let t = tempfile::TempDir::new().unwrap();
-        let p = t.path().join("big.db");
+        let (_t, w) = sandbox();
+        let p = w.join("big.db");
         let mut b = "header text ".repeat(BLOCK).into_bytes();
         b.truncate(8 * BLOCK);
         let mid = 4 * BLOCK;
@@ -512,9 +546,9 @@ mod tests {
     /// not copies of the burst.
     #[test]
     fn sample_copies_reads_the_copies_not_the_originals() {
-        let t = tempfile::TempDir::new().unwrap();
+        let (_t, d) = sandbox();
+        let d = d.as_path();
         let host = |p: &Path| p.to_path_buf();
-        let d = t.path();
         let text = "plain report text, nothing encrypted here. ".repeat(300);
         let enc = |name: &str, seed: u64| {
             let mut b = random(2 * BLOCK, seed);
@@ -543,8 +577,8 @@ mod tests {
         assert!(s.holds());
 
         // Compressed copies (a rotation with compression) are containers.
-        let t2 = tempfile::TempDir::new().unwrap();
-        let d2 = t2.path();
+        let (_t2, d2) = sandbox();
+        let d2 = d2.as_path();
         for i in 0..6 {
             let mut gz = random(2 * BLOCK, 30 + i);
             gz[..2].copy_from_slice(b"\x1f\x8b");
@@ -571,9 +605,9 @@ mod tests {
     /// copy's directory and beside it, within the scan's bound.
     #[test]
     fn sample_copies_looks_below_and_beside_in_small_directories() {
-        let t = tempfile::TempDir::new().unwrap();
+        let (_t, w) = sandbox();
         let host = |p: &Path| p.to_path_buf();
-        let top = t.path().join("home");
+        let top = w.join("home");
         for i in 0..6 {
             let d = top.join(format!("d{i}"));
             std::fs::create_dir_all(d.join("sub")).unwrap();
@@ -592,8 +626,8 @@ mod tests {
         );
         assert_eq!((s.examined, s.high), (4, 4), "{s:?}");
         // Nothing beside or below: the copy alone, one file, no signal.
-        let lone = tempfile::TempDir::new().unwrap();
-        let p = lone.path().join("x/only.pdf.crypt");
+        let (_lone, l) = sandbox();
+        let p = l.join("x/only.pdf.crypt");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         let mut b = random(BLOCK, 60);
         b[0] = 0x42;
@@ -601,5 +635,76 @@ mod tests {
         let s = sample_copies_dir(&p, "crypt", Duration::from_secs(120), &host);
         assert_eq!((s.examined, s.high), (1, 1));
         assert!(!s.holds());
+    }
+
+    /// A world-writable sticky directory (`/tmp`, `/var/tmp`, `/dev/shm`)
+    /// holds the trees of unrelated users and programs side by side: the
+    /// copies are looked for neither beside it nor below it. Another tree's
+    /// fresh copies of ciphertext there — same suffix, at least a block,
+    /// originals gone — say nothing of this burst (and anyone can plant
+    /// them). In an ordinary directory they count: the tree of small
+    /// directories, and the CI failure of PR 427 (the copy sampler of a
+    /// test in `/tmp/.tmpX` read another test's `.locked` copies beside
+    /// it); a shared directory's own copies count as well.
+    #[test]
+    fn sample_copies_does_not_cross_a_shared_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, w) = sandbox();
+        let host = |p: &Path| p.to_path_buf();
+        let since = Duration::from_secs(120);
+        let text = "plain report text, nothing encrypted here. ".repeat(300);
+        let enc = |p: PathBuf, seed: u64| {
+            let mut b = random(2 * BLOCK, seed);
+            b[0] = 0x42;
+            std::fs::write(p, b).unwrap();
+        };
+        // `base/job/a.csv.part`: the burst's copy, plain, alone in its
+        // directory; `base/<other>/x*.bin.part`: another tree's encrypted
+        // copies, the shared directory being `base` or `base/<other>`.
+        let tree = |base: &Path, other: &str, base_mode: u32, other_mode: u32| {
+            std::fs::create_dir_all(base.join("job")).unwrap();
+            std::fs::create_dir_all(base.join(other)).unwrap();
+            std::fs::write(base.join("job/a.csv.part"), &text).unwrap();
+            for i in 0..3 {
+                enc(base.join(format!("{other}/x{i}.bin.part")), 70 + i);
+            }
+            let mode = |p: &Path, m: u32| {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+            };
+            mode(&base.join(other), other_mode);
+            mode(base, base_mode);
+            base.join("job/a.csv.part")
+        };
+        let other_tree = Sample {
+            examined: 4,
+            high: 3,
+            containers: 0,
+        };
+        let alone = Sample {
+            examined: 1,
+            high: 0,
+            containers: 0,
+        };
+        // Beside, in an ordinary directory: read.
+        let copy = tree(&w.join("home"), "u2", 0o755, 0o755);
+        assert_eq!(sample_copies_dir(&copy, "part", since, &host), other_tree);
+        // Beside, in a shared directory: not read.
+        let copy = tree(&w.join("tmp"), "u2", 0o1777, 0o700);
+        assert_eq!(sample_copies_dir(&copy, "part", since, &host), alone);
+        // A shared directory beside, in an ordinary one (`/var/tmp` from
+        // `/var/x`): not read.
+        let copy = tree(&w.join("var"), "tmp", 0o755, 0o1777);
+        assert_eq!(sample_copies_dir(&copy, "part", since, &host), alone);
+        // Below a shared directory (the copy in `/tmp` itself): not read;
+        // its own copies are.
+        let shared = w.join("tmp");
+        std::fs::write(shared.join("b.csv.part"), &text).unwrap();
+        let copy = shared.join("b.csv.part");
+        assert_eq!(sample_copies_dir(&copy, "part", since, &host), alone);
+        enc(shared.join("c.pdf.part"), 80);
+        enc(shared.join("d.pdf.part"), 81);
+        let s = sample_copies_dir(&copy, "part", since, &host);
+        assert_eq!((s.examined, s.high), (3, 2), "{s:?}");
+        assert!(s.holds());
     }
 }
