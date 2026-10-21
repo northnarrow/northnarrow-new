@@ -140,6 +140,30 @@ to that build. What changes then is in `UPGRADE_NOTES_WAVE4.md`.
   namespace's 1 GiB; the watchdog's `exec` respawn backend inside its
   unit, already unsupported, now starts the agent without `CAP_SYS_ADMIN`
   too.
+- **The watchdog fails visibly** (capability C23, static review C-43 /
+  C-44, lab PR 216). Every failure of the watchdog has a non-zero exit
+  status of its own (10–20, [§3.9](INSTALL_UPGRADE_UNINSTALL.md#39-when-the-watchdog-fails-lab-pr-216))
+  and a signed `watchdog_exit` record; "pidfd wait failed" exited 0 and was
+  never restarted. Its unit has `Restart=always` with
+  `RestartPreventExitStatus=0`, a backoff from 2 s to 60 s, no start limit
+  (it is restarted for as long as it fails, each run recorded) and
+  `OnFailure=` for a unit-level failure — a new unit,
+  `northnarrow-watchdog-failed.service` (installed, packaged, protected
+  like the others, never enabled) — which records `watchdog_failed`. The
+  agent signs `watchdog_gone` when its watchdog no longer runs. The
+  watchdog checks that the agent's event loop goes round (a new unsigned
+  `LoopProgress` request after its STATUS ping); a failed stuck recovery no
+  longer evicts a running agent from `PROTECTED_PIDS`; the hold retries
+  after 10, 20, 40 minutes, then hourly. Both daemons are not dumpable, the
+  units set `LimitCORE=0` and `TimeoutStartSec=` (agent 180 s, watchdog
+  60 s), and `install.sh` creates `/run/northnarrow` 0700 (it was 0755).
+  **Regression:** a watchdog killed by SIGHUP is restarted (it counted as
+  a clean stop); a watchdog that keeps failing is restarted every minute
+  with one signed `watchdog_exit` per run; an agent stuck for 90 s behind
+  one event is now restarted. The `LoopProgress` variants take the admin protocol's indices
+  52 and 53 (the debug-only variants move to 54 and 55): upgrade the agent,
+  the watchdog and `nn-admin` together, as before. A watchdog newer than
+  the agent falls back to the STATUS answer alone.
 - **A removed admin socket comes back, and no longer hides a frozen
   agent** (Wave 3: NN-AUD-358 WDG-007, NN-AUD-364 WDG-015, NN-AUD-359
   WDG-008, NN-AUD-360 WDG-010, lab PR 170). The agent checks

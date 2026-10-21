@@ -19,6 +19,11 @@
 //!
 //! Restart loop, layer-2 PROTECTED_PIDS evict, and the STATUS
 //! ping land in W3/W4/W5.
+//!
+//! Lab PR 216 (capability C23): every failure exits non-zero with a status
+//! of its own ([`northnarrow_watchdog::ExitReason`]) after a record the
+//! agent signs; `--record-unit-failure` is the unit's `OnFailure=`
+//! handler.
 
 use std::os::fd::{IntoRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -33,19 +38,24 @@ use tracing_subscriber::EnvFilter;
 
 use northnarrow_watchdog::{
     check_shutdown_marker, evict_dead_agent, harden_self, hold_until_agent_returns,
-    log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited, ping_agent_status,
-    process_start_unix, register_self_pid, reinsert_new_agent_pid, sd_notify_ready,
-    sd_notify_status, stuck_recovery, unregister_self_pid, wait_for_agent_death,
-    write_pidfile_atomic, BackoffOutcome, Cli, HoldOutcome, PingOutcome, RestartBackoff,
-    ShutdownCheck, ShutdownVerdict, StatusPingTracker, DEFAULT_AGENT_BIN, HOLD_POLL,
-    PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL, STATUS_PING_TIMEOUT,
-    STUCK_RECOVERY_HARDKILL_GRACE,
+    log_tamper_suspected, open_agent_pidfd_with_retry, pidfd_exited, process_start_unix,
+    register_self_pid, reinsert_new_agent_pid, sd_notify_ready, sd_notify_status, stuck_recovery,
+    unregister_self_pid, wait_for_agent_death, write_pidfile_atomic, BackoffOutcome, Cli,
+    HoldOutcome, PingOutcome, RestartBackoff, ShutdownCheck, ShutdownVerdict, StatusPingTracker,
+    DEFAULT_AGENT_BIN, HOLD_POLL, PIDFD_OPEN_RETRY_DEADLINE, STATUS_PING_INTERVAL,
+    STATUS_PING_TIMEOUT, STUCK_RECOVERY_HARDKILL_GRACE,
 };
 use northnarrow_watchdog::{
     classify_ping_error, exec_respawn_argv, hold_record_path, off_runtime, ping_ticker, reap_agent,
     record_hold, respawn_agent_off_runtime, select_backend, systemctl_unit_state,
     systemd_is_booted, PingFailure, Reaped, RespawnBackend, STATUS_PING_ABSENT_ERROR_AFTER,
     STATUS_PING_VANISHED_TAMPER_AFTER, SYSTEMD_RUNTIME_DIR, UNIT_STATE_TIMEOUT,
+};
+use northnarrow_watchdog::{
+    event_loop_stalled_record, exit_record, hold_status_line, pidfd_wait_failed, ping_agent,
+    read_pid_from_file, stuck_recovery_failed_record, stuck_verdict, unit_failure_record, unix_now,
+    ExitAs, ExitReason, Failure, HoldRetry, LoopProgress, StuckVerdict, HOLD_REMIND_EVERY,
+    HOLD_STATUS_EVERY,
 };
 
 /// Deadline budget for the post-respawn pidfile-readiness wait.
@@ -74,6 +84,9 @@ async fn main() -> ExitCode {
         .try_init();
 
     let cli = Cli::parse();
+    if cli.record_unit_failure {
+        return record_unit_failure(&cli);
+    }
     info!(
         target: "watchdog",
         agent_pidfile = %cli.agent_pidfile.display(),
@@ -83,19 +96,68 @@ async fn main() -> ExitCode {
         "watchdog starting"
     );
 
+    let holds = hold_record_path(&cli.shutdown_marker);
+    let bpffs_root = cli.bpffs_root.clone();
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            // A failure before the restart loop skips its teardown: the pid
+            // this watchdog registered at its start must not stay protected
+            // for whoever reuses it (idempotent after the teardown).
+            let _ = unregister_self_pid(&bpffs_root, std::process::id());
+            // Lab PR 216: a status of its own, and a record the agent signs
+            // — systemd restarts the watchdog (`Restart=always`).
+            error!(
+                target: "watchdog.tamper",
+                status = failure.reason.code(),
+                reason = failure.reason.name(),
+                agent_pid = failure.agent_pid,
+                error = format!("{:#}", failure.error),
+                "watchdog EXITING on a failure — systemd restarts it; the agent signs the record"
+            );
+            if let Err(e) = record_hold(&holds, &exit_record(&failure, unix_now())) {
+                warn!(
+                    target: "watchdog.tamper",
+                    error = %e,
+                    path = %holds.display(),
+                    "could not record the exit for the agent's audit chain"
+                );
+            }
+            ExitCode::from(failure.reason.code())
+        }
+    }
+}
+
+/// Lab PR 216: `--record-unit-failure`, the mode
+/// `northnarrow-watchdog-failed.service` runs when systemd puts the
+/// watchdog unit in its failed state (`OnFailure=`): one
+/// `watchdog_failed` record, signed by the agent at its next round, and an
+/// ERROR line. Exit 0, or [`ExitReason::RecordFailed`].
+fn record_unit_failure(cli: &Cli) -> ExitCode {
+    let agent_pid = read_pid_from_file(&cli.agent_pidfile).unwrap_or(0);
+    let record = unit_failure_record(|k| std::env::var(k).ok(), agent_pid, unix_now());
+    error!(
+        target: "watchdog.tamper",
+        detail = %record.detail,
+        "the watchdog unit FAILED — systemd no longer restarts it; the agent runs unsupervised \
+         until `systemctl start northnarrow-watchdog`"
+    );
+    let path = hold_record_path(&cli.shutdown_marker);
+    match record_hold(&path, &record) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            warn!(error = %e, "watchdog exited with error");
-            ExitCode::FAILURE
+            error!(target: "watchdog.tamper", error = %e, path = %path.display(), "could not record the watchdog's failure");
+            ExitCode::from(ExitReason::RecordFailed.code())
         }
     }
 }
 
 /// Body of the watchdog boot/wait/teardown cycle, extracted so
 /// the binary surface stays a thin error→exit-code mapper.
-async fn run(cli: Cli) -> Result<()> {
-    harden_self().context("harden_self (prctl PR_SET_DUMPABLE + PR_SET_NAME)")?;
+async fn run(cli: Cli) -> std::result::Result<(), Failure> {
+    harden_self()
+        .context("harden_self (prctl PR_SET_DUMPABLE + PR_SET_NAME)")
+        .exit_as(ExitReason::Harden)?;
 
     // W4: persist the agent's argv for respawn (design §5.3
     // "first launch's argv is the canonical respawn command").
@@ -120,7 +182,8 @@ async fn run(cli: Cli) -> Result<()> {
     let (mut agent_pid, mut agent_pidfd) =
         open_agent_pidfd_with_retry(&cli.agent_pidfile, PIDFD_OPEN_RETRY_DEADLINE, &agent_bin)
             .await
-            .context("opening initial agent pidfd")?;
+            .context("opening initial agent pidfd")
+            .exit_as(ExitReason::NoAgent)?;
     // Respawn v2 (docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md): on a
     // systemd host the agent is brought back through ITS OWN unit, so
     // it gets the unit's ExecStart argv, cgroup, caps and ProtectHome —
@@ -143,10 +206,12 @@ async fn run(cli: Cli) -> Result<()> {
                 &hold_record_path(&cli.shutdown_marker),
             ))
         },
-    )?;
+    )
+    .map_err(|e| Failure::new(ExitReason::Backend, e).agent(agent_pid))?;
 
     write_pidfile_atomic(&cli.pidfile, own_pid)
-        .with_context(|| format!("writing watchdog pidfile {}", cli.pidfile.display()))?;
+        .with_context(|| format!("writing watchdog pidfile {}", cli.pidfile.display()))
+        .map_err(|e| Failure::new(ExitReason::Pidfile, e).agent(agent_pid))?;
 
     // Self-protection + signalling rights (see register_self_pid): the
     // task_kill hook only lets a PROTECTED caller signal the protected
@@ -160,7 +225,10 @@ async fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    sd_notify_ready().context("sd_notify(READY=1)")?;
+    sd_notify_ready()
+        .context("sd_notify(READY=1)")
+        .map_err(|e| Failure::new(ExitReason::Notify, e).agent(agent_pid))?;
+    sd_notify_status(&format!("supervising agent pid {agent_pid}"));
 
     info!(
         target: "watchdog",
@@ -171,9 +239,19 @@ async fn run(cli: Cli) -> Result<()> {
         "boot sequence complete — entering restart-backoff loop"
     );
 
-    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt())
+        .context("installing SIGINT handler")
+        .map_err(|e| Failure::new(ExitReason::Signals, e).agent(agent_pid))?;
+    let mut sigterm = signal(SignalKind::terminate())
+        .context("installing SIGTERM handler")
+        .map_err(|e| Failure::new(ExitReason::Signals, e).agent(agent_pid))?;
     let mut backoff = RestartBackoff::new();
+    // Lab PR 216: the hold's bounded retries, counted over this watchdog's
+    // life.
+    let mut hold_retry = HoldRetry::new();
+    // Lab PR 216: how the restart loop ended — a stop it was told to make,
+    // or a failure with its own exit status. Teardown is the same.
+    let mut failure: Option<Failure> = None;
     // External audit WDG-001: a shutdown authorisation must have been
     // signed while the agent it stops was running.
     let mut agent_started = process_start_unix(agent_pid);
@@ -223,7 +301,7 @@ async fn run(cli: Cli) -> Result<()> {
         let select_outcome = tokio::select! {
             _ = sigint.recv() => SelectOutcome::Signal("SIGINT"),
             _ = sigterm.recv() => SelectOutcome::Signal("SIGTERM"),
-            result = wait_for_agent_death(&agent_pidfd) => SelectOutcome::AgentDied(result),
+            result = wait_agent(&agent_pidfd, &cli.agent_pidfile) => SelectOutcome::AgentDied(result),
             // W5 stuck-recovery arm: the parallel ping task has
             // observed two consecutive STATUS-ping timeouts and
             // decided the agent is wedged. Run the SIGINT →
@@ -242,22 +320,28 @@ async fn run(cli: Cli) -> Result<()> {
                     agent_pid,
                     "STATUS-ping stuck signal received from ping task — running recovery"
                 );
-                let recovery = stuck_recovery(
-                    agent_pid,
-                    &cli.bpffs_root,
-                    STUCK_RECOVERY_HARDKILL_GRACE,
-                    &agent_bin,
-                )
-                .await;
-                if let Err(e) = recovery {
-                    warn!(
-                        target: "watchdog.stuck_recovery",
-                        error = %e,
+                let recovery = if debug_refuse_recovery(&cli.agent_pidfile) {
+                    Err(anyhow::anyhow!("debug-trigger: stuck recovery refused before its signals"))
+                } else {
+                    stuck_recovery(
                         agent_pid,
-                        "stuck_recovery failed — falling through to restart logic anyway"
-                    );
+                        &cli.bpffs_root,
+                        STUCK_RECOVERY_HARDKILL_GRACE,
+                        &agent_bin,
+                    )
+                    .await
+                };
+                // Lab PR 216 (static review C-44 / G-05): a death is what
+                // the agent's own pidfd says, never a failed recovery.
+                match (stuck_verdict(&agent_pidfd), recovery) {
+                    (StuckVerdict::Exited, _) => SelectOutcome::AgentDied(Ok(())),
+                    (StuckVerdict::StillRunning, Err(e)) => {
+                        SelectOutcome::RecoveryFailed(format!("{e:#}"))
+                    }
+                    (StuckVerdict::StillRunning, Ok(())) => SelectOutcome::RecoveryFailed(
+                        "the recovery reported an exit the agent's pidfd does not show".to_string(),
+                    ),
                 }
-                SelectOutcome::AgentDied(Ok(()))
                 }
             }
         };
@@ -277,8 +361,26 @@ async fn run(cli: Cli) -> Result<()> {
                 continue 'restart_loop;
             }
             SelectOutcome::AgentDied(Err(e)) => {
-                warn!(target: "watchdog.pidfd", error = %e, "pidfd wait failed — exiting");
+                // Lab PR 216 (static review C-44 / G-05): this `break` was
+                // a clean exit 0, which `Restart=on-failure` did not
+                // restart. A status of its own: systemd restarts the
+                // watchdog, which opens a pidfd on the agent again.
+                error!(
+                    target: "watchdog.pidfd",
+                    error = %e,
+                    agent_pid,
+                    "pidfd wait failed — exiting with status {} for a restart",
+                    ExitReason::PidfdWait.code()
+                );
+                failure = Some(pidfd_wait_failed(e, agent_pid));
                 break 'restart_loop;
+            }
+            SelectOutcome::RecoveryFailed(error) => {
+                // Lab PR 216: the agent runs. It keeps its PROTECTED_PIDS
+                // entry (written again: idempotent) and its pidfile; the
+                // pidfd stays watched and the next stuck signal tries again.
+                recovery_failed(&cli, agent_pid, &error);
+                continue 'restart_loop;
             }
             SelectOutcome::AgentDied(Ok(())) => {
                 info!(
@@ -385,6 +487,7 @@ async fn run(cli: Cli) -> Result<()> {
                             &mut stuck_rx,
                             held,
                             &agent_bin,
+                            &mut hold_retry,
                         )
                         .await
                         {
@@ -476,6 +579,7 @@ async fn run(cli: Cli) -> Result<()> {
                             &mut stuck_rx,
                             held,
                             &agent_bin,
+                            &mut hold_retry,
                         )
                         .await
                         {
@@ -494,6 +598,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
     }
 
+    // Lab PR 216: the same teardown after a failure as after a stop — the
+    // next watchdog (systemd restarts this one) registers itself again.
     // Best-effort pidfile cleanup. Crash paths deliberately leave
     // the file STALE; readers must re-confirm via /proc/<pid>.
     if cli.pidfile.exists() {
@@ -513,8 +619,63 @@ async fn run(cli: Cli) -> Result<()> {
     if let Err(e) = unregister_self_pid(&cli.bpffs_root, own_pid) {
         debug!(target: "watchdog", error = %e, "own PID not evicted from PROTECTED_PIDS (no pin?)");
     }
-    info!(target: "watchdog", "watchdog stopped");
-    Ok(())
+    match failure {
+        Some(f) => Err(f),
+        None => {
+            info!(target: "watchdog", "watchdog stopped");
+            Ok(())
+        }
+    }
+}
+
+/// The wait on the agent's pidfd ([`wait_for_agent_death`]). `debug-trigger`
+/// builds (the lab's) only: a file `debug-fail-pidfd-wait` beside the agent
+/// pidfile makes it fail once — lab check of lab PR 216 (exit status 20, a
+/// `watchdog_exit` record, systemd's restart). Polled every second.
+async fn wait_agent(pidfd: &OwnedFd, agent_pidfile: &std::path::Path) -> Result<()> {
+    #[cfg(feature = "debug-trigger")]
+    {
+        let trigger = agent_pidfile.with_file_name("debug-fail-pidfd-wait");
+        let injected = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if std::fs::remove_file(&trigger).is_ok() {
+                    warn!(target: "watchdog.pidfd", "debug-trigger: pidfd wait failure injected (lab test of lab PR 216)");
+                    return anyhow::anyhow!("debug-trigger: pidfd wait failure injected");
+                }
+            }
+        };
+        tokio::select! {
+            r = wait_for_agent_death(pidfd) => r,
+            e = injected => Err(e),
+        }
+    }
+    #[cfg(not(feature = "debug-trigger"))]
+    {
+        let _ = agent_pidfile;
+        wait_for_agent_death(pidfd).await
+    }
+}
+
+/// `debug-trigger` builds only: a file `debug-refuse-recovery` beside the
+/// agent pidfile makes the next stuck recovery fail before its signals, as
+/// a refused SIGINT does — lab check of lab PR 216 (the agent keeps its
+/// protection). Consumed by that recovery. Always `false` otherwise.
+fn debug_refuse_recovery(agent_pidfile: &std::path::Path) -> bool {
+    #[cfg(feature = "debug-trigger")]
+    {
+        let taken =
+            std::fs::remove_file(agent_pidfile.with_file_name("debug-refuse-recovery")).is_ok();
+        if taken {
+            warn!(target: "watchdog.stuck_recovery", "debug-trigger: stuck recovery refused (lab test of lab PR 216)");
+        }
+        taken
+    }
+    #[cfg(not(feature = "debug-trigger"))]
+    {
+        let _ = agent_pidfile;
+        false
+    }
 }
 
 /// Internal select-arm outcome — folds the three branches of the
@@ -528,6 +689,9 @@ fn new_generation(
 ) {
     current.send_replace(Some(pid));
     while stuck_rx.try_recv().is_ok() {}
+    // Lab PR 216: a DEGRADED line from a failed recovery or a hold ends
+    // with the agent it was about.
+    sd_notify_status(&format!("supervising agent pid {pid}"));
 }
 
 enum SelectOutcome {
@@ -535,6 +699,44 @@ enum SelectOutcome {
     AgentDied(Result<()>),
     /// External audit WDG-002: a stuck signal for an earlier agent.
     StaleStuck(u32),
+    /// Lab PR 216: stuck recovery could not confirm the agent's exit.
+    RecoveryFailed(String),
+}
+
+/// Lab PR 216 (static review C-44 / G-05): stuck recovery failed and the
+/// agent still runs. Before, it was handled as a death — evicted from
+/// `PROTECTED_PIDS`, its pidfile removed, a respawn queued — with the agent
+/// alive, which re-registers its pid only at its start. Now: its entry
+/// written again (idempotent; nothing removed it), `DEGRADED` in
+/// `systemctl status`, an ERROR, and a record the agent signs
+/// (`stuck_recovery_failed`).
+fn recovery_failed(cli: &Cli, agent_pid: u32, error: &str) {
+    if let Err(e) = reinsert_new_agent_pid(&cli.bpffs_root, agent_pid) {
+        debug!(target: "watchdog.stuck_recovery", error = %e, agent_pid, "PROTECTED_PIDS re-assert (no pin?)");
+    }
+    sd_notify_status(&format!(
+        "DEGRADED: agent pid {agent_pid} unresponsive and could not be stopped — still protected \
+         and supervised"
+    ));
+    error!(
+        target: "watchdog.tamper",
+        agent_pid,
+        error,
+        "stuck recovery FAILED and the agent still runs — NOT evicted, pidfile kept, still \
+         supervised; the next stuck signal tries again"
+    );
+    let path = hold_record_path(&cli.shutdown_marker);
+    if let Err(e) = record_hold(
+        &path,
+        &stuck_recovery_failed_record(agent_pid, error, unix_now()),
+    ) {
+        warn!(
+            target: "watchdog.tamper",
+            error = %e,
+            path = %path.display(),
+            "could not record the failed recovery for the agent's audit chain"
+        );
+    }
 }
 
 /// One full respawn cycle: spawn the agent, wait for its
@@ -626,6 +828,17 @@ struct Hold {
 /// signed audit chain ([`record_hold`]) — with the agent unit's state on a
 /// systemd host — and signed as an `integrity_drift` (`watchdog_hold`) at
 /// the agent's next start. The journal line alone stayed on this host.
+///
+/// Lab PR 216 (static review C-44: the hold was indefinite, and with no
+/// agent nothing signed its record): the hold is bounded and stays
+/// visible ([`hold_supervision`]) — its `STATUS=` line says for how long
+/// and when it retries, an ERROR repeats every 10 minutes, and after
+/// [`northnarrow_watchdog::HOLD_RETRY_FIRST`] (then twice as long, up to an
+/// hour) it starts the agent once more, recorded as `hold_retry`. Its end
+/// is recorded too (`hold_ended`, with its length). The retries supersede
+/// WDG-004's "only an operator starts the agent again" (the maintainer's
+/// decision); an operator's start still ends the hold at once.
+#[allow(clippy::too_many_arguments)]
 async fn hold(
     cli: &Cli,
     backend: &RespawnBackend,
@@ -634,13 +847,12 @@ async fn hold(
     stuck_rx: &mut tokio::sync::mpsc::Receiver<u32>,
     held: Hold,
     agent_bin: &std::path::Path,
+    retry: &mut HoldRetry,
 ) -> Option<(u32, OwnedFd)> {
     let why = held.why;
     // Once the dead agent's PID is reused its pidfile would read as live.
     let _ = std::fs::remove_file(&cli.agent_pidfile);
-    sd_notify_status(&format!(
-        "DEGRADED: {why} — not respawning the agent; start northnarrow-agent once investigated"
-    ));
+    sd_notify_status(&hold_status_line(why, Duration::ZERO, retry.next_wait()));
     let unit_state = match backend {
         RespawnBackend::SystemdUnit { unit } => {
             let unit = unit.clone();
@@ -668,14 +880,12 @@ async fn hold(
         why,
         detail = %held.detail,
         unit_state = unit_state.as_deref().unwrap_or("-"),
+        retry_in_secs = retry.next_wait().as_secs(),
         "watchdog HOLDING: alive and protected, not respawning the agent until an operator \
-         starts it"
+         starts it or the hold's next retry"
     );
     let record = common::watchdog_hold::HoldRecord {
-        at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        at: unix_now(),
         agent_pid: held.agent_pid,
         reason: why.to_string(),
         detail: held.detail,
@@ -690,13 +900,18 @@ async fn hold(
             "could not record the hold for the agent's audit chain; the journal line above is the only trace"
         );
     }
+    let started = Instant::now();
     let shutdown = async {
         tokio::select! {
             _ = sigint.recv() => "SIGINT",
             _ = sigterm.recv() => "SIGTERM",
         }
     };
-    match hold_until_agent_returns(&cli.agent_pidfile, HOLD_POLL, shutdown, agent_bin).await {
+    let outcome = tokio::select! {
+        out = hold_until_agent_returns(&cli.agent_pidfile, HOLD_POLL, shutdown, agent_bin) => out,
+        never = hold_supervision(why, backend, &path, held.agent_pid, started, &mut *retry) => match never {},
+    };
+    match outcome {
         HoldOutcome::Resumed { pid, pidfd } => {
             // Pings failed while no agent ran: those stuck signals are stale.
             while stuck_rx.try_recv().is_ok() {}
@@ -706,17 +921,102 @@ async fn hold(
                 }
             }
             sd_notify_status(&format!("supervising agent pid {pid}"));
+            let held_for = started.elapsed().as_secs();
             info!(
                 target: "watchdog",
                 pid,
+                held_for_secs = held_for,
                 "agent running again — supervision resumed with a fresh restart window"
             );
+            let ended = common::watchdog_hold::HoldRecord {
+                at: unix_now(),
+                agent_pid: pid,
+                reason: common::watchdog_hold::REASON_HOLD_ENDED.to_string(),
+                detail: format!(
+                    "the hold ({why}) lasted {held_for} s; agent pid {pid} runs again after {} \
+                     retries in this watchdog's life",
+                    retry.retries()
+                ),
+                unit_state: None,
+            };
+            if let Err(e) = record_hold(&path, &ended) {
+                warn!(target: "watchdog.tamper", error = %e, "could not record the end of the hold");
+            }
             Some((pid, pidfd))
         }
         HoldOutcome::Shutdown(name) => {
             info!(target: "watchdog", signal = name, "shutting down while holding");
             None
         }
+    }
+}
+
+/// Lab PR 216: what a hold does while it waits, never returning — the
+/// caller races it against the agent's return. Every
+/// [`HOLD_STATUS_EVERY`] it refreshes the `STATUS=` line; every
+/// [`HOLD_REMIND_EVERY`] it repeats the ERROR; when [`HoldRetry`] says, it
+/// records a `hold_retry` and starts the agent once (its pidfile, polled by
+/// the caller, ends the hold).
+async fn hold_supervision(
+    why: &'static str,
+    backend: &RespawnBackend,
+    holds: &std::path::Path,
+    agent_pid: u32,
+    started: Instant,
+    retry: &mut HoldRetry,
+) -> std::convert::Infallible {
+    let mut tick = ping_ticker(HOLD_STATUS_EVERY);
+    tick.tick().await; // the first fires at once
+    let mut next_retry = started + retry.next_wait();
+    let mut reminders = 0u64;
+    loop {
+        tick.tick().await;
+        let now = Instant::now();
+        let held_for = now.saturating_duration_since(started);
+        if now >= next_retry {
+            retry.record();
+            let attempt = retry.retries();
+            error!(
+                target: "watchdog.tamper",
+                why,
+                attempt,
+                held_for_secs = held_for.as_secs(),
+                "hold retry: starting the agent once more"
+            );
+            let record = common::watchdog_hold::HoldRecord {
+                at: unix_now(),
+                agent_pid,
+                reason: common::watchdog_hold::REASON_HOLD_RETRY.to_string(),
+                detail: format!(
+                    "holding ({why}) for {} s; retry {attempt} starts the agent through {}",
+                    held_for.as_secs(),
+                    backend.describe()
+                ),
+                unit_state: None,
+            };
+            if let Err(e) = record_hold(holds, &record) {
+                warn!(target: "watchdog.tamper", error = %e, "could not record the hold retry");
+            }
+            if let Err(e) = respawn_agent_off_runtime(backend).await {
+                error!(target: "watchdog.respawn", attempt, error = %e, "hold retry: the start failed");
+            }
+            next_retry = now + retry.next_wait();
+        }
+        let due = held_for.as_secs() / HOLD_REMIND_EVERY.as_secs().max(1);
+        if due > reminders {
+            reminders = due;
+            error!(
+                target: "watchdog.tamper",
+                why,
+                held_for_secs = held_for.as_secs(),
+                "watchdog STILL HOLDING: the agent is not running"
+            );
+        }
+        sd_notify_status(&hold_status_line(
+            why,
+            held_for,
+            next_retry.saturating_duration_since(now),
+        ));
     }
 }
 
@@ -776,6 +1076,12 @@ async fn run_ping_loop(
 
     let mut tracker = StatusPingTracker::new();
     let mut watching = *agent.borrow_and_update();
+    // Lab PR 216: whether to ask this agent for its loop progress (an agent
+    // older than the request is asked once).
+    let mut ask_progress = true;
+    // Lab PR 216: a stuck signal was sent for this agent; its next healthy
+    // answer clears the DEGRADED line a failed recovery leaves.
+    let mut signalled = false;
     loop {
         tick.tick().await;
         // External audit WDG-002: timeouts against the previous agent do
@@ -784,40 +1090,111 @@ async fn run_ping_loop(
         if current != watching {
             tracker.reset();
             watching = current;
+            ask_progress = true;
+            signalled = false;
         }
         let Some(agent_pid) = watching else {
             continue;
         };
-        let outcome =
-            match ping_agent_status(&socket_path, STATUS_PING_TIMEOUT, Some(agent_pid)).await {
-                Ok(()) => tracker.record_ok(),
-                Err(e) => match classify_ping_error(&e) {
-                    PingFailure::SocketAbsent => tracker.record_socket_absent(),
-                    PingFailure::NotTheAgent => {
-                        warn!(
-                            target: "watchdog.tamper",
-                            error = %e,
-                            socket = %socket_path.display(),
-                            agent_pid,
-                            "a process that is not the agent serves the admin socket — not \
-                             counted as an answer"
-                        );
-                        tracker.record_socket_absent()
-                    }
-                    PingFailure::Unresponsive => {
-                        warn!(
-                            target: "watchdog.status_ping",
-                            error = %e,
-                            socket = %socket_path.display(),
-                            consecutive = tracker.consecutive_timeouts(),
-                            "STATUS ping failed"
-                        );
-                        tracker.record_timeout()
-                    }
-                },
-            };
+        let outcome = match ping_agent(
+            &socket_path,
+            STATUS_PING_TIMEOUT,
+            Some(agent_pid),
+            ask_progress,
+        )
+        .await
+        {
+            Ok(progress) => {
+                if ask_progress && progress == LoopProgress::Unreported {
+                    info!(
+                        target: "watchdog.status_ping",
+                        agent_pid,
+                        "the agent does not report its event loop's progress (older than \
+                         lab PR 216) — its STATUS answer alone counts"
+                    );
+                    ask_progress = false;
+                }
+                tracker.record_answer(progress)
+            }
+            Err(e) => match classify_ping_error(&e) {
+                PingFailure::SocketAbsent => tracker.record_socket_absent(),
+                PingFailure::NotTheAgent => {
+                    warn!(
+                        target: "watchdog.tamper",
+                        error = %e,
+                        socket = %socket_path.display(),
+                        agent_pid,
+                        "a process that is not the agent serves the admin socket — not \
+                         counted as an answer"
+                    );
+                    tracker.record_socket_absent()
+                }
+                PingFailure::Unresponsive => {
+                    warn!(
+                        target: "watchdog.status_ping",
+                        error = %e,
+                        socket = %socket_path.display(),
+                        consecutive = tracker.consecutive_timeouts(),
+                        "STATUS ping failed"
+                    );
+                    tracker.record_timeout()
+                }
+            },
+        };
         match outcome {
-            PingOutcome::Ok | PingOutcome::TimeoutOnce => {}
+            PingOutcome::Ok => {
+                if std::mem::take(&mut signalled) {
+                    info!(
+                        target: "watchdog.status_ping",
+                        agent_pid,
+                        "the agent answers again, its event loop moving"
+                    );
+                    sd_notify_status(&format!("supervising agent pid {agent_pid}"));
+                }
+            }
+            PingOutcome::TimeoutOnce => {}
+            PingOutcome::LoopStalled {
+                consecutive,
+                since_last_ms,
+            } => {
+                warn!(
+                    target: "watchdog.status_ping",
+                    agent_pid,
+                    consecutive,
+                    since_last_ms,
+                    "the agent answered, but its event loop made no round since the last ping"
+                );
+            }
+            PingOutcome::LoopStuck {
+                pings,
+                since_last_ms,
+            } => {
+                // Lab PR 216 (static review C-44 / TD-08): the socket
+                // answers, the loop does not move — a hang all the same.
+                error!(
+                    target: "watchdog.tamper",
+                    agent_pid,
+                    pings,
+                    since_last_ms,
+                    "the agent's event loop stands still while its admin socket answers — \
+                     signalling the main loop for stuck recovery"
+                );
+                if let Err(e) = record_hold(
+                    &holds,
+                    &event_loop_stalled_record(agent_pid, pings, since_last_ms, unix_now()),
+                ) {
+                    warn!(target: "watchdog.tamper", error = %e, "could not record the stalled event loop");
+                }
+                tracker.reset();
+                signalled = true;
+                if stuck_tx.send(agent_pid).await.is_err() {
+                    info!(
+                        target: "watchdog.status_ping",
+                        "main loop dropped stuck channel; ping task exiting"
+                    );
+                    return;
+                }
+            }
             PingOutcome::SocketAbsent { consecutive } => {
                 // Not a hang: never feed stuck recovery (it would SIGINT
                 // a healthy-but-misconfigured agent every 30 s forever).
@@ -861,6 +1238,7 @@ async fn run_ping_loop(
                      the agent answered) — signalling main loop for stuck recovery"
                 );
                 tracker.reset();
+                signalled = true;
                 if stuck_tx.send(agent_pid).await.is_err() {
                     // Main loop has dropped the receiver. Exit
                     // cleanly — no listener.

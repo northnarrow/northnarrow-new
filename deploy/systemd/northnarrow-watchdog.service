@@ -23,6 +23,16 @@ Wants=northnarrow-agent.service
 # (shutdown) still go through. Maintenance, inside the window: `systemctl
 # kill -s SIGTERM` (install.sh, uninstall.sh; docs/operator §3.7).
 RefuseManualStop=yes
+# Lab PR 216 (capability C23): the watchdog never stays down. No start
+# limit — systemd retries it forever (Restart=always below, with a backoff
+# growing to 60 s) — and each failed run is visible on its own: the
+# watchdog's `watchdog_exit` record (its exit status and why) and the
+# agent's `watchdog_gone`, both signed by the agent at its next round, and
+# the unit's NRestarts counter. OnFailure= still covers what leaves the unit
+# itself `failed` (a start or stop job systemd fails, not a death of the
+# process, which is restarted): its handler records `watchdog_failed`.
+StartLimitIntervalSec=0
+OnFailure=northnarrow-watchdog-failed.service
 # No Requires=sys-fs-bpf.mount: /sys/fs/bpf is an API VFS with no
 # materialisable mount unit (see northnarrow-agent.service). The
 # watchdog is ordered After= the agent, whose ExecStartPre= has already
@@ -57,14 +67,24 @@ ExecStart=/usr/local/bin/northnarrow-watchdog \
 # 64 MiB / 2-cap sandbox. --agent-bin is only consulted by the `exec`
 # backend (non-systemd hosts), where it overrides argv[0] of the full
 # argv the watchdog captures from /proc/<agent>/cmdline at boot.
-# Watchdog owns ITS OWN restart policy via systemd: if the
-# watchdog crashes (which would be a bug — W2 process-hardening
-# minimises the surface), systemd brings it back after 2 s. The
-# agent it was protecting is unaffected — the agent's
-# PROTECTED_PIDS entry persists across the watchdog's death
-# because the bpffs map pin is independent of the watchdog
-# process lifetime.
-Restart=on-failure
+# Watchdog owns ITS OWN restart policy via systemd. The agent it was
+# protecting is unaffected by its death — the agent's PROTECTED_PIDS entry
+# persists because the bpffs map pin is independent of the watchdog
+# process lifetime — and the agent signs that the watchdog is gone
+# (`watchdog_gone`).
+# Lab PR 216 (static review C-44 / G-05): Restart=always, except a stop the
+# watchdog was told to make. It exits 0 only then — SIGTERM/SIGINT (a
+# maintenance stop inside the trusted-installer window, a shutdown) or a
+# shutdown the admin quorum signed — and RestartPreventExitStatus=0 keeps
+# systemd from undoing it. Every failure has a non-zero status of its own
+# (watchdog/src/lib.rs `ExitReason`: 10 hardening, 11 no verified agent
+# within 30 s, 12 pidfile, 13 respawn backend, 14 READY=1, 15 signal
+# handlers, 20 the wait on the agent's pidfd) and leaves a `watchdog_exit`
+# record; a death by any signal (SIGKILL, SIGHUP, an abort) is restarted
+# too. With Restart=on-failure, "pidfd wait failed" exited 0 and was never
+# restarted, and a SIGHUP counted as a clean stop.
+Restart=always
+RestartPreventExitStatus=0
 # External audit EBPF-001: outside a signed trusted-installer window the
 # task_kill hook refuses systemd's signals; a stop job (shutdown) then ends
 # within TimeoutStopSec with the process still running, which ends with
@@ -72,7 +92,25 @@ Restart=on-failure
 # process left in the cgroup systemd refuses to start a second instance.
 TimeoutStopSec=5s
 SendSIGKILL=no
+# Backoff between restarts: 2 s, growing in 5 steps to 60 s, then every
+# 60 s for as long as it fails (systemd 254+; an older systemd ignores
+# RestartSteps=/RestartMaxDelaySec= with a warning and restarts every 2 s).
 RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+# Lab PR 216 (static review C-43): READY=1 follows the verified agent pidfd,
+# at most 30 s after the start (PIDFD_OPEN_RETRY_DEADLINE): the watchdog's
+# own deadline — exit 11, recorded — fires before systemd's.
+TimeoutStartSec=60s
+# Lab PR 216 (static review C-43 / G-06): no core dump. The watchdog is not
+# dumpable either (harden_self: PR_SET_DUMPABLE 0).
+LimitCORE=0
+# Lab PR 216: /run/northnarrow is created 0700 whichever unit starts first
+# (the agent's unit declares the same; Preserve keeps it shared across
+# restarts of either).
+RuntimeDirectory=northnarrow
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 
 # Resource ceilings per design §9 "Resource ceiling (V1 targets)":
 #   RSS ≤ 10 MB steady state. The whole binary is a tokio runtime

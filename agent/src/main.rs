@@ -782,6 +782,13 @@ fn main() -> Result<()> {
         }
     }
 
+    // Lab PR 216 (static review C-43 / G-06): from here on the process is
+    // the daemon, and it will hold its signing key — no core dump, no
+    // `/proc/<agent>/mem` for a reader without CAP_SYS_PTRACE. Before the
+    // runtime and before any key is read; reported once logging is up.
+    let undumpable = northnarrow_agent::process_hardening::forbid_core_dumps();
+    northnarrow_agent::loop_progress::start();
+
     // The runtime is the one `#[tokio::main]` built: multi-thread, every
     // driver. (External audit LLMR-009 built it by hand to pin the LLM
     // advisor's worker count first; the advisor was removed in lab PR 214.)
@@ -789,7 +796,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("building the tokio runtime")?
-        .block_on(run(cli))
+        .block_on(run(cli, undumpable))
 }
 
 impl Cli {
@@ -811,7 +818,7 @@ impl Cli {
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // Lab finding (external audit EBPF-001 work): when the log stream is
     // gone — journald@northnarrow stopped, at shutdown or by root — the
     // fmt layer reported the failed write with `eprintln!`, which panics
@@ -838,6 +845,14 @@ async fn run(cli: Cli) -> Result<()> {
         &cli.removed_flags(),
         &northnarrow_agent::removed_settings::removed_env_in_process(),
     );
+    // Lab PR 216: a failure is an ERROR, not a refusal to protect.
+    if let Err(e) = undumpable {
+        error!(
+            error = %e,
+            "could not forbid core dumps (PR_SET_DUMPABLE 0, RLIMIT_CORE 0): a crash may write \
+             the agent's memory, keys included, to disk"
+        );
+    }
     // External audit DEP-005 (NN-AUD-381): on a host where the unit's
     // memory cap cannot bind, the unit's OOMScoreAdjust=-500 is raised to 0
     // before anything grows (the self-integrity check expects it there).
@@ -1974,11 +1989,16 @@ async fn run(cli: Cli) -> Result<()> {
     // fail toward over-triggering, never under-triggering. Only wired
     // when the posture machine actually carries the exemption (the
     // dev-mode `PostureMachine::new()` branch has none).
+    // Lab PR 216: the signed log the refresh reports a vanished watchdog
+    // to, set once it is open (below).
+    let watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>> =
+        Arc::new(std::sync::OnceLock::new());
     if isolator.is_some() {
         spawn_watchdog_exempt_refresh(
             exempt.clone(),
             cli.watchdog_pidfile.clone(),
             cli.resolved_watchdog_exe(),
+            Arc::clone(&watchdog_audit),
         );
     }
     // External audit EBPF-001: PID 1 may signal the agent at the very end
@@ -2311,6 +2331,8 @@ async fn run(cli: Cli) -> Result<()> {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
+    // Lab PR 216: and the watchdog refresh, to sign a watchdog that is gone.
+    let _ = watchdog_audit.set(audit_log.clone());
     // External audit ATP-017 (NN-AUD-265): the `link_*` entries of the pin
     // root that are not the agent's links, one signed `integrity_drift` each.
     northnarrow_agent::anti_tamper::bpf_defense::attest_foreign_pins(audit_log.as_ref());
@@ -3792,6 +3814,10 @@ async fn run(cli: Cli) -> Result<()> {
     let mut pump_check = tokio::time::interval(PUMP_CHECK_PERIOD);
     pump_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Lab PR 216: one round of the loop, for the watchdog's progress
+        // check — `pump_check` brings a round at least every 5 s on an idle
+        // host, so a count that stands still is a loop that does.
+        northnarrow_agent::loop_progress::tick();
         tokio::select! {
             evt = sensor.next_event() => match evt {
                 Some(e) => {
@@ -3829,6 +3855,8 @@ async fn run(cli: Cli) -> Result<()> {
                 debug_abort_pump(&sensor, &cli.admin_socket);
                 #[cfg(feature = "debug-trigger")]
                 debug_protected_query(&debug_guard, &cli.admin_socket);
+                #[cfg(feature = "debug-trigger")]
+                debug_stall_loop(&cli.admin_socket);
                 let dead = sensor.finished_pumps();
                 if !dead.is_empty() {
                     // A blind sensor is not hidden behind a silent restart:
@@ -4013,6 +4041,29 @@ fn debug_protected_query(
             "debug-trigger: COMBAT guard query (lab test of CMB-022)"
         );
     }
+}
+
+/// `debug-trigger` builds only: a file `debug-stall-loop` next to the admin
+/// socket, holding a number of seconds (at most 600), blocks the event loop
+/// that long — the admin socket, on other workers, keeps answering. Lab
+/// check of lab PR 216: the watchdog must see the loop stand still
+/// (`event_loop_stalled`) and recover the agent.
+#[cfg(feature = "debug-trigger")]
+fn debug_stall_loop(admin_socket: &std::path::Path) {
+    let Some(dir) = admin_socket.parent() else {
+        return;
+    };
+    let trigger = dir.join("debug-stall-loop");
+    let Ok(text) = std::fs::read_to_string(&trigger) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&trigger);
+    let secs = text.trim().parse::<u64>().unwrap_or(0).min(600);
+    warn!(
+        secs,
+        "debug-trigger: the event loop stalls on request (lab test of lab PR 216)"
+    );
+    std::thread::sleep(Duration::from_secs(secs));
 }
 
 /// `debug-trigger` builds only: a file `debug-abort-pump` next to the admin
@@ -5075,7 +5126,15 @@ fn spawn_shutdown_exe_refresh() {
     });
 }
 
-fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_exe: PathBuf) {
+/// The signed audit log, as the watchdog refresh gets it once it is open.
+type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
+
+fn spawn_watchdog_exempt_refresh(
+    exempt: ExemptPids,
+    pidfile: PathBuf,
+    expected_exe: PathBuf,
+    audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
         // Last verified PID we stored (`None` == exemption cleared).
@@ -5127,6 +5186,12 @@ fn spawn_watchdog_exempt_refresh(exempt: ExemptPids, pidfile: PathBuf, expected_
             // a deleted or rewritten pidfile alone does not unprotect the
             // watchdog that still runs.
             if let Some(prev) = last {
+                // Lab PR 216: a watchdog gone is signed, once per pid.
+                if !runs_watchdog_binary(prev, &expected_exe) {
+                    let f = northnarrow_agent::self_integrity::watchdog_gone(prev, &resolution);
+                    let log = audit.get().and_then(|l| l.as_ref());
+                    northnarrow_agent::self_integrity::report_event(log, &f);
+                }
                 withdraw_watchdog_pid(bpffs_root, prev, &expected_exe);
             }
             if let Some(p) = new_pid {

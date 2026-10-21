@@ -437,7 +437,7 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 
 | `kind` | Meaning |
 |---|---|
-| `unit_dropin` | a `.conf` drop-in for one of the two units that `install.sh` did not create, in any directory of systemd's unit search path (`/etc`, `/run` and `/usr/lib/systemd/system`, `system.control`, `transient`, `system.attached`, the generator directories; also `northnarrow-.service.d` and `service.d`), or its own Debian drop-in with content other than the shipped `deploy/systemd/10-debian-perf-paranoid.conf` (lab PR 180) |
+| `unit_dropin` | a `.conf` drop-in for one of the units (the agent's, the watchdog's and, since lab PR 216, the watchdog's `OnFailure=` handler `northnarrow-watchdog-failed.service`) that `install.sh` did not create, in any directory of systemd's unit search path (`/etc`, `/run` and `/usr/lib/systemd/system`, `system.control`, `transient`, `system.attached`, the generator directories; also `northnarrow-.service.d` and `service.d`), or its own Debian drop-in with content other than the shipped `deploy/systemd/10-debian-perf-paranoid.conf` (lab PR 180) |
 | `limit_changed` | `oom_score_adj`, `memory.max`, `pids.max`, `cpu.max` or `cgroup.freeze` differs from boot |
 | `mount_over_protected` | a mount over the config, state, runtime, pin, unit or binary paths (host view), or — laid after the agent started — over a directory above them (a tmpfs over `/var/lib`, a bind over `/etc` or `/usr/local/bin`, a second bpffs on `/sys/fs/bpf`: the detail says what it hides; lab PR 180) |
 | `protected_mount_gone` | a mount those paths resolved through when the agent started is no longer mounted (a lazy unmount of a separate `/var`, of `/sys/fs/bpf`): they now resolve through the mount below (lab PR 180) |
@@ -448,7 +448,12 @@ sudo nn-admin audit verify && sudo grep '"op":"integrity_drift"' /etc/northnarro
 | `config_overlay` | a `*.local` overlay in `/etc/northnarrow`, with size and hash |
 | `weakening_env` | the agent started with a variable that turns a protection off or cuts the evidence it keeps (`NN_ANTI_TAMPER_ALLOW_DEGRADED`, `NN_BPF_DEFENSE_OBSERVE=1`, `NN_DETECT_ONLY=1/true/yes`, a `NN_TELEMETRY_PROBE_SECS` of 0 or above 60, any `NN_*_CAP_BYTES` override, …) |
 | `agent_stalled` | the agent did not run for more than 15 s past a check (cgroup freeze, stopped VM, starvation) |
-| `watchdog_hold` | while the agent was down the watchdog stopped respawning it: a start that brought no agent back within 30 s (the unit failed — its `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` without bpffs — or was stopped or skipped; the record carries systemd's `ActiveState`/`SubState`/`Result`/`ConditionResult`/`AssertResult`), a failed `systemctl start`, or the restart ceiling. Signed at the agent's next start (external audit DEP-004) |
+| `watchdog_hold` | while the agent was down the watchdog stopped respawning it: a start that brought no agent back within 30 s (the unit failed — its `ExecStartPre=/usr/bin/mountpoint -q /sys/fs/bpf` without bpffs — or was stopped or skipped; the record carries systemd's `ActiveState`/`SubState`/`Result`/`ConditionResult`/`AssertResult`), a failed `systemctl start`, or the restart ceiling. Signed at the agent's next start (external audit DEP-004). Since lab PR 216 also each bounded retry of a hold (`hold_retry`) and its end, with its length (`hold_ended`) |
+| `watchdog_exit` | the watchdog exited on a failure, with its exit status and reason (§3.9); systemd restarts it, as often as it fails (one record per run). Written by the watchdog just before it exits (lab PR 216) |
+| `watchdog_failed` | systemd put `northnarrow-watchdog.service` in the failed state — a start or stop job of the unit failed (a death of the process is restarted, without limit) — and no longer restarts it: the agent runs without a supervisor until the unit is started. Written by the unit's `OnFailure=` handler with systemd's `service_result`, `exit_code` and `exit_status` (lab PR 216, §3.9) |
+| `watchdog_gone` | the watchdog the agent had verified no longer runs (a crash, a kill, a stop), and what the agent finds in its place. Signed by the agent itself, within 30 s (lab PR 216) |
+| `stuck_recovery_failed` | the agent stopped answering (or its event loop stood still) and the watchdog's SIGINT then SIGKILL could not end it: the agent kept its `PROTECTED_PIDS` entry and its pidfile and stays supervised (lab PR 216) |
+| `event_loop_stalled` | the agent's admin socket answered three STATUS pings in a row while its event loop made no round (90 s or more); the watchdog recovers it like a hang (lab PR 216) |
 
 The memory limits are absolute (`MemoryHigh=9G`, `MemoryMax=11G`, sized
 for the model of the LLM advisor, removed in Wave 4, and not re-sized yet:
@@ -608,6 +613,93 @@ before writing.
 The agent registers itself in the pinned `PROTECTED_PIDS` before its boot
 creates anything, so a restarted agent is not refused the files and map
 pins it recreates by its predecessor's hooks.
+
+### 3.9 When the watchdog fails (lab PR 216)
+
+The watchdog supervises the agent; since lab PR 216 its own failures are
+visible too (capability C23; static review C-43, C-44).
+
+**Exit statuses.** The watchdog exits 0 only for a stop it was told to
+make: SIGTERM or SIGINT (a maintenance stop inside the trusted-installer
+window, a shutdown) or a shutdown signed by the admin quorum. Every failure
+has its own status, logged as `watchdog EXITING on a failure` on
+`watchdog.tamper` and recorded for the agent to sign (`watchdog_exit`):
+
+| status | reason |
+|---|---|
+| 0 | stopped (signal, or an admin-signed shutdown) |
+| 1 | an error without a status of its own (none is known) |
+| 2 | the command line was refused |
+| 10 | process hardening (`prctl`) failed |
+| 11 | no verified agent within 30 s of the start |
+| 12 | the watchdog's pidfile could not be written |
+| 13 | the respawn backend could not be set up |
+| 14 | `READY=1` could not be sent to systemd |
+| 15 | the signal handlers could not be installed |
+| 20 | the wait on the agent's pidfd failed (it used to exit 0, and was never restarted) |
+| 30 | `--record-unit-failure`: the record could not be written |
+
+**Restarts.** The watchdog never stays down.
+`northnarrow-watchdog.service` has `Restart=always` with
+`RestartPreventExitStatus=0` and no start limit (`StartLimitIntervalSec=0`):
+every failure and every death by a signal (SIGKILL, SIGHUP, an abort) is
+restarted, for as long as it fails; a stop is not. The delay grows from 2 s
+to 60 s and stays there (`RestartSteps=5`, `RestartMaxDelaySec=60s`;
+systemd 254+, an older systemd restarts every 2 s and logs the two keys as
+unknown). Each failed run is visible on its own: the watchdog's
+`watchdog_exit` record (its status and why), the agent's `watchdog_gone`
+(the watchdog it had verified no longer runs, whatever ended it), both
+signed within about 30 s, and the unit's restart counter:
+
+```sh
+systemctl show -p NRestarts,ExecMainStatus,StatusText northnarrow-watchdog
+journalctl --namespace=northnarrow -u northnarrow-watchdog -p err
+sudo grep '"op":"integrity_drift"' /etc/northnarrow/audit.log | grep -E 'watchdog_(exit|gone)'
+```
+
+A watchdog that keeps failing is restarted every minute and leaves one
+record per run: fix the cause the records name. `OnFailure=` still covers
+what leaves the unit itself `failed` — a start or stop job systemd fails,
+not a death of the process: `northnarrow-watchdog-failed.service` records
+`watchdog_failed` with systemd's result, the agent signs it, and
+`systemctl start northnarrow-watchdog` brings the watchdog back.
+
+**Liveness.** The STATUS ping is answered by the agent's admin socket,
+which runs beside its event loop: a loop stuck behind one event answered
+every ping. Each ping now also asks for the loop's round count (`LoopProgress`,
+unsigned; the loop goes round at least every 5 s). Three answers in a row with
+the count unchanged since the answer before them — 90 s or more without a
+round — are a stuck agent (`event_loop_stalled`, then the SIGINT / SIGKILL
+recovery). An agent older than lab PR 216 closes the
+connection at that request; the watchdog then counts its STATUS answer
+alone, as before, and logs it once.
+
+**A recovery that fails does not unprotect.** The watchdog evicts the
+agent's pid from `PROTECTED_PIDS` only after its pidfd reports the exit.
+When the SIGINT or the SIGKILL is refused, or the agent has not exited 10 s
+after the SIGKILL, the agent keeps its entry and its pidfile, the watchdog
+keeps watching it and tries again at the next stuck signal; the unit's
+status reads `DEGRADED: agent pid … unresponsive and could not be stopped`
+and the agent signs `stuck_recovery_failed`.
+
+**The hold is bounded.** After the restart ceiling (5 restarts in 60 s) or
+a respawn that brings no agent back, the watchdog still holds — alive,
+protected, no respawn loop — but its `STATUS=` line says for how long and
+when it retries, an ERROR repeats every 10 minutes, and it starts the agent
+once more after 10 minutes, then 20, 40 and at most every hour
+(`hold_retry`). Starting the agent yourself ends the hold at once, as
+before (`hold_ended` records its length).
+
+**No core dumps.** The agent and the watchdog are not dumpable
+(`PR_SET_DUMPABLE` 0 at their start; the agent also sets `RLIMIT_CORE` 0)
+and the units set `LimitCORE=0`: a crash writes no memory to disk, and
+`/proc/<pid>/mem`, `environ` and `maps` are closed to a process without
+`CAP_SYS_PTRACE`. `/run/northnarrow` is 0700 whoever creates it (both units
+and the handler declare `RuntimeDirectoryMode=0700`; `install.sh` and the
+watchdog create it 0700). Each unit bounds its start: `TimeoutStartSec=180s`
+for the agent (its `READY=1` follows the eBPF attach and the ADE load),
+`60s` for the watchdog (its own 30-s deadline for a verified agent fires
+first).
 
 ## 4. What still needs a reboot
 

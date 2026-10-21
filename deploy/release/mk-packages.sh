@@ -6,7 +6,7 @@
 #
 # Layout (review 26):
 #   /usr/bin/{northnarrow-agent,northnarrow-watchdog,nn-admin}
-#   /usr/lib/systemd/system/northnarrow-{agent,watchdog}.service  (rewritten for /usr/bin)
+#   /usr/lib/systemd/system/northnarrow-{agent,watchdog,watchdog-failed}.service  (rewritten for /usr/bin)
 #   /usr/share/northnarrow/   data tree `install.sh --package-configure` reads:
 #                             deploy/{install,uninstall}.sh, deploy/systemd/, configs/,
 #                             and the eBPF object the install manifest hashes
@@ -73,7 +73,7 @@ install -d "$root/usr/bin" "$root/usr/lib/systemd/system" \
     "$root/usr/share/doc/northnarrow/operator"
 install -m 0755 target/release/northnarrow-agent target/release/northnarrow-watchdog target/release/nn-admin \
     "$root/usr/bin/"
-for u in northnarrow-agent northnarrow-watchdog; do
+for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     sed 's#/usr/local/bin/#/usr/bin/#g' "deploy/systemd/$u.service" > "$root/usr/lib/systemd/system/$u.service"
     chmod 0644 "$root/usr/lib/systemd/system/$u.service"
 done
@@ -183,6 +183,7 @@ $(body postrm)
 /usr/bin/nn-admin
 /usr/lib/systemd/system/northnarrow-agent.service
 /usr/lib/systemd/system/northnarrow-watchdog.service
+/usr/lib/systemd/system/northnarrow-watchdog-failed.service
 /usr/share/northnarrow
 %doc /usr/share/doc/northnarrow
 EOT

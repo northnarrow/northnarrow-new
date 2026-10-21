@@ -65,7 +65,7 @@ pub enum RespawnBackend {
 | Agent unit masked / disabled by an attacker | `systemctl start` fails → same as above, plus a dedicated `watchdog.respawn unit_masked=true` line. Unit files are in PROTECTED_INODES (Tappa 9 C7) so masking requires defeating the FS deny first. |
 | Agent crashes during its own argv parse | identical to §5.3: ceiling trips, `failed` state visible, journal explains. |
 | Operator `systemctl stop northnarrow-agent` | agent writes the shutdown marker on a signed stop (A8) → watchdog stands down. An **unsigned** stop (plain `systemctl stop` without the admin token) is, by Tappa 8 design, indistinguishable from a kill: the watchdog respawns. This is unchanged from today and is the intended anti-tamper posture. |
-| Watchdog crashes mid-respawn | systemd restarts the watchdog (`Restart=on-failure`); the queued `systemctl start` job completes independently; new watchdog adopts the new agent via pidfile (§7.3). Better than today, where a watchdog crash killed the child agent with it. |
+| Watchdog crashes mid-respawn | systemd restarts the watchdog (`Restart=on-failure`; since lab PR 216 `Restart=always` without a start limit, and an `OnFailure=` record); the queued `systemctl start` job completes independently; new watchdog adopts the new agent via pidfile (§7.3). Better than today, where a watchdog crash killed the child agent with it. |
 | Non-systemd host | `--respawn-backend exec` with full argv (§3.1). |
 
 ## 4. Tests

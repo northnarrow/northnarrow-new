@@ -145,7 +145,7 @@ start_agent_for_window() {
 
 echo "NorthNarrow uninstall"
 echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin}"
-echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog}.service"
+echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog,watchdog-failed}.service"
 echo "  bpffs    : $BPFFS_ROOT"
 if (( PURGE )); then
     echo "  PURGE    : $ETC_DIR (admin keys, audit chain, agent identity)"
@@ -329,7 +329,7 @@ done
 for b in northnarrow-agent northnarrow-watchdog nn-admin; do
     [[ -e "$BIN_DIR/$b" ]] && { log "removing $BIN_DIR/$b"; rm -f "$BIN_DIR/$b"; }
 done
-for u in northnarrow-agent northnarrow-watchdog; do
+for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     [[ -e "$UNIT_DIR/$u.service" ]] && { log "removing $UNIT_DIR/$u.service"; rm -f "$UNIT_DIR/$u.service"; }
 done
 rm -rf "$DROPIN_ROOT/northnarrow-agent.service.d" "$DROPIN_ROOT/northnarrow-watchdog.service.d" 2>/dev/null || true

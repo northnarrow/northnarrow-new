@@ -40,7 +40,8 @@ fn watchdog_unit_has_no_bindsto_and_wants_the_agent() {
     );
     assert_eq!(value(&d, "Wants"), Some("northnarrow-agent.service"));
     assert_eq!(value(&d, "After"), Some("northnarrow-agent.service"));
-    assert_eq!(value(&d, "Restart"), Some("on-failure"));
+    // Lab PR 216: restarted on every failure (see below).
+    assert_eq!(value(&d, "Restart"), Some("always"));
 }
 
 #[test]
@@ -197,7 +198,7 @@ fn agent_unit_asserts_bpffs() {
     );
     assert!(
         value(&d, "OnFailure").is_none(),
-        "no failure handler unit ships in deploy/systemd"
+        "the watchdog restarts the agent; only the watchdog's unit has a failure handler"
     );
 }
 
@@ -228,6 +229,282 @@ fn both_units_set_a_path_without_usr_local() {
             "{name}: an EnvironmentFile could set PATH again"
         );
     }
+}
+
+// ── Lab PR 216 (capability C23): fail-visible supervision ──────────────
+
+const WATCHDOG: &str = "northnarrow-watchdog.service";
+const AGENT: &str = "northnarrow-agent.service";
+const HANDLER: &str = "northnarrow-watchdog-failed.service";
+
+/// `60s`, `10min`, `5` → seconds.
+fn secs(v: &str) -> u64 {
+    let v = v.trim();
+    let (num, mult) = if let Some(n) = v.strip_suffix("min") {
+        (n, 60)
+    } else if let Some(n) = v.strip_suffix('s') {
+        (n, 1)
+    } else {
+        (v, 1)
+    };
+    num.trim()
+        .parse::<u64>()
+        .unwrap_or_else(|e| panic!("{v}: {e}"))
+        * mult
+}
+
+/// The `[section]` of a unit, as directives.
+fn section_directives(body: &str, section: &str) -> Vec<(String, String)> {
+    let mut inside = false;
+    let mut kept = String::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            inside = t == format!("[{section}]");
+            continue;
+        }
+        if inside {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    directives(&kept)
+}
+
+/// Static review C-44 / G-05: "pidfd wait failed" exited 0 and
+/// `Restart=on-failure` never restarted the watchdog. Every failure is now
+/// a non-zero status of its own and the unit restarts on all of them — and
+/// on a death by any signal — but not on 0, the stop it was told to make.
+/// It never stays down (the maintainer's decision): no start limit, a
+/// backoff that grows to 60 s and stays there, each failed run recorded by
+/// the watchdog (`watchdog_exit`) and the agent (`watchdog_gone`).
+/// `OnFailure=` still records what fails the unit itself.
+#[test]
+fn the_watchdog_restarts_on_every_failure_but_not_after_a_stop() {
+    use northnarrow_watchdog::ExitReason;
+    let body = unit(WATCHDOG);
+    let d = directives(&body);
+    assert_eq!(value(&d, "Restart"), Some("always"));
+    assert_eq!(
+        value(&d, "RestartPreventExitStatus"),
+        Some("0"),
+        "only a stop the watchdog was told to make is not restarted"
+    );
+    for r in ExitReason::ALL {
+        assert_eq!(
+            r.code() == 0,
+            r == ExitReason::Stopped,
+            "{r:?}: only Stopped may share the prevented status"
+        );
+    }
+    assert!(
+        value(&d, "SuccessExitStatus").is_none(),
+        "no failure passes as success"
+    );
+    // backoff between restarts
+    let first = secs(value(&d, "RestartSec").expect("RestartSec"));
+    let max = secs(value(&d, "RestartMaxDelaySec").expect("RestartMaxDelaySec"));
+    let steps: u32 = value(&d, "RestartSteps")
+        .expect("RestartSteps")
+        .parse()
+        .unwrap();
+    assert!(
+        first >= 1 && max > first && max <= 300 && steps >= 1,
+        "{first} {max} {steps}"
+    );
+    // no start limit: in [Unit] (systemd ignores it in [Service]), 0
+    let u = section_directives(&body, "Unit");
+    assert_eq!(
+        value(&u, "StartLimitIntervalSec"),
+        Some("0"),
+        "the watchdog never stays down: systemd retries it forever"
+    );
+    assert!(
+        value(&u, "StartLimitBurst").is_none(),
+        "no burst without an interval"
+    );
+    assert_eq!(value(&u, "OnFailure"), Some(HANDLER));
+    assert!(section_directives(&body, "Service")
+        .iter()
+        .all(|(k, _)| k != "OnFailure" && !k.starts_with("StartLimit")));
+}
+
+/// Static review C-43 / G-06: no core dump from any unit, and each start
+/// is bounded. The watchdog's own deadline for a verified agent (30 s,
+/// exit 11, recorded) fires before systemd's start timeout; the agent's is
+/// explicit and not below systemd's default (the task_kill hook refuses
+/// the SIGTERM that follows a start timeout).
+#[test]
+fn every_unit_forbids_core_dumps_and_bounds_its_start() {
+    for name in [AGENT, WATCHDOG, HANDLER] {
+        let d = directives(&unit(name));
+        assert_eq!(value(&d, "LimitCORE"), Some("0"), "{name}");
+        assert!(
+            value(&d, "TimeoutStartSec").is_some(),
+            "{name}: explicit start timeout"
+        );
+        assert_ne!(value(&d, "TimeoutStartSec"), Some("infinity"), "{name}");
+    }
+    let w = directives(&unit(WATCHDOG));
+    let w_start = secs(value(&w, "TimeoutStartSec").unwrap());
+    assert!(
+        w_start > northnarrow_watchdog::PIDFD_OPEN_RETRY_DEADLINE.as_secs(),
+        "{w_start} s: the watchdog's own deadline must fire first"
+    );
+    let a = directives(&unit(AGENT));
+    let a_start = secs(value(&a, "TimeoutStartSec").unwrap());
+    assert!((90..=600).contains(&a_start), "{a_start}");
+}
+
+/// Static review C-43: `/run/northnarrow` is 0700 whichever unit creates
+/// it, and kept across restarts (it is shared).
+#[test]
+fn every_unit_creates_the_run_directory_0700() {
+    for name in [AGENT, WATCHDOG, HANDLER] {
+        let d = directives(&unit(name));
+        assert_eq!(value(&d, "RuntimeDirectory"), Some("northnarrow"), "{name}");
+        assert_eq!(value(&d, "RuntimeDirectoryMode"), Some("0700"), "{name}");
+        assert_eq!(value(&d, "RuntimeDirectoryPreserve"), Some("yes"), "{name}");
+    }
+    assert_eq!(
+        northnarrow_watchdog::RUN_DIR_MODE,
+        0o700,
+        "the watchdog creates it with the same mode"
+    );
+}
+
+/// The `OnFailure=` handler: a oneshot that runs the watchdog's record
+/// mode, started only by `OnFailure=` (no `[Install]`), with no capability
+/// and nothing writable but `/run/northnarrow`.
+#[test]
+fn the_failure_handler_only_records() {
+    let body = unit(HANDLER);
+    let d = directives(&body);
+    assert_eq!(value(&d, "Type"), Some("oneshot"));
+    let exec = value(&d, "ExecStart").expect("ExecStart");
+    assert!(
+        exec.starts_with("/usr/local/bin/northnarrow-watchdog --record-unit-failure"),
+        "{exec}"
+    );
+    assert!(
+        body.lines().all(|l| l.trim() != "[Install]"),
+        "never enabled, only OnFailure= starts it"
+    );
+    assert_eq!(value(&d, "CapabilityBoundingSet"), Some(""));
+    assert_eq!(value(&d, "ReadWritePaths"), Some("/run/northnarrow"));
+    assert_eq!(value(&d, "ProtectSystem"), Some("strict"));
+    assert_eq!(value(&d, "NoNewPrivileges"), Some("true"));
+    assert_eq!(value(&d, "PrivateNetwork"), Some("true"));
+    assert_eq!(value(&d, "LogNamespace"), Some("northnarrow"));
+    assert!(value(&d, "Restart").is_none() && value(&d, "OnFailure").is_none());
+    assert!(
+        d.iter()
+            .any(|(k, v)| k == "Environment" && v == "PATH=/usr/sbin:/usr/bin:/sbin:/bin"),
+        "same search path as the other units"
+    );
+}
+
+/// The executables a unit names (`ExecStart=`, `ExecStartPre=`, …).
+fn executables(body: &str) -> Vec<String> {
+    directives(body)
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("Exec"))
+        .filter_map(|(_, v)| {
+            v.trim_start_matches(['-', '@', ':', '+', '!'])
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// `systemd-analyze verify` of the three units, offline: a scratch root
+/// holds them under `etc/systemd/system`, a copy of this host's unit
+/// directory (the dependencies `LogNamespace=` and the default targets
+/// pull in) and stub executables at the paths they name. Any warning fails
+/// it, except, on systemd before 254, the two backoff keys it does not
+/// know. Skipped where `systemd-analyze` or a unit directory is missing.
+#[test]
+fn the_units_pass_systemd_analyze_verify() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let Ok(version) = Command::new("systemd-analyze").arg("--version").output() else {
+        eprintln!("skipped: no systemd-analyze on this host");
+        return;
+    };
+    let vendor = ["/usr/lib/systemd/system", "/lib/systemd/system"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.join("sysinit.target").exists());
+    let Some(vendor) = vendor else {
+        eprintln!("skipped: no systemd unit directory on this host");
+        return;
+    };
+    let major: u32 = String::from_utf8_lossy(&version.stdout)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let root = tempfile::tempdir().unwrap();
+    let units = root.path().join("etc/systemd/system");
+    std::fs::create_dir_all(&units).unwrap();
+    std::fs::create_dir_all(root.path().join("usr/lib/systemd")).unwrap();
+    let cp = Command::new("cp")
+        .arg("-a")
+        .arg(&vendor)
+        .arg(root.path().join("usr/lib/systemd/"))
+        .status()
+        .expect("cp runs");
+    assert!(cp.success(), "copying {}", vendor.display());
+    let mut args = Vec::new();
+    for name in [AGENT, WATCHDOG, HANDLER] {
+        let body = unit(name);
+        std::fs::write(units.join(name), &body).unwrap();
+        for exe in executables(&body) {
+            let stub = root.path().join(exe.trim_start_matches('/'));
+            std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+            std::fs::write(&stub, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        args.push(units.join(name));
+    }
+    let out = Command::new("systemd-analyze")
+        .arg("verify")
+        .arg("--man=no")
+        .arg(format!("--root={}", root.path().display()))
+        .args(&args)
+        .output()
+        .expect("systemd-analyze runs");
+    let text =
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    // The host's vendor units are copied as they are: a unit that is an
+    // absolute symlink into a tree outside it (dracut's on hosts that build
+    // the initramfs with dracut, systemd 259 on the CI runner) dangles under
+    // --root. That is the copy, not one of ours.
+    let dangling = format!(
+        ": Failed to open {}/usr/lib/systemd/system/",
+        root.path().display()
+    );
+    let complaints: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| {
+            !(l.contains(&dangling)
+                && l.ends_with("No such file or directory")
+                && !l.starts_with("northnarrow"))
+        })
+        .filter(|l| {
+            !(major < 254
+                && (l.contains("Unknown key name 'RestartSteps'")
+                    || l.contains("Unknown key name 'RestartMaxDelaySec'")))
+        })
+        .collect();
+    assert!(
+        out.status.success() && complaints.is_empty(),
+        "systemd {major}: {:?}\n{}",
+        out.status,
+        complaints.join("\n")
+    );
 }
 
 // ── package hooks: the rollback restart (external audit DEP-010) ──────
