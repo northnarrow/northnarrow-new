@@ -15,6 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 mod btf_check;
+mod gate_report;
 
 const EBPF_TARGET: &str = "bpfel-unknown-none";
 const EBPF_PACKAGE: &str = "northnarrow-agent-ebpf";
@@ -75,6 +76,57 @@ enum Cmd {
     InspectEbpf,
     // `ade-demo` and `rag-kb` (the LLM advisor's demo and its knowledge
     // base) were removed with the advisor in Wave 4, lab PR 214.
+    /// Lab PR 227: judge one guest's privileged-suite run from the output
+    /// of `deploy/lab/nn-lab.sh test-ignored` — suites, passed, failed,
+    /// ignored, the expected failures of deploy/lab/expected-failures.tsv
+    /// shown with their outcome — and write gate-summary.json (and the
+    /// Markdown of the CI job summary). Exits 1 when the gate fails.
+    GateSummary {
+        /// The saved output of `nn-lab.sh test-ignored` (stdout and stderr).
+        /// Missing: the gate did not run, and the summary says so.
+        #[arg(long)]
+        log: PathBuf,
+        /// The guest (NN_LAB_DISTRO); selects the expected failures.
+        #[arg(long)]
+        distro: String,
+        /// The guest's kernel (`uname -r`).
+        #[arg(long, default_value = "")]
+        kernel: String,
+        /// The exit status of `nn-lab.sh test-ignored`.
+        #[arg(long)]
+        rc: Option<i32>,
+        /// The workflow's steps before the summary, `NAME=OUTCOME`
+        /// (`steps.<id>.outcome`), repeated; any outcome but `success`
+        /// fails the gate.
+        #[arg(long = "step", value_name = "NAME=OUTCOME")]
+        steps: Vec<String>,
+        /// The tested commit.
+        #[arg(long, default_value = "")]
+        commit: String,
+        /// The workflow run.
+        #[arg(long, default_value = "")]
+        run_url: String,
+        #[arg(long, default_value = "deploy/lab/expected-failures.tsv")]
+        expected: PathBuf,
+        /// Where the machine-readable summary goes.
+        #[arg(long, default_value = gate_report::SUMMARY_FILE)]
+        json: PathBuf,
+        /// Where the job summary's Markdown goes.
+        #[arg(long)]
+        markdown: Option<PathBuf>,
+    },
+    /// Lab PR 227: one Markdown table (a row per guest kernel) from
+    /// gate-summary.json files or the directories holding them, e.g. the
+    /// artefacts of a lab-vm run (`gh run download <run id> -D DIR`), for
+    /// the maintainer to commit under docs/validation/results/.
+    GateReport {
+        /// gate-summary.json files, or directories searched for them.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Write the report here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -112,6 +164,104 @@ fn run(cli: Cli) -> Result<()> {
             run_agent(release, no_sudo, &args)?;
         }
         Cmd::InspectEbpf => inspect_ebpf()?,
+        Cmd::GateSummary {
+            log,
+            distro,
+            kernel,
+            rc,
+            steps,
+            commit,
+            run_url,
+            expected,
+            json,
+            markdown,
+        } => gate_summary(GateSummaryArgs {
+            log,
+            distro,
+            kernel,
+            rc,
+            steps,
+            commit,
+            run_url,
+            expected,
+            json,
+            markdown,
+        })?,
+        Cmd::GateReport { paths, out } => {
+            let mut summaries = Vec::new();
+            for p in gate_report::find_summaries(&paths)? {
+                summaries.push(gate_report::read_summary(&p)?);
+            }
+            let md = gate_report::report_markdown(&summaries);
+            match out {
+                Some(path) => write_creating_dirs(&path, &md)?,
+                None => print!("{md}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_creating_dirs(path: &Path, text: &str) -> Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+struct GateSummaryArgs {
+    log: PathBuf,
+    distro: String,
+    kernel: String,
+    rc: Option<i32>,
+    steps: Vec<String>,
+    commit: String,
+    run_url: String,
+    expected: PathBuf,
+    json: PathBuf,
+    markdown: Option<PathBuf>,
+}
+
+/// `cargo xtask gate-summary`: the files first, the verdict last, so a
+/// failed gate still leaves its summary for the job summary and the
+/// artefacts.
+fn gate_summary(a: GateSummaryArgs) -> Result<()> {
+    let expected_text = std::fs::read_to_string(&a.expected)
+        .with_context(|| format!("reading {}", a.expected.display()))?;
+    let expected = gate_report::parse_expected(&expected_text)
+        .with_context(|| format!("in {}", a.expected.display()))?;
+    let log = match std::fs::read(&a.log) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", a.log.display())),
+    };
+    let steps = a
+        .steps
+        .iter()
+        .map(|s| gate_report::parse_step(s))
+        .collect::<Result<Vec<_>>>()?;
+    let inputs = gate_report::Inputs {
+        distro: a.distro,
+        kernel: a.kernel,
+        commit: a.commit,
+        run_url: a.run_url,
+        exit_status: a.rc,
+        steps,
+    };
+    let summary = gate_report::evaluate(&inputs, log.as_deref(), &expected);
+    let json = serde_json::to_string_pretty(&summary)? + "\n";
+    write_creating_dirs(&a.json, &json)?;
+    let md = gate_report::job_markdown(&summary);
+    if let Some(path) = &a.markdown {
+        write_creating_dirs(path, &md)?;
+    }
+    eprint!("{md}");
+    if !summary.passed() {
+        bail!(
+            "the privileged-suite gate failed on {}: {}",
+            summary.distro,
+            summary.reasons.join("; ")
+        );
     }
     Ok(())
 }

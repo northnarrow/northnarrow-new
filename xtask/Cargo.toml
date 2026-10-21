@@ -21,15 +21,18 @@ aya-obj = "0.2"
 # agent/build.rs verifies it. Same crate on both sides so the hash is
 # computed identically (see ebpf-guard crate docs).
 ebpf-guard = { path = "../ebpf-guard" }
-
-[dev-dependencies]
-# The tests' own parsers and clock: JSON fixtures of the lab records, the
-# committed workflow files (YAML), the dates of the advisory exceptions,
-# of security.txt and of the install stamps. (ureq, serde, sha2, flate2 and tar, and
-# these three as normal dependencies, served `cargo xtask rag-kb`, the LLM
-# advisor's knowledge base, removed in Wave 4 with lab PR 214.)
+# `cargo xtask gate-summary` / `gate-report` (lab PR 227): gate-summary.json
+# written and read back, with the time it was made. All three were already
+# in Cargo.lock (the agent's); no new crate.
+serde = { workspace = true }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+# The tests' own parser of the committed workflow files (YAML); JSON and
+# the clock come from the dependencies above (the lab records' fixtures,
+# the dates of the advisory exceptions, of security.txt and of the install
+# stamps).
 # serde_yaml (dtolnay) was archived 2024-11; serde_yaml_ng is the
 # actively-maintained drop-in fork (owner ruling, 2026-05-17).
 serde_yaml_ng = "0.10"

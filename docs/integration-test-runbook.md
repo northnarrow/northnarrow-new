@@ -6,8 +6,11 @@ real `northnarrow-agent` and `nn-admin` binaries, forces a Combat
 transition, asserts the iptables ruleset is live, signs the admin
 challenge, and asserts the ruleset has been torn down.
 
-CI compiles this module (bit-rot guard) but does **not** execute it
-— the runners lack root and `iptables`. Manual execution lives here.
+CI compiles this module on every push (bit-rot guard, `ci.yml`): the
+runner itself has no BPF-LSM and the job no root. Since lab PR 227 CI also
+*executes* it, with every other privileged suite, in a KVM guest on
+GitHub-hosted runners (`.github/workflows/lab-vm.yml`, see "The CI VM gate"
+below). Manual execution, and everything the CI gate leaves out, lives here.
 
 ## Prerequisites
 
@@ -179,11 +182,12 @@ verdict, the anti-tamper rows that are a DEVIATION, a KNOWN GAP or N/A;
 that says it does not apply (btrfs-check on a kernel without btrfs) is
 `N/A`, not ok; a `NOT RUN` fails whatever its exit status. Each security
 check starts the units it finds stopped. The security checks add tens of
-minutes; `NN_LAB_NIGHTLY_SKIP` takes their names too. The privileged tests only *compile* in
-GitHub CI, so this is the run that catches a test or a kernel-side
-behaviour drifting from the product — the 2026-10-08 lab rounds found
-two detection gaps and a dozen stale tests that CI had been green on
-for months.
+minutes; `NN_LAB_NIGHTLY_SKIP` takes their names too. Until lab PR 227 the
+privileged tests only *compiled* in GitHub CI, so this was the only run that
+caught a test or a kernel-side behaviour drifting from the product — the
+2026-10-08 lab rounds found two detection gaps and a dozen stale tests that
+CI had been green on for months. The CI VM gate (below) now runs
+`test-ignored` there too; the rest of this nightly still runs only here.
 
 Schedule it from WSL2 with cron (the guest must be reachable; `up` is
 run automatically when it is not):
@@ -201,6 +205,126 @@ After a WSL restart `/dev/kvm` must be writable again (`kvm` group
 membership, or `sudo chmod 666 /dev/kvm`). `NN_LAB_NIGHTLY_DOWN=1` powers
 the guest off at the end; `NN_LAB_NIGHTLY_SKIP="test-ignored"` skips a
 step.
+
+### The CI VM gate (GitHub Actions, lab PR 227)
+
+`.github/workflows/lab-vm.yml` runs this lab's `test-ignored` on
+GitHub-hosted `ubuntu-24.04` runners (4 vCPUs, 16 GB), so the privileged
+suites no longer run only on the self-hosted guests. Each job boots **one**
+guest with `nn-lab.sh` in CI mode and runs, as separate steps with their
+own time bounds: the KVM check, the host build (`cargo --locked xtask
+build-ebpf --locked`, then the credential check of external audit SUP-003),
+`image-info` → image cache → `fetch-image`, `up`, `sync`, `build`, `install`,
+`test-ignored`, then `cargo xtask gate-summary` (always).
+
+| Event | Guests |
+|---|---|
+| a pull request to `main` that touches a tree the suites are built or run from (the workflow's path filters; `xtask/tests/lab_ci.rs` derives the list from the repository and fails on a missing one) | `ubuntu2404` (6.8), `ubuntu2204` (5.15) |
+| the nightly schedule (01:17 UTC) and a manual dispatch | the four: + `debian12` (6.1), `debian13` (6.12) |
+
+**Informational on a pull request, the gate at night.** On a pull request
+the job is informational: the workflow is not `ci.yml`, its jobs are not a
+required check of `main`, and `continue-on-error` keeps a red guest from
+failing the run (the job summary and the artefact still say what failed:
+read them before merging). The nightly schedule and a manual dispatch are
+the gate: a failure fails the run. The workflow never uses
+`pull_request_target`: a pull request from a fork runs its own code with
+the read-only token (`permissions: contents: read`, not persisted in
+`.git/config`, no OIDC) and no secret, and only runs on `main` save to the
+image cache.
+
+**Same lab, CI mode.** The same script, cloud images, templates, base-image
+verification (the vendor's signed list, the digest record), injected host
+key (lab PR 211) and the same `test-ignored`: its five cargo runs, as root,
+single-threaded, on a purged pin root. `NN_LAB_CI=1` changes only what a
+runner needs, and nothing when unset (it is never inferred from `$CI`,
+which GitHub sets for every job):
+
+- KVM only: `whpx` and `tcg` are refused (exit 2). The workflow opens
+  `/dev/kvm` with the udev rule GitHub documents for its Linux runners,
+  first. A runner without a usable `/dev/kvm` boots nothing: the job
+  reports **skipped: no KVM** (job summary, annotation,
+  `skipped-no-kvm.txt` in the artefact), skips every later step, passes on
+  a pull request and fails on the nightly and a dispatch — a gate that did
+  not run is not a pass.
+- Every cargo build `--locked` (external audit SUP-016): the host's eBPF
+  build and the guest's builds and test runs.
+- ssh in batch mode with keepalives: no prompt, and a guest that stops
+  answering ends a call within 5 minutes instead of at the job's timeout.
+  A boot that does not come up prints the last 60 lines of the guest's
+  serial console; the whole console is uploaded.
+- `fetch-image` checks an image restored from the cache against the list
+  the vendor publishes now and downloads it again when it is another image.
+  In the lab `fetch-image` only verifies (as `verify-image`): a base image
+  with guests layered on it is never replaced.
+- The workflow gives the guest 12 GiB (`NN_LAB_MEM=12288`; the lab's are
+  8 GiB) and a 20-minute boot bound.
+
+`test-ignored` now frames each of its five cargo runs with
+`nn-lab: test-ignored run <n>/5 start: …` and `… end: …: exit <status>`
+lines, in the lab too (output only): `gate-summary` reads them to tell a run
+that failed on a test from one that failed to build.
+
+**Images.** The cache key is the digest the vendor's list gives for its
+current image (`nn-lab.sh image-info`: the list is downloaded and its
+signature checked, never the image); a key is never restored from another
+one, and what comes back is checked again by `fetch-image`, never trusted
+for what its key says. Only the nightly and dispatch runs on `main` save an
+image; pull requests restore them. Ubuntu's signing key is cached too, by the
+file that pins its fingerprint (a list counts only with a good signature by
+the pinned primary key, cached key or not).
+
+**Verdict and expected failures.** `cargo xtask gate-summary` reads the
+saved `test-ignored` output and passes the job only when every step
+succeeded, at least one suite ran, nothing failed to build, every cargo run
+finished, every test binary that failed printed its libtest summary (a
+crash, a kill or a timeout does not), and every failed test is an expected
+one. `deploy/lab/expected-failures.tsv` lists those: one line per recorded
+follow-up, for one distro (`distro`, `suite`, `test`, the follow-up). Today
+it holds one: on Debian 13,
+`net_privileged_e2e::net_outbound_connect_records_flow_with_dns_attribution`
+fails as on `main` (the guest resolves through `nss-resolve`, a follow-up
+since lab PR 164). An expected failure is never hidden: it is counted in
+`failed`, given its own column and listed with its outcome and follow-up;
+it fails the run when it passes (the follow-up is fixed: remove its line)
+or does not run, and it does not excuse the same test on another guest.
+
+**Evidence.** Each job writes the table (distro, kernel, suites, passed,
+failed, expected failures, ignored, verdict) and the reasons of a failure to
+the job summary, and uploads the artefact `lab-gate-<distro>`: `gate.log`,
+`gate.rc`, `kernel`, `gate-summary.json` (machine-readable: totals, every
+suite, the failed tests, the expected failures, the cargo runs, the
+steps), `gate-summary.md` and the guest's `serial.log` — never its
+user-data or seed, which hold its private host key. "Suites" counts libtest
+summaries, as the lab's gate lines do ("38 suites, 84 passed, 0 failed").
+
+**A nightly worth keeping.** CI never pushes. To commit a run:
+
+```sh
+gh run download <run id> -D /tmp/lab-gate        # one lab-gate-<distro>/ per guest
+cargo xtask gate-report /tmp/lab-gate --out docs/validation/results/<date>-<sha12>.md
+```
+
+`gate-report` prints one row per kernel (the lab's order), the expected
+failures with their outcome, every failure's reason and the commit and run.
+The same tool reads a lab run:
+`deploy/lab/nn-lab.sh test-ignored 2>&1 | tee gate.log; rc=${PIPESTATUS[0]}`, then
+`cargo xtask gate-summary --log gate.log --distro <distro> --rc "$rc" --kernel "$(deploy/lab/nn-lab.sh ssh uname -r)"`.
+
+**What stays in the self-hosted lab.** AlmaLinux 9; the lockdown guests
+(anti-tamper C27); `test-e2e`'s per-suite counts; the nightly's security
+checks (tamper-check, pkgmgr-, open-sensor-, fim-reuse-, btrfs-,
+overlay-check), respawn-, upgrade- and uninstall-check; `release-check`,
+`pkg-check`, the sensor checks, the overhead and the soak; the before/after
+probes of a lab PR. A lab PR's evidence is still its lab run; the CI gate
+gives every relevant pull request an informational run of the privileged
+suites on two kernels, and gates them every night on four.
+
+**Time.** Expected 1.5–3 h per job (an estimate until the first runs: the
+host build ~5 min, the boot with cloud-init ~5–10 min, two release builds
+in a 4-vCPU guest — the test build has the release profile's fat LTO — then
+the suites); the job stops at 330 minutes, under GitHub's 6 h ceiling, and
+`test-ignored` at 200. The first real runs measure it.
 
 ### Soak test (hours of synthetic load)
 

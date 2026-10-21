@@ -228,6 +228,49 @@ no "  the Windows copy changed: refused" verify
 no "  and no new guest is layered on it" check_win
 ACCEL=kvm
 
+# CI glue (lab PR 227): the workflow keys its image cache by image-info's
+# digest and checks a restored image with fetch-image. The mirror above:
+# current/ lists a random image, 20260911/ lists $W/img.
+echo "== CI glue (image-info, fetch-image)"
+info() { (cmd_image_info); }
+fetchi() { (cmd_fetch_image); }
+cur_img="$SRV/$n/current/noble-server-cloudimg-amd64.img"
+cur=$(nnv_digest sha256 "$cur_img")
+rm -f "$BASE_IMG" "$BASE_IMG.verified"
+ok "image-info: the digest the current signed list gives" grep -qx "digest=$cur" <<<"$(info 2>/dev/null)"
+ok "  the KVM image's path and the guest's directory" grep -qx "path=$BASE_IMG" <<<"$(info 2>/dev/null)"
+ok "  (lab_dir)" grep -qx "lab_dir=$LAB_DIR" <<<"$(info 2>/dev/null)"
+no "  no image downloaded" test -e "$BASE_IMG"
+CI_MODE=1
+cp "$cur_img" "$BASE_IMG"
+ok "ci fetch-image: a restored image that is the current one is kept" fetchi
+ok "  and recorded against the list" grep -qx "sha256=$cur" "$BASE_IMG.verified"
+ok "  prints the digest the cache key was made of" grep -qx "digest=$cur" <<<"$(fetchi 2>/dev/null)"
+cp "$W/img" "$BASE_IMG"
+rm -f "$BASE_IMG.verified"
+ok "ci fetch-image: a restored older build (still published) is replaced" fetchi
+ok "  by the current image" cmp -s "$BASE_IMG" "$cur_img"
+flip "$BASE_IMG"
+ok "ci fetch-image: a restored image changed by one byte, record and all, is replaced" fetchi
+ok "  by the current image" cmp -s "$BASE_IMG" "$cur_img"
+SIGNER=$B publish "$n/current" noble-server-cloudimg-amd64.img
+no "ci fetch-image: the current list signed by another key" fetchi
+no "ci image-info: the same list" info
+SIGNER=$A publish "$n/current" noble-server-cloudimg-amd64.img
+rm -f "$BASE_IMG" "$BASE_IMG.verified"
+ok "ci fetch-image: no image: downloaded against the list" fetchi
+ok "  the current image" cmp -s "$BASE_IMG" "$cur_img"
+CI_MODE=0
+cp "$W/img" "$BASE_IMG"
+rm -f "$BASE_IMG.verified"
+ok "lab fetch-image: an older build still published is verified" fetchi
+ok "  and kept (the lab's guests are layered on it)" cmp -s "$BASE_IMG" "$W/img"
+head -c 1000 /dev/urandom > "$BASE_IMG"
+rm -f "$BASE_IMG.verified"
+no "lab fetch-image: an image in no published list" fetchi
+ok "  is not deleted" test -s "$BASE_IMG"
+unset CI_MODE
+
 echo
 echo "verify-download self-test: $pass passed, $fail failed"
 ((fail == 0))

@@ -57,6 +57,11 @@
 #                                      # by an older nn-lab.sh); `up` records it for a new guest (generated
 #                                      # here, injected by cloud-init) or once for an existing disk
 #   deploy/lab/nn-lab.sh verify-image  # base image vs its verified download or the vendor's signed lists
+#   deploy/lab/nn-lab.sh image-info    # the base image the vendor's signed list names now: path= lab_dir=
+#                                      # algo= digest= url= lines (the CI cache key); downloads the list only
+#   deploy/lab/nn-lab.sh fetch-image   # the base image without a guest: downloaded against that list, or
+#                                      # the one present checked (as verify-image; in CI mode replaced
+#                                      # when it is not the vendor's current image); prints image-info's lines
 #   deploy/lab/nn-lab.sh nightly       # unattended full run, the security checks included (tamper-check,
 #                                      # pkgmgr-, open-sensor-, fim-reuse-, btrfs-, overlay-check)
 #                                      # → $LAB_DIR/reports/<stamp>.md (exit 1 on any failure)
@@ -71,6 +76,14 @@
 #   NN_REPO (git toplevel of this script), NN_LAB_NIGHTLY_DOWN=1 (power the guest off at the end),
 #   NN_LAB_NIGHTLY_SKIP (space-separated steps to skip, e.g. "test-ignored"),
 #   NN_LAB_LOCKDOWN (integrity: the lockdown guest of the distro, above).
+#   NN_LAB_CI=1: CI mode (.github/workflows/lab-vm.yml, lab PR 227), one KVM guest on a
+#   GitHub-hosted runner. KVM only (whpx and tcg refused), every cargo build --locked (the
+#   host's eBPF build, the guest's builds and test runs), ssh in batch mode with keepalives
+#   (a guest that stops answering ends a call within 5 min, not at the job's timeout), a
+#   boot that fails prints the tail of the guest's serial console, and `fetch-image`
+#   replaces a base image that is not the vendor's current one. Unset or 0: the lab as
+#   before. $CI is not read (GitHub sets it for every job).
+# Exit status: 0 done; 1 a failure (the message says which); 2 a usage or configuration error.
 set -euo pipefail
 
 # cron / Task Scheduler invocations come with a minimal PATH: make sure
@@ -83,6 +96,20 @@ CPUS=${NN_LAB_CPUS:-4}
 # kvm (default), whpx (QEMU for Windows, see the header) or tcg.
 ACCEL=${NN_LAB_ACCEL:-$(cat "${NN_LAB_DIR:-$HOME/.cache/nn-lab}/accel" 2>/dev/null || echo kvm)}
 case "$ACCEL" in kvm | whpx | tcg) ;; *) echo "nn-lab: unknown NN_LAB_ACCEL=$ACCEL (kvm | whpx | tcg)" >&2; exit 2 ;; esac
+# CI mode (lab PR 227; see the header). Only NN_LAB_CI turns it on: never
+# $CI, which GitHub sets for every job, the xtask tests that run this script
+# included. Off, nothing below changes.
+CI_MODE=${NN_LAB_CI:-0}
+case "$CI_MODE" in 0 | 1) ;; *) echo "nn-lab: unknown NN_LAB_CI=$CI_MODE (1, or 0 / unset)" >&2; exit 2 ;; esac
+if [[ $CI_MODE == 1 && $ACCEL != kvm ]]; then
+    echo "nn-lab: NN_LAB_CI=1 runs the guest under KVM only, not NN_LAB_ACCEL=$ACCEL: a hosted runner has no Windows hypervisor, and a TCG guest would not finish within a job" >&2
+    exit 2
+fi
+# External audit SUP-016 in CI mode: the host's `cargo xtask build-ebpf` and
+# every cargo build and test run in the guest are --locked, as in the other
+# workflows. Empty in the lab.
+LAB_CARGO_LOCKED=
+if [[ $CI_MODE == 1 ]]; then LAB_CARGO_LOCKED=--locked; fi
 MEM=${NN_LAB_MEM:-8192}
 DISK_SIZE=${NN_LAB_DISK:-30G}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -187,6 +214,12 @@ SSH_COMMON=(-i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
     -o "UserKnownHostsFile=\"$KNOWN_HOSTS\"" -o GlobalKnownHostsFile=/dev/null
     -o "HostKeyAlias=$HOST_KEY_ALIAS" -o HostKeyAlgorithms=ssh-ed25519 -o UpdateHostKeys=no
     -o CheckHostIP=no -o LogLevel=ERROR -o ConnectTimeout=5)
+# CI mode (lab PR 227): never a prompt, and a guest that stops answering (a
+# kernel panic, a hung QEMU) ends the call after 10 unanswered keepalives 30 s
+# apart instead of at the job's timeout.
+if [[ ${CI_MODE:-0} == 1 ]]; then
+    SSH_COMMON+=(-o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
+fi
 SSH_OPTS=("${SSH_COMMON[@]}" -p "$SSH_PORT")
 SCP_OPTS=("${SSH_COMMON[@]}" -P "$SSH_PORT")
 # rsync splits its -e string on spaces and honours quotes (not
@@ -251,6 +284,9 @@ need_host_deps() {
         die "missing on host: ${missing[*]} — run: sudo apt install qemu-system-x86 qemu-utils cloud-image-utils openssh-client rsync curl"
     fi
     if [[ $ACCEL == kvm ]]; then
+        if [[ $CI_MODE == 1 && ! ( -r /dev/kvm && -w /dev/kvm ) ]]; then
+            die "/dev/kvm not usable by $(id -un) (NN_LAB_CI=1): the runner must expose KVM and open it to the job's user (the udev rule of .github/workflows/lab-vm.yml)"
+        fi
         [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm not usable: enable nested virtualization and add yourself to the kvm group (sudo usermod -aG kvm \$USER, then re-login) — or NN_LAB_ACCEL=whpx (QEMU for Windows) / tcg (emulation)"
     else
         log "NN_LAB_ACCEL=tcg: software emulation, no KVM — builds and timing-sensitive tests run far slower"
@@ -532,7 +568,16 @@ wait_ssh() {
         sleep 5
     done
     if ((said_key)); then die "$(host_key_mismatch_msg)"; fi
-    die "guest did not become reachable; see $SERIAL"
+    lab_serial_tail
+    die "guest did not become reachable within ${1:-600}s; see $SERIAL"
+}
+
+# CI mode (lab PR 227): the guest's console is the only view of a boot that
+# failed on a runner (the workflow uploads the whole file too).
+lab_serial_tail() {
+    [[ $CI_MODE == 1 && -f $SERIAL ]] || return 0
+    log "last 60 lines of the guest's serial console ($SERIAL):"
+    tail -n 60 "$SERIAL" | tr -d '\r' | sed 's/^/  serial| /' >&2 || true
 }
 
 cmd_up() {
@@ -677,7 +722,7 @@ cmd_sync() {
     local obj="$REPO/agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf"
     command -v bpf-linker >/dev/null 2>&1 || die "bpf-linker not on PATH (cargo install bpf-linker --version 0.10.3 --locked)"
     log "building eBPF object on host (cargo xtask build-ebpf)"
-    (cd "$REPO" && cargo xtask build-ebpf >/dev/null)
+    (cd "$REPO" && cargo ${LAB_CARGO_LOCKED:+--locked} xtask build-ebpf ${LAB_CARGO_LOCKED:+--locked} >/dev/null)
     [[ -f "$obj" && -f "$obj.buildhash" ]] || die "eBPF object/stamp missing after build: $obj"
     # (target/kb, the LLM advisor's knowledge base, rode along until the
     # advisor was removed in Wave 4, lab PR 214.)
@@ -714,7 +759,7 @@ cmd_build() {
     # build with symbols ('CARGO_PROFILE_RELEASE_STRIP=none
     # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only'); perf can then name the
     # agent's functions (the release profile strips them).
-    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
+    vcargo "CARGO_PROFILE_RELEASE_LTO=$lto ${NN_LAB_CARGO_ENV:-} cargo build --release $LAB_CARGO_LOCKED --features test-privileged,debug-trigger -p northnarrow-agent -p northnarrow-watchdog 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Locking|Adding|Updating)' | tail -40; ls -la target/release/northnarrow-agent target/release/nn-admin target/release/northnarrow-watchdog"
 }
 
 # Purge the pin root on the guest the way an operator must now do it (review
@@ -816,9 +861,9 @@ REMOTE
 lab_e2e_suite() {
     local label=$1 sel=$2 listf runf listed rc=0
     listf=$(mktemp) runf=$(mktemp)
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release $sel -- --list" >"$listf" || true
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED $sel -- --list" >"$listf" || true
     listed=$(nnsc_listed "$listf")
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release $sel -- --test-threads=1 --nocapture ${NN_LAB_E2E_TEST_ARGS:-}" | tee "$runf" || rc=1
+    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED $sel -- --test-threads=1 --nocapture ${NN_LAB_E2E_TEST_ARGS:-}" | tee "$runf" || rc=1
     nnsc_verdict "$label" "$listed" "$runf" >&2 || rc=1
     rm -f "$listf" "$runf"
     return "$rc"
@@ -858,6 +903,18 @@ cmd_test_e2e() {
     return "$rc"
 }
 
+# One cargo run of test-ignored, framed by two lines `cargo xtask
+# gate-summary` reads (lab PR 227): which run ended with which status, so a
+# run that failed without a failing test (a build or cargo error) is told
+# apart from one whose only failures are expected ones.
+lab_ignored_run() {   # <n>/<runs> <label> <command for vcargo>
+    local rc=0
+    log "test-ignored run $1 start: $2"
+    vcargo "$3" || rc=$?
+    log "test-ignored run $1 end: $2: exit $rc"
+    return "$rc"
+}
+
 cmd_test_ignored() {
     vm_running || die "guest is not running"
     guest_require_bpftool
@@ -872,11 +929,17 @@ cmd_test_ignored() {
     lab_purge_pins >/dev/null
     # --no-fail-fast: one failing test binary must not skip the other
     # targets (the first run stopped at 11 of 56 ignored tests).
+    # $LAB_CARGO_LOCKED: --locked in CI mode (lab PR 227), empty in the lab.
+    # Each of the five cargo runs is framed by lab_ignored_run's start/end
+    # lines; `cargo xtask gate-summary` reads them with every `test result:`
+    # line (the CI job summary; the lab can run it on a saved log).
     # NN_LAB_IGNORED_SKIP: substrings of test names to leave out (none by
     # default; the RAG release gates it skipped without target/kb left with
     # the LLM advisor in Wave 4, lab PR 214).
     local skip_args="" t
     for t in ${NN_LAB_IGNORED_SKIP-}; do skip_args+=" --skip $t"; done
+    # Said once, so a saved log (and gate-summary's notes) shows what was left out.
+    [[ -z $skip_args ]] || log "NN_LAB_IGNORED_SKIP: skipping the tests matching:${skip_args// --skip / }"
     # The map-pin restart test needs a pin root no earlier test agent has
     # left behind: their pins stay protected, so its own purge is refused.
     # It runs first, alone, then the pins are purged again for the rest.
@@ -886,22 +949,22 @@ cmd_test_ignored() {
     # (the map-pin test's included) can leave it in a state iptables-nft
     # reports as "incompatible". They run first, on a chain of their own.
     local guard_tests="iptables::iptables_guard"
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test fixture_selftest $guard_tests -- --ignored --test-threads=1" || rc=1
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_map_pin $pin_test -- --ignored --test-threads=1" || rc=1
+    lab_ignored_run 1/5 "fixture_selftest: the iptables guard" "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED -p northnarrow-agent --features test-privileged,debug-trigger --test fixture_selftest $guard_tests -- --ignored --test-threads=1" || rc=1
+    lab_ignored_run 2/5 "privileged_map_pin: the restart test" "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED -p northnarrow-agent --features test-privileged,debug-trigger --test privileged_map_pin $pin_test -- --ignored --test-threads=1" || rc=1
     lab_purge_pins >/dev/null
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1 --skip $pin_test --skip $guard_tests$skip_args" || rc=1
+    lab_ignored_run 3/5 "workspace: every #[ignore] test" "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED --workspace --no-fail-fast --features northnarrow-agent/test-privileged,northnarrow-agent/debug-trigger -- --ignored --test-threads=1 --skip $pin_test --skip $guard_tests$skip_args" || rc=1
     # The watchdog's privileged e2e are gated by its own feature, not by
     # #[ignore]: the run above compiled them out (0 tests), so they never
     # ran in the gate. Run them on their own, on a purged pin root.
     lab_purge_pins >/dev/null
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1" || rc=1
+    lab_ignored_run 4/5 "watchdog privileged_e2e" "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED -p northnarrow-watchdog --features test-privileged --test privileged_e2e -- --test-threads=1" || rc=1
     # The same held for the agent's FIM e2e and for six of its admin e2e
     # (force-combat/unlock, a wrong key, status, the signed shutdown, key
     # rotation, audit verify): gated by the feature, not by #[ignore], so
     # the --ignored run skipped them (found with lab PR 111). Their
     # non-ignored tests, on a purged pin root.
     lab_purge_pins >/dev/null
-    vcargo "sudo -E env \"PATH=\$PATH\" cargo test --release -p northnarrow-agent --features test-privileged,debug-trigger --test fim_privileged_e2e --test privileged_e2e -- --test-threads=1" || rc=1
+    lab_ignored_run 5/5 "agent fim_privileged_e2e, privileged_e2e" "sudo -E env \"PATH=\$PATH\" cargo test --release $LAB_CARGO_LOCKED -p northnarrow-agent --features test-privileged,debug-trigger --test fim_privileged_e2e --test privileged_e2e -- --test-threads=1" || rc=1
     return "$rc"
 }
 
@@ -1876,6 +1939,8 @@ case "${1:-help}" in
     restore)       cmd_restore "${2:-}" ;;
     destroy)       cmd_destroy ;;
     verify-image)  cmd_verify_image ;;
+    image-info)    cmd_image_info ;;
+    fetch-image)   cmd_fetch_image ;;
     nightly)       cmd_nightly ;;
     soak)          shift; cmd_soak "$@" ;;
     help|-h|--help) cmd_help ;;

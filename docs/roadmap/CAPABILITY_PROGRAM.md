@@ -260,3 +260,58 @@ only in the table below, in the same PR as the evidence.
     host's hardening is listed, not scored; `main()` is still one body (one
     function per phase is the follow-up).
   - Lab: On Ubuntu 24.04, Debian 12, 22.04 and Debian 13: the five boot phases in order (preflight steps through bpf_lsm, attach, self-test, attest, subsystems), the deny self-test refused and its signal consumed (no NN-L-AT-001 for it), trust level L3, the signed capability manifest equal to `nn-admin capabilities`, the unsigned status withholding the trust level; NetFlowDb made unopenable: the drain ran without persistence and signed `net_drain`; three sensor fallbacks signed within 60 s; a read-only audit log and a dropped CAP_KILL refused before any attach. On 22.04 booted without `bpf` in `lsm=`: the start refused with exit 78 and signed rows, the opt-in start at L0, a hidden LSM list caught by the self-test (`refused_by deny_self_test`), the guest restored (39 of 39 checks). Gate: the integration tree of lab PRs 214–218 on `main` with lab PRs 176–213: Ubuntu 22.04 (5.15) 47 suites, 79 passed, 0 failed; Ubuntu 24.04 and Debian 12, 47 suites, 78 passed, 1 failed — `audit_verify_e2e`, whose expected row list did not have lab PR 218's new boot-time `capability_manifest` row (the expectation is updated in lab PR 218 and passes on 22.04 with it); Debian 13 (6.12) 47 suites, 78 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); anti-tamper suite on 24.04 and 22.04: every case OK but C64 (lab PR 215's enumeration case, which found a stale own link id, a recorded follow-up); deny fail-opens 0 over the whole run; `upgrade-check` from the tree without these lots OK on 24.04 (with the old advisor drop-in in place); host 2,480 passed, 0 failed.
+- **Lab PR 227 — the privileged suites in KVM guests on GitHub-hosted
+  runners.** C01 (Linux sensor), C29 (independent public validation); Wave 4
+  Phase 2.1.
+  - What was wrong: the privileged tests and the `#[ignore]` integration
+    tests ran only in the self-hosted lab (`nn-lab.sh test-ignored` on four
+    guests). CI compiled them (`--no-run`): a pull request could merge with
+    a suite red on a kernel until the next lab gate, and no run of them was
+    visible to anyone outside the lab.
+  - What changed: `.github/workflows/lab-vm.yml` runs the same
+    `test-ignored` in one KVM guest per job on a GitHub-hosted
+    `ubuntu-24.04` runner — on the pull requests that touch the trees the
+    suites are built or run from, Ubuntu 24.04 (6.8) and 22.04 (5.15); every
+    night and on dispatch, the lab's four guests (and Debian 12, 6.1; Debian
+    13, 6.12). On a pull request the job is informational (its own
+    workflow, not a required check, `continue-on-error`); the nightly and a
+    dispatch are the gate; a runner without KVM reports "skipped: no KVM"
+    and fails only the nightly and a dispatch; no `pull_request_target`, a
+    read-only token, no secret. nn-lab.sh gains a CI mode (`NN_LAB_CI=1`:
+    KVM only, every cargo build `--locked`, batch ssh with keepalives, the
+    serial console on a failed boot; the lab unchanged without it) and
+    `image-info` / `fetch-image`: the image cache is keyed by the digest the
+    vendor's signed list gives now and a restored image is checked against
+    that list again. `cargo xtask gate-summary` judges a run (a crash, a build error
+    or a run that never ended fails it, not only a failed test) and writes
+    `gate-summary.json` and the job summary; the expected failures of
+    `deploy/lab/expected-failures.tsv` (Debian 13's DNS attribution under
+    `nss-resolve`, a recorded follow-up) are counted and shown, and fail the
+    run once they pass. `cargo xtask gate-report` makes a run's artefacts a
+    Markdown table the maintainer commits.
+  - Evidence so far, offline only: `xtask/tests/lab_ci.rs` (the path
+    filters derived from the repository, the matrix, the pins and the
+    read-only token, the pull-request policy and the no-KVM skip, the time
+    bounds, the KVM step, the image cache, the order of the steps and the
+    evidence; the CI switches of nn-lab.sh run under bash, its ssh options
+    under `ssh -G`; gate-summary and
+    gate-report on synthetic logs: an expected failure on its guest and not
+    on another, a stale one, a crash, a build error, a cut log, a job that
+    stopped before the gate), each mutation of the workflow tried failing
+    them; the download self-test with the CI glue (82 cases); actionlint
+    1.7.12 with shellcheck 0.10.0 clean on the workflow, no new shellcheck
+    finding in the lab scripts; `cargo fmt`, `cargo test -p xtask`. No guest
+    was booted and no workflow ran: the dev host has no usable `/dev/kvm`.
+  - Levels unchanged (C01 2, C29 0): owed, the first runs — KVM on a hosted
+    runner, the boot and builds within the bounds, the measured run time
+    (estimated 1.5–3 h a job), the four kernels green with Debian 13's one
+    expected failure. For C29 the runs are public and reproducible on
+    infrastructure the project does not own; that is a step towards, not,
+    an independent validation, which still needs a third party.
+    Open: AlmaLinux 9, the lockdown guests, `test-e2e`'s counts, the
+    security checks and the rest of the nightly stay in the self-hosted
+    lab; the image cache shares the repository's 10 GB with the cargo
+    caches.
+  - Lab: the verification is the VM job's first run on this pull request
+    (`lab-vm.yml`, Ubuntu 24.04 and 22.04 guests); its link is added here
+    once the run exists.
