@@ -871,6 +871,38 @@ pub struct StatusResponse {
     pub defense_tamper_sanctioned_total: Option<u64>,
     #[serde(default)]
     pub defense_tools_watched: Option<u64>,
+    /// Lab PR 226 (EXPERIMENTAL): the exec policy — `off`, `audit`,
+    /// `enforce` (with `; N partial` when part of it could not start), or
+    /// `degraded: <why>` — and the kernel's counts since boot: execs
+    /// refused; execs a deny cell named and allowed ("would deny": audit
+    /// mode, an audit cell, a class in audit mode); execs handed to the
+    /// exec quarantine; quarantine cells while the quarantine is off;
+    /// execs refused on their environment; environment findings reported;
+    /// executable mappings refused; mappings reported. Appended after lab
+    /// PR 225's fields (the fields of lab PRs 215 to 225 before them, after
+    /// lab PR 207's); telemetry (`None` in the unsigned reply).
+    #[serde(default)]
+    pub execpol_state: Option<String>,
+    #[serde(default)]
+    pub execpol_denied_total: Option<u64>,
+    #[serde(default)]
+    pub execpol_would_deny_total: Option<u64>,
+    #[serde(default)]
+    pub execpol_quarantine_total: Option<u64>,
+    #[serde(default)]
+    pub execpol_quarantine_inactive_total: Option<u64>,
+    #[serde(default)]
+    pub execpol_env_denied_total: Option<u64>,
+    #[serde(default)]
+    pub execpol_env_recorded_total: Option<u64>,
+    #[serde(default)]
+    pub execpol_map_denied_total: Option<u64>,
+    #[serde(default)]
+    pub execpol_map_recorded_total: Option<u64>,
+    /// Lab PR 226: scripts the exec quarantine refused at exec (enforce
+    /// mode: the interpreter would re-read the file after the scan).
+    #[serde(default)]
+    pub execq_script_refused_total: Option<u64>,
 }
 
 /// Lab PR 219: the exploit post-condition guard in `nn-admin status`.
@@ -974,6 +1006,16 @@ impl StatusResponse {
             defense_tamper_total: None,
             defense_tamper_sanctioned_total: None,
             defense_tools_watched: None,
+            execpol_state: None,
+            execpol_denied_total: None,
+            execpol_would_deny_total: None,
+            execpol_quarantine_total: None,
+            execpol_quarantine_inactive_total: None,
+            execpol_env_denied_total: None,
+            execpol_env_recorded_total: None,
+            execpol_map_denied_total: None,
+            execpol_map_recorded_total: None,
+            execq_script_refused_total: None,
         }
     }
 
@@ -2062,6 +2104,16 @@ mod tests {
             defense_tamper_total: None,
             defense_tamper_sanctioned_total: None,
             defense_tools_watched: None,
+            execpol_state: None,
+            execpol_denied_total: None,
+            execpol_would_deny_total: None,
+            execpol_quarantine_total: None,
+            execpol_quarantine_inactive_total: None,
+            execpol_env_denied_total: None,
+            execpol_env_recorded_total: None,
+            execpol_map_denied_total: None,
+            execpol_map_recorded_total: None,
+            execq_script_refused_total: None,
         }));
     }
 
@@ -2122,6 +2174,16 @@ mod tests {
             defense_tamper_total: None,
             defense_tamper_sanctioned_total: None,
             defense_tools_watched: None,
+            execpol_state: None,
+            execpol_denied_total: None,
+            execpol_would_deny_total: None,
+            execpol_quarantine_total: None,
+            execpol_quarantine_inactive_total: None,
+            execpol_env_denied_total: None,
+            execpol_env_recorded_total: None,
+            execpol_map_denied_total: None,
+            execpol_map_recorded_total: None,
+            execq_script_refused_total: None,
         }));
     }
 
@@ -2363,6 +2425,16 @@ mod tests {
             defense_tamper_total: None,
             defense_tamper_sanctioned_total: None,
             defense_tools_watched: None,
+            execpol_state: None,
+            execpol_denied_total: None,
+            execpol_would_deny_total: None,
+            execpol_quarantine_total: None,
+            execpol_quarantine_inactive_total: None,
+            execpol_env_denied_total: None,
+            execpol_env_recorded_total: None,
+            execpol_map_denied_total: None,
+            execpol_map_recorded_total: None,
+            execq_script_refused_total: None,
         }));
     }
 
@@ -2452,6 +2524,16 @@ mod tests {
             defense_tamper_total: None,
             defense_tamper_sanctioned_total: None,
             defense_tools_watched: None,
+            execpol_state: None,
+            execpol_denied_total: None,
+            execpol_would_deny_total: None,
+            execpol_quarantine_total: None,
+            execpol_quarantine_inactive_total: None,
+            execpol_env_denied_total: None,
+            execpol_env_recorded_total: None,
+            execpol_map_denied_total: None,
+            execpol_map_recorded_total: None,
+            execq_script_refused_total: None,
         }
     }
 
@@ -2932,6 +3014,8 @@ mod tests {
         assert_eq!(public.net_flow_snapshots_total, None);
         assert_eq!(public.net_flow_snapshots_deferred_total, None);
         assert_eq!(public.net_connect_denied_total, None);
+        assert_eq!(public.execpol_state, None);
+        assert_eq!(public.execpol_denied_total, None);
         assert!(!status_with_lab193_fields().telemetry_withheld());
         // Same shape: an older nn-admin or watchdog reads it.
         let body = postcard::to_allocvec(&public).unwrap();
@@ -3018,8 +3102,8 @@ mod tests {
     /// public, passed through by the unsigned reply — and an `nn-admin` of
     /// lab PR 213 reads every byte before it (the two fields follow lab PR
     /// 215's; the fields appended after them — lab PR 218's four, 219's
-    /// and 222's one each, 223's ten, 224's four, 225's seven — are `None`
-    /// in a public reply).
+    /// and 222's one each, 223's ten, 224's four, 225's seven, 226's ten —
+    /// are `None` in a public reply).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -3037,8 +3121,8 @@ mod tests {
         // them (one `None` byte each here) are the last bytes of both: lab
         // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
         // `cow_guard`, lab PR 223's ten `execq_*`, lab PR 224's four
-        // counters, lab PR 225's seven.
-        let tail = 4 + 1 + 1 + 10 + 4 + 7;
+        // counters, lab PR 225's seven, lab PR 226's ten.
+        let tail = 4 + 1 + 1 + 10 + 4 + 7 + 10;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);

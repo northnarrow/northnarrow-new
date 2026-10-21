@@ -260,6 +260,20 @@ impl SensorMultiplexer {
                 crate::execq::fail(format!("kernel configuration failed: {e:#}"));
             }
         }
+        // Lab PR 226 (EXPERIMENTAL): the exec policy — its environment and
+        // mapping programs, then its kernel configuration, written OFF too
+        // and frozen. Not fatal: an unwritten configuration is OFF.
+        let execq_on = crate::execq::config().is_some_and(|c| c.mode != crate::execq::Mode::Off)
+            && !crate::execq::state().starts_with("degraded");
+        if let Err(e) = crate::execpol::install(&mut ebpf, execq_on) {
+            error!(
+                error = format!("{e:#}"),
+                "exec policy: kernel configuration failed — the policy is off"
+            );
+            if crate::execpol::config().is_some_and(|c| c.mode != crate::execpol::Mode::Off) {
+                crate::execpol::fail(format!("kernel configuration failed: {e:#}"));
+            }
+        }
         // io_uring (Tappa 10.8): soft attach — a kernel built without
         // CONFIG_IO_URING has no such tracepoints and nothing to observe.
         // The submit tracepoint was renamed across kernels (`_sqe` ≤ 6.1,

@@ -3543,6 +3543,7 @@ fn telemetry_status(
     let execq = crate::execq::snapshot();
     let ransom = crate::impact::published_counts();
     let defense = crate::impair::published_counts();
+    let execpol = crate::execpol::snapshot();
     StatusResponse {
         posture: posture.current_kind(),
         network_isolation_engaged: isolator.is_engaged(),
@@ -3620,6 +3621,17 @@ fn telemetry_status(
         defense_tamper_total: defense.map(|c| c.findings),
         defense_tamper_sanctioned_total: defense.map(|c| c.sanctioned),
         defense_tools_watched: defense.map(|c| c.defenders),
+        // Lab PR 226 (EXPERIMENTAL): the exec policy.
+        execpol_state: Some(execpol.state),
+        execpol_denied_total: Some(execpol.denied),
+        execpol_would_deny_total: Some(execpol.would_deny),
+        execpol_quarantine_total: Some(execpol.quarantine),
+        execpol_quarantine_inactive_total: Some(execpol.quarantine_inactive),
+        execpol_env_denied_total: Some(execpol.env_denied),
+        execpol_env_recorded_total: Some(execpol.env_recorded),
+        execpol_map_denied_total: Some(execpol.map_denied),
+        execpol_map_recorded_total: Some(execpol.map_recorded),
+        execq_script_refused_total: Some(execq.script_refused),
     }
 }
 
@@ -6199,6 +6211,16 @@ mod tests {
             defense_tamper_total: None,
             defense_tamper_sanctioned_total: None,
             defense_tools_watched: None,
+            execpol_state: None,
+            execpol_denied_total: None,
+            execpol_would_deny_total: None,
+            execpol_quarantine_total: None,
+            execpol_quarantine_inactive_total: None,
+            execpol_env_denied_total: None,
+            execpol_env_recorded_total: None,
+            execpol_map_denied_total: None,
+            execpol_map_recorded_total: None,
+            execq_script_refused_total: None,
         });
         emit_audit_for(
             &status_req,
@@ -7229,6 +7251,9 @@ mod tests {
         // Lab PR 223: the exec quarantine is always reported (off here).
         assert_eq!(r.execq_state.as_deref(), Some("off"));
         assert!(r.execq_held_total.is_some());
+        // Lab PR 226: the exec policy too.
+        assert_eq!(r.execpol_state.as_deref(), Some("off"));
+        assert!(r.execpol_denied_total.is_some());
 
         // No response state (no executor): not known, not "enforcing".
         let r = status(None);

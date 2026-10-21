@@ -122,7 +122,7 @@ fn merge_sample(prev: &[u64], now: &[Option<u64>], failing: &mut [bool]) -> Vec<
 
 /// External audit SNS-009: the rings whose loss hides security evidence.
 /// A drop there raises `TriggerType::TelemetryLoss` (ALERTED).
-pub const SECURITY_RINGS: [u32; 9] = [
+pub const SECURITY_RINGS: [u32; 10] = [
     ring_slot::EXEC,
     ring_slot::FS_PROTECT,
     ring_slot::OPEN_SENSOR,
@@ -140,6 +140,9 @@ pub const SECURITY_RINGS: [u32; 9] = [
     // Lab PR 223: an exec quarantine candidate the ring could not hold
     // ran unstopped and unscanned.
     ring_slot::EXECQ,
+    // Lab PR 226: an exec policy report lost — a deny (or an environment
+    // or mapping finding) without its record.
+    ring_slot::EXECPOL,
 ];
 
 /// Events a security ring may lose within one sample before the posture

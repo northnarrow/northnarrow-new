@@ -47,12 +47,20 @@ impl ExecqRecord {
             (Action::Kill, true) => ResponseAction::Quarantine,
             (Action::Kill, false) => ResponseAction::KillProcess,
         };
-        let reasoning = format!(
-            "first sight of an executable in a guarded location ({}): {} — {}",
-            evidence.classes.join(", "),
-            evidence.verdict,
-            o.why
-        );
+        let reasoning = if o.refused {
+            format!(
+                "a script in a guarded location ({}) the exec quarantine would hold — {}",
+                evidence.classes.join(", "),
+                o.why
+            )
+        } else {
+            format!(
+                "first sight of an executable in a guarded location ({}): {} — {}",
+                evidence.classes.join(", "),
+                evidence.verdict,
+                o.why
+            )
+        };
         ExecqRecord {
             verdict: Verdict {
                 rule_id: RULE_ID.to_string(),
@@ -108,10 +116,11 @@ pub fn evidence(
         sha256: scan.map(|r| common::execq::hex32(&r.sha256)),
         format: scan.map(|r| r.format.clone()),
         reasons,
-        decision: if enforce {
-            o.action.as_str().to_string()
-        } else {
-            format!("would {}", o.action.as_str())
+        decision: match (o.refused, enforce) {
+            (true, true) => "refuse".to_string(),
+            (true, false) => "would refuse".to_string(),
+            (false, true) => o.action.as_str().to_string(),
+            (false, false) => format!("would {}", o.action.as_str()),
         },
         basis: o.why.clone(),
         classes: common::wire::execq::class_names(class)

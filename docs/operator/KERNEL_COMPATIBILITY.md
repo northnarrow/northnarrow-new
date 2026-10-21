@@ -235,11 +235,11 @@ The agent now reads the prototype of `bpf_lsm_inode_setattr` from the
 running kernel's BTF at boot, takes the position of its only `struct
 dentry *` argument (which must be followed by the `struct iattr *`), and
 writes it into the `BTF_OFFSETS` map (`INODE_SETATTR_DENTRY_ARG`, slot
-109) before anything attaches; both programs read the dentry at that
+113) before anything attaches; both programs read the dentry at that
 position. The same check found a second case: on 5.7 to 5.11 (5.10 LTS
 included) `inode_setxattr` and `inode_removexattr` start with the dentry,
 where the xattr deny read argument 1 (the attribute name); their
-positions are resolved the same way (slots 110 and 111, the name taken
+positions are resolved the same way (slots 114 and 115, the name taken
 right after the dentry).
 
 Hook prototypes per kernel, for the arguments the programs read
@@ -581,6 +581,27 @@ same program without them: the exec records keep flowing, their streams
 say "not read", and R020's loss is a signed degradation (`stdio_probe`,
 in `nn-admin status`) — never the process-spawn sensor's.
 
+## Exec policy, exec environment and executable mappings (lab PR 226)
+
+Off by default (`--exec-policy`). Each piece turns its part off with a
+signed degradation when its kernel interface is missing; none stops the
+agent:
+
+| Piece | Kernel interface | 5.14 | 5.15 | 6.1 | 6.8 | 6.12 | Without it |
+|---|---|---|---|---|---|---|---|
+| exec policy (the verdict) | LSM `bprm_check_security`: the exec sensor's program returns `-EACCES` | yes | yes | yes | yes | yes | nothing refused (the exec sensor not on LSM) |
+| exec environment | tracepoints `syscalls/sys_enter_execve` and `sys_enter_execveat`, field `envp` (resolved from the tracepoint format) | yes | yes | yes | yes | yes | no environment check |
+| executable mappings | LSM `mmap_file` `(file, reqprot, prot, flags)`, argument 0 checked at boot (`HOOK_ARG_CHECKS`) | yes | yes | yes | yes | yes | no mapping check |
+| admin tier | BTF `task_struct.signal`, `signal_struct.tty` (optional slots 98, 99) | yes | yes | yes | yes | yes | no `admin` tier |
+| session tier | `task_struct.loginuid` (`CONFIG_AUDIT`) | yes | yes | yes | yes | yes | a login session is `unknown` |
+| another user's home | `inode.i_uid` | yes | yes | yes | yes | yes | no `other_home` class |
+| service and session tiers | cgroup v2 ids of `system.slice` and `user.slice` | systemd | systemd | systemd | systemd | systemd | every caller `unknown` |
+
+"yes" is the kernel interface; whether each program passes the verifier
+on a kernel is the lab's `nn-lab.sh verifier-check`, recorded in the
+design note. Design:
+https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_POLICY.md
+
 ## Older verifiers (5.15): constructs the eBPF code avoids
 
 The 5.15 verifier rejected the constructs below, which 6.1 and 6.8 accept. All
@@ -678,6 +699,10 @@ same rules or the 22.04 guest will refuse to load it:
    Two adjacent zero stores are merged by the compiler into the same
    `memset` (`fim_watch`'s `dest_dev` and `dest_ino`, lab PR 225): write
    them with `write_volatile`.
+   A program body the compiler leaves outlined is a static subprogram
+   called with the hook's context: the exec LSM program, grown by lab PRs
+   223 and 226, was refused on 5.15 and 6.1 until `#[inline(always)]` on
+   its function put the body back in the program's entry.
 10. **Fewer ways through the program (5.15 and 6.1).** Every branch the
     verifier cannot prove one-sided doubles the paths after it until they
     merge again, and these verifiers merge fewer. In the exploit guard:

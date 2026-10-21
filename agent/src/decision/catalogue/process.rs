@@ -492,4 +492,84 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       also names its interpreter's technique (T1059.004, .006, .007, or T1059), \
                       per record.",
     },
+    // ── exec policy (lab PR 226, experimental, off by default) ──────
+    RuleDoc {
+        id: "NN-L-EXECPOL-001_StagingExecDenied",
+        severities: &[Severity::High, Severity::Medium],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032"],
+        observes: "With --exec-policy: an exec of a file in a staging class (memfd, a deleted \
+                   file, /dev/shm, /tmp… per the profile's table) by a caller of a lineage \
+                   tier (admin, session, service) the table denies: refused with EACCES \
+                   before the exec's point of no return (enforce, High) or recorded as \
+                   \"would deny\" (audit, Medium). Recorded by the policy's controller.",
+        false_positives: "The desktop profile allows a login session's own staging locations \
+                          (AppImage, build trees); `exempt` lines of the signed \
+                          exec-policy.local; audit mode first.",
+        how_to_test: "`nn-lab.sh malsim-exec-check`: MS-01 (a copy of id in /dev/shm run \
+                      from a service) refused in enforce, recorded in audit.",
+        tests: &[
+            "agent/src/execpol/record.rs::a_denied_exec_is_one_high_record",
+            "agent/src/execpol/record.rs::memfd_and_deleted_techniques",
+            "deploy/lab/malsim/exec-check.sh::MS-01",
+        ],
+        attack_note: "Per record: T1620 for a memfd or a deleted file (and T1070.004 for the \
+                      deletion), T1204.002 for a staging location, T1564.001 for a hidden \
+                      name on the way.",
+    },
+    RuleDoc {
+        id: "NN-L-EXECENV-001_PreloadFromStaging",
+        severities: &[Severity::High, Severity::Medium, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032"],
+        observes: "A loader variable at exec (`LD_PRELOAD`, `LD_AUDIT`) naming a staging \
+                   path: refused (enforce) or recorded; a set-id target is recorded (the \
+                   kernel sets AT_SECURE and the loader ignores it).",
+        false_positives: "A developer's own preload from a build tree in a session (Low).",
+        how_to_test: "`nn-lab.sh malsim-exec-check`: MS-32, LD_PRELOAD of a no-op library \
+                      from /tmp into a service.",
+        tests: &[
+            "agent/src/execpol/record.rs::the_preload_record",
+            "deploy/lab/malsim/exec-check.sh::MS-32",
+        ],
+        attack_note: "",
+    },
+    RuleDoc {
+        id: "NN-L-EXECENV-002_ExecEnvironmentTrick",
+        severities: &[
+            Severity::Critical,
+            Severity::Medium,
+            Severity::Low,
+        ],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032"],
+        observes: "The environment of an exec, recorded: `GLIBC_TUNABLES` at a set-id \
+                   target (Critical in the shape of CVE-2023-4911), a library path into \
+                   staging for a service or root, shell history disabled.",
+        false_positives: "History disabled by a user's own shell configuration (Low, repeats \
+                          held back).",
+        how_to_test: "Run `su` with `GLIBC_TUNABLES=glibc.malloc.mxfast=glibc.malloc.mxfast=A` \
+                      on a lab guest with the exec policy on.",
+        tests: &["agent/src/execpol/record.rs::tunables_history_and_library_path"],
+        attack_note: "Per record: T1068 for the set-id exploit's environment, T1574.006 for \
+                      the library path, T1070.003 for the history.",
+    },
+    RuleDoc {
+        id: "NN-L-EXECENV-003_ExecMappingFromStaging",
+        severities: &[Severity::High, Severity::Medium, Severity::Low],
+        actions: &[ResponseAction::Log],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032"],
+        observes: "An executable mapping (`mmap_file` with PROT_EXEC) of a file in a staging \
+                   class: refused (enforce) or recorded.",
+        false_positives: "JIT runtimes mapping their own caches from a session's temporary \
+                          directory (recorded, Low).",
+        how_to_test: "`dlopen` a library copied to /tmp from a service, with the exec policy \
+                      on.",
+        tests: &["agent/src/execpol/record.rs::a_mapping_record"],
+        attack_note: "T1620 is added for a memfd or a deleted file.",
+    },
 ];

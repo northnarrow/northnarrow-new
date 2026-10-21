@@ -247,6 +247,13 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         OverlayKind::ExecqHashes => {
             common::execq::parse_hash_list(text).map_err(|e| anyhow!("{label}: {e}"))?;
         }
+        // Lab PR 226: every line an exec, audit, preload, map, exempt or
+        // profile line (over either profile: the base does not change
+        // what parses).
+        OverlayKind::ExecPolicy => {
+            crate::execpol::policy::parse(text, crate::execpol::Profile::Server)
+                .map_err(|e| anyhow!("{label}: {e}"))?;
+        }
     }
     Ok(())
 }

@@ -24,28 +24,26 @@
 //! (`PROTECTED_PIDS`) are never stopped.
 use aya_ebpf::{
     cty::c_void,
-    helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        gen,
-    },
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, gen},
     macros::map,
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
 };
 use northnarrow_common::wire::exe::{exe_flags, exe_path_slot, ExeIdentityRaw, EXE_PATH_SLOT_LEN};
 use northnarrow_common::wire::execq::{
-    class, conf_slot, counter, mode, stop_flags, ExecqCandRaw, ExecqKey, ExecqKnown, ExecqStopRaw,
-    ExecqStopped,
+    class, conf_slot, counter, mode, root_kind, stop_flags, ExecqCandRaw, ExecqKey, ExecqKnown,
+    ExecqStopRaw, ExecqStopped,
 };
-use northnarrow_common::wire::TASK_COMM_LEN;
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_PARENT_OFFSET, INODE_I_CTIME_NSEC_OFFSET,
-    INODE_I_CTIME_SEC_OFFSET, INODE_I_MODE_OFFSET, INODE_I_SIZE_OFFSET,
+    INODE_I_CTIME_SEC_OFFSET, INODE_I_MODE_OFFSET, INODE_I_SIZE_OFFSET, INODE_I_UID_OFFSET,
     TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
 };
 
 /// `SIGSTOP` on every Linux architecture the agent supports.
 const SIGSTOP: u32 = 19;
+/// `EACCES`.
+const EACCES: i32 = 13;
 /// `S_IWOTH`.
 const S_IWOTH: u16 = 0o002;
 
@@ -97,6 +95,13 @@ fn conf(slot: u32) -> u64 {
     }
 }
 
+/// The guard is on (observe or enforce).
+#[inline(always)]
+pub(crate) fn armed() -> bool {
+    conf(conf_slot::MODE) != mode::OFF
+}
+
+
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
@@ -118,10 +123,13 @@ unsafe fn peek_u16(src: *const u8) -> u16 {
     v.assume_init()
 }
 
-/// "tmp", "var", "home", "root" as the low bytes of a little-endian u64,
-/// their NUL included (a slot holds the name the kernel read and its NUL).
+/// "tmp", "var", "home", "root", "dev", "shm" as the low bytes of a
+/// little-endian u64, their NUL included (a slot holds the name the kernel
+/// read and its NUL).
 const NAME_TMP: u64 = 0x0070_6d74;
 const NAME_VAR: u64 = 0x0072_6176;
+const NAME_DEV: u64 = 0x0076_6564;
+const NAME_SHM: u64 = 0x006d_6873;
 const NAME_HOME: u64 = 0x00_656d_6f68;
 const NAME_ROOT: u64 = 0x00_746f_6f72;
 const MASK4: u64 = 0xffff_ffff;
@@ -140,15 +148,18 @@ unsafe fn level_name(s: *const ExeIdentityRaw, level: usize) -> u64 {
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_execq_classify(dentry: u64, flags: u64) -> u64 {
-    unsafe { classify(dentry as *const u8, flags as u32) as u64 }
+    unsafe {
+        match crate::exec_lsm::EXEC_SCRATCH.get_ptr(0) {
+            Some(s) => classify(s, dentry as *const u8, flags as u32) as u64,
+            None => 0,
+        }
+    }
 }
 
+/// The classes of the file whose walk is in `s` (the exec sensor's scratch,
+/// or the mapping check's, `crate::execpol`).
 #[inline(always)]
-unsafe fn classify(dentry: *const u8, flags: u32) -> u32 {
-    let s = match crate::exec_lsm::EXEC_SCRATCH.get_ptr(0) {
-        Some(p) => p,
-        None => return 0,
-    };
+pub(crate) unsafe fn classify(s: *const ExeIdentityRaw, dentry: *const u8, flags: u32) -> u32 {
     let mut c = 0u32;
     if flags & exe_flags::MEMFD != 0 {
         c |= class::MEMFD;
@@ -180,46 +191,94 @@ unsafe fn classify(dentry: *const u8, flags: u32) -> u32 {
                 c |= class::TMP;
             } else if top & MASK5 == NAME_HOME || top & MASK5 == NAME_ROOT {
                 c |= class::HOME;
-            } else if top & MASK4 == NAME_VAR
-                && levels >= 3
-                && level_name(s, levels - 2) & MASK4 == NAME_TMP
-            {
-                c |= class::TMP;
+            } else if levels >= 3 {
+                let next = level_name(s, levels - 2) & MASK4;
+                if top & MASK4 == NAME_VAR && next == NAME_TMP {
+                    c |= class::VAR_TMP;
+                } else if top & MASK4 == NAME_DEV && next == NAME_SHM {
+                    c |= class::DEV_SHM;
+                }
             }
         }
     } else {
-        // The walk ended on a filesystem's root: a guarded mount?
+        // The walk ended on a filesystem's root: a guarded mount, and
+        // which point it is mounted at (lab PR 226).
         let key = ExecqKey {
             dev: (*s).root_dev,
             ino: (*s).root_ino,
         };
-        if EXECQ_ROOTS.get(&key).is_some() {
+        if let Some(v) = EXECQ_ROOTS.get(&key) {
+            let v = *v;
             c |= class::GUARDED_MOUNT;
+            if v & root_kind::TMP != 0 {
+                c |= class::TMP;
+            }
+            if v & root_kind::VAR_TMP != 0 {
+                c |= class::VAR_TMP;
+            }
+            if v & root_kind::DEV_SHM != 0 {
+                c |= class::DEV_SHM;
+            }
+            if v & root_kind::HOME != 0 {
+                c |= class::HOME;
+            }
+        }
+    }
+    // Lab PR 226: a home file another account owns (neither the caller's
+    // real uid nor root).
+    if c & class::HOME != 0 {
+        if let Some(o) = off_opt!(INODE_I_UID_OFFSET) {
+            let inode = peek_u64(dentry.add(off!(DENTRY_D_INODE_OFFSET))) as *const u8;
+            if !inode.is_null() {
+                let owner = peek_u32(inode.add(o & 0xffff));
+                let caller = bpf_get_current_uid_gid() as u32;
+                if owner != 0 && owner != caller {
+                    c |= class::OTHER_HOME;
+                }
+            }
         }
     }
     c
 }
 
 /// A binfmt pass of `bprm_check_security`, after `exec_lsm`'s walk filled
-/// the scratch `s`. `inode` and `dentry` are the pass's file; `task` the
-/// exec'ing `task_struct`; `pass` 0 for the file the caller named.
+/// the scratch `s`. `inode` is the pass's file, `classes` its classes as
+/// the exec policy leaves them to the guard (all of them without the
+/// policy, lab PR 223); `task` the exec'ing `task_struct`; `pass` 0 for the
+/// file the caller named. Returns the pass's verdict: `-EACCES` for a
+/// script the guard would hold in enforce mode (lab PR 226), else 0.
 #[inline(always)]
 pub(crate) unsafe fn note_pass(
     s: *const ExeIdentityRaw,
     inode: *const u8,
-    dentry: *const u8,
     task: u64,
     pass: u8,
-) {
-    if conf(conf_slot::MODE) == mode::OFF {
-        return;
+    classes: u32,
+) -> i32 {
+    let m = conf(conf_slot::MODE);
+    if m == mode::OFF {
+        return 0;
     }
     // A failed exec may have left a candidate; this exec starts afresh.
     if pass == 0 {
         let _ = EXECQ_CAND.remove(&task);
+    } else if m == mode::ENFORCE {
+        // Lab PR 226: the pass-0 candidate was a `#!` script (or a
+        // binfmt_misc input) — this pass is its interpreter. Held, the
+        // interpreter would open the script by its path once resumed, and
+        // what it reads then need not be what was scanned: refused here,
+        // before the point of no return.
+        if let Some(cand) = EXECQ_CAND.get_ptr(&task) {
+            if (*cand).flags & stop_flags::INTERP_PASS == 0 {
+                let refused = refuse_script(cand, task);
+                let _ = EXECQ_CAND.remove(&task);
+                if refused {
+                    return -EACCES;
+                }
+            }
+        }
     }
-    let guarded = conf(conf_slot::CLASSES) as u32;
-    let c = nn_execq_classify(dentry as u64, (*s).flags as u64) as u32 & guarded;
+    let c = classes & conf(conf_slot::CLASSES) as u32;
     let size = peek_u64(inode.add(off!(INODE_I_SIZE_OFFSET))) as i64;
     let mut cflags = 0u32;
     let mut ctime_sec = 0i64;
@@ -254,11 +313,11 @@ pub(crate) unsafe fn note_pass(
                 }
             }
         }
-        return;
+        return 0;
     }
     let cand = match EXECQ_CAND_SCRATCH.get_ptr_mut(0) {
         Some(p) => p,
-        None => return,
+        None => return 0,
     };
     (*cand).ctime_sec = ctime_sec;
     (*cand).ctime_nsec = ctime_nsec;
@@ -279,6 +338,70 @@ pub(crate) unsafe fn note_pass(
     if EXECQ_CAND.insert(&task, &*cand, 0).is_err() {
         bump(counter::CAND_DROPPED);
     }
+    0
+}
+
+/// Forget the exec's candidate (the exec policy refused the pass).
+#[inline(always)]
+pub(crate) unsafe fn forget(task: u64) {
+    let _ = EXECQ_CAND.remove(&task);
+}
+
+/// Lab PR 226: report a script refused at its interpreter's pass, as a
+/// candidate the kernel did not stop (`SCRIPT_REFUSED`). Fail-open like a
+/// stop: without the agent's heartbeat, with a full ring, or for one of
+/// the agent's own processes, nothing is refused (`false`).
+#[inline(always)]
+unsafe fn refuse_script(cand: *const ExecqCandRaw, task: u64) -> bool {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+    if crate::task_kill::PROTECTED_PIDS.get(&tgid).is_some() {
+        return false;
+    }
+    let now = bpf_ktime_get_ns();
+    let beat = match EXECQ_ALIVE.get(0) {
+        Some(v) => *v,
+        None => 0,
+    };
+    if beat == 0 || (now > beat && now - beat > conf(conf_slot::HEARTBEAT_MAX_NS)) {
+        bump(counter::STALE);
+        return false;
+    }
+    let mut entry = match EXECQ_EVENTS.reserve::<ExecqStopRaw>(0) {
+        Some(e) => e,
+        None => {
+            crate::drops::bump(northnarrow_common::ring_drops::ring_slot::EXECQ);
+            bump(counter::RING_FULL);
+            return false;
+        }
+    };
+    let raw: *mut ExecqStopRaw = entry.as_mut_ptr();
+    crate::zero::zero(raw);
+    let t = task as *const u8;
+    let uid_gid = bpf_get_current_uid_gid();
+    let parent = peek_u64(t.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
+    (*raw).pid = tgid;
+    (*raw).tid = pid_tgid as u32;
+    (*raw).ppid = peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)));
+    (*raw).uid = (uid_gid & 0xFFFF_FFFF) as u32;
+    (*raw).gid = (uid_gid >> 32) as u32;
+    (*raw).timestamp_ns = now;
+    (*raw).start_ns = peek_u64(t.add(off!(TASK_STRUCT_START_TIME_OFFSET)));
+    (*raw).ctime_sec = (*cand).ctime_sec;
+    (*raw).ctime_nsec = (*cand).ctime_nsec;
+    (*raw).size = (*cand).size;
+    (*raw).class = (*cand).class;
+    (*raw).flags = (*cand).flags | stop_flags::SCRIPT | stop_flags::SCRIPT_REFUSED;
+    (*raw).stop_rc = -EACCES;
+    crate::comm::comm_into(&mut (*raw).comm);
+    let _ = gen::bpf_probe_read_kernel(
+        &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
+        core::mem::size_of::<ExeIdentityRaw>() as u32,
+        &(*cand).exe as *const ExeIdentityRaw as *const c_void,
+    );
+    entry.submit(0);
+    bump(counter::SCRIPT_REFUSED);
+    true
 }
 
 /// `sched_process_exec`, in the task that exec'd (`task`): report the
@@ -334,14 +457,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
     (*raw).size = (*cand).size;
     (*raw).class = (*cand).class;
     let mut flags = (*cand).flags;
-    if let Ok(comm) = bpf_get_current_comm() {
-        let dst = (*raw).comm.as_mut_ptr();
-        let mut i = 0usize;
-        while i < TASK_COMM_LEN {
-            *dst.add(i) = comm[i];
-            i += 1;
-        }
-    }
+    crate::comm::comm_into(&mut (*raw).comm);
     let _ = gen::bpf_probe_read_kernel(
         &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
         core::mem::size_of::<ExeIdentityRaw>() as u32,

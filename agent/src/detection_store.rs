@@ -613,6 +613,39 @@ pub struct DetectionRecord {
     /// [`Self::file`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanction: Option<String>,
+    /// Lab PR 226 (EXPERIMENTAL): the exec policy's evidence on its own
+    /// records (`NN-L-EXECPOL-001`, `NN-L-EXECENV-00x`) — the decision, the
+    /// caller's lineage tier and its signals, the classes, the loader
+    /// variables. Absent on every other record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execpol: Option<ExecPolEvidence>,
+}
+
+/// Lab PR 226: what the exec policy saw and decided
+/// ([`DetectionRecord::execpol`]). Frozen like the record: fields are only
+/// ever appended as `Option`s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecPolEvidence {
+    /// `exec` (an exec pass) or `map` (an executable mapping).
+    pub kind: String,
+    /// `deny`, `would deny`, `record`, `quarantine`.
+    pub decision: String,
+    /// `admin`, `session`, `service`, `unknown`.
+    pub tier: String,
+    /// What the tier rests on (`user.slice`, `tty`, `login_uid`…).
+    pub tier_signals: Vec<String>,
+    /// The file's classes.
+    pub classes: Vec<String>,
+    /// Environment findings (`LD_PRELOAD`, `preload_staging`…).
+    pub environment: Vec<String>,
+    /// The captured values (`LD_PRELOAD=/tmp/x.so`), journal-escaped.
+    pub values: Vec<String>,
+    /// The target is set-id: the kernel sets `AT_SECURE` and the loader
+    /// ignores these variables itself.
+    pub at_secure: bool,
+    /// Where the policy came from (`server profile (built in)`,
+    /// `/etc/northnarrow/exec-policy.local (signed)`).
+    pub policy: String,
 }
 
 /// Lab PR 223: what the exec quarantine found and decided
@@ -682,6 +715,7 @@ impl DetectionRecord {
             execq: None,
             network: network_from_event(event),
             sanction: None,
+            execpol: None,
         }
     }
 
@@ -1073,6 +1107,29 @@ impl DetectionSink {
             DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
                 .with_attack(attack);
         record.execq = Some(evidence);
+        record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
+        self.enqueue(record);
+    }
+
+    /// Lab PR 226: record an exec policy finding — a rule-path record of
+    /// `verdict`, with its ATT&CK references (lab PR 221: typed, their ids
+    /// in `mitre`, the version in `mitre_version`) and the policy's
+    /// `evidence`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_execpol(
+        &self,
+        event: &Event,
+        verdict: &Verdict,
+        posture: PostureKind,
+        response: String,
+        attack: &[AttackRef],
+        evidence: ExecPolEvidence,
+        suppressed_before: u64,
+    ) {
+        let mut record =
+            DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
+                .with_attack(attack);
+        record.execpol = Some(evidence);
         record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
         self.enqueue(record);
     }
@@ -1876,6 +1933,7 @@ mod tests {
             execq: None,
             network: None,
             sanction: None,
+            execpol: None,
         };
         assert_roundtrip(&record);
     }
@@ -2997,6 +3055,7 @@ mod tests {
             execq: None,
             network: None,
             sanction: None,
+            execpol: None,
         }
     }
 

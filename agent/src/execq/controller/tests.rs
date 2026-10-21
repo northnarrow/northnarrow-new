@@ -769,3 +769,73 @@ fn repeated_scanner_deaths_are_signed_once_per_window() {
     assert!(d[1].contains("killed by signal"));
     assert!(COUNTERS.scanner_deaths.load(Ordering::Relaxed) >= 4);
 }
+
+/// Lab PR 226: a script the kernel refused at its interpreter's pass
+/// (enforce mode) is one Medium record, "refuse", and nothing is signalled
+/// (no process was held, the caller kept its image).
+#[test]
+fn a_refused_script_is_recorded_and_nothing_is_signalled() {
+    let mut w = world(ScanConfig::default(), enforce(), 2000, false);
+    let script = w.dir.path().join("nn-s.sh");
+    std::fs::write(&script, b"#!/bin/sh\ntrue\n").unwrap();
+    // a pid nothing runs under: a signal to it would fail, a resume too
+    let mut raw = raw_of(999_999, 1, &script, class::TMP);
+    raw.flags |= stop_flags::SCRIPT | stop_flags::SCRIPT_REFUSED;
+    raw.stop_rc = -libc::EACCES;
+    assert!(!raw.stopped());
+    let before = COUNTERS.script_refused.load(Ordering::Relaxed);
+    w.push(raw);
+    w.ctl.step(Instant::now());
+    let recs = w.records();
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    let r = &recs[0];
+    assert_eq!(r.evidence.decision, "refuse");
+    assert_eq!(r.verdict.severity, common::Severity::Medium);
+    assert!(
+        r.response.starts_with("refused at exec (EACCES)"),
+        "{}",
+        r.response
+    );
+    assert!(r
+        .verdict
+        .reasoning
+        .contains("interpreter reads by its path"));
+    assert!(!r.evidence.held);
+    assert_eq!(r.techniques(), ["T1204.002", "T1059"]);
+    assert!(w.k.0.lock().unstopped.is_empty(), "nothing was held");
+    assert!(w.k.0.lock().known.is_empty(), "nothing is cached");
+    assert!(COUNTERS.script_refused.load(Ordering::Relaxed) > before);
+}
+
+/// Lab PR 226: in observe mode a held-path script is scanned but the
+/// record says it would be refused (the interpreter re-reads the file by
+/// path after any scan), and its content is remembered (one record).
+#[test]
+fn observe_mode_says_a_script_would_be_refused() {
+    let dir = tempfile::Builder::new().prefix("nnq").tempdir().unwrap();
+    let h = held_copy(dir.path(), "nn-obs-s");
+    // SAFETY: resuming our own child: observe mode holds nothing.
+    unsafe { libc::kill(h.pid as i32, libc::SIGCONT) };
+    let mut w = world(
+        ScanConfig::default(),
+        Policy {
+            enforce: false,
+            ..Policy::default()
+        },
+        2000,
+        true,
+    );
+    let mut raw = raw_for(&h, class::HOME);
+    raw.flags |= stop_flags::OBSERVE | stop_flags::SCRIPT;
+    w.push(raw);
+    w.run_until(|w| !w.records().is_empty());
+    let r = &w.records()[0];
+    assert_eq!(r.evidence.decision, "would refuse");
+    assert!(
+        r.response.starts_with("observe: would refuse at exec"),
+        "{}",
+        r.response
+    );
+    assert!(state(h.pid).is_some_and(|s| s != 'Z'), "observe killed it");
+    assert_eq!(w.k.0.lock().known.len(), 1, "one record per content");
+}

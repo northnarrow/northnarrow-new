@@ -791,6 +791,62 @@ struct Cli {
         default_value = northnarrow_agent::execq::DEFAULT_HASHES_LOCAL
     )]
     execq_hashes_local: PathBuf,
+
+    /// Lab PR 226 (EXPERIMENTAL): synchronous exec policies
+    /// (docs/design/EXEC_POLICY.md). `off` (default); `audit`: every exec a
+    /// deny cell names (memfd, a deleted file, /dev/shm for services and
+    /// sessions in the server profile) is recorded as "would deny" and
+    /// runs; `enforce`: it is refused with EACCES before the exec's point
+    /// of no return. Quarantine cells hand the exec to --exec-quarantine.
+    /// The loader variables (LD_PRELOAD, LD_AUDIT into a staging path) and
+    /// the executable mappings of staging files are judged by the same
+    /// policy. A detect-only agent audits.
+    #[arg(
+        long = "exec-policy",
+        env = "NN_EXEC_POLICY",
+        value_enum,
+        default_value_t = northnarrow_agent::execpol::Mode::Off
+    )]
+    exec_policy: northnarrow_agent::execpol::Mode,
+
+    /// The built-in table the signed overlay starts from: `server`
+    /// (default) or `desktop` (a login session's own staging locations
+    /// allowed: AppImage, build trees; memfd and deleted files recorded).
+    #[arg(
+        long = "exec-policy-profile",
+        env = "NN_EXEC_POLICY_PROFILE",
+        value_enum,
+        default_value_t = northnarrow_agent::execpol::Profile::Server
+    )]
+    exec_policy_profile: northnarrow_agent::execpol::Profile,
+
+    /// The signed policy (`exec <class> <tier> <action>`…), stored with
+    /// `nn-admin config overlay set exec-policy`.
+    #[arg(
+        long = "exec-policy-local",
+        value_name = "PATH",
+        default_value = northnarrow_agent::execpol::DEFAULT_POLICY_LOCAL
+    )]
+    exec_policy_local: PathBuf,
+
+    /// Do not read the new environment at exec (no LD_PRELOAD / LD_AUDIT /
+    /// GLIBC_TUNABLES / history checks). Also `NN_EXEC_POLICY_NO_ENV=1`
+    /// (1/0, true/false, yes/no, on/off).
+    #[arg(
+        long = "exec-policy-no-env",
+        env = "NN_EXEC_POLICY_NO_ENV",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    exec_policy_no_env: bool,
+
+    /// Do not judge executable mappings (`mmap_file`). Also
+    /// `NN_EXEC_POLICY_NO_MAP=1` (1/0, true/false, yes/no, on/off).
+    #[arg(
+        long = "exec-policy-no-map",
+        env = "NN_EXEC_POLICY_NO_MAP",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    exec_policy_no_map: bool,
 }
 
 impl Cli {
@@ -2009,6 +2065,44 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     );
     let execq_mode = execq_cfg.mode;
     northnarrow_agent::execq::configure(execq_cfg);
+    // Lab PR 226 (EXPERIMENTAL): the exec policy, its signed table read
+    // now (the kernel configuration is written and frozen when the
+    // multiplexer starts); a detect-only agent audits.
+    let execpol_mode = {
+        use northnarrow_agent::execpol::{self as ep, Mode};
+        let detect_only =
+            cli.detect_only || northnarrow_agent::response::config::detect_only_env().is_some();
+        let mode = match cli.exec_policy {
+            Mode::Enforce if detect_only => Mode::Audit,
+            m => m,
+        };
+        let boot = if mode == Mode::Off {
+            ep::boot_table(None, cli.exec_policy_profile)
+        } else {
+            match overlay_gate.verified(OverlayKind::ExecPolicy, &cli.exec_policy_local) {
+                northnarrow_agent::config::overlay_auth::Verified::Content { path, text } => {
+                    ep::boot_table(Some((&path, &text)), cli.exec_policy_profile)
+                }
+                _ => ep::boot_table(None, cli.exec_policy_profile),
+            }
+        };
+        if let Some(detail) = &boot.degraded {
+            error!(detail = %detail, "exec policy unreadable — the built-in profile applies");
+            // A signed file `overlay set` would refuse (a bad line) found at
+            // boot: the operator's table is not in force — a signed
+            // degradation, listed by `status --key`, not only a log line.
+            northnarrow_agent::boot::degradation::report("exec_policy", detail);
+        }
+        let ep::BootTable { table, source, .. } = boot;
+        ep::configure(ep::Config {
+            mode,
+            table,
+            source,
+            env: !cli.exec_policy_no_env,
+            map: !cli.exec_policy_no_map,
+        });
+        mode
+    };
     // External audit DEP-006: the previous boot's program-id list goes before
     // this boot loads anything — its programs are replaced now, and a list
     // that cannot be rewritten must not outlive them (the scripts then fall
@@ -4662,6 +4756,32 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }
     };
 
+    // Lab PR 226 (EXPERIMENTAL): the exec policy's controller — the slices
+    // and images published, the kernel's reports into signed records —
+    // and each part of the policy that could not start, signed.
+    let execpol_handle = if execpol_mode == northnarrow_agent::execpol::Mode::Off {
+        None
+    } else {
+        let posture_for_execpol = posture.clone();
+        let recorder = northnarrow_agent::execpol::record::SinkRecorder {
+            sink: detection_sink.clone(),
+            posture: Box::new(move || posture_for_execpol.current_kind()),
+        };
+        let execq_on = execq_handle.is_some();
+        let handle = match northnarrow_agent::execpol::start(Box::new(recorder), execq_on) {
+            Ok(h) => Some(h),
+            Err(why) => {
+                error!(reason = %why, "exec policy controller NOT running — nothing is recorded");
+                attest_degraded(audit_log.as_ref(), &format!("exec policy: {why}"));
+                None
+            }
+        };
+        for why in northnarrow_agent::execpol::degradations() {
+            attest_degraded(audit_log.as_ref(), &why);
+        }
+        handle
+    };
+
     // Install the three shutdown signals up front, before the loop.
     // Re-creating the future inside `select!` every iteration (the
     // old `signal::ctrl_c()` shorthand) re-runs handler registration
@@ -4887,6 +5007,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     }
     // Lab PR 223: nothing stays held by an agent that stops.
     northnarrow_agent::execq::shutdown(execq_handle);
+    // Lab PR 226: the kernel keeps the policy until its programs detach.
+    northnarrow_agent::execpol::shutdown(execpol_handle);
     // The links go with the agent from here on: the self-check stops
     // reporting them (a spurious signed bpf_link_missing otherwise).
     northnarrow_agent::anti_tamper::bpf_defense::mark_stopping();
@@ -6689,10 +6811,16 @@ mod tests {
     /// on/off; anything else is refused, never read as on.
     #[test]
     fn env_switches_read_1_and_0() {
-        const SWITCHES: &[(&str, &str)] = &[("NN_NET_CONNECT_DENY", "--net-connect-deny")];
+        const SWITCHES: &[(&str, &str)] = &[
+            ("NN_NET_CONNECT_DENY", "--net-connect-deny"),
+            ("NN_EXEC_POLICY_NO_ENV", "--exec-policy-no-env"),
+            ("NN_EXEC_POLICY_NO_MAP", "--exec-policy-no-map"),
+        ];
         fn get(cli: &Cli, flag: &str) -> bool {
             match flag {
                 "--net-connect-deny" => cli.net_connect_deny,
+                "--exec-policy-no-env" => cli.exec_policy_no_env,
+                "--exec-policy-no-map" => cli.exec_policy_no_map,
                 _ => unreachable!("{flag}"),
             }
         }

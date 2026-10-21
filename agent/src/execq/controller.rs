@@ -397,6 +397,10 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
     // ── inputs ───────────────────────────────────────────────────────
 
     fn on_stop(&mut self, raw: ExecqStopRaw, now: Instant) {
+        if raw.flags & stop_flags::SCRIPT_REFUSED != 0 {
+            self.script_refused(raw);
+            return;
+        }
         let id = self.next_id;
         self.next_id += 1;
         let held = raw.stopped();
@@ -482,6 +486,50 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
                 late_until: None,
             },
         );
+    }
+
+    /// Lab PR 226: a script the kernel refused at its interpreter's pass
+    /// (enforce mode): recorded, nothing to resume or scan.
+    fn script_refused(&mut self, raw: ExecqStopRaw) {
+        COUNTERS.script_refused.fetch_add(1, Ordering::Relaxed);
+        let mut event = Event::ExecCheck {
+            pid: raw.pid,
+            ppid: raw.ppid,
+            uid: raw.uid,
+            comm: common::wire::cstr_lossy(&raw.comm).into_owned(),
+            filename: String::new(),
+            timestamp_ns: raw.timestamp_ns,
+            exe: ExeIdentity::from_raw(&raw.exe),
+        };
+        crate::sensors::exe_identity::resolve(&mut event);
+        let path = match &event {
+            Event::ExecCheck { exe, .. } => exe.path.clone(),
+            _ => String::new(),
+        };
+        let o = decide(&self.s.policy, &Basis::ScriptRefused);
+        info!(
+            pid = raw.pid,
+            path = %common::log_escape::Escaped(&path),
+            "exec quarantine: script refused at exec"
+        );
+        let ev = evidence(
+            None,
+            &o,
+            true,
+            false,
+            0,
+            raw.class,
+            &["target: script (refused at its interpreter's pass)".to_string()],
+        );
+        self.r.detection(ExecqRecord::new(
+            event,
+            &path,
+            &o,
+            ev,
+            "refused at exec (EACCES): the caller kept its image, the interpreter never ran"
+                .to_string(),
+            "script:",
+        ));
     }
 
     fn on_scanner(&mut self, ev: ScannerEvent, now: Instant) {
@@ -684,7 +732,13 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let Some(p) = self.entries.get(&id) else {
             return;
         };
-        let basis = if let Some(b) = &p.basis {
+        // Lab PR 226: observe mode — a script would have been refused
+        // (enforce refuses it in the kernel; it never gets here).
+        let script =
+            p.raw.flags & stop_flags::SCRIPT != 0 && p.raw.flags & stop_flags::INTERP_PASS == 0;
+        let basis = if script && !self.s.policy.enforce {
+            Basis::ScriptRefused
+        } else if let Some(b) = &p.basis {
             b.clone()
         } else if let Some(r) = &p.scan {
             if r.verdict == ScanVerdict::Clean && self.known.contains(&r.sha256) {
@@ -763,7 +817,9 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let held = was_held && !late;
         let alive = p.proc_ref.is_live();
         let pid = p.raw.pid;
-        let mut out = if !enforce {
+        let mut out = if !enforce && o.refused {
+            "observe: would refuse at exec (not held, the script ran)".to_string()
+        } else if !enforce {
             format!("observe: would {} (not held)", o.action.as_str())
         } else {
             match o.action {

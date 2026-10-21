@@ -408,8 +408,8 @@ only in the table below, in the same PR as the evidence.
   - What changed: `Rule::attack()` (required, no default) returns typed
     references — a `Tactic` enum and technique ids whose shape is checked
     when the constant compiles — of ATT&CK Enterprise 20.0 (2026-10-13).
-    All 89 rules (lab PR 219's two, 223's NN-L-EXECQ-001, 224's three and
-    225's six included) are mapped: 64 techniques and sub-techniques under 12
+    All 93 rules (lab PR 219's two, 223's NN-L-EXECQ-001, 224's three,
+    225's six and 226's four included) are mapped: 66 techniques and sub-techniques under 12
     tactics. A rule detection record carries the ids in `mitre` and
     `mitre_version` `"20.0"` (an additive field: older lines keep their
     bytes and verify). The ids in use are pinned with their v20 names,
@@ -608,3 +608,51 @@ only in the table below, in the same PR as the evidence.
     stops, no operator overlay of the tool list yet.
   - Lab: On Debian 12 (6.1), Ubuntu 24.04 (6.8), Ubuntu 22.04 (5.15) and Debian 13 (6.12): fim_rename_observe, fim_unlink_observe and task_kill loaded with no verifier rejection, DEFENDER_PIDS in use with the listed tools that run registered (auditd and rsyslogd on 24.04, rsyslogd on 22.04, none on the Debian cloud images, which run neither), security-tools.v1 installed (33 tools), the ransomware and security-tool lines in the signed status. On 24.04 the lot's ransom-check.sh passed 19 of 19 (against `main`: MS-23 and MS-25 drew no record, 8 KNOWN GAP, its 11 negatives clean): MS-23 in place and copy-delete each drew a Critical NN-L-IMP-001 whose kill is held (response none: alert only by default), the simulator ran to its end (300 of 300 files), the posture reached ENGAGED and never COMBAT on RansomwareEncryption; the simulator's own gzip-delete and move-away scripts, tar (twice), rsync (twice), a git checkout and an apt install / reinstall of 400 random files drew none; MS-25 `systemctl stop auditd`, `auditctl -e 0`, a builtin `kill -STOP` of a restarted auditd, a rule file in /etc/audit/rules.d and `ufw disable` each drew its High NN-L-EVA record, none a kill. NN-L-EVA-002, which drew dozens of High records for one `ufw disable` (one per iptables call of ufw-init), was fixed in this lot before the lab: 5 records for `auditctl -e 0` and `ufw disable`, the repeats counted in a signed detections_held row. Run on their own, tar, rsync and rm bursts (new files, the same tree again, unlinks) were judged trusted writers (the status counter 0 → 6, no shape counted, no record); in the harness's run its tar / rsync negatives left no burst line at all (an open observation). A watched file renamed x → x.locked drew one Critical NN-L-FIM-010 naming the file, the verdict's reasoning naming x.locked (the watched file's own rename keeps its kill, which predates the lot). After the decision that a stop or restart of the agent's own units inside a valid signed trusted-installer window is sanctioned, the build with it ran on 24.04: two restarts inside a window each drew one Low NN-L-EVA-001 whose sanction names the window ("key c2e8f3da (until 2026-10-21T12:41:37Z)"), and the posture stayed at OBSERVING; with no window, and after a 2 s window had expired, `systemctl kill` of the agent's unit was refused (the agent kept its pid) and drew a High record with a DefenseImpairment transition; auditd stopped inside a valid window was High too; MS-25 passed 5 of 5 (none a kill, NN-L-EVA-002 coalesced), trust225 judged six bursts trusted; the upgrade-check from `main` passed, and a second one over the installed build drew two Low NN-L-EVA-001 (install.sh's stops, an administrator's sudo session at a terminal) with no posture change. Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).
 
+- **Lab PR 226 — synchronous exec policies and the exec environment
+  (EXPERIMENTAL).** C12 (synchronous inline blocking), C13 (malware
+  prevention); countermeasures CM-01, CM-25; `docs/design/EXEC_POLICY.md`.
+  Off by default.
+  - C12: `bprm_check_security` returns the policy's verdict — `-EACCES`
+    before the exec's point of no return — for a file class (memfd, deleted,
+    `/dev/shm`, `/tmp`, `/var/tmp`, world-writable, tmpfs, home, another
+    user's home, guarded mount) × a lineage tier computed in the kernel
+    (interactive admin, session, service, unknown: the systemd slice, the
+    login uid, the terminal, an elevation binary's image up the lineage);
+    quarantine cells hand the exec to lab PR 223's stop-and-scan, audit
+    cells and classes record "would deny". `LD_PRELOAD`/`LD_AUDIT` into a
+    staging path are refused at exec (server profile) for services,
+    unknown callers and root in a session — an admin-tier root caller is
+    recorded only (`AT_SECURE` targets left to the kernel) — and
+    `mmap_file` judges
+    executable mappings from the same classes. The quarantine refuses a
+    script it would hold (the interpreter re-reads it by path after the
+    scan).
+  - C13: memfd, deleted-file and `/dev/shm` execs refused outside an
+    interactive admin session in the server profile (MS-01, MS-02, MS-03);
+    `GLIBC_TUNABLES` of the CVE-2023-4911 shape at a set-id exec recorded
+    Critical.
+  - Evidence so far: unit tests — the server profile and its encoding
+    into the kernel configuration (the desktop profile on a few cells), the
+    overlay grammar (a bad line refuses the file at `overlay set`; at boot
+    it is a signed degradation), the records and their ATT&CK mapping for
+    the exec, preload and environment findings (not EXECENV-003's mapping
+    record), the repeat window, the controller publishing the slices and
+    roots (the images' encoding is tested on its own), the quarantine's
+    "would refuse" script on a real process (the refusal on a pid nothing
+    runs under), the wire layouts, the BTF and tracepoint slots; the eBPF
+    object built; the three clippy runs, `cargo fmt`, `cargo test
+    --workspace`. Not tested: the configuration freeze (`BPF_MAP_FREEZE`).
+    Levels unchanged (C12 1, C13 0): the guest checks are owed — the four
+    phases of `deploy/lab/malsim/exec-check.sh` (MS-01, MS-02, MS-03, MS-32
+    before and after, the environment and mapping records, the negatives,
+    audit, the desktop profile) on 5.15, 6.1, 6.8, 6.12 and RHEL 9, the
+    per-exec cost.
+    Open: the environment check reads string prefixes at the syscall's
+    entry (a racing caller, `//tmp`, symlinks: the mapping check is the
+    line that does not depend on them); `file_mprotect` is not judged; a
+    root attacker can forge the admin tier; quarantine cells need
+    `--exec-quarantine`; the rules are outside the frozen V2 denominator.
+    (Integration w4b: T1204.002 — EXECPOL-001 — and T1129 — EXECENV-003 —
+    checked active in the ATT&CK 20.0 bundle and pinned; the mapping is lab
+    PR 221's typed one.)
+  - Lab: On Debian 12 (6.1), Ubuntu 24.04 (6.8), Ubuntu 22.04 (5.15) and Debian 13 (6.12), with NN_EXEC_POLICY=enforce: the exec policy armed in the kernel with the environment and mapping checks on, exec_check_lsm, execpol_env_execve / execveat and execmap_check loaded with no verifier rejection, the signed status `enforce; 1 partial` whose one note is the server profile's quarantine cells while the exec quarantine is off (no other degradation), off again once the drop-in was removed. On 24.04 the lot's exec-check.sh passed 20 of 20: with the policy off MS-01/02/03/32 ran (MS-01 then killed by R002, MS-02/03 recorded by R004, rules that predate the policy); in enforce a service's /dev/shm copy of id (MS-01), memfd exec (MS-02), exec of a deleted file (MS-03) and LD_PRELOAD from /tmp (MS-32) were refused at exec (EACCES / exit 203), each a signed NN-L-EXECPOL-001 or NN-L-EXECENV-001 deny at the service tier, counted 0 → 3 in the signed status; the `//tmp` preload side-step was recorded through the loader's mapping (NN-L-EXECENV-003), HISTFILE=/dev/null and a CVE-2023-4911-shaped GLIBC_TUNABLES at su recorded; the lab user's script in its home (session tier) and through sudo at a terminal (admin tier), a package install and removal and systemd services ran with no deny; audit mode recorded MS-01 as "would deny"; the desktop profile let an AppImage-shaped run from /tmp/.mount_* and a Flatpak-shaped one through and kept services strict. The 9 exec policy records each carried their execpol evidence (decision, tier) and ATT&CK 20.0 ids within the catalogue's. With the exec quarantine on as well, a /tmp script started by a service was refused at exec (NN-L-EXECQ-001 decision refuse, script_refused 0 → 1). NN_EXEC_POLICY_NO_ENV / _NO_MAP now read 1/0, true/false, yes/no, on/off, like lab PR 224's switch whose `=1` stopped the agent in the lab (a unit test; not run on a guest). Gate: the integration tree of lab PRs 219–226 on `main` (the guest gates ran integ/w4b f69fae9; the final f1284c7 adds the fix of the lab harness deploy/lab/cow/cow-check.sh and two fixups — lab PR 225's sanction of the agent's own units inside the trusted-installer window, lab PR 222's fanotify reader — whose build passed on 24.04 the smoke, the window's cases, MS-25, trust225, the guard's restart and two upgrade-checks): Ubuntu 24.04 (6.8), Debian 12 (6.1) and Ubuntu 22.04 (5.15) 54 suites, 80 passed, 0 failed; Debian 13 (6.12) 54 suites, 79 passed, 1 failed — `net_outbound_connect_records_flow_with_dns_attribution`, the same on `main` there (nss-resolve, a recorded follow-up); on each guest first the smoke step: `nn-lab.sh verifier-check` exit 0 (76 of 76 programs OK on 6.8 and 6.12, 74 on 6.1 and 5.15 with the two optional ACL hooks absent, 0 failing), both units active, no refused / attach FAILED / NOT running in the agent's journal, 0 degradations; anti-tamper suite on 24.04 and 22.04: 72 of 75 cases OK, C27 (no lockdown) and C57c (journal vacuum) known gaps, C64 the stale own link id of lab PR 215 (a recorded follow-up, as in the lab of lots 214–218); deny fail-opens 0 on every guest over the whole run; `upgrade-check` from `main` OK on 24.04; host 2,828 passed, 0 failed (f1284c7).

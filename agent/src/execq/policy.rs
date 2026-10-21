@@ -11,6 +11,7 @@
 //! | malicious (block list) | kill + quarantine | no | Critical |
 //! | unscanned, unreachable, budget expired | `on_expiry` (resume) | no | Medium |
 //! | left stopped by an agent that died | resume | no | Medium |
+//! | a `#!` script (lab PR 226) | refused at exec (enforce), "would refuse" (observe) | observe only | Medium |
 //!
 //! The defaults in this lot resume and alert; every row is a signed
 //! detection record except the known-hash one (its first sight was).
@@ -78,6 +79,11 @@ pub enum Basis {
     Unreachable { detail: String },
     /// Found stopped at boot: the previous agent died before deciding.
     Recovered,
+    /// Lab PR 226: a `#!` script (or a binfmt_misc input). The interpreter
+    /// opens it by its path once it runs, so a scan made while it is held
+    /// cannot vouch for what it reads: refused at exec in enforce mode,
+    /// "would refuse" in observe mode.
+    ScriptRefused,
 }
 
 /// The decision.
@@ -95,6 +101,8 @@ pub struct Outcome {
     pub severity: Severity,
     /// One phrase for the record (`scanned clean`, `budget expired: …`).
     pub why: String,
+    /// Lab PR 226: the exec is refused (a script), not resumed or killed.
+    pub refused: bool,
 }
 
 pub fn decide(policy: &Policy, basis: &Basis) -> Outcome {
@@ -107,6 +115,7 @@ pub fn decide(policy: &Policy, basis: &Basis) -> Outcome {
             record,
             severity,
             why,
+            refused: false,
         };
     let fallback = |why: String| Outcome {
         action: policy.on_expiry,
@@ -116,6 +125,7 @@ pub fn decide(policy: &Policy, basis: &Basis) -> Outcome {
         record: true,
         severity: Severity::Medium,
         why,
+        refused: false,
     };
     match basis {
         Basis::Scanned(ScanVerdict::Clean) => resume(
@@ -162,6 +172,7 @@ pub fn decide(policy: &Policy, basis: &Basis) -> Outcome {
                 record: true,
                 severity: Severity::High,
                 why: "suspicious, killed by policy (on-suspicious kill)".into(),
+                refused: false,
             },
         },
         Basis::Scanned(ScanVerdict::Malicious) => Outcome {
@@ -172,6 +183,7 @@ pub fn decide(policy: &Policy, basis: &Basis) -> Outcome {
             record: true,
             severity: Severity::Critical,
             why: "block-listed content".into(),
+            refused: false,
         },
         Basis::Scanned(ScanVerdict::Unscanned) => fallback(format!(
             "not scanned, default policy ({})",
@@ -193,6 +205,20 @@ pub fn decide(policy: &Policy, basis: &Basis) -> Outcome {
             record: true,
             severity: Severity::Medium,
             why: "left stopped by an agent that exited before deciding; resumed at boot".into(),
+            refused: false,
+        },
+        Basis::ScriptRefused => Outcome {
+            action: Action::Resume,
+            quarantine: false,
+            // observe mode: one "would refuse" per script content
+            cache: (!policy.enforce).then_some(known_verdict::RESUMED),
+            known_clean: false,
+            record: true,
+            severity: Severity::Medium,
+            why: "a script the interpreter reads by its path after the scan (the file can change \
+                  in between): refused at exec"
+                .into(),
+            refused: true,
         },
     }
 }
@@ -334,6 +360,34 @@ mod tests {
         }
         let o = decide(&p(Action::Kill, Action::Kill), &Basis::Recovered);
         assert_eq!(o.action, Action::Resume, "never kill blind at boot");
+    }
+
+    /// Lab PR 226: a script is refused, never resumed on a scan of a file
+    /// the interpreter re-reads.
+    #[test]
+    fn a_script_is_refused() {
+        let o = decide(&Policy::default(), &Basis::ScriptRefused);
+        assert!(o.refused && o.record && !o.known_clean && !o.quarantine);
+        assert_eq!(o.cache, None, "enforce: nothing ran, nothing to cache");
+        assert_eq!(o.severity, Severity::Medium);
+        assert!(o.why.contains("refused at exec"));
+        let observe = Policy {
+            enforce: false,
+            ..Policy::default()
+        };
+        let o = decide(&observe, &Basis::ScriptRefused);
+        assert_eq!(
+            o.cache,
+            Some(known_verdict::RESUMED),
+            "one record per content"
+        );
+        for b in [
+            Basis::KnownHash,
+            Basis::Recovered,
+            Basis::Scanned(ScanVerdict::Clean),
+        ] {
+            assert!(!decide(&Policy::default(), &b).refused);
+        }
     }
 
     #[test]

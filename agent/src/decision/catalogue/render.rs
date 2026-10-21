@@ -245,8 +245,10 @@ pub struct ShippedRule {
 /// production engine's rules (built as main.rs builds them, over empty
 /// operator state) and NN-L-AT-001 and NN-L-EPG-001/002 (lab PR 219), which
 /// `process_event` issues outside the engine (the denominator of
-/// `docs/validation/v2-rules.tsv`), then NN-L-EXECQ-001 (lab PR 223), which
-/// the exec quarantine's controller records (not in that denominator).
+/// `docs/validation/v2-rules.tsv`), then NN-L-EXECQ-001 (lab PR 223) and
+/// NN-L-EXECPOL-001 / NN-L-EXECENV-001..003 (lab PR 226), which the exec
+/// quarantine's and the exec policy's controllers record (not in that
+/// denominator).
 pub fn shipped_rules() -> Vec<ShippedRule> {
     use crate::config::comm_allowlist::CommAllowlist;
     use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
@@ -301,6 +303,24 @@ pub fn shipped_rules() -> Vec<ShippedRule> {
         category: crate::execq::CATEGORY,
         attack: crate::execq::ATTACK,
     });
+    // Lab PR 226: the exec policy's four rules, recorded by its controller
+    // too.
+    {
+        use crate::execpol::{self as ep, record as epr};
+        for (id, name, attack) in [
+            (ep::RULE_EXEC, ep::RULE_EXEC_NAME, epr::ATTACK_EXEC),
+            (ep::RULE_PRELOAD, ep::RULE_PRELOAD_NAME, epr::ATTACK_PRELOAD),
+            (ep::RULE_ENV, ep::RULE_ENV_NAME, epr::ATTACK_ENV),
+            (ep::RULE_MAP, ep::RULE_MAP_NAME, epr::ATTACK_MAP),
+        ] {
+            rules.push(ShippedRule {
+                id,
+                name,
+                category: ep::CATEGORY,
+                attack,
+            });
+        }
+    }
     rules
 }
 
@@ -691,8 +711,15 @@ fn render_coverage(inp: &Inputs) -> String {
 
 /// The id prefixes of the rules the agent issues outside the engine:
 /// NN-L-AT-001 (an anti-tamper denial) and the exploit post-condition
-/// guard's (lab PR 219); the exec quarantine's controller's (lab PR 223).
-const OUTSIDE_ENGINE: &[&str] = &["NN-L-AT-", "NN-L-EPG-", "NN-L-EXECQ-"];
+/// guard's (lab PR 219); the exec quarantine's controller's (lab PR 223);
+/// the exec policy's controller's (lab PR 226).
+const OUTSIDE_ENGINE: &[&str] = &[
+    "NN-L-AT-",
+    "NN-L-EPG-",
+    "NN-L-EXECQ-",
+    "NN-L-EXECPOL-",
+    "NN-L-EXECENV-",
+];
 
 fn render_catalogue(inp: &Inputs) -> String {
     let p = &inp.pinned;

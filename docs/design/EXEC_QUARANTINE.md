@@ -34,9 +34,17 @@ guarded class (`wire::execq::class`) and its identity is not cached:
 | `deleted` | `i_nlink == 0` (unlinked, `O_TMPFILE`) |
 | `tmpfs` | tmpfs, hugetlbfs or ramfs superblock (`/dev/shm`, `/run`, a tmpfs `/tmp`) |
 | `world_writable_dir` | the parent directory's mode has `S_IWOTH` |
-| `tmp` | the task's own view starts with `/tmp/` or `/var/tmp/` |
+| `tmp` | the task's own view starts with `/tmp/` (lab PR 226: `/var/tmp` is its own class) |
+| `var_tmp` | the task's own view starts with `/var/tmp/` (lab PR 226) |
+| `dev_shm` | the task's own view starts with `/dev/shm/` (lab PR 226) |
 | `home` | the task's own view starts with `/home/` or `/root/` |
-| `guarded_mount` | the walk ended on the root of a filesystem mounted at a guarded point (a separate `/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`): `EXECQ_ROOTS`, refreshed by the agent every 10 s from `mountinfo` |
+| `other_home` | `home`, and owned by neither the caller's real uid nor root (lab PR 226) |
+| `guarded_mount` | the walk ended on the root of a filesystem mounted at a guarded point (a separate `/home`, `/tmp`, `/var/tmp`, `/root`, `/dev/shm`, `/run/user/*`): `EXECQ_ROOTS`, refreshed by the agent every 10 s from `mountinfo`. Lab PR 226: the root's value says which point (`root_kind`), and the file gets that point's class too (`tmp`, `var_tmp`, `dev_shm`, `home`) |
+
+Lab PR 226: with the exec policy on (`--exec-policy audit|enforce`,
+`docs/design/EXEC_POLICY.md`) the guard holds only the execs a quarantine
+cell of the policy names (the file's class × the caller's lineage tier);
+without it, every candidate of its classes, as here.
 
 The path classes read the walk's top components, so a container's or a
 chroot's `/tmp` is guarded in its own view. Package-managed binaries live
@@ -137,6 +145,7 @@ For each candidate:
 | block list | kill + quarantine | no | Critical |
 | budget expired, not scannable, scanner unavailable | `--exec-quarantine-on-expiry` (resume) | no | Medium |
 | left stopped by an agent that died | resume | no | signed audit entry |
+| a `#!` script (lab PR 226) | refused at exec in enforce mode; observe: "would refuse" | observe only | Medium |
 
 A held process whose scanner cannot be back before its budget runs out is
 decided at once on the default policy, not after the budget. A verdict that
@@ -308,9 +317,17 @@ only by location.
 What it does **not** stop:
 
 - **Interpreted code.** A `#!` script executed directly from a guarded
-  location is a candidate: its interpreter is held, the script is opened by
-  path (its inode checked), hashed against the lists, and its `#!` line
-  judged; the ELF heuristics do not apply. A script handed to an interpreter
+  location is a candidate. Lab PR 226 (design review): the interpreter
+  opens the script by its path once it runs — and a shell reads it as it
+  goes — so a scan made while it is held cannot vouch for what it executes
+  (the file rewritten, or another renamed onto the path, in between).
+  Handing it a sealed memfd copy would mean rewriting a stopped process's
+  argv and planting a descriptor in it; the simplest safe option is taken:
+  in enforce mode the kernel **refuses** the exec at the interpreter's pass
+  (`-EACCES`, before the point of no return; `SCRIPT_REFUSED`, counted, a
+  Medium record, decision `refuse`; a binfmt_misc input likewise). Observe
+  mode opens the script by path (its inode checked), hashes it against the
+  lists, judges its `#!` line and records "would refuse". A script handed to an interpreter
   (`bash /tmp/x.sh`, `python3 x.py`, `curl … | sh`, `perl -e`) is no exec of
   the script: the exec is the interpreter's, package-managed, never held. The
   exec rules and the FIM see what they see.

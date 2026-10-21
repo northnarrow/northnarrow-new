@@ -12,16 +12,20 @@
 //! `sys_enter_execve` writes in tracepoint mode). On pass 0, the file the
 //! caller named, it also leaves the identity in [`EXEC_HANDOFF`] for
 //! `sched_process_exec`, which runs in the same task once the exec has
-//! succeeded and appends it to `ProcessSpawnRaw`. Observe only: the
-//! program always returns 0 (Q4: the deny belongs to the 10.9
-//! inline-enforcement item). Lab PR 223: each pass is also offered to the
-//! exec quarantine (`crate::execq::note_pass`), which holds the new image
-//! from `sched_process_exec` instead of denying the exec.
+//! succeeded and appends it to `ProcessSpawnRaw`. Lab PR 223: each pass
+//! is also offered to the exec quarantine (`crate::execq::note_pass`),
+//! which holds the new image from `sched_process_exec` instead of denying
+//! the exec. Lab PR 226 (EXPERIMENTAL): the exec policy
+//! (`crate::execpol::on_pass`) may refuse the pass — the program's first
+//! non-zero return, `-EACCES` before the exec's point of no return — and
+//! decides which execs the quarantine holds; the quarantine refuses a
+//! `#!` script it would hold (the interpreter would re-read the file by
+//! its path after the scan).
 use aya_ebpf::{
     cty::c_void,
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, gen,
+        bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid,
+        bpf_ktime_get_ns, gen,
     },
     macros::{lsm, map},
     maps::{LruHashMap, PerCpuArray},
@@ -30,7 +34,7 @@ use aya_ebpf::{
 use northnarrow_common::wire::exe::{
     exe_flags, exe_path_slot, ExeIdentityRaw, EXE_PATH_SLOTS, EXE_PATH_SLOT_LEN, EXE_WALK_DEPTH,
 };
-use northnarrow_common::wire::{ExecCheckRaw, FILENAME_LEN, TASK_COMM_LEN};
+use northnarrow_common::wire::{ExecCheckRaw, FILENAME_LEN};
 
 use crate::btf_offsets::{
     DENTRY_D_INODE_OFFSET, DENTRY_D_NAME_OFFSET, DENTRY_D_PARENT_OFFSET, FILE_F_INODE_OFFSET,
@@ -74,36 +78,41 @@ unsafe fn peek_u32(src: *const u8) -> u32 {
     v.assume_init()
 }
 
+/// Lab PR 223/226 (verifier, KERNEL_COMPATIBILITY "Older verifiers", rule
+/// 9): inlined into the program's entry. Left to the compiler, this body
+/// became a static subprogram called with the hook's context, and before
+/// 6.3 every precision mark that reached its first instruction marked all
+/// scalars precise.
 #[lsm(hook = "bprm_check_security")]
+#[inline(always)]
 pub fn exec_check_lsm(ctx: LsmContext) -> i32 {
-    unsafe { try_exec_check_lsm(&ctx) };
-    0
+    unsafe { try_exec_check_lsm(&ctx) }
 }
 
 #[inline(always)]
-unsafe fn try_exec_check_lsm(ctx: &LsmContext) {
+unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
     // Kernel signature: (bprm).
     let bprm: *const u8 = ctx.arg(0);
     if bprm.is_null() {
-        return;
+        return 0;
     }
     // Optional offsets, one at a time (5.15 rule 3); userland attaches
     // this program only when all of them resolved.
     let o_file = match off_opt!(LINUX_BINPRM_FILE_OFFSET) {
         Some(o) => o & 0xffff,
-        None => return,
+        None => return 0,
     };
     let o_filename = match off_opt!(LINUX_BINPRM_FILENAME_OFFSET) {
         Some(o) => o & 0xffff,
-        None => return,
+        None => return 0,
     };
     let o_interp = match off_opt!(LINUX_BINPRM_INTERP_OFFSET) {
         Some(o) => o & 0xffff,
-        None => return,
+        None => return 0,
     };
     let s = match EXEC_SCRATCH.get_ptr_mut(0) {
         Some(p) => p,
-        None => return,
+        None => return 0,
     };
     let file = peek_u64(bprm.add(o_file)) as *const u8;
     let filename = peek_u64(bprm.add(o_filename)) as *const u8;
@@ -157,14 +166,7 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) {
             (*raw).timestamp_ns = bpf_ktime_get_ns();
             let parent = peek_u64(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
             (*raw).ppid = peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)));
-            if let Ok(comm) = bpf_get_current_comm() {
-                let dst = (*raw).comm.as_mut_ptr();
-                let mut i = 0usize;
-                while i < TASK_COMM_LEN {
-                    *dst.add(i) = comm[i];
-                    i += 1;
-                }
-            }
+            crate::comm::comm_into(&mut (*raw).comm);
             let _ = gen::bpf_probe_read_kernel_str(
                 (*raw).filename.as_mut_ptr() as *mut c_void,
                 FILENAME_LEN as u32,
@@ -183,10 +185,10 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) {
     if pass == 0 {
         let _ = EXEC_HANDOFF.insert(&(task as u64), &*s, 0);
     }
-    // Lab PR 223 (EXPERIMENTAL): the exec quarantine's candidate, stopped
-    // by `sched_process_exec` once the exec succeeded. One array read
-    // when the guard is off.
-    crate::execq::note_pass(s, inode, dentry, task as u64, pass);
+    // Lab PR 226 (EXPERIMENTAL): the exec policy, then the exec
+    // quarantine's candidate (lab PR 223), stopped by `sched_process_exec`
+    // once the exec succeeded. Two array reads when both are off.
+    crate::execpol::on_pass(s, inode, dentry, task as u64, pass)
 }
 
 /// The dentry walk of [`exec_check_lsm`]: writes the path slots, the
@@ -199,23 +201,27 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) {
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn nn_exe_walk(dentry: u64, task_root: u64) -> u64 {
-    unsafe { exe_walk(dentry as *const u8, task_root as *const u8) }
+    unsafe {
+        match EXEC_SCRATCH.get_ptr_mut(0) {
+            Some(s) => exe_walk(s, dentry as *const u8, task_root as *const u8),
+            None => u64::from(exe_flags::UNRESOLVED),
+        }
+    }
 }
 
+/// The walk into the scratch `s` (the exec sensor's, or the mapping
+/// check's: `crate::execpol`).
 #[inline(always)]
-unsafe fn exe_walk(dentry: *const u8, task_root: *const u8) -> u64 {
-    let s = match EXEC_SCRATCH.get_ptr_mut(0) {
-        Some(p) => p,
-        None => return u64::from(exe_flags::UNRESOLVED),
-    };
+pub(crate) unsafe fn exe_walk(s: *mut ExeIdentityRaw, dentry: *const u8, task_root: *const u8) -> u64 {
     let o_parent = off!(DENTRY_D_PARENT_OFFSET);
     let o_inode = off!(DENTRY_D_INODE_OFFSET);
     let o_name = off!(DENTRY_D_NAME_OFFSET) + off!(QSTR_NAME_OFFSET);
     let path = (*s).path.as_mut_ptr();
     let mut flags = exe_flags::UNRESOLVED;
     let mut levels: u16 = 0;
-    (*s).root_dev = 0;
-    (*s).root_ino = 0;
+    // Volatile: two plain zero stores became a `memset` call (rule 9).
+    core::ptr::write_volatile(&mut (*s).root_dev, 0);
+    core::ptr::write_volatile(&mut (*s).root_ino, 0);
     let mut d = dentry;
     for level in 0..EXE_WALK_DEPTH {
         if d.is_null() {
