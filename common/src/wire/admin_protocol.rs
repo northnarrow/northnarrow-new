@@ -100,7 +100,16 @@ pub enum UnlockResult {
     Success,
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited { retry_after_secs: u32 },
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    /// Lab PR 217 (NN-AUD-243 residue, capability C17): the agent no longer
+    /// releases COMBAT on a signature over the bare nonce — no operation,
+    /// install or time is bound to it, and its audit row could not name the
+    /// signer. The release is [`AdminMessage::SignedUnlockRequest`]. An
+    /// `nn-admin` older than the variant cannot decode this reply and reports
+    /// a protocol error (exit 5); it never reads a success.
+    LegacyProtocolRefused,
 }
 
 /// Tappa 8 commit A7 — superset reply enum for the new wire
@@ -143,6 +152,11 @@ pub enum AdminResult {
     ProtocolVersionUnsupported {
         server_version: u16,
     },
+    /// Lab PR 217: the request verified, and the agent could not carry it
+    /// out — a release whose iptables teardown did not leave the tables
+    /// clear, read back. Nothing was reported done. An `nn-admin` older than
+    /// the variant cannot decode the reply (a protocol error, exit 5).
+    ActionFailed,
 }
 
 /// One signature in a multi-sig quorum submission. Wrapped in a
@@ -623,7 +637,8 @@ pub struct StatusRequest {}
 /// External audit ASK-009 (lab PR 213): the unsigned `status` carries only
 /// what the watchdog and COMBAT recovery need — `posture`,
 /// `network_isolation_engaged`, `last_admin_action_secs_ago`,
-/// `combat_stage`, `combat_locked` ([`StatusResponse::public`]). Every
+/// `combat_stage`, `combat_locked` ([`StatusResponse::public`]), and since
+/// lab PR 217 `network_isolation_v4` / `network_isolation_v6`. Every
 /// other field (the ring drops and rejected records, the netflow pacing and
 /// evictions, `FLOW_SOCK_MAP`, the inactive network rules, detect-only, the
 /// COMBAT evidence gaps, the encrypted-flow counts) is `None` there and is
@@ -742,9 +757,29 @@ pub struct StatusResponse {
     /// `(hook, fail-opens)` for the hooks that failed open.
     #[serde(default)]
     pub deny_fail_open: Option<Vec<(String, u64)>>,
+    /// Lab PR 217 (capability C18): the COMBAT isolation per IP family, as
+    /// the agent's state holds it — set only after the table was read back
+    /// (`iptables -S` / `ip6tables -S`) following an engage, cleared only
+    /// after a release read back clear. `network_isolation_engaged` is
+    /// either of them. Public, like the isolation flag: COMBAT recovery
+    /// needs to know an IPv6 hole. `None` from an agent older than the
+    /// fields (see the compatibility note above).
+    #[serde(default)]
+    pub network_isolation_v4: Option<bool>,
+    #[serde(default)]
+    pub network_isolation_v6: Option<bool>,
 }
 
 impl StatusResponse {
+    /// Lab PR 217: [`Self::public`] with the isolation per IP family (and
+    /// `network_isolation_engaged` set to either of them).
+    pub fn with_isolation_families(mut self, v4: bool, v6: bool) -> Self {
+        self.network_isolation_engaged = v4 || v6;
+        self.network_isolation_v4 = Some(v4);
+        self.network_isolation_v6 = Some(v6);
+        self
+    }
+
     /// External audit ASK-009 (lab PR 213): the reply to the unsigned
     /// `status` — the posture, the isolation, the last admin action and the
     /// COMBAT stage and lock, the telemetry withheld (`None`; the signed
@@ -784,19 +819,24 @@ impl StatusResponse {
             net_quic_rows_total: None,
             deny_fail_open_total: None,
             deny_fail_open: None,
+            network_isolation_v4: None,
+            network_isolation_v6: None,
         }
     }
 
     /// The fields [`Self::public`] withholds are all `None` (an unsigned
     /// reply of this build, or of an agent older than all of them).
     pub fn telemetry_withheld(&self) -> bool {
-        let public = Self::public(
+        let mut public = Self::public(
             self.posture,
             self.network_isolation_engaged,
             self.last_admin_action_secs_ago,
             self.combat_stage.clone(),
             self.combat_locked,
         );
+        // Lab PR 217: public fields, passed through.
+        public.network_isolation_v4 = self.network_isolation_v4;
+        public.network_isolation_v6 = self.network_isolation_v6;
         *self == public
     }
 }
@@ -1077,6 +1117,37 @@ pub struct LoopProgressResponse {
     pub since_last_ms: u64,
 }
 
+/// Lab PR 217 (NN-AUD-243 residue, capability C17) — signed `unlock`: the
+/// release of COMBAT, signed over a [`SignedPayload`] with
+/// `op = Unlock` (`extra = Unlock {}`) like every other admin operation —
+/// the challenge, the time, the install and the operation inside the signed
+/// scope — 1-of-N, `Role::Unlock`. Replaces [`UnlockRequest`] (a signature
+/// over the bare nonce), which the agent now refuses
+/// ([`UnlockResult::LegacyProtocolRefused`]). The audit row of the release
+/// names the signer's fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedUnlockRequest {
+    pub payload: SignedPayload,
+    pub signatures: Vec<KeyedSignature>,
+}
+
+/// Reply to [`SignedUnlockRequest`]. `result` is `Success` only when the
+/// release was carried out and read back — the COMBAT chain gone from both
+/// tables (`iptables -S` / `ip6tables -S`) — and [`AdminResult::ActionFailed`]
+/// when the request verified but the teardown did not leave the tables
+/// clear (the posture then stays COMBAT); any other value is the
+/// authentication refusal. `released` repeats it; `isolation_v4` /
+/// `isolation_v6` are what the agent's per-family isolation state says after
+/// the call; `message` names what was done, or why not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedUnlockResponse {
+    pub result: AdminResult,
+    pub released: bool,
+    pub isolation_v4: bool,
+    pub isolation_v6: bool,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminMessage {
     // ── client → server ────────────────────────────────────────
@@ -1241,6 +1312,12 @@ pub enum AdminMessage {
     LoopProgress(LoopProgressRequest),
     /// Reply to [`AdminMessage::LoopProgress`].
     LoopProgressResponse(LoopProgressResponse),
+    /// Lab PR 217 — signed release of COMBAT (`OperationCode::Unlock`).
+    /// Triggers [`AdminMessage::SignedUnlockResponse`]. An agent older than
+    /// the variant cannot decode it and closes the connection.
+    SignedUnlockRequest(SignedUnlockRequest),
+    /// Reply to [`AdminMessage::SignedUnlockRequest`].
+    SignedUnlockResponse(SignedUnlockResponse),
 
     // ── debug-only, LAST (external audit ASK-016, lab PR 170) ─────
     // A `cfg` variant shifts the postcard discriminant of every variant
@@ -1563,8 +1640,22 @@ mod tests {
                 LoopProgressResponse::default()
             )) as u32,
             LOOP_PROGRESS_RESPONSE_INDEX,
-            "the last production variant, the watchdog's progress decode"
+            "LoopProgressResponse, the watchdog's progress decode"
         );
+        // Lab PR 217: the signed unlock, appended after lab PR 216's pair.
+        let unlock_request = AdminMessage::SignedUnlockRequest(SignedUnlockRequest {
+            payload: SignedPayload::new_unlock([0; 32], 0, [0; 16]),
+            signatures: Vec::new(),
+        });
+        assert_eq!(first(&unlock_request), 54, "SignedUnlockRequest");
+        let unlock = AdminMessage::SignedUnlockResponse(SignedUnlockResponse {
+            result: AdminResult::ActionFailed,
+            released: false,
+            isolation_v4: true,
+            isolation_v6: false,
+            message: String::new(),
+        });
+        assert_eq!(first(&unlock), 55, "the last production variant");
         assert_eq!(
             first(&AdminMessage::StatusResponse(StatusResponse::public(
                 PostureKind::Observing,
@@ -1580,9 +1671,9 @@ mod tests {
         {
             assert_eq!(
                 first(&AdminMessage::DebugForcePosture(DebugForcePosture::Combat)),
-                54
+                56
             );
-            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 55);
+            assert_eq!(first(&AdminMessage::DebugForcePostureAck), 57);
         }
     }
 
@@ -1667,6 +1758,8 @@ mod tests {
             net_quic_rows_total: None,
             deny_fail_open_total: None,
             deny_fail_open: None,
+            network_isolation_v4: None,
+            network_isolation_v6: None,
         }));
     }
 
@@ -1698,6 +1791,8 @@ mod tests {
             net_quic_rows_total: None,
             deny_fail_open_total: None,
             deny_fail_open: None,
+            network_isolation_v4: None,
+            network_isolation_v6: None,
         }));
     }
 
@@ -1843,7 +1938,9 @@ mod tests {
                 | AdminMessage::TelemetryStatusRequest(_)
                 | AdminMessage::TelemetryStatusResponse(_)
                 | AdminMessage::LoopProgress(_)
-                | AdminMessage::LoopProgressResponse(_) => {}
+                | AdminMessage::LoopProgressResponse(_)
+                | AdminMessage::SignedUnlockRequest(_)
+                | AdminMessage::SignedUnlockResponse(_) => {}
             }
         }
     }
@@ -1881,6 +1978,8 @@ mod tests {
             net_quic_rows_total: Some(40),
             deny_fail_open_total: Some(3),
             deny_fail_open: Some(vec![("file_open".to_string(), 3)]),
+            network_isolation_v4: None,
+            network_isolation_v6: None,
         }));
     }
 
@@ -1932,6 +2031,8 @@ mod tests {
             net_quic_rows_total: Some(5),
             deny_fail_open_total: Some(1),
             deny_fail_open: Some(vec![("bpf".to_string(), 1)]),
+            network_isolation_v4: None,
+            network_isolation_v6: None,
         }
     }
 
@@ -2344,6 +2445,79 @@ mod tests {
                 status: None,
             },
         ));
+    }
+
+    /// Lab PR 217: the signed unlock and its reply survive a wire round-trip;
+    /// the appended reply variants keep every earlier discriminant
+    /// (`UnlockResult::LegacyProtocolRefused` after `RateLimited`,
+    /// `AdminResult::ActionFailed` after `ProtocolVersionUnsupported`).
+    #[test]
+    fn roundtrip_signed_unlock_verb() {
+        use crate::wire::admin_signed_payload::SignedPayload;
+        roundtrip(AdminMessage::SignedUnlockRequest(SignedUnlockRequest {
+            payload: SignedPayload::new_unlock([0x44; 32], 1_700_000_000, [0x55; 16]),
+            signatures: vec![KeyedSignature {
+                signature: [0x66; 64],
+            }],
+        }));
+        for (result, released) in [
+            (AdminResult::Success, true),
+            (AdminResult::ActionFailed, false),
+            (AdminResult::RoleDenied, false),
+        ] {
+            roundtrip(AdminMessage::SignedUnlockResponse(SignedUnlockResponse {
+                result,
+                released,
+                isolation_v4: !released,
+                isolation_v6: false,
+                message: "IPv4: chain gone; IPv6: chain still listed".to_string(),
+            }));
+        }
+        roundtrip(AdminMessage::UnlockResult(
+            UnlockResult::LegacyProtocolRefused,
+        ));
+        let tag = |r: UnlockResult| postcard::to_allocvec(&r).unwrap()[0];
+        assert_eq!(tag(UnlockResult::Success), 0);
+        assert_eq!(
+            tag(UnlockResult::RateLimited {
+                retry_after_secs: 1
+            }),
+            3
+        );
+        assert_eq!(tag(UnlockResult::LegacyProtocolRefused), 4);
+        let tag = |r: AdminResult| postcard::to_allocvec(&r).unwrap()[0];
+        assert_eq!(tag(AdminResult::UnknownOperation), 8);
+        assert_eq!(
+            tag(AdminResult::ProtocolVersionUnsupported { server_version: 1 }),
+            9
+        );
+        assert_eq!(tag(AdminResult::ActionFailed), 10);
+    }
+
+    /// Lab PR 217: the isolation per IP family is appended to the status —
+    /// public, passed through by the unsigned reply — and an `nn-admin` of
+    /// lab PR 213 reads every byte before it (the two fields are the reply's
+    /// last bytes).
+    #[test]
+    fn the_status_carries_the_isolation_per_family() {
+        let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
+            .with_isolation_families(true, false);
+        assert!(public.network_isolation_engaged, "either family");
+        assert_eq!(public.network_isolation_v4, Some(true));
+        assert_eq!(public.network_isolation_v6, Some(false));
+        assert!(public.telemetry_withheld(), "public fields, not telemetry");
+        let with = postcard::to_allocvec(&public).unwrap();
+        let mut without = public.clone();
+        without.network_isolation_v4 = None;
+        without.network_isolation_v6 = None;
+        let without = postcard::to_allocvec(&without).unwrap();
+        // None is one byte each; Some(bool) two.
+        let prefix = without.len() - 2;
+        assert_eq!(with.len(), prefix + 4);
+        assert_eq!(&with[..prefix], &without[..prefix]);
+        let old: StatusResponseLabPr164 = postcard::from_bytes(&with).unwrap();
+        assert!(old.network_isolation_engaged);
+        roundtrip(AdminMessage::StatusResponse(public));
     }
 
     /// External audit CMB-016: the three response verbs and their replies

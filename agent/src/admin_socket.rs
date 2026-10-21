@@ -47,8 +47,9 @@ use common::wire::admin_protocol::{
     NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
     ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest,
     ResponseRestoreResponse, ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest,
-    RotateKeysRevokeRequest, ShutdownRequest, StatusResponse, TelemetryStatusRequest,
-    TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockResult, MAX_FRAME_BODY,
+    RotateKeysRevokeRequest, ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse,
+    StatusResponse, TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest,
+    UnlockResult, MAX_FRAME_BODY,
 };
 use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
@@ -56,7 +57,7 @@ use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError, ConnAuth};
-use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::canary::detector::CanaryIndexes;
@@ -1370,6 +1371,9 @@ struct DispatchNotes {
     /// transition was applied (also a no-op to the same state). `None`
     /// when it was refused: the state did not change.
     force_from: Option<common::posture_types::PostureKind>,
+    /// Lab PR 217: a force-posture out of COMBAT — what its release
+    /// released, or why it did not (the posture then stayed COMBAT).
+    force_release: Option<std::result::Result<String, String>>,
 }
 
 /// Inspect the (request, reply) pair after `dispatch` returns
@@ -1380,9 +1384,10 @@ struct DispatchNotes {
 /// even if the audit log is temporarily unwritable (design §9
 /// states "the entry is the receipt; the action is the action").
 // PHASE_D_004: `matched_fps` is the dispatch_* fns' `fps_out`
-// values — empty for the legacy `Unlock` path (still goes
-// through the non-payload verify) and for failure paths;
-// populated for successful signed-payload ops.
+// values — empty for the legacy `Unlock` (refused since lab PR 217,
+// verified by no one) and for failure paths; populated for successful
+// signed-payload ops, the signed unlock included (lab PR 217: its row
+// names the signer).
 fn emit_audit_for(
     msg: &AdminMessage,
     reply: &AdminMessage,
@@ -1395,9 +1400,36 @@ fn emit_audit_for(
         return;
     };
     let (op, extra, result, cosigner_count) = match (msg, reply) {
-        (AdminMessage::Unlock(_), AdminMessage::UnlockResult(r)) => {
-            ("unlock", serde_json::json!({}), unlock_result_str(r), 0)
-        }
+        // Lab PR 217: refused (`failure: legacy_protocol_refused`) — the
+        // row says which protocol was used.
+        (AdminMessage::Unlock(_), AdminMessage::UnlockResult(r)) => (
+            "unlock",
+            serde_json::json!({ "protocol": "legacy" }),
+            unlock_result_str(r),
+            0,
+        ),
+        // Lab PR 217 (NN-AUD-243 residue, capability C17): `success` only
+        // when the release was carried out and the tables read back clear;
+        // a verified request whose teardown failed is a failure with why,
+        // and the row names the signer (`key_fp`).
+        (AdminMessage::SignedUnlockRequest(req), AdminMessage::SignedUnlockResponse(r)) => (
+            "unlock",
+            serde_json::json!({
+                "protocol": "signed",
+                "released": r.released,
+                "isolation_v4": r.isolation_v4,
+                "isolation_v6": r.isolation_v6,
+                "detail": r.message,
+            }),
+            match r.result {
+                AdminResult::Success if r.released => "success".to_string(),
+                AdminResult::Success | AdminResult::ActionFailed => {
+                    format!("failure: release_failed ({})", r.message)
+                }
+                other => audit_result_str(other),
+            },
+            req.signatures.len().saturating_sub(1),
+        ),
         (AdminMessage::ShutdownRequest(req), AdminMessage::ShutdownResult(r)) => {
             let grace = match &req.payload.extra {
                 OperationExtra::Shutdown(s) => s.grace_secs,
@@ -1421,10 +1453,23 @@ fn emit_audit_for(
             if let Some(from) = notes.force_from {
                 extra["from"] = serde_json::Value::String(format!("{from:?}"));
             }
+            // Lab PR 217: leaving COMBAT released the containment — or did
+            // not, and the posture stayed COMBAT.
+            let result = match &notes.force_release {
+                Some(Ok(released)) => {
+                    extra["release"] = serde_json::Value::String(released.clone());
+                    audit_result_str(*r)
+                }
+                Some(Err(why)) => {
+                    extra["release"] = serde_json::Value::String(why.clone());
+                    format!("failure: release_failed ({why})")
+                }
+                None => audit_result_str(*r),
+            };
             (
                 "force_posture",
                 extra,
-                audit_result_str(*r),
+                result,
                 req.signatures.len().saturating_sub(1),
             )
         }
@@ -1827,29 +1872,96 @@ fn unlock_result_str(r: &UnlockResult) -> String {
         UnlockResult::RateLimited { retry_after_secs } => {
             format!("failure: rate_limited (retry_after_secs={retry_after_secs})")
         }
+        UnlockResult::LegacyProtocolRefused => "failure: legacy_protocol_refused".to_string(),
     }
 }
 
-/// The reply to a verified `unlock`, from what the release did.
+/// Lab PR 217 (NN-AUD-243 residue, capability C17) — handle one signed
+/// `unlock` (`OperationCode::Unlock`, 1-of-N, `Role::Unlock`): verify, run
+/// the release through the posture — the ladder stood down, the iptables
+/// teardown read back per family — and answer what it did.
 ///
-/// Not in COMBAT is idempotent success from the operator's perspective —
-/// there's nothing to release. External audit ASK-017: any other refusal
-/// used to be answered `Success` too, and recorded as one; it is answered
-/// `InvalidSignature` (the legacy reply has no better variant), with an
-/// ERROR, so the audit row says `failure`. Unreachable today
-/// (`admin_release_combat_with_token` refuses only `NotInCombat`). What the
-/// release hook does with the token is not observable here (`Fn(UnlockToken)`).
-fn unlock_release_result(
-    outcome: std::result::Result<crate::posture::PostureState, AdminReleaseError>,
-) -> UnlockResult {
-    match outcome {
-        Ok(_) | Err(AdminReleaseError::NotInCombat) => UnlockResult::Success,
-        Err(other) => {
-            error!(
-                error = %other,
-                "unlock verified but the COMBAT release was refused — answering a failure"
+/// `Success` only when the release was carried out and the tables read
+/// back clear (or there was nothing to release); a verified request whose
+/// teardown did not leave them clear is [`AdminResult::ActionFailed`] with
+/// why, and the posture stays COMBAT (external audit ASK-017 / NN-AUD-243:
+/// this was `Success`, recorded "success", whatever the teardown did). The
+/// signer's fingerprint goes to the audit row.
+fn dispatch_signed_unlock(
+    req: SignedUnlockRequest,
+    auth: &ConnAuth<'_>,
+    posture: &PostureMachine,
+    isolator: &NetworkIsolator,
+    fps_out: &mut Vec<String>,
+) -> SignedUnlockResponse {
+    let reply = |result: AdminResult, released: bool, message: String| SignedUnlockResponse {
+        result,
+        released,
+        isolation_v4: isolator.is_isolated(Family::V4),
+        isolation_v6: isolator.is_isolated(Family::V6),
+        message,
+    };
+    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    let (token, matched_fps) = match auth.verify_signed_payload_quorum(
+        &req.payload,
+        &sigs,
+        1,
+        &[Role::Unlock],
+        OperationCode::Unlock,
+        now_unix_secs(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let r = map_admin_auth_error(e, "unlock");
+            return reply(r, false, "signature verification failed".to_string());
+        }
+    };
+    *fps_out = matched_fps;
+    let signer = fps_out.first().cloned().unwrap_or_default();
+    match posture.admin_release_combat_with_token(token) {
+        Ok(out) => {
+            let message = if out.left_combat {
+                format!(
+                    "COMBAT released, posture {}: {}",
+                    out.state.kind(),
+                    out.detail
+                )
+            } else {
+                format!(
+                    "not in COMBAT (posture {}): {}",
+                    out.state.kind(),
+                    out.detail
+                )
+            };
+            info!(
+                target: "admin.unlock",
+                signer_fp = %signer,
+                outcome = %message,
+                "signed unlock carried out"
             );
-            UnlockResult::InvalidSignature
+            reply(AdminResult::Success, true, message)
+        }
+        Err(e) => {
+            error!(
+                target: "admin.unlock",
+                signer_fp = %signer,
+                error = %e,
+                "signed unlock verified, but the isolation was NOT released — answering a \
+                 failure; the posture stays {}",
+                posture.current_kind()
+            );
+            let why = match e {
+                AdminReleaseError::ReleaseFailed(why) => why,
+                other => other.to_string(),
+            };
+            reply(
+                AdminResult::ActionFailed,
+                false,
+                format!(
+                    "the isolation was NOT released, the posture stays {}: {why}",
+                    posture.current_kind()
+                ),
+            )
         }
     }
 }
@@ -1891,6 +2003,7 @@ fn audit_result_str(r: AdminResult) -> String {
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             format!("failure: protocol_version_unsupported (server_version={server_version})")
         }
+        AdminResult::ActionFailed => "failure: action_failed".to_string(),
     }
 }
 
@@ -1935,59 +2048,28 @@ fn dispatch(
             }
         },
 
-        AdminMessage::Unlock(req) => {
-            let result = match auth.verify_unlock(&req.signature) {
-                Ok(token) => unlock_release_result(posture.admin_release_combat_with_token(token)),
-                Err(AdminAuthError::InvalidSignature) => UnlockResult::InvalidSignature,
-                Err(AdminAuthError::NoPendingChallenge) => UnlockResult::NoPendingChallenge,
-                Err(AdminAuthError::RateLimited { retry_after_secs }) => {
-                    UnlockResult::RateLimited { retry_after_secs }
-                }
-                // Tappa 8 A5 introduces RoleDenied; the wire layer
-                // currently has no dedicated variant for it
-                // (UnlockResult predates A5). A7 lands the new
-                // AdminResult enum with a real RoleDenied wire
-                // variant; until then, surface as InvalidSignature
-                // — the operator-facing detail is in the agent's
-                // own journald `anti_tamper.admin_auth.verify_failure`
-                // line (reason="role_denied", key_fingerprint, …).
-                // For an `unlock` request specifically, RoleDenied
-                // is also vanishingly rare: every legacy admin.pub
-                // line gets `Role::Unlock` in its default allowlist,
-                // so this arm only fires when an operator has
-                // deliberately written a line without `unlock`.
-                Err(AdminAuthError::RoleDenied { .. }) => UnlockResult::InvalidSignature,
-                // Tappa 8 A6 introduces QuorumNotMet. The legacy
-                // Unlock wire path is strictly 1-of-N (verify_unlock
-                // delegates to verify_with_role, not verify_quorum)
-                // so this arm is exhaustiveness-only — it can
-                // never fire from `Unlock` dispatch in practice.
-                // Mapped to InvalidSignature on the wire for the
-                // same reason as RoleDenied: UnlockResult predates
-                // A6, and A7's AdminResult will carry the proper
-                // QuorumNotMet { required, provided } variant.
-                Err(AdminAuthError::QuorumNotMet { .. }) => UnlockResult::InvalidSignature,
-                // Tappa 8 A7 introduces additional AdminAuthError
-                // variants used exclusively by
-                // `verify_signed_payload_quorum` (the SignedPayload
-                // path consumed by `ShutdownRequest`, not by
-                // legacy `Unlock`). These arms are exhaustiveness-
-                // only — the legacy `verify_unlock` →
-                // `verify_with_role` path can never produce them.
-                // Mapped to `UnlockResult::InvalidSignature`
-                // because the legacy wire surface has no
-                // dedicated variant; A7's `AdminResult` (consumed
-                // by `ShutdownRequest`) is the proper home for the
-                // distinct semantics.
-                Err(AdminAuthError::TimestampSkew { .. })
-                | Err(AdminAuthError::AgentIdMismatch)
-                | Err(AdminAuthError::NonceMismatch)
-                | Err(AdminAuthError::UnknownOperation { .. })
-                | Err(AdminAuthError::TooManySignatures { .. })
-                | Err(AdminAuthError::PayloadVerify(_)) => UnlockResult::InvalidSignature,
-            };
-            AdminMessage::UnlockResult(result)
+        // Lab PR 217 (NN-AUD-243 residue, capability C17): the legacy unlock
+        // — a signature over the bare nonce, no operation, install or time
+        // bound to it, its audit row unable to name the signer — no longer
+        // releases COMBAT. Refused outright, whatever it carries: a
+        // compatibility switch would be a downgrade of the one operation
+        // that lifts the host's isolation, and the `nn-admin` that signs the
+        // payload ships in the same release as this agent. The connection's
+        // challenge is spent; the refusal is audited.
+        AdminMessage::Unlock(_) => {
+            auth.discard_challenge();
+            error!(
+                target: "admin.unlock",
+                "legacy unlock (signature over the bare nonce) REFUSED — sign an \
+                 `OperationCode::Unlock` payload: use the nn-admin of this agent's release \
+                 (`nn-admin unlock --key … --agent-id-file …`)"
+            );
+            AdminMessage::UnlockResult(UnlockResult::LegacyProtocolRefused)
         }
+
+        AdminMessage::SignedUnlockRequest(req) => AdminMessage::SignedUnlockResponse(
+            dispatch_signed_unlock(req, auth, posture, isolator, fps_out),
+        ),
 
         // External audit ASK-009 (lab PR 213): unsigned, what the watchdog
         // and COMBAT recovery need; the telemetry is the signed verb's.
@@ -2135,7 +2217,8 @@ fn dispatch(
         | AdminMessage::ResponseReleaseResponse(_)
         | AdminMessage::ResponseRestoreResponse(_)
         | AdminMessage::TelemetryStatusResponse(_)
-        | AdminMessage::LoopProgressResponse(_) => {
+        | AdminMessage::LoopProgressResponse(_)
+        | AdminMessage::SignedUnlockResponse(_) => {
             warn!("client sent server-only message variant; ignoring");
             AdminMessage::UnlockResult(UnlockResult::NoPendingChallenge)
         }
@@ -2419,6 +2502,7 @@ fn dispatch_force_posture(
     match posture.admin_force_state_with_token(signers.token, target, may_release) {
         Ok(outcome) => {
             notes.force_from = Some(outcome.from);
+            notes.force_release = outcome.release.map(Ok);
             info!(
                 target: "admin.force_posture",
                 from = ?outcome.from,
@@ -2435,6 +2519,20 @@ fn dispatch_force_posture(
                 "force-posture out of COMBAT refused: no signer holds the `unlock` role"
             );
             AdminResult::RoleDenied
+        }
+        // Lab PR 217 (NN-AUD-243 residue): leaving COMBAT released nothing
+        // the tables confirm — the posture stays COMBAT, and the reply says
+        // the request was not carried out (it was `Success`).
+        Err(AdminReleaseError::ReleaseFailed(why)) => {
+            error!(
+                target: "admin.force_posture",
+                to = ?target,
+                why = %why,
+                "force-posture out of COMBAT verified, but the isolation was NOT released — \
+                 the posture stays COMBAT"
+            );
+            notes.force_release = Some(Err(why));
+            AdminResult::ActionFailed
         }
         Err(e) => {
             warn!(
@@ -3405,6 +3503,9 @@ fn telemetry_status(
     StatusResponse {
         posture: posture.current_kind(),
         network_isolation_engaged: isolator.is_engaged(),
+        // Lab PR 217 (capability C18): per IP family, as read back.
+        network_isolation_v4: Some(isolator.is_isolated(Family::V4)),
+        network_isolation_v6: Some(isolator.is_isolated(Family::V6)),
         last_admin_action_secs_ago: posture.last_admin_action_secs_ago(),
         ringbuf_drops_total: Some(crate::sensors::ring_drops::total()),
         ringbuf_drops: Some(crate::sensors::ring_drops::snapshot_nonzero()),
@@ -3461,6 +3562,11 @@ fn public_status(
         posture.last_admin_action_secs_ago(),
         response_state.and_then(|s| (s.combat_stage)()),
         Some(posture.is_combat_locked()),
+    )
+    // Lab PR 217 (capability C18): the isolation per IP family, public.
+    .with_isolation_families(
+        isolator.is_isolated(Family::V4),
+        isolator.is_isolated(Family::V6),
     )
 }
 
@@ -4989,7 +5095,14 @@ mod tests {
         _task: JoinHandle<()>,
         posture: Arc<PostureMachine>,
         isolator: Arc<NetworkIsolator>,
+        /// Lab PR 217: the install the signed requests are bound to, and
+        /// the file `nn-admin` reads it from.
+        agent_id: [u8; 16],
+        agent_id_path: PathBuf,
     }
+
+    /// The install id of the [`spawn_server`] harness.
+    const HARNESS_AGENT_ID: [u8; 16] = [0x7a; 16];
 
     fn rules_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -5013,7 +5126,13 @@ mod tests {
             format!("{}\n", hex::encode(signing.verifying_key().to_bytes())),
         )
         .unwrap();
-        let auth = Arc::new(AdminAuth::load(&pub_path).unwrap());
+        let auth = Arc::new(AdminAuth::load_with_agent_id(&pub_path, HARNESS_AGENT_ID).unwrap());
+        let agent_id_path = dir.path().join("agent_id");
+        std::fs::write(
+            &agent_id_path,
+            format!("{}\n", hex::encode(HARNESS_AGENT_ID)),
+        )
+        .unwrap();
 
         // NetworkIsolator with mock binaries — no root needed.
         let isolator = Arc::new(
@@ -5046,6 +5165,8 @@ mod tests {
             _task: task,
             posture,
             isolator,
+            agent_id: HARNESS_AGENT_ID,
+            agent_id_path,
         }
     }
 
@@ -5118,7 +5239,7 @@ mod tests {
         // built with the real rules path + system iptables-restore,
         // which on a test machine without root will fail. Skip this
         // particular test if the engage shell-out fails.)
-        if h.isolator.engage().is_err() {
+        if !h.isolator.engage().engaged() {
             eprintln!("iptables-restore unavailable / not root; skipping end-to-end test");
             return;
         }
@@ -5151,10 +5272,16 @@ mod tests {
 
         let priv_path = write_priv_key(&h._dir, &signing);
         let socket = h.socket.clone();
-        let outcome = tokio::task::spawn_blocking(move || run_unlock(&socket, &priv_path).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(outcome, crate::admin_cli::UnlockOutcome::Success));
+        let agent_id_path = h.agent_id_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_unlock(&socket, &priv_path, &agent_id_path).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::admin_cli::UnlockOutcome::Success { .. }
+        ));
         // Posture dropped to Alerted; isolator state left engaged
         // because we don't wire a release hook in this harness
         // (commit #6 main.rs wiring does that — this test exercises
@@ -5172,9 +5299,12 @@ mod tests {
         let other = SigningKey::generate(&mut OsRng);
         let priv_path = write_priv_key(&h._dir, &other);
         let socket = h.socket.clone();
-        let outcome = tokio::task::spawn_blocking(move || run_unlock(&socket, &priv_path).unwrap())
-            .await
-            .unwrap();
+        let agent_id_path = h.agent_id_path.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_unlock(&socket, &priv_path, &agent_id_path).unwrap()
+        })
+        .await
+        .unwrap();
         assert!(matches!(
             outcome,
             crate::admin_cli::UnlockOutcome::InvalidSignature
@@ -5832,6 +5962,8 @@ mod tests {
             net_quic_rows_total: None,
             deny_fail_open_total: None,
             deny_fail_open: None,
+            network_isolation_v4: None,
+            network_isolation_v6: None,
         });
         emit_audit_for(
             &status_req,
@@ -8571,21 +8703,27 @@ mod tests {
         }
     }
 
+    /// Lab PR 217: the signed unlock (`OperationCode::Unlock`) over
+    /// `nonce`, for `agent_id`; the reply's result.
     fn sync_unlock(
         stream: &mut std::os::unix::net::UnixStream,
         signing: &SigningKey,
         nonce: &[u8; 32],
-    ) -> UnlockResult {
-        use ed25519_dalek::Signer;
+        agent_id: [u8; 16],
+    ) -> AdminResult {
+        let payload = SignedPayload::new_unlock(*nonce, now_unix_secs(), agent_id);
         sync_write_frame(
             stream,
-            &AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
-                signature: signing.sign(nonce).to_bytes(),
+            &AdminMessage::SignedUnlockRequest(SignedUnlockRequest {
+                signatures: vec![KeyedSignature {
+                    signature: sign(&payload, signing).unwrap(),
+                }],
+                payload,
             }),
         );
         match sync_read_frame(stream) {
-            AdminMessage::UnlockResult(r) => r,
-            other => panic!("expected UnlockResult, got {other:?}"),
+            AdminMessage::SignedUnlockResponse(r) => r.result,
+            other => panic!("expected SignedUnlockResponse, got {other:?}"),
         }
     }
 
@@ -8598,19 +8736,20 @@ mod tests {
         let signing = SigningKey::generate(&mut OsRng);
         let h = spawn_server(&signing).await;
         let socket = h.socket.clone();
+        let id = h.agent_id;
         tokio::task::spawn_blocking(move || {
             let mut a = connect_retrying(&socket);
             let mut b = connect_retrying(&socket);
             let nonce_a = sync_challenge(&mut a);
             let nonce_b = sync_challenge(&mut b);
-            assert!(matches!(
-                sync_unlock(&mut a, &signing, &nonce_a),
-                UnlockResult::Success
-            ));
-            assert!(matches!(
-                sync_unlock(&mut b, &signing, &nonce_b),
-                UnlockResult::Success
-            ));
+            assert_eq!(
+                sync_unlock(&mut a, &signing, &nonce_a, id),
+                AdminResult::Success
+            );
+            assert_eq!(
+                sync_unlock(&mut b, &signing, &nonce_b, id),
+                AdminResult::Success
+            );
         })
         .await
         .unwrap();
@@ -8678,16 +8817,17 @@ mod tests {
         let stranger = SigningKey::generate(&mut OsRng);
         let h = spawn_server(&signing).await;
         let socket = h.socket.clone();
+        let id = h.agent_id;
         tokio::task::spawn_blocking(move || {
             use crate::anti_tamper::admin_auth::MAX_AUTH_FAILURES_PER_CONNECTION;
             let mut hostile = connect_retrying(&socket);
             for attempt in 1..=MAX_AUTH_FAILURES_PER_CONNECTION {
                 let nonce = sync_challenge(&mut hostile);
-                let r = sync_unlock(&mut hostile, &stranger, &nonce);
+                let r = sync_unlock(&mut hostile, &stranger, &nonce, id);
                 if attempt < MAX_AUTH_FAILURES_PER_CONNECTION {
-                    assert!(matches!(r, UnlockResult::InvalidSignature), "{r:?}");
+                    assert_eq!(r, AdminResult::InvalidSignature);
                 } else {
-                    assert!(matches!(r, UnlockResult::RateLimited { .. }), "{r:?}");
+                    assert!(matches!(r, AdminResult::RateLimited { .. }), "{r:?}");
                 }
             }
             // A further request on that connection gets no reply.
@@ -8701,10 +8841,10 @@ mod tests {
 
             let mut operator = connect_retrying(&socket);
             let nonce = sync_challenge(&mut operator);
-            assert!(matches!(
-                sync_unlock(&mut operator, &signing, &nonce),
-                UnlockResult::Success
-            ));
+            assert_eq!(
+                sync_unlock(&mut operator, &signing, &nonce, id),
+                AdminResult::Success
+            );
         })
         .await
         .unwrap();
@@ -9404,32 +9544,224 @@ mod tests {
 
     // ── External audit, Wave 3: signed-request verification (lab PR 192) ──
 
-    /// External audit ASK-017: a verified `unlock` whose release is
-    /// refused for any reason but "not in COMBAT" is answered as a failure
-    /// and recorded as one (it was `Success`).
+    /// A posture in a locked COMBAT whose release hook fails while `fail`
+    /// is set (the iptables teardown that does not take) — lab PR 217.
+    fn combat_with_release_hook(fail: Arc<std::sync::atomic::AtomicBool>) -> PostureMachine {
+        let hook: crate::posture::CombatReleaseHook = Arc::new(move |_token, _scope| {
+            if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(
+                    "IPv4: FAILED (read back: the NORTHNARROW_COMBAT chain is still listed); \
+                     IPv6: cleared (read back)"
+                        .to_string(),
+                )
+            } else {
+                Ok("IPv4: cleared (read back); IPv6: cleared (read back)".to_string())
+            }
+        });
+        let posture = PostureMachine::new_with_hooks(Arc::new(|| {}), hook);
+        posture
+            .admin_force_state_with_token(
+                crate::anti_tamper::_test_mint_unlock_token(),
+                PostureKind::Combat,
+                true,
+            )
+            .unwrap();
+        assert!(posture.is_combat_locked());
+        posture
+    }
+
+    /// Lab PR 217 (NN-AUD-243 residue, capability C17): a verified signed
+    /// unlock whose teardown does not leave the tables clear is answered as
+    /// a failure (`ActionFailed`), the posture stays COMBAT, and the audit
+    /// row records the failure with the signer's fingerprint; once the
+    /// teardown works, the same verb succeeds and the row says so. It was
+    /// `Success` and "success" whatever the teardown did, with no `key_fp`.
     #[test]
-    fn unlock_maps_an_unexpected_release_error_to_a_failure() {
-        use crate::posture::PostureState;
-        assert_eq!(
-            unlock_release_result(Ok(PostureState::Observing)),
-            UnlockResult::Success
-        );
-        assert_eq!(
-            unlock_release_result(Err(AdminReleaseError::NotInCombat)),
-            UnlockResult::Success,
-            "unlock outside COMBAT stays idempotent"
-        );
-        for refused in [
-            AdminReleaseError::Unauthorized,
-            AdminReleaseError::NeedsUnlock,
-        ] {
-            let reply = unlock_release_result(Err(refused));
-            assert_ne!(reply, UnlockResult::Success, "{refused:?}");
-            assert!(
-                unlock_result_str(&reply).starts_with("failure"),
-                "{refused:?}: the audit row must record a failure"
+    fn a_signed_unlock_whose_teardown_fails_is_a_failure() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x3d; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let isolator = NetworkIsolator::new(rules_path()).unwrap();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let posture = combat_with_release_hook(Arc::clone(&fail));
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let fp = hex::encode(crate::anti_tamper::admin_auth::fingerprint_bytes(
+            &signing.verifying_key(),
+        ));
+        let unlock = |auth: &ConnAuth<'_>| {
+            let payload = SignedPayload::new_unlock(
+                auth.issue_challenge().unwrap(),
+                now_unix_secs(),
+                agent_id,
             );
-        }
+            let req = SignedUnlockRequest {
+                signatures: keyed(&payload, &signing),
+                payload,
+            };
+            let mut fps = Vec::new();
+            let reply = dispatch_signed_unlock(req.clone(), auth, &posture, &isolator, &mut fps);
+            emit_audit_for(
+                &AdminMessage::SignedUnlockRequest(req),
+                &AdminMessage::SignedUnlockResponse(reply.clone()),
+                &fake_client(),
+                Some(&audit),
+                &fps,
+                &DispatchNotes::default(),
+            );
+            reply
+        };
+
+        let reply = unlock(&auth);
+        assert_eq!(reply.result, AdminResult::ActionFailed, "{reply:?}");
+        assert!(!reply.released);
+        assert!(reply.message.contains("still listed"), "{}", reply.message);
+        assert_eq!(posture.current_kind(), PostureKind::Combat, "COMBAT stays");
+        let rows = read_audit_entries(&log_path);
+        assert_eq!(rows[0].op, "unlock");
+        assert!(
+            rows[0].result.starts_with("failure: release_failed"),
+            "{}",
+            rows[0].result
+        );
+        assert_eq!(rows[0].key_fp, fp, "the row names the signer");
+        assert_eq!(rows[0].extra["protocol"], "signed");
+        assert_eq!(rows[0].extra["released"], false);
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let reply = unlock(&auth);
+        assert_eq!(reply.result, AdminResult::Success, "{reply:?}");
+        assert!(reply.released);
+        assert_eq!(posture.current_kind(), PostureKind::Alerted);
+        let rows = read_audit_entries(&log_path);
+        assert_eq!(rows[1].result, "success");
+        assert_eq!(rows[1].key_fp, fp);
+        // a key without the `unlock` role is refused before any release
+        let other = SigningKey::generate(&mut OsRng);
+        let (auth2, _d2) = build_auth_with_roles(&other, "audit-read", agent_id);
+        let auth2 = ConnAuth::new(&auth2);
+        let payload =
+            SignedPayload::new_unlock(auth2.issue_challenge().unwrap(), now_unix_secs(), agent_id);
+        let reply = dispatch_signed_unlock(
+            SignedUnlockRequest {
+                signatures: keyed(&payload, &other),
+                payload,
+            },
+            &auth2,
+            &posture,
+            &isolator,
+            &mut Vec::new(),
+        );
+        assert_eq!(reply.result, AdminResult::RoleDenied);
+        assert!(!reply.released);
+    }
+
+    /// Lab PR 217 (capability C17): the legacy unlock — a valid signature
+    /// over the bare nonce, by a key holding `unlock` — no longer releases
+    /// COMBAT: refused with its own reply, audited as a failure, the
+    /// challenge spent. It used to release, and its row had no `key_fp`.
+    #[test]
+    fn the_legacy_unlock_is_refused_and_audited() {
+        use ed25519_dalek::Signer;
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x3e; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let isolator = NetworkIsolator::new(rules_path()).unwrap();
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let posture = combat_with_release_hook(fail);
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let nonce = auth.issue_challenge().unwrap();
+        let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+            signature: signing.sign(&nonce).to_bytes(),
+        });
+        let mut fps = Vec::new();
+        let reply = dispatch(
+            req.clone(),
+            &auth,
+            &posture,
+            &isolator,
+            &dir.path().join("marker"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdminReadPaths::default(),
+            &fake_client(),
+            &mut fps,
+            &mut DispatchNotes::default(),
+        );
+        assert_eq!(
+            reply,
+            AdminMessage::UnlockResult(UnlockResult::LegacyProtocolRefused)
+        );
+        assert_eq!(posture.current_kind(), PostureKind::Combat, "not released");
+        emit_audit_for(
+            &req,
+            &reply,
+            &fake_client(),
+            Some(&audit),
+            &fps,
+            &DispatchNotes::default(),
+        );
+        let rows = read_audit_entries(&log_path);
+        assert_eq!(rows[0].op, "unlock");
+        assert_eq!(rows[0].result, "failure: legacy_protocol_refused");
+        assert_eq!(rows[0].extra["protocol"], "legacy");
+        // the challenge is spent: a signed request on it finds none
+        let payload = SignedPayload::new_unlock(nonce, now_unix_secs(), agent_id);
+        let reply = dispatch_signed_unlock(
+            SignedUnlockRequest {
+                signatures: keyed(&payload, &signing),
+                payload,
+            },
+            &auth,
+            &posture,
+            &isolator,
+            &mut Vec::new(),
+        );
+        assert_eq!(reply.result, AdminResult::NoPendingChallenge);
+    }
+
+    /// Lab PR 217 (NN-AUD-243 residue): a force-posture out of COMBAT whose
+    /// release fails is not carried out — `ActionFailed`, COMBAT stays, the
+    /// row says why.
+    #[test]
+    fn a_force_posture_out_of_combat_whose_release_fails_is_a_failure() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let agent_id = [0x3f; 16];
+        let (auth, _d) = build_auth_with_roles(&signing, "force-posture,unlock", agent_id);
+        let auth = ConnAuth::new(&auth);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let posture = combat_with_release_hook(fail);
+        let dir = TempDir::new().unwrap();
+        let (log_path, audit) = build_test_audit_log(&dir);
+        let req = force_posture_req(&auth, &signing, agent_id, PostureKind::Observing);
+        let mut fps = Vec::new();
+        let mut notes = DispatchNotes::default();
+        let r = dispatch_force_posture(req.clone(), &auth, &posture, &mut fps, &mut notes);
+        assert_eq!(r, AdminResult::ActionFailed);
+        assert_eq!(posture.current_kind(), PostureKind::Combat);
+        emit_audit_for(
+            &AdminMessage::ForcePostureRequest(req),
+            &AdminMessage::ForcePostureResult(r),
+            &fake_client(),
+            Some(&audit),
+            &fps,
+            &notes,
+        );
+        let rows = read_audit_entries(&log_path);
+        assert_eq!(rows[0].op, "force_posture");
+        assert!(
+            rows[0].result.starts_with("failure: release_failed"),
+            "{}",
+            rows[0].result
+        );
+        assert!(rows[0].extra.get("from").is_none(), "nothing changed");
     }
 
     /// External audit AUT-001: a shutdown request whose payload carries an

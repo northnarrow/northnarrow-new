@@ -19,6 +19,7 @@ pub mod anti_tamper;
 pub mod async_fd;
 pub mod atomic_file;
 pub mod audit;
+pub mod bounded_cmd;
 pub mod canary;
 pub mod chain_anchor;
 pub(crate) mod chain_tail;

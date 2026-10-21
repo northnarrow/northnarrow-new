@@ -4146,6 +4146,8 @@ mod tests {
                 net_quic_rows_total: None,
                 deny_fail_open_total: None,
                 deny_fail_open: None,
+                network_isolation_v4: None,
+                network_isolation_v6: None,
             });
             let bytes = encode_frame(&reply).expect("encode reply");
             stream.write_all(&bytes).await.expect("write reply");

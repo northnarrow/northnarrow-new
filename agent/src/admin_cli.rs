@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
@@ -31,7 +31,7 @@ use common::posture_types::PostureKind;
 use common::wire::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryListRequest, CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature,
-    ShutdownRequest, StatusRequest, UnlockRequest, UnlockResult,
+    ShutdownRequest, StatusRequest,
 };
 use common::wire::admin_signed_payload::{
     sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
@@ -43,13 +43,36 @@ use crate::agent_id::{self, AGENT_ID_LEN};
 
 /// Result of `nn-admin unlock`. Mapped to exit codes in the binary
 /// (Success=0, InvalidSignature=2, NoPendingChallenge=3,
-/// RateLimited=4, Transport=5).
+/// RateLimited=4, Transport/Refused=5, RoleDenied=7, ReleaseFailed=9).
+///
+/// Lab PR 217 (NN-AUD-243 residue, capability C17): the unlock is a signed
+/// `OperationCode::Unlock` payload, and `Success` means the agent released
+/// the containment and read the tables back clear; `ReleaseFailed` is a
+/// verified request whose teardown did not take (the posture stays COMBAT).
+/// `isolation_v4` / `isolation_v6` are the agent's per-family state after
+/// the call.
 #[derive(Debug)]
 pub enum UnlockOutcome {
-    Success,
+    Success {
+        message: String,
+        isolation_v4: bool,
+        isolation_v6: bool,
+    },
+    ReleaseFailed {
+        message: String,
+        isolation_v4: bool,
+        isolation_v6: bool,
+    },
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited { retry_after_secs: u32 },
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    /// The key verified but does not hold the `unlock` role.
+    RoleDenied,
+    /// Refused for another reason (clock skew, another install's
+    /// agent_id, …): the reply as the agent sent it.
+    Refused(AdminResult),
 }
 
 /// Result of `nn-admin force-posture` (Tappa 8 A10, design §4 +
@@ -63,13 +86,26 @@ pub enum ForcePostureOutcome {
     Success,
     InvalidSignature,
     NoPendingChallenge,
-    RateLimited { retry_after_secs: u32 },
-    QuorumNotMet { required: u8, provided: u8 },
+    RateLimited {
+        retry_after_secs: u32,
+    },
+    QuorumNotMet {
+        required: u8,
+        provided: u8,
+    },
     RoleDenied,
-    TimestampSkew { server_ts: u64, max_skew_secs: u32 },
+    TimestampSkew {
+        server_ts: u64,
+        max_skew_secs: u32,
+    },
     AgentIdMismatch,
     UnknownOperation,
-    ProtocolVersionUnsupported { server_version: u16 },
+    ProtocolVersionUnsupported {
+        server_version: u16,
+    },
+    /// Lab PR 217: verified, and leaving COMBAT released nothing the agent
+    /// could read back — the posture stays COMBAT.
+    ActionFailed,
 }
 
 /// Result of `nn-admin shutdown` (Tappa 8 A9, design §5.1 + §10).
@@ -105,6 +141,10 @@ pub enum ShutdownOutcome {
 pub struct StatusOutcome {
     pub posture: common::posture_types::PostureKind,
     pub network_isolation_engaged: bool,
+    /// Lab PR 217 (capability C18): the isolation per IP family, as the
+    /// agent read the tables back (`None`: agent predates the fields).
+    pub network_isolation_v4: Option<bool>,
+    pub network_isolation_v6: Option<bool>,
     pub last_admin_action_secs_ago: Option<u64>,
     /// Ring-buffer drops since boot (`None`: agent predates the field).
     pub ringbuf_drops_total: Option<u64>,
@@ -234,38 +274,57 @@ pub fn run_init(priv_out: &Path, pub_append: &Path, force: bool) -> Result<InitO
     })
 }
 
-/// Full unlock flow: connect, request challenge, sign, submit
-/// signature, return outcome.
-pub fn run_unlock(socket: &Path, key_path: &Path) -> Result<UnlockOutcome> {
-    let signing = read_priv_key(key_path)?;
-    let mut stream = connect_socket(socket)?;
-
-    write_frame(
-        &mut stream,
-        &AdminMessage::ChallengeRequest(ChallengeRequest {}),
+/// Full unlock flow: connect, request challenge, sign an
+/// `OperationCode::Unlock` payload (the challenge, the time, this install's
+/// agent_id — lab PR 217, NN-AUD-243 residue: it was a signature over the
+/// bare nonce, which the agent now refuses), submit, return the outcome.
+///
+/// An agent older than lab PR 217 does not know the signed unlock: it
+/// closes the connection, and the error says to use the `nn-admin` of its
+/// release.
+pub fn run_unlock(socket: &Path, key_path: &Path, agent_id_path: &Path) -> Result<UnlockOutcome> {
+    use common::wire::admin_protocol::SignedUnlockRequest;
+    let reply = signed_request(
+        socket,
+        key_path,
+        agent_id_path,
+        SignedPayload::new_unlock,
+        |payload, signatures| {
+            AdminMessage::SignedUnlockRequest(SignedUnlockRequest {
+                payload,
+                signatures,
+            })
+        },
+    )
+    .context(
+        "the signed unlock got no reply — an agent older than this nn-admin (before lab PR \
+         217) does not know it: unlock it with the nn-admin of its own release",
     )?;
-    let nonce = match read_frame(&mut stream)? {
-        AdminMessage::Challenge(c) => c.nonce,
-        other => bail!("unexpected server reply to ChallengeRequest: {other:?}"),
+    let r = match reply {
+        AdminMessage::SignedUnlockResponse(r) => r,
+        other => bail!(
+            "unexpected reply to the signed unlock: {other:?} (an agent older than lab PR 217 \
+             does not know it: use the nn-admin of its release)"
+        ),
     };
-
-    let sig: [u8; 64] = signing.sign(&nonce).to_bytes();
-    write_frame(
-        &mut stream,
-        &AdminMessage::Unlock(UnlockRequest { signature: sig }),
-    )?;
-    let result = match read_frame(&mut stream)? {
-        AdminMessage::UnlockResult(r) => r,
-        other => bail!("unexpected server reply to UnlockRequest: {other:?}"),
-    };
-
-    Ok(match result {
-        UnlockResult::Success => UnlockOutcome::Success,
-        UnlockResult::InvalidSignature => UnlockOutcome::InvalidSignature,
-        UnlockResult::NoPendingChallenge => UnlockOutcome::NoPendingChallenge,
-        UnlockResult::RateLimited { retry_after_secs } => {
+    Ok(match r.result {
+        AdminResult::Success if r.released => UnlockOutcome::Success {
+            message: r.message,
+            isolation_v4: r.isolation_v4,
+            isolation_v6: r.isolation_v6,
+        },
+        AdminResult::Success | AdminResult::ActionFailed => UnlockOutcome::ReleaseFailed {
+            message: r.message,
+            isolation_v4: r.isolation_v4,
+            isolation_v6: r.isolation_v6,
+        },
+        AdminResult::InvalidSignature => UnlockOutcome::InvalidSignature,
+        AdminResult::NoPendingChallenge => UnlockOutcome::NoPendingChallenge,
+        AdminResult::RateLimited { retry_after_secs } => {
             UnlockOutcome::RateLimited { retry_after_secs }
         }
+        AdminResult::RoleDenied => UnlockOutcome::RoleDenied,
+        other => UnlockOutcome::Refused(other),
     })
 }
 
@@ -330,6 +389,8 @@ fn status_outcome(
     StatusOutcome {
         posture: resp.posture,
         network_isolation_engaged: resp.network_isolation_engaged,
+        network_isolation_v4: resp.network_isolation_v4,
+        network_isolation_v6: resp.network_isolation_v6,
         last_admin_action_secs_ago: resp.last_admin_action_secs_ago,
         ringbuf_drops_total: resp.ringbuf_drops_total,
         ringbuf_drops: resp.ringbuf_drops.unwrap_or_default(),
@@ -475,6 +536,8 @@ pub fn run_shutdown(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             ShutdownOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => ShutdownOutcome::UnknownOperation,
     })
 }
 
@@ -567,6 +630,7 @@ pub fn run_force_posture(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             ForcePostureOutcome::ProtocolVersionUnsupported { server_version }
         }
+        AdminResult::ActionFailed => ForcePostureOutcome::ActionFailed,
     })
 }
 
@@ -802,6 +866,8 @@ fn map_admin_result_to_rotate(r: AdminResult) -> RotateKeysOutcome {
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             RotateKeysOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => RotateKeysOutcome::UnknownOperation,
     }
 }
 
@@ -1205,6 +1271,8 @@ fn map_admin_result_to_baseline(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             FimBaselineOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => FimBaselineOutcome::UnknownOperation,
     }
 }
 
@@ -1237,6 +1305,8 @@ fn map_response_to_fim_report(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             FimReportOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => FimReportOutcome::Transport,
     }
 }
 
@@ -1358,6 +1428,8 @@ fn map_response_to_fim_status(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             FimStatusOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => FimStatusOutcome::Transport,
     }
 }
 
@@ -1628,6 +1700,8 @@ fn map_response_to_canary_deploy(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             CanaryDeployOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => CanaryDeployOutcome::Transport,
     }
 }
 
@@ -1659,6 +1733,8 @@ fn map_response_to_canary_list(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             CanaryListOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => CanaryListOutcome::Transport,
     }
 }
 
@@ -1691,6 +1767,8 @@ fn map_admin_result_to_canary_burn(r: AdminResult) -> CanaryBurnOutcome {
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             CanaryBurnOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => CanaryBurnOutcome::Transport,
     }
 }
 
@@ -1718,6 +1796,8 @@ fn map_admin_result_to_canary_refresh(r: AdminResult) -> CanaryRefreshOutcome {
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             CanaryRefreshOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => CanaryRefreshOutcome::Transport,
     }
 }
 
@@ -2156,6 +2236,8 @@ fn map_admin_result_to_net_jsonl(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             NetJsonlOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => NetJsonlOutcome::Transport,
     }
 }
 
@@ -2352,6 +2434,8 @@ fn map_response_to_set_status(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             O::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => O::Transport,
     }
 }
 
@@ -2510,6 +2594,8 @@ pub fn run_net_resolve(
             AdminResult::ProtocolVersionUnsupported { server_version } => {
                 NetResolveOutcome::ProtocolVersionUnsupported { server_version }
             }
+            // Lab PR 217: no reply of this operation; out of spec.
+            AdminResult::ActionFailed => NetResolveOutcome::Transport,
         }),
         _ => Ok(NetResolveOutcome::Transport),
     }
@@ -2610,6 +2696,8 @@ fn map_admin_result_to_trusted_installer(
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             TrustedInstallerGrantOutcome::ProtocolVersionUnsupported { server_version }
         }
+        // Lab PR 217: no reply of this operation; out of spec.
+        AdminResult::ActionFailed => TrustedInstallerGrantOutcome::UnknownOperation,
     }
 }
 
@@ -2936,6 +3024,7 @@ pub fn run_config_overlay_sign(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::Signer;
 
     /// A private key file as `nn-admin init` and install.sh leave it: 0600
     /// (external audit AUT-002: `read_priv_key` refuses anything looser).
@@ -3208,11 +3297,15 @@ mod tests {
 
     #[test]
     fn cli_unlock_happy_path() {
+        use common::wire::admin_protocol::SignedUnlockResponse;
+        use common::wire::admin_signed_payload::{verify, OperationCode};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
         let signing = SigningKey::generate(&mut OsRng);
         write_priv_key_file(&priv_path, &signing);
+        let agent_id = [0x42u8; 16];
+        let agent_id_path = write_agent_id_file(&dir, &agent_id);
 
         let vk = signing.verifying_key();
         let nonce = [0x11u8; 32];
@@ -3225,22 +3318,93 @@ mod tests {
             }
             server_write_frame(stream, &AdminMessage::Challenge(Challenge { nonce }));
 
-            // Expect Unlock(sig). Verify sig matches the nonce we just
-            // sent, so the test exercises the real signing path.
-            let unlock = match server_read_frame(stream) {
-                AdminMessage::Unlock(u) => u,
-                other => panic!("expected Unlock, got {other:?}"),
+            // Lab PR 217: a signed `Unlock` payload over that challenge and
+            // this install — never a signature over the bare nonce.
+            let req = match server_read_frame(stream) {
+                AdminMessage::SignedUnlockRequest(r) => r,
+                other => panic!("expected SignedUnlockRequest, got {other:?}"),
             };
-            let sig = ed25519_dalek::Signature::from_bytes(&unlock.signature);
-            vk.verify_strict(&nonce, &sig)
+            assert_eq!(req.payload.op, OperationCode::Unlock);
+            assert_eq!(req.payload.nonce, nonce);
+            assert_eq!(req.payload.agent_id, agent_id);
+            assert_eq!(req.signatures.len(), 1);
+            verify(&req.payload, &req.signatures[0].signature, &vk)
                 .expect("client sig must verify");
 
-            server_write_frame(stream, &AdminMessage::UnlockResult(UnlockResult::Success));
+            server_write_frame(
+                stream,
+                &AdminMessage::SignedUnlockResponse(SignedUnlockResponse {
+                    result: AdminResult::Success,
+                    released: true,
+                    isolation_v4: false,
+                    isolation_v6: false,
+                    message: "COMBAT released".to_string(),
+                }),
+            );
         });
 
-        let outcome = run_unlock(&socket, &priv_path).expect("unlock");
-        assert!(matches!(outcome, UnlockOutcome::Success));
+        let outcome = run_unlock(&socket, &priv_path, &agent_id_path).expect("unlock");
+        match outcome {
+            UnlockOutcome::Success {
+                message,
+                isolation_v4,
+                isolation_v6,
+            } => {
+                assert_eq!(message, "COMBAT released");
+                assert!(!isolation_v4 && !isolation_v6);
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
         server.join().unwrap();
+    }
+
+    /// Lab PR 217 (NN-AUD-243 residue): a verified unlock whose teardown
+    /// did not take is a failure for the CLI — never a success — with the
+    /// agent's reason and its per-family state; so is a `Success` that says
+    /// nothing was released.
+    #[test]
+    fn cli_unlock_reports_a_failed_release() {
+        use common::wire::admin_protocol::SignedUnlockResponse;
+        for (result, released) in [
+            (AdminResult::ActionFailed, false),
+            (AdminResult::Success, false),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let socket = dir.path().join("admin.sock");
+            let priv_path = dir.path().join("admin.key");
+            write_priv_key_file(&priv_path, &SigningKey::generate(&mut OsRng));
+            let agent_id_path = write_agent_id_file(&dir, &[0x42u8; 16]);
+            let server = spawn_mock_server(&socket, move |stream| {
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::Challenge(Challenge { nonce: [0u8; 32] }),
+                );
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::SignedUnlockResponse(SignedUnlockResponse {
+                        result,
+                        released,
+                        isolation_v4: false,
+                        isolation_v6: true,
+                        message: "IPv6: FAILED (read back: the chain is still listed)".into(),
+                    }),
+                );
+            });
+            match run_unlock(&socket, &priv_path, &agent_id_path).expect("unlock") {
+                UnlockOutcome::ReleaseFailed {
+                    message,
+                    isolation_v4,
+                    isolation_v6,
+                } => {
+                    assert!(message.contains("IPv6"), "{message}");
+                    assert!(!isolation_v4 && isolation_v6);
+                }
+                other => panic!("{result:?}/{released}: expected ReleaseFailed, got {other:?}"),
+            }
+            server.join().unwrap();
+        }
     }
 
     /// FIM-009 self-upgrade (§15.1): the `trusted-installer-grant`
@@ -3342,16 +3506,25 @@ mod tests {
                 stream,
                 &AdminMessage::Challenge(Challenge { nonce: [0u8; 32] }),
             );
-            let _ = server_read_frame(stream); // Unlock
+            let _ = server_read_frame(stream); // SignedUnlockRequest
             server_write_frame(
                 stream,
-                &AdminMessage::UnlockResult(UnlockResult::RateLimited {
-                    retry_after_secs: 42,
-                }),
+                &AdminMessage::SignedUnlockResponse(
+                    common::wire::admin_protocol::SignedUnlockResponse {
+                        result: AdminResult::RateLimited {
+                            retry_after_secs: 42,
+                        },
+                        released: false,
+                        isolation_v4: true,
+                        isolation_v6: true,
+                        message: String::new(),
+                    },
+                ),
             );
         });
 
-        let outcome = run_unlock(&socket, &priv_path).expect("unlock");
+        let agent_id_path = write_agent_id_file(&dir, &[0x42u8; 16]);
+        let outcome = run_unlock(&socket, &priv_path, &agent_id_path).expect("unlock");
         match outcome {
             UnlockOutcome::RateLimited { retry_after_secs } => {
                 assert_eq!(retry_after_secs, 42);
@@ -3378,10 +3551,19 @@ mod tests {
             let _ = server_read_frame(stream);
             server_write_frame(
                 stream,
-                &AdminMessage::UnlockResult(UnlockResult::InvalidSignature),
+                &AdminMessage::SignedUnlockResponse(
+                    common::wire::admin_protocol::SignedUnlockResponse {
+                        result: AdminResult::InvalidSignature,
+                        released: false,
+                        isolation_v4: true,
+                        isolation_v6: false,
+                        message: "signature verification failed".into(),
+                    },
+                ),
             );
         });
-        let outcome = run_unlock(&socket, &priv_path).expect("unlock");
+        let agent_id_path = write_agent_id_file(&dir, &[0x42u8; 16]);
+        let outcome = run_unlock(&socket, &priv_path, &agent_id_path).expect("unlock");
         assert!(matches!(outcome, UnlockOutcome::InvalidSignature));
         server.join().unwrap();
     }
@@ -3424,6 +3606,8 @@ mod tests {
                     net_quic_rows_total: Some(9),
                     deny_fail_open_total: Some(2),
                     deny_fail_open: Some(vec![("inode_rename".to_string(), 2)]),
+                    network_isolation_v4: None,
+                    network_isolation_v6: None,
                 }),
             );
         });

@@ -16,12 +16,15 @@ use parking_lot::Mutex;
 use common::posture_types::TriggerType;
 use common::Event;
 
-use super::actuator::{CombatActuator, NeutralizeOutcome, SoftBlock};
-use super::evidence::{AuditEvidence, LadderEvidence, StageTransition, Unrecorded};
+use super::actuator::{
+    CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
+};
+use super::evidence::{ActionOutcome, AuditEvidence, LadderEvidence, StageTransition, Unrecorded};
 use super::ProcRef;
 use super::{
     CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason,
 };
+use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport};
 
 /// Shared ordered call log for the mocks + the test.
 #[derive(Clone)]
@@ -44,6 +47,17 @@ struct MockActuator {
     neutralize_outcome: NeutralizeOutcome,
     /// PIDs whose soft block does not take effect (external audit CMB-014).
     failing_blocks: Vec<u32>,
+    /// Lab PR 217: what each isolate call reports, in order; once used up,
+    /// every family isolated.
+    isolate_plan: Mutex<std::collections::VecDeque<IsolateOutcome>>,
+}
+
+/// Lab PR 217: both families isolated, read back.
+fn isolated() -> IsolateOutcome {
+    IsolateOutcome::Applied(IsolationReport {
+        v4: FamilyOutcome::Done,
+        v6: FamilyOutcome::Done,
+    })
 }
 
 /// A captured process without a pidfd (nothing is signalled), with a
@@ -95,13 +109,17 @@ impl CombatActuator for MockActuator {
         );
         self.rec.push(format!("soft_clear:{pid}"));
     }
-    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome {
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeReport {
         self.rec
             .push(format!("neutralize:{:?}", pids_of(offenders)));
-        self.neutralize_outcome.clone()
+        NeutralizeReport::uniform(&pids_of(offenders), &self.neutralize_outcome)
     }
-    fn isolate(&self) {
+    fn isolate(&self) -> IsolateOutcome {
         self.rec.push("isolate".to_string());
+        self.isolate_plan
+            .lock()
+            .pop_front()
+            .unwrap_or_else(isolated)
     }
     fn is_dry_run(&self) -> bool {
         false
@@ -118,6 +136,14 @@ impl LadderEvidence for MockEvidence {
         self.rec.push(format!("audit:{}->{}", from, t.to.as_str()));
         Ok(())
     }
+    fn record_outcome(&self, o: &ActionOutcome) -> Result<(), Unrecorded> {
+        self.rec.push(format!(
+            "outcome:{}:{}",
+            o.stage.as_str(),
+            if o.success { "success" } else { "failure" }
+        ));
+        Ok(())
+    }
 }
 
 fn ladder(neutralize: NeutralizeOutcome, window: Duration) -> (CombatLadder, Recorder) {
@@ -126,6 +152,7 @@ fn ladder(neutralize: NeutralizeOutcome, window: Duration) -> (CombatLadder, Rec
         rec: rec.clone(),
         neutralize_outcome: neutralize,
         failing_blocks: Vec::new(),
+        isolate_plan: Default::default(),
     });
     let evidence = Box::new(MockEvidence { rec: rec.clone() });
     let l = CombatLadder::new(
@@ -164,6 +191,10 @@ impl LadderEvidence for ReasonEvidence {
             .push((t.to.as_str().to_string(), t.reason.clone()));
         Ok(())
     }
+    // The stage transitions only (the order the tests read them in).
+    fn record_outcome(&self, _: &ActionOutcome) -> Result<(), Unrecorded> {
+        Ok(())
+    }
 }
 
 /// Ladder with an injected protected-PID set. The shared `Recorder` still
@@ -181,6 +212,7 @@ fn ladder_protected(
         rec: rec.clone(),
         neutralize_outcome: neutralize,
         failing_blocks: Vec::new(),
+        isolate_plan: Default::default(),
     });
     let evidence = Box::new(ReasonEvidence(reasons.clone()));
     let l = CombatLadder::new(
@@ -846,15 +878,16 @@ impl CombatActuator for HeldActuator {
     fn soft_egress_clear(&self, target: &ProcRef) {
         self.rec.push(format!("soft_clear:{}", target.pid()));
     }
-    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeOutcome {
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeReport {
         self.wait_if(Held::Neutralize, "neutralize");
         self.rec
             .push(format!("neutralize:{:?}", pids_of(offenders)));
-        self.neutralize_outcome.clone()
+        NeutralizeReport::uniform(&pids_of(offenders), &self.neutralize_outcome)
     }
-    fn isolate(&self) {
+    fn isolate(&self) -> IsolateOutcome {
         self.wait_if(Held::Isolate, "isolate");
         self.rec.push("isolate".to_string());
+        isolated()
     }
     fn is_dry_run(&self) -> bool {
         false
@@ -996,6 +1029,7 @@ fn spread_attribution_is_capped_and_escalates() {
             rec: rec.clone(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: Vec::new(),
+            isolate_plan: Default::default(),
         }),
         Box::new(MockEvidence { rec: rec.clone() }),
         Box::new(NoProtectedProcs),
@@ -1036,6 +1070,7 @@ fn a_failed_soft_block_is_recorded_and_shortens_investigate() {
             rec: rec.clone(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: vec![100],
+            isolate_plan: Default::default(),
         }),
         Box::new(reasons.clone()),
         Box::new(NoProtectedProcs),
@@ -1068,6 +1103,7 @@ fn a_failed_block_after_the_investigate_record_is_recorded() {
             rec: Recorder::new(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: vec![100, 101],
+            isolate_plan: Default::default(),
         }),
         Box::new(reasons.clone()),
         Box::new(NoProtectedProcs),
@@ -1096,6 +1132,7 @@ fn stand_down_releases_only_what_this_episode_blocked() {
             rec: rec.clone(),
             neutralize_outcome: NeutralizeOutcome::Contained,
             failing_blocks: vec![8],
+            isolate_plan: Default::default(),
         }),
         Box::new(MockEvidence { rec: rec.clone() }),
         Box::new(StubProtected(HashMap::from([(
@@ -1141,6 +1178,7 @@ fn a_failing_audit_log_never_holds_the_ladder() {
                 reason: "respawns".to_string(),
             },
             failing_blocks: Vec::new(),
+            isolate_plan: Default::default(),
         }),
         Box::new(AuditEvidence::new(Some(Arc::clone(&audit)))),
         Box::new(NoProtectedProcs),
@@ -1161,8 +1199,10 @@ fn a_failing_audit_log_never_holds_the_ladder() {
     for step in ["soft_block:1234", "neutralize:[1234]", "isolate"] {
         assert!(log.iter().any(|e| e == step), "{step} not driven: {log:?}");
     }
+    // INVESTIGATE, NEUTRALIZE and its outcome, ISOLATE and its outcome
+    // (lab PR 217: the outcomes are signed too, behind the same queue).
     let c = l.evidence_counts();
-    assert_eq!((c.unrecorded, c.pending, c.dropped), (3, 3, 0), "{c:?}");
+    assert_eq!((c.unrecorded, c.pending, c.dropped), (5, 5, 0), "{c:?}");
 
     // The log is back; the stand-down writes what waited.
     std::fs::remove_dir(&log_path).unwrap();
@@ -1171,7 +1211,7 @@ fn a_failing_audit_log_never_holds_the_ladder() {
     }
     l.stand_down(t0 + Duration::from_secs(120));
     let c = l.evidence_counts();
-    assert_eq!((c.unrecorded, c.pending, c.dropped), (3, 0, 0), "{c:?}");
+    assert_eq!((c.unrecorded, c.pending, c.dropped), (5, 0, 0), "{c:?}");
     let all: Vec<crate::audit::AuditEntry> = std::fs::read_to_string(&log_path)
         .unwrap()
         .lines()
@@ -1193,4 +1233,280 @@ fn a_failing_audit_log_never_holds_the_ladder() {
         let at = e.extra["occurred_at"].as_str().unwrap();
         assert!(at <= e.ts.as_str(), "happened {at}, written {}", e.ts);
     }
+    // Lab PR 217: each action's outcome, after its transition, with the
+    // result it had — the kill did not contain, the isolation took.
+    let outcomes: Vec<(&str, &str)> = all
+        .iter()
+        .filter(|e| e.op == "combat_outcome")
+        .map(|e| (e.extra["stage"].as_str().unwrap(), e.result.as_str()))
+        .collect();
+    assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+    assert_eq!(outcomes[0].0, "NEUTRALIZE");
+    assert!(outcomes[0].1.starts_with("failure: "), "{outcomes:?}");
+    assert_eq!(outcomes[1], ("ISOLATE", "success"));
+}
+
+// ── Lab PR 217 (capability C17): truthful NEUTRALIZE / ISOLATE outcomes ──
+
+/// Evidence that keeps every action outcome, for the tests below.
+#[derive(Clone, Default)]
+struct OutcomeEvidence(Arc<Mutex<Vec<ActionOutcome>>>);
+
+impl LadderEvidence for OutcomeEvidence {
+    fn record_stage(&self, _: &StageTransition) -> Result<(), Unrecorded> {
+        Ok(())
+    }
+    fn record_outcome(&self, o: &ActionOutcome) -> Result<(), Unrecorded> {
+        self.0.lock().push(o.clone());
+        Ok(())
+    }
+}
+
+/// An actuator whose NEUTRALIZE cannot contain the FIRST offender it is
+/// handed and contains the others — the case that stopped the old loop.
+struct FirstUncontained {
+    rec: Recorder,
+}
+
+impl CombatActuator for FirstUncontained {
+    fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
+        mock_ref(pid)
+    }
+    fn same_process(&self, target: &ProcRef, start_ns: u64) -> bool {
+        mock_same_process(target, start_ns)
+    }
+    fn soft_egress_block(&self, _: &ProcRef) -> SoftBlock {
+        SoftBlock::Blocked
+    }
+    fn soft_egress_clear(&self, _: &ProcRef) {}
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeReport {
+        self.rec
+            .push(format!("neutralize:{:?}", pids_of(offenders)));
+        let mut report =
+            NeutralizeReport::uniform(&pids_of(offenders), &NeutralizeOutcome::Contained);
+        report.offenders[0].contained = false;
+        report.offenders[0].kill = "kill outcome PermissionDenied { errno: 1 }".to_string();
+        report
+    }
+    fn isolate(&self) -> IsolateOutcome {
+        self.rec.push("isolate".to_string());
+        isolated()
+    }
+    fn is_dry_run(&self) -> bool {
+        false
+    }
+}
+
+/// Lab PR 217: NEUTRALIZE's signed outcome covers every offender — the one
+/// it could not contain and the ones after it — and the ladder escalates.
+#[test]
+fn neutralize_signs_an_outcome_for_every_offender() {
+    let rec = Recorder::new();
+    let ev = OutcomeEvidence::default();
+    let l = CombatLadder::new(
+        Box::new(FirstUncontained { rec: rec.clone() }),
+        Box::new(ev.clone()),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    let t0 = Instant::now();
+    l.engage(Some(100), Some(TriggerType::ConfirmedIntrusion), t0);
+    l.engage(Some(101), None, t0);
+    l.engage(Some(102), None, t0);
+    l.tick(t0 + Duration::from_secs(31));
+    assert!(
+        rec.log().iter().any(|e| e == "neutralize:[100, 101, 102]"),
+        "{:?}",
+        rec.log()
+    );
+    let outcomes = ev.0.lock().clone();
+    let n = outcomes
+        .iter()
+        .find(|o| o.stage == CombatStage::Neutralize)
+        .expect("a signed NEUTRALIZE outcome");
+    assert!(!n.success);
+    assert_eq!(n.action, "kill+quarantine");
+    let rows = n.detail["offenders"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{:?}", n.detail);
+    assert_eq!(rows[0]["pid"], 100);
+    assert_eq!(rows[0]["contained"], false);
+    assert_eq!(rows[1]["contained"], true);
+    assert_eq!(rows[2]["contained"], true);
+    assert!(
+        n.summary.contains("2 contained, 1 NOT contained"),
+        "{}",
+        n.summary
+    );
+    assert!(n.summary.contains("pid 100"), "{}", n.summary);
+    // the uncontained offender escalates to ISOLATE, whose outcome follows
+    assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
+    assert!(outcomes
+        .iter()
+        .any(|o| o.stage == CombatStage::Isolate && o.success));
+}
+
+/// A ladder whose isolations report `plan` in order (then success).
+fn ladder_with_isolate_plan(
+    plan: Vec<IsolateOutcome>,
+) -> (CombatLadder, Recorder, OutcomeEvidence) {
+    let rec = Recorder::new();
+    let ev = OutcomeEvidence::default();
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Uncontainable {
+                reason: "respawns".to_string(),
+            },
+            failing_blocks: Vec::new(),
+            isolate_plan: Mutex::new(plan.into()),
+        }),
+        Box::new(ev.clone()),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    (l, rec, ev)
+}
+
+fn failed_v4() -> IsolateOutcome {
+    IsolateOutcome::Applied(IsolationReport {
+        v4: FamilyOutcome::Failed("iptables-restore exited 4".to_string()),
+        v6: FamilyOutcome::Done,
+    })
+}
+
+fn failed_v6() -> IsolateOutcome {
+    IsolateOutcome::Applied(IsolationReport {
+        v4: FamilyOutcome::Done,
+        v6: FamilyOutcome::Failed("ip6tables-restore exited 1".to_string()),
+    })
+}
+
+fn isolates(rec: &Recorder) -> usize {
+    rec.log().iter().filter(|e| *e == "isolate").count()
+}
+
+/// Lab PR 217 (capability C17): an ISOLATE whose iptables did not take is
+/// not done — the stage stays where it was, the failure is signed — and it
+/// is retried after its wait; a partial one (IPv4 isolated, IPv6 not)
+/// moves the stage to ISOLATE and is retried for the family left. It used
+/// to be marked done before it ran, logged, and never retried.
+#[test]
+fn a_failed_isolate_is_not_done_and_is_retried() {
+    let (l, rec, ev) = ladder_with_isolate_plan(vec![failed_v4(), failed_v6()]);
+    let t0 = Instant::now();
+    l.engage(Some(1234), Some(TriggerType::PersistenceMechanism), t0);
+    let t1 = t0 + Duration::from_secs(31);
+    l.tick(t1);
+    assert_eq!(isolates(&rec), 1);
+    assert_eq!(
+        l.current_stage(),
+        Some(CombatStage::Neutralize),
+        "the host is not isolated: the stage does not say ISOLATE"
+    );
+    {
+        let o = ev.0.lock();
+        let last = o.last().unwrap();
+        assert_eq!(last.stage, CombatStage::Isolate);
+        assert!(!last.success);
+        assert!(last.summary.contains("attempt 1 of 3"), "{}", last.summary);
+        assert!(last.summary.contains("IPv4: FAILED"), "{}", last.summary);
+        assert_eq!(last.detail["retry_in_secs"], 5);
+    }
+    // before the wait: no retry
+    l.tick(t1 + Duration::from_secs(4));
+    assert_eq!(isolates(&rec), 1);
+    // after it: attempt 2 — IPv4 isolated, IPv6 not
+    l.tick(t1 + Duration::from_secs(5));
+    assert_eq!(isolates(&rec), 2);
+    assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
+    assert!(ev.0.lock().last().unwrap().summary.contains("IPv6: FAILED"));
+    // attempt 3, 10 s later: both isolated — done, no further attempt
+    l.tick(t1 + Duration::from_secs(15));
+    assert_eq!(isolates(&rec), 3);
+    let last = ev.0.lock().last().unwrap().clone();
+    assert!(last.success, "{}", last.summary);
+    assert!(last.summary.contains("attempt 3 of 3"), "{}", last.summary);
+    for s in [30, 60, 120] {
+        l.tick(t1 + Duration::from_secs(s));
+    }
+    assert_eq!(isolates(&rec), 3);
+}
+
+/// Lab PR 217: the retries are bounded — after the last attempt fails the
+/// ladder stops, the failure is signed as final, and the stage still does
+/// not claim an isolation.
+#[test]
+fn isolate_retries_are_bounded() {
+    let (l, rec, ev) = ladder_with_isolate_plan(vec![failed_v4(), failed_v4(), failed_v4()]);
+    let t0 = Instant::now();
+    l.engage(Some(1234), Some(TriggerType::PersistenceMechanism), t0);
+    let t1 = t0 + Duration::from_secs(31);
+    l.tick(t1);
+    for s in [5, 15, 30, 60, 300] {
+        l.tick(t1 + Duration::from_secs(s));
+    }
+    assert_eq!(isolates(&rec), 3, "{:?}", rec.log());
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    let o = ev.0.lock();
+    let isolate: Vec<_> = o
+        .iter()
+        .filter(|x| x.stage == CombatStage::Isolate)
+        .collect();
+    assert_eq!(isolate.len(), 3);
+    assert!(isolate.iter().all(|x| !x.success));
+    assert!(
+        isolate[2].detail["retry_in_secs"].is_null(),
+        "no further retry"
+    );
+}
+
+/// Lab PR 217: IPv4 isolated and IPv6 unavailable on this host (no
+/// ip6tables): not retried — a retry would not change it — but the row is
+/// not a success either: it names the hole.
+#[test]
+fn an_unavailable_family_is_a_hole_not_a_success() {
+    let (l, rec, ev) = ladder_with_isolate_plan(vec![IsolateOutcome::Applied(IsolationReport {
+        v4: FamilyOutcome::Done,
+        v6: FamilyOutcome::Unavailable("no `ip6tables` in /usr/sbin, /usr/bin, /sbin, /bin".into()),
+    })]);
+    let t0 = Instant::now();
+    l.engage(Some(1234), None, t0);
+    let t1 = t0 + Duration::from_secs(31);
+    l.tick(t1);
+    for s in [5, 15, 60] {
+        l.tick(t1 + Duration::from_secs(s));
+    }
+    assert_eq!(isolates(&rec), 1, "not retried");
+    assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
+    let o = ev.0.lock();
+    let last = o.last().unwrap();
+    assert!(!last.success, "an IPv6 hole is not a success");
+    assert!(
+        last.summary.contains("IPv6: unavailable"),
+        "{}",
+        last.summary
+    );
+    assert!(last.detail["retry_in_secs"].is_null());
+}
+
+/// Lab PR 217: an isolation that cannot be applied (detect-only, no
+/// isolator) is recorded as not applied, once, and not retried.
+#[test]
+fn an_isolation_not_applied_is_recorded_and_not_retried() {
+    let (l, rec, ev) = ladder_with_isolate_plan(vec![IsolateOutcome::NotApplied(
+        "detect-only: iptables NOT applied".to_string(),
+    )]);
+    let t0 = Instant::now();
+    l.engage(Some(1234), None, t0);
+    let t1 = t0 + Duration::from_secs(31);
+    l.tick(t1);
+    for s in [5, 15, 60] {
+        l.tick(t1 + Duration::from_secs(s));
+    }
+    assert_eq!(isolates(&rec), 1);
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    let o = ev.0.lock();
+    let last = o.last().unwrap();
+    assert!(!last.success);
+    assert!(last.summary.contains("not applied"), "{}", last.summary);
 }

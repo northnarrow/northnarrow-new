@@ -65,6 +65,8 @@ use tracing::{info, warn};
 use common::posture_types::TriggerType;
 use common::Event;
 
+use crate::anti_tamper::network_isolate::FamilyOutcome;
+
 pub mod actuator;
 pub mod evidence;
 pub mod protected;
@@ -74,8 +76,13 @@ pub mod reconcile;
 mod tests;
 
 pub use crate::response::proc_ref::ProcRef;
-pub use actuator::{CombatActuator, NeutralizeOutcome, SoftBlock, SystemActuator};
-pub use evidence::{AuditEvidence, EvidenceCounts, LadderEvidence, StageTransition, Unrecorded};
+pub use actuator::{
+    CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, OffenderOutcome,
+    SoftBlock, SystemActuator,
+};
+pub use evidence::{
+    ActionOutcome, AuditEvidence, EvidenceCounts, LadderEvidence, StageTransition, Unrecorded,
+};
 pub use protected::{NoProtectedProcs, ProtectedProcs, ProtectedReason, SystemProtectedProcs};
 
 /// The active-response stage WITHIN COMBAT posture. Ordered by
@@ -123,6 +130,12 @@ pub struct LadderConfig {
     /// episode. A tree that grows past it is not containable process by
     /// process: the ladder escalates instead of attributing more.
     pub max_offenders: usize,
+    /// Lab PR 217 (capability C17): ISOLATE attempts per episode. An
+    /// attempt that leaves a family not isolated (read back) is retried
+    /// until then; each attempt's outcome is signed.
+    pub isolate_attempts: u32,
+    /// Lab PR 217: the wait before the n-th retry is n times this.
+    pub isolate_retry_after: Duration,
 }
 
 impl Default for LadderConfig {
@@ -135,6 +148,8 @@ impl Default for LadderConfig {
             investigate_window: Duration::from_secs(30),
             failed_block_window: Duration::from_secs(10),
             max_offenders: 1024,
+            isolate_attempts: 3,
+            isolate_retry_after: Duration::from_secs(5),
         }
     }
 }
@@ -171,8 +186,10 @@ struct LadderState {
     drive_queued: bool,
     /// The posture trigger that drove COMBAT (telemetry / audit only).
     trigger: Option<TriggerType>,
-    /// Set once STAGE 3 has run, so a repeat tick/observe is a no-op.
-    isolated: bool,
+    /// Lab PR 217 (capability C17): where STAGE 3 stands. It was a flag
+    /// set before the isolation ran, so a failed one counted as done and
+    /// was never retried; it now follows the read-back outcome.
+    isolation: Isolation,
     /// Set once a NEUTRALIZE attempt has run, so a repeat advance does
     /// not re-kill (the decision to escalate to ISOLATE is taken from
     /// that one attempt's outcome).
@@ -196,7 +213,7 @@ impl LadderState {
             attribution_capped: false,
             drive_queued: false,
             trigger: None,
-            isolated: false,
+            isolation: Isolation::Idle,
             neutralize_attempted: false,
             isolation_deferred: None,
         }
@@ -210,6 +227,29 @@ impl LadderState {
             cfg.investigate_window
         }
     }
+}
+
+/// Lab PR 217 (capability C17): STAGE 3's progress within an episode. The
+/// stage reads ISOLATE only once an attempt isolated the host (IPv4 read
+/// back), never before the attempt ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Isolation {
+    /// Not attempted this episode (a refusal by the gate leaves it here).
+    Idle,
+    /// Attempt `n` is running.
+    Running(u32),
+    /// The last of `attempts` left a family not isolated (`why`); the tick
+    /// retries at `retry_at`, `None` once the attempts are used up.
+    Failed {
+        attempts: u32,
+        retry_at: Option<Instant>,
+        why: String,
+    },
+    /// Every family that can be isolated on this host is.
+    Done,
+    /// Not applied, and no attempt would change it: detect-only, or no
+    /// isolator in this build.
+    NotApplied,
 }
 
 /// Internal: the side effects a stage transition must perform once the
@@ -237,6 +277,9 @@ enum LadderStep {
         from: CombatStage,
         offenders: Vec<u32>,
         trigger: Option<TriggerType>,
+        /// Lab PR 217: which attempt this is (1 = the decision itself).
+        attempt: u32,
+        episode: u64,
     },
 }
 
@@ -368,7 +411,9 @@ impl CombatLadder {
 
     /// Current stage if a COMBAT episode is active, else `None`. Surfaced
     /// for `nn-admin status` and used by tests. With the worker, the
-    /// stage is the decided one; its side effects may still be queued.
+    /// stage is the decided one; its side effects may still be queued —
+    /// except ISOLATE, which the stage reads only once an isolation was
+    /// read back in place (lab PR 217).
     pub fn current_stage(&self) -> Option<CombatStage> {
         let s = self.inner.state.lock();
         if s.engaged {
@@ -692,7 +737,7 @@ impl CombatLadder {
         // taken under it).
         let deferred = {
             let s = self.inner.state.lock();
-            if s.engaged && !s.isolated && !s.drive_queued {
+            if s.engaged && s.isolation == Isolation::Idle && !s.drive_queued {
                 s.isolation_deferred.clone()
             } else {
                 None
@@ -702,7 +747,7 @@ impl CombatLadder {
             if (self.inner.isolation_gate)() {
                 let job = {
                     let mut s = self.inner.state.lock();
-                    if s.engaged && !s.isolated {
+                    if s.engaged && s.isolation == Isolation::Idle {
                         self.queue_drive(
                             &mut s,
                             CombatStage::Isolate,
@@ -717,6 +762,30 @@ impl CombatLadder {
                     self.dispatch(job);
                 }
             }
+        }
+        // Lab PR 217 (capability C17): an ISOLATE that left a family not
+        // isolated is retried, a bounded number of times, once its wait
+        // has passed.
+        let retry = {
+            let mut s = self.inner.state.lock();
+            match &s.isolation {
+                Isolation::Failed {
+                    attempts,
+                    retry_at: Some(at),
+                    why,
+                } if s.engaged && now >= *at => {
+                    let reason = format!(
+                        "retry ISOLATE (attempt {} of {}): the last attempt left {why}",
+                        attempts + 1,
+                        self.inner.cfg.isolate_attempts
+                    );
+                    self.queue_drive(&mut s, CombatStage::Isolate, now, &reason)
+                }
+                _ => None,
+            }
+        };
+        if let Some(job) = retry {
+            self.dispatch(job);
         }
     }
 
@@ -803,6 +872,120 @@ impl Inner {
                 "COMBAT stage transition NOT in the signed audit log — enforcement proceeds"
             );
         }
+    }
+
+    /// Lab PR 217 (capability C17): an action's outcome, signed after it
+    /// ran. Like [`Self::record`], an entry the audit log refuses is logged
+    /// whole at ERROR and the ladder proceeds.
+    fn record_outcome(&self, o: ActionOutcome) {
+        if let Err(why) = self.evidence.record_outcome(&o) {
+            tracing::error!(
+                target: "combat.audit",
+                stage = %o.stage,
+                action = o.action,
+                success = o.success,
+                summary = %common::log_escape::Escaped(&o.summary),
+                why = %why,
+                "COMBAT action outcome NOT in the signed audit log — the ladder proceeds"
+            );
+        }
+    }
+
+    /// Lab PR 217 (capability C17): what ISOLATE attempt `attempt` of
+    /// `episode` did, into the state and the signed log. The stage reads
+    /// ISOLATE once the host is isolated (IPv4 read back); a family left
+    /// not isolated is retried by the tick while attempts remain.
+    fn settle_isolation(
+        &self,
+        episode: u64,
+        attempt: u32,
+        now: Instant,
+        trigger: Option<TriggerType>,
+        outcome: IsolateOutcome,
+    ) {
+        let max = self.cfg.isolate_attempts.max(1);
+        let (next, success, summary, detail) = match &outcome {
+            IsolateOutcome::NotApplied(why) => (
+                Isolation::NotApplied,
+                false,
+                format!("not applied: {why}"),
+                serde_json::json!({ "applied": false, "why": why }),
+            ),
+            IsolateOutcome::Applied(report) => {
+                let summary = report.summary("isolated (read back)");
+                let next = if report.complete() {
+                    Isolation::Done
+                } else {
+                    Isolation::Failed {
+                        attempts: attempt,
+                        retry_at: (attempt < max)
+                            .then(|| now + self.cfg.isolate_retry_after * attempt),
+                        why: summary.clone(),
+                    }
+                };
+                let retry_in = match &next {
+                    Isolation::Failed {
+                        retry_at: Some(_), ..
+                    } => Some((self.cfg.isolate_retry_after * attempt).as_secs()),
+                    _ => None,
+                };
+                let detail = serde_json::json!({
+                    "applied": true,
+                    "v4": report.v4.describe_short(),
+                    "v6": report.v6.describe_short(),
+                    "engaged": report.engaged(),
+                    "complete": report.complete(),
+                    "retry_in_secs": retry_in,
+                });
+                // `success` only when both families are isolated: an
+                // unavailable one (no ip6tables, no v6 ruleset) is not
+                // retried, but it is a hole, and the row says so.
+                let both = report.v4 == FamilyOutcome::Done && report.v6 == FamilyOutcome::Done;
+                (next, both, summary, detail)
+            }
+        };
+        let engaged = matches!(&outcome, IsolateOutcome::Applied(r) if r.engaged());
+        let exhausted = matches!(next, Isolation::Failed { retry_at: None, .. });
+        let next_kind = next.clone();
+        {
+            let mut s = self.state.lock();
+            if s.engaged && s.episode == episode {
+                if engaged {
+                    s.stage = CombatStage::Isolate;
+                    s.stage_since = now;
+                }
+                s.isolation = next;
+            }
+        }
+        let mut detail = detail;
+        detail["attempt"] = serde_json::Value::from(attempt);
+        detail["max_attempts"] = serde_json::Value::from(max);
+        let summary = format!("attempt {attempt} of {max}: {summary}");
+        if success {
+            info!(target: "combat.ladder", outcome = %summary, "COMBAT: ISOLATE verified");
+        } else if matches!(next_kind, Isolation::Done) {
+            warn!(
+                target: "combat.ladder",
+                outcome = %summary,
+                "COMBAT: ISOLATE in place with a family that cannot be isolated on this host"
+            );
+        } else if exhausted {
+            tracing::error!(
+                target: "combat.ladder",
+                outcome = %summary,
+                "COMBAT: ISOLATE did not take after every attempt — no further retry this episode"
+            );
+        } else {
+            warn!(target: "combat.ladder", outcome = %summary, "COMBAT: ISOLATE incomplete");
+        }
+        self.record_outcome(ActionOutcome {
+            stage: CombatStage::Isolate,
+            action: "isolate",
+            trigger,
+            success,
+            summary,
+            detail,
+        });
     }
 
     /// Run one job (on the worker, or inline).
@@ -1039,12 +1222,14 @@ impl Inner {
     /// serialises against `current_stage()` or the drivers.
     ///
     /// NEUTRALIZE chains into ISOLATE when the threat is uncontainable.
-    /// The `neutralize_attempted` / `isolated` flags persist in the state
-    /// across the re-lock gap, so a repeated advance can never
-    /// double-neutralize or double-isolate (its under-lock check yields
-    /// [`LadderStep::None`]). Evidence for a stage is ALWAYS emitted
-    /// before that stage's enforcement action — so the dossier precedes
-    /// any isolation in every COMBAT case.
+    /// The `neutralize_attempted` flag and the [`Isolation`] progress
+    /// persist in the state across the re-lock gap, so a repeated advance
+    /// can never double-neutralize or run two isolations at once (its
+    /// under-lock check yields [`LadderStep::None`]); an isolation that did
+    /// not take is retried by the tick, bounded (lab PR 217). Evidence for
+    /// a stage is ALWAYS emitted before that stage's enforcement action —
+    /// so the dossier precedes any isolation in every COMBAT case — and the
+    /// action's outcome after it.
     fn drive_to(&self, target: CombatStage, now: Instant, reason: &str) {
         let mut target = target;
         let mut reason = reason.to_string();
@@ -1076,7 +1261,16 @@ impl Inner {
                             }
                         }
                         CombatStage::Isolate => {
-                            if s.isolated {
+                            // Lab PR 217: settled (isolated, not
+                            // applicable, attempts used up) or under way.
+                            let settled = matches!(
+                                s.isolation,
+                                Isolation::Done
+                                    | Isolation::NotApplied
+                                    | Isolation::Running(_)
+                                    | Isolation::Failed { retry_at: None, .. }
+                            );
+                            if settled {
                                 LadderStep::None
                             } else if !isolation_allowed {
                                 if s.isolation_deferred.replace(reason.clone()).is_some() {
@@ -1089,15 +1283,21 @@ impl Inner {
                                     }
                                 }
                             } else {
-                                let from = s.stage;
+                                // Lab PR 217: the attempt is recorded as
+                                // running — the stage moves to ISOLATE only
+                                // once it isolated the host (below).
+                                let attempt = match s.isolation {
+                                    Isolation::Failed { attempts, .. } => attempts + 1,
+                                    _ => 1,
+                                };
                                 s.isolation_deferred = None;
-                                s.isolated = true;
-                                s.stage = CombatStage::Isolate;
-                                s.stage_since = now;
+                                s.isolation = Isolation::Running(attempt);
                                 LadderStep::Isolate {
-                                    from,
+                                    from: s.stage,
                                     offenders: s.offenders.keys().copied().collect(),
                                     trigger: s.trigger,
+                                    attempt,
+                                    episode: s.episode,
                                 }
                             }
                         }
@@ -1168,6 +1368,11 @@ impl Inner {
                             "COMBAT: all attributed offenders are host-critical and were spared — \
                              escalating to ISOLATE (last resort)"
                         );
+                        self.record_outcome(neutralize_outcome(
+                            trigger,
+                            &NeutralizeReport::default(),
+                            &spared,
+                        ));
                         reason = format!(
                             "all attributed offenders host-critical, spared: {}",
                             fmt_protected(&spared)
@@ -1176,7 +1381,11 @@ impl Inner {
                         continue;
                     }
 
-                    match self.actuator.neutralize(&actionable) {
+                    // Lab PR 217 (capability C17): every offender handled,
+                    // each one's outcome signed after the kill.
+                    let report = self.actuator.neutralize(&actionable);
+                    self.record_outcome(neutralize_outcome(trigger, &report, &spared));
+                    match report.outcome() {
                         NeutralizeOutcome::Contained if spared.is_empty() => {
                             info!(
                                 target: "combat.ladder",
@@ -1245,23 +1454,31 @@ impl Inner {
                     from,
                     offenders,
                     trigger,
+                    attempt,
+                    episode,
                 } => {
                     warn!(
                         target: "combat.ladder",
                         offenders = ?offenders,
                         reason = %reason,
+                        attempt,
                         "COMBAT: ISOLATE (last resort) — engaging full network isolation"
                     );
                     // Evidence FIRST — emitted before the iptables DROP,
-                    // so isolation never blinds the operator.
-                    self.record(StageTransition {
-                        from: Some(from),
-                        to: CombatStage::Isolate,
-                        trigger,
-                        offenders,
-                        reason: reason.clone(),
-                    });
-                    self.actuator.isolate();
+                    // so isolation never blinds the operator. A retry's
+                    // decision is the first attempt's; its outcome is
+                    // recorded below like every attempt's.
+                    if attempt == 1 {
+                        self.record(StageTransition {
+                            from: Some(from),
+                            to: CombatStage::Isolate,
+                            trigger,
+                            offenders,
+                            reason: reason.clone(),
+                        });
+                    }
+                    let outcome = self.actuator.isolate();
+                    self.settle_isolation(episode, attempt, now, trigger, outcome);
                     return;
                 }
             }
@@ -1276,6 +1493,58 @@ fn fmt_protected(spared: &[(u32, ProtectedReason)]) -> String {
         .map(|(pid, reason)| format!("{reason} (pid {pid})"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Lab PR 217 (capability C17): the signed outcome of a NEUTRALIZE — one
+/// entry per offender handed to the actuator, and the host-critical ones
+/// spared (never killed). `success` only when every offender is contained
+/// and none was spared.
+fn neutralize_outcome(
+    trigger: Option<TriggerType>,
+    report: &NeutralizeReport,
+    spared: &[(u32, ProtectedReason)],
+) -> ActionOutcome {
+    let contained = report.offenders.iter().filter(|o| o.contained).count();
+    let not = report.offenders.len() - contained;
+    let mut summary = format!(
+        "{} offender(s) handled: {contained} contained, {not} NOT contained",
+        report.offenders.len()
+    );
+    if let NeutralizeOutcome::Uncontainable { reason } = report.outcome() {
+        if not > 0 || report.offenders.is_empty() {
+            summary.push_str(&format!(" ({reason})"));
+        }
+    }
+    if !spared.is_empty() {
+        summary.push_str(&format!(
+            "; host-critical, spared (not killed): {}",
+            fmt_protected(spared)
+        ));
+    }
+    let offenders: Vec<serde_json::Value> = report
+        .offenders
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "pid": o.pid,
+                "contained": o.contained,
+                "kill": o.kill,
+                "quarantine": o.quarantine,
+            })
+        })
+        .collect();
+    let spared_rows: Vec<serde_json::Value> = spared
+        .iter()
+        .map(|(pid, why)| serde_json::json!({ "pid": pid, "reason": why.to_string() }))
+        .collect();
+    ActionOutcome {
+        stage: CombatStage::Neutralize,
+        action: "kill+quarantine",
+        trigger,
+        success: !report.offenders.is_empty() && not == 0 && spared.is_empty(),
+        summary,
+        detail: serde_json::json!({ "offenders": offenders, "spared": spared_rows }),
+    }
 }
 
 /// True if `addr` (interpreted per `family`: 2 = AF_INET, 10 = AF_INET6)

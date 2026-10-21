@@ -1004,6 +1004,9 @@ fn rotate_keys_round_trip() {
             "unlock",
             "--key",
             new_priv.to_str().unwrap(),
+            // Lab PR 217: the signed unlock is bound to this install.
+            "--agent-id-file",
+            paths.agent_id_file.to_str().unwrap(),
             "--socket",
             paths.socket.to_str().unwrap(),
         ])
@@ -1113,6 +1116,9 @@ fn audit_verify_e2e() {
             "unlock",
             "--key",
             priv_a.to_str().unwrap(),
+            // Lab PR 217: the signed unlock is bound to this install.
+            "--agent-id-file",
+            paths.agent_id_file.to_str().unwrap(),
             "--socket",
             paths.socket.to_str().unwrap(),
         ])
@@ -1134,6 +1140,9 @@ fn audit_verify_e2e() {
             "unlock",
             "--key",
             wrong_priv.to_str().unwrap(),
+            // Lab PR 217: the signed unlock is bound to this install.
+            "--agent-id-file",
+            paths.agent_id_file.to_str().unwrap(),
             "--socket",
             paths.socket.to_str().unwrap(),
         ])

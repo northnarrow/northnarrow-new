@@ -9,18 +9,29 @@
 //! physical access plus an Ed25519-signed admin unlock (see
 //! `admin_auth.rs`, landing in a later commit).
 //!
-//! `release()` is omitted from this commit; it ships alongside the
-//! [`UnlockToken`] capability type so the API can only be used by
-//! code that proved a signature first.
+//! `release()` requires the [`UnlockToken`] capability type, so the API
+//! can only be used by code that proved a signature first.
+//!
+//! ## Truthful state (lab PR 217, capability C18)
+//!
+//! The isolation is kept per IP family ([`Family`]): a family is isolated
+//! only once its table was read back (`iptables -S` / `ip6tables -S`) after
+//! an engage and found holding the COMBAT chain with its catch-all DROP and
+//! every jump into it; it is clear again only once a release read the table
+//! back without the chain or any jump. [`NetworkIsolator::engage`] and
+//! [`NetworkIsolator::release`] return what they found, per family
+//! ([`IsolationReport`]), and every iptables / ip6tables invocation is
+//! waited for at most [`crate::bounded_cmd::EXTERNAL_CMD_TIMEOUT`].
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{error, info, warn};
 
 use super::combat_allow;
+use crate::bounded_cmd::{run_bounded, EXTERNAL_CMD_TIMEOUT};
 use crate::trusted_bin::{self, SystemBin};
 
 /// `iptables-restore` lookup name. External audit ATP-014 (NN-AUD-262):
@@ -116,12 +127,101 @@ pub(in crate::anti_tamper) fn mint_unlock_token() -> UnlockToken {
     UnlockToken { _private: () }
 }
 
+/// An IP family COMBAT isolates (lab PR 217: the state is kept per family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    pub fn label(self) -> &'static str {
+        match self {
+            Family::V4 => "IPv4",
+            Family::V6 => "IPv6",
+        }
+    }
+}
+
+/// What an engage or a release found in one family's table, read back
+/// (lab PR 217).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FamilyOutcome {
+    /// Engage: the table holds the COMBAT chain, its catch-all DROP and
+    /// every jump into it. Release: it holds neither the chain nor a jump.
+    Done,
+    /// Nothing of COMBAT can be applied or read in this family, and none of
+    /// ours is known to be there: no v6 ruleset provisioned (a build without
+    /// the overlay gate), no trusted `ip6tables` on the host, a table the
+    /// kernel does not have. Permanent — a retry would not change it — and
+    /// named in the record: after an engage it is a hole (that family's
+    /// traffic is not dropped).
+    Unavailable(String),
+    /// The step did not take effect; the reason, from the read-back.
+    Failed(String),
+}
+
+impl FamilyOutcome {
+    /// `done`, `unavailable: …`, `FAILED: …` — for a structured record.
+    pub fn describe_short(&self) -> String {
+        match self {
+            FamilyOutcome::Done => "done".to_string(),
+            FamilyOutcome::Unavailable(why) => format!("unavailable: {why}"),
+            FamilyOutcome::Failed(why) => format!("FAILED: {why}"),
+        }
+    }
+
+    fn describe(&self, family: Family, done: &str) -> String {
+        match self {
+            FamilyOutcome::Done => format!("{}: {done}", family.label()),
+            FamilyOutcome::Unavailable(why) => format!("{}: unavailable ({why})", family.label()),
+            FamilyOutcome::Failed(why) => format!("{}: FAILED ({why})", family.label()),
+        }
+    }
+}
+
+/// The outcome of [`NetworkIsolator::engage`] or [`NetworkIsolator::release`]
+/// per IP family, as the tables were read back (lab PR 217).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationReport {
+    pub v4: FamilyOutcome,
+    pub v6: FamilyOutcome,
+}
+
+impl IsolationReport {
+    /// Engage: the critical (IPv4) leg is in place — the host is isolated.
+    pub fn engaged(&self) -> bool {
+        self.v4 == FamilyOutcome::Done
+    }
+
+    /// No family failed: an engage that isolated every family that can be
+    /// isolated on this host, a release that left every table clear. A
+    /// failed family is worth a retry; an unavailable one is not.
+    pub fn complete(&self) -> bool {
+        !matches!(self.v4, FamilyOutcome::Failed(_)) && !matches!(self.v6, FamilyOutcome::Failed(_))
+    }
+
+    /// One line per report, for the journal, the signed record and the
+    /// admin reply. `done` names what [`FamilyOutcome::Done`] means.
+    pub fn summary(&self, done: &str) -> String {
+        format!(
+            "{}; {}",
+            self.v4.describe(Family::V4, done),
+            self.v6.describe(Family::V6, done)
+        )
+    }
+}
+
 /// COMBAT-state network isolator. Cheap to construct (no I/O beyond
 /// a path-exists check); the expensive work happens in
 /// [`Self::engage`].
 #[derive(Debug)]
 pub struct NetworkIsolator {
-    is_isolated: AtomicBool,
+    /// Lab PR 217: per family — true only after a read-back found the
+    /// COMBAT ruleset in that table (one flag for both used to say
+    /// "isolated" with IPv6 open).
+    isolated_v4: AtomicBool,
+    isolated_v6: AtomicBool,
     rules_path: PathBuf,
     /// Beta Step 4b: opt-in management carve-out CIDR list, re-read at
     /// every `engage()` (never cached) so an operator can add an
@@ -141,6 +241,9 @@ pub struct NetworkIsolator {
     /// COMBAT reads ([`Self::trusted_source`]). `None` (tests, tools):
     /// the files are trusted as they are.
     gate: Option<std::sync::Arc<crate::config::overlay_auth::OverlayGate>>,
+    /// Lab PR 217: how long each iptables / ip6tables invocation may take
+    /// ([`EXTERNAL_CMD_TIMEOUT`]).
+    cmd_timeout: std::time::Duration,
 }
 
 /// The rulesets and carve-out the agent was built with — what COMBAT
@@ -202,7 +305,8 @@ impl NetworkIsolator {
             return Err(anyhow!("combat ruleset {} not found", rules_path.display()));
         }
         Ok(Self {
-            is_isolated: AtomicBool::new(false),
+            isolated_v4: AtomicBool::new(false),
+            isolated_v6: AtomicBool::new(false),
             rules_path,
             allow_cidrs_path: combat_allow::default_path(),
             restore_bin: Bin::System(DEFAULT_RESTORE_BIN),
@@ -211,6 +315,7 @@ impl NetworkIsolator {
             restore_bin_v6: Bin::System(DEFAULT_RESTORE_BIN_V6),
             ip6tables_bin: Bin::System(DEFAULT_IPTABLES_BIN_V6),
             gate: None,
+            cmd_timeout: EXTERNAL_CMD_TIMEOUT,
         })
     }
 
@@ -335,7 +440,8 @@ impl NetworkIsolator {
         iptables_bin: PathBuf,
     ) -> Result<Self> {
         Ok(Self {
-            is_isolated: AtomicBool::new(false),
+            isolated_v4: AtomicBool::new(false),
+            isolated_v6: AtomicBool::new(false),
             // v6 fields default to the same (benign) test binaries +
             // ruleset so existing v4 tests exercise the v6 legs harmlessly
             // (`/bin/true` / `/usr/bin/cat`). v6-specific tests pass the
@@ -348,17 +454,68 @@ impl NetworkIsolator {
             restore_bin: Bin::Fixed(restore_bin),
             iptables_bin: Bin::Fixed(iptables_bin),
             gate: None,
+            cmd_timeout: EXTERNAL_CMD_TIMEOUT,
         })
     }
 
-    /// Apply the combat ruleset. Idempotent: re-engaging shells out
-    /// again, which is intentional — if an attacker has flushed
-    /// iptables between our calls, re-asserting the ruleset is
-    /// exactly what we want.
-    pub fn engage(&self) -> Result<()> {
-        let (ruleset, carved) = self.build_engaged_ruleset()?;
-        let restore_exe = run_iptables_restore_data(&self.restore_bin, ruleset.as_bytes())
-            .context("iptables-restore failed during COMBAT engage")?;
+    /// Apply the combat ruleset, IPv4 and IPv6, and read each table back.
+    /// Idempotent: re-engaging shells out again, which is intentional — if
+    /// an attacker has flushed iptables between our calls, re-asserting the
+    /// ruleset is exactly what we want.
+    ///
+    /// Lab PR 217 (capability C18): what is returned — and what the state
+    /// says — is what the read-back found, per family. A family is isolated
+    /// only when its table holds the COMBAT chain, its catch-all DROP and
+    /// every jump into it after the restore; a restore that exited non-zero
+    /// over a table still holding an earlier engage's ruleset is isolated
+    /// too (the restore's error is logged). The v6 leg stays best-effort
+    /// (BUG-031: an attack is under way; refusing all isolation because v6
+    /// is not provisioned would let it proceed), and it is no longer silent:
+    /// its outcome is in the report, the signed record and `nn-admin
+    /// status`, and a v6 failure is retried by the ladder like a v4 one. Both
+    /// legs are attempted whatever the other's outcome.
+    pub fn engage(&self) -> IsolationReport {
+        let v4 = match self.build_engaged_ruleset() {
+            Ok((ruleset, carved)) => self.engage_family(Family::V4, &ruleset, &carved),
+            Err(e) => {
+                self.set_isolated(Family::V4, false);
+                FamilyOutcome::Failed(format!("building the v4 ruleset: {e:#}"))
+            }
+        };
+        let v6 = match self.build_engaged_ruleset_v6() {
+            Ok(None) => {
+                warn!(
+                    rules_v6 = %self.rules_path_v6.display(),
+                    "COMBAT: combat-rules.v6 absent — IPv6 NOT isolated this COMBAT (provision \
+                     the v6 ruleset to close the gap)"
+                );
+                FamilyOutcome::Unavailable(format!(
+                    "{} absent: no v6 ruleset provisioned",
+                    self.rules_path_v6.display()
+                ))
+            }
+            Ok(Some((ruleset, carved))) => self.engage_family(Family::V6, &ruleset, &carved),
+            Err(e) => {
+                warn!(error = %e, "COMBAT: building the v6 ruleset failed — IPv6 NOT isolated this COMBAT");
+                FamilyOutcome::Failed(format!("building the v6 ruleset: {e:#}"))
+            }
+        };
+        IsolationReport { v4, v6 }
+    }
+
+    /// One family's engage: restore, read back, record. See [`Self::engage`].
+    fn engage_family(&self, family: Family, ruleset: &str, carved: &[String]) -> FamilyOutcome {
+        let (restore_bin, list_bin) = self.bins(family);
+        if family == Family::V6 {
+            // No trusted ip6tables on this host: nothing can be applied (the
+            // v4 leg names its own binaries' gap as a failure — it is the
+            // isolation).
+            if let Err(e) = restore_bin.command().and(list_bin.command()) {
+                warn!(error = %format!("{e:#}"), "COMBAT: IPv6 NOT isolated — no ip6tables to apply the v6 ruleset with");
+                return FamilyOutcome::Unavailable(format!("{e:#}"));
+            }
+        }
+        let restored = run_iptables_restore_data(restore_bin, ruleset.as_bytes(), self.cmd_timeout);
         // Lab follow-up (lab PR 188): a restore that exits 0 is not proof
         // that the ruleset is in. Root can point the `iptables-restore`
         // link (or its `/etc/alternatives` entry) at another root-owned
@@ -367,123 +524,107 @@ impl NetworkIsolator {
         // isolated", visible only in `restore_bin`. The table is read back
         // (`iptables -S`): the chain must hold its catch-all DROP and every
         // base chain the ruleset jumps from must jump into it. Otherwise the
-        // host is not isolated, and is not reported so.
-        if let Err(gaps) = verify_isolation(&self.iptables_bin, &ruleset) {
-            self.is_isolated.store(false, Ordering::SeqCst);
-            error!(
-                restore_bin = %restore_exe.display(),
-                gaps = %gaps,
-                "COMBAT: isolation NOT in place — iptables-restore exited 0 but the table does \
-                 not hold the COMBAT ruleset (an iptables-restore link pointed at another \
-                 binary?); the host is NOT isolated"
-            );
-            return Err(anyhow!(
-                "COMBAT isolation not in place after {} exited 0: {gaps} — the host is NOT \
-                 isolated",
-                restore_exe.display()
-            ));
+        // family is not isolated, and is not reported so. Lab PR 217: the v6
+        // table likewise, and after a failed restore too (the state follows
+        // the table, not the exit code).
+        if let Err(gaps) = verify_isolation(list_bin, ruleset, self.cmd_timeout) {
+            self.set_isolated(family, false);
+            let why = match &restored {
+                Ok(exe) => format!(
+                    "isolation not in place after {} exited 0: {gaps} — {} is NOT isolated",
+                    exe.display(),
+                    family.label()
+                ),
+                Err(e) => format!(
+                    "{restore_bin} failed: {e:#}; read back: {gaps} — {} is NOT isolated",
+                    family.label()
+                ),
+            };
+            error!(family = family.label(), why = %why, "COMBAT: isolation NOT in place");
+            return FamilyOutcome::Failed(why);
         }
         // External audit ATP-006 (NN-AUD-259): the ruleset is in, so the
-        // host is isolated — recorded before anything else can fail. The
-        // dedup's `?` used to return between the two: `nn-admin status`
-        // then said "not isolated" of an isolated host, and the ladder's
-        // caller logged a failed isolation.
-        self.is_isolated.store(true, Ordering::SeqCst);
+        // family is isolated — recorded before anything else can fail.
+        self.set_isolated(family, true);
+        if let Err(e) = &restored {
+            warn!(
+                family = family.label(),
+                error = %format!("{e:#}"),
+                "COMBAT: the restore failed, but the table still holds the COMBAT ruleset of an \
+                 earlier engage — isolated"
+            );
+        }
         // BUG-041: the restore inserts our jump on top; a re-engage would
         // stack a duplicate. Trim to exactly one — windowless (only
         // deletes extras, always leaves >= 1 jump). Runs AFTER the
-        // restore `?`, so it never acts on a zero-jump table from a
-        // failed restore. A failure leaves a duplicate jump, which
-        // isolates like the first and which the teardown removes too
-        // (`remove_jumps`): an ERROR, not a failed engage (the v6 mirror
-        // has always treated it so).
-        if let Err(e) = dedup_jumps(&self.iptables_bin) {
+        // read-back, so it never acts on a zero-jump table. A failure
+        // leaves a duplicate jump, which isolates like the first and which
+        // the teardown removes too (`remove_jumps`): an ERROR, not a failed
+        // engage.
+        if let Err(e) = dedup_jumps(list_bin, self.cmd_timeout) {
             error!(
+                family = family.label(),
                 error = %format!("{e:#}"),
-                "COMBAT: network isolated, but the v4 jump dedup failed — a duplicate jump \
-                 may be left (it isolates too; the release removes every jump)"
+                "COMBAT: isolated, but the jump dedup failed — a duplicate jump may be left (it \
+                 isolates too; the release removes every jump)"
             );
         }
+        let restore_exe = restored
+            .as_ref()
+            .map(|e| e.display().to_string())
+            .unwrap_or_default();
         if carved.is_empty() {
             info!(
-                rules = %self.rules_path.display(),
-                restore_bin = %restore_exe.display(),
-                "COMBAT: network isolated (loopback only)"
+                family = family.label(),
+                restore_bin = %restore_exe,
+                "COMBAT: network isolated (loopback only; IPv6: NDP/MLD preserved)"
             );
         } else {
             // WARN so the carve-out is conspicuous in the audit trail:
             // these CIDRs survive isolation, which is exactly the kind
             // of thing an operator reviewing a COMBAT event must see.
             warn!(
-                rules = %self.rules_path.display(),
-                restore_bin = %restore_exe.display(),
+                family = family.label(),
+                restore_bin = %restore_exe,
                 allow_cidrs = ?carved,
                 count = carved.len(),
                 "COMBAT: network isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
             );
         }
-        // BUG-031 — v6 mirror, best-effort. An attack is already detected;
-        // refusing the whole COMBAT because v6 isn't provisioned would mean
-        // NO isolation (v4 included), letting the attack proceed. Isolate
-        // v4 + WARN loudly on any v6 hole.
-        self.engage_v6();
-        Ok(())
+        FamilyOutcome::Done
     }
 
-    /// BUG-031 — apply the v6 isolation ruleset via `ip6tables-restore`.
-    /// Best-effort + loud: a missing `combat-rules.v6` or absent
-    /// `ip6tables` leaves IPv6 un-isolated with a WARN, never failing the
-    /// (v4) engage.
-    fn engage_v6(&self) {
-        match self.build_engaged_ruleset_v6() {
-            Ok(None) => warn!(
-                rules_v6 = %self.rules_path_v6.display(),
-                "COMBAT: combat-rules.v6 absent — IPv6 NOT isolated this COMBAT (v4 applied; provision the v6 ruleset to close the gap)"
-            ),
-            Ok(Some((ruleset, carved))) => {
-                match run_iptables_restore_data(&self.restore_bin_v6, ruleset.as_bytes()) {
-                    Ok(exe) => {
-                        // Lab follow-up (lab PR 188): read back, as for v4.
-                        if let Err(gaps) = verify_isolation(&self.ip6tables_bin, &ruleset) {
-                            warn!(
-                                restore_bin = %exe.display(),
-                                gaps = %gaps,
-                                "COMBAT: ip6tables-restore exited 0 but the table does not hold \
-                                 the COMBAT ruleset — IPv6 NOT isolated this COMBAT (v4 applied; \
-                                 an ip6tables-restore link pointed at another binary?)"
-                            );
-                            return;
-                        }
-                        // BUG-041: dedup our v6 jumps (best-effort — a dup
-                        // is harmless, both isolate; v4 already succeeded).
-                        if let Err(e) = dedup_jumps(&self.ip6tables_bin) {
-                            warn!(error = %e, "COMBAT: v6 jump dedup failed (best-effort; isolation intact)");
-                        }
-                        if carved.is_empty() {
-                            info!(
-                                rules_v6 = %self.rules_path_v6.display(),
-                                "COMBAT: IPv6 isolated (NDP/MLD preserved, loopback only)"
-                            );
-                        } else {
-                            warn!(
-                                rules_v6 = %self.rules_path_v6.display(),
-                                allow_cidrs = ?carved,
-                                count = carved.len(),
-                                "COMBAT: IPv6 isolated WITH management carve-out — the listed CIDR(s) are NOT dropped"
-                            );
-                        }
-                    }
-                    Err(e) => warn!(
-                        error = %e,
-                        "COMBAT: ip6tables-restore FAILED — IPv6 NOT isolated this COMBAT (v4 applied; ip6tables absent or errored)"
-                    ),
-                }
-            }
-            Err(e) => warn!(
-                error = %e,
-                "COMBAT: building the v6 ruleset failed — IPv6 NOT isolated this COMBAT"
-            ),
+    /// The restore and the list/edit binary of `family`.
+    fn bins(&self, family: Family) -> (&Bin, &Bin) {
+        match family {
+            Family::V4 => (&self.restore_bin, &self.iptables_bin),
+            Family::V6 => (&self.restore_bin_v6, &self.ip6tables_bin),
         }
+    }
+
+    fn flag(&self, family: Family) -> &AtomicBool {
+        match family {
+            Family::V4 => &self.isolated_v4,
+            Family::V6 => &self.isolated_v6,
+        }
+    }
+
+    fn set_isolated(&self, family: Family, isolated: bool) {
+        self.flag(family).store(isolated, Ordering::SeqCst);
+    }
+
+    /// Lab PR 217: whether `family` is isolated, as its table was last read
+    /// back.
+    pub fn is_isolated(&self, family: Family) -> bool {
+        self.flag(family).load(Ordering::SeqCst)
+    }
+
+    /// Lab PR 217: run each iptables / ip6tables invocation with `timeout`
+    /// instead of [`EXTERNAL_CMD_TIMEOUT`] (tests).
+    #[cfg(test)]
+    fn with_cmd_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.cmd_timeout = timeout;
+        self
     }
 
     /// Build the ruleset to feed `iptables-restore`: the base
@@ -578,14 +719,20 @@ impl NetworkIsolator {
     /// otherwise keep the host isolated with no live posture state
     /// backing it (the B3 split-brain). Reuses the idempotent teardown
     /// path; a no-op (and cheap) when no chain is present.
+    ///
+    /// Lab PR 217: a teardown that does not leave the tables clear, read
+    /// back, is an `Err`, and the family whose table still holds the chain
+    /// is reported isolated (`nn-admin status`) — the boot state used to
+    /// say "not isolated" whatever the table held. A signed `unlock` retries
+    /// it.
     pub fn reconcile_stale_chain(&self) -> Result<ReconcileOutcome> {
-        let v4 = probe_chain(&self.iptables_bin)
+        let v4 = probe_chain(&self.iptables_bin, self.cmd_timeout)
             .with_context(|| format!("probing for stale {COMBAT_CHAIN} v4 chain"))?;
         // BUG-031: a mid-COMBAT crash can leave a stale v6 chain too —
         // probe it INDEPENDENTLY so a v6-only orphan is still detected
         // (the v6 edition of the B3 split-brain). Best-effort: ip6tables
         // absent ⇒ treat as no v6 chain.
-        let v6 = probe_chain(&self.ip6tables_bin).unwrap_or(None);
+        let v6 = probe_chain(&self.ip6tables_bin, self.cmd_timeout).unwrap_or(None);
         if v4.is_none() && v6.is_none() {
             // Neither chain present (the normal clean-boot case).
             return Ok(ReconcileOutcome {
@@ -594,60 +741,191 @@ impl NetworkIsolator {
             });
         }
         let rules_removed = v4.unwrap_or(0) + v6.unwrap_or(0);
-        // tear_down_chain clears BOTH tables (best-effort on v6).
-        self.tear_down_chain()
-            .context("tearing down stale COMBAT chain(s)")?;
-        self.is_isolated.store(false, Ordering::SeqCst);
+        let report = self.tear_down_and_verify();
+        if !report.complete() {
+            return Err(anyhow!(
+                "tearing down stale COMBAT chain(s): {}",
+                report.summary("cleared")
+            ));
+        }
         Ok(ReconcileOutcome {
             chain_existed: true,
             rules_removed,
         })
     }
 
-    /// Idempotent chain teardown shared by [`Self::release`] and
-    /// [`Self::reconcile_stale_chain`]. Clears `COMBAT_CHAIN` on BOTH the
-    /// v4 and v6 tables (BUG-031). v4 is the critical path (errors
-    /// propagate); the v6 leg is best-effort + WARN, so a v4-only host
-    /// (no `ip6tables`) still releases cleanly. Because release() and
-    /// reconcile() both delegate here, the v6 teardown covers both.
-    fn tear_down_chain(&self) -> Result<()> {
-        tear_down_one(&self.iptables_bin)?;
-        if let Err(e) = tear_down_one(&self.ip6tables_bin) {
-            warn!(
-                error = %e,
-                "COMBAT release: v6 chain teardown failed (best-effort; v4 cleared)"
-            );
+    /// Idempotent teardown shared by [`Self::release`] and
+    /// [`Self::reconcile_stale_chain`], on BOTH tables (BUG-031), each read
+    /// back afterwards (lab PR 217). A host without `ip6tables` (or without
+    /// an IPv6 filter table) releases cleanly: its v6 leg is unavailable,
+    /// not failed — unless this agent had isolated it.
+    fn tear_down_and_verify(&self) -> IsolationReport {
+        IsolationReport {
+            v4: self.release_family(Family::V4),
+            v6: self.release_family(Family::V6),
         }
-        Ok(())
+    }
+
+    /// One family's teardown, then its table read back: [`FamilyOutcome::Done`]
+    /// only when neither the chain nor a jump into it is listed. The state
+    /// follows the read-back: still listed is still isolated.
+    fn release_family(&self, family: Family) -> FamilyOutcome {
+        let (_, bin) = self.bins(family);
+        let was = self.is_isolated(family);
+        if let Err(e) = bin.command() {
+            let why = format!("{e:#}");
+            return if was {
+                FamilyOutcome::Failed(format!(
+                    "{why} — the isolation applied earlier cannot be removed"
+                ))
+            } else {
+                FamilyOutcome::Unavailable(why)
+            };
+        }
+        let torn = tear_down_one(bin, self.cmd_timeout);
+        match read_back_cleared(bin, self.cmd_timeout) {
+            Cleared::Clear => {
+                self.set_isolated(family, false);
+                if let Err(e) = torn {
+                    // The read-back is the truth: e.g. a `-X` that raced a
+                    // concurrent delete.
+                    info!(
+                        family = family.label(),
+                        error = %format!("{e:#}"),
+                        "COMBAT release: a teardown step failed, but the table is clear"
+                    );
+                }
+                FamilyOutcome::Done
+            }
+            Cleared::Present { left, isolating } => {
+                // The state says whether the family still drops: a chain
+                // left without any jump into it (a `-X` refused after the
+                // jumps went) is not a release, and not an isolation either.
+                self.set_isolated(family, isolating);
+                let step = torn.err().map(|e| format!("{e:#}; ")).unwrap_or_default();
+                let effect = if isolating {
+                    "the family is still isolated"
+                } else {
+                    "the family no longer drops (the chain is not jumped to, or no longer \
+                     reaches its DROP)"
+                };
+                FamilyOutcome::Failed(format!("{step}read back: {left} — {effect}"))
+            }
+            // The IPv4 table always exists where COMBAT runs: one that
+            // cannot be listed is a failure — nothing shows it is clear. An
+            // IPv6 one the kernel does not have is unavailable, unless this
+            // agent had isolated it.
+            Cleared::Unreadable(why) if was || family == Family::V4 => {
+                let step = torn.err().map(|e| format!("{e:#}; ")).unwrap_or_default();
+                FamilyOutcome::Failed(format!(
+                    "{step}the table cannot be read back ({why}) — nothing shows the COMBAT \
+                     chain is gone"
+                ))
+            }
+            Cleared::Unreadable(why) => FamilyOutcome::Unavailable(why),
+        }
     }
 
     /// Tear down the combat ruleset. Requires a verified
     /// [`UnlockToken`] — the type system enforces that this method
     /// can only be reached via the Ed25519 admin path.
     ///
-    /// `pub(crate)` because the agent crate's own admin pipeline is
-    /// the only legitimate caller. The spec snippet `iptables -F &&
-    /// iptables -X` is incomplete: `-X` refuses to remove a chain
-    /// still referenced from `INPUT`/`OUTPUT`/`FORWARD`, so we delete
-    /// the jump rules in those base chains first. Each command
-    /// tolerates "rule does not exist" / "no chain by that name"
-    /// stderr so calling `release()` on an already-released
-    /// isolator is a no-op rather than an error.
-    /// Promoted from `pub(crate)` in commit #2 to `pub` here so the
-    /// binary crate (`main.rs`) can construct the
+    /// The spec snippet `iptables -F && iptables -X` is incomplete: `-X`
+    /// refuses to remove a chain still referenced from
+    /// `INPUT`/`OUTPUT`/`FORWARD`, so we delete the jump rules in those
+    /// base chains first. Each command tolerates "rule does not exist" /
+    /// "no chain by that name" stderr so calling `release()` on an
+    /// already-released isolator is a no-op rather than an error.
+    ///
+    /// Lab PR 217 (NN-AUD-243 residue, capability C17): the outcome is
+    /// what the tables hold afterwards, read back per family — the caller
+    /// answers the operator from it ([`IsolationReport::complete`]). An exit
+    /// status of `iptables -X` used to be the whole proof, and the release
+    /// hook dropped even that.
+    ///
+    /// `pub` so the binary crate (`main.rs`) can construct the
     /// `combat_release_hook` closure. The capability invariant is
     /// unchanged: `release` requires an [`UnlockToken`] by value and
     /// `mint_unlock_token` is still `pub(in crate::anti_tamper)`,
     /// so no external caller can fabricate a token to slip past this.
-    pub fn release(&self, _: UnlockToken) -> Result<()> {
-        self.tear_down_chain()?;
-        self.is_isolated.store(false, Ordering::SeqCst);
-        info!(target: "anti_tamper.network_isolation.released", "COMBAT: network isolation released");
-        Ok(())
+    pub fn release(&self, _: UnlockToken) -> IsolationReport {
+        let report = self.tear_down_and_verify();
+        if report.complete() {
+            info!(
+                target: "anti_tamper.network_isolation.released",
+                outcome = %report.summary("cleared"),
+                "COMBAT: network isolation released (tables read back clear)"
+            );
+        } else {
+            error!(
+                target: "anti_tamper.network_isolation.released",
+                outcome = %report.summary("cleared"),
+                "COMBAT: network isolation NOT released — a table still holds the COMBAT chain, \
+                 or cannot be read back"
+            );
+        }
+        report
     }
 
+    /// Either family isolated (lab PR 217: [`Self::is_isolated`] per family).
     pub fn is_engaged(&self) -> bool {
-        self.is_isolated.load(Ordering::SeqCst)
+        self.is_isolated(Family::V4) || self.is_isolated(Family::V6)
+    }
+}
+
+/// What a family's table holds of COMBAT after a teardown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Cleared {
+    /// Neither the chain nor a jump into it is listed.
+    Clear,
+    /// What is still listed (`left`), and whether it still isolates: the
+    /// chain reaches its catch-all DROP and INPUT and OUTPUT jump into it.
+    Present { left: String, isolating: bool },
+    /// The table could not be listed (no such table, the binary failed).
+    Unreadable(String),
+}
+
+/// Lab PR 217: read `bin`'s table back after a teardown.
+fn read_back_cleared(bin: &Bin, timeout: std::time::Duration) -> Cleared {
+    let chain = match list_rules(bin, COMBAT_CHAIN, timeout) {
+        Ok(c) => c,
+        Err(e) => return Cleared::Unreadable(format!("{e:#}")),
+    };
+    let mut left = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut jumps: Vec<(&str, Option<usize>)> = Vec::new();
+    if chain.is_some() {
+        left.push(format!("the {COMBAT_CHAIN} chain is still listed"));
+    }
+    for base in ["INPUT", "OUTPUT", "FORWARD"] {
+        match list_rules(bin, base, timeout) {
+            Ok(Some(listing)) => {
+                let n = count_jumps(&listing);
+                if n > 0 {
+                    left.push(format!("{n} jump(s) into {COMBAT_CHAIN} still in {base}"));
+                }
+                jumps.push((base, Some(n)));
+            }
+            Ok(None) => {
+                unreadable.push(format!("{base} could not be listed"));
+                jumps.push((base, None));
+            }
+            Err(e) => return Cleared::Unreadable(format!("{e:#}")),
+        }
+    }
+    if !left.is_empty() {
+        // INPUT and OUTPUT are what every COMBAT ruleset jumps from
+        // (`validate_ruleset`).
+        let required: Vec<(&str, Option<usize>)> =
+            jumps.into_iter().filter(|(b, _)| *b != "FORWARD").collect();
+        Cleared::Present {
+            left: left.join("; "),
+            isolating: isolation_gaps(chain.as_deref(), &required).is_ok(),
+        }
+    } else if !unreadable.is_empty() {
+        Cleared::Unreadable(unreadable.join("; "))
+    } else {
+        Cleared::Clear
     }
 }
 
@@ -655,14 +933,13 @@ impl NetworkIsolator {
 /// when stderr indicates the rule or chain was already absent. This
 /// makes [`NetworkIsolator::release`] idempotent without needing a
 /// separate "is this chain present?" probe per command.
-fn run_iptables_idempotent(bin: &Bin, args: &[&str]) -> Result<()> {
+fn run_iptables_idempotent(bin: &Bin, args: &[&str], timeout: std::time::Duration) -> Result<()> {
     let (mut cmd, _) = bin.command()?;
-    let output = cmd
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("spawning {bin} {}", args.join(" ")))?;
+    cmd.args(args);
+    let what = format!("{bin} {}", args.join(" "));
+    // Lab PR 217: waited for at most `timeout`.
+    let output =
+        run_bounded(cmd, None, timeout, &what).with_context(|| format!("running {what}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -710,14 +987,14 @@ pub struct ReconcileOutcome {
 /// still-referenced chain), then flush + delete. Each step tolerates
 /// "already gone". Parameterized by `bin` so the v4 (`iptables`) and v6
 /// (`ip6tables`) tables share one implementation.
-fn tear_down_one(bin: &Bin) -> Result<()> {
+fn tear_down_one(bin: &Bin, timeout: std::time::Duration) -> Result<()> {
     for base in ["INPUT", "OUTPUT", "FORWARD"] {
-        remove_jumps(bin, base)
+        remove_jumps(bin, base, timeout)
             .with_context(|| format!("removing {COMBAT_CHAIN} jump from {base}"))?;
     }
-    run_iptables_idempotent(bin, &["-F", COMBAT_CHAIN])
+    run_iptables_idempotent(bin, &["-F", COMBAT_CHAIN], timeout)
         .with_context(|| format!("flushing chain {COMBAT_CHAIN}"))?;
-    run_iptables_idempotent(bin, &["-X", COMBAT_CHAIN])
+    run_iptables_idempotent(bin, &["-X", COMBAT_CHAIN], timeout)
         .with_context(|| format!("deleting chain {COMBAT_CHAIN}"))?;
     Ok(())
 }
@@ -726,20 +1003,19 @@ fn tear_down_one(bin: &Bin) -> Result<()> {
 /// `Ok(Some(n))` = present with `n` `-A` rules, `Ok(None)` = absent
 /// (non-zero exit), `Err` = the binary could not be run (BUG-031: the
 /// v6 caller treats that as "no v6 chain").
-fn probe_chain(bin: &Bin) -> Result<Option<usize>> {
-    Ok(list_rules(bin, COMBAT_CHAIN)?.map(|listed| count_chain_rules(&listed)))
+fn probe_chain(bin: &Bin, timeout: std::time::Duration) -> Result<Option<usize>> {
+    Ok(list_rules(bin, COMBAT_CHAIN, timeout)?.map(|listed| count_chain_rules(&listed)))
 }
 
 /// `bin -S chain`: the rules listed, `None` when the listing exits non-zero
-/// (no such chain); `Err` when the binary could not be run.
-fn list_rules(bin: &Bin, chain: &str) -> Result<Option<String>> {
+/// (no such chain); `Err` when the binary could not be run, or did not
+/// answer within `timeout` (lab PR 217).
+fn list_rules(bin: &Bin, chain: &str, timeout: std::time::Duration) -> Result<Option<String>> {
     let (mut cmd, _) = bin.command()?;
-    let listed = cmd
-        .args(["-S", chain])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("running {bin} -S {chain}"))?;
+    cmd.args(["-S", chain]);
+    let what = format!("{bin} -S {chain}");
+    let listed =
+        run_bounded(cmd, None, timeout, &what).with_context(|| format!("running {what}"))?;
     if !listed.status.success() {
         return Ok(None);
     }
@@ -809,8 +1085,12 @@ fn isolation_gaps(
 /// Lab follow-up (lab PR 188): read the table back after a restore of
 /// `ruleset` ([`isolation_gaps`]). `Err` names the gaps, or why the table
 /// could not be read (not isolated either: nothing shows that it is).
-fn verify_isolation(bin: &Bin, ruleset: &str) -> std::result::Result<(), String> {
-    let read = |chain: &str| list_rules(bin, chain).map_err(|e| format!("{e:#}"));
+fn verify_isolation(
+    bin: &Bin,
+    ruleset: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    let read = |chain: &str| list_rules(bin, chain, timeout).map_err(|e| format!("{e:#}"));
     let chain = read(COMBAT_CHAIN)?;
     let mut jumps = Vec::new();
     for base in jump_bases(ruleset) {
@@ -824,9 +1104,9 @@ fn verify_isolation(bin: &Bin, ruleset: &str) -> std::result::Result<(), String>
 /// otherwise stack a duplicate). Windowless: only ever DELETEs extras,
 /// leaving >= 1 jump in place at all times — never a no-jump moment.
 /// Must run AFTER a successful restore (so the count is >= 1).
-fn dedup_jumps(bin: &Bin) -> Result<()> {
+fn dedup_jumps(bin: &Bin, timeout: std::time::Duration) -> Result<()> {
     for base in ["INPUT", "OUTPUT", "FORWARD"] {
-        let Some(n) = list_jumps(bin, base)
+        let Some(n) = list_jumps(bin, base, timeout)
             .with_context(|| format!("listing {base} to dedup {COMBAT_CHAIN} jumps"))?
         else {
             continue; // base chain unreadable — skip (best-effort)
@@ -834,7 +1114,7 @@ fn dedup_jumps(bin: &Bin) -> Result<()> {
         // Delete (n - 1) extras, keeping exactly one. `1..n` is empty when
         // n <= 1, so this never deletes below one jump.
         for _ in 1..n {
-            run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])
+            run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN], timeout)
                 .with_context(|| format!("removing duplicate {COMBAT_CHAIN} jump from {base}"))?;
         }
     }
@@ -843,8 +1123,8 @@ fn dedup_jumps(bin: &Bin) -> Result<()> {
 
 /// The `-j COMBAT_CHAIN` jumps in `base` (`iptables -S base`); `None` when
 /// the listing exits non-zero (base chain unreadable).
-fn list_jumps(bin: &Bin, base: &str) -> Result<Option<usize>> {
-    Ok(list_rules(bin, base)?.map(|listed| count_jumps(&listed)))
+fn list_jumps(bin: &Bin, base: &str, timeout: std::time::Duration) -> Result<Option<usize>> {
+    Ok(list_rules(bin, base, timeout)?.map(|listed| count_jumps(&listed)))
 }
 
 /// External audit ATP-006 (NN-AUD-259): remove EVERY jump into
@@ -853,10 +1133,14 @@ fn list_jumps(bin: &Bin, base: &str) -> Result<Option<usize>> {
 /// leaves a second jump, and `-X` refuses a chain still referenced: a
 /// single `-D` let the release flush the chain (the host back on the
 /// network) and then fail, with the isolation still reported.
-fn remove_jumps(bin: &Bin, base: &str) -> Result<()> {
-    let n = list_jumps(bin, base).ok().flatten().unwrap_or(1).max(1);
+fn remove_jumps(bin: &Bin, base: &str, timeout: std::time::Duration) -> Result<()> {
+    let n = list_jumps(bin, base, timeout)
+        .ok()
+        .flatten()
+        .unwrap_or(1)
+        .max(1);
     for _ in 0..n {
-        run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN])?;
+        run_iptables_idempotent(bin, &["-D", base, "-j", COMBAT_CHAIN], timeout)?;
     }
     Ok(())
 }
@@ -926,38 +1210,21 @@ fn finish(lines: Vec<String>) -> String {
 
 /// Spawn `bin`, pipe `rules_data` to its stdin, and treat a non-zero
 /// exit as a hard failure. Returns the file that ran (the log names it).
-fn run_iptables_restore_data(bin: &Bin, rules_data: &[u8]) -> Result<PathBuf> {
-    use std::io::Write;
-
+/// Lab PR 217: waited for at most `timeout`.
+fn run_iptables_restore_data(
+    bin: &Bin,
+    rules_data: &[u8],
+    timeout: std::time::Duration,
+) -> Result<PathBuf> {
     let (mut cmd, exe) = bin.command()?;
-    let mut child = cmd
-        // BUG-041: ADDITIVE — never flush the operator's table. The dump
-        // rebuilds only our own declared chain (`:NORTHNARROW_COMBAT`)
-        // and inserts our jumps (`-I … 1`); every operator chain/rule is
-        // left untouched.
-        .arg("--noflush")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning {bin} ({})", exe.display()))?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("failed to capture {bin} stdin"))?;
-        // `iptables-restore` reads everything from stdin then exits.
-        // A non-reading mock (e.g. `true`) would EPIPE here; we use
-        // `cat` in tests precisely because it drains stdin reliably.
-        stdin
-            .write_all(rules_data)
-            .with_context(|| format!("writing ruleset to {bin} stdin"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("waiting for {bin}"))?;
+    // BUG-041: ADDITIVE — never flush the operator's table. The dump
+    // rebuilds only our own declared chain (`:NORTHNARROW_COMBAT`)
+    // and inserts our jumps (`-I … 1`); every operator chain/rule is
+    // left untouched.
+    cmd.arg("--noflush");
+    let what = format!("{bin} ({})", exe.display());
+    let output = run_bounded(cmd, Some(rules_data), timeout, &what)
+        .with_context(|| format!("running {what}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
@@ -973,6 +1240,7 @@ fn run_iptables_restore_data(bin: &Bin, rules_data: &[u8]) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
     // BUG-031: the idempotent-teardown classifier must recognize the
     // "already gone" messages across backends — including nf_tables'
@@ -1106,6 +1374,250 @@ mod tests {
         Some(NetworkIsolator::new_with_bin(combat_rules_path(), restore, iptables).unwrap())
     }
 
+    /// Lab PR 217: the reason a family failed, or a panic naming the report.
+    fn failure(outcome: &FamilyOutcome) -> String {
+        match outcome {
+            FamilyOutcome::Failed(why) => why.clone(),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// Lab PR 217: a fake filter table — an `iptables-restore` and an
+    /// `iptables` that keep the COMBAT chain and the jumps into it in a
+    /// directory, with the failures a test asks for (`fail("restore")`,
+    /// `fail("X")`, `fail("D")`, `fail("all")`, `fail("hang")`).
+    struct FakeTable {
+        dir: tempfile::TempDir,
+        restore: PathBuf,
+        iptables: PathBuf,
+    }
+
+    impl FakeTable {
+        fn new() -> Option<Self> {
+            let dir = tempfile::tempdir().ok()?;
+            let st = dir.path().display().to_string();
+            let restore = mock_script(&format!(
+                "#!/bin/sh\n\
+                 st={st}\n\
+                 cat >/dev/null\n\
+                 [ -f \"$st/fail_hang\" ] && sleep 30\n\
+                 [ -f \"$st/fail_restore\" ] && {{ echo 'iptables-restore: line 4 failed' >&2; exit 1; }}\n\
+                 printf -- '-A NORTHNARROW_COMBAT -i lo -j ACCEPT\\n-A NORTHNARROW_COMBAT -j DROP\\n' > \"$st/chain\"\n\
+                 for b in INPUT OUTPUT FORWARD; do n=$(cat \"$st/$b\" 2>/dev/null || echo 0); echo $((n+1)) > \"$st/$b\"; done\n\
+                 exit 0\n"
+            ))?;
+            let iptables = mock_script(&format!(
+                "#!/bin/sh\n\
+                 st={st}\n\
+                 busy='iptables v1.8.10 (nf_tables): CHAIN_DEL failed (Device or resource busy): chain NORTHNARROW_COMBAT'\n\
+                 [ -f \"$st/fail_hang\" ] && sleep 30\n\
+                 [ -f \"$st/fail_all\" ] && {{ echo \"iptables: can't initialize iptables table 'filter'\" >&2; exit 4; }}\n\
+                 jumps() {{ cat \"$st/$1\" 2>/dev/null || echo 0; }}\n\
+                 case \"$1\" in\n\
+                 -S) if [ \"$2\" = NORTHNARROW_COMBAT ]; then\n\
+                       [ -f \"$st/chain\" ] || {{ echo 'iptables: No chain/target/match by that name.' >&2; exit 1; }}\n\
+                       echo '-N NORTHNARROW_COMBAT'; cat \"$st/chain\"; exit 0\n\
+                     fi\n\
+                     echo \"-P $2 ACCEPT\"; i=0; n=$(jumps \"$2\")\n\
+                     while [ $i -lt $n ]; do echo \"-A $2 -j NORTHNARROW_COMBAT\"; i=$((i+1)); done; exit 0 ;;\n\
+                 -D) [ -f \"$st/fail_D\" ] && {{ echo 'iptables: Resource temporarily unavailable.' >&2; exit 4; }}\n\
+                     n=$(jumps \"$2\"); if [ \"$n\" -gt 0 ]; then echo $((n-1)) > \"$st/$2\"; exit 0; fi\n\
+                     echo 'iptables: Bad rule (does a matching rule exist in that chain?).' >&2; exit 1 ;;\n\
+                 -F) [ -f \"$st/chain\" ] || {{ echo 'iptables: No chain/target/match by that name.' >&2; exit 1; }}\n\
+                     : > \"$st/chain\"; exit 0 ;;\n\
+                 -X) [ -f \"$st/fail_X\" ] && {{ echo \"$busy\" >&2; exit 1; }}\n\
+                     for b in INPUT OUTPUT FORWARD; do [ \"$(jumps $b)\" -eq 0 ] || {{ echo \"$busy\" >&2; exit 1; }}; done\n\
+                     [ -f \"$st/chain\" ] || {{ echo 'iptables: No chain/target/match by that name.' >&2; exit 1; }}\n\
+                     rm -f \"$st/chain\"; exit 0 ;;\n\
+                 esac\n\
+                 exit 0\n"
+            ))?;
+            // `mock_script` ran each once (its ETXTBSY probe): an empty
+            // table again.
+            for f in ["chain", "INPUT", "OUTPUT", "FORWARD"] {
+                let _ = std::fs::remove_file(dir.path().join(f));
+            }
+            Some(Self {
+                dir,
+                restore,
+                iptables,
+            })
+        }
+
+        fn fail(&self, what: &str) {
+            std::fs::write(self.dir.path().join(format!("fail_{what}")), "").unwrap();
+        }
+
+        fn heal(&self, what: &str) {
+            let _ = std::fs::remove_file(self.dir.path().join(format!("fail_{what}")));
+        }
+
+        /// A COMBAT chain left in the table, `jumps` jumps per base chain.
+        fn seed(&self, jumps: usize) {
+            std::fs::write(
+                self.dir.path().join("chain"),
+                "-A NORTHNARROW_COMBAT -j DROP\n",
+            )
+            .unwrap();
+            for b in ["INPUT", "OUTPUT", "FORWARD"] {
+                std::fs::write(self.dir.path().join(b), format!("{jumps}\n")).unwrap();
+            }
+        }
+
+        fn has_chain(&self) -> bool {
+            self.dir.path().join("chain").exists()
+        }
+
+        fn jumps(&self, base: &str) -> usize {
+            std::fs::read_to_string(self.dir.path().join(base))
+                .map(|s| s.trim().parse().unwrap())
+                .unwrap_or(0)
+        }
+    }
+
+    /// Lab PR 217: an isolator over two fake tables, v4 and v6.
+    fn fake_isolator() -> Option<(NetworkIsolator, FakeTable, FakeTable)> {
+        let (v4, v6) = (FakeTable::new()?, FakeTable::new()?);
+        let iso = NetworkIsolator::new_with_bin(
+            combat_rules_path(),
+            v4.restore.clone(),
+            v4.iptables.clone(),
+        )
+        .unwrap();
+        let iso = NetworkIsolator {
+            restore_bin_v6: Bin::Fixed(v6.restore.clone()),
+            ip6tables_bin: Bin::Fixed(v6.iptables.clone()),
+            ..iso
+        };
+        Some((iso, v4, v6))
+    }
+
+    /// Lab PR 217 (capability C18): the state is per IP family — an
+    /// `ip6tables-restore` that fails leaves IPv4 isolated and IPv6 reported
+    /// NOT isolated, and the report says so. One flag for both said the host
+    /// isolated with IPv6 open, and the v6 failure was only a WARN.
+    #[test]
+    fn a_failing_ip6tables_is_reported_per_family() {
+        let Some((iso, v4, v6)) = fake_isolator() else {
+            return;
+        };
+        v6.fail("restore");
+        let report = iso.engage();
+        assert!(report.engaged(), "{report:?}");
+        assert!(!report.complete(), "a family failed: {report:?}");
+        assert_eq!(report.v4, FamilyOutcome::Done);
+        assert!(failure(&report.v6).contains("line 4 failed"), "{report:?}");
+        assert!(iso.is_isolated(Family::V4));
+        assert!(!iso.is_isolated(Family::V6), "IPv6 is NOT isolated");
+        assert!(iso.is_engaged(), "either family");
+        assert!(report.summary("isolated").contains("IPv6: FAILED"));
+        assert!(v4.has_chain() && !v6.has_chain());
+        // the retry, once ip6tables works: both isolated, one jump each
+        v6.heal("restore");
+        let report = iso.engage();
+        assert!(report.complete(), "{report:?}");
+        assert!(iso.is_isolated(Family::V6));
+        assert_eq!(
+            v4.jumps("INPUT"),
+            1,
+            "the re-engage's duplicate jump is trimmed"
+        );
+    }
+
+    /// Lab PR 217 (NN-AUD-243 residue): a teardown that leaves the chain in
+    /// the table is not a release: the read-back says what is left, and only
+    /// a later release that clears it reports it clear. The state says
+    /// whether the family still drops — the jumps refused (`-D`) leave it
+    /// isolated; the chain refused (`-X`) after the jumps went leaves it
+    /// listed but no longer dropping. The release used to be judged by exit
+    /// codes, and the hook dropped even that.
+    #[test]
+    fn a_teardown_that_leaves_the_chain_is_not_a_release() {
+        let Some((iso, v4, v6)) = fake_isolator() else {
+            return;
+        };
+        assert!(iso.engage().complete());
+        v4.fail("D");
+        let report = iso.release(mint_unlock_token());
+        assert!(!report.complete(), "{report:?}");
+        let why = failure(&report.v4);
+        assert!(why.contains("Resource temporarily unavailable"), "{why}");
+        assert!(why.contains("still isolated"), "{why}");
+        assert_eq!(report.v6, FamilyOutcome::Done);
+        assert!(iso.is_isolated(Family::V4), "the jumps are in: isolated");
+        assert!(!iso.is_isolated(Family::V6));
+        assert!(v4.has_chain() && !v6.has_chain());
+        v4.heal("D");
+        v4.fail("X");
+        let report = iso.release(mint_unlock_token());
+        let why = failure(&report.v4);
+        assert!(why.contains("Device or resource busy"), "{why}");
+        assert!(why.contains("chain is still listed"), "{why}");
+        assert!(why.contains("no longer drops"), "{why}");
+        assert!(
+            !iso.is_isolated(Family::V4),
+            "listed without a jump: not an isolation"
+        );
+        assert!(v4.has_chain());
+        v4.heal("X");
+        let report = iso.release(mint_unlock_token());
+        assert!(report.complete(), "{report:?}");
+        assert!(!iso.is_engaged());
+        assert!(!v4.has_chain());
+        // and a v6 teardown failure is a failure too (it was a WARN)
+        assert!(iso.engage().complete());
+        v6.fail("D");
+        let report = iso.release(mint_unlock_token());
+        assert!(failure(&report.v6).contains("still isolated"), "{report:?}");
+        assert!(!iso.is_isolated(Family::V4) && iso.is_isolated(Family::V6));
+    }
+
+    /// Lab PR 217 (capability C18): every iptables / ip6tables invocation is
+    /// bounded — a binary that hangs fails the step at the deadline, it does
+    /// not hold the ladder's worker.
+    #[test]
+    fn a_hung_iptables_times_out() {
+        let Some((iso, v4, v6)) = fake_isolator() else {
+            return;
+        };
+        let iso = iso.with_cmd_timeout(std::time::Duration::from_millis(300));
+        v4.fail("hang");
+        v6.fail("hang");
+        let start = std::time::Instant::now();
+        let report = iso.engage();
+        assert!(!report.engaged());
+        assert!(
+            failure(&report.v4).contains("did not exit within"),
+            "{report:?}"
+        );
+        let report = iso.release(mint_unlock_token());
+        assert!(!report.complete());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "bounded: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Lab PR 217: a stale chain the boot teardown cannot remove is an
+    /// error, and the family is reported isolated — the boot state said
+    /// "not isolated" whatever the table held.
+    #[test]
+    fn a_stale_chain_left_in_place_is_reported_isolated() {
+        let Some((iso, v4, _v6)) = fake_isolator() else {
+            return;
+        };
+        v4.seed(1);
+        v4.fail("D");
+        let err = format!("{:#}", iso.reconcile_stale_chain().unwrap_err());
+        assert!(err.contains("IPv4: FAILED"), "{err}");
+        assert!(iso.is_isolated(Family::V4));
+        v4.heal("D");
+        let out = iso.reconcile_stale_chain().expect("cleared");
+        assert!(!out.chain_existed || out.rules_removed <= 1);
+        assert!(!iso.is_engaged());
+    }
+
     /// Lab follow-up (lab PR 188): a restore that exits 0 and applies
     /// nothing — the `iptables-restore` link pointed at `/usr/bin/true`
     /// (here a script that drains its stdin and exits 0) — is not an
@@ -1128,7 +1640,7 @@ mod tests {
         };
         let iso =
             NetworkIsolator::new_with_bin(combat_rules_path(), restore.clone(), no_chain).unwrap();
-        let err = format!("{:#}", iso.engage().unwrap_err());
+        let err = failure(&iso.engage().v4);
         assert!(err.contains("NOT isolated"), "{err}");
         for gap in [
             "no NORTHNARROW_COMBAT chain",
@@ -1143,7 +1655,7 @@ mod tests {
         let truebin = PathBuf::from("/bin/true");
         if truebin.exists() {
             let iso = NetworkIsolator::new_with_bin(combat_rules_path(), restore, truebin).unwrap();
-            let err = format!("{:#}", iso.engage().unwrap_err());
+            let err = failure(&iso.engage().v4);
             assert!(err.contains("no catch-all DROP"), "{err}");
             assert!(!iso.is_engaged());
         }
@@ -1157,7 +1669,7 @@ mod tests {
         let Some(iso) = mock_success_isolator() else {
             return;
         };
-        iso.engage().expect("engaged");
+        assert!(iso.engage().complete());
         assert!(iso.is_engaged());
         let truebin = PathBuf::from("/bin/true");
         if !truebin.exists() {
@@ -1167,13 +1679,16 @@ mod tests {
             iptables_bin: Bin::Fixed(truebin),
             ..iso
         };
-        assert!(iso.engage().is_err());
-        assert!(!iso.is_engaged(), "the host is no longer isolated");
+        assert!(!iso.engage().engaged());
+        assert!(
+            !iso.is_isolated(Family::V4),
+            "the host is no longer isolated"
+        );
     }
 
     /// Lab follow-up (lab PR 188): the v6 leg is read back too, and stays
     /// best-effort — a v6 table without the ruleset leaves the v4 isolation
-    /// engaged.
+    /// engaged. Lab PR 217: and it is reported, per family.
     #[test]
     fn a_v6_table_without_the_ruleset_keeps_the_v4_isolation() {
         let Some(iso) = mock_success_isolator() else {
@@ -1187,8 +1702,11 @@ mod tests {
             ip6tables_bin: Bin::Fixed(truebin),
             ..iso
         };
-        iso.engage().expect("v4 isolated");
-        assert!(iso.is_engaged());
+        let report = iso.engage();
+        assert!(report.engaged(), "v4 isolated: {report:?}");
+        assert!(!report.complete());
+        assert!(failure(&report.v6).contains("no catch-all DROP"));
+        assert!(iso.is_isolated(Family::V4) && !iso.is_isolated(Family::V6));
     }
 
     /// Lab follow-up (lab PR 188): what the read-back accepts and refuses.
@@ -1383,11 +1901,11 @@ mod tests {
             None => return,
         };
         assert!(!iso.is_engaged(), "fresh isolator must not be engaged");
-        iso.engage().expect("first engage");
+        assert!(iso.engage().complete(), "first engage");
         assert!(iso.is_engaged());
-        // Second engage: still Ok, still engaged. Idempotent at the
+        // Second engage: still complete, still engaged. Idempotent at the
         // observable-state level.
-        iso.engage().expect("second engage");
+        assert!(iso.engage().complete(), "second engage");
         assert!(iso.is_engaged());
     }
 
@@ -1403,9 +1921,9 @@ mod tests {
         let iso =
             NetworkIsolator::new_with_bin(combat_rules_path(), bin, PathBuf::from("/bin/true"))
                 .unwrap();
-        let err = iso.engage().unwrap_err();
+        let err = failure(&iso.engage().v4);
         assert!(
-            err.to_string().contains("iptables-restore failed"),
+            err.contains("failed") && err.contains("NOT isolated"),
             "unexpected error: {err}"
         );
         assert!(
@@ -1436,7 +1954,7 @@ mod tests {
             return;
         };
         let iso = NetworkIsolator::new_with_bin(combat_rules_path(), restore, iptables).unwrap();
-        iso.engage().expect("the restore succeeded: engaged");
+        assert!(iso.engage().engaged(), "the restore succeeded: engaged");
         assert!(iso.is_engaged(), "the host is isolated: reported so");
         // a failed restore is still not engaged
         let bin = PathBuf::from("/bin/false");
@@ -1444,7 +1962,7 @@ mod tests {
             let failed =
                 NetworkIsolator::new_with_bin(combat_rules_path(), bin, PathBuf::from("/bin/true"))
                     .unwrap();
-            assert!(failed.engage().is_err());
+            assert!(!failed.engage().engaged());
             assert!(!failed.is_engaged());
         }
     }
@@ -1456,47 +1974,25 @@ mod tests {
     /// network.
     #[test]
     fn release_removes_every_jump() {
-        let dir = tempfile::tempdir().unwrap();
-        let st = dir.path().display().to_string();
-        for base in ["INPUT", "OUTPUT", "FORWARD"] {
-            std::fs::write(dir.path().join(base), "2\n").unwrap();
-        }
-        // a stateful iptables: `-S base` lists the jumps left, `-D` takes
-        // one off or says it is gone, `-X` refuses while one is left
-        let Some(iptables) = mock_script(&format!(
-            "#!/bin/sh\n\
-             st={st}\n\
-             case \"$1\" in\n\
-             -S) [ -f \"$st/$2\" ] || exit 0; i=0; n=$(cat \"$st/$2\");\n\
-                 while [ $i -lt $n ]; do echo \"-A $2 -j NORTHNARROW_COMBAT\"; i=$((i+1)); done; exit 0 ;;\n\
-             -D) n=$(cat \"$st/$2\"); if [ \"$n\" -gt 0 ]; then echo $((n-1)) > \"$st/$2\"; exit 0; fi;\n\
-                 echo 'iptables: Bad rule (does a matching rule exist in that chain?).' >&2; exit 1 ;;\n\
-             -X) for b in INPUT OUTPUT FORWARD; do [ \"$(cat \"$st/$b\")\" -eq 0 ] || \n\
-                 {{ echo 'iptables v1.8.10 (nf_tables): CHAIN_DEL failed (Device or resource busy): chain NORTHNARROW_COMBAT' >&2; exit 1; }}; done; exit 0 ;;\n\
-             esac\n\
-             exit 0\n"
-        )) else {
+        let Some((iso, v4, _v6)) = fake_isolator() else {
             return;
         };
-        let iso = NetworkIsolator::new_with_bin(
-            combat_rules_path(),
-            PathBuf::from("/usr/bin/cat"),
-            iptables,
-        )
-        .unwrap();
-        iso.release(mint_unlock_token())
-            .expect("every jump removed, the chain deleted");
+        // two jumps per base chain, as a failed dedup leaves them
+        v4.seed(2);
+        let report = iso.release(mint_unlock_token());
+        assert!(
+            report.complete(),
+            "every jump removed, the chain deleted: {report:?}"
+        );
         for base in ["INPUT", "OUTPUT", "FORWARD"] {
-            assert_eq!(
-                std::fs::read_to_string(dir.path().join(base))
-                    .unwrap()
-                    .trim(),
-                "0",
-                "{base}"
-            );
+            assert_eq!(v4.jumps(base), 0, "{base}");
         }
+        assert!(!v4.has_chain());
         // idempotent: nothing left, the release still succeeds
-        iso.release(mint_unlock_token()).expect("second release");
+        assert!(
+            iso.release(mint_unlock_token()).complete(),
+            "second release"
+        );
     }
 
     /// External audit ATP-014 (NN-AUD-262): the production isolator runs
@@ -1538,33 +2034,33 @@ mod tests {
         // value. If the signature ever drifts (e.g. someone weakens
         // the cap requirement to `bool` or `&str`), this coercion
         // fails to type-check and the build breaks.
-        let _: fn(&NetworkIsolator, UnlockToken) -> Result<()> = NetworkIsolator::release;
+        let _: fn(&NetworkIsolator, UnlockToken) -> IsolationReport = NetworkIsolator::release;
     }
 
     #[test]
     fn release_clears_engaged_state() {
-        let iso = match mock_success_isolator() {
-            Some(i) => i,
-            None => return,
+        let Some((iso, _v4, _v6)) = fake_isolator() else {
+            return;
         };
-        iso.engage().expect("engage");
+        assert!(iso.engage().complete());
         assert!(iso.is_engaged());
-        iso.release(mint_unlock_token()).expect("release");
-        assert!(!iso.is_engaged(), "release must clear is_isolated");
+        assert!(iso.release(mint_unlock_token()).complete());
+        assert!(!iso.is_engaged(), "release must clear the isolation state");
     }
 
+    /// The release of a table that holds no COMBAT chain is a release (read
+    /// back clear), however often it runs.
     #[test]
     fn release_is_idempotent() {
-        let iso = match mock_success_isolator() {
-            Some(i) => i,
-            None => return,
+        let Some((iso, _v4, _v6)) = fake_isolator() else {
+            return;
         };
-        iso.engage().expect("engage");
-        iso.release(mint_unlock_token()).expect("first release");
-        // Calling release a second time on a no-op state must also
-        // succeed — /bin/true returns 0 unconditionally, so we're
-        // really testing that we don't panic / double-error here.
-        iso.release(mint_unlock_token()).expect("second release");
+        assert!(iso.engage().complete());
+        assert!(iso.release(mint_unlock_token()).complete(), "first release");
+        assert!(
+            iso.release(mint_unlock_token()).complete(),
+            "second release"
+        );
         assert!(!iso.is_engaged());
     }
 
@@ -1581,13 +2077,16 @@ mod tests {
         let iso =
             NetworkIsolator::new_with_bin(combat_rules_path(), PathBuf::from("/usr/bin/cat"), bin)
                 .unwrap();
-        let err = iso.release(mint_unlock_token()).unwrap_err();
+        let report = iso.release(mint_unlock_token());
         // The first `iptables -D INPUT …` call fails; the wrap is
-        // "removing NORTHNARROW_COMBAT jump from INPUT".
+        // "removing NORTHNARROW_COMBAT jump from INPUT". Lab PR 217: and the
+        // table cannot be read back — not a release.
+        let err = failure(&report.v4);
         assert!(
-            err.to_string().contains("NORTHNARROW_COMBAT"),
+            err.contains("NORTHNARROW_COMBAT"),
             "unexpected error: {err}"
         );
+        assert!(err.contains("cannot be read back"), "{err}");
     }
 
     #[test]
