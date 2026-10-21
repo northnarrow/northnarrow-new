@@ -11,7 +11,7 @@
 #
 # Usage: deploy/release/mk-tarball.sh [out-dir]        (default: dist/)
 # Emits: <out>/northnarrow-<version>-<arch>-linux.tar.gz
-#        <out>/northnarrow-<version>-<arch>-linux.{agent,watchdog}.sbom.cdx.json   (if cargo-cyclonedx is installed)
+#        <out>/northnarrow-<version>-<arch>-linux.{agent,watchdog,scan}.sbom.cdx.json   (if cargo-cyclonedx is installed)
 #        <out>/SHA256SUMS
 
 set -euo pipefail
@@ -25,6 +25,7 @@ name="northnarrow-${ver}-${arch}-linux"
 tree="$OUT/$name"
 
 for f in target/release/northnarrow-agent target/release/northnarrow-watchdog target/release/nn-admin \
+         target/release/northnarrow-scan \
          agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf \
          agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf.buildhash; do
     [[ -f "$f" ]] || { echo "mk-tarball: missing $f — run \`cargo xtask build --release\` first" >&2; exit 1; }
@@ -35,7 +36,8 @@ done
 
 rm -rf "$tree" && mkdir -p "$tree"
 install -d "$tree/target/release" "$tree/agent-ebpf/target/bpfel-unknown-none/release" "$tree/deploy" "$tree/docs/operator"
-cp -p target/release/northnarrow-agent target/release/northnarrow-watchdog target/release/nn-admin "$tree/target/release/"
+cp -p target/release/northnarrow-agent target/release/northnarrow-watchdog target/release/nn-admin \
+    target/release/northnarrow-scan "$tree/target/release/"
 cp -p agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf{,.buildhash} "$tree/agent-ebpf/target/bpfel-unknown-none/release/"
 cp -pr deploy/install.sh deploy/uninstall.sh deploy/systemd "$tree/deploy/"
 cp -pr configs "$tree/configs"
@@ -64,10 +66,10 @@ echo "mk-tarball: $OUT/$name.tar.gz ($(du -h "$OUT/$name.tar.gz" | cut -f1))"
 if cargo cyclonedx --version >/dev/null 2>&1; then
     # cargo-cyclonedx emits one <override>.json per workspace member next
     # to its manifest, whatever --manifest-path says. Keep the SBOMs of
-    # the two shipped daemons (the agent crate also owns nn-admin), drop
-    # the rest.
+    # the shipped daemons (the agent crate also owns nn-admin; lab PR 223:
+    # the scanner the agent spawns), drop the rest.
     cargo cyclonedx --format json --all --override-filename "$name.sbom" >/dev/null 2>&1
-    for crate in agent watchdog; do
+    for crate in agent watchdog scan; do
         mv "$crate/$name.sbom.json" "$OUT/$name.$crate.sbom.cdx.json" && echo "mk-tarball: $OUT/$name.$crate.sbom.cdx.json"
     done
     find . -maxdepth 2 -name "$name.sbom.json" -delete

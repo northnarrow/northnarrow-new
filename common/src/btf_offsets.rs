@@ -404,7 +404,7 @@ pub const ENUM_VALUES: &[EnumSpec] = &[
 
 /// Every offset the boot-time revalidator checks against running-kernel
 /// BTF. `PF_KTHREAD` is intentionally absent (a flag bitmask, not a
-/// layout offset). 94 entries — kept in lockstep with the consts above
+/// layout offset). 96 entries — kept in lockstep with the consts above
 /// by `revalidate_table_is_complete` (test).
 pub const REVALIDATE: &[OffsetSpec] = &[
     OffsetSpec {
@@ -1167,6 +1167,26 @@ pub const REVALIDATE: &[OffsetSpec] = &[
         alt_paths: &[],
         optional: true,
     },
+    // Lab PR 223 (EXPERIMENTAL exec quarantine): the inode's change time,
+    // the stamp under which a judged executable skips the stop. Renamed
+    // twice: `i_ctime` (timespec64) up to 6.5, `__i_ctime` 6.6–6.10,
+    // `i_ctime_sec` / `i_ctime_nsec` from 6.11.
+    OffsetSpec {
+        name: "INODE_I_CTIME_SEC_OFFSET",
+        struct_name: "inode",
+        field_path: &["__i_ctime", "tv_sec"],
+        expected: INODE_I_CTIME_SEC_OFFSET,
+        alt_paths: &[&["i_ctime_sec"], &["i_ctime", "tv_sec"]],
+        optional: true,
+    },
+    OffsetSpec {
+        name: "INODE_I_CTIME_NSEC_OFFSET",
+        struct_name: "inode",
+        field_path: &["__i_ctime", "tv_nsec"],
+        expected: INODE_I_CTIME_NSEC_OFFSET,
+        alt_paths: &[&["i_ctime_nsec"], &["i_ctime", "tv_nsec"]],
+        optional: true,
+    },
 ];
 
 /// Structs defined by a kernel module rather than vmlinux, and the module
@@ -1288,16 +1308,18 @@ pub mod slot {
     pub const USER_NAMESPACE_INUM_OFFSET: u32 = 92;
     pub const TASK_STRUCT_REAL_CRED_OFFSET: u32 = 93;
     pub const INODE_I_UID_OFFSET: u32 = 94;
-    // enum slots 95–96 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
-    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 97;
-    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 98;
-    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 99;
-    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 100;
-    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 101;
-    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 102;
-    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 103;
-    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 104;
-    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 105;
+    pub const INODE_I_CTIME_SEC_OFFSET: u32 = 95;
+    pub const INODE_I_CTIME_NSEC_OFFSET: u32 = 96;
+    // enum slots 97–98 (`ITER_UBUF_VALUE_SLOT`, `ITER_IOVEC_VALUE_SLOT`)
+    pub const TP_SCHED_EXEC_FILENAME_OFFSET: u32 = 99;
+    pub const TP_SYS_ENTER_EXECVE_FILENAME_OFFSET: u32 = 100;
+    pub const TP_SYS_ENTER_OPENAT_FILENAME_OFFSET: u32 = 101;
+    pub const TP_SYS_ENTER_OPENAT_FLAGS_OFFSET: u32 = 102;
+    pub const TP_IOURING_SUBMIT_OPCODE_OFFSET: u32 = 103;
+    pub const TP_IOURING_SUBMIT_SQ_THREAD_OFFSET: u32 = 104;
+    pub const TP_IOURING_CREATE_FD_OFFSET: u32 = 105;
+    pub const TP_IOURING_CREATE_SQ_ENTRIES_OFFSET: u32 = 106;
+    pub const TP_IOURING_CREATE_FLAGS_OFFSET: u32 = 107;
 }
 
 /// `(const name, slot)` in [`REVALIDATE`] order — the agent writes resolved
@@ -1397,6 +1419,8 @@ pub const SLOT_TABLE: &[(&str, u32)] = &[
     ("USER_NAMESPACE_INUM_OFFSET", 92),
     ("TASK_STRUCT_REAL_CRED_OFFSET", 93),
     ("INODE_I_UID_OFFSET", 94),
+    ("INODE_I_CTIME_SEC_OFFSET", 95),
+    ("INODE_I_CTIME_NSEC_OFFSET", 96),
 ];
 
 /// BPF self-defence (Tappa 10.8): `struct bpf_map`, `struct bpf_prog` and
@@ -1441,6 +1465,15 @@ pub const INODE_I_MODE_OFFSET: usize = 0;
 /// existing file of a few KiB, read at open, before any `O_TRUNC`.
 /// `bits_offset=768` = byte 96 on 6.8 (80 on 6.1, resolved at boot).
 pub const INODE_I_SIZE_OFFSET: usize = 96;
+/// `inode.__i_ctime.tv_sec` / `.tv_nsec` (lab PR 223, EXPERIMENTAL exec
+/// quarantine): the change time a judged executable is cached under.
+/// Optional: without them the guard cannot cache a verdict and stops every
+/// exec of a guarded file. Compiled values: the 6.8 build kernel
+/// (`i_size` 96, `__i_atime` 104, `__i_mtime` 120, `__i_ctime` 136).
+/// Only the low 4 bytes of the nanoseconds are read (`tv_nsec` is a `long`
+/// up to 6.10, `i_ctime_nsec` a `u32` from 6.11).
+pub const INODE_I_CTIME_SEC_OFFSET: usize = 136;
+pub const INODE_I_CTIME_NSEC_OFFSET: usize = 144;
 
 // ── Lab PR 219 — exploit post-condition guard (`agent-ebpf/src/epg.rs`) ──
 //
@@ -1691,24 +1724,24 @@ pub const TRACEPOINT_FIELDS: &[TracepointFieldSpec] = &[
 
 /// Tracepoint-field slots follow the enum slots.
 pub const TRACEPOINT_SLOT_TABLE: &[(&str, u32)] = &[
-    ("TP_SCHED_EXEC_FILENAME_OFFSET", 97),
-    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 98),
-    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 99),
-    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 100),
-    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 101),
-    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 102),
-    ("TP_IOURING_CREATE_FD_OFFSET", 103),
-    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 104),
-    ("TP_IOURING_CREATE_FLAGS_OFFSET", 105),
+    ("TP_SCHED_EXEC_FILENAME_OFFSET", 99),
+    ("TP_SYS_ENTER_EXECVE_FILENAME_OFFSET", 100),
+    ("TP_SYS_ENTER_OPENAT_FILENAME_OFFSET", 101),
+    ("TP_SYS_ENTER_OPENAT_FLAGS_OFFSET", 102),
+    ("TP_IOURING_SUBMIT_OPCODE_OFFSET", 103),
+    ("TP_IOURING_SUBMIT_SQ_THREAD_OFFSET", 104),
+    ("TP_IOURING_CREATE_FD_OFFSET", 105),
+    ("TP_IOURING_CREATE_SQ_ENTRIES_OFFSET", 106),
+    ("TP_IOURING_CREATE_FLAGS_OFFSET", 107),
 ];
 
 /// Enum-value slots follow the offset slots.
-pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 95), ("ITER_IOVEC_VALUE", 96)];
+pub const ENUM_SLOT_TABLE: &[(&str, u32)] = &[("ITER_UBUF_VALUE", 97), ("ITER_IOVEC_VALUE", 98)];
 
 /// Slot of [`ITER_UBUF_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_UBUF_VALUE_SLOT: u32 = 95;
+pub const ITER_UBUF_VALUE_SLOT: u32 = 97;
 /// Slot of [`ITER_IOVEC_VALUE`] in the `BTF_OFFSETS` map.
-pub const ITER_IOVEC_VALUE_SLOT: u32 = 96;
+pub const ITER_IOVEC_VALUE_SLOT: u32 = 98;
 
 // ───────────────────────────────────────
 //  LSM hook prototypes (lab PR 164).
@@ -1778,20 +1811,20 @@ pub const HOOK_ARGS: &[HookArgSpec] = &[
 
 /// Hook-argument slots follow the tracepoint slots.
 pub const HOOK_ARG_SLOT_TABLE: &[(&str, u32)] = &[
-    ("INODE_SETATTR_DENTRY_ARG", 106),
-    ("INODE_SETXATTR_DENTRY_ARG", 107),
-    ("INODE_REMOVEXATTR_DENTRY_ARG", 108),
+    ("INODE_SETATTR_DENTRY_ARG", 108),
+    ("INODE_SETXATTR_DENTRY_ARG", 109),
+    ("INODE_REMOVEXATTR_DENTRY_ARG", 110),
 ];
 
 /// Slot of the position of `inode_setattr`'s dentry: 0 up to 6.8, 1 from
 /// 6.9.
-pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 106;
+pub const INODE_SETATTR_DENTRY_ARG_SLOT: u32 = 108;
 /// Slot of the position of `inode_setxattr`'s dentry: 0 on 5.7 to 5.11,
 /// 1 from 5.12. The attribute name follows it.
-pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 107;
+pub const INODE_SETXATTR_DENTRY_ARG_SLOT: u32 = 109;
 /// Slot of the position of `inode_removexattr`'s dentry (as
 /// `inode_setxattr`).
-pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 108;
+pub const INODE_REMOVEXATTR_DENTRY_ARG_SLOT: u32 = 110;
 
 /// Upper bound on a resolved position: every hook the agent attaches has
 /// at most six arguments. The eBPF reader bounds the slot value by it.
@@ -1883,7 +1916,7 @@ mod tests {
     /// (at-authz-1 added FILE_F_MODE_OFFSET).
     #[test]
     fn revalidate_table_is_complete() {
-        assert_eq!(REVALIDATE.len(), 94, "REVALIDATE must cover all 94 offsets");
+        assert_eq!(REVALIDATE.len(), 96, "REVALIDATE must cover all 96 offsets");
     }
 
     /// No duplicate const names in the table (a copy-paste guard).
@@ -1903,7 +1936,7 @@ mod tests {
             assert_eq!(spec.name, *name, "slot table out of order at {i}");
             assert_eq!(*slot, i as u32 + 1);
         }
-        assert_eq!(BTF_OFFSETS_SLOTS, 109);
+        assert_eq!(BTF_OFFSETS_SLOTS, 111);
         assert_eq!(ENUM_SLOT_TABLE[0].1, ITER_UBUF_VALUE_SLOT);
         assert_eq!(ENUM_SLOT_TABLE[0].0, ENUM_VALUES[0].name);
         assert_eq!(ENUM_SLOT_TABLE[1].1, ITER_IOVEC_VALUE_SLOT);
@@ -1933,8 +1966,8 @@ mod tests {
             assert_eq!(*slot, first + i as u32);
             assert!(*slot < BTF_OFFSETS_SLOTS);
         }
-        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 97);
-        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 100);
+        assert_eq!(slot::TP_SCHED_EXEC_FILENAME_OFFSET, 99);
+        assert_eq!(slot::TP_SYS_ENTER_OPENAT_FLAGS_OFFSET, 102);
         assert_eq!(TP_SCHED_EXEC_FILENAME_OFFSET, 8);
     }
 
@@ -1955,14 +1988,14 @@ mod tests {
             assert!(spec.compiled < HOOK_ARG_MAX);
             assert!(spec.func.starts_with("bpf_lsm_"));
         }
-        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 106);
-        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 107);
-        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 108);
-        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 106));
-        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 107));
+        assert_eq!(INODE_SETATTR_DENTRY_ARG_SLOT, 108);
+        assert_eq!(INODE_SETXATTR_DENTRY_ARG_SLOT, 109);
+        assert_eq!(INODE_REMOVEXATTR_DENTRY_ARG_SLOT, 110);
+        assert_eq!(HOOK_ARG_SLOT_TABLE[0], ("INODE_SETATTR_DENTRY_ARG", 108));
+        assert_eq!(HOOK_ARG_SLOT_TABLE[1], ("INODE_SETXATTR_DENTRY_ARG", 109));
         assert_eq!(
             HOOK_ARG_SLOT_TABLE[2],
-            ("INODE_REMOVEXATTR_DENTRY_ARG", 108)
+            ("INODE_REMOVEXATTR_DENTRY_ARG", 110)
         );
         // a position and the argument after it stay below the bound
         assert!(HOOK_ARGS.iter().all(|h| h.compiled + 1 < HOOK_ARG_MAX));

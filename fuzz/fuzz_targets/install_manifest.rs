@@ -1,15 +1,17 @@
 #![no_main]
 //! The install manifest is parsed at every boot and decides whether the
-//! agent starts. The check runs against a fixed fixture directory (the
-//! agent and the other two binaries, `fuzz_api`), so every manifest that
+//! agent starts. The check runs against a fixed fixture directory (a
+//! binary for each file name install.sh records: the agent and the
+//! others, `fuzz_api::INSTALL_MANIFEST_FIXTURE`), so every manifest that
 //! parses reaches the hash comparison (WDG-R05: through `/proc/self/exe`
 //! every input ended `NotApplicable`). Beyond "never panics":
 //! - the outcome is a verdict on the fixture: never `NoManifest` or
 //!   `NotApplicable`;
-//! - `Verified` exactly when every recorded name is one of the four
-//!   install.sh writes and its hash is the fixture's; every other entry is
-//!   a mismatch, an unknown name refused without being opened (an
-//!   absolute name such as `/dev/zero` hung the check).
+//! - `Verified` exactly when every name in the manifest is one of
+//!   `RECORDED_NAMES` (what install.sh records: its binaries and the eBPF
+//!   object's hash) and its hash is the fixture's; every other entry is a
+//!   mismatch, an unknown name refused without being opened (an absolute
+//!   name such as `/dev/zero` hung the check).
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -36,7 +38,10 @@ fn fixture() -> &'static (&'static Path, BTreeMap<&'static str, String>) {
             let h = if name == EBPF_OBJECT_KEY {
                 INSTALL_MANIFEST_FIXTURE_EBPF_SHA.to_string()
             } else {
-                sha256_file(&dir.join(name)).expect("a fixture binary")
+                // a recorded name without its fixture binary
+                // (INSTALL_MANIFEST_FIXTURE) is a harness defect
+                sha256_file(&dir.join(name))
+                    .unwrap_or_else(|e| panic!("{name}: no fixture binary: {e}"))
             };
             hashes.insert(name, h);
         }

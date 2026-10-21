@@ -243,6 +243,10 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
                 return Err(anyhow!("{label}: {w}"));
             }
         }
+        // Lab PR 223: every line a `block`/`allow` entry, no digest twice.
+        OverlayKind::ExecqHashes => {
+            common::execq::parse_hash_list(text).map_err(|e| anyhow!("{label}: {e}"))?;
+        }
     }
     Ok(())
 }

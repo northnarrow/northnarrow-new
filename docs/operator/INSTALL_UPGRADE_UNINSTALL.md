@@ -19,7 +19,13 @@ with `rm -f` or `kill -9`, they are denied by design.
 | Retire the host | `sudo ./deploy/uninstall.sh --purge --grant-key <admin.key>` | no — everything removed |
 
 All three assume `cargo xtask build --release` (or the release tarball)
-produced `target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin}`.
+produced `target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}`.
+`northnarrow-scan` is the confined scanner of the EXPERIMENTAL exec quarantine
+(lab PR 223, off unless the agent runs with `--exec-quarantine`): installed
+next to the agent, recorded in `install-manifest.json`, run by the agent as
+the system account `northnarrow-scan` that `install.sh` creates (no home, no
+shell) and `uninstall.sh` removes; see
+<https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/EXEC_QUARANTINE.md>.
 A release tree installs only when its tarball's provenance attestation
 verifies (section 5.1). A tree built from source has no `MANIFEST.sha256`:
 `install.sh` installs it only with `--source-tree` (or `--allow-unverified`),
@@ -146,7 +152,8 @@ start — left the host without a working agent. What it does now, in order:
    `/var/lib/northnarrow-upgrade/<time>-<pid>/` (`cp -a`: bytes, mode,
    owner, times, extended attributes; mode `0700`, outside the agent's own
    directories), and lists the ones that do not exist yet. That is the two
-   binaries and `nn-admin`, the three units (the agent's, the watchdog's
+   binaries, `nn-admin` and the scanner (`northnarrow-scan`, lab PR 223),
+   the three units (the agent's, the watchdog's
    and its `OnFailure=` handler, lab PR 216), the Debian drop-in and the
    copy-on-first-write one (lab PR 222),
    `journald@northnarrow.conf`, `install-manifest.json`, the five `.v1`
@@ -180,7 +187,7 @@ start — left the host without a working agent. What it does now, in order:
 5. **switches** the binaries and units: each new file is staged next to
    the installed one (`<path>.nn-new`, same directory, same file system),
    compared with its source, then renamed over it (`rename(2)`): every path
-   is the old file or the new one, never half of either, and the six
+   is the old file or the new one, never half of either, and the seven
    change together. `install-manifest.json` is written the same way. Then
    the rest of the install (configs — the shipped `.v1` lists replaced by
    the release's, an edited one kept as `<list>.v1.operator` (§1);

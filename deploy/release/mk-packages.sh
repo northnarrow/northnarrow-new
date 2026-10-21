@@ -5,7 +5,7 @@
 #   <out>/northnarrow-<ver>-<rel>.x86_64.rpm    (rpmbuild)
 #
 # Layout (review 26):
-#   /usr/bin/{northnarrow-agent,northnarrow-watchdog,nn-admin}
+#   /usr/bin/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}
 #   /usr/lib/systemd/system/northnarrow-{agent,watchdog,watchdog-failed}.service  (rewritten for /usr/bin)
 #   /usr/share/northnarrow/   data tree `install.sh --package-configure` reads:
 #                             deploy/{install,uninstall}.sh, deploy/systemd/, configs/,
@@ -60,7 +60,7 @@ OUT=$(cd "$OUT" && pwd)
 ver=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 ebpf=agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf
 for f in target/release/northnarrow-agent target/release/northnarrow-watchdog target/release/nn-admin \
-         "$ebpf" "$ebpf.buildhash"; do
+         target/release/northnarrow-scan "$ebpf" "$ebpf.buildhash"; do
     [[ -f "$f" ]] || { echo "mk-packages: missing $f — run \`cargo xtask build --release\` first" >&2; exit 1; }
 done
 # Same guard install.sh applies to a tree: the agent must embed the stamped object.
@@ -76,7 +76,7 @@ install -d "$root/usr/bin" "$root/usr/lib/systemd/system" \
     "$root/usr/share/northnarrow/deploy/systemd" "$root/usr/share/northnarrow/$(dirname "$ebpf")" \
     "$root/usr/share/doc/northnarrow/operator"
 install -m 0755 target/release/northnarrow-agent target/release/northnarrow-watchdog target/release/nn-admin \
-    "$root/usr/bin/"
+    target/release/northnarrow-scan "$root/usr/bin/"
 for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     sed 's#/usr/local/bin/#/usr/bin/#g' "deploy/systemd/$u.service" > "$root/usr/lib/systemd/system/$u.service"
     chmod 0644 "$root/usr/lib/systemd/system/$u.service"
@@ -188,6 +188,7 @@ $(body posttrans)
 /usr/bin/northnarrow-agent
 /usr/bin/northnarrow-watchdog
 /usr/bin/nn-admin
+/usr/bin/northnarrow-scan
 /usr/lib/systemd/system/northnarrow-agent.service
 /usr/lib/systemd/system/northnarrow-watchdog.service
 /usr/lib/systemd/system/northnarrow-watchdog-failed.service

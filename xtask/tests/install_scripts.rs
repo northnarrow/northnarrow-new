@@ -1041,6 +1041,15 @@ exit 0"#,
         write_exec(&stub.join("sleep"), "exit 0");
         write_exec(&stub.join("chown"), "exit 0");
         write_exec(&stub.join("chattr"), "exit 0");
+        // Lab PR 223: the scanner's system account — never the host's.
+        write_exec(
+            &stub.join("getent"),
+            r#"[ "$1" = passwd ] && [ "${2:-}" = northnarrow-scan ] && [ -e "$NN_TEST_DIR/scan-user" ]"#,
+        );
+        write_exec(
+            &stub.join("useradd"),
+            r#"echo "useradd $*" >> "$NN_TEST_DIR/calls"; : > "$NN_TEST_DIR/scan-user""#,
+        );
         write_exec(
             &stub.join("logger"),
             r#"echo "$*" >> "$NN_TEST_DIR/logged""#,
@@ -1207,6 +1216,18 @@ esac
 T=$NN_TEST_DIR; pid=$2
 [ "$FAIL" = start ] && exit 1
 [ "$FAIL" = noregister ] || echo "2026-10-20T10:00:01.000000Z  INFO watchdog: watchdog PID registered in PROTECTED_PIDS pid=$pid bpffs_root=$T/pins" >> "$T/journal/northnarrow-watchdog.$pid"
+exit 0"#
+            ),
+        );
+        // Lab PR 223: the exec quarantine's scanner, installed with the
+        // binaries (the agent spawns it only with --exec-quarantine).
+        write_exec(
+            &rel.join("northnarrow-scan"),
+            &format!(
+                r#"# fake northnarrow-scan {v}
+case "${{1:-}}" in
+    --version) echo "northnarrow-scan {v}" ;;
+esac
 exit 0"#
             ),
         );

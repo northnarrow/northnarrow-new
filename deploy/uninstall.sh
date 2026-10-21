@@ -147,7 +147,7 @@ start_agent_for_window() {
 # <<< stale_pin_root
 
 echo "NorthNarrow uninstall"
-echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin}"
+echo "  binaries : $BIN_DIR/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}"
 echo "  units    : $UNIT_DIR/northnarrow-{agent,watchdog,watchdog-failed}.service"
 echo "  bpffs    : $BPFFS_ROOT"
 if (( PURGE )); then
@@ -329,9 +329,14 @@ for d in "$STATE_DIR" "$ETC_DIR"; do
 done
 
 # ── 4. binaries, units, journald, baits, /run ─────────────────────────
-for b in northnarrow-agent northnarrow-watchdog nn-admin; do
+for b in northnarrow-agent northnarrow-watchdog nn-admin northnarrow-scan; do
     [[ -e "$BIN_DIR/$b" ]] && { log "removing $BIN_DIR/$b"; rm -f "$BIN_DIR/$b"; }
 done
+# Lab PR 223: the exec quarantine scanner's account (it owns no file).
+if getent passwd northnarrow-scan >/dev/null 2>&1 && command -v userdel >/dev/null 2>&1; then
+    log "removing the system account northnarrow-scan"
+    userdel northnarrow-scan 2>/dev/null || log "userdel northnarrow-scan failed — remove it by hand"
+fi
 for u in northnarrow-agent northnarrow-watchdog northnarrow-watchdog-failed; do
     [[ -e "$UNIT_DIR/$u.service" ]] && { log "removing $UNIT_DIR/$u.service"; rm -f "$UNIT_DIR/$u.service"; }
 done

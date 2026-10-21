@@ -28,6 +28,7 @@ mod epg;
 mod epg_lite;
 mod exec_check;
 mod exec_lsm;
+mod execq;
 mod fail_open;
 mod file_open;
 mod fim_watch;
@@ -316,6 +317,13 @@ fn try_sched_process_exec(ctx: &TracePointContext) -> Result<(), i64> {
     }
 
     entry.submit(0);
+    // Lab PR 223 (EXPERIMENTAL): the exec quarantine. The exec is past its
+    // point of no return and the task is still in the kernel: a SIGSTOP
+    // sent now holds the new image before its first instruction.
+    let task = unsafe { bpf_get_current_task() } as *const u8;
+    if !task.is_null() {
+        unsafe { crate::execq::maybe_stop(task) };
+    }
     Ok(())
 }
 

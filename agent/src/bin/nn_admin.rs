@@ -670,7 +670,8 @@ enum OverlayCmd {
     Set {
         /// fim-paths, process-comm-allowlist, netflow-comm-allowlist,
         /// netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout,
-        /// escalation-allow, canary-readers, cow-guard.
+        /// escalation-allow, canary-readers, cow-guard,
+        /// execq-hashes.
         kind: String,
         /// The overlay content to store.
         #[arg(long)]
@@ -2415,6 +2416,7 @@ fn telemetry_withheld(out: &StatusOutcome) -> bool {
         && out.trust_level.is_none()
         && out.degradations.is_none()
         && out.exploit_guard.is_none()
+        && out.execq_state.is_none()
 }
 
 /// The line that replaces the telemetry in an unsigned reply.
@@ -2858,6 +2860,55 @@ fn capability_lines(v: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+/// Lab PR 223 (EXPERIMENTAL): the exec quarantine's state and counts.
+fn execq_line(out: &StatusOutcome, tty: bool) -> String {
+    let Some(state) = &out.execq_state else {
+        return "exec quarantine   : (not reported: the agent predates the guard)".to_string();
+    };
+    let n = |v: Option<u64>| v.unwrap_or(0);
+    let shown = if state.starts_with("degraded") {
+        colorize(state, "31", tty)
+    } else {
+        state.clone()
+    };
+    if state == "off" {
+        return format!("exec quarantine   : {shown}");
+    }
+    format!(
+        "exec quarantine   : {shown} — held {}, resumed {}, killed {} ({} quarantined), default policy {}, known identity {}, known content {}, not held {}, scanner deaths {}",
+        n(out.execq_held_total),
+        n(out.execq_resumed_total),
+        n(out.execq_killed_total),
+        n(out.execq_quarantined_total),
+        n(out.execq_defaulted_total),
+        n(out.execq_known_identity_total),
+        n(out.execq_known_hash_total),
+        n(out.execq_not_held_total),
+        n(out.execq_scanner_deaths_total),
+    )
+}
+
+/// The exec quarantine's fields as a JSON object (`null` when absent).
+fn execq_json(out: &StatusOutcome) -> String {
+    let Some(state) = &out.execq_state else {
+        return "null".to_string();
+    };
+    let n = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
+    format!(
+        "{{\"state\":{},\"held\":{},\"resumed\":{},\"killed\":{},\"quarantined\":{},\"defaulted\":{},\"known_identity\":{},\"known_hash\":{},\"not_held\":{},\"scanner_deaths\":{}}}",
+        serde_json::to_string(state).unwrap_or_else(|_| "null".to_string()),
+        n(out.execq_held_total),
+        n(out.execq_resumed_total),
+        n(out.execq_killed_total),
+        n(out.execq_quarantined_total),
+        n(out.execq_defaulted_total),
+        n(out.execq_known_identity_total),
+        n(out.execq_known_hash_total),
+        n(out.execq_not_held_total),
+        n(out.execq_scanner_deaths_total),
+    )
+}
+
 fn print_status(out: &StatusOutcome, json: bool) {
     if json {
         // Hand-rolled JSON to avoid a serde_json dep at the binary
@@ -2879,7 +2930,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             .collect();
         let opt = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |n| n.to_string());
         println!(
-            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"telemetry_signed\":{}}}",
+            "{{\"posture\":\"{:?}\",\"network_isolation_engaged\":{},\"network_isolation_v4\":{},\"network_isolation_v6\":{},\"last_admin_action_secs_ago\":{},\"ringbuf_drops_total\":{},\"ringbuf_drops\":{{{}}},\"combat_stage\":{},\"combat_locked\":{},\"ringbuf_rejected_total\":{},\"ringbuf_rejected\":{{{}}},\"detect_only\":{},\"detect_only_source\":{},\"combat_evidence_unrecorded\":{},\"combat_evidence_pending\":{},\"combat_evidence_dropped\":{},\"deny_fail_open_total\":{},\"deny_fail_open\":{{{}}},\"trust_level\":{},\"trust_reasons\":{},\"degradations\":{},\"exploit_guard\":{},\"cow_guard\":{},\"execq\":{},\"telemetry_signed\":{}}}",
             out.posture,
             out.network_isolation_engaged,
             // Lab PR 217 (capability C18).
@@ -2927,6 +2978,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             // Lab PR 219.
             serde_json::to_string(&out.exploit_guard).unwrap_or_else(|_| "null".to_string()),
             serde_json::to_string(&out.cow_guard).unwrap_or_else(|_| "null".to_string()),
+            execq_json(out),
             out.telemetry_signed,
         );
         return;
@@ -2972,6 +3024,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
             println!("{line}");
         }
         println!("{}", exploit_guard_line(out, tty));
+        println!("{}", execq_line(out, tty));
     }
     match out.last_admin_action_secs_ago {
         Some(s) => println!("last admin action : {s}s ago"),
@@ -4560,6 +4613,30 @@ mod flow_sock_line_tests {
     };
     use northnarrow_agent::admin_cli::StatusOutcome;
 
+    /// Lab PR 223: the exec quarantine's line and JSON object.
+    #[test]
+    fn the_exec_quarantine_line() {
+        let mut o = outcome(None, None, None);
+        assert!(super::execq_line(&o, false).contains("predates the guard"));
+        assert_eq!(super::execq_json(&o), "null");
+        o.execq_state = Some("off".into());
+        assert_eq!(super::execq_line(&o, false), "exec quarantine   : off");
+        o.execq_state = Some("enforce".into());
+        o.execq_held_total = Some(3);
+        o.execq_killed_total = Some(1);
+        o.execq_quarantined_total = Some(1);
+        let l = super::execq_line(&o, false);
+        assert!(
+            l.contains("enforce — held 3") && l.contains("killed 1 (1 quarantined)"),
+            "{l}"
+        );
+        assert!(l.contains("quarantined), default policy 0, known"), "{l}");
+        let j: serde_json::Value = serde_json::from_str(&super::execq_json(&o)).unwrap();
+        assert_eq!(j["state"], "enforce");
+        assert_eq!(j["held"], 3);
+        assert!(j["resumed"].is_null());
+    }
+
     fn outcome(
         pending: Option<u64>,
         capacity: Option<u64>,
@@ -4599,6 +4676,16 @@ mod flow_sock_line_tests {
             capability_manifest: None,
             exploit_guard: None,
             cow_guard: None,
+            execq_state: None,
+            execq_held_total: None,
+            execq_resumed_total: None,
+            execq_killed_total: None,
+            execq_quarantined_total: None,
+            execq_defaulted_total: None,
+            execq_known_identity_total: None,
+            execq_known_hash_total: None,
+            execq_not_held_total: None,
+            execq_scanner_deaths_total: None,
             telemetry_signed: true,
         }
     }

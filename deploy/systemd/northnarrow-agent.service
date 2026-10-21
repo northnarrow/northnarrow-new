@@ -275,7 +275,12 @@ ReadWritePaths=/run/northnarrow /var/lib/northnarrow /etc/northnarrow
 # Debian-family kernels: perf_event_paranoid=3 semantics need CAP_SYS_ADMIN
 # for the tracepoint/kprobe attach; install.sh adds it there through the
 # drop-in northnarrow-agent.service.d/10-debian-perf-paranoid.conf.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_KILL CAP_SETFCAP
+# Lab PR 223 (EXPERIMENTAL exec quarantine): CAP_SETUID and CAP_SETGID
+# let the agent start its scanner as the unprivileged `northnarrow-scan`
+# account (setgroups/setgid/setuid in the child before exec); nothing else
+# uses them. Without them the guard refuses to start (a signed
+# degradation), the agent runs.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN CAP_LINUX_IMMUTABLE CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_KILL CAP_SETFCAP CAP_SETUID CAP_SETGID
 
 [Install]
 WantedBy=multi-user.target

@@ -422,4 +422,43 @@ pub(super) const DOCS: &[RuleDoc] = &[
         ],
         attack_note: "",
     },
+    // ── exec quarantine (lab PR 223, experimental, off by default) ──
+    RuleDoc {
+        id: "NN-L-EXECQ-001_FirstSightQuarantine",
+        severities: &[
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+        ],
+        actions: &[
+            ResponseAction::Quarantine,
+            ResponseAction::KillProcess,
+            ResponseAction::Log,
+        ],
+        sensors: &[Sensor::Exec],
+        data_components: &["DC0032", "DC0059"],
+        observes: "With --exec-quarantine: an executable never judged before, run from a \
+                   guarded location (/tmp, /var/tmp, /dev/shm, a home or world-writable \
+                   directory, a memfd, an unlinked file), held by the kernel before its first \
+                   instruction (enforce) and judged by the confined scanner (signed hash list, \
+                   ELF and script heuristics) and the rules; resumed, or killed and \
+                   quarantined. Recorded by the guard's controller, one record per decision.",
+        false_positives: "A build or a test suite running new binaries from a home or /tmp: \
+                          judged once per identity, resumed when clean (cached), and the \
+                          default policy resumes on an expired budget; a suspicious verdict \
+                          resumes unless --exec-quarantine-on-suspicious kill.",
+        how_to_test: "On a lab guest, `nn-lab.sh execq-check`: copies of /usr/bin/true and \
+                      /usr/bin/ls are resumed and cached, the block-listed marker binary is \
+                      killed before it writes its marker and quarantined.",
+        tests: &[
+            "agent/src/execq/controller/tests.rs::a_blocklisted_binary_is_killed_and_quarantined",
+            "agent/src/execq/controller/tests.rs::\
+             a_clean_new_binary_is_resumed_cached_and_recorded_once",
+            "deploy/lab/execq/execq-check.sh::execq check: PASS",
+        ],
+        attack_note: "User Execution: Malicious File (T1204.002) for what it holds; a script \
+                      also names its interpreter's technique (T1059.004, .006, .007, or T1059), \
+                      per record.",
+    },
 ];

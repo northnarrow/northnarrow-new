@@ -59,7 +59,7 @@
       "techniqueID": "T1053.002"
     },
     {
-      "comment": "NN-L-CHAIN-007_TmpCredExfilSequence, NN-L-CHAIN-002_TmpExecThenEgress, NN-L-CHAIN-005_CrossPidTmpC2, R002_ExecFromDevShm, R001_ExecFromTmp, R003_ExecFromVarTmp",
+      "comment": "NN-L-CHAIN-007_TmpCredExfilSequence, NN-L-CHAIN-002_TmpExecThenEgress, NN-L-CHAIN-005_CrossPidTmpC2, R002_ExecFromDevShm, R001_ExecFromTmp, R003_ExecFromVarTmp, NN-L-EXECQ-001_FirstSightQuarantine",
       "enabled": true,
       "metadata": [
         {
@@ -85,15 +85,19 @@
         {
           "name": "rule",
           "value": "R003_ExecFromVarTmp (unit)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
         }
       ],
-      "score": 6,
+      "score": 7,
       "showSubtechniques": false,
       "tactic": "execution",
       "techniqueID": "T1059"
     },
     {
-      "comment": "R006_ReverseShellTooling, R017_ShellFromNonstandardPath",
+      "comment": "R006_ReverseShellTooling, R017_ShellFromNonstandardPath, NN-L-EXECQ-001_FirstSightQuarantine",
       "enabled": true,
       "metadata": [
         {
@@ -103,12 +107,44 @@
         {
           "name": "rule",
           "value": "R017_ShellFromNonstandardPath (unit+e2e)"
+        },
+        {
+          "name": "rule",
+          "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
         }
       ],
-      "score": 2,
+      "score": 3,
       "showSubtechniques": false,
       "tactic": "execution",
       "techniqueID": "T1059.004"
+    },
+    {
+      "comment": "NN-L-EXECQ-001_FirstSightQuarantine",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
+        }
+      ],
+      "score": 1,
+      "showSubtechniques": false,
+      "tactic": "execution",
+      "techniqueID": "T1059.006"
+    },
+    {
+      "comment": "NN-L-EXECQ-001_FirstSightQuarantine",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
+        }
+      ],
+      "score": 1,
+      "showSubtechniques": false,
+      "tactic": "execution",
+      "techniqueID": "T1059.007"
     },
     {
       "comment": "NN-L-IOU-001_IoUringRingCreated, NN-L-IOU-002_IoUringFileAndNetwork",
@@ -127,6 +163,20 @@
       "showSubtechniques": false,
       "tactic": "execution",
       "techniqueID": "T1106"
+    },
+    {
+      "comment": "NN-L-EXECQ-001_FirstSightQuarantine",
+      "enabled": true,
+      "metadata": [
+        {
+          "name": "rule",
+          "value": "NN-L-EXECQ-001_FirstSightQuarantine (no proof)"
+        }
+      ],
+      "score": 1,
+      "showSubtechniques": false,
+      "tactic": "execution",
+      "techniqueID": "T1204.002"
     },
     {
       "comment": "NN-L-FIM-022_LdSoPreloadModified",

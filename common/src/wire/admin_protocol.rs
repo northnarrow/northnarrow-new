@@ -801,6 +801,36 @@ pub struct StatusResponse {
     /// code).
     #[serde(default)]
     pub cow_guard: Option<CowGuardStatus>,
+    /// Lab PR 223 (EXPERIMENTAL): the exec quarantine — `off`, `enforce`,
+    /// `observe`, or `degraded: <why>` — and its counts since boot:
+    /// processes the kernel held; resumed, killed, files quarantined;
+    /// decided by the default policy (budget expired, file not scannable);
+    /// execs the kernel let through on an identity already judged; resumed
+    /// on content judged clean earlier; candidates not held (observe mode,
+    /// a stale heartbeat, a full ring, a refused signal); scanner deaths.
+    /// Appended after lab PR 222's `cow_guard` (lab PR 219's
+    /// `exploit_guard`, 218's, 217's, 215's and 207's fields before it);
+    /// telemetry (`None` in the unsigned reply).
+    #[serde(default)]
+    pub execq_state: Option<String>,
+    #[serde(default)]
+    pub execq_held_total: Option<u64>,
+    #[serde(default)]
+    pub execq_resumed_total: Option<u64>,
+    #[serde(default)]
+    pub execq_killed_total: Option<u64>,
+    #[serde(default)]
+    pub execq_quarantined_total: Option<u64>,
+    #[serde(default)]
+    pub execq_defaulted_total: Option<u64>,
+    #[serde(default)]
+    pub execq_known_identity_total: Option<u64>,
+    #[serde(default)]
+    pub execq_known_hash_total: Option<u64>,
+    #[serde(default)]
+    pub execq_not_held_total: Option<u64>,
+    #[serde(default)]
+    pub execq_scanner_deaths_total: Option<u64>,
 }
 
 /// Lab PR 219: the exploit post-condition guard in `nn-admin status`.
@@ -883,6 +913,16 @@ impl StatusResponse {
             capability_manifest: None,
             exploit_guard: None,
             cow_guard: None,
+            execq_state: None,
+            execq_held_total: None,
+            execq_resumed_total: None,
+            execq_killed_total: None,
+            execq_quarantined_total: None,
+            execq_defaulted_total: None,
+            execq_known_identity_total: None,
+            execq_known_hash_total: None,
+            execq_not_held_total: None,
+            execq_scanner_deaths_total: None,
         }
     }
 
@@ -1950,6 +1990,16 @@ mod tests {
             capability_manifest: None,
             exploit_guard: None,
             cow_guard: None,
+            execq_state: None,
+            execq_held_total: None,
+            execq_resumed_total: None,
+            execq_killed_total: None,
+            execq_quarantined_total: None,
+            execq_defaulted_total: None,
+            execq_known_identity_total: None,
+            execq_known_hash_total: None,
+            execq_not_held_total: None,
+            execq_scanner_deaths_total: None,
         }));
     }
 
@@ -1989,6 +2039,16 @@ mod tests {
             capability_manifest: None,
             exploit_guard: None,
             cow_guard: None,
+            execq_state: None,
+            execq_held_total: None,
+            execq_resumed_total: None,
+            execq_killed_total: None,
+            execq_quarantined_total: None,
+            execq_defaulted_total: None,
+            execq_known_identity_total: None,
+            execq_known_hash_total: None,
+            execq_not_held_total: None,
+            execq_scanner_deaths_total: None,
         }));
     }
 
@@ -2209,6 +2269,16 @@ mod tests {
                 }],
                 counters: vec![("copies_reflink".to_string(), 2)],
             }),
+            execq_state: None,
+            execq_held_total: None,
+            execq_resumed_total: None,
+            execq_killed_total: None,
+            execq_quarantined_total: None,
+            execq_defaulted_total: None,
+            execq_known_identity_total: None,
+            execq_known_hash_total: None,
+            execq_not_held_total: None,
+            execq_scanner_deaths_total: None,
         }));
     }
 
@@ -2277,6 +2347,16 @@ mod tests {
                 denied_total: 0,
             }),
             cow_guard: None,
+            execq_state: None,
+            execq_held_total: None,
+            execq_resumed_total: None,
+            execq_killed_total: None,
+            execq_quarantined_total: None,
+            execq_defaulted_total: None,
+            execq_known_identity_total: None,
+            execq_known_hash_total: None,
+            execq_not_held_total: None,
+            execq_scanner_deaths_total: None,
         }
     }
 
@@ -2729,6 +2809,8 @@ mod tests {
         assert_eq!(public.deny_fail_open_total, None);
         assert_eq!(public.deny_fail_open, None);
         assert_eq!(public.exploit_guard, None);
+        assert_eq!(public.execq_state, None);
+        assert_eq!(public.execq_held_total, None);
         assert!(!status_with_lab193_fields().telemetry_withheld());
         // Same shape: an older nn-admin or watchdog reads it.
         let body = postcard::to_allocvec(&public).unwrap();
@@ -2815,7 +2897,7 @@ mod tests {
     /// public, passed through by the unsigned reply — and an `nn-admin` of
     /// lab PR 213 reads every byte before it (the two fields follow lab PR
     /// 215's; the fields appended after them — lab PR 218's four, 219's
-    /// and 222's one each — are `None` in a public reply).
+    /// and 222's one each, 223's ten — are `None` in a public reply).
     #[test]
     fn the_status_carries_the_isolation_per_family() {
         let public = StatusResponse::public(PostureKind::Combat, false, None, None, Some(true))
@@ -2832,8 +2914,8 @@ mod tests {
         // None is one byte each; Some(bool) two. The fields appended after
         // them (one `None` byte each here) are the last bytes of both: lab
         // PR 218's four, lab PR 219's `exploit_guard`, lab PR 222's
-        // `cow_guard`.
-        let tail = 4 + 1 + 1;
+        // `cow_guard`, lab PR 223's ten `execq_*`.
+        let tail = 4 + 1 + 1 + 10;
         let prefix = without.len() - 2 - tail;
         assert_eq!(with.len(), without.len() + 2);
         assert_eq!(&with[..prefix], &without[..prefix]);

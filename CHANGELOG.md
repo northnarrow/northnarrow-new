@@ -6,6 +6,68 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Exec quarantine at first sight, EXPERIMENTAL and off by default
+  (capabilities C13, C12; lab PR 223; `docs/design/EXEC_QUARANTINE.md`).
+  With `--exec-quarantine enforce` an executable never judged on the host,
+  run from a guarded location (`/tmp`, `/var/tmp`, `/dev/shm`, a home
+  directory, a world-writable directory, a memory-backed filesystem, a
+  memfd, an unlinked file), is held by the kernel before its first
+  instruction: `sched_process_exec` sends it `SIGSTOP` (`bpf_send_signal`,
+  pending before the task returns to user mode in the new image); the LSM
+  exec sensor classifies each binfmt pass. The agent opens the file the
+  process runs (`/proc/<pid>/exe`, or a script by path, the inode checked),
+  trusts a package's unmodified file (dpkg md5sums, rpm digests), has the
+  file scanned, waits within the budget for the rule engine's verdict on the
+  same exec (a rule kill lands on a held process: it never ran), then
+  resumes it, or kills it and quarantines the file. No decision within the budget
+  (`--exec-quarantine-budget-ms`, 2000) gets the default policy
+  (`--exec-quarantine-on-expiry`, resume); a suspicious verdict gets
+  `--exec-quarantine-on-suspicious` (resume). An identity judged once —
+  `(dev, ino)` under the same ctime and size, resumed (or observed), for
+  the agent's run — is not held again; a copy of content judged clean is
+  resumed on its digest without a new record. A decision is a signed
+  detection record `NN-L-EXECQ-001_FirstSightQuarantine`, except a resume on
+  a known digest, a clean verdict that arrives after the default policy,
+  and what the per-rule budget holds back
+  (ATT&CK 20.0, lab PR 221's typed mapping: TA0002, T1204.002, T1059.x for
+  a script, `mitre_version` set; field `execq`: verdict,
+  SHA-256, reasons, decision, classes, held time); a guard that cannot
+  start and a scanner loss are signed `subsystem_degraded` (one per cause
+  per 10 min, repeats counted); processes a dead agent left held are
+  resumed at the next boot that runs the guard (`exec_quarantine`
+  `recovered_at_boot`). Fail-open: without the controller's heartbeat, with
+  a full ring (`RING_DROPS[execq]`, a security ring) or a refused signal the
+  kernel holds nothing; the execs a full ring or a refused signal let run
+  are a signed `subsystem_degraded` with their counts, at most one per
+  10 min; the kernel configuration is frozen. A detect-only
+  agent observes. `nn-admin status --key` shows its state and counts
+  (`execq_*`, appended after lab PR 222's `cow_guard`). New BTF offsets
+  `INODE_I_CTIME_SEC_OFFSET` / `INODE_I_CTIME_NSEC_OFFSET` (optional; slots
+  95 and 96, after lab PR 219's; the tracepoint, enum and hook argument
+  slots move up by two).
+- `northnarrow-scan`, the exec quarantine's scanner: a separate process the
+  agent spawns as the system account `northnarrow-scan` (created by
+  `install.sh`, removed by `uninstall.sh`; `CAP_SETUID`/`CAP_SETGID` added
+  to the agent unit's bounding set), supervised and restarted under a
+  backoff. It refuses root, sets `PR_SET_NO_NEW_PRIVS` and
+  `PR_SET_DUMPABLE` 0, closes every other descriptor, caps processes,
+  descriptors and memory, then installs a seccomp filter that kills it on
+  any `open*`, `exec*`, `socket`, `clone`, `ptrace`, `bpf` or executable
+  mapping: it reads only the descriptors the agent hands it over a
+  `SOCK_SEQPACKET` pair (`SCM_RIGHTS`), its configuration from a sealed
+  memfd. It computes SHA-256, checks the signed hash list and runs
+  explainable ELF heuristics (UPX, high-entropy code, RWX segments, an
+  unusual or missing interpreter, a stripped static binary, suspicious
+  imports in a small binary; weights to a threshold, every reason in the
+  record). Shipped in the tarball, the `.deb` and the `.rpm`, recorded in
+  `install-manifest.json`, its binary inode-protected. YARA is not in this
+  release: libyara is C, yara-x needs rustc 1.95 and a JIT the filter
+  refuses; the `yara` feature is reserved (design §6).
+- Overlay kind `execq-hashes` (`/etc/northnarrow/execq-hashes.local`,
+  `block <sha256> [label]` / `allow <sha256> [label]`), signed and verified
+  like every overlay (`nn-admin config overlay set execq-hashes`),
+  MUTATE-protected with its signature.
+- Lab check `deploy/lab/execq/execq-check.sh` (`nn-lab.sh execq-check`).
 - Copy on first write: ransomware rollback for Linux (lab PR 222,
   EXPERIMENTAL, off by default; capabilities C19, C17;
   `docs/design/COPY_ON_FIRST_WRITE.md`). Before a writer whose trust is not
@@ -66,11 +128,11 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 - Every rule declares its MITRE ATT&CK tactics and techniques as data
   (lab PR 221, capability C16): `Rule::attack()` returns typed
   references (a `Tactic` enum, technique ids checked for shape when they
-  compile) of ATT&CK Enterprise 20.0. All 79 rules the agent can record
-  (lab PR 219's two included) are mapped — 58 techniques and
-  sub-techniques under 12 tactics — and a rule detection record now
-  carries their ids in `mitre` (it was always empty
-  on the rule path) and the version in a new `mitre_version` field
+  compile) of ATT&CK Enterprise 20.0. All 80 rules the agent can record
+  (lab PR 219's two and lab PR 223's NN-L-EXECQ-001 included) are mapped —
+  61 techniques and sub-techniques under 12 tactics — and a rule detection
+  record now carries their ids in `mitre` (it was always empty on the rule
+  path) and the version in a new `mitre_version` field
   (`"20.0"`). Records written before keep their bytes and still verify:
   the field is absent on them and on ADE records. The ids are pinned in
   `docs/detection/attack-enterprise-20.0.tsv`, extracted from MITRE's STIX

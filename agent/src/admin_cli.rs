@@ -208,6 +208,19 @@ pub struct StatusOutcome {
     /// Lab PR 222: the copy-on-first-write guard (`None`: withheld, or an
     /// agent without it).
     pub cow_guard: Option<common::wire::admin_protocol::CowGuardStatus>,
+    /// Lab PR 223 (EXPERIMENTAL): the exec quarantine's state and counts
+    /// (`StatusResponse::execq_*`; `None`: withheld, or an agent before
+    /// the fields).
+    pub execq_state: Option<String>,
+    pub execq_held_total: Option<u64>,
+    pub execq_resumed_total: Option<u64>,
+    pub execq_killed_total: Option<u64>,
+    pub execq_quarantined_total: Option<u64>,
+    pub execq_defaulted_total: Option<u64>,
+    pub execq_known_identity_total: Option<u64>,
+    pub execq_known_hash_total: Option<u64>,
+    pub execq_not_held_total: Option<u64>,
+    pub execq_scanner_deaths_total: Option<u64>,
     /// External audit ASK-009 (lab PR 213): the reply of the signed
     /// telemetry verb (`--key`). `false` for the unsigned `status`, whose
     /// telemetry fields the agent leaves `None` — withheld, not unknown.
@@ -434,6 +447,16 @@ fn status_outcome(
         capability_manifest: resp.capability_manifest,
         exploit_guard: resp.exploit_guard,
         cow_guard: resp.cow_guard,
+        execq_state: resp.execq_state,
+        execq_held_total: resp.execq_held_total,
+        execq_resumed_total: resp.execq_resumed_total,
+        execq_killed_total: resp.execq_killed_total,
+        execq_quarantined_total: resp.execq_quarantined_total,
+        execq_defaulted_total: resp.execq_defaulted_total,
+        execq_known_identity_total: resp.execq_known_identity_total,
+        execq_known_hash_total: resp.execq_known_hash_total,
+        execq_not_held_total: resp.execq_not_held_total,
+        execq_scanner_deaths_total: resp.execq_scanner_deaths_total,
         telemetry_signed: signed,
     }
 }
@@ -3692,10 +3715,24 @@ mod tests {
                         denied_total: 0,
                     }),
                     cow_guard: None,
+                    execq_state: Some("enforce".to_string()),
+                    execq_held_total: Some(1),
+                    execq_resumed_total: Some(2),
+                    execq_killed_total: Some(3),
+                    execq_quarantined_total: Some(4),
+                    execq_defaulted_total: Some(5),
+                    execq_known_identity_total: Some(6),
+                    execq_known_hash_total: Some(7),
+                    execq_not_held_total: Some(8),
+                    execq_scanner_deaths_total: Some(9),
                 }),
             );
         });
         let out = run_status(&socket).expect("status");
+        // Lab PR 223: the exec quarantine's fields.
+        assert_eq!(out.execq_state.as_deref(), Some("enforce"));
+        assert_eq!(out.execq_held_total, Some(1));
+        assert_eq!(out.execq_scanner_deaths_total, Some(9));
         assert_eq!(out.combat_stage.as_deref(), Some("ISOLATE"));
         assert_eq!(out.combat_locked, Some(true));
         assert_eq!(out.ringbuf_rejected_total, Some(2));

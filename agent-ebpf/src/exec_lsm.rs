@@ -14,7 +14,9 @@
 //! `sched_process_exec`, which runs in the same task once the exec has
 //! succeeded and appends it to `ProcessSpawnRaw`. Observe only: the
 //! program always returns 0 (Q4: the deny belongs to the 10.9
-//! inline-enforcement item).
+//! inline-enforcement item). Lab PR 223: each pass is also offered to the
+//! exec quarantine (`crate::execq::note_pass`), which holds the new image
+//! from `sched_process_exec` instead of denying the exec.
 use aya_ebpf::{
     cty::c_void,
     helpers::{
@@ -54,7 +56,7 @@ const MEMFD_MASK: u64 = 0xffff_ffff_ffff;
 pub static EXEC_HANDOFF: LruHashMap<u64, ExeIdentityRaw> = LruHashMap::with_max_entries(1024, 0);
 /// Where a pass's identity is built (552 bytes: never on the stack).
 #[map]
-static EXEC_SCRATCH: PerCpuArray<ExeIdentityRaw> = PerCpuArray::with_max_entries(1, 0);
+pub(crate) static EXEC_SCRATCH: PerCpuArray<ExeIdentityRaw> = PerCpuArray::with_max_entries(1, 0);
 
 /// `u64` at `src`, 0 when unreadable, without a branch on the result
 /// (the helper always writes its destination).
@@ -181,6 +183,10 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) {
     if pass == 0 {
         let _ = EXEC_HANDOFF.insert(&(task as u64), &*s, 0);
     }
+    // Lab PR 223 (EXPERIMENTAL): the exec quarantine's candidate, stopped
+    // by `sched_process_exec` once the exec succeeded. One array read
+    // when the guard is off.
+    crate::execq::note_pass(s, inode, dentry, task as u64, pass);
 }
 
 /// The dentry walk of [`exec_check_lsm`]: writes the path slots, the

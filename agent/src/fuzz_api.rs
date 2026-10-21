@@ -40,15 +40,22 @@ pub const COMBAT_CARVE_OUT_MARKER: &str = crate::anti_tamper::network_isolate::C
 
 // ── install manifest (external audit WDG-R05, NN-AUD-371) ────────────
 
-/// The binaries of the `install_manifest` target's fixture directory.
+/// The binaries of the `install_manifest` target's fixture directory: one
+/// per name of [`crate::install_manifest::RECORDED_NAMES`] but the eBPF
+/// object's (a hash, not a file). The target hashes each recorded name's
+/// file at start, so a name added there needs its binary here (lab PR
+/// 223: `northnarrow-scan` was missing, and the replay of the first input
+/// panicked; `install_manifest_fixture_has_every_recorded_binary` checks
+/// it on the host).
 #[doc(hidden)]
-pub const INSTALL_MANIFEST_FIXTURE: [(&str, &[u8]); 3] = [
+pub const INSTALL_MANIFEST_FIXTURE: [(&str, &[u8]); 4] = [
     ("northnarrow-agent", b"fuzz fixture: northnarrow-agent\n"),
     (
         "northnarrow-watchdog",
         b"fuzz fixture: northnarrow-watchdog\n",
     ),
     ("nn-admin", b"fuzz fixture: nn-admin\n"),
+    ("northnarrow-scan", b"fuzz fixture: northnarrow-scan\n"),
 ];
 
 /// The embedded eBPF object hash the target checks against.
@@ -307,22 +314,49 @@ mod tests {
         )
     }
 
+    /// Lab PR 223: the `install_manifest` target hashes the fixture's file
+    /// of every recorded name at start; a name without one (the scanner)
+    /// panicked on the first input of the CI replay.
+    #[test]
+    fn install_manifest_fixture_has_every_recorded_binary() {
+        use crate::install_manifest::{EBPF_OBJECT_KEY, RECORDED_NAMES};
+        use std::collections::BTreeSet;
+        let recorded: BTreeSet<&str> = RECORDED_NAMES
+            .into_iter()
+            .filter(|n| *n != EBPF_OBJECT_KEY)
+            .collect();
+        let fixture: BTreeSet<&str> = INSTALL_MANIFEST_FIXTURE.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            fixture.len(),
+            INSTALL_MANIFEST_FIXTURE.len(),
+            "a name twice"
+        );
+        assert_eq!(
+            fixture, recorded,
+            "INSTALL_MANIFEST_FIXTURE must hold a binary for every file name of RECORDED_NAMES"
+        );
+    }
+
     #[test]
     fn install_manifest_seeds_reach_the_hash_comparison() {
         use crate::install_manifest::{sha256_file, UNKNOWN_NAME};
         let dir = tempfile::tempdir().unwrap();
         write_install_manifest_fixture(dir.path()).unwrap();
         let sha = |n: &str| sha256_file(&dir.path().join(n)).unwrap();
-        let (agent, wd, admin) = (
+        let (agent, wd, admin, scan) = (
             sha("northnarrow-agent"),
             sha("northnarrow-watchdog"),
             sha("nn-admin"),
+            sha("northnarrow-scan"),
         );
         let ebpf = INSTALL_MANIFEST_FIXTURE_EBPF_SHA;
+        // what install.sh records since lab PR 223 (one-mismatch.json is a
+        // manifest without the scanner, as one written before it)
         let verified = fixture_manifest(&[
             ("ebpf_object", ebpf),
             ("nn-admin", &admin),
             ("northnarrow-agent", &agent),
+            ("northnarrow-scan", &scan),
             ("northnarrow-watchdog", &wd),
         ]);
         let zeros = "0".repeat(64);
@@ -346,7 +380,7 @@ mod tests {
         let run = |json: &[u8]| install_manifest_check_in_dir(json, dir.path(), ebpf).1;
         assert!(matches!(
             run(verified.as_bytes()),
-            IntegrityOutcome::Verified { checked: 4, .. }
+            IntegrityOutcome::Verified { checked: 5, .. }
         ));
         assert!(matches!(
             run(mismatch.as_bytes()),
