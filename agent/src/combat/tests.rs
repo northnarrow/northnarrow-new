@@ -464,6 +464,95 @@ fn an_offender_pid_reused_inside_the_tree_is_attributed_afresh() {
     assert_eq!(l.offenders(), vec![700, 701]);
 }
 
+/// The mock's actions with production's process identity: `identify` and
+/// `same_process` are the trait's own (a pidfd and the start the event
+/// reported, `ProcRef::matches_event`), not [`mock_same_process`].
+struct RealIdentity(MockActuator);
+
+impl CombatActuator for RealIdentity {
+    fn soft_egress_block(&self, target: &ProcRef) -> SoftBlock {
+        self.0.soft_egress_block(target)
+    }
+    fn soft_egress_clear(&self, target: &ProcRef) {
+        self.0.rec.push(format!("soft_clear:{}", target.pid()));
+    }
+    fn neutralize(&self, offenders: &[Arc<ProcRef>]) -> NeutralizeReport {
+        self.0.neutralize(offenders)
+    }
+    fn isolate(&self) -> IsolateOutcome {
+        self.0.isolate()
+    }
+    fn is_dry_run(&self) -> bool {
+        false
+    }
+}
+
+/// Lab PR 238 (lot 122): the exec sensor names, as `parent_start_ns`, the
+/// start of the parent PROCESS — its thread-group leader's, the start its
+/// own exec reported — also for a child forked by a thread other than its
+/// main one; it named the forking thread's start before. With the process
+/// identity of production, an offender that has exited is the parent of a
+/// child whose event names the offender's start; the start of one of its
+/// threads, begun after the attribution, names no captured process (the
+/// residual of lab PR 120: such a child escaped the lateral spread).
+#[test]
+fn a_child_forked_by_an_exited_offenders_thread_is_attributed_by_its_start() {
+    let rec = Recorder::new();
+    let l = CombatLadder::new(
+        Box::new(RealIdentity(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: Vec::new(),
+            isolate_plan: Default::default(),
+        })),
+        Box::new(MockEvidence { rec: rec.clone() }),
+        Box::new(NoProtectedProcs),
+        LadderConfig {
+            investigate_window: Duration::from_secs(300),
+            ..LadderConfig::default()
+        },
+    );
+    // A real process, attributed by the event of its exec: its start, and
+    // the event's time just after it.
+    let mut offender = std::process::Command::new("sleep")
+        .arg("30")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = offender.id();
+    let start = crate::response::proc_ref::proc_start_ns(pid).expect("its start");
+    let t0 = Instant::now();
+    l.engage_with(Some(pid), start, start + 1_000_000, None, t0);
+    assert_eq!(l.offenders(), vec![pid]);
+    // It exits before its children's exec records are read.
+    offender.kill().unwrap();
+    offender.wait().unwrap();
+
+    // The forking thread's own start, five seconds after the process's
+    // (what the sensor sent before): no captured process — not its child.
+    let thread_start = start + 5_000_000_000;
+    l.observe(
+        &spawn_started(999_999_001, thread_start + 1, pid, thread_start),
+        t0 + Duration::from_secs(1),
+    );
+    assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
+    assert_eq!(l.offenders(), vec![pid]);
+    // The leader's start (what it sends now): the offender's child.
+    l.observe(
+        &spawn_started(999_999_002, thread_start + 2, pid, start),
+        t0 + Duration::from_secs(2),
+    );
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    assert_eq!(l.offenders(), vec![pid, 999_999_002]);
+    assert!(
+        rec.log()
+            .iter()
+            .any(|e| *e == format!("neutralize:[{pid}, 999999002]")),
+        "{:?}",
+        rec.log()
+    );
+}
+
 // ── Idempotent engage: hook + process_event both call it ──
 #[test]
 fn engage_is_idempotent_and_merges_offenders() {

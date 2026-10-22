@@ -384,6 +384,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- An exec record named, as its parent's start (`parent_start_ns`, the
+  PID-reuse key of the lineage), the start of the THREAD that forked it
+  (lab PR 238, the follow-up of lab PR 120 known as lot 122): the eBPF
+  exec sensor read `real_parent->start_time`, and `real_parent` is the
+  forking thread. For a child of a thread other than its parent's main
+  one, that key matched no record of the parent (whose exec reports its
+  thread-group leader's start); once the parent had exited, the COMBAT
+  ladder no longer took such a child of an offender for its child. It now
+  reads `real_parent->group_leader->start_time`, the parent process's
+  start; unread, the field stays 0 ("unknown"), never a thread's start.
+  New BTF offset `TASK_STRUCT_GROUP_LEADER_OFFSET` (required, resolved at
+  boot like the others): slot 100; the enum, tracepoint and hook-argument
+  slots move up by one (117 slots).
 - Rule shadowing (lab PR 236): NN-L-FIM-023 (systemd timer) was never
   reached behind NN-L-FIM-009 — both now match a `.timer`; a new
   `authorized_keys` under `/home` was NN-L-FIM-002's record and

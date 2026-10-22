@@ -47,7 +47,11 @@ pub enum Event {
         #[serde(default)]
         parent_comm: String,
         /// Tappa 10.6: parent `start_time` — PID-reuse-safe ancestry key
-        /// for the correlation engine (0 until D2 / older records).
+        /// for the correlation engine (0 until D2 / older records). The
+        /// parent process's: its thread-group leader's, the start its own
+        /// exec reported as `start_ns` (lab PR 238; a child forked by a
+        /// thread other than the parent's main one named the thread's
+        /// start before).
         #[serde(default)]
         parent_start_ns: u64,
         /// External audit POS-003: the process's own `start_time` (its

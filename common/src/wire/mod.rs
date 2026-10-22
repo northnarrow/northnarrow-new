@@ -99,7 +99,10 @@ pub struct ProcessSpawnRaw {
     // ── Tappa 10.6 APPENDED (never reorder the above) ──
     /// `real_parent->comm`, NUL-terminated (D2).
     pub parent_comm: [u8; TASK_COMM_LEN],
-    /// `real_parent->start_time` — PID-reuse-safe ancestry key (D2).
+    /// `real_parent->group_leader->start_time` — PID-reuse-safe ancestry
+    /// key (D2): the parent process's start, the `start_ns` its own exec
+    /// reported, also when a thread other than its main one forked (lab
+    /// PR 238; `real_parent->start_time`, the forking thread's, before).
     pub parent_start_ns: u64,
     /// NUL-separated argv blob from `[mm->arg_start, mm->arg_end)` (D2).
     pub argv: [u8; ARGV_LEN],
