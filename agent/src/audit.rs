@@ -964,7 +964,7 @@ fn build_signed_entry<K: ChainSigner>(
 ///
 /// External audit EVD-023 (NN-AUD-427, lab PR 204): an entry that still
 /// carries `entry_hash` or `agent_sig` is an error in every build.
-pub(crate) fn compute_entry_hash(entry: &AuditEntry) -> Result<[u8; 32]> {
+pub fn compute_entry_hash(entry: &AuditEntry) -> Result<[u8; 32]> {
     crate::chain_anchor::check_unsealed(&entry.entry_hash, &entry.agent_sig)?;
     let body =
         serde_json::to_vec(entry).map_err(|e| anyhow!("serialising audit pre-image: {e}"))?;
@@ -982,7 +982,7 @@ pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
     })
 }
 
-pub(crate) fn format_ts(t: DateTime<Utc>) -> String {
+pub fn format_ts(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 

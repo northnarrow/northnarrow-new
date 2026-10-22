@@ -41,13 +41,13 @@ use tracing::warn;
 use crate::chain_host::ChainHost;
 
 /// Bytes scanned at most in one file (its tail).
-pub(crate) const MAX_SCAN_BYTES_PER_FILE: u64 = 64 * 1024 * 1024;
+pub const MAX_SCAN_BYTES_PER_FILE: u64 = 64 * 1024 * 1024;
 
 /// Bytes scanned at most by one read, over all files.
-pub(crate) const MAX_SCAN_BYTES_TOTAL: u64 = 128 * 1024 * 1024;
+pub const MAX_SCAN_BYTES_TOTAL: u64 = 128 * 1024 * 1024;
 
 /// What one tail read keeps.
-pub(crate) struct TailQuery<'a> {
+pub struct TailQuery<'a> {
     /// Lower bound on each row's `ts`, as an ISO-8601 prefix compared
     /// lexicographically (the chain logs write a fixed-width UTC form). A
     /// row without a `ts` field is kept.
@@ -62,7 +62,7 @@ pub(crate) struct TailQuery<'a> {
 
 /// The rows a tail read returns.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ChainTail {
+pub struct ChainTail {
     /// Rows, newest first, one per line.
     pub jsonl: String,
     pub count: u32,
@@ -72,7 +72,7 @@ pub(crate) struct ChainTail {
 
 /// The newest rows of the chain log whose active file is `active`, newest
 /// first, within `query`'s budgets. See the module doc.
-pub(crate) fn read_chain_tail<H: ChainHost>(active: &Path, query: &TailQuery<'_>) -> ChainTail {
+pub fn read_chain_tail<H: ChainHost>(active: &Path, query: &TailQuery<'_>) -> ChainTail {
     read_chain_tail_bounded::<H>(active, query, MAX_SCAN_BYTES_PER_FILE, MAX_SCAN_BYTES_TOTAL)
 }
 
@@ -256,7 +256,7 @@ fn scan_file(
 
 /// The value of the first `"ts":"…"` field of a raw line (the chain logs
 /// write `ts` first).
-pub(crate) fn ts_field(line: &str) -> Option<&str> {
+pub fn ts_field(line: &str) -> Option<&str> {
     let key = "\"ts\":\"";
     let start = line.find(key)? + key.len();
     let end = line[start..].find('"')?;

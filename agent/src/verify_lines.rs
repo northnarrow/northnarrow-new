@@ -29,7 +29,7 @@ pub const MAX_VERIFY_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// What a line holds.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum LineBody<'a> {
+pub enum LineBody<'a> {
     /// The line's bytes, without its newline.
     Bytes(&'a [u8]),
     /// Longer than the cap: `len` bytes (newline excluded), consumed, not
@@ -39,7 +39,7 @@ pub(crate) enum LineBody<'a> {
 
 /// One line of a file.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Line<'a> {
+pub struct Line<'a> {
     /// 1-based, empty lines counted.
     pub number: u64,
     /// Offset past the line and its newline.
@@ -68,7 +68,7 @@ impl Line<'_> {
 }
 
 /// Bounded line reader (see the module doc).
-pub(crate) struct VerifyLines<R> {
+pub struct VerifyLines<R> {
     reader: R,
     buf: Vec<u8>,
     max: usize,
@@ -81,7 +81,7 @@ impl<R: BufRead> VerifyLines<R> {
         Self::with_max(reader, MAX_VERIFY_LINE_BYTES)
     }
 
-    pub(crate) fn with_max(reader: R, max: usize) -> Self {
+    pub fn with_max(reader: R, max: usize) -> Self {
         Self {
             reader,
             buf: Vec::new(),

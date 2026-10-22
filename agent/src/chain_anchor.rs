@@ -1276,19 +1276,23 @@ pub fn numbering_started_draft(first: &HeadsSnapshot, heads_file: &Path) -> Audi
 /// `s = 0`) that the lax `verify` accepts under that key for every
 /// message. `verify_strict` refuses both; a signature the agent made
 /// passes either.
-#[cfg(test)]
-pub(crate) mod small_order {
+///
+/// R04a (lab PR 241): compiled in every build, hidden from the docs, for
+/// the verifiers' tests on both sides of the crate boundary (the canary
+/// chains and the FIM baseline keep theirs in the agent).
+#[doc(hidden)]
+pub mod small_order {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use ed25519_dalek::{Signature, VerifyingKey};
 
-    pub(crate) fn key() -> VerifyingKey {
+    pub fn key() -> VerifyingKey {
         let mut b = [0u8; 32];
         b[0] = 1;
         VerifyingKey::from_bytes(&b).expect("the identity point decompresses")
     }
 
-    pub(crate) fn signature() -> Signature {
+    pub fn signature() -> Signature {
         let mut b = [0u8; 64];
         b[0] = 1;
         Signature::from_bytes(&b)
@@ -1296,7 +1300,7 @@ pub(crate) mod small_order {
 
     /// The premise of each test: the lax check accepts the pair over
     /// `msg`, the strict one does not.
-    pub(crate) fn assert_premise(msg: &[u8]) {
+    pub fn assert_premise(msg: &[u8]) {
         use ed25519_dalek::Verifier as _;
         assert!(key().verify(msg, &signature()).is_ok(), "lax verify");
         assert!(key().verify_strict(msg, &signature()).is_err());
@@ -1304,7 +1308,7 @@ pub(crate) mod small_order {
 
     /// `text` with every `agent_sig` value replaced by the small-order
     /// signature; nothing else changed (the hashes still recompute).
-    pub(crate) fn forge(text: &str) -> String {
+    pub fn forge(text: &str) -> String {
         const MARK: &str = "\"agent_sig\":\"";
         let sig = B64.encode(signature().to_bytes());
         let mut out = String::with_capacity(text.len());

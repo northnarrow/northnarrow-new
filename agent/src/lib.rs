@@ -35,7 +35,7 @@ pub mod chain_anchor;
 pub mod chain_host;
 /// The Linux host of the signed chains (R04a, lab PR 241).
 pub mod chain_host_linux;
-pub(crate) mod chain_tail;
+pub mod chain_tail;
 pub mod chainlog;
 /// The agent's chains: paths, checks, anchoring tasks (from `chain_anchor`,
 /// R04a, lab PR 241).
