@@ -8,8 +8,10 @@ where you do that, rule by rule, and where you tone a noisy rule down or
 exempt one known program from it. Design:
 https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/MULTI_MATCH_AND_RULE_POLICY.md
 
-Without a policy nothing changes: every rule keeps its built-in response and
-every held kill stays held.
+Without a policy nothing changes in what the agent *does*: every held kill
+stays held, and no event gets a stronger response than the agent gave it
+before lab PR 236 (the legacy ceiling, §1). What changes is what it
+*records*: every rule that matches an event is named.
 
 ## 1. What a decision is
 
@@ -20,6 +22,20 @@ action, then the most specific rule), and runs, for each process concerned,
 the strongest response the matched rules' modes allow. A rule set to `audit`
 or exempt for the actor never raises that response.
 
+**The legacy ceiling.** Before lab PR 236 only the first matching rule
+answered an event, so some responses never ran: a new `authorized_keys`
+under `/home` was NN-L-FIM-002's record, never NN-L-FIM-004's kill. To keep
+an administrator's `ssh-copy-id` from being killed the day the agent is
+upgraded, a rule without `enforce` never runs more than the first-match
+engine would have run on that event (on the same process). Such a match is
+recorded with `held: "legacy_ceiling"`, the action it asked for in
+`held_action`, and its reasoning names the directive that lifts it:
+`enforce <rule>`. To turn FIM-004's kill on:
+
+```
+enforce NN-L-FIM-004
+```
+
 ## 2. Writing a policy
 
 `/etc/northnarrow/rule-policy.local`, one directive per line, `#` comments.
@@ -28,7 +44,7 @@ https://github.com/northnarrow/northnarrow-new/blob/main/docs/detection/RULE_CAT
 
 | directive | effect |
 |---|---|
-| `enforce <rule>` | the rule's own response, **its held kill included** |
+| `enforce <rule>` | the rule's own response, **its held kill included**, above the legacy ceiling |
 | `alert <rule>` | recorded as an alert (counted for severity), no response |
 | `audit <rule>` | recorded only (no alert line, not counted) |
 | `off <rule>` | not recorded, no response (the rule still runs, so chains and windows keep their state) |
@@ -109,7 +125,8 @@ nothing; the records say `suppressed (detect-only)`.
   (a new signature over the older content; the rollback floor refuses an
   older *signature*, not older content).
 - To the built-in defaults: `nn-admin policy set` with a file that has only
-  comments.
+  comments — applied at once: every held kill held again, the legacy
+  ceiling on every rule.
 - `nn-admin policy show` exits 1 when a present file would not be loaded.
 
 ## 6. Reading the records
@@ -118,6 +135,7 @@ nothing; the records say `suppressed (detect-only)`.
 primary rule; `matches` (absent on a record of one rule under the built-in
 defaults) lists every rule with its `action`, `severity`, `mode`
 (`builtin`, `enforce`, `alert`, `audit`, `exempt`), `pid`, ATT&CK ids, the
-switch still holding it (`held`) and the exemption that covered the actor
-(`exempt`). A held kill reads `Log` with its reasoning ending in
+switch or the legacy ceiling still holding it (`held`: the switch's text or
+`legacy_ceiling`, with `held_action`) and the exemption that covered the
+actor (`exempt`). A held kill reads `Log` with its reasoning ending in
 `[held back: …]`; an enforced one names the policy.

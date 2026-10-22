@@ -77,9 +77,12 @@ one line per item of the stream, in order (`seq`), with its `decision`:
   mode allows, `severity` the highest of the counted matches, the reasoning
   ends with `[also matched: …]`, and `matches` lists every match in engine
   order (`rule`, `action`, `severity`, `mode` — builtin, enforce, alert,
-  audit, exempt — `pid`, `mitre`, `held` when a switch still holds its
-  response, `exempt` with the exemption), with `responses`: what the
-  executor would run, per target;
+  audit, exempt — `pid`, `mitre`, `held` when a switch or the legacy
+  ceiling still holds its response — the switch's text or
+  `legacy_ceiling` — with `held_action`, `exempt` with the exemption), with
+  `responses`: what the executor would run, per target. Without `enforce`,
+  a match never runs more than the first-match engine ran on the event (the
+  legacy ceiling, `docs/design/MULTI_MATCH_AND_RULE_POLICY.md` §2.1);
 - for a connect sweep (`tcp_sweep` item), `{"sweep": N, "decisions": [...]}`:
   the expanded events that gave a verdict, by index (`at`);
 - for an exec-policy report, the list of its records, each with its
@@ -111,7 +114,8 @@ NN-L-CHAIN-002's alert stays held on the same flow (both listed).
 | `epg-postcondition` | a credential gained with no mechanism (detect), namespaces left with no mechanism (enforce) | NN-L-EPG-001/002 records (lab PR 219) |
 | `execpol-records` | memfd exec denied, `/dev/shm` exec in audit, `LD_PRELOAD` from `/tmp`, Looney Tunables, history off, a `/tmp` library mapped | NN-L-EXECPOL-001, NN-L-EXECENV-001..003 (lab PR 226) |
 | `shadow-fim009-fim023-timer` | a `.timer` dropped in `/etc/systemd/system` by a `/tmp` program | NN-L-FIM-009 and NN-L-FIM-023 on one record (FIM-023 was never reached before lab PR 236) |
-| `shadow-fim002-fim004-authorized-keys` | a new `~/.ssh/authorized_keys` under `/home` | NN-L-FIM-004's kill (High, primary) with NN-L-FIM-002's record; it was FIM-002's Log alone |
+| `shadow-fim002-fim004-authorized-keys` | a new `~/.ssh/authorized_keys` under `/home` | NN-L-FIM-004 (High) primary with NN-L-FIM-002's record (it was FIM-002's Log alone); FIM-004's kill held by the legacy ceiling |
+| `policy-fim004-enforced` | the same under `enforce NN-L-FIM-004` | the ceiling lifted: FIM-004's kill runs (mode enforce) |
 | `shadow-net007-net009-internal-volume` | 200 MiB over TCP to an internal host, then 101 UDP datagrams of 1 MiB | NN-L-NET-009 (High) primary over NN-L-NET-007; its UDP sum crosses 100 MiB on the 101st datagram |
 | `shadow-chain007-late-exec` | a `/tmp` program's key read and connect, its exec record processed last (lab PR 235) | NN-L-CHAIN-007 with R001 and R009 on the late exec, one kill of the tree |
 | `policy-imp001-enforced` | `imp001-in-place` under the test policy `enforce NN-L-IMP-001` | the ransomware kill given back (mode enforce); no other held kill moves |

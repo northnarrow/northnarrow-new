@@ -201,7 +201,9 @@ impl RuleEngine {
 
     /// Lab PR 236 (multi-match): every rule judges the event, and the
     /// decision is computed from all the matches ([`combine::combine`])
-    /// after the per-rule policy ([`combine::apply_policy`]); every rule's
+    /// after the per-rule policy ([`combine::apply_policy`]), under the
+    /// legacy ceiling — without `enforce`, no response runs that the
+    /// first-match engine would not have run on the event; every rule's
     /// state (chains, windows, the correlation store) sees the event.
     ///
     /// Lab PR 224 (CM-02): a flow is judged in each of its phases (the
@@ -241,11 +243,15 @@ impl RuleEngine {
                 let uid = (p.pid == v.event_pid).then_some(p.uid);
                 rule_policy::exempt(policy.exemptions(rule.id()), v.event_pid, uid, facts)
             };
-            if let Some(m) =
-                combine::apply_policy(index, rule.id(), rule.attack(), v, held, &policy, exempt)
-            {
-                matches.push(m);
-            }
+            matches.push(combine::apply_policy(
+                index,
+                rule.id(),
+                rule.attack(),
+                v,
+                held,
+                &policy,
+                exempt,
+            ));
         }
         let mut decision = combine::combine(matches);
         match (flow, key) {

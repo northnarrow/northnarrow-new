@@ -1,5 +1,5 @@
 {
- "about": "Lab PR 236 (multi-match): a new ~/.ssh/authorized_keys created under /home by a user's program. NN-L-FIM-002 (a file created in a watched user-writable directory: Medium, recorded) used to win first-match, so the authorized_keys backdoor (NN-L-FIM-004, High, kill) was a Log. Now both match; FIM-004 is primary (High) and its kill runs.",
+ "about": "Lab PR 236 (multi-match): a new ~/.ssh/authorized_keys created under /home by a user's program. NN-L-FIM-002 (a file created in a watched user-writable directory: Medium, recorded) used to win first-match and NN-L-FIM-004 (High, kill) was never recorded. Now both match and FIM-004 is primary (High); its kill is held by the legacy ceiling (the first-match engine ran only FIM-002's record: an administrator's ssh-copy-id is not killed) until a signed policy says `enforce NN-L-FIM-004` (policy-fim004-enforced).",
  "fires": [
   "NN-L-FIM-002_NewSuidBinary",
   "NN-L-FIM-004_AuthorizedKeysModified"

@@ -1503,19 +1503,21 @@ fn shadow_fim023_fires_with_fim009_on_a_timer() {
 }
 
 /// FIM-002 (a Log) used to win over FIM-004 (a kill) on a new
-/// authorized_keys under /home.
+/// authorized_keys under /home. Both are now recorded, FIM-004 primary
+/// (High); its kill stays held by the legacy ceiling (an administrator's
+/// ssh-copy-id is not killed) until `enforce NN-L-FIM-004` lifts it.
 #[test]
-fn shadow_fim004_kills_a_new_authorized_keys_under_home() {
-    let p = prod("");
-    let d = p
-        .decide(&fim_event(
+fn shadow_fim004_is_recorded_and_its_kill_waits_for_enforce() {
+    let keys = || {
+        fim_event(
             "/home/u/.ssh/authorized_keys",
             common::wire::FimOp::Created,
             7002,
             1000,
             10 * SEC,
-        ))
-        .expect("a decision");
+        )
+    };
+    let d = prod("").decide(&keys()).expect("a decision");
     assert_eq!(
         ids(&d),
         [
@@ -1524,8 +1526,71 @@ fn shadow_fim004_kills_a_new_authorized_keys_under_home() {
         ]
     );
     assert_eq!(d.verdict.rule_id, "NN-L-FIM-004_AuthorizedKeysModified");
-    assert_eq!(d.verdict.action, ResponseAction::KillProcess);
     assert_eq!(d.verdict.severity, Severity::High);
+    assert_eq!(d.verdict.action, ResponseAction::Log, "the legacy ceiling");
+    assert!(d.responses.is_empty());
+    let k = d.primary();
+    assert_eq!(k.held, Some(super::combine::LEGACY_CEILING));
+    assert_eq!(k.held_action, Some(ResponseAction::KillProcess));
+    assert!(d
+        .verdict
+        .reasoning
+        .contains("`enforce NN-L-FIM-004` in the signed per-rule policy lifts it"));
+    let d = prod("enforce NN-L-FIM-004\n")
+        .decide(&keys())
+        .expect("a decision");
+    assert_eq!(d.verdict.action, ResponseAction::KillProcess);
+    assert_eq!(
+        d.responses[0].rule_id,
+        "NN-L-FIM-004_AuthorizedKeysModified"
+    );
+    assert_eq!(d.primary().held, None);
+}
+
+/// The legacy ceiling never lowers what the first-match engine ran: on a
+/// `/tmp` exec by root, R009 (the first match) kills the tree as before,
+/// R001's tree kill of the same process runs within it.
+#[test]
+fn the_ceiling_keeps_the_legacy_winners_kill() {
+    let d = prod("")
+        .decide(&spawn_as(0, "payload", "/tmp/payload"))
+        .expect("a decision");
+    assert_eq!(d.verdict.action, ResponseAction::KillProcessTree);
+    assert_eq!(d.responses.len(), 1);
+    assert!(d.matches.iter().all(|m| m.held.is_none()), "{:?}", ids(&d));
+}
+
+/// Detect-only still wins over a lifted ceiling: the enforced FIM-004 kill
+/// is a `WouldExecute` in a detect-only executor.
+#[test]
+fn detect_only_wins_over_a_lifted_ceiling() {
+    let d = prod("enforce NN-L-FIM-004\n")
+        .decide(&fim_event(
+            "/home/u/.ssh/authorized_keys",
+            common::wire::FimOp::Created,
+            7003,
+            1000,
+            10 * SEC,
+        ))
+        .expect("a decision");
+    let exec = crate::response::Executor::with_config(crate::response::ExecutorConfig {
+        dry_run: true,
+        ..crate::response::ExecutorConfig::default()
+    });
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let r = &d.responses[0];
+    assert_eq!(r.action, ResponseAction::KillProcess);
+    let report = exec.execute_for_started(r.action.clone(), child.id(), 0, 0, &r.filename);
+    assert_eq!(
+        report.primary,
+        crate::response::ExecutionOutcome::WouldExecute { pid: child.id() }
+    );
+    assert!(child.try_wait().unwrap().is_none(), "still running");
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 /// NET-007 (Medium) used to win over NET-009 (High): a large internal TCP

@@ -200,7 +200,12 @@ pub fn decision_line(d: Option<&Decision>) -> Value {
         return Value::Null;
     };
     let mut line = verdict_json(&d.verdict, &d.attack());
-    if d.matches.len() > 1 || d.primary().applied != super::combine::Applied::Builtin {
+    if d.matches.len() > 1
+        || d.primary().applied != super::combine::Applied::Builtin
+        || d.primary()
+            .held
+            .is_some_and(|h| h == super::combine::LEGACY_CEILING)
+    {
         line["matches"] = Value::Array(
             d.matches
                 .iter()
@@ -215,6 +220,9 @@ pub fn decision_line(d: Option<&Decision>) -> Value {
                     });
                     if let Some(h) = m.held {
                         e["held"] = Value::String(h.to_string());
+                    }
+                    if let Some(a) = &m.held_action {
+                        e["held_action"] = Value::String(format!("{a:?}"));
                     }
                     if let super::combine::Applied::Exempt(why) = &m.applied {
                         e["exempt"] = Value::String(why.clone());

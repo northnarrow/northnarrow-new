@@ -218,6 +218,10 @@ pub fn show(p: &RulePolicy) -> String {
             "off (built-in default)"
         }
     ));
+    out.push_str(
+        "legacy ceiling: a rule not set to enforce never runs more than the first-match \
+         engine ran on the same event (lifted per rule by `enforce <rule>`)\n",
+    );
     out.push_str("built-in held responses (given back by `enforce <rule>` for that rule):\n");
     for s in super::response_policy::ALL {
         out.push_str(&format!("  held: {}\n", s.held));

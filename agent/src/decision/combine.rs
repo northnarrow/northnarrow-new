@@ -5,7 +5,13 @@
 //! per-rule policy's mode ([`apply_policy`]), to [`combine`]:
 //!
 //! - the action is the strongest among the matches whose mode allows one
-//!   (`builtin`, `enforce`; [`action_rank`]);
+//!   (`builtin`, `enforce`; [`action_rank`]) — under the **legacy ceiling**:
+//!   a `builtin` match never runs more than the first-match engine ran on
+//!   the same event ([`legacy_first_match`]: the first rule in registration
+//!   order that fired, with the held-kill switches applied), on its target;
+//!   only `enforce` for the rule supplying a stronger action lifts it
+//!   (decision of 22/10/2026: multi-match never unmasks a destructive
+//!   response by default);
 //! - the responses are, per target (a process, or a file for
 //!   `StripFileCapability`), the strongest action aimed at it;
 //! - the severity is the maximum over the counted matches (not `audit`, not
@@ -39,6 +45,9 @@ pub fn action_rank(a: &ResponseAction) -> u8 {
     }
 }
 
+/// The record's `held` of a match whose action the legacy ceiling held.
+pub const LEGACY_CEILING: &str = "legacy_ceiling";
+
 /// What the per-rule policy made of one match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
@@ -52,6 +61,10 @@ pub enum Applied {
     Audit,
     /// An exemption of the policy covers the actor: recorded only.
     Exempt(String),
+    /// `off`: dropped from the decision. Kept until [`combine`] has read it
+    /// for the legacy first match (an `off` rule never unmasks another's
+    /// response), then removed.
+    Off,
 }
 
 impl Applied {
@@ -63,6 +76,7 @@ impl Applied {
             Applied::Alert => "alert",
             Applied::Audit => "audit",
             Applied::Exempt(_) => "exempt",
+            Applied::Off => "off",
         }
     }
 }
@@ -76,14 +90,25 @@ pub struct RuleMatch {
     pub attack: &'static [AttackRef],
     pub verdict: Verdict,
     pub applied: Applied,
-    /// The switch still holding this match's response (built in).
+    /// What still holds this match's response: a switch (its text, built
+    /// in) or the legacy ceiling ([`LEGACY_CEILING`]).
     pub held: Option<&'static str>,
+    /// The action held back (the rule's own), when [`Self::held`] is set.
+    pub held_action: Option<ResponseAction>,
+    /// The action the rule's verdict carried with today's switches, before
+    /// the policy: what the first-match engine would have run.
+    pub builtin_action: ResponseAction,
+    /// A switch held the rule's response (before the policy).
+    pub switch_held: bool,
 }
 
 impl RuleMatch {
     /// Counted for the severity and the primary rule.
     pub fn counted(&self) -> bool {
-        !matches!(self.applied, Applied::Audit | Applied::Exempt(_))
+        !matches!(
+            self.applied,
+            Applied::Audit | Applied::Exempt(_) | Applied::Off
+        )
     }
 
     /// Its response runs.
@@ -146,8 +171,8 @@ impl Decision {
     }
 }
 
-/// The match of rule `rule_id` (index `index`) as the policy makes it:
-/// `None` when the rule is `off`. `held` is what the rule's switch held
+/// The match of rule `rule_id` (index `index`) as the policy makes it
+/// (an `off` rule's is [`Applied::Off`]). `held` is what the rule's switch held
 /// ([`super::response_policy::take_held`]); `exempt` says which exemption,
 /// if any, covers the actor (read only when the rule has exemptions).
 pub fn apply_policy(
@@ -158,14 +183,17 @@ pub fn apply_policy(
     held: Option<Held>,
     policy: &RulePolicy,
     exempt: impl FnOnce(&Verdict) -> Option<String>,
-) -> Option<RuleMatch> {
+) -> RuleMatch {
     let mode = policy.mode(rule_id);
-    if mode == Some(Mode::Off) {
-        return None;
-    }
+    let builtin_action = v.action.clone();
+    let switch_held = held.is_some();
     // Named only while the switch still holds the response (built in).
     let mut held_switch = held.as_ref().map(|h| h.switch);
-    let applied = if let Some(e) = (!policy.exemptions(rule_id).is_empty())
+    let held_action = held.as_ref().map(|h| h.action.clone());
+    let applied = if mode == Some(Mode::Off) {
+        held_switch = None;
+        Applied::Off
+    } else if let Some(e) = (!policy.exemptions(rule_id).is_empty())
         .then(|| exempt(&v))
         .flatten()
     {
@@ -210,17 +238,101 @@ pub fn apply_policy(
                 v.action = ResponseAction::Log;
                 Applied::Audit
             }
-            Some(Mode::Off) => unreachable!("returned above"),
+            Some(Mode::Off) => unreachable!("handled above"),
         }
     };
-    Some(RuleMatch {
+    RuleMatch {
         index,
         rule_id,
         attack,
         verdict: v,
         applied,
+        held_action: held_switch.and(held_action),
         held: held_switch,
-    })
+        builtin_action,
+        switch_held,
+    }
+}
+
+/// The match the first-match engine (before lab PR 236) would have
+/// answered the event with, among `matches` sorted by registration index,
+/// and the action it ran: the first rule that fired, with the held-kill
+/// switches applied — a held verdict let a later rule's response through,
+/// and outranked a later record (`response_policy` before lab PR 236).
+/// Computed on the rules' own verdicts before the policy, `off` rules
+/// included. `None` when there is no match.
+pub fn legacy_first_match(matches: &[RuleMatch]) -> Option<(usize, ResponseAction)> {
+    let mut first_held = None;
+    for (pos, m) in matches.iter().enumerate() {
+        if m.switch_held {
+            first_held.get_or_insert(pos);
+            continue;
+        }
+        if let Some(h) = first_held {
+            if m.builtin_action == ResponseAction::Log {
+                return Some((h, ResponseAction::Log));
+            }
+        }
+        return Some((pos, m.builtin_action.clone()));
+    }
+    first_held.map(|h| (h, ResponseAction::Log))
+}
+
+/// The legacy ceiling on `matches` (sorted): a `builtin` match whose
+/// response the first-match engine would not have run on this event —
+/// stronger than its action, or aimed at another target — is held
+/// (`Log`, [`LEGACY_CEILING`], the action in `held_action`, its reasoning
+/// saying so). `enforce` matches are not capped.
+fn apply_legacy_ceiling(matches: &mut [RuleMatch]) {
+    let Some((pos, action)) = legacy_first_match(matches) else {
+        return;
+    };
+    let winner = &matches[pos];
+    let (rule, pid, file) = (
+        winner.rule_id,
+        winner.verdict.event_pid,
+        winner.verdict.event_filename.clone(),
+    );
+    let ceiling_target = target_for(&action, pid, &file);
+    for m in matches.iter_mut() {
+        if m.applied != Applied::Builtin || m.verdict.action == ResponseAction::Log {
+            continue;
+        }
+        let within = action != ResponseAction::Log
+            && target(&m.verdict) == ceiling_target
+            && action_rank(&m.verdict.action) <= action_rank(&action);
+        if within {
+            continue;
+        }
+        let ran = if action == ResponseAction::Log {
+            format!("only a record ({rule})")
+        } else {
+            format!("{action:?} of pid {pid} ({rule})")
+        };
+        m.verdict.reasoning = format!(
+            "{} [legacy ceiling: {:?} held — the first-match engine ran {ran} on this event; \
+             `enforce {}` in the signed per-rule policy lifts it]",
+            m.verdict.reasoning,
+            m.verdict.action,
+            super::rule_policy::short_id(m.rule_id)
+        );
+        m.held_action = Some(std::mem::replace(
+            &mut m.verdict.action,
+            ResponseAction::Log,
+        ));
+        m.held = Some(LEGACY_CEILING);
+    }
+}
+
+/// The action a match ranks by for the primary rule: its own, also when
+/// the legacy ceiling held it (the primary may be the strongest rule, its
+/// action executed at the ceiling); a switch's hold ranks as `Log`, as it
+/// did before lab PR 236.
+fn ranked_action(m: &RuleMatch) -> &ResponseAction {
+    match (m.held, &m.held_action) {
+        (Some(LEGACY_CEILING), Some(a)) => a,
+        _ => &m.verdict.action,
+    }
 }
 
 /// The primary order: higher severity, then stronger action, then the
@@ -228,7 +340,7 @@ pub fn apply_policy(
 fn primary_order(a: &RuleMatch, b: &RuleMatch) -> std::cmp::Ordering {
     (b.verdict.severity as u8)
         .cmp(&(a.verdict.severity as u8))
-        .then(action_rank(&b.verdict.action).cmp(&action_rank(&a.verdict.action)))
+        .then(action_rank(ranked_action(b)).cmp(&action_rank(ranked_action(a))))
         .then(a.index.cmp(&b.index))
 }
 
@@ -241,19 +353,26 @@ enum Target<'a> {
 }
 
 fn target(v: &Verdict) -> Target<'_> {
-    match v.action {
-        ResponseAction::StripFileCapability => Target::File(v.event_pid, &v.event_filename),
-        _ => Target::Process(v.event_pid),
+    target_for(&v.action, v.event_pid, &v.event_filename)
+}
+
+fn target_for<'a>(action: &ResponseAction, pid: u32, file: &'a str) -> Target<'a> {
+    match action {
+        ResponseAction::StripFileCapability => Target::File(pid, file),
+        _ => Target::Process(pid),
     }
 }
 
 /// The decision from `matches` (any order; sorted here by registration
-/// index). `None` when there is none.
+/// index), under the legacy ceiling; `off` matches are read for it, then
+/// dropped. `None` when no match is left.
 pub fn combine(mut matches: Vec<RuleMatch>) -> Option<Decision> {
+    matches.sort_by_key(|m| m.index);
+    apply_legacy_ceiling(&mut matches);
+    matches.retain(|m| m.applied != Applied::Off);
     if matches.is_empty() {
         return None;
     }
-    matches.sort_by_key(|m| m.index);
     let any_counted = matches.iter().any(RuleMatch::counted);
     let pool = |m: &&RuleMatch| !any_counted || m.counted();
     let primary = matches
@@ -312,9 +431,13 @@ pub fn combine(mut matches: Vec<RuleMatch>) -> Option<Decision> {
                     m.rule_id,
                     m.verdict.action,
                     m.verdict.severity,
-                    match m.applied {
-                        Applied::Builtin => String::new(),
-                        ref a => format!(", {}", a.name()),
+                    match (&m.applied, m.held) {
+                        (Applied::Builtin, Some(LEGACY_CEILING)) => format!(
+                            ", legacy ceiling: {:?} held",
+                            m.held_action.clone().unwrap_or(ResponseAction::Log)
+                        ),
+                        (Applied::Builtin, _) => String::new(),
+                        (a, _) => format!(", {}", a.name()),
                     }
                 )
             })
@@ -383,9 +506,20 @@ mod tests {
             index,
             rule_id: rule,
             attack: A1,
+            builtin_action: action.clone(),
             verdict: v(rule, action, sev, 100),
             applied: Applied::Builtin,
             held: None,
+            held_action: None,
+            switch_held: false,
+        }
+    }
+
+    /// `m` under `enforce` (no legacy ceiling).
+    fn e(index: usize, rule: &'static str, action: ResponseAction, sev: Severity) -> RuleMatch {
+        RuleMatch {
+            applied: Applied::Enforce,
+            ..m(index, rule, action, sev)
         }
     }
 
@@ -434,7 +568,9 @@ mod tests {
             m(1, "KILL", KillProcess, High),
         ])
         .unwrap();
+        // Ranked by its own action, though the legacy ceiling holds it.
         assert_eq!(d.primary().rule_id, "KILL");
+        assert_eq!(d.primary().held, Some(LEGACY_CEILING));
     }
 
     /// Equal severity and action: the earliest registered (the most
@@ -478,12 +614,13 @@ mod tests {
     /// file action keep their own response.
     #[test]
     fn responses_per_target() {
-        let mut other = m(2, "OTHER-PID", KillProcess, High);
+        // Enforced, so the legacy ceiling does not cap them.
+        let mut other = e(2, "OTHER-PID", KillProcess, High);
         other.verdict.event_pid = 200;
-        let strip = m(3, "STRIP", StripFileCapability, High);
+        let strip = e(3, "STRIP", StripFileCapability, High);
         let d = combine(vec![
-            m(0, "KP", KillProcess, High),
-            m(1, "KPT", KillProcessTree, High),
+            e(0, "KP", KillProcess, High),
+            e(1, "KPT", KillProcessTree, High),
             other,
             strip,
         ])
@@ -561,10 +698,13 @@ mod tests {
     fn builtin_keeps_a_held_kill_held() {
         let (out, held) = held_kill();
         let p = RulePolicy::builtin();
-        let m = apply_policy(0, R020, A1, out, held, &p, |_| None).unwrap();
+        let m = apply_policy(0, R020, A1, out, held, &p, |_| None);
         assert_eq!(m.applied, Applied::Builtin);
         assert_eq!(m.verdict.action, Log);
         assert_eq!(m.held, Some(R020_KILL.held));
+        assert_eq!(m.held_action, Some(KillProcessTree));
+        assert!(m.switch_held);
+        assert_eq!(m.builtin_action, Log);
         assert!(!m.acts());
     }
 
@@ -573,7 +713,7 @@ mod tests {
     fn enforce_gives_a_held_kill_back() {
         let (out, held) = held_kill();
         let p = parse("enforce R020\n").unwrap();
-        let m = apply_policy(0, R020, A1, out, held, &p, |_| None).unwrap();
+        let m = apply_policy(0, R020, A1, out, held, &p, |_| None);
         assert_eq!(m.applied, Applied::Enforce);
         assert_eq!(m.verdict.action, KillProcessTree);
         assert!(m
@@ -590,8 +730,7 @@ mod tests {
         let p = parse("alert R020\n").unwrap();
         let m = apply_policy(0, R020, A1, v(R020, KillProcess, High, 1), None, &p, |_| {
             None
-        })
-        .unwrap();
+        });
         assert_eq!(
             (m.verdict.action.clone(), m.applied.clone()),
             (Log, Applied::Alert)
@@ -601,20 +740,18 @@ mod tests {
         let p = parse("audit R020\n").unwrap();
         let m = apply_policy(0, R020, A1, v(R020, KillProcess, High, 1), None, &p, |_| {
             None
-        })
-        .unwrap();
+        });
         assert_eq!(
             (m.verdict.action.clone(), m.applied.clone()),
             (Log, Applied::Audit)
         );
         assert!(!m.counted());
         let p = parse("off R020\n").unwrap();
-        assert!(
-            apply_policy(0, R020, A1, v(R020, KillProcess, High, 1), None, &p, |_| {
-                None
-            })
-            .is_none()
-        );
+        let off = apply_policy(0, R020, A1, v(R020, KillProcess, High, 1), None, &p, |_| {
+            None
+        });
+        assert_eq!(off.applied, Applied::Off);
+        assert!(combine(vec![off]).is_none(), "an off match is dropped");
     }
 
     /// An exemption wins over `enforce`; it is consulted only when the rule
@@ -623,19 +760,19 @@ mod tests {
     fn an_exemption_makes_the_match_a_record() {
         let p = parse("enforce R020\nexempt R020 uid 998\n").unwrap();
         let (out, held) = held_kill();
-        let m = apply_policy(0, R020, A1, out, held, &p, |_| Some("uid 998".into())).unwrap();
+        let m = apply_policy(0, R020, A1, out, held, &p, |_| Some("uid 998".into()));
         assert_eq!(m.applied, Applied::Exempt("uid 998".into()));
         assert_eq!(m.verdict.action, Log);
         assert!(!m.acts() && !m.counted());
         assert!(m.verdict.reasoning.contains("(uid 998): recorded only]"));
         // Not the exempt actor: enforced.
         let (out, held) = held_kill();
-        let m = apply_policy(0, R020, A1, out, held, &p, |_| None).unwrap();
+        let m = apply_policy(0, R020, A1, out, held, &p, |_| None);
         assert_eq!(m.verdict.action, KillProcessTree);
         // No exemption: the check is never asked.
         let p = parse("enforce R020\n").unwrap();
         let (out, held) = held_kill();
-        apply_policy(0, R020, A1, out, held, &p, |_| panic!("asked")).unwrap();
+        apply_policy(0, R020, A1, out, held, &p, |_| panic!("asked"));
     }
 
     /// The same matches in any order give the same decision.
@@ -654,5 +791,120 @@ mod tests {
         assert_eq!(d.verdict.reasoning, base.verdict.reasoning);
         assert_eq!(d.responses, base.responses);
         assert_eq!(d.primary().rule_id, "D");
+    }
+
+    // ── the legacy ceiling (decision of 22/10/2026) ──
+
+    /// The shadowed kill (FIM-004 behind FIM-002's record): held by the
+    /// ceiling by default — recorded, its action named — and run once the
+    /// policy enforces its rule.
+    #[test]
+    fn the_legacy_ceiling_holds_an_unmasked_kill_until_enforced() {
+        let d = combine(vec![
+            m(0, "REC", Log, Medium),
+            m(1, "KILL", KillProcess, High),
+        ])
+        .unwrap();
+        assert!(d.responses.is_empty());
+        assert_eq!(d.verdict.action, Log);
+        assert_eq!(d.verdict.severity, High);
+        assert_eq!(
+            d.verdict.rule_id, "KILL",
+            "the primary may be the stronger rule"
+        );
+        let k = &d.matches[1];
+        assert_eq!(
+            (k.held, k.held_action.clone(), k.verdict.action.clone()),
+            (Some(LEGACY_CEILING), Some(KillProcess), Log)
+        );
+        assert!(k.verdict.reasoning.contains(
+            "[legacy ceiling: KillProcess held — the first-match engine ran only a record (REC)"
+        ));
+        assert!(k.verdict.reasoning.contains("`enforce KILL`"));
+        let d = combine(vec![
+            m(0, "REC", Log, Medium),
+            e(1, "KILL", KillProcess, High),
+        ])
+        .unwrap();
+        assert_eq!(d.verdict.action, KillProcess);
+        assert_eq!(d.responses[0].rule_id, "KILL");
+        assert_eq!(d.matches[1].held, None);
+    }
+
+    /// The legacy winner was already the strongest (R001's tree kill before
+    /// R009's): unchanged, and a weaker action on its target runs within it.
+    #[test]
+    fn the_ceiling_keeps_a_legacy_winner_that_was_the_strongest() {
+        let d = combine(vec![
+            m(0, "FIRST", KillProcessTree, Medium),
+            m(1, "LATER", KillProcess, High),
+        ])
+        .unwrap();
+        assert_eq!(d.verdict.action, KillProcessTree);
+        assert_eq!(d.responses.len(), 1);
+        assert_eq!(
+            (d.responses[0].rule_id, d.responses[0].also.clone()),
+            ("FIRST", vec!["LATER"])
+        );
+        assert!(d.matches.iter().all(|m| m.held.is_none()));
+    }
+
+    /// Another target than the legacy winner's, or a stronger action on its
+    /// own: held.
+    #[test]
+    fn the_ceiling_holds_another_target_and_a_stronger_action() {
+        let mut other = m(1, "OTHER-PID", KillProcess, High);
+        other.verdict.event_pid = 200;
+        let d = combine(vec![
+            m(0, "FIRST", KillProcess, High),
+            other,
+            m(2, "TREE", KillProcessTree, High),
+            m(3, "STRIP", StripFileCapability, High),
+        ])
+        .unwrap();
+        assert_eq!(d.responses.len(), 1);
+        assert_eq!(
+            (d.responses[0].rule_id, d.responses[0].action.clone()),
+            ("FIRST", KillProcess)
+        );
+        for m in &d.matches[1..] {
+            assert_eq!(m.held, Some(LEGACY_CEILING), "{}", m.rule_id);
+        }
+    }
+
+    /// The legacy first match with switches: a held alert lets a later
+    /// response through, and outranks a later record.
+    #[test]
+    fn the_legacy_first_match_reads_the_switches() {
+        let held = |i| RuleMatch {
+            switch_held: true,
+            ..m(i, "HELD", Log, Critical)
+        };
+        let ms = vec![held(0), m(1, "KILL", KillProcess, High)];
+        assert_eq!(legacy_first_match(&ms), Some((1, KillProcess)));
+        assert_eq!(combine(ms).unwrap().verdict.action, KillProcess);
+        let ms = vec![
+            held(0),
+            m(1, "REC", Log, High),
+            m(2, "KILL", KillProcess, High),
+        ];
+        assert_eq!(legacy_first_match(&ms), Some((0, Log)));
+        assert_eq!(combine(ms).unwrap().verdict.action, Log);
+        assert_eq!(legacy_first_match(&[held(0)]), Some((0, Log)));
+        assert_eq!(legacy_first_match(&[]), None);
+    }
+
+    /// An `off` rule still counts for the legacy first match: turning the
+    /// first rule off never unmasks a later rule's response.
+    #[test]
+    fn an_off_legacy_winner_never_unmasks_a_later_response() {
+        let off = RuleMatch {
+            applied: Applied::Off,
+            ..m(0, "REC", Log, Medium)
+        };
+        let d = combine(vec![off, m(1, "KILL", KillProcess, High)]).unwrap();
+        assert_eq!(d.matches.len(), 1, "the off match is dropped");
+        assert_eq!(d.verdict.action, Log);
+        assert_eq!(d.matches[0].held, Some(LEGACY_CEILING));
     }
 }

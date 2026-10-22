@@ -16,11 +16,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   or a file for `StripFileCapability`); the highest severity; a primary rule
   (the highest severity, then the strongest action, then the earliest
   registered); every tie ends on the registration index, so a stream gives
-  the same decisions on every run and thread. A detection record names the
+  the same decisions on every run and thread. **Legacy ceiling:** without a
+  signed `enforce` for the rule supplying it, no event gets a stronger
+  response than the first-match engine gave it (computed from the same
+  matches, the switches applied, `off` rules included); a match held by it
+  is recorded with `held: "legacy_ceiling"` and `held_action`. A detection record names the
   primary rule in `rule_id`, every match in the new `matches` field (rule,
   action, severity, mode, pid, ATT&CK ids, `held`, `exempt`; absent on a
   single-match record under the built-in defaults, which keeps its bytes),
-  and the union of their ATT&CK ids in `mitre`; the journal line lists the
+  and the union of their ATT&CK ids in `mitre` (`held_action`: what a
+  switch or the ceiling held back); the journal line lists the
   other rules (`also`). The flow ledger notes every matched rule. **Policy.**
   The signed overlay `rule-policy.local` (`OverlayKind::RulePolicy = 15`,
   appended; role `config-manage`) maps a rule (full or short id) to `off`,
@@ -43,8 +48,8 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   and an offline replay of sample events (one `Event` per line or a golden
   case) under a candidate policy. Fuzz target `rule_policy`. Golden replay
   format `northnarrow-golden/2` (`matches`, `responses`, the policy in the
-  header) and six new cases: the four shadowing bugs, a test policy that
-  enforces NN-L-IMP-001, an exemption by uid. Lab harness
+  header) and seven new cases: the four shadowing bugs, test policies that
+  enforce NN-L-IMP-001 and NN-L-FIM-004, an exemption by uid. Lab harness
   `nn-lab.sh policy-check` (`deploy/lab/malsim/policy-check.sh`).
 - Performance baseline, regression gate and golden replay (lab PR 228,
   Wave 4 phase 2). **Baseline.** `nn-lab.sh perf [--fresh] [--quick]` runs
@@ -381,13 +386,14 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ### Fixed
 - Rule shadowing (lab PR 236): NN-L-FIM-023 (systemd timer) was never
   reached behind NN-L-FIM-009 — both now match a `.timer`; a new
-  `authorized_keys` under `/home` was NN-L-FIM-002's record, not
-  NN-L-FIM-004's kill — the kill now runs (High); a large internal transfer
-  was NN-L-NET-007's Medium and NN-L-NET-009's UDP sum never grew — NET-009
-  (High) is the primary rule and its UDP sum crosses 100 MiB; R001 and R009
-  were silent on an exec that completed NN-L-CHAIN-007 late (lab PR 235) —
-  the record names all three. A response a shadowed rule asked for now runs
-  (FIM-004's kill above); no held kill runs without a policy.
+  `authorized_keys` under `/home` was NN-L-FIM-002's record and
+  NN-L-FIM-004 was never recorded — FIM-004 (High) is now the primary rule,
+  its kill held by the legacy ceiling until `enforce NN-L-FIM-004`; a large
+  internal transfer was NN-L-NET-007's Medium and NN-L-NET-009's UDP sum
+  never grew — NET-009 (High) is the primary rule and its UDP sum crosses
+  100 MiB; R001 and R009 were silent on an exec that completed
+  NN-L-CHAIN-007 late (lab PR 235) — the record names all three. Without a
+  policy no event gets a stronger response than before.
 - NN-L-CHAIN-007 (`/tmp` exec, credential read, egress) was missed when
   the exec record reached the engine after the read and the egress it
   preceded (lab PR 235; the CI flake of

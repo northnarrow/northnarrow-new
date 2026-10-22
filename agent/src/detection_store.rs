@@ -620,8 +620,8 @@ pub struct DetectionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execpol: Option<ExecPolEvidence>,
     /// Lab PR 236 (multi-match): every rule that matched the event, in the
-    /// engine's order, when there are several or the per-rule policy gave
-    /// the primary rule a mode — [`Self::rule_id`] is the primary rule and
+    /// engine's order, when there are several, the per-rule policy gave the
+    /// primary rule a mode, or the legacy ceiling held its response — [`Self::rule_id`] is the primary rule and
     /// [`Self::mitre`] the union of their ATT&CK references. Absent on a
     /// record of one rule under the built-in defaults (absent-on-`None`,
     /// like [`Self::file`], so those lines keep their bytes).
@@ -644,9 +644,14 @@ pub struct RuleMatchRecord {
     /// The process the rule's verdict names.
     pub pid: u32,
     pub mitre: MitreAttack,
-    /// The switch still holding its response (built-in defaults).
+    /// What still holds its response: a switch (its text, built-in
+    /// defaults) or `legacy_ceiling` — the first-match engine would not have
+    /// run it on this event, and no `enforce` lifts the ceiling for the rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<String>,
+    /// The action held back (the rule's own), when `held` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_action: Option<ResponseAction>,
     /// The policy's exemption that covered the actor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exempt: Option<String>,
@@ -656,7 +661,10 @@ impl RuleMatchRecord {
     /// The record entries of `d`'s matches, when the record lists them.
     pub fn of(d: &crate::decision::combine::Decision) -> Option<Vec<Self>> {
         use crate::decision::combine::Applied;
-        if d.matches.len() < 2 && d.primary().applied == Applied::Builtin {
+        if d.matches.len() < 2
+            && d.primary().applied == Applied::Builtin
+            && d.primary().held != Some(crate::decision::combine::LEGACY_CEILING)
+        {
             return None;
         }
         Some(
@@ -670,6 +678,7 @@ impl RuleMatchRecord {
                     pid: m.verdict.event_pid,
                     mitre: mitre_of(m.attack),
                     held: m.held.map(str::to_string),
+                    held_action: m.held_action.clone(),
                     exempt: match &m.applied {
                         Applied::Exempt(e) => Some(e.clone()),
                         _ => None,
