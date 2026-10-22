@@ -386,8 +386,7 @@ mod tests {
     #[test]
     fn install_sh_writes_a_marker_this_agent_reads() {
         let script =
-            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/install.sh"))
-                .unwrap();
+            fs::read_to_string(Path::new(env!("NN_REPO_ROOT")).join("deploy/install.sh")).unwrap();
         let start = script.find("# >>> rollback_marker").expect("block");
         let end = script.find("# <<< rollback_marker").expect("block end");
         let block = &script[start..end];

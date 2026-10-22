@@ -753,6 +753,50 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- Wave 4 restructure, R00 — guardrails, no file moved (lab PR 239): a
+  member reaches a repository file through `NN_REPO_ROOT`
+  (`.cargo/config.toml` `[env]`, absolute) instead of a path relative to
+  where the file sits (`include_str!("../../../configs/…")`,
+  `CARGO_MANIFEST_DIR/..`; 37 files of the agent and the watchdog), so a
+  module moved to another crate still builds; the repository tests read
+  the workspace members from `cargo metadata` (the licence check, the Kani
+  proof scan, the lab-vm path-filter scan, the journal-field scan of every
+  member and the line guard wherever the daemon installs its subscriber);
+  `xtask/tests/path_liveness.rs` fails on a workflow path filter that
+  matches no tracked file, a `cargo kani` step whose package or harness is
+  gone, a `-p`/feature of CI or the lab scripts that names nothing, a
+  file the xtask tests name that does not exist, and a depth-relative path
+  in a member; `docs/architecture/module-map.toml` maps every module of
+  `agent/src` and `common/src` to its target crate, with the layers, and
+  `xtask/tests/module_map.rs` keeps the layer violations from growing (77
+  today: nn-core 53, nn-evidence 12, nn-admin 6, nn-linux 3, nn-proto 3);
+  `[workspace.lints]` (the `cfg(kani)` declaration) shared by the members;
+  `mk-tarball.sh` drops the unshipped SBOMs to depth 3. `lab-vm.yml` also
+  starts on `fuzz/**` (the agent's seed test reads it; the old scan missed
+  the `../fuzz` path). The eBPF object and the golden files are
+  byte-identical to `main`'s, so are the watchdog and the scanner; the
+  agent and nn-admin differ only in source line numbers (panic locations,
+  log callsites) of the seven files whose embeds took more lines: same
+  size, same `.text`.
+- Wave 4 restructure, R01 — scaffolding (lab PR 239): the crates of the
+  layered layout, empty, in `crates/`: nn-parse, nn-model, nn-proto,
+  nn-evidence, nn-core (the pure ones), nn-linux and nn-admin — workspace
+  fields and lints, `#![forbid(unsafe_code)]` but in nn-linux, members and
+  `[workspace.dependencies]`; nothing depends on them yet. The layer gate
+  `xtask/tests/workspace_layers.rs` holds the workspace to
+  `docs/architecture/module-map.toml`: every dependency between members is
+  one the layers allow (normal, build or dev), no cycle, the pure crates
+  reach no OS interface (libc, nix, aya, procfs, tokio; `std::os`,
+  `cfg(target_os)`), crate roots forbid `unsafe` where the map says, every
+  member inherits the workspace lints. The new CI job `portable-core`
+  checks the pure crates for aarch64 Linux, Windows and macOS (x86_64 and
+  aarch64). The x86-64-v2 rustflags are the x86_64 Linux target's
+  (`[target.x86_64-unknown-linux-gnu]`, a string so that
+  `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` still replaces them),
+  no longer every target's: with `[build]`, an aarch64 build got
+  `target-cpu=x86-64-v2` and a `neon` ABI warning. `lab-vm.yml` starts on
+  `crates/**`. The shipped binaries, the eBPF object and the packages are
+  the same as R00's.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

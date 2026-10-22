@@ -1,6 +1,20 @@
 [alias]
 xtask = "run --quiet --package xtask --release --"
 
+# Wave 4 restructure, R00 (lab PR 239): the repository root, absolute, for
+# the files a crate embeds or reads from outside itself
+# (`include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/…"))`). A path
+# relative to the including file (`../../../configs/…`) or to the crate
+# (`CARGO_MANIFEST_DIR/..`) breaks when the file moves to another crate or
+# another depth; this one does not, so a `move(…)` commit stays a move.
+# `relative = true`: relative to the directory holding `.cargo/`. Cargo
+# finds this file from the working directory, so every build of the tree
+# runs from inside it (CI, xtask, the lab, the fuzz harness); xtask's own
+# tests keep `CARGO_MANIFEST_DIR` (xtask lives at the root by definition).
+# xtask/tests/path_liveness.rs refuses a depth-relative path in a member.
+[env]
+NN_REPO_ROOT = { value = ".", relative = true }
+
 # External audit SUP-017: the repository default is x86-64-v2 (SSE4.2,
 # POPCNT; every x86_64 server since 2009 and every CI runner), the ISA the
 # release ships. It was target-cpu=native (Sub-tappa 6.8, for the CPU
@@ -22,5 +36,14 @@ xtask = "run --quiet --package xtask --release --"
 # `lld` would shave a few seconds off link time but is not available
 # on the production host (Hetzner CCX23, May 2026); leaving the
 # default linker keeps `cargo build --release` self-contained.
-[build]
-rustflags = ["-C", "target-cpu=x86-64-v2"]
+#
+# Wave 4 restructure, R01 (lab PR 239): for the x86_64 Linux target only
+# (it was `[build]`, every target's): the portable crates are also built for
+# aarch64, Windows and macOS (CI job `portable-core`), where an x86 CPU
+# name has no meaning. A build without `--target` (the host's) is the same
+# as before: these flags, for build scripts and proc-macros too. A string,
+# not a list: `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` then replaces
+# it, as it replaced `[build]` (a list would be merged with it), so the
+# release job's and a native opt-in's command lines are unchanged.
+[target.x86_64-unknown-linux-gnu]
+rustflags = "-C target-cpu=x86-64-v2"

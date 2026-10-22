@@ -212,10 +212,9 @@ mod tests {
     /// agent's aya must re-read it (a newer aya may load more types).
     #[test]
     fn aya_is_the_version_the_list_was_read_from() {
-        let lock = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock"),
-        )
-        .expect("the workspace Cargo.lock");
+        let lock =
+            std::fs::read_to_string(std::path::Path::new(env!("NN_REPO_ROOT")).join("Cargo.lock"))
+                .expect("the workspace Cargo.lock");
         let aya = lock
             .split("[[package]]")
             .find(|p| p.contains("\nname = \"aya\"\n"))

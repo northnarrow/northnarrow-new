@@ -37,8 +37,8 @@ const BAIT_DIR_MODE: u32 = 0o700;
 macro_rules! bait {
     ($name:literal) => {
         include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../configs/honeypot-baits/",
+            env!("NN_REPO_ROOT"),
+            "/configs/honeypot-baits/",
             $name
         ))
     };
@@ -371,11 +371,8 @@ mod tests {
         // fim-paths.v1 is installed to /etc/northnarrow (0644,
         // attacker-readable) — its honeypot section must not reveal the
         // deception either.
-        let cfg = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../configs/fim-paths.v1"
-        ))
-        .to_lowercase();
+        let cfg =
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/fim-paths.v1")).to_lowercase();
         for b in ["honeypot", "decoy", "bait", "trap"] {
             assert!(
                 !cfg.contains(b),

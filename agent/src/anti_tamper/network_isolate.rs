@@ -248,11 +248,14 @@ pub struct NetworkIsolator {
 
 /// The rulesets and carve-out the agent was built with — what COMBAT
 /// applies when a file on disk is missing or not vouched for.
-pub const BUILTIN_RULES_V4: &str = include_str!("../../../configs/combat-rules.v4");
+pub const BUILTIN_RULES_V4: &str =
+    include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/combat-rules.v4"));
 /// See [`BUILTIN_RULES_V4`].
-pub const BUILTIN_RULES_V6: &str = include_str!("../../../configs/combat-rules.v6");
+pub const BUILTIN_RULES_V6: &str =
+    include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/combat-rules.v6"));
 /// See [`BUILTIN_RULES_V4`]: comments only, no network spared.
-pub const BUILTIN_ALLOW: &str = include_str!("../../../configs/combat-allow.cidrs");
+pub const BUILTIN_ALLOW: &str =
+    include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/combat-allow.cidrs"));
 
 /// What a COMBAT ruleset must keep to still isolate: the filter table, the
 /// COMBAT chain and its catch-all DROP, the INPUT and OUTPUT jumps into
@@ -1282,8 +1285,7 @@ mod tests {
     /// Absolute path to `configs/combat-rules.v4` in the repo. Tests
     /// run with `CARGO_MANIFEST_DIR` set to the agent crate root.
     fn combat_rules_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
+        PathBuf::from(env!("NN_REPO_ROOT"))
             .join("configs")
             .join("combat-rules.v4")
     }

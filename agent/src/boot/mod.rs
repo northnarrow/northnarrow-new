@@ -432,7 +432,7 @@ mod tests {
     /// event loop.
     #[test]
     fn main_runs_the_phases_in_order() {
-        let main = include_str!("../main.rs");
+        let main = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/main.rs"));
         let at = |needle: &str| {
             main.find(needle)
                 .unwrap_or_else(|| panic!("main.rs: `{needle}` not found"))
@@ -472,7 +472,7 @@ mod tests {
     /// every attach (the BTF parses whose pages glibc kept) and only once.
     #[test]
     fn main_releases_the_boot_heap_after_ready() {
-        let main = include_str!("../main.rs");
+        let main = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/main.rs"));
         let release = main
             .find("boot::release_boot_heap()")
             .expect("main.rs releases the boot heap");
@@ -500,7 +500,7 @@ mod tests {
     /// the gap is signed (`net::drain` tests the record path without a log).
     #[test]
     fn main_runs_the_net_drain_without_its_log() {
-        let main = include_str!("../main.rs");
+        let main = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/main.rs"));
         assert!(
             !main.contains("if let Some(netflow_db) = netflow_db_opt"),
             "the drain waits for the netflow log again"

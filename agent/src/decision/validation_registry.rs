@@ -36,9 +36,7 @@ const MATRIX_MD: &str = "docs/validation/matrix.md";
 const NO_PROOF: &str = "no proof";
 
 fn repo_path(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join(rel)
+    PathBuf::from(env!("NN_REPO_ROOT")).join(rel)
 }
 
 fn read(rel: &str) -> String {

@@ -55,8 +55,9 @@ on:
     # The trees the privileged suites are built or run from: the workspace
     # crates (the guest compiles every test target of the workspace) and the
     # eBPF crate, the files the agent embeds (configs/, deploy/systemd/, the
-    # COMBAT recovery guide) or the tests read (configs/, deploy/), the
-    # toolchain and lockfile, the lab scripts, and this workflow.
+    # COMBAT recovery guide) or the tests read (configs/, deploy/, fuzz/:
+    # the agent's seed test, seen since its path is NN_REPO_ROOT's, lab PR
+    # 239), the toolchain and lockfile, the lab scripts, and this workflow.
     # xtask/tests/lab_ci.rs derives that list from the repository and fails
     # when a filter is missing or names a path that no longer exists.
     paths:
@@ -65,12 +66,14 @@ on:
       - antitamper-bpf/**
       - cli/**
       - common/**
+      - crates/**
       - ebpf-guard/**
       - scan/**
       - watchdog/**
       - xtask/**
       - configs/**
       - deploy/**
+      - fuzz/**
       - docs/operator/COMBAT_RECOVERY.md
       - Cargo.toml
       - Cargo.lock

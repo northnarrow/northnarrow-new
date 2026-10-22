@@ -163,8 +163,7 @@ fn agent_bin_src() -> PathBuf {
     // sibling crate's output. Fallback to repo-root/target/release
     // if the env var isn't set (e.g., invoked outside cargo).
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
+        PathBuf::from(env!("NN_REPO_ROOT"))
             .join("target")
             .to_string_lossy()
             .into_owned()
@@ -182,8 +181,7 @@ fn watchdog_bin_src() -> &'static str {
 /// test copies it into its tempdir so the agent loads a stable
 /// shape regardless of operator overrides.
 fn combat_rules_src() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
+    PathBuf::from(env!("NN_REPO_ROOT"))
         .join("configs")
         .join("combat-rules.v4")
 }

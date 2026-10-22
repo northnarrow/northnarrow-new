@@ -1,0 +1,295 @@
+# The Wave 4 restructure's layout: the crates, which of them each may
+# depend on, and the crate each module of `agent/src` and `common/src` is
+# headed for. Plan: w4-restructure-plan (§2.1 layers, §2.4 module map,
+# §4 lots R00–R17); this file is its versioned half, read by two tests:
+#
+# - xtask/tests/module_map.rs, the ratchet (R00, lab PR 239): every source
+#   file of `agent/src` and `common/src` is mapped; a reference from a
+#   module to a module of a crate its own crate may not depend on
+#   (`allowed` below) is a violation; the violations of each crate may not
+#   go above `[ratchet]`, and when they go down `[ratchet]` goes down with
+#   them. A module moves to its crate when it has none left (rule 3 of §4.1).
+# - xtask/tests/workspace_layers.rs, the gate (R01, lab PR 239): the real
+#   dependency graph of the workspace (`cargo metadata`) against `allowed`,
+#   no cycle, and the rules of the pure crates.
+#
+# The format is the TOML subset xtask/tests/support/mod.rs reads: `[a.b]`
+# headers, `key = "string" | true | false | integer | ["list", …]`.
+
+[map]
+format = "northnarrow-module-map/1"
+
+# ── crates ───────────────────────────────────────────────────────────────
+# `allowed`: the crates of this repository it may depend on (normal, build
+# or dev dependency alike). `pure`: no OS interface (no libc, nix, rustix,
+# aya, procfs, tokio, no `std::os`, no `cfg(target_os)`/`cfg(unix)`),
+# built for the non-Linux targets by the CI job `portable-core`.
+# `forbid_unsafe`: `#![forbid(unsafe_code)]` at the crate root. `planned`:
+# not a workspace member yet (R01, lab PR 239, created nn-parse, nn-model,
+# nn-proto, nn-evidence, nn-core, nn-linux and nn-admin, empty; nn-export
+# and nn-server come with R15 and R16). Bottom up, as §2.1 draws them.
+
+[crates.northnarrow-common]
+about = "nn-wire: the kernel/userland ABI (no_std raw layouts, btf_offsets, ring_drops); its std half leaves in R02/R03"
+allowed = []
+forbid_unsafe = true
+planned = false
+
+[crates.nn-parse]
+about = "parsers of hostile bytes (TLS ClientHello, DNS records, QNAME); a leaf, fuzzed, run in the worker (R06, R14b)"
+allowed = []
+pure = true
+forbid_unsafe = true
+planned = false
+
+[crates.nn-model]
+about = "the vocabulary: Event, verdicts, actions and outcomes, ProcessKey, PostureKind, log_escape, netaddr, OCSF (R02)"
+allowed = ["northnarrow-common", "nn-parse"]
+pure = true
+forbid_unsafe = true
+planned = false
+
+[crates.nn-proto]
+about = "the admin protocol, signed payloads, quorum, shutdown marker, watchdog hold, core/worker IPC (R03)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model"]
+pure = true
+forbid_unsafe = true
+planned = false
+
+[crates.nn-evidence]
+about = "signed chains behind a Signer trait: canonical form, RowSeq, heads, verification, payloads; no key (R05)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model"]
+pure = true
+forbid_unsafe = true
+planned = false
+
+[crates.nn-core]
+about = "detection, posture, correlation, COMBAT and response policy, signed content, sensor contract, bus types; no OS call, no tokio (R07, R08)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence"]
+pure = true
+forbid_unsafe = true
+planned = false
+
+[crates.northnarrow-antitamper-bpf]
+about = "the Linux base shared with the watchdog: bpffs pins, LSM attach (and sd_notify, atomic_file from R03)"
+allowed = ["northnarrow-common", "nn-model", "nn-proto"]
+planned = false
+
+[crates.northnarrow-scan]
+about = "the exec quarantine's confined scanner (lab PR 223, after the plan): a worker-like process the agent spawns"
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto"]
+planned = false
+
+[crates.ebpf-guard]
+about = "the eBPF object's provenance stamp (xtask writes it, the agent's build script checks it)"
+allowed = []
+planned = false
+
+[crates.nn-linux]
+about = "the adapters: eBPF loader and sensors, /proc, actuators, self-defence, systemd, KeyStore, sandbox (R09)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core", "northnarrow-antitamper-bpf", "northnarrow-scan", "ebpf-guard"]
+planned = false
+
+[crates.nn-export]
+about = "the export worker: WAL, OCSF, OTLP/syslog with an at-least-once cursor (R15)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
+planned = true
+
+[crates.nn-admin]
+about = "the operator client's library; the nn-admin binary stays a shim of the agent package (R10)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
+forbid_unsafe = true
+planned = false
+
+[crates.northnarrow-agent]
+about = "nn-agent: the composition (typed boot phases, bus and pipeline, admin server, supervisor, worker entry)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core", "nn-linux", "northnarrow-antitamper-bpf", "northnarrow-scan", "nn-export", "nn-admin", "ebpf-guard"]
+planned = false
+
+[crates.northnarrow-watchdog]
+about = "nn-watchdog: the pidfd supervisor; never the engine"
+allowed = ["northnarrow-common", "nn-model", "nn-proto", "northnarrow-antitamper-bpf"]
+planned = false
+
+[crates.nn-server]
+about = "the backend (evidence gateway, then Director/TUF/SIEM); never linked into the agent (R16)"
+allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence"]
+planned = true
+
+[crates.xtask]
+about = "the workspace's task runner"
+allowed = ["ebpf-guard"]
+planned = false
+
+[crates.northnarrow-cli]
+about = "the CLI stub, removed in R17"
+allowed = []
+forbid_unsafe = true
+planned = false
+
+# ── agent/src: module → crate (§2.4) ─────────────────────────────────────
+# A file takes the entry of its longest module prefix (`fim::drain`, else
+# `fim`). A file that will be split (R04c) is mapped where the plan sends
+# most of it; the comment says which part goes elsewhere. Modules added
+# after the plan (lab PRs 214–238) are marked "post-plan": mapped by lab
+# PR 239 on the plan's principles, to be confirmed by the lot that moves
+# them.
+
+[modules.agent]
+"lib" = "northnarrow-agent"
+"main" = "northnarrow-agent"
+"bin::nn_admin" = "nn-admin"
+"admin_cli" = "nn-admin"
+"admin_socket" = "northnarrow-agent"
+"agent_id" = "nn-linux"
+"anchored" = "nn-evidence"
+"anti_tamper" = "nn-linux"
+# the role parse and the UnlockToken verification; key loading stays Linux
+"anti_tamper::admin_auth" = "nn-proto"
+"anti_tamper::combat_allow" = "nn-core"
+"async_fd" = "nn-linux"
+"atomic_file" = "nn-linux"
+"audit" = "nn-evidence"
+# post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a
+"boot" = "northnarrow-agent"
+# post-plan (lab PR 217): an external command with a deadline
+"bounded_cmd" = "nn-linux"
+# path_policy, the registry's store, network, access_log, read_forward
+"canary" = "nn-linux"
+# post-plan (lab PR 178): the one reader of the canary chains' lines
+"canary::chain_lines" = "nn-evidence"
+"canary::detector" = "nn-core"
+"canary::readers" = "nn-core"
+# the format half goes to nn-core (R04c)
+"canary::registry" = "nn-linux"
+"canary::templates" = "nn-core"
+"chain_anchor" = "nn-evidence"
+"chain_tail" = "nn-evidence"
+"chainlog" = "nn-evidence"
+# the ladder and its evidence; SystemActuator and the probes of protected
+# and reconcile go to nn-linux (R04c)
+"combat" = "nn-core"
+# comm_allowlist, overlay (parse), overlay_auth (verify; install → nn-linux,
+# R04c), overlay_floor
+"config" = "nn-core"
+"correlation" = "nn-core"
+# post-plan (lab PR 222): copy on first write; fanotify, copies, journal
+"cow" = "nn-linux"
+"cow::config" = "nn-core"
+"cow::index" = "nn-core"
+"cow::trust" = "nn-core"
+"decision" = "nn-core"
+"detection_budget" = "nn-core"
+# not in §2.4: the detection sink's queue and files (its payloads go to
+# nn-evidence with R04a)
+"detection_store" = "nn-linux"
+# post-plan (lab PR 226): exec policy; the controller and the kernel maps
+"execpol" = "nn-linux"
+"execpol::policy" = "nn-core"
+"execpol::record" = "nn-core"
+# post-plan (lab PR 223): exec quarantine; controller, kernel, package trust
+"execq" = "nn-linux"
+"execq::policy" = "nn-core"
+"execq::record" = "nn-core"
+# attach, drain (the ring half; the drift classification → nn-core, R04c),
+# baseline, honeypot, recompute
+"fim" = "nn-linux"
+"fim::paths_config" = "nn-core"
+"fim::rules" = "nn-core"
+"fs_type" = "nn-linux"
+# into the crates it exercises in R17
+"fuzz_api" = "northnarrow-agent"
+"host_hardening" = "nn-linux"
+# post-plan (lab PR 225): the ransomware signal (sampler behind a trait)
+"impact" = "nn-core"
+# post-plan (lab PR 225): defences switched off, a shipped list
+"impair" = "nn-core"
+"install_manifest" = "nn-linux"
+# post-plan (lab PR 216): the event loop's progress, for the watchdog
+"loop_progress" = "northnarrow-agent"
+# flow_tracker, dns_cache (state; its parsers → nn-parse, R06), limiter,
+# blocklist
+"net" = "nn-core"
+"net::blind_spots" = "nn-linux"
+"net::drain" = "nn-linux"
+# post-plan (lab PR 224): the host's resolv.conf
+"net::resolvers" = "nn-linux"
+"net::tls_parser" = "nn-parse"
+# post-plan (lab PR 234): the OS CSPRNG
+"os_rng" = "nn-linux"
+"posture" = "nn-core"
+# post-plan (lab PR 216): no core dump, no readable memory
+"process_hardening" = "nn-linux"
+# post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
+"removed_settings" = "northnarrow-agent"
+# the actuators and the Executor; ExecutionOutcome/Report → nn-model (R04a)
+"response" = "nn-linux"
+"response::config" = "nn-core"
+"runtime" = "nn-linux"
+"sd_notify" = "nn-linux"
+"self_integrity" = "nn-linux"
+"sensor_feasibility" = "nn-linux"
+"sensors" = "nn-linux"
+# the file I/O; the marker's format is common's (→ nn-proto)
+"shutdown_marker" = "nn-linux"
+"systemd_state" = "nn-linux"
+"telemetry_probe" = "nn-linux"
+"trusted_bin" = "nn-linux"
+# post-plan (lab PR 220): the signed record of a rolled-back upgrade
+"upgrade_rollback" = "nn-linux"
+# post-plan (lab only): `--verifier-check`
+"verifier_check" = "nn-linux"
+"verify_lines" = "nn-evidence"
+
+# ── common/src: module → crate (§2.4) ────────────────────────────────────
+
+[modules.common]
+"lib" = "northnarrow-common"
+# raw layouts and constants; the std types of wire/mod.rs (FimEvent,
+# NetFlowEvent, NetListenerEvent, TlsFingerprint) go to nn-model (R02)
+"wire" = "northnarrow-common"
+"wire::admin_protocol" = "nn-proto"
+"wire::admin_signed_payload" = "nn-proto"
+"admin_quorum" = "nn-proto"
+"atomic_file" = "northnarrow-antitamper-bpf"
+# post-plan (lab PR 215): uapi bpf_cmd numbers, shared with the eBPF object
+"bpf_cmd" = "northnarrow-common"
+"btf_offsets" = "northnarrow-common"
+"dns_qname" = "nn-parse"
+# post-plan (lab PR 219): the decision model the eBPF programs run
+"epg" = "northnarrow-common"
+# post-plan (lab PR 223): the agent ↔ scanner protocol and hash list
+"execq" = "nn-proto"
+# post-plan (lab PR 215): the deny hooks' fail-open counters
+"fail_open" = "northnarrow-common"
+"log_escape" = "nn-model"
+"model" = "nn-model"
+"netaddr" = "nn-model"
+"posture_types" = "nn-model"
+"ring_drops" = "northnarrow-common"
+"sd_notify" = "northnarrow-antitamper-bpf"
+"shutdown_marker" = "nn-proto"
+"watchdog_hold" = "nn-proto"
+
+# The items of common's root and the modules that define them
+# (`pub use model::*`, `pub use dns_qname::{…}`); `*`: any other item.
+[aliases.common]
+"decode_dns_qname" = "dns_qname"
+"qname_wire_end" = "dns_qname"
+"QnameLabel" = "dns_qname"
+"QnameLabels" = "dns_qname"
+"*" = "model"
+
+# ── the ratchet ──────────────────────────────────────────────────────────
+# The references, per crate of the referring module, to a crate it may not
+# depend on (distinct (file, module) pairs, outside tests and Kani
+# proofs). They may only go down: xtask/tests/module_map.rs fails above
+# these numbers and asks for the lower number below them. R04 brings
+# nn-evidence and nn-core to 0.
+
+[ratchet]
+nn-admin = 6
+nn-core = 53
+nn-evidence = 12
+nn-linux = 3
+nn-proto = 3

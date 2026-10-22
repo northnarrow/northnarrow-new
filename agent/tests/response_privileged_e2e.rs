@@ -57,9 +57,7 @@ fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
 }
 fn configs() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("configs")
+    PathBuf::from(env!("NN_REPO_ROOT")).join("configs")
 }
 
 fn wipe_pin_tree() {

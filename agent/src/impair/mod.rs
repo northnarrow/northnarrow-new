@@ -58,7 +58,8 @@ use crate::posture::lineage::{AuthSessionTracker, ExecIdentity};
 /// Deploy location of the list.
 pub const SECURITY_TOOLS_V1: &str = "/etc/northnarrow/security-tools.v1";
 /// The shipped list, built in.
-pub const BUILTIN_SECURITY_TOOLS_V1: &str = include_str!("../../../configs/security-tools.v1");
+pub const BUILTIN_SECURITY_TOOLS_V1: &str =
+    include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/security-tools.v1"));
 /// SHA-256 of every `security-tools.v1` an earlier release shipped.
 pub const EARLIER_SECURITY_TOOLS_V1_SHA256: &[&str] = &[];
 /// The shipped `security-tools.v1` (built-in copy, earlier ones).

@@ -323,10 +323,13 @@ mod tests {
     /// `dns_query.rs`): a rename there must fail here, not at attach time.
     #[test]
     fn program_names_match_the_ebpf_object() {
-        let src = include_str!("../../../agent-ebpf/src/dns_skb.rs");
+        let src = include_str!(concat!(env!("NN_REPO_ROOT"), "/agent-ebpf/src/dns_skb.rs"));
         assert!(src.contains(&format!("pub fn {SKB4_PROGRAM}(")));
         assert!(src.contains(&format!("pub fn {SKB6_PROGRAM}(")));
-        let old = include_str!("../../../agent-ebpf/src/dns_query.rs");
+        let old = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent-ebpf/src/dns_query.rs"
+        ));
         assert!(old.contains(&format!("pub fn {SENDMSG_PROGRAM}(")));
     }
 }

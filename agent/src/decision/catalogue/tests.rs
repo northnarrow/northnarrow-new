@@ -26,7 +26,7 @@ use super::{docs, RuleDoc};
 use crate::decision::attack::{AttackRef, Tactic, ATTACK_IDS_FILE, ATTACK_VERSION};
 
 fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+    PathBuf::from(env!("NN_REPO_ROOT"))
 }
 
 fn read(rel: &str) -> String {
