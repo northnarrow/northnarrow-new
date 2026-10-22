@@ -1989,12 +1989,22 @@ mod tests {
         /// key 00 01 … 1f: `agent/tests/fixtures/vault-v1/`, binary files
         /// as hex.
         const FIXTURE_ID: &str = "1b3e9723638c4980bfe76816eafc1081";
-        const FIXTURE_MASTER: &str = include_str!("../../tests/fixtures/vault-v1/master.key.hex");
-        const FIXTURE_BIN: &str =
-            include_str!("../../tests/fixtures/vault-v1/1b3e9723638c4980bfe76816eafc1081.bin.hex");
-        const FIXTURE_META: &str =
-            include_str!("../../tests/fixtures/vault-v1/1b3e9723638c4980bfe76816eafc1081.meta");
-        const FIXTURE_INDEX: &str = include_str!("../../tests/fixtures/vault-v1/index.json");
+        const FIXTURE_MASTER: &str = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent/tests/fixtures/vault-v1/master.key.hex"
+        ));
+        const FIXTURE_BIN: &str = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent/tests/fixtures/vault-v1/1b3e9723638c4980bfe76816eafc1081.bin.hex"
+        ));
+        const FIXTURE_META: &str = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent/tests/fixtures/vault-v1/1b3e9723638c4980bfe76816eafc1081.meta"
+        ));
+        const FIXTURE_INDEX: &str = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent/tests/fixtures/vault-v1/index.json"
+        ));
 
         /// Protects: a vault written before the bump must restore after it.
         #[test]

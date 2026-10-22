@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 
+mod support;
+
 /// The contact SECURITY.md and security.txt name: GitHub Security
 /// Advisories, the repository's private vulnerability reporting.
 const ADVISORIES: &str = "https://github.com/northnarrow/northnarrow-new/security/advisories/new";
@@ -90,17 +92,10 @@ fn manifest_value(text: &str, section: &str, key: &str) -> Option<String> {
     None
 }
 
+/// The members' directories, from `cargo metadata` (lab PR 239: the
+/// `members = […]` line was parsed as one line of text).
 fn workspace_members() -> Vec<String> {
-    let text = read("Cargo.toml");
-    let line = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("members"))
-        .expect("Cargo.toml: members");
-    let list = &line[line.find('[').unwrap() + 1..line.rfind(']').unwrap()];
-    list.split(',')
-        .map(|m| m.trim().trim_matches('"').to_string())
-        .filter(|m| !m.is_empty())
-        .collect()
+    support::members().into_iter().map(|m| m.dir).collect()
 }
 
 /// The text under a `## ` heading that starts with `title`, to the next

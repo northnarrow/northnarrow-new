@@ -50,7 +50,8 @@ pub const DEFAULT_PATHS_LOCAL: &str = "/etc/northnarrow/fim-paths.local";
 /// External audit LLMR-016: the shipped default list, built in — used
 /// when `fim-paths.v1` cannot be read (FIM used to watch only the
 /// overlay's additions then).
-pub const BUILTIN_PATHS_V1: &str = include_str!("../../../configs/fim-paths.v1");
+pub const BUILTIN_PATHS_V1: &str =
+    include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/fim-paths.v1"));
 
 /// External audit LLMR-015 (NN-AUD-327): SHA-256 of every `fim-paths.v1`
 /// an earlier release shipped (the history of `configs/`). The agent
@@ -268,10 +269,7 @@ mod tests {
     /// than at an operator's boot.
     #[test]
     fn shipped_fim_paths_v1_loads_clean_with_d3_paths() {
-        let v1 = std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../configs/fim-paths.v1"
-        ));
+        let v1 = std::path::PathBuf::from(concat!(env!("NN_REPO_ROOT"), "/configs/fim-paths.v1"));
         // No overlay shipped (operator-curated) — exercise v1-only.
         let out = load_watched_paths(&v1, &Verified::Missing)
             .expect("shipped fim-paths.v1 must parse clean");

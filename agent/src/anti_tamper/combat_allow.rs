@@ -330,7 +330,7 @@ garbage-line\n\
     /// produces the ip6tables ACCEPT rules.
     #[test]
     fn the_shipped_file_with_an_ipv6_line_carves_out_ipv6() {
-        let shipped = include_str!("../../../configs/combat-allow.cidrs");
+        let shipped = include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/combat-allow.cidrs"));
         let load = parse_allow_text(&format!("{shipped}\n2001:db8:10::/48\n"));
         let v6 = generate_accept_rules_v6(&load.entries, "NORTHNARROW_COMBAT");
         assert!(
@@ -351,11 +351,14 @@ garbage-line\n\
         for (name, text) in [
             (
                 "configs/combat-allow.cidrs",
-                include_str!("../../../configs/combat-allow.cidrs"),
+                include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/combat-allow.cidrs")),
             ),
             (
                 "docs/operator/COMBAT_RECOVERY.md",
-                include_str!("../../../docs/operator/COMBAT_RECOVERY.md"),
+                include_str!(concat!(
+                    env!("NN_REPO_ROOT"),
+                    "/docs/operator/COMBAT_RECOVERY.md"
+                )),
             ),
         ] {
             assert!(!text.contains("IPv4-only"), "{name} still says IPv4-only");

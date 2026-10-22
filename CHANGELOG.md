@@ -753,6 +753,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- Wave 4 restructure, R00 — guardrails, no file moved (lab PR 239): a
+  member reaches a repository file through `NN_REPO_ROOT`
+  (`.cargo/config.toml` `[env]`, absolute) instead of a path relative to
+  where the file sits (`include_str!("../../../configs/…")`,
+  `CARGO_MANIFEST_DIR/..`; 37 files of the agent and the watchdog), so a
+  module moved to another crate still builds; the repository tests read
+  the workspace members from `cargo metadata` (the licence check, the Kani
+  proof scan, the lab-vm path-filter scan, the journal-field scan of every
+  member and the line guard wherever the daemon installs its subscriber);
+  `xtask/tests/path_liveness.rs` fails on a workflow path filter that
+  matches no tracked file, a `cargo kani` step whose package or harness is
+  gone, a `-p`/feature of CI or the lab scripts that names nothing, a
+  file the xtask tests name that does not exist, and a depth-relative path
+  in a member; `docs/architecture/module-map.toml` maps every module of
+  `agent/src` and `common/src` to its target crate, with the layers, and
+  `xtask/tests/module_map.rs` keeps the layer violations from growing (77
+  today: nn-core 53, nn-evidence 12, nn-admin 6, nn-linux 3, nn-proto 3);
+  `[workspace.lints]` (the `cfg(kani)` declaration) shared by the members;
+  `mk-tarball.sh` drops the unshipped SBOMs to depth 3. `lab-vm.yml` also
+  starts on `fuzz/**` (the agent's seed test reads it; the old scan missed
+  the `../fuzz` path). The eBPF object and the golden files are
+  byte-identical to `main`'s, so are the watchdog and the scanner; the
+  agent and nn-admin differ only in source line numbers (panic locations,
+  log callsites) of the seven files whose embeds took more lines: same
+  size, same `.text`.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

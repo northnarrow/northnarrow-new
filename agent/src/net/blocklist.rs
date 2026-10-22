@@ -35,10 +35,14 @@ use crate::config::overlay_auth::Verified;
 /// External audit LLMR-016: the shipped default lists, built in — used
 /// when the `.v1` on disk cannot be read (the blocklists used to be empty
 /// then, with a WARN).
-pub const BUILTIN_NETFLOW_BLOCKLIST_V1: &str =
-    include_str!("../../../configs/netflow-blocklist.v1");
-pub const BUILTIN_JA3_BLOCKLIST_V1: &str =
-    include_str!("../../../configs/netflow-ja3-blocklist.v1");
+pub const BUILTIN_NETFLOW_BLOCKLIST_V1: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/netflow-blocklist.v1"
+));
+pub const BUILTIN_JA3_BLOCKLIST_V1: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/netflow-ja3-blocklist.v1"
+));
 
 /// External audit LLMR-015 (NN-AUD-327): SHA-256 of every
 /// `netflow-blocklist.v1` an earlier release shipped (the history of
@@ -640,7 +644,7 @@ mod tests {
             }
         ));
         // the current shipped file is the one used
-        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs");
+        let configs = Path::new(env!("NN_REPO_ROOT")).join("configs");
         let bl =
             NetBlocklist::load(&configs.join("netflow-blocklist.v1"), &Verified::Missing).unwrap();
         assert_eq!(bl.defaults(), &DefaultsSource::Disk);
@@ -672,7 +676,7 @@ mod tests {
         assert!(bl.contains(&"192.0.2.1".parse().unwrap()));
         let ja3 = Ja3Blocklist::load(&missing, &Verified::Missing).unwrap();
         assert!(matches!(ja3.defaults(), DefaultsSource::BuiltIn(_)));
-        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs");
+        let configs = Path::new(env!("NN_REPO_ROOT")).join("configs");
         assert_eq!(
             std::fs::read_to_string(configs.join("netflow-blocklist.v1")).unwrap(),
             BUILTIN_NETFLOW_BLOCKLIST_V1
@@ -778,7 +782,7 @@ mod tests {
     fn shipped_seed_contains_no_prefix_in_real_world_use() {
         // External audit NET-011 (NN-AUD-060): the seed feeds NN-L-NET-001
         // (KillProcessTree); CGNAT and benchmarking space are in daily use.
-        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../configs/netflow-blocklist.v1");
+        let shipped = Path::new(env!("NN_REPO_ROOT")).join("configs/netflow-blocklist.v1");
         let bl = NetBlocklist::load(&shipped, &Verified::Missing).unwrap();
         for a in [
             "100.64.0.1",
@@ -866,8 +870,7 @@ mod tests {
     /// via its production loader.
     #[test]
     fn net_blocklist_v1_default_loads_clean() {
-        let v1 = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
+        let v1 = std::path::PathBuf::from(env!("NN_REPO_ROOT"))
             .join("configs")
             .join("netflow-blocklist.v1");
         assert!(
@@ -898,8 +901,7 @@ mod tests {
     /// before reaching a host.
     #[test]
     fn net_ja3_blocklist_v1_default_loads_clean() {
-        let v1 = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
+        let v1 = std::path::PathBuf::from(env!("NN_REPO_ROOT"))
             .join("configs")
             .join("netflow-ja3-blocklist.v1");
         assert!(

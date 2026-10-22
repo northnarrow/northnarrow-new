@@ -104,15 +104,13 @@ fn nn_admin_bin() -> &'static str {
 }
 
 fn combat_rules_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
+    PathBuf::from(env!("NN_REPO_ROOT"))
         .join("configs")
         .join("combat-rules.v4")
 }
 
 fn canary_templates_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
+    PathBuf::from(env!("NN_REPO_ROOT"))
         .join("configs")
         .join("canary-templates")
 }

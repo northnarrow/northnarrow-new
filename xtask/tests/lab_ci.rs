@@ -18,6 +18,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+mod support;
+
 const WORKFLOW: &str = ".github/workflows/lab-vm.yml";
 const NN_LAB: &str = "deploy/lab/nn-lab.sh";
 const EXPECTED: &str = "deploy/lab/expected-failures.tsv";
@@ -135,19 +137,6 @@ fn step_using(steps: &[Yaml], action: &str) -> Vec<usize> {
 
 // ── which pull requests start it ──────────────────────────────────────────
 
-/// `"a", "b"` of a TOML array on the line that starts with `key =`.
-fn toml_array(text: &str, key: &str) -> Vec<String> {
-    let line = text
-        .lines()
-        .find(|l| l.trim_start().starts_with(&format!("{key} =")))
-        .unwrap_or_else(|| panic!("Cargo.toml: no `{key} =`"));
-    line.split('"')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_string)
-        .collect()
-}
-
 /// `a/b/../c` → `a/c`; None when it leaves the repository.
 fn normalize(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
@@ -183,15 +172,18 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The repository paths the privileged suites are built or run from: the
-/// workspace members, the eBPF crate xtask builds, the `[patch]` paths, every
-/// file a member embeds from outside itself (`include_str!`,
-/// `include_bytes!`), the top-level trees the agent's and the watchdog's
-/// tests read (`.join("configs")`, `"/../configs"`), the toolchain and the
-/// lockfile, the lab script and the workflow.
+/// workspace members (`cargo metadata`, lab PR 239), the eBPF crate xtask
+/// builds, the `[patch]` paths, every file a member embeds or reads from
+/// outside itself (`include_str!`/`include_bytes!` relative to the file,
+/// or `env!("NN_REPO_ROOT")` and the path after it, R00), the top-level
+/// trees the members' code and tests read (`.join("configs")`,
+/// `"/../configs"`; xtask's aside), the toolchain and the lockfile, the lab
+/// script and the workflow.
 fn trees_the_suites_need() -> BTreeSet<String> {
     let root = repo_root();
     let cargo = read("Cargo.toml");
-    let mut need: BTreeSet<String> = toml_array(&cargo, "members").into_iter().collect();
+    let members: Vec<String> = support::members().into_iter().map(|m| m.dir).collect();
+    let mut need: BTreeSet<String> = members.iter().cloned().collect();
     need.insert("agent-ebpf".to_string());
     // the path dependencies of a `[patch.*]` section (none today)
     let mut in_patch = false;
@@ -205,7 +197,6 @@ fn trees_the_suites_need() -> BTreeSet<String> {
             }
         }
     }
-    let members: Vec<String> = toml_array(&cargo, "members");
     for m in &members {
         let krate = root.join(m);
         let mut files = Vec::new();
@@ -222,6 +213,18 @@ fn trees_the_suites_need() -> BTreeSet<String> {
                     }
                 }
             }
+            // `concat!(env!("NN_REPO_ROOT"), "/configs/…")`, over lines too
+            for piece in src.split("env!(\"NN_REPO_ROOT\")").skip(1) {
+                let rest = piece.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+                let Some(lit) = rest.strip_prefix("\"/") else {
+                    continue;
+                };
+                let rel = lit.split('"').next().unwrap().trim_end_matches('/');
+                let target = normalize(Path::new(rel)).unwrap();
+                if !rel.is_empty() && !target.starts_with(m) {
+                    need.insert(target.display().to_string());
+                }
+            }
         }
     }
     let top: BTreeSet<String> = fs::read_dir(&root)
@@ -231,9 +234,11 @@ fn trees_the_suites_need() -> BTreeSet<String> {
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
         .filter(|n| !n.starts_with('.') && n != "target")
         .collect();
-    for tests in ["agent/tests", "watchdog/tests", "agent/src", "watchdog/src"] {
+    // xtask's own reads stay out: its tests run on the host (the `test`
+    // job), never in a guest
+    for m in members.iter().filter(|m| *m != "xtask") {
         let mut files = Vec::new();
-        rs_files(&root.join(tests), &mut files);
+        rs_files(&root.join(m), &mut files);
         for f in files {
             let src = fs::read_to_string(&f).unwrap();
             for t in &top {

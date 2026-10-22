@@ -5,7 +5,8 @@
 //! it (fmt layer, no target, no colours, through `OneLine`). And no field
 //! that carries a value another user names is logged with `%` (Display)
 //! unless it goes through `common::log_escape::Escaped`: a source scan of
-//! the agent and the watchdog, so a new `comm = %comm` fails here.
+//! every workspace member (`cargo metadata`; the agent and the watchdog
+//! until lab PR 239), so a new `comm = %comm` fails here.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -280,17 +281,71 @@ fn the_scan_finds_what_it_must() {
     assert!(violations("src/main.rs", r#"info!(path = %cli.audit.display(), "x")"#).is_empty());
 }
 
+/// The workspace members, `(package, directory)`, from `cargo metadata`
+/// (Wave 4 restructure R00, lab PR 239): the scan follows the crates as
+/// modules move between them, where a list of directories written here
+/// would go on scanning the old ones and pass with nothing to read.
+fn members() -> Vec<(String, PathBuf)> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        .current_dir(env!("NN_REPO_ROOT"))
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .expect("cargo metadata runs");
+    assert!(
+        out.status.success(),
+        "cargo metadata: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta: serde_json::Value = serde_json::from_slice(&out.stdout).expect("metadata JSON");
+    let ids: Vec<&str> = meta["workspace_members"]
+        .as_array()
+        .expect("workspace_members")
+        .iter()
+        .filter_map(|m| m.as_str())
+        .collect();
+    let mut members: Vec<(String, PathBuf)> = meta["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .filter(|p| ids.contains(&p["id"].as_str().unwrap_or("")))
+        .map(|p| {
+            let manifest = Path::new(p["manifest_path"].as_str().expect("manifest_path"));
+            (
+                p["name"].as_str().expect("name").to_string(),
+                manifest.parent().expect("package directory").to_path_buf(),
+            )
+        })
+        .collect();
+    members.sort();
+    assert!(
+        members.iter().any(|(n, _)| n == "northnarrow-agent")
+            && members.iter().any(|(n, _)| n == "northnarrow-watchdog"),
+        "{members:?}"
+    );
+    members
+}
+
 #[test]
 fn no_attacker_named_field_is_logged_raw() {
-    let agent = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(env!("NN_REPO_ROOT"));
     let mut files = Vec::new();
-    rs_files(&agent.join("src"), &mut files);
-    rs_files(&agent.join("../watchdog/src"), &mut files);
+    for (_, dir) in members() {
+        if dir.join("src").is_dir() {
+            rs_files(&dir.join("src"), &mut files);
+        }
+    }
     assert!(files.len() > 50, "the scan found {} files", files.len());
     let (mut bad, mut calls) = (Vec::new(), 0);
     for p in &files {
         let rel = p
-            .strip_prefix(agent)
+            .strip_prefix(root)
             .unwrap_or(p)
             .to_string_lossy()
             .into_owned();
@@ -307,16 +362,35 @@ fn no_attacker_named_field_is_logged_raw() {
     );
 }
 
-/// The agent and the watchdog write their log through the line guard.
+/// The agent and the watchdog write their log through the line guard: the
+/// statement that installs the process's subscriber
+/// (`tracing_subscriber::fmt()…init()`), in whichever file of the daemon's
+/// sources it lives (R00: `main.rs` today, a boot phase after R11a).
 #[test]
 fn both_daemons_log_through_the_line_guard() {
-    let agent = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for main in ["src/main.rs", "../watchdog/src/main.rs"] {
-        let src = std::fs::read_to_string(agent.join(main)).unwrap();
-        assert!(
-            src.contains(".with_writer(common::log_escape::stdout_one_line)")
-                && src.contains(".with_ansi(common::log_escape::stdout_ansi())"),
-            "{main}: the fmt layer must write through common::log_escape::stdout_one_line"
-        );
+    for (pkg, dir) in members() {
+        if pkg != "northnarrow-agent" && pkg != "northnarrow-watchdog" {
+            continue;
+        }
+        let mut files = Vec::new();
+        rs_files(&dir.join("src"), &mut files);
+        let mut installs = 0;
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap();
+            for stmt in src.split("tracing_subscriber::fmt()").skip(1) {
+                let stmt = &stmt[..stmt.find(';').unwrap_or(stmt.len())];
+                if !(stmt.contains(".init()") || stmt.contains(".try_init()")) {
+                    continue; // a test's own subscriber (`with_default`)
+                }
+                installs += 1;
+                assert!(
+                    stmt.contains(".with_writer(common::log_escape::stdout_one_line)")
+                        && stmt.contains(".with_ansi(common::log_escape::stdout_ansi())"),
+                    "{}: the fmt layer must write through common::log_escape::stdout_one_line",
+                    f.display()
+                );
+            }
+        }
+        assert!(installs >= 1, "{pkg}: no file installs the fmt subscriber");
     }
 }

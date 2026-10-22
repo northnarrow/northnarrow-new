@@ -16,6 +16,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod support;
+
 /// The certificate identity every attestation check must require: the
 /// release workflow of this repository, run for a `v*` tag (SUP-001).
 const RELEASE_IDENTITY_REGEX: &str =
@@ -1888,8 +1890,10 @@ fn kani_runs_every_proof_on_the_prs_that_touch_it() {
     let root = repo_root();
     let mut files = Vec::new();
     let mut harnesses = Vec::new();
-    for krate in ["agent", "common", "watchdog", "cli", "ebpf-guard", "xtask"] {
-        for file in files_under(&root.join(krate).join("src"), &[".rs"], &[]) {
+    // every member's sources (`cargo metadata`, lab PR 239: the list was
+    // written here, and a proof in a crate it missed never ran)
+    for krate in support::members().into_iter().map(|m| m.dir) {
+        for file in files_under(&root.join(&krate).join("src"), &[".rs"], &[]) {
             let text = read(&file);
             let lines: Vec<&str> = text.lines().collect();
             let mut found = false;

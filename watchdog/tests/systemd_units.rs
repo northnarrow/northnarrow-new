@@ -9,8 +9,7 @@
 use std::path::PathBuf;
 
 fn unit(name: &str) -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
+    let p = PathBuf::from(env!("NN_REPO_ROOT"))
         .join("deploy")
         .join("systemd")
         .join(name);
@@ -510,8 +509,7 @@ fn the_units_pass_systemd_analyze_verify() {
 // ── package hooks: the rollback restart (external audit DEP-010) ──────
 
 fn pkg_hook(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
+    PathBuf::from(env!("NN_REPO_ROOT"))
         .join("deploy/release/pkg")
         .join(name)
 }

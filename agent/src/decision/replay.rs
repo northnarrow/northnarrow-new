@@ -329,7 +329,7 @@ pub fn policy_test(
 mod tests {
     use super::*;
 
-    const CONFIGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../configs");
+    const CONFIGS: &str = concat!(env!("NN_REPO_ROOT"), "/configs");
 
     fn shell_line() -> String {
         let e = crate::decision::rules::testutil::spawn("payload", "/tmp/payload");

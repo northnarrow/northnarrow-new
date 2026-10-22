@@ -41,10 +41,14 @@ pub const NETFLOW_COMM_ALLOWLIST_LOCAL: &str = "/etc/northnarrow/netflow-comm-al
 
 /// External audit LLMR-016: the shipped default lists, built in — used
 /// when the `.v1` on disk cannot be read.
-pub const BUILTIN_PROCESS_COMM_ALLOWLIST_V1: &str =
-    include_str!("../../../configs/process-comm-allowlist.v1");
-pub const BUILTIN_NETFLOW_COMM_ALLOWLIST_V1: &str =
-    include_str!("../../../configs/netflow-comm-allowlist.v1");
+pub const BUILTIN_PROCESS_COMM_ALLOWLIST_V1: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/process-comm-allowlist.v1"
+));
+pub const BUILTIN_NETFLOW_COMM_ALLOWLIST_V1: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/netflow-comm-allowlist.v1"
+));
 
 /// External audit LLMR-015 (NN-AUD-327): SHA-256 of every
 /// `process-comm-allowlist.v1` an earlier release shipped (the history of
@@ -358,7 +362,7 @@ mod tests {
     /// test gate rather than at an operator's boot.
     #[test]
     fn per_family_allowlist_files_load_clean() {
-        let configs = concat!(env!("CARGO_MANIFEST_DIR"), "/../configs");
+        let configs = concat!(env!("NN_REPO_ROOT"), "/configs");
         for (label, file, shipped) in [
             (
                 "process-comm-allowlist",

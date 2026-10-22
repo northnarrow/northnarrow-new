@@ -17,3 +17,6 @@ path = "src/lib.rs"
 # Same 0.10 line the agent + xtask already pin; no new third-party
 # surface enters the tree.
 sha2 = "0.11"
+
+[lints]
+workspace = true

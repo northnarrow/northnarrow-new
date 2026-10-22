@@ -656,8 +656,7 @@ mod tests {
     fn install_sh_knows_the_same_shipped_lists() {
         use std::collections::BTreeMap;
         let install =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/install.sh"))
-                .unwrap();
+            std::fs::read_to_string(concat!(env!("NN_REPO_ROOT"), "/deploy/install.sh")).unwrap();
         let start = install
             .find("declare -A SHIPPED_V1_EARLIER=(")
             .expect("deploy/install.sh declares SHIPPED_V1_EARLIER");
@@ -751,11 +750,8 @@ mod tests {
                     "{name}: {h}"
                 );
             }
-            let file = std::fs::read_to_string(format!(
-                "{}/../configs/{name}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let file = std::fs::read_to_string(format!("{}/configs/{name}", env!("NN_REPO_ROOT")))
+                .unwrap();
             assert_eq!(
                 file, shipped.builtin,
                 "{name}: the built-in copy is configs/"

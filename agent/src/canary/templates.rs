@@ -89,11 +89,26 @@ pub const DEFAULT_TEMPLATE_DIR: &str = "/etc/northnarrow/canary-templates";
 /// Built-in template defaults — compiled into the agent
 /// binary so tests + first-boot agents that haven't run
 /// `install.sh` yet still render valid canary content.
-const AWS_TMPL: &str = include_str!("../../../configs/canary-templates/aws.tmpl");
-const AZURE_TMPL: &str = include_str!("../../../configs/canary-templates/azure.tmpl");
-const GCP_TMPL: &str = include_str!("../../../configs/canary-templates/gcp.tmpl");
-const DOCKER_TMPL: &str = include_str!("../../../configs/canary-templates/docker.tmpl");
-const GENERIC_TMPL: &str = include_str!("../../../configs/canary-templates/generic.tmpl");
+const AWS_TMPL: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/canary-templates/aws.tmpl"
+));
+const AZURE_TMPL: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/canary-templates/azure.tmpl"
+));
+const GCP_TMPL: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/canary-templates/gcp.tmpl"
+));
+const DOCKER_TMPL: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/canary-templates/docker.tmpl"
+));
+const GENERIC_TMPL: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/configs/canary-templates/generic.tmpl"
+));
 
 /// The 5 credential families K4 ships. Wire-stable identifier
 /// strings ("aws" / "azure" / "gcp" / "docker" / "generic")

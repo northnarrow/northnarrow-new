@@ -1551,7 +1551,7 @@ mod tests {
     /// reused before the BUG-024 fix, and comments here still said so).
     #[test]
     fn no_event_ring_is_pinned() {
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../agent-ebpf/src");
+        let src = std::path::Path::new(env!("NN_REPO_ROOT")).join("agent-ebpf/src");
         let mut rings = Vec::new();
         for entry in std::fs::read_dir(&src).unwrap() {
             let path = entry.unwrap().path();

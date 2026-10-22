@@ -879,7 +879,7 @@ mod tests {
         let proc = tempfile::TempDir::new().unwrap();
         let lineage = crate::posture::lineage::AuthSessionTracker::new(proc.path());
         let engine = crate::decision::replay::engine(crate::decision::replay::HostParts {
-            configs: Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../configs")),
+            configs: Path::new(concat!(env!("NN_REPO_ROOT"), "/configs")),
             proc_root: proc.path(),
             lineage: lineage.clone(),
             ransom: Arc::new(crate::impact::RansomTracker::new(lineage)),

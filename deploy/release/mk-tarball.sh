@@ -67,12 +67,13 @@ if cargo cyclonedx --version >/dev/null 2>&1; then
     # cargo-cyclonedx emits one <override>.json per workspace member next
     # to its manifest, whatever --manifest-path says. Keep the SBOMs of
     # the shipped daemons (the agent crate also owns nn-admin; lab PR 223:
-    # the scanner the agent spawns), drop the rest.
+    # the scanner the agent spawns), drop the rest — down to depth 3: the
+    # Wave 4 crates live in crates/<name>/ (lab PR 239).
     cargo cyclonedx --format json --all --override-filename "$name.sbom" >/dev/null 2>&1
     for crate in agent watchdog scan; do
         mv "$crate/$name.sbom.json" "$OUT/$name.$crate.sbom.cdx.json" && echo "mk-tarball: $OUT/$name.$crate.sbom.cdx.json"
     done
-    find . -maxdepth 2 -name "$name.sbom.json" -delete
+    find . -maxdepth 3 -name "$name.sbom.json" -delete
 else
     echo "mk-tarball: cargo-cyclonedx not installed — SBOM skipped (cargo install cargo-cyclonedx --version 0.5.9 --locked)"
 fi

@@ -61,9 +61,9 @@ use crate::impact::RansomTracker;
 use crate::posture::lineage::AuthSessionTracker;
 
 /// The cases, the golden files and the fixture root.
-const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
+const GOLDEN_DIR: &str = concat!(env!("NN_REPO_ROOT"), "/agent/tests/golden");
 /// The repository's shipped lists (`configs/`), as install.sh lays them.
-const CONFIGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../configs");
+const CONFIGS: &str = concat!(env!("NN_REPO_ROOT"), "/configs");
 /// `1`: write the golden files instead of comparing (`cargo xtask golden
 /// --update`).
 const UPDATE_ENV: &str = "NN_GOLDEN_UPDATE";

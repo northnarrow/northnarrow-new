@@ -96,12 +96,18 @@ const UNIT_SEARCH_PATH: &[&str] = &[
 const KNOWN_DROPINS: &[(&str, &str)] = &[
     (
         "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
-        include_str!("../../deploy/systemd/10-debian-perf-paranoid.conf"),
+        include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/deploy/systemd/10-debian-perf-paranoid.conf"
+        )),
     ),
     // Lab PR 222: `install.sh --cow-guard` (the guard's fanotify group).
     (
         "/etc/systemd/system/northnarrow-agent.service.d/20-cow-guard.conf",
-        include_str!("../../deploy/systemd/20-cow-guard.conf"),
+        include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/deploy/systemd/20-cow-guard.conf"
+        )),
     ),
 ];
 
@@ -243,8 +249,14 @@ pub const MAX_PER_KIND: usize = 64;
 
 /// External audit NN-AUD-113: the units as installed, for the limits they
 /// set (`KNOWN_DROPINS` embeds the drop-in the same way).
-const AGENT_UNIT: &str = include_str!("../../deploy/systemd/northnarrow-agent.service");
-const WATCHDOG_UNIT: &str = include_str!("../../deploy/systemd/northnarrow-watchdog.service");
+const AGENT_UNIT: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/deploy/systemd/northnarrow-agent.service"
+));
+const WATCHDOG_UNIT: &str = include_str!(concat!(
+    env!("NN_REPO_ROOT"),
+    "/deploy/systemd/northnarrow-watchdog.service"
+));
 
 /// The agent unit's cgroup (cgroup v2 path, as in `/proc/self/cgroup`).
 const AGENT_UNIT_CGROUP: &str = "/system.slice/northnarrow-agent.service";

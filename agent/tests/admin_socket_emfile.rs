@@ -60,7 +60,7 @@ async fn admin_socket_survives_emfile() {
     )
     .unwrap();
     let auth = Arc::new(AdminAuth::load(&pub_path).unwrap());
-    let rules = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../configs/combat-rules.v4");
+    let rules = PathBuf::from(env!("NN_REPO_ROOT")).join("configs/combat-rules.v4");
     let isolator = Arc::new(NetworkIsolator::new(rules).unwrap());
     let posture = Arc::new(PostureMachine::new());
     let server = tokio::spawn(serve(socket.clone(), auth, posture, isolator));

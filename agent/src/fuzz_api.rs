@@ -176,7 +176,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn fuzz_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../fuzz")
+        Path::new(env!("NN_REPO_ROOT")).join("fuzz")
     }
 
     /// Every file of `fuzz/<kind>/<target>/`, sorted.

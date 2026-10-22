@@ -1293,11 +1293,18 @@ mod tests {
     mod crypto_vectors {
         use super::*;
 
-        const FIXTURE_PUB: &str = include_str!("../../tests/fixtures/overlay-v1/admin.pub");
-        const FIXTURE_BODY: &str =
-            include_str!("../../tests/fixtures/overlay-v1/process-comm-allowlist.local");
-        const FIXTURE_SIG: &str =
-            include_str!("../../tests/fixtures/overlay-v1/process-comm-allowlist.local.sig");
+        const FIXTURE_PUB: &str = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent/tests/fixtures/overlay-v1/admin.pub"
+        ));
+        const FIXTURE_BODY: &str = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent/tests/fixtures/overlay-v1/process-comm-allowlist.local"
+        ));
+        const FIXTURE_SIG: &str = include_str!(concat!(
+            env!("NN_REPO_ROOT"),
+            "/agent/tests/fixtures/overlay-v1/process-comm-allowlist.local.sig"
+        ));
         const SIGNED_TS: u64 = 1_792_540_800;
         /// SHA-256 of the overlay (`+backupd\n`).
         const BODY_SHA256: &str =
