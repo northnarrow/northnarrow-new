@@ -34,10 +34,11 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
+
+use crate::chain_host::ChainHost;
 
 /// Bytes scanned at most in one file (its tail).
 pub(crate) const MAX_SCAN_BYTES_PER_FILE: u64 = 64 * 1024 * 1024;
@@ -71,17 +72,17 @@ pub(crate) struct ChainTail {
 
 /// The newest rows of the chain log whose active file is `active`, newest
 /// first, within `query`'s budgets. See the module doc.
-pub(crate) fn read_chain_tail(active: &Path, query: &TailQuery<'_>) -> ChainTail {
-    read_chain_tail_bounded(active, query, MAX_SCAN_BYTES_PER_FILE, MAX_SCAN_BYTES_TOTAL)
+pub(crate) fn read_chain_tail<H: ChainHost>(active: &Path, query: &TailQuery<'_>) -> ChainTail {
+    read_chain_tail_bounded::<H>(active, query, MAX_SCAN_BYTES_PER_FILE, MAX_SCAN_BYTES_TOTAL)
 }
 
-fn read_chain_tail_bounded(
+fn read_chain_tail_bounded<H: ChainHost>(
     active: &Path,
     query: &TailQuery<'_>,
     per_file: u64,
     total: u64,
 ) -> ChainTail {
-    let active = crate::anchored::anchor(active);
+    let active = H::anchor(active);
     let mut files: Vec<PathBuf> = vec![active.clone()];
     files.extend(crate::chainlog::archives_newest_first(&active));
 
@@ -97,7 +98,7 @@ fn read_chain_tail_bounded(
             truncated = true;
             break;
         }
-        let Some(file) = open_regular(path) else {
+        let Some(file) = open_regular::<H>(path) else {
             continue;
         };
         let budget = FileBudget {
@@ -143,12 +144,8 @@ fn read_chain_tail_bounded(
 /// Open `path` for reading without following a final symlink and without
 /// blocking; `None` unless it is a regular file. A missing file is not an
 /// error (a log not written yet, an archive evicted meanwhile).
-fn open_regular(path: &Path) -> Option<File> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+fn open_regular<H: ChainHost>(path: &Path) -> Option<File> {
+    let file = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -328,6 +325,7 @@ fn next_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, max: usize) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_host_linux::LinuxHost;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -377,7 +375,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("log.jsonl");
         write_rows(&active, 0..1000);
-        let t = read_chain_tail(&active, &all(10 * (row(999).len() + 1)));
+        let t = read_chain_tail::<LinuxHost>(&active, &all(10 * (row(999).len() + 1)));
         assert_eq!(numbers(&t), (990..1000).rev().collect::<Vec<_>>());
         assert_eq!(t.count, 10);
         assert!(t.truncated);
@@ -388,10 +386,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("log.jsonl");
         write_rows(&active, 0..5);
-        let t = read_chain_tail(&active, &all(1 << 20));
+        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), vec![4, 3, 2, 1, 0]);
         assert!(!t.truncated);
-        let missing = read_chain_tail(&dir.path().join("none.jsonl"), &all(1 << 20));
+        let missing = read_chain_tail::<LinuxHost>(&dir.path().join("none.jsonl"), &all(1 << 20));
         assert_eq!(missing, ChainTail::default());
     }
 
@@ -411,7 +409,7 @@ mod tests {
             .unwrap();
         write_rows(&active, 6..8);
         std::fs::write(dir.path().join("log.jsonl.manifest.jsonl"), "{\"x\":1}\n").unwrap();
-        let t = read_chain_tail(&active, &all(1 << 20));
+        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), vec![7, 6, 5, 4, 3, 2, 1, 0]);
         assert!(!t.truncated);
     }
@@ -428,7 +426,7 @@ mod tests {
             since: Some(since),
             ..all(1 << 20)
         };
-        let t = read_chain_tail(&active, &q);
+        let t = read_chain_tail::<LinuxHost>(&active, &q);
         assert_eq!(numbers(&t), vec![11, 10, 9, 8]);
         assert!(!t.truncated);
     }
@@ -451,7 +449,7 @@ mod tests {
             max_rows: 8,
             ..all(1 << 20)
         };
-        let t = read_chain_tail(&active, &q);
+        let t = read_chain_tail::<LinuxHost>(&active, &q);
         assert_eq!(numbers(&t), vec![58, 56, 54, 52, 50, 48, 46, 44]);
         assert!(t.truncated);
     }
@@ -465,11 +463,12 @@ mod tests {
         write_rows(&dir.path().join("log.jsonl.000001"), 0..10);
         write_rows(&active, 10..100);
         let line = row(99).len() as u64 + 1;
-        let t = read_chain_tail_bounded(&active, &all(1 << 20), 3 * line + 5, u64::MAX);
+        let t =
+            read_chain_tail_bounded::<LinuxHost>(&active, &all(1 << 20), 3 * line + 5, u64::MAX);
         assert_eq!(numbers(&t), vec![99, 98, 97]);
         assert!(t.truncated, "the head of the active file was not read");
         // The total bound stops the descent too.
-        let t = read_chain_tail_bounded(&active, &all(1 << 20), u64::MAX, 90 * line);
+        let t = read_chain_tail_bounded::<LinuxHost>(&active, &all(1 << 20), u64::MAX, 90 * line);
         assert_eq!(t.count, 90);
         assert!(t.truncated);
     }
@@ -487,7 +486,7 @@ mod tests {
             format!("{}\n{big}\n{}\n{{\"ts\":\"torn", row(1), row(2)),
         )
         .unwrap();
-        let t = read_chain_tail(&active, &all(1024));
+        let t = read_chain_tail::<LinuxHost>(&active, &all(1024));
         assert_eq!(numbers(&t), vec![2, 1]);
         assert!(t.truncated, "the oversized row is a row left out");
     }
@@ -511,12 +510,12 @@ mod tests {
         // SAFETY: a NUL-terminated path that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         write_rows(&active, 0..2);
-        let t = read_chain_tail(&active, &all(1 << 20));
+        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), vec![1, 0]);
         // The active path itself as a symlink is refused too.
         let link = dir.path().join("link.jsonl");
         std::os::unix::fs::symlink(&secret, &link).unwrap();
-        assert_eq!(read_chain_tail(&link, &all(1 << 20)).count, 0);
+        assert_eq!(read_chain_tail::<LinuxHost>(&link, &all(1 << 20)).count, 0);
     }
 
     /// The terminator a real rotation writes is recognised.
@@ -550,7 +549,7 @@ mod tests {
             .unwrap();
         }
         assert!(!crate::chainlog::archives_newest_first(&active).is_empty());
-        let t = read_chain_tail(&active, &all(1 << 20));
+        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), (0..12).rev().collect::<Vec<_>>());
     }
 }

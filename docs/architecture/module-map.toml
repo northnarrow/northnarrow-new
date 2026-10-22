@@ -150,6 +150,9 @@ planned = false
 "async_fd" = "nn-linux"
 "atomic_file" = "nn-linux"
 "audit" = "nn-evidence"
+# post-plan (lab PR 241, R04a): the audit log's writability before the
+# attach (`access(2)`), from `audit`
+"audit_preflight" = "nn-linux"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 217): an external command with a deadline
@@ -171,6 +174,8 @@ planned = false
 # post-plan (lab PR 241, R04a): what the chains need from their host (the
 # signer; the file operations)
 "chain_host" = "nn-evidence"
+# post-plan (lab PR 241, R04a): the chains' Linux file operations
+"chain_host_linux" = "nn-linux"
 "chain_tail" = "nn-evidence"
 "chainlog" = "nn-evidence"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is

@@ -53,7 +53,6 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -66,7 +65,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
-use crate::chain_host::ChainSigner;
+use crate::chain_host::{ChainHost, ChainSigner};
 
 /// Pre-image prefix of a numbered `audit.log` row.
 pub const AUDIT_DOMAIN_V2: &[u8] = b"northnarrow/audit/v2\0";
@@ -235,15 +234,11 @@ pub type LineCheck = fn(&[u8], &VerifyingKey) -> bool;
 /// The head of `path`: its newest complete line that `genuine` accepts,
 /// looked for in a bounded window from the end. `None` when the file is
 /// missing, empty, or holds no such line in the window.
-pub fn read_file_head(
+pub fn read_file_head<H: ChainHost>(
     path: &Path,
     genuine: &dyn Fn(&[u8]) -> bool,
 ) -> std::io::Result<Option<FileHead>> {
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let mut f = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -325,16 +320,12 @@ pub enum HeadCheck {
 }
 
 /// Compare `path` with `head` in O(window).
-pub fn check_head(path: &Path, head: &FileHead) -> std::io::Result<HeadCheck> {
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+pub fn check_head<H: ChainHost>(path: &Path, head: &FileHead) -> std::io::Result<HeadCheck> {
+    let mut f = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HeadCheck::Missing),
         // A symlink put where the chain file was is not the chain.
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(HeadCheck::Changed),
+        Err(e) if H::is_symlink_refusal(&e) => return Ok(HeadCheck::Changed),
         Err(e) => return Err(e),
     };
     let meta = f.metadata()?;
@@ -414,17 +405,18 @@ pub struct ChainTarget {
 }
 
 impl ChainTarget {
-    /// The target of the rotating log of `P` at `path`.
-    pub fn rotating<P>(chain: &'static str, path: &Path) -> Self
+    /// The target of the rotating log of `P` at `path`, on the host `H`.
+    pub fn rotating<P, H>(chain: &'static str, path: &Path) -> Self
     where
         P: Serialize + serde::de::DeserializeOwned + crate::chainlog::ChainPayload,
+        H: ChainHost,
     {
         ChainTarget {
             chain,
             path: path.to_path_buf(),
             kind: ChainKind::Rotating,
             genuine: crate::chainlog::line_is_genuine::<P>,
-            recent: Some(crate::chainlog::verify_recent::<P>),
+            recent: Some(crate::chainlog::verify_recent::<P, H>),
             full: full_rotating::<P>,
             payload_kind: Some(P::KIND),
         }
@@ -613,8 +605,8 @@ pub struct HeadsStore;
 
 impl HeadsStore {
     /// The newest genuine snapshot in `path`.
-    pub fn read(path: &Path, pk: &VerifyingKey) -> HeadsRead {
-        let bytes = match read_bounded(path, 2 * SLOT_BYTES) {
+    pub fn read<H: ChainHost>(path: &Path, pk: &VerifyingKey) -> HeadsRead {
+        let bytes = match read_bounded::<H>(path, 2 * SLOT_BYTES) {
             Ok(Some(b)) => b,
             Ok(None) => return HeadsRead::Missing,
             Err(e) => return HeadsRead::Invalid(format!("unreadable: {e}")),
@@ -670,16 +662,14 @@ impl HeadsStore {
         }
         text.resize(SLOT_BYTES as usize - 1, b' ');
         text.push(b'\n');
-        let f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(HEADS_FILE_MODE)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let f = K::Host::open_with_mode_nofollow(
+            OpenOptions::new().write(true).create(true).truncate(false),
+            HEADS_FILE_MODE,
+            path,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
         let offset = (snapshot.counter % 2) * SLOT_BYTES;
-        f.write_all_at(&text, offset)
+        K::Host::write_all_at(&f, &text, offset)
             .with_context(|| format!("writing {}", path.display()))?;
         f.sync_all()
             .with_context(|| format!("fsync {}", path.display()))?;
@@ -687,12 +677,8 @@ impl HeadsStore {
     }
 }
 
-fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
-    let f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+fn read_bounded<H: ChainHost>(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let f = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -703,17 +689,21 @@ fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
 }
 
 /// The heads of every target, read from disk now.
-pub fn collect_heads(targets: &[ChainTarget], pk: &VerifyingKey) -> Vec<AnchoredHead> {
+pub fn collect_heads<H: ChainHost>(
+    targets: &[ChainTarget],
+    pk: &VerifyingKey,
+) -> Vec<AnchoredHead> {
     let mut out = Vec::new();
     for t in targets {
         let genuine = |l: &[u8]| (t.genuine)(l, pk);
-        let head = |path: &Path, check: &dyn Fn(&[u8]) -> bool| match read_file_head(path, check) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, path = %path.display(), "chain head: file not read");
-                None
-            }
-        };
+        let head =
+            |path: &Path, check: &dyn Fn(&[u8]) -> bool| match read_file_head::<H>(path, check) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(error = %e, path = %path.display(), "chain head: file not read");
+                    None
+                }
+            };
         match t.kind {
             ChainKind::Flat => {
                 if let Some(h) = head(&t.path, &genuine) {
@@ -894,9 +884,13 @@ impl BootCheck {
 /// Compare the chains with what was anchored: every head of the last
 /// snapshot in `heads_file`, and the newest manifest checkpoint of every
 /// rotating log. O(1) reads per file; run before any writer opens.
-pub fn boot_check(targets: &[ChainTarget], heads_file: &Path, pk: &VerifyingKey) -> BootCheck {
+pub fn boot_check<H: ChainHost>(
+    targets: &[ChainTarget],
+    heads_file: &Path,
+    pk: &VerifyingKey,
+) -> BootCheck {
     let mut out = BootCheck::default();
-    match HeadsStore::read(heads_file, pk) {
+    match HeadsStore::read::<H>(heads_file, pk) {
         HeadsRead::Valid(s) => out.previous = Some(s),
         HeadsRead::Invalid(why) => out.findings.push(ChainFinding::new(
             "chain_heads",
@@ -910,14 +904,14 @@ pub fn boot_check(targets: &[ChainTarget], heads_file: &Path, pk: &VerifyingKey)
     }
     if let Some(prev) = &out.previous {
         for h in &prev.heads {
-            check_anchored(h, &prev.ts, targets, &mut out.findings);
+            check_anchored::<H>(h, &prev.ts, targets, &mut out.findings);
         }
     }
     for t in targets
         .iter()
         .filter(|t| matches!(t.kind, ChainKind::Rotating))
     {
-        check_rotating(t, pk, &mut out.findings);
+        check_rotating::<H>(t, pk, &mut out.findings);
     }
     // One finding per file and kind is enough.
     let mut seen = std::collections::HashSet::new();
@@ -959,7 +953,7 @@ fn holder(active: &Path, generation: u64) -> Holder {
     }
 }
 
-fn check_anchored(
+fn check_anchored<H: ChainHost>(
     h: &AnchoredHead,
     anchored_at: &str,
     targets: &[ChainTarget],
@@ -993,7 +987,7 @@ fn check_anchored(
             _ => t.path.clone(),
         }
     };
-    report_head(
+    report_head::<H>(
         &h.chain,
         &path,
         &h.head,
@@ -1002,7 +996,7 @@ fn check_anchored(
     );
 }
 
-fn report_head(
+fn report_head<H: ChainHost>(
     chain: &str,
     path: &Path,
     head: &FileHead,
@@ -1014,7 +1008,7 @@ fn report_head(
         "the head {source} ends at byte {} ({row}entry_hash {})",
         head.bytes, head.tail_hash
     );
-    let finding = match check_head(path, head) {
+    let finding = match check_head::<H>(path, head) {
         Ok(HeadCheck::Intact) => return,
         Ok(HeadCheck::Missing) => ("chain_missing", format!("the file is gone; {what}")),
         Ok(HeadCheck::Shorter { len }) => (
@@ -1035,9 +1029,13 @@ fn report_head(
 
 /// The newest manifest checkpoint, and a missing active file, of one
 /// rotating log.
-fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFinding>) {
+fn check_rotating<H: ChainHost>(
+    t: &ChainTarget,
+    pk: &VerifyingKey,
+    findings: &mut Vec<ChainFinding>,
+) {
     let tail =
-        crate::chainlog::manifest_tail_events(&t.path, t.payload_kind.unwrap_or_default(), pk);
+        crate::chainlog::manifest_tail_events::<H>(&t.path, t.payload_kind.unwrap_or_default(), pk);
     if let Some((seq, head)) = tail.iter().find_map(|e| match e {
         crate::chainlog::ManifestEvent::ActiveCheckpoint {
             seq,
@@ -1054,7 +1052,7 @@ fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFi
         _ => None,
     }) {
         match holder(&t.path, seq) {
-            Holder::File(p) => report_head(
+            Holder::File(p) => report_head::<H>(
                 t.chain,
                 &p,
                 &head,
@@ -1154,12 +1152,11 @@ impl<K: ChainSigner> Anchor<K> {
             return Ok(());
         }
         let create = |path: &Path| -> Result<()> {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(HEADS_FILE_MODE)
-                .open(path)
-            {
+            match K::Host::open_with_mode(
+                OpenOptions::new().write(true).create_new(true),
+                HEADS_FILE_MODE,
+                path,
+            ) {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                 Err(e) => Err(anyhow!(e).context(format!("creating {}", path.display()))),
@@ -1182,7 +1179,7 @@ impl<K: ChainSigner> Anchor<K> {
     /// Re-read every head; write a snapshot when `force` or one moved
     /// (or the sticky flag turned on). Returns the heads that moved.
     pub fn refresh(&mut self, force: bool, second_key_added: bool) -> Result<Vec<AnchoredHead>> {
-        let heads = collect_heads(&self.targets, &self.key.verifying_key());
+        let heads = collect_heads::<K::Host>(&self.targets, &self.key.verifying_key());
         let flag = self.second_key_added || second_key_added;
         // Sticky in memory even if the write below fails.
         self.second_key_added = flag;
@@ -1336,6 +1333,8 @@ pub(crate) fn append_raw(path: &Path, bytes: &[u8]) {
 mod tests {
     use super::*;
     use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
+    use crate::chain_host_linux::LinuxHost;
+    use std::os::unix::fs::FileExt;
     use tempfile::TempDir;
 
     fn draft(n: u32) -> AuditEntryDraft {
@@ -1405,28 +1404,37 @@ mod tests {
             log.append(draft(n)).unwrap();
         }
         let ok = |l: &[u8]| crate::audit::row_is_genuine(l, &pk);
-        let head = read_file_head(&path, &ok).unwrap().unwrap();
+        let head = read_file_head::<LinuxHost>(&path, &ok).unwrap().unwrap();
         assert_eq!(head.seq, Some(4));
         assert_eq!(head.bytes, std::fs::metadata(&path).unwrap().len());
-        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Intact);
+        assert_eq!(
+            check_head::<LinuxHost>(&path, &head).unwrap(),
+            HeadCheck::Intact
+        );
         // growth keeps it intact
         log.append(draft(9)).unwrap();
-        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Intact);
+        assert_eq!(
+            check_head::<LinuxHost>(&path, &head).unwrap(),
+            HeadCheck::Intact
+        );
         // a forged trailing line is not a head
         append_raw(&path, b"{\"entry_hash\":\"");
         append_raw(&path, "ab".repeat(32).as_bytes());
         append_raw(&path, b"\"}\n");
-        let again = read_file_head(&path, &ok).unwrap().unwrap();
+        let again = read_file_head::<LinuxHost>(&path, &ok).unwrap().unwrap();
         assert_eq!(again.seq, Some(5));
         // cut below the head
         let body = std::fs::read(&path).unwrap();
         std::fs::write(&path, &body[..head.bytes as usize - 10]).unwrap();
         assert!(matches!(
-            check_head(&path, &head).unwrap(),
+            check_head::<LinuxHost>(&path, &head).unwrap(),
             HeadCheck::Shorter { .. }
         ));
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Missing);
+        assert_eq!(
+            check_head::<LinuxHost>(&path, &head).unwrap(),
+            HeadCheck::Missing
+        );
     }
 
     #[test]
@@ -1435,9 +1443,12 @@ mod tests {
         let k = key(&dir);
         let pk = k.verifying_key();
         let file = dir.path().join(HEADS_FILE_NAME);
-        assert_eq!(HeadsStore::read(&file, &pk), HeadsRead::Missing);
+        assert_eq!(
+            HeadsStore::read::<LinuxHost>(&file, &pk),
+            HeadsRead::Missing
+        );
         std::fs::write(&file, b"").unwrap();
-        assert_eq!(HeadsStore::read(&file, &pk), HeadsRead::Empty);
+        assert_eq!(HeadsStore::read::<LinuxHost>(&file, &pk), HeadsRead::Empty);
         let mut s = HeadsSnapshot {
             counter: 1,
             ts: "t1".into(),
@@ -1449,18 +1460,22 @@ mod tests {
         s.counter = 2;
         s.ts = "t2".into();
         HeadsStore::write(&file, &k, &s).unwrap();
-        assert!(matches!(HeadsStore::read(&file, &pk), HeadsRead::Valid(v) if v.counter == 2));
+        assert!(
+            matches!(HeadsStore::read::<LinuxHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 2)
+        );
         // slot of counter 2 torn: counter 1 is still there
         let f = OpenOptions::new().write(true).open(&file).unwrap();
         f.write_all_at(b"{\"torn", 0).unwrap();
-        assert!(matches!(HeadsStore::read(&file, &pk), HeadsRead::Valid(v) if v.counter == 1));
+        assert!(
+            matches!(HeadsStore::read::<LinuxHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 1)
+        );
         // another key's snapshot is not genuine
         let other = AgentSigningKey::load_or_bootstrap(&dir.path().join("other")).unwrap();
         HeadsStore::write(&file, &other, &s).unwrap();
         s.counter = 3;
         HeadsStore::write(&file, &other, &s).unwrap();
         assert!(matches!(
-            HeadsStore::read(&file, &pk),
+            HeadsStore::read::<LinuxHost>(&file, &pk),
             HeadsRead::Invalid(_)
         ));
     }
@@ -1496,7 +1511,7 @@ mod tests {
     }
 
     fn rotating_target(path: &Path) -> ChainTarget {
-        ChainTarget::rotating::<P>("test_log", path)
+        ChainTarget::rotating::<P, LinuxHost>("test_log", path)
     }
 
     fn rotating_log(
@@ -1542,7 +1557,7 @@ mod tests {
         drop(log);
         drop(rotating_log(&active, key(&dir), 1 << 30));
         std::fs::write(&active, b"").unwrap();
-        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].kind, "chain_truncated");
         // (b) no checkpoint yet: the snapshot taken at stop
@@ -1552,7 +1567,9 @@ mod tests {
             log.append(p(n)).unwrap();
         }
         drop(log);
-        assert!(crate::chainlog::manifest_tail_events(&active, "test_log", &pk).is_empty());
+        assert!(
+            crate::chainlog::manifest_tail_events::<LinuxHost>(&active, "test_log", &pk).is_empty()
+        );
         Anchor::new(
             heads.clone(),
             k,
@@ -1563,11 +1580,13 @@ mod tests {
         )
         .refresh(true, false)
         .unwrap();
-        assert!(boot_check(&[rotating_target(&active)], &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk)
+                .findings
+                .is_empty()
+        );
         std::fs::write(&active, b"").unwrap();
-        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].kind, "chain_truncated");
         assert_eq!(found.findings[0].chain, "test_log");
@@ -1589,7 +1608,7 @@ mod tests {
         drop(log);
         assert!(crate::chainlog::current_generation(&active) > 1);
         std::fs::remove_file(&active).unwrap();
-        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk);
         assert!(
             found
                 .findings

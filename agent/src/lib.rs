@@ -19,6 +19,9 @@ pub mod anti_tamper;
 pub mod async_fd;
 pub mod atomic_file;
 pub mod audit;
+/// The audit log's writability before the attach (from `audit`, R04a, lab
+/// PR 241).
+pub mod audit_preflight;
 /// Lab PR 218: the start as typed phases, the BPF LSM gate, the deny
 /// self-test, the degradations, the trust level and the capability manifest.
 pub mod boot;
@@ -30,6 +33,8 @@ pub mod canary;
 pub mod chain_anchor;
 /// What the signed chains need from their host (R04a, lab PR 241).
 pub mod chain_host;
+/// The Linux host of the signed chains (R04a, lab PR 241).
+pub mod chain_host_linux;
 pub(crate) mod chain_tail;
 pub mod chainlog;
 /// The agent's chains: paths, checks, anchoring tasks (from `chain_anchor`,

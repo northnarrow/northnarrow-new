@@ -262,6 +262,7 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 
 /// The chains sign with the agent's key.
 impl ChainSigner for AgentSigningKey {
+    type Host = crate::chain_host_linux::LinuxHost;
     fn sign(&self, msg: &[u8]) -> Signature {
         AgentSigningKey::sign(self, msg)
     }

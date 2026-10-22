@@ -1212,7 +1212,7 @@ pub fn run_chain_verify(
             }
         })
         .collect();
-    let check = crate::chain_anchor::boot_check(&targets, heads, pubkey);
+    let check = crate::chains::boot_check(&targets, heads, pubkey);
     for f in &check.findings {
         out.push(ChainVerifyLine {
             chain: f.chain.clone(),

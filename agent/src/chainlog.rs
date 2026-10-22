@@ -68,7 +68,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -82,7 +81,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
-use crate::chain_host::ChainSigner;
+use crate::chain_host::{ChainHost, ChainSigner};
 
 /// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
 /// line (the legacy flat line, NO `fmt_ver`) and a v2 line are read and
@@ -697,8 +696,8 @@ fn to_jsonl<T: Serialize>(line: &T) -> Result<String> {
 }
 
 /// Append a pre-serialised line to `path` (create if missing) + fsync.
-fn append_and_fsync(path: &Path, line: &str, mode: u32) -> Result<()> {
-    let f = append_line(path, line, mode)?;
+fn append_and_fsync<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<()> {
+    let f = append_line::<H>(path, line, mode)?;
     f.sync_all()
         .with_context(|| format!("fsync {}", path.display()))?;
     Ok(())
@@ -706,12 +705,8 @@ fn append_and_fsync(path: &Path, line: &str, mode: u32) -> Result<()> {
 
 /// Append a pre-serialised line to `path` (create if missing), without
 /// waiting for the disk. Returns the open file.
-fn append_line(path: &Path, line: &str, mode: u32) -> Result<std::fs::File> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(mode)
-        .open(path)
+fn append_line<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<std::fs::File> {
+    let mut f = H::open_with_mode(OpenOptions::new().create(true).append(true), mode, path)
         .with_context(|| format!("opening chainlog {} for append", path.display()))?;
     f.write_all(line.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
@@ -930,7 +925,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     ) -> Result<Self> {
         // Review entry 44: every later open/rename goes through a directory
         // fd taken now, so a mount over the directory cannot divert the log.
-        let anchored = crate::anchored::anchor(active_path);
+        let anchored = K::Host::anchor(active_path);
         let active_path = anchored.as_path();
         let manifest_path = manifest_path_for(active_path);
         let next_seq = scan_max_archive_seq(active_path)?.map_or(1, |m| m + 1);
@@ -1044,7 +1039,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // manifest already says exactly that. Non-fatal.
         if log.pending_seal.is_none() && log.active_bytes > 0 {
             let current = (log.next_seq, log.active_bytes, log.last_hash.clone());
-            let anchored = manifest_tail_events(&log.active_path, P::KIND, &pubkey)
+            let anchored = manifest_tail_events::<K::Host>(&log.active_path, P::KIND, &pubkey)
                 .into_iter()
                 .find_map(|e| match e {
                     ManifestEvent::ActiveCheckpoint {
@@ -1110,12 +1105,11 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         let manifest = self.manifest_path.clone();
         let mode = self.cfg.file_mode;
         self.protection
-            .with_mutable_dir(&mut || match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(mode)
-                .open(&manifest)
-            {
+            .with_mutable_dir(&mut || match K::Host::open_with_mode(
+                OpenOptions::new().create_new(true).write(true),
+                mode,
+                &manifest,
+            ) {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                 Err(e) => Err(anyhow!(e).context(format!("creating {}", manifest.display()))),
@@ -1202,12 +1196,12 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     /// Write `bytes` to the active file, with or without an fsync.
     fn write_active(&mut self, bytes: &str, durable: bool) -> Result<()> {
         if durable {
-            append_and_fsync(&self.active_path, bytes, self.cfg.file_mode)?;
+            append_and_fsync::<K::Host>(&self.active_path, bytes, self.cfg.file_mode)?;
             // The fsync covers the earlier deferred lines of this file.
             self.unsynced = false;
             self.fsyncs += 1;
         } else {
-            append_line(&self.active_path, bytes, self.cfg.file_mode)?;
+            append_line::<K::Host>(&self.active_path, bytes, self.cfg.file_mode)?;
             self.unsynced = true;
         }
         Ok(())
@@ -1282,7 +1276,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         // SEAL: append the terminator to the active file. Done OUTSIDE the
         // `+i` dance — appending to an *existing* file is allowed under an
         // immutable dir; only NEW/renamed dir entries need the lift.
-        append_and_fsync(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)?;
+        append_and_fsync::<K::Host>(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)?;
         // The terminator's fsync covers the deferred lines before it.
         self.unsynced = false;
         self.fsyncs += 1;
@@ -1341,7 +1335,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             let mut attempts = 0;
             loop {
                 let archive = archive_path(&active, seq);
-                match rename_noreplace(&active, &archive) {
+                match K::Host::rename_noreplace(&active, &archive) {
                     Ok(()) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         let (kind, bytes) = slot_kind(&archive).unwrap_or(("other", 0));
@@ -1377,7 +1371,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             self.checkpoint_at = std::time::Instant::now();
             // 3. Fresh empty active (O_EXCL: never truncate or follow a name
             //    that appeared after the rename) + register its inode.
-            create_fresh_active(&active, file_mode)?;
+            create_fresh_active::<K::Host>(&active, file_mode)?;
             protection_inner.register_active(&active)?;
             // 4. Manifest + eviction — NON-FATAL (archive already committed).
             let evicted = evict_excess_archives(&active, max_archives, protection_inner.as_ref())
@@ -1540,7 +1534,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             event,
         };
         let line = ManifestLine::sealed(entry, &self.key, &self.manifest_last_hash, P::KIND)?;
-        append_and_fsync(&self.manifest_path, &to_jsonl(&line)?, self.cfg.file_mode)?;
+        append_and_fsync::<K::Host>(&self.manifest_path, &to_jsonl(&line)?, self.cfg.file_mode)?;
         self.manifest_last_hash = line.entry_hash;
         Ok(())
     }
@@ -1699,55 +1693,17 @@ fn next_free_candidate(active: &Path, taken: u64) -> u64 {
     max.max(taken) + 1
 }
 
-/// `rename(from, to)` that fails with `AlreadyExists` instead of replacing
-/// `to` (`renameat2(RENAME_NOREPLACE)`). External audit NN-AUD-115. On a
-/// filesystem without the flag, fall back to an `lstat` check then a
-/// plain rename (the window is inside the rotation's `+i` dance).
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let cstr = |p: &Path| {
-        std::ffi::CString::new(p.as_os_str().as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-    };
-    let (f, t) = (cstr(from)?, cstr(to)?);
-    // SAFETY: two NUL-terminated paths that outlive the call; renameat2
-    // only reads them.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            f.as_ptr(),
-            libc::AT_FDCWD,
-            t.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EINVAL) | Some(libc::ENOSYS) => {
-            if fs::symlink_metadata(to).is_ok() {
-                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
-            }
-            fs::rename(from, to)
-        }
-        _ => Err(err),
-    }
-}
-
 /// Create the fresh, empty active file after a rotation. External audit
 /// NN-AUD-115: `O_CREAT|O_EXCL` (which also refuses a dangling symlink), so
 /// a name that appeared after the rename is an error, never truncated or
 /// followed.
-fn create_fresh_active(active: &Path, mode: u32) -> Result<()> {
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(mode)
-        .open(active)
-        .with_context(|| format!("creating fresh active {}", active.display()))?;
+fn create_fresh_active<H: ChainHost>(active: &Path, mode: u32) -> Result<()> {
+    H::open_with_mode(
+        OpenOptions::new().create_new(true).write(true),
+        mode,
+        active,
+    )
+    .with_context(|| format!("creating fresh active {}", active.display()))?;
     Ok(())
 }
 
@@ -2089,13 +2045,13 @@ const MANIFEST_TAIL_WINDOW: u64 = 256 * 1024;
 /// [`MANIFEST_TAIL_WINDOW`] bytes of the manifest of `active`, the log
 /// `kind` ([`ChainPayload::KIND`]), newest first. Lines that do not verify
 /// are left out.
-pub fn manifest_tail_events(active: &Path, kind: &str, pk: &VerifyingKey) -> Vec<ManifestEvent> {
+pub fn manifest_tail_events<H: ChainHost>(
+    active: &Path,
+    kind: &str,
+    pk: &VerifyingKey,
+) -> Vec<ManifestEvent> {
     let path = manifest_path_for(active);
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)
-    {
+    let mut f = match H::open_read_nofollow(&path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
@@ -2637,7 +2593,7 @@ pub struct RecentReport {
 /// the active file must verify (hash and signature) and link to the line
 /// before it. The full check of the set is [`verify_log_set`]
 /// (`nn-admin chain verify`).
-pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload>(
+pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHost>(
     active: &Path,
     pubkey: &VerifyingKey,
     max_bytes: u64,
@@ -2649,11 +2605,7 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload>(
         reason,
     };
     let generation = current_generation(active);
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(active)
-    {
+    let mut f = match H::open_read_nofollow(active) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RecentReport {
@@ -3008,6 +2960,7 @@ fn verify_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_host_linux::LinuxHost;
     use tempfile::TempDir;
 
     #[test]
@@ -3521,7 +3474,7 @@ mod tests {
         // v1: `fmt_ver` omitted on the wire (skip_serializing_if), untagged
         // pre-image.
         let line = ChainLine::sealed_as(p, None, k, prev_hash).unwrap();
-        append_and_fsync(path, &to_jsonl(&line).unwrap(), 0o600).unwrap();
+        append_and_fsync::<LinuxHost>(path, &to_jsonl(&line).unwrap(), 0o600).unwrap();
         line.entry_hash
     }
 
@@ -3855,7 +3808,7 @@ mod tests {
             TestPayload::KIND,
         )
         .unwrap();
-        append_and_fsync(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
+        append_and_fsync::<LinuxHost>(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
         assert!(
             list_archive_seqs(&active).unwrap().is_empty(),
             "pre-recovery: sealed active, no archive yet"
@@ -3922,7 +3875,7 @@ mod tests {
             TestPayload::KIND,
         )
         .unwrap();
-        append_and_fsync(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
+        append_and_fsync::<LinuxHost>(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
         // open #1 completes the interrupted rotation → archive seq-1 + EMPTY active.
         drop(
             RotatingChainLog::<TestPayload>::open(
@@ -4409,20 +4362,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let existing = dir.path().join("existing");
         fs::write(&existing, b"keep").unwrap();
-        assert!(create_fresh_active(&existing, 0o600).is_err());
+        assert!(create_fresh_active::<LinuxHost>(&existing, 0o600).is_err());
         assert_eq!(fs::read(&existing).unwrap(), b"keep");
         let victim = dir.path().join("victim");
         fs::write(&victim, b"victim").unwrap();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
-        assert!(create_fresh_active(&link, 0o600).is_err());
+        assert!(create_fresh_active::<LinuxHost>(&link, 0o600).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"victim");
         let dangling = dir.path().join("dangling");
         std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
-        assert!(create_fresh_active(&dangling, 0o600).is_err());
+        assert!(create_fresh_active::<LinuxHost>(&dangling, 0o600).is_err());
         assert!(!dir.path().join("nowhere").exists());
         let fresh = dir.path().join("fresh");
-        create_fresh_active(&fresh, 0o600).unwrap();
+        create_fresh_active::<LinuxHost>(&fresh, 0o600).unwrap();
         assert_eq!(fs::metadata(&fresh).unwrap().len(), 0);
     }
 
@@ -4567,7 +4520,7 @@ mod tests {
         fs::remove_file(&active).unwrap();
         let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
         assert!(matches!(err, LogSetError::ActiveMissing { .. }), "{err:?}");
-        let tail = manifest_tail_events(&active, TestPayload::KIND, &pk);
+        let tail = manifest_tail_events::<LinuxHost>(&active, TestPayload::KIND, &pk);
         assert!(active_missing(&active, &tail).is_some());
     }
 
@@ -4612,9 +4565,9 @@ mod tests {
             log.append(payload(i)).unwrap();
         }
         drop(log);
-        let whole = verify_recent::<TestPayload>(&active, &pk, 1 << 20).unwrap();
+        let whole = verify_recent::<TestPayload, LinuxHost>(&active, &pk, 1 << 20).unwrap();
         assert_eq!((whole.lines, whole.whole_file), (20, true));
-        let part = verify_recent::<TestPayload>(&active, &pk, 600).unwrap();
+        let part = verify_recent::<TestPayload, LinuxHost>(&active, &pk, 600).unwrap();
         assert!(!part.whole_file && part.lines < 20 && part.lines > 0);
         // a fabricated detection-shaped line at the end
         let forged = format!(
@@ -4624,7 +4577,7 @@ mod tests {
             "11".repeat(32)
         );
         append_raw(&active, forged.as_bytes());
-        assert!(verify_recent::<TestPayload>(&active, &pk, 1 << 20).is_err());
+        assert!(verify_recent::<TestPayload, LinuxHost>(&active, &pk, 1 << 20).is_err());
         assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
     }
 
@@ -5007,7 +4960,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    verify_recent::<TestPayload>(&active, &pk, 1 << 20),
+                    verify_recent::<TestPayload, LinuxHost>(&active, &pk, 1 << 20),
                     Err(LogSetError::NonCanonicalLine { idx: 1, .. })
                 ),
                 "{what}: boot check"
@@ -5141,8 +5094,8 @@ mod tests {
                 if file.ends_with(".manifest.jsonl")),
             "{err:?}"
         );
-        assert!(manifest_tail_events(&b, TwinPayload::KIND, &pk).is_empty());
-        assert!(!manifest_tail_events(&b, TestPayload::KIND, &pk).is_empty());
+        assert!(manifest_tail_events::<LinuxHost>(&b, TwinPayload::KIND, &pk).is_empty());
+        assert!(!manifest_tail_events::<LinuxHost>(&b, TestPayload::KIND, &pk).is_empty());
     }
 
     /// EVD-008: the three line types are signed under three domains, per
@@ -5208,7 +5161,7 @@ mod tests {
             "{err:?}"
         );
         assert!(matches!(
-            verify_recent::<TestPayload>(&active, &pk, 1 << 20),
+            verify_recent::<TestPayload, LinuxHost>(&active, &pk, 1 << 20),
             Err(LogSetError::LegacyAfterV3 { idx: 3, .. })
         ));
     }
@@ -5350,7 +5303,7 @@ mod tests {
             let l = ChainLine::sealed_as(payload(i), Some(CHAINLOG_FMT_V2), &k, &prev).unwrap();
             let s = to_jsonl(&l).unwrap();
             bytes += s.len() as u64;
-            append_and_fsync(&archive1, &s, 0o600).unwrap();
+            append_and_fsync::<LinuxHost>(&archive1, &s, 0o600).unwrap();
             prev = l.entry_hash;
         }
         let rotate = RotateTerminator {
@@ -5361,7 +5314,7 @@ mod tests {
             bytes,
         };
         let term = TerminatorLine::sealed(rotate, &k, &prev, kind).unwrap();
-        append_and_fsync(&archive1, &to_jsonl(&term).unwrap(), 0o600).unwrap();
+        append_and_fsync::<LinuxHost>(&archive1, &to_jsonl(&term).unwrap(), 0o600).unwrap();
         let rotated = ManifestEntry {
             fmt_ver: CHAINLOG_FMT_V2,
             ts: now_ts(),
@@ -5373,11 +5326,12 @@ mod tests {
             },
         };
         let m = ManifestLine::sealed(rotated, &k, GENESIS_PREV_HASH, kind).unwrap();
-        append_and_fsync(&manifest_path_for(&active), &to_jsonl(&m).unwrap(), 0o600).unwrap();
+        append_and_fsync::<LinuxHost>(&manifest_path_for(&active), &to_jsonl(&m).unwrap(), 0o600)
+            .unwrap();
         let mut prev = term.entry_hash.clone();
         for i in 3..5 {
             let l = ChainLine::sealed_as(payload(i), Some(CHAINLOG_FMT_V2), &k, &prev).unwrap();
-            append_and_fsync(&active, &to_jsonl(&l).unwrap(), 0o600).unwrap();
+            append_and_fsync::<LinuxHost>(&active, &to_jsonl(&l).unwrap(), 0o600).unwrap();
             prev = l.entry_hash;
         }
         let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();

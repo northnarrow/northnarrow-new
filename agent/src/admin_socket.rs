@@ -3455,7 +3455,7 @@ fn read_tail_jsonl(
     max_rows: usize,
 ) -> (String, u32, bool) {
     let since = since.map(format_iso8601_unix);
-    let tail = crate::chain_tail::read_chain_tail(
+    let tail = crate::chain_tail::read_chain_tail::<crate::chain_host_linux::LinuxHost>(
         path,
         &crate::chain_tail::TailQuery {
             since: since.as_deref(),

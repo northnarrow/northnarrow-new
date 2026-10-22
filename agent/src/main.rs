@@ -1491,7 +1491,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     let heads_file = cli.resolved_chain_heads_file();
     let chain_targets = cli.chain_paths().targets();
     let mut boot_chains = match northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
-        Some(pk) => northnarrow_agent::chain_anchor::boot_check(&chain_targets, &heads_file, &pk),
+        Some(pk) => northnarrow_agent::chains::boot_check(&chain_targets, &heads_file, &pk),
         None => {
             info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
             northnarrow_agent::chain_anchor::BootCheck::default()
@@ -1944,19 +1944,19 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // writability before anything attaches — a read-only mount or an
     // immutable file refuses the start while the host is untouched. The
     // signed `agent_boot` after the attach still proves it with a row.
-    match northnarrow_agent::audit::preflight_writable(
+    match northnarrow_agent::audit_preflight::preflight_writable(
         &cli.audit_log_file,
         early_registration_failed,
     ) {
-        northnarrow_agent::audit::AuditPreflight::Writable => {
+        northnarrow_agent::audit_preflight::AuditPreflight::Writable => {
             debug!(path = %cli.audit_log_file.display(), "audit log writable (preflight)")
         }
-        northnarrow_agent::audit::AuditPreflight::Deferred(why) => info!(
+        northnarrow_agent::audit_preflight::AuditPreflight::Deferred(why) => info!(
             why,
             "audit log closed to this process until the attach registers it — the boot probe \
              decides"
         ),
-        northnarrow_agent::audit::AuditPreflight::Unwritable(why) => {
+        northnarrow_agent::audit_preflight::AuditPreflight::Unwritable(why) => {
             let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
                 std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
                     .ok()

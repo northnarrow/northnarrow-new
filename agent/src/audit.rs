@@ -75,9 +75,8 @@
 //! 8. `verify_chain` rejects an entry whose signature was
 //!    flipped.
 
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -87,7 +86,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::chain_host::ChainSigner;
+use crate::chain_host::{ChainHost, ChainSigner};
 /// The agent's signing key and its files: `crate::keys`' since R04a (lab
 /// PR 241), named here as they were until the shims go (R17).
 pub use crate::keys::{
@@ -368,18 +367,14 @@ impl<K: ChainSigner> AuditLog<K> {
         // `/etc/northnarrow/` install.
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::DirBuilder::new()
-                    .mode(PARENT_DIR_MODE)
-                    .recursive(true)
-                    .create(parent)
-                    .with_context(|| {
-                        format!("creating audit-log parent dir {}", parent.display())
-                    })?;
+                K::Host::create_dir_all_with_mode(parent, PARENT_DIR_MODE).with_context(|| {
+                    format!("creating audit-log parent dir {}", parent.display())
+                })?;
             }
         }
         let mut log = Self {
             path: path.to_path_buf(),
-            io_path: crate::anchored::anchor(path),
+            io_path: K::Host::anchor(path),
             key,
             agent_id,
             last_hash: tail.last_hash,
@@ -631,12 +626,12 @@ impl<K: ChainSigner> AuditLog<K> {
         let mut line =
             serde_json::to_string(&entry).map_err(|e| anyhow!("serialising audit entry: {e}"))?;
         line.push('\n');
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(AUDIT_LOG_FILE_MODE)
-            .open(&self.io_path)
-            .with_context(|| format!("opening audit log {} for append", self.path.display()))?;
+        let mut f = K::Host::open_with_mode(
+            OpenOptions::new().create(true).append(true),
+            AUDIT_LOG_FILE_MODE,
+            &self.io_path,
+        )
+        .with_context(|| format!("opening audit log {} for append", self.path.display()))?;
         f.write_all(line.as_bytes())
             .with_context(|| format!("appending audit entry to {}", self.path.display()))?;
         f.sync_all()
@@ -784,76 +779,6 @@ pub const AGENT_ID_CHANGED_KIND: &str = "agent_id_changed";
 
 /// Escape hatch: run with an unwritable / unopenable audit log.
 pub const AUDIT_ALLOW_UNWRITABLE_ENV: &str = "NN_AUDIT_ALLOW_UNWRITABLE";
-
-/// Lab PR 218 (external review G-09 / Q11-03): whether the audit log can be
-/// written, checked before anything attaches. The signed `agent_boot` after
-/// the attach still proves it with a row; this finds a read-only mount, an
-/// immutable file or a missing directory while the host is untouched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuditPreflight {
-    /// Opened for append (no byte written), or its directory is writable.
-    Writable,
-    /// Refused with a permission error while the previous agent's pinned
-    /// hooks may close it to this process (its early registration failed):
-    /// the boot probe after the attach decides.
-    Deferred(String),
-    /// Cannot be written.
-    Unwritable(String),
-}
-
-/// [`AuditPreflight`] for `path`; `closed_by_previous_hooks`: the early
-/// registration in the pinned `PROTECTED_PIDS` failed.
-pub fn preflight_writable(path: &Path, closed_by_previous_hooks: bool) -> AuditPreflight {
-    let refused = |e: &std::io::Error| {
-        if closed_by_previous_hooks && e.kind() == std::io::ErrorKind::PermissionDenied {
-            AuditPreflight::Deferred(format!(
-                "{}: {e} (the previous agent's hooks close it to an unregistered process)",
-                path.display()
-            ))
-        } else {
-            AuditPreflight::Unwritable(format!("{}: {e}", path.display()))
-        }
-    };
-    match OpenOptions::new().append(true).open(path) {
-        Ok(_) => AuditPreflight::Writable,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Created at the first append: its directory must take it.
-            let dir = match path.parent() {
-                Some(d) if !d.as_os_str().is_empty() => d,
-                _ => Path::new("."),
-            };
-            match dir_writable(dir) {
-                Ok(()) => AuditPreflight::Writable,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // `AuditLog::open` creates a missing directory: its
-                    // nearest existing ancestor must take it.
-                    match dir.ancestors().skip(1).find(|a| a.exists()) {
-                        Some(a) => match dir_writable(a) {
-                            Ok(()) => AuditPreflight::Writable,
-                            Err(e) => refused(&e),
-                        },
-                        None => refused(&e),
-                    }
-                }
-                Err(e) => refused(&e),
-            }
-        }
-        Err(e) => refused(&e),
-    }
-}
-
-/// `access(dir, W_OK)`: `EROFS` on a read-only mount.
-fn dir_writable(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // SAFETY: a NUL-terminated path and a mode constant.
-    if unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
 
 /// Is an audit-log failure at boot fatal? Yes unless the operator set the
 /// explicit override: an audit chain that silently stops is a silently
@@ -1372,6 +1297,7 @@ pub fn verify_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -1522,40 +1448,6 @@ mod tests {
             other => panic!("expected Clean, got {other:?}"),
         }
         assert!(verify_chain_ok(&log_path));
-    }
-
-    /// Lab PR 218 (external review G-09): the audit log's writability is
-    /// read without writing — a missing file in a writable directory, an
-    /// existing file, a directory that cannot take it; a permission error
-    /// is left to the boot probe only while the previous hooks may cause it.
-    #[test]
-    fn the_audit_preflight_writes_nothing_and_finds_an_unwritable_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("audit.log");
-        assert_eq!(preflight_writable(&log, false), AuditPreflight::Writable);
-        assert!(!log.exists(), "nothing created");
-        assert_eq!(
-            preflight_writable(&dir.path().join("etc/northnarrow/audit.log"), false),
-            AuditPreflight::Writable,
-            "the open creates the directory"
-        );
-        std::fs::write(&log, b"").unwrap();
-        assert_eq!(preflight_writable(&log, false), AuditPreflight::Writable);
-        assert_eq!(std::fs::read(&log).unwrap(), b"", "no byte written");
-        // A directory in place of the file cannot be opened for append.
-        let not_a_file = dir.path().join("dir.log");
-        std::fs::create_dir(&not_a_file).unwrap();
-        assert!(matches!(
-            preflight_writable(&not_a_file, false),
-            AuditPreflight::Unwritable(_)
-        ));
-        assert!(
-            matches!(
-                preflight_writable(&not_a_file, true),
-                AuditPreflight::Unwritable(_)
-            ),
-            "not a permission error: never deferred"
-        );
     }
 
     /// Lab PR 218: a refused boot names the gate that refused it.

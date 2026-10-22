@@ -20,6 +20,7 @@ use crate::chain_anchor::{
     canonical_rows, flat_rows, full_audit, non_canonical_note, numbered_summary, Anchor,
     ChainFinding, ChainKind, ChainTarget, ANCHOR_SECS, BOOT_VERIFY_BYTES, CHAIN_VERIFY_OP,
 };
+use crate::chain_host_linux::LinuxHost;
 
 fn full_canary_registry(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
     let (rows, raws) = flat_rows::<crate::canary::registry::CanaryToken>(path)?;
@@ -98,21 +99,35 @@ impl ChainPaths {
                 crate::canary::access_log::row_is_genuine,
                 full_canary_access,
             ),
-            ChainTarget::rotating::<crate::detection_store::DetectionRecord>(
+            ChainTarget::rotating::<crate::detection_store::DetectionRecord, LinuxHost>(
                 "detections",
                 &self.detections,
             ),
-            ChainTarget::rotating::<crate::detection_store::StatusEvent>(
+            ChainTarget::rotating::<crate::detection_store::StatusEvent, LinuxHost>(
                 "status_events",
                 &self.status_events,
             ),
-            ChainTarget::rotating::<crate::net::drain::NetFlowPayload>("netflow", &self.netflow),
-            ChainTarget::rotating::<crate::fim::drain::FimDriftPayload>(
+            ChainTarget::rotating::<crate::net::drain::NetFlowPayload, LinuxHost>(
+                "netflow",
+                &self.netflow,
+            ),
+            ChainTarget::rotating::<crate::fim::drain::FimDriftPayload, LinuxHost>(
                 "fim_drift",
                 &self.fim_drift,
             ),
         ]
     }
+}
+
+/// [`crate::chain_anchor::boot_check`] on the agent's host: the chains
+/// compared with their anchored heads and checkpoints, read as the agent
+/// reads them ([`LinuxHost`]).
+pub fn boot_check(
+    targets: &[ChainTarget],
+    heads_file: &Path,
+    pk: &VerifyingKey,
+) -> crate::chain_anchor::BootCheck {
+    crate::chain_anchor::boot_check::<LinuxHost>(targets, heads_file, pk)
 }
 
 /// External audit NN-AUD-112: the signed chains were never verified in
@@ -340,7 +355,7 @@ mod tests {
     }
 
     fn rotating_target(path: &Path) -> ChainTarget {
-        ChainTarget::rotating::<P>("test_log", path)
+        ChainTarget::rotating::<P, LinuxHost>("test_log", path)
     }
 
     fn rotating_log(
@@ -398,7 +413,9 @@ mod tests {
         log.append(anchor.take_marker().expect("first snapshot written"))
             .unwrap();
         assert!(anchor.take_marker().is_none());
-        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
+        assert!(boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
+            .findings
+            .is_empty());
         // cut the last rows; the chain that is left verifies
         let body = std::fs::read_to_string(&p.audit).unwrap();
         let full = body.clone();
@@ -410,7 +427,7 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         crate::audit::verify_chain(&rows, &pk).expect("what is left still verifies");
-        let found = boot_check(&p.targets(), &heads, &pk);
+        let found = boot_check::<LinuxHost>(&p.targets(), &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].kind, "chain_truncated");
         assert_eq!(found.findings[0].chain, "audit");
@@ -420,7 +437,7 @@ mod tests {
         // the heads file removed after anchoring started
         std::fs::write(&p.audit, full).unwrap();
         std::fs::remove_file(&heads).unwrap();
-        let mut found = boot_check(&p.targets(), &heads, &pk);
+        let mut found = boot_check::<LinuxHost>(&p.targets(), &heads, &pk);
         assert!(found.findings.is_empty());
         let started = AuditLog::open(&p.audit, key(&dir), [1; 16])
             .unwrap()
@@ -436,10 +453,14 @@ mod tests {
         let pk = key(&dir).verifying_key();
         let p = paths(&dir);
         let heads = dir.path().join(HEADS_FILE_NAME);
-        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
+        assert!(boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
+            .findings
+            .is_empty());
         // legacy rows only, no anchor yet: the upgrade itself
         std::fs::write(&p.audit, "").unwrap();
-        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
+        assert!(boot_check::<LinuxHost>(&p.targets(), &heads, &pk)
+            .findings
+            .is_empty());
     }
 
     /// External audit NN-AUD-174: before lab PR 160 a canary access log cut
@@ -478,7 +499,7 @@ mod tests {
         let body = std::fs::read_to_string(&paths.canary_access).unwrap();
         let keep: String = body.lines().take(3).map(|l| format!("{l}\n")).collect();
         std::fs::write(&paths.canary_access, keep).unwrap();
-        let found = boot_check(&paths.targets(), &heads, &pk);
+        let found = boot_check::<LinuxHost>(&paths.targets(), &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].chain, "canary_access");
         assert_eq!(found.findings[0].kind, "chain_truncated");
@@ -551,7 +572,7 @@ mod tests {
         for (i, line) in [(0usize, 1usize), (1, 1), (2, 1), (3, 1)] {
             let t = &targets[i];
             let before = std::fs::read(&t.path).unwrap();
-            let head = read_file_head(&t.path, &|l: &[u8]| (t.genuine)(l, &pk))
+            let head = read_file_head::<LinuxHost>(&t.path, &|l: &[u8]| (t.genuine)(l, &pk))
                 .unwrap()
                 .unwrap();
             inject_at(&t.path, line);
@@ -559,7 +580,7 @@ mod tests {
             assert!(err.contains("canonical"), "{}: {err}", t.chain);
             if line + 1 == String::from_utf8_lossy(&before).lines().count() {
                 assert_ne!(
-                    read_file_head(&t.path, &|l: &[u8]| (t.genuine)(l, &pk)).unwrap(),
+                    read_file_head::<LinuxHost>(&t.path, &|l: &[u8]| (t.genuine)(l, &pk)).unwrap(),
                     Some(head),
                     "{}: not a head",
                     t.chain
