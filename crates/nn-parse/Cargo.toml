@@ -6,12 +6,21 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "NorthNarrow nn-parse: parsers of attacker-written bytes: the TLS ClientHello (JA3), DNS records and QNAMEs (Wave 4 restructure; empty until its lot moves code in)."
+description = "NorthNarrow nn-parse: parsers of attacker-written bytes: the TLS ClientHello (JA3, JA4), DNS records and QNAMEs (Wave 4 restructure)."
 publish = false
 
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
+# R06 (lab PR 242): the agent's ClientHello parser and DNS reply parser
+# moved here with the dependencies they had there, the same versions and
+# features (one version each in the workspace).
 [dependencies]
+# JA3's MD5: a fingerprint's hash, not a security primitive (the agent's
+# manifest says why md-5, RustCrypto).
+md-5 = "0.11"
+# JA4's truncated SHA-256 hashes, written in hex.
+sha2 = "0.11"
+hex = "0.4"
 
 [lints]
 workspace = true
