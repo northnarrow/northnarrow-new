@@ -13,6 +13,4 @@ name = "northnarrow"
 path = "src/main.rs"
 
 [dependencies]
-common = { workspace = true }
 clap = { workspace = true }
-anyhow = { workspace = true }
