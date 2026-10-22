@@ -814,3 +814,45 @@ only in the table below, in the same PR as the evidence.
     exactly 1.89), and the fuzz job's nightly-2025-12-01 builds and
     replays all 12 targets; `cargo audit` clean.
   - Lab: On Ubuntu 22.04 (5.15, QEMU for Windows with WHPX): `main` a9d65ab synced, built and installed; its agent at L3, deny hooks 17 of 17, self-test denied, 0 degradations. A signed overlay (process-comm-allowlist) stored with `main`'s nn-admin. `nn-lab.sh execq-check` on `main`'s tree: PASS; case 2's harmless block-listed test binary killed while held and quarantined by the agent: vault 1fe5d76348f44eec9b12fad4acdd76dc, 16,136 bytes, `.meta` sha256 c02f2e6a0c0d11dfa1af84c8069e88c2fa9aea1e5730c41f288f3193d4be1e4f (the harness had hashed the test binary as c02f2e6a0c0d11df… before running it). Then the branch synced and built, and `nn-lab.sh upgrade-check` (`install.sh --upgrade`): OK — UPGRADE complete, health check passed, identity kept, deny_attached=17 deny_expected=17, 34 own LSM programs before and after, no anti-tamper degradation signed. The entry's `.bin` (df2bfce1…), `.meta` (d1d0cda2…) and `master.key` (939d66ff…) byte-identical across the upgrade. `nn-admin response restore` with the branch's nn-admin: first refused `role denied` (the lab's bootstrap key has no `response-manage`, as `cow-check.sh` notes); the role granted the way `cow-check.sh` grants it (trusted-installer window, agent restart), the restore wrote 16,136 bytes, mode 0600, sha256 c02f2e6a0c0d11dfa1af84c8069e88c2fa9aea1e5730c41f288f3193d4be1e4f — the `.meta` `main` wrote — signed `response_restore`; the vault kept the entry; the role taken back. `main`'s signatures on the branch: the overlay `main`'s nn-admin stored was accepted by the upgraded agent at boot (`signed overlay accepted`, sha256 940b124a…) and `config overlay status` says it loads; `main`'s nn-admin binary (kept aside) got `response status` and `capabilities` through the branch agent's challenge, and its `config overlay set` (a signed CBOR payload) was verified, stored and signed `config_overlay_set` by the branch agent. The branch agent at each of its three boots (upgrade, the two restarts): L3, deny hooks 17 of 17, deny self-test `denied` (a signal from an unprotected child refused), 0 degradations. Guest put back (overlay, kept binary, role). Host: `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` 2,900 passed, 0 failed; `crypto_vectors` 14 of 14; golden replay unchanged; the four clippy runs, `cargo fmt`, `attack-coverage --check`, MSRV 1.89, the 12 fuzz targets built and replayed on nightly-2025-12-01, `cargo audit`: all pass.
+- **Lab PR 229 — two flaky privileged tests fixed in the product: a
+  `chmod u+s` always recorded, the DNS attribution behind its ring and
+  through `nss-resolve`.** C06 (file telemetry and FIM), C07 (endpoint
+  network telemetry); Wave 4 Phase 2.
+  - What was wrong: `fim_chmod_setuid_records_attribute_drift` failed on
+    PR 421 (CI run 39622005407, Ubuntu 24.04) with one `Modified` row and
+    no baseline: the recompute task filled the drain's cache only after
+    the baseline row's fsync, and a chmod in that window was compared with
+    nothing. Two more ways a set-uid bit went unrecorded: the
+    `inode_setattr` hook fires before the change lands, and a drain that
+    re-read the file first dropped the event as a no-op touch; a mode
+    change read with a content change left no attributes on its row.
+    `net_outbound_connect_records_flow_with_dns_attribution` left
+    `resolved_hostname` null on 24.04 (CI run 39602279581): the query, the
+    connect and the close come on three rings read by three tasks, and a
+    close read before the DNS pump had read the query found no name. On
+    Debian 13 (`resolve` before `dns` in nsswitch.conf) it always failed:
+    the lookup goes to systemd-resolved over varlink, no datagram of the
+    process's own (lab PR 227's one expected failure).
+  - What changed: `BaselineDb::append_cached` (the cache holds the entry
+    before its row is written); a setattr re-read as unchanged waits for
+    the change like a rename or an enrollment (2 s, looks from 5 ms
+    doubling to 250 ms) and is then checked as its writer's modification;
+    a `Modified` row names a mode or owner change that came with it.
+    `DnsIngest`: the net drain and the connect pump wait, bounded (250 ms
+    from the record), for a pass of the DNS pump begun after their newest
+    record; the pump feeds the cache a whole pass at a time and holds the
+    bus's events in order (up to 8192). A uprobe on `libnss_resolve.so.2`
+    (`_nss_resolve_gethostbyname4_r`, `…3_r`; optional) feeds the names
+    asked through systemd-resolved into the attribution only (no
+    `DnsQuery` event, no server); the expected failure is gone and
+    `verifier-check` loads uprobes. Lab gates: `malsim/exec-check.sh`
+    copies `true` as `dir/<case>/true` (uutils on 26.04); nn-lab.sh knows
+    `ubuntu2604`, which joins the nightly CI matrix (not the pull
+    requests'); its first gate run found two uutils differences, fixed:
+    `fs_deny_privileged_e2e` read EPERM from coreutils' message (uutils
+    prints "Permission denied" for EPERM; the attempts now go through
+    python3, which prints the errno's own), and `install.sh --upgrade` ran
+    `install -d` on the immutable state directory before lifting the flag
+    (uutils sets owner and mode again where GNU skips them). The local
+    gate script replays the fuzz inputs as the CI job does.
+  - Lab: On Debian 13 (6.12), 30 runs of each test before (main 8180540) and after: the FIM test with its fixtures on tmpfs 30/30 → 30/30, on ext4 30/30 → 30/30, on ext4 with a 1 ms baseline poll 30/30 → 30/30, on a dm-delay ext4 (an fsync of ~100 ms) 6/30 → 30/30, the 24 failures each one `Modified` row with a null baseline, the chmod's own (the CI's shape); the DNS test through nss-resolve 0/30 → 30/30 (probes on `/usr/lib/x86_64-linux-gnu/libnss_resolve.so.2`, 4_r and 3_r), with `hosts: files dns` (24.04's path) 30/30 → 30/30, the same with 600 DNS records queued ahead of the helper's query 28/30 → 30/30, the 2 failures a null `resolved_hostname`. On the final tree there: `verifier-check` 77 of 77 OK (`dns_nss_resolve` 537 instructions processed, stack 64 bytes, 96 down its deepest call chain, of 512), `dns-sensor-check` OK (10 of 10), `net-check` 13 of 13, the net and FIM privileged suites 5 of 5 and 6 of 6; `fim-reuse-check` NOT RUN (no inode reused within 5000 files). Ubuntu 26.04 (`ubuntu2604`, the lab's WHPX guest) booted from the catalogue: its image list checked against the pinned UEC key, kernel 7.0.0-38-generic with `bpf` in the LSM list, uutils coreutils (rust-coreutils 0.10), systemd 259, no libnss_resolve (the NSS probe not attached, said so); `verifier-check` 77 of 77 OK; the gate's test-ignored on the tree before the two fixes: 55 suites, 79 passed, 1 failed (`new_entries_and_xattrs_are_denied_outside_the_window`, the refusal read from uutils' message); after them `fs_deny_privileged_e2e` 2 of 2, an `install.sh` upgrade over the running install (immutable state directory) through where it had failed and rolled back, and the two tests of this lot 10 of 10 each. On the final tree the gate's test-ignored there: 56 suites, 80 passed, 0 failed (gate-summary: pass); `malsim-exec-check` there: MS-01/02/03/32 before and after, audit and the desktop cases passed with the copies of `true` (MS-02 and MS-03 ran, rc 0, as on 24.04), the two NN-L-EXECENV-002 cases (`HISTFILE=/dev/null bash`, `GLIBC_TUNABLES` at su) drew no record — open, outside the CI gate.

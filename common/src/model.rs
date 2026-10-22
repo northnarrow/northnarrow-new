@@ -1443,6 +1443,30 @@ impl From<&FsProtectDenialRaw> for Event {
     }
 }
 
+/// Lab PR 229: the name of a [`crate::wire::dns_flags::NSS`] record — the
+/// text the process passed to systemd-resolved's NSS module, up to its NUL
+/// — in the presentation form [`decode_dns_qname`] gives a wire name: the
+/// root dot of an absolute name dropped, a byte outside printable ASCII
+/// (and `\`) as `\DDD`. `None` for an empty name.
+pub fn nss_query_name(raw: &DnsQueryRaw) -> Option<alloc::string::String> {
+    let len = (raw.qname_len as usize).min(raw.query_name.len());
+    let bytes = &raw.query_name[..len];
+    let bytes = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
+    let bytes = bytes.strip_suffix(b".").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut out = alloc::string::String::with_capacity(bytes.len());
+    for &b in bytes {
+        if (32..=126).contains(&b) && b != b'\\' {
+            out.push(b as char);
+        } else {
+            out.push_str(&alloc::format!("\\{b:03}"));
+        }
+    }
+    Some(out)
+}
+
 impl From<&DnsQueryRaw> for Event {
     fn from(raw: &DnsQueryRaw) -> Self {
         let len = (raw.qname_len as usize).min(raw.query_name.len());
@@ -1588,7 +1612,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
-    use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, QNAME_LEN, TASK_COMM_LEN};
+    use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, QNAME_LEN, QNAME_WIRE_LEN, TASK_COMM_LEN};
 
     #[test]
     fn file_open_raw_to_event() {
@@ -1669,6 +1693,37 @@ mod tests {
         }
         // Sanity: the size constant is honoured.
         assert_eq!(QNAME_LEN, 253);
+    }
+
+    /// Lab PR 229: the name of an NSS record — text as the process passed
+    /// it — in the form a wire name decodes to.
+    #[test]
+    fn an_nss_record_names_the_text_the_process_passed() {
+        let nss = |text: &[u8], len: usize| {
+            let mut raw = DnsQueryRaw::zeroed();
+            raw.flags = crate::wire::dns_flags::NSS;
+            raw.query_name[..text.len()].copy_from_slice(text);
+            raw.qname_len = len as u16;
+            nss_query_name(&raw)
+        };
+        let name = b"foo.northnarrow-e2etest.invalid.";
+        assert_eq!(
+            nss(name, name.len()).as_deref(),
+            Some("foo.northnarrow-e2etest.invalid"),
+            "the root dot of an absolute name dropped, as on the wire"
+        );
+        assert_eq!(nss(b"example.com", 11).as_deref(), Some("example.com"));
+        // up to the NUL, whatever the length says
+        assert_eq!(nss(b"a.b\0junk", 8).as_deref(), Some("a.b"));
+        // a byte outside printable ASCII, and the backslash, as \DDD
+        assert_eq!(nss(b"x\ny\\z", 5).as_deref(), Some("x\\010y\\092z"));
+        assert_eq!(nss(b"", 0), None);
+        assert_eq!(nss(b".", 1), None);
+        // a length past the buffer is cut to it
+        let mut raw = DnsQueryRaw::zeroed();
+        raw.query_name.fill(b'a');
+        raw.qname_len = u16::MAX;
+        assert_eq!(nss_query_name(&raw).map(|n| n.len()), Some(QNAME_WIRE_LEN));
     }
 
     /// A record from the socket-buffer sensor (Tappa 10.9 step 3): wire

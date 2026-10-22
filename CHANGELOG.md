@@ -339,6 +339,36 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- A `chmod u+s` of a watched file could go unrecorded as attribute drift
+  (lab PR 229; the CI flake of `fim_chmod_setuid_records_attribute_drift`).
+  The recompute task filled the drain's baseline cache only after the
+  baseline row's fsync: a chmod in that window was compared with no
+  baseline and recorded as `Modified`, with no mode. The cache now takes
+  the entry before the row is written. The `inode_setattr` hook fires
+  before the change lands: a drain that re-read the file first dropped
+  the event as a no-op touch; the event now waits (up to 2 s) until a
+  `stat` shows the change, then is checked as its writer's modification.
+  A mode or owner change read with a content change is named on the
+  `Modified` row (`attrs`), where it was dropped.
+- The DNS attribution of a flow (`resolved_hostname`) depended on which of
+  three tasks ran first (lab PR 229; the CI flake of
+  `net_outbound_connect_records_flow_with_dns_attribution`): a close or a
+  connect read before the DNS pump had read the query of the same process
+  found no name. They now wait, at most 250 ms from the record, for a pass
+  of the DNS pump begun after them; the pump feeds the cache a whole pass
+  at a time and holds the events of a full bus in order instead of
+  feeding it behind each send. Names asked through systemd-resolved's NSS
+  module (`resolve` before `dns` in nsswitch.conf: Debian 13, Fedora) are
+  attributed too: an optional uprobe on `libnss_resolve.so.2`
+  (`_nss_resolve_gethostbyname4_r`, `…3_r`) reads them into the DNS cache
+  only (no `DnsQuery` event; the DNS rules judge the queries on the wire).
+  The Debian 13 expected failure of the CI gate is removed.
+- `install.sh --upgrade` failed on Ubuntu 26.04 and rolled back (lab PR
+  229): it ran `install -d` on the state directory before lifting the
+  immutable flag the agent sets on it. GNU install leaves an existing
+  directory's owner and mode alone when they match; uutils coreutils, the
+  default on 26.04, sets them again, which an immutable directory refuses.
+  The flag is now lifted first.
 - NN-L-IMP-001's copy-delete evidence looked for the copies below and
   beside the burst's directory across a world-writable sticky directory
   (lab PR 232): a user's script with one plain copy in `/tmp/job` was

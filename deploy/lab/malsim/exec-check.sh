@@ -36,7 +36,7 @@
 # Phase C — `--exec-policy audit`: MS-01 runs (R002 may kill it after the
 #   exec, as in phase A), recorded "would deny".
 # Phase D — `--exec-policy-profile desktop`: an AppImage-shaped run
-#   (/tmp/.mount_nnms*/AppRun) and a Flatpak-shaped one
+#   (/tmp/.mount_nnms*/AppRun/true) and a Flatpak-shaped one
 #   (~/.local/share/flatpak/app/…) from the login session: allowed, no record.
 # Then it puts the guest back (drop-in removed, agent restarted).
 # Verdicts come from the signed detection chain and the signed status, never
@@ -202,20 +202,29 @@ sudo install -d -m 0755 "$OPTD"
 printf '# nn-ms marker\n' | sudo tee "$OPTD/nn-ms" >/dev/null
 
 ms01() { svc "$SHMD/id"; }
+# Lab PR 229: /usr/bin/true may be a multi-call binary that picks its
+# utility from the name it is run by — uutils coreutils (Ubuntu 26.04, the
+# hosted CI runners) from the path given to execve, else argv[0]; busybox
+# from argv[0]. A copy under another name printed "unknown program" and
+# exited 1, which read as a run killed by a rule. As lot 223's fixtures do,
+# each copy keeps the name true, in a directory of its own per case, and an
+# exec through a descriptor (no path) passes true as argv[0].
 MEMFD_PY='import os,sys
 fd = os.memfd_create("nn-ms")
 os.write(fd, open("/usr/bin/true", "rb").read())
 try:
-    os.execve(fd, ["nn-ms"], {})
+    os.execve(fd, ["true"], {})
 except OSError as e:
     print("refused:", e.errno); sys.exit(13)'
 ms02() { svc /usr/bin/python3 -c "$MEMFD_PY"; }
 DELETED_PY='import os,shutil,sys
-p = sys.argv[1] + "/nn-ms-deleted"
+d = sys.argv[1] + "/nn-ms-deleted"
+os.makedirs(d, exist_ok=True)
+p = d + "/true"
 shutil.copy("/usr/bin/true", p); os.chmod(p, 0o755)
 fd = os.open(p, os.O_RDONLY); os.unlink(p)
 try:
-    os.execve(fd, ["nn-ms-deleted"], {})
+    os.execve(fd, ["true"], {})
 except OSError as e:
     print("refused:", e.errno); sys.exit(13)'
 ms03() { svc /usr/bin/python3 -c "$DELETED_PY" "$OPTD"; }
@@ -358,12 +367,13 @@ fi
 # ── phase D: desktop profile — AppImage and Flatpak shapes allowed ────
 policy NN_EXEC_POLICY=enforce NN_EXEC_POLICY_PROFILE=desktop
 APPD=$(mktemp -d /tmp/.mount_nnmsXXXXXX)
-cp /usr/bin/true "$APPD/AppRun" && chmod 0755 "$APPD/AppRun"
+# a copy named true in a directory per case (see MEMFD_PY above)
+mkdir -p "$APPD/AppRun" && cp /usr/bin/true "$APPD/AppRun/true" && chmod 0755 "$APPD/AppRun/true"
 FPD=$HOME/.local/share/flatpak/app/org.nnms.Probe/x86_64/stable/active/files/bin
-mkdir -p "$FPD" && cp /usr/bin/true "$FPD/nn-ms-probe"
+mkdir -p "$FPD/nn-ms-probe" && cp /usr/bin/true "$FPD/nn-ms-probe/true"
 b=$(det_count)
-"$APPD/AppRun"; rc1=$?
-"$FPD/nn-ms-probe"; rc2=$?
+"$APPD/AppRun/true"; rc1=$?
+"$FPD/nn-ms-probe/true"; rc2=$?
 sleep 2
 n=$(pol_since "$b" | grep -E -c "AppRun|nn-ms-probe")
 [[ $rc1 == 0 && $rc2 == 0 && $n == 0 ]] && pass "D  desktop profile: an AppImage-shaped run from /tmp/.mount_* and a Flatpak-shaped one from the home (session tier): allowed, no record" \

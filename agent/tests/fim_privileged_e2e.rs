@@ -427,6 +427,13 @@ fn fim_baseline_then_modify_records_drift_event() {
 /// file, and the drain dropped it as a no-op touch — a set-uid bit on a
 /// watched binary left no trace. It is recorded as `AttrChanged` with the
 /// mode before and after.
+///
+/// Lab PR 229 — deterministic. The chmod right after the baseline row
+/// appeared was sometimes recorded as a `Modified` row with no baseline
+/// (PR 421, CI run 39622005407): the row was in the log while its fsync
+/// ran, and the drain's cache took it only after. The cache now holds the
+/// entry before the row is written, and a setattr the drain re-read before
+/// it landed waits for it, so the row asserted here is always there.
 #[test]
 fn fim_chmod_setuid_records_attribute_drift() {
     use std::os::unix::fs::PermissionsExt;
@@ -453,6 +460,17 @@ fn fim_chmod_setuid_records_attribute_drift() {
     assert_eq!(
         row["baseline_sha256"], row["new_sha256"],
         "the content did not change"
+    );
+    // Lab PR 229: the flake's row — the chmod recorded as `Modified`, with
+    // no baseline and no mode — is never there: every row on the file is
+    // the attribute drift, against the baseline.
+    let rows = common::read_jsonl_strict(&fx.drift_log);
+    assert!(
+        rows.iter()
+            .filter(|r| r["path"] == serde_json::json!(watched_str))
+            .all(|r| r["op"].as_u64() == Some(OP_ATTR_CHANGED)
+                && r["baseline_sha256"].as_str().is_some()),
+        "{rows:?}"
     );
 }
 

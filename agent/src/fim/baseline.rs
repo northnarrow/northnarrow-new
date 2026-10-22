@@ -561,6 +561,34 @@ impl BaselineCache {
         self.inner.write().insert(key, entry);
     }
 
+    /// Lab PR 229: put `entry` in place and return the entry it replaced,
+    /// for [`Self::put_back`].
+    fn swap_in(&self, entry: BaselineEntry) -> Option<BaselineEntry> {
+        let key = CacheKey {
+            path: entry.path.clone(),
+            is_symlink: entry.is_symlink,
+        };
+        self.inner.write().insert(key, entry)
+    }
+
+    /// Lab PR 229: undo a [`Self::swap_in`] of `entry` — `previous` back in
+    /// its place, or nothing when there was none.
+    fn put_back(&self, entry: &BaselineEntry, previous: Option<BaselineEntry>) {
+        let key = CacheKey {
+            path: entry.path.clone(),
+            is_symlink: entry.is_symlink,
+        };
+        let mut g = self.inner.write();
+        match previous {
+            Some(p) => {
+                g.insert(key, p);
+            }
+            None => {
+                g.remove(&key);
+            }
+        }
+    }
+
     /// Number of cached entries. Useful for boot logs +
     /// `nn-admin fim status` summary counts.
     pub fn len(&self) -> usize {
@@ -630,8 +658,37 @@ impl BaselineDb {
     /// tail. On success returns the entry as persisted.
     pub fn append(&mut self, draft: BaselineEntryDraft) -> Result<BaselineEntry> {
         let entry = build_signed_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
-        let mut line = serde_json::to_string(&entry)
-            .map_err(|e| anyhow!("serialising baseline entry: {e}"))?;
+        self.write_entry(&entry)?;
+        Ok(entry)
+    }
+
+    /// [`Self::append`], with `cache` — the drain's — holding the new entry
+    /// before its line is written (lab PR 229). The cache used to take it
+    /// after the append's fsync: for that long the row was in the log, and
+    /// an event on the path met no baseline. A `chmod u+s` made as soon as
+    /// the row was there was recorded as a `Modified` row with no baseline
+    /// and no mode, not as attribute drift (the CI flake of
+    /// `fim_chmod_setuid_records_attribute_drift`, PR 421). A write that
+    /// fails puts the cache back as it was.
+    pub fn append_cached(
+        &mut self,
+        draft: BaselineEntryDraft,
+        cache: &BaselineCache,
+    ) -> Result<BaselineEntry> {
+        let entry = build_signed_entry(&draft, &self.key, &self.agent_id, &self.last_hash)?;
+        let previous = cache.swap_in(entry.clone());
+        if let Err(e) = self.write_entry(&entry) {
+            cache.put_back(&entry, previous);
+            return Err(e);
+        }
+        Ok(entry)
+    }
+
+    /// One signed entry as a line of the log, fsynced; the chain tail
+    /// advances when it is written.
+    fn write_entry(&mut self, entry: &BaselineEntry) -> Result<()> {
+        let mut line =
+            serde_json::to_string(entry).map_err(|e| anyhow!("serialising baseline entry: {e}"))?;
         line.push('\n');
         let mut f = OpenOptions::new()
             .create(true)
@@ -644,7 +701,7 @@ impl BaselineDb {
         f.sync_all()
             .with_context(|| format!("fsync {}", self.path.display()))?;
         self.last_hash = entry.entry_hash.clone();
-        Ok(entry)
+        Ok(())
     }
 
     /// Tail hash an auditor would chain the NEXT entry off.
@@ -1332,6 +1389,33 @@ mod tests {
         let got = cache.get_content("/etc/sudoers").unwrap();
         assert_eq!(got.sha256, entry_v2.sha256);
         assert_eq!(got.entry_hash, entry_v2.entry_hash);
+    }
+
+    /// Lab PR 229: `append_cached` leaves the new entry in the cache, its
+    /// row in the log; a write that fails puts the cache back as it was.
+    #[test]
+    fn append_cached_holds_the_entry_and_undoes_a_failed_write() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("baseline.jsonl");
+        let cache = BaselineCache::new();
+        let mut db = BaselineDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let first = db.append_cached(sample_draft(1), &cache).unwrap();
+        assert_eq!(cache.get_content("/etc/test_1"), Some(first.clone()));
+        let rows = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(rows.lines().count(), 1);
+        assert!(rows.contains(&first.entry_hash));
+        // The log cannot be written any more: the entry it held stays, and a
+        // path it did not hold stays out.
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::create_dir(&log_path).unwrap();
+        let mut again = sample_draft(1);
+        again.sha256 = hex::encode([0x77u8; 32]);
+        assert!(db.append_cached(again, &cache).is_err());
+        assert_eq!(cache.get_content("/etc/test_1"), Some(first));
+        assert!(db.append_cached(sample_draft(2), &cache).is_err());
+        assert!(cache.get_content("/etc/test_2").is_none());
+        assert_eq!(cache.len(), 1);
     }
 
     /// Cache test #4: missing-file load returns an empty cache

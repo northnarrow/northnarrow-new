@@ -143,6 +143,116 @@ pub fn attach(
     Ok(SKB4_PROGRAM)
 }
 
+/// Lab PR 229: the uprobe on systemd-resolved's NSS module
+/// (`agent-ebpf/src/dns_nss.rs`).
+pub const NSS_PROGRAM: &str = "dns_nss_resolve";
+/// The module's name lookups. `_nss_resolve_gethostbyname2_r` and
+/// `…_r` are systemd's fallbacks onto `…3_r` (`NSS_GETHOSTBYNAME_FALLBACKS`):
+/// attached there too, each lookup would be recorded twice.
+const NSS_SYMBOLS: &[&str] = &[
+    "_nss_resolve_gethostbyname4_r",
+    "_nss_resolve_gethostbyname3_r",
+];
+/// Where distributions install the module (Debian and Ubuntu multiarch,
+/// the RPM and Arch layouts).
+const NSS_LIBRARY_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib64",
+    "/lib64",
+    "/usr/lib",
+];
+const NSS_LIBRARY: &str = "libnss_resolve.so.2";
+
+/// Lab PR 229: the copies of systemd-resolved's NSS module on this host —
+/// each file once (a merged `/usr` names it twice), root's and not
+/// writable by anyone else: a module another user could replace is not
+/// one the system's lookups load.
+fn nss_libraries() -> Vec<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dir in NSS_LIBRARY_DIRS {
+        let Ok(path) = std::fs::canonicalize(std::path::Path::new(dir).join(NSS_LIBRARY)) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            continue;
+        }
+        if seen.insert((meta.dev(), meta.ino())) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Lab PR 229: attach the uprobe on systemd-resolved's NSS module, so a
+/// name resolved through it (`hosts: … resolve …` in nsswitch.conf: the
+/// asking process sends no DNS datagram) attributes the connects that
+/// follow. Optional: without the module, or when it does not attach, the
+/// connects of those processes carry no name, as before (logged, and in
+/// the boot manifest). A module replaced after the attach (an upgrade of
+/// systemd) is a new file the probe is not on until the agent restarts.
+pub fn attach_nss(ebpf: &mut Ebpf) {
+    let libs = nss_libraries();
+    if libs.is_empty() {
+        info!("DNS sensor: no {NSS_LIBRARY} on this host — no NSS lookups to attribute");
+        crate::boot::manifest::note_sensor("dns_nss", "none (no libnss_resolve)");
+        return;
+    }
+    let prog: &mut aya::programs::UProbe = match ebpf
+        .program_mut(NSS_PROGRAM)
+        .ok_or_else(|| anyhow::anyhow!("program {NSS_PROGRAM} missing from eBPF object"))
+        .and_then(|p| {
+            p.try_into()
+                .map_err(|e| anyhow::anyhow!("{NSS_PROGRAM} is not a uprobe: {e}"))
+        }) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "DNS sensor: NSS lookups are not attributed");
+            crate::boot::manifest::note_sensor("dns_nss", "not attached");
+            return;
+        }
+    };
+    if let Err(e) = prog.load() {
+        warn!(
+            error = %verifier_tail(&anyhow::Error::from(e)),
+            "DNS sensor: the NSS uprobe was refused — NSS lookups are not attributed"
+        );
+        crate::boot::manifest::note_sensor("dns_nss", "not attached");
+        return;
+    }
+    let mut attached = Vec::new();
+    for lib in &libs {
+        for sym in NSS_SYMBOLS {
+            match prog.attach(*sym, lib, aya::programs::uprobe::UProbeScope::AllProcesses) {
+                Ok(_) => attached.push(format!("{}:{sym}", lib.display())),
+                Err(e) => warn!(
+                    library = %lib.display(),
+                    symbol = sym,
+                    error = %e,
+                    "DNS sensor: NSS uprobe not attached here"
+                ),
+            }
+        }
+    }
+    if attached.is_empty() {
+        crate::boot::manifest::note_sensor("dns_nss", "not attached");
+        return;
+    }
+    info!(
+        probes = %attached.join(", "),
+        "DNS sensor: uprobe on systemd-resolved's NSS module — names resolved through it \
+         attribute the connects that follow (lab PR 229)"
+    );
+    crate::boot::manifest::note_sensor("dns_nss", &format!("uprobe:{}", attached.join("+")));
+}
+
 /// Review 78: users of the local resolvers, whose forwarded queries the
 /// kernel's DNS budgets (`agent-ebpf/src/dns_query.rs`) do not pace.
 /// Dedicated service users only: a generic one (`nobody`) would exempt

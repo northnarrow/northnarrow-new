@@ -324,14 +324,25 @@ fn attempts(link_src: &Path) -> Vec<Attempt> {
     let link = format!("{ETC}/.nn-e2e-152-link");
     let setx = format!("import os; os.setxattr('{ETC}', '{XATTR}', b'1')");
     let rmx = format!("import os; os.removexattr('{ETC}', '{XATTR}')");
+    // Lab PR 229: the directory, FIFO and links are made by python3, which
+    // prints the errno's own message. uutils coreutils (Ubuntu 26.04) print
+    // "Permission denied" for EPERM as for EACCES, so a refused `mkdir`
+    // there read as no EPERM.
+    let mkdir = |d: &str| format!("import os; os.mkdir('{d}')");
+    let mkfifo = format!("import os; os.mkfifo('{fifo}')");
+    let symlink = format!("import os; os.symlink('/etc/hostname', '{sym}')");
+    let hard_link = format!(
+        "import os; os.link('{}', '{link}')",
+        link_src.to_str().unwrap()
+    );
     vec![
         a("create", &["sh", "-c", &format!(": > {file}")]),
         a("create", &["sh", "-c", &format!(": > {state_file}")]),
-        a("mkdir", &["mkdir", &dir]),
-        a("mkdir", &["mkdir", &pin_dir]),
-        a("mknod", &["mkfifo", &fifo]),
-        a("symlink", &["ln", "-s", "/etc/hostname", &sym]),
-        a("link", &["ln", link_src.to_str().unwrap(), &link]),
+        a("mkdir", &["python3", "-c", &mkdir(&dir)]),
+        a("mkdir", &["python3", "-c", &mkdir(&pin_dir)]),
+        a("mknod", &["python3", "-c", &mkfifo]),
+        a("symlink", &["python3", "-c", &symlink]),
+        a("link", &["python3", "-c", &hard_link]),
         a("xattr", &["python3", "-c", &setx]),
         a("xattr", &["python3", "-c", &rmx]),
     ]

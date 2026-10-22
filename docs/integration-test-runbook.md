@@ -128,7 +128,7 @@ guest: `sync` sent it the tree.
   `-o StrictHostKeyChecking=yes -o UserKnownHostsFile=<guest dir>/known_hosts
   -o HostKeyAlias=nn-lab-<guest> -o HostKeyAlgorithms=ssh-ed25519`.
 
-### Other guests: Debian 12, Debian 13, Ubuntu 22.04, AlmaLinux 9
+### Other guests: Debian 12, Debian 13, Ubuntu 22.04, Ubuntu 26.04, AlmaLinux 9
 
 `NN_LAB_DISTRO=<distro> deploy/lab/nn-lab.sh up` boots a separate guest;
 prefix any sub-command with the variable to target it. Each guest has its
@@ -141,6 +141,7 @@ own disk, seed, ssh port and reports under `~/.cache/nn-lab/<distro>/`
 | `debian12` | 6.1 | 2422 | `perf_event_paranoid=3` drop-in |
 | `debian13` | 6.12 | 2722 | first guest from 6.9 (`inode_setattr` takes `mnt_idmap` first); `nftables` installed; `perf_event_paranoid=3` drop-in |
 | `ubuntu2204` | 5.15 | 2522 | older verifier, sudo 1.9.9, systemd 249 |
+| `ubuntu2604` | 7.0 | 2822 | lab PR 229: the hosted CI runners' release; coreutils are the uutils multi-call binary, which picks its utility from the name it is run by (a copy of `true` or `sleep` keeps its name, in a directory of its own); systemd 259; `sudo` is sudo-rs; in `malsim-exec-check` the two NN-L-EXECENV-002 cases draw no record there (a follow-up) |
 | `alma9` | 5.14 el9 | 2622 | SELinux enforcing, vendor tracepoint header; `kernel.io_uring_disabled=2` (no ring, not even for root); sudo's `secure_path` has no `/usr/local/bin`, so call `/usr/local/bin/nn-admin` |
 
 `install` builds the tree already on the guest: run `sync` first
@@ -220,7 +221,7 @@ build-ebpf --locked`, then the credential check of external audit SUP-003),
 | Event | Guests |
 |---|---|
 | a pull request to `main` that touches a tree the suites are built or run from (the workflow's path filters; `xtask/tests/lab_ci.rs` derives the list from the repository and fails on a missing one) | `ubuntu2404` (6.8), `ubuntu2204` (5.15) |
-| the nightly schedule (01:17 UTC) and a manual dispatch | the four: + `debian12` (6.1), `debian13` (6.12) |
+| the nightly schedule (01:17 UTC) and a manual dispatch | five: + `debian12` (6.1), `debian13` (6.12), `ubuntu2604` (7.0, uutils coreutils; lab PR 229) |
 
 **Informational on a pull request, the gate at night.** On a pull request
 the job is informational: the workflow is not `ci.yml`, its jobs are not a
@@ -281,10 +282,11 @@ finished, every test binary that failed printed its libtest summary (a
 crash, a kill or a timeout does not), and every failed test is an expected
 one. `deploy/lab/expected-failures.tsv` lists those: one line per recorded
 follow-up, for one distro (`distro`, `suite`, `test`, the follow-up). Today
-it holds one: on Debian 13,
+it holds none: its one line — on Debian 13,
 `net_privileged_e2e::net_outbound_connect_records_flow_with_dns_attribution`
-fails as on `main` (the guest resolves through `nss-resolve`, a follow-up
-since lab PR 164). An expected failure is never hidden: it is counted in
+failed (the guest resolves through `nss-resolve`, a follow-up since lab PR
+164) — went with lab PR 229, which attributes the names asked through
+systemd-resolved's NSS module. An expected failure is never hidden: it is counted in
 `failed`, given its own column and listed with its outcome and follow-up;
 it fails the run when it passes (the follow-up is fixed: remove its line)
 or does not run, and it does not excuse the same test on another guest.

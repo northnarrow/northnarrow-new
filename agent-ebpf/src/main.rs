@@ -21,6 +21,7 @@ mod btf_offsets;
 mod bpf_defense;
 mod budget;
 mod comm;
+mod dns_nss;
 mod dns_query;
 mod dns_skb;
 mod drops;

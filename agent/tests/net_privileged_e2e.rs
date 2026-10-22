@@ -468,6 +468,16 @@ where
 /// query and `lookup_for_connect` attributes it to the immediately
 /// following connect from the same PID → `resolved_hostname`.
 ///
+/// **Lab PR 229 — deterministic.** The query, the connect and the close
+/// come on three rings read by three tasks; a close read before the DNS
+/// pump had read the helper's query left `resolved_hostname` null (the
+/// Ubuntu 24.04 flake, CI run 39602279581). The drain now waits for a pass
+/// of the DNS pump begun after the close (`DnsIngest`), so the query is in
+/// the cache whenever the lookup runs. Where `nsswitch.conf` puts `resolve`
+/// before `dns` (Debian 13) the helper sends no datagram: systemd-resolved
+/// is asked over varlink, and the name comes from the uprobe on its NSS
+/// module (`agent-ebpf/src/dns_nss.rs`) — the same assertion holds there.
+///
 /// The helper queries an FQDN (trailing dot) so glibc skips
 /// `resolv.conf` search-domain expansion and the most-recent observed
 /// QNAME is deterministically the literal we assert.
@@ -502,8 +512,9 @@ fn net_outbound_connect_records_flow_with_dns_attribution() {
     // Spawn the helper. python3 is universally present on the
     // production target; if it's missing, we want a clear failure
     // message rather than a silent skip. The helper resolves an FQDN
-    // (the kprobe captures the connected-UDP DNS query → PID-keyed
-    // DnsCache), then connects to loopback from the SAME PID so the
+    // (the kprobe captures the connected-UDP DNS query, or the NSS uprobe
+    // the name asked of systemd-resolved → PID-keyed DnsCache), then
+    // connects to loopback from the SAME PID so the
     // drain loop attributes the qname to the flow. The `.invalid`
     // TLD guarantees NXDOMAIN (no real egress); the query still goes
     // on the wire, which is all the attribution needs. The trailing

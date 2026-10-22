@@ -25,7 +25,13 @@ const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
 
 /// The guests a pull request runs, and those the nightly and a dispatch run.
 const PR_GUESTS: [&str; 2] = ["ubuntu2404", "ubuntu2204"];
-const NIGHTLY_GUESTS: [&str; 4] = ["ubuntu2404", "ubuntu2204", "debian12", "debian13"];
+const NIGHTLY_GUESTS: [&str; 5] = [
+    "ubuntu2404",
+    "ubuntu2204",
+    "debian12",
+    "debian13",
+    "ubuntu2604",
+];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -354,11 +360,12 @@ fn matrix_lists() -> (Vec<String>, Vec<String>) {
     (lists[0].clone(), lists[1].clone())
 }
 
-/// Ubuntu 24.04 and 22.04 on a pull request; the lab's four guests at night
-/// and on a dispatch; nothing else starts it. Every guest is one nn-lab.sh
+/// Ubuntu 24.04 and 22.04 on a pull request; the lab's four guests and
+/// Ubuntu 26.04 (lab PR 229: the runners' release, uutils coreutils) at
+/// night and on a dispatch; nothing else starts it. Every guest is one nn-lab.sh
 /// knows, one job each, and a failing guest does not cancel the others.
 #[test]
-fn lab_vm_matrix_two_ubuntu_kernels_on_prs_four_guests_nightly() {
+fn lab_vm_matrix_two_ubuntu_kernels_on_prs_five_guests_nightly() {
     let (pr, nightly) = matrix_lists();
     assert_eq!(pr, PR_GUESTS);
     assert_eq!(nightly, NIGHTLY_GUESTS);
@@ -1064,13 +1071,14 @@ fn expected_rows() -> Vec<Vec<String>> {
 }
 
 /// Each expected failure is a recorded follow-up of one guest nn-lab.sh
-/// knows, on a test that exists in its suite; the one the gate started with
-/// is Debian 13's DNS attribution (nss-resolve), on Debian 13 only.
+/// knows, on a test that exists in its suite. The one the gate started with,
+/// Debian 13's DNS attribution (nss-resolve), is gone since lab PR 229 fixed
+/// it: the list holds no line for it, and the real list run through
+/// gate-summary passes a Debian 13 run where that test passes.
 #[test]
 fn expected_failures_are_recorded_follow_ups() {
     let nn_lab = read(NN_LAB);
     let rows = expected_rows();
-    assert!(!rows.is_empty());
     for r in &rows {
         assert_eq!(r.len(), 4, "{EXPECTED}: {r:?}");
         let (distro, suite, test, follow_up) = (&r[0], &r[1], &r[2], &r[3]);
@@ -1095,15 +1103,29 @@ fn expected_failures_are_recorded_follow_ups() {
             "{EXPECTED}: {test}: the follow-up names where it is recorded"
         );
     }
-    let dns: Vec<&Vec<String>> = rows
-        .iter()
-        .filter(|r| r[2] == "net_outbound_connect_records_flow_with_dns_attribution")
-        .collect();
-    assert_eq!(dns.len(), 1, "{dns:?}");
-    assert_eq!(
-        (dns[0][0].as_str(), dns[0][1].as_str()),
-        ("debian13", "net_privileged_e2e")
+    assert!(
+        rows.iter().all(|r| r[2] != DNS_TEST),
+        "{EXPECTED}: lab PR 229 fixed the DNS attribution under nss-resolve: {rows:?}"
     );
+    let dir = case_dir("real-list");
+    let log = dir.join("gate.log");
+    fs::write(&log, gate_log(true, "", None)).unwrap();
+    let out = Command::new(XTASK)
+        .arg("gate-summary")
+        .arg("--log")
+        .arg(&log)
+        .args(["--distro", "debian13", "--kernel", "6.x-test", "--rc", "0"])
+        .arg("--expected")
+        .arg(repo_root().join(EXPECTED))
+        .arg("--json")
+        .arg(dir.join("gate-summary.json"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let j: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("gate-summary.json")).unwrap()).unwrap();
+    assert_eq!(j["verdict"], "pass");
+    assert_eq!(j["expected_failures"].as_array().map(Vec::len), Some(0));
 }
 
 // ── gate-summary and gate-report ──────────────────────────────────────────
@@ -1239,7 +1261,7 @@ fn gate_summary(name: &str, log: Option<&str>, distro: &str, extra: &[&str]) -> 
             "0123456789abcdef0123456789abcdef01234567",
         ])
         .arg("--expected")
-        .arg(repo_root().join(EXPECTED))
+        .arg(expected_fixture(&dir))
         .arg("--json")
         .arg(&json)
         .arg("--markdown")
@@ -1255,6 +1277,30 @@ fn gate_summary(name: &str, log: Option<&str>, distro: &str, extra: &[&str]) -> 
         json: serde_json::from_str(&j).unwrap(),
         markdown: fs::read_to_string(&md).unwrap_or_default(),
     }
+}
+
+/// An expected-failures list in `deploy/lab/expected-failures.tsv`'s
+/// format holding the one line the gate started with (Debian 13's DNS
+/// attribution under nss-resolve), for the gate-summary and gate-report
+/// tests: they check the mechanism, whatever the real list holds today
+/// (lab PR 229 closed that follow-up and removed its line).
+fn expected_fixture(dir: &Path) -> PathBuf {
+    let path = dir.join("expected-failures.tsv");
+    let header: String = read(EXPECTED)
+        .lines()
+        .take_while(|l| l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(
+        &path,
+        format!(
+            "{header}debian13\tnet_privileged_e2e\t{DNS_TEST}\tDNS attribution on hosts that \
+             resolve through systemd-resolved (nss-resolve; a fixture of the line lab PR 164 \
+             recorded)\n"
+        ),
+    )
+    .unwrap();
+    path
 }
 
 fn reasons(g: &Gate) -> String {
