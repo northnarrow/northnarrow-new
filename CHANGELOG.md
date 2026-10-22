@@ -339,6 +339,12 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- NN-L-CHAIN-007 (`/tmp` exec, credential read, egress) was missed when
+  the exec record reached the engine after the read and the egress it
+  preceded (lab PR 235; the CI flake of
+  `chain_tmp_then_cred_then_egress_trips_chain_007` on Ubuntu 22.04):
+  CHAIN-001 fired and CHAIN-007 never did. The exec now completes the
+  chain on the kernel timestamps, as a late read already did (review 70).
 - A `chmod u+s` of a watched file could go unrecorded as attribute drift
   (lab PR 229; the CI flake of `fim_chmod_setuid_records_attribute_drift`).
   The recompute task filled the drain's baseline cache only after the

@@ -856,3 +856,27 @@ only in the table below, in the same PR as the evidence.
     (uutils sets owner and mode again where GNU skips them). The local
     gate script replays the fuzz inputs as the CI job does.
   - Lab: On Debian 13 (6.12), 30 runs of each test before (main 8180540) and after: the FIM test with its fixtures on tmpfs 30/30 → 30/30, on ext4 30/30 → 30/30, on ext4 with a 1 ms baseline poll 30/30 → 30/30, on a dm-delay ext4 (an fsync of ~100 ms) 6/30 → 30/30, the 24 failures each one `Modified` row with a null baseline, the chmod's own (the CI's shape); the DNS test through nss-resolve 0/30 → 30/30 (probes on `/usr/lib/x86_64-linux-gnu/libnss_resolve.so.2`, 4_r and 3_r), with `hosts: files dns` (24.04's path) 30/30 → 30/30, the same with 600 DNS records queued ahead of the helper's query 28/30 → 30/30, the 2 failures a null `resolved_hostname`. On the final tree there: `verifier-check` 77 of 77 OK (`dns_nss_resolve` 537 instructions processed, stack 64 bytes, 96 down its deepest call chain, of 512), `dns-sensor-check` OK (10 of 10), `net-check` 13 of 13, the net and FIM privileged suites 5 of 5 and 6 of 6; `fim-reuse-check` NOT RUN (no inode reused within 5000 files). Ubuntu 26.04 (`ubuntu2604`, the lab's WHPX guest) booted from the catalogue: its image list checked against the pinned UEC key, kernel 7.0.0-38-generic with `bpf` in the LSM list, uutils coreutils (rust-coreutils 0.10), systemd 259, no libnss_resolve (the NSS probe not attached, said so); `verifier-check` 77 of 77 OK; the gate's test-ignored on the tree before the two fixes: 55 suites, 79 passed, 1 failed (`new_entries_and_xattrs_are_denied_outside_the_window`, the refusal read from uutils' message); after them `fs_deny_privileged_e2e` 2 of 2, an `install.sh` upgrade over the running install (immutable state directory) through where it had failed and rolled back, and the two tests of this lot 10 of 10 each. On the final tree the gate's test-ignored there: 56 suites, 80 passed, 0 failed (gate-summary: pass); `malsim-exec-check` there: MS-01/02/03/32 before and after, audit and the desktop cases passed with the copies of `true` (MS-02 and MS-03 ran, rc 0, as on 24.04), the two NN-L-EXECENV-002 cases (`HISTFILE=/dev/null bash`, `GLIBC_TUNABLES` at su) drew no record — open, outside the CI gate.
+- **Lab PR 235 — NN-L-CHAIN-007 completed by a `/tmp` exec processed
+  after the read and the egress.** C14 (behavioural detection and
+  correlation); Wave 4 Phase 2.
+  - What was wrong: on PR #428's first CI attempt (run 39729153594,
+    Ubuntu 22.04, 5.15) `chain_tmp_then_cred_then_egress_trips_chain_007`
+    found no CHAIN-007 verdict. The agent log: the exec check raised
+    StagingExec, then FIM-015 fired on the credential read, CHAIN-001 on
+    the connect, and R009 on the `ProcessSpawn` last — the exec record
+    (its own ring and pump) reached the engine after the read and the
+    connect it preceded, and the `TmpExec` was not in the store when the
+    egress was judged. Review 70 had covered a late read, not a late
+    exec. Not a regression of lab PR 229 (its `DnsIngest` wait delays
+    the connect, not the exec; the loop below is the same before and
+    after it), and no earlier CHAIN-007 failure in the 47 lab-vm runs.
+  - What changed: CHAIN-007 also judges a staging exec: when the same
+    process has a credential read at or after the exec and a noted
+    egress after the read, within the window (kernel timestamps), it
+    fires the Critical KillProcessTree verdict naming the egress, and
+    observes the exec and records its `TmpExec` as CHAIN-002 would. On a
+    miss nothing changes. CHAIN-001's in-order and late completions now
+    claim the noted egress instead of removing it, so no second two-step
+    chain uses it but the late exec still upgrades it to the three-step
+    one; the flow ledger keeps one more chain verdict off its close.
+  - Lab: On Ubuntu 22.04 (5.15, KVM guest ubuntu2204), the test alone, 30 runs per tree: `main` before #428 (4423267) 30/30 pass; `main` 8f52f5c 30/30, and 30/30, 30/30, 10/10 with 3, 8 and 16 `/bin/true` exec loops in the guest (the CI reorder not reproduced in the lab); this branch 30/30, and 30/30 with 8 exec loops; the whole `detection_rules_at_scale_privileged_e2e` suite 16 of 16. Host: `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` 2,913 passed, 0 failed (3 new unit tests of the late exec); the four clippy runs, `cargo fmt`, `attack-coverage --check`: pass.

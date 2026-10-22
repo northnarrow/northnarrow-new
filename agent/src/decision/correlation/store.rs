@@ -123,6 +123,16 @@ pub struct EgressNote {
     pub start_ns: u64,
 }
 
+/// Lab PR 235: a noted egress, and whether a two-step chain (CHAIN-001)
+/// already fired on it. A claimed egress completes no further two-step
+/// chain, but a `/tmp` exec processed after it can still complete the
+/// three-step CHAIN-007 with it ([`CorrelationStore::exec_sequence_egress`]).
+#[derive(Clone, Debug)]
+struct NotedEgress {
+    note: EgressNote,
+    claimed: bool,
+}
+
 /// PID-reuse-safe process identity (§13 Q2). `start_ns` is the task's
 /// `start_time` (CLOCK_MONOTONIC ns, `Event::ProcessSpawn::start_ns`);
 /// `start_ns == 0` means "incarnation unknown".
@@ -196,8 +206,9 @@ pub struct CorrelationStore {
     /// D4 — parent→child lineage for cross-PID correlation, and the
     /// `pid → start_ns` map (NETR-009).
     tree: AncestryTree,
-    /// Review 70 — egresses no chain has claimed yet, per process.
-    egress: HashMap<ProcKey, VecDeque<EgressNote>>,
+    /// Review 70 — egresses noted for a precursor processed after them,
+    /// per process.
+    egress: HashMap<ProcKey, VecDeque<NotedEgress>>,
     egress_order: LazyLru<ProcKey>,
 }
 
@@ -299,21 +310,24 @@ impl CorrelationStore {
         let q = self.egress.entry(key).or_default();
         // Lab PR 224: a flow is judged at its connect, in snapshots and at
         // its close, all under its connect's timestamp: one note.
-        if q.iter().any(|n| n.start_ns == note.start_ns) {
+        if q.iter().any(|n| n.note.start_ns == note.start_ns) {
             self.egress_order.touch(key);
             return;
         }
-        q.push_back(note);
+        q.push_back(NotedEgress {
+            note,
+            claimed: false,
+        });
         while q.len() > MAX_EGRESS_PER_PROC {
             q.pop_front();
         }
         self.egress_order.touch(key);
     }
 
-    /// Review 70: take the earliest noted egress of `key` that happened
-    /// after `after_ns`, within `window_ns` of it — the one a precursor
-    /// stamped `after_ns` completes. It is taken: an egress completes one
-    /// late chain only.
+    /// Review 70: take the earliest unclaimed noted egress of `key` that
+    /// happened after `after_ns`, within `window_ns` of it — the one a
+    /// precursor stamped `after_ns` completes. It is taken: an egress
+    /// completes one late chain only.
     pub fn take_egress_after(
         &mut self,
         key: ProcKey,
@@ -321,24 +335,104 @@ impl CorrelationStore {
         window_ns: u64,
     ) -> Option<EgressNote> {
         let q = self.egress.get_mut(&key)?;
-        let idx = q
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| n.start_ns > after_ns && n.start_ns - after_ns <= window_ns)
-            .min_by_key(|(_, n)| n.start_ns)
-            .map(|(i, _)| i);
-        let note = idx.and_then(|i| q.remove(i));
+        let idx = earliest_after(q, after_ns, window_ns);
+        let note = idx.and_then(|i| q.remove(i)).map(|n| n.note);
         if q.is_empty() {
             self.remove_egress(&key);
         }
         note
     }
 
+    /// Lab PR 235: [`Self::take_egress_after`] for a two-step chain
+    /// (CHAIN-001): the egress is claimed, not removed — no later read
+    /// completes a two-step chain with it again, and a `/tmp` exec
+    /// processed after both can still complete CHAIN-007 with it.
+    pub fn claim_egress_after(
+        &mut self,
+        key: ProcKey,
+        after_ns: u64,
+        window_ns: u64,
+    ) -> Option<EgressNote> {
+        let q = self.egress.get_mut(&key)?;
+        let i = earliest_after(q, after_ns, window_ns)?;
+        let n = &mut q[i];
+        n.claimed = true;
+        Some(n.note.clone())
+    }
+
     /// Review 70: a chain fired on this egress in order, so no late
-    /// precursor may complete a chain with it again.
+    /// precursor may complete a two-step chain with it again. Lab PR 235:
+    /// claimed, not removed (see [`Self::claim_egress_after`]).
     pub fn claim_egress(&mut self, key: ProcKey, start_ns: u64) {
         if let Some(q) = self.egress.get_mut(&key) {
-            q.retain(|n| n.start_ns != start_ns);
+            for n in q.iter_mut().filter(|n| n.note.start_ns == start_ns) {
+                n.claimed = true;
+            }
+        }
+    }
+
+    /// Lab PR 235: the three-step CHAIN-007 whose `/tmp` exec (`exec_ts`,
+    /// of the process started at `start_ns`) is processed after the
+    /// credential read and the egress that followed it — another ring, in
+    /// kernel order before both (the CI flake of 22/10/2026). Returns the
+    /// earliest noted egress, claimed or not, that follows a credential
+    /// read of the same process made at or after the exec, all within
+    /// `window_ns` of the exec. Read-only: [`Self::complete_exec_sequence`]
+    /// commits it.
+    ///
+    /// Before the exec is observed, the read and the egress sit under the
+    /// PID's unresolved key, the incarnation the tree last saw, or this
+    /// one; all three are looked at, as [`Self::observe_spawn`] hands them
+    /// over (only what happened since `start_ns`).
+    pub fn exec_sequence_egress(
+        &self,
+        pid: u32,
+        start_ns: u64,
+        exec_ts: u64,
+        window_ns: u64,
+    ) -> Option<EgressNote> {
+        if start_ns == 0 {
+            return None;
+        }
+        let keys = [
+            ProcKey { pid, start_ns },
+            ProcKey::unresolved(pid),
+            self.current_key(pid),
+        ];
+        let within = |ts: u64| ts >= exec_ts && ts >= start_ns && ts - exec_ts <= window_ns;
+        let read_ts = keys
+            .iter()
+            .filter_map(|k| self.per_proc.get(k))
+            .flatten()
+            .filter(|p| p.kind == PrecursorKind::CredRead && within(p.ts_ns))
+            .map(|p| p.ts_ns)
+            .min()?;
+        keys.iter()
+            .filter_map(|k| self.egress.get(k))
+            .flatten()
+            .map(|n| &n.note)
+            .filter(|n| n.start_ns > read_ts && within(n.start_ns))
+            .min_by_key(|n| n.start_ns)
+            .cloned()
+    }
+
+    /// Lab PR 235: commit a late exec's CHAIN-007 found by
+    /// [`Self::exec_sequence_egress`]: the exec is observed (the read and
+    /// the egress handed to its incarnation), its `TmpExec` recorded, and
+    /// the egress removed — it completes no other chain.
+    pub fn complete_exec_sequence(
+        &mut self,
+        pid: u32,
+        ppid: u32,
+        start_ns: u64,
+        exec_ts: u64,
+        egress_start_ns: u64,
+    ) {
+        self.observe_spawn(pid, ppid, start_ns);
+        let key = ProcKey { pid, start_ns };
+        self.record(key, PrecursorKind::TmpExec, exec_ts);
+        if let Some(q) = self.egress.get_mut(&key) {
+            q.retain(|n| n.note.start_ns != egress_start_ns);
             if q.is_empty() {
                 self.remove_egress(&key);
             }
@@ -531,8 +625,13 @@ impl CorrelationStore {
             }
             if let Some(q) = self.egress.get(&old).cloned() {
                 self.remove_egress(&old);
-                for n in q.into_iter().filter(|n| n.start_ns >= start_ns) {
-                    self.note_egress(new_key, n);
+                for n in q.into_iter().filter(|n| n.note.start_ns >= start_ns) {
+                    let claimed = n.claimed;
+                    let at = n.note.start_ns;
+                    self.note_egress(new_key, n.note);
+                    if claimed {
+                        self.claim_egress(new_key, at);
+                    }
                 }
             }
         }
@@ -709,6 +808,17 @@ impl CorrelationStore {
     fn tracked_procs(&self) -> usize {
         self.per_proc.len()
     }
+}
+
+/// The index of the earliest egress of `q` after `after_ns` and within
+/// `window_ns` of it, of the unclaimed ones.
+fn earliest_after(q: &VecDeque<NotedEgress>, after_ns: u64, window_ns: u64) -> Option<usize> {
+    q.iter()
+        .enumerate()
+        .filter(|(_, n)| !n.claimed)
+        .filter(|(_, n)| n.note.start_ns > after_ns && n.note.start_ns - after_ns <= window_ns)
+        .min_by_key(|(_, n)| n.note.start_ns)
+        .map(|(i, _)| i)
 }
 
 #[cfg(test)]
