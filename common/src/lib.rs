@@ -7,7 +7,7 @@
 //!   by the eBPF program (`agent-ebpf`) with `default-features = false`.
 //! - The `std` feature (default) adds the userland helpers of those
 //!   layouts (`wire::cstr_lossy`, the name tables of `wire::execpol` and
-//!   `wire::execq`, the bytemuck derives) and [`execq`]. The richer
+//!   `wire::execq`, the bytemuck derives). The richer
 //!   userland representation (`Event`, `Verdict`, `ResponseAction`,
 //!   `Severity`) is nn-model's since the Wave 4 restructure's R02 (lab PR
 //!   240).
@@ -41,11 +41,6 @@ pub mod fail_open;
 /// Ring-buffer drop slots shared by eBPF producers and the agent.
 pub mod ring_drops;
 
-/// Lab PR 223 (EXPERIMENTAL): the exec quarantine's scanner protocol and
-/// signed hash list.
-#[cfg(feature = "std")]
-pub mod execq;
-
 // Wave 4 restructure, R03 (lab PR 240): the admin protocol
 // (`wire::admin_protocol`), the signed payloads
 // (`wire::admin_signed_payload`), the quorum, the shutdown marker and the
@@ -54,4 +49,7 @@ pub mod execq;
 // model (`model`, re-exported here), `posture_types`, `netaddr`,
 // `log_escape` and the std types of `wire` (`FimEvent`, `NetFlowEvent`,
 // `NetListenerEvent`, `TlsFingerprint`, …) are nn-model's, `dns_qname`
-// nn-parse's. No re-export here: those crates depend on this one.
+// nn-parse's. No re-export here: those crates depend on this one. Lab PR
+// 241: the exec quarantine's scanner protocol and hash list (`execq`) are
+// nn-proto's too; the raw layouts of its kernel records stay
+// (`wire::execq`).

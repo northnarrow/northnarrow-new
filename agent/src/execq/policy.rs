@@ -18,9 +18,9 @@
 
 use std::time::{Duration, Instant};
 
-use common::execq::ScanVerdict;
 use common::wire::execq::known_verdict;
 use nn_model::Severity;
+use nn_proto::execq::ScanVerdict;
 
 /// What is done to the held process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

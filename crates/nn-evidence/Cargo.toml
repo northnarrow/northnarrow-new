@@ -11,7 +11,31 @@ publish = false
 
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
+# R05 (lab PR 241): the agent's evidence chain moved here with the
+# dependencies it had there, the same versions and features (one version
+# each in the workspace). No libc, no OS crate: the host's file operations
+# are behind `chain_host::ChainHost`.
 [dependencies]
+# R04a/R02: `log_escape` (the journal's escaping of an identity).
+nn-model = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+# `float_roundtrip`: a float decoded from a line is the value that was
+# written, so the canonical re-serialisation of a v3 line holds (the
+# agent's feature; a verifier built without it could refuse genuine rows).
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
+
+[dev-dependencies]
+tempfile = "3"
+# The audit rows' byte-exact round trip draws its strings from a seeded RNG.
+rand = "0.10"
 
 [lints]
 workspace = true

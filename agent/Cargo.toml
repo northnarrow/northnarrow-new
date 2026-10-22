@@ -66,6 +66,10 @@ nn-proto = { workspace = true }
 # QNAME walk (nn-parse).
 nn-model = { workspace = true }
 nn-parse = { workspace = true }
+# R05 (lab PR 241): the evidence chain (chainlog, audit, chain_anchor,
+# chain_tail, verify_lines, the canary chain line reader), named through
+# the shims of the same modules here.
+nn-evidence = { workspace = true }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
 # crate directly without pulling the rest of `agent` —

@@ -53,7 +53,6 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -65,7 +64,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
-use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
+use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::chain_host::{ChainHost, ChainSigner};
 
 /// Pre-image prefix of a numbered `audit.log` row.
 pub const AUDIT_DOMAIN_V2: &[u8] = b"northnarrow/audit/v2\0";
@@ -234,15 +234,11 @@ pub type LineCheck = fn(&[u8], &VerifyingKey) -> bool;
 /// The head of `path`: its newest complete line that `genuine` accepts,
 /// looked for in a bounded window from the end. `None` when the file is
 /// missing, empty, or holds no such line in the window.
-pub fn read_file_head(
+pub fn read_file_head<H: ChainHost>(
     path: &Path,
     genuine: &dyn Fn(&[u8]) -> bool,
 ) -> std::io::Result<Option<FileHead>> {
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+    let mut f = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -324,16 +320,12 @@ pub enum HeadCheck {
 }
 
 /// Compare `path` with `head` in O(window).
-pub fn check_head(path: &Path, head: &FileHead) -> std::io::Result<HeadCheck> {
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+pub fn check_head<H: ChainHost>(path: &Path, head: &FileHead) -> std::io::Result<HeadCheck> {
+    let mut f = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HeadCheck::Missing),
         // A symlink put where the chain file was is not the chain.
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(HeadCheck::Changed),
+        Err(e) if H::is_symlink_refusal(&e) => return Ok(HeadCheck::Changed),
         Err(e) => return Err(e),
     };
     let meta = f.metadata()?;
@@ -413,17 +405,18 @@ pub struct ChainTarget {
 }
 
 impl ChainTarget {
-    /// The target of the rotating log of `P` at `path`.
-    pub fn rotating<P>(chain: &'static str, path: &Path) -> Self
+    /// The target of the rotating log of `P` at `path`, on the host `H`.
+    pub fn rotating<P, H>(chain: &'static str, path: &Path) -> Self
     where
         P: Serialize + serde::de::DeserializeOwned + crate::chainlog::ChainPayload,
+        H: ChainHost,
     {
         ChainTarget {
             chain,
             path: path.to_path_buf(),
             kind: ChainKind::Rotating,
             genuine: crate::chainlog::line_is_genuine::<P>,
-            recent: Some(crate::chainlog::verify_recent::<P>),
+            recent: Some(crate::chainlog::verify_recent::<P, H>),
             full: full_rotating::<P>,
             payload_kind: Some(P::KIND),
         }
@@ -472,7 +465,9 @@ fn legacy_summary(legacy: u64, non_canonical: u64) -> String {
 
 /// The rows of a flat chain file, and each row's line as on disk (external
 /// audit EVD-007, lab PR 204); a line that does not parse is an error.
-fn flat_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Result<(Vec<T>, Vec<String>), String> {
+pub fn flat_rows<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<(Vec<T>, Vec<String>), String> {
     let body = match std::fs::read_to_string(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
@@ -490,7 +485,7 @@ fn flat_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Result<(Vec<T>, Vec
 /// External audit EVD-007 (NN-AUD-273, lab PR 204): every numbered row of a
 /// flat chain is in its canonical bytes; returns how many rows without
 /// `seq` are not (they verify as before).
-fn canonical_rows<T: Serialize>(
+pub fn canonical_rows<T: Serialize>(
     rows: &[T],
     raws: &[String],
     numbered: impl Fn(&T) -> bool,
@@ -512,7 +507,7 @@ fn canonical_rows<T: Serialize>(
 }
 
 /// The summary's note on rows without `seq` not in canonical bytes.
-fn non_canonical_note(n: usize) -> String {
+pub fn non_canonical_note(n: usize) -> String {
     if n == 0 {
         String::new()
     } else {
@@ -526,7 +521,7 @@ fn non_canonical_note(n: usize) -> String {
 /// streaming pass ([`crate::audit::verify_chain_file`]); it was read whole
 /// and kept row by row, and a line that is not a row was named only by its
 /// parse error.
-fn full_audit(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
+pub fn full_audit(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
     let r =
         crate::audit::verify_chain_file(path, pk, None).map_err(|e| format!("unreadable: {e}"))?;
     if let Some(e) = r.broken {
@@ -535,27 +530,7 @@ fn full_audit(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
     Ok(numbered_summary(r.rows, r.first_numbered) + &non_canonical_note(r.non_canonical_legacy))
 }
 
-fn full_canary_registry(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
-    let (rows, raws) = flat_rows::<crate::canary::registry::CanaryToken>(path)?;
-    crate::canary::registry::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
-    let legacy = canonical_rows(&rows, &raws, |r| r.seq.is_some())?;
-    Ok(
-        numbered_summary(rows.len(), rows.iter().position(|r| r.seq.is_some()))
-            + &non_canonical_note(legacy),
-    )
-}
-
-fn full_canary_access(path: &Path, pk: &VerifyingKey) -> Result<String, String> {
-    let (rows, raws) = flat_rows::<crate::canary::access_log::CanaryAccessEntry>(path)?;
-    crate::canary::access_log::verify_chain(&rows, pk).map_err(|e| e.to_string())?;
-    let legacy = canonical_rows(&rows, &raws, |r| r.seq.is_some())?;
-    Ok(
-        numbered_summary(rows.len(), rows.iter().position(|r| r.seq.is_some()))
-            + &non_canonical_note(legacy),
-    )
-}
-
-fn numbered_summary(rows: usize, first_numbered: Option<usize>) -> String {
+pub fn numbered_summary(rows: usize, first_numbered: Option<usize>) -> String {
     match first_numbered {
         Some(0) => format!("{rows} rows, all numbered"),
         Some(n) => format!("{rows} rows, {n} in the old format then numbered"),
@@ -569,80 +544,6 @@ pub type RecentCheck = fn(
     &VerifyingKey,
     u64,
 ) -> Result<crate::chainlog::RecentReport, crate::chainlog::LogSetError>;
-
-/// Where the agent's chains live (the CLI flags; `Default`: built-ins).
-#[derive(Debug, Clone)]
-pub struct ChainPaths {
-    pub audit: PathBuf,
-    pub canary_registry: PathBuf,
-    pub canary_access: PathBuf,
-    pub detections: PathBuf,
-    pub status_events: PathBuf,
-    pub netflow: PathBuf,
-    pub fim_drift: PathBuf,
-}
-
-impl Default for ChainPaths {
-    fn default() -> Self {
-        Self {
-            audit: crate::audit::DEFAULT_AUDIT_LOG_PATH.into(),
-            canary_registry: crate::canary::registry::DEFAULT_REGISTRY_PATH.into(),
-            canary_access: crate::canary::access_log::DEFAULT_ACCESS_LOG_PATH.into(),
-            detections: crate::detection_store::DEFAULT_DETECTIONS_LOG_PATH.into(),
-            status_events: crate::detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH.into(),
-            netflow: crate::admin_socket::DEFAULT_NETFLOW_JSONL_PATH.into(),
-            fim_drift: crate::fim::drain::DEFAULT_DRIFT_LOG_PATH.into(),
-        }
-    }
-}
-
-impl ChainPaths {
-    /// Every chain the agent anchors, in a fixed order.
-    pub fn targets(&self) -> Vec<ChainTarget> {
-        let flat = |chain, path: &PathBuf, genuine, full| ChainTarget {
-            chain,
-            path: path.clone(),
-            kind: ChainKind::Flat,
-            genuine,
-            recent: None,
-            full,
-            payload_kind: None,
-        };
-        vec![
-            flat(
-                "audit",
-                &self.audit,
-                crate::audit::row_is_genuine,
-                full_audit,
-            ),
-            flat(
-                "canary_registry",
-                &self.canary_registry,
-                crate::canary::registry::row_is_genuine,
-                full_canary_registry,
-            ),
-            flat(
-                "canary_access",
-                &self.canary_access,
-                crate::canary::access_log::row_is_genuine,
-                full_canary_access,
-            ),
-            ChainTarget::rotating::<crate::detection_store::DetectionRecord>(
-                "detections",
-                &self.detections,
-            ),
-            ChainTarget::rotating::<crate::detection_store::StatusEvent>(
-                "status_events",
-                &self.status_events,
-            ),
-            ChainTarget::rotating::<crate::net::drain::NetFlowPayload>("netflow", &self.netflow),
-            ChainTarget::rotating::<crate::fim::drain::FimDriftPayload>(
-                "fim_drift",
-                &self.fim_drift,
-            ),
-        ]
-    }
-}
 
 // ── the head anchor ─────────────────────────────────────────────────
 
@@ -704,8 +605,8 @@ pub struct HeadsStore;
 
 impl HeadsStore {
     /// The newest genuine snapshot in `path`.
-    pub fn read(path: &Path, pk: &VerifyingKey) -> HeadsRead {
-        let bytes = match read_bounded(path, 2 * SLOT_BYTES) {
+    pub fn read<H: ChainHost>(path: &Path, pk: &VerifyingKey) -> HeadsRead {
+        let bytes = match read_bounded::<H>(path, 2 * SLOT_BYTES) {
             Ok(Some(b)) => b,
             Ok(None) => return HeadsRead::Missing,
             Err(e) => return HeadsRead::Invalid(format!("unreadable: {e}")),
@@ -746,7 +647,7 @@ impl HeadsStore {
 
     /// Write `snapshot` (its `counter` picks the slot) and fsync. The file
     /// is created if missing (`O_NOFOLLOW`, never truncated).
-    pub fn write(path: &Path, key: &AgentSigningKey, snapshot: &HeadsSnapshot) -> Result<()> {
+    pub fn write<K: ChainSigner>(path: &Path, key: &K, snapshot: &HeadsSnapshot) -> Result<()> {
         let digest = snapshot_digest(snapshot)?;
         let slot = SignedSlot {
             snapshot: snapshot.clone(),
@@ -761,16 +662,14 @@ impl HeadsStore {
         }
         text.resize(SLOT_BYTES as usize - 1, b' ');
         text.push(b'\n');
-        let f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(HEADS_FILE_MODE)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let f = K::Host::open_with_mode_nofollow(
+            OpenOptions::new().write(true).create(true).truncate(false),
+            HEADS_FILE_MODE,
+            path,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
         let offset = (snapshot.counter % 2) * SLOT_BYTES;
-        f.write_all_at(&text, offset)
+        K::Host::write_all_at(&f, &text, offset)
             .with_context(|| format!("writing {}", path.display()))?;
         f.sync_all()
             .with_context(|| format!("fsync {}", path.display()))?;
@@ -778,12 +677,8 @@ impl HeadsStore {
     }
 }
 
-fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
-    let f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
+fn read_bounded<H: ChainHost>(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let f = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -794,17 +689,21 @@ fn read_bounded(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
 }
 
 /// The heads of every target, read from disk now.
-pub fn collect_heads(targets: &[ChainTarget], pk: &VerifyingKey) -> Vec<AnchoredHead> {
+pub fn collect_heads<H: ChainHost>(
+    targets: &[ChainTarget],
+    pk: &VerifyingKey,
+) -> Vec<AnchoredHead> {
     let mut out = Vec::new();
     for t in targets {
         let genuine = |l: &[u8]| (t.genuine)(l, pk);
-        let head = |path: &Path, check: &dyn Fn(&[u8]) -> bool| match read_file_head(path, check) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, path = %path.display(), "chain head: file not read");
-                None
-            }
-        };
+        let head =
+            |path: &Path, check: &dyn Fn(&[u8]) -> bool| match read_file_head::<H>(path, check) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(error = %e, path = %path.display(), "chain head: file not read");
+                    None
+                }
+            };
         match t.kind {
             ChainKind::Flat => {
                 if let Some(h) = head(&t.path, &genuine) {
@@ -886,7 +785,7 @@ impl ChainFinding {
     /// The signed `integrity_drift` entry.
     pub fn draft(&self) -> AuditEntryDraft {
         AuditEntryDraft {
-            op: crate::self_integrity::AUDIT_OP.to_string(),
+            op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
             extra: serde_json::json!({
                 "kind": self.kind,
                 "chain": self.chain,
@@ -905,7 +804,7 @@ impl ChainFinding {
     }
 
     /// ERROR in the journal, then the signed entry.
-    pub fn attest(&self, log: Option<&mut AuditLog>) {
+    pub fn attest<K: ChainSigner>(&self, log: Option<&mut AuditLog<K>>) {
         error!(
             kind = self.kind,
             chain = %self.chain,
@@ -982,24 +881,16 @@ impl BootCheck {
     }
 }
 
-/// Load the verifying key the way the boot does before the attach: the
-/// signing key if readable, else its published public half.
-pub fn boot_verifying_key(signing_key_file: &Path) -> Option<VerifyingKey> {
-    match crate::audit::read_signing_key(signing_key_file) {
-        Ok(k) => Some(k.verifying_key()),
-        Err(_) => {
-            crate::audit::read_verifying_key(&crate::audit::verifying_key_path(signing_key_file))
-                .ok()
-        }
-    }
-}
-
 /// Compare the chains with what was anchored: every head of the last
 /// snapshot in `heads_file`, and the newest manifest checkpoint of every
 /// rotating log. O(1) reads per file; run before any writer opens.
-pub fn boot_check(targets: &[ChainTarget], heads_file: &Path, pk: &VerifyingKey) -> BootCheck {
+pub fn boot_check<H: ChainHost>(
+    targets: &[ChainTarget],
+    heads_file: &Path,
+    pk: &VerifyingKey,
+) -> BootCheck {
     let mut out = BootCheck::default();
-    match HeadsStore::read(heads_file, pk) {
+    match HeadsStore::read::<H>(heads_file, pk) {
         HeadsRead::Valid(s) => out.previous = Some(s),
         HeadsRead::Invalid(why) => out.findings.push(ChainFinding::new(
             "chain_heads",
@@ -1013,14 +904,14 @@ pub fn boot_check(targets: &[ChainTarget], heads_file: &Path, pk: &VerifyingKey)
     }
     if let Some(prev) = &out.previous {
         for h in &prev.heads {
-            check_anchored(h, &prev.ts, targets, &mut out.findings);
+            check_anchored::<H>(h, &prev.ts, targets, &mut out.findings);
         }
     }
     for t in targets
         .iter()
         .filter(|t| matches!(t.kind, ChainKind::Rotating))
     {
-        check_rotating(t, pk, &mut out.findings);
+        check_rotating::<H>(t, pk, &mut out.findings);
     }
     // One finding per file and kind is enough.
     let mut seen = std::collections::HashSet::new();
@@ -1062,7 +953,7 @@ fn holder(active: &Path, generation: u64) -> Holder {
     }
 }
 
-fn check_anchored(
+fn check_anchored<H: ChainHost>(
     h: &AnchoredHead,
     anchored_at: &str,
     targets: &[ChainTarget],
@@ -1096,7 +987,7 @@ fn check_anchored(
             _ => t.path.clone(),
         }
     };
-    report_head(
+    report_head::<H>(
         &h.chain,
         &path,
         &h.head,
@@ -1105,7 +996,7 @@ fn check_anchored(
     );
 }
 
-fn report_head(
+fn report_head<H: ChainHost>(
     chain: &str,
     path: &Path,
     head: &FileHead,
@@ -1117,7 +1008,7 @@ fn report_head(
         "the head {source} ends at byte {} ({row}entry_hash {})",
         head.bytes, head.tail_hash
     );
-    let finding = match check_head(path, head) {
+    let finding = match check_head::<H>(path, head) {
         Ok(HeadCheck::Intact) => return,
         Ok(HeadCheck::Missing) => ("chain_missing", format!("the file is gone; {what}")),
         Ok(HeadCheck::Shorter { len }) => (
@@ -1138,9 +1029,13 @@ fn report_head(
 
 /// The newest manifest checkpoint, and a missing active file, of one
 /// rotating log.
-fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFinding>) {
+fn check_rotating<H: ChainHost>(
+    t: &ChainTarget,
+    pk: &VerifyingKey,
+    findings: &mut Vec<ChainFinding>,
+) {
     let tail =
-        crate::chainlog::manifest_tail_events(&t.path, t.payload_kind.unwrap_or_default(), pk);
+        crate::chainlog::manifest_tail_events::<H>(&t.path, t.payload_kind.unwrap_or_default(), pk);
     if let Some((seq, head)) = tail.iter().find_map(|e| match e {
         crate::chainlog::ManifestEvent::ActiveCheckpoint {
             seq,
@@ -1157,7 +1052,7 @@ fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFi
         _ => None,
     }) {
         match holder(&t.path, seq) {
-            Holder::File(p) => report_head(
+            Holder::File(p) => report_head::<H>(
                 t.chain,
                 &p,
                 &head,
@@ -1190,9 +1085,9 @@ fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFi
 // ── the anchor writer ───────────────────────────────────────────────
 
 /// Writes the head anchor for the running agent.
-pub struct Anchor {
+pub struct Anchor<K> {
     file: PathBuf,
-    key: AgentSigningKey,
+    key: K,
     agent_id: [u8; 16],
     targets: Vec<ChainTarget>,
     last: Option<HeadsSnapshot>,
@@ -1204,13 +1099,13 @@ pub struct Anchor {
     marker_pending: bool,
 }
 
-impl Anchor {
+impl<K: ChainSigner> Anchor<K> {
     /// `previous`: the snapshot the boot check read (its counter and
     /// sticky flag carry over). `anchoring_started`: the audit chain
     /// already holds the [`NUMBERING_STARTED_OP`] row.
     pub fn new(
         file: PathBuf,
-        key: AgentSigningKey,
+        key: K,
         agent_id: [u8; 16],
         targets: Vec<ChainTarget>,
         previous: Option<HeadsSnapshot>,
@@ -1257,12 +1152,11 @@ impl Anchor {
             return Ok(());
         }
         let create = |path: &Path| -> Result<()> {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(HEADS_FILE_MODE)
-                .open(path)
-            {
+            match K::Host::open_with_mode(
+                OpenOptions::new().write(true).create_new(true),
+                HEADS_FILE_MODE,
+                path,
+            ) {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                 Err(e) => Err(anyhow!(e).context(format!("creating {}", path.display()))),
@@ -1285,7 +1179,7 @@ impl Anchor {
     /// Re-read every head; write a snapshot when `force` or one moved
     /// (or the sticky flag turned on). Returns the heads that moved.
     pub fn refresh(&mut self, force: bool, second_key_added: bool) -> Result<Vec<AnchoredHead>> {
-        let heads = collect_heads(&self.targets, &self.key.verifying_key());
+        let heads = collect_heads::<K::Host>(&self.targets, &self.key.verifying_key());
         let flag = self.second_key_added || second_key_added;
         // Sticky in memory even if the write below fails.
         self.second_key_added = flag;
@@ -1339,181 +1233,6 @@ pub const BOOT_VERIFY_BYTES: u64 = 4 * 1024 * 1024;
 /// Audit op of the boot verification's result.
 pub const CHAIN_VERIFY_OP: &str = "chain_verify";
 
-/// External audit NN-AUD-112: the signed chains were never verified in
-/// production. After the start, in the background, every rotating log's
-/// last [`BOOT_VERIFY_BYTES`] are verified (hash, signature, link); the
-/// result is one signed `chain_verify` entry, and each failure an ERROR and
-/// a signed `integrity_drift` (`chain_verify_failed`). The flat chains are
-/// verified when they open (canary chains) or by the overlay floor scan
-/// (audit log); `nn-admin chain verify` checks everything in full.
-pub fn spawn_boot_verify(
-    targets: Vec<ChainTarget>,
-    pk: VerifyingKey,
-    audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>,
-) {
-    tokio::spawn(async move {
-        let started = std::time::Instant::now();
-        let results = tokio::task::spawn_blocking(move || {
-            targets
-                .iter()
-                .filter_map(|t| t.recent.map(|r| (t, r)))
-                .map(|(t, recent)| {
-                    (
-                        t.chain,
-                        t.path.clone(),
-                        recent(&t.path, &pk, BOOT_VERIFY_BYTES),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .await;
-        let Ok(results) = results else {
-            warn!("chain verify: the boot verification task failed");
-            return;
-        };
-        let mut logs = Vec::new();
-        let mut failures = Vec::new();
-        for (chain, path, r) in results {
-            match r {
-                Ok(rep) => logs.push(serde_json::json!({
-                    "chain": chain,
-                    "file": path.display().to_string(),
-                    "lines": rep.lines,
-                    "bytes": rep.bytes,
-                    "whole_file": rep.whole_file,
-                    "result": "ok",
-                })),
-                Err(e) => {
-                    logs.push(serde_json::json!({
-                        "chain": chain,
-                        "file": path.display().to_string(),
-                        "result": "broken",
-                        "error": e.to_string(),
-                    }));
-                    failures.push(ChainFinding::new(
-                        chain,
-                        &path,
-                        "chain_verify_failed",
-                        format!("the last {BOOT_VERIFY_BYTES} bytes do not verify: {e}"),
-                    ));
-                }
-            }
-        }
-        let result = if failures.is_empty() { "ok" } else { "broken" };
-        info!(
-            result,
-            ms = started.elapsed().as_millis() as u64,
-            logs = logs.len(),
-            "chain verify: boot verification of the rotating logs done"
-        );
-        let Some(log) = audit_log else {
-            for f in &failures {
-                f.attest(None);
-            }
-            return;
-        };
-        let mut log = log.lock();
-        if let Err(e) = log.append(AuditEntryDraft {
-            op: CHAIN_VERIFY_OP.to_string(),
-            extra: serde_json::json!({
-                "scope": format!("last {BOOT_VERIFY_BYTES} bytes of each rotating log's active file"),
-                "logs": logs,
-            }),
-            key_fp: "agent-self".to_string(),
-            cosigner_fps: Vec::new(),
-            result: result.to_string(),
-            client_pid: std::process::id(),
-            client_uid: 0,
-            client_comm: "northnarrow-agent".to_string(),
-            client_exe: None,
-        }) {
-            warn!(error = %format!("{e:#}"), "chain verify: result not recorded");
-        }
-        for f in &failures {
-            f.attest(Some(&mut log));
-        }
-    });
-}
-
-/// The signed audit log, for [`report_unverified_rows`].
-static READ_AUDIT_LOG: std::sync::OnceLock<Arc<parking_lot::Mutex<AuditLog>>> =
-    std::sync::OnceLock::new();
-/// Last count reported per file, so a dashboard polling the same forged
-/// rows does not write one entry per query.
-static REPORTED: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, usize>>> =
-    std::sync::Mutex::new(None);
-
-/// Hand the signed audit log to the read paths (from `main`).
-pub fn set_audit_log(log: Option<Arc<parking_lot::Mutex<AuditLog>>>) {
-    if let Some(l) = log {
-        let _ = READ_AUDIT_LOG.set(l);
-    }
-}
-
-/// External audit NN-AUD-112: a read verb left out `count` rows of `file`
-/// that do not verify. ERROR in the journal every time; a signed
-/// `integrity_drift` (`chain_lines_unverified`) when the count for that
-/// file changed since the last one.
-pub fn report_unverified_rows(chain: &str, file: &Path, count: usize) {
-    let finding = ChainFinding::new(
-        chain,
-        file,
-        "chain_lines_unverified",
-        format!(
-            "{count} row(s) served by a read verb fail hash or signature verification: left out"
-        ),
-    );
-    let fresh = REPORTED
-        .lock()
-        .map(|mut m| {
-            let m = m.get_or_insert_with(Default::default);
-            m.insert(file.to_path_buf(), count) != Some(count)
-        })
-        .unwrap_or(true);
-    if !fresh {
-        error!(chain, file = %file.display(), count, "read verb: rows that do not verify left out");
-        return;
-    }
-    match READ_AUDIT_LOG.get() {
-        Some(log) => finding.attest(Some(&mut log.lock())),
-        None => finding.attest(None),
-    }
-}
-
-/// Re-anchor every [`ANCHOR_SECS`] the heads that moved.
-pub fn spawn(
-    anchor: Arc<parking_lot::Mutex<Anchor>>,
-    audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>>,
-) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(ANCHOR_SECS));
-        tick.tick().await; // the boot already anchored
-        loop {
-            tick.tick().await;
-            let second = audit_log
-                .as_ref()
-                .is_some_and(|l| l.lock().second_key_added());
-            let a = Arc::clone(&anchor);
-            let r = tokio::task::spawn_blocking(move || {
-                let mut a = a.lock();
-                a.refresh(false, second).map(|_| a.take_marker())
-            })
-            .await;
-            match r {
-                Ok(Ok(marker)) => {
-                    if let (Some(d), Some(log)) = (marker, audit_log.as_ref()) {
-                        if let Err(e) = log.lock().append(d) {
-                            warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
-                        }
-                    }
-                }
-                Ok(Err(e)) => warn!(error = %format!("{e:#}"), "chain heads: anchor not written"),
-                Err(e) => warn!(error = %e, "chain heads: anchor task failed"),
-            }
-        }
-    });
-}
-
 /// The one-time record, in the audit chain, of where numbering and head
 /// anchoring start: the head of every flat chain in the first snapshot.
 /// Rows after these heads carry `seq` and a domain-tagged hash; the rows up
@@ -1557,19 +1276,23 @@ pub fn numbering_started_draft(first: &HeadsSnapshot, heads_file: &Path) -> Audi
 /// `s = 0`) that the lax `verify` accepts under that key for every
 /// message. `verify_strict` refuses both; a signature the agent made
 /// passes either.
-#[cfg(test)]
-pub(crate) mod small_order {
+///
+/// R04a (lab PR 241): compiled in every build, hidden from the docs, for
+/// the verifiers' tests on both sides of the crate boundary (the canary
+/// chains and the FIM baseline keep theirs in the agent).
+#[doc(hidden)]
+pub mod small_order {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use ed25519_dalek::{Signature, VerifyingKey};
 
-    pub(crate) fn key() -> VerifyingKey {
+    pub fn key() -> VerifyingKey {
         let mut b = [0u8; 32];
         b[0] = 1;
         VerifyingKey::from_bytes(&b).expect("the identity point decompresses")
     }
 
-    pub(crate) fn signature() -> Signature {
+    pub fn signature() -> Signature {
         let mut b = [0u8; 64];
         b[0] = 1;
         Signature::from_bytes(&b)
@@ -1577,7 +1300,7 @@ pub(crate) mod small_order {
 
     /// The premise of each test: the lax check accepts the pair over
     /// `msg`, the strict one does not.
-    pub(crate) fn assert_premise(msg: &[u8]) {
+    pub fn assert_premise(msg: &[u8]) {
         use ed25519_dalek::Verifier as _;
         assert!(key().verify(msg, &signature()).is_ok(), "lax verify");
         assert!(key().verify_strict(msg, &signature()).is_err());
@@ -1585,7 +1308,7 @@ pub(crate) mod small_order {
 
     /// `text` with every `agent_sig` value replaced by the small-order
     /// signature; nothing else changed (the hashes still recompute).
-    pub(crate) fn forge(text: &str) -> String {
+    pub fn forge(text: &str) -> String {
         const MARK: &str = "\"agent_sig\":\"";
         let sig = B64.encode(signature().to_bytes());
         let mut out = String::with_capacity(text.len());
@@ -1613,7 +1336,8 @@ pub(crate) fn append_raw(path: &Path, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
+    use crate::audit::{AuditEntryDraft, AuditLog};
+    use crate::chain_host::testing::{PortableHost, TestKey};
     use tempfile::TempDir;
 
     fn draft(n: u32) -> AuditEntryDraft {
@@ -1630,8 +1354,8 @@ mod tests {
         }
     }
 
-    fn key(dir: &TempDir) -> AgentSigningKey {
-        AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap()
+    fn key(dir: &TempDir) -> TestKey {
+        TestKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap()
     }
 
     /// External audit NN-AUD-292 (FIMP-013): the heads snapshot's signature
@@ -1647,19 +1371,6 @@ mod tests {
         assert!(!signature_ok(&digest, &weak, &small_order::key()));
         let genuine = B64.encode(k.sign(&digest).to_bytes());
         assert!(signature_ok(&digest, &genuine, &k.verifying_key()));
-    }
-
-    fn paths(dir: &TempDir) -> ChainPaths {
-        let p = |n: &str| dir.path().join(n);
-        ChainPaths {
-            audit: p("audit.log"),
-            canary_registry: p("canaries.jsonl"),
-            canary_access: p("canary_access.jsonl"),
-            detections: p("detections.jsonl"),
-            status_events: p("status_events.jsonl"),
-            netflow: p("netflow.jsonl"),
-            fim_drift: p("fim_drift.jsonl"),
-        }
     }
 
     #[test]
@@ -1696,28 +1407,37 @@ mod tests {
             log.append(draft(n)).unwrap();
         }
         let ok = |l: &[u8]| crate::audit::row_is_genuine(l, &pk);
-        let head = read_file_head(&path, &ok).unwrap().unwrap();
+        let head = read_file_head::<PortableHost>(&path, &ok).unwrap().unwrap();
         assert_eq!(head.seq, Some(4));
         assert_eq!(head.bytes, std::fs::metadata(&path).unwrap().len());
-        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Intact);
+        assert_eq!(
+            check_head::<PortableHost>(&path, &head).unwrap(),
+            HeadCheck::Intact
+        );
         // growth keeps it intact
         log.append(draft(9)).unwrap();
-        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Intact);
+        assert_eq!(
+            check_head::<PortableHost>(&path, &head).unwrap(),
+            HeadCheck::Intact
+        );
         // a forged trailing line is not a head
         append_raw(&path, b"{\"entry_hash\":\"");
         append_raw(&path, "ab".repeat(32).as_bytes());
         append_raw(&path, b"\"}\n");
-        let again = read_file_head(&path, &ok).unwrap().unwrap();
+        let again = read_file_head::<PortableHost>(&path, &ok).unwrap().unwrap();
         assert_eq!(again.seq, Some(5));
         // cut below the head
         let body = std::fs::read(&path).unwrap();
         std::fs::write(&path, &body[..head.bytes as usize - 10]).unwrap();
         assert!(matches!(
-            check_head(&path, &head).unwrap(),
+            check_head::<PortableHost>(&path, &head).unwrap(),
             HeadCheck::Shorter { .. }
         ));
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(check_head(&path, &head).unwrap(), HeadCheck::Missing);
+        assert_eq!(
+            check_head::<PortableHost>(&path, &head).unwrap(),
+            HeadCheck::Missing
+        );
     }
 
     #[test]
@@ -1726,9 +1446,15 @@ mod tests {
         let k = key(&dir);
         let pk = k.verifying_key();
         let file = dir.path().join(HEADS_FILE_NAME);
-        assert_eq!(HeadsStore::read(&file, &pk), HeadsRead::Missing);
+        assert_eq!(
+            HeadsStore::read::<PortableHost>(&file, &pk),
+            HeadsRead::Missing
+        );
         std::fs::write(&file, b"").unwrap();
-        assert_eq!(HeadsStore::read(&file, &pk), HeadsRead::Empty);
+        assert_eq!(
+            HeadsStore::read::<PortableHost>(&file, &pk),
+            HeadsRead::Empty
+        );
         let mut s = HeadsSnapshot {
             counter: 1,
             ts: "t1".into(),
@@ -1740,103 +1466,24 @@ mod tests {
         s.counter = 2;
         s.ts = "t2".into();
         HeadsStore::write(&file, &k, &s).unwrap();
-        assert!(matches!(HeadsStore::read(&file, &pk), HeadsRead::Valid(v) if v.counter == 2));
+        assert!(
+            matches!(HeadsStore::read::<PortableHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 2)
+        );
         // slot of counter 2 torn: counter 1 is still there
         let f = OpenOptions::new().write(true).open(&file).unwrap();
-        f.write_all_at(b"{\"torn", 0).unwrap();
-        assert!(matches!(HeadsStore::read(&file, &pk), HeadsRead::Valid(v) if v.counter == 1));
+        PortableHost::write_all_at(&f, b"{\"torn", 0).unwrap();
+        assert!(
+            matches!(HeadsStore::read::<PortableHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 1)
+        );
         // another key's snapshot is not genuine
-        let other = AgentSigningKey::load_or_bootstrap(&dir.path().join("other")).unwrap();
+        let other = TestKey::load_or_bootstrap(&dir.path().join("other")).unwrap();
         HeadsStore::write(&file, &other, &s).unwrap();
         s.counter = 3;
         HeadsStore::write(&file, &other, &s).unwrap();
         assert!(matches!(
-            HeadsStore::read(&file, &pk),
+            HeadsStore::read::<PortableHost>(&file, &pk),
             HeadsRead::Invalid(_)
         ));
-    }
-
-    /// External audit EVD-019 (NN-AUD-281): the head anchor the agent
-    /// creates is closed to other users, like the audit log next to it.
-    #[test]
-    fn the_heads_file_is_created_closed_to_other_users() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
-        let k = key(&dir);
-        let file = dir.path().join(HEADS_FILE_NAME);
-        let s = HeadsSnapshot {
-            counter: 1,
-            ts: "t1".into(),
-            agent_id: "00".into(),
-            second_key_added: false,
-            heads: vec![],
-        };
-        HeadsStore::write(&file, &k, &s).unwrap();
-        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o640, "chain_heads.json mode {mode:o}");
-    }
-
-    /// External audit NN-AUD-108: on the code before lab PR 160 a cut
-    /// audit log reopened and verified with nothing to say. The head
-    /// anchor written before the cut names it at the next boot.
-    #[test]
-    fn a_cut_audit_log_is_found_at_the_next_boot() {
-        let dir = TempDir::new().unwrap();
-        let k = key(&dir);
-        let pk = k.verifying_key();
-        let p = paths(&dir);
-        let heads = dir.path().join(HEADS_FILE_NAME);
-        let mut log = AuditLog::open(&p.audit, key(&dir), [1; 16]).unwrap();
-        for n in 0..10 {
-            log.append(draft(n)).unwrap();
-        }
-        let mut anchor = Anchor::new(heads.clone(), k, [1; 16], p.targets(), None, false);
-        anchor.refresh(true, false).unwrap();
-        log.append(anchor.take_marker().expect("first snapshot written"))
-            .unwrap();
-        assert!(anchor.take_marker().is_none());
-        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
-        // cut the last rows; the chain that is left verifies
-        let body = std::fs::read_to_string(&p.audit).unwrap();
-        let full = body.clone();
-        let keep: String = body.lines().take(7).map(|l| format!("{l}\n")).collect();
-        std::fs::write(&p.audit, keep).unwrap();
-        let rows: Vec<crate::audit::AuditEntry> = std::fs::read_to_string(&p.audit)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        crate::audit::verify_chain(&rows, &pk).expect("what is left still verifies");
-        let found = boot_check(&p.targets(), &heads, &pk);
-        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
-        assert_eq!(found.findings[0].kind, "chain_truncated");
-        assert_eq!(found.findings[0].chain, "audit");
-        assert!(found.findings[0].detail.contains("row 9"));
-        assert!(found.audit_history_lost().is_some());
-        assert!(found.second_key_added(), "fails closed");
-        // the heads file removed after anchoring started
-        std::fs::write(&p.audit, full).unwrap();
-        std::fs::remove_file(&heads).unwrap();
-        let mut found = boot_check(&p.targets(), &heads, &pk);
-        assert!(found.findings.is_empty());
-        let started = AuditLog::open(&p.audit, key(&dir), [1; 16])
-            .unwrap()
-            .anchoring_started();
-        assert!(started);
-        let f = found.heads_missing(&heads, started).expect("reported");
-        assert_eq!(f.kind, "chain_heads_missing");
-    }
-
-    #[test]
-    fn a_fresh_or_legacy_install_has_nothing_to_report() {
-        let dir = TempDir::new().unwrap();
-        let pk = key(&dir).verifying_key();
-        let p = paths(&dir);
-        let heads = dir.path().join(HEADS_FILE_NAME);
-        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
-        // legacy rows only, no anchor yet: the upgrade itself
-        std::fs::write(&p.audit, "").unwrap();
-        assert!(boot_check(&p.targets(), &heads, &pk).findings.is_empty());
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1850,15 +1497,15 @@ mod tests {
     }
 
     fn rotating_target(path: &Path) -> ChainTarget {
-        ChainTarget::rotating::<P>("test_log", path)
+        ChainTarget::rotating::<P, PortableHost>("test_log", path)
     }
 
     fn rotating_log(
         path: &Path,
-        key: AgentSigningKey,
+        key: TestKey,
         cap: u64,
-    ) -> crate::chainlog::RotatingChainLog<P> {
-        crate::chainlog::RotatingChainLog::<P>::open(
+    ) -> crate::chainlog::RotatingChainLog<P, TestKey> {
+        crate::chainlog::RotatingChainLog::<P, _>::open(
             path,
             key,
             crate::chainlog::RotationConfig {
@@ -1876,49 +1523,6 @@ mod tests {
             ts: format!("2026-10-15T00:00:{n:02}.000000Z"),
             n,
         }
-    }
-
-    /// External audit NN-AUD-174: before lab PR 160 a canary access log cut
-    /// at its end reopened without a word.
-    #[test]
-    fn a_cut_canary_chain_is_found_at_the_next_boot() {
-        let dir = TempDir::new().unwrap();
-        let k = key(&dir);
-        let pk = k.verifying_key();
-        let paths = paths(&dir);
-        let heads = dir.path().join(HEADS_FILE_NAME);
-        let mut db = crate::canary::access_log::CanaryAccessDb::open(
-            &paths.canary_access,
-            key(&dir),
-            [1; 16],
-        )
-        .unwrap();
-        for n in 0..5 {
-            db.append(crate::canary::access_log::CanaryAccessDraft {
-                canary_id: format!("c{n}"),
-                canary_name: "decoy".into(),
-                canary_type: nn_model::CanaryTypeTag::File,
-                access_kind: nn_model::CanaryAccessKind::FileOpen,
-                accessor_pid: 1,
-                accessor_uid: 0,
-                accessor_comm: "cat".into(),
-                accessor_exe: None,
-                first_trip: n == 0,
-            })
-            .unwrap();
-        }
-        drop(db);
-        Anchor::new(heads.clone(), k, [1; 16], paths.targets(), None, false)
-            .refresh(true, false)
-            .unwrap();
-        let body = std::fs::read_to_string(&paths.canary_access).unwrap();
-        let keep: String = body.lines().take(3).map(|l| format!("{l}\n")).collect();
-        std::fs::write(&paths.canary_access, keep).unwrap();
-        let found = boot_check(&paths.targets(), &heads, &pk);
-        assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
-        assert_eq!(found.findings[0].chain, "canary_access");
-        assert_eq!(found.findings[0].kind, "chain_truncated");
-        assert!(found.audit_history_lost().is_none(), "not the audit chain");
     }
 
     /// External audit NN-AUD-109: an active file emptied while the agent is
@@ -1939,7 +1543,7 @@ mod tests {
         drop(log);
         drop(rotating_log(&active, key(&dir), 1 << 30));
         std::fs::write(&active, b"").unwrap();
-        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].kind, "chain_truncated");
         // (b) no checkpoint yet: the snapshot taken at stop
@@ -1949,7 +1553,10 @@ mod tests {
             log.append(p(n)).unwrap();
         }
         drop(log);
-        assert!(crate::chainlog::manifest_tail_events(&active, "test_log", &pk).is_empty());
+        assert!(
+            crate::chainlog::manifest_tail_events::<PortableHost>(&active, "test_log", &pk)
+                .is_empty()
+        );
         Anchor::new(
             heads.clone(),
             k,
@@ -1960,11 +1567,13 @@ mod tests {
         )
         .refresh(true, false)
         .unwrap();
-        assert!(boot_check(&[rotating_target(&active)], &heads, &pk)
-            .findings
-            .is_empty());
+        assert!(
+            boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk)
+                .findings
+                .is_empty()
+        );
         std::fs::write(&active, b"").unwrap();
-        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].kind, "chain_truncated");
         assert_eq!(found.findings[0].chain, "test_log");
@@ -1986,7 +1595,7 @@ mod tests {
         drop(log);
         assert!(crate::chainlog::current_generation(&active) > 1);
         std::fs::remove_file(&active).unwrap();
-        let found = boot_check(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
         assert!(
             found
                 .findings
@@ -1997,103 +1606,5 @@ mod tests {
         );
         // full verification agrees
         assert!((rotating_target(&active).full)(&active, &pk).is_err());
-    }
-
-    // ── External audit, Wave 3, lab PR 204 ─────────────────────────────
-
-    /// Rewrite line `n` (0-based) of `path` with `"injected":"x"` added.
-    fn inject_at(path: &Path, n: usize) {
-        let body = std::fs::read_to_string(path).unwrap();
-        let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
-        lines[n] = format!(
-            "{},\"injected\":\"x\"}}",
-            lines[n].strip_suffix('}').unwrap()
-        );
-        std::fs::write(path, lines.join("\n") + "\n").unwrap();
-    }
-
-    /// EVD-007 (NN-AUD-273): `nn-admin chain verify` refuses a numbered row
-    /// not in its canonical bytes in every flat chain (audit, canary
-    /// registry, canary access) and a v3 line of a rotating log; the head of
-    /// a chain is never such a row. Rows in the old format are named in the
-    /// summary. On the starting code all of them verified.
-    #[test]
-    fn the_full_checks_refuse_a_row_not_in_canonical_form() {
-        let dir = TempDir::new().unwrap();
-        let k = key(&dir);
-        let pk = k.verifying_key();
-        let cp = paths(&dir);
-        let mut log = AuditLog::open(&cp.audit, k, [1; 16]).unwrap();
-        for n in 0..3 {
-            log.append(draft(n)).unwrap();
-        }
-        drop(log);
-        let mut reg =
-            crate::canary::registry::Registry::open(&cp.canary_registry, key(&dir), [1; 16])
-                .unwrap();
-        for n in 0..2 {
-            reg.deploy(crate::canary::registry::CanaryTokenDraft {
-                name: format!("c{n}"),
-                canary_type: nn_proto::admin_signed_payload::CanaryTypeWire::File,
-                deployment: nn_proto::admin_signed_payload::CanaryDeploymentWire::File {
-                    path: format!("/tmp/c{n}"),
-                    template: None,
-                },
-                deployed_by_fp: "00000000".to_string(),
-                content: None,
-            })
-            .unwrap();
-        }
-        drop(reg);
-        let mut acc =
-            crate::canary::access_log::CanaryAccessDb::open(&cp.canary_access, key(&dir), [1; 16])
-                .unwrap();
-        for n in 0..2 {
-            acc.append(crate::canary::access_log::CanaryAccessDraft {
-                canary_id: format!("id{n}"),
-                canary_name: format!("c{n}"),
-                canary_type: nn_model::CanaryTypeTag::File,
-                access_kind: nn_model::CanaryAccessKind::FileOpen,
-                accessor_pid: 1,
-                accessor_uid: 0,
-                accessor_comm: "cat".to_string(),
-                accessor_exe: None,
-                first_trip: n == 0,
-            })
-            .unwrap();
-        }
-        drop(acc);
-        let mut rot = rotating_log(&cp.detections, key(&dir), 1 << 20);
-        for n in 0..3 {
-            rot.append(p(n)).unwrap();
-        }
-        drop(rot);
-        let mut targets = cp.targets();
-        targets[3] = rotating_target(&cp.detections);
-        let full = |t: &ChainTarget| (t.full)(&t.path, &pk);
-        for t in &targets[..4] {
-            let ok = full(t).unwrap();
-            assert!(!ok.contains("old format"), "{}: {ok}", t.chain);
-        }
-        for (i, line) in [(0usize, 1usize), (1, 1), (2, 1), (3, 1)] {
-            let t = &targets[i];
-            let before = std::fs::read(&t.path).unwrap();
-            let head = read_file_head(&t.path, &|l: &[u8]| (t.genuine)(l, &pk))
-                .unwrap()
-                .unwrap();
-            inject_at(&t.path, line);
-            let err = full(t).unwrap_err();
-            assert!(err.contains("canonical"), "{}: {err}", t.chain);
-            if line + 1 == String::from_utf8_lossy(&before).lines().count() {
-                assert_ne!(
-                    read_file_head(&t.path, &|l: &[u8]| (t.genuine)(l, &pk)).unwrap(),
-                    Some(head),
-                    "{}: not a head",
-                    t.chain
-                );
-            }
-            std::fs::write(&t.path, before).unwrap();
-            full(t).unwrap();
-        }
     }
 }

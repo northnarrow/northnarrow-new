@@ -143,7 +143,7 @@ pub fn draft(outcome: &StaleChain) -> AuditEntryDraft {
         ),
     };
     AuditEntryDraft {
-        op: crate::self_integrity::AUDIT_OP.to_string(),
+        op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
         extra,
         key_fp: "agent-self".to_string(),
         cosigner_fps: Vec::new(),

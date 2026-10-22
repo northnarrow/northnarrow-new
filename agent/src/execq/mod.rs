@@ -413,7 +413,7 @@ impl Drop for SpawnGuard {
 
 /// What the controller needs from the rest of the agent.
 pub struct StartDeps {
-    pub hashes: common::execq::HashList,
+    pub hashes: nn_proto::execq::HashList,
     /// Where it came from (`execq-hashes.local`, signed), for the log.
     pub hashes_source: String,
     pub recorder: Box<dyn controller::Recorder>,
@@ -444,15 +444,15 @@ pub fn start(deps: StartDeps) -> Result<Handle, String> {
         set_state(why.clone());
         why
     })?;
-    let scan_cfg = common::execq::ScanConfig {
+    let scan_cfg = nn_proto::execq::ScanConfig {
         block: deps.hashes.block.clone(),
         allow: deps.hashes.allow.clone(),
-        suspicious_threshold: common::execq::DEFAULT_SUSPICIOUS_THRESHOLD,
-        max_read_bytes: common::execq::DEFAULT_MAX_READ_BYTES,
-        max_hash_bytes: common::execq::DEFAULT_MAX_HASH_BYTES,
+        suspicious_threshold: nn_proto::execq::DEFAULT_SUSPICIOUS_THRESHOLD,
+        max_read_bytes: nn_proto::execq::DEFAULT_MAX_READ_BYTES,
+        max_hash_bytes: nn_proto::execq::DEFAULT_MAX_HASH_BYTES,
         yara_rules: None,
     };
-    let encoded = common::execq::encode_config(&scan_cfg)?;
+    let encoded = nn_proto::execq::encode_config(&scan_cfg)?;
     let sup = northnarrow_scan::supervisor::Supervisor::new(cfg.scanner.clone(), user, encoded);
     info!(
         scanner = %cfg.scanner.display(),

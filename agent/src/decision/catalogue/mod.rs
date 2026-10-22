@@ -14,7 +14,7 @@
 
 use nn_model::{ResponseAction, Severity};
 
-use crate::detection_store::Sensor;
+use crate::detection_payload::Sensor;
 
 mod fim;
 mod net;

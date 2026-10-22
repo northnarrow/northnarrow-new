@@ -7,7 +7,7 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::process::ExitCode;
 
-use common::execq::{
+use nn_proto::execq::{
     decode, decode_config, encode, FromScanner, ToScanner, MAX_CONFIG_BYTES, MAX_PACKET,
     PROTOCOL_VERSION,
 };

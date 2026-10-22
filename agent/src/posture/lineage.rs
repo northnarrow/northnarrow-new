@@ -1065,7 +1065,7 @@ impl AuthSessionTracker {
         let Some(root_dev) = self.storage_rooted_namespace(pid, uid, &users) else {
             return false;
         };
-        crate::sensors::open_sensor::unplaced_root_dev(path).is_none_or(|dev| dev == root_dev)
+        crate::path_text::unplaced_root_dev(path).is_none_or(|dev| dev == root_dev)
     }
 
     /// Lab PR 175: `uid`, and the owner of the `/etc/subuid` range it lies
@@ -1112,9 +1112,9 @@ impl AuthSessionTracker {
     /// ([`Self::is_user_container_storage_write`]).
     fn in_container_storage(&self, path: &str, uid: u32, users: &[u32]) -> bool {
         if !path.starts_with('/')
-            || path.split('/').any(|c| {
-                c == "." || c == ".." || c == crate::sensors::open_sensor::UNREAD_COMPONENT
-            })
+            || path
+                .split('/')
+                .any(|c| c == "." || c == ".." || c == crate::path_text::UNREAD_COMPONENT)
         {
             return false;
         }
@@ -2104,7 +2104,7 @@ fn root_overlay(mountinfo: &str) -> Option<((u32, u32), String, String)> {
         options
             .split(',')
             .find_map(|o| o.strip_prefix(name)?.strip_prefix('='))
-            .map(crate::sensors::open_sensor::unescape_octal)
+            .map(crate::path_text::unescape_octal)
     };
     Some((dev, option("upperdir")?, option("workdir")?))
 }

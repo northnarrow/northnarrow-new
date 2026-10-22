@@ -64,7 +64,7 @@
 
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand::rngs::SysRng;
@@ -77,11 +77,9 @@ use tracing::{error, info};
 /// commits).
 pub const DEFAULT_AGENT_ID_PATH: &str = "/etc/northnarrow/agent_id";
 
-/// Width of the raw agent_id in bytes. Bound by the design (§6.5
-/// "16-byte UUID") and by the
-/// [`nn_proto::admin_signed_payload::SignedPayload::agent_id`]
-/// array type. Changing this is a wire-protocol break.
-pub const AGENT_ID_LEN: usize = 16;
+/// Width of the raw agent_id in bytes (with the identity types, the audit
+/// chain's since R04a, lab PR 241).
+pub use crate::audit::AGENT_ID_LEN;
 
 /// Width of the on-disk hex encoding of one [`AGENT_ID_LEN`]-byte
 /// value (the parser, `nn_proto::shutdown_marker::parse_agent_id`,
@@ -100,38 +98,11 @@ const FILE_MODE: u32 = 0o644;
 /// world reads.
 const PARENT_DIR_MODE: u32 = 0o755;
 
-/// Where this boot's identity came from (external audit MAIN-009,
-/// EVD-020).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IdentitySource {
-    /// Read from the file.
-    Loaded,
-    /// The file was absent: a fresh id was minted and persisted.
-    Minted,
-    /// The file could not be read, parsed or written (the reason): the id
-    /// is a per-boot random one, never persisted.
-    Unavailable(String),
-}
-
-impl IdentitySource {
-    /// The word the signed rows and the journal use.
-    pub fn label(&self) -> &'static str {
-        match self {
-            IdentitySource::Loaded => "loaded",
-            IdentitySource::Minted => "minted",
-            IdentitySource::Unavailable(_) => "unavailable",
-        }
-    }
-}
-
-/// The identity a boot signs as, read once ([`resolve`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentIdentity {
-    pub id: [u8; AGENT_ID_LEN],
-    pub source: IdentitySource,
-    /// The file it was read from, minted into, or could not be used.
-    pub path: PathBuf,
-}
+/// Where this boot's identity came from, and the identity a boot signs as
+/// ([`resolve`]). Since R04a (lab PR 241) they are defined with the audit
+/// chain that attests them ([`crate::audit::AuditLog::attest_identity`]), so
+/// its writer names no module of the host.
+pub use crate::audit::{AgentIdentity, IdentitySource};
 
 /// The agent's one read of its identity at boot (external audit
 /// MAIN-009). Never fails and never yields the all-zero id: a file that
@@ -327,6 +298,7 @@ fn persist_atomically(path: &Path, id: &[u8; AGENT_ID_LEN]) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn fresh_path() -> (TempDir, PathBuf) {

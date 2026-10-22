@@ -50,7 +50,9 @@ use tracing::{error, info, warn};
 use crate::audit::{AuditEntryDraft, AuditLog};
 
 pub const BASE_SECS: u64 = 30;
-pub const AUDIT_OP: &str = "integrity_drift";
+/// The op of the signed integrity findings (the audit chain's since R04a,
+/// lab PR 241).
+pub const AUDIT_OP: &str = crate::audit::INTEGRITY_DRIFT_OP;
 
 /// Units whose drop-ins, copies and masks are checked. Lab PR 216: the
 /// watchdog's `OnFailure=` handler too — masked or overridden, systemd's

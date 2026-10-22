@@ -245,7 +245,7 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         }
         // Lab PR 223: every line a `block`/`allow` entry, no digest twice.
         OverlayKind::ExecqHashes => {
-            common::execq::parse_hash_list(text).map_err(|e| anyhow!("{label}: {e}"))?;
+            nn_proto::execq::parse_hash_list(text).map_err(|e| anyhow!("{label}: {e}"))?;
         }
         // Lab PR 226: every line an exec, audit, preload, map, exempt or
         // profile line (over either profile: the base does not change
@@ -743,7 +743,7 @@ fn decision_entry(
 
 /// A signed `integrity_drift` entry.
 pub(crate) fn drift_entry(extra: serde_json::Value) -> AuditEntryDraft {
-    entry(crate::self_integrity::AUDIT_OP, "detected", extra)
+    entry(crate::audit::INTEGRITY_DRIFT_OP, "detected", extra)
 }
 
 pub(crate) fn entry(op: &str, result: &str, extra: serde_json::Value) -> AuditEntryDraft {
@@ -948,7 +948,7 @@ mod tests {
         );
         let pending = gate.pending.lock();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].op, crate::self_integrity::AUDIT_OP);
+        assert_eq!(pending[0].op, crate::audit::INTEGRITY_DRIFT_OP);
         assert_eq!(pending[0].extra["kind"], "default_list_unavailable");
     }
 
@@ -962,7 +962,7 @@ mod tests {
         gate.report_default_modified("process-comm-allowlist", &v1, "aa", "bb", false);
         let pending = gate.pending.lock();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].op, crate::self_integrity::AUDIT_OP);
+        assert_eq!(pending[0].op, crate::audit::INTEGRITY_DRIFT_OP);
         assert_eq!(pending[0].result, "detected");
         let extra = &pending[0].extra;
         assert_eq!(extra["kind"], "default_list_modified");
@@ -1164,7 +1164,13 @@ mod tests {
         let signing = crate::audit::AgentSigningKey::load_or_bootstrap(&agent_key).unwrap();
         let mut log = AuditLog::open(&audit, signing, AGENT).unwrap();
         gate.attest_floor(&mut log);
-        log.boot_probe(None, "verified", "installed").unwrap();
+        log.boot_probe(
+            None,
+            "verified",
+            "installed",
+            &crate::build_info::agent_build(),
+        )
+        .unwrap();
         gate.attach_audit_log(Some(Arc::new(Mutex::new(log))));
         let ops: Vec<(String, String)> = std::fs::read_to_string(&audit)
             .unwrap()
@@ -1179,7 +1185,7 @@ mod tests {
             ops,
             [
                 (
-                    crate::self_integrity::AUDIT_OP.to_string(),
+                    crate::audit::INTEGRITY_DRIFT_OP.to_string(),
                     super::super::overlay_floor::DRIFT_KIND.to_string()
                 ),
                 (

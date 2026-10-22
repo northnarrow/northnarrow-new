@@ -632,6 +632,27 @@ pub fn unlink_socket(path: &Path) {
     }
 }
 
+/// A row the agent writes from one admin frame fits the line caps of the
+/// chain readers: the operator's strings come from one signed frame of at
+/// most `MAX_FRAME_BODY`, a JSON escape is at most six bytes for one, and
+/// the rest of a row is bounded (hashes, signature, ids, a `PATH_MAX`
+/// executable). The caps are the readers' (`verify_lines`, the canary
+/// chains' `chain_lines`), the frame bound the admin protocol's; the agent,
+/// which writes the rows and sees both, holds the two to each other.
+/// R04a (lab PR 241): these assertions were in `verify_lines` and
+/// `canary::chain_lines`, the only names of the admin protocol in the
+/// evidence code (nn-evidence and nn-proto are siblings, plan §2.1).
+const _: () = assert!(
+    crate::verify_lines::MAX_VERIFY_LINE_BYTES
+        >= 6 * (nn_proto::admin_protocol::MAX_FRAME_BODY + 4096) + 64 * 1024,
+    "a row the agent can write must fit the verifiers' line cap"
+);
+const _: () = assert!(
+    crate::canary::chain_lines::MAX_CHAIN_LINE_BYTES
+        >= 6 * (nn_proto::admin_protocol::MAX_FRAME_BODY + 4096) + 64 * 1024,
+    "a row the agent can write must fit the chain line cap"
+);
+
 /// External audit NN-AUD-077: connections served at once. nn-admin and
 /// the watchdog open one at a time; 32 leaves room for a dashboard and
 /// operators while bounding the fds and buffers the admin plane can take
@@ -3434,7 +3455,7 @@ fn read_tail_jsonl(
     max_rows: usize,
 ) -> (String, u32, bool) {
     let since = since.map(format_iso8601_unix);
-    let tail = crate::chain_tail::read_chain_tail(
+    let tail = crate::chain_tail::read_chain_tail::<crate::chain_host_linux::LinuxHost>(
         path,
         &crate::chain_tail::TailQuery {
             since: since.as_deref(),
@@ -4904,7 +4925,7 @@ fn dispatch_detections(
         pubkey.as_ref(),
     );
     if unverified > 0 {
-        crate::chain_anchor::report_unverified_rows("detections", &detections_path, unverified);
+        crate::chains::report_unverified_rows("detections", &detections_path, unverified);
     }
 
     // Serialise newest-first, bounding the body at the wire soft cap.

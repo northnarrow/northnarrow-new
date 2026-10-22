@@ -442,7 +442,7 @@ mod tests {
         for check in [
             "caps::boot_gate(",
             "install_manifest::check(",
-            "audit::preflight_writable(",
+            "audit_preflight::preflight_writable(",
             "boot::lsm::gate(",
             "boot.done(BootStep::Capabilities)",
             "boot.done(BootStep::InstallManifest)",

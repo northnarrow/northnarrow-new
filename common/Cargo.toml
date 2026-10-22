@@ -14,27 +14,25 @@ path = "src/lib.rs"
 
 [features]
 default = ["std"]
-# `std` enables the userland helpers of the raw layouts, bytemuck Pod
-# derives and the exec quarantine's scanner protocol. Disable it from the
-# eBPF crate, which only needs the raw wire types.
+# `std` enables the userland helpers of the raw layouts and bytemuck Pod
+# derives. Disable it from the eBPF crate, which only needs the raw wire
+# types.
 std = [
     "dep:serde",
     "dep:bytemuck",
-    "dep:postcard",
-    "dep:hex",
 ]
 # Wave 4 restructure, R03 (lab PR 240): the admin protocol, the signed
 # payloads, the quorum and the shutdown marker went to nn-proto with their
 # dependencies (serde-big-array, ciborium, sha2, ed25519-dalek) and the
 # `debug-trigger` feature. R02 (lab PR 240): the event model and the std
 # types of `wire` went to nn-model, and serde_json, which only their tests
-# used, with them.
+# used, with them. Lab PR 241: the exec quarantine's scanner protocol
+# (`execq`) went to nn-proto, and postcard and hex, which only it used,
+# with it.
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 bytemuck = { version = "1", default-features = false, features = ["derive", "min_const_generics"], optional = true }
-postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
-hex = { version = "0.4", optional = true }
 
 # Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
 # builds with -D warnings do not flag it as an unexpected cfg.

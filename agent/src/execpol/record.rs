@@ -18,7 +18,8 @@ use super::{
     RULE_PRELOAD, RULE_PRELOAD_NAME,
 };
 use crate::decision::attack::{mitre_of, AttackRef, Tactic};
-use crate::detection_store::{DetectionSink, ExecPolEvidence};
+use crate::detection_payload::ExecPolEvidence;
+use crate::detection_store::DetectionSink;
 
 /// Lab PR 221's typed ATT&CK mapping (Enterprise 20.0) of the exec policy's
 /// rules: every reference a record of each can carry; a record carries the
@@ -474,7 +475,7 @@ impl Repeats {
         let key = format!(
             "{}|{}|{}|{}|{}",
             rec.verdict.rule_id,
-            crate::detection_store::Principal::from_event(&rec.event).uid,
+            crate::detection_payload::Principal::from_event(&rec.event).uid,
             rec.verdict.event_filename,
             rec.evidence.values.join(","),
             rec.evidence.decision
@@ -505,9 +506,9 @@ impl Recorder for SinkRecorder {
         let Some(sink) = &self.sink else {
             return;
         };
-        let uid = crate::detection_store::Principal::from_event(&rec.event).uid;
+        let uid = crate::detection_payload::Principal::from_event(&rec.event).uid;
         let admit = crate::detection_budget::admit(&rec.verdict.rule_id, uid, || {
-            crate::detection_store::held_sample(&rec.event)
+            crate::detection_payload::held_sample(&rec.event)
         });
         if let crate::detection_budget::Admit::Record { suppressed_before } = admit {
             warn!(

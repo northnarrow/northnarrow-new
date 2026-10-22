@@ -6,7 +6,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-use common::execq::MAX_PACKET;
+use nn_proto::execq::MAX_PACKET;
 
 fn cvt(rc: libc::c_int) -> io::Result<libc::c_int> {
     if rc < 0 {

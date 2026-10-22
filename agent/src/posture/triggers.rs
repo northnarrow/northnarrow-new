@@ -989,7 +989,7 @@ fn looks_dga(name: &str) -> bool {
 /// below cannot judge it. A path that can be compared is judged by the
 /// lists alone, as before.
 fn kernel_class_says(filename: &str, kernel_class: u32, bit: u32) -> bool {
-    kernel_class & bit != 0 && !crate::sensors::open_sensor::path_is_exact(filename)
+    kernel_class & bit != 0 && !crate::path_text::path_is_exact(filename)
 }
 
 fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
