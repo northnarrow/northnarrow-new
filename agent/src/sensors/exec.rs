@@ -3,7 +3,7 @@
 //! Loads the compiled eBPF program (`agent-ebpf/`), attaches it to the
 //! `sched/sched_process_exec` tracepoint, opens the
 //! `EVENTS` ringbuffer, and forwards every event as a typed
-//! [`common::Event::ProcessSpawn`] over a tokio mpsc channel.
+//! [`nn_model::Event::ProcessSpawn`] over a tokio mpsc channel.
 //!
 //! The eBPF object is embedded via the build script: see
 //! `agent/build.rs`.
@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use aya::{maps::ring_buf::RingBuf, programs::TracePoint, Ebpf, EbpfLoader};
-use common::{wire::ProcessSpawnRaw, Event};
+use common::wire::ProcessSpawnRaw;
+use nn_model::Event;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, warn};
 

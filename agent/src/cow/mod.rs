@@ -47,8 +47,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 
-use common::wire::admin_protocol::CowGuardStatus;
-use common::Event;
+use nn_model::Event;
+use nn_proto::admin_protocol::CowGuardStatus;
 
 use crate::audit::AuditLog;
 use crate::config::overlay_auth::Verified;

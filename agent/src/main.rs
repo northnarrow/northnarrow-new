@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use common::posture_types::PostureKind;
-use common::Event;
+use nn_model::posture_types::PostureKind;
+use nn_model::Event;
 use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
@@ -1254,14 +1254,14 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // A lost log line must never cost the agent.
     // External audit Wave 3 (journal line injection, lab PR 167): one event
     // is one journal line whatever it holds, with no colour codes under
-    // journald (common::log_escape).
+    // journald (nn_model::log_escape).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
-        .with_ansi(common::log_escape::stdout_ansi())
-        .with_writer(common::log_escape::stdout_one_line)
+        .with_ansi(nn_model::log_escape::stdout_ansi())
+        .with_writer(nn_model::log_escape::stdout_one_line)
         .log_internal_errors(false)
         .init();
 
@@ -1727,7 +1727,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         agent_id,
         rollback_floor,
     ));
-    use common::wire::admin_signed_payload::OverlayKind;
+    use nn_proto::admin_signed_payload::OverlayKind;
 
     // Lab PR 218: resolved before the attach — the capability gate below
     // depends on it.
@@ -4344,7 +4344,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                                 if check.state != DecoyState::Intact {
                                     error!(
                                         canary_id = %canary.canary_id,
-                                        name = %common::log_escape::Escaped(&canary.name),
+                                        name = %nn_model::log_escape::Escaped(&canary.name),
                                         path,
                                         state = check.state.as_str(),
                                         "canary: the decoy is not what was deployed — changed, \
@@ -5170,7 +5170,7 @@ fn debug_protected_query(
         };
         warn!(
             pid,
-            exe = %common::log_escape::Escaped(&exe),
+            exe = %nn_model::log_escape::Escaped(&exe),
             spared = guard.protected_reason(pid).map_or("no", |r| r.as_str()),
             "debug-trigger: COMBAT guard query (lab test of CMB-022)"
         );
@@ -5280,7 +5280,7 @@ async fn process_event(
     // posture signal.
     if let Event::FsProtectDenial {
         pid: 1,
-        operation: common::FsProtectOperation::Signal,
+        operation: nn_model::FsProtectOperation::Signal,
         target_dev: sig,
         target_ino: target,
         ..
@@ -5405,7 +5405,7 @@ async fn process_event(
     // External audit Wave 3 (journal line injection, lab PR 167): a value
     // another user names (comm, file name, DNS name, the rule text quoting
     // them) is logged through Escaped, quoted when it holds a separator.
-    use common::log_escape::Escaped;
+    use nn_model::log_escape::Escaped;
     match &event {
         Event::ProcessSpawn { .. } => debug!(event = ?event, "process spawn detected"),
         Event::ModuleLoad {
@@ -5433,7 +5433,7 @@ async fn process_event(
             pid = *pid,
             comm = %Escaped(comm),
             created = *created,
-            classes = ?common::io_uring_class_names(*classes),
+            classes = ?nn_model::io_uring_class_names(*classes),
             count = *count,
             sq_thread = *sq_thread,
             "io_uring activity"
@@ -5713,7 +5713,7 @@ async fn process_event(
             // silently to `engine.evaluate` below; if a cred-read rule
             // fires, THE RULE emits the alert with proper framing.
             // Only integrity-changing ops get the FIM DRIFT line.
-            if fe.op == common::wire::FimOp::Opened {
+            if fe.op == nn_model::telemetry::FimOp::Opened {
                 debug!(
                     path = %Escaped(&fe.path),
                     modifier_pid = fe.modifier_pid,
@@ -5843,7 +5843,7 @@ async fn process_event(
             // A Log decision runs nothing: no blocking task for it.
             reports.push((
                 None,
-                executor.execute(common::ResponseAction::Log, verdict.event_pid),
+                executor.execute(nn_model::ResponseAction::Log, verdict.event_pid),
             ));
         }
         for response in &decision.responses {
@@ -5953,7 +5953,7 @@ fn budget_admit(rule: &str, uid: u32, event: &Event) -> Admit {
 fn render_addr(family: u8, bytes: &[u8; 16]) -> String {
     // External audit NET-001: one form in the logs, IPv4-mapped folded.
     if family == 2 || family == 10 {
-        common::netaddr::canonical_ip(family, bytes).to_string()
+        nn_model::netaddr::canonical_ip(family, bytes).to_string()
     } else {
         format!("family={family}")
     }

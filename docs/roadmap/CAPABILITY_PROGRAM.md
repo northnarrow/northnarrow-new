@@ -1016,3 +1016,52 @@ only in the table below, in the same PR as the evidence.
     R02 either follows R03 or leaves nn-model out of `portable-core` until
     then.
   - Lab: no guest (the shipped code does not change: see the identity below). Host: `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` 2979 passed, 0 failed (2972 at R00); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` with the golden files unchanged; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets, seeds and regressions, the three lockfiles unchanged); `portable-core`'s `cargo check` for the five targets, installed with rustup. Identity against `main` 0abf596, same path, same commands: the eBPF object (sha256 9345ac10…) and its stamp are byte-identical to `main`'s; built as the release job builds (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`), the watchdog (b538235d…) and the scanner (33be3ab2…) are byte-identical, the agent (23f51b19… → 130f3707…) and nn-admin (1390b7b8… → 3db04031…) have the same size and the same `.text`, and differ in 127 and 22 bytes, all in `.rodata`, `.data.rel.ro` (line numbers moved by 1, 2, 3, 4, 12 and 15: the lines the reformatted embeds of seven files added) and the build id; R01's four binaries and object are byte-identical to R00's. `mk-tarball.sh`: the same 72 entries; `mk-packages.sh` (.deb): the same 79 paths, modes and sizes but `CHANGELOG.md`.
+- **Lab PR 240 — nn-proto and nn-model: the admin protocol and the event
+  model leave `common` (Wave 4 Phase 2, R03 + R02 of the restructure
+  plan; no level changes).**
+  - What was wrong: `common`, the crate the eBPF object compiles, also
+    held the userland's event model, the admin protocol, the signed
+    payloads, the quorum, the shutdown marker, the watchdog hold and two
+    Unix-only helpers (`atomic_file`, `sd_notify`): an edit to any of them
+    made the eBPF object's stamp stale, the watchdog and nn-admin took the
+    whole event model to read a frame, and no crate above `common` could
+    build for another OS — R02's nn-model would have inherited
+    `atomic_file` (lab PR 239's finding), hence R03 first.
+  - What changed: R03 — `common`'s `wire::admin_protocol`,
+    `wire::admin_signed_payload`, `admin_quorum` (and its Kani proof),
+    `shutdown_marker` and `watchdog_hold` moved unchanged (`git mv`,
+    100 %; `admin_protocol` 97 % with the new test) to `crates/nn-proto`,
+    with their dependencies and the `debug-trigger` feature (the agent
+    forwards it; CI's wire-discriminant step and `kani.yml` on `-p
+    nn-proto`); `atomic_file` and `sd_notify` to
+    `northnarrow-antitamper-bpf`. A test pins five admin frames and a v1
+    envelope byte for byte (computed on `main` before the move, the same
+    after). R02 — `common`'s `model.rs` to `crates/nn-model/src/event.rs`
+    (its items at nn-model's root), `posture_types`, `netaddr`,
+    `log_escape` to nn-model, the std types of `wire/mod.rs` and their
+    tests to `nn_model::telemetry` (the `std` gates dropped), `dns_qname`
+    and its Kani proofs to `crates/nn-parse`; nn-proto then depends on
+    nn-model only, the watchdog and the fuzz crate no longer on `common`.
+    The moved files compile through `pub(crate)` shims at the new crates'
+    roots (`crate::wire`, `crate::epg`, `crate::dns_qname`,
+    `crate::posture_types`; removed in R17). The ratchet scan names the
+    crates of `crates/` (a moved module's reference still counts): 77,
+    unchanged. nn-model and nn-proto now hold code; `portable-core`
+    checks them on the five targets. Deviations from the plan: no shim at
+    the old paths — `common` cannot re-export crates that depend on it
+    (cargo refuses the cycle), so the importers' paths were rewritten (the
+    plan's "riscrittura meccanica" of R02, done for R03 too), in the
+    step's one commit: no separate move and rewrite commits, no
+    `.git-blame-ignore-revs`, and `wire/mod.rs`'s std half cut rather than
+    split with appendix A's merge recipe (`git blame -C -C` finds the
+    lines); `execq` (post-plan, mapped to nn-proto), the name tables of the
+    raw layouts and `wire::cstr_lossy` stay in `common`, which is the ABI
+    plus the scanner protocol, not the ABI alone; the ratchet does not go
+    down — no counted reference was from a moved module, and the two
+    nn-evidence → `admin_protocol` ones (`verify_lines`,
+    `canary::chain_lines`) remain; the binaries are not byte-identical
+    (below); no guest run (the KVM jobs of the PR run the privileged
+    suites). Open: `execq` to nn-proto with the scanner; the nn-evidence →
+    nn-proto arc (R05); nn-admin's `--events` help still names
+    `common::Event` (kept: no output changes in a move).
+  - Lab: no guest (moves only; the identity below). Host, on each commit (R03 09c65fd and the tip): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked` 68 suites, 2,988 passed, 0 failed (`main` 2e1438f: 2,987; the test list is `main`'s plus `encoded_frames_are_pinned`, every moved test found by name); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo test -p nn-proto --features debug-trigger --lib admin_protocol` (60 passed); `cargo xtask attack-coverage --check`; `cargo xtask golden` with the golden files unchanged; `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core` locally, the five targets, nn-parse, nn-model, nn-proto, nn-evidence, nn-core; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets built against nn-proto, nn-model and nn-parse, seeds and regressions; the three lockfiles unchanged by the build): all pass. Identity against `main` 2e1438f, same path, same commands: the eBPF object is byte-identical (sha256 d5474fc4…) at R03 and at the tip, its stamp's source hash f4fb7f9d… → d93b49ed… (R03) → c3651dc3… (`common/src` and its manifest are the object's source closure), embedded in the agent as before. Built as the release job builds (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`), the binaries are not byte-identical: scanner 401,368 → 401,400 bytes, watchdog 2,337,264 → 2,336,904, nn-admin 3,901,064 → 3,912,344, agent 14,631,184 → 14,642,952. A move between crates cannot keep them so: a crate's identity seeds symbol names and `TypeId`s, and the fat-LTO module is composed anew. Control: `main` built in another directory is byte-identical to `main` here (no path in the binaries); `main` rebuilt with one unused optional dependency in `common` (anyhow, enabled by `std`; no source changed) moves the scanner by 16 bytes and changes 2 functions of the watchdog (a `TypeId`), 16 of nn-admin and 17 of the agent. Unstripped builds (same flags, strip off), function by function, names mapped to the new crates and addresses dropped: scanner 503 of 504 functions the same code (one postcard decoder of `execq`, a crate this lot does not touch, allocates its registers otherwise), watchdog 2,429 of 2,468 (+1 kept out of line), nn-admin 3,210 of 3,330, agent 7,217 of 7,408; the others differ in inlining (postcard and serde helpers), interprocedural constant propagation (`RawVec` growth), which of identical bodies keeps its name, register allocation and `TypeId` constants. The text of `.rodata` differs only in the moved files' paths (panic locations: `common/src/{admin_quorum,shutdown_marker,model,dns_qname}.rs` → `crates/…`), log-callsite line numbers and the stamp hash; no module path, type name or help text changed (a first build changed nn-admin's `--events` help, a clap doc comment the path rewrite had touched; restored). Sources, by a token check: of the 157 `.rs` files changed or moved (the new `telemetry.rs` aside), 148 have the same tokens outside `use` once the moved paths are mapped and their `use` declarations import the same items; the 9 others are the crate roots and declarations, the new test, the ratchet's scanner and `journal_fields`' scan patterns (`nn_model::log_escape::Escaped`); `telemetry.rs` and `wire/mod.rs` are the split rerun on R03's `wire/mod.rs`, byte for byte. `mk-tarball.sh`: the same 72 entries; `mk-packages.sh` (.deb): the same 79 paths and modes, the four binaries' sizes and `CHANGELOG.md` aside.

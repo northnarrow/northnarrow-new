@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use common::Severity;
+use nn_model::Severity;
 
 use super::render::{self, parse_pinned, parse_tsv, Pinned, PinnedRow, ShippedRule};
 use super::{docs, RuleDoc};
@@ -358,7 +358,7 @@ fn a_missing_test_or_data_component_is_reported() {
     let d = RuleDoc {
         id: "X",
         severities: &[Severity::Medium, Severity::High],
-        actions: &[common::ResponseAction::Log],
+        actions: &[nn_model::ResponseAction::Log],
         sensors: &[crate::detection_store::Sensor::Exec],
         data_components: &["DC0999"],
         observes: "x",

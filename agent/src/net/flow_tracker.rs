@@ -87,7 +87,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::wire::{FlowPhase, NetFlowEvent, TlsFingerprint};
+use nn_model::telemetry::{FlowPhase, NetFlowEvent, TlsFingerprint};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 

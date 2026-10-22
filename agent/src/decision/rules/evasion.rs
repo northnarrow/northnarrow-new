@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::response_policy::{self, PolicySwitch};
@@ -208,7 +208,7 @@ mod tests {
             parent_start_ns: 0,
             start_ns: 0,
             parent_is_kthread: false,
-            exe: common::ExeIdentity::default(),
+            exe: nn_model::ExeIdentity::default(),
             argv_truncated: false,
             filename_truncated: false,
             // Lab PR 224: the new image's standard streams (not read here).

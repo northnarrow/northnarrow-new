@@ -9,7 +9,7 @@
 //! decision of 21/10/2026 holds ([`super::response_policy`]) held.
 //!
 //! The policy is the signed overlay `rule-policy.local`
-//! ([`OverlayKind::RulePolicy`](common::wire::admin_signed_payload::OverlayKind::RulePolicy)):
+//! ([`OverlayKind::RulePolicy`](nn_proto::admin_signed_payload::OverlayKind::RulePolicy)):
 //! one directive per line, any bad line refuses the whole file
 //! ([`parse`]). The engine reads the active policy through a
 //! [`PolicyHandle`]; `nn-admin policy set` swaps it between two events.
@@ -507,9 +507,9 @@ pub fn global() -> &'static PolicyHandle {
 
 /// Put `p` in force for the agent: the [`global`] handle the production
 /// engine reads, and the posture's ransomware flag
-/// ([`common::posture_types::ransomware_combat_without_corroboration`]).
+/// ([`nn_model::posture_types::ransomware_combat_without_corroboration`]).
 pub fn install_global(p: RulePolicy) -> Arc<RulePolicy> {
-    common::posture_types::set_ransomware_combat_without_corroboration(
+    nn_model::posture_types::set_ransomware_combat_without_corroboration(
         p.ransomware_combat_without_corroboration,
     );
     global().install(p)

@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::ResponseAction;
+use nn_model::ResponseAction;
 use tracing::warn;
 
 use super::{

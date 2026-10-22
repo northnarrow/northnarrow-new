@@ -43,9 +43,9 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use common::admin_quorum::{self, distinct_matches, quorum_decision, QuorumDecision};
-use common::wire::admin_signed_payload::{self, Role, SignedPayload, SignedPayloadError};
 use ed25519_dalek::{Signature, VerifyingKey};
+use nn_proto::admin_quorum::{self, distinct_matches, quorum_decision, QuorumDecision};
+use nn_proto::admin_signed_payload::{self, Role, SignedPayload, SignedPayloadError};
 use parking_lot::RwLock;
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -70,7 +70,7 @@ use admin_quorum::default_roles;
 
 /// Reasons [`ConnAuth::issue_challenge`] / [`ConnAuth::verify_with_role`]
 /// can refuse, carrying the user-facing detail needed to translate
-/// into an [`UnlockResult`](common::wire::admin_protocol::UnlockResult)
+/// into an [`UnlockResult`](nn_proto::admin_protocol::UnlockResult)
 /// or the broader Tappa 8 [`AdminResult`](docs/design/TAPPA8_…)
 /// shape (design §6.6).
 #[derive(Debug, Error)]
@@ -139,8 +139,8 @@ pub enum AdminAuthError {
     /// and the journal line names the extra's operation.
     #[error("unknown operation: payload.op={got:?} expected {expected:?}")]
     UnknownOperation {
-        expected: common::wire::admin_signed_payload::OperationCode,
-        got: common::wire::admin_signed_payload::OperationCode,
+        expected: nn_proto::admin_signed_payload::OperationCode,
+        got: nn_proto::admin_signed_payload::OperationCode,
     },
     /// External audit AUT-005: more signatures than
     /// [`admin_quorum::MAX_SUBMITTED_SIGNATURES`] in one submission,
@@ -151,7 +151,7 @@ pub enum AdminAuthError {
     TooManySignatures { submitted: usize },
     /// Tappa 8 A7: signing-payload CBOR / hashing failed during
     /// verify. Wraps the underlying `SignedPayloadError` from
-    /// `common::wire::admin_signed_payload`. In practice this
+    /// `nn_proto::admin_signed_payload`. In practice this
     /// only fires on malformed input that already passed CBOR
     /// decode at the frame layer.
     #[error("signed payload error: {0}")]
@@ -167,7 +167,7 @@ type KeyEntry = admin_quorum::AdminKey;
 ///
 /// Each entry of `pub_keys` pairs a verifying key with the operations
 /// its operator is authorised to trigger ([`Role`] enum from
-/// [`common::wire::admin_signed_payload`]). External audit NN-AUD-078 /
+/// [`nn_proto::admin_signed_payload`]). External audit NN-AUD-078 /
 /// NN-AUD-079: no challenge and no failure count live here — they belong
 /// to the connection ([`ConnAuth`]), the only way to verify a live request.
 #[derive(Debug)]
@@ -1217,7 +1217,7 @@ pub fn fingerprint_bytes(vk: &VerifyingKey) -> [u8; 4] {
 /// Outcome of an [`atomic_rewrite_admin_pub_add`] /
 /// [`atomic_rewrite_admin_pub_revoke`] call. Surfaced distinctly
 /// (rather than via `anyhow::Error`) so the dispatcher can map
-/// each variant to the right [`common::wire::admin_protocol::AdminResult`]
+/// each variant to the right [`nn_proto::admin_protocol::AdminResult`]
 /// without string-matching.
 #[derive(Debug, thiserror::Error)]
 pub enum RotateKeysError {
@@ -2758,7 +2758,7 @@ mod tests {
     /// this ordering for its `key_fp` / `cosigner_fps` split.
     #[test]
     fn verify_signed_payload_quorum_returns_matched_fingerprints() {
-        use common::wire::admin_signed_payload::{
+        use nn_proto::admin_signed_payload::{
             sign as sign_payload, signing_digest, OperationCode, SignedPayload,
         };
         // Build a 2-of-N auth with both keys carrying Shutdown
@@ -2962,7 +2962,7 @@ mod tests {
     /// the live path (only the tag was checked) as on the stored one.
     #[test]
     fn verify_signed_payload_quorum_rejects_op_extra_mismatch() {
-        use common::wire::admin_signed_payload::{
+        use nn_proto::admin_signed_payload::{
             sign as sign_payload, OperationCode, OperationExtra, UnlockExtra,
         };
         const T: u64 = 1_700_000_000;
@@ -3014,7 +3014,7 @@ mod tests {
     /// The same on the nonce-only quorum and the stored-payload paths.
     #[test]
     fn verify_quorum_rejects_submission_over_signature_cap() {
-        use common::wire::admin_signed_payload::{sign as sign_payload, OperationCode};
+        use nn_proto::admin_signed_payload::{sign as sign_payload, OperationCode};
         const T: u64 = 1_700_000_000;
         let cap = admin_quorum::MAX_SUBMITTED_SIGNATURES;
         let agent_id = [0x5b; 16];

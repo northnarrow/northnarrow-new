@@ -41,7 +41,7 @@ demo-tappa5 = []
 # Exposes the nn-admin `debug --force-posture <STATE>` subcommand and
 # the agent-side handler that consumes it. Used by the integration
 # test harness; never enabled in production builds.
-debug-trigger = ["common/debug-trigger"]
+debug-trigger = ["nn-proto/debug-trigger"]
 # Gates `agent/tests/privileged_e2e.rs` — full end-to-end scenarios
 # that spawn the agent + nn-admin subprocesses and verify the
 # iptables ruleset against a live kernel. Requires root and a
@@ -58,6 +58,14 @@ posture-demo = []
 
 [dependencies]
 common = { workspace = true }
+# Wave 4 restructure, R03 (lab PR 240): the admin protocol, the signed
+# payloads, the quorum, the shutdown marker and the watchdog hold.
+nn-proto = { workspace = true }
+# R02 (lab PR 240): the event model, the posture types, the network
+# addresses, log escaping and the decoded telemetry records (nn-model); the
+# QNAME walk (nn-parse).
+nn-model = { workspace = true }
+nn-parse = { workspace = true }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
 # crate directly without pulling the rest of `agent` —

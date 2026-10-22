@@ -902,7 +902,7 @@ impl Runtime {
                     let now = now_ms();
                     let e = degraded.entry(reason).or_insert((0, 0, String::new()));
                     if e.1 == 0 {
-                        warn!(reason, detail = %common::log_escape::Escaped(&detail), "copy on first write degraded");
+                        warn!(reason, detail = %nn_model::log_escape::Escaped(&detail), "copy on first write degraded");
                         self.store.sign_degraded(
                             reason,
                             &detail,
@@ -1000,8 +1000,8 @@ impl Runtime {
     }
 
     /// The guard as `status --key` shows it.
-    pub fn status(&self) -> common::wire::admin_protocol::CowGuardStatus {
-        use common::wire::admin_protocol::{CowGuardStatus, CowScopeStatus};
+    pub fn status(&self) -> nn_proto::admin_protocol::CowGuardStatus {
+        use nn_proto::admin_protocol::{CowGuardStatus, CowScopeStatus};
         let ix = self.store.index.lock();
         let scopes = self
             .store

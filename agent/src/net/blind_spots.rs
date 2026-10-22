@@ -36,8 +36,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::log_escape::Escaped;
-use common::wire::NetFlowEvent;
+use nn_model::log_escape::Escaped;
+use nn_model::telemetry::NetFlowEvent;
 
 /// DNS over TLS (RFC 7858).
 pub const DOT_PORT: u16 = 853;

@@ -14,9 +14,9 @@
 //!   firing sensor, rule, severity, MITRE tags, principal,
 //!   posture-at-detection, the response taken, and an
 //!   `Open`/`Acknowledged`/`Closed` lifecycle status. It REUSES the
-//!   existing [`Severity`](common::model::Severity),
-//!   [`ResponseAction`](common::model::ResponseAction) and
-//!   [`PostureKind`](common::posture_types::PostureKind) types rather
+//!   existing [`Severity`](nn_model::Severity),
+//!   [`ResponseAction`](nn_model::ResponseAction) and
+//!   [`PostureKind`](nn_model::posture_types::PostureKind) types rather
 //!   than redefining them. Records written before Wave 4 (lab PR 214) can
 //!   also carry a verdict of the removed LLM advisor
 //!   ([`DetectionPath::Ade`], [`AdvisorAction`]); they still decode and
@@ -51,8 +51,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use common::posture_types::PostureKind;
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::posture_types::PostureKind;
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -417,7 +417,7 @@ fn file_from_event(event: &Event) -> Option<String> {
 fn operation_from_event(event: &Event) -> Option<String> {
     match event {
         Event::FsProtectDenial { operation, .. } => Some(operation.to_string()),
-        Event::NetFlow(nf) if nf.phase == common::wire::FlowPhase::Denied => {
+        Event::NetFlow(nf) if nf.phase == nn_model::telemetry::FlowPhase::Denied => {
             Some("connect".to_string())
         }
         _ => None,
@@ -432,7 +432,7 @@ fn operation_from_event(event: &Event) -> Option<String> {
 /// parent's are one connected out, `"parent-stdio … outbound"`. `None`
 /// otherwise.
 pub fn network_from_event(event: &Event) -> Option<String> {
-    use common::wire::FlowPhase;
+    use nn_model::telemetry::FlowPhase;
     let proto = |p: u8| match p {
         6 => "tcp",
         17 => "udp",
@@ -1418,7 +1418,7 @@ pub struct DetectionFilter {
 }
 
 /// Severity as a comparable rung (`Low` < `Medium` < `High` <
-/// `Critical`). [`common::model::Severity`] is not `Ord`, so the
+/// `Critical`). [`nn_model::Severity`] is not `Ord`, so the
 /// `min_severity` filter ranks explicitly rather than relying on a
 /// derived ordering that could silently drift if a rung is inserted.
 fn severity_rank(s: Severity) -> u8 {
@@ -2190,10 +2190,10 @@ mod tests {
             "none".to_string(),
         );
         assert_eq!(r.file.as_deref(), Some("/etc/shadow"));
-        let drift = Event::Fim(common::wire::FimEvent {
+        let drift = Event::Fim(nn_model::telemetry::FimEvent {
             timestamp_ns: 1,
             path: "/etc/cron.d/backdoor".to_string(),
-            op: common::wire::FimOp::Created,
+            op: nn_model::telemetry::FimOp::Created,
             new_sha256: None,
             baseline_sha256: None,
             new_size: None,
@@ -2276,8 +2276,8 @@ mod tests {
         assert_eq!(file.principal.comm, "cat");
     }
 
-    fn flow_event(phase: common::wire::FlowPhase, proto: u8) -> Event {
-        Event::NetFlow(common::wire::NetFlowEvent {
+    fn flow_event(phase: nn_model::telemetry::FlowPhase, proto: u8) -> Event {
+        Event::NetFlow(nn_model::telemetry::NetFlowEvent {
             start_ns: 10_000_000_000,
             end_ns: 0,
             family: 2,
@@ -2309,7 +2309,7 @@ mod tests {
     /// neither.
     #[test]
     fn network_detections_record_the_flow_and_its_phase() {
-        use common::wire::FlowPhase;
+        use nn_model::telemetry::FlowPhase;
         let rec = |e: &Event| {
             DetectionRecord::from_rule(
                 1,
@@ -2337,7 +2337,7 @@ mod tests {
         // An exec whose stdio is a connected socket (R020's evidence).
         let mut spawn = sample_event();
         if let Event::ProcessSpawn { stdio, .. } = &mut spawn {
-            stdio.own = common::StdioSocket {
+            stdio.own = nn_model::StdioSocket {
                 read: true,
                 inet_fds: 0b111,
                 outbound: true,
@@ -2738,7 +2738,7 @@ mod tests {
             comm: "rm".to_string(),
             target_dev: 1,
             target_ino: 2,
-            operation: common::FsProtectOperation::Unlink,
+            operation: nn_model::FsProtectOperation::Unlink,
         };
         let r = DetectionRecord::from_rule(
             1,

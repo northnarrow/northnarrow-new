@@ -77,10 +77,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use common::wire::{
-    FileAttrChange, FimDriftRaw, FimEvent, FimOp, InodeKey, FIM_CHILD_NAME_LEN,
-    FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF, FIM_RENAME_REPLACED,
+    FimDriftRaw, InodeKey, FIM_CHILD_NAME_LEN, FIM_CHILD_TRUNCATED, FIM_RENAME_DEST_LEAF,
+    FIM_RENAME_REPLACED,
 };
-use common::Event;
+use nn_model::telemetry::{FileAttrChange, FimEvent, FimOp};
+use nn_model::Event;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -2048,7 +2049,7 @@ pub fn process_drift(
         if !is_canary && !crate::fim::rules::is_credential_path(&path) {
             debug!(
                 target: "fim.drain",
-                path = %common::log_escape::Escaped(&path),
+                path = %nn_model::log_escape::Escaped(&path),
                 "BUG-012 v2: dropping FimOp::Opened on non-credential, non-canary watched path \
                  (a read is not integrity drift; no rule consumes it)"
             );
@@ -2062,8 +2063,8 @@ pub fn process_drift(
         // so we emit a content-less event and skip the baseline probe.
         debug!(
             target: "fim.drain",
-            path = %common::log_escape::Escaped(&path),
-            modifier_comm = %common::log_escape::Escaped(comm_to_string(&raw.modifier_comm)),
+            path = %nn_model::log_escape::Escaped(&path),
+            modifier_comm = %nn_model::log_escape::Escaped(comm_to_string(&raw.modifier_comm)),
             canary = is_canary,
             "BUG-012 v2: forwarding FimOp::Opened on credential/canary path to rule engine \
              (silent — not recorded as drift)"
@@ -2180,10 +2181,10 @@ pub fn process_drift(
             if restored.is_power_of_two() {
                 warn!(
                     target: "fim.drain",
-                    path = %common::log_escape::Escaped(&path),
+                    path = %nn_model::log_escape::Escaped(&path),
                     ?op,
                     modifier_pid = raw.modifier_pid,
-                    modifier_comm = %common::log_escape::Escaped(comm_to_string(&raw.modifier_comm)),
+                    modifier_comm = %nn_model::log_escape::Escaped(comm_to_string(&raw.modifier_comm)),
                     restored_writes = restored,
                     "FIM: a write on a critical path left its content as baselined — recorded \
                      as content_restored (a touch, or a change undone before the re-hash)"
@@ -2209,7 +2210,7 @@ pub fn process_drift(
         }
         debug!(
             target: "fim.drain",
-            path = %common::log_escape::Escaped(&path),
+            path = %nn_model::log_escape::Escaped(&path),
             ?op,
             "no-op drift: sha256 unchanged for content-class op, skipping"
         );
@@ -2261,7 +2262,7 @@ pub fn process_drift(
     if skipped {
         info!(
             target: "fim.drain",
-            path = %common::log_escape::Escaped(&path),
+            path = %nn_model::log_escape::Escaped(&path),
             severity = ?severity,
             skip_reason,
             "drift suppressed by rate limit — audit chain still recorded"
@@ -2778,7 +2779,7 @@ fn content_after(path: &str, event_ns: u64) -> Option<Content> {
         Err(e) => {
             debug!(
                 target: "fim.drain",
-                path = %common::log_escape::Escaped(&path),
+                path = %nn_model::log_escape::Escaped(&path),
                 error = %e,
                 "compute_baseline failed during drift re-hash; emitting with new_sha256=None"
             );
@@ -4772,7 +4773,7 @@ mod tests {
     fn bug012_v2_opened_on_cred_path_forwards_to_rules_silently() {
         use crate::decision::Rule;
         use crate::fim::rules::NnLFim011AwsCredsRead;
-        use common::ResponseAction;
+        use nn_model::ResponseAction;
 
         let dir = TempDir::new().unwrap();
         let key = fresh_signing_key(&dir);
@@ -4824,7 +4825,7 @@ mod tests {
             other => panic!("expected Event::Fim, got {other:?}"),
         };
         // The forwarded event STILL reaches + fires NN-L-FIM-011.
-        assert_eq!(fe.op, common::wire::FimOp::Opened);
+        assert_eq!(fe.op, nn_model::telemetry::FimOp::Opened);
         let verdict = NnLFim011AwsCredsRead
             .evaluate(&ev)
             .expect("BUG-012 v2 coverage: NN-L-FIM-011 MUST still fire on the forwarded event");
@@ -5602,11 +5603,11 @@ mod tests {
     }
 
     fn fim010_fires(out: &[Event]) -> bool {
-        fim010_verdict(out).is_some_and(|a| a == common::ResponseAction::KillProcessTree)
+        fim010_verdict(out).is_some_and(|a| a == nn_model::ResponseAction::KillProcessTree)
     }
 
     /// NN-L-FIM-010's action on the first event it fires on.
-    fn fim010_verdict(out: &[Event]) -> Option<common::ResponseAction> {
+    fn fim010_verdict(out: &[Event]) -> Option<nn_model::ResponseAction> {
         use crate::decision::Rule as _;
         out.iter().find_map(|e| {
             crate::fim::rules::NnLFim010RansomwareExtensionRename
@@ -5701,6 +5702,6 @@ mod tests {
             matches!(&out[..], [Event::Fim(fe)] if fe.op == FimOp::Created && fe.moved_in),
             "{out:?}"
         );
-        assert_eq!(fim010_verdict(&out), Some(common::ResponseAction::Log));
+        assert_eq!(fim010_verdict(&out), Some(nn_model::ResponseAction::Log));
     }
 }

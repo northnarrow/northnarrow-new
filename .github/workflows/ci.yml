@@ -207,8 +207,9 @@ jobs:
       # External audit ASK-016 (lab PR 170): the wire's production
       # discriminants must not move with `debug-trigger` (a lab agent and a
       # watchdog built without it must still read each other's frames).
+      # The admin protocol is nn-proto's since R03 (lab PR 240).
       - name: Wire discriminants with debug-trigger
-        run: cargo test --locked -p northnarrow-common --features debug-trigger --lib wire::admin_protocol
+        run: cargo test --locked -p nn-proto --features debug-trigger --lib admin_protocol
 
   ebpf-build:
     name: ebpf-build (ubuntu-latest)

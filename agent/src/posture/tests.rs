@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::thread;
 
-use common::posture_types::{PostureKind, TriggerType};
-use common::Event;
+use nn_model::posture_types::{PostureKind, TriggerType};
+use nn_model::Event;
 
 use super::triggers::testutil::{
     file_open, fs_protect_denial, spawn, spawn_by, spawn_exe_flags, tcp_v4,
@@ -383,7 +383,7 @@ fn cross_class_pair_reaches_unlocked_combat() {
 
 fn exploit_postcondition(pid: u32) -> Event {
     let mut ev =
-        crate::decision::rules::epg::tests::epg_event(common::EpgKind::CredFromSyscall, false);
+        crate::decision::rules::epg::tests::epg_event(nn_model::EpgKind::CredFromSyscall, false);
     if let Event::ExploitPostcondition { pid: p, tid, .. } = &mut ev {
         *p = pid;
         *tid = pid;
@@ -1532,7 +1532,7 @@ fn a_relayed_signal_denial_engages_but_never_reaches_combat() {
         comm: "systemd".into(),
         target_dev: 15,
         target_ino: 4242,
-        operation: common::FsProtectOperation::Signal,
+        operation: nn_model::FsProtectOperation::Signal,
         timestamp_ns: 1,
     };
     let (state, firing) = m.observe(&relayed, &[]).expect("posture transitioned");
@@ -1545,7 +1545,7 @@ fn a_relayed_signal_denial_engages_but_never_reaches_combat() {
             comm: "systemd".into(),
             target_dev: 9,
             target_ino: 4242,
-            operation: common::FsProtectOperation::Signal,
+            operation: nn_model::FsProtectOperation::Signal,
             timestamp_ns: ts,
         };
         let _ = m.observe(&again, &[]);
@@ -1574,8 +1574,8 @@ fn observe_returns_none_when_no_transition() {
 fn a_refused_read_of_the_signing_key_alerts_without_combat() {
     let m = PostureMachine::new();
     let mut read = super::triggers::testutil::fs_protect_denial(7, 1);
-    if let common::Event::FsProtectDenial { operation, .. } = &mut read {
-        *operation = common::FsProtectOperation::Read;
+    if let nn_model::Event::FsProtectDenial { operation, .. } = &mut read {
+        *operation = nn_model::FsProtectOperation::Read;
     }
     m.observe(&read, &[]);
     assert_eq!(m.current_kind(), PostureKind::Alerted);
@@ -1881,16 +1881,16 @@ fn two_signals_in_one_container_corroborate() {
 #[test]
 fn a_refused_new_entry_or_xattr_change_reaches_combat() {
     for op in [
-        common::FsProtectOperation::Create,
-        common::FsProtectOperation::Link,
-        common::FsProtectOperation::Symlink,
-        common::FsProtectOperation::Mkdir,
-        common::FsProtectOperation::Mknod,
-        common::FsProtectOperation::Xattr,
+        nn_model::FsProtectOperation::Create,
+        nn_model::FsProtectOperation::Link,
+        nn_model::FsProtectOperation::Symlink,
+        nn_model::FsProtectOperation::Mkdir,
+        nn_model::FsProtectOperation::Mknod,
+        nn_model::FsProtectOperation::Xattr,
     ] {
         let m = PostureMachine::new();
         let mut denial = super::triggers::testutil::fs_protect_denial(7, 1);
-        if let common::Event::FsProtectDenial { operation, .. } = &mut denial {
+        if let nn_model::Event::FsProtectDenial { operation, .. } = &mut denial {
             *operation = op;
         }
         let (state, firing) = m.observe(&denial, &[]).expect("posture transitioned");
@@ -1902,8 +1902,8 @@ fn a_refused_new_entry_or_xattr_change_reaches_combat() {
 // ─── Lab PR 162 — a tamper of an anti-tamper control-surface file ───
 
 /// A FIM event: `op` on `path` by `pid`.
-fn fim(op: common::wire::FimOp, path: &str, pid: u32) -> Event {
-    Event::Fim(common::wire::FimEvent {
+fn fim(op: nn_model::telemetry::FimOp, path: &str, pid: u32) -> Event {
+    Event::Fim(nn_model::telemetry::FimEvent {
         timestamp_ns: 1_000,
         path: path.into(),
         op,
@@ -1940,7 +1940,7 @@ const TAMPERER: u32 = 999_999_999;
 #[test]
 fn a_control_surface_tamper_reaches_locked_combat() {
     let m = PostureMachine::new();
-    let tamper = fim(common::wire::FimOp::Deleted, KILL_SWITCH, TAMPERER);
+    let tamper = fim(nn_model::telemetry::FimOp::Deleted, KILL_SWITCH, TAMPERER);
     let (state, firing) = m.observe(&tamper, &[]).expect("posture transitioned");
     assert_eq!(state.kind(), PostureKind::Combat);
     assert_eq!(firing, Some(TriggerType::ControlSurfaceTamper));
@@ -1954,7 +1954,7 @@ fn a_control_surface_tamper_reaches_locked_combat() {
 fn the_trigger_fires_exactly_where_fim024_does() {
     use crate::decision::Rule as _;
     use crate::fim::rules::{NnLFim024AntiTamperHoneypotModified, HONEYPOT_PATHS};
-    use common::wire::FimOp;
+    use nn_model::telemetry::FimOp;
     let rule = NnLFim024AntiTamperHoneypotModified::new(1);
     let ops = [
         FimOp::Modified,
@@ -1994,13 +1994,13 @@ fn the_agents_own_write_of_a_control_surface_file_raises_nothing() {
         ExemptPids::with_agent(4242),
         AuthSessionTracker::default(),
     );
-    let recreate = fim(common::wire::FimOp::Created, KILL_SWITCH, 4242);
+    let recreate = fim(nn_model::telemetry::FimOp::Created, KILL_SWITCH, 4242);
     assert!(exempt.observe(&recreate, &[]).is_none());
     assert_eq!(exempt.current_kind(), PostureKind::Observing);
 
     let unwired = PostureMachine::new();
     let own = fim(
-        common::wire::FimOp::Created,
+        nn_model::telemetry::FimOp::Created,
         KILL_SWITCH,
         std::process::id(),
     );
@@ -2023,7 +2023,7 @@ fn a_control_surface_tamper_inside_the_trusted_installer_window_raises_nothing()
     let m = PostureMachine::new();
     m.set_installer_window(Arc::clone(&window));
     window.arm(120, std::time::Instant::now());
-    let tamper = fim(common::wire::FimOp::Modified, KILL_SWITCH, TAMPERER);
+    let tamper = fim(nn_model::telemetry::FimOp::Modified, KILL_SWITCH, TAMPERER);
     assert!(m.observe(&tamper, &[]).is_none());
     assert_eq!(m.current_kind(), PostureKind::Observing);
 
@@ -2159,7 +2159,7 @@ fn overwrites(pid: u32, uid: u32) -> Event {
 fn ransomware_combination_needs_corroboration_until_the_policy() {
     // Held by the decision of 21/10/2026 (until the signed per-rule policy):
     // the combination needs corroboration — ENGAGED alone, never locked.
-    const { assert!(!common::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
+    const { assert!(!nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
     let tmp = tempfile::TempDir::new().unwrap();
     let lineage = AuthSessionTracker::new(tmp.path());
     lineage.ingest_exec(

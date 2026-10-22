@@ -38,8 +38,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use common::wire::admin_signed_payload::OverlayKind;
 use ed25519_dalek::VerifyingKey;
+use nn_proto::admin_signed_payload::OverlayKind;
 use serde::{Deserialize, Serialize};
 
 use super::overlay_auth::{drift_entry, entry, AUDIT_OP_ACCEPTED, AUDIT_OP_SET};

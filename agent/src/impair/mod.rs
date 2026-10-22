@@ -46,8 +46,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use common::wire::FimOp;
-use common::Event;
+use nn_model::telemetry::FimOp;
+use nn_model::Event;
 use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;

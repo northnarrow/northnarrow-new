@@ -12,7 +12,7 @@
 //!
 //! [`Rule::attack`]: super::Rule::attack
 
-use common::{ResponseAction, Severity};
+use nn_model::{ResponseAction, Severity};
 
 use crate::detection_store::Sensor;
 

@@ -22,7 +22,7 @@ use common::wire::exe::exe_flags;
 use common::wire::execq::{
     class_names, counter, stop_flags, ExecqKey, ExecqKnown, ExecqStopRaw, ExecqStopped,
 };
-use common::{Event, ExeIdentity};
+use nn_model::{Event, ExeIdentity};
 use northnarrow_scan::supervisor::{ScannerEvent, Supervisor};
 use tracing::{debug, info, warn};
 
@@ -461,7 +461,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
             pid = raw.pid,
             held,
             target,
-            path = %common::log_escape::Escaped(&path),
+            path = %nn_model::log_escape::Escaped(&path),
             classes = ?class_names(raw.class),
             "exec quarantine: candidate"
         );
@@ -509,7 +509,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let o = decide(&self.s.policy, &Basis::ScriptRefused);
         info!(
             pid = raw.pid,
-            path = %common::log_escape::Escaped(&path),
+            path = %nn_model::log_escape::Escaped(&path),
             "exec quarantine: script refused at exec"
         );
         let ev = evidence(
@@ -786,7 +786,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         } else {
             None
         };
-        let record = outcome.action == Action::Kill || outcome.severity != common::Severity::Low;
+        let record = outcome.action == Action::Kill || outcome.severity != nn_model::Severity::Low;
         match response {
             Some(resp) => self.after(id, &basis, &outcome, resp, now, true),
             None => {
@@ -943,7 +943,7 @@ impl<K: KernelIo, B: Backend> Controller<K, B> {
         let held_ms = now.duration_since(p.gate.since).as_millis() as u64;
         info!(
             pid = p.raw.pid,
-            path = %common::log_escape::Escaped(&p.path),
+            path = %nn_model::log_escape::Escaped(&p.path),
             basis = %o.why,
             response = %response,
             held_ms,

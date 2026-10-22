@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};

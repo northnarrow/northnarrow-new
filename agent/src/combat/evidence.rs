@@ -55,7 +55,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use common::posture_types::TriggerType;
+use nn_model::posture_types::TriggerType;
 
 use crate::audit::{AuditEntryDraft, AuditLog};
 
@@ -377,7 +377,7 @@ impl LadderEvidence for AuditEvidence {
             stage = %o.stage,
             action = o.action,
             success = o.success,
-            summary = %common::log_escape::Escaped(&o.summary),
+            summary = %nn_model::log_escape::Escaped(&o.summary),
             "COMBAT action outcome (signed audit entry)"
         );
         self.append(Record::Outcome(o.clone()))

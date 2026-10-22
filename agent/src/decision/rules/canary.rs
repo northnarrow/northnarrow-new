@@ -50,7 +50,7 @@
 //! rules see the ORIGINAL `Event::Fim` only when the detector
 //! returned `None` (no matching canary).
 
-use common::{CanaryAccessKind, CanaryTypeTag, Event, ResponseAction, Severity, Verdict};
+use nn_model::{CanaryAccessKind, CanaryTypeTag, Event, ResponseAction, Severity, Verdict};
 
 use crate::canary::readers::CanaryReaders;
 use crate::decision::attack::{AttackRef, Tactic};
@@ -737,10 +737,10 @@ mod tests {
     }
 
     fn fim_event() -> Event {
-        Event::Fim(common::wire::FimEvent {
+        Event::Fim(nn_model::telemetry::FimEvent {
             timestamp_ns: 1_700_000_000_000_000_000,
             path: "/etc/passwd".to_string(),
-            op: common::wire::FimOp::Modified,
+            op: nn_model::telemetry::FimOp::Modified,
             new_sha256: None,
             baseline_sha256: None,
             new_size: None,

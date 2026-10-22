@@ -152,7 +152,7 @@ pub fn note_identity(path: &Path) {
     let magic = magic_of_path(path);
     if LEDGER.lock().note(path, magic) {
         tracing::warn!(
-            path = %common::log_escape::Escaped(path.display()),
+            path = %nn_model::log_escape::Escaped(path.display()),
             fs = magic.and_then(identity_unverified_fs).unwrap_or("?"),
             "inode identity unverified — a path enrolled after boot is on a filesystem where \
              stat() and the eBPF hooks may not see the same (dev, ino): it may be neither \

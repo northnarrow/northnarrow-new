@@ -39,8 +39,8 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use common::{CanaryAccessKind, CanaryTypeTag};
 use ed25519_dalek::{Signature, VerifyingKey};
+use nn_model::{CanaryAccessKind, CanaryTypeTag};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};

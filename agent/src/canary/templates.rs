@@ -113,7 +113,7 @@ const GENERIC_TMPL: &str = include_str!(concat!(
 /// The 5 credential families K4 ships. Wire-stable identifier
 /// strings ("aws" / "azure" / "gcp" / "docker" / "generic")
 /// match the `cred_family` field on
-/// [`common::wire::admin_signed_payload::CanaryDeploymentWire::Credential`].
+/// [`nn_proto::admin_signed_payload::CanaryDeploymentWire::Credential`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredFamily {
     Aws,

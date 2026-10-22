@@ -21,7 +21,7 @@
 //!   tokio tasks.
 //! - [`PostureState`] is the live state (with monotonic
 //!   [`Instant`](std::time::Instant) timestamps).
-//! - [`common::posture_types::PostureKind`] is the serializable
+//! - [`nn_model::posture_types::PostureKind`] is the serializable
 //!   projection used in logs and on the wire.
 //! - [`TriggerDetector`] / [`triggers`] enumerate every condition
 //!   that can move the posture up.
@@ -51,10 +51,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 
-use common::posture_types::{
+use nn_model::posture_types::{
     Confidence, EvidenceClass, PostureKind, PostureTransition, TriggerType,
 };
-use common::Event;
+use nn_model::Event;
 
 use crate::anti_tamper::network_isolate::UnlockToken;
 use corroboration::CorroborationLedger;

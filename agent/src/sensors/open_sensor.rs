@@ -36,8 +36,9 @@ use common::wire::open_sensor::{
     OPEN_NAME_RULES_MAX, OPEN_PATH_SLOTS, OPEN_PATH_SLOT_LEN, OPEN_RULES_MAX, OPEN_SENSOR_ARMED,
     RUNTIME_UIDS_MAX,
 };
-use common::wire::{FileCapability, FimEvent, FimOp, InodeKey};
-use common::Event;
+use common::wire::InodeKey;
+use nn_model::telemetry::{FileCapability, FimEvent, FimOp};
+use nn_model::Event;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -1370,7 +1371,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             pid: r.pid,
             uid: r.uid,
             comm: comm.clone(),
-            kind: common::FileBurstKind::RenameExtension,
+            kind: nn_model::FileBurstKind::RenameExtension,
             count: r.count,
             appended: r.flags,
             sources: r.mode,
@@ -1383,7 +1384,7 @@ pub fn events_of(r: &OpenRecordRaw, mounts: &mut MountTable) -> Vec<Event> {
             pid: r.pid,
             uid: r.uid,
             comm,
-            kind: common::FileBurstKind::Unlink,
+            kind: nn_model::FileBurstKind::Unlink,
             count: r.count,
             appended: 0,
             sources: 0,
@@ -2034,7 +2035,7 @@ mod tests {
         let ev = events_of(&r, &mut mounts);
         assert!(
             matches!(&ev[..], [Event::FileBurst {
-                kind: common::FileBurstKind::RenameExtension,
+                kind: nn_model::FileBurstKind::RenameExtension,
                 count: 20,
                 appended: 18,
                 sources: 4,
@@ -2051,7 +2052,7 @@ mod tests {
         assert!(matches!(
             &events_of(&r, &mut mounts)[..],
             [Event::FileBurst {
-                kind: common::FileBurstKind::Unlink,
+                kind: nn_model::FileBurstKind::Unlink,
                 count: 20,
                 ..
             }]

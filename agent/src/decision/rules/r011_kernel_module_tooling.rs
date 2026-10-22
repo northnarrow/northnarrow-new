@@ -37,7 +37,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, Severity, Verdict};
+use nn_model::{Event, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
@@ -121,8 +121,8 @@ impl Rule for R011KernelModuleTooling {
             rule = "R011_KernelModuleTooling",
             event = "r011_kthread_decision",
             pid = *pid,
-            comm = %common::log_escape::Escaped(comm),
-            parent_comm = %common::log_escape::Escaped(parent_comm),
+            comm = %nn_model::log_escape::Escaped(comm),
+            parent_comm = %nn_model::log_escape::Escaped(parent_comm),
             parent_is_kthread = *parent_is_kthread,
             decision,
             "R011 kernel-module-tooling exec: PF_KTHREAD parent-origin decision"
@@ -168,7 +168,7 @@ impl Rule for R011KernelModuleTooling {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::{spawn, spawn_full};
-    use common::ResponseAction;
+    use nn_model::ResponseAction;
 
     fn rule() -> R011KernelModuleTooling {
         R011KernelModuleTooling::new(Arc::new(CommAllowlist::default()))

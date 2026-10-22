@@ -36,7 +36,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
-use common::netaddr::{canonical, AF_INET, AF_INET6};
+use nn_model::netaddr::{canonical, AF_INET, AF_INET6};
 use parking_lot::Mutex;
 
 /// How long the interface addresses read for a wildcard canary are reused.

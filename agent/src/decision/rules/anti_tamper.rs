@@ -13,7 +13,7 @@
 //! `FsProtectDenial` before the engine (a kernel deny is not re-evaluated)
 //! and calls this rule directly in that arm.
 
-use common::{Event, FsProtectOperation, ResponseAction, Severity, Verdict};
+use nn_model::{Event, FsProtectOperation, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};

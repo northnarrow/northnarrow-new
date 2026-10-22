@@ -4,8 +4,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use common::wire::FlowPhase;
-use common::{Event, Verdict};
+use nn_model::telemetry::FlowPhase;
+use nn_model::{Event, Verdict};
 use parking_lot::Mutex;
 
 use super::attack::AttackRef;

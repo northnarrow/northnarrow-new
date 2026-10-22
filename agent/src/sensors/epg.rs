@@ -221,8 +221,8 @@ pub fn counter_total(slot: u32) -> u64 {
 }
 
 /// The guard in `nn-admin status` (signed telemetry verb).
-pub fn status() -> common::wire::admin_protocol::ExploitGuardStatus {
-    common::wire::admin_protocol::ExploitGuardStatus {
+pub fn status() -> nn_proto::admin_protocol::ExploitGuardStatus {
+    nn_proto::admin_protocol::ExploitGuardStatus {
         mode: mode_line(),
         checked_total: counter_total(counter::CHECKED),
         skipped_privileged_total: counter_total(counter::SKIPPED_PRIVILEGED),
@@ -609,7 +609,7 @@ fn with_lab_injection(mut c: GuardConfig) -> GuardConfig {
             c.inject_comm_lo = lo;
             c.inject_comm_hi = hi;
             warn!(
-                comm = %common::log_escape::Escaped(&v),
+                comm = %nn_model::log_escape::Escaped(&v),
                 "exploit guard: LAB fault injection armed (debug build) — this comm's strict \
                  getppid() or first lite use point is reported as an anomaly marked injected"
             );

@@ -26,7 +26,7 @@ use common::wire::{
     IOURING_CLASS_FILE_OPEN, IOURING_CLASS_FILE_RW, IOURING_CLASS_NET_CONNECT,
     IOURING_CLASS_NET_SENDRECV,
 };
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
@@ -155,7 +155,7 @@ impl Rule for NnLIou002IoUringFileAndNetwork {
         if judgement == Judgement::Allowed {
             return None;
         }
-        let names = common::io_uring_class_names(*classes);
+        let names = nn_model::io_uring_class_names(*classes);
         let reasoning = format!(
             "`{comm}` drives both file I/O and network I/O through io_uring rings ({}){}: \
              reads, writes and connections that never pass through openat/connect/sendto — \

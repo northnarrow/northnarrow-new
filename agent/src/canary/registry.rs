@@ -84,9 +84,9 @@ use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use common::wire::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use common::wire::InodeKey;
 use ed25519_dalek::{Signature, VerifyingKey};
+use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

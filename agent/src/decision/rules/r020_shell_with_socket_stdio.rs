@@ -52,7 +52,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, StdioSocket, Verdict};
+use nn_model::{Event, ResponseAction, Severity, StdioSocket, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};
@@ -302,7 +302,7 @@ impl Rule for R020ShellWithSocketStdio {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::spawn_exe;
-    use common::{StdioSocket, StdioSockets};
+    use nn_model::{StdioSocket, StdioSockets};
 
     fn sock(outbound: bool, fds: u8, peer: &str) -> StdioSocket {
         StdioSocket {

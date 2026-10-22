@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
-use common::wire::admin_signed_payload::{
+use nn_proto::admin_signed_payload::{
     OperationCode, OperationExtra, OverlayKind, Role, SignedPayload,
 };
 use parking_lot::Mutex;
@@ -769,8 +769,8 @@ fn append(log: &Arc<Mutex<AuditLog>>, draft: AuditEntryDraft) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::admin_signed_payload::sign;
     use ed25519_dalek::SigningKey;
+    use nn_proto::admin_signed_payload::sign;
 
     const AGENT: [u8; 16] = [3; 16];
 

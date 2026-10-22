@@ -797,6 +797,64 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `target-cpu=x86-64-v2` and a `neon` ABI warning. `lab-vm.yml` starts on
   `crates/**`. The shipped binaries, the eBPF object and the packages are
   the same as R00's.
+- Wave 4 restructure, R03 — nn-proto (lab PR 240; before R02, so that
+  nn-model, which depends on `common`, does not inherit its Unix-only
+  `atomic_file`): `common`'s admin protocol (`wire::admin_protocol`),
+  signed payloads (`wire::admin_signed_payload`), quorum (its Kani proof
+  with it), shutdown marker and watchdog hold moved unchanged (`git mv`)
+  to `crates/nn-proto`, with their dependencies and the `debug-trigger`
+  feature, which the agent now forwards there (CI's wire-discriminant step
+  and `kani.yml` run on `-p nn-proto`); `atomic_file` and `sd_notify` to
+  `northnarrow-antitamper-bpf`, the Linux base of the agent and the
+  watchdog. `common` cannot re-export them (they depend on it, and cargo
+  refuses the cycle): the importers — the agent, the watchdog, the fuzz
+  targets `admin_frame` and `shutdown_marker` — name the new crates, a
+  path rewrite, and the moved files compile through `pub(crate)` shims at
+  nn-proto's root (removed in R17). A new test pins five admin frames and
+  a v1 envelope byte for byte as `main` encoded them (signed payloads and
+  `PostureKind` inside); it passes before and after the move. The ratchet
+  scan counts a reference to a crate of `crates/` by its name, so the
+  nn-evidence → nn-proto arc of `verify_lines` and `canary::chain_lines`
+  still counts: 77. The eBPF object is byte-identical to `main`'s; its
+  stamp changes with `common`'s sources.
+- Wave 4 restructure, R02 — nn-model and nn-parse (lab PR 240): `common`'s
+  event model (`model.rs` → `crates/nn-model/src/event.rs`, its items at
+  nn-model's root as they were at `common`'s), `posture_types`, `netaddr`
+  and `log_escape` moved unchanged to nn-model; the std types of
+  `common::wire` (`FimEvent`, `FileAttrChange`, `FileCapability`, `FimOp`,
+  `FimOpDecodeError`, `TlsFingerprint`, `NetFlowEvent`, `FlowPhase`,
+  `NetListenerEvent`) and their tests cut, as they were, into
+  `nn_model::telemetry`; `dns_qname` and its Kani proofs to
+  `crates/nn-parse` (`kani.yml`: `-p nn-parse`). nn-proto's one dependency
+  in the repository is now nn-model. `common` is the kernel↔userland ABI
+  (raw layouts and their name tables, BTF offsets, uapi constants, drop
+  and fail-open slots, the exploit guard's model) and the exec
+  quarantine's scanner protocol; it no longer depends on `serde_json`, and
+  the watchdog and the fuzz crate no longer depend on it. The importers
+  name nn-model and nn-parse (a path rewrite, `use` groups split by
+  crate); `journal_fields`' source scan looks for
+  `nn_model::log_escape::Escaped`. nn-model and nn-proto now hold code,
+  and `portable-core` checks them for aarch64 Linux, Windows and macOS
+  (they pass: `common` has no Unix-only module left). The ratchet stays at
+  77: no reference it counts was to or from a moved module but the two
+  nn-evidence → `admin_protocol` ones, which remain. Identity of the two
+  steps against `main` 2e1438f (same path, the release job's flags): the
+  eBPF object is byte-identical, its stamp's source hash moves with
+  `common`'s sources; the tarball's 72 entries and the .deb's 79 paths and
+  modes are the same; the golden replay and its files are unchanged, and
+  the test list is `main`'s plus the frame pin. The binaries are not
+  byte-identical, and cannot be after a move between crates: a crate's
+  identity seeds symbol names and `TypeId`s, and the fat-LTO module is
+  composed anew — `main` rebuilt with one unused optional dependency added
+  to `common` already changes the scanner's layout and 2, 16 and 17
+  functions of the watchdog, nn-admin and the agent. Function by function
+  (names mapped, addresses dropped) 503 of 504, 2,429 of 2,468, 3,210 of
+  3,330 and 7,217 of 7,408 are the same code, the rest LLVM's choices
+  (inlining, constant propagation, which of identical bodies is kept,
+  registers, `TypeId` constants); the text of `.rodata` differs only in
+  the moved files' paths (panic locations), log-callsite line numbers and
+  the stamp hash. nn-admin's `--events` help still says `common::Event`,
+  so that no output changes.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

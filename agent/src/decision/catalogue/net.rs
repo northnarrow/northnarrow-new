@@ -1,6 +1,6 @@
 //! The network rules (NN-L-NET-*).
 
-use common::{ResponseAction, Severity};
+use nn_model::{ResponseAction, Severity};
 
 use super::RuleDoc;
 use crate::detection_store::Sensor;

@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use aya::programs::Lsm;
 use aya::{Btf, Ebpf};
 use common::btf_offsets::{slot, BTF_OFFSETS_ABSENT};
-use common::Event;
+use nn_model::Event;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
@@ -228,7 +228,7 @@ fn lexically_normal(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::ExeIdentity;
+    use nn_model::ExeIdentity;
 
     fn spawn_with(exe: ExeIdentity) -> Event {
         Event::ProcessSpawn {

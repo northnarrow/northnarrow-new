@@ -34,7 +34,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Event, FsProtectOperation};
+use nn_model::{Event, FsProtectOperation};
 use parking_lot::Mutex;
 use tracing::{error, info, warn};
 

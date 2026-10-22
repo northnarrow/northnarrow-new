@@ -4,7 +4,7 @@
 //! `ANTI-TAMPER DENIAL` stays one line, formatted the way the agent formats
 //! it (fmt layer, no target, no colours, through `OneLine`). And no field
 //! that carries a value another user names is logged with `%` (Display)
-//! unless it goes through `common::log_escape::Escaped`: a source scan of
+//! unless it goes through `nn_model::log_escape::Escaped`: a source scan of
 //! every workspace member (`cargo metadata`; the agent and the watchdog
 //! until lab PR 239), so a new `comm = %comm` fails here.
 
@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use common::log_escape::{Escaped, OneLine};
+use nn_model::log_escape::{Escaped, OneLine};
 
 #[derive(Clone, Default)]
 struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -220,7 +220,7 @@ fn violations(file: &str, src: &str) -> Vec<String> {
             let expr = body[p + 1..].trim_start();
             if attacker_named(file, name)
                 && !expr.starts_with("Escaped(")
-                && !expr.starts_with("common::log_escape::Escaped(")
+                && !expr.starts_with("nn_model::log_escape::Escaped(")
             {
                 out.push(format!("{file}:{line}: `{name} = %…` without Escaped"));
             }
@@ -268,7 +268,11 @@ fn the_scan_finds_what_it_must() {
     );
     assert_eq!(violations(f, r#"info!("ran {comm}")"#).len(), 1);
     assert!(violations(f, r#"warn!(comm = %Escaped(comm), "x")"#).is_empty());
-    assert!(violations(f, r#"warn!(comm = %common::log_escape::Escaped(&c), "x")"#).is_empty());
+    assert!(violations(
+        f,
+        r#"warn!(comm = %nn_model::log_escape::Escaped(&c), "x")"#
+    )
+    .is_empty());
     assert!(violations(f, r#"warn!(comm = ?comm, path = %p.display(), "x")"#).is_empty());
     assert!(violations(f, r#"info!("ran {comm:?} at {}", 5)"#).is_empty());
     assert!(violations(f, "// warn!(comm = %comm)\nlet x = 5 % 3;").is_empty());
@@ -357,7 +361,7 @@ fn no_attacker_named_field_is_logged_raw() {
     assert!(calls > 500, "the scan found {calls} log calls");
     assert!(
         bad.is_empty(),
-        "log these through common::log_escape::Escaped (or `?`):\n{}",
+        "log these through nn_model::log_escape::Escaped (or `?`):\n{}",
         bad.join("\n")
     );
 }
@@ -384,9 +388,9 @@ fn both_daemons_log_through_the_line_guard() {
                 }
                 installs += 1;
                 assert!(
-                    stmt.contains(".with_writer(common::log_escape::stdout_one_line)")
-                        && stmt.contains(".with_ansi(common::log_escape::stdout_ansi())"),
-                    "{}: the fmt layer must write through common::log_escape::stdout_one_line",
+                    stmt.contains(".with_writer(nn_model::log_escape::stdout_one_line)")
+                        && stmt.contains(".with_ansi(nn_model::log_escape::stdout_ansi())"),
+                    "{}: the fmt layer must write through nn_model::log_escape::stdout_one_line",
                     f.display()
                 );
             }

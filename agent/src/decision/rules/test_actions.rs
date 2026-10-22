@@ -11,7 +11,7 @@
 //! payload (`*.block-outbound`, `*.isolate-network`,
 //! `*.quarantine-me`, `*.throttle-me`).
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::{attack::AttackRef, rules::build_verdict, Rule};
 

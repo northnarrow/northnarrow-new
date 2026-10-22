@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::wire::execpol::{self as wpol, ExecPolRaw};
-use common::{Event, ExeIdentity};
+use nn_model::{Event, ExeIdentity};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -129,7 +129,7 @@ struct EntropyAnswer {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Item {
-    /// One event as the agent serialises it (`common::Event`).
+    /// One event as the agent serialises it (`nn_model::Event`).
     Event(Box<Event>),
     /// A connect sweep of one process: `count` `TcpConnect` events, the
     /// destination address counting up from `first` and wrapping after

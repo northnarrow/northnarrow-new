@@ -5,7 +5,7 @@
 //! running the same image under init, and a child that never execs draws
 //! no verdict of its own. The tree kill reaps descendants only.
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};

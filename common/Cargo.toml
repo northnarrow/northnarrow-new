@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared types for the NorthNarrow XDR (events, verdicts, response actions, kernel↔userland wire types)."
+description = "The kernel↔userland ABI of the NorthNarrow XDR (raw wire layouts, BTF offsets, uapi constants, ring-drop slots) and the exec quarantine's scanner protocol."
 
 [lib]
 name = "northnarrow_common"
@@ -14,50 +14,27 @@ path = "src/lib.rs"
 
 [features]
 default = ["std"]
-# `std` enables the userland-rich types (Event, Verdict, ResponseAction)
-# and bytemuck Pod derives. Disable it from the eBPF crate, which only
-# needs the raw wire types.
+# `std` enables the userland helpers of the raw layouts, bytemuck Pod
+# derives and the exec quarantine's scanner protocol. Disable it from the
+# eBPF crate, which only needs the raw wire types.
 std = [
     "dep:serde",
     "dep:bytemuck",
     "dep:postcard",
-    "dep:serde-big-array",
-    # Tappa 8 commit A2 (admin_signed_payload): CBOR + SHA-512 + Ed25519
-    # verify. Std-gated so the eBPF half stays free of these deps.
-    "dep:ciborium",
-    "dep:sha2",
-    "dep:ed25519-dalek",
-    # External audit WDG-001: admin.pub parsing (hex) and the shutdown
-    # marker (JSON) the watchdog verifies.
     "dep:hex",
-    "dep:serde_json",
 ]
-# Opt-in for the nn-admin debug surface (DebugForcePosture variant in
-# the admin protocol). Off by default; production builds never see it.
-# The agent crate forwards its own `debug-trigger` feature here.
-debug-trigger = []
+# Wave 4 restructure, R03 (lab PR 240): the admin protocol, the signed
+# payloads, the quorum and the shutdown marker went to nn-proto with their
+# dependencies (serde-big-array, ciborium, sha2, ed25519-dalek) and the
+# `debug-trigger` feature. R02 (lab PR 240): the event model and the std
+# types of `wire` went to nn-model, and serde_json, which only their tests
+# used, with them.
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 bytemuck = { version = "1", default-features = false, features = ["derive", "min_const_generics"], optional = true }
 postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
-# Serde's auto-derive supports `[T; N]` only up to N=32 in stable;
-# UnlockRequest carries an Ed25519 sig as `[u8; 64]`. serde-big-array
-# unblocks the larger sizes without us hand-rolling Deserialize.
-serde-big-array = { version = "0.5", optional = true }
-# Tappa 8 commit A2 (admin_signed_payload). All std-gated.
-# ciborium: deterministic CBOR (RFC 8949) ser/de for SignedPayload.
-ciborium = { version = "0.2", optional = true }
-# sha2: SHA-512 for the signing digest. Same 0.11 as the agent's chains.
-sha2 = { version = "0.11", optional = true }
-# ed25519-dalek: signature primitives for sign/verify. Match the
-# agent's exact feature shape so the workspace resolves one version.
-ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"], optional = true }
 hex = { version = "0.4", optional = true }
-serde_json = { version = "1", optional = true }
-
-[dev-dependencies]
-serde_json = "1"
 
 # Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
 # builds with -D warnings do not flag it as an unexpected cfg.

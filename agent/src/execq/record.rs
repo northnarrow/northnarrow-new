@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use common::execq::ScanResult;
-use common::{Event, ResponseAction, Verdict};
+use nn_model::{Event, ResponseAction, Verdict};
 use parking_lot::Mutex;
 use tracing::warn;
 
@@ -139,7 +139,7 @@ type AuditLog = Arc<Mutex<crate::audit::AuditLog>>;
 pub struct SinkRecorder {
     pub sink: Option<DetectionSink>,
     pub audit: Option<AuditLog>,
-    pub posture: Box<dyn Fn() -> common::posture_types::PostureKind + Send>,
+    pub posture: Box<dyn Fn() -> nn_model::posture_types::PostureKind + Send>,
 }
 
 impl SinkRecorder {
@@ -181,10 +181,10 @@ impl Recorder for SinkRecorder {
                 rule = RULE_ID,
                 severity = ?rec.verdict.severity,
                 target_pid = rec.verdict.event_pid,
-                target_filename = %common::log_escape::Escaped(&rec.verdict.event_filename),
+                target_filename = %nn_model::log_escape::Escaped(&rec.verdict.event_filename),
                 verdict = %rec.evidence.verdict,
                 decision = %rec.evidence.decision,
-                response = %common::log_escape::Escaped(&rec.response),
+                response = %nn_model::log_escape::Escaped(&rec.response),
                 "VERDICT (exec quarantine)"
             );
             sink.record_execq(
@@ -271,7 +271,7 @@ mod tests {
         );
         assert_eq!(r.verdict.rule_id, RULE_ID);
         assert_eq!(r.verdict.action, ResponseAction::Quarantine);
-        assert_eq!(r.verdict.severity, common::Severity::Critical);
+        assert_eq!(r.verdict.severity, nn_model::Severity::Critical);
         assert_eq!(r.verdict.event_pid, 42);
         assert_eq!(r.techniques(), ["T1204.002"]);
         assert!(r.verdict.reasoning.contains("block-listed"));

@@ -16,11 +16,11 @@
 //! survives a crash.
 //!
 //! External audit WDG-015 (NN-AUD-364): the writer lives in
-//! [`common::atomic_file`], and the agent's and the watchdog's pidfiles
+//! [`antitamper_bpf::atomic_file`], and the agent's and the watchdog's pidfiles
 //! use it too ([`write_pidfile`]); this module keeps the agent's path to
 //! it.
 
-pub use common::atomic_file::{replace, write_pidfile};
+pub use antitamper_bpf::atomic_file::{replace, write_pidfile};
 
 #[cfg(test)]
 mod tests {

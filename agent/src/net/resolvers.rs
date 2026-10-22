@@ -59,7 +59,7 @@ pub fn parse_resolv_conf(text: &str) -> Vec<IpAddr> {
         let Ok(ip) = addr.parse::<IpAddr>() else {
             continue;
         };
-        let ip = common::netaddr::canonical(ip);
+        let ip = nn_model::netaddr::canonical(ip);
         if !out.contains(&ip) {
             out.push(ip);
         }
@@ -127,7 +127,10 @@ impl HostResolvers {
         Arc::new(Self {
             files: Vec::new(),
             state: RwLock::new(State {
-                set: addrs.into_iter().map(common::netaddr::canonical).collect(),
+                set: addrs
+                    .into_iter()
+                    .map(nn_model::netaddr::canonical)
+                    .collect(),
                 stamps: Vec::new(),
                 checked: None,
             }),
@@ -154,7 +157,7 @@ impl HostResolvers {
         self.state
             .read()
             .set
-            .contains(&common::netaddr::canonical(*addr))
+            .contains(&nn_model::netaddr::canonical(*addr))
     }
 
     /// The set now (status, logs).
@@ -185,7 +188,7 @@ impl HostResolvers {
 
 /// A flow to the DNS port of a configured resolver: the resolution a
 /// staged image may make (NN-L-NET-008, NN-L-CHAIN-002/005).
-pub fn is_resolver_flow(nf: &common::wire::NetFlowEvent, resolvers: &HostResolvers) -> bool {
+pub fn is_resolver_flow(nf: &nn_model::telemetry::NetFlowEvent, resolvers: &HostResolvers) -> bool {
     nf.dst_port == DNS_PORT && resolvers.contains(&nf.dst_addr)
 }
 

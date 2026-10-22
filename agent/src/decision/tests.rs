@@ -3,7 +3,7 @@
 //! implementation; these cases pin the behaviour of the engine as a
 //! whole — composition, ordering, and the empty-engine baseline.
 
-use common::{Event, ResponseAction, Severity};
+use nn_model::{Event, ResponseAction, Severity};
 
 use super::rules::testutil::{spawn, spawn_as};
 use super::rules::{
@@ -679,7 +679,7 @@ fn the_demo_engine_is_the_production_engine_behind_r901_to_r904() {
 
 /// A verdict's strength: its action (record < kill < kill the tree), then
 /// its severity.
-fn strength(v: &common::Verdict) -> (u8, u8) {
+fn strength(v: &nn_model::Verdict) -> (u8, u8) {
     let action = match v.action {
         ResponseAction::Log => 0,
         ResponseAction::KillProcessTree => 2,
@@ -757,7 +757,7 @@ fn spawn_fixtures() -> Vec<Event> {
 fn the_engine_returns_the_strongest_spawn_verdict() {
     for event in spawn_fixtures() {
         let got = RuleEngine::with_default_rules().decide(&event);
-        let all: Vec<common::Verdict> = super::rules::default_rules()
+        let all: Vec<nn_model::Verdict> = super::rules::default_rules()
             .iter()
             .filter_map(|r| r.evaluate(&event))
             .collect();
@@ -1033,7 +1033,7 @@ fn one_lookup_of_a_tunnel_shaped_name_is_one_record() {
 fn a_staging_listener_on_8080_is_recorded() {
     let engine = RuleEngine::with_default_rules();
     let listen = |exe: &str, comm: &str| {
-        Event::NetListener(common::wire::NetListenerEvent {
+        Event::NetListener(nn_model::telemetry::NetListenerEvent {
             timestamp_ns: 100,
             family: 2,
             bind_addr: std::net::Ipv4Addr::UNSPECIFIED.into(),
@@ -1081,11 +1081,11 @@ fn tcp_row(
     dst: &str,
     port: u16,
     start_ns: u64,
-    phase: common::wire::FlowPhase,
+    phase: nn_model::telemetry::FlowPhase,
 ) -> Event {
-    use common::wire::FlowPhase;
+    use nn_model::telemetry::FlowPhase;
     let open = phase != FlowPhase::Closed;
-    Event::NetFlow(common::wire::NetFlowEvent {
+    Event::NetFlow(nn_model::telemetry::NetFlowEvent {
         start_ns,
         end_ns: if open { 0 } else { start_ns + 5_000_000_000 },
         family: 2,
@@ -1120,7 +1120,7 @@ fn tcp_row(
 /// known only then) still does.
 #[test]
 fn a_c2_port_flow_is_judged_at_the_connect_once() {
-    use common::wire::FlowPhase;
+    use nn_model::telemetry::FlowPhase;
     let (_tmp, lineage) = lineage_of(&[]);
     let engine = production_engine(lineage);
     let before = super::engine::connect_verdicts_total();
@@ -1178,7 +1178,7 @@ fn a_c2_port_flow_is_judged_at_the_connect_once() {
 /// internal host is recorded once, at the close.
 #[test]
 fn record_rules_wait_for_the_close() {
-    use common::wire::FlowPhase;
+    use nn_model::telemetry::FlowPhase;
     let engine = RuleEngine::with_default_rules();
     let row = |phase| tcp_row(4200, "/opt/app/bin/client", "10.0.0.5", 8080, 1, phase);
     assert!(engine.evaluate(&row(FlowPhase::Connect)).is_none());
@@ -1195,7 +1195,7 @@ fn record_rules_wait_for_the_close() {
 /// the session closed.
 #[test]
 fn a_snapshot_completes_a_chain_while_the_session_is_open() {
-    use common::wire::{FimEvent, FimOp, FlowPhase};
+    use nn_model::telemetry::{FimEvent, FimOp, FlowPhase};
     let engine = RuleEngine::with_default_rules();
     let start = 100_000_000_000;
     let row = |phase| {
@@ -1256,7 +1256,7 @@ fn a_snapshot_completes_a_chain_while_the_session_is_open() {
 /// reasoning says no connection was made; a port rule does not judge it.
 #[test]
 fn a_refused_connect_is_net_001s_record() {
-    use common::wire::FlowPhase;
+    use nn_model::telemetry::FlowPhase;
     use std::sync::Arc;
     let mut engine = RuleEngine::new();
     let bl = crate::net::blocklist::NetBlocklist::from_entries([
@@ -1314,7 +1314,7 @@ fn a_refused_connect_is_net_001s_record() {
 /// would). `cargo test -p northnarrow-agent --lib connect_time_evaluation_cost -- --nocapture`.
 #[test]
 fn connect_time_evaluation_cost() {
-    use common::wire::FlowPhase;
+    use nn_model::telemetry::FlowPhase;
     let (_tmp, lineage) = lineage_of(&[]);
     let engine = production_engine(lineage);
     const N: u32 = 20_000;
@@ -1420,8 +1420,8 @@ fn ids(d: &super::combine::Decision) -> Vec<&'static str> {
     d.matches.iter().map(|m| m.rule_id).collect()
 }
 
-fn fim_event(path: &str, op: common::wire::FimOp, pid: u32, uid: u32, ts: u64) -> Event {
-    Event::Fim(common::wire::FimEvent {
+fn fim_event(path: &str, op: nn_model::telemetry::FimOp, pid: u32, uid: u32, ts: u64) -> Event {
+    Event::Fim(nn_model::telemetry::FimEvent {
         timestamp_ns: ts,
         path: path.to_string(),
         op,
@@ -1447,7 +1447,7 @@ fn fim_event(path: &str, op: common::wire::FimOp, pid: u32, uid: u32, ts: u64) -
 }
 
 fn net_flow(pid: u32, dst: [u8; 4], port: u16, proto: u8, ts: u64, sent: u64) -> Event {
-    Event::NetFlow(common::wire::NetFlowEvent {
+    Event::NetFlow(nn_model::telemetry::NetFlowEvent {
         start_ns: ts,
         end_ns: ts + 1_000,
         family: 2,
@@ -1481,7 +1481,7 @@ fn shadow_fim023_fires_with_fim009_on_a_timer() {
     let d = p
         .decide(&fim_event(
             "/etc/systemd/system/x.timer",
-            common::wire::FimOp::Created,
+            nn_model::telemetry::FimOp::Created,
             7001,
             0,
             10 * SEC,
@@ -1511,7 +1511,7 @@ fn shadow_fim004_is_recorded_and_its_kill_waits_for_enforce() {
     let keys = || {
         fim_event(
             "/home/u/.ssh/authorized_keys",
-            common::wire::FimOp::Created,
+            nn_model::telemetry::FimOp::Created,
             7002,
             1000,
             10 * SEC,
@@ -1567,7 +1567,7 @@ fn detect_only_wins_over_a_lifted_ceiling() {
     let d = prod("enforce NN-L-FIM-004\n")
         .decide(&fim_event(
             "/home/u/.ssh/authorized_keys",
-            common::wire::FimOp::Created,
+            nn_model::telemetry::FimOp::Created,
             7003,
             1000,
             10 * SEC,
@@ -1638,7 +1638,7 @@ fn shadow_chain007_late_exec_keeps_r001_and_r009() {
     let p = prod("");
     let mut read = fim_event(
         "/root/.gnupg/private-keys-v1.d/k.key",
-        common::wire::FimOp::Opened,
+        nn_model::telemetry::FimOp::Opened,
         7005,
         0,
         11 * SEC,
@@ -1650,7 +1650,7 @@ fn shadow_chain007_late_exec_keeps_r001_and_r009() {
     p.decide(&read);
     let mut connect = net_flow(7005, [203, 0, 113, 9], 443, 6, 12 * SEC, 1024);
     if let Event::NetFlow(nf) = &mut connect {
-        nf.phase = common::wire::FlowPhase::Connect;
+        nf.phase = nn_model::telemetry::FlowPhase::Connect;
         nf.uid = 0;
         nf.comm = "stager".into();
         nf.exe = Some("/tmp/.s/stager".into());
@@ -1703,7 +1703,7 @@ fn reverse_shell(uid: u32, pid: u32) -> Event {
         *p = pid;
         *ppid = pid - 1;
         exe.path = "/usr/bin/bash".into();
-        stdio.own = common::StdioSocket {
+        stdio.own = nn_model::StdioSocket {
             read: true,
             inet_fds: 3,
             outbound: true,
@@ -1815,7 +1815,7 @@ fn decisions_are_deterministic_across_threads() {
             reverse_shell(34, 7503),
             fim_event(
                 "/home/u/.ssh/authorized_keys",
-                common::wire::FimOp::Created,
+                nn_model::telemetry::FimOp::Created,
                 7505,
                 1000,
                 SEC,

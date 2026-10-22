@@ -14,7 +14,7 @@
 
 use std::collections::VecDeque;
 
-use common::Event;
+use nn_model::Event;
 use parking_lot::RwLock;
 
 const DEFAULT_CAPACITY: usize = 1000;

@@ -25,7 +25,7 @@
 
 use std::cell::RefCell;
 
-use common::{ResponseAction, Verdict};
+use nn_model::{ResponseAction, Verdict};
 
 /// A destructive response a rule holds until the per-rule policy enables
 /// it.
@@ -121,7 +121,7 @@ pub const PORT_53_KILL: PolicySwitch = PolicySwitch::off(
 
 /// [`PORT_53_KILL`] for a verdict on a flow to port 53 (the rules skip a
 /// configured resolver's); a verdict on another port passes unchanged.
-pub fn hold_port_53(nf: &common::wire::NetFlowEvent, v: Verdict) -> Verdict {
+pub fn hold_port_53(nf: &nn_model::telemetry::NetFlowEvent, v: Verdict) -> Verdict {
     if nf.dst_port == crate::net::resolvers::DNS_PORT {
         PORT_53_KILL.hold(v)
     } else {
@@ -139,7 +139,7 @@ pub const REVOKED_TRANSFER_TOOL_KILL: PolicySwitch = PolicySwitch::off(
 
 /// NN-L-IMP-001 (lab PR 225, new rule): the kill of the actor's tree. Its
 /// posture trigger's COMBAT without corroboration is held likewise
-/// ([`common::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`]).
+/// ([`nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`]).
 pub const IMP_001_KILL: PolicySwitch =
     PolicySwitch::off("the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)");
 
@@ -172,7 +172,7 @@ pub const ALL: &[PolicySwitch] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::Severity;
+    use nn_model::Severity;
 
     fn kill() -> Verdict {
         Verdict {
@@ -197,7 +197,7 @@ mod tests {
             assert!(!s.held.is_empty());
         }
         // The posture half of NN-L-IMP-001's hold.
-        const { assert!(!common::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
+        const { assert!(!nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
     }
 
     /// Off: the action is `Log`, severity and the rest kept, the reasoning
@@ -237,7 +237,7 @@ mod tests {
         fn attack(&self) -> &'static [crate::decision::attack::AttackRef] {
             &[]
         }
-        fn evaluate(&self, _event: &common::Event) -> Option<Verdict> {
+        fn evaluate(&self, _event: &nn_model::Event) -> Option<Verdict> {
             let mut v = kill();
             v.rule_id = self.0.to_string();
             v.action = self.1.clone();
@@ -256,7 +256,7 @@ mod tests {
         e
     }
 
-    fn event() -> common::Event {
+    fn event() -> nn_model::Event {
         crate::decision::rules::testutil::spawn_exe("bash", "/bin/bash", "/usr/bin/bash", 0)
     }
 

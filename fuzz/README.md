@@ -101,12 +101,14 @@ pull request that touches a proved file — external audit SUP-023):
 | `admin_quorum::kani_proofs::quorum_accepts_only_enough_distinct_keys_carrying_every_role` | the admin multi-signature rule behind `verify_quorum` and `verify_signed_payload_quorum`, with the signature checks abstracted (any key or none per signature, any role set per key; up to 4 signatures, 3 keys, 2 roles, any threshold): it accepts only when at least `max(threshold, 1)` **distinct** keys matched and every required role is carried by one of them, and each refusal reports the truth |
 
 The pull-request filter names the files that hold proofs
-(`agent/src/net/tls_parser.rs`, `common/src/dns_qname.rs`,
-`common/src/admin_quorum.rs`) and the workflow;
+(`agent/src/net/tls_parser.rs`, `crates/nn-parse/src/dns_qname.rs` and
+`crates/nn-proto/src/admin_quorum.rs`, both common's until the Wave 4
+restructure's R02 and R03) and the workflow;
 `xtask/tests/supply_chain.rs` keeps it equal to the files with a
 `#[kani::proof]` and checks that the workflow runs every harness. The DNS
-walk moved out of the event model (`common/src/model.rs`), which changes
-often, so that its edits do not start the proofs.
+walk moved out of the event model (then `common/src/model.rs`, now
+nn-model's `event.rs`), which changes often, so that its edits do not
+start the proofs.
 
 Separating the quorum rule from the cryptography also closed a release-build
 gap: a threshold of 0 was rejected only by a `debug_assert`, so a caller
@@ -119,8 +121,9 @@ it is now `n > len - pos` (saturating). Local run:
 
 ```sh
 cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup
-cargo kani -p northnarrow-common --harness qname_label_walk_is_in_bounds_and_terminates
-cargo kani -p northnarrow-common --harness qname_wire_end_is_past_a_root_label
+cargo kani -p nn-parse --harness qname_label_walk_is_in_bounds_and_terminates
+cargo kani -p nn-parse --harness qname_wire_end_is_past_a_root_label
+cargo kani -p nn-proto --harness quorum_accepts_only_enough_distinct_keys_carrying_every_role
 cargo kani -p northnarrow-agent --harness cursor_operations_never_panic_and_keep_pos_in_bounds \
     -Z unstable-options --ignore-global-asm
 ```

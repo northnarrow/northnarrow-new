@@ -88,8 +88,8 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use common::wire::FlowPhase;
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::telemetry::FlowPhase;
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::decision::attack::{AttackRef, Tactic};
@@ -105,7 +105,11 @@ use crate::posture::lineage::AuthSessionTracker;
 // ── verdict helper ───────────────────────────────────────────────────
 
 /// Build a Critical chain Verdict from the triggering `NetFlowEvent`.
-fn chain_verdict(rule: &dyn Rule, nf: &common::wire::NetFlowEvent, reasoning: &str) -> Verdict {
+fn chain_verdict(
+    rule: &dyn Rule,
+    nf: &nn_model::telemetry::NetFlowEvent,
+    reasoning: &str,
+) -> Verdict {
     chain_verdict_with(
         rule,
         nf,
@@ -121,7 +125,7 @@ fn chain_verdict(rule: &dyn Rule, nf: &common::wire::NetFlowEvent, reasoning: &s
 /// process (or its ancestor) did; the age is in minutes.
 fn aged_chain_verdict(
     rule: &dyn Rule,
-    nf: &common::wire::NetFlowEvent,
+    nf: &nn_model::telemetry::NetFlowEvent,
     age_ns: u64,
     kind: PrecursorKind,
     what: &str,
@@ -166,7 +170,7 @@ fn late_chain_verdict(rule: &dyn Rule, egress: &EgressNote, reasoning: &str) -> 
     }
 }
 
-fn egress_note(nf: &common::wire::NetFlowEvent) -> EgressNote {
+fn egress_note(nf: &nn_model::telemetry::NetFlowEvent) -> EgressNote {
     EgressNote {
         pid: nf.pid,
         comm: nf.comm.clone(),
@@ -178,7 +182,7 @@ fn egress_note(nf: &common::wire::NetFlowEvent) -> EgressNote {
 /// informational NN-L-CHAIN-008 uses `Log` + `Medium`).
 fn chain_verdict_with(
     rule: &dyn Rule,
-    nf: &common::wire::NetFlowEvent,
+    nf: &nn_model::telemetry::NetFlowEvent,
     action: ResponseAction,
     severity: Severity,
     reasoning: &str,
@@ -1112,7 +1116,7 @@ pub fn chain_rules() -> Vec<Box<dyn Rule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::{FimEvent, FimOp, NetFlowEvent};
+    use nn_model::telemetry::{FimEvent, FimOp, NetFlowEvent};
     use std::net::{IpAddr, Ipv4Addr};
 
     const SEC: u64 = 1_000_000_000;
@@ -1168,8 +1172,8 @@ mod tests {
         Event::CanaryTripped {
             canary_id: "deadbeef".to_string(),
             canary_name: "decoy-aws".to_string(),
-            canary_type: common::CanaryTypeTag::Credential,
-            access_kind: common::CanaryAccessKind::FileOpen,
+            canary_type: nn_model::CanaryTypeTag::Credential,
+            access_kind: nn_model::CanaryAccessKind::FileOpen,
             accessor_pid: pid,
             accessor_uid: 1000,
             accessor_comm: "thief".to_string(),

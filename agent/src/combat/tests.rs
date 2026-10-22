@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use common::posture_types::TriggerType;
-use common::Event;
+use nn_model::posture_types::TriggerType;
+use nn_model::Event;
 
 use super::actuator::{
     CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,

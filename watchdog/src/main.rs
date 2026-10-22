@@ -73,13 +73,13 @@ async fn main() -> ExitCode {
     // not abort the watchdog: the fmt layer's own error report is an
     // `eprintln!` that panics on the same broken pipe (panic = "abort").
     // External audit Wave 3 (journal line injection, lab PR 167): one
-    // event is one journal line, as in the agent (common::log_escape).
+    // event is one journal line, as in the agent (nn_model::log_escape).
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_ansi(common::log_escape::stdout_ansi())
-        .with_writer(common::log_escape::stdout_one_line)
+        .with_ansi(nn_model::log_escape::stdout_ansi())
+        .with_writer(nn_model::log_escape::stdout_one_line)
         .log_internal_errors(false)
         .try_init();
 
@@ -884,7 +884,7 @@ async fn hold(
         "watchdog HOLDING: alive and protected, not respawning the agent until an operator \
          starts it or the hold's next retry"
     );
-    let record = common::watchdog_hold::HoldRecord {
+    let record = nn_proto::watchdog_hold::HoldRecord {
         at: unix_now(),
         agent_pid: held.agent_pid,
         reason: why.to_string(),
@@ -928,10 +928,10 @@ async fn hold(
                 held_for_secs = held_for,
                 "agent running again — supervision resumed with a fresh restart window"
             );
-            let ended = common::watchdog_hold::HoldRecord {
+            let ended = nn_proto::watchdog_hold::HoldRecord {
                 at: unix_now(),
                 agent_pid: pid,
-                reason: common::watchdog_hold::REASON_HOLD_ENDED.to_string(),
+                reason: nn_proto::watchdog_hold::REASON_HOLD_ENDED.to_string(),
                 detail: format!(
                     "the hold ({why}) lasted {held_for} s; agent pid {pid} runs again after {} \
                      retries in this watchdog's life",
@@ -983,10 +983,10 @@ async fn hold_supervision(
                 held_for_secs = held_for.as_secs(),
                 "hold retry: starting the agent once more"
             );
-            let record = common::watchdog_hold::HoldRecord {
+            let record = nn_proto::watchdog_hold::HoldRecord {
                 at: unix_now(),
                 agent_pid,
-                reason: common::watchdog_hold::REASON_HOLD_RETRY.to_string(),
+                reason: nn_proto::watchdog_hold::REASON_HOLD_RETRY.to_string(),
                 detail: format!(
                     "holding ({why}) for {} s; retry {attempt} starts the agent through {}",
                     held_for.as_secs(),
@@ -1268,13 +1268,13 @@ fn socket_vanished(holds: &std::path::Path, socket: &std::path::Path, agent_pid:
          removed or replaced while the agent runs, and not bound again (agent frozen or \
          stuck?); stuck recovery follows if it stays away"
     );
-    let record = common::watchdog_hold::HoldRecord {
+    let record = nn_proto::watchdog_hold::HoldRecord {
         at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
         agent_pid,
-        reason: common::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED.to_string(),
+        reason: nn_proto::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED.to_string(),
         detail: format!(
             "{}: nothing that is the agent answers there on {pings} STATUS pings in a row \
              (at least {secs} s) after it had answered",

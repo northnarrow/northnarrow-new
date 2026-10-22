@@ -26,15 +26,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use common::posture_types::PostureKind;
-use common::wire::admin_protocol::{
+use nn_model::posture_types::PostureKind;
+use nn_proto::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryListRequest, CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature,
     ShutdownRequest, StatusRequest,
 };
-use common::wire::admin_signed_payload::{
-    sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
-};
+use nn_proto::admin_signed_payload::{sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
 
 use crate::agent_id::{self, AGENT_ID_LEN};
 use crate::os_rng::OsRng;
@@ -139,7 +137,7 @@ pub enum ShutdownOutcome {
 
 #[derive(Debug)]
 pub struct StatusOutcome {
-    pub posture: common::posture_types::PostureKind,
+    pub posture: nn_model::posture_types::PostureKind,
     pub network_isolation_engaged: bool,
     /// Lab PR 217 (capability C18): the isolation per IP family, as the
     /// agent read the tables back (`None`: agent predates the fields).
@@ -204,10 +202,10 @@ pub struct StatusOutcome {
     pub capability_manifest: Option<String>,
     /// Lab PR 219: the exploit post-condition guard's mode and counters
     /// (`None`: agent predates it, or the unsigned `status`).
-    pub exploit_guard: Option<common::wire::admin_protocol::ExploitGuardStatus>,
+    pub exploit_guard: Option<nn_proto::admin_protocol::ExploitGuardStatus>,
     /// Lab PR 222: the copy-on-first-write guard (`None`: withheld, or an
     /// agent without it).
-    pub cow_guard: Option<common::wire::admin_protocol::CowGuardStatus>,
+    pub cow_guard: Option<nn_proto::admin_protocol::CowGuardStatus>,
     /// Lab PR 223 (EXPERIMENTAL): the exec quarantine's state and counts
     /// (`StatusResponse::execq_*`; `None`: withheld, or an agent before
     /// the fields).
@@ -339,7 +337,7 @@ pub fn run_init(priv_out: &Path, pub_append: &Path, force: bool) -> Result<InitO
 /// closes the connection, and the error says to use the `nn-admin` of its
 /// release.
 pub fn run_unlock(socket: &Path, key_path: &Path, agent_id_path: &Path) -> Result<UnlockOutcome> {
-    use common::wire::admin_protocol::SignedUnlockRequest;
+    use nn_proto::admin_protocol::SignedUnlockRequest;
     let reply = signed_request(
         socket,
         key_path,
@@ -407,7 +405,7 @@ pub fn run_telemetry_status(
     key_path: &Path,
     agent_id_path: &Path,
 ) -> Result<std::result::Result<StatusOutcome, AdminResult>> {
-    use common::wire::admin_protocol::TelemetryStatusRequest;
+    use nn_proto::admin_protocol::TelemetryStatusRequest;
     match signed_request(
         socket,
         key_path,
@@ -438,10 +436,7 @@ pub fn run_telemetry_status(
 
 /// A status reply as the CLI prints it; `signed` says which verb it came
 /// from.
-fn status_outcome(
-    resp: common::wire::admin_protocol::StatusResponse,
-    signed: bool,
-) -> StatusOutcome {
+fn status_outcome(resp: nn_proto::admin_protocol::StatusResponse, signed: bool) -> StatusOutcome {
     StatusOutcome {
         posture: resp.posture,
         network_isolation_engaged: resp.network_isolation_engaged,
@@ -735,7 +730,7 @@ pub fn run_verify_keys(path: &Path) -> Result<VerifyKeysOutcome> {
     // External audit MAIN-005: the agent's own parser — a key line may carry
     // its role list (`<hex> unlock,audit-read`, as install.sh writes it),
     // which a check for exactly 64 characters refused.
-    let parsed = common::admin_quorum::parse_admin_pub_lenient(&content);
+    let parsed = nn_proto::admin_quorum::parse_admin_pub_lenient(&content);
     let fingerprints = parsed
         .keys
         .iter()
@@ -796,7 +791,7 @@ pub fn run_rotate_keys_add(
     cosign_key_path: &Path,
     agent_id_path: &Path,
     new_pubkey_hex: &str,
-    roles: &[common::wire::admin_signed_payload::Role],
+    roles: &[nn_proto::admin_signed_payload::Role],
 ) -> Result<RotateKeysOutcome> {
     let new_pubkey_bytes = parse_pubkey_hex(new_pubkey_hex)?;
 
@@ -833,7 +828,7 @@ pub fn run_rotate_keys_add(
 
     write_frame(
         &mut stream,
-        &AdminMessage::RotateKeysAddRequest(common::wire::admin_protocol::RotateKeysAddRequest {
+        &AdminMessage::RotateKeysAddRequest(nn_proto::admin_protocol::RotateKeysAddRequest {
             payload,
             signatures: vec![
                 KeyedSignature { signature: sig_a },
@@ -889,15 +884,13 @@ pub fn run_rotate_keys_revoke(
 
     write_frame(
         &mut stream,
-        &AdminMessage::RotateKeysRevokeRequest(
-            common::wire::admin_protocol::RotateKeysRevokeRequest {
-                payload,
-                signatures: vec![
-                    KeyedSignature { signature: sig_a },
-                    KeyedSignature { signature: sig_b },
-                ],
-            },
-        ),
+        &AdminMessage::RotateKeysRevokeRequest(nn_proto::admin_protocol::RotateKeysRevokeRequest {
+            payload,
+            signatures: vec![
+                KeyedSignature { signature: sig_a },
+                KeyedSignature { signature: sig_b },
+            ],
+        }),
     )?;
 
     let result = match read_frame(&mut stream)? {
@@ -1337,10 +1330,8 @@ pub enum FimReportOutcome {
     Transport,
 }
 
-fn map_admin_result_to_baseline(
-    r: common::wire::admin_protocol::AdminResult,
-) -> FimBaselineOutcome {
-    use common::wire::admin_protocol::AdminResult;
+fn map_admin_result_to_baseline(r: nn_proto::admin_protocol::AdminResult) -> FimBaselineOutcome {
+    use nn_proto::admin_protocol::AdminResult;
     match r {
         AdminResult::Success => FimBaselineOutcome::Success,
         AdminResult::InvalidSignature => FimBaselineOutcome::InvalidSignature,
@@ -1370,9 +1361,9 @@ fn map_admin_result_to_baseline(
 }
 
 fn map_response_to_fim_report(
-    resp: common::wire::admin_protocol::FimReportResponse,
+    resp: nn_proto::admin_protocol::FimReportResponse,
 ) -> FimReportOutcome {
-    use common::wire::admin_protocol::AdminResult;
+    use nn_proto::admin_protocol::AdminResult;
     match resp.result {
         AdminResult::Success => FimReportOutcome::Success {
             entries_jsonl: resp.entries_jsonl,
@@ -1412,7 +1403,7 @@ pub fn run_fim_baseline(
     key_path: &Path,
     agent_id_path: &Path,
 ) -> Result<FimBaselineOutcome> {
-    use common::wire::admin_protocol::FimBaselineRequest;
+    use nn_proto::admin_protocol::FimBaselineRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -1485,9 +1476,9 @@ pub enum FimStatusOutcome {
 }
 
 fn map_response_to_fim_status(
-    resp: common::wire::admin_protocol::FimStatusResponse,
+    resp: nn_proto::admin_protocol::FimStatusResponse,
 ) -> FimStatusOutcome {
-    use common::wire::admin_protocol::AdminResult;
+    use nn_proto::admin_protocol::AdminResult;
     match resp.result {
         AdminResult::Success => FimStatusOutcome::Success {
             watched_paths_count: resp.watched_paths_count,
@@ -1535,7 +1526,7 @@ pub fn run_fim_status(
     key_path: &Path,
     agent_id_path: &Path,
 ) -> Result<FimStatusOutcome> {
-    use common::wire::admin_protocol::FimStatusRequest;
+    use nn_proto::admin_protocol::FimStatusRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -1588,7 +1579,7 @@ pub fn run_fim_report(
     agent_id_path: &Path,
     since_unix_ts: Option<u64>,
 ) -> Result<FimReportOutcome> {
-    use common::wire::admin_protocol::FimReportRequest;
+    use nn_proto::admin_protocol::FimReportRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -1766,7 +1757,7 @@ pub enum CanaryRefreshOutcome {
 }
 
 fn map_response_to_canary_deploy(
-    resp: common::wire::admin_protocol::CanaryDeployResponse,
+    resp: nn_proto::admin_protocol::CanaryDeployResponse,
 ) -> CanaryDeployOutcome {
     match resp.result {
         AdminResult::Success => CanaryDeployOutcome::Success {
@@ -1799,7 +1790,7 @@ fn map_response_to_canary_deploy(
 }
 
 fn map_response_to_canary_list(
-    resp: common::wire::admin_protocol::CanaryListResponse,
+    resp: nn_proto::admin_protocol::CanaryListResponse,
 ) -> CanaryListOutcome {
     match resp.result {
         AdminResult::Success => CanaryListOutcome::Success {
@@ -2094,7 +2085,7 @@ pub fn run_canary_refresh(
 #[cfg(feature = "debug-trigger")]
 pub fn run_debug_force_posture(
     socket: &Path,
-    state: common::wire::admin_protocol::DebugForcePosture,
+    state: nn_proto::admin_protocol::DebugForcePosture,
 ) -> Result<()> {
     let mut stream = connect_socket(socket)?;
     write_frame(&mut stream, &AdminMessage::DebugForcePosture(state))?;
@@ -2196,10 +2187,10 @@ fn read_frame(stream: &mut UnixStream) -> Result<AdminMessage> {
         .read_exact(&mut header)
         .context("reading frame length header")?;
     let body_len = u32::from_be_bytes(header) as usize;
-    if body_len > common::wire::admin_protocol::MAX_FRAME_BODY {
+    if body_len > nn_proto::admin_protocol::MAX_FRAME_BODY {
         bail!(
             "advertised frame body {body_len} > limit {}",
-            common::wire::admin_protocol::MAX_FRAME_BODY
+            nn_proto::admin_protocol::MAX_FRAME_BODY
         );
     }
     let mut body = vec![0u8; body_len];
@@ -2298,12 +2289,12 @@ pub enum NetResolveOutcome {
 }
 
 fn map_admin_result_to_net_jsonl(
-    result: common::wire::admin_protocol::AdminResult,
+    result: nn_proto::admin_protocol::AdminResult,
     entries_jsonl: String,
     entries_count: u32,
     entries_truncated: bool,
 ) -> NetJsonlOutcome {
-    use common::wire::admin_protocol::AdminResult;
+    use nn_proto::admin_protocol::AdminResult;
     match result {
         AdminResult::Success => NetJsonlOutcome::Success {
             entries_jsonl,
@@ -2342,7 +2333,7 @@ pub fn run_net_flows(
     agent_id_path: &Path,
     since_unix_ts: Option<u64>,
 ) -> Result<NetJsonlOutcome> {
-    use common::wire::admin_protocol::NetFlowsRequest;
+    use nn_proto::admin_protocol::NetFlowsRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -2401,7 +2392,7 @@ pub fn run_detections(
     sensor: Option<String>,
     path: Option<String>,
 ) -> Result<NetJsonlOutcome> {
-    use common::wire::admin_protocol::DetectionsRequest;
+    use nn_proto::admin_protocol::DetectionsRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -2495,7 +2486,7 @@ pub enum DetectionSetStatusOutcome {
 }
 
 fn map_response_to_set_status(
-    resp: common::wire::admin_protocol::DetectionSetStatusResponse,
+    resp: nn_proto::admin_protocol::DetectionSetStatusResponse,
 ) -> DetectionSetStatusOutcome {
     use DetectionSetStatusOutcome as O;
     match resp.result {
@@ -2546,7 +2537,7 @@ pub fn run_detection_set_status(
     new_status: String,
     note: Option<String>,
 ) -> Result<DetectionSetStatusOutcome> {
-    use common::wire::admin_protocol::DetectionSetStatusRequest;
+    use nn_proto::admin_protocol::DetectionSetStatusRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -2588,7 +2579,7 @@ pub fn run_net_listeners(
     key_path: &Path,
     agent_id_path: &Path,
 ) -> Result<NetJsonlOutcome> {
-    use common::wire::admin_protocol::NetListenersRequest;
+    use nn_proto::admin_protocol::NetListenersRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -2634,7 +2625,7 @@ pub fn run_net_resolve(
     agent_id_path: &Path,
     ip: String,
 ) -> Result<NetResolveOutcome> {
-    use common::wire::admin_protocol::{AdminResult, NetResolveRequest};
+    use nn_proto::admin_protocol::{AdminResult, NetResolveRequest};
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -2702,7 +2693,7 @@ pub fn run_net_fingerprint(
     agent_id_path: &Path,
     flow_id: String,
 ) -> Result<NetJsonlOutcome> {
-    use common::wire::admin_protocol::NetFingerprintRequest;
+    use nn_proto::admin_protocol::NetFingerprintRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -2763,9 +2754,9 @@ pub enum TrustedInstallerGrantOutcome {
 }
 
 fn map_admin_result_to_trusted_installer(
-    r: common::wire::admin_protocol::AdminResult,
+    r: nn_proto::admin_protocol::AdminResult,
 ) -> TrustedInstallerGrantOutcome {
-    use common::wire::admin_protocol::AdminResult;
+    use nn_proto::admin_protocol::AdminResult;
     match r {
         AdminResult::Success => TrustedInstallerGrantOutcome::Success,
         AdminResult::InvalidSignature => TrustedInstallerGrantOutcome::InvalidSignature,
@@ -2805,7 +2796,7 @@ pub fn run_trusted_installer_grant(
     agent_id_path: &Path,
     window_secs: u32,
 ) -> Result<TrustedInstallerGrantOutcome> {
-    use common::wire::admin_protocol::TrustedInstallerGrantRequest;
+    use nn_proto::admin_protocol::TrustedInstallerGrantRequest;
 
     let signing = read_priv_key(key_path)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
@@ -2846,7 +2837,7 @@ pub fn run_trusted_installer_grant(
 
 /// Outcome of `nn-admin response status`: the reply as the agent sent it
 /// (the lists are empty unless `result` is `Success`).
-pub type ResponseStatusOutcome = common::wire::admin_protocol::ResponseStatusResponse;
+pub type ResponseStatusOutcome = nn_proto::admin_protocol::ResponseStatusResponse;
 
 /// Outcome of `nn-admin response release` / `restore`. `done` is false
 /// when the request was verified but nothing was done (`message` says
@@ -2918,8 +2909,8 @@ pub fn run_remediate_ransomware(
     pid: Option<u32>,
     since_unix: Option<u64>,
     dry_run: bool,
-) -> Result<common::wire::admin_protocol::RemediateRansomwareResponse> {
-    use common::wire::admin_protocol::RemediateRansomwareRequest;
+) -> Result<nn_proto::admin_protocol::RemediateRansomwareResponse> {
+    use nn_proto::admin_protocol::RemediateRansomwareRequest;
     match signed_request_waiting(
         socket,
         key_path,
@@ -2949,7 +2940,7 @@ pub fn run_response_status(
     key_path: &Path,
     agent_id_path: &Path,
 ) -> Result<ResponseStatusOutcome> {
-    use common::wire::admin_protocol::ResponseStatusRequest;
+    use nn_proto::admin_protocol::ResponseStatusRequest;
     match signed_request(
         socket,
         key_path,
@@ -2975,7 +2966,7 @@ pub fn run_response_release(
     agent_id_path: &Path,
     pid: u32,
 ) -> Result<ResponseActionOutcome> {
-    use common::wire::admin_protocol::ResponseReleaseRequest;
+    use nn_proto::admin_protocol::ResponseReleaseRequest;
     match signed_request(
         socket,
         key_path,
@@ -3008,7 +2999,7 @@ pub fn run_response_restore(
     vault_id: String,
     to: Option<String>,
 ) -> Result<ResponseActionOutcome> {
-    use common::wire::admin_protocol::ResponseRestoreRequest;
+    use nn_proto::admin_protocol::ResponseRestoreRequest;
     match signed_request(
         socket,
         key_path,
@@ -3044,17 +3035,17 @@ pub struct ConfigOverlaySetOutcome {
 /// Read and check an overlay before signing it: size, the loader's own
 /// parse rules, SHA-256 and length of the exact bytes.
 fn read_overlay_for_signing(
-    kind: common::wire::admin_signed_payload::OverlayKind,
+    kind: nn_proto::admin_signed_payload::OverlayKind,
     file: &Path,
 ) -> Result<(String, [u8; 32], u32)> {
     let content = std::fs::read_to_string(file)
         .with_context(|| format!("reading overlay {}", file.display()))?;
-    if content.len() > common::wire::admin_protocol::MAX_OVERLAY_BYTES {
+    if content.len() > nn_proto::admin_protocol::MAX_OVERLAY_BYTES {
         bail!(
             "{} is {} bytes; overlays are limited to {} bytes",
             file.display(),
             content.len(),
-            common::wire::admin_protocol::MAX_OVERLAY_BYTES
+            nn_proto::admin_protocol::MAX_OVERLAY_BYTES
         );
     }
     crate::config::overlay_auth::validate_content(kind, &content).with_context(|| {
@@ -3090,10 +3081,10 @@ pub fn run_config_overlay_set(
     key_path: &Path,
     cosign_path: Option<&Path>,
     agent_id_path: &Path,
-    kind: common::wire::admin_signed_payload::OverlayKind,
+    kind: nn_proto::admin_signed_payload::OverlayKind,
     file: &Path,
 ) -> Result<ConfigOverlaySetOutcome> {
-    use common::wire::admin_protocol::ConfigOverlaySetRequest;
+    use nn_proto::admin_protocol::ConfigOverlaySetRequest;
     let (content, sha, len) = read_overlay_for_signing(kind, file)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut stream = connect_socket(socket)?;
@@ -3139,7 +3130,7 @@ pub fn run_config_overlay_sign(
     key_path: &Path,
     cosign_path: Option<&Path>,
     agent_id_path: &Path,
-    kind: common::wire::admin_signed_payload::OverlayKind,
+    kind: nn_proto::admin_signed_payload::OverlayKind,
     file: &Path,
     out: Option<&Path>,
 ) -> Result<PathBuf> {
@@ -3180,7 +3171,7 @@ mod tests {
     /// and over the socket (`config overlay set`, same `validate_content`).
     #[test]
     fn wide_carveout_refused_at_signing() {
-        use common::wire::admin_signed_payload::OverlayKind;
+        use nn_proto::admin_signed_payload::OverlayKind;
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("combat-allow.cidrs");
         for wide in [
@@ -3223,8 +3214,8 @@ mod tests {
             key.verifying_key()
         );
     }
-    use common::posture_types::PostureKind;
-    use common::wire::admin_protocol::{Challenge, StatusResponse};
+    use nn_model::posture_types::PostureKind;
+    use nn_proto::admin_protocol::{Challenge, StatusResponse};
     use std::os::unix::net::UnixListener;
     use std::thread;
     use tempfile::TempDir;
@@ -3439,8 +3430,8 @@ mod tests {
 
     #[test]
     fn cli_unlock_happy_path() {
-        use common::wire::admin_protocol::SignedUnlockResponse;
-        use common::wire::admin_signed_payload::{verify, OperationCode};
+        use nn_proto::admin_protocol::SignedUnlockResponse;
+        use nn_proto::admin_signed_payload::{verify, OperationCode};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
@@ -3506,7 +3497,7 @@ mod tests {
     /// nothing was released.
     #[test]
     fn cli_unlock_reports_a_failed_release() {
-        use common::wire::admin_protocol::SignedUnlockResponse;
+        use nn_proto::admin_protocol::SignedUnlockResponse;
         for (result, released) in [
             (AdminResult::ActionFailed, false),
             (AdminResult::Success, false),
@@ -3557,7 +3548,7 @@ mod tests {
     /// the signature + the signed window.
     #[test]
     fn cli_trusted_installer_grant_happy_path() {
-        use common::wire::admin_signed_payload::{signing_digest, OperationExtra};
+        use nn_proto::admin_signed_payload::{signing_digest, OperationExtra};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let priv_path = dir.path().join("admin.key");
@@ -3652,7 +3643,7 @@ mod tests {
             server_write_frame(
                 stream,
                 &AdminMessage::SignedUnlockResponse(
-                    common::wire::admin_protocol::SignedUnlockResponse {
+                    nn_proto::admin_protocol::SignedUnlockResponse {
                         result: AdminResult::RateLimited {
                             retry_after_secs: 42,
                         },
@@ -3694,7 +3685,7 @@ mod tests {
             server_write_frame(
                 stream,
                 &AdminMessage::SignedUnlockResponse(
-                    common::wire::admin_protocol::SignedUnlockResponse {
+                    nn_proto::admin_protocol::SignedUnlockResponse {
                         result: AdminResult::InvalidSignature,
                         released: false,
                         isolation_v4: true,
@@ -3754,7 +3745,7 @@ mod tests {
                     trust_reasons: None,
                     degradations: None,
                     capability_manifest: None,
-                    exploit_guard: Some(common::wire::admin_protocol::ExploitGuardStatus {
+                    exploit_guard: Some(nn_proto::admin_protocol::ExploitGuardStatus {
                         mode: "lite detect".to_string(),
                         checked_total: 50,
                         skipped_privileged_total: 20,
@@ -3880,8 +3871,8 @@ mod tests {
 
     // ── A9: nn-admin shutdown — mock-server tests ──────────────────
 
-    use common::wire::admin_protocol::AdminResult;
-    use common::wire::admin_signed_payload::verify;
+    use nn_proto::admin_protocol::AdminResult;
+    use nn_proto::admin_signed_payload::verify;
 
     /// Write a 16-byte agent_id to a tempdir file in the canonical
     /// format. Returns both the path and the raw bytes so the test
@@ -3944,7 +3935,7 @@ mod tests {
                     &priv_path,
                     None,
                     &missing,
-                    common::wire::admin_signed_payload::OverlayKind::FimPaths,
+                    nn_proto::admin_signed_payload::OverlayKind::FimPaths,
                     &overlay,
                     None,
                 )
@@ -4011,7 +4002,7 @@ mod tests {
                 }
                 server_write_frame(
                     stream,
-                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge { nonce }),
+                    &AdminMessage::Challenge(nn_proto::admin_protocol::Challenge { nonce }),
                 );
 
                 // Step 2: server receives ShutdownRequest, verifies
@@ -4051,7 +4042,7 @@ mod tests {
     /// destination into the payload and maps the agent's reply.
     #[test]
     fn cli_response_restore_signs_the_extra_and_maps_the_reply() {
-        use common::wire::admin_signed_payload::OperationExtra;
+        use nn_proto::admin_signed_payload::OperationExtra;
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let key = dir.path().join("admin.key");
@@ -4066,7 +4057,7 @@ mod tests {
                 let _ = server_read_frame(stream);
                 server_write_frame(
                     stream,
-                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                    &AdminMessage::Challenge(nn_proto::admin_protocol::Challenge {
                         nonce: [7u8; 32],
                     }),
                 );
@@ -4085,7 +4076,7 @@ mod tests {
                 server_write_frame(
                     stream,
                     &AdminMessage::ResponseRestoreResponse(
-                        common::wire::admin_protocol::ResponseRestoreResponse {
+                        nn_proto::admin_protocol::ResponseRestoreResponse {
                             result: AdminResult::Success,
                             restored: true,
                             path: "/tmp/out".to_string(),
@@ -4114,8 +4105,8 @@ mod tests {
     /// status, marked signed; a refusal is returned as the agent's result.
     #[test]
     fn cli_telemetry_status_signs_and_maps_the_reply() {
-        use common::wire::admin_protocol::{StatusResponse, TelemetryStatusResponse};
-        use common::wire::admin_signed_payload::{OperationCode, OperationExtra};
+        use nn_proto::admin_protocol::{StatusResponse, TelemetryStatusResponse};
+        use nn_proto::admin_signed_payload::{OperationCode, OperationExtra};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("admin.sock");
         let key = dir.path().join("admin.key");
@@ -4132,7 +4123,7 @@ mod tests {
                     let _ = server_read_frame(stream);
                     server_write_frame(
                         stream,
-                        &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                        &AdminMessage::Challenge(nn_proto::admin_protocol::Challenge {
                             nonce: [9u8; 32],
                         }),
                     );
@@ -4209,7 +4200,7 @@ mod tests {
                 let _ = server_read_frame(stream);
                 server_write_frame(
                     stream,
-                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                    &AdminMessage::Challenge(nn_proto::admin_protocol::Challenge {
                         nonce: [0u8; 32],
                     }),
                 );
@@ -4256,7 +4247,7 @@ mod tests {
                 let _ = server_read_frame(stream);
                 server_write_frame(
                     stream,
-                    &AdminMessage::Challenge(common::wire::admin_protocol::Challenge {
+                    &AdminMessage::Challenge(nn_proto::admin_protocol::Challenge {
                         nonce: [0u8; 32],
                     }),
                 );
@@ -4663,7 +4654,7 @@ mod tests {
     /// "detection not found" — the wire flag maps to its own outcome.
     #[test]
     fn set_status_persist_failure_is_distinguishable_from_not_found() {
-        use common::wire::admin_protocol::DetectionSetStatusResponse;
+        use nn_proto::admin_protocol::DetectionSetStatusResponse;
         let not_found = DetectionSetStatusResponse {
             result: AdminResult::UnknownOperation,
             id: 7,

@@ -848,13 +848,13 @@ fn shutdown_signed_round_trip() {
     // External audit TST-003: the marker carries the quorum the agent
     // verified, and verifies against the same admin.pub and agent_id —
     // what the watchdog checks before it stands down.
-    let parsed = ::common::shutdown_marker::ShutdownMarker::parse(&marker)
+    let parsed = ::nn_proto::shutdown_marker::ShutdownMarker::parse(&marker)
         .unwrap_or_else(|e| panic!("marker body unexpected ({e}): {marker}"));
-    let keys = ::common::admin_quorum::parse_admin_pub(
+    let keys = ::nn_proto::admin_quorum::parse_admin_pub(
         &std::fs::read_to_string(&paths.admin_pub).expect("admin.pub"),
     )
     .expect("admin.pub parses");
-    let agent_id = ::common::shutdown_marker::parse_agent_id(
+    let agent_id = ::nn_proto::shutdown_marker::parse_agent_id(
         &std::fs::read_to_string(&paths.agent_id_file).expect("agent_id"),
     )
     .expect("agent_id parses");
@@ -862,14 +862,14 @@ fn shutdown_signed_round_trip() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let exp = ::common::shutdown_marker::Expectation {
+    let exp = ::nn_proto::shutdown_marker::Expectation {
         keys: &keys,
         agent_id,
         agent_pid: parsed.agent_pid,
         agent_started: None,
         now,
     };
-    ::common::shutdown_marker::verify(&parsed, &exp, |_| false)
+    ::nn_proto::shutdown_marker::verify(&parsed, &exp, |_| false)
         .unwrap_or_else(|e| panic!("the watchdog would refuse the agent's marker: {e}"));
 
     // Audit row emitted for the op (B5 wiring).

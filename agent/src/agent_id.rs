@@ -4,7 +4,7 @@
 //! install UUID** — written exactly once at first start to
 //! `/etc/northnarrow/agent_id` and re-read on every subsequent boot.
 //! The value participates in the Tappa 8 signed-payload binding
-//! (design §6.4 layer 3, [`common::wire::admin_signed_payload::SignedPayload::agent_id`]):
+//! (design §6.4 layer 3, [`nn_proto::admin_signed_payload::SignedPayload::agent_id`]):
 //! a captured admin signature replayed against a different agent
 //! install fails because the payload's `agent_id` field will no
 //! longer match the verifier's value.
@@ -79,12 +79,12 @@ pub const DEFAULT_AGENT_ID_PATH: &str = "/etc/northnarrow/agent_id";
 
 /// Width of the raw agent_id in bytes. Bound by the design (§6.5
 /// "16-byte UUID") and by the
-/// [`common::wire::admin_signed_payload::SignedPayload::agent_id`]
+/// [`nn_proto::admin_signed_payload::SignedPayload::agent_id`]
 /// array type. Changing this is a wire-protocol break.
 pub const AGENT_ID_LEN: usize = 16;
 
 /// Width of the on-disk hex encoding of one [`AGENT_ID_LEN`]-byte
-/// value (the parser, `common::shutdown_marker::parse_agent_id`,
+/// value (the parser, `nn_proto::shutdown_marker::parse_agent_id`,
 /// checks it before decoding).
 #[cfg(test)]
 const HEX_LEN: usize = AGENT_ID_LEN * 2;
@@ -252,7 +252,7 @@ pub fn load_existing(path: &Path) -> Result<[u8; AGENT_ID_LEN]> {
 fn parse(raw: &str) -> Result<[u8; AGENT_ID_LEN]> {
     // Shared with the watchdog, which reads the same file to check the
     // install a shutdown was signed for (external audit WDG-001).
-    let id = common::shutdown_marker::parse_agent_id(raw).map_err(|e| anyhow!(e))?;
+    let id = nn_proto::shutdown_marker::parse_agent_id(raw).map_err(|e| anyhow!(e))?;
     // External audit MAIN-009: zero is the identity the test fixtures sign
     // with and the old fallback used; OsRng does not mint it (2^-128).
     if id == [0u8; AGENT_ID_LEN] {

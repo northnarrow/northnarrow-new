@@ -42,8 +42,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use common::wire::{FimEvent, FimOp, InodeKey};
-use common::{Event, ResponseAction, Severity, Verdict};
+use common::wire::InodeKey;
+use nn_model::telemetry::{FimEvent, FimOp};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::{TrustedInstallerOverride, OWN_SYSTEMD_UNITS};
@@ -1170,7 +1171,7 @@ impl Rule for NnLFim010RansomwareExtensionRename {
         let reasoning = format!(
             "Ransomware extension rename — MITRE T1486 (Data Encrypted for Impact); \
              kill the modifier tree to halt the encrypt loop [new name {}]",
-            common::log_escape::Escaped(new_path)
+            nn_model::log_escape::Escaped(new_path)
         );
         let v = fim_verdict(
             self,
@@ -2730,7 +2731,7 @@ pub fn fim_rules_with_lineage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::FimEvent;
+    use nn_model::telemetry::FimEvent;
     use std::collections::HashMap;
 
     fn fim_event(op: FimOp, path: &str) -> Event {
@@ -3084,7 +3085,7 @@ mod tests {
     fn attr_event(path: &str, before: (u32, u32, u32), after: (u32, u32, u32)) -> Event {
         let mut e = fim_event(FimOp::AttrChanged, path);
         if let Event::Fim(fe) = &mut e {
-            fe.attrs = Some(common::wire::FileAttrChange {
+            fe.attrs = Some(nn_model::telemetry::FileAttrChange {
                 mode_before: before.0,
                 mode_after: after.0,
                 uid_before: before.1,
@@ -5525,7 +5526,7 @@ mod tests {
     fn cap_set(path: &str, pid: u32, permitted: u64, namespaced: bool) -> Event {
         let mut e = written_by(FimOp::CapabilitySet, path, pid, "python3");
         if let Event::Fim(fe) = &mut e {
-            fe.capability = Some(common::wire::FileCapability {
+            fe.capability = Some(nn_model::telemetry::FileCapability {
                 permitted,
                 effective: true,
                 namespaced,

@@ -59,8 +59,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use common::wire::FlowPhase;
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::telemetry::FlowPhase;
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
@@ -1387,7 +1387,7 @@ impl Rule for NnLNet005DnsBurst {
 ///
 /// [`ExecIdentity::is_installed_program`]: crate::posture::lineage::ExecIdentity::is_installed_program
 fn common_port_service(
-    nl: &common::wire::NetListenerEvent,
+    nl: &nn_model::telemetry::NetListenerEvent,
     lineage: Option<&crate::posture::lineage::AuthSessionTracker>,
 ) -> Option<bool> {
     if !LISTENER_COMMON_PORTS.contains(&nl.bind_port) {
@@ -1408,7 +1408,7 @@ fn common_port_service(
 
 /// Where NN-L-NET-006 / -019 say the listener is: on a common port, why
 /// that did not exempt it (NETR-015).
-fn listener_port_text(nl: &common::wire::NetListenerEvent, common: bool) -> String {
+fn listener_port_text(nl: &nn_model::telemetry::NetListenerEvent, common: bool) -> String {
     if common {
         format!(
             "on port {}, a common service port, from a program not installed in a \
@@ -1517,7 +1517,7 @@ impl NnLNet007Rfc1918FromUnusualProc {
     /// link-local — IPv6 used to be never internal, so lateral movement
     /// over ULA or link-local drew neither this rule nor NN-L-NET-018.
     fn is_internal(addr: &IpAddr) -> bool {
-        common::netaddr::is_internal(*addr)
+        nn_model::netaddr::is_internal(*addr)
     }
 }
 
@@ -2361,7 +2361,7 @@ impl Rule for NnLNet020DnsQueryFlood {
 /// from NN-L-NET-020, whose reasoning is DNS-specific (a hidden tunnel).
 pub struct NnLNet021SensorRecordFlood {
     /// (sensor, uid, pid — 0 for the user's budget).
-    held: HeldWindows<(common::FloodSource, u32, u32)>,
+    held: HeldWindows<(nn_model::FloodSource, u32, u32)>,
 }
 
 impl NnLNet021SensorRecordFlood {
@@ -2410,8 +2410,8 @@ impl Rule for NnLNet021SensorRecordFlood {
         let sum = self.held.add(key, *held, *timestamp_ns)?;
         let scope = if *uid_level { "its user's" } else { "its own" };
         let (calls, records) = match source {
-            common::FloodSource::Listen => ("listen() calls", "listener records"),
-            common::FloodSource::IoUringCreate => {
+            nn_model::FloodSource::Listen => ("listen() calls", "listener records"),
+            nn_model::FloodSource::IoUringCreate => {
                 ("io_uring_setup() calls", "io_uring ring-creation records")
             }
         };
@@ -2644,7 +2644,10 @@ impl Rule for NnLNet014DnsTunnelEntropy {
 /// rules (`net::limiter`). Kept next to the rules so a change to one of
 /// these predicates is made here too; the test
 /// `every_killing_netflow_verdict_is_guarded` checks the superset.
-pub fn may_meet_a_kill_rule(nf: &common::wire::NetFlowEvent, blocklist: &NetBlocklist) -> bool {
+pub fn may_meet_a_kill_rule(
+    nf: &nn_model::telemetry::NetFlowEvent,
+    blocklist: &NetBlocklist,
+) -> bool {
     if blocklist.contains(&nf.dst_addr) || nf.tls_fingerprint.is_some() {
         return true;
     }
@@ -2657,7 +2660,8 @@ pub fn may_meet_a_kill_rule(nf: &common::wire::NetFlowEvent, blocklist: &NetBloc
     if HIGH_RISK_C2_PORTS.contains(&nf.dst_port) {
         return true;
     }
-    if LATERAL_MOVEMENT_PORTS.contains(&nf.dst_port) && common::netaddr::is_internal(nf.dst_addr) {
+    if LATERAL_MOVEMENT_PORTS.contains(&nf.dst_port) && nn_model::netaddr::is_internal(nf.dst_addr)
+    {
         return true;
     }
     // Lab PR 224: a superset — the resolver exemption of NN-L-NET-008 is
@@ -2829,8 +2833,8 @@ pub fn net_rules_empty() -> Vec<Box<dyn Rule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::{NetFlowEvent, NetListenerEvent, TlsFingerprint};
-    use common::ResponseAction;
+    use nn_model::telemetry::{NetFlowEvent, NetListenerEvent, TlsFingerprint};
+    use nn_model::ResponseAction;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     /// Default-seeded comm allowlist (the shipped union) for the
@@ -3997,7 +4001,7 @@ mod tests {
     }
 
     fn sensor_flood(
-        source: common::FloodSource,
+        source: nn_model::FloodSource,
         pid: u32,
         uid: u32,
         held: u32,
@@ -4021,7 +4025,7 @@ mod tests {
     /// window at 256.
     #[test]
     fn net_021_names_the_listen_flooder_once_per_window() {
-        use common::FloodSource::Listen;
+        use nn_model::FloodSource::Listen;
         const SEC: u64 = 1_000_000_000;
         let rule = NnLNet021SensorRecordFlood::new();
         assert!(rule
@@ -4051,7 +4055,7 @@ mod tests {
     /// The two sensors are summed apart, and the user's budget per user.
     #[test]
     fn net_021_sums_per_sensor_and_user() {
-        use common::FloodSource::{IoUringCreate, Listen};
+        use nn_model::FloodSource::{IoUringCreate, Listen};
         let rule = NnLNet021SensorRecordFlood::new();
         assert!(rule
             .evaluate(&sensor_flood(Listen, 40, 1000, 200, false, 0))

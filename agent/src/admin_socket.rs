@@ -37,7 +37,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tracing::{error, info, warn};
 
-use common::wire::admin_protocol::{
+use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
+use ed25519_dalek::VerifyingKey;
+use nn_proto::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
     ConfigOverlaySetRequest, ConfigOverlaySetResponse, DetectionSetStatusRequest,
@@ -52,9 +54,7 @@ use common::wire::admin_protocol::{
     TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockResult,
     MAX_FRAME_BODY,
 };
-use common::wire::admin_signed_payload::{OperationCode, OperationExtra, Role};
-use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
-use ed25519_dalek::VerifyingKey;
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
 use sha2::{Digest, Sha256};
 
 use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError, ConnAuth};
@@ -998,7 +998,7 @@ async fn handle_connection(
         if auth.exhausted() {
             warn!(
                 client_pid = client.pid,
-                client_comm = %common::log_escape::Escaped(&client.comm),
+                client_comm = %nn_model::log_escape::Escaped(&client.comm),
                 "admin connection closed after repeated signature failures"
             );
             return Ok(());
@@ -1371,7 +1371,7 @@ struct DispatchNotes {
     /// External audit ASK-015: the posture a force-posture left, when the
     /// transition was applied (also a no-op to the same state). `None`
     /// when it was refused: the state did not change.
-    force_from: Option<common::posture_types::PostureKind>,
+    force_from: Option<nn_model::posture_types::PostureKind>,
     /// Lab PR 217: a force-posture out of COMBAT — what its release
     /// released, or why it did not (the posture then stayed COMBAT).
     force_release: Option<std::result::Result<String, String>>,
@@ -1550,7 +1550,7 @@ fn emit_audit_for(
             let (name, family) = match &req.payload.extra {
                 OperationExtra::CanaryDeploy(e) => {
                     let family = match &e.deployment {
-                        common::wire::admin_signed_payload::CanaryDeploymentWire::Credential {
+                        nn_proto::admin_signed_payload::CanaryDeploymentWire::Credential {
                             cred_family,
                             ..
                         } => cred_family.clone(),
@@ -1609,7 +1609,7 @@ fn emit_audit_for(
         // the same "what did the operator just learn?" detail
         // that fim_report + fim_status capture for their domain.
         (AdminMessage::NetFlowsRequest(req), AdminMessage::NetFlowsResponse(resp)) => {
-            use common::wire::admin_signed_payload::NetFlowsExtra;
+            use nn_proto::admin_signed_payload::NetFlowsExtra;
             let since = match &req.payload.extra {
                 OperationExtra::NetFlows(NetFlowsExtra { since_unix_ts }) => *since_unix_ts,
                 _ => None,
@@ -1635,7 +1635,7 @@ fn emit_audit_for(
             req.signatures.len().saturating_sub(1),
         ),
         (AdminMessage::NetResolveRequest(req), AdminMessage::NetResolveResponse(resp)) => {
-            use common::wire::admin_signed_payload::NetResolveExtra;
+            use nn_proto::admin_signed_payload::NetResolveExtra;
             let ip = match &req.payload.extra {
                 OperationExtra::NetResolve(NetResolveExtra { ip }) => ip.clone(),
                 _ => String::new(),
@@ -1651,7 +1651,7 @@ fn emit_audit_for(
             )
         }
         (AdminMessage::NetFingerprintRequest(req), AdminMessage::NetFingerprintResponse(resp)) => {
-            use common::wire::admin_signed_payload::NetFingerprintExtra;
+            use nn_proto::admin_signed_payload::NetFingerprintExtra;
             let flow_id = match &req.payload.extra {
                 OperationExtra::NetFingerprint(NetFingerprintExtra { flow_id }) => flow_id.clone(),
                 _ => String::new(),
@@ -2261,17 +2261,17 @@ fn dispatch(
         #[cfg(feature = "debug-trigger")]
         AdminMessage::DebugForcePosture(state) => {
             let target = match state {
-                common::wire::admin_protocol::DebugForcePosture::Observing => {
-                    common::posture_types::PostureKind::Observing
+                nn_proto::admin_protocol::DebugForcePosture::Observing => {
+                    nn_model::posture_types::PostureKind::Observing
                 }
-                common::wire::admin_protocol::DebugForcePosture::Alerted => {
-                    common::posture_types::PostureKind::Alerted
+                nn_proto::admin_protocol::DebugForcePosture::Alerted => {
+                    nn_model::posture_types::PostureKind::Alerted
                 }
-                common::wire::admin_protocol::DebugForcePosture::Engaged => {
-                    common::posture_types::PostureKind::Engaged
+                nn_proto::admin_protocol::DebugForcePosture::Engaged => {
+                    nn_model::posture_types::PostureKind::Engaged
                 }
-                common::wire::admin_protocol::DebugForcePosture::Combat => {
-                    common::posture_types::PostureKind::Combat
+                nn_proto::admin_protocol::DebugForcePosture::Combat => {
+                    nn_model::posture_types::PostureKind::Combat
                 }
             };
             posture.force_state_for_test(target);
@@ -2647,12 +2647,12 @@ fn dispatch_config_overlay_set(
             "not a config-overlay payload".to_string(),
         );
     };
-    if req.content.len() > common::wire::admin_protocol::MAX_OVERLAY_BYTES {
+    if req.content.len() > nn_proto::admin_protocol::MAX_OVERLAY_BYTES {
         return refuse(
             AdminResult::Success,
             format!(
                 "content larger than {} bytes",
-                common::wire::admin_protocol::MAX_OVERLAY_BYTES
+                nn_proto::admin_protocol::MAX_OVERLAY_BYTES
             ),
         );
     }
@@ -2684,9 +2684,7 @@ fn dispatch_config_overlay_set(
         // Lab PR 236: the per-rule policy is put in force at once, between
         // two events; the signed `config_overlay_set` row records it
         // (`applied` in its detail).
-        Ok(sig_file)
-            if extra.kind == common::wire::admin_signed_payload::OverlayKind::RulePolicy =>
-        {
+        Ok(sig_file) if extra.kind == nn_proto::admin_signed_payload::OverlayKind::RulePolicy => {
             use crate::decision::rule_policy as rp;
             let boot = rp::boot_policy(Some((&target, &req.content)));
             let summary = boot.policy.summary();
@@ -2933,11 +2931,14 @@ fn dispatch_rotate_keys_add(
 /// pubkey-only line, which loads with the default roles — those are
 /// checked.
 ///
-/// [`AdminKey::authorizes`]: common::admin_quorum::AdminKey::authorizes
-fn role_beyond_signers(roles: &[Role], signers: &[common::admin_quorum::AdminKey]) -> Option<Role> {
+/// [`AdminKey::authorizes`]: nn_proto::admin_quorum::AdminKey::authorizes
+fn role_beyond_signers(
+    roles: &[Role],
+    signers: &[nn_proto::admin_quorum::AdminKey],
+) -> Option<Role> {
     let defaults;
     let granted = if roles.is_empty() {
-        defaults = common::admin_quorum::default_roles();
+        defaults = nn_proto::admin_quorum::default_roles();
         &defaults[..]
     } else {
         roles
@@ -3360,7 +3361,7 @@ fn dispatch_fim_report(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> FimReportResponse {
-    use common::wire::admin_signed_payload::FimReportExtra;
+    use nn_proto::admin_signed_payload::FimReportExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -3495,7 +3496,7 @@ fn dispatch_response_status(
     state: Option<&ResponseAdminState>,
     fps_out: &mut Vec<String>,
 ) -> ResponseStatusResponse {
-    use common::wire::admin_protocol::{
+    use nn_proto::admin_protocol::{
         ContainedProcessWire, QuarantinedFileWire, MAX_RESPONSE_STATUS_ROWS,
     };
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -3842,7 +3843,7 @@ fn dispatch_response_release(
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
         pid,
         released,
-        detail = %common::log_escape::Escaped(&message),
+        detail = %nn_model::log_escape::Escaped(&message),
         "response release"
     );
     ResponseReleaseResponse {
@@ -3901,7 +3902,7 @@ fn dispatch_response_restore(
                 target: "admin.response_restore",
                 signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
                 vault_id = %extra.vault_id,
-                path = %common::log_escape::Escaped(&path),
+                path = %nn_model::log_escape::Escaped(&path),
                 "quarantined file restored by an administrator (mode 0600)"
             );
             ResponseRestoreResponse {
@@ -3979,7 +3980,7 @@ fn dispatch_remediate_ransomware(
     let mut rows = Vec::new();
     for r in &report.rows {
         let clip = |s: &str| s.chars().take(512).collect::<String>();
-        let row = common::wire::admin_protocol::CowRestoreRow {
+        let row = nn_proto::admin_protocol::CowRestoreRow {
             path: clip(&r.path),
             action: r.action.clone(),
             entry: r.entry,
@@ -3994,7 +3995,7 @@ fn dispatch_remediate_ransomware(
             + row.beside.as_ref().map_or(0, |s| s.len())
             + row.evidence.as_ref().map_or(0, |s| s.len())
             + 200;
-        if rows.len() >= common::wire::admin_protocol::REMEDIATE_ROWS_MAX || cost > budget {
+        if rows.len() >= nn_proto::admin_protocol::REMEDIATE_ROWS_MAX || cost > budget {
             break;
         }
         budget -= cost;
@@ -4128,9 +4129,9 @@ async fn write_frame(stream: &mut UnixStream, msg: &AdminMessage) -> Result<()> 
 /// uses (V1.0 pragmatism documented in K3 module doc).
 /// The decoy path of a File or Credential canary.
 pub fn canary_path(
-    deployment: &common::wire::admin_signed_payload::CanaryDeploymentWire,
+    deployment: &nn_proto::admin_signed_payload::CanaryDeploymentWire,
 ) -> Option<&str> {
-    use common::wire::admin_signed_payload::CanaryDeploymentWire;
+    use nn_proto::admin_signed_payload::CanaryDeploymentWire;
     match deployment {
         CanaryDeploymentWire::File { path, .. } | CanaryDeploymentWire::Credential { path, .. } => {
             Some(path)
@@ -4213,7 +4214,7 @@ fn dispatch_canary_deploy(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> CanaryDeployResponse {
-    use common::wire::admin_signed_payload::OperationExtra;
+    use nn_proto::admin_signed_payload::OperationExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -4282,7 +4283,7 @@ fn dispatch_canary_deploy(
     // port (`canary::network`). One whose address is not an IP address
     // could never trip, and one where a listener on this host takes the
     // connections would trip on every client of that service.
-    if let common::wire::admin_signed_payload::CanaryDeploymentWire::Network {
+    if let nn_proto::admin_signed_payload::CanaryDeploymentWire::Network {
         bind_addr,
         bind_port,
     } = &extra.deployment
@@ -4377,7 +4378,7 @@ fn dispatch_canary_deploy(
         target: "admin.canary_deploy",
         signer_fp = %primary_fp,
         canary_id = %entry.canary_id,
-        canary_name = %common::log_escape::Escaped(&entry.name),
+        canary_name = %nn_model::log_escape::Escaped(&entry.name),
         "canary deployed"
     );
     CanaryDeployResponse {
@@ -4397,11 +4398,11 @@ fn dispatch_canary_deploy(
 /// — its SHA-256 and seed, for the registry row (DEC-010). Process +
 /// Network canaries write nothing: `(None, None)`.
 fn materialise_canary_file(
-    deployment: &common::wire::admin_signed_payload::CanaryDeploymentWire,
+    deployment: &nn_proto::admin_signed_payload::CanaryDeploymentWire,
     state: &CanaryAdminState,
 ) -> Result<(Option<common::wire::InodeKey>, Option<DecoyContent>)> {
     use crate::canary::templates::{new_content_seed, render, render_file_body, CredFamily};
-    use common::wire::admin_signed_payload::CanaryDeploymentWire;
+    use nn_proto::admin_signed_payload::CanaryDeploymentWire;
     let seed = new_content_seed();
     let (path, body) = match deployment {
         CanaryDeploymentWire::File { path, .. } => (path, render_file_body(&seed)),
@@ -4483,7 +4484,7 @@ fn dispatch_canary_list(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> CanaryListResponse {
-    use common::wire::admin_signed_payload::OperationExtra;
+    use nn_proto::admin_signed_payload::OperationExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -4554,7 +4555,7 @@ fn dispatch_canary_burn(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
-    use common::wire::admin_signed_payload::OperationExtra;
+    use nn_proto::admin_signed_payload::OperationExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -4638,7 +4639,7 @@ fn dispatch_canary_refresh(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
-    use common::wire::admin_signed_payload::OperationExtra;
+    use nn_proto::admin_signed_payload::OperationExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -4721,7 +4722,7 @@ fn dispatch_net_flows(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFlowsResponse {
-    use common::wire::admin_signed_payload::NetFlowsExtra;
+    use nn_proto::admin_signed_payload::NetFlowsExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -5168,7 +5169,7 @@ fn dispatch_net_resolve(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetResolveResponse {
-    use common::wire::admin_signed_payload::NetResolveExtra;
+    use nn_proto::admin_signed_payload::NetResolveExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -5259,7 +5260,7 @@ fn dispatch_net_fingerprint(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFingerprintResponse {
-    use common::wire::admin_signed_payload::NetFingerprintExtra;
+    use nn_proto::admin_signed_payload::NetFingerprintExtra;
 
     let server_now = now_unix_secs();
     let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
@@ -5327,8 +5328,8 @@ mod tests {
     use super::*;
     use crate::admin_cli::{run_status, run_unlock, run_verify_keys};
     use crate::os_rng::OsRng;
-    use common::posture_types::PostureKind;
     use ed25519_dalek::SigningKey;
+    use nn_model::posture_types::PostureKind;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -5498,7 +5499,7 @@ mod tests {
         // Combat. posture/triggers/testutil is `pub(super)`-scoped so
         // not reachable from this module; hand-rolled is fine for one
         // event.
-        use common::Event;
+        use nn_model::Event;
         let intrusion = Event::ProcessSpawn {
             pid: 100,
             ppid: 1,
@@ -5634,8 +5635,8 @@ mod tests {
 
     // ── A7: signed shutdown — mock-server e2e ──────────────────────
 
-    use common::wire::admin_protocol::{AdminResult, KeyedSignature, ShutdownRequest};
-    use common::wire::admin_signed_payload::{sign, SignedPayload};
+    use nn_proto::admin_protocol::{AdminResult, KeyedSignature, ShutdownRequest};
+    use nn_proto::admin_signed_payload::{sign, SignedPayload};
 
     /// Spin up a [`serve_with_marker_path`] task plus two
     /// admin keypairs, both holding `Role::Shutdown` so the
@@ -5769,7 +5770,7 @@ mod tests {
             // Step 1: request a challenge.
             sync_write_frame(
                 &mut stream,
-                &AdminMessage::ChallengeRequest(common::wire::admin_protocol::ChallengeRequest {}),
+                &AdminMessage::ChallengeRequest(nn_proto::admin_protocol::ChallengeRequest {}),
             );
             let nonce = match sync_read_frame(&mut stream) {
                 AdminMessage::Challenge(c) => c.nonce,
@@ -5815,10 +5816,10 @@ mod tests {
             // External audit TST-003: the watchdog's half of the contract.
             // The marker verifies against the admin keys, and the same
             // marker with its signatures replaced does not.
-            use common::shutdown_marker::{verify, Expectation, Rejection};
-            let keys: Vec<common::admin_quorum::AdminKey> = [&signing_a, &signing_b]
+            use nn_proto::shutdown_marker::{verify, Expectation, Rejection};
+            let keys: Vec<nn_proto::admin_quorum::AdminKey> = [&signing_a, &signing_b]
                 .iter()
-                .map(|sk| common::admin_quorum::AdminKey {
+                .map(|sk| nn_proto::admin_quorum::AdminKey {
                     key: sk.verifying_key(),
                     roles: vec![Role::Shutdown],
                 })
@@ -5977,7 +5978,7 @@ mod tests {
             stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
             sync_write_frame(
                 &mut stream,
-                &AdminMessage::ChallengeRequest(common::wire::admin_protocol::ChallengeRequest {}),
+                &AdminMessage::ChallengeRequest(nn_proto::admin_protocol::ChallengeRequest {}),
             );
             let nonce = match sync_read_frame(&mut stream) {
                 AdminMessage::Challenge(c) => c.nonce,
@@ -6059,9 +6060,8 @@ mod tests {
     fn audit_emits_on_unlock_success() {
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
-        let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
-            signature: [0; 64],
-        });
+        let req =
+            AdminMessage::Unlock(nn_proto::admin_protocol::UnlockRequest { signature: [0; 64] });
         let reply = AdminMessage::UnlockResult(UnlockResult::Success);
         emit_audit_for(
             &req,
@@ -6092,8 +6092,8 @@ mod tests {
     /// vec (len - 1, since the first is the primary signer).
     #[test]
     fn audit_emits_on_shutdown_success_with_grace_extra() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_shutdown([0x11; 32], 1_700_000_000, [0x22; 16], 45);
@@ -6129,9 +6129,9 @@ mod tests {
     /// chain captures attempts, not just wins.
     #[test]
     fn audit_emits_on_force_posture_failure() {
-        use common::posture_types::PostureKind;
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_model::posture_types::PostureKind;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_force_posture(
@@ -6168,8 +6168,8 @@ mod tests {
     /// to assert they do NOT emit rows.
     #[test]
     fn audit_chains_rotate_keys_add_emissions_and_skips_non_auditable() {
-        use common::wire::admin_protocol::{ChallengeRequest, KeyedSignature, StatusRequest};
-        use common::wire::admin_signed_payload::{Role, SignedPayload};
+        use nn_proto::admin_protocol::{ChallengeRequest, KeyedSignature, StatusRequest};
+        use nn_proto::admin_signed_payload::{Role, SignedPayload};
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
 
@@ -6187,7 +6187,7 @@ mod tests {
         // Non-auditable: Status request.
         let status_req = AdminMessage::Status(StatusRequest {});
         let status_reply = AdminMessage::StatusResponse(StatusResponse {
-            posture: common::posture_types::PostureKind::Observing,
+            posture: nn_model::posture_types::PostureKind::Observing,
             network_isolation_engaged: false,
             last_admin_action_secs_ago: None,
             ringbuf_drops_total: None,
@@ -6345,9 +6345,8 @@ mod tests {
     fn audit_empty_matched_fps_preserves_b5_empty_string_shape() {
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
-        let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
-            signature: [0; 64],
-        });
+        let req =
+            AdminMessage::Unlock(nn_proto::admin_protocol::UnlockRequest { signature: [0; 64] });
         let reply = AdminMessage::UnlockResult(UnlockResult::Success);
         emit_audit_for(
             &req,
@@ -6370,8 +6369,8 @@ mod tests {
     /// result="success", populated key_fp from matched_fps.
     #[test]
     fn audit_emits_on_fim_baseline_success() {
-        use common::wire::admin_protocol::{FimBaselineRequest, KeyedSignature};
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::{FimBaselineRequest, KeyedSignature};
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_fim_baseline([0x11; 32], 1_700_000_000, [0x22; 16]);
@@ -6403,8 +6402,8 @@ mod tests {
     /// read`).
     #[test]
     fn audit_emits_on_fim_report_success_with_extra() {
-        use common::wire::admin_protocol::{FimReportRequest, FimReportResponse, KeyedSignature};
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::{FimReportRequest, FimReportResponse, KeyedSignature};
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_fim_report(
@@ -6451,8 +6450,8 @@ mod tests {
     /// missing fim-status from the audit chain.
     #[test]
     fn audit_emits_on_fim_status_success_with_extra() {
-        use common::wire::admin_protocol::{FimStatusRequest, FimStatusResponse, KeyedSignature};
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::{FimStatusRequest, FimStatusResponse, KeyedSignature};
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_fim_status([0x77; 32], 1_700_000_000, [0x88; 16]);
@@ -6500,8 +6499,8 @@ mod tests {
     /// successes — the chain captures attempts).
     #[test]
     fn audit_emits_on_fim_baseline_failure_role_denied() {
-        use common::wire::admin_protocol::{FimBaselineRequest, KeyedSignature};
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::{FimBaselineRequest, KeyedSignature};
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_fim_baseline([0x55; 32], 1_700_000_000, [0x66; 16]);
@@ -6535,10 +6534,8 @@ mod tests {
     /// canary lifecycle from the audit chain.
     #[test]
     fn audit_emits_on_canary_deploy_success_with_canary_id_extra() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::{
-            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
-        };
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_canary_deploy(
@@ -6583,8 +6580,8 @@ mod tests {
     /// truncated flag (matches the FimReport audit shape).
     #[test]
     fn audit_emits_on_canary_list_success_with_entries_count_extra() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_canary_list([0x30; 32], 1_700_000_000, [0x40; 16]);
@@ -6618,8 +6615,8 @@ mod tests {
     /// (NOT from the reply — burn replies are bare AdminResult).
     #[test]
     fn audit_emits_on_canary_burn_success_with_canary_id_extra() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_canary_burn(
@@ -6654,8 +6651,8 @@ mod tests {
     /// mutations keyed by canary_id.
     #[test]
     fn audit_emits_on_canary_refresh_success_with_canary_id_extra() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_canary_refresh(
@@ -6689,10 +6686,8 @@ mod tests {
     /// successes — chains capture attempts, not just successes).
     #[test]
     fn audit_emits_on_canary_deploy_failure_role_denied() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::{
-            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
-        };
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload = SignedPayload::new_canary_deploy(
@@ -6779,9 +6774,9 @@ mod tests {
     /// What `dispatch_canary_deploy` does after the signature check.
     fn deploy_canary(
         state: &CanaryAdminState,
-        deployment: common::wire::admin_signed_payload::CanaryDeploymentWire,
+        deployment: nn_proto::admin_signed_payload::CanaryDeploymentWire,
     ) -> CanaryToken {
-        use common::wire::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
+        use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
         let canary_type = match &deployment {
             CanaryDeploymentWire::Credential { .. } => CanaryTypeWire::Credential,
             _ => CanaryTypeWire::File,
@@ -6812,7 +6807,7 @@ mod tests {
     /// DEC-010: the row records the SHA-256 of what was written.
     #[test]
     fn two_deploys_same_operator_same_path_render_differently() {
-        use common::wire::admin_signed_payload::CanaryDeploymentWire;
+        use nn_proto::admin_signed_payload::CanaryDeploymentWire;
         let dir = TempDir::new().unwrap();
         let state = canary_state(&dir);
         let path = dir.path().join("home/u/.docker/config.json");
@@ -6852,7 +6847,7 @@ mod tests {
     /// in place.
     #[test]
     fn refresh_rotates_credential_content() {
-        use common::wire::admin_signed_payload::CanaryDeploymentWire;
+        use nn_proto::admin_signed_payload::CanaryDeploymentWire;
         use std::os::unix::fs::MetadataExt;
         let dir = TempDir::new().unwrap();
         let state = canary_state(&dir);
@@ -6915,10 +6910,8 @@ mod tests {
     /// mapping in the CLI works without a new variant.
     #[test]
     fn dispatch_canary_deploy_without_state_returns_unknown_operation() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::{
-            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
-        };
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xa0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
@@ -6935,7 +6928,7 @@ mod tests {
                 template: None,
             },
         );
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let sig: [u8; 64] = nn_proto::admin_signed_payload::sign(&payload, &signing).unwrap();
         let req = CanaryDeployRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
@@ -6953,10 +6946,8 @@ mod tests {
     /// the detector's index at once.
     #[test]
     fn a_network_canary_deploy_is_checked_then_indexed() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::{
-            CanaryDeploymentWire, CanaryTypeWire, SignedPayload,
-        };
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xa1; 16];
         let (auth, _auth_dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
@@ -6976,7 +6967,7 @@ mod tests {
                     bind_port,
                 },
             );
-            let sig = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+            let sig = nn_proto::admin_signed_payload::sign(&payload, &signing).unwrap();
             let req = CanaryDeployRequest {
                 payload,
                 signatures: vec![KeyedSignature { signature: sig }],
@@ -7023,15 +7014,15 @@ mod tests {
     /// Same protection as deploy.
     #[test]
     fn dispatch_canary_list_without_state_returns_unknown_operation() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xb0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-read", agent_id);
         let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_canary_list(nonce, now_unix_secs(), agent_id);
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let sig: [u8; 64] = nn_proto::admin_signed_payload::sign(&payload, &signing).unwrap();
         let req = CanaryListRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
@@ -7047,8 +7038,8 @@ mod tests {
     /// to UnknownOperation when no CanaryAdminState is wired.
     #[test]
     fn dispatch_canary_burn_without_state_returns_unknown_operation() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xc0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
@@ -7060,7 +7051,7 @@ mod tests {
             agent_id,
             "doesnotexist".to_string(),
         );
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let sig: [u8; 64] = nn_proto::admin_signed_payload::sign(&payload, &signing).unwrap();
         let req = CanaryBurnRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
@@ -7075,8 +7066,8 @@ mod tests {
     /// CanaryAdminState is wired.
     #[test]
     fn dispatch_canary_refresh_without_state_returns_unknown_operation() {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xd0; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "canary-manage", agent_id);
@@ -7088,7 +7079,7 @@ mod tests {
             agent_id,
             "doesnotexist".to_string(),
         );
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let sig: [u8; 64] = nn_proto::admin_signed_payload::sign(&payload, &signing).unwrap();
         let req = CanaryRefreshRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
@@ -7101,11 +7092,11 @@ mod tests {
     // ── External audit CMB-016 — undoing a response ────────────────
 
     fn keyed(
-        payload: &common::wire::admin_signed_payload::SignedPayload,
+        payload: &nn_proto::admin_signed_payload::SignedPayload,
         signing: &SigningKey,
-    ) -> Vec<common::wire::admin_protocol::KeyedSignature> {
-        vec![common::wire::admin_protocol::KeyedSignature {
-            signature: common::wire::admin_signed_payload::sign(payload, signing).unwrap(),
+    ) -> Vec<nn_proto::admin_protocol::KeyedSignature> {
+        vec![nn_proto::admin_protocol::KeyedSignature {
+            signature: nn_proto::admin_signed_payload::sign(payload, signing).unwrap(),
         }]
     }
 
@@ -7128,7 +7119,7 @@ mod tests {
         auth: &ConnAuth<'_>,
         agent_id: [u8; 16],
     ) -> ResponseStatusRequest {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let payload = SignedPayload::new_response_status(
             auth.issue_challenge().unwrap(),
             now_unix_secs(),
@@ -7147,7 +7138,7 @@ mod tests {
         agent_id: [u8; 16],
         pid: u32,
     ) -> ResponseReleaseRequest {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let payload = SignedPayload::new_response_release(
             auth.issue_challenge().unwrap(),
             now_unix_secs(),
@@ -7168,7 +7159,7 @@ mod tests {
         vault_id: &str,
         to: Option<String>,
     ) -> ResponseRestoreRequest {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let payload = SignedPayload::new_response_restore(
             auth.issue_challenge().unwrap(),
             now_unix_secs(),
@@ -7190,7 +7181,7 @@ mod tests {
         auth: &ConnAuth<'_>,
         agent_id: [u8; 16],
     ) -> TelemetryStatusRequest {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let payload = SignedPayload::new_telemetry_status(
             auth.issue_challenge().unwrap(),
             now_unix_secs(),
@@ -7298,7 +7289,7 @@ mod tests {
     /// the agent holds.
     #[test]
     fn the_unsigned_status_withholds_the_telemetry() {
-        use common::wire::admin_protocol::StatusRequest;
+        use nn_proto::admin_protocol::StatusRequest;
         let signing = SigningKey::generate(&mut OsRng);
         let dir = TempDir::new().unwrap();
         let (auth, _d) = build_auth_with_roles(&signing, "audit-read", [0x1d; 16]);
@@ -7330,7 +7321,7 @@ mod tests {
             AdminMessage::StatusResponse(r) => r,
             other => panic!("{other:?}"),
         };
-        assert_eq!(r.posture, common::posture_types::PostureKind::Observing);
+        assert_eq!(r.posture, nn_model::posture_types::PostureKind::Observing);
         assert!(!r.network_isolation_engaged);
         assert_eq!(r.combat_stage.as_deref(), Some("NEUTRALIZE"));
         assert_eq!(r.combat_locked, Some(false));
@@ -7687,9 +7678,7 @@ mod tests {
     /// refused, whatever the role.
     #[test]
     fn dispatch_response_verbs_refuse_a_mismatched_extra() {
-        use common::wire::admin_signed_payload::{
-            OperationExtra, ResponseRestoreExtra, SignedPayload,
-        };
+        use nn_proto::admin_signed_payload::{OperationExtra, ResponseRestoreExtra, SignedPayload};
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1a; 16];
         let dir = TempDir::new().unwrap();
@@ -7814,7 +7803,7 @@ mod tests {
     /// the audit chain as a rejection with why, not as a success.
     #[test]
     fn audit_records_a_release_that_did_nothing_as_rejected() {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let req = AdminMessage::ResponseReleaseRequest(ResponseReleaseRequest {
@@ -7850,16 +7839,16 @@ mod tests {
     #[test]
     fn dispatch_net_flows_returns_empty_success_when_log_absent() {
         use crate::os_rng::OsRng;
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
         use ed25519_dalek::SigningKey;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xAA; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "net-read", agent_id);
         let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, None);
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let sig: [u8; 64] = nn_proto::admin_signed_payload::sign(&payload, &signing).unwrap();
         let req = NetFlowsRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
@@ -7878,9 +7867,9 @@ mod tests {
     #[test]
     fn dispatch_net_flows_role_denied_without_net_read() {
         use crate::os_rng::OsRng;
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
         use ed25519_dalek::SigningKey;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xBB; 16];
         // Key carries `unlock` only — not `net-read`.
@@ -7888,7 +7877,7 @@ mod tests {
         let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
         let payload = SignedPayload::new_net_flows(nonce, now_unix_secs(), agent_id, None);
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, &signing).unwrap();
+        let sig: [u8; 64] = nn_proto::admin_signed_payload::sign(&payload, &signing).unwrap();
         let req = NetFlowsRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
@@ -7967,16 +7956,16 @@ mod tests {
     }
 
     fn one_sig(
-        payload: &common::wire::admin_signed_payload::SignedPayload,
+        payload: &nn_proto::admin_signed_payload::SignedPayload,
         signing: &SigningKey,
-    ) -> Vec<common::wire::admin_protocol::KeyedSignature> {
-        vec![common::wire::admin_protocol::KeyedSignature {
-            signature: common::wire::admin_signed_payload::sign(payload, signing).unwrap(),
+    ) -> Vec<nn_proto::admin_protocol::KeyedSignature> {
+        vec![nn_proto::admin_protocol::KeyedSignature {
+            signature: nn_proto::admin_signed_payload::sign(payload, signing).unwrap(),
         }]
     }
 
     fn net_flows(dir: &Path, since: Option<u64>) -> NetFlowsResponse {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let (signing, auth, _k, agent_id) = read_verb_key("net-read");
         let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
@@ -7989,7 +7978,7 @@ mod tests {
     }
 
     fn fim_report(dir: &Path) -> FimReportResponse {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let (signing, auth, _k, agent_id) = read_verb_key("fim-read");
         let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
@@ -8083,7 +8072,7 @@ mod tests {
     /// (it answered Success with an empty body).
     #[test]
     fn net_listeners_serves_listener_log() {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         append_lines(
             &dir.path().join("netflow_listeners.jsonl"),
@@ -8113,7 +8102,7 @@ mod tests {
     }
 
     fn net_fingerprint(dir: &Path, flow_id: &str) -> NetFingerprintResponse {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let (signing, auth, _k, agent_id) = read_verb_key("net-read");
         let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
@@ -8162,7 +8151,7 @@ mod tests {
     }
 
     fn net_resolve(dir: &Path, ip: &str) -> NetResolveResponse {
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let (signing, auth, _k, agent_id) = read_verb_key("net-read");
         let auth = ConnAuth::new(&auth);
         let nonce = auth.issue_challenge().unwrap();
@@ -8217,8 +8206,8 @@ mod tests {
         nonce: [u8; 32],
         agent_id: [u8; 16],
     ) -> DetectionsRequest {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let payload = SignedPayload::new_detections(
             nonce,
             now_unix_secs(),
@@ -8231,7 +8220,7 @@ mod tests {
             None,
             None,
         );
-        let sig: [u8; 64] = common::wire::admin_signed_payload::sign(&payload, signing).unwrap();
+        let sig: [u8; 64] = nn_proto::admin_signed_payload::sign(&payload, signing).unwrap();
         DetectionsRequest {
             payload,
             signatures: vec![KeyedSignature { signature: sig }],
@@ -8339,8 +8328,8 @@ mod tests {
         id: u64,
         status: &str,
     ) -> DetectionSetStatusRequest {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::{sign, SignedPayload};
         let payload = SignedPayload::new_detection_set_status(
             nonce,
             now_unix_secs(),
@@ -8542,8 +8531,8 @@ mod tests {
         window_secs: u32,
         ts: u64,
     ) -> TrustedInstallerGrantRequest {
-        use common::wire::admin_protocol::KeyedSignature;
-        use common::wire::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::admin_protocol::KeyedSignature;
+        use nn_proto::admin_signed_payload::{sign, SignedPayload};
         let payload = SignedPayload::new_trusted_installer_grant(nonce, ts, agent_id, window_secs);
         let sig: [u8; 64] = sign(&payload, signing).unwrap();
         TrustedInstallerGrantRequest {
@@ -8720,8 +8709,8 @@ mod tests {
     /// fim_report shape.
     #[test]
     fn audit_emits_on_net_flows_success_with_counts_extra() {
-        use common::wire::admin_protocol::{KeyedSignature, NetFlowsRequest, NetFlowsResponse};
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_protocol::{KeyedSignature, NetFlowsRequest, NetFlowsResponse};
+        use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let payload =
@@ -8907,7 +8896,7 @@ mod tests {
         let (client, task, slots) = spawn_conn_handler(limits);
         let (_read_half, mut write_half) = client.into_split();
         let frame = encode_frame(&AdminMessage::Status(
-            common::wire::admin_protocol::StatusRequest {},
+            nn_proto::admin_protocol::StatusRequest {},
         ))
         .unwrap();
         let writer = tokio::spawn(async move {
@@ -8990,7 +8979,7 @@ mod tests {
     fn sync_challenge(stream: &mut std::os::unix::net::UnixStream) -> [u8; 32] {
         sync_write_frame(
             stream,
-            &AdminMessage::ChallengeRequest(common::wire::admin_protocol::ChallengeRequest {}),
+            &AdminMessage::ChallengeRequest(nn_proto::admin_protocol::ChallengeRequest {}),
         );
         match sync_read_frame(stream) {
             AdminMessage::Challenge(c) => c.nonce,
@@ -9128,7 +9117,7 @@ mod tests {
             // A further request on that connection gets no reply.
             use std::io::Write;
             let frame = encode_frame(&AdminMessage::ChallengeRequest(
-                common::wire::admin_protocol::ChallengeRequest {},
+                nn_proto::admin_protocol::ChallengeRequest {},
             ))
             .unwrap();
             let _ = hostile.write_all(&frame);
@@ -9446,7 +9435,7 @@ mod tests {
     /// the gate) and delegates the roles it holds, nothing more.
     #[test]
     fn bootstrap_add_delegates_signer_roles() {
-        let signer = common::admin_quorum::AdminKey {
+        let signer = nn_proto::admin_quorum::AdminKey {
             key: SigningKey::generate(&mut OsRng).verifying_key(),
             roles: vec![Role::Unlock, Role::RotateKeys, Role::TrustedInstaller],
         };
@@ -9635,7 +9624,7 @@ mod tests {
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut c = std::os::unix::net::UnixStream::connect(&s).unwrap();
-            let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+            let req = AdminMessage::Unlock(nn_proto::admin_protocol::UnlockRequest {
                 signature: [0; 64],
             });
             c.write_all(&encode_frame(&req).unwrap()).unwrap();
@@ -9744,7 +9733,7 @@ mod tests {
         let client = std::thread::spawn(move || {
             use std::io::Write;
             let mut c = std::os::unix::net::UnixStream::connect(&s).unwrap();
-            let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+            let req = AdminMessage::Unlock(nn_proto::admin_protocol::UnlockRequest {
                 signature: [0; 64],
             });
             c.write_all(&encode_frame(&req).unwrap()).unwrap();
@@ -9969,7 +9958,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let nonce = auth.issue_challenge().unwrap();
-        let req = AdminMessage::Unlock(common::wire::admin_protocol::UnlockRequest {
+        let req = AdminMessage::Unlock(nn_proto::admin_protocol::UnlockRequest {
             signature: signing.sign(&nonce).to_bytes(),
         });
         let mut fps = Vec::new();
@@ -10066,8 +10055,8 @@ mod tests {
     /// and `dispatch_shutdown` fell back to a 30 s grace nobody signed.
     #[test]
     fn dispatch_shutdown_refuses_an_extra_that_is_not_a_shutdown() {
-        use common::wire::admin_protocol::{KeyedSignature, ShutdownRequest};
-        use common::wire::admin_signed_payload::{sign, SignedPayload, UnlockExtra};
+        use nn_proto::admin_protocol::{KeyedSignature, ShutdownRequest};
+        use nn_proto::admin_signed_payload::{sign, SignedPayload, UnlockExtra};
         let agent_id = [0xc4; 16];
         let sks = [
             SigningKey::from_bytes(&[0x31; 32]),

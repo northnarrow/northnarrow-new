@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, Severity, Verdict};
+use nn_model::{Event, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
@@ -137,7 +137,7 @@ impl Rule for R013NamespaceEscapeTooling {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::{argv_cut, spawn, spawn_full};
-    use common::ResponseAction;
+    use nn_model::ResponseAction;
 
     fn rule() -> R013NamespaceEscapeTooling {
         R013NamespaceEscapeTooling::new(Arc::new(CommAllowlist::default()))

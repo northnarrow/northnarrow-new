@@ -28,10 +28,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use common::posture_types::{EvidenceClass, TriggerType};
 use common::wire::exe::exe_flags;
 use common::wire::open_sensor::open_reason;
-use common::Event;
+use nn_model::posture_types::{EvidenceClass, TriggerType};
+use nn_model::Event;
 
 use super::corroboration::Scope;
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
@@ -684,7 +684,7 @@ impl TriggerDetector {
         if let Event::FsProtectDenial { pid, operation, .. } = event {
             hits.push(if *pid == 1 {
                 TriggerType::RelayedTamperAttempt
-            } else if *operation == common::FsProtectOperation::Read {
+            } else if *operation == nn_model::FsProtectOperation::Read {
                 // External audit EVD-001: a refused read of the agent's
                 // signing key is a credential reach (ALERTED), not a
                 // decisive tamper — a backup of /etc meets it too.
@@ -1254,7 +1254,7 @@ fn staging_exec(
     }
     tracing::warn!(
         pid,
-        image = %common::log_escape::Escaped(image),
+        image = %nn_model::log_escape::Escaped(image),
         unlinked,
         mass_wrote,
         "staging exec with a second factor — raising ConfirmedIntrusion"
@@ -1305,8 +1305,8 @@ fn confirmed_intrusion(
         if !*overwrites && auth.is_auth_mediated(*pid) {
             tracing::info!(
                 pid = *pid,
-                comm = %common::log_escape::Escaped(comm),
-                filename = %common::log_escape::Escaped(filename),
+                comm = %nn_model::log_escape::Escaped(comm),
+                filename = %nn_model::log_escape::Escaped(filename),
                 count_within_window = *count,
                 "mass write of new files inside an authenticated session — not counted (a build, \
                  a clone, an archive extracted); rewriting existing files would be"
@@ -1317,8 +1317,8 @@ fn confirmed_intrusion(
             tracing::warn!(
                 trigger = "ConfirmedIntrusion_MassWrite",
                 focal_pid = *pid,
-                focal_comm = %common::log_escape::Escaped(comm),
-                focal_filename = %common::log_escape::Escaped(filename),
+                focal_comm = %nn_model::log_escape::Escaped(comm),
+                focal_filename = %nn_model::log_escape::Escaped(filename),
                 count_within_window = *count,
                 overwrites = *overwrites,
                 // External audit EBPF-011: the processes of the writer's
@@ -1459,8 +1459,8 @@ fn confirmed_intrusion(
                     tracing::warn!(
                         trigger = "ConfirmedIntrusion_MassWrite",
                         focal_pid = *focal_pid,
-                        focal_comm = %common::log_escape::Escaped(focal_comm),
-                        focal_filename = %common::log_escape::Escaped(focal_filename),
+                        focal_comm = %nn_model::log_escape::Escaped(focal_comm),
+                        focal_filename = %nn_model::log_escape::Escaped(focal_filename),
                         count_within_window = count,
                         threshold = MASS_WRITE_MIN,
                         window_secs = MASS_WRITE_WINDOW_NS / 1_000_000_000,
@@ -1699,11 +1699,11 @@ fn is_inet_family(family: u8) -> bool {
 ///
 /// External audit NET-001: an IPv4-mapped IPv6 address (a dual-stack
 /// socket reaching an IPv4 peer) is judged as the IPv4 address it maps.
-/// External audit NETR-007: the predicate lives in `common::netaddr`, shared
+/// External audit NETR-007: the predicate lives in `nn_model::netaddr`, shared
 /// with NN-L-NET-007/018.
 fn is_internal(addr: &[u8; 16], family: u8) -> bool {
     is_inet_family(family)
-        && common::netaddr::is_internal(common::netaddr::canonical_ip(family, addr))
+        && nn_model::netaddr::is_internal(nn_model::netaddr::canonical_ip(family, addr))
 }
 
 fn is_write_open(flags: u32) -> bool {
@@ -1822,7 +1822,7 @@ pub(super) mod testutil {
             comm: "attacker".into(),
             target_dev: 1,
             target_ino: 2,
-            operation: common::FsProtectOperation::Unlink,
+            operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: ts,
         }
     }
@@ -2046,7 +2046,7 @@ mod tests {
         let with = |ppid: u32, outbound: bool| {
             let mut e = spawn_exe_flags(44, ppid, "/usr/bin/bash", 0, 1);
             if let Event::ProcessSpawn { stdio, .. } = &mut e {
-                stdio.own = common::StdioSocket {
+                stdio.own = nn_model::StdioSocket {
                     read: true,
                     inet_fds: 0b011,
                     outbound,
@@ -2129,7 +2129,7 @@ mod tests {
             comm: "rm".into(),
             target_dev: 64_770,
             target_ino: 12345,
-            operation: common::FsProtectOperation::Unlink,
+            operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 1,
         };
         let hits = det.detect(&focal, &[]);
@@ -2258,7 +2258,7 @@ mod tests {
             comm: "northnarrow-wa".into(),
             target_dev: 64_770,
             target_ino: 12345,
-            operation: common::FsProtectOperation::Unlink,
+            operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 1,
         };
         assert_eq!(
@@ -2294,7 +2294,7 @@ mod tests {
             comm: "rm".into(),
             target_dev: 64_770,
             target_ino: 12345,
-            operation: common::FsProtectOperation::Unlink,
+            operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 1,
         };
         let hits = det.detect(&focal, &[]);
@@ -3351,7 +3351,7 @@ mod tests {
             comm: "rm".into(),
             target_dev: 64_770,
             target_ino: 12345,
-            operation: common::FsProtectOperation::Unlink,
+            operation: nn_model::FsProtectOperation::Unlink,
             timestamp_ns: 3,
         };
         let hits = det.detect(&focal, &[]);

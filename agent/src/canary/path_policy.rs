@@ -26,7 +26,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use common::wire::admin_signed_payload::CanaryDeploymentWire;
+use nn_proto::admin_signed_payload::CanaryDeploymentWire;
 
 /// Prefixes a canary may never be written under. A trailing `/`
 /// matches the subtree; `/var/lib/northnarrow/canary/` is carved back in

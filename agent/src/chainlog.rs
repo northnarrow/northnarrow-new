@@ -5504,7 +5504,7 @@ mod tests {
         use crate::detection_store::{DetectionRecord, DetectionStatus, Principal, StatusEvent};
         let detections: Vec<DetectionRecord> = (0..120)
             .map(|i| {
-                let event = common::Event::ProcessSpawn {
+                let event = nn_model::Event::ProcessSpawn {
                     pid: rng.random(),
                     ppid: rng.random(),
                     uid: rng.random(),
@@ -5522,12 +5522,12 @@ mod tests {
                     filename_truncated: false,
                     stdio: Default::default(),
                 };
-                let verdict = common::Verdict {
+                let verdict = nn_model::Verdict {
                     rule_id: text(&mut rng),
                     rule_name: text(&mut rng),
                     category: text(&mut rng),
-                    action: common::ResponseAction::Log,
-                    severity: common::Severity::High,
+                    action: nn_model::ResponseAction::Log,
+                    severity: nn_model::Severity::High,
                     reasoning: text(&mut rng),
                     event_pid: 1,
                     event_filename: text(&mut rng),
@@ -5538,7 +5538,7 @@ mod tests {
                     text(&mut rng),
                     &event,
                     &verdict,
-                    common::posture_types::PostureKind::Engaged,
+                    nn_model::posture_types::PostureKind::Engaged,
                     text(&mut rng),
                 );
                 d.confidence = loop {
@@ -5602,7 +5602,7 @@ mod tests {
             .map(|_| crate::fim::drain::FimDriftPayload {
                 ts: text(&mut rng),
                 path: text(&mut rng),
-                op: common::wire::FimOp::AttrChanged,
+                op: nn_model::telemetry::FimOp::AttrChanged,
                 baseline_sha256: opt(&mut rng),
                 new_sha256: opt(&mut rng),
                 modifier_pid: rng.random(),
@@ -5612,14 +5612,16 @@ mod tests {
                 decision_engine_skipped: rng.random(),
                 skip_reason: text(&mut rng),
                 agent_id: text(&mut rng),
-                attrs: rng.random_bool(0.5).then(|| common::wire::FileAttrChange {
-                    mode_before: rng.random(),
-                    mode_after: rng.random(),
-                    uid_before: rng.random(),
-                    uid_after: rng.random(),
-                    gid_before: rng.random(),
-                    gid_after: rng.random(),
-                }),
+                attrs: rng
+                    .random_bool(0.5)
+                    .then(|| nn_model::telemetry::FileAttrChange {
+                        mode_before: rng.random(),
+                        mode_after: rng.random(),
+                        uid_before: rng.random(),
+                        uid_after: rng.random(),
+                        gid_before: rng.random(),
+                        gid_after: rng.random(),
+                    }),
             })
             .collect();
         check(drifts);

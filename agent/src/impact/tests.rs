@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Event, FileBurstKind};
+use nn_model::{Event, FileBurstKind};
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -403,10 +403,10 @@ fn one_event_is_assessed_once() {
     assert_eq!(sampler.calls.load(Ordering::Relaxed), 1);
     assert_eq!(t.counts().decisive, 1);
     assert!(t
-        .assess(&Event::Fim(common::wire::FimEvent {
+        .assess(&Event::Fim(nn_model::telemetry::FimEvent {
             timestamp_ns: 0,
             path: "/x".into(),
-            op: common::wire::FimOp::Modified,
+            op: nn_model::telemetry::FimOp::Modified,
             new_sha256: None,
             baseline_sha256: None,
             new_size: None,

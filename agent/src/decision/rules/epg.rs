@@ -21,7 +21,7 @@
 //! evidence) reaches COMBAT only with corroboration while the guard is
 //! experimental (design note, "Response").
 
-use common::{EpgKind, Event, ResponseAction, Severity, Verdict};
+use nn_model::{EpgKind, Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
@@ -296,7 +296,7 @@ impl Rule for NnLEpg002NamespaceRootPostcondition {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use common::{CredView, SyscallAbi};
+    use nn_model::{CredView, SyscallAbi};
 
     pub(crate) fn epg_event(kind: EpgKind, killed: bool) -> Event {
         let user = CredView {
@@ -338,8 +338,8 @@ pub(crate) mod tests {
             exit_bypassed: false,
             timestamp_ns: 7,
             injected: false,
-            variant: common::GuardVariant::Strict,
-            caught_at: common::CatchPoint::SysExit,
+            variant: nn_model::GuardVariant::Strict,
+            caught_at: nn_model::CatchPoint::SysExit,
             baseline_lost: false,
             rebaselined: false,
         }
@@ -419,8 +419,8 @@ pub(crate) mod tests {
             variant, caught_at, ..
         } = &mut ev
         {
-            *variant = common::GuardVariant::Lite;
-            *caught_at = common::CatchPoint::Capable;
+            *variant = nn_model::GuardVariant::Lite;
+            *caught_at = nn_model::CatchPoint::Capable;
         }
         let v = NnLEpg001CredentialPostcondition
             .evaluate(&ev)
@@ -439,7 +439,7 @@ pub(crate) mod tests {
         } = &mut ev
         {
             *killed = false;
-            *caught_at = common::CatchPoint::Exec;
+            *caught_at = nn_model::CatchPoint::Exec;
         }
         assert!(
             response_line(&ev).contains("lite, detect, caught at exec"),
@@ -547,8 +547,8 @@ pub(crate) mod tests {
         } = &mut ev
         {
             *before = *after;
-            *variant = common::GuardVariant::Lite;
-            *caught_at = common::CatchPoint::Capable;
+            *variant = nn_model::GuardVariant::Lite;
+            *caught_at = nn_model::CatchPoint::Capable;
             *baseline_lost = true;
             *rebaselined = true;
         }
@@ -586,8 +586,8 @@ pub(crate) mod tests {
             ..
         } = &mut ev
         {
-            *variant = common::GuardVariant::Lite;
-            *caught_at = common::CatchPoint::FileOpen;
+            *variant = nn_model::GuardVariant::Lite;
+            *caught_at = nn_model::CatchPoint::FileOpen;
             *rebaselined = true;
         }
         let v = NnLEpg001CredentialPostcondition

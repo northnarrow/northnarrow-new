@@ -215,7 +215,7 @@ pub struct ForcePostureRequest {
 /// (design §7.2). Carries the full [`SignedPayload`] with
 /// `op = RotateKeysAdd` and `extra = RotateKeysAdd { new_pubkey,
 /// roles }`, plus a 2-of-N quorum (≥1 carrying
-/// [`common::wire::admin_signed_payload::Role::RotateKeys`] per
+/// [`crate::admin_signed_payload::Role::RotateKeys`] per
 /// §3.3). On verify, the agent atomically appends a new line to
 /// `/etc/northnarrow/admin.pub` (tmpfile + fsync + `rename(2)`)
 /// and reloads its in-memory key set so the next challenge
@@ -246,7 +246,7 @@ pub struct RotateKeysRevokeRequest {
 /// (with `op = FimBaseline` and `extra = FimBaseline {}`) plus
 /// a single signature — 1-of-N per §13 Q6 ("baseline is a
 /// workflow op, not a security gate"). Required role:
-/// [`common::wire::admin_signed_payload::Role::FimManage`].
+/// [`crate::admin_signed_payload::Role::FimManage`].
 /// `Vec<KeyedSignature>` is reused for shape consistency with
 /// the other Tappa-8 ops; the agent's quorum verify enforces
 /// `min_distinct=1`.
@@ -259,7 +259,7 @@ pub struct FimBaselineRequest {
 /// Tappa 9 commit C6 — signed FIM drift-log read request
 /// (design §6.3 + §13 Q6). Carries `op = FimReport` with the
 /// optional `since_unix_ts` filter in
-/// [`common::wire::admin_signed_payload::FimReportExtra`].
+/// [`crate::admin_signed_payload::FimReportExtra`].
 /// 1-of-N quorum (single-sig, `Role::FimRead` — the
 /// lower-privilege FIM role). Reply on the success path is a
 /// [`FimReportResponse`] carrying the JSONL-encoded chain
@@ -352,7 +352,7 @@ pub struct FimReportResponse {
 /// `op = Detections` with the bounded "last N" cap + optional
 /// filters (since/until time bounds, min_severity, status, sensor,
 /// path) in
-/// [`common::wire::admin_signed_payload::DetectionsExtra`].
+/// [`crate::admin_signed_payload::DetectionsExtra`].
 /// 1-of-N quorum (single-sig, `Role::TelemetryRead` — the
 /// lowest-privilege read-only role). Reply on the success path is a
 /// [`DetectionsResponse`] carrying the JSONL-encoded detection
@@ -394,7 +394,7 @@ pub struct DetectionsResponse {
 /// Tappa 9.0.c — signed detection triage status-change request.
 /// Carries `op = DetectionSetStatus` with the target detection id +
 /// new status (lowercase string) + optional note in
-/// [`common::wire::admin_signed_payload::DetectionSetStatusExtra`].
+/// [`crate::admin_signed_payload::DetectionSetStatusExtra`].
 /// 1-of-N quorum (single-sig, `Role::Triage`). On verify the agent
 /// appends a `StatusEvent` to the SEPARATE `status_events.jsonl`
 /// signed chain (event-sourced; `detections.jsonl` is never mutated)
@@ -435,7 +435,7 @@ pub struct DetectionSetStatusResponse {
 /// Tappa 9.5 commit K6 — signed canary deploy request. Carries
 /// `op = CanaryDeploy` with the operator's chosen canary name +
 /// type + deployment payload in
-/// [`common::wire::admin_signed_payload::CanaryDeployExtra`].
+/// [`crate::admin_signed_payload::CanaryDeployExtra`].
 /// 1-of-N quorum, `Role::CanaryManage` (§12 Q7 split-role
 /// lock-in).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,7 +482,7 @@ pub struct CanaryListResponse {
 
 /// Tappa 9.5 commit K6 — signed canary burn request. 1-of-N
 /// quorum, `Role::CanaryManage`. The `canary_id` field rides
-/// in [`common::wire::admin_signed_payload::CanaryBurnExtra`].
+/// in [`crate::admin_signed_payload::CanaryBurnExtra`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanaryBurnRequest {
     pub payload: SignedPayload,
@@ -1143,7 +1143,7 @@ pub enum DebugForcePosture {
 /// }`) plus the signature quorum. Verified 1-of-N (M=1) today — like
 /// COMBAT reactivation — but expressed through the quorum path so M can
 /// be raised without re-architecting. Required role:
-/// [`common::wire::admin_signed_payload::Role::TrustedInstaller`]. On
+/// [`crate::admin_signed_payload::Role::TrustedInstaller`]. On
 /// verify the agent arms the TTL'd FS-pin override and downgrades
 /// NN-L-FIM-009 for its OWN units for the (clamped) window's duration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3884,5 +3884,78 @@ mod tests {
     fn versioned_current_constructor_uses_protocol_version_constant() {
         let env = VersionedAdminMessage::current(AdminMessage::Status(StatusRequest {}));
         assert_eq!(env.version, PROTOCOL_VERSION);
+    }
+
+    /// Wave 4 restructure, R03 (lab PR 240): whole frames pinned, byte for
+    /// byte, as `main` 2e1438f encoded them before this module left
+    /// `common` (the variant index alone is pinned above). postcard and
+    /// serde are positional: a reordered or renamed variant or field, or a
+    /// type that moved and changed shape, shows here. Covers the signed
+    /// payload inside a frame and `PostureKind` (moved to nn-model by R02).
+    #[test]
+    fn encoded_frames_are_pinned() {
+        const STATUS_REQUEST: &str = "0000000102";
+        const CHALLENGE: &str =
+            "00000021031111111111111111111111111111111111111111111111111111111111111111";
+        const STATUS_RESPONSE: &str = concat!(
+            "0000004b050301012a0000010749534f4c4154450101000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
+        const SHUTDOWN_REQUEST: &str = concat!(
+            "0000007a0602abababababababababababababababababababababababababababababababab808f",
+            "b2af06cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd011e015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "5a5a5a5a5a5a",
+        );
+        const FORCE_POSTURE_REQUEST: &str = concat!(
+            "0000003a08030101010101010101010101010101010101010101010101010101010101010101818f",
+            "b2af0602020202020202020202020202020202020200",
+        );
+        const QUORUM_NOT_MET_V1: &str = "000000050107050201";
+
+        let frame = |m: AdminMessage| hex::encode(encode_frame(&m).unwrap());
+        assert_eq!(
+            frame(AdminMessage::Status(StatusRequest {})),
+            STATUS_REQUEST
+        );
+        let challenge = Challenge { nonce: [0x11; 32] };
+        assert_eq!(frame(AdminMessage::Challenge(challenge)), CHALLENGE);
+        let status = StatusResponse::public(
+            PostureKind::Combat,
+            true,
+            Some(42),
+            Some("ISOLATE".into()),
+            Some(true),
+        );
+        assert_eq!(frame(AdminMessage::StatusResponse(status)), STATUS_RESPONSE);
+        let shutdown = ShutdownRequest {
+            payload: SignedPayload::new_shutdown([0xAB; 32], 1_710_000_000, [0xCD; 16], 30),
+            signatures: vec![KeyedSignature::from([0x5A; 64])],
+        };
+        assert_eq!(
+            frame(AdminMessage::ShutdownRequest(shutdown)),
+            SHUTDOWN_REQUEST
+        );
+        let force = ForcePostureRequest {
+            payload: SignedPayload::new_force_posture(
+                [0x01; 32],
+                1_710_000_001,
+                [0x02; 16],
+                PostureKind::Engaged,
+            ),
+            signatures: Vec::new(),
+        };
+        assert_eq!(
+            frame(AdminMessage::ForcePostureRequest(force)),
+            FORCE_POSTURE_REQUEST
+        );
+        let quorum = VersionedAdminMessage::current(AdminMessage::ShutdownResult(
+            AdminResult::QuorumNotMet {
+                required: 2,
+                provided: 1,
+            },
+        ));
+        let versioned = hex::encode(encode_versioned_frame(&quorum).unwrap());
+        assert_eq!(versioned, QUORUM_NOT_MET_V1);
     }
 }

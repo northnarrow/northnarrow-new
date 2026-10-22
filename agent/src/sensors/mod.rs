@@ -1,5 +1,5 @@
 //! Sensors: kernel-side primitives that turn raw OS events into the
-//! common [`Event`](common::Event) enum consumed by the decision
+//! common [`Event`](nn_model::Event) enum consumed by the decision
 //! engine.
 //!
 //! Tappa 4 introduces the [`SensorMultiplexer`]: a single owner of

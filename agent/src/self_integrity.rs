@@ -853,7 +853,7 @@ pub fn config_overlays(dir: &Path) -> Vec<Finding> {
     let combat_kind = |p: &Path| {
         p.file_name()
             .and_then(|n| n.to_str())
-            .and_then(common::wire::admin_signed_payload::OverlayKind::from_keyword)
+            .and_then(nn_proto::admin_signed_payload::OverlayKind::from_keyword)
             .filter(|k| crate::config::overlay_auth::shipped_default(*k).is_some())
     };
     let mut paths: Vec<PathBuf> = entries
@@ -938,7 +938,7 @@ fn limits(watchdog_pidfile: &Path) -> Vec<(String, String)> {
 }
 
 /// The shutdown markers the watchdog refused, one JSON line each
-/// ([`common::shutdown_marker::RejectedRecord`]) at `path`.
+/// ([`nn_proto::shutdown_marker::RejectedRecord`]) at `path`.
 pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
     let Ok(body) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -946,7 +946,8 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
     body.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
-            let detail = match serde_json::from_str::<common::shutdown_marker::RejectedRecord>(l) {
+            let detail = match serde_json::from_str::<nn_proto::shutdown_marker::RejectedRecord>(l)
+            {
                 Ok(r) => format!(
                     "the watchdog refused a shutdown marker at {} (agent pid {}): {} [sha256 {}]",
                     r.at, r.agent_pid, r.reason, r.sha256
@@ -965,7 +966,7 @@ pub fn rejected_shutdowns(path: &Path) -> Vec<Finding> {
 }
 
 /// External audit DEP-004: the holds the watchdog recorded while the agent
-/// was down ([`common::watchdog_hold::HoldRecord`], one JSON line each) at
+/// was down ([`nn_proto::watchdog_hold::HoldRecord`], one JSON line each) at
 /// `path` — a respawn that brought no agent back (a start job queued for a
 /// unit that then failed or was skipped) or the restart ceiling. The same
 /// file carries the supervision events the watchdog cannot sign, each under
@@ -980,7 +981,7 @@ pub fn watchdog_holds(path: &Path) -> Vec<Finding> {
     body.lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
-            use common::watchdog_hold as wh;
+            use nn_proto::watchdog_hold as wh;
             let (kind, detail) = match serde_json::from_str::<wh::HoldRecord>(l) {
                 Ok(r) => {
                     let (kind, what) = match r.reason.as_str() {
@@ -1595,7 +1596,7 @@ impl Checker {
         let Some(kind) = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(common::wire::admin_signed_payload::OverlayKind::from_keyword)
+            .and_then(nn_proto::admin_signed_payload::OverlayKind::from_keyword)
         else {
             return false;
         };
@@ -1686,7 +1687,7 @@ impl Checker {
         self.apply(findings, unix_now(), at_boot);
         // External audit WDG-001: shutdown markers the watchdog refused
         // (forged, replayed or stale) while the agent was down.
-        let rejected = Path::new(common::shutdown_marker::REJECTED_PATH);
+        let rejected = Path::new(nn_proto::shutdown_marker::REJECTED_PATH);
         let found = rejected_shutdowns(rejected);
         if !found.is_empty() {
             for f in cap_per_kind(found) {
@@ -1696,7 +1697,7 @@ impl Checker {
         }
         // External audit DEP-004: the watchdog's holds (no agent after a
         // respawn, or the restart ceiling) while the agent was down.
-        let holds = Path::new(common::watchdog_hold::HOLD_PATH);
+        let holds = Path::new(nn_proto::watchdog_hold::HOLD_PATH);
         let found = watchdog_holds(holds);
         if !found.is_empty() {
             for f in cap_per_kind(found) {
@@ -1828,7 +1829,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("agent.shutdown_rejected");
         assert!(rejected_shutdowns(&path).is_empty());
-        let rec = common::shutdown_marker::RejectedRecord {
+        let rec = nn_proto::shutdown_marker::RejectedRecord {
             at: 1_800_000_000,
             agent_pid: 4242,
             reason: "the admin signatures do not authorise it".to_string(),
@@ -1883,7 +1884,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("watchdog.hold");
         assert!(watchdog_holds(&path).is_empty());
-        let rec = common::watchdog_hold::HoldRecord {
+        let rec = nn_proto::watchdog_hold::HoldRecord {
             at: 1_800_000_000,
             agent_pid: 4242,
             reason: "agent respawn failed".to_string(),
@@ -1891,7 +1892,7 @@ mod tests {
                 .to_string(),
             unit_state: Some("ActiveState=failed SubState=failed Result=exit-code".to_string()),
         };
-        let bare = common::watchdog_hold::HoldRecord {
+        let bare = nn_proto::watchdog_hold::HoldRecord {
             unit_state: None,
             ..rec.clone()
         };
@@ -1931,7 +1932,7 @@ mod tests {
     /// not as a hold.
     #[test]
     fn watchdog_events_are_signed_under_their_own_kind() {
-        use common::watchdog_hold::{
+        use nn_proto::watchdog_hold::{
             HoldRecord, REASON_ADMIN_SOCKET_VANISHED, REASON_RESPAWN_ARGV_DEGRADED,
         };
         let dir = tempfile::TempDir::new().unwrap();
@@ -1977,7 +1978,7 @@ mod tests {
     /// kind; a hold's retries and its end stay `watchdog_hold`.
     #[test]
     fn the_supervisors_failures_are_their_own_kind() {
-        use common::watchdog_hold as wh;
+        use nn_proto::watchdog_hold as wh;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("watchdog.hold");
         let ev = |reason: &str| wh::HoldRecord {

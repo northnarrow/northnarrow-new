@@ -47,8 +47,9 @@ use aya::maps::{ring_buf::RingBuf, MapData};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use common::wire::{NetFlowCloseRaw, NetFlowEvent, NetListenRaw, NetListenerEvent};
-use common::Event;
+use common::wire::{NetFlowCloseRaw, NetListenRaw};
+use nn_model::telemetry::{NetFlowEvent, NetListenerEvent};
+use nn_model::Event;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -728,7 +729,7 @@ async fn process_close_record(
                         debug!(
                             target: "net.drain",
                             pid = raw.pid,
-                            comm = %common::log_escape::Escaped(comm),
+                            comm = %nn_model::log_escape::Escaped(comm),
                             src = %src,
                             dst = %dst,
                             "net drain: TCP close without a connect-side flow (passive or pre-agent socket) — not recorded"
@@ -742,7 +743,7 @@ async fn process_close_record(
                         warn!(
                             target: "net.drain",
                             pid = raw.pid,
-                            comm = %common::log_escape::Escaped(comm),
+                            comm = %nn_model::log_escape::Escaped(comm),
                             src = %src,
                             dst = %dst,
                             corr_start_ns = corr_start_ns(&raw.flow_id),
@@ -860,8 +861,8 @@ async fn process_listen_record(
     };
     // External audit EBPF-013: listen() calls the kernel's record budgets
     // held back since this process's previous record.
-    let floods = common::sensor_floods(
-        common::FloodSource::Listen,
+    let floods = nn_model::sensor_floods(
+        nn_model::FloodSource::Listen,
         raw.pid,
         raw.uid,
         &ev.comm,
@@ -890,7 +891,7 @@ async fn process_listen_record(
 /// The canonical address (external audit NET-001: an IPv4-mapped IPv6
 /// address is the IPv4 address it maps).
 fn decode_addr(family: u8, bytes: [u8; 16]) -> IpAddr {
-    common::netaddr::canonical_ip(family, &bytes)
+    nn_model::netaddr::canonical_ip(family, &bytes)
 }
 
 fn comm_to_string(comm: &[u8; 16]) -> String {
@@ -965,7 +966,7 @@ fn format_ts(t: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::TlsFingerprint;
+    use nn_model::telemetry::TlsFingerprint;
     use std::net::Ipv4Addr;
 
     fn test_event() -> NetFlowEvent {
@@ -1049,7 +1050,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].pid, 4700);
         assert_eq!(rows[0].exe.as_deref(), Some("/var/tmp/nn-ms/stage2"));
-        assert_eq!(rows[0].phase, common::wire::FlowPhase::Snapshot);
+        assert_eq!(rows[0].phase, nn_model::telemetry::FlowPhase::Snapshot);
     }
 
     fn fresh_key() -> AgentSigningKey {

@@ -1,6 +1,6 @@
 //! `cow-guard.local`: the copy-on-first-write guard's configuration.
 //!
-//! A signed operator overlay ([`common::wire::admin_signed_payload::OverlayKind::CowGuard`]),
+//! A signed operator overlay ([`nn_proto::admin_signed_payload::OverlayKind::CowGuard`]),
 //! loaded through the overlay gate like the other `*.local` files: root
 //! cannot widen the trusted writers, shrink a scope or switch the guard
 //! off without an admin key carrying `config-manage`. Absent, refused or

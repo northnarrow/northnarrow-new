@@ -26,7 +26,7 @@ use common::bpf_cmd::{
     BPF_LINK_CREATE, BPF_LINK_DETACH, BPF_PROG_ATTACH, BPF_PROG_DETACH, BPF_PROG_LOAD,
 };
 use common::wire::{bpf_cmd_name, BPF_CMD_FOREIGN_GET_FD, BPF_CMD_FOREIGN_MAP_WRITE};
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::{CommAllowlist, Judgement};
 use crate::decision::attack::{AttackRef, Tactic};

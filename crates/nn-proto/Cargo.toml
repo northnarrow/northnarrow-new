@@ -11,7 +11,38 @@ publish = false
 
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
+# R03 (lab PR 240): `common`'s admin protocol, signed payloads, quorum,
+# shutdown marker and watchdog hold moved here with the dependencies they
+# had there, the same versions and features (one version each in the
+# workspace).
+[features]
+# Opt-in for the nn-admin debug surface (DebugForcePosture variant in
+# the admin protocol). Off by default; production builds never see it.
+# The agent crate forwards its own `debug-trigger` feature here.
+debug-trigger = []
+
 [dependencies]
+# R02 (lab PR 240): `PostureKind` is nn-model's (it was `common`'s, the one
+# item of `common` these modules named).
+nn-model = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+# Serde's auto-derive supports `[T; N]` only up to N=32 in stable;
+# UnlockRequest carries an Ed25519 sig as `[u8; 64]`. serde-big-array
+# unblocks the larger sizes without us hand-rolling Deserialize.
+serde-big-array = "0.5"
+# Tappa 8 commit A2 (admin_signed_payload).
+# ciborium: deterministic CBOR (RFC 8949) ser/de for SignedPayload.
+ciborium = "0.2"
+# sha2: SHA-512 for the signing digest. Same 0.11 as the agent's chains.
+sha2 = "0.11"
+# ed25519-dalek: signature primitives for sign/verify. Match the
+# agent's exact feature shape so the workspace resolves one version.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
+# External audit WDG-001: admin.pub parsing (hex) and the shutdown
+# marker (JSON) the watchdog verifies.
+hex = "0.4"
+serde_json = "1"
 
 [lints]
 workspace = true

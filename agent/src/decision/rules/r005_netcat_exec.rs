@@ -1,6 +1,6 @@
 //! R005 — Netcat-family tool launched. Alert only; netcat has legit uses.
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};

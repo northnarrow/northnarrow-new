@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::response_policy::{self, PolicySwitch};
@@ -140,7 +140,7 @@ impl Rule for NnLImp002RenameExtensionBurst {
         if !matches!(
             event,
             Event::FileBurst {
-                kind: common::FileBurstKind::RenameExtension,
+                kind: nn_model::FileBurstKind::RenameExtension,
                 ..
             }
         ) {
@@ -187,7 +187,7 @@ mod tests {
     use crate::impact::entropy::{Sample, Sampler};
     use crate::impact::trust::ProgramOwners;
     use crate::posture::lineage::AuthSessionTracker;
-    use common::FileBurstKind;
+    use nn_model::FileBurstKind;
 
     const S: u64 = 1_000_000_000;
 

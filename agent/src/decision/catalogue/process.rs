@@ -1,6 +1,6 @@
 //! The process rules (R001..R018).
 
-use common::{ResponseAction, Severity};
+use nn_model::{ResponseAction, Severity};
 
 use super::RuleDoc;
 use crate::detection_store::Sensor;

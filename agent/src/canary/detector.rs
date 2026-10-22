@@ -64,9 +64,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::wire::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use common::wire::InodeKey;
-use common::{CanaryAccessKind, CanaryTypeTag, Event};
+use nn_model::{CanaryAccessKind, CanaryTypeTag, Event};
+use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use parking_lot::Mutex;
 use tracing::{error, warn};
 
@@ -590,8 +590,8 @@ pub fn stat_inode_key(path: &Path) -> Option<InodeKey> {
 mod tests {
     use super::*;
     use crate::canary::registry::{CanaryTokenDraft, Registry};
-    use common::wire::FimEvent;
-    use common::wire::FimOp;
+    use nn_model::telemetry::FimEvent;
+    use nn_model::telemetry::FimOp;
     use tempfile::TempDir;
 
     fn build_detector(dir: &TempDir) -> (Detector, Arc<Mutex<Registry>>) {
@@ -1292,8 +1292,8 @@ mod tests {
             .evaluate(&trip)
             .expect("NN-L-CANARY-003 fires");
         assert_eq!(v.rule_id, "NN-L-CANARY-003_NetworkConnect");
-        assert_eq!(v.severity, common::Severity::Critical);
-        assert_eq!(v.action, common::ResponseAction::KillProcessTree);
+        assert_eq!(v.severity, nn_model::Severity::Critical);
+        assert_eq!(v.action, nn_model::ResponseAction::KillProcessTree);
         assert_eq!(v.event_pid, 4242);
     }
 
@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     fn flow_close(pid: u32, start_ns: u64, proto: u8) -> Event {
-        Event::NetFlow(common::wire::NetFlowEvent {
+        Event::NetFlow(nn_model::telemetry::NetFlowEvent {
             start_ns,
             end_ns: start_ns + 1_000,
             family: 2,
