@@ -36,7 +36,7 @@ agent being switched off.
 | (a) rewrites of existing files | `file_open` LSM, mass-write counter (`MASS_OVERWRITE`, existing) | 20 write-opens of existing regular files of ≥ 4 KiB in 60 s; or 40 by one cgroup's processes (each ≥ 3) |
 | (b) ciphertext-like content | userland sampling when (a), (c) or (c′) is read | ≥ 2 of up to 4 files (the one named, siblings changed in the window; for (c′) the copies only) with Shannon entropy ≥ 7.5 bits/byte in the first 4 KiB block or a middle one, and no known container signature |
 | (c) renames to a new extension | `inode_rename` LSM, new counter (`MASS_RENAME`) | 20 renames of regular files to **one** new extension in 60 s, the extension appended to the whole old name or replacing the old one; then, in userland, the encryptor's shape: half or more appended, or ≥ 3 changes of the original extension, or an extension of NN-L-FIM-010's list |
-| (c′) copies under a new extension | userland, when (d) is read | a copy named the deleted original's name with an extension appended exists (the new files' extension, else any: the crossing write may be a ransom note), and (b) holds on the copies of that shape — files `<original>.<suffix>` whose original is gone, changed in the window, in its directory, then below and beside it (≤ 4096 entries looked at) — never on the originals still waiting beside them |
+| (c′) copies under a new extension | userland, when (d) is read | a copy named the deleted original's name with an extension appended exists (the new files' extension, else any: the crossing write may be a ransom note), and (b) holds on the copies of that shape — files `<original>.<suffix>` whose original is gone, changed in the window, in its directory, then below and beside it (≤ 4096 entries looked at; never below a world-writable sticky directory such as `/tmp` nor beside a directory in one) — never on the originals still waiting beside them |
 | (d) deletion of originals after writing new files | `inode_unlink` LSM, new counter (`MASS_UNLINK`) | 20 unlinks of regular files of ≥ 4 KiB in 60 s, by an actor that crossed the new-file mass-write threshold in the window |
 
 **Any two distinct shapes within 120 s (two kernel windows) for one actor →
@@ -142,6 +142,17 @@ kill targets the nearest foreign program (the script, the payload).
   so an in-place run with no rename among originals changed in the last
   two minutes can miss (b) the same way: a residual (documents are rarely
   that fresh; (a)+(c) does not need (b)).
+- The copy walk went below and beside the burst's directory whatever
+  shared it (lab PR 232): a user's script with one plain copy in
+  `/tmp/job` was decisive on another tree's fresh copies of ciphertext
+  under the same suffix in `/tmp` — another user's or program's, or
+  planted by anyone to have a benign job judged an encryptor. It no
+  longer crosses a world-writable sticky directory (`/tmp`, `/var/tmp`,
+  `/dev/shm`): not below one, not beside a directory in one, not into one
+  found beside or below. A world-writable directory without the sticky
+  bit (a `0777` share) is walked: that is where an encryptor goes.
+  Residual: when the burst's own directory is a shared one, its copies are
+  counted whoever owns them (an owner match there is a follow-up).
 - Residuals: an intruder in an interactive session who encrypts with
   packaged tools only (`openssl`, `gpg` from that session) is a trusted
   writer here; an encryptor that forks a new process every few files stays

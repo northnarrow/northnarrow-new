@@ -339,6 +339,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- NN-L-IMP-001's copy-delete evidence looked for the copies below and
+  beside the burst's directory across a world-writable sticky directory
+  (lab PR 232): a user's script with one plain copy in `/tmp/job` was
+  decisive on another tree's fresh copies of ciphertext under the same
+  suffix elsewhere in `/tmp` — anyone's, and plantable. The copy walk no
+  longer goes below `/tmp`, `/var/tmp`, `/dev/shm` (`1777`) nor beside a
+  directory in one; that directory's own copies and the trees of ordinary
+  directories still count. The impact tests now work in a directory of
+  their own inside their `TempDir`: one read another's `.locked` copies
+  beside it in `/tmp` and failed on CI (PR 427).
 - NN-L-FIM-010 named a rename's destination DIRECTORY, so a watched file
   renamed `x → x.locked` never matched, and a rename inside a watched data
   directory (seen as the directory's creation of the new name) was not
