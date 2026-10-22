@@ -880,3 +880,23 @@ only in the table below, in the same PR as the evidence.
     chain uses it but the late exec still upgrades it to the three-step
     one; the flow ledger keeps one more chain verdict off its close.
   - Lab: On Ubuntu 22.04 (5.15, KVM guest ubuntu2204), the test alone, 30 runs per tree: `main` before #428 (4423267) 30/30 pass; `main` 8f52f5c 30/30, and 30/30, 30/30, 10/10 with 3, 8 and 16 `/bin/true` exec loops in the guest (the CI reorder not reproduced in the lab); this branch 30/30, and 30/30 with 8 exec loops; the whole `detection_rules_at_scale_privileged_e2e` suite 16 of 16. Host: `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` 2,913 passed, 0 failed (3 new unit tests of the late exec); the four clippy runs, `cargo fmt`, `attack-coverage --check`: pass.
+- **Lab PR 237 — the remaining dependencies refreshed (C27; Wave 4
+  Phase 2, D3a of the dependency plan; no level changes).**
+  - What was wrong: after D1 and D2 the lockfiles still trailed by 49
+    patch/minor entries at the root, 10 in the fuzzer and 9 in
+    agent-ebpf; nix was at 0.29 with 0.31 out (Dependabot #433); and
+    Dependabot's grouped cargo entry moved only the root `Cargo.lock`, so
+    its PR left `fuzz/Cargo.lock` behind on tokio or nix and
+    `security_crates_are_locked_alike_for_the_fuzzer` red (#413, redone
+    by hand in cc6ac72).
+  - What changed: nix 0.31.3 (the agent; `signal` and `process`, no
+    source change); `cargo update` of the three lockfiles (tokio 1.54.1,
+    cc 1.9, syn 2.0.119 / 3.0.9, zerocopy 0.8.63, …), aya-build held at
+    0.2.0, aya / aya-obj and the RustCrypto crates not moved (Dependabot
+    #435's aya-obj 0.5 does not fit aya 0.14's pin); the CLI stub's
+    unused `northnarrow-common` and `anyhow` removed; the grouped cargo
+    entry of `.github/dependabot.yml` covers `directories: ["/",
+    "/fuzz"]`, checked by `dependabot_moves_the_fuzz_lockfile_with_the_root_one`.
+    MSRV 1.89 unchanged; parking_lot 0.13 (MSRV 1.95) is left to D3b.
+    Supersedes Dependabot #433.
+  - Lab: QEMU guests (ubuntu2204 KVM, debian12); the tree c73d0a3 on `main` 60a65cb. Objects: the same tree path built with `main`'s and with this branch's `agent-ebpf/Cargo.lock` differ only in `.debug_str` (the crate hashes of the mangled names, same length): `.text`, every program and map section, `.BTF`, `.BTF.ext`, `.rodata`, `license` and the ELF symbols byte-identical; this branch's object cfa68c2b…. `nn-lab.sh verifier-check` with the branch's lab build (the object embedded, cfa68c2b…, and the synced copy): Ubuntu 22.04 (5.15.0-198) 77 programs, 75 OK, 2 ABSENT (the optional ACL deny hooks), 0 failing; Debian 12 (6.1.0-54) 77 programs, 75 OK, 2 ABSENT, 0 failing (fim_file_open_sensor 300,387 and exec_check_lsm 284,246 instructions processed, as in lab PR 233). `test-ignored` on Ubuntu 22.04: 56 suites, 80 passed, 0 failed (24.04 was in use by another lot). Host: `cargo +1.89.0 check --workspace --all-targets --locked`, `cargo xtask build-ebpf --release`, the four clippy runs with `-D warnings`, `cargo fmt --check`, `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` (2,914 passed, 0 failed, the golden replay included), `cargo xtask attack-coverage --check`, the fuzz job's build (nightly-2025-12-01, cargo-fuzz 0.13.2, `fuzz/Cargo.lock` `--locked`) and the replay of the 12 targets, `cargo audit` on the three lockfiles (0 vulnerabilities; the registered unsafe-libyaml exception): all pass.

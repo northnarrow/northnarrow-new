@@ -665,6 +665,23 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
+  dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
+  0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and
+  `cargo update` of the three lockfiles, patch and minor only — 49
+  entries in `Cargo.lock` (tokio 1.54.1, cc 1.9, bitflags 2.13, bytes
+  1.12, syn 2.0.119 and 3.0.9, zerocopy 0.8.63, among others), 10 in
+  `fuzz/Cargo.lock` (tokio and nix as in the root, the security crates
+  locked alike), 9 in `agent-ebpf/Cargo.lock` (proc-macro and build
+  crates; aya-build kept at 0.2.0). aya, aya-obj and the RustCrypto
+  crates do not move; parking_lot 0.13 waits for the MSRV 1.95 lot. The
+  MSRV stays 1.89. The eBPF object's code, maps, BTF and BTF.ext are
+  byte-identical to `main`'s; only `.debug_str` differs (the crate
+  hashes in mangled names). The CLI stub no longer depends on
+  `northnarrow-common` and `anyhow`, which it did not use.
+  `.github/dependabot.yml`: the grouped cargo entry covers `/` and
+  `/fuzz` (`directories`), so its patch/minor PR moves the fuzz lockfile
+  with the root one; an xtask test checks it.
 - RustCrypto's next generation, in one step (Wave 4 Phase 2, D2 of the
   dependency plan; lab PR 234): sha2 0.11 (agent, common, ebpf-guard,
   scan), hkdf and hmac 0.13, aes-gcm 0.11, md-5 0.11, ed25519-dalek 3

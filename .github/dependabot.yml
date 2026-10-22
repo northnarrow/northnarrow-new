@@ -3,8 +3,11 @@
 # regardless of the schedule below.
 version: 2
 updates:
+  # Lab PR 237: the fuzz lockfile moves with the root one, so a grouped
+  # bump does not leave security_crates_are_locked_alike_for_the_fuzzer
+  # red (#413 had to be redone by hand in cc6ac72).
   - package-ecosystem: cargo
-    directory: /
+    directories: ["/", "/fuzz"]
     schedule:
       interval: weekly
       day: monday

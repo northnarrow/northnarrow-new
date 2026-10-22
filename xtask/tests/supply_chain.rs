@@ -859,6 +859,69 @@ fn the_toolchain_is_pinned_and_the_msrv_is_checked() {
     );
 }
 
+/// Lab PR 237: a grouped patch/minor bump that moves only the root
+/// Cargo.lock leaves fuzz/Cargo.lock behind on the security crates, and
+/// `security_crates_are_locked_alike_for_the_fuzzer` goes red (#413). The
+/// cargo entry that carries the `rust-minor` group covers both lockfiles.
+#[test]
+fn dependabot_moves_the_fuzz_lockfile_with_the_root_one() {
+    let root = repo_root();
+    let dependabot: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&read(&root.join(".github/dependabot.yml"))).unwrap();
+    let updates = dependabot
+        .get("updates")
+        .and_then(|u| u.as_sequence())
+        .expect(".github/dependabot.yml has an `updates` list");
+    let dirs = |e: &serde_yaml_ng::Value| -> Vec<String> {
+        let mut out: Vec<String> = e
+            .get("directories")
+            .and_then(|d| d.as_sequence())
+            .map(|d| {
+                d.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(|x| x.trim_end_matches('/').to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(d) = str_of(e, "directory") {
+            out.push(d.trim_end_matches('/').to_string());
+        }
+        out
+    };
+    let grouped: Vec<&serde_yaml_ng::Value> = updates
+        .iter()
+        .filter(|e| {
+            str_of(e, "package-ecosystem") == Some("cargo")
+                && e.get("groups").and_then(|g| g.get("rust-minor")).is_some()
+        })
+        .collect();
+    assert_eq!(
+        grouped.len(),
+        1,
+        ".github/dependabot.yml needs exactly one cargo entry with the rust-minor group"
+    );
+    let covered = dirs(grouped[0]);
+    for want in ["", "/fuzz"] {
+        assert!(
+            covered.iter().any(|d| d == want),
+            "the rust-minor cargo entry must cover `{}` (directories: [\"/\", \"/fuzz\"]); \
+             it covers {covered:?}",
+            if want.is_empty() { "/" } else { want }
+        );
+    }
+    // The fuzz lockfile is not left to a second, ungrouped entry that
+    // would bump it on its own schedule.
+    let fuzz_elsewhere = updates.iter().any(|e| {
+        str_of(e, "package-ecosystem") == Some("cargo")
+            && !std::ptr::eq(e, grouped[0])
+            && dirs(e).iter().any(|d| d == "/fuzz")
+    });
+    assert!(
+        !fuzz_elsewhere,
+        "/fuzz belongs to the rust-minor cargo entry only"
+    );
+}
+
 /// SUP-015: the declared floor is not below what the locked dependencies
 /// declare for the platform the product ships on. cargo metadata runs
 /// offline: a workspace build has already downloaded those crates (CI's
