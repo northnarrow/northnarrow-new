@@ -302,7 +302,7 @@ impl RollbackFloor {
             }
             return false;
         }
-        if e.op == crate::self_integrity::AUDIT_OP
+        if e.op == crate::audit::INTEGRITY_DRIFT_OP
             && e.extra.get("kind").and_then(|k| k.as_str()) == Some(DRIFT_KIND)
         {
             if let Some(t) = e.extra.get("not_before").and_then(|t| t.as_u64()) {

@@ -319,7 +319,7 @@ planned = false
 
 [ratchet]
 nn-admin = 8
-nn-core = 44
+nn-core = 40
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

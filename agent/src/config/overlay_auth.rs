@@ -743,7 +743,7 @@ fn decision_entry(
 
 /// A signed `integrity_drift` entry.
 pub(crate) fn drift_entry(extra: serde_json::Value) -> AuditEntryDraft {
-    entry(crate::self_integrity::AUDIT_OP, "detected", extra)
+    entry(crate::audit::INTEGRITY_DRIFT_OP, "detected", extra)
 }
 
 pub(crate) fn entry(op: &str, result: &str, extra: serde_json::Value) -> AuditEntryDraft {
@@ -948,7 +948,7 @@ mod tests {
         );
         let pending = gate.pending.lock();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].op, crate::self_integrity::AUDIT_OP);
+        assert_eq!(pending[0].op, crate::audit::INTEGRITY_DRIFT_OP);
         assert_eq!(pending[0].extra["kind"], "default_list_unavailable");
     }
 
@@ -962,7 +962,7 @@ mod tests {
         gate.report_default_modified("process-comm-allowlist", &v1, "aa", "bb", false);
         let pending = gate.pending.lock();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].op, crate::self_integrity::AUDIT_OP);
+        assert_eq!(pending[0].op, crate::audit::INTEGRITY_DRIFT_OP);
         assert_eq!(pending[0].result, "detected");
         let extra = &pending[0].extra;
         assert_eq!(extra["kind"], "default_list_modified");
@@ -1185,7 +1185,7 @@ mod tests {
             ops,
             [
                 (
-                    crate::self_integrity::AUDIT_OP.to_string(),
+                    crate::audit::INTEGRITY_DRIFT_OP.to_string(),
                     super::super::overlay_floor::DRIFT_KIND.to_string()
                 ),
                 (

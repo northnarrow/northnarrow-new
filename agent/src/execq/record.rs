@@ -206,7 +206,7 @@ impl Recorder for SinkRecorder {
 
     fn degraded(&self, detail: &str) {
         self.append(
-            crate::self_integrity::AUDIT_OP,
+            crate::audit::INTEGRITY_DRIFT_OP,
             serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": false }),
             "detected",
         );
