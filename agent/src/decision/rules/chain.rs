@@ -281,10 +281,12 @@ impl Rule for NnLChain001CredReadThenEgress {
                 let mut store = self.buf.lock();
                 store.record_for_pid(fe.modifier_pid, PrecursorKind::CredRead, fe.timestamp_ns);
                 // Review 70: the read happened before an egress of the same
-                // process that was processed first (another ring).
+                // process that was processed first (another ring). Lab PR
+                // 235: claimed, so a `/tmp` exec processed later still
+                // completes CHAIN-007 with it.
                 let key = store.current_key(fe.modifier_pid);
                 let egress =
-                    store.take_egress_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
+                    store.claim_egress_after(key, fe.timestamp_ns, CORRELATION_WINDOW_NS)?;
                 Some(late_chain_verdict(
                     self,
                     &egress,
@@ -861,6 +863,49 @@ impl Rule for NnLChain007TmpCredExfilSequence {
                      then opened an outbound flow (the read was processed after \
                      the flow, in kernel order before it) — three-step dropper → \
                      credential-access → exfil chain (T1059 → T1555 → T1041); \
+                     kill the process tree + posture → COMBAT",
+                ))
+            }
+            // Lab PR 235: the staging exec of the chain was processed after
+            // the credential read and the egress (the exec ring's pump behind
+            // the open sensor's or FIM's and the connect pump), though it
+            // happened before both: the CI flake of 22/10/2026, where
+            // CHAIN-001 fired on the egress and this rule never did. The
+            // chain is judged on the kernel timestamps. On a hit the exec is
+            // observed and its `TmpExec` recorded here, as CHAIN-002 would
+            // (this verdict ends the rule pass); on a miss nothing changes.
+            Event::ProcessSpawn {
+                pid,
+                ppid,
+                filename,
+                exe,
+                timestamp_ns,
+                start_ns,
+                ..
+            } if crate::decision::rules::is_staging_path(exe.path_or(filename)) => {
+                let egress = self.buf.lock().exec_sequence_egress(
+                    *pid,
+                    *start_ns,
+                    *timestamp_ns,
+                    CORRELATION_WINDOW_NS,
+                )?;
+                if package_mediated(self.lineage.as_ref(), *pid, *timestamp_ns) {
+                    return None;
+                }
+                self.buf.lock().complete_exec_sequence(
+                    *pid,
+                    *ppid,
+                    *start_ns,
+                    *timestamp_ns,
+                    egress.start_ns,
+                );
+                Some(late_chain_verdict(
+                    self,
+                    &egress,
+                    "Process executed from a staging directory, then read a credential store, \
+                     then opened an outbound flow (the exec was processed after \
+                     the read and the flow, in kernel order before them) — three-step \
+                     dropper → credential-access → exfil chain (T1059 → T1555 → T1041); \
                      kill the process tree + posture → COMBAT",
                 ))
             }
@@ -1969,6 +2014,115 @@ mod tests {
             !other.iter().any(|id| id == C007 || id == C001),
             "{other:?}"
         );
+    }
+
+    /// A `/tmp` exec of the process started at `start_ns`, as the exec
+    /// sensor reports it (the start known).
+    fn tmp_exec_started(pid: u32, start_ns: u64, ts_ns: u64) -> Event {
+        let mut e = tmp_spawn(pid, ts_ns);
+        if let Event::ProcessSpawn { start_ns: s, .. } = &mut e {
+            *s = start_ns;
+        }
+        e
+    }
+
+    /// Lab PR 235: the `/tmp` exec of the chain was processed after the
+    /// credential read and the egress (CI, Ubuntu 22.04, 22/10/2026:
+    /// CHAIN-001 fired on the egress, CHAIN-007 never did). The exec now
+    /// completes CHAIN-007 on the kernel timestamps, naming the egress,
+    /// once; the exec is observed and its `TmpExec` kept.
+    #[test]
+    fn chain007_completes_when_the_exec_is_processed_after_the_read_and_the_egress() {
+        let rules = chain_rules();
+        assert!(first_verdict(&rules, &cred_fim(42, 11 * SEC)).is_none());
+        let on_flow = first_verdict(&rules, &flow(42, 443, 12 * SEC)).expect("CHAIN-001");
+        assert_eq!(on_flow.rule_id, C001);
+        let on_exec = first_verdict(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC))
+            .expect("late CHAIN-007");
+        assert_eq!(on_exec.rule_id, C007);
+        assert_eq!(
+            (on_exec.event_pid, on_exec.timestamp_ns),
+            (42, 12 * SEC),
+            "the verdict names the egress"
+        );
+        assert_eq!(on_exec.action, ResponseAction::KillProcessTree);
+        assert_eq!(on_exec.severity, Severity::Critical);
+        // The egress is spent; a re-exec of the same process completes
+        // nothing more, and the exec was recorded for the flows to come.
+        let again = first_verdict(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC + 5));
+        assert!(again.is_none(), "{again:?}");
+        assert_eq!(
+            first_verdict(&rules, &flow(42, 443, 13 * SEC)).map(|v| v.rule_id),
+            Some(C007.to_string()),
+            "in order now: exec, read, egress"
+        );
+    }
+
+    /// Lab PR 235 with the read processed last as well: egress, read
+    /// (CHAIN-001 late), then the exec (CHAIN-007).
+    #[test]
+    fn chain007_completes_when_the_egress_comes_first_and_the_exec_last() {
+        let rules = chain_rules();
+        assert!(first_verdict(&rules, &flow(42, 443, 12 * SEC)).is_none());
+        assert_eq!(
+            first_verdict(&rules, &cred_fim(42, 11 * SEC)).map(|v| v.rule_id),
+            Some(C001.to_string())
+        );
+        // the read's late CHAIN-001 claimed the egress: no second one
+        assert!(first_verdict(&rules, &cred_fim(42, 11 * SEC + 5)).is_none());
+        let on_exec = first_verdict(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC))
+            .expect("late CHAIN-007");
+        assert_eq!(on_exec.rule_id, C007);
+        assert_eq!(on_exec.timestamp_ns, 12 * SEC);
+    }
+
+    /// Lab PR 235: a late exec completes nothing out of kernel order — a
+    /// read before the exec, an egress before the read, a read of another
+    /// process, an exec outside the staging directories, an exec whose
+    /// start is unknown.
+    #[test]
+    fn a_late_exec_completes_only_the_ordered_sequence() {
+        let late_exec = |cred_ts: u64, cred_pid: u32, flow_ts: u64, exec: Event| {
+            let rules = chain_rules();
+            fire_ids(&rules, &cred_fim(cred_pid, cred_ts));
+            fire_ids(&rules, &flow(42, 443, flow_ts));
+            fire_ids(&rules, &exec)
+        };
+        let staged = tmp_exec_started(42, 9 * SEC, 10 * SEC);
+        for (what, fired) in [
+            (
+                "read before the exec",
+                late_exec(9 * SEC + 5, 42, 12 * SEC, staged.clone()),
+            ),
+            (
+                "egress before the read",
+                late_exec(11 * SEC, 42, 10 * SEC + 5, staged.clone()),
+            ),
+            (
+                "another process read",
+                late_exec(11 * SEC, 43, 12 * SEC, staged.clone()),
+            ),
+            (
+                "egress past the window",
+                late_exec(
+                    11 * SEC,
+                    42,
+                    10 * SEC + CORRELATION_WINDOW_NS + 1,
+                    staged.clone(),
+                ),
+            ),
+            ("start unknown", {
+                late_exec(11 * SEC, 42, 12 * SEC, tmp_exec_started(42, 0, 10 * SEC))
+            }),
+        ] {
+            assert!(!fired.iter().any(|id| id == C007), "{what}: {fired:?}");
+        }
+        let mut not_staged = tmp_exec_started(42, 9 * SEC, 10 * SEC);
+        if let Event::ProcessSpawn { filename, .. } = &mut not_staged {
+            *filename = "/usr/bin/dropper".to_string();
+        }
+        let fired = late_exec(11 * SEC, 42, 12 * SEC, not_staged);
+        assert!(!fired.iter().any(|id| id == C007), "not staged: {fired:?}");
     }
 
     #[test]

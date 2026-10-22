@@ -1429,6 +1429,13 @@ fn chain_cred_read_parent_then_descendant_egress_trips_chain_004() {
 /// refinement); the rule logic itself is covered by the chain.rs unit
 /// tests. The repro below is retained as the T10.6.2 starting point and
 /// is EXCLUDED from the D9 gating run (filter on `descendant_egress`).
+///
+/// Lab PR 235: the suite now runs detect-only (no kill race), and the
+/// CI flake of 22/10/2026 (Ubuntu 22.04) was the engine's order, not a
+/// kill: the exec record (its own ring and pump) was processed after the
+/// credential read and the connect, CHAIN-001 fired on the connect and
+/// CHAIN-007 never did. The exec now completes the chain on the kernel
+/// timestamps (`CorrelationStore::exec_sequence_egress`).
 #[test]
 #[ignore = "T10.6.2: same-PID tmp+cred+egress double-kill race (flaky) — deferred; rule logic unit-tested in chain.rs"]
 fn chain_tmp_then_cred_then_egress_trips_chain_007() {
