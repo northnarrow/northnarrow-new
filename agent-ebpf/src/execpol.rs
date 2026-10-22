@@ -21,7 +21,7 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, gen,
+        bpf_get_current_uid_gid, bpf_ktime_get_ns, generated,
     },
     macros::{lsm, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
@@ -123,21 +123,21 @@ fn slice(slot: u32) -> u64 {
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
     let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: *const u8) -> u16 {
     let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
     v.assume_init()
 }
 
@@ -203,7 +203,7 @@ unsafe fn tier_of(task: *const u8) -> u32 {
         return tier::UNKNOWN | sig | tier_sig::NO_SLICES;
     }
     // Level 1: the top-level slice the caller's cgroup is under.
-    let cg1 = gen::bpf_get_current_ancestor_cgroup_id(1);
+    let cg1 = generated::bpf_get_current_ancestor_cgroup_id(1);
     if cg1 != 0 && cg1 == sys {
         return tier::SERVICE | sig | tier_sig::SYSTEM_SLICE;
     }
@@ -443,7 +443,7 @@ unsafe fn fill_head(raw: *mut ExecPolRaw, task: *const u8) {
     };
     (*raw).timestamp_ns = bpf_ktime_get_ns();
     (*raw).start_ns = peek_u64(task.add(off!(TASK_STRUCT_START_TIME_OFFSET)));
-    (*raw).cgroup_id = gen::bpf_get_current_cgroup_id();
+    (*raw).cgroup_id = generated::bpf_get_current_cgroup_id();
     crate::comm::comm_into(&mut (*raw).comm);
 }
 
@@ -484,14 +484,14 @@ unsafe fn report_exec(
         (*raw).env_flags = (*e).flags;
         (*raw).env_count = (*e).count;
         (*raw).tunables_len = (*e).tunables_len;
-        let _ = gen::bpf_probe_read_kernel(
+        let _ = generated::bpf_probe_read_kernel(
             (*raw).preload.as_mut_ptr() as *mut c_void,
             (ENV_PRELOAD_LEN + ENV_AUDIT_LEN + ENV_TUNABLES_LEN + ENV_LIBPATH_LEN + ENV_HIST_LEN)
                 as u32,
             (*e).preload.as_ptr() as *const c_void,
         );
     }
-    let _ = gen::bpf_probe_read_kernel(
+    let _ = generated::bpf_probe_read_kernel(
         &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
         core::mem::size_of::<ExeIdentityRaw>() as u32,
         s as *const c_void,
@@ -589,7 +589,7 @@ unsafe fn env_scan(envp: u64) -> u32 {
     let mut i = 0usize;
     while i < ENV_SCAN_MAX {
         let mut ptr = 0u64;
-        if gen::bpf_probe_read_user(
+        if generated::bpf_probe_read_user(
             &mut ptr as *mut u64 as *mut c_void,
             8,
             (envp + (i as u64) * 8) as *const c_void,
@@ -611,7 +611,7 @@ unsafe fn env_scan(envp: u64) -> u32 {
             core::ptr::write_volatile(wp.add(z), 0);
             z += 1;
         }
-        let _ = gen::bpf_probe_read_user_str(
+        let _ = generated::bpf_probe_read_user_str(
             wp as *mut c_void,
             ENV_PREFIX_LEN as u32,
             ptr as *const c_void,
@@ -624,7 +624,7 @@ unsafe fn env_scan(envp: u64) -> u32 {
     if i == ENV_SCAN_MAX {
         // Was there a 65th?
         let mut ptr = 0u64;
-        let _ = gen::bpf_probe_read_user(
+        let _ = generated::bpf_probe_read_user(
             &mut ptr as *mut u64 as *mut c_void,
             8,
             (envp + (ENV_SCAN_MAX as u64) * 8) as *const c_void,
@@ -651,7 +651,7 @@ unsafe fn env_scan(envp: u64) -> u32 {
 unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
     if w0 == W_LD_PRELO && w1 & M3 == W_AD_EQ {
         (*e).flags |= env_flags::LD_PRELOAD;
-        let len = gen::bpf_probe_read_user_str(
+        let len = generated::bpf_probe_read_user_str(
             (*e).preload.as_mut_ptr() as *mut c_void,
             ENV_PRELOAD_LEN as u32,
             (ptr + 11) as *const c_void,
@@ -661,7 +661,7 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
         }
     } else if w0 == W_LD_AUDIT && w1 & M1 == u64::from(b'=') {
         (*e).flags |= env_flags::LD_AUDIT;
-        let len = gen::bpf_probe_read_user_str(
+        let len = generated::bpf_probe_read_user_str(
             (*e).audit.as_mut_ptr() as *mut c_void,
             ENV_AUDIT_LEN as u32,
             (ptr + 9) as *const c_void,
@@ -671,7 +671,7 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
         }
     } else if w0 == W_LD_LIBRA && w1 == W_RY_PATH {
         (*e).flags |= env_flags::LD_LIBRARY_PATH;
-        let len = gen::bpf_probe_read_user_str(
+        let len = generated::bpf_probe_read_user_str(
             (*e).libpath.as_mut_ptr() as *mut c_void,
             ENV_LIBPATH_LEN as u32,
             (ptr + 16) as *const c_void,
@@ -681,7 +681,7 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
         }
     } else if w0 == W_GLIBC_TU && w1 & M7 == W_NABLES {
         (*e).flags |= env_flags::GLIBC_TUNABLES;
-        let len = gen::bpf_probe_read_user_str(
+        let len = generated::bpf_probe_read_user_str(
             (*e).tunables.as_mut_ptr() as *mut c_void,
             ENV_TUNABLES_LEN as u32,
             (ptr + 15) as *const c_void,
@@ -689,7 +689,7 @@ unsafe fn scan_one(e: *mut EnvStashRaw, ptr: u64, w0: u64, w1: u64, w2: u64) {
         (*e).tunables_len = if len > 0 { (len - 1) as u32 } else { 0 };
     } else if w0 == W_HISTFILE && w1 & M1 == u64::from(b'=') {
         (*e).flags |= env_flags::HISTFILE;
-        let _ = gen::bpf_probe_read_user_str(
+        let _ = generated::bpf_probe_read_user_str(
             (*e).hist.as_mut_ptr() as *mut c_void,
             ENV_HIST_LEN as u32,
             (ptr + 9) as *const c_void,
@@ -759,12 +759,12 @@ unsafe fn list_staging(base: *const u8, len: usize) -> bool {
             if start && b == b'/' && i + 9 <= len {
                 let mut w = 0u64;
                 let mut nine = 0u8;
-                let _ = gen::bpf_probe_read_kernel(
+                let _ = generated::bpf_probe_read_kernel(
                     &mut w as *mut u64 as *mut c_void,
                     8,
                     base.add(i) as *const c_void,
                 );
-                let _ = gen::bpf_probe_read_kernel(
+                let _ = generated::bpf_probe_read_kernel(
                     &mut nine as *mut u8 as *mut c_void,
                     1,
                     base.add(i + 8) as *const c_void,
@@ -792,7 +792,7 @@ unsafe fn list_staging(base: *const u8, len: usize) -> bool {
 unsafe fn raw_arg(ctx: &LsmContext, i: usize) -> u64 {
     let args = ctx.as_ptr() as *const u64;
     let mut v = 0u64;
-    let _ = gen::bpf_probe_read_kernel(
+    let _ = generated::bpf_probe_read_kernel(
         &mut v as *mut u64 as *mut c_void,
         8,
         args.add(i) as *const c_void,
@@ -913,7 +913,7 @@ unsafe fn try_execmap(ctx: &LsmContext) -> i32 {
         (*raw).file_uid = peek_u32(inode.add(o & 0xffff));
     }
     if let Some(sc) = EXECMAP_SCRATCH.get_ptr(0) {
-        let _ = gen::bpf_probe_read_kernel(
+        let _ = generated::bpf_probe_read_kernel(
             &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
             core::mem::size_of::<ExeIdentityRaw>() as u32,
             sc as *const c_void,

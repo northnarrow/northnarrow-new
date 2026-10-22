@@ -30,7 +30,7 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_pid_tgid,
         bpf_get_current_task, bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel,
-        bpf_probe_read_kernel_buf, bpf_probe_read_kernel_str_bytes, gen,
+        bpf_probe_read_kernel_buf, bpf_probe_read_kernel_str_bytes, generated,
     },
     macros::{lsm, map},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
@@ -191,14 +191,14 @@ pub(crate) unsafe fn read_ptr(p: *const u8) -> *const u8 {
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
     let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
     v.assume_init()
 }
 
@@ -208,7 +208,7 @@ unsafe fn peek_u32(src: *const u8) -> u32 {
 unsafe fn peek_name(dentry: *const u8, name_off: usize, dst: *mut u8) {
     zero32(dst);
     let name = peek_u64(dentry.add(name_off)) as *const c_void;
-    let _ = gen::bpf_probe_read_kernel_str(dst as *mut c_void, OPEN_NAME_LEN as u32, name);
+    let _ = generated::bpf_probe_read_kernel_str(dst as *mut c_void, OPEN_NAME_LEN as u32, name);
 }
 
 /// `(dev, ino)` of `inode` as `stat()` reports it (review 55); dev 0 /

@@ -1,6 +1,6 @@
 //! Hard-coded kernel struct field offsets — the single source of truth.
 //!
-//! aya-ebpf 0.1 emits no CO-RE field relocations, so every kernel
+//! aya-ebpf (0.1, 0.2) emits no CO-RE field relocations: every kernel
 //! pointer dereference in the LSM hooks and sensors goes through one of
 //! these byte offsets plus `bpf_probe_read_kernel`. The values are
 //! hard-coded for x86_64 Linux 6.8.x (Ubuntu 24.04), captured from

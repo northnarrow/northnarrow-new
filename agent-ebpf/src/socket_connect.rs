@@ -24,7 +24,7 @@
 
 use aya_ebpf::{
     cty::c_void,
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, gen},
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, generated},
     macros::{lsm, map},
     maps::{lpm_trie::Key, Array, LpmTrie},
     programs::LsmContext,
@@ -53,21 +53,21 @@ const EPERM: i32 = -1;
 #[inline(always)]
 unsafe fn peek_u64(src: u64) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: u64) -> u32 {
     let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: u64) -> u16 {
     let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
     v.assume_init()
 }
 

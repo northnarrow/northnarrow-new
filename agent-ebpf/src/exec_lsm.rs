@@ -25,7 +25,7 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, gen,
+        bpf_ktime_get_ns, generated,
     },
     macros::{lsm, map},
     maps::{LruHashMap, PerCpuArray},
@@ -67,14 +67,14 @@ pub(crate) static EXEC_SCRATCH: PerCpuArray<ExeIdentityRaw> = PerCpuArray::with_
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
     let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
     v.assume_init()
 }
 
@@ -167,12 +167,12 @@ unsafe fn try_exec_check_lsm(ctx: &LsmContext) -> i32 {
             let parent = peek_u64(task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET))) as *const u8;
             (*raw).ppid = peek_u32(parent.add(off!(TASK_STRUCT_TGID_OFFSET)));
             crate::comm::comm_into(&mut (*raw).comm);
-            let _ = gen::bpf_probe_read_kernel_str(
+            let _ = generated::bpf_probe_read_kernel_str(
                 (*raw).filename.as_mut_ptr() as *mut c_void,
                 FILENAME_LEN as u32,
                 filename as *const c_void,
             );
-            let _ = gen::bpf_probe_read_kernel(
+            let _ = generated::bpf_probe_read_kernel(
                 &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
                 core::mem::size_of::<ExeIdentityRaw>() as u32,
                 s as *const c_void,
@@ -235,7 +235,7 @@ pub(crate) unsafe fn exe_walk(s: *mut ExeIdentityRaw, dentry: *const u8, task_ro
         }
         let slot = exe_path_slot(level);
         let name = peek_u64(d.add(o_name)) as *const c_void;
-        let _ = gen::bpf_probe_read_kernel_str(
+        let _ = generated::bpf_probe_read_kernel_str(
             path.add(slot * EXE_PATH_SLOT_LEN) as *mut c_void,
             EXE_PATH_SLOT_LEN as u32,
             name,

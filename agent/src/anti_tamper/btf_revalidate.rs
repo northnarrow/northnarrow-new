@@ -1,7 +1,7 @@
 //! Boot-time BTF offset revalidation (BUG-036).
 //!
 //! The eBPF half compiles in fixed kernel struct offsets
-//! ([`common::btf_offsets`]) because aya-ebpf 0.1 has no CO-RE. If the
+//! ([`common::btf_offsets`]) because aya-ebpf (0.2) has no CO-RE. If the
 //! running kernel's struct layout differs from what those offsets
 //! assume (a kernel upgrade, a different distro), every dependent LSM
 //! decision and sensor read operates on the WRONG kernel memory —

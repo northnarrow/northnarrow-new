@@ -25,7 +25,7 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_current_task,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, gen,
+        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel, generated,
     },
     macros::{fentry, map, raw_tracepoint},
     maps::{ring_buf::RingBufEntry, Array, HashMap, PerCpuArray, RingBuf},
@@ -159,7 +159,7 @@ pub(crate) unsafe fn rd<T>(addr: u64) -> Option<T> {
 #[inline(always)]
 pub(crate) unsafe fn peek<T>(addr: u64) -> T {
     let mut v = core::mem::MaybeUninit::<T>::uninit();
-    let _ = gen::bpf_probe_read_kernel(
+    let _ = generated::bpf_probe_read_kernel(
         v.as_mut_ptr() as *mut aya_ebpf::cty::c_void,
         core::mem::size_of::<T>() as u32,
         addr as *const aya_ebpf::cty::c_void,
@@ -305,7 +305,7 @@ pub(crate) struct Finding {
 pub(crate) unsafe fn respond(c: &GuardConfig) -> u8 {
     count(counter::ANOMALIES);
     if c.mode == cfg::MODE_ENFORCE {
-        if gen::bpf_send_signal(SIGKILL) == 0 {
+        if generated::bpf_send_signal(SIGKILL) == 0 {
             count(counter::KILLS);
             action::KILLED
         } else {

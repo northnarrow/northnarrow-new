@@ -33,7 +33,7 @@
 
 use aya_ebpf::{
     bindings::task_struct,
-    helpers::{bpf_get_current_task, gen},
+    helpers::{bpf_get_current_task, generated},
     macros::{btf_tracepoint, fentry, lsm, map},
     maps::LruHashMap,
     programs::{BtfTracePointContext, FEntryContext, LsmContext},
@@ -96,7 +96,7 @@ unsafe fn real_cred(c: &GuardConfig, task: u64) -> Option<u64> {
 /// The call the current task (`task`) is in: `(abi, nr, in_syscall)`.
 #[inline(always)]
 unsafe fn current_call(c: &GuardConfig, task: u64) -> (u8, u32, bool) {
-    let regs = gen::bpf_task_pt_regs(gen::bpf_get_current_task_btf()) as u64;
+    let regs = generated::bpf_task_pt_regs(generated::bpf_get_current_task_btf()) as u64;
     if regs == 0 {
         return (abi::NONE, NO_SYSCALL, false);
     }
@@ -291,7 +291,7 @@ unsafe fn use_point_found(
     };
     if (*s).flags & lf::TAINTED != 0 && c.mode == cfg::MODE_ENFORCE {
         // Already found: every further use is refused.
-        let _ = gen::bpf_send_signal(SIGKILL);
+        let _ = generated::bpf_send_signal(SIGKILL);
         count(counter::DENIED);
         return -EPERM;
     }

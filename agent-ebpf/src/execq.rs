@@ -24,7 +24,7 @@
 //! (`PROTECTED_PIDS`) are never stopped.
 use aya_ebpf::{
     cty::c_void,
-    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, gen},
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns, generated},
     macros::map,
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
 };
@@ -105,21 +105,21 @@ pub(crate) fn armed() -> bool {
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
     let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: *const u8) -> u16 {
     let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
     v.assume_init()
 }
 
@@ -330,7 +330,7 @@ pub(crate) unsafe fn note_pass(
             0
         };
     (*cand)._pad = 0;
-    let _ = gen::bpf_probe_read_kernel(
+    let _ = generated::bpf_probe_read_kernel(
         &mut (*cand).exe as *mut ExeIdentityRaw as *mut c_void,
         core::mem::size_of::<ExeIdentityRaw>() as u32,
         s as *const c_void,
@@ -394,7 +394,7 @@ unsafe fn refuse_script(cand: *const ExecqCandRaw, task: u64) -> bool {
     (*raw).flags = (*cand).flags | stop_flags::SCRIPT | stop_flags::SCRIPT_REFUSED;
     (*raw).stop_rc = -EACCES;
     crate::comm::comm_into(&mut (*raw).comm);
-    let _ = gen::bpf_probe_read_kernel(
+    let _ = generated::bpf_probe_read_kernel(
         &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
         core::mem::size_of::<ExeIdentityRaw>() as u32,
         &(*cand).exe as *const ExeIdentityRaw as *const c_void,
@@ -458,7 +458,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
     (*raw).class = (*cand).class;
     let mut flags = (*cand).flags;
     crate::comm::comm_into(&mut (*raw).comm);
-    let _ = gen::bpf_probe_read_kernel(
+    let _ = generated::bpf_probe_read_kernel(
         &mut (*raw).exe as *mut ExeIdentityRaw as *mut c_void,
         core::mem::size_of::<ExeIdentityRaw>() as u32,
         &(*cand).exe as *const ExeIdentityRaw as *const c_void,
@@ -467,7 +467,7 @@ pub(crate) unsafe fn maybe_stop(task: *const u8) {
     if m == mode::ENFORCE {
         // Pending from here: delivered on the exit to user mode, before
         // the new image's first instruction.
-        let rc = gen::bpf_send_signal(SIGSTOP);
+        let rc = generated::bpf_send_signal(SIGSTOP);
         (*raw).stop_rc = rc as i32;
         if rc == 0 {
             let v = ExecqStopped {
