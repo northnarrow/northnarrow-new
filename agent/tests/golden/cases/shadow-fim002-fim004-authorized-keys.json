@@ -1,0 +1,87 @@
+{
+ "about": "Lab PR 236 (multi-match): a new ~/.ssh/authorized_keys created under /home by a user's program. NN-L-FIM-002 (a file created in a watched user-writable directory: Medium, recorded) used to win first-match and NN-L-FIM-004 (High, kill) was never recorded. Now both match and FIM-004 is primary (High); its kill is held by the legacy ceiling (the first-match engine ran only FIM-002's record: an administrator's ssh-copy-id is not killed) until a signed policy says `enforce NN-L-FIM-004` (policy-fim004-enforced).",
+ "fires": [
+  "NN-L-FIM-002_NewSuidBinary",
+  "NN-L-FIM-004_AuthorizedKeysModified"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6000001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "sshd",
+     "filename": "/usr/sbin/sshd",
+     "timestamp_ns": 100000000000,
+     "argv": [
+      "sshd: u [priv]"
+     ],
+     "parent_comm": "",
+     "start_ns": 99999000000,
+     "exe": {
+      "path": "/usr/sbin/sshd"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6000002,
+     "ppid": 6000001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 101000000000,
+     "argv": [
+      "-bash"
+     ],
+     "parent_comm": "sshd",
+     "start_ns": 100999000000,
+     "exe": {
+      "path": "/usr/bin/bash"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6200003,
+     "ppid": 6000002,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "implant",
+     "filename": "/home/u/.local/bin/implant",
+     "timestamp_ns": 3600000000000,
+     "argv": [
+      "/home/u/.local/bin/implant"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3599999000000,
+     "exe": {
+      "path": "/home/u/.local/bin/implant"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3601000000000,
+     "path": "/home/u/.ssh/authorized_keys",
+     "op": 2,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/home/u/.local/bin/implant",
+     "modifier_pid": 6200003,
+     "modifier_uid": 1000,
+     "modifier_comm": "implant"
+    }
+   }
+  }
+ ]
+}

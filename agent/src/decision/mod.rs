@@ -12,19 +12,24 @@
 //! - Each rule has a stable, immutable id (`R<NNN>_Name`). Once an id
 //!   ships it never changes meaning; a deprecated rule keeps the slot
 //!   and is retired in code only.
-//! - The first matching rule wins. (Tappa 6 fed what no rule matched to an
-//!   on-host LLM advisor; it was removed in Wave 4, lab PR 214, and
-//!   detection stays deterministic.)
+//! - Every rule judges every event (lab PR 236, multi-match): the decision
+//!   is computed from all the matches under the signed per-rule policy
+//!   ([`combine`], [`rule_policy`]). It used to be the first match. (Tappa 6
+//!   fed what no rule matched to an on-host LLM advisor; it was removed in
+//!   Wave 4, lab PR 214, and detection stays deterministic.)
 
 use common::{Event, Verdict};
 
 pub mod attack;
 pub mod bounded;
 pub mod catalogue;
+pub mod combine;
 pub mod correlation;
 pub mod engine;
 pub mod flow_ledger;
+pub mod replay;
 pub mod response_policy;
+pub mod rule_policy;
 pub mod rules;
 
 pub use engine::RuleEngine;

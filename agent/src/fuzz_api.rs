@@ -464,6 +464,30 @@ mod tests {
         assert!(!all.contains(&"10.0.0.9".parse().unwrap()), "{all:?}");
     }
 
+    /// Lab PR 236: the rule-policy seeds reach both sides — a policy of
+    /// every directive accepted, and refusals (an exemption by name, of
+    /// uid 0, of a staged executable) named by their line.
+    #[test]
+    fn rule_policy_seeds_reach_acceptance_and_refusal() {
+        use crate::decision::rule_policy::parse;
+        let (mut ok, mut refused) = (0, 0);
+        for (name, bytes) in inputs("seeds", "rule_policy") {
+            match parse(text(&bytes)) {
+                Ok(p) => {
+                    assert!(p.modes().count() >= 4, "{name}");
+                    assert!(p.all_exemptions().next().is_some(), "{name}");
+                    assert!(p.ransomware_combat_without_corroboration, "{name}");
+                    ok += 1;
+                }
+                Err(e) => {
+                    assert_eq!(e.line, 2, "{name}: {e}");
+                    refused += 1;
+                }
+            }
+        }
+        assert!(ok >= 1 && refused >= 2, "ok {ok}, refused {refused}");
+    }
+
     #[test]
     fn text_and_binary_seeds_reach_the_asserted_paths() {
         use crate::anti_tamper::combat_allow::{

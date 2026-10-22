@@ -2681,6 +2681,37 @@ fn dispatch_config_overlay_set(
         Err(e) => return refuse(AdminResult::Success, format!("{e:#}")),
     };
     match overlay_auth::store(&target, &req.content, &sig) {
+        // Lab PR 236: the per-rule policy is put in force at once, between
+        // two events; the signed `config_overlay_set` row records it
+        // (`applied` in its detail).
+        Ok(sig_file)
+            if extra.kind == common::wire::admin_signed_payload::OverlayKind::RulePolicy =>
+        {
+            use crate::decision::rule_policy as rp;
+            let boot = rp::boot_policy(Some((&target, &req.content)));
+            let summary = boot.policy.summary();
+            let source = boot.policy.source.clone();
+            let previous = rp::install_global(boot.policy);
+            warn!(
+                target: "admin.config_overlay",
+                path = %target.display(),
+                source = %source,
+                summary = %summary,
+                previous = %previous.source,
+                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                "signed per-rule response policy stored and applied"
+            );
+            ConfigOverlaySetResponse {
+                result: AdminResult::Success,
+                stored: true,
+                message: format!(
+                    "{} and {} written; applied now ({summary}; replaces {})",
+                    target.display(),
+                    sig_file.display(),
+                    previous.source
+                ),
+            }
+        }
         Ok(sig_file) => {
             info!(
                 target: "admin.config_overlay",

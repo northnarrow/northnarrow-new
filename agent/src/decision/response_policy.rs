@@ -12,17 +12,18 @@
 //! existed before (same rule, same match) is not held.
 //!
 //! A held verdict never stands in for a response that existed before it:
-//! the engine (first match wins) learns from [`take_held`] that a rule's
-//! verdict was held, keeps evaluating, and returns a later rule's
-//! destructive verdict when one fires — the response that rule gave before
-//! the hold existed — or else the held alert (which outranks a later
-//! rule's record).
+//! the engine evaluates every rule (lab PR 236, multi-match) and runs the
+//! strongest response any match allows, so another rule's kill on the same
+//! event still runs.
 //!
-//! Phase 2 wires each switch to the signed per-rule policy. Until then the
-//! constants below are the only values production uses; tests turn a switch
-//! on ([`PolicySwitch::enabled`]) to keep the held response exercised.
+//! Lab PR 236 wired the switches to the signed per-rule response policy
+//! ([`super::rule_policy`]): the constants below are its built-in defaults.
+//! [`PolicySwitch::hold`] keeps the response it held ([`take_held`]); the
+//! engine gives it back to a rule the policy says `enforce`. Tests turn a
+//! switch on ([`PolicySwitch::enabled`]) to keep the held response
+//! exercised.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 
 use common::{ResponseAction, Verdict};
 
@@ -50,32 +51,50 @@ impl PolicySwitch {
 
     /// `v` as the rule built it when the switch is on, or when its action
     /// is already `Log`. Otherwise its action becomes `Log`, its reasoning
-    /// says what was held back, and the engine is told ([`take_held`]).
+    /// says what was held back, and the engine is told, with the response
+    /// held ([`take_held`]).
     pub fn hold(self, mut v: Verdict) -> Verdict {
         if self.on || v.action == ResponseAction::Log {
             return v;
         }
+        let original = Held {
+            action: v.action.clone(),
+            reasoning: v.reasoning.clone(),
+            switch: self.held,
+        };
         v.reasoning = format!(
             "{} [held back: {} — alert only, by default, until the signed per-rule response \
              policy enables it]",
             v.reasoning, self.held
         );
         v.action = ResponseAction::Log;
-        HELD.with(|h| h.set(true));
+        HELD.with(|h| {
+            // The first hold of a rule's verdict keeps what the rule built.
+            h.borrow_mut().get_or_insert(original);
+        });
         v
     }
+}
+
+/// What [`PolicySwitch::hold`] held back: the rule's own action and
+/// reasoning, before the hold, and the switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub action: ResponseAction,
+    pub reasoning: String,
+    pub switch: &'static str,
 }
 
 thread_local! {
     /// Set by [`PolicySwitch::hold`] when it held a response; read and
     /// cleared by the engine around each rule.
-    static HELD: Cell<bool> = const { Cell::new(false) };
+    static HELD: RefCell<Option<Held>> = const { RefCell::new(None) };
 }
 
-/// Whether a response was held on this thread since the last call (and
+/// The response held on this thread since the last call, if any (and
 /// clear it). The engine calls it before and after each rule.
-pub fn take_held() -> bool {
-    HELD.with(|h| h.replace(false))
+pub fn take_held() -> Option<Held> {
+    HELD.with(|h| h.borrow_mut().take())
 }
 
 /// R020 (lab PR 224, new rule).
@@ -194,8 +213,11 @@ mod tests {
             .reasoning
             .starts_with("why; kill the process tree [held back: "));
         assert!(v.reasoning.contains("per-rule response policy"));
-        assert!(take_held());
-        assert!(!take_held(), "read once");
+        let held = take_held().expect("held");
+        assert_eq!(held.action, ResponseAction::KillProcessTree);
+        assert_eq!(held.reasoning, "why; kill the process tree");
+        assert_eq!(held.switch, R020_KILL.held);
+        assert!(take_held().is_none(), "read once");
     }
 
     /// A rule for the engine tests: fires on every event with `action`,
@@ -286,6 +308,6 @@ mod tests {
         log.action = ResponseAction::Log;
         let l = R020_KILL.hold(log.clone());
         assert_eq!(l.reasoning, log.reasoning);
-        assert!(!take_held());
+        assert!(take_held().is_none());
     }
 }

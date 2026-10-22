@@ -113,3 +113,10 @@ path = "fuzz_targets/resolv_conf.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rule_policy"
+path = "fuzz_targets/rule_policy.rs"
+test = false
+doc = false
+bench = false

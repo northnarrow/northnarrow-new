@@ -741,10 +741,15 @@ pub enum OverlayKind {
     /// `audit <class>`, `preload <tier> <action>`, `map <class> <tier>
     /// <action>`, `exempt <path> [classes]`, `profile server|desktop`).
     ExecPolicy = 14,
+    /// Lab PR 236: `rule-policy.local` — the per-rule response policy
+    /// (`enforce|alert|audit|off <rule>`, `exempt <rule> uid|exe|cgroup|unit
+    /// …`, `combat-without-corroboration NN-L-IMP-001`). Without it every
+    /// rule keeps its built-in response, the held kills held.
+    RulePolicy = 15,
 }
 
 impl OverlayKind {
-    pub const ALL: [OverlayKind; 14] = [
+    pub const ALL: [OverlayKind; 15] = [
         OverlayKind::FimPaths,
         OverlayKind::ProcessCommAllowlist,
         OverlayKind::NetflowCommAllowlist,
@@ -759,6 +764,7 @@ impl OverlayKind {
         OverlayKind::CowGuard,
         OverlayKind::ExecqHashes,
         OverlayKind::ExecPolicy,
+        OverlayKind::RulePolicy,
     ];
 
     /// CLI / log keyword (`nn-admin config overlay set <keyword>`).
@@ -778,6 +784,7 @@ impl OverlayKind {
             OverlayKind::CowGuard => "cow-guard",
             OverlayKind::ExecqHashes => "execq-hashes",
             OverlayKind::ExecPolicy => "exec-policy",
+            OverlayKind::RulePolicy => "rule-policy",
         }
     }
 
@@ -828,6 +835,7 @@ impl TryFrom<u8> for OverlayKind {
             12 => Ok(Self::CowGuard),
             13 => Ok(Self::ExecqHashes),
             14 => Ok(Self::ExecPolicy),
+            15 => Ok(Self::RulePolicy),
             other => Err(SignedPayloadError::UnknownOverlayKind(other)),
         }
     }
@@ -1990,6 +1998,7 @@ mod tests {
             (OverlayKind::CowGuard, 12, "cow-guard"),
             (OverlayKind::ExecqHashes, 13, "execq-hashes"),
             (OverlayKind::ExecPolicy, 14, "exec-policy"),
+            (OverlayKind::RulePolicy, 15, "rule-policy"),
         ] {
             assert_eq!(u8::from(k), byte);
             assert_eq!(OverlayKind::try_from(byte).unwrap(), k);

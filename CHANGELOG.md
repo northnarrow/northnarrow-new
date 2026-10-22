@@ -6,6 +6,51 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Multi-match decisions and the signed per-rule response policy (lab PR
+  236, Wave 4 phase 2, C14/C12; `docs/design/MULTI_MATCH_AND_RULE_POLICY.md`,
+  `docs/operator/RULE_POLICY.md`). **Multi-match.** The engine evaluates
+  every rule on every event (it stopped at the first match), so every
+  stateful rule — chains, windows, accumulators, the correlation store —
+  sees every event, and computes the decision from all the matches: the
+  strongest action any match's mode allows, run once per target (a process,
+  or a file for `StripFileCapability`); the highest severity; a primary rule
+  (the highest severity, then the strongest action, then the earliest
+  registered); every tie ends on the registration index, so a stream gives
+  the same decisions on every run and thread. **Legacy ceiling:** without a
+  signed `enforce` for the rule supplying it, no event gets a stronger
+  response than the first-match engine gave it (computed from the same
+  matches, the switches applied, `off` rules included); a match held by it
+  is recorded with `held: "legacy_ceiling"` and `held_action`. A detection record names the
+  primary rule in `rule_id`, every match in the new `matches` field (rule,
+  action, severity, mode, pid, ATT&CK ids, `held`, `exempt`; absent on a
+  single-match record under the built-in defaults, which keeps its bytes),
+  and the union of their ATT&CK ids in `mitre` (`held_action`: what a
+  switch or the ceiling held back); the journal line lists the
+  other rules (`also`). The flow ledger notes every matched rule. **Policy.**
+  The signed overlay `rule-policy.local` (`OverlayKind::RulePolicy = 15`,
+  appended; role `config-manage`) maps a rule (full or short id) to `off`,
+  `audit` (recorded only), `alert` (recorded and counted, no response) or
+  `enforce` (its own response, a held kill given back), exempts an actor
+  from a rule by uid (not 0), executable (a root-owned system-tree path
+  and its SHA-256, checked on the opened file), cgroup or systemd unit —
+  never by process name — and carries `combat-without-corroboration
+  NN-L-IMP-001` (the runtime form of
+  `RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`). Any bad line refuses the
+  file. The `PolicySwitch` constants are its built-in defaults: without a
+  policy every held kill stays held and every other rule keeps its
+  response. The agent reads it through the overlay gate at boot
+  (`--rule-policy-local`; a signed `rule_policy_loaded` row; unsigned:
+  `unauthorized_overlay`, defaults; signed but unparsable: a signed
+  degradation `rule_policy`, defaults) and applies a new one at once when
+  `nn-admin policy set` stores it (the signed `config_overlay_set` row says
+  `applied now`). `--detect-only` still overrides every mode.
+  `nn-admin policy show|set|test`: the effective table, sign and store,
+  and an offline replay of sample events (one `Event` per line or a golden
+  case) under a candidate policy. Fuzz target `rule_policy`. Golden replay
+  format `northnarrow-golden/2` (`matches`, `responses`, the policy in the
+  header) and seven new cases: the four shadowing bugs, test policies that
+  enforce NN-L-IMP-001 and NN-L-FIM-004, an exemption by uid. Lab harness
+  `nn-lab.sh policy-check` (`deploy/lab/malsim/policy-check.sh`).
 - Performance baseline, regression gate and golden replay (lab PR 228,
   Wave 4 phase 2). **Baseline.** `nn-lab.sh perf [--fresh] [--quick]` runs
   `deploy/lab/perf/perf-run.sh` on a lab guest, as root: the hooked
@@ -339,6 +384,16 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- Rule shadowing (lab PR 236): NN-L-FIM-023 (systemd timer) was never
+  reached behind NN-L-FIM-009 — both now match a `.timer`; a new
+  `authorized_keys` under `/home` was NN-L-FIM-002's record and
+  NN-L-FIM-004 was never recorded — FIM-004 (High) is now the primary rule,
+  its kill held by the legacy ceiling until `enforce NN-L-FIM-004`; a large
+  internal transfer was NN-L-NET-007's Medium and NN-L-NET-009's UDP sum
+  never grew — NET-009 (High) is the primary rule and its UDP sum crosses
+  100 MiB; R001 and R009 were silent on an exec that completed
+  NN-L-CHAIN-007 late (lab PR 235) — the record names all three. Without a
+  policy no event gets a stronger response than before.
 - NN-L-CHAIN-007 (`/tmp` exec, credential read, egress) was missed when
   the exec record reached the engine after the read and the egress it
   preceded (lab PR 235; the CI flake of

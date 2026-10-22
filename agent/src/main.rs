@@ -829,6 +829,16 @@ struct Cli {
     )]
     exec_policy_local: PathBuf,
 
+    /// Lab PR 236: the signed per-rule response policy (`enforce|alert|audit|off
+    /// <rule>`, `exempt <rule> …`), stored with `nn-admin policy set`.
+    /// Without it every rule keeps its built-in response.
+    #[arg(
+        long = "rule-policy-local",
+        value_name = "PATH",
+        default_value = northnarrow_agent::decision::rule_policy::DEFAULT_LOCAL
+    )]
+    rule_policy_local: PathBuf,
+
     /// Do not read the new environment at exec (no LD_PRELOAD / LD_AUDIT /
     /// GLIBC_TUNABLES / history checks). Also `NN_EXEC_POLICY_NO_ENV=1`
     /// (1/0, true/false, yes/no, on/off).
@@ -2702,6 +2712,42 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                 .with_identity(lineage.clone()),
         )),
     ));
+    // Lab PR 236: the signed per-rule response policy, read once through the
+    // overlay gate (absent or refused: the built-in defaults — every held
+    // kill held). A signed file that does not parse leaves the defaults in
+    // force, a signed degradation.
+    {
+        use northnarrow_agent::config::overlay_auth::Verified;
+        use northnarrow_agent::decision::rule_policy as rp;
+        let boot = match overlay_gate.verified(OverlayKind::RulePolicy, &cli.rule_policy_local) {
+            Verified::Content { path, text } => rp::boot_policy(Some((&path, &text))),
+            _ => rp::boot_policy(None),
+        };
+        if let Some(detail) = &boot.degraded {
+            error!(detail = %detail, "per-rule policy unreadable — the built-in defaults apply");
+            northnarrow_agent::boot::degradation::report("rule_policy", detail);
+        }
+        let policy = boot.policy;
+        if !policy.is_builtin() {
+            warn!(
+                source = %policy.source,
+                summary = %policy.summary(),
+                "per-rule response policy in force"
+            );
+            overlay_gate.record_note(
+                rp::AUDIT_OP_LOADED,
+                "success",
+                serde_json::json!({
+                    "source": policy.source,
+                    "summary": policy.summary(),
+                    "at_boot": true,
+                }),
+            );
+        } else {
+            info!("per-rule response policy: built-in defaults (every held kill held)");
+        }
+        rp::install_global(policy);
+    }
     let engine = RuleEngine::with_default_rules_and_net(
         Arc::clone(&netflow_blocklist),
         Arc::clone(&ja3_blocklist),
@@ -2730,7 +2776,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         net_rule_config,
         Arc::clone(&ransom_tracker),
         Arc::clone(&defense_detector),
-    );
+    )
+    .with_policy(northnarrow_agent::decision::rule_policy::global().clone());
     // External audit PROC-015 / PROC-014: a demo build runs R901..R904
     // ahead of the production engine (operator state included), and
     // enforces only under the demo-rules gate below.
@@ -5744,43 +5791,72 @@ async fn process_event(
         }
     }
 
-    if let Some((verdict, attack)) = engine.evaluate_with_attack(&event) {
+    // Lab PR 236 (multi-match): every rule judged the event; the decision
+    // names the primary rule and every match, and runs, per target, the
+    // strongest response the per-rule policy allows.
+    if let Some(decision) = engine.decide(&event) {
+        let verdict = &decision.verdict;
         // Review 75: every verdict is acted on; its log lines and its
-        // record count against the rule's budget for the acting uid.
+        // record count against the primary rule's budget for the acting uid.
         let uid = northnarrow_agent::detection_store::Principal::from_event(&event).uid;
         let admit = budget_admit(&verdict.rule_id, uid, &event);
         if admit.record() {
-            warn!(
-                rule = %verdict.rule_id,
-                rule_name = %verdict.rule_name,
-                category = %verdict.category,
-                action = ?verdict.action,
-                severity = ?verdict.severity,
-                target_pid = verdict.event_pid,
-                target_filename = %Escaped(&verdict.event_filename),
-                reasoning = %Escaped(&verdict.reasoning),
-                "VERDICT (rule)"
-            );
+            let also: Vec<&str> = decision
+                .matches
+                .iter()
+                .filter(|m| m.rule_id != verdict.rule_id)
+                .map(|m| m.rule_id)
+                .collect();
+            if decision.audit_only() {
+                info!(
+                    rule = %verdict.rule_id,
+                    also = ?also,
+                    severity = ?verdict.severity,
+                    target_pid = verdict.event_pid,
+                    reasoning = %Escaped(&verdict.reasoning),
+                    "AUDIT (rule, per-rule policy)"
+                );
+            } else {
+                warn!(
+                    rule = %verdict.rule_id,
+                    rule_name = %verdict.rule_name,
+                    category = %verdict.category,
+                    action = ?verdict.action,
+                    severity = ?verdict.severity,
+                    also = ?also,
+                    target_pid = verdict.event_pid,
+                    target_filename = %Escaped(&verdict.event_filename),
+                    reasoning = %Escaped(&verdict.reasoning),
+                    "VERDICT (rule)"
+                );
+            }
         }
 
-        let exec = executor.clone();
-        let action = verdict.action.clone();
-        let target_pid = verdict.event_pid;
-        let target_file = verdict.event_filename.clone();
         // External audit CMB-004: what the event says about the process
         // the verdict is about — its start (an exec), the event's time — so
         // a kill does not reach a process that took the PID after the event.
-        let (target_start_ns, target_seen_ns) =
-            if northnarrow_agent::posture::triggers::event_owner_pid(&event) == Some(target_pid) {
-                northnarrow_agent::posture::triggers::event_owner_seen(&event)
+        let owner = northnarrow_agent::posture::triggers::event_owner_pid(&event);
+        let (owner_start_ns, owner_seen_ns) =
+            northnarrow_agent::posture::triggers::event_owner_seen(&event);
+        let mut reports = Vec::new();
+        if decision.responses.is_empty() {
+            // A Log decision runs nothing: no blocking task for it.
+            reports.push((
+                None,
+                executor.execute(common::ResponseAction::Log, verdict.event_pid),
+            ));
+        }
+        for response in &decision.responses {
+            let exec = executor.clone();
+            let action = response.action.clone();
+            let target_pid = response.pid;
+            let target_file = response.filename.clone();
+            let (target_start_ns, target_seen_ns) = if owner == Some(target_pid) {
+                (owner_start_ns, owner_seen_ns)
             } else {
                 (0, 0)
             };
-        // A Log verdict runs nothing: no blocking task for it.
-        let report = if matches!(action, common::ResponseAction::Log) {
-            exec.execute(action, target_pid)
-        } else {
-            match tokio::task::spawn_blocking(move || {
+            let report = match tokio::task::spawn_blocking(move || {
                 exec.execute_for_started(
                     action,
                     target_pid,
@@ -5796,35 +5872,56 @@ async fn process_event(
                     warn!(error = %e, "executor task join failed");
                     return;
                 }
-            }
-        };
-
-        // Lab PR 222: the ransomware rule's kill neutralized its writer.
-        northnarrow_agent::cow::after_rule_response(
-            &verdict.rule_id,
-            target_pid,
-            matches!(
-                report.primary,
-                northnarrow_agent::response::ExecutionOutcome::Killed { .. }
-                    | northnarrow_agent::response::ExecutionOutcome::AlreadyGone { .. }
-            ),
-        );
+            };
+            reports.push((Some(response), report));
+        }
+        // Lab PR 222: a ransomware rule's match flags its writer, and a kill
+        // of that process (whichever matched rule's response it was)
+        // neutralized it.
+        for m in &decision.matches {
+            let pid = m.verdict.event_pid;
+            let neutralized = reports.iter().any(|(r, report)| {
+                r.is_some_and(|r| r.pid == pid)
+                    && matches!(
+                        report.primary,
+                        northnarrow_agent::response::ExecutionOutcome::Killed { .. }
+                            | northnarrow_agent::response::ExecutionOutcome::AlreadyGone { .. }
+                    )
+            });
+            northnarrow_agent::cow::after_rule_response(m.rule_id, pid, neutralized);
+        }
         if let Admit::Record { suppressed_before } = admit {
-            info!(
-                action = ?report.action,
-                primary = ?report.primary,
-                additional_count = report.additional.len(),
-                elapsed_us = report.elapsed.as_micros() as u64,
-                "EXECUTED"
-            );
+            for (_, report) in &reports {
+                info!(
+                    action = ?report.action,
+                    primary = ?report.primary,
+                    additional_count = report.additional.len(),
+                    elapsed_us = report.elapsed.as_micros() as u64,
+                    "EXECUTED"
+                );
+            }
             // Tappa 9.0.a: persist the rule detection (off the hot path).
             if let Some(sink) = detection_sink {
-                sink.record_rule(
+                let response = match reports.as_slice() {
+                    [(_, only)] => northnarrow_agent::detection_store::describe_response(only),
+                    many => many
+                        .iter()
+                        .map(|(r, report)| {
+                            format!(
+                                "{} (pid {}, {})",
+                                northnarrow_agent::detection_store::describe_response(report),
+                                r.map_or(verdict.event_pid, |r| r.pid),
+                                r.map_or("", |r| r.rule_id)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                };
+                sink.record_decision(
                     &event,
-                    &verdict,
-                    attack,
+                    &decision,
                     posture.current_kind(),
-                    northnarrow_agent::detection_store::describe_response(&report),
+                    response,
                     suppressed_before,
                 );
             }

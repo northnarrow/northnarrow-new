@@ -1077,11 +1077,11 @@ systemd timer unit created — category `fim_persistence`.
 
 **Known false positives.** Package transactions are recorded at Low, writes in an interactive sudo or su session at High.
 
-**How to test.** In the engine a .timer write there is recorded as NN-L-FIM-009, which is evaluated first and matches every write in the same directories; this rule fires on its own in its unit tests. `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.timer` shows the NN-L-FIM-009 record.
+**How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.timer`: one record naming NN-L-FIM-009 (primary: same severity and action, registered first) and this rule among its matches (lab PR 236, multi-match).
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`
+**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`, `agent/src/decision/tests.rs::shadow_fim023_fires_with_fim009_on_a_timer`
 
-**ATT&CK note.** Shadowed by NN-L-FIM-009 (T1543.002) in the engine's first-match order, so the T1053.006 mapping reaches no record today.
+**ATT&CK note.** NN-L-FIM-009 (T1543.002) matches the same writes; until lab PR 236 it shadowed this rule in the engine's first-match order. Now both are matches of one record, whose ATT&CK field carries T1543.002 and T1053.006.
 
 ### NN-L-FIM-024_AntiTamperHoneypotModified
 

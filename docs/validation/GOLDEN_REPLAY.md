@@ -21,7 +21,10 @@ the 86 rules of `default_rules_with_net`, in their order, over the shipped
 lists of `configs/` (process and network comm allowlists, the network and
 JA3 blocklists, `security-tools.v1`), the default fan-out thresholds, and
 every per-rule policy switch of `agent/src/decision/response_policy.rs` at
-its production value — off. Nothing of the machine running the test is read:
+its production value — off — under the case's per-rule policy (lab PR 236:
+`policy`, the text of a `rule-policy.local`; none: the built-in defaults).
+The engine is built by `agent/src/decision/replay.rs`, which `nn-admin policy
+test` uses too. Nothing of the machine running the test is read:
 
 | host state | in a replay |
 |---|---|
@@ -40,8 +43,10 @@ The decision path of one item is that of `process_event` (`main.rs`):
 2. an anti-tamper denial (`FsProtectDenial`) is NN-L-AT-001's and an exploit
    post-condition (`ExploitPostcondition`) NN-L-EPG-001/002's, outside the
    engine, with the record's response line;
-3. every other event goes to the engine: first match wins, a held response
-   is an alert;
+3. every other event goes to the engine: every rule judges it and the
+   decision is computed from all the matches (lab PR 236, multi-match,
+   `docs/design/MULTI_MATCH_AND_RULE_POLICY.md`); a held response is an
+   alert unless the case's policy enforces its rule;
 4. an exec-policy report (`execpol` item) becomes the exec policy's records
    (`execpol::record::records_of`), outside the engine, with their evidence.
 
@@ -53,8 +58,10 @@ quarantine's scanner (a process, not a rule over events).
 
 ## 2. Reading a golden file
 
-The first line names the format (`northnarrow-golden/1`), the case, what it
-is about, the number of rules and every policy switch with its state. Then
+The first line names the format (`northnarrow-golden/2` since lab PR 236),
+the case, what it is about, the number of rules, every policy switch with its
+state and the per-rule policy (`built-in defaults`, or the policy rendered).
+Then
 one line per item of the stream, in order (`seq`), with its `decision`:
 
 - `null` — nothing fired;
@@ -62,8 +69,20 @@ one line per item of the stream, in order (`seq`), with its `decision`:
   executor would run: `Log`, `KillProcess`, `KillProcessTree`, …),
   `severity`, `pid` (the target), `file`, `ts` (the event's time),
   `reasoning` (as the record carries it), `mitre` (the record's ATT&CK
-  field: tactic ids, technique ids) and, for a record made outside the
-  engine, `response`;
+  field: tactic ids, technique ids — the union of every match's, the
+  primary's first) and, for a record made outside the engine, `response`;
+- with several matches, or a policy mode on its one match (lab PR 236):
+  `rule` is the primary rule (the highest severity, then the strongest
+  action, then the earliest registered), `action` the strongest any match's
+  mode allows, `severity` the highest of the counted matches, the reasoning
+  ends with `[also matched: …]`, and `matches` lists every match in engine
+  order (`rule`, `action`, `severity`, `mode` — builtin, enforce, alert,
+  audit, exempt — `pid`, `mitre`, `held` when a switch or the legacy
+  ceiling still holds its response — the switch's text or
+  `legacy_ceiling` — with `held_action`, `exempt` with the exemption), with
+  `responses`: what the executor would run, per target. Without `enforce`,
+  a match never runs more than the first-match engine ran on the event (the
+  legacy ceiling, `docs/design/MULTI_MATCH_AND_RULE_POLICY.md` §2.1);
 - for a connect sweep (`tcp_sweep` item), `{"sweep": N, "decisions": [...]}`:
   the expanded events that gave a verdict, by index (`at`);
 - for an exec-policy report, the list of its records, each with its
@@ -74,9 +93,9 @@ severity, and its reasoning ends in `[held back: <what> — alert only, by
 default, until the signed per-rule response policy enables it]`. A kill that
 predates the holds (R001 and R009 on a `/tmp` exec, NN-L-FIM-010 on a watched
 file's own rename, NN-L-CHAIN-002 on port 443, NN-L-NET-001 on a blocklisted
-server) reads its kill. A held verdict never stands in for a later rule's
-response (`response_policy`): `port53-held` shows NN-L-NET-001's kill
-winning over NN-L-CHAIN-002's held alert on the same flow.
+server) reads its kill. A held verdict never stands in for another rule's
+response: `port53-held` shows NN-L-NET-001's kill running while
+NN-L-CHAIN-002's alert stays held on the same flow (both listed).
 
 ## 3. The cases
 
@@ -94,15 +113,24 @@ winning over NN-L-CHAIN-002's held alert on the same flow.
 | `port53-held` | a `/tmp` program's flows to a configured resolver, to port 53 of another server, to port 53 of a blocklisted server, to port 443 | the resolver exemption; NN-L-CHAIN-002's port-53 kill held (lab PR 224); the held alert not standing in for NN-L-NET-001's kill; the port-443 kill kept |
 | `epg-postcondition` | a credential gained with no mechanism (detect), namespaces left with no mechanism (enforce) | NN-L-EPG-001/002 records (lab PR 219) |
 | `execpol-records` | memfd exec denied, `/dev/shm` exec in audit, `LD_PRELOAD` from `/tmp`, Looney Tunables, history off, a `/tmp` library mapped | NN-L-EXECPOL-001, NN-L-EXECENV-001..003 (lab PR 226) |
+| `shadow-fim009-fim023-timer` | a `.timer` dropped in `/etc/systemd/system` by a `/tmp` program | NN-L-FIM-009 and NN-L-FIM-023 on one record (FIM-023 was never reached before lab PR 236) |
+| `shadow-fim002-fim004-authorized-keys` | a new `~/.ssh/authorized_keys` under `/home` | NN-L-FIM-004 (High) primary with NN-L-FIM-002's record (it was FIM-002's Log alone); FIM-004's kill held by the legacy ceiling |
+| `policy-fim004-enforced` | the same under `enforce NN-L-FIM-004` | the ceiling lifted: FIM-004's kill runs (mode enforce) |
+| `shadow-net007-net009-internal-volume` | 200 MiB over TCP to an internal host, then 101 UDP datagrams of 1 MiB | NN-L-NET-009 (High) primary over NN-L-NET-007; its UDP sum crosses 100 MiB on the 101st datagram |
+| `shadow-chain007-late-exec` | a `/tmp` program's key read and connect, its exec record processed last (lab PR 235) | NN-L-CHAIN-007 with R001 and R009 on the late exec, one kill of the tree |
+| `policy-imp001-enforced` | `imp001-in-place` under the test policy `enforce NN-L-IMP-001` | the ransomware kill given back (mode enforce); no other held kill moves |
+| `policy-r020-exempt-uid` | `r020-shell-socket-stdio` under `enforce R020` and `exempt R020 uid 33`, the same shell under uid 34 | uid 33 exempt (recorded only), uid 34 killed (enforce) |
 
-Each case names in its file the rules it must fire (`fires`) and those
-whose held response it must show (`held`); `every_case_shows_what_it_says`
-checks them, so an update of a golden file that loses a detection fails
+Each case names in its file the rules it must fire (`fires`, as the primary
+rule or a match), those whose held response it must show (`held`), and,
+with a `policy`, those it must show enforced (`enforced`) or exempt
+(`exempt`); `every_case_shows_what_it_says` checks them, so an update of a golden file that loses a detection fails
 even though the file was rewritten. Across the cases the tests also require
 NN-L-EPG-001, NN-L-NET-026/027, R020, NN-L-IMP-001/002, NN-L-EVA-001,
 NN-L-FIM-010 and NN-L-EXECPOL-001 to fire; every held kill of R020,
 NN-L-NET-026/027, NN-L-IMP-001, NN-L-EVA-001 and NN-L-FIM-010 to show as
-action `Log`; and no verdict whose action is not `Log` to say it was held.
+action `Log` in the cases without a policy; and no response there to be a
+held rule's.
 
 The streams are written in the agent's own serialised event format
 (`common::Event`), each shaped on a lab scenario (the MS-nn names are those
@@ -145,7 +173,8 @@ files and never writes them: with `CI` set, `--update` and
 golden file without a case, fails `cargo test`.
 
 To add a case: write `agent/tests/golden/cases/<case>.json` (`about`,
-`fires`, the optional `held`, `resolvers`, `files`, `entropy`, and `items`:
+`fires`, the optional `held`, `policy`, `enforced`, `exempt`, `resolvers`,
+`files`, `entropy`, and `items`:
 `{"event": <Event>}`, `{"tcp_sweep": {...}}` or `{"execpol": {...}}`, see
 the harness), run `cargo xtask golden --update`, and review its golden file
 like any other.

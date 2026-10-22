@@ -1,0 +1,72 @@
+{
+ "about": "Lab PR 236 (multi-match) over lab PR 235: a root process staged in /tmp reads a GPG private key and connects out, and its exec record reaches the engine last. NN-L-CHAIN-001 fires on the connect; on the late exec NN-L-CHAIN-007 completes the three-step chain, which used to silence the exec's own rules. Now the exec's record names CHAIN-007 (Critical, primary) with R001 and R009, one kill of the tree.",
+ "fires": [
+  "NN-L-CHAIN-001_CredReadThenEgress",
+  "NN-L-CHAIN-007_TmpCredExfilSequence",
+  "R001_ExecFromTmp",
+  "R009_RootExecFromUserPath"
+ ],
+ "items": [
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3611000000000,
+     "path": "/root/.gnupg/private-keys-v1.d/golden.key",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/tmp/.s/stager",
+     "modifier_pid": 6400001,
+     "modifier_uid": 0,
+     "modifier_comm": "stager"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3612000000000,
+     "end_ns": 3612050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "203.0.113.9",
+     "dst_port": 443,
+     "proto": 6,
+     "pid": 6400001,
+     "uid": 0,
+     "comm": "stager",
+     "exe": "/tmp/.s/stager",
+     "proc_start_ns": 0,
+     "bytes_sent": 1024,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6400001-3612000000000",
+     "phase": "connect"
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6400001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "stager",
+     "filename": "/tmp/.s/stager",
+     "timestamp_ns": 3610000000000,
+     "argv": [
+      "/tmp/.s/stager"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3609000000000,
+     "exe": {
+      "path": "/tmp/.s/stager"
+     }
+    }
+   }
+  }
+ ]
+}

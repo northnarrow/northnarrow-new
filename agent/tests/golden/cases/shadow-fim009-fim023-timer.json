@@ -1,0 +1,45 @@
+{
+ "about": "Lab PR 236 (multi-match): a systemd .timer dropped in /etc/systemd/system by a program staged in /tmp. NN-L-FIM-009 (unit dropped) and NN-L-FIM-023 (timer created) both match the same drift; first-match gave FIM-009 alone and FIM-023 never fired. Now the record names both, FIM-009 primary (same severity and action, registered first), one kill of the writer.",
+ "fires": [
+  "NN-L-FIM-009_SystemdUnitDropped",
+  "NN-L-FIM-023_SystemdTimerCreated"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6100001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "dropper",
+     "filename": "/tmp/.x/dropper",
+     "timestamp_ns": 3600000000000,
+     "argv": [
+      "/tmp/.x/dropper"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3599999000000,
+     "exe": {
+      "path": "/tmp/.x/dropper"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3601000000000,
+     "path": "/etc/systemd/system/nn-golden-update.timer",
+     "op": 2,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/tmp/.x/dropper",
+     "modifier_pid": 6100001,
+     "modifier_uid": 0,
+     "modifier_comm": "dropper"
+    }
+   }
+  }
+ ]
+}

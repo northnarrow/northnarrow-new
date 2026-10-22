@@ -5,12 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use common::wire::FlowPhase;
-use common::{Event, ResponseAction, Verdict};
+use common::{Event, Verdict};
 use parking_lot::Mutex;
 
 use super::attack::AttackRef;
+use super::combine::{self, Decision};
 use super::flow_ledger::{self, FlowLedger};
 use super::response_policy;
+use super::rule_policy::{self, ActorFacts, PolicyHandle, ProcFacts};
 
 use super::rules::net::DnsBurstWindow;
 use super::rules::{default_rules, default_rules_with_net};
@@ -20,14 +22,20 @@ use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
 /// Owns the active rule set and dispatches events to it.
 ///
-/// Order matters: rules are evaluated in insertion order and the first
-/// match wins. Place high-confidence, high-severity rules earlier so a
-/// cheap obvious match short-circuits the rest.
+/// Lab PR 236 (multi-match): every rule is evaluated, in insertion order,
+/// and the decision is computed from all the matches ([`combine`]) under
+/// the per-rule policy ([`rule_policy`]). The order is the last tie-break
+/// of the primary rule: place the more specific rule earlier.
 pub struct RuleEngine {
     rules: Vec<Box<dyn Rule>>,
     /// Lab PR 224 (CM-02): the rules that already answered each open flow
     /// ([`flow_ledger`]).
     flow_ledger: Mutex<FlowLedger>,
+    /// Lab PR 236: the per-rule policy this engine reads (production: the
+    /// agent's [`rule_policy::global`]).
+    policy: PolicyHandle,
+    /// What an exemption check reads about a process.
+    facts: Arc<dyn ActorFacts>,
 }
 
 /// Lab PR 224: verdicts given to a flow at its connect, since boot.
@@ -45,7 +53,28 @@ impl RuleEngine {
         Self {
             rules: Vec::new(),
             flow_ledger: Mutex::new(FlowLedger::default()),
+            policy: PolicyHandle::default(),
+            facts: Arc::new(ProcFacts::default()),
         }
+    }
+
+    /// This engine reading the policy `handle` (production: the agent's
+    /// [`rule_policy::global`], swapped by `nn-admin policy set`).
+    pub fn with_policy(mut self, handle: PolicyHandle) -> Self {
+        self.policy = handle;
+        self
+    }
+
+    /// This engine reading exemption facts from `facts` (the golden replay
+    /// and `nn-admin policy test`: an empty `/proc`).
+    pub fn with_facts(mut self, facts: Arc<dyn ActorFacts>) -> Self {
+        self.facts = facts;
+        self
+    }
+
+    /// The policy this engine reads.
+    pub fn policy(&self) -> &PolicyHandle {
+        &self.policy
     }
 
     /// Engine pre-loaded with [`default_rules`]: the production
@@ -132,6 +161,8 @@ impl RuleEngine {
             e.add_rule(r);
         }
         e.rules.extend(self.rules);
+        e.policy = self.policy;
+        e.facts = self.facts;
         e
     }
 
@@ -151,33 +182,48 @@ impl RuleEngine {
         self.rules.len()
     }
 
-    /// First-match wins. Returns the verdict from the earliest rule
-    /// that fires, or `None` if every rule abstains.
+    /// The decision's verdict ([`Self::decide`]): the primary rule's, with
+    /// the strongest allowed action and the highest severity of every
+    /// match, or `None` if every rule abstains.
+    pub fn evaluate(&self, event: &Event) -> Option<Verdict> {
+        self.decide(event).map(|d| d.verdict)
+    }
+
+    /// [`Self::evaluate`], with the ATT&CK references of every matched
+    /// rule ([`Rule::attack`], the primary's first) for its detection
+    /// record (lab PR 221).
+    pub fn evaluate_with_attack(&self, event: &Event) -> Option<(Verdict, Vec<AttackRef>)> {
+        self.decide(event).map(|d| {
+            let attack = d.attack();
+            (d.verdict, attack)
+        })
+    }
+
+    /// Lab PR 236 (multi-match): every rule judges the event, and the
+    /// decision is computed from all the matches ([`combine::combine`])
+    /// after the per-rule policy ([`combine::apply_policy`]), under the
+    /// legacy ceiling — without `enforce`, no response runs that the
+    /// first-match engine would not have run on the event; every rule's
+    /// state (chains, windows, the correlation store) sees the event.
     ///
     /// Lab PR 224 (CM-02): a flow is judged in each of its phases (the
     /// connect, the open-flow snapshots, the close); a rule that already
     /// answered the flow in an earlier phase is skipped, and a flow gets
-    /// one chain verdict ([`flow_ledger`]). A verdict on an open flow, or
-    /// on a refused connect, says so in its reasoning.
-    pub fn evaluate(&self, event: &Event) -> Option<Verdict> {
-        self.evaluate_with_attack(event).map(|(v, _)| v)
-    }
-
-    /// [`Self::evaluate`], with the ATT&CK references of the rule that
-    /// fired ([`Rule::attack`]) for its detection record (lab PR 221).
-    pub fn evaluate_with_attack(&self, event: &Event) -> Option<(Verdict, &'static [AttackRef])> {
+    /// chain verdicts in one phase only ([`flow_ledger`]). A verdict on an
+    /// open flow, or on a refused connect, says so in its reasoning.
+    pub fn decide(&self, event: &Event) -> Option<Decision> {
         let flow = match event {
             Event::NetFlow(nf) => Some(nf),
             _ => None,
         };
         let key = flow.map(|nf| (nf.pid, nf.start_ns));
         let fired = key.and_then(|k| self.flow_ledger.lock().fired(&k));
-        let mut found = None;
-        // A verdict whose response a rule held behind the per-rule policy
-        // (`response_policy`): an alert that must not stand in for a later
-        // rule's response — the one that rule gave before the hold existed.
-        let mut held = None;
-        for rule in &self.rules {
+        let policy = self.policy.current();
+        // The event's actor, for a uid exemption (read once, if asked).
+        let principal = std::cell::OnceCell::new();
+        let mut matched: Vec<&'static str> = Vec::new();
+        let mut matches = Vec::new();
+        for (index, rule) in self.rules.iter().enumerate() {
             if fired
                 .as_deref()
                 .is_some_and(|f| flow_ledger::excluded(rule.id(), f))
@@ -185,22 +231,29 @@ impl RuleEngine {
                 continue;
             }
             response_policy::take_held();
-            if let Some(v) = rule.evaluate(event) {
-                if response_policy::take_held() {
-                    if held.is_none() {
-                        held = Some((rule.id(), rule.attack(), v));
-                    }
-                    continue;
-                }
-                if held.is_some() && v.action == ResponseAction::Log {
-                    // The held alert outranks a later record.
-                    break;
-                }
-                found = Some((rule.id(), rule.attack(), v));
-                break;
-            }
+            let Some(v) = rule.evaluate(event) else {
+                continue;
+            };
+            let held = response_policy::take_held();
+            matched.push(rule.id());
+            let facts = &*self.facts;
+            let exempt = |v: &Verdict| {
+                let p =
+                    principal.get_or_init(|| crate::detection_store::Principal::from_event(event));
+                let uid = (p.pid == v.event_pid).then_some(p.uid);
+                rule_policy::exempt(policy.exemptions(rule.id()), v.event_pid, uid, facts)
+            };
+            matches.push(combine::apply_policy(
+                index,
+                rule.id(),
+                rule.attack(),
+                v,
+                held,
+                &policy,
+                exempt,
+            ));
         }
-        let found = found.or(held);
+        let mut decision = combine::combine(matches);
         match (flow, key) {
             (Some(nf), Some(key)) => {
                 let mut ledger = self.flow_ledger.lock();
@@ -208,14 +261,14 @@ impl RuleEngine {
                     // The flow is over: nothing more will name it.
                     FlowPhase::Closed => ledger.forget(&key),
                     FlowPhase::Connect | FlowPhase::Snapshot => {
-                        if let Some((id, _, _)) = &found {
+                        for id in &matched {
                             ledger.record(key, id);
                         }
                     }
                     // No flow follows a refused connect.
                     FlowPhase::Denied => {}
                 }
-                if nf.phase == FlowPhase::Connect && found.is_some() {
+                if nf.phase == FlowPhase::Connect && decision.is_some() {
                     CONNECT_VERDICTS.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -223,23 +276,21 @@ impl RuleEngine {
             // its egress names that egress (pid, connect time): its later
             // phases get no second chain verdict.
             _ => {
-                if let Some((id, _, v)) = &found {
-                    if id.starts_with("NN-L-CHAIN-") && v.timestamp_ns != 0 {
-                        self.flow_ledger
-                            .lock()
-                            .record((v.event_pid, v.timestamp_ns), id);
+                if let Some(d) = &decision {
+                    for m in &d.matches {
+                        if m.rule_id.starts_with("NN-L-CHAIN-") && m.verdict.timestamp_ns != 0 {
+                            self.flow_ledger
+                                .lock()
+                                .record((m.verdict.event_pid, m.verdict.timestamp_ns), m.rule_id);
+                        }
                     }
                 }
             }
         }
-        let (_, attack, v) = found?;
-        Some((
-            match flow {
-                Some(nf) => flow_ledger::annotate(v, nf),
-                None => v,
-            },
-            attack,
-        ))
+        if let (Some(nf), Some(d)) = (flow, decision.as_mut()) {
+            d.verdict = flow_ledger::annotate(d.verdict.clone(), nf);
+        }
+        decision
     }
 
     /// Flows the engine remembers a verdict for (tests, metrics).
