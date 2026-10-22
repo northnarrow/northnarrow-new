@@ -72,3 +72,110 @@ pub trait ChainSigner {
     /// The public half, the verifiers' key.
     fn verifying_key(&self) -> VerifyingKey;
 }
+
+/// The chain code's own tests: a portable host and a key kept in a file.
+/// What is Linux about the agent's host (modes, symlinks, FIFOs, the
+/// anchor) is tested with it, in the agent.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
+    use sha2::{Digest, Sha256};
+
+    use super::{ChainHost, ChainSigner};
+
+    /// Plain `std`: no mode, symlinks followed, no anchor; the rename
+    /// checks the target first (the agent's fallback on a filesystem
+    /// without `RENAME_NOREPLACE`).
+    pub(crate) struct PortableHost;
+
+    impl ChainHost for PortableHost {
+        fn open_read_nofollow(path: &Path) -> io::Result<File> {
+            OpenOptions::new().read(true).open(path)
+        }
+        fn is_symlink_refusal(_err: &io::Error) -> bool {
+            false
+        }
+        fn open_with_mode(options: &mut OpenOptions, _mode: u32, path: &Path) -> io::Result<File> {
+            options.open(path)
+        }
+        fn open_with_mode_nofollow(
+            options: &mut OpenOptions,
+            _mode: u32,
+            path: &Path,
+        ) -> io::Result<File> {
+            options.open(path)
+        }
+        fn create_dir_all_with_mode(dir: &Path, _mode: u32) -> io::Result<()> {
+            std::fs::create_dir_all(dir)
+        }
+        fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(from, to)
+        }
+        fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+            let mut f = file;
+            f.seek(SeekFrom::Start(offset))?;
+            f.write_all(buf)
+        }
+        fn anchor(path: &Path) -> PathBuf {
+            path.to_path_buf()
+        }
+    }
+
+    /// A test key, kept in a file by [`Self::load_or_bootstrap`].
+    pub(crate) struct TestKey(SigningKey);
+
+    impl std::fmt::Debug for TestKey {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TestKey")
+        }
+    }
+
+    impl TestKey {
+        /// A key no other call returns.
+        pub(crate) fn fresh() -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let mut h = Sha256::new();
+            h.update(b"nn-evidence test key\0");
+            h.update(N.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+            h.update(std::process::id().to_le_bytes());
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            h.update(nanos.to_le_bytes());
+            TestKey(SigningKey::from_bytes(&h.finalize().into()))
+        }
+
+        /// The key in `path` (64 hex characters), written there first if the
+        /// file is absent: the call shape of the agent's key, without its
+        /// modes, so two loads of one path sign alike.
+        pub(crate) fn load_or_bootstrap(path: &Path) -> anyhow::Result<Self> {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let bytes: [u8; 32] = hex::decode(text.trim())?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("{}: not 32 bytes", path.display()))?;
+                return Ok(TestKey(SigningKey::from_bytes(&bytes)));
+            }
+            let key = Self::fresh();
+            std::fs::write(path, format!("{}\n", hex::encode(key.0.to_bytes())))?;
+            Ok(key)
+        }
+    }
+
+    impl ChainSigner for TestKey {
+        type Host = PortableHost;
+        fn sign(&self, msg: &[u8]) -> Signature {
+            self.0.sign(msg)
+        }
+        fn verifying_key(&self) -> VerifyingKey {
+            self.0.verifying_key()
+        }
+    }
+}

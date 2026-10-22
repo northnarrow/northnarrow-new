@@ -1297,9 +1297,9 @@ pub fn verify_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_host::testing::TestKey;
     use std::fs;
 
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     /// The build facts of a test's boot rows.
@@ -1316,7 +1316,7 @@ mod tests {
     #[test]
     fn boot_rows_record_the_build_they_are_given() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         let e = log
             .boot_probe(None, "verified", "attested", &test_build())
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn a_torn_last_write_is_repaired_and_attested_mid_file_corruption_is_not() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
         log.append(sample_draft(1)).unwrap();
         log.append(sample_draft(2)).unwrap();
@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn a_second_key_in_the_chain_is_remembered() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
         assert!(!log.second_key_added());
         let mut refused = sample_draft(1);
@@ -1415,7 +1415,7 @@ mod tests {
     #[test]
     fn previous_run_none_abrupt_clean() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         // first boot: nothing before it
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
         assert_eq!(log.previous_run(), &PreviousRun::None);
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn a_refused_boot_names_its_gate() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         let e = log
             .boot_refused_by(
@@ -1480,7 +1480,7 @@ mod tests {
     #[test]
     fn verified_boot_is_found_in_the_chain() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         assert!(!verified_boot_recorded(&log_path).unwrap(), "no file yet");
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
         log.boot_probe(None, "no-manifest", "none", &test_build())
@@ -1543,7 +1543,7 @@ mod tests {
     #[test]
     fn open_missing_log_starts_at_genesis() {
         let (_dir, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let log = AuditLog::open(&log_path, key, [0u8; 16]).expect("open missing file");
         assert_eq!(log.last_hash(), GENESIS_PREV_HASH);
         // open() must NOT create the file itself — first append
@@ -1551,33 +1551,12 @@ mod tests {
         assert!(!log_path.exists());
     }
 
-    /// External audit EVD-019 (NN-AUD-281): the log the first append
-    /// creates is closed to other users (0640), and a later append keeps
-    /// the mode and group an installer set.
-    #[test]
-    fn audit_log_is_created_closed_to_other_users() {
-        let (_dir, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
-        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
-        log.append(sample_draft(1)).unwrap();
-        let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o640, "audit.log mode {mode:o}");
-        assert_eq!(mode & 0o007, 0, "no access for other users");
-        // an installer's choice (here: owner only) survives the next append
-        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600)).unwrap();
-        log.append(sample_draft(2)).unwrap();
-        assert_eq!(
-            fs::metadata(&log_path).unwrap().permissions().mode() & 0o7777,
-            0o600
-        );
-    }
-
     // ── Test 5 (design A11 #5): append produces a JSONL line whose
     //                            entry_hash + signature both verify.
     #[test]
     fn append_writes_signed_jsonl_line() {
         let (_dir, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pubkey = key.verifying_key();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         let entry = log.append(sample_draft(1)).expect("first append");
@@ -1599,7 +1578,7 @@ mod tests {
     #[test]
     fn second_append_chains_off_first_entry() {
         let (_dir, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pubkey = key.verifying_key();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         let first = log.append(sample_draft(1)).unwrap();
@@ -1623,7 +1602,7 @@ mod tests {
     #[test]
     fn verify_chain_detects_payload_tamper() {
         let (_dir, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pubkey = key.verifying_key();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         let _ = log.append(sample_draft(1)).unwrap();
@@ -1649,7 +1628,7 @@ mod tests {
     #[test]
     fn verify_chain_detects_signature_tamper() {
         let (_dir, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pubkey = key.verifying_key();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         let _ = log.append(sample_draft(1)).unwrap();
@@ -1674,7 +1653,7 @@ mod tests {
     fn boot_probe_appends_signed_agent_boot_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.log");
-        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let key = TestKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
         let mut log = AuditLog::open(&path, key, [7u8; 16]).unwrap();
         let e = log
             .boot_probe(None, "verified", "attested", &test_build())
@@ -1692,7 +1671,7 @@ mod tests {
         // A directory where the "file" should be → open(O_CREAT|O_APPEND) fails.
         let path = dir.path().join("audit.log");
         std::fs::create_dir(&path).unwrap();
-        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let key = TestKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
         let mut log = match AuditLog::open(&path, key, [7u8; 16]) {
             Ok(l) => l,
             Err(_) => return, // open itself refusing is the same signal
@@ -1714,7 +1693,7 @@ mod tests {
     fn boot_probe_records_where_detect_only_came_from() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.log");
-        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let key = TestKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
         let mut log = AuditLog::open(&path, key, [7u8; 16]).unwrap();
         let e = log
             .boot_probe(
@@ -1737,7 +1716,7 @@ mod tests {
 
     /// Rows as the code before lab PR 160 wrote them: no `seq`, untagged
     /// pre-image (`SHA-256(prev ‖ row)`), same bytes on disk.
-    fn write_legacy_rows(path: &Path, key: &AgentSigningKey, n: u32) -> String {
+    fn write_legacy_rows(path: &Path, key: &TestKey, n: u32) -> String {
         let mut prev = GENESIS_PREV_HASH.to_string();
         let mut body = String::new();
         for i in 0..n {
@@ -1773,7 +1752,7 @@ mod tests {
     #[test]
     fn strict_accepts_every_signed_row() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         write_legacy_rows(&log_path, &key, 24);
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
@@ -1795,7 +1774,7 @@ mod tests {
     fn verify_chain_rejects_small_order_signature() {
         use crate::chain_anchor::small_order;
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         write_legacy_rows(&log_path, &key, 2);
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         log.append(sample_draft(10)).unwrap();
@@ -1820,7 +1799,7 @@ mod tests {
     #[test]
     fn legacy_rows_without_seq_verify_and_new_rows_are_numbered_after_them() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         let legacy_tail = write_legacy_rows(&log_path, &key, 3);
         let before = fs::read(&log_path).unwrap();
@@ -1844,7 +1823,7 @@ mod tests {
         );
         assert!(AuditLog::open(
             &log_path,
-            AgentSigningKey::load_or_bootstrap(&key_path).unwrap(),
+            TestKey::load_or_bootstrap(&key_path).unwrap(),
             [0u8; 16]
         )
         .unwrap()
@@ -1860,7 +1839,7 @@ mod tests {
     #[test]
     fn client_exe_is_signed_and_rows_without_it_keep_their_bytes() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         log.append(sample_draft(0)).unwrap();
@@ -1893,7 +1872,7 @@ mod tests {
     #[test]
     fn seq_gap_or_regression_fails_verify_chain_and_is_reported_at_open() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         for i in 0..4 {
@@ -1917,7 +1896,7 @@ mod tests {
         fs::write(&log_path, kept).unwrap();
         let mut reopened = AuditLog::open(
             &log_path,
-            AgentSigningKey::load_or_bootstrap(&key_path).unwrap(),
+            TestKey::load_or_bootstrap(&key_path).unwrap(),
             [0u8; 16],
         )
         .unwrap();
@@ -1942,7 +1921,7 @@ mod tests {
     #[test]
     fn the_file_verifier_agrees_with_verify_chain_on_every_break() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         write_legacy_rows(&log_path, &key, 3);
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
@@ -2021,7 +2000,7 @@ mod tests {
     #[test]
     fn a_numbered_row_hashed_for_another_domain_is_rejected() {
         let (_d, key_path, _log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         let good =
             build_signed_entry(&sample_draft(1), &key, &[0u8; 16], GENESIS_PREV_HASH, 0).unwrap();
@@ -2060,7 +2039,7 @@ mod tests {
             .collect()
     }
 
-    fn whole_chain_verifies(path: &Path, key: &AgentSigningKey) {
+    fn whole_chain_verifies(path: &Path, key: &TestKey) {
         let all = rows(path);
         verify_chain(&all, &key.verifying_key()).expect("the whole chain verifies");
     }
@@ -2072,7 +2051,7 @@ mod tests {
     #[test]
     fn a_chain_last_signed_as_another_id_reports_the_change_once() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let (a, b) = ([0xAAu8; 16], [0xBBu8; 16]);
         let mut log = AuditLog::open(&log_path, key(), a).unwrap();
         log.append(sample_draft(1)).unwrap();
@@ -2112,7 +2091,7 @@ mod tests {
     #[test]
     fn a_fresh_chain_with_a_minted_id_records_the_mint_and_no_drift() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let id = [0x42u8; 16];
         let mut log = AuditLog::open(&log_path, key(), id).unwrap();
         log.attest_identity(&identity(id, IdentitySource::Minted))
@@ -2133,7 +2112,7 @@ mod tests {
     #[test]
     fn a_mint_over_an_existing_chain_records_the_mint_and_the_change() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let (a, b) = ([0x0Au8; 16], [0x0Bu8; 16]);
         let mut log = AuditLog::open(&log_path, key(), a).unwrap();
         log.append(sample_draft(1)).unwrap();
@@ -2162,7 +2141,7 @@ mod tests {
     #[test]
     fn an_unusable_identity_is_a_signed_degradation() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         let (a, per_boot) = ([0x0Au8; 16], [0x77u8; 16]);
         let mut log = AuditLog::open(&log_path, key(), a).unwrap();
         log.append(sample_draft(1)).unwrap();
@@ -2193,7 +2172,7 @@ mod tests {
     #[test]
     fn legacy_rows_keep_verifying_and_an_old_zero_fallback_is_named() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
         // write_legacy_rows signs as the all-zero id, as the old fallback did
         write_legacy_rows(&log_path, &key(), 3);
         let before = fs::read(&log_path).unwrap();
@@ -2233,7 +2212,7 @@ mod tests {
     #[test]
     fn a_numbered_row_not_in_canonical_form_is_refused_a_legacy_row_is_counted() {
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         write_legacy_rows(&log_path, &key, 2);
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
@@ -2299,7 +2278,7 @@ mod tests {
     #[test]
     fn compute_entry_hash_refuses_an_entry_that_carries_its_seal() {
         let (_d, key_path, _log) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let e =
             build_signed_entry(&sample_draft(1), &key, &[0u8; 16], GENESIS_PREV_HASH, 0).unwrap();
         let err = compute_entry_hash(&e).unwrap_err();
@@ -2349,7 +2328,7 @@ mod tests {
                 .collect()
         };
         let (_d, key_path, log_path) = fresh_paths();
-        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
         let mut log = AuditLog::open(&log_path, key, [7u8; 16]).unwrap();
         for _ in 0..150 {

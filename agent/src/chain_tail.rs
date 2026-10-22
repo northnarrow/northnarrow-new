@@ -325,7 +325,7 @@ fn next_line<R: BufRead>(r: &mut R, buf: &mut Vec<u8>, max: usize) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_host_linux::LinuxHost;
+    use crate::chain_host::testing::{PortableHost, TestKey};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -375,7 +375,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("log.jsonl");
         write_rows(&active, 0..1000);
-        let t = read_chain_tail::<LinuxHost>(&active, &all(10 * (row(999).len() + 1)));
+        let t = read_chain_tail::<PortableHost>(&active, &all(10 * (row(999).len() + 1)));
         assert_eq!(numbers(&t), (990..1000).rev().collect::<Vec<_>>());
         assert_eq!(t.count, 10);
         assert!(t.truncated);
@@ -386,10 +386,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("log.jsonl");
         write_rows(&active, 0..5);
-        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
+        let t = read_chain_tail::<PortableHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), vec![4, 3, 2, 1, 0]);
         assert!(!t.truncated);
-        let missing = read_chain_tail::<LinuxHost>(&dir.path().join("none.jsonl"), &all(1 << 20));
+        let missing =
+            read_chain_tail::<PortableHost>(&dir.path().join("none.jsonl"), &all(1 << 20));
         assert_eq!(missing, ChainTail::default());
     }
 
@@ -409,7 +410,7 @@ mod tests {
             .unwrap();
         write_rows(&active, 6..8);
         std::fs::write(dir.path().join("log.jsonl.manifest.jsonl"), "{\"x\":1}\n").unwrap();
-        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
+        let t = read_chain_tail::<PortableHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), vec![7, 6, 5, 4, 3, 2, 1, 0]);
         assert!(!t.truncated);
     }
@@ -426,7 +427,7 @@ mod tests {
             since: Some(since),
             ..all(1 << 20)
         };
-        let t = read_chain_tail::<LinuxHost>(&active, &q);
+        let t = read_chain_tail::<PortableHost>(&active, &q);
         assert_eq!(numbers(&t), vec![11, 10, 9, 8]);
         assert!(!t.truncated);
     }
@@ -449,7 +450,7 @@ mod tests {
             max_rows: 8,
             ..all(1 << 20)
         };
-        let t = read_chain_tail::<LinuxHost>(&active, &q);
+        let t = read_chain_tail::<PortableHost>(&active, &q);
         assert_eq!(numbers(&t), vec![58, 56, 54, 52, 50, 48, 46, 44]);
         assert!(t.truncated);
     }
@@ -464,11 +465,12 @@ mod tests {
         write_rows(&active, 10..100);
         let line = row(99).len() as u64 + 1;
         let t =
-            read_chain_tail_bounded::<LinuxHost>(&active, &all(1 << 20), 3 * line + 5, u64::MAX);
+            read_chain_tail_bounded::<PortableHost>(&active, &all(1 << 20), 3 * line + 5, u64::MAX);
         assert_eq!(numbers(&t), vec![99, 98, 97]);
         assert!(t.truncated, "the head of the active file was not read");
         // The total bound stops the descent too.
-        let t = read_chain_tail_bounded::<LinuxHost>(&active, &all(1 << 20), u64::MAX, 90 * line);
+        let t =
+            read_chain_tail_bounded::<PortableHost>(&active, &all(1 << 20), u64::MAX, 90 * line);
         assert_eq!(t.count, 90);
         assert!(t.truncated);
     }
@@ -486,36 +488,9 @@ mod tests {
             format!("{}\n{big}\n{}\n{{\"ts\":\"torn", row(1), row(2)),
         )
         .unwrap();
-        let t = read_chain_tail::<LinuxHost>(&active, &all(1024));
+        let t = read_chain_tail::<PortableHost>(&active, &all(1024));
         assert_eq!(numbers(&t), vec![2, 1]);
         assert!(t.truncated, "the oversized row is a row left out");
-    }
-
-    /// A symlink or a FIFO at an archive name is not read.
-    #[test]
-    fn symlinked_and_special_files_are_not_read() {
-        let dir = TempDir::new().unwrap();
-        let active = dir.path().join("log.jsonl");
-        let secret = dir.path().join("secret");
-        std::fs::write(&secret, "{\"ts\":\"2026-10-15T09:00:00Z\",\"n\":666}\n").unwrap();
-        std::os::unix::fs::symlink(&secret, dir.path().join("log.jsonl.000002")).unwrap();
-        let fifo = std::ffi::CString::new(
-            dir.path()
-                .join("log.jsonl.000001")
-                .as_os_str()
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
-        // SAFETY: a NUL-terminated path that outlives the call.
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        write_rows(&active, 0..2);
-        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
-        assert_eq!(numbers(&t), vec![1, 0]);
-        // The active path itself as a symlink is refused too.
-        let link = dir.path().join("link.jsonl");
-        std::os::unix::fs::symlink(&secret, &link).unwrap();
-        assert_eq!(read_chain_tail::<LinuxHost>(&link, &all(1 << 20)).count, 0);
     }
 
     /// The terminator a real rotation writes is recognised.
@@ -532,14 +507,14 @@ mod tests {
         }
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("rot.jsonl");
-        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let key = TestKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
         let cfg = RotationConfig {
             size_cap_bytes: 600,
             max_archives: 32,
             file_mode: 0o600,
         };
         let mut log =
-            RotatingChainLog::<P>::open(&active, key, cfg, std::sync::Arc::new(NoProtection))
+            RotatingChainLog::<P, _>::open(&active, key, cfg, std::sync::Arc::new(NoProtection))
                 .unwrap();
         for n in 0..12 {
             log.append(P {
@@ -549,7 +524,7 @@ mod tests {
             .unwrap();
         }
         assert!(!crate::chainlog::archives_newest_first(&active).is_empty());
-        let t = read_chain_tail::<LinuxHost>(&active, &all(1 << 20));
+        let t = read_chain_tail::<PortableHost>(&active, &all(1 << 20));
         assert_eq!(numbers(&t), (0..12).rev().collect::<Vec<_>>());
     }
 }

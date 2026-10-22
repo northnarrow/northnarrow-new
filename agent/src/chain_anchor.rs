@@ -1332,9 +1332,8 @@ pub(crate) fn append_raw(path: &Path, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
-    use crate::chain_host_linux::LinuxHost;
-    use std::os::unix::fs::FileExt;
+    use crate::audit::{AuditEntryDraft, AuditLog};
+    use crate::chain_host::testing::{PortableHost, TestKey};
     use tempfile::TempDir;
 
     fn draft(n: u32) -> AuditEntryDraft {
@@ -1351,8 +1350,8 @@ mod tests {
         }
     }
 
-    fn key(dir: &TempDir) -> AgentSigningKey {
-        AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap()
+    fn key(dir: &TempDir) -> TestKey {
+        TestKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap()
     }
 
     /// External audit NN-AUD-292 (FIMP-013): the heads snapshot's signature
@@ -1404,35 +1403,35 @@ mod tests {
             log.append(draft(n)).unwrap();
         }
         let ok = |l: &[u8]| crate::audit::row_is_genuine(l, &pk);
-        let head = read_file_head::<LinuxHost>(&path, &ok).unwrap().unwrap();
+        let head = read_file_head::<PortableHost>(&path, &ok).unwrap().unwrap();
         assert_eq!(head.seq, Some(4));
         assert_eq!(head.bytes, std::fs::metadata(&path).unwrap().len());
         assert_eq!(
-            check_head::<LinuxHost>(&path, &head).unwrap(),
+            check_head::<PortableHost>(&path, &head).unwrap(),
             HeadCheck::Intact
         );
         // growth keeps it intact
         log.append(draft(9)).unwrap();
         assert_eq!(
-            check_head::<LinuxHost>(&path, &head).unwrap(),
+            check_head::<PortableHost>(&path, &head).unwrap(),
             HeadCheck::Intact
         );
         // a forged trailing line is not a head
         append_raw(&path, b"{\"entry_hash\":\"");
         append_raw(&path, "ab".repeat(32).as_bytes());
         append_raw(&path, b"\"}\n");
-        let again = read_file_head::<LinuxHost>(&path, &ok).unwrap().unwrap();
+        let again = read_file_head::<PortableHost>(&path, &ok).unwrap().unwrap();
         assert_eq!(again.seq, Some(5));
         // cut below the head
         let body = std::fs::read(&path).unwrap();
         std::fs::write(&path, &body[..head.bytes as usize - 10]).unwrap();
         assert!(matches!(
-            check_head::<LinuxHost>(&path, &head).unwrap(),
+            check_head::<PortableHost>(&path, &head).unwrap(),
             HeadCheck::Shorter { .. }
         ));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            check_head::<LinuxHost>(&path, &head).unwrap(),
+            check_head::<PortableHost>(&path, &head).unwrap(),
             HeadCheck::Missing
         );
     }
@@ -1444,11 +1443,14 @@ mod tests {
         let pk = k.verifying_key();
         let file = dir.path().join(HEADS_FILE_NAME);
         assert_eq!(
-            HeadsStore::read::<LinuxHost>(&file, &pk),
+            HeadsStore::read::<PortableHost>(&file, &pk),
             HeadsRead::Missing
         );
         std::fs::write(&file, b"").unwrap();
-        assert_eq!(HeadsStore::read::<LinuxHost>(&file, &pk), HeadsRead::Empty);
+        assert_eq!(
+            HeadsStore::read::<PortableHost>(&file, &pk),
+            HeadsRead::Empty
+        );
         let mut s = HeadsSnapshot {
             counter: 1,
             ts: "t1".into(),
@@ -1461,43 +1463,23 @@ mod tests {
         s.ts = "t2".into();
         HeadsStore::write(&file, &k, &s).unwrap();
         assert!(
-            matches!(HeadsStore::read::<LinuxHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 2)
+            matches!(HeadsStore::read::<PortableHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 2)
         );
         // slot of counter 2 torn: counter 1 is still there
         let f = OpenOptions::new().write(true).open(&file).unwrap();
-        f.write_all_at(b"{\"torn", 0).unwrap();
+        PortableHost::write_all_at(&f, b"{\"torn", 0).unwrap();
         assert!(
-            matches!(HeadsStore::read::<LinuxHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 1)
+            matches!(HeadsStore::read::<PortableHost>(&file, &pk), HeadsRead::Valid(v) if v.counter == 1)
         );
         // another key's snapshot is not genuine
-        let other = AgentSigningKey::load_or_bootstrap(&dir.path().join("other")).unwrap();
+        let other = TestKey::load_or_bootstrap(&dir.path().join("other")).unwrap();
         HeadsStore::write(&file, &other, &s).unwrap();
         s.counter = 3;
         HeadsStore::write(&file, &other, &s).unwrap();
         assert!(matches!(
-            HeadsStore::read::<LinuxHost>(&file, &pk),
+            HeadsStore::read::<PortableHost>(&file, &pk),
             HeadsRead::Invalid(_)
         ));
-    }
-
-    /// External audit EVD-019 (NN-AUD-281): the head anchor the agent
-    /// creates is closed to other users, like the audit log next to it.
-    #[test]
-    fn the_heads_file_is_created_closed_to_other_users() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
-        let k = key(&dir);
-        let file = dir.path().join(HEADS_FILE_NAME);
-        let s = HeadsSnapshot {
-            counter: 1,
-            ts: "t1".into(),
-            agent_id: "00".into(),
-            second_key_added: false,
-            heads: vec![],
-        };
-        HeadsStore::write(&file, &k, &s).unwrap();
-        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o640, "chain_heads.json mode {mode:o}");
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1511,15 +1493,15 @@ mod tests {
     }
 
     fn rotating_target(path: &Path) -> ChainTarget {
-        ChainTarget::rotating::<P, LinuxHost>("test_log", path)
+        ChainTarget::rotating::<P, PortableHost>("test_log", path)
     }
 
     fn rotating_log(
         path: &Path,
-        key: AgentSigningKey,
+        key: TestKey,
         cap: u64,
-    ) -> crate::chainlog::RotatingChainLog<P> {
-        crate::chainlog::RotatingChainLog::<P>::open(
+    ) -> crate::chainlog::RotatingChainLog<P, TestKey> {
+        crate::chainlog::RotatingChainLog::<P, _>::open(
             path,
             key,
             crate::chainlog::RotationConfig {
@@ -1557,7 +1539,7 @@ mod tests {
         drop(log);
         drop(rotating_log(&active, key(&dir), 1 << 30));
         std::fs::write(&active, b"").unwrap();
-        let found = boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].kind, "chain_truncated");
         // (b) no checkpoint yet: the snapshot taken at stop
@@ -1568,7 +1550,8 @@ mod tests {
         }
         drop(log);
         assert!(
-            crate::chainlog::manifest_tail_events::<LinuxHost>(&active, "test_log", &pk).is_empty()
+            crate::chainlog::manifest_tail_events::<PortableHost>(&active, "test_log", &pk)
+                .is_empty()
         );
         Anchor::new(
             heads.clone(),
@@ -1581,12 +1564,12 @@ mod tests {
         .refresh(true, false)
         .unwrap();
         assert!(
-            boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk)
+            boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk)
                 .findings
                 .is_empty()
         );
         std::fs::write(&active, b"").unwrap();
-        let found = boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
         assert_eq!(found.findings.len(), 1, "{:?}", found.findings);
         assert_eq!(found.findings[0].kind, "chain_truncated");
         assert_eq!(found.findings[0].chain, "test_log");
@@ -1608,7 +1591,7 @@ mod tests {
         drop(log);
         assert!(crate::chainlog::current_generation(&active) > 1);
         std::fs::remove_file(&active).unwrap();
-        let found = boot_check::<LinuxHost>(&[rotating_target(&active)], &heads, &pk);
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
         assert!(
             found
                 .findings

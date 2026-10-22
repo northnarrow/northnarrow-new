@@ -590,4 +590,240 @@ mod tests {
             full(t).unwrap();
         }
     }
+
+    /// The kinds of the shipped payload types, pinned: they are part of
+    /// every v3 line on disk (external audit EVD-008, lab PR 204; from
+    /// `chainlog`'s tests, R04a, lab PR 241).
+    #[test]
+    fn the_shipped_payload_kinds_are_pinned() {
+        use crate::chainlog::ChainPayload;
+        assert_eq!(crate::detection_store::DetectionRecord::KIND, "detections");
+        assert_eq!(crate::detection_store::StatusEvent::KIND, "status_events");
+        assert_eq!(crate::net::drain::NetFlowPayload::KIND, "netflow");
+        assert_eq!(crate::fim::drain::FimDriftPayload::KIND, "fim_drift");
+    }
+
+    fn key_at(path: &Path) -> AgentSigningKey {
+        AgentSigningKey::load_or_bootstrap(path).unwrap()
+    }
+
+    fn raw_lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// EVD-007, round trip over the shipped payload types: every line the
+    /// writer produces for detections, status events, netflow and FIM drift
+    /// rows with random strings (escapes, control characters, non-ASCII,
+    /// astral), integers and floats verifies under v3 — which includes the
+    /// byte-canonical check — and is its own re-serialisation. A payload
+    /// type whose `Serialize`/`Deserialize` were asymmetric would fail its
+    /// own new rows here, before a release.
+    #[test]
+    fn every_shipped_payload_type_round_trips_byte_exactly() {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x204);
+        fn text(rng: &mut rand::rngs::StdRng) -> String {
+            const POOL: &[char] = &[
+                'a',
+                'Z',
+                '0',
+                ' ',
+                '"',
+                '\\',
+                '/',
+                '\n',
+                '\t',
+                '\r',
+                '\u{0}',
+                '\u{1f}',
+                '\u{7f}',
+                '\u{e9}',
+                '\u{20ac}',
+                '\u{2028}',
+                '\u{fffd}',
+                '\u{1d11e}',
+                '{',
+                '}',
+                ':',
+                ',',
+            ];
+            let n = rng.random_range(0..24);
+            (0..n)
+                .map(|_| POOL[rng.random_range(0..POOL.len())])
+                .collect()
+        }
+        fn opt(rng: &mut rand::rngs::StdRng) -> Option<String> {
+            rng.random_bool(0.5).then(|| text(rng))
+        }
+        fn check<P>(rows: Vec<P>)
+        where
+            P: Serialize + serde::de::DeserializeOwned + crate::chainlog::ChainPayload,
+        {
+            let dir = TempDir::new().unwrap();
+            let active = dir.path().join("log.jsonl");
+            let kp = dir.path().join("key");
+            let pk = key_at(&kp).verifying_key();
+            let mut log = crate::chainlog::RotatingChainLog::<P>::open(
+                &active,
+                key_at(&kp),
+                crate::chainlog::RotationConfig {
+                    size_cap_bytes: 16 * 1024,
+                    max_archives: 64,
+                    file_mode: 0o600,
+                },
+                std::sync::Arc::new(crate::chainlog::NoProtection),
+            )
+            .unwrap();
+            let n = rows.len() as u64;
+            for p in rows {
+                log.append(p).unwrap();
+            }
+            drop(log);
+            let r = crate::chainlog::verify_log_set::<P>(&active, &pk).unwrap();
+            assert_eq!((r.total_records, r.legacy_lines), (n, 0), "{}", P::KIND);
+            let mut files = crate::chainlog::sealed_files(&active);
+            files.push(active.clone());
+            for file in files {
+                for raw in raw_lines(&file) {
+                    if crate::chainlog::is_terminator_line(&raw)
+                        || raw.starts_with("{\"manifest\":")
+                    {
+                        continue;
+                    }
+                    let d: crate::chainlog::ChainLine<P> = serde_json::from_str(&raw).unwrap();
+                    assert_eq!(serde_json::to_string(&d).unwrap(), raw, "{}", P::KIND);
+                    assert!(crate::chainlog::line_is_genuine::<P>(raw.as_bytes(), &pk));
+                }
+            }
+        }
+        use crate::detection_store::{DetectionRecord, DetectionStatus, Principal, StatusEvent};
+        let detections: Vec<DetectionRecord> = (0..120)
+            .map(|i| {
+                let event = nn_model::Event::ProcessSpawn {
+                    pid: rng.random(),
+                    ppid: rng.random(),
+                    uid: rng.random(),
+                    gid: rng.random(),
+                    comm: text(&mut rng),
+                    filename: text(&mut rng),
+                    timestamp_ns: rng.random(),
+                    argv: Vec::new(),
+                    parent_comm: text(&mut rng),
+                    parent_start_ns: 0,
+                    start_ns: 0,
+                    parent_is_kthread: false,
+                    exe: Default::default(),
+                    argv_truncated: false,
+                    filename_truncated: false,
+                    stdio: Default::default(),
+                };
+                let verdict = nn_model::Verdict {
+                    rule_id: text(&mut rng),
+                    rule_name: text(&mut rng),
+                    category: text(&mut rng),
+                    action: nn_model::ResponseAction::Log,
+                    severity: nn_model::Severity::High,
+                    reasoning: text(&mut rng),
+                    event_pid: 1,
+                    event_filename: text(&mut rng),
+                    timestamp_ns: 1,
+                };
+                let mut d = DetectionRecord::from_rule(
+                    i,
+                    text(&mut rng),
+                    &event,
+                    &verdict,
+                    nn_model::posture_types::PostureKind::Engaged,
+                    text(&mut rng),
+                );
+                d.confidence = loop {
+                    let f = f64::from_bits(rng.random());
+                    if f.is_finite() {
+                        break f;
+                    }
+                };
+                d.suppressed_before = rng.random_bool(0.3).then(|| rng.random());
+                d.file = opt(&mut rng);
+                d.operation = opt(&mut rng);
+                d
+            })
+            .collect();
+        check(detections);
+        let statuses: Vec<StatusEvent> = (0..120)
+            .map(|_| StatusEvent {
+                detection_id: rng.random(),
+                new_status: DetectionStatus::Investigating,
+                ts: text(&mut rng),
+                principal: Principal {
+                    pid: rng.random(),
+                    comm: text(&mut rng),
+                    uid: rng.random(),
+                    ppid: rng.random_bool(0.5).then(|| rng.random()),
+                },
+                note: opt(&mut rng),
+                principal_exe: opt(&mut rng),
+            })
+            .collect();
+        check(statuses);
+        let flows: Vec<crate::net::drain::NetFlowPayload> = (0..120)
+            .map(|_| crate::net::drain::NetFlowPayload {
+                ts: text(&mut rng),
+                flow_id: text(&mut rng),
+                start_ns: rng.random(),
+                end_ns: rng.random(),
+                family: rng.random(),
+                src_addr: text(&mut rng),
+                src_port: rng.random(),
+                dst_addr: text(&mut rng),
+                dst_port: rng.random(),
+                proto: rng.random(),
+                pid: rng.random(),
+                uid: rng.random(),
+                comm: text(&mut rng),
+                exe: opt(&mut rng),
+                bytes_sent: rng.random(),
+                bytes_recv: rng.random(),
+                resolved_hostname: opt(&mut rng),
+                ja3: opt(&mut rng),
+                ja4: opt(&mut rng),
+                sni: opt(&mut rng),
+                close_reason: rng.random(),
+                agent_id: text(&mut rng),
+                decision_engine_skipped: rng.random(),
+            })
+            .collect();
+        check(flows);
+        let drifts: Vec<crate::fim::drain::FimDriftPayload> = (0..120)
+            .map(|_| crate::fim::drain::FimDriftPayload {
+                ts: text(&mut rng),
+                path: text(&mut rng),
+                op: nn_model::telemetry::FimOp::AttrChanged,
+                baseline_sha256: opt(&mut rng),
+                new_sha256: opt(&mut rng),
+                modifier_pid: rng.random(),
+                modifier_uid: rng.random(),
+                modifier_comm: text(&mut rng),
+                severity: crate::fim::drain::DriftSeverity::High,
+                decision_engine_skipped: rng.random(),
+                skip_reason: text(&mut rng),
+                agent_id: text(&mut rng),
+                attrs: rng
+                    .random_bool(0.5)
+                    .then(|| nn_model::telemetry::FileAttrChange {
+                        mode_before: rng.random(),
+                        mode_after: rng.random(),
+                        uid_before: rng.random(),
+                        uid_after: rng.random(),
+                        gid_before: rng.random(),
+                        gid_after: rng.random(),
+                    }),
+            })
+            .collect();
+        check(drifts);
+    }
 }
