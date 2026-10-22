@@ -54,8 +54,13 @@ fn fixtures() -> PathBuf {
     ))
 }
 
+/// The fixed key, read as the agent reads its key file (the hex in a file
+/// of its own; no key file is kept in the repository, `*.key` is ignored).
 fn key() -> AgentSigningKey {
-    read_signing_key(&fixtures().join("agent.sig.key")).expect("the fixture key")
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.sig.key");
+    std::fs::write(&path, format!("{KEY_HEX}\n")).unwrap();
+    read_signing_key(&path).expect("the fixed key")
 }
 
 /// One row of the pinned rotating log.
@@ -178,7 +183,6 @@ fn log_files(dir: &Path) -> Vec<PathBuf> {
 fn regenerate_chain_pin_fixtures() {
     let out = PathBuf::from(std::env::var_os("NN_CHAIN_PIN_REGEN").expect("NN_CHAIN_PIN_REGEN"));
     std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("agent.sig.key"), format!("{KEY_HEX}\n")).unwrap();
     let work = tempfile::tempdir().unwrap();
     let mut log = AuditLog::open(&work.path().join("audit.log"), key(), AGENT_ID).unwrap();
     for d in drafts() {
