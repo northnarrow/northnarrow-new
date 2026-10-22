@@ -453,6 +453,51 @@ pub struct AuditEntryDraft {
     pub client_exe: Option<String>,
 }
 
+// ── the identity a boot signs as ────────────────────────────────────
+
+/// Width of the raw agent_id in bytes. Bound by the design (§6.5
+/// "16-byte UUID") and by the
+/// [`nn_proto::admin_signed_payload::SignedPayload::agent_id`]
+/// array type. Changing this is a wire-protocol break.
+///
+/// R04a (lab PR 241): this, [`IdentitySource`] and [`AgentIdentity`] are
+/// `crate::agent_id`'s, unchanged, defined here with the chain that
+/// attests them ([`AuditLog::attest_identity`]); `agent_id` re-exports them.
+pub const AGENT_ID_LEN: usize = 16;
+
+/// Where this boot's identity came from (external audit MAIN-009,
+/// EVD-020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentitySource {
+    /// Read from the file.
+    Loaded,
+    /// The file was absent: a fresh id was minted and persisted.
+    Minted,
+    /// The file could not be read, parsed or written (the reason): the id
+    /// is a per-boot random one, never persisted.
+    Unavailable(String),
+}
+
+impl IdentitySource {
+    /// The word the signed rows and the journal use.
+    pub fn label(&self) -> &'static str {
+        match self {
+            IdentitySource::Loaded => "loaded",
+            IdentitySource::Minted => "minted",
+            IdentitySource::Unavailable(_) => "unavailable",
+        }
+    }
+}
+
+/// The identity a boot signs as, read once (`crate::agent_id::resolve`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentIdentity {
+    pub id: [u8; AGENT_ID_LEN],
+    pub source: IdentitySource,
+    /// The file it was read from, minted into, or could not be used.
+    pub path: PathBuf,
+}
+
 // ── audit log writer ────────────────────────────────────────────────
 
 /// Append-only writer for the audit log. Holds the
@@ -629,7 +674,7 @@ impl AuditLog {
             "chain log: unreadable lines skipped — corruption or tampering"
         );
         self.append(AuditEntryDraft {
-            op: crate::self_integrity::AUDIT_OP.to_string(),
+            op: INTEGRITY_DRIFT_OP.to_string(),
             extra: serde_json::json!({
                 "kind": "chain_lines_unreadable",
                 "detail": format!("{}: {skipped} unreadable line(s) skipped at boot", file.display()),
@@ -700,10 +745,7 @@ impl AuditLog {
     ///
     /// An unchanged identity loaded from the file adds nothing.
     ///
-    /// [`IdentitySource::Minted`]: crate::agent_id::IdentitySource::Minted
-    /// [`IdentitySource::Unavailable`]: crate::agent_id::IdentitySource::Unavailable
-    pub fn attest_identity(&mut self, identity: &crate::agent_id::AgentIdentity) -> Result<()> {
-        use crate::agent_id::IdentitySource;
+    pub fn attest_identity(&mut self, identity: &AgentIdentity) -> Result<()> {
         if std::mem::replace(&mut self.identity_attested, true) {
             return Ok(());
         }
@@ -737,7 +779,7 @@ impl AuditLog {
             }
             IdentitySource::Unavailable(reason) => {
                 self.append(self_row(
-                    crate::self_integrity::AUDIT_OP,
+                    INTEGRITY_DRIFT_OP,
                     serde_json::json!({
                         "kind": "subsystem_degraded",
                         "detail": format!(
@@ -769,7 +811,7 @@ impl AuditLog {
                  signatures and overlays made for the old id no longer verify"
             );
             self.append(self_row(
-                crate::self_integrity::AUDIT_OP,
+                INTEGRITY_DRIFT_OP,
                 serde_json::json!({
                     "kind": AGENT_ID_CHANGED_KIND,
                     "from": from,
@@ -863,8 +905,9 @@ impl AuditLog {
         integrity: &str,
         provenance: &str,
         detail: &str,
+        build: &AgentBuild,
     ) -> Result<AuditEntry> {
-        self.boot_refused_by("install_manifest", integrity, provenance, detail)
+        self.boot_refused_by("install_manifest", integrity, provenance, detail, build)
     }
 
     /// Lab PR 218: [`Self::boot_refused`] for any boot gate — `refused_by`
@@ -875,11 +918,12 @@ impl AuditLog {
         integrity: &str,
         provenance: &str,
         detail: &str,
+        build: &AgentBuild,
     ) -> Result<AuditEntry> {
         self.append(AuditEntryDraft {
             op: "agent_boot".to_string(),
             extra: serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": build.version,
                 "refused_by": gate,
                 "binary_integrity": integrity,
                 "install_provenance": provenance,
@@ -905,16 +949,18 @@ impl AuditLog {
     /// the release and whether the binaries running now still match it.
     /// `detect_only`: where detect-only mode came from (`--detect-only` or
     /// `NAME=value` of the variable), `None` when the agent enforces.
+    /// `build`: the agent's version, features and BPF guard mode.
     pub fn boot_probe(
         &mut self,
         detect_only: Option<&str>,
         integrity: &str,
         provenance: &str,
+        build: &AgentBuild,
     ) -> Result<AuditEntry> {
         self.append(AuditEntryDraft {
             op: "agent_boot".to_string(),
             extra: serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": build.version,
                 "detect_only": detect_only.is_some(),
                 // External audit MAIN-008: the source, not only the bool.
                 "detect_only_source": detect_only,
@@ -923,8 +969,8 @@ impl AuditLog {
                 "previous_run": self.previous_run.to_json(),
                 // External audit ATP-009: what the build is and how the BPF
                 // guard runs — a debug-trigger build only observes.
-                "build_features": build_features(),
-                "bpf_guard": if crate::anti_tamper::bpf_defense::enforce_mode() {
+                "build_features": build.features,
+                "bpf_guard": if build.bpf_guard_enforce {
                     "enforce"
                 } else {
                     "observe"
@@ -942,34 +988,26 @@ impl AuditLog {
     }
 }
 
-/// External audit ATP-009: the test and debug features this binary was
-/// built with — none in a release build. Also printed by
-/// `northnarrow-agent --build-features`, which the range bootstrap checks
-/// before it installs a binary (external audit NN-AUD-211) and the release
-/// workflow checks on every artefact it builds (external audit PROC-015).
-pub fn build_features() -> Vec<&'static str> {
-    LAB_FEATURES
-        .iter()
-        .filter(|(_, built)| *built)
-        .map(|(name, _)| *name)
-        .collect()
+/// What the agent's `agent_boot` rows say about its build (external audit
+/// ATP-009): its version, the test and debug features it was built with
+/// (none in a release build) and whether the BPF guard enforces. R04a (lab
+/// PR 241): given by the agent (`crate::build_info::agent_build`) — read
+/// here, `env!` and `cfg!(feature)` would be this crate's, not the agent's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBuild {
+    pub version: &'static str,
+    pub features: Vec<&'static str>,
+    pub bpf_guard_enforce: bool,
 }
-
-/// External audit PROC-015 (NN-AUD-302): every cargo feature of this crate
-/// (`agent/Cargo.toml`), with whether this binary was built with it. All
-/// of them are test, debug or demo features, none is a default, and
-/// `agent/tests/build_features_cli.rs` holds this list to the manifest, so
-/// a new feature cannot be added without [`build_features`] naming it.
-pub const LAB_FEATURES: &[(&str, bool)] = &[
-    ("debug-trigger", cfg!(feature = "debug-trigger")),
-    ("demo-tappa5", cfg!(feature = "demo-tappa5")),
-    // POS-013, WDG-R02: builds `examples/posture_demo.rs` only.
-    ("posture-demo", cfg!(feature = "posture-demo")),
-    ("test-privileged", cfg!(feature = "test-privileged")),
-];
 
 /// Audit op recording a repaired torn tail of a chain log.
 pub const CHAIN_TAIL_REPAIRED_OP: &str = "chain_tail_repaired";
+
+/// The op of the signed integrity findings (`integrity_drift`: a drift of
+/// the host or of a chain, a degraded subsystem, an unreadable line). R04a
+/// (lab PR 241): `crate::self_integrity::AUDIT_OP`, which now names this,
+/// so the chain code that writes findings names no module of the host.
+pub const INTEGRITY_DRIFT_OP: &str = "integrity_drift";
 
 /// External audit EVD-020: the agent minted its identity
 /// ([`AuditLog::attest_identity`]).
@@ -1596,6 +1634,45 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    /// The build facts of a test's boot rows.
+    fn test_build() -> AgentBuild {
+        AgentBuild {
+            version: "0.0.0-test",
+            features: vec!["test-privileged"],
+            bpf_guard_enforce: false,
+        }
+    }
+
+    /// R04a (lab PR 241): the boot row records the build facts it is given
+    /// (the agent's, `crate::build_info::agent_build`), as it read them.
+    #[test]
+    fn boot_rows_record_the_build_they_are_given() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        let e = log
+            .boot_probe(None, "verified", "attested", &test_build())
+            .unwrap();
+        assert_eq!(e.extra["version"], "0.0.0-test");
+        assert_eq!(
+            e.extra["build_features"],
+            serde_json::json!(["test-privileged"])
+        );
+        assert_eq!(e.extra["bpf_guard"], "observe");
+        let enforcing = AgentBuild {
+            bpf_guard_enforce: true,
+            ..test_build()
+        };
+        let e = log
+            .boot_probe(None, "verified", "attested", &enforcing)
+            .unwrap();
+        assert_eq!(e.extra["bpf_guard"], "enforce");
+        let e = log
+            .boot_refused_by("bpf_lsm", "verified", "checksums", "x", &test_build())
+            .unwrap();
+        assert_eq!(e.extra["version"], "0.0.0-test");
+    }
+
     fn fresh_paths() -> (TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().expect("create tempdir");
         let key_path = dir.path().join("agent.sig.key");
@@ -1674,7 +1751,9 @@ mod tests {
         // first boot: nothing before it
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
         assert_eq!(log.previous_run(), &PreviousRun::None);
-        let boot = log.boot_probe(None, "verified", "source-tree").unwrap();
+        let boot = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
         assert_eq!(boot.extra["previous_run"]["ended"], "none");
         log.append(sample_draft(1)).unwrap();
         // killed: reopen without a stop entry
@@ -1689,7 +1768,9 @@ mod tests {
             }
             other => panic!("expected Abrupt, got {other:?}"),
         }
-        let boot2 = log.boot_probe(None, "verified", "source-tree").unwrap();
+        let boot2 = log
+            .boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
         assert_eq!(boot2.extra["previous_run"]["ended"], "abrupt");
         log.stop_entry("sigterm", 42).unwrap();
         // clean stop
@@ -1742,11 +1823,19 @@ mod tests {
         let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
         let e = log
-            .boot_refused_by("bpf_lsm", "verified", "checksums", "anti-tamper: no bpf")
+            .boot_refused_by(
+                "bpf_lsm",
+                "verified",
+                "checksums",
+                "anti-tamper: no bpf",
+                &test_build(),
+            )
             .unwrap();
         assert_eq!(e.result, "refused");
         assert_eq!(e.extra["refused_by"], "bpf_lsm");
-        let e = log.boot_refused("mismatch", "source-tree", "x").unwrap();
+        let e = log
+            .boot_refused("mismatch", "source-tree", "x", &test_build())
+            .unwrap();
         assert_eq!(e.extra["refused_by"], "install_manifest");
         assert!(!verified_boot_recorded(&log_path).unwrap());
     }
@@ -1760,15 +1849,23 @@ mod tests {
         let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         assert!(!verified_boot_recorded(&log_path).unwrap(), "no file yet");
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
-        log.boot_probe(None, "no-manifest", "none").unwrap();
-        log.boot_probe(None, "not-applicable", "none").unwrap();
-        log.boot_refused("mismatch", "source-tree", "nn-admin: expected 00 got 11")
+        log.boot_probe(None, "no-manifest", "none", &test_build())
             .unwrap();
+        log.boot_probe(None, "not-applicable", "none", &test_build())
+            .unwrap();
+        log.boot_refused(
+            "mismatch",
+            "source-tree",
+            "nn-admin: expected 00 got 11",
+            &test_build(),
+        )
+        .unwrap();
         let mut other = sample_draft(1);
         other.extra = serde_json::json!({ "binary_integrity": "verified" });
         log.append(other).unwrap();
         assert!(!verified_boot_recorded(&log_path).unwrap());
-        log.boot_probe(None, "verified", "source-tree").unwrap();
+        log.boot_probe(None, "verified", "source-tree", &test_build())
+            .unwrap();
         log.stop_entry("sigterm", 1).unwrap();
         assert!(verified_boot_recorded(&log_path).unwrap());
         // a corrupt line: the caller cannot tell
@@ -1988,7 +2085,9 @@ mod tests {
         let path = dir.path().join("audit.log");
         let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
         let mut log = AuditLog::open(&path, key, [7u8; 16]).unwrap();
-        let e = log.boot_probe(None, "verified", "attested").expect("probe");
+        let e = log
+            .boot_probe(None, "verified", "attested", &test_build())
+            .expect("probe");
         assert_eq!(e.op, "agent_boot");
         assert_eq!(e.key_fp, "agent-self");
         let body = std::fs::read_to_string(&path).unwrap();
@@ -2007,7 +2106,9 @@ mod tests {
             Ok(l) => l,
             Err(_) => return, // open itself refusing is the same signal
         };
-        assert!(log.boot_probe(None, "verified", "attested").is_err());
+        assert!(log
+            .boot_probe(None, "verified", "attested", &test_build())
+            .is_err());
     }
 
     #[test]
@@ -2025,11 +2126,18 @@ mod tests {
         let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
         let mut log = AuditLog::open(&path, key, [7u8; 16]).unwrap();
         let e = log
-            .boot_probe(Some("NN_DETECT_ONLY=yes"), "verified", "attested")
+            .boot_probe(
+                Some("NN_DETECT_ONLY=yes"),
+                "verified",
+                "attested",
+                &test_build(),
+            )
             .unwrap();
         assert_eq!(e.extra["detect_only"], true);
         assert_eq!(e.extra["detect_only_source"], "NN_DETECT_ONLY=yes");
-        let e = log.boot_probe(None, "verified", "attested").unwrap();
+        let e = log
+            .boot_probe(None, "verified", "attested", &test_build())
+            .unwrap();
         assert_eq!(e.extra["detect_only"], false);
         assert!(e.extra["detect_only_source"].is_null());
     }
@@ -2344,11 +2452,8 @@ mod tests {
 
     // ── External audit EVD-020 / MAIN-009: the identity in the chain ──
 
-    fn identity(
-        id: [u8; 16],
-        source: crate::agent_id::IdentitySource,
-    ) -> crate::agent_id::AgentIdentity {
-        crate::agent_id::AgentIdentity {
+    fn identity(id: [u8; 16], source: IdentitySource) -> AgentIdentity {
+        AgentIdentity {
             id,
             source,
             path: PathBuf::from("/etc/northnarrow/agent_id"),
@@ -2358,7 +2463,7 @@ mod tests {
     fn drifts<'a>(rows: &'a [AuditEntry], kind: &str) -> Vec<&'a AuditEntry> {
         rows.iter()
             .filter(|r| {
-                r.op == crate::self_integrity::AUDIT_OP
+                r.op == INTEGRITY_DRIFT_OP
                     && r.extra.get("kind").and_then(|k| k.as_str()) == Some(kind)
             })
             .collect()
@@ -2375,7 +2480,6 @@ mod tests {
     /// next boot with B is quiet.
     #[test]
     fn a_chain_last_signed_as_another_id_reports_the_change_once() {
-        use crate::agent_id::IdentitySource;
         let (_d, key_path, log_path) = fresh_paths();
         let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         let (a, b) = ([0xAAu8; 16], [0xBBu8; 16]);
@@ -2416,7 +2520,6 @@ mod tests {
     /// EVD-020: a first start (empty chain) records the mint, no drift.
     #[test]
     fn a_fresh_chain_with_a_minted_id_records_the_mint_and_no_drift() {
-        use crate::agent_id::IdentitySource;
         let (_d, key_path, log_path) = fresh_paths();
         let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         let id = [0x42u8; 16];
@@ -2438,7 +2541,6 @@ mod tests {
     /// mints B over a chain last signed as A: the mint and the change.
     #[test]
     fn a_mint_over_an_existing_chain_records_the_mint_and_the_change() {
-        use crate::agent_id::IdentitySource;
         let (_d, key_path, log_path) = fresh_paths();
         let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         let (a, b) = ([0x0Au8; 16], [0x0Bu8; 16]);
@@ -2468,7 +2570,6 @@ mod tests {
     /// change too.
     #[test]
     fn an_unusable_identity_is_a_signed_degradation() {
-        use crate::agent_id::IdentitySource;
         let (_d, key_path, log_path) = fresh_paths();
         let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         let (a, per_boot) = ([0x0Au8; 16], [0x77u8; 16]);
@@ -2500,7 +2601,6 @@ mod tests {
     /// the change.
     #[test]
     fn legacy_rows_keep_verifying_and_an_old_zero_fallback_is_named() {
-        use crate::agent_id::IdentitySource;
         let (_d, key_path, log_path) = fresh_paths();
         let key = || AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
         // write_legacy_rows signs as the all-zero id, as the old fallback did

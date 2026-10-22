@@ -23,6 +23,9 @@ pub mod audit;
 /// self-test, the degradations, the trust level and the capability manifest.
 pub mod boot;
 pub mod bounded_cmd;
+/// The binary's version, cargo features and BPF guard mode (from `audit`,
+/// R04a, lab PR 241).
+pub mod build_info;
 pub mod canary;
 pub mod chain_anchor;
 pub(crate) mod chain_tail;

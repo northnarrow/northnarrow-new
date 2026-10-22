@@ -886,7 +886,7 @@ impl ChainFinding {
     /// The signed `integrity_drift` entry.
     pub fn draft(&self) -> AuditEntryDraft {
         AuditEntryDraft {
-            op: crate::self_integrity::AUDIT_OP.to_string(),
+            op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
             extra: serde_json::json!({
                 "kind": self.kind,
                 "chain": self.chain,

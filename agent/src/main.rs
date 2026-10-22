@@ -1169,7 +1169,7 @@ fn report_open_rules(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.build_features {
-        let features = northnarrow_agent::audit::build_features();
+        let features = northnarrow_agent::build_info::build_features();
         if features.is_empty() {
             println!("none");
         } else {
@@ -2313,6 +2313,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                             detect_only_source.as_deref(),
                             integrity.label(),
                             integrity.provenance(),
+                            &northnarrow_agent::build_info::agent_build(),
                         ) {
                             Ok(entry) => {
                                 info!(
@@ -6227,7 +6228,13 @@ fn record_refused_boot(
     if let Some((source, what)) = degraded {
         northnarrow_agent::boot::degradation::sign_into(&mut log, source, what, true);
     }
-    match log.boot_refused_by(gate, integrity, provenance, detail) {
+    match log.boot_refused_by(
+        gate,
+        integrity,
+        provenance,
+        detail,
+        &northnarrow_agent::build_info::agent_build(),
+    ) {
         Ok(e) => {
             info!(entry_hash = %e.entry_hash, gate, "refused boot recorded in the audit chain")
         }

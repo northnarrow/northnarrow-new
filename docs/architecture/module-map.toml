@@ -154,6 +154,10 @@ planned = false
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 217): an external command with a deadline
 "bounded_cmd" = "nn-linux"
+# post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
+# guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
+# rule 4)
+"build_info" = "northnarrow-agent"
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
 # post-plan (lab PR 178): the one reader of the canary chains' lines
@@ -280,6 +284,6 @@ planned = false
 [ratchet]
 nn-admin = 6
 nn-core = 53
-nn-evidence = 12
+nn-evidence = 8
 nn-linux = 3
 nn-proto = 3
