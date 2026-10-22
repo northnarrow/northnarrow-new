@@ -2459,6 +2459,165 @@ mod tests {
             assert_eq!(compute_ja3(&hello), "7c8b1b3287298e5d9d59f8e6cb769274");
         }
     }
+
+    /// Lab PR 242 (R06 of the Wave 4 restructure): what the parser makes of
+    /// bytes, pinned on `main` before the file moved from the agent to
+    /// nn-parse and unchanged after — on the `tls_client_hello` fuzz seeds
+    /// every field and fingerprint, and on a corpus of hostile inputs
+    /// (every prefix and mutants of the seeds and the reference vectors) a
+    /// SHA-256 over everything each input parses to.
+    mod output_pins {
+        use super::*;
+
+        /// The fuzz seeds (fuzz/seeds/tls_client_hello), the bytes the fuzz
+        /// job replays: one record-wrapped hello, one handshake message.
+        const SEEDS: [(&str, &[u8]); 2] = [
+            (
+                "chrome-shaped",
+                include_bytes!(concat!(
+                    env!("NN_REPO_ROOT"),
+                    "/fuzz/seeds/tls_client_hello/chrome-shaped.bin"
+                )),
+            ),
+            (
+                "curl-shaped-handshake-only",
+                include_bytes!(concat!(
+                    env!("NN_REPO_ROOT"),
+                    "/fuzz/seeds/tls_client_hello/curl-shaped-handshake-only.bin"
+                )),
+            ),
+        ];
+
+        /// Everything the parser makes of `bytes`, on one line: the outcome
+        /// and, for a complete hello, its fields, the SNI both ways, the
+        /// ALPN, JA3's input, JA3 (MD5) and JA4.
+        fn render(bytes: &[u8]) -> String {
+            let hello = match parse_client_hello_outcome(bytes) {
+                ClientHelloParse::Complete(hello) => hello,
+                other => {
+                    assert_eq!(parse_client_hello(bytes), None);
+                    return format!("{other:?}");
+                }
+            };
+            assert_eq!(parse_client_hello(bytes).as_ref(), Some(&hello));
+            let extensions: Vec<String> = hello
+                .extensions
+                .iter()
+                .map(|e| format!("{}:{}", e.ext_type, hex::encode(&e.data)))
+                .collect();
+            format!(
+                "Complete version={} random={} session_id={} ciphers={:?} compression={:?} \
+                 extensions=[{}] sni={:?} extract_sni={:?} alpn={:?} ja3_raw={} ja3={} ja4={}",
+                hello.version,
+                hex::encode(hello.random),
+                hex::encode(&hello.session_id),
+                hello.cipher_suites,
+                hello.compression_methods,
+                extensions.join(" "),
+                sni(&hello),
+                extract_sni(&hello),
+                extract_alpn(&hello),
+                compute_ja3_raw(&hello),
+                compute_ja3(&hello),
+                compute_ja4(&hello),
+            )
+        }
+
+        /// Protects: the seeds parse to the same fields and fingerprints
+        /// wherever the parser lives.
+        #[test]
+        fn the_fuzz_seeds_parse_to_the_pinned_fingerprints() {
+            let want = [
+                concat!(
+                    "Complete version=771 ",
+                    "random=4242424242424242424242424242424242424242424242424242424242424242 ",
+                    "session_id= ciphers=[2570, 4865, 4866, 4867] compression=[0] ",
+                    "extensions=[43690: 0:000e00000b6578616d706c652e636f6d 10:0004001d0017 ",
+                    "11:0100 13:000404030804 16:000c02683208687474702f312e31 43:0403040303] ",
+                    "sni=Host(\"example.com\") extract_sni=Some(\"example.com\") ",
+                    "alpn=[\"h2\", \"http/1.1\"] ",
+                    "ja3_raw=771,4865-4866-4867,0-10-11-13-16-43,29-23,0 ",
+                    "ja3=7c8b1b3287298e5d9d59f8e6cb769274 ja4=t13d0306h2_55b375c5d22e_fb71836bce29"
+                ),
+                concat!(
+                    "Complete version=771 ",
+                    "random=0707070707070707070707070707070707070707070707070707070707070707 ",
+                    "session_id=1111111111111111111111111111111111111111111111111111111111111111 ",
+                    "ciphers=[4866, 4867, 4865, 49196, 49200, 159] compression=[0] ",
+                    "extensions=[0:001200000f6170692e6578616d706c652e6f7267 11:03000102 ",
+                    "10:0006001d00170018 16:000908687474702f312e31 13:00080403050306030804 ",
+                    "43:0403040303] ",
+                    "sni=Host(\"api.example.org\") extract_sni=Some(\"api.example.org\") ",
+                    "alpn=[\"http/1.1\"] ",
+                    "ja3_raw=771,4866-4867-4865-49196-49200-159,0-11-10-16-13-43,29-23-24,0-1-2 ",
+                    "ja3=50a5c09058ba3dfce127ba686a35b8d4 ja4=t13d0606h1_50064deaa0fd_453946b46bd2"
+                ),
+            ];
+            for ((name, bytes), want) in SEEDS.iter().zip(want) {
+                assert_eq!(render(bytes), want, "{name}");
+            }
+        }
+
+        /// Every prefix of each seed and reference vector (the incomplete
+        /// hellos and the cut records), then 300 mutants of each: one to
+        /// four bytes set to 0x00, 0xFF or a random value, a third of them
+        /// then cut short — from a fixed xorshift stream.
+        fn hostile_corpus() -> Vec<Vec<u8>> {
+            let mut bases: Vec<Vec<u8>> = SEEDS.iter().map(|(_, b)| b.to_vec()).collect();
+            bases.extend(VECTORS.iter().map(|v| (v.build)()));
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut out = Vec::new();
+            for base in &bases {
+                out.extend((0..=base.len()).map(|n| base[..n].to_vec()));
+                for _ in 0..300 {
+                    let mut m = base.clone();
+                    for _ in 0..(1 + next() % 4) {
+                        let at = (next() as usize) % m.len();
+                        m[at] = match next() % 4 {
+                            0 => 0x00,
+                            1 => 0xFF,
+                            _ => next() as u8,
+                        };
+                    }
+                    if next() % 3 == 0 {
+                        let keep = (next() as usize) % m.len();
+                        m.truncate(keep);
+                    }
+                    out.push(m);
+                }
+            }
+            out
+        }
+
+        /// Protects: hostile bytes parse to the same outcome, fields and
+        /// fingerprints wherever the parser lives — the corpus's renderings
+        /// in order, hashed; the counts say all three outcomes are covered.
+        #[test]
+        fn a_hostile_corpus_parses_to_the_pinned_digest() {
+            let mut all = String::new();
+            let (mut complete, mut incomplete, mut invalid) = (0usize, 0usize, 0usize);
+            for input in hostile_corpus() {
+                match parse_client_hello_outcome(&input) {
+                    ClientHelloParse::Complete(_) => complete += 1,
+                    ClientHelloParse::Incomplete => incomplete += 1,
+                    ClientHelloParse::Invalid => invalid += 1,
+                }
+                all.push_str(&render(&input));
+                all.push('\n');
+            }
+            assert_eq!((complete, incomplete, invalid), (1840, 3842, 877));
+            assert_eq!(
+                hex::encode(Sha256::digest(all.as_bytes())),
+                "b395f945cdb9c32a2a0e4a99286b0f0d4b3475965b2c16c32c3903924b7052fc"
+            );
+        }
+    }
 }
 
 /// Kani proofs (Tappa 10.8, "verifica formale dopo il fuzzing"). Every byte

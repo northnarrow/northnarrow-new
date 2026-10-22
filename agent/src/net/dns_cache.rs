@@ -1175,6 +1175,149 @@ mod tests {
         assert!(parse_a_records(&one_answer).is_empty());
     }
 
+    /// Lab PR 242 (R06 of the Wave 4 restructure): what the reply parser
+    /// makes of bytes, pinned on `main` before it moved from the agent to
+    /// nn-parse and unchanged after — on the `dns_records` fuzz seeds and
+    /// regression the answers each holds, and on a corpus of hostile inputs
+    /// (every prefix and mutants of those and of this module's responses) a
+    /// SHA-256 over everything each input parses to.
+    mod output_pins {
+        use super::*;
+        use sha2::{Digest as _, Sha256};
+
+        /// The fuzz job's inputs for `dns_records`: a response with A, AAAA
+        /// and CNAME answers, the QNAME a sensor copies, and the NN-AUD-185
+        /// regression (a dot inside a label).
+        const INPUTS: [(&str, &[u8]); 3] = [
+            (
+                "seeds/response-a-aaaa-cname",
+                include_bytes!(concat!(
+                    env!("NN_REPO_ROOT"),
+                    "/fuzz/seeds/dns_records/response-a-aaaa-cname.bin"
+                )),
+            ),
+            (
+                "seeds/sensor-qname-then-type",
+                include_bytes!(concat!(
+                    env!("NN_REPO_ROOT"),
+                    "/fuzz/seeds/dns_records/sensor-qname-then-type.bin"
+                )),
+            ),
+            (
+                "regressions/nn-aud-185-dot-inside-label",
+                include_bytes!(concat!(
+                    env!("NN_REPO_ROOT"),
+                    "/fuzz/regressions/dns_records/nn-aud-185-dot-inside-label.bin"
+                )),
+            ),
+        ];
+
+        /// Everything the parser makes of `bytes`: the answers (or the
+        /// refusal) and what the two public parsers return.
+        fn render(bytes: &[u8]) -> String {
+            format!(
+                "{:?} a={:?} aaaa={:?}",
+                try_parse_answers(bytes),
+                parse_a_records(bytes),
+                parse_aaaa_records(bytes)
+            )
+        }
+
+        /// Protects: the fuzz inputs parse to the same answers wherever the
+        /// parser lives.
+        #[test]
+        fn the_fuzz_inputs_parse_to_the_pinned_answers() {
+            let want = [
+                concat!(
+                    "Some([A(93.184.216.34), Aaaa(2606:2800:220:1:248:1893:25c8:1946), Other]) ",
+                    "a=[93.184.216.34] aaaa=[2606:2800:220:1:248:1893:25c8:1946]"
+                ),
+                "None a=[] aaaa=[]",
+                "None a=[] aaaa=[]",
+            ];
+            for ((name, bytes), want) in INPUTS.iter().zip(want) {
+                assert_eq!(render(bytes), want, "{name}");
+            }
+        }
+
+        /// Every prefix of each fuzz input and of this module's responses
+        /// (A, AAAA, the longest name, a compressed answer name), then 500
+        /// mutants of each: one to four bytes set to 0x00, 0xFF, 0xC0 or a
+        /// random value, a third of them then cut short — from a fixed
+        /// xorshift stream.
+        fn hostile_corpus() -> Vec<Vec<u8>> {
+            let mut bases: Vec<Vec<u8>> = INPUTS.iter().map(|(_, b)| b.to_vec()).collect();
+            bases.push(build_response_a(
+                "example.com",
+                Ipv4Addr::new(93, 184, 216, 34),
+            ));
+            bases.push(build_response_aaaa(
+                "example.com",
+                Ipv6Addr::new(0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25c8, 0x1946),
+            ));
+            bases.push(response_with_name(&name_of_labels(&[63, 63, 63, 61])));
+            let mut compressed = build_response_a("example.com", Ipv4Addr::new(9, 9, 9, 9));
+            let answer_at = DNS_HEADER_LEN + "example.com".len() + 2 + 4;
+            let rest = compressed.split_off(answer_at + "example.com".len() + 2);
+            compressed.truncate(answer_at);
+            compressed.extend_from_slice(&[0xC0, 0x0C]);
+            compressed.extend_from_slice(&rest);
+            bases.push(compressed);
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut out = Vec::new();
+            for base in &bases {
+                out.extend((0..=base.len()).map(|n| base[..n].to_vec()));
+                for _ in 0..500 {
+                    let mut m = base.clone();
+                    for _ in 0..(1 + next() % 4) {
+                        let at = (next() as usize) % m.len();
+                        m[at] = match next() % 5 {
+                            0 => 0x00,
+                            1 => 0xFF,
+                            2 => 0xC0,
+                            _ => next() as u8,
+                        };
+                    }
+                    if next() % 3 == 0 {
+                        let keep = (next() as usize) % m.len();
+                        m.truncate(keep);
+                    }
+                    out.push(m);
+                }
+            }
+            out
+        }
+
+        /// Protects: hostile bytes parse to the same answers wherever the
+        /// parser lives — the corpus's renderings in order, hashed; the
+        /// counts say refusals, empty and non-empty answers are covered.
+        #[test]
+        fn a_hostile_corpus_parses_to_the_pinned_digest() {
+            let mut all = String::new();
+            let (mut refused, mut empty, mut answered) = (0usize, 0usize, 0usize);
+            for input in hostile_corpus() {
+                match try_parse_answers(&input) {
+                    None => refused += 1,
+                    Some(a) if a.is_empty() => empty += 1,
+                    Some(_) => answered += 1,
+                }
+                all.push_str(&render(&input));
+                all.push('\n');
+            }
+            assert_eq!((refused, empty, answered), (3186, 8, 1160));
+            assert_eq!(
+                hex::encode(Sha256::digest(all.as_bytes())),
+                "f57c8bf29ddfbb0e042c11dac53d985d1bfe32f1abcacbc6ff3e1b63209de873"
+            );
+        }
+    }
+
     /// N4 test #6 — concurrent insert/lookup is safe. Spawn N
     /// threads, each inserting + looking up for its own PID;
     /// no deadlock + all PIDs eventually resolve. This anchors
