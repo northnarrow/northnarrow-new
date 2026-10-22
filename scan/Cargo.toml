@@ -19,7 +19,7 @@ path = "src/lib.rs"
 [dependencies]
 # Protocol, hash-list types and postcard framing (common::execq).
 common = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 # recvmsg/sendmsg with SCM_RIGHTS, prctl, setrlimit, seccomp(2): raw
 # syscalls, as the watchdog does (no libseccomp: no C in production).
 libc = "0.2"

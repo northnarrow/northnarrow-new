@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -481,7 +481,7 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
     let master = load_or_init_master_key(cfg)?;
     let plaintext = open(&master, vault_id, &bin)?;
     drop(bin);
-    let got_sha = format!("{:x}", Sha256::digest(&*plaintext));
+    let got_sha = hex::encode(Sha256::digest(&*plaintext));
     if got_sha != want_sha {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
@@ -622,7 +622,7 @@ fn quarantine_file_after_check(
     let vault_id = uuid::Uuid::new_v4().simple().to_string();
     let master = load_or_init_master_key(cfg)?;
     let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    crate::os_rng::OsRng.fill_bytes(&mut nonce);
     let ciphertext = seal(&master, &vault_id, &nonce, &content)
         .map_err(|e| QuarantineError::Crypto(format!("encrypt: {e}")))?;
 
@@ -652,7 +652,7 @@ fn quarantine_file_after_check(
         "vault_id": vault_id,
         "original_path": original_str,
         "size_bytes": size,
-        "sha256": format!("{:x}", sha),
+        "sha256": hex::encode(sha),
         "captured_at": current_timestamp(),
     });
     let mut meta_file = OpenOptions::new()
@@ -923,7 +923,7 @@ pub(crate) fn load_or_init_master_key(
         fs::create_dir_all(parent)?;
     }
     let mut k = Zeroizing::new([0u8; 32]);
-    rand::rngs::OsRng.fill_bytes(&mut *k);
+    crate::os_rng::OsRng.fill_bytes(&mut *k);
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -956,7 +956,7 @@ fn seal(
     let key = derive_file_key(master, vault_id);
     let cipher = Aes256Gcm::new((&*key).into());
     cipher.encrypt(
-        Nonce::from_slice(nonce),
+        &Nonce::from(*nonce),
         Payload {
             msg: content,
             aad: vault_id.as_bytes(),
@@ -974,11 +974,14 @@ fn open(
     let (nonce, ciphertext) = bin
         .split_at_checked(NONCE_LEN)
         .ok_or_else(|| std::io::Error::other("vault file too short"))?;
+    let nonce: &[u8; NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| std::io::Error::other("vault nonce is not 12 bytes"))?;
     let key = derive_file_key(master, vault_id);
     let cipher = Aes256Gcm::new((&*key).into());
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(*nonce),
             Payload {
                 msg: ciphertext,
                 aad: vault_id.as_bytes(),
@@ -1500,7 +1503,7 @@ mod tests {
         let meta_path = cfg.quarantine_dir.join("vault").join(format!("{id}.meta"));
         let mut meta: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta["sha256"] = serde_json::json!(format!("{:x}", Sha256::digest(b"other")));
+        meta["sha256"] = serde_json::json!(hex::encode(Sha256::digest(b"other")));
         fs::write(&meta_path, meta.to_string()).unwrap();
         let out = tmp.path().join("out");
         let e = restore(&id, &out, &cfg).unwrap_err();

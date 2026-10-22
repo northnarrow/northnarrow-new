@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
 use common::posture_types::PostureKind;
@@ -38,6 +37,7 @@ use common::wire::admin_signed_payload::{
 };
 
 use crate::agent_id::{self, AGENT_ID_LEN};
+use crate::os_rng::OsRng;
 
 // ── public outcome types ────────────────────────────────────────────
 
@@ -3143,7 +3143,7 @@ pub fn run_config_overlay_sign(
     file: &Path,
     out: Option<&Path>,
 ) -> Result<PathBuf> {
-    use rand::RngCore;
+    use rand::Rng;
     let (_content, sha, len) = read_overlay_for_signing(kind, file)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut nonce = [0u8; 32];

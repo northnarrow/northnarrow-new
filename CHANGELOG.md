@@ -629,6 +629,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- RustCrypto's next generation, in one step (Wave 4 Phase 2, D2 of the
+  dependency plan; lab PR 234): sha2 0.11 (agent, common, ebpf-guard,
+  scan), hkdf and hmac 0.13, aes-gcm 0.11, md-5 0.11, ed25519-dalek 3
+  (its `std` feature is now `alloc`) and rand 0.10, which ed25519-dalek 3
+  needs. One copy of each crate in `Cargo.lock` and `fuzz/Cargo.lock`
+  (getrandom 0.4.3 in both); generic-array, getrandom 0.2, rand_chacha and
+  ppv-lite86 left the graph. rand 0.10 has no `OsRng`: `agent/src/os_rng.rs`
+  keeps one over rand's `SysRng` — every byte from the operating system's
+  CSPRNG (getrandom: the `getrandom(2)` syscall, `/dev/urandom` after
+  polling `/dev/random` as fallback), no userland generator in between, a
+  panic if it fails, as before — for keys, nonces, challenges and seeds;
+  the callers that handle the error (agent id, audit signing key, probe
+  nonce) read `SysRng` itself, and the anti-tamper session nonce, drawn
+  from `thread_rng`, now comes from the OS generator too. The vault's
+  nonce is built from its 12-byte array and the `.meta` SHA-256 is
+  `hex::encode`d (the same lowercase hex). The 20 vectors of lab PR 230
+  pass unchanged; the fuzzer lock check also covers rand, rand_core,
+  getrandom and md-5. Supersedes Dependabot #289 and #287.
 - The eBPF programs are built with aya-ebpf 0.2.1 instead of 0.1.1 (lab
   PR 233, D1b of the Wave 4 phase 2 dependency plan; supersedes Dependabot
   #361): `helpers::gen` is now `helpers::generated` (56 calls in 11 files)

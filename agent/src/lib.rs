@@ -47,6 +47,7 @@ pub mod impair;
 pub mod install_manifest;
 pub mod loop_progress;
 pub mod net;
+pub mod os_rng;
 pub mod posture;
 pub mod process_hardening;
 pub mod removed_settings;

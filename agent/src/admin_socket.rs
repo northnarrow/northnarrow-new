@@ -5295,9 +5295,9 @@ fn dispatch_net_fingerprint(
 mod tests {
     use super::*;
     use crate::admin_cli::{run_status, run_unlock, run_verify_keys};
+    use crate::os_rng::OsRng;
     use common::posture_types::PostureKind;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -7819,10 +7819,10 @@ mod tests {
     /// file-tolerance paths.
     #[test]
     fn dispatch_net_flows_returns_empty_success_when_log_absent() {
+        use crate::os_rng::OsRng;
         use common::wire::admin_protocol::KeyedSignature;
         use common::wire::admin_signed_payload::SignedPayload;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xAA; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "net-read", agent_id);
@@ -7847,10 +7847,10 @@ mod tests {
     /// `net-read` returns `RoleDenied`. Anchors the role gate.
     #[test]
     fn dispatch_net_flows_role_denied_without_net_read() {
+        use crate::os_rng::OsRng;
         use common::wire::admin_protocol::KeyedSignature;
         use common::wire::admin_signed_payload::SignedPayload;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0xBB; 16];
         // Key carries `unlock` only — not `net-read`.
@@ -8532,8 +8532,8 @@ mod tests {
     /// the override and captures the signer fingerprint for the audit.
     #[test]
     fn dispatch_trusted_installer_grant_arms_on_valid_m1() {
+        use crate::os_rng::OsRng;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1a; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
@@ -8559,8 +8559,8 @@ mod tests {
     /// stays disarmed.
     #[test]
     fn dispatch_trusted_installer_grant_bad_signature_rejected() {
+        use crate::os_rng::OsRng;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let other = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1b; 16];
@@ -8583,8 +8583,8 @@ mod tests {
     /// (cross-agent replay defence) before the override is touched.
     #[test]
     fn dispatch_trusted_installer_grant_wrong_agent_id_rejected() {
+        use crate::os_rng::OsRng;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1c; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
@@ -8604,8 +8604,8 @@ mod tests {
     /// successful arm yields `NoPendingChallenge`.
     #[test]
     fn dispatch_trusted_installer_grant_replayed_nonce_rejected() {
+        use crate::os_rng::OsRng;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1d; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
@@ -8630,8 +8630,8 @@ mod tests {
     /// is RoleDenied; the override stays disarmed.
     #[test]
     fn dispatch_trusted_installer_grant_role_denied_without_role() {
+        use crate::os_rng::OsRng;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1e; 16];
         // Key carries `audit-read` only.
@@ -8650,8 +8650,8 @@ mod tests {
     /// (captured-signature replay across a clock window).
     #[test]
     fn dispatch_trusted_installer_grant_skewed_ts_rejected() {
+        use crate::os_rng::OsRng;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x1f; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);
@@ -8671,8 +8671,8 @@ mod tests {
     /// returns `UnknownOperation` rather than silently succeeding.
     #[test]
     fn dispatch_trusted_installer_grant_without_override_unknown_operation() {
+        use crate::os_rng::OsRng;
         use ed25519_dalek::SigningKey;
-        use rand::rngs::OsRng;
         let signing = SigningKey::generate(&mut OsRng);
         let agent_id = [0x20; 16];
         let (auth, _dir) = build_auth_with_roles(&signing, "trusted-installer", agent_id);

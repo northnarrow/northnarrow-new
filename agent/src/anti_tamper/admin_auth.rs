@@ -47,13 +47,13 @@ use common::admin_quorum::{self, distinct_matches, quorum_decision, QuorumDecisi
 use common::wire::admin_signed_payload::{self, Role, SignedPayload, SignedPayloadError};
 use ed25519_dalek::{Signature, VerifyingKey};
 use parking_lot::RwLock;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{info, warn};
 
 use super::network_isolate::{mint_unlock_token, UnlockToken};
+use crate::os_rng::OsRng;
 
 /// External audit NN-AUD-079: failed signature checks one admin-socket
 /// connection may make. The one that reaches this count is answered
@@ -908,8 +908,8 @@ pub struct VerifiedSigners {
 }
 
 /// A fresh 32-byte challenge from OS entropy. `OsRng` is deliberately
-/// preferred over `rand::thread_rng()` — for security primitives we want
-/// the OS CSPRNG directly, not a userland-cached source.
+/// preferred over `rand::rng()` (`ThreadRng`) — for security primitives
+/// we want the OS CSPRNG directly, not a userland-cached source.
 fn mint_challenge_nonce() -> [u8; 32] {
     let mut nonce = [0u8; 32];
     OsRng.fill_bytes(&mut nonce);
