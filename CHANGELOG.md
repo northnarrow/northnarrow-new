@@ -855,6 +855,71 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the moved files' paths (panic locations), log-callsite line numbers and
   the stamp hash. nn-admin's `--events` help still says `common::Event`,
   so that no output changes.
+- Wave 4 restructure, R04a/R04b — the evidence chain's ties to the agent
+  cut, no file moved (lab PR 241): a test pins the signed chains' format
+  first (`agent/tests/chain_format_pin.rs`: fixtures written by `main`
+  c7bb346's code — audit rows, a rotating log with archives and manifest,
+  a head anchor — verify in full, and this code writes `main`'s bytes for
+  the same inputs). Then: the identity types the audit chain attests
+  (`AgentIdentity`, `IdentitySource`) and the `integrity_drift` op are
+  `audit`'s; the boot rows take the build facts by value (`AgentBuild`:
+  version, features, BPF guard mode, from the new `build_info`, which
+  holds `build_features` and `LAB_FEATURES`); the agent's signing key and
+  its files leave for the new `keys` (plan: "AgentSigningKey si separa dal
+  formato"), the writers sign through `chain_host::ChainSigner`; the
+  agent's own list of chains (`ChainPaths`, the canary chains' checks,
+  the anchoring and boot-verify tasks) leaves `chain_anchor` for the new
+  `chains`; the build-time assertions holding the readers' line caps to
+  the admin frame size (`MAX_FRAME_BODY`) go to `admin_socket`, which
+  sees both crates (the two nn-evidence → nn-proto arcs); the chains'
+  Linux file operations (`O_NOFOLLOW | O_NONBLOCK` opens, file and
+  directory modes, `renameat2(RENAME_NOREPLACE)`, `pwrite`, the
+  directory anchor) go behind `chain_host::ChainHost`, implemented by
+  `chain_host_linux::LinuxHost` with the same calls, reached through the
+  writers' key type and named by the readers (`boot_check::<H>`); the
+  audit log's boot preflight (`access(2)`) leaves `audit` for
+  `audit_preflight`; the chain tests run on a portable host, what is
+  Linux about the chains is tested on the agent's; the detection log's
+  records leave `detection_store` for `detection_payload` (mapped to
+  nn-evidence); the core modules name the integrity op through `audit`;
+  the open sensor's path text (cut and unread marks, an exact path, an
+  unplaced path's device, mountinfo's escapes) leaves `sensors` for
+  `path_text` (R04b).
+- Wave 4 restructure, R05 — nn-evidence (lab PR 241): the agent's
+  `chainlog`, `audit`, `chain_anchor`, `chain_tail`, `verify_lines`,
+  `chain_host` and `canary::chain_lines` moved to `crates/nn-evidence`
+  (`git mv`, 99-100 %), which is pure: no libc, no `std::os`,
+  `#![forbid(unsafe_code)]`, checked by `portable-core` on the five
+  targets. The agent keeps every path as a shim without a file (`lib.rs`,
+  `canary/mod.rs`; removed in R17), the writers aliased with the agent's
+  key as default, so callers, tests, fuzz targets and examples are
+  unchanged; the ratchet learns shims (`[shims.agent]`). `anchored`
+  stays in the agent (nn-linux): it is the Linux host's anchor. Also:
+  `common::execq` (the exec quarantine's scanner protocol, lab PR 240's
+  open item) moved to `nn_proto::execq` (the importers rewritten, the
+  scanner depends on nn-proto, `common` drops postcard and hex), and
+  `nn-admin policy test --events` names `nn_model::Event`. The ratchet
+  goes from 77 to 54: nn-evidence 12 → 0, nn-core 53 → 40, nn-admin
+  6 → 8 (its `chain verify` builds the agent's chain list, which names
+  payloads of nn-linux modules), nn-linux 3, nn-proto 3. Identity
+  against `main` c7bb346: the eBPF object is byte-identical (sha256
+  2cfdde83…), its stamp's source hash moves with `common`; the golden
+  replay, the wire pins (`encoded_frames_are_pinned`), the crypto vectors
+  and the chain format pin are unchanged; the tarball's 72 entries and
+  the .deb's 79 paths and modes are the same. The binaries are not
+  byte-identical (a crate's identity seeds symbols and `TypeId`s, and
+  rustc instantiates a generic function in each crate that uses it in a
+  release build): function by function, names mapped and addresses
+  dropped, the scanner is 478 of 479 the same (the `execq` decoder of
+  its hash list), the watchdog 2,242 of 2,244 (two `TypeId` users),
+  nn-admin 2,980 of 3,131, the agent 6,639 of 6,893; the rest is inlining
+  at the new crate boundary, register allocation, `TypeId` constants and
+  generic code made twice (the agent's `.text` +2.5 %, nn-admin's +2.5 %:
+  serde_json's deserializers of the audit row, chrono's formatting,
+  base64 — one copy per crate). Logging: the moved modules' events carry
+  `nn_evidence::…` as their target, which the journal line does not show
+  (`with_target(false)`); a `RUST_LOG` filter naming the agent's module
+  paths no longer selects them.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

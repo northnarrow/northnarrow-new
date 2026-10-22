@@ -1065,3 +1065,64 @@ only in the table below, in the same PR as the evidence.
     nn-proto arc (R05); nn-admin's `--events` help still names
     `common::Event` (kept: no output changes in a move).
   - Lab: no guest (moves only; the identity below). Host, on each commit (R03 09c65fd and the tip): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked` 68 suites, 2,988 passed, 0 failed (`main` 2e1438f: 2,987; the test list is `main`'s plus `encoded_frames_are_pinned`, every moved test found by name); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo test -p nn-proto --features debug-trigger --lib admin_protocol` (60 passed); `cargo xtask attack-coverage --check`; `cargo xtask golden` with the golden files unchanged; `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core` locally, the five targets, nn-parse, nn-model, nn-proto, nn-evidence, nn-core; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets built against nn-proto, nn-model and nn-parse, seeds and regressions; the three lockfiles unchanged by the build): all pass. Identity against `main` 2e1438f, same path, same commands: the eBPF object is byte-identical (sha256 d5474fc4…) at R03 and at the tip, its stamp's source hash f4fb7f9d… → d93b49ed… (R03) → c3651dc3… (`common/src` and its manifest are the object's source closure), embedded in the agent as before. Built as the release job builds (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`), the binaries are not byte-identical: scanner 401,368 → 401,400 bytes, watchdog 2,337,264 → 2,336,904, nn-admin 3,901,064 → 3,912,344, agent 14,631,184 → 14,642,952. A move between crates cannot keep them so: a crate's identity seeds symbol names and `TypeId`s, and the fat-LTO module is composed anew. Control: `main` built in another directory is byte-identical to `main` here (no path in the binaries); `main` rebuilt with one unused optional dependency in `common` (anyhow, enabled by `std`; no source changed) moves the scanner by 16 bytes and changes 2 functions of the watchdog (a `TypeId`), 16 of nn-admin and 17 of the agent. Unstripped builds (same flags, strip off), function by function, names mapped to the new crates and addresses dropped: scanner 503 of 504 functions the same code (one postcard decoder of `execq`, a crate this lot does not touch, allocates its registers otherwise), watchdog 2,429 of 2,468 (+1 kept out of line), nn-admin 3,210 of 3,330, agent 7,217 of 7,408; the others differ in inlining (postcard and serde helpers), interprocedural constant propagation (`RawVec` growth), which of identical bodies keeps its name, register allocation and `TypeId` constants. The text of `.rodata` differs only in the moved files' paths (panic locations: `common/src/{admin_quorum,shutdown_marker,model,dns_qname}.rs` → `crates/…`), log-callsite line numbers and the stamp hash; no module path, type name or help text changed (a first build changed nn-admin's `--events` help, a clap doc comment the path rewrite had touched; restored). Sources, by a token check: of the 157 `.rs` files changed or moved (the new `telemetry.rs` aside), 148 have the same tokens outside `use` once the moved paths are mapped and their `use` declarations import the same items; the 9 others are the crate roots and declarations, the new test, the ratchet's scanner and `journal_fields`' scan patterns (`nn_model::log_escape::Escaped`); `telemetry.rs` and `wire/mod.rs` are the split rerun on R03's `wire/mod.rs`, byte for byte. `mk-tarball.sh`: the same 72 entries; `mk-packages.sh` (.deb): the same 79 paths and modes, the four binaries' sizes and `CHANGELOG.md` aside.
+- **Lab PR 241 — nn-evidence: the evidence chain leaves the agent (Wave 4
+  Phase 2, R04 + R05 of the restructure plan; no level changes).**
+  - What was wrong: the signed chains (`chainlog`, `audit`, `chain_anchor`,
+    `chain_tail`, `verify_lines`, the canary line reader) named the agent
+    all over — its key and key files, its identity, the op of
+    `self_integrity`, the BPF guard's mode, its feature set through
+    `cfg!`, the payloads of its detection store and drains, the admin
+    socket's netflow path, tokio tasks — 12 ratchet references, two of them
+    to nn-proto (`MAX_FRAME_BODY`); and they made Linux calls of their own
+    (`O_NOFOLLOW | O_NONBLOCK`, file modes, `renameat2` in an `unsafe`
+    block, `access(2)`, `pwrite`, `/proc/self/fd` anchoring), while the map
+    holds nn-evidence pure (no libc, no `std::os`, five other targets).
+  - What changed: R04a, before any change a format pin
+    (`agent/tests/chain_format_pin.rs`, fixtures written by `main`
+    c7bb346's code: they verify after the move, and this code writes
+    their bytes for the same inputs); then, each its commit: identity
+    types and the `integrity_drift` op in `audit`, the boot rows' build
+    facts by value (`build_info`); the key and its files to `keys`, the
+    writers signing through `chain_host::ChainSigner`; the agent's chain
+    list and tasks to `chains`; the two `MAX_FRAME_BODY` assertions to
+    `admin_socket` (the agent sees both crates: no constant moved, nothing
+    parameterised); the Linux calls behind `chain_host::ChainHost`
+    (static functions; `chain_host_linux::LinuxHost` holds the same calls;
+    the writers reach it through their key type, the readers name it),
+    the audit preflight to `audit_preflight`; the chain tests on a
+    portable host, the Linux semantics tested on the agent's
+    (`chain_host_linux` tests); `pub` across the boundary. R05: `git mv`
+    of the seven modules to `crates/nn-evidence` (99-100 %), the agent's
+    paths kept as shims in `lib.rs` and `canary/mod.rs` (the writers
+    aliased with the agent's key as default; callers, tests, fuzz targets
+    and examples unchanged), the ratchet taught `[shims.agent]`. After it:
+    `common::execq` to `nn_proto::execq` (lab PR 240's open item; importers
+    rewritten, the scanner depends on nn-proto, `common` drops postcard
+    and hex); nn-admin's `--events` help names `nn_model::Event`; R04a's
+    detection records to `detection_payload` (mapped to nn-evidence, still
+    in the agent: `DetectionRecord::from_rule`, `with_attack` and
+    `RuleMatchRecord::of` name the engine and stay in `detection_store`);
+    the core modules name the integrity op through `audit`; R04b's path
+    text of the open sensor to `path_text`. Ratchet 77 → 54: nn-evidence
+    12 → 0, nn-core 53 → 40, nn-admin 6 → 8 (`chain verify` builds the
+    agent's chain list, which names nn-linux payloads), nn-linux 3,
+    nn-proto 3; nn-core passed through 54 when `anchored` was mapped to
+    nn-linux (`combat::reconcile` anchors its file through it). Deviations
+    from the plan: nn-evidence stays pure, so `anchored` (the Linux
+    anchor) stays in the agent and the chains reach the OS through
+    `ChainHost`, a seam the plan did not list; the R04a commits that cut
+    nothing the move needed (the detection payloads, the integrity op of
+    the core modules) come after R05; `audit_ops.rs` and `paths.rs` were
+    not made (the op is `audit::INTEGRITY_DRIFT_OP`; `ChainPaths` and its
+    built-in paths went to `chains`); not done here, for the next lots:
+    R04b's `ProcSource`, `Clock`, `PackageOwnership`, the installer
+    window/kernel-sync split and `UnlockToken` (each needs a host handle
+    through the rule engine's and the posture's constructors — some sixty
+    call sites — or the composition root of R11a, and the posture's and
+    ladder's clock a reviewed golden regeneration, which this lot's
+    identity rules exclude), `ExecutionOutcome`/`ExecutionReport` to
+    `response/outcome.rs`, and R04c's splits (fim/drain, overlay_auth,
+    canary/registry, combat/protected+reconcile, net, response); the
+    payload types into nn-evidence once their constructors leave the
+    types.
+  - Lab: no guest (moves and seams that keep every call; the identity below). Host, on R05 (452add6) and the tip: `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked` 69 suites, 2,999 passed, 0 failed (the test list is `main`'s — 3,002 names, every one found at the tip — plus 12: the chain format pin's 5 and its ignored generator, the build facts' 2, the Linux host's exclusive create and `rename_noreplace`, the portable foreign-slot case, the payload kinds' pin); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `crypto_vectors` (19) and `encoded_frames_are_pinned`; `cargo xtask attack-coverage --check`; `cargo xtask golden` with the golden files unchanged; `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core`'s `cargo check` of nn-parse, nn-model, nn-proto, nn-evidence (now code) and nn-core for the five targets; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; `fuzz/Cargo.lock` carries nn-evidence, no lockfile changed by the build): all pass. Identity against `main` c7bb346, same path, same commands: the eBPF object is byte-identical (sha256 2cfdde83…) at R05 and the tip, its stamp's source hash c3651dc3… → c0365736… (the execq step: `common`'s sources and manifest). Built as the release job builds (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`): scanner 401,400 → 401,368 bytes, watchdog 2,336,904 → 2,336,920, nn-admin 3,912,344 → 4,006,152, agent 14,642,952 → 14,842,344. Unstripped (same flags, `CARGO_PROFILE_RELEASE_STRIP=none`), function by function — names mapped to their new crates and modules, the key and host type parameters dropped, addresses dropped (instruction addresses, rip displacements, branch targets, the layout-dependent symbol of a data reference), trailing padding dropped: scanner 478 of 479 the same (the postcard decoder of `Vec<execq::HashEntry>`), watchdog 2,242 of 2,244 (tracing-subscriber's `downcast_raw` and `main`'s closure: `TypeId` constants), nn-admin 2,980 of 3,131 (5 and 24 unpaired), agent 6,639 of 6,893 (16 and 40 unpaired; of the 254, 135 in dependencies, 65 nn-evidence's, 47 the agent's — stack frames, registers, inlining at the new boundary, clap's `TypeId`s of the agent's enums —, 4 in the new modules, 3 nn-proto/nn-model). `.text` grows by 2.5 % in the agent and nn-admin: rustc instantiates a generic function in each crate that uses it in a release build, and the copies of the same instantiation went from 509 to 669 in the agent (serde_json's deserializers of the audit row, chrono's formatting, base64's decode, one copy per crate). `.rodata`'s source paths and callsite lines differ only for the moved files (`agent/src/{audit,chain_anchor,chain_tail,chainlog}.rs` → `crates/nn-evidence/src/…`; `keys.rs`, `chains.rs`, `path_text.rs` new) and the lines of the edited ones (main.rs, admin_socket.rs, self_integrity.rs, detection_store.rs, agent_id.rs, open_sensor.rs, the exec policy's and quarantine's records); nn-admin's help text says `nn_model::Event`; the moved modules' tracing target is `nn_evidence::…` (not printed: `with_target(false)`). `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes, the four binaries' sizes, `RULE_POLICY.md` (the help's doc) and `CHANGELOG.md` aside.

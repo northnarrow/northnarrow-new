@@ -315,7 +315,8 @@ planned = false
 # depend on (distinct (file, module) pairs, outside tests and Kani
 # proofs). They may only go down: xtask/tests/module_map.rs fails above
 # these numbers and asks for the lower number below them. R04 brings
-# nn-evidence and nn-core to 0.
+# nn-evidence and nn-core to 0. Lab PR 241: 77 → 54 (nn-evidence 0; nn-core
+# 40, the rest R04b's and R04c's).
 
 [ratchet]
 nn-admin = 8
