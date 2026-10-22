@@ -145,7 +145,7 @@ tempfile = "3"
 # task-storage map parsed and still stopped the agent), and the exploit
 # guard's maps and programs. Already in the tree through aya (lab PR 231:
 # 0.2.1 → 0.3.0 with aya 0.14).
-aya-obj = "=0.3.0"
+aya-obj = "=0.5.0"
 
 # Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
 # builds with -D warnings do not flag it as an unexpected cfg.
