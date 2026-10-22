@@ -238,7 +238,7 @@ config overlay sign rule-policy` signs offline.
 - `set --file F --key K` — validate locally, then sign and store through the
   agent (role `config-manage`); applied at once.
 - `test --policy F --events E [--config-dir D]` — replay a sample event file
-  (one `common::Event` JSON per line, or a golden case) through an offline
+  (one `nn_model::Event` JSON per line, or a golden case) through an offline
   engine (shipped lists, empty `/proc`) with the candidate policy and print
   each decision. Nothing is signed, stored or applied.
 

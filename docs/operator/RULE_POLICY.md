@@ -84,7 +84,7 @@ nn-admin policy test --events ./case.json                  # a golden case of th
 nn-admin policy test --policy ./rule-policy.local --events ./sample.jsonl --json
 ```
 
-The events are one `common::Event` JSON per line (as the agent serialises
+The events are one `nn_model::Event` JSON per line (as the agent serialises
 them), `{"event": …}` per line, or a golden case. Exemptions by exe, cgroup
 or unit never match offline (there is no `/proc` to read); a uid exemption
 does.

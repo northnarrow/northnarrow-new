@@ -769,10 +769,7 @@ enum PolicyCmd {
         /// defaults.
         #[arg(long)]
         policy: Option<PathBuf>,
-        // This doc comment is the `--events` help text, which the Wave 4
-        // restructure leaves as it was (lab PR 240): the event model it
-        // names is nn-model's `Event` since R02.
-        /// One `common::Event` JSON per line, `{"event": …}` per line, or a
+        /// One `nn_model::Event` JSON per line, `{"event": …}` per line, or a
         /// golden case (`agent/tests/golden/cases/*.json`).
         #[arg(long)]
         events: PathBuf,

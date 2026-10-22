@@ -133,7 +133,7 @@ action `Log` in the cases without a policy; and no response there to be a
 held rule's.
 
 The streams are written in the agent's own serialised event format
-(`common::Event`), each shaped on a lab scenario (the MS-nn names are those
+(`nn_model::Event`, `common::Event` before the Wave 4 restructure), each shaped on a lab scenario (the MS-nn names are those
 of `deploy/lab/malsim/`); they were not captured from a kernel. Pids are
 above the kernel's `PID_MAX_LIMIT` (4,194,304), so no case's pid is ever the
 test process's own (NN-L-NET-026/027 and NN-L-FIM-024 skip the agent's pid).
