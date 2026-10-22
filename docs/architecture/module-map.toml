@@ -192,8 +192,12 @@ planned = false
 "cow::trust" = "nn-core"
 "decision" = "nn-core"
 "detection_budget" = "nn-core"
-# not in §2.4: the detection sink's queue and files (its payloads go to
-# nn-evidence with R04a)
+# post-plan (lab PR 241, R04a): the detection log's records and their
+# parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
+# file propri"; the payloads are nn-evidence's)
+"detection_payload" = "nn-evidence"
+# not in §2.4: the detection sink's queue and files, the records'
+# constructors from the engine's decisions (its payloads: above, R04a)
 "detection_store" = "nn-linux"
 # post-plan (lab PR 226): exec policy; the controller and the kernel maps
 "execpol" = "nn-linux"
@@ -315,7 +319,7 @@ planned = false
 
 [ratchet]
 nn-admin = 8
-nn-core = 52
+nn-core = 44
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

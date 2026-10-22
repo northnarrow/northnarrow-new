@@ -79,6 +79,8 @@ pub mod correlation;
 pub mod cow;
 pub mod decision;
 pub mod detection_budget;
+/// The detection log's records (from `detection_store`, R04a, lab PR 241).
+pub mod detection_payload;
 pub mod detection_store;
 pub mod execpol;
 pub mod execq;

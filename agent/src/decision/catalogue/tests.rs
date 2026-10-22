@@ -359,7 +359,7 @@ fn a_missing_test_or_data_component_is_reported() {
         id: "X",
         severities: &[Severity::Medium, Severity::High],
         actions: &[nn_model::ResponseAction::Log],
-        sensors: &[crate::detection_store::Sensor::Exec],
+        sensors: &[crate::detection_payload::Sensor::Exec],
         data_components: &["DC0999"],
         observes: "x",
         false_positives: "x",

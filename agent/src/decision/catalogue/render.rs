@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use super::{RuleDoc, FAMILIES};
 use crate::decision::attack::{AttackRef, Tactic, ATTACK_IDS_FILE, ATTACK_VERSION};
 use crate::decision::{rules, Rule};
-use crate::detection_store::Sensor;
+use crate::detection_payload::Sensor;
 
 /// The generated documents, relative to the repository root.
 pub const COVERAGE_MD: &str = "docs/detection/ATTACK_COVERAGE.md";

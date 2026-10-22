@@ -14,7 +14,8 @@ use super::controller::Recorder;
 use super::policy::{Action, Outcome};
 use super::{attack_refs, CATEGORY, RULE_ID, RULE_NAME};
 use crate::decision::attack::AttackRef;
-use crate::detection_store::{DetectionSink, ExecqEvidence};
+use crate::detection_payload::ExecqEvidence;
+use crate::detection_store::DetectionSink;
 
 /// One decision, ready for the detection chain.
 #[derive(Debug, Clone)]
@@ -172,9 +173,9 @@ impl Recorder for SinkRecorder {
         let Some(sink) = &self.sink else {
             return;
         };
-        let uid = crate::detection_store::Principal::from_event(&rec.event).uid;
+        let uid = crate::detection_payload::Principal::from_event(&rec.event).uid;
         let admit = crate::detection_budget::admit(RULE_ID, uid, || {
-            crate::detection_store::held_sample(&rec.event)
+            crate::detection_payload::held_sample(&rec.event)
         });
         if let crate::detection_budget::Admit::Record { suppressed_before } = admit {
             warn!(

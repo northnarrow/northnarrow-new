@@ -238,8 +238,8 @@ impl RuleEngine {
             matched.push(rule.id());
             let facts = &*self.facts;
             let exempt = |v: &Verdict| {
-                let p =
-                    principal.get_or_init(|| crate::detection_store::Principal::from_event(event));
+                let p = principal
+                    .get_or_init(|| crate::detection_payload::Principal::from_event(event));
                 let uid = (p.pid == v.event_pid).then_some(p.uid);
                 rule_policy::exempt(policy.exemptions(rule.id()), v.event_pid, uid, facts)
             };

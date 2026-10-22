@@ -19,7 +19,7 @@
 //! and the sha256); the tests below hold every mapping to it. ATT&CK
 //! content is MITRE's, under its Terms of Use (`NOTICES.md`).
 
-use crate::detection_store::MitreAttack;
+use crate::detection_payload::MitreAttack;
 
 /// The ATT&CK domain the mapping is in.
 pub const ATTACK_DOMAIN: &str = "enterprise-attack";
