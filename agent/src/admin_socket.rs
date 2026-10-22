@@ -4904,7 +4904,7 @@ fn dispatch_detections(
         pubkey.as_ref(),
     );
     if unverified > 0 {
-        crate::chain_anchor::report_unverified_rows("detections", &detections_path, unverified);
+        crate::chains::report_unverified_rows("detections", &detections_path, unverified);
     }
 
     // Serialise newest-first, bounding the body at the wire soft cap.

@@ -1708,7 +1708,7 @@ fn main() -> ExitCode {
                         .collect()
                 };
                 let det = state_dir.join("detections");
-                let paths = northnarrow_agent::chain_anchor::ChainPaths {
+                let paths = northnarrow_agent::chains::ChainPaths {
                     audit: audit_log,
                     canary_registry: state_dir.join("canaries.jsonl"),
                     canary_access: state_dir.join("canary_access.jsonl"),

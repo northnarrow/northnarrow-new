@@ -873,8 +873,8 @@ impl Cli {
     }
 
     /// The chains the agent anchors, at the configured paths.
-    fn chain_paths(&self) -> northnarrow_agent::chain_anchor::ChainPaths {
-        northnarrow_agent::chain_anchor::ChainPaths {
+    fn chain_paths(&self) -> northnarrow_agent::chains::ChainPaths {
+        northnarrow_agent::chains::ChainPaths {
             audit: self.audit_log_file.clone(),
             canary_registry: self.canary_registry_file.clone(),
             canary_access: self.canary_access_file.clone(),
@@ -3255,15 +3255,11 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // verification of the rotating logs in the background
     // (external audit NN-AUD-108, NN-AUD-112).
     if let Some(a) = &chain_anchor {
-        northnarrow_agent::chain_anchor::spawn(Arc::clone(a), audit_log.clone());
+        northnarrow_agent::chains::spawn(Arc::clone(a), audit_log.clone());
     }
-    northnarrow_agent::chain_anchor::set_audit_log(audit_log.clone());
+    northnarrow_agent::chains::set_audit_log(audit_log.clone());
     if let Some(pk) = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
-        northnarrow_agent::chain_anchor::spawn_boot_verify(
-            chain_targets.clone(),
-            pk,
-            audit_log.clone(),
-        );
+        northnarrow_agent::chains::spawn_boot_verify(chain_targets.clone(), pk, audit_log.clone());
     }
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
     // Lab PR 215: a deny hook that let an operation through undecided.

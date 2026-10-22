@@ -32,6 +32,9 @@ pub mod chain_anchor;
 pub mod chain_host;
 pub(crate) mod chain_tail;
 pub mod chainlog;
+/// The agent's chains: paths, checks, anchoring tasks (from `chain_anchor`,
+/// R04a, lab PR 241).
+pub mod chains;
 pub mod combat;
 pub mod config;
 pub mod correlation;

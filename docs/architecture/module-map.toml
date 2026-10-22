@@ -173,6 +173,12 @@ planned = false
 "chain_host" = "nn-evidence"
 "chain_tail" = "nn-evidence"
 "chainlog" = "nn-evidence"
+# post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
+# the admin socket's), the payload of each rotating log, the canary chains'
+# full checks, the anchoring and boot-verify tasks — from `chain_anchor`.
+# nn-admin's `chain verify` reads the list: two nn-admin references until
+# the payloads have a crate below it (plan R04a/R05 "i payload"; R10)
+"chains" = "northnarrow-agent"
 # the ladder and its evidence; SystemActuator and the probes of protected
 # and reconcile go to nn-linux (R04c)
 "combat" = "nn-core"
@@ -288,8 +294,8 @@ planned = false
 # nn-evidence and nn-core to 0.
 
 [ratchet]
-nn-admin = 6
+nn-admin = 8
 nn-core = 53
-nn-evidence = 9
+nn-evidence = 3
 nn-linux = 3
 nn-proto = 3
