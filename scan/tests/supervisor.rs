@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use common::execq::{encode_config, HashEntry, ScanConfig, ScanRequest, ScanVerdict};
+use nn_proto::execq::{encode_config, HashEntry, ScanConfig, ScanRequest, ScanVerdict};
 use northnarrow_scan::supervisor::{lookup_user, ScanUser, ScannerEvent, Supervisor};
 use sha2::{Digest, Sha256};
 

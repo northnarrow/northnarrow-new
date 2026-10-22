@@ -17,12 +17,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::execq::{ScanRequest, ScanResult, ScanVerdict};
 use common::wire::exe::exe_flags;
 use common::wire::execq::{
     class_names, counter, stop_flags, ExecqKey, ExecqKnown, ExecqStopRaw, ExecqStopped,
 };
 use nn_model::{Event, ExeIdentity};
+use nn_proto::execq::{ScanRequest, ScanResult, ScanVerdict};
 use northnarrow_scan::supervisor::{ScannerEvent, Supervisor};
 use tracing::{debug, info, warn};
 

@@ -245,7 +245,7 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         }
         // Lab PR 223: every line a `block`/`allow` entry, no digest twice.
         OverlayKind::ExecqHashes => {
-            common::execq::parse_hash_list(text).map_err(|e| anyhow!("{label}: {e}"))?;
+            nn_proto::execq::parse_hash_list(text).map_err(|e| anyhow!("{label}: {e}"))?;
         }
         // Lab PR 226: every line an exec, audit, preload, map, exempt or
         // profile line (over either profile: the base does not change

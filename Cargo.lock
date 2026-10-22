@@ -939,8 +939,6 @@ name = "northnarrow-common"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "hex",
- "postcard",
  "serde",
 ]
 
@@ -949,6 +947,7 @@ name = "northnarrow-scan"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "nn-proto",
  "northnarrow-common",
  "sha2",
  "tempfile",

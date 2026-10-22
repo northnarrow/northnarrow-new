@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use common::execq::ScanResult;
 use nn_model::{Event, ResponseAction, Verdict};
+use nn_proto::execq::ScanResult;
 use parking_lot::Mutex;
 use tracing::warn;
 
@@ -113,7 +113,7 @@ pub fn evidence(
     reasons.extend(notes.iter().cloned());
     ExecqEvidence {
         verdict: scan.map_or("none", |r| r.verdict.as_str()).to_string(),
-        sha256: scan.map(|r| common::execq::hex32(&r.sha256)),
+        sha256: scan.map(|r| nn_proto::execq::hex32(&r.sha256)),
         format: scan.map(|r| r.format.clone()),
         reasons,
         decision: match (o.refused, enforce) {
@@ -216,8 +216,8 @@ impl Recorder for SinkRecorder {
 mod tests {
     use super::*;
     use crate::execq::policy::{decide, Basis, Policy};
-    use common::execq::{Reason, ScanVerdict};
     use common::wire::execq::class;
+    use nn_proto::execq::{Reason, ScanVerdict};
 
     fn event() -> Event {
         Event::ExecCheck {

@@ -4763,18 +4763,18 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             .verified(OverlayKind::ExecqHashes, &cfg.hashes_local)
         {
             northnarrow_agent::config::overlay_auth::Verified::Content { path, text } => {
-                match common::execq::parse_hash_list(&text) {
+                match nn_proto::execq::parse_hash_list(&text) {
                     Ok(l) => (l, format!("{} (signed)", path.display())),
                     Err(e) => {
                         error!(error = %e, path = %path.display(), "exec quarantine hash list unreadable — empty lists");
                         (
-                            common::execq::HashList::default(),
+                            nn_proto::execq::HashList::default(),
                             format!("{}: {e}", path.display()),
                         )
                     }
                 }
             }
-            _ => (common::execq::HashList::default(), "none".to_string()),
+            _ => (nn_proto::execq::HashList::default(), "none".to_string()),
         };
         let posture_for_execq = posture.clone();
         let recorder = northnarrow_agent::execq::record::SinkRecorder {

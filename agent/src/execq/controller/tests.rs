@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
 
-use common::execq::{HashEntry, ScanConfig};
 use common::wire::exe::{exe_path_slot, EXE_PATH_SLOT_LEN};
 use common::wire::execq::class;
+use nn_proto::execq::{HashEntry, ScanConfig};
 use northnarrow_scan::engine::Engine;
 use northnarrow_scan::ipc::FdFile;
 use parking_lot::Mutex;

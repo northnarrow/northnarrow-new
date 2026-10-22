@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
-use common::execq::{
+use nn_proto::execq::{
     decode, encode, encode_config, FromScanner, HashEntry, ScanConfig, ScanRequest, ScanVerdict,
     ToScanner, MAX_PACKET, PROTOCOL_VERSION,
 };

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Instant;
 
-use common::execq::{
+use nn_proto::execq::{
     Reason, ScanConfig, ScanRequest, ScanResult, ScanVerdict, ScannerHello, DEFAULT_MAX_HASH_BYTES,
     DEFAULT_MAX_READ_BYTES, DEFAULT_SUSPICIOUS_THRESHOLD, PROTOCOL_VERSION,
 };
@@ -233,8 +233,8 @@ mod tests {
     use super::*;
     use crate::elf::fixtures::*;
     use crate::elf::{ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD};
-    use common::execq::HashEntry;
     use common::wire::execq::class;
+    use nn_proto::execq::HashEntry;
 
     fn req() -> ScanRequest {
         ScanRequest {

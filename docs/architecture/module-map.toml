@@ -287,8 +287,6 @@ planned = false
 "btf_offsets" = "northnarrow-common"
 # post-plan (lab PR 219): the decision model the eBPF programs run
 "epg" = "northnarrow-common"
-# post-plan (lab PR 223): the agent ↔ scanner protocol and hash list
-"execq" = "nn-proto"
 # post-plan (lab PR 215): the deny hooks' fail-open counters
 "fail_open" = "northnarrow-common"
 "ring_drops" = "northnarrow-common"
@@ -297,7 +295,8 @@ planned = false
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,
 # posture_types, netaddr, log_escape (and the std types of wire) to
 # nn-model, dns_qname to nn-parse: a member's own sources, out of this scan
-# (the layer gate checks its dependencies).
+# (the layer gate checks its dependencies). Lab PR 241: execq (post-plan, lab
+# PR 223: the agent ↔ scanner protocol and hash list) to nn-proto.
 
 # `[aliases.<tree>]`: the items of a tree's root and the modules that define
 # them, `*` for any other item. common's (`pub use model::*`, `pub use
