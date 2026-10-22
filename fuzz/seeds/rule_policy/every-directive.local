@@ -1,0 +1,10 @@
+# every directive the policy reads
+enforce NN-L-IMP-001
+alert R020_ShellWithSocketStdio
+audit NN-L-NET-007
+off R008
+exempt NN-L-IMP-001 uid 998
+exempt NN-L-IMP-001 exe /usr/bin/rsync sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+exempt NN-L-IMP-001 cgroup /system.slice/backup.service
+exempt NN-L-IMP-001 unit backup.service
+combat-without-corroboration NN-L-IMP-001

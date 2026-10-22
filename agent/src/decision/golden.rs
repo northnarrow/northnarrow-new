@@ -19,8 +19,10 @@
 //!   trigger detector does it before the rules see the event);
 //! - an anti-tamper denial is NN-L-AT-001's and an exploit post-condition
 //!   NN-L-EPG-001/002's, outside the engine (lab PR 219);
-//! - every other event goes to the engine: first match wins, a held
-//!   response is an alert (`response_policy`);
+//! - every other event goes to the engine: every rule judges it and the
+//!   decision is computed from all the matches (lab PR 236, multi-match) —
+//!   a line names every matched rule — under the case's per-rule policy
+//!   (`policy`, none: the built-in defaults, a held response an alert);
 //! - an exec-policy report of the kernel (lab PR 226) becomes the exec
 //!   policy's records (`execpol::record::records_of`), outside the engine.
 //!
@@ -49,23 +51,13 @@ use std::time::Duration;
 
 use common::wire::execpol::{self as wpol, ExecPolRaw};
 use common::{Event, ExeIdentity};
-use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::attack::{mitre_of, AttackRef};
-use super::correlation::{AncestryTree, CorrelationStore};
-use super::rules::{epg, net::NetRuleConfig, net_fanout::FanoutConfig};
-use super::{response_policy, Rule, RuleEngine};
-use crate::config::comm_allowlist::{
-    load_comm_allowlist, NETFLOW_COMM_ALLOWLIST_SHIPPED, PROCESS_COMM_ALLOWLIST_SHIPPED,
-};
-use crate::config::overlay_auth::Verified;
+use super::{replay, response_policy, rule_policy, RuleEngine};
 use crate::impact::entropy::{Sample, Sampler};
 use crate::impact::trust::ProgramOwners;
 use crate::impact::RansomTracker;
-use crate::impair::{DefenseDetector, SecurityTools};
-use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 use crate::posture::lineage::AuthSessionTracker;
 
 /// The cases, the golden files and the fixture root.
@@ -80,7 +72,9 @@ const UPDATE_ENV: &str = "NN_GOLDEN_UPDATE";
 /// it in place of the token).
 const ROOT_TOKEN: &str = "@ROOT@";
 /// The golden file's format; a change of the line shape bumps it.
-const FORMAT: &str = "northnarrow-golden/1";
+/// Lab PR 236: 2 — a decision of several rules lists its `matches` and
+/// `responses`, the header names the policy.
+const FORMAT: &str = "northnarrow-golden/2";
 /// Replays of each case in the determinism test, and threads at once.
 const RUNS: usize = 3;
 const THREADS: usize = 4;
@@ -111,6 +105,16 @@ struct Case {
     fires: Vec<String>,
     #[serde(default)]
     held: Vec<String>,
+    /// Lab PR 236: a per-rule policy (`rule-policy.local` text) the engine
+    /// reads; none = the built-in defaults.
+    #[serde(default)]
+    policy: Option<String>,
+    /// Rules the stream must show enforced by that policy (an action other
+    /// than `Log`, mode `enforce`), and rules it must show exempt.
+    #[serde(default)]
+    enforced: Vec<String>,
+    #[serde(default)]
+    exempt: Vec<String>,
     items: Vec<Item>,
 }
 
@@ -332,16 +336,12 @@ impl Sampler for Answers {
 }
 
 /// The host a replay runs on: its own `/proc` (empty) and file root, the
-/// engine `main.rs` builds over them.
+/// engine `main.rs` builds over them (`replay::engine`).
 struct Host {
     _proc: tempfile::TempDir,
     root: tempfile::TempDir,
     lineage: AuthSessionTracker,
     engine: RuleEngine,
-}
-
-fn configs(file: &str) -> PathBuf {
-    Path::new(CONFIGS).join(file)
 }
 
 impl Host {
@@ -360,24 +360,6 @@ impl Host {
         }
         let fixture = Path::new(GOLDEN_DIR).join("host");
         let lineage = AuthSessionTracker::new(proc.path()).with_host_root(&fixture);
-        let process_allowlist = Arc::new(
-            load_comm_allowlist(
-                "process-comm-allowlist",
-                &configs("process-comm-allowlist.v1"),
-                PROCESS_COMM_ALLOWLIST_SHIPPED,
-                &Verified::Missing,
-            )
-            .unwrap(),
-        );
-        let netflow_allowlist = Arc::new(
-            load_comm_allowlist(
-                "netflow-comm-allowlist",
-                &configs("netflow-comm-allowlist.v1"),
-                NETFLOW_COMM_ALLOWLIST_SHIPPED,
-                &Verified::Missing,
-            )
-            .unwrap(),
-        );
         let entropy: Vec<EntropyAnswer> = case
             .entropy
             .iter()
@@ -392,49 +374,20 @@ impl Host {
             ProgramOwners::new(&fixture),
             Arc::new(Answers(entropy)),
         ));
-        let (tools, _) = SecurityTools::load(&configs("security-tools.v1"));
-        let defense = Arc::new(DefenseDetector::with_proc_root(
-            Arc::new(tools),
-            lineage.clone(),
-            Some(Arc::new(
-                process_allowlist
-                    .as_ref()
-                    .clone()
-                    .with_identity(lineage.clone()),
-            )),
-            proc.path(),
-        ));
-        let correlation = Arc::new(Mutex::new(CorrelationStore::with_tree(
-            AncestryTree::with_proc_root(
-                proc.path(),
-                super::correlation::ancestry::MAX_TRACKED_EDGES,
-            ),
-        )));
-        let net_config = NetRuleConfig {
-            resolvers: crate::net::resolvers::HostResolvers::fixed(case.resolvers.iter().copied()),
-            fanout: Arc::new(FanoutConfig::default()),
+        let policy = match &case.policy {
+            Some(text) => {
+                rule_policy::parse(text).unwrap_or_else(|e| panic!("the case's policy: {e}"))
+            }
+            None => rule_policy::RulePolicy::builtin(),
         };
-        let engine = RuleEngine::with_default_rules_and_net(
-            Arc::new(
-                NetBlocklist::load(&configs("netflow-blocklist.v1"), &Verified::Missing).unwrap(),
-            ),
-            Arc::new(
-                Ja3Blocklist::load(&configs("netflow-ja3-blocklist.v1"), &Verified::Missing)
-                    .unwrap(),
-            ),
-            Arc::new(Mutex::new(super::rules::net::DnsBurstWindow::new())),
-            process_allowlist,
-            netflow_allowlist,
-            Arc::new(Mutex::new(super::rules::net::BeaconWindow::new())),
-            Arc::new(crate::net::dns_cache::DnsCache::default()),
-            crate::anti_tamper::trusted_installer::TrustedInstallerOverride::inert_arc(),
-            lineage.clone(),
-            crate::canary::readers::CanaryReaders::default(),
-            correlation,
-            net_config,
+        let engine = replay::engine(replay::HostParts {
+            configs: Path::new(CONFIGS),
+            proc_root: proc.path(),
+            lineage: lineage.clone(),
             ransom,
-            defense,
-        );
+            resolvers: case.resolvers.clone(),
+            policy,
+        });
         Self {
             _proc: proc,
             root,
@@ -445,41 +398,7 @@ impl Host {
 
     /// The decision on one event, as `process_event` takes it.
     fn decide(&self, event: &Event) -> Value {
-        if let Event::ProcessSpawn {
-            pid,
-            ppid,
-            uid,
-            filename,
-            argv,
-            timestamp_ns,
-            exe,
-            start_ns,
-            ..
-        } = event
-        {
-            self.lineage.ingest_exec(
-                *pid,
-                *ppid,
-                exe.path_or(filename),
-                argv,
-                *timestamp_ns,
-                *start_ns,
-                *uid,
-            );
-        }
-        match event {
-            Event::FsProtectDenial { .. } => {
-                let at001 = super::rules::anti_tamper::NnLAt001AntiTamperDenial;
-                verdict_line(at001.evaluate(event).map(|v| (v, at001.attack())), None)
-            }
-            Event::ExploitPostcondition { .. } => {
-                let found =
-                    epg::rule_for(event).and_then(|r| r.evaluate(event).map(|v| (v, r.attack())));
-                let response = found.as_ref().map(|_| epg::response_line(event));
-                verdict_line(found, response)
-            }
-            _ => verdict_line(self.engine.evaluate_with_attack(event), None),
-        }
+        replay::decide(&self.engine, &self.lineage, event)
     }
 
     fn replay(&self, case: &Case) -> Vec<Value> {
@@ -506,8 +425,9 @@ impl Host {
                         records
                             .iter()
                             .map(|r| {
-                                let mut v = verdict_line(
-                                    Some((r.verdict.clone(), r.attack.as_slice())),
+                                let mut v = replay::outside_line(
+                                    Some(r.verdict.clone()),
+                                    r.attack.as_slice(),
                                     Some(r.response.clone()),
                                 );
                                 v["execpol"] = serde_json::to_value(&r.evidence).unwrap();
@@ -522,30 +442,6 @@ impl Host {
     }
 }
 
-/// One decision as a golden line: the verdict and its ATT&CK record field,
-/// and the response line of a record made outside the engine.
-fn verdict_line(found: Option<(common::Verdict, &[AttackRef])>, response: Option<String>) -> Value {
-    let Some((v, attack)) = found else {
-        return Value::Null;
-    };
-    let mut line = json!({
-        "rule": v.rule_id,
-        "name": v.rule_name,
-        "category": v.category,
-        "action": format!("{:?}", v.action),
-        "severity": format!("{:?}", v.severity),
-        "pid": v.event_pid,
-        "file": v.event_filename,
-        "ts": v.timestamp_ns,
-        "reasoning": v.reasoning,
-        "mitre": serde_json::to_value(mitre_of(attack)).unwrap(),
-    });
-    if let Some(r) = response {
-        line["response"] = Value::String(r);
-    }
-    line
-}
-
 /// The golden text of one replay: a header naming the case and the policy
 /// switches, then one line per item.
 fn render(name: &str, case: &Case, host: &Host, lines: &[Value]) -> String {
@@ -553,12 +449,14 @@ fn render(name: &str, case: &Case, host: &Host, lines: &[Value]) -> String {
         .iter()
         .map(|s| json!({"held": s.held, "on": s.on}))
         .collect();
+    let policy = host.engine.policy().current();
     let mut text = serde_json::to_string(&json!({
         "format": FORMAT,
         "case": name,
         "about": case.about,
         "rules": host.engine.rule_count(),
         "switches": switches,
+        "policy": if policy.is_builtin() { "built-in defaults".to_string() } else { policy.render() },
     }))
     .unwrap();
     text.push('\n');
@@ -736,19 +634,59 @@ fn decisions(v: &Value, out: &mut Vec<Value>) {
     }
 }
 
+/// One matched rule of a decision line: its id, action, mode, whether a
+/// switch still holds its response, and its exemption. A line of one match
+/// carries no `matches`: the line is the match.
+struct RuleView {
+    rule: String,
+    action: String,
+    mode: String,
+    held: bool,
+    exempt: bool,
+}
+
+fn rule_views(d: &Value) -> Vec<RuleView> {
+    match d.get("matches").and_then(Value::as_array) {
+        Some(ms) => ms
+            .iter()
+            .map(|m| RuleView {
+                rule: m["rule"].as_str().unwrap().to_string(),
+                action: m["action"].as_str().unwrap().to_string(),
+                mode: m["mode"].as_str().unwrap().to_string(),
+                held: m.get("held").is_some(),
+                exempt: m.get("exempt").is_some(),
+            })
+            .collect(),
+        None => vec![RuleView {
+            rule: d["rule"].as_str().unwrap().to_string(),
+            action: d["action"].as_str().unwrap().to_string(),
+            mode: "builtin".to_string(),
+            held: d["action"] == "Log" && d["reasoning"].as_str().unwrap().contains("[held back: "),
+            exempt: false,
+        }],
+    }
+}
+
 /// The cases cover the rules lots 219–226 added, and every response those
 /// lots hold behind a switch shows as an alert: action `Log`, the reasoning
-/// naming what was held.
+/// naming what was held — unless the case's own test policy enforces it.
 #[test]
 fn golden_cases_cover_the_rules_of_lots_219_to_226() {
     let mut all = Vec::new();
+    let mut builtin = Vec::new();
     for (name, text) in cases() {
-        let (_, _, lines) = replay(&name, &text);
+        let (case, _, lines) = replay(&name, &text);
         for l in &lines {
             decisions(l, &mut all);
+            if case.policy.is_none() {
+                decisions(l, &mut builtin);
+            }
         }
     }
-    let fired: BTreeSet<&str> = all.iter().map(|d| d["rule"].as_str().unwrap()).collect();
+    let fired: BTreeSet<String> = all
+        .iter()
+        .flat_map(|d| rule_views(d).into_iter().map(|v| v.rule))
+        .collect();
     for want in [
         "NN-L-EPG-001_CredentialPostcondition",
         "NN-L-NET-026_ScanFanOut",
@@ -766,14 +704,15 @@ fn golden_cases_cover_the_rules_of_lots_219_to_226() {
         );
     }
     // A held kill is an alert in the golden output.
-    let held: Vec<&Value> = all
+    let held: Vec<RuleView> = builtin
         .iter()
-        .filter(|d| d["reasoning"].as_str().unwrap().contains("[held back: "))
+        .flat_map(rule_views)
+        .filter(|v| v.held)
         .collect();
-    for d in &held {
-        assert_eq!(d["action"], "Log", "{d}");
+    for v in &held {
+        assert_eq!(v.action, "Log", "{}", v.rule);
     }
-    let held_rules: BTreeSet<&str> = held.iter().map(|d| d["rule"].as_str().unwrap()).collect();
+    let held_rules: BTreeSet<&str> = held.iter().map(|v| v.rule.as_str()).collect();
     for want in [
         "R020_ShellWithSocketStdio",
         "NN-L-NET-026_ScanFanOut",
@@ -787,17 +726,30 @@ fn golden_cases_cover_the_rules_of_lots_219_to_226() {
             "no golden case shows the held kill of {want}: {held_rules:?}"
         );
     }
-    // No response a switch holds runs in the golden output.
-    for d in &all {
-        if d["action"] != "Log" {
+    // Without a policy no response a switch holds runs in the golden
+    // output: no response is a held rule's, and a single-match line that
+    // acts names nothing held.
+    for d in &builtin {
+        let views = rule_views(d);
+        for r in d
+            .get("responses")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let rule = r["rule"].as_str().unwrap();
+            assert!(!views.iter().any(|v| v.rule == rule && v.held), "{d}");
+        }
+        if d.get("matches").is_none() && d["action"] != "Log" {
             let r = d["reasoning"].as_str().unwrap();
             assert!(!r.contains("[held back: "), "{d}");
         }
     }
 }
 
-/// Each case fires the rules it names in `fires` and shows held the
-/// responses it names in `held`.
+/// Each case fires the rules it names in `fires`, shows held the
+/// responses it names in `held`, enforced by its policy those in
+/// `enforced` and exempt those in `exempt`.
 #[test]
 fn every_case_shows_what_it_says() {
     for (name, text) in cases() {
@@ -807,19 +759,40 @@ fn every_case_shows_what_it_says() {
         for l in &lines {
             decisions(l, &mut all);
         }
+        let views: Vec<RuleView> = all.iter().flat_map(rule_views).collect();
         for want in &case.fires {
             assert!(
-                all.iter().any(|d| d["rule"] == want.as_str()),
+                views.iter().any(|v| v.rule == *want),
                 "case {name}: {want} does not fire"
             );
         }
         for want in &case.held {
             assert!(
-                all.iter().any(|d| d["rule"] == want.as_str()
-                    && d["action"] == "Log"
-                    && d["reasoning"].as_str().unwrap().contains("[held back: ")),
+                views
+                    .iter()
+                    .any(|v| v.rule == *want && v.action == "Log" && v.held),
                 "case {name}: no held response of {want}"
             );
         }
+        for want in &case.enforced {
+            assert!(
+                views
+                    .iter()
+                    .any(|v| v.rule == *want && v.action != "Log" && v.mode == "enforce"),
+                "case {name}: no response of {want} enforced by the policy"
+            );
+        }
+        for want in &case.exempt {
+            assert!(
+                views
+                    .iter()
+                    .any(|v| v.rule == *want && v.action == "Log" && v.exempt),
+                "case {name}: {want} is not exempt"
+            );
+        }
+        assert!(
+            case.policy.is_some() || (case.enforced.is_empty() && case.exempt.is_empty()),
+            "case {name}: `enforced` / `exempt` need a `policy`"
+        );
     }
 }

@@ -5,8 +5,8 @@ attacker can shape: admin socket frames, TLS ClientHello and DNS payloads
 from the kernel ring buffers, the BTF blob, tracefs `format` files, role
 lists from `admin.pub` / the CLI, chain-log lines, the install manifest,
 the COMBAT management carve-out (`combat-allow.cidrs` spliced into
-`combat-rules`), the operator canary templates and the watchdog's
-shutdown marker. (The `ade_verdict` and `ade_preparse` targets, the LLM
+`combat-rules`), the operator canary templates, the watchdog's
+shutdown marker and the per-rule response policy (`rule-policy.local`). (The `ade_verdict` and `ade_preparse` targets, the LLM
 advisor's output and its pre-parser, left with the advisor in Wave 4, lab
 PR 214.) The base property is
 always **never panic** — reject or report. Each target also asserts what
@@ -27,6 +27,7 @@ audit WDG-R04 to WDG-R08, WDG-014):
 | `canary_template` | a rendered canary keeps no `{{`, a JSON family's is JSON, the same body renders the same |
 | `resolv_conf` | every resolver parsed is the address of a `nameserver` line (zone index dropped), canonical, listed once, at most sixteen; the list rendered as `nameserver` lines parses back to itself (lab PR 224) |
 | `shutdown_marker` | a marker honoured against the fixture carries a shutdown the fixture keys signed (the fuzzer cannot sign: anything else is a forgery accepted), names the agent that exited, has at most the signature cap, two signers including the `shutdown` key, a capped grace, and is refused as a replay once honoured |
+| `rule_policy` | an accepted per-rule policy names only rules the engine decides, by their full id; no exemption by name (`comm`, `name`, `process`, `argv` refuse the file), of uid 0, of an executable outside a root-owned system tree, of a cgroup without a unit; at most 64 exemptions a rule; its rendering parses back to itself; a refusal names a line of the text (lab PR 236) |
 
 `install_manifest` and
 `shutdown_marker` check against fixtures in `agent/src/fuzz_api.rs`

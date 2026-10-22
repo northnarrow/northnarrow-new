@@ -559,6 +559,15 @@ enum Cmd {
         sub: ConfigCmd,
     },
 
+    /// Lab PR 236 — the signed per-rule response policy
+    /// (`rule-policy.local`): which rules enforce, alert, audit or are off,
+    /// their exemptions. `show` the policy in force, `set` a new one
+    /// (signed, applied at once), `test` a candidate on sample events.
+    Policy {
+        #[command(subcommand)]
+        sub: PolicyCmd,
+    },
+
     /// Debug-only: force the agent's posture state machine into a
     /// chosen state. Only compiled when the `debug-trigger` Cargo
     /// feature is on.
@@ -671,7 +680,7 @@ enum OverlayCmd {
         /// fim-paths, process-comm-allowlist, netflow-comm-allowlist,
         /// netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout,
         /// escalation-allow, canary-readers, cow-guard,
-        /// execq-hashes, exec-policy.
+        /// execq-hashes, exec-policy, rule-policy.
         kind: String,
         /// The overlay content to store.
         #[arg(long)]
@@ -717,6 +726,60 @@ enum OverlayCmd {
         /// public half `agent.sig.pub` when the key is closed to readers).
         #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
         agent_sig_key: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCmd {
+    /// The policy the agent applies: the signed file's (if its signature
+    /// holds), else the built-in defaults, and the held responses (exit 1
+    /// when a present file would not be loaded).
+    Show {
+        #[arg(long, default_value = northnarrow_agent::decision::rule_policy::DEFAULT_LOCAL)]
+        file: PathBuf,
+        #[arg(long = "admin-pub", default_value = DEFAULT_PUB_PATH)]
+        admin_pub: PathBuf,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long = "audit-log", default_value = DEFAULT_AUDIT_LOG_PATH)]
+        audit_log: PathBuf,
+        #[arg(long = "agent-sig-key", default_value = DEFAULT_SIGNING_KEY_PATH)]
+        agent_sig_key: PathBuf,
+    },
+    /// Validate, sign (role `config-manage`) and store a policy through the
+    /// running agent, which applies it at once (a signed audit row). A bad
+    /// line refuses the file; the policy in force stays.
+    Set {
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long = "cosign-key")]
+        cosign_key: Option<PathBuf>,
+        #[arg(long = "agent-id-file", default_value = DEFAULT_AGENT_ID_PATH)]
+        agent_id_file: PathBuf,
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+    },
+    /// Replay sample events through an offline engine (the shipped lists,
+    /// an empty /proc) under a candidate policy and print each decision.
+    /// Nothing is signed, stored, applied or executed.
+    Test {
+        /// The candidate (`rule-policy.local` text); none = the built-in
+        /// defaults.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// One `common::Event` JSON per line, `{"event": …}` per line, or a
+        /// golden case (`agent/tests/golden/cases/*.json`).
+        #[arg(long)]
+        events: PathBuf,
+        /// Where the shipped lists (`*.v1`) are read; a missing one is the
+        /// copy built into nn-admin.
+        #[arg(long = "config-dir", default_value = "/etc/northnarrow")]
+        config_dir: PathBuf,
+        /// One JSON decision per line instead of the table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1882,6 +1945,7 @@ fn main() -> ExitCode {
         Cmd::Config {
             sub: ConfigCmd::Overlay { sub },
         } => run_overlay_cmd(sub),
+        Cmd::Policy { sub } => run_policy_cmd(sub),
         Cmd::TrustedInstallerGrant {
             key,
             window_secs,
@@ -3862,6 +3926,211 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
             } else {
                 ExitCode::SUCCESS
             }
+        }
+    }
+}
+
+/// Lab PR 236: `nn-admin policy show|set|test`.
+fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
+    use common::wire::admin_signed_payload::OverlayKind;
+    use northnarrow_agent::config::overlay_auth::{Decision, OverlayGate};
+    use northnarrow_agent::decision::{replay, rule_policy};
+    match sub {
+        PolicyCmd::Show {
+            file,
+            admin_pub,
+            agent_id_file,
+            audit_log,
+            agent_sig_key,
+        } => {
+            let agent_id = match northnarrow_agent::agent_id::load_existing(&agent_id_file) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("policy show: {e:#}");
+                    return ExitCode::from(5);
+                }
+            };
+            let floor = northnarrow_agent::config::overlay_floor::RollbackFloor::scan(
+                &audit_log,
+                &agent_sig_key,
+            );
+            let gate = OverlayGate::new(&admin_pub, agent_id, floor);
+            let (policy, refused) = match gate.check(OverlayKind::RulePolicy, &file) {
+                Decision::Absent => {
+                    println!("{}: absent — the built-in defaults apply", file.display());
+                    (rule_policy::RulePolicy::builtin(), false)
+                }
+                Decision::Refused { reason, .. } => {
+                    println!(
+                        "{}: NOT LOADED ({reason}) — the built-in defaults apply",
+                        file.display()
+                    );
+                    (rule_policy::RulePolicy::builtin(), true)
+                }
+                Decision::Accepted {
+                    signed_ts, key_fps, ..
+                } => {
+                    let text = std::fs::read_to_string(&file).unwrap_or_default();
+                    let boot = rule_policy::boot_policy(Some((&file, &text)));
+                    match &boot.degraded {
+                        Some(d) => println!("signed, but refused: {d}"),
+                        None => println!(
+                            "{}: signed (ts {signed_ts}, keys {})",
+                            file.display(),
+                            key_fps.join(",")
+                        ),
+                    }
+                    let bad = boot.degraded.is_some();
+                    (boot.policy, bad)
+                }
+            };
+            print!("{}", rule_policy::show(&policy));
+            if refused {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        PolicyCmd::Set {
+            file,
+            key,
+            cosign_key,
+            agent_id_file,
+            socket,
+        } => {
+            let text = match std::fs::read_to_string(&file) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("policy set: {}: {e}", file.display());
+                    return ExitCode::from(2);
+                }
+            };
+            match rule_policy::parse(&text) {
+                Ok(p) => println!("policy set: {}", p.summary()),
+                Err(e) => {
+                    eprintln!("policy set: {}: {e} — nothing sent", file.display());
+                    return ExitCode::from(2);
+                }
+            }
+            run_overlay_cmd(OverlayCmd::Set {
+                kind: OverlayKind::RulePolicy.keyword().to_string(),
+                file,
+                key,
+                cosign_key,
+                agent_id_file,
+                socket,
+            })
+        }
+        PolicyCmd::Test {
+            policy,
+            events,
+            config_dir,
+            json,
+        } => {
+            let candidate = match &policy {
+                None => rule_policy::RulePolicy::builtin(),
+                Some(path) => {
+                    let parsed = std::fs::read_to_string(path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|t| rule_policy::parse(&t).map_err(|e| e.to_string()));
+                    match parsed {
+                        Ok(mut p) => {
+                            p.source = format!("{} (candidate, not signed)", path.display());
+                            p
+                        }
+                        Err(e) => {
+                            eprintln!("policy test: {}: {e}", path.display());
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+            };
+            let text = match std::fs::read_to_string(&events) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("policy test: {}: {e}", events.display());
+                    return ExitCode::from(2);
+                }
+            };
+            let (list, skipped) = match replay::sample_events(&text) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("policy test: {}: {e:#}", events.display());
+                    return ExitCode::from(2);
+                }
+            };
+            // An empty /proc of our own: nothing of this host's processes.
+            let proc_root = std::env::temp_dir().join(format!(
+                "nn-policy-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            if let Err(e) = std::fs::create_dir(&proc_root) {
+                eprintln!("policy test: {}: {e}", proc_root.display());
+                return ExitCode::from(5);
+            }
+            if !json {
+                println!("policy: {}", candidate.source);
+                if skipped > 0 {
+                    println!("({skipped} non-event items of the case skipped)");
+                }
+            }
+            let lines = replay::policy_test(candidate, &list, &config_dir, &proc_root);
+            let _ = std::fs::remove_dir(&proc_root);
+            for (i, l) in lines.iter().enumerate() {
+                if json {
+                    println!("{}", serde_json::json!({"seq": i, "decision": l}));
+                    continue;
+                }
+                if l.is_null() {
+                    println!("{i:>4}  -");
+                    continue;
+                }
+                let modes: Vec<String> = l["matches"]
+                    .as_array()
+                    .map(|ms| {
+                        ms.iter()
+                            .map(|m| {
+                                format!(
+                                    "{} {} {}{}",
+                                    m["rule"].as_str().unwrap_or(""),
+                                    m["mode"].as_str().unwrap_or(""),
+                                    m["action"].as_str().unwrap_or(""),
+                                    if m.get("held").is_some() {
+                                        " (held)"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "{i:>4}  {} {} {} pid {}{}",
+                    l["rule"].as_str().unwrap_or(""),
+                    l["action"].as_str().unwrap_or(""),
+                    l["severity"].as_str().unwrap_or(""),
+                    l["pid"],
+                    if modes.is_empty() {
+                        if l["reasoning"]
+                            .as_str()
+                            .unwrap_or("")
+                            .contains("[held back: ")
+                        {
+                            "  (held)".to_string()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        format!("  [{}]", modes.join("; "))
+                    }
+                );
+            }
+            ExitCode::SUCCESS
         }
     }
 }

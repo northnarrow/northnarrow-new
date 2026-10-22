@@ -254,6 +254,10 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
             crate::execpol::policy::parse(text, crate::execpol::Profile::Server)
                 .map_err(|e| anyhow!("{label}: {e}"))?;
         }
+        // Lab PR 236: any bad line refuses the per-rule policy whole.
+        OverlayKind::RulePolicy => {
+            crate::decision::rule_policy::parse(text).map_err(|e| anyhow!("{label}: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -684,6 +688,13 @@ impl OverlayGate {
             Some(l) => append(&l, draft),
             None => self.pending.lock().push(draft),
         }
+    }
+
+    /// A signed audit row of the gate's (lab PR 236: `rule_policy_loaded`,
+    /// the per-rule policy in force at boot), written now or when the log
+    /// is attached.
+    pub fn record_note(&self, op: &str, result: &str, extra: serde_json::Value) {
+        self.record_entry(entry(op, result, extra));
     }
 
     /// True when `path` (an overlay of `kind`) carries a valid signature
@@ -1206,6 +1217,72 @@ mod tests {
         assert!(
             validate_content(OverlayKind::ProcessCommAllowlist, "# comment\n+backupd\n").is_ok()
         );
+    }
+
+    /// Lab PR 236: the per-rule policy is an overlay like the others — a
+    /// `config-manage` signature over its exact bytes is in force; an
+    /// edit, another role's key, another agent, no signature leave the
+    /// built-in defaults; a signed file that does not parse is refused by
+    /// the content check (`overlay set`) and, at boot, leaves the defaults
+    /// with a degradation.
+    #[test]
+    fn the_rule_policy_is_signed_like_every_overlay() {
+        use crate::decision::rule_policy::{boot_policy, Mode};
+        const IMP: &str = "NN-L-IMP-001_RansomwareEncryption";
+        let body = "enforce NN-L-IMP-001\nexempt R020 uid 998\n";
+        let boot = |gate: &OverlayGate, p: &Path| match gate.verified(OverlayKind::RulePolicy, p) {
+            Verified::Content { path, text } => boot_policy(Some((&path, &text))),
+            _ => boot_policy(None),
+        };
+        let (dir, key, admin_pub) = setup("config-manage");
+        let p = write_signed(dir.path(), &key, OverlayKind::RulePolicy, body, 100);
+        assert_eq!(p.file_name().unwrap(), "rule-policy.local");
+        let gate = OverlayGate::new(&admin_pub, AGENT, RollbackFloor::default());
+        let b = boot(&gate, &p);
+        assert_eq!(b.degraded, None);
+        assert_eq!(b.policy.mode(IMP), Some(Mode::Enforce));
+        // Edited after signing: the defaults.
+        std::fs::write(&p, "enforce NN-L-IMP-001\nenforce R020\n").unwrap();
+        assert!(boot(&gate, &p).policy.is_builtin());
+        // Signed by a key without config-manage: the defaults.
+        let (dir2, key2, admin_pub2) = setup("unlock,audit-read");
+        let p2 = write_signed(dir2.path(), &key2, OverlayKind::RulePolicy, body, 100);
+        let gate2 = OverlayGate::new(&admin_pub2, AGENT, RollbackFloor::default());
+        assert!(
+            matches!(gate2.check(OverlayKind::RulePolicy, &p2), Decision::Refused { reason, .. } if reason.contains("rejected"))
+        );
+        assert!(boot(&gate2, &p2).policy.is_builtin());
+        // Another agent's signature: the defaults.
+        let (dir3, key3, admin_pub3) = setup("config-manage");
+        let p3 = write_signed(dir3.path(), &key3, OverlayKind::RulePolicy, body, 100);
+        let gate3 = OverlayGate::new(&admin_pub3, [4; 16], RollbackFloor::default());
+        assert!(boot(&gate3, &p3).policy.is_builtin());
+        // A signature of another kind over the same bytes: refused.
+        let p4 = write_signed(dir3.path(), &key3, OverlayKind::ExecPolicy, body, 100);
+        std::fs::rename(&p4, dir3.path().join("x.local")).unwrap();
+        std::fs::rename(sig_path(&p4), sig_path(&p3)).unwrap();
+        let gate4 = OverlayGate::new(&admin_pub3, AGENT, RollbackFloor::default());
+        assert!(
+            matches!(gate4.check(OverlayKind::RulePolicy, &p3), Decision::Refused { reason, .. } if reason.contains("exec-policy"))
+        );
+        // Unsigned: refused.
+        let u = dir3.path().join("unsigned-rule-policy.local");
+        std::fs::write(&u, body).unwrap();
+        assert!(boot(&gate4, &u).policy.is_builtin());
+        // Signed but not parsing: `overlay set` refuses it; at boot, the
+        // defaults and a degradation.
+        let bad = "enforce NN-L-IMP-001\nexempt R020 comm sshd\n";
+        let e = validate_content(OverlayKind::RulePolicy, bad)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rule-policy.local: line 2"), "{e}");
+        assert!(validate_content(OverlayKind::RulePolicy, body).is_ok());
+        let (dir5, key5, admin_pub5) = setup("config-manage");
+        let p5 = write_signed(dir5.path(), &key5, OverlayKind::RulePolicy, bad, 100);
+        let gate5 = OverlayGate::new(&admin_pub5, AGENT, RollbackFloor::default());
+        let b = boot(&gate5, &p5);
+        assert!(b.policy.is_builtin());
+        assert!(b.degraded.unwrap().contains("line 2"));
     }
 
     /// Lab PR 230 (D0 of the dependency plan): an overlay signed before the

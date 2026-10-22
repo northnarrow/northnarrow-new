@@ -158,6 +158,23 @@ pub enum TriggerType {
 /// (`decision::response_policy::IMP_001_KILL` in the agent).
 pub const RANSOMWARE_COMBAT_WITHOUT_CORROBORATION: bool = false;
 
+/// Lab PR 236: the value in force — [`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`]
+/// (the built-in default) until a signed per-rule policy says
+/// `combat-without-corroboration NN-L-IMP-001`.
+static RANSOMWARE_DECISIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(RANSOMWARE_COMBAT_WITHOUT_CORROBORATION);
+
+/// Whether [`TriggerType::RansomwareEncryption`] reaches COMBAT without
+/// corroboration now (lab PR 236: the signed per-rule policy's directive).
+pub fn ransomware_combat_without_corroboration() -> bool {
+    RANSOMWARE_DECISIVE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set by the agent when it puts a per-rule policy in force (lab PR 236).
+pub fn set_ransomware_combat_without_corroboration(on: bool) {
+    RANSOMWARE_DECISIVE.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
 ///
 /// BUG-032: only a *Decisive* signal escalates straight to locked
@@ -258,13 +275,15 @@ impl TriggerType {
     /// [`Confidence::Decisive`] escalates straight to COMBAT; every
     /// heuristic pattern is [`Confidence::NeedsCorroboration`].
     /// [`TriggerType::RansomwareEncryption`] is decisive only with
-    /// [`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`] (off by default).
+    /// [`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`] (off by default; lab PR
+    /// 236: [`ransomware_combat_without_corroboration`], the signed
+    /// per-rule policy's value).
     pub fn confidence(&self) -> Confidence {
         match self {
             TriggerType::AntiTamperDenial | TriggerType::ControlSurfaceTamper => {
                 Confidence::Decisive
             }
-            TriggerType::RansomwareEncryption if RANSOMWARE_COMBAT_WITHOUT_CORROBORATION => {
+            TriggerType::RansomwareEncryption if ransomware_combat_without_corroboration() => {
                 Confidence::Decisive
             }
             _ => Confidence::NeedsCorroboration,
@@ -432,6 +451,14 @@ mod tests {
         let r = TriggerType::RansomwareEncryption;
         assert_eq!(r.target_level(), PostureKind::Combat);
         const { assert!(!RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
+        assert_eq!(r.confidence(), Confidence::NeedsCorroboration);
+        // Lab PR 236: the signed policy's directive makes it decisive,
+        // still never locking; back off, it needs corroboration again.
+        assert!(!ransomware_combat_without_corroboration());
+        set_ransomware_combat_without_corroboration(true);
+        assert_eq!(r.confidence(), Confidence::Decisive);
+        assert!(!r.locks_combat());
+        set_ransomware_combat_without_corroboration(false);
         assert_eq!(r.confidence(), Confidence::NeedsCorroboration);
         assert_eq!(r.evidence_class(), EvidenceClass::FileSystem);
         assert!(!r.locks_combat());

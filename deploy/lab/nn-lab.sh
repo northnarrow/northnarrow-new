@@ -55,6 +55,7 @@
 #   deploy/lab/nn-lab.sh exec-sensor-check # Tappa 10.9 step 2: the exec sensor on LSM bprm_check_security (review 61)
 #   deploy/lab/nn-lab.sh execq-check     # lab PR 223 (EXPERIMENTAL): exec quarantine at first sight, six cases, guest put back
 #   deploy/lab/nn-lab.sh malsim-exec-check # lab PR 226 (EXPERIMENTAL): exec policy and exec environment, MS-01/02/03/32 before and after, negatives, guest put back
+#   deploy/lab/nn-lab.sh policy-check    # lab PR 236: the signed per-rule policy — MS-23 held built in, killed under `enforce NN-L-IMP-001` (set live, then at boot), a bad policy refused, back to built in
 #   deploy/lab/nn-lab.sh dns-sensor-check # Tappa 10.9 step 3: the DNS sensor on the socket buffer (reviews 66, 67)
 #   deploy/lab/nn-lab.sh net-check         # lab PR 224: connect-time network verdicts, reverse shells, outbound fan-out (CM-02/03/14)
 #   deploy/lab/nn-lab.sh ransom-check [--only MS23|MS25] # lab PR 225: MS-23 ransomware recorded (kill held, ENGAGED), negatives; MS-25 security tools
@@ -1420,6 +1421,17 @@ cmd_malsim_exec_check() {
     vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/exec-check.sh'
 }
 
+cmd_policy_check() {
+    # Lab PR 236 (deploy/lab/malsim/policy-check.sh): the signed per-rule
+    # response policy on MS-23 — built in, NN-L-IMP-001's kill held; `nn-admin
+    # policy set` of `enforce NN-L-IMP-001`, applied at once and at the next
+    # boot, kills the simulator's tree; a policy exempting by name refused;
+    # a policy of comments only puts the built-in defaults back. Needs a sync
+    # + install.
+    vm_running || die "guest is not running"
+    vssh 'sudo systemctl is-active --quiet northnarrow-agent || { sudo systemctl start northnarrow-agent; sleep 4; }; cd ~/northnarrow && bash deploy/lab/malsim/policy-check.sh'
+}
+
 cmd_dns_sensor_check() {
     # Tappa 10.9 step 3 (deploy/lab/dns-sensor/dns-sensor-check.sh): the DNS
     # sensor reads the kernel's copy of the query. NET-004 kills a sender
@@ -2115,6 +2127,7 @@ case "${1:-help}" in
     execq-check) cmd_execq_check ;;
     net-check)     cmd_net_check ;;
     malsim-exec-check) cmd_malsim_exec_check ;;
+    policy-check)  cmd_policy_check ;;
     dns-sensor-check) cmd_dns_sensor_check ;;
     ransom-check)  shift; cmd_ransom_check "$@" ;;
     fim-reuse-check) cmd_fim_reuse_check ;;

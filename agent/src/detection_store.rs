@@ -619,6 +619,65 @@ pub struct DetectionRecord {
     /// variables. Absent on every other record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execpol: Option<ExecPolEvidence>,
+    /// Lab PR 236 (multi-match): every rule that matched the event, in the
+    /// engine's order, when there are several or the per-rule policy gave
+    /// the primary rule a mode — [`Self::rule_id`] is the primary rule and
+    /// [`Self::mitre`] the union of their ATT&CK references. Absent on a
+    /// record of one rule under the built-in defaults (absent-on-`None`,
+    /// like [`Self::file`], so those lines keep their bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Vec<RuleMatchRecord>>,
+}
+
+/// Lab PR 236: one matched rule of a multi-match record
+/// ([`DetectionRecord::matches`]). Frozen like the record: fields are only
+/// ever appended as `Option`s.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleMatchRecord {
+    pub rule_id: String,
+    /// The match's action after the policy (`Log` for a held, alert,
+    /// audit or exempt match).
+    pub action: ResponseAction,
+    pub severity: Severity,
+    /// `builtin`, `enforce`, `alert`, `audit` or `exempt`.
+    pub mode: String,
+    /// The process the rule's verdict names.
+    pub pid: u32,
+    pub mitre: MitreAttack,
+    /// The switch still holding its response (built-in defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
+    /// The policy's exemption that covered the actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt: Option<String>,
+}
+
+impl RuleMatchRecord {
+    /// The record entries of `d`'s matches, when the record lists them.
+    pub fn of(d: &crate::decision::combine::Decision) -> Option<Vec<Self>> {
+        use crate::decision::combine::Applied;
+        if d.matches.len() < 2 && d.primary().applied == Applied::Builtin {
+            return None;
+        }
+        Some(
+            d.matches
+                .iter()
+                .map(|m| RuleMatchRecord {
+                    rule_id: m.rule_id.to_string(),
+                    action: m.verdict.action.clone(),
+                    severity: m.verdict.severity,
+                    mode: m.applied.name().to_string(),
+                    pid: m.verdict.event_pid,
+                    mitre: mitre_of(m.attack),
+                    held: m.held.map(str::to_string),
+                    exempt: match &m.applied {
+                        Applied::Exempt(e) => Some(e.clone()),
+                        _ => None,
+                    },
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Lab PR 226: what the exec policy saw and decided
@@ -716,6 +775,7 @@ impl DetectionRecord {
             network: network_from_event(event),
             sanction: None,
             execpol: None,
+            matches: None,
         }
     }
 
@@ -1085,6 +1145,34 @@ impl DetectionSink {
         if verdict.rule_id.starts_with("NN-L-EVA-") {
             record.sanction = crate::impair::published_sanction(event);
         }
+        self.enqueue(record);
+    }
+
+    /// Lab PR 236: record an engine decision — its verdict (the primary
+    /// rule's, with the decision's action and severity), the ATT&CK union
+    /// of its matches, and the matches ([`DetectionRecord::matches`]).
+    pub fn record_decision(
+        &self,
+        event: &Event,
+        decision: &crate::decision::combine::Decision,
+        posture: PostureKind,
+        response: String,
+        suppressed_before: u64,
+    ) {
+        let verdict = &decision.verdict;
+        let mut record =
+            DetectionRecord::from_rule(self.next_id(), now_ts(), event, verdict, posture, response)
+                .with_attack(&decision.attack());
+        record.suppressed_before = (suppressed_before > 0).then_some(suppressed_before);
+        // Lab PR 225: a sanctioned security-tool finding names why.
+        if decision
+            .matches
+            .iter()
+            .any(|m| m.rule_id.starts_with("NN-L-EVA-"))
+        {
+            record.sanction = crate::impair::published_sanction(event);
+        }
+        record.matches = RuleMatchRecord::of(decision);
         self.enqueue(record);
     }
 
@@ -1934,6 +2022,7 @@ mod tests {
             network: None,
             sanction: None,
             execpol: None,
+            matches: None,
         };
         assert_roundtrip(&record);
     }
@@ -3056,6 +3145,7 @@ mod tests {
             network: None,
             sanction: None,
             execpol: None,
+            matches: None,
         }
     }
 

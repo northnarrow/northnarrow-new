@@ -1,0 +1,2622 @@
+{
+ "about": "Lab PR 236 (multi-match): a user's program sends 200 MiB over TCP to an internal host, then 101 UDP datagrams of 1 MiB to another internal host. NN-L-NET-007 (internal flow from an unusual process, Medium) used to win first-match: the TCP flow got Medium and NN-L-NET-009's UDP accumulator never grew. Now NET-009 (High) is primary on the TCP flow, and its UDP sum crosses 100 MiB on the 101st datagram.",
+ "fires": [
+  "NN-L-NET-007_Rfc1918FromUnusualProc",
+  "NN-L-NET-009_ByteAnomaly"
+ ],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6000001,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "sshd",
+     "filename": "/usr/sbin/sshd",
+     "timestamp_ns": 100000000000,
+     "argv": [
+      "sshd: u [priv]"
+     ],
+     "parent_comm": "",
+     "start_ns": 99999000000,
+     "exe": {
+      "path": "/usr/sbin/sshd"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6000002,
+     "ppid": 6000001,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 101000000000,
+     "argv": [
+      "-bash"
+     ],
+     "parent_comm": "sshd",
+     "start_ns": 100999000000,
+     "exe": {
+      "path": "/usr/bin/bash"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6300003,
+     "ppid": 6000002,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "exfil",
+     "filename": "/home/u/.local/bin/exfil",
+     "timestamp_ns": 3600000000000,
+     "argv": [
+      "/home/u/.local/bin/exfil"
+     ],
+     "parent_comm": "bash",
+     "start_ns": 3599999000000,
+     "exe": {
+      "path": "/home/u/.local/bin/exfil"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3601000000000,
+     "end_ns": 3601050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.40",
+     "dst_port": 8080,
+     "proto": 6,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 209715200,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3601000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3700000000000,
+     "end_ns": 3700050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3700000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3701000000000,
+     "end_ns": 3701050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3701000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3702000000000,
+     "end_ns": 3702050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3702000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3703000000000,
+     "end_ns": 3703050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3703000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3704000000000,
+     "end_ns": 3704050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3704000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3705000000000,
+     "end_ns": 3705050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3705000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3706000000000,
+     "end_ns": 3706050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3706000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3707000000000,
+     "end_ns": 3707050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3707000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3708000000000,
+     "end_ns": 3708050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3708000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3709000000000,
+     "end_ns": 3709050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3709000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3710000000000,
+     "end_ns": 3710050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3710000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3711000000000,
+     "end_ns": 3711050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3711000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3712000000000,
+     "end_ns": 3712050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3712000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3713000000000,
+     "end_ns": 3713050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3713000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3714000000000,
+     "end_ns": 3714050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3714000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3715000000000,
+     "end_ns": 3715050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3715000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3716000000000,
+     "end_ns": 3716050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3716000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3717000000000,
+     "end_ns": 3717050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3717000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3718000000000,
+     "end_ns": 3718050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3718000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3719000000000,
+     "end_ns": 3719050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3719000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3720000000000,
+     "end_ns": 3720050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3720000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3721000000000,
+     "end_ns": 3721050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3721000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3722000000000,
+     "end_ns": 3722050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3722000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3723000000000,
+     "end_ns": 3723050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3723000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3724000000000,
+     "end_ns": 3724050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3724000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3725000000000,
+     "end_ns": 3725050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3725000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3726000000000,
+     "end_ns": 3726050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3726000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3727000000000,
+     "end_ns": 3727050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3727000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3728000000000,
+     "end_ns": 3728050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3728000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3729000000000,
+     "end_ns": 3729050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3729000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3730000000000,
+     "end_ns": 3730050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3730000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3731000000000,
+     "end_ns": 3731050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3731000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3732000000000,
+     "end_ns": 3732050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3732000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3733000000000,
+     "end_ns": 3733050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3733000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3734000000000,
+     "end_ns": 3734050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3734000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3735000000000,
+     "end_ns": 3735050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3735000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3736000000000,
+     "end_ns": 3736050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3736000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3737000000000,
+     "end_ns": 3737050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3737000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3738000000000,
+     "end_ns": 3738050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3738000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3739000000000,
+     "end_ns": 3739050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3739000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3740000000000,
+     "end_ns": 3740050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3740000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3741000000000,
+     "end_ns": 3741050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3741000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3742000000000,
+     "end_ns": 3742050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3742000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3743000000000,
+     "end_ns": 3743050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3743000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3744000000000,
+     "end_ns": 3744050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3744000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3745000000000,
+     "end_ns": 3745050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3745000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3746000000000,
+     "end_ns": 3746050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3746000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3747000000000,
+     "end_ns": 3747050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3747000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3748000000000,
+     "end_ns": 3748050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3748000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3749000000000,
+     "end_ns": 3749050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3749000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3750000000000,
+     "end_ns": 3750050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3750000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3751000000000,
+     "end_ns": 3751050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3751000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3752000000000,
+     "end_ns": 3752050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3752000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3753000000000,
+     "end_ns": 3753050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3753000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3754000000000,
+     "end_ns": 3754050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3754000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3755000000000,
+     "end_ns": 3755050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3755000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3756000000000,
+     "end_ns": 3756050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3756000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3757000000000,
+     "end_ns": 3757050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3757000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3758000000000,
+     "end_ns": 3758050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3758000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3759000000000,
+     "end_ns": 3759050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3759000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3760000000000,
+     "end_ns": 3760050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3760000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3761000000000,
+     "end_ns": 3761050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3761000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3762000000000,
+     "end_ns": 3762050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3762000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3763000000000,
+     "end_ns": 3763050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3763000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3764000000000,
+     "end_ns": 3764050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3764000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3765000000000,
+     "end_ns": 3765050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3765000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3766000000000,
+     "end_ns": 3766050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3766000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3767000000000,
+     "end_ns": 3767050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3767000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3768000000000,
+     "end_ns": 3768050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3768000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3769000000000,
+     "end_ns": 3769050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3769000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3770000000000,
+     "end_ns": 3770050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3770000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3771000000000,
+     "end_ns": 3771050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3771000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3772000000000,
+     "end_ns": 3772050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3772000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3773000000000,
+     "end_ns": 3773050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3773000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3774000000000,
+     "end_ns": 3774050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3774000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3775000000000,
+     "end_ns": 3775050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3775000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3776000000000,
+     "end_ns": 3776050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3776000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3777000000000,
+     "end_ns": 3777050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3777000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3778000000000,
+     "end_ns": 3778050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3778000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3779000000000,
+     "end_ns": 3779050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3779000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3780000000000,
+     "end_ns": 3780050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3780000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3781000000000,
+     "end_ns": 3781050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3781000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3782000000000,
+     "end_ns": 3782050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3782000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3783000000000,
+     "end_ns": 3783050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3783000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3784000000000,
+     "end_ns": 3784050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3784000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3785000000000,
+     "end_ns": 3785050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3785000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3786000000000,
+     "end_ns": 3786050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3786000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3787000000000,
+     "end_ns": 3787050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3787000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3788000000000,
+     "end_ns": 3788050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3788000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3789000000000,
+     "end_ns": 3789050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3789000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3790000000000,
+     "end_ns": 3790050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3790000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3791000000000,
+     "end_ns": 3791050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3791000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3792000000000,
+     "end_ns": 3792050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3792000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3793000000000,
+     "end_ns": 3793050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3793000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3794000000000,
+     "end_ns": 3794050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3794000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3795000000000,
+     "end_ns": 3795050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3795000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3796000000000,
+     "end_ns": 3796050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3796000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3797000000000,
+     "end_ns": 3797050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3797000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3798000000000,
+     "end_ns": 3798050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3798000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3799000000000,
+     "end_ns": 3799050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3799000000000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3800000000000,
+     "end_ns": 3800050000000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 40100,
+     "dst_addr": "10.20.30.41",
+     "dst_port": 5353,
+     "proto": 17,
+     "pid": 6300003,
+     "uid": 1000,
+     "comm": "exfil",
+     "exe": "/home/u/.local/bin/exfil",
+     "proc_start_ns": 0,
+     "bytes_sent": 1048576,
+     "bytes_recv": 128,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6300003-3800000000000",
+     "phase": "closed"
+    }
+   }
+  }
+ ]
+}

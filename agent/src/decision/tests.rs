@@ -750,24 +750,46 @@ fn spawn_fixtures() -> Vec<Event> {
 /// strongest any single rule returns — the strongest action, then the
 /// highest severity. Before, `/tmp/insmod` was R001 (Medium), not R011
 /// (High), and `/home/alice/.hidden/bash` R008's record, not R017's kill.
+/// Lab PR 236 (multi-match): the decision's action is the strongest any
+/// rule returns, its severity the highest any rule returns — they may come
+/// from two rules — and it lists every rule that fired.
 #[test]
 fn the_engine_returns_the_strongest_spawn_verdict() {
     for event in spawn_fixtures() {
-        let got = RuleEngine::with_default_rules().evaluate(&event);
+        let got = RuleEngine::with_default_rules().decide(&event);
         let all: Vec<common::Verdict> = super::rules::default_rules()
             .iter()
             .filter_map(|r| r.evaluate(&event))
             .collect();
-        let strongest = all.iter().map(strength).max();
+        let strongest_action = all.iter().map(|v| strength(v).0).max();
+        let highest_severity = all.iter().map(|v| v.severity as u8).max();
+        let ctx = || {
+            format!(
+                "{event:?}\n  engine: {:?}\n  rules: {:?}",
+                got.as_ref().map(|d| d.verdict.rule_id.clone()),
+                all.iter()
+                    .map(|v| (&v.rule_id, &v.action, v.severity))
+                    .collect::<Vec<_>>()
+            )
+        };
         assert_eq!(
-            got.as_ref().map(strength),
-            strongest,
-            "{event:?}\n  engine: {:?}\n  rules: {:?}",
-            got.map(|v| v.rule_id),
-            all.iter()
-                .map(|v| (&v.rule_id, &v.action, v.severity))
-                .collect::<Vec<_>>()
+            got.as_ref().map(|d| strength(&d.verdict).0),
+            strongest_action,
+            "{}",
+            ctx()
         );
+        assert_eq!(
+            got.as_ref().map(|d| d.verdict.severity as u8),
+            highest_severity,
+            "{}",
+            ctx()
+        );
+        let listed: Vec<&str> = got
+            .as_ref()
+            .map(|d| d.matches.iter().map(|m| m.rule_id).collect())
+            .unwrap_or_default();
+        let fired: Vec<&str> = all.iter().map(|v| v.rule_id.as_str()).collect();
+        assert_eq!(listed, fired, "{}", ctx());
     }
 }
 
@@ -814,11 +836,19 @@ fn a_log_rule_never_shadows_a_staging_kill() {
             "R017_ShellFromNonstandardPath",
         ),
     ] {
-        let v = engine
-            .evaluate(&spawn_as(uid, comm, path))
+        // Lab PR 236: a record rule of higher severity may be the primary
+        // rule; the staging kill is the response that runs.
+        let d = engine
+            .decide(&spawn_as(uid, comm, path))
             .unwrap_or_else(|| panic!("{path}"));
-        assert_eq!(v.rule_id, rule, "{path}");
-        assert_eq!(v.action, ResponseAction::KillProcessTree, "{path}");
+        assert_eq!(d.verdict.action, ResponseAction::KillProcessTree, "{path}");
+        assert_eq!(d.responses.len(), 1, "{path}");
+        assert_eq!(d.responses[0].rule_id, rule, "{path}");
+        assert_eq!(
+            d.responses[0].action,
+            ResponseAction::KillProcessTree,
+            "{path}"
+        );
     }
 }
 
@@ -1328,4 +1358,419 @@ fn connect_time_evaluation_cost() {
         connect_ns < 500_000,
         "connect-time evaluation {connect_ns} ns/row: something scans or blocks per flow"
     );
+}
+
+// ── Lab PR 236: multi-match — the shadowing bugs, the policy, detect-only ──
+
+/// The production engine (`replay::engine`: the shipped lists, an empty
+/// `/proc`) under `policy`.
+struct Prod {
+    _proc: tempfile::TempDir,
+    lineage: crate::posture::lineage::AuthSessionTracker,
+    engine: RuleEngine,
+}
+
+fn prod(policy: &str) -> Prod {
+    let proc = tempfile::TempDir::new().unwrap();
+    let lineage = crate::posture::lineage::AuthSessionTracker::new(proc.path());
+    let engine = super::replay::engine(super::replay::HostParts {
+        configs: std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../configs")),
+        proc_root: proc.path(),
+        lineage: lineage.clone(),
+        ransom: std::sync::Arc::new(crate::impact::RansomTracker::new(lineage.clone())),
+        resolvers: Vec::new(),
+        policy: super::rule_policy::parse(policy).unwrap(),
+    });
+    Prod {
+        _proc: proc,
+        lineage,
+        engine,
+    }
+}
+
+impl Prod {
+    fn decide(&self, e: &Event) -> Option<super::combine::Decision> {
+        if let Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid,
+            filename,
+            argv,
+            timestamp_ns,
+            exe,
+            start_ns,
+            ..
+        } = e
+        {
+            self.lineage.ingest_exec(
+                *pid,
+                *ppid,
+                exe.path_or(filename),
+                argv,
+                *timestamp_ns,
+                *start_ns,
+                *uid,
+            );
+        }
+        self.engine.decide(e)
+    }
+}
+
+fn ids(d: &super::combine::Decision) -> Vec<&'static str> {
+    d.matches.iter().map(|m| m.rule_id).collect()
+}
+
+fn fim_event(path: &str, op: common::wire::FimOp, pid: u32, uid: u32, ts: u64) -> Event {
+    Event::Fim(common::wire::FimEvent {
+        timestamp_ns: ts,
+        path: path.to_string(),
+        op,
+        new_sha256: None,
+        baseline_sha256: None,
+        new_size: None,
+        baseline_size: None,
+        modifier_exe: Some("/home/u/.local/bin/implant".to_string()),
+        modifier_pid: pid,
+        modifier_uid: uid,
+        modifier_comm: "implant".to_string(),
+        dest_path: None,
+        child_truncated: false,
+        wide_coverage: false,
+        owner_uid: None,
+        reader_dac_capable: false,
+        capability: None,
+        attrs: None,
+        file_key: None,
+        is_dir: false,
+        moved_in: false,
+    })
+}
+
+fn net_flow(pid: u32, dst: [u8; 4], port: u16, proto: u8, ts: u64, sent: u64) -> Event {
+    Event::NetFlow(common::wire::NetFlowEvent {
+        start_ns: ts,
+        end_ns: ts + 1_000,
+        family: 2,
+        src_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 15)),
+        src_port: 40_100,
+        dst_addr: std::net::IpAddr::V4(dst.into()),
+        dst_port: port,
+        proto,
+        pid,
+        uid: 1000,
+        comm: "exfil".to_string(),
+        exe: Some("/home/u/.local/bin/exfil".to_string()),
+        proc_start_ns: 0,
+        bytes_sent: sent,
+        bytes_recv: 128,
+        resolved_hostname: None,
+        tls_fingerprint: None,
+        flow_id: format!("t-{pid}-{ts}"),
+        close_reason: 0,
+        phase: Default::default(),
+        observed_ns: 0,
+    })
+}
+
+const SEC: u64 = 1_000_000_000;
+
+/// FIM-023 was never reached: FIM-009 matched the same `.timer` first.
+#[test]
+fn shadow_fim023_fires_with_fim009_on_a_timer() {
+    let p = prod("");
+    let d = p
+        .decide(&fim_event(
+            "/etc/systemd/system/x.timer",
+            common::wire::FimOp::Created,
+            7001,
+            0,
+            10 * SEC,
+        ))
+        .expect("a decision");
+    assert_eq!(
+        ids(&d),
+        [
+            "NN-L-FIM-009_SystemdUnitDropped",
+            "NN-L-FIM-023_SystemdTimerCreated"
+        ]
+    );
+    assert_eq!(d.verdict.rule_id, "NN-L-FIM-009_SystemdUnitDropped");
+    assert!(d
+        .attack()
+        .iter()
+        .any(|a| a.technique.as_str() == "T1053.006"));
+    assert_eq!(d.responses.len(), 1, "one kill of the writer");
+}
+
+/// FIM-002 (a Log) used to win over FIM-004 (a kill) on a new
+/// authorized_keys under /home.
+#[test]
+fn shadow_fim004_kills_a_new_authorized_keys_under_home() {
+    let p = prod("");
+    let d = p
+        .decide(&fim_event(
+            "/home/u/.ssh/authorized_keys",
+            common::wire::FimOp::Created,
+            7002,
+            1000,
+            10 * SEC,
+        ))
+        .expect("a decision");
+    assert_eq!(
+        ids(&d),
+        [
+            "NN-L-FIM-002_NewSuidBinary",
+            "NN-L-FIM-004_AuthorizedKeysModified"
+        ]
+    );
+    assert_eq!(d.verdict.rule_id, "NN-L-FIM-004_AuthorizedKeysModified");
+    assert_eq!(d.verdict.action, ResponseAction::KillProcess);
+    assert_eq!(d.verdict.severity, Severity::High);
+}
+
+/// NET-007 (Medium) used to win over NET-009 (High): a large internal TCP
+/// transfer got Medium, and NET-009's UDP sum never grew.
+#[test]
+fn shadow_net009_sees_internal_flows_past_net007() {
+    let p = prod("");
+    let d = p
+        .decide(&net_flow(7003, [10, 1, 2, 3], 8080, 6, 10 * SEC, 200 << 20))
+        .expect("a decision");
+    assert_eq!(
+        ids(&d),
+        [
+            "NN-L-NET-007_Rfc1918FromUnusualProc",
+            "NN-L-NET-009_ByteAnomaly"
+        ]
+    );
+    assert_eq!(d.verdict.rule_id, "NN-L-NET-009_ByteAnomaly");
+    assert_eq!(d.verdict.severity, Severity::High);
+    // UDP: 101 datagrams of 1 MiB to an internal host, 1 s apart (the
+    // sum is kept 10 minutes).
+    let mut net009 = Vec::new();
+    for i in 0..101u64 {
+        let d = p
+            .decide(&net_flow(
+                7004,
+                [10, 1, 2, 4],
+                5353,
+                17,
+                (100 + i) * SEC,
+                1 << 20,
+            ))
+            .expect("NET-007 at least");
+        if ids(&d).contains(&"NN-L-NET-009_ByteAnomaly") {
+            net009.push(i);
+        }
+    }
+    assert_eq!(net009, [100], "the sum crosses 100 MiB on the 101st");
+}
+
+/// Lab PR 235: CHAIN-007 completed on a late exec silenced the exec's own
+/// R001 / R009.
+#[test]
+fn shadow_chain007_late_exec_keeps_r001_and_r009() {
+    let p = prod("");
+    let mut read = fim_event(
+        "/root/.gnupg/private-keys-v1.d/k.key",
+        common::wire::FimOp::Opened,
+        7005,
+        0,
+        11 * SEC,
+    );
+    if let Event::Fim(fe) = &mut read {
+        fe.modifier_comm = "stager".into();
+        fe.modifier_exe = Some("/tmp/.s/stager".into());
+    }
+    p.decide(&read);
+    let mut connect = net_flow(7005, [203, 0, 113, 9], 443, 6, 12 * SEC, 1024);
+    if let Event::NetFlow(nf) = &mut connect {
+        nf.phase = common::wire::FlowPhase::Connect;
+        nf.uid = 0;
+        nf.comm = "stager".into();
+        nf.exe = Some("/tmp/.s/stager".into());
+    }
+    let on_connect = p.decide(&connect).expect("CHAIN-001");
+    assert!(ids(&on_connect).contains(&"NN-L-CHAIN-001_CredReadThenEgress"));
+    let mut exec = spawn_as(0, "stager", "/tmp/.s/stager");
+    if let Event::ProcessSpawn {
+        pid,
+        timestamp_ns,
+        start_ns,
+        ..
+    } = &mut exec
+    {
+        *pid = 7005;
+        *timestamp_ns = 10 * SEC;
+        *start_ns = 9 * SEC;
+    }
+    let d = p.decide(&exec).expect("the late exec");
+    let got = ids(&d);
+    for want in [
+        "NN-L-CHAIN-007_TmpCredExfilSequence",
+        "R001_ExecFromTmp",
+        "R009_RootExecFromUserPath",
+    ] {
+        assert!(got.contains(&want), "{want}: {got:?}");
+    }
+    assert_eq!(d.verdict.rule_id, "NN-L-CHAIN-007_TmpCredExfilSequence");
+    assert_eq!(
+        d.responses.len(),
+        1,
+        "one kill of one tree: {:?}",
+        d.responses
+    );
+    assert_eq!(d.responses[0].action, ResponseAction::KillProcessTree);
+}
+
+/// R020's reverse shell: the shell of a web server, stdio on a socket it
+/// connected out.
+fn reverse_shell(uid: u32, pid: u32) -> Event {
+    let mut e = spawn_as(uid, "bash", "/usr/bin/bash");
+    if let Event::ProcessSpawn {
+        pid: p,
+        ppid,
+        stdio,
+        exe,
+        ..
+    } = &mut e
+    {
+        *p = pid;
+        *ppid = pid - 1;
+        exe.path = "/usr/bin/bash".into();
+        stdio.own = common::StdioSocket {
+            read: true,
+            inet_fds: 3,
+            outbound: true,
+            proto: 6,
+            peer: Some("203.0.113.7:4444".parse().unwrap()),
+        };
+    }
+    e
+}
+
+/// Without a policy a held kill stays held; `enforce` gives it back;
+/// `alert`, `audit`, `off` and an exemption by uid do what they say.
+#[test]
+fn the_policy_modes_on_a_held_kill() {
+    let mode = |policy: &str| {
+        let p = prod(policy);
+        p.decide(&reverse_shell(33, 7101)).map(|d| {
+            (
+                d.verdict.action.clone(),
+                d.primary().applied.name(),
+                d.audit_only(),
+            )
+        })
+    };
+    assert_eq!(
+        mode(""),
+        Some((ResponseAction::Log, "builtin", false)),
+        "held without a policy"
+    );
+    assert_eq!(
+        mode("enforce R020\n"),
+        Some((ResponseAction::KillProcessTree, "enforce", false))
+    );
+    assert_eq!(
+        mode("alert R020\n"),
+        Some((ResponseAction::Log, "alert", false))
+    );
+    assert_eq!(
+        mode("audit R020\n"),
+        Some((ResponseAction::Log, "audit", true))
+    );
+    assert_eq!(mode("off R020\n"), None);
+    assert_eq!(
+        mode("enforce R020\nexempt R020 uid 33\n"),
+        Some((ResponseAction::Log, "exempt", true))
+    );
+    // Another uid is not exempt.
+    let p = prod("enforce R020\nexempt R020 uid 33\n");
+    let d = p.decide(&reverse_shell(34, 7201)).unwrap();
+    assert_eq!(d.verdict.action, ResponseAction::KillProcessTree);
+    // The other rules keep their response under a policy that names R020
+    // only: R001's kill of a /tmp exec.
+    let d = p.decide(&spawn("payload", "/tmp/payload")).unwrap();
+    assert_eq!(d.verdict.action, ResponseAction::KillProcessTree);
+    assert_eq!(d.primary().applied.name(), "builtin");
+}
+
+/// A policy swapped between two events applies from the next one.
+#[test]
+fn a_policy_swap_applies_from_the_next_event() {
+    let p = prod("");
+    let e = reverse_shell(33, 7301);
+    assert_eq!(p.decide(&e).unwrap().verdict.action, ResponseAction::Log);
+    p.engine
+        .policy()
+        .install(super::rule_policy::parse("enforce R020\n").unwrap());
+    assert_eq!(
+        p.decide(&reverse_shell(33, 7302)).unwrap().verdict.action,
+        ResponseAction::KillProcessTree
+    );
+}
+
+/// `--detect-only` overrides every mode: the executor of a detect-only
+/// agent runs no response a policy enforces (it reports `WouldExecute`).
+#[test]
+fn detect_only_overrides_an_enforced_kill() {
+    let p = prod("enforce R020\n");
+    let d = p.decide(&reverse_shell(33, 7401)).unwrap();
+    assert_eq!(d.responses.len(), 1);
+    let exec = crate::response::Executor::with_config(crate::response::ExecutorConfig {
+        dry_run: true,
+        ..crate::response::ExecutorConfig::default()
+    });
+    // A real child, so a kill that ran would show.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let r = &d.responses[0];
+    let report = exec.execute_for_started(r.action.clone(), child.id(), 0, 0, &r.filename);
+    assert_eq!(
+        report.primary,
+        crate::response::ExecutionOutcome::WouldExecute { pid: child.id() }
+    );
+    assert!(child.try_wait().unwrap().is_none(), "still running");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// The same stream gives the same decisions on several threads at once,
+/// each on its own engine, under a policy with an exemption.
+#[test]
+fn decisions_are_deterministic_across_threads() {
+    let run = || {
+        let p = prod("enforce R020\nexempt R020 uid 33\nalert NN-L-FIM-004\n");
+        let mut out = Vec::new();
+        for (i, e) in [
+            reverse_shell(33, 7501),
+            reverse_shell(34, 7503),
+            fim_event(
+                "/home/u/.ssh/authorized_keys",
+                common::wire::FimOp::Created,
+                7505,
+                1000,
+                SEC,
+            ),
+            spawn("payload", "/tmp/payload"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            out.push(format!(
+                "{i} {:?}",
+                p.decide(e)
+                    .map(|d| (ids(&d), d.verdict.reasoning, d.verdict.action))
+            ));
+        }
+        out
+    };
+    let first = run();
+    let threads: Vec<_> = (0..4).map(|_| std::thread::spawn(run)).collect();
+    for t in threads {
+        assert_eq!(t.join().unwrap(), first);
+    }
 }

