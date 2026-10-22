@@ -66,6 +66,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
+use crate::chain_host::ChainSigner;
 
 /// Pre-image prefix of a numbered `audit.log` row.
 pub const AUDIT_DOMAIN_V2: &[u8] = b"northnarrow/audit/v2\0";
@@ -746,7 +747,7 @@ impl HeadsStore {
 
     /// Write `snapshot` (its `counter` picks the slot) and fsync. The file
     /// is created if missing (`O_NOFOLLOW`, never truncated).
-    pub fn write(path: &Path, key: &AgentSigningKey, snapshot: &HeadsSnapshot) -> Result<()> {
+    pub fn write<K: ChainSigner>(path: &Path, key: &K, snapshot: &HeadsSnapshot) -> Result<()> {
         let digest = snapshot_digest(snapshot)?;
         let slot = SignedSlot {
             snapshot: snapshot.clone(),
@@ -905,7 +906,7 @@ impl ChainFinding {
     }
 
     /// ERROR in the journal, then the signed entry.
-    pub fn attest(&self, log: Option<&mut AuditLog>) {
+    pub fn attest<K: ChainSigner>(&self, log: Option<&mut AuditLog<K>>) {
         error!(
             kind = self.kind,
             chain = %self.chain,
@@ -979,18 +980,6 @@ impl BootCheck {
     pub fn second_key_added(&self) -> bool {
         self.previous.as_ref().is_some_and(|p| p.second_key_added)
             || self.audit_history_lost().is_some()
-    }
-}
-
-/// Load the verifying key the way the boot does before the attach: the
-/// signing key if readable, else its published public half.
-pub fn boot_verifying_key(signing_key_file: &Path) -> Option<VerifyingKey> {
-    match crate::audit::read_signing_key(signing_key_file) {
-        Ok(k) => Some(k.verifying_key()),
-        Err(_) => {
-            crate::audit::read_verifying_key(&crate::audit::verifying_key_path(signing_key_file))
-                .ok()
-        }
     }
 }
 
@@ -1190,9 +1179,9 @@ fn check_rotating(t: &ChainTarget, pk: &VerifyingKey, findings: &mut Vec<ChainFi
 // ── the anchor writer ───────────────────────────────────────────────
 
 /// Writes the head anchor for the running agent.
-pub struct Anchor {
+pub struct Anchor<K = AgentSigningKey> {
     file: PathBuf,
-    key: AgentSigningKey,
+    key: K,
     agent_id: [u8; 16],
     targets: Vec<ChainTarget>,
     last: Option<HeadsSnapshot>,
@@ -1204,13 +1193,13 @@ pub struct Anchor {
     marker_pending: bool,
 }
 
-impl Anchor {
+impl<K: ChainSigner> Anchor<K> {
     /// `previous`: the snapshot the boot check read (its counter and
     /// sticky flag carry over). `anchoring_started`: the audit chain
     /// already holds the [`NUMBERING_STARTED_OP`] row.
     pub fn new(
         file: PathBuf,
-        key: AgentSigningKey,
+        key: K,
         agent_id: [u8; 16],
         targets: Vec<ChainTarget>,
         previous: Option<HeadsSnapshot>,
@@ -1408,7 +1397,7 @@ pub fn spawn_boot_verify(
         );
         let Some(log) = audit_log else {
             for f in &failures {
-                f.attest(None);
+                f.attest(None::<&mut AuditLog>);
             }
             return;
         };
@@ -1476,7 +1465,7 @@ pub fn report_unverified_rows(chain: &str, file: &Path, count: usize) {
     }
     match READ_AUDIT_LOG.get() {
         Some(log) => finding.attest(Some(&mut log.lock())),
-        None => finding.attest(None),
+        None => finding.attest(None::<&mut AuditLog>),
     }
 }
 

@@ -1490,16 +1490,13 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // overlay rollback floor below.
     let heads_file = cli.resolved_chain_heads_file();
     let chain_targets = cli.chain_paths().targets();
-    let mut boot_chains =
-        match northnarrow_agent::chain_anchor::boot_verifying_key(&cli.signing_key_file) {
-            Some(pk) => {
-                northnarrow_agent::chain_anchor::boot_check(&chain_targets, &heads_file, &pk)
-            }
-            None => {
-                info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
-                northnarrow_agent::chain_anchor::BootCheck::default()
-            }
-        };
+    let mut boot_chains = match northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
+        Some(pk) => northnarrow_agent::chain_anchor::boot_check(&chain_targets, &heads_file, &pk),
+        None => {
+            info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
+            northnarrow_agent::chain_anchor::BootCheck::default()
+        }
+    };
     // External audit LLMR-014: the signed overlays' rollback floor, from the
     // audit chain as this boot found it — verified, and read before the key
     // and the log below are bootstrapped (a log found missing must not look
@@ -3261,7 +3258,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         northnarrow_agent::chain_anchor::spawn(Arc::clone(a), audit_log.clone());
     }
     northnarrow_agent::chain_anchor::set_audit_log(audit_log.clone());
-    if let Some(pk) = northnarrow_agent::chain_anchor::boot_verifying_key(&cli.signing_key_file) {
+    if let Some(pk) = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
         northnarrow_agent::chain_anchor::spawn_boot_verify(
             chain_targets.clone(),
             pk,

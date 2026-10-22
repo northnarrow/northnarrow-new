@@ -82,6 +82,7 @@ use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
+use crate::chain_host::ChainSigner;
 
 /// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
 /// line (the legacy flat line, NO `fmt_ver`) and a v2 line are read and
@@ -398,7 +399,7 @@ fn chain_digest<T: Frame>(line: &T, kind: &str) -> Result<[u8; 32]> {
 
 /// Hash and sign `line` (its seal empty) for the log `kind`, in the format
 /// its version field names.
-fn seal_line<T: Frame>(mut line: T, key: &AgentSigningKey, kind: &str) -> Result<T> {
+fn seal_line<T: Frame, K: ChainSigner>(mut line: T, key: &K, kind: &str) -> Result<T> {
     let digest = chain_digest(&line, kind)?;
     let (hash, sig) = line.seal_mut();
     *hash = hex::encode(digest);
@@ -626,16 +627,16 @@ fn check_reserved_keys<P: Serialize>(payload: &P) -> Result<()> {
 
 impl<P: Serialize + ChainPayload> ChainLine<P> {
     /// Build a fully-signed v3 data line chained off `prev_hash`.
-    fn sealed(payload: P, key: &AgentSigningKey, prev_hash: &str) -> Result<Self> {
+    fn sealed<K: ChainSigner>(payload: P, key: &K, prev_hash: &str) -> Result<Self> {
         Self::sealed_as(payload, Some(CHAINLOG_FMT_V3), key, prev_hash)
     }
 
     /// A data line in the format `fmt_ver` names (the writer: v3; the
     /// tests' legacy fixtures: `None` or v2).
-    fn sealed_as(
+    fn sealed_as<K: ChainSigner>(
         payload: P,
         fmt_ver: Option<u32>,
-        key: &AgentSigningKey,
+        key: &K,
         prev_hash: &str,
     ) -> Result<Self> {
         let line = ChainLine {
@@ -651,9 +652,9 @@ impl<P: Serialize + ChainPayload> ChainLine<P> {
 
 impl TerminatorLine {
     /// The seal of the log `kind`, in the format `rotate.fmt_ver` names.
-    fn sealed(
+    fn sealed<K: ChainSigner>(
         rotate: RotateTerminator,
-        key: &AgentSigningKey,
+        key: &K,
         prev_hash: &str,
         kind: &str,
     ) -> Result<Self> {
@@ -671,9 +672,9 @@ impl TerminatorLine {
 impl ManifestLine {
     /// A manifest row of the log `kind`, in the format `manifest.fmt_ver`
     /// names.
-    fn sealed(
+    fn sealed<K: ChainSigner>(
         manifest: ManifestEntry,
-        key: &AgentSigningKey,
+        key: &K,
         prev_hash: &str,
         kind: &str,
     ) -> Result<Self> {
@@ -872,10 +873,10 @@ struct PendingSeal {
 }
 
 /// Append-only, rotation-aware, signed chain writer for one log.
-pub struct RotatingChainLog<P> {
+pub struct RotatingChainLog<P, K = AgentSigningKey> {
     active_path: PathBuf,
     manifest_path: PathBuf,
-    key: AgentSigningKey,
+    key: K,
     cfg: RotationConfig,
     protection: std::sync::Arc<dyn ProtectionManager>,
     /// Tail `entry_hash` the next data line chains off (the previous
@@ -916,14 +917,14 @@ pub const CHECKPOINT_EVERY_RECORDS: u64 = 1000;
 /// ...or after this long with records appended since the last one.
 pub const CHECKPOINT_EVERY_SECS: u64 = 600;
 
-impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
+impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingChainLog<P, K> {
     /// Open (or initialise) the log at `active_path`. Scans existing
     /// archives to recover `next_seq`, walks the (bounded) active file
     /// for its tail/size/count, and completes a half-finished rotation
     /// if a crash left the active file sealed-but-unrenamed.
     pub fn open(
         active_path: &Path,
-        key: AgentSigningKey,
+        key: K,
         cfg: RotationConfig,
         protection: std::sync::Arc<dyn ProtectionManager>,
     ) -> Result<Self> {

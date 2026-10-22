@@ -28,6 +28,8 @@ pub mod bounded_cmd;
 pub mod build_info;
 pub mod canary;
 pub mod chain_anchor;
+/// What the signed chains need from their host (R04a, lab PR 241).
+pub mod chain_host;
 pub(crate) mod chain_tail;
 pub mod chainlog;
 pub mod combat;
@@ -48,6 +50,8 @@ pub mod host_hardening;
 pub mod impact;
 pub mod impair;
 pub mod install_manifest;
+/// The agent's signing key (from `audit`, R04a, lab PR 241).
+pub mod keys;
 pub mod loop_progress;
 pub mod net;
 pub mod os_rng;

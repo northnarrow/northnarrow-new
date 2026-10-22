@@ -168,6 +168,9 @@ planned = false
 "canary::registry" = "nn-linux"
 "canary::templates" = "nn-core"
 "chain_anchor" = "nn-evidence"
+# post-plan (lab PR 241, R04a): what the chains need from their host (the
+# signer; the file operations)
+"chain_host" = "nn-evidence"
 "chain_tail" = "nn-evidence"
 "chainlog" = "nn-evidence"
 # the ladder and its evidence; SystemActuator and the probes of protected
@@ -209,6 +212,9 @@ planned = false
 # post-plan (lab PR 225): defences switched off, a shipped list
 "impair" = "nn-core"
 "install_manifest" = "nn-linux"
+# the agent's signing key and its files, from `audit` (plan R04a; nn-linux's
+# `keys`, R09a)
+"keys" = "nn-linux"
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
 # flow_tracker, dns_cache (state; its parsers → nn-parse, R06), limiter,
@@ -284,6 +290,6 @@ planned = false
 [ratchet]
 nn-admin = 6
 nn-core = 53
-nn-evidence = 8
+nn-evidence = 9
 nn-linux = 3
 nn-proto = 3
