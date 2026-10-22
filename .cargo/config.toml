@@ -36,5 +36,14 @@ NN_REPO_ROOT = { value = ".", relative = true }
 # `lld` would shave a few seconds off link time but is not available
 # on the production host (Hetzner CCX23, May 2026); leaving the
 # default linker keeps `cargo build --release` self-contained.
-[build]
-rustflags = ["-C", "target-cpu=x86-64-v2"]
+#
+# Wave 4 restructure, R01 (lab PR 239): for the x86_64 Linux target only
+# (it was `[build]`, every target's): the portable crates are also built for
+# aarch64, Windows and macOS (CI job `portable-core`), where an x86 CPU
+# name has no meaning. A build without `--target` (the host's) is the same
+# as before: these flags, for build scripts and proc-macros too. A string,
+# not a list: `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` then replaces
+# it, as it replaced `[build]` (a list would be merged with it), so the
+# release job's and a native opt-in's command lines are unchanged.
+[target.x86_64-unknown-linux-gnu]
+rustflags = "-C target-cpu=x86-64-v2"

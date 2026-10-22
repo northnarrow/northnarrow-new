@@ -66,6 +66,7 @@ on:
       - antitamper-bpf/**
       - cli/**
       - common/**
+      - crates/**
       - ebpf-guard/**
       - scan/**
       - watchdog/**

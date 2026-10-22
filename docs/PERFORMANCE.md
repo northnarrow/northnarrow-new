@@ -27,11 +27,13 @@ of them kept the raw data, and they are withdrawn.
 ## 1. Build flags (`target-cpu` + LTO fat)
 
 Since external audit SUP-017 the default in `/.cargo/config.toml` is the
-ISA the release ships, so no build is tied to the host that compiled it:
+ISA the release ships, so no build is tied to the host that compiled it
+(for the x86_64 Linux target since lab PR 239, `[build]` before: the
+portable crates are also built for other targets):
 
 ```toml
-[build]
-rustflags = ["-C", "target-cpu=x86-64-v2"]
+[target.x86_64-unknown-linux-gnu]
+rustflags = "-C target-cpu=x86-64-v2"
 ```
 
 A build that only ever runs on the host that compiles it opts into

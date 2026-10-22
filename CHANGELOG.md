@@ -778,6 +778,25 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   agent and nn-admin differ only in source line numbers (panic locations,
   log callsites) of the seven files whose embeds took more lines: same
   size, same `.text`.
+- Wave 4 restructure, R01 — scaffolding (lab PR 239): the crates of the
+  layered layout, empty, in `crates/`: nn-parse, nn-model, nn-proto,
+  nn-evidence, nn-core (the pure ones), nn-linux and nn-admin — workspace
+  fields and lints, `#![forbid(unsafe_code)]` but in nn-linux, members and
+  `[workspace.dependencies]`; nothing depends on them yet. The layer gate
+  `xtask/tests/workspace_layers.rs` holds the workspace to
+  `docs/architecture/module-map.toml`: every dependency between members is
+  one the layers allow (normal, build or dev), no cycle, the pure crates
+  reach no OS interface (libc, nix, aya, procfs, tokio; `std::os`,
+  `cfg(target_os)`), crate roots forbid `unsafe` where the map says, every
+  member inherits the workspace lints. The new CI job `portable-core`
+  checks the pure crates for aarch64 Linux, Windows and macOS (x86_64 and
+  aarch64). The x86-64-v2 rustflags are the x86_64 Linux target's
+  (`[target.x86_64-unknown-linux-gnu]`, a string so that
+  `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS` still replaces them),
+  no longer every target's: with `[build]`, an aarch64 build got
+  `target-cpu=x86-64-v2` and a `neon` ABI warning. `lab-vm.yml` starts on
+  `crates/**`. The shipped binaries, the eBPF object and the packages are
+  the same as R00's.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

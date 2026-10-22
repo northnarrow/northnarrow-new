@@ -25,7 +25,9 @@ format = "northnarrow-module-map/1"
 # aya, procfs, tokio, no `std::os`, no `cfg(target_os)`/`cfg(unix)`),
 # built for the non-Linux targets by the CI job `portable-core`.
 # `forbid_unsafe`: `#![forbid(unsafe_code)]` at the crate root. `planned`:
-# not a workspace member yet. Bottom up, as §2.1 draws them.
+# not a workspace member yet (R01, lab PR 239, created nn-parse, nn-model,
+# nn-proto, nn-evidence, nn-core, nn-linux and nn-admin, empty; nn-export
+# and nn-server come with R15 and R16). Bottom up, as §2.1 draws them.
 
 [crates.northnarrow-common]
 about = "nn-wire: the kernel/userland ABI (no_std raw layouts, btf_offsets, ring_drops); its std half leaves in R02/R03"
@@ -38,35 +40,35 @@ about = "parsers of hostile bytes (TLS ClientHello, DNS records, QNAME); a leaf,
 allowed = []
 pure = true
 forbid_unsafe = true
-planned = true
+planned = false
 
 [crates.nn-model]
 about = "the vocabulary: Event, verdicts, actions and outcomes, ProcessKey, PostureKind, log_escape, netaddr, OCSF (R02)"
 allowed = ["northnarrow-common", "nn-parse"]
 pure = true
 forbid_unsafe = true
-planned = true
+planned = false
 
 [crates.nn-proto]
 about = "the admin protocol, signed payloads, quorum, shutdown marker, watchdog hold, core/worker IPC (R03)"
 allowed = ["northnarrow-common", "nn-parse", "nn-model"]
 pure = true
 forbid_unsafe = true
-planned = true
+planned = false
 
 [crates.nn-evidence]
 about = "signed chains behind a Signer trait: canonical form, RowSeq, heads, verification, payloads; no key (R05)"
 allowed = ["northnarrow-common", "nn-parse", "nn-model"]
 pure = true
 forbid_unsafe = true
-planned = true
+planned = false
 
 [crates.nn-core]
 about = "detection, posture, correlation, COMBAT and response policy, signed content, sensor contract, bus types; no OS call, no tokio (R07, R08)"
 allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence"]
 pure = true
 forbid_unsafe = true
-planned = true
+planned = false
 
 [crates.northnarrow-antitamper-bpf]
 about = "the Linux base shared with the watchdog: bpffs pins, LSM attach (and sd_notify, atomic_file from R03)"
@@ -86,7 +88,7 @@ planned = false
 [crates.nn-linux]
 about = "the adapters: eBPF loader and sensors, /proc, actuators, self-defence, systemd, KeyStore, sandbox (R09)"
 allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core", "northnarrow-antitamper-bpf", "northnarrow-scan", "ebpf-guard"]
-planned = true
+planned = false
 
 [crates.nn-export]
 about = "the export worker: WAL, OCSF, OTLP/syslog with an at-least-once cursor (R15)"
@@ -97,7 +99,7 @@ planned = true
 about = "the operator client's library; the nn-admin binary stays a shim of the agent package (R10)"
 allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
 forbid_unsafe = true
-planned = true
+planned = false
 
 [crates.northnarrow-agent]
 about = "nn-agent: the composition (typed boot phases, bus and pipeline, admin server, supervisor, worker entry)"

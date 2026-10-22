@@ -1,0 +1,17 @@
+[package]
+name = "nn-evidence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NorthNarrow nn-evidence: the signed chains: canonical form, RowSeq, heads, verification and payloads, behind a `Signer` trait (Wave 4 restructure; empty until its lot moves code in)."
+publish = false
+
+# Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
+# depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
+[dependencies]
+
+[lints]
+workspace = true

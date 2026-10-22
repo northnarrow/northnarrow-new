@@ -969,3 +969,50 @@ only in the table below, in the same PR as the evidence.
     `sample_copies`) carries the uid, so the decision engine's test and
     golden samplers are untouched.
   - Lab: QEMU for Windows guests with WHPX, the branch's lab build (eBPF object 82172165…). (1) `nn-lab.sh verifier-check`: Ubuntu 22.04 (5.15.0-198) 77 programs, 75 OK, 2 ABSENT (the optional ACL deny hooks), 0 failing; Debian 12 (6.1.0-54) 75 OK, 2 ABSENT, 0 failing — `sched_process_exec` 1,952 instructions and 4,926 processed (`main`'s object 1,909 / 4,869), `sched_process_exec_nostdio` 1,030 / 2,377 (987 / 2,320); Debian 13 (6.12.113) 77 of 77 OK; Ubuntu 24.04 (6.8.0-147) 77 of 77 OK, `sched_process_exec` 1,952 / 3,649; on each, 105 slots resolved from the live BTF (2 optional ones absent on 5.15). The e2e with the installed units stopped the operator way (trusted-installer window, watchdog then agent, pin root removed): on Ubuntu 22.04 `main` 1609034's eBPF with the new test FAILED as expected — the child's `parent_start_ns` 1190978440890, the forking thread's start, 1.2 ms after its parent's exec `start_ns` 1190977234699 — and the branch's passed (`exec_sensor_live` 4 of 4); on Debian 12 the branch's passed, 4 of 4; units put back on both (L3, deny hooks 17 of 17, self-test denied, 0 degradations). (2) On Ubuntu 22.04: `main` 1609034 synced and installed, `nn-lab.sh execq-check` (`main`'s tree) quarantined its block-listed test binary as v1 entry 72b62a03…, beside two v1 entries of earlier `main`s (1fe5d763…, 6b286cc1…); the branch built, `upgrade-check` from `main` OK (UPGRADE complete, identity kept, deny hooks 17 of 17, 34 own LSM programs before and after); the vault's `.bin`, `.meta` and `master.key` byte-identical across the upgrade; response-manage granted as `cow-check.sh` does; the three v1 entries restored by the branch's nn-admin, each sha256 c02f2e6a… as its `.meta` recorded, mode 0600; `execq-check` on the branch: entry e55bec99…, its `.bin` starting `4e 4e 51 56 02` (16,169 bytes: 5 + 12 + 16,136 + 16), its `.meta` `"format":2`, restored with the sha256 the harness took before the quarantine; a copy of it with the version byte set to 3 refused (exit 9, "the entry's .meta declares vault record format 2, its .bin is format 3 — refused"), nothing written, a signed `response_restore` row; copy removed, role taken back, the agent at L3, deny hooks 17 of 17, 0 degradations. (3) Before: `main`'s impact code with the new tracker test — another uid's copy-delete burst in a sticky directory decisive on this test's copies (`!b.decisive` failed); after: the impact tests pass (29, one root test ignored on the host), and the root test with two owners side by side passed as root on Ubuntu 22.04 and Debian 12; golden replay byte-identical, no golden file changed. Host: `cargo xtask build-ebpf --release`, the four clippy runs with `-D warnings`, `cargo fmt --check`, `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` 2,922 passed, 0 failed (the golden replay and `crypto_vectors`, 19 tests, included), `cargo xtask attack-coverage --check`, `cargo +1.89.0 check --workspace --all-targets --locked`, the fuzz build and replay of the 12 targets (nightly-2025-12-01, `--locked`): all pass.
+- **Lab PR 239 — the restructure's guardrails and scaffolding (Wave 4
+  Phase 2, R00 + R01 of the restructure plan; no level changes).**
+  - What was wrong: the restructure (R02–R17) moves the agent's modules
+    into layered crates, and several checks would have switched off in
+    silence under a move: embeds and reads relative to the including file
+    (`include_str!("../../../configs/…")`, `CARGO_MANIFEST_DIR/..`), member
+    lists parsed from one line of `Cargo.toml` (the licence check, the
+    lab-vm filter scan) or written by hand (the Kani proof scan: six
+    crates), the journal-field scan of two fixed directories, the line
+    guard pinned to two `main.rs`, workflow path filters nobody checked
+    but lab-vm.yml's; no crate rule said where a module may go; the
+    x86-64-v2 rustflags applied to every target.
+  - What changed: R00 — `NN_REPO_ROOT` (`.cargo/config.toml` `[env]`) for
+    every repository path of the agent and the watchdog (37 files);
+    `cargo metadata` for the member lists; `xtask/tests/path_liveness.rs`
+    (workflow path filters, `cargo kani` steps, `-p` and features of CI and
+    the lab scripts, the files the xtask tests name, no depth-relative path
+    in a member); `docs/architecture/module-map.toml` (the crates, what each
+    may depend on, the target crate of every module of `agent/src` and
+    `common/src`, the post-plan ones marked) and its ratchet
+    `xtask/tests/module_map.rs` (77 violations: nn-core 53, nn-evidence 12,
+    nn-admin 6, nn-linux 3, nn-proto 3); `[workspace.lints]`; SBOM cleanup
+    to depth 3; `fuzz/**` in lab-vm.yml's filters (the agent's seed test
+    reads it, which the new scan sees). R01 — the empty crates
+    `crates/nn-{parse,model,proto,evidence,core,linux,admin}` (workspace
+    fields and lints, `#![forbid(unsafe_code)]` but nn-linux), members and
+    `[workspace.dependencies]`, the gate `xtask/tests/workspace_layers.rs`
+    (the members' dependencies against the map, no cycle, the pure crates'
+    rules, the lints, `portable-core`'s list), the CI job `portable-core`
+    (`cargo check` of the pure crates for aarch64 Linux, Windows and macOS
+    on x86_64 and aarch64), the x86-64-v2 rustflags under
+    `[target.x86_64-unknown-linux-gnu]` as a string (the per-target
+    variable still replaces it), `crates/**` in lab-vm.yml. Deviations
+    from the plan: the golden replay of lab PR 228 is the replay harness
+    (the posture and the ladder are not replayed yet: before R08); common's
+    one `CARGO_MANIFEST_DIR/..` (a test) and `agent/build.rs` keep theirs
+    (the eBPF source closure; R09b); the modules of lab PRs 214–238 are
+    mapped on the plan's principles; the scanner crate (lab PR 223) has a
+    rule of its own. Open, for the next lots: the ratchet shows
+    nn-evidence → nn-proto (`verify_lines` and `canary::chain_lines` read
+    `admin_protocol`), which §2.1 draws as siblings — R05 cuts it or the
+    map allows it; nn-admin's host checks are nn-linux's (`agent_id`,
+    `host_hardening`), a decision for R10; nn-model will depend on
+    `common`, whose `atomic_file` is Unix-only until R03 takes it out, so
+    R02 either follows R03 or leaves nn-model out of `portable-core` until
+    then.
+  - Lab: no guest (the shipped code does not change: see the identity below). Host: `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test --workspace --exclude northnarrow-agent-ebpf --locked` 2979 passed, 0 failed (2972 at R00); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` with the golden files unchanged; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets, seeds and regressions, the three lockfiles unchanged); `portable-core`'s `cargo check` for the five targets, installed with rustup. Identity against `main` 0abf596, same path, same commands: the eBPF object (sha256 9345ac10…) and its stamp are byte-identical to `main`'s; built as the release job builds (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`), the watchdog (b538235d…) and the scanner (33be3ab2…) are byte-identical, the agent (23f51b19… → 130f3707…) and nn-admin (1390b7b8… → 3db04031…) have the same size and the same `.text`, and differ in 127 and 22 bytes, all in `.rodata`, `.data.rel.ro` (line numbers moved by 1, 2, 3, 4, 12 and 15: the lines the reformatted embeds of seven files added) and the build id; R01's four binaries and object are byte-identical to R00's. `mk-tarball.sh`: the same 72 entries; `mk-packages.sh` (.deb): the same 79 paths, modes and sizes but `CHANGELOG.md`.

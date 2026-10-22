@@ -196,6 +196,34 @@ fn repository_default_target_cpu_is_portable() {
             .any(|l| l.starts_with("rustflags") && l.contains("target-cpu=x86-64-v2")),
         ".cargo/config.toml must default to target-cpu=x86-64-v2"
     );
+    // Lab PR 239 (Wave 4 restructure R01): the x86_64 Linux target's, not
+    // every target's — the portable crates are built for aarch64, Windows
+    // and macOS too — and a string, which CARGO_TARGET_…_RUSTFLAGS replaces
+    // (a list would be merged with the override).
+    let section = |key: &str| {
+        let mut current = "";
+        for l in &settings {
+            if l.starts_with('[') {
+                current = l;
+            } else if l.starts_with(key) {
+                return Some(current.to_string());
+            }
+        }
+        None
+    };
+    assert_eq!(
+        section("rustflags").as_deref(),
+        Some("[target.x86_64-unknown-linux-gnu]"),
+        ".cargo/config.toml: the x86-64-v2 rustflags belong to [target.x86_64-unknown-linux-gnu]"
+    );
+    assert!(
+        settings.contains(&r#"rustflags = "-C target-cpu=x86-64-v2""#),
+        ".cargo/config.toml: rustflags as a string, which the per-target variable replaces"
+    );
+    assert!(
+        !settings.contains(&"[build]"),
+        ".cargo/config.toml: no [build] section (its rustflags would reach every target)"
+    );
     // The release keeps its explicit override and its ISA check.
     let release = read(&root.join(".github/workflows/release.yml"));
     assert!(release

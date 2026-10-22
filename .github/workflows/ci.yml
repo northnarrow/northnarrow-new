@@ -107,6 +107,44 @@ jobs:
         if: matrix.task == 'test'
         run: cargo test --workspace --exclude northnarrow-agent-ebpf --locked --verbose
 
+  portable-core:
+    # Wave 4 restructure, R01 (lab PR 239): the pure crates of
+    # docs/architecture/module-map.toml — the core the plan builds for six
+    # targets, no OS interface — checked for the five other than x86_64
+    # Linux (every other job's): aarch64 Linux, Windows and macOS on x86_64
+    # and aarch64. `cargo check` needs the target's standard library only:
+    # no linker, no SDK. The crates are empty until R02; the job holds them
+    # to it from their first line. xtask/tests/workspace_layers.rs keeps
+    # the -p list equal to the pure crates of the map, and the targets.
+    name: portable-core (aarch64 Linux, Windows, macOS)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain and the targets
+        # rust-toolchain.toml's release (SUP-015), with the standard library
+        # of each target.
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-unknown-linux-gnu x86_64-pc-windows-msvc \
+            aarch64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin
+          rustup show active-toolchain
+
+      - name: cargo check the pure crates for each target
+        run: |
+          set -euo pipefail
+          for t in aarch64-unknown-linux-gnu x86_64-pc-windows-msvc \
+                   aarch64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin; do
+            echo "::group::$t"
+            cargo check --locked --target "$t" \
+              -p nn-parse -p nn-model -p nn-proto -p nn-evidence -p nn-core
+            echo "::endgroup::"
+          done
+
   test-privileged:
     name: test-privileged (compile-only)
     if: github.event_name != 'schedule'

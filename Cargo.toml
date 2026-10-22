@@ -1,6 +1,25 @@
 [workspace]
 resolver = "2"
-members = ["agent", "antitamper-bpf", "common", "cli", "ebpf-guard", "scan", "watchdog", "xtask"]
+# Wave 4 restructure, R01 (lab PR 239): the crates of the layered layout
+# live in crates/ (docs/architecture/module-map.toml); the repository tests
+# read this list through `cargo metadata`.
+members = [
+    "agent",
+    "antitamper-bpf",
+    "common",
+    "cli",
+    "crates/nn-admin",
+    "crates/nn-core",
+    "crates/nn-evidence",
+    "crates/nn-linux",
+    "crates/nn-model",
+    "crates/nn-parse",
+    "crates/nn-proto",
+    "ebpf-guard",
+    "scan",
+    "watchdog",
+    "xtask",
+]
 # `agent-ebpf` is a separate cargo project: nightly toolchain,
 # bpfel-unknown-none target, build-std=core. The xtask runner builds it.
 exclude = ["agent-ebpf", "fuzz"]
@@ -30,6 +49,14 @@ authors = ["NorthNarrow"]
 [workspace.dependencies]
 common = { package = "northnarrow-common", path = "common" }
 antitamper-bpf = { package = "northnarrow-antitamper-bpf", path = "antitamper-bpf" }
+# R01 (lab PR 239): the crates of the layered layout, empty until their lot.
+nn-parse = { path = "crates/nn-parse" }
+nn-model = { path = "crates/nn-model" }
+nn-proto = { path = "crates/nn-proto" }
+nn-evidence = { path = "crates/nn-evidence" }
+nn-core = { path = "crates/nn-core" }
+nn-linux = { path = "crates/nn-linux" }
+nn-admin = { path = "crates/nn-admin" }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
