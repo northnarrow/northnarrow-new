@@ -81,9 +81,14 @@ nix = { version = "0.29", features = ["signal", "process"] }
 procfs = { version = "0.18", default-features = false }
 
 # Tappa 5: response executors
-aes-gcm = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
+# Lab PR 234: the RustCrypto generation (aes-gcm 0.11, hkdf/hmac 0.13,
+# sha2 0.11, md-5 0.11, ed25519-dalek 3, rand 0.10) moves together, in
+# every crate of the workspace and in fuzz/Cargo.lock: one copy of
+# digest, crypto-common and rand_core. The vault, Ed25519, SHA-256 and
+# MD5 bytes are pinned by `cargo test crypto_vectors` (lab PR 230).
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
 # Tappa 10 (N5): JA3 TLS fingerprint hashing. MD5 here is a
 # threat-intel fingerprint compatibility primitive (JA3 spec,
 # Salesforce 2017 / RFC-equivalent), NOT a cryptographic
@@ -94,8 +99,8 @@ sha2 = "0.10"
 # trusted sha2 + ed25519-dalek + curve25519-dalek deps above) so
 # the workspace's "crypto deps under a single trusted maintainer"
 # invariant holds.
-md-5 = "0.10"
-rand = "0.8"
+md-5 = "0.11"
+rand = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -119,9 +124,10 @@ parking_lot = "0.12"
 base64 = "0.23"
 
 # Tappa 7 task 7 / Tappa 8: nn-admin Ed25519 challenge-response.
-# `std` keeps the regular SignatureError type (no_std mode pares it
-# down); `rand_core` lets us feed rand 0.8's OsRng into key generation.
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "zeroize"] }
+# Lab PR 234: ed25519-dalek 3 has no `std` feature; `alloc` is what it
+# left. `rand_core` lets the OS CSPRNG (`os_rng::OsRng`, getrandom, over
+# rand 0.10's `SysRng`) feed key generation.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
 hex = "0.4"
 
 [build-dependencies]

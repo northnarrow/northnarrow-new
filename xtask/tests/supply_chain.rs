@@ -1604,6 +1604,12 @@ fn security_crates_are_locked_alike_for_the_fuzzer() {
         "aes-gcm",
         "zeroize",
         "subtle",
+        // the OS CSPRNG behind every key and nonce (`os_rng`, lab PR 234),
+        // and JA3's MD5
+        "rand",
+        "rand_core",
+        "getrandom",
+        "md-5",
         // the kernel interface, /proc and the BTF/ELF parsing
         "libc",
         "nix",

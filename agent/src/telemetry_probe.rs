@@ -59,8 +59,8 @@ use std::time::{Duration, Instant};
 
 use common::Event;
 use parking_lot::Mutex;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use tracing::{debug, error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
@@ -139,7 +139,7 @@ static GAPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// 25-character label and NN-L-NET-004's 60-character name.
 pub fn make_nonce() -> Option<String> {
     let mut b = [0u8; NONCE_BYTES];
-    OsRng.try_fill_bytes(&mut b).ok()?;
+    SysRng.try_fill_bytes(&mut b).ok()?;
     Some(hex::encode(b))
 }
 

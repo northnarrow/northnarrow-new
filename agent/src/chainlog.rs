@@ -5436,7 +5436,7 @@ mod tests {
     /// own new rows here, before a release.
     #[test]
     fn every_shipped_payload_type_round_trips_byte_exactly() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x204);
         fn text(rng: &mut rand::rngs::StdRng) -> String {
             const POOL: &[char] = &[
@@ -5463,11 +5463,13 @@ mod tests {
                 ':',
                 ',',
             ];
-            let n = rng.gen_range(0..24);
-            (0..n).map(|_| POOL[rng.gen_range(0..POOL.len())]).collect()
+            let n = rng.random_range(0..24);
+            (0..n)
+                .map(|_| POOL[rng.random_range(0..POOL.len())])
+                .collect()
         }
         fn opt(rng: &mut rand::rngs::StdRng) -> Option<String> {
-            rng.gen_bool(0.5).then(|| text(rng))
+            rng.random_bool(0.5).then(|| text(rng))
         }
         fn check<P: Serialize + DeserializeOwned + ChainPayload>(rows: Vec<P>) {
             let dir = TempDir::new().unwrap();
@@ -5503,13 +5505,13 @@ mod tests {
         let detections: Vec<DetectionRecord> = (0..120)
             .map(|i| {
                 let event = common::Event::ProcessSpawn {
-                    pid: rng.gen(),
-                    ppid: rng.gen(),
-                    uid: rng.gen(),
-                    gid: rng.gen(),
+                    pid: rng.random(),
+                    ppid: rng.random(),
+                    uid: rng.random(),
+                    gid: rng.random(),
                     comm: text(&mut rng),
                     filename: text(&mut rng),
-                    timestamp_ns: rng.gen(),
+                    timestamp_ns: rng.random(),
                     argv: Vec::new(),
                     parent_comm: text(&mut rng),
                     parent_start_ns: 0,
@@ -5540,12 +5542,12 @@ mod tests {
                     text(&mut rng),
                 );
                 d.confidence = loop {
-                    let f = f64::from_bits(rng.gen());
+                    let f = f64::from_bits(rng.random());
                     if f.is_finite() {
                         break f;
                     }
                 };
-                d.suppressed_before = rng.gen_bool(0.3).then(|| rng.gen());
+                d.suppressed_before = rng.random_bool(0.3).then(|| rng.random());
                 d.file = opt(&mut rng);
                 d.operation = opt(&mut rng);
                 d
@@ -5554,14 +5556,14 @@ mod tests {
         check(detections);
         let statuses: Vec<StatusEvent> = (0..120)
             .map(|_| StatusEvent {
-                detection_id: rng.gen(),
+                detection_id: rng.random(),
                 new_status: DetectionStatus::Investigating,
                 ts: text(&mut rng),
                 principal: Principal {
-                    pid: rng.gen(),
+                    pid: rng.random(),
                     comm: text(&mut rng),
-                    uid: rng.gen(),
-                    ppid: rng.gen_bool(0.5).then(|| rng.gen()),
+                    uid: rng.random(),
+                    ppid: rng.random_bool(0.5).then(|| rng.random()),
                 },
                 note: opt(&mut rng),
                 principal_exe: opt(&mut rng),
@@ -5572,27 +5574,27 @@ mod tests {
             .map(|_| crate::net::drain::NetFlowPayload {
                 ts: text(&mut rng),
                 flow_id: text(&mut rng),
-                start_ns: rng.gen(),
-                end_ns: rng.gen(),
-                family: rng.gen(),
+                start_ns: rng.random(),
+                end_ns: rng.random(),
+                family: rng.random(),
                 src_addr: text(&mut rng),
-                src_port: rng.gen(),
+                src_port: rng.random(),
                 dst_addr: text(&mut rng),
-                dst_port: rng.gen(),
-                proto: rng.gen(),
-                pid: rng.gen(),
-                uid: rng.gen(),
+                dst_port: rng.random(),
+                proto: rng.random(),
+                pid: rng.random(),
+                uid: rng.random(),
                 comm: text(&mut rng),
                 exe: opt(&mut rng),
-                bytes_sent: rng.gen(),
-                bytes_recv: rng.gen(),
+                bytes_sent: rng.random(),
+                bytes_recv: rng.random(),
                 resolved_hostname: opt(&mut rng),
                 ja3: opt(&mut rng),
                 ja4: opt(&mut rng),
                 sni: opt(&mut rng),
-                close_reason: rng.gen(),
+                close_reason: rng.random(),
                 agent_id: text(&mut rng),
-                decision_engine_skipped: rng.gen(),
+                decision_engine_skipped: rng.random(),
             })
             .collect();
         check(flows);
@@ -5603,20 +5605,20 @@ mod tests {
                 op: common::wire::FimOp::AttrChanged,
                 baseline_sha256: opt(&mut rng),
                 new_sha256: opt(&mut rng),
-                modifier_pid: rng.gen(),
-                modifier_uid: rng.gen(),
+                modifier_pid: rng.random(),
+                modifier_uid: rng.random(),
                 modifier_comm: text(&mut rng),
                 severity: crate::fim::drain::DriftSeverity::High,
-                decision_engine_skipped: rng.gen(),
+                decision_engine_skipped: rng.random(),
                 skip_reason: text(&mut rng),
                 agent_id: text(&mut rng),
-                attrs: rng.gen_bool(0.5).then(|| common::wire::FileAttrChange {
-                    mode_before: rng.gen(),
-                    mode_after: rng.gen(),
-                    uid_before: rng.gen(),
-                    uid_after: rng.gen(),
-                    gid_before: rng.gen(),
-                    gid_after: rng.gen(),
+                attrs: rng.random_bool(0.5).then(|| common::wire::FileAttrChange {
+                    mode_before: rng.random(),
+                    mode_after: rng.random(),
+                    uid_before: rng.random(),
+                    uid_after: rng.random(),
+                    gid_before: rng.random(),
+                    gid_after: rng.random(),
                 }),
             })
             .collect();

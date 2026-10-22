@@ -73,5 +73,5 @@ tempfile = "3"
 # External audit WDG-009: paused-clock tests of the ping ticker.
 tokio = { version = "1", default-features = false, features = ["test-util", "macros", "rt", "time"] }
 # External audit WDG-001: tests sign shutdown markers as the admins do.
-ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
 hex = "0.4"

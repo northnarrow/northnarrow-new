@@ -67,8 +67,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use tracing::{error, info};
 
 /// Default location of the persisted agent install UUID. Mirrors the
@@ -261,15 +261,16 @@ fn parse(raw: &str) -> Result<[u8; AGENT_ID_LEN]> {
     Ok(id)
 }
 
-/// Mint 16 fresh CSPRNG bytes via `OsRng`. Same source the rest of
-/// the crypto path (admin_auth nonces, ed25519 keygen) uses — we
-/// never reach for the thread-local `rand::thread_rng()` for
+/// Mint 16 fresh bytes from the OS CSPRNG (`SysRng`, getrandom; its
+/// error is ours to handle here). Same source the rest of the crypto
+/// path (admin_auth nonces, ed25519 keygen: [`crate::os_rng::OsRng`])
+/// uses — we never reach for the thread-local `rand::rng()` for
 /// security-relevant material.
 fn mint_random() -> Result<[u8; AGENT_ID_LEN]> {
     let mut buf = [0u8; AGENT_ID_LEN];
-    OsRng
+    SysRng
         .try_fill_bytes(&mut buf)
-        .map_err(|e| anyhow!("OsRng failed to provide entropy: {e}"))?;
+        .map_err(|e| anyhow!("the OS random source failed to provide entropy: {e}"))?;
     Ok(buf)
 }
 

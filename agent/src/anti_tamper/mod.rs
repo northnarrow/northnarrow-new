@@ -70,7 +70,7 @@ use aya::{
     Btf, Ebpf,
 };
 use common::wire::{FsGrant, InodeKey, KillGrant};
-use rand::RngCore;
+use rand::Rng;
 use tracing::{debug, error, info, warn};
 
 // ISSUE_002: bpffs root / pin / LSM-attach primitives were
@@ -795,14 +795,15 @@ fn decide_shortfall(
 ///   window writes it ([`trusted_installer`]), or as `systemd-shutdown`
 ///   (`SHUTDOWN_EXE`, kept current by [`refresh_shutdown_exe`]).
 ///
-/// `rand::thread_rng().next_u32()` (OS-seeded ChaCha) draws the nonce;
-/// an attacker able to read it already holds BPF write privilege — see
-/// `docs/design/ANTITAMPER_TRUST_MODEL.md` §BUG-010.
+/// The OS CSPRNG ([`crate::os_rng::OsRng`], getrandom) draws the nonce
+/// (lab PR 234: rand 0.10 dropped `thread_rng`, and a nonce takes no
+/// userland generator); an attacker able to read it already holds BPF
+/// write privilege — see `docs/design/ANTITAMPER_TRUST_MODEL.md` §BUG-010.
 fn arm_session(ebpf: &mut Ebpf) -> Result<()> {
     // Re-roll on zero: zero is the "disarmed" value of every slot.
     let mut nonce: u32 = 0;
     while nonce == 0 {
-        nonce = rand::thread_rng().next_u32();
+        nonce = crate::os_rng::OsRng.next_u32();
     }
     write_array_u32(ebpf, AGENT_SESSION_MAP_NAME, nonce)
         .with_context(|| format!("writing {AGENT_SESSION_MAP_NAME}[0]"))?;

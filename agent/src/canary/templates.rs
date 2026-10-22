@@ -216,9 +216,9 @@ pub const SUPERSEDED_TEMPLATE_SHA256: &[(&str, &str)] = &[
 /// A fresh content seed (external audit DEC-008): 32 bytes from the OS
 /// RNG, hex. One per deploy and per refresh, recorded in the registry row.
 pub fn new_content_seed() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut seed = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut seed);
+    crate::os_rng::OsRng.fill_bytes(&mut seed);
     hex::encode(seed)
 }
 

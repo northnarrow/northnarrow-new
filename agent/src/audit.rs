@@ -85,8 +85,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, SECRET_KEY_LENGTH};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -272,9 +272,9 @@ impl AgentSigningKey {
 
 fn mint_signing_key() -> Result<SigningKey> {
     let mut secret = [0u8; SECRET_KEY_LENGTH];
-    OsRng
-        .try_fill_bytes(&mut secret)
-        .map_err(|e| anyhow!("OsRng failed to provide entropy for signing key: {e}"))?;
+    SysRng.try_fill_bytes(&mut secret).map_err(|e| {
+        anyhow!("the OS random source failed to provide entropy for signing key: {e}")
+    })?;
     Ok(SigningKey::from_bytes(&secret))
 }
 
@@ -2631,7 +2631,7 @@ mod tests {
     /// canonical serialisation and verifies with the canonical check.
     #[test]
     fn every_row_the_writer_produces_round_trips_byte_exactly() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x204a);
         let text = |rng: &mut rand::rngs::StdRng| -> String {
             const POOL: &[char] = &[
@@ -2652,8 +2652,10 @@ mod tests {
                 '{',
                 '}',
             ];
-            let n = rng.gen_range(0..16);
-            (0..n).map(|_| POOL[rng.gen_range(0..POOL.len())]).collect()
+            let n = rng.random_range(0..16);
+            (0..n)
+                .map(|_| POOL[rng.random_range(0..POOL.len())])
+                .collect()
         };
         let (_d, key_path, log_path) = fresh_paths();
         let key = AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
@@ -2661,7 +2663,7 @@ mod tests {
         let mut log = AuditLog::open(&log_path, key, [7u8; 16]).unwrap();
         for _ in 0..150 {
             let f = loop {
-                let f = f64::from_bits(rng.gen());
+                let f = f64::from_bits(rng.random());
                 if f.is_finite() {
                     break f;
                 }
@@ -2672,17 +2674,17 @@ mod tests {
                 extra: serde_json::json!({
                     k1: text(&mut rng),
                     "f": f,
-                    "n": rng.gen::<i64>(),
-                    "u": rng.gen::<u64>(),
+                    "n": rng.random::<i64>(),
+                    "u": rng.random::<u64>(),
                     "nested": { "list": [text(&mut rng), null, true, f], "z": {} },
                 }),
                 key_fp: text(&mut rng),
                 cosigner_fps: vec![text(&mut rng)],
                 result: text(&mut rng),
-                client_pid: rng.gen(),
-                client_uid: rng.gen(),
+                client_pid: rng.random(),
+                client_uid: rng.random(),
                 client_comm: text(&mut rng),
-                client_exe: rng.gen_bool(0.5).then(|| text(&mut rng)),
+                client_exe: rng.random_bool(0.5).then(|| text(&mut rng)),
             };
             log.append(draft).unwrap();
         }
