@@ -8,7 +8,7 @@
 //!   in the v1 envelope and the v0 body alike: the agent acts on a value
 //!   it would itself send, whatever bytes spelled it.
 use libfuzzer_sys::fuzz_target;
-use northnarrow_common::wire::admin_protocol::{
+use nn_proto::admin_protocol::{
     decode_frame, decode_versioned_frame, decode_versioned_or_legacy_frame, encode_frame,
     encode_versioned_frame, PROTOCOL_VERSION,
 };

@@ -26,7 +26,7 @@ use std::io::{BufRead, ErrorKind};
 pub const MAX_VERIFY_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 const _: () = assert!(
-    MAX_VERIFY_LINE_BYTES >= 6 * (common::wire::admin_protocol::MAX_FRAME_BODY + 4096) + 64 * 1024,
+    MAX_VERIFY_LINE_BYTES >= 6 * (nn_proto::admin_protocol::MAX_FRAME_BODY + 4096) + 64 * 1024,
     "a row the agent can write must fit the verifiers' line cap"
 );
 

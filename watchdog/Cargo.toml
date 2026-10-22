@@ -26,6 +26,9 @@ antitamper-bpf = { workspace = true }
 # Imported now so the cargo graph settles in W2; W2 itself only
 # uses the std bits.
 common = { workspace = true }
+# Wave 4 restructure, R03 (lab PR 240): the quorum, the shutdown marker, the
+# watchdog hold and the status reply it decodes.
+nn-proto = { workspace = true }
 # tokio current-thread flavour — the watchdog has at most three
 # concurrent waits at any moment (agent pidfd, SIGTERM/SIGINT,
 # periodic heartbeat). No reason to pay for the multi-thread

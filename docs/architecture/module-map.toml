@@ -30,7 +30,7 @@ format = "northnarrow-module-map/1"
 # and nn-server come with R15 and R16). Bottom up, as §2.1 draws them.
 
 [crates.northnarrow-common]
-about = "nn-wire: the kernel/userland ABI (no_std raw layouts, btf_offsets, ring_drops); its std half leaves in R02/R03"
+about = "nn-wire: the kernel/userland ABI (no_std raw layouts, btf_offsets, ring_drops); its std half leaves in R02/R03 (R03, lab PR 240: the admin modules to nn-proto, atomic_file and sd_notify to antitamper-bpf)"
 allowed = []
 forbid_unsafe = true
 planned = false
@@ -71,7 +71,7 @@ forbid_unsafe = true
 planned = false
 
 [crates.northnarrow-antitamper-bpf]
-about = "the Linux base shared with the watchdog: bpffs pins, LSM attach (and sd_notify, atomic_file from R03)"
+about = "the Linux base shared with the watchdog: bpffs pins, LSM attach, sd_notify, atomic_file (R03, lab PR 240)"
 allowed = ["northnarrow-common", "nn-model", "nn-proto"]
 planned = false
 
@@ -230,7 +230,7 @@ planned = false
 "self_integrity" = "nn-linux"
 "sensor_feasibility" = "nn-linux"
 "sensors" = "nn-linux"
-# the file I/O; the marker's format is common's (→ nn-proto)
+# the file I/O; the marker's format is nn-proto's (R03, lab PR 240)
 "shutdown_marker" = "nn-linux"
 "systemd_state" = "nn-linux"
 "telemetry_probe" = "nn-linux"
@@ -248,10 +248,6 @@ planned = false
 # raw layouts and constants; the std types of wire/mod.rs (FimEvent,
 # NetFlowEvent, NetListenerEvent, TlsFingerprint) go to nn-model (R02)
 "wire" = "northnarrow-common"
-"wire::admin_protocol" = "nn-proto"
-"wire::admin_signed_payload" = "nn-proto"
-"admin_quorum" = "nn-proto"
-"atomic_file" = "northnarrow-antitamper-bpf"
 # post-plan (lab PR 215): uapi bpf_cmd numbers, shared with the eBPF object
 "bpf_cmd" = "northnarrow-common"
 "btf_offsets" = "northnarrow-common"
@@ -267,9 +263,10 @@ planned = false
 "netaddr" = "nn-model"
 "posture_types" = "nn-model"
 "ring_drops" = "northnarrow-common"
-"sd_notify" = "northnarrow-antitamper-bpf"
-"shutdown_marker" = "nn-proto"
-"watchdog_hold" = "nn-proto"
+# R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
+# admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
+# and sd_notify to northnarrow-antitamper-bpf: a member's own sources, out
+# of this scan (the layer gate checks its dependencies).
 
 # The items of common's root and the modules that define them
 # (`pub use model::*`, `pub use dns_qname::{…}`); `*`: any other item.

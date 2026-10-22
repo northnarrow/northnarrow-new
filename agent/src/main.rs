@@ -1727,7 +1727,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         agent_id,
         rollback_floor,
     ));
-    use common::wire::admin_signed_payload::OverlayKind;
+    use nn_proto::admin_signed_payload::OverlayKind;
 
     // Lab PR 218: resolved before the attach — the capability gate below
     // depends on it.

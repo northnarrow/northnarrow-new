@@ -8,8 +8,8 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use common::admin_quorum::{parse_admin_pub, AdminKey};
-use common::shutdown_marker::{verify, Authorised, Expectation, Rejection, ShutdownMarker};
+use nn_proto::admin_quorum::{parse_admin_pub, AdminKey};
+use nn_proto::shutdown_marker::{verify, Authorised, Expectation, Rejection, ShutdownMarker};
 
 use crate::install_manifest::{check_with, parse_manifest, InstallManifest, IntegrityOutcome};
 
@@ -227,7 +227,7 @@ mod tests {
             let sk = SigningKey::from_bytes(&[i as u8 + 1; 32]);
             assert_eq!(k.key, sk.verifying_key());
             assert_eq!(
-                k.authorizes(common::wire::admin_signed_payload::Role::Shutdown),
+                k.authorizes(nn_proto::admin_signed_payload::Role::Shutdown),
                 i == 0
             );
         }
@@ -236,8 +236,8 @@ mod tests {
     /// The marker the fixture admins 1 and 2 sign for each
     /// [`SHUTDOWN_FIXTURE_SIGNED`] entry (Ed25519 signs deterministically).
     fn signed_marker(nonce: [u8; 32], ts: u64, grace: u32) -> String {
-        use common::wire::admin_signed_payload::{sign, SignedPayload};
         use ed25519_dalek::SigningKey;
+        use nn_proto::admin_signed_payload::{sign, SignedPayload};
         let payload = SignedPayload::new_shutdown(nonce, ts, SHUTDOWN_FIXTURE_AGENT_ID, grace);
         let sigs: Vec<[u8; 64]> = [1u8, 2]
             .iter()
@@ -417,12 +417,12 @@ mod tests {
 
     #[test]
     fn admin_frame_seeds_decode() {
-        use common::wire::admin_protocol::{
+        use nn_proto::admin_protocol::{
             decode_versioned_or_legacy_frame, encode_frame, encode_versioned_frame, AdminMessage,
             ChallengeRequest, KeyedSignature, ShutdownRequest, StatusRequest,
             VersionedAdminMessage,
         };
-        use common::wire::admin_signed_payload::SignedPayload;
+        use nn_proto::admin_signed_payload::SignedPayload;
         let v1 =
             |m: AdminMessage| encode_versioned_frame(&VersionedAdminMessage::current(m)).unwrap();
         let status = v1(AdminMessage::Status(StatusRequest {}));

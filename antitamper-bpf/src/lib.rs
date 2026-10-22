@@ -51,6 +51,22 @@
 //! (`crate::anti_tamper::reattach_fresh`, `crate::anti_tamper::prepare_pin_root`,
 //! `crate::anti_tamper::read_self_comm`, …) compile byte-identically.
 //! This is the "zero functional changes" contract from ISSUE_002.
+//!
+//! ## Linux base shared with the watchdog
+//!
+//! Wave 4 restructure, R03 (lab PR 240): [`atomic_file`] and
+//! [`sd_notify`], which both daemons use, moved here from `common` (plan
+//! §2.4), so `common` keeps no Unix-only module and the crates above it
+//! build for every target of the CI job `portable-core`.
+
+/// Replacing a file without writing through a planted link (external
+/// audit AUT-003, WDG-015).
+pub mod atomic_file;
+
+/// The `sd_notify(3)` datagram of the agent and the watchdog (external
+/// audit MAIN-016: abstract sockets).
+#[cfg(target_os = "linux")]
+pub mod sd_notify;
 
 use std::borrow::{Borrow, BorrowMut};
 use std::os::unix::ffi::OsStrExt;

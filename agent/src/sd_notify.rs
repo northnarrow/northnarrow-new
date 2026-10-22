@@ -11,7 +11,7 @@
 //! `BindsTo=northnarrow-agent.service` and tore the supervisor down.
 //!
 //! A single Unix datagram, no `libsystemd` / `sd-notify` crate
-//! dependency: [`common::sd_notify`], shared with the watchdog. External
+//! dependency: [`antitamper_bpf::sd_notify`], shared with the watchdog. External
 //! audit MAIN-016: each crate kept a copy that sent to `$NOTIFY_SOCKET` as
 //! a filesystem path, so an abstract socket (`@name`) never got `READY=1`.
 
@@ -28,7 +28,7 @@ use tracing::{debug, info};
 /// off-systemd behaviour is a no-op. A value it cannot send to is an
 /// error, never a silent success.
 pub fn ready() -> Result<()> {
-    let sent = common::sd_notify::notify(b"READY=1\n").with_context(|| {
+    let sent = antitamper_bpf::sd_notify::notify(b"READY=1\n").with_context(|| {
         format!(
             "sending READY=1 to NOTIFY_SOCKET={}",
             std::env::var_os("NOTIFY_SOCKET")

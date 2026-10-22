@@ -1540,21 +1540,6 @@ impl core::fmt::Display for FimOpDecodeError {
 #[cfg(feature = "std")]
 impl std::error::Error for FimOpDecodeError {}
 
-/// nn-admin ↔ agent protocol carried over the Unix socket at
-/// `/run/northnarrow/admin.sock`. Std-only because the agent is the
-/// only consumer and `StatusResponse` references `PostureKind` which
-/// lives behind `#[cfg(feature = "std")]` at the crate root.
-#[cfg(feature = "std")]
-pub mod admin_protocol;
-
-/// Tappa 8 signed-payload value layer (operation code + nonce + ts +
-/// agent_id + op-specific extra) plus the Ed25519 sign/verify
-/// pipeline. Std-only because it pulls ciborium + ed25519-dalek +
-/// sha2, all of which require `alloc`/std and are not needed by the
-/// kernel eBPF half.
-#[cfg(feature = "std")]
-pub mod admin_signed_payload;
-
 /// Tappa 10.9 step 0 — sensor-feasibility probe records.
 /// Lab PR 219 — the exploit post-condition guard's record.
 pub mod epg;

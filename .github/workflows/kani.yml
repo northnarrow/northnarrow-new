@@ -26,7 +26,7 @@ on:
     branches: [main]
     paths:
       - agent/src/net/tls_parser.rs
-      - common/src/admin_quorum.rs
+      - crates/nn-proto/src/admin_quorum.rs
       - common/src/dns_qname.rs
       - .github/workflows/kani.yml
 
@@ -86,9 +86,9 @@ jobs:
           --harness cursor_operations_never_panic_and_keep_pos_in_bounds
           -Z unstable-options --ignore-global-asm
 
-      - name: Prove the admin quorum rule (common, shared by agent and watchdog)
+      - name: Prove the admin quorum rule (nn-proto, shared by agent and watchdog)
         run: >
-          cargo kani -p northnarrow-common
+          cargo kani -p nn-proto
           --harness quorum_accepts_only_enough_distinct_keys_carrying_every_role
 
       - name: No lockfile changed during the proofs

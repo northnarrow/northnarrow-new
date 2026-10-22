@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use common::wire::admin_protocol::LoopProgressResponse;
+use nn_proto::admin_protocol::LoopProgressResponse;
 
 /// When this process started counting (the first [`start`], [`tick`] or
 /// [`snapshot`]); `since_last_ms` before the first round counts from here.

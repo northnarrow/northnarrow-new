@@ -2034,8 +2034,8 @@ mod tests {
         for n in 0..2 {
             reg.deploy(crate::canary::registry::CanaryTokenDraft {
                 name: format!("c{n}"),
-                canary_type: common::wire::admin_signed_payload::CanaryTypeWire::File,
-                deployment: common::wire::admin_signed_payload::CanaryDeploymentWire::File {
+                canary_type: nn_proto::admin_signed_payload::CanaryTypeWire::File,
+                deployment: nn_proto::admin_signed_payload::CanaryDeploymentWire::File {
                     path: format!("/tmp/c{n}"),
                     template: None,
                 },

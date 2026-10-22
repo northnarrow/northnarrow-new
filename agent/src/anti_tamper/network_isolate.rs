@@ -375,7 +375,7 @@ impl NetworkIsolator {
     /// isolated.
     fn trusted_source(
         &self,
-        kind: common::wire::admin_signed_payload::OverlayKind,
+        kind: nn_proto::admin_signed_payload::OverlayKind,
         path: &std::path::Path,
         builtin: &'static str,
     ) -> String {
@@ -636,7 +636,7 @@ impl NetworkIsolator {
     /// ruleset and the list of IPv4 CIDRs actually carved out (for
     /// logging). Re-reads the allow file every call — never cached.
     fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
-        use common::wire::admin_signed_payload::OverlayKind;
+        use nn_proto::admin_signed_payload::OverlayKind;
         let base = self.trusted_source(
             OverlayKind::CombatRulesV4,
             &self.rules_path,
@@ -674,7 +674,7 @@ impl NetworkIsolator {
     /// degrades with a WARN). Splices the IPv6 carve-out entries — which
     /// the v4 path parses but ignores — ahead of the v6 catch-all DROP.
     fn build_engaged_ruleset_v6(&self) -> Result<Option<(String, Vec<String>)>> {
-        use common::wire::admin_signed_payload::OverlayKind;
+        use nn_proto::admin_signed_payload::OverlayKind;
         // External audit DEP-003: a missing v6 ruleset no longer leaves
         // IPv6 open when the built-in one can be applied (with a gate).
         if self.gate.is_none() && !self.rules_path_v6.exists() {
@@ -703,7 +703,7 @@ impl NetworkIsolator {
     /// unsigned; the gate already answers a missing file with the built-in
     /// list.
     fn trusted_allow(&self) -> combat_allow::AllowLoad {
-        use common::wire::admin_signed_payload::OverlayKind;
+        use nn_proto::admin_signed_payload::OverlayKind;
         if self.gate.is_none() {
             return combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
         }

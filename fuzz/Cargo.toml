@@ -15,6 +15,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 northnarrow-agent = { path = "../agent" }
 northnarrow-common = { path = "../common" }
+# Wave 4 restructure, R03 (lab PR 240): admin_frame and shutdown_marker
+# decode nn-proto's types (they were common's).
+nn-proto = { path = "../crates/nn-proto" }
 # Already in the agent's graph, at the versions fuzz/Cargo.lock locks
 # (xtask/tests/supply_chain.rs keeps the security crates equal to
 # Cargo.lock): the targets' own checks (serde_json), and their one

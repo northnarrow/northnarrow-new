@@ -32,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use antitamper_bpf::ProtectedPidsHandle;
 use anyhow::{anyhow, Context, Result};
-use common::wire::admin_protocol::{
+use nn_proto::admin_protocol::{
     decode_loop_progress, decode_status_liveness, encode_frame, AdminMessage, LoopProgressRequest,
     StatusRequest, MAX_FRAME_BODY,
 };
@@ -127,7 +127,7 @@ pub struct Cli {
 
     /// The shutdown-authorisation marker the agent leaves when an admin
     /// quorum stops it ([`check_shutdown_marker`]).
-    #[arg(long = "shutdown-marker", value_name = "PATH", default_value = common::shutdown_marker::MARKER_PATH)]
+    #[arg(long = "shutdown-marker", value_name = "PATH", default_value = nn_proto::shutdown_marker::MARKER_PATH)]
     pub shutdown_marker: PathBuf,
 
     /// The admin keys a shutdown must be signed by (external audit
@@ -178,7 +178,7 @@ pub struct Cli {
 /// Each non-zero exit of the daemon leaves a [`REASON_WATCHDOG_EXIT`]
 /// record ([`exit_record`]) for the agent to sign first.
 ///
-/// [`REASON_WATCHDOG_EXIT`]: common::watchdog_hold::REASON_WATCHDOG_EXIT
+/// [`REASON_WATCHDOG_EXIT`]: nn_proto::watchdog_hold::REASON_WATCHDOG_EXIT
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitReason {
     Stopped,
@@ -297,13 +297,13 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The [`common::watchdog_hold::REASON_WATCHDOG_EXIT`] record of `failure`,
+/// The [`nn_proto::watchdog_hold::REASON_WATCHDOG_EXIT`] record of `failure`,
 /// written just before the watchdog exits with its status.
-pub fn exit_record(failure: &Failure, at: u64) -> common::watchdog_hold::HoldRecord {
-    common::watchdog_hold::HoldRecord {
+pub fn exit_record(failure: &Failure, at: u64) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
         at,
         agent_pid: failure.agent_pid,
-        reason: common::watchdog_hold::REASON_WATCHDOG_EXIT.to_string(),
+        reason: nn_proto::watchdog_hold::REASON_WATCHDOG_EXIT.to_string(),
         detail: format!(
             "exit status {} ({}): {}",
             failure.reason.code(),
@@ -341,7 +341,7 @@ pub const MONITOR_VARS: [&str; 5] = [
     "MONITOR_INVOCATION_ID",
 ];
 
-/// The [`common::watchdog_hold::REASON_WATCHDOG_FAILED`] record the
+/// The [`nn_proto::watchdog_hold::REASON_WATCHDOG_FAILED`] record the
 /// `OnFailure=` handler writes: systemd put the watchdog unit in its failed
 /// state (a start or stop job of its own failed — a death of the process is
 /// restarted, the unit has no start limit) and no longer restarts it.
@@ -352,7 +352,7 @@ pub fn unit_failure_record(
     var: impl Fn(&str) -> Option<String>,
     agent_pid: u32,
     at: u64,
-) -> common::watchdog_hold::HoldRecord {
+) -> nn_proto::watchdog_hold::HoldRecord {
     let fields: Vec<String> = MONITOR_VARS
         .iter()
         .filter_map(|k| {
@@ -379,10 +379,10 @@ pub fn unit_failure_record(
             fields.join(" ")
         )
     };
-    common::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
         at,
         agent_pid,
-        reason: common::watchdog_hold::REASON_WATCHDOG_FAILED.to_string(),
+        reason: nn_proto::watchdog_hold::REASON_WATCHDOG_FAILED.to_string(),
         detail,
         unit_state: None,
     }
@@ -666,7 +666,7 @@ pub async fn open_agent_pidfd_with_retry(
 /// `<pidfile>.tmp` with `create(true).truncate(true)`, so a link planted at
 /// that name in `/run/northnarrow` (root-writable, outside the inode deny
 /// set) was written through by a process the hooks trust. It is now the
-/// agent's AUT-003 writer ([`common::atomic_file::write_pidfile`]): the
+/// agent's AUT-003 writer ([`antitamper_bpf::atomic_file::write_pidfile`]): the
 /// temporary name is removed, created exclusively, renamed into place, and
 /// the directory synced.
 ///
@@ -685,7 +685,7 @@ pub fn write_pidfile_atomic(path: &Path, pid: u32) -> Result<()> {
                 .with_context(|| format!("creating pidfile parent {}", parent.display()))?;
         }
     }
-    common::atomic_file::write_pidfile(path, pid)
+    antitamper_bpf::atomic_file::write_pidfile(path, pid)
         .with_context(|| format!("writing pidfile {} (atomic replace)", path.display()))
 }
 
@@ -695,7 +695,7 @@ pub const RUN_DIR_MODE: u32 = 0o700;
 
 /// Manual systemd `sd_notify(READY=1)` — sends a single Unix
 /// datagram to `$NOTIFY_SOCKET` per the `sd_notify(3)` wire
-/// protocol ([`common::sd_notify`], shared with the agent): a path,
+/// protocol ([`antitamper_bpf::sd_notify`], shared with the agent): a path,
 /// or `@name` in the abstract namespace (external audit MAIN-016:
 /// it was sent to `@name` as a path, and never arrived). Cheap and
 /// no new dep vs `libsystemd-rs` / `sd-notify` crates.
@@ -704,7 +704,7 @@ pub const RUN_DIR_MODE: u32 = 0o700;
 /// under `Type=notify`) — that's a normal dev-shell invocation,
 /// not an error. A value it cannot send to is an error.
 pub fn sd_notify_ready() -> Result<()> {
-    let sent = common::sd_notify::notify(b"READY=1\n").with_context(|| {
+    let sent = antitamper_bpf::sd_notify::notify(b"READY=1\n").with_context(|| {
         format!(
             "sending READY=1 to NOTIFY_SOCKET={}",
             std::env::var_os("NOTIFY_SOCKET")
@@ -729,7 +729,7 @@ pub fn sd_notify_ready() -> Result<()> {
 /// External audit WDG-004: `STATUS=<status>` to systemd, best effort (a
 /// no-op outside `Type=notify`). `systemctl status` shows it.
 pub fn sd_notify_status(status: &str) {
-    if let Err(e) = common::sd_notify::notify(format!("STATUS={status}\n").as_bytes()) {
+    if let Err(e) = antitamper_bpf::sd_notify::notify(format!("STATUS={status}\n").as_bytes()) {
         warn!(target: "watchdog.sd_notify", error = %e, status, "sd_notify STATUS failed");
     }
 }
@@ -1335,7 +1335,7 @@ pub fn persist_agent_argv(path: &Path, argv: &[String]) -> Result<()> {
         body.extend_from_slice(arg.as_bytes());
         body.push(0);
     }
-    common::atomic_file::replace(path, &body, 0o600)
+    antitamper_bpf::atomic_file::replace(path, &body, 0o600)
         .with_context(|| format!("recording the agent argv at {}", path.display()))
 }
 
@@ -1392,7 +1392,7 @@ pub fn read_persisted_agent_argv(path: &Path) -> Result<Vec<String>> {
 /// agent was verified to run; with neither, the minimal
 /// `[verified_bin, --pid-file, pidfile]`, which drops every other flag.
 /// Each fallback is a WARN and a record at `hold_path`
-/// ([`common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED`]) that the agent
+/// ([`nn_proto::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED`]) that the agent
 /// signs at its next round: every later respawn uses that argv. Only the
 /// exec backend (non-systemd hosts) calls this.
 pub fn exec_respawn_argv(
@@ -1443,13 +1443,13 @@ pub fn exec_respawn_argv(
     let detail = format!(
         "/proc/{agent_pid}/cmdline unreadable ({capture_error:#}); respawns use {source}: {argv:?}"
     );
-    let rec = common::watchdog_hold::HoldRecord {
+    let rec = nn_proto::watchdog_hold::HoldRecord {
         at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
         agent_pid,
-        reason: common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED.to_string(),
+        reason: nn_proto::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED.to_string(),
         detail,
         unit_state: None,
     };
@@ -1608,18 +1608,18 @@ pub fn systemctl_unit_state(unit: &str) -> Result<String> {
 }
 
 /// External audit DEP-004: record a hold at `path` for the agent's signed
-/// audit chain ([`common::watchdog_hold`]). One JSON line per hold,
+/// audit chain ([`nn_proto::watchdog_hold`]). One JSON line per hold,
 /// appended (0600, never through a symlink).
-pub fn record_hold(path: &Path, record: &common::watchdog_hold::HoldRecord) -> Result<()> {
+pub fn record_hold(path: &Path, record: &nn_proto::watchdog_hold::HoldRecord) -> Result<()> {
     let line = serde_json::to_string(record).context("serialising the hold record")? + "\n";
     append_line(path, &line).with_context(|| format!("appending to {}", path.display()))
 }
 
 /// Where [`record_hold`] writes: next to the shutdown marker, like the
-/// refused-marker record ([`common::watchdog_hold::HOLD_PATH`] with the
+/// refused-marker record ([`nn_proto::watchdog_hold::HOLD_PATH`] with the
 /// default paths).
 pub fn hold_record_path(shutdown_marker: &Path) -> PathBuf {
-    shutdown_marker.with_file_name(file_name_of(common::watchdog_hold::HOLD_PATH))
+    shutdown_marker.with_file_name(file_name_of(nn_proto::watchdog_hold::HOLD_PATH))
 }
 
 /// Defensive re-insert of the new agent's PID into
@@ -1712,7 +1712,7 @@ pub enum ShutdownVerdict {
     Authorised,
     /// A marker that does not (forged, replayed, stale, or the keys or the
     /// install id could not be read): respawn, and report it. The marker
-    /// is removed and recorded at [`common::shutdown_marker::REJECTED_PATH`]
+    /// is removed and recorded at [`nn_proto::shutdown_marker::REJECTED_PATH`]
     /// for the agent's signed audit chain.
     Refused(String),
 }
@@ -1736,11 +1736,11 @@ pub struct ShutdownCheck<'a> {
 /// Decide what the agent's exit means. A marker is honoured only when it
 /// carries a shutdown signed by the admin quorum for this install, recent,
 /// written by the agent that exited, and not honoured before
-/// ([`common::shutdown_marker::verify`]); it was a JSON with a hash and a
+/// ([`nn_proto::shutdown_marker::verify`]); it was a JSON with a hash and a
 /// deadline any root process could write. Every failure is a refusal —
 /// the agent is respawned.
 pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
-    use common::shutdown_marker as sm;
+    use nn_proto::shutdown_marker as sm;
     let raw = match std::fs::read(c.marker) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1761,7 +1761,7 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
     // its own key, as in the agent, so both judge the marker with the same
     // keys.
     let keys = match std::fs::read_to_string(c.admin_pub)
-        .map(|body| common::admin_quorum::parse_admin_pub_lenient(&body).keys)
+        .map(|body| nn_proto::admin_quorum::parse_admin_pub_lenient(&body).keys)
     {
         Ok(k) if !k.is_empty() => k,
         Ok(_) => {
@@ -1820,7 +1820,7 @@ pub fn check_shutdown_marker(c: &ShutdownCheck<'_>) -> ShutdownVerdict {
 
 /// Record a refused marker for the agent and remove it.
 fn refuse(c: &ShutdownCheck<'_>, raw: &[u8], reason: String) -> ShutdownVerdict {
-    use common::shutdown_marker as sm;
+    use nn_proto::shutdown_marker as sm;
     let record = sm::RejectedRecord {
         at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2084,7 +2084,7 @@ pub const AGENT_SOCKET_REBIND_WITHIN: Duration = Duration::from_secs(10);
 /// (≥ 30 s without the socket, three times
 /// [`AGENT_SOCKET_REBIND_WITHIN`]) is reported as tamper — an ERROR on
 /// `watchdog.tamper` and a record the agent signs
-/// ([`common::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED`]). Not on the
+/// ([`nn_proto::watchdog_hold::REASON_ADMIN_SOCKET_VANISHED`]). Not on the
 /// first: a ping can land between the agent's clean unlink at shutdown and
 /// its exit, or inside the rebind window.
 pub const STATUS_PING_VANISHED_TAMPER_AFTER: u32 = 2;
@@ -2597,16 +2597,16 @@ pub fn stuck_verdict(agent_pidfd: &OwnedFd) -> StuckVerdict {
     }
 }
 
-/// The [`common::watchdog_hold::REASON_STUCK_RECOVERY_FAILED`] record.
+/// The [`nn_proto::watchdog_hold::REASON_STUCK_RECOVERY_FAILED`] record.
 pub fn stuck_recovery_failed_record(
     agent_pid: u32,
     error: &str,
     at: u64,
-) -> common::watchdog_hold::HoldRecord {
-    common::watchdog_hold::HoldRecord {
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
         at,
         agent_pid,
-        reason: common::watchdog_hold::REASON_STUCK_RECOVERY_FAILED.to_string(),
+        reason: nn_proto::watchdog_hold::REASON_STUCK_RECOVERY_FAILED.to_string(),
         detail: format!(
             "the agent did not answer (or its event loop stood still) and could not be stopped: \
              {} — still protected, its pidfile kept, still supervised",
@@ -2616,7 +2616,7 @@ pub fn stuck_recovery_failed_record(
     }
 }
 
-/// The [`common::watchdog_hold::REASON_EVENT_LOOP_STALLED`] record:
+/// The [`nn_proto::watchdog_hold::REASON_EVENT_LOOP_STALLED`] record:
 /// `pings` STATUS pings in a row answered while the event loop stood still,
 /// its last round `since_last_ms` before the last of them.
 pub fn event_loop_stalled_record(
@@ -2624,11 +2624,11 @@ pub fn event_loop_stalled_record(
     pings: u32,
     since_last_ms: u64,
     at: u64,
-) -> common::watchdog_hold::HoldRecord {
-    common::watchdog_hold::HoldRecord {
+) -> nn_proto::watchdog_hold::HoldRecord {
+    nn_proto::watchdog_hold::HoldRecord {
         at,
         agent_pid,
-        reason: common::watchdog_hold::REASON_EVENT_LOOP_STALLED.to_string(),
+        reason: nn_proto::watchdog_hold::REASON_EVENT_LOOP_STALLED.to_string(),
         detail: format!(
             "the admin socket answered {pings} STATUS pings in a row while the event loop made \
              no round (the last one {} s before); stuck recovery follows",
@@ -3228,8 +3228,8 @@ mod tests {
     /// for the agent and removed; a genuine authorisation is honoured once.
     #[test]
     fn only_a_quorum_signed_marker_stands_the_watchdog_down() {
-        use common::shutdown_marker::ShutdownMarker;
-        use common::wire::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::admin_signed_payload::{sign, SignedPayload};
+        use nn_proto::shutdown_marker::ShutdownMarker;
         let dir = TempDir::new().unwrap();
         let marker = dir.path().join("agent.shutdown_authorised");
         let admin_pub = dir.path().join("admin.pub");
@@ -3518,9 +3518,9 @@ mod tests {
     /// the agent reads it (next to the shutdown marker).
     #[test]
     fn record_hold_appends_one_line_per_hold() {
-        use common::watchdog_hold::{HoldRecord, HOLD_PATH};
+        use nn_proto::watchdog_hold::{HoldRecord, HOLD_PATH};
         assert_eq!(
-            hold_record_path(Path::new(common::shutdown_marker::MARKER_PATH)),
+            hold_record_path(Path::new(nn_proto::shutdown_marker::MARKER_PATH)),
             Path::new(HOLD_PATH)
         );
         let dir = TempDir::new().unwrap();
@@ -3850,11 +3850,11 @@ mod tests {
             ]
         );
         let line = std::fs::read_to_string(&holds).unwrap();
-        let rec: common::watchdog_hold::HoldRecord =
+        let rec: nn_proto::watchdog_hold::HoldRecord =
             serde_json::from_str(line.lines().next().unwrap()).unwrap();
         assert_eq!(
             rec.reason,
-            common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED
+            nn_proto::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED
         );
         assert_eq!(rec.agent_pid, NO_SUCH_PID);
         assert!(rec.detail.contains("--detect-only"), "{}", rec.detail);
@@ -3878,7 +3878,7 @@ mod tests {
         );
         let body = std::fs::read_to_string(&holds).unwrap();
         assert_eq!(body.lines().count(), 1);
-        assert!(body.contains(common::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED));
+        assert!(body.contains(nn_proto::watchdog_hold::REASON_RESPAWN_ARGV_DEGRADED));
         assert!(body.contains("minimal argv"), "{body}");
     }
 
@@ -4101,7 +4101,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn ping_agent_status_round_trips_through_mock_server() {
         use common::posture_types::PostureKind;
-        use common::wire::admin_protocol::StatusResponse;
+        use nn_proto::admin_protocol::StatusResponse;
 
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("mock.sock");
@@ -4233,13 +4233,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_ping_does_not_depend_on_the_status_fields() {
         use common::posture_types::PostureKind;
-        use common::wire::admin_protocol::{StatusResponse, STATUS_RESPONSE_INDEX};
+        use nn_proto::admin_protocol::{StatusResponse, STATUS_RESPONSE_INDEX};
         // The first agents' reply, as postcard writes it: the variant, then
         // posture Combat (3), isolation engaged (1), last admin action
         // Some(4) — and nothing after.
         let old = vec![STATUS_RESPONSE_INDEX as u8, 3, 1, 1, 4];
         assert!(
-            common::wire::admin_protocol::decode_frame(&{
+            nn_proto::admin_protocol::decode_frame(&{
                 let mut f = (old.len() as u32).to_be_bytes().to_vec();
                 f.extend(&old);
                 f
@@ -4274,7 +4274,7 @@ mod tests {
     /// Another reply than a status reply is still a failed ping.
     #[tokio::test(flavor = "current_thread")]
     async fn a_ping_answered_with_another_variant_fails() {
-        use common::wire::admin_protocol::UnlockResult;
+        use nn_proto::admin_protocol::UnlockResult;
         let other = encode_frame(&AdminMessage::UnlockResult(UnlockResult::Success)).unwrap();
         let err = ping_against(other[4..].to_vec()).await.unwrap_err();
         assert!(
@@ -4326,7 +4326,7 @@ mod tests {
         assert_ne!(failure.reason.code(), 0);
         assert_eq!(failure.agent_pid, 4242);
         let rec = exit_record(&failure, 1_800_000_000);
-        assert_eq!(rec.reason, common::watchdog_hold::REASON_WATCHDOG_EXIT);
+        assert_eq!(rec.reason, nn_proto::watchdog_hold::REASON_WATCHDOG_EXIT);
         assert_eq!(rec.agent_pid, 4242);
         assert!(
             rec.detail
@@ -4369,7 +4369,7 @@ mod tests {
             _ => None,
         };
         let rec = unit_failure_record(vars, 4242, 1_800_000_000);
-        assert_eq!(rec.reason, common::watchdog_hold::REASON_WATCHDOG_FAILED);
+        assert_eq!(rec.reason, nn_proto::watchdog_hold::REASON_WATCHDOG_FAILED);
         assert_eq!(rec.agent_pid, 4242);
         for part in [
             "northnarrow-watchdog.service entered the failed state",
@@ -4418,7 +4418,7 @@ mod tests {
         let rec = stuck_recovery_failed_record(child.id(), &format!("{:#}", r.unwrap_err()), 1);
         assert_eq!(
             rec.reason,
-            common::watchdog_hold::REASON_STUCK_RECOVERY_FAILED
+            nn_proto::watchdog_hold::REASON_STUCK_RECOVERY_FAILED
         );
         assert!(rec.detail.contains("still protected"), "{}", rec.detail);
         let _ = child.kill();
@@ -4535,7 +4535,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_ping_reads_the_loop_progress_after_the_status() {
         use common::posture_types::PostureKind;
-        use common::wire::admin_protocol::{LoopProgressResponse, StatusResponse};
+        use nn_proto::admin_protocol::{LoopProgressResponse, StatusResponse};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("mock.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();

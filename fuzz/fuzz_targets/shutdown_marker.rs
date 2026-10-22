@@ -20,8 +20,8 @@ use libfuzzer_sys::fuzz_target;
 use northnarrow_agent::fuzz_api::{
     shutdown_marker_check, SHUTDOWN_FIXTURE_PID, SHUTDOWN_FIXTURE_SIGNED,
 };
-use northnarrow_common::admin_quorum::MAX_SUBMITTED_SIGNATURES;
-use northnarrow_common::shutdown_marker::{Rejection, MAX_GRACE_SECS};
+use nn_proto::admin_quorum::MAX_SUBMITTED_SIGNATURES;
+use nn_proto::shutdown_marker::{Rejection, MAX_GRACE_SECS};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(raw) = std::str::from_utf8(data) else {

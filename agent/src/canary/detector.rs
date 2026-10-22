@@ -64,9 +64,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::wire::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use common::wire::InodeKey;
 use common::{CanaryAccessKind, CanaryTypeTag, Event};
+use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use parking_lot::Mutex;
 use tracing::{error, warn};
 

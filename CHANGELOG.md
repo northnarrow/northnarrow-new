@@ -797,6 +797,26 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `target-cpu=x86-64-v2` and a `neon` ABI warning. `lab-vm.yml` starts on
   `crates/**`. The shipped binaries, the eBPF object and the packages are
   the same as R00's.
+- Wave 4 restructure, R03 — nn-proto (lab PR 240; before R02, so that
+  nn-model, which depends on `common`, does not inherit its Unix-only
+  `atomic_file`): `common`'s admin protocol (`wire::admin_protocol`),
+  signed payloads (`wire::admin_signed_payload`), quorum (its Kani proof
+  with it), shutdown marker and watchdog hold moved unchanged (`git mv`)
+  to `crates/nn-proto`, with their dependencies and the `debug-trigger`
+  feature, which the agent now forwards there (CI's wire-discriminant step
+  and `kani.yml` run on `-p nn-proto`); `atomic_file` and `sd_notify` to
+  `northnarrow-antitamper-bpf`, the Linux base of the agent and the
+  watchdog. `common` cannot re-export them (they depend on it, and cargo
+  refuses the cycle): the importers — the agent, the watchdog, the fuzz
+  targets `admin_frame` and `shutdown_marker` — name the new crates, a
+  path rewrite, and the moved files compile through `pub(crate)` shims at
+  nn-proto's root (removed in R17). A new test pins five admin frames and
+  a v1 envelope byte for byte as `main` encoded them (signed payloads and
+  `PostureKind` inside); it passes before and after the move. The ratchet
+  scan counts a reference to a crate of `crates/` by its name, so the
+  nn-evidence → nn-proto arc of `verify_lines` and `canary::chain_lines`
+  still counts: 77. The eBPF object is byte-identical to `main`'s; its
+  stamp changes with `common`'s sources.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

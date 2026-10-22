@@ -1352,9 +1352,9 @@ enum DebugStateArg {
 }
 
 #[cfg(feature = "debug-trigger")]
-impl From<DebugStateArg> for common::wire::admin_protocol::DebugForcePosture {
+impl From<DebugStateArg> for nn_proto::admin_protocol::DebugForcePosture {
     fn from(s: DebugStateArg) -> Self {
-        use common::wire::admin_protocol::DebugForcePosture::*;
+        use nn_proto::admin_protocol::DebugForcePosture::*;
         match s {
             DebugStateArg::Observing => Observing,
             DebugStateArg::Alerted => Alerted,
@@ -2436,7 +2436,7 @@ fn read_status(
     agent_id_file: &std::path::Path,
     op: &str,
 ) -> Result<StatusOutcome, ExitCode> {
-    use common::wire::admin_protocol::AdminResult;
+    use nn_proto::admin_protocol::AdminResult;
     let Some(key) = key else {
         return run_status(socket).map_err(|e| {
             eprintln!("{op}: {e:#}");
@@ -3292,7 +3292,7 @@ fn print_status(out: &StatusOutcome, json: bool) {
 }
 
 /// Lab PR 222: the guard's lines of `status --key`.
-fn cow_guard_lines(g: Option<&common::wire::admin_protocol::CowGuardStatus>) -> Vec<String> {
+fn cow_guard_lines(g: Option<&nn_proto::admin_protocol::CowGuardStatus>) -> Vec<String> {
     let Some(g) = g else {
         return vec!["copy on write     : (agent predates the guard)".to_string()];
     };
@@ -3397,7 +3397,7 @@ fn colorize(s: &str, sgr: &str, tty: bool) -> String {
 }
 
 /// Parse a CSV role list (`unlock,audit-read`, …) into the wire
-/// [`common::wire::admin_signed_payload::Role`] enum. Empty input
+/// [`nn_proto::admin_signed_payload::Role`] enum. Empty input
 /// is rejected — A13's `add` flow requires at least one role.
 ///
 /// External audit AUT-013: the list is checked by the agent's own
@@ -3405,7 +3405,7 @@ fn colorize(s: &str, sgr: &str, tty: bool) -> String {
 /// `unlock,`) is refused with the agent's words instead of being
 /// skipped; spaces around an entry are still trimmed (a convenience
 /// of the command line, the agent writes the list without them).
-fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<common::wire::admin_signed_payload::Role>> {
+fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<nn_proto::admin_signed_payload::Role>> {
     use anyhow::bail;
     if s.trim().is_empty() {
         bail!("--new-roles must list at least one role keyword");
@@ -3555,10 +3555,10 @@ fn exit_from_fim_baseline(outcome: FimBaselineOutcome) -> ExitCode {
 /// to a stable exit code — same contract as [`exit_from_fim_baseline`]
 /// (0 success; 2 bad-sig; 3 no-challenge; 4 rate-limited; 5 transport/
 /// skew/agent-id/unknown-op/version; 6 quorum; 7 role-denied).
-fn overlay_kind_arg(kind: &str) -> Option<common::wire::admin_signed_payload::OverlayKind> {
-    let k = common::wire::admin_signed_payload::OverlayKind::from_keyword(kind);
+fn overlay_kind_arg(kind: &str) -> Option<nn_proto::admin_signed_payload::OverlayKind> {
+    let k = nn_proto::admin_signed_payload::OverlayKind::from_keyword(kind);
     if k.is_none() {
-        let all: Vec<&str> = common::wire::admin_signed_payload::OverlayKind::ALL
+        let all: Vec<&str> = nn_proto::admin_signed_payload::OverlayKind::ALL
             .iter()
             .map(|k| k.keyword())
             .collect();
@@ -3572,8 +3572,8 @@ fn overlay_kind_arg(kind: &str) -> Option<common::wire::admin_signed_payload::Ov
 
 /// Exit code of a signed verb that the agent refused before doing
 /// anything (authentication, role, version).
-fn exit_from_admin_result(op: &str, r: common::wire::admin_protocol::AdminResult) -> ExitCode {
-    use common::wire::admin_protocol::AdminResult;
+fn exit_from_admin_result(op: &str, r: nn_proto::admin_protocol::AdminResult) -> ExitCode {
+    use nn_proto::admin_protocol::AdminResult;
     let (code, why) = match r {
         AdminResult::Success => (0, String::new()),
         AdminResult::InvalidSignature => (2, "invalid signature".to_string()),
@@ -3604,7 +3604,7 @@ fn exit_from_admin_result(op: &str, r: common::wire::admin_protocol::AdminResult
 /// codes otherwise (2 signature, 3 challenge, 4 rate limit, 5 transport /
 /// version, 7 role).
 fn run_response_cmd(sub: ResponseCmd) -> ExitCode {
-    use common::wire::admin_protocol::AdminResult;
+    use nn_proto::admin_protocol::AdminResult;
     use northnarrow_agent::admin_cli::{
         run_response_release, run_response_restore, run_response_status, ResponseActionOutcome,
     };
@@ -3739,7 +3739,7 @@ fn run_remediate_cmd(sub: RemediateCmd) -> ExitCode {
                 return ExitCode::from(2);
             }
             match run_remediate_ransomware(&socket, &key, &agent_id_file, pid, since, dry_run) {
-                Ok(r) if r.result == common::wire::admin_protocol::AdminResult::Success => {
+                Ok(r) if r.result == nn_proto::admin_protocol::AdminResult::Success => {
                     if json {
                         println!(
                             "{}",
@@ -3801,15 +3801,15 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                     println!("config overlay set: {}", o.message);
                     ExitCode::SUCCESS
                 }
-                Ok(o) if o.result == common::wire::admin_protocol::AdminResult::Success => {
+                Ok(o) if o.result == nn_proto::admin_protocol::AdminResult::Success => {
                     eprintln!("config overlay set: refused by the agent: {}", o.message);
                     ExitCode::from(6)
                 }
                 Ok(o) => {
                     eprintln!("config overlay set: {:?} ({})", o.result, o.message);
                     ExitCode::from(match o.result {
-                        common::wire::admin_protocol::AdminResult::RoleDenied => 7,
-                        common::wire::admin_protocol::AdminResult::InvalidSignature => 2,
+                        nn_proto::admin_protocol::AdminResult::RoleDenied => 7,
+                        nn_proto::admin_protocol::AdminResult::InvalidSignature => 2,
                         _ => 5,
                     })
                 }
@@ -3883,7 +3883,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
             }
             let gate = OverlayGate::new(&admin_pub, agent_id, floor);
             let mut unsigned = 0;
-            for kind in common::wire::admin_signed_payload::OverlayKind::ALL {
+            for kind in nn_proto::admin_signed_payload::OverlayKind::ALL {
                 let path = dir.join(kind.file_name());
                 match gate.check(kind, &path) {
                     Decision::Absent => println!(
@@ -3932,7 +3932,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
 
 /// Lab PR 236: `nn-admin policy show|set|test`.
 fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
-    use common::wire::admin_signed_payload::OverlayKind;
+    use nn_proto::admin_signed_payload::OverlayKind;
     use northnarrow_agent::config::overlay_auth::{Decision, OverlayGate};
     use northnarrow_agent::decision::{replay, rule_policy};
     match sub {
@@ -4140,10 +4140,10 @@ fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
 /// said here, on the same status line (install.sh reads its first two
 /// words).
 fn carveout_lines_dropped(
-    kind: common::wire::admin_signed_payload::OverlayKind,
+    kind: nn_proto::admin_signed_payload::OverlayKind,
     path: &std::path::Path,
 ) -> String {
-    if kind != common::wire::admin_signed_payload::OverlayKind::CombatAllow {
+    if kind != nn_proto::admin_signed_payload::OverlayKind::CombatAllow {
         return String::new();
     }
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -4910,7 +4910,7 @@ fn exit_from_net_resolve(outcome: NetResolveOutcome) -> ExitCode {
 #[cfg(test)]
 mod roles_csv_tests {
     use super::parse_roles_csv;
-    use common::wire::admin_signed_payload::Role;
+    use nn_proto::admin_signed_payload::Role;
 
     /// Review `admin-cli-roles-1`: every keyword the agent accepts in
     /// admin.pub is grantable from the CLI, not just the legacy five.
@@ -4960,7 +4960,7 @@ mod roles_csv_tests {
                 "{list}: {e}"
             );
             let agent =
-                common::admin_quorum::parse_role_list(&list.replace(' ', "")).expect_err(list);
+                nn_proto::admin_quorum::parse_role_list(&list.replace(' ', "")).expect_err(list);
             assert!(e.ends_with(&agent), "{list}: {e} / {agent}");
         }
         assert_eq!(
@@ -5410,7 +5410,7 @@ mod flow_sock_line_tests {
     fn status_shows_the_exploit_guard() {
         let mut o = outcome(None, None, None);
         assert!(exploit_guard_line(&o, false).contains("predates"));
-        o.exploit_guard = Some(common::wire::admin_protocol::ExploitGuardStatus {
+        o.exploit_guard = Some(nn_proto::admin_protocol::ExploitGuardStatus {
             mode: "strict detect".to_string(),
             checked_total: 12,
             skipped_privileged_total: 30,
@@ -5473,7 +5473,7 @@ mod flow_sock_line_tests {
 #[cfg(test)]
 mod cow_guard_line_tests {
     use super::{cow_guard_lines, parse_since};
-    use common::wire::admin_protocol::{CowGuardStatus, CowScopeStatus};
+    use nn_proto::admin_protocol::{CowGuardStatus, CowScopeStatus};
 
     #[test]
     fn the_guard_is_shown_with_its_scopes_skips_and_latencies() {

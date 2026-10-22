@@ -976,8 +976,8 @@ fn a_forged_shutdown_marker_is_refused_and_the_agent_respawned() {
 /// authorisation is recorded so it cannot be presented again.
 #[test]
 fn a_quorum_signed_shutdown_marker_stands_the_watchdog_down() {
-    use common::shutdown_marker::ShutdownMarker;
-    use common::wire::admin_signed_payload::{sign, SignedPayload};
+    use nn_proto::admin_signed_payload::{sign, SignedPayload};
+    use nn_proto::shutdown_marker::ShutdownMarker;
 
     let mut fx = E2eFixture::setup();
     let a = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
@@ -993,7 +993,7 @@ fn a_quorum_signed_shutdown_marker_stands_the_watchdog_down() {
     .expect("write admin.pub");
     let pid = fx.spawn_agent();
     fx.spawn_watchdog();
-    let agent_id = common::shutdown_marker::parse_agent_id(
+    let agent_id = nn_proto::shutdown_marker::parse_agent_id(
         &fs::read_to_string(fx.agent_id_path()).expect("agent_id written at boot"),
     )
     .expect("agent_id");

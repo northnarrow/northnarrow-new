@@ -102,7 +102,8 @@ pull request that touches a proved file — external audit SUP-023):
 
 The pull-request filter names the files that hold proofs
 (`agent/src/net/tls_parser.rs`, `common/src/dns_qname.rs`,
-`common/src/admin_quorum.rs`) and the workflow;
+`crates/nn-proto/src/admin_quorum.rs`, common's until the Wave 4
+restructure's R03) and the workflow;
 `xtask/tests/supply_chain.rs` keeps it equal to the files with a
 `#[kani::proof]` and checks that the workflow runs every harness. The DNS
 walk moved out of the event model (`common/src/model.rs`), which changes

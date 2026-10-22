@@ -56,14 +56,6 @@ mod dns_qname;
 #[cfg(feature = "std")]
 pub use dns_qname::{decode_dns_qname, qname_wire_end, QnameLabel, QnameLabels};
 
-#[cfg(feature = "std")]
-pub mod admin_quorum;
-
-/// Replacing a file without writing through a planted link (external
-/// audit AUT-003, WDG-015).
-#[cfg(feature = "std")]
-pub mod atomic_file;
-
 /// Lab PR 223 (EXPERIMENTAL): the exec quarantine's scanner protocol and
 /// signed hash list.
 #[cfg(feature = "std")]
@@ -78,13 +70,9 @@ pub mod netaddr;
 #[cfg(feature = "std")]
 pub mod posture_types;
 
-/// The `sd_notify(3)` datagram of the agent and the watchdog (external
-/// audit MAIN-016: abstract sockets).
-#[cfg(all(feature = "std", target_os = "linux"))]
-pub mod sd_notify;
-
-#[cfg(feature = "std")]
-pub mod shutdown_marker;
-
-#[cfg(feature = "std")]
-pub mod watchdog_hold;
+// Wave 4 restructure, R03 (lab PR 240): the admin protocol
+// (`wire::admin_protocol`), the signed payloads
+// (`wire::admin_signed_payload`), the quorum, the shutdown marker and the
+// watchdog hold are nn-proto's (`crates/nn-proto`); `atomic_file` and
+// `sd_notify` are northnarrow-antitamper-bpf's. No re-export here: both
+// crates depend on this one.

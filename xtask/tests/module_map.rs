@@ -4,8 +4,8 @@
 //! and `common/src` to the crate it is headed for, and says which crates
 //! each crate may depend on. A module that names a module of a crate its
 //! own crate may not depend on (a `crate::`, `super::`, `self::`,
-//! `common::` or `northnarrow_agent::` path outside tests and Kani proofs)
-//! is a violation: the arc R04 has to cut before the module can move
+//! `common::` or `northnarrow_agent::` path, or the name of another crate
+//! of the repository, outside tests and Kani proofs) is a violation: the arc R04 has to cut before the module can move
 //! (rule 3 of the plan's §4.1, "extract from the bottom"). The count of
 //! each crate may not grow above its `[ratchet]` ceiling, and a count
 //! below it fails too until the ceiling comes down to it — so the number
@@ -32,11 +32,22 @@ const SOURCES: &[(&str, &str, &str)] = &[
 ];
 
 /// Extern crates of the repository named from these trees, mapped
-/// directly to their package.
+/// directly to their package. R03 (lab PR 240): the crates of `crates/`
+/// too — a module that moves out of `common` is named by its new crate,
+/// and the reference must still count (`verify_lines` →
+/// `nn_proto::admin_protocol` is the nn-evidence → nn-proto arc it was
+/// as `common::wire::admin_protocol`).
 const EXTERN: &[(&str, &str)] = &[
     ("antitamper_bpf", "northnarrow-antitamper-bpf"),
     ("northnarrow_antitamper_bpf", "northnarrow-antitamper-bpf"),
     ("northnarrow_scan", "northnarrow-scan"),
+    ("nn_parse", "nn-parse"),
+    ("nn_model", "nn-model"),
+    ("nn_proto", "nn-proto"),
+    ("nn_evidence", "nn-evidence"),
+    ("nn_core", "nn-core"),
+    ("nn_linux", "nn-linux"),
+    ("nn_admin", "nn-admin"),
 ];
 
 // ── lexing ────────────────────────────────────────────────────────────────
@@ -625,6 +636,7 @@ fn the_scan_reads_paths_the_way_rust_does() {
         use crate::shipped::Yes;
         let t = crate::net::Tracker::<u8>::new();
         antitamper_bpf::pin();
+        const _: usize = nn_proto::admin_protocol::MAX_FRAME_BODY;
     "##;
     let (text, test_mods) = drop_test_items(&blank(src));
     assert_eq!(test_mods, vec!["more_tests".to_string()]);
@@ -642,6 +654,7 @@ fn the_scan_reads_paths_the_way_rust_does() {
         Target::Module("agent".into(), m("shipped::Yes")),
         Target::Module("agent".into(), m("net::Tracker")),
         Target::Crate("northnarrow-antitamper-bpf".into()),
+        Target::Crate("nn-proto".into()),
     ]
     .into_iter()
     .collect();

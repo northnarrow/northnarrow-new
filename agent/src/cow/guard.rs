@@ -1000,8 +1000,8 @@ impl Runtime {
     }
 
     /// The guard as `status --key` shows it.
-    pub fn status(&self) -> common::wire::admin_protocol::CowGuardStatus {
-        use common::wire::admin_protocol::{CowGuardStatus, CowScopeStatus};
+    pub fn status(&self) -> nn_proto::admin_protocol::CowGuardStatus {
+        use nn_proto::admin_protocol::{CowGuardStatus, CowScopeStatus};
         let ix = self.store.index.lock();
         let scopes = self
             .store

@@ -841,6 +841,17 @@ version = "0.0.1"
 [[package]]
 name = "nn-proto"
 version = "0.0.1"
+dependencies = [
+ "ciborium",
+ "ed25519-dalek",
+ "hex",
+ "northnarrow-common",
+ "postcard",
+ "serde",
+ "serde-big-array",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "northnarrow-agent"
@@ -861,6 +872,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-proto",
  "northnarrow-antitamper-bpf",
  "northnarrow-common",
  "northnarrow-scan",
@@ -903,13 +915,10 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "ciborium",
- "ed25519-dalek",
  "hex",
  "postcard",
  "serde",
- "serde-big-array",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -931,6 +940,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "libc",
+ "nn-proto",
  "northnarrow-antitamper-bpf",
  "northnarrow-common",
  "serde_json",

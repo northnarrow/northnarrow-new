@@ -2,7 +2,7 @@
 //! §10.3; external audit WDG-001, EVD-021, TST-003).
 //!
 //! When an admin quorum authorises a shutdown with a signed
-//! [`ShutdownRequest`](common::wire::admin_protocol::ShutdownRequest), the
+//! [`ShutdownRequest`](nn_proto::admin_protocol::ShutdownRequest), the
 //! agent writes `/run/northnarrow/agent.shutdown_authorised` BEFORE
 //! replying `Success` and beginning its own graceful exit. The watchdog
 //! reads it when the agent's pidfd fires, to tell "admin authorised this
@@ -36,10 +36,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 
-pub use common::shutdown_marker::ShutdownMarker;
+pub use nn_proto::shutdown_marker::ShutdownMarker;
 
-/// Canonical marker path ([`common::shutdown_marker::MARKER_PATH`]).
-pub const DEFAULT_MARKER_PATH: &str = common::shutdown_marker::MARKER_PATH;
+/// Canonical marker path ([`nn_proto::shutdown_marker::MARKER_PATH`]).
+pub const DEFAULT_MARKER_PATH: &str = nn_proto::shutdown_marker::MARKER_PATH;
 
 /// File mode applied at write time. Design §10.3 mandates 0600.
 const MARKER_MODE: u32 = 0o600;
@@ -130,7 +130,7 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::admin_signed_payload::SignedPayload;
+    use nn_proto::admin_signed_payload::SignedPayload;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 

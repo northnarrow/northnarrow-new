@@ -221,8 +221,8 @@ pub fn counter_total(slot: u32) -> u64 {
 }
 
 /// The guard in `nn-admin status` (signed telemetry verb).
-pub fn status() -> common::wire::admin_protocol::ExploitGuardStatus {
-    common::wire::admin_protocol::ExploitGuardStatus {
+pub fn status() -> nn_proto::admin_protocol::ExploitGuardStatus {
+    nn_proto::admin_protocol::ExploitGuardStatus {
         mode: mode_line(),
         checked_total: counter_total(counter::CHECKED),
         skipped_privileged_total: counter_total(counter::SKIPPED_PRIVILEGED),

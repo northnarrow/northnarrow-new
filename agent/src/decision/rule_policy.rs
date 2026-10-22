@@ -9,7 +9,7 @@
 //! decision of 21/10/2026 holds ([`super::response_policy`]) held.
 //!
 //! The policy is the signed overlay `rule-policy.local`
-//! ([`OverlayKind::RulePolicy`](common::wire::admin_signed_payload::OverlayKind::RulePolicy)):
+//! ([`OverlayKind::RulePolicy`](nn_proto::admin_signed_payload::OverlayKind::RulePolicy)):
 //! one directive per line, any bad line refuses the whole file
 //! ([`parse`]). The engine reads the active policy through a
 //! [`PolicyHandle`]; `nn-admin policy set` swaps it between two events.
