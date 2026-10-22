@@ -382,10 +382,7 @@ unsafe fn probe_skb_ret(ctx: &RetProbeContext, kind: u8) {
     if !current_is_target() {
         return;
     }
-    let skb: *const u8 = match ctx.ret() {
-        Some(p) => p,
-        None => return,
-    };
+    let skb: *const u8 = ctx.ret();
     // ERR_PTR() values sit in the last page of the address space.
     if skb.is_null() || (skb as u64) >= 0xffff_ffff_ffff_f000 {
         return;

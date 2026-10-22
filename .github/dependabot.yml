@@ -21,6 +21,11 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 2
+    ignore:
+      # Lab PR 233: aya-build 0.2.1 needs rustc 1.98; the eBPF nightly is
+      # 1.93. It moves with the nightly and bpf-linker, by hand.
+      - dependency-name: aya-build
+        versions: [">= 0.2.1"]
 
   - package-ecosystem: github-actions
     directory: /

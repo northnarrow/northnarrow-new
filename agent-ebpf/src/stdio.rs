@@ -28,7 +28,7 @@
 //! `match` (rule 3), the record built in map memory (rule 4), a loop of
 //! three constant-bounded steps.
 
-use aya_ebpf::{cty::c_void, helpers::gen, macros::map, maps::PerCpuArray};
+use aya_ebpf::{cty::c_void, helpers::generated, macros::map, maps::PerCpuArray};
 use northnarrow_common::wire::{stdio_flags, StdioRaw};
 
 use crate::btf_offsets::{
@@ -51,21 +51,21 @@ const AF_INET6: u16 = 10;
 #[inline(always)]
 unsafe fn peek_u64(src: u64) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: u64) -> u32 {
     let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: u64) -> u16 {
     let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
     v.assume_init()
 }
 

@@ -629,6 +629,24 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- The eBPF programs are built with aya-ebpf 0.2.1 instead of 0.1.1 (lab
+  PR 233, D1b of the Wave 4 phase 2 dependency plan; supersedes Dependabot
+  #361): `helpers::gen` is now `helpers::generated` (56 calls in 11 files)
+  and `RetProbeContext::ret` returns the value itself. Its build
+  dependency aya-build stays at 0.2.0 in `agent-ebpf/Cargo.lock` (0.2.1
+  needs rustc 1.98, the eBPF nightly is 1.93; Dependabot ignores it
+  there); the nightly and bpf-linker 0.10.3 are unchanged. The generated
+  code differs in 48 of the 96 BPF functions (among other things, kprobes
+  read their arguments from the context instead of through
+  `bpf_probe_read`), and the object still keeps the "Older verifiers"
+  rules: the same `memset`/`memcmp` calls function for function, none in
+  the exploit guard, exec or file-open programs, global functions with
+  `u64` arguments only. Every program that loads with `main`'s object
+  loads with this one on 5.15, 6.1, 6.8 and 6.12. Per program, the
+  instructions the verifier processes move between −47 % (the TCP connect
+  kprobes) and +16 % against `main`'s, and between −1.3 % and −0.1 % in
+  total; the largest stays at 48 % of the 1M limit
+  (`docs/validation/results/verifier-2026-10-22-aya-ebpf-0.2.md`).
 - aya 0.13.1 → 0.14.0 in userland, with aya-obj 0.2.1 → 0.3.0 (lab PR 231,
   Wave 4 phase 2, D1a; supersedes Dependabot #363). aya-log is removed
   instead of bumped: the eBPF object has no `AYA_LOGS` map, so its init

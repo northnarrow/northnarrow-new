@@ -16,7 +16,7 @@
 //! buffer with volatile stores (no `memset`). Compared whole, an unzeroed
 //! tail made lab PR 219's injected comm match nothing on 6.1.
 
-use aya_ebpf::{cty::c_void, helpers::gen};
+use aya_ebpf::{cty::c_void, helpers::generated};
 
 /// `TASK_COMM_LEN`.
 pub const COMM_LEN: usize = 16;
@@ -32,7 +32,7 @@ pub fn current_comm() -> Result<[u8; COMM_LEN], i64> {
     let ret = unsafe {
         core::ptr::write_volatile(words, 0);
         core::ptr::write_volatile(words.add(1), 0);
-        gen::bpf_get_current_comm(words as *mut c_void, COMM_LEN as u32)
+        generated::bpf_get_current_comm(words as *mut c_void, COMM_LEN as u32)
     };
     if ret == 0 {
         // SAFETY: initialised above; `[u64; 2]` and `[u8; 16]` have one size.
@@ -51,5 +51,5 @@ pub fn current_comm() -> Result<[u8; COMM_LEN], i64> {
 /// (the bytes after the name's NUL are not written on every kernel).
 #[inline(always)]
 pub unsafe fn comm_into(dst: *mut [u8; COMM_LEN]) {
-    let _ = gen::bpf_get_current_comm(dst as *mut c_void, COMM_LEN as u32);
+    let _ = generated::bpf_get_current_comm(dst as *mut c_void, COMM_LEN as u32);
 }

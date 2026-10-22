@@ -17,7 +17,11 @@ path = "src/main.rs"
 # agent-ebpf/.cargo/config.toml. The xtask runner builds it.
 
 [dependencies]
-aya-ebpf = "0.1"
+# Lab PR 233: aya-ebpf 0.2 (helpers::generated, RetProbeContext::ret -> T).
+# Its build dependency aya-build stays at 0.2.0 in Cargo.lock: 0.2.1 needs
+# rustc 1.98 and the nightly of rust-toolchain.toml is 1.93 (the nightly
+# and bpf-linker move together, in a lot of their own).
+aya-ebpf = "0.2"
 northnarrow-common = { path = "../common", default-features = false }
 
 [profile.dev]

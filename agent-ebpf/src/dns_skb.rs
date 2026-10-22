@@ -19,7 +19,7 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, gen,
+        bpf_ktime_get_ns, generated,
     },
     macros::kprobe,
     programs::ProbeContext,
@@ -51,21 +51,21 @@ const HEADER_UNSET: usize = 0xffff;
 #[inline(always)]
 unsafe fn peek_u64(src: *const u8) -> u64 {
     let mut v = core::mem::MaybeUninit::<u64>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 8, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u32(src: *const u8) -> u32 {
     let mut v = core::mem::MaybeUninit::<u32>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 4, src as *const c_void);
     v.assume_init()
 }
 
 #[inline(always)]
 unsafe fn peek_u16(src: *const u8) -> u16 {
     let mut v = core::mem::MaybeUninit::<u16>::uninit();
-    let _ = gen::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
+    let _ = generated::bpf_probe_read_kernel(v.as_mut_ptr() as *mut c_void, 2, src as *const c_void);
     v.assume_init()
 }
 
@@ -156,10 +156,10 @@ unsafe fn try_dns_send_skb(ctx: &ProbeContext, v6: bool) {
     let dst = (*raw).dns_server.as_mut_ptr() as *mut c_void;
     if v6 {
         (*raw).family = AF_INET6;
-        let _ = gen::bpf_probe_read_kernel(dst, 16, fl.add(o_daddr) as *const c_void);
+        let _ = generated::bpf_probe_read_kernel(dst, 16, fl.add(o_daddr) as *const c_void);
     } else {
         (*raw).family = AF_INET;
-        let _ = gen::bpf_probe_read_kernel(dst, 4, fl.add(o_daddr) as *const c_void);
+        let _ = generated::bpf_probe_read_kernel(dst, 4, fl.add(o_daddr) as *const c_void);
     }
 
     // The payload the kernel copied: `head + transport_header` is the UDP
@@ -190,7 +190,7 @@ unsafe fn try_dns_send_skb(ctx: &ProbeContext, v6: bool) {
                 break;
             }
             let dst = (*raw).query_name.as_mut_ptr().add(off) as *mut c_void;
-            if gen::bpf_probe_read_kernel(dst, CHUNK as u32, src.add(off) as *const c_void) != 0 {
+            if generated::bpf_probe_read_kernel(dst, CHUNK as u32, src.add(off) as *const c_void) != 0 {
                 break;
             }
             copied = off + CHUNK;

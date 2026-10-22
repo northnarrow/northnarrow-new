@@ -12,6 +12,7 @@ Range setup + run procedure: [`../../RANGE_SETUP.md`](../../RANGE_SETUP.md).
 | `REPORT.md` | the assembled validation report skeleton (§8) | V6 (metrics), V8 (publication) |
 | `evidence/<run-id>/` | logs, screencaps, PCAP, hashes per run | every executed test |
 | `results/perf-<date>-<guest>-<commit>.json` + `.md` | performance baselines: every raw sample with the host, the tree and the method — the only source of a performance figure ([`../PERFORMANCE.md`](../PERFORMANCE.md) §2); `-aa` the A/A run the thresholds rest on ([`PERF_BASELINE.md`](PERF_BASELINE.md)) | `nn-lab.sh perf`, committed after the A/A check (lab PR 228) |
+| `results/verifier-<date>-<change>.md` | a change to the eBPF object's generated code run through each lab kernel's verifier: per program the result, the instructions processed and the stack, `main`'s object against the change's, with the static check of the "Older verifiers" rules | the lot that changes the generated code (lab PR 233) |
 | `PERF_BASELINE.md` | how to read the committed baseline, its A/A check and the regression thresholds of `deploy/lab/perf/thresholds.tsv` | the lot that commits a baseline |
 | `GOLDEN_REPLAY.md` | the golden replay of the decision engine: recorded streams (`agent/tests/golden/`), how to read and update the golden files | the lot that moves a verdict (`cargo xtask golden --update`, reviewed) |
 

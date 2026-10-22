@@ -323,7 +323,7 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
             let _ = crate::stdio::nn_stdio_probe(parent, 1);
             if let Some(s) = crate::stdio::STDIO_SCRATCH.get_ptr(0) {
                 unsafe {
-                    let _ = aya_ebpf::helpers::gen::bpf_probe_read_kernel(
+                    let _ = aya_ebpf::helpers::generated::bpf_probe_read_kernel(
                         &mut (*raw_ptr).stdio as *mut _ as *mut aya_ebpf::cty::c_void,
                         core::mem::size_of::<northnarrow_common::wire::StdioRaw>() as u32,
                         s as *const aya_ebpf::cty::c_void,
@@ -332,7 +332,7 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
             }
             if let Some(s) = crate::stdio::STDIO_SCRATCH.get_ptr(1) {
                 unsafe {
-                    let _ = aya_ebpf::helpers::gen::bpf_probe_read_kernel(
+                    let _ = aya_ebpf::helpers::generated::bpf_probe_read_kernel(
                         &mut (*raw_ptr).parent_stdio as *mut _ as *mut aya_ebpf::cty::c_void,
                         core::mem::size_of::<northnarrow_common::wire::StdioRaw>() as u32,
                         s as *const aya_ebpf::cty::c_void,
@@ -347,7 +347,7 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
         let key = task as u64;
         if let Some(v) = crate::exec_lsm::EXEC_HANDOFF.get_ptr(&key) {
             unsafe {
-                let _ = aya_ebpf::helpers::gen::bpf_probe_read_kernel(
+                let _ = aya_ebpf::helpers::generated::bpf_probe_read_kernel(
                     &mut (*raw_ptr).exe as *mut _ as *mut aya_ebpf::cty::c_void,
                     core::mem::size_of::<northnarrow_common::wire::exe::ExeIdentityRaw>() as u32,
                     v as *const aya_ebpf::cty::c_void,
