@@ -207,14 +207,15 @@ planned = false
 "install_manifest" = "nn-linux"
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
-# flow_tracker, dns_cache (state; its parsers → nn-parse, R06), limiter,
-# blocklist
+# flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
+# dns_records in R06, lab PR 242), limiter, blocklist
 "net" = "nn-core"
 "net::blind_spots" = "nn-linux"
 "net::drain" = "nn-linux"
 # post-plan (lab PR 224): the host's resolv.conf
 "net::resolvers" = "nn-linux"
-"net::tls_parser" = "nn-parse"
+# R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
+# re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # post-plan (lab PR 234): the OS CSPRNG
 "os_rng" = "nn-linux"
 "posture" = "nn-core"

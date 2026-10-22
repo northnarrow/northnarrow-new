@@ -106,7 +106,9 @@ sha2 = "0.11"
 # Sourced from RustCrypto (same maintainer org as the already-
 # trusted sha2 + ed25519-dalek + curve25519-dalek deps above) so
 # the workspace's "crypto deps under a single trusted maintainer"
-# invariant holds.
+# invariant holds. R06 (lab PR 242): JA3 left with the ClientHello parser
+# for nn-parse; the agent's own MD5 is the exec quarantine's RPM file
+# digests (execq/pkgtrust).
 md-5 = "0.11"
 rand = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
