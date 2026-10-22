@@ -81,7 +81,7 @@ nix = { version = "0.29", features = ["signal", "process"] }
 procfs = { version = "0.18", default-features = false }
 
 # Tappa 5: response executors
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 hkdf = "0.12"
 sha2 = "0.10"
 # Tappa 10 (N5): JA3 TLS fingerprint hashing. MD5 here is a
