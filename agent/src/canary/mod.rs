@@ -22,7 +22,9 @@
 //!   `agent/src/decision/rules/canary.rs` (K5).
 
 pub mod access_log;
-pub mod chain_lines;
+/// R05 shim (lab PR 241; removed in R17): the canary chains' line reader is
+/// nn-evidence's.
+pub use nn_evidence::chain_lines;
 pub mod detector;
 pub mod network;
 pub mod path_policy;

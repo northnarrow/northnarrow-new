@@ -87,12 +87,6 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::chain_host::{ChainHost, ChainSigner};
-/// The agent's signing key and its files: `crate::keys`' since R04a (lab
-/// PR 241), named here as they were until the shims go (R17).
-pub use crate::keys::{
-    read_signing_key, read_verifying_key, verifying_key_path, AgentSigningKey,
-    DEFAULT_SIGNING_KEY_PATH,
-};
 
 /// Default location of the tamper-evident audit log. Mirrors the
 /// `/etc/northnarrow/` install layout (`admin.pub`, `agent_id`).
@@ -312,7 +306,7 @@ impl PreviousRun {
     }
 }
 
-pub struct AuditLog<K = AgentSigningKey> {
+pub struct AuditLog<K> {
     path: PathBuf,
     /// `path` anchored to the directory fd taken at open (review entry 44):
     /// appends cannot be diverted by a later mount over the directory.

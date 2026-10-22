@@ -442,8 +442,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(l).unwrap()["n"]
                 .as_u64()
                 .unwrap()
-                % 2
-                == 0
+                .is_multiple_of(2)
         };
         let q = TailQuery {
             keep: Some(&even),

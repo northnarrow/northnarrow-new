@@ -64,7 +64,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
-use crate::audit::{AgentSigningKey, AuditEntryDraft, AuditLog};
+use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::chain_host::{ChainHost, ChainSigner};
 
 /// Pre-image prefix of a numbered `audit.log` row.
@@ -1085,7 +1085,7 @@ fn check_rotating<H: ChainHost>(
 // ── the anchor writer ───────────────────────────────────────────────
 
 /// Writes the head anchor for the running agent.
-pub struct Anchor<K = AgentSigningKey> {
+pub struct Anchor<K> {
     file: PathBuf,
     key: K,
     agent_id: [u8; 16],

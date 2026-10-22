@@ -80,7 +80,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
-use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
+use crate::audit::GENESIS_PREV_HASH;
 use crate::chain_host::{ChainHost, ChainSigner};
 
 /// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
@@ -868,7 +868,7 @@ struct PendingSeal {
 }
 
 /// Append-only, rotation-aware, signed chain writer for one log.
-pub struct RotatingChainLog<P, K = AgentSigningKey> {
+pub struct RotatingChainLog<P, K> {
     active_path: PathBuf,
     manifest_path: PathBuf,
     key: K,

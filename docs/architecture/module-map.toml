@@ -142,14 +142,16 @@ planned = false
 "admin_cli" = "nn-admin"
 "admin_socket" = "northnarrow-agent"
 "agent_id" = "nn-linux"
-"anchored" = "nn-evidence"
+# the Linux host's anchor of a log's directory (`/proc/self/fd`), behind
+# `chain_host::ChainHost::anchor`: not moved to nn-evidence with the chains
+# (R05, lab PR 241)
+"anchored" = "nn-linux"
 "anti_tamper" = "nn-linux"
 # the role parse and the UnlockToken verification; key loading stays Linux
 "anti_tamper::admin_auth" = "nn-proto"
 "anti_tamper::combat_allow" = "nn-core"
 "async_fd" = "nn-linux"
 "atomic_file" = "nn-linux"
-"audit" = "nn-evidence"
 # post-plan (lab PR 241, R04a): the audit log's writability before the
 # attach (`access(2)`), from `audit`
 "audit_preflight" = "nn-linux"
@@ -163,21 +165,13 @@ planned = false
 "build_info" = "northnarrow-agent"
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
-# post-plan (lab PR 178): the one reader of the canary chains' lines
-"canary::chain_lines" = "nn-evidence"
 "canary::detector" = "nn-core"
 "canary::readers" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
 "canary::templates" = "nn-core"
-"chain_anchor" = "nn-evidence"
-# post-plan (lab PR 241, R04a): what the chains need from their host (the
-# signer; the file operations)
-"chain_host" = "nn-evidence"
 # post-plan (lab PR 241, R04a): the chains' Linux file operations
 "chain_host_linux" = "nn-linux"
-"chain_tail" = "nn-evidence"
-"chainlog" = "nn-evidence"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
 # the admin socket's), the payload of each rotating log, the canary chains'
 # full checks, the anchoring and boot-verify tasks — from `chain_anchor`.
@@ -260,6 +254,24 @@ planned = false
 "upgrade_rollback" = "nn-linux"
 # post-plan (lab only): `--verifier-check`
 "verifier_check" = "nn-linux"
+
+# ── agent/src: the shims of R05 ───────────────────────────────────────
+# R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
+# their paths, without a file, in `lib.rs` and `canary/mod.rs` (plan §4.1
+# rule 2: `pub use nn_evidence::…`; the writers' aliases with the agent's
+# key as default and the key's names under `audit`; removed in R17). A
+# reference to one counts for nn-evidence.
+
+[shims.agent]
+"audit" = "nn-evidence"
+# post-plan (lab PR 178): the one reader of the canary chains' lines
+"canary::chain_lines" = "nn-evidence"
+"chain_anchor" = "nn-evidence"
+# post-plan (lab PR 241, R04a): what the chains need from their host (the
+# signer; the file operations)
+"chain_host" = "nn-evidence"
+"chain_tail" = "nn-evidence"
+"chainlog" = "nn-evidence"
 "verify_lines" = "nn-evidence"
 
 # ── common/src: module → crate (§2.4) ────────────────────────────────────
@@ -300,7 +312,7 @@ planned = false
 
 [ratchet]
 nn-admin = 8
-nn-core = 53
-nn-evidence = 1
+nn-core = 54
+nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

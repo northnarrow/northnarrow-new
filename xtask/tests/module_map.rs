@@ -11,6 +11,10 @@
 //! below it fails too until the ceiling comes down to it — so the number
 //! in the file is always the number of the tree.
 //!
+//! `[shims.<tree>]` (R05, lab PR 241) names the paths a tree keeps, without
+//! a file, for modules that moved to a crate (plan §4.1 rule 2): a
+//! reference to one counts for that crate.
+//!
 //! The scan is lexical, not a compiler's: comments, strings and char
 //! literals are blanked first, `#[cfg(test)]` and `#[cfg(kani)]` items and
 //! the files they declare are dropped, and `use` groups are expanded. It
@@ -437,9 +441,13 @@ fn references(text: &str, source: &str, module: &[String], bin: bool) -> BTreeSe
 /// the root's aliases; `None` when nothing maps it.
 fn crate_of(map: &ModuleMap, source: &str, path: &[String]) -> Option<(String, String)> {
     let modules = map.modules.get(source)?;
+    let shims = map.shims.get(source);
     for n in (1..=path.len()).rev() {
         let key = path[..n].join("::");
-        if let Some(c) = modules.get(&key) {
+        if let Some(c) = modules
+            .get(&key)
+            .or_else(|| shims.and_then(|s| s.get(&key)))
+        {
             return Some((key, c.clone()));
         }
     }
@@ -575,6 +583,17 @@ fn every_source_file_is_mapped_to_a_crate() {
             assert!(
                 found,
                 "module-map.toml [modules.{source}] `{key}`: no {dir}/{rel}.rs or {rel}/mod.rs"
+            );
+        }
+        // a shim is a path the tree keeps without a file (R05, lab PR 241)
+        for key in map.shims.get(*source).into_iter().flat_map(|m| m.keys()) {
+            let rel = key.replace("::", "/");
+            let file = root.join(dir).join(format!("{rel}.rs")).is_file()
+                || root.join(dir).join(&rel).join("mod.rs").is_file();
+            assert!(
+                !file && !map.modules[*source].contains_key(key),
+                "module-map.toml [shims.{source}] `{key}`: a shim has no file and no \
+                 [modules.{source}] entry"
             );
         }
     }
