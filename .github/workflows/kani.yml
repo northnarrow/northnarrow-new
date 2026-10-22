@@ -3,7 +3,7 @@
 # The fuzz job samples the input space of the parsers that read
 # attacker-written bytes; these proofs cover all of it for the
 # bounds-checking cores those parsers are built on:
-#   - net::tls_parser::Cursor — every ClientHello read goes through it
+#   - nn_parse::tls::Cursor — every ClientHello read goes through it
 #     (any buffer ≤ 8 bytes, any position, any length: no panic, the
 #     position never leaves the buffer; by induction any read sequence);
 #   - dns_qname::QnameLabels — the DNS name walk behind decode_dns_qname
@@ -25,7 +25,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - agent/src/net/tls_parser.rs
+      - crates/nn-parse/src/tls.rs
       - crates/nn-proto/src/admin_quorum.rs
       - crates/nn-parse/src/dns_qname.rs
       - .github/workflows/kani.yml
@@ -76,15 +76,15 @@ jobs:
       - name: Prove the end of a DNS name (nn-parse)
         run: cargo kani -p nn-parse --harness qname_wire_end_is_past_a_root_label
 
-      - name: Prove the TLS cursor (agent)
-        # The flag was added for a Candle dependency (pulp) carrying global
-        # asm, which Kani cannot model; pulp left with the LLM advisor in
-        # Wave 4 (lab PR 214). Kept until a run without it is confirmed
-        # (another dependency may carry some; the proved code reaches none).
+      - name: Prove the TLS cursor (nn-parse)
+        # R06 (lab PR 242): the parser left the agent for nn-parse, and the
+        # proof with it. `--ignore-global-asm` was the agent's (a Candle
+        # dependency, pulp, carried global asm Kani cannot model; it left
+        # with the LLM advisor, lab PR 214): nn-parse's graph (md-5, sha2,
+        # hex) needs no flag.
         run: >
-          cargo kani -p northnarrow-agent
+          cargo kani -p nn-parse
           --harness cursor_operations_never_panic_and_keep_pos_in_bounds
-          -Z unstable-options --ignore-global-asm
 
       - name: Prove the admin quorum rule (nn-proto, shared by agent and watchdog)
         run: >

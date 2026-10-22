@@ -22,4 +22,7 @@ pub mod drain;
 pub mod flow_tracker;
 pub mod limiter;
 pub mod resolvers;
-pub mod tls_parser;
+/// The ClientHello parser (JA3, JA4, SNI, ALPN): nn-parse's `tls` since R06
+/// of the Wave 4 restructure (lab PR 242), re-exported at the path the fuzz
+/// targets and `fuzz_api` name (until R17).
+pub use nn_parse::tls as tls_parser;

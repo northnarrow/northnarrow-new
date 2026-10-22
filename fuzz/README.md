@@ -95,15 +95,16 @@ pull request that touches a proved file — external audit SUP-023):
 
 | Proof | What it covers |
 |---|---|
-| `net::tls_parser::kani_proofs::cursor_operations_never_panic_and_keep_pos_in_bounds` | every `Cursor` read (`u8`, `u16`, `u24`, `bytes(n)` with any `n`) on any buffer ≤ 8 bytes from any position: no panic, the position never leaves the buffer — so any sequence of reads, i.e. the whole ClientHello parser, is in bounds |
+| `tls::kani_proofs::cursor_operations_never_panic_and_keep_pos_in_bounds` | every `Cursor` read (`u8`, `u16`, `u24`, `bytes(n)` with any `n`) on any buffer ≤ 8 bytes from any position: no panic, the position never leaves the buffer — so any sequence of reads, i.e. the whole ClientHello parser, is in bounds |
 | `dns_qname::kani_proofs::qname_label_walk_is_in_bounds_and_terminates` | the DNS name walk behind `decode_dns_qname` on any buffer ≤ 16 bytes: every label inside the buffer, at most `len` steps |
 | `dns_qname::kani_proofs::qname_wire_end_is_past_a_root_label` | the end of a name `qname_wire_end` reports, on any buffer ≤ 16 bytes: inside the buffer, just past a root label |
 | `admin_quorum::kani_proofs::quorum_accepts_only_enough_distinct_keys_carrying_every_role` | the admin multi-signature rule behind `verify_quorum` and `verify_signed_payload_quorum`, with the signature checks abstracted (any key or none per signature, any role set per key; up to 4 signatures, 3 keys, 2 roles, any threshold): it accepts only when at least `max(threshold, 1)` **distinct** keys matched and every required role is carried by one of them, and each refusal reports the truth |
 
 The pull-request filter names the files that hold proofs
-(`agent/src/net/tls_parser.rs`, `crates/nn-parse/src/dns_qname.rs` and
-`crates/nn-proto/src/admin_quorum.rs`, both common's until the Wave 4
-restructure's R02 and R03) and the workflow;
+(`crates/nn-parse/src/tls.rs`, the agent's `net/tls_parser.rs` until the
+Wave 4 restructure's R06; `crates/nn-parse/src/dns_qname.rs` and
+`crates/nn-proto/src/admin_quorum.rs`, both common's until R02 and R03)
+and the workflow;
 `xtask/tests/supply_chain.rs` keeps it equal to the files with a
 `#[kani::proof]` and checks that the workflow runs every harness. The DNS
 walk moved out of the event model (then `common/src/model.rs`, now
@@ -124,8 +125,7 @@ cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup
 cargo kani -p nn-parse --harness qname_label_walk_is_in_bounds_and_terminates
 cargo kani -p nn-parse --harness qname_wire_end_is_past_a_root_label
 cargo kani -p nn-proto --harness quorum_accepts_only_enough_distinct_keys_carrying_every_role
-cargo kani -p northnarrow-agent --harness cursor_operations_never_panic_and_keep_pos_in_bounds \
-    -Z unstable-options --ignore-global-asm
+cargo kani -p nn-parse --harness cursor_operations_never_panic_and_keep_pos_in_bounds
 ```
 
 Functions that build `String`s byte by byte are out of reach for the model

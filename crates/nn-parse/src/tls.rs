@@ -412,7 +412,7 @@ fn parse_client_hello_body(body: &[u8], complete: bool) -> Result<TlsClientHello
     // message holds before anything is allocated for it. (The check was
     // `> u16::MAX`, which a `u16` never is.)
     let cipher_suites_len = c.read_u16().ok_or(Short)? as usize;
-    if cipher_suites_len % 2 != 0 {
+    if !cipher_suites_len.is_multiple_of(2) {
         return Err(Bad);
     }
     if cipher_suites_len > c.remaining() {
@@ -643,7 +643,7 @@ fn extract_supported_versions(hello: &TlsClientHello) -> Vec<u16> {
         return Vec::new();
     };
     let bytes_len = bytes_len as usize;
-    if bytes_len % 2 != 0 || bytes_len != c.remaining() {
+    if !bytes_len.is_multiple_of(2) || bytes_len != c.remaining() {
         return Vec::new();
     }
     be_u16s(&ext.data[1..])

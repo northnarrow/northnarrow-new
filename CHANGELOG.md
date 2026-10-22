@@ -855,6 +855,46 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the moved files' paths (panic locations), log-callsite line numbers and
   the stamp hash. nn-admin's `--events` help still says `common::Event`,
   so that no output changes.
+- Wave 4 restructure, R06 — nn-parse (lab PR 242): the agent's TLS
+  ClientHello parser (`net/tls_parser.rs` → `crates/nn-parse/src/tls.rs`,
+  `git mv`, with its tests, the `crypto_vectors` JA3 pin and its Kani
+  proof) and `net/dns_cache`'s reply parser (`parse_a_records`,
+  `parse_aaaa_records` and the bounded walk, cut verbatim with their tests
+  into `crates/nn-parse/src/dns_records.rs`) moved to nn-parse, which now
+  holds every parser of the plan's §2.4 and takes md-5, sha2 and hex at
+  the agent's versions and features. The cache and its state stay in the
+  agent. Two lines of the parser changed: `x % 2 != 0` became
+  `!x.is_multiple_of(2)` (the same for the divisor 2), which the
+  workspace's clippy asks of nn-parse (the agent's SUP-015 exception kept
+  the lint off there). The agent re-exports both at their old paths
+  (`net::tls_parser`, `net::dns_cache::{parse_a_records,
+  parse_aaaa_records}`), so the fuzz targets and seeds are unchanged (the
+  shims go in R17). Pins added first, on `main`: the `tls_client_hello`
+  seeds parse to the same fields, SNI, ALPN, JA3 input, JA3 MD5 and JA4;
+  the `dns_records` seeds and regression to the same answers; a hostile
+  corpus of each (every prefix and xorshift mutants: 6,559 ClientHello and
+  4,354 DNS inputs) to the same outcome counts and the same SHA-256 over
+  every rendering. They moved with the code and pass there unchanged.
+  `kani.yml` proves the TLS cursor on `-p nn-parse` (path filter
+  `crates/nn-parse/src/tls.rs`), without the agent's
+  `--ignore-global-asm`. The ratchet stays at 77: the moved code named no
+  module of the agent. Identity against `main` c7bb346 (same path, the
+  release job's flags): the eBPF object and its stamp are byte-identical
+  (`common` is untouched), so is the scanner; the tarball's 72 entries and
+  the .deb's 79 paths and modes are the same; the golden replay, the 19
+  `crypto_vectors` tests and the test list (3,006, the 48 moved tests
+  found by name) are unchanged. No shipped binary links the moved parsers
+  (nothing feeds them yet: `TLS_FINGERPRINT_PRODUCER` is false, the DNS
+  parser has no observer). The others differ as nn-parse's new
+  dependencies make them: `main` rebuilt with md-5, sha2 and hex added to
+  nn-parse, no source changed, gives a watchdog byte-identical to this
+  lot's (2 of 2,469 functions differ from `main`'s, both `TypeId`
+  constants) and changes 11 functions of nn-admin and 24 of the agent the
+  same way (`TypeId`s, which of identical bodies keeps its name); the move
+  itself changes 2 more of nn-admin and 3 of the agent and keeps
+  `RawVec<&[u8]>::grow_one` out of line: the growth of `Vec<&[u8]>`, which
+  the parser's `alpn_values` shared with `RollbackFloor::scan` before.
+  `.rodata` holds the same text.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and
