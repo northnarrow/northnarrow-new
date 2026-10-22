@@ -151,8 +151,13 @@ kill targets the nearest foreign program (the script, the payload).
   `/dev/shm`): not below one, not beside a directory in one, not into one
   found beside or below. A world-writable directory without the sticky
   bit (a `0777` share) is walked: that is where an encryptor goes.
-  Residual: when the burst's own directory is a shared one, its copies are
-  counted whoever owns them (an owner match there is a follow-up).
+  When the burst's own directory is a shared one (the copy in `/tmp`
+  itself), only the copies owned by the uid the burst ran as count there
+  (lab PR 238), the copy the record names included, checked again on the
+  file opened: an encryptor's copies are new files, its own. Residual: an
+  encryptor that runs set-uid (its files owned by another uid than the one
+  the kernel records for the burst) has its copies in a shared directory
+  left out.
 - Residuals: an intruder in an interactive session who encrypts with
   packaged tools only (`openssl`, `gpg` from that session) is a trusted
   writer here; an encryptor that forks a new process every few files stays

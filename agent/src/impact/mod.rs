@@ -315,7 +315,7 @@ impl RansomTracker {
         // What this event shows, and the files to sample for (b).
         let mut shapes: Vec<(Signal, String)> = Vec::new();
         let mut sample: Option<String> = None;
-        let mut copies_of: Option<(String, Vec<String>)> = None;
+        let mut copies_of: Option<(String, Vec<String>, u32)> = None;
         match event {
             Event::MassWrite {
                 overwrites: true,
@@ -376,6 +376,7 @@ impl RansomTracker {
                 kind: FileBurstKind::Unlink,
                 count,
                 filename,
+                uid,
                 ..
             } => {
                 let mut st = self.state.lock();
@@ -396,7 +397,7 @@ impl RansomTracker {
                             common::wire::open_sensor::OPEN_MASS_WRITE_MIN
                         ),
                     ));
-                    copies_of = Some((filename.clone(), new));
+                    copies_of = Some((filename.clone(), new, *uid));
                 }
             }
             _ => {}
@@ -407,15 +408,17 @@ impl RansomTracker {
         // content: (b) on the copies themselves, never on the originals
         // still waiting beside them (lab, MS-23 copy-delete). A copy of
         // plain content is a backup, a compressed one a rotation: not
-        // counted.
+        // counted. In a directory shared by everyone (`/tmp`) only the
+        // copies of the uid the burst ran as count (lab PR 238).
         let mut copy_checked = false;
-        if let Some((deleted, new)) = &copies_of {
+        if let Some((deleted, new, uid)) = &copies_of {
             if let Some((copy, suffix)) = copy_beside(deleted, new) {
                 copy_checked = true;
                 self.counters.samplings.fetch_add(1, Ordering::Relaxed);
-                let s = self.sampler.sample_copies(
+                let s = self.sampler.sample_copies_by(
                     &copy,
                     &suffix,
+                    *uid,
                     Duration::from_nanos(RANSOM_WINDOW_NS),
                 );
                 if s.holds() {

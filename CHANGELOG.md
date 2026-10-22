@@ -408,6 +408,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   format differs from its `.meta`'s is refused with that reason before
   anything is decrypted or written. The vectors of lab PR 230 and the v1
   vault fixture pass unchanged; the v2 record is pinned too.
+- NN-L-IMP-001's copy-delete evidence counted, in a world-writable sticky
+  directory that was the burst's own (`/tmp`, `/var/tmp`, `/dev/shm`), the
+  copies of whoever owned them (lab PR 238, the residual of lab PR 232):
+  another user's fresh copies of ciphertext there, or copies planted to
+  have a benign job judged an encryptor, made the burst decisive. There,
+  only the copies owned by the uid the burst ran as count now, the copy
+  the record names included (checked on the file opened); an encryptor's
+  copies are new files, its own. Ordinary directories, a `0777` share
+  included, are unchanged.
 - Rule shadowing (lab PR 236): NN-L-FIM-023 (systemd timer) was never
   reached behind NN-L-FIM-009 — both now match a `.timer`; a new
   `authorized_keys` under `/home` was NN-L-FIM-002's record and
