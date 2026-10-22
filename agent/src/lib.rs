@@ -95,6 +95,9 @@ pub mod keys;
 pub mod loop_progress;
 pub mod net;
 pub mod os_rng;
+/// The text of the open sensor's paths (from `sensors::open_sensor`, R04b,
+/// lab PR 241).
+pub mod path_text;
 pub mod posture;
 pub mod process_hardening;
 pub mod removed_settings;

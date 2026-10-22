@@ -1104,48 +1104,10 @@ pub fn mount_points(mountinfo: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn unescape_octal(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 4 <= b.len()
-            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
-        {
-            let v = u32::from(b[i + 1] - b'0') * 64
-                + u32::from(b[i + 2] - b'0') * 8
-                + u32::from(b[i + 3] - b'0');
-            if let Ok(byte) = u8::try_from(v) {
-                out.push(byte);
-                i += 4;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Marks a component the kernel may have cut (a slot holds at most
-/// `OPEN_PATH_SLOT_LEN - 1` bytes), and a path that is not placed on a
-/// mount point.
-pub const CUT_MARK: char = '…';
-/// A component the kernel could not read (an empty slot).
-pub const UNREAD_COMPONENT: &str = "?";
-
-/// External audit SNS-005/SNS-006: whether `path`, as [`events_of`] renders
-/// it, names one host file exactly: absolute (placed on a mount point),
-/// with no cut and no unread component. Anything else is not comparable
-/// for equality with a host path, and the consumers fall back on the
-/// kernel's class (`Event::FileOpen::kernel_class`). A file whose own name
-/// holds the marks only turns that fallback on.
-pub fn path_is_exact(path: &str) -> bool {
-    path.starts_with('/')
-        && !path.contains(CUT_MARK)
-        && !path.split('/').any(|c| c == UNREAD_COMPONENT)
-}
+pub(crate) use crate::path_text::unescape_octal;
+/// The text of the paths this sensor renders, shared with their readers:
+/// `crate::path_text`'s since R04b (lab PR 241), named here as before.
+pub use crate::path_text::{path_is_exact, CUT_MARK, UNREAD_COMPONENT};
 
 /// The record's path components, leaf → root. External audit SNS-006: a
 /// name of `OPEN_PATH_SLOT_LEN - 1` bytes may have been cut (a longer name
@@ -1242,18 +1204,6 @@ fn file_capability(r: &OpenRecordRaw) -> FileCapability {
 fn unplaced_path(r: &OpenRecordRaw, rel: &str) -> String {
     let (major, minor) = (r.root_dev >> 20, r.root_dev & 0xF_FFFF);
     format!("mnt[{major}:{minor}:{}]{rel}", r.root_ino)
-}
-
-/// Lab PR 175: the `(major, minor)` of the filesystem an [`unplaced_path`]
-/// names, as field 3 of `/proc/<pid>/mountinfo` shows it; `None` for any
-/// other path.
-pub(crate) fn unplaced_root_dev(path: &str) -> Option<(u32, u32)> {
-    let inner = path.strip_prefix("mnt[")?.split_once(']')?.0;
-    let mut it = inner.splitn(3, ':');
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next()?.parse().ok()?;
-    it.next()?.parse::<u64>().ok()?;
-    Some((major, minor))
 }
 
 /// The events one record stands for.
@@ -1665,6 +1615,7 @@ mod tests {
     /// Lab PR 175: an unplaced path names its filesystem as mountinfo does.
     #[test]
     fn an_unplaced_path_names_its_filesystem() {
+        use crate::path_text::unplaced_root_dev;
         let r = record(
             open_reason::MASS_WRITE,
             &["x", "lib", "/"],

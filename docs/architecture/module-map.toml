@@ -232,6 +232,10 @@ planned = false
 "net::tls_parser" = "nn-parse"
 # post-plan (lab PR 234): the OS CSPRNG
 "os_rng" = "nn-linux"
+# post-plan (lab PR 241, R04b): the text of the open sensor's paths (cut and
+# unread marks, an exact path, an unplaced path's device, mountinfo's
+# escapes), from `sensors::open_sensor`: the event's vocabulary
+"path_text" = "nn-model"
 "posture" = "nn-core"
 # post-plan (lab PR 216): no core dump, no readable memory
 "process_hardening" = "nn-linux"
@@ -311,7 +315,7 @@ planned = false
 
 [ratchet]
 nn-admin = 8
-nn-core = 54
+nn-core = 52
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3
