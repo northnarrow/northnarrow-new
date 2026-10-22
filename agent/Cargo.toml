@@ -95,7 +95,7 @@ sha2 = "0.10"
 # the workspace's "crypto deps under a single trusted maintainer"
 # invariant holds.
 md-5 = "0.10"
-rand = "0.8"
+rand = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
