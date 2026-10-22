@@ -82,7 +82,7 @@ procfs = { version = "0.18", default-features = false }
 
 # Tappa 5: response executors
 aes-gcm = "0.10"
-hkdf = "0.12"
+hkdf = "0.13"
 sha2 = "0.10"
 # Tappa 10 (N5): JA3 TLS fingerprint hashing. MD5 here is a
 # threat-intel fingerprint compatibility primitive (JA3 spec,
