@@ -4,7 +4,7 @@
 //! ## What this proves (the §4 kernel-ID stability invariant)
 //!
 //! The commit-#1 → commit-#2 regression was: `EbpfLoader::map_pin_path`
-//! is consulted by aya **only** for maps whose ELF def carries
+//! (`default_map_pin_directory` since aya 0.14) is consulted by aya **only** for maps whose ELF def carries
 //! `LIBBPF_PIN_BY_NAME` (`aya-0.13.1` `bpf.rs:494`). The six
 //! anti-tamper maps were declared with the non-pinning constructors,
 //! so every agent boot created a *fresh* kernel `PROTECTED_PIDS`

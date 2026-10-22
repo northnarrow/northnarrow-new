@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-aya-obj = "0.2"
+aya-obj = "0.3"
 # Shared eBPF-object provenance logic. xtask writes the build stamp;
 # agent/build.rs verifies it. Same crate on both sides so the hash is
 # computed identically (see ebpf-guard crate docs).

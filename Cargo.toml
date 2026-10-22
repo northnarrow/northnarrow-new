@@ -41,8 +41,7 @@ clap = { version = "4", features = ["derive", "env"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 # eBPF userland
-aya = "0.13"
-aya-log = "0.2"
+aya = "0.14"
 
 [profile.release]
 # Sub-tappa 6.8 bumped LTO from "thin" to "fat" for the on-host LLM

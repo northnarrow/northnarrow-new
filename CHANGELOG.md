@@ -629,6 +629,34 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- aya 0.13.1 → 0.14.0 in userland, with aya-obj 0.2.1 → 0.3.0 (lab PR 231,
+  Wave 4 phase 2, D1a; supersedes Dependabot #363). aya-log is removed
+  instead of bumped: the eBPF object has no `AYA_LOGS` map, so its init
+  failed at every start with a debug line, and nothing else used it. The
+  loader follows 0.14's API with the same effect: `map_max_entries` for the
+  exploit guard's task maps, `default_map_pin_directory` for the pin root
+  (maps pinned by name under it, an existing pin reused). The BPF guard's
+  `map_data` covers the nine new `Map` variants, and the map types the
+  embedded object is held to are re-read from 0.14's `parse_map`: 29, up
+  from 20, still without task storage. The kernel side (aya-ebpf 0.1.1) is
+  unchanged, and the eBPF object is byte-identical to `main`'s. Both
+  lockfiles lose aya-log, aya-log-common, thiserror 1, core-error,
+  num_enum and allocator-api2, and take object 0.39.1 (from 0.36) and
+  foldhash 0.2; `Cargo.lock` also loses windows-sys 0.52/0.59, and
+  `fuzz/Cargo.lock` hashbrown 0.15. The MSRV stays 1.89. Detection,
+  response and the programs the kernel loads do not change. One memory
+  fix comes with the bump: aya-obj 0.3's `BtfType` is 72 bytes (48 in
+  0.2.1), and glibc kept the pages that the boot's vmlinux BTF parses
+  freed. The perf gate measured the idle agent 17 MB larger than `main`
+  on the same guest (`agent_rss_idle_kib` +47.5 %, `agent_rss_load_kib`
+  +37.7 %, both REGRESSION). The agent now calls `malloc_trim(0)` once
+  after READY (`boot::release_boot_heap`, glibc only), which returns only
+  free memory. Lab: the eBPF object (sha256 `243a806b…`) and every
+  program's verifier result and count are the same as `main`'s on 5.15,
+  6.1, 6.8 and 6.12. The agent reaches L3 with no degradation on all
+  four. On 24.04 the upgrade from `main` passes, the privileged suites
+  pass (80 passed, 0 failed) and the perf gate reports 0 regressions
+  against the committed baseline.
 - The ADE is a consultant: a model verdict that names a response (Kill,
   KillTree, Quarantine, BlockNetwork, Isolate) is recorded as a
   recommendation — a detection with the model's reasoning, response

@@ -928,25 +928,35 @@ pub fn spawn_link_self_check(audit_log: Option<Arc<parking_lot::Mutex<AuditLog>>
     });
 }
 
-/// The `MapData` behind any `Map` variant (aya 0.13 exposes `info()` on
-/// `MapData` only).
+/// The `MapData` behind any `Map` variant (aya 0.14 exposes `info()` on
+/// `MapData` only, and `Map` is neither `#[non_exhaustive]` nor has an
+/// accessor: an aya upgrade that adds a variant fails to compile here).
 fn map_data(m: &Map) -> &MapData {
     match m {
         Map::Array(d)
+        | Map::ArrayOfMaps(d)
         | Map::BloomFilter(d)
+        | Map::CgroupArray(d)
+        | Map::CgroupStorage(d)
+        | Map::CgrpStorage(d)
         | Map::CpuMap(d)
         | Map::DevMap(d)
         | Map::DevMapHash(d)
         | Map::HashMap(d)
+        | Map::HashOfMaps(d)
+        | Map::InodeStorage(d)
         | Map::LpmTrie(d)
         | Map::LruHashMap(d)
         | Map::PerCpuArray(d)
+        | Map::PerCpuCgroupStorage(d)
         | Map::PerCpuHashMap(d)
         | Map::PerCpuLruHashMap(d)
         | Map::PerfEventArray(d)
         | Map::ProgramArray(d)
         | Map::Queue(d)
+        | Map::ReusePortSockArray(d)
         | Map::RingBuf(d)
+        | Map::SkStorage(d)
         | Map::SockHash(d)
         | Map::SockMap(d)
         | Map::Stack(d)

@@ -164,16 +164,16 @@ impl SensorMultiplexer {
         // Lab PR 219: the exploit guard's task maps. Strict's sized from
         // pid_max (or --exploit-guard-tasks), not preallocated; lite's (an
         // LRU map, always preallocated) bounded, one entry unless lite runs.
-        loader.set_max_entries(
+        loader.map_max_entries(
             crate::sensors::epg::STRICT_TASKS_MAP,
             crate::sensors::epg::task_map_entries_for_load(),
         );
-        loader.set_max_entries(
+        loader.map_max_entries(
             crate::sensors::epg::LITE_TASKS_MAP,
             crate::sensors::epg::lite_task_map_entries_for_load(),
         );
         if let Some(root) = pin_root {
-            loader.map_pin_path(root);
+            loader.default_map_pin_directory(root);
             debug!(
                 path = %root.display(),
                 "anti-tamper: anti-tamper maps will be by-name pinned to bpffs"
@@ -215,9 +215,6 @@ impl SensorMultiplexer {
             );
         }
 
-        if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-            debug!(?e, "aya-log not initialised (no logger map exported)");
-        }
         crate::sensors::ring_drops::install(&mut ebpf);
         // Lab PR 215: the deny hooks' fail-open counters.
         crate::anti_tamper::fail_open::install(&mut ebpf);

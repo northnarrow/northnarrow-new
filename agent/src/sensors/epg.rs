@@ -8,8 +8,8 @@
 //!   call in progress; the use points (LSM `capable`, `bprm_check_security`,
 //!   a filtered `file_open`) compare the task's objective credential and
 //!   `nsproxy` with the ones its mechanisms last gave it, kept in an LRU
-//!   task map keyed by `task_struct` address (aya 0.13 cannot load task
-//!   storage). The map is preallocated and sized here at load
+//!   task map keyed by `task_struct` address (aya cannot load task
+//!   storage, 0.13 nor 0.14). The map is preallocated and sized here at load
 //!   ([`lite_task_map_entries`]); a record it evicts is re-taken, counted
 //!   (`baselines_lost`) and attested, and one that holds privilege is
 //!   recorded as degraded evidence.
@@ -303,7 +303,7 @@ pub fn set_task_map_entries(requested: Option<u32>, v: Variant) {
     LITE_MAP_ENTRIES.store(lite, Ordering::Relaxed);
 }
 
-/// The size the loader gives strict's task map (`EbpfLoader::set_max_entries`).
+/// The size the loader gives strict's task map (`EbpfLoader::map_max_entries`).
 pub fn task_map_entries_for_load() -> u32 {
     match TASK_MAP_ENTRIES.load(Ordering::Relaxed) {
         0 => task_map_entries(None, pid_max()),
@@ -966,7 +966,7 @@ mod tests {
     }
 
     /// Lab PR 219: the embedded eBPF object declares lite's task map as an
-    /// LRU hash (type 9, which aya 0.13 loads: lite's first map, task
+    /// LRU hash (type 9, which aya loads: lite's first map, task
     /// storage, parsed here but made the agent refuse to start, "Unsupported
     /// map type found 29") keyed by the `task_struct` address with the
     /// `LiteState` value, strict's map not preallocated, and every program

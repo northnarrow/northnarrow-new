@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use aya::{maps::ring_buf::RingBuf, programs::TracePoint, Ebpf, EbpfLoader};
 use common::{wire::ProcessSpawnRaw, Event};
 use tokio::{sync::mpsc, task::JoinHandle};
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 /// Compiled eBPF object, embedded once in [`crate::sensors::ebpf_object`]
 /// (the single embed site + boot preflight). Re-used here so both
@@ -60,12 +60,6 @@ impl ExecSensor {
             .btf(None)
             .load(EBPF_BYTES)
             .with_context(|| "loading eBPF object (BTF, maps, programs)")?;
-
-        // Try to wire up aya-log; it's a no-op if the eBPF program
-        // doesn't ship a logger map, so any error is non-fatal.
-        if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-            debug!(?e, "aya-log not initialised (no logger map exported)");
-        }
 
         // The kernel offsets the program reads (task->mm, mm->arg_start …)
         // from THIS kernel's BTF, resolved and armed as the agent's boot and
