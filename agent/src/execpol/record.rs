@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::wire::execpol::{action, env_flags, kind, tier, ExecPolRaw};
 use common::wire::execq::class;
-use common::{Event, ExeIdentity, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ExeIdentity, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 use tracing::warn;
 
@@ -168,7 +168,7 @@ fn values(raw: &ExecPolRaw) -> Vec<String> {
         if f & bit != 0 {
             out.push(format!(
                 "{name}={}",
-                common::log_escape::Escaped(&cstr(buf))
+                nn_model::log_escape::Escaped(&cstr(buf))
             ));
         }
     };
@@ -181,7 +181,7 @@ fn values(raw: &ExecPolRaw) -> Vec<String> {
         let shown: String = v.chars().take(96).collect();
         out.push(format!(
             "GLIBC_TUNABLES={} ({} bytes read{})",
-            common::log_escape::Escaped(&shown),
+            nn_model::log_escape::Escaped(&shown),
             raw.tunables_len,
             if raw.tunables_len as usize >= common::wire::execpol::ENV_TUNABLES_LEN - 1 {
                 ", cut"
@@ -497,7 +497,7 @@ impl Repeats {
 /// budget.
 pub struct SinkRecorder {
     pub sink: Option<DetectionSink>,
-    pub posture: Box<dyn Fn() -> common::posture_types::PostureKind + Send>,
+    pub posture: Box<dyn Fn() -> nn_model::posture_types::PostureKind + Send>,
 }
 
 impl Recorder for SinkRecorder {
@@ -514,7 +514,7 @@ impl Recorder for SinkRecorder {
                 rule = %rec.verdict.rule_id,
                 severity = ?rec.verdict.severity,
                 target_pid = rec.verdict.event_pid,
-                target_filename = %common::log_escape::Escaped(&rec.verdict.event_filename),
+                target_filename = %nn_model::log_escape::Escaped(&rec.verdict.event_filename),
                 decision = %rec.evidence.decision,
                 tier = %rec.evidence.tier,
                 "VERDICT (exec policy)"

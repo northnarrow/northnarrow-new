@@ -380,7 +380,7 @@ fn a_clean_new_binary_is_resumed_cached_and_recorded_once() {
     );
     let r = &w.records()[0];
     assert_eq!(r.verdict.rule_id, crate::execq::RULE_ID);
-    assert_eq!(r.verdict.severity, common::Severity::Low);
+    assert_eq!(r.verdict.severity, nn_model::Severity::Low);
     assert_eq!(r.evidence.verdict, "clean");
     assert_eq!(r.evidence.decision, "resume");
     assert_eq!(r.response, "resumed");
@@ -430,8 +430,8 @@ fn a_blocklisted_binary_is_killed_and_quarantined() {
         "not killed"
     );
     let r = &w.records()[0];
-    assert_eq!(r.verdict.severity, common::Severity::Critical);
-    assert_eq!(r.verdict.action, common::ResponseAction::Quarantine);
+    assert_eq!(r.verdict.severity, nn_model::Severity::Critical);
+    assert_eq!(r.verdict.action, nn_model::ResponseAction::Quarantine);
     assert_eq!(r.evidence.verdict, "malicious");
     assert!(r.evidence.reasons[0].contains("nn-lab-test-elf"));
     assert!(
@@ -470,7 +470,7 @@ fn no_scanner_means_the_default_policy_without_waiting_the_budget() {
         r.evidence.basis
     );
     assert!(r.evidence.basis.contains("default policy (resume)"));
-    assert_eq!(r.verdict.severity, common::Severity::Medium);
+    assert_eq!(r.verdict.severity, nn_model::Severity::Medium);
     assert_eq!(r.response, "resumed");
     assert!(w.k.0.lock().known.is_empty());
 }
@@ -790,7 +790,7 @@ fn a_refused_script_is_recorded_and_nothing_is_signalled() {
     assert_eq!(recs.len(), 1, "{recs:?}");
     let r = &recs[0];
     assert_eq!(r.evidence.decision, "refuse");
-    assert_eq!(r.verdict.severity, common::Severity::Medium);
+    assert_eq!(r.verdict.severity, nn_model::Severity::Medium);
     assert!(
         r.response.starts_with("refused at exec (EACCES)"),
         "{}",

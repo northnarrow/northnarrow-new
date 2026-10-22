@@ -8,13 +8,13 @@
 //!   skew; an attacker should not be able to force a posture
 //!   down-shift by tampering with the host clock.
 //! - The serializable, audit-friendly shape lives in
-//!   [`common::posture_types::PostureKind`]; this enum carries the
+//!   [`nn_model::posture_types::PostureKind`]; this enum carries the
 //!   timing/lock fields that the runtime needs but that don't belong
 //!   on the wire.
 
 use std::time::Instant;
 
-use common::posture_types::PostureKind;
+use nn_model::posture_types::PostureKind;
 
 /// Live posture, including timing fields used for decay.
 ///

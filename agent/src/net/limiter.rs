@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::wire::NetFlowEvent;
+use nn_model::telemetry::NetFlowEvent;
 use parking_lot::Mutex;
 use tracing::warn;
 
@@ -196,7 +196,7 @@ impl RuleGate {
             warn!(
                 uid = ev.uid,
                 pid = ev.pid,
-                comm = %common::log_escape::Escaped(&ev.comm),
+                comm = %nn_model::log_escape::Escaped(&ev.comm),
                 burst = self.pacer.burst,
                 per_sec = (Duration::from_secs(1).as_nanos()
                     / self.pacer.refill_every.as_nanos().max(1)) as u64,

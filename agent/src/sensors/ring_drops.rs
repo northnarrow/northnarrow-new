@@ -267,7 +267,7 @@ fn raise_telemetry_loss(lost: &[(&'static str, u64)]) {
     let reason = format!("security ring events dropped in {SAMPLE_SECS} s: {what}");
     if let Some(state) = sink
         .posture
-        .raise_signal(common::posture_types::TriggerType::TelemetryLoss, &reason)
+        .raise_signal(nn_model::posture_types::TriggerType::TelemetryLoss, &reason)
     {
         warn!(
             state = %state.kind(),

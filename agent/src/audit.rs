@@ -760,7 +760,7 @@ impl AuditLog {
                 IdentitySource::Unavailable(_) => "unusable",
             };
             tracing::error!(
-                from = %common::log_escape::Escaped(&from),
+                from = %nn_model::log_escape::Escaped(&from),
                 to = %to,
                 source,
                 path = %file,

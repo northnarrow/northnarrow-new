@@ -18,7 +18,7 @@
 //!   fed what no rule matched to an on-host LLM advisor; it was removed in
 //!   Wave 4, lab PR 214, and detection stays deterministic.)
 
-use common::{Event, Verdict};
+use nn_model::{Event, Verdict};
 
 pub mod attack;
 pub mod bounded;

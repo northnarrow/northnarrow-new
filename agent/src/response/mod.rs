@@ -26,7 +26,7 @@ pub use executor::Executor;
 
 use std::time::Duration;
 
-use common::ResponseAction;
+use nn_model::ResponseAction;
 
 /// Outcome of a single execution attempt.
 ///

@@ -10,7 +10,7 @@
 //! (the caller's path stands in only where the kernel's is unknown, as in
 //! the tracepoint mode).
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};

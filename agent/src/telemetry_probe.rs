@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use common::Event;
+use nn_model::Event;
 use parking_lot::Mutex;
 use rand::rngs::SysRng;
 use rand::TryRng;

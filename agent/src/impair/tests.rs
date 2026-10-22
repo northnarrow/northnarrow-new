@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
-use common::wire::{FimEvent, FimOp};
-use common::{Event, ExeIdentity};
+use nn_model::telemetry::{FimEvent, FimOp};
+use nn_model::{Event, ExeIdentity};
 use tempfile::TempDir;
 
 use super::*;

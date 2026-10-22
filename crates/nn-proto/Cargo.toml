@@ -22,7 +22,9 @@ publish = false
 debug-trigger = []
 
 [dependencies]
-common = { workspace = true }
+# R02 (lab PR 240): `PostureKind` is nn-model's (it was `common`'s, the one
+# item of `common` these modules named).
+nn-model = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 # Serde's auto-derive supports `[T; N]` only up to N=32 in stable;

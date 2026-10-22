@@ -659,15 +659,22 @@ fn the_scan_reads_paths_the_way_rust_does() {
     .into_iter()
     .collect();
     assert_eq!(got, want);
-    // the root's aliases: common::Event is the model's
-    let map = module_map();
+    // the root's aliases: an item of a tree's root is its module's (R00's
+    // `common::Event` → model; common has no root item since R02, lab PR
+    // 240, and no alias table)
+    let mut map = module_map();
+    assert!(map.aliases.get("common").is_none_or(|a| a.is_empty()));
     assert_eq!(
-        crate_of(&map, "common", &m("Event")).map(|(_, c)| c),
-        Some("nn-model".to_string())
+        crate_of(&map, "common", &m("wire::FimDriftRaw")).map(|(_, c)| c),
+        Some("northnarrow-common".to_string())
+    );
+    map.aliases.insert(
+        "common".into(),
+        [("Event".to_string(), "wire".to_string())].into(),
     );
     assert_eq!(
-        crate_of(&map, "common", &m("decode_dns_qname")).map(|(_, c)| c),
-        Some("nn-parse".to_string())
+        crate_of(&map, "common", &m("Event")).map(|(k, _)| k),
+        Some("wire".to_string())
     );
     assert_eq!(
         crate_of(&map, "agent", &m("fim::drain::Drain")).map(|(k, _)| k),

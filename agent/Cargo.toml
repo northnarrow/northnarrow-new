@@ -61,6 +61,11 @@ common = { workspace = true }
 # Wave 4 restructure, R03 (lab PR 240): the admin protocol, the signed
 # payloads, the quorum, the shutdown marker and the watchdog hold.
 nn-proto = { workspace = true }
+# R02 (lab PR 240): the event model, the posture types, the network
+# addresses, log escaping and the decoded telemetry records (nn-model); the
+# QNAME walk (nn-parse).
+nn-model = { workspace = true }
+nn-parse = { workspace = true }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
 # crate directly without pulling the rest of `agent` —

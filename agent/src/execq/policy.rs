@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use common::execq::ScanVerdict;
 use common::wire::execq::known_verdict;
-use common::Severity;
+use nn_model::Severity;
 
 /// What is done to the held process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

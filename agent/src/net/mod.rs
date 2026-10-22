@@ -12,8 +12,8 @@
 //!   - N4: `dns_cache` — PID-keyed 5-min TTL DNS-to-flow attribution.
 //!   - N5: `tls_parser` — JA3/JA4/SNI/ALPN from ClientHello.
 //!
-//! [`NetFlowEvent`]: northnarrow_common::wire::NetFlowEvent
-//! [`NetListenerEvent`]: northnarrow_common::wire::NetListenerEvent
+//! [`NetFlowEvent`]: nn_model::telemetry::NetFlowEvent
+//! [`NetListenerEvent`]: nn_model::telemetry::NetListenerEvent
 
 pub mod blind_spots;
 pub mod blocklist;

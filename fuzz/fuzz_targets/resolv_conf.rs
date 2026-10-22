@@ -16,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     assert!(got.len() <= 16, "{} resolvers", got.len());
     for (i, ip) in got.iter().enumerate() {
         assert!(!got[..i].contains(ip), "{ip} twice");
-        assert_eq!(northnarrow_common::netaddr::canonical(*ip), *ip);
+        assert_eq!(nn_model::netaddr::canonical(*ip), *ip);
         let named = text.lines().any(|l| {
             let mut w = l.split_whitespace();
             w.next() == Some("nameserver")
@@ -24,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
                     a.split('%')
                         .next()
                         .and_then(|a| a.parse::<std::net::IpAddr>().ok())
-                        .is_some_and(|a| northnarrow_common::netaddr::canonical(a) == *ip)
+                        .is_some_and(|a| nn_model::netaddr::canonical(a) == *ip)
                 })
         });
         assert!(named, "{ip} is no nameserver line of the text");

@@ -4100,7 +4100,7 @@ mod tests {
     /// needing a real agent.
     #[tokio::test(flavor = "current_thread")]
     async fn ping_agent_status_round_trips_through_mock_server() {
-        use common::posture_types::PostureKind;
+        use nn_model::posture_types::PostureKind;
         use nn_proto::admin_protocol::StatusResponse;
 
         let dir = TempDir::new().unwrap();
@@ -4232,7 +4232,7 @@ mod tests {
     /// the agent counted every ping as a timeout.
     #[tokio::test(flavor = "current_thread")]
     async fn a_ping_does_not_depend_on_the_status_fields() {
-        use common::posture_types::PostureKind;
+        use nn_model::posture_types::PostureKind;
         use nn_proto::admin_protocol::{StatusResponse, STATUS_RESPONSE_INDEX};
         // The first agents' reply, as postcard writes it: the variant, then
         // posture Combat (3), isolation engaged (1), last admin action
@@ -4534,7 +4534,7 @@ mod tests {
     /// status reply and returns the agent's count.
     #[tokio::test(flavor = "current_thread")]
     async fn the_ping_reads_the_loop_progress_after_the_status() {
-        use common::posture_types::PostureKind;
+        use nn_model::posture_types::PostureKind;
         use nn_proto::admin_protocol::{LoopProgressResponse, StatusResponse};
         let dir = TempDir::new().unwrap();
         let socket = dir.path().join("mock.sock");

@@ -3,7 +3,7 @@
 //! Lab PR 166: the executable is the payload itself, so the response is
 //! the tree, as for R001.
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};

@@ -4,7 +4,7 @@
 //! heuristics) escalates to ENGAGED on its own and reaches COMBAT only
 //! with a SECOND distinct escalation signal within
 //! [`CORROBORATION_WINDOW`]. Decisive triggers (kernel-adjudicated,
-//! [`common::posture_types::Confidence::Decisive`]) bypass this and
+//! [`nn_model::posture_types::Confidence::Decisive`]) bypass this and
 //! reach COMBAT immediately. Lab PR 225: so would the ransomware
 //! combination (`RansomwareEncryption`: two independent shapes of one
 //! actor's file activity, its own corroboration), decisive without being
@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use common::posture_types::{EvidenceClass, TriggerType};
+use nn_model::posture_types::{EvidenceClass, TriggerType};
 
 /// Calibration knob (NOT a fixed constant — tune on the VM). Window in
 /// which a second distinct escalation signal corroborates a blunt

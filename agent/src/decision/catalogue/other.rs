@@ -1,7 +1,7 @@
 //! The canary, chain, io_uring, BPF, anti-tamper, exploit guard and security-tool
 //! rules.
 
-use common::{ResponseAction, Severity};
+use nn_model::{ResponseAction, Severity};
 
 use super::RuleDoc;
 use crate::detection_store::Sensor;

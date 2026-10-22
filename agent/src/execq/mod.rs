@@ -33,7 +33,7 @@ use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 use common::wire::execq::{class, mode};
-use common::Event;
+use nn_model::Event;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 

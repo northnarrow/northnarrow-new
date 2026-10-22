@@ -290,7 +290,7 @@ fn parse_cidr(s: &str) -> Result<(IpAddr, u8), String> {
 /// (external audit NET-001: an IPv4-mapped IPv6 address is the IPv4
 /// address it maps).
 fn to_ipaddr(dst: &[u8; 16], family: u8) -> IpAddr {
-    common::netaddr::canonical_ip(family, dst)
+    nn_model::netaddr::canonical_ip(family, dst)
 }
 
 /// v4/v6 CIDR containment (same masking as `net::blocklist`). Cross-

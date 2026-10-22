@@ -335,7 +335,7 @@ pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> 
     if cfg.dry_run {
         info!(
             pid = target_pid,
-            path = %common::log_escape::Escaped(&original_str),
+            path = %nn_model::log_escape::Escaped(&original_str),
             "dry-run: would quarantine binary"
         );
         return ExecutionOutcome::WouldExecute { pid: target_pid };
@@ -346,7 +346,7 @@ pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> 
             info!(
                 pid = target_pid,
                 vault_id = %vault_id,
-                path = %common::log_escape::Escaped(&original_str),
+                path = %nn_model::log_escape::Escaped(&original_str),
                 "quarantined binary"
             );
             ExecutionOutcome::Quarantined {
@@ -358,7 +358,7 @@ pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> 
         Err(QuarantineError::PathSwapped) => {
             warn!(
                 pid = target_pid,
-                path = %common::log_escape::Escaped(&original_str),
+                path = %nn_model::log_escape::Escaped(&original_str),
                 "the binary's path no longer names the file the process ran (a directory \
                  swapped for a link?) — vaulted, not removed"
             );
@@ -370,7 +370,7 @@ pub fn quarantine_handle(handle: &ExeHandle, pid: u32, cfg: &ExecutorConfig) -> 
         Err(QuarantineError::ProtectedPath) => {
             warn!(
                 pid = target_pid,
-                path = %common::log_escape::Escaped(&original_str),
+                path = %nn_model::log_escape::Escaped(&original_str),
                 "binary lives under a protected system prefix; refusing to quarantine (kill-only)"
             );
             ExecutionOutcome::Refused {
@@ -584,7 +584,7 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
 
     info!(
         vault_id,
-        out = %common::log_escape::Escaped(out_path.display()),
+        out = %nn_model::log_escape::Escaped(out_path.display()),
         size = plaintext.len(),
         "restored quarantined file (mode 0600)"
     );
@@ -782,7 +782,7 @@ fn remove_verified(path: &Path, handle: &ExeHandle) -> Result<(), QuarantineErro
     // SAFETY: the same directory fd and name as the openat above.
     if unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), 0) } != 0 {
         let e = std::io::Error::last_os_error();
-        warn!(error = %e, path = %common::log_escape::Escaped(path.display()), "remove original failed; chmod 000");
+        warn!(error = %e, path = %nn_model::log_escape::Escaped(path.display()), "remove original failed; chmod 000");
         target.set_permissions(fs::Permissions::from_mode(0o000))?;
     }
     Ok(())

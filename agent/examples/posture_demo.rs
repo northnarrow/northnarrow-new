@@ -28,7 +28,7 @@
 //! (A phase that modulated a verdict of the on-host LLM advisor by the
 //! posture left with the advisor in Wave 4, lab PR 214.)
 
-use common::{Event, FsProtectOperation};
+use nn_model::{Event, FsProtectOperation};
 use northnarrow_agent::posture::PostureMachine;
 use std::time::{Duration, Instant};
 

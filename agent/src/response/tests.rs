@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use common::ResponseAction;
+use nn_model::ResponseAction;
 
 use super::{ExecutionOutcome, Executor};
 

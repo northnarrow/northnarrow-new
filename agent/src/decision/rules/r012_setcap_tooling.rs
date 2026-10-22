@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, Severity, Verdict};
+use nn_model::{Event, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::comm_allowlist::Judgement;
@@ -98,7 +98,7 @@ impl Rule for R012SetcapTooling {
 mod tests {
     use super::*;
     use crate::decision::rules::testutil::{spawn, spawn_full};
-    use common::ResponseAction;
+    use nn_model::ResponseAction;
 
     fn rule() -> R012SetcapTooling {
         R012SetcapTooling::new(Arc::new(CommAllowlist::default()))

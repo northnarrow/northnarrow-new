@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use common::ResponseAction;
+use nn_model::ResponseAction;
 
 use crate::anti_tamper::network_isolate::{IsolationReport, NetworkIsolator};
 use crate::response::proc_ref::ProcRef;

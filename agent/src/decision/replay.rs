@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::Event;
+use nn_model::Event;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
@@ -163,7 +163,7 @@ pub fn decide(engine: &RuleEngine, lineage: &AuthSessionTracker, event: &Event) 
 
 /// A verdict made outside the engine (one rule), as a decision line.
 pub fn outside_line(
-    v: Option<common::Verdict>,
+    v: Option<nn_model::Verdict>,
     attack: &[super::attack::AttackRef],
     response: Option<String>,
 ) -> Value {
@@ -177,7 +177,7 @@ pub fn outside_line(
     line
 }
 
-fn verdict_json(v: &common::Verdict, attack: &[super::attack::AttackRef]) -> Value {
+fn verdict_json(v: &nn_model::Verdict, attack: &[super::attack::AttackRef]) -> Value {
     json!({
         "rule": v.rule_id,
         "name": v.rule_name,
@@ -248,7 +248,7 @@ pub fn decision_line(d: Option<&Decision>) -> Value {
 }
 
 /// The events of a sample file for `nn-admin policy test`: one
-/// `common::Event` JSON per line, or one `{"event": …}` per line, or a
+/// `nn_model::Event` JSON per line, or one `{"event": …}` per line, or a
 /// golden case (`{"items": [{"event": …}, …]}`; its other items are
 /// skipped, said so in `skipped`).
 pub fn sample_events(text: &str) -> anyhow::Result<(Vec<Event>, usize)> {

@@ -25,7 +25,7 @@
 //! matches give the same decision on any run and thread.
 //! `docs/design/MULTI_MATCH_AND_RULE_POLICY.md` §2.
 
-use common::{ResponseAction, Severity, Verdict};
+use nn_model::{ResponseAction, Severity, Verdict};
 
 use super::attack::AttackRef;
 use super::response_policy::Held;

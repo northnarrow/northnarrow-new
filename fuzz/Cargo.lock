@@ -843,13 +843,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nn-model"
+version = "0.0.1"
+dependencies = [
+ "nn-parse",
+ "northnarrow-common",
+ "serde",
+]
+
+[[package]]
+name = "nn-parse"
+version = "0.0.1"
+
+[[package]]
 name = "nn-proto"
 version = "0.0.1"
 dependencies = [
  "ciborium",
  "ed25519-dalek",
  "hex",
- "northnarrow-common",
+ "nn-model",
  "postcard",
  "serde",
  "serde-big-array",
@@ -875,6 +888,8 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-model",
+ "nn-parse",
  "nn-proto",
  "northnarrow-antitamper-bpf",
  "northnarrow-common",
@@ -911,7 +926,6 @@ dependencies = [
  "hex",
  "postcard",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -920,9 +934,10 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "libfuzzer-sys",
+ "nn-model",
+ "nn-parse",
  "nn-proto",
  "northnarrow-agent",
- "northnarrow-common",
  "serde_json",
  "tempfile",
 ]

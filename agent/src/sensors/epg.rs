@@ -609,7 +609,7 @@ fn with_lab_injection(mut c: GuardConfig) -> GuardConfig {
             c.inject_comm_lo = lo;
             c.inject_comm_hi = hi;
             warn!(
-                comm = %common::log_escape::Escaped(&v),
+                comm = %nn_model::log_escape::Escaped(&v),
                 "exploit guard: LAB fault injection armed (debug build) — this comm's strict \
                  getppid() or first lite use point is reported as an anomaly marked injected"
             );

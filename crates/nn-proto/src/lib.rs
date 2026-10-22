@@ -35,5 +35,5 @@ pub mod watchdog_hold;
 mod wire {
     pub(crate) use crate::admin_signed_payload;
 }
-/// `crate::posture_types::PostureKind` (still `common`'s until R02).
-pub(crate) use common::posture_types;
+/// `crate::posture_types::PostureKind` (`common`'s until R02, nn-model's).
+pub(crate) use nn_model::posture_types;

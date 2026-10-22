@@ -11,7 +11,18 @@ publish = false
 
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
+# R02 (lab PR 240): `common`'s event model, posture types, network
+# addresses, log escaping and the std types of `wire` moved here; `common`
+# (the raw layouts they decode) and nn-parse (the QNAME walk) below it.
 [dependencies]
+common = { workspace = true }
+nn-parse = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+# The CBOR round-trip of `telemetry::TlsFingerprint` (a test).
+ciborium = "0.2"
 
 [lints]
 workspace = true

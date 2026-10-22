@@ -62,8 +62,8 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use common::posture_types::TriggerType;
-use common::Event;
+use nn_model::posture_types::TriggerType;
+use nn_model::Event;
 
 use crate::anti_tamper::network_isolate::FamilyOutcome;
 
@@ -889,7 +889,7 @@ impl Inner {
                 to = %t.to,
                 trigger = ?t.trigger,
                 offenders = ?t.offenders,
-                reason = %common::log_escape::Escaped(&t.reason),
+                reason = %nn_model::log_escape::Escaped(&t.reason),
                 why = %why,
                 "COMBAT stage transition NOT in the signed audit log — enforcement proceeds"
             );
@@ -906,7 +906,7 @@ impl Inner {
                 stage = %o.stage,
                 action = o.action,
                 success = o.success,
-                summary = %common::log_escape::Escaped(&o.summary),
+                summary = %nn_model::log_escape::Escaped(&o.summary),
                 why = %why,
                 "COMBAT action outcome NOT in the signed audit log — the ladder proceeds"
             );
@@ -1584,7 +1584,7 @@ fn neutralize_outcome(
 /// External audit NET-001: `::ffff:127.0.0.1` (a dual-stack socket) is
 /// loopback too.
 fn is_loopback(family: u8, addr: &[u8]) -> bool {
-    use common::netaddr::{canonical_ip, AF_INET, AF_INET6};
+    use nn_model::netaddr::{canonical_ip, AF_INET, AF_INET6};
     if family != AF_INET && family != AF_INET6 {
         return false;
     }

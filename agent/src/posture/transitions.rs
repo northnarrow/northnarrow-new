@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use common::posture_types::{PostureKind, TriggerType};
+use nn_model::posture_types::{PostureKind, TriggerType};
 
 use super::state::PostureState;
 

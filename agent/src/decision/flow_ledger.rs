@@ -20,8 +20,8 @@
 
 use std::collections::HashMap;
 
-use common::wire::{FlowPhase, NetFlowEvent};
-use common::Verdict;
+use nn_model::telemetry::{FlowPhase, NetFlowEvent};
+use nn_model::Verdict;
 
 use super::bounded::LazyLru;
 

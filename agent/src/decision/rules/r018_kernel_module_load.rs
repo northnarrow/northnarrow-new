@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, ModuleLoadMethod, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ModuleLoadMethod, ResponseAction, Severity, Verdict};
 
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::decision::attack::{AttackRef, Tactic};
@@ -124,7 +124,7 @@ impl Rule for R018KernelModuleLoad {
                 // dozen components down at most). The loader chose that
                 // depth; it must not buy the load an alert instead of the
                 // kill.
-                if common::module_path_too_deep(p) {
+                if nn_model::module_path_too_deep(p) {
                     return Some(build_verdict(
                         self,
                         event,
@@ -138,7 +138,7 @@ impl Rule for R018KernelModuleLoad {
                         ),
                     ));
                 }
-                if common::module_path_is_truncated(p) {
+                if nn_model::module_path_is_truncated(p) {
                     if self.loader_allowlist.contains(loader_comm)
                         || self.loader_allowlist.contains(parent_comm)
                     {
@@ -493,7 +493,7 @@ mod tests {
                 panic!("not ModuleLoad")
             };
             let p = path.as_deref().unwrap();
-            assert!(common::module_path_too_deep(p), "{p}");
+            assert!(nn_model::module_path_too_deep(p), "{p}");
             let v = rule().evaluate(&e).expect("fires");
             assert_eq!(v.action, ResponseAction::KillProcessTree, "{loader}");
             assert_eq!(v.severity, Severity::Critical);
@@ -515,7 +515,7 @@ mod tests {
                     !p.starts_with('/'),
                     "truncated path must stay relative: {p}"
                 );
-                assert!(common::module_path_is_truncated(p));
+                assert!(nn_model::module_path_is_truncated(p));
             }
             _ => panic!("not ModuleLoad"),
         }

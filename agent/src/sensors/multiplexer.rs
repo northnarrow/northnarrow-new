@@ -32,7 +32,7 @@ use common::wire::{
     dns_flags, BpfSyscallRaw, DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw,
     IoUringRaw, ModuleLoadRaw, ProcessSpawnRaw, TcpConnectRaw,
 };
-use common::Event;
+use nn_model::Event;
 use parking_lot::Mutex;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, error, info, warn};
@@ -785,7 +785,7 @@ where
 /// record budgets held back since the process's previous one).
 fn spawn_iouring_pump(rb: RingBuf<MapData>, tx: mpsc::Sender<Event>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let floods = |raw: &IoUringRaw, e: Event| (e, common::io_uring_floods(raw));
+        let floods = |raw: &IoUringRaw, e: Event| (e, nn_model::io_uring_floods(raw));
         if let Err(e) = pump_with("io_uring", rb, tx, floods).await {
             error!(label = "io_uring", error = %e, "ringbuf pump failed");
         }
@@ -945,7 +945,7 @@ async fn pump_tcp_connect(
 /// The events one connect record becomes, in bus order.
 ///
 /// - A connect the `socket_connect` deny refused (lab PR 224, CM-02 c):
-///   its [`common::wire::FlowPhase::Denied`] row only — no flow exists,
+///   its [`nn_model::telemetry::FlowPhase::Denied`] row only — no flow exists,
 ///   nothing is pending.
 /// - A connect: the flow tracker is fed FIRST, so the matching
 ///   `tcp_close` fexit (drained on the NET_FLOW_CLOSE_EVENTS task) always
@@ -1017,7 +1017,7 @@ fn tcp_connect_info_from_raw(raw: &TcpConnectRaw, lineage: &AuthSessionTracker) 
 
 /// The canonical address (external audit NET-001).
 fn decode_addr(family: u8, bytes: [u8; 16]) -> std::net::IpAddr {
-    common::netaddr::canonical_ip(family, &bytes)
+    nn_model::netaddr::canonical_ip(family, &bytes)
 }
 
 /// FP-3: the image of a DNS query's sender — never `comm`, which is
@@ -1069,7 +1069,7 @@ fn dns_events(
                 *pid,
                 query_name.clone(),
                 *query_type,
-                common::netaddr::canonical_ip(*family, dns_server),
+                nn_model::netaddr::canonical_ip(*family, dns_server),
                 *timestamp_ns,
             );
         }
@@ -1104,7 +1104,7 @@ fn nss_events(
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
 ) -> Option<Event> {
-    if let (Some(cache), Some(name)) = (dns_cache, common::nss_query_name(raw)) {
+    if let (Some(cache), Some(name)) = (dns_cache, nn_model::nss_query_name(raw)) {
         cache.on_dns_query(
             raw.pid,
             name,
@@ -1348,7 +1348,7 @@ mod tests {
         );
         let mut raw = TcpConnectRaw::zeroed();
         raw.pid = 4500;
-        raw.family = common::netaddr::AF_INET;
+        raw.family = nn_model::netaddr::AF_INET;
         raw.dst_port = 4444;
         raw.dst_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
         raw.timestamp_ns = 10_000;
@@ -1359,7 +1359,7 @@ mod tests {
         let Event::NetFlow(row) = &events[1] else {
             panic!("{:?}", events[1]);
         };
-        assert_eq!(row.phase, common::wire::FlowPhase::Connect);
+        assert_eq!(row.phase, nn_model::telemetry::FlowPhase::Connect);
         assert_eq!(row.exe.as_deref(), Some("/usr/bin/python3.12"));
         assert_eq!(row.resolved_hostname.as_deref(), Some("c2.example"));
         assert_eq!(w.flow_tracker.lock().pending_len(), 1);
@@ -1376,7 +1376,7 @@ mod tests {
         let w = wiring(AuthSessionTracker::new(tmp.path()));
         let mut raw = TcpConnectRaw::zeroed();
         raw.pid = 4600;
-        raw.family = common::netaddr::AF_INET;
+        raw.family = nn_model::netaddr::AF_INET;
         raw.flags = common::wire::tcp_connect_flags::DENIED;
         raw.proto = 17;
         raw.dst_port = 53;
@@ -1386,7 +1386,7 @@ mod tests {
         let Event::NetFlow(row) = &events[0] else {
             panic!("{:?}", events[0]);
         };
-        assert_eq!(row.phase, common::wire::FlowPhase::Denied);
+        assert_eq!(row.phase, nn_model::telemetry::FlowPhase::Denied);
         assert_eq!(row.proto, 17);
         assert_eq!(w.flow_tracker.lock().pending_len(), 0);
     }
@@ -1405,7 +1405,7 @@ mod tests {
 
         let mut raw = TcpConnectRaw::zeroed();
         raw.pid = 4242;
-        raw.family = common::netaddr::AF_INET;
+        raw.family = nn_model::netaddr::AF_INET;
         raw.dst_port = 8080;
         let info = tcp_connect_info_from_raw(&raw, &lineage);
         assert_eq!(info.exe.as_deref(), Some("/dev/shm/dropper"));
@@ -1440,7 +1440,7 @@ mod tests {
 
         let mut raw = TcpConnectRaw::zeroed();
         raw.pid = 4242;
-        raw.family = common::netaddr::AF_INET;
+        raw.family = nn_model::netaddr::AF_INET;
         let start = tcp_connect_info_from_raw(&raw, &lineage).proc_start_ns;
         assert!(start > 0 && start <= shown, "{start} vs {shown}");
 

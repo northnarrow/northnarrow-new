@@ -385,7 +385,7 @@ impl DnsCache {
             qname,
             pid,
             ts_ns,
-            server: common::netaddr::canonical(server),
+            server: nn_model::netaddr::canonical(server),
         });
         let cutoff = ts_ns.saturating_sub(self.reverse_retain_ns);
         while g.recent_by_time.front().is_some_and(|e| e.ts_ns < cutoff) {

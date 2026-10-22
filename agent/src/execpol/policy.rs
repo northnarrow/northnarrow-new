@@ -461,7 +461,7 @@ pub fn parse(text: &str, default_profile: Profile) -> Result<Table, String> {
             _ => {
                 return Err(err(format!(
                     "`{}` is not an exec, audit, preload, map, exempt or profile line",
-                    common::log_escape::Escaped(line)
+                    nn_model::log_escape::Escaped(line)
                 )))
             }
         }

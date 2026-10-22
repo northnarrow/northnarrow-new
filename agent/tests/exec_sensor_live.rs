@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use common::Event;
+use nn_model::Event;
 use northnarrow_agent::sensors::ExecSensor;
 
 /// The argument the canary exec carries.

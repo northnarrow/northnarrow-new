@@ -540,7 +540,7 @@ mod tests {
         for (_, bytes) in inputs("seeds", "dns_records") {
             a += crate::net::dns_cache::parse_a_records(&bytes).len();
             aaaa += crate::net::dns_cache::parse_aaaa_records(&bytes).len();
-            if common::qname_wire_end(&bytes).is_some() {
+            if nn_parse::dns_qname::qname_wire_end(&bytes).is_some() {
                 names += 1;
             }
         }

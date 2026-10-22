@@ -22,13 +22,12 @@ path = "src/lib.rs"
 # AND the bpffs/pin helpers without dragging the agent's
 # tokio/posture/decision transitive cone.
 antitamper-bpf = { workspace = true }
-# common: posture/wire types the W5 STATUS-ping path will need.
-# Imported now so the cargo graph settles in W2; W2 itself only
-# uses the std bits.
-common = { workspace = true }
 # Wave 4 restructure, R03 (lab PR 240): the quorum, the shutdown marker, the
-# watchdog hold and the status reply it decodes.
+# watchdog hold and the status reply it decodes (they were `common`'s).
 nn-proto = { workspace = true }
+# R02 (lab PR 240): log escaping and the posture kind (tests), `common`'s
+# until then; the watchdog names nothing of `common` any more.
+nn-model = { workspace = true }
 # tokio current-thread flavour — the watchdog has at most three
 # concurrent waits at any moment (agent pidfd, SIGTERM/SIGINT,
 # periodic heartbeat). No reason to pay for the multi-thread

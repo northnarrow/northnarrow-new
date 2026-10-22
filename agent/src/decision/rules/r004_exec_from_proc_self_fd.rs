@@ -29,7 +29,7 @@
 //! identity, `argv[0]` must be an install path exactly and only PID 1
 //! counts as the parent.
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::{rules::build_verdict, Rule};
@@ -106,7 +106,7 @@ impl R004ExecFromProcSelfFd {
     /// executor — PID 1 holds it open across a systemd upgrade and keeps
     /// launching units from it until the next re-exec — a file named
     /// `systemd-executor` in a root-owned system tree.
-    fn is_upgraded_executor(exe: &common::ExeIdentity) -> bool {
+    fn is_upgraded_executor(exe: &nn_model::ExeIdentity) -> bool {
         let path = exe.path_or("");
         let path = path.strip_suffix(" (deleted)").unwrap_or(path);
         path.rsplit('/').next() == Some("systemd-executor")

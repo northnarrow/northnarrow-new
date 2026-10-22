@@ -12,7 +12,7 @@
 //!   label (the Kani property, on buffers longer than the proof's).
 use libfuzzer_sys::fuzz_target;
 use northnarrow_agent::net::dns_cache::{parse_a_records, parse_aaaa_records};
-use northnarrow_common::{decode_dns_qname, qname_wire_end, QnameLabel, QnameLabels};
+use nn_parse::dns_qname::{QnameLabel, QnameLabels, decode_dns_qname, qname_wire_end};
 
 /// The labels a decoded name spells, `\DDD` turned back into bytes.
 fn read_back(name: &str) -> Vec<Vec<u8>> {

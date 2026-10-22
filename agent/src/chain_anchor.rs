@@ -1897,8 +1897,8 @@ mod tests {
             db.append(crate::canary::access_log::CanaryAccessDraft {
                 canary_id: format!("c{n}"),
                 canary_name: "decoy".into(),
-                canary_type: common::CanaryTypeTag::File,
-                access_kind: common::CanaryAccessKind::FileOpen,
+                canary_type: nn_model::CanaryTypeTag::File,
+                access_kind: nn_model::CanaryAccessKind::FileOpen,
                 accessor_pid: 1,
                 accessor_uid: 0,
                 accessor_comm: "cat".into(),
@@ -2052,8 +2052,8 @@ mod tests {
             acc.append(crate::canary::access_log::CanaryAccessDraft {
                 canary_id: format!("id{n}"),
                 canary_name: format!("c{n}"),
-                canary_type: common::CanaryTypeTag::File,
-                access_kind: common::CanaryAccessKind::FileOpen,
+                canary_type: nn_model::CanaryTypeTag::File,
+                access_kind: nn_model::CanaryAccessKind::FileOpen,
                 accessor_pid: 1,
                 accessor_uid: 0,
                 accessor_comm: "cat".to_string(),

@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Event, FileBurstKind};
+use nn_model::{Event, FileBurstKind};
 use parking_lot::Mutex;
 
 use crate::posture::lineage::AuthSessionTracker;

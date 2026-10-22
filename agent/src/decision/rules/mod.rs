@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use self::net::DnsBurstWindow;
@@ -305,7 +305,7 @@ pub(crate) fn judge_spawn(
     allowlist: &CommAllowlist,
     event: &Event,
 ) -> crate::config::comm_allowlist::Judgement {
-    let (comm, filename, exe, argv): (&str, &str, &common::ExeIdentity, &[String]) = match event {
+    let (comm, filename, exe, argv): (&str, &str, &nn_model::ExeIdentity, &[String]) = match event {
         Event::ProcessSpawn {
             comm,
             filename,
@@ -566,7 +566,7 @@ pub(crate) fn build_verdict(
 
 #[cfg(test)]
 pub(crate) mod testutil {
-    use common::Event;
+    use nn_model::Event;
 
     /// Build a `ProcessSpawn` event with sensible defaults plus the
     /// fields callers actually care about.

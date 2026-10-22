@@ -769,6 +769,9 @@ enum PolicyCmd {
         /// defaults.
         #[arg(long)]
         policy: Option<PathBuf>,
+        // This doc comment is the `--events` help text, which the Wave 4
+        // restructure leaves as it was (lab PR 240): the event model it
+        // names is nn-model's `Event` since R02.
         /// One `common::Event` JSON per line, `{"event": …}` per line, or a
         /// golden case (`agent/tests/golden/cases/*.json`).
         #[arg(long)]
@@ -1375,9 +1378,9 @@ enum ForcePostureTargetArg {
     Combat,
 }
 
-impl From<ForcePostureTargetArg> for common::posture_types::PostureKind {
+impl From<ForcePostureTargetArg> for nn_model::posture_types::PostureKind {
     fn from(t: ForcePostureTargetArg) -> Self {
-        use common::posture_types::PostureKind::*;
+        use nn_model::posture_types::PostureKind::*;
         match t {
             ForcePostureTargetArg::Observing => Observing,
             ForcePostureTargetArg::Alerted => Alerted,
@@ -2022,7 +2025,7 @@ fn exit_from_anyhow(r: anyhow::Result<()>) -> ExitCode {
 
 fn exit_from_force_posture(
     outcome: ForcePostureOutcome,
-    target: common::posture_types::PostureKind,
+    target: nn_model::posture_types::PostureKind,
 ) -> ExitCode {
     let tty = std::io::stdout().is_terminal();
     match outcome {
@@ -5078,7 +5081,7 @@ mod flow_sock_line_tests {
         forgotten: Option<u64>,
     ) -> StatusOutcome {
         StatusOutcome {
-            posture: common::posture_types::PostureKind::Observing,
+            posture: nn_model::posture_types::PostureKind::Observing,
             network_isolation_engaged: false,
             last_admin_action_secs_ago: None,
             ringbuf_drops_total: None,

@@ -4,7 +4,7 @@
 //!
 //! The mode: [`want_skb`] (the `--dns-sensor` switch) before the
 //! multiplexer starts, [`attach`] there, [`skb_active`] after. The record
-//! is decoded in `common::model` (`From<&DnsQueryRaw>`), which walks the
+//! is decoded in `nn_model` (`From<&DnsQueryRaw>`), which walks the
 //! wire bytes the kernel side copied.
 
 use std::sync::atomic::{AtomicBool, Ordering};

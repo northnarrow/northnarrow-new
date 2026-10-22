@@ -145,10 +145,10 @@ pub enum Judgement {
 impl Judgement {
     /// Shape the verdict a rule built for a process that is not
     /// [`Judgement::Allowed`].
-    pub fn apply(self, mut v: common::Verdict, comm: &str) -> common::Verdict {
+    pub fn apply(self, mut v: nn_model::Verdict, comm: &str) -> nn_model::Verdict {
         match self {
             Judgement::Unverified => {
-                v.action = common::ResponseAction::Log;
+                v.action = nn_model::ResponseAction::Log;
                 v.reasoning = format!(
                     "{} [named '{comm}', an allowlisted program, but its exec could not be \
                      read: recorded, not acted on]",

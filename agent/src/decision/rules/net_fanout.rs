@@ -54,8 +54,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use common::wire::FlowPhase;
-use common::{Event, ResponseAction, Severity, Verdict};
+use nn_model::telemetry::FlowPhase;
+use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::decision::attack::{AttackRef, Tactic};
@@ -358,7 +358,7 @@ fn sample_of(event: &Event) -> Option<Sample> {
         } => Some(Sample {
             pid: *pid,
             comm: comm.clone(),
-            dst: common::netaddr::canonical_ip(*family, dst_addr),
+            dst: nn_model::netaddr::canonical_ip(*family, dst_addr),
             port: *dst_port,
             ts: *timestamp_ns,
             proto: "tcp",

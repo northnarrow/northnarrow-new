@@ -123,9 +123,9 @@ impl NetBlocklistEntry {
     /// External audit NET-001: both sides in canonical form, so an
     /// IPv4-mapped IPv6 address matches the IPv4 entry it maps.
     pub fn matches(&self, addr: &IpAddr) -> bool {
-        let addr = common::netaddr::canonical(*addr);
+        let addr = nn_model::netaddr::canonical(*addr);
         match self {
-            NetBlocklistEntry::Ip(e) => common::netaddr::canonical(*e) == addr,
+            NetBlocklistEntry::Ip(e) => nn_model::netaddr::canonical(*e) == addr,
             NetBlocklistEntry::Cidr { net, prefix } => cidr_contains(net, *prefix, &addr),
         }
     }

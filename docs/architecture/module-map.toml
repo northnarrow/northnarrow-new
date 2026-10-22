@@ -246,36 +246,29 @@ planned = false
 [modules.common]
 "lib" = "northnarrow-common"
 # raw layouts and constants; the std types of wire/mod.rs (FimEvent,
-# NetFlowEvent, NetListenerEvent, TlsFingerprint) go to nn-model (R02)
+# NetFlowEvent, NetListenerEvent, TlsFingerprint, …) went to nn-model's
+# `telemetry` (R02, lab PR 240)
 "wire" = "northnarrow-common"
 # post-plan (lab PR 215): uapi bpf_cmd numbers, shared with the eBPF object
 "bpf_cmd" = "northnarrow-common"
 "btf_offsets" = "northnarrow-common"
-"dns_qname" = "nn-parse"
 # post-plan (lab PR 219): the decision model the eBPF programs run
 "epg" = "northnarrow-common"
 # post-plan (lab PR 223): the agent ↔ scanner protocol and hash list
 "execq" = "nn-proto"
 # post-plan (lab PR 215): the deny hooks' fail-open counters
 "fail_open" = "northnarrow-common"
-"log_escape" = "nn-model"
-"model" = "nn-model"
-"netaddr" = "nn-model"
-"posture_types" = "nn-model"
 "ring_drops" = "northnarrow-common"
 # R03 (lab PR 240) moved wire::admin_protocol, wire::admin_signed_payload,
 # admin_quorum, shutdown_marker and watchdog_hold to nn-proto, atomic_file
-# and sd_notify to northnarrow-antitamper-bpf: a member's own sources, out
-# of this scan (the layer gate checks its dependencies).
+# and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,
+# posture_types, netaddr, log_escape (and the std types of wire) to
+# nn-model, dns_qname to nn-parse: a member's own sources, out of this scan
+# (the layer gate checks its dependencies).
 
-# The items of common's root and the modules that define them
-# (`pub use model::*`, `pub use dns_qname::{…}`); `*`: any other item.
-[aliases.common]
-"decode_dns_qname" = "dns_qname"
-"qname_wire_end" = "dns_qname"
-"QnameLabel" = "dns_qname"
-"QnameLabels" = "dns_qname"
-"*" = "model"
+# `[aliases.<tree>]`: the items of a tree's root and the modules that define
+# them, `*` for any other item. common's (`pub use model::*`, `pub use
+# dns_qname::{…}`) left with R02 (lab PR 240): its root holds modules only.
 
 # ── the ratchet ──────────────────────────────────────────────────────────
 # The references, per crate of the referring module, to a crate it may not

@@ -26,7 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use common::posture_types::PostureKind;
+use nn_model::posture_types::PostureKind;
 use nn_proto::admin_protocol::{
     decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
     CanaryListRequest, CanaryRefreshRequest, ChallengeRequest, ForcePostureRequest, KeyedSignature,
@@ -137,7 +137,7 @@ pub enum ShutdownOutcome {
 
 #[derive(Debug)]
 pub struct StatusOutcome {
-    pub posture: common::posture_types::PostureKind,
+    pub posture: nn_model::posture_types::PostureKind,
     pub network_isolation_engaged: bool,
     /// Lab PR 217 (capability C18): the isolation per IP family, as the
     /// agent read the tables back (`None`: agent predates the fields).
@@ -3214,7 +3214,7 @@ mod tests {
             key.verifying_key()
         );
     }
-    use common::posture_types::PostureKind;
+    use nn_model::posture_types::PostureKind;
     use nn_proto::admin_protocol::{Challenge, StatusResponse};
     use std::os::unix::net::UnixListener;
     use std::thread;

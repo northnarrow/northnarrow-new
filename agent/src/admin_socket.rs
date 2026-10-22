@@ -998,7 +998,7 @@ async fn handle_connection(
         if auth.exhausted() {
             warn!(
                 client_pid = client.pid,
-                client_comm = %common::log_escape::Escaped(&client.comm),
+                client_comm = %nn_model::log_escape::Escaped(&client.comm),
                 "admin connection closed after repeated signature failures"
             );
             return Ok(());
@@ -1371,7 +1371,7 @@ struct DispatchNotes {
     /// External audit ASK-015: the posture a force-posture left, when the
     /// transition was applied (also a no-op to the same state). `None`
     /// when it was refused: the state did not change.
-    force_from: Option<common::posture_types::PostureKind>,
+    force_from: Option<nn_model::posture_types::PostureKind>,
     /// Lab PR 217: a force-posture out of COMBAT — what its release
     /// released, or why it did not (the posture then stayed COMBAT).
     force_release: Option<std::result::Result<String, String>>,
@@ -2262,16 +2262,16 @@ fn dispatch(
         AdminMessage::DebugForcePosture(state) => {
             let target = match state {
                 nn_proto::admin_protocol::DebugForcePosture::Observing => {
-                    common::posture_types::PostureKind::Observing
+                    nn_model::posture_types::PostureKind::Observing
                 }
                 nn_proto::admin_protocol::DebugForcePosture::Alerted => {
-                    common::posture_types::PostureKind::Alerted
+                    nn_model::posture_types::PostureKind::Alerted
                 }
                 nn_proto::admin_protocol::DebugForcePosture::Engaged => {
-                    common::posture_types::PostureKind::Engaged
+                    nn_model::posture_types::PostureKind::Engaged
                 }
                 nn_proto::admin_protocol::DebugForcePosture::Combat => {
-                    common::posture_types::PostureKind::Combat
+                    nn_model::posture_types::PostureKind::Combat
                 }
             };
             posture.force_state_for_test(target);
@@ -3843,7 +3843,7 @@ fn dispatch_response_release(
         signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
         pid,
         released,
-        detail = %common::log_escape::Escaped(&message),
+        detail = %nn_model::log_escape::Escaped(&message),
         "response release"
     );
     ResponseReleaseResponse {
@@ -3902,7 +3902,7 @@ fn dispatch_response_restore(
                 target: "admin.response_restore",
                 signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
                 vault_id = %extra.vault_id,
-                path = %common::log_escape::Escaped(&path),
+                path = %nn_model::log_escape::Escaped(&path),
                 "quarantined file restored by an administrator (mode 0600)"
             );
             ResponseRestoreResponse {
@@ -4378,7 +4378,7 @@ fn dispatch_canary_deploy(
         target: "admin.canary_deploy",
         signer_fp = %primary_fp,
         canary_id = %entry.canary_id,
-        canary_name = %common::log_escape::Escaped(&entry.name),
+        canary_name = %nn_model::log_escape::Escaped(&entry.name),
         "canary deployed"
     );
     CanaryDeployResponse {
@@ -5328,8 +5328,8 @@ mod tests {
     use super::*;
     use crate::admin_cli::{run_status, run_unlock, run_verify_keys};
     use crate::os_rng::OsRng;
-    use common::posture_types::PostureKind;
     use ed25519_dalek::SigningKey;
+    use nn_model::posture_types::PostureKind;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -5499,7 +5499,7 @@ mod tests {
         // Combat. posture/triggers/testutil is `pub(super)`-scoped so
         // not reachable from this module; hand-rolled is fine for one
         // event.
-        use common::Event;
+        use nn_model::Event;
         let intrusion = Event::ProcessSpawn {
             pid: 100,
             ppid: 1,
@@ -6129,7 +6129,7 @@ mod tests {
     /// chain captures attempts, not just wins.
     #[test]
     fn audit_emits_on_force_posture_failure() {
-        use common::posture_types::PostureKind;
+        use nn_model::posture_types::PostureKind;
         use nn_proto::admin_protocol::KeyedSignature;
         use nn_proto::admin_signed_payload::SignedPayload;
         let dir = TempDir::new().unwrap();
@@ -6187,7 +6187,7 @@ mod tests {
         // Non-auditable: Status request.
         let status_req = AdminMessage::Status(StatusRequest {});
         let status_reply = AdminMessage::StatusResponse(StatusResponse {
-            posture: common::posture_types::PostureKind::Observing,
+            posture: nn_model::posture_types::PostureKind::Observing,
             network_isolation_engaged: false,
             last_admin_action_secs_ago: None,
             ringbuf_drops_total: None,
@@ -7321,7 +7321,7 @@ mod tests {
             AdminMessage::StatusResponse(r) => r,
             other => panic!("{other:?}"),
         };
-        assert_eq!(r.posture, common::posture_types::PostureKind::Observing);
+        assert_eq!(r.posture, nn_model::posture_types::PostureKind::Observing);
         assert!(!r.network_isolation_engaged);
         assert_eq!(r.combat_stage.as_deref(), Some("NEUTRALIZE"));
         assert_eq!(r.combat_locked, Some(false));
