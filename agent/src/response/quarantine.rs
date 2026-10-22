@@ -6,7 +6,7 @@
 //! <quarantine_dir>/
 //! ├── index.json          (mode 0600; atomic write via tmp+rename)
 //! └── vault/
-//!     ├── <uuid>.bin      (AES-256-GCM ciphertext, mode 0600)
+//!     ├── <uuid>.bin      (AES-256-GCM record, mode 0600)
 //!     └── <uuid>.meta     (JSON metadata, mode 0600)
 //! ```
 //!
@@ -14,11 +14,24 @@
 //! - Master key: 32 random bytes at [`ExecutorConfig::master_key_file`],
 //!   created mode 0600 on first use, kept in memory wrapped in
 //!   `Zeroizing<[u8; 32]>` so it gets wiped on drop.
-//! - Per-file derivation: HKDF-SHA256 with salt
-//!   `"northnarrow-quarantine-v1"` and per-file info equal to the
-//!   vault id. This means a leaked file-key can decrypt only its
-//!   own ciphertext.
+//! - Per-file derivation: HKDF-SHA256 with the format's salt and per-file
+//!   info equal to the vault id. This means a leaked file-key can decrypt
+//!   only its own ciphertext.
 //! - Per-file nonce: 96 random bits, fresh per encryption.
+//!
+//! Record formats of the `.bin` (lab PR 238):
+//! - **v2**, written since lab PR 238: `"NNQV" ‖ 0x02 ‖ nonce (12) ‖
+//!   ciphertext ‖ tag (16)`, the key salted `"northnarrow-quarantine-v2"`,
+//!   the header and the vault id authenticated with it (associated data
+//!   `"NNQV" ‖ 0x02 ‖ vault id`): a record cannot be passed off as another
+//!   format or another entry's. Its `.meta` says `"format": 2`.
+//! - **v1**, written before: `nonce (12) ‖ ciphertext ‖ tag (16)`, no
+//!   header (the format was only the salt's `"northnarrow-quarantine-v1"`),
+//!   the vault id as associated data; its `.meta` names no format. Read,
+//!   never written.
+//!
+//! A `.meta` naming a format this agent does not read, or a `.bin` whose
+//! header disagrees with it, is refused before anything is decrypted.
 //!
 //! [`restore`] reverses the operation: decrypts the vault file and
 //! writes it to a new file (never over an existing one, never through a
@@ -43,7 +56,17 @@ use zeroize::Zeroizing;
 
 use super::{config::ExecutorConfig, ExecutionOutcome};
 
+/// HKDF salt of the v1 record (no header: the salt was the only version).
 const KDF_SALT: &[u8] = b"northnarrow-quarantine-v1";
+/// HKDF salt of the v2 record (lab PR 238).
+const KDF_SALT_V2: &[u8] = b"northnarrow-quarantine-v2";
+/// The first bytes of a record with a header (v2 and later).
+const RECORD_MAGIC: [u8; 4] = *b"NNQV";
+/// The format the quarantine writes (lab PR 238), the byte after
+/// [`RECORD_MAGIC`] and the `.meta`'s `format`.
+const RECORD_V2: u8 = 2;
+/// [`RECORD_MAGIC`] and the version byte.
+const HEADER_LEN: usize = RECORD_MAGIC.len() + 1;
 
 /// Paths that are NEVER quarantined, whatever the verdict says.
 ///
@@ -479,7 +502,24 @@ pub fn restore(vault_id: &str, out_path: &Path, cfg: &ExecutorConfig) -> std::io
     }
 
     let master = load_or_init_master_key(cfg)?;
-    let plaintext = open(&master, vault_id, &bin)?;
+    let plaintext = match declared_format(&meta)? {
+        // Written before lab PR 238: a v1 record, read as one whatever its
+        // first (random) bytes are.
+        None => open_v1(&master, vault_id, &bin)?,
+        Some(declared) => {
+            let found = record_format(&bin)?;
+            if found != declared {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "the entry's .meta declares vault record format {declared}, its .bin is \
+                         format {found} — refused"
+                    ),
+                ));
+            }
+            open(&master, vault_id, &bin)?
+        }
+    };
     drop(bin);
     let got_sha = hex::encode(Sha256::digest(&*plaintext));
     if got_sha != want_sha {
@@ -623,7 +663,7 @@ fn quarantine_file_after_check(
     let master = load_or_init_master_key(cfg)?;
     let mut nonce = [0u8; NONCE_LEN];
     crate::os_rng::OsRng.fill_bytes(&mut nonce);
-    let ciphertext = seal(&master, &vault_id, &nonce, &content)
+    let record = seal_v2(&master, &vault_id, &nonce, &content)
         .map_err(|e| QuarantineError::Crypto(format!("encrypt: {e}")))?;
 
     // Lay out the vault.
@@ -635,14 +675,13 @@ fn quarantine_file_after_check(
     let bin_path = vault_dir.join(format!("{vault_id}.bin"));
     let meta_path = vault_dir.join(format!("{vault_id}.meta"));
 
-    // Write ciphertext (nonce prefix). Mode 0600.
+    // Write the v2 record (header, nonce, ciphertext, tag). Mode 0600.
     let mut bin_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&bin_path)?;
-    bin_file.write_all(&nonce)?;
-    bin_file.write_all(&ciphertext)?;
+    bin_file.write_all(&record)?;
     bin_file.sync_all()?;
     drop(bin_file);
 
@@ -654,6 +693,7 @@ fn quarantine_file_after_check(
         "size_bytes": size,
         "sha256": hex::encode(sha),
         "captured_at": current_timestamp(),
+        "format": RECORD_V2,
     });
     let mut meta_file = OpenOptions::new()
         .write(true)
@@ -934,19 +974,47 @@ pub(crate) fn load_or_init_master_key(
     Ok(k)
 }
 
+/// The per-entry key of a v1 record: HKDF-SHA256 of the master key, salt
+/// [`KDF_SALT`], info the vault id. Lab PR 230 pins it.
 fn derive_file_key(master: &Zeroizing<[u8; 32]>, vault_id: &str) -> Zeroizing<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(Some(KDF_SALT), &**master);
+    derive_key(KDF_SALT, master, vault_id)
+}
+
+/// The per-entry key of a v2 record (lab PR 238): as [`derive_file_key`]
+/// with the salt [`KDF_SALT_V2`].
+fn derive_file_key_v2(master: &Zeroizing<[u8; 32]>, vault_id: &str) -> Zeroizing<[u8; 32]> {
+    derive_key(KDF_SALT_V2, master, vault_id)
+}
+
+fn derive_key(salt: &[u8], master: &Zeroizing<[u8; 32]>, vault_id: &str) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), &**master);
     let mut out = Zeroizing::new([0u8; 32]);
     hk.expand(vault_id.as_bytes(), &mut *out)
         .expect("HKDF 32-byte expand cannot fail");
     out
 }
 
-/// AES-256-GCM of `content` for the vault entry `vault_id`, under its
-/// [`derive_file_key`] with the vault id as associated data: ciphertext ‖
-/// tag (16 bytes). The `.bin` of the entry is `nonce (12) ‖` this, with no
-/// header; [`open`] reads it back. Lab PR 230 pins these bytes
-/// (`crypto_vectors`).
+/// The v2 header: [`RECORD_MAGIC`] and [`RECORD_V2`].
+fn header_v2() -> [u8; HEADER_LEN] {
+    let mut h = [0u8; HEADER_LEN];
+    h[..RECORD_MAGIC.len()].copy_from_slice(&RECORD_MAGIC);
+    h[RECORD_MAGIC.len()] = RECORD_V2;
+    h
+}
+
+/// The associated data of a v2 record: its header, then the vault id.
+fn aad_v2(vault_id: &str) -> Vec<u8> {
+    let mut aad = header_v2().to_vec();
+    aad.extend_from_slice(vault_id.as_bytes());
+    aad
+}
+
+/// AES-256-GCM of `content` for the vault entry `vault_id` in the v1
+/// format, under its [`derive_file_key`] with the vault id as associated
+/// data: ciphertext ‖ tag (16 bytes), the `.bin` of a v1 entry being
+/// `nonce (12) ‖` this. Nothing writes v1 any more (lab PR 238): kept for
+/// the vectors of lab PR 230, which pin what entries written before hold.
+#[cfg(test)]
 fn seal(
     master: &Zeroizing<[u8; 32]>,
     vault_id: &str,
@@ -964,9 +1032,93 @@ fn seal(
     )
 }
 
-/// The content of the `.bin` of the vault entry `vault_id` ([`seal`]),
-/// refused when its tag, its nonce or its vault id do not match.
+/// The `.bin` of the vault entry `vault_id` in the v2 format (lab PR 238):
+/// `"NNQV" ‖ 0x02 ‖ nonce (12) ‖ ciphertext ‖ tag (16)`, AES-256-GCM under
+/// its [`derive_file_key_v2`] with the header and the vault id as
+/// associated data. [`open`] reads it back.
+fn seal_v2(
+    master: &Zeroizing<[u8; 32]>,
+    vault_id: &str,
+    nonce: &[u8; NONCE_LEN],
+    content: &[u8],
+) -> Result<Vec<u8>, aes_gcm::Error> {
+    let key = derive_file_key_v2(master, vault_id);
+    let cipher = Aes256Gcm::new((&*key).into());
+    let sealed = cipher.encrypt(
+        &Nonce::from(*nonce),
+        Payload {
+            msg: content,
+            aad: &aad_v2(vault_id),
+        },
+    )?;
+    let mut record = Vec::with_capacity(HEADER_LEN + NONCE_LEN + sealed.len());
+    record.extend_from_slice(&header_v2());
+    record.extend_from_slice(nonce);
+    record.extend_from_slice(&sealed);
+    Ok(record)
+}
+
+fn bad_record(msg: String) -> std::io::Error {
+    std::io::Error::new(ErrorKind::InvalidData, msg)
+}
+
+/// The format of a `.bin` by its first bytes: 1 for a record without a
+/// header (v1), else the version byte after [`RECORD_MAGIC`]. A header cut
+/// before its version byte, or one naming 0 or 1 (formats without a
+/// header), is refused.
+fn record_format(bin: &[u8]) -> std::io::Result<u8> {
+    let Some(rest) = bin.strip_prefix(&RECORD_MAGIC) else {
+        return Ok(1);
+    };
+    match rest.first() {
+        Some(&v) if v >= RECORD_V2 => Ok(v),
+        Some(&v) => Err(bad_record(format!(
+            "vault record header names format {v}, which has no header — refused"
+        ))),
+        None => Err(bad_record(
+            "vault record header cut before its version byte — refused".into(),
+        )),
+    }
+}
+
+/// The record format a vault entry's `.meta` declares: `None` when it
+/// declares none (an entry written before lab PR 238, a v1 record); a
+/// format this agent does not read is refused.
+fn declared_format(meta: &serde_json::Value) -> std::io::Result<Option<u8>> {
+    match meta.get("format") {
+        None => Ok(None),
+        Some(f) => match f.as_u64() {
+            Some(1) => Ok(Some(1)),
+            Some(v) if v == u64::from(RECORD_V2) => Ok(Some(RECORD_V2)),
+            _ => Err(bad_record(format!(
+                "the entry's .meta declares vault record format {f}, not one this agent reads \
+                 (1, {RECORD_V2}) — refused"
+            ))),
+        },
+    }
+}
+
+/// The content of the `.bin` of the vault entry `vault_id`, in the format
+/// its first bytes name ([`record_format`]): v2 ([`seal_v2`]) or v1 (no
+/// header). A record of a format this agent does not read is refused, as
+/// is one whose tag, nonce, header or vault id do not match.
 fn open(
+    master: &Zeroizing<[u8; 32]>,
+    vault_id: &str,
+    bin: &[u8],
+) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    match record_format(bin)? {
+        1 => open_v1(master, vault_id, bin),
+        RECORD_V2 => open_v2(master, vault_id, bin),
+        v => Err(bad_record(format!(
+            "vault record format {v} is not one this agent reads (1, {RECORD_V2}) — refused"
+        ))),
+    }
+}
+
+/// A v1 record: `nonce ‖ ciphertext ‖ tag`, refused when its tag, its
+/// nonce or its vault id do not match.
+fn open_v1(
     master: &Zeroizing<[u8; 32]>,
     vault_id: &str,
     bin: &[u8],
@@ -985,6 +1137,39 @@ fn open(
             Payload {
                 msg: ciphertext,
                 aad: vault_id.as_bytes(),
+            },
+        )
+        .map_err(|e| std::io::Error::other(format!("decrypt: {e}")))?;
+    Ok(Zeroizing::new(plaintext))
+}
+
+/// A v2 record ([`seal_v2`]), refused when its header is not v2's or its
+/// tag, nonce or vault id do not match.
+fn open_v2(
+    master: &Zeroizing<[u8; 32]>,
+    vault_id: &str,
+    bin: &[u8],
+) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let (header, rest) = bin
+        .split_at_checked(HEADER_LEN)
+        .ok_or_else(|| bad_record("vault record header cut — refused".into()))?;
+    if header != header_v2() {
+        return Err(bad_record("not a v2 vault record header — refused".into()));
+    }
+    let (nonce, ciphertext) = rest
+        .split_at_checked(NONCE_LEN)
+        .ok_or_else(|| std::io::Error::other("vault file too short"))?;
+    let nonce: &[u8; NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| std::io::Error::other("vault nonce is not 12 bytes"))?;
+    let key = derive_file_key_v2(master, vault_id);
+    let cipher = Aes256Gcm::new((&*key).into());
+    let plaintext = cipher
+        .decrypt(
+            &Nonce::from(*nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad_v2(vault_id),
             },
         )
         .map_err(|e| std::io::Error::other(format!("decrypt: {e}")))?;
@@ -1624,7 +1809,9 @@ mod tests {
             assert!(open(&master(), VAULT_ID, &good[..NONCE_LEN - 1]).is_err());
         }
 
-        /// Protects: what the quarantine writes is the format the vectors above pin.
+        /// Protects: what the quarantine writes is the format a vector
+        /// pins — v2 since lab PR 238 ([`VAULT_BIN_V2`]; it was the v1
+        /// record above until then).
         #[test]
         fn the_quarantine_writes_the_pinned_format() {
             let tmp = TempDir::new().unwrap();
@@ -1633,17 +1820,168 @@ mod tests {
             let src = tmp.path().join("kat-sample");
             fs::write(&src, MSG).unwrap();
             let id = quarantine_file(&ExeHandle::open(&src).unwrap(), &cfg).expect("quarantine");
-            // `.bin` = nonce ‖ seal(…); `.meta` = the SHA-256 in lowercase hex.
+            // `.bin` = seal_v2(…) (header, nonce, ciphertext, tag); `.meta`
+            // = the SHA-256 in lowercase hex and the format.
             let bin = fs::read(cfg.quarantine_dir.join("vault").join(format!("{id}.bin"))).unwrap();
-            assert_eq!(bin.len(), NONCE_LEN + MSG.len() + 16);
-            let nonce: [u8; NONCE_LEN] = bin[..NONCE_LEN].try_into().unwrap();
-            assert_eq!(
-                bin[NONCE_LEN..],
-                seal(&master(), &id, &nonce, MSG).unwrap()[..]
-            );
+            assert_eq!(bin.len(), HEADER_LEN + NONCE_LEN + MSG.len() + 16);
+            assert_eq!(bin[..HEADER_LEN], *b"NNQV\x02");
+            let nonce: [u8; NONCE_LEN] =
+                bin[HEADER_LEN..HEADER_LEN + NONCE_LEN].try_into().unwrap();
+            assert_eq!(bin, seal_v2(&master(), &id, &nonce, MSG).unwrap());
             let meta = vault_meta(&id, &cfg).unwrap();
             assert_eq!(meta["sha256"], MSG_SHA256);
             assert_eq!(meta["size_bytes"], MSG.len() as u64);
+            assert_eq!(meta["format"], 2);
+        }
+
+        /// Lab PR 238: the v2 record of [`MSG_V2`] under the master key
+        /// 00 01 … 1f, vault id [`VAULT_ID`] and nonce [`NONCE`] —
+        /// `"NNQV" ‖ 02 ‖ nonce ‖ ciphertext (30) ‖ tag (16)`. Recomputed
+        /// outside the repository (Python `cryptography` 41 on OpenSSL),
+        /// with the v1 record and key above as a check of the script.
+        const MSG_V2: &[u8] = b"NorthNarrow quarantine KAT v2\n";
+        const FILE_KEY_V2: &str =
+            "b021499b6001b1be9e08ba5c05fc2804e6737d9597c6c4836a4ae95ebb8e7835";
+        const VAULT_BIN_V2: &str = concat!(
+            "4e4e515602",
+            "a0a1a2a3a4a5a6a7a8a9aaab",
+            "dce6f148d4e74442230dd0a7a8a947be6cf2514eec02784b728eec305000",
+            "10d608cc0d4dcd9a9657992aacf72a7c",
+        );
+        const MSG_V2_SHA256: &str =
+            "d0b9ea3f27483db1df593647f6222a6d9a698476c8d5ab6bdb6fd025422f389b";
+
+        /// Protects: the per-entry key of a v2 record (its own salt).
+        #[test]
+        fn hkdf_file_key_v2_is_pinned() {
+            assert_eq!(
+                hex::encode(*derive_file_key_v2(&master(), VAULT_ID)),
+                FILE_KEY_V2
+            );
+            assert_ne!(FILE_KEY_V2, FILE_KEY);
+        }
+
+        /// Protects: the v2 record's bytes, and that the reader opens them
+        /// and the v1 record alike.
+        #[test]
+        fn vault_record_v2_is_pinned() {
+            let bin = seal_v2(&master(), VAULT_ID, &NONCE, MSG_V2).unwrap();
+            assert_eq!(bin.len(), HEADER_LEN + NONCE_LEN + MSG_V2.len() + 16);
+            assert_eq!(hex::encode(&bin), VAULT_BIN_V2);
+            assert_eq!(hex::encode(Sha256::digest(MSG_V2)), MSG_V2_SHA256);
+            assert_eq!(record_format(&bin).unwrap(), 2);
+            assert_eq!(
+                &*open(&master(), VAULT_ID, &unhex(VAULT_BIN_V2)).unwrap(),
+                MSG_V2
+            );
+            assert_eq!(record_format(&unhex(VAULT_BIN)).unwrap(), 1);
+            assert_eq!(&*open(&master(), VAULT_ID, &unhex(VAULT_BIN)).unwrap(), MSG);
+        }
+
+        /// Protects: a v2 record with a changed header, nonce, ciphertext,
+        /// tag or vault id is refused; so is one cut short, and one read as
+        /// v1 (its header stripped, or as an older agent would).
+        #[test]
+        fn a_v2_record_that_does_not_match_is_refused() {
+            let good = unhex(VAULT_BIN_V2);
+            // a bit of the magic, of the version byte, of the nonce, of
+            // the ciphertext, of the tag
+            for at in [
+                0,
+                3,
+                HEADER_LEN - 1,
+                HEADER_LEN,
+                HEADER_LEN + NONCE_LEN,
+                good.len() - 1,
+            ] {
+                let mut bad = good.clone();
+                bad[at] ^= 1;
+                assert!(open(&master(), VAULT_ID, &bad).is_err(), "byte {at}");
+            }
+            assert!(open(&master(), "00112233445566778899aabbccddeefe", &good).is_err());
+            assert!(open(&master(), VAULT_ID, &good[..HEADER_LEN + NONCE_LEN + 15]).is_err());
+            assert!(open(&master(), VAULT_ID, &good[..HEADER_LEN + NONCE_LEN - 1]).is_err());
+            assert!(open(&master(), VAULT_ID, &good[..HEADER_LEN - 1]).is_err());
+            // no downgrade: the record without its header, and the record
+            // read as v1, open nothing
+            assert!(open(&master(), VAULT_ID, &good[HEADER_LEN..]).is_err());
+            assert!(open_v1(&master(), VAULT_ID, &good).is_err());
+            assert!(open_v1(&master(), VAULT_ID, &good[HEADER_LEN..]).is_err());
+            // nor the v1 record read as v2
+            assert!(open_v2(&master(), VAULT_ID, &unhex(VAULT_BIN)).is_err());
+        }
+
+        /// Protects: a format this agent does not read — in the `.bin`'s
+        /// header or in the `.meta` — and a `.bin` that disagrees with its
+        /// `.meta` are refused with what is wrong, nothing written.
+        #[test]
+        fn an_unknown_or_mismatched_record_format_is_refused_clearly() {
+            let good = unhex(VAULT_BIN_V2);
+            let mut v3 = good.clone();
+            v3[HEADER_LEN - 1] = 3;
+            let e = open(&master(), VAULT_ID, &v3).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidData);
+            assert!(
+                e.to_string()
+                    .contains("format 3 is not one this agent reads"),
+                "{e}"
+            );
+            let mut v1_header = good.clone();
+            v1_header[HEADER_LEN - 1] = 1;
+            let e = open(&master(), VAULT_ID, &v1_header).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("names format 1, which has no header"),
+                "{e}"
+            );
+            let e = open(&master(), VAULT_ID, b"NNQV").unwrap_err();
+            assert!(e.to_string().contains("cut before its version byte"), "{e}");
+
+            // Through restore: a quarantined entry, then its `.meta` or its
+            // `.bin` changed.
+            let tmp = TempDir::new().unwrap();
+            let cfg = cfg_for(&tmp);
+            fs::write(&cfg.master_key_file, *master()).unwrap();
+            let src = tmp.path().join("kat-sample");
+            fs::write(&src, MSG_V2).unwrap();
+            let id = quarantine_file(&ExeHandle::open(&src).unwrap(), &cfg).expect("quarantine");
+            let vault = cfg.quarantine_dir.join("vault");
+            let meta_path = vault.join(format!("{id}.meta"));
+            let bin_path = vault.join(format!("{id}.bin"));
+            let meta: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+            let bin = fs::read(&bin_path).unwrap();
+            let out = tmp.path().join("out");
+            let refused = |why: &str| {
+                let e = restore(&id, &out, &cfg).unwrap_err();
+                assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+                assert!(e.to_string().contains(why), "{e}");
+                assert!(!out.exists());
+            };
+            // the `.meta` names a format this agent does not read
+            for f in [
+                serde_json::json!(3),
+                serde_json::json!("2"),
+                serde_json::json!(0),
+            ] {
+                let mut m = meta.clone();
+                m["format"] = f;
+                fs::write(&meta_path, m.to_string()).unwrap();
+                refused("not one this agent reads");
+            }
+            fs::write(&meta_path, meta.to_string()).unwrap();
+            // the `.bin`'s header names format 3
+            let mut b = bin.clone();
+            b[HEADER_LEN - 1] = 3;
+            fs::write(&bin_path, &b).unwrap();
+            refused("declares vault record format 2, its .bin is format 3");
+            // the `.bin` lost its header (format 1 to the reader)
+            fs::write(&bin_path, &bin[HEADER_LEN..]).unwrap();
+            refused("declares vault record format 2, its .bin is format 1");
+            // as written: restored
+            fs::write(&bin_path, &bin).unwrap();
+            restore(&id, &out, &cfg).unwrap();
+            assert_eq!(fs::read(&out).unwrap(), MSG_V2);
         }
 
         /// The vault `quarantine_file` of `main` at 8180540 wrote for
@@ -1691,6 +2029,50 @@ mod tests {
             let to = out.to_string_lossy().into_owned();
             assert_eq!(restore_entry(FIXTURE_ID, Some(&to), &cfg).unwrap(), out);
             assert_eq!(fs::read(&out).unwrap(), MSG);
+        }
+
+        /// Lab PR 238: the vault of `main` (v1, [`FIXTURE_ID`]) gets a new
+        /// entry, written as v2 beside it; both are listed and both
+        /// restore, each by its own format, and the v1 entry's files are
+        /// left as they were.
+        #[test]
+        fn a_v1_vault_takes_v2_entries_and_restores_both() {
+            let tmp = TempDir::new().unwrap();
+            let cfg = cfg_for(&tmp);
+            let vault = cfg.quarantine_dir.join("vault");
+            fs::create_dir_all(&vault).unwrap();
+            fs::write(&cfg.master_key_file, unhex(FIXTURE_MASTER)).unwrap();
+            fs::write(vault.join(format!("{FIXTURE_ID}.bin")), unhex(FIXTURE_BIN)).unwrap();
+            fs::write(vault.join(format!("{FIXTURE_ID}.meta")), FIXTURE_META).unwrap();
+            fs::write(cfg.quarantine_dir.join("index.json"), FIXTURE_INDEX).unwrap();
+
+            let src = tmp.path().join("new-sample");
+            fs::write(&src, MSG_V2).unwrap();
+            let id = quarantine_file(&ExeHandle::open(&src).unwrap(), &cfg).expect("quarantine");
+            let listed: Vec<String> = list_vault(&cfg).into_iter().map(|e| e.vault_id).collect();
+            assert_eq!(listed, vec![FIXTURE_ID.to_string(), id.clone()]);
+            let new_bin = fs::read(vault.join(format!("{id}.bin"))).unwrap();
+            assert_eq!(record_format(&new_bin).unwrap(), 2);
+            assert_eq!(vault_meta(&id, &cfg).unwrap()["format"], 2);
+            assert!(vault_meta(FIXTURE_ID, &cfg)
+                .unwrap()
+                .get("format")
+                .is_none());
+
+            let old_out = tmp.path().join("old-restored");
+            restore(FIXTURE_ID, &old_out, &cfg).unwrap();
+            assert_eq!(fs::read(&old_out).unwrap(), MSG);
+            assert_eq!(restore_entry(&id, None, &cfg).unwrap(), src);
+            assert_eq!(fs::read(&src).unwrap(), MSG_V2);
+            // the v1 entry untouched
+            assert_eq!(
+                fs::read(vault.join(format!("{FIXTURE_ID}.bin"))).unwrap(),
+                unhex(FIXTURE_BIN)
+            );
+            assert_eq!(
+                fs::read_to_string(vault.join(format!("{FIXTURE_ID}.meta"))).unwrap(),
+                FIXTURE_META
+            );
         }
     }
 }

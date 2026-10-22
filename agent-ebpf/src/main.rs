@@ -66,8 +66,9 @@ use northnarrow_common::wire::{spawn_trunc, ProcessSpawnRaw, ARGV_LEN, FILENAME_
 
 use crate::btf_offsets::{
     MM_STRUCT_ARG_END_OFFSET, MM_STRUCT_ARG_START_OFFSET, PF_KTHREAD, TASK_STRUCT_COMM_OFFSET,
-    TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_MM_OFFSET, TASK_STRUCT_REAL_PARENT_OFFSET,
-    TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET, TP_SCHED_EXEC_FILENAME_OFFSET,
+    TASK_STRUCT_FLAGS_OFFSET, TASK_STRUCT_GROUP_LEADER_OFFSET, TASK_STRUCT_MM_OFFSET,
+    TASK_STRUCT_REAL_PARENT_OFFSET, TASK_STRUCT_START_TIME_OFFSET, TASK_STRUCT_TGID_OFFSET,
+    TP_SCHED_EXEC_FILENAME_OFFSET,
 };
 
 /// Ringbuffer carrying [`ProcessSpawnRaw`] events to userland.
@@ -204,7 +205,7 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
             unsafe { (*raw_ptr).start_ns = start };
         }
         // Parent: task->real_parent, then tgid (userspace ppid) +
-        // start_time (PID-reuse key) + comm.
+        // the start of its thread-group leader (PID-reuse key) + comm.
         if let Ok(parent) = unsafe {
             bpf_probe_read_kernel::<*const u8>(
                 task.add(off!(TASK_STRUCT_REAL_PARENT_OFFSET)) as *const _,
@@ -216,12 +217,29 @@ fn try_sched_process_exec<const STDIO: bool>(ctx: &TracePointContext) -> Result<
                 } {
                     unsafe { (*raw_ptr).ppid = ptgid };
                 }
-                if let Ok(pstart) = unsafe {
-                    bpf_probe_read_kernel::<u64>(
-                        parent.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _,
+                // Lab PR 238 (lot 122): the parent PROCESS's start, read
+                // off its group leader. `real_parent` is the thread that
+                // forked: a child forked by a thread other than the
+                // parent's main one would carry that thread's start, not
+                // the one the parent's exec reported (its `start_ns`, the
+                // lineage key). Unread, the field stays 0 ("unknown"),
+                // never a thread's start. Two plain reads into the ring
+                // record: no stack copy, no call (KERNEL_COMPATIBILITY
+                // "Older verifiers").
+                let leader = unsafe {
+                    bpf_probe_read_kernel::<*const u8>(
+                        parent.add(off!(TASK_STRUCT_GROUP_LEADER_OFFSET)) as *const _,
                     )
-                } {
-                    unsafe { (*raw_ptr).parent_start_ns = pstart };
+                }
+                .unwrap_or(core::ptr::null());
+                if !leader.is_null() {
+                    if let Ok(pstart) = unsafe {
+                        bpf_probe_read_kernel::<u64>(
+                            leader.add(off!(TASK_STRUCT_START_TIME_OFFSET)) as *const _,
+                        )
+                    } {
+                        unsafe { (*raw_ptr).parent_start_ns = pstart };
+                    }
                 }
                 unsafe {
                     let dst = core::slice::from_raw_parts_mut(

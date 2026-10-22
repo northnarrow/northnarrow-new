@@ -791,3 +791,80 @@ fn another_tree_of_a_shared_directory_is_no_evidence() {
     assert_eq!(b.added, vec![Signal::DeleteOriginals], "{b:?}");
     assert_eq!(t.counts().samplings, 1);
 }
+
+/// An unlink burst run as `uid`.
+fn unlinks_by(uid: u32, pid: u32, ts: u64, file: &str) -> Event {
+    match unlinks(pid, ts, file) {
+        Event::FileBurst {
+            pid,
+            comm,
+            kind,
+            count,
+            appended,
+            sources,
+            filename,
+            timestamp_ns,
+            ..
+        } => Event::FileBurst {
+            pid,
+            uid,
+            comm,
+            kind,
+            count,
+            appended,
+            sources,
+            filename,
+            timestamp_ns,
+        },
+        e => e,
+    }
+}
+
+/// Lab PR 238: the burst's own directory is a shared one (`/tmp` itself,
+/// world-writable and sticky). Its copies count when the uid the burst ran
+/// as owns them — an encryptor's copies are new files, its own: the
+/// simulator's run there is decisive as anywhere. Run as another uid, the
+/// same copies are another user's, no evidence of this burst: one shape,
+/// the deletion.
+#[test]
+fn copy_delete_in_a_shared_directory_counts_the_bursts_own_copies() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid(2) has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let h = Host::new();
+    h.exec(300, 200, "/usr/bin/python3", &["python3", SIM]);
+    let (_w, w) = sandbox();
+    let tmp = w.join("tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    let deleted = copy_delete(&tmp, 40, 20);
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+    let t = fs_tracker(&h);
+    t.assess(&new_files(300, T0, &format!("{deleted}.locked")))
+        .unwrap();
+    let b = t.assess(&unlinks_by(me, 300, T0 + S, &deleted)).unwrap();
+    assert!(b.decisive, "{b:?}");
+    assert_eq!(
+        shapes_of(&b),
+        vec![
+            Signal::Entropy,
+            Signal::RenameExtension,
+            Signal::DeleteOriginals
+        ]
+    );
+    assert!(
+        b.describe().contains("4 of 4 copies under .locked"),
+        "{}",
+        b.describe()
+    );
+
+    let t = fs_tracker(&h);
+    t.assess(&new_files(300, T0, &format!("{deleted}.locked")))
+        .unwrap();
+    let b = t
+        .assess(&unlinks_by(me.wrapping_add(1), 300, T0 + S, &deleted))
+        .unwrap();
+    assert!(!b.decisive, "{b:?}");
+    assert_eq!(b.added, vec![Signal::DeleteOriginals], "{b:?}");
+    assert_eq!(t.counts().samplings, 1);
+}

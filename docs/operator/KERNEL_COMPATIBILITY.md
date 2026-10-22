@@ -236,11 +236,11 @@ The agent now reads the prototype of `bpf_lsm_inode_setattr` from the
 running kernel's BTF at boot, takes the position of its only `struct
 dentry *` argument (which must be followed by the `struct iattr *`), and
 writes it into the `BTF_OFFSETS` map (`INODE_SETATTR_DENTRY_ARG`, slot
-113) before anything attaches; both programs read the dentry at that
+114 since lab PR 238) before anything attaches; both programs read the dentry at that
 position. The same check found a second case: on 5.7 to 5.11 (5.10 LTS
 included) `inode_setxattr` and `inode_removexattr` start with the dentry,
 where the xattr deny read argument 1 (the attribute name); their
-positions are resolved the same way (slots 114 and 115, the name taken
+positions are resolved the same way (slots 115 and 116, the name taken
 right after the dentry).
 
 Hook prototypes per kernel, for the arguments the programs read

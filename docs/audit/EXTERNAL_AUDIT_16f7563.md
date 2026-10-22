@@ -2507,7 +2507,8 @@ group, the ones an unprivileged user or a local attacker could use first.
     `real_parent->start_time`); once that offender has exited, the child
     is matched only by time — not when the thread started after the
     offender was attributed. Reading the group leader's start in eBPF is a
-    follow-up (the lineage tracker keys on the same field).
+    follow-up (the lineage tracker keys on the same field). Done in lab PR
+    238 (Wave 4): `real_parent->group_leader->start_time`.
   - Lab: on Ubuntu 24.04 (QEMU/WHPX), `kill120-probe.sh`. Before (main): an
     offender exits and a harmless `sleep` takes its PID — killed at
     NEUTRALIZE; a harmless shell with two children takes the PID — taken

@@ -175,3 +175,118 @@ async fn long_argv_and_filename_are_marked_cut() {
     );
     assert!(!a_cut, "its argv fits");
 }
+
+/// Lab PR 238 (lot 122): the environment variable that makes
+/// [`thread_spawn_helper`] act (the argument it gives its child).
+const HELPER_ENV: &str = "NN_E2E_THREAD_SPAWN_MARKER";
+
+/// Lab PR 238 (lot 122): `parent_start_ns` is the parent PROCESS's start —
+/// its thread-group leader's — also for a child forked by a thread other
+/// than the parent's main one, whose `real_parent` is that thread. It read
+/// `real_parent->start_time` before: the forking thread's own start, which
+/// matched no record of the parent (its exec reports the leader's), so the
+/// PID-reuse key of the lineage named no process.
+///
+/// This test binary runs again as the parent (A, [`thread_spawn_helper`]):
+/// A forks `/bin/true <marker>` (B) from a thread it starts, after checking
+/// that thread is not its leader. The exec record of B must name A's pid
+/// as its parent and, as its parent's start, exactly the `start_ns` of A's
+/// own exec record (a thread starts after its process: its start differs).
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires root and a Linux kernel with eBPF"]
+async fn a_child_of_a_non_leader_thread_names_its_parents_start() {
+    let mut sensor = ExecSensor::start()
+        .await
+        .expect("ExecSensor::start (need root + built eBPF artifact)");
+
+    let marker = format!("nn-leader-key-{}", std::process::id());
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut parent = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "thread_spawn_helper",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, &marker)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the helper");
+    let a_pid = parent.id();
+    let status = parent.wait().expect("wait for the helper");
+    assert!(
+        status.success(),
+        "the helper failed ({status}): its child was not forked by a non-leader thread"
+    );
+
+    // Every exec of A or by A seen, for the failure message.
+    let mut seen: Vec<String> = Vec::new();
+    let mut a_start: Option<u64> = None;
+    let mut b: Option<(u32, u64)> = None;
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        while a_start.is_none() || b.is_none() {
+            let evt = sensor.next_event().await.expect("sensor closed");
+            let Event::ProcessSpawn {
+                pid,
+                ppid,
+                argv,
+                start_ns,
+                parent_start_ns,
+                ..
+            } = &evt
+            else {
+                continue;
+            };
+            if *pid == a_pid || *ppid == a_pid {
+                seen.push(format!(
+                    "pid={pid} ppid={ppid} start_ns={start_ns} parent_start_ns={parent_start_ns} \
+                     argv={argv:?}"
+                ));
+            }
+            if *pid == a_pid && argv.iter().any(|a| a == "thread_spawn_helper") {
+                a_start = Some(*start_ns);
+            }
+            if *ppid == a_pid && argv.contains(&marker) {
+                b = Some((*pid, *parent_start_ns));
+            }
+        }
+    })
+    .await;
+
+    let a_start = a_start
+        .unwrap_or_else(|| panic!("no exec record of the helper (pid {a_pid}); seen: {seen:#?}"));
+    let (b_pid, b_parent_start) = b.unwrap_or_else(|| {
+        panic!("no exec record of the helper's child (ppid {a_pid}); seen: {seen:#?}")
+    });
+    assert_ne!(a_start, 0, "the helper's own start: {seen:#?}");
+    assert_eq!(
+        b_parent_start, a_start,
+        "pid {b_pid}, forked by a non-leader thread of {a_pid}: its parent's start must be \
+         the helper's (its leader's), not the forking thread's; seen: {seen:#?}"
+    );
+}
+
+/// The parent of [`a_child_of_a_non_leader_thread_names_its_parents_start`]
+/// (run by it with [`HELPER_ENV`] set; does nothing otherwise): forks
+/// `/bin/true <marker>` from a thread of its own, checked not to be the
+/// thread-group leader.
+#[test]
+#[ignore = "helper of a_child_of_a_non_leader_thread_names_its_parents_start"]
+fn thread_spawn_helper() {
+    let Ok(marker) = std::env::var(HELPER_ENV) else {
+        return;
+    };
+    let forked = std::thread::spawn(move || {
+        // SAFETY: gettid(2) and getpid(2) have no preconditions.
+        let (tid, pid) = unsafe { (libc::gettid(), libc::getpid()) };
+        assert_ne!(tid, pid, "the forking thread is the leader");
+        std::process::Command::new("/bin/true")
+            .arg(&marker)
+            .status()
+            .expect("spawn /bin/true")
+    })
+    .join()
+    .expect("the forking thread");
+    assert!(forked.success());
+}

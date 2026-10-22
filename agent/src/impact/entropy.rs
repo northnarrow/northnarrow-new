@@ -72,8 +72,18 @@ pub trait Sampler: Send + Sync {
     /// Sample the copies a copy-delete burst left behind: `copy` (an
     /// original's name with `.suffix` appended, the original deleted) and
     /// the other copies of that shape changed since `since`
-    /// ([`sample_copies_dir`]), never the originals beside them.
+    /// ([`sample_copies_dir`]), never the originals beside them. The burst's
+    /// uid is not known here: in a shared directory no copy counts.
     fn sample_copies(&self, copy: &str, suffix: &str, since: Duration) -> Sample;
+    /// [`Self::sample_copies`] for a burst that ran as `uid` (lab PR 238):
+    /// in a shared directory ([`shared_dir`]: `/tmp`, `/var/tmp`,
+    /// `/dev/shm`) only the copies `uid` owns count. What the tracker calls.
+    /// A sampler that answers by path (the tests', the golden replay's)
+    /// keeps this default: its [`Self::sample_copies`].
+    fn sample_copies_by(&self, copy: &str, suffix: &str, uid: u32, since: Duration) -> Sample {
+        let _ = uid;
+        self.sample_copies(copy, suffix, since)
+    }
 }
 
 /// The production sampler: the host's files.
@@ -104,7 +114,16 @@ impl Sampler for FsSampler {
             return Sample::default();
         }
         crate::runtime::off_the_runtime(|| {
-            sample_copies_dir(Path::new(copy), suffix, since, &host_view)
+            sample_copies_dir(Path::new(copy), suffix, None, since, &host_view)
+        })
+    }
+
+    fn sample_copies_by(&self, copy: &str, suffix: &str, uid: u32, since: Duration) -> Sample {
+        if !copy.starts_with('/') {
+            return Sample::default();
+        }
+        crate::runtime::off_the_runtime(|| {
+            sample_copies_dir(Path::new(copy), suffix, Some(uid), since, &host_view)
         })
     }
 }
@@ -121,7 +140,7 @@ fn recent(meta: &std::fs::Metadata, cutoff: Option<SystemTime>) -> bool {
 /// `since`, each reached through `host`.
 pub fn sample_dir(path: &Path, since: Duration, host: &dyn Fn(&Path) -> PathBuf) -> Sample {
     let cutoff = SystemTime::now().checked_sub(since);
-    let mut files: Vec<PathBuf> = vec![path.to_path_buf()];
+    let mut files: Vec<(PathBuf, Option<u32>)> = vec![(path.to_path_buf(), None)];
     if let Some(dir) = path.parent() {
         if let Ok(entries) = std::fs::read_dir(host(dir)) {
             for e in entries.take(DIR_SCAN_MAX).flatten() {
@@ -134,7 +153,7 @@ pub fn sample_dir(path: &Path, since: Duration, host: &dyn Fn(&Path) -> PathBuf)
                 }
                 let Ok(meta) = e.metadata() else { continue };
                 if meta.is_file() && meta.len() >= BLOCK as u64 && recent(&meta, cutoff) {
-                    files.push(name);
+                    files.push((name, None));
                 }
             }
         }
@@ -150,7 +169,9 @@ pub fn sample_dir(path: &Path, since: Duration, host: &dyn Fn(&Path) -> PathBuf)
 /// tree of small directories) but never across a world-writable sticky
 /// directory (below `/tmp`, beside `/tmp/x`: other users' trees); at most
 /// [`COPY_SCAN_MAX`] entries looked at in all, each reached through
-/// `host`.
+/// `host`. In a shared directory itself (the copy in `/tmp`) a copy counts
+/// only when `owner`, the uid the burst ran as, owns it — `copy` included
+/// (lab PR 238); with `owner` unknown, none there does.
 ///
 /// The originals that still wait their turn are never sampled: what sits
 /// beside the copies says nothing about what the burst wrote. In the lab's
@@ -162,10 +183,18 @@ pub fn sample_dir(path: &Path, since: Duration, host: &dyn Fn(&Path) -> PathBuf)
 pub fn sample_copies_dir(
     copy: &Path,
     suffix: &str,
+    owner: Option<u32>,
     since: Duration,
     host: &dyn Fn(&Path) -> PathBuf,
 ) -> Sample {
-    let mut files: Vec<PathBuf> = vec![copy.to_path_buf()];
+    let mut files: Vec<(PathBuf, Option<u32>)> = Vec::new();
+    // The copy the record names, as any other: in a shared directory
+    // anyone may have left a file under that name.
+    match copy.parent().map(|d| Owners::of(d, owner, host)) {
+        Some(Owners::Nobody) => {}
+        Some(Owners::Only(uid)) => files.push((copy.to_path_buf(), Some(uid))),
+        Some(Owners::Any) | None => files.push((copy.to_path_buf(), None)),
+    }
     let (Some(dir), false) = (copy.parent(), suffix.is_empty()) else {
         return examine(files, host);
     };
@@ -175,6 +204,7 @@ pub fn sample_copies_dir(
         cutoff: SystemTime::now().checked_sub(since),
         host,
         budget: COPY_SCAN_MAX,
+        owner,
     };
     // Below it and beside it — never under the root (`/proc`, `/sys`,
     // `/dev` are no tree an encryptor walks), nor across a shared
@@ -219,6 +249,32 @@ fn shared_dir(dir: &Path, host: &dyn Fn(&Path) -> PathBuf) -> bool {
     std::fs::metadata(host(dir)).is_ok_and(|m| m.is_dir() && m.mode() & shared == shared)
 }
 
+/// Whose copies count in a directory (lab PR 238).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owners {
+    /// An ordinary directory: whoever owns them (a share's tree included).
+    Any,
+    /// A shared directory ([`shared_dir`]): those of the uid the burst ran
+    /// as. Another user's fresh copies of ciphertext there — or copies
+    /// planted to have a benign job judged an encryptor — are not the
+    /// burst's. An encryptor's copies are new files: its own.
+    Only(u32),
+    /// A shared directory, the burst's uid unknown: none.
+    Nobody,
+}
+
+impl Owners {
+    fn of(dir: &Path, owner: Option<u32>, host: &dyn Fn(&Path) -> PathBuf) -> Self {
+        if !shared_dir(dir, host) {
+            return Owners::Any;
+        }
+        match owner {
+            Some(uid) => Owners::Only(uid),
+            None => Owners::Nobody,
+        }
+    }
+}
+
 /// The walk of [`sample_copies_dir`].
 struct CopyScan<'a> {
     skip: &'a Path,
@@ -227,17 +283,27 @@ struct CopyScan<'a> {
     host: &'a dyn Fn(&Path) -> PathBuf,
     /// Entries left to look at.
     budget: usize,
+    /// The uid the burst ran as, when known ([`Owners`]).
+    owner: Option<u32>,
 }
 
 impl CopyScan<'_> {
     /// The copies in `dir` into `files` (up to twice [`SAMPLE_FILES_MAX`]:
-    /// some may not be readable), its subdirectories into `subdirs`.
+    /// some may not be readable), each with the owner it must have to
+    /// count ([`Owners`]), its subdirectories into `subdirs`.
     fn dir(
         &mut self,
         dir: &Path,
-        files: &mut Vec<PathBuf>,
+        files: &mut Vec<(PathBuf, Option<u32>)>,
         mut subdirs: Option<&mut Vec<PathBuf>>,
     ) {
+        let only = match Owners::of(dir, self.owner, self.host) {
+            Owners::Any => None,
+            Owners::Only(uid) => Some(uid),
+            // Nothing here counts (a shared directory's subdirectories are
+            // not walked either).
+            Owners::Nobody => return,
+        };
         let Ok(entries) = std::fs::read_dir((self.host)(dir)) else {
             return;
         };
@@ -273,6 +339,12 @@ impl CopyScan<'_> {
             if meta.len() < BLOCK as u64 || !recent(&meta, self.cutoff) {
                 continue;
             }
+            // Another owner's, in a shared directory: not looked at (nor
+            // taking the place of one of the burst's). Checked again on
+            // the file opened ([`classify`]).
+            if only.is_some_and(|uid| meta.uid() != uid) {
+                continue;
+            }
             // Its original is gone: a copy still waiting for its deletion
             // (or a `.bak` kept beside its file) is not one.
             let gone = matches!(
@@ -280,20 +352,21 @@ impl CopyScan<'_> {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound
             );
             if gone {
-                files.push(name);
+                files.push((name, only));
             }
         }
     }
 }
 
-/// Read up to [`SAMPLE_FILES_MAX`] of `files`, in order.
-fn examine(files: Vec<PathBuf>, host: &dyn Fn(&Path) -> PathBuf) -> Sample {
+/// Read up to [`SAMPLE_FILES_MAX`] of `files`, in order; a file paired with
+/// a uid is read only when that uid owns it (lab PR 238).
+fn examine(files: Vec<(PathBuf, Option<u32>)>, host: &dyn Fn(&Path) -> PathBuf) -> Sample {
     let mut out = Sample::default();
-    for f in files {
+    for (f, owner) in files {
         if out.examined as usize >= SAMPLE_FILES_MAX {
             break;
         }
-        match classify(&host(&f)) {
+        match classify(&host(&f), owner) {
             Some(Kind::Ciphertext) => {
                 out.examined += 1;
                 out.high += 1;
@@ -316,9 +389,9 @@ enum Kind {
     Plain,
 }
 
-/// One file: `None` when it cannot be read or is no regular file of at
-/// least a block.
-fn classify(path: &Path) -> Option<Kind> {
+/// One file: `None` when it cannot be read, is no regular file of at
+/// least a block, or is not `owner`'s (when given).
+fn classify(path: &Path, owner: Option<u32>) -> Option<Kind> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
@@ -326,6 +399,9 @@ fn classify(path: &Path) -> Option<Kind> {
         .ok()?;
     let meta = f.metadata().ok()?;
     if !meta.is_file() || meta.size() < BLOCK as u64 {
+        return None;
+    }
+    if owner.is_some_and(|uid| meta.uid() != uid) {
         return None;
     }
     let mut head = vec![0u8; BLOCK];
@@ -448,6 +524,12 @@ mod tests {
         (t, w)
     }
 
+    /// The uid this test runs as: the owner of the files it writes.
+    fn me() -> u32 {
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
     fn random(n: usize, seed: u64) -> Vec<u8> {
         // xorshift: deterministic, uniform enough for an entropy test.
         let mut x = seed | 1;
@@ -536,7 +618,10 @@ mod tests {
         let mid = 4 * BLOCK;
         b[mid..mid + BLOCK].copy_from_slice(&random(BLOCK, 21));
         std::fs::write(&p, &b).unwrap();
-        assert_eq!(classify(&p), Some(Kind::Ciphertext));
+        assert_eq!(classify(&p, None), Some(Kind::Ciphertext));
+        // lab PR 238: read only when the uid it is given owns it
+        assert_eq!(classify(&p, Some(me())), Some(Kind::Ciphertext));
+        assert_eq!(classify(&p, Some(me().wrapping_add(1))), None);
     }
 
     /// Lab MS-23 copy-delete: the copies are sampled — the files named
@@ -570,6 +655,7 @@ mod tests {
         let s = sample_copies_dir(
             &d.join("r902.txt.locked"),
             "locked",
+            Some(me()),
             Duration::from_secs(120),
             &host,
         );
@@ -587,6 +673,7 @@ mod tests {
         let s = sample_copies_dir(
             &d2.join("app5.log.1.gz"),
             "gz",
+            Some(me()),
             Duration::from_secs(120),
             &host,
         );
@@ -595,6 +682,7 @@ mod tests {
         let s = sample_copies_dir(
             &d.join("r902.txt.locked"),
             "",
+            Some(me()),
             Duration::from_secs(120),
             &host,
         );
@@ -621,6 +709,7 @@ mod tests {
         let s = sample_copies_dir(
             &top.join("d0/a.odt.crypt"),
             "crypt",
+            Some(me()),
             Duration::from_secs(120),
             &host,
         );
@@ -632,7 +721,7 @@ mod tests {
         let mut b = random(BLOCK, 60);
         b[0] = 0x42;
         std::fs::write(&p, &b).unwrap();
-        let s = sample_copies_dir(&p, "crypt", Duration::from_secs(120), &host);
+        let s = sample_copies_dir(&p, "crypt", Some(me()), Duration::from_secs(120), &host);
         assert_eq!((s.examined, s.high), (1, 1));
         assert!(!s.holds());
     }
@@ -687,24 +776,139 @@ mod tests {
         };
         // Beside, in an ordinary directory: read.
         let copy = tree(&w.join("home"), "u2", 0o755, 0o755);
-        assert_eq!(sample_copies_dir(&copy, "part", since, &host), other_tree);
+        assert_eq!(
+            sample_copies_dir(&copy, "part", Some(me()), since, &host),
+            other_tree
+        );
         // Beside, in a shared directory: not read.
         let copy = tree(&w.join("tmp"), "u2", 0o1777, 0o700);
-        assert_eq!(sample_copies_dir(&copy, "part", since, &host), alone);
+        assert_eq!(
+            sample_copies_dir(&copy, "part", Some(me()), since, &host),
+            alone
+        );
         // A shared directory beside, in an ordinary one (`/var/tmp` from
         // `/var/x`): not read.
         let copy = tree(&w.join("var"), "tmp", 0o755, 0o1777);
-        assert_eq!(sample_copies_dir(&copy, "part", since, &host), alone);
+        assert_eq!(
+            sample_copies_dir(&copy, "part", Some(me()), since, &host),
+            alone
+        );
         // Below a shared directory (the copy in `/tmp` itself): not read;
-        // its own copies are.
+        // its own copies are (the burst's uid's, lab PR 238: this test's).
         let shared = w.join("tmp");
         std::fs::write(shared.join("b.csv.part"), &text).unwrap();
         let copy = shared.join("b.csv.part");
-        assert_eq!(sample_copies_dir(&copy, "part", since, &host), alone);
+        assert_eq!(
+            sample_copies_dir(&copy, "part", Some(me()), since, &host),
+            alone
+        );
         enc(shared.join("c.pdf.part"), 80);
         enc(shared.join("d.pdf.part"), 81);
-        let s = sample_copies_dir(&copy, "part", since, &host);
+        let s = sample_copies_dir(&copy, "part", Some(me()), since, &host);
         assert_eq!((s.examined, s.high), (3, 2), "{s:?}");
         assert!(s.holds());
+    }
+
+    /// Lab PR 238: in a shared directory itself (the burst's copy in
+    /// `/tmp`), only the copies of the uid the burst ran as count — the
+    /// copy the record names included: anyone may have left a file under
+    /// that name. Another uid's burst finds none of this test's copies
+    /// there, and nothing counts when the uid is unknown. In an ordinary
+    /// directory, a `0777` share included, the copies count whoever owns
+    /// them.
+    #[test]
+    fn in_a_shared_directory_only_the_bursts_own_copies_count() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, w) = sandbox();
+        let host = |p: &Path| p.to_path_buf();
+        let since = Duration::from_secs(120);
+        let other = me().wrapping_add(1);
+        let enc = |p: PathBuf, seed: u64| {
+            let mut b = random(2 * BLOCK, seed);
+            b[0] = 0x42;
+            std::fs::write(p, b).unwrap();
+        };
+        let three = |dir: &Path, mode: u32| {
+            std::fs::create_dir_all(dir).unwrap();
+            for (i, n) in ["a", "b", "c"].iter().enumerate() {
+                enc(dir.join(format!("{n}.pdf.locked")), 90 + i as u64);
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            dir.join("c.pdf.locked")
+        };
+        let all = Sample {
+            examined: 3,
+            high: 3,
+            containers: 0,
+        };
+        // `/tmp`-like: this test's burst counts them; another uid's, none
+        // (not even the copy its record names); an unknown uid, none.
+        let copy = three(&w.join("tmp"), 0o1777);
+        assert_eq!(
+            sample_copies_dir(&copy, "locked", Some(me()), since, &host),
+            all
+        );
+        assert!(sample_copies_dir(&copy, "locked", Some(me()), since, &host).holds());
+        assert_eq!(
+            sample_copies_dir(&copy, "locked", Some(other), since, &host),
+            Sample::default()
+        );
+        assert_eq!(
+            sample_copies_dir(&copy, "locked", None, since, &host),
+            Sample::default()
+        );
+        // An ordinary directory and a share without the sticky bit (each
+        // in a sandbox of its own: the walk looks beside): the copies
+        // count whoever owns them.
+        for (name, mode) in [("home", 0o755), ("share", 0o777)] {
+            let (_t, w) = sandbox();
+            let copy = three(&w.join(name), mode);
+            for owner in [Some(other), None] {
+                assert_eq!(
+                    sample_copies_dir(&copy, "locked", owner, since, &host),
+                    all,
+                    "{name} {owner:?}"
+                );
+            }
+        }
+    }
+
+    /// Lab PR 238, with copies of two owners side by side in a shared
+    /// directory (root: `chown`): the burst's own copies are read, the
+    /// other user's skipped — they neither count nor take the place of the
+    /// burst's in the sample.
+    #[test]
+    #[ignore = "requires root (chown to another uid)"]
+    fn in_a_shared_directory_another_users_copies_are_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_t, w) = sandbox();
+        let host = |p: &Path| p.to_path_buf();
+        let since = Duration::from_secs(120);
+        let dir = w.join("tmp");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let nobody = 65_534;
+        // eight of another user's copies of ciphertext, two of the burst's
+        // (one plain): more of the other's than the sample takes
+        for i in 0..8 {
+            let p = dir.join(format!("o{i}.doc.locked"));
+            let mut b = random(2 * BLOCK, 100 + i);
+            b[0] = 0x42;
+            std::fs::write(&p, b).unwrap();
+            std::os::unix::fs::chown(&p, Some(nobody), Some(nobody)).unwrap();
+        }
+        let mut b = random(2 * BLOCK, 120);
+        b[0] = 0x42;
+        std::fs::write(dir.join("m0.doc.locked"), b).unwrap();
+        let text = "plain report text, nothing encrypted here. ".repeat(300);
+        std::fs::write(dir.join("m1.doc.locked"), &text).unwrap();
+        let copy = dir.join("m1.doc.locked");
+        let s = sample_copies_dir(&copy, "locked", Some(me()), since, &host);
+        assert_eq!((s.examined, s.high), (2, 1), "{s:?}");
+        assert!(!s.holds());
+        // the other user's burst: its own eight (the named copy is not its)
+        let named = dir.join("o0.doc.locked");
+        let s = sample_copies_dir(&named, "locked", Some(nobody), since, &host);
+        assert_eq!((s.examined, s.high), (4, 4), "{s:?}");
     }
 }
