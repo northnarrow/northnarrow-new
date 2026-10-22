@@ -22,13 +22,10 @@ use std::io::{BufRead, ErrorKind};
 /// most `MAX_FRAME_BODY` (64 KiB, at most six bytes of JSON escape each),
 /// the rows the agent writes for itself and the rotating logs' records are
 /// built from bounded kernel records and rule texts. A longer line cannot
-/// be a row the agent wrote, and it is reported, not buffered.
+/// be a row the agent wrote, and it is reported, not buffered. The agent
+/// holds this cap to the admin protocol's frame bound at build time
+/// (`admin_socket`, R04a, lab PR 241).
 pub const MAX_VERIFY_LINE_BYTES: usize = 16 * 1024 * 1024;
-
-const _: () = assert!(
-    MAX_VERIFY_LINE_BYTES >= 6 * (nn_proto::admin_protocol::MAX_FRAME_BODY + 4096) + 64 * 1024,
-    "a row the agent can write must fit the verifiers' line cap"
-);
 
 /// What a line holds.
 #[derive(Debug, PartialEq, Eq)]
