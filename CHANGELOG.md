@@ -397,6 +397,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   New BTF offset `TASK_STRUCT_GROUP_LEADER_OFFSET` (required, resolved at
   boot like the others): slot 100; the enum, tracepoint and hook-argument
   slots move up by one (117 slots).
+- The quarantine vault's records carried no format version (lab PR 238):
+  a `.bin` was `nonce ‖ ciphertext ‖ tag`, the version only implied by the
+  HKDF salt `northnarrow-quarantine-v1`. New entries are written as v2:
+  `"NNQV" ‖ 0x02 ‖ nonce ‖ ciphertext ‖ tag`, the key salted
+  `northnarrow-quarantine-v2`, the header and the vault id authenticated
+  with the content, and `"format": 2` in the `.meta`. Entries written
+  before (no `format`) are read as v1, as they were. A `.meta` naming a
+  format the agent does not read, a header naming one, or a `.bin` whose
+  format differs from its `.meta`'s is refused with that reason before
+  anything is decrypted or written. The vectors of lab PR 230 and the v1
+  vault fixture pass unchanged; the v2 record is pinned too.
 - Rule shadowing (lab PR 236): NN-L-FIM-023 (systemd timer) was never
   reached behind NN-L-FIM-009 — both now match a `.timer`; a new
   `authorized_keys` under `/home` was NN-L-FIM-002's record and

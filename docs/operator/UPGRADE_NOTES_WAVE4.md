@@ -19,6 +19,10 @@ has the details of each change below.
 3. A dashboard, report or SIEM rule that counted `VERDICT (ADE)` lines,
    `EXECUTED (from ADE)` lines or advisor detections gets no new ones
    (§3).
+4. The quarantine vault keeps every entry and restores it as before; a
+   file quarantined after the upgrade is written in a new record format
+   that an agent from before it cannot restore (§5): restore such an
+   entry with this release, also after a rollback.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -131,3 +135,24 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
 - The release profile is unchanged (`lto = "fat"`, `panic = "abort"`); a
   build is shorter and the dependency graph smaller (about 150 crates fewer
   in `Cargo.lock`).
+
+## 5. The quarantine vault's record format (lab PR 238)
+
+A file the agent quarantines is kept encrypted in
+`/var/lib/northnarrow/quarantine/vault/<id>.bin`, described by
+`<id>.meta`. The `.bin` had no header: its format was implied by the key
+derivation alone. A new entry is now written as format 2: the `.bin`
+starts with `NNQV` and the byte `02`, which the encryption authenticates
+with the content, and the `.meta` says `"format": 2`.
+
+- **Nothing to migrate.** Entries written before the upgrade are not
+  rewritten: their `.meta` names no format, and they are read and restored
+  as before (`nn-admin response restore`, the same SHA-256 check).
+- **Rollback.** An agent from before this release does not read format 2:
+  its restore of a new entry fails (a decryption error) and writes
+  nothing; the entry stays in the vault for this release to restore.
+- **Refusals.** A `.meta` that names a format this agent does not read,
+  or a `.bin` whose header disagrees with its `.meta`, is refused with
+  that reason (`response restore` exits non-zero, nothing is written):
+  the entry was changed or damaged after it was written.
+
