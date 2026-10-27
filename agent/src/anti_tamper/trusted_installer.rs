@@ -44,7 +44,9 @@
 //!   zeroed only by an event-path sweep, and a host whose events had
 //!   stopped kept the files, the pin root and the kexec refusal open).
 //!   A one-second ticker closes the window on time and records it
-//!   ([`Self::close_if_expired`]).
+//!   ([`Self::close_if_expired`]). Lab PR 243: the window reads the time
+//!   through [`Clock`] (the host's by default; the golden replay of the
+//!   posture gives it its own, [`TrustedInstallerOverride::with_clock`]).
 //! - **anti-replay.** The signed grant is verified through the standard
 //!   `verify_signed_payload_quorum` path (single-use challenge nonce +
 //!   `agent_id` binding + skew), so a captured grant cannot be replayed
@@ -75,6 +77,7 @@ use super::{
     AyaFsGrant, AyaKillGrant, AGENT_SESSION_MAP_NAME, FS_GRANT_MAP_NAME, KILL_GRANT_MAP_NAME,
 };
 use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::posture::clock::{Clock, SystemClock};
 use common::wire::{FsGrant, KillGrant};
 
 /// Hard ceiling on a grant window. A grant whose `window_secs` exceeds
@@ -133,6 +136,10 @@ pub struct TrustedInstallerOverride {
     /// later. `None` ⇒ close is logged to tracing only.
     audit: Mutex<Option<Arc<Mutex<AuditLog>>>>,
     max_window: Duration,
+    /// Lab PR 243: where the window reads the time — the host's clocks,
+    /// or a replay's ([`Self::with_clock`]). The kernel grant's deadline
+    /// is the kernel's monotonic clock, always.
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Default)]
@@ -171,7 +178,16 @@ impl TrustedInstallerOverride {
             session_nonce,
             audit: Mutex::new(audit),
             max_window,
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    /// Lab PR 243: read the time from `clock` — the window's deadline and
+    /// its wall-clock end (the golden replay of the posture). Production
+    /// keeps the host's clocks.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Late-bind the audit-chain writer. main.rs constructs the override
@@ -320,11 +336,12 @@ impl TrustedInstallerOverride {
         // The deadline on the wall clock, from the monotonic one (`now` may
         // lie in the past: a test of an expired window).
         let deadline = now + window;
-        let mono_now = Instant::now();
+        let mono_now = self.clock.now();
+        let wall_now = chrono::DateTime::<chrono::Utc>::from(self.clock.wall());
         let wall = if deadline >= mono_now {
-            chrono::Utc::now() + chrono::Duration::from_std(deadline - mono_now).unwrap_or_default()
+            wall_now + chrono::Duration::from_std(deadline - mono_now).unwrap_or_default()
         } else {
-            chrono::Utc::now() - chrono::Duration::from_std(mono_now - deadline).unwrap_or_default()
+            wall_now - chrono::Duration::from_std(mono_now - deadline).unwrap_or_default()
         };
         {
             let mut inner = self.inner.lock();
@@ -363,7 +380,7 @@ impl TrustedInstallerOverride {
     /// rule-facing accessor: detection expires exactly at the deadline,
     /// independent of event flow.
     pub fn is_window_open(&self) -> bool {
-        self.is_active_at(Instant::now())
+        self.is_active_at(self.clock.now())
     }
 
     /// Lab PR 225: the grant of the window open as of `now` — its key id
@@ -374,6 +391,12 @@ impl TrustedInstallerOverride {
             return None;
         }
         self.inner.lock().grant.clone()
+    }
+
+    /// [`Self::grant_at`] clocked at the window's now (lab PR 243: its
+    /// [`Clock`], the host's in production).
+    pub fn current_grant(&self) -> Option<WindowGrant> {
+        self.grant_at(self.clock.now())
     }
 
     /// Lazy expiry on the event path. If a window is open but `now` is
@@ -708,6 +731,26 @@ mod tests {
         assert!(ov.grant_at(t0 + Duration::from_secs(121)).is_none());
         ov.close("test");
         assert!(ov.grant_at(t0 + Duration::from_secs(1)).is_none());
+    }
+
+    /// Lab PR 243: the window reads the time through its clock — whether
+    /// it is open, and its end on the wall clock — never the host's.
+    #[test]
+    fn the_window_reads_its_clock() {
+        use crate::posture::clock::{Clock, TestClock};
+        let clock = Arc::new(TestClock::at(
+            std::time::UNIX_EPOCH + Duration::from_secs(1_767_225_600),
+        ));
+        let ov = test_override(600).with_clock(clock.clone());
+        ov.arm_by(90, clock.now(), "c2e8f3da");
+        assert!(ov.is_window_open());
+        let g = ov.current_grant().expect("open window");
+        assert_eq!(g.expires_at, "2026-01-01T00:01:30Z");
+        clock.advance(Duration::from_secs(89));
+        assert!(ov.is_window_open());
+        clock.advance(Duration::from_secs(1));
+        assert!(!ov.is_window_open());
+        assert!(ov.current_grant().is_none());
     }
 
     #[test]

@@ -28,12 +28,15 @@
 //!
 //! Decay is monotonic-clock based (immune to wall-clock skew): the
 //! caller is expected to invoke [`PostureMachine::tick_decay`] on a
-//! periodic timer (60 s in `agent/src/main.rs`).
+//! periodic timer (60 s in `agent/src/main.rs`). Lab PR 243: the machine
+//! reads both clocks through [`clock::Clock`] (the host's by default), so
+//! the golden replay (`posture::golden`) runs it on a clock of its own.
 //!
 //! Admin release from `COMBAT` is a stub for Sub-tappa 6.5 — it
 //! takes a boolean flag. The Tappa 8 milestone replaces it with an
 //! Ed25519-signed command path.
 
+pub mod clock;
 pub mod corroboration;
 pub mod escalation_allow;
 pub mod exempt;
@@ -47,7 +50,7 @@ pub mod triggers;
 mod tests;
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -57,6 +60,7 @@ use nn_model::posture_types::{
 use nn_model::Event;
 
 use crate::anti_tamper::network_isolate::UnlockToken;
+use clock::Clock;
 use corroboration::CorroborationLedger;
 use escalation_allow::EscalationAllowList;
 
@@ -139,6 +143,9 @@ struct Inner {
     /// External audit POS-001: run when an unlocked COMBAT decays (the
     /// agent stands the ladder down). Set once at boot.
     combat_decay_hook: std::sync::OnceLock<CombatEntryHook>,
+    /// Lab PR 243: where the machine reads the time — the host's clocks
+    /// ([`clock::SystemClock`]), or a replay's ([`PostureMachine::with_clock`]).
+    clock: Arc<dyn Clock>,
 }
 
 impl PostureMachine {
@@ -301,8 +308,26 @@ impl PostureMachine {
                 combat_release_hook,
                 last_admin_action: Mutex::new(None),
                 combat_decay_hook: std::sync::OnceLock::new(),
+                clock: Arc::new(clock::SystemClock),
             }),
         }
+    }
+
+    /// Lab PR 243: run the machine on `clock` — its timers and the
+    /// wall-clock second of its transition records — instead of the
+    /// host's clocks (the golden replay of the posture). Call before the
+    /// machine is shared (cloned); a later call is ignored, said so.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.clock = clock,
+            None => tracing::warn!("posture clock set after the machine was shared — ignored"),
+        }
+        self
+    }
+
+    /// The monotonic now of the machine's clock.
+    fn now(&self) -> Instant {
+        self.inner.clock.now()
     }
 
     /// External audit POS-001: COMBAT on evidence an unprivileged user
@@ -365,7 +390,7 @@ impl PostureMachine {
         event: &Event,
         recent_events: impl Into<triggers::Recent<'a>>,
     ) -> Option<(PostureState, Option<TriggerType>)> {
-        let now = Instant::now();
+        let now = self.now();
         let hits = self.inner.triggers.detect(event, recent_events);
         if hits.is_empty() {
             return None;
@@ -581,7 +606,7 @@ impl PostureMachine {
             tracing::warn!(%trigger, "raise_signal refused: only ALERTED-tier signals are accepted");
             return None;
         }
-        let now = Instant::now();
+        let now = self.now();
         let mut guard = self.inner.state.write();
         let before = guard.kind();
         let next = transitions::apply_to_level(&guard, trigger.target_level(), now);
@@ -599,7 +624,7 @@ impl PostureMachine {
     /// Apply decay if the appropriate window has elapsed. Returns
     /// `Some(new_state)` if a transition fired.
     pub fn tick_decay(&self) -> Option<PostureState> {
-        self.tick_decay_at(Instant::now())
+        self.tick_decay_at(self.now())
     }
 
     /// [`Self::tick_decay`] as of `now`.
@@ -672,7 +697,7 @@ impl PostureMachine {
             tracing::warn!("admin override required to leave COMBAT (denied)");
             return Err(AdminReleaseError::Unauthorized);
         }
-        let now = Instant::now();
+        let now = self.now();
         let mut guard = self.inner.state.write();
         if !matches!(*guard, PostureState::Combat { .. }) {
             return Err(AdminReleaseError::NotInCombat);
@@ -737,7 +762,7 @@ impl PostureMachine {
     ///   its outcome is returned the same way — an unlock outside COMBAT is
     ///   idempotent when the tables read back clear.
     ///
-    /// On success records `Instant::now()` in `last_admin_action`,
+    /// On success records the machine's now in `last_admin_action`,
     /// surfaced via [`Self::last_admin_action_secs_ago`] for the
     /// `nn-admin status` response.
     pub fn admin_release_combat_with_token(
@@ -766,7 +791,7 @@ impl PostureMachine {
                 detail,
             });
         }
-        let now = Instant::now();
+        let now = self.now();
         let mut guard = self.inner.state.write();
         if !matches!(*guard, PostureState::Combat { .. }) {
             // COMBAT ended while the release ran (an unlocked COMBAT that
@@ -823,10 +848,11 @@ impl PostureMachine {
     }
 
     pub fn last_admin_action_secs_ago(&self) -> Option<u64> {
+        let now = self.now();
         self.inner
             .last_admin_action
             .lock()
-            .map(|t| t.elapsed().as_secs())
+            .map(|t| now.saturating_duration_since(t).as_secs())
     }
 
     /// Tappa 8 A10 — production force-posture (design §12.2).
@@ -846,7 +872,7 @@ impl PostureMachine {
     /// - Lateral non-COMBAT transitions (e.g. Alerted → Engaged)
     ///   log the transition but fire no hook.
     ///
-    /// Records `Instant::now()` in `last_admin_action` on any
+    /// Records the machine's now in `last_admin_action` on any
     /// actual transition — surfaced via
     /// [`Self::last_admin_action_secs_ago`] for `nn-admin status`.
     ///
@@ -899,7 +925,7 @@ impl PostureMachine {
         } else {
             (Some(token), None)
         };
-        let now = Instant::now();
+        let now = self.now();
         let mut guard = self.inner.state.write();
         let before = guard.kind();
         if before == PostureKind::Combat && target != PostureKind::Combat {
@@ -996,7 +1022,7 @@ impl PostureMachine {
     /// in production prevents accidental misuse.
     #[cfg(feature = "debug-trigger")]
     pub fn force_state_for_test(&self, target: PostureKind) {
-        let now = Instant::now();
+        let now = self.now();
         let mut guard = self.inner.state.write();
         let before = guard.kind();
         let next = match target {
@@ -1044,7 +1070,10 @@ impl PostureMachine {
         trigger: Option<TriggerType>,
         reason: String,
     ) {
-        let unix_ts_secs = SystemTime::now()
+        let unix_ts_secs = self
+            .inner
+            .clock
+            .wall()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
