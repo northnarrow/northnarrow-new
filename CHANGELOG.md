@@ -417,6 +417,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- NN-L-CHAIN-002 (`/tmp` exec, then egress) was missed when the exec
+  record reached the engine after the egress it preceded (lab PR 244; the
+  race lab PR 235 fixed for NN-L-CHAIN-007): the egress was judged before
+  the staging exec was known, and the exec completed nothing. The egress
+  the engine notes for a late precursor now keeps its destination address
+  and port, so a late exec completes CHAIN-002 on the kernel timestamps,
+  naming the egress, with the in-order rule's resolver exemption, package
+  carve-out and port-53 hold. A flow still gets at most two chain verdicts
+  — the two-step one, then NN-L-CHAIN-007 — and CHAIN-002 now also claims
+  the egress it answers in order, so a second staging exec of the process
+  completes no second CHAIN-002 with it.
 - An exec record named, as its parent's start (`parent_start_ns`, the
   PID-reuse key of the lineage), the start of the THREAD that forked it
   (lab PR 238, the follow-up of lab PR 120 known as lot 122): the eBPF

@@ -1241,3 +1241,41 @@ only in the table below, in the same PR as the evidence.
     privileged tests; the ladder's worker thread runs inline in the replay
     (what an event sees while a step is queued is not replayed).
   - Lab: no guest (a replay of the agent library and seams that keep every call; no behaviour change: the decision replay's golden files unchanged). Host, on 00f9e15 (the final tree but for this line; the lot's four commits on `main` 70715b2, lab PR 241 merged): `cargo xtask build-ebpf --release` (`common` and the eBPF crates untouched: the stamp's source c0365736…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,011 passed, 0 failed, 15 ignored (the lot's 8 tests: the posture replay's 5, the two clock seams', xtask's directory check; no `#[ignore]` test added); `cargo xtask attack-coverage --check`; `cargo xtask golden` (both replays, 9 tests); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; no lockfile changed by the build): all pass. Determinism: 25 separate test processes (20 with the default threads, 5 with `--test-threads=1`) each found the 8 posture golden files byte-identical to the committed ones, each process also replaying every case 3 times on one thread and once on each of 4 threads at once; `cargo xtask golden --update` changed no file; with `CI` set, `--update` and `NN_GOLDEN_UPDATE=1` are refused. No temporary directory is left behind: the first version of the harness kept each replay's host, and its `/proc`, alive through an `Arc` cycle between the posture's hooks and the ladder's gate (416 directories in `/tmp`, removed); the hooks now hold the ladder weakly and `a_replay_leaves_no_directory_behind` holds it. The same gates on 2af276e, before that fix: all pass, 3,010 passed.
+- **Lab PR 244 — NN-L-CHAIN-002 completed by a `/tmp` exec processed
+  after the egress.** C14 (behavioural detection and correlation); Wave 4
+  Phase 2.
+  - What was wrong: the exec record of a staged program comes through its
+    own ring and pump, so it can reach the engine after the connect it
+    preceded in kernel time; the connect was then judged without the
+    `TmpExec` precursor, and the exec completed nothing: NN-L-CHAIN-002
+    was missed (R001's kill on the exec, no Critical chain verdict). Lab PR
+    235 fixed the same race for NN-L-CHAIN-007 and left CHAIN-002 out on
+    purpose: the noted egress had no destination port, which CHAIN-002
+    needs to leave a lookup at a configured resolver alone (lab PR 224)
+    and to hold its port-53 kill (`PORT_53_KILL`).
+  - What changed: the egress note keeps the destination address and port
+    (`EgressNote::of`: two fixed-size fields; still at most four notes per
+    process and 4,096 processes). A staging exec judges the unclaimed
+    notes of its process on the kernel timestamps
+    (`CorrelationStore::exec_egresses`): the earliest egress at or after
+    the exec and within 300 s of it that is neither a lookup at a
+    configured resolver nor a package transaction's completes CHAIN-002,
+    the verdict naming the egress, its port-53 kill held as in order; the
+    exec's start must be known. The claim on a noted egress names the
+    two-step chain that made it (`CredRead` for CHAIN-001, `TmpExec` for
+    CHAIN-002), and CHAIN-002 now claims in order too: a late two-step
+    completion needs an unclaimed egress; CHAIN-007 takes one claimed by
+    CHAIN-002 on a late read (the read is the step it lacked) and any on a
+    late exec, as lab PR 235 left it. The flow-ledger rule is unchanged: at
+    most two chain verdicts per flow, the two-step one first, then
+    CHAIN-007. The comments of `chain.rs` and `ancestry.rs` no longer call
+    `parent_start_ns` the forking thread's start (the parent's thread-group
+    leader's since lab PR 238). Tests: 3 of the store (the note's
+    destination, the late exec's candidates, the claim), 7 of the chains
+    (the CI ordering with and without the read, the in-order claim, the
+    resolver exemption and the port-53 hold, the window, the ordering, the
+    package carve-out), 1 of the engine (the late exec's decision with
+    R001 and one kill; two chain verdicts for the flow); golden cases
+    `chain002-late-exec` and `chain002-late-exec-resolver`, every other
+    golden file byte-identical.
+  - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX), this PR's code (local commit db39770, on `main` 70715b2, before the rebase below) synced, built and installed (`nn-lab.sh sync`, `build`, `install`: the agent and the watchdog active), the installed units then stopped the operator way (`lab_purge_pins`, no LSM program left), and `detection_rules_at_scale_privileged_e2e` (16 tests, NN-L-CHAIN-002 positive and negative and NN-L-CHAIN-004..008 among them) run 10 times as root, single-threaded, with `--include-ignored`: 10 of 10 runs passed, 16 of 16 tests each (47 to 50 s a run); the units put back, the guest powered off. Host, on db39770 and again after the rebase onto `main` 1f70068 (#444: uuid 1.29 in `Cargo.lock` and `fuzz/Cargo.lock`): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,014 passed, 0 failed; `cargo xtask attack-coverage --check`; `cargo xtask golden` (the two new golden files, every other one unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass, both times.

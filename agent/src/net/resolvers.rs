@@ -189,7 +189,18 @@ impl HostResolvers {
 /// A flow to the DNS port of a configured resolver: the resolution a
 /// staged image may make (NN-L-NET-008, NN-L-CHAIN-002/005).
 pub fn is_resolver_flow(nf: &nn_model::telemetry::NetFlowEvent, resolvers: &HostResolvers) -> bool {
-    nf.dst_port == DNS_PORT && resolvers.contains(&nf.dst_addr)
+    is_resolver_destination(&nf.dst_addr, nf.dst_port, resolvers)
+}
+
+/// [`is_resolver_flow`] by the flow's destination: lab PR 244, an egress
+/// NN-L-CHAIN-002 judges from its note when the staging exec that preceded
+/// it is processed after it.
+pub fn is_resolver_destination(
+    dst_addr: &IpAddr,
+    dst_port: u16,
+    resolvers: &HostResolvers,
+) -> bool {
+    dst_port == DNS_PORT && resolvers.contains(dst_addr)
 }
 
 #[cfg(test)]

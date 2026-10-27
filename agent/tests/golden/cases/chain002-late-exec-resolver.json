@@ -1,0 +1,9 @@
+{
+  "about": "Lab PR 244: a user's program staged in /tmp makes a lookup at the host's configured resolver (127.0.0.53, port 53), and its exec record reaches the engine after it. A lookup at a configured resolver is no egress for NN-L-CHAIN-002 in order (lab PR 224, `port53-held`), nor for a late exec: the exec's record is R001's alone, no chain.",
+  "fires": ["R001_ExecFromTmp"],
+  "resolvers": ["127.0.0.53"],
+  "items": [
+    {"event": {"NetFlow": {"start_ns": 3611000000000, "end_ns": 3611050000000, "family": 2, "src_addr": "10.0.2.15", "src_port": 40200, "dst_addr": "127.0.0.53", "dst_port": 53, "proto": 17, "pid": 6440002, "uid": 1000, "comm": "dropper", "exe": "/tmp/.d/dropper", "proc_start_ns": 3609000000000, "bytes_sent": 64, "bytes_recv": 0, "resolved_hostname": null, "tls_fingerprint": null, "flow_id": "golden-6440002-3611000000000", "phase": "closed"}}},
+    {"event": {"ProcessSpawn": {"pid": 6440002, "ppid": 1, "uid": 1000, "gid": 1000, "comm": "dropper", "filename": "/tmp/.d/dropper", "timestamp_ns": 3610000000000, "argv": ["/tmp/.d/dropper"], "parent_comm": "systemd", "start_ns": 3609000000000, "exe": {"path": "/tmp/.d/dropper"}}}}
+  ]
+}
