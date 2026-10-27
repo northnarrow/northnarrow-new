@@ -38,8 +38,8 @@
 //!
 //! Every value is derived from a seed: `SHA-256(seed || ":" || field)`,
 //! truncated and mapped to the family's alphabet. The deploy (and a
-//! refresh) draws a fresh 32-byte seed from the OS RNG
-//! ([`new_content_seed`]) and records it in the registry row with the
+//! refresh) draws a fresh 32-byte seed from the OS RNG (the agent's
+//! `new_content_seed`) and records it in the registry row with the
 //! SHA-256 of the bytes written, so two deploys never render the same
 //! content and a decoy can be re-rendered from its row. The seed used to
 //! be `"<operator key fingerprint>:<path>"`: the fingerprint appeared in
@@ -79,10 +79,9 @@ use std::path::PathBuf;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use nn_core::content_host::ContentHost;
 use sha2::{Digest, Sha256};
 
-use crate::chain_host_linux::LinuxHost;
+use crate::content_host::ContentHost;
 
 /// Default deploy location of the operator-overrideable
 /// template directory. K7 `install.sh` drops the repo's
@@ -231,15 +230,6 @@ pub const SUPERSEDED_TEMPLATE_SHA256: &[(&str, &str)] = &[
     ),
 ];
 
-/// A fresh content seed (external audit DEC-008): 32 bytes from the OS
-/// RNG, hex. One per deploy and per refresh, recorded in the registry row.
-pub fn new_content_seed() -> String {
-    use rand::Rng;
-    let mut seed = [0u8; 32];
-    crate::os_rng::OsRng.fill_bytes(&mut seed);
-    hex::encode(seed)
-}
-
 /// The body of a File canary (external audit DEC-007): bytes derived from
 /// `seed`, 512 to 4095 of them — no marker, no fingerprint, no rule id,
 /// and no size or content shared by every decoy. It used to be three
@@ -257,7 +247,7 @@ pub fn render_file_body(seed: &str) -> Vec<u8> {
     out
 }
 
-/// Pure renderer. Given a content `seed` (see [`new_content_seed`]),
+/// Pure renderer. Given a content `seed` (the agent's `new_content_seed`),
 /// produce the canary's file content for `family`. Output is
 /// deterministic per seed — the same seed always renders the same
 /// bytes, so a row's recorded seed re-renders its decoy.
@@ -266,12 +256,12 @@ pub fn render_file_body(seed: &str) -> Vec<u8> {
 /// directory for tests; production callers pass
 /// `Some(Path::new(DEFAULT_TEMPLATE_DIR))`. `None` skips the
 /// override lookup entirely (built-in templates only).
-pub fn render(
+pub fn render<H: ContentHost>(
     family: CredFamily,
     seed: &str,
     template_dir: Option<&std::path::Path>,
 ) -> Result<String, RenderError> {
-    let template = load_template::<LinuxHost>(family, template_dir)?;
+    let template = load_template::<H>(family, template_dir)?;
     let placeholders = build_placeholders(family, seed);
     let out = substitute(&template, &placeholders)?;
     // External audit DEC-017: a JSON family's decoy is a JSON document.
@@ -659,10 +649,20 @@ fn short_id(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_host::testing::PortableHost;
     use tempfile::TempDir;
 
+    /// The renderer on the portable host (R07, lab PR 247).
+    fn render(
+        family: CredFamily,
+        seed: &str,
+        template_dir: Option<&std::path::Path>,
+    ) -> Result<String, RenderError> {
+        super::render::<PortableHost>(family, seed, template_dir)
+    }
+
     /// Stable seed for deterministic-output assertions (a real one is
-    /// 64 hex chars from [`new_content_seed`]).
+    /// 64 hex chars from the agent's `new_content_seed`).
     const TEST_ID: &str = "9f3c8a01b2c3d4e5f6a7b8c9d0e1f2a3";
 
     const FAMILIES: [CredFamily; 5] = [

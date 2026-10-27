@@ -168,7 +168,6 @@ planned = false
 "canary::readers" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
-"canary::templates" = "nn-core"
 # post-plan (lab PR 241, R04a): the chains' Linux file operations
 "chain_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
@@ -281,6 +280,9 @@ planned = false
 [shims.agent]
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
+# R07 (lab PR 247): the credential renderer; `canary/mod.rs` binds it to the
+# agent's host and draws the deploy's seed from the OS RNG
+"canary::templates" = "nn-core"
 # R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
 # binds its reading loaders to the agent's host
 "config::overlay" = "nn-core"
@@ -337,11 +339,12 @@ planned = false
 # overlay_auth's install half leaves for nn-linux (→ 42); it names the
 # exec profile in `execpol::policy`, where it is defined (→ 41); the
 # inactive network rules (the resolver's DNS over TLS) leave the
-# blocklist for `net::blind_spots` (→ 40).
+# blocklist for `net::blind_spots` (→ 40); the canary renderer moves to
+# nn-core and the OS RNG of its seed stays in the agent (→ 38).
 
 [ratchet]
 nn-admin = 8
-nn-core = 40
+nn-core = 38
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

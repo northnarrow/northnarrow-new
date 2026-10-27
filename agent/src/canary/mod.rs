@@ -31,7 +31,33 @@ pub mod path_policy;
 pub mod read_forward;
 pub mod readers;
 pub mod registry;
-pub mod templates;
+/// R07 shim (lab PR 247; plan §4.1 rule 2, removed in R17): the credential
+/// renderer is nn-core's. It reads an operator template through the agent's
+/// host (`LinuxHost`), under its old name and signature; the deploy's seed
+/// is drawn from the OS RNG here.
+pub mod templates {
+    pub use nn_core::canary::templates::*;
+
+    use crate::chain_host_linux::LinuxHost;
+
+    /// A fresh content seed (external audit DEC-008): 32 bytes from the OS
+    /// RNG, hex. One per deploy and per refresh, recorded in the registry row.
+    pub fn new_content_seed() -> String {
+        use rand::Rng;
+        let mut seed = [0u8; 32];
+        crate::os_rng::OsRng.fill_bytes(&mut seed);
+        hex::encode(seed)
+    }
+
+    /// [`nn_core::canary::templates::render`] on the agent's host.
+    pub fn render(
+        family: CredFamily,
+        seed: &str,
+        template_dir: Option<&std::path::Path>,
+    ) -> Result<String, RenderError> {
+        nn_core::canary::templates::render::<LinuxHost>(family, seed, template_dir)
+    }
+}
 
 /// The deploy's seed: drawn fresh from the OS for each decoy. R07 (lab PR
 /// 247): from `templates`' tests (the renderer's own run on a portable

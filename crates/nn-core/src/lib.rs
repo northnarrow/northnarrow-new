@@ -29,6 +29,13 @@ pub mod config {
     pub mod overlay_auth;
 }
 
+/// Deception content (R07, lab PR 247): the credential canaries' renderer
+/// (was the agent's `canary::templates`).
+pub mod canary {
+    /// The five credential families' decoys, rendered from a seed.
+    pub mod templates;
+}
+
 /// FIM content (R07, lab PR 247): the watched paths (was the agent's
 /// `fim::paths_config`).
 pub mod fim {
