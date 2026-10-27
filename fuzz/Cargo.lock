@@ -889,6 +889,7 @@ dependencies = [
  "nn-model",
  "nn-proto",
  "northnarrow-antitamper-bpf",
+ "northnarrow-common",
  "parking_lot",
  "rand",
  "serde_json",

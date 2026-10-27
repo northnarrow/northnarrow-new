@@ -51,9 +51,10 @@ use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::chain_host_linux::LinuxHost;
 
 pub const BASE_SECS: u64 = 30;
-/// The op of the signed integrity findings (the audit chain's since R04a,
-/// lab PR 241).
-pub const AUDIT_OP: &str = crate::audit::INTEGRITY_DRIFT_OP;
+/// The op of the signed integrity findings, and the jitter of the
+/// self-checks' interval ([`jittered`]): nn-linux's (R09a, lab PR 253: the
+/// self-defence and the actuators, which move to nn-linux, name them), under their paths here.
+pub use nn_linux::self_integrity::{jittered, AUDIT_OP};
 
 /// Units whose drop-ins, copies and masks are checked. Lab PR 216: the
 /// watchdog's `OnFailure=` handler too — masked or overridden, systemd's
@@ -273,25 +274,6 @@ const LIMIT_WATCHDOG_OOM: &str = "watchdog oom_score_adj";
 pub struct Finding {
     pub kind: &'static str,
     pub detail: String,
-}
-
-/// Jitter `base` by ±20 % (xorshift on the clock; unpredictability, not
-/// cryptography).
-pub fn jittered(base: Duration) -> Duration {
-    let mut x = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E37_79B9_7F4A_7C15)
-        ^ ((std::process::id() as u64) << 17);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    let ms = base.as_millis() as u64;
-    let span = ms / 5; // 20 %
-    if span == 0 {
-        return base;
-    }
-    Duration::from_millis(ms - span + x % (2 * span + 1))
 }
 
 /// Environment variables of this process that weaken it.

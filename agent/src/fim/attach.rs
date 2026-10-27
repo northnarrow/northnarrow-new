@@ -88,17 +88,9 @@ pub const WATCHED_PATHS_CAPACITY: usize = 8192;
 /// static.
 pub const FS_FIM_EVENTS_MAP: &str = "FS_FIM_EVENTS";
 
-/// Convert the userland-encoded `dev_t` returned by `stat(2)` /
-/// `MetadataExt::dev()` back into the kernel-internal `MKDEV`
-/// form. Mirrors
-/// [`crate::anti_tamper::filesystem::stat_dev_to_kernel_dev`]
-/// (private there — duplicated here so the FIM module doesn't
-/// reach into anti-tamper internals).
-pub(crate) fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
-    let major = libc::major(st_dev) as u64;
-    let minor = libc::minor(st_dev) as u64;
-    (major << 20) | minor
-}
+/// [`nn_linux::fim::attach::stat_dev_to_kernel_dev`] (R09a, lab PR 253:
+/// the canary registry, which moves to nn-linux, names it), under its path here.
+pub(crate) use nn_linux::fim::attach::stat_dev_to_kernel_dev;
 
 /// Aya `Pod` wrapper for `InodeKey`. Same pattern as
 /// `crate::anti_tamper::filesystem::AyaInodeKey` — orphan rule
@@ -663,17 +655,9 @@ pub fn take_watched_paths_map(ebpf: &mut Ebpf) -> Result<WatchedPathsHandle> {
     })
 }
 
-/// Tappa 9 C8 — diagnostic helper. Stat a candidate path and
-/// return its kernel-form `InodeKey` for cross-checking against
-/// `WATCHED_PATHS` map dumps. Used in privileged e2e tests.
-pub fn key_for_path(path: &Path) -> Result<InodeKey> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("symlink_metadata({})", path.display()))?;
-    Ok(InodeKey {
-        dev: stat_dev_to_kernel_dev(meta.dev()),
-        ino: meta.ino(),
-    })
-}
+/// [`nn_linux::fim::attach::key_for_path`] (R09a, lab PR 253: the
+/// self-defence, which moves to nn-linux, names it), under its path here.
+pub use nn_linux::fim::attach::key_for_path;
 
 #[cfg(test)]
 mod tests {

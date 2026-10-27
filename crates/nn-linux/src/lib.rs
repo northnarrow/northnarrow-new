@@ -41,6 +41,14 @@ pub mod atomic_file;
 // `bounded_cmd`).
 pub mod bounded_cmd;
 
+/// FIM (R09a, lab PR 253): the helpers the self-defence and the canary
+/// registry name, cut from the agent's `fim::attach` (the FIM's attach,
+/// drain, baseline, honeypot and recompute are R09b's).
+pub mod fim {
+    /// The kernel's form of a `stat(2)` device number, a path's `InodeKey`.
+    pub mod attach;
+}
+
 // The filesystems the agent's files live on, by identity (R09a; was the
 // agent's `fs_type`).
 pub mod fs_type;
@@ -52,6 +60,10 @@ pub mod os_rng;
 // Blocking work kept off the async runtime's worker threads (R09a; was the
 // agent's `runtime`).
 pub mod runtime;
+
+/// The self-integrity watcher's pieces the self-defence and the actuators
+/// name (R09a, lab PR 253; cut from the agent's `self_integrity`, R09c's).
+pub mod self_integrity;
 
 // The system directories' binaries, never `$PATH` (R09a; was the agent's
 // `trusted_bin`).

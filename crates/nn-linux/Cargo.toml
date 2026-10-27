@@ -17,6 +17,8 @@ publish = false
 # same versions and features (one version each in the workspace).
 # `atomic_file`: the writer shared with the watchdog.
 antitamper-bpf = { workspace = true }
+# `fim::attach`: the kernel's `InodeKey` (`common::wire`).
+common = { workspace = true }
 # `agent_id`: the identity's names in the audit chain (`AgentIdentity`,
 # `AGENT_ID_LEN`) and its parser (`shutdown_marker::parse_agent_id`);
 # `fs_type`: log escaping.
