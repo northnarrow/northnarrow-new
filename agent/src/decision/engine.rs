@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use nn_model::telemetry::FlowPhase;
-use nn_model::{Event, Verdict};
+use nn_model::{CanaryAccessKind, Event, Verdict};
 use parking_lot::Mutex;
 
 use super::attack::AttackRef;
@@ -211,12 +211,30 @@ impl RuleEngine {
     /// answered the flow in an earlier phase is skipped, and a flow gets
     /// chain verdicts in one phase only ([`flow_ledger`]). A verdict on an
     /// open flow, or on a refused connect, says so in its reasoning.
+    ///
+    /// Lab PR 246: a network canary trip owns its connection — the trip is
+    /// the connect, NN-L-CANARY-003 answers it — and no rule judges a row
+    /// of that connection ([`Self::owned_by_trip`]).
     pub fn decide(&self, event: &Event) -> Option<Decision> {
+        if let Event::CanaryTripped {
+            access_kind: CanaryAccessKind::NetworkConnect,
+            accessor_pid,
+            timestamp_ns,
+            ..
+        } = event
+        {
+            self.flow_ledger
+                .lock()
+                .claim_for_trip((*accessor_pid, *timestamp_ns));
+        }
         let flow = match event {
             Event::NetFlow(nf) => Some(nf),
             _ => None,
         };
         let key = flow.map(|nf| (nf.pid, nf.start_ns));
+        if self.owned_by_trip(event) {
+            return None;
+        }
         let fired = key.and_then(|k| self.flow_ledger.lock().fired(&k));
         let policy = self.policy.current();
         // The event's actor, for a uid exemption (read once, if asked).
@@ -296,6 +314,25 @@ impl RuleEngine {
     /// Flows the engine remembers a verdict for (tests, metrics).
     pub fn open_flows_with_verdicts(&self) -> usize {
         self.flow_ledger.lock().len()
+    }
+
+    /// Lab PR 246: whether `event` is a row of a connection a network
+    /// canary trip owns — the connect the engine decided as an
+    /// `Event::CanaryTripped` (`NetworkConnect`): its accessor and its
+    /// connect time, the key every row of the connection carries
+    /// ([`flow_ledger`]). Such a row is the trip's: `main.rs` records it
+    /// (netflow log) and does not judge it again — no posture signal, no
+    /// rule; [`Self::decide`] judges it with no rule either. Judged, the
+    /// trip's own close drew NN-L-CHAIN-003, a second Critical for one
+    /// access (the KVM failure of 27/10/2026).
+    pub fn owned_by_trip(&self, event: &Event) -> bool {
+        match event {
+            Event::NetFlow(nf) => self
+                .flow_ledger
+                .lock()
+                .owned_by_trip(&(nf.pid, nf.start_ns)),
+            _ => false,
+        }
     }
 }
 

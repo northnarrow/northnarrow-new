@@ -1088,7 +1088,10 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> Option<std::process::ExitS
 /// - a second connect is recorded with `first_trip = false` and, as every
 ///   connect to a network canary (external audit NETR-006), killed;
 /// - the close of a trip's connection is not judged again: no
-///   NN-L-CHAIN-003 record (checked after an exec barrier).
+///   NN-L-CHAIN-003 record (checked after an exec barrier). Lab PR 246:
+///   whichever ring the agent reads first — the KVM run of 27/10/2026 had
+///   the close synthesised by the flow tracker (`127.0.0.1:0`, the refused
+///   connect's port cleared) and judged after the trip as an egress.
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn network_canary_connect_trips_canary_003_and_kills_the_connector() {

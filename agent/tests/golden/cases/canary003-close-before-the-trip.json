@@ -1,0 +1,92 @@
+{
+ "about": "Lab PR 246: the other order of the same trip. The close of the refused connect reaches the engine before the trip (the close ring read first; past the drain's wait for its connect, or with the connect lost): it is judged as any flow, before any precursor, and noted as an egress for a precursor processed later (review 70). The trip then owns the connection and drops that note: a credential read of the shell processed after both, though made before the connect, is the read's record alone (NN-L-FIM-016) — no NN-L-CHAIN-001 completed with the trip's own connection. A later flow of the shell is an egress after the read and the trip: NN-L-CHAIN-001 and NN-L-CHAIN-003.",
+ "fires": [
+  "NN-L-CANARY-003_NetworkConnect",
+  "NN-L-FIM-016_PasswordManagerDbAccessed",
+  "NN-L-CHAIN-001_CredReadThenEgress",
+  "NN-L-CHAIN-003_CanaryThenEgress"
+ ],
+ "items": [
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3655817248000,
+     "end_ns": 3655817288000,
+     "family": 2,
+     "src_addr": "127.0.0.1",
+     "src_port": 52000,
+     "dst_addr": "127.0.0.1",
+     "dst_port": 0,
+     "proto": 6,
+     "pid": 6460002,
+     "uid": 0,
+     "comm": "bash",
+     "exe": null,
+     "proc_start_ns": 0,
+     "bytes_sent": 0,
+     "bytes_recv": 0,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6460002-3655817248000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "CanaryTripped": {
+     "canary_id": "85e1875c23bc4a795484f81a1519f39a",
+     "canary_name": "decoy-db",
+     "canary_type": "Network",
+     "access_kind": "NetworkConnect",
+     "accessor_pid": 6460002,
+     "accessor_uid": 0,
+     "accessor_comm": "bash",
+     "accessor_exe": "/usr/bin/bash",
+     "timestamp_ns": 3655817248000,
+     "first_trip": true
+    }
+   }
+  },
+  {
+   "event": {
+    "Fim": {
+     "timestamp_ns": 3654817248000,
+     "path": "/root/.password-store/golden-246.gpg",
+     "op": 6,
+     "new_sha256": null,
+     "baseline_sha256": null,
+     "modifier_exe": "/usr/bin/bash",
+     "modifier_pid": 6460002,
+     "modifier_uid": 0,
+     "modifier_comm": "bash"
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3657817248000,
+     "end_ns": 3658817248000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 52100,
+     "dst_addr": "100.64.20.9",
+     "dst_port": 443,
+     "proto": 6,
+     "pid": 6460002,
+     "uid": 0,
+     "comm": "bash",
+     "exe": "/usr/bin/bash",
+     "proc_start_ns": 0,
+     "bytes_sent": 4096,
+     "bytes_recv": 512,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6460002-3657817248000",
+     "phase": "closed"
+    }
+   }
+  }
+ ]
+}

@@ -1207,3 +1207,62 @@ only in the table below, in the same PR as the evidence.
     `chain002-late-exec` and `chain002-late-exec-resolver`, every other
     golden file byte-identical.
   - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX), this PR's code (local commit db39770, on `main` 70715b2, before the rebase below) synced, built and installed (`nn-lab.sh sync`, `build`, `install`: the agent and the watchdog active), the installed units then stopped the operator way (`lab_purge_pins`, no LSM program left), and `detection_rules_at_scale_privileged_e2e` (16 tests, NN-L-CHAIN-002 positive and negative and NN-L-CHAIN-004..008 among them) run 10 times as root, single-threaded, with `--include-ignored`: 10 of 10 runs passed, 16 of 16 tests each (47 to 50 s a run); the units put back, the guest powered off. Host, on db39770 and again after the rebase onto `main` 1f70068 (#444: uuid 1.29 in `Cargo.lock` and `fuzz/Cargo.lock`): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,014 passed, 0 failed; `cargo xtask attack-coverage --check`; `cargo xtask golden` (the two new golden files, every other one unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass, both times.
+- **Lab PR 246 — a network canary trip owns its connection, in any order
+  the rings deliver it: no NN-L-CHAIN-003 on the trip's own connection.**
+  C14 (behavioural detection and correlation), C07 (endpoint network
+  telemetry); Wave 4 Phase 2; no level changes.
+  - What was wrong: PR #448's KVM job on Ubuntu 22.04 (job 122036206565)
+    failed `network_canary_connect_trips_canary_003_and_kills_the_connector`
+    — the second connect to the canary drew NN-L-CANARY-003 and then
+    NN-L-CHAIN-003 on its own connection, `tcp 127.0.0.1:0 closed`: two
+    Critical verdicts for one connect. The connect and the close come on
+    two rings, read by two tasks. The refused loopback connect closed
+    within microseconds; the net drain read the close first and the flow
+    tracker, with no pending connect, synthesised the row starting at the
+    close, with the destination the kernel had left (port 0); the connect
+    pump then put the connect on the bus before the drain sent that row.
+    The detector made the connect the trip and remembered (pid, connect
+    time), the row carried (pid, close time), `Detector::owns_trip_flow`
+    did not own it, and CHAIN-003 — its precursor just recorded — judged
+    it as an egress after the trip. Neither multi-match (lab PR 236) nor
+    the late chains (lab PRs 235, 244) were involved. Forced in a unit
+    test on `main`, the order gives exactly the CI verdict; a credential
+    read processed late also completed NN-L-CHAIN-001 with the trip's
+    connection, and on `main` with lab PR 244 a staging exec processed
+    late completed NN-L-CHAIN-002 with it.
+  - Decision (founder-delegated): the trip owns its connection. A network
+    trip is the connect, NN-L-CANARY-003 answers it, and NN-L-CHAIN-003
+    ("a canary trip, then an egress of the same process") on that
+    connection counts one access twice; the test's expectation stands
+    (design §5.4, lab PR 163). Any other flow of the process is still
+    CHAIN-003.
+  - What changed: a synthesised close starts at its connect, the time the
+    kernel correlator carries (`FlowTracker::corr_start_ns`), so every
+    row of a flow carries (pid, connect time); the connect pump announces
+    a connect once its events are on the bus and the net drain holds a TCP
+    close until then (`close_may_proceed`), at most `CONNECT_WAIT` (500
+    ms) from the connect's time — a close of an older connect waits for
+    nothing, nothing waits without a connect pump — so the trip is decided
+    first and a refused connect's row keeps its real port, image and DNS
+    name; the engine's flow ledger owns the connection from the trip on
+    (`FlowLedger::claim_for_trip`, `RuleEngine::owned_by_trip`, used by
+    `decide` and by `main.rs` before the posture), past the close (a
+    connect-time row following it under a full bus drew the chain too),
+    4,096 trips at most — the detector's 256-entry queue, which forgot a
+    trip at its first close row, is removed; and CHAIN-003's trip drops
+    the egress note its connection left when the close was judged first
+    (`CorrelationStore::drop_trip_egress`), so no late read or exec
+    completes NN-L-CHAIN-001, -002 or -007 with it. Tests: the agent's
+    path over the tracker (close or connect first) and five bus orders,
+    each followed by a late read, a late staging exec and a later egress
+    (four mutations of the fix each fail it), plus the tracker, drain,
+    pump, ledger and store units; golden cases
+    `canary003-trip-owns-its-connection`, `canary003-close-before-the-trip`,
+    `canary003-close-before-the-trip-late-exec` (on `main` they show
+    CHAIN-003 on the close and the connect-time row, CHAIN-001 and
+    CHAIN-002 completed late with the trip's connection), every other
+    golden file byte-identical. Not done: a close still judged before its
+    trip (its connect lost, or later than the wait) is judged as any flow,
+    as lab PR 163 left it; an in-order chain whose precursor the process
+    already held answers it.
+  - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX, 4 vCPU), each tree synced, built and installed (`nn-lab.sh sync`, `build`, `install`), the installed units then stopped the operator way (`lab_purge_pins`, no LSM program left), and `canary_privileged_e2e` (7 tests, the network canary test among them) run as root, single-threaded, with `--include-ignored`: `main` 1f70068 30 of 30 runs passed (the CI reorder not reproduced in the lab: no run drew NN-L-CHAIN-003 on a trip's connection); this fix on 1f70068 (local commit 8f8d48c) 40 of 40; rebased on `main` 2a44301 (lab PR 244; local commit 2e45dac, this commit's code) 30 of 30; 24 to 27 s a run before and after; the units put back, the guest powered off. The CI order forced in a unit test on `main` 1f70068 (temporary, not committed): the synthesised close (`127.0.0.1:0`, starting 40 µs after the connect) drew NN-L-CHAIN-003 after NN-L-CANARY-003, and a credential read processed late completed NN-L-CHAIN-001 with the trip's connection. Host, on 8f8d48c and again on 2e45dac: `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,009 and 3,020 passed, 0 failed; `cargo xtask attack-coverage --check`; `cargo xtask golden` (the three new golden files, every other one unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass, both times.

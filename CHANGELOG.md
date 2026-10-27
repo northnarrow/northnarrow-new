@@ -384,6 +384,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The close of a network canary trip's own connection could draw
+  NN-L-CHAIN-003 (lab PR 246; the KVM failure of
+  `network_canary_connect_trips_canary_003_and_kills_the_connector` on
+  Ubuntu 22.04, job 122036206565): a second Critical for the one connect
+  NN-L-CANARY-003 answers. The connect and the close come on two rings,
+  read by two tasks. When the close reached the flow tracker first, its
+  row was synthesised starting at the close (`tcp 127.0.0.1:0 closed`: a
+  refused connect, the port cleared by the kernel), while the trip owned
+  the connection under the connect's time; when the connect then reached
+  the engine first, the close was not recognised and was judged as an
+  egress after the trip. A synthesised close now starts at its connect
+  (the kernel correlator's time); the net drain holds a TCP close until
+  the connect pump has put its connect on the bus (at most 500 ms from
+  the connect: `CONNECT_WAIT`), so a close resolves against its connect
+  and follows it; the engine's flow ledger owns every row of a network
+  trip's connection from the trip on, also past the close (a
+  connect-time row that followed the close drew the chain too), in place
+  of the detector's queue; and a trip drops the egress note its
+  connection left when its close was judged first, so no chain completed
+  late — NN-L-CHAIN-001 on a credential read, NN-L-CHAIN-002 (lab PR 244)
+  on a staging exec, NN-L-CHAIN-007 on either, processed after the close
+  — uses the trip's own connection. Any other flow of the process is
+  still NN-L-CHAIN-003. Golden cases `canary003-trip-owns-its-connection`,
+  `canary003-close-before-the-trip` and
+  `canary003-close-before-the-trip-late-exec`.
 - NN-L-CHAIN-002 (`/tmp` exec, then egress) was missed when the exec
   record reached the engine after the egress it preceded (lab PR 244; the
   race lab PR 235 fixed for NN-L-CHAIN-007): the egress was judged before
