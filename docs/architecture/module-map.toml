@@ -249,8 +249,6 @@ planned = false
 "net" = "nn-core"
 "net::blind_spots" = "nn-linux"
 "net::drain" = "nn-linux"
-# post-plan (lab PR 224): the host's resolv.conf
-"net::resolvers" = "nn-linux"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # post-plan (lab PR 234): the OS CSPRNG
@@ -327,6 +325,11 @@ planned = false
 "config::overlay" = "nn-core"
 # R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
 "fim::paths_config" = "nn-core"
+# post-plan (lab PR 224): the host's resolv.conf, mapped to nn-linux by
+# lab PR 239; R08b (lab PR 251): the set the network and chain rules
+# consult, read with `std::fs` (portable, as `combat_allow`), moved to
+# nn-core with them
+"net::resolvers" = "nn-core"
 # R08a (lab PR 250): the text of the open sensor's paths (post-plan, lab PR
 # 241, R04b: from `sensors::open_sensor`), the event's vocabulary
 "path_text" = "nn-model"
@@ -384,11 +387,14 @@ planned = false
 # names it (→ 38); the triggers consult the agent's other modules through
 # that host, the posture's second seam (→ 39); the machine, the triggers,
 # the entry and the clock moved, and the agent's `posture.rs`, which binds
-# the posture to the Linux host, names it (→ 36).
+# the posture to the Linux host, names it (→ 36). Lab PR 251 (R08b): 50 →
+# 46, nn-core 36 → 32: the host's resolvers moved to nn-core, so the
+# response policy, the chain and network rules and the decision replay name
+# nn-core's module (→ 32).
 
 [ratchet]
 nn-admin = 8
-nn-core = 36
+nn-core = 32
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

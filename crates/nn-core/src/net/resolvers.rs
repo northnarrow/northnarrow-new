@@ -14,6 +14,12 @@
 //! looked at most every [`REFRESH`] (DHCP and VPN clients rewrite them).
 //! A file that cannot be read contributes no resolver: the exemption then
 //! narrows, it never widens.
+//!
+//! R08b (lab PR 251): moved from the agent (where the module map had sent
+//! it to nn-linux) with the rules that consult it: the set is read with
+//! `std::fs` — a file's size and modification time, a bounded read — which
+//! builds on every target, as the COMBAT carve-out's list (R07, lab PR 247);
+//! the paths are the host's configuration, as the lineage's `/etc/subuid`.
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;

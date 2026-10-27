@@ -21,7 +21,9 @@ pub mod dns_cache;
 pub mod drain;
 pub mod flow_tracker;
 pub mod limiter;
-pub mod resolvers;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the host's
+/// configured DNS resolvers are nn-core's, with the rules that read them.
+pub use nn_core::net::resolvers;
 /// The ClientHello parser (JA3, JA4, SNI, ALPN): nn-parse's `tls` since R06
 /// of the Wave 4 restructure (lab PR 242), re-exported at the path the fuzz
 /// targets and `fuzz_api` name (until R17).

@@ -63,6 +63,14 @@ pub mod canary {
 /// `crate::path_text::…`, the open sensor's path text (nn-model's).
 use nn_model::path_text;
 
+/// The network state the rules read (R08b, lab PR 251): the host's
+/// configured DNS resolvers (was the agent's `net::resolvers`).
+pub mod net {
+    // The `nameserver`s of the host's `resolv.conf`, re-read when they
+    // change (lab PR 224).
+    pub mod resolvers;
+}
+
 /// FIM content (R07, lab PR 247): the watched paths (was the agent's
 /// `fim::paths_config`); R08b (lab PR 251): the anti-tamper baits.
 pub mod fim {
