@@ -2,8 +2,8 @@
 //! 252): the production process identity on a real process, the agent's
 //! signing key and audit log, its posture machine, its production actuator
 //! in detect-only. Cut verbatim from the ladder's tests (`combat/tests.rs`,
-//! which move to nn-core with the ladder) with copies of the fixtures they
-//! use.
+//! nn-core's since R08c) with copies of the fixtures they use; the mocks
+//! implement the actuator's trait on the agent's host.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use super::offender::ProcFacts;
 use super::ProcRef;
 use super::{AuditEvidence, CombatLadder, CombatStage, LadderConfig, NoProtectedProcs};
 use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport};
+use crate::chain_host_linux::LinuxHost;
 use crate::posture::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 
 /// Lab PR 245: the evidence the posture cites for `trigger`, raised on an
@@ -125,7 +126,7 @@ fn mock_facts(pid: u32) -> ProcFacts {
     }
 }
 
-impl CombatActuator for MockActuator {
+impl CombatActuator<LinuxHost> for MockActuator {
     fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
         mock_ref(pid)
     }
@@ -217,7 +218,7 @@ fn spawn_started(pid: u32, start_ns: u64, ppid: u32, parent_start_ns: u64) -> Ev
 /// reported, `ProcRef::matches_event`), not [`mock_same_process`].
 struct RealIdentity(MockActuator);
 
-impl CombatActuator for RealIdentity {
+impl CombatActuator<LinuxHost> for RealIdentity {
     fn soft_egress_block(&self, target: &ProcRef) -> SoftBlock {
         self.0.soft_egress_block(target)
     }

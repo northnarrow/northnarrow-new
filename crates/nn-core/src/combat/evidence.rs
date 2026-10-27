@@ -6,7 +6,7 @@
 //!
 //! Every stage transition (INVESTIGATE / NEUTRALIZE / ISOLATE) is written
 //! as a signed, hash-chained entry in the agent's tamper-evident audit
-//! log ([`crate::audit::AuditLog`]) under op `"combat_stage"`, carrying
+//! log ([`nn_evidence::audit::AuditLog`]) under op `"combat_stage"`, carrying
 //! the from/to stages, the firing posture trigger, the attributed
 //! offender PIDs, and a reason string. This is the per-stage-transition
 //! audit trail the redesign requires, and it is captured/emitted BEFORE
@@ -61,6 +61,13 @@
 //! when the action achieved its purpose. It shares the stage transitions'
 //! retry queue and order.
 //!
+//! ## R08c (lab PR 252): in nn-core
+//!
+//! Moved from the agent with the ladder. [`AuditEvidence`] writes into an
+//! audit log signed by any key (nn-evidence's writer, `AuditLog<K>`); the
+//! agent's is its own signing key (`combat.rs`, an alias). Its tests, which
+//! sign with that key, stay in the agent (`combat/evidence_tests.rs`).
+//!
 //! ## Phase 3 (next): multi-sink dossier
 //!
 //! [`LadderEvidence`] is the seam the Panopticon work plugs into: a
@@ -79,6 +86,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
+use nn_evidence::chain_host::ChainSigner;
 use nn_model::posture_types::TriggerType;
 
 use crate::audit::{AuditEntryDraft, AuditLog};
@@ -243,8 +251,8 @@ struct Backlog {
 /// hash-chained entry in the agent audit log. `None` audit log (a run
 /// with `NN_AUDIT_ALLOW_UNWRITABLE=1`) records nothing: every transition
 /// is `Unrecorded::NoAuditLog`, the ladder's ERROR line its only trace.
-pub struct AuditEvidence {
-    audit_log: Option<Arc<Mutex<AuditLog>>>,
+pub struct AuditEvidence<K> {
+    audit_log: Option<Arc<Mutex<AuditLog<K>>>>,
     backlog: Mutex<Backlog>,
     unrecorded: AtomicU64,
     pending: AtomicU64,
@@ -255,8 +263,8 @@ pub struct AuditEvidence {
     clock: Arc<dyn nn_evidence::clock::Clock>,
 }
 
-impl AuditEvidence {
-    pub fn new(audit_log: Option<Arc<Mutex<AuditLog>>>) -> Self {
+impl<K: ChainSigner> AuditEvidence<K> {
+    pub fn new(audit_log: Option<Arc<Mutex<AuditLog<K>>>>) -> Self {
         Self {
             audit_log,
             backlog: Mutex::new(Backlog::default()),
@@ -277,7 +285,7 @@ impl AuditEvidence {
 
     /// Write the waiting transitions, oldest first, stopping at the first
     /// failure (the rest keep their place). Called with both locks held.
-    fn drain(&self, backlog: &mut Backlog, log: &mut AuditLog) -> Result<(), String> {
+    fn drain(&self, backlog: &mut Backlog, log: &mut AuditLog<K>) -> Result<(), String> {
         let mut written = 0usize;
         while let Some(w) = backlog.waiting.front() {
             let draft = draft(
@@ -405,7 +413,7 @@ fn draft(r: &Record, deferred: Option<&str>, lost: u64, pid: u32) -> AuditEntryD
     }
 }
 
-impl AuditEvidence {
+impl<K: ChainSigner> AuditEvidence<K> {
     /// Append `r`, after what waits; queued when the log refuses it.
     fn append(&self, r: Record) -> Result<(), Unrecorded> {
         let Some(log) = &self.audit_log else {
@@ -436,7 +444,7 @@ impl AuditEvidence {
     }
 }
 
-impl LadderEvidence for AuditEvidence {
+impl<K: ChainSigner + Send + 'static> LadderEvidence for AuditEvidence<K> {
     fn record_stage(&self, t: &StageTransition) -> Result<(), Unrecorded> {
         info!(
             target: "combat.audit",

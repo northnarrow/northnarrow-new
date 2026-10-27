@@ -732,7 +732,7 @@ impl HostActuator {
     }
 }
 
-impl CombatActuator for HostActuator {
+impl CombatActuator<LinuxHost> for HostActuator {
     /// `ProcRef::open_for_event` on the host: the process `pid` names now,
     /// if it is the event's (started at `start_ns`, or — that unknown — by
     /// `seen_ns`).

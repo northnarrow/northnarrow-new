@@ -29,8 +29,8 @@
 //!    without ever cutting the host off.
 //! 3. [`CombatStage::Isolate`] — **only** if neutralization fails
 //!    (unkillable, respawning, kernel-level, otherwise uncontainable):
-//!    the existing full network isolation
-//!    ([`crate::anti_tamper::network_isolate::NetworkIsolator::engage`]),
+//!    the existing full network isolation (the agent's
+//!    `anti_tamper::network_isolate::NetworkIsolator::engage`),
 //!    released via the same Ed25519 admin-key path as today. By this
 //!    point the dossier is already captured and emitted, so isolation
 //!    does not blind the operator.
@@ -55,8 +55,22 @@
 //! The two side-effecting dependencies are injected as trait objects
 //! ([`CombatActuator`], [`LadderEvidence`]) so the stage logic is unit
 //! tested deterministically without touching the real kill / nftables /
-//! iptables / audit machinery. The production wiring lives in
-//! [`actuator`] / [`evidence`]; `main.rs` constructs the trio.
+//! iptables / audit machinery. The production wiring is the agent's
+//! actuator (`SystemActuator`) and host-critical guard
+//! (`SystemProtectedProcs`), and the signed audit log
+//! ([`evidence::AuditEvidence`]); `main.rs` constructs the trio.
+//!
+//! ## Where it runs (R08c, lab PR 252)
+//!
+//! The ladder moved from the agent to nn-core with its evidence, the
+//! actuator's and the guard's traits and the outcomes they report: the
+//! policy of the graduated response, no OS call. What it holds of an
+//! offender is its host's capture of the process ([`host::CombatHost`]:
+//! the agent's `LinuxHost` captures it by a pidfd and its start,
+//! `response::proc_ref::ProcRef`), so the ladder's types take the host as
+//! a type parameter; the agent names them on its host (`combat.rs`). The
+//! production actuator, the production guard (`/proc`) and the stale
+//! chain's compatibility line stay in the agent for nn-linux (R09).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -73,35 +87,24 @@ use crate::posture::{CombatCause, CombatEntry};
 
 pub mod actuator;
 pub mod evidence;
-// R08c (lab PR 252): who the ladder acts against, as its signed rows name
-// them, is nn-core's (data and its rendering; `/proc` is read by the
-// actuator), here under its path.
-pub use nn_core::combat::offender;
+pub mod host;
+pub mod offender;
 pub mod protected;
 pub mod reconcile;
 
-/// The evidence's tests, which sign with the agent's key (R08c, lab PR
-/// 252).
-#[cfg(test)]
-mod evidence_tests;
-/// The ladder's tests that need the agent's other modules (R08c, lab PR
-/// 252).
-#[cfg(test)]
-mod host_tests;
 #[cfg(test)]
 mod tests;
 
-pub use crate::response::proc_ref::ProcRef;
 pub use actuator::{
-    CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, OffenderOutcome,
-    SoftBlock, SystemActuator,
+    CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, OffenderOutcome, SoftBlock,
 };
 pub use evidence::{
     ActionOutcome, Addition, AuditEvidence, EvidenceCounts, LadderEvidence, StageTransition,
     Unrecorded,
 };
+pub use host::{Capture, CombatHost};
 pub use offender::{OffenderId, ProcFacts, Via};
-pub use protected::{NoProtectedProcs, ProtectedProcs, ProtectedReason, SystemProtectedProcs};
+pub use protected::{NoProtectedProcs, ProtectedProcs, ProtectedReason};
 
 /// The active-response stage WITHIN COMBAT posture. Ordered by
 /// invasiveness (`Investigate < Neutralize < Isolate`); the ladder only
@@ -175,7 +178,7 @@ impl Default for LadderConfig {
 /// Live ladder state for one COMBAT episode. Only meaningful while
 /// `engaged`; the timestamps are re-stamped on each `engage`/advance.
 #[derive(Debug)]
-struct LadderState {
+struct LadderState<H: CombatHost> {
     engaged: bool,
     /// External audit CMB-012: bumped when an episode opens and at
     /// stand-down; the worker drops a queued step of another episode.
@@ -191,10 +194,10 @@ struct LadderState {
     /// captured (pidfd + start time) when it was attributed — the actions
     /// reach that process, never a later holder of its PID. Lab PR 245:
     /// with what identified it then, for the signed rows.
-    offenders: BTreeMap<u32, Attributed>,
+    offenders: BTreeMap<u32, Attributed<H>>,
     /// External audit CMB-010: the processes the actuator reported
     /// blocked this episode — the only ones the stand-down releases.
-    blocked: BTreeMap<u32, Arc<ProcRef>>,
+    blocked: BTreeMap<u32, Arc<H::Proc>>,
     /// External audit CMB-014: a soft egress block of this episode did
     /// not take effect (the shorter window applies).
     block_failed: bool,
@@ -221,7 +224,7 @@ struct LadderState {
     isolation_deferred: Option<String>,
 }
 
-impl LadderState {
+impl<H: CombatHost> LadderState<H> {
     fn idle(now: Instant, episode: u64) -> Self {
         Self {
             engaged: false,
@@ -267,10 +270,21 @@ impl LadderState {
 /// External audit CMB-004 / lab PR 245: an attributed process — the
 /// capture the actions reach it through, and what identified it when it
 /// was attributed (the signed rows' `offender_details`).
-#[derive(Debug, Clone)]
-struct Attributed {
-    proc: Arc<ProcRef>,
+#[derive(Debug)]
+struct Attributed<H: CombatHost> {
+    proc: Arc<H::Proc>,
     id: Arc<OffenderId>,
+}
+
+/// R08c (lab PR 252): what `derive(Clone)` made, without asking the host's
+/// capture to be `Clone` (only its `Arc` is cloned).
+impl<H: CombatHost> Clone for Attributed<H> {
+    fn clone(&self) -> Self {
+        Self {
+            proc: Arc::clone(&self.proc),
+            id: Arc::clone(&self.id),
+        }
+    }
 }
 
 /// Lab PR 245: who and why, as the state holds them when a step is
@@ -334,14 +348,14 @@ enum Isolation {
 /// the stage flags atomically), then executed WITHOUT the lock so a
 /// blocking kill / iptables / audit shell-out never serialises against a
 /// concurrent `current_stage()` reader or the other driver task.
-enum LadderStep {
+enum LadderStep<H: CombatHost> {
     /// Already at/past the target (or not engaged) — nothing to do.
     None,
     Neutralize {
         from: CombatStage,
         named: Named,
         /// The attributed processes (external audit CMB-004).
-        refs: Vec<Arc<ProcRef>>,
+        refs: Vec<Arc<H::Proc>>,
     },
     /// External audit POS-001: ISOLATE was due but the gate is closed.
     IsolationRefused { from: CombatStage, named: Named },
@@ -355,9 +369,9 @@ enum LadderStep {
 }
 
 /// The ladder's decisions and the side effects that carry them out.
-struct Inner {
-    state: Mutex<LadderState>,
-    actuator: Box<dyn CombatActuator>,
+struct Inner<H: CombatHost> {
+    state: Mutex<LadderState<H>>,
+    actuator: Box<dyn CombatActuator<H>>,
     evidence: Box<dyn LadderEvidence>,
     /// Host-critical process guard. Consulted before every per-PID action
     /// so the ladder never kills / net-cuts PID 1, the agent, its
@@ -375,29 +389,30 @@ struct Inner {
     /// verified gone) — the copy-on-first-write guard restores what a
     /// ransomware tree among them rewrote. Runs on the ladder's worker
     /// after the kill; must not block (the guard spawns its own thread).
-    neutralize_hook: Option<NeutralizeHook>,
+    neutralize_hook: Option<NeutralizeHook<H>>,
 }
 
-/// Lab PR 222: see [`Inner::neutralize_hook`].
-pub type NeutralizeHook = Box<dyn Fn(&[Arc<ProcRef>]) + Send + Sync>;
+/// Lab PR 222: see [`Inner::neutralize_hook`]. R08c (lab PR 252): the
+/// processes are the host's captures.
+pub type NeutralizeHook<H> = Box<dyn Fn(&[Arc<<H as CombatHost>::Proc>]) + Send + Sync>;
 
 /// A side effect of the ladder, run in order by [`Runner`].
-enum Job {
+enum Job<H: CombatHost> {
     /// An episode opened: soft-block its offenders, record INVESTIGATE.
     Investigate {
         episode: u64,
-        offenders: Vec<Attributed>,
+        offenders: Vec<Attributed<H>>,
         cause: Arc<CombatCause>,
     },
     /// Soft-block an offender attributed later in the episode (lateral
     /// spread).
-    SoftBlock { episode: u64, target: Attributed },
+    SoftBlock { episode: u64, target: Attributed<H> },
     /// Lab PR 245: a later COMBAT entry named another process while the
     /// episode ran (`by`: that entry's cause) — soft-block it and sign the
     /// addition; the episode's cause stays.
     Added {
         episode: u64,
-        target: Attributed,
+        target: Attributed<H>,
         by: Arc<CombatCause>,
     },
     /// Advance the episode to `target` (decided again when it runs).
@@ -411,16 +426,16 @@ enum Job {
     /// release ran (every earlier job ran before it).
     StandDown {
         from: CombatStage,
-        blocked: Vec<Arc<ProcRef>>,
+        blocked: Vec<Arc<H::Proc>>,
         done: Option<std::sync::mpsc::SyncSender<()>>,
     },
 }
 
 /// How jobs run: in the caller (unit tests, and the fallback when the
 /// worker thread cannot start) or on the ladder's worker thread.
-enum Runner {
+enum Runner<H: CombatHost> {
     Inline,
-    Worker(std::sync::mpsc::SyncSender<Job>),
+    Worker(std::sync::mpsc::SyncSender<Job<H>>),
 }
 
 /// Jobs waiting for the worker. An episode queues at most one job per
@@ -437,14 +452,14 @@ const QUEUE_DEPTH: usize = 4096;
 /// worker thread ([`CombatLadder::with_worker`]). A NEUTRALIZE of a large
 /// tree no longer stops the event loop, and the two drivers and the
 /// stand-down are serialised by the queue (CMB-012).
-pub struct CombatLadder {
-    inner: Arc<Inner>,
-    runner: Runner,
+pub struct CombatLadder<H: CombatHost> {
+    inner: Arc<Inner<H>>,
+    runner: Runner<H>,
 }
 
-impl CombatLadder {
+impl<H: CombatHost> CombatLadder<H> {
     pub fn new(
-        actuator: Box<dyn CombatActuator>,
+        actuator: Box<dyn CombatActuator<H>>,
         evidence: Box<dyn LadderEvidence>,
         protected: Box<dyn ProtectedProcs>,
         cfg: LadderConfig,
@@ -478,7 +493,7 @@ impl CombatLadder {
 
     /// Lab PR 222: tell `hook` which processes each NEUTRALIZE contained.
     /// Call before [`Self::with_worker`].
-    pub fn with_neutralize_hook(mut self, hook: NeutralizeHook) -> Self {
+    pub fn with_neutralize_hook(mut self, hook: NeutralizeHook<H>) -> Self {
         match Arc::get_mut(&mut self.inner) {
             Some(inner) => inner.neutralize_hook = Some(hook),
             None => warn!(
@@ -492,7 +507,7 @@ impl CombatLadder {
     /// External audit CMB-007: run the side effects on a worker thread of
     /// their own. Without it (unit tests) they run in the caller.
     pub fn with_worker(mut self) -> Self {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Job>(QUEUE_DEPTH);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Job<H>>(QUEUE_DEPTH);
         let inner = Arc::clone(&self.inner);
         match std::thread::Builder::new()
             .name("nn-combat-ladder".into())
@@ -539,7 +554,7 @@ impl CombatLadder {
     /// Hand `job` to the runner. A full queue drops a soft block or a
     /// stage advance (the tick queues the advance again); an episode
     /// opening or a stand-down waits for room.
-    fn dispatch(&self, job: Job) {
+    fn dispatch(&self, job: Job<H>) {
         let tx = match &self.runner {
             Runner::Inline => return self.inner.run(job),
             Runner::Worker(tx) => tx,
@@ -577,11 +592,11 @@ impl CombatLadder {
     /// Queue an advance to `target` unless one is queued already.
     fn queue_drive(
         &self,
-        s: &mut LadderState,
+        s: &mut LadderState<H>,
         target: CombatStage,
         now: Instant,
         reason: &str,
-    ) -> Option<Job> {
+    ) -> Option<Job<H>> {
         if s.drive_queued {
             return None;
         }
@@ -597,7 +612,7 @@ impl CombatLadder {
     /// Capture the process `pid` names (external audit CMB-004;
     /// `start_ns` from its exec event, `seen_ns` the attributing event's
     /// time, 0 when unknown) with what identifies it now (lab PR 245).
-    fn capture(&self, pid: u32, start_ns: u64, seen_ns: u64, via: Via) -> Attributed {
+    fn capture(&self, pid: u32, start_ns: u64, seen_ns: u64, via: Via) -> Attributed<H> {
         let proc = self.inner.actuator.identify(pid, start_ns, seen_ns);
         let facts = self.inner.actuator.describe(&proc);
         Attributed {
@@ -618,12 +633,12 @@ impl CombatLadder {
     /// `Err` once the cap is reached (the first time only: `Err(true)`).
     fn attribute(
         &self,
-        s: &mut LadderState,
+        s: &mut LadderState<H>,
         pid: u32,
         start_ns: u64,
         seen_ns: u64,
         via: Via,
-    ) -> Result<Option<Attributed>, bool> {
+    ) -> Result<Option<Attributed<H>>, bool> {
         // External audit CMB-004: the PID of an offender that has exited
         // may name a new process by now — attributed afresh, in its place.
         let reused = match s.offenders.get(&pid) {
@@ -645,7 +660,7 @@ impl CombatLadder {
     /// External audit CMB-011: the step for a tree past the cap — not
     /// containable process by process. During INVESTIGATE, neutralize
     /// now; past it, ask for ISOLATE (through the gate).
-    fn capped_step(&self, s: &mut LadderState, now: Instant) -> Option<Job> {
+    fn capped_step(&self, s: &mut LadderState<H>, now: Instant) -> Option<Job<H>> {
         let cap = self.inner.cfg.max_offenders;
         warn!(
             target: "combat.ladder",
@@ -705,7 +720,7 @@ impl CombatLadder {
                     let target = self.capture(p.pid, p.start_ns, p.seen_ns, Via::Entry);
                     s.offenders.insert(p.pid, target);
                 }
-                let offenders: Vec<Attributed> = s.offenders.values().cloned().collect();
+                let offenders: Vec<Attributed<H>> = s.offenders.values().cloned().collect();
                 info!(
                     target: "combat.ladder",
                     stage = %CombatStage::Investigate,
@@ -770,7 +785,7 @@ impl CombatLadder {
                 None
             } else {
                 // Lateral spread: an offender spawned a child → attribute it.
-                let mut spread_child: Option<Attributed> = None;
+                let mut spread_child: Option<Attributed<H>> = None;
                 let mut capped = false;
                 if let Event::ProcessSpawn {
                     pid,
@@ -945,7 +960,7 @@ impl CombatLadder {
             let from = s.stage;
             // External audit CMB-010 (stop-gap): only what this episode
             // blocked is released — not every attributed PID.
-            let blocked: Vec<Arc<ProcRef>> = s.blocked.values().cloned().collect();
+            let blocked: Vec<Arc<H::Proc>> = s.blocked.values().cloned().collect();
             let episode = s.episode + 1;
             *s = LadderState::idle(now, episode);
             info!(
@@ -981,7 +996,7 @@ impl CombatLadder {
     }
 }
 
-impl Inner {
+impl<H: CombatHost> Inner<H> {
     /// External audit CMB-027: evidence before enforcement, checked. A
     /// transition the audit log did not take is logged here whole, at
     /// ERROR — then the journal line is its record until the sink writes it
@@ -1133,7 +1148,7 @@ impl Inner {
     }
 
     /// Run one job (on the worker, or inline).
-    fn run(&self, job: Job) {
+    fn run(&self, job: Job<H>) {
         let current = |episode: u64| {
             let s = self.state.lock();
             s.engaged && s.episode == episode
@@ -1316,7 +1331,7 @@ impl Inner {
     fn soft_block(
         &self,
         episode: u64,
-        attributed: &Attributed,
+        attributed: &Attributed<H>,
         record: bool,
     ) -> (Option<String>, bool) {
         let target = &attributed.proc;
@@ -1406,14 +1421,15 @@ impl Inner {
     /// External audit CMB-004: an offender that has exited is gone — the
     /// guard's lookup by PID would judge the process that holds the PID
     /// now (an sshd child, a restarted watchdog: spared, then ISOLATE).
-    fn is_gone(&self, r: &ProcRef) -> bool {
+    fn is_gone(&self, r: &H::Proc) -> bool {
         !self.actuator.same_process(r, 0) && r.capture_errno().is_none()
     }
 
+    #[allow(clippy::type_complexity)]
     fn split_protected(
         &self,
-        refs: &[Arc<ProcRef>],
-    ) -> (Vec<Arc<ProcRef>>, Vec<(u32, ProtectedReason)>) {
+        refs: &[Arc<H::Proc>],
+    ) -> (Vec<Arc<H::Proc>>, Vec<(u32, ProtectedReason)>) {
         let mut actionable = Vec::new();
         let mut spared = Vec::new();
         for r in refs {
@@ -1453,7 +1469,7 @@ impl Inner {
             // so the posture's lock is never taken under the ladder's.
             let isolation_allowed = target != CombatStage::Isolate || (self.isolation_gate)();
             // ── Critical section: decide + mutate state, extract work ──
-            let step = {
+            let step: LadderStep<H> = {
                 let mut s = self.state.lock();
                 if !s.engaged {
                     LadderStep::None

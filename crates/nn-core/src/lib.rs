@@ -12,7 +12,10 @@
 //! the multi-match combination, the signed per-rule policy, the network
 //! state the rules read, the ransomware and security-tool judges, the
 //! canary detector — and what they do on their host is a trait the host
-//! implements too ([`decision::host`], [`canary::host`]).
+//! implements too ([`decision::host`], [`canary::host`]). R08c (lab PR 252)
+//! moves the COMBAT ladder here — its policy, the traits of its actuator and
+//! host-critical guard, its signed evidence — with its host's capture of a
+//! process as a trait ([`combat::host`]).
 //!
 //! Created empty by the Wave 4 restructure, R01 (lab PR 239); the crates it may
 //! depend on, and the rules of the pure crates, are in
@@ -149,20 +152,12 @@ pub mod fim {
     pub mod rules;
 }
 
-/// The COMBAT ladder (R08c, lab PR 252): who it acts against, as its
-/// signed rows name them (was the agent's `combat::offender`), the record
-/// of a stale chain found at start (from the agent's `combat::reconcile`),
-/// and what it needs from its host (`combat::host`).
-pub mod combat {
-    /// What the ladder needs from its host: a process captured when it is
-    /// attributed.
-    pub mod host;
-    /// An offender's identity as the ladder captured it: pid, starts,
-    /// executable, cgroup, how it joined the episode.
-    pub mod offender;
-    /// The signed record of a stale COMBAT chain found at start.
-    pub mod reconcile;
-}
+// The COMBAT ladder (R08c, lab PR 252; was the agent's `combat`): the
+// graduated active response's stages and state machine, its worker, the
+// actuator's and the host-critical guard's traits, the signed evidence, the
+// offenders' identity, the stale chain's record, and what the ladder needs
+// from its host (`combat::host`).
+pub mod combat;
 
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
 /// carve-out (was the agent's `anti_tamper::combat_allow`); R08b (lab PR

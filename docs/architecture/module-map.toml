@@ -180,8 +180,25 @@ planned = false
 # the payloads have a crate below it (plan R04a/R05 "i payload"; R10)
 "chains" = "northnarrow-agent"
 # the ladder and its evidence; SystemActuator and the probes of protected
-# and reconcile go to nn-linux (R04c)
+# and reconcile go to nn-linux (R04c). R08c (lab PR 252): the ladder moved
+# to nn-core — its stages and state machine, its worker, the actuator's and
+# the guard's traits and the outcomes they report, the evidence, the
+# offenders' identity — generic over its host's capture of a process
+# (`combat::host`); `combat.rs` is the agent's binding of it to the Linux
+# host (the ladder and its hook as aliases on `LinuxHost`, the evidence on
+# the agent's key); its tests that wire the agent's key, audit log,
+# posture, actuator or a real process stay in `combat/`, test modules
 "combat" = "nn-core"
+# R08c (lab PR 252): the production actuator (`SystemActuator`: the
+# executor's kill, quarantine and per-PID egress block, the isolator,
+# `/proc`) on the ladder's trait, which moved to nn-core's
+# `combat::actuator` with the outcomes it reports
+"combat::actuator" = "nn-linux"
+# R08c (lab PR 252): the production host-critical guard
+# (`SystemProtectedProcs`: the identities read from the live `/proc`); the
+# guard's trait and the reasons it names moved to nn-core's
+# `combat::protected`
+"combat::protected" = "nn-linux"
 # R08c (lab PR 252): the stale chain's record (the outcome, its signed
 # entry, its append) moved to nn-core's `combat::reconcile`; the agent's
 # file keeps the unsigned compatibility line's Linux file I/O (the
@@ -484,7 +501,7 @@ planned = false
 
 [ratchet]
 nn-admin = 8
-nn-core = 18
+nn-core = 15
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

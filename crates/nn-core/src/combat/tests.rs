@@ -6,6 +6,12 @@
 //! enforcement action — acceptance: a dossier is captured/emitted before
 //! any isolation). Time is injected (`Instant`), so the deadline path is
 //! exercised without sleeping.
+//!
+//! R08c (lab PR 252): moved from the agent with the ladder; they run on the
+//! portable test host ([`super::host::testing`]: a capture without a
+//! descriptor, as the agent's `ProcRef::for_test`). The tests that wire the
+//! agent's signing key and audit log, its posture machine, its production
+//! actuator or a real process stay in the agent (`combat/host_tests.rs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,11 +26,15 @@ use super::actuator::{
     CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
 };
 use super::evidence::{ActionOutcome, LadderEvidence, StageTransition, Unrecorded};
+use super::host::{Capture, CombatHost};
 use super::offender::ProcFacts;
-use super::ProcRef;
-use super::{
-    CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason,
-};
+use super::{CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason};
+use crate::posture::host::testing::TestHost;
+
+/// The ladder on the test host.
+type CombatLadder = super::CombatLadder<TestHost>;
+/// The test host's capture: a pid and a start, no descriptor.
+type ProcRef = <TestHost as CombatHost>::Proc;
 use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport};
 use crate::posture::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 
@@ -130,7 +140,7 @@ fn mock_facts(pid: u32) -> ProcFacts {
     }
 }
 
-impl CombatActuator for MockActuator {
+impl CombatActuator<TestHost> for MockActuator {
     fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
         mock_ref(pid)
     }
@@ -939,7 +949,7 @@ impl HeldActuator {
     }
 }
 
-impl CombatActuator for HeldActuator {
+impl CombatActuator<TestHost> for HeldActuator {
     fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
         mock_ref(pid)
     }
@@ -1293,7 +1303,7 @@ struct FirstUncontained {
     rec: Recorder,
 }
 
-impl CombatActuator for FirstUncontained {
+impl CombatActuator<TestHost> for FirstUncontained {
     fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
         mock_ref(pid)
     }

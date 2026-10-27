@@ -78,3 +78,93 @@ pub trait Capture: Debug + Send + Sync + 'static {
     /// whose descriptor holds nothing worth an open file.
     fn without_fd(&self) -> Self;
 }
+
+/// The ladder's own tests: the posture's portable test host
+/// ([`crate::posture::host::testing::TestHost`]), whose capture is the
+/// identity alone — the pid and the starts, no descriptor: nothing is
+/// signalled and it never reads as running, as the agent's
+/// `ProcRef::for_test`. What is Linux about the agent's capture (the
+/// pidfd) is tested with its host, in the agent (`combat_host_linux`).
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{Capture, CombatHost};
+    use crate::posture::host::testing::TestHost;
+
+    /// A capture without a descriptor.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct TestProc {
+        pid: u32,
+        start_ticks: Option<u64>,
+        start_ns: Option<u64>,
+        seen_ns: Option<u64>,
+    }
+
+    impl TestProc {
+        /// The process `pid` with the start `start_ticks` (the tests' mocks
+        /// compare an event's start with it).
+        pub(crate) fn for_test(pid: u32, start_ticks: Option<u64>) -> Self {
+            Self {
+                pid,
+                start_ticks,
+                start_ns: None,
+                seen_ns: None,
+            }
+        }
+    }
+
+    impl Capture for TestProc {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        fn start_ticks(&self) -> Option<u64> {
+            self.start_ticks
+        }
+
+        fn start_ns(&self) -> Option<u64> {
+            self.start_ns
+        }
+
+        fn seen_ns(&self) -> Option<u64> {
+            self.seen_ns
+        }
+
+        fn capture_errno(&self) -> Option<i32> {
+            None
+        }
+
+        /// Not running: an event names it by its own start, or one that had
+        /// started by a time it ran.
+        fn matches_event(&self, start_ns: u64) -> bool {
+            start_ns != 0
+                && (self.start_ns == Some(start_ns)
+                    || self.seen_ns.is_some_and(|seen| start_ns <= seen))
+        }
+
+        fn is_live(&self) -> bool {
+            false
+        }
+
+        fn has_fd(&self) -> bool {
+            false
+        }
+
+        fn without_fd(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// A capture is the identity the event gave.
+    impl CombatHost for TestHost {
+        type Proc = TestProc;
+
+        fn open_for_event(pid: u32, start_ns: u64, seen_ns: u64) -> TestProc {
+            TestProc {
+                pid,
+                start_ticks: None,
+                start_ns: (start_ns != 0).then_some(start_ns),
+                seen_ns: (seen_ns != 0).then_some(seen_ns),
+            }
+        }
+    }
+}

@@ -1,35 +1,10 @@
-//! Host-critical process guard for the COMBAT ladder.
+//! The production host-critical process guard of the COMBAT ladder,
+//! [`SystemProtectedProcs`]: which processes are PID 1, the agent, its
+//! watchdog and the SSH service, read from the live `/proc`.
 //!
-//! ## Why this exists
-//!
-//! The ladder's two destructive primitives operate on a *target PID*:
-//! [`CombatStage::Neutralize`](super::CombatStage::Neutralize) kills the
-//! offending process tree, and
-//! [`CombatStage::Investigate`](super::CombatStage::Investigate) applies a
-//! surgical per-PID egress cut. Pointed at a **host-critical** process,
-//! either one is catastrophic and self-defeating:
-//!
-//! - **PID 1** — `SIGKILL` to init panics the host.
-//! - **The agent itself** — neutralizing our own PID disables the
-//!   defender mid-incident (the [`Executor`](crate::response::Executor)
-//!   already refuses its own PID, but the ladder must not even *ask*).
-//! - **The watchdog** — killing the supervisor removes the agent's
-//!   restart/anti-tamper backstop. NB: the executor's protected set is
-//!   only `{0, 1, 2, own_pid}` — it does **not** carry the watchdog PID,
-//!   so absent this guard the ladder *could* kill it.
-//! - **The SSH service** — killing or net-cutting `sshd` can lock the
-//!   remote operator out of a host that just escalated, with no console.
-//!
-//! So this guard names those processes. The ladder consults it before any
-//! per-PID action and, instead of acting on a protected PID, **skips +
-//! logs** it and (at NEUTRALIZE) **escalates to ISOLATE** — the
-//! network-level last resort. That is the safe middle path between the two
-//! failure modes: never destroy a critical process, but never hand a real
-//! threat hiding *as* one a free pass either (a confirmed offender we
-//! refuse to kill is, by definition, uncontainable at the process level,
-//! which is exactly the existing
-//! [`NeutralizeOutcome::Uncontainable`](super::NeutralizeOutcome::Uncontainable)
-//! → ISOLATE semantics).
+//! R08c (lab PR 252): why the ladder has a guard, the guard's trait and the
+//! reasons it names are nn-core's (`combat::protected`, the ladder's), here
+//! under their names; this file keeps the Linux guard, for nn-linux (R09).
 //!
 //! ## Identity: PID + kernel-resolved exe, never `comm`
 //!
@@ -95,62 +70,9 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
+pub use nn_core::combat::protected::{NoProtectedProcs, ProtectedProcs, ProtectedReason};
+
 use crate::posture::ExemptPids;
-
-/// Why a PID is host-critical and must not be directly acted on by the
-/// COMBAT ladder. Carried into the audit reason string so the escalation
-/// record names the class of process that was spared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProtectedReason {
-    /// PID 1 — killing init panics the host.
-    Init,
-    /// The agent's own process — acting on it disables the defender.
-    AgentSelf,
-    /// The verified watchdog supervising the agent.
-    Watchdog,
-    /// The SSH service (`sshd`) — killing/cutting it can lock the operator
-    /// out of a host that just escalated.
-    SshService,
-}
-
-impl ProtectedReason {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ProtectedReason::Init => "init(pid 1)",
-            ProtectedReason::AgentSelf => "northnarrow-agent(self)",
-            ProtectedReason::Watchdog => "northnarrow-watchdog",
-            ProtectedReason::SshService => "ssh-service(sshd)",
-        }
-    }
-}
-
-impl core::fmt::Display for ProtectedReason {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Recognizes the host-critical processes the COMBAT ladder must never
-/// directly kill or net-cut. Injected into [`super::CombatLadder`] (like
-/// the actuator/evidence) so the guard is unit-testable with a
-/// deterministic stub; production ([`SystemProtectedProcs`]) reads the
-/// live `/proc`.
-pub trait ProtectedProcs: Send + Sync {
-    /// Why `pid` is host-critical, or `None` if it is fair game for a
-    /// per-PID combat action.
-    fn protected_reason(&self, pid: u32) -> Option<ProtectedReason>;
-}
-
-/// A guard that protects nothing. The safe default for dev builds without
-/// a resolved process stack, and the baseline most ladder unit tests use.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoProtectedProcs;
-
-impl ProtectedProcs for NoProtectedProcs {
-    fn protected_reason(&self, _pid: u32) -> Option<ProtectedReason> {
-        None
-    }
-}
 
 /// Canonical sshd install paths matched against the kernel-resolved
 /// `/proc/<pid>/exe`. Mirrors the sshd entries in
@@ -749,12 +671,5 @@ mod tests {
         assert_eq!(w.hit(t0 + Duration::from_secs(59)), None);
         assert_eq!(w.hit(t0 + Duration::from_secs(60)), Some(2));
         assert_eq!(w.hit(t0 + Duration::from_secs(61)), None);
-    }
-
-    #[test]
-    fn no_protected_procs_protects_nothing() {
-        let g = NoProtectedProcs;
-        assert_eq!(g.protected_reason(1), None);
-        assert_eq!(g.protected_reason(std::process::id()), None);
     }
 }
