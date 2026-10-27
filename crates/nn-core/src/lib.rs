@@ -64,8 +64,11 @@ pub mod canary {
 use nn_model::path_text;
 
 /// FIM content (R07, lab PR 247): the watched paths (was the agent's
-/// `fim::paths_config`).
+/// `fim::paths_config`); R08b (lab PR 251): the anti-tamper baits.
 pub mod fim {
+    /// The anti-tamper baits: each path with its template (R08b, lab PR 251;
+    /// cut from the agent's `fim::honeypot`).
+    pub mod baits;
     /// The shipped `fim-paths.v1` and the operator's `fim-paths.local`.
     pub mod paths_config;
 }

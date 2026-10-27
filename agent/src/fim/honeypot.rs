@@ -34,73 +34,10 @@ const BAIT_MODE: u32 = 0o644;
 /// systemd) is created as systemd's `RuntimeDirectoryMode` would.
 const BAIT_DIR_MODE: u32 = 0o700;
 
-macro_rules! bait {
-    ($name:literal) => {
-        include_str!(concat!(
-            env!("NN_REPO_ROOT"),
-            "/configs/honeypot-baits/",
-            $name
-        ))
-    };
-}
-
-/// The baits: each path with its template, embedded from
-/// `configs/honeypot-baits/`. External audit NN-AUD-289 (FIMR-015): the
-/// paths were a list in `fim::rules` and the contents a `match` here,
-/// paired only by a test, and the sweep took a bait without a template
-/// for a bug — `.expect`, a panic (`panic = "abort"`: the agent). One
-/// table now: a bait cannot be listed without its content.
-pub const BAITS: &[(&str, &str)] = &[
-    ("/etc/northnarrow/agent.dev.lock", bait!("agent.dev.lock")),
-    (
-        "/etc/northnarrow/kill_switch.conf",
-        bait!("kill_switch.conf"),
-    ),
-    (
-        "/etc/northnarrow/maintenance.mode",
-        bait!("maintenance.mode"),
-    ),
-    (
-        "/etc/northnarrow/debug_disable.flag",
-        bait!("debug_disable.flag"),
-    ),
-    (
-        "/etc/northnarrow/agent.legacy.conf",
-        bait!("agent.legacy.conf"),
-    ),
-    (
-        "/var/lib/northnarrow/shutdown.signal",
-        bait!("shutdown.signal"),
-    ),
-    ("/var/lib/northnarrow/disable.token", bait!("disable.token")),
-    (
-        "/var/lib/northnarrow/override.config",
-        bait!("override.config"),
-    ),
-    ("/run/northnarrow/pause.flag", bait!("pause.flag")),
-    ("/run/northnarrow/unload.signal", bait!("unload.signal")),
-];
-
-/// The paths of [`BAITS`], in its order: what
-/// [`crate::fim::rules::HONEYPOT_PATHS`] is.
-pub const BAIT_PATHS: [&str; BAITS.len()] = {
-    let mut paths = [""; BAITS.len()];
-    let mut i = 0;
-    while i < BAITS.len() {
-        paths[i] = BAITS[i].0;
-        i += 1;
-    }
-    paths
-};
-
-/// The template of a bait (its `last_modified=` line empty), embedded from
-/// `configs/honeypot-baits/`. `None` for any path not in [`BAITS`].
-pub fn bait_content(path: &str) -> Option<&'static str> {
-    BAITS
-        .iter()
-        .find(|(p, _)| *p == path)
-        .map(|(_, content)| *content)
-}
+// R08b (lab PR 251): the bait table — each path with its template — is
+// nn-core's content (`nn_core::fim::baits`, cut verbatim), as NN-L-FIM-024
+// watches its paths; here under its names.
+pub use nn_core::fim::baits::{bait_content, BAITS, BAIT_PATHS};
 
 /// Prefix of the line a bait's write fills.
 const LAST_MODIFIED: &str = "last_modified=";
