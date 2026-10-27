@@ -461,7 +461,7 @@ This requires bootstrap-order coordination: watchdog must be started AFTER agent
 
 **References.**
 - Cluster: **anti-tamper trust model gap** (§15.1).
-- Symmetric design with `ExemptPids` / `agent/src/posture/exempt.rs`.
+- Symmetric design with `ExemptPids` / `crates/nn-core/src/posture/exempt.rs`.
 
 ---
 
@@ -608,7 +608,7 @@ Deliberately NOT in the carve-out:
 - `/run/user/<uid>/` — per-user runtime where a compromised user session could mass-write.
 - `/tmp/` — exec-from-tmp arm of `confirmed_intrusion` independently catches /tmp executions.
 
-Regression tests at `agent/src/posture/triggers.rs::tests::mass_write_excludes_sysfs_writes` (+ 3 sibling `excludes_*` tests + 3 `still_fires_for_*` tests + 1 mixed-boundary test).
+Regression tests at `crates/nn-core/src/posture/triggers.rs::tests::mass_write_excludes_sysfs_writes` (+ 3 sibling `excludes_*` tests + 3 `still_fires_for_*` tests + 1 mixed-boundary test).
 
 **References.**
 - Cluster: **detection heuristic crudeness** (§15.2) — subsumed by POSTURE_FSM_V2_REDESIGN.md §5.1 (path-class becomes a continuous "is-data-path" score, not a binary list).
@@ -628,7 +628,7 @@ Regression tests at `agent/src/posture/triggers.rs::tests::mass_write_excludes_s
 WARN POSTURE TRANSITION state=COMBAT      ← which trigger fired? unknown from journal
 ```
 
-The firing `TriggerType` was recorded in `PostureMachine.inner.transitions` (in-memory ring buffer, see `agent/src/posture/mod.rs::log_transition`) but not exposed to journald. Diagnosing posture transitions required either:
+The firing `TriggerType` was recorded in `PostureMachine.inner.transitions` (in-memory ring buffer, see `crates/nn-core/src/posture/mod.rs::log_transition`) but not exposed to journald. Diagnosing posture transitions required either:
 - Reading the in-memory ring buffer via internal API (no exposed CLI surface).
 - Adding tracing instrumentation and rebuilding.
 
@@ -726,7 +726,7 @@ The Bun runtime (Claude Code's execution engine) maintains a worker pool; each w
 ```
 
 Implementation:
-- Loader: `agent/src/posture/mass_write_overlay.rs::load_mass_write_carveout_extras` (DEFAULT_MASS_WRITE_OVERLAY constant at line 31).
+- Loader: `crates/nn-core/src/posture/mass_write_overlay.rs::load_mass_write_carveout_extras` (DEFAULT_MASS_WRITE_OVERLAY constant at line 31).
 - TriggerDetector field: `mass_write_extras: Arc<Vec<String>>` (triggers.rs:174-178), builder method `with_mass_write_extras` (triggers.rs:223).
 - Wired in `agent/src/main.rs` boot path: file loaded once at agent start, passed via `PostureMachine::new_with_hooks_and_exempt_and_auth_and_extras`.
 - 4 parser tests + 3 detector integration tests (`mass_write_extras_overlay_exempts_listed_prefix`, etc.).

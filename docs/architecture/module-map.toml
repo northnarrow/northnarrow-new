@@ -181,10 +181,12 @@ planned = false
 # comm_allowlist, overlay_auth (verify), overlay_floor. R07 (lab PR 247):
 # `overlay` (the loader) and the part of `overlay_auth` the loaders take
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
-# agent's host; comm_allowlist judges on `posture::lineage` and holds a kill
-# through `decision::response_policy` (R08); the gate verifies through
-# `anti_tamper::admin_auth` (nn-proto, after R04b) and the floor reads the
-# agent's key (`keys`): they move when those are below nn-core (§4.1 rule 3)
+# agent's host; comm_allowlist judges on `posture::lineage` (nn-core's since
+# R08a, lab PR 250) and holds a kill through `decision::response_policy`
+# (its `Judgement::apply`, which the rules call: it moves with them, R08b);
+# the gate verifies through `anti_tamper::admin_auth` (nn-proto, after
+# R04b) and the floor reads the agent's key (`keys`): they move when those
+# are below nn-core (§4.1 rule 3)
 "config" = "nn-core"
 # R04c (lab PR 247, with R07): overlay_auth's install half (`config overlay
 # set`'s atomic write and the new inodes' protection)

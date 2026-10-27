@@ -1601,3 +1601,122 @@ only in the table below, in the same PR as the evidence.
     verdict counters), the clock-tick constants; `response_policy`'s held
     switches are constants and its `HELD` per thread.
   - Lab: no guest (seams that keep every production call: `AuditLog::open`, `RotatingChainLog::open`, `Anchor::new` and `AuditEvidence::new` take the host's clock and pid as before; the switches are filled from the same places with the same defaults). Host, on afcf8ed (the final tree but for this line and a rewrapped paragraph; on `main` 60d9965, lab PR 245 merged), `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo xtask build-ebpf --release` (`common` and the eBPF crates untouched: the stamp's source c0365736…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 70 suites, 3,058 passed, 0 failed, 15 ignored (the lot's 14 tests: the clock's 2, the audit log's 2, the rotating log's 2, the head anchor's, `chain_format_clock`'s 2, the posture machine's directive, the detector's mass-write mode, NN-L-FIM-010's list, the late ladder row's clock and pid, the golden's parallel policy replay; no `#[ignore]` test added); `cargo xtask attack-coverage --check`; `cargo xtask golden` ten times, each a process of its own: 11 tests passed each time, the 33 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed); `portable-core`'s check of the pure crates for its five targets: all pass. The crypto vectors (19 tests, `cargo test crypto_vectors`) and `chain_format_pin.rs` pass with their fixtures untouched. The first commit's tree alone (the clock seam): clippy on the workspace, nn-evidence's tests, both chain pins, the posture, COMBAT and window tests pass. Golden review: a script put the named fields of the 25 new rows back to their placeholders and found every line of the six files equal to the committed one (JSON equality), each `ts` its line's time on the replay's wall clock, `prev_hash` chaining from 64 zeros, `client_pid` 4,200,000. Mutation checks (temporary): the audit row's time not read from the log's clock fails 6 tests (the fixed chain written twice, the v1 audit log made again, the late ladder row, three golden checks); the manifest rows' 2 (the rotating set written twice, the v1 set made again), the terminators' and the head snapshot's 1 each; the posture ignoring its policy handle 5 (the directive per machine, four golden checks); the detector ignoring its switch 1; the ladder rows stamped with the test's pid 8 (the late row, seven golden checks); `occurred_at` on the host's clock 1; NN-L-FIM-010's list shared again 1. The first gate run of the final tree compiled a stale nn-model and failed: the two commits were split by restoring files with `cp -a`, which kept mtimes older than the first commit's build, so cargo saw nothing to rebuild; the files touched, the gates above ran on a fresh build. Rebased on `main` cedf7e1 (lab PR 247 merged; only the lot notes conflicted, both kept), the same gates on 321fb3c: all pass, 70 suites, 3,058 passed, 0 failed, 15 ignored, the ten golden runs identical; on GitHub (c34cdd9, pull request #453) the 13 checks pass, both KVM suites included. Merged with `main` a99aff9 (lab PR 248; again only the lot notes conflicted, both kept), the same gates on c093eeb: all pass, 70 suites, 3,063 passed (lab PR 248's tests with them), 0 failed, 15 ignored, the ten golden runs identical.
+- **Lab PR 250 — nn-core, part 2a: the posture, its lineage, the
+  correlation buffer and the detection budget leave the agent (Wave 4
+  Phase 2, R08a of the restructure plan; no level changes).**
+  - What was wrong: nn-core, the pure core (no OS call, no tokio,
+    `forbid(unsafe_code)`, built for five other targets), held the content
+    lists only (R07, lab PR 247). R08a moves the posture's logic into it,
+    and that logic read its host itself: the process table
+    (`/proc/<pid>/{stat,status,exe,cgroup,loginuid,cmdline,mountinfo,
+    ns/mnt}` — the lineage's hops, the sessions' login uid and terminal,
+    the cgroups) and the host's `/etc/subuid`, `/etc/passwd` and the
+    owners of container storage through `std::fs` and `MetadataExt::uid`,
+    and three clocks through libc in `unsafe` blocks (the time suspended,
+    `CLOCK_BOOTTIME` − `CLOCK_MONOTONIC`, which `for_host`'s live checks
+    read; `CLOCK_MONOTONIC`; `sysconf(_SC_CLK_TCK)`). It also named the
+    agent's other modules: the rule engine's shapes the triggers share
+    with the rules (NN-L-FIM-024's bait tamper, NN-L-EPG-001/002's event,
+    R020's reverse-shell shape, the staging directories), the engine's
+    per-rule policy handle, the trusted-installer window and the unlock
+    token (`anti_tamper`), the ransomware and security-tool judges
+    (`impact`, `impair`). The detection budget held a tokio reporter task
+    over the agent's audit log and detection sink. Ratchet 52, nn-core 38,
+    three of them R08a's (`posture/mod.rs` and `posture/triggers.rs` →
+    `anti_tamper`, `detection_budget` → `detection_store`).
+  - What changed, one commit each: the open sensor's path text
+    (`path_text`, nn-model's by the map since lab PR 241) to nn-model
+    first, as the lineage and the triggers read it (§4.1 rule 3); the
+    correlation buffer to nn-core (98 %); the budget's reporter task cut
+    verbatim into the agent's `detection_report` (it takes the counts
+    through `detection_budget::take_held`, new), then the budget (100 %:
+    the rule catalogue cites one of its tests for NN-L-EVA-002, so the
+    citation and `RULE_CATALOGUE.md` follow, one line); the ledger, the
+    state and the transitions (99–100 %); the two operator overlays
+    `escalation_allow` and `mass_write_overlay` (99 %, R07's leftovers).
+    Then the first seam, `nn_core::posture::host::PostureHost`: the
+    process table's root and the host's, the file reads (generic over the
+    path as `std::fs` is, so each call passes what it passed), a
+    directory's owner, the three clocks — static functions, as `ChainHost`
+    and `ContentHost` —, implemented for the agent's `LinuxHost` by
+    `posture_host_linux` with the same calls (three tests of what is Linux
+    about it: `lstat`'s owner, `/proc`, the kernel's clocks); the lineage
+    and the exemption reading through it; then their move (99 %, 90 %) as
+    generics over the host, and the canary readers after them (92 %: they
+    judge on the lineage and name nothing of the engine). Then the second
+    seam, `PostureAgent` on top of it: the four shapes and the three
+    judges as static functions, the rule policy, the window, the two
+    judges and the unlock token as associated types (the machine stores
+    them, hands the token to its release hook and never makes one),
+    implemented for `LinuxHost` with the calls the triggers and the
+    machine made; then the move of the machine (93 %), the triggers (98
+    %), the COMBAT entry (100 %) and the clock (84 %), generic over the
+    host. The agent keeps every path as a shim (plan §4.1 rule 2, removed
+    in R17): `lib.rs` for `path_text`, `correlation` and
+    `detection_budget`, `canary/mod.rs` for the readers, a new
+    `posture.rs` for the posture — `pub use nn_core::posture::*`, the
+    machine, the detector, the tracker and the exemption as aliases on
+    `LinuxHost` (an alias without a parameter: one with a default does not
+    apply where a value is built), the release hook on the agent's unlock
+    token, the two watchdog lookups under their names and signatures.
+    Callers, `main.rs` (one import: the reporter's path), the admin
+    socket, the ladder, the rules, the tests, the replays, the examples
+    and the fuzz targets are unchanged. Tests: 252 moved with their code
+    and run in nn-core on a portable test host (`posture::host::testing`:
+    `std::fs`, every directory owned by one test user, never suspended,
+    100 ticks a second, a monotonic clock an hour into its uptime; the
+    staging directories and the exploit guard's event as the rules read
+    them, no bait file, no reverse-shell shape, a policy and a window of
+    `bool`, judges that never fire) — their fixture links made with
+    `std::fs::soft_link`, their user that test user instead of `getuid()`,
+    each test module binding the host in a few lines, every assertion the
+    same; the cross-module tests that wire the agent's rules, ladder,
+    judges and audit log, and the golden replay, stay in the agent and
+    read nn-core's test helpers through a feature its dev-dependency
+    enables, `test-util` (the triggers' event builders, the `TestClock`,
+    the ledger's and the machine's readers the replay took from private
+    fields, the lineage's two test builders); the legacy boolean release
+    stays `cfg(test)` (WDG-R02), so its seven tests and the clock's are
+    cut verbatim into nn-core's `posture/tests.rs`, and R020's trigger
+    test, which needs the rules' real shape, into the agent's. nn-core
+    gains nn-model, parking_lot and `common` (the agent's versions) and a
+    `debug-trigger` feature the agent forwards; the lockfiles gain the
+    edges, nothing else. Ratchet 52 → 50: nn-core 38 → 37 (the reporter
+    left the budget) → 39 (the first seam: the lineage and the exemption
+    name the Linux host where they called `std::fs` and libc) → 38 (they
+    moved; the machine's `posture/mod.rs`, which bound them, named it) →
+    39 (the second seam: the triggers) → 36 (the machine and the triggers
+    moved; the agent's `posture.rs`, which binds the posture to the Linux
+    host, names it, as `config/mod.rs` does for the loaders); nn-admin 8,
+    nn-linux 3, nn-proto 3.
+  - Deviations from the plan: the plan's `ProcSource` and `Clock` (§2.3,
+    R04b) are one host trait of static functions with the calls the
+    posture made (lab PR 247's way), not typed records of a process; the
+    posture's own clock stays lab PR 243's `posture::clock::Clock` (an
+    `Instant`). `PostureAgent` is a seam the plan did not foresee: the
+    triggers share four shapes with the rules R08b moves, and the machine
+    holds the agent's policy handle, window, judges and token; R08b drops
+    its engine's half. `config::comm_allowlist` is not moved: its
+    `Judgement::apply`, which 23 sites of the rules call, holds the
+    revoked transfer tool's kill through the engine's per-rule response
+    policy (`REVOKED_TRANSFER_TOOL_KILL`, a per-thread hold); a seam there
+    changes every caller's arguments or imports, in R08b's code, and in
+    R08b the policy and the rules move with it, so no seam is needed.
+    `path_text` (to nn-model) and the canary readers were not in R08a's
+    list: the posture needs the first, the second needs the lineage. The
+    posture's shim is a file (`posture.rs`), not `lib.rs` as R05's: the
+    ratchet's scan finds the test-only `mod` a file declares, not one
+    inside an inline module, and would have read the golden replay and the
+    cross-module tests as the posture's code. The moves carry their
+    generics (no separate rewrite commits, no `.git-blame-ignore-revs`);
+    `exempt` (90 %), the readers (92 %) and `clock` (84 %) are below
+    §4.1's 95 %: short files. The test host's staging list is a copy of
+    the rules' three prefixes until R08b.
+  - Open: `comm_allowlist`, `net::blocklist` and the decision replay
+    (R08b); `PostureAgent`'s engine half (R08b), its judges (`impact`,
+    `impair`), the window and the token (R04b's split and the
+    `UnlockToken` verification); the overlay gate and the rollback floor
+    (after R04b and R09a); in R09, `LinuxHost` goes to nn-linux and its
+    `PostureAgent` implementation with it (the orphan rule); the shims
+    (R17).
+  - Lab: no guest (moves and seams that keep every call; the identity below). Host, on 1356811 (the lot's code; the commit after it changes documentation only) and again on the final tree, `set -o pipefail`, `CARGO_BUILD_JOBS=6`: `cargo xtask build-ebpf --release` (`common` and the eBPF crates untouched: the stamp's source c0365736…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo, whose output is `main`'s line for line); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 70 suites, 3,066 passed, 0 failed, 15 ignored (the test list is `main`'s — 3,078 names, every one found at the tip, 252 now nn-core's (44 → 296 there), R020's trigger test now the agent's `posture::tests::reverse_shell` — plus the Linux host's 3 tests; no `#[ignore]` test added); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` five times, each a process of its own: 11 tests passed each time, the 33 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed by the build); `portable-core`'s `cargo check` of the pure crates for its five targets (nn-core's test code builds for Windows too): all pass. The pins pass unchanged, by name: `encoded_frames_are_pinned`, `chain_format_pin` (5, its generator ignored), `chain_format_clock` (2), `crypto_vectors` (19), the TLS and DNS parser pins (5), the overlay-v1 fixture (2). Identity against `main` 9e33fad, both built in one temporary checkout (same path), the release job's commands (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`; unstripped: the same flags, `CARGO_PROFILE_RELEASE_STRIP=none`): the eBPF object is byte-identical (sha256 a4f7006f… there), its stamp too (source c0365736…); the scanner (401,368 bytes) is byte-identical (unstripped: its 504 functions the same code, and 24 bytes differ, the numbers LLVM appends to the names of four local symbols); the watchdog (2,336,920 → 2,337,080 bytes) has every one of `main`'s 2,469 functions the same code and one more copy of a `RawVec` growth body `main` has twice — `path_text`'s commit alone builds this watchdog byte for byte, stripped and unstripped; `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes, the sizes of the agent, nn-admin, the watchdog and `CHANGELOG.md` aside. The agent (14,901,048 → 14,940,328 bytes) and nn-admin (4,029,280 → 4,029,840) are not byte-identical. Function by function (unstripped, names mapped to the new crates and modules, the host type parameter dropped, addresses and rip-relative targets dropped, trailing padding dropped): the agent 7,536 of 7,653 the same code (89 differ, 28 and 59 unpaired), nn-admin 3,440 of 3,478 (31; 7 and 12). Control — `main` with nn-core's three new dependencies, no source moved: the watchdog and the scanner byte-identical, 21 of the agent's functions and 6 of nn-admin's change already (clap's `TypeId`s of the binaries' enums: a crate's identity moves with its dependency list; which of identical bodies keeps its name). From the control to this lot: 69 of the agent's — 34 call other callees (inlining at the new crate boundary), 23 schedule or allocate registers otherwise, 12 have the same instructions with other operands — and 25 of nn-admin's (9, 14 and 2); the unpaired are generic code made in both the agent's library and its binary now that the lineage's and the exemption's methods are generic (`loginuid_of`, `image_path`, `is_running`, `proc_start_ticks_of`, …), the machine's `observe` kept out of line (28,039 bytes, which `process_event` loses: −24,512), and helpers kept out of line or folded: `.text` +35,376 bytes in the agent (+0.49 %), +32 in nn-admin. `.rodata`, cut at every address the code or a dynamic relocation names, callsite line numbers aside: the watchdog's and the scanner's text the same; the agent's the same but the reporter's source path and tracing target (`detection_report`, a move within the agent) and adjacent literals grouped otherwise; nn-admin's the same but a search for `/../` compiled with vector constants; the moved modules' paths and tracing target are nn-core's and nn-model's (not printed: `with_target(false)`).
