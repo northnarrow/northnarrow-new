@@ -1384,36 +1384,10 @@ fn format_role_list(roles: &[Role]) -> String {
     parts.join(",")
 }
 
-pub fn role_keyword(r: Role) -> &'static str {
-    match r {
-        Role::Unlock => "unlock",
-        Role::Shutdown => "shutdown",
-        Role::ForcePosture => "force-posture",
-        Role::RotateKeys => "rotate-keys",
-        Role::AuditRead => "audit-read",
-        // Tappa 9 (C1) additions — same wire-byte keyword
-        // shape operators see in admin.pub lines + CLI.
-        Role::FimManage => "fim-manage",
-        Role::FimRead => "fim-read",
-        // Tappa 9.5 (K1) — design §12 Q7 split-role lock-in.
-        Role::CanaryRead => "canary-read",
-        Role::CanaryManage => "canary-manage",
-        // Tappa 10 (N1) — network observability split-role pair.
-        Role::NetRead => "net-read",
-        Role::NetManage => "net-manage",
-        // FIM-009 self-upgrade (§15.1).
-        Role::TrustedInstaller => "trusted-installer",
-        // Tappa 9.0.b — read-only telemetry role.
-        Role::TelemetryRead => "telemetry-read",
-        // Tappa 9.0.c — triage role (subsumes telemetry-read).
-        Role::Triage => "triage",
-        // Tappa 10.8 — signed operator overlays.
-        Role::ConfigManage => "config-manage",
-        // External audit CMB-016 — undo a response.
-        Role::ResponseManage => "response-manage",
-        Role::All => "all",
-    }
-}
+/// The keyword of a role as `admin.pub` and the CLI write it: nn-proto's
+/// (Wave 4 restructure, R09a, lab PR 253: the role parse is nn-proto's,
+/// plan §2.4), under its path here.
+pub use nn_proto::admin_quorum::role_keyword;
 
 fn write_admin_pub_atomically(config_path: &Path, body: &str) -> std::io::Result<()> {
     // 0644 matches the pre-rotation admin.pub layout (design §6.5 / §8.1:

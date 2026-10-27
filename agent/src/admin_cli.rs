@@ -742,7 +742,7 @@ pub fn run_verify_keys(path: &Path) -> Result<VerifyKeysOutcome> {
         .map(|k| {
             k.roles
                 .iter()
-                .map(|r| crate::anti_tamper::admin_auth::role_keyword(*r))
+                .map(|r| nn_proto::admin_quorum::role_keyword(*r))
                 .collect::<Vec<_>>()
                 .join(",")
         })
