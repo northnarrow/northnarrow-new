@@ -5319,8 +5319,11 @@ async fn process_event(
     // Lab PR 163: the close of a connection that tripped a network canary
     // belongs to the trip (its row is in the signed netflow log already);
     // judged again, NN-L-CHAIN-003 answered the one access a second time.
-    if canary_detector.is_some_and(|d| d.owns_trip_flow(&event)) {
-        debug!("close of a network canary trip connection — part of the trip, not judged again");
+    // Lab PR 246: every row of that connection, as the engine's flow ledger
+    // keys it (the trip's accessor and connect time) — a close the flow
+    // tracker synthesised included, and a row that follows the close.
+    if engine.owned_by_trip(&event) {
+        debug!("row of a network canary trip's connection — part of the trip, not judged again");
         return;
     }
 

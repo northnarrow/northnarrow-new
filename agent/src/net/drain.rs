@@ -520,6 +520,8 @@ pub async fn drain_loop(
                 }
                 guard.clear_ready();
                 attribution_barrier(&batch, &dns_cache).await;
+                // Lab PR 246: each close after its connect, on the bus too.
+                connect_barrier(&batch, &flow_tracker).await;
                 for raw in batch.drain(..) {
                     process_close_record(
                         bytemuck::bytes_of(&raw),
@@ -648,9 +650,55 @@ fn group_commit(
 /// `FlowTracker::corr_id`). Bytes 8..16 are the socket's kernel address,
 /// which nothing outside the agent sees.
 fn corr_start_ns(corr: &[u8; 16]) -> u64 {
-    let mut ts = [0u8; 8];
-    ts.copy_from_slice(&corr[..8]);
-    u64::from_le_bytes(ts)
+    FlowTracker::corr_start_ns(corr)
+}
+
+/// Lab PR 246: how long a TCP close waits for its connect to be on the bus,
+/// counted from the connect's kernel time (its correlator's): the connect
+/// pump may itself wait [`crate::net::dns_cache::INGEST_WAIT`] for the DNS
+/// pump before it sends a connect. A close whose connect is older than
+/// this (connected before the agent started, or long ago) waits for
+/// nothing.
+pub const CONNECT_WAIT: Duration = Duration::from_millis(500);
+
+/// Lab PR 246: hold the TCP closes of `batch` until the connect pump has
+/// put their connects on the bus ([`FlowTracker::close_may_proceed`]), at
+/// most [`CONNECT_WAIT`] from each connect's time. The connect and the
+/// close come on two rings, read by two tasks: a close resolved first was
+/// synthesised (the connect's destination lost — a refused connect showed
+/// port 0) and reached the rules before its `Event::TcpConnect`, so the
+/// close of a network canary trip's own connection was judged before the
+/// trip that owns it, or as an egress after it (NN-L-CHAIN-003 on the
+/// trip's own connection, the KVM failure of 27/10/2026). Past the wait
+/// the close goes on as before (synthesised under its connect's time).
+pub(crate) async fn connect_barrier(batch: &[NetFlowCloseRaw], flow_tracker: &Mutex<FlowTracker>) {
+    let announced = flow_tracker.lock().announcements();
+    for raw in batch.iter().filter(|r| r.proto == IPPROTO_TCP) {
+        let connect_ns = corr_start_ns(&raw.flow_id);
+        let age = Duration::from_nanos(monotonic_ns().saturating_sub(connect_ns));
+        let Some(left) = CONNECT_WAIT.checked_sub(age) else {
+            continue;
+        };
+        let deadline = tokio::time::Instant::now() + left;
+        loop {
+            let notified = announced.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if flow_tracker.lock().close_may_proceed(&raw.flow_id) {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                debug!(
+                    target: "net.drain",
+                    pid = raw.pid,
+                    corr_start_ns = connect_ns,
+                    "net drain: a TCP close's connect was not on the bus within the wait — \
+                     the close goes on (its row synthesised if the connect is still unread)"
+                );
+                break;
+            }
+        }
+    }
 }
 
 async fn process_close_record(
@@ -1462,6 +1510,155 @@ mod tests {
         raw.src_port = 40_000;
         raw.dst_port = dport;
         bytemuck::bytes_of(&raw).to_vec()
+    }
+
+    /// A refused loopback connect's close (lab PR 246, the KVM failure of
+    /// 27/10/2026): the kernel cleared the destination port, its
+    /// correlator names the connect at `connect_ns`.
+    fn refused_close(connect_ns: u64, sk_ptr: u64) -> NetFlowCloseRaw {
+        let mut raw = NetFlowCloseRaw::zeroed();
+        raw.timestamp_ns = connect_ns + 40_000;
+        raw.flow_id = FlowTracker::corr_id(connect_ns, sk_ptr);
+        raw.pid = 9825;
+        raw.src_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
+        raw.dst_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
+        raw.comm[..4].copy_from_slice(b"bash");
+        raw.family = 2;
+        raw.proto = IPPROTO_TCP;
+        raw.src_port = 40_000;
+        raw
+    }
+
+    fn refused_connect(connect_ns: u64, sk_ptr: u64) -> crate::net::flow_tracker::TcpConnectInfo {
+        crate::net::flow_tracker::TcpConnectInfo {
+            start_ns: connect_ns,
+            sk_ptr,
+            family: 2,
+            src_addr: "0.0.0.0".parse().unwrap(),
+            src_port: 0,
+            dst_addr: "127.0.0.1".parse().unwrap(),
+            dst_port: 41147,
+            proto: 6,
+            pid: 9825,
+            uid: 0,
+            comm: "bash".into(),
+            exe: Some("/usr/bin/bash".into()),
+            proc_start_ns: 0,
+        }
+    }
+
+    /// Lab PR 246: a TCP close is held until the connect pump has put its
+    /// connect on the bus (announced), at most `CONNECT_WAIT` from the
+    /// connect's time; then it resolves against its connect — the
+    /// connect's destination, not the port 0 the kernel left on a refused
+    /// connect. No wait for a close whose connect is old, is announced,
+    /// is a kernel lookup miss, for a UDP record, or with no connect pump.
+    #[tokio::test]
+    async fn a_close_is_held_until_its_connect_is_on_the_bus() {
+        use std::time::Instant as StdInstant;
+        let zero = Duration::ZERO;
+        let tracker = Arc::new(Mutex::new(FlowTracker::default()));
+        tracker.lock().set_connect_pump(true);
+
+        // The connect not read yet: the close waits...
+        let t0 = monotonic_ns();
+        let close = refused_close(t0, 0x5eed);
+        assert!(
+            tokio::time::timeout(zero, connect_barrier(&[close], &tracker))
+                .await
+                .is_err(),
+            "a fresh close waits for its connect"
+        );
+        // ...and goes on once the connect pump announces it.
+        let waiting = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                let began = StdInstant::now();
+                connect_barrier(&[close], &tracker).await;
+                began.elapsed()
+            })
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut t = tracker.lock();
+            assert!(t.on_tcp_connect(&refused_connect(t0, 0x5eed)).is_some());
+            t.announce(&close.flow_id);
+        }
+        let waited = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("woken")
+            .unwrap();
+        assert!(
+            waited < CONNECT_WAIT,
+            "woken by the announcement: {waited:?}"
+        );
+        let info = TcpCloseInfo {
+            end_ns: close.timestamp_ns,
+            corr_id: close.flow_id,
+            src_addr: "127.0.0.1".parse().unwrap(),
+            src_port: 40_000,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            close_reason: 0,
+            family: 2,
+            dst_addr: "127.0.0.1".parse().unwrap(),
+            dst_port: 0,
+            pid: 9825,
+            uid: 0,
+            comm: "bash".into(),
+        };
+        let row = tracker.lock().on_tcp_close(&info).expect("resolved");
+        assert_eq!((row.start_ns, row.dst_port), (t0, 41147));
+        assert_eq!(row.exe.as_deref(), Some("/usr/bin/bash"));
+
+        // No wait: an announced connect, an old connect, a kernel lookup
+        // miss, a UDP record.
+        let announced = refused_close(monotonic_ns(), 0x6eed);
+        {
+            let mut t = tracker.lock();
+            let c = refused_connect(FlowTracker::corr_start_ns(&announced.flow_id), 0x6eed);
+            t.on_tcp_connect(&c);
+            t.announce(&announced.flow_id);
+        }
+        let old = refused_close(
+            monotonic_ns().saturating_sub(2 * CONNECT_WAIT.as_nanos() as u64),
+            0x7eed,
+        );
+        let mut miss = refused_close(monotonic_ns(), 0x8eed);
+        miss.flow_id = [0u8; 16];
+        let mut udp = refused_close(monotonic_ns(), 0x9eed);
+        udp.proto = IPPROTO_UDP;
+        for raw in [announced, old, miss, udp] {
+            assert!(
+                tokio::time::timeout(zero, connect_barrier(&[raw], &tracker))
+                    .await
+                    .is_ok(),
+                "no wait: {raw:?}"
+            );
+        }
+
+        // A connect never announced: the close goes on at the bound.
+        let late = refused_close(
+            monotonic_ns()
+                .saturating_sub((CONNECT_WAIT - Duration::from_millis(60)).as_nanos() as u64),
+            0xaeed,
+        );
+        let began = StdInstant::now();
+        tokio::time::timeout(Duration::from_secs(5), connect_barrier(&[late], &tracker))
+            .await
+            .expect("bounded");
+        assert!(began.elapsed() >= Duration::from_millis(20));
+
+        // No connect pump: nothing waits.
+        tracker.lock().set_connect_pump(false);
+        let fresh = refused_close(monotonic_ns(), 0xbeed);
+        assert!(
+            tokio::time::timeout(zero, connect_barrier(&[fresh], &tracker))
+                .await
+                .is_ok()
+        );
     }
 
     /// External audit NET-019 + NET-012 through the drain's record path:

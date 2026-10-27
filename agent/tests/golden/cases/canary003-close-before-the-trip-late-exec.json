@@ -1,0 +1,98 @@
+{
+ "about": "Lab PR 246 over lab PR 244: a program staged in /tmp connects to a network canary on a loopback port nothing listens on; the close of the refused socket reaches the engine before the trip (judged as any flow, before any precursor, and noted as an egress), then the trip, then the program's exec record, processed last though it came first in kernel time. NN-L-CHAIN-002's late exec (lab PR 244) would complete the chain with the trip's own connection; the trip dropped that note, so the late exec is R001's alone. A later flow of the program is NN-L-CHAIN-002 and NN-L-CHAIN-003.",
+ "fires": [
+  "NN-L-CANARY-003_NetworkConnect",
+  "R001_ExecFromTmp",
+  "NN-L-CHAIN-002_TmpExecThenEgress",
+  "NN-L-CHAIN-003_CanaryThenEgress"
+ ],
+ "items": [
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3655817248000,
+     "end_ns": 3655817288000,
+     "family": 2,
+     "src_addr": "127.0.0.1",
+     "src_port": 52000,
+     "dst_addr": "127.0.0.1",
+     "dst_port": 0,
+     "proto": 6,
+     "pid": 6460003,
+     "uid": 1000,
+     "comm": "nn-246",
+     "exe": null,
+     "proc_start_ns": 0,
+     "bytes_sent": 0,
+     "bytes_recv": 0,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6460003-3655817248000",
+     "phase": "closed"
+    }
+   }
+  },
+  {
+   "event": {
+    "CanaryTripped": {
+     "canary_id": "85e1875c23bc4a795484f81a1519f39a",
+     "canary_name": "decoy-db",
+     "canary_type": "Network",
+     "access_kind": "NetworkConnect",
+     "accessor_pid": 6460003,
+     "accessor_uid": 1000,
+     "accessor_comm": "nn-246",
+     "accessor_exe": "/tmp/.cache/nn-246",
+     "timestamp_ns": 3655817248000,
+     "first_trip": true
+    }
+   }
+  },
+  {
+   "event": {
+    "ProcessSpawn": {
+     "pid": 6460003,
+     "ppid": 1,
+     "uid": 1000,
+     "gid": 1000,
+     "comm": "nn-246",
+     "filename": "/tmp/.cache/nn-246",
+     "timestamp_ns": 3653817248000,
+     "argv": [
+      "/tmp/.cache/nn-246"
+     ],
+     "parent_comm": "systemd",
+     "start_ns": 3652817248000,
+     "exe": {
+      "path": "/tmp/.cache/nn-246"
+     }
+    }
+   }
+  },
+  {
+   "event": {
+    "NetFlow": {
+     "start_ns": 3657817248000,
+     "end_ns": 3658817248000,
+     "family": 2,
+     "src_addr": "10.0.2.15",
+     "src_port": 52100,
+     "dst_addr": "100.64.20.9",
+     "dst_port": 443,
+     "proto": 6,
+     "pid": 6460003,
+     "uid": 1000,
+     "comm": "nn-246",
+     "exe": "/tmp/.cache/nn-246",
+     "proc_start_ns": 0,
+     "bytes_sent": 4096,
+     "bytes_recv": 512,
+     "resolved_hostname": null,
+     "tls_fingerprint": null,
+     "flow_id": "golden-6460003-3657817248000",
+     "phase": "closed"
+    }
+   }
+  }
+ ]
+}
