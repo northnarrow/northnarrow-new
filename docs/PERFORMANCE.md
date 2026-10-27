@@ -224,7 +224,10 @@ with positive = worse, the noise, the limit, the verdict) and exits
   run did not;
 - **2** — unreadable input, another schema, a misspelt metric in an
   option, or runs from different hosts (kernel, CPU model, vCPUs, memory,
-  virtualisation, clocksource) without `--allow-host-mismatch`.
+  virtualisation, clocksource) without `--allow-host-mismatch`. Memory is
+  MemTotal, which moves by a few KiB between boots of one guest: within
+  ±0.1 % of the base's or ±1 MiB, whichever is larger, it is the same host
+  and the output notes the drift (lab PR 248).
 
 A gated metric regresses when its new median is worse than the base median
 

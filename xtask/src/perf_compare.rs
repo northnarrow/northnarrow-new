@@ -23,7 +23,11 @@
 //! Exit 0: no regression and nothing missing; 1: a regression or a missing
 //! metric; 2: unreadable input, another schema, or runs from different hosts
 //! (kernel, CPU model, vCPUs, memory, virtualisation, clocksource) without
-//! `--allow-host-mismatch`.
+//! `--allow-host-mismatch`. The host fields must be equal, but for MemTotal,
+//! which moves by a few KiB between boots of one guest (lab PR 248): within
+//! ±[`MEM_TOTAL_DRIFT_PCT`] % of the base's or ±[`MEM_TOTAL_DRIFT_MIN_KIB`]
+//! KiB, whichever is larger, it is the same host, and the report notes the
+//! drift.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -56,6 +60,15 @@ pub const DEFAULT_ABS_FLOORS: &[(&str, f64)] = &[
     ("event_to_disk_ms", 2.0),
     ("boot_to_ready_ms", 100.0),
 ];
+/// MemTotal drifts between boots of the same guest (what the kernel
+/// reserves at boot: 8,131,760 and 8,131,764 KiB on the lab's 8 GiB guest):
+/// a new run's MemTotal within this share of the base's, percent, or within
+/// [`MEM_TOTAL_DRIFT_MIN_KIB`] when that is more, is the same host's.
+pub const MEM_TOTAL_DRIFT_PCT: f64 = 0.1;
+/// The smallest MemTotal drift tolerated, KiB (1 MiB).
+pub const MEM_TOTAL_DRIFT_MIN_KIB: f64 = 1024.0;
+/// The host field that may drift by [`mem_total_tolerance_kib`].
+const MEM_TOTAL_KEY: &str = "mem_total_kib";
 /// The host fields two runs must share to be compared.
 pub const HOST_KEYS: &[&str] = &[
     "kernel",
@@ -101,8 +114,8 @@ pub struct Args {
     /// Smallest noise, percent, whatever the samples show.
     #[arg(long = "noise-floor", default_value_t = DEFAULT_NOISE_FLOOR_PCT)]
     pub noise_floor: f64,
-    /// Compare runs taken on different hosts (kernel, CPU, vCPUs, memory,
-    /// virtualisation, clocksource) anyway.
+    /// Compare runs taken on different hosts (kernel, CPU, vCPUs, memory
+    /// beyond a boot's drift, virtualisation, clocksource) anyway.
     #[arg(long)]
     pub allow_host_mismatch: bool,
     /// The per-metric thresholds and floors (default: the committed
@@ -467,16 +480,51 @@ fn show(v: Option<&Value>) -> String {
     }
 }
 
+/// The MemTotal drift, KiB, either way, that a run of the base's host may
+/// show: [`MEM_TOTAL_DRIFT_PCT`] of the base's MemTotal, at least
+/// [`MEM_TOTAL_DRIFT_MIN_KIB`].
+pub fn mem_total_tolerance_kib(base_kib: f64) -> f64 {
+    (base_kib.abs() * MEM_TOTAL_DRIFT_PCT / 100.0).max(MEM_TOTAL_DRIFT_MIN_KIB)
+}
+
+/// Whether one host field tells two hosts apart: `Err` with the mismatch
+/// line, `Ok(Some(note))` for a MemTotal drift within the tolerance,
+/// `Ok(None)` for equal values. MemTotal is compared as a number only when
+/// both runs recorded one; otherwise, and for every other field, the values
+/// must be equal.
+fn host_field(key: &str, b: Option<&Value>, n: Option<&Value>) -> Result<Option<String>, String> {
+    if b == n {
+        return Ok(None);
+    }
+    if key == MEM_TOTAL_KEY {
+        if let (Some(x), Some(y)) = (b.and_then(Value::as_f64), n.and_then(Value::as_f64)) {
+            let tolerance = mem_total_tolerance_kib(x);
+            if (y - x).abs() <= tolerance {
+                return Ok(Some(format!(
+                    "host: {key} {} → {} ({:+} KiB), within the drift between boots of one \
+                     host (±{tolerance:.0} KiB: {MEM_TOTAL_DRIFT_PCT} % of the base or \
+                     {MEM_TOTAL_DRIFT_MIN_KIB:.0} KiB, whichever is larger): the same host",
+                    show(b),
+                    show(n),
+                    y - x
+                )));
+            }
+        }
+    }
+    Err(format!("{key}: {} → {}", show(b), show(n)))
+}
+
 /// Compare `new` with `base`.
 pub fn compare(base: &Run, new: &Run, cfg: &Config) -> Report {
     let mut host_mismatch = Vec::new();
+    let mut notes = Vec::new();
     for k in HOST_KEYS {
-        let (b, n) = (base.host.get(*k), new.host.get(*k));
-        if b != n {
-            host_mismatch.push(format!("{k}: {} → {}", show(b), show(n)));
+        match host_field(k, base.host.get(*k), new.host.get(*k)) {
+            Ok(None) => {}
+            Ok(Some(note)) => notes.push(note),
+            Err(line) => host_mismatch.push(line),
         }
     }
-    let mut notes = Vec::new();
     for k in METHOD_KEYS {
         let (b, n) = (base.method.get(*k), new.method.get(*k));
         if b != n {
@@ -901,6 +949,138 @@ mod tests {
         ] {
             assert!(parse_thresholds(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A run with only a `host` object (no metrics).
+    fn run_on(host: Value) -> Run {
+        let doc = serde_json::json!({"schema": SCHEMA, "host": host, "metrics": {}});
+        parse_run(&doc.to_string(), "x").unwrap()
+    }
+
+    /// The host of the committed baseline (lab PR 228).
+    fn lab_host() -> Value {
+        serde_json::json!({
+            "kernel": "6.8.0-147-generic",
+            "cpu_model": "AMD Ryzen 9 3900XT 12-Core Processor",
+            "vcpus": 4,
+            "mem_total_kib": 8_131_764,
+            "virt": "microsoft",
+            "clocksource": "hyperv_clocksource_tsc_page",
+        })
+    }
+
+    fn with(key: &str, value: Value) -> Run {
+        let mut h = lab_host();
+        h[key] = value;
+        run_on(h)
+    }
+
+    fn mem(base_kib: u64, new_kib: u64) -> Report {
+        let cfg = Config::new(DEFAULT_THRESHOLD_PCT, DEFAULT_NOISE_FLOOR_PCT);
+        compare(
+            &with("mem_total_kib", base_kib.into()),
+            &with("mem_total_kib", new_kib.into()),
+            &cfg,
+        )
+    }
+
+    /// Lab PR 248: the guest's MemTotal was 8,131,760 KiB on one boot and
+    /// 8,131,764 on another, and the gate refused the pair as two hosts
+    /// (exit 2), so every comparison needed --allow-host-mismatch. A drift
+    /// within ±0.1 % of the base's MemTotal, or ±1 MiB when that is more, is
+    /// the same host now — noted, not a mismatch.
+    #[test]
+    fn a_memtotal_drift_between_boots_is_the_same_host() {
+        let r = mem(8_131_764, 8_131_760);
+        assert!(r.host_mismatch.is_empty(), "{:?}", r.host_mismatch);
+        assert!(
+            r.notes.iter().any(
+                |n| n.starts_with("host: mem_total_kib 8131764 → 8131760 (-4 KiB)")
+                    && n.contains("±8132 KiB")
+                    && n.ends_with("the same host")
+            ),
+            "{:?}",
+            r.notes
+        );
+        assert!(r
+            .render()
+            .contains("note: host: mem_total_kib 8131764 → 8131760"));
+        // 0.1 % of the base (8,131.8 KiB here), at least 1 MiB
+        assert!((mem_total_tolerance_kib(8_131_764.0) - 8_131.764).abs() < 1e-9);
+        assert_eq!(mem_total_tolerance_kib(524_288.0), 1024.0);
+        for (b, n) in [
+            (8_131_764, 8_131_764 + 8_131),
+            (8_131_764, 8_131_764 - 8_131),
+            (524_288, 524_288 + 1024),
+            (524_288, 524_288 - 1024),
+        ] {
+            let r = mem(b, n);
+            assert!(
+                r.host_mismatch.is_empty(),
+                "{b} → {n}: {:?}",
+                r.host_mismatch
+            );
+        }
+        // the same MemTotal: nothing to note
+        let r = mem(8_131_764, 8_131_764);
+        assert!(r.host_mismatch.is_empty() && r.notes.iter().all(|n| !n.contains("mem_total")));
+    }
+
+    /// A host that did change still fails the comparison: another CPU model
+    /// or count, another kernel, a MemTotal beyond the drift (a smaller
+    /// guest, or just past the tolerance either way), one not recorded, the
+    /// virtualisation or the clocksource.
+    #[test]
+    fn a_real_host_change_is_still_another_host() {
+        let cfg = Config::new(DEFAULT_THRESHOLD_PCT, DEFAULT_NOISE_FLOOR_PCT);
+        let base = run_on(lab_host());
+        for (key, value, line) in [
+            (
+                "cpu_model",
+                serde_json::json!("AMD EPYC 7763 64-Core Processor"),
+                "cpu_model: AMD Ryzen 9 3900XT 12-Core Processor → AMD EPYC 7763 64-Core Processor",
+            ),
+            ("vcpus", serde_json::json!(8), "vcpus: 4 → 8"),
+            (
+                "kernel",
+                serde_json::json!("6.8.0-149-generic"),
+                "kernel: 6.8.0-147-generic → 6.8.0-149-generic",
+            ),
+            (
+                "mem_total_kib",
+                serde_json::json!(6_093_644),
+                "mem_total_kib: 8131764 → 6093644",
+            ),
+            (
+                "mem_total_kib",
+                serde_json::json!(8_131_764 + 8_132),
+                "mem_total_kib: 8131764 → 8139896",
+            ),
+            (
+                "mem_total_kib",
+                serde_json::json!(8_131_764 - 8_132),
+                "mem_total_kib: 8131764 → 8123632",
+            ),
+            ("mem_total_kib", Value::Null, "mem_total_kib: 8131764 → —"),
+            ("virt", serde_json::json!("kvm"), "virt: microsoft → kvm"),
+            (
+                "clocksource",
+                serde_json::json!("tsc"),
+                "clocksource: hyperv_clocksource_tsc_page → tsc",
+            ),
+        ] {
+            let r = compare(&base, &with(key, value), &cfg);
+            assert_eq!(r.host_mismatch, vec![line.to_string()], "{key}");
+            assert!(
+                r.render().contains(&format!("host differs: {line}")),
+                "{key}"
+            );
+        }
+        // beyond the 1 MiB floor of a small guest
+        assert_eq!(
+            mem(524_288, 524_288 + 1025).host_mismatch,
+            vec!["mem_total_kib: 524288 → 525313".to_string()]
+        );
     }
 
     #[test]

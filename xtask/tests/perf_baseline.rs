@@ -314,6 +314,42 @@ fn runs_from_different_hosts_are_refused() {
     );
 }
 
+/// Lab PR 248: MemTotal moves by a few KiB between two boots of one guest
+/// (8,131,760 and 8,131,764 KiB), and the gate took that for another host
+/// (exit 2). Within ±0.1 % of the base's or ±1 MiB it is the same host, and
+/// the output says so; a larger change is still another host.
+#[test]
+fn a_memtotal_drift_between_boots_is_the_same_host() {
+    let dir = case_dir("host-mem");
+    let m = json!({"exec_true_ns": metric(&TIGHT)});
+    let mut base = run_doc(m.clone());
+    base["host"]["mem_total_kib"] = json!(8_131_764);
+    let b = write(&dir, "base.json", &base);
+    let mut boot = base.clone();
+    boot["host"]["mem_total_kib"] = json!(8_131_760);
+    let n = write(&dir, "new.json", &boot);
+    let out = compare(&b, &n, &[]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(0), "{t}");
+    assert!(
+        t.contains("note: host: mem_total_kib 8131764 → 8131760 (-4 KiB)")
+            && t.contains("the same host")
+            && !t.contains("host differs"),
+        "{t}"
+    );
+    let mut smaller = base.clone();
+    smaller["host"]["mem_total_kib"] = json!(6_093_644);
+    let n = write(&dir, "smaller.json", &smaller);
+    let out = compare(&b, &n, &[]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(2), "{t}");
+    assert!(
+        t.contains("host differs: mem_total_kib: 8131764 → 6093644")
+            && t.contains("not comparable"),
+        "{t}"
+    );
+}
+
 #[test]
 fn unreadable_input_is_an_error_not_a_verdict() {
     let dir = case_dir("bad-input");
