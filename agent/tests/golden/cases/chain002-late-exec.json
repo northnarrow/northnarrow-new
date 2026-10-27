@@ -1,0 +1,9 @@
+{
+  "about": "Lab PR 244: a user's program staged in /tmp connects out to port 443, and its exec record reaches the engine after the connect (its own ring and pump: the CI ordering of the e2e). On the connect no chain fires — its exec is not known yet; NN-L-NET-008 judges the staged image of the flow. On the late exec NN-L-CHAIN-002 completes on the kernel timestamps and names the connect (Critical, primary) with R001, one kill of the tree. At the flow's close no second chain verdict (the flow ledger).",
+  "fires": ["NN-L-CHAIN-002_TmpExecThenEgress", "R001_ExecFromTmp"],
+  "items": [
+    {"event": {"NetFlow": {"start_ns": 3612000000000, "end_ns": 0, "family": 2, "src_addr": "10.0.2.15", "src_port": 40100, "dst_addr": "100.64.20.9", "dst_port": 443, "proto": 6, "pid": 6440001, "uid": 1000, "comm": "dropper", "exe": "/tmp/.d/dropper", "proc_start_ns": 3609000000000, "bytes_sent": 0, "bytes_recv": 0, "resolved_hostname": null, "tls_fingerprint": null, "flow_id": "golden-6440001-3612000000000", "phase": "connect"}}},
+    {"event": {"ProcessSpawn": {"pid": 6440001, "ppid": 1, "uid": 1000, "gid": 1000, "comm": "dropper", "filename": "/tmp/.d/dropper", "timestamp_ns": 3610000000000, "argv": ["/tmp/.d/dropper"], "parent_comm": "systemd", "start_ns": 3609000000000, "exe": {"path": "/tmp/.d/dropper"}}}},
+    {"event": {"NetFlow": {"start_ns": 3612000000000, "end_ns": 3612050000000, "family": 2, "src_addr": "10.0.2.15", "src_port": 40100, "dst_addr": "100.64.20.9", "dst_port": 443, "proto": 6, "pid": 6440001, "uid": 1000, "comm": "dropper", "exe": "/tmp/.d/dropper", "proc_start_ns": 3609000000000, "bytes_sent": 1024, "bytes_recv": 128, "resolved_hostname": null, "tls_fingerprint": null, "flow_id": "golden-6440001-3612000000000", "phase": "closed"}}}
+  ]
+}

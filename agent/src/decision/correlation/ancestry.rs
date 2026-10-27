@@ -8,16 +8,17 @@
 //! ## Keying
 //!
 //! An edge is keyed by the child's `pid` and records its parent's pid.
-//! The parent start the D2 wire carries (`parent_start_ns`) is the start
-//! of the thread that forked, not of the process, so it is not used.
+//! The parent start the D2 wire carries (`parent_start_ns`) is not used:
+//! it was the start of the thread that forked, not of the process, until
+//! lab PR 238 (the parent's thread-group leader's since).
 //!
 //! External audit NETR-009: each edge also records the child's own
 //! `start_time` (`Event::ProcessSpawn::start_ns`, POS-003), so the tree
 //! is the store's `pid → start_ns` map. A lineage walk keys each ancestor
-//! with the start recorded for *it*, not with the parent start carried by
-//! the child's exec (that is the start of the forking thread), and stops
-//! at a hop that started after its child: such a hop is a later process
-//! holding a reused PID (the POS-003 rule of `lineage_match`).
+//! with the start recorded for *it* (its own exec's), not with the parent
+//! start carried by the child's exec, and stops at a hop that started after
+//! its child: such a hop is a later process holding a reused PID (the
+//! POS-003 rule of `lineage_match`).
 //!
 //! External audit NETR-010: bounded at [`MAX_TRACKED_EDGES`] edges with
 //! second-chance eviction. When the tree is full, up to

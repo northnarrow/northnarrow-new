@@ -1688,6 +1688,87 @@ fn shadow_chain007_late_exec_keeps_r001_and_r009() {
     assert_eq!(d.responses[0].action, ResponseAction::KillProcessTree);
 }
 
+/// Lab PR 244: the CI ordering of the e2e on the production engine — a
+/// `/tmp` program's connect judged before its exec record. The late exec's
+/// decision names NN-L-CHAIN-002 (primary, the egress's time) with R001,
+/// one kill of the tree; the flow's close gets no second chain verdict; a
+/// credential read stamped between the exec and the connect, processed
+/// last, upgrades the flow to NN-L-CHAIN-007; nothing more: two chain
+/// verdicts, the two-step one first.
+#[test]
+fn a_late_exec_completes_chain002_and_the_flow_gets_two_chain_verdicts() {
+    use nn_model::telemetry::{FimOp, FlowPhase};
+    let p = prod("");
+    let flow = |phase| {
+        let mut e = net_flow(7006, [100, 64, 20, 9], 443, 6, 12 * SEC, 1024);
+        if let Event::NetFlow(nf) = &mut e {
+            nf.phase = phase;
+            nf.comm = "dropper".into();
+            nf.exe = Some("/tmp/.s/dropper".into());
+        }
+        e
+    };
+    let exec = |ts| {
+        let mut e = spawn_as(1000, "dropper", "/tmp/.s/dropper");
+        if let Event::ProcessSpawn {
+            pid,
+            timestamp_ns,
+            start_ns,
+            ..
+        } = &mut e
+        {
+            *pid = 7006;
+            *timestamp_ns = ts;
+            *start_ns = 9 * SEC;
+        }
+        e
+    };
+    let read = |ts| {
+        fim_event(
+            "/home/u/.gnupg/private-keys-v1.d/k.key",
+            FimOp::Opened,
+            7006,
+            1000,
+            ts,
+        )
+    };
+    let chains = |d: Option<super::combine::Decision>| -> Vec<&'static str> {
+        d.map(|d| {
+            ids(&d)
+                .into_iter()
+                .filter(|id| id.starts_with("NN-L-CHAIN-"))
+                .collect()
+        })
+        .unwrap_or_default()
+    };
+    assert!(chains(p.decide(&flow(FlowPhase::Connect))).is_empty());
+    let d = p.decide(&exec(10 * SEC)).expect("the late exec");
+    let got = ids(&d);
+    for want in ["NN-L-CHAIN-002_TmpExecThenEgress", "R001_ExecFromTmp"] {
+        assert!(got.contains(&want), "{want}: {got:?}");
+    }
+    assert_eq!(d.verdict.rule_id, "NN-L-CHAIN-002_TmpExecThenEgress");
+    assert_eq!(
+        (d.verdict.event_pid, d.verdict.timestamp_ns),
+        (7006, 12 * SEC),
+        "the verdict names the egress"
+    );
+    assert_eq!(
+        d.responses.len(),
+        1,
+        "one kill of one tree: {:?}",
+        d.responses
+    );
+    assert_eq!(d.responses[0].action, ResponseAction::KillProcessTree);
+    assert!(chains(p.decide(&flow(FlowPhase::Closed))).is_empty());
+    assert_eq!(
+        chains(p.decide(&read(11 * SEC))),
+        ["NN-L-CHAIN-007_TmpCredExfilSequence"]
+    );
+    assert!(chains(p.decide(&read(11 * SEC + 5))).is_empty());
+    assert!(chains(p.decide(&exec(10 * SEC + 5))).is_empty());
+}
+
 /// R020's reverse shell: the shell of a web server, stdio on a socket it
 /// connected out.
 fn reverse_shell(uid: u32, pid: u32) -> Event {

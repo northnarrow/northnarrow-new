@@ -209,14 +209,7 @@ impl RuleGate {
         }
         let mut store = self.correlation.lock();
         let key = store.current_key(ev.pid);
-        store.note_egress(
-            key,
-            EgressNote {
-                pid: ev.pid,
-                comm: ev.comm.clone(),
-                start_ns: ev.start_ns,
-            },
-        );
+        store.note_egress(key, EgressNote::of(ev));
         true
     }
 }

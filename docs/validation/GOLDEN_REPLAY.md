@@ -118,6 +118,8 @@ NN-L-CHAIN-002's alert stays held on the same flow (both listed).
 | `policy-fim004-enforced` | the same under `enforce NN-L-FIM-004` | the ceiling lifted: FIM-004's kill runs (mode enforce) |
 | `shadow-net007-net009-internal-volume` | 200 MiB over TCP to an internal host, then 101 UDP datagrams of 1 MiB | NN-L-NET-009 (High) primary over NN-L-NET-007; its UDP sum crosses 100 MiB on the 101st datagram |
 | `shadow-chain007-late-exec` | a `/tmp` program's key read and connect, its exec record processed last (lab PR 235) | NN-L-CHAIN-007 with R001 and R009 on the late exec, one kill of the tree |
+| `chain002-late-exec` | a `/tmp` program's connect, its exec record processed after it, then the flow's close (lab PR 244) | NN-L-CHAIN-002 completed on the late exec, naming the connect, with R001: one kill of the tree; no chain verdict at the close |
+| `chain002-late-exec-resolver` | a `/tmp` program's lookup at the configured resolver, its exec record processed after it (lab PR 244) | the resolver exemption kept on a late exec: R001 alone, no chain |
 | `policy-imp001-enforced` | `imp001-in-place` under the test policy `enforce NN-L-IMP-001` | the ransomware kill given back (mode enforce); no other held kill moves |
 | `policy-r020-exempt-uid` | `r020-shell-socket-stdio` under `enforce R020` and `exempt R020 uid 33`, the same shell under uid 34 | uid 33 exempt (recorded only), uid 34 killed (enforce) |
 

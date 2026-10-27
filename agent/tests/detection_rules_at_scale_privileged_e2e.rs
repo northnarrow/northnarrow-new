@@ -1152,6 +1152,10 @@ fn net_wildcard_listener_trips_net_019() {
 /// then the NetFlow [trigger] from the same PID → CHAIN-002 fires.
 /// The negative half: a /tmp exec that does NOT connect leaves
 /// CHAIN-002 silent.
+///
+/// Lab PR 244: the exec record (its own ring and pump) may reach the
+/// engine after the connect it preceded; it then completes the chain on
+/// the kernel timestamps (`CorrelationStore::exec_egresses`).
 #[test]
 #[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
 fn chain_tmp_exec_then_egress_trips_chain_002() {
