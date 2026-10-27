@@ -100,9 +100,10 @@ pub mod keys;
 pub mod loop_progress;
 pub mod net;
 pub mod os_rng;
-/// The text of the open sensor's paths (from `sensors::open_sensor`, R04b,
-/// lab PR 241).
-pub mod path_text;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the text of the
+/// open sensor's paths (from `sensors::open_sensor`, R04b, lab PR 241) is
+/// nn-model's, the crate the module map names; the posture reads it.
+pub use nn_model::path_text;
 pub mod posture;
 pub mod process_hardening;
 pub mod removed_settings;

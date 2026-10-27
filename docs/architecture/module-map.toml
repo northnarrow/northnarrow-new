@@ -250,10 +250,6 @@ planned = false
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # post-plan (lab PR 234): the OS CSPRNG
 "os_rng" = "nn-linux"
-# post-plan (lab PR 241, R04b): the text of the open sensor's paths (cut and
-# unread marks, an exact path, an unplaced path's device, mountinfo's
-# escapes), from `sensors::open_sensor`: the event's vocabulary
-"path_text" = "nn-model"
 "posture" = "nn-core"
 # post-plan (lab PR 216): no core dump, no readable memory
 "process_hardening" = "nn-linux"
@@ -277,14 +273,17 @@ planned = false
 # post-plan (lab only): `--verifier-check`
 "verifier_check" = "nn-linux"
 
-# ── agent/src: the shims of R05 and R07 ───────────────────────────────
+# ── agent/src: the shims of R05, R07 and R08a ─────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
 # their paths, without a file, in `lib.rs` and `canary/mod.rs` (plan §4.1
 # rule 2: `pub use nn_evidence::…`; the writers' aliases with the agent's
 # key as default and the key's names under `audit`; removed in R17). A
 # reference to one counts for nn-evidence. R07 (lab PR 247): content
 # modules moved to nn-core, their paths kept the same way in their
-# parent's `mod.rs`; a reference to one counts for nn-core.
+# parent's `mod.rs`; a reference to one counts for nn-core. R08a (lab PR
+# 250): the open sensor's path text moved to nn-model first (the posture
+# reads it: §4.1 rule 3), then the posture, its lineage, the correlation
+# buffer and the detection budget to nn-core, the same way.
 
 [shims.agent]
 # R07 (lab PR 247): the COMBAT carve-out
@@ -306,6 +305,9 @@ planned = false
 "config::overlay" = "nn-core"
 # R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
 "fim::paths_config" = "nn-core"
+# R08a (lab PR 250): the text of the open sensor's paths (post-plan, lab PR
+# 241, R04b: from `sensors::open_sensor`), the event's vocabulary
+"path_text" = "nn-model"
 "verify_lines" = "nn-evidence"
 
 # ── common/src: module → crate (§2.4) ────────────────────────────────────

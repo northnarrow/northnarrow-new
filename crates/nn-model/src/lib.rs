@@ -30,6 +30,11 @@ pub mod log_escape;
 /// (external audit NET-001: IPv4-mapped IPv6).
 pub mod netaddr;
 
+/// The text of the paths the open sensor renders: cut and unread marks, an
+/// exact host path, an unplaced path's device, mountinfo's escapes (was the
+/// agent's `path_text`, R08a, lab PR 250).
+pub mod path_text;
+
 /// Adaptive Defensive Posture types (Sub-tappa 6.5).
 pub mod posture_types;
 
