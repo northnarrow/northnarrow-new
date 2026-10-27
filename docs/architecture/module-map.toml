@@ -180,8 +180,34 @@ planned = false
 # the payloads have a crate below it (plan R04a/R05 "i payload"; R10)
 "chains" = "northnarrow-agent"
 # the ladder and its evidence; SystemActuator and the probes of protected
-# and reconcile go to nn-linux (R04c)
+# and reconcile go to nn-linux (R04c). R08c (lab PR 252): the ladder moved
+# to nn-core — its stages and state machine, its worker, the actuator's and
+# the guard's traits and the outcomes they report, the evidence, the
+# offenders' identity — generic over its host's capture of a process
+# (`combat::host`); `combat.rs` is the agent's binding of it to the Linux
+# host (the ladder and its hook as aliases on `LinuxHost`, the evidence on
+# the agent's key); its tests that wire the agent's key, audit log,
+# posture, actuator or a real process stay in `combat/`, test modules
 "combat" = "nn-core"
+# R08c (lab PR 252): the production actuator (`SystemActuator`: the
+# executor's kill, quarantine and per-PID egress block, the isolator,
+# `/proc`) on the ladder's trait, which moved to nn-core's
+# `combat::actuator` with the outcomes it reports
+"combat::actuator" = "nn-linux"
+# R08c (lab PR 252): the production host-critical guard
+# (`SystemProtectedProcs`: the identities read from the live `/proc`); the
+# guard's trait and the reasons it names moved to nn-core's
+# `combat::protected`
+"combat::protected" = "nn-linux"
+# R08c (lab PR 252): the stale chain's record (the outcome, its signed
+# entry, its append) moved to nn-core's `combat::reconcile`; the agent's
+# file keeps the unsigned compatibility line's Linux file I/O (the
+# anchored `O_NOFOLLOW` open, the mode, the state directory's dance)
+"combat::reconcile" = "nn-linux"
+# post-plan (lab PR 252, R08c): the Linux host of the COMBAT ladder — its
+# capture of a process, a pidfd and its start (`response::proc_ref`) — of
+# nn-core's `combat::host::CombatHost`
+"combat_host_linux" = "nn-linux"
 # comm_allowlist, overlay_auth (verify), overlay_floor. R07 (lab PR 247):
 # `overlay` (the loader) and the part of `overlay_auth` the loaders take
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
@@ -304,7 +330,6 @@ planned = false
 "removed_settings" = "northnarrow-agent"
 # the actuators and the Executor; ExecutionOutcome/Report → nn-model (R04a)
 "response" = "nn-linux"
-"response::config" = "nn-core"
 "runtime" = "nn-linux"
 "sd_notify" = "nn-linux"
 "self_integrity" = "nn-linux"
@@ -371,6 +396,10 @@ planned = false
 "config::comm_allowlist" = "nn-core"
 # R08b (lab PR 251): the FIM rules, with the engine
 "fim::rules" = "nn-core"
+# R08c (lab PR 252): the executor's configuration and its policy (the
+# detect-only gate, the variables that switch it on); `response/mod.rs`
+# names nn-core's module under its path
+"response::config" = "nn-core"
 # R08b (lab PR 251): the operator's blocklists, with the rules; their
 # loaders take the host that reads a `.v1` (R07's `ContentHost`)
 "net::blocklist" = "nn-core"
@@ -472,10 +501,19 @@ planned = false
 # the canary detector moved, taking its two references (the registry, the
 # access log, the addresses and the read-forward set are its host's), and
 # `canary/mod.rs`, which binds it to the Linux host, is nn-linux's (→ 19).
+# Lab PR 252 (R08c): 33 → 29, nn-core 19 → 15. The stale COMBAT chain's
+# record moved to nn-core, and the agent's `combat/reconcile.rs`, which
+# keeps the compatibility line's file I/O, is nn-linux's: its reference to
+# `anchored` left nn-core (→ 18); the ladder moved — its state machine,
+# its evidence, the actuator's and the guard's traits — and the agent's
+# `combat/actuator.rs` (`SystemActuator`) and `combat/protected.rs`
+# (`SystemProtectedProcs`) are nn-linux's: the ladder's and the actuator's
+# four references to `anti_tamper` and `response` left nn-core (→ 14), and
+# `combat.rs`, which binds the ladder to the Linux host, names it (→ 15).
 
 [ratchet]
 nn-admin = 8
-nn-core = 19
+nn-core = 15
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

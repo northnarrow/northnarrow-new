@@ -8,24 +8,22 @@
 //! chains' one ([`LinuxHost`], `chain_host_linux`): one type, the agent's.
 //!
 //! And what the posture consults in the agent's other modules
-//! ([`PostureAgent`]): the trusted-installer window, the ransomware and
-//! security-tool judges, the unlock capability — the calls the triggers and
-//! the machine made, each until its lot moves it below the posture (R04b).
-//! R08b (lab PR 251): the rule engine's shapes and its per-rule policy left
-//! the trait, the engine being nn-core's with the posture.
+//! ([`PostureAgent`]): the trusted-installer window, the unlock capability
+//! — the calls the triggers and the machine made, each until its lot moves
+//! it below the posture (R04b). R08b (lab PR 251): the rule engine's shapes
+//! and its per-rule policy left the trait, the engine being nn-core's with
+//! the posture; R08c (lab PR 252): so did the ransomware and security-tool
+//! judges, which the posture names itself.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use nn_core::posture::host::{PostureAgent, PostureHost};
-use nn_model::Event;
 
 use crate::anti_tamper::network_isolate::UnlockToken;
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::chain_host_linux::LinuxHost;
-use crate::impact::RansomTracker;
-use crate::impair::DefenseDetector;
 
 impl PostureHost for LinuxHost {
     const PROC_ROOT: &'static str = "/proc";
@@ -107,20 +105,6 @@ impl PostureAgent for LinuxHost {
 
     fn installer_window_open(window: &TrustedInstallerOverride) -> bool {
         window.is_window_open()
-    }
-
-    type RansomTracker = RansomTracker;
-
-    fn ransomware_decisive(tracker: &RansomTracker, event: &Event) -> bool {
-        tracker.assess(event).is_some_and(|a| a.decisive)
-    }
-
-    type DefenseDetector = DefenseDetector;
-
-    fn defense_unsanctioned(detector: &DefenseDetector, event: &Event) -> bool {
-        detector
-            .assess(event)
-            .is_some_and(|f| f.sanctioned.is_none())
     }
 
     /// Minted only by `anti_tamper` (`AdminAuth`, once a signed unlock

@@ -5,6 +5,14 @@
 //! [`ExecutorConfig::for_test`]. Any module that touches the system
 //! reads the relevant field from this struct so behaviour is
 //! configurable + dry-runnable from one place.
+//!
+//! R08c (lab PR 252): moved from the agent's `response::config` — the
+//! executor's policy: the detect-only gate and the variables and values
+//! that switch it on, the quarantine's cap, the names of the cgroups and
+//! of the nftables table the actions use. The executor and its actions
+//! (kill, quarantine, per-PID egress block, throttle) stay in the agent
+//! for nn-linux (R09); the agent's `response` module names this one under
+//! its path.
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +39,7 @@ pub struct ExecutorConfig {
 
     /// The flag file the retired `FullNetworkIsolation` blackout left
     /// (external audit CMB-006): removed at start
-    /// ([`super::network_isolation::retire_legacy`]).
+    /// (the agent's `response::network_isolation::retire_legacy`).
     pub isolation_flag_file: PathBuf,
     /// External audit CMB-010: the record of the processes moved into the
     /// blocked / throttled scopes and the cgroup each came from — on tmpfs,
@@ -39,10 +47,10 @@ pub struct ExecutorConfig {
     pub containment_file: PathBuf,
 
     /// **The agent-wide detect-only / no-enforcement gate.** When
-    /// `true`, NOTHING touches the system: the [`Executor`](super::Executor)
+    /// `true`, NOTHING touches the system: the agent's `response::Executor`
     /// dispatcher suppresses every response action (kill, block,
     /// quarantine, throttle, isolation) and returns
-    /// [`WouldExecute`](super::ExecutionOutcome::WouldExecute); `main.rs`
+    /// `ExecutionOutcome::WouldExecute`; `main.rs`
     /// gates COMBAT-posture network isolation on the same flag. The
     /// agent logs the verdict it WOULD have enforced and executes
     /// nothing — posture-independent (BUG-033). Set by `--detect-only`

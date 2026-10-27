@@ -22,6 +22,16 @@ extern crate alloc;
 mod event;
 pub use event::*;
 
+/// The class of an event, the priority bus's and the sensor contract's
+/// (R08c, lab PR 252; plan §2.3).
+mod event_class;
+pub use event_class::EventClass;
+
+/// A process's key, which no reuse of its PID gives to another (R08c, lab
+/// PR 252; plan §2.3).
+mod process_key;
+pub use process_key::ProcessKey;
+
 /// Journal-safe log values and lines (external audit, Wave 3: journal
 /// line injection, lab PR 167).
 pub mod log_escape;

@@ -12,7 +12,12 @@
 //! the multi-match combination, the signed per-rule policy, the network
 //! state the rules read, the ransomware and security-tool judges, the
 //! canary detector — and what they do on their host is a trait the host
-//! implements too ([`decision::host`], [`canary::host`]).
+//! implements too ([`decision::host`], [`canary::host`]). R08c (lab PR 252)
+//! moves the COMBAT ladder here — its policy, the traits of its actuator and
+//! host-critical guard, its signed evidence — with its host's capture of a
+//! process as a trait ([`combat::host`]), the executor's configuration
+//! ([`response::config`]), and lays down the types the priority bus and
+//! the sensor contract are built on ([`bus`], [`contract`]: R12, R13).
 //!
 //! Created empty by the Wave 4 restructure, R01 (lab PR 239); the crates it may
 //! depend on, and the rules of the pure crates, are in
@@ -21,9 +26,17 @@
 
 #![forbid(unsafe_code)]
 
+/// The event bus's types: a skeleton for the priority bus (R08c, lab PR
+/// 252; plan §3.4, R12).
+pub mod bus;
+
 /// What the content lists need from their host: an open that follows no
 /// final symlink and blocks on no FIFO.
 pub mod content_host;
+
+/// The sensor contract's types: a skeleton for the signed contract (R08c,
+/// lab PR 252; plan §3.6, R13).
+pub mod contract;
 
 // The bounded buffer of recent events the posture's triggers count over
 // (R08a, lab PR 250; was the agent's `correlation`). No outer doc comment on
@@ -104,6 +117,11 @@ use nn_model::path_text;
 /// `crate::detection_payload::…`, nn-evidence's.
 use nn_evidence::detection_payload;
 
+// R08c shim (lab PR 252; plan §4.1 rule 2, removed in R17): the path the
+// moved ladder names for the signed audit log it writes.
+/// `crate::audit::…`, nn-evidence's.
+use nn_evidence::audit;
+
 /// The network state the rules read (R08b, lab PR 251): the operator's
 /// blocklists, the DNS cache, the flow tracker, the netflow pacing, the
 /// host's configured DNS resolvers (were the agent's `net::blocklist`, the
@@ -144,12 +162,32 @@ pub mod fim {
     pub mod rules;
 }
 
+// The COMBAT ladder (R08c, lab PR 252; was the agent's `combat`): the
+// graduated active response's stages and state machine, its worker, the
+// actuator's and the host-critical guard's traits, the signed evidence, the
+// offenders' identity, the stale chain's record, and what the ladder needs
+// from its host (`combat::host`).
+pub mod combat;
+
+/// The response's policy (R08c, lab PR 252): the executor's configuration
+/// (was the agent's `response::config`).
+pub mod response {
+    // The detect-only gate, the quarantine's cap, the cgroup and nftables
+    // names the actions use.
+    pub mod config;
+}
+
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
 /// carve-out (was the agent's `anti_tamper::combat_allow`); R08b (lab PR
-/// 251): the trusted-installer window's vocabulary.
+/// 251): the trusted-installer window's vocabulary; R08c (lab PR 252): the
+/// isolation's read-back vocabulary.
 pub mod anti_tamper {
     /// The CIDRs COMBAT's isolation spares (`combat-allow.cidrs`).
     pub mod combat_allow;
+    /// An IP family and what an isolation found in its table, read back
+    /// (R08c, lab PR 252; cut from the agent's
+    /// `anti_tamper::network_isolate`).
+    pub mod network_isolate;
     /// The trusted-installer window's vocabulary: the agent's own units, a
     /// window's grant (R08b, lab PR 251).
     pub mod trusted_installer;
