@@ -32,6 +32,11 @@ pub mod posture {
     /// The corroboration ledger: the escalation signals of each actor's
     /// scope, recent enough to vouch for a blunt heuristic.
     pub mod corroboration;
+    /// The operator's escalation allowlist: process × destination tuples
+    /// the exfiltration and lateral-movement counts leave out.
+    pub mod escalation_allow;
+    /// The operator's carve-out of the mass-write arm.
+    pub mod mass_write_overlay;
     /// The live state, with its monotonic timestamps.
     pub mod state;
     /// The transitions: a trigger's level, the decay.

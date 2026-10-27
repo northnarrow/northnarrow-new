@@ -165,7 +165,7 @@ impl EscalationAllowList {
 
     /// Parse text → (list, per-line refusals, each `line N: …` naming the
     /// entry). Blank lines + `#` comments ignored. The loader and
-    /// [`crate::config::overlay_auth::validate_content`] share it.
+    /// agent's `config::overlay_auth::validate_content` share it.
     pub fn parse(text: &str) -> (Self, Vec<String>) {
         let mut entries = Vec::new();
         let mut warnings = Vec::new();

@@ -65,7 +65,7 @@ const SHARED_TREES: &[&[&str]] = &[&["var", "tmp"], &["dev", "shm"], &["run", "u
 /// One line of the overlay: `Ok(None)` for a blank or comment line,
 /// `Ok(Some(entry))` for an accepted entry (repeated `/` folded), `Err`
 /// with the reason, the entry named, for a refused one. The loader and
-/// [`crate::config::overlay_auth::validate_content`] share it.
+/// agent's `config::overlay_auth::validate_content` share it.
 pub fn parse_line(raw: &str) -> Result<Option<String>, String> {
     let stripped = match raw.split_once('#') {
         Some((before, _comment)) => before,
