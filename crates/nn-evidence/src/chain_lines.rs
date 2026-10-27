@@ -23,13 +23,10 @@ use std::io::{BufRead, ErrorKind};
 /// `MAX_FRAME_BODY` (64 KiB), a JSON escape is at most six bytes for one,
 /// an access row adds a `/proc/<pid>/exe` of at most `PATH_MAX`, and the
 /// rest is fixed-size (hashes, signature, ids). The writers refuse a row
-/// over the cap, so no row they write is skipped at the next boot.
+/// over the cap, so no row they write is skipped at the next boot. The agent
+/// holds this cap to the admin protocol's frame bound at build time
+/// (`admin_socket`, R04a, lab PR 241).
 pub const MAX_CHAIN_LINE_BYTES: usize = 1024 * 1024;
-
-const _: () = assert!(
-    MAX_CHAIN_LINE_BYTES >= 6 * (nn_proto::admin_protocol::MAX_FRAME_BODY + 4096) + 64 * 1024,
-    "a row the agent can write must fit the chain line cap"
-);
 
 /// One line of a chain file.
 #[derive(Debug, PartialEq, Eq)]

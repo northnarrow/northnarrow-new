@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use common::execq::ScanResult;
 use nn_model::{Event, ResponseAction, Verdict};
+use nn_proto::execq::ScanResult;
 use parking_lot::Mutex;
 use tracing::warn;
 
@@ -14,7 +14,8 @@ use super::controller::Recorder;
 use super::policy::{Action, Outcome};
 use super::{attack_refs, CATEGORY, RULE_ID, RULE_NAME};
 use crate::decision::attack::AttackRef;
-use crate::detection_store::{DetectionSink, ExecqEvidence};
+use crate::detection_payload::ExecqEvidence;
+use crate::detection_store::DetectionSink;
 
 /// One decision, ready for the detection chain.
 #[derive(Debug, Clone)]
@@ -113,7 +114,7 @@ pub fn evidence(
     reasons.extend(notes.iter().cloned());
     ExecqEvidence {
         verdict: scan.map_or("none", |r| r.verdict.as_str()).to_string(),
-        sha256: scan.map(|r| common::execq::hex32(&r.sha256)),
+        sha256: scan.map(|r| nn_proto::execq::hex32(&r.sha256)),
         format: scan.map(|r| r.format.clone()),
         reasons,
         decision: match (o.refused, enforce) {
@@ -172,9 +173,9 @@ impl Recorder for SinkRecorder {
         let Some(sink) = &self.sink else {
             return;
         };
-        let uid = crate::detection_store::Principal::from_event(&rec.event).uid;
+        let uid = crate::detection_payload::Principal::from_event(&rec.event).uid;
         let admit = crate::detection_budget::admit(RULE_ID, uid, || {
-            crate::detection_store::held_sample(&rec.event)
+            crate::detection_payload::held_sample(&rec.event)
         });
         if let crate::detection_budget::Admit::Record { suppressed_before } = admit {
             warn!(
@@ -205,7 +206,7 @@ impl Recorder for SinkRecorder {
 
     fn degraded(&self, detail: &str) {
         self.append(
-            crate::self_integrity::AUDIT_OP,
+            crate::audit::INTEGRITY_DRIFT_OP,
             serde_json::json!({ "kind": "subsystem_degraded", "detail": detail, "at_boot": false }),
             "detected",
         );
@@ -216,8 +217,8 @@ impl Recorder for SinkRecorder {
 mod tests {
     use super::*;
     use crate::execq::policy::{decide, Basis, Policy};
-    use common::execq::{Reason, ScanVerdict};
     use common::wire::execq::class;
+    use nn_proto::execq::{Reason, ScanVerdict};
 
     fn event() -> Event {
         Event::ExecCheck {

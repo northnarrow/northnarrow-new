@@ -769,10 +769,7 @@ enum PolicyCmd {
         /// defaults.
         #[arg(long)]
         policy: Option<PathBuf>,
-        // This doc comment is the `--events` help text, which the Wave 4
-        // restructure leaves as it was (lab PR 240): the event model it
-        // names is nn-model's `Event` since R02.
-        /// One `common::Event` JSON per line, `{"event": …}` per line, or a
+        /// One `nn_model::Event` JSON per line, `{"event": …}` per line, or a
         /// golden case (`agent/tests/golden/cases/*.json`).
         #[arg(long)]
         events: PathBuf,
@@ -1708,7 +1705,7 @@ fn main() -> ExitCode {
                         .collect()
                 };
                 let det = state_dir.join("detections");
-                let paths = northnarrow_agent::chain_anchor::ChainPaths {
+                let paths = northnarrow_agent::chains::ChainPaths {
                     audit: audit_log,
                     canary_registry: state_dir.join("canaries.jsonl"),
                     canary_access: state_dir.join("canary_access.jsonl"),

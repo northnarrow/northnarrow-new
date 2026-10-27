@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::execq::{
+use nn_proto::execq::{
     decode, encode, FromScanner, ScanRequest, ScanResult, ScannerHello, ToScanner, MAX_PACKET,
     PROTOCOL_VERSION,
 };
@@ -112,7 +112,7 @@ impl std::fmt::Debug for Supervisor {
 }
 
 impl Supervisor {
-    /// `config`: the encoded `ScanConfig` (`common::execq::encode_config`).
+    /// `config`: the encoded `ScanConfig` (`nn_proto::execq::encode_config`).
     pub fn new(exe: PathBuf, user: ScanUser, config: Vec<u8>) -> Self {
         Self {
             exe,

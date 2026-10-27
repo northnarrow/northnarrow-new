@@ -325,6 +325,11 @@ pub struct ModuleMap {
     pub aliases: BTreeMap<String, BTreeMap<String, String>>,
     /// `[ratchet]`: crate → the most violations it may have.
     pub ratchet: BTreeMap<String, i64>,
+    /// `[shims.<source>]` (R05, lab PR 241): a module path the tree keeps,
+    /// without a file of its own, for a module that moved to a crate (plan
+    /// §4.1 rule 2: a `pub use` or an inline module in the root) → that
+    /// crate.
+    pub shims: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 pub fn module_map() -> ModuleMap {
@@ -336,6 +341,7 @@ pub fn module_map() -> ModuleMap {
         modules: BTreeMap::new(),
         aliases: BTreeMap::new(),
         ratchet: BTreeMap::new(),
+        shims: BTreeMap::new(),
     };
     for (name, t) in &tables {
         if let Some(krate) = name.strip_prefix("crates.") {
@@ -371,6 +377,12 @@ pub fn module_map() -> ModuleMap {
                 .map(|(k, v)| (k.clone(), v.str().to_string()))
                 .collect();
             map.aliases.insert(src.to_string(), m);
+        } else if let Some(src) = name.strip_prefix("shims.") {
+            let m = t
+                .iter()
+                .map(|(k, v)| (k.clone(), v.str().to_string()))
+                .collect();
+            map.shims.insert(src.to_string(), m);
         } else if name == "ratchet" {
             map.ratchet = t.iter().map(|(k, v)| (k.clone(), v.int())).collect();
         } else if name != "map" {
@@ -386,12 +398,15 @@ pub fn module_map() -> ModuleMap {
             );
         }
     }
-    for (src, m) in &map.modules {
-        for (module, krate) in m {
-            assert!(
-                map.crates.contains_key(krate),
-                "{MODULE_MAP}: [modules.{src}] `{module}` → `{krate}`, which has no [crates.{krate}]"
-            );
+    for (table, maps) in [("modules", &map.modules), ("shims", &map.shims)] {
+        for (src, m) in maps {
+            for (module, krate) in m {
+                assert!(
+                    map.crates.contains_key(krate),
+                    "{MODULE_MAP}: [{table}.{src}] `{module}` → `{krate}`, which has no \
+                     [crates.{krate}]"
+                );
+            }
         }
     }
     map

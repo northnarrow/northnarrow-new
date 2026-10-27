@@ -843,6 +843,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nn-evidence"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "nn-model",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "nn-model"
 version = "0.0.1"
 dependencies = [
@@ -893,6 +910,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-evidence",
  "nn-model",
  "nn-parse",
  "nn-proto",
@@ -928,8 +946,6 @@ name = "northnarrow-common"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "hex",
- "postcard",
  "serde",
 ]
 
@@ -952,6 +968,7 @@ name = "northnarrow-scan"
 version = "0.0.1"
 dependencies = [
  "libc",
+ "nn-proto",
  "northnarrow-common",
  "sha2",
 ]

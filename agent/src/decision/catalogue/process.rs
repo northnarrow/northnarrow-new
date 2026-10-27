@@ -3,7 +3,7 @@
 use nn_model::{ResponseAction, Severity};
 
 use super::RuleDoc;
-use crate::detection_store::Sensor;
+use crate::detection_payload::Sensor;
 
 pub(super) const DOCS: &[RuleDoc] = &[
     RuleDoc {

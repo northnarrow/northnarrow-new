@@ -29,6 +29,10 @@ pub mod shutdown_marker;
 
 pub mod watchdog_hold;
 
+/// The exec quarantine's agent ↔ scanner protocol and signed hash list (lab
+/// PR 223, EXPERIMENTAL; was `common::execq`, lab PR 241).
+pub mod execq;
+
 // R03 shims (plan §4.1 rule 2; removed in R17): the paths the moved files
 // name, so they compile as they were in `common`.
 /// `crate::wire::admin_signed_payload`: the module was `common::wire`'s.

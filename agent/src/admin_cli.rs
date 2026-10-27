@@ -1190,7 +1190,7 @@ pub struct ChainVerifyLine {
 /// row numbers), then the files against the head anchor `heads` when it
 /// exists. `only`: chain names to check (empty: all).
 pub fn run_chain_verify(
-    paths: &crate::chain_anchor::ChainPaths,
+    paths: &crate::chains::ChainPaths,
     heads: &Path,
     only: &[String],
     pubkey: &VerifyingKey,
@@ -1212,7 +1212,7 @@ pub fn run_chain_verify(
             }
         })
         .collect();
-    let check = crate::chain_anchor::boot_check(&targets, heads, pubkey);
+    let check = crate::chains::boot_check(&targets, heads, pubkey);
     for f in &check.findings {
         out.push(ChainVerifyLine {
             chain: f.chain.clone(),
@@ -4586,7 +4586,7 @@ mod tests {
         let det = dir.path().join("detections");
         std::fs::create_dir_all(&det).unwrap();
         std::fs::File::create(det.join("detections.jsonl.000001")).unwrap();
-        let paths = crate::chain_anchor::ChainPaths {
+        let paths = crate::chains::ChainPaths {
             audit,
             canary_registry: dir.path().join("canaries.jsonl"),
             canary_access: dir.path().join("canary_access.jsonl"),

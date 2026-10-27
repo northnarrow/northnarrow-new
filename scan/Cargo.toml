@@ -17,8 +17,12 @@ name = "northnarrow_scan"
 path = "src/lib.rs"
 
 [dependencies]
-# Protocol, hash-list types and postcard framing (common::execq).
+# The raw layouts of the kernel's exec records (`common::wire::execq`: the
+# path classes).
 common = { workspace = true }
+# Protocol, hash-list types and postcard framing (`nn_proto::execq`; was
+# `common::execq`, lab PR 241).
+nn-proto = { workspace = true }
 sha2 = "0.11"
 # recvmsg/sendmsg with SCM_RIGHTS, prctl, setrlimit, seccomp(2): raw
 # syscalls, as the watchdog does (no libseccomp: no C in production).

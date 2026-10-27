@@ -20,8 +20,8 @@
 //! | `elf.suspicious_imports` | 2 (≤ 256 KiB) / 1 | `ptrace`, `memfd_create`, `process_vm_writev`… |
 //! | `elf.static_stripped` | 2 (staging class) / 1 | no interpreter, no dynamic section, no symbol table |
 
-use common::execq::Reason;
 use common::wire::execq::class;
+use nn_proto::execq::Reason;
 
 use crate::elf::{
     Elf, ElfError, ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD,

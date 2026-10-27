@@ -68,7 +68,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -81,7 +80,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, warn};
 
-use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
+use crate::audit::GENESIS_PREV_HASH;
+use crate::chain_host::{ChainHost, ChainSigner};
 
 /// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
 /// line (the legacy flat line, NO `fmt_ver`) and a v2 line are read and
@@ -398,7 +398,7 @@ fn chain_digest<T: Frame>(line: &T, kind: &str) -> Result<[u8; 32]> {
 
 /// Hash and sign `line` (its seal empty) for the log `kind`, in the format
 /// its version field names.
-fn seal_line<T: Frame>(mut line: T, key: &AgentSigningKey, kind: &str) -> Result<T> {
+fn seal_line<T: Frame, K: ChainSigner>(mut line: T, key: &K, kind: &str) -> Result<T> {
     let digest = chain_digest(&line, kind)?;
     let (hash, sig) = line.seal_mut();
     *hash = hex::encode(digest);
@@ -626,16 +626,16 @@ fn check_reserved_keys<P: Serialize>(payload: &P) -> Result<()> {
 
 impl<P: Serialize + ChainPayload> ChainLine<P> {
     /// Build a fully-signed v3 data line chained off `prev_hash`.
-    fn sealed(payload: P, key: &AgentSigningKey, prev_hash: &str) -> Result<Self> {
+    fn sealed<K: ChainSigner>(payload: P, key: &K, prev_hash: &str) -> Result<Self> {
         Self::sealed_as(payload, Some(CHAINLOG_FMT_V3), key, prev_hash)
     }
 
     /// A data line in the format `fmt_ver` names (the writer: v3; the
     /// tests' legacy fixtures: `None` or v2).
-    fn sealed_as(
+    fn sealed_as<K: ChainSigner>(
         payload: P,
         fmt_ver: Option<u32>,
-        key: &AgentSigningKey,
+        key: &K,
         prev_hash: &str,
     ) -> Result<Self> {
         let line = ChainLine {
@@ -651,9 +651,9 @@ impl<P: Serialize + ChainPayload> ChainLine<P> {
 
 impl TerminatorLine {
     /// The seal of the log `kind`, in the format `rotate.fmt_ver` names.
-    fn sealed(
+    fn sealed<K: ChainSigner>(
         rotate: RotateTerminator,
-        key: &AgentSigningKey,
+        key: &K,
         prev_hash: &str,
         kind: &str,
     ) -> Result<Self> {
@@ -671,9 +671,9 @@ impl TerminatorLine {
 impl ManifestLine {
     /// A manifest row of the log `kind`, in the format `manifest.fmt_ver`
     /// names.
-    fn sealed(
+    fn sealed<K: ChainSigner>(
         manifest: ManifestEntry,
-        key: &AgentSigningKey,
+        key: &K,
         prev_hash: &str,
         kind: &str,
     ) -> Result<Self> {
@@ -696,8 +696,8 @@ fn to_jsonl<T: Serialize>(line: &T) -> Result<String> {
 }
 
 /// Append a pre-serialised line to `path` (create if missing) + fsync.
-fn append_and_fsync(path: &Path, line: &str, mode: u32) -> Result<()> {
-    let f = append_line(path, line, mode)?;
+fn append_and_fsync<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<()> {
+    let f = append_line::<H>(path, line, mode)?;
     f.sync_all()
         .with_context(|| format!("fsync {}", path.display()))?;
     Ok(())
@@ -705,12 +705,8 @@ fn append_and_fsync(path: &Path, line: &str, mode: u32) -> Result<()> {
 
 /// Append a pre-serialised line to `path` (create if missing), without
 /// waiting for the disk. Returns the open file.
-fn append_line(path: &Path, line: &str, mode: u32) -> Result<std::fs::File> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(mode)
-        .open(path)
+fn append_line<H: ChainHost>(path: &Path, line: &str, mode: u32) -> Result<std::fs::File> {
+    let mut f = H::open_with_mode(OpenOptions::new().create(true).append(true), mode, path)
         .with_context(|| format!("opening chainlog {} for append", path.display()))?;
     f.write_all(line.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
@@ -872,10 +868,10 @@ struct PendingSeal {
 }
 
 /// Append-only, rotation-aware, signed chain writer for one log.
-pub struct RotatingChainLog<P> {
+pub struct RotatingChainLog<P, K> {
     active_path: PathBuf,
     manifest_path: PathBuf,
-    key: AgentSigningKey,
+    key: K,
     cfg: RotationConfig,
     protection: std::sync::Arc<dyn ProtectionManager>,
     /// Tail `entry_hash` the next data line chains off (the previous
@@ -916,20 +912,20 @@ pub const CHECKPOINT_EVERY_RECORDS: u64 = 1000;
 /// ...or after this long with records appended since the last one.
 pub const CHECKPOINT_EVERY_SECS: u64 = 600;
 
-impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
+impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingChainLog<P, K> {
     /// Open (or initialise) the log at `active_path`. Scans existing
     /// archives to recover `next_seq`, walks the (bounded) active file
     /// for its tail/size/count, and completes a half-finished rotation
     /// if a crash left the active file sealed-but-unrenamed.
     pub fn open(
         active_path: &Path,
-        key: AgentSigningKey,
+        key: K,
         cfg: RotationConfig,
         protection: std::sync::Arc<dyn ProtectionManager>,
     ) -> Result<Self> {
         // Review entry 44: every later open/rename goes through a directory
         // fd taken now, so a mount over the directory cannot divert the log.
-        let anchored = crate::anchored::anchor(active_path);
+        let anchored = K::Host::anchor(active_path);
         let active_path = anchored.as_path();
         let manifest_path = manifest_path_for(active_path);
         let next_seq = scan_max_archive_seq(active_path)?.map_or(1, |m| m + 1);
@@ -1043,7 +1039,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
         // manifest already says exactly that. Non-fatal.
         if log.pending_seal.is_none() && log.active_bytes > 0 {
             let current = (log.next_seq, log.active_bytes, log.last_hash.clone());
-            let anchored = manifest_tail_events(&log.active_path, P::KIND, &pubkey)
+            let anchored = manifest_tail_events::<K::Host>(&log.active_path, P::KIND, &pubkey)
                 .into_iter()
                 .find_map(|e| match e {
                     ManifestEvent::ActiveCheckpoint {
@@ -1109,12 +1105,11 @@ impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
         let manifest = self.manifest_path.clone();
         let mode = self.cfg.file_mode;
         self.protection
-            .with_mutable_dir(&mut || match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(mode)
-                .open(&manifest)
-            {
+            .with_mutable_dir(&mut || match K::Host::open_with_mode(
+                OpenOptions::new().create_new(true).write(true),
+                mode,
+                &manifest,
+            ) {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                 Err(e) => Err(anyhow!(e).context(format!("creating {}", manifest.display()))),
@@ -1201,12 +1196,12 @@ impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
     /// Write `bytes` to the active file, with or without an fsync.
     fn write_active(&mut self, bytes: &str, durable: bool) -> Result<()> {
         if durable {
-            append_and_fsync(&self.active_path, bytes, self.cfg.file_mode)?;
+            append_and_fsync::<K::Host>(&self.active_path, bytes, self.cfg.file_mode)?;
             // The fsync covers the earlier deferred lines of this file.
             self.unsynced = false;
             self.fsyncs += 1;
         } else {
-            append_line(&self.active_path, bytes, self.cfg.file_mode)?;
+            append_line::<K::Host>(&self.active_path, bytes, self.cfg.file_mode)?;
             self.unsynced = true;
         }
         Ok(())
@@ -1281,7 +1276,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
         // SEAL: append the terminator to the active file. Done OUTSIDE the
         // `+i` dance — appending to an *existing* file is allowed under an
         // immutable dir; only NEW/renamed dir entries need the lift.
-        append_and_fsync(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)?;
+        append_and_fsync::<K::Host>(&self.active_path, &to_jsonl(&term)?, self.cfg.file_mode)?;
         // The terminator's fsync covers the deferred lines before it.
         self.unsynced = false;
         self.fsyncs += 1;
@@ -1340,7 +1335,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
             let mut attempts = 0;
             loop {
                 let archive = archive_path(&active, seq);
-                match rename_noreplace(&active, &archive) {
+                match K::Host::rename_noreplace(&active, &archive) {
                     Ok(()) => break,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         let (kind, bytes) = slot_kind(&archive).unwrap_or(("other", 0));
@@ -1376,7 +1371,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
             self.checkpoint_at = std::time::Instant::now();
             // 3. Fresh empty active (O_EXCL: never truncate or follow a name
             //    that appeared after the rename) + register its inode.
-            create_fresh_active(&active, file_mode)?;
+            create_fresh_active::<K::Host>(&active, file_mode)?;
             protection_inner.register_active(&active)?;
             // 4. Manifest + eviction — NON-FATAL (archive already committed).
             let evicted = evict_excess_archives(&active, max_archives, protection_inner.as_ref())
@@ -1539,7 +1534,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload> RotatingChainLog<P> {
             event,
         };
         let line = ManifestLine::sealed(entry, &self.key, &self.manifest_last_hash, P::KIND)?;
-        append_and_fsync(&self.manifest_path, &to_jsonl(&line)?, self.cfg.file_mode)?;
+        append_and_fsync::<K::Host>(&self.manifest_path, &to_jsonl(&line)?, self.cfg.file_mode)?;
         self.manifest_last_hash = line.entry_hash;
         Ok(())
     }
@@ -1656,7 +1651,7 @@ fn scan_max_archive_seq(active: &Path) -> Result<Option<u64>> {
 /// last rotated file holds the newest archived rows). An unreadable
 /// directory yields none. External audit NN-AUD-080: the one lister for
 /// the readers (the detection store and the admin read verbs).
-pub(crate) fn archives_newest_first(active: &Path) -> Vec<PathBuf> {
+pub fn archives_newest_first(active: &Path) -> Vec<PathBuf> {
     let mut seqs = list_archive_seqs(active).unwrap_or_default();
     seqs.reverse();
     seqs.into_iter()
@@ -1667,7 +1662,7 @@ pub(crate) fn archives_newest_first(active: &Path) -> Vec<PathBuf> {
 /// Whether a raw line is a [`TerminatorLine`]: its first key is `rotate`
 /// (field order of the struct), which no data line may carry
 /// ([`RESERVED_LINE_KEYS`]).
-pub(crate) fn is_terminator_line(line: &str) -> bool {
+pub fn is_terminator_line(line: &str) -> bool {
     line.starts_with("{\"rotate\":")
 }
 
@@ -1698,55 +1693,17 @@ fn next_free_candidate(active: &Path, taken: u64) -> u64 {
     max.max(taken) + 1
 }
 
-/// `rename(from, to)` that fails with `AlreadyExists` instead of replacing
-/// `to` (`renameat2(RENAME_NOREPLACE)`). External audit NN-AUD-115. On a
-/// filesystem without the flag, fall back to an `lstat` check then a
-/// plain rename (the window is inside the rotation's `+i` dance).
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let cstr = |p: &Path| {
-        std::ffi::CString::new(p.as_os_str().as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-    };
-    let (f, t) = (cstr(from)?, cstr(to)?);
-    // SAFETY: two NUL-terminated paths that outlive the call; renameat2
-    // only reads them.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            f.as_ptr(),
-            libc::AT_FDCWD,
-            t.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EINVAL) | Some(libc::ENOSYS) => {
-            if fs::symlink_metadata(to).is_ok() {
-                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
-            }
-            fs::rename(from, to)
-        }
-        _ => Err(err),
-    }
-}
-
 /// Create the fresh, empty active file after a rotation. External audit
 /// NN-AUD-115: `O_CREAT|O_EXCL` (which also refuses a dangling symlink), so
 /// a name that appeared after the rename is an error, never truncated or
 /// followed.
-fn create_fresh_active(active: &Path, mode: u32) -> Result<()> {
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(mode)
-        .open(active)
-        .with_context(|| format!("creating fresh active {}", active.display()))?;
+fn create_fresh_active<H: ChainHost>(active: &Path, mode: u32) -> Result<()> {
+    H::open_with_mode(
+        OpenOptions::new().create_new(true).write(true),
+        mode,
+        active,
+    )
+    .with_context(|| format!("creating fresh active {}", active.display()))?;
     Ok(())
 }
 
@@ -2088,13 +2045,13 @@ const MANIFEST_TAIL_WINDOW: u64 = 256 * 1024;
 /// [`MANIFEST_TAIL_WINDOW`] bytes of the manifest of `active`, the log
 /// `kind` ([`ChainPayload::KIND`]), newest first. Lines that do not verify
 /// are left out.
-pub fn manifest_tail_events(active: &Path, kind: &str, pk: &VerifyingKey) -> Vec<ManifestEvent> {
+pub fn manifest_tail_events<H: ChainHost>(
+    active: &Path,
+    kind: &str,
+    pk: &VerifyingKey,
+) -> Vec<ManifestEvent> {
     let path = manifest_path_for(active);
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&path)
-    {
+    let mut f = match H::open_read_nofollow(&path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
@@ -2636,7 +2593,7 @@ pub struct RecentReport {
 /// the active file must verify (hash and signature) and link to the line
 /// before it. The full check of the set is [`verify_log_set`]
 /// (`nn-admin chain verify`).
-pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload>(
+pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHost>(
     active: &Path,
     pubkey: &VerifyingKey,
     max_bytes: u64,
@@ -2648,11 +2605,7 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload>(
         reason,
     };
     let generation = current_generation(active);
-    let mut f = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(active)
-    {
+    let mut f = match H::open_read_nofollow(active) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RecentReport {
@@ -3007,6 +2960,7 @@ fn verify_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain_host::testing::{PortableHost, TestKey};
     use tempfile::TempDir;
 
     #[test]
@@ -3032,10 +2986,10 @@ mod tests {
         const KIND: &'static str = "test_payload";
     }
 
-    fn key() -> AgentSigningKey {
+    fn key() -> TestKey {
         // Deterministic-enough for tests: bootstrap a fresh key in a tmp.
         let dir = TempDir::new().unwrap();
-        AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap()
+        TestKey::load_or_bootstrap(&dir.path().join("k")).unwrap()
     }
 
     fn cfg(cap: u64, archives: usize) -> RotationConfig {
@@ -3063,7 +3017,7 @@ mod tests {
         let active = dir.path().join("log.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(4096, 64),
@@ -3106,7 +3060,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(2000, 50),
@@ -3152,7 +3106,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(2000, 50),
@@ -3198,7 +3152,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(300, 2),
@@ -3229,7 +3183,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(2000, 50),
@@ -3267,7 +3221,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(2000, 50),
@@ -3299,13 +3253,11 @@ mod tests {
         let kpath = dir.path().join("agent.sig.key");
         // Bootstrap + persist the key once; pk is its pubkey. Every
         // session reloads the SAME key from kpath.
-        let pk = AgentSigningKey::load_or_bootstrap(&kpath)
-            .unwrap()
-            .verifying_key();
+        let pk = TestKey::load_or_bootstrap(&kpath).unwrap().verifying_key();
 
         for round in [0u64, 25] {
-            let k = AgentSigningKey::load_or_bootstrap(&kpath).unwrap();
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let k = TestKey::load_or_bootstrap(&kpath).unwrap();
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 k,
                 cfg(2000, 50),
@@ -3332,7 +3284,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(2000, 2),
@@ -3358,7 +3310,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("test.jsonl");
         assert!(sealed_files(&active).is_empty());
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             key(),
             cfg(2000, 2),
@@ -3409,7 +3361,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let rec = std::sync::Arc::new(Recorder::default());
         let mut log =
-            RotatingChainLog::<TestPayload>::open(&active, key(), cfg(2000, 2), rec.clone())
+            RotatingChainLog::<TestPayload, _>::open(&active, key(), cfg(2000, 2), rec.clone())
                 .unwrap();
         for i in 0..60 {
             log.append(payload(i)).unwrap();
@@ -3441,7 +3393,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(2000, 2),
@@ -3483,7 +3435,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("evil.jsonl");
         let k = key();
-        let mut log = RotatingChainLog::<Evil>::open(
+        let mut log = RotatingChainLog::<Evil, _>::open(
             &active,
             k,
             cfg(2000, 50),
@@ -3508,19 +3460,19 @@ mod tests {
 
     /// Same key across "restarts" so a continued chain verifies under one
     /// pubkey (a fixed path → `load_or_bootstrap` reloads the same key).
-    fn key_at(path: &Path) -> AgentSigningKey {
-        AgentSigningKey::load_or_bootstrap(path).unwrap()
+    fn key_at(path: &Path) -> TestKey {
+        TestKey::load_or_bootstrap(path).unwrap()
     }
 
     /// Append a REAL legacy-v1 data line (no `fmt_ver` on the wire), signed
     /// exactly as the pre-BUG-026 writer did; returns its `entry_hash` so
     /// the caller can chain the next line. Same byte-compat invariant as
     /// `drain::bug026_legacy_v1_drift_line_still_verifies`.
-    fn append_v1(path: &Path, p: TestPayload, k: &AgentSigningKey, prev_hash: &str) -> String {
+    fn append_v1(path: &Path, p: TestPayload, k: &TestKey, prev_hash: &str) -> String {
         // v1: `fmt_ver` omitted on the wire (skip_serializing_if), untagged
         // pre-image.
         let line = ChainLine::sealed_as(p, None, k, prev_hash).unwrap();
-        append_and_fsync(path, &to_jsonl(&line).unwrap(), 0o600).unwrap();
+        append_and_fsync::<PortableHost>(path, &to_jsonl(&line).unwrap(), 0o600).unwrap();
         line.entry_hash
     }
 
@@ -3533,7 +3485,7 @@ mod tests {
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3545,7 +3497,7 @@ mod tests {
             }
         } // drop ⇒ simulate a restart
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3574,7 +3526,7 @@ mod tests {
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3595,7 +3547,7 @@ mod tests {
         }
         assert!(fs::metadata(&active).unwrap().len() > clean_len);
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3621,7 +3573,7 @@ mod tests {
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3638,7 +3590,7 @@ mod tests {
             f.sync_all().unwrap();
         }
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3683,7 +3635,7 @@ mod tests {
         );
         // Reopen with a cap SMALLER than the existing file ⇒ over-cap at open.
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(64, 50),
@@ -3715,7 +3667,7 @@ mod tests {
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3735,7 +3687,7 @@ mod tests {
         }
         // Reopen → repair + attest.
         {
-            let _ = RotatingChainLog::<TestPayload>::open(
+            let _ = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3773,7 +3725,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             key_at(&kp),
             cfg(2000, 50),
@@ -3826,7 +3778,7 @@ mod tests {
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
         let tail = {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3854,14 +3806,14 @@ mod tests {
             TestPayload::KIND,
         )
         .unwrap();
-        append_and_fsync(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
+        append_and_fsync::<PortableHost>(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
         assert!(
             list_archive_seqs(&active).unwrap().is_empty(),
             "pre-recovery: sealed active, no archive yet"
         );
         // Reopen → open() sees the sealed active → complete_interrupted_rotation.
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3895,7 +3847,7 @@ mod tests {
         let kp = dir.path().join("key");
         let pk = key_at(&kp).verifying_key();
         let tail = {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3921,10 +3873,10 @@ mod tests {
             TestPayload::KIND,
         )
         .unwrap();
-        append_and_fsync(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
+        append_and_fsync::<PortableHost>(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
         // open #1 completes the interrupted rotation → archive seq-1 + EMPTY active.
         drop(
-            RotatingChainLog::<TestPayload>::open(
+            RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -3938,7 +3890,7 @@ mod tests {
         std::fs::remove_file(&active).unwrap();
         // open #2 must recover: active absent → chain off seq-1's terminator.
         {
-            let mut log = RotatingChainLog::<TestPayload>::open(
+            let mut log = RotatingChainLog::<TestPayload, _>::open(
                 &active,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -4021,7 +3973,7 @@ mod tests {
 
     // ── External audit NN-AUD-110 / NN-AUD-115 ──
 
-    fn open_log(active: &Path, kp: &Path, cap: u64) -> RotatingChainLog<TestPayload> {
+    fn open_log(active: &Path, kp: &Path, cap: u64) -> RotatingChainLog<TestPayload, TestKey> {
         open_log_with(active, kp, cap, std::sync::Arc::new(NoProtection))
     }
 
@@ -4030,8 +3982,8 @@ mod tests {
         kp: &Path,
         cap: u64,
         prot: std::sync::Arc<dyn ProtectionManager>,
-    ) -> RotatingChainLog<TestPayload> {
-        RotatingChainLog::<TestPayload>::open(active, key_at(kp), cfg(cap, 50), prot).unwrap()
+    ) -> RotatingChainLog<TestPayload, TestKey> {
+        RotatingChainLog::<TestPayload, _>::open(active, key_at(kp), cfg(cap, 50), prot).unwrap()
     }
 
     fn append_raw(path: &Path, bytes: &[u8]) {
@@ -4353,11 +4305,13 @@ mod tests {
     }
 
     /// External audit NN-AUD-115: the slot check is an lstat, and the rename
-    /// never replaces: a symlink at the slot is neither followed nor
-    /// overwritten, even when it appears after the seal (interrupted
-    /// rotation completed at open).
+    /// never replaces: a foreign entry at the slot is not overwritten, even
+    /// when it appears after the seal (interrupted rotation completed at
+    /// open). R04a (lab PR 241): a regular file here, on the portable host;
+    /// the symlink case, on the agent's host, is
+    /// `chain_host_linux::tests::a_symlink_at_the_slot_of_an_interrupted_rotation_is_left_alone`.
     #[test]
-    fn a_symlink_at_the_slot_of_an_interrupted_rotation_is_left_alone() {
+    fn a_foreign_file_at_the_slot_of_an_interrupted_rotation_is_left_alone() {
         let dir = TempDir::new().unwrap();
         let active = dir.path().join("test.jsonl");
         let kp = dir.path().join("key");
@@ -4382,46 +4336,32 @@ mod tests {
         )
         .unwrap();
         append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
-        let victim = dir.path().join("victim");
-        fs::write(&victim, b"victim").unwrap();
         let slot = archive_path(&active, 1);
-        std::os::unix::fs::symlink(&victim, &slot).unwrap();
+        fs::write(&slot, b"foreign").unwrap();
         let mut log = open_log(&active, &kp, 1 << 30);
         log.append(payload(3)).unwrap();
         drop(log);
-        assert!(fs::symlink_metadata(&slot)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        assert_eq!(fs::read(&slot).unwrap(), b"foreign");
         let archived = archive_path(&active, 2);
         assert_eq!(data_lines(&archived), 3, "sealed file archived intact");
         assert_eq!(data_lines(&active), 1);
         assert!(manifest_events(&active).iter().any(|e| matches!(e,
-            ManifestEvent::ForeignArchive { seq: 1, entry_type, .. } if entry_type == "symlink")));
+            ManifestEvent::ForeignArchive { seq: 1, entry_type, .. } if entry_type == "file")));
     }
 
     /// External audit NN-AUD-115: the fresh active is created with O_EXCL —
-    /// an existing file is not truncated and a symlink is not followed.
+    /// an existing file is not truncated. R04a (lab PR 241): that a symlink
+    /// is not followed is the host's open, tested on the agent's
+    /// (`chain_host_linux::tests::an_exclusive_create_follows_no_symlink`).
     #[test]
     fn fresh_active_is_created_exclusively() {
         let dir = TempDir::new().unwrap();
         let existing = dir.path().join("existing");
         fs::write(&existing, b"keep").unwrap();
-        assert!(create_fresh_active(&existing, 0o600).is_err());
+        assert!(create_fresh_active::<PortableHost>(&existing, 0o600).is_err());
         assert_eq!(fs::read(&existing).unwrap(), b"keep");
-        let victim = dir.path().join("victim");
-        fs::write(&victim, b"victim").unwrap();
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&victim, &link).unwrap();
-        assert!(create_fresh_active(&link, 0o600).is_err());
-        assert_eq!(fs::read(&victim).unwrap(), b"victim");
-        let dangling = dir.path().join("dangling");
-        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
-        assert!(create_fresh_active(&dangling, 0o600).is_err());
-        assert!(!dir.path().join("nowhere").exists());
         let fresh = dir.path().join("fresh");
-        create_fresh_active(&fresh, 0o600).unwrap();
+        create_fresh_active::<PortableHost>(&fresh, 0o600).unwrap();
         assert_eq!(fs::metadata(&fresh).unwrap().len(), 0);
     }
 
@@ -4566,7 +4506,7 @@ mod tests {
         fs::remove_file(&active).unwrap();
         let err = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
         assert!(matches!(err, LogSetError::ActiveMissing { .. }), "{err:?}");
-        let tail = manifest_tail_events(&active, TestPayload::KIND, &pk);
+        let tail = manifest_tail_events::<PortableHost>(&active, TestPayload::KIND, &pk);
         assert!(active_missing(&active, &tail).is_some());
     }
 
@@ -4611,9 +4551,9 @@ mod tests {
             log.append(payload(i)).unwrap();
         }
         drop(log);
-        let whole = verify_recent::<TestPayload>(&active, &pk, 1 << 20).unwrap();
+        let whole = verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20).unwrap();
         assert_eq!((whole.lines, whole.whole_file), (20, true));
-        let part = verify_recent::<TestPayload>(&active, &pk, 600).unwrap();
+        let part = verify_recent::<TestPayload, PortableHost>(&active, &pk, 600).unwrap();
         assert!(!part.whole_file && part.lines < 20 && part.lines > 0);
         // a fabricated detection-shaped line at the end
         let forged = format!(
@@ -4623,7 +4563,7 @@ mod tests {
             "11".repeat(32)
         );
         append_raw(&active, forged.as_bytes());
-        assert!(verify_recent::<TestPayload>(&active, &pk, 1 << 20).is_err());
+        assert!(verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20).is_err());
         assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
     }
 
@@ -4640,7 +4580,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(1 << 30, 50),
@@ -4670,7 +4610,7 @@ mod tests {
         let active = dir.path().join("test.jsonl");
         let k = key();
         let pk = k.verifying_key();
-        let mut log = RotatingChainLog::<TestPayload>::open(
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
             &active,
             k,
             cfg(2000, 50),
@@ -4897,7 +4837,7 @@ mod tests {
         let pk = key_at(&kp).verifying_key();
         {
             let mut log =
-                RotatingChainLog::<TestPayload>::open(&active, key_at(&kp), cfg(900, 3), {
+                RotatingChainLog::<TestPayload, _>::open(&active, key_at(&kp), cfg(900, 3), {
                     std::sync::Arc::new(NoProtection)
                 })
                 .unwrap();
@@ -5006,7 +4946,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    verify_recent::<TestPayload>(&active, &pk, 1 << 20),
+                    verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20),
                     Err(LogSetError::NonCanonicalLine { idx: 1, .. })
                 ),
                 "{what}: boot check"
@@ -5093,7 +5033,7 @@ mod tests {
         let b = dir.path().join("b.jsonl");
         {
             let mut la = open_log(&a, &kp, 1 << 30);
-            let mut lb = RotatingChainLog::<TwinPayload>::open(
+            let mut lb = RotatingChainLog::<TwinPayload, _>::open(
                 &b,
                 key_at(&kp),
                 cfg(1 << 30, 50),
@@ -5140,8 +5080,8 @@ mod tests {
                 if file.ends_with(".manifest.jsonl")),
             "{err:?}"
         );
-        assert!(manifest_tail_events(&b, TwinPayload::KIND, &pk).is_empty());
-        assert!(!manifest_tail_events(&b, TestPayload::KIND, &pk).is_empty());
+        assert!(manifest_tail_events::<PortableHost>(&b, TwinPayload::KIND, &pk).is_empty());
+        assert!(!manifest_tail_events::<PortableHost>(&b, TestPayload::KIND, &pk).is_empty());
     }
 
     /// EVD-008: the three line types are signed under three domains, per
@@ -5170,12 +5110,6 @@ mod tests {
         ] {
             assert!(chain_domain(bad, LineRole::Data).is_err(), "{bad:?}");
         }
-        // The kinds of the shipped payload types, pinned: they are part of
-        // every v3 line on disk.
-        assert_eq!(crate::detection_store::DetectionRecord::KIND, "detections");
-        assert_eq!(crate::detection_store::StatusEvent::KIND, "status_events");
-        assert_eq!(crate::net::drain::NetFlowPayload::KIND, "netflow");
-        assert_eq!(crate::fim::drain::FimDriftPayload::KIND, "fim_drift");
     }
 
     /// EVD-008: once a set holds a v3 line, a later v2 line — even one the
@@ -5207,7 +5141,7 @@ mod tests {
             "{err:?}"
         );
         assert!(matches!(
-            verify_recent::<TestPayload>(&active, &pk, 1 << 20),
+            verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20),
             Err(LogSetError::LegacyAfterV3 { idx: 3, .. })
         ));
     }
@@ -5253,10 +5187,10 @@ mod tests {
     }
 
     /// Fixed key for the frozen vectors.
-    fn frozen_key(dir: &Path) -> AgentSigningKey {
+    fn frozen_key(dir: &Path) -> TestKey {
         let p = dir.join("frozen.key");
         fs::write(&p, format!("{}\n", "42".repeat(32))).unwrap();
-        crate::audit::read_signing_key(&p).unwrap()
+        TestKey::load_or_bootstrap(&p).unwrap()
     }
 
     const FROZEN_ROW: &str =
@@ -5349,7 +5283,7 @@ mod tests {
             let l = ChainLine::sealed_as(payload(i), Some(CHAINLOG_FMT_V2), &k, &prev).unwrap();
             let s = to_jsonl(&l).unwrap();
             bytes += s.len() as u64;
-            append_and_fsync(&archive1, &s, 0o600).unwrap();
+            append_and_fsync::<PortableHost>(&archive1, &s, 0o600).unwrap();
             prev = l.entry_hash;
         }
         let rotate = RotateTerminator {
@@ -5360,7 +5294,7 @@ mod tests {
             bytes,
         };
         let term = TerminatorLine::sealed(rotate, &k, &prev, kind).unwrap();
-        append_and_fsync(&archive1, &to_jsonl(&term).unwrap(), 0o600).unwrap();
+        append_and_fsync::<PortableHost>(&archive1, &to_jsonl(&term).unwrap(), 0o600).unwrap();
         let rotated = ManifestEntry {
             fmt_ver: CHAINLOG_FMT_V2,
             ts: now_ts(),
@@ -5372,11 +5306,16 @@ mod tests {
             },
         };
         let m = ManifestLine::sealed(rotated, &k, GENESIS_PREV_HASH, kind).unwrap();
-        append_and_fsync(&manifest_path_for(&active), &to_jsonl(&m).unwrap(), 0o600).unwrap();
+        append_and_fsync::<PortableHost>(
+            &manifest_path_for(&active),
+            &to_jsonl(&m).unwrap(),
+            0o600,
+        )
+        .unwrap();
         let mut prev = term.entry_hash.clone();
         for i in 3..5 {
             let l = ChainLine::sealed_as(payload(i), Some(CHAINLOG_FMT_V2), &k, &prev).unwrap();
-            append_and_fsync(&active, &to_jsonl(&l).unwrap(), 0o600).unwrap();
+            append_and_fsync::<PortableHost>(&active, &to_jsonl(&l).unwrap(), 0o600).unwrap();
             prev = l.entry_hash;
         }
         let r = verify_log_set::<TestPayload>(&active, &pk).unwrap();
@@ -5425,205 +5364,5 @@ mod tests {
             (r.total_records, r.legacy_lines, r.non_canonical_legacy),
             (30, 7, 0)
         );
-    }
-
-    /// EVD-007, round trip over the shipped payload types: every line the
-    /// writer produces for detections, status events, netflow and FIM drift
-    /// rows with random strings (escapes, control characters, non-ASCII,
-    /// astral), integers and floats verifies under v3 — which includes the
-    /// byte-canonical check — and is its own re-serialisation. A payload
-    /// type whose `Serialize`/`Deserialize` were asymmetric would fail its
-    /// own new rows here, before a release.
-    #[test]
-    fn every_shipped_payload_type_round_trips_byte_exactly() {
-        use rand::{RngExt, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x204);
-        fn text(rng: &mut rand::rngs::StdRng) -> String {
-            const POOL: &[char] = &[
-                'a',
-                'Z',
-                '0',
-                ' ',
-                '"',
-                '\\',
-                '/',
-                '\n',
-                '\t',
-                '\r',
-                '\u{0}',
-                '\u{1f}',
-                '\u{7f}',
-                '\u{e9}',
-                '\u{20ac}',
-                '\u{2028}',
-                '\u{fffd}',
-                '\u{1d11e}',
-                '{',
-                '}',
-                ':',
-                ',',
-            ];
-            let n = rng.random_range(0..24);
-            (0..n)
-                .map(|_| POOL[rng.random_range(0..POOL.len())])
-                .collect()
-        }
-        fn opt(rng: &mut rand::rngs::StdRng) -> Option<String> {
-            rng.random_bool(0.5).then(|| text(rng))
-        }
-        fn check<P: Serialize + DeserializeOwned + ChainPayload>(rows: Vec<P>) {
-            let dir = TempDir::new().unwrap();
-            let active = dir.path().join("log.jsonl");
-            let kp = dir.path().join("key");
-            let pk = key_at(&kp).verifying_key();
-            let mut log = RotatingChainLog::<P>::open(
-                &active,
-                key_at(&kp),
-                cfg(16 * 1024, 64),
-                std::sync::Arc::new(NoProtection),
-            )
-            .unwrap();
-            let n = rows.len() as u64;
-            for p in rows {
-                log.append(p).unwrap();
-            }
-            drop(log);
-            let r = verify_log_set::<P>(&active, &pk).unwrap();
-            assert_eq!((r.total_records, r.legacy_lines), (n, 0), "{}", P::KIND);
-            for file in set_files(&active) {
-                for raw in raw_lines(&file) {
-                    if is_terminator_line(&raw) || raw.starts_with("{\"manifest\":") {
-                        continue;
-                    }
-                    let d: ChainLine<P> = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(serde_json::to_string(&d).unwrap(), raw, "{}", P::KIND);
-                    assert!(line_is_genuine::<P>(raw.as_bytes(), &pk));
-                }
-            }
-        }
-        use crate::detection_store::{DetectionRecord, DetectionStatus, Principal, StatusEvent};
-        let detections: Vec<DetectionRecord> = (0..120)
-            .map(|i| {
-                let event = nn_model::Event::ProcessSpawn {
-                    pid: rng.random(),
-                    ppid: rng.random(),
-                    uid: rng.random(),
-                    gid: rng.random(),
-                    comm: text(&mut rng),
-                    filename: text(&mut rng),
-                    timestamp_ns: rng.random(),
-                    argv: Vec::new(),
-                    parent_comm: text(&mut rng),
-                    parent_start_ns: 0,
-                    start_ns: 0,
-                    parent_is_kthread: false,
-                    exe: Default::default(),
-                    argv_truncated: false,
-                    filename_truncated: false,
-                    stdio: Default::default(),
-                };
-                let verdict = nn_model::Verdict {
-                    rule_id: text(&mut rng),
-                    rule_name: text(&mut rng),
-                    category: text(&mut rng),
-                    action: nn_model::ResponseAction::Log,
-                    severity: nn_model::Severity::High,
-                    reasoning: text(&mut rng),
-                    event_pid: 1,
-                    event_filename: text(&mut rng),
-                    timestamp_ns: 1,
-                };
-                let mut d = DetectionRecord::from_rule(
-                    i,
-                    text(&mut rng),
-                    &event,
-                    &verdict,
-                    nn_model::posture_types::PostureKind::Engaged,
-                    text(&mut rng),
-                );
-                d.confidence = loop {
-                    let f = f64::from_bits(rng.random());
-                    if f.is_finite() {
-                        break f;
-                    }
-                };
-                d.suppressed_before = rng.random_bool(0.3).then(|| rng.random());
-                d.file = opt(&mut rng);
-                d.operation = opt(&mut rng);
-                d
-            })
-            .collect();
-        check(detections);
-        let statuses: Vec<StatusEvent> = (0..120)
-            .map(|_| StatusEvent {
-                detection_id: rng.random(),
-                new_status: DetectionStatus::Investigating,
-                ts: text(&mut rng),
-                principal: Principal {
-                    pid: rng.random(),
-                    comm: text(&mut rng),
-                    uid: rng.random(),
-                    ppid: rng.random_bool(0.5).then(|| rng.random()),
-                },
-                note: opt(&mut rng),
-                principal_exe: opt(&mut rng),
-            })
-            .collect();
-        check(statuses);
-        let flows: Vec<crate::net::drain::NetFlowPayload> = (0..120)
-            .map(|_| crate::net::drain::NetFlowPayload {
-                ts: text(&mut rng),
-                flow_id: text(&mut rng),
-                start_ns: rng.random(),
-                end_ns: rng.random(),
-                family: rng.random(),
-                src_addr: text(&mut rng),
-                src_port: rng.random(),
-                dst_addr: text(&mut rng),
-                dst_port: rng.random(),
-                proto: rng.random(),
-                pid: rng.random(),
-                uid: rng.random(),
-                comm: text(&mut rng),
-                exe: opt(&mut rng),
-                bytes_sent: rng.random(),
-                bytes_recv: rng.random(),
-                resolved_hostname: opt(&mut rng),
-                ja3: opt(&mut rng),
-                ja4: opt(&mut rng),
-                sni: opt(&mut rng),
-                close_reason: rng.random(),
-                agent_id: text(&mut rng),
-                decision_engine_skipped: rng.random(),
-            })
-            .collect();
-        check(flows);
-        let drifts: Vec<crate::fim::drain::FimDriftPayload> = (0..120)
-            .map(|_| crate::fim::drain::FimDriftPayload {
-                ts: text(&mut rng),
-                path: text(&mut rng),
-                op: nn_model::telemetry::FimOp::AttrChanged,
-                baseline_sha256: opt(&mut rng),
-                new_sha256: opt(&mut rng),
-                modifier_pid: rng.random(),
-                modifier_uid: rng.random(),
-                modifier_comm: text(&mut rng),
-                severity: crate::fim::drain::DriftSeverity::High,
-                decision_engine_skipped: rng.random(),
-                skip_reason: text(&mut rng),
-                agent_id: text(&mut rng),
-                attrs: rng
-                    .random_bool(0.5)
-                    .then(|| nn_model::telemetry::FileAttrChange {
-                        mode_before: rng.random(),
-                        mode_after: rng.random(),
-                        uid_before: rng.random(),
-                        uid_after: rng.random(),
-                        gid_before: rng.random(),
-                        gid_after: rng.random(),
-                    }),
-            })
-            .collect();
-        check(drifts);
     }
 }

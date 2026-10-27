@@ -12,7 +12,7 @@
 use std::collections::BTreeSet;
 use std::process::Command;
 
-use northnarrow_agent::audit::LAB_FEATURES;
+use northnarrow_agent::build_info::LAB_FEATURES;
 
 fn expected() -> String {
     let mut features = Vec::new();
@@ -79,7 +79,7 @@ fn manifest_features(manifest: &str) -> (Option<String>, BTreeSet<String>) {
 /// declares is one `--build-features` names, and none is on by default. A
 /// release build (`cargo xtask build --release`, no `--features`) then
 /// carries none, and a feature added later cannot be compiled into a
-/// release unseen: this test fails until `audit::LAB_FEATURES` lists it.
+/// release unseen: this test fails until `build_info::LAB_FEATURES` lists it.
 #[test]
 fn every_cargo_feature_is_named_by_build_features() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
@@ -97,7 +97,7 @@ fn every_cargo_feature_is_named_by_build_features() {
     let named: BTreeSet<String> = LAB_FEATURES.iter().map(|(n, _)| n.to_string()).collect();
     assert_eq!(
         declared, named,
-        "agent/Cargo.toml [features] vs audit::LAB_FEATURES: add the new feature to both"
+        "agent/Cargo.toml [features] vs build_info::LAB_FEATURES: add the new feature to both"
     );
     // Each entry says what cargo compiled: the list cannot claim a feature
     // off while this build has it on.

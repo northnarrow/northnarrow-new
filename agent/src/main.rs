@@ -873,8 +873,8 @@ impl Cli {
     }
 
     /// The chains the agent anchors, at the configured paths.
-    fn chain_paths(&self) -> northnarrow_agent::chain_anchor::ChainPaths {
-        northnarrow_agent::chain_anchor::ChainPaths {
+    fn chain_paths(&self) -> northnarrow_agent::chains::ChainPaths {
+        northnarrow_agent::chains::ChainPaths {
             audit: self.audit_log_file.clone(),
             canary_registry: self.canary_registry_file.clone(),
             canary_access: self.canary_access_file.clone(),
@@ -1169,7 +1169,7 @@ fn report_open_rules(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.build_features {
-        let features = northnarrow_agent::audit::build_features();
+        let features = northnarrow_agent::build_info::build_features();
         if features.is_empty() {
             println!("none");
         } else {
@@ -1490,16 +1490,13 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // overlay rollback floor below.
     let heads_file = cli.resolved_chain_heads_file();
     let chain_targets = cli.chain_paths().targets();
-    let mut boot_chains =
-        match northnarrow_agent::chain_anchor::boot_verifying_key(&cli.signing_key_file) {
-            Some(pk) => {
-                northnarrow_agent::chain_anchor::boot_check(&chain_targets, &heads_file, &pk)
-            }
-            None => {
-                info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
-                northnarrow_agent::chain_anchor::BootCheck::default()
-            }
-        };
+    let mut boot_chains = match northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
+        Some(pk) => northnarrow_agent::chains::boot_check(&chain_targets, &heads_file, &pk),
+        None => {
+            info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
+            northnarrow_agent::chain_anchor::BootCheck::default()
+        }
+    };
     // External audit LLMR-014: the signed overlays' rollback floor, from the
     // audit chain as this boot found it — verified, and read before the key
     // and the log below are bootstrapped (a log found missing must not look
@@ -1947,19 +1944,19 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // writability before anything attaches — a read-only mount or an
     // immutable file refuses the start while the host is untouched. The
     // signed `agent_boot` after the attach still proves it with a row.
-    match northnarrow_agent::audit::preflight_writable(
+    match northnarrow_agent::audit_preflight::preflight_writable(
         &cli.audit_log_file,
         early_registration_failed,
     ) {
-        northnarrow_agent::audit::AuditPreflight::Writable => {
+        northnarrow_agent::audit_preflight::AuditPreflight::Writable => {
             debug!(path = %cli.audit_log_file.display(), "audit log writable (preflight)")
         }
-        northnarrow_agent::audit::AuditPreflight::Deferred(why) => info!(
+        northnarrow_agent::audit_preflight::AuditPreflight::Deferred(why) => info!(
             why,
             "audit log closed to this process until the attach registers it — the boot probe \
              decides"
         ),
-        northnarrow_agent::audit::AuditPreflight::Unwritable(why) => {
+        northnarrow_agent::audit_preflight::AuditPreflight::Unwritable(why) => {
             let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
                 std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
                     .ok()
@@ -2313,6 +2310,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                             detect_only_source.as_deref(),
                             integrity.label(),
                             integrity.provenance(),
+                            &northnarrow_agent::build_info::agent_build(),
                         ) {
                             Ok(entry) => {
                                 info!(
@@ -3257,15 +3255,11 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // verification of the rotating logs in the background
     // (external audit NN-AUD-108, NN-AUD-112).
     if let Some(a) = &chain_anchor {
-        northnarrow_agent::chain_anchor::spawn(Arc::clone(a), audit_log.clone());
+        northnarrow_agent::chains::spawn(Arc::clone(a), audit_log.clone());
     }
-    northnarrow_agent::chain_anchor::set_audit_log(audit_log.clone());
-    if let Some(pk) = northnarrow_agent::chain_anchor::boot_verifying_key(&cli.signing_key_file) {
-        northnarrow_agent::chain_anchor::spawn_boot_verify(
-            chain_targets.clone(),
-            pk,
-            audit_log.clone(),
-        );
+    northnarrow_agent::chains::set_audit_log(audit_log.clone());
+    if let Some(pk) = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
+        northnarrow_agent::chains::spawn_boot_verify(chain_targets.clone(), pk, audit_log.clone());
     }
     northnarrow_agent::sensors::ring_drops::set_audit_log(audit_log.clone());
     // Lab PR 215: a deny hook that let an operation through undecided.
@@ -4769,18 +4763,18 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             .verified(OverlayKind::ExecqHashes, &cfg.hashes_local)
         {
             northnarrow_agent::config::overlay_auth::Verified::Content { path, text } => {
-                match common::execq::parse_hash_list(&text) {
+                match nn_proto::execq::parse_hash_list(&text) {
                     Ok(l) => (l, format!("{} (signed)", path.display())),
                     Err(e) => {
                         error!(error = %e, path = %path.display(), "exec quarantine hash list unreadable — empty lists");
                         (
-                            common::execq::HashList::default(),
+                            nn_proto::execq::HashList::default(),
                             format!("{}: {e}", path.display()),
                         )
                     }
                 }
             }
-            _ => (common::execq::HashList::default(), "none".to_string()),
+            _ => (nn_proto::execq::HashList::default(), "none".to_string()),
         };
         let posture_for_execq = posture.clone();
         let recorder = northnarrow_agent::execq::record::SinkRecorder {
@@ -6227,7 +6221,13 @@ fn record_refused_boot(
     if let Some((source, what)) = degraded {
         northnarrow_agent::boot::degradation::sign_into(&mut log, source, what, true);
     }
-    match log.boot_refused_by(gate, integrity, provenance, detail) {
+    match log.boot_refused_by(
+        gate,
+        integrity,
+        provenance,
+        detail,
+        &northnarrow_agent::build_info::agent_build(),
+    ) {
         Ok(e) => {
             info!(entry_hash = %e.entry_hash, gate, "refused boot recorded in the audit chain")
         }

@@ -142,30 +142,42 @@ planned = false
 "admin_cli" = "nn-admin"
 "admin_socket" = "northnarrow-agent"
 "agent_id" = "nn-linux"
-"anchored" = "nn-evidence"
+# the Linux host's anchor of a log's directory (`/proc/self/fd`), behind
+# `chain_host::ChainHost::anchor`: not moved to nn-evidence with the chains
+# (R05, lab PR 241)
+"anchored" = "nn-linux"
 "anti_tamper" = "nn-linux"
 # the role parse and the UnlockToken verification; key loading stays Linux
 "anti_tamper::admin_auth" = "nn-proto"
 "anti_tamper::combat_allow" = "nn-core"
 "async_fd" = "nn-linux"
 "atomic_file" = "nn-linux"
-"audit" = "nn-evidence"
+# post-plan (lab PR 241, R04a): the audit log's writability before the
+# attach (`access(2)`), from `audit`
+"audit_preflight" = "nn-linux"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 217): an external command with a deadline
 "bounded_cmd" = "nn-linux"
+# post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
+# guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
+# rule 4)
+"build_info" = "northnarrow-agent"
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
-# post-plan (lab PR 178): the one reader of the canary chains' lines
-"canary::chain_lines" = "nn-evidence"
 "canary::detector" = "nn-core"
 "canary::readers" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
 "canary::templates" = "nn-core"
-"chain_anchor" = "nn-evidence"
-"chain_tail" = "nn-evidence"
-"chainlog" = "nn-evidence"
+# post-plan (lab PR 241, R04a): the chains' Linux file operations
+"chain_host_linux" = "nn-linux"
+# post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
+# the admin socket's), the payload of each rotating log, the canary chains'
+# full checks, the anchoring and boot-verify tasks — from `chain_anchor`.
+# nn-admin's `chain verify` reads the list: two nn-admin references until
+# the payloads have a crate below it (plan R04a/R05 "i payload"; R10)
+"chains" = "northnarrow-agent"
 # the ladder and its evidence; SystemActuator and the probes of protected
 # and reconcile go to nn-linux (R04c)
 "combat" = "nn-core"
@@ -180,8 +192,12 @@ planned = false
 "cow::trust" = "nn-core"
 "decision" = "nn-core"
 "detection_budget" = "nn-core"
-# not in §2.4: the detection sink's queue and files (its payloads go to
-# nn-evidence with R04a)
+# post-plan (lab PR 241, R04a): the detection log's records and their
+# parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
+# file propri"; the payloads are nn-evidence's)
+"detection_payload" = "nn-evidence"
+# not in §2.4: the detection sink's queue and files, the records'
+# constructors from the engine's decisions (its payloads: above, R04a)
 "detection_store" = "nn-linux"
 # post-plan (lab PR 226): exec policy; the controller and the kernel maps
 "execpol" = "nn-linux"
@@ -205,6 +221,9 @@ planned = false
 # post-plan (lab PR 225): defences switched off, a shipped list
 "impair" = "nn-core"
 "install_manifest" = "nn-linux"
+# the agent's signing key and its files, from `audit` (plan R04a; nn-linux's
+# `keys`, R09a)
+"keys" = "nn-linux"
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
@@ -218,6 +237,10 @@ planned = false
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # post-plan (lab PR 234): the OS CSPRNG
 "os_rng" = "nn-linux"
+# post-plan (lab PR 241, R04b): the text of the open sensor's paths (cut and
+# unread marks, an exact path, an unplaced path's device, mountinfo's
+# escapes), from `sensors::open_sensor`: the event's vocabulary
+"path_text" = "nn-model"
 "posture" = "nn-core"
 # post-plan (lab PR 216): no core dump, no readable memory
 "process_hardening" = "nn-linux"
@@ -240,6 +263,24 @@ planned = false
 "upgrade_rollback" = "nn-linux"
 # post-plan (lab only): `--verifier-check`
 "verifier_check" = "nn-linux"
+
+# ── agent/src: the shims of R05 ───────────────────────────────────────
+# R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
+# their paths, without a file, in `lib.rs` and `canary/mod.rs` (plan §4.1
+# rule 2: `pub use nn_evidence::…`; the writers' aliases with the agent's
+# key as default and the key's names under `audit`; removed in R17). A
+# reference to one counts for nn-evidence.
+
+[shims.agent]
+"audit" = "nn-evidence"
+# post-plan (lab PR 178): the one reader of the canary chains' lines
+"canary::chain_lines" = "nn-evidence"
+"chain_anchor" = "nn-evidence"
+# post-plan (lab PR 241, R04a): what the chains need from their host (the
+# signer; the file operations)
+"chain_host" = "nn-evidence"
+"chain_tail" = "nn-evidence"
+"chainlog" = "nn-evidence"
 "verify_lines" = "nn-evidence"
 
 # ── common/src: module → crate (§2.4) ────────────────────────────────────
@@ -255,8 +296,6 @@ planned = false
 "btf_offsets" = "northnarrow-common"
 # post-plan (lab PR 219): the decision model the eBPF programs run
 "epg" = "northnarrow-common"
-# post-plan (lab PR 223): the agent ↔ scanner protocol and hash list
-"execq" = "nn-proto"
 # post-plan (lab PR 215): the deny hooks' fail-open counters
 "fail_open" = "northnarrow-common"
 "ring_drops" = "northnarrow-common"
@@ -265,7 +304,8 @@ planned = false
 # and sd_notify to northnarrow-antitamper-bpf; R02 (lab PR 240) model,
 # posture_types, netaddr, log_escape (and the std types of wire) to
 # nn-model, dns_qname to nn-parse: a member's own sources, out of this scan
-# (the layer gate checks its dependencies).
+# (the layer gate checks its dependencies). Lab PR 241: execq (post-plan, lab
+# PR 223: the agent ↔ scanner protocol and hash list) to nn-proto.
 
 # `[aliases.<tree>]`: the items of a tree's root and the modules that define
 # them, `*` for any other item. common's (`pub use model::*`, `pub use
@@ -276,11 +316,12 @@ planned = false
 # depend on (distinct (file, module) pairs, outside tests and Kani
 # proofs). They may only go down: xtask/tests/module_map.rs fails above
 # these numbers and asks for the lower number below them. R04 brings
-# nn-evidence and nn-core to 0.
+# nn-evidence and nn-core to 0. Lab PR 241: 77 → 54 (nn-evidence 0; nn-core
+# 40, the rest R04b's and R04c's).
 
 [ratchet]
-nn-admin = 6
-nn-core = 53
-nn-evidence = 12
+nn-admin = 8
+nn-core = 40
+nn-evidence = 0
 nn-linux = 3
 nn-proto = 3
