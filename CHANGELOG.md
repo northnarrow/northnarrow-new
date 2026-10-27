@@ -847,6 +847,43 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   to the self-hosted lab and what stays there.
 
 ### Changed
+- Determinism seams: the signed chains' clock and the posture's switches
+  per machine (lab PR 249, Wave 4 phase 2, before R08; no behaviour
+  change). **Clock.** nn-evidence's writers read the time they stamp on a
+  row through `nn_evidence::clock::Clock` — the host's, `SystemClock`
+  (`Utc::now`, as before), unless given another: an audit row's `ts`
+  (`AuditLog::open_with` with `AuditStamps`, which also carries the pid of
+  the rows the writer signs about itself — `std::process::id()` by
+  default; the ladder's and the trusted-installer window's rows read it
+  with `AuditLog::self_pid`), a rotating log's terminators and manifest
+  rows (`RotatingChainLog::open_with_clock`), the head anchor's snapshots
+  (`Anchor::with_clock`), the time a refused COMBAT transition happened
+  (`AuditEvidence::with_clock`); `open` and `new` keep the host's. The
+  format is unchanged: given the times `main` wrote, the writers make the
+  chain-pin fixtures of lab PR 241 again byte for byte, every file
+  (`agent/tests/chain_format_clock.rs`; `chain_format_pin.rs` and the v1
+  fixtures untouched). The posture golden replay opens its audit log with a
+  fixed key, its own clock and the replayed agent's pid, and prints its
+  signed rows whole — time, hashes, signature, pid — where it named them
+  (`@TS@`, `#n`, `@SIG@`, `@AGENT_PID@`): the six golden files that hold
+  signed rows changed in those fields only. **Switches.** The runtime value
+  of `RANSOMWARE_COMBAT_WITHOUT_CORROBORATION` (`RANSOMWARE_DECISIVE`) and
+  `KERNEL_MASS_WRITE` were process-wide: the posture reads the ransomware
+  directive of the per-rule policy from the handle it is given
+  (`PostureMachine::with_rule_policy`; the agent passes
+  `rule_policy::global()`, the handle the engine reads and `nn-admin policy
+  set` swaps; `TriggerType::confidence` takes the value), and the
+  mass-write mode is the trigger detector's own
+  (`PostureMachine::set_kernel_mass_write`, set by `main.rs` when the LSM
+  file-open sensor is armed, as before);
+  `posture_types::{ransomware_combat_without_corroboration,
+  set_ransomware_combat_without_corroboration}` and
+  `triggers::set_kernel_mass_write` are gone. NN-L-FIM-010's
+  one-verdict-per-rename list is the rule's own (it was process-wide too:
+  two engines in one process — parallel replays, tests — shared it). A new
+  posture golden case, `ransomware-alone-combat-policy`, runs under
+  `combat-without-corroboration NN-L-IMP-001` — ransomware alone to COMBAT,
+  decisive and unlocked — beside the other cases.
 - Wave 4 restructure, R00 — guardrails, no file moved (lab PR 239): a
   member reaches a repository file through `NN_REPO_ROOT`
   (`.cargo/config.toml` `[env]`, absolute) instead of a path relative to

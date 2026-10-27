@@ -1486,3 +1486,68 @@ only in the table below, in the same PR as the evidence.
     builds `main` and this lot in the same directory. Open: the five
     modules above (R08, R04b/R09a); the shims (R17).
   - Lab: no guest (moves and seams that keep every call; the identity below). Host, on 0e7802b (the lot's code; the commit after it changes documentation only), on 0df3394 (the lot's last commit before `main`'s lab PR 245 was merged in) and on the merge (b4f2467, 3,044 passed with lab PR 245's tests, the posture golden files as lab PR 245 left them): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,028 passed, 0 failed, 15 ignored (the test list is `main`'s: 3,043 names, every one found at the tip — 44 now nn-core's, 9 moved within the agent — and no test added); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` (both replays, golden files unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core`'s `cargo check` of nn-parse, nn-model, nn-proto, nn-evidence and nn-core (now code) for the five targets; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; no lockfile changed by the build): all pass. The pins pass unchanged: `encoded_frames_are_pinned`, `chain_format_pin`, `crypto_vectors`, the TLS and DNS parser pins, and the overlay-v1 fixture of lab PR 230 (`an_overlay_signed_before_the_bump_is_accepted`, `the_stored_overlay_signature_is_pinned`). Identity against `main` 9de1923, both built in one temporary checkout (same path), the release job's commands (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`; unstripped: the same flags, `CARGO_PROFILE_RELEASE_STRIP=none`): the eBPF object is byte-identical (sha256 42afd5b6… there; a clean rebuild of `main`'s, `agent-ebpf/target` removed, gives the same bytes), its stamp too (source c0365736…, `main`'s: `common` and the eBPF crates are untouched); the scanner (401,368 bytes) and the watchdog (2,336,920) are byte-identical, stripped and unstripped; `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes, the agent's and nn-admin's sizes, `CHANGELOG.md` and the two documents whose path mentions changed (`COMBAT_RECOVERY.md`, `install.sh`'s comment) aside. The agent (14,863,200 → 14,876,736 bytes) and nn-admin (4,022,024 → 4,029,320) are not byte-identical. Function by function (unstripped, names mapped to the new crates and modules, the host type parameter dropped, addresses and rip-relative targets dropped, trailing padding dropped): the agent 7,555 of 7,614 the same code (53 differ, 6 and 26 unpaired), nn-admin 3,441 of 3,463 (19; 3 and 20). Control — `main` with the agent depending on nn-core and nn-core on its new dependencies, no source moved: 14 of the agent's and 6 of nn-admin's change already (clap's `TypeId`s of the agent's enums: the agent crate's identity moves with its dependency list; which of identical bodies keeps its name). From the control to this lot: 41 of the agent's (19 only call a body LLVM folded under another name, the shared `RawVec::grow_one` among them; 22 differ in inlining at the new crate boundary, register allocation and stack frames, and an argument constant propagated into a callee: the moved loaders and parsers, their callers — the gate, the network isolator, the canary deploy, the COW and rule-policy boots —, nn-evidence's writers over the agent's key) and 13 of nn-admin's; the unpaired are generic code made a second time in nn-core (anyhow's message errors, `RawVec` growth, hex and base64 encoding, line iteration: `.text` +10,000 bytes in the agent, +0.14 %, +4,368 in nn-admin) and helpers kept out of line. `.rodata`: every text constant of one build is in the other's but the moved files' paths (panic locations, callsite files) and the callsite line numbers of the moved and edited files; the moved modules' tracing target is `nn_core::…` (not printed: `with_target(false)`).
+- **Lab PR 249 — determinism seams: the signed chains' clock and the
+  posture's switches per machine (Wave 4 Phase 2, before R08; C14, C17,
+  C23; no level changes).**
+  - What was wrong (found by lab PR 243): the chain writers of nn-evidence
+    read `Utc::now` where they stamped a row (an audit row's `ts` in
+    `build_signed_entry`, a rotating log's terminators and manifest rows,
+    the head anchor's snapshots), and the hash covers the time, the
+    signature the hash: the posture golden could not print its signed rows
+    and named their time, hashes, signature and the test's pid (`@TS@`,
+    `#n`, `@SIG@`, `@AGENT_PID@`); the chain pin of lab PR 241 could only
+    verify those rows, not make them again. Two posture switches were
+    process-wide — the runtime value of
+    `RANSOMWARE_COMBAT_WITHOUT_CORROBORATION` (`RANSOMWARE_DECISIVE`, set
+    by `rule_policy::install_global`) and `KERNEL_MASS_WRITE` (set by
+    `main.rs` when the LSM file-open sensor is armed) — so a case or test
+    that needed another value raced every other one.
+  - What changed (seams, no behaviour change): `nn_evidence::clock`
+    (`Clock`, `SystemClock` = `Utc::now`, `stamp`); every row stamp of the
+    crate reads it — `AuditLog::open_with` and `AuditStamps` (the clock and
+    the pid of the rows the writer signs about itself, `AuditLog::self_pid`,
+    which the ladder's rows and the trusted-installer window's close row now
+    read), `RotatingChainLog::open_with_clock`, `Anchor::with_clock`;
+    `open` and `new` keep the host's clock and `std::process::id()`. The
+    agent's `AuditEvidence::with_clock` stamps `occurred_at` of a late row.
+    The posture reads the ransomware directive from the policy handle it is
+    given (`PostureMachine::with_rule_policy`; `main.rs` passes
+    `rule_policy::global()`, the handle the engine reads and `nn-admin
+    policy set` swaps — read once per round; `TriggerType::confidence`
+    takes the value), and the mass-write mode is the trigger detector's
+    own (`PostureMachine::set_kernel_mass_write`, called by
+    `start_open_sensor` where the global was set); the global setters and
+    readers are gone. The posture golden opens its audit log with a fixed
+    key, its clock and the replayed agent's pid (4,200,000) and prints the
+    rows whole; a case's `rule_policy` lines are its machine's policy. New
+    case `ransomware-alone-combat-policy`: under `combat-without-corroboration
+    NN-L-IMP-001`, ransomware alone — decisive, nothing in its scope before
+    — reaches COMBAT, unlocked; INVESTIGATE, NEUTRALIZE of the tree,
+    contained; decay to ENGAGED. Golden diff: the six files that hold signed
+    rows, and in their 25 rows only the named fields became values (checked
+    by a script: each `ts` the line's time on the replay's wall clock,
+    `prev_hash` chaining from 64 zeros, `client_pid` 4,200,000, every other
+    byte of every line the same); the decision golden and the two other
+    posture files unchanged. Proof that the format did not change: the v1
+    fixtures of lab PR 241 made again, every file, byte for byte, by this
+    code given `main`'s times through a scripted clock
+    (`agent/tests/chain_format_clock.rs`: `audit.log`, and the whole
+    rotating set with its three terminators, `Rotated` rows and checkpoint;
+    `chain_format_pin.rs` and the fixtures untouched); the crypto vectors of
+    lab PR 230 unchanged and passing. Other process-wide state read by the
+    posture, impact or the engine, listed: NN-L-FIM-010's
+    one-verdict-per-rename list (`FIM010_RECENT`, the engine's) — converted,
+    the rule's own (one engine in the agent, so the same list; two replays
+    or tests in one process shared it); kept, not switches or not trivial:
+    `rule_policy::global()` (the agent's one policy handle, which the
+    engine and now the posture are given), the per-process random keys of
+    the DNS qname hash (`QNAME_HASH_KEYS`, NETR-012), the agent's own pid
+    read by the control-surface trigger (`std::process::id()`; the dev
+    build's machine has no agent pid to read instead) and as the default of
+    the fan-out rules' and NN-L-FIM-024's per-instance `agent_pid`, the
+    quarantine's boot-time `RUNTIME_DENY`, the impact sampler's
+    `/proc/1/root` probe (`response::host_path`), the status counters
+    (`impact`/`impair` `PUBLISHED`, `detection_budget::BUDGET`, eviction and
+    verdict counters), the clock-tick constants; `response_policy`'s held
+    switches are constants and its `HELD` per thread.
+  - Lab: no guest (seams that keep every production call: `AuditLog::open`, `RotatingChainLog::open`, `Anchor::new` and `AuditEvidence::new` take the host's clock and pid as before; the switches are filled from the same places with the same defaults). Host, on afcf8ed (the final tree but for this line and a rewrapped paragraph; on `main` 60d9965, lab PR 245 merged), `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo xtask build-ebpf --release` (`common` and the eBPF crates untouched: the stamp's source c0365736…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 70 suites, 3,058 passed, 0 failed, 15 ignored (the lot's 14 tests: the clock's 2, the audit log's 2, the rotating log's 2, the head anchor's, `chain_format_clock`'s 2, the posture machine's directive, the detector's mass-write mode, NN-L-FIM-010's list, the late ladder row's clock and pid, the golden's parallel policy replay; no `#[ignore]` test added); `cargo xtask attack-coverage --check`; `cargo xtask golden` ten times, each a process of its own: 11 tests passed each time, the 33 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed); `portable-core`'s check of the pure crates for its five targets: all pass. The crypto vectors (19 tests, `cargo test crypto_vectors`) and `chain_format_pin.rs` pass with their fixtures untouched. The first commit's tree alone (the clock seam): clippy on the workspace, nn-evidence's tests, both chain pins, the posture, COMBAT and window tests pass. Golden review: a script put the named fields of the 25 new rows back to their placeholders and found every line of the six files equal to the committed one (JSON equality), each `ts` its line's time on the replay's wall clock, `prev_hash` chaining from 64 zeros, `client_pid` 4,200,000. Mutation checks (temporary): the audit row's time not read from the log's clock fails 6 tests (the fixed chain written twice, the v1 audit log made again, the late ladder row, three golden checks); the manifest rows' 2 (the rotating set written twice, the v1 set made again), the terminators' and the head snapshot's 1 each; the posture ignoring its policy handle 5 (the directive per machine, four golden checks); the detector ignoring its switch 1; the ladder rows stamped with the test's pid 8 (the late row, seven golden checks); `occurred_at` on the host's clock 1; NN-L-FIM-010's list shared again 1. The first gate run of the final tree compiled a stale nn-model and failed: the two commits were split by restoring files with `cp -a`, which kept mtimes older than the first commit's build, so cargo saw nothing to rebuild; the files touched, the gates above ran on a fresh build. Rebased on `main` cedf7e1 (lab PR 247 merged; only the lot notes conflicted, both kept), the same gates on 321fb3c: all pass, 70 suites, 3,058 passed, 0 failed, 15 ignored, the ten golden runs identical.

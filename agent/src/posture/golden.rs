@@ -59,9 +59,14 @@
 //! the trackers it shares with the posture are assessed for every event,
 //! as the rules would), the ladder's worker thread (its steps run in the
 //! caller, in the order the worker runs them), the admin socket's own
-//! audit rows, and the process-wide switches (the ransomware directive of
-//! the per-rule policy and the kernel mass-write mode stay at their
-//! defaults: a case cannot set them without racing every other test).
+//! audit rows.
+//!
+//! Lab PR 249: the ransomware directive of the per-rule policy and the
+//! kernel mass-write mode are the machine's own (they were process-wide
+//! switches, read at their defaults here: a case could not set them
+//! without racing every other test). A case's `rule_policy` puts its lines
+//! in force on its machine's own handle (`PostureMachine::with_rule_policy`);
+//! the header names both values.
 //!
 //! `cargo xtask golden` runs these tests with the decision golden's;
 //! `cargo xtask golden --update` rewrites the golden files
@@ -75,7 +80,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nn_model::posture_types::{self, TriggerType};
+use nn_model::posture_types::TriggerType;
 use nn_model::{Event, ResponseAction};
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -102,6 +107,7 @@ use crate::combat::{
 use crate::config::comm_allowlist::{load_comm_allowlist, PROCESS_COMM_ALLOWLIST_SHIPPED};
 use crate::config::overlay_auth::Verified;
 use crate::correlation::CorrelationBuffer;
+use crate::decision::rule_policy::{self, PolicyHandle, RulePolicy};
 use crate::impact::entropy::{Sample, Sampler};
 use crate::impact::trust::ProgramOwners;
 use crate::impact::RansomTracker;
@@ -195,6 +201,12 @@ struct Case {
     /// both families clear.
     #[serde(default)]
     release: Vec<Families>,
+    /// Lab PR 249: the lines of the signed per-rule policy (lab PR 236,
+    /// `rule-policy.local`) in force for this case's posture — its own
+    /// handle (`PostureMachine::with_rule_policy`); none: the built-in
+    /// defaults.
+    #[serde(default)]
+    rule_policy: Vec<String>,
     items: Vec<Item>,
 }
 
@@ -1096,7 +1108,9 @@ impl Replay {
             Vec::new(),
             EscalationAllowList::empty(),
         )
-        .with_clock(clock.clone());
+        .with_clock(clock.clone())
+        // Lab PR 249: the case's per-rule policy, on a handle of its own.
+        .with_rule_policy(PolicyHandle::new(case_policy(case)));
         posture.set_installer_window(Arc::clone(&window));
         posture.set_ransom_tracker(Arc::clone(&ransom));
         posture.set_defense_detector(Arc::clone(&defense));
@@ -1399,11 +1413,12 @@ impl Replay {
             .map(|t| t.reason.clone())
         {
             if fired.is_some() {
+                let decisive = self.posture.ransomware_combat_without_corroboration();
                 cited["triggers"] = Value::Array(
                     reason
                         .split('+')
                         .filter_map(trigger_named)
-                        .map(|t| trigger_json(t, event))
+                        .map(|t| trigger_json(t, event, decisive))
                         .collect(),
                 );
             }
@@ -1574,6 +1589,21 @@ impl Replay {
     }
 }
 
+/// Lab PR 249: the per-rule policy a case's posture reads — its
+/// `rule_policy` lines through the parser of `rule-policy.local` (any bad
+/// line fails the case), or the built-in defaults.
+fn case_policy(case: &Case) -> RulePolicy {
+    if case.rule_policy.is_empty() {
+        return RulePolicy::builtin();
+    }
+    let mut text = case.rule_policy.join("\n");
+    text.push('\n');
+    let mut p = rule_policy::parse(&text)
+        .unwrap_or_else(|e| panic!("the case's rule_policy does not parse: {e}"));
+    p.source = "the case's rule_policy".to_string();
+    p
+}
+
 /// The time an event happened (ns, the events' clock).
 fn event_ts(e: &Event) -> u64 {
     triggers::event_owner_seen(e).1.max(match e {
@@ -1621,13 +1651,14 @@ fn trigger_named(name: &str) -> Option<TriggerType> {
     .find(|t| t.as_str() == name)
 }
 
-/// A trigger an event raised, as the posture judges it.
-fn trigger_json(t: TriggerType, e: &Event) -> Value {
+/// A trigger an event raised, as the posture judges it (`ransomware_decisive`:
+/// the machine's ransomware directive, lab PR 249).
+fn trigger_json(t: TriggerType, e: &Event, ransomware_decisive: bool) -> Value {
     json!({
         "trigger": t.as_str(),
         "class": format!("{:?}", triggers::evidence_class(t, e)),
         "level": t.target_level().as_str(),
-        "confidence": format!("{:?}", t.confidence()),
+        "confidence": format!("{:?}", t.confidence(ransomware_decisive)),
         "locks_combat": t.locks_combat(),
     })
 }
@@ -1642,9 +1673,10 @@ fn render(name: &str, case: &Case, r: &Replay) -> String {
         "about": case.about,
         "detect_only": case.detect_only,
         "posture": {
+            // Lab PR 249: the replay's machine's own (they were process-wide).
             "ransomware_combat_without_corroboration":
-                posture_types::ransomware_combat_without_corroboration(),
-            "kernel_mass_write": triggers::kernel_mass_write(),
+                r.posture.ransomware_combat_without_corroboration(),
+            "kernel_mass_write": r.posture.kernel_mass_write(),
             "corroboration_window_secs": super::corroboration::CORROBORATION_WINDOW.as_secs(),
             "combat_quiet_window_secs": transitions::COMBAT_QUIET_WINDOW.as_secs(),
             "alerted_decay_secs": transitions::ALERTED_DECAY.as_secs(),
@@ -1963,9 +1995,13 @@ fn every_ladder_row_names_its_trigger_and_offender() {
 /// agent's own unit stopped inside a signed trusted-installer window not
 /// moving the posture, a forking tree frozen and killed with the outcomes
 /// of a process gone and of a stale capture, the signed unlock leaving
-/// COMBAT, detect-only acting on nothing, decay down to OBSERVING.
+/// COMBAT, detect-only acting on nothing, decay down to OBSERVING. Lab PR
+/// 249: and ransomware alone to COMBAT — decisive, nothing in its scope
+/// before — only on a machine whose per-rule policy says
+/// `combat-without-corroboration`.
 #[test]
 fn posture_golden_cases_cover_the_lot() {
+    let mut ransomware_alone_combat = 0;
     let mut combat_by: BTreeSet<String> = BTreeSet::new();
     let mut engaged_by: BTreeSet<String> = BTreeSet::new();
     let mut kills_in_cgroup = 0;
@@ -1982,6 +2018,23 @@ fn posture_golden_cases_cover_the_lot() {
             let transitions: Vec<&Value> = l["posture"].as_array().into_iter().flatten().collect();
             for t in &transitions {
                 let trig = t["trigger"].as_str().unwrap_or("");
+                let alone = t["evidence"]["in_scope_before"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty);
+                let decisive = t["evidence"]["triggers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|x| x["trigger"] == trig && x["confidence"] == "Decisive");
+                if t["to"] == "COMBAT" && trig == "RansomwareEncryption" && alone {
+                    assert!(
+                        decisive && r.posture.ransomware_combat_without_corroboration(),
+                        "case {name}: ransomware alone reached COMBAT without \
+                         `combat-without-corroboration`: {t}"
+                    );
+                    assert!(!case.rule_policy.is_empty(), "case {name}");
+                    ransomware_alone_combat += 1;
+                }
                 match t["to"].as_str() {
                     Some("COMBAT") => {
                         combat_by.insert(trig.to_string());
@@ -2048,4 +2101,58 @@ fn posture_golden_cases_cover_the_lot() {
     assert!(decayed_to_observing > 0, "no decay down to OBSERVING");
     assert!(detect_only_neutralize > 0, "no detect-only NEUTRALIZE");
     assert_eq!(detect_only_kills, 0, "detect-only killed something");
+    assert!(
+        ransomware_alone_combat > 0,
+        "no case takes ransomware alone to COMBAT under `combat-without-corroboration`"
+    );
+}
+
+/// Lab PR 249: a case's per-rule policy is its machine's own. The case
+/// under `combat-without-corroboration` (ransomware alone: COMBAT) and the
+/// one without it (the same encryption: ENGAGED), replayed at once on
+/// threads of their own, each give their committed golden file. The
+/// directive was a process-wide switch: a case setting it would have moved
+/// every case replayed beside it.
+#[test]
+fn a_case_s_rule_policy_is_its_machine_s_own() {
+    const PAIRS: usize = 3;
+    let cases = cases();
+    let pick = |n: &str| {
+        cases
+            .iter()
+            .find(|(c, _)| c == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("no case {n}"))
+    };
+    let pair = [
+        pick("ransomware-alone-combat-policy"),
+        pick("ransomware-alone-engaged"),
+    ];
+    // Each alone on this thread first; then all at once.
+    let alone: Vec<String> = pair.iter().map(|(n, t)| golden_text(n, t)).collect();
+    let barrier = Arc::new(std::sync::Barrier::new(2 * PAIRS));
+    let handles: Vec<_> = (0..2 * PAIRS)
+        .map(|i| {
+            let (name, text) = pair[i % 2].clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                (i % 2, golden_text(&name, &text))
+            })
+        })
+        .collect();
+    for h in handles {
+        let (k, replayed) = h.join().unwrap();
+        assert!(
+            replayed == alone[k],
+            "case {}: a replay beside the other case's differs from one alone",
+            pair[k].0
+        );
+    }
+    if !updating() {
+        for ((name, _), text) in pair.iter().zip(&alone) {
+            let committed = std::fs::read_to_string(expected_path(name)).unwrap();
+            assert!(*text == committed, "case {name}: not its golden file");
+        }
+    }
 }

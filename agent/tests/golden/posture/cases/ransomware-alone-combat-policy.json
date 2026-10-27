@@ -1,0 +1,18 @@
+{
+  "about": "Lab PR 249: the encryption of ransomware-alone-engaged under the signed per-rule policy `combat-without-corroboration NN-L-IMP-001` (lab PR 236), on this case's machine only (its own policy handle): an unpackaged program of a login session renames 20 files to .locked and leaves ciphertext — RansomwareEncryption, decisive under the directive: COMBAT with nothing in its scope before, unlocked (any user can encrypt their own files: the ransomware trigger never locks COMBAT). The ladder investigates; at the deadline NEUTRALIZE kills its tree through the kill cgroup and quarantines its binary; contained, no isolation. Quiet for the window, the unlocked COMBAT decays to ENGAGED and the ladder stands down. Replayed beside the other cases, whose machines read the built-in defaults: ransomware-alone-engaged stays ENGAGED.",
+  "path": ["COMBAT", "ENGAGED"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE"],
+  "signed": ["combat_stage", "combat_outcome"],
+  "rule_policy": ["combat-without-corroboration NN-L-IMP-001"],
+  "start_ns": 250000000000,
+  "procs": [
+    {"pid": 6900002, "ppid": 1, "start_ns": 100000000000, "uid": 0, "comm": "sshd", "exe": "/usr/sbin/sshd", "argv": ["sshd: u1000 [priv]"], "loginuid": 1000, "cgroup": "/user.slice/user-1000.slice/session-7.scope"},
+    {"pid": 6900003, "ppid": 6900002, "start_ns": 101000000000, "uid": 1000, "comm": "bash", "exe": "/usr/bin/bash", "argv": ["-bash"], "tty": true}
+  ],
+  "entropy": [{"prefix": "/home/u/docs/", "examined": 4, "high": 4}],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 6900020, "ppid": 6900003, "uid": 1000, "gid": 1000, "comm": "nn-ms-enc", "filename": "/home/u/.local/bin/nn-ms-enc", "timestamp_ns": 300000000000, "argv": ["nn-ms-enc", "/home/u/docs"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 299999000000, "exe": {"path": "/home/u/.local/bin/nn-ms-enc"}}}},
+    {"event": {"FileBurst": {"pid": 6900020, "uid": 1000, "comm": "nn-ms-enc", "kind": "RenameExtension", "count": 20, "appended": 20, "sources": 0, "filename": "/home/u/docs/f19.odt.locked", "timestamp_ns": 302000000000}}},
+    {"wait": {"secs": 1900}}
+  ]
+}

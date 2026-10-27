@@ -1057,23 +1057,28 @@ pub(crate) fn has_ransomware_extension(path: &str) -> bool {
 /// time and which of its two records it was (`moved_in`).
 type Fim010Seen = (String, u32, u64, bool);
 
-/// Lab PR 225: the renames NN-L-FIM-010 judged in the last
-/// [`FIM010_DEDUP_NS`].
-static FIM010_RECENT: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::VecDeque<Fim010Seen>>,
-> = std::sync::LazyLock::new(Default::default);
 const FIM010_DEDUP_NS: u64 = 2_000_000_000;
 const FIM010_RECENT_CAP: usize = 64;
 
 /// `true` when the other record of the same rename — to `path` by `pid`
 /// around `ts`, the watched file's `Renamed` or the watched directory's
 /// moved-in `Created` — was already judged; records this one otherwise.
+/// `recent`: the renames the rule judged in the last [`FIM010_DEDUP_NS`]
+/// (lab PR 249: the rule's own, it was a process-wide list that two engines
+/// — two parallel replays, two tests — shared).
 ///
 /// `register = false` checks without recording: a moved-in record whose
 /// kill is held must not suppress the watched file's own `Renamed`, which
 /// kills as it did before lab PR 225.
-fn fim010_seen(path: &str, pid: u32, ts: u64, moved_in: bool, register: bool) -> bool {
-    let mut recent = FIM010_RECENT.lock();
+fn fim010_seen(
+    recent: &parking_lot::Mutex<std::collections::VecDeque<Fim010Seen>>,
+    path: &str,
+    pid: u32,
+    ts: u64,
+    moved_in: bool,
+    register: bool,
+) -> bool {
+    let mut recent = recent.lock();
     if recent.iter().any(|(p, q, t, m)| {
         p == path && *q == pid && *m != moved_in && t.abs_diff(ts) <= FIM010_DEDUP_NS
     }) {
@@ -1109,7 +1114,12 @@ fn fim010_seen(path: &str, pid: u32, ts: u64, moved_in: bool, register: bool) ->
 ///   BPF program's `should_emit` (PHASE_D_002-symmetric
 ///   `caller_is_in_family` check); FIM events that reach the
 ///   rule layer have already been screened.
-pub struct NnLFim010RansomwareExtensionRename;
+#[derive(Default)]
+pub struct NnLFim010RansomwareExtensionRename {
+    /// Lab PR 225: the renames judged in the last [`FIM010_DEDUP_NS`] (one
+    /// verdict per rename); lab PR 249: this rule's own.
+    recent: parking_lot::Mutex<std::collections::VecDeque<Fim010Seen>>,
+}
 
 impl Rule for NnLFim010RansomwareExtensionRename {
     fn id(&self) -> &'static str {
@@ -1164,7 +1174,14 @@ impl Rule for NnLFim010RansomwareExtensionRename {
         // file's own rename kills as before.
         let moved_in_kill = crate::decision::response_policy::FIM_010_MOVED_IN_KILL;
         let held = moved_in && !moved_in_kill.on;
-        if fim010_seen(new_path, fe.modifier_pid, fe.timestamp_ns, moved_in, !held) {
+        if fim010_seen(
+            &self.recent,
+            new_path,
+            fe.modifier_pid,
+            fe.timestamp_ns,
+            moved_in,
+            !held,
+        ) {
             return None;
         }
         // Lab PR 225: the record names the new name.
@@ -2678,7 +2695,7 @@ pub fn fim_rules_with_lineage(
     vec![
         // Critical first — fire on the worst-case signals
         // before any High/Medium rule has a chance to match.
-        Box::new(NnLFim010RansomwareExtensionRename),
+        Box::new(NnLFim010RansomwareExtensionRename::default()),
         pkg(Box::new(NnLFim001SystemBinaryModified)),
         pkg(Box::new(NnLFim002NewSuidBinary)),
         pkg(Box::new(NnLFim008KernelModuleModified)),
@@ -3927,7 +3944,7 @@ mod tests {
                 Severity::Critical,
             ),
             (
-                NnLFim010RansomwareExtensionRename
+                NnLFim010RansomwareExtensionRename::default()
                     .evaluate(&fim_event(FimOp::Renamed, "/home/u/photo.jpg.locked")),
                 Severity::Critical,
             ),
@@ -3940,13 +3957,47 @@ mod tests {
 
     // ── NN-L-FIM-010 (C5.1) ─────────────────────────────────────
 
+    /// Lab PR 225: one verdict per rename — the watched directory's
+    /// moved-in record of a rename the rule already judged as the watched
+    /// file's `Renamed` gives none. Lab PR 249: the rule remembers what it
+    /// judged, not the process: another rule instance (another engine — a
+    /// parallel replay, another test) judges the same record afresh. The
+    /// list was process-wide.
+    #[test]
+    fn fim010_one_verdict_per_rename_is_the_rule_s_own() {
+        let new = "/srv/data/per-rule.db.locked";
+        let mut renamed = fim_renamed_with_dest("/srv/data/per-rule.db", new);
+        let mut created = fim_event(FimOp::Created, new);
+        for e in [&mut renamed, &mut created] {
+            if let Event::Fim(fe) = e {
+                fe.modifier_pid = 7272;
+            }
+        }
+        if let Event::Fim(fe) = &mut created {
+            fe.moved_in = true;
+        }
+        let judged = NnLFim010RansomwareExtensionRename::default();
+        let v = judged.evaluate(&renamed).expect("the file's rename fires");
+        assert_eq!(v.action, ResponseAction::KillProcessTree);
+        assert!(
+            judged.evaluate(&created).is_none(),
+            "the same rename's second record"
+        );
+        let other = NnLFim010RansomwareExtensionRename::default();
+        let v = other
+            .evaluate(&created)
+            .expect("another rule judges the record afresh");
+        assert_eq!(v.severity, Severity::Critical);
+        assert_eq!(v.action, ResponseAction::Log, "the moved-in kill is held");
+    }
+
     /// Review of lab PR 225 (decision of 21/10/2026): the moved-in match
     /// is new, so its kill is held behind the per-rule policy — a Critical
     /// record — and it does not suppress the watched file's own `Renamed`
     /// of the same rename, which kills as before.
     #[test]
     fn fim010_moved_in_is_held_and_does_not_hide_the_files_rename() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         let new = "/srv/data/held-review.db.locked";
         let mut created = fim_event(FimOp::Created, new);
         if let Event::Fim(fe) = &mut created {
@@ -3967,7 +4018,7 @@ mod tests {
 
     #[test]
     fn fim010_fires_on_renamed_to_ransomware_extension() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         for path in &[
             "/home/u/photo.jpg.locked",
             "/home/u/doc.txt.encrypted",
@@ -3990,7 +4041,7 @@ mod tests {
     /// case, on the source and on the destination.
     #[test]
     fn fim010_matches_extension_case_insensitively() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         for path in [
             "/etc/foo.conf.LOCKED",
             "/etc/foo.conf.Crypted",
@@ -4017,7 +4068,7 @@ mod tests {
 
     #[test]
     fn fim010_does_not_fire_on_legitimate_lock_or_temp_extensions() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         // PID lock files in /var/run/, /run/, /tmp/ use .lock
         // (singular) — the rule matches .locked only. Asserted
         // false-positive guard.
@@ -4046,7 +4097,7 @@ mod tests {
 
     #[test]
     fn fim010_does_not_fire_on_non_rename_ops() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         let path = "/home/u/photo.jpg.locked";
         // Created / Modified / Deleted / Linked of a
         // ransomware-extension file are caught (or not) by
@@ -4068,7 +4119,7 @@ mod tests {
     /// `doc.docx.crypted`.
     #[test]
     fn fim010_fires_on_dest_path_match_when_src_clean() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         let v = r
             .evaluate(&fim_renamed_with_dest(
                 "/home/u/documents/quarterly.docx",
@@ -4085,7 +4136,7 @@ mod tests {
     /// abstain. Defends the false-positive boundary.
     #[test]
     fn fim010_does_not_fire_when_neither_src_nor_dest_match() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         assert!(
             r.evaluate(&fim_renamed_with_dest(
                 "/home/u/draft.docx",
@@ -4111,7 +4162,7 @@ mod tests {
     /// rename with dest_path None (no regression).
     #[test]
     fn fim010_does_not_fire_when_src_clean_and_dest_path_none() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         assert!(
             r.evaluate(&fim_event(FimOp::Renamed, "/home/u/clean.docx"))
                 .is_none(),
@@ -4126,7 +4177,7 @@ mod tests {
     /// src-side branch.
     #[test]
     fn fim010_still_fires_on_src_match_with_dest_clean() {
-        let r = NnLFim010RansomwareExtensionRename;
+        let r = NnLFim010RansomwareExtensionRename::default();
         let v = r
             .evaluate(&fim_renamed_with_dest(
                 "/home/u/document.docx.locked",

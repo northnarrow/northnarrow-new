@@ -156,24 +156,14 @@ pub enum TriggerType {
 /// heuristics — ENGAGED alone, COMBAT when a signal of another class in its
 /// scope vouches for it. NN-L-IMP-001's kill is held with it
 /// (`decision::response_policy::IMP_001_KILL` in the agent).
+///
+/// The built-in default. Lab PR 236: a signed per-rule policy turns it on
+/// (`combat-without-corroboration NN-L-IMP-001`); lab PR 249: the value in
+/// force is the posture machine's own — the policy it reads — passed to
+/// [`TriggerType::confidence`] (it was a process-wide switch, so two
+/// machines could not hold two values, nor a test change it without racing
+/// every other one).
 pub const RANSOMWARE_COMBAT_WITHOUT_CORROBORATION: bool = false;
-
-/// Lab PR 236: the value in force — [`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`]
-/// (the built-in default) until a signed per-rule policy says
-/// `combat-without-corroboration NN-L-IMP-001`.
-static RANSOMWARE_DECISIVE: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(RANSOMWARE_COMBAT_WITHOUT_CORROBORATION);
-
-/// Whether [`TriggerType::RansomwareEncryption`] reaches COMBAT without
-/// corroboration now (lab PR 236: the signed per-rule policy's directive).
-pub fn ransomware_combat_without_corroboration() -> bool {
-    RANSOMWARE_DECISIVE.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Set by the agent when it puts a per-rule policy in force (lab PR 236).
-pub fn set_ransomware_combat_without_corroboration(on: bool) {
-    RANSOMWARE_DECISIVE.store(on, core::sync::atomic::Ordering::Relaxed);
-}
 
 /// How much trust a [`TriggerType`] carries when it targets COMBAT.
 ///
@@ -274,16 +264,16 @@ impl TriggerType {
     /// Trust class for COMBAT-targeting triggers (BUG-032). Only
     /// [`Confidence::Decisive`] escalates straight to COMBAT; every
     /// heuristic pattern is [`Confidence::NeedsCorroboration`].
-    /// [`TriggerType::RansomwareEncryption`] is decisive only with
-    /// [`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`] (off by default; lab PR
-    /// 236: [`ransomware_combat_without_corroboration`], the signed
-    /// per-rule policy's value).
-    pub fn confidence(&self) -> Confidence {
+    /// [`TriggerType::RansomwareEncryption`] is decisive only when
+    /// `ransomware_combat_without_corroboration` is on — the asking posture
+    /// machine's value (lab PR 249; [`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`],
+    /// off, by default; lab PR 236: the signed per-rule policy's directive).
+    pub fn confidence(&self, ransomware_combat_without_corroboration: bool) -> Confidence {
         match self {
             TriggerType::AntiTamperDenial | TriggerType::ControlSurfaceTamper => {
                 Confidence::Decisive
             }
-            TriggerType::RansomwareEncryption if ransomware_combat_without_corroboration() => {
+            TriggerType::RansomwareEncryption if ransomware_combat_without_corroboration => {
                 Confidence::Decisive
             }
             _ => Confidence::NeedsCorroboration,
@@ -388,7 +378,10 @@ mod tests {
     fn telemetry_loss_targets_alerted_in_its_own_class() {
         let t = TriggerType::TelemetryLoss;
         assert_eq!(t.target_level(), PostureKind::Alerted);
-        assert_eq!(t.confidence(), Confidence::NeedsCorroboration);
+        assert_eq!(
+            t.confidence(RANSOMWARE_COMBAT_WITHOUT_CORROBORATION),
+            Confidence::NeedsCorroboration
+        );
         assert_eq!(t.evidence_class(), EvidenceClass::Telemetry);
         assert_eq!(t.as_str(), "TelemetryLoss");
     }
@@ -416,7 +409,10 @@ mod tests {
     fn control_surface_tamper_is_decisive_anti_tamper_evidence() {
         let t = TriggerType::ControlSurfaceTamper;
         assert_eq!(t.target_level(), PostureKind::Combat);
-        assert_eq!(t.confidence(), Confidence::Decisive);
+        assert_eq!(
+            t.confidence(RANSOMWARE_COMBAT_WITHOUT_CORROBORATION),
+            Confidence::Decisive
+        );
         assert_eq!(t.evidence_class(), EvidenceClass::Kernel);
         assert!(t.is_corroboration());
         assert_eq!(t.as_str(), "ControlSurfaceTamper");
@@ -434,7 +430,10 @@ mod tests {
     fn exploit_postcondition_is_kernel_evidence_needing_corroboration() {
         let t = TriggerType::ExploitPostcondition;
         assert_eq!(t.target_level(), PostureKind::Combat);
-        assert_eq!(t.confidence(), Confidence::NeedsCorroboration);
+        assert_eq!(
+            t.confidence(RANSOMWARE_COMBAT_WITHOUT_CORROBORATION),
+            Confidence::NeedsCorroboration
+        );
         assert_eq!(t.evidence_class(), EvidenceClass::Kernel);
         assert!(t.is_corroboration());
         assert_eq!(t.as_str(), "ExploitPostcondition");
@@ -451,15 +450,30 @@ mod tests {
         let r = TriggerType::RansomwareEncryption;
         assert_eq!(r.target_level(), PostureKind::Combat);
         const { assert!(!RANSOMWARE_COMBAT_WITHOUT_CORROBORATION) };
-        assert_eq!(r.confidence(), Confidence::NeedsCorroboration);
+        assert_eq!(
+            r.confidence(RANSOMWARE_COMBAT_WITHOUT_CORROBORATION),
+            Confidence::NeedsCorroboration
+        );
         // Lab PR 236: the signed policy's directive makes it decisive,
-        // still never locking; back off, it needs corroboration again.
-        assert!(!ransomware_combat_without_corroboration());
-        set_ransomware_combat_without_corroboration(true);
-        assert_eq!(r.confidence(), Confidence::Decisive);
+        // still never locking; off, it needs corroboration again. Lab PR
+        // 249: the directive is the asking machine's, not the process's.
+        assert_eq!(r.confidence(true), Confidence::Decisive);
         assert!(!r.locks_combat());
-        set_ransomware_combat_without_corroboration(false);
-        assert_eq!(r.confidence(), Confidence::NeedsCorroboration);
+        assert_eq!(r.confidence(false), Confidence::NeedsCorroboration);
+        // Only the ransomware trigger reads it.
+        for t in [
+            TriggerType::ConfirmedIntrusion,
+            TriggerType::ExploitPostcondition,
+            TriggerType::PersistenceMechanism,
+        ] {
+            assert_eq!(t.confidence(true), Confidence::NeedsCorroboration, "{t:?}");
+        }
+        for t in [
+            TriggerType::AntiTamperDenial,
+            TriggerType::ControlSurfaceTamper,
+        ] {
+            assert_eq!(t.confidence(false), Confidence::Decisive, "{t:?}");
+        }
         assert_eq!(r.evidence_class(), EvidenceClass::FileSystem);
         assert!(!r.locks_combat());
         assert!(r.is_corroboration());

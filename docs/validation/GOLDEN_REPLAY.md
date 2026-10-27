@@ -245,6 +245,7 @@ every 5 s, on the events' clock, in that order when they fall together.
 | the signed rows | the real `AuditEvidence` over a real `AuditLog` in the replay's directory, the trusted-installer window's close rows in the same log; lab PR 249: the log opened with a fixed key, the replay's wall clock (`nn_evidence::clock::Clock`) and the replayed agent's pid (`AuditStamps`), so every row is the same bytes in every replay |
 | the administrator | a fixed Ed25519 key (`unlock,trusted-installer`) in an `admin.pub` of the replay's own; agent id `golden-posture-1` |
 | the agent | pid 4,200,000, exempt from the posture as `main.rs` exempts its own, and the `client_pid` of the rows it signs |
+| the switches | lab PR 249: the machine's own — the ransomware directive of a per-rule policy handle of its own (`PostureMachine::with_rule_policy`; the case's `rule_policy` lines, parsed as `rule-policy.local` is, or the built-in defaults), the mass-write mode at the default (tracepoint) |
 
 Not replayed, said so: the rule engine (§1–§5 replay it), the ladder's
 worker thread (the steps run in the caller, in the order the worker runs
@@ -258,9 +259,10 @@ iptables): its privileged tests cover it (`a_tree_kill_freezes_the_root…`,
 
 The first line names the format (`northnarrow-posture-golden/1`), the case,
 what it is about, detect-only, the posture's settings (the ransomware
-directive and the mass-write mode in force, the corroboration window, the
-quiet window of an unlocked COMBAT, the two decays), the ladder's
-(`LadderConfig::default()`, the inline runner) and the heartbeats. Then one
+directive and the mass-write mode of the case's machine, the corroboration
+window, the quiet window of an unlocked COMBAT, the two decays), the
+ladder's (`LadderConfig::default()`, the inline runner) and the
+heartbeats. Then one
 line per item (`item`, its index in the case) and one per heartbeat that
 changed something (`tick`: `installer window`, `posture decay`, `ladder`),
 each with `seq`, `at_ms` (the events' clock) and:
@@ -301,6 +303,7 @@ each with `seq`, `at_ms` (the events' clock) and:
 |---|---|---|
 | `ransomware-corroborated-combat` | a login session's `nc`, then an unpackaged program of the same session renaming 20 files to `.locked` over ciphertext, connecting out; then quiet | OBSERVING → ENGAGED (ExploitAttempt) → COMBAT (RansomwareEncryption, corroborated by the session's execution evidence; unlocked); INVESTIGATE, the exfiltration jump-ahead, NEUTRALIZE of the tree through the kill cgroup, contained; the unlocked COMBAT decays to ENGAGED and the ladder stands down |
 | `ransomware-alone-engaged` | the same encryption with nothing before it; another user's `nc`; a second burst | RansomwareEncryption alone stops at ENGAGED (`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION` off); another session's signal does not vouch, nor the actor's own file-system evidence |
+| `ransomware-alone-combat-policy` | the same encryption alone, on a machine whose per-rule policy says `combat-without-corroboration NN-L-IMP-001` (lab PR 249) | RansomwareEncryption decisive: OBSERVING → COMBAT with nothing in its scope before, unlocked (the trigger never locks); INVESTIGATE, NEUTRALIZE of the tree through the kill cgroup, contained; the unlocked COMBAT decays to ENGAGED; replayed beside the other cases, whose machines keep the defaults |
 | `eva-installer-window` | a root unit's script with a signed 300 s grant stops the agent's unit, then auditd; the window ends; the agent's unit again; a systemd unit dropped | the own-unit stop sanctioned by the window (its key and end named), no transition; auditd's stop DefenseImpairment (ENGAGED) inside the window; the window's signed close; the unit drop corroborated by DefenseImpairment: COMBAT locked; NEUTRALIZE at the deadline, the system binary not quarantined |
 | `combat-forking-tree` | a web worker's `/tmp` payload with a child, two grandchildren (forks), a write to the agent's state refused, another child | StagingExec (ENGAGED), AntiTamperDenial (COMBAT locked); the spread jump-ahead; the tree frozen and killed in its cgroup, the attributed child reported gone, the binary quarantined once; the signed unlock (ALERTED); ALERTED decays to OBSERVING |
 | `combat-stale-capture` | no `nft`; a `/dev/shm` payload refused a write; it exits and logrotate takes its pid | the failed soft block signed, INVESTIGATE shortened to 10 s; NEUTRALIZE finds the capture stale: gone, the pid's new holder untouched, nothing to quarantine |
@@ -316,7 +319,12 @@ the cases: COMBAT by RansomwareEncryption and ENGAGED by it, ENGAGED by
 DefenseImpairment, an own-unit stop sanctioned by the window with no
 transition, a tree killed through its cgroup, an offender gone before
 NEUTRALIZE, a stale capture, a signed unlock leaving COMBAT, a decay to
-OBSERVING, a detect-only NEUTRALIZE and no kill in detect-only.
+OBSERVING, a detect-only NEUTRALIZE and no kill in detect-only, and (lab PR
+249) ransomware alone to COMBAT — decisive, nothing in its scope before —
+only on a machine under `combat-without-corroboration`.
+`a_case_s_rule_policy_is_its_machine_s_own` replays that case and
+`ransomware-alone-engaged` at once on six threads: each gives its own
+bytes.
 
 The replay showed that the signed `combat_stage` rows of a COMBAT the
 posture reached carried `"trigger": null`, and that its INVESTIGATE row
@@ -340,7 +348,8 @@ Lab PR 249 moved the six files that hold signed rows, and only their 25
 rows' named fields: `@TS@`, `#n`, `#n-1`/`genesis`, `@SIG@` and
 `@AGENT_PID@` became the values written — each `ts` the time of its line on
 the replay's wall clock, each `prev_hash` the row before's `entry_hash`,
-every `client_pid` 4,200,000. No other byte of a golden file moved.
+every `client_pid` 4,200,000. No other byte of a golden file moved; the new
+case `ransomware-alone-combat-policy` has a file of its own.
 
 ### 6.4 Determinism
 
@@ -359,13 +368,12 @@ bytes in another process. What could break it, and how it is held:
   named, not printed (`@PROC@`, `@ROOT@`); the challenge nonce of a signed
   request is the OS's random, and only the verification's outcome and the
   key's fingerprint are printed;
-- process-wide switches: `RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`'s
-  runtime value (set by the signed per-rule policy) and the kernel
-  mass-write mode (`triggers::set_kernel_mass_write`, set by `main.rs` when
-  the LSM file-open sensor is armed) are read at their defaults, printed in
-  the header; a case cannot change them without racing every other test —
-  a case under `combat-without-corroboration NN-L-IMP-001` needs the
-  directive to become the machine's own;
+- the posture's switches (lab PR 249): the ransomware directive of the
+  per-rule policy and the kernel mass-write mode are fields of the machine
+  (`PostureMachine::with_rule_policy`, `set_kernel_mass_write`), no longer
+  process-wide (`posture_types::set_ransomware_combat_without_corroboration`,
+  `triggers::set_kernel_mass_write`, removed): a case sets the directive on
+  its own machine (`rule_policy`) and replays beside every other case;
 - the lineage runs with the live checks off (`AuthSessionTracker::new`, as
   §1): `for_host` compares a cached exec with `/proc`'s start using the
   host's suspended time;
@@ -383,5 +391,6 @@ request says why each transition, step or row moved. A case is a
 `cases/<case>.json` with `about`, `path`, the optional `stages`, `signed`,
 `detect_only`, `start_ns` (the clock's start), `procs` (`pid`, `ppid`,
 `start_ns`, `uid`, `comm`, `exe`, `argv`, `loginuid`, `cgroup`, `tty`,
-`stuck`, `deleted`), `files`, `entropy`, `isolation`, `release`, and
+`stuck`, `deleted`), `files`, `entropy`, `isolation`, `release`,
+`rule_policy` (lab PR 249: the lines of the case's per-rule policy), and
 `items`. Pids are above `PID_MAX_LIMIT`, like §3's.

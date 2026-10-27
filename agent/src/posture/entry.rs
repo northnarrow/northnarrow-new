@@ -190,7 +190,8 @@ mod tests {
             trigger,
             raised: vec![trigger],
             class: trigger.evidence_class(),
-            confidence: trigger.confidence(),
+            confidence: trigger
+                .confidence(nn_model::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION),
             corroborated_by: Vec::new(),
             locked: true,
             scope: "login uid 1000".to_string(),

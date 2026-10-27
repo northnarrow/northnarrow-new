@@ -63,6 +63,7 @@ use nn_model::posture_types::{
 use nn_model::Event;
 
 use crate::anti_tamper::network_isolate::UnlockToken;
+use crate::decision::rule_policy::PolicyHandle;
 use clock::Clock;
 use corroboration::CorroborationLedger;
 use escalation_allow::EscalationAllowList;
@@ -159,6 +160,13 @@ struct Inner {
     /// Lab PR 243: where the machine reads the time — the host's clocks
     /// ([`clock::SystemClock`]), or a replay's ([`PostureMachine::with_clock`]).
     clock: Arc<dyn Clock>,
+    /// Lab PR 249: the per-rule policy this machine reads its ransomware
+    /// directive from (`combat-without-corroboration NN-L-IMP-001`, lab PR
+    /// 236) — production: the agent's `rule_policy::global()`, the handle
+    /// the engine reads and `nn-admin policy set` swaps
+    /// ([`PostureMachine::with_rule_policy`]); the built-in defaults
+    /// otherwise. It was a process-wide switch.
+    rule_policy: PolicyHandle,
 }
 
 impl PostureMachine {
@@ -322,6 +330,7 @@ impl PostureMachine {
                 last_admin_action: Mutex::new(None),
                 combat_decay_hook: std::sync::OnceLock::new(),
                 clock: Arc::new(clock::SystemClock),
+                rule_policy: PolicyHandle::default(),
             }),
         }
     }
@@ -336,6 +345,47 @@ impl PostureMachine {
             None => tracing::warn!("posture clock set after the machine was shared — ignored"),
         }
         self
+    }
+
+    /// Lab PR 249: read the ransomware directive of the per-rule policy
+    /// `handle` holds — production: the agent's `rule_policy::global()`,
+    /// so a policy `nn-admin policy set` puts in force reaches the posture
+    /// at its next event, as it reaches the engine. Without it the machine
+    /// reads the built-in defaults (off). Call before the machine is
+    /// shared (cloned); a later call is ignored, said so.
+    pub fn with_rule_policy(mut self, handle: PolicyHandle) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.rule_policy = handle,
+            None => {
+                tracing::warn!("posture rule policy set after the machine was shared — ignored")
+            }
+        }
+        self
+    }
+
+    /// Whether RansomwareEncryption reaches COMBAT without corroboration on
+    /// this machine now: the directive of the policy it reads (lab PR 236,
+    /// 249).
+    pub fn ransomware_combat_without_corroboration(&self) -> bool {
+        self.inner
+            .rule_policy
+            .current()
+            .ransomware_combat_without_corroboration
+    }
+
+    /// Tappa 10.9 step 1, lab PR 249: switch this machine's mass-write arm
+    /// to the kernel count — set by `main.rs` once the LSM file-open sensor
+    /// is armed (`MassWrite` events, carve-outs applied in the kernel) —
+    /// or back to the userland count of `FileOpen` (tracepoint mode, the
+    /// default). It was a process-wide switch.
+    pub fn set_kernel_mass_write(&self, on: bool) {
+        self.inner.triggers.set_kernel_mass_write(on);
+    }
+
+    /// Whether the mass-write arm reads the kernel count
+    /// ([`Self::set_kernel_mass_write`]).
+    pub fn kernel_mass_write(&self) -> bool {
+        self.inner.triggers.kernel_mass_write()
     }
 
     /// The monotonic now of the machine's clock.
@@ -408,6 +458,10 @@ impl PostureMachine {
         if hits.is_empty() {
             return None;
         }
+        // Lab PR 249: the ransomware directive in force for this machine,
+        // read once for the round (it was a process-wide switch, read at
+        // each confidence).
+        let ransomware_decisive = self.ransomware_combat_without_corroboration();
         // Review `posture-ledger-scope-1`: corroboration is per actor
         // scope; a weak signal from one user, service or container never
         // vouches for a blunt signal from another (external audit POS-005:
@@ -460,7 +514,7 @@ impl PostureMachine {
             .copied()
             .map(|t| {
                 let level = if t.target_level() == PostureKind::Combat
-                    && t.confidence() == Confidence::NeedsCorroboration
+                    && t.confidence(ransomware_decisive) == Confidence::NeedsCorroboration
                 {
                     if ledger.corroborated_as(t, triggers::evidence_class(t, event), &scope) {
                         PostureKind::Combat
@@ -503,7 +557,7 @@ impl PostureMachine {
         // ledger the decision read — before this round's signals are
         // recorded (audit `posture-1`: they never corroborate each other).
         let corroborated_by = match combat_by {
-            Some(t) if t.confidence() == Confidence::NeedsCorroboration => {
+            Some(t) if t.confidence(ransomware_decisive) == Confidence::NeedsCorroboration => {
                 ledger.corroborating(t, triggers::evidence_class(t, event), &scope)
             }
             _ => Vec::new(),
@@ -548,7 +602,7 @@ impl PostureMachine {
                     trigger: t,
                     raised: hits.clone(),
                     class: triggers::evidence_class(t, event),
-                    confidence: t.confidence(),
+                    confidence: t.confidence(ransomware_decisive),
                     corroborated_by,
                     locked: matches!(current, PostureState::Combat { locked: true, .. }),
                     scope: scope.to_string(),
