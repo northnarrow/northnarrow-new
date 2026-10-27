@@ -37,15 +37,15 @@
 //! Ed25519-signed command path.
 
 pub mod clock;
-pub mod corroboration;
 pub mod entry;
 pub mod escalation_allow;
 pub mod exempt;
 pub mod lineage;
 pub mod mass_write_overlay;
-pub mod state;
-pub mod transitions;
 pub mod triggers;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the ledger, the
+/// state and the transitions are nn-core's.
+pub use nn_core::posture::{corroboration, state, transitions};
 
 #[cfg(test)]
 mod golden;

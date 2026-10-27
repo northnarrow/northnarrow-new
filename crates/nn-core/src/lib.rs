@@ -26,6 +26,18 @@ pub mod correlation;
 /// PR 250; was the agent's `detection_budget`, without its reporter task).
 pub mod detection_budget;
 
+/// The adaptive defensive posture (R08a, lab PR 250; was the agent's
+/// `posture`).
+pub mod posture {
+    /// The corroboration ledger: the escalation signals of each actor's
+    /// scope, recent enough to vouch for a blunt heuristic.
+    pub mod corroboration;
+    /// The live state, with its monotonic timestamps.
+    pub mod state;
+    /// The transitions: a trigger's level, the decay.
+    pub mod transitions;
+}
+
 /// Configuration content (R07, lab PR 247): the generic `.v1` + `.local`
 /// list loader and what the loaders take from the signed-overlay gate (was
 /// the agent's `config::overlay` and part of its `config::overlay_auth`).

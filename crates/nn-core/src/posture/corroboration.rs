@@ -525,8 +525,8 @@ impl CorroborationLedger {
     /// class, privileged, placed — in an order a reader can compare (the
     /// order of a scope's entries carries nothing). Reads only: the ledger
     /// is pruned where it always was.
-    #[cfg(test)]
-    pub(crate) fn signals_of(
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn signals_of(
         &self,
         scope: &Scope,
         now: Instant,

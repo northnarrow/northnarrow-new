@@ -34,6 +34,14 @@ base64 = "0.23"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = { workspace = true }
 
+[features]
+# R08a (lab PR 250): the helpers this crate keeps for tests — its own, and
+# the agent's tests and replays of the posture that wire the agent's rules
+# (the agent enables it as a dev-dependency only). Nothing that changes a
+# decision: readers and builders. The posture's own test-only doors (the
+# legacy boolean release) stay `cfg(test)`.
+test-util = []
+
 [dev-dependencies]
 tempfile = "3"
 
