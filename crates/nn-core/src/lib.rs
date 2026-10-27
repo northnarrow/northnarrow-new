@@ -35,9 +35,15 @@ pub mod posture {
     /// The operator's escalation allowlist: process × destination tuples
     /// the exfiltration and lateral-movement counts leave out.
     pub mod escalation_allow;
+    /// The NorthNarrow stack's own PIDs (the agent, the verified watchdog),
+    /// whose events raise no trigger.
+    pub mod exempt;
     /// What the posture reads from its host: the process table, the host's
     /// files, the clocks.
     pub mod host;
+    /// What the kernel executed for a process and its ancestors: the
+    /// authenticated sessions, the package transactions, the workloads.
+    pub mod lineage;
     /// The operator's carve-out of the mass-write arm.
     pub mod mass_write_overlay;
     /// The live state, with its monotonic timestamps.
@@ -63,6 +69,11 @@ pub mod canary {
     /// The five credential families' decoys, rendered from a seed.
     pub mod templates;
 }
+
+// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the path the
+// moved lineage names, so it compiles as it was in the agent.
+/// `crate::path_text::…`, the open sensor's path text (nn-model's).
+use nn_model::path_text;
 
 /// FIM content (R07, lab PR 247): the watched paths (was the agent's
 /// `fim::paths_config`).

@@ -368,11 +368,13 @@ planned = false
 # 250 (R08a): 52 → 51, nn-core 38 → 37: the detection budget's reporter
 # task (the detection sink) left it for `detection_report`; the posture's
 # seam — the lineage and the stack exemption name the agent's Linux host
-# where they called `std::fs` and libc, which the scan does not see (→ 39).
+# where they called `std::fs` and libc, which the scan does not see (→ 39);
+# they moved, the machine's `posture/mod.rs`, which binds them to that host,
+# names it (→ 38).
 
 [ratchet]
 nn-admin = 8
-nn-core = 39
+nn-core = 38
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

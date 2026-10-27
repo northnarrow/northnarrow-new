@@ -62,15 +62,13 @@
 //! at exec time.
 
 use std::collections::{HashMap, VecDeque};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nn_core::posture::host::PostureHost;
 use parking_lot::RwLock;
 
-/// R08a (lab PR 250): the host the lineage reads through, the agent's, until
-/// the lineage moves to nn-core and takes it as a type parameter.
-use crate::chain_host_linux::LinuxHost as H;
+use super::host::PostureHost;
 
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
@@ -229,7 +227,7 @@ pub const SYSTEM_DAEMON_EXES: &[&str] = &[
 
 /// External audit NN-AUD-284 (FIMR-010): the package managers proper —
 /// [`SYSTEM_DAEMON_EXES`] without `mandb`. The FIM rules' package carve-out
-/// ([`crate::fim::rules::PackageManaged`]) and the drain's rate limiter
+/// (the agent's `fim::rules::PackageManaged`) and the drain's rate limiter
 /// trust these, through [`AuthSessionTracker::is_package_transaction_write`].
 /// `mandb` is not set-id (man-db's default), so any user runs it, with
 /// `LD_PRELOAD`, and has it fork whatever it likes: as a lineage root for
@@ -485,7 +483,7 @@ const COMM_LEN_MAX: usize = 15;
 /// Review 85: `path` lies in a root-owned system tree, which a process
 /// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
 /// memfd, and not a binary deleted or replaced while it runs.
-pub(crate) fn in_system_tree(path: &str) -> bool {
+pub fn in_system_tree(path: &str) -> bool {
     const TREES: &[&str] = &[
         "/usr/",
         "/opt/",
@@ -707,12 +705,16 @@ struct Inner {
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
 /// so both the per-event trigger detector and (future) background
 /// pruning tasks can hold one without further plumbing.
+///
+/// R08a (lab PR 250): `H` is the host it reads — the process table, the
+/// host's files, the clocks ([`PostureHost`]; the agent's is `LinuxHost`).
 #[derive(Clone, Debug)]
-pub struct AuthSessionTracker {
+pub struct AuthSessionTracker<H: PostureHost> {
     inner: Arc<Inner>,
+    host: PhantomData<fn() -> H>,
 }
 
-impl AuthSessionTracker {
+impl<H: PostureHost> AuthSessionTracker<H> {
     /// Construct a tracker reading `/proc` from `proc_root`. The
     /// indirection is the test seam: production uses
     /// [`Self::with_proc`]; unit tests point at a fixture tree.
@@ -737,6 +739,7 @@ impl AuthSessionTracker {
                 suspended_ns: None,
                 host_root: PathBuf::from(H::HOST_ROOT),
             }),
+            host: PhantomData,
         }
     }
 
@@ -756,8 +759,8 @@ impl AuthSessionTracker {
     }
 
     /// Tests: `/etc` and the container storage read under `root`.
-    #[cfg(test)]
-    pub(crate) fn with_host_root(mut self, root: &Path) -> Self {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_host_root(mut self, root: &Path) -> Self {
         Arc::get_mut(&mut self.inner)
             .expect("an unshared tracker")
             .host_root = root.to_path_buf();
@@ -925,8 +928,8 @@ impl AuthSessionTracker {
     /// [`Self::in_package_transaction`] (and the mass-write arm
     /// [`Self::is_system_man_cache_writer`]); this stays for the tests of
     /// the walk.
-    #[cfg(test)]
-    pub(crate) fn is_system_daemon_mediated(&self, pid: u32) -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn is_system_daemon_mediated(&self, pid: u32) -> bool {
         self.lineage_exe_matches(pid, is_system_daemon_binary)
     }
 
@@ -1941,7 +1944,7 @@ impl AuthSessionTracker {
     }
 }
 
-impl Default for AuthSessionTracker {
+impl<H: PostureHost> Default for AuthSessionTracker<H> {
     fn default() -> Self {
         Self::with_proc()
     }
@@ -1996,7 +1999,7 @@ fn is_node_exe(exe: &Path) -> bool {
 
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
 /// what they run is named by their arguments, not by their exe.
-pub(crate) fn is_interpreter(exe: &Path) -> bool {
+pub fn is_interpreter(exe: &Path) -> bool {
     let base = exe
         .file_name()
         .map(|b| b.to_string_lossy())
@@ -2089,8 +2092,12 @@ fn parse_real_uid(status_text: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    use crate::posture::host::testing::{symlink, TestHost as H, TEST_OWNER};
+
+    /// R08a (lab PR 250): the tracker on the portable test host.
+    type AuthSessionTracker = super::AuthSessionTracker<H>;
 
     fn write_status(dir: &Path, pid: u32, ppid: u32) {
         let pid_dir = dir.join(pid.to_string());
@@ -2355,7 +2362,7 @@ mod tests {
     #[test]
     fn a_users_container_storage_is_told_by_ownership() {
         let host = TempDir::new().unwrap();
-        let me = unsafe { libc::getuid() };
+        let me = TEST_OWNER;
         for d in [
             "home/nn/.local/share/containers/storage",
             "home/nn/.local/share/lxc/c1",
@@ -2433,7 +2440,7 @@ mod tests {
     fn a_users_package_manager_writes_its_container_storage_only() {
         let host = TempDir::new().unwrap();
         let procs = TempDir::new().unwrap();
-        let me = unsafe { libc::getuid() };
+        let me = TEST_OWNER;
         fs::create_dir_all(host.path().join("home/nn/.local/share/containers/storage")).unwrap();
         let t = AuthSessionTracker::new(procs.path()).with_host_root(host.path());
         let storage = "/home/nn/.local/share/containers/storage/overlay/0a1b/diff/usr/lib/x";

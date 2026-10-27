@@ -72,3 +72,89 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     /// kernel's event timestamps.
     fn monotonic_ns() -> u64;
 }
+
+/// The posture's own tests: a portable host. Its files are the machine's
+/// (`std::fs`: a fixture directory stands for the process table, or the
+/// test's own `/proc`); a directory is owned by [`testing::TEST_OWNER`];
+/// it is never suspended, its clock ticks 100 times a second, and its
+/// monotonic clock reads an hour of uptime when the tests begin. What is
+/// Linux about the agent's host (`lstat`'s owner, the kernel's clocks) is
+/// tested with that host, in the agent (`posture_host_linux`).
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::LazyLock;
+    use std::time::Instant;
+
+    use super::PostureHost;
+
+    /// The owner of every directory on the test host: the fixtures' user,
+    /// not root (a package manager a user runs is not root's transaction).
+    pub(crate) const TEST_OWNER: u32 = 1000;
+
+    /// The host's uptime when the tests begin: an hour.
+    const UPTIME_AT_START_NS: u64 = 3_600 * 1_000_000_000;
+
+    /// When the tests began.
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+    /// Plain `std`, every directory [`TEST_OWNER`]'s, the clocks above.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub(crate) struct TestHost;
+
+    impl PostureHost for TestHost {
+        const PROC_ROOT: &'static str = "/proc";
+
+        const HOST_ROOT: &'static str = "/";
+
+        fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
+            std::fs::read_to_string(path)
+        }
+
+        fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+
+        fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+            std::fs::read_link(path)
+        }
+
+        fn is_dir(path: &Path) -> bool {
+            path.is_dir()
+        }
+
+        fn exists(path: &Path) -> bool {
+            path.exists()
+        }
+
+        fn dir_owner<P: AsRef<Path>>(path: P) -> Option<u32> {
+            std::fs::symlink_metadata(path)
+                .ok()
+                .filter(|m| m.is_dir())
+                .map(|_| TEST_OWNER)
+        }
+
+        fn suspended_ns() -> u64 {
+            0
+        }
+
+        fn clock_tick_ns() -> u64 {
+            10_000_000
+        }
+
+        fn monotonic_ns() -> u64 {
+            UPTIME_AT_START_NS + START.elapsed().as_nanos() as u64
+        }
+    }
+
+    /// A symbolic link at `link` to `target`, as the fixtures of the process
+    /// table need one (`exe`, `ns/mnt`): `std::fs::soft_link`, the spelling
+    /// of `symlink(2)` that builds on every target — deprecated because
+    /// Windows has two kinds of link; these fixtures are a Linux process
+    /// table, read back with `std::fs::read_link`.
+    #[allow(deprecated)]
+    pub(crate) fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(target: P, link: Q) -> io::Result<()> {
+        std::fs::soft_link(target, link)
+    }
+}

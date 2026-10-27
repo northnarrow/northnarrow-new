@@ -38,14 +38,51 @@
 
 pub mod clock;
 pub mod entry;
-pub mod exempt;
-pub mod lineage;
 pub mod triggers;
 /// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the ledger, the
 /// state, the transitions and the operator's two overlays are nn-core's.
 pub use nn_core::posture::{
     corroboration, escalation_allow, mass_write_overlay, state, transitions,
 };
+
+/// R08a shim (lab PR 250): the lineage is nn-core's; the agent's tracker
+/// reads the Linux host.
+pub mod lineage {
+    pub use nn_core::posture::lineage::*;
+
+    /// [`nn_core::posture::lineage::AuthSessionTracker`] on the agent's host.
+    pub type AuthSessionTracker =
+        nn_core::posture::lineage::AuthSessionTracker<crate::chain_host_linux::LinuxHost>;
+}
+
+/// R08a shim (lab PR 250): the stack exemption is nn-core's; the agent's
+/// reads the Linux host, and so do its two watchdog lookups, under their
+/// names and signatures.
+pub mod exempt {
+    use std::path::{Path, PathBuf};
+
+    use crate::chain_host_linux::LinuxHost;
+
+    pub use nn_core::posture::exempt::*;
+
+    /// [`nn_core::posture::exempt::ExemptPids`] on the agent's host.
+    pub type ExemptPids = nn_core::posture::exempt::ExemptPids<LinuxHost>;
+
+    /// [`nn_core::posture::exempt::sibling_watchdog_exe`] on the agent's
+    /// host.
+    pub fn sibling_watchdog_exe(own_exe: Option<&Path>) -> PathBuf {
+        nn_core::posture::exempt::sibling_watchdog_exe::<LinuxHost>(own_exe)
+    }
+
+    /// [`nn_core::posture::exempt::resolve_verified_watchdog_pid`] on the
+    /// agent's host.
+    pub fn resolve_verified_watchdog_pid(
+        pidfile: &Path,
+        expected_exe: &Path,
+    ) -> WatchdogResolution {
+        nn_core::posture::exempt::resolve_verified_watchdog_pid::<LinuxHost>(pidfile, expected_exe)
+    }
+}
 
 #[cfg(test)]
 mod golden;
