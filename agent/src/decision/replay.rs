@@ -100,11 +100,11 @@ pub fn engine(host: HostParts<'_>) -> RuleEngine {
     };
     RuleEngine::with_default_rules_and_net(
         Arc::new(
-            NetBlocklist::load(&file("netflow-blocklist.v1"), &Verified::Missing)
+            NetBlocklist::load::<H>(&file("netflow-blocklist.v1"), &Verified::Missing)
                 .unwrap_or_default(),
         ),
         Arc::new(
-            Ja3Blocklist::load(&file("netflow-ja3-blocklist.v1"), &Verified::Missing)
+            Ja3Blocklist::load::<H>(&file("netflow-ja3-blocklist.v1"), &Verified::Missing)
                 .unwrap_or_default(),
         ),
         Arc::new(Mutex::new(super::rules::net::DnsBurstWindow::new())),

@@ -34,6 +34,7 @@ use northnarrow_agent::anti_tamper::btf_revalidate::{
 };
 use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
 use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
+use northnarrow_agent::chain_host_linux::LinuxHost;
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::detection_budget::{self, Admit};
@@ -2447,7 +2448,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // `.v1` that cannot be read gives way to the copy built into the agent,
     // recorded.
     let netflow_blocklist = Arc::new(
-        NetBlocklist::load(
+        NetBlocklist::load::<LinuxHost>(
             &cli.netflow_blocklist_v1,
             &overlay_gate.verified(OverlayKind::NetflowBlocklist, &cli.netflow_blocklist_local),
         )
@@ -2519,7 +2520,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }
     }
     let ja3_blocklist = Arc::new(
-        Ja3Blocklist::load(
+        Ja3Blocklist::load::<LinuxHost>(
             &cli.netflow_ja3_blocklist_v1,
             &overlay_gate.verified(
                 OverlayKind::NetflowJa3Blocklist,

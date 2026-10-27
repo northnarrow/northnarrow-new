@@ -16,7 +16,10 @@
 //! [`NetListenerEvent`]: nn_model::telemetry::NetListenerEvent
 
 pub mod blind_spots;
-pub mod blocklist;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the operator's
+/// blocklists are nn-core's, with the rules that read them; their loaders
+/// take the host that reads a `.v1` (the agent's `LinuxHost`).
+pub use nn_core::net::blocklist;
 pub mod dns_cache;
 pub mod drain;
 pub mod flow_tracker;
