@@ -162,8 +162,9 @@ pub struct NetworkIsolator {
     ip6tables_bin: Bin,
     /// External audit ATP-001 / DEP-003: who vouches for the three files
     /// COMBAT reads ([`Self::trusted_source`]). `None` (tests, tools):
-    /// the files are trusted as they are.
-    gate: Option<std::sync::Arc<crate::config::overlay_auth::OverlayGate>>,
+    /// the files are trusted as they are. R09a (lab PR 253): the agent's
+    /// signed-overlay gate, through nn-core's `Vouch`.
+    gate: Option<std::sync::Arc<dyn nn_core::config::overlay_auth::Vouch>>,
     /// Lab PR 217: how long each iptables / ip6tables invocation may take
     /// ([`EXTERNAL_CMD_TIMEOUT`]).
     cmd_timeout: std::time::Duration,
@@ -272,10 +273,12 @@ impl NetworkIsolator {
     }
 
     /// External audit ATP-001 / DEP-003: vouch for the COMBAT files with
-    /// the signed-overlay gate ([`Self::trusted_source`]).
-    pub fn with_overlay_gate(
+    /// the signed-overlay gate ([`Self::trusted_source`]). R09a (lab PR
+    /// 253): the gate is nn-core's [`Vouch`](nn_core::config::overlay_auth::Vouch),
+    /// the agent's `OverlayGate`.
+    pub fn with_overlay_gate<G: nn_core::config::overlay_auth::Vouch + 'static>(
         mut self,
-        gate: std::sync::Arc<crate::config::overlay_auth::OverlayGate>,
+        gate: std::sync::Arc<G>,
     ) -> Self {
         self.gate = Some(gate);
         self
@@ -302,7 +305,7 @@ impl NetworkIsolator {
         path: &std::path::Path,
         builtin: &'static str,
     ) -> String {
-        use crate::config::overlay_auth::Verified;
+        use nn_core::config::overlay_auth::Verified;
         let Some(gate) = &self.gate else {
             return match std::fs::read_to_string(path) {
                 Ok(t) => t,
