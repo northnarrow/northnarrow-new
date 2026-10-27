@@ -171,7 +171,7 @@ struct Inner<H: PostureAgent> {
     /// the engine reads and `nn-admin policy set` swaps
     /// ([`PostureMachine::with_rule_policy`]); the built-in defaults
     /// otherwise. It was a process-wide switch.
-    rule_policy: H::RulePolicy,
+    rule_policy: crate::decision::rule_policy::PolicyHandle,
 }
 
 impl<H: PostureAgent> PostureMachine<H> {
@@ -338,7 +338,7 @@ impl<H: PostureAgent> PostureMachine<H> {
                 last_admin_action: Mutex::new(None),
                 combat_decay_hook: std::sync::OnceLock::new(),
                 clock: Arc::new(clock::SystemClock),
-                rule_policy: H::RulePolicy::default(),
+                rule_policy: crate::decision::rule_policy::PolicyHandle::default(),
             }),
         }
     }
@@ -361,7 +361,7 @@ impl<H: PostureAgent> PostureMachine<H> {
     /// at its next event, as it reaches the engine. Without it the machine
     /// reads the built-in defaults (off). Call before the machine is
     /// shared (cloned); a later call is ignored, said so.
-    pub fn with_rule_policy(mut self, handle: H::RulePolicy) -> Self {
+    pub fn with_rule_policy(mut self, handle: crate::decision::rule_policy::PolicyHandle) -> Self {
         match Arc::get_mut(&mut self.inner) {
             Some(inner) => inner.rule_policy = handle,
             None => {
@@ -375,7 +375,10 @@ impl<H: PostureAgent> PostureMachine<H> {
     /// this machine now: the directive of the policy it reads (lab PR 236,
     /// 249).
     pub fn ransomware_combat_without_corroboration(&self) -> bool {
-        H::ransomware_combat_without_corroboration(&self.inner.rule_policy)
+        self.inner
+            .rule_policy
+            .current()
+            .ransomware_combat_without_corroboration
     }
 
     /// Tappa 10.9 step 1, lab PR 249: switch this machine's mass-write arm

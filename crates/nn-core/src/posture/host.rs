@@ -30,10 +30,7 @@ use std::fmt::Debug;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nn_model::telemetry::FimEvent;
 use nn_model::Event;
-
-use super::lineage::AuthSessionTracker;
 
 /// The host's reads and clocks the posture uses. A unit type: the posture's
 /// types hold it as a parameter only (hence `Copy`, `Default`, `Debug`).
@@ -84,37 +81,19 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
 
 /// What the posture's triggers and machine consult in the agent's other
 /// modules (R08a, lab PR 250), each until the lot that moves it below the
-/// posture: the rule engine's shapes the triggers share with its rules so
-/// that the two cannot drift apart (R08b moves the engine here), the
-/// engine's per-rule policy (R08b), the trusted-installer window
-/// (`anti_tamper`; R04b splits it), the ransomware tracker and the
-/// security-tool detector the rules share (`impact`, `impair`), and the
-/// capability a verified signed unlock mints (`anti_tamper`; R04b). The
-/// agent's `LinuxHost` implements it with the calls the posture made.
+/// posture: the trusted-installer window (`anti_tamper`; R04b splits it),
+/// the ransomware tracker and the security-tool detector the rules share,
+/// and the capability a verified signed unlock mints (`anti_tamper`; R04b).
+/// The agent's `LinuxHost` implements it with the calls the posture made.
+///
+/// R08b (lab PR 251): the rule engine is nn-core's, so the triggers call
+/// the shapes they share with its rules (NN-L-FIM-024's bait tamper,
+/// NN-L-EPG-001/002's event, R020's reverse shell, the staging directories)
+/// and the machine reads the engine's per-rule policy themselves; the trait
+/// lost that half. The tracker and the detector moved with the engine too
+/// but stay associated types here: they are generic over the decision
+/// host, which the posture's host is not.
 pub trait PostureAgent: PostureHost {
-    /// NN-L-FIM-024's match: a mutation of an anti-tamper bait file (the
-    /// control-surface trigger, lab PR 162).
-    fn is_bait_tamper(fe: &FimEvent) -> bool;
-
-    /// NN-L-EPG-001/002's event: the exploit guard's post-condition (lab PR
-    /// 219).
-    fn is_exploit_postcondition(event: &Event) -> bool;
-
-    /// R020's shape (lab PR 224): a shell or interpreter whose stdin or
-    /// stdout is the network, its parent placed through `lineage`.
-    fn is_reverse_shell(event: &Event, lineage: &AuthSessionTracker<Self>) -> bool;
-
-    /// `path` lies in a staging directory (the rules' list).
-    fn is_staging_path(path: &str) -> bool;
-
-    /// The per-rule policy a machine reads its ransomware directive from
-    /// (lab PR 249); its default is the built-in policy.
-    type RulePolicy: Clone + Default + Send + Sync + 'static;
-
-    /// `combat-without-corroboration NN-L-IMP-001` is in force in `policy`
-    /// now (lab PR 236).
-    fn ransomware_combat_without_corroboration(policy: &Self::RulePolicy) -> bool;
-
     /// The trusted-installer window (lab PR 162).
     type InstallerWindow: Send + Sync + 'static;
 
@@ -152,11 +131,9 @@ pub(crate) mod testing {
     use std::sync::LazyLock;
     use std::time::Instant;
 
-    use nn_model::telemetry::FimEvent;
     use nn_model::Event;
 
     use super::{PostureAgent, PostureHost};
-    use crate::posture::lineage::AuthSessionTracker;
 
     /// The owner of every directory on the test host: the fixtures' user,
     /// not root (a package manager a user runs is not root's transaction).
@@ -221,38 +198,11 @@ pub(crate) mod testing {
         }
     }
 
-    /// What the posture consults in the agent, as its tests need it while
-    /// the engine is the agent's (R08b): the staging directories and the
-    /// exploit guard's event as the rules read them (their list, their
-    /// match); no bait file and no reverse-shell shape (the tests of those
-    /// two wire the agent's rules: the agent's posture tests); the policy is
-    /// the ransomware directive itself, the window whether it is open; no
-    /// judge ever fires; the unlock capability is `()`.
+    /// What the posture consults in the agent, as its tests need it: the
+    /// window whether it is open; no judge ever fires; the unlock capability
+    /// is `()`. (R08b, lab PR 251: the engine's shapes and policy are read
+    /// from the engine itself, nn-core's.)
     impl PostureAgent for TestHost {
-        fn is_bait_tamper(_fe: &FimEvent) -> bool {
-            false
-        }
-
-        fn is_exploit_postcondition(event: &Event) -> bool {
-            matches!(event, Event::ExploitPostcondition { .. })
-        }
-
-        fn is_reverse_shell(_event: &Event, _lineage: &AuthSessionTracker<Self>) -> bool {
-            false
-        }
-
-        fn is_staging_path(path: &str) -> bool {
-            ["/tmp/", "/var/tmp/", "/dev/shm/"]
-                .iter()
-                .any(|p| path.starts_with(p))
-        }
-
-        type RulePolicy = bool;
-
-        fn ransomware_combat_without_corroboration(policy: &bool) -> bool {
-            *policy
-        }
-
         type InstallerWindow = bool;
 
         fn installer_window_open(window: &bool) -> bool {
