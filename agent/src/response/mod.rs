@@ -11,7 +11,10 @@
 
 pub mod block_outbound;
 pub mod caps_preflight;
-pub mod config;
+// R08c (lab PR 252): the executor's configuration and its policy (the
+// detect-only gate, the variables that switch it on) are nn-core's, here
+// under their path.
+pub use nn_core::response::config;
 pub mod containment;
 pub mod executor;
 pub mod file_caps;

@@ -330,7 +330,6 @@ planned = false
 "removed_settings" = "northnarrow-agent"
 # the actuators and the Executor; ExecutionOutcome/Report → nn-model (R04a)
 "response" = "nn-linux"
-"response::config" = "nn-core"
 "runtime" = "nn-linux"
 "sd_notify" = "nn-linux"
 "self_integrity" = "nn-linux"
@@ -397,6 +396,10 @@ planned = false
 "config::comm_allowlist" = "nn-core"
 # R08b (lab PR 251): the FIM rules, with the engine
 "fim::rules" = "nn-core"
+# R08c (lab PR 252): the executor's configuration and its policy (the
+# detect-only gate, the variables that switch it on); `response/mod.rs`
+# names nn-core's module under its path
+"response::config" = "nn-core"
 # R08b (lab PR 251): the operator's blocklists, with the rules; their
 # loaders take the host that reads a `.v1` (R07's `ContentHost`)
 "net::blocklist" = "nn-core"

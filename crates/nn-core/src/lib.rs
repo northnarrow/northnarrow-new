@@ -159,6 +159,14 @@ pub mod fim {
 // from its host (`combat::host`).
 pub mod combat;
 
+/// The response's policy (R08c, lab PR 252): the executor's configuration
+/// (was the agent's `response::config`).
+pub mod response {
+    // The detect-only gate, the quarantine's cap, the cgroup and nftables
+    // names the actions use.
+    pub mod config;
+}
+
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
 /// carve-out (was the agent's `anti_tamper::combat_allow`); R08b (lab PR
 /// 251): the trusted-installer window's vocabulary; R08c (lab PR 252): the
