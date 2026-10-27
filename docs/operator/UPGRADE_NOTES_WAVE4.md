@@ -123,7 +123,20 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   chain verifies; no new one is written. The `explanation` field of the
   detection schema (XAI, never written) is gone.
 - **Signed audit log.** No `subsystem_degraded` for a refused knowledge
-  base any more; nothing else changes in the audit rows.
+  base any more; nothing else in the audit rows changes with the
+  advisor's removal.
+- **COMBAT rows name the trigger and the offender (lab PR 245).** The
+  `combat_stage` rows of a COMBAT the posture reached carried `"trigger":
+  null`, and the INVESTIGATE row named no offender. They now carry the
+  trigger (in `trigger`, and in the `combat_outcome` rows), and two new
+  fields, `cause` (the evidence the trigger cites, or the forced COMBAT's
+  signers) and `offender_details` (each offender's pid, start, executable
+  and cgroup as captured); a later COMBAT entry naming another process
+  during an episode writes a row with `added`. `COMBAT_RECOVERY.md` §3.4
+  has the fields. A query of `trigger` sees names where it saw `null`; the
+  rows written before the upgrade keep their bytes and verify as before,
+  and the INVESTIGATE row of an episode that opened with a failed soft
+  block now carries the failure (it was a row of its own).
 
 ## 4. Build and development (source builds only)
 

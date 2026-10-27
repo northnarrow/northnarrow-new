@@ -23,7 +23,7 @@ fn workload_proc(dir: &std::path::Path, pid: u32, cgroup: &str) {
 /// A machine reading the fixture `/proc` at `dir`.
 fn machine_on(dir: &std::path::Path) -> PostureMachine {
     PostureMachine::new_with_hooks_and_exempt_and_auth(
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
         Arc::new(|_, _| Ok(String::new())),
         ExemptPids::default(),
         AuthSessionTracker::new(dir),
@@ -268,7 +268,7 @@ fn combat_hook_fires_on_first_combat_entry() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let count = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::clone(&count);
-    let m = PostureMachine::new_with_combat_hook(Arc::new(move || {
+    let m = PostureMachine::new_with_combat_hook(Arc::new(move |_| {
         c2.fetch_add(1, Ordering::SeqCst);
     }));
 
@@ -515,7 +515,7 @@ fn combat_hook_does_not_refire_while_already_in_combat() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let count = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::clone(&count);
-    let m = PostureMachine::new_with_combat_hook(Arc::new(move || {
+    let m = PostureMachine::new_with_combat_hook(Arc::new(move |_| {
         c2.fetch_add(1, Ordering::SeqCst);
     }));
 
@@ -530,6 +530,118 @@ fn combat_hook_does_not_refire_while_already_in_combat() {
     let result = m.observe(&again, &[]);
     assert!(result.is_none(), "no transition expected while in COMBAT");
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+/// The entries a machine's entry hook received.
+fn recording_machine() -> (
+    PostureMachine,
+    Arc<parking_lot::Mutex<Vec<super::CombatEntry>>>,
+) {
+    let heard = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let h = Arc::clone(&heard);
+    let m = PostureMachine::new_with_combat_hook(Arc::new(move |e: &super::CombatEntry| {
+        h.lock().push(e.clone());
+    }));
+    (m, heard)
+}
+
+/// Lab PR 245: the entry hook hears why the posture entered COMBAT and
+/// the process the event names — the ladder's episode opens with them. It
+/// heard nothing, and the episode's signed rows said `"trigger": null`.
+#[test]
+fn the_entry_hook_hears_the_trigger_and_the_offender() {
+    use super::{CombatCause, EntryProcess};
+    use nn_model::posture_types::{Confidence, EvidenceClass};
+    let (m, heard) = recording_machine();
+    m.observe(&fs_protect_denial(100, 500), &[]);
+    let heard = heard.lock().clone();
+    assert_eq!(heard.len(), 1);
+    assert_eq!(
+        heard[0].offender,
+        Some(EntryProcess {
+            pid: 100,
+            start_ns: 0,
+            seen_ns: 500
+        })
+    );
+    let CombatCause::Trigger(t) = &heard[0].cause else {
+        panic!("{:?}", heard[0].cause)
+    };
+    assert_eq!(t.trigger, TriggerType::AntiTamperDenial);
+    assert_eq!(t.raised, vec![TriggerType::AntiTamperDenial]);
+    assert_eq!(
+        (t.class, t.confidence),
+        (EvidenceClass::Kernel, Confidence::Decisive)
+    );
+    assert!(t.corroborated_by.is_empty(), "decisive: nothing to cite");
+    assert!(t.locked);
+    assert_eq!(
+        (t.event_kind, t.event_pid, t.event_ns),
+        ("FsProtectDenial", Some(100), Some(500))
+    );
+}
+
+/// Lab PR 245: a heuristic's COMBAT cites the earlier signal of its scope
+/// that vouched for it (and not one this same round raised); not locked.
+#[test]
+fn a_heuristic_combat_cites_the_signal_that_vouched_for_it() {
+    use super::CombatCause;
+    use nn_model::posture_types::EvidenceClass;
+    let tmp = tempfile::TempDir::new().unwrap();
+    workload_proc(tmp.path(), 42, "/system.slice/app.service");
+    let heard = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let h = Arc::clone(&heard);
+    let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
+        Arc::new(move |e: &super::CombatEntry| h.lock().push(e.clone())),
+        Arc::new(|_, _| Ok(String::new())),
+        ExemptPids::default(),
+        AuthSessionTracker::new(tmp.path()),
+    );
+    m.observe(&spawn(42, 1, "nc", "/usr/bin/nc", 1), &[]);
+    assert!(heard.lock().is_empty(), "ENGAGED: no entry");
+    let (ef, er) = exfil_burst(42);
+    m.observe(&ef, &er);
+    assert_eq!(m.current_kind(), PostureKind::Combat);
+    let heard = heard.lock().clone();
+    assert_eq!(heard.len(), 1);
+    let CombatCause::Trigger(t) = &heard[0].cause else {
+        panic!("{:?}", heard[0].cause)
+    };
+    assert_eq!(t.trigger, TriggerType::ExfiltrationPattern);
+    assert_eq!(
+        t.corroborated_by,
+        vec![(TriggerType::ExploitAttempt, EvidenceClass::Execution)]
+    );
+    assert!(!t.locked, "heuristics alone: unlocked");
+    assert_eq!(t.scope, "workload /system.slice/app.service");
+    assert_eq!(heard[0].offender.map(|p| p.pid), Some(42));
+}
+
+/// Lab PR 245: a forced COMBAT's entry names no process, and its cause
+/// is the order — with the keys that signed it, when the caller says.
+#[test]
+fn a_forced_combat_entry_names_its_order() {
+    use super::CombatCause;
+    let (m, heard) = recording_machine();
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    m.admin_force_state_signed_by(token, PostureKind::Combat, true, vec!["a1b2c3d4".into()])
+        .expect("Observing → Combat allowed");
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    m.admin_force_state_with_token(token, PostureKind::Observing, true)
+        .expect("Combat → Observing allowed with unlock");
+    let token = crate::anti_tamper::_test_mint_unlock_token();
+    m.admin_force_state_with_token(token, PostureKind::Combat, true)
+        .expect("Observing → Combat allowed");
+    let heard = heard.lock().clone();
+    assert_eq!(heard.len(), 2);
+    assert!(heard.iter().all(|e| e.offender.is_none()));
+    assert_eq!(
+        heard[0].cause,
+        CombatCause::AdminForce {
+            signers: vec!["a1b2c3d4".to_string()]
+        }
+    );
+    assert_eq!(heard[1].cause, CombatCause::AdminForce { signers: vec![] });
 }
 
 #[test]
@@ -582,7 +694,7 @@ fn release_hook_fires_with_token_on_successful_release() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let count = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::clone(&count);
-    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
     let release_hook: super::CombatReleaseHook = Arc::new(move |_token, scope| {
         // The token is consumed by-value into the closure body —
         // dropping it here exercises the production ownership flow.
@@ -607,7 +719,7 @@ fn release_hook_fires_with_token_on_successful_release() {
 fn release_hook_outside_combat_is_scoped_to_the_isolation() {
     let scopes = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let s2 = Arc::clone(&scopes);
-    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
     let release_hook: super::CombatReleaseHook = Arc::new(move |_token, scope| {
         s2.lock().push(scope);
         Ok("nothing engaged".to_string())
@@ -627,7 +739,7 @@ fn release_hook_outside_combat_is_scoped_to_the_isolation() {
 /// operator read `Success` with the host still isolated.
 #[test]
 fn a_failed_release_keeps_combat_and_says_why() {
-    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let f2 = Arc::clone(&fail);
     let release_hook: super::CombatReleaseHook = Arc::new(move |_token, _scope| {
@@ -714,7 +826,7 @@ fn admin_force_state_with_token_non_combat_to_combat_fires_entry_hook() {
     use std::sync::atomic::{AtomicU32, Ordering};
     let counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
-    let entry_hook: super::CombatEntryHook = Arc::new(move || {
+    let entry_hook: super::CombatEntryHook = Arc::new(move |_| {
         c.fetch_add(1, Ordering::SeqCst);
     });
     let m = PostureMachine::new_with_combat_hook(entry_hook);
@@ -748,7 +860,7 @@ fn admin_force_state_with_token_combat_to_non_combat_fires_release_hook() {
     });
     // Build a PostureMachine with both hooks present so the
     // combat-entry path also works for state setup.
-    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
     let m = PostureMachine::new_with_hooks(entry_hook, release_hook);
     m.force_state_for_test(PostureKind::Combat);
     assert_eq!(m.current_kind(), PostureKind::Combat);
@@ -778,7 +890,7 @@ fn admin_force_state_out_of_combat_needs_may_release() {
         r.fetch_add(1, Ordering::SeqCst);
         Ok(String::new())
     });
-    let m = PostureMachine::new_with_hooks(Arc::new(|| {}), release_hook);
+    let m = PostureMachine::new_with_hooks(Arc::new(|_| {}), release_hook);
     let token = crate::anti_tamper::_test_mint_unlock_token();
     m.admin_force_state_with_token(token, PostureKind::Alerted, false)
         .expect("a lateral move needs no unlock");
@@ -845,7 +957,7 @@ fn admin_force_state_reports_the_state_it_left() {
 /// pointed at a nonexistent /proc, so the lineage gate only sees what
 /// the test explicitly ingests via ProcessSpawn events.
 fn machine_with_isolated_auth() -> PostureMachine {
-    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
     let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
     PostureMachine::new_with_hooks_and_exempt_and_auth(
         entry_hook,
@@ -996,7 +1108,7 @@ fn own_runtime_dir_burst_is_not_mass_write_but_home_burst_is() {
     std::fs::create_dir_all(&pid_dir).unwrap();
     std::fs::write(pid_dir.join("loginuid"), "1000\n").unwrap();
     let mk = || {
-        let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+        let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
         let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
         PostureMachine::new_with_hooks_and_exempt_and_auth(
             entry_hook,
@@ -1047,7 +1159,7 @@ fn corroboration_is_scoped_to_the_login_session() {
         std::fs::write(d.join("loginuid"), format!("{uid}\n")).unwrap();
     }
     let mk = || {
-        let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+        let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
         let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
         PostureMachine::new_with_hooks_and_exempt_and_auth(
             entry_hook,
@@ -1095,7 +1207,7 @@ fn corroboration_is_scoped_to_the_login_session() {
 #[test]
 fn agent_self_writes_still_exempt() {
     const AGENT_PID: u32 = 4242;
-    let entry_hook: super::CombatEntryHook = Arc::new(|| {});
+    let entry_hook: super::CombatEntryHook = Arc::new(|_| {});
     let release_hook: super::CombatReleaseHook = Arc::new(|_, _| Ok(String::new()));
     let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
         entry_hook,
@@ -1365,7 +1477,7 @@ fn admin_session_machine() -> (tempfile::TempDir, PostureMachine) {
         session_proc(tmp.path(), pid, ppid);
     }
     let m = PostureMachine::new_with_hooks_and_exempt_and_auth(
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
         Arc::new(|_, _| Ok(String::new())),
         ExemptPids::default(),
         AuthSessionTracker::new(tmp.path()),
@@ -1473,7 +1585,7 @@ fn admin_force_state_with_token_same_state_is_noop() {
     use std::sync::atomic::{AtomicU32, Ordering};
     let counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
-    let entry_hook: super::CombatEntryHook = Arc::new(move || {
+    let entry_hook: super::CombatEntryHook = Arc::new(move |_| {
         c.fetch_add(1, Ordering::SeqCst);
     });
     let m = PostureMachine::new_with_combat_hook(entry_hook);
@@ -1989,7 +2101,7 @@ fn the_trigger_fires_exactly_where_fim024_does() {
 #[test]
 fn the_agents_own_write_of_a_control_surface_file_raises_nothing() {
     let exempt = PostureMachine::new_with_hooks_and_exempt_and_auth(
-        Arc::new(|| {}),
+        Arc::new(|_| {}),
         Arc::new(|_, _| Ok(String::new())),
         ExemptPids::with_agent(4242),
         AuthSessionTracker::default(),

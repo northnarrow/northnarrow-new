@@ -215,11 +215,12 @@ posture and the ladder:
 
 1. an event: the clock moves to its time (never back: an event read late is
    processed when it is read); `PostureMachine::observe` over the recent
-   events; on the edge into COMBAT, `engage_with` names the event's process
-   to the ladder; an engaged ladder sees the event (`observe`, the
-   jump-ahead); the correlation buffer keeps it; the two trackers the rules
-   share with the posture assess it, as the rules would (memoised: the
-   posture's answer);
+   events — on the edge into COMBAT its entry hook engages the ladder with
+   the posture's entry: the firing trigger, the evidence it cites and the
+   event's process (lab PR 245); an engaged ladder sees the event
+   (`observe`, the jump-ahead); the correlation buffer keeps it; the two
+   trackers the rules share with the posture assess it, as the rules would
+   (memoised: the posture's answer);
 2. `{"wait": {"secs": N}}`: the clock moves on;
 3. `{"unlock": {}}`: a signed unlock (`OperationCode::Unlock`, lab PR 217)
    by the case's administrator, verified by `ConnAuth` as the admin socket
@@ -316,13 +317,23 @@ transition, a tree killed through its cgroup, an offender gone before
 NEUTRALIZE, a stale capture, a signed unlock leaving COMBAT, a decay to
 OBSERVING, a detect-only NEUTRALIZE and no kill in detect-only.
 
-Two things the replay showed of production, kept as they are (a behaviour
-change is another lot's): the signed `combat_stage` rows of a COMBAT the
-posture reached carry `"trigger": null`, and its INVESTIGATE row names no
-offender — `main.rs`'s entry hook opens the episode (`engage(None, None)`)
-inside `observe`, before `process_event` passes the offender and the firing
-trigger, which `engage_with` then only merges (the offender is soft-blocked,
-the trigger dropped).
+The replay showed that the signed `combat_stage` rows of a COMBAT the
+posture reached carried `"trigger": null`, and that its INVESTIGATE row
+named no offender: `main.rs`'s entry hook opened the episode (`engage(None,
+None)`) inside `observe`, before `process_event` passed the offender and the
+firing trigger, which `engage_with` then only merged (the offender
+soft-blocked, the trigger dropped). Lab PR 245 fixed it: the entry hook
+receives the posture's `CombatEntry` and the episode opens with its cause
+and its offender, so every row names the trigger, `cause` (the evidence it
+cites) and `offender_details` (each offender as captured), the INVESTIGATE
+row included; `every_ladder_row_names_its_trigger_and_offender` checks it on
+every case. The golden files moved with it, in the six cases that reach
+COMBAT and nowhere else: the capture of the offender now precedes `begin
+episode`; the rows carry the trigger and the new fields; a soft egress note
+of the offender is in the INVESTIGATE reason (`detect-only`), and in
+`combat-stale-capture` the failed block, which had a row of its own, is in
+the INVESTIGATE row (with the shortened window), the rows after it one
+place earlier in the chain.
 
 ### 6.4 Determinism
 

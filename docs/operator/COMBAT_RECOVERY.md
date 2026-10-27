@@ -266,6 +266,48 @@ payload ships in the same release as the agent.
   NEUTRALIZE) with each offender's kill and quarantine outcome and the
   host-critical ones spared.
 
+### 3.4 Why the ladder engaged, and against whom (lab PR 245)
+
+Every `combat_stage` row says why the episode opened and whom it acts
+against, the INVESTIGATE row included (before this release a COMBAT the
+posture reached was recorded with `"trigger": null`, and its INVESTIGATE
+row named no offender):
+
+- `trigger` — the posture trigger that moved the posture to COMBAT
+  (`AntiTamperDenial`, `ConfirmedIntrusion`, …); `null` only for a forced
+  COMBAT. The `combat_outcome` rows carry it too.
+- `cause` — the same, with the evidence it cites: `kind`
+  `posture_trigger`; every trigger the event raised (`raised`), the kind of
+  evidence (`class`), `Decisive` or `NeedsCorroboration`, the earlier
+  signals of the actor's scope that corroborated a heuristic
+  (`corroborated_by`), whether COMBAT is `locked`, the actor's `scope`, and
+  the `event` (its kind, the process it names, its time). A COMBAT forced
+  by a signed `force-posture` is `admin_force_posture` with the signing
+  keys' fingerprints (`signers`; the `force_posture` row next to it is the
+  request itself); `debug_force_posture` in a `debug-trigger` build.
+- `offenders` — the PIDs, as before; `offender_details` — each of them, in
+  the same order, as the ladder captured it when it attributed it: `pid`,
+  its start (`start_ticks` from `/proc`, `start_ns` from its exec event,
+  `seen_ns` the time of the event that named it), `exe` (`/proc/<pid>/exe`,
+  ` (deleted)` kept) and `cgroup` read at that moment, and `via`: `entry`
+  (named by the event that opened the episode), `spread` (spawned by an
+  offender: `parent`), `later_entry`. After a NEUTRALIZE nothing of the
+  process is left in `/proc`: the row is the record. A path longer than 512
+  bytes keeps its last 512, after `…`.
+- `added` — on the row a later COMBAT entry writes when it names another
+  process while the episode runs (from and to the current stage): that
+  process and the later entry's `cause`. The episode's `trigger` and
+  `cause` stay the first entry's.
+
+```sh
+sudo nn-admin audit read --json | jq -c 'select(.op == "combat_stage") | .extra
+  | {to, trigger, offenders, why: .cause.kind, exe: [.offender_details[]?.exe]}'
+```
+
+Rows written before the upgrade keep their bytes and their `null`s and
+still verify (`nn-admin audit verify`); a reader takes a missing `cause` or
+`offender_details` as unknown.
+
 ---
 
 ## 4. Recovering from an agent crash mid-COMBAT

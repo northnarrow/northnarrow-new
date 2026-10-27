@@ -38,6 +38,7 @@
 
 pub mod clock;
 pub mod corroboration;
+pub mod entry;
 pub mod escalation_allow;
 pub mod exempt;
 pub mod lineage;
@@ -66,6 +67,7 @@ use clock::Clock;
 use corroboration::CorroborationLedger;
 use escalation_allow::EscalationAllowList;
 
+pub use entry::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 pub use exempt::{
     resolve_verified_watchdog_pid, sibling_watchdog_exe, ExemptPids, WatchdogResolution,
     DEFAULT_WATCHDOG_EXE, DEFAULT_WATCHDOG_PIDFILE,
@@ -89,10 +91,19 @@ pub struct PostureMachine {
 }
 
 /// Hook invoked exactly once per Observing/Alerted/Engaged →
-/// COMBAT edge. The agent's `main.rs` wires this to
-/// `NetworkIsolator::engage`. Stored as `Arc<dyn Fn() + Send +
-/// Sync>` so the machine itself can stay `Clone + Send + Sync`.
-pub type CombatEntryHook = Arc<dyn Fn() + Send + Sync>;
+/// COMBAT edge. The agent's `main.rs` wires it to the COMBAT ladder
+/// (`CombatLadder::engage`). Stored as an `Arc<dyn Fn>` so the machine
+/// itself can stay `Clone + Send + Sync`.
+///
+/// Lab PR 245: it receives the [`CombatEntry`] — the cause (the trigger
+/// and the evidence it cites, or a forced COMBAT) and the process the
+/// event names — so the ladder's episode opens with them. It took no
+/// argument, and the episode opened without either.
+pub type CombatEntryHook = Arc<dyn Fn(&CombatEntry) + Send + Sync>;
+
+/// External audit POS-001: run when an unlocked COMBAT decays
+/// ([`PostureMachine::on_combat_decay`]).
+pub type CombatDecayHook = Arc<dyn Fn() + Send + Sync>;
 
 /// What a release hook did with the containment (lab PR 217, NN-AUD-243
 /// residue): `Ok` with what was released — the tables read back clear —
@@ -144,7 +155,7 @@ struct Inner {
     last_admin_action: Mutex<Option<Instant>>,
     /// External audit POS-001: run when an unlocked COMBAT decays (the
     /// agent stands the ladder down). Set once at boot.
-    combat_decay_hook: std::sync::OnceLock<CombatEntryHook>,
+    combat_decay_hook: std::sync::OnceLock<CombatDecayHook>,
     /// Lab PR 243: where the machine reads the time — the host's clocks
     /// ([`clock::SystemClock`]), or a replay's ([`PostureMachine::with_clock`]).
     clock: Arc<dyn Clock>,
@@ -368,7 +379,7 @@ impl PostureMachine {
 
     /// External audit POS-001: run `hook` when an unlocked COMBAT decays.
     /// Set once; a second call is ignored.
-    pub fn on_combat_decay(&self, hook: CombatEntryHook) {
+    pub fn on_combat_decay(&self, hook: CombatDecayHook) {
         let _ = self.inner.combat_decay_hook.set(hook);
     }
 
@@ -476,13 +487,27 @@ impl PostureMachine {
         let before = guard.kind();
         let mut current = (*guard).clone();
         let mut firing: Option<TriggerType> = None;
+        // Lab PR 245: the trigger that crossed into COMBAT, when one did.
+        let mut combat_by: Option<TriggerType> = None;
         for (t, level) in leveled {
             let next = transitions::apply_to_level(&current, level, now);
             if next.kind() > current.kind() {
                 firing = Some(t);
+                if next.kind() == PostureKind::Combat {
+                    combat_by = Some(t);
+                }
             }
             current = next;
         }
+        // Lab PR 245: the signals a heuristic's COMBAT cites, read from the
+        // ledger the decision read — before this round's signals are
+        // recorded (audit `posture-1`: they never corroborate each other).
+        let corroborated_by = match combat_by {
+            Some(t) if t.confidence() == Confidence::NeedsCorroboration => {
+                ledger.corroborating(t, triggers::evidence_class(t, event), &scope)
+            }
+            _ => Vec::new(),
+        };
 
         // External audit POS-001 (NN-AUD-002): COMBAT is LOCKED — no decay,
         // a signed release, and the ladder may isolate the host — only on
@@ -514,6 +539,25 @@ impl PostureMachine {
             lock_acquired = locked && !was_locked && before == PostureKind::Combat;
             current = PostureState::Combat { since, locked };
         }
+        // Lab PR 245: what the entry hook hands the ladder — the trigger,
+        // the evidence it cites and the process the event names.
+        let entry = combat_by.map(|t| {
+            CombatEntry::of_event(
+                event,
+                TriggerEvidence {
+                    trigger: t,
+                    raised: hits.clone(),
+                    class: triggers::evidence_class(t, event),
+                    confidence: t.confidence(),
+                    corroborated_by,
+                    locked: matches!(current, PostureState::Combat { locked: true, .. }),
+                    scope: scope.to_string(),
+                    event_kind: triggers::event_kind(event),
+                    event_pid: triggers::event_owner_pid(event),
+                    event_ns: Some(triggers::event_time_ns(event)).filter(|ns| *ns != 0),
+                },
+            )
+        });
 
         // Record this round's escalation signals AFTER the decision, so
         // the current signal does not self-corroborate via the ledger
@@ -580,14 +624,15 @@ impl PostureMachine {
                 "posture signal scope"
             );
             self.log_transition(before, after, firing, describe_triggers(&hits));
-            // Combat-entry edge — fire the hook exactly once per
-            // upward crossing. We deliberately check `before` so a
-            // re-trigger while already in Combat does NOT re-engage
-            // network isolation (which would be a redundant shell-out
-            // and could mask audit signal).
-            if before != PostureKind::Combat && after == PostureKind::Combat {
+            // Combat-entry edge — fire the hook exactly once per upward
+            // crossing: `entry` exists only when this round crossed into
+            // COMBAT from below, so a re-trigger while already in Combat
+            // does NOT re-engage the ladder. Lab PR 245: with the entry —
+            // the ladder's episode opens with its trigger and offender.
+            if let Some(entry) = &entry {
+                debug_assert!(before != PostureKind::Combat && after == PostureKind::Combat);
                 if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
-                    hook();
+                    hook(entry);
                 }
             }
             Some((current, firing))
@@ -897,6 +942,19 @@ impl PostureMachine {
         target: PostureKind,
         may_release: bool,
     ) -> Result<ForceOutcome, AdminReleaseError> {
+        self.admin_force_state_signed_by(token, target, may_release, Vec::new())
+    }
+
+    /// [`Self::admin_force_state_with_token`], naming the keys that signed
+    /// the request (lab PR 245): a COMBAT it enters cites them as its cause
+    /// in the ladder's signed rows.
+    pub fn admin_force_state_signed_by(
+        &self,
+        token: UnlockToken,
+        target: PostureKind,
+        may_release: bool,
+        signers: Vec<String>,
+    ) -> Result<ForceOutcome, AdminReleaseError> {
         let leaving_combat = {
             let guard = self.inner.state.read();
             let before = guard.kind();
@@ -990,13 +1048,14 @@ impl PostureMachine {
 
         // Side-effects per §12.2.
         if before != PostureKind::Combat && target == PostureKind::Combat {
-            // Non-COMBAT → COMBAT: entry hook fires (iptables
-            // engage). The entry hook's signature is `Fn()`, not
-            // `Fn(UnlockToken)` (entry isn't gated by capability —
-            // detectors can fire it autonomously). The `token`
+            // Non-COMBAT → COMBAT: entry hook fires (the ladder engages).
+            // The entry hook takes the entry, not the `UnlockToken` (entry
+            // isn't gated by capability — detectors can fire it
+            // autonomously). Lab PR 245: the cause is the administrator's
+            // signed order, naming the keys; no process. The `token`
             // binding falls out of scope on return.
             if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
-                hook();
+                hook(&CombatEntry::forced(CombatCause::AdminForce { signers }));
             }
             let _ = token;
         } else if before == PostureKind::Combat && target != PostureKind::Combat {
@@ -1054,7 +1113,7 @@ impl PostureMachine {
             );
             if before != PostureKind::Combat && after == PostureKind::Combat {
                 if let Some(hook) = self.inner.combat_entry_hook.as_ref() {
-                    hook();
+                    hook(&CombatEntry::forced(CombatCause::DebugForce));
                 }
             }
         }

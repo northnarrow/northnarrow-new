@@ -321,6 +321,41 @@ impl CorroborationLedger {
                 >= SUSTAINED_SAME_TYPE_MIN
     }
 
+    /// Lab PR 245: the signals of `scope` that corroborate `current`
+    /// raised as evidence of `class` — what [`Self::corroborated_as`]
+    /// finds — as (trigger, kind of evidence), each once, sorted: the
+    /// evidence a COMBAT reached on a heuristic cites. Empty when nothing
+    /// corroborates it. Caller must [`prune`](Self::prune) first.
+    pub fn corroborating(
+        &self,
+        current: TriggerType,
+        class: EvidenceClass,
+        scope: &Scope,
+    ) -> Vec<(TriggerType, EvidenceClass)> {
+        if !self.corroborated_as(current, class, scope) {
+            return Vec::new();
+        }
+        let Some(entries) = self.scopes.get(scope) else {
+            return Vec::new();
+        };
+        let placed = entries.iter().filter(|e| e.placed());
+        let mut out: Vec<(TriggerType, EvidenceClass)> = placed
+            .clone()
+            .filter(|e| e.class != class)
+            .map(|e| (e.trigger, e.class))
+            .collect();
+        if out.is_empty() {
+            // The sustained knob: repeats of the same signal.
+            out = placed
+                .filter(|e| e.trigger == current)
+                .map(|e| (e.trigger, e.class))
+                .collect();
+        }
+        out.sort_by_key(|(t, c)| (t.as_str(), format!("{c:?}")));
+        out.dedup();
+        out
+    }
+
     /// Record an escalation signal. The caller records only signals
     /// whose `target_level() >= Engaged` (ALERTED-tier recon/DNS is too
     /// noisy to count as corroboration).
@@ -547,6 +582,38 @@ mod tests {
 
     fn unit(name: &str) -> Scope {
         Scope::Workload(format!("/system.slice/{name}"))
+    }
+
+    /// Lab PR 245: the signals that vouch for a heuristic are the ones
+    /// `corroborated_as` counts — another kind of evidence, placed, in the
+    /// same scope — each once; nothing when it is not corroborated.
+    #[test]
+    fn the_corroborating_signals_are_the_ones_that_vouch() {
+        let now = Instant::now();
+        let session = Scope::Login(1000);
+        let mut l = CorroborationLedger::new();
+        let fs = EvidenceClass::FileSystem;
+        assert!(l
+            .corroborating(TriggerType::ConfirmedIntrusion, fs, &session)
+            .is_empty());
+        l.record(TriggerType::CriticalFileModification, now, session.clone());
+        // the same kind of evidence vouches for nothing
+        assert!(l
+            .corroborating(TriggerType::ConfirmedIntrusion, fs, &session)
+            .is_empty());
+        l.record(TriggerType::ExploitAttempt, now, session.clone());
+        l.record(TriggerType::ExploitAttempt, now, session.clone());
+        l.record(TriggerType::LateralMovement, now, unit("other.service"));
+        // a writer not placed yet vouches for nothing
+        l.record_pending(TriggerType::LateralMovement, now, session.clone(), 7, false);
+        assert_eq!(
+            l.corroborating(TriggerType::ConfirmedIntrusion, fs, &session),
+            vec![(TriggerType::ExploitAttempt, EvidenceClass::Execution)],
+            "another class, placed, in this scope, once"
+        );
+        assert!(l
+            .corroborating(TriggerType::ConfirmedIntrusion, fs, &Scope::Unattributed)
+            .is_empty());
     }
 
     /// Review 52: a pending configuration change corroborates nothing

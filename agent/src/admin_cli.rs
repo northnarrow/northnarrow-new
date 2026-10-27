@@ -4517,6 +4517,163 @@ mod tests {
         }
     }
 
+    /// Lab PR 245: `combat_stage` rows of both shapes in one chain — the
+    /// one written before the lot (`"trigger": null`, no offender, no
+    /// `cause`) and the ones the ladder writes now (the trigger named,
+    /// `cause`, `offender_details`, an `added`) — are read, exported by
+    /// `audit read --json` byte for byte, and verified, together.
+    #[test]
+    fn combat_rows_before_and_after_lab_pr_245_read_export_and_verify() {
+        use crate::combat::{
+            Addition, AuditEvidence, CombatStage, LadderEvidence, OffenderId, ProcFacts,
+            StageTransition, Via,
+        };
+        use crate::posture::{CombatCause, TriggerEvidence};
+        use nn_model::posture_types::{Confidence, EvidenceClass, TriggerType};
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("audit.log");
+        let key =
+            crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key"))
+                .unwrap();
+        let pubkey = key.verifying_key();
+        let log = Arc::new(parking_lot::Mutex::new(
+            crate::audit::AuditLog::open(&log_path, key, [0u8; 16]).unwrap(),
+        ));
+        // Before: the INVESTIGATE row of a COMBAT the posture reached.
+        log.lock()
+            .append(crate::audit::AuditEntryDraft {
+                op: "combat_stage".to_string(),
+                extra: serde_json::json!({
+                    "from": null,
+                    "offenders": [],
+                    "reason": "COMBAT entry — investigate first, network up",
+                    "to": "INVESTIGATE",
+                    "trigger": null,
+                }),
+                key_fp: "agent-self".to_string(),
+                cosigner_fps: vec![],
+                result: "success".to_string(),
+                client_pid: 4242,
+                client_uid: 0,
+                client_comm: "northnarrow-agent".to_string(),
+                client_exe: None,
+            })
+            .unwrap();
+        // After: through the ladder's evidence sink.
+        let cause = Arc::new(CombatCause::Trigger(TriggerEvidence {
+            trigger: TriggerType::ExfiltrationPattern,
+            raised: vec![TriggerType::ExfiltrationPattern],
+            class: EvidenceClass::Network,
+            confidence: Confidence::NeedsCorroboration,
+            corroborated_by: vec![(TriggerType::ExploitAttempt, EvidenceClass::Execution)],
+            locked: false,
+            scope: "login uid 1000".to_string(),
+            event_kind: "TcpConnect",
+            event_pid: Some(4242),
+            event_ns: Some(9),
+        }));
+        let id = |pid: u32, via: Via| {
+            Arc::new(OffenderId {
+                pid,
+                start_ticks: Some(7),
+                start_ns: None,
+                seen_ns: Some(9),
+                facts: ProcFacts {
+                    exe: Some("/tmp/.x/p \"q\"\té".to_string()),
+                    cgroup: Some("/user.slice/user-1000.slice/session-3.scope".to_string()),
+                },
+                via,
+            })
+        };
+        let ev = AuditEvidence::new(Some(Arc::clone(&log)));
+        let stage = CombatStage::Investigate;
+        ev.record_stage(&StageTransition {
+            from: None,
+            to: stage,
+            cause: Some(Arc::clone(&cause)),
+            offenders: vec![4242],
+            details: vec![id(4242, Via::Entry)],
+            added: None,
+            reason: "COMBAT entry — investigate first, network up".to_string(),
+        })
+        .unwrap();
+        ev.record_stage(&StageTransition {
+            from: Some(stage),
+            to: stage,
+            cause: Some(cause),
+            offenders: vec![4242, 4243],
+            details: vec![id(4242, Via::Entry), id(4243, Via::LaterEntry)],
+            added: Some(Addition {
+                offender: id(4243, Via::LaterEntry),
+                by: Arc::new(CombatCause::AdminForce {
+                    signers: vec!["a1b2c3d4".to_string()],
+                }),
+            }),
+            reason: "offender 4243 added by a later COMBAT entry".to_string(),
+        })
+        .unwrap();
+
+        // Read and exported: every row, byte for byte.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let r = audit_read_into(&log_path, None, true, &mut out, &mut err).unwrap();
+        assert_eq!(
+            r,
+            AuditReadReport {
+                rows: 3,
+                skipped: 0
+            }
+        );
+        assert_eq!(
+            String::from_utf8(out.clone()).unwrap(),
+            std::fs::read_to_string(&log_path).unwrap(),
+            "the export is the log's bytes"
+        );
+        let export = dir.path().join("export.jsonl");
+        std::fs::write(&export, &out).unwrap();
+        match run_audit_verify(&export, &pubkey).unwrap() {
+            AuditVerifyOutcome::Success { entries } => assert_eq!(entries, 3),
+            other => panic!("the export does not verify: {other:?}"),
+        }
+        // What a reader finds in each shape.
+        let rows: Vec<crate::audit::AuditEntry> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(rows[0].extra["trigger"].is_null());
+        assert!(
+            rows[0].extra.get("cause").is_none() && rows[0].extra.get("offender_details").is_none()
+        );
+        assert_eq!(rows[1].extra["trigger"], "ExfiltrationPattern");
+        assert_eq!(
+            rows[1].extra["cause"]["corroborated_by"][0]["trigger"],
+            "ExploitAttempt"
+        );
+        assert_eq!(
+            rows[1].extra["offender_details"][0]["exe"],
+            "/tmp/.x/p \"q\"\té"
+        );
+        assert_eq!(rows[2].extra["added"]["offender"]["pid"], 4243);
+        assert_eq!(rows[2].extra["added"]["by"]["signers"][0], "a1b2c3d4");
+        assert_eq!(
+            rows[2].extra["trigger"], "ExfiltrationPattern",
+            "the episode's"
+        );
+        // The human view: one line per row, the same columns.
+        let (mut human, mut err) = (Vec::new(), Vec::new());
+        audit_read_into(&log_path, None, false, &mut human, &mut err).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert_eq!(human.lines().count(), 3);
+        assert!(
+            human
+                .lines()
+                .all(|l| l.contains("combat_stage") && l.contains("agent-self success")),
+            "{human}"
+        );
+    }
+
     /// MAIN-014: lines that are not rows anywhere in the file — not JSON,
     /// not UTF-8, blank lines between rows — hide none of the rows after
     /// them; past [`AUDIT_READ_SKIPS_LISTED`] only the count grows.
