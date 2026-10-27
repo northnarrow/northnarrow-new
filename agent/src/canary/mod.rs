@@ -26,6 +26,9 @@ pub mod access_log;
 /// nn-evidence's.
 pub use nn_evidence::chain_lines;
 pub mod detector;
+/// The detector's tests (R08b, lab PR 251: cut from `detector.rs`).
+#[cfg(test)]
+mod detector_tests;
 pub mod network;
 pub mod path_policy;
 pub mod read_forward;

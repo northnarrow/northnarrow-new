@@ -1697,7 +1697,7 @@ Canary network connect — category `canary_deception`.
 
 **How to test.** Deploy a Network canary (`nn-admin canary deploy --name t --key <key> network --bind-addr 127.0.0.1 --bind-port 4444`) and connect to it from a shell (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'`).
 
-**Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect`, `agent/src/canary/detector.rs::a_network_canary_trip_draws_canary_003_on_the_connector`, `agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector`
+**Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect`, `agent/src/canary/detector_tests.rs::a_network_canary_trip_draws_canary_003_on_the_connector`, `agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector`
 
 **ATT&CK note.** A port scan of the host finds the decoy (T1046); a decoy destination planted in a configuration file, a hosts entry or an ssh config is a remote service the intruder tries to reach (T1021).
 
@@ -1783,7 +1783,7 @@ Canary trip followed by network egress — category `chain_exfiltration`.
 
 **How to test.** Deploy a File canary, then from one process read it and connect out (`python3 -c` opening the decoy, then a socket); run the agent in detect-only mode, since NN-L-CANARY-001 kills the reader first.
 
-**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress`, `crates/nn-core/src/decision/rules/chain.rs::chain003_records_an_aged_trip_without_killing`, `agent/src/canary/detector.rs::the_trips_own_connection_draws_no_chain_verdict_in_any_order`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress`, `crates/nn-core/src/decision/rules/chain.rs::chain003_records_an_aged_trip_without_killing`, `agent/src/canary/detector_tests.rs::the_trips_own_connection_draws_no_chain_verdict_in_any_order`
 
 **ATT&CK note.** The precursor's technique depends on the canary type (see NN-L-CANARY-001..004); the chain itself is evidence of exfiltration.
 

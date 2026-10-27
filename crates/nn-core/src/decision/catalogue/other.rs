@@ -74,7 +74,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       a shell (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'`).",
         tests: &[
             "crates/nn-core/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect",
-            "agent/src/canary/detector.rs::a_network_canary_trip_draws_canary_003_on_the_connector",
+            "agent/src/canary/detector_tests.rs::a_network_canary_trip_draws_canary_003_on_the_connector",
             "agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector",
         ],
         attack_note: "A port scan of the host finds the decoy (T1046); a decoy destination \
@@ -179,7 +179,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "crates/nn-core/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress",
             "crates/nn-core/src/decision/rules/chain.rs::chain003_records_an_aged_trip_without_killing",
-            "agent/src/canary/detector.rs::the_trips_own_connection_draws_no_chain_verdict_in_any_order",
+            "agent/src/canary/detector_tests.rs::the_trips_own_connection_draws_no_chain_verdict_in_any_order",
         ],
         attack_note: "The precursor's technique depends on the canary type (see \
                       NN-L-CANARY-001..004); the chain itself is evidence of exfiltration.",
