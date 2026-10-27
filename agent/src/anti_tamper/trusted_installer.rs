@@ -487,6 +487,7 @@ impl TrustedInstallerOverride {
                 format!("close_failed: {reason} (the kernel grant ends at its own deadline)"),
             ),
         };
+        let mut log = audit.lock();
         let draft = AuditEntryDraft {
             op: "trusted_installer_window_close".to_string(),
             extra,
@@ -494,12 +495,15 @@ impl TrustedInstallerOverride {
             key_fp: "(agent)".to_string(),
             cosigner_fps: Vec::new(),
             result,
-            client_pid: std::process::id(),
+            // Lab PR 249: the log's own pid (the agent's; a replay's log
+            // names the replayed agent).
+            client_pid: log.self_pid(),
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
             client_exe: None,
         };
-        let appended = audit.lock().append(draft);
+        let appended = log.append(draft);
+        drop(log);
         if let Err(e) = appended {
             warn!(
                 target: "anti_tamper.trusted_installer",

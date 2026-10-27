@@ -1097,6 +1097,9 @@ pub struct Anchor<K> {
     protection: Option<Arc<dyn crate::chainlog::ProtectionManager>>,
     /// The audit chain does not record yet that anchoring started.
     marker_pending: bool,
+    /// Lab PR 249: the time each snapshot is stamped with (the host's
+    /// unless [`Self::with_clock`] gave another).
+    clock: Arc<dyn crate::clock::Clock>,
 }
 
 impl<K: ChainSigner> Anchor<K> {
@@ -1121,7 +1124,15 @@ impl<K: ChainSigner> Anchor<K> {
             second_key_added,
             protection: None,
             marker_pending: !anchoring_started,
+            clock: Arc::new(crate::clock::SystemClock),
         }
+    }
+
+    /// Lab PR 249: stamp the snapshots with `clock` instead of the host's
+    /// (a test's or a replay's: the same head anchor every run).
+    pub fn with_clock(mut self, clock: Arc<dyn crate::clock::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Use `protection` to create the file when it is missing.
@@ -1200,9 +1211,7 @@ impl<K: ChainSigner> Anchor<K> {
         }
         let snapshot = HeadsSnapshot {
             counter: self.last.as_ref().map_or(1, |l| l.counter + 1),
-            ts: chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.6fZ")
-                .to_string(),
+            ts: crate::clock::stamp(self.clock.as_ref()),
             agent_id: hex::encode(self.agent_id),
             second_key_added: flag,
             heads,
@@ -1606,5 +1615,52 @@ mod tests {
         );
         // full verification agrees
         assert!((rotating_target(&active).full)(&active, &pk).is_err());
+    }
+
+    /// Lab PR 249: the head anchor's snapshot carries its clock's time —
+    /// the host's by default (between two readings of `Utc::now`), a clock
+    /// of the caller's with `with_clock` — and the snapshot verifies.
+    #[test]
+    fn the_head_snapshot_is_stamped_by_the_anchor_s_clock() {
+        let dir = TempDir::new().unwrap();
+        let pk = key(&dir).verifying_key();
+        let active = dir.path().join("d.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 1 << 30);
+        log.append(p(0)).unwrap();
+        drop(log);
+        let read = |heads: &Path| match HeadsStore::read::<PortableHost>(heads, &pk) {
+            HeadsRead::Valid(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let fixed = dir.path().join("fixed_heads.json");
+        Anchor::new(
+            fixed.clone(),
+            key(&dir),
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        )
+        .with_clock(Arc::new(crate::clock::testing::FixedClock::at(
+            "2026-01-01T00:00:42.000007Z",
+        )))
+        .refresh(true, false)
+        .unwrap();
+        assert_eq!(read(&fixed).ts, "2026-01-01T00:00:42.000007Z");
+        let host = dir.path().join("host_heads.json");
+        let before = crate::audit::format_ts(chrono::Utc::now());
+        Anchor::new(
+            host.clone(),
+            key(&dir),
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        )
+        .refresh(true, false)
+        .unwrap();
+        let after = crate::audit::format_ts(chrono::Utc::now());
+        let ts = read(&host).ts;
+        assert!(before <= ts && ts <= after, "{before} <= {ts} <= {after}");
     }
 }

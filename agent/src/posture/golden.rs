@@ -44,10 +44,12 @@
 //!   (`response::kill`, pidfds, cgroupfs) is not replayed — its privileged
 //!   tests are;
 //! - the signed rows: the real `AuditEvidence` over a real `AuditLog` in
-//!   the replay's directory. Their timestamps (and so their hashes and
-//!   signatures) are the writer's own clock, and `client_pid` is the test
-//!   process: the golden file names them (`@TS@`, `#n`, `@SIG@`,
-//!   `@AGENT_PID@`) after the whole chain verified with the key;
+//!   the replay's directory, opened (lab PR 249) with a fixed key, the
+//!   replay's wall clock (`nn_evidence::clock::Clock`) and the replayed
+//!   agent's pid (`AuditStamps`): every row is printed whole — its time,
+//!   hashes and signature — and the whole chain verifies with the key. They
+//!   were the writer's own clock and the test's pid, named (`@TS@`, `#n`,
+//!   `@SIG@`, `@AGENT_PID@`);
 //! - the administrator: a fixed Ed25519 key in an `admin.pub` of the
 //!   replay's own; a signed unlock or trusted-installer grant is verified
 //!   by `ConnAuth` as the admin socket verifies it, then handed to what
@@ -91,7 +93,7 @@ use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport, Unlock
 use crate::anti_tamper::trusted_installer::{
     TrustedInstallerOverride, MAX_TRUSTED_INSTALLER_WINDOW_SECS,
 };
-use crate::audit::{AgentSigningKey, AuditEntry, AuditLog};
+use crate::audit::{AgentSigningKey, AuditEntry, AuditLog, AuditStamps};
 use crate::combat::actuator::{SystemActuator, DETECT_ONLY_ISOLATE, NO_BINARY};
 use crate::combat::{
     AuditEvidence, CombatActuator, CombatLadder, IsolateOutcome, LadderConfig, NeutralizeReport,
@@ -133,6 +135,10 @@ const AGENT_PID: u32 = 4_200_000;
 /// The administrator's key: a fixed seed, so its fingerprint is the same
 /// in every replay.
 const ADMIN_SEED: [u8; 32] = [0x2a; 32];
+/// Lab PR 249: the replayed agent's signing key, a fixed seed — Ed25519
+/// signs deterministically, so with the replay's clock and the agent's pid
+/// a row is the same bytes, signature included, in every replay.
+const AUDIT_KEY_SEED: [u8; 32] = [0x5e; 32];
 /// The wall clock at the events' zero: 2026-01-01T00:00:00Z.
 const WALL_AT_ZERO_SECS: u64 = 1_767_225_600;
 /// `main.rs`'s heartbeats.
@@ -340,6 +346,14 @@ impl Clock for ReplayClock {
 
     fn wall(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(WALL_AT_ZERO_SECS) + Duration::from_nanos(self.ns())
+    }
+}
+
+/// Lab PR 249: the audit log's clock — its rows are stamped with the
+/// replay's wall clock, as the posture's records are.
+impl nn_evidence::clock::Clock for ReplayClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from(Clock::wall(self))
     }
 }
 
@@ -969,14 +983,28 @@ impl Replay {
         let fixture = Path::new(GOLDEN_DIR).join("host");
         let lineage = AuthSessionTracker::new(&proc_root).with_host_root(&fixture);
 
-        // The signed audit log and its key (`main.rs`: the agent's).
+        // The signed audit log and its key (`main.rs`: the agent's). Lab PR
+        // 249: a fixed key, the replay's clock and the replayed agent's pid,
+        // so the rows — their hashes and signatures — are the same bytes in
+        // every replay.
         let state = root.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let key = AgentSigningKey::load_or_bootstrap(&state.join("agent.key")).unwrap();
+        let key_file = state.join("agent.key");
+        std::fs::write(&key_file, format!("{}\n", hex::encode(AUDIT_KEY_SEED))).unwrap();
+        let key = AgentSigningKey::load_or_bootstrap(&key_file).unwrap();
         let audit_key = key.verifying_key();
         let audit_path = state.join("audit.log");
         let audit = Arc::new(Mutex::new(
-            AuditLog::open(&audit_path, key, AGENT_ID).unwrap(),
+            AuditLog::open_with(
+                &audit_path,
+                key,
+                AGENT_ID,
+                AuditStamps {
+                    clock: clock.clone(),
+                    self_pid: AGENT_PID,
+                },
+            )
+            .unwrap(),
         ));
 
         // The shared judges (`main.rs`: the shipped lists, the lineage).
@@ -1094,7 +1122,7 @@ impl Replay {
                     detect_only: case.detect_only,
                     guard: guard(),
                 }),
-                Box::new(AuditEvidence::new(Some(Arc::clone(&audit)))),
+                Box::new(AuditEvidence::new(Some(Arc::clone(&audit))).with_clock(clock.clone())),
                 Box::new(guard()),
                 LadderConfig::default(),
             )
@@ -1250,36 +1278,40 @@ impl Replay {
         any
     }
 
-    /// The audit log's rows written since the last call, as the golden file
-    /// shows them: the writer's clock (`ts`, and the hashes and signature
-    /// that cover it) and the test's pid named, not printed.
+    /// The audit log's rows written since the last call, whole. Lab PR 249:
+    /// the replay's clock, a fixed key and the replayed agent's pid make
+    /// every field the same in every replay — the time, the hashes and the
+    /// signature over it are printed (they were named `@TS@`, `#n`, `@SIG@`
+    /// and `@AGENT_PID@`). A row naming the replay's directories would not
+    /// be: it fails here.
     fn new_rows(&mut self) -> Vec<Value> {
         let text = std::fs::read_to_string(&self.audit_path).unwrap_or_default();
-        let all: Vec<AuditEntry> = text
-            .lines()
+        let raw: Vec<&str> = text.lines().collect();
+        let all: Vec<AuditEntry> = raw
+            .iter()
             .map(|l| serde_json::from_str(l).expect("an audit row"))
             .collect();
         let from = self.rows.len();
+        let dirs = [
+            self.root.path().to_str().unwrap(),
+            self.proc_dir.path().to_str().unwrap(),
+        ];
         let out = all[from..]
             .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let n = from + i;
-                let mut v = serde_json::to_value(e).unwrap();
-                v["ts"] = json!("@TS@");
-                v["prev_hash"] = json!(if n == 0 {
-                    "genesis".to_string()
-                } else {
-                    format!("#{}", n - 1)
-                });
-                v["entry_hash"] = json!(format!("#{n}"));
-                v["agent_sig"] = json!("@SIG@");
-                assert_eq!(e.client_pid, std::process::id());
-                v["client_pid"] = json!("@AGENT_PID@");
-                if v["extra"].get("occurred_at").is_some() {
-                    v["extra"]["occurred_at"] = json!("@TS@");
+            .zip(&raw[from..])
+            .map(|(e, line)| {
+                assert_eq!(
+                    e.client_pid, AGENT_PID,
+                    "a row the replayed agent signs names its pid: {line}"
+                );
+                for d in dirs {
+                    assert!(
+                        !line.contains(d),
+                        "a signed row names the replay's directory {d}, so its hash and \
+                         signature differ in every replay: {line}"
+                    );
                 }
-                v
+                serde_json::to_value(e).unwrap()
             })
             .collect();
         self.rows = all;

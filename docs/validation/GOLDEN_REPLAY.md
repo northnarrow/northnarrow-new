@@ -242,9 +242,9 @@ every 5 s, on the events' clock, in that order when they fall together.
 | processes | a table: the case's `procs`, every exec event's process, `host` items; written as a `/proc` of the replay's own (`stat` with state, terminal and start, `status`, `loginuid`, `cgroup`, `cmdline`, `exe`) that the lineage, the posture's scopes, the security-tool detector and the ladder's host-critical guard (`SystemProtectedProcs`) read; a child inherits its parent's login uid, cgroup and terminal |
 | the actuator | the replay's `CombatActuator` on that table, with the steps and words of `SystemActuator`: a capture is a pid and a start (a process that exited, or whose pid another process holds now — a stale pidfd — reaches nothing); a soft egress block takes unless `nft` is missing; NEUTRALIZE looks up each binary before the kill, kills each offender's tree through a cgroup of its own (the root moved in and frozen, every descendant found by the `/proc` walk moved in, a guarded one refused, the cgroup killed, each member checked by its identity: one in an uninterruptible wait is still running and reported failed) and quarantines each binary once (a system path refused, kill-only); the outcomes go through `SystemActuator::kill_outcome`, `quarantine_text` and `soft_block_of` |
 | the isolation | the case's `isolation` (what each engage finds per family, then both isolated) and `release` (what each release reads back, then both clear) |
-| the signed rows | the real `AuditEvidence` over a real `AuditLog` in the replay's directory, the trusted-installer window's close rows in the same log |
+| the signed rows | the real `AuditEvidence` over a real `AuditLog` in the replay's directory, the trusted-installer window's close rows in the same log; lab PR 249: the log opened with a fixed key, the replay's wall clock (`nn_evidence::clock::Clock`) and the replayed agent's pid (`AuditStamps`), so every row is the same bytes in every replay |
 | the administrator | a fixed Ed25519 key (`unlock,trusted-installer`) in an `admin.pub` of the replay's own; agent id `golden-posture-1` |
-| the agent | pid 4,200,000, exempt from the posture as `main.rs` exempts its own |
+| the agent | pid 4,200,000, exempt from the posture as `main.rs` exempts its own, and the `client_pid` of the rows it signs |
 
 Not replayed, said so: the rule engine (§1–§5 replay it), the ladder's
 worker thread (the steps run in the caller, in the order the worker runs
@@ -286,11 +286,12 @@ each with `seq`, `at_ms` (the events' clock) and:
   and what the host did (`kill tree`: the cgroup, the processes frozen with
   the root, those spared, those still running — or why nothing was killed;
   `quarantine`; the `host` items' changes);
-- `signed`: the audit rows written, whole, with what the replay cannot fix
-  named: `ts` → `@TS@`, `entry_hash` → `#n`, `prev_hash` → `#n-1`
-  (`genesis` for the first), `agent_sig` → `@SIG@`, `client_pid` (the test
-  process) → `@AGENT_PID@`. The replay verifies the chain with the key
-  before it names them;
+- `signed`: the audit rows written, whole — the time (`ts`, the replay's
+  wall clock when the row was written), `prev_hash` (64 zeros for the
+  first), `entry_hash`, `agent_sig` and `client_pid` (4,200,000) printed as
+  written, and the chain verified with the key. Before lab PR 249 the
+  writer's clock and the test's pid made them differ in every replay, and
+  they were named: `@TS@`, `#n`, `#n-1`/`genesis`, `@SIG@`, `@AGENT_PID@`;
 - `state`: the posture (with `since_ms` and `last_trigger_ms`, or `locked`
   in COMBAT), the ladder's stage and offenders, the ledger's size.
 
@@ -335,6 +336,12 @@ of the offender is in the INVESTIGATE reason (`detect-only`), and in
 the INVESTIGATE row (with the shortened window), the rows after it one
 place earlier in the chain.
 
+Lab PR 249 moved the six files that hold signed rows, and only their 25
+rows' named fields: `@TS@`, `#n`, `#n-1`/`genesis`, `@SIG@` and
+`@AGENT_PID@` became the values written — each `ts` the time of its line on
+the replay's wall clock, each `prev_hash` the row before's `entry_hash`,
+every `client_pid` 4,200,000. No other byte of a golden file moved.
+
 ### 6.4 Determinism
 
 `posture_golden_is_deterministic_across_runs_and_threads` replays every case
@@ -342,12 +349,16 @@ three times on one thread and once on each of four threads at once, each on
 its own host, and requires the same bytes; the committed files are the same
 bytes in another process. What could break it, and how it is held:
 
-- the clocks: the posture, the window and the ladder read the replay's
-  clock only (the seams above); the audit writer's clock (`ts`, and the
-  hashes and signature over it), the test's pid and the replay's directories
-  are named, not printed (`@TS@`, `#n`, `@SIG@`, `@AGENT_PID@`, `@PROC@`,
-  `@ROOT@`); the challenge nonce of a signed request is the OS's random, and
-  only the verification's outcome and the key's fingerprint are printed;
+- the clocks: the posture, the window, the ladder and (lab PR 249) the
+  audit writer read the replay's clock only (the seams above,
+  `nn_evidence::clock::Clock` for the signed rows' `ts`); with a fixed
+  signing key (Ed25519 signs deterministically) and the replayed agent's
+  pid in its rows, a signed row is the same bytes in every replay, so it
+  is printed whole; a row naming the replay's directories would not be,
+  and `new_rows` fails on one. The replay's directories elsewhere are
+  named, not printed (`@PROC@`, `@ROOT@`); the challenge nonce of a signed
+  request is the OS's random, and only the verification's outcome and the
+  key's fingerprint are printed;
 - process-wide switches: `RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`'s
   runtime value (set by the signed per-rule policy) and the kernel
   mass-write mode (`triggers::set_kernel_mass_write`, set by `main.rs` when
