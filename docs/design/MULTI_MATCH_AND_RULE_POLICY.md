@@ -1,11 +1,14 @@
 # Multi-match decisions and the signed per-rule response policy (lab PR 236)
 
 Wave 4, Phase 2, capabilities C14 (behavioural detection: multi-match) and
-C12 (a response policy per rule). Code: `agent/src/decision/engine.rs` (the
-engine), `agent/src/decision/combine.rs` (the combiner),
-`agent/src/decision/rule_policy.rs` (the policy: format, defaults, exemptions,
-the active policy), `agent/src/decision/response_policy.rs` (the built-in
-switches). Userland only: no eBPF program and no sensor changes.
+C12 (a response policy per rule). Code: `crates/nn-core/src/decision/engine.rs`
+(the engine), `crates/nn-core/src/decision/combine.rs` (the combiner),
+`crates/nn-core/src/decision/rule_policy.rs` (the policy: format, defaults,
+exemptions, the active policy), `crates/nn-core/src/decision/response_policy.rs`
+(the built-in switches) — the agent's until R08b (lab PR 251), which moved
+the engine to nn-core; the exemption facts read from `/proc` are the
+agent's `decision_host_linux::ProcFacts`. Userland only: no eBPF program and
+no sensor changes.
 
 Status: accepted, 22/10/2026 (founder-delegated decision); the legacy
 ceiling (§2.1) added the same day, on review.

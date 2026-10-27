@@ -749,7 +749,7 @@ impl<H: PostureAgent> TriggerDetector<H> {
         // write and so no denial reaches the posture either, it is not
         // raised; the rule still kills and records.
         if let Event::Fim(fe) = event {
-            if H::is_bait_tamper(fe)
+            if crate::fim::rules::is_bait_tamper(fe)
                 && fe.modifier_pid != std::process::id()
                 && !self.installer_window.is_open()
             {
@@ -760,7 +760,7 @@ impl<H: PostureAgent> TriggerDetector<H> {
         // evidence of COMBAT tier that needs a second signal of another
         // class while the guard is experimental (the shared predicate of
         // NN-L-EPG-001/002, so the rules and the trigger cannot drift).
-        if H::is_exploit_postcondition(event) {
+        if crate::decision::rules::epg::is_exploit_postcondition(event) {
             hits.push(TriggerType::ExploitPostcondition);
         }
         let mass_write = confirmed_intrusion(
@@ -781,7 +781,9 @@ impl<H: PostureAgent> TriggerDetector<H> {
         // reverse shell), read on exec identity and the kernel's file table.
         // A COMBAT-tier execution signal: on its own it stops at ENGAGED, a
         // second signal of another class reaches COMBAT.
-        let reverse_shell = H::is_reverse_shell(event, &self.auth);
+        let reverse_shell =
+            crate::decision::rules::r020_shell_with_socket_stdio::shape(event, Some(&self.auth))
+                .is_some();
         if mass_write || staged == Some(StagedExec::Confirmed) || reverse_shell {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
@@ -1322,7 +1324,7 @@ fn staging_exec<H: PostureAgent>(
         _ => return None,
     };
     let image = exe.path_or(filename);
-    if !H::is_staging_path(image) {
+    if !crate::decision::rules::is_staging_path(image) {
         return None;
     }
     if auth.in_package_transaction(pid, ts) {

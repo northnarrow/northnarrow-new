@@ -164,9 +164,13 @@ planned = false
 "build_info" = "northnarrow-agent"
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
-"canary::detector" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
+# post-plan (lab PR 251, R08b): the Linux host of the canary detector —
+# the signed registry and access log, the interface addresses, the
+# read-forward set, `stat(2)`, `/proc/<pid>/exe` — of nn-core's
+# `canary::host::CanaryHost`
+"canary_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the chains' Linux file operations
 "chain_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
@@ -183,10 +187,10 @@ planned = false
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
 # agent's host; comm_allowlist judges on `posture::lineage` (nn-core's since
 # R08a, lab PR 250) and holds a kill through `decision::response_policy`
-# (its `Judgement::apply`, which the rules call: it moves with them, R08b);
-# the gate verifies through `anti_tamper::admin_auth` (nn-proto, after
-# R04b) and the floor reads the agent's key (`keys`): they move when those
-# are below nn-core (§4.1 rule 3)
+# (its `Judgement::apply`, which the rules call): it moved with them (R08b,
+# lab PR 251, `[shims.agent]`); the gate verifies through
+# `anti_tamper::admin_auth` (nn-proto, after R04b) and the floor reads the
+# agent's key (`keys`): they move when those are below nn-core (§4.1 rule 3)
 "config" = "nn-core"
 # R04c (lab PR 247, with R07): overlay_auth's install half (`config overlay
 # set`'s atomic write and the new inodes' protection)
@@ -200,10 +204,30 @@ planned = false
 "cow::config" = "nn-core"
 "cow::index" = "nn-core"
 "cow::trust" = "nn-core"
+# R08b (lab PR 251): the decision engine moved to nn-core. `decision.rs` is
+# the agent's binding of it to the Linux host (the engine, the correlation
+# store and tree as aliases on `LinuxHost`, the default rule set and the
+# offline replay under their names and signatures); the golden replay, the
+# validation registry's checks and the engine's tests that wire the agent's
+# other modules (`host_tests`) stay in `decision/`, test modules
 "decision" = "nn-core"
+# post-plan (lab PR 251, R08b): the rule catalogue's renderer — the rules
+# decided outside the engine (the exec quarantine, the exec policy, the
+# anti-tamper and exploit-guard rules) composed with the engine's, and the
+# docs it writes: the composition, as `chains`. `decision/catalogue.rs`
+# binds nn-core's table here
+"decision::catalogue::render" = "northnarrow-agent"
+# post-plan (lab PR 251, R08b): the Linux host of the decision engine —
+# the package database's `rpm`, the work kept off the async runtime, the
+# host's view of a path, the trusted-installer window, `DEFENDER_PIDS` —
+# of nn-core's `decision::host::DecisionHost`
+"decision_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the detection log's records and their
 # parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
-# file propri"; the payloads are nn-evidence's)
+# file propri"; the payloads are nn-evidence's). R08b (lab PR 251): the
+# parts the engine names (`Sensor`, `MitreAttack`, `Principal`) are cut to
+# nn-evidence's `detection_payload` and re-exported here; the records stay
+# while their constructors take the engine's decisions (`detection_store`)
 "detection_payload" = "nn-evidence"
 # post-plan (lab PR 250, R08a): the detection budget's reporter task (tokio,
 # the agent's audit log and detection sink), from `detection_budget`: the
@@ -220,17 +244,26 @@ planned = false
 "execq" = "nn-linux"
 "execq::policy" = "nn-core"
 "execq::record" = "nn-core"
-# attach, drain (the ring half; the drift classification → nn-core, R04c),
-# baseline, honeypot, recompute
+# attach, drain (the ring half; R08b, lab PR 251, cut the drift's
+# classification to nn-core's `fim::drift`, re-exported by the drain),
+# baseline, honeypot, recompute; the rules: `[shims.agent]` (R08b)
 "fim" = "nn-linux"
-"fim::rules" = "nn-core"
 "fs_type" = "nn-linux"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
 "host_hardening" = "nn-linux"
-# post-plan (lab PR 225): the ransomware signal (sampler behind a trait)
+# post-plan (lab PR 225): the ransomware signal (sampler behind a trait).
+# R08b (lab PR 251): the tracker moved to nn-core; `impact.rs` binds it to
+# the Linux host and publishes the agent's tracker for `status`
 "impact" = "nn-core"
-# post-plan (lab PR 225): defences switched off, a shipped list
+# post-plan (lab PR 251, R08b): the production sampler of the host's files
+# (`FsSampler`: `O_NOFOLLOW`, the owners and mode bits, `/proc/1/root`);
+# the signal's vocabulary it re-exports is nn-core's
+"impact::entropy" = "nn-linux"
+# post-plan (lab PR 225): defences switched off, a shipped list. R08b (lab
+# PR 251): the detector moved to nn-core; `impair.rs` binds it to the
+# Linux host, names the kernel's `DEFENDER_PIDS` and publishes the agent's
+# detector for `status`
 "impair" = "nn-core"
 "install_manifest" = "nn-linux"
 # the agent's signing key and its files, from `audit` (plan R04a; nn-linux's
@@ -239,15 +272,18 @@ planned = false
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
-# dns_records in R06, lab PR 242), limiter, blocklist (its loaders read the
-# shipped `.v1` through the host: they move with the decision replay that
-# calls them, R08b; lab PR 247 sent its inactive-rules report, which reads
-# the resolver's configuration, to `net::blind_spots`)
+# dns_records in R06, lab PR 242), limiter, blocklist (lab PR 247 sent its
+# inactive-rules report, which reads the resolver's configuration, to
+# `net::blind_spots`): R08b (lab PR 251) moved them, with the resolvers,
+# to nn-core (`[shims.agent]`); `net/mod.rs` binds them to the agent's
+# host (inline modules)
 "net" = "nn-core"
 "net::blind_spots" = "nn-linux"
+# post-plan (lab PR 251, R08b): the DNS pump's ingest (lab PR 229: tokio's
+# `Notify`, `CLOCK_MONOTONIC`), cut from `net::dns_cache` when the cache's
+# state moved to nn-core; the agent's cache carries it
+"net::dns_ingest" = "nn-linux"
 "net::drain" = "nn-linux"
-# post-plan (lab PR 224): the host's resolv.conf
-"net::resolvers" = "nn-linux"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # post-plan (lab PR 234): the OS CSPRNG
@@ -305,6 +341,11 @@ planned = false
 # R08a (lab PR 250): the readers a File or Credential canary spares (they
 # judge on `posture::lineage`); `canary/mod.rs` binds them to the agent's host
 "canary::readers" = "nn-core"
+# R08b (lab PR 251): the canary detector and its indexes, with the rules
+# (the network canaries' addresses it matches were cut from
+# `canary::network` with it); `canary/mod.rs` binds them to the agent's
+# host (an inline module), its tests stay in `canary/detector_tests.rs`
+"canary::detector" = "nn-core"
 # R07 (lab PR 247): the credential renderer; `canary/mod.rs` binds it to the
 # agent's host and draws the deploy's seed from the OS RNG
 "canary::templates" = "nn-core"
@@ -324,6 +365,31 @@ planned = false
 "config::overlay" = "nn-core"
 # R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
 "fim::paths_config" = "nn-core"
+# R08b (lab PR 251): the comm allowlists, with the rules that judge on
+# them; `config/mod.rs` binds the allowlist and its loader to the agent's
+# host (an inline module)
+"config::comm_allowlist" = "nn-core"
+# R08b (lab PR 251): the FIM rules, with the engine
+"fim::rules" = "nn-core"
+# R08b (lab PR 251): the operator's blocklists, with the rules; their
+# loaders take the host that reads a `.v1` (R07's `ContentHost`)
+"net::blocklist" = "nn-core"
+# R08b (lab PR 251): the DNS cache's state, with the rules; the agent's
+# `net::dns_cache` is an inline module of `net/mod.rs` that gives it the
+# pump's ingest (`net::dns_ingest`) and keeps the reply parsers' path (R06)
+"net::dns_cache" = "nn-core"
+# R08b (lab PR 251): the flow tracker (connect → close, the flow id, the
+# open-flow snapshots), with the rules' network state; `net/mod.rs` names it
+# on the agent's host, whose notifier the drain awaits (an inline module)
+"net::flow_tracker" = "nn-core"
+# R08b (lab PR 251): the netflow rows handed to the rules, paced per uid;
+# `net/mod.rs` names the gate on the agent's host (an inline module)
+"net::limiter" = "nn-core"
+# post-plan (lab PR 224): the host's resolv.conf, mapped to nn-linux by
+# lab PR 239; R08b (lab PR 251): the set the network and chain rules
+# consult, read with `std::fs` (portable, as `combat_allow`), moved to
+# nn-core with them
+"net::resolvers" = "nn-core"
 # R08a (lab PR 250): the text of the open sensor's paths (post-plan, lab PR
 # 241, R04b: from `sensors::open_sensor`), the event's vocabulary
 "path_text" = "nn-model"
@@ -381,11 +447,35 @@ planned = false
 # names it (→ 38); the triggers consult the agent's other modules through
 # that host, the posture's second seam (→ 39); the machine, the triggers,
 # the entry and the clock moved, and the agent's `posture.rs`, which binds
-# the posture to the Linux host, names it (→ 36).
+# the posture to the Linux host, names it (→ 36). Lab PR 251 (R08b): 50 →
+# 33, nn-core 36 → 19. The host's resolvers moved to nn-core, so the
+# response policy, the chain and network rules and the decision replay name
+# nn-core's module (→ 32); the engine's seam — the ancestry tree, the
+# transfer tools' clock, R018's and the ransomware tracker's package
+# database, the tracker's host path, the security-tool detector, the FIM
+# rules' window and the rule sets' inert one name the agent's Linux host
+# where they called libc, `std::fs` on `/proc`, `runtime`, `trusted_bin`,
+# `response` and the window (→ 35); the per-rule policy's `/proc` facts
+# stay with the Linux host and `rule_policy.rs` re-exports them from it
+# (→ 36); the blocklists moved (36); the DNS cache's state moved and
+# `net/mod.rs`, which gives the agent's cache the pump's ingest, names it
+# (→ 37); the engine's foundations moved (the ATT&CK mapping, the bounded
+# structures, the flow ledger, the correlation store and ancestry tree) and
+# the agent's `decision/mod.rs`, which binds the store and the tree to the
+# Linux host, names it (→ 38); the engine moved — the rules, the FIM
+# rules, the combination, the per-rule policy, the replay, the comm
+# allowlists, the netflow limiter, the ransomware tracker and the
+# security-tool detector — taking their 13 references with them (the
+# catalogue's three to the rules decided outside the engine stay with its
+# renderer, the agent's), and the shims that bind them to the Linux host
+# name it: `decision.rs`, `impact.rs`, `impair.rs`, `net/mod.rs` (→ 21);
+# the canary detector moved, taking its two references (the registry, the
+# access log, the addresses and the read-forward set are its host's), and
+# `canary/mod.rs`, which binds it to the Linux host, is nn-linux's (→ 19).
 
 [ratchet]
 nn-admin = 8
-nn-core = 36
+nn-core = 19
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

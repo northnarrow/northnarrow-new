@@ -7,7 +7,39 @@
 //! families consume. The FIM loader (`fim/paths_config.rs`) is now
 //! a thin path-typed wrapper over [`overlay::load_flat_list`].
 
-pub mod comm_allowlist;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the comm
+/// allowlists are nn-core's, with the rules that judge on them. The
+/// allowlist reads its lineage through its host and its shipped `.v1`
+/// through the agent's (`LinuxHost`): here under its name, and its loader
+/// under its old name and signature.
+pub mod comm_allowlist {
+    pub use nn_core::config::comm_allowlist::*;
+
+    use std::path::Path;
+
+    use anyhow::Result;
+
+    use crate::chain_host_linux::LinuxHost;
+    use crate::config::overlay::Shipped;
+    use crate::config::overlay_auth::Verified;
+
+    /// [`nn_core::config::comm_allowlist::CommAllowlist`] on the agent's
+    /// host.
+    pub type CommAllowlist = nn_core::config::comm_allowlist::CommAllowlist<LinuxHost>;
+
+    /// [`nn_core::config::comm_allowlist::load_comm_allowlist`] on the
+    /// agent's host.
+    pub fn load_comm_allowlist(
+        label: &str,
+        v1_path: &Path,
+        shipped: Shipped<'_>,
+        local: &Verified,
+    ) -> Result<CommAllowlist> {
+        nn_core::config::comm_allowlist::load_comm_allowlist::<LinuxHost>(
+            label, v1_path, shipped, local,
+        )
+    }
+}
 /// R07 shim (lab PR 247; plan §4.1 rule 2, removed in R17): the generic
 /// `.v1` + `.local` loader is nn-core's. Its loaders that read a shipped
 /// `.v1` take the host as a type parameter; here they read through the

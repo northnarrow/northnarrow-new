@@ -25,7 +25,24 @@ pub mod access_log;
 /// R05 shim (lab PR 241; removed in R17): the canary chains' line reader is
 /// nn-evidence's.
 pub use nn_evidence::chain_lines;
-pub mod detector;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the canary
+/// detector and its indexes are nn-core's, on the agent's host — its signed
+/// registry and access log, its interface addresses, the read-forward set,
+/// `stat(2)` and `/proc` (`canary_host_linux`).
+pub mod detector {
+    pub use crate::canary_host_linux::stat_inode_key;
+
+    /// [`nn_core::canary::detector::Detector`] on the agent's host.
+    pub type Detector = nn_core::canary::detector::Detector<crate::chain_host_linux::LinuxHost>;
+
+    /// [`nn_core::canary::detector::CanaryIndexes`] on the agent's host.
+    pub type CanaryIndexes =
+        nn_core::canary::detector::CanaryIndexes<crate::chain_host_linux::LinuxHost>;
+}
+/// The detector's tests (R08b, lab PR 251: cut from `detector.rs`; they
+/// wire the agent's registry and access log).
+#[cfg(test)]
+mod detector_tests;
 pub mod network;
 pub mod path_policy;
 pub mod read_forward;

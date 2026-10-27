@@ -59,6 +59,10 @@ pub use nn_evidence::chain_host;
 pub mod chain_host_linux;
 /// R05 shim: the newest-first tail reader of the admin read verbs.
 pub use nn_evidence::chain_tail;
+/// The Linux host of the canary detector: the signed registry and access
+/// log, the interface addresses, the read-forward set, `stat(2)`, `/proc`
+/// (nn-core's `CanaryHost`, R08b, lab PR 251).
+pub mod canary_host_linux;
 /// R05 shim: the rotating, signed chains are nn-evidence's; the writer signs
 /// with the agent's key unless told otherwise.
 pub mod chainlog {
@@ -83,6 +87,11 @@ pub use nn_core::correlation;
 /// Lab PR 222: copy on first write (ransomware rollback, EXPERIMENTAL).
 pub mod cow;
 pub mod decision;
+/// The Linux host of the decision engine: the package database's `rpm`, the
+/// work kept off the async runtime, the host's view of a path, the
+/// trusted-installer window, `DEFENDER_PIDS` (nn-core's `DecisionHost`,
+/// R08b, lab PR 251).
+pub mod decision_host_linux;
 /// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the detection
 /// budget is nn-core's; its reporter task is [`detection_report`].
 pub use nn_core::detection_budget;

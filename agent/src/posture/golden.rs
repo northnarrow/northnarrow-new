@@ -99,6 +99,7 @@ use crate::anti_tamper::trusted_installer::{
     TrustedInstallerOverride, MAX_TRUSTED_INSTALLER_WINDOW_SECS,
 };
 use crate::audit::{AgentSigningKey, AuditEntry, AuditLog, AuditStamps};
+use crate::chain_host_linux::LinuxHost;
 use crate::combat::actuator::{SystemActuator, DETECT_ONLY_ISOLATE, NO_BINARY};
 use crate::combat::{
     AuditEvidence, CombatActuator, CombatLadder, IsolateOutcome, LadderConfig, NeutralizeReport,
@@ -1041,7 +1042,8 @@ impl Replay {
             &Verified::Missing,
         )
         .unwrap_or_default();
-        let (tools, _) = SecurityTools::load(&Path::new(CONFIGS).join("security-tools.v1"));
+        let (tools, _) =
+            SecurityTools::load::<LinuxHost>(&Path::new(CONFIGS).join("security-tools.v1"));
         let defense = Arc::new(DefenseDetector::with_proc_root(
             Arc::new(tools),
             lineage.clone(),

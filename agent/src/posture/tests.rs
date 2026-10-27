@@ -249,7 +249,7 @@ fn cross_class_pair_reaches_unlocked_combat() {
 
 fn exploit_postcondition(pid: u32) -> Event {
     let mut ev =
-        crate::decision::rules::epg::tests::epg_event(nn_model::EpgKind::CredFromSyscall, false);
+        crate::decision::rules::epg::testutil::epg_event(nn_model::EpgKind::CredFromSyscall, false);
     if let Event::ExploitPostcondition { pid: p, tid, .. } = &mut ev {
         *p = pid;
         *tid = pid;

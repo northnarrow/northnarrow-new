@@ -102,22 +102,10 @@ pub struct CanaryAccessEntry {
     pub agent_sig: String,
 }
 
-/// Operator-supplied fields for [`CanaryAccessDb::append`].
-/// Chain integrity fields (`ts`, `prev_hash`, `entry_hash`,
-/// `agent_sig`, `agent_id`) are computed by `append`, never
-/// supplied by the caller.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanaryAccessDraft {
-    pub canary_id: String,
-    pub canary_name: String,
-    pub canary_type: CanaryTypeTag,
-    pub access_kind: CanaryAccessKind,
-    pub accessor_pid: u32,
-    pub accessor_uid: u32,
-    pub accessor_comm: String,
-    pub accessor_exe: Option<String>,
-    pub first_trip: bool,
-}
+/// Operator-supplied fields for [`CanaryAccessDb::append`]: nn-core's
+/// since the canary detector, which fills them, moved there (R08b, lab PR
+/// 251).
+pub use nn_core::canary::host::CanaryAccessDraft;
 
 // ── access log ──────────────────────────────────────────────────────
 

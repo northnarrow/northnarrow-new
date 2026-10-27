@@ -832,24 +832,6 @@ pub fn parse_severity_filter(s: &str) -> Option<Severity> {
     }
 }
 
-impl Sensor {
-    /// Parse a `--sensor` token (case-insensitive). Accepts both the
-    /// hyphenated and squashed forms of the two-word sensors.
-    pub fn parse_filter(s: &str) -> Option<Sensor> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "exec" => Some(Sensor::Exec),
-            "file" => Some(Sensor::File),
-            "module-load" | "moduleload" => Some(Sensor::ModuleLoad),
-            "network" => Some(Sensor::Network),
-            "anti-tamper" | "antitamper" => Some(Sensor::AntiTamper),
-            "canary" => Some(Sensor::Canary),
-            "io-uring" | "iouring" | "io_uring" => Some(Sensor::IoUring),
-            "exploit-guard" | "exploitguard" | "exploit_guard" => Some(Sensor::ExploitGuard),
-            _ => None,
-        }
-    }
-}
-
 impl DetectionStatus {
     /// Parse a `--status` filter token (case-insensitive). Accepts
     /// every rung, INCLUDING `open` (an operator can filter for

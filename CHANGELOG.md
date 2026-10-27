@@ -1225,6 +1225,76 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   text but the moved files' paths, the callsite line numbers and the
   reporter's path; the moved modules' tracing target is `nn_core::…` (not
   printed: `with_target(false)`).
+- Wave 4 restructure, R08b — nn-core, part 2b: the decision engine (lab
+  PR 251). Moved to `crates/nn-core` (`git mv`, 65–100 %, most over
+  85 %): the decision engine — the rules, the multi-match combination and
+  its legacy ceiling, the signed per-rule policy and the response switches
+  (lab PR 236), the offline replay that the golden replay and `nn-admin
+  policy test` share, the rule catalogue's table, the ATT&CK mapping, the
+  flow ledger, the chain rules' correlation store and ancestry tree — with
+  the state its rules read: the comm allowlists, the FIM rules, the
+  operator's blocklists, the DNS cache's state, the flow tracker, the
+  netflow limiter, the host's resolvers, the ransomware tracker, the
+  security-tool detector, the drift's classification and the canary
+  detector (with the network canaries' addresses); the parts of a
+  detection record the engine names (`Sensor`, `MitreAttack`,
+  `Principal`) to `crates/nn-evidence`, the bait table and the
+  trusted-installer window's vocabulary to nn-core first. nn-core stays
+  pure: what the engine did on its host itself — `rpm -qf` through
+  `trusted_bin` and the dpkg lists inside tokio's `block_in_place`, the
+  host's view of a path (`/proc/1/root`), `/proc` for the ancestry tree
+  and the per-rule policy's exemption facts, the files' samples, the
+  trusted-installer window, the kernel's `DEFENDER_PIDS`, tokio's `Notify`
+  of the DNS pump and of the flow tracker, the canary registry and access
+  log (signed chains), `getifaddrs`, `stat(2)` — is the new
+  `decision::host::DecisionHost`'s and `canary::host::CanaryHost`'s,
+  implemented for the agent's `LinuxHost` by `decision_host_linux` and
+  `canary_host_linux` with the calls the code made; the exemption facts
+  (`ProcFacts`), the files' sampler (`FsSampler`), the pump's ingest
+  (`net::dns_ingest`) and `stat_inode_key` stay with that host, behind the
+  engine's traits. The posture reads the engine's shapes and per-rule
+  policy itself (`PostureAgent` drops them). The agent keeps every path
+  as a shim (removed in R17): `decision.rs`, `impact.rs`, `impair.rs` and
+  inline modules for the comm allowlist, the limiter, the DNS cache, the
+  flow tracker and the canary detector, with the engine, the stores, the
+  trackers and the detectors as aliases on `LinuxHost`; callers are
+  unchanged but for three list loaders in `main.rs` and the posture's
+  golden replay, which name the host. 699 tests moved with their code and
+  run on the portable test host; the tests that wire the agent's other
+  modules stay in the agent (`decision/host_tests.rs`,
+  `impact/host_tests.rs`, `impair/host_tests.rs`,
+  `canary/detector_tests.rs`), with the golden replay, the validation
+  registry and the catalogue's renderer; the rule catalogue and the
+  validation matrix cite the moved tests at their new paths
+  (`ATTACK_COVERAGE.md` and the Navigator layer unchanged). The ratchet
+  goes from 50 to 33 (nn-core 36 → 19). Left for R08c: the COMBAT
+  ladder's policy and traits, the response types and the executor's
+  policy, the contract and bus skeletons. Identity against `main`
+  55f0e97, same path, the release job's flags: the eBPF object and its
+  stamp are byte-identical (sha256 7b9fa6d2… at that path; stamp source
+  c0365736…); the scanner and the watchdog are byte-identical, stripped
+  and unstripped; the tarball's 72 entries and the .deb's 79 paths and
+  modes are the same; `posture_demo` prints the same lines; `nn-admin
+  policy test` on the golden cases under four policies, with the shipped
+  lists and without, as a table and as JSON, gives the same 402 outputs;
+  the golden replays (five runs), the wire and chain format pins, the
+  crypto vectors, the parser pins, the overlay-v1 fixture and the
+  per-rule policy's format pass unchanged; the test list is `main`'s
+  (3,081 names, 699 now in nn-core). The agent (14,939,576 → 15,035,960
+  bytes) and nn-admin (4,029,840 → 4,086,576) are not byte-identical:
+  function by function, names mapped and addresses dropped, 7,500 of the
+  agent's 7,684 functions and 3,364 of nn-admin's 3,483 are the same
+  code; a control (`main` with nn-core's new dependencies, no source
+  moved) already changes 12 and 7 (clap's `TypeId`s, which of identical
+  bodies keeps its name); the move adds inlining and register choices at
+  the new crate boundary, the seams' functions, and the engine's code
+  made and inlined in the agent's crates now that it is generic over the
+  host (`.text` +83,104 bytes, +1.14 %; nn-admin +44,224, +1.36 %).
+  `.rodata` holds the same text but the moved and new files' paths, the
+  callsite names of the moved and edited files, the catalogue's cited
+  test paths (compiled in, never printed) and literals grouped otherwise;
+  the moved modules' tracing target is `nn_core::…` (not printed:
+  `with_target(false)`).
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

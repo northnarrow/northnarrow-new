@@ -341,7 +341,11 @@ fn cited_kinds(doc: &RuleDoc) -> String {
         ("agent/tests/", "e2e"),
         ("deploy/lab/", "lab"),
     ] {
-        if doc.tests.iter().any(|t| t.starts_with(prefix)) {
+        if doc
+            .tests
+            .iter()
+            .any(|t| t.starts_with(prefix) || unit_of_a_crate(t, kind))
+        {
             kinds.push(kind);
         }
     }
@@ -350,6 +354,17 @@ fn cited_kinds(doc: &RuleDoc) -> String {
     } else {
         kinds.join("+")
     }
+}
+
+/// R08b (lab PR 251): a unit test of a crate of `crates/` (the engine's
+/// rules moved to nn-core with their tests) is a unit test as one of
+/// `agent/src/` is.
+fn unit_of_a_crate(test: &str, kind: &str) -> bool {
+    kind == "unit"
+        && test.strip_prefix("crates/").is_some_and(|t| {
+            t.split_once('/')
+                .is_some_and(|(_, r)| r.starts_with("src/"))
+        })
 }
 
 /// Everything the renderers read.
