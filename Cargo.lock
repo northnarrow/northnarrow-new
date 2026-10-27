@@ -822,7 +822,11 @@ version = "0.0.1"
 name = "nn-core"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
+ "hex",
  "sha2",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

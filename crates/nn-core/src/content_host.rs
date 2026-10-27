@@ -29,3 +29,27 @@ pub trait ContentHost: 'static {
     /// `err` is how [`Self::open_read_nofollow`] refuses a final symlink.
     fn is_symlink_refusal(err: &io::Error) -> bool;
 }
+
+/// The content code's own tests: a portable host. What is Linux about the
+/// agent's host (a symlink refused, a FIFO not waited on) is tested with
+/// it, in the agent (`content_host_linux`).
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::path::Path;
+
+    use super::ContentHost;
+
+    /// Plain `std`: a final symlink followed, no refusal of its own.
+    pub(crate) struct PortableHost;
+
+    impl ContentHost for PortableHost {
+        fn open_read_nofollow(path: &Path) -> io::Result<File> {
+            OpenOptions::new().read(true).open(path)
+        }
+        fn is_symlink_refusal(_err: &io::Error) -> bool {
+            false
+        }
+    }
+}

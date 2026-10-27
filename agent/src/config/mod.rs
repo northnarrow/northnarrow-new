@@ -8,7 +8,56 @@
 //! a thin path-typed wrapper over [`overlay::load_flat_list`].
 
 pub mod comm_allowlist;
-pub mod overlay;
+/// R07 shim (lab PR 247; plan §4.1 rule 2, removed in R17): the generic
+/// `.v1` + `.local` loader is nn-core's. Its loaders that read a shipped
+/// `.v1` take the host as a type parameter; here they read through the
+/// agent's (`LinuxHost`: no symlink followed, no FIFO waited on), under
+/// their old names and signatures.
+pub mod overlay {
+    pub use nn_core::config::overlay::*;
+
+    use std::path::Path;
+
+    use anyhow::Result;
+
+    use crate::chain_host_linux::LinuxHost;
+
+    /// [`nn_core::config::overlay::load_defaults`] on the agent's host.
+    pub fn load_defaults<T>(
+        label: &str,
+        v1_path: &Path,
+        shipped: Shipped<'_>,
+        parse: impl Fn(&str, &str) -> T,
+    ) -> (T, DefaultsSource) {
+        nn_core::config::overlay::load_defaults::<LinuxHost, T>(label, v1_path, shipped, parse)
+    }
+
+    /// [`nn_core::config::overlay::load_pinned_defaults`] on the agent's
+    /// host.
+    pub fn load_pinned_defaults<T>(
+        label: &str,
+        v1_path: &Path,
+        shipped: Shipped<'_>,
+        parse: impl Fn(&str, &str) -> T,
+    ) -> (T, DefaultsSource) {
+        nn_core::config::overlay::load_pinned_defaults::<LinuxHost, T>(
+            label, v1_path, shipped, parse,
+        )
+    }
+
+    /// [`nn_core::config::overlay::load_flat_list`] on the agent's host.
+    pub fn load_flat_list(
+        label: &str,
+        v1_path: &Path,
+        shipped: Shipped<'_>,
+        local: &crate::config::overlay_auth::Verified,
+        validate: EntryValidator<'_>,
+    ) -> Result<OverlayLoad> {
+        nn_core::config::overlay::load_flat_list::<LinuxHost>(
+            label, v1_path, shipped, local, validate,
+        )
+    }
+}
 pub mod overlay_auth;
 pub mod overlay_floor;
 /// The install half of a signed overlay (`config overlay set`'s write and

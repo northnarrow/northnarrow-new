@@ -282,6 +282,9 @@ planned = false
 [shims.agent]
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
+# R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
+# binds its reading loaders to the agent's host
+"config::overlay" = "nn-core"
 "audit" = "nn-evidence"
 # post-plan (lab PR 178): the one reader of the canary chains' lines
 "canary::chain_lines" = "nn-evidence"

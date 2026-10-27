@@ -37,8 +37,8 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use tracing::{error, info, warn};
 
-use crate::chain_host_linux::LinuxHost;
 use crate::config::overlay_auth::{content_sha256, read_overlay, Verified, ALLOW_UNSIGNED_ENV};
+use crate::content_host::ContentHost;
 
 /// Validates a single entry AFTER directive stripping. Returns a
 /// human diagnostic on rejection; the loader wraps it with the
@@ -78,7 +78,7 @@ pub enum DefaultsSource {
     #[default]
     Disk,
     /// The copy built into the agent: the file could not be read (why).
-    /// The caller records it ([`crate::config::overlay_auth::OverlayGate::report_default_unavailable`]).
+    /// The caller records it (the agent's `OverlayGate::report_default_unavailable`).
     BuiltIn(String),
     /// The copy built into the agent: the file on disk is the list an
     /// earlier release shipped (its SHA-256), which `install.sh` replaces.
@@ -88,7 +88,7 @@ pub enum DefaultsSource {
     /// The copy built into the agent is in force, unless the unsigned
     /// configuration escape hatch is set (`loaded_anyway`: the file was
     /// applied). The caller records it
-    /// ([`crate::config::overlay_auth::OverlayGate::report_default_modified`]).
+    /// (the agent's `OverlayGate::report_default_modified`).
     Modified {
         sha256: String,
         builtin_sha256: String,
@@ -142,14 +142,14 @@ impl<'a> Shipped<'a> {
 /// be applied as it was, and `install.sh` never replaced it, so a host kept
 /// the lists of its first install (NET-011, lab PR 78: a KillProcessTree
 /// rule on CGNAT and VPN ranges) and an offline edit took effect silently.
-pub fn load_defaults<T>(
+pub fn load_defaults<H: ContentHost, T>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
     parse: impl Fn(&str, &str) -> T,
 ) -> (T, DefaultsSource) {
     let allow_modified = std::env::var(ALLOW_UNSIGNED_ENV).is_ok_and(|v| v == "1");
-    load_defaults_with(label, v1_path, shipped, allow_modified, true, parse)
+    load_defaults_with::<H, T>(label, v1_path, shipped, allow_modified, true, parse)
 }
 
 /// Lab PR 225: a shipped list with no operator overlay (`security-tools.v1`)
@@ -158,19 +158,19 @@ pub fn load_defaults<T>(
 /// (there is no signed way to tune such a list, so its file is no
 /// configuration), and the message points to no overlay. The file is not
 /// signed: it is compared byte for byte with the built-in copy.
-pub fn load_pinned_defaults<T>(
+pub fn load_pinned_defaults<H: ContentHost, T>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
     parse: impl Fn(&str, &str) -> T,
 ) -> (T, DefaultsSource) {
-    load_defaults_with(label, v1_path, shipped, false, false, parse)
+    load_defaults_with::<H, T>(label, v1_path, shipped, false, false, parse)
 }
 
 /// [`load_defaults`] with the escape hatch given, and whether the list has
 /// a signed `.local` overlay to point the operator to (the tests of the
 /// agent's Linux host call it, R07).
-pub(crate) fn load_defaults_with<T>(
+pub fn load_defaults_with<H: ContentHost, T>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
@@ -184,7 +184,7 @@ pub(crate) fn load_defaults_with<T>(
             source,
         )
     };
-    let bytes = match read_overlay::<LinuxHost>(v1_path) {
+    let bytes = match read_overlay::<H>(v1_path) {
         Ok(b) => b,
         Err(e) => {
             error!(
@@ -261,14 +261,14 @@ pub(crate) fn load_defaults_with<T>(
 ///
 /// `label` prefixes every log line (e.g. `"fim paths-config"` or
 /// `"process-comm-allowlist"`) so boot logs name the family.
-pub fn load_flat_list(
+pub fn load_flat_list<H: ContentHost>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
     local: &Verified,
     validate: EntryValidator<'_>,
 ) -> Result<OverlayLoad> {
-    let (defaults, source) = load_defaults(label, v1_path, shipped, |name, body| {
+    let (defaults, source) = load_defaults::<H, _>(label, v1_path, shipped, |name, body| {
         parse_default_text(name, body, validate)
     });
     let (adds, disables) = match (local.text(), local.source()) {
@@ -448,6 +448,7 @@ fn strip_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_host::testing::PortableHost;
     use tempfile::TempDir;
 
     /// A validator that accepts any non-empty token — keeps the
@@ -476,7 +477,7 @@ mod tests {
     /// the built-in copy): the merge tests below are about the overlay.
     fn load_own(v1: &Path, local: &Verified) -> OverlayLoad {
         let own = std::fs::read_to_string(v1).unwrap();
-        load_flat_list(
+        load_flat_list::<PortableHost>(
             "test-allowlist",
             v1,
             Shipped::new(&own, &[]),
@@ -496,7 +497,7 @@ mod tests {
     fn load_test_list(v1: &Path, allow_modified: bool) -> (BTreeSet<String>, DefaultsSource) {
         let earlier = hex::encode(content_sha256(EARLIER.as_bytes()));
         let earlier = [earlier.as_str()];
-        load_defaults_with(
+        load_defaults_with::<PortableHost, _>(
             "test-allowlist",
             v1,
             Shipped::new(SHIPPED, &earlier),
@@ -674,7 +675,7 @@ mod tests {
     #[test]
     fn a_missing_default_list_uses_the_built_in_copy() {
         let dir = TempDir::new().unwrap();
-        let out = load_flat_list(
+        let out = load_flat_list::<PortableHost>(
             "test-allowlist",
             &dir.path().join("missing.v1"),
             Shipped::new("sshd\nnginx\n", &[]),
@@ -692,7 +693,7 @@ mod tests {
 
         let v1 = dir.path().join("comm.v1");
         std::fs::write(&v1, "curl\n").unwrap();
-        let out = load_flat_list(
+        let out = load_flat_list::<PortableHost>(
             "test-allowlist",
             &v1,
             Shipped::new("curl\n", &[]),
@@ -702,7 +703,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.defaults, DefaultsSource::Disk);
         assert_eq!(out.effective.into_iter().collect::<Vec<_>>(), vec!["curl"]);
-        let out = load_flat_list(
+        let out = load_flat_list::<PortableHost>(
             "test-allowlist",
             &v1,
             Shipped::new("sshd\n", &[]),

@@ -43,8 +43,10 @@ mod tests {
     use anyhow::{anyhow, Result};
     use tempfile::TempDir;
 
+    use super::LinuxHost;
+
     use crate::canary::templates::{render, CredFamily, RenderError};
-    use crate::config::overlay::{load_defaults_with, parse_default_text, DefaultsSource, Shipped};
+    use crate::config::overlay::{parse_default_text, DefaultsSource, Shipped};
     use crate::config::overlay_auth::content_sha256;
 
     /// A validator that accepts any non-empty token (as `config::overlay`'s
@@ -66,7 +68,7 @@ mod tests {
     fn load_test_list(v1: &Path, allow_modified: bool) -> (BTreeSet<String>, DefaultsSource) {
         let earlier = hex::encode(content_sha256(EARLIER.as_bytes()));
         let earlier = [earlier.as_str()];
-        load_defaults_with(
+        nn_core::config::overlay::load_defaults_with::<LinuxHost, _>(
             "test-allowlist",
             v1,
             Shipped::new(SHIPPED, &earlier),

@@ -18,9 +18,13 @@
 /// final symlink and blocks on no FIFO.
 pub mod content_host;
 
-/// Configuration content (R07, lab PR 247): what the list loaders take
-/// from the signed-overlay gate (was in the agent's `config::overlay_auth`).
+/// Configuration content (R07, lab PR 247): the generic `.v1` + `.local`
+/// list loader and what the loaders take from the signed-overlay gate (was
+/// the agent's `config::overlay` and part of its `config::overlay_auth`).
 pub mod config {
+    /// The shipped `.v1` defaults and the operator's `.local` overlay of a
+    /// flat list, merged.
+    pub mod overlay;
     /// The verified overlay content, its hash, the bounded read.
     pub mod overlay_auth;
 }
