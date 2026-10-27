@@ -30,6 +30,12 @@ lab guest, the commit the run recorded (`tree.commit`).
 
 The JSON records all of it (`host`, `tree`, `build`, `agent`, `method`): a
 comparison on another host is refused (exit 2), a different method is noted.
+Another host is another kernel, CPU model, vCPU count, virtualisation or
+clocksource, or a MemTotal beyond a boot's drift: the guest's MemTotal moves
+by a few KiB between boots (8,131,760 KiB on one, 8,131,764 on another), so
+a MemTotal within ±0.1 % of the base's or ±1 MiB, whichever is larger (here
+±8,132 KiB), is the same host — the output notes the drift (lab PR 248;
+before it every such pair needed `--allow-host-mismatch`).
 
 ## 3. The baseline
 

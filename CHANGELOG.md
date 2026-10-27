@@ -417,6 +417,27 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- Lab and validation tooling (lab PR 248; no product change). Under whpx
+  `nn-lab.sh ssh … bash -s` with the script on stdin (a here-doc, a pipe,
+  `< file`) ran none of it and exited 0 (lab PR 245 hit it): there
+  `vm_running` is an ssh probe running `true`, and ssh hands its stdin to
+  the remote command, which dropped the script. The probes now read
+  `/dev/null`, as does every Windows program the script runs (WSL interop
+  gives them the caller's stdin, and tasklist.exe read a piped script to
+  its end). A whpx guest powered off from inside — the lab host's stop
+  helper — took QEMU for Windows down a few seconds later but left its ssh
+  forwarder (unit `nn-fwd-<guest>`, which only `down` stops) listening on
+  127.0.0.1, and `status` called that "stopped"; `down` said "stopped"
+  without checking. `status` now names a forwarder left running, and
+  `down` says "stopped" only once tasklist.exe no longer lists QEMU and
+  systemd no longer runs the forwarder, else it names what is left and
+  exits 1. `cargo xtask perf-compare` took two runs of one guest for two
+  hosts (exit 2) when MemTotal moved by a few KiB between boots (8,131,760
+  and 8,131,764 KiB), so every comparison needed `--allow-host-mismatch`:
+  a MemTotal within ±0.1 % of the base's or ±1 MiB, whichever is larger,
+  is the same host now, and the output notes the drift; another kernel,
+  CPU model or vCPU count, a larger MemTotal change, another
+  virtualisation or clocksource are still refused.
 - The signed `combat_stage` rows of a COMBAT the posture reached said
   `"trigger": null`, and the INVESTIGATE row named no offender (lab PR
   245; found by the golden replay of lab PR 243). The posture's entry hook

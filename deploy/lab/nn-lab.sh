@@ -18,6 +18,10 @@
 #     hypervisor, next to WSL instead of inside it, at full speed. Needs the
 #     "Windows Hypervisor Platform" feature, QEMU for Windows
 #     (NN_LAB_WIN_QEMU), `sudo apt install socat` and a systemd user session.
+#     Stop it with `down` (lab PR 248): a guest powered off from inside takes
+#     QEMU down with it but not its ssh forwarder (unit nn-fwd-<guest>);
+#     `down` stops both and fails when either is left, and `status` names a
+#     forwarder left running.
 #   NN_LAB_ACCEL=tcg — software emulation in WSL: slow, timing-sensitive
 #     tests may not hold.
 #   `echo whpx > ~/.cache/nn-lab/accel` makes it the default.
@@ -337,6 +341,7 @@ vm_running() {
 # and lab probe talks to 127.0.0.1 as with KVM. WHPX hangs on a guest reset
 # ("reboot: Restarting system"), so QEMU runs with -no-reboot: a guest
 # reboot ends the process, and `up` (or the wait for ssh) starts it again.
+# >>> whpx-stop (xtask/tests/lab_host_safety.rs runs this block)
 WIN_LAB_DIR=${NN_LAB_WIN_DIR:-'C:\nn-lab'}
 WIN_QEMU=${NN_LAB_WIN_QEMU:-'C:\Program Files\qemu\qemu-system-x86_64w.exe'}
 WIN_QEMU_IMG=${NN_LAB_WIN_QEMU_IMG:-'C:\Program Files\qemu\qemu-img.exe'}
@@ -345,14 +350,85 @@ FWD_UNIT="nn-fwd-$GUEST_NAME"
 whpx_dir_win() { printf '%s\\%s' "$WIN_LAB_DIR" "$GUEST_NAME"; }
 whpx_dir() { wslpath -u "$(whpx_dir_win)"; }
 # A Windows program, from a Windows working directory (a WSL one makes it
-# warn about UNC paths); a user unit has no interop dirs on PATH.
-win() { (cd /mnt/c && PATH="$PATH:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0" "$@"); }
+# warn about UNC paths); a user unit has no interop dirs on PATH. Never with
+# the caller's stdin (lab PR 248): WSL interop passes it on to the Windows
+# program, and tasklist.exe — every check of QEMU's state — reads a script
+# piped into nn-lab.sh to its end.
+win() { (cd /mnt/c && PATH="$PATH:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0" "$@" </dev/null); }
 whpx_host_ip() { ip route | awk '/default/ {print $3; exit}'; }
 whpx_pid() { tr -d '\r ' < "$(whpx_dir)/qemu.pid" 2>/dev/null || true; }
-whpx_qemu_running() {
-    local p; p=$(whpx_pid)
-    [[ -n "$p" ]] && win tasklist.exe /FI "PID eq $p" 2>/dev/null | tr -d '\r' | grep -q qemu-system
+# This guest's QEMU for Windows: 0 running, 1 not running (no pid file, or
+# tasklist.exe answered without it), 2 cannot tell (tasklist.exe did not
+# run: no Windows interop here).
+whpx_qemu_state() {
+    local p out
+    p=$(whpx_pid)
+    [[ -n "$p" ]] || return 1
+    out=$(win tasklist.exe /FI "PID eq $p" /NH 2>/dev/null) || return 2
+    [[ $out == *qemu-system* ]] && return 0
+    return 1
 }
+whpx_qemu_running() { whpx_qemu_state; }
+# The forwarder unit's state as systemd names it (`inactive` for a unit it
+# does not know), empty without a systemd user session.
+whpx_forward_state() { systemctl --user is-active "$FWD_UNIT" 2>/dev/null || true; }
+
+# Lab PR 248: the forwarder is a unit of its own, and only this stops it. A
+# guest powered off from inside (the host's stop helper, `nn-lab.sh ssh sudo
+# poweroff`) took QEMU for Windows down a few seconds later but left the
+# forwarder listening on 127.0.0.1, which `status` called "stopped"; and
+# this said "stopped" without looking. It still powers the guest off from
+# inside, waits for QEMU (forced after two minutes) and stops the forwarder,
+# and now says "stopped" only once tasklist.exe no longer lists QEMU and
+# systemd no longer runs the forwarder; otherwise it names what is left and
+# fails (exit 1).
+whpx_down() {
+    # The guest is powered off from inside: not without its host key, or
+    # it would be killed after two minutes (lab PR 211).
+    if [[ ! -s $KNOWN_HOSTS ]] && whpx_qemu_running; then die "$(no_host_key_msg); nothing stopped"; fi
+    vssh 'sudo systemctl poweroff' </dev/null >/dev/null 2>&1 || true
+    local _
+    for _ in $(seq 1 60); do whpx_qemu_running || break; sleep 2; done
+    if whpx_qemu_running; then
+        log "forcing QEMU exit"
+        win taskkill.exe /PID "$(whpx_pid)" /F >/dev/null 2>&1 || true
+        for _ in $(seq 1 10); do whpx_qemu_running || break; sleep 1; done
+    fi
+    systemctl --user stop "$FWD_UNIT" 2>/dev/null || true
+    local q=0 fwd left=()
+    whpx_qemu_state || q=$?
+    case $q in
+        0) left+=("QEMU for Windows still runs (pid $(whpx_pid))") ;;
+        2) left+=("no answer from tasklist.exe (Windows interop?): QEMU for Windows may still run") ;;
+    esac
+    fwd=$(whpx_forward_state)
+    case $fwd in
+        inactive | failed) ;;
+        *) left+=("the forwarder $FWD_UNIT is ${fwd:-in an unknown state (no systemd user session?)}") ;;
+    esac
+    if ((${#left[@]})); then
+        local msg
+        msg=$(printf '%s; ' "${left[@]}")
+        log "ERROR: $GUEST_NAME not stopped: ${msg%; }"
+        return 1
+    fi
+    log "stopped: QEMU for Windows not running, forwarder $FWD_UNIT inactive"
+}
+
+whpx_status() {
+    local q=0 fwd
+    fwd=$(whpx_forward_state)
+    whpx_qemu_state || q=$?
+    case $q in
+        0) echo "running: QEMU for Windows pid $(whpx_pid), ssh -i $KEY -p $SSH_PORT $GUEST (forwarder $FWD_UNIT: $fwd)" ;;
+        2) echo "unknown: tasklist.exe gave no answer (Windows interop?); forwarder $FWD_UNIT: ${fwd:-unknown}" ;;
+        *) case $fwd in
+               inactive | failed | "") echo "stopped" ;;
+               *) echo "stopped, but its forwarder $FWD_UNIT is still $fwd on 127.0.0.1:$SSH_PORT: \`nn-lab.sh down\` stops it" ;;
+           esac ;;
+    esac
+}
+# <<< whpx-stop
 whpx_launch() {
     win powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(whpx_dir_win)\\start.ps1" >/dev/null
 }
@@ -420,21 +496,6 @@ EOF
     cmd_check
 }
 
-whpx_down() {
-    # The guest is powered off from inside: not without its host key, or
-    # it would be killed after two minutes (lab PR 211).
-    if [[ ! -s $KNOWN_HOSTS ]] && whpx_qemu_running; then die "$(no_host_key_msg); nothing stopped"; fi
-    vssh 'sudo systemctl poweroff' >/dev/null 2>&1 || true
-    local _
-    for _ in $(seq 1 60); do whpx_qemu_running || break; sleep 2; done
-    if whpx_qemu_running; then
-        log "forcing QEMU exit"
-        win taskkill.exe /PID "$(whpx_pid)" /F >/dev/null 2>&1 || true
-    fi
-    systemctl --user stop "$FWD_UNIT" 2>/dev/null || true
-    log "stopped"
-}
-
 # >>> host-key (xtask/tests/lab_host_safety.rs runs this block)
 # The guest's known_hosts (external audit LAB-025, lab PR 211; see SSH_OPTS).
 no_host_key_msg() {
@@ -458,10 +519,14 @@ vssh() { need_known_host || return; ssh "${SSH_OPTS[@]}" "$GUEST" "$@"; }
 vrsync() { need_known_host || return; rsync -e "$RSYNC_RSH" "$@"; }
 vscp() { need_known_host || return; scp -q "${SCP_OPTS[@]}" "$@"; }
 # One batch connection: 0 the guest answered, 2 a host key that is not the
-# guest's (or no ed25519 key at all), 1 anything else (not up yet).
+# guest's (or no ed25519 key at all), 1 anything else (not up yet). Its
+# stdin is /dev/null (lab PR 248): ssh hands its stdin to the remote command
+# whether that reads it or not, so under whpx, where `vm_running` is this
+# probe, `nn-lab.sh ssh bash -s < script` (a here-doc, a pipe) had the
+# script eaten by the probe's `true` and ran an empty one, exit 0.
 guest_probe() {
     local err
-    err=$(vssh -o BatchMode=yes true 2>&1 >/dev/null) && return 0
+    err=$(vssh -o BatchMode=yes true 2>&1 >/dev/null </dev/null) && return 0
     if grep -qE 'Host key verification failed|no matching host key type|REMOTE HOST IDENTIFICATION HAS CHANGED' <<<"$err"; then
         return 2
     fi
@@ -578,7 +643,7 @@ wait_ssh() {
             # Provisioning done AND we are past the reboot (lsm=bpf active;
             # on a lockdown guest, the lockdown too: Debian's first boot
             # already lists bpf)?
-            if vssh "test -f /var/lib/nn-lab-provisioned && grep -q bpf /sys/kernel/security/lsm${LOCKDOWN:+ && grep -q '\\[$LOCKDOWN\\]' /sys/kernel/security/lockdown}" 2>/dev/null; then
+            if vssh "test -f /var/lib/nn-lab-provisioned && grep -q bpf /sys/kernel/security/lsm${LOCKDOWN:+ && grep -q '\\[$LOCKDOWN\\]' /sys/kernel/security/lockdown}" 2>/dev/null </dev/null; then
                 log "guest is up and provisioned"
                 return 0
             fi
@@ -1525,18 +1590,14 @@ cmd_trust_host_key() {
         *) die "no ed25519 host key from 127.0.0.1:$SSH_PORT (is the guest's sshd up?)" ;;
     esac
     log "previous host key: $old"
-    vssh -o BatchMode=yes true || die "a strict connection with the recorded key failed"
+    vssh -o BatchMode=yes true </dev/null || die "a strict connection with the recorded key failed"
     log "OK: $HOST_KEY_ALIAS $(known_host_fingerprint)"
 }
 
 cmd_status() {
     echo "host key: ${HOST_KEY_ALIAS} $(known_host_fingerprint || echo "not recorded (nn-lab.sh up)") ($KNOWN_HOSTS)"
     if [[ $ACCEL == whpx ]]; then
-        if whpx_qemu_running; then
-            echo "running: QEMU for Windows pid $(whpx_pid), ssh -i $KEY -p $SSH_PORT $GUEST (forwarder $FWD_UNIT: $(systemctl --user is-active "$FWD_UNIT" 2>/dev/null || true))"
-        else
-            echo "stopped"
-        fi
+        whpx_status
         return 0
     fi
     if vm_running; then

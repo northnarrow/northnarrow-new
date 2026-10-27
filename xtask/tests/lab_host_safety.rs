@@ -7,7 +7,12 @@
 //! lab guest and puts `~/.aws` back as it found it, the range teardown says
 //! what it does and deletes no disk outside a VM's folder, and the range
 //! bootstrap refuses a tree it cannot vouch for and records what it
-//! installed. Offline: committed files, `bash`, OpenSSH's client tools,
+//! installed. Lab PR 248: `nn-lab.sh ssh` hands the caller's stdin to the
+//! guest's command (its probe reads none, nor does a Windows program), and
+//! under whpx `down` stops QEMU for Windows and the ssh forwarder and says
+//! "stopped" only when both are gone, while `status` names a forwarder a
+//! guest powered off from inside left listening on 127.0.0.1.
+//! Offline: committed files, `bash`, OpenSSH's client tools,
 //! `git`, `python3 -I` and stubs; no guest, nothing privileged, nothing
 //! written outside the target and temporary directories.
 
@@ -759,6 +764,347 @@ fn nn_lab_has_no_unchecked_guest_connection() {
             );
         }
     }
+}
+
+// ── Lab PR 248: `nn-lab.sh ssh`'s stdin; the whpx stop ──────────────────
+
+/// OpenSSH as far as its stdin goes: unless `-n`, ssh reads its stdin and
+/// hands it to the remote command — run here, by bash — which may leave it
+/// unread: what ssh read is gone either way. Options before the destination
+/// and right after it, as ssh(1) takes them. Every call is logged as the
+/// remote command, a tab and the bytes ssh read.
+const SSH_LIKE: &str = r#"#!/bin/bash
+n=0 dest=
+while (($#)); do
+    case $1 in
+        -n) n=1; shift ;;
+        -[iopFlJLRDEWw]) shift 2 ;;
+        -?*) shift ;;
+        *) [[ -z $dest ]] || break; dest=$1; shift ;;
+    esac
+done
+if ((n)); then exec </dev/null; fi
+buf=$(mktemp "$HOME/ssh-stdin.XXXXXX")
+cat > "$buf"
+printf '%s\t%s\n' "$*" "$(wc -c < "$buf" | tr -d ' ')" >> "$HOME/ssh-calls"
+rc=0
+bash -c "$*" < "$buf" || rc=$?
+rm -f "$buf"
+exit "$rc"
+"#;
+
+/// Lot 245 sent a script with `nn-lab.sh ssh … bash -s < script` and the
+/// guest ran none of it, exit 0: under whpx `vm_running` is a probe, `ssh …
+/// true`, and ssh hands its stdin to `true`, which drops it. The probe now
+/// reads none, and the script runs — from a here-doc, a pipe and a file,
+/// under whpx (the probe) and kvm (the pid file, no probe).
+#[test]
+fn nn_lab_ssh_hands_the_callers_stdin_to_the_guest() {
+    for accel in ["whpx", "kvm"] {
+        let dir = case_dir(&format!("ssh-stdin-{accel}"));
+        let lab = dir.join("lab");
+        fs::create_dir_all(&lab).unwrap();
+        let (_, host) = keypair(&dir, "host");
+        fs::write(
+            lab.join("known_hosts"),
+            format!("nn-lab-ubuntu2404 {host}\n"),
+        )
+        .unwrap();
+        // kvm: the guest "runs" when its pid file names a live process
+        let qemu = (accel == "kvm").then(Sleeper::new);
+        if let Some(q) = &qemu {
+            fs::write(lab.join("qemu.pid"), q.pid()).unwrap();
+        }
+        // nn-lab.sh puts $HOME/.cargo/bin first on its PATH
+        write_exec(&dir.join(".cargo/bin/ssh"), SSH_LIKE);
+        let script = dir.join("script.sh");
+        fs::write(&script, "echo \"FILE-RAN $((6 * 7))\"\n").unwrap();
+        let nn_lab = repo_root().join(NN_LAB);
+        for (how, line, want) in [
+            (
+                "here-doc",
+                format!(
+                    "bash {nn_lab:?} ssh bash -s <<'EOF'\necho \"HEREDOC-RAN $((6 * 7))\"\nEOF\n"
+                ),
+                "HEREDOC-RAN 42",
+            ),
+            (
+                "pipe",
+                format!(
+                    "printf '%s\\n' 'echo \"PIPE-RAN $((6 * 7))\"' | bash {nn_lab:?} ssh bash -s\n"
+                ),
+                "PIPE-RAN 42",
+            ),
+            (
+                "file",
+                format!("bash {nn_lab:?} ssh bash -s < {script:?}\n"),
+                "FILE-RAN 42",
+            ),
+        ] {
+            let _ = fs::remove_file(dir.join("ssh-calls"));
+            let out = bash(
+                &format!("unset NN_LAB_DISTRO NN_LAB_LOCKDOWN NN_LAB_SSH_PORT NN_LAB_CI\n{line}"),
+                &[],
+                &[
+                    ("HOME", dir.to_str().unwrap()),
+                    ("NN_LAB_DIR", lab.to_str().unwrap()),
+                    ("NN_LAB_ACCEL", accel),
+                ],
+            );
+            let t = text(&out);
+            let calls = fs::read_to_string(dir.join("ssh-calls")).unwrap_or_default();
+            assert!(out.status.success(), "{accel} {how}: {t}\n{calls}");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(want),
+                "{accel} {how}: the script did not run (the probe read it?)\n{t}\nssh calls:\n{calls}"
+            );
+            let calls: Vec<&str> = calls.lines().collect();
+            let session = *calls.last().unwrap();
+            assert!(
+                session.starts_with("bash -s\t") && session != "bash -s\t0",
+                "{accel} {how}: {calls:?}"
+            );
+            if accel == "whpx" {
+                assert_eq!(
+                    calls.len(),
+                    2,
+                    "{accel} {how}: the probe, then the session: {calls:?}"
+                );
+                assert_eq!(calls[0], "true\t0", "{accel} {how}: the probe read stdin");
+            } else {
+                assert_eq!(calls.len(), 1, "{accel} {how}: {calls:?}");
+            }
+        }
+    }
+}
+
+/// A whpx host for the `whpx-stop` block: QEMU for Windows, the forwarder
+/// unit and the guest's sshd are stubs that answer from state files —
+/// `qemu`: running (exits when the guest powers off), hung (until a
+/// taskkill), stuck (outlives it), gone, broken (tasklist.exe does not run:
+/// no interop); `fwd`: active, inactive, nobus (no systemd user session);
+/// `fwd-stuck`: a forwarder that does not stop. The Windows programs take
+/// whatever stdin they get, as WSL interop gives it to them, and log it.
+struct Whpx {
+    dir: PathBuf,
+    lab: PathBuf,
+}
+impl Whpx {
+    fn new(name: &str) -> Whpx {
+        let dir = case_dir(name);
+        let lab = dir.join("lab");
+        let win = dir.join("C/nn-lab-test/ubuntu2204");
+        fs::create_dir_all(&lab).unwrap();
+        fs::create_dir_all(&win).unwrap();
+        fs::create_dir_all(dir.join("mnt-c")).unwrap();
+        fs::write(win.join("qemu.pid"), "4568\r\n").unwrap();
+        let (_, host) = keypair(&dir, "host");
+        fs::write(
+            lab.join("known_hosts"),
+            format!("nn-lab-ubuntu2204 {host}\n"),
+        )
+        .unwrap();
+        let bin = dir.join("bin");
+        write_exec(
+            &bin.join("wslpath"),
+            "#!/bin/bash\n[[ $1 == -u ]] && shift\np=${1//\\\\//}\nprintf '%s\\n' \"$T/C/${p#*/}\"\n",
+        );
+        write_exec(
+            &bin.join("tasklist.exe"),
+            "#!/bin/bash\ncat >> \"$T/windows-stdin\"\necho \"tasklist $*\" >> \"$T/calls\"\n\
+             case $(cat \"$T/qemu\") in\n\
+             running | hung | stuck) printf 'qemu-system-x86_64w.exe      4568 Console    1  1.234.567 K\\r\\n' ;;\n\
+             broken) exit 126 ;;\n\
+             *) printf 'INFO: No tasks are running which match the specified criteria.\\r\\n' ;;\n\
+             esac\n",
+        );
+        write_exec(
+            &bin.join("taskkill.exe"),
+            "#!/bin/bash\ncat >> \"$T/windows-stdin\"\necho \"taskkill $*\" >> \"$T/calls\"\n\
+             [[ $(cat \"$T/qemu\") == stuck ]] || echo gone > \"$T/qemu\"\n",
+        );
+        write_exec(
+            &bin.join("ssh"),
+            "#!/bin/bash\ncmd=${*: -1}\necho \"ssh $cmd\" >> \"$T/calls\"\n\
+             case $(cat \"$T/qemu\") in\n\
+             running) [[ $cmd == 'sudo systemctl poweroff' ]] && echo gone > \"$T/qemu\"; exit 0 ;;\n\
+             hung | stuck) exit 0 ;;\n\
+             *) exit 255 ;;\n\
+             esac\n",
+        );
+        write_exec(
+            &bin.join("systemctl"),
+            "#!/bin/bash\n[[ $1 == --user ]] || exit 9\nf=$(cat \"$T/fwd\")\n\
+             if [[ $f == nobus ]]; then echo 'Failed to connect to bus' >&2; exit 1; fi\n\
+             case $2 in\n\
+             stop) echo \"systemctl stop $3\" >> \"$T/calls\"; [[ -e $T/fwd-stuck ]] || echo inactive > \"$T/fwd\" ;;\n\
+             is-active) echo \"$f\"; [[ $f == active ]] ;;\n\
+             *) exit 9 ;;\n\
+             esac\n",
+        );
+        Whpx { dir, lab }
+    }
+
+    /// `body` after the blocks, with stdin "keep-me" (read back at the
+    /// end): (exit code, output, the calls the stubs saw).
+    fn run(
+        &self,
+        qemu: &str,
+        fwd: &str,
+        fwd_stuck: bool,
+        body: &str,
+    ) -> (Option<i32>, String, String) {
+        fs::write(self.dir.join("qemu"), format!("{qemu}\n")).unwrap();
+        fs::write(self.dir.join("fwd"), format!("{fwd}\n")).unwrap();
+        let stuck = self.dir.join("fwd-stuck");
+        if fwd_stuck {
+            fs::write(&stuck, "").unwrap();
+        } else {
+            let _ = fs::remove_file(&stuck);
+        }
+        let _ = fs::remove_file(self.dir.join("calls"));
+        let _ = fs::remove_file(self.dir.join("windows-stdin"));
+        let script = format!(
+            "{}LAB_DIR={lab:?}; ROOT_LAB_DIR=$LAB_DIR; KEY=\"$LAB_DIR/id_ed25519\"; GUEST_NAME=ubuntu2204\n\
+             SSH_PORT=2522; ACCEL=whpx; GUEST=nn@127.0.0.1; NN_LAB_WIN_DIR='C:\\nn-lab-test'\n\
+             {}\n{}\n{}\n\
+             # win() works from /mnt/c, which not every host has; the waits, without waiting\n\
+             cd() {{ if [[ ${{1:-}} == /mnt/c ]]; then builtin cd \"$T/mnt-c\"; else builtin cd \"$@\"; fi; }}\n\
+             sleep() {{ :; }}\n\
+             {{\n{body}\necho \"stdin left: $(cat)\"\n}} <<<keep-me\n",
+            fn_prelude(),
+            block(NN_LAB, "ssh-options"),
+            block(NN_LAB, "host-key"),
+            block(NN_LAB, "whpx-stop"),
+            lab = self.lab.display().to_string(),
+        );
+        let path = format!(
+            "{}:/usr/sbin:/usr/bin:/sbin:/bin",
+            self.dir.join("bin").display()
+        );
+        let out = bash(
+            &script,
+            &[],
+            &[("PATH", &path), ("T", self.dir.to_str().unwrap())],
+        );
+        let calls = fs::read_to_string(self.dir.join("calls")).unwrap_or_default();
+        let t = text(&out);
+        assert!(
+            t.contains("stdin left: keep-me"),
+            "the caller's stdin was read:\n{t}"
+        );
+        assert_eq!(
+            fs::read_to_string(self.dir.join("windows-stdin")).unwrap_or_default(),
+            "",
+            "a Windows program got the caller's stdin"
+        );
+        (out.status.code(), t, calls)
+    }
+
+    fn down(&self, qemu: &str, fwd: &str, fwd_stuck: bool) -> (String, String) {
+        let (code, out, calls) = self.run(
+            qemu,
+            fwd,
+            fwd_stuck,
+            "rc=0; whpx_down || rc=$?; echo \"down rc=$rc\"; whpx_status",
+        );
+        assert_eq!(code, Some(0), "{out}");
+        (out, calls)
+    }
+
+    fn status(&self, qemu: &str, fwd: &str) -> String {
+        let (code, out, _) = self.run(qemu, fwd, false, "whpx_status");
+        assert_eq!(code, Some(0), "{out}");
+        out
+    }
+}
+
+/// Under whpx a guest powered off from inside (the host's stop helper)
+/// took QEMU for Windows down a few seconds later, never the forwarder,
+/// which kept 127.0.0.1:<port> while `status` said "stopped"; and `down`
+/// said "stopped" without looking. `status` names the forwarder now;
+/// `down` stops QEMU (powered off, or killed when it hangs) and the
+/// forwarder, and says "stopped" only when tasklist.exe no longer lists
+/// QEMU and systemd no longer runs the forwarder — else it says what is
+/// left and fails. Neither reads the caller's stdin.
+#[test]
+fn whpx_down_stops_qemu_and_the_forwarder_and_says_what_is_left() {
+    let w = Whpx::new("whpx-stop");
+    let fwd = "nn-fwd-ubuntu2204";
+
+    // the state the stop helper leaves: QEMU gone, the forwarder up
+    let st = w.status("gone", "active");
+    assert!(
+        st.contains(&format!(
+            "stopped, but its forwarder {fwd} is still active on 127.0.0.1:2522: `nn-lab.sh down` stops it"
+        )),
+        "{st}"
+    );
+    let (out, calls) = w.down("gone", "active", false);
+    assert!(out.contains("down rc=0"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "stopped: QEMU for Windows not running, forwarder {fwd} inactive"
+        )),
+        "{out}"
+    );
+    assert!(out.lines().any(|l| l == "stopped"), "status after: {out}");
+    assert!(calls.contains(&format!("systemctl stop {fwd}")), "{calls}");
+    assert!(!calls.contains("taskkill"), "{calls}");
+
+    // a running guest: powered off from inside, QEMU exits by itself
+    let st = w.status("running", "active");
+    assert!(
+        st.contains("running: QEMU for Windows pid 4568,")
+            && st.contains(&format!("(forwarder {fwd}: active)")),
+        "{st}"
+    );
+    let (out, calls) = w.down("running", "active", false);
+    assert!(out.contains("down rc=0"), "{out}");
+    assert!(calls.contains("ssh sudo systemctl poweroff"), "{calls}");
+    assert!(!calls.contains("taskkill"), "{calls}");
+    assert!(calls.contains(&format!("systemctl stop {fwd}")), "{calls}");
+
+    // QEMU that hangs at power-down: killed after the wait
+    let (out, calls) = w.down("hung", "active", false);
+    assert!(
+        out.contains("forcing QEMU exit") && out.contains("down rc=0"),
+        "{out}"
+    );
+    assert!(calls.contains("taskkill /PID 4568 /F"), "{calls}");
+    assert!(out.lines().any(|l| l == "stopped"), "{out}");
+
+    // what is left is named, and `down` fails
+    let (out, _) = w.down("stuck", "active", false);
+    assert!(
+        out.contains("ERROR: ubuntu2204 not stopped: QEMU for Windows still runs (pid 4568)")
+            && out.contains("down rc=1"),
+        "{out}"
+    );
+    let (out, _) = w.down("running", "active", true);
+    assert!(
+        out.contains(&format!(
+            "ERROR: ubuntu2204 not stopped: the forwarder {fwd} is active"
+        )) && out.contains("down rc=1"),
+        "{out}"
+    );
+    let (out, _) = w.down("gone", "nobus", false);
+    assert!(
+        out.contains("is in an unknown state (no systemd user session?)")
+            && out.contains("down rc=1"),
+        "{out}"
+    );
+    let (out, _) = w.down("broken", "active", false);
+    assert!(
+        out.contains(
+            "no answer from tasklist.exe (Windows interop?): QEMU for Windows may still run"
+        ) && out.contains("down rc=1"),
+        "{out}"
+    );
+    assert!(
+        out.contains("unknown: tasklist.exe gave no answer (Windows interop?)"),
+        "{out}"
+    );
 }
 
 // ── LAB-022: ~/.aws (open-sensor-check.sh) ──────────────────────────────
