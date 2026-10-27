@@ -38,10 +38,15 @@
 //! re-reads it for the watchdog's PID (one `/proc/<pid>/stat` read per
 //! event that PID owns): a recycled PID starts later and is not exempt.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+
+use nn_core::posture::host::PostureHost;
+
+/// R08a (lab PR 250): the host the exemption reads through, the agent's,
+/// until it moves to nn-core and takes it as a type parameter.
+use crate::chain_host_linux::LinuxHost as H;
 
 /// Fallback install path of the watchdog binary, used to verify a
 /// candidate PID's `/proc/<pid>/exe` when [`sibling_watchdog_exe`]
@@ -57,7 +62,7 @@ pub fn sibling_watchdog_exe(own_exe: Option<&Path>) -> PathBuf {
     own_exe
         .and_then(Path::parent)
         .map(|dir| dir.join("northnarrow-watchdog"))
-        .filter(|p| p.exists())
+        .filter(|p| H::exists(p))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_WATCHDOG_EXE))
 }
 
@@ -97,7 +102,7 @@ struct ExemptInner {
 impl ExemptPids {
     /// Exempt the agent's own PID. The watchdog slot starts empty.
     pub fn with_agent(agent_pid: u32) -> Self {
-        Self::with_agent_on(agent_pid, Path::new("/proc"))
+        Self::with_agent_on(agent_pid, Path::new(H::PROC_ROOT))
     }
 
     /// [`Self::with_agent`], reading the watchdog's start from
@@ -177,7 +182,7 @@ impl ExemptPids {
 /// `starttime`, field 22 of `<proc_root>/<pid>/stat`, counted after the
 /// `(comm)` field, which may itself hold spaces or parentheses.
 fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
         .split_whitespace()
@@ -214,7 +219,7 @@ pub enum WatchdogResolution {
 /// testable; the `proc_root` indirection lets tests point at a fixture
 /// tree instead of the live `/proc`.
 pub fn resolve_verified_watchdog_pid(pidfile: &Path, expected_exe: &Path) -> WatchdogResolution {
-    resolve_with_proc_root(pidfile, expected_exe, Path::new("/proc"))
+    resolve_with_proc_root(pidfile, expected_exe, Path::new(H::PROC_ROOT))
 }
 
 pub(crate) fn resolve_with_proc_root(
@@ -222,7 +227,7 @@ pub(crate) fn resolve_with_proc_root(
     expected_exe: &Path,
     proc_root: &Path,
 ) -> WatchdogResolution {
-    let text = match fs::read_to_string(pidfile) {
+    let text = match H::read_to_string(pidfile) {
         Ok(t) => t,
         Err(_) => return WatchdogResolution::NotPresent,
     };
@@ -235,7 +240,7 @@ pub(crate) fn resolve_with_proc_root(
         }
     };
     let exe_link = proc_root.join(pid.to_string()).join("exe");
-    let resolved = match fs::read_link(&exe_link) {
+    let resolved = match H::read_link(&exe_link) {
         Ok(p) => p,
         Err(e) => {
             return WatchdogResolution::Unverifiable {
@@ -266,6 +271,7 @@ pub(crate) fn resolve_with_proc_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     /// `<proc_root>/<pid>/stat` with `starttime` (field 22) at `ticks`.

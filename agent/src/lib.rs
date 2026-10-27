@@ -112,6 +112,9 @@ pub mod os_rng;
 /// nn-model's, the crate the module map names; the posture reads it.
 pub use nn_model::path_text;
 pub mod posture;
+/// The Linux host of the posture: the process table, the host's files and
+/// the clocks of nn-core's `PostureHost` (R08a, lab PR 250).
+pub mod posture_host_linux;
 pub mod process_hardening;
 pub mod removed_settings;
 pub mod response;

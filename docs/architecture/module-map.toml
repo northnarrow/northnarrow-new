@@ -253,6 +253,10 @@ planned = false
 # post-plan (lab PR 234): the OS CSPRNG
 "os_rng" = "nn-linux"
 "posture" = "nn-core"
+# post-plan (lab PR 250, R08a): the Linux host of the posture — the process
+# table (`/proc`), the host's files, a directory's owner, the clocks — of
+# nn-core's `posture::host::PostureHost`
+"posture_host_linux" = "nn-linux"
 # post-plan (lab PR 216): no core dump, no readable memory
 "process_hardening" = "nn-linux"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
@@ -362,11 +366,13 @@ planned = false
 # seed stayed in the agent (→ 38). The two left of R07's: `config/mod.rs`
 # and the gate in `config/overlay_auth.rs` name `chain_host_linux`. Lab PR
 # 250 (R08a): 52 → 51, nn-core 38 → 37: the detection budget's reporter
-# task (the detection sink) left it for `detection_report`.
+# task (the detection sink) left it for `detection_report`; the posture's
+# seam — the lineage and the stack exemption name the agent's Linux host
+# where they called `std::fs` and libc, which the scan does not see (→ 39).
 
 [ratchet]
 nn-admin = 8
-nn-core = 37
+nn-core = 39
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

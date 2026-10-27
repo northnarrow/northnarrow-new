@@ -35,6 +35,9 @@ pub mod posture {
     /// The operator's escalation allowlist: process × destination tuples
     /// the exfiltration and lateral-movement counts leave out.
     pub mod escalation_allow;
+    /// What the posture reads from its host: the process table, the host's
+    /// files, the clocks.
+    pub mod host;
     /// The operator's carve-out of the mass-write arm.
     pub mod mass_write_overlay;
     /// The live state, with its monotonic timestamps.
