@@ -31,17 +31,13 @@
 //! [`MAX_ANCESTRY_DEPTH`] with a cycle guard.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nn_core::posture::host::PostureHost;
-
 use super::store::ProcKey;
-// R08b (lab PR 251): the process table and the clocks are the host's
-// (`PostureHost`); the agent's for now, the tree's type parameter once it
-// moves to nn-core.
-use crate::chain_host_linux::LinuxHost as H;
 use crate::decision::bounded::{LazyLru, LossCounter};
+use crate::posture::host::PostureHost;
 
 /// Max parent→child edges retained (about 2 MiB with the recency queue).
 pub const MAX_TRACKED_EDGES: usize = 65_536;
@@ -70,21 +66,26 @@ struct Edge {
 }
 
 /// Per-host parent→child lineage, keyed by child pid.
-pub struct AncestryTree {
+///
+/// R08b (lab PR 251): `H` is the host whose process table the liveness
+/// check reads, with its clocks ([`PostureHost`]; the agent's is
+/// `LinuxHost`).
+pub struct AncestryTree<H: PostureHost> {
     edges: HashMap<u32, Edge>,
     order: LazyLru<u32>,
     proc_root: PathBuf,
     cap: usize,
     live_evictions: LossCounter,
+    host: PhantomData<fn() -> H>,
 }
 
-impl Default for AncestryTree {
+impl<H: PostureHost> Default for AncestryTree<H> {
     fn default() -> Self {
         Self::with_proc_root(H::PROC_ROOT, MAX_TRACKED_EDGES)
     }
 }
 
-impl AncestryTree {
+impl<H: PostureHost> AncestryTree<H> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -97,6 +98,7 @@ impl AncestryTree {
             proc_root: proc_root.into(),
             cap: cap.max(1),
             live_evictions: LossCounter::new(&LIVE_EDGE_EVICTIONS),
+            host: PhantomData,
         }
     }
 
@@ -203,7 +205,7 @@ impl AncestryTree {
             let Some(edge) = self.edges.get(&pid).copied() else {
                 continue;
             };
-            if is_alive(&self.proc_root, pid, edge.start_ns) {
+            if is_alive::<H>(&self.proc_root, pid, edge.start_ns) {
                 live.push(pid);
             } else {
                 self.edges.remove(&pid);
@@ -234,8 +236,8 @@ impl AncestryTree {
 /// `/proc` shows the start in CLOCK_BOOTTIME ticks, ahead of the
 /// monotonic `start_ns` by the time suspended before the start (as in
 /// `posture::lineage`).
-fn is_alive(proc_root: &Path, pid: u32, start_ns: u64) -> bool {
-    let Some(ticks) = proc_start_ticks(proc_root, pid) else {
+fn is_alive<H: PostureHost>(proc_root: &Path, pid: u32, start_ns: u64) -> bool {
+    let Some(ticks) = proc_start_ticks::<H>(proc_root, pid) else {
         return false;
     };
     if start_ns == 0 {
@@ -248,7 +250,7 @@ fn is_alive(proc_root: &Path, pid: u32, start_ns: u64) -> bool {
 }
 
 /// `starttime`, field 22 of `/proc/<pid>/stat`, counted after `(comm)`.
-fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
+fn proc_start_ticks<H: PostureHost>(proc_root: &Path, pid: u32) -> Option<u64> {
     let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
@@ -261,6 +263,20 @@ fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::posture::host::testing::TestHost as H;
+
+    /// R08b (lab PR 251): the tree and its liveness check on the portable
+    /// test host (its `/proc` a fixture, or this machine's).
+    type AncestryTree = super::AncestryTree<H>;
+
+    fn is_alive(proc_root: &Path, pid: u32, start_ns: u64) -> bool {
+        super::is_alive::<H>(proc_root, pid, start_ns)
+    }
+
+    fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
+        super::proc_start_ticks::<H>(proc_root, pid)
+    }
 
     fn k(pid: u32, start: u64) -> ProcKey {
         ProcKey {

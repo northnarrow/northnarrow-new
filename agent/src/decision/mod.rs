@@ -20,19 +20,45 @@
 
 use nn_model::{Event, Verdict};
 
-pub mod attack;
-pub mod bounded;
 pub mod catalogue;
 pub mod combine;
-pub mod correlation;
 pub mod engine;
-pub mod flow_ledger;
 pub mod replay;
 pub mod response_policy;
 pub mod rule_policy;
 pub mod rules;
 
 pub use engine::RuleEngine;
+
+// R08b shims (lab PR 251; plan §4.1 rule 2, removed in R17): the engine's
+// foundations are nn-core's — the ATT&CK mapping, the bounded structures,
+// the flow ledger, and the chain rules' correlation store and ancestry
+// tree, which read the process table through their host (the agent's
+// `LinuxHost` here).
+pub use nn_core::decision::{attack, bounded, flow_ledger};
+
+/// The chain rules' correlation state: nn-core's, on the agent's host.
+pub mod correlation {
+    pub use nn_core::decision::correlation::*;
+
+    /// [`nn_core::decision::correlation::CorrelationStore`] on the agent's
+    /// host.
+    pub type CorrelationStore =
+        nn_core::decision::correlation::CorrelationStore<crate::chain_host_linux::LinuxHost>;
+
+    /// [`nn_core::decision::correlation::AncestryTree`] on the agent's host.
+    pub type AncestryTree =
+        nn_core::decision::correlation::AncestryTree<crate::chain_host_linux::LinuxHost>;
+
+    /// The ancestry tree, on the agent's host.
+    pub mod ancestry {
+        pub use nn_core::decision::correlation::ancestry::*;
+
+        /// [`nn_core::decision::correlation::AncestryTree`] on the agent's
+        /// host.
+        pub type AncestryTree = super::AncestryTree;
+    }
+}
 
 /// Contract every rule implements.
 ///

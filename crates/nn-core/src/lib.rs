@@ -31,8 +31,18 @@ pub mod correlation;
 pub mod detection_budget;
 
 /// The decision engine (R08b, lab PR 251): what it does on its host
-/// (`decision::host`, the agent's `LinuxHost`).
+/// (`decision::host`, the agent's `LinuxHost`); its foundations — the
+/// ATT&CK mapping, the bounded structures, the flow ledger, the chain
+/// rules' correlation store and ancestry tree (were the agent's).
 pub mod decision {
+    // Lab PR 221: the ATT&CK tactics and techniques a rule is evidence of.
+    pub mod attack;
+    // The bounded maps and loss counters of the engine's state.
+    pub mod bounded;
+    // Tappa 10.6: the chain rules' precursors and the ancestry tree.
+    pub mod correlation;
+    // Lab PR 224: the rules that already answered each open flow.
+    pub mod flow_ledger;
     /// The host's calls the engine makes: the package database's `rpm`, the
     /// work kept off the async runtime, the host's view of a path, the
     /// trusted-installer window, the kernel's map of the security tools.
@@ -78,6 +88,11 @@ pub mod canary {
 // moved lineage names, so it compiles as it was in the agent.
 /// `crate::path_text::…`, the open sensor's path text (nn-model's).
 use nn_model::path_text;
+
+// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the path the
+// moved engine names for the parts of a detection record it reads.
+/// `crate::detection_payload::…`, nn-evidence's.
+use nn_evidence::detection_payload;
 
 /// The network state the rules read (R08b, lab PR 251): the operator's
 /// blocklists, the DNS cache, the host's configured DNS resolvers (were the

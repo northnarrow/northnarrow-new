@@ -414,11 +414,14 @@ planned = false
 # stay with the Linux host and `rule_policy.rs` re-exports them from it
 # (→ 36); the blocklists moved (36); the DNS cache's state moved and
 # `net/mod.rs`, which gives the agent's cache the pump's ingest, names it
-# (→ 37).
+# (→ 37); the engine's foundations moved (the ATT&CK mapping, the bounded
+# structures, the flow ledger, the correlation store and ancestry tree) and
+# the agent's `decision/mod.rs`, which binds the store and the tree to the
+# Linux host, names it (→ 38).
 
 [ratchet]
 nn-admin = 8
-nn-core = 37
+nn-core = 38
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

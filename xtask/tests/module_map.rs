@@ -567,7 +567,10 @@ fn scan(map: &ModuleMap) -> Scan {
 fn every_source_file_is_mapped_to_a_crate() {
     let map = module_map();
     let s = scan(&map);
-    assert!(s.files > 200, "the scan found {} files", s.files);
+    // A floor against a scan that finds nothing, not a count: the agent's
+    // files leave for the crates lot by lot (R08b, lab PR 251: the
+    // engine's, 196 files left before it).
+    assert!(s.files > 100, "the scan found {} files", s.files);
     assert!(
         s.unmapped.is_empty(),
         "docs/architecture/module-map.toml: map these modules to the crate they are headed for:\n{}",

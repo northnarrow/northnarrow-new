@@ -825,6 +825,7 @@ dependencies = [
  "anyhow",
  "base64",
  "hex",
+ "nn-evidence",
  "nn-model",
  "northnarrow-common",
  "parking_lot",

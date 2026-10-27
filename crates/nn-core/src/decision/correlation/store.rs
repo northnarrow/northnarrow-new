@@ -52,6 +52,7 @@ use nn_model::telemetry::NetFlowEvent;
 
 use super::ancestry::AncestryTree;
 use crate::decision::bounded::{LazyLru, LossCounter};
+use crate::posture::host::PostureHost;
 
 /// Default correlation lookback (§13 Q4). Rules may pass a different
 /// `window_ns`; this is the value the migrated CHAIN-001..003 use,
@@ -222,7 +223,10 @@ impl Precursor {
 
 /// Shared correlation state. `Arc<Mutex<_>>`-wrapped by the engine and
 /// queried from `Rule::evaluate`.
-pub struct CorrelationStore {
+///
+/// R08b (lab PR 251): `H` is the host of its ancestry tree
+/// ([`AncestryTree`]'s).
+pub struct CorrelationStore<H: PostureHost> {
     per_proc: HashMap<ProcKey, VecDeque<Precursor>>,
     /// External audit NETR-004: keys holding only `PrivEsc`, evicted
     /// first, least recently recorded first.
@@ -234,26 +238,26 @@ pub struct CorrelationStore {
     lost: LossCounter,
     /// D4 — parent→child lineage for cross-PID correlation, and the
     /// `pid → start_ns` map (NETR-009).
-    tree: AncestryTree,
+    tree: AncestryTree<H>,
     /// Review 70 — egresses noted for a precursor processed after them,
     /// per process.
     egress: HashMap<ProcKey, VecDeque<NotedEgress>>,
     egress_order: LazyLru<ProcKey>,
 }
 
-impl Default for CorrelationStore {
+impl<H: PostureHost> Default for CorrelationStore<H> {
     fn default() -> Self {
         Self::with_tree(AncestryTree::new())
     }
 }
 
-impl CorrelationStore {
+impl<H: PostureHost> CorrelationStore<H> {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// A store over `tree` (a fixture proc root in tests).
-    pub fn with_tree(tree: AncestryTree) -> Self {
+    pub fn with_tree(tree: AncestryTree<H>) -> Self {
         Self {
             per_proc: HashMap::new(),
             privesc_only: LazyLru::new(),
@@ -287,7 +291,7 @@ impl CorrelationStore {
         let Precursor { kind, ts_ns, .. } = precursor;
         if !self.per_proc.contains_key(&key) {
             self.new_keys = self.new_keys.wrapping_add(1);
-            if self.new_keys % SWEEP_EVERY == 0 {
+            if self.new_keys.is_multiple_of(SWEEP_EVERY) {
                 self.prune_stale(ts_ns);
             }
             while self.per_proc.len() >= MAX_TRACKED_PROCS {
@@ -822,7 +826,7 @@ impl CorrelationStore {
     }
 
     /// Read-only view of the ancestry tree (lineage queries / tests).
-    pub fn ancestry(&self) -> &AncestryTree {
+    pub fn ancestry(&self) -> &AncestryTree<H> {
         &self.tree
     }
 
@@ -946,6 +950,11 @@ fn earliest_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::posture::host::testing::TestHost as H;
+
+    /// R08b (lab PR 251): the store on the portable test host.
+    type CorrelationStore = super::CorrelationStore<H>;
 
     const SEC: u64 = 1_000_000_000;
     const W: u64 = CORRELATION_WINDOW_NS;
