@@ -74,6 +74,9 @@ pub mod chainlog {
 pub mod chains;
 pub mod combat;
 pub mod config;
+/// The Linux host of the content lists: the open of nn-core's
+/// `ContentHost` (R07, lab PR 247).
+pub mod content_host_linux;
 pub mod correlation;
 /// Lab PR 222: copy on first write (ransomware rollback, EXPERIMENTAL).
 pub mod cow;

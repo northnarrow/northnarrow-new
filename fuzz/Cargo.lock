@@ -843,6 +843,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nn-core"
+version = "0.0.1"
+
+[[package]]
 name = "nn-evidence"
 version = "0.0.1"
 dependencies = [
@@ -910,6 +914,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-core",
  "nn-evidence",
  "nn-model",
  "nn-parse",

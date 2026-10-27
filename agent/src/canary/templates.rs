@@ -79,7 +79,10 @@ use std::path::PathBuf;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use nn_core::content_host::ContentHost;
 use sha2::{Digest, Sha256};
+
+use crate::chain_host_linux::LinuxHost;
 
 /// Default deploy location of the operator-overrideable
 /// template directory. K7 `install.sh` drops the repo's
@@ -268,7 +271,7 @@ pub fn render(
     seed: &str,
     template_dir: Option<&std::path::Path>,
 ) -> Result<String, RenderError> {
-    let template = load_template(family, template_dir)?;
+    let template = load_template::<LinuxHost>(family, template_dir)?;
     let placeholders = build_placeholders(family, seed);
     let out = substitute(&template, &placeholders)?;
     // External audit DEC-017: a JSON family's decoy is a JSON document.
@@ -286,13 +289,13 @@ pub fn render(
 /// Load the template body for `family`. Tries operator
 /// override under `template_dir` first; falls back to the
 /// `include_str!` built-in.
-fn load_template(
+fn load_template<H: ContentHost>(
     family: CredFamily,
     template_dir: Option<&std::path::Path>,
 ) -> Result<String, RenderError> {
     if let Some(dir) = template_dir {
         let candidate = dir.join(format!("{}.tmpl", family.as_wire()));
-        match read_template(&candidate) {
+        match read_template::<H>(&candidate) {
             Ok(body) if is_superseded(family, &body) => {
                 // External audit DEC-007: an earlier release's template left
                 // on disk (an upgrade that did not run install.sh) named the
@@ -328,21 +331,18 @@ fn load_template(
 /// file created as a link to `/dev/zero`, was read without limit at the
 /// next deploy. A template present but refused is
 /// [`RenderError::TemplateRead`] (the deploy is refused and the file
-/// named), never a silent fall-back to the built-in one.
-fn read_template(path: &std::path::Path) -> std::io::Result<String> {
+/// named), never a silent fall-back to the built-in one. The open is the
+/// host's ([`ContentHost`], R07: the agent's is `LinuxHost`,
+/// `O_NOFOLLOW | O_NONBLOCK`).
+fn read_template<H: ContentHost>(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                std::io::Error::other("a symbolic link (not read through one)")
-            } else {
-                e
-            }
-        })?;
+    let f = H::open_read_nofollow(path).map_err(|e| {
+        if H::is_symlink_refusal(&e) {
+            std::io::Error::other("a symbolic link (not read through one)")
+        } else {
+            e
+        }
+    })?;
     if !f.metadata()?.file_type().is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }

@@ -37,6 +37,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use tracing::{error, info, warn};
 
+use crate::chain_host_linux::LinuxHost;
 use crate::config::overlay_auth::{content_sha256, read_overlay, Verified, ALLOW_UNSIGNED_ENV};
 
 /// Validates a single entry AFTER directive stripping. Returns a
@@ -182,7 +183,7 @@ fn load_defaults_with<T>(
             source,
         )
     };
-    let bytes = match read_overlay(v1_path) {
+    let bytes = match read_overlay::<LinuxHost>(v1_path) {
         Ok(b) => b,
         Err(e) => {
             error!(

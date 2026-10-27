@@ -899,6 +899,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-core",
  "nn-evidence",
  "nn-model",
  "nn-parse",

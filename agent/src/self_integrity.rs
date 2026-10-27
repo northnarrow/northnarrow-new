@@ -48,6 +48,7 @@ use parking_lot::Mutex;
 use tracing::{error, info, warn};
 
 use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::chain_host_linux::LinuxHost;
 
 pub const BASE_SECS: u64 = 30;
 /// The op of the signed integrity findings (the audit chain's since R04a,
@@ -411,7 +412,7 @@ fn unit_dropins_with(roots: &[&Path], known_dropins: &[(&str, &str)]) -> Vec<Fin
                 // FIFO): anything else is not the known content.
                 if known_dropins.iter().any(|(known, content)| {
                     *known == shown
-                        && crate::config::overlay_auth::read_overlay(&path)
+                        && crate::config::overlay_auth::read_overlay::<LinuxHost>(&path)
                             .is_ok_and(|b| b == content.as_bytes())
                 }) {
                     continue;
@@ -870,7 +871,7 @@ pub fn config_overlays(dir: &Path) -> Vec<Finding> {
         // External audit LLMR-013: read as the overlay gate reads — once, not
         // through a link, never waiting on a FIFO planted at the name (that
         // stopped this check for good); what cannot be read so is reported.
-        let bytes = match crate::config::overlay_auth::read_overlay(&path) {
+        let bytes = match crate::config::overlay_auth::read_overlay::<LinuxHost>(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {

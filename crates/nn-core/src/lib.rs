@@ -3,7 +3,9 @@
 //!
 //! Why a crate of its own: the common core: no OS call, no tokio, built for six
 //! targets (the CI job `portable-core`). The content lists move here in R07,
-//! the logic in R08.
+//! the logic in R08. What the content code needs from the OS is a trait the
+//! host implements ([`content_host::ContentHost`], R07, lab PR 247; the
+//! agent's is `LinuxHost`).
 //!
 //! Created empty by the Wave 4 restructure, R01 (lab PR 239); the crates it may
 //! depend on, and the rules of the pure crates, are in
@@ -11,3 +13,7 @@
 //! xtask/tests/workspace_layers.rs.
 
 #![forbid(unsafe_code)]
+
+/// What the content lists need from their host: an open that follows no
+/// final symlink and blocks on no FIFO.
+pub mod content_host;

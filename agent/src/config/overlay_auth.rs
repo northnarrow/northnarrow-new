@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
+use nn_core::content_host::ContentHost;
 use nn_proto::admin_signed_payload::{
     OperationCode, OperationExtra, OverlayKind, Role, SignedPayload,
 };
@@ -39,6 +40,7 @@ use tracing::{error, info, warn};
 use super::overlay_floor::RollbackFloor;
 use crate::anti_tamper::admin_auth::AdminAuth;
 use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::chain_host_linux::LinuxHost;
 
 /// Suffix of the signature file next to an overlay.
 pub const SIG_SUFFIX: &str = ".sig";
@@ -344,21 +346,17 @@ enum Read {
 /// External audit LLMR-013: an overlay is read once, without following a
 /// link (the last component), without blocking on a FIFO planted at its
 /// name, and at most [`MAX_OVERLAY_BYTES`]. So is a shipped default list
-/// (`.v1`, LLMR-015).
-pub(crate) fn read_overlay(path: &Path) -> std::io::Result<Vec<u8>> {
+/// (`.v1`, LLMR-015). The open is the host's ([`ContentHost`], R07: the
+/// agent's is `LinuxHost`, `O_NOFOLLOW | O_NONBLOCK`).
+pub fn read_overlay<H: ContentHost>(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                std::io::Error::other("a symbolic link (not read through one)")
-            } else {
-                e
-            }
-        })?;
+    let f = H::open_read_nofollow(path).map_err(|e| {
+        if H::is_symlink_refusal(&e) {
+            std::io::Error::other("a symbolic link (not read through one)")
+        } else {
+            e
+        }
+    })?;
     if !f.metadata()?.file_type().is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
@@ -438,7 +436,7 @@ impl OverlayGate {
 
     /// One read of `path`, and the decision made on those bytes.
     fn read_and_check(&self, kind: OverlayKind, path: &Path) -> (Decision, Read) {
-        let bytes = match read_overlay(path) {
+        let bytes = match read_overlay::<LinuxHost>(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return (Decision::Absent, Read::Missing)
