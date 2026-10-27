@@ -68,8 +68,25 @@
 //! opens a credential store and talks to the network much later (a backup
 //! client, an agent-style helper) is not killed for it. CHAIN-002/005/008
 //! (staging exec, `sudo`/`su`) and the three-step CHAIN-007 (its first step
-//! is the staging exec) keep the 300 s window; so do the review-70 late
-//! completions (`take_egress_after`).
+//! is the staging exec) keep the 300 s window; so do the late completions
+//! below.
+//!
+//! ## Late precursors (review 70, lab PRs 235 and 244)
+//!
+//! A precursor and its egress come through different rings and pumps, so
+//! the precursor can reach the engine after an egress it preceded in kernel
+//! time. CHAIN-007 notes every flow it sees that completes no chain
+//! ([`CorrelationStore::note_egress`]); a late precursor completes the chain
+//! with the noted egress on the kernel timestamps and the verdict names that
+//! egress: a credential read completes CHAIN-007 or CHAIN-001 (review 70), a
+//! staging exec CHAIN-007 (lab PR 235) or CHAIN-002 (lab PR 244). A two-step
+//! chain (CHAIN-001, CHAIN-002), in order or late, claims the egress, naming
+//! its precursor, and a late two-step completion needs an unclaimed one. The
+//! three-step CHAIN-007 takes the egress (it is removed): a late read one
+//! unclaimed or claimed by CHAIN-002, a late exec one unclaimed or claimed.
+//! So a flow gets at most two chain verdicts, the two-step one first and
+//! then CHAIN-007, and the flow ledger keeps the flow's later phases from a
+//! third.
 //!
 //! ## Rate limiting (§13 Q4)
 //!
@@ -167,14 +184,6 @@ fn late_chain_verdict(rule: &dyn Rule, egress: &EgressNote, reasoning: &str) -> 
         event_pid: egress.pid,
         event_filename: egress.comm.clone(),
         timestamp_ns: egress.start_ns,
-    }
-}
-
-fn egress_note(nf: &nn_model::telemetry::NetFlowEvent) -> EgressNote {
-    EgressNote {
-        pid: nf.pid,
-        comm: nf.comm.clone(),
-        start_ns: nf.start_ns,
     }
 }
 
@@ -320,9 +329,10 @@ impl Rule for NnLChain001CredReadThenEgress {
                         ))
                     }
                 }
-                // Review 70: completed in order; no late read may reuse it.
+                // Review 70: completed in order; no late precursor may reuse
+                // it for a two-step chain.
                 let key = store.current_key(nf.pid);
-                store.claim_egress(key, nf.start_ns);
+                store.claim_egress(key, nf.start_ns, PrecursorKind::CredRead);
                 Some(chain_verdict(
                     self,
                     nf,
@@ -351,6 +361,11 @@ impl Rule for NnLChain001CredReadThenEgress {
 /// C2-over-443 case, while excluding DNS avoids the benign resolver
 /// call. The `/tmp`-exec precursor is the high-confidence half; the
 /// egress correlation is what escalates it to Critical.
+///
+/// Lab PR 244: an exec record processed after the egress it preceded
+/// completes the chain with the noted egress (module docs, "Late
+/// precursors"), the resolver exemption, the package carve-out and the
+/// port-53 hold judged on the egress's own destination and time.
 pub struct NnLChain002TmpExecThenEgress {
     buf: Arc<Mutex<CorrelationStore>>,
     lineage: Option<AuthSessionTracker>,
@@ -406,9 +421,11 @@ impl Rule for NnLChain002TmpExecThenEgress {
             // the one chain rule that sees `Event::ProcessSpawn`, so it
             // hosts lineage observation for the whole store. A `/tmp`
             // image additionally records the TmpExec precursor (R001
-            // shape). Always returns None (record-only).
+            // shape).
             // External audit NETR-009: keyed with the process's own start
-            // (POS-003), not `parent_start_ns` (the forking thread's).
+            // (POS-003), not `parent_start_ns` (the parent's start: since
+            // lab PR 238 its thread-group leader's, the forking thread's
+            // before).
             Event::ProcessSpawn {
                 pid,
                 ppid,
@@ -422,14 +439,50 @@ impl Rule for NnLChain002TmpExecThenEgress {
                 store.observe_spawn(*pid, *ppid, *start_ns);
                 // Review 61: the file the kernel executed. External audit
                 // NETR-008: any staging directory, not `/tmp/` alone.
-                if crate::decision::rules::is_staging_path(exe.path_or(filename)) {
-                    let key = ProcKey {
-                        pid: *pid,
-                        start_ns: *start_ns,
-                    };
-                    store.record(key, PrecursorKind::TmpExec, *timestamp_ns);
+                if !crate::decision::rules::is_staging_path(exe.path_or(filename)) {
+                    return None;
                 }
-                None
+                let key = ProcKey {
+                    pid: *pid,
+                    start_ns: *start_ns,
+                };
+                store.record(key, PrecursorKind::TmpExec, *timestamp_ns);
+                // Lab PR 244: the exec was processed after an egress it
+                // preceded (the exec ring's pump behind the connect's, as in
+                // lab PR 235), so the egress was judged without it. The
+                // chain is judged on the kernel timestamps, flow by flow as
+                // in order: the earliest unclaimed egress of this process
+                // within the window after the exec that is not a lookup at a
+                // configured resolver nor a package transaction's. On a miss
+                // the exec is only recorded, as before.
+                let candidates =
+                    store.exec_egresses(*pid, *start_ns, *timestamp_ns, CORRELATION_WINDOW_NS);
+                drop(store);
+                let egress = candidates.into_iter().find(|n| {
+                    !crate::net::resolvers::is_resolver_destination(
+                        &n.dst_addr,
+                        n.dst_port,
+                        &self.resolvers,
+                    ) && !package_mediated(self.lineage.as_ref(), *pid, n.start_ns)
+                })?;
+                // Claimed: no late precursor completes a two-step chain with
+                // it again; a late credential read can still complete
+                // CHAIN-007 with it.
+                self.buf
+                    .lock()
+                    .claim_exec_egress(*pid, *start_ns, egress.start_ns);
+                Some(crate::decision::response_policy::hold_port_53_to(
+                    egress.dst_port,
+                    late_chain_verdict(
+                        self,
+                        &egress,
+                        "Process executed from a staging directory (/tmp, /var/tmp, \
+                         /dev/shm) then opened an outbound flow (other than a lookup at a \
+                         configured resolver) within the correlation window (the exec was \
+                         processed after the flow, in kernel order before it) — dropper C2 \
+                         (T1059 → T1571); kill the process tree + posture → COMBAT",
+                    ),
+                ))
             }
             // Trigger: same-PID egress other than a lookup at a configured
             // resolver (lab PR 224: in any phase of the flow but a refused
@@ -447,6 +500,14 @@ impl Rule for NnLChain002TmpExecThenEgress {
                 {
                     return None;
                 }
+                // Lab PR 244: completed in order; no late precursor completes
+                // a two-step chain with it again (a second staging exec of the
+                // process, a credential read for CHAIN-001), a late read can
+                // still complete CHAIN-007 with it.
+                let mut store = self.buf.lock();
+                let key = store.current_key(nf.pid);
+                store.claim_egress(key, nf.start_ns, PrecursorKind::TmpExec);
+                drop(store);
                 Some(crate::decision::response_policy::hold_port_53(
                     nf,
                     chain_verdict(
@@ -820,8 +881,8 @@ impl Rule for NnLChain007TmpCredExfilSequence {
                     CORRELATION_WINDOW_NS,
                 ) {
                     // Review 70: this rule sees every flow first; keep it
-                    // for a credential read processed after it.
-                    store.note_egress(key, egress_note(nf));
+                    // for a precursor processed after it.
+                    store.note_egress(key, EgressNote::of(nf));
                     return None;
                 }
                 drop(store);
@@ -876,8 +937,10 @@ impl Rule for NnLChain007TmpCredExfilSequence {
             // happened before both: the CI flake of 22/10/2026, where
             // CHAIN-001 fired on the egress and this rule never did. The
             // chain is judged on the kernel timestamps. On a hit the exec is
-            // observed and its `TmpExec` recorded here, as CHAIN-002 would
-            // (this verdict ends the rule pass); on a miss nothing changes.
+            // observed and its `TmpExec` recorded here, as CHAIN-002 would,
+            // and the egress is taken: CHAIN-002, which judges the exec after
+            // this rule, completes no two-step chain with it (lab PR 244). On
+            // a miss nothing changes here.
             Event::ProcessSpawn {
                 pid,
                 ppid,
@@ -2127,6 +2190,241 @@ mod tests {
         }
         let fired = late_exec(11 * SEC, 42, 12 * SEC, not_staged);
         assert!(!fired.iter().any(|id| id == C007), "not staged: {fired:?}");
+    }
+
+    // ── Lab PR 244: NN-L-CHAIN-002 completed by a late exec ─────────
+
+    /// Every chain verdict on `event` (no first-match short-circuit).
+    fn verdicts(rules: &[Box<dyn Rule>], event: &Event) -> Vec<Verdict> {
+        rules.iter().filter_map(|r| r.evaluate(event)).collect()
+    }
+
+    /// The CI ordering of the e2e, deterministically: the `/tmp` exec
+    /// record (its own ring and pump) is processed after the egress it
+    /// preceded, which was judged without it. CHAIN-002 completes on the
+    /// kernel timestamps, naming the egress, once; the exec is recorded for
+    /// the flows that follow.
+    #[test]
+    fn chain002_completes_when_the_exec_is_processed_after_the_egress() {
+        let rules = chain_rules();
+        assert!(fire_ids(&rules, &flow(42, 443, 12 * SEC)).is_empty());
+        let on_exec = verdicts(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC));
+        assert_eq!(on_exec.len(), 1, "{on_exec:?}");
+        let v = &on_exec[0];
+        assert_eq!(v.rule_id, C002);
+        assert_eq!(
+            (v.event_pid, v.timestamp_ns),
+            (42, 12 * SEC),
+            "the verdict names the egress"
+        );
+        assert_eq!(
+            (v.severity, v.action.clone()),
+            (Severity::Critical, ResponseAction::KillProcessTree)
+        );
+        assert!(
+            v.reasoning
+                .contains("the exec was processed after the flow"),
+            "{}",
+            v.reasoning
+        );
+        // Once: a re-exec of the process completes nothing more.
+        let again = fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC + 5));
+        assert!(again.is_empty(), "{again:?}");
+        // The exec was recorded: the next egress is CHAIN-002's in order.
+        assert_eq!(fire_ids(&rules, &flow(42, 443, 13 * SEC)), [C002]);
+    }
+
+    /// The CI ordering of lab PR 235 — the exec processed after the read
+    /// and the egress: CHAIN-001 on the egress, CHAIN-007 on the late exec,
+    /// never CHAIN-002 as well — and the egress first, the exec, then the
+    /// read: CHAIN-002 on the late exec, CHAIN-007 on the late read. Either
+    /// way the flow gets the two-step chain first, then the longer one, and
+    /// nothing completes it a third time.
+    #[test]
+    fn a_flow_gets_at_most_the_two_step_chain_then_chain007() {
+        let rules = chain_rules();
+        assert!(fire_ids(&rules, &cred_fim(42, 11 * SEC)).is_empty());
+        assert_eq!(fire_ids(&rules, &flow(42, 443, 12 * SEC)), [C001]);
+        assert_eq!(
+            fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC)),
+            [C007]
+        );
+        assert!(fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC + 5)).is_empty());
+        assert!(fire_ids(&rules, &cred_fim(42, 11 * SEC + 5)).is_empty());
+
+        let rules = chain_rules();
+        assert!(fire_ids(&rules, &flow(43, 443, 12 * SEC)).is_empty());
+        assert_eq!(
+            fire_ids(&rules, &tmp_exec_started(43, 9 * SEC, 10 * SEC)),
+            [C002]
+        );
+        let on_read = verdicts(&rules, &cred_fim(43, 11 * SEC));
+        assert_eq!(
+            on_read
+                .iter()
+                .map(|v| (v.rule_id.as_str(), v.timestamp_ns))
+                .collect::<Vec<_>>(),
+            [(C007, 12 * SEC)],
+            "the read is the step CHAIN-002 lacked"
+        );
+        assert!(fire_ids(&rules, &cred_fim(43, 11 * SEC + 5)).is_empty());
+        assert!(fire_ids(&rules, &tmp_exec_started(43, 9 * SEC, 10 * SEC + 5)).is_empty());
+    }
+
+    /// An egress CHAIN-002 answered in order is claimed: a second staging
+    /// exec of the process (execve keeps its start) stamped before the
+    /// egress but processed after it completes no second CHAIN-002.
+    #[test]
+    fn an_egress_chain002_answered_in_order_is_not_completed_again() {
+        let rules = chain_rules();
+        assert!(fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC)).is_empty());
+        assert_eq!(fire_ids(&rules, &flow(42, 443, 12 * SEC)), [C002]);
+        let again = fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 11 * SEC));
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// CHAIN-002 over a store CHAIN-007 notes the flows in, with `resolvers`
+    /// configured.
+    fn chain002_with_resolvers(resolvers: &[IpAddr]) -> Vec<Box<dyn Rule>> {
+        let store = Arc::new(Mutex::new(CorrelationStore::new()));
+        vec![
+            Box::new(NnLChain007TmpCredExfilSequence::new(Arc::clone(&store))),
+            Box::new(
+                NnLChain002TmpExecThenEgress::new(store)
+                    .with_resolvers(HostResolvers::fixed(resolvers.iter().copied())),
+            ),
+        ]
+    }
+
+    /// The resolver exemption holds for a late exec: a lookup at a
+    /// configured resolver is no egress (the exec then names the C2 flow
+    /// after it); port 53 of another server is, its kill held as in order.
+    #[test]
+    fn a_late_exec_keeps_the_resolver_exemption_and_the_port_53_hold() {
+        let resolver = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53));
+        let rules = chain002_with_resolvers(&[resolver]);
+        fire_ids(&rules, &flow_to(42, resolver, 53, 11 * SEC));
+        let fired = fire_ids(&rules, &tmp_exec_started(42, 9 * SEC, 10 * SEC));
+        assert!(fired.is_empty(), "a lookup at the resolver: {fired:?}");
+
+        let rules = chain002_with_resolvers(&[resolver]);
+        fire_ids(&rules, &flow_to(43, resolver, 53, 11 * SEC));
+        fire_ids(&rules, &flow(43, 4444, 12 * SEC));
+        let v = verdicts(&rules, &tmp_exec_started(43, 9 * SEC, 10 * SEC));
+        assert_eq!(
+            v.iter()
+                .map(|v| (v.rule_id.as_str(), v.timestamp_ns, v.action.clone()))
+                .collect::<Vec<_>>(),
+            [(C002, 12 * SEC, ResponseAction::KillProcessTree)],
+            "the C2 flow after the lookup"
+        );
+
+        // 203.0.113.9 is no configured resolver: its port 53 is an egress.
+        let rules = chain002_with_resolvers(&[resolver]);
+        fire_ids(&rules, &flow(44, 53, 11 * SEC));
+        let v = verdicts(&rules, &tmp_exec_started(44, 9 * SEC, 10 * SEC));
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(
+            (v[0].rule_id.as_str(), v[0].severity, v[0].action.clone()),
+            (C002, Severity::Critical, ResponseAction::Log)
+        );
+        assert!(
+            v[0].reasoning.contains("[held back: "),
+            "{}",
+            v[0].reasoning
+        );
+    }
+
+    /// The window is the exec's, as in order: an egress at its end
+    /// completes the chain, one past it does not — whichever is processed
+    /// first.
+    #[test]
+    fn a_late_exec_keeps_the_five_minute_window() {
+        for (delta, fires) in [
+            (CORRELATION_WINDOW_NS, true),
+            (CORRELATION_WINDOW_NS + 1, false),
+        ] {
+            let at = 10 * SEC + delta;
+            let in_order = chain_rules();
+            fire_ids(&in_order, &tmp_exec_started(42, 9 * SEC, 10 * SEC));
+            let late = chain_rules();
+            fire_ids(&late, &flow(42, 443, at));
+            for fired in [
+                fire_ids(&in_order, &flow(42, 443, at)),
+                fire_ids(&late, &tmp_exec_started(42, 9 * SEC, 10 * SEC)),
+            ] {
+                assert_eq!(
+                    fired.iter().any(|id| id == C002),
+                    fires,
+                    "{delta}: {fired:?}"
+                );
+            }
+        }
+    }
+
+    /// A late exec completes CHAIN-002 only with an egress of its process
+    /// after it: not one before the exec (kernel time), not another
+    /// process's, not for an exec outside the staging directories or whose
+    /// start is unknown.
+    #[test]
+    fn a_late_exec_completes_chain002_only_after_it() {
+        let late = |flow_pid: u32, flow_ts: u64, exec: Event| {
+            let rules = chain_rules();
+            fire_ids(&rules, &flow(flow_pid, 443, flow_ts));
+            fire_ids(&rules, &exec)
+        };
+        let staged = tmp_exec_started(42, 9 * SEC, 10 * SEC);
+        let mut not_staged = staged.clone();
+        if let Event::ProcessSpawn { filename, .. } = &mut not_staged {
+            *filename = "/usr/bin/dropper".to_string();
+        }
+        for (what, fired) in [
+            (
+                "egress before the exec",
+                late(42, 10 * SEC - 1, staged.clone()),
+            ),
+            (
+                "another process's egress",
+                late(43, 12 * SEC, staged.clone()),
+            ),
+            ("not staged", late(42, 12 * SEC, not_staged)),
+            (
+                "start unknown",
+                late(42, 12 * SEC, tmp_exec_started(42, 0, 10 * SEC)),
+            ),
+        ] {
+            assert!(!fired.iter().any(|id| id == C002), "{what}: {fired:?}");
+        }
+        assert_eq!(late(42, 12 * SEC, staged), [C002]);
+    }
+
+    /// A package transaction's staged scriptlet is spared on a late exec
+    /// too (its flow falls to NN-L-NET-008); another staged program is not.
+    #[test]
+    fn a_late_exec_spares_a_package_transaction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lineage = AuthSessionTracker::new(tmp.path());
+        // root's rpm (720, running) → its scriptlet (721)
+        lineage.ingest_exec(720, 1, "/usr/bin/rpm", &[], SEC, SEC, 0);
+        lineage.ingest_exec(721, 720, "/var/tmp/rpm-tmp.x", &[], 10 * SEC, 10 * SEC, 0);
+        lineage.ingest_exec(702, 1, "/var/tmp/stage2", &[], 10 * SEC, 10 * SEC, 1000);
+        std::fs::create_dir_all(tmp.path().join("720")).unwrap();
+        let store = Arc::new(Mutex::new(CorrelationStore::new()));
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(
+                NnLChain007TmpCredExfilSequence::new(Arc::clone(&store))
+                    .with_lineage(Some(lineage.clone())),
+            ),
+            Box::new(NnLChain002TmpExecThenEgress::new(store).with_lineage(Some(lineage))),
+        ];
+        fire_ids(&rules, &flow(721, 443, 11 * SEC));
+        fire_ids(&rules, &flow(702, 443, 11 * SEC));
+        let scriptlet = fire_ids(&rules, &spawn_at(721, 720, "/var/tmp/rpm-tmp.x", 10 * SEC));
+        assert!(scriptlet.is_empty(), "{scriptlet:?}");
+        assert_eq!(
+            fire_ids(&rules, &spawn_at(702, 1, "/var/tmp/stage2", 10 * SEC)),
+            [C002]
+        );
     }
 
     #[test]

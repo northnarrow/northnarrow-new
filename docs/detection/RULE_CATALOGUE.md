@@ -1755,13 +1755,13 @@ Credential-store access followed by network egress — category `chain_exfiltrat
 | Sensor — data | network (TCP connect, DNS, flows, listeners); exec (sched_process_exec, bprm_check_security) — DC0078 Network Traffic Flow, DC0032 Process Creation |
 | Validation | e2e (V2 Critical sub-gate) |
 
-**Observes.** An outbound flow (at its connect, while it is open, at its close), other than one to port 53 of a configured resolver, from a process whose image is in a staging directory (/tmp, /var/tmp, /dev/shm), within 300 s of its exec. To port 53 of a server that is no configured resolver — a match new in lab PR 224, which exempts only the host's resolvers — the kill is held behind the per-rule response policy (off by default): recorded at the same severity.
+**Observes.** An outbound flow (at its connect, while it is open, at its close), other than one to port 53 of a configured resolver, from a process whose image is in a staging directory (/tmp, /var/tmp, /dev/shm), within 300 s of its exec. To port 53 of a server that is no configured resolver — a match new in lab PR 224, which exempts only the host's resolvers — the kill is held behind the per-rule response policy (off by default): recorded at the same severity. It also completes when the exec record is processed after the flow (lab PR 244), judged on the kernel timestamps.
 
 **Known false positives.** An installer or a test binary run from a temporary directory that talks to the network. A process of a package transaction is spared (NETR-008, lab PR 175); its flow falls to NN-L-NET-008.
 
 **How to test.** Run from /tmp a helper that connects out as its first act (the e2e compiles one, which wins the race against R001's kill), or run the agent in detect-only mode and `cp /usr/bin/curl /tmp/c && /tmp/c http://127.0.0.1:8080/`.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002`
+**Tests.** `agent/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress`, `agent/src/decision/rules/chain.rs::chain002_completes_when_the_exec_is_processed_after_the_egress`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002`
 
 **ATT&CK note.** T1059 and T1571 as the design and the V2 technique rows (TQ18, TQ55) have them. The image need not be an interpreter, and the trigger is any port but 53, so a payload calling home on 443 (T1071) fires it too, which the mapping does not claim.
 

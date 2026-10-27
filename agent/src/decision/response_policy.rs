@@ -122,7 +122,14 @@ pub const PORT_53_KILL: PolicySwitch = PolicySwitch::off(
 /// [`PORT_53_KILL`] for a verdict on a flow to port 53 (the rules skip a
 /// configured resolver's); a verdict on another port passes unchanged.
 pub fn hold_port_53(nf: &nn_model::telemetry::NetFlowEvent, v: Verdict) -> Verdict {
-    if nf.dst_port == crate::net::resolvers::DNS_PORT {
+    hold_port_53_to(nf.dst_port, v)
+}
+
+/// [`hold_port_53`] for a flow known by its destination port: lab PR 244,
+/// an egress NN-L-CHAIN-002 completes when the staging exec that preceded
+/// it is processed after it (`EgressNote`).
+pub fn hold_port_53_to(dst_port: u16, v: Verdict) -> Verdict {
+    if dst_port == crate::net::resolvers::DNS_PORT {
         PORT_53_KILL.hold(v)
     } else {
         v

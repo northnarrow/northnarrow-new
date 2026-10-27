@@ -138,7 +138,9 @@ pub(super) const DOCS: &[RuleDoc] = &[
                    is in a staging directory (/tmp, /var/tmp, /dev/shm), within 300 s of its \
                    exec. To port 53 of a server that is no configured resolver — a match new in lab PR 224, \
                    which exempts only the host's resolvers — the kill is held behind the \
-                   per-rule response policy (off by default): recorded at the same severity.",
+                   per-rule response policy (off by default): recorded at the same severity. \
+                   It also completes when the exec record is processed after the flow (lab \
+                   PR 244), judged on the kernel timestamps.",
         false_positives: "An installer or a test binary run from a temporary directory that \
                           talks to the network. A process of a package transaction is spared \
                           (NETR-008, lab PR 175); its flow falls to NN-L-NET-008.",
@@ -148,6 +150,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
                       http://127.0.0.1:8080/`.",
         tests: &[
             "agent/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress",
+            "agent/src/decision/rules/chain.rs::chain002_completes_when_the_exec_is_processed_after_the_egress",
             "agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002",
         ],
         attack_note: "T1059 and T1571 as the design and the V2 technique rows (TQ18, TQ55) \

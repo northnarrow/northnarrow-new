@@ -1169,3 +1169,41 @@ only in the table below, in the same PR as the evidence.
     payload types into nn-evidence once their constructors leave the
     types.
   - Lab: no guest (moves and seams that keep every call; the identity below). Host, on R05 (452add6), on the lot's last commit before main's lab PR 242 was merged in (80486b7) and on the merge (f951e2f, 3,003 passed with lab PR 242's tests): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked` 69 suites, 2,999 passed, 0 failed (the test list is `main`'s — 3,002 names, every one found at the tip — plus 12: the chain format pin's 5 and its ignored generator, the build facts' 2, the Linux host's exclusive create and `rename_noreplace`, the portable foreign-slot case, the payload kinds' pin); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `crypto_vectors` (19) and `encoded_frames_are_pinned`; `cargo xtask attack-coverage --check`; `cargo xtask golden` with the golden files unchanged; `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core`'s `cargo check` of nn-parse, nn-model, nn-proto, nn-evidence (now code) and nn-core for the five targets; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; `fuzz/Cargo.lock` carries nn-evidence, no lockfile changed by the build): all pass. Identity against `main` c7bb346, same path, same commands: the eBPF object is byte-identical (sha256 2cfdde83…) at R05 and the tip, its stamp's source hash c3651dc3… → c0365736… (the execq step: `common`'s sources and manifest). Built as the release job builds (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`): scanner 401,400 → 401,368 bytes, watchdog 2,336,904 → 2,336,920, nn-admin 3,912,344 → 4,006,152, agent 14,642,952 → 14,842,344. Unstripped (same flags, `CARGO_PROFILE_RELEASE_STRIP=none`), function by function — names mapped to their new crates and modules, the key and host type parameters dropped, addresses dropped (instruction addresses, rip displacements, branch targets, the layout-dependent symbol of a data reference), trailing padding dropped: scanner 478 of 479 the same (the postcard decoder of `Vec<execq::HashEntry>`), watchdog 2,242 of 2,244 (tracing-subscriber's `downcast_raw` and `main`'s closure: `TypeId` constants), nn-admin 2,980 of 3,131 (5 and 24 unpaired), agent 6,639 of 6,893 (16 and 40 unpaired; of the 254, 135 in dependencies, 65 nn-evidence's, 47 the agent's — stack frames, registers, inlining at the new boundary, clap's `TypeId`s of the agent's enums —, 4 in the new modules, 3 nn-proto/nn-model). `.text` grows by 2.5 % in the agent and nn-admin: rustc instantiates a generic function in each crate that uses it in a release build, and the copies of the same instantiation went from 509 to 669 in the agent (serde_json's deserializers of the audit row, chrono's formatting, base64's decode, one copy per crate). `.rodata`'s source paths and callsite lines differ only for the moved files (`agent/src/{audit,chain_anchor,chain_tail,chainlog}.rs` → `crates/nn-evidence/src/…`; `keys.rs`, `chains.rs`, `path_text.rs` new) and the lines of the edited ones (main.rs, admin_socket.rs, self_integrity.rs, detection_store.rs, agent_id.rs, open_sensor.rs, the exec policy's and quarantine's records); nn-admin's help text says `nn_model::Event`; the moved modules' tracing target is `nn_evidence::…` (not printed: `with_target(false)`). `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes, the four binaries' sizes, `RULE_POLICY.md` (the help's doc) and `CHANGELOG.md` aside.
+- **Lab PR 244 — NN-L-CHAIN-002 completed by a `/tmp` exec processed
+  after the egress.** C14 (behavioural detection and correlation); Wave 4
+  Phase 2.
+  - What was wrong: the exec record of a staged program comes through its
+    own ring and pump, so it can reach the engine after the connect it
+    preceded in kernel time; the connect was then judged without the
+    `TmpExec` precursor, and the exec completed nothing: NN-L-CHAIN-002
+    was missed (R001's kill on the exec, no Critical chain verdict). Lab PR
+    235 fixed the same race for NN-L-CHAIN-007 and left CHAIN-002 out on
+    purpose: the noted egress had no destination port, which CHAIN-002
+    needs to leave a lookup at a configured resolver alone (lab PR 224)
+    and to hold its port-53 kill (`PORT_53_KILL`).
+  - What changed: the egress note keeps the destination address and port
+    (`EgressNote::of`: two fixed-size fields; still at most four notes per
+    process and 4,096 processes). A staging exec judges the unclaimed
+    notes of its process on the kernel timestamps
+    (`CorrelationStore::exec_egresses`): the earliest egress at or after
+    the exec and within 300 s of it that is neither a lookup at a
+    configured resolver nor a package transaction's completes CHAIN-002,
+    the verdict naming the egress, its port-53 kill held as in order; the
+    exec's start must be known. The claim on a noted egress names the
+    two-step chain that made it (`CredRead` for CHAIN-001, `TmpExec` for
+    CHAIN-002), and CHAIN-002 now claims in order too: a late two-step
+    completion needs an unclaimed egress; CHAIN-007 takes one claimed by
+    CHAIN-002 on a late read (the read is the step it lacked) and any on a
+    late exec, as lab PR 235 left it. The flow-ledger rule is unchanged: at
+    most two chain verdicts per flow, the two-step one first, then
+    CHAIN-007. The comments of `chain.rs` and `ancestry.rs` no longer call
+    `parent_start_ns` the forking thread's start (the parent's thread-group
+    leader's since lab PR 238). Tests: 3 of the store (the note's
+    destination, the late exec's candidates, the claim), 7 of the chains
+    (the CI ordering with and without the read, the in-order claim, the
+    resolver exemption and the port-53 hold, the window, the ordering, the
+    package carve-out), 1 of the engine (the late exec's decision with
+    R001 and one kill; two chain verdicts for the flow); golden cases
+    `chain002-late-exec` and `chain002-late-exec-resolver`, every other
+    golden file byte-identical.
+  - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX), this PR's code (local commit db39770, on `main` 70715b2, before the rebase below) synced, built and installed (`nn-lab.sh sync`, `build`, `install`: the agent and the watchdog active), the installed units then stopped the operator way (`lab_purge_pins`, no LSM program left), and `detection_rules_at_scale_privileged_e2e` (16 tests, NN-L-CHAIN-002 positive and negative and NN-L-CHAIN-004..008 among them) run 10 times as root, single-threaded, with `--include-ignored`: 10 of 10 runs passed, 16 of 16 tests each (47 to 50 s a run); the units put back, the guest powered off. Host, on db39770 and again after the rebase onto `main` 1f70068 (#444: uuid 1.29 in `Cargo.lock` and `fuzz/Cargo.lock`): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,014 passed, 0 failed; `cargo xtask attack-coverage --check`; `cargo xtask golden` (the two new golden files, every other one unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass, both times.
