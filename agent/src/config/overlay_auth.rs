@@ -661,6 +661,11 @@ fn append(log: &Arc<Mutex<AuditLog>>, draft: AuditEntryDraft) {
     }
 }
 
+/// The network isolator with this gate (R09a, lab PR 253: from the
+/// isolator's tests).
+#[cfg(test)]
+mod isolator_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

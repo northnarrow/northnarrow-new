@@ -363,7 +363,7 @@ impl NetworkIsolator {
     /// `iptables_bin`, exercising the success path without root or
     /// real firewall side effects.
     #[cfg(test)]
-    fn new_with_bin(
+    pub(crate) fn new_with_bin(
         rules_path: PathBuf,
         restore_bin: PathBuf,
         iptables_bin: PathBuf,
@@ -561,7 +561,7 @@ impl NetworkIsolator {
     /// spliced in ahead of the catch-all DROP. Returns the rendered
     /// ruleset and the list of IPv4 CIDRs actually carved out (for
     /// logging). Re-reads the allow file every call — never cached.
-    fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
+    pub(crate) fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
         use nn_proto::admin_signed_payload::OverlayKind;
         let base = self.trusted_source(
             OverlayKind::CombatRulesV4,
@@ -628,7 +628,7 @@ impl NetworkIsolator {
     /// ungated, so one created between the check and the read was applied
     /// unsigned; the gate already answers a missing file with the built-in
     /// list.
-    fn trusted_allow(&self) -> combat_allow::AllowLoad {
+    pub(crate) fn trusted_allow(&self) -> combat_allow::AllowLoad {
         use nn_proto::admin_signed_payload::OverlayKind;
         if self.gate.is_none() {
             return combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
@@ -1720,103 +1720,6 @@ mod tests {
             let path = format!("/usr/sbin/{name}");
             assert!(listed.contains(path.as_str()), "{path} not in fim-paths.v1");
         }
-    }
-
-    /// External audit ATP-001 / DEP-003: with the overlay gate, a ruleset
-    /// rewritten to isolate nothing and a carve-out adding a network,
-    /// neither signed, are not applied — the built-in content is; the
-    /// shipped content is applied as it is; a deleted ruleset no longer
-    /// fails the engage.
-    #[test]
-    fn unsigned_combat_files_give_way_to_the_builtin_content() {
-        let Some(restore) = mock_restore_bin() else {
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let admin_pub = dir.path().join("admin.pub");
-        std::fs::write(&admin_pub, format!("{} config-manage\n", "00".repeat(32))).unwrap();
-        let gate = std::sync::Arc::new(crate::config::overlay_auth::OverlayGate::new(
-            &admin_pub,
-            [1; 16],
-            crate::config::overlay_floor::RollbackFloor::default(),
-        ));
-        let v4 = dir.path().join("combat-rules.v4");
-        let allow = dir.path().join("combat-allow.cidrs");
-        std::fs::write(
-            &v4,
-            "*filter\n:NORTHNARROW_COMBAT - [0:0]\n-A NORTHNARROW_COMBAT -j ACCEPT\nCOMMIT\n",
-        )
-        .unwrap();
-        std::fs::write(&allow, "203.0.113.0/24\n").unwrap();
-        let iso = NetworkIsolator::new_with_bin(v4.clone(), restore, PathBuf::from("/bin/true"))
-            .unwrap()
-            .with_allow_cidrs_path(allow.clone())
-            .with_overlay_gate(gate);
-        let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
-        assert!(
-            ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"),
-            "{ruleset}"
-        );
-        assert!(
-            !ruleset.contains("-A NORTHNARROW_COMBAT -j ACCEPT\n"),
-            "{ruleset}"
-        );
-        assert!(
-            carved.is_empty(),
-            "an unsigned carve-out spares nothing: {carved:?}"
-        );
-        // the shipped content is applied as it is
-        std::fs::write(&v4, BUILTIN_RULES_V4).unwrap();
-        std::fs::write(&allow, BUILTIN_ALLOW).unwrap();
-        let (ruleset, _) = iso.build_engaged_ruleset().expect("build");
-        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
-        // deleted: the built-in ruleset, not a failed engage
-        std::fs::remove_file(&v4).unwrap();
-        let (ruleset, _) = iso.build_engaged_ruleset().expect("built-in when deleted");
-        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
-        assert!(validate_ruleset(BUILTIN_RULES_V4).is_ok());
-        assert!(validate_ruleset(BUILTIN_RULES_V6).is_ok());
-        assert!(validate_ruleset("*filter\n:NORTHNARROW_COMBAT - [0:0]\nCOMMIT\n").is_err());
-    }
-
-    /// External audit NN-AUD-095: with a gate, a carve-out file that is
-    /// missing is answered by the gate (the built-in, empty list), not by
-    /// the ungated loader — whose read would apply a file created after
-    /// the old `exists()` check without a signature. The ungated loader's
-    /// mark is its `read_error` for the missing file.
-    #[test]
-    fn missing_allow_file_is_never_read_ungated() {
-        let dir = tempfile::tempdir().unwrap();
-        let admin_pub = dir.path().join("admin.pub");
-        std::fs::write(&admin_pub, format!("{} config-manage\n", "00".repeat(32))).unwrap();
-        let gate = std::sync::Arc::new(crate::config::overlay_auth::OverlayGate::new(
-            &admin_pub,
-            [1; 16],
-            crate::config::overlay_floor::RollbackFloor::default(),
-        ));
-        let allow = dir.path().join("combat-allow.cidrs");
-        let ungated = NetworkIsolator::new_with_bin(
-            combat_rules_path(),
-            PathBuf::from("/usr/bin/cat"),
-            PathBuf::from("/bin/true"),
-        )
-        .unwrap()
-        .with_allow_cidrs_path(allow.clone());
-        assert!(
-            ungated.trusted_allow().read_error.is_some(),
-            "without a gate the file is read directly"
-        );
-        let gated = ungated.with_overlay_gate(gate);
-        let load = gated.trusted_allow();
-        assert!(
-            load.read_error.is_none(),
-            "read outside the gate: {:?}",
-            load.read_error
-        );
-        assert!(load.entries.is_empty() && load.warnings.is_empty());
-        // and once the file appears, unsigned, it spares nothing either
-        std::fs::write(&allow, "203.0.113.0/24\n").unwrap();
-        assert!(gated.trusted_allow().entries.is_empty());
     }
 
     #[test]

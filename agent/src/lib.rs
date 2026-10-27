@@ -14,6 +14,10 @@
 pub mod admin_cli;
 pub mod admin_socket;
 pub mod agent_id;
+/// The agent reads its identity once: a scan of `main.rs` (R09a, lab PR
+/// 253: from `agent_id`'s tests).
+#[cfg(test)]
+mod agent_id_tests;
 pub mod anchored;
 pub mod anti_tamper;
 pub mod async_fd;
@@ -84,6 +88,10 @@ pub mod config;
 /// The Linux host of the content lists: the open of nn-core's
 /// `ContentHost` (R07, lab PR 247).
 pub mod content_host_linux;
+/// What is Linux about the content reads, through the agent's loaders and
+/// renderer (R09a, lab PR 253: from `content_host_linux`'s tests).
+#[cfg(test)]
+mod content_host_tests;
 /// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the buffer of
 /// recent events the posture's triggers read is nn-core's.
 pub use nn_core::correlation;
