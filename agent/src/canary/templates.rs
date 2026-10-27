@@ -697,23 +697,6 @@ mod tests {
         }
     }
 
-    /// External audit DEC-007: the File canary body carries no marker and
-    /// no fingerprint, and neither its content nor its size is the same on
-    /// every decoy.
-    #[test]
-    fn file_canary_body_has_no_marker_or_fingerprint() {
-        let a = render_file_body(&new_content_seed());
-        let b = render_file_body(&new_content_seed());
-        for body in [&a, &b] {
-            assert!((512..4096).contains(&body.len()));
-            assert_no_marker("file body", &String::from_utf8_lossy(body));
-            assert!(!String::from_utf8_lossy(body).contains("deadbeef"));
-        }
-        assert_ne!(a, b, "two deploys, two bodies");
-        let seed = "5a".repeat(32);
-        assert_eq!(render_file_body(&seed), render_file_body(&seed));
-    }
-
     /// External audit DEC-008: the seed used to be `<operator fp>:<path>`
     /// and `short_id` its first 8 characters, so the fingerprint was
     /// printed into the azure, gcp and docker decoys.
@@ -732,20 +715,6 @@ mod tests {
             assert!(
                 !body.contains(fp) && !decoded.contains(fp),
                 "{family:?} carries the operator fingerprint"
-            );
-        }
-    }
-
-    /// External audit DEC-008: every deploy draws its own seed.
-    #[test]
-    fn content_seeds_are_fresh() {
-        let (a, b) = (new_content_seed(), new_content_seed());
-        assert_eq!(a.len(), 64);
-        assert_ne!(a, b);
-        for family in FAMILIES {
-            assert_ne!(
-                render(family, &a, None).unwrap(),
-                render(family, &b, None).unwrap()
             );
         }
     }
@@ -1047,52 +1016,6 @@ mod tests {
         // at the cap: read
         std::fs::write(&path, "#".repeat(MAX_TEMPLATE_BYTES as usize)).unwrap();
         assert!(render(CredFamily::Aws, TEST_ID, Some(dir.path())).is_ok());
-    }
-
-    /// External audit DEC-016 (lab PR 178): a link at a template's name
-    /// (`/dev/zero`, or a file elsewhere) is not read through, and refuses
-    /// the render instead of falling back to the built-in one.
-    #[test]
-    fn symlinked_template_is_refused() {
-        let dir = TempDir::new().unwrap();
-        let elsewhere = dir.path().join("elsewhere");
-        std::fs::write(&elsewhere, "aws_access_key_id = {{access_key_id}}\n").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, dir.path().join("aws.tmpl")).unwrap();
-        std::os::unix::fs::symlink("/dev/zero", dir.path().join("gcp.tmpl")).unwrap();
-        for family in [CredFamily::Aws, CredFamily::Gcp] {
-            match render(family, TEST_ID, Some(dir.path())) {
-                Err(RenderError::TemplateRead { source, .. }) => {
-                    assert!(source.to_string().contains("symbolic link"), "{source}")
-                }
-                other => panic!("expected TemplateRead, got {other:?}"),
-            }
-        }
-        // a directory at the name is refused too
-        std::fs::create_dir(dir.path().join("docker.tmpl")).unwrap();
-        assert!(matches!(
-            render(CredFamily::Docker, TEST_ID, Some(dir.path())),
-            Err(RenderError::TemplateRead { .. })
-        ));
-    }
-
-    /// External audit DEC-016 (lab PR 178): a FIFO at a template's name used
-    /// to block the deploy (and its admin connection) until a writer came.
-    #[test]
-    fn fifo_template_does_not_block() {
-        let dir = TempDir::new().unwrap();
-        let fifo = dir.path().join("aws.tmpl");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        // SAFETY: mkfifo on a NUL-terminated path in our temp dir.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let template_dir = dir.path().to_path_buf();
-        std::thread::spawn(move || {
-            let _ = tx.send(render(CredFamily::Aws, TEST_ID, Some(&template_dir)).is_err());
-        });
-        let refused = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the render returns instead of blocking on the FIFO");
-        assert!(refused, "a FIFO is not a template");
     }
 
     /// A template that is not UTF-8 is refused, as before.

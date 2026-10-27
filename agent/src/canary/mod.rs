@@ -32,3 +32,61 @@ pub mod read_forward;
 pub mod readers;
 pub mod registry;
 pub mod templates;
+
+/// The deploy's seed: drawn fresh from the OS for each decoy. R07 (lab PR
+/// 247): from `templates`' tests (the renderer's own run on a portable
+/// host since); these draw the agent's seeds.
+#[cfg(test)]
+mod tests {
+    use super::templates::{new_content_seed, render, render_file_body, CredFamily};
+
+    const FAMILIES: [CredFamily; 5] = [
+        CredFamily::Aws,
+        CredFamily::Azure,
+        CredFamily::Gcp,
+        CredFamily::Docker,
+        CredFamily::Generic,
+    ];
+
+    /// What would tell an attacker the file is a canary, or whose (as
+    /// `templates`' tests).
+    const MARKERS: [&str; 5] = ["northnarrow", "canary", "do not use", "decoy", "nn-l-"];
+
+    fn assert_no_marker(what: &str, body: &str) {
+        let lower = body.to_lowercase();
+        for m in MARKERS {
+            assert!(!lower.contains(m), "{what} carries {m:?}: {body}");
+        }
+    }
+
+    /// External audit DEC-007: the File canary body carries no marker and
+    /// no fingerprint, and neither its content nor its size is the same on
+    /// every decoy.
+    #[test]
+    fn file_canary_body_has_no_marker_or_fingerprint() {
+        let a = render_file_body(&new_content_seed());
+        let b = render_file_body(&new_content_seed());
+        for body in [&a, &b] {
+            assert!((512..4096).contains(&body.len()));
+            assert_no_marker("file body", &String::from_utf8_lossy(body));
+            assert!(!String::from_utf8_lossy(body).contains("deadbeef"));
+        }
+        assert_ne!(a, b, "two deploys, two bodies");
+        let seed = "5a".repeat(32);
+        assert_eq!(render_file_body(&seed), render_file_body(&seed));
+    }
+
+    /// External audit DEC-008: every deploy draws its own seed.
+    #[test]
+    fn content_seeds_are_fresh() {
+        let (a, b) = (new_content_seed(), new_content_seed());
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+        for family in FAMILIES {
+            assert_ne!(
+                render(family, &a, None).unwrap(),
+                render(family, &b, None).unwrap()
+            );
+        }
+    }
+}
