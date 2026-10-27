@@ -5610,7 +5610,7 @@ mod tests {
     fn fim010_verdict(out: &[Event]) -> Option<nn_model::ResponseAction> {
         use crate::decision::Rule as _;
         out.iter().find_map(|e| {
-            crate::fim::rules::NnLFim010RansomwareExtensionRename
+            crate::fim::rules::NnLFim010RansomwareExtensionRename::default()
                 .evaluate(e)
                 .map(|v| v.action)
         })
@@ -5631,7 +5631,7 @@ mod tests {
         assert_eq!(fe.dest_path.as_deref(), Some(want.to_str().unwrap()));
         assert!(fim010_fires(&out), "x → x.locked must fire NN-L-FIM-010");
         use crate::decision::Rule as _;
-        let v = crate::fim::rules::NnLFim010RansomwareExtensionRename
+        let v = crate::fim::rules::NnLFim010RansomwareExtensionRename::default()
             .evaluate(&Event::Fim(FimEvent {
                 timestamp_ns: fe.timestamp_ns + 10_000_000_000,
                 ..fe.clone()

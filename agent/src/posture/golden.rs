@@ -44,10 +44,12 @@
 //!   (`response::kill`, pidfds, cgroupfs) is not replayed — its privileged
 //!   tests are;
 //! - the signed rows: the real `AuditEvidence` over a real `AuditLog` in
-//!   the replay's directory. Their timestamps (and so their hashes and
-//!   signatures) are the writer's own clock, and `client_pid` is the test
-//!   process: the golden file names them (`@TS@`, `#n`, `@SIG@`,
-//!   `@AGENT_PID@`) after the whole chain verified with the key;
+//!   the replay's directory, opened (lab PR 249) with a fixed key, the
+//!   replay's wall clock (`nn_evidence::clock::Clock`) and the replayed
+//!   agent's pid (`AuditStamps`): every row is printed whole — its time,
+//!   hashes and signature — and the whole chain verifies with the key. They
+//!   were the writer's own clock and the test's pid, named (`@TS@`, `#n`,
+//!   `@SIG@`, `@AGENT_PID@`);
 //! - the administrator: a fixed Ed25519 key in an `admin.pub` of the
 //!   replay's own; a signed unlock or trusted-installer grant is verified
 //!   by `ConnAuth` as the admin socket verifies it, then handed to what
@@ -57,9 +59,14 @@
 //! the trackers it shares with the posture are assessed for every event,
 //! as the rules would), the ladder's worker thread (its steps run in the
 //! caller, in the order the worker runs them), the admin socket's own
-//! audit rows, and the process-wide switches (the ransomware directive of
-//! the per-rule policy and the kernel mass-write mode stay at their
-//! defaults: a case cannot set them without racing every other test).
+//! audit rows.
+//!
+//! Lab PR 249: the ransomware directive of the per-rule policy and the
+//! kernel mass-write mode are the machine's own (they were process-wide
+//! switches, read at their defaults here: a case could not set them
+//! without racing every other test). A case's `rule_policy` puts its lines
+//! in force on its machine's own handle (`PostureMachine::with_rule_policy`);
+//! the header names both values.
 //!
 //! `cargo xtask golden` runs these tests with the decision golden's;
 //! `cargo xtask golden --update` rewrites the golden files
@@ -73,7 +80,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nn_model::posture_types::{self, TriggerType};
+use nn_model::posture_types::TriggerType;
 use nn_model::{Event, ResponseAction};
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -91,7 +98,7 @@ use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport, Unlock
 use crate::anti_tamper::trusted_installer::{
     TrustedInstallerOverride, MAX_TRUSTED_INSTALLER_WINDOW_SECS,
 };
-use crate::audit::{AgentSigningKey, AuditEntry, AuditLog};
+use crate::audit::{AgentSigningKey, AuditEntry, AuditLog, AuditStamps};
 use crate::combat::actuator::{SystemActuator, DETECT_ONLY_ISOLATE, NO_BINARY};
 use crate::combat::{
     AuditEvidence, CombatActuator, CombatLadder, IsolateOutcome, LadderConfig, NeutralizeReport,
@@ -100,6 +107,7 @@ use crate::combat::{
 use crate::config::comm_allowlist::{load_comm_allowlist, PROCESS_COMM_ALLOWLIST_SHIPPED};
 use crate::config::overlay_auth::Verified;
 use crate::correlation::CorrelationBuffer;
+use crate::decision::rule_policy::{self, PolicyHandle, RulePolicy};
 use crate::impact::entropy::{Sample, Sampler};
 use crate::impact::trust::ProgramOwners;
 use crate::impact::RansomTracker;
@@ -133,6 +141,10 @@ const AGENT_PID: u32 = 4_200_000;
 /// The administrator's key: a fixed seed, so its fingerprint is the same
 /// in every replay.
 const ADMIN_SEED: [u8; 32] = [0x2a; 32];
+/// Lab PR 249: the replayed agent's signing key, a fixed seed — Ed25519
+/// signs deterministically, so with the replay's clock and the agent's pid
+/// a row is the same bytes, signature included, in every replay.
+const AUDIT_KEY_SEED: [u8; 32] = [0x5e; 32];
 /// The wall clock at the events' zero: 2026-01-01T00:00:00Z.
 const WALL_AT_ZERO_SECS: u64 = 1_767_225_600;
 /// `main.rs`'s heartbeats.
@@ -189,6 +201,12 @@ struct Case {
     /// both families clear.
     #[serde(default)]
     release: Vec<Families>,
+    /// Lab PR 249: the lines of the signed per-rule policy (lab PR 236,
+    /// `rule-policy.local`) in force for this case's posture — its own
+    /// handle (`PostureMachine::with_rule_policy`); none: the built-in
+    /// defaults.
+    #[serde(default)]
+    rule_policy: Vec<String>,
     items: Vec<Item>,
 }
 
@@ -340,6 +358,14 @@ impl Clock for ReplayClock {
 
     fn wall(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(WALL_AT_ZERO_SECS) + Duration::from_nanos(self.ns())
+    }
+}
+
+/// Lab PR 249: the audit log's clock — its rows are stamped with the
+/// replay's wall clock, as the posture's records are.
+impl nn_evidence::clock::Clock for ReplayClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from(Clock::wall(self))
     }
 }
 
@@ -969,14 +995,28 @@ impl Replay {
         let fixture = Path::new(GOLDEN_DIR).join("host");
         let lineage = AuthSessionTracker::new(&proc_root).with_host_root(&fixture);
 
-        // The signed audit log and its key (`main.rs`: the agent's).
+        // The signed audit log and its key (`main.rs`: the agent's). Lab PR
+        // 249: a fixed key, the replay's clock and the replayed agent's pid,
+        // so the rows — their hashes and signatures — are the same bytes in
+        // every replay.
         let state = root.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        let key = AgentSigningKey::load_or_bootstrap(&state.join("agent.key")).unwrap();
+        let key_file = state.join("agent.key");
+        std::fs::write(&key_file, format!("{}\n", hex::encode(AUDIT_KEY_SEED))).unwrap();
+        let key = AgentSigningKey::load_or_bootstrap(&key_file).unwrap();
         let audit_key = key.verifying_key();
         let audit_path = state.join("audit.log");
         let audit = Arc::new(Mutex::new(
-            AuditLog::open(&audit_path, key, AGENT_ID).unwrap(),
+            AuditLog::open_with(
+                &audit_path,
+                key,
+                AGENT_ID,
+                AuditStamps {
+                    clock: clock.clone(),
+                    self_pid: AGENT_PID,
+                },
+            )
+            .unwrap(),
         ));
 
         // The shared judges (`main.rs`: the shipped lists, the lineage).
@@ -1068,7 +1108,9 @@ impl Replay {
             Vec::new(),
             EscalationAllowList::empty(),
         )
-        .with_clock(clock.clone());
+        .with_clock(clock.clone())
+        // Lab PR 249: the case's per-rule policy, on a handle of its own.
+        .with_rule_policy(PolicyHandle::new(case_policy(case)));
         posture.set_installer_window(Arc::clone(&window));
         posture.set_ransom_tracker(Arc::clone(&ransom));
         posture.set_defense_detector(Arc::clone(&defense));
@@ -1094,7 +1136,7 @@ impl Replay {
                     detect_only: case.detect_only,
                     guard: guard(),
                 }),
-                Box::new(AuditEvidence::new(Some(Arc::clone(&audit)))),
+                Box::new(AuditEvidence::new(Some(Arc::clone(&audit))).with_clock(clock.clone())),
                 Box::new(guard()),
                 LadderConfig::default(),
             )
@@ -1250,36 +1292,40 @@ impl Replay {
         any
     }
 
-    /// The audit log's rows written since the last call, as the golden file
-    /// shows them: the writer's clock (`ts`, and the hashes and signature
-    /// that cover it) and the test's pid named, not printed.
+    /// The audit log's rows written since the last call, whole. Lab PR 249:
+    /// the replay's clock, a fixed key and the replayed agent's pid make
+    /// every field the same in every replay — the time, the hashes and the
+    /// signature over it are printed (they were named `@TS@`, `#n`, `@SIG@`
+    /// and `@AGENT_PID@`). A row naming the replay's directories would not
+    /// be: it fails here.
     fn new_rows(&mut self) -> Vec<Value> {
         let text = std::fs::read_to_string(&self.audit_path).unwrap_or_default();
-        let all: Vec<AuditEntry> = text
-            .lines()
+        let raw: Vec<&str> = text.lines().collect();
+        let all: Vec<AuditEntry> = raw
+            .iter()
             .map(|l| serde_json::from_str(l).expect("an audit row"))
             .collect();
         let from = self.rows.len();
+        let dirs = [
+            self.root.path().to_str().unwrap(),
+            self.proc_dir.path().to_str().unwrap(),
+        ];
         let out = all[from..]
             .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let n = from + i;
-                let mut v = serde_json::to_value(e).unwrap();
-                v["ts"] = json!("@TS@");
-                v["prev_hash"] = json!(if n == 0 {
-                    "genesis".to_string()
-                } else {
-                    format!("#{}", n - 1)
-                });
-                v["entry_hash"] = json!(format!("#{n}"));
-                v["agent_sig"] = json!("@SIG@");
-                assert_eq!(e.client_pid, std::process::id());
-                v["client_pid"] = json!("@AGENT_PID@");
-                if v["extra"].get("occurred_at").is_some() {
-                    v["extra"]["occurred_at"] = json!("@TS@");
+            .zip(&raw[from..])
+            .map(|(e, line)| {
+                assert_eq!(
+                    e.client_pid, AGENT_PID,
+                    "a row the replayed agent signs names its pid: {line}"
+                );
+                for d in dirs {
+                    assert!(
+                        !line.contains(d),
+                        "a signed row names the replay's directory {d}, so its hash and \
+                         signature differ in every replay: {line}"
+                    );
                 }
-                v
+                serde_json::to_value(e).unwrap()
             })
             .collect();
         self.rows = all;
@@ -1367,11 +1413,12 @@ impl Replay {
             .map(|t| t.reason.clone())
         {
             if fired.is_some() {
+                let decisive = self.posture.ransomware_combat_without_corroboration();
                 cited["triggers"] = Value::Array(
                     reason
                         .split('+')
                         .filter_map(trigger_named)
-                        .map(|t| trigger_json(t, event))
+                        .map(|t| trigger_json(t, event, decisive))
                         .collect(),
                 );
             }
@@ -1542,6 +1589,21 @@ impl Replay {
     }
 }
 
+/// Lab PR 249: the per-rule policy a case's posture reads — its
+/// `rule_policy` lines through the parser of `rule-policy.local` (any bad
+/// line fails the case), or the built-in defaults.
+fn case_policy(case: &Case) -> RulePolicy {
+    if case.rule_policy.is_empty() {
+        return RulePolicy::builtin();
+    }
+    let mut text = case.rule_policy.join("\n");
+    text.push('\n');
+    let mut p = rule_policy::parse(&text)
+        .unwrap_or_else(|e| panic!("the case's rule_policy does not parse: {e}"));
+    p.source = "the case's rule_policy".to_string();
+    p
+}
+
 /// The time an event happened (ns, the events' clock).
 fn event_ts(e: &Event) -> u64 {
     triggers::event_owner_seen(e).1.max(match e {
@@ -1589,13 +1651,14 @@ fn trigger_named(name: &str) -> Option<TriggerType> {
     .find(|t| t.as_str() == name)
 }
 
-/// A trigger an event raised, as the posture judges it.
-fn trigger_json(t: TriggerType, e: &Event) -> Value {
+/// A trigger an event raised, as the posture judges it (`ransomware_decisive`:
+/// the machine's ransomware directive, lab PR 249).
+fn trigger_json(t: TriggerType, e: &Event, ransomware_decisive: bool) -> Value {
     json!({
         "trigger": t.as_str(),
         "class": format!("{:?}", triggers::evidence_class(t, e)),
         "level": t.target_level().as_str(),
-        "confidence": format!("{:?}", t.confidence()),
+        "confidence": format!("{:?}", t.confidence(ransomware_decisive)),
         "locks_combat": t.locks_combat(),
     })
 }
@@ -1610,9 +1673,10 @@ fn render(name: &str, case: &Case, r: &Replay) -> String {
         "about": case.about,
         "detect_only": case.detect_only,
         "posture": {
+            // Lab PR 249: the replay's machine's own (they were process-wide).
             "ransomware_combat_without_corroboration":
-                posture_types::ransomware_combat_without_corroboration(),
-            "kernel_mass_write": triggers::kernel_mass_write(),
+                r.posture.ransomware_combat_without_corroboration(),
+            "kernel_mass_write": r.posture.kernel_mass_write(),
             "corroboration_window_secs": super::corroboration::CORROBORATION_WINDOW.as_secs(),
             "combat_quiet_window_secs": transitions::COMBAT_QUIET_WINDOW.as_secs(),
             "alerted_decay_secs": transitions::ALERTED_DECAY.as_secs(),
@@ -1931,9 +1995,13 @@ fn every_ladder_row_names_its_trigger_and_offender() {
 /// agent's own unit stopped inside a signed trusted-installer window not
 /// moving the posture, a forking tree frozen and killed with the outcomes
 /// of a process gone and of a stale capture, the signed unlock leaving
-/// COMBAT, detect-only acting on nothing, decay down to OBSERVING.
+/// COMBAT, detect-only acting on nothing, decay down to OBSERVING. Lab PR
+/// 249: and ransomware alone to COMBAT — decisive, nothing in its scope
+/// before — only on a machine whose per-rule policy says
+/// `combat-without-corroboration`.
 #[test]
 fn posture_golden_cases_cover_the_lot() {
+    let mut ransomware_alone_combat = 0;
     let mut combat_by: BTreeSet<String> = BTreeSet::new();
     let mut engaged_by: BTreeSet<String> = BTreeSet::new();
     let mut kills_in_cgroup = 0;
@@ -1950,6 +2018,23 @@ fn posture_golden_cases_cover_the_lot() {
             let transitions: Vec<&Value> = l["posture"].as_array().into_iter().flatten().collect();
             for t in &transitions {
                 let trig = t["trigger"].as_str().unwrap_or("");
+                let alone = t["evidence"]["in_scope_before"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty);
+                let decisive = t["evidence"]["triggers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|x| x["trigger"] == trig && x["confidence"] == "Decisive");
+                if t["to"] == "COMBAT" && trig == "RansomwareEncryption" && alone {
+                    assert!(
+                        decisive && r.posture.ransomware_combat_without_corroboration(),
+                        "case {name}: ransomware alone reached COMBAT without \
+                         `combat-without-corroboration`: {t}"
+                    );
+                    assert!(!case.rule_policy.is_empty(), "case {name}");
+                    ransomware_alone_combat += 1;
+                }
                 match t["to"].as_str() {
                     Some("COMBAT") => {
                         combat_by.insert(trig.to_string());
@@ -2016,4 +2101,58 @@ fn posture_golden_cases_cover_the_lot() {
     assert!(decayed_to_observing > 0, "no decay down to OBSERVING");
     assert!(detect_only_neutralize > 0, "no detect-only NEUTRALIZE");
     assert_eq!(detect_only_kills, 0, "detect-only killed something");
+    assert!(
+        ransomware_alone_combat > 0,
+        "no case takes ransomware alone to COMBAT under `combat-without-corroboration`"
+    );
+}
+
+/// Lab PR 249: a case's per-rule policy is its machine's own. The case
+/// under `combat-without-corroboration` (ransomware alone: COMBAT) and the
+/// one without it (the same encryption: ENGAGED), replayed at once on
+/// threads of their own, each give their committed golden file. The
+/// directive was a process-wide switch: a case setting it would have moved
+/// every case replayed beside it.
+#[test]
+fn a_case_s_rule_policy_is_its_machine_s_own() {
+    const PAIRS: usize = 3;
+    let cases = cases();
+    let pick = |n: &str| {
+        cases
+            .iter()
+            .find(|(c, _)| c == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("no case {n}"))
+    };
+    let pair = [
+        pick("ransomware-alone-combat-policy"),
+        pick("ransomware-alone-engaged"),
+    ];
+    // Each alone on this thread first; then all at once.
+    let alone: Vec<String> = pair.iter().map(|(n, t)| golden_text(n, t)).collect();
+    let barrier = Arc::new(std::sync::Barrier::new(2 * PAIRS));
+    let handles: Vec<_> = (0..2 * PAIRS)
+        .map(|i| {
+            let (name, text) = pair[i % 2].clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                (i % 2, golden_text(&name, &text))
+            })
+        })
+        .collect();
+    for h in handles {
+        let (k, replayed) = h.join().unwrap();
+        assert!(
+            replayed == alone[k],
+            "case {}: a replay beside the other case's differs from one alone",
+            pair[k].0
+        );
+    }
+    if !updating() {
+        for ((name, _), text) in pair.iter().zip(&alone) {
+            let committed = std::fs::read_to_string(expected_path(name)).unwrap();
+            assert!(*text == committed, "case {name}: not its golden file");
+        }
+    }
 }

@@ -1536,3 +1536,68 @@ only in the table below, in the same PR as the evidence.
     forwarder, the MemTotal drift and its bounds). Outside the repository,
     the lab host's stop helper now ends with `nn-lab.sh down`.
   - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX, 4 vCPU; no other guest up). Before (`main` 60d9965, the branch's first base, and 8180540 on a second boot): `nn-lab.sh ssh bash -s` with the script in a here-doc, a pipe and `< file` printed nothing, exit 0, each time. The lab host's stop helper as it was (a poweroff from inside, its wait on a QEMU pid file and its unit stop): the guest reached `reboot: Power down`, QEMU for Windows was gone a few seconds later, the forwarder `nn-fwd-ubuntu2204` still active and listening on 127.0.0.1:2522 three and a half minutes later, and `status` said "stopped". After (this branch): in that state `status` names the forwarder ("stopped, but its forwarder nn-fwd-ubuntu2204 is still active on 127.0.0.1:2522 …") and `down` stops it (exit 0, 5 s; then `status` "stopped", no `nn-*` user unit, nothing listening on 2522). On a new boot the three scripts ran (here-doc, pipe and file, each printing the guest's hostname and kernel, exit 0), and a command as an argument as before; the helper, now ending with `nn-lab.sh down`, with this branch's script: exit 0 in 5 s, `status` "stopped", no `nn-*` unit, `tasklist.exe` listing no QEMU, nothing on 2522; on a third boot the same with the helper's default tree (the lab's main checkout, `main` 8180540's `down`): exit 0 in 5 s, nothing left. This branch's `up` (QEMU launched, the forwarder started, the probes with `/dev/null`) booted the guest in 24 s and passed `check`; a piped script ran; `down` on the running guest: exit 0 in 5 s, nothing left. Host, on the lot's commit over `main` 60d9965 and again after its rebase over lab PR 247 (`main` cedf7e1): `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,049 passed, 0 failed, 15 ignored, both times; `bash -n` on `nn-lab.sh` and the helper; shellcheck 0.9.0 (`-x`, warnings): the same two SC2054 on QEMU's comma-separated arguments as on `main`, nothing new (every finding of any severity the same set as on `main`), the helper clean.
+- **Lab PR 249 — determinism seams: the signed chains' clock and the
+  posture's switches per machine (Wave 4 Phase 2, before R08; C14, C17,
+  C23; no level changes).**
+  - What was wrong (found by lab PR 243): the chain writers of nn-evidence
+    read `Utc::now` where they stamped a row (an audit row's `ts` in
+    `build_signed_entry`, a rotating log's terminators and manifest rows,
+    the head anchor's snapshots), and the hash covers the time, the
+    signature the hash: the posture golden could not print its signed rows
+    and named their time, hashes, signature and the test's pid (`@TS@`,
+    `#n`, `@SIG@`, `@AGENT_PID@`); the chain pin of lab PR 241 could only
+    verify those rows, not make them again. Two posture switches were
+    process-wide — the runtime value of
+    `RANSOMWARE_COMBAT_WITHOUT_CORROBORATION` (`RANSOMWARE_DECISIVE`, set
+    by `rule_policy::install_global`) and `KERNEL_MASS_WRITE` (set by
+    `main.rs` when the LSM file-open sensor is armed) — so a case or test
+    that needed another value raced every other one.
+  - What changed (seams, no behaviour change): `nn_evidence::clock`
+    (`Clock`, `SystemClock` = `Utc::now`, `stamp`); every row stamp of the
+    crate reads it — `AuditLog::open_with` and `AuditStamps` (the clock and
+    the pid of the rows the writer signs about itself, `AuditLog::self_pid`,
+    which the ladder's rows and the trusted-installer window's close row now
+    read), `RotatingChainLog::open_with_clock`, `Anchor::with_clock`;
+    `open` and `new` keep the host's clock and `std::process::id()`. The
+    agent's `AuditEvidence::with_clock` stamps `occurred_at` of a late row.
+    The posture reads the ransomware directive from the policy handle it is
+    given (`PostureMachine::with_rule_policy`; `main.rs` passes
+    `rule_policy::global()`, the handle the engine reads and `nn-admin
+    policy set` swaps — read once per round; `TriggerType::confidence`
+    takes the value), and the mass-write mode is the trigger detector's
+    own (`PostureMachine::set_kernel_mass_write`, called by
+    `start_open_sensor` where the global was set); the global setters and
+    readers are gone. The posture golden opens its audit log with a fixed
+    key, its clock and the replayed agent's pid (4,200,000) and prints the
+    rows whole; a case's `rule_policy` lines are its machine's policy. New
+    case `ransomware-alone-combat-policy`: under `combat-without-corroboration
+    NN-L-IMP-001`, ransomware alone — decisive, nothing in its scope before
+    — reaches COMBAT, unlocked; INVESTIGATE, NEUTRALIZE of the tree,
+    contained; decay to ENGAGED. Golden diff: the six files that hold signed
+    rows, and in their 25 rows only the named fields became values (checked
+    by a script: each `ts` the line's time on the replay's wall clock,
+    `prev_hash` chaining from 64 zeros, `client_pid` 4,200,000, every other
+    byte of every line the same); the decision golden and the two other
+    posture files unchanged. Proof that the format did not change: the v1
+    fixtures of lab PR 241 made again, every file, byte for byte, by this
+    code given `main`'s times through a scripted clock
+    (`agent/tests/chain_format_clock.rs`: `audit.log`, and the whole
+    rotating set with its three terminators, `Rotated` rows and checkpoint;
+    `chain_format_pin.rs` and the fixtures untouched); the crypto vectors of
+    lab PR 230 unchanged and passing. Other process-wide state read by the
+    posture, impact or the engine, listed: NN-L-FIM-010's
+    one-verdict-per-rename list (`FIM010_RECENT`, the engine's) — converted,
+    the rule's own (one engine in the agent, so the same list; two replays
+    or tests in one process shared it); kept, not switches or not trivial:
+    `rule_policy::global()` (the agent's one policy handle, which the
+    engine and now the posture are given), the per-process random keys of
+    the DNS qname hash (`QNAME_HASH_KEYS`, NETR-012), the agent's own pid
+    read by the control-surface trigger (`std::process::id()`; the dev
+    build's machine has no agent pid to read instead) and as the default of
+    the fan-out rules' and NN-L-FIM-024's per-instance `agent_pid`, the
+    quarantine's boot-time `RUNTIME_DENY`, the impact sampler's
+    `/proc/1/root` probe (`response::host_path`), the status counters
+    (`impact`/`impair` `PUBLISHED`, `detection_budget::BUDGET`, eviction and
+    verdict counters), the clock-tick constants; `response_policy`'s held
+    switches are constants and its `HELD` per thread.
+  - Lab: no guest (seams that keep every production call: `AuditLog::open`, `RotatingChainLog::open`, `Anchor::new` and `AuditEvidence::new` take the host's clock and pid as before; the switches are filled from the same places with the same defaults). Host, on afcf8ed (the final tree but for this line and a rewrapped paragraph; on `main` 60d9965, lab PR 245 merged), `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo xtask build-ebpf --release` (`common` and the eBPF crates untouched: the stamp's source c0365736…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 70 suites, 3,058 passed, 0 failed, 15 ignored (the lot's 14 tests: the clock's 2, the audit log's 2, the rotating log's 2, the head anchor's, `chain_format_clock`'s 2, the posture machine's directive, the detector's mass-write mode, NN-L-FIM-010's list, the late ladder row's clock and pid, the golden's parallel policy replay; no `#[ignore]` test added); `cargo xtask attack-coverage --check`; `cargo xtask golden` ten times, each a process of its own: 11 tests passed each time, the 33 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed); `portable-core`'s check of the pure crates for its five targets: all pass. The crypto vectors (19 tests, `cargo test crypto_vectors`) and `chain_format_pin.rs` pass with their fixtures untouched. The first commit's tree alone (the clock seam): clippy on the workspace, nn-evidence's tests, both chain pins, the posture, COMBAT and window tests pass. Golden review: a script put the named fields of the 25 new rows back to their placeholders and found every line of the six files equal to the committed one (JSON equality), each `ts` its line's time on the replay's wall clock, `prev_hash` chaining from 64 zeros, `client_pid` 4,200,000. Mutation checks (temporary): the audit row's time not read from the log's clock fails 6 tests (the fixed chain written twice, the v1 audit log made again, the late ladder row, three golden checks); the manifest rows' 2 (the rotating set written twice, the v1 set made again), the terminators' and the head snapshot's 1 each; the posture ignoring its policy handle 5 (the directive per machine, four golden checks); the detector ignoring its switch 1; the ladder rows stamped with the test's pid 8 (the late row, seven golden checks); `occurred_at` on the host's clock 1; NN-L-FIM-010's list shared again 1. The first gate run of the final tree compiled a stale nn-model and failed: the two commits were split by restoring files with `cp -a`, which kept mtimes older than the first commit's build, so cargo saw nothing to rebuild; the files touched, the gates above ran on a fresh build. Rebased on `main` cedf7e1 (lab PR 247 merged; only the lot notes conflicted, both kept), the same gates on 321fb3c: all pass, 70 suites, 3,058 passed, 0 failed, 15 ignored, the ten golden runs identical; on GitHub (c34cdd9, pull request #453) the 13 checks pass, both KVM suites included. Merged with `main` a99aff9 (lab PR 248; again only the lot notes conflicted, both kept), the same gates on c093eeb: all pass, 70 suites, 3,063 passed (lab PR 248's tests with them), 0 failed, 15 ignored, the ten golden runs identical.

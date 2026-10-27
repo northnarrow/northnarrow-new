@@ -206,26 +206,6 @@ fn is_device_node(filename: &str) -> bool {
         && !filename.starts_with("/dev/mqueue/")
 }
 
-/// Tappa 10.9 step 1: `true` once the file-open sensor on LSM `file_open`
-/// counts write-opens in the kernel and reports bursts as
-/// `Event::MassWrite`. Only the opens a rule reads reach userland then,
-/// so counting `FileOpen` events here would be wrong (and double): the
-/// mass-write arm reads `MassWrite` instead. `false` (tracepoint mode,
-/// the Q6 switch) keeps the userland count.
-static KERNEL_MASS_WRITE: AtomicBool = AtomicBool::new(false);
-
-/// Switch the mass-write arm between the kernel count (LSM file-open
-/// sensor armed) and the userland count (tracepoint mode).
-pub fn set_kernel_mass_write(on: bool) {
-    KERNEL_MASS_WRITE.store(on, Ordering::Relaxed);
-}
-
-/// Lab PR 243 (tests: the golden replay names the mode it ran in).
-#[cfg(test)]
-pub(crate) fn kernel_mass_write() -> bool {
-    KERNEL_MASS_WRITE.load(Ordering::Relaxed)
-}
-
 /// Lateral movement: 3+ distinct internal hosts on admin ports in 10 min.
 pub(super) const LATERAL_WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
 pub(super) const LATERAL_DISTINCT_DST_MIN: usize = 3;
@@ -353,6 +333,15 @@ pub struct TriggerDetector {
     /// Lab PR 225: the ransomware tracker and the security-tool detector
     /// the rules share, once `main.rs` has wired them.
     impact: ImpactHooks,
+    /// Tappa 10.9 step 1: `true` once the file-open sensor on LSM
+    /// `file_open` counts write-opens in the kernel and reports bursts as
+    /// `Event::MassWrite`. Only the opens a rule reads reach userland then,
+    /// so counting `FileOpen` events here would be wrong (and double): the
+    /// mass-write arm reads `MassWrite` instead. `false` (tracepoint mode,
+    /// the Q6 switch, the default) keeps the userland count. Lab PR 249:
+    /// this detector's own ([`Self::set_kernel_mass_write`]; it was a
+    /// process-wide switch).
+    kernel_mass_write: Arc<AtomicBool>,
 }
 
 /// Lab PR 225: the shared judges of the ransomware and security-tool
@@ -437,6 +426,7 @@ impl TriggerDetector {
             mass_writers: MassWriters::default(),
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
+            kernel_mass_write: Arc::default(),
         }
     }
 
@@ -453,6 +443,7 @@ impl TriggerDetector {
             mass_writers: MassWriters::default(),
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
+            kernel_mass_write: Arc::default(),
         }
     }
 
@@ -470,6 +461,7 @@ impl TriggerDetector {
             mass_writers: MassWriters::default(),
             installer_window: InstallerWindow::default(),
             impact: ImpactHooks::default(),
+            kernel_mass_write: Arc::default(),
         }
     }
 
@@ -496,6 +488,18 @@ impl TriggerDetector {
     /// Lab PR 225: the security-tool detector (`DefenseImpairment`). Set once.
     pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector>) {
         let _ = self.impact.defense.set(detector);
+    }
+
+    /// Switch the mass-write arm between the kernel count (LSM file-open
+    /// sensor armed) and the userland count (tracepoint mode). Lab PR 249:
+    /// this detector's, and the clones' that share its state.
+    pub fn set_kernel_mass_write(&self, on: bool) {
+        self.kernel_mass_write.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the mass-write arm reads the kernel count.
+    pub fn kernel_mass_write(&self) -> bool {
+        self.kernel_mass_write.load(Ordering::Relaxed)
     }
 
     /// BUG-032 — builder for the escalation allowlist. Production:
@@ -729,6 +733,7 @@ impl TriggerDetector {
             &self.auth,
             &self.mass_write_extras,
             &self.mass_write_warned,
+            self.kernel_mass_write(),
         );
         if mass_write {
             if let (Some(pid), (_, ts)) = (event_owner_pid(event), event_owner_seen(event)) {
@@ -1312,6 +1317,7 @@ fn confirmed_intrusion(
     auth: &AuthSessionTracker,
     mass_write_extras: &[String],
     warned: &parking_lot::Mutex<HashMap<u32, u64>>,
+    kernel_mass_write: bool,
 ) -> bool {
     // BUG-032: the FsProtectDenial arm moved OUT to the Decisive
     // `AntiTamperDenial` trigger (raised directly in `detect`) — a
@@ -1379,7 +1385,7 @@ fn confirmed_intrusion(
     }
     // Mass-write / encryption-pattern: many writes from same pid in
     // a short window (tracepoint mode: every open reaches userland).
-    if KERNEL_MASS_WRITE.load(Ordering::Relaxed) {
+    if kernel_mass_write {
         return false;
     }
     if let Event::FileOpen {
@@ -3740,6 +3746,41 @@ mod tests {
             hits.contains(&TriggerType::ConfirmedIntrusion),
             "mass-write on user data must still fire: {hits:?}"
         );
+    }
+
+    /// Lab PR 249: the mass-write mode is the detector's own (it was a
+    /// process-wide switch). A detector on the kernel count — the LSM
+    /// file-open sensor armed — leaves a burst of `FileOpen` to the kernel
+    /// (no ConfirmedIntrusion), while a detector at the default (tracepoint
+    /// mode) counts the same burst, the two on two threads at once; the
+    /// kernel's `MassWrite` fires in either mode; a clone shares the switch.
+    #[test]
+    fn the_mass_write_mode_is_the_detectors_own() {
+        let kernel = TriggerDetector::with_self_pid(AGENT_PID);
+        kernel.set_kernel_mass_write(true);
+        let userland = TriggerDetector::with_self_pid(AGENT_PID);
+        assert!(kernel.kernel_mass_write() && !userland.kernel_mass_write());
+        let (focal, recent) = write_burst_to(ATTACKER_PID, "/home/alice/Documents/report.docx");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let run = |d: TriggerDetector| {
+            let (focal, recent, barrier) = (focal.clone(), recent.clone(), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                d.detect(&focal, &recent)
+            })
+        };
+        let (k, u) = (run(kernel.clone()), run(userland.clone()));
+        let (k, u) = (k.join().unwrap(), u.join().unwrap());
+        assert!(!k.contains(&TriggerType::ConfirmedIntrusion), "{k:?}");
+        assert!(u.contains(&TriggerType::ConfirmedIntrusion), "{u:?}");
+        for d in [&kernel, &userland] {
+            let hits = d.detect(&mass_write(ATTACKER_PID + 1, true, 7), &[]);
+            assert!(hits.contains(&TriggerType::ConfirmedIntrusion), "{hits:?}");
+        }
+        let clone = userland.clone();
+        clone.set_kernel_mass_write(true);
+        assert!(userland.kernel_mass_write(), "a clone shares the switch");
+        assert!(!TriggerDetector::with_self_pid(AGENT_PID).kernel_mass_write());
     }
 
     #[test]

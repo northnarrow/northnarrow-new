@@ -2300,6 +2300,59 @@ fn ransomware_combination_needs_corroboration_until_the_policy() {
     );
 }
 
+/// Lab PR 249: the ransomware directive is the machine's own — the
+/// per-rule policy handle it reads (it was a process-wide switch). Two
+/// machines over one host, one reading a policy that says
+/// `combat-without-corroboration NN-L-IMP-001` and one the built-in
+/// defaults, judge the same combination at once on two threads: COMBAT
+/// (never locked) and ENGAGED. The handle given the defaults again (what
+/// `nn-admin policy set` does to the agent's), a machine reading it judges
+/// the combination as the defaults say.
+#[test]
+fn the_ransomware_directive_is_the_machines_own() {
+    use crate::decision::rule_policy::{parse, PolicyHandle, RulePolicy};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lineage = AuthSessionTracker::new(tmp.path());
+    lineage.ingest_exec(
+        300,
+        1,
+        "/usr/bin/python3",
+        &["python3".into(), "/srv/nn-malsim/ransom-sim.py".into()],
+        1_000_000_000,
+        1_000_000_000,
+        1000,
+    );
+    let handle = PolicyHandle::new(parse("combat-without-corroboration NN-L-IMP-001\n").unwrap());
+    let decisive = machine_on(tmp.path()).with_rule_policy(handle.clone());
+    decisive.set_ransom_tracker(ransom_tracker(lineage.clone(), tmp.path()));
+    let held = machine_on(tmp.path());
+    held.set_ransom_tracker(ransom_tracker(lineage.clone(), tmp.path()));
+    assert!(decisive.ransomware_combat_without_corroboration());
+    assert!(!held.ransomware_combat_without_corroboration());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let run = |m: PostureMachine| {
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            let _ = m.observe(&overwrites(300, 1000), &[]);
+            m.current_kind()
+        })
+    };
+    let (a, b) = (run(decisive.clone()), run(held.clone()));
+    assert_eq!(a.join().unwrap(), PostureKind::Combat);
+    assert_eq!(b.join().unwrap(), PostureKind::Engaged);
+    assert!(
+        !decisive.is_combat_locked(),
+        "the combination does not lock COMBAT"
+    );
+    handle.install(RulePolicy::builtin());
+    assert!(!decisive.ransomware_combat_without_corroboration());
+    let after = machine_on(tmp.path()).with_rule_policy(handle);
+    after.set_ransom_tracker(ransom_tracker(lineage, tmp.path()));
+    let _ = after.observe(&overwrites(300, 1000), &[]);
+    assert_eq!(after.current_kind(), PostureKind::Engaged);
+}
+
 /// Lab PR 225: one shape keeps its level — a trusted writer's (a packaged
 /// program started by installed programs) rewrites stay ENGAGED.
 #[test]

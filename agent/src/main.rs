@@ -1017,6 +1017,7 @@ fn start_open_sensor(
     fim_attached: &[&str],
     carveout: &[String],
     audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    posture: &PostureMachine,
 ) {
     use northnarrow_agent::sensors::open_sensor::{
         pump, refresh, take_ringbuf, warn_refused_carveouts, DepthCapLog, OpenSensorMaps,
@@ -1070,7 +1071,8 @@ fn start_open_sensor(
         return;
     }
     northnarrow_agent::boot::manifest::note_sensor("file_open", "lsm:file_open (FIM observer)");
-    northnarrow_agent::posture::triggers::set_kernel_mass_write(true);
+    // Lab PR 249: the posture's own switch (it was process-wide).
+    posture.set_kernel_mass_write(true);
     // Armed: the old tracepoint (every openat to userland) goes. Its link
     // is retired first, or the BPF self-defence would report its absence
     // as tampering.
@@ -3112,6 +3114,10 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             mass_write_extras,
             escalation_allow,
         )
+        // Lab PR 249: the ransomware directive of the per-rule policy put
+        // in force above, read from the engine's handle (it was a
+        // process-wide switch set by `install_global`).
+        .with_rule_policy(northnarrow_agent::decision::rule_policy::global().clone())
     } else {
         // Dev / no-isolator build: still wire the ladder hooks so a
         // (detector- or admin-forced) COMBAT engages the same graduated
@@ -3139,6 +3145,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             ExemptPids::default(),
             lineage.clone(),
         )
+        .with_rule_policy(northnarrow_agent::decision::rule_policy::global().clone())
     };
     // Lab PR 162: inside the trusted-installer window a control-surface
     // tamper (NN-L-FIM-024) does not raise the posture; the rule still acts.
@@ -3851,6 +3858,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     &fim_attached,
                     &open_sensor_carveout,
                     audit_log.clone(),
+                    &posture,
                 );
                 // External audit ATP-013: the FIM observers and the file-open
                 // sensor were loaded after the BPF guard registered the

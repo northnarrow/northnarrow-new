@@ -78,6 +78,7 @@
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -87,6 +88,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::chain_host::{ChainHost, ChainSigner};
+use crate::clock::{Clock, SystemClock};
 
 /// Default location of the tamper-evident audit log. Mirrors the
 /// `/etc/northnarrow/` install layout (`admin.pub`, `agent_id`).
@@ -306,11 +308,47 @@ impl PreviousRun {
     }
 }
 
+/// Lab PR 249: what an [`AuditLog`] stamps on a row from the process that
+/// writes it — the time, and the pid of the rows it signs about itself. The
+/// agent's are the host's ([`Self::host`], what [`AuditLog::open`] takes); a
+/// replay or a test gives fixed ones, so that its chain is the same bytes
+/// every run.
+#[derive(Clone)]
+pub struct AuditStamps {
+    /// The time every row is stamped with (`ts`).
+    pub clock: Arc<dyn Clock>,
+    /// `client_pid` of the rows the writer signs about itself (`agent_boot`,
+    /// `agent_stop`, its attestations; the agent's ladder and
+    /// trusted-installer rows read it with [`AuditLog::self_pid`]).
+    pub self_pid: u32,
+}
+
+impl AuditStamps {
+    /// The writing process's own: the host's clock ([`SystemClock`],
+    /// `Utc::now`) and its pid (`std::process::id`).
+    pub fn host() -> Self {
+        Self {
+            clock: Arc::new(SystemClock),
+            self_pid: std::process::id(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuditStamps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditStamps")
+            .field("self_pid", &self.self_pid)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct AuditLog<K> {
     path: PathBuf,
     /// `path` anchored to the directory fd taken at open (review entry 44):
     /// appends cannot be diverted by a later mount over the directory.
     io_path: PathBuf,
+    /// Lab PR 249: the time and the self pid the rows are stamped with.
+    stamps: AuditStamps,
     /// How the run before this one ended (from the chain at open).
     previous_run: PreviousRun,
     /// External audit ATP-004: the chain holds a successful
@@ -347,6 +385,12 @@ impl<K: ChainSigner> AuditLog<K> {
     /// `nn-admin audit verify` (later commit) is the
     /// signature-checking reader.
     pub fn open(path: &Path, key: K, agent_id: [u8; 16]) -> Result<Self> {
+        Self::open_with(path, key, agent_id, AuditStamps::host())
+    }
+
+    /// Lab PR 249: [`Self::open`] stamping its rows — the ones written at
+    /// open included — with `stamps` instead of the host's clock and pid.
+    pub fn open_with(path: &Path, key: K, agent_id: [u8; 16], stamps: AuditStamps) -> Result<Self> {
         // External audit EVD-005: a last write cut short (crash, power
         // loss) left a fragment that `read_tail` refused, and the agent
         // would not start again in enforce mode. Only that fragment is
@@ -369,6 +413,7 @@ impl<K: ChainSigner> AuditLog<K> {
         let mut log = Self {
             path: path.to_path_buf(),
             io_path: K::Host::anchor(path),
+            stamps,
             key,
             agent_id,
             last_hash: tail.last_hash,
@@ -409,7 +454,7 @@ impl<K: ChainSigner> AuditLog<K> {
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: "repaired".to_string(),
-            client_pid: std::process::id(),
+            client_pid: self.stamps.self_pid,
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
             client_exe: None,
@@ -437,7 +482,7 @@ impl<K: ChainSigner> AuditLog<K> {
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: "detected".to_string(),
-            client_pid: std::process::id(),
+            client_pid: self.stamps.self_pid,
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
             client_exe: None,
@@ -506,13 +551,14 @@ impl<K: ChainSigner> AuditLog<K> {
         let file = identity.path.display().to_string();
         let to = hex::encode(self.agent_id);
         let from = self.previous_agent_id.clone();
+        let pid = self.stamps.self_pid;
         let self_row = |op: &str, extra: serde_json::Value, result: &str| AuditEntryDraft {
             op: op.to_string(),
             extra,
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: result.to_string(),
-            client_pid: std::process::id(),
+            client_pid: pid,
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
             client_exe: None,
@@ -594,7 +640,7 @@ impl<K: ChainSigner> AuditLog<K> {
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: "success".to_string(),
-            client_pid: std::process::id(),
+            client_pid: self.stamps.self_pid,
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
             client_exe: None,
@@ -616,6 +662,7 @@ impl<K: ChainSigner> AuditLog<K> {
             &self.agent_id,
             &self.last_hash,
             self.rows,
+            self.stamps.clock.as_ref(),
         )?;
         let mut line =
             serde_json::to_string(&entry).map_err(|e| anyhow!("serialising audit entry: {e}"))?;
@@ -642,6 +689,13 @@ impl<K: ChainSigner> AuditLog<K> {
             self.anchoring_started = true;
         }
         Ok(entry)
+    }
+
+    /// Lab PR 249: the pid of the rows this writer signs about itself
+    /// ([`AuditStamps::self_pid`]; the agent's, `std::process::id()`): the
+    /// `client_pid` the agent's own rows written through this log carry.
+    pub fn self_pid(&self) -> u32 {
+        self.stamps.self_pid
     }
 
     /// Tail hash an auditor would chain the NEXT entry off. Test
@@ -686,7 +740,7 @@ impl<K: ChainSigner> AuditLog<K> {
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: "refused".to_string(),
-            client_pid: std::process::id(),
+            client_pid: self.stamps.self_pid,
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
             client_exe: None,
@@ -733,7 +787,7 @@ impl<K: ChainSigner> AuditLog<K> {
             key_fp: "agent-self".to_string(),
             cosigner_fps: Vec::new(),
             result: "success".to_string(),
-            client_pid: std::process::id(),
+            client_pid: self.stamps.self_pid,
             client_uid: 0,
             client_comm: "northnarrow-agent".to_string(),
             client_exe: None,
@@ -910,14 +964,18 @@ fn read_tail(path: &Path) -> Result<TailState> {
 /// against a given `prev_hash` and signing key. Extracted from
 /// [`AuditLog::append`] so [`verify_chain`] can recompute the
 /// same bytes for cross-check.
+///
+/// Lab PR 249: the row's time is `clock`'s (the log's, the host's
+/// `Utc::now` unless it was opened with another).
 fn build_signed_entry<K: ChainSigner>(
     draft: &AuditEntryDraft,
     key: &K,
     agent_id: &[u8; 16],
     prev_hash: &str,
     seq: u64,
+    clock: &dyn Clock,
 ) -> Result<AuditEntry> {
-    let ts = format_ts(Utc::now());
+    let ts = format_ts(clock.now());
     let mut entry = AuditEntry {
         ts,
         agent_id: hex::encode(agent_id),
@@ -1714,7 +1772,9 @@ mod tests {
         let mut prev = GENESIS_PREV_HASH.to_string();
         let mut body = String::new();
         for i in 0..n {
-            let mut e = build_signed_entry(&sample_draft(i), key, &[0u8; 16], &prev, 0).unwrap();
+            let mut e =
+                build_signed_entry(&sample_draft(i), key, &[0u8; 16], &prev, 0, &SystemClock)
+                    .unwrap();
             e.seq = None;
             e.entry_hash.clear();
             e.agent_sig.clear();
@@ -1996,8 +2056,15 @@ mod tests {
         let (_d, key_path, _log_path) = fresh_paths();
         let key = TestKey::load_or_bootstrap(&key_path).unwrap();
         let pk = key.verifying_key();
-        let good =
-            build_signed_entry(&sample_draft(1), &key, &[0u8; 16], GENESIS_PREV_HASH, 0).unwrap();
+        let good = build_signed_entry(
+            &sample_draft(1),
+            &key,
+            &[0u8; 16],
+            GENESIS_PREV_HASH,
+            0,
+            &SystemClock,
+        )
+        .unwrap();
         verify_chain(std::slice::from_ref(&good), &pk).unwrap();
         for domain in [None, Some(crate::chain_anchor::CANARY_ACCESS_DOMAIN_V2)] {
             let mut e = good.clone();
@@ -2273,8 +2340,15 @@ mod tests {
     fn compute_entry_hash_refuses_an_entry_that_carries_its_seal() {
         let (_d, key_path, _log) = fresh_paths();
         let key = TestKey::load_or_bootstrap(&key_path).unwrap();
-        let e =
-            build_signed_entry(&sample_draft(1), &key, &[0u8; 16], GENESIS_PREV_HASH, 0).unwrap();
+        let e = build_signed_entry(
+            &sample_draft(1),
+            &key,
+            &[0u8; 16],
+            GENESIS_PREV_HASH,
+            0,
+            &SystemClock,
+        )
+        .unwrap();
         let err = compute_entry_hash(&e).unwrap_err();
         assert!(err.to_string().contains("carries its own"), "{err}");
         let mut only_sig = e.clone();
@@ -2360,5 +2434,121 @@ mod tests {
         }
         let r = verify_chain_file(&log_path, &pk, None).unwrap();
         assert_eq!((r.rows, r.broken), (150, None));
+    }
+
+    /// Lab PR 249: the key file of a fixed test key (RFC 8032 test 1's
+    /// secret key), in `dir`.
+    fn fixed_key(dir: &Path) -> TestKey {
+        let path = dir.join("fixed.key");
+        fs::write(
+            &path,
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\n",
+        )
+        .unwrap();
+        TestKey::load_or_bootstrap(&path).unwrap()
+    }
+
+    /// Lab PR 249: the rows of one writing, every kind the log stamps — an
+    /// operator's row, the writer's own (`agent_boot`, an identity minted,
+    /// a skipped-lines finding, `agent_stop`) — with `stamps`.
+    fn write_one(dir: &Path, stamps: AuditStamps) -> Vec<u8> {
+        let log_path = dir.join("audit.log");
+        let mut log = AuditLog::open_with(&log_path, fixed_key(dir), [7u8; 16], stamps).unwrap();
+        log.boot_probe(None, "verified", "attested", &test_build())
+            .unwrap();
+        log.attest_identity(&AgentIdentity {
+            id: [7u8; 16],
+            source: IdentitySource::Minted,
+            path: PathBuf::from("/etc/northnarrow/agent_id"),
+        })
+        .unwrap();
+        log.append(sample_draft(1)).unwrap();
+        log.attest_skipped_lines(Path::new("/var/lib/northnarrow/x.jsonl"), 2)
+            .unwrap();
+        log.stop_entry("sigterm", 9).unwrap();
+        drop(log);
+        fs::read(&log_path).unwrap()
+    }
+
+    /// Lab PR 249: with a fixed key, a clock of the caller's and its pid, a
+    /// chain written twice is the same bytes — times, hashes, signatures —
+    /// and verifies; every row carries the clock's time, the rows the writer
+    /// signs about itself its pid, an operator's row the pid it was given.
+    #[test]
+    fn a_fixed_clock_key_and_pid_write_the_same_chain_twice() {
+        let stamps = |clock: &Arc<crate::clock::testing::FixedClock>| AuditStamps {
+            clock: clock.clone(),
+            self_pid: 4_200_000,
+        };
+        let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let ca = Arc::new(crate::clock::testing::FixedClock::at(
+            "2026-01-01T00:10:00.250000Z",
+        ));
+        let cb = Arc::new(crate::clock::testing::FixedClock::at(
+            "2026-01-01T00:10:00.250000Z",
+        ));
+        let first = write_one(a.path(), stamps(&ca));
+        let second = write_one(b.path(), stamps(&cb));
+        assert_eq!(
+            String::from_utf8(first.clone()).unwrap(),
+            String::from_utf8(second).unwrap()
+        );
+        let pk = fixed_key(a.path()).verifying_key();
+        let r = verify_chain_file(&a.path().join("audit.log"), &pk, None).unwrap();
+        assert_eq!((r.rows, r.broken), (5, None));
+        let rows: Vec<AuditEntry> = String::from_utf8(first)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        for e in &rows {
+            assert_eq!(e.ts, "2026-01-01T00:10:00.250000Z", "{e:?}");
+            let expected_pid = if e.op == "test_op_1" {
+                12345
+            } else {
+                4_200_000
+            };
+            assert_eq!(e.client_pid, expected_pid, "{e:?}");
+        }
+        // The clock moved: the next row says so, and the bytes differ.
+        let c = TempDir::new().unwrap();
+        let cc = Arc::new(crate::clock::testing::FixedClock::at(
+            "2026-01-01T00:10:00.250000Z",
+        ));
+        let mut log = AuditLog::open_with(
+            &c.path().join("audit.log"),
+            fixed_key(c.path()),
+            [7u8; 16],
+            stamps(&cc),
+        )
+        .unwrap();
+        cc.advance(chrono::TimeDelta::seconds(3));
+        assert_eq!(
+            log.append(sample_draft(2)).unwrap().ts,
+            "2026-01-01T00:10:03.250000Z"
+        );
+        assert_eq!(log.self_pid(), 4_200_000);
+    }
+
+    /// Lab PR 249: `open` stamps as before — the host's clock (`Utc::now`,
+    /// the row's time between two readings of it) and the writing process's
+    /// pid on the rows about itself.
+    #[test]
+    fn open_stamps_with_the_host_clock_and_pid() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        assert_eq!(log.self_pid(), std::process::id());
+        let before = format_ts(Utc::now());
+        let e = log.stop_entry("sigterm", 1).unwrap();
+        let after = format_ts(Utc::now());
+        assert!(
+            before <= e.ts && e.ts <= after,
+            "{before} <= {} <= {after}",
+            e.ts
+        );
+        assert_eq!(e.client_pid, std::process::id());
+        let e = log.append(sample_draft(3)).unwrap();
+        assert_eq!(e.client_pid, 12345, "an operator's row keeps its pid");
     }
 }

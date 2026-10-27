@@ -249,6 +249,10 @@ pub struct AuditEvidence {
     unrecorded: AtomicU64,
     pending: AtomicU64,
     dropped: AtomicU64,
+    /// Lab PR 249: the time a transition the log refused happened
+    /// (`occurred_at`) — the host's clock, or a replay's
+    /// ([`Self::with_clock`]).
+    clock: Arc<dyn nn_evidence::clock::Clock>,
 }
 
 impl AuditEvidence {
@@ -259,7 +263,16 @@ impl AuditEvidence {
             unrecorded: AtomicU64::new(0),
             pending: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            clock: Arc::new(nn_evidence::clock::SystemClock),
         }
+    }
+
+    /// Lab PR 249: stamp `occurred_at` with `clock` instead of the host's
+    /// (the posture golden replay: its audit log's clock). The rows' own
+    /// `ts` is the audit log's ([`nn_evidence::audit::AuditStamps`]).
+    pub fn with_clock(mut self, clock: Arc<dyn nn_evidence::clock::Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Write the waiting transitions, oldest first, stopping at the first
@@ -267,7 +280,12 @@ impl AuditEvidence {
     fn drain(&self, backlog: &mut Backlog, log: &mut AuditLog) -> Result<(), String> {
         let mut written = 0usize;
         while let Some(w) = backlog.waiting.front() {
-            let draft = draft(&w.record, Some(&w.occurred_at), backlog.lost_unsaid);
+            let draft = draft(
+                &w.record,
+                Some(&w.occurred_at),
+                backlog.lost_unsaid,
+                log.self_pid(),
+            );
             if let Err(e) = log.append(draft) {
                 if written > 0 {
                     self.after_drain(written, backlog);
@@ -322,8 +340,9 @@ impl AuditEvidence {
 }
 
 /// The audit entry of `r`; `deferred` is the time it happened when it is
-/// written late.
-fn draft(r: &Record, deferred: Option<&str>, lost: u64) -> AuditEntryDraft {
+/// written late. `pid`: the log's own (`AuditLog::self_pid`, the agent's —
+/// lab PR 249: a replay's log names the replayed agent).
+fn draft(r: &Record, deferred: Option<&str>, lost: u64, pid: u32) -> AuditEntryDraft {
     let (op, mut extra, result) = match r {
         Record::Stage(t) => {
             let mut extra = serde_json::json!({
@@ -379,7 +398,7 @@ fn draft(r: &Record, deferred: Option<&str>, lost: u64) -> AuditEntryDraft {
         key_fp: "agent-self".to_string(),
         cosigner_fps: Vec::new(),
         result,
-        client_pid: std::process::id(),
+        client_pid: pid,
         client_uid: 0,
         client_comm: "northnarrow-agent".to_string(),
         client_exe: None,
@@ -393,17 +412,20 @@ impl AuditEvidence {
             self.unrecorded.fetch_add(1, Ordering::Relaxed);
             return Err(Unrecorded::NoAuditLog);
         };
-        let occurred_at = crate::audit::format_ts(chrono::Utc::now());
+        let occurred_at = nn_evidence::clock::stamp(self.clock.as_ref());
         let mut backlog = self.backlog.lock();
         let mut guard = log.lock();
         // In order: what waits goes first; while it cannot, this one waits
         // behind it.
         let res = match self.drain(&mut backlog, &mut guard) {
             Err(e) => Err(e),
-            Ok(()) => guard
-                .append(draft(&r, None, backlog.lost_unsaid))
-                .map(|_| backlog.lost_unsaid = 0)
-                .map_err(|e| format!("{e:#}")),
+            Ok(()) => {
+                let pid = guard.self_pid();
+                guard
+                    .append(draft(&r, None, backlog.lost_unsaid, pid))
+                    .map(|_| backlog.lost_unsaid = 0)
+                    .map_err(|e| format!("{e:#}"))
+            }
         };
         drop(guard);
         res.map_err(|error| {
@@ -496,12 +518,19 @@ mod tests {
 
     impl Lab {
         fn new() -> Self {
+            Self::stamped(crate::audit::AuditStamps::host())
+        }
+
+        /// Lab PR 249: the log stamping its rows with `stamps`.
+        fn stamped(stamps: crate::audit::AuditStamps) -> Self {
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("audit.log");
             let key =
                 crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
             let pubkey = key.verifying_key();
-            let log = Arc::new(Mutex::new(AuditLog::open(&path, key, [0u8; 16]).unwrap()));
+            let log = Arc::new(Mutex::new(
+                AuditLog::open_with(&path, key, [0u8; 16], stamps).unwrap(),
+            ));
             Self {
                 away: dir.path().join("audit.log.away"),
                 _dir: dir,
@@ -597,6 +626,49 @@ mod tests {
         // Nothing waits: a retry writes nothing more.
         ev.retry_pending();
         assert_eq!(lab.stages().len(), 4);
+    }
+
+    /// Lab PR 249: a clock that stays where it is put.
+    struct Held(Mutex<chrono::DateTime<chrono::Utc>>);
+
+    impl nn_evidence::clock::Clock for Held {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            *self.0.lock()
+        }
+    }
+
+    /// Lab PR 249: the rows name the log's pid (`AuditLog::self_pid`) and a
+    /// refused transition the time of the evidence's clock: with the
+    /// replay's clock and pid given to both, a row written late says when
+    /// the transition happened (`occurred_at`) and when it was written
+    /// (`ts`), each the clock's, and every row names the replayed agent.
+    #[test]
+    fn a_late_row_names_the_clocks_times_and_the_logs_pid() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let clock = Arc::new(Held(Mutex::new(at("2026-01-01T00:05:02Z"))));
+        let lab = Lab::stamped(crate::audit::AuditStamps {
+            clock: clock.clone(),
+            self_pid: 4_200_000,
+        });
+        let ev = AuditEvidence::new(Some(Arc::clone(&lab.log))).with_clock(clock.clone());
+        lab.fail();
+        assert!(ev
+            .record_stage(&transition(CombatStage::Investigate, "t1"))
+            .is_err());
+        *clock.0.lock() = at("2026-01-01T00:05:40Z");
+        lab.recover();
+        ev.record_stage(&transition(CombatStage::Neutralize, "t2"))
+            .unwrap();
+        let rows = lab.stages();
+        assert_eq!(reasons(&rows), ["t1", "t2"]);
+        assert_eq!(rows[0].extra["occurred_at"], "2026-01-01T00:05:02.000000Z");
+        assert_eq!(rows[0].ts, "2026-01-01T00:05:40.000000Z");
+        assert_eq!(rows[1].ts, "2026-01-01T00:05:40.000000Z");
+        assert!(rows.iter().all(|e| e.client_pid == 4_200_000), "{rows:?}");
     }
 
     /// The stand-down's retry writes what waits without a new transition;

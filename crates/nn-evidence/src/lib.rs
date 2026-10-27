@@ -32,5 +32,8 @@ pub mod chain_lines;
 pub mod chain_tail;
 /// The rotating, signed, hash-chained logs (was the agent's `chainlog`).
 pub mod chainlog;
+/// The time the writers stamp on their rows (lab PR 249: the host's clock
+/// by default, a replay's or a test's when given one).
+pub mod clock;
 /// The full verifiers' bounded line reader (was the agent's `verify_lines`).
 pub mod verify_lines;

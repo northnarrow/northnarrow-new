@@ -73,7 +73,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chrono::Utc;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -82,6 +81,7 @@ use tracing::{error, warn};
 
 use crate::audit::GENESIS_PREV_HASH;
 use crate::chain_host::{ChainHost, ChainSigner};
+use crate::clock::{stamp, Clock, SystemClock};
 
 /// On-disk format of the lines written before lab PR 204 (BUG-026). A v1
 /// line (the legacy flat line, NO `fmt_ver`) and a v2 line are read and
@@ -582,10 +582,6 @@ fn track_format(
     }
 }
 
-fn now_ts() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
-}
-
 /// Top-level JSON keys reserved by the line framing. A flattened data
 /// payload `P` MUST NOT use any of these: the envelope keys
 /// (`fmt_ver`/`prev_hash`/`entry_hash`/`agent_sig`) would corrupt the
@@ -650,16 +646,18 @@ impl<P: Serialize + ChainPayload> ChainLine<P> {
 }
 
 impl TerminatorLine {
-    /// The seal of the log `kind`, in the format `rotate.fmt_ver` names.
+    /// The seal of the log `kind`, in the format `rotate.fmt_ver` names,
+    /// stamped by `clock` (lab PR 249).
     fn sealed<K: ChainSigner>(
         rotate: RotateTerminator,
         key: &K,
         prev_hash: &str,
         kind: &str,
+        clock: &dyn Clock,
     ) -> Result<Self> {
         let line = TerminatorLine {
             rotate,
-            ts: now_ts(),
+            ts: stamp(clock),
             prev_hash: prev_hash.to_string(),
             entry_hash: String::new(),
             agent_sig: String::new(),
@@ -904,6 +902,9 @@ pub struct RotatingChainLog<P, K> {
     /// [`ManifestEvent::ActiveCheckpoint`], and when it was written.
     since_checkpoint: u64,
     checkpoint_at: std::time::Instant,
+    /// Lab PR 249: the time the terminators and manifest rows are stamped
+    /// with (the host's unless [`Self::open_with_clock`] was given another).
+    clock: std::sync::Arc<dyn Clock>,
     _marker: std::marker::PhantomData<P>,
 }
 
@@ -922,6 +923,26 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
         key: K,
         cfg: RotationConfig,
         protection: std::sync::Arc<dyn ProtectionManager>,
+    ) -> Result<Self> {
+        Self::open_with_clock(
+            active_path,
+            key,
+            cfg,
+            protection,
+            std::sync::Arc::new(SystemClock),
+        )
+    }
+
+    /// Lab PR 249: [`Self::open`] stamping the rows it writes — the
+    /// terminators and the manifest rows, those written at open included —
+    /// with `clock` instead of the host's. Its data lines carry no time of
+    /// their own.
+    pub fn open_with_clock(
+        active_path: &Path,
+        key: K,
+        cfg: RotationConfig,
+        protection: std::sync::Arc<dyn ProtectionManager>,
+        clock: std::sync::Arc<dyn Clock>,
     ) -> Result<Self> {
         // Review entry 44: every later open/rename goes through a directory
         // fd taken now, so a mount over the directory cannot divert the log.
@@ -959,6 +980,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             fsyncs: 0,
             since_checkpoint: 0,
             checkpoint_at: std::time::Instant::now(),
+            clock,
             _marker: std::marker::PhantomData,
         };
 
@@ -1269,6 +1291,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
             &self.key,
             &self.last_hash,
             P::KIND,
+            self.clock.as_ref(),
         )?;
         let terminator_hash = term.entry_hash.clone();
         let sealed_bytes = self.active_bytes;
@@ -1530,7 +1553,7 @@ impl<P: Serialize + DeserializeOwned + ChainPayload, K: ChainSigner> RotatingCha
     fn manifest_append(&mut self, event: ManifestEvent) -> Result<()> {
         let entry = ManifestEntry {
             fmt_ver: CHAINLOG_FMT_V3,
-            ts: now_ts(),
+            ts: stamp(self.clock.as_ref()),
             event,
         };
         let line = ManifestLine::sealed(entry, &self.key, &self.manifest_last_hash, P::KIND)?;
@@ -3804,6 +3827,7 @@ mod tests {
             &k,
             &tail,
             TestPayload::KIND,
+            &SystemClock,
         )
         .unwrap();
         append_and_fsync::<PortableHost>(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
@@ -3871,6 +3895,7 @@ mod tests {
             &k,
             &tail,
             TestPayload::KIND,
+            &SystemClock,
         )
         .unwrap();
         append_and_fsync::<PortableHost>(&active, &to_jsonl(&term).unwrap(), 0o600).unwrap();
@@ -4104,6 +4129,7 @@ mod tests {
             &other,
             &tail,
             TestPayload::KIND,
+            &SystemClock,
         )
         .unwrap();
         append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
@@ -4226,6 +4252,7 @@ mod tests {
             &key_at(&kp),
             &tail,
             TestPayload::KIND,
+            &SystemClock,
         )
         .unwrap();
         append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
@@ -4333,6 +4360,7 @@ mod tests {
             &key_at(&kp),
             &tail,
             TestPayload::KIND,
+            &SystemClock,
         )
         .unwrap();
         append_raw(&active, to_jsonl(&term).unwrap().as_bytes());
@@ -5293,11 +5321,11 @@ mod tests {
             record_count: 3,
             bytes,
         };
-        let term = TerminatorLine::sealed(rotate, &k, &prev, kind).unwrap();
+        let term = TerminatorLine::sealed(rotate, &k, &prev, kind, &SystemClock).unwrap();
         append_and_fsync::<PortableHost>(&archive1, &to_jsonl(&term).unwrap(), 0o600).unwrap();
         let rotated = ManifestEntry {
             fmt_ver: CHAINLOG_FMT_V2,
-            ts: now_ts(),
+            ts: stamp(&SystemClock),
             event: ManifestEvent::Rotated {
                 seq: 1,
                 terminator_hash: term.entry_hash.clone(),
@@ -5364,5 +5392,147 @@ mod tests {
             (r.total_records, r.legacy_lines, r.non_canonical_legacy),
             (30, 7, 0)
         );
+    }
+
+    /// Lab PR 249: one writing of a rotating set with a fixed key and a
+    /// clock that moves 250 ms before each append: three rotations (each a
+    /// terminator and a manifest `Rotated` row), then a checkpoint. Every
+    /// file of the set, by name, with its bytes.
+    fn write_rotating_set(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let kp = dir.join("fixed.key");
+        fs::write(
+            &kp,
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\n",
+        )
+        .unwrap();
+        let clock = std::sync::Arc::new(crate::clock::testing::FixedClock::at(
+            "2026-01-01T00:00:05.000001Z",
+        ));
+        let active = dir.join("set.jsonl");
+        let mut log = RotatingChainLog::<TestPayload, _>::open_with_clock(
+            &active,
+            TestKey::load_or_bootstrap(&kp).unwrap(),
+            cfg(1600, 8),
+            std::sync::Arc::new(NoProtection),
+            clock.clone(),
+        )
+        .unwrap();
+        for i in 0..12 {
+            clock.advance(chrono::TimeDelta::milliseconds(250));
+            log.append(payload(i)).unwrap();
+        }
+        clock.advance(chrono::TimeDelta::seconds(1));
+        log.checkpoint().unwrap();
+        drop(log);
+        let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("set.jsonl")
+            })
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_str().unwrap().to_string(),
+                    fs::read(&p).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Lab PR 249: the rows a rotating log stamps — its terminators and its
+    /// manifest rows — carry its clock's time: with a fixed key and a clock
+    /// of the caller's, the set written twice is the same bytes, every file,
+    /// and verifies.
+    #[test]
+    fn a_fixed_clock_and_key_write_the_same_rotating_set_twice() {
+        let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let first = write_rotating_set(a.path());
+        let second = write_rotating_set(b.path());
+        let names: Vec<&str> = first.iter().map(|(n, _)| n.as_str()).collect();
+        let archives = names.len() - 2;
+        assert!(archives >= 2, "{names:?}");
+        let mut want = vec!["set.jsonl".to_string()];
+        want.extend((1..=archives).map(|n| format!("set.jsonl.{n:06}")));
+        want.push("set.jsonl.manifest.jsonl".to_string());
+        assert_eq!(names, want);
+        assert_eq!(first, second);
+        let pk = TestKey::load_or_bootstrap(&a.path().join("fixed.key"))
+            .unwrap()
+            .verifying_key();
+        let r = verify_log_set::<TestPayload>(&a.path().join("set.jsonl"), &pk).unwrap();
+        assert_eq!((r.archives_verified, r.total_records), (archives, 12));
+        // The stamps are the clock's: terminators and manifest rows in the
+        // order they were written, the checkpoint a second after the last.
+        let ts_of = |line: &str| -> String {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v.get("ts")
+                .or_else(|| v["manifest"].get("ts"))
+                .and_then(|t| t.as_str())
+                .unwrap()
+                .to_string()
+        };
+        let text = |name: &str| {
+            String::from_utf8(first.iter().find(|(n, _)| n == name).unwrap().1.clone()).unwrap()
+        };
+        let mut stamps = Vec::new();
+        for seq in 1..=archives {
+            let archive = text(&format!("set.jsonl.{seq:06}"));
+            stamps.push(ts_of(archive.lines().last().unwrap()));
+        }
+        let manifest: Vec<String> = text("set.jsonl.manifest.jsonl")
+            .lines()
+            .map(ts_of)
+            .collect();
+        assert_eq!(
+            manifest.len(),
+            archives + 1,
+            "the rotations and a checkpoint"
+        );
+        for (t, m) in stamps.iter().zip(&manifest) {
+            assert_eq!(t, m, "a rotation's terminator and its manifest row");
+            assert!(t.starts_with("2026-01-01T00:00:0"), "{t}");
+            assert!(t.ends_with("0001Z"), "{t}");
+        }
+        assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
+        assert_eq!(manifest[archives], "2026-01-01T00:00:09.000001Z");
+    }
+
+    /// Lab PR 249: `open` stamps with the host's clock, as before.
+    #[test]
+    fn open_stamps_with_the_host_clock() {
+        let dir = TempDir::new().unwrap();
+        let active = dir.path().join("host.jsonl");
+        let before = crate::audit::format_ts(chrono::Utc::now());
+        let mut log = RotatingChainLog::<TestPayload, _>::open(
+            &active,
+            key(),
+            cfg(1600, 8),
+            std::sync::Arc::new(NoProtection),
+        )
+        .unwrap();
+        for i in 0..6 {
+            log.append(payload(i)).unwrap();
+        }
+        log.checkpoint().unwrap();
+        drop(log);
+        let after = crate::audit::format_ts(chrono::Utc::now());
+        let manifest = fs::read_to_string(manifest_path_for(&active)).unwrap();
+        let mut n = 0;
+        for line in manifest.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let ts = v["manifest"]["ts"].as_str().unwrap();
+            assert!(
+                before.as_str() <= ts && ts <= after.as_str(),
+                "{before} {ts} {after}"
+            );
+            n += 1;
+        }
+        assert!(n >= 2, "a rotation and a checkpoint: {manifest}");
     }
 }

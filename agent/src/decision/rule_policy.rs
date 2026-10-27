@@ -506,12 +506,10 @@ pub fn global() -> &'static PolicyHandle {
 }
 
 /// Put `p` in force for the agent: the [`global`] handle the production
-/// engine reads, and the posture's ransomware flag
-/// ([`nn_model::posture_types::ransomware_combat_without_corroboration`]).
+/// engine and posture read (lab PR 249: the posture reads its ransomware
+/// directive from it, `PostureMachine::with_rule_policy`; it used to be a
+/// process-wide flag this set beside the handle).
 pub fn install_global(p: RulePolicy) -> Arc<RulePolicy> {
-    nn_model::posture_types::set_ransomware_combat_without_corroboration(
-        p.ransomware_combat_without_corroboration,
-    );
     global().install(p)
 }
 

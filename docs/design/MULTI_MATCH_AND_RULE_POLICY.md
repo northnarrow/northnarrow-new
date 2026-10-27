@@ -163,6 +163,11 @@ for one rule, more than 4,096 lines.
 `combat-without-corroboration NN-L-IMP-001` is the policy's form of
 `posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`: the ransomware
 trigger reaches COMBAT without corroboration (it never locks it, lab PR 225).
+Lab PR 249: the posture reads it from the policy handle it is given
+(`PostureMachine::with_rule_policy`; the agent's is the engine's,
+`rule_policy::global()`), as the engine reads its modes — `nn-admin policy
+set` reaches both at the next event. It was a process-wide flag that
+`install_global` set beside the handle.
 
 ### 3.2 Built-in defaults
 
