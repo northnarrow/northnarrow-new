@@ -15,12 +15,12 @@
 //! [`PolicyHandle`]; `nn-admin policy set` swaps it between two events.
 //! Design: `docs/design/MULTI_MATCH_AND_RULE_POLICY.md`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
 use super::catalogue;
@@ -566,136 +566,10 @@ pub trait ActorFacts: Send + Sync {
     fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])>;
 }
 
-/// [`ActorFacts`] read from a `/proc` (the host's, or an empty one in the
-/// golden replay).
-pub struct ProcFacts {
-    root: PathBuf,
-    hashes: Mutex<HashCache>,
-}
-
-/// Executables hashed, by identity; at most [`HASH_CACHE_CAP`].
-#[derive(Default)]
-struct HashCache {
-    map: HashMap<FileKey, [u8; 32]>,
-    order: std::collections::VecDeque<FileKey>,
-}
-
-const HASH_CACHE_CAP: usize = 64;
-/// Larger executables are not hashed (not exempt).
-const MAX_HASHED_BYTES: u64 = 512 << 20;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileKey {
-    dev: u64,
-    ino: u64,
-    size: u64,
-    mtime: (i64, i64),
-    ctime: (i64, i64),
-}
-
-impl ProcFacts {
-    pub fn new(proc_root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: proc_root.into(),
-            hashes: Mutex::new(HashCache::default()),
-        }
-    }
-
-    fn hash_file(&self, f: &mut std::fs::File, key: FileKey) -> Option<[u8; 32]> {
-        use std::io::Read as _;
-        if let Some(h) = self.hashes.lock().map.get(&key) {
-            return Some(*h);
-        }
-        if key.size > MAX_HASHED_BYTES {
-            return None;
-        }
-        let mut h = Sha256::new();
-        let mut buf = vec![0u8; 64 << 10];
-        loop {
-            match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => h.update(&buf[..n]),
-                Err(_) => return None,
-            }
-        }
-        let digest: [u8; 32] = h.finalize().into();
-        let mut c = self.hashes.lock();
-        if c.map.insert(key, digest).is_none() {
-            c.order.push_back(key);
-            while c.order.len() > HASH_CACHE_CAP {
-                if let Some(old) = c.order.pop_front() {
-                    c.map.remove(&old);
-                }
-            }
-        }
-        Some(digest)
-    }
-}
-
-impl Default for ProcFacts {
-    fn default() -> Self {
-        Self::new("/proc")
-    }
-}
-
-/// Root-owned and writable by no one else.
-fn root_only(m: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    m.uid() == 0 && m.mode() & 0o022 == 0
-}
-
-impl ActorFacts for ProcFacts {
-    fn uid(&self, pid: u32) -> Option<u32> {
-        let s = std::fs::read_to_string(self.root.join(pid.to_string()).join("status")).ok()?;
-        s.lines()
-            .find_map(|l| l.strip_prefix("Uid:"))
-            .and_then(|r| r.split_whitespace().next())
-            .and_then(|u| u.parse().ok())
-    }
-
-    fn cgroup(&self, pid: u32) -> Option<String> {
-        let s = std::fs::read_to_string(self.root.join(pid.to_string()).join("cgroup")).ok()?;
-        s.lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .map(str::to_string)
-    }
-
-    fn trusted_exe(&self, pid: u32) -> Option<(String, [u8; 32])> {
-        use std::os::unix::fs::MetadataExt;
-        let link = self.root.join(pid.to_string()).join("exe");
-        let path = std::fs::read_link(&link).ok()?;
-        let path_s = path.to_str()?.to_string();
-        if !crate::posture::lineage::in_system_tree(&path_s) {
-            return None;
-        }
-        let mut f = std::fs::File::open(&link).ok()?;
-        let m = f.metadata().ok()?;
-        if !m.file_type().is_file() || !root_only(&m) {
-            return None;
-        }
-        // The opened file is the one at the path it names now.
-        let at_path = std::fs::symlink_metadata(&path).ok()?;
-        if at_path.dev() != m.dev() || at_path.ino() != m.ino() {
-            return None;
-        }
-        let mut dir = path.parent();
-        while let Some(d) = dir {
-            if !root_only(&std::fs::symlink_metadata(d).ok()?) {
-                return None;
-            }
-            dir = d.parent();
-        }
-        let key = FileKey {
-            dev: m.dev(),
-            ino: m.ino(),
-            size: m.size(),
-            mtime: (m.mtime(), m.mtime_nsec()),
-            ctime: (m.ctime(), m.ctime_nsec()),
-        };
-        let digest = self.hash_file(&mut f, key)?;
-        Some((path_s, digest))
-    }
-}
+/// R08b (lab PR 251): the Linux source of the facts (`/proc`, `st_uid` and
+/// the mode bits, the executable hashed) is the agent's host's
+/// (`decision_host_linux`, cut verbatim), here under its name.
+pub use crate::decision_host_linux::ProcFacts;
 
 /// The unit a cgroup path names: its last `.service` / `.scope` component.
 fn unit_of(cgroup: &str) -> Option<&str> {
@@ -748,6 +622,8 @@ pub fn exempt(
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+
     use super::*;
 
     const IMP: &str = "NN-L-IMP-001_RansomwareEncryption";
@@ -986,49 +862,6 @@ mod tests {
             &f,
         );
         assert_eq!(*f.reads.lock(), vec!["cgroup"]);
-    }
-
-    /// The host's own `/proc`: this test process's facts.
-    #[test]
-    fn proc_facts_read_this_process() {
-        let me = std::process::id();
-        let f = ProcFacts::default();
-        assert_eq!(f.uid(me), Some(unsafe { libc::getuid() }));
-        assert!(f.cgroup(me).is_some_and(|c| c.starts_with('/')));
-        // A process of an empty /proc has no facts.
-        let empty = tempfile::TempDir::new().unwrap();
-        let f = ProcFacts::new(empty.path());
-        assert_eq!(f.uid(me), None);
-        assert_eq!(f.cgroup(me), None);
-        assert_eq!(f.trusted_exe(me), None);
-    }
-
-    /// A root-owned system binary is trusted with its digest; a file the
-    /// test user owns never is.
-    #[test]
-    fn proc_facts_trust_only_root_owned_system_executables() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let proc_root = dir.path().join("proc");
-        std::fs::create_dir_all(proc_root.join("1")).unwrap();
-        let target = Path::new("/bin/sh")
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from("/bin/sh"));
-        std::os::unix::fs::symlink(&target, proc_root.join("1/exe")).unwrap();
-        let f = ProcFacts::new(&proc_root);
-        let (path, digest) = f.trusted_exe(1).expect("a root-owned system shell");
-        assert_eq!(Path::new(&path), target);
-        assert_eq!(
-            digest,
-            <[u8; 32]>::from(Sha256::digest(std::fs::read(&target).unwrap()))
-        );
-        // Cached: the same answer again.
-        assert_eq!(f.trusted_exe(1), Some((path, digest)));
-        // A file outside the system trees (owned by the test user).
-        let mine = dir.path().join("mine");
-        std::fs::write(&mine, b"x").unwrap();
-        std::fs::create_dir_all(proc_root.join("2")).unwrap();
-        std::os::unix::fs::symlink(&mine, proc_root.join("2/exe")).unwrap();
-        assert_eq!(f.trusted_exe(2), None);
     }
 
     #[test]

@@ -400,11 +400,13 @@ planned = false
 # database, the tracker's host path, the security-tool detector, the FIM
 # rules' window and the rule sets' inert one name the agent's Linux host
 # where they called libc, `std::fs` on `/proc`, `runtime`, `trusted_bin`,
-# `response` and the window (→ 35).
+# `response` and the window (→ 35); the per-rule policy's `/proc` facts
+# stay with the Linux host and `rule_policy.rs` re-exports them from it
+# (→ 36).
 
 [ratchet]
 nn-admin = 8
-nn-core = 35
+nn-core = 36
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

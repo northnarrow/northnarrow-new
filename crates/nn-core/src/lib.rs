@@ -39,6 +39,13 @@ pub mod decision {
     pub mod host;
 }
 
+/// The ransomware signal (R08b, lab PR 251): the entropy of what a burst
+/// left behind (cut from the agent's `impact::entropy`).
+pub mod impact {
+    /// What a sampling found, what samples, the measure, the containers.
+    pub mod entropy;
+}
+
 // The adaptive defensive posture (R08a, lab PR 250; was the agent's
 // `posture`): the state machine, its triggers, the corroboration ledger, the
 // lineage, the stack exemption, the operator's two overlays, and what it
