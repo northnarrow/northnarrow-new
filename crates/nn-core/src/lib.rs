@@ -144,6 +144,14 @@ pub mod fim {
     pub mod rules;
 }
 
+/// The COMBAT ladder (R08c, lab PR 252): who it acts against, as its
+/// signed rows name them (was the agent's `combat::offender`).
+pub mod combat {
+    /// An offender's identity as the ladder captured it: pid, starts,
+    /// executable, cgroup, how it joined the episode.
+    pub mod offender;
+}
+
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
 /// carve-out (was the agent's `anti_tamper::combat_allow`); R08b (lab PR
 /// 251): the trusted-installer window's vocabulary; R08c (lab PR 252): the

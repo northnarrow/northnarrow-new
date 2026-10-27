@@ -73,7 +73,10 @@ use crate::posture::{CombatCause, CombatEntry};
 
 pub mod actuator;
 pub mod evidence;
-pub mod offender;
+// R08c (lab PR 252): who the ladder acts against, as its signed rows name
+// them, is nn-core's (data and its rendering; `/proc` is read by the
+// actuator), here under its path.
+pub use nn_core::combat::offender;
 pub mod protected;
 pub mod reconcile;
 

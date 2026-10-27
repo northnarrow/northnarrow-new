@@ -34,7 +34,7 @@ pub struct ProcFacts {
 /// The cgroup path a `/proc/<pid>/cgroup` text places the process in: the
 /// unified hierarchy (`0::/…`), or systemd's own (`name=systemd`) on a v1
 /// host.
-pub(crate) fn cgroup_path(text: &str) -> Option<&str> {
+pub fn cgroup_path(text: &str) -> Option<&str> {
     text.lines()
         .find_map(|l| l.strip_prefix("0::"))
         .or_else(|| {
@@ -44,7 +44,7 @@ pub(crate) fn cgroup_path(text: &str) -> Option<&str> {
 }
 
 /// `s` within [`MAX_PATH_SHOWN`] bytes: as it is, or its end after `…`.
-pub(crate) fn shown(s: &str) -> String {
+pub fn shown(s: &str) -> String {
     if s.len() <= MAX_PATH_SHOWN {
         return s.to_string();
     }
