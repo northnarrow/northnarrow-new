@@ -371,11 +371,12 @@ planned = false
 # seam — the lineage and the stack exemption name the agent's Linux host
 # where they called `std::fs` and libc, which the scan does not see (→ 39);
 # they moved, the machine's `posture/mod.rs`, which binds them to that host,
-# names it (→ 38).
+# names it (→ 38); the triggers consult the agent's other modules through
+# that host, the posture's second seam (→ 39).
 
 [ratchet]
 nn-admin = 8
-nn-core = 38
+nn-core = 39
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

@@ -30,6 +30,11 @@ use std::fmt::Debug;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use nn_model::telemetry::FimEvent;
+use nn_model::Event;
+
+use super::lineage::AuthSessionTracker;
+
 /// The host's reads and clocks the posture uses. A unit type: the posture's
 /// types hold it as a parameter only (hence `Copy`, `Default`, `Debug`).
 pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
@@ -71,6 +76,62 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     /// The monotonic clock now, ns (`CLOCK_MONOTONIC`): the clock of the
     /// kernel's event timestamps.
     fn monotonic_ns() -> u64;
+}
+
+/// What the posture's triggers and machine consult in the agent's other
+/// modules (R08a, lab PR 250), each until the lot that moves it below the
+/// posture: the rule engine's shapes the triggers share with its rules so
+/// that the two cannot drift apart (R08b moves the engine here), the
+/// engine's per-rule policy (R08b), the trusted-installer window
+/// (`anti_tamper`; R04b splits it), the ransomware tracker and the
+/// security-tool detector the rules share (`impact`, `impair`), and the
+/// capability a verified signed unlock mints (`anti_tamper`; R04b). The
+/// agent's `LinuxHost` implements it with the calls the posture made.
+pub trait PostureAgent: PostureHost {
+    /// NN-L-FIM-024's match: a mutation of an anti-tamper bait file (the
+    /// control-surface trigger, lab PR 162).
+    fn is_bait_tamper(fe: &FimEvent) -> bool;
+
+    /// NN-L-EPG-001/002's event: the exploit guard's post-condition (lab PR
+    /// 219).
+    fn is_exploit_postcondition(event: &Event) -> bool;
+
+    /// R020's shape (lab PR 224): a shell or interpreter whose stdin or
+    /// stdout is the network, its parent placed through `lineage`.
+    fn is_reverse_shell(event: &Event, lineage: &AuthSessionTracker<Self>) -> bool;
+
+    /// `path` lies in a staging directory (the rules' list).
+    fn is_staging_path(path: &str) -> bool;
+
+    /// The per-rule policy a machine reads its ransomware directive from
+    /// (lab PR 249); its default is the built-in policy.
+    type RulePolicy: Clone + Default + Send + Sync + 'static;
+
+    /// `combat-without-corroboration NN-L-IMP-001` is in force in `policy`
+    /// now (lab PR 236).
+    fn ransomware_combat_without_corroboration(policy: &Self::RulePolicy) -> bool;
+
+    /// The trusted-installer window (lab PR 162).
+    type InstallerWindow: Send + Sync + 'static;
+
+    /// The window is open now.
+    fn installer_window_open(window: &Self::InstallerWindow) -> bool;
+
+    /// The ransomware tracker the rules share (lab PR 225).
+    type RansomTracker: Send + Sync + 'static;
+
+    /// `event` makes the tracker's assessment of its actor decisive.
+    fn ransomware_decisive(tracker: &Self::RansomTracker, event: &Event) -> bool;
+
+    /// The security-tool detector the rules share (lab PR 225).
+    type DefenseDetector: Send + Sync + 'static;
+
+    /// `event` switches a security tool off, and nothing sanctions it.
+    fn defense_unsanctioned(detector: &Self::DefenseDetector, event: &Event) -> bool;
+
+    /// The capability a verified signed unlock mints: the machine hands it
+    /// to its release hook (lab PR 217), it never makes one.
+    type UnlockToken: Send + 'static;
 }
 
 /// The posture's own tests: a portable host. Its files are the machine's

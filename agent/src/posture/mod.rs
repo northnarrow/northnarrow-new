@@ -102,6 +102,12 @@ use nn_model::Event;
 use crate::anti_tamper::network_isolate::UnlockToken;
 use crate::decision::rule_policy::PolicyHandle;
 use clock::Clock;
+use nn_core::posture::host::PostureAgent;
+
+/// R08a (lab PR 250): what the machine consults in the agent's other modules
+/// goes through the agent's host, until the machine moves to nn-core and
+/// takes it as a type parameter.
+use crate::chain_host_linux::LinuxHost as H;
 use corroboration::CorroborationLedger;
 use escalation_allow::EscalationAllowList;
 
@@ -404,10 +410,7 @@ impl PostureMachine {
     /// this machine now: the directive of the policy it reads (lab PR 236,
     /// 249).
     pub fn ransomware_combat_without_corroboration(&self) -> bool {
-        self.inner
-            .rule_policy
-            .current()
-            .ransomware_combat_without_corroboration
+        H::ransomware_combat_without_corroboration(&self.inner.rule_policy)
     }
 
     /// Tappa 10.9 step 1, lab PR 249: switch this machine's mass-write arm

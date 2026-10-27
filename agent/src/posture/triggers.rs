@@ -38,6 +38,12 @@ use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::lineage::AuthSessionTracker;
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+use nn_core::posture::host::PostureAgent;
+
+/// R08a (lab PR 250): what the triggers consult in the agent's other modules
+/// goes through the agent's host, until the triggers move to nn-core and
+/// take it as a type parameter.
+use crate::chain_host_linux::LinuxHost as H;
 
 /// The recent events the triggers scan, borrowed (review 72). The
 /// correlation buffer is a ring of up to 1,000 events; cloning it for every
@@ -378,7 +384,7 @@ impl std::fmt::Debug for InstallerWindow {
 
 impl InstallerWindow {
     fn is_open(&self) -> bool {
-        self.0.get().is_some_and(|w| w.is_window_open())
+        self.0.get().is_some_and(|w| H::installer_window_open(w))
     }
 }
 
@@ -713,7 +719,7 @@ impl TriggerDetector {
         // write and so no denial reaches the posture either, it is not
         // raised; the rule still kills and records.
         if let Event::Fim(fe) = event {
-            if crate::fim::rules::is_bait_tamper(fe)
+            if H::is_bait_tamper(fe)
                 && fe.modifier_pid != std::process::id()
                 && !self.installer_window.is_open()
             {
@@ -724,7 +730,7 @@ impl TriggerDetector {
         // evidence of COMBAT tier that needs a second signal of another
         // class while the guard is experimental (the shared predicate of
         // NN-L-EPG-001/002, so the rules and the trigger cannot drift).
-        if crate::decision::rules::epg::is_exploit_postcondition(event) {
+        if H::is_exploit_postcondition(event) {
             hits.push(TriggerType::ExploitPostcondition);
         }
         let mass_write = confirmed_intrusion(
@@ -745,9 +751,7 @@ impl TriggerDetector {
         // reverse shell), read on exec identity and the kernel's file table.
         // A COMBAT-tier execution signal: on its own it stops at ENGAGED, a
         // second signal of another class reaches COMBAT.
-        let reverse_shell =
-            crate::decision::rules::r020_shell_with_socket_stdio::shape(event, Some(&self.auth))
-                .is_some();
+        let reverse_shell = H::is_reverse_shell(event, &self.auth);
         if mass_write || staged == Some(StagedExec::Confirmed) || reverse_shell {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
@@ -757,7 +761,7 @@ impl TriggerDetector {
         // default). The shapes alone keep their triggers (the mass-write
         // arm above).
         if let Some(t) = self.impact.ransom.get() {
-            if t.assess(event).is_some_and(|a| a.decisive) {
+            if H::ransomware_decisive(t, event) {
                 hits.push(TriggerType::RansomwareEncryption);
             }
         }
@@ -765,7 +769,7 @@ impl TriggerDetector {
         // transaction, an administrator's session and configuration
         // management — ENGAGED, execution evidence that corroborates.
         if let Some(d) = self.impact.defense.get() {
-            if d.assess(event).is_some_and(|f| f.sanctioned.is_none()) {
+            if H::defense_unsanctioned(d, event) {
                 hits.push(TriggerType::DefenseImpairment);
             }
         }
@@ -1288,7 +1292,7 @@ fn staging_exec(
         _ => return None,
     };
     let image = exe.path_or(filename);
-    if !crate::decision::rules::is_staging_path(image) {
+    if !H::is_staging_path(image) {
         return None;
     }
     if auth.in_package_transaction(pid, ts) {

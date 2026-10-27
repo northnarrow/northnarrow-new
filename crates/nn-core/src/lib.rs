@@ -38,8 +38,9 @@ pub mod posture {
     /// The NorthNarrow stack's own PIDs (the agent, the verified watchdog),
     /// whose events raise no trigger.
     pub mod exempt;
-    /// What the posture reads from its host: the process table, the host's
-    /// files, the clocks.
+    /// What the posture reads from its host — the process table, the
+    /// host's files, the clocks — and what it consults in the agent's other
+    /// modules.
     pub mod host;
     /// What the kernel executed for a process and its ancestors: the
     /// authenticated sessions, the package transactions, the workloads.

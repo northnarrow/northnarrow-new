@@ -6,14 +6,28 @@
 //! (`clock_gettime(CLOCK_BOOTTIME)`, `clock_gettime(CLOCK_MONOTONIC)`,
 //! `sysconf(_SC_CLK_TCK)`), with the same arguments. The host is the
 //! chains' one ([`LinuxHost`], `chain_host_linux`): one type, the agent's.
+//!
+//! And what the posture consults in the agent's other modules
+//! ([`PostureAgent`]): the rule engine's shapes, its per-rule policy, the
+//! trusted-installer window, the ransomware and security-tool judges, the
+//! unlock capability — the calls the triggers and the machine made, each
+//! until its lot moves it below the posture (R08b, R04b).
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nn_core::posture::host::PostureHost;
+use nn_core::posture::host::{PostureAgent, PostureHost};
+use nn_core::posture::lineage::AuthSessionTracker;
+use nn_model::telemetry::FimEvent;
+use nn_model::Event;
 
+use crate::anti_tamper::network_isolate::UnlockToken;
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 use crate::chain_host_linux::LinuxHost;
+use crate::decision::rule_policy::PolicyHandle;
+use crate::impact::RansomTracker;
+use crate::impair::DefenseDetector;
 
 impl PostureHost for LinuxHost {
     const PROC_ROOT: &'static str = "/proc";
@@ -84,6 +98,56 @@ impl PostureHost for LinuxHost {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
         ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
     }
+}
+
+impl PostureAgent for LinuxHost {
+    fn is_bait_tamper(fe: &FimEvent) -> bool {
+        crate::fim::rules::is_bait_tamper(fe)
+    }
+
+    fn is_exploit_postcondition(event: &Event) -> bool {
+        crate::decision::rules::epg::is_exploit_postcondition(event)
+    }
+
+    fn is_reverse_shell(event: &Event, lineage: &AuthSessionTracker<Self>) -> bool {
+        crate::decision::rules::r020_shell_with_socket_stdio::shape(event, Some(lineage)).is_some()
+    }
+
+    fn is_staging_path(path: &str) -> bool {
+        crate::decision::rules::is_staging_path(path)
+    }
+
+    /// The handle the engine reads and `nn-admin policy set` swaps
+    /// (`rule_policy::global()` in production).
+    type RulePolicy = PolicyHandle;
+
+    fn ransomware_combat_without_corroboration(policy: &PolicyHandle) -> bool {
+        policy.current().ransomware_combat_without_corroboration
+    }
+
+    type InstallerWindow = TrustedInstallerOverride;
+
+    fn installer_window_open(window: &TrustedInstallerOverride) -> bool {
+        window.is_window_open()
+    }
+
+    type RansomTracker = RansomTracker;
+
+    fn ransomware_decisive(tracker: &RansomTracker, event: &Event) -> bool {
+        tracker.assess(event).is_some_and(|a| a.decisive)
+    }
+
+    type DefenseDetector = DefenseDetector;
+
+    fn defense_unsanctioned(detector: &DefenseDetector, event: &Event) -> bool {
+        detector
+            .assess(event)
+            .is_some_and(|f| f.sanctioned.is_none())
+    }
+
+    /// Minted only by `anti_tamper` (`AdminAuth`, once a signed unlock
+    /// verified).
+    type UnlockToken = UnlockToken;
 }
 
 /// What is Linux about the posture's host: a directory's owner from
