@@ -148,7 +148,11 @@ pub(crate) mod testing {
     use std::sync::LazyLock;
     use std::time::Instant;
 
-    use super::PostureHost;
+    use nn_model::telemetry::FimEvent;
+    use nn_model::Event;
+
+    use super::{PostureAgent, PostureHost};
+    use crate::posture::lineage::AuthSessionTracker;
 
     /// The owner of every directory on the test host: the fixtures' user,
     /// not root (a package manager a user runs is not root's transaction).
@@ -207,6 +211,59 @@ pub(crate) mod testing {
         fn monotonic_ns() -> u64 {
             UPTIME_AT_START_NS + START.elapsed().as_nanos() as u64
         }
+    }
+
+    /// What the posture consults in the agent, as its tests need it while
+    /// the engine is the agent's (R08b): the staging directories and the
+    /// exploit guard's event as the rules read them (their list, their
+    /// match); no bait file and no reverse-shell shape (the tests of those
+    /// two wire the agent's rules: the agent's posture tests); the policy is
+    /// the ransomware directive itself, the window whether it is open; no
+    /// judge ever fires; the unlock capability is `()`.
+    impl PostureAgent for TestHost {
+        fn is_bait_tamper(_fe: &FimEvent) -> bool {
+            false
+        }
+
+        fn is_exploit_postcondition(event: &Event) -> bool {
+            matches!(event, Event::ExploitPostcondition { .. })
+        }
+
+        fn is_reverse_shell(_event: &Event, _lineage: &AuthSessionTracker<Self>) -> bool {
+            false
+        }
+
+        fn is_staging_path(path: &str) -> bool {
+            ["/tmp/", "/var/tmp/", "/dev/shm/"]
+                .iter()
+                .any(|p| path.starts_with(p))
+        }
+
+        type RulePolicy = bool;
+
+        fn ransomware_combat_without_corroboration(policy: &bool) -> bool {
+            *policy
+        }
+
+        type InstallerWindow = bool;
+
+        fn installer_window_open(window: &bool) -> bool {
+            *window
+        }
+
+        type RansomTracker = ();
+
+        fn ransomware_decisive(_tracker: &(), _event: &Event) -> bool {
+            false
+        }
+
+        type DefenseDetector = ();
+
+        fn defense_unsanctioned(_detector: &(), _event: &Event) -> bool {
+            false
+        }
+
+        type UnlockToken = ();
     }
 
     /// A symbolic link at `link` to `target`, as the fixtures of the process

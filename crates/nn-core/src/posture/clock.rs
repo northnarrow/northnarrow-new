@@ -43,18 +43,20 @@ impl Clock for SystemClock {
     }
 }
 
-/// Tests: a clock that moves only when told (lab PR 243).
-#[cfg(test)]
-pub(crate) struct TestClock {
+/// Tests: a clock that moves only when told (lab PR 243). R08a (lab PR
+/// 250): the agent's tests of the trusted-installer window read it too
+/// (`test-util`).
+#[cfg(any(test, feature = "test-util"))]
+pub struct TestClock {
     base: Instant,
     wall_at_base: SystemTime,
     elapsed: parking_lot::Mutex<std::time::Duration>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl TestClock {
     /// At `wall_at_base` on the wall clock.
-    pub(crate) fn at(wall_at_base: SystemTime) -> Self {
+    pub fn at(wall_at_base: SystemTime) -> Self {
         Self {
             base: Instant::now(),
             wall_at_base,
@@ -62,12 +64,12 @@ impl TestClock {
         }
     }
 
-    pub(crate) fn advance(&self, by: std::time::Duration) {
+    pub fn advance(&self, by: std::time::Duration) {
         *self.elapsed.lock() += by;
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Clock for TestClock {
     fn now(&self) -> Instant {
         self.base + *self.elapsed.lock()

@@ -27,31 +27,10 @@ pub mod correlation;
 pub mod detection_budget;
 
 /// The adaptive defensive posture (R08a, lab PR 250; was the agent's
-/// `posture`).
-pub mod posture {
-    /// The corroboration ledger: the escalation signals of each actor's
-    /// scope, recent enough to vouch for a blunt heuristic.
-    pub mod corroboration;
-    /// The operator's escalation allowlist: process × destination tuples
-    /// the exfiltration and lateral-movement counts leave out.
-    pub mod escalation_allow;
-    /// The NorthNarrow stack's own PIDs (the agent, the verified watchdog),
-    /// whose events raise no trigger.
-    pub mod exempt;
-    /// What the posture reads from its host — the process table, the
-    /// host's files, the clocks — and what it consults in the agent's other
-    /// modules.
-    pub mod host;
-    /// What the kernel executed for a process and its ancestors: the
-    /// authenticated sessions, the package transactions, the workloads.
-    pub mod lineage;
-    /// The operator's carve-out of the mass-write arm.
-    pub mod mass_write_overlay;
-    /// The live state, with its monotonic timestamps.
-    pub mod state;
-    /// The transitions: a trigger's level, the decay.
-    pub mod transitions;
-}
+/// `posture`): the state machine, its triggers, the corroboration ledger,
+/// the lineage, the stack exemption, the operator's two overlays, and what
+/// it needs from its host (`posture::host`).
+pub mod posture;
 
 /// Configuration content (R07, lab PR 247): the generic `.v1` + `.local`
 /// list loader and what the loaders take from the signed-overlay gate (was

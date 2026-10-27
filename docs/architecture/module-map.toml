@@ -250,6 +250,11 @@ planned = false
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # post-plan (lab PR 234): the OS CSPRNG
 "os_rng" = "nn-linux"
+# R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
+# agent's binding of it to the Linux host (its paths kept, the machine,
+# triggers, tracker and exemption as aliases on `LinuxHost`; it names
+# `chain_host_linux`, as `config/mod.rs` does for the loaders); the
+# posture's cross-module tests and golden replay stay in `posture/`
 "posture" = "nn-core"
 # post-plan (lab PR 250, R08a): the Linux host of the posture — the process
 # table (`/proc`), the host's files, a directory's owner, the clocks — of
@@ -372,11 +377,13 @@ planned = false
 # where they called `std::fs` and libc, which the scan does not see (→ 39);
 # they moved, the machine's `posture/mod.rs`, which binds them to that host,
 # names it (→ 38); the triggers consult the agent's other modules through
-# that host, the posture's second seam (→ 39).
+# that host, the posture's second seam (→ 39); the machine, the triggers,
+# the entry and the clock moved, and the agent's `posture.rs`, which binds
+# the posture to the Linux host, names it (→ 36).
 
 [ratchet]
 nn-admin = 8
-nn-core = 39
+nn-core = 36
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

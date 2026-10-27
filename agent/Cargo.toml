@@ -41,7 +41,7 @@ demo-tappa5 = []
 # Exposes the nn-admin `debug --force-posture <STATE>` subcommand and
 # the agent-side handler that consumes it. Used by the integration
 # test harness; never enabled in production builds.
-debug-trigger = ["nn-proto/debug-trigger"]
+debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger"]
 # Gates `agent/tests/privileged_e2e.rs` — full end-to-end scenarios
 # that spawn the agent + nn-admin subprocesses and verify the
 # iptables ruleset against a live kernel. Requires root and a
