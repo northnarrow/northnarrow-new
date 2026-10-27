@@ -64,8 +64,12 @@ pub mod config {
 }
 
 /// Deception content (R07, lab PR 247): the credential canaries' renderer
-/// (was the agent's `canary::templates`).
+/// (was the agent's `canary::templates`); R08a (lab PR 250): the readers a
+/// File or Credential canary spares (was the agent's `canary::readers`).
 pub mod canary {
+    /// The programs whose read of a File or Credential canary is recorded,
+    /// not killed: judged on what the kernel executed.
+    pub mod readers;
     /// The five credential families' decoys, rendered from a seed.
     pub mod templates;
 }

@@ -29,7 +29,16 @@ pub mod detector;
 pub mod network;
 pub mod path_policy;
 pub mod read_forward;
-pub mod readers;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the readers a
+/// File or Credential canary spares are nn-core's; the agent's judge on the
+/// lineage cache of the Linux host.
+pub mod readers {
+    pub use nn_core::canary::readers::*;
+
+    /// [`nn_core::canary::readers::CanaryReaders`] on the agent's host.
+    pub type CanaryReaders =
+        nn_core::canary::readers::CanaryReaders<crate::chain_host_linux::LinuxHost>;
+}
 pub mod registry;
 /// R07 shim (lab PR 247; plan §4.1 rule 2, removed in R17): the credential
 /// renderer is nn-core's. It reads an operator template through the agent's

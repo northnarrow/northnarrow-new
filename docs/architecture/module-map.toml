@@ -165,8 +165,6 @@ planned = false
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
 "canary::detector" = "nn-core"
-# judges on `posture::lineage` (R08a)
-"canary::readers" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
 # post-plan (lab PR 241, R04a): the chains' Linux file operations
@@ -297,6 +295,9 @@ planned = false
 "audit" = "nn-evidence"
 # post-plan (lab PR 178): the one reader of the canary chains' lines
 "canary::chain_lines" = "nn-evidence"
+# R08a (lab PR 250): the readers a File or Credential canary spares (they
+# judge on `posture::lineage`); `canary/mod.rs` binds them to the agent's host
+"canary::readers" = "nn-core"
 # R07 (lab PR 247): the credential renderer; `canary/mod.rs` binds it to the
 # agent's host and draws the deploy's seed from the OS RNG
 "canary::templates" = "nn-core"
