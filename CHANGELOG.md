@@ -1029,6 +1029,57 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `nn_evidence::…` as their target, which the journal line does not show
   (`with_target(false)`); a `RUST_LOG` filter naming the agent's module
   paths no longer selects them.
+- Wave 4 restructure, R07 — nn-core, part 1: the content lists (lab PR
+  247): the generic `.v1` + `.local` list loader (`config/overlay.rs`), the
+  FIM watched paths (`fim/paths_config.rs`), the credential canary renderer
+  (`canary/templates.rs`) and the COMBAT management carve-out
+  (`anti_tamper/combat_allow.rs`) moved to `crates/nn-core` (`git mv`,
+  94–99 %), with the part of `config::overlay_auth` the loaders take
+  (`Verified`, `content_sha256`, `read_overlay`, `ALLOW_UNSIGNED_ENV`,
+  `MAX_OVERLAY_BYTES`, cut verbatim); nn-core keeps the agent's module paths
+  (`nn_core::config::overlay`, …). nn-core stays pure: the open the content
+  code made itself (`O_NOFOLLOW | O_NONBLOCK`, an `ELOOP` refused as a
+  symbolic link — an overlay, a shipped `.v1`, an operator template) is the
+  new `content_host::ContentHost`'s, implemented for the agent's
+  `LinuxHost` by `content_host_linux` with the same flags, and the deploy's
+  seed is still drawn from the OS RNG in the agent (`new_content_seed`).
+  The agent keeps every path as a shim in the parent's `mod.rs` (removed in
+  R17), the loaders that read a file bound there to `LinuxHost` under their
+  names and signatures, so callers, tests, `fuzz_api` and the fuzz targets
+  are unchanged. On the way: `overlay_auth`'s install half (`store`,
+  `inode_key`: the atomic replace and inode protection of `config overlay
+  set`) to `config::overlay_install`; the overlay check names the exec
+  profile in `execpol::policy`; `net status`'s inactive-rules report from
+  the blocklist to `net::blind_spots` (it reads the resolver's
+  configuration). The ratchet goes from 54 to 52 (nn-core 40 → 38). Not
+  moved, and why: the comm allowlists and the canary readers judge on
+  `posture::lineage` (the allowlist also holds a kill through
+  `decision::response_policy`), `escalation_allow` and `mass_write_overlay`
+  are in `posture/`, the blocklist's loaders are called by the decision
+  replay without a host (R08); the overlay gate verifies through
+  `anti_tamper::admin_auth` and the rollback floor reads the agent's key,
+  which are not below nn-core yet (§4.1 rule 3). Identity against `main`
+  9de1923, same path, the release job's flags: the eBPF object (a clean
+  rebuild of `main`'s) and its stamp are byte-identical (sha256 42afd5b6…
+  at that path; stamp source c0365736…); the scanner and the watchdog are
+  byte-identical, stripped and not; the tarball's 72 entries and the .deb's
+  79 paths and modes are the same; the golden replays, the wire and chain
+  format pins, the crypto vectors, the parser pins and the overlay-v1
+  fixture pass unchanged; the test list is `main`'s (3,043 names; 44 now in
+  nn-core, 9 moved within the agent). The agent (14,863,200 → 14,876,736
+  bytes) and nn-admin (4,022,024 → 4,029,320) are not byte-identical, and
+  cannot be after a move between crates: function by function, names mapped
+  and addresses dropped, 7,555 of the agent's 7,614 functions and 3,441 of
+  nn-admin's 3,463 are the same code; a control (`main` with the agent
+  depending on nn-core and nn-core on its new crates, no source moved)
+  already changes 14 and 6 of them (clap's `TypeId`s of the agent's enums,
+  which of identical bodies keeps its name); the moves add generic code
+  made a second time in nn-core (anyhow's message errors, `RawVec` growth,
+  hex, base64: `.text` +0.14 %), inlining and register choices at the new
+  crate boundary, and calls to folded bodies under another name. `.rodata`
+  holds the same text but the moved files' paths and the callsite line
+  numbers of the moved and edited files; the moved modules' tracing target
+  is `nn_core::…` (not printed: `with_target(false)`).
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

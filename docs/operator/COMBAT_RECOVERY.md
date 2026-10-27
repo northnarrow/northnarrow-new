@@ -450,4 +450,4 @@ what it could not protect. Exit codes as §6.
 
 Related: `configs/combat-rules.v4`,
 `agent/src/anti_tamper/network_isolate.rs`,
-`agent/src/anti_tamper/combat_allow.rs`.
+`crates/nn-core/src/anti_tamper/combat_allow.rs`.

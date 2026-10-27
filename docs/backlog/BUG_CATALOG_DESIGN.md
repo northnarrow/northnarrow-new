@@ -497,7 +497,7 @@ tmux re-reads `/etc/passwd` periodically to refresh user-info; sshd reads `/etc/
 +/etc/login.defs op:Modified,Renamed,Deleted
 ```
 
-Defaults remain "all ops" for any path; operator narrows the mask per path. Schema extension to the existing `fim-paths.local` parser (`agent/src/config/overlay.rs`, `agent/src/fim/paths_config.rs`). NN-L-FIM-001 rule body unchanged; the op-mask filter happens at FIM drain.
+Defaults remain "all ops" for any path; operator narrows the mask per path. Schema extension to the existing `fim-paths.local` parser (`crates/nn-core/src/config/overlay.rs`, `crates/nn-core/src/fim/paths_config.rs`). NN-L-FIM-001 rule body unchanged; the op-mask filter happens at FIM drain.
 
 **References.**
 - POSTURE_FSM_V2_REDESIGN.md §5 — V2 multi-signal redesign would replace "fire on every Opened" with "fire on data-mutation pattern" anyway. This BUG-012 fix may be subsumed.

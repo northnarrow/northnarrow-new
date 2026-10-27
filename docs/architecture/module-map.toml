@@ -165,6 +165,7 @@ planned = false
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
 "canary::detector" = "nn-core"
+# judges on `posture::lineage` (R08a)
 "canary::readers" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
@@ -179,8 +180,13 @@ planned = false
 # the ladder and its evidence; SystemActuator and the probes of protected
 # and reconcile go to nn-linux (R04c)
 "combat" = "nn-core"
-# comm_allowlist, overlay (parse), overlay_auth (verify; install → nn-linux,
-# R04c), overlay_floor
+# comm_allowlist, overlay_auth (verify), overlay_floor. R07 (lab PR 247):
+# `overlay` (the loader) and the part of `overlay_auth` the loaders take
+# moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
+# agent's host; comm_allowlist judges on `posture::lineage` and holds a kill
+# through `decision::response_policy` (R08); the gate verifies through
+# `anti_tamper::admin_auth` (nn-proto, after R04b) and the floor reads the
+# agent's key (`keys`): they move when those are below nn-core (§4.1 rule 3)
 "config" = "nn-core"
 # R04c (lab PR 247, with R07): overlay_auth's install half (`config overlay
 # set`'s atomic write and the new inodes' protection)
@@ -231,7 +237,10 @@ planned = false
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
-# dns_records in R06, lab PR 242), limiter, blocklist
+# dns_records in R06, lab PR 242), limiter, blocklist (its loaders read the
+# shipped `.v1` through the host: they move with the decision replay that
+# calls them, R08b; lab PR 247 sent its inactive-rules report, which reads
+# the resolver's configuration, to `net::blind_spots`)
 "net" = "nn-core"
 "net::blind_spots" = "nn-linux"
 "net::drain" = "nn-linux"
@@ -280,23 +289,23 @@ planned = false
 [shims.agent]
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
-# R07 (lab PR 247): the credential renderer; `canary/mod.rs` binds it to the
-# agent's host and draws the deploy's seed from the OS RNG
-"canary::templates" = "nn-core"
-# R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
-# binds its reading loaders to the agent's host
-"config::overlay" = "nn-core"
-# R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
-"fim::paths_config" = "nn-core"
 "audit" = "nn-evidence"
 # post-plan (lab PR 178): the one reader of the canary chains' lines
 "canary::chain_lines" = "nn-evidence"
+# R07 (lab PR 247): the credential renderer; `canary/mod.rs` binds it to the
+# agent's host and draws the deploy's seed from the OS RNG
+"canary::templates" = "nn-core"
 "chain_anchor" = "nn-evidence"
 # post-plan (lab PR 241, R04a): what the chains need from their host (the
 # signer; the file operations)
 "chain_host" = "nn-evidence"
 "chain_tail" = "nn-evidence"
 "chainlog" = "nn-evidence"
+# R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
+# binds its reading loaders to the agent's host
+"config::overlay" = "nn-core"
+# R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
+"fim::paths_config" = "nn-core"
 "verify_lines" = "nn-evidence"
 
 # ── common/src: module → crate (§2.4) ────────────────────────────────────
@@ -333,14 +342,16 @@ planned = false
 # proofs). They may only go down: xtask/tests/module_map.rs fails above
 # these numbers and asks for the lower number below them. R04 brings
 # nn-evidence and nn-core to 0. Lab PR 241: 77 → 54 (nn-evidence 0; nn-core
-# 40, the rest R04b's and R04c's). Lab PR 247 (R07): the content code's
-# reads go through the host seam, which names the agent's Linux host
-# where libc was called before (nn-core 40 → 43, until the moves);
-# overlay_auth's install half leaves for nn-linux (→ 42); it names the
-# exec profile in `execpol::policy`, where it is defined (→ 41); the
-# inactive network rules (the resolver's DNS over TLS) leave the
-# blocklist for `net::blind_spots` (→ 40); the canary renderer moves to
-# nn-core and the OS RNG of its seed stays in the agent (→ 38).
+# 40, the rest R04b's and R04c's). Lab PR 247 (R07): 54 → 52, nn-core
+# 40 → 38. The content code's two reads went behind the host seam and named
+# the agent's Linux host where they had called libc (→ 43); overlay_auth's
+# install half left for nn-linux (→ 42), and it names the exec profile in
+# `execpol::policy`, where it is defined (→ 41); the inactive network rules
+# (the resolver's DNS over TLS) left the blocklist for `net::blind_spots`
+# (→ 40); the moved list loader no longer names the host, `config/mod.rs`,
+# which binds it, does (40); the canary renderer moved and the OS RNG of its
+# seed stayed in the agent (→ 38). The two left of R07's: `config/mod.rs`
+# and the gate in `config/overlay_auth.rs` name `chain_host_linux`.
 
 [ratchet]
 nn-admin = 8
