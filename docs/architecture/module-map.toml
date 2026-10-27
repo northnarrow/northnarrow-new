@@ -501,6 +501,15 @@ planned = false
 # the canary detector moved, taking its two references (the registry, the
 # access log, the addresses and the read-forward set are its host's), and
 # `canary/mod.rs`, which binds it to the Linux host, is nn-linux's (→ 19).
+# Lab PR 252 (R08c): 33 → 29, nn-core 19 → 15. The stale COMBAT chain's
+# record moved to nn-core, and the agent's `combat/reconcile.rs`, which
+# keeps the compatibility line's file I/O, is nn-linux's: its reference to
+# `anchored` left nn-core (→ 18); the ladder moved — its state machine,
+# its evidence, the actuator's and the guard's traits — and the agent's
+# `combat/actuator.rs` (`SystemActuator`) and `combat/protected.rs`
+# (`SystemProtectedProcs`) are nn-linux's: the ladder's and the actuator's
+# four references to `anti_tamper` and `response` left nn-core (→ 14), and
+# `combat.rs`, which binds the ladder to the Linux host, names it (→ 15).
 
 [ratchet]
 nn-admin = 8

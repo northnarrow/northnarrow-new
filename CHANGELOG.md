@@ -1295,6 +1295,72 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   test paths (compiled in, never printed) and literals grouped otherwise;
   the moved modules' tracing target is `nn_core::…` (not printed:
   `with_target(false)`).
+- Wave 4 restructure, R08c — nn-core, part 2c: the COMBAT ladder and the
+  executor's policy (lab PR 252). Moved to `crates/nn-core` (`git mv`,
+  90–98 %): the COMBAT ladder — its three stages and their state machine,
+  the jump-ahead, the attribution and its cap, the isolation gate, the
+  worker and its queue, the stand-down — with its signed evidence
+  (`AuditEvidence`, now over an audit log of any key), the offenders'
+  identity (lab PR 245) and its tests; the executor's configuration and
+  policy (`response::config`: the detect-only gate and the variables that
+  switch it on, the quarantine's cap, the cgroup and nftables names). Cut
+  to nn-core from the agent's files, verbatim: the traits of what the
+  ladder drives and the outcomes they report (`CombatActuator`,
+  `SoftBlock`, `NeutralizeReport`, `IsolateOutcome`; `ProtectedProcs`,
+  `ProtectedReason`, `NoProtectedProcs`), the record of a stale COMBAT
+  chain found at start (`StaleChain`, its signed entry, `attest`), and
+  first the isolation's read-back vocabulary (`Family`, `FamilyOutcome`,
+  `IsolationReport`). nn-core stays pure: the ladder held the agent's
+  capture of a process (a pidfd and its start, `ProcRef`), now its host's
+  (`combat::host::CombatHost` and `Capture`, implemented for `LinuxHost`
+  by `combat_host_linux` with `ProcRef`'s own calls). What is Linux stays
+  in the agent for nn-linux (R09): the production actuator
+  (`SystemActuator`: the executor's kill, quarantine and per-PID egress
+  block, the isolator, `/proc`), the production host-critical guard
+  (`SystemProtectedProcs`: the live `/proc`), the stale chain's unsigned
+  compatibility line, the executor and its actions. The posture names the
+  engine's ransomware and security-tool judges itself (its machine and
+  triggers take `DecisionHost`); `PostureAgent` keeps the
+  trusted-installer window and the unlock token (R04b). The skeletons the
+  priority bus (R12) and the signed sensor contract (R13) are built on,
+  types only: `nn_model::{EventClass, ProcessKey}`, `nn_core::bus`
+  (priorities, the envelope, the loss stages and counters) and
+  `nn_core::contract` (a class's contract, its synchronous verdict and
+  failure mode, truncations, a source's state). The agent keeps every
+  path as a shim (removed in R17): a new `combat.rs`, with the ladder and
+  its neutralize hook as aliases on `LinuxHost`, the evidence on the
+  agent's key and `ProcRef` as the host's capture, and `response/mod.rs`;
+  callers are unchanged but for the actuators of the posture's golden
+  replay and of the ladder's host tests, which implement the trait on
+  `LinuxHost`. 39 tests moved with their code and run on the portable test
+  host (nn-core 995 → 1,034); the 11 that wire the agent's key, audit log,
+  posture, actuator or a real process stay in the agent
+  (`combat/host_tests.rs`, `combat/evidence_tests.rs`), and the Linux
+  host's capture has a test of its own. The ratchet goes from 33 to 29
+  (nn-core 19 → 15). Identity against `main` 3a1ee3e, same path, the
+  release job's flags: the eBPF object and its stamp are byte-identical
+  (sha256 5eab9218… at that path; stamp source c0365736…); the scanner and
+  the watchdog are byte-identical, stripped and unstripped (nn-model's new
+  types change nothing in it); the tarball's 72 entries and the .deb's 79
+  paths and modes are the same; `posture_demo` prints the same lines;
+  `nn-admin policy test` gives the same 402 outputs; the golden replays
+  (five runs), the wire and chain format pins, the crypto vectors, the
+  parser pins, the overlay-v1 fixture and the per-rule policy's format
+  pass unchanged; the test list is `main`'s (3,081 names, 11 at a new path
+  in the agent) and the capture's test. nn-admin keeps its size (4,086,576
+  bytes) and is not byte-identical: function by function, names mapped and
+  addresses dropped, 3,526 of its 3,527 functions are the same code
+  (NN-L-EVA's `evaluate` no longer inlines the security-tool assessment)
+  and its `.rodata` holds the same text. The agent (15,036,712 → 14,998,040 bytes)
+  has 7,673 of its 7,744 functions the same code; no manifest changed, so
+  the rest is the code's: the assessment kept out of line, called by the
+  rule and the posture's triggers (`.text` −37,920 bytes, −0.52 %: the
+  rule −15,172, the posture's `observe` −12,468 without the ransomware
+  judge inlined), inlining and register choices where the moved code is
+  instantiated now, and std's channel code of the ladder's queue and of
+  the copy-on-write guard inlined otherwise. `.rodata` holds the same text
+  but the callsite names of the moved and edited files, the stale chain
+  record's path and tracing target, and literals grouped otherwise.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and
