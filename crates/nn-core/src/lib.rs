@@ -146,10 +146,15 @@ pub mod fim {
 
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
 /// carve-out (was the agent's `anti_tamper::combat_allow`); R08b (lab PR
-/// 251): the trusted-installer window's vocabulary.
+/// 251): the trusted-installer window's vocabulary; R08c (lab PR 252): the
+/// isolation's read-back vocabulary.
 pub mod anti_tamper {
     /// The CIDRs COMBAT's isolation spares (`combat-allow.cidrs`).
     pub mod combat_allow;
+    /// An IP family and what an isolation found in its table, read back
+    /// (R08c, lab PR 252; cut from the agent's
+    /// `anti_tamper::network_isolate`).
+    pub mod network_isolate;
     /// The trusted-installer window's vocabulary: the agent's own units, a
     /// window's grant (R08b, lab PR 251).
     pub mod trusted_installer;
