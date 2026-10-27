@@ -87,26 +87,11 @@ use common::wire::{FsGrant, KillGrant};
 /// practice. 10 minutes is generous for an in-place upgrade.
 pub const MAX_TRUSTED_INSTALLER_WINDOW_SECS: u32 = 600;
 
-/// The agent's OWN systemd unit paths — the ONLY units whose
-/// `NN-L-FIM-009` verdict the override downgrades. A write to any other
-/// unit path still trips `KillProcess` even inside an open window. These
-/// are the canonical install locations (`deploy/install.sh` copies the
-/// units to `/etc/systemd/system/`).
-pub const OWN_SYSTEMD_UNITS: &[&str] = &[
-    "/etc/systemd/system/northnarrow-agent.service",
-    "/etc/systemd/system/northnarrow-watchdog.service",
-    // Review 26: a distro package ships the units in the vendor
-    // directory. On a merged-/usr host the FIM sensor may report that
-    // directory through either spelling.
-    "/usr/lib/systemd/system/northnarrow-agent.service",
-    "/usr/lib/systemd/system/northnarrow-watchdog.service",
-    "/lib/systemd/system/northnarrow-agent.service",
-    "/lib/systemd/system/northnarrow-watchdog.service",
-    // Lab PR 216: the watchdog's `OnFailure=` handler.
-    "/etc/systemd/system/northnarrow-watchdog-failed.service",
-    "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
-    "/lib/systemd/system/northnarrow-watchdog-failed.service",
-];
+// R08b (lab PR 251): the agent's own units and a window's grant are the
+// window's vocabulary, which the rules moving to nn-core read (NN-L-FIM-009,
+// NN-L-EVA-001's sanction): nn-core's `anti_tamper::trusted_installer`, cut
+// verbatim, here under their names.
+pub use nn_core::anti_tamper::trusted_installer::{WindowGrant, OWN_SYSTEMD_UNITS};
 
 /// Userland state of the trusted-installer override. Shared via `Arc`
 /// across the admin-socket dispatcher (arms it), the `NN-L-FIM-009` rule
@@ -148,17 +133,6 @@ struct Inner {
     deadline: Option<Instant>,
     /// Who opened the current window and until when (lab PR 225).
     grant: Option<WindowGrant>,
-}
-
-/// Lab PR 225: who opened the current window and when it ends — named in
-/// the records the window sanctions (a stop or restart of the agent's own
-/// units, NN-L-EVA-001 at Low: [`crate::impair`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WindowGrant {
-    /// Fingerprint of the admin key whose signed grant opened the window.
-    pub key_id: String,
-    /// The window's deadline, wall clock (UTC, RFC 3339 to the second).
-    pub expires_at: String,
 }
 
 impl TrustedInstallerOverride {

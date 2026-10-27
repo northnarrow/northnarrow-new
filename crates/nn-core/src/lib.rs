@@ -82,8 +82,12 @@ pub mod fim {
 }
 
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
-/// carve-out (was the agent's `anti_tamper::combat_allow`).
+/// carve-out (was the agent's `anti_tamper::combat_allow`); R08b (lab PR
+/// 251): the trusted-installer window's vocabulary.
 pub mod anti_tamper {
     /// The CIDRs COMBAT's isolation spares (`combat-allow.cidrs`).
     pub mod combat_allow;
+    /// The trusted-installer window's vocabulary: the agent's own units, a
+    /// window's grant (R08b, lab PR 251).
+    pub mod trusted_installer;
 }
