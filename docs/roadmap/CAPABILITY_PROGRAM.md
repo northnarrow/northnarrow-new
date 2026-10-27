@@ -1169,3 +1169,75 @@ only in the table below, in the same PR as the evidence.
     payload types into nn-evidence once their constructors leave the
     types.
   - Lab: no guest (moves and seams that keep every call; the identity below). Host, on R05 (452add6), on the lot's last commit before main's lab PR 242 was merged in (80486b7) and on the merge (f951e2f, 3,003 passed with lab PR 242's tests): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked` 69 suites, 2,999 passed, 0 failed (the test list is `main`'s — 3,002 names, every one found at the tip — plus 12: the chain format pin's 5 and its ignored generator, the build facts' 2, the Linux host's exclusive create and `rename_noreplace`, the portable foreign-slot case, the payload kinds' pin); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `crypto_vectors` (19) and `encoded_frames_are_pinned`; `cargo xtask attack-coverage --check`; `cargo xtask golden` with the golden files unchanged; `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core`'s `cargo check` of nn-parse, nn-model, nn-proto, nn-evidence (now code) and nn-core for the five targets; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; `fuzz/Cargo.lock` carries nn-evidence, no lockfile changed by the build): all pass. Identity against `main` c7bb346, same path, same commands: the eBPF object is byte-identical (sha256 2cfdde83…) at R05 and the tip, its stamp's source hash c3651dc3… → c0365736… (the execq step: `common`'s sources and manifest). Built as the release job builds (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`): scanner 401,400 → 401,368 bytes, watchdog 2,336,904 → 2,336,920, nn-admin 3,912,344 → 4,006,152, agent 14,642,952 → 14,842,344. Unstripped (same flags, `CARGO_PROFILE_RELEASE_STRIP=none`), function by function — names mapped to their new crates and modules, the key and host type parameters dropped, addresses dropped (instruction addresses, rip displacements, branch targets, the layout-dependent symbol of a data reference), trailing padding dropped: scanner 478 of 479 the same (the postcard decoder of `Vec<execq::HashEntry>`), watchdog 2,242 of 2,244 (tracing-subscriber's `downcast_raw` and `main`'s closure: `TypeId` constants), nn-admin 2,980 of 3,131 (5 and 24 unpaired), agent 6,639 of 6,893 (16 and 40 unpaired; of the 254, 135 in dependencies, 65 nn-evidence's, 47 the agent's — stack frames, registers, inlining at the new boundary, clap's `TypeId`s of the agent's enums —, 4 in the new modules, 3 nn-proto/nn-model). `.text` grows by 2.5 % in the agent and nn-admin: rustc instantiates a generic function in each crate that uses it in a release build, and the copies of the same instantiation went from 509 to 669 in the agent (serde_json's deserializers of the audit row, chrono's formatting, base64's decode, one copy per crate). `.rodata`'s source paths and callsite lines differ only for the moved files (`agent/src/{audit,chain_anchor,chain_tail,chainlog}.rs` → `crates/nn-evidence/src/…`; `keys.rs`, `chains.rs`, `path_text.rs` new) and the lines of the edited ones (main.rs, admin_socket.rs, self_integrity.rs, detection_store.rs, agent_id.rs, open_sensor.rs, the exec policy's and quarantine's records); nn-admin's help text says `nn_model::Event`; the moved modules' tracing target is `nn_evidence::…` (not printed: `with_target(false)`). `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes, the four binaries' sizes, `RULE_POLICY.md` (the help's doc) and `CHANGELOG.md` aside.
+- **Lab PR 243 — the golden replay of the posture and the COMBAT ladder
+  (Wave 4 Phase 2, before R08; C14, C17, C18; no level changes).**
+  - What was wrong: the golden replay (lab PR 228) pinned what the rules
+    answer to a stream, not what acts on the answers. The posture state
+    machine and the COMBAT ladder had unit tests and no replay of a stream,
+    and R08 moves posture, lineage, correlation and decision into nn-core
+    (the lot-239 agent: "posture e scala COMBAT non sono ancora
+    rigiocate"). They could not be replayed the same way twice: the
+    posture read `Instant::now` and `SystemTime::now` where it needed them,
+    the trusted-installer window `Instant::now` and `Utc::now` (its end is
+    named in the sanction of an own-unit stop), and the ladder's actuator
+    is the kernel.
+  - What changed: seams, no behaviour change — `posture::clock::Clock`
+    (the monotonic now and the wall clock; the host's, `SystemClock`, by
+    default) read by `PostureMachine` (`with_clock`) and the window
+    (`with_clock`, `current_grant`, which the security-tool detector's
+    own-unit sanction now asks); `SystemActuator`'s outcome words in
+    functions of their own (`kill_outcome`, `quarantine_text`,
+    `soft_block_of`). The replay, `agent/src/posture/golden.rs`
+    (`GOLDEN_REPLAY.md` §6): the path `process_event` takes for the
+    posture and the ladder, wired as `main.rs` wires them (hooks through a
+    slot, the isolation gate, the decay stand-down), on a host of the
+    case's own — the replay's clock on the events' clock with `main.rs`'s
+    heartbeats (1 s window, 5 s ladder, 60 s decay); a process table
+    written as a `/proc` of its own, read by the lineage, the scopes, the
+    security-tool detector and the ladder's `SystemProtectedProcs`; a
+    `CombatActuator` that carries out the ladder's calls on that table
+    (soft block, the tree frozen, moved and killed in a cgroup of its own
+    with each member checked by its identity, the quarantine with the
+    production denylist, the isolation per family read back; a capture is
+    a pid and a start, so a stale one reaches nothing); the real
+    `AuditEvidence` over a real `AuditLog` (the writer's timestamp, the
+    hashes and the signature over it and the test's pid named after the
+    chain verifies); a fixed administrator key whose signed unlock and
+    trusted-installer grant `ConnAuth` verifies. Eight cases
+    (`agent/tests/golden/posture/`): ransomware corroborated to COMBAT
+    (unlocked; jump-ahead NEUTRALIZE; decay to ENGAGED) and alone held at
+    ENGAGED, security tools switched off around a signed trusted-installer
+    window (the own-unit stop sanctioned, no transition; auditd's
+    DefenseImpairment; the window's signed close; a unit drop it
+    corroborates to a locked COMBAT), a forking tree killed in its cgroup
+    with an attributed child gone and the signed unlock then decay to
+    OBSERVING, a stale capture after a failed soft block (INVESTIGATE
+    shortened), a member that does not die and ISOLATE retried (IPv6
+    unavailable signed as a hole), detect-only, decay ALERTED and ENGAGED
+    to OBSERVING. Each case's `path`, `stages` and `signed` are checked,
+    and a coverage test requires each of these stories. `cargo xtask golden
+    [--update]` runs both replays. Deviations from the plan: `Clock`
+    returns the `Instant` the posture holds, not `mono_ns` (§2.3), so no
+    timer changes type before R08; no `ProcSource` trait — the process
+    source is a `/proc` directory (the existing `proc_root` seam) and the
+    `CombatActuator`; the harness is a test module of the agent library,
+    as the decision replay, not `agent/tests/replay_golden.rs` (it uses
+    crate-private seams); R04b's `PackageOwnership`, the installer
+    window/kernel-sync split and the `UnlockToken` verification are not
+    done. Found, not changed (a behaviour change is another lot's): the
+    signed `combat_stage` rows of a COMBAT the posture reached carry
+    `trigger: null` and its INVESTIGATE row names no offender — `main.rs`'s
+    entry hook opens the episode (`engage(None, None)`) inside `observe`,
+    before `process_event`'s `engage_with`, which then only merges the
+    offender and drops the trigger; two process-wide switches
+    (`RANSOMWARE_DECISIVE` of the per-rule policy, `KERNEL_MASS_WRITE`)
+    keep a case under `combat-without-corroboration` or the LSM mass-write
+    mode out of a parallel replay; the audit writer's clock is
+    nn-evidence's own (`build_signed_entry`: `Utc::now`), so byte-stable
+    signed rows would need a clock there; the lineage's live check
+    (`for_host`) reads the host's suspended time, so the replay runs
+    `AuthSessionTracker::new`, as the decision replay. Open: the Linux half
+    of the kill (pidfds, cgroupfs, nft, iptables) stays with its
+    privileged tests; the ladder's worker thread runs inline in the replay
+    (what an event sees while a step is queued is not replayed).
+  - Lab: no guest (a replay of the agent library and seams that keep every call; no behaviour change: the decision replay's golden files unchanged). Host, on 00f9e15 (the final tree but for this line; the lot's four commits on `main` 70715b2, lab PR 241 merged): `cargo xtask build-ebpf --release` (`common` and the eBPF crates untouched: the stamp's source c0365736…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,011 passed, 0 failed, 15 ignored (the lot's 8 tests: the posture replay's 5, the two clock seams', xtask's directory check; no `#[ignore]` test added); `cargo xtask attack-coverage --check`; `cargo xtask golden` (both replays, 9 tests); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; no lockfile changed by the build): all pass. Determinism: 25 separate test processes (20 with the default threads, 5 with `--test-threads=1`) each found the 8 posture golden files byte-identical to the committed ones, each process also replaying every case 3 times on one thread and once on each of 4 threads at once; `cargo xtask golden --update` changed no file; with `CI` set, `--update` and `NN_GOLDEN_UPDATE=1` are refused. No temporary directory is left behind: the first version of the harness kept each replay's host, and its `/proc`, alive through an `Arc` cycle between the posture's hooks and the ladder's gate (416 directories in `/tmp`, removed); the hooks now hold the ladder weakly and `a_replay_leaves_no_directory_behind` holds it. The same gates on 2af276e, before that fix: all pass, 3,010 passed.
