@@ -485,6 +485,32 @@ impl CorroborationLedger {
         }
     }
 
+    /// Lab PR 243 (tests: the golden replay of the posture): the signals
+    /// `scope` holds within the window as of `now` — trigger, evidence
+    /// class, privileged, placed — in an order a reader can compare (the
+    /// order of a scope's entries carries nothing). Reads only: the ledger
+    /// is pruned where it always was.
+    #[cfg(test)]
+    pub(crate) fn signals_of(
+        &self,
+        scope: &Scope,
+        now: Instant,
+    ) -> Vec<(TriggerType, EvidenceClass, bool, bool)> {
+        let mut out: Vec<(TriggerType, EvidenceClass, bool, bool)> = self
+            .scopes
+            .get(scope)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| now.saturating_duration_since(e.at) <= CORROBORATION_WINDOW)
+                    .map(|e| (e.trigger, e.class, e.privileged, e.placed()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by_key(|(t, c, p, placed)| (t.as_str(), format!("{c:?}"), *p, *placed));
+        out
+    }
+
     /// `true` when an entry still waits for [`Self::resolve_pending`].
     pub fn has_pending(&self) -> bool {
         self.scopes

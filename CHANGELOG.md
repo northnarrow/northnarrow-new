@@ -6,6 +6,39 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- Golden replay of the posture and the COMBAT ladder (lab PR 243, Wave 4
+  phase 2, before R08 moves them into nn-core;
+  `docs/validation/GOLDEN_REPLAY.md` §6). `agent/src/posture/golden.rs`
+  replays recorded streams (`agent/tests/golden/posture/cases/`) through
+  the path `process_event` takes for the posture and the ladder, wired as
+  `main.rs` wires them, on a host of the case's own — no root, network or
+  real process: the replay's clock, a process table written as a `/proc`
+  of its own, an actuator that carries out the ladder's calls on that table
+  in `SystemActuator`'s steps and words (the tree frozen and killed in a
+  cgroup of its own, each member checked by its identity, a stale capture
+  reaching nothing), the real signed audit log, a fixed administrator key
+  whose signed unlock and trusted-installer grant `ConnAuth` verifies. Each
+  step is a line of `agent/tests/golden/posture/expected/<case>.jsonl`
+  (`northnarrow-posture-golden/1`): the posture's transitions with the
+  evidence they cite, the ladder's calls and the host's acts, the signed
+  rows (the writer's timestamp, hashes, signature and the test's pid
+  named, the chain verified), the state. Eight cases: ransomware
+  corroborated to COMBAT and alone held at ENGAGED, security tools switched
+  off around a signed trusted-installer window, a forking tree killed with
+  an attributed child already gone and the signed unlock, a stale capture
+  after a failed soft block, a member that does not die and ISOLATE retried,
+  detect-only, decay to OBSERVING. Byte-identical across runs, threads and
+  processes; `cargo xtask golden [--update]` runs both replays (refused
+  under CI). Seams, no behaviour change: `posture::clock::Clock` (the
+  host's clocks by default) read by `PostureMachine` (`with_clock`) and the
+  trusted-installer window (`with_clock`, `current_grant`, which the
+  security-tool detector's own-unit sanction now asks); the words of
+  NEUTRALIZE's outcomes in functions of their own
+  (`SystemActuator::kill_outcome`, `quarantine_text`, `soft_block_of`).
+  Found, not changed: the signed `combat_stage` rows of a COMBAT the
+  posture reached carry `trigger: null`, and its INVESTIGATE row names no
+  offender (the entry hook opens the episode before `process_event` names
+  them).
 - Multi-match decisions and the signed per-rule response policy (lab PR
   236, Wave 4 phase 2, C14/C12; `docs/design/MULTI_MATCH_AND_RULE_POLICY.md`,
   `docs/operator/RULE_POLICY.md`). **Multi-match.** The engine evaluates

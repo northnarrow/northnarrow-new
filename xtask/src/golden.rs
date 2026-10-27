@@ -1,10 +1,13 @@
 //! Lab PR 228: `cargo xtask golden [--update]` — the golden replay of the
-//! decision engine (`agent/src/decision/golden.rs`).
+//! decision engine (`agent/src/decision/golden.rs`); lab PR 243: and of the
+//! posture and the COMBAT ladder (`agent/src/posture/golden.rs`).
 //!
-//! Without `--update` it runs the replay's tests: every case of
+//! Without `--update` it runs the replays' tests: every case of
 //! `agent/tests/golden/cases/` gives its committed golden file of
-//! `agent/tests/golden/expected/` byte for byte, the same bytes on every
-//! run and thread, and the cases cover the rules of lots 219–226. `cargo
+//! `agent/tests/golden/expected/` byte for byte, every case of
+//! `agent/tests/golden/posture/cases/` its file of
+//! `agent/tests/golden/posture/expected/`, the same bytes on every run and
+//! thread, and the cases cover what each replay set out to show. `cargo
 //! test --workspace` runs the same tests, so a stale golden file fails CI.
 //! With `--update` the tests write the golden files instead
 //! (`NN_GOLDEN_UPDATE=1`) and the changed ones are listed: a maintainer
@@ -18,10 +21,17 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-/// The variable the agent's golden tests read (`decision::golden::UPDATE_ENV`).
+/// The variable the agent's golden tests read (`decision::golden::UPDATE_ENV`,
+/// `posture::golden::UPDATE_ENV`).
 pub const UPDATE_ENV: &str = "NN_GOLDEN_UPDATE";
-/// The golden files, relative to the repository root.
-pub const EXPECTED_DIR: &str = "agent/tests/golden/expected";
+/// The golden files, relative to the repository root: the decision
+/// replay's, and (lab PR 243) the posture and ladder replay's.
+pub const EXPECTED_DIRS: [&str; 2] = [
+    "agent/tests/golden/expected",
+    "agent/tests/golden/posture/expected",
+];
+/// The agent's golden tests, by module (lab PR 243: one filter each).
+const TEST_FILTERS: [&str; 2] = ["decision::golden::", "posture::golden::"];
 
 /// The cargo arguments of the run.
 fn cargo_args(locked: bool) -> Vec<&'static str> {
@@ -29,7 +39,8 @@ fn cargo_args(locked: bool) -> Vec<&'static str> {
     if locked {
         args.push("--locked");
     }
-    args.extend(["--", "decision::golden::"]);
+    args.push("--");
+    args.extend(TEST_FILTERS);
     args
 }
 
@@ -57,15 +68,16 @@ pub fn run(root: &Path, update: bool, locked: bool) -> Result<()> {
             if update {
                 ""
             } else {
-                ": a decision moved — if it is intended, `cargo xtask golden --update` and \
-                 review the diff"
+                ": a decision, a posture transition or a ladder step moved — if it is \
+                 intended, `cargo xtask golden --update` and review the diff"
             }
         );
     }
     if update {
         let out = Command::new("git")
             .current_dir(root)
-            .args(["status", "--short", "--", EXPECTED_DIR])
+            .args(["status", "--short", "--"])
+            .args(EXPECTED_DIRS)
             .output()
             .with_context(|| "git status")?;
         let changed = String::from_utf8_lossy(&out.stdout);
@@ -73,8 +85,9 @@ pub fn run(root: &Path, update: bool, locked: bool) -> Result<()> {
             eprintln!("golden: no golden file changed");
         } else {
             eprintln!(
-                "golden: changed golden files — review `git diff -- {EXPECTED_DIR}` and say in \
-                 the pull request why each verdict moved:\n{changed}"
+                "golden: changed golden files — review `git diff -- {}` and say in the pull \
+                 request why each verdict, transition or step moved:\n{changed}",
+                EXPECTED_DIRS.join(" ")
             );
         }
     }
@@ -95,10 +108,11 @@ mod tests {
                 "northnarrow-agent",
                 "--lib",
                 "--",
-                "decision::golden::"
+                "decision::golden::",
+                "posture::golden::"
             ]
         );
-        // `--locked` is cargo's, before the test filter
+        // `--locked` is cargo's, before the test filters
         assert_eq!(
             cargo_args(true),
             [
@@ -108,8 +122,19 @@ mod tests {
                 "--lib",
                 "--locked",
                 "--",
-                "decision::golden::"
+                "decision::golden::",
+                "posture::golden::"
             ]
         );
+    }
+
+    /// Lab PR 243: the update lists the changed files of both replays: the
+    /// directories are there.
+    #[test]
+    fn both_replays_golden_directories_are_listed() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for dir in EXPECTED_DIRS {
+            assert!(root.join(dir).is_dir(), "{dir}");
+        }
     }
 }

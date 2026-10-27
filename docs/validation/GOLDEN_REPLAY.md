@@ -1,10 +1,12 @@
-# Golden replay of the decision engine (lab PR 228)
+# Golden replays: the decision engine (lab PR 228), the posture and the COMBAT ladder (lab PR 243)
 
 What the decision path answers to a recorded event stream, kept as a
 committed file and checked byte for byte on every `cargo test`: a change of a
 rule, of the rule order, of a policy switch, of a shipped list or of the
 engine's state handling shows as a diff of a golden file, in the pull request
-that makes it.
+that makes it. Lab PR 243 adds the same for what acts on the answers — the
+posture state machine and the COMBAT ladder (§6) — before the restructure's
+R08 moves them into nn-core.
 
 - Harness: `agent/src/decision/golden.rs` (tests of the agent library: no
   root, no network, no guest; part of `cargo test --workspace`).
@@ -50,8 +52,9 @@ The decision path of one item is that of `process_event` (`main.rs`):
 4. an exec-policy report (`execpol` item) becomes the exec policy's records
    (`execpol::record::records_of`), outside the engine, with their evidence.
 
-Not replayed: the posture and the COMBAT ladder (they act on verdicts, they
-are not verdicts), the canary registry (no case deploys a canary), the
+Not replayed here: the posture and the COMBAT ladder (they act on verdicts,
+they are not verdicts: their own replay is §6), the canary registry (no case
+deploys a canary), the
 per-rule budget (it decides what is stored, never the verdict), the exec
 sensor's path resolution (a case's paths are absolute), the exec
 quarantine's scanner (a process, not a rule over events).
@@ -183,3 +186,180 @@ To add a case: write `agent/tests/golden/cases/<case>.json` (`about`,
 `{"event": <Event>}`, `{"tcp_sweep": {...}}` or `{"execpol": {...}}`, see
 the harness), run `cargo xtask golden --update`, and review its golden file
 like any other.
+
+## 6. The posture and the COMBAT ladder (lab PR 243)
+
+What the posture state machine and the COMBAT ladder do with a recorded
+event stream: every posture transition (from, to, trigger, the evidence it
+cites), every call the ladder makes into its actuator and what the host did,
+every signed row the ladder and the trusted-installer window write, and the
+state after each step.
+
+- Harness: `agent/src/posture/golden.rs` (tests of the agent library: no
+  root, no network, no real process; part of `cargo test --workspace`).
+- Streams: `agent/tests/golden/posture/cases/<case>.json`.
+- Golden files: `agent/tests/golden/posture/expected/<case>.jsonl`.
+- Fixture host: the decision replay's (`agent/tests/golden/host`), plus a
+  `/proc` the replay writes from the case.
+- Runner: `cargo xtask golden [--update]` runs both replays.
+
+### 6.1 What a replay is
+
+Each case runs on a posture machine, a ladder and a trusted-installer window
+wired the way `main.rs` wires them — the entry hook engages the ladder, the
+release hook stands it down and lifts the isolation, the decay hook stands
+it down, the ladder isolates only while COMBAT is locked, the posture shares
+the ransomware tracker and the security-tool detector built over the shipped
+lists — and every item goes the way `process_event` takes it for the
+posture and the ladder:
+
+1. an event: the clock moves to its time (never back: an event read late is
+   processed when it is read); `PostureMachine::observe` over the recent
+   events; on the edge into COMBAT, `engage_with` names the event's process
+   to the ladder; an engaged ladder sees the event (`observe`, the
+   jump-ahead); the correlation buffer keeps it; the two trackers the rules
+   share with the posture assess it, as the rules would (memoised: the
+   posture's answer);
+2. `{"wait": {"secs": N}}`: the clock moves on;
+3. `{"unlock": {}}`: a signed unlock (`OperationCode::Unlock`, lab PR 217)
+   by the case's administrator, verified by `ConnAuth` as the admin socket
+   verifies it, then `admin_release_combat_with_token`;
+4. `{"installer_grant": {"window_secs": N}}`: a signed trusted-installer
+   grant, verified the same way, then the window armed for its signer;
+5. `{"host": {...}}`: the host changes without an event the agent reads —
+   processes exit (`exit`, their children go to init), start (`spawn`: a
+   fork with no exec read, or another process taking a freed pid), enter an
+   uninterruptible wait (`stuck`), `nft` missing (`nft: false`).
+
+Whenever the clock passes them, `main.rs`'s heartbeats fire: the window's
+expiry every second, the posture's decay every 60 s and the ladder's tick
+every 5 s, on the events' clock, in that order when they fall together.
+
+| host state | in a replay |
+|---|---|
+| the clock | the replay's own: the events' clock (`timestamp_ns`) as the posture's and the window's monotonic clock (`posture::clock::Clock`, `PostureMachine::with_clock`, `TrustedInstallerOverride::with_clock`), handed to the ladder as `main.rs` hands it `Instant::now()`; the wall clock is 2026-01-01T00:00:00Z at the events' zero |
+| processes | a table: the case's `procs`, every exec event's process, `host` items; written as a `/proc` of the replay's own (`stat` with state, terminal and start, `status`, `loginuid`, `cgroup`, `cmdline`, `exe`) that the lineage, the posture's scopes, the security-tool detector and the ladder's host-critical guard (`SystemProtectedProcs`) read; a child inherits its parent's login uid, cgroup and terminal |
+| the actuator | the replay's `CombatActuator` on that table, with the steps and words of `SystemActuator`: a capture is a pid and a start (a process that exited, or whose pid another process holds now — a stale pidfd — reaches nothing); a soft egress block takes unless `nft` is missing; NEUTRALIZE looks up each binary before the kill, kills each offender's tree through a cgroup of its own (the root moved in and frozen, every descendant found by the `/proc` walk moved in, a guarded one refused, the cgroup killed, each member checked by its identity: one in an uninterruptible wait is still running and reported failed) and quarantines each binary once (a system path refused, kill-only); the outcomes go through `SystemActuator::kill_outcome`, `quarantine_text` and `soft_block_of` |
+| the isolation | the case's `isolation` (what each engage finds per family, then both isolated) and `release` (what each release reads back, then both clear) |
+| the signed rows | the real `AuditEvidence` over a real `AuditLog` in the replay's directory, the trusted-installer window's close rows in the same log |
+| the administrator | a fixed Ed25519 key (`unlock,trusted-installer`) in an `admin.pub` of the replay's own; agent id `golden-posture-1` |
+| the agent | pid 4,200,000, exempt from the posture as `main.rs` exempts its own |
+
+Not replayed, said so: the rule engine (§1–§5 replay it), the ladder's
+worker thread (the steps run in the caller, in the order the worker runs
+them; what an event sees while a step is still queued is not replayed), the
+admin socket's own audit rows (the unlock's, the grant's), and the Linux
+half of the response (`response::kill`'s pidfds and cgroupfs, nft,
+iptables): its privileged tests cover it (`a_tree_kill_freezes_the_root…`,
+`kill_tree_reaps_a_tree_that_keeps_forking`).
+
+### 6.2 Reading a golden file
+
+The first line names the format (`northnarrow-posture-golden/1`), the case,
+what it is about, detect-only, the posture's settings (the ransomware
+directive and the mass-write mode in force, the corroboration window, the
+quiet window of an unlocked COMBAT, the two decays), the ladder's
+(`LadderConfig::default()`, the inline runner) and the heartbeats. Then one
+line per item (`item`, its index in the case) and one per heartbeat that
+changed something (`tick`: `installer window`, `posture decay`, `ladder`),
+each with `seq`, `at_ms` (the events' clock) and:
+
+- `event`: the event's kind and process; `wait_secs`; `unlock` (the
+  signer's fingerprint, the outcome as the admin socket words it);
+  `installer_grant` (signer, window, its end); `host: "changed"`;
+- `posture`: the transitions of the posture's log, each with `from`, `to`,
+  `trigger` (the firing one; `null` for decay and release), `reason` and
+  `unix_ts_secs`, and for an event's transition its `evidence`: the triggers
+  it raised (kind of evidence, level, confidence, whether it locks COMBAT),
+  the actor's corroboration scope and the signals that scope held before
+  (what corroborates a COMBAT-tier heuristic);
+- `signal`: an event that moved no level but re-armed the current one or
+  was recorded in the ledger — its scope and what that scope held;
+- `assessed`: what the shared trackers made of the event — a security tool
+  switched off (`defense`: the EVA rule, the tool, what was done, why it is
+  sanctioned or `null`) and the ransomware shapes of its actor
+  (`ransomware`: actor, program, trusted or not, shapes, decisive);
+- `acts`: in order, the ladder's calls into the actuator (`capture`, `begin
+  episode`, `soft egress block`/`release`, `neutralize`, `isolate`,
+  `release isolation`, the copy-on-first-write hand-off) with their answers,
+  and what the host did (`kill tree`: the cgroup, the processes frozen with
+  the root, those spared, those still running — or why nothing was killed;
+  `quarantine`; the `host` items' changes);
+- `signed`: the audit rows written, whole, with what the replay cannot fix
+  named: `ts` → `@TS@`, `entry_hash` → `#n`, `prev_hash` → `#n-1`
+  (`genesis` for the first), `agent_sig` → `@SIG@`, `client_pid` (the test
+  process) → `@AGENT_PID@`. The replay verifies the chain with the key
+  before it names them;
+- `state`: the posture (with `since_ms` and `last_trigger_ms`, or `locked`
+  in COMBAT), the ladder's stage and offenders, the ledger's size.
+
+### 6.3 The cases
+
+| case | scenario | shows |
+|---|---|---|
+| `ransomware-corroborated-combat` | a login session's `nc`, then an unpackaged program of the same session renaming 20 files to `.locked` over ciphertext, connecting out; then quiet | OBSERVING → ENGAGED (ExploitAttempt) → COMBAT (RansomwareEncryption, corroborated by the session's execution evidence; unlocked); INVESTIGATE, the exfiltration jump-ahead, NEUTRALIZE of the tree through the kill cgroup, contained; the unlocked COMBAT decays to ENGAGED and the ladder stands down |
+| `ransomware-alone-engaged` | the same encryption with nothing before it; another user's `nc`; a second burst | RansomwareEncryption alone stops at ENGAGED (`RANSOMWARE_COMBAT_WITHOUT_CORROBORATION` off); another session's signal does not vouch, nor the actor's own file-system evidence |
+| `eva-installer-window` | a root unit's script with a signed 300 s grant stops the agent's unit, then auditd; the window ends; the agent's unit again; a systemd unit dropped | the own-unit stop sanctioned by the window (its key and end named), no transition; auditd's stop DefenseImpairment (ENGAGED) inside the window; the window's signed close; the unit drop corroborated by DefenseImpairment: COMBAT locked; NEUTRALIZE at the deadline, the system binary not quarantined |
+| `combat-forking-tree` | a web worker's `/tmp` payload with a child, two grandchildren (forks), a write to the agent's state refused, another child | StagingExec (ENGAGED), AntiTamperDenial (COMBAT locked); the spread jump-ahead; the tree frozen and killed in its cgroup, the attributed child reported gone, the binary quarantined once; the signed unlock (ALERTED); ALERTED decays to OBSERVING |
+| `combat-stale-capture` | no `nft`; a `/dev/shm` payload refused a write; it exits and logrotate takes its pid | the failed soft block signed, INVESTIGATE shortened to 10 s; NEUTRALIZE finds the capture stale: gone, the pid's new holder untouched, nothing to quarantine |
+| `combat-stuck-isolate-unlock` | a `/var/tmp` miner whose worker is in an uninterruptible wait; a write refused | the tree not contained (a member still running), ISOLATE (evidence first); attempt 1 leaves IPv4 not isolated (signed failure, retried in 5 s), attempt 2 isolates IPv4 with IPv6 unavailable (a hole, signed); the signed unlock lifts it |
+| `detect-only` | a forking payload refused a write, in detect-only | the same posture, stages and signed rows; the actuator touches nothing (soft block not needed, NEUTRALIZE what would have been done) |
+| `decay-to-observing` | `nmap` twice, then `nc`, then quiet | ALERTED re-armed by the same tier, decays to OBSERVING an hour after the last; ENGAGED decays to ALERTED after 24 h, then to OBSERVING |
+
+Each case names the levels its posture moves to, in order (`path`), the
+ladder stages it reaches (`stages`) and the ops of the signed rows it writes
+(`signed`); `every_posture_case_shows_what_it_says` checks them, so an update
+that loses one fails. `posture_golden_cases_cover_the_lot` requires, across
+the cases: COMBAT by RansomwareEncryption and ENGAGED by it, ENGAGED by
+DefenseImpairment, an own-unit stop sanctioned by the window with no
+transition, a tree killed through its cgroup, an offender gone before
+NEUTRALIZE, a stale capture, a signed unlock leaving COMBAT, a decay to
+OBSERVING, a detect-only NEUTRALIZE and no kill in detect-only.
+
+Two things the replay showed of production, kept as they are (a behaviour
+change is another lot's): the signed `combat_stage` rows of a COMBAT the
+posture reached carry `"trigger": null`, and its INVESTIGATE row names no
+offender — `main.rs`'s entry hook opens the episode (`engage(None, None)`)
+inside `observe`, before `process_event` passes the offender and the firing
+trigger, which `engage_with` then only merges (the offender is soft-blocked,
+the trigger dropped).
+
+### 6.4 Determinism
+
+`posture_golden_is_deterministic_across_runs_and_threads` replays every case
+three times on one thread and once on each of four threads at once, each on
+its own host, and requires the same bytes; the committed files are the same
+bytes in another process. What could break it, and how it is held:
+
+- the clocks: the posture, the window and the ladder read the replay's
+  clock only (the seams above); the audit writer's clock (`ts`, and the
+  hashes and signature over it), the test's pid and the replay's directories
+  are named, not printed (`@TS@`, `#n`, `@SIG@`, `@AGENT_PID@`, `@PROC@`,
+  `@ROOT@`); the challenge nonce of a signed request is the OS's random, and
+  only the verification's outcome and the key's fingerprint are printed;
+- process-wide switches: `RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`'s
+  runtime value (set by the signed per-rule policy) and the kernel
+  mass-write mode (`triggers::set_kernel_mass_write`, set by `main.rs` when
+  the LSM file-open sensor is armed) are read at their defaults, printed in
+  the header; a case cannot change them without racing every other test —
+  a case under `combat-without-corroboration NN-L-IMP-001` needs the
+  directive to become the machine's own;
+- the lineage runs with the live checks off (`AuthSessionTracker::new`, as
+  §1): `for_host` compares a cached exec with `/proc`'s start using the
+  host's suspended time;
+- map order never reaches a line: the ledger's signals are sorted, the
+  JSON keys are;
+- a replay keeps nothing past its end: its hooks reach the ladder weakly
+  (`main.rs`'s live as long as the agent), so the host, its `/proc` and its
+  directory go with it (`a_replay_leaves_no_directory_behind`).
+
+### 6.5 Updating
+
+As §5: `cargo xtask golden --update` writes both replays' files, `git diff
+-- agent/tests/golden/posture/expected` is read line by line, and the pull
+request says why each transition, step or row moved. A case is a
+`cases/<case>.json` with `about`, `path`, the optional `stages`, `signed`,
+`detect_only`, `start_ns` (the clock's start), `procs` (`pid`, `ppid`,
+`start_ns`, `uid`, `comm`, `exe`, `argv`, `loginuid`, `cgroup`, `tty`,
+`stuck`, `deleted`), `files`, `entropy`, `isolation`, `release`, and
+`items`. Pids are above `PID_MAX_LIMIT`, like §3's.

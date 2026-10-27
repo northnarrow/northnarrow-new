@@ -1,0 +1,16 @@
+{
+  "about": "Decay (transitions::ALERTED_DECAY, ENGAGED_DECAY): a login session runs nmap (Reconnaissance, ALERTED) and again 30 minutes later (the same tier: the timer re-armed, no transition); an hour after the second, ALERTED decays to OBSERVING. The session then runs nc (ExploitAttempt, ENGAGED); 24 hours of quiet decay it to ALERTED, one more hour to OBSERVING.",
+  "path": ["ALERTED", "OBSERVING", "ENGAGED", "ALERTED", "OBSERVING"],
+  "start_ns": 60000000000,
+  "procs": [
+    {"pid": 6800002, "ppid": 1, "start_ns": 100000000000, "uid": 0, "comm": "sshd", "exe": "/usr/sbin/sshd", "argv": ["sshd: u1000 [priv]"], "loginuid": 1000, "cgroup": "/user.slice/user-1000.slice/session-7.scope"},
+    {"pid": 6800003, "ppid": 6800002, "start_ns": 101000000000, "uid": 1000, "comm": "bash", "exe": "/usr/bin/bash", "argv": ["-bash"], "tty": true}
+  ],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 6800010, "ppid": 6800003, "uid": 1000, "gid": 1000, "comm": "nmap", "filename": "/usr/bin/nmap", "timestamp_ns": 100000000000, "argv": ["nmap", "-sS", "10.0.0.0/24"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 99999000000, "exe": {"path": "/usr/bin/nmap"}}}},
+    {"event": {"ProcessSpawn": {"pid": 6800011, "ppid": 6800003, "uid": 1000, "gid": 1000, "comm": "nmap", "filename": "/usr/bin/nmap", "timestamp_ns": 1900000000000, "argv": ["nmap", "-sV", "10.0.0.7"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 1899999000000, "exe": {"path": "/usr/bin/nmap"}}}},
+    {"wait": {"secs": 3700}},
+    {"event": {"ProcessSpawn": {"pid": 6800020, "ppid": 6800003, "uid": 1000, "gid": 1000, "comm": "nc", "filename": "/usr/bin/nc.openbsd", "timestamp_ns": 6000000000000, "argv": ["nc", "10.0.0.7", "22"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 5999999000000, "exe": {"path": "/usr/bin/nc.openbsd"}}}},
+    {"wait": {"secs": 90000}}
+  ]
+}

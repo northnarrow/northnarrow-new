@@ -25,7 +25,7 @@ use nn_model::ResponseAction;
 use crate::anti_tamper::network_isolate::{IsolationReport, NetworkIsolator};
 use crate::response::proc_ref::ProcRef;
 use crate::response::quarantine::ExeHandle;
-use crate::response::{block_outbound, ExecutionOutcome, Executor};
+use crate::response::{block_outbound, ExecutionOutcome, ExecutionReport, Executor};
 
 /// Outcome of a STAGE-2 neutralization attempt — the signal the ladder
 /// uses to decide whether STAGE 3 (isolation) is necessary.
@@ -253,7 +253,81 @@ impl SystemActuator {
         }
         Some(parts.join("; "))
     }
+
+    /// Lab PR 217 (capability C17): one offender's kill report as its
+    /// signed outcome — contained or not, and the kill's outcome or why
+    /// not. External audit CMB-002: the whole tree, not only its root. A
+    /// descendant still running — not killed, spared by the host-critical
+    /// guard, or beyond a walk cut short — is a threat the process level
+    /// did not contain. (Lab PR 243: a function of its own, so the golden
+    /// replay's host reports through the same words.)
+    pub(crate) fn kill_outcome(report: &ExecutionReport) -> (bool, String) {
+        if !Self::contained(&report.primary) {
+            (false, format!("kill outcome {:?}", report.primary))
+        } else if let Some(reason) = Self::tree_not_contained(&report.additional) {
+            (false, reason)
+        } else {
+            (
+                true,
+                format!(
+                    "{:?} ({} descendant(s) handled)",
+                    report.primary,
+                    report.additional.len()
+                ),
+            )
+        }
+    }
+
+    /// Review 87: what became of an offender's binary, from the
+    /// quarantine's outcome (lab PR 243: a function of its own, as
+    /// [`Self::kill_outcome`]).
+    pub(crate) fn quarantine_text(pid: u32, outcome: &ExecutionOutcome) -> String {
+        match outcome {
+            ExecutionOutcome::Quarantined { .. } => "quarantined".to_string(),
+            ExecutionOutcome::AlreadyGone { .. } => "binary already gone".to_string(),
+            ExecutionOutcome::WouldExecute { .. } => {
+                "detect-only: would be quarantined".to_string()
+            }
+            other => {
+                warn!(
+                    target: "combat.actuator",
+                    pid,
+                    outcome = ?other,
+                    "NEUTRALIZE: binary quarantine did not complete (re-exec prevention degraded)"
+                );
+                format!("NOT quarantined: {other:?} (re-exec prevention degraded)")
+            }
+        }
+    }
+
+    /// External audit CMB-014: what a soft egress block's outcome means for
+    /// the ladder (lab PR 243: a function of its own, as
+    /// [`Self::kill_outcome`]).
+    pub(crate) fn soft_block_of(outcome: ExecutionOutcome) -> SoftBlock {
+        match outcome {
+            ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked,
+            ExecutionOutcome::WouldExecute { .. } => SoftBlock::NotNeeded("detect-only"),
+            ExecutionOutcome::AlreadyGone { .. } => SoftBlock::NotNeeded("process already exited"),
+            ExecutionOutcome::Failed { errno: 0, .. } => {
+                SoftBlock::Failed("block failed: nft rejected the drop ruleset".to_string())
+            }
+            ExecutionOutcome::Failed { errno, .. } => SoftBlock::Failed(format!(
+                "block failed: {} — is nftables (`nft`) installed?",
+                std::io::Error::from_raw_os_error(errno)
+            )),
+            other => SoftBlock::Failed(format!("{other:?}")),
+        }
+    }
 }
+
+/// Review 87: an offender with no binary on disk to quarantine (lab PR
+/// 243: named, for the golden replay's host).
+pub(crate) const NO_BINARY: &str =
+    "no binary on disk to quarantine (exited before NEUTRALIZE, or deleted while running)";
+
+/// What ISOLATE answers in detect-only (lab PR 243: named, as
+/// [`NO_BINARY`]).
+pub(crate) const DETECT_ONLY_ISOLATE: &str = "detect-only: iptables NOT applied (no enforcement)";
 
 impl CombatActuator for SystemActuator {
     fn begin_episode(&self) {
@@ -280,19 +354,7 @@ impl CombatActuator for SystemActuator {
             outcome = ?report.primary,
             "INVESTIGATE soft egress: per-PID outbound block (host channels preserved)"
         );
-        match report.primary {
-            ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked,
-            ExecutionOutcome::WouldExecute { .. } => SoftBlock::NotNeeded("detect-only"),
-            ExecutionOutcome::AlreadyGone { .. } => SoftBlock::NotNeeded("process already exited"),
-            ExecutionOutcome::Failed { errno: 0, .. } => {
-                SoftBlock::Failed("block failed: nft rejected the drop ruleset".to_string())
-            }
-            ExecutionOutcome::Failed { errno, .. } => SoftBlock::Failed(format!(
-                "block failed: {} — is nftables (`nft`) installed?",
-                std::io::Error::from_raw_os_error(errno)
-            )),
-            other => SoftBlock::Failed(format!("{other:?}")),
-        }
+        Self::soft_block_of(report.primary)
     }
 
     fn soft_egress_clear(&self, target: &ProcRef) {
@@ -354,24 +416,7 @@ impl CombatActuator for SystemActuator {
         for r in offenders {
             let pid = r.pid();
             let report = self.executor.execute_on(ResponseAction::KillProcessTree, r);
-            let (contained, kill) = if !Self::contained(&report.primary) {
-                (false, format!("kill outcome {:?}", report.primary))
-            } else if let Some(reason) = Self::tree_not_contained(&report.additional) {
-                // External audit CMB-002: the whole tree, not only its root.
-                // A descendant still running — not killed, spared by the
-                // host-critical guard, or beyond a walk cut short — is a
-                // threat the process level did not contain.
-                (false, reason)
-            } else {
-                (
-                    true,
-                    format!(
-                        "{:?} ({} descendant(s) handled)",
-                        report.primary,
-                        report.additional.len()
-                    ),
-                )
-            };
+            let (contained, kill) = Self::kill_outcome(&report);
             if contained {
                 info!(
                     target: "combat.actuator",
@@ -403,33 +448,13 @@ impl CombatActuator for SystemActuator {
         let mut done: Vec<((u64, u64), u32)> = Vec::new();
         for (slot, (pid, binary)) in outcomes.iter_mut().zip(binaries) {
             slot.quarantine = match binary {
-                None => "no binary on disk to quarantine (exited before NEUTRALIZE, or deleted \
-                         while running)"
-                    .to_string(),
+                None => NO_BINARY.to_string(),
                 Some(handle) => match done.iter().find(|(k, _)| *k == handle.key()) {
                     Some((_, first)) => format!("same binary as pid {first}"),
                     None => {
                         let report = self.executor.quarantine_handle(&handle, pid);
                         done.push((handle.key(), pid));
-                        match report.primary {
-                            ExecutionOutcome::Quarantined { .. } => "quarantined".to_string(),
-                            ExecutionOutcome::AlreadyGone { .. } => {
-                                "binary already gone".to_string()
-                            }
-                            ExecutionOutcome::WouldExecute { .. } => {
-                                "detect-only: would be quarantined".to_string()
-                            }
-                            other => {
-                                warn!(
-                                    target: "combat.actuator",
-                                    pid,
-                                    outcome = ?other,
-                                    "NEUTRALIZE: binary quarantine did not complete (re-exec \
-                                     prevention degraded)"
-                                );
-                                format!("NOT quarantined: {other:?} (re-exec prevention degraded)")
-                            }
-                        }
+                        Self::quarantine_text(pid, &report.primary)
                     }
                 },
             };
@@ -447,9 +472,7 @@ impl CombatActuator for SystemActuator {
                 "DETECT-ONLY: STAGE 3 reached — would engage full network isolation; \
                  iptables NOT applied (no enforcement)"
             );
-            return IsolateOutcome::NotApplied(
-                "detect-only: iptables NOT applied (no enforcement)".to_string(),
-            );
+            return IsolateOutcome::NotApplied(DETECT_ONLY_ISOLATE.to_string());
         }
         match &self.isolator {
             Some(iso) => {

@@ -963,7 +963,7 @@ impl DefenseDetector {
         if !AGENT_UNITS.contains(&unit) || !matches!(verb, "stop" | "force-stop" | "kill") {
             return None;
         }
-        let g = self.installer.get()?.grant_at(Instant::now())?;
+        let g = self.installer.get()?.current_grant()?;
         Some(format!(
             "inside the signed trusted-installer window of key {} (until {}): a stop or restart \
              of the agent's own unit",

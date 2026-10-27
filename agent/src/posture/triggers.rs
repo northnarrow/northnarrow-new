@@ -220,6 +220,12 @@ pub fn set_kernel_mass_write(on: bool) {
     KERNEL_MASS_WRITE.store(on, Ordering::Relaxed);
 }
 
+/// Lab PR 243 (tests: the golden replay names the mode it ran in).
+#[cfg(test)]
+pub(crate) fn kernel_mass_write() -> bool {
+    KERNEL_MASS_WRITE.load(Ordering::Relaxed)
+}
+
 /// Lateral movement: 3+ distinct internal hosts on admin ports in 10 min.
 pub(super) const LATERAL_WINDOW_NS: u64 = 10 * 60 * 1_000_000_000;
 pub(super) const LATERAL_DISTINCT_DST_MIN: usize = 3;

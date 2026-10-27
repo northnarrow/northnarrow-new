@@ -2279,3 +2279,40 @@ fn defense_impairment_engages_and_corroborates() {
         .iter()
         .any(|t| t.trigger == Some(TriggerType::DefenseImpairment)));
 }
+
+/// Lab PR 243: the machine reads the time through its clock — its timers
+/// (here the ALERTED decay) and the wall-clock second of its transition
+/// records — never the host's.
+#[test]
+fn a_machine_runs_on_its_clock() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::clock::TestClock;
+    use super::transitions::ALERTED_DECAY;
+
+    let clock = Arc::new(TestClock::at(
+        UNIX_EPOCH + Duration::from_secs(1_767_225_600),
+    ));
+    let m = PostureMachine::new().with_clock(clock.clone());
+    m.observe(&spawn(42, 1, "nmap", "/usr/bin/nmap", 1), &[]);
+    assert_eq!(m.current_kind(), PostureKind::Alerted);
+    clock.advance(ALERTED_DECAY - Duration::from_secs(1));
+    assert!(m.tick_decay().is_none());
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        m.tick_decay().map(|s| s.kind()),
+        Some(PostureKind::Observing)
+    );
+    let log = m.transition_log();
+    assert_eq!(log[0].unix_ts_secs, 1_767_225_600);
+    assert_eq!(log[1].unix_ts_secs, 1_767_225_600 + ALERTED_DECAY.as_secs());
+    // Shared already: a later clock is refused, the machine keeps its own.
+    let shared = m.clone();
+    let other = Arc::new(TestClock::at(UNIX_EPOCH));
+    let m = m.with_clock(other);
+    m.observe(&spawn(43, 1, "nmap", "/usr/bin/nmap", 2), &[]);
+    assert_eq!(
+        shared.transition_log().last().unwrap().unix_ts_secs,
+        1_767_225_600 + ALERTED_DECAY.as_secs()
+    );
+}

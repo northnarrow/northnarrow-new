@@ -1,0 +1,19 @@
+{
+  "about": "NEUTRALIZE that does not contain, and ISOLATE as it is read back (external audit CMB-002; lab PR 217): a /var/tmp miner (StagingExec, ENGAGED) whose worker is in an uninterruptible wait is refused a write to the agent's state (COMBAT locked). At the INVESTIGATE deadline the kill cgroup takes the tree but the worker is still running after the kill: the tree is NOT contained, and the ladder isolates (allowed: COMBAT is locked), evidence first. The first attempt leaves IPv4 not isolated (read back): signed, retried 5 s later; the second isolates IPv4 with IPv6 unavailable on this host (a hole, signed as one). A signed unlock stands the ladder down and lifts the isolation (IPv4 cleared, IPv6 unavailable): ALERTED.",
+  "path": ["ENGAGED", "COMBAT", "ALERTED"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE", "ISOLATE"],
+  "signed": ["combat_stage", "combat_outcome"],
+  "start_ns": 2990000000000,
+  "procs": [
+    {"pid": 6600001, "ppid": 1, "start_ns": 5000000000, "uid": 33, "comm": "apache2", "exe": "/usr/sbin/apache2", "argv": ["/usr/sbin/apache2", "-k", "start"], "cgroup": "/system.slice/apache2.service"}
+  ],
+  "isolation": [{"v4": "failed: iptables-restore exited 4", "v6": "done"}, {"v4": "done", "v6": "unavailable: no trusted ip6tables on this host"}],
+  "release": [{"v4": "done", "v6": "unavailable: no trusted ip6tables on this host"}],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 6600010, "ppid": 6600001, "uid": 33, "gid": 33, "comm": "miner", "filename": "/var/tmp/.cache/miner", "timestamp_ns": 3000000000000, "argv": ["/var/tmp/.cache/miner"], "parent_comm": "apache2", "parent_start_ns": 5000000000, "start_ns": 2999999000000, "exe": {"path": "/var/tmp/.cache/miner"}}}},
+    {"host": {"spawn": [{"pid": 6600011, "ppid": 6600010, "start_ns": 3000500000000, "uid": 33, "comm": "miner", "exe": "/var/tmp/.cache/miner", "stuck": true}]}},
+    {"event": {"FsProtectDenial": {"pid": 6600010, "uid": 33, "comm": "miner", "target_dev": 2049, "target_ino": 131074, "operation": "Unlink", "timestamp_ns": 3002000000000}}},
+    {"wait": {"secs": 40}},
+    {"unlock": {}}
+  ]
+}

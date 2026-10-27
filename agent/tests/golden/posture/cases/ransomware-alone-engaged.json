@@ -1,0 +1,19 @@
+{
+  "about": "Lab MS-22 shape, alone (lab PR 225, RANSOMWARE_COMBAT_WITHOUT_CORROBORATION off): an unpackaged program of a login session renames 20 files to .locked and leaves ciphertext — RansomwareEncryption with nothing to corroborate it: ENGAGED, the ladder not engaged. Another user's session then runs nc (ExploitAttempt, in that session's scope), and the program's second burst finds no other kind of evidence in its own scope (only its own earlier burst, file-system evidence like itself): ENGAGED still — one actor's evidence never vouches for another's.",
+  "path": ["ENGAGED"],
+  "start_ns": 250000000000,
+  "procs": [
+    {"pid": 6200002, "ppid": 1, "start_ns": 100000000000, "uid": 0, "comm": "sshd", "exe": "/usr/sbin/sshd", "argv": ["sshd: u1000 [priv]"], "loginuid": 1000, "cgroup": "/user.slice/user-1000.slice/session-7.scope"},
+    {"pid": 6200003, "ppid": 6200002, "start_ns": 101000000000, "uid": 1000, "comm": "bash", "exe": "/usr/bin/bash", "argv": ["-bash"], "tty": true},
+    {"pid": 6200004, "ppid": 1, "start_ns": 110000000000, "uid": 0, "comm": "sshd", "exe": "/usr/sbin/sshd", "argv": ["sshd: u1001 [priv]"], "loginuid": 1001, "cgroup": "/user.slice/user-1001.slice/session-9.scope"},
+    {"pid": 6200005, "ppid": 6200004, "start_ns": 111000000000, "uid": 1001, "comm": "bash", "exe": "/usr/bin/bash", "argv": ["-bash"], "tty": true}
+  ],
+  "entropy": [{"prefix": "/home/u/docs/", "examined": 4, "high": 4}],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 6200020, "ppid": 6200003, "uid": 1000, "gid": 1000, "comm": "nn-ms-enc", "filename": "/home/u/.local/bin/nn-ms-enc", "timestamp_ns": 300000000000, "argv": ["nn-ms-enc", "/home/u/docs"], "parent_comm": "bash", "parent_start_ns": 101000000000, "start_ns": 299999000000, "exe": {"path": "/home/u/.local/bin/nn-ms-enc"}}}},
+    {"event": {"FileBurst": {"pid": 6200020, "uid": 1000, "comm": "nn-ms-enc", "kind": "RenameExtension", "count": 20, "appended": 20, "sources": 0, "filename": "/home/u/docs/f19.odt.locked", "timestamp_ns": 302000000000}}},
+    {"event": {"ProcessSpawn": {"pid": 6200030, "ppid": 6200005, "uid": 1001, "gid": 1001, "comm": "nc", "filename": "/usr/bin/nc.openbsd", "timestamp_ns": 320000000000, "argv": ["nc", "198.51.100.7", "4444"], "parent_comm": "bash", "parent_start_ns": 111000000000, "start_ns": 319999000000, "exe": {"path": "/usr/bin/nc.openbsd"}}}},
+    {"event": {"FileBurst": {"pid": 6200020, "uid": 1000, "comm": "nn-ms-enc", "kind": "RenameExtension", "count": 20, "appended": 20, "sources": 0, "filename": "/home/u/docs/f39.odt.locked", "timestamp_ns": 380000000000}}},
+    {"wait": {"secs": 60}}
+  ]
+}
