@@ -216,7 +216,6 @@ planned = false
 # attach, drain (the ring half; the drift classification → nn-core, R04c),
 # baseline, honeypot, recompute
 "fim" = "nn-linux"
-"fim::paths_config" = "nn-core"
 "fim::rules" = "nn-core"
 "fs_type" = "nn-linux"
 # into the crates it exercises in R17
@@ -285,6 +284,8 @@ planned = false
 # R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
 # binds its reading loaders to the agent's host
 "config::overlay" = "nn-core"
+# R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
+"fim::paths_config" = "nn-core"
 "audit" = "nn-evidence"
 # post-plan (lab PR 178): the one reader of the canary chains' lines
 "canary::chain_lines" = "nn-evidence"

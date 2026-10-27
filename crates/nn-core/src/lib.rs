@@ -29,6 +29,13 @@ pub mod config {
     pub mod overlay_auth;
 }
 
+/// FIM content (R07, lab PR 247): the watched paths (was the agent's
+/// `fim::paths_config`).
+pub mod fim {
+    /// The shipped `fim-paths.v1` and the operator's `fim-paths.local`.
+    pub mod paths_config;
+}
+
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
 /// carve-out (was the agent's `anti_tamper::combat_allow`).
 pub mod anti_tamper {
