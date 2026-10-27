@@ -41,6 +41,11 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = { workspace = true }
 
 [features]
+# R08b (lab PR 251): R901..=R904, the Tappa 5 demo rules, and the engine's
+# `with_demo_tappa5_first` (`DEMO_RULES_BUILD` reads it); the agent
+# forwards its own `demo-tappa5` here (plan §4.1 rule 4). Never enabled in
+# production builds.
+demo-tappa5 = []
 # R08a (lab PR 250): `PostureMachine::force_state_for_test`, the
 # `nn-admin debug force-posture` hatch; the agent forwards its own
 # `debug-trigger` here. Off by default; production builds never see it.

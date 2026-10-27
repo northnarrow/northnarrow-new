@@ -67,6 +67,20 @@ impl DecisionHost for LinuxHost {
     fn defender_map_remove(map: &mut Self::DefenderMap, pid: u32) {
         let _ = map.remove(&pid);
     }
+
+    /// [`ProcFacts`] over `proc_root` (below), as the engine and the
+    /// offline replay made it.
+    fn actor_facts(proc_root: &Path) -> Arc<dyn ActorFacts> {
+        Arc::new(ProcFacts::new(proc_root))
+    }
+
+    /// The host's files ([`crate::impact::entropy::FsSampler`]).
+    fn sampler() -> Arc<dyn nn_core::impact::entropy::Sampler> {
+        Arc::new(crate::impact::entropy::FsSampler)
+    }
+
+    /// Tokio's `Notify` and the pump's mark (lab PR 229).
+    type DnsIngest = crate::net::dns_cache::DnsIngest;
 }
 
 // ── the exemption facts (from `decision::rule_policy`, R08b) ───────────

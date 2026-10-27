@@ -200,7 +200,19 @@ planned = false
 "cow::config" = "nn-core"
 "cow::index" = "nn-core"
 "cow::trust" = "nn-core"
+# R08b (lab PR 251): the decision engine moved to nn-core. `decision.rs` is
+# the agent's binding of it to the Linux host (the engine, the correlation
+# store and tree as aliases on `LinuxHost`, the default rule set and the
+# offline replay under their names and signatures); the golden replay, the
+# validation registry's checks and the engine's tests that wire the agent's
+# other modules (`host_tests`) stay in `decision/`, test modules
 "decision" = "nn-core"
+# post-plan (lab PR 251, R08b): the rule catalogue's renderer — the rules
+# decided outside the engine (the exec quarantine, the exec policy, the
+# anti-tamper and exploit-guard rules) composed with the engine's, and the
+# docs it writes: the composition, as `chains`. `decision/catalogue.rs`
+# binds nn-core's table here
+"decision::catalogue::render" = "northnarrow-agent"
 # post-plan (lab PR 251, R08b): the Linux host of the decision engine —
 # the package database's `rpm`, the work kept off the async runtime, the
 # host's view of a path, the trusted-installer window, `DEFENDER_PIDS` —
@@ -229,16 +241,24 @@ planned = false
 "execq::policy" = "nn-core"
 "execq::record" = "nn-core"
 # attach, drain (the ring half; the drift classification → nn-core, R04c),
-# baseline, honeypot, recompute
+# baseline, honeypot, recompute; the rules: `[shims.agent]` (R08b)
 "fim" = "nn-linux"
-"fim::rules" = "nn-core"
 "fs_type" = "nn-linux"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
 "host_hardening" = "nn-linux"
-# post-plan (lab PR 225): the ransomware signal (sampler behind a trait)
+# post-plan (lab PR 225): the ransomware signal (sampler behind a trait).
+# R08b (lab PR 251): the tracker moved to nn-core; `impact.rs` binds it to
+# the Linux host and publishes the agent's tracker for `status`
 "impact" = "nn-core"
-# post-plan (lab PR 225): defences switched off, a shipped list
+# post-plan (lab PR 251, R08b): the production sampler of the host's files
+# (`FsSampler`: `O_NOFOLLOW`, the owners and mode bits, `/proc/1/root`);
+# the signal's vocabulary it re-exports is nn-core's
+"impact::entropy" = "nn-linux"
+# post-plan (lab PR 225): defences switched off, a shipped list. R08b (lab
+# PR 251): the detector moved to nn-core; `impair.rs` binds it to the
+# Linux host, names the kernel's `DEFENDER_PIDS` and publishes the agent's
+# detector for `status`
 "impair" = "nn-core"
 "install_manifest" = "nn-linux"
 # the agent's signing key and its files, from `audit` (plan R04a; nn-linux's
@@ -333,6 +353,12 @@ planned = false
 "config::overlay" = "nn-core"
 # R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
 "fim::paths_config" = "nn-core"
+# R08b (lab PR 251): the comm allowlists, with the rules that judge on
+# them; `config/mod.rs` binds the allowlist and its loader to the agent's
+# host (an inline module)
+"config::comm_allowlist" = "nn-core"
+# R08b (lab PR 251): the FIM rules, with the engine
+"fim::rules" = "nn-core"
 # R08b (lab PR 251): the operator's blocklists, with the rules; their
 # loaders take the host that reads a `.v1` (R07's `ContentHost`)
 "net::blocklist" = "nn-core"
@@ -340,6 +366,9 @@ planned = false
 # `net::dns_cache` is an inline module of `net/mod.rs` that gives it the
 # pump's ingest (`net::dns_ingest`) and keeps the reply parsers' path (R06)
 "net::dns_cache" = "nn-core"
+# R08b (lab PR 251): the netflow rows handed to the rules, paced per uid;
+# `net/mod.rs` names the gate on the agent's host (an inline module)
+"net::limiter" = "nn-core"
 # post-plan (lab PR 224): the host's resolv.conf, mapped to nn-linux by
 # lab PR 239; R08b (lab PR 251): the set the network and chain rules
 # consult, read with `std::fs` (portable, as `combat_allow`), moved to
@@ -417,11 +446,17 @@ planned = false
 # (→ 37); the engine's foundations moved (the ATT&CK mapping, the bounded
 # structures, the flow ledger, the correlation store and ancestry tree) and
 # the agent's `decision/mod.rs`, which binds the store and the tree to the
-# Linux host, names it (→ 38).
+# Linux host, names it (→ 38); the engine moved — the rules, the FIM
+# rules, the combination, the per-rule policy, the replay, the comm
+# allowlists, the netflow limiter, the ransomware tracker and the
+# security-tool detector — taking their 13 references with them (the
+# catalogue's three to the rules decided outside the engine stay with its
+# renderer, the agent's), and the shims that bind them to the Linux host
+# name it: `decision.rs`, `impact.rs`, `impair.rs`, `net/mod.rs` (→ 21).
 
 [ratchet]
 nn-admin = 8
-nn-core = 38
+nn-core = 21
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

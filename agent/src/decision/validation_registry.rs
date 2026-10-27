@@ -213,7 +213,7 @@ const Q1_CRITICAL_FIM_RULE_IDS: &[&str] = &[
 /// The rules design §13 Q1 names, from the code: the Critical FIM rules
 /// ([`Q1_CRITICAL_FIM_RULE_IDS`]) and every chain rule ("all CHAIN-*").
 fn q1_rule_ids() -> BTreeSet<String> {
-    let chains = rules::chain::chain_rule_set();
+    let chains = rules::chain::chain_rule_set::<crate::chain_host_linux::LinuxHost>();
     Q1_CRITICAL_FIM_RULE_IDS
         .iter()
         .map(|s| s.to_string())

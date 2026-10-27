@@ -274,6 +274,18 @@ pub(crate) mod testing {
         type UnlockToken = ();
     }
 
+    /// R08b (lab PR 251): the engine's tests read shipped lists through the
+    /// same host: plain `std` (a final symlink followed, no refusal of its
+    /// own), as the content code's portable test host.
+    impl crate::content_host::ContentHost for TestHost {
+        fn open_read_nofollow(path: &Path) -> io::Result<std::fs::File> {
+            std::fs::OpenOptions::new().read(true).open(path)
+        }
+        fn is_symlink_refusal(_err: &io::Error) -> bool {
+            false
+        }
+    }
+
     /// A symbolic link at `link` to `target`, as the fixtures of the process
     /// table need one (`exe`, `ns/mnt`): `std::fs::soft_link`, the spelling
     /// of `symlink(2)` that builds on every target — deprecated because

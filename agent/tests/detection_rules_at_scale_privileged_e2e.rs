@@ -826,7 +826,7 @@ fn process_shell_from_nonstandard_path_trips_r017() {
 // EXEMPT the legitimate launcher (else it KillProcessTree's the agent's
 // own restart, the watchdog, and every service started after the agent)
 // while still firing on genuine /proc/self/fd execs from non-systemd
-// parents. See agent/src/decision/rules/r004_exec_from_proc_self_fd.rs.
+// parents. See crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs.
 
 /// Compile a genuine T1620 fileless-exec helper at `<dir>/<name>`: it
 /// copies `/bin/true` into an anonymous `memfd` and `fexecve()`s it, so

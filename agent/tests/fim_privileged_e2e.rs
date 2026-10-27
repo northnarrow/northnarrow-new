@@ -36,7 +36,7 @@
 //! sacrificial subprocess + posture-state assertion path that
 //! belongs in a separate test module. C8's scope is the wire from
 //! kernel BPF → drain → fim_drift.jsonl; rule-side response is
-//! covered by the existing unit tests in `agent/src/fim/rules.rs`.
+//! covered by the existing unit tests in `crates/nn-core/src/fim/rules.rs`.
 
 #![cfg(feature = "test-privileged")]
 

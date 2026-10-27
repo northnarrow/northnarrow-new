@@ -43,4 +43,7 @@ pub mod paths_config {
     }
 }
 pub mod recompute;
-pub mod rules;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the FIM rules
+/// (NN-L-FIM-001..025) are nn-core's, with the engine; they read the
+/// trusted-installer window and the lineage through their host.
+pub use nn_core::fim::rules;

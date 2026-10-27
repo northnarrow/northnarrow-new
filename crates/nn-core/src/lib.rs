@@ -8,7 +8,11 @@
 //! agent's is `LinuxHost`); so is what the posture reads from its host — the
 //! process table, the host's files, the clocks — and what it consults in the
 //! agent's other modules until they move here ([`posture::host`], R08a, lab
-//! PR 250).
+//! PR 250). R08b (lab PR 251) moves the decision engine here — its rules,
+//! the multi-match combination, the signed per-rule policy, the network
+//! state the rules read, the ransomware and security-tool judges — and what
+//! it does on its host is a trait the host implements too
+//! ([`decision::host`]).
 //!
 //! Created empty by the Wave 4 restructure, R01 (lab PR 239); the crates it may
 //! depend on, and the rules of the pure crates, are in
@@ -30,31 +34,22 @@ pub mod correlation;
 // PR 250; was the agent's `detection_budget`, without its reporter task).
 pub mod detection_budget;
 
-/// The decision engine (R08b, lab PR 251): what it does on its host
-/// (`decision::host`, the agent's `LinuxHost`); its foundations — the
-/// ATT&CK mapping, the bounded structures, the flow ledger, the chain
-/// rules' correlation store and ancestry tree (were the agent's).
-pub mod decision {
-    // Lab PR 221: the ATT&CK tactics and techniques a rule is evidence of.
-    pub mod attack;
-    // The bounded maps and loss counters of the engine's state.
-    pub mod bounded;
-    // Tappa 10.6: the chain rules' precursors and the ancestry tree.
-    pub mod correlation;
-    // Lab PR 224: the rules that already answered each open flow.
-    pub mod flow_ledger;
-    /// The host's calls the engine makes: the package database's `rpm`, the
-    /// work kept off the async runtime, the host's view of a path, the
-    /// trusted-installer window, the kernel's map of the security tools.
-    pub mod host;
-}
+// The decision engine (R08b, lab PR 251; was the agent's `decision`): the
+// rules, the multi-match combination, the signed per-rule policy, the held
+// responses, the replay, the ATT&CK mapping and the rule catalogue's table,
+// the chain rules' correlation state, and what the engine does on its host
+// (`decision::host`).
+pub mod decision;
 
-/// The ransomware signal (R08b, lab PR 251): the entropy of what a burst
-/// left behind (cut from the agent's `impact::entropy`).
-pub mod impact {
-    /// What a sampling found, what samples, the measure, the containers.
-    pub mod entropy;
-}
+// The ransomware signal (R08b, lab PR 251; was the agent's `impact`, without
+// its sampler of the host's files): the tracker the NN-L-IMP rules and the
+// posture share.
+pub mod impact;
+
+// Defences switched off (R08b, lab PR 251; was the agent's `impair`): the
+// security-tool detector the NN-L-EVA rules and the posture share, and its
+// shipped list.
+pub mod impair;
 
 // The adaptive defensive posture (R08a, lab PR 250; was the agent's
 // `posture`): the state machine, its triggers, the corroboration ledger, the
@@ -64,8 +59,13 @@ pub mod posture;
 
 /// Configuration content (R07, lab PR 247): the generic `.v1` + `.local`
 /// list loader and what the loaders take from the signed-overlay gate (was
-/// the agent's `config::overlay` and part of its `config::overlay_auth`).
+/// the agent's `config::overlay` and part of its `config::overlay_auth`);
+/// R08b (lab PR 251): the comm allowlists (were the agent's
+/// `config::comm_allowlist`).
 pub mod config {
+    // The process and network comm allowlists (Tappa 10.5, D1; R08b, lab PR
+    // 251, with the rules that judge on them).
+    pub mod comm_allowlist;
     /// The shipped `.v1` defaults and the operator's `.local` overlay of a
     /// flat list, merged.
     pub mod overlay;
@@ -95,28 +95,35 @@ use nn_model::path_text;
 use nn_evidence::detection_payload;
 
 /// The network state the rules read (R08b, lab PR 251): the operator's
-/// blocklists, the DNS cache, the host's configured DNS resolvers (were the
-/// agent's `net::blocklist`, the state of its `net::dns_cache` and its
-/// `net::resolvers`).
+/// blocklists, the DNS cache, the netflow pacing, the host's configured DNS
+/// resolvers (were the agent's `net::blocklist`, the state of its
+/// `net::dns_cache`, its `net::limiter` and `net::resolvers`).
 pub mod net {
     // The operator's NetFlow and JA3 blocklists (Tappa 10, N6).
     pub mod blocklist;
     // The PID-keyed DNS query cache: a connect's name, a forwarded query's
     // originator (Tappa 10, N4).
     pub mod dns_cache;
+    // The netflow rows handed to the rules, paced per uid (external audit
+    // NET-019).
+    pub mod limiter;
     // The `nameserver`s of the host's `resolv.conf`, re-read when they
     // change (lab PR 224).
     pub mod resolvers;
 }
 
 /// FIM content (R07, lab PR 247): the watched paths (was the agent's
-/// `fim::paths_config`); R08b (lab PR 251): the anti-tamper baits.
+/// `fim::paths_config`); R08b (lab PR 251): the anti-tamper baits and the
+/// FIM rules (were the agent's `fim::rules`).
 pub mod fim {
     /// The anti-tamper baits: each path with its template (R08b, lab PR 251;
     /// cut from the agent's `fim::honeypot`).
     pub mod baits;
     /// The shipped `fim-paths.v1` and the operator's `fim-paths.local`.
     pub mod paths_config;
+    // The FIM, credential-read and file-capability rules (Tappa 9; R08b,
+    // lab PR 251, with the engine).
+    pub mod rules;
 }
 
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management

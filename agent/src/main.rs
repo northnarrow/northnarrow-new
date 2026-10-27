@@ -2697,7 +2697,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     ));
     let security_tools_v1 = std::path::Path::new(northnarrow_agent::impair::SECURITY_TOOLS_V1);
     let (security_tools, security_tools_defaults) =
-        northnarrow_agent::impair::SecurityTools::load(security_tools_v1);
+        northnarrow_agent::impair::SecurityTools::load::<LinuxHost>(security_tools_v1);
     report_builtin_defaults(
         &overlay_gate,
         "security-tools",

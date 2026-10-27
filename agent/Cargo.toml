@@ -36,8 +36,9 @@ default = []
 # Enables R901..=R904, four hardcoded demo rules whose only job is to
 # trigger each of the new Tappa 5 actions (BlockOutbound,
 # FullNetworkIsolation, Quarantine, ThrottleProcess) by filename
-# suffix. NEVER enable in production builds.
-demo-tappa5 = []
+# suffix. NEVER enable in production builds. R08b (lab PR 251): the rules
+# and the engine's demo builder are nn-core's, which takes the feature.
+demo-tappa5 = ["nn-core/demo-tappa5"]
 # Exposes the nn-admin `debug --force-posture <STATE>` subcommand and
 # the agent-side handler that consumes it. Used by the integration
 # test harness; never enabled in production builds.

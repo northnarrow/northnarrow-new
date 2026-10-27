@@ -42,7 +42,15 @@ pub mod dns_cache {
 pub mod dns_ingest;
 pub mod drain;
 pub mod flow_tracker;
-pub mod limiter;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the netflow
+/// rows handed to the rules, paced per uid, are nn-core's, with the rules
+/// and the correlation store they read.
+pub mod limiter {
+    pub use nn_core::net::limiter::*;
+
+    /// [`nn_core::net::limiter::RuleGate`] on the agent's host.
+    pub type RuleGate = nn_core::net::limiter::RuleGate<crate::chain_host_linux::LinuxHost>;
+}
 /// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the host's
 /// configured DNS resolvers are nn-core's, with the rules that read them.
 pub use nn_core::net::resolvers;

@@ -55,7 +55,7 @@ Exec from /tmp/ — category `execution`.
 
 **How to test.** As an unprivileged user: `cp /bin/true /tmp/nn-r001 && /tmp/nn-r001`. Run as root it is R009's verdict.
 
-**Tests.** `agent/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp`
+**Tests.** `crates/nn-core/src/decision/rules/r001_exec_from_tmp.rs::fires_on_exec_from_tmp`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R001_ExecFromTmp`
 
 **ATT&CK note.** No technique is "execution from a staging directory": T1059 follows design §7.1 and V2 row TQ18 (the script or shell a dropper runs). A native payload is evidence of the Execution tactic, not of an interpreter.
 
@@ -77,7 +77,7 @@ Exec from /dev/shm/ — category `execution`.
 
 **How to test.** As an unprivileged user: `cp /bin/true /dev/shm/nn-r002 && /dev/shm/nn-r002` (a host that mounts `/dev/shm` noexec refuses the exec before the rule sees it).
 
-**Tests.** `agent/src/decision/rules/r002_exec_from_dev_shm.rs::fires_on_dev_shm`, `agent/src/decision/rules/r002_exec_from_dev_shm.rs::r002_kills_the_process_tree`
+**Tests.** `crates/nn-core/src/decision/rules/r002_exec_from_dev_shm.rs::fires_on_dev_shm`, `crates/nn-core/src/decision/rules/r002_exec_from_dev_shm.rs::r002_kills_the_process_tree`
 
 **ATT&CK note.** T1027.011 names `/dev/shm` as fileless storage; T1059 as for R001.
 
@@ -99,7 +99,7 @@ Exec from /var/tmp/ — category `execution`.
 
 **How to test.** As an unprivileged user: `cp /bin/true /var/tmp/nn-r003 && /var/tmp/nn-r003`.
 
-**Tests.** `agent/src/decision/rules/r003_exec_from_var_tmp.rs::fires_on_var_tmp`, `agent/src/decision/rules/r003_exec_from_var_tmp.rs::r003_kills_the_process_tree`
+**Tests.** `crates/nn-core/src/decision/rules/r003_exec_from_var_tmp.rs::fires_on_var_tmp`, `crates/nn-core/src/decision/rules/r003_exec_from_var_tmp.rs::r003_kills_the_process_tree`
 
 **ATT&CK note.** T1059 as for R001.
 
@@ -121,7 +121,7 @@ Exec from /proc/<pid>/fd/* (memfd) — category `execution`.
 
 **How to test.** `python3 -c 'import os; fd = os.memfd_create("x"); os.write(fd, open("/bin/true", "rb").read()); os.execv("/proc/self/fd/%d" % fd, ["x"])'`.
 
-**Tests.** `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_proc_self_fd`, `agent/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_a_memfd_whatever_path_reached_it`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_memfd_fileless_exec_trips_r004`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd`
+**Tests.** `crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_proc_self_fd`, `crates/nn-core/src/decision/rules/r004_exec_from_proc_self_fd.rs::fires_on_a_memfd_whatever_path_reached_it`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_memfd_fileless_exec_trips_r004`, `deploy/lab/exec-sensor/exec-sensor-check.sh::R004_ExecFromProcSelfFd`
 
 **ATT&CK note.** T1620: an anonymous (memfd) or unlinked file executed through a descriptor is a payload with no file on disk.
 
@@ -143,7 +143,7 @@ Netcat family launched — category `lateral_movement`.
 
 **How to test.** `nc -z 127.0.0.1 22` (any netcat invocation).
 
-**Tests.** `agent/src/decision/rules/r005_netcat_exec.rs::fires_on_each_netcat_alias`
+**Tests.** `crates/nn-core/src/decision/rules/r005_netcat_exec.rs::fires_on_each_netcat_alias`
 
 **ATT&CK note.** T1095 for netcat's use as a raw TCP/UDP channel (a reverse or bind shell); the rule sees the name only, not the connection.
 
@@ -165,7 +165,7 @@ Reverse shell tooling — category `lateral_movement`.
 
 **How to test.** `cp /bin/sleep /tmp/sliver && /tmp/sliver 5` (killed); `socat -V` (the distribution's socat, recorded).
 
-**Tests.** `agent/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool`, `agent/src/decision/rules/r006_reverse_shell_tooling.rs::r006_system_socat_is_recorded_a_copy_is_killed`, `agent/src/decision/rules/r006_reverse_shell_tooling.rs::r006_system_socat_running_a_shell_is_killed`
+**Tests.** `crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::fires_on_each_offsec_tool`, `crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::r006_system_socat_is_recorded_a_copy_is_killed`, `crates/nn-core/src/decision/rules/r006_reverse_shell_tooling.rs::r006_system_socat_running_a_shell_is_killed`
 
 **ATT&CK note.** The tools are C2 frameworks and a relay: T1095 for the raw TCP channel, T1059.004 for the shell `socat EXEC:` runs. The rule sees the name and argv, not the traffic; a renamed tool evades it.
 
@@ -187,7 +187,7 @@ Crypto miner — category `resource_abuse`.
 
 **How to test.** `cp /bin/sleep ~/xmrig && ~/xmrig 5` (killed); `cp /bin/sleep ~/xmrig-check && ~/xmrig-check 5` (recorded).
 
-**Tests.** `agent/src/decision/rules/r007_crypto_miner.rs::fires_on_known_miner_comms`, `agent/src/decision/rules/r007_crypto_miner.rs::r007_substring_only_is_recorded`
+**Tests.** `crates/nn-core/src/decision/rules/r007_crypto_miner.rs::fires_on_known_miner_comms`, `crates/nn-core/src/decision/rules/r007_crypto_miner.rs::r007_substring_only_is_recorded`
 
 **ATT&CK note.** T1496.001 Compute Hijacking, v20's sub-technique for mining. By name only: the CPU and pool connections of a renamed miner are not judged here.
 
@@ -209,7 +209,7 @@ Executable in hidden user directory — category `persistence`.
 
 **How to test.** `mkdir -p ~/.nn-r008 && cp /bin/true ~/.nn-r008/x && ~/.nn-r008/x`.
 
-**Tests.** `agent/src/decision/rules/r008_hidden_home_binary.rs::fires_on_unknown_dot_directory`, `agent/src/decision/rules/r008_hidden_home_binary.rs::autostart_dir_is_never_exempt`
+**Tests.** `crates/nn-core/src/decision/rules/r008_hidden_home_binary.rs::fires_on_unknown_dot_directory`, `crates/nn-core/src/decision/rules/r008_hidden_home_binary.rs::autostart_dir_is_never_exempt`
 
 **ATT&CK note.** T1564.001: only the hiding is observed, not the persistence a hidden binary may serve.
 
@@ -231,7 +231,7 @@ Root exec from user-writable path — category `privilege_escalation`.
 
 **How to test.** `cp /bin/true /tmp/nn-r009 && sudo systemd-run --wait /tmp/nn-r009` (root, outside a terminal session).
 
-**Tests.** `agent/src/decision/rules/r009_root_exec_from_user_path.rs::fires_on_root_in_user_path`, `agent/src/decision/rules/r009_root_exec_from_user_path.rs::sudo_session_at_a_terminal_is_recorded_not_killed`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`
+**Tests.** `crates/nn-core/src/decision/rules/r009_root_exec_from_user_path.rs::fires_on_root_in_user_path`, `crates/nn-core/src/decision/rules/r009_root_exec_from_user_path.rs::sudo_session_at_a_terminal_is_recorded_not_killed`, `agent/tests/response_privileged_e2e.rs::tmp_dropper_forked_child_dies_with_it`
 
 **ATT&CK note.** The rule sees the result, root executing a file a user can write, not the means: T1548 (an abused setuid binary or sudo rule) and T1068 (an exploit) are the escalations it is evidence of.
 
@@ -253,7 +253,7 @@ Exec from web document root — category `execution`.
 
 **How to test.** `sudo install -m 755 /bin/true /var/www/nn-r010 && /var/www/nn-r010`.
 
-**Tests.** `agent/src/decision/rules/r010_binary_in_webroot.rs::fires_on_each_webroot`, `agent/src/decision/rules/r010_binary_in_webroot.rs::r010_kills_the_process_tree`
+**Tests.** `crates/nn-core/src/decision/rules/r010_binary_in_webroot.rs::fires_on_each_webroot`, `crates/nn-core/src/decision/rules/r010_binary_in_webroot.rs::r010_kills_the_process_tree`
 
 ### R011_KernelModuleTooling
 
@@ -273,7 +273,7 @@ Kernel-module tooling exec — category `persistence`.
 
 **How to test.** `sudo modprobe dummy` (anti-tamper.sh case C16).
 
-**Tests.** `agent/src/decision/rules/r011_kernel_module_tooling.rs::fires_on_kmod_tooling`, `agent/src/decision/rules/r011_kernel_module_tooling.rs::kmod_tool_under_apt_is_recorded_not_killed`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_kernel_module_tooling_trips_r011`, `deploy/lab/adversarial/anti-tamper.sh::case C16`
+**Tests.** `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::fires_on_kmod_tooling`, `crates/nn-core/src/decision/rules/r011_kernel_module_tooling.rs::kmod_tool_under_apt_is_recorded_not_killed`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_kernel_module_tooling_trips_r011`, `deploy/lab/adversarial/anti-tamper.sh::case C16`
 
 **ATT&CK note.** The tool's exec, not the load itself (R018).
 
@@ -295,7 +295,7 @@ Capability-set tooling exec — category `privilege_escalation`.
 
 **How to test.** `setcap` with no argument (the exec alone fires it).
 
-**Tests.** `agent/src/decision/rules/r012_setcap_tooling.rs::fires_on_setcap`, `agent/src/decision/rules/r012_setcap_tooling.rs::r012_staged_copy_kills_the_process_tree`
+**Tests.** `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::fires_on_setcap`, `crates/nn-core/src/decision/rules/r012_setcap_tooling.rs::r012_staged_copy_kills_the_process_tree`
 
 **ATT&CK note.** File capabilities have no sub-technique of their own (T1548.001 is setuid and setgid): the parent technique.
 
@@ -317,7 +317,7 @@ Namespace/escape tooling from non-standard path — category `privilege_escalati
 
 **How to test.** `cp /usr/bin/unshare ~/unshare && ~/unshare --help`.
 
-**Tests.** `agent/src/decision/rules/r013_namespace_escape_tooling.rs::fires_on_escape_tool_from_nonstandard_path`, `agent/src/decision/rules/r013_namespace_escape_tooling.rs::r013_staged_copy_kills_the_process_tree`
+**Tests.** `crates/nn-core/src/decision/rules/r013_namespace_escape_tooling.rs::fires_on_escape_tool_from_nonstandard_path`, `crates/nn-core/src/decision/rules/r013_namespace_escape_tooling.rs::r013_staged_copy_kills_the_process_tree`
 
 **ATT&CK note.** The tool's exec from an odd place is the escape attempt's shape; the escape itself (a write to the host's namespaces) is not observed.
 
@@ -339,7 +339,7 @@ at/batch scheduling exec — category `persistence`.
 
 **How to test.** `echo true | at now + 1 minute` (the `at` package installed).
 
-**Tests.** `agent/src/decision/rules/r014_at_batch_scheduling.rs::fires_on_scheduling_tool`
+**Tests.** `crates/nn-core/src/decision/rules/r014_at_batch_scheduling.rs::fires_on_scheduling_tool`
 
 **ATT&CK note.** Execution and Persistence, the two tactics of T1053.002 a one-shot job serves; the job's own run later is an ordinary exec.
 
@@ -361,7 +361,7 @@ Encoding tooling exec by service account — category `defense_evasion`.
 
 **How to test.** `sudo -u nobody base64 /etc/hostname`.
 
-**Tests.** `agent/src/decision/rules/r015_encoding_tooling_service_uid.rs::fires_on_encoder_by_service_uid`, `agent/src/decision/rules/r015_encoding_tooling_service_uid.rs::nobody_is_service_class`
+**Tests.** `crates/nn-core/src/decision/rules/r015_encoding_tooling_service_uid.rs::fires_on_encoder_by_service_uid`, `crates/nn-core/src/decision/rules/r015_encoding_tooling_service_uid.rs::nobody_is_service_class`
 
 **ATT&CK note.** T1027 for an encode, T1140 for a decode (`base64 -d`), T1132 as V2 row TQ29: the rule sees the encoder's exec, not the data or the channel.
 
@@ -383,7 +383,7 @@ Debugger/tracer exec by service account — category `defense_evasion`.
 
 **How to test.** `sudo -u nobody gdb --version` (gdb installed).
 
-**Tests.** `agent/src/decision/rules/r016_debugger_service_uid.rs::fires_on_debugger_by_service_uid`, `agent/src/decision/rules/r016_debugger_service_uid.rs::argv_attach_pid_enriches_reasoning`
+**Tests.** `crates/nn-core/src/decision/rules/r016_debugger_service_uid.rs::fires_on_debugger_by_service_uid`, `crates/nn-core/src/decision/rules/r016_debugger_service_uid.rs::argv_attach_pid_enriches_reasoning`
 
 **ATT&CK note.** The rule's prose named T1622 (Debugger Evasion) until lab PR 221: a payload detecting a debugger, not running one. What it observes is a ptrace tracer started by a service account, the tool of T1055.008; a service account traces only its own processes, so Stealth, not Privilege Escalation. The ptrace call itself is not seen (V2 row TQ14 stays a known gap).
 
@@ -405,7 +405,7 @@ Shell binary from non-standard path — category `execution`.
 
 **How to test.** `cp /bin/sh ~/sh && ~/sh -c true`.
 
-**Tests.** `agent/src/decision/rules/r017_shell_from_nonstandard_path.rs::fires_on_shell_from_nonstandard_path`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_shell_from_nonstandard_path_trips_r017`
+**Tests.** `crates/nn-core/src/decision/rules/r017_shell_from_nonstandard_path.rs::fires_on_shell_from_nonstandard_path`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::process_shell_from_nonstandard_path_trips_r017`
 
 ### R018_KernelModuleLoad
 
@@ -425,7 +425,7 @@ Kernel module load — category `rootkit`.
 
 **How to test.** Copy an in-tree module out of the module tree, decompressed, and `insmod` it from `/tmp` (Critical); `exec -a modprobe` of a renamed loader for a standard module (anti-tamper.sh case C58, Medium).
 
-**Tests.** `agent/src/decision/rules/r018_kernel_module_load.rs::fire_nonstandard_path_is_critical_killtree`, `agent/src/decision/rules/r018_kernel_module_load.rs::fire_stdpath_unexpected_loader_is_medium_log`, `deploy/lab/adversarial/anti-tamper.sh::case C58`
+**Tests.** `crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::fire_nonstandard_path_is_critical_killtree`, `crates/nn-core/src/decision/rules/r018_kernel_module_load.rs::fire_stdpath_unexpected_loader_is_medium_log`, `deploy/lab/adversarial/anti-tamper.sh::case C58`
 
 ### R020_ShellWithSocketStdio
 
@@ -445,7 +445,7 @@ Shell or interpreter with stdin/stdout on a network socket — category `executi
 
 **How to test.** `net-check.sh --only MS06`: bash on a /dev/tcp socket, and the Python pty reverse shell (MS06B), to a loopback listener.
 
-**Tests.** `agent/src/decision/rules/r020_shell_with_socket_stdio.rs::a_shell_on_an_outbound_socket_is_a_critical_reverse_shell`, `agent/src/decision/rules/r020_shell_with_socket_stdio.rs::a_pty_wrapped_reverse_shell_fires_on_the_shell`, `deploy/lab/malsim/net-check.sh::MS06`
+**Tests.** `crates/nn-core/src/decision/rules/r020_shell_with_socket_stdio.rs::a_shell_on_an_outbound_socket_is_a_critical_reverse_shell`, `crates/nn-core/src/decision/rules/r020_shell_with_socket_stdio.rs::a_pty_wrapped_reverse_shell_fires_on_the_shell`, `deploy/lab/malsim/net-check.sh::MS06`
 
 **ATT&CK note.** The shell (T1059.004) and its raw channel (T1095), as R006 maps the tools that set one up.
 
@@ -607,7 +607,7 @@ System binary modified — category `fim_persistence`.
 
 **How to test.** `sudo chmod g+w /usr/bin/curl` (a watched binary), then `sudo chmod g-w /usr/bin/curl`; expect Critical, KillProcessTree aimed at chmod.
 
-**Tests.** `agent/src/fim/rules.rs::fim001_fires_on_system_binary_modified`, `agent/src/fim/rules.rs::a_set_uid_bit_on_a_system_binary_is_killed_its_removal_is_not`, `agent/src/fim/rules.rs::package_manager_writes_are_logged_not_killed`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim001_fires_on_system_binary_modified`, `crates/nn-core/src/fim/rules.rs::a_set_uid_bit_on_a_system_binary_is_killed_its_removal_is_not`, `crates/nn-core/src/fim/rules.rs::package_manager_writes_are_logged_not_killed`
 
 **ATT&CK note.** T1554 for a rewritten binary, T1548.001 for a set-id bit granted on one. A supply-chain compromise (T1195) happens upstream; the host sees the file change.
 
@@ -629,7 +629,7 @@ New SUID-root binary appeared in user-writable dir — category `fim_evasion`.
 
 **How to test.** `sudo ln /usr/bin/passwd /var/tmp/nn-link` (on the filesystem of /usr), then `sudo rm /var/tmp/nn-link`; expect Critical, KillProcessTree aimed at ln.
 
-**Tests.** `agent/src/fim/rules.rs::fim002_kills_a_watched_inode_linked_into_a_user_writable_dir`, `agent/src/fim/rules.rs::fim002_records_a_file_created_in_a_watched_user_writable_dir`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim002_kills_a_watched_inode_linked_into_a_user_writable_dir`, `crates/nn-core/src/fim/rules.rs::fim002_records_a_file_created_in_a_watched_user_writable_dir`
 
 **ATT&CK note.** T1548.001: a setuid binary kept under a name a user controls. The rule does not see a set-id bit itself; NN-L-FIM-001 and NN-L-FIM-025 do.
 
@@ -651,7 +651,7 @@ Sensitive config modified — category `fim_credential_access`.
 
 **How to test.** `sudo systemd-run --wait chmod o+r /etc/shadow`, then `sudo chmod o-r /etc/shadow` (systemd-run: no terminal, so the interactive-admin carve-out does not apply); expect High, KillProcess.
 
-**Tests.** `agent/src/fim/rules.rs::fim003_fires_on_sensitive_config_modified`, `agent/src/fim/rules.rs::shadow_made_readable_by_others_is_a_sensitive_change`, `agent/src/fim/rules.rs::account_tools_are_recorded_not_killed`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim003_fires_on_sensitive_config_modified`, `crates/nn-core/src/fim/rules.rs::shadow_made_readable_by_others_is_a_sensitive_change`, `crates/nn-core/src/fim/rules.rs::account_tools_are_recorded_not_killed`
 
 **ATT&CK note.** One technique per file: passwd and shadow are T1098 (an account changed) and T1136.001 (a local account added), the two PAM files T1556.003, sudoers T1548.003; sshd_config has none of its own. A read of shadow (T1003.008) is not this rule's: it fires on a write or a permission change.
 
@@ -673,7 +673,7 @@ SSH authorized_keys modified — category `fim_persistence`.
 
 **How to test.** `echo ssh-ed25519 AAAA nn-test | sudo tee -a /root/.ssh/authorized_keys` (the file must exist when the agent starts); expect High, KillProcess aimed at tee. Remove the line afterwards.
 
-**Tests.** `agent/src/fim/rules.rs::fim004_fires_on_authorized_keys_modified`, `agent/src/fim/rules.rs::fim004_fires_on_authorized_keys2_and_etc_ssh_forms`, `agent/src/fim/rules.rs::an_authorized_keys_file_handed_to_another_owner_fires`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim004_fires_on_authorized_keys_modified`, `crates/nn-core/src/fim/rules.rs::fim004_fires_on_authorized_keys2_and_etc_ssh_forms`, `crates/nn-core/src/fim/rules.rs::an_authorized_keys_file_handed_to_another_owner_fires`
 
 **ATT&CK note.** A new authorized_keys file created in a watched directory under /home is recorded by NN-L-FIM-002 (Medium, Log), which the engine evaluates first; an edit of an existing one, and any write under /root or /etc/ssh, is this rule's.
 
@@ -695,7 +695,7 @@ Log file modified (truncation suspect) — category `fim_defense_evasion`.
 
 **How to test.** `echo nn-test | sudo tee -a /var/log/syslog` (/var/log/messages on the RHEL family), a writer other than rsyslogd; expect High, Log.
 
-**Tests.** `agent/src/fim/rules.rs::fim005_fires_on_log_modification_but_logs_only`, `agent/src/fim/rules.rs::fim005_rsyslogd_truncation_still_fires`, `agent/src/fim/rules.rs::fim005_non_rsyslogd_writer_still_fires`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim005_fires_on_log_modification_but_logs_only`, `crates/nn-core/src/fim/rules.rs::fim005_rsyslogd_truncation_still_fires`, `crates/nn-core/src/fim/rules.rs::fim005_non_rsyslogd_writer_still_fires`
 
 **ATT&CK note.** T1685.006 (Clear Linux or Mac System Logs), which ATT&CK v19 made of T1070.002, now revoked. A write to the Linux audit log is also T1685.004; the rule does not tell it from another log.
 
@@ -717,7 +717,7 @@ Operator-installed binary modified — category `fim_supply_chain`.
 
 **How to test.** Add an existing file, /usr/local/bin/nn-test, to /etc/northnarrow/fim-paths.local, restart the agent, then `echo x | sudo tee -a /usr/local/bin/nn-test`; expect Medium, Log.
 
-**Tests.** `agent/src/fim/rules.rs::fim006_fires_on_operator_binary_modified`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim006_fires_on_operator_binary_modified`
 
 **ATT&CK note.** T1554, as NN-L-FIM-001, for the binaries outside the distribution's trees.
 
@@ -739,7 +739,7 @@ Cron drop-in created — category `fim_persistence`.
 
 **How to test.** `sudo systemd-run --wait cp /dev/null /etc/cron.d/nn-test`, then remove the file; expect High, KillProcess aimed at cp.
 
-**Tests.** `agent/src/fim/rules.rs::fim007_fires_on_cron_dropin_created_or_modified`, `agent/src/fim/rules.rs::fim007_two_distinct_dropins_fire_twice`, `agent/src/fim/rules.rs::package_manager_writes_are_logged_not_killed`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim007_fires_on_cron_dropin_created_or_modified`, `crates/nn-core/src/fim/rules.rs::fim007_two_distinct_dropins_fire_twice`, `crates/nn-core/src/fim/rules.rs::package_manager_writes_are_logged_not_killed`
 
 **ATT&CK note.** Persistence only: a drop-in under /etc/cron.d already needs root, and a user's crontab runs as that user.
 
@@ -761,7 +761,7 @@ Kernel module file modified — category `fim_rootkit`.
 
 **How to test.** `sudo touch /lib/modules/$(uname -r)/nn-test.ko`, then remove it; expect Critical, KillProcessTree aimed at touch.
 
-**Tests.** `agent/src/fim/rules.rs::fim008_fires_on_kmod_modified`, `agent/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim008_fires_on_kmod_modified`, `crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`
 
 **ATT&CK note.** The file on disk; R018_KernelModuleLoad sees the load. T1014 because a dropped module is the usual vehicle of a kernel rootkit; the rule does not see what the module does.
 
@@ -783,7 +783,7 @@ Systemd unit file dropped or modified — category `fim_persistence`.
 
 **How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.service`, then remove it; expect High, KillProcess aimed at cp.
 
-**Tests.** `agent/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified`, `agent/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim009_fires_on_systemd_unit_dropped_or_modified`, `crates/nn-core/src/fim/rules.rs::fim009_downgrades_own_unit_under_open_window`
 
 **ATT&CK note.** /etc/systemd/user is watched but not among the rule's directories: a user unit there draws no verdict. A .timer here is recorded as this rule, which the engine evaluates before NN-L-FIM-023.
 
@@ -805,7 +805,7 @@ Ransomware extension rename — category `fim_impact_ransomware`.
 
 **How to test.** Add an existing scratch file, /srv/nn-test/report.txt, to /etc/northnarrow/fim-paths.local, restart the agent, then `sudo mv /srv/nn-test/report.txt /srv/nn-test/report.txt.locked`; expect Critical, KillProcessTree aimed at mv.
 
-**Tests.** `agent/src/fim/rules.rs::fim010_fires_on_renamed_to_ransomware_extension`, `agent/src/fim/rules.rs::fim010_matches_extension_case_insensitively`, `agent/src/fim/rules.rs::fim010_moved_in_is_held_and_does_not_hide_the_files_rename`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim010_fires_on_renamed_to_ransomware_extension`, `crates/nn-core/src/fim/rules.rs::fim010_matches_extension_case_insensitively`, `crates/nn-core/src/fim/rules.rs::fim010_moved_in_is_held_and_does_not_hide_the_files_rename`
 
 **ATT&CK note.** Encryption in place, without a rename, has no rule (v2-techniques.tsv TQ32).
 
@@ -827,7 +827,7 @@ AWS credentials read by non-CLI process — category `fim_credential_access`.
 
 **How to test.** With /root/.aws/credentials in place when the agent starts: `sudo cat /root/.aws/credentials`; expect High, KillProcess aimed at cat. The lab probe reads a file in a home outside the watch list and expects High with action Log.
 
-**Tests.** `agent/src/fim/rules.rs::fim011_fires_on_aws_cred_read_by_unknown_process`, `agent/src/fim/rules.rs::fim011_fires_on_replaced_credentials`, `agent/tests/fim_privileged_e2e.rs::fim_subprocess_open_aws_creds_records_opened_event`, `deploy/lab/open-sensor/open-sensor-check.sh::NN-L-FIM-011_AwsCredsRead`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim011_fires_on_aws_cred_read_by_unknown_process`, `crates/nn-core/src/fim/rules.rs::fim011_fires_on_replaced_credentials`, `agent/tests/fim_privileged_e2e.rs::fim_subprocess_open_aws_creds_records_opened_event`, `deploy/lab/open-sensor/open-sensor-check.sh::NN-L-FIM-011_AwsCredsRead`
 
 ### NN-L-FIM-012_AzureCredsRead
 
@@ -847,7 +847,7 @@ Azure credentials read by non-CLI process — category `fim_credential_access`.
 
 **How to test.** With a file under /root/.azure in place when the agent starts: `sudo cat /root/.azure/azureProfile.json`; expect High, KillProcess aimed at cat.
 
-**Tests.** `agent/src/fim/rules.rs::fim012_fires_on_azure_cred_read_by_unknown_process`, `agent/src/fim/rules.rs::own_clients_are_told_by_their_exec`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim012_fires_on_azure_cred_read_by_unknown_process`, `crates/nn-core/src/fim/rules.rs::own_clients_are_told_by_their_exec`
 
 ### NN-L-FIM-013_GcpCredsRead
 
@@ -867,7 +867,7 @@ GCP credentials read by non-CLI process — category `fim_credential_access`.
 
 **How to test.** With /root/.config/gcloud/credentials.db in place when the agent starts: `sudo cat /root/.config/gcloud/credentials.db`; expect High, KillProcess aimed at cat.
 
-**Tests.** `agent/src/fim/rules.rs::fim013_fires_on_gcp_cred_read_by_unknown_process`, `agent/src/fim/rules.rs::own_clients_are_told_by_their_exec`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim013_fires_on_gcp_cred_read_by_unknown_process`, `crates/nn-core/src/fim/rules.rs::own_clients_are_told_by_their_exec`
 
 ### NN-L-FIM-014_DockerCredsRead
 
@@ -887,7 +887,7 @@ Docker registry credentials read by non-CLI process — category `fim_credential
 
 **How to test.** With /root/.docker/config.json in place when the agent starts: `sudo cat /root/.docker/config.json`; expect High, KillProcess aimed at cat.
 
-**Tests.** `agent/src/fim/rules.rs::fim014_fires_on_docker_cred_read_by_unknown_process`, `agent/src/fim/rules.rs::own_clients_are_told_by_their_exec`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim014_fires_on_docker_cred_read_by_unknown_process`, `crates/nn-core/src/fim/rules.rs::own_clients_are_told_by_their_exec`
 
 ### NN-L-FIM-015_BrowserCredsAccessed
 
@@ -907,7 +907,7 @@ Browser stored credentials accessed by non-browser process — category `fim_cre
 
 **How to test.** With /root/.config/google-chrome/Default/Login Data in place when the agent starts: `sudo cp '/root/.config/google-chrome/Default/Login Data' /tmp/`; expect High, KillProcess aimed at cp.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::own_clients_are_told_by_their_exec`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::fim_browser_cred_access_trips_fim_015`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::own_clients_are_told_by_their_exec`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::fim_browser_cred_access_trips_fim_015`
 
 ### NN-L-FIM-016_PasswordManagerDbAccessed
 
@@ -927,7 +927,7 @@ Password-manager database accessed by foreign process — category `fim_credenti
 
 **How to test.** With a file under /root/.password-store in place when the agent starts: `sudo cat /root/.password-store/nn-test.gpg`; expect High, KillProcess aimed at cat.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::own_clients_are_told_by_their_exec`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::own_clients_are_told_by_their_exec`
 
 ### NN-L-FIM-017_GpgKeyringAccessed
 
@@ -947,7 +947,7 @@ GPG keyring accessed by non-GnuPG process — category `fim_credential_access`.
 
 **How to test.** With /root/.gnupg in place when the agent starts: `sudo cat /root/.gnupg/pubring.kbx` (any file there); expect High, KillProcess aimed at cat.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::own_clients_are_told_by_their_exec`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::own_clients_are_told_by_their_exec`
 
 **ATT&CK note.** T1552.004 (Private Keys): the rule fires on any file there, public keyrings included.
 
@@ -969,7 +969,7 @@ lastlog tampered by non-login process — category `fim_defense_evasion`.
 
 **How to test.** `printf x | sudo dd of=/var/log/lastlog oflag=append conv=notrunc` (a lab guest: it appends a byte); expect High, KillProcess aimed at dd.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::account_tools_are_recorded_not_killed`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::account_tools_are_recorded_not_killed`
 
 **ATT&CK note.** T1685.006: ATT&CK lists the login records among the system logs (T1070.002, revoked in v19). The reasoning text names T1070.
 
@@ -991,7 +991,7 @@ wtmp/btmp tampered by non-login process — category `fim_defense_evasion`.
 
 **How to test.** `printf x | sudo dd of=/var/log/btmp oflag=append conv=notrunc` (a lab guest: it appends a byte); expect High, KillProcess aimed at dd.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::own_clients_are_told_by_their_exec`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::own_clients_are_told_by_their_exec`
 
 **ATT&CK note.** T1685.006, as NN-L-FIM-018; the reasoning text names T1070.
 
@@ -1013,7 +1013,7 @@ Shell history deleted or renamed — category `fim_defense_evasion`.
 
 **How to test.** `sudo touch /root/.bash_history` before the agent starts, then `sudo mv /root/.bash_history /root/.bash_history.nn` and back; expect Medium, Log.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`
 
 **ATT&CK note.** A truncation in place, `history -c` and `unset HISTFILE` (also T1070.003) draw no verdict: only a deletion or a rename.
 
@@ -1035,7 +1035,7 @@ PAM module created or modified — category `fim_persistence`.
 
 **How to test.** `sudo cp /usr/lib/x86_64-linux-gnu/security/pam_permit.so /usr/lib/x86_64-linux-gnu/security/pam_nntest.so` (Debian, Ubuntu), then remove it; expect Critical, KillProcessTree aimed at cp.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::fim_pam_module_modify_trips_fim_021_combat`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::fim_pam_module_modify_trips_fim_021_combat`
 
 **ATT&CK note.** T1556.003 for both the backdoor (persistence) and the credential harvest; the reasoning's T1543 is not the behaviour. A rewrite of an existing module under /usr/lib is evaluated by NN-L-FIM-001 first and recorded as that rule (same response, T1554).
 
@@ -1057,7 +1057,7 @@ PAM module created or modified — category `fim_persistence`.
 
 **How to test.** The path must exist when the agent starts (an absent watch-list path is skipped): create an empty /etc/ld.so.preload with the agent stopped, start it, then `echo | sudo tee /etc/ld.so.preload`; expect Critical, KillProcessTree aimed at tee. Remove the file afterwards.
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::ld_so_preload_is_not_carved_out`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::ld_so_preload_is_not_carved_out`
 
 **ATT&CK note.** T1574.006 under Execution and Stealth, its two v20 tactics (v19 took it out of Persistence). On a host without the file the first creation is not seen: fim::attach::populate_watched_paths skips a path that does not exist, and /etc is not watched as a directory.
 
@@ -1079,7 +1079,7 @@ systemd timer unit created — category `fim_persistence`.
 
 **How to test.** `sudo systemd-run --wait cp /dev/null /etc/systemd/system/nn-test.timer`: one record naming NN-L-FIM-009 (primary: same severity and action, registered first) and this rule among its matches (lab PR 236, multi-match).
 
-**Tests.** `agent/src/fim/rules.rs::d3_fim_rules_table`, `agent/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`, `agent/src/decision/tests.rs::shadow_fim023_fires_with_fim009_on_a_timer`
+**Tests.** `crates/nn-core/src/fim/rules.rs::d3_fim_rules_table`, `crates/nn-core/src/fim/rules.rs::bug022_created_kmod_and_truncated_suffix_rules_fire`, `crates/nn-core/src/decision/tests.rs::shadow_fim023_fires_with_fim009_on_a_timer`
 
 **ATT&CK note.** NN-L-FIM-009 (T1543.002) matches the same writes; until lab PR 236 it shadowed this rule in the engine's first-match order. Now both are matches of one record, whose ATT&CK field carries T1543.002 and T1053.006.
 
@@ -1101,7 +1101,7 @@ Anti-tamper control-surface file tampered — category `fim_anti_tamper`.
 
 **How to test.** `sudo rm /etc/northnarrow/kill_switch.conf` (the e2e's case; the agent recreates the file at its next start); expect Critical, KillProcessTree aimed at rm.
 
-**Tests.** `agent/src/fim/rules.rs::fim024_fires_on_every_honeypot_path`, `agent/src/fim/rules.rs::fim024_fires_on_create_delete_rename_too`, `agent/tests/honeypot_tamper_e2e.rs::delete_kill_switch_conf_trips_fim024_and_kills_the_tamperer`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim024_fires_on_every_honeypot_path`, `crates/nn-core/src/fim/rules.rs::fim024_fires_on_create_delete_rename_too`, `agent/tests/honeypot_tamper_e2e.rs::delete_kill_switch_conf_trips_fim024_and_kills_the_tamperer`
 
 **ATT&CK note.** T1685 (Disable or Modify Tools), which replaced T1562.001 in ATT&CK v19; the reasoning text, pinned by a test, still names T1562.001.
 
@@ -1123,7 +1123,7 @@ File capability granted — category `fim_privilege_escalation`.
 
 **How to test.** `cp /usr/bin/python3 /tmp/nn-py && sudo systemd-run --wait setcap cap_setuid+ep /tmp/nn-py`; `getcap /tmp/nn-py` then prints nothing; expect Critical, StripFileCapability.
 
-**Tests.** `agent/src/fim/rules.rs::fim025_strips_a_granted_capability`, `agent/src/fim/rules.rs::fim025_keeps_a_grant_inside_the_trusted_installer_window`, `agent/src/fim/rules.rs::fim025_package_manager_and_interactive_admin_keep_the_capability`
+**Tests.** `crates/nn-core/src/fim/rules.rs::fim025_strips_a_granted_capability`, `crates/nn-core/src/fim/rules.rs::fim025_keeps_a_grant_inside_the_trusted_installer_window`, `crates/nn-core/src/fim/rules.rs::fim025_package_manager_and_interactive_admin_keep_the_capability`
 
 **ATT&CK note.** T1548: ATT&CK has no sub-technique for Linux file capabilities (T1548.001 is the set-id bits).
 
@@ -1145,7 +1145,7 @@ Ransomware encryption: two shapes of one process tree — category `impact_ranso
 
 **How to test.** `ransom-check.sh` MS-23: the benign simulator (`ransom-sim.py`, /srv/nn-malsim only), in place and copy-delete, draws the Critical record (its kill held: the simulator finishes) and the posture reaches ENGAGED; tar, rsync, git checkout, an apt install and the simulator's own script compressing or moving its files then deleting them draw no record.
 
-**Tests.** `agent/src/decision/rules/impact.rs::imp001_kills_the_actors_tree_on_two_shapes`, `agent/src/impact/tests.rs::copy_delete_beside_fresh_originals_is_decisive`, `agent/src/impact/tests.rs::benign_copy_delete_shapes_are_not_decisive`, `deploy/lab/malsim/ransom-check.sh::MS-23`
+**Tests.** `crates/nn-core/src/decision/rules/impact.rs::imp001_kills_the_actors_tree_on_two_shapes`, `agent/src/impact/host_tests.rs::copy_delete_beside_fresh_originals_is_decisive`, `agent/src/impact/host_tests.rs::benign_copy_delete_shapes_are_not_decisive`, `deploy/lab/malsim/ransom-check.sh::MS-23`
 
 **ATT&CK note.** Data Encrypted for Impact (T1486) by the shape of the writes, not by a ransom note or a known family.
 
@@ -1167,7 +1167,7 @@ Burst of renames to a new extension — category `impact_ransomware`.
 
 **How to test.** From ONE process — the counter is per process, and a shell loop of `mv` is one process per file — rename 20 regular files of 4 KiB or more to `.locked`, with the LSM file-open sensor armed and no other shape: `python3 -c 'import glob,os; [os.rename(f, f + ".locked") for f in glob.glob("/srv/nn-test/*")]'`.
 
-**Tests.** `agent/src/decision/rules/impact.rs::imp002_records_a_lone_rename_burst`
+**Tests.** `crates/nn-core/src/decision/rules/impact.rs::imp002_records_a_lone_rename_burst`
 
 ## Network
 
@@ -1211,7 +1211,7 @@ Outbound to operator-blocked IP/CIDR — category `net_critical`.
 
 **How to test.** Add an address the guest can reach (the lab host's bridge address) to `netflow-blocklist.local`, restart the agent, then connect to it from a throwaway shell: `sh -c 'curl -s --max-time 3 http://<address>/'`. The shell's tree is killed.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_001_fires_on_blocklist_match`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_001_fires_on_blocklist_match`
 
 **ATT&CK note.** An indicator match: the destination, not the protocol, is the signal. Mapped to the two C2 channel techniques a flow to a known C2 address is an instance of (an application protocol, T1071, or raw TCP/UDP, T1095); the flow's protocol is not inspected.
 
@@ -1233,7 +1233,7 @@ Outbound to operator-blocked TLD — category `net_high`.
 
 **How to test.** From one process, look up a `.onion` name (the resolver's NXDOMAIN is enough: the sensor records the query), then connect anywhere within 5 minutes: `python3 -c $'import socket, contextlib\nwith contextlib.suppress(OSError): socket.getaddrinfo("nn-test.onion", 80)\nsocket.create_connection(("<peer>", 80))'` (bash). The process is killed.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_002_fires_on_onion_tld`, `agent/src/decision/rules/net.rs::net_002_no_hostname_no_fire`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_002_fires_on_onion_tld`, `crates/nn-core/src/decision/rules/net.rs::net_002_no_hostname_no_fire`
 
 **ATT&CK note.** `.onion` is Tor, T1090.003 Multi-hop Proxy. `.bit` (Namecoin) names have no ATT&CK technique of their own and are not mapped separately.
 
@@ -1255,7 +1255,7 @@ JA3 fingerprint matches threat-actor blocklist — category `net_critical`.
 
 **How to test.** Cannot be exercised on a guest: no sensor fills a flow's TLS fingerprint until BUG-025 (`FlowTracker::attach_tls` has no caller), so the rule cannot fire. The unit test gives the flow a fingerprint directly.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_003_fires_on_ja3_blocklist_match`
 
 **ATT&CK note.** TLS C2 is T1573.002 (ATT&CK classes SSL/TLS as asymmetric cryptography). Inactive until BUG-025: out of the V2 Critical sub-gate, still in its denominator.
 
@@ -1277,7 +1277,7 @@ Unusually long DNS qname (recorded) — category `net_high`.
 
 **How to test.** Look up a name over 60 characters whose first label is under 25: `dig aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccc.example.com`. `deploy/lab/dns-sensor/dns-sensor-check.sh` does it, and the name sent in pieces, with its own sender.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_004_records_a_long_qname`, `agent/src/decision/rules/net.rs::net_004_logs_a_partial_name`, `deploy/lab/dns-sensor/dns-sensor-check.sh::NN-L-NET-004_SuspiciousDnsQname`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_004_records_a_long_qname`, `crates/nn-core/src/decision/rules/net.rs::net_004_logs_a_partial_name`, `deploy/lab/dns-sensor/dns-sensor-check.sh::NN-L-NET-004_SuspiciousDnsQname`
 
 **ATT&CK note.** Length alone is the shape of a DNS tunnel (T1071.004), not proof of one; the encoded label is NN-L-NET-014's.
 
@@ -1299,7 +1299,7 @@ DNS TXT/NULL burst (tunnelling shape) — category `net_high`.
 
 **How to test.** Send 60 TXT lookups from one process: `for i in $(seq 60); do echo "nn$i.example.com TXT"; done > /tmp/q; dig -f /tmp/q +short +tries=1 +time=1`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_005_fires_on_txt_burst_over_threshold`, `agent/src/decision/rules/net.rs::fp3_005_skips_forwarded_leg_but_fires_on_originator`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_005_fires_on_txt_burst_over_threshold`, `crates/nn-core/src/decision/rules/net.rs::fp3_005_skips_forwarded_leg_but_fires_on_originator`
 
 ### NN-L-NET-006_UncommonListener
 
@@ -1319,7 +1319,7 @@ New listener on uncommon port — category `net_medium`.
 
 **How to test.** Listen on loopback on an uncommon port from `python3`: `python3 -m http.server 18080 --bind 127.0.0.1`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_006_fires_on_uncommon_port_non_allowlist_comm`, `agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_006_fires_on_uncommon_port_non_allowlist_comm`, `agent/tests/net_privileged_e2e.rs::net_listener_on_uncommon_port_records_event`
 
 **ATT&CK note.** A bind shell or a backdoor listener has no ATT&CK technique of its own; mapped to T1571 as the code names it. The protocol served on the port is not seen.
 
@@ -1341,7 +1341,7 @@ Outbound to RFC1918 from non-allowlist process — category `net_medium`.
 
 **How to test.** From `python3`, connect to a port an RFC 1918 host on the lab network serves (not 445, 3389, 5985 or 5900): `python3 -c 'import socket; socket.create_connection(("<internal peer>", 8000), timeout=3)'`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_007_fires_on_rfc1918_non_allowlist`, `agent/src/decision/rules/net.rs::net_007_fires_on_link_local`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_007_fires_on_rfc1918_non_allowlist`, `crates/nn-core/src/decision/rules/net.rs::net_007_fires_on_link_local`
 
 **ATT&CK note.** Evidence of internal reach, not of a protocol: a remote service (T1021) or a scan of internal services (T1046) draw it alike; the rule sees one flow at a time and does not tell them apart.
 
@@ -1363,7 +1363,7 @@ Outbound from a staging-directory exec to non-resolver — category `net_high`.
 
 **How to test.** In detect-only (R001 would kill the exec first), run a copy of `python3` from `/tmp` that connects more than 5 minutes after its exec, when the chain precursor is gone: `cp /usr/bin/python3 /tmp/nn-py; /tmp/nn-py -c 'import socket,time; time.sleep(330); socket.create_connection(("<peer>", 80))'`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_008_fires_on_tmp_exec_outbound`, `agent/src/decision/rules/net.rs::net_008_covers_every_staging_directory`, `agent/src/decision/rules/net.rs::net_008_spares_a_package_transaction`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_008_fires_on_tmp_exec_outbound`, `crates/nn-core/src/decision/rules/net.rs::net_008_covers_every_staging_directory`, `crates/nn-core/src/decision/rules/net.rs::net_008_spares_a_package_transaction`
 
 **ATT&CK note.** A staged payload calling out is mapped to its likeliest purpose, fetching the next stage (T1105); the flow's protocol is not seen, and a staged payload's C2 channel draws the rule as well.
 
@@ -1385,7 +1385,7 @@ Flow byte-count anomaly (possible exfiltration) — category `net_high`.
 
 **How to test.** Send 120 MiB from `python3` to a listener on the lab host (`nc -l 9000 > /dev/null` there): `python3 -c 'import socket; s = socket.create_connection(("<peer>", 9000)); s.sendall(bytes(120 << 20))'`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_009_fires_on_large_flow_from_non_allowlist`, `agent/src/decision/rules/net.rs::net_009_sums_udp_rows_per_destination`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_009_fires_on_large_flow_from_non_allowlist`, `crates/nn-core/src/decision/rules/net.rs::net_009_sums_udp_rows_per_destination`
 
 **ATT&CK note.** Volume only: whether the channel is the C2 channel (T1041) or another protocol (T1048) is not seen, so both are named.
 
@@ -1407,7 +1407,7 @@ Outbound to high-risk C2 port — category `net_high`.
 
 **How to test.** With a listener on port 4444 of the lab host, connect from `python3`: `python3 -c 'import socket; socket.create_connection(("<peer>", 4444), timeout=3)'`. The process is killed.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_010_fires_on_c2_port_non_allowlist`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::net_outbound_high_risk_c2_port_trips_net_010`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_010_fires_on_c2_port_non_allowlist`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::net_outbound_high_risk_c2_port_trips_net_010`
 
 **ATT&CK note.** 4444 and 6667/6697 are C2 on a non-standard port (T1571); 1080 SOCKS and 9001 Tor are proxies (T1090; 9001 is the multi-hop T1090.003).
 
@@ -1429,7 +1429,7 @@ Plaintext-credential service flow (FTP/Telnet) — category `net_medium`.
 
 **How to test.** With a listener on port 21 of the lab host, connect from `python3`: `python3 -c 'import socket; socket.create_connection(("<peer>", 21), timeout=3)'`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_011_fires_on_plaintext_port_non_allowlist`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_011_fires_on_plaintext_port_non_allowlist`
 
 **ATT&CK note.** The rule's concern is credentials in clear, which ATT&CK does not name as a host behaviour. FTP is mapped as an application-layer C2 protocol (T1071.002), Telnet as a remote service (T1021, which has no Telnet sub-technique); FTP used for exfiltration (T1048.003) is not told apart.
 
@@ -1451,7 +1451,7 @@ Periodic outbound beacon (low jitter) — category `net_high`.
 
 **How to test.** From one process, connect to the same address every 5 seconds: `python3 -c 'import socket, time; [(socket.create_connection(("<peer>", 80)).close(), time.sleep(5)) for _ in range(6)]'`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_013_fires_on_low_jitter_periodic_flow`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_013_fires_on_low_jitter_periodic_flow`
 
 **ATT&CK note.** The timing is the signal: a C2 beacon over an application protocol (T1071) or a scheduled transfer (T1029).
 
@@ -1473,7 +1473,7 @@ DNS qname high-entropy label (tunnelling) — category `net_high`.
 
 **How to test.** Look up 8 random base32 labels under one parent from one process: `for i in $(seq 8); do echo "$(head -c 20 /dev/urandom | base32 | tr -d = | tr A-Z a-z).nn-tunnel.example.com"; done > /tmp/q; dig -f /tmp/q +short`. `dig` is killed; one label alone is recorded.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_014_kills_a_tunnel_of_distinct_labels_under_one_parent`, `agent/src/decision/rules/net.rs::net_014_records_a_single_high_entropy_label`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_014_kills_a_tunnel_of_distinct_labels_under_one_parent`, `crates/nn-core/src/decision/rules/net.rs::net_014_records_a_single_high_entropy_label`
 
 **ATT&CK note.** DNS tunnelling carries C2 or exfiltrated data alike; the rule cannot tell them apart and is mapped to the DNS channel (T1071.004) only.
 
@@ -1495,7 +1495,7 @@ RFC1918 outbound on lateral-movement port — category `net_high`.
 
 **How to test.** With a listener on port 445 of an RFC 1918 lab host, connect from `python3`: `python3 -c 'import socket; socket.create_connection(("<internal peer>", 445), timeout=3)'`. The process is killed.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_018_fires_on_rfc1918_lateral_port_non_allowlist`, `agent/src/decision/rules/net.rs::net_018_fires_on_ula_lateral_port`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_018_fires_on_rfc1918_lateral_port_non_allowlist`, `crates/nn-core/src/decision/rules/net.rs::net_018_fires_on_ula_lateral_port`
 
 **ATT&CK note.** One sub-technique per watched port; the port, not the protocol spoken on it, is what the rule sees.
 
@@ -1517,7 +1517,7 @@ Wildcard-bind listener on uncommon port — category `net_medium`.
 
 **How to test.** Listen on all addresses on an uncommon port: `python3 -m http.server 18080`.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_019_fires_on_wildcard_uncommon_port_non_allowlist`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::net_wildcard_listener_trips_net_019`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_019_fires_on_wildcard_uncommon_port_non_allowlist`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::net_wildcard_listener_trips_net_019`
 
 **ATT&CK note.** As NN-L-NET-006: a backdoor listener has no technique of its own; T1571 as the code names it.
 
@@ -1539,7 +1539,7 @@ DNS queries beyond the kernel's DNS budget — category `net_high`.
 
 **How to test.** Send 3,000 queries from one process as fast as it can: `python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); q = bytes.fromhex("123401000001000000000000076578616d706c6503636f6d0000010001"); [s.sendto(q, ("127.0.0.53", 53)) for _ in range(3000)]'` (a query for `example.com`).
 
-**Tests.** `agent/src/decision/rules/net.rs::net_020_sums_held_queries_per_process_and_window`, `agent/src/decision/rules/net.rs::net_020_user_budget_is_summed_per_user`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_020_sums_held_queries_per_process_and_window`, `crates/nn-core/src/decision/rules/net.rs::net_020_user_budget_is_summed_per_user`
 
 **ATT&CK note.** The queries held back were not judged: the rule reports the volume a DNS tunnel (T1071.004) could hide in, not their content.
 
@@ -1561,7 +1561,7 @@ listen() or io_uring_setup() calls beyond the kernel's record budget — categor
 
 **How to test.** Open and close 2,000 listeners from one process: `python3 -c 'import socket; [socket.create_server(("127.0.0.1", 0)).close() for _ in range(2000)]'`. The listeners recorded within the budget also draw NN-L-NET-006.
 
-**Tests.** `agent/src/decision/rules/net.rs::net_021_names_the_listen_flooder_once_per_window`, `agent/src/decision/rules/net.rs::net_021_sums_per_sensor_and_user`
+**Tests.** `crates/nn-core/src/decision/rules/net.rs::net_021_names_the_listen_flooder_once_per_window`, `crates/nn-core/src/decision/rules/net.rs::net_021_sums_per_sensor_and_user`
 
 **ATT&CK note.** The code named T1562.006 Indicator Blocking, revoked in v19, until lab PR 221; its replacement T1685 Disable or Modify Tools (Defense Impairment) covers blocking the telemetry a sensor collects.
 
@@ -1583,7 +1583,7 @@ Outbound connects to many hosts or ports (scan fan-out) — category `net_high`.
 
 **How to test.** `net-check.sh --only MS21`: a sweep of a loopback /24 from one process, a port scan of one host.
 
-**Tests.** `agent/src/decision/rules/net_fanout.rs::a_sweep_is_recorded_then_killed_at_the_kill_threshold`, `agent/src/decision/rules/net_fanout.rs::a_port_scan_of_one_host_is_recorded_on_the_pairs`, `deploy/lab/malsim/net-check.sh::MS21`
+**Tests.** `crates/nn-core/src/decision/rules/net_fanout.rs::a_sweep_is_recorded_then_killed_at_the_kill_threshold`, `crates/nn-core/src/decision/rules/net_fanout.rs::a_port_scan_of_one_host_is_recorded_on_the_pairs`, `deploy/lab/malsim/net-check.sh::MS21`
 
 ### NN-L-NET-027_OutboundAuthBruteforce
 
@@ -1603,7 +1603,7 @@ Repeated outbound connects to authentication services (brute force) — category
 
 **How to test.** `net-check.sh --only MS21`: repeated connects to a loopback SSH port.
 
-**Tests.** `agent/src/decision/rules/net_fanout.rs::repeated_ssh_connects_are_a_brute_force`, `deploy/lab/malsim/net-check.sh::MS21`
+**Tests.** `crates/nn-core/src/decision/rules/net_fanout.rs::repeated_ssh_connects_are_a_brute_force`, `deploy/lab/malsim/net-check.sh::MS21`
 
 **ATT&CK note.** Outbound only: the connects are counted, not the credentials tried.
 
@@ -1653,7 +1653,7 @@ Canary file access — category `canary_deception`.
 
 **How to test.** Deploy a File canary (`nn-admin canary deploy --name t --key <key> file --path /root/aws_keys_old.txt`) and `cat` it from a shell: the shell's tree is killed, the posture goes to COMBAT.
 
-**Tests.** `agent/src/decision/rules/canary.rs::canary001_fires_on_file_canary_file_open`, `agent/src/decision/rules/canary.rs::a_reader_of_whole_trees_is_recorded_not_killed`, `agent/tests/canary_privileged_e2e.rs::file_canary_open_triggers_canary_tripped_event_and_combat`
+**Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary001_fires_on_file_canary_file_open`, `crates/nn-core/src/decision/rules/canary.rs::a_reader_of_whole_trees_is_recorded_not_killed`, `agent/tests/canary_privileged_e2e.rs::file_canary_open_triggers_canary_tripped_event_and_combat`
 
 **ATT&CK note.** The technique is what the intruder did: read a file found on the host (T1005). A decoy named for credentials is NN-L-CANARY-004's (T1552.001).
 
@@ -1675,7 +1675,7 @@ Canary process executed — category `canary_deception`.
 
 **How to test.** Deploy a Process canary (`nn-admin canary deploy --name t --key <key> process --path /usr/local/bin/sysadmin-helper --fake-arg0 helper`) and run it: the caller's tree is killed.
 
-**Tests.** `agent/src/decision/rules/canary.rs::canary002_fires_on_process_canary_exec`, `agent/tests/canary_privileged_e2e.rs::process_canary_exec_triggers_canary_tripped_event_and_combat`
+**Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary002_fires_on_process_canary_exec`, `agent/tests/canary_privileged_e2e.rs::process_canary_exec_triggers_canary_tripped_event_and_combat`
 
 **ATT&CK note.** Weak mapping: no ATT&CK technique names running a decoy. The decoy is found by enumerating a binary directory (T1083, design appendix B: `ls /usr/local/bin` then exec something interesting); the exec itself is what the rule sees.
 
@@ -1697,7 +1697,7 @@ Canary network connect — category `canary_deception`.
 
 **How to test.** Deploy a Network canary (`nn-admin canary deploy --name t --key <key> network --bind-addr 127.0.0.1 --bind-port 4444`) and connect to it from a shell (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'`).
 
-**Tests.** `agent/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect`, `agent/src/canary/detector.rs::a_network_canary_trip_draws_canary_003_on_the_connector`, `agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector`
+**Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary003_fires_on_network_canary_connect`, `agent/src/canary/detector.rs::a_network_canary_trip_draws_canary_003_on_the_connector`, `agent/tests/canary_privileged_e2e.rs::network_canary_connect_trips_canary_003_and_kills_the_connector`
 
 **ATT&CK note.** A port scan of the host finds the decoy (T1046); a decoy destination planted in a configuration file, a hosts entry or an ssh config is a remote service the intruder tries to reach (T1021).
 
@@ -1719,7 +1719,7 @@ Canary credential read — category `canary_deception`.
 
 **How to test.** Deploy a Credential canary (`nn-admin canary deploy --name t --key <key> credential --path /root/.aws/credentials.bak --cred-family aws`) and `grep -r AKIA /root` from a shell.
 
-**Tests.** `agent/src/decision/rules/canary.rs::canary004_fires_on_credential_canary_read`, `agent/src/decision/rules/canary.rs::a_later_access_to_a_tripped_canary_is_recorded_not_killed`
+**Tests.** `crates/nn-core/src/decision/rules/canary.rs::canary004_fires_on_credential_canary_read`, `crates/nn-core/src/decision/rules/canary.rs::a_later_access_to_a_tripped_canary_is_recorded_not_killed`
 
 ### NN-L-CHAIN-001_CredReadThenEgress
 
@@ -1739,7 +1739,7 @@ Credential-store access followed by network egress — category `chain_exfiltrat
 
 **How to test.** With a browser credential file (`Login Data`) in the FIM watch list, one process reads it and connects out (loopback counts); run the agent in detect-only mode, since NN-L-FIM-015 acts on the read first.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain001_fires_on_cred_read_then_egress`, `agent/src/decision/rules/chain.rs::an_aged_read_is_recorded_once`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain001_fires_on_cred_read_then_egress`, `crates/nn-core/src/decision/rules/chain.rs::an_aged_read_is_recorded_once`
 
 **ATT&CK note.** The credential stores of the precursor are those of NN-L-FIM-015, -016 and -017 (T1555.003, T1555.005, T1552.004); the egress is read as exfiltration over the process's own channel (T1041).
 
@@ -1761,7 +1761,7 @@ Credential-store access followed by network egress — category `chain_exfiltrat
 
 **How to test.** Run from /tmp a helper that connects out as its first act (the e2e compiles one, which wins the race against R001's kill), or run the agent in detect-only mode and `cp /usr/bin/curl /tmp/c && /tmp/c http://127.0.0.1:8080/`.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress`, `agent/src/decision/rules/chain.rs::chain002_completes_when_the_exec_is_processed_after_the_egress`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain002_fires_on_tmp_exec_then_nondns_egress`, `crates/nn-core/src/decision/rules/chain.rs::chain002_completes_when_the_exec_is_processed_after_the_egress`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_exec_then_egress_trips_chain_002`
 
 **ATT&CK note.** T1059 and T1571 as the design and the V2 technique rows (TQ18, TQ55) have them. The image need not be an interpreter, and the trigger is any port but 53, so a payload calling home on 443 (T1071) fires it too, which the mapping does not claim.
 
@@ -1783,7 +1783,7 @@ Canary trip followed by network egress — category `chain_exfiltration`.
 
 **How to test.** Deploy a File canary, then from one process read it and connect out (`python3 -c` opening the decoy, then a socket); run the agent in detect-only mode, since NN-L-CANARY-001 kills the reader first.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress`, `agent/src/decision/rules/chain.rs::chain003_records_an_aged_trip_without_killing`, `agent/src/canary/detector.rs::the_trips_own_connection_draws_no_chain_verdict_in_any_order`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress`, `crates/nn-core/src/decision/rules/chain.rs::chain003_records_an_aged_trip_without_killing`, `agent/src/canary/detector.rs::the_trips_own_connection_draws_no_chain_verdict_in_any_order`
 
 **ATT&CK note.** The precursor's technique depends on the canary type (see NN-L-CANARY-001..004); the chain itself is evidence of exfiltration.
 
@@ -1805,7 +1805,7 @@ Ancestor credential read followed by descendant egress — category `chain_exfil
 
 **How to test.** A parent reads a FIM-watched `Login Data` file (NN-L-FIM-015 kills the parent only) after forking a child that connects out afterwards; the e2e does exactly this.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain004_cross_pid_cred_exfil_fires`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_cred_read_parent_then_descendant_egress_trips_chain_004`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain004_cross_pid_cred_exfil_fires`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_cred_read_parent_then_descendant_egress_trips_chain_004`
 
 **ATT&CK note.** As NN-L-CHAIN-001.
 
@@ -1827,7 +1827,7 @@ Ancestor /tmp exec followed by descendant egress — category `chain_c2`.
 
 **How to test.** A program run from /tmp forks a child that connects out to a port other than 53; the e2e builds one.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain005_cross_pid_tmp_c2_fires`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_parent_then_descendant_egress_trips_chain_005`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain005_cross_pid_tmp_c2_fires`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_tmp_parent_then_descendant_egress_trips_chain_005`
 
 **ATT&CK note.** As NN-L-CHAIN-002.
 
@@ -1849,7 +1849,7 @@ Ancestor canary trip followed by descendant egress — category `chain_exfiltrat
 
 **How to test.** A process forks a daemonised grandchild, then trips a File canary; the grandchild connects out afterwards (the e2e's recipe).
 
-**Tests.** `agent/src/decision/rules/chain.rs::cross_pid_chains_grade_by_age`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_canary_trip_parent_then_descendant_egress_trips_chain_006`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::cross_pid_chains_grade_by_age`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_canary_trip_parent_then_descendant_egress_trips_chain_006`
 
 **ATT&CK note.** As NN-L-CHAIN-003.
 
@@ -1871,7 +1871,7 @@ Ancestor canary trip followed by descendant egress — category `chain_exfiltrat
 
 **How to test.** In detect-only mode, a binary run from /tmp reads a FIM-watched `Login Data` file and connects out (the e2e is ignored as flaky, T10.6.2: the same-PID kills race).
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain007_three_step_sequence_fires`, `agent/src/decision/rules/chain.rs::chain007_completes_when_the_read_is_processed_after_the_egress`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain007_three_step_sequence_fires`, `crates/nn-core/src/decision/rules/chain.rs::chain007_completes_when_the_read_is_processed_after_the_egress`
 
 **ATT&CK note.** The steps of NN-L-CHAIN-002 (T1059) and NN-L-CHAIN-001 (T1555.003, T1555.005, T1552.004, T1041).
 
@@ -1893,7 +1893,7 @@ Ancestor sudo/su privesc followed by descendant egress — category `chain_exfil
 
 **How to test.** `sudo curl -s http://example.org/ >/dev/null` from a login shell.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain008_cross_pid_privesc_exfil_fires`, `agent/src/decision/rules/chain.rs::chain008_is_informational_log_not_kill`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_privesc_then_descendant_egress_trips_chain_008`
+**Tests.** `crates/nn-core/src/decision/rules/chain.rs::chain008_cross_pid_privesc_exfil_fires`, `crates/nn-core/src/decision/rules/chain.rs::chain008_is_informational_log_not_kill`, `agent/tests/detection_rules_at_scale_privileged_e2e.rs::chain_privesc_then_descendant_egress_trips_chain_008`
 
 **ATT&CK note.** T1548, not T1548.003 (Sudo and Sudo Caching): `su` is a precursor too. The precursor is any use of sudo or su, not an abuse of it.
 
@@ -1915,7 +1915,7 @@ io_uring ring created by an unlisted process — category `defense_evasion`.
 
 **How to test.** anti-tamper.sh case C22 builds a probe that opens and reads /etc/hostname and connects to 127.0.0.1:9 through one ring (`kernel.io_uring_disabled` must be 0).
 
-**Tests.** `agent/src/decision/rules/iouring.rs::ring_creation_logs_unlisted_and_exempts_known_and_allowlisted`, `deploy/lab/adversarial/anti-tamper.sh::case C22`
+**Tests.** `crates/nn-core/src/decision/rules/iouring.rs::ring_creation_logs_unlisted_and_exempts_known_and_allowlisted`, `deploy/lab/adversarial/anti-tamper.sh::case C22`
 
 **ATT&CK note.** The reasoning text named T1562 (Impair Defenses), revoked in ATT&CK v19, until lab PR 221 (its successor T1685 is disabling or tampering with a tool, which a ring does not do). io_uring does I/O outside the syscalls the open, exec and connect sensors hook: calling a kernel interface directly to sidestep hooked APIs is T1106.
 
@@ -1937,7 +1937,7 @@ io_uring file and network I/O from the same unlisted process — category `defen
 
 **How to test.** anti-tamper.sh case C22 (the same probe as NN-L-IOU-001: openat, read and connect through one ring).
 
-**Tests.** `agent/src/decision/rules/iouring.rs::file_and_network_fires_once_on_the_completing_record`, `deploy/lab/adversarial/anti-tamper.sh::case C22`
+**Tests.** `crates/nn-core/src/decision/rules/iouring.rs::file_and_network_fires_once_on_the_completing_record`, `deploy/lab/adversarial/anti-tamper.sh::case C22`
 
 **ATT&CK note.** As NN-L-IOU-001 (T1106). The file-and-network pairing is the shape of an implant's collection and exfiltration (T1005, T1041), whose content the rule does not see; those are not claimed.
 
@@ -1959,7 +1959,7 @@ BPF program loaded or attached by an unlisted process — category `defense_evas
 
 **How to test.** `bpftool feature probe kernel` loads test programs (anti-tamper.sh case C10).
 
-**Tests.** `agent/src/decision/rules/bpf.rs::program_load_by_unlisted_logs_medium_and_known_tooling_is_exempt`, `deploy/lab/adversarial/anti-tamper.sh::case C10`
+**Tests.** `crates/nn-core/src/decision/rules/bpf.rs::program_load_by_unlisted_logs_medium_and_known_tooling_is_exempt`, `deploy/lab/adversarial/anti-tamper.sh::case C10`
 
 **ATT&CK note.** A kernel-resident program from an unknown loader is the eBPF rootkit shape (T1014). The reasoning text also named T1562, revoked in v19, until lab PR 221; a program that blinds a sensor would be T1685, which a load alone does not show.
 
@@ -1981,7 +1981,7 @@ Handle to the agent's BPF objects, or a program/link detach, by an unlisted proc
 
 **How to test.** `bpftool map update pinned <pins>/PROTECTED_PIDS key 1 0 0 0 value 1` (anti-tamper.sh case C08) or `bpftool link show pinned` (C09): observe mode records this rule, enforce mode denies the handle (NN-L-AT-001).
 
-**Tests.** `agent/src/decision/rules/bpf.rs::own_object_handle_is_high_even_for_known_tooling`, `deploy/lab/adversarial/anti-tamper.sh::case C08`
+**Tests.** `crates/nn-core/src/decision/rules/bpf.rs::own_object_handle_is_high_even_for_known_tooling`, `deploy/lab/adversarial/anti-tamper.sh::case C08`
 
 ### NN-L-AT-001_AntiTamperDenial
 
@@ -2001,7 +2001,7 @@ Attempt on the agent refused by an anti-tamper hook — category `anti_tamper`.
 
 **How to test.** `kill -9` the agent from a root shell (anti-tamper.sh case C01) or read /proc/&lt;agent&gt;/mem (case C03): the record names the refused operation (deny=signal, deny=ptrace).
 
-**Tests.** `agent/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict`, `deploy/lab/adversarial/anti-tamper.sh::case C01`, `deploy/lab/adversarial/anti-tamper.sh::case C03`
+**Tests.** `crates/nn-core/src/decision/rules/anti_tamper.rs::every_denial_kind_is_a_high_log_verdict`, `deploy/lab/adversarial/anti-tamper.sh::case C01`, `deploy/lab/adversarial/anti-tamper.sh::case C03`
 
 **ATT&CK note.** Killing, stopping or rewriting the sensor is T1685. A ptrace or /proc/&lt;pid&gt;/mem access on the agent is the injection attempt the V2 rows TQ13 and TQ15 expect denied (T1055.008, T1055.009); a read of the signing key is T1552.004.
 
@@ -2023,7 +2023,7 @@ Credentials gained without a legitimate kernel transition — category `privileg
 
 **How to test.** On a debug build, `epg-check.sh inject capable detect` (lite) or `inject getppid detect` (strict; the agent refuses strict below Linux 6.1): the injected anomaly is recorded, the record naming the probe (comm nn-epg-probe) and, in its response, the point that caught it (the journal's VERDICT line says LAB INJECTION); `negative` runs the legitimate transitions and expects no record.
 
-**Tests.** `agent/src/decision/rules/epg.rs::credential_write_in_detect_mode_is_a_critical_log`, `agent/src/decision/rules/epg.rs::enforce_kill_is_recorded_as_a_kernel_kill`, `agent/src/decision/rules/epg.rs::a_lost_baseline_is_degraded_evidence`, `deploy/lab/epg/epg-check.sh::inject`
+**Tests.** `crates/nn-core/src/decision/rules/epg.rs::credential_write_in_detect_mode_is_a_critical_log`, `crates/nn-core/src/decision/rules/epg.rs::enforce_kill_is_recorded_as_a_kernel_kill`, `crates/nn-core/src/decision/rules/epg.rs::a_lost_baseline_is_degraded_evidence`, `deploy/lab/epg/epg-check.sh::inject`
 
 **ATT&CK note.** Exploitation for Privilege Escalation (T1068) by its result: the rule sees the credentials an exploit leaves, not the exploit.
 
@@ -2045,7 +2045,7 @@ Namespaces or root left without a legitimate kernel transition — category `esc
 
 **How to test.** As NN-L-EPG-001 (`epg-check.sh negative`; the injection exercises the record path of both rules).
 
-**Tests.** `agent/src/decision/rules/epg.rs::namespace_escape_is_epg_002`, `deploy/lab/epg/epg-check.sh::negative`
+**Tests.** `crates/nn-core/src/decision/rules/epg.rs::namespace_escape_is_epg_002`, `deploy/lab/epg/epg-check.sh::negative`
 
 **ATT&CK note.** Escape to Host (T1611) by its result; a credential gain in the same call is NN-L-EPG-001's.
 
@@ -2067,7 +2067,7 @@ Security tool's service stopped, disabled or masked — category `defense_impair
 
 **How to test.** `ransom-check.sh` MS-25: `systemctl stop auditd` (auditd installed).
 
-**Tests.** `agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `agent/src/decision/rules/evasion.rs::eva_kills_a_staged_script_that_asks`, `agent/src/decision/rules/evasion.rs::eva_001_inside_the_installer_window_is_low_for_the_agents_own_units_only`, `agent/src/impair/tests.rs::a_valid_window_sanctions_a_stop_or_restart_of_the_agents_own_units`, `agent/src/impair/tests.rs::an_expired_window_sanctions_nothing`, `agent/src/impair/tests.rs::a_valid_window_never_sanctions_another_tool`, `deploy/lab/malsim/ransom-check.sh::MS-25`
+**Tests.** `crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `crates/nn-core/src/decision/rules/evasion.rs::eva_kills_a_staged_script_that_asks`, `agent/src/decision/host_tests.rs::eva_001_inside_the_installer_window_is_low_for_the_agents_own_units_only`, `agent/src/impair/host_tests.rs::a_valid_window_sanctions_a_stop_or_restart_of_the_agents_own_units`, `agent/src/impair/host_tests.rs::an_expired_window_sanctions_nothing`, `agent/src/impair/host_tests.rs::a_valid_window_never_sanctions_another_tool`, `deploy/lab/malsim/ransom-check.sh::MS-25`
 
 **ATT&CK note.** T1685 for a tool, T1685.004 for the audit system, T1686 for the firewall; the record's reasoning names the one of its tool.
 
@@ -2089,7 +2089,7 @@ Security tool switched off by its own command — category `defense_impairment`.
 
 **How to test.** `ransom-check.sh` MS-25: `auditctl -e 0`, `ufw disable`.
 
-**Tests.** `agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `agent/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable`, `crates/nn-core/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget`, `deploy/lab/malsim/ransom-check.sh::MS-25`
+**Tests.** `crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `crates/nn-core/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable`, `crates/nn-core/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget`, `deploy/lab/malsim/ransom-check.sh::MS-25`
 
 **ATT&CK note.** As NN-L-EVA-001.
 
@@ -2111,7 +2111,7 @@ Security tool's process killed or stopped — category `defense_impairment`.
 
 **How to test.** `ransom-check.sh` MS-25: `kill -STOP` of auditd from a shell.
 
-**Tests.** `agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `agent/src/impair/tests.rs::a_forking_daemons_own_pid_is_registered_after_its_exec`, `deploy/lab/malsim/ransom-check.sh::kill -STOP of auditd`
+**Tests.** `crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `crates/nn-core/src/impair/tests.rs::a_forking_daemons_own_pid_is_registered_after_its_exec`, `deploy/lab/malsim/ransom-check.sh::kill -STOP of auditd`
 
 **ATT&CK note.** As NN-L-EVA-001.
 
@@ -2133,6 +2133,6 @@ Security tool's configuration changed — category `defense_impairment`.
 
 **How to test.** `ransom-check.sh` MS-25: an edit of auditd's configuration.
 
-**Tests.** `agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `deploy/lab/malsim/ransom-check.sh::MS-25`
+**Tests.** `crates/nn-core/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `deploy/lab/malsim/ransom-check.sh::MS-25`
 
 **ATT&CK note.** As NN-L-EVA-001.

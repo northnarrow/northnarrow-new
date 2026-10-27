@@ -1238,7 +1238,7 @@ mod tests {
         let trip = detector
             .process_event(&connect_to("127.0.0.1", 31337, 4242, 5_000))
             .expect("a trip");
-        let v = NnLCanary003NetworkConnect::default()
+        let v = NnLCanary003NetworkConnect::<crate::chain_host_linux::LinuxHost>::default()
             .evaluate(&trip)
             .expect("NN-L-CANARY-003 fires");
         assert_eq!(v.rule_id, "NN-L-CANARY-003_NetworkConnect");
