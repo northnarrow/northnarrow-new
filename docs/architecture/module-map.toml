@@ -149,7 +149,6 @@ planned = false
 "anti_tamper" = "nn-linux"
 # the role parse and the UnlockToken verification; key loading stays Linux
 "anti_tamper::admin_auth" = "nn-proto"
-"anti_tamper::combat_allow" = "nn-core"
 "async_fd" = "nn-linux"
 "atomic_file" = "nn-linux"
 # post-plan (lab PR 241, R04a): the audit log's writability before the
@@ -271,14 +270,18 @@ planned = false
 # post-plan (lab only): `--verifier-check`
 "verifier_check" = "nn-linux"
 
-# ── agent/src: the shims of R05 ───────────────────────────────────────
+# ── agent/src: the shims of R05 and R07 ───────────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
 # their paths, without a file, in `lib.rs` and `canary/mod.rs` (plan §4.1
 # rule 2: `pub use nn_evidence::…`; the writers' aliases with the agent's
 # key as default and the key's names under `audit`; removed in R17). A
-# reference to one counts for nn-evidence.
+# reference to one counts for nn-evidence. R07 (lab PR 247): content
+# modules moved to nn-core, their paths kept the same way in their
+# parent's `mod.rs`; a reference to one counts for nn-core.
 
 [shims.agent]
+# R07 (lab PR 247): the COMBAT carve-out
+"anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"
 # post-plan (lab PR 178): the one reader of the canary chains' lines
 "canary::chain_lines" = "nn-evidence"

@@ -17,3 +17,10 @@
 /// What the content lists need from their host: an open that follows no
 /// final symlink and blocks on no FIFO.
 pub mod content_host;
+
+/// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
+/// carve-out (was the agent's `anti_tamper::combat_allow`).
+pub mod anti_tamper {
+    /// The CIDRs COMBAT's isolation spares (`combat-allow.cidrs`).
+    pub mod combat_allow;
+}

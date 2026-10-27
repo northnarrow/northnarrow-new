@@ -42,7 +42,9 @@ pub mod bpf_defense;
 /// BUG-036: boot-time revalidation of the compiled-in kernel struct
 /// offsets against the running kernel's BTF (refuse-to-start on drift).
 pub mod btf_revalidate;
-pub mod combat_allow;
+/// R07 shim (lab PR 247; plan §4.1 rule 2, removed in R17): the COMBAT
+/// carve-out's list is nn-core's.
+pub use nn_core::anti_tamper::combat_allow;
 /// Lab PR 215: the deny hooks' fail-open counters (`DENY_FAIL_OPEN`).
 pub mod fail_open;
 pub mod filesystem;

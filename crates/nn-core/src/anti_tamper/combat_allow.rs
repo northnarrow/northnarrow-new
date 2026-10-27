@@ -3,11 +3,11 @@
 //! By default COMBAT drops every non-loopback packet, which can lock a
 //! remote operator out of a host that escalated while they had no local
 //! console. This module loads an OPT-IN list of management CIDRs from
-//! `/etc/northnarrow/combat-allow.cidrs` that [`engage`] splices into
+//! `/etc/northnarrow/combat-allow.cidrs` that `engage` splices into
 //! the ruleset as `ACCEPT` rules *ahead of* the catch-all DROP, so SSH
 //! / management traffic to and from those networks survives isolation.
 //!
-//! [`engage`]: super::network_isolate::NetworkIsolator::engage
+//! (`engage`: the agent's `anti_tamper::network_isolate::NetworkIsolator`.)
 //!
 //! Design rules (operator-confirmed):
 //!
