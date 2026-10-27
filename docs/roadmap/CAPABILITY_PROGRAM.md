@@ -1486,3 +1486,53 @@ only in the table below, in the same PR as the evidence.
     builds `main` and this lot in the same directory. Open: the five
     modules above (R08, R04b/R09a); the shims (R17).
   - Lab: no guest (moves and seams that keep every call; the identity below). Host, on 0e7802b (the lot's code; the commit after it changes documentation only), on 0df3394 (the lot's last commit before `main`'s lab PR 245 was merged in) and on the merge (b4f2467, 3,044 passed with lab PR 245's tests, the posture golden files as lab PR 245 left them): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,028 passed, 0 failed, 15 ignored (the test list is `main`'s: 3,043 names, every one found at the tip — 44 now nn-core's, 9 moved within the agent — and no test added); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` (both replays, golden files unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core`'s `cargo check` of nn-parse, nn-model, nn-proto, nn-evidence and nn-core (now code) for the five targets; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; no lockfile changed by the build): all pass. The pins pass unchanged: `encoded_frames_are_pinned`, `chain_format_pin`, `crypto_vectors`, the TLS and DNS parser pins, and the overlay-v1 fixture of lab PR 230 (`an_overlay_signed_before_the_bump_is_accepted`, `the_stored_overlay_signature_is_pinned`). Identity against `main` 9de1923, both built in one temporary checkout (same path), the release job's commands (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`; unstripped: the same flags, `CARGO_PROFILE_RELEASE_STRIP=none`): the eBPF object is byte-identical (sha256 42afd5b6… there; a clean rebuild of `main`'s, `agent-ebpf/target` removed, gives the same bytes), its stamp too (source c0365736…, `main`'s: `common` and the eBPF crates are untouched); the scanner (401,368 bytes) and the watchdog (2,336,920) are byte-identical, stripped and unstripped; `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes, the agent's and nn-admin's sizes, `CHANGELOG.md` and the two documents whose path mentions changed (`COMBAT_RECOVERY.md`, `install.sh`'s comment) aside. The agent (14,863,200 → 14,876,736 bytes) and nn-admin (4,022,024 → 4,029,320) are not byte-identical. Function by function (unstripped, names mapped to the new crates and modules, the host type parameter dropped, addresses and rip-relative targets dropped, trailing padding dropped): the agent 7,555 of 7,614 the same code (53 differ, 6 and 26 unpaired), nn-admin 3,441 of 3,463 (19; 3 and 20). Control — `main` with the agent depending on nn-core and nn-core on its new dependencies, no source moved: 14 of the agent's and 6 of nn-admin's change already (clap's `TypeId`s of the agent's enums: the agent crate's identity moves with its dependency list; which of identical bodies keeps its name). From the control to this lot: 41 of the agent's (19 only call a body LLVM folded under another name, the shared `RawVec::grow_one` among them; 22 differ in inlining at the new crate boundary, register allocation and stack frames, and an argument constant propagated into a callee: the moved loaders and parsers, their callers — the gate, the network isolator, the canary deploy, the COW and rule-policy boots —, nn-evidence's writers over the agent's key) and 13 of nn-admin's; the unpaired are generic code made a second time in nn-core (anyhow's message errors, `RawVec` growth, hex and base64 encoding, line iteration: `.text` +10,000 bytes in the agent, +0.14 %, +4,368 in nn-admin) and helpers kept out of line. `.rodata`: every text constant of one build is in the other's but the moved files' paths (panic locations, callsite files) and the callsite line numbers of the moved and edited files; the moved modules' tracing target is `nn_core::…` (not printed: `with_target(false)`).
+- **Lab PR 248 — lab and validation tooling: `nn-lab.sh ssh`'s stdin,
+  the whpx stop, the perf gate's MemTotal.** Tooling only (no capability,
+  no level changes, no product change); Wave 4 Phase 2.
+  - What was wrong: under whpx `vm_running` is an ssh probe (`ssh … true`)
+    and ssh hands its stdin to the remote command, so `nn-lab.sh ssh …
+    bash -s` with the script on stdin (a here-doc, a pipe, `< file`) had
+    it eaten by the probe and ran an empty one, exit 0 (lab PR 245 sent its
+    COMBAT drive as a base64 argument instead); a Windows program run
+    through WSL interop reads the caller's stdin the same way. A whpx guest
+    powered off from inside (the lab host's stop helper: a KVM procedure,
+    its wait on a QEMU pid file and its unit stop do nothing under whpx)
+    took QEMU for Windows down a few seconds later, but its ssh forwarder,
+    a user unit of its own (`nn-fwd-<guest>`) that only `down` stops, kept
+    listening on 127.0.0.1, while `status` said "stopped"; `down` itself
+    said "stopped" without checking (a failed taskkill or `systemctl
+    --user stop`, or no answer from tasklist.exe, went unseen). `cargo
+    xtask perf-compare` compared the host fields for equality, MemTotal
+    included, which moves by a few KiB between boots of one guest
+    (8,131,760 and 8,131,764 KiB): exit 2, "host mismatch", every time.
+  - What changed: the probes (`guest_probe`, the wait for ssh's
+    provisioning check, `trust-host-key`'s strict connection) and every
+    Windows program (`win`) read `/dev/null`; the real session keeps the
+    caller's stdin. Under whpx (the block `whpx-stop`) the QEMU check tells
+    "not running" from "no answer from tasklist.exe"; `down` still powers
+    the guest off from inside, waits for QEMU (forced after two minutes)
+    and stops the forwarder, then checks both and, if either is left, names
+    it and exits 1; `status` says "stopped, but its forwarder … is still
+    active on 127.0.0.1:<port>: `nn-lab.sh down` stops it". The perf gate
+    takes a MemTotal within ±0.1 % of the base's, or ±1 MiB when that is
+    more, for the same host and notes the drift; any other host field, or
+    a larger MemTotal change, is still another host (exit 2 without
+    `--allow-host-mismatch`). Tests: `xtask/tests/lab_host_safety.rs`
+    `nn_lab_ssh_hands_the_callers_stdin_to_the_guest` (the real script
+    under whpx and kvm, an ssh stub with OpenSSH's stdin semantics: a
+    here-doc, a pipe and a file run, the probe reads 0 bytes) and
+    `whpx_down_stops_qemu_and_the_forwarder_and_says_what_is_left` (the
+    block with Windows, systemd and sshd stubs: the helper's leftover
+    state, a running guest, a QEMU that hangs at power-down, and a QEMU,
+    a forwarder, a user session or tasklist.exe that does not answer;
+    nothing reads the caller's stdin); `perf_compare`'s
+    `a_memtotal_drift_between_boots_is_the_same_host` and
+    `a_real_host_change_is_still_another_host` (the bounds either way, the
+    1 MiB floor, CPU model and count, kernel, a 6 GiB guest, a MemTotal
+    not recorded, virtualisation, clocksource); `perf_baseline.rs`
+    `a_memtotal_drift_between_boots_is_the_same_host` (exit 0 with the
+    note, exit 2 for a smaller guest). Each test fails with its fix taken
+    back (the probe's or `win`'s `/dev/null`, `down`'s check, `status`'s
+    forwarder, the MemTotal drift and its bounds). Outside the repository,
+    the lab host's stop helper now ends with `nn-lab.sh down`.
+  - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX, 4 vCPU; no other guest up). Before (`main` 60d9965, the branch's first base, and 8180540 on a second boot): `nn-lab.sh ssh bash -s` with the script in a here-doc, a pipe and `< file` printed nothing, exit 0, each time. The lab host's stop helper as it was (a poweroff from inside, its wait on a QEMU pid file and its unit stop): the guest reached `reboot: Power down`, QEMU for Windows was gone a few seconds later, the forwarder `nn-fwd-ubuntu2204` still active and listening on 127.0.0.1:2522 three and a half minutes later, and `status` said "stopped". After (this branch): in that state `status` names the forwarder ("stopped, but its forwarder nn-fwd-ubuntu2204 is still active on 127.0.0.1:2522 …") and `down` stops it (exit 0, 5 s; then `status` "stopped", no `nn-*` user unit, nothing listening on 2522). On a new boot the three scripts ran (here-doc, pipe and file, each printing the guest's hostname and kernel, exit 0), and a command as an argument as before; the helper, now ending with `nn-lab.sh down`, with this branch's script: exit 0 in 5 s, `status` "stopped", no `nn-*` unit, `tasklist.exe` listing no QEMU, nothing on 2522; on a third boot the same with the helper's default tree (the lab's main checkout, `main` 8180540's `down`): exit 0 in 5 s, nothing left. This branch's `up` (QEMU launched, the forwarder started, the probes with `/dev/null`) booted the guest in 24 s and passed `check`; a piped script ran; `down` on the running guest: exit 0 in 5 s, nothing left. Host, on the lot's commit over `main` 60d9965 and again after its rebase over lab PR 247 (`main` cedf7e1): `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,049 passed, 0 failed, 15 ignored, both times; `bash -n` on `nn-lab.sh` and the helper; shellcheck 0.9.0 (`-x`, warnings): the same two SC2054 on QEMU's comma-separated arguments as on `main`, nothing new (every finding of any severity the same set as on `main`), the helper clean.
