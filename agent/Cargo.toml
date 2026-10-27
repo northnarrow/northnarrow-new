@@ -76,6 +76,11 @@ nn-evidence = { workspace = true }
 # the same modules here; the agent's host implements their
 # `content_host::ContentHost`.
 nn-core = { workspace = true }
+# R09a (lab PR 253): the Linux adapters — the utilities the actuators, the
+# self-defence and the hosts stand on, the actuators, the self-defence, the
+# agent's key and its Linux host — named through the shims of the same
+# modules here.
+nn-linux = { workspace = true }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
 # crate directly without pulling the rest of `agent` —

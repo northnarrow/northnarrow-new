@@ -879,6 +879,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nn-linux"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "libc",
+ "nn-evidence",
+ "nn-model",
+ "nn-proto",
+ "northnarrow-antitamper-bpf",
+ "parking_lot",
+ "rand",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nn-model"
 version = "0.0.1"
 dependencies = [
@@ -931,6 +950,7 @@ dependencies = [
  "nix",
  "nn-core",
  "nn-evidence",
+ "nn-linux",
  "nn-model",
  "nn-parse",
  "nn-proto",

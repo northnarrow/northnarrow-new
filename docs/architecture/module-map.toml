@@ -141,23 +141,14 @@ planned = false
 "bin::nn_admin" = "nn-admin"
 "admin_cli" = "nn-admin"
 "admin_socket" = "northnarrow-agent"
-"agent_id" = "nn-linux"
-# the Linux host's anchor of a log's directory (`/proc/self/fd`), behind
-# `chain_host::ChainHost::anchor`: not moved to nn-evidence with the chains
-# (R05, lab PR 241)
-"anchored" = "nn-linux"
 "anti_tamper" = "nn-linux"
 # the role parse and the UnlockToken verification; key loading stays Linux
 "anti_tamper::admin_auth" = "nn-proto"
-"async_fd" = "nn-linux"
-"atomic_file" = "nn-linux"
 # post-plan (lab PR 241, R04a): the audit log's writability before the
 # attach (`access(2)`), from `audit`
 "audit_preflight" = "nn-linux"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a
 "boot" = "northnarrow-agent"
-# post-plan (lab PR 217): an external command with a deadline
-"bounded_cmd" = "nn-linux"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
 # rule 4)
@@ -274,7 +265,6 @@ planned = false
 # classification to nn-core's `fim::drift`, re-exported by the drain),
 # baseline, honeypot, recompute; the rules: `[shims.agent]` (R08b)
 "fim" = "nn-linux"
-"fs_type" = "nn-linux"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
 "host_hardening" = "nn-linux"
@@ -312,8 +302,6 @@ planned = false
 "net::drain" = "nn-linux"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
-# post-plan (lab PR 234): the OS CSPRNG
-"os_rng" = "nn-linux"
 # R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
 # agent's binding of it to the Linux host (its paths kept, the machine,
 # triggers, tracker and exemption as aliases on `LinuxHost`; it names
@@ -330,7 +318,6 @@ planned = false
 "removed_settings" = "northnarrow-agent"
 # the actuators and the Executor; ExecutionOutcome/Report → nn-model (R04a)
 "response" = "nn-linux"
-"runtime" = "nn-linux"
 "sd_notify" = "nn-linux"
 "self_integrity" = "nn-linux"
 "sensor_feasibility" = "nn-linux"
@@ -339,7 +326,6 @@ planned = false
 "shutdown_marker" = "nn-linux"
 "systemd_state" = "nn-linux"
 "telemetry_probe" = "nn-linux"
-"trusted_bin" = "nn-linux"
 # post-plan (lab PR 220): the signed record of a rolled-back upgrade
 "upgrade_rollback" = "nn-linux"
 # post-plan (lab only): `--verifier-check`
@@ -358,6 +344,24 @@ planned = false
 # buffer and the detection budget to nn-core, the same way.
 
 [shims.agent]
+# R09a (lab PR 253): the utilities the actuators, the self-defence and the
+# hosts stand on moved to nn-linux; the agent keeps their paths in `lib.rs`
+# (`pub use nn_linux::…`): the identity on disk, the anchor of a log's
+# directory (`/proc/self/fd`, behind `chain_host::ChainHost::anchor`; not
+# moved to nn-evidence with the chains, R05, lab PR 241), the async file
+# descriptor, the atomic replace, the external commands with a deadline
+# (post-plan, lab PR 217), the filesystems' identity, the OS CSPRNG
+# (post-plan, lab PR 234), the work kept off the async runtime, the system
+# directories' binaries
+"agent_id" = "nn-linux"
+"anchored" = "nn-linux"
+"async_fd" = "nn-linux"
+"atomic_file" = "nn-linux"
+"bounded_cmd" = "nn-linux"
+"fs_type" = "nn-linux"
+"os_rng" = "nn-linux"
+"runtime" = "nn-linux"
+"trusted_bin" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"

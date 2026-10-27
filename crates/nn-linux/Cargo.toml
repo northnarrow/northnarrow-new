@@ -6,12 +6,45 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "NorthNarrow nn-linux: the Linux adapters: the eBPF loader and sensors, /proc, the actuators, self-defence, systemd, the KeyStore and the sandbox (Wave 4 restructure; empty until its lot moves code in)."
+description = "NorthNarrow nn-linux: the Linux adapters: the eBPF loader and sensors, /proc, the actuators, self-defence, systemd, the KeyStore and the sandbox (Wave 4 restructure; its lots move the adapters in, R09)."
 publish = false
 
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
 [dependencies]
+# R09a (lab PR 253): the utilities the actuators, the self-defence and the
+# hosts stand on moved here with the dependencies they had in the agent, the
+# same versions and features (one version each in the workspace).
+# `atomic_file`: the writer shared with the watchdog.
+antitamper-bpf = { workspace = true }
+# `agent_id`: the identity's names in the audit chain (`AgentIdentity`,
+# `AGENT_ID_LEN`) and its parser (`shutdown_marker::parse_agent_id`);
+# `fs_type`: log escaping.
+nn-evidence = { workspace = true }
+nn-proto = { workspace = true }
+nn-model = { workspace = true }
+# `async_fd`, `runtime`: the agent's async runtime.
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+libc = "0.2"
+parking_lot = "0.12"
+# `fs_type`: the filesystems' audit extra. serde_json with the agent's
+# feature (`float_roundtrip`), so a build of nn-linux alone parses as the
+# agent does.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# `os_rng`, `agent_id`: the OS CSPRNG (rand 0.10's `SysRng`).
+rand = "0.10"
+# `agent_id`: the identity's fingerprint and its hex form.
+sha2 = "0.11"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+# `os_rng`'s tests generate Ed25519 keys from it (the agent's features).
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
+# `anchored`'s tests read the warnings it logs.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -13,15 +13,20 @@
 
 pub mod admin_cli;
 pub mod admin_socket;
-pub mod agent_id;
+/// R09a shim (lab PR 253; plan §4.1 rule 2, removed in R17): the agent's
+/// identity on disk is nn-linux's.
+pub use nn_linux::agent_id;
 /// The agent reads its identity once: a scan of `main.rs` (R09a, lab PR
 /// 253: from `agent_id`'s tests).
 #[cfg(test)]
 mod agent_id_tests;
-pub mod anchored;
+/// R09a shim: the anchor of a log's directory is nn-linux's.
+pub use nn_linux::anchored;
 pub mod anti_tamper;
-pub mod async_fd;
-pub mod atomic_file;
+/// R09a shim: the async file descriptor is nn-linux's.
+pub use nn_linux::async_fd;
+/// R09a shim: the atomic replace of a protected file is nn-linux's.
+pub use nn_linux::atomic_file;
 /// R05 shim (lab PR 241; plan §4.1 rule 2, removed in R17): the audit chain
 /// is nn-evidence's. The agent's key and its files (`keys`) keep their names
 /// here, and the writer signs with that key unless told otherwise.
@@ -43,7 +48,8 @@ pub mod audit_preflight;
 /// Lab PR 218: the start as typed phases, the BPF LSM gate, the deny
 /// self-test, the degradations, the trust level and the capability manifest.
 pub mod boot;
-pub mod bounded_cmd;
+/// R09a shim: the external commands with a deadline are nn-linux's.
+pub use nn_linux::bounded_cmd;
 /// The binary's version, cargo features and BPF guard mode (from `audit`,
 /// R04a, lab PR 241).
 pub mod build_info;
@@ -115,7 +121,8 @@ pub mod detection_store;
 pub mod execpol;
 pub mod execq;
 pub mod fim;
-pub mod fs_type;
+/// R09a shim: the filesystems' identity is nn-linux's.
+pub use nn_linux::fs_type;
 #[doc(hidden)]
 pub mod fuzz_api;
 pub mod host_hardening;
@@ -126,7 +133,8 @@ pub mod install_manifest;
 pub mod keys;
 pub mod loop_progress;
 pub mod net;
-pub mod os_rng;
+/// R09a shim: the OS CSPRNG is nn-linux's.
+pub use nn_linux::os_rng;
 /// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the text of the
 /// open sensor's paths (from `sensors::open_sensor`, R04b, lab PR 241) is
 /// nn-model's, the crate the module map names; the posture reads it.
@@ -138,7 +146,8 @@ pub mod posture_host_linux;
 pub mod process_hardening;
 pub mod removed_settings;
 pub mod response;
-pub(crate) mod runtime;
+/// R09a shim: the work kept off the async runtime is nn-linux's.
+pub(crate) use nn_linux::runtime;
 pub mod sd_notify;
 pub mod self_integrity;
 /// Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`).
@@ -148,7 +157,8 @@ pub mod sensors;
 pub mod shutdown_marker;
 pub mod systemd_state;
 pub mod telemetry_probe;
-pub mod trusted_bin;
+/// R09a shim: the system directories' binaries are nn-linux's.
+pub use nn_linux::trusted_bin;
 pub mod upgrade_rollback;
 /// Lab builds only (`--verifier-check`): every program of the embedded
 /// eBPF object through the kernel's verifier.
