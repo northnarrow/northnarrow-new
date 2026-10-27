@@ -17,16 +17,18 @@
 //! directory's `chattr +i` lifted for that moment ([`record_line`]). Written
 //! at the teardown with a plain open, it was refused with EPERM whenever the
 //! file did not exist yet.
+//!
+//! R08c (lab PR 252): the record itself — the outcome ([`StaleChain`]), its
+//! signed entry ([`draft`]) and its append to the audit log ([`attest`]) —
+//! is nn-core's `combat::reconcile`, here under its names. This file keeps
+//! the compatibility log's Linux file I/O: the anchored, `O_NOFOLLOW` open,
+//! the mode, the state directory's dance (nn-linux, R09).
 
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::Arc;
 
-use parking_lot::Mutex;
-use tracing::warn;
-
-use crate::audit::{AuditEntryDraft, AuditLog};
+pub use nn_core::combat::reconcile::{attest, draft, StaleChain};
 
 /// The unsigned compatibility log (docs/operator/COMBAT_RECOVERY.md).
 pub const LOG_PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";
@@ -35,16 +37,6 @@ pub const LOG_PATH: &str = "/var/lib/northnarrow/combat-audit.jsonl";
 /// rotation is a blocked directory-entry operation; past this size the
 /// file is truncated in place (a content operation, allowed under `+i`).
 pub const CAP_BYTES: u64 = 8 * 1024 * 1024;
-
-/// What the start-time reconcile did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StaleChain {
-    /// The chain(s) were present and torn down.
-    TornDown { rules_removed: usize },
-    /// The chain is (or may still be) present: the probe or the teardown
-    /// failed.
-    Failed { error: String },
-}
 
 /// Append one `combat_reconcile` line to the compatibility log at `path`.
 /// The file is opened through the anchored parent, without following a
@@ -112,67 +104,15 @@ pub fn record_line(
     }
 }
 
-/// The signed entry for `outcome` (`integrity_drift`, kind
-/// `combat_reconcile`, `at_boot`).
-pub fn draft(outcome: &StaleChain) -> AuditEntryDraft {
-    let (extra, result) = match outcome {
-        StaleChain::TornDown { rules_removed } => (
-            serde_json::json!({
-                "kind": "combat_reconcile",
-                "detail": format!(
-                    "a NORTHNARROW_COMBAT chain left by an earlier run (killed or crashed in \
-                     COMBAT) was found at start and torn down: {rules_removed} rules removed; \
-                     the host is no longer isolated by it"
-                ),
-                "rules_torn_down": rules_removed,
-                "at_boot": true,
-            }),
-            "repaired",
-        ),
-        StaleChain::Failed { error } => (
-            serde_json::json!({
-                "kind": "combat_reconcile",
-                "detail": format!(
-                    "a NORTHNARROW_COMBAT chain left by an earlier run could not be checked or \
-                     torn down at start ({error}): the host may still be isolated by it — \
-                     see docs/operator/COMBAT_RECOVERY.md"
-                ),
-                "at_boot": true,
-            }),
-            "failed",
-        ),
-    };
-    AuditEntryDraft {
-        op: crate::audit::INTEGRITY_DRIFT_OP.to_string(),
-        extra,
-        key_fp: "agent-self".to_string(),
-        cosigner_fps: Vec::new(),
-        result: result.to_string(),
-        client_pid: std::process::id(),
-        client_uid: 0,
-        client_comm: "northnarrow-agent".to_string(),
-        client_exe: None,
-    }
-}
-
-/// Record `outcome` in the signed audit log (once it is open). Without a
-/// log the journal keeps the WARN the reconcile logged.
-pub fn attest(audit_log: Option<&Arc<Mutex<AuditLog>>>, outcome: &StaleChain) {
-    let Some(log) = audit_log else {
-        return;
-    };
-    if let Err(e) = log.lock().append(draft(outcome)) {
-        warn!(
-            error = format!("{e:#}"),
-            "recording the COMBAT reconcile in the audit log failed"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use crate::audit::AuditLog;
 
     #[test]
     fn a_new_log_is_created_closed_and_appended() {
@@ -331,24 +271,6 @@ mod tests {
         assert!(record_line(&p, 1, CAP_BYTES, &open).is_err());
         assert_eq!(open.dances(), 0);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
-    }
-
-    #[test]
-    fn the_signed_entry_names_the_outcome() {
-        let d = draft(&StaleChain::TornDown { rules_removed: 7 });
-        assert_eq!(d.op, "integrity_drift");
-        assert_eq!(d.result, "repaired");
-        assert_eq!(d.extra["kind"], "combat_reconcile");
-        assert_eq!(d.extra["rules_torn_down"], 7);
-        assert_eq!(d.extra["at_boot"], true);
-        let d = draft(&StaleChain::Failed {
-            error: "iptables: exit 4".to_string(),
-        });
-        assert_eq!(d.result, "failed");
-        assert!(d.extra["detail"]
-            .as_str()
-            .unwrap()
-            .contains("iptables: exit 4"));
     }
 
     #[test]

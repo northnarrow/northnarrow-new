@@ -104,6 +104,11 @@ use nn_model::path_text;
 /// `crate::detection_payload::…`, nn-evidence's.
 use nn_evidence::detection_payload;
 
+// R08c shim (lab PR 252; plan §4.1 rule 2, removed in R17): the path the
+// moved ladder names for the signed audit log it writes.
+/// `crate::audit::…`, nn-evidence's.
+use nn_evidence::audit;
+
 /// The network state the rules read (R08b, lab PR 251): the operator's
 /// blocklists, the DNS cache, the flow tracker, the netflow pacing, the
 /// host's configured DNS resolvers (were the agent's `net::blocklist`, the
@@ -145,11 +150,14 @@ pub mod fim {
 }
 
 /// The COMBAT ladder (R08c, lab PR 252): who it acts against, as its
-/// signed rows name them (was the agent's `combat::offender`).
+/// signed rows name them (was the agent's `combat::offender`), the record
+/// of a stale chain found at start (from the agent's `combat::reconcile`).
 pub mod combat {
     /// An offender's identity as the ladder captured it: pid, starts,
     /// executable, cgroup, how it joined the episode.
     pub mod offender;
+    /// The signed record of a stale COMBAT chain found at start.
+    pub mod reconcile;
 }
 
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management

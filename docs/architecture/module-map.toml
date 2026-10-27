@@ -182,6 +182,11 @@ planned = false
 # the ladder and its evidence; SystemActuator and the probes of protected
 # and reconcile go to nn-linux (R04c)
 "combat" = "nn-core"
+# R08c (lab PR 252): the stale chain's record (the outcome, its signed
+# entry, its append) moved to nn-core's `combat::reconcile`; the agent's
+# file keeps the unsigned compatibility line's Linux file I/O (the
+# anchored `O_NOFOLLOW` open, the mode, the state directory's dance)
+"combat::reconcile" = "nn-linux"
 # comm_allowlist, overlay_auth (verify), overlay_floor. R07 (lab PR 247):
 # `overlay` (the loader) and the part of `overlay_auth` the loaders take
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
@@ -475,7 +480,7 @@ planned = false
 
 [ratchet]
 nn-admin = 8
-nn-core = 19
+nn-core = 18
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3
