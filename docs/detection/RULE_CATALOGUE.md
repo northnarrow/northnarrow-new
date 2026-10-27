@@ -2089,7 +2089,7 @@ Security tool switched off by its own command — category `defense_impairment`.
 
 **How to test.** `ransom-check.sh` MS-25: `auditctl -e 0`, `ufw disable`.
 
-**Tests.** `agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `agent/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable`, `agent/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget`, `deploy/lab/malsim/ransom-check.sh::MS-25`
+**Tests.** `agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands`, `agent/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable`, `crates/nn-core/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget`, `deploy/lab/malsim/ransom-check.sh::MS-25`
 
 **ATT&CK note.** As NN-L-EVA-001.
 

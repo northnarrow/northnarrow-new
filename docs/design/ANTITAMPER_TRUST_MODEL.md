@@ -169,7 +169,8 @@ kill/ptrace immunity.
 How the watchdog registers itself: **the agent reads
 `/proc/<watchdog_pid>/exe` (kernel-resolved, not forgeable) and verifies
 it matches `DEFAULT_WATCHDOG_EXE`**. This is exactly the pattern
-`agent/src/posture/exempt.rs::resolve_verified_watchdog_pid` already uses
+`crates/nn-core/src/posture/exempt.rs::resolve_verified_watchdog_pid` (the
+agent's since R08a, lab PR 250, bound to its Linux host) already uses
 for the posture-trigger exemption. Re-use that helper.
 
 **The kernel attack: can an attacker self-register?**

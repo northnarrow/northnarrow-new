@@ -41,7 +41,7 @@ demo-tappa5 = []
 # Exposes the nn-admin `debug --force-posture <STATE>` subcommand and
 # the agent-side handler that consumes it. Used by the integration
 # test harness; never enabled in production builds.
-debug-trigger = ["nn-proto/debug-trigger"]
+debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger"]
 # Gates `agent/tests/privileged_e2e.rs` — full end-to-end scenarios
 # that spawn the agent + nn-admin subprocesses and verify the
 # iptables ruleset against a live kernel. Requires root and a
@@ -159,6 +159,12 @@ ebpf-guard = { path = "../ebpf-guard" }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+# R08a (lab PR 250): the posture's tests and replays that stay here (they
+# wire the agent's rules, ladder and audit log) read the helpers nn-core
+# keeps for tests (`test-util`: the posture's event builders, the ledger's
+# reader, the lineage's test builders). A dev-dependency only: no build of
+# the binaries has them.
+nn-core = { workspace = true, features = ["test-util"] }
 # Lab PR 219: parse the embedded eBPF object in unit tests, with the parser
 # aya 0.14.0 itself runs: every map must be of a type aya 0.14 loads (a
 # task-storage map parsed and still stopped the agent), and the exploit

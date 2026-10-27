@@ -62,11 +62,13 @@
 //! at exec time.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+
+use super::host::PostureHost;
 
 /// Hard-coded allowlist of installed authentication binaries whose
 /// children we treat as auth-mediated. Two classes live here:
@@ -225,7 +227,7 @@ pub const SYSTEM_DAEMON_EXES: &[&str] = &[
 
 /// External audit NN-AUD-284 (FIMR-010): the package managers proper —
 /// [`SYSTEM_DAEMON_EXES`] without `mandb`. The FIM rules' package carve-out
-/// ([`crate::fim::rules::PackageManaged`]) and the drain's rate limiter
+/// (the agent's `fim::rules::PackageManaged`) and the drain's rate limiter
 /// trust these, through [`AuthSessionTracker::is_package_transaction_write`].
 /// `mandb` is not set-id (man-db's default), so any user runs it, with
 /// `LD_PRELOAD`, and has it fork whatever it likes: as a lineage root for
@@ -481,7 +483,7 @@ const COMM_LEN_MAX: usize = 15;
 /// Review 85: `path` lies in a root-owned system tree, which a process
 /// without root cannot write: not `/tmp`, a home, `/dev/shm`, `/run` or a
 /// memfd, and not a binary deleted or replaced while it runs.
-pub(crate) fn in_system_tree(path: &str) -> bool {
+pub fn in_system_tree(path: &str) -> bool {
     const TREES: &[&str] = &[
         "/usr/",
         "/opt/",
@@ -703,12 +705,16 @@ struct Inner {
 /// Cheap, `Clone`-able shared handle. The tracker is `Send + Sync`
 /// so both the per-event trigger detector and (future) background
 /// pruning tasks can hold one without further plumbing.
+///
+/// R08a (lab PR 250): `H` is the host it reads — the process table, the
+/// host's files, the clocks ([`PostureHost`]; the agent's is `LinuxHost`).
 #[derive(Clone, Debug)]
-pub struct AuthSessionTracker {
+pub struct AuthSessionTracker<H: PostureHost> {
     inner: Arc<Inner>,
+    host: PhantomData<fn() -> H>,
 }
 
-impl AuthSessionTracker {
+impl<H: PostureHost> AuthSessionTracker<H> {
     /// Construct a tracker reading `/proc` from `proc_root`. The
     /// indirection is the test seam: production uses
     /// [`Self::with_proc`]; unit tests point at a fixture tree.
@@ -731,8 +737,9 @@ impl AuthSessionTracker {
                 observer_start: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 suspended_ns: None,
-                host_root: PathBuf::from("/"),
+                host_root: PathBuf::from(H::HOST_ROOT),
             }),
+            host: PhantomData,
         }
     }
 
@@ -740,7 +747,7 @@ impl AuthSessionTracker {
     /// process its pid names now (tests and tools, whose pids are made
     /// up). The agent uses [`Self::for_host`].
     pub fn with_proc() -> Self {
-        Self::new("/proc")
+        Self::new(H::PROC_ROOT)
     }
 
     /// The agent's tracker: the live `/proc`, and every cached exec the
@@ -748,12 +755,12 @@ impl AuthSessionTracker {
     /// a pid reused by a fork, which no exec event announces, does not
     /// inherit the entry (external audit POS-003).
     pub fn for_host() -> Self {
-        Self::build(PathBuf::from("/proc"), true)
+        Self::build(PathBuf::from(H::PROC_ROOT), true)
     }
 
     /// Tests: `/etc` and the container storage read under `root`.
-    #[cfg(test)]
-    pub(crate) fn with_host_root(mut self, root: &Path) -> Self {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_host_root(mut self, root: &Path) -> Self {
         Arc::get_mut(&mut self.inner)
             .expect("an unshared tracker")
             .host_root = root.to_path_buf();
@@ -921,8 +928,8 @@ impl AuthSessionTracker {
     /// [`Self::in_package_transaction`] (and the mass-write arm
     /// [`Self::is_system_man_cache_writer`]); this stays for the tests of
     /// the walk.
-    #[cfg(test)]
-    pub(crate) fn is_system_daemon_mediated(&self, pid: u32) -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn is_system_daemon_mediated(&self, pid: u32) -> bool {
         self.lineage_exe_matches(pid, is_system_daemon_binary)
     }
 
@@ -978,7 +985,7 @@ impl AuthSessionTracker {
             return false;
         }
         let event_ns = if event_ns == 0 {
-            monotonic_ns()
+            H::monotonic_ns()
         } else {
             event_ns
         };
@@ -1051,7 +1058,7 @@ impl AuthSessionTracker {
             return false;
         };
         let event_ns = if event_ns == 0 {
-            monotonic_ns()
+            H::monotonic_ns()
         } else {
             event_ns
         };
@@ -1073,7 +1080,7 @@ impl AuthSessionTracker {
     /// `/etc/passwd`).
     fn storage_users(&self, uid: u32) -> Vec<u32> {
         let mut users = vec![uid];
-        let read = |f: &str| fs::read_to_string(self.inner.host_root.join(f)).unwrap_or_default();
+        let read = |f: &str| H::read_to_string(self.inner.host_root.join(f)).unwrap_or_default();
         let subuid = read("etc/subuid");
         let mut passwd: Option<String> = None;
         for line in subuid.lines() {
@@ -1118,12 +1125,8 @@ impl AuthSessionTracker {
         {
             return false;
         }
-        let owner = |dir: &str| {
-            fs::symlink_metadata(self.inner.host_root.join(dir.trim_start_matches('/')))
-                .ok()
-                .filter(|m| m.is_dir())
-                .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
-        };
+        let owner =
+            |dir: &str| H::dir_owner(self.inner.host_root.join(dir.trim_start_matches('/')));
         if users
             .iter()
             .any(|u| path.starts_with(&format!("/run/user/{u}/containers/")))
@@ -1157,13 +1160,13 @@ impl AuthSessionTracker {
     /// `upperdir` and `workdir` in the container storage of `users`; that
     /// overlay's `(major, minor)`.
     fn storage_rooted_namespace(&self, pid: u32, uid: u32, users: &[u32]) -> Option<(u32, u32)> {
-        let ns = |p: &str| fs::read_link(self.inner.proc_root.join(p).join("ns").join("mnt")).ok();
+        let ns = |p: &str| H::read_link(self.inner.proc_root.join(p).join("ns").join("mnt")).ok();
         let (own, init) = (ns(&pid.to_string())?, ns("1")?);
         if own == init {
             return None;
         }
-        let text = fs::read_to_string(self.inner.proc_root.join(pid.to_string()).join("mountinfo"))
-            .ok()?;
+        let text =
+            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("mountinfo")).ok()?;
         let (dev, upper, work) = root_overlay(&text)?;
         (self.in_container_storage(&format!("{upper}/"), uid, users)
             && self.in_container_storage(&format!("{work}/"), uid, users))
@@ -1177,7 +1180,7 @@ impl AuthSessionTracker {
             if hop.cached {
                 // Seen running no earlier than now, nor than the event it
                 // was found running for (the same clock).
-                let seen = event_ns.max(monotonic_ns());
+                let seen = event_ns.max(H::monotonic_ns());
                 // A package transaction writes in bursts: refresh at most
                 // once a second, so the walks share the read lock.
                 let fresh = self
@@ -1310,14 +1313,14 @@ impl AuthSessionTracker {
             return None;
         }
         let text =
-            fs::read_to_string(self.inner.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
         placing_cgroup(&text).map(str::to_string)
     }
 
     /// `PPid:` of `/proc/<pid>/status`.
     fn proc_ppid(&self, pid: u32) -> Option<u32> {
         let text =
-            fs::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status")).ok()?;
+            H::read_to_string(self.inner.proc_root.join(pid.to_string()).join("status")).ok()?;
         parse_ppid(&text)
     }
 
@@ -1352,10 +1355,10 @@ impl AuthSessionTracker {
     /// state until sudo reaps it.
     fn is_running(&self, pid: u32) -> bool {
         let dir = self.inner.proc_root.join(pid.to_string());
-        if !dir.is_dir() {
+        if !H::is_dir(&dir) {
             return false;
         }
-        let Ok(stat) = fs::read_to_string(dir.join("stat")) else {
+        let Ok(stat) = H::read_to_string(dir.join("stat")) else {
             return true;
         };
         let state = stat
@@ -1391,7 +1394,7 @@ impl AuthSessionTracker {
             return false;
         }
         let path = self.inner.proc_root.join(pid.to_string()).join("stat");
-        let Ok(stat) = fs::read_to_string(path) else {
+        let Ok(stat) = H::read_to_string(path) else {
             return false;
         };
         stat.rsplit_once(')')
@@ -1562,8 +1565,8 @@ impl AuthSessionTracker {
     /// The script or module an interpreter `exe` runs as process `pid`,
     /// from `/proc/<pid>/cmdline` ([`script_of`]).
     fn proc_script(&self, pid: u32, exe: &Path) -> Option<String> {
-        let cmdline = fs::read(self.inner.proc_root.join(pid.to_string()).join("cmdline"))
-            .unwrap_or_default();
+        let cmdline =
+            H::read(self.inner.proc_root.join(pid.to_string()).join("cmdline")).unwrap_or_default();
         let argv: Vec<String> = cmdline
             .split(|b| *b == 0)
             .filter(|a| !a.is_empty())
@@ -1613,10 +1616,10 @@ impl AuthSessionTracker {
     /// start that is later whatever that time was ends the walk. A start
     /// `/proc` does not show is not held against it.
     fn started_no_later(&self, up: &Hop, below: &Hop) -> bool {
-        let slack = 2 * tick_ns();
+        let slack = 2 * H::clock_tick_ns();
         let boot = |h: &Hop| {
             self.proc_start_ticks(h.pid)
-                .map(|t| t.saturating_mul(tick_ns()))
+                .map(|t| t.saturating_mul(H::clock_tick_ns()))
         };
         match (up.cached, below.cached) {
             (true, true) => up.start_ns <= below.start_ns,
@@ -1693,7 +1696,7 @@ impl AuthSessionTracker {
     /// A `/proc` start of `ticks` (boot clock) is the monotonic start
     /// `start_ns` ([`Self::started_at`]).
     fn ticks_show_start(&self, ticks: u64, start_ns: u64) -> bool {
-        let tick = tick_ns();
+        let tick = H::clock_tick_ns();
         let shown = ticks.saturating_mul(tick);
         let slack = 2 * tick;
         shown + slack >= start_ns && shown <= start_ns + self.suspended_ns() + slack
@@ -1726,7 +1729,7 @@ impl AuthSessionTracker {
                 return Some(start);
             }
         }
-        let tick = tick_ns();
+        let tick = H::clock_tick_ns();
         Some(
             ticks
                 .saturating_mul(tick)
@@ -1753,7 +1756,7 @@ impl AuthSessionTracker {
     /// `starttime`, field 22 of `/proc/<name>/stat`, counted after the
     /// `(comm)` field, which may itself hold spaces or parentheses.
     fn proc_start_ticks_of(&self, name: &str) -> Option<u64> {
-        let stat = fs::read_to_string(self.inner.proc_root.join(name).join("stat")).ok()?;
+        let stat = H::read_to_string(self.inner.proc_root.join(name).join("stat")).ok()?;
         stat.rsplit_once(')')?
             .1
             .split_whitespace()
@@ -1769,16 +1772,7 @@ impl AuthSessionTracker {
         if let Some(s) = self.inner.suspended_ns {
             return s;
         }
-        let now = |clock| {
-            let mut ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: a valid clock id and a timespec to fill.
-            unsafe { libc::clock_gettime(clock, &mut ts) };
-            ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-        };
-        now(libc::CLOCK_BOOTTIME).saturating_sub(now(libc::CLOCK_MONOTONIC))
+        H::suspended_ns()
     }
 
     /// BUG-018 (tactical): true iff `/proc/<pid>/loginuid` contains
@@ -1819,7 +1813,7 @@ impl AuthSessionTracker {
             return None;
         }
         let path = self.inner.proc_root.join(pid.to_string()).join("loginuid");
-        let raw = fs::read_to_string(&path).ok()?;
+        let raw = H::read_to_string(&path).ok()?;
         match raw.trim().parse::<u32>() {
             Ok(v) if v != LOGINUID_UNSET => Some(v),
             _ => None,
@@ -1843,7 +1837,7 @@ impl AuthSessionTracker {
                 });
             }
         }
-        let exe = fs::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         if exe.to_string_lossy().ends_with(" (deleted)") {
             return None;
         }
@@ -1867,7 +1861,7 @@ impl AuthSessionTracker {
                 return Some(e.exe.to_string_lossy().into_owned());
             }
         }
-        let exe = fs::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         Some(exe.to_string_lossy().into_owned())
     }
 
@@ -1892,7 +1886,7 @@ impl AuthSessionTracker {
             return None;
         }
         let ticks = self.proc_start_ticks(pid)?;
-        let tick = tick_ns();
+        let tick = H::clock_tick_ns();
         let floor = ticks
             .saturating_mul(tick)
             .saturating_sub(self.suspended_ns() + 2 * tick);
@@ -1912,7 +1906,7 @@ impl AuthSessionTracker {
                 return (exec_ns <= at_ns).then(|| exe.to_string_lossy().into_owned());
             }
         }
-        let exe = fs::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
+        let exe = H::read_link(self.inner.proc_root.join(pid.to_string()).join("exe")).ok()?;
         Some(exe.to_string_lossy().into_owned())
     }
 
@@ -1929,7 +1923,7 @@ impl AuthSessionTracker {
     fn lookup_proc(&self, pid: u32) -> Option<(u32, PathBuf, Option<u32>)> {
         let pid_str = pid.to_string();
         let exe_link = self.inner.proc_root.join(&pid_str).join("exe");
-        let exe = fs::read_link(&exe_link).ok()?;
+        let exe = H::read_link(&exe_link).ok()?;
         // `/proc/<pid>/exe` carries a ` (deleted)` suffix when the
         // on-disk binary was unlinked while the process is still
         // running. Treat that as a mismatch — a deleted/swapped
@@ -1939,7 +1933,7 @@ impl AuthSessionTracker {
             return None;
         }
         let status_path = self.inner.proc_root.join(&pid_str).join("status");
-        let text = fs::read_to_string(&status_path).ok()?;
+        let text = H::read_to_string(&status_path).ok()?;
         let ppid = parse_ppid(&text)?;
         Some((ppid, exe, parse_real_uid(&text)))
     }
@@ -1950,7 +1944,7 @@ impl AuthSessionTracker {
     }
 }
 
-impl Default for AuthSessionTracker {
+impl<H: PostureHost> Default for AuthSessionTracker<H> {
     fn default() -> Self {
         Self::with_proc()
     }
@@ -1974,20 +1968,6 @@ struct Hop {
     uid: Option<u32>,
 }
 
-/// Nanoseconds per `/proc` clock tick (`sysconf(_SC_CLK_TCK)`).
-fn tick_ns() -> u64 {
-    static TICK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TICK.get_or_init(|| {
-        // SAFETY: sysconf has no preconditions.
-        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        if hz > 0 {
-            1_000_000_000 / hz as u64
-        } else {
-            10_000_000
-        }
-    })
-}
-
 fn is_auth_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     AUTH_BINARY_EXES.iter().any(|p| s == *p)
@@ -2001,17 +1981,6 @@ fn is_system_daemon_binary(exe: &Path) -> bool {
 fn is_package_manager_binary(exe: &Path) -> bool {
     let s = exe.to_string_lossy();
     PACKAGE_MANAGER_EXES.iter().any(|p| s == *p)
-}
-
-/// CLOCK_MONOTONIC in ns: the clock of the kernel's event timestamps.
-fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: a valid clock id and a timespec to fill.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 fn is_elevation_binary(exe: &Path) -> bool {
@@ -2030,7 +1999,7 @@ fn is_node_exe(exe: &Path) -> bool {
 
 /// Review 85: interpreters, by exe basename (`python3.12`, `perl5.36`):
 /// what they run is named by their arguments, not by their exe.
-pub(crate) fn is_interpreter(exe: &Path) -> bool {
+pub fn is_interpreter(exe: &Path) -> bool {
     let base = exe
         .file_name()
         .map(|b| b.to_string_lossy())
@@ -2122,8 +2091,13 @@ fn parse_real_uid(status_text: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::fs;
     use tempfile::TempDir;
+
+    use crate::posture::host::testing::{symlink, TestHost as H, TEST_OWNER};
+
+    /// R08a (lab PR 250): the tracker on the portable test host.
+    type AuthSessionTracker = super::AuthSessionTracker<H>;
 
     fn write_status(dir: &Path, pid: u32, ppid: u32) {
         let pid_dir = dir.join(pid.to_string());
@@ -2231,7 +2205,7 @@ mod tests {
     #[test]
     fn a_package_transaction_is_bound_to_its_package_managers_run() {
         let tmp = TempDir::new().unwrap();
-        let ticks = |ns: u64| ns / tick_ns();
+        let ticks = |ns: u64| ns / H::clock_tick_ns();
         let t = AuthSessionTracker::live_on(tmp.path(), 0);
         // far past the host's own monotonic clock
         let b = 1_000_000_000 * S;
@@ -2388,7 +2362,7 @@ mod tests {
     #[test]
     fn a_users_container_storage_is_told_by_ownership() {
         let host = TempDir::new().unwrap();
-        let me = unsafe { libc::getuid() };
+        let me = TEST_OWNER;
         for d in [
             "home/nn/.local/share/containers/storage",
             "home/nn/.local/share/lxc/c1",
@@ -2466,7 +2440,7 @@ mod tests {
     fn a_users_package_manager_writes_its_container_storage_only() {
         let host = TempDir::new().unwrap();
         let procs = TempDir::new().unwrap();
-        let me = unsafe { libc::getuid() };
+        let me = TEST_OWNER;
         fs::create_dir_all(host.path().join("home/nn/.local/share/containers/storage")).unwrap();
         let t = AuthSessionTracker::new(procs.path()).with_host_root(host.path());
         let storage = "/home/nn/.local/share/containers/storage/overlay/0a1b/diff/usr/lib/x";
@@ -3066,7 +3040,7 @@ mod tests {
     #[test]
     fn a_cached_exec_is_checked_against_the_process_its_pid_names_now() {
         let tmp = TempDir::new().unwrap();
-        let ticks = |ns: u64| ns / tick_ns();
+        let ticks = |ns: u64| ns / H::clock_tick_ns();
         let t = AuthSessionTracker::live_on(tmp.path(), 0);
         t.ingest_exec(100, 1, "/usr/bin/sudo", &[], 1000 * S, 1000 * S, 0);
         write_started(tmp.path(), "100", 1, ticks(1000 * S));
@@ -3100,7 +3074,7 @@ mod tests {
     #[test]
     fn the_start_floor_is_the_current_process_start_or_below_it() {
         let tmp = TempDir::new().unwrap();
-        let ticks = |ns: u64| ns / tick_ns();
+        let ticks = |ns: u64| ns / H::clock_tick_ns();
         let t = AuthSessionTracker::live_on(tmp.path(), 0);
         // the cached exec is the process pid 100 names: its exact start
         t.ingest_exec(100, 1, "/usr/bin/curl", &[], 1000 * S + 5, 1000 * S + 3, 0);
@@ -3110,13 +3084,16 @@ mod tests {
         write_started(tmp.path(), "100", 1, ticks(2000 * S));
         let floor = t.start_floor_ns(100).unwrap();
         assert!(
-            floor <= 2000 * S && floor >= 2000 * S - 3 * tick_ns(),
+            floor <= 2000 * S && floor >= 2000 * S - 3 * H::clock_tick_ns(),
             "{floor}"
         );
         // an hour suspended: the floor moves back by the hour
         write_started(tmp.path(), "100", 1, ticks(10_000 * S));
         let t = AuthSessionTracker::live_on(tmp.path(), 3600 * S);
-        assert_eq!(t.start_floor_ns(100), Some(6400 * S - 2 * tick_ns()));
+        assert_eq!(
+            t.start_floor_ns(100),
+            Some(6400 * S - 2 * H::clock_tick_ns())
+        );
         // an exited process has no start to read
         fs::remove_dir_all(tmp.path().join("100")).unwrap();
         assert_eq!(t.start_floor_ns(100), None);
@@ -3130,7 +3107,7 @@ mod tests {
     #[test]
     fn the_image_at_a_time_is_the_sender_s_only() {
         let tmp = TempDir::new().unwrap();
-        let ticks = |ns: u64| ns / tick_ns();
+        let ticks = |ns: u64| ns / H::clock_tick_ns();
         let t = AuthSessionTracker::live_on(tmp.path(), 0);
         // a resolver started before the agent: no exec event, /proc
         write_started(tmp.path(), "100", 1, ticks(10 * S));
@@ -3172,8 +3149,8 @@ mod tests {
     #[test]
     fn stat_start_parses_comm_with_parens() {
         let tmp = TempDir::new().unwrap();
-        let late = 5000 * S / tick_ns();
-        let early = 10 * S / tick_ns();
+        let late = 5000 * S / H::clock_tick_ns();
+        let early = 10 * S / H::clock_tick_ns();
         let dir = tmp.path().join("400");
         fs::create_dir_all(&dir).unwrap();
         // the name ends like a stat line whose start is late

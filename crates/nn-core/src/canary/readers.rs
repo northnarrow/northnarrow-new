@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use anyhow::{anyhow, Result};
 
 use crate::config::overlay_auth::Verified;
+use crate::posture::host::PostureHost;
 use crate::posture::lineage::{in_system_tree, AuthSessionTracker};
 
 /// Programs that read whole trees by design: an entry is a program name
@@ -76,13 +77,16 @@ pub fn validate_reader(entry: &str) -> Result<()> {
 /// The readers the K5 File and Credential rules spare, and how they tell
 /// one: the built-in list, the operator's signed additions, and the
 /// process-lineage cache that knows what a pid executed.
+///
+/// R08a (lab PR 250): `H` is the host the lineage cache reads
+/// ([`PostureHost`]; the agent's is `LinuxHost`).
 #[derive(Clone, Default)]
-pub struct CanaryReaders {
+pub struct CanaryReaders<H: PostureHost> {
     extra: BTreeSet<String>,
-    identity: Option<AuthSessionTracker>,
+    identity: Option<AuthSessionTracker<H>>,
 }
 
-impl CanaryReaders {
+impl<H: PostureHost> CanaryReaders<H> {
     /// No identity source: nothing is a reader (tests, early boot).
     pub fn none() -> Self {
         Self::default()
@@ -90,7 +94,7 @@ impl CanaryReaders {
 
     /// Readers judged through `identity`, with the operator's `extra`
     /// entries added to [`CANARY_READERS`].
-    pub fn new(extra: BTreeSet<String>, identity: AuthSessionTracker) -> Self {
+    pub fn new(extra: BTreeSet<String>, identity: AuthSessionTracker<H>) -> Self {
         Self {
             extra,
             identity: Some(identity),
@@ -101,7 +105,7 @@ impl CanaryReaders {
     /// signed-overlay gate verified it (external audit LLMR-013). None
     /// adds nothing; a malformed one is refused whole (fail-secure: the
     /// built-in readers only).
-    pub fn load(local: &Verified, identity: AuthSessionTracker) -> Self {
+    pub fn load(local: &Verified, identity: AuthSessionTracker<H>) -> Self {
         let extra = match local.text() {
             Some(text) => match crate::config::overlay::parse_overlay_text(
                 "canary-readers.local",
@@ -148,6 +152,13 @@ impl CanaryReaders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::posture::host::testing::TestHost;
+
+    /// R08a (lab PR 250): the readers and their lineage cache on the
+    /// portable test host.
+    type AuthSessionTracker = crate::posture::lineage::AuthSessionTracker<TestHost>;
+    type CanaryReaders = super::CanaryReaders<TestHost>;
 
     fn tracker() -> (tempfile::TempDir, AuthSessionTracker) {
         let dir = tempfile::tempdir().unwrap();

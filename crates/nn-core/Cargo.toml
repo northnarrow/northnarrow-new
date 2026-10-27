@@ -12,6 +12,14 @@ publish = false
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
 [dependencies]
+# R08a (lab PR 250): the posture, its lineage, the correlation buffer and
+# the detection budget moved here; they judge `nn_model::Event`s and lock
+# with parking_lot, the agent's version.
+nn-model = { workspace = true }
+parking_lot = "0.12"
+# the triggers read the exec and open sensors' flags and reasons
+# (`common::wire::{exe, open_sensor}`), the kernel ABI's constants.
+common = { workspace = true }
 # R07 (lab PR 247): the content lists moved here with the dependencies they
 # had in the agent, the same versions (one version each in the workspace).
 # `config::overlay_auth`: an overlay's SHA-256.
@@ -28,6 +36,18 @@ hex = "0.4"
 base64 = "0.23"
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = { workspace = true }
+
+[features]
+# R08a (lab PR 250): `PostureMachine::force_state_for_test`, the
+# `nn-admin debug force-posture` hatch; the agent forwards its own
+# `debug-trigger` here. Off by default; production builds never see it.
+debug-trigger = []
+# R08a (lab PR 250): the helpers this crate keeps for tests — its own, and
+# the agent's tests and replays of the posture that wire the agent's rules
+# (the agent enables it as a dev-dependency only). Nothing that changes a
+# decision: readers and builders. The posture's own test-only doors (the
+# legacy boolean release) stay `cfg(test)`.
+test-util = []
 
 [dev-dependencies]
 tempfile = "3"

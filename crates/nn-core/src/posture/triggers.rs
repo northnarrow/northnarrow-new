@@ -36,8 +36,8 @@ use nn_model::Event;
 use super::corroboration::Scope;
 use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
+use super::host::{PostureAgent, PostureHost};
 use super::lineage::AuthSessionTracker;
-use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
 
 /// The recent events the triggers scan, borrowed (review 72). The
 /// correlation buffer is a ring of up to 1,000 events; cloning it for every
@@ -128,7 +128,7 @@ pub(super) const MASS_WRITE_MIN: usize = 20;
 ///   processes legitimately write (lock files, dbus
 ///   sockets). Counted toward mass-write so a
 ///   compromised user session is still detectable.
-pub(crate) const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] =
+pub const MASS_WRITE_CARVEOUT_PREFIXES: &[&str] =
     &["/sys/", "/proc/", "/run/systemd/", "/run/log/journal/"];
 
 /// Returns true if `filename` is in a path class the mass-write arm of
@@ -236,14 +236,14 @@ const ADMIN_PORTS: &[u16] = &[22, 3389, 445, 5985, 5986];
 /// suppressed by the SAME auth-lineage gate that protects `/etc/shadow`
 /// (see [`sensitive_file_access`]), so adding it here does NOT
 /// re-introduce the T7.13 FP for sudo/sshd/login/etc.
-pub(crate) const SENSITIVE_FILES: &[&str] = &[
+pub const SENSITIVE_FILES: &[&str] = &[
     "/etc/passwd",
     "/etc/shadow",
     "/etc/gshadow",
     "/etc/sudoers",
     "/etc/login.defs",
 ];
-pub(crate) const CRITICAL_FILES_PREFIXES: &[&str] = &[
+pub const CRITICAL_FILES_PREFIXES: &[&str] = &[
     "/etc/sshd_config",
     "/etc/ssh/sshd_config",
     // Already matched by the prefix above; spelled out because the LSM
@@ -255,7 +255,7 @@ pub(crate) const CRITICAL_FILES_PREFIXES: &[&str] = &[
     "/etc/pam.d/",
     "/root/.ssh/",
 ];
-pub(crate) const PERSISTENCE_PREFIXES: &[&str] = &[
+pub const PERSISTENCE_PREFIXES: &[&str] = &[
     "/etc/cron.d/",
     "/etc/cron.hourly/",
     "/etc/cron.daily/",
@@ -287,11 +287,15 @@ pub(crate) const PERSISTENCE_PREFIXES: &[&str] = &[
 /// LSM hooks deny them and surface an `FsProtectDenial`, which
 /// `detect` raises as the Decisive `AntiTamperDenial` trigger
 /// (straight to COMBAT on its own — BUG-032).
+///
+/// R08a (lab PR 250): `H` is the host — the process table the lineage and
+/// the exemption read, and what the triggers consult in the agent's other
+/// modules ([`PostureAgent`]; the agent's is `LinuxHost`).
 #[derive(Debug, Default, Clone)]
-pub struct TriggerDetector {
+pub struct TriggerDetector<H: PostureAgent> {
     /// PIDs belonging to the NorthNarrow process stack (agent + the
     /// verified watchdog) whose events must never raise a trigger.
-    exempt: ExemptPids,
+    exempt: ExemptPids<H>,
     /// T7.13 (Beta Step 5) — sudo-mediated process lineage tracker.
     /// Consulted ONLY by `sensitive_file_access` and the mass-write
     /// arm of `confirmed_intrusion` (and, review 52, by
@@ -304,7 +308,7 @@ pub struct TriggerDetector {
     /// — dropping a /tmp payload, tampering with agent state — is
     /// still caught. (External audit POS-015: a /tmp exec under a
     /// package manager's lineage is never promoted past `StagingExec`.)
-    auth: AuthSessionTracker,
+    auth: AuthSessionTracker<H>,
     /// BUG-017 P-8 — operator-supplemental mass-write path-prefix
     /// carve-out, layered on top of [`MASS_WRITE_CARVEOUT_PREFIXES`].
     /// Loaded from `/etc/northnarrow/mass-write-carveout.local` at
@@ -329,10 +333,10 @@ pub struct TriggerDetector {
     /// Lab PR 162: the trusted-installer window, once `main.rs` has wired
     /// it ([`Self::set_installer_window`]); inside it a control-surface
     /// tamper does not raise the posture.
-    installer_window: InstallerWindow,
+    installer_window: InstallerWindow<H>,
     /// Lab PR 225: the ransomware tracker and the security-tool detector
     /// the rules share, once `main.rs` has wired them.
-    impact: ImpactHooks,
+    impact: ImpactHooks<H>,
     /// Tappa 10.9 step 1: `true` once the file-open sensor on LSM
     /// `file_open` counts write-opens in the kernel and reports bursts as
     /// `Event::MassWrite`. Only the opens a rule reads reach userland then,
@@ -347,13 +351,32 @@ pub struct TriggerDetector {
 /// Lab PR 225: the shared judges of the ransomware and security-tool
 /// triggers. Unset (a test, a build that does not wire them): neither
 /// trigger fires.
-#[derive(Clone, Default)]
-struct ImpactHooks {
-    ransom: Arc<std::sync::OnceLock<Arc<crate::impact::RansomTracker>>>,
-    defense: Arc<std::sync::OnceLock<Arc<crate::impair::DefenseDetector>>>,
+struct ImpactHooks<H: PostureAgent> {
+    ransom: Arc<std::sync::OnceLock<Arc<H::RansomTracker>>>,
+    defense: Arc<std::sync::OnceLock<Arc<H::DefenseDetector>>>,
 }
 
-impl std::fmt::Debug for ImpactHooks {
+/// R08a (lab PR 250): what `derive(Clone, Default)` made, without asking
+/// the host's judges to be `Clone` or `Default` (only their slots are).
+impl<H: PostureAgent> Clone for ImpactHooks<H> {
+    fn clone(&self) -> Self {
+        Self {
+            ransom: self.ransom.clone(),
+            defense: self.defense.clone(),
+        }
+    }
+}
+
+impl<H: PostureAgent> Default for ImpactHooks<H> {
+    fn default() -> Self {
+        Self {
+            ransom: Arc::default(),
+            defense: Arc::default(),
+        }
+    }
+}
+
+impl<H: PostureAgent> std::fmt::Debug for ImpactHooks<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImpactHooks")
             .field("ransom", &self.ransom.get().is_some())
@@ -365,10 +388,23 @@ impl std::fmt::Debug for ImpactHooks {
 /// Lab PR 162: the trusted-installer window as the detector reads it.
 /// Unset (a test, a build that does not wire it) reads as closed, so the
 /// trigger fires.
-#[derive(Clone, Default)]
-struct InstallerWindow(Arc<std::sync::OnceLock<Arc<TrustedInstallerOverride>>>);
+struct InstallerWindow<H: PostureAgent>(Arc<std::sync::OnceLock<Arc<H::InstallerWindow>>>);
 
-impl std::fmt::Debug for InstallerWindow {
+/// R08a (lab PR 250): what `derive(Clone, Default)` made, without asking
+/// the host's window to be `Clone` or `Default` (only its slot is).
+impl<H: PostureAgent> Clone for InstallerWindow<H> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<H: PostureAgent> Default for InstallerWindow<H> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<H: PostureAgent> std::fmt::Debug for InstallerWindow<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstallerWindow")
             .field("wired", &self.0.get().is_some())
@@ -376,9 +412,9 @@ impl std::fmt::Debug for InstallerWindow {
     }
 }
 
-impl InstallerWindow {
+impl<H: PostureAgent> InstallerWindow<H> {
     fn is_open(&self) -> bool {
-        self.0.get().is_some_and(|w| w.is_window_open())
+        self.0.get().is_some_and(|w| H::installer_window_open(w))
     }
 }
 
@@ -408,7 +444,7 @@ impl MassWriters {
     }
 }
 
-impl TriggerDetector {
+impl<H: PostureAgent> TriggerDetector<H> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -433,7 +469,7 @@ impl TriggerDetector {
     /// Construct a detector with an explicit, shared [`ExemptPids`]
     /// (Beta Step 3) so the agent *and* the verified watchdog PID are
     /// both excluded, the latter refreshed live by `main.rs`.
-    pub fn with_exempt(exempt: ExemptPids) -> Self {
+    pub fn with_exempt(exempt: ExemptPids<H>) -> Self {
         Self {
             exempt,
             auth: AuthSessionTracker::default(),
@@ -451,7 +487,7 @@ impl TriggerDetector {
     /// stack-exempt set with the auth-lineage tracker. `main.rs` uses
     /// this; tests can build a detector with a fixture `proc_root`
     /// via [`AuthSessionTracker::new`].
-    pub fn with_exempt_and_auth(exempt: ExemptPids, auth: AuthSessionTracker) -> Self {
+    pub fn with_exempt_and_auth(exempt: ExemptPids<H>, auth: AuthSessionTracker<H>) -> Self {
         Self {
             exempt,
             auth,
@@ -476,17 +512,17 @@ impl TriggerDetector {
 
     /// Lab PR 162: the trusted-installer window the control-surface
     /// trigger defers to. Set once; a second call is ignored.
-    pub fn set_installer_window(&self, window: Arc<TrustedInstallerOverride>) {
+    pub fn set_installer_window(&self, window: Arc<H::InstallerWindow>) {
         let _ = self.installer_window.0.set(window);
     }
 
     /// Lab PR 225: the ransomware tracker (`RansomwareEncryption`). Set once.
-    pub fn set_ransom_tracker(&self, tracker: Arc<crate::impact::RansomTracker>) {
+    pub fn set_ransom_tracker(&self, tracker: Arc<H::RansomTracker>) {
         let _ = self.impact.ransom.set(tracker);
     }
 
     /// Lab PR 225: the security-tool detector (`DefenseImpairment`). Set once.
-    pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector>) {
+    pub fn set_defense_detector(&self, detector: Arc<H::DefenseDetector>) {
         let _ = self.impact.defense.set(detector);
     }
 
@@ -713,7 +749,7 @@ impl TriggerDetector {
         // write and so no denial reaches the posture either, it is not
         // raised; the rule still kills and records.
         if let Event::Fim(fe) = event {
-            if crate::fim::rules::is_bait_tamper(fe)
+            if H::is_bait_tamper(fe)
                 && fe.modifier_pid != std::process::id()
                 && !self.installer_window.is_open()
             {
@@ -724,7 +760,7 @@ impl TriggerDetector {
         // evidence of COMBAT tier that needs a second signal of another
         // class while the guard is experimental (the shared predicate of
         // NN-L-EPG-001/002, so the rules and the trigger cannot drift).
-        if crate::decision::rules::epg::is_exploit_postcondition(event) {
+        if H::is_exploit_postcondition(event) {
             hits.push(TriggerType::ExploitPostcondition);
         }
         let mass_write = confirmed_intrusion(
@@ -745,9 +781,7 @@ impl TriggerDetector {
         // reverse shell), read on exec identity and the kernel's file table.
         // A COMBAT-tier execution signal: on its own it stops at ENGAGED, a
         // second signal of another class reaches COMBAT.
-        let reverse_shell =
-            crate::decision::rules::r020_shell_with_socket_stdio::shape(event, Some(&self.auth))
-                .is_some();
+        let reverse_shell = H::is_reverse_shell(event, &self.auth);
         if mass_write || staged == Some(StagedExec::Confirmed) || reverse_shell {
             hits.push(TriggerType::ConfirmedIntrusion);
         }
@@ -757,7 +791,7 @@ impl TriggerDetector {
         // default). The shapes alone keep their triggers (the mass-write
         // arm above).
         if let Some(t) = self.impact.ransom.get() {
-            if t.assess(event).is_some_and(|a| a.decisive) {
+            if H::ransomware_decisive(t, event) {
                 hits.push(TriggerType::RansomwareEncryption);
             }
         }
@@ -765,7 +799,7 @@ impl TriggerDetector {
         // transaction, an administrator's session and configuration
         // management — ENGAGED, execution evidence that corroborates.
         if let Some(d) = self.impact.defense.get() {
-            if d.assess(event).is_some_and(|f| f.sanctioned.is_none()) {
+            if H::defense_unsanctioned(d, event) {
                 hits.push(TriggerType::DefenseImpairment);
             }
         }
@@ -1039,7 +1073,7 @@ fn kernel_class_says(filename: &str, kernel_class: u32, bit: u32) -> bool {
     kernel_class & bit != 0 && !crate::path_text::path_is_exact(filename)
 }
 
-fn sensitive_file_access(focal: &Event, auth: &AuthSessionTracker) -> bool {
+fn sensitive_file_access<H: PostureHost>(focal: &Event, auth: &AuthSessionTracker<H>) -> bool {
     let Event::FileOpen {
         pid,
         uid,
@@ -1151,11 +1185,11 @@ const INTERPRETER_EXES: &[&str] = &[
 /// before its exec was read) fires too: the signal is ALERTED tier.
 /// Not covered: a module inside the daemon's own image (`mod_php` in
 /// `apache2`) reads as the daemon.
-fn service_uid_credential_read(
+fn service_uid_credential_read<H: PostureHost>(
     pid: u32,
     filename: &str,
     by_kernel: bool,
-    auth: &AuthSessionTracker,
+    auth: &AuthSessionTracker<H>,
 ) -> bool {
     let credential = SERVICE_UID_CREDENTIAL_FILES
         .iter()
@@ -1265,9 +1299,9 @@ enum StagedExec {
 /// `mandb` or package manager in the lineage. Not gated by the auth
 /// lineage: a sudo-spawned process running `/tmp/payload` is raised like
 /// any other. R001..R003 still kill the exec, whatever the posture.
-fn staging_exec(
+fn staging_exec<H: PostureAgent>(
     focal: &Event,
-    auth: &AuthSessionTracker,
+    auth: &AuthSessionTracker<H>,
     mass_writers: &MassWriters,
 ) -> Option<StagedExec> {
     let (pid, filename, exe, ts) = match focal {
@@ -1288,7 +1322,7 @@ fn staging_exec(
         _ => return None,
     };
     let image = exe.path_or(filename);
-    if !crate::decision::rules::is_staging_path(image) {
+    if !H::is_staging_path(image) {
         return None;
     }
     if auth.in_package_transaction(pid, ts) {
@@ -1311,10 +1345,10 @@ fn staging_exec(
 
 /// The mass-write arm of `ConfirmedIntrusion` (the exec arm is
 /// [`staging_exec`]).
-fn confirmed_intrusion(
+fn confirmed_intrusion<H: PostureHost>(
     focal: &Event,
     recent: Recent<'_>,
-    auth: &AuthSessionTracker,
+    auth: &AuthSessionTracker<H>,
     mass_write_extras: &[String],
     warned: &parking_lot::Mutex<HashMap<u32, u64>>,
     kernel_mass_write: bool,
@@ -1541,8 +1575,8 @@ fn confirmed_intrusion(
 /// ([`AuthSessionTracker::is_user_container_storage_write`], judged on the
 /// open `path` names: the kernel counts a process's write-opens, and
 /// reports the one that crossed the threshold).
-fn mass_write_exempt(
-    auth: &AuthSessionTracker,
+fn mass_write_exempt<H: PostureHost>(
+    auth: &AuthSessionTracker<H>,
     pid: u32,
     ts_ns: u64,
     path: &str,
@@ -1576,7 +1610,7 @@ fn mass_write_warn_due(
     true
 }
 
-fn persistence_mechanism(focal: &Event, auth: &AuthSessionTracker) -> bool {
+fn persistence_mechanism<H: PostureHost>(focal: &Event, auth: &AuthSessionTracker<H>) -> bool {
     let Event::FileOpen {
         pid,
         filename,
@@ -1763,8 +1797,10 @@ fn is_write_open(flags: u32) -> bool {
 /// `O_CREAT` on Linux (0o100): the open may create the file.
 const O_CREAT: u32 = 0o100;
 
-#[cfg(test)]
-pub(super) mod testutil {
+/// The posture's event builders for tests: its own, and the agent's tests
+/// of the posture (nn-core's `test-util`, R08a, lab PR 250).
+#[cfg(any(test, feature = "test-util"))]
+pub mod testutil {
     use super::*;
 
     pub fn spawn(pid: u32, ppid: u32, comm: &str, filename: &str, ts: u64) -> Event {
@@ -1906,6 +1942,11 @@ pub(super) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::testutil::*;
+
+    use crate::posture::host::testing::{TestHost, TEST_OWNER};
+
+    /// R08a (lab PR 250): the detector on the portable test host.
+    type TriggerDetector = super::TriggerDetector<TestHost>;
 
     /// Review entry 37: the trigger keeps firing on every hit (posture
     /// logic unchanged) but the WARN is due once per window per pid.
@@ -2082,36 +2123,6 @@ mod tests {
         // A file on tmpfs that is still linked: no second factor.
         let hits = det.detect(&spawn_exe_flags(43, 1, "/dev/shm/x", TMPFS, 1), &[]);
         assert_eq!(hits, vec![TriggerType::StagingExec]);
-    }
-
-    /// Lab PR 224 (CM-03): a shell whose stdin/stdout is a socket connected
-    /// out is a confirmed intrusion (COMBAT tier, corroboration needed);
-    /// the same shell on a terminal, or an accepted socket systemd handed
-    /// over (`Accept=yes`, PID 1 the parent), is not.
-    #[test]
-    fn a_reverse_shell_is_confirmed_intrusion() {
-        let det = detector_with_empty_proc();
-        let with = |ppid: u32, outbound: bool| {
-            let mut e = spawn_exe_flags(44, ppid, "/usr/bin/bash", 0, 1);
-            if let Event::ProcessSpawn { stdio, .. } = &mut e {
-                stdio.own = nn_model::StdioSocket {
-                    read: true,
-                    inet_fds: 0b011,
-                    outbound,
-                    proto: 6,
-                    peer: Some("127.0.0.1:44401".parse().unwrap()),
-                };
-            }
-            e
-        };
-        assert_eq!(
-            det.detect(&with(4000, true), &[]),
-            vec![TriggerType::ConfirmedIntrusion]
-        );
-        assert!(det.detect(&with(1, false), &[]).is_empty());
-        assert!(det
-            .detect(&spawn_exe_flags(45, 4000, "/usr/bin/bash", 0, 1), &[])
-            .is_empty());
     }
 
     /// External audit POS-015: the mass-write arm fired for the same
@@ -3267,10 +3278,10 @@ mod tests {
     fn rootless_build() -> (tempfile::TempDir, tempfile::TempDir, TriggerDetector, u32) {
         use super::super::exempt::ExemptPids;
         use super::super::lineage::AuthSessionTracker;
-        use std::os::unix::fs::symlink;
+        use crate::posture::host::testing::symlink;
         let host = tempfile::tempdir().unwrap();
         let procs = tempfile::tempdir().unwrap();
-        let me = unsafe { libc::getuid() };
+        let me = TEST_OWNER;
         std::fs::create_dir_all(host.path().join("home/u/.local/share/containers/storage"))
             .unwrap();
         for (pid, ns) in [("1", "mnt:[4026531841]"), ("700", "mnt:[4026532900]")] {

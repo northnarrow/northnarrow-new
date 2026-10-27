@@ -197,6 +197,10 @@ state after each step.
 
 - Harness: `agent/src/posture/golden.rs` (tests of the agent library: no
   root, no network, no real process; part of `cargo test --workspace`).
+  Since R08a (lab PR 250) the posture is nn-core's (`nn_core::posture`); the
+  replay runs it on the agent's host (`LinuxHost`, a `/proc` of the case's
+  own), with the agent's rules, ladder and audit log, and reads the
+  machine's state through nn-core's test helpers (`test-util`).
 - Streams: `agent/tests/golden/posture/cases/<case>.json`.
 - Golden files: `agent/tests/golden/posture/expected/<case>.jsonl`.
 - Fixture host: the decision replay's (`agent/tests/golden/host`), plus a

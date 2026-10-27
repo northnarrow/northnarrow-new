@@ -165,8 +165,6 @@ planned = false
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
 "canary::detector" = "nn-core"
-# judges on `posture::lineage` (R08a)
-"canary::readers" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
 # post-plan (lab PR 241, R04a): the chains' Linux file operations
@@ -183,10 +181,12 @@ planned = false
 # comm_allowlist, overlay_auth (verify), overlay_floor. R07 (lab PR 247):
 # `overlay` (the loader) and the part of `overlay_auth` the loaders take
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
-# agent's host; comm_allowlist judges on `posture::lineage` and holds a kill
-# through `decision::response_policy` (R08); the gate verifies through
-# `anti_tamper::admin_auth` (nn-proto, after R04b) and the floor reads the
-# agent's key (`keys`): they move when those are below nn-core (§4.1 rule 3)
+# agent's host; comm_allowlist judges on `posture::lineage` (nn-core's since
+# R08a, lab PR 250) and holds a kill through `decision::response_policy`
+# (its `Judgement::apply`, which the rules call: it moves with them, R08b);
+# the gate verifies through `anti_tamper::admin_auth` (nn-proto, after
+# R04b) and the floor reads the agent's key (`keys`): they move when those
+# are below nn-core (§4.1 rule 3)
 "config" = "nn-core"
 # R04c (lab PR 247, with R07): overlay_auth's install half (`config overlay
 # set`'s atomic write and the new inodes' protection)
@@ -195,18 +195,20 @@ planned = false
 # (`content_host::ContentHost`: the open that follows no symlink and blocks
 # on no FIFO)
 "content_host_linux" = "nn-linux"
-"correlation" = "nn-core"
 # post-plan (lab PR 222): copy on first write; fanotify, copies, journal
 "cow" = "nn-linux"
 "cow::config" = "nn-core"
 "cow::index" = "nn-core"
 "cow::trust" = "nn-core"
 "decision" = "nn-core"
-"detection_budget" = "nn-core"
 # post-plan (lab PR 241, R04a): the detection log's records and their
 # parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
 # file propri"; the payloads are nn-evidence's)
 "detection_payload" = "nn-evidence"
+# post-plan (lab PR 250, R08a): the detection budget's reporter task (tokio,
+# the agent's audit log and detection sink), from `detection_budget`: the
+# composition, as `chains`' tasks
+"detection_report" = "northnarrow-agent"
 # not in §2.4: the detection sink's queue and files, the records'
 # constructors from the engine's decisions (its payloads: above, R04a)
 "detection_store" = "nn-linux"
@@ -250,11 +252,16 @@ planned = false
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # post-plan (lab PR 234): the OS CSPRNG
 "os_rng" = "nn-linux"
-# post-plan (lab PR 241, R04b): the text of the open sensor's paths (cut and
-# unread marks, an exact path, an unplaced path's device, mountinfo's
-# escapes), from `sensors::open_sensor`: the event's vocabulary
-"path_text" = "nn-model"
+# R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
+# agent's binding of it to the Linux host (its paths kept, the machine,
+# triggers, tracker and exemption as aliases on `LinuxHost`; it names
+# `chain_host_linux`, as `config/mod.rs` does for the loaders); the
+# posture's cross-module tests and golden replay stay in `posture/`
 "posture" = "nn-core"
+# post-plan (lab PR 250, R08a): the Linux host of the posture — the process
+# table (`/proc`), the host's files, a directory's owner, the clocks — of
+# nn-core's `posture::host::PostureHost`
+"posture_host_linux" = "nn-linux"
 # post-plan (lab PR 216): no core dump, no readable memory
 "process_hardening" = "nn-linux"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
@@ -277,14 +284,17 @@ planned = false
 # post-plan (lab only): `--verifier-check`
 "verifier_check" = "nn-linux"
 
-# ── agent/src: the shims of R05 and R07 ───────────────────────────────
+# ── agent/src: the shims of R05, R07 and R08a ─────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
 # their paths, without a file, in `lib.rs` and `canary/mod.rs` (plan §4.1
 # rule 2: `pub use nn_evidence::…`; the writers' aliases with the agent's
 # key as default and the key's names under `audit`; removed in R17). A
 # reference to one counts for nn-evidence. R07 (lab PR 247): content
 # modules moved to nn-core, their paths kept the same way in their
-# parent's `mod.rs`; a reference to one counts for nn-core.
+# parent's `mod.rs`; a reference to one counts for nn-core. R08a (lab PR
+# 250): the open sensor's path text moved to nn-model first (the posture
+# reads it: §4.1 rule 3), then the posture, its lineage, the correlation
+# buffer and the detection budget to nn-core, the same way.
 
 [shims.agent]
 # R07 (lab PR 247): the COMBAT carve-out
@@ -292,6 +302,9 @@ planned = false
 "audit" = "nn-evidence"
 # post-plan (lab PR 178): the one reader of the canary chains' lines
 "canary::chain_lines" = "nn-evidence"
+# R08a (lab PR 250): the readers a File or Credential canary spares (they
+# judge on `posture::lineage`); `canary/mod.rs` binds them to the agent's host
+"canary::readers" = "nn-core"
 # R07 (lab PR 247): the credential renderer; `canary/mod.rs` binds it to the
 # agent's host and draws the deploy's seed from the OS RNG
 "canary::templates" = "nn-core"
@@ -301,11 +314,19 @@ planned = false
 "chain_host" = "nn-evidence"
 "chain_tail" = "nn-evidence"
 "chainlog" = "nn-evidence"
+# R08a (lab PR 250): the buffer of recent events the triggers read
+"correlation" = "nn-core"
+# R08a (lab PR 250): the budget; its reporter task stays in the agent
+# (`detection_report`)
+"detection_budget" = "nn-core"
 # R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
 # binds its reading loaders to the agent's host
 "config::overlay" = "nn-core"
 # R07 (lab PR 247): the FIM watched paths; `fim/mod.rs` binds the loader
 "fim::paths_config" = "nn-core"
+# R08a (lab PR 250): the text of the open sensor's paths (post-plan, lab PR
+# 241, R04b: from `sensors::open_sensor`), the event's vocabulary
+"path_text" = "nn-model"
 "verify_lines" = "nn-evidence"
 
 # ── common/src: module → crate (§2.4) ────────────────────────────────────
@@ -351,11 +372,20 @@ planned = false
 # (→ 40); the moved list loader no longer names the host, `config/mod.rs`,
 # which binds it, does (40); the canary renderer moved and the OS RNG of its
 # seed stayed in the agent (→ 38). The two left of R07's: `config/mod.rs`
-# and the gate in `config/overlay_auth.rs` name `chain_host_linux`.
+# and the gate in `config/overlay_auth.rs` name `chain_host_linux`. Lab PR
+# 250 (R08a): 52 → 51, nn-core 38 → 37: the detection budget's reporter
+# task (the detection sink) left it for `detection_report`; the posture's
+# seam — the lineage and the stack exemption name the agent's Linux host
+# where they called `std::fs` and libc, which the scan does not see (→ 39);
+# they moved, the machine's `posture/mod.rs`, which binds them to that host,
+# names it (→ 38); the triggers consult the agent's other modules through
+# that host, the posture's second seam (→ 39); the machine, the triggers,
+# the entry and the clock moved, and the agent's `posture.rs`, which binds
+# the posture to the Linux host, names it (→ 36).
 
 [ratchet]
 nn-admin = 8
-nn-core = 38
+nn-core = 36
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

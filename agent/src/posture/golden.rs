@@ -1249,7 +1249,7 @@ impl Replay {
     fn collect(&mut self, line: &mut Value, evidence: Option<&Value>) -> bool {
         // A heartbeat that changed nothing (most of them): no copy of the
         // logs.
-        if self.posture.inner.transitions.read().len() == self.transitions_seen
+        if self.posture.transitions_len() == self.transitions_seen
             && self.host.journal.lock().is_empty()
             && self.audit.lock().rows() as usize == self.rows.len()
         {
@@ -1367,12 +1367,9 @@ impl Replay {
     /// evidence, level, confidence), the actor's scope and the signals that
     /// scope held before it (what corroborates a COMBAT-tier heuristic).
     fn evidence_before(&self, event: &Event) -> (super::corroboration::Scope, Value) {
-        let scope = self.posture.inner.triggers.session_scope(event);
+        let scope = self.posture.trigger_detector().session_scope(event);
         let held: Vec<Value> = self
             .posture
-            .inner
-            .corroboration
-            .lock()
             .signals_of(&scope, self.clock.now())
             .into_iter()
             .map(|(t, class, privileged, placed)| {

@@ -6,7 +6,7 @@
 //! shifts up as evidence accumulates (recon → exploit → confirmed
 //! intrusion) and:
 //!
-//! - engages the COMBAT active-response ladder ([`crate::combat`]) when
+//! - engages the COMBAT active-response ladder (the agent's `combat`) when
 //!   it reaches `COMBAT`,
 //! - blocks automatic exit from `COMBAT` (admin-signed release only).
 //!
@@ -41,14 +41,13 @@ pub mod corroboration;
 pub mod entry;
 pub mod escalation_allow;
 pub mod exempt;
+pub mod host;
 pub mod lineage;
 pub mod mass_write_overlay;
 pub mod state;
 pub mod transitions;
 pub mod triggers;
 
-#[cfg(test)]
-mod golden;
 #[cfg(test)]
 mod tests;
 
@@ -62,11 +61,10 @@ use nn_model::posture_types::{
 };
 use nn_model::Event;
 
-use crate::anti_tamper::network_isolate::UnlockToken;
-use crate::decision::rule_policy::PolicyHandle;
 use clock::Clock;
 use corroboration::CorroborationLedger;
 use escalation_allow::EscalationAllowList;
+use host::PostureAgent;
 
 pub use entry::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 pub use exempt::{
@@ -86,9 +84,13 @@ const TRANSITION_LOG_CAP: usize = 256;
 /// The handle is `Send + Sync + Clone` (cheap clones — internally an
 /// `Arc<Inner>`), so callers can stash it in tokio tasks without
 /// extra plumbing.
+///
+/// R08a (lab PR 250): `H` is the host — its process table and clocks, and
+/// what the machine consults in the agent's other modules ([`PostureAgent`];
+/// the agent's is `LinuxHost`).
 #[derive(Clone)]
-pub struct PostureMachine {
-    inner: Arc<Inner>,
+pub struct PostureMachine<H: PostureAgent> {
+    inner: Arc<Inner<H>>,
 }
 
 /// Hook invoked exactly once per Observing/Alerted/Engaged →
@@ -125,7 +127,7 @@ pub enum ReleaseScope {
 
 /// Hook invoked when the admin releases COMBAT via
 /// [`PostureMachine::admin_release_combat_with_token`] (or forces the
-/// posture out of it). Receives the validated [`UnlockToken`] by value so
+/// posture out of it). Receives the validated [`PostureAgent::UnlockToken`] by value so
 /// the implementation can pass it straight into `NetworkIsolator::release`.
 ///
 /// Lab PR 217 (NN-AUD-243 residue, capability C17): it returns what it did,
@@ -134,22 +136,25 @@ pub enum ReleaseScope {
 /// It used to return nothing and run after the state had already been
 /// written ALERTED, so a teardown that failed was answered `Success` and
 /// recorded as one.
-pub type CombatReleaseHook = Arc<dyn Fn(UnlockToken, ReleaseScope) -> ReleaseResult + Send + Sync>;
+///
+/// R08a (lab PR 250): `T` is the host's unlock capability
+/// ([`PostureAgent::UnlockToken`]).
+pub type CombatReleaseHook<T> = Arc<dyn Fn(T, ReleaseScope) -> ReleaseResult + Send + Sync>;
 
 /// Pre-#6 alias retained so any in-flight references keep building.
 pub type CombatHook = CombatEntryHook;
 
-struct Inner {
+struct Inner<H: PostureAgent> {
     state: RwLock<PostureState>,
     transitions: RwLock<Vec<PostureTransition>>,
-    triggers: TriggerDetector,
+    triggers: TriggerDetector<H>,
     /// BUG-032 — recent escalation signals, used to decide whether a
     /// blunt COMBAT-tier heuristic has corroboration. Only ever touched
     /// inside `observe()`'s `state.write()` critical section (consistent
     /// lock order, no hazard).
     corroboration: Mutex<CorroborationLedger>,
     combat_entry_hook: Option<CombatEntryHook>,
-    combat_release_hook: Option<CombatReleaseHook>,
+    combat_release_hook: Option<CombatReleaseHook<H::UnlockToken>>,
     /// Monotonic timestamp of the most recent successful admin
     /// release. `None` if no admin action has occurred since boot.
     /// Read by `StatusResponse` via [`PostureMachine::last_admin_action_secs_ago`].
@@ -166,10 +171,10 @@ struct Inner {
     /// the engine reads and `nn-admin policy set` swaps
     /// ([`PostureMachine::with_rule_policy`]); the built-in defaults
     /// otherwise. It was a process-wide switch.
-    rule_policy: PolicyHandle,
+    rule_policy: H::RulePolicy,
 }
 
-impl PostureMachine {
+impl<H: PostureAgent> PostureMachine<H> {
     pub fn new() -> Self {
         Self::build(
             None,
@@ -205,12 +210,15 @@ impl PostureMachine {
     /// Build a machine that fires both an entry hook (on the
     /// non-Combat → Combat edge) and a release hook (during
     /// [`Self::admin_release_combat_with_token`]). The release hook
-    /// receives the validated [`UnlockToken`] by value.
+    /// receives the validated [`PostureAgent::UnlockToken`] by value.
     ///
     /// This is the production constructor — `main.rs` uses it to
     /// wire `NetworkIsolator::engage` and `NetworkIsolator::release`
     /// to the posture state machine in one place.
-    pub fn new_with_hooks(entry: CombatEntryHook, release: CombatReleaseHook) -> Self {
+    pub fn new_with_hooks(
+        entry: CombatEntryHook,
+        release: CombatReleaseHook<H::UnlockToken>,
+    ) -> Self {
         Self::build(
             Some(entry),
             Some(release),
@@ -228,7 +236,7 @@ impl PostureMachine {
     /// [`TriggerDetector`] docs). `main.rs` passes `std::process::id()`.
     pub fn new_with_hooks_and_self_pid(
         entry: CombatEntryHook,
-        release: CombatReleaseHook,
+        release: CombatReleaseHook<H::UnlockToken>,
         self_pid: u32,
     ) -> Self {
         Self::build(
@@ -249,8 +257,8 @@ impl PostureMachine {
     /// timer.
     pub fn new_with_hooks_and_exempt(
         entry: CombatEntryHook,
-        release: CombatReleaseHook,
-        exempt: ExemptPids,
+        release: CombatReleaseHook<H::UnlockToken>,
+        exempt: ExemptPids<H>,
     ) -> Self {
         Self::build(
             Some(entry),
@@ -271,9 +279,9 @@ impl PostureMachine {
     /// the posture machine.
     pub fn new_with_hooks_and_exempt_and_auth(
         entry: CombatEntryHook,
-        release: CombatReleaseHook,
-        exempt: ExemptPids,
-        auth: AuthSessionTracker,
+        release: CombatReleaseHook<H::UnlockToken>,
+        exempt: ExemptPids<H>,
+        auth: AuthSessionTracker<H>,
     ) -> Self {
         Self::build(
             Some(entry),
@@ -293,9 +301,9 @@ impl PostureMachine {
     /// constructor.
     pub fn new_with_hooks_and_exempt_and_auth_and_extras(
         entry: CombatEntryHook,
-        release: CombatReleaseHook,
-        exempt: ExemptPids,
-        auth: AuthSessionTracker,
+        release: CombatReleaseHook<H::UnlockToken>,
+        exempt: ExemptPids<H>,
+        auth: AuthSessionTracker<H>,
         mass_write_extras: Vec<String>,
         escalation_allow: EscalationAllowList,
     ) -> Self {
@@ -311,9 +319,9 @@ impl PostureMachine {
 
     fn build(
         combat_entry_hook: Option<CombatEntryHook>,
-        combat_release_hook: Option<CombatReleaseHook>,
-        exempt: ExemptPids,
-        auth: AuthSessionTracker,
+        combat_release_hook: Option<CombatReleaseHook<H::UnlockToken>>,
+        exempt: ExemptPids<H>,
+        auth: AuthSessionTracker<H>,
         mass_write_extras: Vec<String>,
         escalation_allow: EscalationAllowList,
     ) -> Self {
@@ -330,7 +338,7 @@ impl PostureMachine {
                 last_admin_action: Mutex::new(None),
                 combat_decay_hook: std::sync::OnceLock::new(),
                 clock: Arc::new(clock::SystemClock),
-                rule_policy: PolicyHandle::default(),
+                rule_policy: H::RulePolicy::default(),
             }),
         }
     }
@@ -353,7 +361,7 @@ impl PostureMachine {
     /// at its next event, as it reaches the engine. Without it the machine
     /// reads the built-in defaults (off). Call before the machine is
     /// shared (cloned); a later call is ignored, said so.
-    pub fn with_rule_policy(mut self, handle: PolicyHandle) -> Self {
+    pub fn with_rule_policy(mut self, handle: H::RulePolicy) -> Self {
         match Arc::get_mut(&mut self.inner) {
             Some(inner) => inner.rule_policy = handle,
             None => {
@@ -367,10 +375,7 @@ impl PostureMachine {
     /// this machine now: the directive of the policy it reads (lab PR 236,
     /// 249).
     pub fn ransomware_combat_without_corroboration(&self) -> bool {
-        self.inner
-            .rule_policy
-            .current()
-            .ransomware_combat_without_corroboration
+        H::ransomware_combat_without_corroboration(&self.inner.rule_policy)
     }
 
     /// Tappa 10.9 step 1, lab PR 249: switch this machine's mass-write arm
@@ -407,23 +412,20 @@ impl PostureMachine {
     /// an anti-tamper control-surface file does not raise the posture (the
     /// FIM-024 rule still acts). Unwired, the trigger always fires. Set
     /// once; a second call is ignored.
-    pub fn set_installer_window(
-        &self,
-        window: Arc<crate::anti_tamper::trusted_installer::TrustedInstallerOverride>,
-    ) {
+    pub fn set_installer_window(&self, window: Arc<H::InstallerWindow>) {
         self.inner.triggers.set_installer_window(window);
     }
 
     /// Lab PR 225: the ransomware tracker the rules share; the posture
     /// raises `RansomwareEncryption` on its decisive assessments. Unwired,
     /// the trigger never fires. Set once; a second call is ignored.
-    pub fn set_ransom_tracker(&self, tracker: Arc<crate::impact::RansomTracker>) {
+    pub fn set_ransom_tracker(&self, tracker: Arc<H::RansomTracker>) {
         self.inner.triggers.set_ransom_tracker(tracker);
     }
 
     /// Lab PR 225: the security-tool detector the rules share; the posture
     /// raises `DefenseImpairment` on its unsanctioned findings. Set once.
-    pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector>) {
+    pub fn set_defense_detector(&self, detector: Arc<H::DefenseDetector>) {
         self.inner.triggers.set_defense_detector(detector);
     }
 
@@ -868,7 +870,7 @@ impl PostureMachine {
     /// `nn-admin status` response.
     pub fn admin_release_combat_with_token(
         &self,
-        token: UnlockToken,
+        token: H::UnlockToken,
     ) -> Result<ReleaseOutcome, AdminReleaseError> {
         let in_combat = matches!(*self.inner.state.read(), PostureState::Combat { .. });
         let scope = if in_combat {
@@ -957,9 +959,9 @@ impl PostureMachine {
     }
 
     /// Tappa 8 A10 — production force-posture (design §12.2).
-    /// Capability-gated by [`UnlockToken`] in the same way as
+    /// Capability-gated by [`PostureAgent::UnlockToken`] in the same way as
     /// [`Self::admin_release_combat_with_token`]; consumed at the
-    /// type-system level so only [`crate::anti_tamper::admin_auth::AdminAuth`]
+    /// type-system level so only the agent's `anti_tamper::admin_auth::AdminAuth`
     /// (the sole minting site outside `cfg(test)`) can drive this
     /// path. Allowed direction: any state → any state.
     ///
@@ -992,7 +994,7 @@ impl PostureMachine {
     /// before the call would race with an autonomous COMBAT entry.
     pub fn admin_force_state_with_token(
         &self,
-        token: UnlockToken,
+        token: H::UnlockToken,
         target: PostureKind,
         may_release: bool,
     ) -> Result<ForceOutcome, AdminReleaseError> {
@@ -1004,7 +1006,7 @@ impl PostureMachine {
     /// in the ladder's signed rows.
     pub fn admin_force_state_signed_by(
         &self,
-        token: UnlockToken,
+        token: H::UnlockToken,
         target: PostureKind,
         may_release: bool,
         signers: Vec<String>,
@@ -1207,7 +1209,34 @@ impl PostureMachine {
     }
 }
 
-impl Default for PostureMachine {
+/// The posture golden's readers of the machine's state (lab PR 243). R08a
+/// (lab PR 250): the replay stays in the agent (it wires the ladder, the
+/// audit log and the rules), so what it read through the machine's private
+/// fields is this crate's test helpers (`test-util`). Readers only.
+#[cfg(any(test, feature = "test-util"))]
+impl<H: PostureAgent> PostureMachine<H> {
+    /// The number of transitions in the log (no copy of it).
+    pub fn transitions_len(&self) -> usize {
+        self.inner.transitions.read().len()
+    }
+
+    /// The machine's trigger detector.
+    pub fn trigger_detector(&self) -> &TriggerDetector<H> {
+        &self.inner.triggers
+    }
+
+    /// The signals the corroboration ledger holds for `scope` as of `now`
+    /// ([`corroboration::CorroborationLedger::signals_of`]).
+    pub fn signals_of(
+        &self,
+        scope: &corroboration::Scope,
+        now: Instant,
+    ) -> Vec<(TriggerType, EvidenceClass, bool, bool)> {
+        self.inner.corroboration.lock().signals_of(scope, now)
+    }
+}
+
+impl<H: PostureAgent> Default for PostureMachine<H> {
     fn default() -> Self {
         Self::new()
     }

@@ -77,13 +77,20 @@ pub mod config;
 /// The Linux host of the content lists: the open of nn-core's
 /// `ContentHost` (R07, lab PR 247).
 pub mod content_host_linux;
-pub mod correlation;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the buffer of
+/// recent events the posture's triggers read is nn-core's.
+pub use nn_core::correlation;
 /// Lab PR 222: copy on first write (ransomware rollback, EXPERIMENTAL).
 pub mod cow;
 pub mod decision;
-pub mod detection_budget;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the detection
+/// budget is nn-core's; its reporter task is [`detection_report`].
+pub use nn_core::detection_budget;
 /// The detection log's records (from `detection_store`, R04a, lab PR 241).
 pub mod detection_payload;
+/// The detection budget's reporter task (from `detection_budget`, R08a, lab
+/// PR 250).
+pub mod detection_report;
 pub mod detection_store;
 pub mod execpol;
 pub mod execq;
@@ -100,10 +107,14 @@ pub mod keys;
 pub mod loop_progress;
 pub mod net;
 pub mod os_rng;
-/// The text of the open sensor's paths (from `sensors::open_sensor`, R04b,
-/// lab PR 241).
-pub mod path_text;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the text of the
+/// open sensor's paths (from `sensors::open_sensor`, R04b, lab PR 241) is
+/// nn-model's, the crate the module map names; the posture reads it.
+pub use nn_model::path_text;
 pub mod posture;
+/// The Linux host of the posture: the process table, the host's files and
+/// the clocks of nn-core's `PostureHost` (R08a, lab PR 250).
+pub mod posture_host_linux;
 pub mod process_hardening;
 pub mod removed_settings;
 pub mod response;

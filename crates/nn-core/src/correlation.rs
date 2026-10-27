@@ -10,7 +10,7 @@
 //! It also used to select the events related to a focal one for the
 //! prompt of the on-host LLM advisor (external audit XAI-004, XAI-013,
 //! LLMR-010); that selection left with the advisor in Wave 4 (lab PR 214).
-//! The rules' own correlation is [`crate::decision::correlation`].
+//! The rules' own correlation is the agent's `decision::correlation`.
 
 use std::collections::VecDeque;
 

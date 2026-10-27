@@ -519,7 +519,7 @@ pub(super) const DOCS: &[RuleDoc] = &[
         tests: &[
             "agent/src/decision/rules/evasion.rs::eva_rules_record_the_ms25_commands",
             "agent/src/decision/rules/evasion.rs::eva_002_coalesces_the_iptables_calls_of_one_ufw_disable",
-            "agent/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget",
+            "crates/nn-core/src/detection_budget.rs::coalesced_repeats_are_counted_without_spending_the_budget",
             "deploy/lab/malsim/ransom-check.sh::MS-25",
         ],
         attack_note: "As NN-L-EVA-001.",

@@ -1163,6 +1163,68 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   holds the same text but the moved files' paths and the callsite line
   numbers of the moved and edited files; the moved modules' tracing target
   is `nn_core::…` (not printed: `with_target(false)`).
+- Wave 4 restructure, R08a — nn-core, part 2a: the posture, its lineage,
+  the correlation buffer and the detection budget (lab PR 250). Moved to
+  `crates/nn-core` (`git mv`, 84–100 %): the posture's state machine, its
+  triggers, the COMBAT entry and the clock, the corroboration ledger, the
+  state and the transitions, the lineage tracker, the stack exemption, the
+  two operator overlays (`escalation_allow`, `mass_write_overlay`), the
+  canary readers (they judge on the lineage), the correlation buffer and
+  the detection budget; the open sensor's path text (`path_text`) to
+  `crates/nn-model` first, as the posture reads it. nn-core stays pure:
+  what the posture read from its host itself — the process table (`exe`,
+  `status`, `stat`, `cgroup`, `loginuid`, `cmdline`, `mountinfo`,
+  `ns/mnt`), the host's `/etc/subuid` and `/etc/passwd`, a directory's
+  owner, the time suspended (`CLOCK_BOOTTIME` − `CLOCK_MONOTONIC`, read by
+  `for_host`'s live checks), `CLOCK_MONOTONIC` and the clock tick — is the
+  new `posture::host::PostureHost`'s, and what it consults in the agent's
+  other modules — the rule engine's shapes the triggers share with the
+  rules (NN-L-FIM-024's bait tamper, NN-L-EPG-001/002, R020's reverse
+  shell, the staging directories), the per-rule policy, the
+  trusted-installer window, the ransomware and security-tool judges, the
+  unlock token — is `posture::host::PostureAgent`'s; both are implemented
+  for the agent's `LinuxHost` by `posture_host_linux` with the calls the
+  posture made, and the posture's types take the host as a type
+  parameter. The budget's reporter task (tokio, the agent's audit log and
+  detection sink) stays in the agent (`detection_report`). The agent keeps
+  every path as a shim (removed in R17): `lib.rs`, `canary/mod.rs` and a
+  new `posture.rs`, with the machine, the detector, the tracker and the
+  exemption as aliases on `LinuxHost`; callers, `main.rs`, the admin
+  socket, the ladder, the rules, the tests, the replays, the examples and
+  the fuzz targets are unchanged. 252 tests moved with their code and run
+  on a portable test host; the cross-module tests and the golden replay
+  stay in the agent and read nn-core's test helpers through a
+  dev-dependency feature (`test-util`; the legacy boolean release stays
+  `cfg(test)`). The ratchet goes from 52 to 50 (nn-core 38 → 36). Not
+  moved: the comm allowlists (`Judgement::apply`, which the rules call,
+  holds a kill through the engine's response policy: R08b), the
+  blocklists and the decision replay (R08b), the overlay gate and the
+  rollback floor (after R04b and R09a). Identity against `main` 9e33fad,
+  same path, the release job's flags: the eBPF object and its stamp are
+  byte-identical (sha256 a4f7006f… at that path; stamp source
+  c0365736…); the scanner is byte-identical; the watchdog (2,336,920 →
+  2,337,080 bytes) has every one of `main`'s 2,469 functions the same
+  code and one more copy of a `RawVec` growth body `main` has twice, which
+  `path_text`'s move into nn-model alone gives (that commit builds the
+  same watchdog byte for byte); the tarball's 72 entries and the .deb's 79
+  paths and modes are the same; the golden replays (five runs), the wire
+  and chain format pins, the crypto vectors, the parser pins and the
+  overlay-v1 fixture pass unchanged; the test list is `main`'s (3,078
+  names: 252 now in nn-core, R020's trigger test in the agent's
+  `posture::tests`) and three tests of the Linux host. The agent
+  (14,901,048 → 14,940,328 bytes) and nn-admin (4,029,280 → 4,029,840)
+  are not byte-identical: function by function, names mapped and
+  addresses dropped, 7,536 of the agent's 7,653 functions and 3,440 of
+  nn-admin's 3,478 are the same code; a control (`main` with nn-core's new
+  dependencies, no source moved) already changes 21 and 6 (clap's
+  `TypeId`s, which of identical bodies keeps its name); the move adds
+  inlining and register choices at the new crate boundary, the machine's
+  `observe` kept out of `process_event` (+28,039 / −24,512 bytes), and
+  the lineage's methods made in both the agent's library and its binary
+  once generic (`.text` +35,376 bytes, +0.49 %). `.rodata` holds the same
+  text but the moved files' paths, the callsite line numbers and the
+  reporter's path; the moved modules' tracing target is `nn_core::…` (not
+  printed: `with_target(false)`).
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and
