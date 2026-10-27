@@ -184,6 +184,9 @@ planned = false
 # comm_allowlist, overlay (parse), overlay_auth (verify; install → nn-linux,
 # R04c), overlay_floor
 "config" = "nn-core"
+# R04c (lab PR 247, with R07): overlay_auth's install half (`config overlay
+# set`'s atomic write and the new inodes' protection)
+"config::overlay_install" = "nn-linux"
 # post-plan (lab PR 247, R07): the Linux host of nn-core's content lists
 # (`content_host::ContentHost`: the open that follows no symlink and blocks
 # on no FIFO)
@@ -323,11 +326,12 @@ planned = false
 # nn-evidence and nn-core to 0. Lab PR 241: 77 → 54 (nn-evidence 0; nn-core
 # 40, the rest R04b's and R04c's). Lab PR 247 (R07): the content code's
 # reads go through the host seam, which names the agent's Linux host
-# where libc was called before (nn-core 40 → 43, until the moves).
+# where libc was called before (nn-core 40 → 43, until the moves);
+# overlay_auth's install half leaves for nn-linux (→ 42).
 
 [ratchet]
 nn-admin = 8
-nn-core = 43
+nn-core = 42
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

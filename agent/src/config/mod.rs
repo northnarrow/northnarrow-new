@@ -11,6 +11,9 @@ pub mod comm_allowlist;
 pub mod overlay;
 pub mod overlay_auth;
 pub mod overlay_floor;
+/// The install half of a signed overlay (`config overlay set`'s write and
+/// inode protection; from `overlay_auth`, R04c, lab PR 247).
+pub mod overlay_install;
 
 /// The shipped default lists of every family, against `deploy/install.sh`
 /// and `configs/`. R07 (lab PR 247): from `overlay`'s tests (the loader's

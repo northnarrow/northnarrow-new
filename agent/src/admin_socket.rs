@@ -2701,7 +2701,7 @@ fn dispatch_config_overlay_set(
         Ok(s) => s,
         Err(e) => return refuse(AdminResult::Success, format!("{e:#}")),
     };
-    match overlay_auth::store(&target, &req.content, &sig) {
+    match crate::config::overlay_install::store(&target, &req.content, &sig) {
         // Lab PR 236: the per-rule policy is put in force at once, between
         // two events; the signed `config_overlay_set` row records it
         // (`applied` in its detail).
