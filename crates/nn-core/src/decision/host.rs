@@ -2,7 +2,8 @@
 //! restructure, R08b, lab PR 251).
 //!
 //! The engine judges events; what it reads to judge them — the process
-//! table, the clocks, the lineage — is its host's ([`PostureHost`], R08a,
+//! table, the clocks, the lineage — is its host's
+//! ([`crate::posture::host::PostureHost`], R08a,
 //! lab PR 250). A few of its judges also ask the host for something no pure
 //! crate can name: R018 and the ransomware tracker ask the system
 //! directories' `rpm` whether a package owns a file and keep that work, and

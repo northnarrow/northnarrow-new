@@ -31,9 +31,9 @@ pub const HIGH_FILES_MIN: u32 = 2;
 /// Directory entries looked at for siblings.
 pub const DIR_SCAN_MAX: usize = 256;
 /// Directory entries looked at for the copies of a copy-delete burst
-/// ([`sample_copies_dir`]): only a name ending in the copies' suffix is
-/// read further, so a directory of thousands of originals that still wait
-/// their turn costs a few `getdents` calls.
+/// (the agent's `FsSampler`, `sample_copies_dir`): only a name ending in
+/// the copies' suffix is read further, so a directory of thousands of
+/// originals that still wait their turn costs a few `getdents` calls.
 pub const COPY_SCAN_MAX: usize = 4096;
 
 /// What one sampling found.
@@ -61,12 +61,12 @@ pub trait Sampler: Send + Sync {
     fn sample(&self, path: &str, since: Duration) -> Sample;
     /// Sample the copies a copy-delete burst left behind: `copy` (an
     /// original's name with `.suffix` appended, the original deleted) and
-    /// the other copies of that shape changed since `since`
-    /// ([`sample_copies_dir`]), never the originals beside them. The burst's
+    /// the other copies of that shape changed since `since` (the agent's
+    /// `sample_copies_dir`), never the originals beside them. The burst's
     /// uid is not known here: in a shared directory no copy counts.
     fn sample_copies(&self, copy: &str, suffix: &str, since: Duration) -> Sample;
     /// [`Self::sample_copies`] for a burst that ran as `uid` (lab PR 238):
-    /// in a shared directory ([`shared_dir`]: `/tmp`, `/var/tmp`,
+    /// in a shared directory (the agent's `shared_dir`: `/tmp`, `/var/tmp`,
     /// `/dev/shm`) only the copies `uid` owns count. What the tracker calls.
     /// A sampler that answers by path (the tests', the golden replay's)
     /// keeps this default: its [`Self::sample_copies`].

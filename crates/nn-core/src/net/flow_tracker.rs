@@ -396,7 +396,7 @@ impl<H: DecisionHost> FlowTracker<H> {
     /// and sent now — its connect is on the bus already (announced), or
     /// no connect will come: a kernel lookup miss (zero), a row already
     /// synthesised, or no connect pump. Otherwise the close waits, a
-    /// bounded time ([`crate::net::drain::CONNECT_WAIT`]): the connect and
+    /// bounded time (the agent's `net::drain::CONNECT_WAIT`): the connect and
     /// the close come on two rings, read by two tasks, and a close sent
     /// first was judged before the connect it ends — a network canary
     /// trip's own connection before the trip that owns it.
@@ -646,7 +646,7 @@ impl<H: DecisionHost> FlowTracker<H> {
     /// the connect event has not reached the tracker yet (short-lived
     /// flow, loopback connect+close in well under the pipeline latency;
     /// since lab PR 246 the drain waits for it first, so this is the
-    /// connect lost or late past [`crate::net::drain::CONNECT_WAIT`]).
+    /// connect lost or late past the agent's `net::drain::CONNECT_WAIT`).
     /// Build the row from what the close hook carries — the full
     /// 5-tuple, owner and byte counters — with no exe/hostname
     /// enrichment (the drain names the image, external audit NET-012),

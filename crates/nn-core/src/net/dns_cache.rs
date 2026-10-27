@@ -13,8 +13,8 @@
 //! a DNS-response observer lands and we can index by resolved IP
 //! directly. V1.0 ships the per-pid recent-query queue + the
 //! reply parser as a forward-compat utility (so the V1.1 wire-up
-//! is just plugging the observer into [`parse_a_records`] /
-//! [`parse_aaaa_records`]).
+//! is just plugging the observer into nn-parse's `parse_a_records` /
+//! `parse_aaaa_records`).
 //!
 //! Q3 5-minute window is **hard-coded** in V1.0 per the lock-in
 //! ("Operator-tunable in V1.1 via net.dns_cache_ttl_secs"). The

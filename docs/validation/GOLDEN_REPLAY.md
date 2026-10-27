@@ -22,10 +22,11 @@ Each case is replayed on a fresh engine built the way `main.rs` builds it:
 the 86 rules of `default_rules_with_net`, in their order, over the shipped
 lists of `configs/` (process and network comm allowlists, the network and
 JA3 blocklists, `security-tools.v1`), the default fan-out thresholds, and
-every per-rule policy switch of `agent/src/decision/response_policy.rs` at
+every per-rule policy switch of `crates/nn-core/src/decision/response_policy.rs` at
 its production value — off — under the case's per-rule policy (lab PR 236:
 `policy`, the text of a `rule-policy.local`; none: the built-in defaults).
-The engine is built by `agent/src/decision/replay.rs`, which `nn-admin policy
+The engine is built by `crates/nn-core/src/decision/replay.rs` (R08b, lab PR
+251: nn-core's, on the agent's host), which `nn-admin policy
 test` uses too. Nothing of the machine running the test is read:
 
 | host state | in a replay |

@@ -187,10 +187,10 @@ planned = false
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
 # agent's host; comm_allowlist judges on `posture::lineage` (nn-core's since
 # R08a, lab PR 250) and holds a kill through `decision::response_policy`
-# (its `Judgement::apply`, which the rules call: it moves with them, R08b);
-# the gate verifies through `anti_tamper::admin_auth` (nn-proto, after
-# R04b) and the floor reads the agent's key (`keys`): they move when those
-# are below nn-core (§4.1 rule 3)
+# (its `Judgement::apply`, which the rules call): it moved with them (R08b,
+# lab PR 251, `[shims.agent]`); the gate verifies through
+# `anti_tamper::admin_auth` (nn-proto, after R04b) and the floor reads the
+# agent's key (`keys`): they move when those are below nn-core (§4.1 rule 3)
 "config" = "nn-core"
 # R04c (lab PR 247, with R07): overlay_auth's install half (`config overlay
 # set`'s atomic write and the new inodes' protection)
@@ -274,7 +274,9 @@ planned = false
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
 # dns_records in R06, lab PR 242), limiter, blocklist (lab PR 247 sent its
 # inactive-rules report, which reads the resolver's configuration, to
-# `net::blind_spots`; R08b, lab PR 251, moved it: `[shims.agent]`)
+# `net::blind_spots`): R08b (lab PR 251) moved them, with the resolvers,
+# to nn-core (`[shims.agent]`); `net/mod.rs` binds them to the agent's
+# host (inline modules)
 "net" = "nn-core"
 "net::blind_spots" = "nn-linux"
 # post-plan (lab PR 251, R08b): the DNS pump's ingest (lab PR 229: tokio's

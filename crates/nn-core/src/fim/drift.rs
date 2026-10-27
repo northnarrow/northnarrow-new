@@ -120,8 +120,8 @@ fn is_user_writable_prefix(path: &str) -> bool {
 /// Hierarchical token-bucket per `DriftSeverity` tier. Critical
 /// is never throttled (per Q4 lock-in). High + Medium have
 /// independent buckets that refill linearly over a 60s window.
-/// [`process_drift`] spends them only on drift written by a package
-/// manager (review 76).
+/// The agent's `fim::drain::process_drift` spends them only on drift
+/// written by a package manager (review 76).
 ///
 /// Thread-safety: a single `Mutex` wraps the bucket state. The
 /// async drain loop holds the lock for microseconds per drift

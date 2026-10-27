@@ -214,7 +214,7 @@ the trusted-installer window first, or expect the capability to be removed.
 - Design doc (source repository):
   <https://github.com/northnarrow/northnarrow-new/blob/main/docs/design/TAPPA9_FIM_DESIGN.md>
   (§5 LSM hooks, §6 userland, §13 RFC resolutions).
-- Rule catalogue: `agent/src/fim/rules.rs` (NN-L-FIM-001..014).
+- Rule catalogue: `crates/nn-core/src/fim/rules.rs` (NN-L-FIM-001..014).
 - Install script: `deploy/install.sh` (Tappa 9 C7 additions —
   drops `fim-paths.v1` + bootstraps the two chained logs).
 - Operator commands: `nn-admin fim baseline`, `nn-admin fim

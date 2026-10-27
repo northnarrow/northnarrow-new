@@ -12,7 +12,7 @@ tree, NN-L-EVA-001..004's of a staged program that asked, NN-L-FIM-010's
 for a rename seen only as a watched directory's new entry — and the
 posture's COMBAT on `RansomwareEncryption` without corroboration are in the
 code, each behind a switch that is off by default
-(`agent/src/decision/response_policy.rs`,
+(`crates/nn-core/src/decision/response_policy.rs`,
 `common::posture_types::RANSOMWARE_COMBAT_WITHOUT_CORROBORATION`). Until it
 is on, a verdict keeps its severity and its signed record with action
 `Log`, its reasoning saying what was held back, and `RansomwareEncryption`
@@ -125,7 +125,7 @@ kill targets the nearest foreign program (the script, the payload).
   no known format header and deletes the originals (`openssl enc`,
   `ccrypt`): (c′)+(b)+(d).
   The legitimate copy-then-delete shapes are one shape, (d), whoever runs
-  them (`agent/src/impact/tests.rs`,
+  them (`agent/src/impact/host_tests.rs`,
   `benign_copy_delete_shapes_are_not_decisive`): `mv` across filesystems
   and `rsync --remove-source-files` leave no copy beside the original; a
   package unpack (`x.dpkg-new`), compiler temporaries, an editor's safe

@@ -931,7 +931,7 @@ impl Rule for NnLFim008KernelModuleModified {
 /// ## FIM-009 self-upgrade downgrade (§15.1)
 ///
 /// When a trusted-installer window is OPEN
-/// ([`TrustedInstallerOverride::is_window_open`]), a write to the
+/// (the agent's `TrustedInstallerOverride::is_window_open`), a write to the
 /// agent's OWN units ([`OWN_SYSTEMD_UNITS`]) is an authorised in-place
 /// upgrade: the verdict is DOWNGRADED from `KillProcess`/High to an
 /// audit-level `Log`/Low — recorded, never silenced. The scope is
@@ -946,9 +946,9 @@ pub struct NnLFim009SystemdUnitDropped<H: PostureAgent> {
 
 impl<H: PostureAgent> NnLFim009SystemdUnitDropped<H> {
     /// Build with the shared trusted-installer override. [`fim_rules`]
-    /// passes the live handle; the default/test rule sets pass
-    /// [`TrustedInstallerOverride::inert_arc`] (never armed → the rule
-    /// behaves exactly as it did before §15.1).
+    /// passes the live handle; the default/test rule sets pass the
+    /// agent's `TrustedInstallerOverride::inert_arc` (never armed → the
+    /// rule behaves exactly as it did before §15.1).
     pub fn new(installer_override: Arc<H::InstallerWindow>) -> Self {
         Self { installer_override }
     }
