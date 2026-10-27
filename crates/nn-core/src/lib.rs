@@ -22,6 +22,10 @@ pub mod content_host;
 /// (R08a, lab PR 250; was the agent's `correlation`).
 pub mod correlation;
 
+/// The per-(rule, uid) budget of logging and storing detections (R08a, lab
+/// PR 250; was the agent's `detection_budget`, without its reporter task).
+pub mod detection_budget;
+
 /// Configuration content (R07, lab PR 247): the generic `.v1` + `.local`
 /// list loader and what the loaders take from the signed-overlay gate (was
 /// the agent's `config::overlay` and part of its `config::overlay_auth`).

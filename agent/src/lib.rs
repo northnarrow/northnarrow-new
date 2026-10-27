@@ -83,7 +83,9 @@ pub use nn_core::correlation;
 /// Lab PR 222: copy on first write (ransomware rollback, EXPERIMENTAL).
 pub mod cow;
 pub mod decision;
-pub mod detection_budget;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the detection
+/// budget is nn-core's; its reporter task is [`detection_report`].
+pub use nn_core::detection_budget;
 /// The detection log's records (from `detection_store`, R04a, lab PR 241).
 pub mod detection_payload;
 /// The detection budget's reporter task (from `detection_budget`, R08a, lab

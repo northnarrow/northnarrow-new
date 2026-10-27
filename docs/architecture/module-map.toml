@@ -201,7 +201,6 @@ planned = false
 "cow::index" = "nn-core"
 "cow::trust" = "nn-core"
 "decision" = "nn-core"
-"detection_budget" = "nn-core"
 # post-plan (lab PR 241, R04a): the detection log's records and their
 # parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
 # file propri"; the payloads are nn-evidence's)
@@ -305,6 +304,9 @@ planned = false
 "chainlog" = "nn-evidence"
 # R08a (lab PR 250): the buffer of recent events the triggers read
 "correlation" = "nn-core"
+# R08a (lab PR 250): the budget; its reporter task stays in the agent
+# (`detection_report`)
+"detection_budget" = "nn-core"
 # R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
 # binds its reading loaders to the agent's host
 "config::overlay" = "nn-core"
