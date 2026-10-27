@@ -47,6 +47,8 @@ pub mod transitions;
 pub mod triggers;
 
 #[cfg(test)]
+mod golden;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;

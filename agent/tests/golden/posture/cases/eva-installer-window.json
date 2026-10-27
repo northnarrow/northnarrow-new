@@ -1,0 +1,20 @@
+{
+  "about": "Security tools switched off (NN-L-EVA, lab PR 225) and the trusted-installer window (decision of 21/10/2026): a root job outside any login session (a unit's script) holds a signed 300 s grant and stops the agent's own unit — sanctioned by the window (its key and end named), the posture does not move; inside the same window it stops auditd — the window sanctions nothing of another tool: DefenseImpairment, ENGAGED. The window ends (its close signed); the agent's unit stopped again is unsanctioned (ENGAGED already). The job then drops a systemd unit as root: PersistenceMechanism, file-system evidence that the DefenseImpairment of its own scope (execution evidence) corroborates — COMBAT, locked (root changing a system file outside an administrator's session). The ladder investigates and, at the deadline, kills the writer.",
+  "path": ["ENGAGED", "COMBAT"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE"],
+  "signed": ["trusted_installer_window_close", "combat_stage", "combat_outcome"],
+  "start_ns": 100000000000,
+  "procs": [
+    {"pid": 6300001, "ppid": 1, "start_ns": 50000000000, "uid": 0, "comm": "bash", "exe": "/usr/bin/bash", "argv": ["/bin/bash", "/usr/local/sbin/nn-upgrade.sh"], "cgroup": "/system.slice/nn-upgrade.service"}
+  ],
+  "items": [
+    {"installer_grant": {"window_secs": 300}},
+    {"event": {"ProcessSpawn": {"pid": 6300010, "ppid": 6300001, "uid": 0, "gid": 0, "comm": "systemctl", "filename": "/usr/bin/systemctl", "timestamp_ns": 110000000000, "argv": ["systemctl", "stop", "northnarrow-agent"], "parent_comm": "bash", "parent_start_ns": 50000000000, "start_ns": 109999000000, "exe": {"path": "/usr/bin/systemctl"}}}},
+    {"event": {"ProcessSpawn": {"pid": 6300011, "ppid": 6300001, "uid": 0, "gid": 0, "comm": "systemctl", "filename": "/usr/bin/systemctl", "timestamp_ns": 120000000000, "argv": ["systemctl", "stop", "auditd"], "parent_comm": "bash", "parent_start_ns": 50000000000, "start_ns": 119999000000, "exe": {"path": "/usr/bin/systemctl"}}}},
+    {"wait": {"secs": 300}},
+    {"event": {"ProcessSpawn": {"pid": 6300012, "ppid": 6300001, "uid": 0, "gid": 0, "comm": "systemctl", "filename": "/usr/bin/systemctl", "timestamp_ns": 500000000000, "argv": ["systemctl", "stop", "northnarrow-agent"], "parent_comm": "bash", "parent_start_ns": 50000000000, "start_ns": 499999000000, "exe": {"path": "/usr/bin/systemctl"}}}},
+    {"event": {"ProcessSpawn": {"pid": 6300013, "ppid": 6300001, "uid": 0, "gid": 0, "comm": "tee", "filename": "/usr/bin/tee", "timestamp_ns": 510000000000, "argv": ["tee", "/etc/systemd/system/nn-helper.service"], "parent_comm": "bash", "parent_start_ns": 50000000000, "start_ns": 509999000000, "exe": {"path": "/usr/bin/tee"}}}},
+    {"event": {"FileOpen": {"pid": 6300013, "uid": 0, "gid": 0, "comm": "tee", "filename": "/etc/systemd/system/nn-helper.service", "flags": 577, "timestamp_ns": 510500000000}}},
+    {"wait": {"secs": 40}}
+  ]
+}

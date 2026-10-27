@@ -1,0 +1,17 @@
+{
+  "about": "Truthful outcomes of a capture gone stale (external audit CMB-004, CMB-014; lab PR 217): on a host without nft, a /dev/shm payload (StagingExec, ENGAGED) is refused a write to the agent's state (COMBAT locked); its soft egress block fails — a signed record of its own, the INVESTIGATE window shortened to 10 s. The payload exits and logrotate takes its pid. At the shortened deadline NEUTRALIZE reaches for the captured process: gone, and the process that holds the pid now is not touched; nothing on disk to quarantine. Contained (nothing left of the offender): no isolation.",
+  "path": ["ENGAGED", "COMBAT"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE"],
+  "signed": ["combat_stage", "combat_outcome"],
+  "start_ns": 1990000000000,
+  "procs": [
+    {"pid": 6500001, "ppid": 1, "start_ns": 5000000000, "uid": 33, "comm": "apache2", "exe": "/usr/sbin/apache2", "argv": ["/usr/sbin/apache2", "-k", "start"], "cgroup": "/system.slice/apache2.service"}
+  ],
+  "items": [
+    {"host": {"nft": false}},
+    {"event": {"ProcessSpawn": {"pid": 6500010, "ppid": 6500001, "uid": 33, "gid": 33, "comm": ".k", "filename": "/dev/shm/.k", "timestamp_ns": 2000000000000, "argv": ["/dev/shm/.k"], "parent_comm": "apache2", "parent_start_ns": 5000000000, "start_ns": 1999999000000, "exe": {"path": "/dev/shm/.k"}}}},
+    {"event": {"FsProtectDenial": {"pid": 6500010, "uid": 33, "comm": ".k", "target_dev": 2049, "target_ino": 131074, "operation": "Unlink", "timestamp_ns": 2002000000000}}},
+    {"host": {"exit": [6500010], "spawn": [{"pid": 6500010, "ppid": 1, "start_ns": 2005000000000, "uid": 0, "comm": "logrotate", "exe": "/usr/sbin/logrotate", "argv": ["/usr/sbin/logrotate", "/etc/logrotate.conf"], "cgroup": "/system.slice/logrotate.service"}]}},
+    {"wait": {"secs": 15}}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "about": "The COMBAT ladder against a forking tree (external audit CMB-019, CMB-004; lab PR 217): a web server's worker runs a /tmp payload (StagingExec, ENGAGED) that forks a child (exec read) and grandchildren (forks, no exec read), then is refused a write to the agent's state (AntiTamperDenial: decisive, COMBAT locked). INVESTIGATE blocks its egress; it spawns another child (lateral spread: attributed, jump-ahead). NEUTRALIZE kills the payload's tree through a cgroup of its own — frozen, every descendant moved in, killed — and the attributed child, killed with the tree, is reported gone; the binary is quarantined once. Contained: no isolation. A signed unlock releases COMBAT (ALERTED; the ladder stands down, the tables read back clear); an hour of quiet decays ALERTED to OBSERVING.",
+  "path": ["ENGAGED", "COMBAT", "ALERTED", "OBSERVING"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE"],
+  "signed": ["combat_stage", "combat_outcome"],
+  "start_ns": 990000000000,
+  "procs": [
+    {"pid": 6400001, "ppid": 1, "start_ns": 5000000000, "uid": 33, "comm": "apache2", "exe": "/usr/sbin/apache2", "argv": ["/usr/sbin/apache2", "-k", "start"], "cgroup": "/system.slice/apache2.service"}
+  ],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 6400010, "ppid": 6400001, "uid": 33, "gid": 33, "comm": "kworkerd", "filename": "/tmp/.x/kworkerd", "timestamp_ns": 1000000000000, "argv": ["/tmp/.x/kworkerd"], "parent_comm": "apache2", "parent_start_ns": 5000000000, "start_ns": 999999000000, "exe": {"path": "/tmp/.x/kworkerd"}}}},
+    {"event": {"ProcessSpawn": {"pid": 6400011, "ppid": 6400010, "uid": 33, "gid": 33, "comm": "kworkerd", "filename": "/tmp/.x/kworkerd", "timestamp_ns": 1001000000000, "argv": ["/tmp/.x/kworkerd", "-w"], "parent_comm": "kworkerd", "parent_start_ns": 999999000000, "start_ns": 1000999000000, "exe": {"path": "/tmp/.x/kworkerd"}}}},
+    {"host": {"spawn": [{"pid": 6400012, "ppid": 6400011, "start_ns": 1001500000000, "uid": 33, "comm": "kworkerd", "exe": "/tmp/.x/kworkerd"}, {"pid": 6400013, "ppid": 6400011, "start_ns": 1001600000000, "uid": 33, "comm": "kworkerd", "exe": "/tmp/.x/kworkerd"}]}},
+    {"event": {"FsProtectDenial": {"pid": 6400010, "uid": 33, "comm": "kworkerd", "target_dev": 2049, "target_ino": 131074, "operation": "Unlink", "timestamp_ns": 1002000000000}}},
+    {"event": {"ProcessSpawn": {"pid": 6400014, "ppid": 6400010, "uid": 33, "gid": 33, "comm": "kworkerd", "filename": "/tmp/.x/kworkerd", "timestamp_ns": 1003000000000, "argv": ["/tmp/.x/kworkerd", "-s"], "parent_comm": "kworkerd", "parent_start_ns": 999999000000, "start_ns": 1002999000000, "exe": {"path": "/tmp/.x/kworkerd"}}}},
+    {"wait": {"secs": 60}},
+    {"unlock": {}},
+    {"wait": {"secs": 3700}}
+  ]
+}

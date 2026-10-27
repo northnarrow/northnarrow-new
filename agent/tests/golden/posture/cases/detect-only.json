@@ -1,0 +1,17 @@
+{
+  "about": "Detect-only (`--detect-only`, BUG-033): the same story as a forking payload refused a write to the agent's state — StagingExec (ENGAGED), AntiTamperDenial (COMBAT locked), a child spawned (jump-ahead) — and the posture, the stages and their signed records are those of an enforcing agent; the actuator touches nothing: the soft egress block not needed (detect-only), NEUTRALIZE what would have been killed and quarantined, no process gone from the host.",
+  "path": ["ENGAGED", "COMBAT"],
+  "stages": ["INVESTIGATE", "NEUTRALIZE"],
+  "signed": ["combat_stage", "combat_outcome"],
+  "detect_only": true,
+  "start_ns": 3990000000000,
+  "procs": [
+    {"pid": 6700001, "ppid": 1, "start_ns": 5000000000, "uid": 33, "comm": "apache2", "exe": "/usr/sbin/apache2", "argv": ["/usr/sbin/apache2", "-k", "start"], "cgroup": "/system.slice/apache2.service"}
+  ],
+  "items": [
+    {"event": {"ProcessSpawn": {"pid": 6700010, "ppid": 6700001, "uid": 33, "gid": 33, "comm": "dropper", "filename": "/tmp/.x/dropper", "timestamp_ns": 4000000000000, "argv": ["/tmp/.x/dropper"], "parent_comm": "apache2", "parent_start_ns": 5000000000, "start_ns": 3999999000000, "exe": {"path": "/tmp/.x/dropper"}}}},
+    {"event": {"FsProtectDenial": {"pid": 6700010, "uid": 33, "comm": "dropper", "target_dev": 2049, "target_ino": 131074, "operation": "Unlink", "timestamp_ns": 4002000000000}}},
+    {"event": {"ProcessSpawn": {"pid": 6700011, "ppid": 6700010, "uid": 33, "gid": 33, "comm": "dropper", "filename": "/tmp/.x/dropper", "timestamp_ns": 4003000000000, "argv": ["/tmp/.x/dropper", "-c"], "parent_comm": "dropper", "parent_start_ns": 3999999000000, "start_ns": 4002999000000, "exe": {"path": "/tmp/.x/dropper"}}}},
+    {"wait": {"secs": 60}}
+  ]
+}

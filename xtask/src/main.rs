@@ -160,7 +160,9 @@ enum Cmd {
     /// Lab PR 228: the golden replay of the decision engine — recorded
     /// event streams (agent/tests/golden/cases) through the decision path,
     /// the verdicts compared byte for byte with agent/tests/golden/expected
-    /// (the agent's `decision::golden` tests, which `cargo test` runs too).
+    /// (the agent's `decision::golden` tests, which `cargo test` runs too);
+    /// lab PR 243: and of the posture and the COMBAT ladder
+    /// (agent/tests/golden/posture, the agent's `posture::golden` tests).
     /// `--update` rewrites the golden files for review; refused under CI.
     Golden {
         /// Write the golden files from the replay instead of comparing.
