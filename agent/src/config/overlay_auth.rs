@@ -208,7 +208,7 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
         // profile line (over either profile: the base does not change
         // what parses).
         OverlayKind::ExecPolicy => {
-            crate::execpol::policy::parse(text, crate::execpol::Profile::Server)
+            crate::execpol::policy::parse(text, crate::execpol::policy::Profile::Server)
                 .map_err(|e| anyhow!("{label}: {e}"))?;
         }
         // Lab PR 236: any bad line refuses the per-rule policy whole.
