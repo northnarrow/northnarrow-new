@@ -195,7 +195,6 @@ planned = false
 # (`content_host::ContentHost`: the open that follows no symlink and blocks
 # on no FIFO)
 "content_host_linux" = "nn-linux"
-"correlation" = "nn-core"
 # post-plan (lab PR 222): copy on first write; fanotify, copies, journal
 "cow" = "nn-linux"
 "cow::config" = "nn-core"
@@ -300,6 +299,8 @@ planned = false
 "chain_host" = "nn-evidence"
 "chain_tail" = "nn-evidence"
 "chainlog" = "nn-evidence"
+# R08a (lab PR 250): the buffer of recent events the triggers read
+"correlation" = "nn-core"
 # R07 (lab PR 247): the `.v1` + `.local` list loader; `config/mod.rs`
 # binds its reading loaders to the agent's host
 "config::overlay" = "nn-core"

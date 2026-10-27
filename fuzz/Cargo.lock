@@ -849,6 +849,8 @@ dependencies = [
  "anyhow",
  "base64",
  "hex",
+ "nn-model",
+ "parking_lot",
  "serde_json",
  "sha2",
  "thiserror",

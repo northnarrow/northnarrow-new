@@ -77,7 +77,9 @@ pub mod config;
 /// The Linux host of the content lists: the open of nn-core's
 /// `ContentHost` (R07, lab PR 247).
 pub mod content_host_linux;
-pub mod correlation;
+/// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the buffer of
+/// recent events the posture's triggers read is nn-core's.
+pub use nn_core::correlation;
 /// Lab PR 222: copy on first write (ransomware rollback, EXPERIMENTAL).
 pub mod cow;
 pub mod decision;

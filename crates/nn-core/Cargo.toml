@@ -12,6 +12,11 @@ publish = false
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
 [dependencies]
+# R08a (lab PR 250): the posture, its lineage, the correlation buffer and
+# the detection budget moved here; they judge `nn_model::Event`s and lock
+# with parking_lot, the agent's version.
+nn-model = { workspace = true }
+parking_lot = "0.12"
 # R07 (lab PR 247): the content lists moved here with the dependencies they
 # had in the agent, the same versions (one version each in the workspace).
 # `config::overlay_auth`: an overlay's SHA-256.
