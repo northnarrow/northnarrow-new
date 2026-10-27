@@ -18,6 +18,13 @@
 /// final symlink and blocks on no FIFO.
 pub mod content_host;
 
+/// Configuration content (R07, lab PR 247): what the list loaders take
+/// from the signed-overlay gate (was in the agent's `config::overlay_auth`).
+pub mod config {
+    /// The verified overlay content, its hash, the bounded read.
+    pub mod overlay_auth;
+}
+
 /// The agent's anti-tamper content (R07, lab PR 247): the COMBAT management
 /// carve-out (was the agent's `anti_tamper::combat_allow`).
 pub mod anti_tamper {

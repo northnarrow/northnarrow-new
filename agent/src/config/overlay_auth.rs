@@ -28,13 +28,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
-use nn_core::content_host::ContentHost;
 use nn_proto::admin_signed_payload::{
     OperationCode, OperationExtra, OverlayKind, Role, SignedPayload,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 use super::overlay_floor::RollbackFloor;
@@ -42,17 +40,20 @@ use crate::anti_tamper::admin_auth::AdminAuth;
 use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::chain_host_linux::LinuxHost;
 
+// R07 (lab PR 247): the part of this module the list loaders take is
+// nn-core's (the verified content, its hash, the bounded read, the escape
+// hatch's name and the read's cap), under its old paths here; the gate,
+// the signature file, the content checks and the install stay in the agent.
+pub use nn_core::config::overlay_auth::{
+    content_sha256, read_overlay, Verified, ALLOW_UNSIGNED_ENV, MAX_OVERLAY_BYTES,
+};
+
 /// Suffix of the signature file next to an overlay.
 pub const SIG_SUFFIX: &str = ".sig";
-/// Escape hatch: load unsigned overlays (still reported).
-pub const ALLOW_UNSIGNED_ENV: &str = "NN_OVERLAY_ALLOW_UNSIGNED";
 /// Audit op of an overlay accepted at boot with a content not yet in the chain.
 pub const AUDIT_OP_ACCEPTED: &str = "config_overlay_accepted";
 /// Audit op of an overlay stored through `nn-admin config overlay set`.
 pub const AUDIT_OP_SET: &str = "config_overlay_set";
-/// Largest overlay the gate reads: an overlay is a list of lines; a larger
-/// file is refused rather than read whole into memory.
-pub const MAX_OVERLAY_BYTES: u64 = 4 << 20;
 
 /// `<overlay>.sig` on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,11 +138,6 @@ pub fn sig_path(overlay: &Path) -> PathBuf {
     let mut s = overlay.as_os_str().to_os_string();
     s.push(SIG_SUFFIX);
     PathBuf::from(s)
-}
-
-/// SHA-256 of an overlay's bytes.
-pub fn content_sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
 }
 
 /// Parse `text` with the same rules the loader of `kind` applies; any
@@ -252,43 +248,6 @@ pub enum Decision {
     },
 }
 
-/// What the loader of an overlay gets from [`OverlayGate::verified`]
-/// (external audit LLMR-013). The gate used to hand over a path, and every
-/// loader read the file again after the gate had verified its own read: a
-/// root process able to pause the agent's `open()` could serve the gate
-/// the signed bytes and the loader others. The loaders now take this, and
-/// only the gate makes one: the text is the one the decision was made on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verified {
-    /// No overlay at the path: the shipped defaults only.
-    Missing,
-    /// The file is the content the agent was built with (the COMBAT files).
-    ShippedDefault,
-    /// Present but refused (logged and recorded by the gate): the shipped
-    /// defaults only.
-    Refused,
-    /// The text to apply: signed, or loaded through the escape hatch.
-    Content { path: PathBuf, text: String },
-}
-
-impl Verified {
-    /// The overlay's text, when there is one to apply.
-    pub fn text(&self) -> Option<&str> {
-        match self {
-            Verified::Content { text, .. } => Some(text),
-            _ => None,
-        }
-    }
-
-    /// Where the applied text was read (for the loaders' logs).
-    pub fn source(&self) -> Option<&Path> {
-        match self {
-            Verified::Content { path, .. } => Some(path),
-            _ => None,
-        }
-    }
-}
-
 /// One read of an overlay, as [`OverlayGate::verified`] decides on it.
 enum Read {
     Missing,
@@ -296,33 +255,6 @@ enum Read {
     /// Present but not usable as text (unreadable, not UTF-8, too large…).
     Unusable,
     Text(String),
-}
-
-/// External audit LLMR-013: an overlay is read once, without following a
-/// link (the last component), without blocking on a FIFO planted at its
-/// name, and at most [`MAX_OVERLAY_BYTES`]. So is a shipped default list
-/// (`.v1`, LLMR-015). The open is the host's ([`ContentHost`], R07: the
-/// agent's is `LinuxHost`, `O_NOFOLLOW | O_NONBLOCK`).
-pub fn read_overlay<H: ContentHost>(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let f = H::open_read_nofollow(path).map_err(|e| {
-        if H::is_symlink_refusal(&e) {
-            std::io::Error::other("a symbolic link (not read through one)")
-        } else {
-            e
-        }
-    })?;
-    if !f.metadata()?.file_type().is_file() {
-        return Err(std::io::Error::other("not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    f.take(MAX_OVERLAY_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_OVERLAY_BYTES {
-        return Err(std::io::Error::other(format!(
-            "larger than {MAX_OVERLAY_BYTES} bytes"
-        )));
-    }
-    Ok(bytes)
 }
 
 /// Boot-time gate for every overlay the agent reads.

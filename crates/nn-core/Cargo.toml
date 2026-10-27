@@ -12,6 +12,10 @@ publish = false
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
 [dependencies]
+# R07 (lab PR 247): the content lists moved here with the dependencies they
+# had in the agent, the same versions (one version each in the workspace).
+# `config::overlay_auth`: an overlay's SHA-256.
+sha2 = "0.11"
 
 [lints]
 workspace = true
