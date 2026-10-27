@@ -61,10 +61,10 @@ use nn_model::posture_types::{
 };
 use nn_model::Event;
 
+use crate::decision::host::DecisionHost;
 use clock::Clock;
 use corroboration::CorroborationLedger;
 use escalation_allow::EscalationAllowList;
-use host::PostureAgent;
 
 pub use entry::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
 pub use exempt::{
@@ -86,10 +86,13 @@ const TRANSITION_LOG_CAP: usize = 256;
 /// extra plumbing.
 ///
 /// R08a (lab PR 250): `H` is the host — its process table and clocks, and
-/// what the machine consults in the agent's other modules ([`PostureAgent`];
-/// the agent's is `LinuxHost`).
+/// what the machine consults in the agent's other modules
+/// ([`host::PostureAgent`]; the agent's is `LinuxHost`). R08c (lab PR 252):
+/// the decision engine's host ([`DecisionHost`], on top of it), whose
+/// ransomware tracker and security-tool detector the machine wires to its
+/// triggers.
 #[derive(Clone)]
-pub struct PostureMachine<H: PostureAgent> {
+pub struct PostureMachine<H: DecisionHost> {
     inner: Arc<Inner<H>>,
 }
 
@@ -127,8 +130,9 @@ pub enum ReleaseScope {
 
 /// Hook invoked when the admin releases COMBAT via
 /// [`PostureMachine::admin_release_combat_with_token`] (or forces the
-/// posture out of it). Receives the validated [`PostureAgent::UnlockToken`] by value so
-/// the implementation can pass it straight into `NetworkIsolator::release`.
+/// posture out of it). Receives the validated
+/// [`host::PostureAgent::UnlockToken`] by value so the implementation can
+/// pass it straight into `NetworkIsolator::release`.
 ///
 /// Lab PR 217 (NN-AUD-243 residue, capability C17): it returns what it did,
 /// and runs BEFORE the posture leaves COMBAT, with no lock held (it shells
@@ -138,13 +142,13 @@ pub enum ReleaseScope {
 /// recorded as one.
 ///
 /// R08a (lab PR 250): `T` is the host's unlock capability
-/// ([`PostureAgent::UnlockToken`]).
+/// ([`host::PostureAgent::UnlockToken`]).
 pub type CombatReleaseHook<T> = Arc<dyn Fn(T, ReleaseScope) -> ReleaseResult + Send + Sync>;
 
 /// Pre-#6 alias retained so any in-flight references keep building.
 pub type CombatHook = CombatEntryHook;
 
-struct Inner<H: PostureAgent> {
+struct Inner<H: DecisionHost> {
     state: RwLock<PostureState>,
     transitions: RwLock<Vec<PostureTransition>>,
     triggers: TriggerDetector<H>,
@@ -174,7 +178,7 @@ struct Inner<H: PostureAgent> {
     rule_policy: crate::decision::rule_policy::PolicyHandle,
 }
 
-impl<H: PostureAgent> PostureMachine<H> {
+impl<H: DecisionHost> PostureMachine<H> {
     pub fn new() -> Self {
         Self::build(
             None,
@@ -210,7 +214,7 @@ impl<H: PostureAgent> PostureMachine<H> {
     /// Build a machine that fires both an entry hook (on the
     /// non-Combat → Combat edge) and a release hook (during
     /// [`Self::admin_release_combat_with_token`]). The release hook
-    /// receives the validated [`PostureAgent::UnlockToken`] by value.
+    /// receives the validated [`host::PostureAgent::UnlockToken`] by value.
     ///
     /// This is the production constructor — `main.rs` uses it to
     /// wire `NetworkIsolator::engage` and `NetworkIsolator::release`
@@ -422,13 +426,13 @@ impl<H: PostureAgent> PostureMachine<H> {
     /// Lab PR 225: the ransomware tracker the rules share; the posture
     /// raises `RansomwareEncryption` on its decisive assessments. Unwired,
     /// the trigger never fires. Set once; a second call is ignored.
-    pub fn set_ransom_tracker(&self, tracker: Arc<H::RansomTracker>) {
+    pub fn set_ransom_tracker(&self, tracker: Arc<crate::impact::RansomTracker<H>>) {
         self.inner.triggers.set_ransom_tracker(tracker);
     }
 
     /// Lab PR 225: the security-tool detector the rules share; the posture
     /// raises `DefenseImpairment` on its unsanctioned findings. Set once.
-    pub fn set_defense_detector(&self, detector: Arc<H::DefenseDetector>) {
+    pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector<H>>) {
         self.inner.triggers.set_defense_detector(detector);
     }
 
@@ -962,7 +966,7 @@ impl<H: PostureAgent> PostureMachine<H> {
     }
 
     /// Tappa 8 A10 — production force-posture (design §12.2).
-    /// Capability-gated by [`PostureAgent::UnlockToken`] in the same way as
+    /// Capability-gated by [`host::PostureAgent::UnlockToken`] in the same way as
     /// [`Self::admin_release_combat_with_token`]; consumed at the
     /// type-system level so only the agent's `anti_tamper::admin_auth::AdminAuth`
     /// (the sole minting site outside `cfg(test)`) can drive this
@@ -1217,7 +1221,7 @@ impl<H: PostureAgent> PostureMachine<H> {
 /// audit log and the rules), so what it read through the machine's private
 /// fields is this crate's test helpers (`test-util`). Readers only.
 #[cfg(any(test, feature = "test-util"))]
-impl<H: PostureAgent> PostureMachine<H> {
+impl<H: DecisionHost> PostureMachine<H> {
     /// The number of transitions in the log (no copy of it).
     pub fn transitions_len(&self) -> usize {
         self.inner.transitions.read().len()
@@ -1239,7 +1243,7 @@ impl<H: PostureAgent> PostureMachine<H> {
     }
 }
 
-impl<H: PostureAgent> Default for PostureMachine<H> {
+impl<H: DecisionHost> Default for PostureMachine<H> {
     fn default() -> Self {
         Self::new()
     }

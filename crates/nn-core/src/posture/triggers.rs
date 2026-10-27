@@ -38,6 +38,7 @@ use super::escalation_allow::{AllowTrigger, EscalationAllowList};
 use super::exempt::ExemptPids;
 use super::host::{PostureAgent, PostureHost};
 use super::lineage::AuthSessionTracker;
+use crate::decision::host::DecisionHost;
 
 /// The recent events the triggers scan, borrowed (review 72). The
 /// correlation buffer is a ring of up to 1,000 events; cloning it for every
@@ -290,9 +291,11 @@ pub const PERSISTENCE_PREFIXES: &[&str] = &[
 ///
 /// R08a (lab PR 250): `H` is the host — the process table the lineage and
 /// the exemption read, and what the triggers consult in the agent's other
-/// modules ([`PostureAgent`]; the agent's is `LinuxHost`).
+/// modules ([`PostureAgent`]; the agent's is `LinuxHost`). R08c (lab PR
+/// 252): the decision engine's host ([`DecisionHost`], on top of it), whose
+/// ransomware tracker and security-tool detector the triggers read.
 #[derive(Debug, Default, Clone)]
-pub struct TriggerDetector<H: PostureAgent> {
+pub struct TriggerDetector<H: DecisionHost> {
     /// PIDs belonging to the NorthNarrow process stack (agent + the
     /// verified watchdog) whose events must never raise a trigger.
     exempt: ExemptPids<H>,
@@ -351,14 +354,14 @@ pub struct TriggerDetector<H: PostureAgent> {
 /// Lab PR 225: the shared judges of the ransomware and security-tool
 /// triggers. Unset (a test, a build that does not wire them): neither
 /// trigger fires.
-struct ImpactHooks<H: PostureAgent> {
-    ransom: Arc<std::sync::OnceLock<Arc<H::RansomTracker>>>,
-    defense: Arc<std::sync::OnceLock<Arc<H::DefenseDetector>>>,
+struct ImpactHooks<H: DecisionHost> {
+    ransom: Arc<std::sync::OnceLock<Arc<crate::impact::RansomTracker<H>>>>,
+    defense: Arc<std::sync::OnceLock<Arc<crate::impair::DefenseDetector<H>>>>,
 }
 
 /// R08a (lab PR 250): what `derive(Clone, Default)` made, without asking
 /// the host's judges to be `Clone` or `Default` (only their slots are).
-impl<H: PostureAgent> Clone for ImpactHooks<H> {
+impl<H: DecisionHost> Clone for ImpactHooks<H> {
     fn clone(&self) -> Self {
         Self {
             ransom: self.ransom.clone(),
@@ -367,7 +370,7 @@ impl<H: PostureAgent> Clone for ImpactHooks<H> {
     }
 }
 
-impl<H: PostureAgent> Default for ImpactHooks<H> {
+impl<H: DecisionHost> Default for ImpactHooks<H> {
     fn default() -> Self {
         Self {
             ransom: Arc::default(),
@@ -376,7 +379,7 @@ impl<H: PostureAgent> Default for ImpactHooks<H> {
     }
 }
 
-impl<H: PostureAgent> std::fmt::Debug for ImpactHooks<H> {
+impl<H: DecisionHost> std::fmt::Debug for ImpactHooks<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImpactHooks")
             .field("ransom", &self.ransom.get().is_some())
@@ -444,7 +447,7 @@ impl MassWriters {
     }
 }
 
-impl<H: PostureAgent> TriggerDetector<H> {
+impl<H: DecisionHost> TriggerDetector<H> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -517,12 +520,12 @@ impl<H: PostureAgent> TriggerDetector<H> {
     }
 
     /// Lab PR 225: the ransomware tracker (`RansomwareEncryption`). Set once.
-    pub fn set_ransom_tracker(&self, tracker: Arc<H::RansomTracker>) {
+    pub fn set_ransom_tracker(&self, tracker: Arc<crate::impact::RansomTracker<H>>) {
         let _ = self.impact.ransom.set(tracker);
     }
 
     /// Lab PR 225: the security-tool detector (`DefenseImpairment`). Set once.
-    pub fn set_defense_detector(&self, detector: Arc<H::DefenseDetector>) {
+    pub fn set_defense_detector(&self, detector: Arc<crate::impair::DefenseDetector<H>>) {
         let _ = self.impact.defense.set(detector);
     }
 
@@ -793,7 +796,7 @@ impl<H: PostureAgent> TriggerDetector<H> {
         // default). The shapes alone keep their triggers (the mass-write
         // arm above).
         if let Some(t) = self.impact.ransom.get() {
-            if H::ransomware_decisive(t, event) {
+            if t.assess(event).is_some_and(|a| a.decisive) {
                 hits.push(TriggerType::RansomwareEncryption);
             }
         }
@@ -801,7 +804,7 @@ impl<H: PostureAgent> TriggerDetector<H> {
         // transaction, an administrator's session and configuration
         // management — ENGAGED, execution evidence that corroborates.
         if let Some(d) = self.impact.defense.get() {
-            if H::defense_unsanctioned(d, event) {
+            if d.assess(event).is_some_and(|f| f.sanctioned.is_none()) {
                 hits.push(TriggerType::DefenseImpairment);
             }
         }

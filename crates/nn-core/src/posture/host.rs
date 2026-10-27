@@ -30,8 +30,6 @@ use std::fmt::Debug;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nn_model::Event;
-
 /// The host's reads and clocks the posture uses. A unit type: the posture's
 /// types hold it as a parameter only (hence `Copy`, `Default`, `Debug`).
 pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
@@ -81,8 +79,7 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
 
 /// What the posture's triggers and machine consult in the agent's other
 /// modules (R08a, lab PR 250), each until the lot that moves it below the
-/// posture: the trusted-installer window (`anti_tamper`; R04b splits it),
-/// the ransomware tracker and the security-tool detector the rules share,
+/// posture: the trusted-installer window (`anti_tamper`; R04b splits it)
 /// and the capability a verified signed unlock mints (`anti_tamper`; R04b).
 /// The agent's `LinuxHost` implements it with the calls the posture made.
 ///
@@ -90,27 +87,17 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
 /// the shapes they share with its rules (NN-L-FIM-024's bait tamper,
 /// NN-L-EPG-001/002's event, R020's reverse shell, the staging directories)
 /// and the machine reads the engine's per-rule policy themselves; the trait
-/// lost that half. The tracker and the detector moved with the engine too
-/// but stay associated types here: they are generic over the decision
-/// host, which the posture's host is not.
+/// lost that half. R08c (lab PR 252): the ransomware tracker and the
+/// security-tool detector, nn-core's since R08b and generic over the
+/// decision host, are named by the machine and the triggers themselves,
+/// which take that host ([`crate::decision::host::DecisionHost`], on top of
+/// this trait); the trait lost the two judges.
 pub trait PostureAgent: PostureHost {
     /// The trusted-installer window (lab PR 162).
     type InstallerWindow: Send + Sync + 'static;
 
     /// The window is open now.
     fn installer_window_open(window: &Self::InstallerWindow) -> bool;
-
-    /// The ransomware tracker the rules share (lab PR 225).
-    type RansomTracker: Send + Sync + 'static;
-
-    /// `event` makes the tracker's assessment of its actor decisive.
-    fn ransomware_decisive(tracker: &Self::RansomTracker, event: &Event) -> bool;
-
-    /// The security-tool detector the rules share (lab PR 225).
-    type DefenseDetector: Send + Sync + 'static;
-
-    /// `event` switches a security tool off, and nothing sanctions it.
-    fn defense_unsanctioned(detector: &Self::DefenseDetector, event: &Event) -> bool;
 
     /// The capability a verified signed unlock mints: the machine hands it
     /// to its release hook (lab PR 217), it never makes one.
@@ -130,8 +117,6 @@ pub(crate) mod testing {
     use std::path::{Path, PathBuf};
     use std::sync::LazyLock;
     use std::time::Instant;
-
-    use nn_model::Event;
 
     use super::{PostureAgent, PostureHost};
 
@@ -199,26 +184,15 @@ pub(crate) mod testing {
     }
 
     /// What the posture consults in the agent, as its tests need it: the
-    /// window whether it is open; no judge ever fires; the unlock capability
-    /// is `()`. (R08b, lab PR 251: the engine's shapes and policy are read
-    /// from the engine itself, nn-core's.)
+    /// window whether it is open; the unlock capability is `()`. (R08b, lab
+    /// PR 251: the engine's shapes and policy are read from the engine
+    /// itself, nn-core's; R08c, lab PR 252: so are its judges, which no
+    /// test of the posture wires — none fires.)
     impl PostureAgent for TestHost {
         type InstallerWindow = bool;
 
         fn installer_window_open(window: &bool) -> bool {
             *window
-        }
-
-        type RansomTracker = ();
-
-        fn ransomware_decisive(_tracker: &(), _event: &Event) -> bool {
-            false
-        }
-
-        type DefenseDetector = ();
-
-        fn defense_unsanctioned(_detector: &(), _event: &Event) -> bool {
-            false
         }
 
         type UnlockToken = ();
