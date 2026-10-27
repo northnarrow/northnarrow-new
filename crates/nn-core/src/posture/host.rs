@@ -56,6 +56,10 @@ pub trait PostureHost: Copy + Default + Debug + Send + Sync + 'static {
     /// process's `exe`, its `ns/mnt`).
     fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf>;
 
+    /// The entries of the directory at `path` (the process table, R08b: the
+    /// security-tool detector's scan of it).
+    fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir>;
+
     /// `path` is a directory (a process's entry in the process table).
     fn is_dir(path: &Path) -> bool;
 
@@ -183,6 +187,10 @@ pub(crate) mod testing {
 
         fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
             std::fs::read_link(path)
+        }
+
+        fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<std::fs::ReadDir> {
+            std::fs::read_dir(path)
         }
 
         fn is_dir(path: &Path) -> bool {

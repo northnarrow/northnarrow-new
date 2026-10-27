@@ -20,7 +20,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use nn_core::decision::host::DecisionHost;
+use nn_core::posture::host::PostureHost;
 use parking_lot::Mutex;
+
+// R08b (lab PR 251): the host's root, the work kept off the async runtime
+// and the trusted `rpm` are the host's (`PostureHost`, `DecisionHost`); the
+// agent's for now, the type parameter of the owners once they move to
+// nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 
 /// Who put a module file where it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +53,7 @@ pub struct ModuleOwners {
 
 impl Default for ModuleOwners {
     fn default() -> Self {
-        Self::new("/")
+        Self::new(H::HOST_ROOT)
     }
 }
 
@@ -62,7 +70,7 @@ impl ModuleOwners {
     /// dpkg list, and `rpm -qf` is a process to wait for, so both run off
     /// its worker.
     pub fn of(&self, path: &str) -> Provenance {
-        crate::runtime::off_the_runtime(|| self.lookup(path))
+        H::off_the_runtime(|| self.lookup(path))
     }
 
     fn lookup(&self, path: &str) -> Provenance {
@@ -146,21 +154,13 @@ impl ModuleOwners {
 /// one planted in `/usr/local/bin` that exits 0 made every module file
 /// "packaged". None trusted: `None`, judged as a host without a database.
 fn rpm_owns(path: &str) -> Option<bool> {
-    let rpm = match crate::trusted_bin::resolve("rpm") {
-        Ok(rpm) => rpm,
+    match H::rpm_owns(path) {
+        Ok(owned) => owned,
         Err(e) => {
             tracing::warn!(error = %e, "R018 provenance: rpm not run");
-            return None;
+            None
         }
-    };
-    let status = rpm
-        .command()
-        .args(["-qf", "--quiet", path])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    Some(status.success())
+    }
 }
 
 /// A registered DKMS package holds a built module of this name.

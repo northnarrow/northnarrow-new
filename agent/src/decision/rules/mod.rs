@@ -6,8 +6,14 @@ use std::sync::Arc;
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
+use nn_core::decision::host::DecisionHost;
+
 use self::net::DnsBurstWindow;
 use super::Rule;
+// R08b (lab PR 251): the inert trusted-installer window is the host's
+// (`DecisionHost`); the agent's for now, the rule sets' type parameter once
+// they move to nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::net::blocklist::{Ja3Blocklist, NetBlocklist};
 
@@ -170,9 +176,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
     // FIM-009 self-upgrade (§15.1): the non-production rule set has no
     // admin dispatcher to arm an override, so FIM-009 gets an inert one
     // (never armed → unchanged KillProcess behaviour).
-    rules.extend(crate::fim::rules::fim_rules(
-        crate::anti_tamper::trusted_installer::TrustedInstallerOverride::inert_arc(),
-    ));
+    rules.extend(crate::fim::rules::fim_rules(H::inert_installer_window()));
     // Lab PR 225: the ransomware and security-tool rules, over a live
     // `/proc`-backed lineage, the host's package database and the shipped
     // list.

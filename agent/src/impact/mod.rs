@@ -54,6 +54,12 @@ use std::time::Duration;
 use nn_model::{Event, FileBurstKind};
 use parking_lot::Mutex;
 
+use nn_core::decision::host::DecisionHost;
+
+// R08b (lab PR 251): the host's view of a path is the host's
+// (`DecisionHost`); the agent's for now, the tracker's type parameter once
+// it moves to nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::posture::lineage::AuthSessionTracker;
 use entropy::Sampler;
 use trust::{Judged, ProgramOwners};
@@ -567,7 +573,7 @@ fn copy_beside(deleted: &str, new: &[String]) -> Option<(String, String)> {
     exts.sort_unstable();
     exts.dedup();
     let found = exts.into_iter().find(|ext| {
-        crate::response::on_host_path(std::path::Path::new(&format!("{dir}/{name}.{ext}")), |p| {
+        H::on_host_path(std::path::Path::new(&format!("{dir}/{name}.{ext}")), |p| {
             std::fs::symlink_metadata(p)
         })
         .is_ok_and(|m| m.is_file())
@@ -577,7 +583,7 @@ fn copy_beside(deleted: &str, new: &[String]) -> Option<(String, String)> {
     }
     let prefix = format!("{name}.");
     let parent = if dir.is_empty() { "/" } else { dir };
-    let newest = crate::response::on_host_path(std::path::Path::new(parent), |p| {
+    let newest = H::on_host_path(std::path::Path::new(parent), |p| {
         let mut best: Option<(std::time::SystemTime, String)> = None;
         for e in std::fs::read_dir(p)?.take(entropy::COPY_SCAN_MAX).flatten() {
             let leaf = e.file_name();

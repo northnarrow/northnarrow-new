@@ -34,7 +34,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nn_core::posture::host::PostureHost;
+
 use super::store::ProcKey;
+// R08b (lab PR 251): the process table and the clocks are the host's
+// (`PostureHost`); the agent's for now, the tree's type parameter once it
+// moves to nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::decision::bounded::{LazyLru, LossCounter};
 
 /// Max parent→child edges retained (about 2 MiB with the recency queue).
@@ -74,7 +80,7 @@ pub struct AncestryTree {
 
 impl Default for AncestryTree {
     fn default() -> Self {
-        Self::with_proc_root("/proc", MAX_TRACKED_EDGES)
+        Self::with_proc_root(H::PROC_ROOT, MAX_TRACKED_EDGES)
     }
 }
 
@@ -235,48 +241,21 @@ fn is_alive(proc_root: &Path, pid: u32, start_ns: u64) -> bool {
     if start_ns == 0 {
         return true;
     }
-    let tick = tick_ns();
+    let tick = H::clock_tick_ns();
     let shown = ticks.saturating_mul(tick);
     let slack = 2 * tick;
-    shown + slack >= start_ns && shown <= start_ns + suspended_ns() + slack
+    shown + slack >= start_ns && shown <= start_ns + H::suspended_ns() + slack
 }
 
 /// `starttime`, field 22 of `/proc/<pid>/stat`, counted after `(comm)`.
 fn proc_start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
         .split_whitespace()
         .nth(19)?
         .parse()
         .ok()
-}
-
-fn tick_ns() -> u64 {
-    static TICK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TICK.get_or_init(|| {
-        // SAFETY: sysconf has no preconditions.
-        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        if hz > 0 {
-            1_000_000_000 / hz as u64
-        } else {
-            10_000_000
-        }
-    })
-}
-
-/// `CLOCK_BOOTTIME` − `CLOCK_MONOTONIC`: the time spent suspended.
-fn suspended_ns() -> u64 {
-    let now = |clock| {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: a valid clock id and a timespec to fill.
-        unsafe { libc::clock_gettime(clock, &mut ts) };
-        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-    };
-    now(libc::CLOCK_BOOTTIME).saturating_sub(now(libc::CLOCK_MONOTONIC))
 }
 
 #[cfg(test)]
@@ -428,7 +407,7 @@ mod tests {
         // pid 7 exists, but its start (1 tick) is not the recorded one.
         let root = proc_fixture(&[(7, 1), (8, 0)]);
         let mut t = AncestryTree::with_proc_root(root.path(), 2);
-        t.observe(7, 1, 1_000_000 * tick_ns());
+        t.observe(7, 1, 1_000_000 * H::clock_tick_ns());
         t.observe(8, 1, 0);
         t.observe(9, 1, 0);
         assert!(t.parent_of(7).is_none());
@@ -444,7 +423,7 @@ mod tests {
         let root = proc_fixture(&procs);
         let mut t = AncestryTree::with_proc_root(root.path(), 16);
         for pid in 1..=40u32 {
-            t.observe(pid, 1, 5 * tick_ns());
+            t.observe(pid, 1, 5 * H::clock_tick_ns());
         }
         assert_eq!(t.len(), 16);
         assert_eq!(t.live_evictions(), 24);
@@ -477,7 +456,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let root = Path::new("/proc");
-        let start = proc_start_ticks(root, pid).unwrap() * tick_ns();
+        let start = proc_start_ticks(root, pid).unwrap() * H::clock_tick_ns();
         assert!(is_alive(root, pid, start));
         assert!(!is_alive(root, pid, start + 3_600 * 1_000_000_000));
         child.kill().unwrap();
@@ -500,7 +479,7 @@ mod tests {
                 .unwrap();
             let pid = first.id();
             let root = Path::new("/proc");
-            let start = proc_start_ticks(root, pid).unwrap() * tick_ns();
+            let start = proc_start_ticks(root, pid).unwrap() * H::clock_tick_ns();
             first.kill().unwrap();
             first.wait().unwrap();
             // more than the 2-tick slack between the two starts

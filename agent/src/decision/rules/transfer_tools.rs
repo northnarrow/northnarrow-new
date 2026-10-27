@@ -26,6 +26,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use nn_core::posture::host::PostureHost;
+
+// R08b (lab PR 251): the monotonic clock is the host's (`PostureHost`); the
+// agent's for now, the rules' type parameter once they move to nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::config::comm_allowlist::PrecursorCheck;
 use crate::decision::correlation::{CorrelationStore, PrecursorKind};
 use crate::posture::lineage::AuthSessionTracker;
@@ -79,17 +84,6 @@ pub(crate) fn is_shell_base(base: &str) -> bool {
     crate::decision::rules::r020_shell_with_socket_stdio::SHELLS
         .iter()
         .any(|s| program_is(base, s))
-}
-
-/// CLOCK_MONOTONIC in ns: the precursors' clock.
-fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: a valid clock id and a timespec to fill.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 /// What in `pid`'s lineage makes a transfer tool a dropper's instrument
@@ -157,7 +151,7 @@ pub fn precursor_check(
     store: Arc<Mutex<CorrelationStore>>,
     lineage: AuthSessionTracker,
 ) -> PrecursorCheck {
-    Arc::new(move |pid| precursor_of(&store, &lineage, pid, monotonic_ns()))
+    Arc::new(move |pid| precursor_of(&store, &lineage, pid, H::monotonic_ns()))
 }
 
 #[cfg(test)]

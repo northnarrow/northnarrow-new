@@ -9,6 +9,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use nn_core::decision::host::DecisionHost;
 use nn_model::Event;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -19,6 +20,10 @@ use super::correlation::{AncestryTree, CorrelationStore};
 use super::rule_policy::{PolicyHandle, ProcFacts, RulePolicy};
 use super::rules::{epg, net::NetRuleConfig, net_fanout::FanoutConfig};
 use super::{Rule, RuleEngine};
+// R08b (lab PR 251): the inert trusted-installer window is the host's
+// (`DecisionHost`); the agent's for now, the replay's type parameter once
+// it moves to nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::config::comm_allowlist::{
     load_comm_allowlist, NETFLOW_COMM_ALLOWLIST_SHIPPED, PROCESS_COMM_ALLOWLIST_SHIPPED,
 };
@@ -107,7 +112,7 @@ pub fn engine(host: HostParts<'_>) -> RuleEngine {
         netflow_allowlist,
         Arc::new(Mutex::new(super::rules::net::BeaconWindow::new())),
         Arc::new(crate::net::dns_cache::DnsCache::default()),
-        crate::anti_tamper::trusted_installer::TrustedInstallerOverride::inert_arc(),
+        H::inert_installer_window(),
         lineage,
         crate::canary::readers::CanaryReaders::default(),
         correlation,

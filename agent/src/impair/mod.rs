@@ -46,11 +46,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use nn_core::decision::host::DecisionHost;
+use nn_core::posture::host::PostureHost;
 use nn_model::telemetry::FimOp;
 use nn_model::Event;
 use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+// R08b (lab PR 251): the process table, the window's grant and the kernel's
+// map of the tools' processes are the host's (`PostureHost`,
+// `DecisionHost`); the agent's for now, the detector's type parameter once
+// it moves to nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::config::comm_allowlist::CommAllowlist;
 use crate::config::overlay::{self, DefaultsSource, Shipped};
 use crate::posture::lineage::{AuthSessionTracker, ExecIdentity};
@@ -550,7 +557,7 @@ impl DefenseDetector {
         lineage: AuthSessionTracker,
         actors: Option<Arc<CommAllowlist>>,
     ) -> Self {
-        Self::with_proc_root(tools, lineage, actors, "/proc")
+        Self::with_proc_root(tools, lineage, actors, H::PROC_ROOT)
     }
 
     /// With a `/proc` of its own (tests).
@@ -650,7 +657,7 @@ impl DefenseDetector {
 
     /// Register every running process of a listed tool (boot).
     pub fn scan_proc(&self) {
-        let Ok(dir) = std::fs::read_dir(&self.proc_root) else {
+        let Ok(dir) = H::read_dir(&self.proc_root) else {
             return;
         };
         for e in dir.flatten() {
@@ -686,9 +693,9 @@ impl DefenseDetector {
         drop(d);
         if let Some(m) = self.map.lock().as_mut() {
             for p in &gone {
-                let _ = m.remove(p);
+                H::defender_map_remove(m, *p);
             }
-            if let Err(e) = m.insert(pid, 1, 0) {
+            if let Err(e) = H::defender_map_insert(m, pid) {
                 tracing::warn!(pid, error = %e, "DEFENDER_PIDS: insert refused");
             }
         }
@@ -963,7 +970,7 @@ impl DefenseDetector {
         if !AGENT_UNITS.contains(&unit) || !matches!(verb, "stop" | "force-stop" | "kill") {
             return None;
         }
-        let g = self.installer.get()?.current_grant()?;
+        let g = H::installer_grant(self.installer.get()?)?;
         Some(format!(
             "inside the signed trusted-installer window of key {} (until {}): a stop or restart \
              of the agent's own unit",
@@ -1025,7 +1032,7 @@ impl DefenseDetector {
 
 /// `starttime` of `/proc/<pid>/stat` (field 22, after the `(comm)` field).
 fn start_ticks(proc_root: &Path, pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
+    let stat = H::read_to_string(proc_root.join(pid.to_string()).join("stat")).ok()?;
     stat.rsplit_once(')')?
         .1
         .split_whitespace()

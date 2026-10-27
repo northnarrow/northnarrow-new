@@ -43,11 +43,16 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use common::wire::InodeKey;
+use nn_core::posture::host::PostureAgent;
 use nn_model::telemetry::{FimEvent, FimOp};
 use nn_model::{Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::anti_tamper::trusted_installer::{TrustedInstallerOverride, OWN_SYSTEMD_UNITS};
+// R08b (lab PR 251): the trusted-installer window is read through the host
+// (`PostureAgent`); the agent's for now, the rules' type parameter once
+// they move to nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::decision::attack::{AttackRef, Tactic};
 use crate::decision::Rule;
 use crate::posture::lineage::AuthSessionTracker;
@@ -978,7 +983,8 @@ impl Rule for NnLFim009SystemdUnitDropped {
         // agent's OWN unit files is an authorised upgrade — downgrade to
         // an audit Log (recorded, not silenced). Tight scope: any other
         // unit, or our units with no open window, still trip the kill.
-        if OWN_SYSTEMD_UNITS.contains(&fe.path.as_str()) && self.installer_override.is_window_open()
+        if OWN_SYSTEMD_UNITS.contains(&fe.path.as_str())
+            && H::installer_window_open(&self.installer_override)
         {
             return Some(fim_verdict(
                 self,
@@ -2296,7 +2302,7 @@ impl Rule for NnLFim025FileCapabilityGranted {
         } else {
             Severity::High
         };
-        if self.installer_override.is_window_open() {
+        if H::installer_window_open(&self.installer_override) {
             return Some(fim_verdict(
                 self,
                 fe,

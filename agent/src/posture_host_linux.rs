@@ -46,6 +46,10 @@ impl PostureHost for LinuxHost {
         fs::read_link(path)
     }
 
+    fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<fs::ReadDir> {
+        fs::read_dir(path)
+    }
+
     fn is_dir(path: &Path) -> bool {
         path.is_dir()
     }

@@ -30,6 +30,15 @@ pub mod correlation;
 // PR 250; was the agent's `detection_budget`, without its reporter task).
 pub mod detection_budget;
 
+/// The decision engine (R08b, lab PR 251): what it does on its host
+/// (`decision::host`, the agent's `LinuxHost`).
+pub mod decision {
+    /// The host's calls the engine makes: the package database's `rpm`, the
+    /// work kept off the async runtime, the host's view of a path, the
+    /// trusted-installer window, the kernel's map of the security tools.
+    pub mod host;
+}
+
 // The adaptive defensive posture (R08a, lab PR 250; was the agent's
 // `posture`): the state machine, its triggers, the corroboration ledger, the
 // lineage, the stack exemption, the operator's two overlays, and what it

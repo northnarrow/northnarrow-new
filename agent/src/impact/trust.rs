@@ -51,8 +51,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use nn_core::decision::host::DecisionHost;
+use nn_core::posture::host::PostureHost;
 use parking_lot::Mutex;
 
+// R08b (lab PR 251): the host's root, the work kept off the async runtime
+// and the trusted `rpm` are the host's (`PostureHost`, `DecisionHost`); the
+// agent's for now, the type parameter of the owners once they move to
+// nn-core.
+use crate::chain_host_linux::LinuxHost as H;
 use crate::posture::lineage::{in_system_tree, is_interpreter, ExecIdentity};
 
 /// Why a writer's bursts do not count.
@@ -229,7 +236,7 @@ const OWNERS_CACHE_CAP: usize = 1024;
 
 impl Default for ProgramOwners {
     fn default() -> Self {
-        Self::new("/")
+        Self::new(H::HOST_ROOT)
     }
 }
 
@@ -264,7 +271,7 @@ impl ProgramOwners {
                 return *v;
             }
         }
-        let answer = crate::runtime::off_the_runtime(|| self.lookup(&text, &key));
+        let answer = H::off_the_runtime(|| self.lookup(&text, &key));
         let mut c = self.cache.lock();
         if c.1.len() >= OWNERS_CACHE_CAP {
             c.1.clear();
@@ -307,15 +314,7 @@ fn dpkg_lists(info: &Path, key: &str) -> bool {
 
 /// `rpm -qf --quiet PATH`, as R018 asks it.
 fn rpm_owns(path: &str) -> Option<bool> {
-    let rpm = crate::trusted_bin::resolve("rpm").ok()?;
-    let status = rpm
-        .command()
-        .args(["-qf", "--quiet", path])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    Some(status.success())
+    H::rpm_owns(path).ok().flatten()
 }
 
 /// `/usr/bin/x` → `/bin/x`.

@@ -201,6 +201,11 @@ planned = false
 "cow::index" = "nn-core"
 "cow::trust" = "nn-core"
 "decision" = "nn-core"
+# post-plan (lab PR 251, R08b): the Linux host of the decision engine —
+# the package database's `rpm`, the work kept off the async runtime, the
+# host's view of a path, the trusted-installer window, `DEFENDER_PIDS` —
+# of nn-core's `decision::host::DecisionHost`
+"decision_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the detection log's records and their
 # parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
 # file propri"; the payloads are nn-evidence's). R08b (lab PR 251): the
@@ -390,11 +395,16 @@ planned = false
 # the posture to the Linux host, names it (→ 36). Lab PR 251 (R08b): 50 →
 # 46, nn-core 36 → 32: the host's resolvers moved to nn-core, so the
 # response policy, the chain and network rules and the decision replay name
-# nn-core's module (→ 32).
+# nn-core's module (→ 32); the engine's seam — the ancestry tree, the
+# transfer tools' clock, R018's and the ransomware tracker's package
+# database, the tracker's host path, the security-tool detector, the FIM
+# rules' window and the rule sets' inert one name the agent's Linux host
+# where they called libc, `std::fs` on `/proc`, `runtime`, `trusted_bin`,
+# `response` and the window (→ 35).
 
 [ratchet]
 nn-admin = 8
-nn-core = 32
+nn-core = 35
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3
