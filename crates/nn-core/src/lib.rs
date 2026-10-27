@@ -10,9 +10,9 @@
 //! agent's other modules until they move here ([`posture::host`], R08a, lab
 //! PR 250). R08b (lab PR 251) moves the decision engine here — its rules,
 //! the multi-match combination, the signed per-rule policy, the network
-//! state the rules read, the ransomware and security-tool judges — and what
-//! it does on its host is a trait the host implements too
-//! ([`decision::host`]).
+//! state the rules read, the ransomware and security-tool judges, the
+//! canary detector — and what they do on their host is a trait the host
+//! implements too ([`decision::host`], [`canary::host`]).
 //!
 //! Created empty by the Wave 4 restructure, R01 (lab PR 239); the crates it may
 //! depend on, and the rules of the pure crates, are in
@@ -75,13 +75,23 @@ pub mod config {
 
 /// Deception content (R07, lab PR 247): the credential canaries' renderer
 /// (was the agent's `canary::templates`); R08a (lab PR 250): the readers a
-/// File or Credential canary spares (was the agent's `canary::readers`).
+/// File or Credential canary spares (was the agent's `canary::readers`);
+/// R08b (lab PR 251): the canary detector (was the agent's
+/// `canary::detector`) and the network canaries' addresses (from the
+/// agent's `canary::network`).
 pub mod canary {
     // The programs whose read of a File or Credential canary is recorded,
     // not killed: judged on what the kernel executed (R08a, lab PR 250).
     pub mod readers;
     /// The five credential families' decoys, rendered from a seed.
     pub mod templates;
+    // R08b (lab PR 251): the inline filter that turns an access to a
+    // deployed canary into its trip (Tappa 9.5 K3), what it does on its host
+    // (`canary::host`), and the network canaries' addresses it matches a
+    // connect on.
+    pub mod detector;
+    pub mod host;
+    pub mod network;
 }
 
 // R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the path the

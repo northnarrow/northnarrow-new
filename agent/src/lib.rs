@@ -59,6 +59,10 @@ pub use nn_evidence::chain_host;
 pub mod chain_host_linux;
 /// R05 shim: the newest-first tail reader of the admin read verbs.
 pub use nn_evidence::chain_tail;
+/// The Linux host of the canary detector: the signed registry and access
+/// log, the interface addresses, the read-forward set, `stat(2)`, `/proc`
+/// (nn-core's `CanaryHost`, R08b, lab PR 251).
+pub mod canary_host_linux;
 /// R05 shim: the rotating, signed chains are nn-evidence's; the writer signs
 /// with the agent's key unless told otherwise.
 pub mod chainlog {

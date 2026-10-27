@@ -164,9 +164,13 @@ planned = false
 "build_info" = "northnarrow-agent"
 # path_policy, the registry's store, network, access_log, read_forward
 "canary" = "nn-linux"
-"canary::detector" = "nn-core"
 # the format half goes to nn-core (R04c)
 "canary::registry" = "nn-linux"
+# post-plan (lab PR 251, R08b): the Linux host of the canary detector —
+# the signed registry and access log, the interface addresses, the
+# read-forward set, `stat(2)`, `/proc/<pid>/exe` — of nn-core's
+# `canary::host::CanaryHost`
+"canary_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the chains' Linux file operations
 "chain_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
@@ -335,6 +339,11 @@ planned = false
 # R08a (lab PR 250): the readers a File or Credential canary spares (they
 # judge on `posture::lineage`); `canary/mod.rs` binds them to the agent's host
 "canary::readers" = "nn-core"
+# R08b (lab PR 251): the canary detector and its indexes, with the rules
+# (the network canaries' addresses it matches were cut from
+# `canary::network` with it); `canary/mod.rs` binds them to the agent's
+# host (an inline module), its tests stay in `canary/detector_tests.rs`
+"canary::detector" = "nn-core"
 # R07 (lab PR 247): the credential renderer; `canary/mod.rs` binds it to the
 # agent's host and draws the deploy's seed from the OS RNG
 "canary::templates" = "nn-core"
@@ -437,7 +446,7 @@ planned = false
 # that host, the posture's second seam (→ 39); the machine, the triggers,
 # the entry and the clock moved, and the agent's `posture.rs`, which binds
 # the posture to the Linux host, names it (→ 36). Lab PR 251 (R08b): 50 →
-# 46, nn-core 36 → 32: the host's resolvers moved to nn-core, so the
+# 33, nn-core 36 → 19. The host's resolvers moved to nn-core, so the
 # response policy, the chain and network rules and the decision replay name
 # nn-core's module (→ 32); the engine's seam — the ancestry tree, the
 # transfer tools' clock, R018's and the ransomware tracker's package
@@ -457,11 +466,14 @@ planned = false
 # security-tool detector — taking their 13 references with them (the
 # catalogue's three to the rules decided outside the engine stay with its
 # renderer, the agent's), and the shims that bind them to the Linux host
-# name it: `decision.rs`, `impact.rs`, `impair.rs`, `net/mod.rs` (→ 21).
+# name it: `decision.rs`, `impact.rs`, `impair.rs`, `net/mod.rs` (→ 21);
+# the canary detector moved, taking its two references (the registry, the
+# access log, the addresses and the read-forward set are its host's), and
+# `canary/mod.rs`, which binds it to the Linux host, is nn-linux's (→ 19).
 
 [ratchet]
 nn-admin = 8
-nn-core = 21
+nn-core = 19
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

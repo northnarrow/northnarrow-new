@@ -23,6 +23,9 @@ nn-evidence = { workspace = true }
 # R08b (lab PR 251): the drift's severity tier is a field of the drift
 # log's signed rows (its serde derives moved with it).
 serde = { workspace = true }
+# R08b (lab PR 251): the canary detector indexes the deployments the
+# admin protocol carries (`admin_signed_payload::CanaryDeploymentWire`).
+nn-proto = { workspace = true }
 # the triggers read the exec and open sensors' flags and reasons
 # (`common::wire::{exe, open_sensor}`), the kernel ABI's constants.
 common = { workspace = true }

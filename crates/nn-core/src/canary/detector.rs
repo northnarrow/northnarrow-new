@@ -8,8 +8,7 @@
 //! BEFORE the rule engine sees the event. For every inbound
 //! `Event::Fim` / `Event::ProcessSpawn` / `Event::TcpConnect`,
 //! `Detector::process_event` checks the corresponding hot-path
-//! index against the [`crate::canary::registry::Registry`]'s
-//! live set:
+//! index against the canary registry's live set:
 //!
 //! - `is_canary_inode(dev, ino)` — File / Credential canary
 //!   trip path. Consulted on `Event::Fim` (the C5.2
@@ -21,7 +20,7 @@
 //! - `is_canary_destination(dst, port)` — Network canary trip
 //!   path (lab PR 163). Consulted on `Event::TcpConnect`: a local
 //!   process connecting to a canary's address and port is the
-//!   accessor ([`crate::canary::network`] says why it is the
+//!   accessor (the agent's `canary::network` says why it is the
 //!   connect, not an accept). Every row of that connection
 //!   (`Event::NetFlow`: its connect-time row, snapshots, close) belongs
 //!   to the trip: the engine's flow ledger owns it from the trip on
@@ -30,14 +29,14 @@
 //! When any helper returns `Some(canary_id)`, under the registry lock:
 //!
 //! 1. Detector asks the registry whether the canary is still armed
-//!    ([`crate::canary::registry::Registry::is_armed`]): this access is
+//!    ([`CanaryHost::is_armed`]): this access is
 //!    then the first trip (§12 Q2 single-trip lock-in).
 //! 2. Detector appends a `CanaryAccessEntry` to
 //!    `canary_access.jsonl` via
-//!    [`crate::canary::access_log::CanaryAccessDb::append`]
+//!    [`CanaryHost::append_access`]
 //!    (chain captures EVERY access; subsequent rows carry
 //!    `first_trip: false`).
-//! 3. On a first trip, [`crate::canary::registry::Registry::mark_tripped`]
+//! 3. On a first trip, [`CanaryHost::mark_tripped`]
 //!    appends a signed `Trip` row carrying that access row's
 //!    `entry_hash` (external audit DEC-011: the state survives a
 //!    restart; the hash used to be left empty).
@@ -59,8 +58,21 @@
 //! the synchronous detector calls land inside the
 //! `process_event` tokio task itself + don't block the
 //! reactor longer than a few HashMap lookups.
+//!
+//! ## Host (Wave 4 restructure, R08b, lab PR 251)
+//!
+//! Moved from the agent to nn-core with the rule engine. The registry,
+//! the access log, this host's addresses, the read-forward set, a
+//! canary's inode and an accessor's executable are the host's
+//! ([`CanaryHost`]: the agent's `LinuxHost`, `canary_host_linux`); the
+//! detector and its indexes take the host as a type parameter and call it
+//! where they called the agent's modules, `stat(2)` and `/proc`, with the
+//! same arguments. The agent names them on its host under their old paths
+//! (`canary::detector::{Detector, CanaryIndexes}`); its tests of them,
+//! which wire its registry and access log, stay there.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,13 +83,12 @@ use nn_proto::admin_signed_payload::{CanaryDeploymentWire, CanaryTypeWire};
 use parking_lot::Mutex;
 use tracing::{error, warn};
 
-use crate::canary::access_log::{CanaryAccessDb, CanaryAccessDraft};
-use crate::canary::network::{connect_destination, CanaryAddr, LocalAddrs, PortCanaries};
-use crate::canary::registry::Registry;
+use crate::canary::host::{CanaryAccessDraft, CanaryHost};
+use crate::canary::network::{connect_destination, CanaryAddr, PortCanaries};
 
 // ── hot-path indexes ────────────────────────────────────────────────
 
-/// Hot-path indexes derived from the [`Registry`]'s live set.
+/// Hot-path indexes derived from the registry's live set.
 /// Rebuilt on registry mutations (deploy / burn / refresh)
 /// via [`CanaryIndexes::rebuild_from_registry`]. Three
 /// independent HashMaps so the detector's
@@ -108,17 +119,42 @@ use crate::canary::registry::Registry;
 /// `is_canary_inode_via_stat`. Tappa 9.5 K3 ships the
 /// HashMap shape; K6's deploy dispatch will populate inode
 /// keys after physically creating each canary file.
-#[derive(Debug, Default)]
-pub struct CanaryIndexes {
+pub struct CanaryIndexes<H: CanaryHost> {
     inode_index: HashMap<InodeKey, String>,
     exe_index: HashMap<PathBuf, String>,
     port_index: HashMap<u16, PortCanaries>,
     /// Reverse lookup `canary_id → name` for trip-event
     /// construction without re-walking the registry.
     name_index: HashMap<String, (String, CanaryTypeTag)>,
+    /// R08b: the host whose registry the indexes are rebuilt from.
+    host: PhantomData<fn() -> H>,
 }
 
-impl CanaryIndexes {
+// R08b: the derives' output, without a bound on the host.
+impl<H: CanaryHost> std::fmt::Debug for CanaryIndexes<H> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanaryIndexes")
+            .field("inode_index", &self.inode_index)
+            .field("exe_index", &self.exe_index)
+            .field("port_index", &self.port_index)
+            .field("name_index", &self.name_index)
+            .finish()
+    }
+}
+
+impl<H: CanaryHost> Default for CanaryIndexes<H> {
+    fn default() -> Self {
+        Self {
+            inode_index: HashMap::default(),
+            exe_index: HashMap::default(),
+            port_index: HashMap::default(),
+            name_index: HashMap::default(),
+            host: PhantomData,
+        }
+    }
+}
+
+impl<H: CanaryHost> CanaryIndexes<H> {
     /// Empty indexes. `rebuild_from_registry` populates from
     /// a snapshot.
     pub fn new() -> Self {
@@ -137,7 +173,7 @@ impl CanaryIndexes {
     /// that canary (file may not exist yet; the lazy
     /// `is_canary_inode_via_path` fallback handles the late
     /// resolution path).
-    pub fn rebuild_from_registry<F>(&mut self, registry: &Registry, inode_resolver: F)
+    pub fn rebuild_from_registry<F>(&mut self, registry: &H::Registry, inode_resolver: F)
     where
         F: Fn(&Path) -> Option<InodeKey>,
     {
@@ -145,7 +181,7 @@ impl CanaryIndexes {
         self.exe_index.clear();
         self.port_index.clear();
         self.name_index.clear();
-        for canary in registry.list() {
+        for canary in H::live(registry) {
             let canary_id = canary.canary_id.clone();
             let type_tag = canary_type_wire_to_tag(canary.canary_type);
             self.name_index
@@ -184,7 +220,7 @@ impl CanaryIndexes {
         }
         // Publish the file-canary inodes so the FIM drain forwards
         // their READ opens past the BUG-012 v2 gate (see read_forward).
-        crate::canary::read_forward::replace(self.inode_index.keys().copied());
+        H::publish_read_forward(self.inode_index.keys().copied());
     }
 
     /// Hot-path inode lookup. Returns the canary_id of the
@@ -227,11 +263,11 @@ impl CanaryIndexes {
     /// the inode index stayed empty, read-forward was published empty, and
     /// the FIM drain dropped every read of a file canary until an operator
     /// deployed, burned or refreshed one. Inodes are resolved here
-    /// ([`stat_inode_key`]) and File/Credential paths layered into the
+    /// ([`CanaryHost::inode_key`]) and File/Credential paths layered into the
     /// path index, in one place.
-    pub fn rebuild_live(&mut self, registry: &Registry) {
-        self.rebuild_from_registry(registry, stat_inode_key);
-        for canary in registry.list() {
+    pub fn rebuild_live(&mut self, registry: &H::Registry) {
+        self.rebuild_from_registry(registry, H::inode_key);
+        for canary in H::live(registry) {
             match &canary.deployment {
                 CanaryDeploymentWire::File { path, .. }
                 | CanaryDeploymentWire::Credential { path, .. } => {
@@ -294,34 +330,34 @@ fn canary_type_wire_to_tag(t: CanaryTypeWire) -> CanaryTypeTag {
 /// registry + the K3 access log + the hot-path indexes. One
 /// `Detector` instance per agent process — main owns it via
 /// `Arc<Detector>` for tokio-task sharing.
-pub struct Detector {
-    registry: Arc<Mutex<Registry>>,
-    access_log: Arc<Mutex<CanaryAccessDb>>,
-    indexes: Arc<Mutex<CanaryIndexes>>,
+pub struct Detector<H: CanaryHost> {
+    registry: Arc<Mutex<H::Registry>>,
+    access_log: Arc<Mutex<H::AccessLog>>,
+    indexes: Arc<Mutex<CanaryIndexes<H>>>,
     /// This host's addresses, for the wildcard network canaries.
-    local_addrs: LocalAddrs,
+    local_addrs: H::LocalAddrs,
 }
 
-impl Detector {
+impl<H: CanaryHost> Detector<H> {
     /// Build with shared handles. Caller (main.rs) wires
     /// the Registry + AccessDb at boot and clones the Arcs.
     pub fn new(
-        registry: Arc<Mutex<Registry>>,
-        access_log: Arc<Mutex<CanaryAccessDb>>,
-        indexes: Arc<Mutex<CanaryIndexes>>,
+        registry: Arc<Mutex<H::Registry>>,
+        access_log: Arc<Mutex<H::AccessLog>>,
+        indexes: Arc<Mutex<CanaryIndexes<H>>>,
     ) -> Self {
         Self {
             registry,
             access_log,
             indexes,
-            local_addrs: LocalAddrs::default(),
+            local_addrs: H::LocalAddrs::default(),
         }
     }
 
-    /// The detector's indexes, for its tests (`canary::detector_tests`) to
-    /// rebuild after a deploy.
-    #[cfg(test)]
-    pub(crate) fn indexes(&self) -> &Arc<Mutex<CanaryIndexes>> {
+    /// The detector's indexes, for the agent's tests of it
+    /// (`canary::detector_tests`) to rebuild after a deploy.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn indexes(&self) -> &Arc<Mutex<CanaryIndexes<H>>> {
         &self.indexes
     }
 
@@ -419,8 +455,10 @@ impl Detector {
                 let dst = connect_destination(*family, dst_addr)?;
                 let canary_id = {
                     let idx = self.indexes.lock();
-                    idx.is_canary_destination(dst, *dst_port, &|a| self.local_addrs.contains(a))
-                        .map(String::from)
+                    idx.is_canary_destination(dst, *dst_port, &|a| {
+                        H::is_local(&self.local_addrs, a)
+                    })
+                    .map(String::from)
                 };
                 let canary_id = canary_id?;
                 (
@@ -460,9 +498,7 @@ impl Detector {
         // for the accessor, for the chain row and the trip event (the K5
         // rules judge readers through the lineage cache). Best-effort: a
         // short-lived reader may be gone.
-        let accessor_exe = std::fs::read_link(format!("/proc/{accessor_pid}/exe"))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
+        let accessor_exe = H::accessor_exe(accessor_pid);
 
         // External audit DEC-011: under the registry lock, decide whether
         // this is the first trip, append the access row (ALWAYS — the
@@ -472,21 +508,24 @@ impl Detector {
         // emitted.
         let first_trip = {
             let mut reg = self.registry.lock();
-            let first_trip = reg.is_armed(&canary_id);
+            let first_trip = H::is_armed(&reg, &canary_id);
             let access_entry_hash = {
                 let mut log = self.access_log.lock();
-                match log.append(CanaryAccessDraft {
-                    canary_id: canary_id.clone(),
-                    canary_name: canary_name.clone(),
-                    canary_type: canary_type_tag,
-                    access_kind,
-                    accessor_pid,
-                    accessor_uid,
-                    accessor_comm: accessor_comm.clone(),
-                    accessor_exe: accessor_exe.clone(),
-                    first_trip,
-                }) {
-                    Ok(entry) => Some(entry.entry_hash),
+                match H::append_access(
+                    &mut log,
+                    CanaryAccessDraft {
+                        canary_id: canary_id.clone(),
+                        canary_name: canary_name.clone(),
+                        canary_type: canary_type_tag,
+                        access_kind,
+                        accessor_pid,
+                        accessor_uid,
+                        accessor_comm: accessor_comm.clone(),
+                        accessor_exe: accessor_exe.clone(),
+                        first_trip,
+                    },
+                ) {
+                    Ok(entry_hash) => Some(entry_hash),
                     Err(e) => {
                         warn!(
                             error = %e,
@@ -499,7 +538,7 @@ impl Detector {
                 }
             };
             if first_trip {
-                if let Err(e) = reg.mark_tripped(&canary_id, access_entry_hash) {
+                if let Err(e) = H::mark_tripped(&mut reg, &canary_id, access_entry_hash) {
                     error!(
                         error = %format!("{e:#}"),
                         canary_id = %canary_id,
@@ -528,17 +567,4 @@ impl Detector {
             first_trip,
         })
     }
-}
-
-/// External audit DEC-003: the kernel's `(dev, ino)` for `path` —
-/// `stat(2)` without following a link, `dev` encoded as the kernel does
-/// (`(major << 20) | minor`). `None` when the file is not there.
-pub fn stat_inode_key(path: &Path) -> Option<InodeKey> {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(path).ok()?;
-    let dev = m.dev();
-    Some(InodeKey {
-        dev: ((libc::major(dev) as u64) << 20) | libc::minor(dev) as u64,
-        ino: m.ino(),
-    })
 }

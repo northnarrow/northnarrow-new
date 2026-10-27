@@ -827,6 +827,7 @@ dependencies = [
  "hex",
  "nn-evidence",
  "nn-model",
+ "nn-proto",
  "northnarrow-common",
  "parking_lot",
  "serde",
