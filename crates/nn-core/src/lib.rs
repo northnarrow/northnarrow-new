@@ -15,7 +15,9 @@
 //! implements too ([`decision::host`], [`canary::host`]). R08c (lab PR 252)
 //! moves the COMBAT ladder here — its policy, the traits of its actuator and
 //! host-critical guard, its signed evidence — with its host's capture of a
-//! process as a trait ([`combat::host`]).
+//! process as a trait ([`combat::host`]), the executor's configuration
+//! ([`response::config`]), and lays down the types the priority bus and
+//! the sensor contract are built on ([`bus`], [`contract`]: R12, R13).
 //!
 //! Created empty by the Wave 4 restructure, R01 (lab PR 239); the crates it may
 //! depend on, and the rules of the pure crates, are in
@@ -24,9 +26,17 @@
 
 #![forbid(unsafe_code)]
 
+/// The event bus's types: a skeleton for the priority bus (R08c, lab PR
+/// 252; plan §3.4, R12).
+pub mod bus;
+
 /// What the content lists need from their host: an open that follows no
 /// final symlink and blocks on no FIFO.
 pub mod content_host;
+
+/// The sensor contract's types: a skeleton for the signed contract (R08c,
+/// lab PR 252; plan §3.6, R13).
+pub mod contract;
 
 // The bounded buffer of recent events the posture's triggers count over
 // (R08a, lab PR 250; was the agent's `correlation`). No outer doc comment on
