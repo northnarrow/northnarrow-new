@@ -113,12 +113,16 @@ pub mod net {
 }
 
 /// FIM content (R07, lab PR 247): the watched paths (was the agent's
-/// `fim::paths_config`); R08b (lab PR 251): the anti-tamper baits and the
-/// FIM rules (were the agent's `fim::rules`).
+/// `fim::paths_config`); R08b (lab PR 251): the anti-tamper baits, the
+/// drift's classification and the FIM rules (were the agent's
+/// `fim::rules` and part of its `fim::drain`).
 pub mod fim {
     /// The anti-tamper baits: each path with its template (R08b, lab PR 251;
     /// cut from the agent's `fim::honeypot`).
     pub mod baits;
+    /// The drift's provisional severity, its classifier and the per-tier
+    /// token bucket (R08b, lab PR 251; cut from the agent's `fim::drain`).
+    pub mod drift;
     /// The shipped `fim-paths.v1` and the operator's `fim-paths.local`.
     pub mod paths_config;
     // The FIM, credential-read and file-capability rules (Tappa 9; R08b,

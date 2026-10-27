@@ -240,7 +240,8 @@ planned = false
 "execq" = "nn-linux"
 "execq::policy" = "nn-core"
 "execq::record" = "nn-core"
-# attach, drain (the ring half; the drift classification → nn-core, R04c),
+# attach, drain (the ring half; R08b, lab PR 251, cut the drift's
+# classification to nn-core's `fim::drift`, re-exported by the drain),
 # baseline, honeypot, recompute; the rules: `[shims.agent]` (R08b)
 "fim" = "nn-linux"
 "fs_type" = "nn-linux"
