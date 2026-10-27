@@ -41,7 +41,17 @@ pub mod dns_cache {
 }
 pub mod dns_ingest;
 pub mod drain;
-pub mod flow_tracker;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the flow
+/// tracker (connect → close, the flow id, the open-flow snapshots) is
+/// nn-core's; its notifier, which the drain awaits, is the agent's host's
+/// (tokio's `Notify`).
+pub mod flow_tracker {
+    pub use nn_core::net::flow_tracker::*;
+
+    /// [`nn_core::net::flow_tracker::FlowTracker`] on the agent's host.
+    pub type FlowTracker =
+        nn_core::net::flow_tracker::FlowTracker<crate::chain_host_linux::LinuxHost>;
+}
 /// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the netflow
 /// rows handed to the rules, paced per uid, are nn-core's, with the rules
 /// and the correlation store they read.

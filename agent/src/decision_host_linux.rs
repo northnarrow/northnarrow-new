@@ -81,6 +81,13 @@ impl DecisionHost for LinuxHost {
 
     /// Tokio's `Notify` and the pump's mark (lab PR 229).
     type DnsIngest = crate::net::dns_cache::DnsIngest;
+
+    /// Tokio's `Notify`, which the net drain awaits (lab PR 246).
+    type FlowNotify = tokio::sync::Notify;
+
+    fn notify_flow_waiters(notify: &tokio::sync::Notify) {
+        notify.notify_waiters();
+    }
 }
 
 // ── the exemption facts (from `decision::rule_policy`, R08b) ───────────

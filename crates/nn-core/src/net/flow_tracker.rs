@@ -104,10 +104,10 @@ use std::sync::Arc;
 
 use nn_model::telemetry::{FlowPhase, NetFlowEvent, TlsFingerprint};
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::decision::bounded::{LazyLru, LossCounter};
+use crate::decision::host::DecisionHost;
 
 /// Default ceiling on simultaneous in-flight (connect-seen,
 /// close-not-yet) flows. Past it a connect evicts one (module docs).
@@ -309,7 +309,11 @@ struct PidPending {
 /// plus, per process, the order of its pending connects.
 /// Single-threaded today; callers that need cross-thread access
 /// wrap it in `Arc<parking_lot::Mutex<FlowTracker>>`.
-pub struct FlowTracker {
+///
+/// R08b (lab PR 251): `H` is the host whose notifier wakes a close the net
+/// drain holds until its connect is announced ([`DecisionHost::FlowNotify`];
+/// the agent's is tokio's `Notify`).
+pub struct FlowTracker<H: DecisionHost> {
     pending: HashMap<CorrId, PendingFlow>,
     /// Every pending entry, under the pid of its connect.
     by_pid: HashMap<u32, PidPending>,
@@ -327,12 +331,12 @@ pub struct FlowTracker {
     /// Lab PR 246: woken when the connect pump announces connects
     /// ([`Self::announce`]); the drain's [`crate::net::drain`] close
     /// waits on it.
-    announced: Arc<Notify>,
+    announced: Arc<H::FlowNotify>,
     /// Lab PR 246: the connect pump runs, so connects get announced.
     connect_pump: bool,
 }
 
-impl std::fmt::Debug for FlowTracker {
+impl<H: DecisionHost> std::fmt::Debug for FlowTracker<H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlowTracker")
             .field("pending", &self.pending.len())
@@ -342,13 +346,13 @@ impl std::fmt::Debug for FlowTracker {
     }
 }
 
-impl Default for FlowTracker {
+impl<H: DecisionHost> Default for FlowTracker<H> {
     fn default() -> Self {
         Self::with_capacity(DEFAULT_PENDING_CAPACITY)
     }
 }
 
-impl FlowTracker {
+impl<H: DecisionHost> FlowTracker<H> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             pending: HashMap::new(),
@@ -358,14 +362,14 @@ impl FlowTracker {
             recent_synth: VecDeque::new(),
             capacity,
             evicted: LossCounter::new(&PENDING_EVICTIONS),
-            announced: Arc::new(Notify::new()),
+            announced: Arc::new(H::FlowNotify::default()),
             connect_pump: false,
         }
     }
 
     /// Lab PR 246: what wakes a close waiting for its connect
     /// ([`Self::close_may_proceed`]).
-    pub fn announcements(&self) -> Arc<Notify> {
+    pub fn announcements(&self) -> Arc<H::FlowNotify> {
         Arc::clone(&self.announced)
     }
 
@@ -374,7 +378,7 @@ impl FlowTracker {
     pub fn set_connect_pump(&mut self, running: bool) {
         self.connect_pump = running;
         if !running {
-            self.announced.notify_waiters();
+            H::notify_flow_waiters(&self.announced);
         }
     }
 
@@ -385,7 +389,7 @@ impl FlowTracker {
         if let Some(p) = self.pending.get_mut(corr) {
             p.announced = true;
         }
-        self.announced.notify_waiters();
+        H::notify_flow_waiters(&self.announced);
     }
 
     /// Lab PR 246: whether the close of the flow `corr` may be resolved
@@ -889,6 +893,10 @@ fn addr_bytes(a: IpAddr) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R08b (lab PR 251): the tracker on the portable test host (no drain
+    // waits on its notifier).
+    type FlowTracker = super::FlowTracker<crate::posture::host::testing::TestHost>;
     use std::net::Ipv4Addr;
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {

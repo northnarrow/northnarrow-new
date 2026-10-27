@@ -367,6 +367,10 @@ planned = false
 # `net::dns_cache` is an inline module of `net/mod.rs` that gives it the
 # pump's ingest (`net::dns_ingest`) and keeps the reply parsers' path (R06)
 "net::dns_cache" = "nn-core"
+# R08b (lab PR 251): the flow tracker (connect → close, the flow id, the
+# open-flow snapshots), with the rules' network state; `net/mod.rs` names it
+# on the agent's host, whose notifier the drain awaits (an inline module)
+"net::flow_tracker" = "nn-core"
 # R08b (lab PR 251): the netflow rows handed to the rules, paced per uid;
 # `net/mod.rs` names the gate on the agent's host (an inline module)
 "net::limiter" = "nn-core"

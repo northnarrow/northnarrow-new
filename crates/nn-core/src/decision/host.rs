@@ -96,6 +96,15 @@ pub trait DecisionHost: PostureAgent + ContentHost {
     /// on (lab PR 229; the agent: `net::dns_cache::DnsIngest`). The engine
     /// holds it in the cache, nothing more.
     type DnsIngest: Default + Debug + Send + Sync + 'static;
+
+    /// What wakes a close the net drain holds until its connect is
+    /// announced (lab PR 246; the agent: tokio's `Notify`, which the drain
+    /// awaits). The flow tracker holds it, hands it out and wakes it.
+    type FlowNotify: Default + Send + Sync + 'static;
+
+    /// Wake every current waiter of `notify` (the agent:
+    /// `Notify::notify_waiters`).
+    fn notify_flow_waiters(notify: &Self::FlowNotify);
 }
 
 /// The engine's own tests: the posture's portable test host
@@ -103,7 +112,8 @@ pub trait DecisionHost: PostureAgent + ContentHost {
 /// nothing of their own — work runs where it is called, no `rpm` to ask,
 /// a path is its own view, a window is a `bool` (open or not: no grant to
 /// name), the defenders' map a set, no exemption fact readable (an empty
-/// process table), a sampler that finds nothing, no DNS pump. The Linux
+/// process table), a sampler that finds nothing, no DNS pump and no drain
+/// waiting on the flow tracker. The Linux
 /// semantics are tested with the agent's host, in the agent.
 #[cfg(test)]
 mod testing {
@@ -189,5 +199,9 @@ mod testing {
         }
 
         type DnsIngest = ();
+
+        type FlowNotify = ();
+
+        fn notify_flow_waiters(_notify: &()) {}
     }
 }

@@ -95,15 +95,19 @@ use nn_model::path_text;
 use nn_evidence::detection_payload;
 
 /// The network state the rules read (R08b, lab PR 251): the operator's
-/// blocklists, the DNS cache, the netflow pacing, the host's configured DNS
-/// resolvers (were the agent's `net::blocklist`, the state of its
-/// `net::dns_cache`, its `net::limiter` and `net::resolvers`).
+/// blocklists, the DNS cache, the flow tracker, the netflow pacing, the
+/// host's configured DNS resolvers (were the agent's `net::blocklist`, the
+/// state of its `net::dns_cache`, its `net::flow_tracker`, `net::limiter`
+/// and `net::resolvers`).
 pub mod net {
     // The operator's NetFlow and JA3 blocklists (Tappa 10, N6).
     pub mod blocklist;
     // The PID-keyed DNS query cache: a connect's name, a forwarded query's
     // originator (Tappa 10, N4).
     pub mod dns_cache;
+    // The TCP connect → close tracker, the flow id, the open-flow snapshots
+    // (Tappa 10, N3).
+    pub mod flow_tracker;
     // The netflow rows handed to the rules, paced per uid (external audit
     // NET-019).
     pub mod limiter;
