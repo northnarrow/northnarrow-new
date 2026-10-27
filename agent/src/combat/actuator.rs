@@ -22,6 +22,7 @@ use tracing::{info, warn};
 
 use nn_model::ResponseAction;
 
+use super::offender::ProcFacts;
 use crate::anti_tamper::network_isolate::{IsolationReport, NetworkIsolator};
 use crate::response::proc_ref::ProcRef;
 use crate::response::quarantine::ExeHandle;
@@ -154,6 +155,13 @@ pub trait CombatActuator: Send + Sync {
     /// captured process, not a later holder of the PID?
     fn same_process(&self, target: &ProcRef, start_ns: u64) -> bool {
         target.matches_event(start_ns)
+    }
+
+    /// Lab PR 245: the executable and the cgroup of `target`, read when it
+    /// is attributed, for the signed rows that name it — only while the
+    /// capture still names the process. Nothing known by default.
+    fn describe(&self, _target: &ProcRef) -> ProcFacts {
+        ProcFacts::default()
     }
 
     /// A COMBAT episode opens (external audit CMB-011: the drop ruleset
@@ -330,6 +338,22 @@ pub(crate) const NO_BINARY: &str =
 pub(crate) const DETECT_ONLY_ISOLATE: &str = "detect-only: iptables NOT applied (no enforcement)";
 
 impl CombatActuator for SystemActuator {
+    /// `/proc/<pid>/exe` and `/proc/<pid>/cgroup`, read while the pidfd
+    /// says the process runs and the PID still has its start — checked
+    /// again after the reads (the PID cannot change hands before the
+    /// process is reaped). Reads only: detect-only reads them too.
+    fn describe(&self, target: &ProcRef) -> ProcFacts {
+        if !target.still_named_by_pid() {
+            return ProcFacts::default();
+        }
+        let facts = read_proc_facts(std::path::Path::new("/proc"), target.pid());
+        if target.still_named_by_pid() {
+            facts
+        } else {
+            ProcFacts::default()
+        }
+    }
+
     fn begin_episode(&self) {
         block_outbound::forget_applied_ruleset();
     }
@@ -511,6 +535,23 @@ impl CombatActuator for SystemActuator {
     }
 }
 
+/// Lab PR 245: what `<proc_root>/<pid>` says of a process the ladder
+/// attributes — `exe` as the kernel resolves it (` (deleted)` kept) and the
+/// cgroup that places it ([`super::offender::cgroup_path`]), each within
+/// [`super::offender::MAX_PATH_SHOWN`] bytes. The caller makes sure the pid
+/// still names the process it means (a pidfd, checked after the reads).
+pub(crate) fn read_proc_facts(proc_root: &std::path::Path, pid: u32) -> ProcFacts {
+    use super::offender::{cgroup_path, shown};
+    let dir = proc_root.join(pid.to_string());
+    let exe = std::fs::read_link(dir.join("exe"))
+        .ok()
+        .map(|p| shown(&p.to_string_lossy()));
+    let cgroup = std::fs::read_to_string(dir.join("cgroup"))
+        .ok()
+        .and_then(|text| cgroup_path(&text).map(shown));
+    ProcFacts { exe, cgroup }
+}
+
 /// Review 87: the file a process runs, opened before it is killed. `None`
 /// once it has exited, or when the binary was deleted while it ran (the
 /// kernel's ` (deleted)` suffix): nothing on disk to quarantine.
@@ -522,6 +563,22 @@ fn binary_of(pid: u32) -> Option<ExeHandle> {
 mod tests {
     use super::*;
     use crate::response::config::ExecutorConfig;
+
+    /// Lab PR 245: the executable and the cgroup as `/proc` gives them; a
+    /// deleted binary keeps its suffix; a pid with nothing to read gives
+    /// nothing.
+    #[test]
+    fn proc_facts_read_the_exe_and_the_cgroup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let d = tmp.path().join("4242");
+        std::fs::create_dir_all(&d).unwrap();
+        std::os::unix::fs::symlink("/tmp/.x/payload (deleted)", d.join("exe")).unwrap();
+        std::fs::write(d.join("cgroup"), "0::/system.slice/apache2.service\n").unwrap();
+        let f = read_proc_facts(tmp.path(), 4242);
+        assert_eq!(f.exe.as_deref(), Some("/tmp/.x/payload (deleted)"));
+        assert_eq!(f.cgroup.as_deref(), Some("/system.slice/apache2.service"));
+        assert_eq!(read_proc_facts(tmp.path(), 4243), ProcFacts::default());
+    }
 
     /// External audit CMB-002: a tree is contained only when every
     /// descendant is — not killed, spared by the guard, or past a walk cut

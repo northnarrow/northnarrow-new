@@ -2550,12 +2550,13 @@ fn dispatch_force_posture(
     };
 
     // Drive the posture mutation through the capability-gated path.
-    // `admin_force_state_with_token` consumes the token, fires
+    // `admin_force_state_signed_by` consumes the token, fires
     // hooks per §12.2, and returns the state it left and the
     // post-transition state. It refuses COMBAT → non-COMBAT without
     // `may_release`; any other error shape maps to InvalidSignature
-    // defensively.
-    match posture.admin_force_state_with_token(signers.token, target, may_release) {
+    // defensively. Lab PR 245: a COMBAT it enters names the keys that
+    // signed the order as its cause, in the ladder's signed rows.
+    match posture.admin_force_state_signed_by(signers.token, target, may_release, fps_out.clone()) {
         Ok(outcome) => {
             notes.force_from = Some(outcome.from);
             notes.force_release = outcome.release.map(Ok);
@@ -9863,7 +9864,7 @@ mod tests {
                 Ok("IPv4: cleared (read back); IPv6: cleared (read back)".to_string())
             }
         });
-        let posture = PostureMachine::new_with_hooks(Arc::new(|| {}), hook);
+        let posture = PostureMachine::new_with_hooks(Arc::new(|_| {}), hook);
         posture
             .admin_force_state_with_token(
                 crate::anti_tamper::_test_mint_unlock_token(),

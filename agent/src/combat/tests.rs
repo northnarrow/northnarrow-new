@@ -20,11 +20,48 @@ use super::actuator::{
     CombatActuator, IsolateOutcome, NeutralizeOutcome, NeutralizeReport, SoftBlock,
 };
 use super::evidence::{ActionOutcome, AuditEvidence, LadderEvidence, StageTransition, Unrecorded};
+use super::offender::ProcFacts;
 use super::ProcRef;
 use super::{
     CombatLadder, CombatStage, LadderConfig, NoProtectedProcs, ProtectedProcs, ProtectedReason,
 };
 use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport};
+use crate::posture::{CombatCause, CombatEntry, EntryProcess, TriggerEvidence};
+
+/// Lab PR 245: the evidence the posture cites for `trigger`, raised on an
+/// event of `pid`.
+fn evidence_of(trigger: TriggerType, pid: Option<u32>) -> TriggerEvidence {
+    TriggerEvidence {
+        trigger,
+        raised: vec![trigger],
+        class: trigger.evidence_class(),
+        confidence: trigger.confidence(),
+        corroborated_by: Vec::new(),
+        locked: trigger.locks_combat(),
+        scope: "login uid 1000".to_string(),
+        event_kind: "ProcessSpawn",
+        event_pid: pid,
+        event_ns: Some(1),
+    }
+}
+
+/// What the posture hands the ladder on a COMBAT entry (lab PR 245): the
+/// event of `pid` that raised `trigger`. With no trigger, the stand-in
+/// cause of the tests that do not read it — `nn-admin debug
+/// force-posture` (a real forced COMBAT names no process).
+fn entry(pid: Option<u32>, trigger: Option<TriggerType>) -> CombatEntry {
+    CombatEntry {
+        cause: match trigger {
+            Some(t) => CombatCause::Trigger(evidence_of(t, pid)),
+            None => CombatCause::DebugForce,
+        },
+        offender: pid.map(|pid| EntryProcess {
+            pid,
+            start_ns: 0,
+            seen_ns: 0,
+        }),
+    }
+}
 
 /// Shared ordered call log for the mocks + the test.
 #[derive(Clone)]
@@ -84,12 +121,23 @@ fn pids_of(offenders: &[Arc<ProcRef>]) -> Vec<u32> {
     offenders.iter().map(|r| r.pid()).collect()
 }
 
+/// Lab PR 245: what the mocks read of a process when it is attributed.
+fn mock_facts(pid: u32) -> ProcFacts {
+    ProcFacts {
+        exe: Some(format!("/tmp/.x/payload-{pid}")),
+        cgroup: Some("/user.slice/user-1000.slice/session-3.scope".to_string()),
+    }
+}
+
 impl CombatActuator for MockActuator {
     fn identify(&self, pid: u32, _start_ns: u64, _seen_ns: u64) -> Arc<ProcRef> {
         mock_ref(pid)
     }
     fn same_process(&self, target: &ProcRef, start_ns: u64) -> bool {
         mock_same_process(target, start_ns)
+    }
+    fn describe(&self, target: &ProcRef) -> ProcFacts {
+        mock_facts(target.pid())
     }
     fn soft_egress_block(&self, target: &ProcRef) -> SoftBlock {
         let pid = target.pid();
@@ -274,8 +322,7 @@ fn spawn_started(pid: u32, start_ns: u64, ppid: u32, parent_start_ns: u64) -> Ev
 fn engage_enters_investigate_without_isolation() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(30));
     l.engage(
-        Some(4242),
-        Some(TriggerType::ConfirmedIntrusion),
+        &entry(Some(4242), Some(TriggerType::ConfirmedIntrusion)),
         Instant::now(),
     );
     assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
@@ -301,7 +348,10 @@ fn investigate_deadline_advances_to_neutralize_contained_no_isolation() {
     let win = Duration::from_secs(30);
     let (l, rec) = ladder(NeutralizeOutcome::Contained, win);
     let t0 = Instant::now();
-    l.engage(Some(900), Some(TriggerType::ExfiltrationPattern), t0);
+    l.engage(
+        &entry(Some(900), Some(TriggerType::ExfiltrationPattern)),
+        t0,
+    );
 
     // Before the deadline: still investigating.
     l.tick(t0 + Duration::from_secs(5));
@@ -333,7 +383,10 @@ fn uncontainable_threat_escalates_to_isolate_last_resort() {
         win,
     );
     let t0 = Instant::now();
-    l.engage(Some(1234), Some(TriggerType::PersistenceMechanism), t0);
+    l.engage(
+        &entry(Some(1234), Some(TriggerType::PersistenceMechanism)),
+        t0,
+    );
     l.tick(t0 + win + Duration::from_secs(1));
 
     assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
@@ -361,7 +414,7 @@ fn uncontainable_threat_escalates_to_isolate_last_resort() {
 fn jump_ahead_on_active_exfil_preempts_deadline() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(300));
     let t0 = Instant::now();
-    l.engage(Some(555), Some(TriggerType::ConfirmedIntrusion), t0);
+    l.engage(&entry(Some(555), Some(TriggerType::ConfirmedIntrusion)), t0);
 
     // Offender opens an outbound connection to an external dst, long
     // before the 5-minute deadline → jump straight to NEUTRALIZE.
@@ -381,7 +434,7 @@ fn jump_ahead_on_active_exfil_preempts_deadline() {
 fn jump_ahead_ignores_loopback_connect() {
     let (l, _rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(300));
     let t0 = Instant::now();
-    l.engage(Some(555), None, t0);
+    l.engage(&entry(Some(555), None), t0);
     // A connect to loopback is not exfil — stay in INVESTIGATE.
     l.observe(
         &tcp_connect(555, [127, 0, 0, 1]),
@@ -395,7 +448,7 @@ fn jump_ahead_ignores_loopback_connect() {
 fn jump_ahead_on_lateral_spread_attributes_child() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(300));
     let t0 = Instant::now();
-    l.engage(Some(700), None, t0);
+    l.engage(&entry(Some(700), None), t0);
 
     // Offender 700 spawns child 701 → child attributed + jump-ahead.
     l.observe(&spawn(701, 700), t0 + Duration::from_secs(1));
@@ -418,7 +471,7 @@ fn jump_ahead_on_lateral_spread_attributes_child() {
 fn a_child_of_a_reused_offender_pid_is_not_attributed() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(300));
     let t0 = Instant::now();
-    l.engage(Some(700), None, t0);
+    l.engage(&entry(Some(700), None), t0);
     // offender 700 started at 7000 (mock_ref); this parent started at 1
     l.observe(&spawn_started(701, 0, 700, 1), t0 + Duration::from_secs(1));
     assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
@@ -444,7 +497,7 @@ fn a_child_of_a_reused_offender_pid_is_not_attributed() {
 fn an_offender_pid_reused_inside_the_tree_is_attributed_afresh() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(300));
     let t0 = Instant::now();
-    l.engage(Some(700), None, t0);
+    l.engage(&entry(Some(700), None), t0);
     l.observe(&spawn(701, 700), t0 + Duration::from_secs(1));
     assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
     let blocks = |rec: &Recorder| rec.log().iter().filter(|e| *e == "soft_block:701").count();
@@ -522,7 +575,13 @@ fn a_child_forked_by_an_exited_offenders_thread_is_attributed_by_its_start() {
     let pid = offender.id();
     let start = crate::response::proc_ref::proc_start_ns(pid).expect("its start");
     let t0 = Instant::now();
-    l.engage_with(Some(pid), start, start + 1_000_000, None, t0);
+    let mut e = entry(Some(pid), Some(TriggerType::ConfirmedIntrusion));
+    e.offender = Some(EntryProcess {
+        pid,
+        start_ns: start,
+        seen_ns: start + 1_000_000,
+    });
+    l.engage(&e, t0);
     assert_eq!(l.offenders(), vec![pid]);
     // It exits before its children's exec records are read.
     offender.kill().unwrap();
@@ -553,16 +612,18 @@ fn a_child_forked_by_an_exited_offenders_thread_is_attributed_by_its_start() {
     );
 }
 
-// ── Idempotent engage: hook + process_event both call it ──
+// ── A later COMBAT entry while the episode runs: merged, never reset ──
 #[test]
 fn engage_is_idempotent_and_merges_offenders() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(30));
     let t0 = Instant::now();
-    l.engage(Some(10), Some(TriggerType::ConfirmedIntrusion), t0);
-    // Second engage (context-free hook alongside context-carrying
-    // process_event) merges a new offender; does NOT reset the episode
-    // or re-emit the INVESTIGATE audit.
-    l.engage(Some(11), None, t0 + Duration::from_secs(1));
+    l.engage(&entry(Some(10), Some(TriggerType::ConfirmedIntrusion)), t0);
+    // The same entry again names a known process: nothing happens.
+    l.engage(&entry(Some(10), Some(TriggerType::ConfirmedIntrusion)), t0);
+    // A later entry naming another process merges it; does NOT reset the
+    // episode or re-emit the INVESTIGATE audit. Lab PR 245: the addition
+    // is signed, from and to the stage the episode is at.
+    l.engage(&entry(Some(11), None), t0 + Duration::from_secs(1));
     assert_eq!(l.current_stage(), Some(CombatStage::Investigate));
     let off = l.offenders();
     assert!(off.contains(&10) && off.contains(&11), "{off:?}");
@@ -573,8 +634,11 @@ fn engage_is_idempotent_and_merges_offenders() {
         .collect();
     assert_eq!(
         audits,
-        vec!["audit:-->INVESTIGATE".to_string()],
-        "exactly one INVESTIGATE audit across both engages: {audits:?}"
+        vec![
+            "audit:-->INVESTIGATE".to_string(),
+            "audit:INVESTIGATE->INVESTIGATE".to_string()
+        ],
+        "one INVESTIGATE audit, then the addition: {audits:?}"
     );
 }
 
@@ -583,7 +647,7 @@ fn engage_is_idempotent_and_merges_offenders() {
 fn stand_down_clears_episode_and_lifts_soft_egress() {
     let (l, rec) = ladder(NeutralizeOutcome::Contained, Duration::from_secs(30));
     let t0 = Instant::now();
-    l.engage(Some(42), None, t0);
+    l.engage(&entry(Some(42), None), t0);
     l.stand_down(t0 + Duration::from_secs(1));
     assert_eq!(l.current_stage(), None);
     assert!(
@@ -621,7 +685,7 @@ fn jump_ahead_then_deadline_tick_neutralizes_once() {
     let win = Duration::from_secs(30);
     let (l, rec) = ladder(NeutralizeOutcome::Contained, win);
     let t0 = Instant::now();
-    l.engage(Some(321), None, t0);
+    l.engage(&entry(Some(321), None), t0);
     // observe() jump-ahead advances to NEUTRALIZE before the deadline.
     l.observe(
         &tcp_connect(321, [198, 51, 100, 7]),
@@ -647,7 +711,7 @@ fn neutralize_runs_once_under_repeated_ticks() {
     let win = Duration::from_secs(10);
     let (l, rec) = ladder(NeutralizeOutcome::Contained, win);
     let t0 = Instant::now();
-    l.engage(Some(77), None, t0);
+    l.engage(&entry(Some(77), None), t0);
     l.tick(t0 + win + Duration::from_secs(1));
     l.tick(t0 + win + Duration::from_secs(2));
     l.tick(t0 + win + Duration::from_secs(3));
@@ -668,8 +732,11 @@ fn neutralize_spares_protected_offender_and_escalates_to_isolate() {
     prot.insert(4242, ProtectedReason::SshService);
     let (l, rec, reasons) = ladder_protected(NeutralizeOutcome::Contained, win, prot);
     let t0 = Instant::now();
-    l.engage(Some(5000), Some(TriggerType::ConfirmedIntrusion), t0);
-    l.engage(Some(4242), None, t0); // merge the protected (sshd) offender
+    l.engage(
+        &entry(Some(5000), Some(TriggerType::ConfirmedIntrusion)),
+        t0,
+    );
+    l.engage(&entry(Some(4242), None), t0); // merge the protected (sshd) offender
 
     // INVESTIGATE: the killable offender is soft-blocked; the protected
     // one is NOT (cutting sshd would risk operator lockout).
@@ -730,8 +797,11 @@ fn an_exited_offender_on_a_protected_pid_is_not_spared() {
     prot.insert(gone, ProtectedReason::SshService);
     let (l, rec, reasons) = ladder_protected(NeutralizeOutcome::Contained, win, prot);
     let t0 = Instant::now();
-    l.engage(Some(5000), Some(TriggerType::ConfirmedIntrusion), t0);
-    l.engage(Some(gone), None, t0);
+    l.engage(
+        &entry(Some(5000), Some(TriggerType::ConfirmedIntrusion)),
+        t0,
+    );
+    l.engage(&entry(Some(gone), None), t0);
     l.tick(t0 + win + Duration::from_secs(1));
     assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
     let log = rec.log();
@@ -758,8 +828,11 @@ fn neutralize_all_offenders_protected_isolates_without_killing() {
     prot.insert(4300, ProtectedReason::Watchdog);
     let (l, rec, reasons) = ladder_protected(NeutralizeOutcome::Contained, win, prot);
     let t0 = Instant::now();
-    l.engage(Some(4242), Some(TriggerType::PersistenceMechanism), t0);
-    l.engage(Some(4300), None, t0);
+    l.engage(
+        &entry(Some(4242), Some(TriggerType::PersistenceMechanism)),
+        t0,
+    );
+    l.engage(&entry(Some(4300), None), t0);
     l.tick(t0 + win + Duration::from_secs(1));
 
     assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
@@ -804,8 +877,7 @@ fn engage_skips_soft_egress_on_protected_offender_no_escalation() {
     let (l, rec, _reasons) =
         ladder_protected(NeutralizeOutcome::Contained, Duration::from_secs(30), prot);
     l.engage(
-        Some(1),
-        Some(TriggerType::ConfirmedIntrusion),
+        &entry(Some(1), Some(TriggerType::ConfirmedIntrusion)),
         Instant::now(),
     );
 
@@ -830,7 +902,10 @@ fn jump_ahead_on_protected_offender_escalates_to_isolate() {
     let (l, rec, _reasons) =
         ladder_protected(NeutralizeOutcome::Contained, Duration::from_secs(300), prot);
     let t0 = Instant::now();
-    l.engage(Some(4242), Some(TriggerType::ExfiltrationPattern), t0);
+    l.engage(
+        &entry(Some(4242), Some(TriggerType::ExfiltrationPattern)),
+        t0,
+    );
     // sshd (protected) actively exfiltrates → jump-ahead → cannot kill it
     // → straight to ISOLATE.
     l.observe(
@@ -863,7 +938,10 @@ fn isolation_waits_for_a_locked_combat() {
         move || locked.load(Ordering::SeqCst)
     });
     let t0 = Instant::now();
-    l.engage(Some(1234), Some(TriggerType::ExfiltrationPattern), t0);
+    l.engage(
+        &entry(Some(1234), Some(TriggerType::ExfiltrationPattern)),
+        t0,
+    );
     l.tick(t0 + win + Duration::from_secs(1));
     l.tick(t0 + win + Duration::from_secs(6));
 
@@ -916,7 +994,10 @@ fn stand_down_drops_a_deferred_isolation() {
         move || locked.load(Ordering::SeqCst)
     });
     let t0 = Instant::now();
-    l.engage(Some(1234), Some(TriggerType::ExfiltrationPattern), t0);
+    l.engage(
+        &entry(Some(1234), Some(TriggerType::ExfiltrationPattern)),
+        t0,
+    );
     l.tick(t0 + win + Duration::from_secs(1));
     l.stand_down(t0 + win + Duration::from_secs(2));
     locked.store(true, Ordering::SeqCst);
@@ -1024,7 +1105,7 @@ fn wait_for(rec: &Recorder, entry: &str) {
 fn observe_returns_while_neutralize_runs() {
     let (l, rec, go) = held_ladder(Held::Neutralize, NeutralizeOutcome::Contained);
     let t0 = Instant::now();
-    l.engage(Some(100), None, t0);
+    l.engage(&entry(Some(100), None), t0);
     l.observe(&spawn(101, 100), t0); // jump-ahead
     wait_for(&rec, "neutralize:start");
     let start = std::time::Instant::now();
@@ -1063,7 +1144,7 @@ fn stand_down_orders_after_an_in_flight_isolate() {
         },
     );
     let t0 = Instant::now();
-    l.engage(Some(100), None, t0);
+    l.engage(&entry(Some(100), None), t0);
     l.tick(t0 + Duration::from_secs(31));
     wait_for(&rec, "isolate:start");
     let releaser = {
@@ -1095,9 +1176,9 @@ fn stand_down_orders_after_an_in_flight_isolate() {
 fn a_step_from_a_past_episode_is_dropped() {
     let (l, rec, go) = held_ladder(Held::SoftBlock(100), NeutralizeOutcome::Contained);
     let t0 = Instant::now();
-    l.engage(Some(100), None, t0);
+    l.engage(&entry(Some(100), None), t0);
     wait_for(&rec, "soft_block:100:start");
-    l.engage(Some(101), None, t0); // queued for episode 1
+    l.engage(&entry(Some(101), None), t0); // queued for episode 1
     l.stand_down(t0 + Duration::from_secs(1)); // episode closes
     go.send(()).unwrap();
     wait_for(&rec, "soft_clear:100");
@@ -1129,7 +1210,7 @@ fn spread_attribution_is_capped_and_escalates() {
         },
     );
     let t0 = Instant::now();
-    l.engage(Some(100), None, t0);
+    l.engage(&entry(Some(100), None), t0);
     l.observe(&spawn(101, 100), t0); // jump-ahead: NEUTRALIZE, contained
     assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
     l.observe(&spawn(102, 101), t0); // third offender: soft-blocked
@@ -1167,7 +1248,7 @@ fn a_failed_soft_block_is_recorded_and_shortens_investigate() {
         LadderConfig::default(),
     );
     let t0 = Instant::now();
-    l.engage(Some(100), None, t0);
+    l.engage(&entry(Some(100), None), t0);
     let r = reasons.0.lock().clone();
     assert!(
         r[0].0 == "INVESTIGATE" && r[0].1.contains("100 FAILED (no nft)"),
@@ -1183,8 +1264,9 @@ fn a_failed_soft_block_is_recorded_and_shortens_investigate() {
 }
 
 /// External audit CMB-014: an offender attributed after the INVESTIGATE
-/// record whose block fails gets a signed record of its own (once per
-/// episode).
+/// record whose block fails is in a signed record of its own, the window
+/// shortened once per episode. Lab PR 245: an offender a later COMBAT
+/// entry names has the record of its addition, which carries its block.
 #[test]
 fn a_failed_block_after_the_investigate_record_is_recorded() {
     let reasons = ReasonEvidence(Arc::new(Mutex::new(Vec::new())));
@@ -1200,13 +1282,51 @@ fn a_failed_block_after_the_investigate_record_is_recorded() {
         LadderConfig::default(),
     );
     let t0 = Instant::now();
-    l.engage(None, None, t0); // the posture hook: no offender yet
-    l.engage(Some(100), None, t0);
-    l.engage(Some(101), None, t0);
+    l.engage(&entry(None, None), t0); // a forced COMBAT: no offender
+    l.engage(&entry(Some(100), None), t0);
+    l.engage(&entry(Some(101), None), t0);
     let r = reasons.0.lock().clone();
-    assert_eq!(r.len(), 2, "{r:?}");
+    assert_eq!(r.len(), 3, "{r:?}");
     assert!(
-        r[1].0 == "INVESTIGATE" && r[1].1.contains("100 FAILED") && r[1].1.contains("10 s"),
+        r[1].0 == "INVESTIGATE"
+            && r[1].1.contains("offender 100 added")
+            && r[1].1.contains("100 FAILED")
+            && r[1].1.contains("10 s"),
+        "{r:?}"
+    );
+    assert!(
+        r[2].1.contains("101 FAILED") && !r[2].1.contains("shortened"),
+        "the window is shortened once: {r:?}"
+    );
+}
+
+/// External audit CMB-014: a child an offender spawned after INVESTIGATE
+/// whose block fails gets a signed record of its own — once per episode.
+#[test]
+fn a_failed_block_of_a_spread_child_is_recorded_once() {
+    let reasons = ReasonEvidence(Arc::new(Mutex::new(Vec::new())));
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: Recorder::new(),
+            neutralize_outcome: NeutralizeOutcome::Contained,
+            failing_blocks: vec![102, 103],
+            isolate_plan: Default::default(),
+        }),
+        Box::new(reasons.clone()),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    let t0 = Instant::now();
+    l.engage(&entry(Some(100), Some(TriggerType::ConfirmedIntrusion)), t0);
+    l.observe(&spawn(101, 100), t0); // jump-ahead: NEUTRALIZE
+    assert_eq!(l.current_stage(), Some(CombatStage::Neutralize));
+    l.observe(&spawn(102, 100), t0);
+    l.observe(&spawn(103, 100), t0);
+    let r = reasons.0.lock().clone();
+    let failed: Vec<_> = r.iter().filter(|(_, why)| why.contains("FAILED")).collect();
+    assert_eq!(failed.len(), 1, "{r:?}");
+    assert!(
+        failed[0].0 == "NEUTRALIZE" && failed[0].1.contains("soft egress: 102 FAILED"),
         "{r:?}"
     );
 }
@@ -1232,9 +1352,9 @@ fn stand_down_releases_only_what_this_episode_blocked() {
         LadderConfig::default(),
     );
     let t0 = Instant::now();
-    l.engage(Some(9), None, t0);
-    l.engage(Some(7), None, t0);
-    l.engage(Some(8), None, t0);
+    l.engage(&entry(Some(9), None), t0);
+    l.engage(&entry(Some(7), None), t0);
+    l.engage(&entry(Some(8), None), t0);
     assert_eq!(l.offenders(), vec![7, 8, 9]);
     l.stand_down(t0 + Duration::from_secs(1));
     let clears: Vec<_> = rec
@@ -1282,7 +1402,10 @@ fn a_failing_audit_log_never_holds_the_ladder() {
     std::fs::create_dir(&log_path).unwrap();
 
     let t0 = Instant::now();
-    l.engage(Some(1234), Some(TriggerType::PersistenceMechanism), t0);
+    l.engage(
+        &entry(Some(1234), Some(TriggerType::PersistenceMechanism)),
+        t0,
+    );
     l.tick(t0 + LadderConfig::default().investigate_window + Duration::from_secs(1));
     assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
     let log = rec.log();
@@ -1400,9 +1523,9 @@ fn neutralize_signs_an_outcome_for_every_offender() {
         LadderConfig::default(),
     );
     let t0 = Instant::now();
-    l.engage(Some(100), Some(TriggerType::ConfirmedIntrusion), t0);
-    l.engage(Some(101), None, t0);
-    l.engage(Some(102), None, t0);
+    l.engage(&entry(Some(100), Some(TriggerType::ConfirmedIntrusion)), t0);
+    l.engage(&entry(Some(101), None), t0);
+    l.engage(&entry(Some(102), None), t0);
     l.tick(t0 + Duration::from_secs(31));
     assert!(
         rec.log().iter().any(|e| e == "neutralize:[100, 101, 102]"),
@@ -1484,7 +1607,10 @@ fn isolates(rec: &Recorder) -> usize {
 fn a_failed_isolate_is_not_done_and_is_retried() {
     let (l, rec, ev) = ladder_with_isolate_plan(vec![failed_v4(), failed_v6()]);
     let t0 = Instant::now();
-    l.engage(Some(1234), Some(TriggerType::PersistenceMechanism), t0);
+    l.engage(
+        &entry(Some(1234), Some(TriggerType::PersistenceMechanism)),
+        t0,
+    );
     let t1 = t0 + Duration::from_secs(31);
     l.tick(t1);
     assert_eq!(isolates(&rec), 1);
@@ -1529,7 +1655,10 @@ fn a_failed_isolate_is_not_done_and_is_retried() {
 fn isolate_retries_are_bounded() {
     let (l, rec, ev) = ladder_with_isolate_plan(vec![failed_v4(), failed_v4(), failed_v4()]);
     let t0 = Instant::now();
-    l.engage(Some(1234), Some(TriggerType::PersistenceMechanism), t0);
+    l.engage(
+        &entry(Some(1234), Some(TriggerType::PersistenceMechanism)),
+        t0,
+    );
     let t1 = t0 + Duration::from_secs(31);
     l.tick(t1);
     for s in [5, 15, 30, 60, 300] {
@@ -1560,7 +1689,7 @@ fn an_unavailable_family_is_a_hole_not_a_success() {
         v6: FamilyOutcome::Unavailable("no `ip6tables` in /usr/sbin, /usr/bin, /sbin, /bin".into()),
     })]);
     let t0 = Instant::now();
-    l.engage(Some(1234), None, t0);
+    l.engage(&entry(Some(1234), None), t0);
     let t1 = t0 + Duration::from_secs(31);
     l.tick(t1);
     for s in [5, 15, 60] {
@@ -1587,7 +1716,7 @@ fn an_isolation_not_applied_is_recorded_and_not_retried() {
         "detect-only: iptables NOT applied".to_string(),
     )]);
     let t0 = Instant::now();
-    l.engage(Some(1234), None, t0);
+    l.engage(&entry(Some(1234), None), t0);
     let t1 = t0 + Duration::from_secs(31);
     l.tick(t1);
     for s in [5, 15, 60] {
@@ -1625,8 +1754,8 @@ fn the_neutralize_hook_hears_the_contained_offenders_only() {
             }))
         };
         let t0 = Instant::now();
-        l.engage(Some(900), Some(TriggerType::ConfirmedIntrusion), t0);
-        l.engage(Some(901), None, t0);
+        l.engage(&entry(Some(900), Some(TriggerType::ConfirmedIntrusion)), t0);
+        l.engage(&entry(Some(901), None), t0);
         l.tick(t0 + Duration::from_secs(31));
         assert_eq!(*heard.lock(), expected);
         let log = rec.log();
@@ -1638,4 +1767,324 @@ fn the_neutralize_hook_hears_the_contained_offenders_only() {
             assert!(n < h, "the hook runs after the kill: {log:?}");
         }
     }
+}
+
+// ── Lab PR 245: every signed row says why the ladder engaged, against whom ──
+
+/// A signed audit log of a test's own, read back after the chain verified.
+struct SignedLog {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    pubkey: ed25519_dalek::VerifyingKey,
+    log: Arc<Mutex<crate::audit::AuditLog>>,
+}
+
+impl SignedLog {
+    fn new() -> Self {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("audit.log");
+        let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("k")).unwrap();
+        let pubkey = key.verifying_key();
+        let log = Arc::new(Mutex::new(
+            crate::audit::AuditLog::open(&path, key, [0u8; 16]).unwrap(),
+        ));
+        Self {
+            _dir: dir,
+            path,
+            pubkey,
+            log,
+        }
+    }
+
+    fn evidence(&self) -> Box<AuditEvidence> {
+        Box::new(AuditEvidence::new(Some(Arc::clone(&self.log))))
+    }
+
+    /// Every row, the whole chain verified first.
+    fn rows(&self) -> Vec<crate::audit::AuditEntry> {
+        let all: Vec<crate::audit::AuditEntry> = std::fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        crate::audit::verify_chain(&all, &self.pubkey).expect("the chain verifies");
+        all
+    }
+
+    fn stages(&self) -> Vec<serde_json::Value> {
+        self.rows()
+            .into_iter()
+            .filter(|e| e.op == "combat_stage")
+            .map(|e| e.extra)
+            .collect()
+    }
+}
+
+fn mock_actuator(rec: &Recorder) -> Box<MockActuator> {
+    Box::new(MockActuator {
+        rec: rec.clone(),
+        neutralize_outcome: NeutralizeOutcome::Contained,
+        failing_blocks: Vec::new(),
+        isolate_plan: Default::default(),
+    })
+}
+
+fn denial(pid: u32, ts: u64) -> Event {
+    Event::FsProtectDenial {
+        pid,
+        uid: 1000,
+        comm: "payload".to_string(),
+        target_dev: 1,
+        target_ino: 2,
+        operation: nn_model::FsProtectOperation::Unlink,
+        timestamp_ns: ts,
+    }
+}
+
+/// The pids a row's `offender_details` name, in order.
+fn detail_pids(row: &serde_json::Value) -> Vec<u64> {
+    row["offender_details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["pid"].as_u64().unwrap())
+        .collect()
+}
+
+/// Lab PR 245: a COMBAT the posture reaches opens the ladder's episode
+/// with the firing trigger, the evidence it cites and the process the
+/// event names — the INVESTIGATE row names them, and so does every row
+/// after it. The same entry again (what `process_event` sent after the
+/// hook) changes nothing; it used to be the only call that named either,
+/// and the trigger was dropped.
+#[test]
+fn a_posture_combat_names_its_trigger_and_offender_from_investigate_on() {
+    let log = SignedLog::new();
+    let rec = Recorder::new();
+    let ladder = Arc::new(CombatLadder::new(
+        mock_actuator(&rec),
+        log.evidence(),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    ));
+    let heard: Arc<Mutex<Vec<CombatEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let posture = {
+        let (ladder, heard) = (Arc::clone(&ladder), Arc::clone(&heard));
+        crate::posture::PostureMachine::new_with_combat_hook(Arc::new(move |e: &CombatEntry| {
+            heard.lock().push(e.clone());
+            ladder.engage(e, Instant::now());
+        }))
+    };
+    let t0 = Instant::now();
+    posture.observe(&denial(6100, 5_000), &[]);
+    assert_eq!(ladder.current_stage(), Some(CombatStage::Investigate));
+    assert_eq!(ladder.offenders(), vec![6100]);
+
+    let rows = log.stages();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let investigate = &rows[0];
+    assert_eq!(investigate["to"], "INVESTIGATE");
+    assert_eq!(investigate["trigger"], "AntiTamperDenial");
+    assert_eq!(investigate["offenders"], serde_json::json!([6100]));
+    let d = &investigate["offender_details"][0];
+    assert_eq!(d["pid"], 6100);
+    assert_eq!(d["exe"], "/tmp/.x/payload-6100");
+    assert_eq!(d["cgroup"], "/user.slice/user-1000.slice/session-3.scope");
+    assert_eq!(d["via"], "entry");
+    assert_eq!(d["start_ticks"], 61_000, "the mock's capture");
+    let cause = &investigate["cause"];
+    assert_eq!(cause["kind"], "posture_trigger");
+    assert_eq!(cause["trigger"], "AntiTamperDenial");
+    assert_eq!(cause["class"], "Kernel");
+    assert_eq!(cause["confidence"], "Decisive");
+    assert_eq!(cause["locked"], true);
+    assert_eq!(cause["event"]["kind"], "FsProtectDenial");
+    assert_eq!(cause["event"]["pid"], 6100);
+    assert_eq!(cause["event"]["timestamp_ns"], 5_000);
+    assert!(
+        rec.log().iter().any(|e| e == "soft_block:6100"),
+        "the offender is blocked as the episode opens: {:?}",
+        rec.log()
+    );
+
+    // What `process_event` sent after the hook: the same process again.
+    let again = heard.lock()[0].clone();
+    ladder.engage(&again, t0);
+    assert_eq!(log.stages().len(), 1, "nothing new to record");
+
+    ladder.tick(Instant::now() + Duration::from_secs(31));
+    assert_eq!(ladder.current_stage(), Some(CombatStage::Neutralize));
+    let all = log.rows();
+    for row in all.iter().filter(|e| e.op.starts_with("combat_")) {
+        assert_eq!(row.extra["trigger"], "AntiTamperDenial", "{row:?}");
+    }
+    let rows = log.stages();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["to"], "NEUTRALIZE");
+    assert_eq!(rows[1]["cause"], rows[0]["cause"]);
+    assert_eq!(detail_pids(&rows[1]), vec![6100]);
+}
+
+/// Lab PR 245: two offenders in one episode — a later COMBAT entry naming
+/// another process adds it, signed as an addition with that entry's
+/// cause; the episode's trigger and cause stay the first entry's in every
+/// row, the outcomes' included, and each row names both offenders.
+#[test]
+fn two_offenders_in_one_episode_keep_the_first_trigger() {
+    let log = SignedLog::new();
+    let rec = Recorder::new();
+    let l = CombatLadder::new(
+        Box::new(MockActuator {
+            rec: rec.clone(),
+            neutralize_outcome: NeutralizeOutcome::Uncontainable {
+                reason: "respawns".to_string(),
+            },
+            failing_blocks: Vec::new(),
+            isolate_plan: Default::default(),
+        }),
+        log.evidence(),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    );
+    let t0 = Instant::now();
+    l.engage(&entry(Some(700), Some(TriggerType::AntiTamperDenial)), t0);
+    l.engage(
+        &entry(Some(800), Some(TriggerType::ExfiltrationPattern)),
+        t0,
+    );
+    // the first offender named again by yet another entry: known, no row
+    l.engage(&entry(Some(700), Some(TriggerType::LateralMovement)), t0);
+    assert_eq!(l.offenders(), vec![700, 800]);
+    l.tick(t0 + Duration::from_secs(31));
+    assert_eq!(l.current_stage(), Some(CombatStage::Isolate));
+
+    let rows = log.stages();
+    let to: Vec<&str> = rows.iter().map(|r| r["to"].as_str().unwrap()).collect();
+    assert_eq!(to, ["INVESTIGATE", "INVESTIGATE", "NEUTRALIZE", "ISOLATE"]);
+    for r in &rows {
+        assert_eq!(r["trigger"], "AntiTamperDenial", "{r}");
+        assert_eq!(r["cause"]["trigger"], "AntiTamperDenial", "{r}");
+    }
+    assert_eq!(detail_pids(&rows[0]), vec![700]);
+    // the addition: from and to INVESTIGATE, the later entry's cause
+    let added = &rows[1];
+    assert_eq!(added["from"], "INVESTIGATE");
+    assert_eq!(added["offenders"], serde_json::json!([700, 800]));
+    assert_eq!(detail_pids(added), vec![700, 800]);
+    assert_eq!(added["added"]["offender"]["pid"], 800);
+    assert_eq!(added["added"]["offender"]["via"], "later_entry");
+    assert_eq!(added["added"]["offender"]["exe"], "/tmp/.x/payload-800");
+    assert_eq!(added["added"]["by"]["trigger"], "ExfiltrationPattern");
+    assert!(
+        added["reason"]
+            .as_str()
+            .unwrap()
+            .contains("offender 800 added by a later COMBAT entry (ExfiltrationPattern"),
+        "{added}"
+    );
+    assert!(rows[0].get("added").is_none() && rows[2].get("added").is_none());
+    for r in &rows[2..] {
+        assert_eq!(detail_pids(r), vec![700, 800], "{r}");
+        assert_eq!(r["offender_details"][0]["via"], "entry");
+        assert_eq!(r["offender_details"][1]["via"], "later_entry");
+    }
+    // the outcomes: the episode's trigger too
+    let outcomes: Vec<_> = log
+        .rows()
+        .into_iter()
+        .filter(|e| e.op == "combat_outcome")
+        .collect();
+    assert_eq!(outcomes.len(), 2);
+    for o in &outcomes {
+        assert_eq!(o.extra["trigger"], "AntiTamperDenial", "{o:?}");
+    }
+    assert!(rec.log().iter().any(|e| e == "soft_block:800"));
+}
+
+/// Lab PR 245: `--detect-only` — the rows still name the trigger and the
+/// offender (its executable and cgroup read from `/proc`), and nothing is
+/// done to it: no block, no kill, no quarantine, no isolation. A real
+/// process, the production actuator in detect-only, a real signed log.
+#[test]
+fn detect_only_rows_name_the_trigger_and_offender_and_nothing_acts() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let exec = crate::response::Executor::with_config(
+        crate::response::config::ExecutorConfig::for_test(&tmp.path().join("state")),
+    );
+    assert!(exec.config().dry_run, "for_test is detect-only");
+    let log = SignedLog::new();
+    let ladder = Arc::new(CombatLadder::new(
+        Box::new(super::SystemActuator::new(exec, None, true)),
+        log.evidence(),
+        Box::new(NoProtectedProcs),
+        LadderConfig::default(),
+    ));
+    let posture = {
+        let ladder = Arc::clone(&ladder);
+        crate::posture::PostureMachine::new_with_combat_hook(Arc::new(move |e: &CombatEntry| {
+            ladder.engage(e, Instant::now())
+        }))
+    };
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    let start = crate::response::proc_ref::proc_start_ns(pid).expect("its start");
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .expect("its exe")
+        .to_string_lossy()
+        .into_owned();
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|t| super::offender::cgroup_path(&t).map(str::to_string));
+
+    posture.observe(&denial(pid, start + 1_000_000_000), &[]);
+    assert_eq!(ladder.current_stage(), Some(CombatStage::Investigate));
+    ladder.tick(Instant::now() + Duration::from_secs(31));
+    assert_eq!(ladder.current_stage(), Some(CombatStage::Neutralize));
+    let still_running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(still_running, "detect-only killed the offender");
+
+    let rows = log.stages();
+    let to: Vec<&str> = rows.iter().map(|r| r["to"].as_str().unwrap()).collect();
+    assert_eq!(to, ["INVESTIGATE", "NEUTRALIZE"], "{rows:?}");
+    for r in &rows {
+        assert_eq!(r["trigger"], "AntiTamperDenial", "{r}");
+        assert_eq!(r["offenders"], serde_json::json!([pid]), "{r}");
+        let d = &r["offender_details"][0];
+        assert_eq!(d["pid"], pid);
+        assert_eq!(d["exe"], exe.as_str(), "{r}");
+        assert_eq!(d["cgroup"].as_str(), cgroup.as_deref(), "{r}");
+        assert!(d["start_ticks"].as_u64().is_some(), "{r}");
+        assert_eq!(d["seen_ns"], start + 1_000_000_000, "the event's time: {r}");
+        assert_eq!(d["via"], "entry", "{r}");
+    }
+    assert!(
+        rows[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{pid} not blocked (detect-only)")),
+        "{}",
+        rows[0]["reason"]
+    );
+    let outcome = log
+        .rows()
+        .into_iter()
+        .find(|e| e.op == "combat_outcome")
+        .expect("NEUTRALIZE's outcome");
+    assert_eq!(outcome.extra["trigger"], "AntiTamperDenial");
+    let o = &outcome.extra["detail"]["offenders"][0];
+    assert!(
+        o["kill"].as_str().unwrap().starts_with("WouldExecute"),
+        "{o}"
+    );
+    assert_eq!(o["quarantine"], "detect-only: would be quarantined");
+    assert!(
+        std::path::Path::new(&exe).exists(),
+        "the binary is not quarantined"
+    );
 }

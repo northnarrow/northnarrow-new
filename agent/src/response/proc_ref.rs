@@ -193,6 +193,18 @@ impl ProcRef {
         self.start_ticks
     }
 
+    /// The start its event reported (`CLOCK_MONOTONIC` ns), when known
+    /// (lab PR 245: the COMBAT ladder's rows name it).
+    pub fn start_ns(&self) -> Option<u64> {
+        self.start_ns
+    }
+
+    /// A time it was known to be running (`CLOCK_MONOTONIC` ns: the event
+    /// that attributed it), when known.
+    pub fn seen_ns(&self) -> Option<u64> {
+        self.seen_ns
+    }
+
     /// Why the process could not be captured (an errno), when it may
     /// still run.
     pub fn capture_errno(&self) -> Option<i32> {

@@ -2986,14 +2986,17 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // (STAGE 3, last resort) is warranted, honours detect-only internally,
     // and emits the per-stage signed audit trail. It is wired into BOTH
     // the prod (isolator) and dev (no-isolator) posture branches so an
-    // admin-forced COMBAT engages the same ladder either way; the detector
-    // path additionally feeds the offending PID + firing trigger via
-    // `process_event` (an idempotent merge).
+    // admin-forced COMBAT engages the same ladder either way. Lab PR 245:
+    // the posture hands it the entry — the firing trigger with the evidence
+    // it cites (or the forced COMBAT's signers) and the process the event
+    // names — so the episode opens with its cause and its offender. It
+    // used to open the episode with neither (`engage(None, None)`) before
+    // `process_event` named them, and the trigger was lost.
     let engage_hook: CombatEntryHook = {
         let ladder_for_entry = Arc::clone(&ladder_slot);
-        Arc::new(move || {
+        Arc::new(move |entry: &northnarrow_agent::posture::CombatEntry| {
             if let Some(ladder) = ladder_for_entry.get() {
-                ladder.engage(None, None, Instant::now());
+                ladder.engage(entry, Instant::now());
             }
         })
     };
@@ -3282,8 +3285,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // Build the ladder with the system actuator (real kill / quarantine /
     // per-PID egress / full isolation) + the signed-audit evidence sink,
     // then publish it to the slot the posture combat hooks read. Driven
-    // from three places: the combat-entry hook (above), `process_event`
-    // (offender context + per-event jump-ahead), and the tick below.
+    // from three places: the combat-entry hook (above: the episode opens
+    // with the posture's cause and offender, lab PR 245), `process_event`
+    // (per-event jump-ahead), and the tick below.
     let ladder = Arc::new(
         northnarrow_agent::combat::CombatLadder::new(
             Box::new(northnarrow_agent::combat::SystemActuator::new(
@@ -5352,28 +5356,13 @@ async fn process_event(
             trigger = ?firing_trigger,
             "POSTURE TRANSITION"
         );
-        // On the non-Combat → Combat edge, enrich the ladder with the
-        // offending PID + firing trigger. The combat-entry hook has
-        // already opened the episode (STAGE 1 INVESTIGATE, network up);
-        // this is the idempotent merge that attributes the focal
-        // process. Reaching COMBAT does NOT isolate — the ladder does.
-        if new_state.kind() == PostureKind::Combat {
-            // External audit EBPF-001: init is never an offender — its only
-            // containment would be ISOLATE, and the events it owns (a relayed
-            // `systemctl`, the console writes of a shutdown) are not its own.
-            // External audit CMB-004: with what the event says about the
-            // offender (its start, a time it was running) — it identifies
-            // the offender after it has exited.
-            let (start_ns, seen_ns) =
-                northnarrow_agent::posture::triggers::event_owner_seen(&event);
-            ladder.engage_with(
-                northnarrow_agent::posture::triggers::event_owner_pid(&event).filter(|p| *p > 1),
-                start_ns,
-                seen_ns,
-                firing_trigger,
-                Instant::now(),
-            );
-        }
+        // On the non-Combat → Combat edge the combat-entry hook, inside
+        // `observe`, has opened the ladder's episode (STAGE 1 INVESTIGATE,
+        // network up) with the firing trigger, the evidence it cites and
+        // the process the event names (lab PR 245: the posture's
+        // `CombatEntry`; external audit EBPF-001: never init; CMB-004: with
+        // the offender's start and a time it was running). Reaching COMBAT
+        // does NOT isolate — the ladder does.
     }
     // While a COMBAT episode is active, feed every event to the ladder
     // for the jump-ahead check: an offender actively exfiltrating or

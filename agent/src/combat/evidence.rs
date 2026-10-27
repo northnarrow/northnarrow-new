@@ -13,6 +13,30 @@
 //! the corresponding enforcement action runs — so the dossier is never
 //! lost to a later isolation.
 //!
+//! ## Lab PR 245: why, and against whom
+//!
+//! A COMBAT the posture reached was recorded with `"trigger": null`, and
+//! its INVESTIGATE row named no offender: the episode opened before the
+//! ladder heard either. The episode now opens with its cause, and every
+//! `combat_stage` row carries, besides the fields above (`trigger` now
+//! named):
+//! - `cause`: why the episode opened — the posture trigger with the
+//!   evidence it cites (`kind` `posture_trigger`: every trigger the event
+//!   raised, the kind of evidence, decisive or corroborated and by which
+//!   signals, locked, the actor's scope, the event), or an administrator's
+//!   signed force-posture (`admin_force_posture`, the keys) or the debug
+//!   one (`debug_force_posture`);
+//! - `offender_details`: each of `offenders`, in its order, as captured
+//!   when it was attributed ([`super::offender::OffenderId`]: pid, starts,
+//!   executable, cgroup, how it joined the episode);
+//! - `added`, on the row a later COMBAT entry writes when it names another
+//!   process during the episode (from and to the current stage): that
+//!   process and the later entry's cause. The episode's `trigger` and
+//!   `cause` stay the first entry's.
+//!
+//! Rows written before keep their bytes and their `null`s; a reader takes
+//! a missing `cause` or `offender_details` as unknown.
+//!
 //! External audit CMB-027: the entry can fail (a full filesystem, an I/O
 //! error). [`LadderEvidence::record_stage`] says so, and the ladder logs the
 //! whole transition at ERROR — the journal line is then its only record —
@@ -58,7 +82,9 @@ use tracing::{info, warn};
 use nn_model::posture_types::TriggerType;
 
 use crate::audit::{AuditEntryDraft, AuditLog};
+use crate::posture::CombatCause;
 
+use super::offender::OffenderId;
 use super::CombatStage;
 
 /// One ladder stage transition — the payload of a signed audit entry.
@@ -67,13 +93,36 @@ pub struct StageTransition {
     /// `None` for the COMBAT-entry transition into INVESTIGATE.
     pub from: Option<CombatStage>,
     pub to: CombatStage,
-    /// The posture trigger that drove COMBAT (telemetry/audit context).
-    pub trigger: Option<TriggerType>,
+    /// Lab PR 245: why the episode opened — the posture trigger and the
+    /// evidence it cites, or a forced COMBAT. Every episode has one; `None`
+    /// is a transition built without it (tests).
+    pub cause: Option<Arc<CombatCause>>,
     /// PIDs attributed to the threat at the time of the transition.
     pub offenders: Vec<u32>,
+    /// Lab PR 245: each of `offenders`, in its order, as captured when it
+    /// was attributed.
+    pub details: Vec<Arc<OffenderId>>,
+    /// Lab PR 245: the process a later COMBAT entry added to the episode,
+    /// on the row that records the addition.
+    pub added: Option<Addition>,
     /// Human-readable reason (deadline, jump-ahead, neutralization
     /// failure, …).
     pub reason: String,
+}
+
+impl StageTransition {
+    /// The posture trigger that drove COMBAT (`None`: a forced COMBAT).
+    pub fn trigger(&self) -> Option<TriggerType> {
+        self.cause.as_ref().and_then(|c| c.trigger())
+    }
+}
+
+/// Lab PR 245: an offender a later COMBAT entry named while the episode
+/// ran, and that entry's cause — added; the episode's cause unchanged.
+#[derive(Debug, Clone)]
+pub struct Addition {
+    pub offender: Arc<OffenderId>,
+    pub by: Arc<CombatCause>,
 }
 
 /// Lab PR 217 (capability C17): what a COMBAT enforcement action did — the
@@ -276,17 +325,25 @@ impl AuditEvidence {
 /// written late.
 fn draft(r: &Record, deferred: Option<&str>, lost: u64) -> AuditEntryDraft {
     let (op, mut extra, result) = match r {
-        Record::Stage(t) => (
-            "combat_stage",
-            serde_json::json!({
+        Record::Stage(t) => {
+            let mut extra = serde_json::json!({
                 "from": t.from.map(|s| s.as_str()),
                 "to": t.to.as_str(),
-                "trigger": t.trigger.map(|x| x.as_str()),
+                "trigger": t.trigger().map(|x| x.as_str()),
                 "offenders": t.offenders,
                 "reason": t.reason,
-            }),
-            "success".to_string(),
-        ),
+                // Lab PR 245: why, and against whom.
+                "cause": t.cause.as_ref().map(|c| c.to_json()),
+                "offender_details": t.details.iter().map(|d| d.to_json()).collect::<Vec<_>>(),
+            });
+            if let Some(a) = &t.added {
+                extra["added"] = serde_json::json!({
+                    "offender": a.offender.to_json(),
+                    "by": a.by.to_json(),
+                });
+            }
+            ("combat_stage", extra, "success".to_string())
+        }
         // Lab PR 217: `result` says whether the action achieved its
         // purpose — a failed kill or isolation is a `failure` row.
         Record::Outcome(o) => (
@@ -363,7 +420,8 @@ impl LadderEvidence for AuditEvidence {
             target: "combat.audit",
             from = t.from.map(|s| s.as_str()).unwrap_or("-"),
             to = %t.to,
-            trigger = ?t.trigger,
+            trigger = ?t.trigger(),
+            cause = %t.cause.as_ref().map(|c| c.summary()).unwrap_or_default(),
             offenders = ?t.offenders,
             reason = %t.reason,
             "COMBAT stage transition (signed audit entry)"
@@ -420,8 +478,10 @@ mod tests {
         StageTransition {
             from: None,
             to,
-            trigger: None,
+            cause: None,
             offenders: vec![4242],
+            details: Vec::new(),
+            added: None,
             reason: reason.to_string(),
         }
     }
