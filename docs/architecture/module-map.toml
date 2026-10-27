@@ -187,6 +187,10 @@ planned = false
 # file keeps the unsigned compatibility line's Linux file I/O (the
 # anchored `O_NOFOLLOW` open, the mode, the state directory's dance)
 "combat::reconcile" = "nn-linux"
+# post-plan (lab PR 252, R08c): the Linux host of the COMBAT ladder — its
+# capture of a process, a pidfd and its start (`response::proc_ref`) — of
+# nn-core's `combat::host::CombatHost`
+"combat_host_linux" = "nn-linux"
 # comm_allowlist, overlay_auth (verify), overlay_floor. R07 (lab PR 247):
 # `overlay` (the loader) and the part of `overlay_auth` the loaders take
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the

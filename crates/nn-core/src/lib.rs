@@ -151,8 +151,12 @@ pub mod fim {
 
 /// The COMBAT ladder (R08c, lab PR 252): who it acts against, as its
 /// signed rows name them (was the agent's `combat::offender`), the record
-/// of a stale chain found at start (from the agent's `combat::reconcile`).
+/// of a stale chain found at start (from the agent's `combat::reconcile`),
+/// and what it needs from its host (`combat::host`).
 pub mod combat {
+    /// What the ladder needs from its host: a process captured when it is
+    /// attributed.
+    pub mod host;
     /// An offender's identity as the ladder captured it: pid, starts,
     /// executable, cgroup, how it joined the episode.
     pub mod offender;

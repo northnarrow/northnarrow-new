@@ -77,6 +77,9 @@ pub mod chainlog {
 /// R04a, lab PR 241).
 pub mod chains;
 pub mod combat;
+/// The Linux host of the COMBAT ladder: its capture of a process, a pidfd
+/// (nn-core's `CombatHost`, R08c, lab PR 252).
+pub mod combat_host_linux;
 pub mod config;
 /// The Linux host of the content lists: the open of nn-core's
 /// `ContentHost` (R07, lab PR 247).
