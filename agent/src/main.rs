@@ -37,6 +37,7 @@ use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
 use northnarrow_agent::correlation::CorrelationBuffer;
 use northnarrow_agent::decision::RuleEngine;
 use northnarrow_agent::detection_budget::{self, Admit};
+use northnarrow_agent::detection_report;
 use northnarrow_agent::net::blocklist::{
     Ja3Blocklist, NetBlocklist, DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
     DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
@@ -3649,7 +3650,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // Review 75: detections held back by the per-rule budget, reported.
     // External audit NN-AUD-111: started once the detection store exists,
     // so the same task records the store's queue drops.
-    detection_budget::spawn_reporter(audit_log.clone(), detection_sink.clone());
+    detection_report::spawn_reporter(audit_log.clone(), detection_sink.clone());
 
     // Tappa 9.0.c: open the status-event chainlog + build the detection
     // admin state for the admin socket (set-status writes here; the

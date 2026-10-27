@@ -86,6 +86,9 @@ pub mod decision;
 pub mod detection_budget;
 /// The detection log's records (from `detection_store`, R04a, lab PR 241).
 pub mod detection_payload;
+/// The detection budget's reporter task (from `detection_budget`, R08a, lab
+/// PR 250).
+pub mod detection_report;
 pub mod detection_store;
 pub mod execpol;
 pub mod execq;

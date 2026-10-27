@@ -206,6 +206,10 @@ planned = false
 # parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
 # file propri"; the payloads are nn-evidence's)
 "detection_payload" = "nn-evidence"
+# post-plan (lab PR 250, R08a): the detection budget's reporter task (tokio,
+# the agent's audit log and detection sink), from `detection_budget`: the
+# composition, as `chains`' tasks
+"detection_report" = "northnarrow-agent"
 # not in §2.4: the detection sink's queue and files, the records'
 # constructors from the engine's decisions (its payloads: above, R04a)
 "detection_store" = "nn-linux"
@@ -354,11 +358,13 @@ planned = false
 # (→ 40); the moved list loader no longer names the host, `config/mod.rs`,
 # which binds it, does (40); the canary renderer moved and the OS RNG of its
 # seed stayed in the agent (→ 38). The two left of R07's: `config/mod.rs`
-# and the gate in `config/overlay_auth.rs` name `chain_host_linux`.
+# and the gate in `config/overlay_auth.rs` name `chain_host_linux`. Lab PR
+# 250 (R08a): 52 → 51, nn-core 38 → 37: the detection budget's reporter
+# task (the detection sink) left it for `detection_report`.
 
 [ratchet]
 nn-admin = 8
-nn-core = 38
+nn-core = 37
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3
