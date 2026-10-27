@@ -73,7 +73,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use nn_model::posture_types::{self, PostureKind, TriggerType};
+use nn_model::posture_types::{self, TriggerType};
 use nn_model::{Event, ResponseAction};
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -82,7 +82,10 @@ use serde_json::{json, Value};
 use super::clock::Clock;
 use super::escalation_allow::EscalationAllowList;
 use super::state::PostureState;
-use super::{transitions, triggers, AuthSessionTracker, ExemptPids, PostureMachine, ReleaseScope};
+use super::{
+    transitions, triggers, AuthSessionTracker, CombatEntry, ExemptPids, PostureMachine,
+    ReleaseScope,
+};
 use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
 use crate::anti_tamper::network_isolate::{FamilyOutcome, IsolationReport, UnlockToken};
 use crate::anti_tamper::trusted_installer::{
@@ -92,7 +95,7 @@ use crate::audit::{AgentSigningKey, AuditEntry, AuditLog};
 use crate::combat::actuator::{SystemActuator, DETECT_ONLY_ISOLATE, NO_BINARY};
 use crate::combat::{
     AuditEvidence, CombatActuator, CombatLadder, IsolateOutcome, LadderConfig, NeutralizeReport,
-    OffenderOutcome, ProcRef, ProtectedProcs, SoftBlock, SystemProtectedProcs,
+    OffenderOutcome, ProcFacts, ProcRef, ProtectedProcs, SoftBlock, SystemProtectedProcs,
 };
 use crate::config::comm_allowlist::{load_comm_allowlist, PROCESS_COMM_ALLOWLIST_SHIPPED};
 use crate::config::overlay_auth::Verified;
@@ -607,8 +610,8 @@ struct HostActuator {
 /// A capture of the process `pid` names (start `start`): its identity, in
 /// a reference without a pidfd (`ProcRef::for_test`), the host's table
 /// standing for the pidfd.
-fn capture(pid: u32, start: Option<u64>) -> Arc<ProcRef> {
-    Arc::new(ProcRef::for_test(pid, start))
+fn capture(pid: u32, start: Option<u64>) -> ProcRef {
+    ProcRef::for_test(pid, start)
 }
 
 impl HostActuator {
@@ -731,13 +734,26 @@ impl CombatActuator for HostActuator {
         };
         self.host
             .note(json!({"ladder": "capture", "pid": pid, "found": what}));
-        r
+        // As `open_for_event`: the event's time kept (lab PR 245: the rows
+        // name it).
+        Arc::new(r.seen_at(seen_ns))
     }
 
     /// `ProcRef::matches_event` on the host: the captured process while it
     /// runs; once it has exited, an event with its start.
     fn same_process(&self, target: &ProcRef, start_ns: u64) -> bool {
         self.live(target) || (start_ns != 0 && target.start_ticks() == Some(start_ns))
+    }
+
+    /// `SystemActuator::describe` on the host (lab PR 245): the production
+    /// reader of `exe` and `cgroup`, on the replay's `/proc`, while the
+    /// capture names the running process.
+    fn describe(&self, target: &ProcRef) -> ProcFacts {
+        if self.live(target) {
+            crate::combat::actuator::read_proc_facts(&self.host.proc_root, target.pid())
+        } else {
+            ProcFacts::default()
+        }
     }
 
     fn begin_episode(&self) {
@@ -1003,15 +1019,18 @@ impl Replay {
         );
 
         // The posture, its hooks reaching the ladder through a slot as in
-        // `main.rs`; the release hook stands the ladder down, then lifts
-        // the isolation and reads the tables back. (Weakly: the ladder's
-        // gate holds the posture, and a replay is dropped at its end.)
+        // `main.rs`; the entry hook engages the ladder with the posture's
+        // entry (lab PR 245: the trigger, the evidence it cites, the
+        // event's process); the release hook stands the ladder down, then
+        // lifts the isolation and reads the tables back. (Weakly: the
+        // ladder's gate holds the posture, and a replay is dropped at its
+        // end.)
         let slot: Arc<OnceLock<Weak<CombatLadder>>> = Arc::new(OnceLock::new());
         let entry = {
             let (slot, clock) = (Arc::clone(&slot), Arc::clone(&clock));
-            Arc::new(move || {
+            Arc::new(move |entry: &CombatEntry| {
                 if let Some(l) = slot.get().and_then(Weak::upgrade) {
-                    l.engage(None, None, clock.now());
+                    l.engage(entry, clock.now());
                 }
             })
         };
@@ -1357,19 +1376,8 @@ impl Replay {
                 );
             }
         }
-        // …the COMBAT edge names the offender to the ladder…
-        if let Some((state, trigger)) = &fired {
-            if state.kind() == PostureKind::Combat {
-                let (start_ns, seen_ns) = triggers::event_owner_seen(event);
-                self.ladder.engage_with(
-                    triggers::event_owner_pid(event).filter(|p| *p > 1),
-                    start_ns,
-                    seen_ns,
-                    *trigger,
-                    now,
-                );
-            }
-        }
+        // (the COMBAT edge engaged the ladder from the entry hook, inside
+        // `observe`, with the trigger and the event's process: lab PR 245)
         // …an engaged ladder sees every event (jump-ahead)…
         if self.ladder.current_stage().is_some() {
             self.ladder.observe(event, now);
@@ -1850,6 +1858,71 @@ fn every_posture_case_shows_what_it_says() {
             );
         }
     }
+}
+
+/// Lab PR 245: every signed row of the ladder says why it engaged and
+/// against whom — the trigger and the evidence it cites, the offenders as
+/// captured, in the order of `offenders` — the INVESTIGATE row included.
+/// (The replay showed `"trigger": null` in every one, and an INVESTIGATE
+/// naming no offender.) Checked on the replay, so an update of the golden
+/// files that loses them fails.
+#[test]
+fn every_ladder_row_names_its_trigger_and_offender() {
+    let mut investigate_rows = 0;
+    for (name, text) in cases() {
+        let (_case, r) = replay(&name, &text);
+        for row in r
+            .lines
+            .iter()
+            .flat_map(|l| l["signed"].as_array().into_iter().flatten())
+        {
+            let op = row["op"].as_str().unwrap();
+            if !op.starts_with("combat_") {
+                continue;
+            }
+            let x = &row["extra"];
+            let trigger = x["trigger"].as_str();
+            assert!(trigger.is_some(), "case {name}: no trigger in {row}");
+            if op != "combat_stage" {
+                continue;
+            }
+            assert_eq!(x["cause"]["kind"], "posture_trigger", "case {name}: {row}");
+            assert_eq!(
+                x["cause"]["trigger"].as_str(),
+                trigger,
+                "case {name}: {row}"
+            );
+            let offenders: Vec<u64> = x["offenders"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_u64().unwrap())
+                .collect();
+            assert!(!offenders.is_empty(), "case {name}: no offender in {row}");
+            let detailed: Vec<u64> = x["offender_details"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["pid"].as_u64().unwrap())
+                .collect();
+            assert_eq!(detailed, offenders, "case {name}: {row}");
+            if x["to"] == "INVESTIGATE" && x["from"].is_null() {
+                investigate_rows += 1;
+                let d = &x["offender_details"][0];
+                assert_eq!(d["via"], "entry", "case {name}: {row}");
+                assert!(
+                    d["exe"].is_string() && d["cgroup"].is_string(),
+                    "case {name}: the offender's executable and cgroup: {row}"
+                );
+                assert_eq!(
+                    x["cause"]["event"]["pid"].as_u64(),
+                    Some(offenders[0]),
+                    "case {name}: the event names the offender: {row}"
+                );
+            }
+        }
+    }
+    assert!(investigate_rows > 0, "no INVESTIGATE row in the cases");
 }
 
 /// The cases cover what the lot set out to replay before R08 moves the

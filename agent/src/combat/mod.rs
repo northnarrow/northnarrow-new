@@ -40,10 +40,13 @@
 //! The ladder is a small state machine ([`LadderState`]) behind a
 //! [`parking_lot::Mutex`], driven from three places in `main.rs`:
 //!
-//! - [`CombatLadder::engage`] — on the non-Combat → Combat edge (and via
-//!   the posture combat-entry hook, so an admin-forced COMBAT engages it
-//!   too). Idempotent: the first call opens the episode; later calls
-//!   merge freshly-attributed offenders.
+//! - [`CombatLadder::engage`] — on the non-Combat → Combat edge, from
+//!   the posture's combat-entry hook (detector-driven and admin-forced
+//!   COMBAT alike), with the [`CombatEntry`] the posture built: the cause
+//!   and the process the event names. The first call opens the episode
+//!   with them (lab PR 245); a later one, while the episode runs, adds the
+//!   process it names — signed as an addition — and leaves the episode's
+//!   cause as it was.
 //! - [`CombatLadder::observe`] — every event while engaged, for the
 //!   jump-ahead check (active exfil / lateral spread by an offender).
 //! - [`CombatLadder::tick`] — a fast heartbeat that advances the
@@ -66,9 +69,11 @@ use nn_model::posture_types::TriggerType;
 use nn_model::Event;
 
 use crate::anti_tamper::network_isolate::FamilyOutcome;
+use crate::posture::{CombatCause, CombatEntry};
 
 pub mod actuator;
 pub mod evidence;
+pub mod offender;
 pub mod protected;
 pub mod reconcile;
 
@@ -81,8 +86,10 @@ pub use actuator::{
     SoftBlock, SystemActuator,
 };
 pub use evidence::{
-    ActionOutcome, AuditEvidence, EvidenceCounts, LadderEvidence, StageTransition, Unrecorded,
+    ActionOutcome, Addition, AuditEvidence, EvidenceCounts, LadderEvidence, StageTransition,
+    Unrecorded,
 };
+pub use offender::{OffenderId, ProcFacts, Via};
 pub use protected::{NoProtectedProcs, ProtectedProcs, ProtectedReason, SystemProtectedProcs};
 
 /// The active-response stage WITHIN COMBAT posture. Ordered by
@@ -171,8 +178,9 @@ struct LadderState {
     /// sees the offender spawn children (lateral spread), up to
     /// [`LadderConfig::max_offenders`]. External audit CMB-004: each one
     /// captured (pidfd + start time) when it was attributed — the actions
-    /// reach that process, never a later holder of its PID.
-    offenders: BTreeMap<u32, Arc<ProcRef>>,
+    /// reach that process, never a later holder of its PID. Lab PR 245:
+    /// with what identified it then, for the signed rows.
+    offenders: BTreeMap<u32, Attributed>,
     /// External audit CMB-010: the processes the actuator reported
     /// blocked this episode — the only ones the stand-down releases.
     blocked: BTreeMap<u32, Arc<ProcRef>>,
@@ -184,8 +192,10 @@ struct LadderState {
     /// A stage advance is queued and has not started: the tick and the
     /// jump-ahead do not queue another.
     drive_queued: bool,
-    /// The posture trigger that drove COMBAT (telemetry / audit only).
-    trigger: Option<TriggerType>,
+    /// Lab PR 245: why the episode opened — the posture's trigger and the
+    /// evidence it cites, or a forced COMBAT. Set when the episode opens,
+    /// never changed by a later entry (telemetry / audit only).
+    cause: Option<Arc<CombatCause>>,
     /// Lab PR 217 (capability C17): where STAGE 3 stands. It was a flag
     /// set before the isolation ran, so a failed one counted as done and
     /// was never retried; it now follows the read-back outcome.
@@ -212,7 +222,7 @@ impl LadderState {
             block_failed: false,
             attribution_capped: false,
             drive_queued: false,
-            trigger: None,
+            cause: None,
             isolation: Isolation::Idle,
             neutralize_attempted: false,
             isolation_deferred: None,
@@ -225,6 +235,62 @@ impl LadderState {
             cfg.investigate_window.min(cfg.failed_block_window)
         } else {
             cfg.investigate_window
+        }
+    }
+
+    /// Lab PR 245: the episode's cause and offenders, for a row.
+    fn named(&self) -> Named {
+        Named {
+            cause: self.cause.clone(),
+            offenders: self.offenders.keys().copied().collect(),
+            details: self.offenders.values().map(|a| Arc::clone(&a.id)).collect(),
+        }
+    }
+
+    /// The trigger of the episode's cause.
+    fn trigger(&self) -> Option<TriggerType> {
+        self.cause.as_ref().and_then(|c| c.trigger())
+    }
+}
+
+/// External audit CMB-004 / lab PR 245: an attributed process — the
+/// capture the actions reach it through, and what identified it when it
+/// was attributed (the signed rows' `offender_details`).
+#[derive(Debug, Clone)]
+struct Attributed {
+    proc: Arc<ProcRef>,
+    id: Arc<OffenderId>,
+}
+
+/// Lab PR 245: who and why, as the state holds them when a step is
+/// decided — what every `combat_stage` row names.
+#[derive(Debug, Clone)]
+struct Named {
+    cause: Option<Arc<CombatCause>>,
+    offenders: Vec<u32>,
+    details: Vec<Arc<OffenderId>>,
+}
+
+impl Named {
+    fn trigger(&self) -> Option<TriggerType> {
+        self.cause.as_ref().and_then(|c| c.trigger())
+    }
+
+    /// The transition `from` → `to` for `reason`.
+    fn transition(
+        self,
+        from: Option<CombatStage>,
+        to: CombatStage,
+        reason: String,
+    ) -> StageTransition {
+        StageTransition {
+            from,
+            to,
+            cause: self.cause,
+            offenders: self.offenders,
+            details: self.details,
+            added: None,
+            reason,
         }
     }
 }
@@ -262,21 +328,15 @@ enum LadderStep {
     None,
     Neutralize {
         from: CombatStage,
-        offenders: Vec<u32>,
+        named: Named,
         /// The attributed processes (external audit CMB-004).
         refs: Vec<Arc<ProcRef>>,
-        trigger: Option<TriggerType>,
     },
     /// External audit POS-001: ISOLATE was due but the gate is closed.
-    IsolationRefused {
-        from: CombatStage,
-        offenders: Vec<u32>,
-        trigger: Option<TriggerType>,
-    },
+    IsolationRefused { from: CombatStage, named: Named },
     Isolate {
         from: CombatStage,
-        offenders: Vec<u32>,
-        trigger: Option<TriggerType>,
+        named: Named,
         /// Lab PR 217: which attempt this is (1 = the decision itself).
         attempt: u32,
         episode: u64,
@@ -315,11 +375,20 @@ enum Job {
     /// An episode opened: soft-block its offenders, record INVESTIGATE.
     Investigate {
         episode: u64,
-        offenders: Vec<Arc<ProcRef>>,
-        trigger: Option<TriggerType>,
+        offenders: Vec<Attributed>,
+        cause: Arc<CombatCause>,
     },
-    /// Soft-block an offender attributed later in the episode.
-    SoftBlock { episode: u64, target: Arc<ProcRef> },
+    /// Soft-block an offender attributed later in the episode (lateral
+    /// spread).
+    SoftBlock { episode: u64, target: Attributed },
+    /// Lab PR 245: a later COMBAT entry named another process while the
+    /// episode ran (`by`: that entry's cause) — soft-block it and sign the
+    /// addition; the episode's cause stays.
+    Added {
+        episode: u64,
+        target: Attributed,
+        by: Arc<CombatCause>,
+    },
     /// Advance the episode to `target` (decided again when it runs).
     Drive {
         episode: u64,
@@ -464,7 +533,12 @@ impl CombatLadder {
             Runner::Inline => return self.inner.run(job),
             Runner::Worker(tx) => tx,
         };
-        let must_run = matches!(job, Job::Investigate { .. } | Job::StandDown { .. });
+        // Lab PR 245: an addition is evidence of its own, not a step the
+        // tick queues again.
+        let must_run = matches!(
+            job,
+            Job::Investigate { .. } | Job::Added { .. } | Job::StandDown { .. }
+        );
         let res = if must_run {
             tx.send(job)
                 .map_err(|e| std::sync::mpsc::TrySendError::Disconnected(e.0))
@@ -509,22 +583,42 @@ impl CombatLadder {
         })
     }
 
+    /// Capture the process `pid` names (external audit CMB-004;
+    /// `start_ns` from its exec event, `seen_ns` the attributing event's
+    /// time, 0 when unknown) with what identifies it now (lab PR 245).
+    fn capture(&self, pid: u32, start_ns: u64, seen_ns: u64, via: Via) -> Attributed {
+        let proc = self.inner.actuator.identify(pid, start_ns, seen_ns);
+        let facts = self.inner.actuator.describe(&proc);
+        Attributed {
+            id: Arc::new(OffenderId {
+                pid: proc.pid(),
+                start_ticks: proc.start_ticks(),
+                start_ns: proc.start_ns(),
+                seen_ns: proc.seen_ns(),
+                facts,
+                via,
+            }),
+            proc,
+        }
+    }
+
     /// Attribute `pid` to the episode, within the cap, capturing the
-    /// process (external audit CMB-004; `start_ns` from its exec event,
-    /// `seen_ns` the attributing event's time, 0 when unknown). `Ok(Some)`
-    /// with the new offender; `Err` once the cap is reached (the first time
-    /// only: `Err(true)`).
+    /// process ([`Self::capture`]). `Ok(Some)` with the new offender;
+    /// `Err` once the cap is reached (the first time only: `Err(true)`).
     fn attribute(
         &self,
         s: &mut LadderState,
         pid: u32,
         start_ns: u64,
         seen_ns: u64,
-    ) -> Result<Option<Arc<ProcRef>>, bool> {
+        via: Via,
+    ) -> Result<Option<Attributed>, bool> {
         // External audit CMB-004: the PID of an offender that has exited
         // may name a new process by now — attributed afresh, in its place.
         let reused = match s.offenders.get(&pid) {
-            Some(known) if self.inner.actuator.same_process(known, start_ns) => return Ok(None),
+            Some(known) if self.inner.actuator.same_process(&known.proc, start_ns) => {
+                return Ok(None)
+            }
             known => known.is_some(),
         };
         if !reused && s.offenders.len() >= self.inner.cfg.max_offenders {
@@ -532,8 +626,8 @@ impl CombatLadder {
             s.attribution_capped = true;
             return Err(first);
         }
-        let target = self.inner.actuator.identify(pid, start_ns, seen_ns);
-        s.offenders.insert(pid, Arc::clone(&target));
+        let target = self.capture(pid, start_ns, seen_ns, via);
+        s.offenders.insert(pid, target.clone());
         Ok(Some(target))
     }
 
@@ -568,33 +662,24 @@ impl CombatLadder {
         }
     }
 
-    /// Enter (or re-confirm) active-response mode at STAGE 1 INVESTIGATE.
+    /// Enter active-response mode at STAGE 1 INVESTIGATE, from the
+    /// posture's COMBAT entry.
     ///
-    /// Idempotent per episode: the first call opens the episode (records
-    /// the offender + trigger, applies surgical soft egress, captures the
-    /// initial dossier, and emits the INVESTIGATE audit entry). Later
-    /// calls — e.g. the context-free combat-entry hook firing alongside
-    /// the context-carrying `process_event` call — merely **merge** a
-    /// freshly-attributed offender and soft-egress-block it. Reaching
-    /// COMBAT does NOT isolate the network here; that is STAGE 3 only.
-    pub fn engage(&self, offender: Option<u32>, trigger: Option<TriggerType>, now: Instant) {
-        self.engage_with(offender, 0, 0, trigger, now);
-    }
-
-    /// [`Self::engage`] with what the event that names the offender says
-    /// about it (external audit CMB-004): `start_ns`, its exec's start,
-    /// and `seen_ns`, the event's time (it was running then) — 0 when
-    /// unknown. They identify it after it has exited: the events of the
-    /// children it left are matched to it, not to a later holder of its
-    /// PID.
-    pub fn engage_with(
-        &self,
-        offender: Option<u32>,
-        start_ns: u64,
-        seen_ns: u64,
-        trigger: Option<TriggerType>,
-        now: Instant,
-    ) {
+    /// The first call opens the episode with the entry's cause and the
+    /// process it names (lab PR 245: both are in the INVESTIGATE row and
+    /// every later one): applies surgical soft egress, captures the
+    /// initial dossier, and emits the INVESTIGATE audit entry. A call while
+    /// the episode runs (a later COMBAT entry) adds the process it names,
+    /// soft-egress-blocks it and signs the addition — with that entry's
+    /// cause — and leaves the episode's cause as it was. Reaching COMBAT
+    /// does NOT isolate the network here; that is STAGE 3 only.
+    ///
+    /// It was two calls: the context-free posture hook opened the episode
+    /// (`engage(None, None)`) inside the posture's `observe`, before
+    /// `process_event` named the offender and the trigger to
+    /// `engage_with`, which by then only merged the offender — the trigger
+    /// was lost, and the INVESTIGATE row named no offender.
+    pub fn engage(&self, entry: &CombatEntry, now: Instant) {
         let job = {
             let mut s = self.inner.state.lock();
             if !s.engaged {
@@ -603,43 +688,54 @@ impl CombatLadder {
                 s.engaged = true;
                 s.stage = CombatStage::Investigate;
                 s.stage_since = now;
-                s.trigger = trigger;
-                if let Some(pid) = offender {
-                    let target = self.inner.actuator.identify(pid, start_ns, seen_ns);
-                    s.offenders.insert(pid, target);
+                let cause = Arc::new(entry.cause.clone());
+                s.cause = Some(Arc::clone(&cause));
+                if let Some(p) = entry.offender {
+                    let target = self.capture(p.pid, p.start_ns, p.seen_ns, Via::Entry);
+                    s.offenders.insert(p.pid, target);
                 }
-                let offenders: Vec<Arc<ProcRef>> = s.offenders.values().cloned().collect();
+                let offenders: Vec<Attributed> = s.offenders.values().cloned().collect();
                 info!(
                     target: "combat.ladder",
                     stage = %CombatStage::Investigate,
                     offenders = ?s.offenders.keys().collect::<Vec<_>>(),
-                    trigger = ?trigger,
+                    trigger = ?s.trigger(),
+                    cause = %cause.summary(),
                     "COMBAT: entered active-response mode — INVESTIGATE (network UP)"
                 );
                 Some(Job::Investigate {
                     episode,
                     offenders,
-                    trigger,
+                    cause,
                 })
-            } else if let Some(pid) = offender {
-                // Already engaged: merge a newly-attributed offender (so
-                // the audit + any later NEUTRALIZE sees the full set).
-                match self.attribute(&mut s, pid, start_ns, seen_ns) {
+            } else if let Some(p) = entry.offender {
+                // Already engaged: a later COMBAT entry adds the process it
+                // names (so the audit + any later NEUTRALIZE sees the full
+                // set); the episode's cause is not replaced.
+                match self.attribute(&mut s, p.pid, p.start_ns, p.seen_ns, Via::LaterEntry) {
                     Ok(Some(target)) => {
                         info!(
                             target: "combat.ladder",
-                            pid,
-                            "COMBAT: additional offender attributed during active response"
+                            pid = p.pid,
+                            by = %entry.cause.summary(),
+                            "COMBAT: additional offender attributed by a later COMBAT entry"
                         );
-                        Some(Job::SoftBlock {
+                        Some(Job::Added {
                             episode: s.episode,
                             target,
+                            by: Arc::new(entry.cause.clone()),
                         })
                     }
                     Ok(None) | Err(false) => None,
                     Err(true) => self.capped_step(&mut s, now),
                 }
             } else {
+                info!(
+                    target: "combat.ladder",
+                    by = %entry.cause.summary(),
+                    "COMBAT: entered again while an episode runs, naming no process — the episode \
+                     goes on as it was"
+                );
                 None
             }
         };
@@ -663,7 +759,7 @@ impl CombatLadder {
                 None
             } else {
                 // Lateral spread: an offender spawned a child → attribute it.
-                let mut spread_child: Option<Arc<ProcRef>> = None;
+                let mut spread_child: Option<Attributed> = None;
                 let mut capped = false;
                 if let Event::ProcessSpawn {
                     pid,
@@ -676,12 +772,12 @@ impl CombatLadder {
                 {
                     // External audit CMB-004: the parent is the offender,
                     // not a process that took its PID after it exited.
-                    let from_offender = s
-                        .offenders
-                        .get(ppid)
-                        .is_some_and(|p| self.inner.actuator.same_process(p, *parent_start_ns));
+                    let from_offender = s.offenders.get(ppid).is_some_and(|p| {
+                        self.inner.actuator.same_process(&p.proc, *parent_start_ns)
+                    });
                     if from_offender {
-                        match self.attribute(&mut s, *pid, *start_ns, *timestamp_ns) {
+                        let via = Via::Spread { parent: *ppid };
+                        match self.attribute(&mut s, *pid, *start_ns, *timestamp_ns, via) {
                             Ok(Some(target)) => spread_child = Some(target),
                             Ok(None) | Err(false) => {}
                             Err(true) => capped = true,
@@ -699,7 +795,7 @@ impl CombatLadder {
                     } => {
                         s.offenders
                             .get(pid)
-                            .is_some_and(|r| self.inner.actuator.same_process(r, 0))
+                            .is_some_and(|r| self.inner.actuator.same_process(&r.proc, 0))
                             && !is_loopback(*family, dst_addr)
                     }
                     _ => false,
@@ -883,12 +979,27 @@ impl Inner {
     /// containment.
     fn record(&self, t: StageTransition) {
         if let Err(why) = self.evidence.record_stage(&t) {
+            // Lab PR 245: the cause and the offenders' identities too — this
+            // line may be the transition's only record.
+            let details: Vec<serde_json::Value> = t.details.iter().map(|d| d.to_json()).collect();
             tracing::error!(
                 target: "combat.audit",
                 from = t.from.map(|s| s.as_str()).unwrap_or("-"),
                 to = %t.to,
-                trigger = ?t.trigger,
+                trigger = ?t.trigger(),
+                cause = %nn_model::log_escape::Escaped(
+                    &t.cause.as_ref().map(|c| c.to_json().to_string()).unwrap_or_default()
+                ),
                 offenders = ?t.offenders,
+                offender_details = %nn_model::log_escape::Escaped(
+                    &serde_json::Value::from(details).to_string()
+                ),
+                added = %nn_model::log_escape::Escaped(
+                    &t.added
+                        .as_ref()
+                        .map(|a| format!("pid {} by {}", a.offender.pid, a.by.summary()))
+                        .unwrap_or_default()
+                ),
                 reason = %nn_model::log_escape::Escaped(&t.reason),
                 why = %why,
                 "COMBAT stage transition NOT in the signed audit log — enforcement proceeds"
@@ -1020,7 +1131,7 @@ impl Inner {
             Job::Investigate {
                 episode,
                 offenders,
-                trigger,
+                cause,
             } => {
                 if !current(episode) {
                     return self.dropped("INVESTIGATE");
@@ -1038,20 +1149,37 @@ impl Inner {
                 // the `observe` jump-ahead (a fresh `TcpConnect`), not DNS
                 // or an established socket.
                 let mut notes = Vec::new();
+                let mut shortened = false;
                 for target in &offenders {
-                    if let Some(note) = self.soft_block(episode, target, false) {
-                        notes.push(note);
-                    }
+                    let (note, first_failure) = self.soft_block(episode, target, false);
+                    shortened |= first_failure;
+                    notes.extend(note);
                 }
                 let mut reason = "COMBAT entry — investigate first, network up".to_string();
                 if !notes.is_empty() {
                     reason.push_str(&format!(" | soft egress: {}", notes.join("; ")));
                 }
+                // External audit CMB-014: said where the failed block is
+                // (lab PR 245: the offender is in this row from the start,
+                // so the block's record of its own is no longer separate).
+                if shortened {
+                    reason.push_str(&format!(
+                        " — an offender is not contained; INVESTIGATE shortened to {} s",
+                        self.cfg
+                            .investigate_window
+                            .min(self.cfg.failed_block_window)
+                            .as_secs()
+                    ));
+                }
+                // Lab PR 245: the episode's cause and the offender it opened
+                // against, as captured when it opened.
                 self.record(StageTransition {
                     from: None,
                     to: CombatStage::Investigate,
-                    trigger,
-                    offenders: offenders.iter().map(|r| r.pid()).collect(),
+                    cause: Some(cause),
+                    offenders: offenders.iter().map(|a| a.proc.pid()).collect(),
+                    details: offenders.iter().map(|a| Arc::clone(&a.id)).collect(),
+                    added: None,
                     reason,
                 });
             }
@@ -1060,6 +1188,45 @@ impl Inner {
                     return self.dropped("soft egress");
                 }
                 self.soft_block(episode, &target, true);
+            }
+            Job::Added {
+                episode,
+                target,
+                by,
+            } => {
+                if !current(episode) {
+                    return self.dropped("offender added");
+                }
+                // As INVESTIGATE: the block first, its outcome in the row.
+                let (note, first_failure) = self.soft_block(episode, &target, false);
+                let pid = target.proc.pid();
+                let (stage, named) = {
+                    let s = self.state.lock();
+                    (s.stage, s.named())
+                };
+                let mut reason = format!(
+                    "offender {pid} added by a later COMBAT entry ({}); the episode's cause is \
+                     unchanged",
+                    by.summary()
+                );
+                if let Some(note) = note {
+                    reason.push_str(&format!(" | soft egress: {note}"));
+                    if first_failure {
+                        reason.push_str(&format!(
+                            " — the offender is not contained; INVESTIGATE shortened to {} s",
+                            self.cfg
+                                .investigate_window
+                                .min(self.cfg.failed_block_window)
+                                .as_secs()
+                        ));
+                    }
+                }
+                let mut t = named.transition(Some(stage), stage, reason);
+                t.added = Some(Addition {
+                    offender: Arc::clone(&target.id),
+                    by,
+                });
+                self.record(t);
             }
             Job::Drive {
                 episode,
@@ -1109,11 +1276,14 @@ impl Inner {
     fn close_exited(&self) {
         let mut s = self.state.lock();
         let s = &mut *s;
-        for map in [&mut s.offenders, &mut s.blocked] {
-            for r in map.values_mut() {
-                if r.has_fd() && !r.is_live() {
-                    *r = Arc::new(r.without_fd());
-                }
+        let refs = s
+            .offenders
+            .values_mut()
+            .map(|a| &mut a.proc)
+            .chain(s.blocked.values_mut());
+        for r in refs {
+            if r.has_fd() && !r.is_live() {
+                *r = Arc::new(r.without_fd());
             }
         }
     }
@@ -1128,13 +1298,23 @@ impl Inner {
 
     /// Soft-block one offender of `episode`; record the outcome in the
     /// state. Returns a note for the evidence when the block did not take
-    /// effect or the process was spared. With `record`, the episode's
-    /// first failed block is a signed record of its own (an offender
-    /// attributed after the INVESTIGATE record was written).
-    fn soft_block(&self, episode: u64, target: &Arc<ProcRef>, record: bool) -> Option<String> {
+    /// effect or the process was spared, and whether this was the
+    /// episode's first failed block. With `record`, the episode's first
+    /// failed block is a signed record of its own (an offender attributed
+    /// by lateral spread after the INVESTIGATE record was written).
+    fn soft_block(
+        &self,
+        episode: u64,
+        attributed: &Attributed,
+        record: bool,
+    ) -> (Option<String>, bool) {
+        let target = &attributed.proc;
         let pid = target.pid();
         if self.is_gone(target) {
-            return Some(format!("{pid} not blocked (process already exited)"));
+            return (
+                Some(format!("{pid} not blocked (process already exited)")),
+                false,
+            );
         }
         if let Some(reason) = self.protected.protected_reason(pid) {
             warn!(
@@ -1144,7 +1324,7 @@ impl Inner {
                 "COMBAT: refusing surgical soft-egress on host-critical process — \
                  skipped (network left intact)"
             );
-            return Some(format!("{pid} spared ({reason})"));
+            return (Some(format!("{pid} spared ({reason})")), false);
         }
         let outcome = self.actuator.soft_egress_block(target);
         let mut s = self.state.lock();
@@ -1165,9 +1345,9 @@ impl Inner {
                     );
                     self.actuator.soft_egress_clear(target);
                 }
-                None
+                (None, false)
             }
-            SoftBlock::NotNeeded(why) => Some(format!("{pid} not blocked ({why})")),
+            SoftBlock::NotNeeded(why) => (Some(format!("{pid} not blocked ({why})")), false),
             SoftBlock::Failed(why) => {
                 // External audit CMB-014: the offender is not contained
                 // while we analyse — the episode's INVESTIGATE is shorter.
@@ -1175,7 +1355,7 @@ impl Inner {
                 if ours {
                     s.block_failed = true;
                 }
-                let (stage, trigger) = (s.stage, s.trigger);
+                let (stage, cause) = (s.stage, s.cause.clone());
                 drop(s);
                 let window = self
                     .cfg
@@ -1192,8 +1372,10 @@ impl Inner {
                     self.record(StageTransition {
                         from: Some(stage),
                         to: stage,
-                        trigger,
+                        cause,
                         offenders: vec![pid],
+                        details: vec![Arc::clone(&attributed.id)],
+                        added: None,
                         reason: format!(
                             "soft egress: {pid} FAILED ({why}) — the offender is not contained; \
                              INVESTIGATE shortened to {} s",
@@ -1201,7 +1383,7 @@ impl Inner {
                         ),
                     });
                 }
-                Some(format!("{pid} FAILED ({why})"))
+                (Some(format!("{pid} FAILED ({why})")), first)
             }
         }
     }
@@ -1276,9 +1458,12 @@ impl Inner {
                                 s.stage_since = now;
                                 LadderStep::Neutralize {
                                     from,
-                                    offenders: s.offenders.keys().copied().collect(),
-                                    refs: s.offenders.values().cloned().collect(),
-                                    trigger: s.trigger,
+                                    named: s.named(),
+                                    refs: s
+                                        .offenders
+                                        .values()
+                                        .map(|a| Arc::clone(&a.proc))
+                                        .collect(),
                                 }
                             }
                         }
@@ -1300,8 +1485,7 @@ impl Inner {
                                 } else {
                                     LadderStep::IsolationRefused {
                                         from: s.stage,
-                                        offenders: s.offenders.keys().copied().collect(),
-                                        trigger: s.trigger,
+                                        named: s.named(),
                                     }
                                 }
                             } else {
@@ -1316,8 +1500,7 @@ impl Inner {
                                 s.isolation = Isolation::Running(attempt);
                                 LadderStep::Isolate {
                                     from: s.stage,
-                                    offenders: s.offenders.keys().copied().collect(),
-                                    trigger: s.trigger,
+                                    named: s.named(),
                                     attempt,
                                     episode: s.episode,
                                 }
@@ -1330,12 +1513,8 @@ impl Inner {
 
             match step {
                 LadderStep::None => return,
-                LadderStep::Neutralize {
-                    from,
-                    offenders,
-                    refs,
-                    trigger,
-                } => {
+                LadderStep::Neutralize { from, named, refs } => {
+                    let trigger = named.trigger();
                     // Pull host-critical processes out of the kill set: the
                     // ladder never SIGKILLs init / the agent / its watchdog
                     // / sshd. A spared offender is logged here and, because
@@ -1372,13 +1551,11 @@ impl Inner {
                             fmt_protected(&spared)
                         )
                     };
-                    self.record(StageTransition {
-                        from: Some(from),
-                        to: CombatStage::Neutralize,
-                        trigger,
-                        offenders: offenders.clone(),
-                        reason: neutralize_reason,
-                    });
+                    self.record(named.transition(
+                        Some(from),
+                        CombatStage::Neutralize,
+                        neutralize_reason,
+                    ));
 
                     // Every offender host-critical → nothing to kill. Go
                     // straight to ISOLATE without troubling the actuator
@@ -1455,41 +1632,35 @@ impl Inner {
                         }
                     }
                 }
-                LadderStep::IsolationRefused {
-                    from,
-                    offenders,
-                    trigger,
-                } => {
+                LadderStep::IsolationRefused { from, named } => {
                     warn!(
                         target: "combat.ladder",
-                        offenders = ?offenders,
+                        offenders = ?named.offenders,
                         reason = %reason,
                         "COMBAT: ISOLATE refused — COMBAT rests on heuristic evidence only \
                          (unlocked); containment stays at the process level until the \
                          posture locks COMBAT"
                     );
-                    self.record(StageTransition {
-                        from: Some(from),
-                        to: from,
-                        trigger,
-                        offenders,
-                        reason: format!(
+                    self.record(named.transition(
+                        Some(from),
+                        from,
+                        format!(
                             "ISOLATE refused ({reason}): COMBAT rests on heuristic evidence only, \
                              which any local user can produce; the host stays on the network"
                         ),
-                    });
+                    ));
                     return;
                 }
                 LadderStep::Isolate {
                     from,
-                    offenders,
-                    trigger,
+                    named,
                     attempt,
                     episode,
                 } => {
+                    let trigger = named.trigger();
                     warn!(
                         target: "combat.ladder",
-                        offenders = ?offenders,
+                        offenders = ?named.offenders,
                         reason = %reason,
                         attempt,
                         "COMBAT: ISOLATE (last resort) — engaging full network isolation"
@@ -1499,13 +1670,11 @@ impl Inner {
                     // decision is the first attempt's; its outcome is
                     // recorded below like every attempt's.
                     if attempt == 1 {
-                        self.record(StageTransition {
-                            from: Some(from),
-                            to: CombatStage::Isolate,
-                            trigger,
-                            offenders,
-                            reason: reason.clone(),
-                        });
+                        self.record(named.transition(
+                            Some(from),
+                            CombatStage::Isolate,
+                            reason.clone(),
+                        ));
                     }
                     let outcome = self.actuator.isolate();
                     self.settle_isolation(episode, attempt, now, trigger, outcome);

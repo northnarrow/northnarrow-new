@@ -1338,3 +1338,70 @@ only in the table below, in the same PR as the evidence.
     as lab PR 163 left it; an in-order chain whose precursor the process
     already held answers it.
   - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX, 4 vCPU), each tree synced, built and installed (`nn-lab.sh sync`, `build`, `install`), the installed units then stopped the operator way (`lab_purge_pins`, no LSM program left), and `canary_privileged_e2e` (7 tests, the network canary test among them) run as root, single-threaded, with `--include-ignored`: `main` 1f70068 30 of 30 runs passed (the CI reorder not reproduced in the lab: no run drew NN-L-CHAIN-003 on a trip's connection); this fix on 1f70068 (local commit 8f8d48c) 40 of 40; rebased on `main` 2a44301 (lab PR 244; local commit 2e45dac, this commit's code) 30 of 30; 24 to 27 s a run before and after; the units put back, the guest powered off. The CI order forced in a unit test on `main` 1f70068 (temporary, not committed): the synthesised close (`127.0.0.1:0`, starting 40 µs after the connect) drew NN-L-CHAIN-003 after NN-L-CANARY-003, and a credential read processed late completed NN-L-CHAIN-001 with the trip's connection. Host, on 8f8d48c and again on 2e45dac: `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,009 and 3,020 passed, 0 failed; `cargo xtask attack-coverage --check`; `cargo xtask golden` (the three new golden files, every other one unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass, both times.
+- **Lab PR 245 — the signed COMBAT rows say why the ladder engaged and
+  against whom.** C17 (response on processes and files); Wave 4 Phase 2;
+  no level changes.
+  - What was wrong (found by the golden replay of lab PR 243): the signed
+    `combat_stage` rows of every COMBAT the posture reached carried
+    `"trigger": null`, and the INVESTIGATE row named no offender
+    (`"offenders": []`); the `combat_outcome` rows too said `"trigger":
+    null`. The posture's entry hook took no argument: `main.rs` opened the
+    ladder's episode from it (`engage(None, None)`) inside
+    `PostureMachine::observe`, before `process_event` passed the offender
+    and the firing trigger to `engage_with`, which, the episode open, only
+    merged the offender (a soft block) and dropped the trigger.
+  - What changed (structural, no hook order or timing): the entry hook
+    receives a `CombatEntry` (`posture/entry.rs`), built in `observe` where
+    the posture decides — the cause, `CombatCause::Trigger`: the firing
+    trigger, every trigger the event raised, its kind of evidence, decisive
+    or a heuristic with the earlier signals of the actor's scope that
+    corroborated it (`CorroborationLedger::corroborating`, read before this
+    round's signals are recorded), locked or not, the scope, the event's
+    kind, process and time; or a forced COMBAT, `AdminForce` with the
+    signing keys' fingerprints (`admin_force_state_signed_by`, used by the
+    admin socket) or `DebugForce` — and the process the event names
+    (external audit EBPF-001's "never init" moved there from `main.rs`).
+    The ladder has one entry point, `CombatLadder::engage(&CombatEntry,
+    now)`: `engage_with` and `process_event`'s second call are gone. The
+    episode holds its cause, never replaced, and each offender with what
+    identified it when it was attributed (`combat::offender::OffenderId`:
+    pid, `start_ticks`, `start_ns`, `seen_ns`, `exe` and `cgroup` read from
+    `/proc` by the actuator while the capture still names the process —
+    `CombatActuator::describe`, `actuator::read_proc_facts`, detect-only
+    included — a path at most 512 bytes, its end kept; `via`: `entry`,
+    `spread` with its parent, `later_entry`). Every `combat_stage` row
+    names the trigger and carries `cause` and `offender_details` (in the
+    order of `offenders`); the `combat_outcome` rows name the trigger; a
+    later COMBAT entry naming another process during an episode adds it
+    with a signed row of its own (from and to the current stage, `added`:
+    that process and the later entry's cause, its soft block in the
+    reason), the episode's trigger and cause unchanged; the ERROR line of a
+    transition the audit log refused carries the cause and the identities
+    too. Readers checked: `nn-admin audit read` (the human view unchanged;
+    `--json`, the export, is the log's bytes for both shapes), `audit
+    verify` and `chain verify` (the rows' own bytes), `nn-admin status`
+    (the stage only, unchanged), the posture golden, the operator docs
+    (`COMBAT_RECOVERY.md` §3.4, `UPGRADE_NOTES_WAVE4.md` §3), the chain
+    pins of lab PR 241 (the v1 fixtures untouched and verified; they hold
+    no COMBAT row, the posture golden pins those bytes). Rows written
+    before keep their bytes and their `null`s. Tests: the posture's entry
+    (trigger, offender, never init; a heuristic's corroborating signal; a
+    forced COMBAT's signers), the ledger's corroborating signals, the
+    identity's rendering and the `/proc` reader, and through the ladder: a
+    COMBAT reached through the posture names its trigger and offender from
+    INVESTIGATE on, the same entry again adds nothing; two offenders in one
+    episode keep the first trigger in every row, outcomes included, the
+    addition signed; `--detect-only` with the production actuator and a
+    real process: the rows name the trigger and the offender (its real
+    executable and cgroup), nothing is blocked, killed or quarantined; both
+    row shapes read, exported and verified in one chain; every ladder row
+    of every posture golden case names its trigger and offender
+    (`every_ladder_row_names_its_trigger_and_offender`). Golden: the six
+    cases that reach COMBAT moved, and only with this (the decision golden
+    unchanged) — the capture of the offender before `begin episode`; the
+    trigger, `cause` and `offender_details` in the rows (a spread child with
+    its parent); `detect-only`'s INVESTIGATE reason with the offender's
+    soft egress note; in `combat-stale-capture` the failed soft block,
+    which had a row of its own, is in the INVESTIGATE row with the
+    shortened window, the two rows after it one place earlier in the chain.
+  - Lab: On Ubuntu 24.04 (6.8.0-147, the lab guest ubuntu2404, QEMU for Windows with WHPX, 4 vCPU, 7 GiB), this PR's code (local commit 7c6c981, on `main` 9de1923) synced, built and installed (`nn-lab.sh sync`, `build`, `install`: the agent and the watchdog active). `nn-lab.sh test-ignored`: the five runs exit 0, 74 suites, 84 passed, 0 failed (the privileged suites' COMBATs forced by `debug force-posture` wrote 6 rows to the installed agent's audit log: `cause` `debug_force_posture`, no offender, `trigger` null, as a forced COMBAT's is). Then, the units put back (`install`), a real COMBAT driven with the benign lab simulator (`deploy/lab/cow/ransom-sim.py --tripwire --hold 60`, root, in a unit of its own, `nn-lab245-sim`, on a 12-file tree under `/srv/nn-cow-lab245`): its append-open of `/etc/northnarrow/admin.pub` refused by the anti-tamper hook (EPERM) — AntiTamperDenial, decisive, COMBAT locked — and its child the jump-ahead to NEUTRALIZE. The agent's signed rows (seq 3929–3931): INVESTIGATE `trigger` AntiTamperDenial, `offenders` [18385], `offender_details` [pid 18385, `exe` `/usr/bin/python3.12`, `cgroup` `/system.slice/nn-lab245-sim.service`, `start_ticks`, `seen_ns`, `via` `entry`], `cause` `posture_trigger` (Kernel, Decisive, locked, `workload /system.slice/nn-lab245-sim.service`, FsProtectDenial of 18385 at its kernel time); NEUTRALIZE the same trigger and cause, `offenders` [18385, 18391], the child `/usr/bin/true` `spread` from 18385 in `/northnarrow.slice/blocked.scope` (born after the soft block took) with its exec's `start_ns`; the `combat_outcome` row `trigger` AntiTamperDenial (both contained, the system binary not quarantined). `nn-admin audit verify`: 3,933 entries, chain intact; `audit read --json` byte-identical to the log, and verified; the signed unlock released COMBAT (ALERTED, both families read back clear). The same audit log holds 110 `combat_stage` rows written by earlier builds (2026-10-20 to 10-22 lab runs): every one `"trigger": null`, and 47 of 47 INVESTIGATE rows `"offenders": []`. The guest powered off. Host, on 7c6c981: `cargo xtask build-ebpf --release` (the eBPF crates untouched); the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,044 passed, 0 failed, 15 ignored (no `#[ignore]` test added); `cargo xtask attack-coverage --check`; `cargo xtask golden`; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass. The same gates on the first tree of the lot (2687147) found the module ratchet one above its ceiling (nn-core 41 > 40: the new `combat/offender.rs` named `response`); the `/proc` reader moved to the actuator and the module holds data only. Mutation checks (temporary): the hook handed an entry without cause or offender fails 8 tests (the ladder's posture COMBAT and detect-only, the posture's entry and heuristic, four golden checks); a later entry overwriting the cause, an addition not signed, the identity not read from `/proc` each fail the test written for it.

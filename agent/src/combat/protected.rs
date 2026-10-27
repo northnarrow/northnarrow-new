@@ -363,15 +363,7 @@ impl SystemProtectedProcs {
     fn cgroup_path(&self, pid: u32) -> Option<String> {
         let cgroup =
             fs::read_to_string(self.proc_root.join(pid.to_string()).join("cgroup")).ok()?;
-        cgroup
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .or_else(|| {
-                cgroup
-                    .lines()
-                    .find_map(|l| l.split_once(":name=systemd:").map(|(_, p)| p))
-            })
-            .map(str::to_string)
+        super::offender::cgroup_path(&cgroup).map(str::to_string)
     }
 
     /// The systemd unit (`*.service`, `*.scope`) `pid` runs in, read from

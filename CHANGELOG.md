@@ -417,6 +417,31 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The signed `combat_stage` rows of a COMBAT the posture reached said
+  `"trigger": null`, and the INVESTIGATE row named no offender (lab PR
+  245; found by the golden replay of lab PR 243). The posture's entry hook
+  took no argument: `main.rs` opened the ladder's episode from it
+  (`engage(None, None)`) inside `observe`, before `process_event` named the
+  offender and the firing trigger to `engage_with`, which by then only
+  merged the offender and dropped the trigger. The hook now receives the
+  posture's `CombatEntry` — the firing trigger with the evidence it cites
+  (every trigger the event raised, the kind of evidence, decisive or
+  corroborated and by which earlier signals of the actor's scope, locked,
+  the scope, the event), or a forced COMBAT with its signers, and the
+  process the event names (never init) — and the ladder has one entry
+  point, `CombatLadder::engage(&CombatEntry, now)`: the episode opens with
+  its cause and its offender. Every `combat_stage` row names the trigger
+  (`combat_outcome` rows too) and carries `cause` and `offender_details`
+  (each offender as captured when attributed: pid, starts, executable and
+  cgroup read from `/proc` while the capture still names it, how it joined
+  the episode); a later COMBAT entry naming another process during an
+  episode adds it with a signed row of its own (`added`: that process and
+  the later entry's cause), the episode's trigger unchanged. Older rows
+  keep their bytes and verify; `nn-admin audit read`, its `--json` export
+  and `audit verify` read both shapes. Posture golden: the six cases that
+  reach COMBAT moved (the trigger and the offender, and what follows from
+  the offender being there when the episode opens); the decision golden is
+  unchanged.
 - The close of a network canary trip's own connection could draw
   NN-L-CHAIN-003 (lab PR 246; the KVM failure of
   `network_canary_connect_trips_canary_003_and_kills_the_connector` on

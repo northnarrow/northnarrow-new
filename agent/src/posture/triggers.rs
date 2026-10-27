@@ -872,6 +872,42 @@ pub fn event_owner_seen(event: &Event) -> (u64, u64) {
     }
 }
 
+/// Lab PR 245: the time of an event that raised a trigger (the sensors'
+/// clock, ns): the owner's event time, a FIM change's own; 0 when the
+/// event carries none.
+pub fn event_time_ns(event: &Event) -> u64 {
+    match event {
+        Event::Fim(fe) => fe.timestamp_ns,
+        _ => event_owner_seen(event).1,
+    }
+}
+
+/// Lab PR 245: an event's kind, as its serialised form names it — the
+/// evidence a COMBAT entry cites ([`super::entry::TriggerEvidence`]).
+pub fn event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::ProcessSpawn { .. } => "ProcessSpawn",
+        Event::FileOpen { .. } => "FileOpen",
+        Event::MassWrite { .. } => "MassWrite",
+        Event::FileBurst { .. } => "FileBurst",
+        Event::DefenderSignal { .. } => "DefenderSignal",
+        Event::ExecCheck { .. } => "ExecCheck",
+        Event::ModuleLoad { .. } => "ModuleLoad",
+        Event::BpfSyscall { .. } => "BpfSyscall",
+        Event::IoUring { .. } => "IoUring",
+        Event::TcpConnect { .. } => "TcpConnect",
+        Event::DnsQuery { .. } => "DnsQuery",
+        Event::FsProtectDenial { .. } => "FsProtectDenial",
+        Event::Fim(_) => "Fim",
+        Event::CanaryTripped { .. } => "CanaryTripped",
+        Event::NetFlow(_) => "NetFlow",
+        Event::NetListener(_) => "NetListener",
+        Event::DnsFlood { .. } => "DnsFlood",
+        Event::SensorFlood { .. } => "SensorFlood",
+        Event::ExploitPostcondition { .. } => "ExploitPostcondition",
+    }
+}
+
 fn recon_pattern(focal: &Event, recent: Recent<'_>) -> bool {
     if let Event::ProcessSpawn { comm, .. } = focal {
         if RECON_TOOL_COMMS.iter().any(|c| comm == c) {
