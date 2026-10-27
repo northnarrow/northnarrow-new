@@ -178,10 +178,16 @@ fn log_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Write the fixtures into `$NN_CHAIN_PIN_REGEN` (a directory). Run once on
 /// `main` c7bb346 for v1; the committed files are what that code wrote.
+/// Without the variable it does nothing: the privileged gate runs every
+/// `#[ignore]` test, and this one must not fail it.
 #[test]
 #[ignore = "writes the fixtures: run once, by hand, on the code they pin"]
 fn regenerate_chain_pin_fixtures() {
-    let out = PathBuf::from(std::env::var_os("NN_CHAIN_PIN_REGEN").expect("NN_CHAIN_PIN_REGEN"));
+    let Some(out) = std::env::var_os("NN_CHAIN_PIN_REGEN") else {
+        eprintln!("skipped: set NN_CHAIN_PIN_REGEN=<dir> to write the fixtures");
+        return;
+    };
+    let out = PathBuf::from(out);
     std::fs::create_dir_all(&out).unwrap();
     let work = tempfile::tempdir().unwrap();
     let mut log = AuditLog::open(&work.path().join("audit.log"), key(), AGENT_ID).unwrap();
