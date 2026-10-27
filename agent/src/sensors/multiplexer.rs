@@ -894,6 +894,46 @@ fn spawn_tcp_connect_pump(
     })
 }
 
+/// Lab PR 246: held by the connect pump while it runs, so the net drain's
+/// closes wait for the connects it announces ([`send_connect`]) — and
+/// stop waiting when it ends.
+struct ConnectPumpClaim(Arc<Mutex<FlowTracker>>);
+
+impl ConnectPumpClaim {
+    fn new(tracker: &Arc<Mutex<FlowTracker>>) -> Self {
+        tracker.lock().set_connect_pump(true);
+        Self(Arc::clone(tracker))
+    }
+}
+
+impl Drop for ConnectPumpClaim {
+    fn drop(&mut self) {
+        self.0.lock().set_connect_pump(false);
+    }
+}
+
+/// One connect record on the bus ([`connect_events`], in order), then,
+/// lab PR 246, announced to the flow tracker: its close, held by the net
+/// drain until then, follows it on the bus. `false` when the bus is
+/// closed.
+async fn send_connect(
+    raw: &TcpConnectRaw,
+    wiring: Option<&ConnectWiring>,
+    tx: &mpsc::Sender<Event>,
+) -> bool {
+    for event in connect_events(raw, wiring) {
+        if tx.send(event).await.is_err() {
+            return false;
+        }
+    }
+    if let Some(w) = wiring {
+        w.flow_tracker
+            .lock()
+            .announce(&FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr));
+    }
+    true
+}
+
 async fn pump_tcp_connect(
     rb: RingBuf<MapData>,
     flow_tracker: Option<ConnectWiring>,
@@ -902,6 +942,9 @@ async fn pump_tcp_connect(
     let mut async_fd = crate::async_fd::register(rb)?;
     let mut reject = RejectThrottle::new();
     let mut batch: Vec<TcpConnectRaw> = Vec::new();
+    let _claim = flow_tracker
+        .as_ref()
+        .map(|w| ConnectPumpClaim::new(&w.flow_tracker));
     loop {
         let mut guard = async_fd.readable_mut().await?;
         let inner = guard.get_inner_mut();
@@ -929,10 +972,8 @@ async fn pump_tcp_connect(
             w.dns_cache.ingest().caught_up(newest).await;
         }
         for raw in batch.drain(..) {
-            for event in connect_events(&raw, flow_tracker.as_ref()) {
-                if tx.send(event).await.is_err() {
-                    return Ok(());
-                }
+            if !send_connect(&raw, flow_tracker.as_ref(), &tx).await {
+                return Ok(());
             }
         }
         if drained == 0 {
@@ -953,6 +994,8 @@ async fn pump_tcp_connect(
 ///   fan-out rules); then (lab PR 224, CM-02 a) the flow's connect-time
 ///   row, with the image named now and the DNS name of its destination,
 ///   for the rules that need no byte count to judge it while it is open.
+///   Once both are on the bus the pump announces the connect (lab PR 246,
+///   [`send_connect`]): the net drain holds its close until then.
 ///   Without net wiring (the exec sensor's live test) only the
 ///   `TcpConnect`.
 fn connect_events(raw: &TcpConnectRaw, wiring: Option<&ConnectWiring>) -> Vec<Event> {
@@ -1365,6 +1408,43 @@ mod tests {
         assert_eq!(w.flow_tracker.lock().pending_len(), 1);
         // Without net wiring: the `TcpConnect` alone, as before.
         assert_eq!(connect_events(&raw, None).len(), 1);
+    }
+
+    /// Lab PR 246: a connect is announced to the flow tracker only once its
+    /// `TcpConnect` and its connect-time row are on the bus, so the close
+    /// the net drain holds for it follows both there. While the pump's
+    /// claim is held a close waits; when the pump ends, none does.
+    #[tokio::test]
+    async fn a_connect_is_announced_after_its_events_are_on_the_bus() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let w = wiring(AuthSessionTracker::new(tmp.path()));
+        let claim = ConnectPumpClaim::new(&w.flow_tracker);
+        let mut raw = TcpConnectRaw::zeroed();
+        raw.pid = 4700;
+        raw.family = nn_model::netaddr::AF_INET;
+        raw.dst_port = 41147;
+        raw.dst_addr[..4].copy_from_slice(&[127, 0, 0, 1]);
+        raw.timestamp_ns = 20_000;
+        raw.sk_ptr = 0xbeef;
+        let corr = FlowTracker::corr_id(raw.timestamp_ns, raw.sk_ptr);
+        assert!(!w.flow_tracker.lock().close_may_proceed(&corr));
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(send_connect(&raw, Some(&w), &tx).await);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::TcpConnect { pid: 4700, .. })
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Event::NetFlow(_))));
+        assert!(w.flow_tracker.lock().close_may_proceed(&corr));
+        // Another connect, not sent: its close waits until the pump ends.
+        let other = FlowTracker::corr_id(30_000, 0xbeef);
+        assert!(!w.flow_tracker.lock().close_may_proceed(&other));
+        drop(claim);
+        assert!(w.flow_tracker.lock().close_may_proceed(&other));
+        // A closed bus: not announced.
+        drop(rx);
+        raw.timestamp_ns = 40_000;
+        assert!(!send_connect(&raw, Some(&w), &tx).await);
     }
 
     /// Lab PR 224 (CM-02 c): a record of the `socket_connect` deny is its

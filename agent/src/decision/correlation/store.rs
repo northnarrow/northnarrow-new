@@ -394,6 +394,33 @@ impl CorrelationStore {
         Some(n.note.clone())
     }
 
+    /// Lab PR 246: the connection a network canary trip owns — `pid`'s
+    /// flow connected at `connect_ns`, the trip's own time — is no egress:
+    /// its note is dropped. The note was taken when a row of the
+    /// connection reached the rules before the trip (the close comes on
+    /// another ring than the connect); left there, a precursor processed
+    /// later would complete a chain with the trip's own connection
+    /// (CHAIN-001 or CHAIN-007 on a late read, CHAIN-002 or CHAIN-007 on a
+    /// late exec), which in the other order is never judged. Every key of
+    /// the pid is looked at: until its exec is seen a note sits under the
+    /// unresolved or the previous incarnation.
+    pub fn drop_trip_egress(&mut self, pid: u32, connect_ns: u64) {
+        let keys: Vec<ProcKey> = self
+            .egress
+            .keys()
+            .filter(|k| k.pid == pid)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(q) = self.egress.get_mut(&key) {
+                q.retain(|n| n.note.start_ns != connect_ns);
+                if q.is_empty() {
+                    self.remove_egress(&key);
+                }
+            }
+        }
+    }
+
     /// Review 70: a two-step chain fired on this egress — `by` its
     /// precursor — so no late precursor may complete a two-step chain with
     /// it again. Lab PR 235: claimed, not removed (see
@@ -1335,6 +1362,38 @@ mod tests {
         let mut s = CorrelationStore::new();
         s.observe_spawn(200, 100, 0);
         assert!(s.ancestry().is_ancestor(200, ProcKey::unresolved(100)));
+    }
+
+    /// Lab PR 246: a network canary trip's own connection, noted when a
+    /// row of it reached the rules before the trip, is dropped under every
+    /// key of the pid (unresolved, previous incarnation): no late read or
+    /// exec completes a chain with it. Another flow of the pid, and the
+    /// same connect time of another pid, stay.
+    #[test]
+    fn a_trips_own_connection_is_no_egress_for_a_late_precursor() {
+        let note = |pid, start_ns| EgressNote {
+            pid,
+            comm: "bash".into(),
+            start_ns,
+            dst_addr: "127.0.0.1".parse().unwrap(),
+            dst_port: 41147,
+        };
+        let mut s = CorrelationStore::new();
+        s.note_egress(ProcKey::unresolved(9825), note(9825, 100 * SEC));
+        s.note_egress(key(9825, 7), note(9825, 100 * SEC));
+        s.note_egress(key(9825, 7), note(9825, 101 * SEC));
+        s.note_egress(ProcKey::unresolved(9826), note(9826, 100 * SEC));
+        s.drop_trip_egress(9825, 100 * SEC);
+        assert!(
+            !s.egress.contains_key(&ProcKey::unresolved(9825)),
+            "emptied, removed"
+        );
+        assert!(s
+            .claim_egress_after(key(9825, 7), 99 * SEC, W)
+            .is_some_and(|n| n.start_ns == 101 * SEC));
+        assert!(s
+            .take_egress_after(ProcKey::unresolved(9826), 99 * SEC, W)
+            .is_some());
     }
 
     // ── External audit NETR-004: a hard cap, O(1) per insert ─────────

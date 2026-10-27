@@ -22,9 +22,10 @@
 //!   path (lab PR 163). Consulted on `Event::TcpConnect`: a local
 //!   process connecting to a canary's address and port is the
 //!   accessor ([`crate::canary::network`] says why it is the
-//!   connect, not an accept). The close of that connection
-//!   (`Event::NetFlow`) belongs to the trip:
-//!   [`Detector::owns_trip_flow`].
+//!   connect, not an accept). Every row of that connection
+//!   (`Event::NetFlow`: its connect-time row, snapshots, close) belongs
+//!   to the trip: the engine's flow ledger owns it from the trip on
+//!   (lab PR 246, [`crate::decision::RuleEngine::owned_by_trip`]).
 //!
 //! When any helper returns `Some(canary_id)`, under the registry lock:
 //!
@@ -59,7 +60,7 @@
 //! `process_event` tokio task itself + don't block the
 //! reactor longer than a few HashMap lookups.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,11 +74,6 @@ use tracing::{error, warn};
 use crate::canary::access_log::{CanaryAccessDb, CanaryAccessDraft};
 use crate::canary::network::{connect_destination, CanaryAddr, LocalAddrs, PortCanaries};
 use crate::canary::registry::Registry;
-
-/// Network trips whose connection's close is still to come, for
-/// [`Detector::owns_trip_flow`]. A close that never arrives (a lost ring
-/// record) leaves its entry until it is the oldest of this many.
-const PENDING_TRIP_FLOWS: usize = 256;
 
 // ── hot-path indexes ────────────────────────────────────────────────
 
@@ -304,9 +300,6 @@ pub struct Detector {
     indexes: Arc<Mutex<CanaryIndexes>>,
     /// This host's addresses, for the wildcard network canaries.
     local_addrs: LocalAddrs,
-    /// `(pid, connect timestamp)` of the network trips whose close has
-    /// not been seen yet ([`Detector::owns_trip_flow`]).
-    trip_flows: Mutex<VecDeque<(u32, u64)>>,
 }
 
 impl Detector {
@@ -322,41 +315,6 @@ impl Detector {
             access_log,
             indexes,
             local_addrs: LocalAddrs::default(),
-            trip_flows: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    /// Lab PR 163: whether `event` is the close of a connection that
-    /// tripped a network canary — the `Event::NetFlow` the flow tracker
-    /// builds from that connect (same pid, the connect's timestamp as its
-    /// start). It belongs to the trip: main records it in the netflow log
-    /// and does not judge it again, as the FIM rules never see a File
-    /// canary's open (design §6, cross-cutting). Judged, the flow was a
-    /// second response to the one access: NN-L-CHAIN-003 ("a canary trip,
-    /// then a flow of the same process") fired on the trip's own
-    /// connection. A close that reaches the loop before its connect is
-    /// judged as any flow (it precedes the trip, so no chain is complete).
-    pub fn owns_trip_flow(&self, event: &Event) -> bool {
-        let Event::NetFlow(nf) = event else {
-            return false;
-        };
-        if nf.proto != 6 {
-            return false;
-        }
-        let mut flows = self.trip_flows.lock();
-        match flows
-            .iter()
-            .position(|&(pid, ts)| pid == nf.pid && ts == nf.start_ns)
-        {
-            // Lab PR 224: the connection's open-phase rows (its connect,
-            // its snapshots) belong to the trip as well; its close ends it.
-            Some(i) => {
-                if !nf.phase.is_open() {
-                    flows.remove(i);
-                }
-                true
-            }
-            None => false,
         }
     }
 
@@ -545,14 +503,6 @@ impl Detector {
             }
             first_trip
         };
-
-        if access_kind == CanaryAccessKind::NetworkConnect {
-            let mut flows = self.trip_flows.lock();
-            if flows.len() >= PENDING_TRIP_FLOWS {
-                flows.pop_front();
-            }
-            flows.push_back((accessor_pid, ts));
-        }
 
         // Return the trip event for main to route through the
         // K5 canary rules.
@@ -1344,7 +1294,15 @@ mod tests {
             .is_none());
     }
 
-    fn flow_close(pid: u32, start_ns: u64, proto: u8) -> Event {
+    /// A TCP row of `pid`'s connection connected at `start_ns`, in `phase`,
+    /// to `dst_port` (0: a close the tracker synthesised for a refused
+    /// connect, whose port the kernel cleared).
+    fn flow_row(
+        pid: u32,
+        start_ns: u64,
+        phase: nn_model::telemetry::FlowPhase,
+        dst_port: u16,
+    ) -> Event {
         Event::NetFlow(nn_model::telemetry::NetFlowEvent {
             start_ns,
             end_ns: start_ns + 1_000,
@@ -1352,8 +1310,8 @@ mod tests {
             src_addr: "127.0.0.1".parse().unwrap(),
             src_port: 40000,
             dst_addr: "100.64.0.9".parse().unwrap(),
-            dst_port: 4444,
-            proto,
+            dst_port,
+            proto: 6,
             pid,
             uid: 1000,
             comm: "nc.openbsd".to_string(),
@@ -1365,57 +1323,290 @@ mod tests {
             tls_fingerprint: None,
             flow_id: String::new(),
             close_reason: 111,
-            phase: Default::default(),
-            observed_ns: 0,
+            phase,
+            observed_ns: start_ns + 1_000,
         })
     }
 
-    /// The close of the trip's own connection belongs to the trip (main
-    /// does not judge it again: NN-L-CHAIN-003 fired on it, a second
-    /// response to one access). Once, and only that flow: another flow of
-    /// the same process, a flow of another process and a UDP record are
-    /// judged as usual.
+    /// Lab PR 163 / 246: the trip of a network canary names its connection
+    /// as every row of the connection does — the connecting process and the
+    /// connect's time — and the engine owns that connection from the trip
+    /// on (main does not judge it again: NN-L-CHAIN-003 fired on it, a
+    /// second response to one access). Every row: the close, resolved or
+    /// synthesised (port 0), a connect-time row after the close, a
+    /// snapshot. Another flow of the same process is an egress after the
+    /// trip (NN-L-CHAIN-003); another process's flow, and a file canary
+    /// trip, own nothing.
     #[test]
-    fn the_close_of_the_trip_connection_belongs_to_the_trip() {
+    fn the_trip_owns_every_row_of_its_connection() {
+        use nn_model::telemetry::FlowPhase;
         let dir = TempDir::new().unwrap();
         let (detector, registry) = build_detector(&dir);
         deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
-        assert!(!detector.owns_trip_flow(&flow_close(7001, 9_000, 6)));
-        detector
+        let engine = crate::decision::RuleEngine::with_default_rules();
+        let trip = detector
             .process_event(&connect_to("100.64.0.9", 4444, 7001, 9_000))
             .expect("a trip");
-        assert!(!detector.owns_trip_flow(&flow_close(7001, 9_001, 6)));
-        assert!(!detector.owns_trip_flow(&flow_close(7002, 9_000, 6)));
-        assert!(!detector.owns_trip_flow(&flow_close(7001, 9_000, 17)));
-        assert!(detector.owns_trip_flow(&flow_close(7001, 9_000, 6)));
+        let Event::CanaryTripped {
+            accessor_pid,
+            timestamp_ns,
+            ..
+        } = &trip
+        else {
+            panic!("{trip:?}");
+        };
+        assert_eq!((*accessor_pid, *timestamp_ns), (7001, 9_000));
+        let before = flow_row(7001, 9_000, FlowPhase::Closed, 0);
+        assert!(!engine.owned_by_trip(&before), "no trip decided yet");
+        let d = engine.decide(&trip).expect("NN-L-CANARY-003");
+        assert_eq!(d.verdict.rule_id, "NN-L-CANARY-003_NetworkConnect");
+        for row in [
+            flow_row(7001, 9_000, FlowPhase::Closed, 0),
+            flow_row(7001, 9_000, FlowPhase::Closed, 4444),
+            flow_row(7001, 9_000, FlowPhase::Connect, 4444),
+            flow_row(7001, 9_000, FlowPhase::Snapshot, 4444),
+        ] {
+            assert!(engine.owned_by_trip(&row), "{row:?}");
+            assert!(engine.decide(&row).is_none(), "{row:?}");
+        }
+        let egress = flow_row(7001, 9_001, FlowPhase::Closed, 443);
+        assert!(!engine.owned_by_trip(&egress));
+        let d = engine.decide(&egress).expect("an egress after the trip");
         assert!(
-            !detector.owns_trip_flow(&flow_close(7001, 9_000, 6)),
-            "once: a later flow with the same key is not the trip's"
+            d.matches
+                .iter()
+                .any(|m| m.rule_id == "NN-L-CHAIN-003_CanaryThenEgress"),
+            "{:?}",
+            d.verdict
         );
-        // a file canary trip owns no flow
+        assert!(!engine.owned_by_trip(&flow_row(7002, 9_000, FlowPhase::Closed, 4444)));
         deploy_file_canary(&registry, &detector, "/tmp/decoy.txt", "f");
         let mut fim = fim_event_on("/tmp/decoy.txt", 7003);
         if let Event::Fim(fe) = &mut fim {
             fe.timestamp_ns = 9_500;
         }
-        detector.process_event(&fim).expect("a file trip");
-        assert!(!detector.owns_trip_flow(&flow_close(7003, 9_500, 6)));
+        let file_trip = detector.process_event(&fim).expect("a file trip");
+        engine.decide(&file_trip);
+        assert!(!engine.owned_by_trip(&flow_row(7003, 9_500, FlowPhase::Closed, 4444)));
     }
 
-    /// The pending trips are bounded: the oldest goes first.
+    /// The bus as `main::process_event` takes it: the detector first (a
+    /// connect to a canary becomes its trip), a row a trip owns not judged
+    /// again, every other event decided by the engine. The rules that
+    /// answered each item.
+    fn agent_path(
+        detector: &Detector,
+        engine: &crate::decision::RuleEngine,
+        bus: &[Event],
+    ) -> Vec<Vec<&'static str>> {
+        bus.iter()
+            .map(|e| {
+                let e = detector.process_event(e).unwrap_or_else(|| e.clone());
+                if engine.owned_by_trip(&e) {
+                    return Vec::new();
+                }
+                engine
+                    .decide(&e)
+                    .map(|d| d.matches.iter().map(|m| m.rule_id).collect())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Lab PR 246 — the KVM failure of 27/10/2026 (job 122036206565), in
+    /// every order the connect and the close of a canary trip can take.
+    /// A shell (pid 9825) connects to a network canary on a loopback port
+    /// nothing listens on: refused, the shell closes the socket at once,
+    /// and the kernel clears the destination port before the close. The
+    /// connect (`TcpConnect`, its pump) and the close (the net drain) come
+    /// on two rings; the flow tracker hears one first, the bus carries
+    /// them in either order. In the CI run the tracker heard the close
+    /// first (a synthesised row, `tcp 127.0.0.1:0 closed`, which started
+    /// at the close) and the bus the connect first: the trip owned
+    /// (pid, connect time), the row carried (pid, close time), and
+    /// NN-L-CHAIN-003 answered the trip's own connection.
+    ///
+    /// In every order: NN-L-CANARY-003 once, on the trip; no chain verdict
+    /// on any row of the trip's connection, neither in order nor completed
+    /// by a precursor processed late — a credential read (NN-L-CHAIN-001,
+    /// CHAIN-007), the shell's exec from a staging directory
+    /// (NN-L-CHAIN-002 of lab PR 244, CHAIN-007), both in kernel time
+    /// before the connect; and a later flow of the shell is still an
+    /// egress after the trip (CHAIN-003).
     #[test]
-    fn pending_trip_flows_are_bounded() {
-        let dir = TempDir::new().unwrap();
-        let (detector, registry) = build_detector(&dir);
-        deploy_network_canary(&registry, &detector, "100.64.0.9", 4444);
-        for i in 0..=PENDING_TRIP_FLOWS as u64 {
-            detector
-                .process_event(&connect_to("100.64.0.9", 4444, 9, i))
-                .expect("a trip");
+    fn the_trips_own_connection_draws_no_chain_verdict_in_any_order() {
+        use crate::net::flow_tracker::{FlowTracker, TcpCloseInfo, TcpConnectInfo};
+        use nn_model::telemetry::{FimEvent, FimOp, FlowPhase};
+
+        const PID: u32 = 9825;
+        const T0: u64 = 3_600_000_000_000;
+        const SK: u64 = 0xffff_8880_1234_5678;
+        let localhost: IpAddr = "127.0.0.1".parse().unwrap();
+        let conn = TcpConnectInfo {
+            start_ns: T0,
+            sk_ptr: SK,
+            family: 2,
+            src_addr: "0.0.0.0".parse().unwrap(),
+            src_port: 0,
+            dst_addr: localhost,
+            dst_port: 41147,
+            proto: 6,
+            pid: PID,
+            uid: 0,
+            comm: "bash".into(),
+            exe: Some("/usr/bin/bash".into()),
+            proc_start_ns: 0,
+        };
+        let close = TcpCloseInfo {
+            end_ns: T0 + 40_000,
+            corr_id: FlowTracker::corr_id(T0, SK),
+            src_addr: localhost,
+            src_port: 52_000,
+            bytes_sent: 0,
+            bytes_recv: 0,
+            close_reason: 0,
+            family: 2,
+            dst_addr: localhost,
+            dst_port: 0,
+            pid: PID,
+            uid: 0,
+            comm: "bash".into(),
+        };
+        let late_read = Event::Fim(FimEvent {
+            timestamp_ns: T0 - 1_000_000_000,
+            path: "/root/.password-store/bank.gpg".into(),
+            op: FimOp::Opened,
+            new_sha256: None,
+            baseline_sha256: None,
+            new_size: None,
+            baseline_size: None,
+            modifier_exe: Some("/usr/bin/bash".into()),
+            modifier_pid: PID,
+            modifier_uid: 0,
+            modifier_comm: "bash".into(),
+            dest_path: None,
+            child_truncated: false,
+            wide_coverage: false,
+            owner_uid: None,
+            reader_dac_capable: false,
+            capability: None,
+            attrs: None,
+            file_key: None,
+            is_dir: false,
+            moved_in: false,
+        });
+        let late_exec = Event::ProcessSpawn {
+            pid: PID,
+            ppid: 1,
+            uid: 0,
+            gid: 0,
+            comm: "bash".into(),
+            filename: "/tmp/.x/bash".into(),
+            timestamp_ns: T0 - 2_000_000_000,
+            argv: vec!["/tmp/.x/bash".into()],
+            parent_comm: "systemd".into(),
+            parent_start_ns: 0,
+            start_ns: T0 - 3_000_000_000,
+            parent_is_kthread: false,
+            exe: nn_model::ExeIdentity {
+                path: "/tmp/.x/bash".into(),
+                ..Default::default()
+            },
+            argv_truncated: false,
+            filename_truncated: false,
+            stdio: Default::default(),
+        };
+        let later_egress = Event::NetFlow(nn_model::telemetry::NetFlowEvent {
+            start_ns: T0 + 2_000_000_000,
+            end_ns: T0 + 3_000_000_000,
+            family: 2,
+            src_addr: "10.0.2.15".parse().unwrap(),
+            src_port: 52_100,
+            dst_addr: "203.0.113.7".parse().unwrap(),
+            dst_port: 443,
+            proto: 6,
+            pid: PID,
+            uid: 0,
+            comm: "bash".into(),
+            exe: Some("/usr/bin/bash".into()),
+            proc_start_ns: 0,
+            bytes_sent: 4096,
+            bytes_recv: 512,
+            resolved_hostname: None,
+            tls_fingerprint: None,
+            flow_id: String::new(),
+            close_reason: 0,
+            phase: FlowPhase::Closed,
+            observed_ns: 0,
+        });
+        let trip = connect_to("127.0.0.1", 41147, PID, T0);
+
+        // (tracker hears the close first?, bus order of C(onnect), O(pen
+        // row), X (the close)), the CI's first.
+        for (close_first, bus) in [
+            (true, "CX"),
+            (true, "XC"),
+            (false, "COX"),
+            (false, "CXO"),
+            (false, "XCO"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let (detector, registry) = build_detector(&dir);
+            deploy_network_canary(&registry, &detector, "127.0.0.1", 41147);
+            let engine = crate::decision::RuleEngine::with_default_rules();
+            let mut tracker = FlowTracker::default();
+            let (open, closed) = if close_first {
+                let x = tracker.on_tcp_close(&close).expect("synthesised");
+                assert!(tracker.on_tcp_connect(&conn).is_none(), "ignored");
+                (None, x)
+            } else {
+                let o = tracker.on_tcp_connect(&conn).expect("connect-time row");
+                (Some(o), tracker.on_tcp_close(&close).expect("resolved"))
+            };
+            assert_eq!(
+                (closed.pid, closed.start_ns),
+                (PID, T0),
+                "the close names the connection as its connect"
+            );
+            let items: Vec<Event> = bus
+                .chars()
+                .map(|c| match c {
+                    'C' => trip.clone(),
+                    'O' => Event::NetFlow(open.clone().expect("an open row")),
+                    _ => Event::NetFlow(closed.clone()),
+                })
+                .chain([late_read.clone(), late_exec.clone(), later_egress.clone()])
+                .collect();
+            let answers = agent_path(&detector, &engine, &items);
+            let case = format!("close first: {close_first}, bus: {bus}");
+            let n = bus.len();
+            for (c, rules) in bus.chars().zip(&answers) {
+                match c {
+                    'C' => assert_eq!(rules, &["NN-L-CANARY-003_NetworkConnect"], "{case}"),
+                    _ => assert!(
+                        !rules.iter().any(|r| r.starts_with("NN-L-CHAIN-")),
+                        "{case}: the trip's own connection drew {rules:?}"
+                    ),
+                }
+            }
+            for late in [n, n + 1] {
+                assert!(
+                    !answers[late].iter().any(|r| r.starts_with("NN-L-CHAIN-")),
+                    "{case}: a late precursor completed a chain with the trip's connection: {:?}",
+                    answers[late]
+                );
+            }
+            assert!(
+                answers[n + 1].contains(&"R001_ExecFromTmp"),
+                "{case}: the late exec's own rule: {:?}",
+                answers[n + 1]
+            );
+            assert!(
+                answers[n + 2].contains(&"NN-L-CHAIN-003_CanaryThenEgress"),
+                "{case}: a later flow is an egress after the trip: {:?}",
+                answers[n + 2]
+            );
         }
-        assert_eq!(detector.trip_flows.lock().len(), PENDING_TRIP_FLOWS);
-        assert!(!detector.owns_trip_flow(&flow_close(9, 0, 6)));
-        assert!(detector.owns_trip_flow(&flow_close(9, PENDING_TRIP_FLOWS as u64, 6)));
     }
 
     /// A network canary recorded with an address that is not one (deployed

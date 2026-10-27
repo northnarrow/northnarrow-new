@@ -106,7 +106,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use nn_model::telemetry::FlowPhase;
-use nn_model::{Event, ResponseAction, Severity, Verdict};
+use nn_model::{CanaryAccessKind, Event, ResponseAction, Severity, Verdict};
 use parking_lot::Mutex;
 
 use crate::decision::attack::{AttackRef, Tactic};
@@ -533,6 +533,13 @@ impl Rule for NnLChain002TmpExecThenEgress {
 /// (Exfiltration Over C2 Channel) — the process that touched a
 /// decoy is now talking to the network. Critical + KillProcessTree →
 /// COMBAT.
+///
+/// The connection a network canary trip is (NN-L-CANARY-003, a connect to
+/// the decoy destination) is not an egress after it: the engine's flow
+/// ledger owns every row of it from the trip on, in any order the rows
+/// arrive (lab PR 163, lab PR 246), and the trip drops a note of it taken
+/// earlier ([`CorrelationStore::drop_trip_egress`]). Any other flow of the
+/// process completes this chain.
 pub struct NnLChain003CanaryThenEgress {
     buf: Arc<Mutex<CorrelationStore>>,
 }
@@ -561,15 +568,21 @@ impl Rule for NnLChain003CanaryThenEgress {
         match event {
             // Precursor: any canary trip, keyed on the accessor PID.
             Event::CanaryTripped {
+                access_kind,
                 accessor_pid,
                 timestamp_ns,
                 ..
             } => {
-                self.buf.lock().record_for_pid(
-                    *accessor_pid,
-                    PrecursorKind::CanaryTrip,
-                    *timestamp_ns,
-                );
+                let mut store = self.buf.lock();
+                store.record_for_pid(*accessor_pid, PrecursorKind::CanaryTrip, *timestamp_ns);
+                // Lab PR 246: a network trip is a connect; that connection is
+                // the trip's, not an egress after it (the engine's flow
+                // ledger keeps every rule off its rows from now on). A row
+                // of it judged before the trip leaves no egress for a late
+                // precursor to complete a chain with.
+                if *access_kind == CanaryAccessKind::NetworkConnect {
+                    store.drop_trip_egress(*accessor_pid, *timestamp_ns);
+                }
                 None
             }
             // Trigger: same-PID egress after the trip. External audit

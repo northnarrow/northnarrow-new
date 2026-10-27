@@ -488,6 +488,18 @@ instead (`agent/src/canary/network.rs`):
   (same pid, the connect's timestamp) is recorded in the netflow log and
   not judged again: NN-L-CHAIN-003 ("a canary trip, then a flow of the
   same process") answered the one access a second time.
+  Lab PR 246: every row of the connection — its connect-time row, its
+  snapshots, its close, resolved against the connect or synthesised by
+  the tracker — carries that key (a synthesised close starts at the
+  connect, the kernel correlator's time; it started at the close, and in
+  the KVM run of 27/10/2026 drew NN-L-CHAIN-003). The trip claims the
+  connection in the engine's flow ledger (`RuleEngine::owned_by_trip`,
+  kept past the close, 4,096 trips), and the net drain holds a close
+  until the connect pump has put its connect on the bus (at most 500 ms
+  from the connect), so the trip is decided first. A close judged before
+  its trip anyway (its connect lost, or later than that) is judged as
+  any flow, before any precursor, and the trip drops the egress note it
+  left: no chain completed late uses the trip's own connection.
 - **Deploy check.** Refused when the address is not an IP address, the
   port is 0, or a TCP listener on this host takes the canary's
   connections (each client of that service would trip it).

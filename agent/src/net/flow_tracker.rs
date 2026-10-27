@@ -62,6 +62,20 @@
 //!   is judged while the session is open ([`FlowPhase::Snapshot`]). The
 //!   snapshot carries no byte counters: the kernel's are read at close.
 //!
+//! ## The connect before its close (lab PR 246)
+//!
+//! The connect and the close come on two rings, read by two tasks (the
+//! connect pump, the net drain), so a close can reach the tracker, and the
+//! bus, before its connect: a refused loopback connect closes within
+//! microseconds. The close was then judged before the connect it ends —
+//! the close of a network canary trip's own connection as an egress after
+//! the trip (NN-L-CHAIN-003). The connect pump now announces each connect
+//! once its events are on the bus ([`FlowTracker::announce`]), and the
+//! drain holds a close until its connect is announced, a bounded time
+//! ([`FlowTracker::close_may_proceed`], `net::drain::CONNECT_WAIT`). A
+//! close whose connect is lost or later than that is synthesised as
+//! before, under its connect's time ([`FlowTracker::corr_start_ns`]).
+//!
 //! ## Bounded memory
 //!
 //! Per §6.1: a `PendingFlow` open > 24 h gets emitted as a
@@ -86,9 +100,11 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use nn_model::telemetry::{FlowPhase, NetFlowEvent, TlsFingerprint};
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 use tracing::warn;
 
 use crate::decision::bounded::{LazyLru, LossCounter};
@@ -261,6 +277,9 @@ pub struct UdpSendInfo {
 
 #[derive(Debug, Clone)]
 struct PendingFlow {
+    /// Lab PR 246: the connect pump has put this connect's events on the
+    /// bus ([`FlowTracker::announce`]); its close may follow them.
+    announced: bool,
     /// Lab PR 224: when [`FlowTracker::due_snapshots`] last handed this
     /// flow out (0 never).
     last_snapshot_ns: u64,
@@ -305,6 +324,12 @@ pub struct FlowTracker {
     /// one of these must not open a pending entry that never closes.
     recent_synth: VecDeque<CorrId>,
     evicted: LossCounter,
+    /// Lab PR 246: woken when the connect pump announces connects
+    /// ([`Self::announce`]); the drain's [`crate::net::drain`] close
+    /// waits on it.
+    announced: Arc<Notify>,
+    /// Lab PR 246: the connect pump runs, so connects get announced.
+    connect_pump: bool,
 }
 
 impl std::fmt::Debug for FlowTracker {
@@ -333,7 +358,49 @@ impl FlowTracker {
             recent_synth: VecDeque::new(),
             capacity,
             evicted: LossCounter::new(&PENDING_EVICTIONS),
+            announced: Arc::new(Notify::new()),
+            connect_pump: false,
         }
+    }
+
+    /// Lab PR 246: what wakes a close waiting for its connect
+    /// ([`Self::close_may_proceed`]).
+    pub fn announcements(&self) -> Arc<Notify> {
+        Arc::clone(&self.announced)
+    }
+
+    /// Lab PR 246: the connect pump starts (`true`) or stops. While it
+    /// does not run, nothing announces a connect and no close waits.
+    pub fn set_connect_pump(&mut self, running: bool) {
+        self.connect_pump = running;
+        if !running {
+            self.announced.notify_waiters();
+        }
+    }
+
+    /// Lab PR 246: the connect pump has sent the events of the connect
+    /// `corr` on the bus (its `Event::TcpConnect`, then its connect-time
+    /// row). The waiters are woken.
+    pub fn announce(&mut self, corr: &CorrId) {
+        if let Some(p) = self.pending.get_mut(corr) {
+            p.announced = true;
+        }
+        self.announced.notify_waiters();
+    }
+
+    /// Lab PR 246: whether the close of the flow `corr` may be resolved
+    /// and sent now — its connect is on the bus already (announced), or
+    /// no connect will come: a kernel lookup miss (zero), a row already
+    /// synthesised, or no connect pump. Otherwise the close waits, a
+    /// bounded time ([`crate::net::drain::CONNECT_WAIT`]): the connect and
+    /// the close come on two rings, read by two tasks, and a close sent
+    /// first was judged before the connect it ends — a network canary
+    /// trip's own connection before the trip that owns it.
+    pub fn close_may_proceed(&self, corr: &CorrId) -> bool {
+        !self.connect_pump
+            || *corr == [0u8; 16]
+            || self.pending.get(corr).is_some_and(|p| p.announced)
+            || self.recent_synth.contains(corr)
     }
 
     /// Pending connects this tracker evicted at capacity.
@@ -358,6 +425,16 @@ impl FlowTracker {
         out[..8].copy_from_slice(&start_ns.to_le_bytes());
         out[8..].copy_from_slice(&sk_ptr.to_le_bytes());
         out
+    }
+
+    /// The connect's kernel time a correlator carries (bytes 0..8,
+    /// little-endian, [`Self::corr_id`]): the start of the flow it names.
+    /// External audit EBPF-019: the half that may be logged (bytes 8..16
+    /// are the socket's kernel address).
+    pub fn corr_start_ns(corr: &CorrId) -> u64 {
+        let mut ts = [0u8; 8];
+        ts.copy_from_slice(&corr[..8]);
+        u64::from_le_bytes(ts)
     }
 
     /// Register a TCP connect observation. The pending entry
@@ -385,6 +462,7 @@ impl FlowTracker {
         self.pending.insert(
             key,
             PendingFlow {
+                announced: false,
                 last_snapshot_ns: 0,
                 start_ns: info.start_ns,
                 family: info.family,
@@ -562,14 +640,26 @@ impl FlowTracker {
 
     /// Close arrived with a kernel-side flow id but no pending connect:
     /// the connect event has not reached the tracker yet (short-lived
-    /// flow, loopback connect+close in well under the pipeline latency).
+    /// flow, loopback connect+close in well under the pipeline latency;
+    /// since lab PR 246 the drain waits for it first, so this is the
+    /// connect lost or late past [`crate::net::drain::CONNECT_WAIT`]).
     /// Build the row from what the close hook carries — the full
-    /// 5-tuple, owner and byte counters — with `start_ns = end_ns`
-    /// (duration unknown) and no exe/hostname enrichment (the drain
-    /// names the image, external audit NET-012), and remember the
-    /// corr_id so the late connect is ignored. Without this every
-    /// connect-and-close-at-once flow (reverse-shell probes, scanners,
-    /// the CHAIN-007 egress leg) vanished from netflow.jsonl.
+    /// 5-tuple, owner and byte counters — with no exe/hostname
+    /// enrichment (the drain names the image, external audit NET-012),
+    /// and remember the corr_id so the late connect is ignored. Without
+    /// this every connect-and-close-at-once flow (reverse-shell probes,
+    /// scanners, the CHAIN-007 egress leg) vanished from netflow.jsonl.
+    ///
+    /// Lab PR 246: the row starts at its connect, whose kernel time the
+    /// correlator carries ([`Self::corr_start_ns`]), not at its close
+    /// (`start_ns = end_ns` before): every row of a flow names it by
+    /// (pid, connect time) — the flow ledger, the egress notes and a
+    /// network canary trip that owns the connection do — whichever ring
+    /// the tracker heard first. The close of a canary trip's own
+    /// connection, synthesised, was judged as an egress after the trip
+    /// (NN-L-CHAIN-003 on the trip's own connection, the KVM failure of
+    /// 27/10/2026). The destination stays the close's: a refused connect
+    /// shows port 0 there (the kernel cleared it).
     fn synthesise_from_close(&mut self, info: &TcpCloseInfo) -> Option<NetFlowEvent> {
         if info.dst_port == 0 && info.dst_addr.is_unspecified() {
             return None;
@@ -578,8 +668,12 @@ impl FlowTracker {
             self.recent_synth.pop_front();
         }
         self.recent_synth.push_back(info.corr_id);
+        let start_ns = match Self::corr_start_ns(&info.corr_id) {
+            0 => info.end_ns,
+            connect => connect.min(info.end_ns),
+        };
         let flow_id = canonical_flow_id(
-            info.end_ns,
+            start_ns,
             info.family,
             info.src_addr,
             info.src_port,
@@ -589,7 +683,7 @@ impl FlowTracker {
             info.pid,
         );
         Some(NetFlowEvent {
-            start_ns: info.end_ns,
+            start_ns,
             end_ns: info.end_ns,
             family: info.family,
             src_addr: info.src_addr,
@@ -1249,8 +1343,10 @@ mod tests {
     }
 
     /// Short-lived flow: the close reaches the tracker before its connect.
-    /// With a real destination on the close, the row is synthesised
-    /// (start == end, no exe) and the late connect is ignored.
+    /// With a real destination on the close, the row is synthesised (no
+    /// exe) and the late connect is ignored. Lab PR 246: the row starts at
+    /// the connect, whose time the correlator carries — the same flow key
+    /// (pid, connect time) as a row resolved against its connect.
     #[test]
     fn close_before_connect_synthesises_row_and_ignores_late_connect() {
         let mut t = FlowTracker::default();
@@ -1263,7 +1359,24 @@ mod tests {
         close.comm = "nnseq".into();
         let evt = t.on_tcp_close(&close).expect("synthesised row");
         assert_eq!(evt.dst_port, 4444);
-        assert_eq!(evt.start_ns, evt.end_ns);
+        assert_eq!(
+            (evt.start_ns, evt.end_ns),
+            (conn.start_ns, 1_000_500),
+            "the connect's time, from the correlator"
+        );
+        assert_eq!(
+            evt.flow_id,
+            canonical_flow_id(
+                conn.start_ns,
+                2,
+                close.src_addr,
+                close.src_port,
+                close.dst_addr,
+                4444,
+                6,
+                42
+            )
+        );
         assert_eq!(evt.pid, 42);
         assert!(evt.exe.is_none());
         assert_eq!(evt.proc_start_ns, 0, "start unknown");
@@ -1279,6 +1392,70 @@ mod tests {
         assert!(t
             .on_tcp_close(&close_fixture(2, [0x55u8; 16], 0, 0, 0))
             .is_none());
+    }
+
+    /// Lab PR 246, the KVM failure of 27/10/2026: a shell's connect to a
+    /// loopback port nothing listens on is refused, and the shell closes
+    /// the socket at once; the kernel cleared the destination port before
+    /// the close (`tcp_disconnect`), and the close reached the tracker
+    /// first. Its row — `tcp 127.0.0.1:0 closed` in the record — names
+    /// the flow as its connect does, (pid, connect time): the key the
+    /// canary trip of that connect owns. It used to start at the close.
+    #[test]
+    fn a_refused_connect_closed_first_keeps_its_connects_flow_key() {
+        let mut t = FlowTracker::default();
+        let t0 = 3_000_000_000_000;
+        let conn = connect_fixture(t0, 0xFFFF_8880_1234_5678, 9825, v4(127, 0, 0, 1), 41147);
+        let corr = FlowTracker::corr_id(conn.start_ns, conn.sk_ptr);
+        let mut close = close_fixture(t0 + 40_000, corr, 0, 0, 0);
+        close.dst_addr = v4(127, 0, 0, 1);
+        close.dst_port = 0;
+        close.pid = 9825;
+        close.comm = "bash".into();
+        let row = t.on_tcp_close(&close).expect("synthesised row");
+        assert_eq!((row.pid, row.start_ns), (conn.pid, conn.start_ns));
+        assert_eq!((row.dst_addr, row.dst_port), (v4(127, 0, 0, 1), 0));
+        assert_eq!(row.phase, FlowPhase::Closed);
+        assert!(
+            t.on_tcp_connect(&conn).is_none(),
+            "no connect-time row after the close"
+        );
+        // A correlator of time 0 (never written so) keeps the close's time.
+        let mut odd = close.clone();
+        odd.corr_id = FlowTracker::corr_id(0, 0xAB);
+        assert_eq!(t.on_tcp_close(&odd).expect("row").start_ns, t0 + 40_000);
+    }
+
+    /// Lab PR 246: a close may be resolved once its connect is on the bus
+    /// (announced by the connect pump), or when no connect will come; it
+    /// waits otherwise — and never while no connect pump runs.
+    #[test]
+    fn a_close_waits_until_its_connect_is_announced() {
+        let mut t = FlowTracker::default();
+        let conn = connect_fixture(7 * S, 0xC1, 501, v4(127, 0, 0, 1), 4444);
+        let corr = FlowTracker::corr_id(conn.start_ns, conn.sk_ptr);
+        assert!(t.close_may_proceed(&corr), "no connect pump: no wait");
+        t.set_connect_pump(true);
+        assert!(!t.close_may_proceed(&corr), "the connect is not read yet");
+        assert!(t.close_may_proceed(&[0u8; 16]), "a kernel lookup miss");
+        t.on_tcp_connect(&conn).expect("connect-time row");
+        assert!(
+            !t.close_may_proceed(&corr),
+            "fed to the tracker, not on the bus yet"
+        );
+        t.announce(&corr);
+        assert!(t.close_may_proceed(&corr));
+        // A row already synthesised: its connect is ignored, nothing waits.
+        let other = FlowTracker::corr_id(8 * S, 0xC2);
+        let mut close = close_fixture(8 * S + 1, other, 0, 0, 0);
+        close.dst_addr = v4(127, 0, 0, 1);
+        assert!(t.on_tcp_close(&close).is_some());
+        assert!(t.close_may_proceed(&other));
+        // The pump stops: nothing waits any more.
+        let third = FlowTracker::corr_id(9 * S, 0xC3);
+        assert!(!t.close_may_proceed(&third));
+        t.set_connect_pump(false);
+        assert!(t.close_may_proceed(&third));
     }
 
     const S: u64 = 1_000_000_000;

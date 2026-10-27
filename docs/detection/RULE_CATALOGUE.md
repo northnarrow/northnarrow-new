@@ -1777,13 +1777,13 @@ Canary trip followed by network egress — category `chain_exfiltration`.
 | Sensor — data | network (TCP connect, DNS, flows, listeners); canary trip — DC0078 Network Traffic Flow, DC0055 File Access, DC0032 Process Creation, DC0082 Network Connection Creation |
 | Validation | unit (V2 Critical sub-gate) |
 
-**Observes.** An outbound flow from a process that tripped a deception canary (any NN-L-CANARY type) within 300 s: Critical kill; within 30 minutes, one High record (NETR-014).
+**Observes.** An outbound flow from a process that tripped a deception canary (any NN-L-CANARY type) within 300 s: Critical kill; within 30 minutes, one High record (NETR-014). The connection a network canary trip is (its connect, answered by NN-L-CANARY-003) is not an egress after it: no row of it completes the chain, in whatever order its connect and close arrive (lab PR 246).
 
 **Known false positives.** Every trip is a precursor, including one the canary rule only records: a reader of whole trees (a backup client) that reads a canary and then uploads within 300 s draws the Critical verdict.
 
 **How to test.** Deploy a File canary, then from one process read it and connect out (`python3 -c` opening the decoy, then a socket); run the agent in detect-only mode, since NN-L-CANARY-001 kills the reader first.
 
-**Tests.** `agent/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress`, `agent/src/decision/rules/chain.rs::chain003_records_an_aged_trip_without_killing`
+**Tests.** `agent/src/decision/rules/chain.rs::chain003_fires_on_canary_then_egress`, `agent/src/decision/rules/chain.rs::chain003_records_an_aged_trip_without_killing`, `agent/src/canary/detector.rs::the_trips_own_connection_draws_no_chain_verdict_in_any_order`
 
 **ATT&CK note.** The precursor's technique depends on the canary type (see NN-L-CANARY-001..004); the chain itself is evidence of exfiltration.
 
