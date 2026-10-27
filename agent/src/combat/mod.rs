@@ -80,6 +80,14 @@ pub use nn_core::combat::offender;
 pub mod protected;
 pub mod reconcile;
 
+/// The evidence's tests, which sign with the agent's key (R08c, lab PR
+/// 252).
+#[cfg(test)]
+mod evidence_tests;
+/// The ladder's tests that need the agent's other modules (R08c, lab PR
+/// 252).
+#[cfg(test)]
+mod host_tests;
 #[cfg(test)]
 mod tests;
 
