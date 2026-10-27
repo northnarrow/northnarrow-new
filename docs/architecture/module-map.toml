@@ -252,6 +252,10 @@ planned = false
 # `net::blind_spots`; R08b, lab PR 251, moved it: `[shims.agent]`)
 "net" = "nn-core"
 "net::blind_spots" = "nn-linux"
+# post-plan (lab PR 251, R08b): the DNS pump's ingest (lab PR 229: tokio's
+# `Notify`, `CLOCK_MONOTONIC`), cut from `net::dns_cache` when the cache's
+# state moved to nn-core; the agent's cache carries it
+"net::dns_ingest" = "nn-linux"
 "net::drain" = "nn-linux"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
@@ -332,6 +336,10 @@ planned = false
 # R08b (lab PR 251): the operator's blocklists, with the rules; their
 # loaders take the host that reads a `.v1` (R07's `ContentHost`)
 "net::blocklist" = "nn-core"
+# R08b (lab PR 251): the DNS cache's state, with the rules; the agent's
+# `net::dns_cache` is an inline module of `net/mod.rs` that gives it the
+# pump's ingest (`net::dns_ingest`) and keeps the reply parsers' path (R06)
+"net::dns_cache" = "nn-core"
 # post-plan (lab PR 224): the host's resolv.conf, mapped to nn-linux by
 # lab PR 239; R08b (lab PR 251): the set the network and chain rules
 # consult, read with `std::fs` (portable, as `combat_allow`), moved to
@@ -404,11 +412,13 @@ planned = false
 # where they called libc, `std::fs` on `/proc`, `runtime`, `trusted_bin`,
 # `response` and the window (→ 35); the per-rule policy's `/proc` facts
 # stay with the Linux host and `rule_policy.rs` re-exports them from it
-# (→ 36).
+# (→ 36); the blocklists moved (36); the DNS cache's state moved and
+# `net/mod.rs`, which gives the agent's cache the pump's ingest, names it
+# (→ 37).
 
 [ratchet]
 nn-admin = 8
-nn-core = 36
+nn-core = 37
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

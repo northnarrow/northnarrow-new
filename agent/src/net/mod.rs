@@ -20,7 +20,26 @@ pub mod blind_spots;
 /// blocklists are nn-core's, with the rules that read them; their loaders
 /// take the host that reads a `.v1` (the agent's `LinuxHost`).
 pub use nn_core::net::blocklist;
-pub mod dns_cache;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the DNS
+/// cache's state is nn-core's, with the rules that read it; the agent's
+/// cache carries the DNS pump's ingest ([`dns_ingest`], lab PR 229), and the
+/// reply parsers keep the path R06 (lab PR 242) left them.
+pub mod dns_cache {
+    pub use nn_core::net::dns_cache::*;
+
+    pub use crate::net::dns_ingest::{monotonic_ns, DnsIngest, IngestClaim, INGEST_WAIT};
+
+    /// [`nn_core::net::dns_cache::DnsCache`] with the DNS pump's ingest.
+    pub type DnsCache = nn_core::net::dns_cache::DnsCache<DnsIngest>;
+
+    // ── DNS reply parser (nn-parse) ─────────────────────────────────
+    //
+    // R06 of the Wave 4 restructure (lab PR 242): the reply parser and its
+    // tests moved to nn-parse's `dns_records`. Re-exported here for the
+    // paths the fuzz targets and `fuzz_api` name (until R17).
+    pub use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
+}
+pub mod dns_ingest;
 pub mod drain;
 pub mod flow_tracker;
 pub mod limiter;

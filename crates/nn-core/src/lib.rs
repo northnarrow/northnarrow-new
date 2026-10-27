@@ -80,11 +80,15 @@ pub mod canary {
 use nn_model::path_text;
 
 /// The network state the rules read (R08b, lab PR 251): the operator's
-/// blocklists, the host's configured DNS resolvers (were the agent's
-/// `net::blocklist` and `net::resolvers`).
+/// blocklists, the DNS cache, the host's configured DNS resolvers (were the
+/// agent's `net::blocklist`, the state of its `net::dns_cache` and its
+/// `net::resolvers`).
 pub mod net {
     // The operator's NetFlow and JA3 blocklists (Tappa 10, N6).
     pub mod blocklist;
+    // The PID-keyed DNS query cache: a connect's name, a forwarded query's
+    // originator (Tappa 10, N4).
+    pub mod dns_cache;
     // The `nameserver`s of the host's `resolv.conf`, re-read when they
     // change (lab PR 224).
     pub mod resolvers;
