@@ -35,5 +35,9 @@ pub mod chainlog;
 /// The time the writers stamp on their rows (lab PR 249: the host's clock
 /// by default, a replay's or a test's when given one).
 pub mod clock;
+/// The parts of a detection record the rule engine names: its sensor, its
+/// ATT&CK tags, its principal (R08b, lab PR 251; cut from the agent's
+/// `detection_payload`, which keeps the records).
+pub mod detection_payload;
 /// The full verifiers' bounded line reader (was the agent's `verify_lines`).
 pub mod verify_lines;

@@ -203,7 +203,10 @@ planned = false
 "decision" = "nn-core"
 # post-plan (lab PR 241, R04a): the detection log's records and their
 # parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
-# file propri"; the payloads are nn-evidence's)
+# file propri"; the payloads are nn-evidence's). R08b (lab PR 251): the
+# parts the engine names (`Sensor`, `MitreAttack`, `Principal`) are cut to
+# nn-evidence's `detection_payload` and re-exported here; the records stay
+# while their constructors take the engine's decisions (`detection_store`)
 "detection_payload" = "nn-evidence"
 # post-plan (lab PR 250, R08a): the detection budget's reporter task (tokio,
 # the agent's audit log and detection sink), from `detection_budget`: the
