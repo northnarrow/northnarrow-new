@@ -70,6 +70,11 @@ nn-parse = { workspace = true }
 # chain_tail, verify_lines, the canary chain line reader), named through
 # the shims of the same modules here.
 nn-evidence = { workspace = true }
+# R07 (lab PR 247): the content lists (the overlay loader, the FIM paths,
+# the canary templates, the COMBAT carve-out), named through the shims of
+# the same modules here; the agent's host implements their
+# `content_host::ContentHost`.
+nn-core = { workspace = true }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
 # crate directly without pulling the rest of `agent` —

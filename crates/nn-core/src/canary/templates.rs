@@ -38,8 +38,8 @@
 //!
 //! Every value is derived from a seed: `SHA-256(seed || ":" || field)`,
 //! truncated and mapped to the family's alphabet. The deploy (and a
-//! refresh) draws a fresh 32-byte seed from the OS RNG
-//! ([`new_content_seed`]) and records it in the registry row with the
+//! refresh) draws a fresh 32-byte seed from the OS RNG (the agent's
+//! `new_content_seed`) and records it in the registry row with the
 //! SHA-256 of the bytes written, so two deploys never render the same
 //! content and a decoy can be re-rendered from its row. The seed used to
 //! be `"<operator key fingerprint>:<path>"`: the fingerprint appeared in
@@ -80,6 +80,8 @@ use std::path::PathBuf;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use sha2::{Digest, Sha256};
+
+use crate::content_host::ContentHost;
 
 /// Default deploy location of the operator-overrideable
 /// template directory. K7 `install.sh` drops the repo's
@@ -228,15 +230,6 @@ pub const SUPERSEDED_TEMPLATE_SHA256: &[(&str, &str)] = &[
     ),
 ];
 
-/// A fresh content seed (external audit DEC-008): 32 bytes from the OS
-/// RNG, hex. One per deploy and per refresh, recorded in the registry row.
-pub fn new_content_seed() -> String {
-    use rand::Rng;
-    let mut seed = [0u8; 32];
-    crate::os_rng::OsRng.fill_bytes(&mut seed);
-    hex::encode(seed)
-}
-
 /// The body of a File canary (external audit DEC-007): bytes derived from
 /// `seed`, 512 to 4095 of them — no marker, no fingerprint, no rule id,
 /// and no size or content shared by every decoy. It used to be three
@@ -254,7 +247,7 @@ pub fn render_file_body(seed: &str) -> Vec<u8> {
     out
 }
 
-/// Pure renderer. Given a content `seed` (see [`new_content_seed`]),
+/// Pure renderer. Given a content `seed` (the agent's `new_content_seed`),
 /// produce the canary's file content for `family`. Output is
 /// deterministic per seed — the same seed always renders the same
 /// bytes, so a row's recorded seed re-renders its decoy.
@@ -263,12 +256,12 @@ pub fn render_file_body(seed: &str) -> Vec<u8> {
 /// directory for tests; production callers pass
 /// `Some(Path::new(DEFAULT_TEMPLATE_DIR))`. `None` skips the
 /// override lookup entirely (built-in templates only).
-pub fn render(
+pub fn render<H: ContentHost>(
     family: CredFamily,
     seed: &str,
     template_dir: Option<&std::path::Path>,
 ) -> Result<String, RenderError> {
-    let template = load_template(family, template_dir)?;
+    let template = load_template::<H>(family, template_dir)?;
     let placeholders = build_placeholders(family, seed);
     let out = substitute(&template, &placeholders)?;
     // External audit DEC-017: a JSON family's decoy is a JSON document.
@@ -286,13 +279,13 @@ pub fn render(
 /// Load the template body for `family`. Tries operator
 /// override under `template_dir` first; falls back to the
 /// `include_str!` built-in.
-fn load_template(
+fn load_template<H: ContentHost>(
     family: CredFamily,
     template_dir: Option<&std::path::Path>,
 ) -> Result<String, RenderError> {
     if let Some(dir) = template_dir {
         let candidate = dir.join(format!("{}.tmpl", family.as_wire()));
-        match read_template(&candidate) {
+        match read_template::<H>(&candidate) {
             Ok(body) if is_superseded(family, &body) => {
                 // External audit DEC-007: an earlier release's template left
                 // on disk (an upgrade that did not run install.sh) named the
@@ -328,21 +321,18 @@ fn load_template(
 /// file created as a link to `/dev/zero`, was read without limit at the
 /// next deploy. A template present but refused is
 /// [`RenderError::TemplateRead`] (the deploy is refused and the file
-/// named), never a silent fall-back to the built-in one.
-fn read_template(path: &std::path::Path) -> std::io::Result<String> {
+/// named), never a silent fall-back to the built-in one. The open is the
+/// host's ([`ContentHost`], R07: the agent's is `LinuxHost`,
+/// `O_NOFOLLOW | O_NONBLOCK`).
+fn read_template<H: ContentHost>(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                std::io::Error::other("a symbolic link (not read through one)")
-            } else {
-                e
-            }
-        })?;
+    let f = H::open_read_nofollow(path).map_err(|e| {
+        if H::is_symlink_refusal(&e) {
+            std::io::Error::other("a symbolic link (not read through one)")
+        } else {
+            e
+        }
+    })?;
     if !f.metadata()?.file_type().is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
@@ -659,10 +649,20 @@ fn short_id(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_host::testing::PortableHost;
     use tempfile::TempDir;
 
+    /// The renderer on the portable host (R07, lab PR 247).
+    fn render(
+        family: CredFamily,
+        seed: &str,
+        template_dir: Option<&std::path::Path>,
+    ) -> Result<String, RenderError> {
+        super::render::<PortableHost>(family, seed, template_dir)
+    }
+
     /// Stable seed for deterministic-output assertions (a real one is
-    /// 64 hex chars from [`new_content_seed`]).
+    /// 64 hex chars from the agent's `new_content_seed`).
     const TEST_ID: &str = "9f3c8a01b2c3d4e5f6a7b8c9d0e1f2a3";
 
     const FAMILIES: [CredFamily; 5] = [
@@ -697,23 +697,6 @@ mod tests {
         }
     }
 
-    /// External audit DEC-007: the File canary body carries no marker and
-    /// no fingerprint, and neither its content nor its size is the same on
-    /// every decoy.
-    #[test]
-    fn file_canary_body_has_no_marker_or_fingerprint() {
-        let a = render_file_body(&new_content_seed());
-        let b = render_file_body(&new_content_seed());
-        for body in [&a, &b] {
-            assert!((512..4096).contains(&body.len()));
-            assert_no_marker("file body", &String::from_utf8_lossy(body));
-            assert!(!String::from_utf8_lossy(body).contains("deadbeef"));
-        }
-        assert_ne!(a, b, "two deploys, two bodies");
-        let seed = "5a".repeat(32);
-        assert_eq!(render_file_body(&seed), render_file_body(&seed));
-    }
-
     /// External audit DEC-008: the seed used to be `<operator fp>:<path>`
     /// and `short_id` its first 8 characters, so the fingerprint was
     /// printed into the azure, gcp and docker decoys.
@@ -732,20 +715,6 @@ mod tests {
             assert!(
                 !body.contains(fp) && !decoded.contains(fp),
                 "{family:?} carries the operator fingerprint"
-            );
-        }
-    }
-
-    /// External audit DEC-008: every deploy draws its own seed.
-    #[test]
-    fn content_seeds_are_fresh() {
-        let (a, b) = (new_content_seed(), new_content_seed());
-        assert_eq!(a.len(), 64);
-        assert_ne!(a, b);
-        for family in FAMILIES {
-            assert_ne!(
-                render(family, &a, None).unwrap(),
-                render(family, &b, None).unwrap()
             );
         }
     }
@@ -1047,52 +1016,6 @@ mod tests {
         // at the cap: read
         std::fs::write(&path, "#".repeat(MAX_TEMPLATE_BYTES as usize)).unwrap();
         assert!(render(CredFamily::Aws, TEST_ID, Some(dir.path())).is_ok());
-    }
-
-    /// External audit DEC-016 (lab PR 178): a link at a template's name
-    /// (`/dev/zero`, or a file elsewhere) is not read through, and refuses
-    /// the render instead of falling back to the built-in one.
-    #[test]
-    fn symlinked_template_is_refused() {
-        let dir = TempDir::new().unwrap();
-        let elsewhere = dir.path().join("elsewhere");
-        std::fs::write(&elsewhere, "aws_access_key_id = {{access_key_id}}\n").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, dir.path().join("aws.tmpl")).unwrap();
-        std::os::unix::fs::symlink("/dev/zero", dir.path().join("gcp.tmpl")).unwrap();
-        for family in [CredFamily::Aws, CredFamily::Gcp] {
-            match render(family, TEST_ID, Some(dir.path())) {
-                Err(RenderError::TemplateRead { source, .. }) => {
-                    assert!(source.to_string().contains("symbolic link"), "{source}")
-                }
-                other => panic!("expected TemplateRead, got {other:?}"),
-            }
-        }
-        // a directory at the name is refused too
-        std::fs::create_dir(dir.path().join("docker.tmpl")).unwrap();
-        assert!(matches!(
-            render(CredFamily::Docker, TEST_ID, Some(dir.path())),
-            Err(RenderError::TemplateRead { .. })
-        ));
-    }
-
-    /// External audit DEC-016 (lab PR 178): a FIFO at a template's name used
-    /// to block the deploy (and its admin connection) until a writer came.
-    #[test]
-    fn fifo_template_does_not_block() {
-        let dir = TempDir::new().unwrap();
-        let fifo = dir.path().join("aws.tmpl");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        // SAFETY: mkfifo on a NUL-terminated path in our temp dir.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let template_dir = dir.path().to_path_buf();
-        std::thread::spawn(move || {
-            let _ = tx.send(render(CredFamily::Aws, TEST_ID, Some(&template_dir)).is_err());
-        });
-        let refused = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the render returns instead of blocking on the FIFO");
-        assert!(refused, "a FIFO is not a template");
     }
 
     /// A template that is not UTF-8 is refused, as before.

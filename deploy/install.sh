@@ -2091,10 +2091,11 @@ fi
 # DEC-007: the templates of earlier releases named the product ("NorthNarrow
 # XDR ... DO NOT USE", northnarrow.io) in what lands in the decoy, and an
 # upgrade kept them; a copy byte-identical to one of those (its SHA-256
-# below, as SUPERSEDED_TEMPLATE_SHA256 in agent/src/canary/templates.rs) is
-# replaced, an edited one is kept and reported if it still names the
-# product. The directory and the templates are closed to other users (0750 /
-# 0640): they describe the decoys.
+# below, as SUPERSEDED_TEMPLATE_SHA256 in
+# crates/nn-core/src/canary/templates.rs) is replaced, an edited one is
+# kept and reported if it still names the product. The directory and the
+# templates are closed to other users (0750 / 0640): they describe the
+# decoys.
 declare -A CANARY_TEMPLATE_SUPERSEDED=(
     [aws.tmpl]="cd728e77335951708ad263d4e2d52f808cd9522d1a63546f6621a8e33b15af79"
     [azure.tmpl]="1f2676fce70db95d9f2aeaf2a2c2628dd7211cf75d8464329acb208b9350ae04"

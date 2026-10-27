@@ -821,6 +821,16 @@ version = "0.0.1"
 [[package]]
 name = "nn-core"
 version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64",
+ "hex",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "nn-evidence"
@@ -899,6 +909,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-core",
  "nn-evidence",
  "nn-model",
  "nn-parse",

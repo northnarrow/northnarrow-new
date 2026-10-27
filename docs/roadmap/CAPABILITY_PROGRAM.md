@@ -1405,3 +1405,84 @@ only in the table below, in the same PR as the evidence.
     which had a row of its own, is in the INVESTIGATE row with the
     shortened window, the two rows after it one place earlier in the chain.
   - Lab: On Ubuntu 24.04 (6.8.0-147, the lab guest ubuntu2404, QEMU for Windows with WHPX, 4 vCPU, 7 GiB), this PR's code (local commit 7c6c981, on `main` 9de1923) synced, built and installed (`nn-lab.sh sync`, `build`, `install`: the agent and the watchdog active). `nn-lab.sh test-ignored`: the five runs exit 0, 74 suites, 84 passed, 0 failed (the privileged suites' COMBATs forced by `debug force-posture` wrote 6 rows to the installed agent's audit log: `cause` `debug_force_posture`, no offender, `trigger` null, as a forced COMBAT's is). Then, the units put back (`install`), a real COMBAT driven with the benign lab simulator (`deploy/lab/cow/ransom-sim.py --tripwire --hold 60`, root, in a unit of its own, `nn-lab245-sim`, on a 12-file tree under `/srv/nn-cow-lab245`): its append-open of `/etc/northnarrow/admin.pub` refused by the anti-tamper hook (EPERM) — AntiTamperDenial, decisive, COMBAT locked — and its child the jump-ahead to NEUTRALIZE. The agent's signed rows (seq 3929–3931): INVESTIGATE `trigger` AntiTamperDenial, `offenders` [18385], `offender_details` [pid 18385, `exe` `/usr/bin/python3.12`, `cgroup` `/system.slice/nn-lab245-sim.service`, `start_ticks`, `seen_ns`, `via` `entry`], `cause` `posture_trigger` (Kernel, Decisive, locked, `workload /system.slice/nn-lab245-sim.service`, FsProtectDenial of 18385 at its kernel time); NEUTRALIZE the same trigger and cause, `offenders` [18385, 18391], the child `/usr/bin/true` `spread` from 18385 in `/northnarrow.slice/blocked.scope` (born after the soft block took) with its exec's `start_ns`; the `combat_outcome` row `trigger` AntiTamperDenial (both contained, the system binary not quarantined). `nn-admin audit verify`: 3,933 entries, chain intact; `audit read --json` byte-identical to the log, and verified; the signed unlock released COMBAT (ALERTED, both families read back clear). The same audit log holds 110 `combat_stage` rows written by earlier builds (2026-10-20 to 10-22 lab runs): every one `"trigger": null`, and 47 of 47 INVESTIGATE rows `"offenders": []`. The guest powered off. Host, on 7c6c981: `cargo xtask build-ebpf --release` (the eBPF crates untouched); the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,044 passed, 0 failed, 15 ignored (no `#[ignore]` test added); `cargo xtask attack-coverage --check`; `cargo xtask golden`; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass. The same gates on the first tree of the lot (2687147) found the module ratchet one above its ceiling (nn-core 41 > 40: the new `combat/offender.rs` named `response`); the `/proc` reader moved to the actuator and the module holds data only. Mutation checks (temporary): the hook handed an entry without cause or offender fails 8 tests (the ladder's posture COMBAT and detect-only, the posture's entry and heuristic, four golden checks); a later entry overwriting the cause, an addition not signed, the identity not read from `/proc` each fail the test written for it.
+- **Lab PR 247 — nn-core, part 1: the content lists leave the agent (Wave
+  4 Phase 2, R07 of the restructure plan; no level changes).**
+  - What was wrong: nn-core, the pure core of the layout (no OS call, built
+    for five other targets by `portable-core`), was empty; R07 moves the
+    content into it — the lists, their loaders and overlays, the canary
+    templates, the COMBAT carve-out (plan §2.4). That content made Linux
+    calls of its own: `read_overlay` (an operator overlay, a shipped `.v1`
+    list) and the canary renderer's `read_template` opened their file with
+    `O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` and turned an `ELOOP` into "a
+    symbolic link (not read through one)"; the renderer drew the deploy's
+    seed from the OS RNG (`os_rng`, nn-linux); `overlay_auth` held the
+    loaders' types, the boot gate and the install (atomic replace, inode
+    protection) together; the blocklist's `net status` report read the
+    resolver's configuration (`net::blind_spots`). Ratchet: 54, nn-core
+    40, five of them references of R07's modules.
+  - What changed, one commit each: the seam —
+    `nn_core::content_host::ContentHost` (the open that follows no final
+    symlink and blocks on no FIFO, and how it refuses a symlink; static
+    functions, as `ChainHost`), implemented for the agent's `LinuxHost` by
+    `content_host_linux` with the same flags, `read_overlay` and the
+    renderer's read generic over it; the tests that need Linux or the
+    agent's other lists leave the files that move, verbatim (the Linux
+    refusals to `content_host_linux`, every family's shipped list against
+    `install.sh` to `config`, the OS seeds to `canary`); `overlay_auth`'s
+    install half (`store`, `inode_key`) to `config::overlay_install`
+    (nn-linux, R04c); the overlay check names the exec profile in
+    `execpol::policy`, where it is defined; the inactive-rules report to
+    `net::blind_spots`. Then the moves to crates/nn-core, the agent's
+    module paths kept (`nn_core::config::overlay`, …):
+    `anti_tamper/combat_allow.rs` (`git mv`, 99 %), the part of
+    `overlay_auth` the loaders take (`Verified`, `content_sha256`,
+    `read_overlay`, `ALLOW_UNSIGNED_ENV`, `MAX_OVERLAY_BYTES`, cut
+    verbatim), `config/overlay.rs` (96 %: its three reading loaders and
+    `load_defaults_with` take the host), `fim/paths_config.rs` (94 %),
+    `canary/templates.rs` (98 %: `render` takes the host,
+    `new_content_seed` stays in the agent). The agent keeps every path as
+    a shim (plan §4.1 rule 2, removed in R17) in the parent's `mod.rs`: a
+    `pub use` of nn-core's module and, for a loader that reads a file, the
+    function under its name and signature bound to `LinuxHost`
+    (`config::overlay::{load_defaults, load_pinned_defaults,
+    load_flat_list}`, `fim::paths_config::load_watched_paths`,
+    `canary::templates::render`); `overlay_auth` re-exports its moved
+    part. Callers, tests, `fuzz_api` and the fuzz targets `canary_template`
+    and `combat_allow` are unchanged; the moved tests run in nn-core on a
+    portable test host. nn-core depends on sha2, anyhow, tracing, hex,
+    base64, serde_json (`float_roundtrip`) and thiserror at the agent's
+    versions; the lockfiles gain nn-core's edges, nothing else. Ratchet
+    54 → 52, nn-core 40 → 43 (the seam: the content code names the Linux
+    host where it called libc, which the scan does not see) → 42 (install)
+    → 41 (exec profile) → 40 (inactive rules) → 40 (the moved loader no
+    longer names the host; `config/mod.rs`, which binds it, does) → 38
+    (the renderer and its RNG); nn-admin 8, nn-linux 3, nn-proto 3,
+    nn-evidence 0. Deviations from the plan: not moved —
+    `config::comm_allowlist` and `canary::readers` judge on
+    `posture::lineage` (`AuthSessionTracker`, `ExecIdentity`,
+    `in_system_tree`), and the allowlist holds a kill through
+    `decision::response_policy`: R08's, as posture and the engine, which
+    this lot leaves untouched (lab PR 245 changed them meanwhile; `main`
+    with it is merged into this branch);
+    `posture::{escalation_allow, mass_write_overlay}` sit in `posture/`
+    (R08a); `net::blocklist`'s loaders are associated functions of the
+    list types that the decision replay (`decision/replay.rs`, R08b) calls
+    without a host — in nn-core the `.v1` read needs it as a type
+    parameter, so they move with that caller; the gate (`OverlayGate`)
+    verifies through `anti_tamper::admin_auth`, which the map sends to
+    nn-proto once R04b cuts its UnlockToken and key loading, and writes
+    the agent's audit log, and `overlay_floor` reads the agent's signing
+    key (`keys`, nn-linux) and is the gate's: by §4.1 rule 3 they move
+    when those are below nn-core. `new_content_seed` stays in the agent:
+    the OS RNG is nn-linux's. `combat_allow` still reads its file with
+    `std::fs` at each engage: a portable read, no seam (nn-evidence's
+    rule). No separate move and rewrite commits and no
+    `.git-blame-ignore-revs`: no importer was rewritten; the moved files'
+    own lines changed for the host parameter, their tests' host and doc
+    links to the agent (94–99 % similar); `overlay_auth`'s part is cut, not
+    split with appendix A's recipe. Found: the eBPF object carries the
+    build directory in its debug information (`/home/…/agent-ebpf/src/…`),
+    so its bytes are a function of the checkout's path; the identity below
+    builds `main` and this lot in the same directory. Open: the five
+    modules above (R08, R04b/R09a); the shims (R17).
+  - Lab: no guest (moves and seams that keep every call; the identity below). Host, on 0e7802b (the lot's code; the commit after it changes documentation only), on 0df3394 (the lot's last commit before `main`'s lab PR 245 was merged in) and on the merge (b4f2467, 3,044 passed with lab PR 245's tests, the posture golden files as lab PR 245 left them): `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 69 suites, 3,028 passed, 0 failed, 15 ignored (the test list is `main`'s: 3,043 names, every one found at the tip — 44 now nn-core's, 9 moved within the agent — and no test added); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` (both replays, golden files unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; `portable-core`'s `cargo check` of nn-parse, nn-model, nn-proto, nn-evidence and nn-core (now code) for the five targets; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, 13 targets, seeds and regressions; no lockfile changed by the build): all pass. The pins pass unchanged: `encoded_frames_are_pinned`, `chain_format_pin`, `crypto_vectors`, the TLS and DNS parser pins, and the overlay-v1 fixture of lab PR 230 (`an_overlay_signed_before_the_bump_is_accepted`, `the_stored_overlay_signature_is_pinned`). Identity against `main` 9de1923, both built in one temporary checkout (same path), the release job's commands (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`; unstripped: the same flags, `CARGO_PROFILE_RELEASE_STRIP=none`): the eBPF object is byte-identical (sha256 42afd5b6… there; a clean rebuild of `main`'s, `agent-ebpf/target` removed, gives the same bytes), its stamp too (source c0365736…, `main`'s: `common` and the eBPF crates are untouched); the scanner (401,368 bytes) and the watchdog (2,336,920) are byte-identical, stripped and unstripped; `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes, the agent's and nn-admin's sizes, `CHANGELOG.md` and the two documents whose path mentions changed (`COMBAT_RECOVERY.md`, `install.sh`'s comment) aside. The agent (14,863,200 → 14,876,736 bytes) and nn-admin (4,022,024 → 4,029,320) are not byte-identical. Function by function (unstripped, names mapped to the new crates and modules, the host type parameter dropped, addresses and rip-relative targets dropped, trailing padding dropped): the agent 7,555 of 7,614 the same code (53 differ, 6 and 26 unpaired), nn-admin 3,441 of 3,463 (19; 3 and 20). Control — `main` with the agent depending on nn-core and nn-core on its new dependencies, no source moved: 14 of the agent's and 6 of nn-admin's change already (clap's `TypeId`s of the agent's enums: the agent crate's identity moves with its dependency list; which of identical bodies keeps its name). From the control to this lot: 41 of the agent's (19 only call a body LLVM folded under another name, the shared `RawVec::grow_one` among them; 22 differ in inlining at the new crate boundary, register allocation and stack frames, and an argument constant propagated into a callee: the moved loaders and parsers, their callers — the gate, the network isolator, the canary deploy, the COW and rule-policy boots —, nn-evidence's writers over the agent's key) and 13 of nn-admin's; the unpaired are generic code made a second time in nn-core (anyhow's message errors, `RawVec` growth, hex and base64 encoding, line iteration: `.text` +10,000 bytes in the agent, +0.14 %, +4,368 in nn-admin) and helpers kept out of line. `.rodata`: every text constant of one build is in the other's but the moved files' paths (panic locations, callsite files) and the callsite line numbers of the moved and edited files; the moved modules' tracing target is `nn_core::…` (not printed: `with_target(false)`).

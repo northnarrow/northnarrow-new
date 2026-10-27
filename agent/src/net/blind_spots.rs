@@ -290,6 +290,39 @@ pub fn dns_blind_rule(dot: &ResolverDot) -> String {
     )
 }
 
+/// External audit NET-009: the network rules that cannot fire in this
+/// build, for `nn-admin net status`. External audit NET-017 (lab PR 207):
+/// and the DNS rules blind to the resolver's upstream while
+/// systemd-resolved runs DNS over TLS, read from its configuration at each
+/// call ([`resolver_dns_over_tls`]). R07 (lab PR 247): from `blocklist`,
+/// which keeps the JA3 list's size and its sentence.
+pub fn inactive_net_rules() -> Vec<String> {
+    inactive_net_rules_with(
+        crate::net::blocklist::ja3_entries(),
+        crate::net::blocklist::TLS_FINGERPRINT_PRODUCER,
+        resolver_dns_over_tls().as_ref(),
+    )
+}
+
+fn inactive_net_rules_with(
+    entries: usize,
+    producer: bool,
+    resolver_dot: Option<&ResolverDot>,
+) -> Vec<String> {
+    let mut rules = Vec::new();
+    if !producer {
+        rules.push(format!(
+            "NN-L-NET-003 (JA3): no TLS fingerprint producer in this build (BUG-025); {} \
+             loaded, none can match",
+            crate::net::blocklist::ja3_entries_phrase(entries)
+        ));
+    }
+    if let Some(dot) = resolver_dot {
+        rules.push(dns_blind_rule(dot));
+    }
+    rules
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,5 +550,60 @@ mod tests {
         assert!(t.contains("TCP/853"), "{t}");
         assert!(!t.contains('\n'), "{t}");
         assert!(t.contains("x\\n.conf"), "{t}");
+    }
+
+    /// External audit NET-009: a JA3 list loaded with no fingerprint
+    /// producer is reported at boot (ERROR + signed `subsystem_degraded`);
+    /// an empty list, or a build with a producer, is not. `net status`
+    /// names NN-L-NET-003 as inactive either way while there is no
+    /// producer.
+    #[test]
+    fn a_ja3_list_without_a_fingerprint_producer_is_reported() {
+        use crate::net::blocklist::ja3_coverage_gap;
+        let gap = ja3_coverage_gap(1, false).expect("reported");
+        assert!(gap.contains("NN-L-NET-003 inactive"), "{gap}");
+        assert!(gap.contains("1 JA3 blocklist entry loaded"), "{gap}");
+        assert!(ja3_coverage_gap(0, false).is_none());
+        assert!(ja3_coverage_gap(3, true).is_none());
+        let inactive = inactive_net_rules_with(2, false, None);
+        assert_eq!(inactive.len(), 1);
+        assert!(inactive[0].starts_with("NN-L-NET-003"), "{inactive:?}");
+        assert!(inactive[0].contains("2 JA3 blocklist entries"));
+        assert!(inactive_net_rules_with(2, true, None).is_empty());
+    }
+
+    /// External audit NET-017 (lab PR 207): systemd-resolved on DNS over
+    /// TLS adds the DNS rules, with the reason and the file, after the JA3
+    /// entry; off, nothing is added.
+    #[test]
+    fn a_resolver_on_dns_over_tls_lists_the_blind_dns_rules() {
+        use crate::net::blind_spots::{resolver_dns_over_tls_under, DotMode, ResolverDot};
+        let dot = ResolverDot {
+            mode: DotMode::Yes,
+            source: std::path::PathBuf::from("/etc/systemd/resolved.conf.d/50-dot.conf"),
+        };
+        let inactive = inactive_net_rules_with(0, false, Some(&dot));
+        assert_eq!(inactive.len(), 2, "{inactive:?}");
+        assert!(inactive[0].starts_with("NN-L-NET-003"), "{inactive:?}");
+        assert!(
+            inactive[1].starts_with(
+                "NN-L-NET-002/004/005/014 (DNS): blind to the local resolver's upstream"
+            ),
+            "{inactive:?}"
+        );
+        assert!(inactive[1].contains("50-dot.conf"), "{inactive:?}");
+        // With a producer, the DNS entry alone.
+        assert_eq!(inactive_net_rules_with(0, true, Some(&dot)).len(), 1);
+
+        // From the files: a drop-in on, then removed.
+        let root = tempfile::tempdir().unwrap();
+        let d = root.path().join("etc/systemd/resolved.conf.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("50-dot.conf"), "[Resolve]\nDNSOverTLS=yes\n").unwrap();
+        let read = resolver_dns_over_tls_under(root.path());
+        assert_eq!(inactive_net_rules_with(0, false, read.as_ref()).len(), 2);
+        std::fs::remove_file(d.join("50-dot.conf")).unwrap();
+        let read = resolver_dns_over_tls_under(root.path());
+        assert_eq!(inactive_net_rules_with(0, false, read.as_ref()).len(), 1);
     }
 }

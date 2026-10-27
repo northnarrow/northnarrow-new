@@ -36,6 +36,7 @@ use anyhow::{anyhow, Result};
 
 use crate::config::overlay::{self, DefaultsSource, Shipped};
 use crate::config::overlay_auth::Verified;
+use crate::content_host::ContentHost;
 
 /// Default deploy location of the curated paths list. Matches
 /// the path `install.sh` (Tappa 9 C7) drops the repo's
@@ -102,12 +103,15 @@ pub struct WatchedPathsLoad {
 ///   edited ones — external audit LLMR-016, LLMR-015).
 /// - `local` is the overlay as the gate verified it; none → `effective`
 ///   equals the default list.
-pub fn load_watched_paths(v1_path: &Path, local: &Verified) -> Result<WatchedPathsLoad> {
-    load_watched_paths_with(v1_path, FIM_PATHS_SHIPPED, local)
+pub fn load_watched_paths<H: ContentHost>(
+    v1_path: &Path,
+    local: &Verified,
+) -> Result<WatchedPathsLoad> {
+    load_watched_paths_with::<H>(v1_path, FIM_PATHS_SHIPPED, local)
 }
 
 /// [`load_watched_paths`] with the shipped defaults given.
-fn load_watched_paths_with(
+fn load_watched_paths_with<H: ContentHost>(
     v1_path: &Path,
     shipped: Shipped<'_>,
     local: &Verified,
@@ -117,7 +121,7 @@ fn load_watched_paths_with(
     // adds the FIM-specific absolute-path validation and maps the
     // generic `String` entries back into `PathBuf`. Behaviour is
     // unchanged (the tests below pin the contract).
-    let load = overlay::load_flat_list(
+    let load = overlay::load_flat_list::<H>(
         "fim paths-config",
         v1_path,
         shipped,
@@ -134,7 +138,7 @@ fn load_watched_paths_with(
 }
 
 /// FIM entry shape rule: watched paths must be absolute.
-pub(crate) fn validate_absolute_path(entry: &str) -> Result<()> {
+pub fn validate_absolute_path(entry: &str) -> Result<()> {
     if !entry.starts_with('/') {
         return Err(anyhow!(
             "paths must be absolute (start with `/`), got `{entry}`"
@@ -157,6 +161,7 @@ fn read_default_list(path: &Path) -> Result<BTreeSet<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_host::testing::PortableHost;
     use tempfile::TempDir;
 
     /// The overlay at `path` as a gate that accepts it hands it over.
@@ -174,7 +179,7 @@ mod tests {
     /// the built-in copy): these tests are about parsing and the overlay.
     fn load_own(v1: &Path, local: &Verified) -> WatchedPathsLoad {
         let own = std::fs::read_to_string(v1).unwrap();
-        load_watched_paths_with(v1, Shipped::new(&own, &[]), local).expect("load")
+        load_watched_paths_with::<PortableHost>(v1, Shipped::new(&own, &[]), local).expect("load")
     }
 
     /// C7 #1: a v1-only file with no overlay yields exactly the
@@ -253,8 +258,9 @@ mod tests {
     #[test]
     fn a_missing_v1_uses_the_built_in_list_and_says_so() {
         let dir = TempDir::new().unwrap();
-        let out = load_watched_paths(&dir.path().join("missing.v1"), &Verified::Missing)
-            .expect("a missing v1 is tolerated");
+        let out =
+            load_watched_paths::<PortableHost>(&dir.path().join("missing.v1"), &Verified::Missing)
+                .expect("a missing v1 is tolerated");
         assert!(matches!(out.defaults, DefaultsSource::BuiltIn(_)));
         assert!(out.effective.contains(&PathBuf::from("/etc/shadow")));
         assert!(out.effective.contains(&PathBuf::from("/etc/ld.so.preload")));
@@ -271,7 +277,7 @@ mod tests {
     fn shipped_fim_paths_v1_loads_clean_with_d3_paths() {
         let v1 = std::path::PathBuf::from(concat!(env!("NN_REPO_ROOT"), "/configs/fim-paths.v1"));
         // No overlay shipped (operator-curated) — exercise v1-only.
-        let out = load_watched_paths(&v1, &Verified::Missing)
+        let out = load_watched_paths::<PortableHost>(&v1, &Verified::Missing)
             .expect("shipped fim-paths.v1 must parse clean");
         for p in [
             "/etc/ld.so.preload",
@@ -307,11 +313,11 @@ mod tests {
             .collect();
         assert_ne!(edited, BUILTIN_PATHS_V1);
         std::fs::write(&v1, &edited).unwrap();
-        let out = load_watched_paths(&v1, &Verified::Missing).unwrap();
+        let out = load_watched_paths::<PortableHost>(&v1, &Verified::Missing).unwrap();
         assert!(out.effective.contains(&PathBuf::from("/etc/ld.so.preload")));
         assert!(matches!(out.defaults, DefaultsSource::Modified { .. }));
         std::fs::write(&v1, BUILTIN_PATHS_V1).unwrap();
-        let out = load_watched_paths(&v1, &Verified::Missing).unwrap();
+        let out = load_watched_paths::<PortableHost>(&v1, &Verified::Missing).unwrap();
         assert_eq!(out.defaults, DefaultsSource::Disk);
     }
 

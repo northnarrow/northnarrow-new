@@ -38,6 +38,7 @@ use anyhow::{anyhow, Context, Result};
 use tracing::{error, info, warn};
 
 use crate::config::overlay_auth::{content_sha256, read_overlay, Verified, ALLOW_UNSIGNED_ENV};
+use crate::content_host::ContentHost;
 
 /// Validates a single entry AFTER directive stripping. Returns a
 /// human diagnostic on rejection; the loader wraps it with the
@@ -77,7 +78,7 @@ pub enum DefaultsSource {
     #[default]
     Disk,
     /// The copy built into the agent: the file could not be read (why).
-    /// The caller records it ([`crate::config::overlay_auth::OverlayGate::report_default_unavailable`]).
+    /// The caller records it (the agent's `OverlayGate::report_default_unavailable`).
     BuiltIn(String),
     /// The copy built into the agent: the file on disk is the list an
     /// earlier release shipped (its SHA-256), which `install.sh` replaces.
@@ -87,7 +88,7 @@ pub enum DefaultsSource {
     /// The copy built into the agent is in force, unless the unsigned
     /// configuration escape hatch is set (`loaded_anyway`: the file was
     /// applied). The caller records it
-    /// ([`crate::config::overlay_auth::OverlayGate::report_default_modified`]).
+    /// (the agent's `OverlayGate::report_default_modified`).
     Modified {
         sha256: String,
         builtin_sha256: String,
@@ -141,14 +142,14 @@ impl<'a> Shipped<'a> {
 /// be applied as it was, and `install.sh` never replaced it, so a host kept
 /// the lists of its first install (NET-011, lab PR 78: a KillProcessTree
 /// rule on CGNAT and VPN ranges) and an offline edit took effect silently.
-pub fn load_defaults<T>(
+pub fn load_defaults<H: ContentHost, T>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
     parse: impl Fn(&str, &str) -> T,
 ) -> (T, DefaultsSource) {
     let allow_modified = std::env::var(ALLOW_UNSIGNED_ENV).is_ok_and(|v| v == "1");
-    load_defaults_with(label, v1_path, shipped, allow_modified, true, parse)
+    load_defaults_with::<H, T>(label, v1_path, shipped, allow_modified, true, parse)
 }
 
 /// Lab PR 225: a shipped list with no operator overlay (`security-tools.v1`)
@@ -157,18 +158,19 @@ pub fn load_defaults<T>(
 /// (there is no signed way to tune such a list, so its file is no
 /// configuration), and the message points to no overlay. The file is not
 /// signed: it is compared byte for byte with the built-in copy.
-pub fn load_pinned_defaults<T>(
+pub fn load_pinned_defaults<H: ContentHost, T>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
     parse: impl Fn(&str, &str) -> T,
 ) -> (T, DefaultsSource) {
-    load_defaults_with(label, v1_path, shipped, false, false, parse)
+    load_defaults_with::<H, T>(label, v1_path, shipped, false, false, parse)
 }
 
 /// [`load_defaults`] with the escape hatch given, and whether the list has
-/// a signed `.local` overlay to point the operator to.
-fn load_defaults_with<T>(
+/// a signed `.local` overlay to point the operator to (the tests of the
+/// agent's Linux host call it, R07).
+pub fn load_defaults_with<H: ContentHost, T>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
@@ -182,7 +184,7 @@ fn load_defaults_with<T>(
             source,
         )
     };
-    let bytes = match read_overlay(v1_path) {
+    let bytes = match read_overlay::<H>(v1_path) {
         Ok(b) => b,
         Err(e) => {
             error!(
@@ -259,14 +261,14 @@ fn load_defaults_with<T>(
 ///
 /// `label` prefixes every log line (e.g. `"fim paths-config"` or
 /// `"process-comm-allowlist"`) so boot logs name the family.
-pub fn load_flat_list(
+pub fn load_flat_list<H: ContentHost>(
     label: &str,
     v1_path: &Path,
     shipped: Shipped<'_>,
     local: &Verified,
     validate: EntryValidator<'_>,
 ) -> Result<OverlayLoad> {
-    let (defaults, source) = load_defaults(label, v1_path, shipped, |name, body| {
+    let (defaults, source) = load_defaults::<H, _>(label, v1_path, shipped, |name, body| {
         parse_default_text(name, body, validate)
     });
     let (adds, disables) = match (local.text(), local.source()) {
@@ -446,6 +448,7 @@ fn strip_comment(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_host::testing::PortableHost;
     use tempfile::TempDir;
 
     /// A validator that accepts any non-empty token — keeps the
@@ -474,7 +477,7 @@ mod tests {
     /// the built-in copy): the merge tests below are about the overlay.
     fn load_own(v1: &Path, local: &Verified) -> OverlayLoad {
         let own = std::fs::read_to_string(v1).unwrap();
-        load_flat_list(
+        load_flat_list::<PortableHost>(
             "test-allowlist",
             v1,
             Shipped::new(&own, &[]),
@@ -494,7 +497,7 @@ mod tests {
     fn load_test_list(v1: &Path, allow_modified: bool) -> (BTreeSet<String>, DefaultsSource) {
         let earlier = hex::encode(content_sha256(EARLIER.as_bytes()));
         let earlier = [earlier.as_str()];
-        load_defaults_with(
+        load_defaults_with::<PortableHost, _>(
             "test-allowlist",
             v1,
             Shipped::new(SHIPPED, &earlier),
@@ -589,176 +592,6 @@ mod tests {
         );
     }
 
-    /// External audit LLMR-015: a `.v1` is read like an overlay — not
-    /// through a link (its target is anything root points it at), not from
-    /// a FIFO (the boot would block on it) — and gives way to the built-in
-    /// copy, reported as unavailable.
-    #[test]
-    fn default_through_a_link_or_fifo_is_refused() {
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("elsewhere");
-        std::fs::write(&target, "implant\n").unwrap();
-        let link = dir.path().join("link.v1");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let (set, source) = load_test_list(&link, true);
-        assert_eq!(set, shipped_set());
-        assert!(
-            matches!(&source, DefaultsSource::BuiltIn(why) if why.contains("symbolic link")),
-            "{source:?}"
-        );
-        // Even when the link points at the shipped content.
-        std::fs::write(&target, SHIPPED).unwrap();
-        let (_, source) = load_test_list(&link, false);
-        assert!(matches!(source, DefaultsSource::BuiltIn(_)));
-
-        let fifo = dir.path().join("fifo.v1");
-        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        // SAFETY: a valid NUL-terminated path; mkfifo has no other preconditions.
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        let (set, source) = load_test_list(&fifo, false);
-        assert_eq!(set, shipped_set());
-        assert!(
-            matches!(&source, DefaultsSource::BuiltIn(why) if why.contains("not a regular file")),
-            "{source:?}"
-        );
-    }
-
-    /// Every shipped default list: its file name in `/etc/northnarrow` and
-    /// its shipped copies.
-    fn shipped_lists() -> [(&'static str, Shipped<'static>); 6] {
-        [
-            ("fim-paths.v1", crate::fim::paths_config::FIM_PATHS_SHIPPED),
-            (
-                "netflow-blocklist.v1",
-                crate::net::blocklist::NETFLOW_BLOCKLIST_SHIPPED,
-            ),
-            (
-                "netflow-ja3-blocklist.v1",
-                crate::net::blocklist::JA3_BLOCKLIST_SHIPPED,
-            ),
-            (
-                "process-comm-allowlist.v1",
-                crate::config::comm_allowlist::PROCESS_COMM_ALLOWLIST_SHIPPED,
-            ),
-            (
-                "netflow-comm-allowlist.v1",
-                crate::config::comm_allowlist::NETFLOW_COMM_ALLOWLIST_SHIPPED,
-            ),
-            // Lab PR 225.
-            ("security-tools.v1", crate::impair::SECURITY_TOOLS_SHIPPED),
-        ]
-    }
-
-    /// External audit LLMR-015: `install.sh` replaces exactly the copies the
-    /// agent supersedes — its `SHIPPED_V1_EARLIER` table is the agent's —
-    /// and installs every list through the same check.
-    #[test]
-    fn install_sh_knows_the_same_shipped_lists() {
-        use std::collections::BTreeMap;
-        let install =
-            std::fs::read_to_string(concat!(env!("NN_REPO_ROOT"), "/deploy/install.sh")).unwrap();
-        let start = install
-            .find("declare -A SHIPPED_V1_EARLIER=(")
-            .expect("deploy/install.sh declares SHIPPED_V1_EARLIER");
-        let block = &install[start..];
-        let block = &block[..block.find("\n)").unwrap()];
-        let mut table = BTreeMap::new();
-        for line in block.lines().skip(1) {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let (name, hashes) = line
-                .strip_prefix('[')
-                .and_then(|l| l.split_once("]="))
-                .unwrap_or_else(|| panic!("unexpected line in SHIPPED_V1_EARLIER: {line}"));
-            let hashes: BTreeSet<String> = hashes
-                .trim_matches('"')
-                .split_whitespace()
-                .map(String::from)
-                .collect();
-            table.insert(name.to_string(), hashes);
-        }
-        let ours: BTreeMap<String, BTreeSet<String>> = shipped_lists()
-            .iter()
-            .map(|(name, shipped)| {
-                (
-                    name.to_string(),
-                    shipped
-                        .earlier_sha256
-                        .iter()
-                        .map(|h| h.to_string())
-                        .collect(),
-                )
-            })
-            .collect();
-        assert_eq!(table, ours);
-        for (name, _) in shipped_lists() {
-            assert!(
-                install.contains(&format!("install_shipped_v1 {name} ")),
-                "install.sh installs {name} through install_shipped_v1"
-            );
-        }
-    }
-
-    /// External audit LLMR-015: the built-in copy of each list, pinned. A
-    /// change to `configs/<list>.v1` turns the copy every installed host has
-    /// into an "edited" one unless its SHA-256 moves to the earlier ones,
-    /// here and in `install.sh`.
-    #[test]
-    fn the_shipped_lists_are_pinned() {
-        let pins = [
-            (
-                "fim-paths.v1",
-                "44a5f17e037148eb31a8798d7c0918e31d4657ba2ca7003b696a775741326508",
-            ),
-            (
-                "netflow-blocklist.v1",
-                "4588710cd342c6eeb5054acb108d47aa6dbf020feb768c8775fdc2d30e4c84f9",
-            ),
-            (
-                "netflow-ja3-blocklist.v1",
-                "3549750f6c1530fc139f9853d173bccb72612b58086392517fa9fe1f3a815870",
-            ),
-            (
-                "process-comm-allowlist.v1",
-                "a096c0dc64852fba9861009935028b28888307ae04dee99f4aa51f6b72ffdea0",
-            ),
-            (
-                "netflow-comm-allowlist.v1",
-                "46a1965afe80c7b578bb3584126f35a46d678bd59a6e2ca59081f65381d93266",
-            ),
-            (
-                "security-tools.v1",
-                "38cef57a92f6b394be9307c0f16e8799d553d0cff7bb6d7fd3db0b3906736335",
-            ),
-        ];
-        for ((name, shipped), (pin_name, pin)) in shipped_lists().into_iter().zip(pins) {
-            assert_eq!(name, pin_name);
-            let sha = shipped.builtin_sha256();
-            assert_eq!(
-                sha, pin,
-                "configs/{name} changed: add {pin} to its EARLIER_*_SHA256 table and to \
-                 SHIPPED_V1_EARLIER in deploy/install.sh, then pin {sha} here"
-            );
-            assert!(!shipped.earlier_sha256.contains(&pin));
-            let distinct: BTreeSet<&&str> = shipped.earlier_sha256.iter().collect();
-            assert_eq!(distinct.len(), shipped.earlier_sha256.len(), "{name}");
-            for h in shipped.earlier_sha256 {
-                assert!(
-                    h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-                    "{name}: {h}"
-                );
-            }
-            let file = std::fs::read_to_string(format!("{}/configs/{name}", env!("NN_REPO_ROOT")))
-                .unwrap();
-            assert_eq!(
-                file, shipped.builtin,
-                "{name}: the built-in copy is configs/"
-            );
-        }
-    }
-
     /// D1: a `.v1`-only file with no overlay yields exactly the
     /// bare entries as `effective`; the other fields are empty.
     #[test]
@@ -842,7 +675,7 @@ mod tests {
     #[test]
     fn a_missing_default_list_uses_the_built_in_copy() {
         let dir = TempDir::new().unwrap();
-        let out = load_flat_list(
+        let out = load_flat_list::<PortableHost>(
             "test-allowlist",
             &dir.path().join("missing.v1"),
             Shipped::new("sshd\nnginx\n", &[]),
@@ -860,7 +693,7 @@ mod tests {
 
         let v1 = dir.path().join("comm.v1");
         std::fs::write(&v1, "curl\n").unwrap();
-        let out = load_flat_list(
+        let out = load_flat_list::<PortableHost>(
             "test-allowlist",
             &v1,
             Shipped::new("curl\n", &[]),
@@ -870,7 +703,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.defaults, DefaultsSource::Disk);
         assert_eq!(out.effective.into_iter().collect::<Vec<_>>(), vec!["curl"]);
-        let out = load_flat_list(
+        let out = load_flat_list::<PortableHost>(
             "test-allowlist",
             &v1,
             Shipped::new("sshd\n", &[]),
