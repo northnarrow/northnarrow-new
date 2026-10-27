@@ -328,11 +328,13 @@ planned = false
 # reads go through the host seam, which names the agent's Linux host
 # where libc was called before (nn-core 40 → 43, until the moves);
 # overlay_auth's install half leaves for nn-linux (→ 42); it names the
-# exec profile in `execpol::policy`, where it is defined (→ 41).
+# exec profile in `execpol::policy`, where it is defined (→ 41); the
+# inactive network rules (the resolver's DNS over TLS) leave the
+# blocklist for `net::blind_spots` (→ 40).
 
 [ratchet]
 nn-admin = 8
-nn-core = 41
+nn-core = 40
 nn-evidence = 0
 nn-linux = 3
 nn-proto = 3

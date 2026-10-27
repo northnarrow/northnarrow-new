@@ -3615,7 +3615,7 @@ fn telemetry_status(
         // External audit NET-019 / NET-012 / NET-009: `nn-admin net status`.
         netflow_rows_skipped_total: Some(crate::net::limiter::rows_skipped_total()),
         netflow_pending_evicted_total: Some(crate::net::flow_tracker::pending_evictions_total()),
-        net_inactive_rules: Some(crate::net::blocklist::inactive_net_rules()),
+        net_inactive_rules: Some(crate::net::blind_spots::inactive_net_rules()),
         // Lab PR 164: the kernel's connect→close socket map.
         flow_sock_pending: crate::sensors::flow_sock::snapshot().map(|o| o.pending),
         flow_sock_capacity: crate::sensors::flow_sock::snapshot().map(|o| o.capacity),
