@@ -432,7 +432,10 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `ActionFailed` for a dropped request (verified, not carried out); a
   request a recompute in flight subsumes stays a success. The rows read
   "failure: unknown_operation" / "failure: action_failed"; nn-admin
-  prints "fim baseline: server rejected operation" (exit 5).
+  prints "fim baseline: nothing was recorded: the agent verified the
+  request but has no baseline recompute task this boot (…)" for the
+  dropped request (the independent review's L-3) and "server rejected
+  operation" without the state, exit 5 both.
 - The signed `detections` read served rows it had not verified on a
   degraded boot (lab PR 263, found by R11d's table): without the
   detection store's state — no agent key this boot, or a status-event
@@ -445,6 +448,19 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   takes its paths and verifies every row with `agent_key`, and is refused
   (`UnknownOperation`, as set-status) without a state; set-status is
   refused when the status log did not open, as before.
+- Two `rotate-keys add` requests sent at once while the one-key
+  bootstrap was armed could both pass with its one signature (lab PR
+  263, the independent review's L-4; on `main` as well): the bootstrap
+  gate is read before the verify, and was read outside any lock, so
+  both found it armed — the first added the second key, the other a
+  third. No escalation (the bootstrap key can add a key of its own and
+  co-sign), but not the one add the design allows; and an add and a
+  revoke each rewrote the admin.pub it had read, so one could lose the
+  other's line (a revoked key kept, an added one dropped). `AdminAuth`
+  (nn-linux) holds a rotation lock now, which both rotate-keys verbs
+  take before the gate, the verify, the rewrite and the reload: a
+  second add waits, then finds the key set at two and the bootstrap
+  spent (`QuorumNotMet`).
 - A tripped canary came back armed when the agent stopped between the
   trip's two rows (lab PR 260; lab PR 258's KVM run on Ubuntu 24.04:
   the e2e fixture's restart signal landed there, and
@@ -1960,6 +1976,17 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   — give the same output, exit status and signed rows from `main`'s
   agent and the lot's, with either build of nn-admin (the telemetry's
   counters, the times and the boot's manifest hash aside).
+  After the independent review of the pull request: the bootstrap's
+  1-of-N is tested end to end through the pipeline (armed, then spent;
+  re-armed neither by a one-key admin.pub with a valid sentinel nor
+  after the signed chain spent it; the gate's closed states), every
+  verb against keys of every other role and of the default roles, the
+  shutdown's quorum is the watchdog's constant (`SHUTDOWN_QUORUM`) in
+  the table, the core has a test of the nonce binding, the rejection
+  table is a golden file of `cargo xtask golden`
+  (`agent/tests/golden/admin/expected`, `docs/validation/
+  GOLDEN_REPLAY.md` §7), and no test reads or removes the host's
+  bootstrap files any more.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and
