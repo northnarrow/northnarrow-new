@@ -96,6 +96,8 @@ impl BootPhase {
                 InstallManifest,
                 AuditWritable,
                 BpfLsm,
+                PinRoot,
+                VmlinuxBtf,
             ],
             BootPhase::Attach => &[Sensors, AntiTamper],
             BootPhase::SelfTest => &[DenySelfTest],
@@ -132,6 +134,14 @@ pub enum BootStep {
     /// `bpf` in the active LSMs, or the degraded-mode opt-in (the agent's
     /// `boot::lsm`).
     BpfLsm,
+    /// Review #466 F6: the bpffs pin root the load pins into is not a
+    /// symbolic link nor anything but a directory (ATP-007), or the
+    /// degraded-mode opt-in.
+    PinRoot,
+    /// Review #466 F6: the kernel's BTF (`/sys/kernel/btf/vmlinux`), which
+    /// every deny hook's attach resolves against, is there, or the
+    /// degraded-mode opt-in.
+    VmlinuxBtf,
     /// The eBPF object loaded and the sensors attached.
     Sensors,
     /// The deny hooks attached and the agent registered.
@@ -150,7 +160,8 @@ impl BootStep {
     /// Wave 4 restructure, R11b (lab PR 262): a step only its check records
     /// ([`checks`]), never [`BootSequence::done`] — the ones the attach
     /// depends on: the eBPF object, the state directory, the BTF offsets,
-    /// the capabilities, the install manifest, the audit log, the BPF LSM.
+    /// the capabilities, the install manifest, the audit log, the BPF LSM,
+    /// and (review #466 F6) the deny hooks' pin root and the kernel's BTF.
     pub fn is_checked(self) -> bool {
         use BootStep::*;
         matches!(
@@ -162,6 +173,8 @@ impl BootStep {
                 | InstallManifest
                 | AuditWritable
                 | BpfLsm
+                | PinRoot
+                | VmlinuxBtf
         )
     }
 
@@ -169,7 +182,9 @@ impl BootStep {
         use BootStep::*;
         match self {
             EbpfObject | StateDir | BtfOffsets | ChainHeads | Identity | Capabilities
-            | InstallManifest | AuditWritable | HostHardening | BpfLsm => BootPhase::Preflight,
+            | InstallManifest | AuditWritable | HostHardening | BpfLsm | PinRoot | VmlinuxBtf => {
+                BootPhase::Preflight
+            }
             Sensors | AntiTamper => BootPhase::Attach,
             DenySelfTest => BootPhase::SelfTest,
             AgentBoot | BootDegradations => BootPhase::Attest,
@@ -190,6 +205,8 @@ impl BootStep {
             AuditWritable => "audit_writable",
             HostHardening => "host_hardening",
             BpfLsm => "bpf_lsm",
+            PinRoot => "pin_root",
+            VmlinuxBtf => "vmlinux_btf",
             Sensors => "sensors",
             AntiTamper => "anti_tamper",
             DenySelfTest => "deny_self_test",
@@ -481,6 +498,8 @@ mod tests {
             BootStep::InstallManifest,
             BootStep::AuditWritable,
             BootStep::BpfLsm,
+            BootStep::PinRoot,
+            BootStep::VmlinuxBtf,
         ] {
             assert!(BootPhase::Preflight.required().contains(&check));
             assert!(check.is_checked(), "{}", check.name());
@@ -505,6 +524,8 @@ mod tests {
                     BootStep::AuditWritable,
                     BootStep::HostHardening,
                     BootStep::BpfLsm,
+                    BootStep::PinRoot,
+                    BootStep::VmlinuxBtf,
                 ],
                 BootPhase::Attach => &[BootStep::Sensors, BootStep::AntiTamper],
                 BootPhase::SelfTest => &[BootStep::DenySelfTest],

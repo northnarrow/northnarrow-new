@@ -375,6 +375,71 @@ fn bpf_lsm_in(
     Ok((state, gate))
 }
 
+/// Review #466 F6: the bpffs pin root the load pins into
+/// ([`crate::anti_tamper::pin_root_refusal`], ATP-007): a symbolic link, or
+/// anything but a directory, refused the start only after the load, from
+/// the deny hooks' attach — now before it, unless the degraded-mode opt-in
+/// ([`lsm::allow_degraded_from_env`]; the attach then counts it as a failed
+/// protection step, signed, as before).
+pub fn pin_root(boot: &mut BootSequence) -> Result<Verdict, BootOrderError> {
+    pin_root_decided(
+        boot,
+        crate::anti_tamper::pin_root_refusal(),
+        lsm::allow_degraded_from_env(),
+    )
+}
+
+fn pin_root_decided(
+    boot: &mut BootSequence,
+    refusal: Option<String>,
+    allow_degraded: bool,
+) -> Result<Verdict, BootOrderError> {
+    match refusal {
+        Some(why) if !allow_degraded => Ok(Verdict::Refused(why)),
+        _ => {
+            boot.passed(BootStep::PinRoot)?;
+            Ok(Verdict::Passed)
+        }
+    }
+}
+
+/// Review #466 F6: the kernel's BTF, `/sys/kernel/btf/vmlinux`: every deny
+/// hook's attach resolves its hook against it, so without it none attaches
+/// (review 53: a kernel built without it, or a tmpfs over
+/// `/sys/kernel/btf`). The deny hooks' shortfall refused the start only
+/// after the load, which pins the maps — now before it, unless the
+/// degraded-mode opt-in ([`lsm::allow_degraded_from_env`]). A file there
+/// that does not parse is the BTF offsets' refusal ([`btf_offsets`]).
+pub fn vmlinux_btf(boot: &mut BootSequence) -> Result<Verdict, BootOrderError> {
+    vmlinux_btf_in(boot, Path::new("/"), lsm::allow_degraded_from_env())
+}
+
+/// [`vmlinux_btf`] for the BTF under `root` (this crate's tests).
+fn vmlinux_btf_in(
+    boot: &mut BootSequence,
+    root: &Path,
+    allow_degraded: bool,
+) -> Result<Verdict, BootOrderError> {
+    let path = root.join("sys/kernel/btf/vmlinux");
+    let missing = match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() && m.len() > 0 => None,
+        Ok(_) => Some(format!("{} is empty or not a file", path.display())),
+        Err(e) => Some(format!("{}: {e}", path.display())),
+    };
+    match missing {
+        Some(why) if !allow_degraded => Ok(Verdict::Refused(format!(
+            "vmlinux BTF unavailable ({why}) — no LSM hook can attach: kernel built without \
+             CONFIG_DEBUG_INFO_BTF, or /sys/kernel/btf hidden. Refusing to start with a \
+             silently-absent protection; set {}=1 to start degraded.",
+            crate::anti_tamper::ALLOW_DEGRADED_ENV
+        ))),
+        _ => {
+            boot.passed(BootStep::VmlinuxBtf)?;
+            Ok(Verdict::Passed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +773,60 @@ mod tests {
         assert!(has(&boot, BootStep::BpfLsm));
     }
 
+    /// Review #466 F6: a symbolic link at the pin root, and a kernel without
+    /// its BTF, refuse before the load and record nothing — unless the
+    /// degraded-mode opt-in.
+    #[test]
+    fn the_deny_hooks_prerequisites_refuse_before_the_load() {
+        let mut boot = BootSequence::new();
+        let why = Some("the bpffs pin root /sys/fs/bpf/northnarrow is a symbolic link".to_string());
+        assert!(matches!(
+            pin_root_decided(&mut boot, why.clone(), false).unwrap(),
+            Verdict::Refused(w) if w.contains("symbolic link")
+        ));
+        assert!(!has(&boot, BootStep::PinRoot));
+        assert_eq!(
+            pin_root_decided(&mut boot, why, true).unwrap(),
+            Verdict::Passed
+        );
+        assert!(has(&boot, BootStep::PinRoot));
+        let mut boot = BootSequence::new();
+        assert_eq!(
+            pin_root_decided(&mut boot, None, false).unwrap(),
+            Verdict::Passed
+        );
+        assert!(has(&boot, BootStep::PinRoot));
+
+        let dir = tempfile::tempdir().unwrap();
+        let btf = dir.path().join("sys/kernel/btf");
+        let mut boot = BootSequence::new();
+        for setup in ["absent", "empty"] {
+            if setup == "empty" {
+                std::fs::create_dir_all(&btf).unwrap();
+                std::fs::write(btf.join("vmlinux"), b"").unwrap();
+            }
+            assert!(
+                matches!(
+                    vmlinux_btf_in(&mut boot, dir.path(), false).unwrap(),
+                    Verdict::Refused(w) if w.contains("vmlinux BTF unavailable")
+                ),
+                "{setup}"
+            );
+            assert!(!has(&boot, BootStep::VmlinuxBtf), "{setup}");
+        }
+        assert_eq!(
+            vmlinux_btf_in(&mut boot, dir.path(), true).unwrap(),
+            Verdict::Passed
+        );
+        let mut boot = BootSequence::new();
+        std::fs::write(btf.join("vmlinux"), b"\x9f\xeb\x01\x00").unwrap();
+        assert_eq!(
+            vmlinux_btf_in(&mut boot, dir.path(), false).unwrap(),
+            Verdict::Passed
+        );
+        assert!(has(&boot, BootStep::VmlinuxBtf));
+    }
+
     /// The proof is given once every check passed, and the attach phase
     /// begins with it: what no other path reaches.
     #[test]
@@ -763,6 +882,16 @@ mod tests {
             bpf_lsm_in(&mut boot, dir.path(), false).unwrap().1,
             LsmGate::Proceed
         ));
+        assert_eq!(
+            pin_root_decided(&mut boot, None, false).unwrap(),
+            Verdict::Passed
+        );
+        std::fs::create_dir_all(dir.path().join("sys/kernel/btf")).unwrap();
+        std::fs::write(dir.path().join("sys/kernel/btf/vmlinux"), b"BTF").unwrap();
+        assert_eq!(
+            vmlinux_btf_in(&mut boot, dir.path(), false).unwrap(),
+            Verdict::Passed
+        );
         let _proof = boot.verify_integrity().expect("every check passed");
         assert_eq!(boot.phase(), BootPhase::Attach);
     }

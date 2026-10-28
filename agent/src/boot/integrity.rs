@@ -464,6 +464,24 @@ pub(crate) fn check(
             );
         }
     }
+    // Review #466 F6: what the deny hooks' attach needs and refused only
+    // after the load — the pin root (ATP-007) and the kernel's BTF (review
+    // 53) — checked before it, refused signed unless
+    // NN_ANTI_TAMPER_ALLOW_DEGRADED=1 (the attach then records them degraded,
+    // as before).
+    for (what, verdict) in [
+        ("pin root", checks::pin_root(boot)?),
+        ("vmlinux BTF", checks::vmlinux_btf(boot)?),
+    ] {
+        if let checks::Verdict::Refused(why) = verdict {
+            error!(what, "refusing to start: {why}");
+            let ctx = refusal::Context {
+                integrity: (integrity.label(), integrity.provenance()),
+                ..unchecked
+            };
+            ctx.refuse(audit_open.log_mut(), Refusal::new("deny_hooks", why));
+        }
+    }
     let verified = boot.verify_integrity()?;
     Ok(Integrity {
         exec_cfg,

@@ -667,6 +667,8 @@ mod tests {
             "checks::install_manifest(",
             "checks::audit_log(",
             "checks::bpf_lsm(",
+            "checks::pin_root(",
+            "checks::vmlinux_btf(",
             "boot.verify_integrity()",
         ] {
             assert!(at(check) < attach, "`{check}` after the attach");
@@ -750,8 +752,13 @@ mod tests {
         assert!(deferred > at("identity::resolve("));
         assert!(deferred < at("checks::capabilities("));
         for gate in ["sensors", "deny_hooks"] {
-            assert!(at(&format!("Refusal::new(\"{gate}\"")) > load, "{gate}");
+            let last = main
+                .rfind(&format!("Refusal::new(\"{gate}\""))
+                .unwrap_or_else(|| panic!("no {gate} refusal"));
+            assert!(last > load, "{gate}");
         }
+        // review #466 F6: the deny hooks' pin root and BTF, before the load
+        assert!(at("Refusal::new(\"deny_hooks\",why)") < load);
         assert!(at("Refusal::new(\"deny_self_test\"") > at("boot::deny_selftest::run("));
         // the refusals an earlier start left in the fallback chain, recorded
         // in the audit log before this boot's own row
