@@ -417,6 +417,36 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- The privileged suites wrote the installed agent's evidence, and the
+  boot check's report did not say what was wrong (lab PR 256; lot 255's
+  finding). Run as root on the lab guests and in the KVM CI, where an
+  agent is installed, six agent spawns of the e2e fixtures gave their
+  agent a signing key of its own but not all of its chains, and three
+  neither key nor audit log: those agents appended rows under their own
+  key to the installed agent's detection, netflow and FIM drift logs —
+  every start of the installed agent then reported `chain_verify_failed`
+  — and test rows (`nn-admin-e2etest-*`) to its audit chain under its key.
+  `agent/tests/common/agent_state.rs` is the one way a test starts an
+  agent: every path flag of the agent that names a file it writes or its
+  identity (17: the id, the admin keys, the signing key, the audit log,
+  the heads anchor, the eight chains, the socket, the shutdown marker,
+  the pid files) gets a file in the test's directory, and the watchdog's
+  suite uses the same file; `xtask/tests/test_state_isolation.rs` fails
+  on an agent started any other way, on a path flag of the agent the
+  helper does not classify, on a test naming the agent's state flags and
+  on a test naming the agent's host paths without a reason. The boot
+  check (the last 4 MiB of each rotating log) now says the class of what
+  fails: lines whose hash recomputes and whose link holds but that
+  another key signed are counted over the window (`K of the M lines
+  checked are signed by another key, from <line> to <line>`, a line
+  placed by its byte offset, by its line number when the window starts
+  the file, and by its `ts`, where `entry N` counted from the window's
+  first line); an altered line, a broken link and the other breaks keep
+  their own class and stop the check at the first; the signed
+  `chain_verify` gives each log's `class`. It is still a
+  `chain_verify_failed`, at every start while the lines are there.
+  `docs/operator/EVIDENCE_CHAINS.md` no longer says that finding is
+  written once, and says what to do.
 - Lab and validation tooling (lab PR 248; no product change). Under whpx
   `nn-lab.sh ssh … bash -s` with the script on stdin (a here-doc, a pipe,
   `< file`) ran none of it and exited 0 (lab PR 245 hit it): there

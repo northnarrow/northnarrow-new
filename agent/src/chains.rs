@@ -175,10 +175,14 @@ pub fn spawn_boot_verify(
                     "result": "ok",
                 })),
                 Err(e) => {
+                    // Lab PR 256: the class (`signed_by_another_key`,
+                    // `content_altered`, `link_broken`, …) beside the text,
+                    // which says where and how many.
                     logs.push(serde_json::json!({
                         "chain": chain,
                         "file": path.display().to_string(),
                         "result": "broken",
+                        "class": e.class(),
                         "error": e.to_string(),
                     }));
                     failures.push(ChainFinding::new(
@@ -392,6 +396,81 @@ mod tests {
             lines[n].strip_suffix('}').unwrap()
         );
         std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    /// Lab PR 256: lines another key appended to a rotating log (lot 255:
+    /// an e2e fixture's agent writing the installed agent's detection
+    /// log) are reported as before — a signed `chain_verify` `broken` and a
+    /// signed `chain_verify_failed` — with the class, how many of the lines
+    /// checked, and where the first and the last are.
+    #[test]
+    fn the_boot_verification_names_lines_another_key_signed() {
+        let dir = TempDir::new().unwrap();
+        let pk = key(&dir).verifying_key();
+        let active = dir.path().join("detections.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 1 << 30);
+        for n in 0..4 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        let other = AgentSigningKey::load_or_bootstrap(&dir.path().join("other.sig.key")).unwrap();
+        let mut log = rotating_log(&active, other, 1 << 30);
+        for n in 4..7 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        let audit_path = dir.path().join("audit.log");
+        let audit = Arc::new(parking_lot::Mutex::new(
+            AuditLog::open(&audit_path, key(&dir), [1; 16]).unwrap(),
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            spawn_boot_verify(vec![rotating_target(&active)], pk, Some(audit.clone()));
+            for _ in 0..500 {
+                let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
+                if text.contains("chain_verify_failed") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let verify = rows
+            .iter()
+            .find(|r| r["op"] == CHAIN_VERIFY_OP)
+            .unwrap_or_else(|| panic!("no chain_verify row: {rows:?}"));
+        assert_eq!(verify["result"], "broken", "{verify}");
+        assert_eq!(
+            verify["extra"]["logs"][0]["class"], "signed_by_another_key",
+            "{verify}"
+        );
+        let drift = rows
+            .iter()
+            .find(|r| r["op"] == "integrity_drift" && r["extra"]["kind"] == "chain_verify_failed")
+            .unwrap_or_else(|| panic!("no chain_verify_failed: {rows:?}"));
+        let detail = drift["extra"]["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with(&format!(
+                "the last {BOOT_VERIFY_BYTES} bytes do not verify: file {}: 3 of the 7 lines \
+                 checked are signed by another key, from line 5 (byte ",
+                active.display()
+            )),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(
+                "ts 2026-10-15T00:00:06.000000Z): each one's entry_hash recomputes and its link \
+                 to the line before it is intact"
+            ),
+            "{detail}"
+        );
     }
 
     /// External audit NN-AUD-108: on the code before lab PR 160 a cut

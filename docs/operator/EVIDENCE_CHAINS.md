@@ -17,7 +17,7 @@ repository, not shipped with the release):
 |---|---|---|
 | every start, before anything opens | anchored heads and checkpoints compared with the files | ERROR `chain integrity: evidence missing or altered` + signed `integrity_drift` |
 | every start, at open | canary registry rows (all), canary access rows (last 256), audit row numbers | same |
-| after the start, in the background | last 4 MiB of each rotating log | signed `chain_verify` (`ok`/`broken`) + `integrity_drift` `chain_verify_failed` |
+| after the start, in the background | last 4 MiB of each rotating log's active file | signed `chain_verify` (`ok`/`broken`, each broken log with its `class`) + `integrity_drift` `chain_verify_failed`, at every start while the lines are there |
 | every `nn-admin detections` | the rows served | rows that do not verify are left out; ERROR + `chain_lines_unverified` |
 | on demand | `sudo nn-admin chain verify` | `OK`/`BROKEN` per chain, exit 8 on any problem |
 
@@ -175,7 +175,7 @@ after this version has written is not supported.
    | `active_file_missing` | a rotating log's active file was deleted after a rotation |
    | `chain_sequence_broken` | a row is missing or was inserted before the end (`seq` out of place, or a link broken) |
    | `chain_lines_unverified` | rows whose hash or signature does not verify (forged or altered); they are not applied or served |
-   | `chain_verify_failed` | the background check of a rotating log failed; the detail names the line |
+   | `chain_verify_failed` | the background check of a rotating log failed; the detail names the class and where (below) |
    | `chain_heads_unverified` | the anchor file holds no genuine snapshot (replaced or altered) |
    | `chain_heads_missing` | the anchor file was removed after anchoring had started |
    | `agent_id_changed` | the agent signs as another `agent_id` than the chain's last row (`from`, `to`): `/etc/northnarrow/agent_id` was removed, replaced or unusable while the agent was stopped (`source`: `minted`, `loaded`, `unavailable`) |
@@ -190,11 +190,68 @@ after this version has written is not supported.
    and a degraded window wanted it gone. Investigate the host as
    compromised; the rows that remain still verify and are still evidence.
 
+### What `chain_verify_failed` says (lab PR 256)
+
+The detail starts with `the last 4194304 bytes do not verify:` and names
+the file, then one of these classes (the `class` of the log's entry in the
+signed `chain_verify`):
+
+| `class` | The detail | Meaning |
+|---|---|---|
+| `signed_by_another_key` | `K of the M lines checked are signed by another key, from <first> to <last>: each one's entry_hash recomputes and its link to the line before it is intact, but its signature does not verify with this agent's key (agent.sig.pub <8 hex>…)` | the lines are as they were written and in their place, but this agent's key did not sign them: a regenerated agent key, another agent process with its own key writing this file — or forged lines. Every such line of the window is counted |
+| `content_altered` | `<line>: its entry_hash does not recompute (…)` | the line was changed after it was written |
+| `link_broken` | `<line>: its prev_hash … is not the entry_hash … of the line before it` | a line was removed, inserted or moved |
+| `malformed`, `not_canonical`, `legacy_after_v3` | `<line>: a malformed line (…)`, … | not a line this agent writes there (see the line formats above) |
+| `unreadable` | `cannot be read: …` | the file could not be read |
+
+A line is placed as `line N (byte B, ts T)`: `B` is the offset of its first
+byte in the active file, `N` its line number (from 1) when the file is
+shorter than the window, `T` its `ts` when that is a plain timestamp. In a
+longer file the window starts inside it and only the offset is given (`the
+line at byte B`): earlier versions counted `entry N` from the window's first
+line, which was not the line's place in the file. The classes other than
+`signed_by_another_key` stop the check at the first line, as before, and
+add how many lines another key signed before it. Each class is a
+`chain_verify_failed`; the file's truncation, removal or rewrite are the
+start's own findings (`chain_truncated`, …) and are reported apart.
+
+**Lines signed by another key.** What to do:
+
+1. `sudo nn-admin chain verify`: every chain, the manifests included (the
+   first failing line of each, `signature invalid (its entry_hash
+   recomputes: …)`), exit 8.
+2. Compare the key: `head -c 8 /etc/northnarrow/agent.sig.pub` against the
+   `agent.sig.pub` the detail names; a regenerated key is the case below
+   ("Expected once"): every older line fails, from the first line of the
+   file.
+3. Find the writer: a writer that met this agent's tail recorded a
+   `tail_unverified` row, signed by its own key, in the log's
+   `.manifest.jsonl` (`sudo grep tail_unverified
+   /var/lib/northnarrow/detections/detections.jsonl.manifest.jsonl`); the
+   `ts` of the first and last line give the window. Look in the audit chain
+   and the journal of that window for what ran as root.
+4. On a lab or CI host, the privileged e2e suites ran as root before lab PR
+   256 with agents of their own key that wrote the installed agent's logs
+   (lot 255): rows in that window from the suites' rules and fixtures
+   (`bpftool`, `fim_child_…`) are theirs. Any other case is an incident
+   (step 5 above).
+
 ## What the agent did about it
 
-- The finding is written once, at the start that found it; the anchor then
-  records the files as they are, so the next start is quiet. The signed
-  `integrity_drift` stays in the audit chain.
+- A start's own findings (`chain_truncated`, `chain_missing`,
+  `chain_rewritten`, …) are written once, at the start that found them;
+  the anchor then records the files as they are, so the next start is
+  quiet. The signed `integrity_drift` stays in the audit chain.
+- `chain_verify_failed` is written at every start while the failing lines
+  are in the last 4 MiB of the active file — the evidence is still bad —
+  and `nn-admin chain verify` keeps failing until their generation leaves
+  retention. The agent removes nothing: do not edit or cut the files (that
+  is a rewrite, and evidence lost). Moving the state directory aside (kept
+  for the investigation) is a rollback: the next start reports it once
+  (below).
+- `chain_lines_unverified` is written each time a read verb leaves out
+  another number of rows of a file than the last time; the ERROR is in the
+  journal every time.
 - A rotating log whose checkpoint is unreachable keeps failing
   `nn-admin chain verify` until that generation leaves retention (the
   evidence is still missing; that is the point).
@@ -214,8 +271,11 @@ after this version has written is not supported.
   (`chain_truncated`, `chain_missing` or `chain_heads_missing`). Record why.
 - A deliberately regenerated agent key (the old `agent.sig.key` removed)
   makes every earlier signature unverifiable, the anchor's included:
-  `chain_heads_unverified` once, and `chain verify` fails on the old rows.
-  Archive the old chains with the old public key before reusing the host.
+  `chain_heads_unverified` once, and `chain verify` fails on the old rows;
+  the background check reports `signed_by_another_key` from the first line
+  of each rotating log at every start until those lines leave the last
+  4 MiB of its active file. Archive the old chains with the old public key
+  before reusing the host.
 - A deliberately removed or restored `agent_id` (a re-mint, a backup put
   back) is `agent_id_changed` once; the first start of an install signs
   `agent_id_minted` only. Overlays and admin signatures made for the old

@@ -418,7 +418,11 @@ enum LineFault {
     },
     /// `agent_sig` is not 64 bytes of base64.
     SigMalformed(String),
-    SigInvalid,
+    /// The signature does not verify with the key. The hash is checked
+    /// first and recomputed: the line is as it was written, signed by
+    /// another key or forged. Its seal and link, for the boot check's class
+    /// and extent (lab PR 256, [`verify_recent`]).
+    SigInvalid(LineOk),
     /// External audit EVD-007: a v3 line whose hash and signature verify but
     /// whose bytes are not its canonical serialisation.
     NonCanonical,
@@ -465,7 +469,12 @@ fn verify_frame<T: Frame>(
         .verify_strict(&digest, &Signature::from_bytes(&sig_arr))
         .is_err()
     {
-        return Err(LineFault::SigInvalid);
+        return Err(LineFault::SigInvalid(LineOk {
+            prev_hash: line.prev().to_string(),
+            entry_hash: stored,
+            pre_image: pre,
+            non_canonical_legacy: false,
+        }));
     }
     {
         let (h, s) = line.seal_mut();
@@ -543,7 +552,7 @@ impl LineFault {
                 recomputed,
                 stored,
             },
-            LineFault::SigInvalid => LogSetError::SignatureInvalid { file, idx },
+            LineFault::SigInvalid(_) => LogSetError::SignatureInvalid { file, idx },
             LineFault::NonCanonical => LogSetError::NonCanonicalLine { file, idx },
         }
     }
@@ -551,7 +560,7 @@ impl LineFault {
     /// The tail recovery's view of it ([`LineCheck`]).
     fn check(&self) -> LineCheck {
         match self {
-            LineFault::SigMalformed(_) | LineFault::SigInvalid => LineCheck::BadSignature,
+            LineFault::SigMalformed(_) | LineFault::SigInvalid(_) => LineCheck::BadSignature,
             LineFault::Malformed(_) | LineFault::EntryHash { .. } | LineFault::NonCanonical => {
                 LineCheck::Invalid
             }
@@ -2355,7 +2364,14 @@ pub enum LogSetError {
         recomputed: String,
         stored: String,
     },
-    #[error("file {file}: entry {idx}: signature invalid")]
+    /// The hash is checked first: a line that fails here is as it was
+    /// written, and another key than this agent's signed it — or it was
+    /// forged (lab PR 256: the class named).
+    #[error(
+        "file {file}: entry {idx}: signature invalid (its entry_hash recomputes: the line is as \
+         it was written, but this agent's key did not sign it — another key did, or it was \
+         forged)"
+    )]
     SignatureInvalid { file: String, idx: usize },
     /// External audit EVD-007 (NN-AUD-273, lab PR 204): a v3 line whose hash
     /// and signature verify, but whose bytes are not the serialisation of
@@ -2611,20 +2627,236 @@ pub struct RecentReport {
     pub whole_file: bool,
 }
 
+/// Where a line of an active file is (lab PR 256): the offset of its first
+/// byte in the file, its line number (from 1) when the check read the file
+/// from its start, and its `ts` when that is a plain timestamp. The window
+/// of [`verify_recent`] starts inside a file longer than it, where the
+/// index of a line in the window (`entry 0`) was not its place in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinePos {
+    pub offset: u64,
+    pub line: Option<u64>,
+    pub ts: Option<String>,
+}
+
+impl std::fmt::Display for LinePos {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.line, &self.ts) {
+            (Some(n), Some(ts)) => write!(f, "line {n} (byte {}, ts {ts})", self.offset),
+            (Some(n), None) => write!(f, "line {n} (byte {})", self.offset),
+            (None, Some(ts)) => write!(f, "the line at byte {} (ts {ts})", self.offset),
+            (None, None) => write!(f, "the line at byte {}", self.offset),
+        }
+    }
+}
+
+/// The `ts` of a line that failed verification, when it is a plain
+/// timestamp (`2026-10-20T08:35:00.123456Z`: digits, `-:.+TZ`, at most 40
+/// bytes). Nothing else of such a line goes into the journal or the signed
+/// finding.
+fn plain_ts(line: &serde_json::Value) -> Option<String> {
+    let ts = line.get("ts")?.as_str()?;
+    let plain = !ts.is_empty()
+        && ts.len() <= 40
+        && ts
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.+TZ".contains(&b));
+    plain.then(|| ts.to_string())
+}
+
+/// How a line breaks the chain ([`RecentError::Broken`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineBreak {
+    /// Its `entry_hash` does not recompute: its content changed after it
+    /// was written.
+    ContentAltered { recomputed: String, stored: String },
+    /// Its `prev_hash` is not the `entry_hash` of the line before it: a line
+    /// was removed, inserted or moved.
+    LinkBroken { got: String, expected: String },
+    /// Not a line of this log: not JSON, not its line type, a format this
+    /// reader does not know, a signature that is not 64 bytes of base64.
+    Malformed { reason: String },
+    /// External audit EVD-007: a v3 line whose bytes are not its canonical
+    /// serialisation.
+    NotCanonical,
+    /// External audit EVD-008: a line in the old format after a v3 line.
+    LegacyAfterV3,
+}
+
+impl std::fmt::Display for LineBreak {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineBreak::ContentAltered { recomputed, stored } => write!(
+                f,
+                "its entry_hash does not recompute (recomputed {recomputed}, stored {stored}): \
+                 the line was altered after it was written"
+            ),
+            LineBreak::LinkBroken { got, expected } => write!(
+                f,
+                "its prev_hash {got} is not the entry_hash {expected} of the line before it: a \
+                 line was removed, inserted or moved"
+            ),
+            LineBreak::Malformed { reason } => write!(f, "a malformed line ({reason})"),
+            LineBreak::NotCanonical => write!(
+                f,
+                "a v3 line not in its canonical form (the bytes on disk are not what the agent \
+                 wrote: a key added, reordered or re-spelled)"
+            ),
+            LineBreak::LegacyAfterV3 => write!(
+                f,
+                "a line in the old format (v1/v2, untagged pre-image) after v3 lines"
+            ),
+        }
+    }
+}
+
+/// Lines of a window another key signed ([`RecentError::SignedByAnotherKey`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignLines {
+    pub file: String,
+    /// Those lines.
+    pub count: u64,
+    /// The lines of the window, those included.
+    pub checked: u64,
+    pub first: LinePos,
+    pub last: LinePos,
+    /// The first 8 hex digits of the agent's public key (`agent.sig.pub`).
+    pub key: String,
+}
+
+/// The first line that breaks the chain otherwise ([`RecentError::Broken`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokenLine {
+    pub file: String,
+    pub pos: LinePos,
+    pub line_break: LineBreak,
+    /// Lines before it another key signed ([`RecentError::SignedByAnotherKey`]).
+    pub signed_by_another_key_before: u64,
+}
+
+/// Why the bounded boot check of a rotating log failed ([`verify_recent`],
+/// lab PR 256): the class, and where. Every one is a `chain_verify_failed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecentError {
+    /// Lines of the window whose `entry_hash` recomputes and whose link to
+    /// the line before them is intact, but whose signature does not verify
+    /// with the agent's key: written under another key (a regenerated
+    /// agent key, another agent or a test run writing the file) or forged.
+    /// Counted over the whole window, the first and the last named.
+    SignedByAnotherKey(Box<ForeignLines>),
+    /// The first line that breaks the chain otherwise; the check stops
+    /// there, as before.
+    Broken(Box<BrokenLine>),
+    /// The file could not be read.
+    Unreadable { file: String, reason: String },
+}
+
+impl RecentError {
+    /// The class, for the signed `chain_verify` entry.
+    pub fn class(&self) -> &'static str {
+        match self {
+            RecentError::SignedByAnotherKey(_) => "signed_by_another_key",
+            RecentError::Broken(b) => match b.line_break {
+                LineBreak::ContentAltered { .. } => "content_altered",
+                LineBreak::LinkBroken { .. } => "link_broken",
+                LineBreak::Malformed { .. } => "malformed",
+                LineBreak::NotCanonical => "not_canonical",
+                LineBreak::LegacyAfterV3 => "legacy_after_v3",
+            },
+            RecentError::Unreadable { .. } => "unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for RecentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecentError::SignedByAnotherKey(l) => {
+                let ForeignLines {
+                    file,
+                    count,
+                    checked,
+                    first,
+                    last,
+                    key,
+                } = l.as_ref();
+                if *count == 1 {
+                    write!(
+                        f,
+                        "file {file}: 1 of the {checked} lines checked is signed by another \
+                         key, {first}: its entry_hash recomputes and its link to the line before \
+                         it is intact, but its signature does not verify with this agent's key \
+                         (agent.sig.pub {key}…)"
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "file {file}: {count} of the {checked} lines checked are signed by \
+                         another key, from {first} to {last}: each one's entry_hash recomputes \
+                         and its link to the line before it is intact, but its signature does \
+                         not verify with this agent's key (agent.sig.pub {key}…)"
+                    )?;
+                }
+                write!(
+                    f,
+                    " — written under another key (a regenerated agent key, another agent or a \
+                     test run writing this file), or forged"
+                )
+            }
+            RecentError::Broken(b) => {
+                let BrokenLine {
+                    file,
+                    pos,
+                    line_break,
+                    signed_by_another_key_before,
+                } = b.as_ref();
+                write!(f, "file {file}: {pos}: {line_break}")?;
+                match signed_by_another_key_before {
+                    0 => Ok(()),
+                    1 => write!(
+                        f,
+                        "; before it, 1 line of the window signed by another key (its hash \
+                         and link intact)"
+                    ),
+                    n => write!(
+                        f,
+                        "; before it, {n} lines of the window signed by another key (their \
+                         hash and link intact)"
+                    ),
+                }
+            }
+            RecentError::Unreadable { file, reason } => {
+                write!(f, "file {file}: cannot be read: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecentError {}
+
 /// External audit NN-AUD-112: the bounded check the agent runs on each
 /// rotating log after it starts — every line in the last `max_bytes` of
 /// the active file must verify (hash and signature) and link to the line
 /// before it. The full check of the set is [`verify_log_set`]
 /// (`nn-admin chain verify`).
+///
+/// Lab PR 256: a failure says its class and where it is
+/// ([`RecentError`]). A line whose hash recomputes and whose link holds
+/// but whose signature does not verify with this key is counted, and the
+/// check goes on to the end of the window: the report names how many of
+/// the lines checked another key signed, the first and the last (lot 255:
+/// an e2e fixture's agent had appended its rows, under its own key, to the
+/// installed agent's log). Any other break stops the check at the first, as
+/// before. Lines are placed by byte offset in the file, and by line number
+/// when the window starts at the top of the file.
 pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHost>(
     active: &Path,
     pubkey: &VerifyingKey,
     max_bytes: u64,
-) -> Result<RecentReport, LogSetError> {
+) -> Result<RecentReport, RecentError> {
     let file = active.display().to_string();
-    let malformed = |idx: usize, reason: String| LogSetError::Malformed {
+    let unreadable = |reason: String| RecentError::Unreadable {
         file: file.clone(),
-        idx,
         reason,
     };
     let generation = current_generation(active);
@@ -2637,14 +2869,14 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHos
                 whole_file: true,
             })
         }
-        Err(e) => return Err(malformed(0, e.to_string())),
+        Err(e) => return Err(unreadable(e.to_string())),
     };
-    let len = f.metadata().map_err(|e| malformed(0, e.to_string()))?.len();
+    let len = f.metadata().map_err(|e| unreadable(e.to_string()))?.len();
     let start = len.saturating_sub(max_bytes);
     let mut buf = Vec::new();
     f.seek(SeekFrom::Start(start))
         .and_then(|_| f.read_to_end(&mut buf))
-        .map_err(|e| malformed(0, e.to_string()))?;
+        .map_err(|e| unreadable(e.to_string()))?;
     let mut body: &[u8] = &buf;
     let mut at = start;
     if start > 0 {
@@ -2679,26 +2911,100 @@ pub fn verify_recent<P: Serialize + DeserializeOwned + ChainPayload, H: ChainHos
     let mut lines = 0u64;
     // External audit EVD-008: no old-format line after a v3 one.
     let mut seen_v3 = false;
+    // Lab PR 256: the lines another key signed (count, first, last).
+    let mut foreign: Option<(u64, LinePos, LinePos)> = None;
+    let mut offset = at;
+    let broken = |pos: LinePos, line_break: LineBreak, before: u64| {
+        RecentError::Broken(Box::new(BrokenLine {
+            file: file.clone(),
+            pos,
+            line_break,
+            signed_by_another_key_before: before,
+        }))
+    };
     for (idx, line) in complete.split(|&c| c == b'\n').enumerate() {
+        let line_at = offset;
+        offset += line.len() as u64 + 1;
         if line.is_empty() {
             continue;
         }
-        serde_json::from_slice::<serde_json::Value>(line)
-            .map_err(|e| malformed(idx, format!("line {idx} of the last {covered} bytes: {e}")))?;
-        let (ok, _) = verify_active_line::<P>(line, pubkey).map_err(|f| f.at(&file, idx))?;
-        track_format(&ok, &mut seen_v3, &file, idx)?;
+        let before = foreign.as_ref().map_or(0, |(n, _, _)| *n);
+        let pos = |value: Option<&serde_json::Value>| LinePos {
+            offset: line_at,
+            line: (start == 0).then_some(idx as u64 + 1),
+            ts: value.and_then(plain_ts),
+        };
+        let value: serde_json::Value = match serde_json::from_slice(line) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(broken(
+                    pos(None),
+                    LineBreak::Malformed {
+                        reason: format!("not JSON: {e}"),
+                    },
+                    before,
+                ))
+            }
+        };
+        let ok = match verify_active_line::<P>(line, pubkey) {
+            Ok((ok, _)) => ok,
+            Err(LineFault::SigInvalid(ok)) => {
+                let here = pos(Some(&value));
+                foreign = Some(match foreign.take() {
+                    None => (1, here.clone(), here),
+                    Some((n, first, _)) => (n + 1, first, here),
+                });
+                ok
+            }
+            Err(LineFault::EntryHash { recomputed, stored }) => {
+                return Err(broken(
+                    pos(Some(&value)),
+                    LineBreak::ContentAltered { recomputed, stored },
+                    before,
+                ))
+            }
+            Err(LineFault::NonCanonical) => {
+                return Err(broken(pos(Some(&value)), LineBreak::NotCanonical, before))
+            }
+            Err(LineFault::Malformed(reason) | LineFault::SigMalformed(reason)) => {
+                return Err(broken(
+                    pos(Some(&value)),
+                    LineBreak::Malformed { reason },
+                    before,
+                ))
+            }
+        };
+        match ok.pre_image {
+            PreImage::V3 => seen_v3 = true,
+            PreImage::Legacy if seen_v3 => {
+                return Err(broken(pos(Some(&value)), LineBreak::LegacyAfterV3, before))
+            }
+            PreImage::Legacy => {}
+        }
         if let Some(want) = &expected {
             if &ok.prev_hash != want {
-                return Err(LogSetError::PrevHashMismatch {
-                    file: file.clone(),
-                    idx,
-                    got: ok.prev_hash,
-                    expected: want.clone(),
-                });
+                return Err(broken(
+                    pos(Some(&value)),
+                    LineBreak::LinkBroken {
+                        got: ok.prev_hash,
+                        expected: want.clone(),
+                    },
+                    before,
+                ));
             }
         }
         expected = Some(ok.entry_hash);
         lines += 1;
+    }
+    if let Some((count, first, last)) = foreign {
+        return Err(RecentError::SignedByAnotherKey(Box::new(ForeignLines {
+            file,
+            count,
+            checked: lines,
+            first,
+            last,
+            key: hex::encode(&pubkey.to_bytes()[..4]),
+        })));
     }
     Ok(RecentReport {
         lines,
@@ -4595,6 +4901,273 @@ mod tests {
         assert!(verify_log_set::<TestPayload>(&active, &pk).is_err());
     }
 
+    // ── Lab PR 256: the boot check says the class and where ──────────────
+
+    /// The offset each line of `path` starts at.
+    fn line_offsets(path: &Path) -> Vec<u64> {
+        let body = fs::read(path).unwrap();
+        let mut out = vec![0u64];
+        for (i, c) in body.iter().enumerate() {
+            if *c == b'\n' && i + 1 < body.len() {
+                out.push(i as u64 + 1);
+            }
+        }
+        out
+    }
+
+    /// `payload(i)`'s timestamp.
+    fn ts(i: u64) -> Option<String> {
+        Some(format!("2026-05-30T00:00:{i:02}.000000Z"))
+    }
+
+    /// `n` lines of the agent's key (`kp`), then `m` of another key, then
+    /// `k` of the agent's again: an agent of another key — an e2e
+    /// fixture's, started on the host with a key of its own (lot 255) —
+    /// appended to the log, and the agent's next lines link to its tail.
+    fn interleaved(dir: &Path, kp: &Path, n: u64, m: u64, k: u64) -> PathBuf {
+        let active = dir.join("test.jsonl");
+        let mut log = open_log(&active, kp, 1 << 30);
+        for i in 0..n {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        let mut other = open_log(&active, &dir.join("other-key"), 1 << 30);
+        for i in n..n + m {
+            other.append(payload(i)).unwrap();
+        }
+        drop(other);
+        let mut log = open_log(&active, kp, 1 << 30);
+        for i in n + m..n + m + k {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        active
+    }
+
+    /// Lines another key signed recompute and link: the boot check names
+    /// that class, counts them over the window, places the first and the
+    /// last (line number and byte offset), and fails — a
+    /// `chain_verify_failed` as before. `chain verify` fails at the first
+    /// and says its hash recomputes.
+    #[test]
+    fn the_boot_check_counts_and_places_lines_another_key_signed() {
+        let dir = TempDir::new().unwrap();
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let active = interleaved(dir.path(), &kp, 5, 3, 2);
+        let at = line_offsets(&active);
+        assert_eq!(at.len(), 10);
+        let err = verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20).unwrap_err();
+        assert_eq!(err.class(), "signed_by_another_key");
+        let key = hex::encode(&pk.to_bytes()[..4]);
+        assert_eq!(
+            err,
+            RecentError::SignedByAnotherKey(Box::new(ForeignLines {
+                file: active.display().to_string(),
+                count: 3,
+                checked: 10,
+                first: LinePos {
+                    offset: at[5],
+                    line: Some(6),
+                    ts: ts(5)
+                },
+                last: LinePos {
+                    offset: at[7],
+                    line: Some(8),
+                    ts: ts(7)
+                },
+                key: key.clone(),
+            }))
+        );
+        let text = err.to_string();
+        let want = format!(
+            "3 of the 10 lines checked are signed by another key, from line 6 (byte {}, ts \
+             2026-05-30T00:00:05.000000Z) to line 8 (byte {}, ts 2026-05-30T00:00:07.000000Z): \
+             each one's entry_hash recomputes and its link to the line before it is intact, but \
+             its signature does not verify with this agent's key (agent.sig.pub {key}…)",
+            at[5], at[7]
+        );
+        assert!(text.contains(&want), "{text}");
+        let full = verify_log_set::<TestPayload>(&active, &pk).unwrap_err();
+        assert!(
+            matches!(full, LogSetError::SignatureInvalid { .. }),
+            "{full:?}"
+        );
+        assert!(
+            full.to_string().contains("its entry_hash recomputes"),
+            "{full}"
+        );
+        // One line: said in the singular.
+        let dir = TempDir::new().unwrap();
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let active = interleaved(dir.path(), &kp, 2, 1, 1);
+        let text = verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("1 of the 4 lines checked is signed by another key, line 3 (byte"),
+            "{text}"
+        );
+        // Under the other key, the agent's own lines are the other key's.
+        let other = key_at(&dir.path().join("other-key")).verifying_key();
+        assert!(matches!(
+            verify_recent::<TestPayload, PortableHost>(&active, &other, 1 << 20),
+            Err(RecentError::SignedByAnotherKey(l)) if l.count == 3 && l.checked == 4
+        ));
+    }
+
+    /// In a window that starts inside the file, lines are placed by their
+    /// byte offset in the file: the index in the window (`entry 0`) was not
+    /// their place.
+    #[test]
+    fn a_window_inside_the_file_places_lines_by_byte_offset() {
+        let dir = TempDir::new().unwrap();
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let active = interleaved(dir.path(), &kp, 20, 2, 3);
+        let at = line_offsets(&active);
+        let len = fs::metadata(&active).unwrap().len();
+        // The window starts in the middle of line 15: lines 16 to 25.
+        let window = len - (at[14] + 10);
+        let err = verify_recent::<TestPayload, PortableHost>(&active, &pk, window).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                RecentError::SignedByAnotherKey(l) if l.count == 2
+                    && l.checked == 10
+                    && l.first == LinePos { offset: at[20], line: None, ts: ts(20) }
+                    && l.last == LinePos { offset: at[21], line: None, ts: ts(21) }
+            ),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "2 of the 10 lines checked are signed by another key, from the line at byte {} \
+                 (ts 2026-05-30T00:00:20.000000Z) to the line at byte {} (ts \
+                 2026-05-30T00:00:21.000000Z)",
+                at[20], at[21]
+            )),
+            "{text}"
+        );
+        // The window without them verifies.
+        let tail = len - at[22];
+        assert!(verify_recent::<TestPayload, PortableHost>(&active, &pk, tail).is_ok());
+    }
+
+    /// The other classes keep their name and stop the check at the first
+    /// line, placed: a line altered after it was written
+    /// (`content_altered`), a line removed (`link_broken`). Lines another
+    /// key signed before such a line are counted in its report.
+    #[test]
+    fn altered_and_removed_lines_keep_their_class_and_place() {
+        let dir = TempDir::new().unwrap();
+        let kp = dir.path().join("key");
+        let pk = key_at(&kp).verifying_key();
+        let active = dir.path().join("test.jsonl");
+        let mut log = open_log(&active, &kp, 1 << 30);
+        for i in 0..6 {
+            log.append(payload(i)).unwrap();
+        }
+        drop(log);
+        let pristine = fs::read(&active).unwrap();
+        let at = line_offsets(&active);
+        // altered: line 3's data, its hash and signature as they were
+        rewrite_line(&active, 2, |l| {
+            l.replace("record-number-2-", "record-number-X-")
+        });
+        let err = verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20).unwrap_err();
+        assert_eq!(err.class(), "content_altered");
+        assert!(
+            matches!(
+                &err,
+                RecentError::Broken(b) if b.pos.line == Some(3)
+                    && b.pos.offset == at[2]
+                    && matches!(b.line_break, LineBreak::ContentAltered { .. })
+                    && b.signed_by_another_key_before == 0
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "line 3 (byte {}, ts 2026-05-30T00:00:02.000000Z): its entry_hash does not \
+                 recompute",
+                at[2]
+            )),
+            "{err}"
+        );
+        // removed: line 3 gone, the next one no longer links
+        fs::write(&active, &pristine).unwrap();
+        let mut lines = raw_lines(&active);
+        lines.remove(2);
+        fs::write(&active, lines.join("\n") + "\n").unwrap();
+        let err = verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20).unwrap_err();
+        assert_eq!(err.class(), "link_broken");
+        assert!(
+            matches!(
+                &err,
+                RecentError::Broken(b) if b.pos == LinePos { offset: at[2], line: Some(3), ts: ts(3) }
+                    && matches!(b.line_break, LineBreak::LinkBroken { .. })
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("a line was removed, inserted or moved"),
+            "{err}"
+        );
+        // another key's lines, then an altered line of the agent's
+        fs::write(&active, &pristine).unwrap();
+        let mut other = open_log(&active, &dir.path().join("other-key"), 1 << 30);
+        for i in 6..8 {
+            other.append(payload(i)).unwrap();
+        }
+        drop(other);
+        let mut log = open_log(&active, &kp, 1 << 30);
+        log.append(payload(8)).unwrap();
+        drop(log);
+        rewrite_line(&active, 8, |l| {
+            l.replace("record-number-8-", "record-number-Y-")
+        });
+        let err = verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                RecentError::Broken(b) if b.pos.line == Some(9)
+                    && matches!(b.line_break, LineBreak::ContentAltered { .. })
+                    && b.signed_by_another_key_before == 2
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().ends_with(
+                "; before it, 2 lines of the window signed by another key (their hash and link \
+                 intact)"
+            ),
+            "{err}"
+        );
+    }
+
+    /// Only a plain timestamp of a line that failed is quoted.
+    #[test]
+    fn only_a_plain_timestamp_is_quoted() {
+        let v = |ts: &str| serde_json::json!({ "ts": ts });
+        assert_eq!(
+            plain_ts(&v("2026-10-20T08:35:00.123456Z")).as_deref(),
+            Some("2026-10-20T08:35:00.123456Z")
+        );
+        assert_eq!(
+            plain_ts(&v("2026-10-20T08:35:00+02:00")).as_deref(),
+            Some("2026-10-20T08:35:00+02:00")
+        );
+        for bad in ["x\nERROR forged", "", "2026-10-20 08:35", &"1".repeat(41)] {
+            assert_eq!(plain_ts(&v(bad)), None, "{bad:?}");
+        }
+        assert_eq!(plain_ts(&serde_json::json!({ "ts": 5 })), None);
+        assert_eq!(plain_ts(&serde_json::json!({})), None);
+    }
+
     // ── External audit, Wave 3, lab PR 190 ─────────────────────────────
 
     /// EVD-017 (NN-AUD-280): an empty `<base>.000001` next to a valid
@@ -4975,7 +5548,9 @@ mod tests {
             assert!(
                 matches!(
                     verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20),
-                    Err(LogSetError::NonCanonicalLine { idx: 1, .. })
+                    Err(RecentError::Broken(b)) if b.line_break == LineBreak::NotCanonical
+                        && b.pos.line == Some(2)
+                        && b.signed_by_another_key_before == 0
                 ),
                 "{what}: boot check"
             );
@@ -5170,7 +5745,8 @@ mod tests {
         );
         assert!(matches!(
             verify_recent::<TestPayload, PortableHost>(&active, &pk, 1 << 20),
-            Err(LogSetError::LegacyAfterV3 { idx: 3, .. })
+            Err(RecentError::Broken(b))
+                if b.line_break == LineBreak::LegacyAfterV3 && b.pos.line == Some(4)
         ));
     }
 
