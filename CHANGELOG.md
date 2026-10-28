@@ -530,17 +530,21 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   PROTECTED_PIDS). Follow-up (review #466 F5): the fallback is on the
   runtime directory's tmpfs, and root can delete it before the next start
   records it (the journal line, with the chain's hash, stays). On the lab
-  guest (Ubuntu 24.04): `test-ignored` 77
-  suites, 89 passed (the four new e2e on the real kernel); `tamper-check`
-  the same 75 outcomes and verdicts as `main`; the refusal paths on the
-  installed agent — a tampered binary, `chattr +i` on the audit log,
-  CAP_KILL dropped, a broken audit chain, a tampered binary with no pin —
-  each exit 78, signed, nothing loaded, no program or pin left, the pid
-  withdrawn (on `main`: three unsigned exits 1, the pid left in
-  PROTECTED_PIDS, and the broken chain refused after the load with 22
+  guest (Ubuntu 24.04), after the review's fixes: `test-ignored` 77
+  suites, 91 passed (the six new e2e on the real kernel; CI's KVM suites
+  the same on 5.15 and 6.8); `tamper-check` the same 75 outcomes and
+  verdicts as `main`; the refusal paths on the installed agent — a
+  tampered binary, `chattr +i` on the audit log, CAP_KILL dropped, a
+  broken audit chain, a tampered binary with no pin, the pin root a
+  symbolic link, a tmpfs over `/sys/kernel/btf`, the key hidden by a bind
+  mount of `/dev/null`, the review's four probes where the fallback goes
+  and two names planted in it — each exit 78, signed where a key can sign
+  it, nothing loaded, followed, created or quoted, no program or pin
+  left, the pid withdrawn (on `main`: three unsigned exits 1, the pid left
+  in PROTECTED_PIDS, and the broken chain refused after the load with 22
   programs and 22 links left pinned); `upgrade-check` from `main` and back
-  OK; the boots the same 204 lines but the key's line, the same signed
-  rows and capability manifest.
+  OK; the boots the same 204 lines but the key's line and the preflight's
+  step list, the same signed rows and capability manifest.
 - A tripped canary came back armed when the agent stopped between the
   trip's two rows (lab PR 260; lab PR 258's KVM run on Ubuntu 24.04:
   the e2e fixture's restart signal landed there, and
