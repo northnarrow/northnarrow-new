@@ -80,10 +80,18 @@ impl Verified {
 /// here with the rest of this module (its admin key set's verification
 /// first goes to nn-proto, R04b): the isolator names the gate through this
 /// trait, and the agent's gate implements it with its own read and check.
+/// R09c (lab PR 257): the integrity check, which moves to nn-linux too,
+/// holds the gate the same way ([`Vouch::is_signed`]).
 pub trait Vouch: Send + Sync + std::fmt::Debug {
     /// What the gate decided on the file at `path` for `kind`, with the text
     /// it read and verified (`OverlayGate::verified`).
     fn verified(&self, kind: OverlayKind, path: &Path) -> Verified;
+
+    /// Whether the file at `path` (an overlay of `kind`) carries a valid
+    /// signature for its current content (`OverlayGate::is_signed`): the
+    /// integrity check's question, to tell a `nn-admin config overlay set`
+    /// from an edit.
+    fn is_signed(&self, kind: OverlayKind, path: &Path) -> bool;
 }
 
 /// External audit LLMR-013: an overlay is read once, without following a

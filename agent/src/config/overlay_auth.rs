@@ -276,10 +276,15 @@ impl std::fmt::Debug for OverlayGate {
 
 /// The network isolator (nn-linux's since R09a, lab PR 253) holds the gate
 /// through nn-core's [`Vouch`]: [`OverlayGate::verified`], the same read
-/// and check.
+/// and check. The integrity check (R09c, lab PR 257) too:
+/// [`OverlayGate::is_signed`].
 impl Vouch for OverlayGate {
     fn verified(&self, kind: OverlayKind, path: &Path) -> Verified {
         OverlayGate::verified(self, kind, path)
+    }
+
+    fn is_signed(&self, kind: OverlayKind, path: &Path) -> bool {
+        OverlayGate::is_signed(self, kind, path)
     }
 }
 

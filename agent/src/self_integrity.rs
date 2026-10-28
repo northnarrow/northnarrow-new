@@ -1496,8 +1496,9 @@ struct Checker {
     once: HashSet<Finding>,
     /// External audit NN-AUD-114: the findings each round recomputes.
     active: ActiveSet,
-    /// Signed overlays are configuration, not drift (Tappa 10.8).
-    overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
+    /// Signed overlays are configuration, not drift (Tappa 10.8). R09c (lab
+    /// PR 257): the agent's signed-overlay gate, through nn-core's `Vouch`.
+    overlay_gate: Option<Arc<dyn nn_core::config::overlay_auth::Vouch>>,
     limits: LimitWatch,
     /// External audit EVD-014: how the watched paths resolved at start.
     mounts: MountWatch,
@@ -1736,11 +1737,13 @@ pub fn report_event(audit_log: Option<&Arc<Mutex<AuditLog>>>, f: &Finding) {
     );
 }
 
-/// Start the check (from `main`, once the audit log exists).
-pub fn spawn(
+/// Start the check (from `main`, once the audit log exists). R09c (lab PR
+/// 257): the gate is nn-core's [`Vouch`](nn_core::config::overlay_auth::Vouch),
+/// the agent's `OverlayGate`.
+pub fn spawn<G: nn_core::config::overlay_auth::Vouch + 'static>(
     audit_log: Option<Arc<Mutex<AuditLog>>>,
     watchdog_pidfile: PathBuf,
-    overlay_gate: Option<Arc<crate::config::overlay_auth::OverlayGate>>,
+    overlay_gate: Option<Arc<G>>,
 ) {
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let mut own_files = Vec::new();
@@ -1754,7 +1757,7 @@ pub fn spawn(
     let mut checker = Checker {
         once: HashSet::new(),
         active: ActiveSet::default(),
-        overlay_gate,
+        overlay_gate: overlay_gate.map(|g| g as Arc<dyn nn_core::config::overlay_auth::Vouch>),
         limits: LimitWatch::default(),
         mounts: MountWatch::default(),
         watchdog_pidfile,
