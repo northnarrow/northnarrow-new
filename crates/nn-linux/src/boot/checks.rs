@@ -169,31 +169,119 @@ pub struct AuditCheck {
     /// The log's writability, read without writing
     /// ([`audit_preflight::preflight_writable`]).
     pub preflight: AuditPreflight,
-    /// The start is refused: the log cannot be written and
-    /// `NN_AUDIT_ALLOW_UNWRITABLE=1` is not set.
+    /// R11b (lab PR 262): the log's open — its chain read — before the load.
+    pub open: AuditOpen,
+    /// The start is refused: the log cannot be written, or its chain cannot
+    /// be opened, and `NN_AUDIT_ALLOW_UNWRITABLE=1` is not set.
     pub fatal: bool,
+}
+
+/// The audit log's open, before anything is loaded (R11b, lab PR 262; the
+/// attest phase opened it after the attach until then).
+pub enum AuditOpen {
+    /// Opened for append, its chain read (a torn last write repaired and
+    /// signed): the attest phase appends the boot's rows to it.
+    Open(Box<crate::audit::AuditLog>),
+    /// Not opened before the attach: the previous agent's pinned hooks close
+    /// the log or the agent's key to this process, whose early registration
+    /// failed — only this boot's attach registers it. The attest phase opens
+    /// it (as it did before R11b), and a failure refuses the start there.
+    Deferred(String),
+    /// The agent's key cannot be loaded: the start runs unaudited, as before
+    /// R11b (lab PR 262 found it and left it).
+    NoKey(String),
+    /// The log cannot be opened: a line before the end is not a row (the
+    /// chain is broken), or the file cannot be opened for writing (under
+    /// the override). Why.
+    Failed(String),
+    /// Not tried: the preflight found the log unwritable without the
+    /// override.
+    NotTried,
+}
+
+impl std::fmt::Debug for AuditOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditOpen::Open(log) => write!(f, "Open(rows: {})", log.rows()),
+            AuditOpen::Deferred(why) => f.debug_tuple("Deferred").field(why).finish(),
+            AuditOpen::NoKey(why) => f.debug_tuple("NoKey").field(why).finish(),
+            AuditOpen::Failed(why) => f.debug_tuple("Failed").field(why).finish(),
+            AuditOpen::NotTried => f.write_str("NotTried"),
+        }
+    }
 }
 
 /// The audit log at `path` can be written: opened for append without
 /// writing, or its directory able to take it
-/// ([`audit_preflight::preflight_writable`];
-/// `closed_by_previous_hooks`: the early registration in the pinned
-/// `PROTECTED_PIDS` failed, so a permission error is left to the boot's
-/// write probe). An unwritable log refuses the start unless
+/// ([`audit_preflight::preflight_writable`]; `closed_by_previous_hooks`:
+/// the early registration in the pinned `PROTECTED_PIDS` failed, so a
+/// permission error is left to the attest phase); then (R11b, lab PR 262)
+/// opened with the agent's key at `signing_key` and the start's `agent_id`
+/// ([`crate::audit::AuditLog::open`]: its chain read, a broken one refused).
+/// An unwritable log or one that cannot be opened refuses the start unless
 /// `allow_unwritable` ([`crate::audit::AUDIT_ALLOW_UNWRITABLE_ENV`]) is `1`.
 pub fn audit_log(
     boot: &mut BootSequence,
     path: &Path,
+    signing_key: &Path,
+    agent_id: [u8; 16],
     closed_by_previous_hooks: bool,
     allow_unwritable: Option<&str>,
 ) -> Result<AuditCheck, BootOrderError> {
     let preflight = audit_preflight::preflight_writable(path, closed_by_previous_hooks);
-    let fatal = matches!(preflight, AuditPreflight::Unwritable(_))
-        && crate::audit::audit_failure_is_fatal(allow_unwritable);
+    let allowed = !crate::audit::audit_failure_is_fatal(allow_unwritable);
+    let open = match &preflight {
+        AuditPreflight::Unwritable(_) if !allowed => AuditOpen::NotTried,
+        AuditPreflight::Deferred(why) => AuditOpen::Deferred(why.clone()),
+        _ => open_audit_log(path, signing_key, agent_id, closed_by_previous_hooks),
+    };
+    let fatal = !allowed
+        && (matches!(preflight, AuditPreflight::Unwritable(_))
+            || matches!(open, AuditOpen::Failed(_)));
     if !fatal {
         boot.passed(BootStep::AuditWritable)?;
     }
-    Ok(AuditCheck { preflight, fatal })
+    Ok(AuditCheck {
+        preflight,
+        open,
+        fatal,
+    })
+}
+
+/// [`AuditLog::open`](crate::audit::AuditLog::open) with the agent's key,
+/// as the attest phase opened it.
+fn open_audit_log(
+    path: &Path,
+    signing_key: &Path,
+    agent_id: [u8; 16],
+    closed_by_previous_hooks: bool,
+) -> AuditOpen {
+    // A permission error while the previous hooks may close the agent's
+    // files to this process: the attach registers it, the attest phase opens
+    // the log (lab PR 218's deferral, for the key and the log too).
+    let closed = |e: &anyhow::Error| {
+        closed_by_previous_hooks
+            && e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+            })
+    };
+    let key = match crate::keys::AgentSigningKey::load_or_bootstrap(signing_key) {
+        Ok(key) => key,
+        Err(e) if closed(&e) => {
+            return AuditOpen::Deferred(format!(
+                "{e:#} (the previous agent's hooks close it to an unregistered process)"
+            ))
+        }
+        Err(e) => return AuditOpen::NoKey(format!("{e:#}")),
+    };
+    match crate::audit::AuditLog::open(path, key, agent_id) {
+        Ok(log) => AuditOpen::Open(Box::new(log)),
+        Err(e) if closed(&e) => AuditOpen::Deferred(format!(
+            "{e:#} (the previous agent's hooks close it to an unregistered process)"
+        )),
+        Err(e) => AuditOpen::Failed(format!("{e:#}")),
+    }
 }
 
 /// `bpf` in the LSMs the kernel runs (`sys/kernel/security/lsm` under
@@ -395,19 +483,79 @@ mod tests {
     #[test]
     fn an_unwritable_audit_log_records_nothing_unless_allowed() {
         let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("agent.sig.key");
         let not_a_file = dir.path().join("audit.log");
         std::fs::create_dir(&not_a_file).unwrap();
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &not_a_file, false, None).unwrap();
+        let c = audit_log(&mut boot, &not_a_file, &key, [1; 16], false, None).unwrap();
         assert!(matches!(c.preflight, AuditPreflight::Unwritable(_)));
+        assert!(matches!(c.open, AuditOpen::NotTried), "{:?}", c.open);
         assert!(c.fatal);
         assert!(!has(&boot, BootStep::AuditWritable));
-        let c = audit_log(&mut boot, &not_a_file, false, Some("1")).unwrap();
+        assert!(!key.exists(), "nothing opened, no key minted");
+        // the override: tried, it fails, the start goes on unaudited
+        let c = audit_log(&mut boot, &not_a_file, &key, [1; 16], false, Some("1")).unwrap();
+        assert!(matches!(c.open, AuditOpen::Failed(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(has(&boot, BootStep::AuditWritable));
+    }
+
+    /// R11b (lab PR 262): the audit chain is opened before the load — a
+    /// fresh one and a written one open (the attest phase appends to them),
+    /// a broken one refuses the start, a key that cannot be loaded leaves
+    /// the start unaudited as before.
+    #[test]
+    fn the_audit_chain_opens_before_the_load_or_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("agent.sig.key");
+        let path = dir.path().join("audit.log");
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &dir.path().join("fresh.log"), false, None).unwrap();
+        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
         assert_eq!(c.preflight, AuditPreflight::Writable);
+        let AuditOpen::Open(mut log) = c.open else {
+            panic!("{:?}", c.open)
+        };
+        assert!(!c.fatal);
+        assert!(has(&boot, BootStep::AuditWritable));
+        let build = crate::audit::AgentBuild {
+            version: "0.0.0",
+            features: Vec::new(),
+            bpf_guard_enforce: true,
+        };
+        log.boot_probe(None, "no-manifest", "none", &build).unwrap();
+        drop(log);
+        // written: opens again, the next row chains on
+        let mut boot = BootSequence::new();
+        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let AuditOpen::Open(log) = c.open else {
+            panic!("{:?}", c.open)
+        };
+        assert_eq!(log.rows(), 1);
+        drop(log);
+        // a line before the end that is not a row: the chain is broken
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{{not a row}}\n{text}")).unwrap();
+        let mut boot = BootSequence::new();
+        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        assert!(
+            matches!(c.open, AuditOpen::Failed(ref why) if why.contains("parsing")),
+            "{:?}",
+            c.open
+        );
+        assert!(c.fatal);
+        assert!(!has(&boot, BootStep::AuditWritable));
+        // under the override the start goes on, unaudited
+        let c = audit_log(&mut boot, &path, &key, [1; 16], false, Some("1")).unwrap();
+        assert!(matches!(c.open, AuditOpen::Failed(_)));
+        assert!(!c.fatal);
+        // a key that cannot be loaded: unaudited, as before R11b
+        let bad_key = dir.path().join("bad.key");
+        std::fs::write(&bad_key, "not a key\n").unwrap();
+        let mut boot = BootSequence::new();
+        let other = dir.path().join("other.log");
+        let c = audit_log(&mut boot, &other, &bad_key, [1; 16], false, None).unwrap();
+        assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
+        assert!(!c.fatal);
         assert!(has(&boot, BootStep::AuditWritable));
     }
 
@@ -466,11 +614,18 @@ mod tests {
         )
         .unwrap();
         assert!(!c.fatal);
-        assert!(
-            !audit_log(&mut boot, &dir.path().join("audit.log"), false, None)
-                .unwrap()
-                .fatal
-        );
+        let key = dir.path().join("agent.sig.key");
+        let audit = audit_log(
+            &mut boot,
+            &dir.path().join("audit.log"),
+            &key,
+            [1; 16],
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!audit.fatal);
+        assert!(matches!(audit.open, AuditOpen::Open(_)));
         assert!(matches!(
             bpf_lsm(&mut boot, dir.path(), false).unwrap().1,
             LsmGate::Proceed

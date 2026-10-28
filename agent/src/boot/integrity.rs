@@ -33,6 +33,9 @@ pub(crate) struct Integrity {
     /// The active LSMs, for the self-test, the trust level and the
     /// capability manifest.
     pub(crate) bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
+    /// R11b (lab PR 262): the audit log, opened before the load (its chain
+    /// read): the attest phase appends the boot's rows to it.
+    pub(crate) audit: checks::AuditOpen,
     /// Lab PR 218: the only way into the kernel, given by
     /// `BootSequence::verify_integrity` once every preflight check has
     /// passed (R11b, lab PR 262: the load, the pins and the attaches take
@@ -268,14 +271,23 @@ pub(crate) fn check(
     // writability before anything attaches — a read-only mount or an
     // immutable file refuses the start while the host is untouched. The
     // signed `agent_boot` after the attach still proves it with a row.
+    // R11b (lab PR 262): and its chain, opened here — a broken chain refuses
+    // the start before anything is loaded (the attest phase opened it after
+    // the attach until then), and the attest phase appends to this log.
     let audit = checks::audit_log(
         boot,
         &cli.audit_log_file,
+        &cli.signing_key_file,
+        identity.id,
         early_registration_failed,
         std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
             .ok()
             .as_deref(),
     )?;
+    let preflight_deferred = matches!(
+        audit.preflight,
+        northnarrow_agent::audit_preflight::AuditPreflight::Deferred(_)
+    );
     match audit.preflight {
         northnarrow_agent::audit_preflight::AuditPreflight::Writable => {
             debug!(path = %cli.audit_log_file.display(), "audit log writable (preflight)")
@@ -303,6 +315,42 @@ pub(crate) fn check(
             }
         }
     }
+    let audit_open = match audit.open {
+        checks::AuditOpen::Failed(why) => {
+            let fatal = audit.fatal;
+            error!(
+                error = why,
+                fatal,
+                "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED"
+            );
+            if fatal {
+                anyhow::bail!(
+                    "audit log {} cannot be opened: {why}. Refusing to run unaudited; set {}=1 to \
+                     start anyway.",
+                    cli.audit_log_file.display(),
+                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                );
+            }
+            checks::AuditOpen::Failed(why)
+        }
+        checks::AuditOpen::NoKey(why) => {
+            warn!(
+                error = why,
+                "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED \
+                 this boot"
+            );
+            checks::AuditOpen::NoKey(why)
+        }
+        checks::AuditOpen::Deferred(why) if !preflight_deferred => {
+            info!(
+                why,
+                "audit chain closed to this process until the attach registers it — opened after \
+                 the attach"
+            );
+            checks::AuditOpen::Deferred(why)
+        }
+        other => other,
+    };
 
     // Host hardening (Tappa 10.8): the anti-tamper holds only while root
     // cannot rewrite the kernel at runtime. One WARN per missing setting,
@@ -366,6 +414,7 @@ pub(crate) fn check(
         host_checks,
         allow_degraded,
         bpf_lsm_state,
+        audit: audit_open,
         verified,
     })
 }

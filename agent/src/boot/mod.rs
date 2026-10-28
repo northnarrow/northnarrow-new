@@ -5,8 +5,9 @@
 //! instead of comments in `main()`:
 //!
 //! 1. [`BootPhase::Preflight`] — checks only, nothing is loaded into the
-//!    kernel: the embedded eBPF object, the BTF offsets, the capabilities,
-//!    the install manifest, the audit log's writability, the active LSMs
+//!    kernel: the embedded eBPF object, the state directory, the BTF
+//!    offsets, the capabilities, the install manifest, the audit log's
+//!    writability and (R11b, lab PR 262) its chain, opened, the active LSMs
 //!    ([`lsm`]). A refusal here leaves the host as it was.
 //! 2. [`BootPhase::Attach`] — the eBPF object, the sensors and the deny
 //!    hooks. Only an [`IntegrityVerified`] opens it, and only
@@ -17,8 +18,9 @@
 //! 3. [`BootPhase::SelfTest`] — one deny hook exercised against the agent
 //!    itself ([`deny_selftest`]): "attached but never run" is measured, not
 //!    assumed.
-//! 4. [`BootPhase::Attest`] — the signed audit log opens (`agent_boot`),
-//!    then every degradation found so far is signed ([`degradation`]).
+//! 4. [`BootPhase::Attest`] — the signed audit log, opened in the preflight,
+//!    takes the boot's rows (`agent_boot`), then every degradation found so
+//!    far is signed ([`degradation`]).
 //! 5. [`BootPhase::Subsystems`] — what needs the audit log: the FIM
 //!    observers, the file-open sensor, the drains, the admin socket.
 //! 6. [`BootPhase::Run`] — the capability manifest and the trust level are
@@ -173,6 +175,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         host_checks,
         allow_degraded,
         bpf_lsm_state,
+        audit,
         verified,
     } = integrity::check(
         &cli,
@@ -220,6 +223,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         hook_args_degraded,
         exploit_guard_degraded,
         caps_degraded,
+        audit,
     )?;
     let policy::Policy {
         netflow_blocklist,
@@ -649,10 +653,16 @@ mod tests {
         }
         let selftest = at("boot::deny_selftest::run(");
         assert!(selftest > at(".attach_anti_tamper("));
-        let audit_open = at("AuditLog::open(&cli.audit_log_file, key, agent_id) {");
-        assert!(audit_open > selftest);
-        assert!(at("boot.enter(BootPhase::Attest)") < audit_open);
-        assert!(at("boot.enter(BootPhase::Subsystems)") > audit_open);
+        // R11b (lab PR 262): the audit chain opens before the load (above,
+        // `checks::audit_log`); the boot's own row after the self-test, in
+        // the attest phase, and the open deferred by the previous agent's
+        // hooks there too, before it
+        let agent_boot = at(".boot_probe(");
+        assert!(agent_boot > selftest);
+        let deferred = at("open_after_attach(cli, agent_id)");
+        assert!(at("boot.enter(BootPhase::Attest)") < deferred);
+        assert!(deferred < agent_boot);
+        assert!(at("boot.enter(BootPhase::Subsystems)") > agent_boot);
         assert!(
             at("RuleEngine::with_default_rules_and_net(") > at("boot.enter(BootPhase::Subsystems)"),
             "the rule engine in the subsystems phase, after the audit log"
