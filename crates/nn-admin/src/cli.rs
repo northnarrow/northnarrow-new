@@ -3527,6 +3527,15 @@ fn exit_from_fim_baseline(outcome: FimBaselineOutcome) -> ExitCode {
             eprintln!("fim baseline: server rejected operation");
             ExitCode::from(5)
         }
+        FimBaselineOutcome::ActionFailed => {
+            // Lab PR 263: verified, not carried out (exit 5, as before).
+            eprintln!(
+                "fim baseline: nothing was recorded: the agent verified the request but has no \
+                 baseline recompute task this boot (it found no baseline database: see the \
+                 agent's journal)"
+            );
+            ExitCode::from(5)
+        }
         FimBaselineOutcome::ProtocolVersionUnsupported { server_version } => {
             eprintln!("fim baseline: server speaks protocol v{server_version}");
             ExitCode::from(5)

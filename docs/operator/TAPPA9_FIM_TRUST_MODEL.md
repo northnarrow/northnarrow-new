@@ -46,7 +46,11 @@ didn't observe.
 2. Run `nn-admin fim baseline` manually after a known-good moment
    (e.g., post-`apt upgrade && reboot` on a clean image). The
    chain APPENDS — old entries stay as audit history; the latest
-   entry per path is the active baseline.
+   entry per path is the active baseline. An agent that found no
+   baseline database at its start records nothing, and says so
+   (lab PR 263): `fim baseline: nothing was recorded: …`, exit 5,
+   a signed `fim_baseline` row `failure: action_failed`; the
+   agent's journal says why the database did not open.
 3. Cross-check the baseline against an external known-good
    manifest (a future V1.1 `seed-from-file` op will accept a
    signed SHA-256 manifest at install time; until then, operators
