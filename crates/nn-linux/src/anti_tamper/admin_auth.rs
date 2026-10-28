@@ -211,6 +211,9 @@ pub struct AdminAuth {
     /// audit chain shows a `rotate_keys_add`, or this run added one): the
     /// 1-of-N bootstrap relaxation never applies again.
     bootstrap_consumed: std::sync::atomic::AtomicBool,
+    /// Lab PR 263's review (L-4): one rotation of `admin.pub` at a time
+    /// ([`Self::rotation_lock`]).
+    rotation: parking_lot::Mutex<()>,
 }
 
 impl AdminAuth {
@@ -377,6 +380,7 @@ impl AdminAuth {
             loaded_admin_pub: RwLock::new(Vec::new()),
             skipped_lines: RwLock::new(Vec::new()),
             bootstrap_consumed: std::sync::atomic::AtomicBool::new(false),
+            rotation: parking_lot::Mutex::new(()),
         }
     }
 
@@ -396,6 +400,16 @@ impl AdminAuth {
     /// signed audit chain, and after a second key is added.
     pub fn mark_bootstrap_consumed(&self) {
         self.bootstrap_consumed.store(true, Ordering::SeqCst);
+    }
+
+    /// Lab PR 263's review (L-4): one rotation of `admin.pub` at a time.
+    /// The admin socket holds it for a `rotate-keys add` or `revoke` from
+    /// its first look at the key set (the bootstrap gate, the verify) to
+    /// the reload: two concurrent adds could each find the one-key
+    /// bootstrap armed and pass with one signature, and two rewrites of
+    /// the file could each lose the other's line.
+    pub fn rotation_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.rotation.lock()
     }
 
     /// Verify `signature` over `nonce` — the challenge one connection

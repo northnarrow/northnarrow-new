@@ -1675,6 +1675,98 @@ fn a_bootstrap_gate_not_armed_keeps_the_add_two_of_n() {
     }
 }
 
+/// Lab PR 263's review (L-4): two `rotate-keys add` sent at once while the
+/// one-key bootstrap is armed, on two connections, signed by the one key:
+/// one adds its key, the other waits for the rotation lock and then finds
+/// the bootstrap spent. Both used to read the gate armed and pass. Several
+/// rounds, each on a fresh install.
+#[test]
+fn two_concurrent_bootstrap_adds_admit_one() {
+    let k = keys();
+    for round in 0..8 {
+        let fx = Fixture::bootstrap(&k.a);
+        let start = std::sync::Barrier::new(2);
+        let replies: Vec<AdminMessage> = std::thread::scope(|s| {
+            let threads: Vec<_> = [&k.b, &k.canary_read]
+                .into_iter()
+                .map(|new| {
+                    let (fx, start) = (&fx, &start);
+                    let a = &k.a;
+                    s.spawn(move || {
+                        let conn = ConnAuth::new(&fx.auth);
+                        let nonce = fx.challenge(&conn);
+                        let extra = OperationExtra::RotateKeysAdd(RotateKeysAddExtra {
+                            new_pubkey: new.verifying_key().to_bytes(),
+                            roles: vec![Role::AuditRead],
+                        });
+                        let p = payload(extra, nonce, now_unix_secs(), AGENT_ID);
+                        let request = AdminMessage::RotateKeysAddRequest(RotateKeysAddRequest {
+                            signatures: signatures(&p, &[a]),
+                            payload: p,
+                        });
+                        start.wait();
+                        fx.serve(&conn, &request)
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let mut results: Vec<AdminResult> = replies.iter().map(result_of).collect();
+        results.sort_by_key(|r| format!("{r:?}"));
+        assert_eq!(
+            results,
+            [ONE_OF_TWO, AdminResult::Success],
+            "round {round}: one add, the other refused"
+        );
+        assert_eq!(fx.admin_keys(), 2, "round {round}");
+    }
+}
+
+/// Lab PR 263's review (L-4): a `rotate-keys add` or `revoke` waits for the
+/// rotation in flight before it reads the bootstrap gate or verifies —
+/// here the test holds the lock, and spends the bootstrap meanwhile, as an
+/// add in flight does.
+#[test]
+fn a_rotation_waits_for_the_one_in_flight() {
+    let k = keys();
+    let fx = Fixture::bootstrap(&k.a);
+    let in_flight = fx.auth.rotation_lock();
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (fx, k) = (&fx, &k);
+        let add = {
+            let tx = tx.clone();
+            s.spawn(move || tx.send(("add", add_key(fx, &k.b, &[&k.a]).0)).unwrap())
+        };
+        let revoke = s.spawn(move || {
+            let extra = OperationExtra::RotateKeysRevoke(RotateKeysRevokeExtra {
+                fingerprint: fp_bytes(&k.a),
+            });
+            tx.send(("revoke", send(fx, extra, &[&k.a]).0)).unwrap()
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(400))
+                .is_err(),
+            "a rotation ran beside the one in flight"
+        );
+        fx.auth.mark_bootstrap_consumed();
+        drop(in_flight);
+        add.join().unwrap();
+        revoke.join().unwrap();
+        let mut replies: Vec<(&str, AdminMessage)> = rx.iter().collect();
+        replies.sort_by_key(|(verb, _)| *verb);
+        assert_eq!(
+            replies,
+            [
+                ("add", AdminMessage::RotateKeysAddResult(ONE_OF_TWO)),
+                ("revoke", AdminMessage::RotateKeysRevokeResult(ONE_OF_TWO)),
+            ],
+            "after it, the add found the bootstrap spent"
+        );
+    });
+    assert_eq!(fx.admin_keys(), 1);
+}
+
 /// Every role but `all`, by hand: a role the enum gains is a role these
 /// tests must place (`every_role_is_in_the_role_tests`).
 const EVERY_ROLE: [Role; 16] = [

@@ -69,6 +69,10 @@ pub(in crate::admin) fn dispatch_rotate_keys_add(
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
+    // One rotation at a time (lab PR 263's review, L-4): the bootstrap
+    // gate, the verify, the rewrite and the reload under the key set's
+    // rotation lock — a second add waits, then finds the gate closed.
+    let _rotation = auth.rotation_lock();
     // BUG-013 (PHASE 15.1): 2-of-N, or 1-of-N while the one-key
     // bootstrap is armed — the pipeline's quorum (`verify::Quorum`).
     signed(&req, auth, fps_out, |r| r, |v| rotate_keys_add(v, auth))
@@ -228,6 +232,9 @@ pub(in crate::admin) fn dispatch_rotate_keys_revoke(
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
+    // One rotation at a time, as the add (L-4): a revoke and an add would
+    // each rewrite the admin.pub they read, losing the other's line.
+    let _rotation = auth.rotation_lock();
     // 2-of-N per §3.3, the pipeline's (`verify::signed`).
     signed(&req, auth, fps_out, |r| r, |v| rotate_keys_revoke(v, auth))
 }
