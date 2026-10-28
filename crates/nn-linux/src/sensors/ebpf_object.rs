@@ -1,6 +1,7 @@
 //! The embedded eBPF object — single source of truth + boot preflight.
 //!
-//! `agent/build.rs` stages the compiled `.o` into `OUT_DIR` and, when
+//! nn-linux's `build.rs` (the agent's until R09b, lab PR 254) stages the
+//! compiled `.o` into `OUT_DIR` and, when
 //! it does, records two facts about it as compile-time env:
 //!   * `NN_EBPF_EMBEDDED` — `"1"` if a real, **staleness-verified**
 //!     object was embedded, `"0"` if only the empty placeholder is
@@ -24,7 +25,7 @@ use aya::include_bytes_aligned;
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-/// Compiled eBPF object, staged into `OUT_DIR` by `agent/build.rs`.
+/// Compiled eBPF object, staged into `OUT_DIR` by nn-linux's `build.rs`.
 ///
 /// `include_bytes_aligned!` wraps the bytes in a `#[repr(align(32))]`
 /// struct: aya's ELF parser does pointer-aligned reads internally and
@@ -37,7 +38,7 @@ pub static EBPF_BYTES: &[u8] =
 const EMBEDDED: &str = env!("NN_EBPF_EMBEDDED");
 /// SHA-256 (hex) of the embedded object bytes, as recorded at build.
 /// SHA-256 (hex) of the embedded eBPF object — compared with the install
-/// manifest at boot (`crate::install_manifest`).
+/// manifest at boot (the agent's `install_manifest`).
 pub const OBJECT_SHA: &str = env!("NN_EBPF_OBJECT_SHA");
 /// eBPF source-closure provenance hash the object was built from.
 const BUILD_HASH: &str = env!("NN_EBPF_BUILD_HASH");

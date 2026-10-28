@@ -148,7 +148,7 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     async fn do_start(net: Option<NetWiring>) -> Result<(Self, Option<NetRingBufs>)> {
         if EBPF_BYTES.is_empty() {
             anyhow::bail!(
-                "eBPF program not built: agent/build.rs found no artifact. Run \
+                "eBPF program not built: crates/nn-linux/build.rs found no artifact. Run \
                  `cargo xtask build-ebpf` first."
             );
         }

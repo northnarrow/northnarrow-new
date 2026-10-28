@@ -1062,7 +1062,8 @@ cmd_install() {
     # `sync` rewrites the eBPF provenance stamp, so an agent binary built
     # before the last sync is "older than the stamp" and install.sh
     # (require_fresh_ebpf) refuses it. An incremental build re-runs
-    # agent/build.rs and relinks the agent — seconds when nothing changed.
+    # crates/nn-linux/build.rs and relinks the agent — seconds when nothing
+    # changed.
     cmd_build
     # Re-install on a host where an agent already ran: its binaries, unit
     # files and now the pin root itself are in PROTECTED_INODES, and the deny

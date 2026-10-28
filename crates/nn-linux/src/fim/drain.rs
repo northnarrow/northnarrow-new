@@ -6,7 +6,7 @@
 //! consumes. Per design §6.3 + §6.5:
 //!
 //! 1. Drain `FS_FIM_EVENTS` via aya's `RingBuf::poll` (the
-//!    pattern matches `agent/src/sensors/multiplexer.rs::pump`).
+//!    pattern matches `sensors::multiplexer::pump`).
 //! 2. Decode each `FimDriftRaw` (C1 wire type).
 //! 3. Resolve `(target_dev, target_ino)` → absolute path via
 //!    the userland [`InodePathMap`] populated by C7 deploy

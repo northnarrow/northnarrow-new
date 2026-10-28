@@ -14,7 +14,7 @@
 # ./target/release/{northnarrow-agent,northnarrow-watchdog,nn-admin,northnarrow-scan}.
 # Use xtask, NOT a bare `cargo build`: xtask compiles the eBPF object
 # (separate nightly/bpfel toolchain) and the userland in one step, and
-# stamps the object so agent/build.rs can prove it is fresh. A plain
+# stamps the object so crates/nn-linux/build.rs can prove it is fresh. A plain
 # `cargo build` does NOT rebuild the eBPF object and cannot produce an
 # installable agent — the build fails on a stale/unstamped object.
 # Pre-flights every step (including eBPF object freshness, see
@@ -27,7 +27,7 @@
 #     is bytemuck Pod and the eBPF object is embedded in + rebuilt
 #     atomically with the agent binary this script installs — and that
 #     atomicity is now ENFORCED, not assumed: `cargo xtask build` stamps
-#     the eBPF object with a source-closure hash, `agent/build.rs`
+#     the eBPF object with a source-closure hash, `crates/nn-linux/build.rs`
 #     refuses to embed a stale/unstamped object (fail-loud at build), the
 #     agent refuses to start on a placeholder (boot preflight), and
 #     require_fresh_ebpf below refuses to install an agent older than its
@@ -662,7 +662,7 @@ require_file() {
 
 # Cluster-15 staleness guard, install-time half. The eBPF object is
 # compiled by `cargo xtask` and EMBEDDED into the agent binary at build
-# time; `agent/build.rs` refuses to embed a stale or unstamped object,
+# time; `crates/nn-linux/build.rs` refuses to embed a stale or unstamped object,
 # and the agent refuses to start on the empty placeholder. This check is
 # the belt-and-suspenders: it refuses to install an agent binary that is
 # OLDER than the current eBPF object/stamp (the eBPF was rebuilt but the
