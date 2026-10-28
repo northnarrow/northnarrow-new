@@ -286,6 +286,10 @@ planned = false
 "posture" = "nn-core"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
 "removed_settings" = "northnarrow-agent"
+# R11a (lab PR 261): `main.rs`'s event loop, as the plan names it (§2.4:
+# `main` → `boot/*`, `pipeline/*`, `run_loop.rs`, `shutdown.rs`): the
+# composition
+"run_loop" = "northnarrow-agent"
 # R09b (lab PR 254): the sensors moved to nn-linux with the eBPF object's
 # embed (`build.rs`); the agent's `sensors.rs` keeps their paths and names
 # the loader on the agent's exec guards (`exec_guards`), an alias as the
