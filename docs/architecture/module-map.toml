@@ -272,14 +272,11 @@ planned = false
 "posture" = "nn-core"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
 "removed_settings" = "northnarrow-agent"
-"sensor_feasibility" = "nn-linux"
 # R09b (lab PR 254): the sensors moved to nn-linux with the eBPF object's
 # embed (`build.rs`); the agent's `sensors.rs` keeps their paths and names
 # the loader on the agent's exec guards (`exec_guards`), an alias as the
 # posture's on `LinuxHost`
 "sensors" = "nn-linux"
-# post-plan (lab only): `--verifier-check`
-"verifier_check" = "nn-linux"
 
 # ── agent/src: the shims of R05, R07 and R08a ─────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
@@ -382,6 +379,11 @@ planned = false
 "audit_preflight" = "nn-linux"
 "shutdown_marker" = "nn-linux"
 "upgrade_rollback" = "nn-linux"
+# R09c (lab PR 257): the lab builds' probes — `--sensor-feasibility`
+# (feature `test-privileged`) and `--verifier-check` (post-plan, feature
+# `debug-trigger`), behind nn-linux's features, which the agent forwards
+"sensor_feasibility" = "nn-linux"
+"verifier_check" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"

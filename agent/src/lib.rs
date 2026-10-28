@@ -184,10 +184,13 @@ pub(crate) use nn_linux::runtime;
 pub use nn_linux::sd_notify;
 /// R09c shim: the self-integrity watcher is nn-linux's.
 pub use nn_linux::self_integrity;
-/// Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`).
+/// R09c shim: Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`),
+/// is nn-linux's (this crate's `test-privileged` turns on nn-linux's).
 #[cfg(feature = "test-privileged")]
-pub mod sensor_feasibility;
+pub use nn_linux::sensor_feasibility;
 pub mod sensors;
+/// R05 shim: the full verifiers' line reader.
+pub use nn_evidence::verify_lines;
 /// R09c shim: the shutdown marker's file (its format is nn-proto's) is
 /// nn-linux's.
 pub use nn_linux::shutdown_marker;
@@ -200,9 +203,8 @@ pub use nn_linux::telemetry_probe;
 pub use nn_linux::trusted_bin;
 /// R09c shim: the signed record of a rolled-back upgrade is nn-linux's.
 pub use nn_linux::upgrade_rollback;
-/// Lab builds only (`--verifier-check`): every program of the embedded
-/// eBPF object through the kernel's verifier.
+/// R09c shim: lab builds only (`--verifier-check`), every program of the
+/// embedded eBPF object through the kernel's verifier, is nn-linux's (this
+/// crate's `debug-trigger` turns on nn-linux's).
 #[cfg(feature = "debug-trigger")]
-pub mod verifier_check;
-/// R05 shim: the full verifiers' line reader.
-pub use nn_evidence::verify_lines;
+pub use nn_linux::verifier_check;

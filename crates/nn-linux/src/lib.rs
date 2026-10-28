@@ -297,6 +297,13 @@ pub mod sd_notify;
 // names, came first, R09a).
 pub mod self_integrity;
 
+// Tappa 10.9, step 0, lab builds only (`--sensor-feasibility`): the
+// throw-away probes of the candidate attach points, loaded and exercised on
+// the running kernel (R09c, lab PR 257; was the agent's
+// `sensor_feasibility`, behind the same feature, which the agent forwards).
+#[cfg(feature = "test-privileged")]
+pub mod sensor_feasibility;
+
 // The sensors (Tappa 4, Tappa 10): the embedded eBPF object and its boot
 // preflight, the single loader that attaches every program and pumps every
 // ring into one channel, the exec, file-open, DNS, connect-deny and exploit
@@ -329,6 +336,12 @@ pub mod trusted_bin;
 // restored (lab PR 220; R09c, lab PR 257; was the agent's
 // `upgrade_rollback`).
 pub mod upgrade_rollback;
+
+// Lab builds only (`--verifier-check`): every program of the embedded eBPF
+// object through the kernel's verifier (R09c, lab PR 257; was the agent's
+// `verifier_check`, behind the same feature, which the agent forwards).
+#[cfg(feature = "debug-trigger")]
+pub mod verifier_check;
 
 // R09a shims (lab PR 253; plan §4.1 rule 2, removed in R17): the paths the
 // moved code names for what is nn-evidence's and nn-core's, as the agent's
