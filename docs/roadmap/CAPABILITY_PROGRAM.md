@@ -2164,3 +2164,96 @@ only in the table below, in the same PR as the evidence.
     and the systemd unit (embedded, their bytes the shipped ones) still
     name the old paths.
   - Lab: On Ubuntu 24.04 (6.8.0-147, the lab guest ubuntu2404, ssh 2322, QEMU for Windows with WHPX, 4 vCPU; no other guest up), the lot's code (d8b91cf) synced, built (release, test-privileged,debug-trigger) and installed (`nn-lab.sh sync`, `build`, `install`): both units active, every deny hook attached (19 of 19), the deny self-test passed, trust level L3. `tamper-check`: 72 of 75 cases OK — C27 (no lockdown on the guest) and C57c (the journal's vacuum) known gaps, C64 (the stale own link id of lab PR 215) the recorded deviation —, and `main` 0e89772 on the same guest right after (synced, built and installed the same way) gave the same 75 outcomes and verdicts, case by case (C38's PIDs aside); the evidence of 7 cases differs by the host's events in a case's window — the self-integrity watcher's jittered rounds, a `modprobe` systemd ran (R011), rsyslog rewriting `/var/log/syslog` and `auth.log` (FIM-005) — which `main`'s run saw at other cases or not at all. `ransom-check`: 15 PASS, 1 SKIP (MS-25's auditd, not installed on the guest), `policy-check`: 8 PASS — the same lines as `main`'s on that guest. `test-ignored` (every `#[ignore]` test as root, single-threaded, its five runs): 75 suites, 84 passed, 0 failed — nn-linux's 9 privileged tests among them (the kills, the freeze, the cgroup release, the kernel's BTF) —, the totals of lab PR 252's KVM run of `main`'s tree on Ubuntu 24.04. Each boot's chain check flags the guest's detections log (an entry under another key: the e2e fixtures' agents write the same file), on `main`'s boots as on the tip's. The guest powered off after. Host, on d8b91cf (the lot's code) and again on the final tree, `set -o pipefail`, `CARGO_BUILD_JOBS=6`: `cargo xtask build-ebpf --release`; the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo, whose output is `main`'s line for line); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 70 suites, 3,067 passed, 0 failed, 15 ignored (the test list is `main`'s — 3,082 names, every one found at the tip, 438 now nn-linux's (0 → 438 there, the agent's library 1,268 → 830) and 6 at a new path in the agent; no test added or removed, no `#[ignore]` added); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` five times, each a process of its own: 11 tests passed each time, the 33 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed by the build); `portable-core`'s `cargo check` of the pure crates for its five targets: all pass. The pins pass unchanged, by name: `encoded_frames_are_pinned`, `chain_format_pin` (5, its generator ignored), `chain_format_clock` (2), `crypto_vectors` (19: the vault's 10 nn-linux's now), the TLS and DNS parser pins (5), the overlay-v1 fixture (2), the per-rule policy's format (its 12 tests, nn-core's; the exemption facts' 2, nn-linux's now; the signed overlay's and the fuzz seeds' tests). `nn-admin policy test`, `main`'s binary and the tip's on lab PR 251's samples (the 24 golden cases under the built-in defaults and three candidate policies, with the shipped lists and with none, as a table and as JSON, and every case's events as one stream, plain and wrapped): the 402 outputs are the same bytes. Identity against `main` 0e89772, both built in one temporary checkout (same path), the release job's commands (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`; unstripped: the same flags, `CARGO_PROFILE_RELEASE_STRIP=none`): the eBPF object is byte-identical (sha256 a568d328… there), its stamp too at the code tip (source c0365736…, `main`'s) and on the final tree but its source hash, 235e2fed… (the guardrail commit's test and a comment of `common`); the scanner (401,368 bytes) and the watchdog (2,337,080) are byte-identical, stripped and unstripped; `mk-tarball.sh`: the same 72 entries, paths and modes; `mk-packages.sh` (.deb): the same 79 paths and modes — the agent, nn-admin, the eBPF stamp, `CHANGELOG.md`, `install.sh` and the two operator guides whose path mentions changed aside —; the agent's SBOM lists nn-linux. The agent (14,998,040 → 15,192,208 bytes) and nn-admin (4,086,576 → 4,129,480) are not byte-identical. Function by function (unstripped, names mapped to the new crates and modules, addresses and rip-relative targets dropped, trailing padding dropped): the agent 7,550 of 7,739 the same code (172 differ, 17 and 270 unpaired), nn-admin 3,476 of 3,527 (42; 9 and 86). Control — `main` with nn-linux's dependencies and features and the agent's on nn-linux, no source moved: the watchdog and the scanner byte-identical, 19 of the agent's functions and 6 of nn-admin's change already (clap's `TypeId`s of the binaries' enums; which of identical bodies keeps its name), the sizes within 32 bytes. From the control to the lot's code: 160 of the agent's — 110 call other callees (inlining at the new crate boundary), 41 schedule or allocate registers otherwise, 5 have the same instructions with other operands, 4 names have several bodies — and 36 of nn-admin's (24, 11, 1); `NetworkIsolator::trusted_source` differs by its one call, through `Vouch`'s vtable. The unpaired are generic code instantiated in nn-linux as in the agent (the extra copies of an instantiation 736 → 953 in the agent, 360 → 434 in nn-admin: serde_json's deserializers and float parsers, anyhow's errors, tracing's field values, aya's error formatting, the audit log's `append` on the agent's key: +86,383 bytes in the agent) and code inlined on one side and kept out of line on the other (the canary stores' chain readers `read_chain`, `read_tail_hash` and `flat_rows::<CanaryToken>` out of line, the row parsers inlined into them: +87,776 and −26,559): `.text` +157,632 bytes in the agent (+2.15 %), +31,808 in nn-admin (+0.97 %). `.rodata`, cut at every address the code or a dynamic relocation names: the same text but the moved files' paths and the callsite names (`event <file>:<line>`) of the moved and edited files, the gate's `Debug` strings (`OverlayGate`, `allow_unsigned`: its vtable keeps the impl), a panic of serde_json's map serializer (`serialize_value called before serialize_key`) no longer kept where the call is inlined, and literals grouped or cut otherwise; nn-admin's the same text, one piece cut at another address. The final tree builds nn-admin, the scanner and the watchdog byte for byte as the code tip, stripped and unstripped, and the agent with the stamp's hash (`NN_EBPF_BUILD_HASH`) and its build id the only bytes that differ. `cargo doc --workspace --no-deps`: no warning the tree did not have (338, `main` 353).
+- **Lab PR 256 — the e2e fixtures' agents keep their state in the test's
+  directory; the boot check says the class and the extent of what fails
+  (Wave 4; lot 255's follow-ups A and B; no capability, no level
+  changes).**
+  - What was wrong: at every start of the installed agent, on the lab
+    guests and in the KVM CI, the background check reported
+    `chain_verify_failed` on the detection log (and `chain verify` on the
+    netflow and FIM drift manifests): `entry N: signature invalid`. Lot
+    255 traced it to the privileged suites, which `nn-lab.sh
+    test-ignored` runs as root where an agent is installed: six agent
+    spawns gave their agent a signing key in a tempdir but not all of its
+    chains (`fs_deny_privileged_e2e`, `fim_privileged_e2e` twice,
+    `privileged_e2e`'s B5 helper, its `GuardFixture` and its agent
+    without `admin.pub`), so those agents appended rows under their key
+    to the installed agent's chains; three gave neither key nor audit log
+    (`privileged_e2e::spawn_agent`, `privileged_map_pin`, the watchdog's
+    suite) and wrote the installed agent's chains with its key (84
+    `nn-admin-e2etest-*` rows in a guest's audit log). The product did
+    what it must — rows of another key in its chain are what the check
+    reports — but the report did not say so: `entry N` counted from the
+    start of the 4 MiB window once the file is longer, and "signature
+    invalid" did not say that the line's hash recomputed and its link
+    held.
+  - What changed: `agent/tests/common/agent_state.rs` (std only; the
+    agent's tests' `common::agent_state`, `include!`d by the watchdog's
+    suite). `AgentState` gives each of the agent's 17 state flags — every
+    path flag of `Cli` that names a file the agent writes or that makes
+    it this agent: `--agent-id-file`, `--admin-pub` (rotate-keys rewrites
+    it, a signed overlay is stored beside it), `--signing-key-file`,
+    `--audit-log-file`, `--chain-heads-file`, the eight chains,
+    `--admin-socket`, `--shutdown-marker-file`, `--pid-file`,
+    `--watchdog-pidfile` — a file in the test's directory
+    (`AgentState::named` for two agents of one directory, which share the
+    id and the admin keys), with `client_args` for nn-admin's signed
+    calls and `watchdog_args` for the watchdog; `InstalledAgent` installs
+    the root-owned copy (`-e2etest-`) and is the one constructor of the
+    agent's command. `INPUT_FLAGS` lists the 21 other path flags (read
+    only), `HOST_PATHS` the paths the agent has no flag for, none of them
+    a chain: the pin root; `/var/lib/northnarrow` (the protected state
+    directory, the quarantine vault's directories, `last_boot_id`, the
+    baits, `combat-audit.jsonl`); `/etc/northnarrow` (its protection, the
+    baits, `master.key`, `.bootstrap`, which a rotate-keys dispatch
+    removes when the test's `admin.pub` holds two keys);
+    `/run/northnarrow` (the probe, the containment record, the baits, and
+    the watchdog's and install.sh's records, which the agent reads,
+    signs into its own audit log and removes). Every agent spawn of
+    `agent/tests` and `watchdog/tests` goes through it (the response suite
+    runs the installed copy now); the older `privileged_e2e` tests'
+    signed nn-admin calls name the test's agent id; `fs_deny` creates the
+    `detections/` directory it tests. `xtask/tests/test_state_isolation.rs`:
+    (1) every `PathBuf` flag of `Cli` is in `STATE_FLAGS` or
+    `INPUT_FLAGS`, once, and the helper passes every state flag; (2) no
+    `Command::new` outside the helper whose program, or `sudo`'s and
+    `env`'s command, names the agent (a builder bound to a variable is
+    followed), and no way to the agent's binary but `build_features_cli.rs`
+    (`--build-features` exits before it opens a path); (3) no test names
+    the agent's own state flags (the names nn-admin and the watchdog share
+    aside); (4) a test that names the agent's host paths is in
+    `HOST_PATH_USERS` with its reason (12 files: the pin root's purges,
+    `privileged_map_pin`'s subject, `fs_deny`'s directories, the
+    honeypot's baits, two of data), and a listed file that names none
+    fails; (5) one helper for both crates. Planted violations: lot 255's
+    spawn (a tempdir key, the host's log), the build's binary run
+    directly, the old `GuardFixture` builder bound to a variable, the
+    helper's own accessor used to start the agent; a state flag; a new
+    path flag of `Cli`, a helper that stopped passing its flags, a flag
+    classified twice; a host path without a reason, a listed file that
+    names none. On `main`'s test sources, rules 2, 3 and 5 fail and name
+    exactly lot 255's spawns, with the other fixtures' own spawns and
+    state flags. The boot check: `verify_recent` returns `RecentError` —
+    `SignedByAnotherKey` (lines whose hash recomputes and whose link
+    holds, their signature not this agent's key: counted over the whole
+    window, `K of the M lines checked …, from <first> to <last>`, a line
+    `line N (byte B, ts T)` or `the line at byte B (ts T)`, the first 8
+    hex digits of `agent.sig.pub`) or `Broken` (`content_altered`,
+    `link_broken`, `malformed`, `not_canonical`, `legacy_after_v3`: at
+    the first, as before, with the count of another key's lines before
+    it); a `ts` is quoted only when it is a plain timestamp. The signed
+    `chain_verify` names each broken log's `class`; the finding is the
+    same `chain_verify_failed`, at every start while the lines are there.
+    `chain verify`'s "signature invalid" says the hash recomputed.
+    `EVIDENCE_CHAINS.md`: the classes, what to do about lines of another
+    key (`chain verify`, the key's prefix, the other key's
+    `tail_unverified` rows in the manifest, the lines' `ts`), and which
+    findings are not written once. Tests: `chainlog` (another key's lines
+    in a whole file — the exact report, `chain verify`'s text, one line in
+    the singular, the other key's view —, in a window inside the file; an
+    altered line, a removed line, an altered line after another key's
+    lines; the quoted `ts`; lab PR 204's two boot-check assertions on the
+    new type), `chain_anchor` (another key's lines and a cut file reported
+    apart: `chain_truncated` stays the start's finding), `chains` (the
+    signed `chain_verify` and `chain_verify_failed`), the ratchet's 10.
+  - Lab: On Debian 12 (6.1.0-54-cloud-amd64, the lab guest debian12, ssh 2422, QEMU for Windows with WHPX, 4 vCPU, 6 GiB; ubuntu2404 was lot 254's), the guest lot 255 left clean (`main` 482a956 installed on a fresh state, `nn-admin chain verify` exit 0, its audit chain 2,007 rows of which 84 `nn-admin-e2etest-*` rows from before lot 255): the lot's tree synced, built (release, test-privileged,debug-trigger) and installed (`nn-lab.sh sync`, `build`, `install`): both units active, the start's background check `chain verify … result="ok"`, `chain verify` exit 0. `test-ignored` (the five runs, 03:59–04:22Z): 76 suites, 84 passed, 0 failed (`cargo xtask gate-summary`: PASS; `main`'s totals, the 76th suite this lot's ratchet, which has no ignored test); the 46 starts of the tests' agents that print their check: `result="ok"` each, no `chain_verify_failed` (the runs of lots 253 and 254 on ubuntu2404: 30 `chain_verify_failed`, 17 of 32 checks `broken`). The installed agent started three times during the run (the lab's purge between the runs) and once after it: `chain verify … result="ok"` each time. After the run and after that start, `nn-admin chain verify` exit 0 (detections 24 records and 9 checkpoints, netflow 13, FIM drift 16 — the installed agent's own rows; the audit chain 2,036 then 2,040 rows), no `tail_unverified` row in any manifest, and still 84 `nn-admin-e2etest-*` rows in the audit chain: none added. Lot 255's backups (`/var/lib/northnarrow.bak-255-*`) left in place; the guest powered off after. Host, on d5644080 (the lot's code and documentation; this line is all that changed after it), `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo xtask build-ebpf --release` (`common` and the eBPF crates untouched); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 71 suites, 3,083 passed, 0 failed, 15 ignored (`main`'s 70 suites and 3,067, the ratchet's suite of 10 and 6 new tests; a first run failed nn-linux's `response::quarantine::tests::a_corrupt_index_is_rebuilt_from_the_meta_files`, a race on the process-global `INDEX_NOTES` that the executor's tests drain — on `main` 482a956 the same test fails 6 of 18 runs of `cargo test -p nn-linux --lib` —, and the rerun passed); `cargo xtask golden`; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed by the build): all pass. The first commit alone: the four clippy runs, `cargo fmt --check` and the ratchet.

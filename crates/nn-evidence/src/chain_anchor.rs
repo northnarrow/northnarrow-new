@@ -543,7 +543,7 @@ pub type RecentCheck = fn(
     &Path,
     &VerifyingKey,
     u64,
-) -> Result<crate::chainlog::RecentReport, crate::chainlog::LogSetError>;
+) -> Result<crate::chainlog::RecentReport, crate::chainlog::RecentError>;
 
 // ── the head anchor ─────────────────────────────────────────────────
 
@@ -1532,6 +1532,83 @@ mod tests {
             ts: format!("2026-10-15T00:00:{n:02}.000000Z"),
             n,
         }
+    }
+
+    /// Lab PR 256: lines another key appended are their own class in the
+    /// background check — `signed_by_another_key`, counted, the first and
+    /// the last placed — and a file cut below its anchored head is still
+    /// `chain_truncated` at the next start: neither hides or renames the
+    /// other, and both stay findings.
+    #[test]
+    fn lines_of_another_key_and_a_cut_file_are_reported_apart() {
+        let dir = TempDir::new().unwrap();
+        let k = key(&dir);
+        let pk = k.verifying_key();
+        let heads = dir.path().join(HEADS_FILE_NAME);
+        let active = dir.path().join("t.jsonl");
+        let mut log = rotating_log(&active, key(&dir), 1 << 30);
+        for n in 0..4 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        let other = TestKey::load_or_bootstrap(&dir.path().join("other.sig.key")).unwrap();
+        let mut log = rotating_log(&active, other, 1 << 30);
+        for n in 4..7 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        let mut log = rotating_log(&active, key(&dir), 1 << 30);
+        for n in 7..9 {
+            log.append(p(n)).unwrap();
+        }
+        drop(log);
+        let recent = rotating_target(&active)
+            .recent
+            .expect("a rotating log's check");
+        let err = recent(&active, &pk, BOOT_VERIFY_BYTES).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::chainlog::RecentError::SignedByAnotherKey(l) if l.count == 3
+                    && l.checked == 9
+                    && l.first.line == Some(5)
+                    && l.last.line == Some(7)
+            ),
+            "{err:?}"
+        );
+        // Anchored as it is, then its last line cut while the agent is down.
+        Anchor::new(
+            heads.clone(),
+            k,
+            [1; 16],
+            vec![rotating_target(&active)],
+            None,
+            false,
+        )
+        .refresh(true, false)
+        .unwrap();
+        let body = std::fs::read(&active).unwrap();
+        let cut = body[..body.len() - 1]
+            .iter()
+            .rposition(|&c| c == b'\n')
+            .unwrap()
+            + 1;
+        std::fs::write(&active, &body[..cut]).unwrap();
+        let found = boot_check::<PortableHost>(&[rotating_target(&active)], &heads, &pk);
+        assert!(
+            found.findings.iter().any(|f| f.kind == "chain_truncated"),
+            "{:?}",
+            found.findings
+        );
+        let err = recent(&active, &pk, BOOT_VERIFY_BYTES).unwrap_err();
+        assert_eq!(err.class(), "signed_by_another_key", "{err}");
+        assert!(
+            matches!(
+                &err,
+                crate::chainlog::RecentError::SignedByAnotherKey(l) if l.count == 3 && l.checked == 8
+            ),
+            "{err:?}"
+        );
     }
 
     /// External audit NN-AUD-109: an active file emptied while the agent is
