@@ -847,8 +847,12 @@ name = "nn-admin"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
+ "nn-core",
  "nn-evidence",
+ "nn-model",
  "nn-proto",
+ "serde_json",
 ]
 
 [[package]]

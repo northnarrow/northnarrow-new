@@ -13,6 +13,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use tempfile::TempDir;
 
 use crate::admin_cli::*;
+use crate::admin_host::AgentAdminHost;
 use crate::os_rng::OsRng;
 
 /// A private key file as `nn-admin init` and install.sh leave it: 0600
@@ -37,7 +38,7 @@ fn wide_carveout_refused_at_signing() {
         "2001:db8::/32\n",
     ] {
         std::fs::write(&file, wide).unwrap();
-        let e = read_overlay_for_signing(OverlayKind::CombatAllow, &file)
+        let e = read_overlay_for_signing(&AgentAdminHost, OverlayKind::CombatAllow, &file)
             .expect_err(wide)
             .root_cause()
             .to_string();
@@ -47,7 +48,7 @@ fn wide_carveout_refused_at_signing() {
         );
     }
     std::fs::write(&file, "10.0.0.0/8\n2001:db8:10::/48\n").unwrap();
-    assert!(read_overlay_for_signing(OverlayKind::CombatAllow, &file).is_ok());
+    assert!(read_overlay_for_signing(&AgentAdminHost, OverlayKind::CombatAllow, &file).is_ok());
 }
 
 /// External audit EVD-001: the verifier reads the published public
@@ -57,16 +58,16 @@ fn wide_carveout_refused_at_signing() {
 fn audit_verify_reads_the_public_half_and_never_mints_a_key() {
     let dir = tempfile::TempDir::new().unwrap();
     let key_path = dir.path().join("agent.sig.key");
-    assert!(load_audit_pubkey(None, &key_path).is_err());
+    assert!(load_audit_pubkey(&AgentAdminHost, None, &key_path).is_err());
     assert!(!key_path.exists(), "no key minted by a verifier");
     let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
     assert_eq!(
-        load_audit_pubkey(None, &key_path).unwrap(),
+        load_audit_pubkey(&AgentAdminHost, None, &key_path).unwrap(),
         key.verifying_key()
     );
     std::fs::remove_file(crate::audit::verifying_key_path(&key_path)).unwrap();
     assert_eq!(
-        load_audit_pubkey(None, &key_path).unwrap(),
+        load_audit_pubkey(&AgentAdminHost, None, &key_path).unwrap(),
         key.verifying_key()
     );
 }
@@ -120,6 +121,7 @@ fn cli_verbs_before_the_first_start_fail_and_mint_nothing() {
         (
             "config overlay sign",
             run_config_overlay_sign(
+                &AgentAdminHost,
                 &priv_path,
                 None,
                 &missing,
@@ -604,7 +606,7 @@ fn load_audit_pubkey_explicit_hex_overrides_file_fallback() {
     let key_path = dir.path().join("agent.sig.key");
     let on_disk_key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
     let on_disk_pub = on_disk_key.verifying_key();
-    let derived = load_audit_pubkey(None, &key_path).expect("file fallback");
+    let derived = load_audit_pubkey(&AgentAdminHost, None, &key_path).expect("file fallback");
     assert_eq!(derived.to_bytes(), on_disk_pub.to_bytes());
 
     // 2) Explicit hex overrides — synthesise a DIFFERENT key,
@@ -613,7 +615,8 @@ fn load_audit_pubkey_explicit_hex_overrides_file_fallback() {
     //    explicit-hex path is wired.
     let other = SigningKey::generate(&mut OsRng);
     let other_pub_hex = hex::encode(other.verifying_key().to_bytes());
-    let from_hex = load_audit_pubkey(Some(&other_pub_hex), &key_path).expect("explicit hex");
+    let from_hex =
+        load_audit_pubkey(&AgentAdminHost, Some(&other_pub_hex), &key_path).expect("explicit hex");
     assert_eq!(from_hex.to_bytes(), other.verifying_key().to_bytes());
     assert_ne!(
         from_hex.to_bytes(),
@@ -623,7 +626,7 @@ fn load_audit_pubkey_explicit_hex_overrides_file_fallback() {
 
     // 3) Bad-length hex is rejected with an actionable error.
     let too_short = "deadbeef".repeat(7); // 56 chars, not 64
-    let err = load_audit_pubkey(Some(&too_short), &key_path).unwrap_err();
+    let err = load_audit_pubkey(&AgentAdminHost, Some(&too_short), &key_path).unwrap_err();
     let msg = format!("{err:#}");
     assert!(
         msg.contains("64 hex chars"),

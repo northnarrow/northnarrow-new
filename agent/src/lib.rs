@@ -16,6 +16,9 @@ pub mod admin_cli;
 /// loaders (R10, lab PR 259: from `admin_cli`'s tests).
 #[cfg(test)]
 mod admin_cli_tests;
+/// nn-admin on the agent's host: the agent's [`nn_admin::host::AdminHost`]
+/// (R10, lab PR 259), which the `nn-admin` binary passes to nn-admin.
+pub mod admin_host;
 pub mod admin_socket;
 /// R09a shim (lab PR 253; plan §4.1 rule 2, removed in R17): the agent's
 /// identity on disk is nn-linux's.

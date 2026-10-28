@@ -14,3 +14,6 @@
 /// The agent's identity on disk, read and never minted (R10, lab PR 259:
 /// from nn-linux's `agent_id`).
 pub mod agent_id;
+/// What nn-admin needs of the host it runs on and of the agent it
+/// administers, which the agent binds (R10, lab PR 259).
+pub mod host;

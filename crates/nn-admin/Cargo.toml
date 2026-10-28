@@ -17,6 +17,14 @@ publish = false
 nn-proto = { workspace = true }
 nn-evidence = { workspace = true }
 anyhow = { workspace = true }
+# The seam the agent binds (`host`): the gate's decision on an overlay and
+# the per-rule policy (nn-core), the chains' targets and boot check
+# (nn-evidence), the replayed events (nn-model), the agent key's public
+# half; the replay's decisions as JSON.
+nn-core = { workspace = true }
+nn-model = { workspace = true }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [lints]
 workspace = true

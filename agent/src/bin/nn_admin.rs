@@ -48,6 +48,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use nn_admin::host::{AdminHost, HostChecks as _, OverlayGate as _, RollbackFloor as _};
 
 use northnarrow_agent::admin_cli::{
     load_audit_pubkey, run_audit_read, run_audit_verify_expecting, run_canary_burn,
@@ -735,7 +736,7 @@ enum PolicyCmd {
     /// holds), else the built-in defaults, and the held responses (exit 1
     /// when a present file would not be loaded).
     Show {
-        #[arg(long, default_value = northnarrow_agent::decision::rule_policy::DEFAULT_LOCAL)]
+        #[arg(long, default_value = nn_core::decision::rule_policy::DEFAULT_LOCAL)]
         file: PathBuf,
         #[arg(long = "admin-pub", default_value = DEFAULT_PUB_PATH)]
         admin_pub: PathBuf,
@@ -1388,6 +1389,13 @@ impl From<ForcePostureTargetArg> for nn_model::posture_types::PostureKind {
 }
 
 fn main() -> ExitCode {
+    run(&northnarrow_agent::admin_host::AgentAdminHost)
+}
+
+/// The command line, on `host`: what nn-admin reads of the host it runs on
+/// and of the agent it administers (R10, lab PR 259: the agent's
+/// [`AdminHost`], which [`main`] passes in).
+fn run<H: AdminHost>(host: &H) -> ExitCode {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Init {
@@ -1457,19 +1465,16 @@ fn main() -> ExitCode {
             }
         },
         Cmd::HostCheck { json } => {
-            let checks = northnarrow_agent::host_hardening::run();
+            let checks = host.host_checks();
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&checks).unwrap_or_else(|_| "[]".to_string())
+                    checks.to_json_pretty().unwrap_or_else(|_| "[]".to_string())
                 );
             } else {
-                print!(
-                    "{}",
-                    northnarrow_agent::host_hardening::render_table(&checks)
-                );
+                print!("{}", checks.render_table());
             }
-            if northnarrow_agent::host_hardening::warn_count(&checks) == 0 {
+            if checks.warn_count() == 0 {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(2)
@@ -1484,11 +1489,11 @@ fn main() -> ExitCode {
             Ok(out) => {
                 print_status(&out, json);
                 if !json {
-                    let checks = northnarrow_agent::host_hardening::run();
-                    let warns = northnarrow_agent::host_hardening::warn_count(&checks);
+                    let checks = host.host_checks();
+                    let warns = checks.warn_count();
                     println!(
                         "host hardening : {} check(s), {warns} warning(s){}",
-                        checks.len(),
+                        checks.count(),
                         if warns > 0 {
                             " — see `nn-admin host-check`"
                         } else {
@@ -1651,7 +1656,7 @@ fn main() -> ExitCode {
                     expect_head,
                     min_seq,
                 },
-        } => match load_audit_pubkey(agent_pubkey.as_deref(), &agent_sig_key) {
+        } => match load_audit_pubkey(host, agent_pubkey.as_deref(), &agent_sig_key) {
             Ok(pubkey) => match run_audit_verify_expecting(
                 &from,
                 &pubkey,
@@ -1694,7 +1699,7 @@ fn main() -> ExitCode {
                     agent_pubkey,
                     agent_sig_key,
                 },
-        } => match load_audit_pubkey(agent_pubkey.as_deref(), &agent_sig_key) {
+        } => match load_audit_pubkey(host, agent_pubkey.as_deref(), &agent_sig_key) {
             Ok(pubkey) => {
                 let only: Vec<String> = if log.contains(&ChainName::All) {
                     Vec::new()
@@ -1704,23 +1709,15 @@ fn main() -> ExitCode {
                         .map(str::to_string)
                         .collect()
                 };
-                let det = state_dir.join("detections");
-                let paths = northnarrow_agent::chains::ChainPaths {
-                    audit: audit_log,
-                    canary_registry: state_dir.join("canaries.jsonl"),
-                    canary_access: state_dir.join("canary_access.jsonl"),
-                    detections: det.join("detections.jsonl"),
-                    status_events: det.join("status_events.jsonl"),
-                    netflow: state_dir.join("netflow.jsonl"),
-                    fim_drift: state_dir.join("fim_drift.jsonl"),
-                };
+                // R10 (lab PR 259): where the agent keeps its chains under
+                // its state directory is the agent's (`AdminHost::chains`).
                 let heads = heads.unwrap_or_else(|| {
-                    paths
-                        .audit
+                    audit_log
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new("."))
-                        .join(northnarrow_agent::chain_anchor::HEADS_FILE_NAME)
+                        .join(nn_evidence::chain_anchor::HEADS_FILE_NAME)
                 });
+                let paths = host.chains(audit_log, &state_dir);
                 let lines = run_chain_verify(&paths, &heads, &only, &pubkey);
                 let mut broken = 0;
                 for l in &lines {
@@ -1944,8 +1941,8 @@ fn main() -> ExitCode {
         Cmd::Remediate { sub } => run_remediate_cmd(sub),
         Cmd::Config {
             sub: ConfigCmd::Overlay { sub },
-        } => run_overlay_cmd(sub),
-        Cmd::Policy { sub } => run_policy_cmd(sub),
+        } => run_overlay_cmd(host, sub),
+        Cmd::Policy { sub } => run_policy_cmd(host, sub),
         Cmd::TrustedInstallerGrant {
             key,
             window_secs,
@@ -3775,9 +3772,9 @@ fn run_remediate_cmd(sub: RemediateCmd) -> ExitCode {
     }
 }
 
-fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
+fn run_overlay_cmd<H: AdminHost>(host: &H, sub: OverlayCmd) -> ExitCode {
+    use nn_core::config::overlay_auth::Decision;
     use northnarrow_agent::admin_cli::{run_config_overlay_set, run_config_overlay_sign};
-    use northnarrow_agent::config::overlay_auth::{Decision, OverlayGate};
     match sub {
         OverlayCmd::Set {
             kind,
@@ -3791,6 +3788,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                 return ExitCode::from(2);
             };
             match run_config_overlay_set(
+                host,
                 &socket,
                 &key,
                 cosign_key.as_deref(),
@@ -3832,6 +3830,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                 return ExitCode::from(2);
             };
             match run_config_overlay_sign(
+                host,
                 &key,
                 cosign_key.as_deref(),
                 &agent_id_file,
@@ -3867,10 +3866,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                 }
             };
             // External audit LLMR-014: the floor the verified chain proves.
-            let floor = northnarrow_agent::config::overlay_floor::RollbackFloor::scan(
-                &audit_log,
-                &agent_sig_key,
-            );
+            let floor = host.rollback_floor(&audit_log, &agent_sig_key);
             if let Some(why) = floor.reset() {
                 println!(
                     "{:<24} reset at the next start: {why} — an overlay signed before it is not loaded",
@@ -3882,7 +3878,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                     "rollback-floor"
                 );
             }
-            let gate = OverlayGate::new(&admin_pub, agent_id, floor);
+            let gate = host.overlay_gate(&admin_pub, agent_id, floor);
             let mut unsigned = 0;
             for kind in nn_proto::admin_signed_payload::OverlayKind::ALL {
                 let path = dir.join(kind.file_name());
@@ -3911,9 +3907,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
                         println!(
                             "{:<24} NOT LOADED at the next start: {reason}{}",
                             kind.keyword(),
-                            if northnarrow_agent::config::overlay_auth::shipped_default(kind)
-                                .is_some()
-                            {
+                            if host.shipped_default(kind).is_some() {
                                 " — COMBAT applies the built-in content"
                             } else {
                                 ""
@@ -3932,10 +3926,10 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
 }
 
 /// Lab PR 236: `nn-admin policy show|set|test`.
-fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
+fn run_policy_cmd<H: AdminHost>(host: &H, sub: PolicyCmd) -> ExitCode {
+    use nn_core::config::overlay_auth::Decision;
+    use nn_core::decision::{replay, rule_policy};
     use nn_proto::admin_signed_payload::OverlayKind;
-    use northnarrow_agent::config::overlay_auth::{Decision, OverlayGate};
-    use northnarrow_agent::decision::{replay, rule_policy};
     match sub {
         PolicyCmd::Show {
             file,
@@ -3951,11 +3945,8 @@ fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
                     return ExitCode::from(5);
                 }
             };
-            let floor = northnarrow_agent::config::overlay_floor::RollbackFloor::scan(
-                &audit_log,
-                &agent_sig_key,
-            );
-            let gate = OverlayGate::new(&admin_pub, agent_id, floor);
+            let floor = host.rollback_floor(&audit_log, &agent_sig_key);
+            let gate = host.overlay_gate(&admin_pub, agent_id, floor);
             let (policy, refused) = match gate.check(OverlayKind::RulePolicy, &file) {
                 Decision::Absent => {
                     println!("{}: absent — the built-in defaults apply", file.display());
@@ -4013,14 +4004,17 @@ fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
-            run_overlay_cmd(OverlayCmd::Set {
-                kind: OverlayKind::RulePolicy.keyword().to_string(),
-                file,
-                key,
-                cosign_key,
-                agent_id_file,
-                socket,
-            })
+            run_overlay_cmd(
+                host,
+                OverlayCmd::Set {
+                    kind: OverlayKind::RulePolicy.keyword().to_string(),
+                    file,
+                    key,
+                    cosign_key,
+                    agent_id_file,
+                    socket,
+                },
+            )
         }
         PolicyCmd::Test {
             policy,
@@ -4079,7 +4073,7 @@ fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
                     println!("({skipped} non-event items of the case skipped)");
                 }
             }
-            let lines = replay::policy_test(candidate, &list, &config_dir, &proc_root);
+            let lines = host.policy_test(candidate, &list, &config_dir, &proc_root);
             let _ = std::fs::remove_dir(&proc_root);
             for (i, l) in lines.iter().enumerate() {
                 if json {
@@ -4150,7 +4144,7 @@ fn carveout_lines_dropped(
     let Ok(text) = std::fs::read_to_string(path) else {
         return String::new();
     };
-    let load = northnarrow_agent::anti_tamper::combat_allow::parse_allow_text(&text);
+    let load = nn_core::anti_tamper::combat_allow::parse_allow_text(&text);
     match load.warnings.as_slice() {
         [] => String::new(),
         [only] => format!(" — 1 line skipped at COMBAT engage: {only}"),

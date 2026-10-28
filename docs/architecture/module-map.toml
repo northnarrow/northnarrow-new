@@ -140,6 +140,13 @@ planned = false
 "main" = "northnarrow-agent"
 "bin::nn_admin" = "nn-admin"
 "admin_cli" = "nn-admin"
+# post-plan (lab PR 259, R10): nn-admin on the agent's host — the agent's
+# implementation of nn-admin's `host::AdminHost` (the hardening checks, the
+# agent key's files, its chains and where they lie under its state
+# directory, the overlay gate and its rollback floor, the loaders' checks,
+# the offline engine on the Linux host), which the `nn-admin` binary passes
+# to nn-admin: the composition, as `chains`
+"admin_host" = "northnarrow-agent"
 "admin_socket" = "northnarrow-agent"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a.
 # R09b (lab PR 254): the phases, the attach permit the sensors' attach
@@ -607,9 +614,17 @@ planned = false
 # (rand's portable `SysRng`; no OS crate named), and the agent's path and
 # nn-linux's name it there: `admin_cli`'s key generation and the offline
 # overlay signature's nonce draw from a crate nn-admin may depend on.
+# Then 17 → 15, nn-admin 3 → 1: what nn-admin reads of the Linux host and
+# of the agent goes through nn-admin's `host::AdminHost`, which the agent
+# implements (`admin_host`): the hardening checks, the agent key's files,
+# the agent's chains (`chain verify` named `chains` twice: the list and
+# its boot check), the overlay gate, its floor and the loaders' checks,
+# the offline engine on the Linux host. The one arc left is the binary's
+# root, which passes the agent's host to nn-admin's logic: it leaves with
+# that logic (the root becomes the agent package's shim).
 
 [ratchet]
-nn-admin = 3
+nn-admin = 1
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0

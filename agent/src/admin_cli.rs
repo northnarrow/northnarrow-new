@@ -34,6 +34,8 @@ use nn_proto::admin_protocol::{
 };
 use nn_proto::admin_signed_payload::{sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
 
+use nn_admin::host::{AdminHost, Chains};
+
 use crate::os_rng::OsRng;
 use nn_admin::agent_id::{self, AGENT_ID_LEN};
 
@@ -1188,9 +1190,10 @@ pub struct ChainVerifyLine {
 /// full (the rotating logs with [`crate::chainlog::verify_log_set`],
 /// archives, manifest and checkpoints included; the flat chains with their
 /// row numbers), then the files against the head anchor `heads` when it
-/// exists. `only`: chain names to check (empty: all).
-pub fn run_chain_verify(
-    paths: &crate::chains::ChainPaths,
+/// exists. `only`: chain names to check (empty: all). `paths`: the agent's
+/// chains, through its host (R10, lab PR 259: [`Chains`]).
+pub fn run_chain_verify<C: Chains>(
+    paths: &C,
     heads: &Path,
     only: &[String],
     pubkey: &VerifyingKey,
@@ -1212,7 +1215,7 @@ pub fn run_chain_verify(
             }
         })
         .collect();
-    let check = crate::chains::boot_check(&targets, heads, pubkey);
+    let check = paths.boot_check(&targets, heads, pubkey);
     for f in &check.findings {
         out.push(ChainVerifyLine {
             chain: f.chain.clone(),
@@ -1248,8 +1251,13 @@ pub fn run_chain_verify(
 /// agent host (operator runs `sudo nn-admin audit verify
 /// --from /etc/northnarrow/audit.log`); the former is the
 /// off-host path (auditor receives the pubkey hex via an
-/// out-of-band channel).
-pub fn load_audit_pubkey(explicit_hex: Option<&str>, key_path: &Path) -> Result<VerifyingKey> {
+/// out-of-band channel). The key's files are the agent's, read through its
+/// host (R10, lab PR 259: [`AdminHost`]).
+pub fn load_audit_pubkey<H: AdminHost>(
+    host: &H,
+    explicit_hex: Option<&str>,
+    key_path: &Path,
+) -> Result<VerifyingKey> {
     if let Some(hex_str) = explicit_hex {
         let trimmed = hex_str.trim();
         if trimmed.len() != 64 {
@@ -1268,19 +1276,21 @@ pub fn load_audit_pubkey(explicit_hex: Option<&str>, key_path: &Path) -> Result<
     // private key is closed to every reader outside the agent's family.
     // A host from before it has only the key: parsed, never minted (a
     // verifier must not create the key it checks against).
-    let pub_path = crate::audit::verifying_key_path(key_path);
+    let pub_path = host.verifying_key_path(key_path);
     if pub_path.exists() {
-        return crate::audit::read_verifying_key(&pub_path);
+        return host.read_verifying_key(&pub_path);
     }
-    let key = crate::audit::read_signing_key(key_path).with_context(|| {
-        format!(
-            "no {} — deriving the agent pubkey from the signing key file {} (refused \
+    let key = host
+        .verifying_key_of_signing_key(key_path)
+        .with_context(|| {
+            format!(
+                "no {} — deriving the agent pubkey from the signing key file {} (refused \
              once the agent protects it); pass --agent-pubkey <hex> when verifying off-host",
-            pub_path.display(),
-            key_path.display()
-        )
-    })?;
-    Ok(key.verifying_key())
+                pub_path.display(),
+                key_path.display()
+            )
+        })?;
+    Ok(key)
 }
 
 // ── Tappa 9 C6 — nn-admin fim baseline / report ────────────────────
@@ -3034,8 +3044,10 @@ pub struct ConfigOverlaySetOutcome {
 
 /// Read and check an overlay before signing it: size, the loader's own
 /// parse rules, SHA-256 and length of the exact bytes. Public for the
-/// agent's tests of the loaders' rules (R10, lab PR 259).
-pub fn read_overlay_for_signing(
+/// agent's tests of the loaders' rules (R10, lab PR 259), which are the
+/// agent's, through its host.
+pub fn read_overlay_for_signing<H: AdminHost>(
+    host: &H,
     kind: nn_proto::admin_signed_payload::OverlayKind,
     file: &Path,
 ) -> Result<(String, [u8; 32], u32)> {
@@ -3049,7 +3061,7 @@ pub fn read_overlay_for_signing(
             nn_proto::admin_protocol::MAX_OVERLAY_BYTES
         );
     }
-    crate::config::overlay_auth::validate_content(kind, &content).with_context(|| {
+    host.validate_overlay(kind, &content).with_context(|| {
         format!(
             "{} does not parse as a {} overlay",
             file.display(),
@@ -3077,7 +3089,8 @@ fn sign_all(payload: &SignedPayload, key: &Path, cosign: Option<&Path>) -> Resul
 /// `nn-admin config overlay set`: sign the overlay over the agent's
 /// challenge and hand it to the running agent, which writes it (and its
 /// `.sig`) where it reads overlays at boot.
-pub fn run_config_overlay_set(
+pub fn run_config_overlay_set<H: AdminHost>(
+    host: &H,
     socket: &Path,
     key_path: &Path,
     cosign_path: Option<&Path>,
@@ -3086,7 +3099,7 @@ pub fn run_config_overlay_set(
     file: &Path,
 ) -> Result<ConfigOverlaySetOutcome> {
     use nn_proto::admin_protocol::ConfigOverlaySetRequest;
-    let (content, sha, len) = read_overlay_for_signing(kind, file)?;
+    let (content, sha, len) = read_overlay_for_signing(host, kind, file)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut stream = connect_socket(socket)?;
     write_frame(
@@ -3127,7 +3140,8 @@ pub fn run_config_overlay_set(
 /// `nn-admin config overlay sign`: sign an overlay offline (no agent
 /// needed) and write `<file>.sig` or `out`. The nonce is random: a stored
 /// signature is ordered by its timestamp, not by a server challenge.
-pub fn run_config_overlay_sign(
+pub fn run_config_overlay_sign<H: AdminHost>(
+    host: &H,
     key_path: &Path,
     cosign_path: Option<&Path>,
     agent_id_path: &Path,
@@ -3136,7 +3150,7 @@ pub fn run_config_overlay_sign(
     out: Option<&Path>,
 ) -> Result<PathBuf> {
     use rand::Rng;
-    let (_content, sha, len) = read_overlay_for_signing(kind, file)?;
+    let (_content, sha, len) = read_overlay_for_signing(host, kind, file)?;
     let agent_id_arr = agent_id::load_existing(agent_id_path)?;
     let mut nonce = [0u8; 32];
     OsRng.fill_bytes(&mut nonce);
