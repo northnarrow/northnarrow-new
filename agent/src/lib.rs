@@ -30,8 +30,8 @@ pub mod admin_socket;
 /// R09a shim (lab PR 253; plan §4.1 rule 2, removed in R17): the agent's
 /// identity on disk is nn-linux's.
 pub use nn_linux::agent_id;
-/// The agent reads its identity once: a scan of `main.rs` (R09a, lab PR
-/// 253: from `agent_id`'s tests).
+/// The agent reads its identity once: a scan of its start's code (R09a,
+/// lab PR 253: from `agent_id`'s tests; `main.rs`'s until R11a).
 #[cfg(test)]
 mod agent_id_tests;
 /// R09a shim: the anchor of a log's directory is nn-linux's.

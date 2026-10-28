@@ -100,7 +100,7 @@ pub fn stat_inode_key(path: &Path) -> Option<InodeKey> {
 /// Lab PR 260: the detector on this host's stores, stopped between its
 /// steps — before the access row, in it (torn), after it, in the registry's
 /// `Trip` row (torn), after it — and the stores opened again as at the next
-/// start (`main.rs`: the registry, the access log, then each trip the
+/// start (the agent's boot: the registry, the access log, then each trip the
 /// registry does not record recorded). An access the access log holds is a
 /// trip, recorded once, and the canary's next access is not a first trip;
 /// an access it does not hold never happened, and the canary is armed. On
@@ -381,7 +381,7 @@ mod stop_tests {
         (paths, id)
     }
 
-    /// The next start (`main.rs`, `record_unrecorded_trips`, without its
+    /// The next start (the agent's `record_unrecorded_trips`, without its
     /// audit row).
     fn next_start(
         paths: &Paths,

@@ -18,7 +18,8 @@ R08 moves them into nn-core.
 
 ## 1. What a replay is
 
-Each case is replayed on a fresh engine built the way `main.rs` builds it:
+Each case is replayed on a fresh engine built the way the agent's start
+(`boot`, `main.rs` until R11a) builds it:
 the 86 rules of `default_rules_with_net`, in their order, over the shipped
 lists of `configs/` (process and network comm allowlists, the network and
 JA3 blocklists, `security-tools.v1`), the default fan-out thresholds, and
@@ -39,7 +40,7 @@ test` uses too. Nothing of the machine running the test is read:
 | the configured resolvers | the case's `resolvers` (none by default: no port-53 flow is exempt) |
 | the trusted-installer window | inert (never open) |
 
-The decision path of one item is that of `process_event` (`main.rs`):
+The decision path of one item is that of `process_event` (`pipeline`):
 
 1. an exec event (`ProcessSpawn`) is first ingested into the lineage cache,
    as the posture's trigger detector does before the rules see it;
@@ -214,7 +215,7 @@ state after each step.
 ### 6.1 What a replay is
 
 Each case runs on a posture machine, a ladder and a trusted-installer window
-wired the way `main.rs` wires them — the entry hook engages the ladder, the
+wired the way `boot` wires them — the entry hook engages the ladder, the
 release hook stands it down and lifts the isolation, the decay hook stands
 it down, the ladder isolates only while COMBAT is locked, the posture shares
 the ransomware tracker and the security-tool detector built over the shipped
@@ -240,19 +241,19 @@ posture and the ladder:
    fork with no exec read, or another process taking a freed pid), enter an
    uninterruptible wait (`stuck`), `nft` missing (`nft: false`).
 
-Whenever the clock passes them, `main.rs`'s heartbeats fire: the window's
+Whenever the clock passes them, `boot`'s heartbeats fire: the window's
 expiry every second, the posture's decay every 60 s and the ladder's tick
 every 5 s, on the events' clock, in that order when they fall together.
 
 | host state | in a replay |
 |---|---|
-| the clock | the replay's own: the events' clock (`timestamp_ns`) as the posture's and the window's monotonic clock (`posture::clock::Clock`, `PostureMachine::with_clock`, `TrustedInstallerOverride::with_clock`), handed to the ladder as `main.rs` hands it `Instant::now()`; the wall clock is 2026-01-01T00:00:00Z at the events' zero |
+| the clock | the replay's own: the events' clock (`timestamp_ns`) as the posture's and the window's monotonic clock (`posture::clock::Clock`, `PostureMachine::with_clock`, `TrustedInstallerOverride::with_clock`), handed to the ladder as `boot` hands it `Instant::now()`; the wall clock is 2026-01-01T00:00:00Z at the events' zero |
 | processes | a table: the case's `procs`, every exec event's process, `host` items; written as a `/proc` of the replay's own (`stat` with state, terminal and start, `status`, `loginuid`, `cgroup`, `cmdline`, `exe`) that the lineage, the posture's scopes, the security-tool detector and the ladder's host-critical guard (`SystemProtectedProcs`) read; a child inherits its parent's login uid, cgroup and terminal |
 | the actuator | the replay's `CombatActuator` on that table, with the steps and words of `SystemActuator`: a capture is a pid and a start (a process that exited, or whose pid another process holds now — a stale pidfd — reaches nothing); a soft egress block takes unless `nft` is missing; NEUTRALIZE looks up each binary before the kill, kills each offender's tree through a cgroup of its own (the root moved in and frozen, every descendant found by the `/proc` walk moved in, a guarded one refused, the cgroup killed, each member checked by its identity: one in an uninterruptible wait is still running and reported failed) and quarantines each binary once (a system path refused, kill-only); the outcomes go through `SystemActuator::kill_outcome`, `quarantine_text` and `soft_block_of` |
 | the isolation | the case's `isolation` (what each engage finds per family, then both isolated) and `release` (what each release reads back, then both clear) |
 | the signed rows | the real `AuditEvidence` over a real `AuditLog` in the replay's directory, the trusted-installer window's close rows in the same log; lab PR 249: the log opened with a fixed key, the replay's wall clock (`nn_evidence::clock::Clock`) and the replayed agent's pid (`AuditStamps`), so every row is the same bytes in every replay |
 | the administrator | a fixed Ed25519 key (`unlock,trusted-installer`) in an `admin.pub` of the replay's own; agent id `golden-posture-1` |
-| the agent | pid 4,200,000, exempt from the posture as `main.rs` exempts its own, and the `client_pid` of the rows it signs |
+| the agent | pid 4,200,000, exempt from the posture as `boot` exempts its own, and the `client_pid` of the rows it signs |
 | the switches | lab PR 249: the machine's own — the ransomware directive of a per-rule policy handle of its own (`PostureMachine::with_rule_policy`; the case's `rule_policy` lines, parsed as `rule-policy.local` is, or the built-in defaults), the mass-write mode at the default (tracepoint) |
 
 Not replayed, said so: the rule engine (§1–§5 replay it), the ladder's
@@ -388,7 +389,7 @@ bytes in another process. What could break it, and how it is held:
 - map order never reaches a line: the ledger's signals are sorted, the
   JSON keys are;
 - a replay keeps nothing past its end: its hooks reach the ladder weakly
-  (`main.rs`'s live as long as the agent), so the host, its `/proc` and its
+  (`boot`'s live as long as the agent), so the host, its `/proc` and its
   directory go with it (`a_replay_leaves_no_directory_behind`).
 
 ### 6.5 Updating

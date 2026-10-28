@@ -26,7 +26,7 @@
 //! required step missing is a [`BootOrderError`]: the start stops there.
 //!
 //! Wave 4 restructure, R11a (lab PR 261): the start's code, `main.rs`'s
-//! `run` until then, is in the modules below, and [`main`]'s `run` calls
+//! `run` until then, is in the modules below, and `main`'s `run` calls
 //! them in the order the code always ran — `logging`, `preflight`, `state`,
 //! `identity`, `integrity` (the preflight phase, which ends in the attach
 //! permit), `attach` (the attach and the self-test), `evidence` (the
@@ -49,7 +49,7 @@ pub mod manifest;
 pub mod trust;
 
 // Wave 4 restructure, R11a (lab PR 261): `main.rs`'s start, cut into its
-// phases and called by [`main`] in the order the code always ran.
+// phases and called by `main` in the order the code always ran.
 pub(crate) mod admin;
 pub(crate) mod attach;
 pub(crate) mod canary;
@@ -76,7 +76,7 @@ pub use nn_linux::boot::{
 };
 
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command
-/// line and its one-shot modes, then the runtime and [`run`].
+/// line and its one-shot modes, then the runtime and `run`.
 pub fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.build_features {

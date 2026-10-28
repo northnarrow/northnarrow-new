@@ -1780,6 +1780,105 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   commands (status, capabilities, net status signed and not, the readers,
   the verifiers, `policy test`, the error paths); every boot verified
   its binaries, nn-admin among them, against the install manifest.
+- Wave 4 restructure, R11a — nn-agent: `main.rs` cut into typed phases
+  (lab PR 261). The agent's start — `main.rs`'s `run`, 3,900 lines, with
+  `process_event` and the helpers around them — is the library's now, in
+  the plan's layout (§2.4: `main` → `boot/*`, `pipeline/*`,
+  `run_loop.rs`, `shutdown.rs`): `boot/cli` (the command line),
+  `logging`, `preflight`, `state`, `identity`, `integrity` (the checks
+  before anything attaches, ending in the attach permit), `attach` (the
+  attach and the deny self-test), `evidence` (the attest phase, the audit
+  log's late binding, the rotating logs and detection stores), `policy`,
+  `response`, `posture` (the machine and the COMBAT ladder), `fim`,
+  `canary`, `net`, `admin`, `tasks`, `ready` (the capability manifest,
+  READY); `pipeline/` (`process_event`, the host-stopping state);
+  `run_loop.rs`; `shutdown.rs`. `boot::main` holds `main`'s one-shot
+  modes and runtime, and `boot`'s `run` calls the phases in the order
+  their code always ran; `main.rs` is the binary's shim. Each phase is a
+  function that takes what the phases before it produced and returns a
+  struct of what the ones after it read (`Preflight`, `StateReady`,
+  `Identity`, `Integrity`, `Attached`, `SelfTested`, `Attested`,
+  `Policy`, `Response`, `Posture`, `Combat`, `FimPaths`, `Stores`,
+  `Canary`, `Tasks`, `Armed`, `Stopped`): the attach takes the
+  `AttachPermit` only the integrity phase gets from
+  `BootSequence::enter_attach`, the event loop takes the proof of READY
+  only `ready::arm` makes, and only the identity phase builds an
+  `Identity` (new unit test). No behaviour change: the phases' code is
+  `run`'s, line for line and in its order, but 49 edits the signatures
+  need (a `&x` of a value a phase now borrows, three `let mut` whose
+  mutation is in a later phase) and the visibility a crate boundary
+  needs; the library names itself as the binary did (`extern crate self
+  as northnarrow_agent`, until R17). The history is kept (the plan's
+  Appendix A): 21 `git mv` copies of main.rs merged beside it, trimmed
+  one region at a time, so `git blame` and `git blame -C -C -M` of the
+  new files reach the commits that wrote their lines — only the new glue
+  is this lot's. The tests that read `main.rs` read the start's sources:
+  the order test rebuilds the start in the order it runs and asserts what
+  it asserted; the identity's read-once scan covers `boot/`, `pipeline/`,
+  `run_loop.rs`, `shutdown.rs` and `main.rs`. xtask's state-isolation
+  ratchet reads the agent's flags from `boot/cli.rs`; `btf-matrix.yml`'s
+  filter names `boot/mod.rs` and `boot/preflight.rs`; the module map maps
+  `pipeline`, `run_loop` and `shutdown` (ratchet 14, unchanged).
+  The lot sits on lab PR 260 (`main` 45eaae3, merged while the lot was
+  in the lab; the history regenerated on it): lab PR 260's step of the
+  canary start — the trips the access log holds and the registry does
+  not record, recorded before the detector runs — moved with the canary
+  phase into `boot/canary.rs`, its 115 lines as lab PR 260 wrote them
+  (plain `git blame` gives them to its commit).
+  Identity against `main` 45eaae3, both built in one exported tree
+  (the same path: the eBPF object carries its sources' absolute paths),
+  the release job's commands: the eBPF object and its stamp are
+  byte-identical (source hash 235e2fed…, `main`'s), the scanner and the
+  watchdog byte-identical, stripped and unstripped; the tarball's 72
+  entries and the .deb's 79 paths and modes are the same, the SBOMs too;
+  `posture_demo` prints the same lines, and the agent's `--help`,
+  `--version`, `--build-features` (release and lab build), `--btf-check`
+  and a bad flag the same text; every `nn-admin` subcommand gives
+  `main`'s bytes (lot 259's matrix, 1,964 cases, release and lab build);
+  the golden replays (five runs), the wire, chain and crypto pins, the
+  parser pins, the overlay-v1 fixture and the per-rule policy's format
+  pass unchanged; the test list is `main`'s but the Cli's three tests at
+  their new path (`boot::cli::tests`, in the library's tests) and the
+  identity phase's new one (3,109 → 3,110 names). The agent (15,338,880
+  → 15,182,136 bytes, `.text` −1.5 %) and nn-admin (4,218,272 →
+  4,228,928) are not byte-identical: function by function (unstripped,
+  names mapped to the new modules, addresses dropped) 6,408 of the
+  agent's 6,784 paired functions are the same code — of the 376 that
+  differ, 214 have another count of bodies (generic code the binary's
+  crate instantiated beside the library's is the library's now: one copy
+  fewer for most), 128 call other callees (inlining at the new crate
+  boundary), 17 are scheduled otherwise, 17 differ in several bodies or
+  operands —, 53 are the same code under another name (the tasks `run`
+  spawned, its closures then, a phase's now), and the unpaired are `run`,
+  its closures and their task harnesses (141) against the 23 phases,
+  theirs (155), and code inlined or instantiated otherwise
+  (`start_open_sensor` and lab PR 260's `record_unrecorded_trips` into
+  their phases, the engine's `decide` out of line); nn-admin, which
+  links the library, 3,135 of 3,188 (53: 34 another count of bodies, 17
+  callees, 2 scheduling). Against `main` b8b55a9, before lab PR 260, the
+  same functions differed in the same ways. `.rodata`: the same text but
+  the 257 log callsites of the moved code, which name their new files
+  (`event <file>:<line>`; 957 in all, as before), the new modules' paths
+  (tracing's module path, not printed: the journal lines have no target)
+  and the moved files' paths; the rest is laid out otherwise, each
+  side's text found in the other's but 0.08 % of the characters
+  (printable bytes of binary constants at the strings' edges).
+  On the lab guest (Ubuntu 24.04), against `main` 45eaae3 on the same
+  guest, the lot's code passes `test-ignored` (76 suites, 85 passed:
+  `main`'s 85 tests, each with the same outcome) and `tamper-check` —
+  `main`'s outcomes and verdicts, case by case (72 of 75 OK, the same
+  two known gaps and deviation) —, and `upgrade-check` from `main`
+  passes. Its boots and `main`'s (three each, and the upgrade's) log
+  the same 204 lines in the same order once the values a boot changes
+  are masked (pids, inodes, hashes, counts, durations, the detections
+  check's moving window), 188 of them byte for byte; their signed rows
+  are the same, row by row, and so is the capability manifest; every
+  boot verified its binaries against the install manifest. A first
+  round against `main` b8b55a9 gave the same, but C15 in `main`'s
+  `tamper-check`: its 45 s cgroup freeze began a second after a round
+  of the self-integrity watcher, whose next round came 10 to 15 s late,
+  under its 15 s stall threshold — no finding; C15 alone, three times
+  on each build, was OK every time.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and
