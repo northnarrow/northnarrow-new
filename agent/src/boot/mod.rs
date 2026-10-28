@@ -67,6 +67,7 @@ pub(crate) mod policy;
 pub(crate) mod posture;
 pub(crate) mod preflight;
 pub(crate) mod ready;
+pub(crate) mod refusal;
 pub(crate) mod response;
 pub(crate) mod state;
 pub(crate) mod tasks;
@@ -151,6 +152,8 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // agent keeps until it stops is this function's, as it was.
     logging::init(&cli, undumpable);
     let preflight::Preflight {
+        refused,
+        state_dir_linked,
         mut boot,
         tracepoint_degraded,
         hook_args_degraded,
@@ -159,7 +162,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         boot_chains,
         rollback_floor,
     } = preflight::check(&cli)?;
-    let state_ready = state::bootstrap(&cli, &heads_file);
+    let state_ready = state::bootstrap(&cli, &heads_file, state_dir_linked);
     let identity::Identity {
         identity,
         agent_id,
@@ -175,7 +178,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         host_checks,
         allow_degraded,
         bpf_lsm_state,
-        audit,
+        mut audit,
         verified,
     } = integrity::check(
         &cli,
@@ -183,7 +186,17 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         &identity,
         &overlay_gate,
         state_ready.early_registration_failed,
+        refused,
     )?;
+    // R11b (lab PR 262): what signs a refusal of the attach and the
+    // self-test, which need the loaded object (into the audit log the
+    // integrity phase opened).
+    let refusals = refusal::Context {
+        cli: &cli,
+        identity: &identity,
+        overlay_gate: &overlay_gate,
+        integrity: (integrity.label(), integrity.provenance()),
+    };
     let attach::Attached {
         lineage,
         flow_tracker,
@@ -194,13 +207,20 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         mut sensor,
         net_bufs,
         exploit_guard_degraded,
-    } = attach::load(&cli, &mut boot, &verified, &state_ready, &overlay_gate).await?;
-    let attach::SelfTested { self_test } = attach::self_test(
+    } = attach::load(
         &cli,
         &mut boot,
-        &identity,
+        &verified,
+        &state_ready,
         &overlay_gate,
-        &integrity,
+        &refusals,
+        &mut audit,
+    )
+    .await?;
+    let attach::SelfTested { self_test } = attach::self_test(
+        &mut boot,
+        &refusals,
+        &mut audit,
         allow_degraded,
         &bpf_lsm_state,
         detect_only,
@@ -659,7 +679,7 @@ mod tests {
         // hooks there too, before it
         let agent_boot = at(".boot_probe(");
         assert!(agent_boot > selftest);
-        let deferred = at("open_after_attach(cli, agent_id)");
+        let deferred = at("open_after_attach(&refusals, agent_id)");
         assert!(at("boot.enter(BootPhase::Attest)") < deferred);
         assert!(deferred < agent_boot);
         assert!(at("boot.enter(BootPhase::Subsystems)") > agent_boot);
@@ -688,6 +708,56 @@ mod tests {
             );
         }
         assert!(!sources.contains("IntegrityVerified::for_tests"));
+    }
+
+    /// R11b (lab PR 262): every refusal of the start goes through
+    /// `boot::refusal` (signed, the registration withdrawn, exit 78): the
+    /// gates before the load refuse before it — the preflight's three at the
+    /// start of the integrity phase, once the identity is read —, the ones
+    /// that need the loaded object after it, and no other exit of the start
+    /// is a refusal's.
+    #[test]
+    fn every_refusal_is_signed_and_the_pre_load_ones_refuse_before_it() {
+        // without whitespace: rustfmt splits a call over lines
+        let main: String = start_in_order()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let at = |needle: &str| {
+            main.find(needle)
+                .unwrap_or_else(|| panic!("the start: `{needle}` not found"))
+        };
+        let load = at("SensorMultiplexer::start_with_net(");
+        for gate in [
+            "ebpf_object",
+            "state_dir",
+            "btf_offsets",
+            "demo_rules",
+            "capabilities",
+            "install_manifest",
+            "audit_log",
+            "bpf_lsm",
+        ] {
+            let refusal = at(&format!("Refusal::new(\"{gate}\""));
+            assert!(refusal < load, "the {gate} refusal after the load");
+        }
+        // the preflight's refusal, signed first thing in the integrity phase
+        let deferred = at("unchecked.refuse(None,r)");
+        assert!(deferred > at("identity::resolve("));
+        assert!(deferred < at("checks::capabilities("));
+        for gate in ["sensors", "deny_hooks"] {
+            assert!(at(&format!("Refusal::new(\"{gate}\"")) > load, "{gate}");
+        }
+        assert!(at("Refusal::new(\"deny_self_test\"") > at("boot::deny_selftest::run("));
+        let sources = start_sources();
+        assert!(!sources.contains("record_refused_boot("));
+        assert!(!sources.contains("process::exit(78)"));
+        assert_eq!(sources.matches("process::exit(EX_CONFIG)").count(), 1);
+        assert!(
+            sources
+                .contains("fn refuse(&self, audit: Option<&mut AuditLog>, refusal: Refusal) -> !"),
+            "a refusal never returns"
+        );
     }
 
     /// Lab PR 231: the boot's heap is released once, after READY — after

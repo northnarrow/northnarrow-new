@@ -12,6 +12,7 @@ use northnarrow_agent::response::ExecutorConfig;
 use tracing::{debug, error, info, warn};
 
 use super::cli::Cli;
+use super::refusal::{self, Refusal};
 
 /// What [`check`] decided: the no-enforcement gate, the checks'
 /// results the attest phase and the capability manifest sign, and the
@@ -47,17 +48,34 @@ pub(crate) struct Integrity {
 /// external review G-09 / Q11-03): the no-enforcement gate and the demo
 /// rules' gate, the capability bounding set, the install manifest, the
 /// audit log's writability, the host hardening, the BPF LSM. A refusal is
-/// signed (`record_refused_boot`) and the start stops with the host
-/// untouched. It ends in `BootSequence::verify_integrity`, which hands out
-/// the integrity proof only once every preflight check has passed (R11b,
-/// lab PR 262: each recorded by its check, `boot::checks`).
+/// signed and the start stops with the host untouched (R11b, lab PR 262:
+/// every refusal, `boot::refusal`; first the one the preflight kept,
+/// `refused`, which waited for the identity). It ends in
+/// `BootSequence::verify_integrity`, which hands out the integrity proof
+/// only once every preflight check has passed (each recorded by its check,
+/// `boot::checks`).
 pub(crate) fn check(
     cli: &Cli,
     boot: &mut BootSequence,
     identity: &agent_id::AgentIdentity,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     early_registration_failed: bool,
+    refused: Option<Refusal>,
 ) -> Result<Integrity> {
+    // R11b (lab PR 262): what signs a refusal before the install manifest
+    // is checked (after it, its verdict too).
+    let unchecked = refusal::Context {
+        cli,
+        identity,
+        overlay_gate,
+        integrity: refusal::UNCHECKED,
+    };
+    // The eBPF object, the state directory or the BTF offsets refused the
+    // start in the preflight: signed now that the identity is read and the
+    // start registered, before anything is loaded.
+    if let Some(r) = refused {
+        unchecked.refuse(None, r);
+    }
     // Lab PR 218: resolved before the attach — the capability gate below
     // depends on it.
     // BUG-033 detect-only: resolve the one no-enforcement gate from the
@@ -77,8 +95,11 @@ pub(crate) fn check(
     {
         use northnarrow_agent::decision::engine as eng;
         let allow = std::env::var(eng::ALLOW_DEMO_RULES_ENV).ok();
-        eng::demo_rules_gate(eng::DEMO_RULES_BUILD, detect_only, allow.as_deref())
-            .map_err(anyhow::Error::msg)?;
+        if let Err(why) = eng::demo_rules_gate(eng::DEMO_RULES_BUILD, detect_only, allow.as_deref())
+        {
+            error!("refusing to start: {why}");
+            unchecked.refuse(None, Refusal::new("demo_rules", why));
+        }
         if eng::DEMO_RULES_BUILD {
             warn!(
                 detect_only,
@@ -116,7 +137,10 @@ pub(crate) fn check(
             warn!("capability preflight: {note}");
         }
         match gate {
-            caps::BootGate::Refuse(why) => anyhow::bail!("{why}"),
+            caps::BootGate::Refuse(why) => {
+                error!("refusing to start: {why}");
+                unchecked.refuse(None, Refusal::new("capabilities", why))
+            }
             caps::BootGate::Start { degraded } if degraded.is_empty() => {
                 debug!("capability preflight: all required caps present");
                 Vec::new()
@@ -243,16 +267,11 @@ pub(crate) fn check(
                 ),
                 _ => String::new(),
             };
-            record_refused_boot(
-                cli,
-                identity,
-                overlay_gate,
-                "install_manifest",
-                (outcome.label(), outcome.provenance()),
-                None,
-                &detail,
-            );
-            std::process::exit(78);
+            refusal::Context {
+                integrity: (outcome.label(), outcome.provenance()),
+                ..unchecked
+            }
+            .refuse(None, Refusal::new("install_manifest", detail));
         } else if matches!(
             outcome,
             IntegrityOutcome::Mismatch { .. } | IntegrityOutcome::Unreadable { .. }
@@ -306,16 +325,28 @@ pub(crate) fn check(
                  the unit's ReadWritePaths?)"
             );
             if fatal {
-                anyhow::bail!(
-                    "audit log {} is not writable: {why}. Refusing to run unaudited; set {}=1 to \
-                     start anyway.",
-                    cli.audit_log_file.display(),
-                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                // R11b (lab PR 262): signed in the fallback chain, the log
+                // cannot take it
+                let ctx = refusal::Context {
+                    integrity: (integrity.label(), integrity.provenance()),
+                    ..unchecked
+                };
+                ctx.refuse(
+                    None,
+                    Refusal::new(
+                        "audit_log",
+                        format!(
+                            "audit log {} is not writable: {why}. Refusing to run unaudited; set \
+                             {}=1 to start anyway.",
+                            cli.audit_log_file.display(),
+                            northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                        ),
+                    ),
                 );
             }
         }
     }
-    let audit_open = match audit.open {
+    let mut audit_open = match audit.open {
         checks::AuditOpen::Failed(why) => {
             let fatal = audit.fatal;
             error!(
@@ -324,11 +355,23 @@ pub(crate) fn check(
                 "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED"
             );
             if fatal {
-                anyhow::bail!(
-                    "audit log {} cannot be opened: {why}. Refusing to run unaudited; set {}=1 to \
-                     start anyway.",
-                    cli.audit_log_file.display(),
-                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                // R11b (lab PR 262): a broken chain refuses the start before
+                // the load, signed in the fallback chain
+                let ctx = refusal::Context {
+                    integrity: (integrity.label(), integrity.provenance()),
+                    ..unchecked
+                };
+                ctx.refuse(
+                    None,
+                    Refusal::new(
+                        "audit_log",
+                        format!(
+                            "audit log {} cannot be opened: {why}. Refusing to run unaudited; \
+                             set {}=1 to start anyway.",
+                            cli.audit_log_file.display(),
+                            northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                        ),
+                    ),
                 );
             }
             checks::AuditOpen::Failed(why)
@@ -392,16 +435,15 @@ pub(crate) fn check(
         }
         northnarrow_agent::boot::lsm::LsmGate::Refuse { detail } => {
             error!("refusing to start: {detail}. Exiting 78.");
-            record_refused_boot(
-                cli,
-                identity,
-                overlay_gate,
-                "bpf_lsm",
-                (integrity.label(), integrity.provenance()),
-                Some(("bpf_lsm", detail.as_str())),
-                &detail,
+            // R11b (lab PR 262): into the audit log opened above
+            let ctx = refusal::Context {
+                integrity: (integrity.label(), integrity.provenance()),
+                ..unchecked
+            };
+            ctx.refuse(
+                audit_open.log_mut(),
+                Refusal::new("bpf_lsm", detail).degraded("bpf_lsm"),
             );
-            std::process::exit(78);
         }
     }
     let verified = boot.verify_integrity()?;
@@ -417,54 +459,4 @@ pub(crate) fn check(
         audit: audit_open,
         verified,
     })
-}
-
-/// Lab PR 218: a start refused by a boot gate (`install_manifest`,
-/// `bpf_lsm`, `deny_self_test`) leaves the refusal in the signed chain
-/// before the process exits — the rollback floor, the identity, then the
-/// `subsystem_degraded` (`degraded`: source and detail) and the `agent_boot`
-/// `refused` naming the gate — so root cannot quietly remove the trace
-/// (lab PR 21).
-pub(crate) fn record_refused_boot(
-    cli: &Cli,
-    identity: &agent_id::AgentIdentity,
-    overlay_gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
-    gate: &str,
-    (integrity, provenance): (&str, &str),
-    degraded: Option<(&str, &str)>,
-    detail: &str,
-) {
-    let Ok(key) =
-        northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
-    else {
-        return;
-    };
-    let Ok(mut log) =
-        northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, identity.id)
-    else {
-        return;
-    };
-    overlay_gate.attest_floor(&mut log);
-    // External audit EVD-020: a refused boot records its identity too.
-    if let Err(e) = log.attest_identity(identity) {
-        warn!(error = format!("{e:#}"), "agent identity not recorded");
-    }
-    if let Some((source, what)) = degraded {
-        northnarrow_agent::boot::degradation::sign_into(&mut log, source, what, true);
-    }
-    match log.boot_refused_by(
-        gate,
-        integrity,
-        provenance,
-        detail,
-        &northnarrow_agent::build_info::agent_build(),
-    ) {
-        Ok(e) => {
-            info!(entry_hash = %e.entry_hash, gate, "refused boot recorded in the audit chain")
-        }
-        Err(e) => error!(
-            error = format!("{e:#}"),
-            "could not record the refused boot in the audit chain"
-        ),
-    }
 }

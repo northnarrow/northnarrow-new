@@ -199,6 +199,17 @@ pub enum AuditOpen {
     NotTried,
 }
 
+impl AuditOpen {
+    /// The log, when it is open: what a refusal after the open signs into
+    /// (one writer of the chain).
+    pub fn log_mut(&mut self) -> Option<&mut crate::audit::AuditLog> {
+        match self {
+            AuditOpen::Open(log) => Some(log),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for AuditOpen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

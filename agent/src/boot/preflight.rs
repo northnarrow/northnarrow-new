@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use northnarrow_agent::anti_tamper::btf_revalidate::{
     publish_resolved, resolve_tracepoint_fields, RefuseReason, ResolveOutcome,
 };
@@ -14,10 +14,19 @@ use northnarrow_agent::boot::{BootSequence, BootStep};
 use tracing::{error, info, warn};
 
 use super::cli::Cli;
+use super::refusal::Refusal;
 
 /// What [`check`] found, for the state files' bootstrap, the
 /// identity and the attest phase.
 pub(crate) struct Preflight {
+    /// R11b (lab PR 262): the first of the eBPF object, the state directory
+    /// and the BTF offsets that refused the start. The refusal is signed,
+    /// with the identity read and the start registered, at the start of the
+    /// integrity phase — before anything is loaded.
+    pub(crate) refused: Option<Refusal>,
+    /// The state directory is reached through a link (the refusal above):
+    /// nothing reads or writes there before the start exits.
+    pub(crate) state_dir_linked: bool,
     /// The start's phases (lab PR 218), opened by the preflight.
     pub(crate) boot: BootSequence,
     /// Tracepoint fields left on their compiled offset (NN-AUD-098), signed
@@ -37,9 +46,11 @@ pub(crate) struct Preflight {
 }
 
 /// `BootPhase::Preflight`, its first checks: the embedded eBPF object, the
-/// state directory, the kernel's offsets from its BTF (a refusal exits 78),
-/// the rlimits, the chains against their heads and the overlays' rollback
-/// floor — nothing written yet, nothing loaded into the kernel.
+/// state directory, the kernel's offsets from its BTF (R11b, lab PR 262: a
+/// refusal is kept in [`Preflight::refused`], signed and exited 78 at the
+/// start of the integrity phase), the rlimits, the chains against their
+/// heads and the overlays' rollback floor — nothing written yet, nothing
+/// loaded into the kernel.
 pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // Lab PR 218 (external review G-09 / Q11-03): the start's phases, in an
     // order the code enforces (`northnarrow_agent::boot`). Preflight —
@@ -57,19 +68,23 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // silently disable every sensor, the anti-tamper LSM hooks, and
     // R011's PF_KTHREAD signal (the exact blindness that let R011
     // over-fire when a stale .o was embedded by a workspace build).
+    let mut refused: Option<Refusal> = None;
     if let Verdict::Refused(why) = checks::ebpf_object(&mut boot)? {
-        return Err(anyhow::anyhow!(why))
-            .context("eBPF object boot preflight failed — refusing to start");
+        error!(error = %why, "eBPF object boot preflight failed — refusing to start");
+        refused.get_or_insert(Refusal::new("ebpf_object", why));
     }
     // External audit ATP-007 (NN-AUD-260): the state directory, or one of
     // the agent's own entries in it, is not a symbolic link — checked before
     // anything below reads or writes there (the bootstraps would create
     // files in a link's target, the attach would protect it).
+    let mut state_dir_linked = false;
     if let Verdict::Refused(why) = checks::state_dir(
         &mut boot,
         std::path::Path::new(northnarrow_agent::anti_tamper::filesystem::STATE_DIR),
     )? {
-        anyhow::bail!(why);
+        error!("{why}");
+        state_dir_linked = true;
+        refused.get_or_insert(Refusal::new("state_dir", why));
     }
 
     // External audit NN-AUD-098: tracepoint fields left on their compiled
@@ -192,8 +207,23 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
         }
         ResolveOutcome::Refuse(reason) => {
             // sysexits.h EX_CONFIG: a non-zero code systemd surfaces as a
-            // `failed` unit (Restart=no ⇒ no auto-restart loop).
-            const EX_CONFIG: i32 = 78;
+            // `failed` unit (Restart=no ⇒ no auto-restart loop). R11b (lab
+            // PR 262): the refusal is signed at the start of the integrity
+            // phase, before anything is loaded, then the start exits.
+            const EX_CONFIG: i32 = super::refusal::EX_CONFIG;
+            let detail = match &reason {
+                RefuseReason::Drift(missing) => format!(
+                    "BTF offset resolution failed: {} field(s), enumerator(s) or hook argument(s) \
+                     the eBPF programs read are not on this kernel: {}",
+                    missing.len(),
+                    missing
+                        .iter()
+                        .map(|m| format!("{} ({}): {}", m.name, m.struct_name, m.detail))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                RefuseReason::ParseError(e) => format!("BTF present but unparseable: {e}"),
+            };
             match reason {
                 RefuseReason::Drift(missing) => {
                     error!(
@@ -225,7 +255,7 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
                     );
                 }
             }
-            std::process::exit(EX_CONFIG);
+            refused.get_or_insert(Refusal::new("btf_offsets", detail));
         }
     }
 
@@ -251,6 +281,9 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     let heads_file = cli.resolved_chain_heads_file();
     let chain_targets = cli.chain_paths().targets();
     let boot_chains = match northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
+        // R11b (lab PR 262): a refused state directory is not read through
+        // its link (the chains under it), the start exits before the attest
+        _ if state_dir_linked => northnarrow_agent::chain_anchor::BootCheck::default(),
         Some(pk) => northnarrow_agent::chains::boot_check(&chain_targets, &heads_file, &pk),
         None => {
             info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
@@ -271,6 +304,8 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     };
     boot.done(BootStep::ChainHeads)?;
     Ok(Preflight {
+        refused,
+        state_dir_linked,
         boot,
         tracepoint_degraded,
         hook_args_degraded,

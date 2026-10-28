@@ -20,8 +20,14 @@ pub(crate) struct StateReady {
 /// in the pinned PROTECTED_PIDS first (EBPF-015), then the key, the audit
 /// log, the FIM, detection, status, canary and network logs and the head
 /// anchor bootstrapped, so the deny hooks protect their inodes from the
-/// moment they attach.
-pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
+/// moment they attach. R11b (lab PR 262): `state_dir_linked`, the preflight
+/// refused the state directory: the registration only (the refusal is
+/// signed under the previous agent's hooks, then withdrawn), no file.
+pub(crate) fn bootstrap(
+    cli: &Cli,
+    heads_file: &std::path::Path,
+    state_dir_linked: bool,
+) -> StateReady {
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
     // registered — the files bootstrapped below when one is missing, a map
@@ -50,6 +56,16 @@ pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
         }
     };
 
+    if state_dir_linked {
+        warn!(
+            "state files not bootstrapped: the state directory is refused (the start is refused \
+             before anything is loaded)"
+        );
+        return StateReady {
+            early_registration_failed,
+            _once: (),
+        };
+    }
     // Tappa 8 A14 (B4): bootstrap the four /etc/northnarrow/ files
     // BEFORE the sensor multiplexer attaches the LSM hooks, so the
     // hooks see their inodes in PROTECTED_INODES the moment they

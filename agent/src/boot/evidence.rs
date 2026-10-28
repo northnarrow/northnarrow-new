@@ -19,6 +19,7 @@ use tracing::{error, info, warn};
 
 use super::cli::Cli;
 use super::posture::audit_combat_reconcile;
+use super::refusal::{self, Refusal};
 use super::tasks::WatchdogAudit;
 
 /// The signed audit log, once [`attest`] opened it (`None`: the boot
@@ -65,6 +66,14 @@ pub(crate) fn attest(
     // executor, the posture, FIM): every degradation found so far is signed
     // now, and later ones within `boot::degradation::FLUSH_PERIOD`.
     boot.enter(BootPhase::Attest)?;
+    // R11b (lab PR 262): what signs a refusal of this phase — the boot's own
+    // row that cannot be written, a deferred open that fails.
+    let refusals = refusal::Context {
+        cli,
+        identity: &identity,
+        overlay_gate,
+        integrity: (integrity.label(), integrity.provenance()),
+    };
     // ── Shared audit log + COMBAT graduated-response ladder ─────────
     //
     // The signed, hash-chained audit log is opened ONCE (R11b, lab PR 262:
@@ -82,7 +91,7 @@ pub(crate) fn attest(
     // every start opened it until then.
     let opened = match audit {
         checks::AuditOpen::Open(log) => Some(*log),
-        checks::AuditOpen::Deferred(_) => open_after_attach(cli, agent_id)?,
+        checks::AuditOpen::Deferred(_) => open_after_attach(&refusals, agent_id),
         // found, said (and refused when fatal) before the load
         checks::AuditOpen::NoKey(_)
         | checks::AuditOpen::Failed(_)
@@ -172,12 +181,16 @@ pub(crate) fn attest(
                              (is the directory in the unit's ReadWritePaths?)"
                         );
                         if fatal {
-                            anyhow::bail!(
+                            // R11b (lab PR 262): the write itself, after the
+                            // attach by its nature (a full disk is found by
+                            // it); signed in the fallback chain
+                            let detail = format!(
                                 "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
-                             set {}=1 to start anyway.",
+                                 set {}=1 to start anyway.",
                                 cli.audit_log_file.display(),
                                 northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
                             );
+                            refusals.refuse(Some(&mut log), Refusal::new("audit_log", detail));
                         }
                         None
                     }
@@ -242,12 +255,14 @@ pub(crate) fn attest(
 /// The audit log's open after the attach, when the integrity phase could
 /// not open it before the load (R11b, lab PR 262: `AuditOpen::Deferred`):
 /// as the attest phase opened it until then — fatal unless
-/// `NN_AUDIT_ALLOW_UNWRITABLE=1`, unaudited without the agent's key.
+/// `NN_AUDIT_ALLOW_UNWRITABLE=1` (the refusal signed, `refusals`),
+/// unaudited without the agent's key.
 fn open_after_attach(
-    cli: &Cli,
+    refusals: &refusal::Context<'_>,
     agent_id: [u8; 16],
-) -> Result<Option<northnarrow_agent::audit::AuditLog>> {
-    Ok(
+) -> Option<northnarrow_agent::audit::AuditLog> {
+    let cli = refusals.cli;
+    {
         match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
             Ok(key) => {
                 match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
@@ -260,11 +275,12 @@ fn open_after_attach(
                         );
                         error!(error = format!("{e:#}"), fatal, "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED");
                         if fatal {
-                            anyhow::bail!(
+                            let detail = format!(
                                 "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway.",
                                 cli.audit_log_file.display(),
                                 northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
                             );
+                            refusals.refuse(None, Refusal::new("audit_log", detail));
                         }
                         None
                     }
@@ -274,8 +290,8 @@ fn open_after_attach(
                 warn!(error = format!("{e:#}"), "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
                 None
             }
-        },
-    )
+        }
+    }
 }
 
 /// The audit log reaches what was built before it opened (the late binding
