@@ -144,6 +144,10 @@ planned = false
 # root left here is the agent package's shim, which passes the agent's host
 # (`admin_host`) to nn-admin's `main`: the composition
 "bin::nn_admin" = "northnarrow-agent"
+# R11d (lab PR 263): the admin socket — `admin_socket.rs` split into
+# `admin/{transport, verify, audit, handlers/*}`, one verification
+# pipeline for every signed verb; the server of the composition
+"admin" = "northnarrow-agent"
 # post-plan (lab PR 259, R10): nn-admin on the agent's host — the agent's
 # implementation of nn-admin's `host::AdminHost` (the hardening checks, the
 # agent key's files, its chains and where they lie under its state
