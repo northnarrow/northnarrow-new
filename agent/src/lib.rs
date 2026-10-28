@@ -173,14 +173,18 @@ pub mod removed_settings;
 pub use nn_linux::response;
 /// R09a shim: the work kept off the async runtime is nn-linux's.
 pub(crate) use nn_linux::runtime;
-pub mod sd_notify;
+/// R09c shim (lab PR 257; plan §4.1 rule 2, removed in R17): systemd's
+/// readiness notification is nn-linux's.
+pub use nn_linux::sd_notify;
 pub mod self_integrity;
 /// Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`).
 #[cfg(feature = "test-privileged")]
 pub mod sensor_feasibility;
 pub mod sensors;
 pub mod shutdown_marker;
-pub mod systemd_state;
+/// R09c shim: what systemd reports the host as, over its private socket,
+/// is nn-linux's.
+pub use nn_linux::systemd_state;
 pub mod telemetry_probe;
 /// R09a shim: the system directories' binaries are nn-linux's.
 pub use nn_linux::trusted_bin;

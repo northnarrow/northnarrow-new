@@ -279,7 +279,6 @@ planned = false
 "process_hardening" = "nn-linux"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
 "removed_settings" = "northnarrow-agent"
-"sd_notify" = "nn-linux"
 "self_integrity" = "nn-linux"
 "sensor_feasibility" = "nn-linux"
 # R09b (lab PR 254): the sensors moved to nn-linux with the eBPF object's
@@ -289,7 +288,6 @@ planned = false
 "sensors" = "nn-linux"
 # the file I/O; the marker's format is nn-proto's (R03, lab PR 240)
 "shutdown_marker" = "nn-linux"
-"systemd_state" = "nn-linux"
 "telemetry_probe" = "nn-linux"
 # post-plan (lab PR 220): the signed record of a rolled-back upgrade
 "upgrade_rollback" = "nn-linux"
@@ -370,6 +368,11 @@ planned = false
 "net::dns_ingest" = "nn-linux"
 "posture_host_linux" = "nn-linux"
 "response" = "nn-linux"
+# R09c (lab PR 257): the systemd integration moved to nn-linux — the
+# readiness notification (`READY=1`) and what systemd reports the host as
+# (its private socket); the agent keeps their paths (`lib.rs`)
+"sd_notify" = "nn-linux"
+"systemd_state" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"

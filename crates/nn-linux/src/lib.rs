@@ -263,6 +263,11 @@ pub mod response;
 // agent's `runtime`).
 pub mod runtime;
 
+// systemd's readiness notification (`READY=1` on `$NOTIFY_SOCKET`, T7.10),
+// through the datagram `antitamper-bpf` shares with the watchdog (R09c, lab
+// PR 257; was the agent's `sd_notify`).
+pub mod sd_notify;
+
 /// The self-integrity watcher's pieces the self-defence and the actuators
 /// name (R09a, lab PR 253; cut from the agent's `self_integrity`, R09c's).
 pub mod self_integrity;
@@ -273,6 +278,11 @@ pub mod self_integrity;
 // guard sensors, the ring drops and rejected records (R09b, lab PR 254; was
 // the agent's `sensors`; `build.rs` embeds the object).
 pub mod sensors;
+
+// What systemd reports the host as (`SystemState`), asked over its private
+// socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
+// 257; was the agent's `systemd_state`).
+pub mod systemd_state;
 
 // The telemetry probe's piece the file-open sensor names (R09b, lab PR
 // 254; cut from the agent's `telemetry_probe`, R09c's).
