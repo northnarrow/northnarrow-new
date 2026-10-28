@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use nn_proto::admin_protocol::{
     AdminResult, FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest,
@@ -14,7 +14,7 @@ use super::read::{extract_ts_field, read_tail_jsonl};
 use crate::admin::verify::{signed, Verified};
 use crate::admin::{AdminReadPaths, FimAdminState};
 use crate::anti_tamper::admin_auth::ConnAuth;
-use crate::fim::recompute::RecomputeReason;
+use crate::fim::recompute::{RecomputeReason, Triggered};
 
 // PHASE_D_004: `fps_out` populated on success with the matched
 // signer fingerprint (1-of-N quorum → one fingerprint).
@@ -23,11 +23,15 @@ use crate::fim::recompute::RecomputeReason;
 /// §13 Q6). Verifies 1-of-N quorum carrying `Role::FimManage`,
 /// then fires the in-process recompute channel so the running
 /// agent re-walks every watched path without an operator-driven
-/// restart (C7 closes C6's lazy deferral). When the agent boots
-/// WITHOUT a recompute channel — every legacy `serve_with_*`
-/// callsite that hasn't migrated to `serve_with_fim_state` —
-/// the dispatcher falls back to the C6 info-log shape ("scheduled
-/// for next restart") so legacy unit-test fixtures stay green.
+/// restart (C7 closes C6's lazy deferral).
+///
+/// Lab PR 263 (R11d): refused when no baseline would be recorded — the
+/// agent's boot did not wire the FIM's admin state (`UnknownOperation`,
+/// as `fim status` and every verb without its subsystem), or no
+/// recompute task takes the request, the boot having found no baseline
+/// database (`ActionFailed`). Both were answered `Success` and signed
+/// "success": the first as "scheduled for next restart", which no restart
+/// did, the second with the request dropped.
 pub(in crate::admin) fn dispatch_fim_baseline(
     req: FimBaselineRequest,
     auth: &ConnAuth<'_>,
@@ -39,33 +43,39 @@ pub(in crate::admin) fn dispatch_fim_baseline(
     signed(&req, auth, fps_out, |r| r, |v| fim_baseline(v, fim_state))
 }
 
-/// The verified `fim baseline`: the recompute channel fired.
+/// The verified `fim baseline`: the recompute channel fired, or the
+/// request refused when nothing would record it.
 fn fim_baseline(
     v: Verified<'_, FimBaselineRequest>,
     fim_state: Option<&FimAdminState>,
 ) -> AdminResult {
-    match fim_state {
-        Some(state) => {
-            let queued = state
-                .recompute_sender
-                .trigger(RecomputeReason::AdminRequest);
-            info!(
-                target: "admin.fim_baseline",
-                signer_fp = %v.signer_fp(),
-                queued,
-                "fim baseline requested — recompute channel fired"
-            );
-        }
-        None => {
-            info!(
-                target: "admin.fim_baseline",
-                signer_fp = %v.signer_fp(),
-                "fim baseline requested — recompute scheduled for next agent restart \
-                 (legacy serve_with_marker_path path; production main.rs uses \
-                 serve_with_fim_state)"
-            );
-        }
+    let Some(state) = fim_state else {
+        warn!(
+            target: "admin.fim_baseline",
+            signer_fp = %v.signer_fp(),
+            "fim baseline refused: the agent boot did not wire FimAdminState — no baseline \
+             would be recorded"
+        );
+        return AdminResult::UnknownOperation;
+    };
+    let triggered = state
+        .recompute_sender
+        .trigger(RecomputeReason::AdminRequest);
+    if triggered == Triggered::Dropped {
+        error!(
+            target: "admin.fim_baseline",
+            signer_fp = %v.signer_fp(),
+            "fim baseline refused: no recompute task takes requests (no baseline database \
+             this boot) — no baseline would be recorded"
+        );
+        return AdminResult::ActionFailed;
     }
+    info!(
+        target: "admin.fim_baseline",
+        signer_fp = %v.signer_fp(),
+        queued = triggered == Triggered::Queued,
+        "fim baseline requested — recompute channel fired"
+    );
     AdminResult::Success
 }
 

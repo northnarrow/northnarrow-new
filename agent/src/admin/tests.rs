@@ -1258,6 +1258,81 @@ fn audit_emits_on_fim_baseline_failure_role_denied() {
     assert!(entries[0].result.starts_with("failure: role_denied"));
 }
 
+/// Lab PR 263 (R11d): a `fim baseline` nothing would record is refused
+/// and its row is a failure — without the FIM's admin state
+/// (`UnknownOperation`, as `fim status`), and with no recompute task to
+/// take it, the boot having found no baseline database (`ActionFailed`).
+/// Both were `Success`, signed "success". A request the task takes is a
+/// success, and the task gets it.
+#[test]
+fn a_fim_baseline_nothing_would_record_is_refused() {
+    use crate::fim::recompute::BaselineRecomputeChannel;
+    use nn_proto::admin_protocol::FimBaselineRequest;
+    let signing = SigningKey::generate(&mut OsRng);
+    let agent_id = [0x63; 16];
+    let (auth, dir) = build_auth_with_roles(&signing, "fim-manage", agent_id);
+    let (log_path, audit) = build_test_audit_log(&dir);
+    let state = |chan: &BaselineRecomputeChannel| FimAdminState {
+        recompute_sender: chan.sender(),
+        rate_limiter: Arc::new(crate::fim::drain::DriftRateLimiter::new()),
+        paths_summary: WatchedPathsSummary::default(),
+        baseline_log_path: dir.path().join("fim_baseline.jsonl"),
+        drift_log_path: dir.path().join("fim_drift.jsonl"),
+        watch: crate::fim::attach::FimWatch::detached(),
+    };
+    let mut live = BaselineRecomputeChannel::new();
+    let mut receiver = live.take_receiver().unwrap();
+    let mut without_task = BaselineRecomputeChannel::new();
+    drop(without_task.take_receiver());
+    let (live_state, dead_state) = (state(&live), state(&without_task));
+    let cases = [
+        (
+            None,
+            AdminResult::UnknownOperation,
+            "failure: unknown_operation",
+        ),
+        (
+            Some(&dead_state),
+            AdminResult::ActionFailed,
+            "failure: action_failed",
+        ),
+        (Some(&live_state), AdminResult::Success, "success"),
+    ];
+    for (fim_state, want, row) in cases {
+        let auth = ConnAuth::new(&auth);
+        let payload = SignedPayload::new_fim_baseline(
+            auth.issue_challenge().unwrap(),
+            now_unix_secs(),
+            agent_id,
+        );
+        let req = FimBaselineRequest {
+            signatures: keyed(&payload, &signing),
+            payload,
+        };
+        let msg = AdminMessage::FimBaselineRequest(req.clone());
+        let mut fps = Vec::new();
+        let r = dispatch_fim_baseline(req, &auth, fim_state, &mut fps);
+        assert_eq!(r, want);
+        emit_audit_for(
+            &msg,
+            &AdminMessage::FimBaselineResult(r),
+            &fake_client(),
+            Some(&audit),
+            &fps,
+            &DispatchNotes::default(),
+        );
+        let entry = read_audit_entries(&log_path).pop().unwrap();
+        assert_eq!(
+            (entry.op.as_str(), entry.result.as_str()),
+            ("fim_baseline", row)
+        );
+        assert!(!entry.key_fp.is_empty(), "verified: the signer is named");
+    }
+    // the live channel's task got the one request it was answered for
+    assert!(receiver.try_recv().is_ok());
+    assert!(receiver.try_recv().is_err());
+}
+
 // ── Tappa 9.5 K6 — canary admin audit + dispatch tests ─────
 
 /// K6 audit test #1: a CanaryDeployRequest + Success
