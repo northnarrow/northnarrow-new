@@ -576,9 +576,19 @@ planned = false
 # the flow tracker's and the rules' gate's binding to the Linux host,
 # which the drain names, with it; `net/mod.rs` re-exports them, and names
 # `LinuxHost` no more (it keeps one reference, to nn-linux).
+# Lab PR 257 (R09c): 22 → 21, nn-admin 8 → 7. R09c's modules — the
+# systemd integration, the install manifest's check, the hardening, the
+# telemetry probe, the self-integrity watcher, the files around the start
+# and stop, the lab builds' probes — named no crate nn-linux may not
+# depend on (nn-linux 0), and what names them counts for nn-linux before
+# and after (nn-admin's `host-check`, `host_hardening`): their moves leave
+# the count as it was. The detections' default limit
+# (`DEFAULT_DETECTIONS_LIMIT`, what `limit = 0` means on the wire) went to
+# nn-proto's `admin_signed_payload` with the verb's fields, and nn-admin's
+# `detections` names it there: its reference to `detection_store` is gone.
 
 [ratchet]
-nn-admin = 8
+nn-admin = 7
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0

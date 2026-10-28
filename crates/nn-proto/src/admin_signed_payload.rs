@@ -591,6 +591,11 @@ pub struct DetectionsExtra {
     pub path: Option<String>,
 }
 
+/// CLI default for `nn-admin detections --limit` when the operator
+/// gives none (the wire carries `limit = 0` ⇒ this default). A live
+/// dashboard wants the freshest handful, not the whole store.
+pub const DEFAULT_DETECTIONS_LIMIT: usize = 50;
+
 /// Op-specific signed-scope fields for
 /// [`OperationCode::DetectionSetStatus`] (Tappa 9.0.c). The target
 /// detection id, the new triage status, and an optional operator note
