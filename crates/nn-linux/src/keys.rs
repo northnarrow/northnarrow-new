@@ -76,8 +76,13 @@ impl AgentSigningKey {
     ///   every signature in the existing audit log.
     /// - I/O refused (`EROFS`, `ENOSPC`, missing parent we
     ///   can't create) → propagated with context.
+    ///
+    /// R11b (lab PR 262, review #466 F4): the file must be a regular one,
+    /// read to a bound ([`read_key_file`]) — a bind mount of `/dev/null`, a
+    /// device or a FIFO over the name is an error (the start refuses), not
+    /// an empty key —, and no error quotes its content.
     pub fn load_or_bootstrap(path: &Path) -> Result<Self> {
-        match fs::read_to_string(path) {
+        match read_key_file(path) {
             Ok(content) => {
                 let key = parse_signing_key(&content).with_context(|| {
                     format!(
@@ -199,10 +204,55 @@ pub fn read_verifying_key(path: &Path) -> Result<VerifyingKey> {
 /// The private key at `path`, read and parsed — never minted (legacy
 /// verification on a host without `agent.sig.pub`).
 pub fn read_signing_key(path: &Path) -> Result<AgentSigningKey> {
-    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = read_key_file(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(AgentSigningKey {
         inner: parse_signing_key(&raw)?,
     })
+}
+
+/// The longest key file read: the key is 64 hex characters and a newline.
+const MAX_KEY_FILE_BYTES: u64 = 4096;
+
+/// R11b (lab PR 262, review #466 F4): the text of the key file at `path`,
+/// without waiting on a FIFO: a regular file, at most
+/// [`MAX_KEY_FILE_BYTES`], UTF-8. Anything else at the name — a character
+/// device (a bind mount of `/dev/null`), a FIFO, a socket, a directory — is
+/// an `InvalidData` error naming what it is.
+fn read_key_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::FileTypeExt;
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let t = f.metadata()?.file_type();
+    if !t.is_file() {
+        let what = if t.is_char_device() || t.is_block_device() {
+            "a device (a mount over the key's name?)"
+        } else if t.is_fifo() {
+            "a FIFO"
+        } else if t.is_socket() {
+            "a socket"
+        } else if t.is_dir() {
+            "a directory"
+        } else {
+            "a special file"
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("not a regular file: {what}"),
+        ));
+    }
+    let mut buf = Vec::new();
+    f.take(MAX_KEY_FILE_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("larger than {MAX_KEY_FILE_BYTES} bytes"),
+        ));
+    }
+    String::from_utf8(buf)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not UTF-8 text"))
 }
 
 fn parse_signing_key(raw: &str) -> Result<SigningKey> {
@@ -218,7 +268,14 @@ fn parse_signing_key(raw: &str) -> Result<SigningKey> {
             trimmed.len()
         ));
     }
-    let bytes = hex::decode(trimmed).map_err(|e| anyhow!("signing key is not valid hex: {e}"))?;
+    // R11b (lab PR 262, review #466 F1/F4): where, never which character —
+    // the error reaches the journal
+    let bytes = hex::decode(trimmed).map_err(|e| match e {
+        hex::FromHexError::InvalidHexCharacter { index, .. } => {
+            anyhow!("signing key is not valid hex (character {index})")
+        }
+        _ => anyhow!("signing key is not valid hex"),
+    })?;
     let mut secret = [0u8; SECRET_KEY_LENGTH];
     secret.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&secret))
@@ -361,5 +418,52 @@ mod tests {
         // regeneration that would invalidate the audit log.
         let after = fs::read_to_string(&key_path).unwrap();
         assert_eq!(after, "definitely not hex\n");
+    }
+
+    /// R11b (lab PR 262, review #466 F4): what sits at the key's name and is
+    /// not a key is an error that says what it is — never an empty key, a
+    /// wait on a FIFO, or a quote of the content: empty (what a bind mount
+    /// of `/dev/null` reads), `/dev/null` itself (through a link here, as a
+    /// mount would show it), a FIFO, a directory, a key with one character
+    /// wrong.
+    #[test]
+    fn what_is_not_a_key_is_an_error_without_its_content() {
+        let (dir, key_path, _) = fresh_paths();
+        let err = |p: &Path| {
+            let p = p.to_path_buf();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    AgentSigningKey::load_or_bootstrap(&p)
+                        .map(drop)
+                        .map_err(|e| format!("{e:#}")),
+                );
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("blocked for 5 s")
+                .expect_err("not a key")
+        };
+        fs::write(&key_path, "").unwrap();
+        assert!(err(&key_path).contains("0 hex chars"), "{}", err(&key_path));
+        let null = dir.path().join("null.key");
+        std::os::unix::fs::symlink("/dev/null", &null).unwrap();
+        assert!(err(&null).contains("a device"), "{}", err(&null));
+        let fifo = dir.path().join("fifo.key");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(err(&fifo).contains("a FIFO"), "{}", err(&fifo));
+        let d = dir.path().join("dir.key");
+        fs::create_dir(&d).unwrap();
+        assert!(err(&d).contains("a directory"), "{}", err(&d));
+        let secret = format!("{}#{}\n", "ab".repeat(16), "cd".repeat(15) + "e");
+        let wrong = dir.path().join("wrong.key");
+        fs::write(&wrong, &secret).unwrap();
+        let e = err(&wrong);
+        assert!(e.contains("not valid hex (character 32)"), "{e}");
+        assert!(!e.contains('#') && !e.contains(&"ab".repeat(16)), "{e}");
+        // none of them was replaced by a fresh key
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), "");
+        assert_eq!(fs::read_to_string(&wrong).unwrap(), secret);
     }
 }

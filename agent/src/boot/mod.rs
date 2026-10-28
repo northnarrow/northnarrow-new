@@ -5,18 +5,25 @@
 //! instead of comments in `main()`:
 //!
 //! 1. [`BootPhase::Preflight`] — checks only, nothing is loaded into the
-//!    kernel: the embedded eBPF object, the BTF offsets, the capabilities,
-//!    the install manifest, the audit log's writability, the active LSMs
-//!    ([`lsm`]). A refusal here leaves the host as it was.
+//!    kernel: the embedded eBPF object, the state directory, the BTF
+//!    offsets, the capabilities, the install manifest, the audit log's
+//!    writability and (R11b, lab PR 262) its chain, opened, the active LSMs
+//!    ([`lsm`]), the deny hooks' pin root and BTF. A refusal here leaves
+//!    the kernel as it was, and creates no state file but what its
+//!    signature needs (review #466 F8): the agent's key and identity when
+//!    they are missing, and the chain that takes the refusal.
 //! 2. [`BootPhase::Attach`] — the eBPF object, the sensors and the deny
-//!    hooks. Only an [`AttachPermit`] opens it, and only
-//!    [`BootSequence::enter_attach`] gives one, once every preflight check
-//!    has run: the sensor and anti-tamper attach take it as an argument.
+//!    hooks. Only an [`IntegrityVerified`] opens it, and only
+//!    [`BootSequence::verify_integrity`] gives one, once every preflight
+//!    check has passed — the ones the attach depends on recorded by their
+//!    checks alone ([`checks`], R11b, lab PR 262): the load, the pins and
+//!    the attaches take it as an argument.
 //! 3. [`BootPhase::SelfTest`] — one deny hook exercised against the agent
 //!    itself ([`deny_selftest`]): "attached but never run" is measured, not
 //!    assumed.
-//! 4. [`BootPhase::Attest`] — the signed audit log opens (`agent_boot`),
-//!    then every degradation found so far is signed ([`degradation`]).
+//! 4. [`BootPhase::Attest`] — the signed audit log, opened in the preflight,
+//!    takes the boot's rows (`agent_boot`), then every degradation found so
+//!    far is signed ([`degradation`]).
 //! 5. [`BootPhase::Subsystems`] — what needs the audit log: the FIM
 //!    observers, the file-open sensor, the drains, the admin socket.
 //! 6. [`BootPhase::Run`] — the capability manifest and the trust level are
@@ -35,7 +42,7 @@
 //! `admin` and `tasks`, then `ready` (the run phase); the event loop and
 //! the stop are the crate's `run_loop` and `shutdown`. Each phase takes
 //! what the ones before it produced and returns what the ones after it
-//! read: the attach takes the permit only the integrity phase holds, the
+//! read: the attach takes the proof only the integrity phase holds, the
 //! event loop the proof of READY only `ready` makes.
 
 use anyhow::{Context, Result};
@@ -44,7 +51,6 @@ use clap::Parser;
 use cli::Cli;
 
 pub mod deny_selftest;
-pub mod lsm;
 pub mod manifest;
 pub mod trust;
 
@@ -64,15 +70,18 @@ pub(crate) mod policy;
 pub(crate) mod posture;
 pub(crate) mod preflight;
 pub(crate) mod ready;
+pub(crate) mod refusal;
 pub(crate) mod response;
 pub(crate) mod state;
 pub(crate) mod tasks;
 
 /// R09b shim (lab PR 254; plan §4.1 rule 2, removed in R17): the phases,
-/// the attach permit and the degradations of a run are nn-linux's, with
-/// the eBPF loader and the sensors that take and report them.
+/// the integrity proof and the degradations of a run are nn-linux's, with
+/// the eBPF loader and the sensors that take and report them; R11b (lab PR
+/// 262): the checks that record the steps the proof requires, and the BPF
+/// LSM gate among them.
 pub use nn_linux::boot::{
-    degradation, AttachPermit, BootOrderError, BootPhase, BootSequence, BootStep,
+    checks, degradation, lsm, BootOrderError, BootPhase, BootSequence, BootStep, IntegrityVerified,
 };
 
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command
@@ -146,6 +155,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // agent keeps until it stops is this function's, as it was.
     logging::init(&cli, undumpable);
     let preflight::Preflight {
+        refused,
         mut boot,
         tracepoint_degraded,
         hook_args_degraded,
@@ -154,9 +164,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         boot_chains,
         rollback_floor,
     } = preflight::check(&cli)?;
-    let state::StateReady {
-        early_registration_failed,
-    } = state::bootstrap(&cli, &heads_file);
+    let state_ready = state::bootstrap(&cli, &heads_file, refused.is_some());
     let identity::Identity {
         identity,
         agent_id,
@@ -172,14 +180,25 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         host_checks,
         allow_degraded,
         bpf_lsm_state,
-        attach_permit,
+        mut audit,
+        verified,
     } = integrity::check(
         &cli,
         &mut boot,
         &identity,
         &overlay_gate,
-        early_registration_failed,
+        state_ready.early_registration_failed,
+        refused,
     )?;
+    // R11b (lab PR 262): what signs a refusal of the attach and the
+    // self-test, which need the loaded object (into the audit log the
+    // integrity phase opened).
+    let refusals = refusal::Context {
+        cli: &cli,
+        identity: &identity,
+        overlay_gate: &overlay_gate,
+        integrity: (integrity.label(), integrity.provenance()),
+    };
     let attach::Attached {
         lineage,
         flow_tracker,
@@ -190,13 +209,20 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         mut sensor,
         net_bufs,
         exploit_guard_degraded,
-    } = attach::load(&cli, &mut boot, attach_permit, &overlay_gate).await?;
-    let attach::SelfTested { self_test } = attach::self_test(
+    } = attach::load(
         &cli,
         &mut boot,
-        &identity,
+        &verified,
+        &state_ready,
         &overlay_gate,
-        &integrity,
+        &refusals,
+        &mut audit,
+    )
+    .await?;
+    let attach::SelfTested { self_test } = attach::self_test(
+        &mut boot,
+        &refusals,
+        &mut audit,
         allow_degraded,
         &bpf_lsm_state,
         detect_only,
@@ -219,6 +245,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         hook_args_degraded,
         exploit_guard_degraded,
         caps_degraded,
+        audit,
     )?;
     let policy::Policy {
         netflow_blocklist,
@@ -619,8 +646,8 @@ mod tests {
     }
 
     /// The order of the start's code (R11a, lab PR 261: of `main.rs` until
-    /// it was cut into the phases): every preflight check and the permit
-    /// come before the first attach, the self-test right after the deny
+    /// it was cut into the phases): every preflight check and the proof
+    /// come before the first load, the self-test right after the deny
     /// hooks, the audit log before the subsystems, the manifest before the
     /// event loop.
     #[test]
@@ -632,25 +659,34 @@ mod tests {
         };
         let attach = at("SensorMultiplexer::start_with_net(");
         assert!(at(".attach_anti_tamper(") > attach);
+        // R11b (lab PR 262): the checks that record the proof's steps
+        // (`boot::checks`), and the proof, before the load.
         for check in [
-            "caps::boot_gate(",
-            "install_manifest::check(",
-            "audit_preflight::preflight_writable(",
-            "boot::lsm::gate(",
-            "boot.done(BootStep::Capabilities)",
-            "boot.done(BootStep::InstallManifest)",
-            "boot.done(BootStep::AuditWritable)",
-            "boot.done(BootStep::BpfLsm)",
-            "boot.enter_attach()",
+            "checks::ebpf_object(",
+            "checks::state_dir(",
+            "checks::btf_offsets(",
+            "checks::capabilities(",
+            "checks::install_manifest(",
+            "checks::audit_log(",
+            "checks::bpf_lsm(",
+            "checks::pin_root(",
+            "checks::vmlinux_btf(",
+            "boot.verify_integrity()",
         ] {
             assert!(at(check) < attach, "`{check}` after the attach");
         }
         let selftest = at("boot::deny_selftest::run(");
         assert!(selftest > at(".attach_anti_tamper("));
-        let audit_open = at("AuditLog::open(&cli.audit_log_file, key, agent_id) {");
-        assert!(audit_open > selftest);
-        assert!(at("boot.enter(BootPhase::Attest)") < audit_open);
-        assert!(at("boot.enter(BootPhase::Subsystems)") > audit_open);
+        // R11b (lab PR 262): the audit chain opens before the load (above,
+        // `checks::audit_log`); the boot's own row after the self-test, in
+        // the attest phase, and the open deferred by the previous agent's
+        // hooks there too, before it
+        let agent_boot = at(".boot_probe(");
+        assert!(agent_boot > selftest);
+        let deferred = at("open_after_attach(&refusals, agent_id)");
+        assert!(at("boot.enter(BootPhase::Attest)") < deferred);
+        assert!(deferred < agent_boot);
+        assert!(at("boot.enter(BootPhase::Subsystems)") > agent_boot);
         assert!(
             at("RuleEngine::with_default_rules_and_net(") > at("boot.enter(BootPhase::Subsystems)"),
             "the rule engine in the subsystems phase, after the audit log"
@@ -659,11 +695,101 @@ mod tests {
         assert!(manifest > at("boot.enter(BootPhase::Run)"));
         assert!(manifest < at("sd_notify::ready()"));
         assert!(at("boot.done(BootStep::CapabilityManifest)") > manifest);
-        // the permit is given once, in the integrity phase, which the
+        // the proof is given once, in the integrity phase, which the
         // attach follows
         let sources = start_sources();
-        assert_eq!(sources.matches("boot.enter_attach()").count(), 1);
-        assert!(function(PHASES[4].1, PHASES[4].2).contains("boot.enter_attach()"));
+        assert_eq!(sources.matches("boot.verify_integrity()").count(), 1);
+        assert!(function(PHASES[4].1, PHASES[4].2).contains("boot.verify_integrity()"));
+        // R11b (lab PR 262): the steps the proof requires are recorded by
+        // their checks only, never by `done` (which refuses them), and the
+        // start holds no test proof
+        for step in nn_linux::boot::BootPhase::Preflight.required() {
+            assert!(step.is_checked());
+            let done = format!("done(BootStep::{step:?})");
+            assert!(
+                !sources.contains(&done),
+                "the start records `{done}` itself"
+            );
+        }
+        assert!(!sources.contains("IntegrityVerified::for_tests"));
+        // review #466 F3: the process's one sequence is the preflight's
+        assert_eq!(sources.matches("BootSequence::begin()").count(), 1);
+        assert!(function(PHASES[1].1, PHASES[1].2).contains("BootSequence::begin()?"));
+        assert!(!sources.contains("BootSequence::for_tests"));
+    }
+
+    /// R11b (lab PR 262): every refusal of the start goes through
+    /// `boot::refusal` (signed, the registration withdrawn, exit 78): the
+    /// gates before the load refuse before it — the preflight's three at the
+    /// start of the integrity phase, once the identity is read —, the ones
+    /// that need the loaded object after it, and no other exit of the start
+    /// is a refusal's.
+    #[test]
+    fn every_refusal_is_signed_and_the_pre_load_ones_refuse_before_it() {
+        // without whitespace: rustfmt splits a call over lines
+        let main: String = start_in_order()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let at = |needle: &str| {
+            main.find(needle)
+                .unwrap_or_else(|| panic!("the start: `{needle}` not found"))
+        };
+        let load = at("SensorMultiplexer::start_with_net(");
+        for gate in [
+            "ebpf_object",
+            "state_dir",
+            "btf_offsets",
+            "demo_rules",
+            "capabilities",
+            "install_manifest",
+            "audit_log",
+            "bpf_lsm",
+        ] {
+            let refusal = at(&format!("Refusal::new(\"{gate}\""));
+            assert!(refusal < load, "the {gate} refusal after the load");
+        }
+        // the preflight's refusal, signed first thing in the integrity phase
+        let deferred = at("unchecked.refuse(None,r)");
+        assert!(deferred > at("identity::resolve("));
+        assert!(deferred < at("checks::capabilities("));
+        for gate in ["sensors", "deny_hooks"] {
+            let last = main
+                .rfind(&format!("Refusal::new(\"{gate}\""))
+                .unwrap_or_else(|| panic!("no {gate} refusal"));
+            assert!(last > load, "{gate}");
+        }
+        // review #466 F6: the deny hooks' pin root and BTF, before the load
+        assert!(at("Refusal::new(\"deny_hooks\",why)") < load);
+        assert!(at("Refusal::new(\"deny_self_test\"") > at("boot::deny_selftest::run("));
+        // the refusals an earlier start left in the fallback chain, recorded
+        // in the audit log before this boot's own row
+        let recorded = at("refusal::record_fallback(");
+        assert!(recorded > at("boot.enter(BootPhase::Attest)"));
+        assert!(recorded < at(".boot_probe("));
+        let sources = start_sources();
+        assert!(!sources.contains("record_refused_boot("));
+        // review #466 F7: no exit of the start but the refusal's — main()'s
+        // one-shot modes (`--build-features` and the probes) aside
+        let one_shots = function(
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            "pub fn main() -> Result<()> {",
+        );
+        let phases = sources.replace(one_shots, "");
+        assert_eq!(phases.len() + one_shots.len(), sources.len(), "main() once");
+        assert_eq!(
+            phases.matches("process::exit(").count(),
+            1,
+            "an exit of the start that is not the refusal's"
+        );
+        assert!(phases
+            .contains("std::process::exit(self.conclude(audit, refusal, withdraw_registration))"));
+        assert!(!phases.contains("libc::exit(") && !phases.contains("libc::_exit("));
+        assert!(
+            sources
+                .contains("fn refuse(&self, audit: Option<&mut AuditLog>, refusal: Refusal) -> !"),
+            "a refusal never returns"
+        );
     }
 
     /// Lab PR 231: the boot's heap is released once, after READY — after

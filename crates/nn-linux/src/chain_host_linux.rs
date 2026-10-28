@@ -33,12 +33,18 @@ impl ChainHost for LinuxHost {
         options.mode(mode).open(path)
     }
 
+    /// `O_NOFOLLOW | O_NONBLOCK` (R11b, lab PR 262, review #466 F1: the
+    /// non-blocking open too — a FIFO at the name cannot stall the writer;
+    /// on a regular file the flag changes nothing).
     fn open_with_mode_nofollow(
         options: &mut OpenOptions,
         mode: u32,
         path: &Path,
     ) -> io::Result<File> {
-        options.mode(mode).custom_flags(libc::O_NOFOLLOW).open(path)
+        options
+            .mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
     }
 
     fn create_dir_all_with_mode(dir: &Path, mode: u32) -> io::Result<()> {
@@ -296,6 +302,121 @@ mod tests {
             fs::metadata(&log_path).unwrap().permissions().mode() & 0o7777,
             0o600
         );
+    }
+
+    /// `f` on its own thread, which must be done within five seconds: an
+    /// open of a FIFO for reading without `O_NONBLOCK` waits for a writer.
+    fn within_5s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("blocked for 5 s")
+    }
+
+    fn mkfifo(p: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// R11b (lab PR 262, review #466 F1, the reviewer's four probes on the
+    /// audit chain's own open): a symbolic link at the log's name — to the
+    /// agent's key, to a file whose last line has no newline, dangling — and
+    /// a FIFO there. The open refuses and says what it found, never what the
+    /// target holds; the target is left as it was, nothing is created, and
+    /// nothing blocks. The read-only readers (the head, the verified boot)
+    /// alike.
+    #[test]
+    fn the_audit_chain_open_follows_no_link_and_blocks_on_no_fifo() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().to_path_buf();
+        let key_file = d.join("agent.sig.key");
+        drop(key(&d));
+        let key_text = fs::read_to_string(&key_file).unwrap();
+        let refused = |name: &str| -> Vec<String> {
+            let p = d.join(name);
+            let d2 = d.clone();
+            within_5s(move || {
+                vec![
+                    format!(
+                        "{:#}",
+                        AuditLog::open(&p, key(&d2), [1; 16]).map(drop).unwrap_err()
+                    ),
+                    format!(
+                        "{:#}",
+                        crate::audit::read_head::<LinuxHost>(&p).unwrap_err()
+                    ),
+                    format!(
+                        "{:#}",
+                        crate::audit::verified_boot_recorded::<LinuxHost>(&p).unwrap_err()
+                    ),
+                ]
+            })
+        };
+        // 1. a link to the key: refused, the key in no message, unchanged
+        symlink(&key_file, d.join("to-key.log")).unwrap();
+        for e in refused("to-key.log") {
+            assert!(e.contains("symbolic link"), "{e}");
+            assert!(!e.contains(key_text.trim()), "{e}");
+        }
+        assert_eq!(fs::read_to_string(&key_file).unwrap(), key_text);
+        // 2. a link to a file without a final newline: not truncated, not
+        // terminated, its lines in no message
+        let target = d.join("protected.json");
+        let body = b"{\"first\":1}\n{\"second\": \"no newline\"";
+        fs::write(&target, body).unwrap();
+        symlink(&target, d.join("to-file.log")).unwrap();
+        for e in refused("to-file.log") {
+            assert!(e.contains("symbolic link"), "{e}");
+            assert!(!e.contains("first") && !e.contains("second"), "{e}");
+        }
+        assert_eq!(fs::read(&target).unwrap(), body);
+        // 3. a dangling link: its target is not created
+        fs::create_dir(d.join("elsewhere")).unwrap();
+        symlink(d.join("elsewhere/planted.jsonl"), d.join("dangling.log")).unwrap();
+        for e in refused("dangling.log") {
+            assert!(e.contains("symbolic link"), "{e}");
+        }
+        assert!(!d.join("elsewhere/planted.jsonl").exists());
+        // 4. a FIFO: refused at once, not a regular file
+        mkfifo(&d.join("fifo.log"));
+        for e in refused("fifo.log") {
+            assert!(e.contains("not a regular file"), "{e}");
+        }
+    }
+
+    /// R11b (lab PR 262, review #466 F1): the append opens the name again
+    /// (through the directory anchored at the open): a link or a FIFO put
+    /// there after the open is not written through, its target neither
+    /// created nor changed, and the append does not block.
+    #[test]
+    fn the_audit_append_follows_no_link_and_blocks_on_no_fifo() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let d = dir.path().to_path_buf();
+        let victim = d.join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        fs::create_dir(d.join("elsewhere")).unwrap();
+        for (name, plant) in [("link", 0), ("dangling", 1), ("fifo", 2)] {
+            let path = d.join(format!("{name}.log"));
+            let mut log = AuditLog::open(&path, key(&d), [1; 16]).unwrap();
+            match plant {
+                0 => symlink(&victim, &path).unwrap(),
+                1 => symlink(d.join("elsewhere/planted"), &path).unwrap(),
+                _ => mkfifo(&path),
+            }
+            let e = within_5s(move || format!("{:#}", log.append(sample_draft(1)).unwrap_err()));
+            assert!(
+                e.contains("symbolic link") || e.contains("for append"),
+                "{name}: {e}"
+            );
+        }
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+        assert!(!d.join("elsewhere/planted").exists());
     }
 
     /// External audit EVD-019 (NN-AUD-281): the head anchor the agent

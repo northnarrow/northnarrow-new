@@ -152,9 +152,10 @@ impl CanaryAccessDb {
         // External audit DEC-006: a torn last write is repaired; an
         // unreadable line elsewhere is skipped and reported instead of
         // disabling the canary subsystem.
-        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
-            serde_json::from_slice::<CanaryAccessEntry>(l).is_ok()
-        })?;
+        let tail_repair =
+            crate::chainlog::repair_torn_tail::<crate::chain_host_linux::LinuxHost>(path, |l| {
+                serde_json::from_slice::<CanaryAccessEntry>(l).is_ok()
+            })?;
         let read = read_tail_hash(path, &key.verifying_key())?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now

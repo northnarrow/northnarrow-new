@@ -372,6 +372,10 @@ pub struct AuditLog<K> {
     /// [`Self::attest_identity`].
     previous_agent_id: Option<String>,
     identity_attested: bool,
+    /// R11b (lab PR 262, review #466 F1): a chain kept in memory
+    /// ([`Self::in_memory`]): the rows are appended here, and the caller
+    /// writes the bytes through a file it opened itself.
+    memory: Option<Vec<u8>>,
 }
 
 impl<K: ChainSigner> AuditLog<K> {
@@ -396,10 +400,13 @@ impl<K: ChainSigner> AuditLog<K> {
         // would not start again in enforce mode. Only that fragment is
         // repaired — and attested below; a bad line before the end is
         // corruption and still refuses the log, untouched.
-        let repair = crate::chainlog::repair_torn_tail(path, |l| {
+        // R11b (lab PR 262, review #466 F1): both through the host's opens
+        // that follow no final symlink and block on no FIFO, and only on a
+        // regular file.
+        let repair = crate::chainlog::repair_torn_tail::<K::Host>(path, |l| {
             serde_json::from_slice::<AuditEntry>(l).is_ok()
         })?;
-        let tail = read_tail(path)?;
+        let tail = read_tail::<K::Host>(path)?;
         // Ensure the parent directory exists with the canonical
         // mode so the first append never fails on a missing
         // `/etc/northnarrow/` install.
@@ -425,11 +432,66 @@ impl<K: ChainSigner> AuditLog<K> {
             anchoring_started: tail.anchoring_started,
             previous_agent_id: tail.last_agent_id,
             identity_attested: false,
+            memory: None,
         };
         if let Some(r) = repair {
             log.attest_tail_repair(path, &r)?;
         }
         Ok(log)
+    }
+
+    /// R11b (lab PR 262, review #466 F1): a new chain from
+    /// [`GENESIS_PREV_HASH`], signed like the log's and kept in memory: its
+    /// rows go to no path. [`Self::into_bytes`] gives them, one line each,
+    /// for a file the caller created itself — the agent's fallback chain of
+    /// a refused start, written through a descriptor it opened `O_EXCL`
+    /// in a directory it checked.
+    pub fn in_memory(key: K, agent_id: [u8; 16]) -> Self {
+        Self {
+            path: PathBuf::new(),
+            io_path: PathBuf::new(),
+            stamps: AuditStamps::host(),
+            key,
+            agent_id,
+            last_hash: GENESIS_PREV_HASH.to_string(),
+            previous_run: PreviousRun::None,
+            second_key_added: false,
+            rows: 0,
+            numbered: false,
+            seq_break: None,
+            anchoring_started: false,
+            previous_agent_id: None,
+            identity_attested: false,
+            memory: Some(Vec::new()),
+        }
+    }
+
+    /// The rows of a chain [`Self::in_memory`], as they would be on disk
+    /// (empty for a log on a file).
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.memory.unwrap_or_default()
+    }
+
+    /// R11b (lab PR 262, review #466 F2): every row of the chain in order,
+    /// with its position (0-based), until `visit` breaks — read again from
+    /// the log's file (through the anchored directory, with the host's open
+    /// that follows no final symlink and blocks on no FIFO, only a regular
+    /// file) or from memory. A line that is not a row is an error that names
+    /// its number, never its content.
+    pub fn scan_rows(
+        &self,
+        visit: impl FnMut(u64, &AuditEntry) -> std::ops::ControlFlow<()>,
+    ) -> Result<()> {
+        if let Some(bytes) = &self.memory {
+            return scan_lines(&bytes[..], &self.path, visit);
+        }
+        let f = match K::Host::open_read_nofollow(&self.io_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(refused_open::<K::Host>(e, &self.path, "to read it")),
+        };
+        regular_file(&f, &self.path)?;
+        scan_lines(BufReader::new(f), &self.path, visit)
     }
 
     /// Record in the signed chain that `file`'s torn last write was
@@ -667,16 +729,11 @@ impl<K: ChainSigner> AuditLog<K> {
         let mut line =
             serde_json::to_string(&entry).map_err(|e| anyhow!("serialising audit entry: {e}"))?;
         line.push('\n');
-        let mut f = K::Host::open_with_mode(
-            OpenOptions::new().create(true).append(true),
-            AUDIT_LOG_FILE_MODE,
-            &self.io_path,
-        )
-        .with_context(|| format!("opening audit log {} for append", self.path.display()))?;
-        f.write_all(line.as_bytes())
-            .with_context(|| format!("appending audit entry to {}", self.path.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", self.path.display()))?;
+        if let Some(memory) = &mut self.memory {
+            memory.extend_from_slice(line.as_bytes());
+        } else {
+            self.write_line(&line)?;
+        }
         self.last_hash = entry.entry_hash.clone();
         self.rows += 1;
         self.numbered = true;
@@ -689,6 +746,26 @@ impl<K: ChainSigner> AuditLog<K> {
             self.anchoring_started = true;
         }
         Ok(entry)
+    }
+
+    /// One row's `line` at the end of the log's file, on the disk before
+    /// the call returns.
+    fn write_line(&self, line: &str) -> Result<()> {
+        // R11b (lab PR 262, review #466 F1): a symbolic link at the name is
+        // not followed — nor its target created —, a FIFO does not stall
+        // the write, and only a regular file takes the row.
+        let mut f = K::Host::open_with_mode_nofollow(
+            OpenOptions::new().create(true).append(true),
+            AUDIT_LOG_FILE_MODE,
+            &self.io_path,
+        )
+        .map_err(|e| refused_open::<K::Host>(e, &self.path, "for append"))?;
+        regular_file(&f, &self.path)?;
+        f.write_all(line.as_bytes())
+            .with_context(|| format!("appending audit entry to {}", self.path.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", self.path.display()))?;
+        Ok(())
     }
 
     /// Lab PR 249: the pid of the rows this writer signs about itself
@@ -844,9 +921,98 @@ pub fn audit_failure_is_fatal(allow_env: Option<&str>) -> bool {
 /// manifest, and a missing one was removed. A missing or empty file is a
 /// fresh chain (`false`); a line that does not parse is an error — the
 /// caller cannot tell. Read-only, without the torn-tail repair of
-/// [`AuditLog::open`].
-pub fn verified_boot_recorded(path: &Path) -> Result<bool> {
-    Ok(read_tail(path)?.verified_boot)
+/// [`AuditLog::open`], through `H`'s open that follows no final symlink and
+/// blocks on no FIFO (R11b, lab PR 262).
+pub fn verified_boot_recorded<H: ChainHost>(path: &Path) -> Result<bool> {
+    Ok(read_tail::<H>(path)?.verified_boot)
+}
+
+/// R11b (lab PR 262): the head of the audit chain at `path` — its rows and
+/// the last `entry_hash` ([`GENESIS_PREV_HASH`] for a missing or empty
+/// file) — read as [`AuditLog::open`] reads it, without writing: what a
+/// refusal the log cannot take names (the agent's fallback chain). An error
+/// says why without the file's content.
+pub fn read_head<H: ChainHost>(path: &Path) -> Result<(u64, String)> {
+    let tail = read_tail::<H>(path)?;
+    Ok((tail.seq.rows(), tail.last_hash))
+}
+
+/// R11b (lab PR 262, review #466 F1): an open of a chain file refused —
+/// a symbolic link said as such, any other error with its path; never the
+/// file's content.
+fn refused_open<H: ChainHost>(e: std::io::Error, path: &Path, what: &str) -> anyhow::Error {
+    if H::is_symlink_refusal(&e) {
+        anyhow!(
+            "{}: a symbolic link, not the audit log — not followed",
+            path.display()
+        )
+    } else {
+        anyhow!(e).context(format!("opening audit log {} {what}", path.display()))
+    }
+}
+
+/// R11b (lab PR 262, review #466 F1): `f`, opened at `path`, is a regular
+/// file — a directory, a FIFO, a socket or a device is not a chain.
+fn regular_file(f: &std::fs::File, path: &Path) -> Result<()> {
+    let meta = f
+        .metadata()
+        .with_context(|| format!("fstat {}", path.display()))?;
+    if meta.file_type().is_file() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{}: {}, not a regular file — not the audit log",
+        path.display(),
+        if meta.is_dir() {
+            "a directory"
+        } else {
+            "a special file (FIFO, socket or device)"
+        }
+    ))
+}
+
+/// R11b (lab PR 262, review #466 F2): [`AuditLog::scan_rows`]'s walk of
+/// `reader`'s lines (the chain at `path`).
+fn scan_lines<R: BufRead>(
+    reader: R,
+    path: &Path,
+    mut visit: impl FnMut(u64, &AuditEntry) -> std::ops::ControlFlow<()>,
+) -> Result<()> {
+    let mut index = 0u64;
+    for (n, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading line from {}", path.display()))?;
+        if line.is_empty() {
+            continue;
+        }
+        let entry: AuditEntry = serde_json::from_str(&line).map_err(|e| {
+            anyhow!(
+                "{}: line {} ({} bytes) is not an audit row ({})",
+                path.display(),
+                n + 1,
+                line.len(),
+                row_parse_reason(&e)
+            )
+        })?;
+        if visit(index, &entry).is_break() {
+            break;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// R11b (lab PR 262, review #466 F1): why a line is not a row, without the
+/// line: its kind of error and where in the line — the reason ends up in
+/// journal lines and in signed details, and a line may be anything (a key
+/// a link pointed at).
+pub fn row_parse_reason(e: &serde_json::Error) -> String {
+    let kind = match e.classify() {
+        serde_json::error::Category::Io => "unreadable",
+        serde_json::error::Category::Syntax => "not JSON",
+        serde_json::error::Category::Data => "JSON, not the row's fields",
+        serde_json::error::Category::Eof => "cut short",
+    };
+    format!("{kind}, at column {}", e.column())
 }
 
 /// What [`read_tail`] recovers from the log.
@@ -874,10 +1040,14 @@ struct TailState {
 /// External audit NN-AUD-108: the walk also checks the row numbers (no
 /// signature work: a missing or extra row before the end is found at
 /// every open) and counts the rows, the `seq` of the next one.
-fn read_tail(path: &Path) -> Result<TailState> {
+///
+/// R11b (lab PR 262, review #466 F1): through `H`'s open that follows no
+/// final symlink and blocks on no FIFO, only a regular file; a line that is
+/// not a row is named by its number and length, never its content.
+fn read_tail<H: ChainHost>(path: &Path) -> Result<TailState> {
     let mut seq = crate::chain_anchor::RowSeq::default();
     let mut seq_break = None;
-    let f = match OpenOptions::new().read(true).open(path) {
+    let f = match H::open_read_nofollow(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(TailState {
@@ -891,8 +1061,9 @@ fn read_tail(path: &Path) -> Result<TailState> {
                 last_agent_id: None,
             });
         }
-        Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
+        Err(e) => return Err(refused_open::<H>(e, path, "to read its chain")),
     };
+    regular_file(&f, path)?;
     let reader = BufReader::new(f);
     let mut last: Option<String> = None;
     let mut last_ts = String::new();
@@ -901,13 +1072,20 @@ fn read_tail(path: &Path) -> Result<TailState> {
     let mut verified_boot = false;
     let mut anchoring_started = false;
     let mut last_agent_id = None;
-    for line in reader.lines() {
+    for (n, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading line from {}", path.display()))?;
         if line.is_empty() {
             continue;
         }
-        let entry: AuditEntry = serde_json::from_str(&line)
-            .with_context(|| format!("parsing audit-log line: {line}"))?;
+        let entry: AuditEntry = serde_json::from_str(&line).map_err(|e| {
+            anyhow!(
+                "{}: line {} ({} bytes) is not an audit row ({})",
+                path.display(),
+                n + 1,
+                line.len(),
+                row_parse_reason(&e)
+            )
+        })?;
         if entry.op == crate::chain_anchor::NUMBERING_STARTED_OP {
             anchoring_started = true;
         }
@@ -1241,31 +1419,79 @@ pub fn verify_chain_file(
     pubkey: &VerifyingKey,
     head: Option<&str>,
 ) -> std::io::Result<ChainFileReport> {
-    let mut report = ChainFileReport {
-        rows: 0,
-        first_numbered: None,
-        last_seq: None,
-        non_canonical_legacy: 0,
-        head_seen: false,
-        broken: None,
-    };
     let f = match OpenOptions::new().read(true).open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ChainFileReport::empty()),
         Err(e) => return Err(e),
     };
+    verify_chain_reader(BufReader::new(f), pubkey, head, true)
+}
+
+/// R11b (lab PR 262, review #466 F2): [`verify_chain_file`] over `bytes`,
+/// a chain its caller read once, bounded, from a descriptor it checked —
+/// the agent's fallback chains of refused starts, verified and listed from
+/// the same bytes. Its reasons never quote a line (a parse error names the
+/// kind of error, [`row_parse_reason`]): the agent signs them.
+pub fn verify_chain_bytes(
+    bytes: &[u8],
+    pubkey: &VerifyingKey,
+    head: Option<&str>,
+) -> ChainFileReport {
+    match verify_chain_reader(bytes, pubkey, head, false) {
+        Ok(report) => report,
+        // memory is never unreadable; were it so, nothing verified
+        Err(e) => ChainFileReport {
+            broken: Some(AuditVerifyError::UnreadableLine {
+                line: 0,
+                verified: 0,
+                reason: e.kind().to_string(),
+            }),
+            ..ChainFileReport::empty()
+        },
+    }
+}
+
+impl ChainFileReport {
+    /// A chain without rows.
+    fn empty() -> Self {
+        ChainFileReport {
+            rows: 0,
+            first_numbered: None,
+            last_seq: None,
+            non_canonical_legacy: 0,
+            head_seen: false,
+            broken: None,
+        }
+    }
+}
+
+/// The verifiers' one pass over `reader`; `quote`: a parse error's reason
+/// carries serde's message (the operator's `audit verify`), or only its
+/// kind ([`verify_chain_bytes`]).
+fn verify_chain_reader<R: BufRead>(
+    reader: R,
+    pubkey: &VerifyingKey,
+    head: Option<&str>,
+    quote: bool,
+) -> std::io::Result<ChainFileReport> {
+    let mut report = ChainFileReport::empty();
     let mut v = ChainVerifier::new(pubkey);
-    let mut lines = crate::verify_lines::VerifyLines::new(BufReader::new(f));
+    let mut lines = crate::verify_lines::VerifyLines::new(reader);
     while let Some(line) = lines.next_line()? {
         if line.is_empty() {
             continue;
         }
         let entry = line.text().and_then(|t| {
             serde_json::from_str::<AuditEntry>(t).map_err(|e| {
-                if line.newline {
-                    format!("not a row: {e}")
+                let why = if quote {
+                    e.to_string()
                 } else {
-                    format!("the last line, cut short (no newline): {e}")
+                    row_parse_reason(&e)
+                };
+                if line.newline {
+                    format!("not a row: {why}")
+                } else {
+                    format!("the last line, cut short (no newline): {why}")
                 }
             })
         });
@@ -1349,7 +1575,7 @@ pub fn verify_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_host::testing::TestKey;
+    use crate::chain_host::testing::{PortableHost, TestKey};
     use std::fs;
 
     use tempfile::TempDir;
@@ -1523,7 +1749,7 @@ mod tests {
             .boot_refused("mismatch", "source-tree", "x", &test_build())
             .unwrap();
         assert_eq!(e.extra["refused_by"], "install_manifest");
-        assert!(!verified_boot_recorded(&log_path).unwrap());
+        assert!(!verified_boot_recorded::<PortableHost>(&log_path).unwrap());
     }
 
     /// External audit DEP-009: only a successful boot whose binaries matched
@@ -1533,7 +1759,10 @@ mod tests {
     fn verified_boot_is_found_in_the_chain() {
         let (_d, key_path, log_path) = fresh_paths();
         let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
-        assert!(!verified_boot_recorded(&log_path).unwrap(), "no file yet");
+        assert!(
+            !verified_boot_recorded::<PortableHost>(&log_path).unwrap(),
+            "no file yet"
+        );
         let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
         log.boot_probe(None, "no-manifest", "none", &test_build())
             .unwrap();
@@ -1549,14 +1778,68 @@ mod tests {
         let mut other = sample_draft(1);
         other.extra = serde_json::json!({ "binary_integrity": "verified" });
         log.append(other).unwrap();
-        assert!(!verified_boot_recorded(&log_path).unwrap());
+        assert!(!verified_boot_recorded::<PortableHost>(&log_path).unwrap());
         log.boot_probe(None, "verified", "source-tree", &test_build())
             .unwrap();
         log.stop_entry("sigterm", 1).unwrap();
-        assert!(verified_boot_recorded(&log_path).unwrap());
+        assert!(verified_boot_recorded::<PortableHost>(&log_path).unwrap());
         // a corrupt line: the caller cannot tell
         std::fs::write(&log_path, b"{not json}\n").unwrap();
-        assert!(verified_boot_recorded(&log_path).is_err());
+        assert!(verified_boot_recorded::<PortableHost>(&log_path).is_err());
+    }
+
+    /// R11b (lab PR 262, review #466 F1): a line that is not a row is named
+    /// by its number and its length, never by its content — the reason ends
+    /// up in journal lines and in signed details, and a line may be anything
+    /// (the agent's key, when a link pointed the writer at it). And only a
+    /// regular file is read.
+    #[test]
+    fn a_line_that_is_not_a_row_is_named_without_its_content() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = || TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key(), [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        drop(log);
+        let good = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            read_head::<PortableHost>(&log_path).unwrap(),
+            (
+                1,
+                serde_json::from_str::<AuditEntry>(good.trim())
+                    .unwrap()
+                    .entry_hash
+            )
+        );
+        for bad in [
+            "hunter2-0123456789abcdef",
+            "{\"secret\":\"hunter2\"}",
+            "[\"hunter2\", 1]",
+        ] {
+            fs::write(&log_path, format!("{good}{bad}\n{good}")).unwrap();
+            for e in [
+                format!(
+                    "{:#}",
+                    AuditLog::open(&log_path, key(), [0u8; 16])
+                        .map(drop)
+                        .unwrap_err()
+                ),
+                format!(
+                    "{:#}",
+                    verified_boot_recorded::<PortableHost>(&log_path).unwrap_err()
+                ),
+                format!("{:#}", read_head::<PortableHost>(&log_path).unwrap_err()),
+            ] {
+                assert!(!e.contains("hunter2"), "{e}");
+                assert!(e.contains("line 2"), "{e}");
+                assert!(e.contains(&format!("({} bytes)", bad.len())), "{e}");
+            }
+        }
+        // a directory at the name: not a chain
+        fs::remove_file(&log_path).unwrap();
+        fs::create_dir(&log_path).unwrap();
+        let e = format!("{:#}", read_head::<PortableHost>(&log_path).unwrap_err());
+        assert!(e.contains("a directory"), "{e}");
+        assert!(AuditLog::open(&log_path, key(), [0u8; 16]).is_err());
     }
 
     fn verify_chain_ok(path: &Path) -> bool {
@@ -2550,5 +2833,121 @@ mod tests {
         assert_eq!(e.client_pid, std::process::id());
         let e = log.append(sample_draft(3)).unwrap();
         assert_eq!(e.client_pid, 12345, "an operator's row keeps its pid");
+    }
+
+    /// R11b (lab PR 262, review #466 F1): a chain kept in memory is a chain
+    /// like the log's — signed, linked from the genesis, numbered — and
+    /// [`verify_chain_bytes`] verifies its bytes; nothing reaches a file.
+    #[test]
+    fn a_chain_in_memory_verifies_from_its_bytes() {
+        let (d, key_path, _log_path) = fresh_paths();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let mut log = AuditLog::in_memory(key, [7u8; 16]);
+        let rows: Vec<AuditEntry> = (1..=3)
+            .map(|i| log.append(sample_draft(i)).unwrap())
+            .collect();
+        assert_eq!(log.rows(), 3);
+        assert_eq!(log.last_hash(), rows[2].entry_hash);
+        let mut seen = Vec::new();
+        log.scan_rows(|i, e| {
+            seen.push((i, e.entry_hash.clone()));
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            rows.iter()
+                .enumerate()
+                .map(|(i, e)| (i as u64, e.entry_hash.clone()))
+                .collect::<Vec<_>>()
+        );
+        let bytes = log.into_bytes();
+        assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), 3);
+        let r = verify_chain_bytes(&bytes, &pk, Some(&rows[1].entry_hash));
+        assert!(r.broken.is_none(), "{r:?}");
+        assert_eq!((r.rows, r.first_numbered, r.head_seen), (3, Some(0), true));
+        assert_eq!(rows[0].prev_hash, GENESIS_PREV_HASH);
+        assert_eq!(rows[0].agent_id, hex::encode([7u8; 16]));
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1, "only the key");
+        // another key's chain does not verify
+        let other = TestKey::fresh();
+        let r = verify_chain_bytes(&bytes, &other.verifying_key(), None);
+        assert!(
+            matches!(
+                r.broken,
+                Some(AuditVerifyError::SignatureInvalid { idx: 0 })
+            ),
+            "{r:?}"
+        );
+    }
+
+    /// R11b (lab PR 262, review #466 F2): [`verify_chain_bytes`] names a line
+    /// that is not a row by its number and kind of error, never its content
+    /// (the agent signs the reason); [`verify_chain_file`], the operator's
+    /// verifier, keeps serde's message.
+    #[test]
+    fn the_byte_verifier_quotes_no_line() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        let pk = key.verifying_key();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        log.append(sample_draft(1)).unwrap();
+        drop(log);
+        let mut bytes = fs::read(&log_path).unwrap();
+        bytes.extend_from_slice(b"{\"ts\": \"hunter2\"}\n");
+        let r = verify_chain_bytes(&bytes, &pk, None);
+        let Some(AuditVerifyError::UnreadableLine {
+            line: 2,
+            verified: 1,
+            reason,
+        }) = &r.broken
+        else {
+            panic!("{r:?}")
+        };
+        assert!(!reason.contains("hunter2"), "{reason}");
+        fs::write(&log_path, &bytes).unwrap();
+        let r = verify_chain_file(&log_path, &pk, None).unwrap();
+        assert!(matches!(
+            r.broken,
+            Some(AuditVerifyError::UnreadableLine { line: 2, .. })
+        ));
+    }
+
+    /// R11b (lab PR 262, review #466 F2): the rows of the log's file, read
+    /// again in order with their positions, until the visitor stops.
+    #[test]
+    fn the_rows_of_the_log_are_scanned_in_order() {
+        let (_d, key_path, log_path) = fresh_paths();
+        let key = TestKey::load_or_bootstrap(&key_path).unwrap();
+        let mut log = AuditLog::open(&log_path, key, [0u8; 16]).unwrap();
+        let mut n = 0;
+        log.scan_rows(|_, _| {
+            n += 1;
+            std::ops::ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(n, 0, "no file yet: no row");
+        let hashes: Vec<String> = (1..=4)
+            .map(|i| log.append(sample_draft(i)).unwrap().entry_hash)
+            .collect();
+        let mut seen = Vec::new();
+        log.scan_rows(|i, e| {
+            seen.push((i, e.entry_hash.clone()));
+            if i == 2 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                (0, hashes[0].clone()),
+                (1, hashes[1].clone()),
+                (2, hashes[2].clone())
+            ]
+        );
     }
 }

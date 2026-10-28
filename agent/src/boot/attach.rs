@@ -1,15 +1,15 @@
 //! `BootPhase::Attach` and `BootPhase::SelfTest` (R11a, lab PR 261: from
 //! `main.rs`): the eBPF object, the sensors and the deny hooks attach on
-//! the permit the integrity checks gave, then one deny hook is exercised
-//! against the agent itself.
+//! the proof the integrity checks gave (R11b, lab PR 262:
+//! `IntegrityVerified`, and the state files bootstrapped before), then one
+//! deny hook is exercised against the agent itself.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nn_proto::admin_signed_payload::OverlayKind;
-use northnarrow_agent::agent_id;
-use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
+use northnarrow_agent::boot::{checks, BootPhase, BootSequence, BootStep};
 use northnarrow_agent::net::dns_cache::DnsCache;
 use northnarrow_agent::net::flow_tracker::FlowTracker;
 use northnarrow_agent::posture::AuthSessionTracker;
@@ -17,7 +17,8 @@ use northnarrow_agent::sensors::SensorMultiplexer;
 use tracing::{debug, error, info, warn};
 
 use super::cli::{Cli, DnsSensor, ExecSensor, ExploitGuard, FileOpenSensor};
-use super::integrity::record_refused_boot;
+use super::refusal::{self, Refusal};
+use super::state::StateReady;
 
 /// What [`load`] attached.
 pub(crate) struct Attached {
@@ -40,14 +41,23 @@ pub(crate) struct Attached {
 /// `BootPhase::Attach`: the eBPF object loads and the sensors attach
 /// (`SensorMultiplexer::start_with_net`), the deny hooks attach and the
 /// agent registers in them (`attach_anti_tamper`), the exploit guard
-/// attaches. Both attaches take `attach_permit`, which only
-/// [`crate::boot::integrity::check`] hands out: nothing reaches the kernel before every
-/// preflight check has run.
+/// attaches. The load, the pins and every attach take `verified`, which
+/// only [`crate::boot::integrity::check`] holds (R11b, lab PR 262: the
+/// plan's `attach(&IntegrityVerified, &StateReady)`): nothing reaches the
+/// kernel before every integrity check has passed, and the state files the
+/// deny hooks protect were bootstrapped before (`_state`, which only
+/// [`crate::boot::state::bootstrap`] builds). A load or an attach that
+/// fails refuses the start, signed (`refusals`, into `audit`, the log the
+/// integrity phase opened); what attached before it stays pinned — the deny
+/// hooks that did attach keep protecting the agent's files.
 pub(crate) async fn load(
     cli: &Cli,
     boot: &mut BootSequence,
-    attach_permit: northnarrow_agent::boot::AttachPermit,
+    verified: &northnarrow_agent::boot::IntegrityVerified,
+    _state: &StateReady,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    refusals: &refusal::Context<'_>,
+    audit: &mut checks::AuditOpen,
 ) -> Result<Attached> {
     // Process-lineage cache shared by the posture triggers and the FIM
     // rules' package-manager carve-out (review 49): "does this writer
@@ -144,9 +154,19 @@ pub(crate) async fn load(
         cli.exploit_guard_tasks,
         cli.exploit_guard.variant(),
     );
-    let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring, &attach_permit)
+    let (mut sensor, net_bufs) = match SensorMultiplexer::start_with_net(net_wiring, verified)
         .await
-        .context("starting the sensor multiplexer (with net observation)")?;
+        .context("starting the sensor multiplexer (with net observation)")
+    {
+        Ok(started) => started,
+        // R11b (lab PR 262): a load or a mandatory sensor's attach that
+        // fails refuses the start, signed; it needs the loaded object
+        Err(e) => {
+            let why = format!("{e:#}");
+            error!(error = %why, "refusing to start: the eBPF object's load or a sensor's attach failed");
+            refusals.refuse(audit.log_mut(), Refusal::new("sensors", why))
+        }
+    };
     boot.done(BootStep::Sensors)?;
     info!(
         sensors =
@@ -186,21 +206,29 @@ pub(crate) async fn load(
     // anti_tamper::attach). A kernel without `bpf` in its active LSMs was
     // refused by the preflight above (lab PR 218), or runs under that same
     // opt-in; hooks that attach and never run are the self-test's below.
-    sensor
-        .attach_anti_tamper(&attach_permit, &pids, &keep)
+    if let Err(e) = sensor
+        .attach_anti_tamper(verified, &pids, &keep)
         .with_context(|| {
             format!(
                 "anti-tamper setup failed (agent_pid={agent_pid}) — \
                  refusing to start with a silently-absent protection"
             )
-        })?;
+        })
+    {
+        // R11b (lab PR 262): the deny hooks' shortfall refuses the start,
+        // signed; it is the attach's own result. The hooks that attached stay
+        // pinned: they protect the agent's files until the next start.
+        let why = format!("{e:#}");
+        error!(error = %why, "refusing to start: the deny hooks did not attach");
+        refusals.refuse(audit.log_mut(), Refusal::new("deny_hooks", why));
+    }
     boot.done(BootStep::AntiTamper)?;
     // Lab PR 219: the exploit post-condition guard, attached before the
     // agent's programs are recorded as its own (DEP-006), in detect mode
     // until the no-enforcement gate is resolved below. Off or unavailable
     // is attested once the audit log is open.
     let exploit_guard_degraded: Option<String> =
-        match sensor.attach_exploit_guard(cli.exploit_guard.variant()) {
+        match sensor.attach_exploit_guard(verified, cli.exploit_guard.variant()) {
             Ok(()) => None,
             Err(_) if cli.exploit_guard == ExploitGuard::Off => Some(
                 "exploit post-condition guard off (--exploit-guard off / NN_EXPLOIT_GUARD=off): \
@@ -234,14 +262,13 @@ pub(crate) struct SelfTested {
 
 /// `BootPhase::SelfTest` (lab PR 218, external review AR-09 / G-12): one
 /// deny hook exercised against the agent itself; hooks attached but never
-/// run refuse the start (signed) unless the degraded mode is asked for.
-#[allow(clippy::too_many_arguments)]
+/// run refuse the start (signed, `refusals`: into `audit`, the log the
+/// integrity phase opened) unless the degraded mode is asked for. It needs
+/// the attached hooks: after the attach, by its nature.
 pub(crate) fn self_test(
-    cli: &Cli,
     boot: &mut BootSequence,
-    identity: &agent_id::AgentIdentity,
-    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
-    integrity: &northnarrow_agent::install_manifest::IntegrityOutcome,
+    refusals: &refusal::Context<'_>,
+    audit: &mut checks::AuditOpen,
     allow_degraded: bool,
     bpf_lsm_state: &northnarrow_agent::boot::lsm::BpfLsm,
     detect_only: bool,
@@ -263,16 +290,10 @@ pub(crate) fn self_test(
             "refusing to start: {detail}; set {}=1 to start without enforcement. Exiting 78.",
             northnarrow_agent::anti_tamper::ALLOW_DEGRADED_ENV
         );
-        record_refused_boot(
-            cli,
-            identity,
-            overlay_gate,
-            "deny_self_test",
-            (integrity.label(), integrity.provenance()),
-            Some(("deny_self_test", detail.as_str())),
-            &detail,
+        refusals.refuse(
+            audit.log_mut(),
+            Refusal::new("deny_self_test", detail).degraded("deny_self_test"),
         );
-        std::process::exit(78);
     }
     if let Some(detail) = &self_test_detail {
         northnarrow_agent::boot::degradation::report("deny_self_test", detail);

@@ -13,9 +13,11 @@
 //! parameter, as the posture's on `LinuxHost`). `main.rs` and the tests are
 //! unchanged.
 
+// R11b (lab PR 262): without `EBPF_BYTES`, which only nn-linux's loaders
+// read (they take the start's integrity proof).
 pub use nn_linux::sensors::{
     connect_deny, dns_sensor, ebpf_object, epg, exe_identity, exec, flow_sock, multiplexer,
-    open_sensor, reject, ring_drops, ExecSensor, EBPF_BYTES,
+    open_sensor, reject, ring_drops, ExecSensor,
 };
 
 /// [`nn_linux::sensors::SensorMultiplexer`] on the agent's exec guards.

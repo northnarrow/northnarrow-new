@@ -78,18 +78,20 @@ hex = "0.4"
 debug-trigger = []
 # R09b (lab PR 254): the attach permit without a boot sequence, for the
 # privileged tests that load the eBPF object outside the agent's start
-# (`boot::AttachPermit::for_tests`); the agent forwards its own
-# `test-privileged` here (plan §4.1 rule 4). R09c (lab PR 257): the lab
-# builds' `--sensor-feasibility` (`sensor_feasibility`). Off by default;
-# production builds never see it.
+# (`boot::IntegrityVerified::for_tests` since R11b, lab PR 262); the agent
+# forwards its own `test-privileged` here (plan §4.1 rule 4). R09c (lab PR
+# 257): the lab builds' `--sensor-feasibility` (`sensor_feasibility`). Off
+# by default; production builds never see it.
 test-privileged = []
 # R09a (lab PR 253): the test doors this crate keeps for the agent's tests
 # that wire it — a capture of a process without a descriptor, the
 # host-critical guard on given identities, an unlock token minted without a
 # signature, the admin key set's fingerprints, the isolator on given
 # binaries; R09b (lab PR 254): the FIM's stand-in for the kernel's watched
-# inodes (the agent enables it as a dev-dependency only, as nn-core's
-# `test-util`). No build of the binaries has it.
+# inodes; R11b (lab PR 262): the integrity proof without a boot sequence
+# (`boot::IntegrityVerified::for_tests`, the live exec sensor test's) (the
+# agent enables it as a dev-dependency only, as nn-core's `test-util`). No
+# build of the binaries has it.
 test-util = []
 
 [build-dependencies]

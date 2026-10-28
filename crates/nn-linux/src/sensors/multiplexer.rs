@@ -120,9 +120,10 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// returns. Net observation programs (Tappa 10 N2) are NOT
     /// attached — use [`Self::start_with_net`] for those.
     ///
-    /// Lab PR 218: `_permit` is the proof that every preflight check ran
-    /// ([`crate::boot::BootSequence::enter_attach`]).
-    pub async fn start(_permit: &crate::boot::AttachPermit) -> Result<Self> {
+    /// Lab PR 218: `_verified` is the proof that every integrity check
+    /// passed ([`crate::boot::BootSequence::verify_integrity`]; R11b, lab PR
+    /// 262: the load, and the by-name pins of the maps it makes, take it).
+    pub async fn start(_verified: &crate::boot::IntegrityVerified) -> Result<Self> {
         let (mux, _) = Self::do_start(None).await?;
         Ok(mux)
     }
@@ -132,12 +133,14 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// two new ringbufs the caller should hand to
     /// [`crate::net::drain::drain_loop`].
     ///
-    /// Lab PR 218: `_permit` is the proof that every preflight check ran
-    /// (capabilities, install manifest, audit log, BPF LSM —
-    /// [`crate::boot::BootSequence::enter_attach`]).
+    /// Lab PR 218: `_verified` is the proof that every integrity check
+    /// passed — the eBPF object, the state directory, the BTF offsets, the
+    /// capabilities, the install manifest, the audit log, the BPF LSM
+    /// ([`crate::boot::BootSequence::verify_integrity`]; R11b, lab PR 262:
+    /// the load, and the by-name pins of the maps it makes, take it).
     pub async fn start_with_net(
         net: NetWiring,
-        _permit: &crate::boot::AttachPermit,
+        _verified: &crate::boot::IntegrityVerified,
     ) -> Result<(Self, NetRingBufs)> {
         let (mux, bufs) = Self::do_start(Some(net)).await?;
         let bufs =
@@ -503,9 +506,11 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
 
     /// Lab PR 219: attach the exploit post-condition guard (detect mode)
     /// and pump its records into the event channel. `Err(reason)` when it
-    /// does not run; nothing of it is attached then.
+    /// does not run; nothing of it is attached then. `_verified`: as for
+    /// [`Self::start_with_net`] (R11b, lab PR 262).
     pub fn attach_exploit_guard(
         &mut self,
+        _verified: &crate::boot::IntegrityVerified,
         variant: crate::sensors::epg::Variant,
     ) -> std::result::Result<(), String> {
         let ring = crate::sensors::epg::attach(&mut self.ebpf, variant)?;
@@ -528,14 +533,15 @@ impl<G: ExecGuards> SensorMultiplexer<G> {
     /// registered alongside the agent in the same call once Tappa 7
     /// task 6 commits #3-4 land.
     ///
-    /// Lab PR 218: `_permit` as for [`Self::start_with_net`].
+    /// Lab PR 218: `verified` as for [`Self::start_with_net`] (R11b, lab PR
+    /// 262: the pins and the deny hooks' attach take it).
     pub fn attach_anti_tamper(
         &mut self,
-        _permit: &crate::boot::AttachPermit,
+        verified: &crate::boot::IntegrityVerified,
         pids: &[u32],
         keep: &[crate::anti_tamper::ExeIdentity],
     ) -> Result<()> {
-        crate::anti_tamper::attach(&mut self.ebpf, pids, keep)
+        crate::anti_tamper::attach(verified, &mut self.ebpf, pids, keep)
     }
 }
 

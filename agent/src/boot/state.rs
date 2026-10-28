@@ -5,19 +5,31 @@ use tracing::{info, warn};
 
 use super::cli::Cli;
 
-/// What [`bootstrap`] found.
+/// What [`bootstrap`] found. Only [`bootstrap`] builds one (`_once` is
+/// private to this module): the attach takes it (R11b, lab PR 262: the
+/// plan's `attach(&IntegrityVerified, &StateReady)`), so the deny hooks
+/// never attach before the files they protect were bootstrapped.
 pub(crate) struct StateReady {
     /// Lab PR 218: the previous agent's hooks may close the agent's files to
     /// this process until the attach registers it (the audit preflight).
     pub(crate) early_registration_failed: bool,
+    _once: (),
 }
 
 /// The state files, before the attach (Tappa 8 A14): the agent registered
 /// in the pinned PROTECTED_PIDS first (EBPF-015), then the key, the audit
 /// log, the FIM, detection, status, canary and network logs and the head
 /// anchor bootstrapped, so the deny hooks protect their inodes from the
-/// moment they attach.
-pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
+/// moment they attach. R11b (lab PR 262): `preflight_refused`, the
+/// preflight refused the start (the eBPF object, the state directory, the
+/// BTF offsets): the registration only (the refusal is signed under the
+/// previous agent's hooks, then withdrawn), no file (review #466 F8: the
+/// refusal's signature makes what it needs, the key and the chain).
+pub(crate) fn bootstrap(
+    cli: &Cli,
+    heads_file: &std::path::Path,
+    preflight_refused: bool,
+) -> StateReady {
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
     // registered — the files bootstrapped below when one is missing, a map
@@ -46,6 +58,16 @@ pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
         }
     };
 
+    if preflight_refused {
+        warn!(
+            "state files not bootstrapped: the preflight refused the start (signed, then exit, \
+             before anything is loaded)"
+        );
+        return StateReady {
+            early_registration_failed,
+            _once: (),
+        };
+    }
     // Tappa 8 A14 (B4): bootstrap the four /etc/northnarrow/ files
     // BEFORE the sensor multiplexer attaches the LSM hooks, so the
     // hooks see their inodes in PROTECTED_INODES the moment they
@@ -72,11 +94,13 @@ pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
                  anti-tamper hooks — read after the attach"
             );
         } else {
+            // Review #466 F4: the integrity phase's audit check refuses the
+            // start on it (unless NN_AUDIT_ALLOW_UNWRITABLE=1).
             warn!(
                 error = %e,
                 path = %cli.signing_key_file.display(),
-                "agent signing key bootstrap failed pre-attach — audit log will be \
-                 unsigned this boot"
+                "agent signing key bootstrap failed pre-attach — the audit check refuses the \
+                 start unless NN_AUDIT_ALLOW_UNWRITABLE=1"
             );
         }
     }
@@ -206,5 +230,65 @@ pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
     }
     StateReady {
         early_registration_failed,
+        _once: (),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::*;
+
+    /// The state files' flags, every one in `dir`.
+    fn cli(dir: &Path) -> Cli {
+        let _env = super::super::cli::TEST_ENV.lock();
+        let mut args = vec!["northnarrow-agent".to_string()];
+        for (flag, file) in [
+            ("--agent-id-file", "agent_id"),
+            ("--admin-pub", "admin.pub"),
+            ("--signing-key-file", "agent.sig.key"),
+            ("--audit-log-file", "audit.log"),
+            ("--fim-baseline-file", "fim_baseline.jsonl"),
+            ("--fim-drift-file", "fim_drift.jsonl"),
+            ("--detections-file", "detections/detections.jsonl"),
+            ("--status-events-file", "detections/status_events.jsonl"),
+            ("--canary-registry-file", "canary_registry.jsonl"),
+            ("--canary-access-file", "canary_access.jsonl"),
+            ("--netflow-file", "netflow.jsonl"),
+            ("--netflow-listeners-file", "netflow_listeners.jsonl"),
+        ] {
+            args.push(flag.to_string());
+            args.push(dir.join(file).to_string_lossy().into_owned());
+        }
+        Cli::try_parse_from(args).expect("a command line with the test's paths")
+    }
+
+    /// Review #466 F8: a start the preflight refused (the eBPF object, the
+    /// state directory, the BTF offsets) bootstraps no state file before its
+    /// signed refusal; any other start does.
+    #[test]
+    fn a_refused_preflight_bootstraps_no_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = cli(dir.path());
+        let heads = dir.path().join("chain_heads.json");
+        bootstrap(&cli, &heads, true);
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        bootstrap(&cli, &heads, false);
+        for made in [
+            "agent.sig.key",
+            "audit.log",
+            "fim_baseline.jsonl",
+            "netflow.jsonl",
+        ] {
+            assert!(dir.path().join(made).exists(), "{made}");
+        }
     }
 }

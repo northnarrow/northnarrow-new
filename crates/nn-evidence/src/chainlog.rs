@@ -1802,16 +1802,36 @@ pub enum TailRepair {
 /// remain — a file with no complete line is left untouched and refused,
 /// so no repair ever empties a chain. `None` when the file is missing,
 /// empty or already ends in a newline.
-pub fn repair_torn_tail(
+///
+/// R11b (lab PR 262, review #466 F1): opened through `H`'s open that
+/// follows no final symlink and blocks on no FIFO
+/// ([`ChainHost::open_with_mode_nofollow`]), and only a regular file is
+/// repaired — a link at the name made the writer truncate, or end with a
+/// newline, whatever file it pointed at. Nothing is created.
+pub fn repair_torn_tail<H: ChainHost>(
     path: &Path,
     is_line: impl Fn(&[u8]) -> bool,
 ) -> Result<Option<TailRepair>> {
-    let mut f = match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(anyhow!(e).context(format!("opening {}", path.display()))),
-    };
-    let size = f.metadata()?.len();
+    let mut f =
+        match H::open_with_mode_nofollow(OpenOptions::new().read(true).write(true), 0o600, path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if H::is_symlink_refusal(&e) => {
+                return Err(anyhow!(
+                    "{}: a symbolic link, not a chain file — not followed, left untouched",
+                    path.display()
+                ))
+            }
+            Err(e) => return Err(anyhow!(e).context(format!("opening {}", path.display()))),
+        };
+    let meta = f.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(anyhow!(
+            "{}: not a regular file — not a chain file, left untouched",
+            path.display()
+        ));
+    }
+    let size = meta.len();
     if size == 0 {
         return Ok(None);
     }
@@ -4248,7 +4268,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let p = dir.path().join("x.jsonl");
         fs::write(&p, "{\"a\":1}\n{\"a\":2}\n{\"a\":3, \"tr").unwrap();
-        let r = repair_torn_tail(&p, parses).unwrap().unwrap();
+        let r = repair_torn_tail::<PortableHost>(&p, parses)
+            .unwrap()
+            .unwrap();
         assert!(
             matches!(
                 r,
@@ -4261,7 +4283,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "{\"a\":1}\n{\"a\":2}\n");
         // clean now
-        assert_eq!(repair_torn_tail(&p, parses).unwrap(), None);
+        assert_eq!(repair_torn_tail::<PortableHost>(&p, parses).unwrap(), None);
     }
 
     #[test]
@@ -4270,7 +4292,7 @@ mod tests {
         let p = dir.path().join("x.jsonl");
         fs::write(&p, "{\"a\":1}\n{\"a\":2}").unwrap();
         assert_eq!(
-            repair_torn_tail(&p, parses).unwrap(),
+            repair_torn_tail::<PortableHost>(&p, parses).unwrap(),
             Some(TailRepair::Terminated)
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "{\"a\":1}\n{\"a\":2}\n");
@@ -4282,7 +4304,7 @@ mod tests {
         // a complete bad line mid-file is not a torn write: untouched
         let p = dir.path().join("mid.jsonl");
         fs::write(&p, "{\"a\":1}\ngarbage\n{\"a\":3}\n").unwrap();
-        assert_eq!(repair_torn_tail(&p, parses).unwrap(), None);
+        assert_eq!(repair_torn_tail::<PortableHost>(&p, parses).unwrap(), None);
         assert_eq!(
             fs::read_to_string(&p).unwrap(),
             "{\"a\":1}\ngarbage\n{\"a\":3}\n"
@@ -4290,16 +4312,16 @@ mod tests {
         // nothing complete would remain: refused, untouched
         let q = dir.path().join("lone.jsonl");
         fs::write(&q, "{\"a\":1, \"tor").unwrap();
-        assert!(repair_torn_tail(&q, parses).is_err());
+        assert!(repair_torn_tail::<PortableHost>(&q, parses).is_err());
         assert_eq!(fs::read_to_string(&q).unwrap(), "{\"a\":1, \"tor");
         // missing and empty files: nothing to do
         assert_eq!(
-            repair_torn_tail(&dir.path().join("none"), parses).unwrap(),
+            repair_torn_tail::<PortableHost>(&dir.path().join("none"), parses).unwrap(),
             None
         );
         let e = dir.path().join("empty");
         fs::write(&e, "").unwrap();
-        assert_eq!(repair_torn_tail(&e, parses).unwrap(), None);
+        assert_eq!(repair_torn_tail::<PortableHost>(&e, parses).unwrap(), None);
     }
 
     // ── External audit NN-AUD-110 / NN-AUD-115 ──

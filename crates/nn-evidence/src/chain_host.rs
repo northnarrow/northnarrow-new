@@ -38,7 +38,9 @@ pub trait ChainHost: 'static {
     /// Open with `options`; a file the open creates gets `mode`.
     fn open_with_mode(options: &mut OpenOptions, mode: u32, path: &Path) -> io::Result<File>;
 
-    /// [`Self::open_with_mode`] without following a final symlink.
+    /// [`Self::open_with_mode`] without following a final symlink and
+    /// without blocking on a FIFO (R11b, lab PR 262: the audit chain's
+    /// opens, after review #466 F1).
     fn open_with_mode_nofollow(
         options: &mut OpenOptions,
         mode: u32,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use northnarrow_agent::admin_socket;
 use northnarrow_agent::agent_id;
-use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
+use northnarrow_agent::boot::{checks, BootPhase, BootSequence, BootStep};
 use northnarrow_agent::detection_report;
 use northnarrow_agent::posture::PostureMachine;
 use northnarrow_agent::response::Executor;
@@ -19,6 +19,7 @@ use tracing::{error, info, warn};
 
 use super::cli::Cli;
 use super::posture::audit_combat_reconcile;
+use super::refusal::{self, Refusal};
 use super::tasks::WatchdogAudit;
 
 /// The signed audit log, once [`attest`] opened it (`None`: the boot
@@ -35,11 +36,13 @@ pub(crate) struct Attested {
     pub(crate) audit_log: AuditHandle,
 }
 
-/// `BootPhase::Attest` (lab PR 218): the signed audit log opens — the heads
-/// anchored as this boot found them, the rollback floor, the chains'
-/// findings, the identity, then the boot's own `agent_boot` (an audit log
-/// that cannot be written refuses the start unless that is allowed) — and
-/// every degradation found so far is signed. Then `BootPhase::Subsystems`.
+/// `BootPhase::Attest` (lab PR 218): the signed audit log — opened by the
+/// integrity phase before the load (R11b, lab PR 262; `audit`), here when
+/// that was deferred — takes the heads anchored as this boot found them,
+/// the rollback floor, the chains' findings, the identity, then the boot's
+/// own `agent_boot` (an audit log that cannot be written refuses the start
+/// unless that is allowed) — and every degradation found so far is signed.
+/// Then `BootPhase::Subsystems`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attest(
     cli: &Cli,
@@ -56,121 +59,131 @@ pub(crate) fn attest(
     hook_args_degraded: Option<String>,
     exploit_guard_degraded: Option<String>,
     caps_degraded: Vec<String>,
+    audit: checks::AuditOpen,
 ) -> Result<Attested> {
     // Lab PR 218: the signed audit log right after the self-test, before
     // the subsystems below load (the blocklists, the rules, the response
     // executor, the posture, FIM): every degradation found so far is signed
     // now, and later ones within `boot::degradation::FLUSH_PERIOD`.
     boot.enter(BootPhase::Attest)?;
+    // R11b (lab PR 262): what signs a refusal of this phase — the boot's own
+    // row that cannot be written, a deferred open that fails.
+    let refusals = refusal::Context {
+        cli,
+        identity: &identity,
+        overlay_gate,
+        integrity: (integrity.label(), integrity.provenance()),
+    };
     // ── Shared audit log + COMBAT graduated-response ladder ─────────
     //
-    // The signed, hash-chained audit log is opened ONCE here (now that
-    // agent_id is ready) and shared by both the COMBAT ladder (per-stage
-    // signed transitions) and the admin socket (admin-op audit). A `None`
-    // audit log (open/key failure) degrades to log-only, exactly as the
-    // admin-op path already tolerates.
+    // The signed, hash-chained audit log is opened ONCE (R11b, lab PR 262:
+    // by the integrity phase, before the load; here when that was deferred)
+    // and shared by both the COMBAT ladder (per-stage signed transitions)
+    // and the admin socket (admin-op audit). A `None` audit log (open/key
+    // failure) degrades to log-only, exactly as the admin-op path already
+    // tolerates.
     let mut chain_anchor: Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>> =
         None;
+    // R11b (lab PR 262): the integrity phase opened the log before the load
+    // (`boot::checks::audit_log`: its chain read, a broken one refused there);
+    // it is opened here only when that was deferred — the previous agent's
+    // hooks closed it to this process until the attach registered it — as
+    // every start opened it until then.
+    let opened = match audit {
+        checks::AuditOpen::Open(log) => Some(*log),
+        checks::AuditOpen::Deferred(_) => open_after_attach(&refusals, agent_id),
+        // found, said (and refused when fatal) before the load
+        checks::AuditOpen::NoKey(_)
+        | checks::AuditOpen::Failed(_)
+        | checks::AuditOpen::NotTried => None,
+    };
     let audit_log: Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>> =
-        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
-            Ok(key) => {
-                match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
-                    // Boot write probe (etc-readonly-audit-1): a signed
-                    // `agent_boot` entry proves the chain is writable NOW
-                    // instead of failing silently at the first COMBAT
-                    // transition. Fail-closed in enforcement mode.
-                    Ok(mut log) => {
-                        // Lab PR 160: anchor the heads as this boot found
-                        // them before it appends anything (the snapshot is on
-                        // disk before the first numbered row of an upgrade).
-                        // A row-number break in the audit chain counts as
-                        // lost history there too (ATP-004 fails closed).
-                        for f in log.take_open_findings(&cli.audit_log_file) {
-                            boot_chains.findings.push(f);
-                        }
-                        chain_anchor = start_chain_anchor(
-                            cli,
-                            &heads_file,
-                            chain_targets,
-                            &mut boot_chains,
-                            agent_id,
-                            &log,
+        match opened {
+            // Boot write probe (etc-readonly-audit-1): a signed
+            // `agent_boot` entry proves the chain is writable NOW
+            // instead of failing silently at the first COMBAT
+            // transition. Fail-closed in enforcement mode.
+            Some(mut log) => {
+                // Lab PR 160: anchor the heads as this boot found
+                // them before it appends anything (the snapshot is on
+                // disk before the first numbered row of an upgrade).
+                // A row-number break in the audit chain counts as
+                // lost history there too (ATP-004 fails closed).
+                for f in log.take_open_findings(&cli.audit_log_file) {
+                    boot_chains.findings.push(f);
+                }
+                chain_anchor = start_chain_anchor(
+                    cli,
+                    &heads_file,
+                    chain_targets,
+                    &mut boot_chains,
+                    agent_id,
+                    &log,
+                );
+                // External audit LLMR-014: the rollback floor's
+                // reset / anchor come first in this boot's entries.
+                overlay_gate.attest_floor(&mut log);
+                // Lab PR 160: what the chain checks found, then the
+                // one-time record of where numbering starts.
+                for f in &boot_chains.findings {
+                    f.attest(Some(&mut log));
+                }
+                if let Some(marker) = chain_anchor.as_ref().and_then(|a| a.lock().take_marker()) {
+                    if let Err(e) = log.append(marker) {
+                        warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
+                    }
+                }
+                // External audit EVD-020 / MAIN-009: a minted id, an
+                // id other than the one the chain's last row carries,
+                // or a per-boot id (the file unusable) is signed
+                // before the boot's own entry.
+                if let Err(e) = log.attest_identity(&identity) {
+                    warn!(error = format!("{e:#}"), "agent identity not recorded");
+                }
+                // R11b (lab PR 262): the refusals earlier starts could not
+                // sign here (the audit log could not take them), from their
+                // fallback chains beside --pid-file, before this boot's row
+                // (review #466 F2: each read once, verified, bound to this
+                // log).
+                if let Some(dir) = refusal::fallback_dir(cli) {
+                    let pk = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file);
+                    for e in refusal::record_fallback(&mut log, &dir, pk.as_ref(), agent_id)
+                        .into_iter()
+                        .filter_map(Result::err)
+                    {
+                        warn!(
+                            error = %e,
+                            path = %dir.display(),
+                            "boot refusals of a fallback chain NOT recorded — kept for the next start"
                         );
-                        // External audit LLMR-014: the rollback floor's
-                        // reset / anchor come first in this boot's entries.
-                        overlay_gate.attest_floor(&mut log);
-                        // Lab PR 160: what the chain checks found, then the
-                        // one-time record of where numbering starts.
-                        for f in &boot_chains.findings {
-                            f.attest(Some(&mut log));
-                        }
-                        if let Some(marker) =
-                            chain_anchor.as_ref().and_then(|a| a.lock().take_marker())
+                    }
+                }
+                match log.boot_probe(
+                    detect_only_source.as_deref(),
+                    integrity.label(),
+                    integrity.provenance(),
+                    &northnarrow_agent::build_info::agent_build(),
+                ) {
+                    Ok(entry) => {
+                        info!(
+                            path = %cli.audit_log_file.display(),
+                            entry_hash = %entry.entry_hash,
+                            "audit log writable — agent_boot entry appended"
+                        );
+                        if let northnarrow_agent::audit::PreviousRun::Abrupt {
+                            booted_at,
+                            last_entry_at,
+                        } = log.previous_run()
                         {
-                            if let Err(e) = log.append(marker) {
-                                warn!(error = %format!("{e:#}"), "chain heads: start not recorded");
-                            }
+                            warn!(
+                                booted_at = %booted_at,
+                                last_entry_at = %last_entry_at,
+                                "PREVIOUS RUN ENDED ABRUPTLY — the agent that booted then never \
+                                 wrote agent_stop: SIGKILL (systemctl kill, cgroup.kill), OOM, \
+                                 crash or power loss; recorded in this boot's audit entry"
+                            );
                         }
-                        // External audit EVD-020 / MAIN-009: a minted id, an
-                        // id other than the one the chain's last row carries,
-                        // or a per-boot id (the file unusable) is signed
-                        // before the boot's own entry.
-                        if let Err(e) = log.attest_identity(&identity) {
-                            warn!(error = format!("{e:#}"), "agent identity not recorded");
-                        }
-                        match log.boot_probe(
-                            detect_only_source.as_deref(),
-                            integrity.label(),
-                            integrity.provenance(),
-                            &northnarrow_agent::build_info::agent_build(),
-                        ) {
-                            Ok(entry) => {
-                                info!(
-                                    path = %cli.audit_log_file.display(),
-                                    entry_hash = %entry.entry_hash,
-                                    "audit log writable — agent_boot entry appended"
-                                );
-                                if let northnarrow_agent::audit::PreviousRun::Abrupt {
-                                    booted_at,
-                                    last_entry_at,
-                                } = log.previous_run()
-                                {
-                                    warn!(
-                                        booted_at = %booted_at,
-                                        last_entry_at = %last_entry_at,
-                                        "PREVIOUS RUN ENDED ABRUPTLY — the agent that booted then never \
-                                         wrote agent_stop: SIGKILL (systemctl kill, cgroup.kill), OOM, \
-                                         crash or power loss; recorded in this boot's audit entry"
-                                    );
-                                }
-                                Some(Arc::new(parking_lot::Mutex::new(log)))
-                            }
-                            Err(e) => {
-                                let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                                    std::env::var(
-                                        northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV,
-                                    )
-                                    .ok()
-                                    .as_deref(),
-                                );
-                                error!(
-                                    error = format!("{e:#}"),
-                                    path = %cli.audit_log_file.display(),
-                                    fatal,
-                                    "audit log NOT writable — the signed audit chain would stop here \
-                                     (is the directory in the unit's ReadWritePaths?)"
-                                );
-                                if fatal {
-                                    anyhow::bail!(
-                                    "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
-                                     set {}=1 to start anyway.",
-                                    cli.audit_log_file.display(),
-                                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
-                                );
-                                }
-                                None
-                            }
-                        }
+                        Some(Arc::new(parking_lot::Mutex::new(log)))
                     }
                     Err(e) => {
                         let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
@@ -178,22 +191,30 @@ pub(crate) fn attest(
                                 .ok()
                                 .as_deref(),
                         );
-                        error!(error = format!("{e:#}"), fatal, "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED");
+                        error!(
+                            error = format!("{e:#}"),
+                            path = %cli.audit_log_file.display(),
+                            fatal,
+                            "audit log NOT writable — the signed audit chain would stop here \
+                             (is the directory in the unit's ReadWritePaths?)"
+                        );
                         if fatal {
-                            anyhow::bail!(
-                                "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway.",
+                            // R11b (lab PR 262): the write itself, after the
+                            // attach by its nature (a full disk is found by
+                            // it); signed in the fallback chain
+                            let detail = format!(
+                                "audit log {} is not writable: {e:#}. Refusing to run unaudited; \
+                                 set {}=1 to start anyway.",
                                 cli.audit_log_file.display(),
                                 northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
                             );
+                            refusals.refuse(Some(&mut log), Refusal::new("audit_log", detail));
                         }
                         None
                     }
                 }
             }
-            Err(e) => {
-                warn!(error = format!("{e:#}"), "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
-                None
-            }
+            None => None,
         };
     boot.done(BootStep::AgentBoot)?;
     // External audit ATP-016 (NN-AUD-264): a start under
@@ -247,6 +268,73 @@ pub(crate) fn attest(
         chain_anchor,
         audit_log,
     })
+}
+
+/// The audit log's open after the attach, when the integrity phase could
+/// not open it before the load (R11b, lab PR 262: `AuditOpen::Deferred`):
+/// as the attest phase opened it until then — fatal unless
+/// `NN_AUDIT_ALLOW_UNWRITABLE=1` (the refusal signed, `refusals`), and so is
+/// a key that cannot be loaded (review #466 F4: it ran unaudited; the
+/// refusal is then the journal's alone).
+fn open_after_attach(
+    refusals: &refusal::Context<'_>,
+    agent_id: [u8; 16],
+) -> Option<northnarrow_agent::audit::AuditLog> {
+    let cli = refusals.cli;
+    let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+        std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let refuse = |what: String| -> ! {
+        refusals.refuse(
+            None,
+            Refusal::new(
+                "audit_log",
+                format!(
+                    "{what}. Refusing to run unaudited; set {}=1 to start anyway.",
+                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                ),
+            ),
+        )
+    };
+    let key =
+        match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
+            Ok(key) => key,
+            Err(e) => {
+                error!(
+                    error = format!("{e:#}"),
+                    fatal,
+                    path = %cli.signing_key_file.display(),
+                    "agent signing key cannot be loaded — no row of the audit chain could be signed"
+                );
+                if fatal {
+                    refuse(format!(
+                        "the agent's signing key {} cannot be loaded: {e:#}",
+                        cli.signing_key_file.display()
+                    ));
+                }
+                warn!("COMBAT stage transitions + admin ops UNAUDITED this boot");
+                return None;
+            }
+        };
+    match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
+        Ok(log) => Some(log),
+        Err(e) => {
+            error!(
+                error = format!("{e:#}"),
+                fatal,
+                "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED"
+            );
+            if fatal {
+                refuse(format!(
+                    "audit log {} cannot be opened: {e:#}",
+                    cli.audit_log_file.display()
+                ));
+            }
+            None
+        }
+    }
 }
 
 /// The audit log reaches what was built before it opened (the late binding

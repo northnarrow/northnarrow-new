@@ -368,6 +368,9 @@ planned = false
 # R09b (lab PR 254): the degradations of a run, which the sensors report,
 # moved to nn-linux with the boot's phases (`boot/mod.rs` re-exports them)
 "boot::degradation" = "nn-linux"
+# R11b (lab PR 262): the BPF LSM gate, whose check records its boot step
+# (`boot/mod.rs` re-exports it)
+"boot::lsm" = "nn-linux"
 # R09b (lab PR 254): file integrity monitoring moved to nn-linux whole —
 # the attach, the drain (the ring half; R08b, lab PR 251, cut the drift's
 # classification to nn-core's `fim::drift`, re-exported by the drain), the

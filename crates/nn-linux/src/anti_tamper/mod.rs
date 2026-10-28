@@ -218,7 +218,16 @@ const PTRACE_HOOK: &str = "ptrace_access_check";
 /// prior pinned-map load are evicted first — every entry whose PID
 /// is dead or does not run one of `keep` ([`ExeIdentity`]) is removed
 /// before `pids` is inserted.
-pub fn attach(ebpf: &mut Ebpf, pids: &[u32], keep: &[ExeIdentity]) -> Result<()> {
+///
+/// Wave 4 restructure, R11b (lab PR 262): `_verified`, the proof that every
+/// integrity check of the start passed ([`crate::boot::IntegrityVerified`]):
+/// the pins and the deny hooks' attach take it, as the load does.
+pub fn attach(
+    _verified: &crate::boot::IntegrityVerified,
+    ebpf: &mut Ebpf,
+    pids: &[u32],
+    keep: &[ExeIdentity],
+) -> Result<()> {
     // The agent first: the scan below reads `/proc/<pid>/exe` of protected
     // processes, which the previous agent's pinned ptrace_access_check
     // hook allows only to a protected caller. Unregistered, the agent
