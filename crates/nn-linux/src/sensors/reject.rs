@@ -48,14 +48,15 @@ pub fn total() -> u64 {
 /// (`sensors::multiplexer`, `no_event_ring_is_pinned`). The eBPF object is
 /// embedded in the agent, so its records and this agent's decoders come
 /// from one build: a rejected record is a defect to report.
-pub(crate) struct RejectThrottle {
+#[derive(Default)]
+pub struct RejectThrottle {
     count: u64,
     last_log: Option<std::time::Instant>,
     last_got: usize,
 }
 
 impl RejectThrottle {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             count: 0,
             last_log: None,
@@ -65,7 +66,7 @@ impl RejectThrottle {
 
     /// Record one rejected entry (counted for `nn-admin status`); emit a
     /// coalesced WARN at most 1/sec.
-    pub(crate) fn record(&mut self, label: &'static str, expected: usize, got: usize) {
+    pub fn record(&mut self, label: &'static str, expected: usize, got: usize) {
         count(label);
         self.count += 1;
         self.last_got = got;

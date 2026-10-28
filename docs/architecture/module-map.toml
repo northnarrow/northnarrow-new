@@ -284,6 +284,10 @@ planned = false
 "sd_notify" = "nn-linux"
 "self_integrity" = "nn-linux"
 "sensor_feasibility" = "nn-linux"
+# R09b (lab PR 254): the sensors moved to nn-linux with the eBPF object's
+# embed (`build.rs`); the agent's `sensors.rs` keeps their paths and names
+# the loader on the agent's exec guards (`exec_guards`), an alias as the
+# posture's on `LinuxHost`
 "sensors" = "nn-linux"
 # the file I/O; the marker's format is nn-proto's (R03, lab PR 240)
 "shutdown_marker" = "nn-linux"
@@ -530,10 +534,18 @@ planned = false
 # its crate, and `combat.rs`, `impact.rs` and `impair.rs` name `LinuxHost`
 # by its crate with it: one reference each, as before (`net/mod.rs` keeps
 # its two). nn-admin 8, nn-core 15, nn-linux 3.
+# Lab PR 254 (R09b): 26 → 23, nn-linux 3 → 0. The sensors moved to
+# nn-linux with the eBPF object's embed, and their three references to the
+# agent's `boot` (the loader's attach permit, the degradations the DNS, exec
+# and loader report, the sensor list) left the scan with them: what they
+# name of `boot` went to nn-linux first (its `boot`: the phases and the
+# permit, which only the sequence gives; the degradations' registry; the
+# sensor list), and the exec guards' kernel configuration the load writes
+# stays the agent's behind the loader's `ExecGuards` (`exec_guards`).
 
 [ratchet]
 nn-admin = 8
 nn-core = 15
 nn-evidence = 0
-nn-linux = 3
+nn-linux = 0
 nn-proto = 0

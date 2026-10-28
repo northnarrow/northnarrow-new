@@ -37,6 +37,8 @@ nn-core = { workspace = true }
 # the DNS reply parsers re-exported at `net::dns_cache` (R06's paths).
 nn-parse = { workspace = true }
 aya = { workspace = true }
+# R09b (lab PR 254): the sensors' ring records read in place (`Pod`).
+bytemuck = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -86,12 +88,22 @@ test-privileged = []
 # `test-util`). No build of the binaries has it.
 test-util = []
 
+[build-dependencies]
+# R09b (lab PR 254): the staleness guard of the eBPF object `build.rs`
+# embeds (was the agent's): the stamp's source hash and the object's sha
+# computed by the same crate as xtask's writer, byte for byte.
+ebpf-guard = { path = "../../ebpf-guard" }
+
 [dev-dependencies]
 tempfile = "3"
 # `anchored`'s tests read the warnings it logs.
 tracing-subscriber = { workspace = true }
 # the trusted-installer window's tests run on nn-core's test clock.
 nn-core = { workspace = true, features = ["test-util"] }
+# R09b (lab PR 254; was the agent's): parse the embedded eBPF object in
+# unit tests, with the parser aya 0.14.0 itself runs (lab PR 219: every map
+# of a type aya loads; the exploit guard's maps and programs).
+aya-obj = "=0.3.0"
 
 [lints]
 workspace = true

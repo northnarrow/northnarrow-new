@@ -24,5 +24,4 @@ pub mod ring_drops;
 
 pub use ebpf_object::EBPF_BYTES;
 pub use exec::ExecSensor;
-/// The loader on the agent's exec guards (R09b seam, lab PR 254).
-pub type SensorMultiplexer = multiplexer::SensorMultiplexer<crate::exec_guards::AgentExecGuards>;
+pub use multiplexer::SensorMultiplexer;

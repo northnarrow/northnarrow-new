@@ -36,11 +36,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
     let dst = out_dir.join("northnarrow-agent-ebpf");
 
-    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = manifest
-        .parent()
-        .expect("agent crate must live one level under the repo root")
-        .to_path_buf();
+    let repo_root = PathBuf::from(env::var_os("NN_REPO_ROOT").expect("NN_REPO_ROOT ([env])"));
 
     let ebpf_artifact = ebpf_guard::ebpf_artifact_path(&repo_root);
     let stamp_path = ebpf_guard::ebpf_stamp_path(&repo_root);

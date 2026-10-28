@@ -194,6 +194,25 @@ pub mod net {
         // paths the fuzz targets and `fuzz_api` name (until R17).
         pub use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
     }
+
+    // R09b shims (lab PR 254; plan §4.1 rule 2, removed in R17): the paths
+    // the moved sensors name for nn-core's network state, as the agent's
+    // `net` gives them.
+
+    /// `crate::net::blocklist::…`, nn-core's (the connect deny's rules).
+    pub(crate) use nn_core::net::blocklist;
+
+    /// The flow tracker (connect → close, the flow id, the open-flow
+    /// snapshots) on the Linux host: nn-core's, whose notifier is the
+    /// host's (the connect pump feeds it; R08b's alias of the agent's
+    /// `net`).
+    pub mod flow_tracker {
+        pub use nn_core::net::flow_tracker::*;
+
+        /// [`nn_core::net::flow_tracker::FlowTracker`] on the Linux host.
+        pub type FlowTracker =
+            nn_core::net::flow_tracker::FlowTracker<crate::chain_host_linux::LinuxHost>;
+    }
 }
 
 // The OS CSPRNG as an infallible generator (R09a; was the agent's
@@ -217,6 +236,13 @@ pub mod runtime;
 /// The self-integrity watcher's pieces the self-defence and the actuators
 /// name (R09a, lab PR 253; cut from the agent's `self_integrity`, R09c's).
 pub mod self_integrity;
+
+// The sensors (Tappa 4, Tappa 10): the embedded eBPF object and its boot
+// preflight, the single loader that attaches every program and pumps every
+// ring into one channel, the exec, file-open, DNS, connect-deny and exploit
+// guard sensors, the ring drops and rejected records (R09b, lab PR 254; was
+// the agent's `sensors`; `build.rs` embeds the object).
+pub mod sensors;
 
 // The telemetry probe's piece the file-open sensor names (R09b, lab PR
 // 254; cut from the agent's `telemetry_probe`, R09c's).
@@ -267,6 +293,9 @@ pub(crate) mod chainlog {
 /// `crate::decision::…`, nn-core's (the exemption facts' trait).
 use nn_core::decision;
 
+/// `crate::path_text::…`, nn-model's (the file-open sensor's paths).
+use nn_model::path_text;
+
 /// `crate::posture::…`: nn-core's posture, and the stack exemption on the
 /// Linux host (the agent's alias).
 pub(crate) mod posture {
@@ -274,4 +303,19 @@ pub(crate) mod posture {
 
     /// [`nn_core::posture::exempt::ExemptPids`] on the Linux host.
     pub type ExemptPids = nn_core::posture::exempt::ExemptPids<crate::chain_host_linux::LinuxHost>;
+
+    /// [`nn_core::posture::PostureMachine`] on the Linux host (R09b: the
+    /// ring-drop reporter's, the agent's alias).
+    pub type PostureMachine = nn_core::posture::PostureMachine<crate::chain_host_linux::LinuxHost>;
+
+    /// The lineage, its tracker on the Linux host (R09b: the sensors' exec
+    /// images, the agent's alias).
+    pub mod lineage {
+        pub use nn_core::posture::lineage::*;
+
+        /// [`nn_core::posture::lineage::AuthSessionTracker`] on the Linux
+        /// host.
+        pub type AuthSessionTracker =
+            nn_core::posture::lineage::AuthSessionTracker<crate::chain_host_linux::LinuxHost>;
+    }
 }
