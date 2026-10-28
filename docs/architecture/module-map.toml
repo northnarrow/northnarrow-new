@@ -226,6 +226,10 @@ planned = false
 # not in §2.4: the detection sink's queue and files, the records'
 # constructors from the engine's decisions (its payloads: above, R04a)
 "detection_store" = "nn-linux"
+# post-plan (lab PR 254, R09b): the exec guards' kernel configuration the
+# eBPF loader writes (nn-linux's `sensors::multiplexer::ExecGuards`), cut
+# from the loader: the exec quarantine's and the exec policy's, with them
+"exec_guards" = "nn-linux"
 # post-plan (lab PR 226): exec policy; the controller and the kernel maps
 "execpol" = "nn-linux"
 "execpol::policy" = "nn-core"

@@ -19,6 +19,7 @@
 //! the bus.
 
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -76,9 +77,23 @@ pub struct NetRingBufs {
     pub udp_rb: RingBuf<MapData>,
 }
 
+/// The exec guards' kernel configuration, which the load writes once the
+/// exec sensor is attached and before the io_uring, TCP, DNS and network
+/// programs attach. Wave 4 restructure, R09b (lab PR 254): the seam that
+/// lets this loader move to nn-linux while the exec quarantine (lab PR 223)
+/// and the exec policy (lab PR 226) stay in the agent, whose
+/// `exec_guards::AgentExecGuards` is the one implementation (the agent's
+/// `sensors::SensorMultiplexer` names it).
+pub trait ExecGuards {
+    /// Write the guards' kernel configuration into the loaded object. Not
+    /// fatal: a guard whose configuration fails is off, and says so.
+    fn install(ebpf: &mut Ebpf);
+}
+
 /// Owns the loaded eBPF object and every attached link. Dropping the
-/// multiplexer detaches everything and aborts the pump tasks.
-pub struct SensorMultiplexer {
+/// multiplexer detaches everything and aborts the pump tasks. `G`: the exec
+/// guards its load configures ([`ExecGuards`]).
+pub struct SensorMultiplexer<G> {
     ebpf: Ebpf,
     /// Every long-lived task that moves telemetry (ring pumps, drains, the
     /// open-sensor rule refresher), by label. External audit SNS-001: the
@@ -93,9 +108,11 @@ pub struct SensorMultiplexer {
     /// `main.rs`. Tappa 10 N9 reuses the same pattern for the
     /// net drain loop.
     event_tx: mpsc::Sender<Event>,
+    /// R09b (lab PR 254): the exec guards of the load.
+    guards: PhantomData<fn() -> G>,
 }
 
-impl SensorMultiplexer {
+impl<G: ExecGuards> SensorMultiplexer<G> {
     /// Load + attach + start. The returned multiplexer is hot: events
     /// will already be flowing into the channel by the time it
     /// returns. Net observation programs (Tappa 10 N2) are NOT
@@ -245,33 +262,10 @@ impl SensorMultiplexer {
         crate::sensors::exe_identity::attach(&mut ebpf, |ebpf| {
             attach_tracepoint(ebpf, "sys_enter_execve", "syscalls", "sys_enter_execve")
         })?;
-        // Lab PR 223 (EXPERIMENTAL): the exec quarantine's kernel
-        // configuration, once the exec sensor's mode is known — written OFF
-        // too, then frozen — and its maps for the controller. Not fatal:
-        // an unwritten configuration is OFF, the kernel holds nothing.
-        if let Err(e) = crate::execq::install(&mut ebpf) {
-            error!(
-                error = format!("{e:#}"),
-                "exec quarantine: kernel configuration failed — the guard is off"
-            );
-            if crate::execq::config().is_some_and(|c| c.mode != crate::execq::Mode::Off) {
-                crate::execq::fail(format!("kernel configuration failed: {e:#}"));
-            }
-        }
-        // Lab PR 226 (EXPERIMENTAL): the exec policy — its environment and
-        // mapping programs, then its kernel configuration, written OFF too
-        // and frozen. Not fatal: an unwritten configuration is OFF.
-        let execq_on = crate::execq::config().is_some_and(|c| c.mode != crate::execq::Mode::Off)
-            && !crate::execq::state().starts_with("degraded");
-        if let Err(e) = crate::execpol::install(&mut ebpf, execq_on) {
-            error!(
-                error = format!("{e:#}"),
-                "exec policy: kernel configuration failed — the policy is off"
-            );
-            if crate::execpol::config().is_some_and(|c| c.mode != crate::execpol::Mode::Off) {
-                crate::execpol::fail(format!("kernel configuration failed: {e:#}"));
-            }
-        }
+        // Lab PRs 223 and 226 (EXPERIMENTAL): the exec guards' kernel
+        // configuration, once the exec sensor's mode is known (R09b, lab PR
+        // 254: the agent's, through [`ExecGuards`]).
+        G::install(&mut ebpf);
         // io_uring (Tappa 10.8): soft attach — a kernel built without
         // CONFIG_IO_URING has no such tracepoints and nothing to observe.
         // The submit tracepoint was renamed across kernels (`_sqe` ≤ 6.1,
@@ -445,6 +439,7 @@ impl SensorMultiplexer {
                 pumps,
                 rx,
                 event_tx: tx,
+                guards: PhantomData,
             },
             net_bufs,
         ))
@@ -542,7 +537,7 @@ impl SensorMultiplexer {
     }
 }
 
-impl Drop for SensorMultiplexer {
+impl<G> Drop for SensorMultiplexer<G> {
     fn drop(&mut self) {
         for (_, h) in self.pumps.drain(..) {
             h.abort();

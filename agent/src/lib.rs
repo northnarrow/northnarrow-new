@@ -128,6 +128,9 @@ pub mod detection_store;
 /// 254: from `sensors::epg`'s tests).
 #[cfg(test)]
 mod epg_tests;
+/// The exec guards' kernel configuration the eBPF loader writes (R09b, lab
+/// PR 254: from `sensors::multiplexer`).
+pub mod exec_guards;
 pub mod execpol;
 pub mod execq;
 pub mod fim;
