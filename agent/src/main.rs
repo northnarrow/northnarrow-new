@@ -26,6 +26,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nn_model::posture_types::PostureKind;
 use nn_model::Event;
+use nn_proto::admin_signed_payload::OverlayKind;
 use northnarrow_agent::admin_socket::{self, ShutdownSignal};
 use northnarrow_agent::agent_id;
 use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
@@ -1250,6 +1251,270 @@ impl Cli {
 }
 
 async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
+    // Wave 4 restructure, R11a (lab PR 261): the start in typed phases,
+    // called in the order their code always ran. Each takes what the phases
+    // before it produced and returns what the ones after it read; what the
+    // agent keeps until it stops is this function's, as it was.
+    boot_logging(&cli, undumpable);
+    let Preflight {
+        mut boot,
+        tracepoint_degraded,
+        hook_args_degraded,
+        heads_file,
+        chain_targets,
+        boot_chains,
+        rollback_floor,
+    } = boot_preflight(&cli)?;
+    let StateReady {
+        early_registration_failed,
+    } = boot_state(&cli, &heads_file);
+    let Identity {
+        identity,
+        agent_id,
+        overlay_gate,
+    } = boot_identity(&cli, &mut boot, rollback_floor)?;
+    let Integrity {
+        exec_cfg,
+        detect_only,
+        detect_only_source,
+        caps_degraded,
+        integrity,
+        host_checks,
+        allow_degraded,
+        bpf_lsm_state,
+        attach_permit,
+    } = boot_integrity(
+        &cli,
+        &mut boot,
+        &identity,
+        &overlay_gate,
+        early_registration_failed,
+    )?;
+    let Attached {
+        lineage,
+        flow_tracker,
+        dns_cache,
+        execq_mode,
+        execpol_mode,
+        own_prog_ids_file,
+        mut sensor,
+        net_bufs,
+        exploit_guard_degraded,
+    } = boot_attach(&cli, &mut boot, attach_permit, &overlay_gate).await?;
+    let SelfTested { self_test } = boot_self_test(
+        &cli,
+        &mut boot,
+        &identity,
+        &overlay_gate,
+        &integrity,
+        allow_degraded,
+        &bpf_lsm_state,
+        detect_only,
+    )?;
+    let Attested {
+        chain_anchor,
+        audit_log,
+    } = boot_attest(
+        &cli,
+        &mut boot,
+        heads_file,
+        &chain_targets,
+        boot_chains,
+        agent_id,
+        &overlay_gate,
+        identity,
+        &detect_only_source,
+        integrity,
+        tracepoint_degraded,
+        hook_args_degraded,
+        exploit_guard_degraded,
+        caps_degraded,
+    )?;
+    let Policy {
+        netflow_blocklist,
+        installer_override,
+        chain_store,
+        ransom_tracker,
+        defense_detector,
+        engine,
+    } = boot_policy(
+        &cli,
+        &overlay_gate,
+        &mut sensor,
+        detect_only,
+        &audit_log,
+        &dns_cache,
+        &lineage,
+    );
+    let Response {
+        legacy_isolation_removed,
+        execq_exec_cfg,
+        executor,
+        correlation,
+        isolator,
+    } = boot_response(&cli, exec_cfg, detect_only, &audit_log, &overlay_gate)?;
+    let Posture {
+        ladder_slot,
+        exempt,
+        open_sensor_carveout,
+        posture,
+        watchdog_audit,
+        stale_combat,
+    } = boot_posture(
+        &cli,
+        &overlay_gate,
+        &lineage,
+        &isolator,
+        &installer_override,
+        &ransom_tracker,
+        &defense_detector,
+    );
+    boot_wire(
+        &cli,
+        &audit_log,
+        &watchdog_audit,
+        &overlay_gate,
+        &executor,
+        &chain_anchor,
+        chain_targets,
+        &posture,
+        &installer_override,
+    );
+    let combat = boot_ladder(
+        &cli,
+        &executor,
+        &isolator,
+        detect_only,
+        &audit_log,
+        &exempt,
+        &posture,
+        &ladder_slot,
+        &overlay_gate,
+        &lineage,
+    );
+    let FimPaths {
+        watched_paths_load,
+        paths_summary,
+    } = boot_fim_paths(
+        &cli,
+        &overlay_gate,
+        &audit_log,
+        legacy_isolation_removed,
+        &stale_combat,
+    );
+    let Stores {
+        state_protection,
+        rotation_protection,
+        fim_drift_rotation,
+        netflow_rotation,
+        detection_sink,
+        detection_admin_state,
+    } = boot_stores(&cli, &mut sensor, &stale_combat, &chain_anchor, &audit_log);
+    let fim_admin_state = boot_fim(
+        &cli,
+        agent_id,
+        &audit_log,
+        &mut sensor,
+        open_sensor_carveout,
+        &posture,
+        &own_prog_ids_file,
+        watched_paths_load,
+        &defense_detector,
+        &overlay_gate,
+        &rotation_protection,
+        fim_drift_rotation,
+        &lineage,
+        paths_summary,
+        &state_protection,
+    );
+    let Canary {
+        canary_admin_state,
+        canary_detector,
+    } = boot_canary(&cli, agent_id, &audit_log, &fim_admin_state);
+    boot_net(
+        &cli,
+        agent_id,
+        rotation_protection,
+        netflow_rotation,
+        &audit_log,
+        flow_tracker,
+        dns_cache,
+        &lineage,
+        &mut sensor,
+        net_bufs,
+        netflow_blocklist,
+        chain_store,
+    );
+    boot_admin(
+        &cli,
+        &isolator,
+        agent_id,
+        &audit_log,
+        &chain_anchor,
+        &posture,
+        &combat.shutdown_signal,
+        &fim_admin_state,
+        &canary_admin_state,
+        &installer_override,
+        &detection_admin_state,
+        &executor,
+        &combat.ladder,
+        &detect_only_source,
+        &exempt,
+    );
+    let Tasks {
+        execq_handle,
+        execpol_handle,
+        mut signals,
+    } = boot_tasks(
+        &posture,
+        &installer_override,
+        execq_mode,
+        &overlay_gate,
+        &detection_sink,
+        &audit_log,
+        execq_exec_cfg,
+        execpol_mode,
+    )?;
+    let armed = boot_ready(
+        &mut boot,
+        bpf_lsm_state,
+        self_test,
+        host_checks,
+        detect_only,
+        &audit_log,
+    )?;
+    let stopped = run_loop(
+        armed,
+        &cli,
+        &mut sensor,
+        &engine,
+        &executor,
+        &correlation,
+        &posture,
+        &combat,
+        &canary_detector,
+        &installer_override,
+        &detection_sink,
+        &audit_log,
+        &mut signals,
+    )
+    .await;
+    shutdown(
+        &cli,
+        execq_handle,
+        execpol_handle,
+        &audit_log,
+        &chain_anchor,
+        stopped,
+    )
+}
+
+/// The log stream (one event, one journal line: lab PR 167), then what the
+/// start says before anything else — the removed advisor's settings, a
+/// core-dump guard that failed, the OOM adjustment (R11a, lab PR 261:
+/// `run`'s first lines).
+fn boot_logging(cli: &Cli, undumpable: std::io::Result<()>) {
     // Lab finding (external audit EBPF-001 work): when the log stream is
     // gone — journald@northnarrow stopped, at shutdown or by root — the
     // fmt layer reported the failed write with `eprintln!`, which panics
@@ -1288,7 +1553,34 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // memory cap cannot bind, the unit's OOMScoreAdjust=-500 is raised to 0
     // before anything grows (the self-integrity check expects it there).
     northnarrow_agent::self_integrity::relax_oom_score_adj();
+}
 
+/// What [`boot_preflight`] found, for the state files' bootstrap, the
+/// identity and the attest phase.
+struct Preflight {
+    /// The start's phases (lab PR 218), opened by the preflight.
+    boot: BootSequence,
+    /// Tracepoint fields left on their compiled offset (NN-AUD-098), signed
+    /// once the audit log is open.
+    tracepoint_degraded: Option<String>,
+    /// LSM hook arguments whose position was not resolved (lab PR 164),
+    /// signed once the audit log is open.
+    hook_args_degraded: Option<String>,
+    /// The chains' head anchor.
+    heads_file: PathBuf,
+    /// The chains the agent anchors.
+    chain_targets: Vec<northnarrow_agent::chain_anchor::ChainTarget>,
+    /// The chains against their anchored heads (lab PR 160).
+    boot_chains: northnarrow_agent::chain_anchor::BootCheck,
+    /// The signed overlays' rollback floor (LLMR-014).
+    rollback_floor: northnarrow_agent::config::overlay_floor::RollbackFloor,
+}
+
+/// `BootPhase::Preflight`, its first checks: the embedded eBPF object, the
+/// state directory, the kernel's offsets from its BTF (a refusal exits 78),
+/// the rlimits, the chains against their heads and the overlays' rollback
+/// floor — nothing written yet, nothing loaded into the kernel.
+fn boot_preflight(cli: &Cli) -> Result<Preflight> {
     // Lab PR 218 (external review G-09 / Q11-03): the start's phases, in an
     // order the code enforces (`northnarrow_agent::boot`). Preflight —
     // checks only — until `enter_attach` hands out the permit the sensor
@@ -1494,7 +1786,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // overlay rollback floor below.
     let heads_file = cli.resolved_chain_heads_file();
     let chain_targets = cli.chain_paths().targets();
-    let mut boot_chains = match northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
+    let boot_chains = match northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file) {
         Some(pk) => northnarrow_agent::chains::boot_check(&chain_targets, &heads_file, &pk),
         None => {
             info!("chain heads: no agent key yet (fresh install) — nothing anchored to check");
@@ -1514,7 +1806,30 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         None => rollback_floor,
     };
     boot.done(BootStep::ChainHeads)?;
+    Ok(Preflight {
+        boot,
+        tracepoint_degraded,
+        hook_args_degraded,
+        heads_file,
+        chain_targets,
+        boot_chains,
+        rollback_floor,
+    })
+}
 
+/// What [`boot_state`] found.
+struct StateReady {
+    /// Lab PR 218: the previous agent's hooks may close the agent's files to
+    /// this process until the attach registers it (the audit preflight).
+    early_registration_failed: bool,
+}
+
+/// The state files, before the attach (Tappa 8 A14): the agent registered
+/// in the pinned PROTECTED_PIDS first (EBPF-015), then the key, the audit
+/// log, the FIM, detection, status, canary and network logs and the head
+/// anchor bootstrapped, so the deny hooks protect their inodes from the
+/// moment they attach.
+fn boot_state(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
     // registered — the files bootstrapped below when one is missing, a map
@@ -1663,7 +1978,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         );
     }
     // Lab PR 160: the head anchor, for the same inode-registration reason.
-    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_chain_heads(&heads_file) {
+    if let Err(e) = northnarrow_agent::anti_tamper::filesystem::bootstrap_chain_heads(heads_file) {
         warn!(
             error = %e,
             path = %heads_file.display(),
@@ -1701,6 +2016,28 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
              lazily created on first listener event (and unprotected this boot)"
         );
     }
+    StateReady {
+        early_registration_failed,
+    }
+}
+
+/// What [`boot_identity`] read.
+struct Identity {
+    /// The agent's identity, read once (MAIN-009).
+    identity: agent_id::AgentIdentity,
+    /// Its id: every consumer takes this binding.
+    agent_id: [u8; 16],
+    /// The operators' signed overlays, verified against that id.
+    overlay_gate: Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+}
+
+/// The agent's identity, read once (MAIN-009), and the signed overlays'
+/// gate on it (Tappa 10.8).
+fn boot_identity(
+    cli: &Cli,
+    boot: &mut BootSequence,
+    rollback_floor: northnarrow_agent::config::overlay_floor::RollbackFloor,
+) -> Result<Identity> {
     // Tappa 8 A3 + A8: the per-install agent UUID, the third anti-replay
     // layer of the signed-payload verify path (design §6.4 layer 3). Read
     // (or, on the first start, minted) here, before the attach, so its
@@ -1728,8 +2065,52 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         agent_id,
         rollback_floor,
     ));
-    use nn_proto::admin_signed_payload::OverlayKind;
+    Ok(Identity {
+        identity,
+        agent_id,
+        overlay_gate,
+    })
+}
 
+/// What [`boot_integrity`] decided: the no-enforcement gate, the checks'
+/// results the attest phase and the capability manifest sign, and the
+/// permit the attach takes.
+struct Integrity {
+    exec_cfg: ExecutorConfig,
+    detect_only: bool,
+    /// Where detect-only came from (MAIN-008), for `agent_boot`.
+    detect_only_source: Option<String>,
+    /// The capabilities missing in enforcement, signed once the audit log
+    /// is open.
+    caps_degraded: Vec<String>,
+    /// The install manifest's verdict, for `agent_boot`.
+    integrity: northnarrow_agent::install_manifest::IntegrityOutcome,
+    /// The host hardening table, for the capability manifest.
+    host_checks: Vec<northnarrow_agent::host_hardening::Check>,
+    /// `NN_ANTI_TAMPER_ALLOW_DEGRADED`, for the self-test.
+    allow_degraded: bool,
+    /// The active LSMs, for the self-test, the trust level and the
+    /// capability manifest.
+    bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
+    /// Lab PR 218: the only way into the kernel, given by
+    /// `BootSequence::enter_attach` once every preflight step is done.
+    attach_permit: northnarrow_agent::boot::AttachPermit,
+}
+
+/// `BootPhase::Preflight`, its checks before anything attaches (lab PR 218,
+/// external review G-09 / Q11-03): the no-enforcement gate and the demo
+/// rules' gate, the capability bounding set, the install manifest, the
+/// audit log's writability, the host hardening, the BPF LSM. A refusal is
+/// signed (`record_refused_boot`) and the start stops with the host
+/// untouched. It ends in `BootSequence::enter_attach`, which hands out the
+/// attach permit only once every preflight step is done.
+fn boot_integrity(
+    cli: &Cli,
+    boot: &mut BootSequence,
+    identity: &agent_id::AgentIdentity,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    early_registration_failed: bool,
+) -> Result<Integrity> {
     // Lab PR 218: resolved before the attach — the capability gate below
     // depends on it.
     // BUG-033 detect-only: resolve the one no-enforcement gate from the
@@ -1920,9 +2301,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                 _ => String::new(),
             };
             record_refused_boot(
-                &cli,
-                &identity,
-                &overlay_gate,
+                cli,
+                identity,
+                overlay_gate,
                 "install_manifest",
                 (outcome.label(), outcome.provenance()),
                 None,
@@ -2024,9 +2405,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         northnarrow_agent::boot::lsm::LsmGate::Refuse { detail } => {
             error!("refusing to start: {detail}. Exiting 78.");
             record_refused_boot(
-                &cli,
-                &identity,
-                &overlay_gate,
+                cli,
+                identity,
+                overlay_gate,
                 "bpf_lsm",
                 (integrity.label(), integrity.provenance()),
                 Some(("bpf_lsm", detail.as_str())),
@@ -2037,7 +2418,49 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     }
     boot.done(BootStep::BpfLsm)?;
     let attach_permit = boot.enter_attach()?;
+    Ok(Integrity {
+        exec_cfg,
+        detect_only,
+        detect_only_source,
+        caps_degraded,
+        integrity,
+        host_checks,
+        allow_degraded,
+        bpf_lsm_state,
+        attach_permit,
+    })
+}
 
+/// What [`boot_attach`] attached.
+struct Attached {
+    /// The process lineage the posture, the rules and the pumps share.
+    lineage: AuthSessionTracker,
+    flow_tracker: Arc<parking_lot::Mutex<FlowTracker>>,
+    dns_cache: Arc<DnsCache>,
+    execq_mode: northnarrow_agent::execq::Mode,
+    execpol_mode: northnarrow_agent::execpol::Mode,
+    /// Where the ids of the agent's BPF programs go (DEP-006).
+    own_prog_ids_file: Option<PathBuf>,
+    sensor: SensorMultiplexer,
+    /// The network drain's rings.
+    net_bufs: northnarrow_agent::sensors::multiplexer::NetRingBufs,
+    /// The exploit guard off or unavailable, signed once the audit log is
+    /// open.
+    exploit_guard_degraded: Option<String>,
+}
+
+/// `BootPhase::Attach`: the eBPF object loads and the sensors attach
+/// (`SensorMultiplexer::start_with_net`), the deny hooks attach and the
+/// agent registers in them (`attach_anti_tamper`), the exploit guard
+/// attaches. Both attaches take `attach_permit`, which only
+/// [`boot_integrity`] hands out: nothing reaches the kernel before every
+/// preflight check has run.
+async fn boot_attach(
+    cli: &Cli,
+    boot: &mut BootSequence,
+    attach_permit: northnarrow_agent::boot::AttachPermit,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+) -> Result<Attached> {
     // Process-lineage cache shared by the posture triggers and the FIM
     // rules' package-manager carve-out (review 49): "does this writer
     // descend from dpkg/rpm/dnf?". Fed from Event::ProcessSpawn by the
@@ -2118,7 +2541,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // this boot loads anything — its programs are replaced now, and a list
     // that cannot be rewritten must not outlive them (the scripts then fall
     // back to their host-wide wait).
-    let own_prog_ids_file = own_prog_ids_file(&cli);
+    let own_prog_ids_file = own_prog_ids_file(cli);
     if let Some(path) = own_prog_ids_file.as_deref() {
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -2203,7 +2626,38 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         };
     // External audit DEP-006: the ids install.sh / uninstall.sh wait for.
     record_own_prog_ids(own_prog_ids_file.as_deref(), sensor.ebpf_mut());
+    Ok(Attached {
+        lineage,
+        flow_tracker,
+        dns_cache,
+        execq_mode,
+        execpol_mode,
+        own_prog_ids_file,
+        sensor,
+        net_bufs,
+        exploit_guard_degraded,
+    })
+}
 
+/// What [`boot_self_test`] measured.
+struct SelfTested {
+    self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
+}
+
+/// `BootPhase::SelfTest` (lab PR 218, external review AR-09 / G-12): one
+/// deny hook exercised against the agent itself; hooks attached but never
+/// run refuse the start (signed) unless the degraded mode is asked for.
+#[allow(clippy::too_many_arguments)]
+fn boot_self_test(
+    cli: &Cli,
+    boot: &mut BootSequence,
+    identity: &agent_id::AgentIdentity,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    integrity: &northnarrow_agent::install_manifest::IntegrityOutcome,
+    allow_degraded: bool,
+    bpf_lsm_state: &northnarrow_agent::boot::lsm::BpfLsm,
+    detect_only: bool,
+) -> Result<SelfTested> {
     // Lab PR 218 (external review AR-09 / G-12): one deny hook exercised
     // against the agent itself — an unprotected child signals it and must
     // be refused. Hooks attached but not run (`bpf` missing from the active
@@ -2222,9 +2676,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             northnarrow_agent::anti_tamper::ALLOW_DEGRADED_ENV
         );
         record_refused_boot(
-            &cli,
-            &identity,
-            &overlay_gate,
+            cli,
+            identity,
+            overlay_gate,
             "deny_self_test",
             (integrity.label(), integrity.provenance()),
             Some(("deny_self_test", detail.as_str())),
@@ -2248,7 +2702,44 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         );
     }
     boot.done(BootStep::DenySelfTest)?;
+    Ok(SelfTested { self_test })
+}
 
+/// The signed audit log, once [`boot_attest`] opened it (`None`: the boot
+/// runs unaudited, as the attest phase allowed).
+type AuditHandle = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
+
+/// The chains' head anchor of this run (lab PR 160).
+type AnchorHandle = Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>>;
+
+/// What [`boot_attest`] opened.
+struct Attested {
+    chain_anchor: AnchorHandle,
+    audit_log: AuditHandle,
+}
+
+/// `BootPhase::Attest` (lab PR 218): the signed audit log opens — the heads
+/// anchored as this boot found them, the rollback floor, the chains'
+/// findings, the identity, then the boot's own `agent_boot` (an audit log
+/// that cannot be written refuses the start unless that is allowed) — and
+/// every degradation found so far is signed. Then `BootPhase::Subsystems`.
+#[allow(clippy::too_many_arguments)]
+fn boot_attest(
+    cli: &Cli,
+    boot: &mut BootSequence,
+    heads_file: PathBuf,
+    chain_targets: &[northnarrow_agent::chain_anchor::ChainTarget],
+    mut boot_chains: northnarrow_agent::chain_anchor::BootCheck,
+    agent_id: [u8; 16],
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    identity: agent_id::AgentIdentity,
+    detect_only_source: &Option<String>,
+    integrity: northnarrow_agent::install_manifest::IntegrityOutcome,
+    tracepoint_degraded: Option<String>,
+    hook_args_degraded: Option<String>,
+    exploit_guard_degraded: Option<String>,
+    caps_degraded: Vec<String>,
+) -> Result<Attested> {
     // Lab PR 218: the signed audit log right after the self-test, before
     // the subsystems below load (the blocklists, the rules, the response
     // executor, the posture, FIM): every degradation found so far is signed
@@ -2281,9 +2772,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                             boot_chains.findings.push(f);
                         }
                         chain_anchor = start_chain_anchor(
-                            &cli,
+                            cli,
                             &heads_file,
-                            &chain_targets,
+                            chain_targets,
                             &mut boot_chains,
                             agent_id,
                             &log,
@@ -2435,7 +2926,38 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     }
     boot.done(BootStep::BootDegradations)?;
     boot.enter(BootPhase::Subsystems)?;
+    Ok(Attested {
+        chain_anchor,
+        audit_log,
+    })
+}
 
+/// What [`boot_policy`] loaded.
+struct Policy {
+    netflow_blocklist: Arc<NetBlocklist>,
+    installer_override:
+        Arc<northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride>,
+    chain_store:
+        Arc<parking_lot::Mutex<northnarrow_agent::decision::correlation::CorrelationStore>>,
+    ransom_tracker: Arc<northnarrow_agent::impact::RansomTracker>,
+    defense_detector: Arc<northnarrow_agent::impair::DefenseDetector>,
+    engine: RuleEngine,
+}
+
+/// The signed content and the decision engine: the network blocklists and
+/// the optional kernel deny of a connect to them, the comm allowlists, the
+/// trusted-installer window, the chain rules' store, the network rules'
+/// thresholds, the ransomware tracker and the security-tool detector, the
+/// signed per-rule response policy, the rule engine.
+fn boot_policy(
+    cli: &Cli,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    sensor: &mut SensorMultiplexer,
+    detect_only: bool,
+    audit_log: &AuditHandle,
+    dns_cache: &Arc<DnsCache>,
+    lineage: &AuthSessionTracker,
+) -> Policy {
     // Tappa 10 N9 — load operator-curated netflow blocklists from
     // disk + thread them into the decision engine. Load failures
     // degrade gracefully (empty list, like N6 net_rules_empty),
@@ -2463,7 +2985,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }),
     );
     report_builtin_defaults(
-        &overlay_gate,
+        overlay_gate,
         "netflow-blocklist",
         &cli.netflow_blocklist_v1,
         netflow_blocklist.defaults(),
@@ -2538,7 +3060,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }),
     );
     report_builtin_defaults(
-        &overlay_gate,
+        overlay_gate,
         "netflow-ja3-blocklist",
         &cli.netflow_ja3_blocklist_v1,
         ja3_blocklist.defaults(),
@@ -2599,7 +3121,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }),
     );
     report_builtin_defaults(
-        &overlay_gate,
+        overlay_gate,
         "netflow-comm-allowlist",
         &cli.netflow_comm_allowlist_v1,
         netflow_comm_allowlist.defaults(),
@@ -2633,7 +3155,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }),
     );
     report_builtin_defaults(
-        &overlay_gate,
+        overlay_gate,
         "process-comm-allowlist",
         &cli.process_comm_allowlist_v1,
         process_allowlist.defaults(),
@@ -2699,7 +3221,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     let (security_tools, security_tools_defaults) =
         northnarrow_agent::impair::SecurityTools::load::<LinuxHost>(security_tools_v1);
     report_builtin_defaults(
-        &overlay_gate,
+        overlay_gate,
         "security-tools",
         security_tools_v1,
         &security_tools_defaults,
@@ -2760,7 +3282,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         // FP-3: the SAME DnsCache the DnsQuery pump feeds — NN-L-NET-004/
         // -014 read its reverse index to back-correlate a forwarded leg
         // to the originating process instead of the stub resolver.
-        Arc::clone(&dns_cache),
+        Arc::clone(dns_cache),
         // FIM-009 self-upgrade (§15.1): the NN-L-FIM-009 rule reads this
         // override; the admin dispatcher arms it on a signed grant.
         Arc::clone(&installer_override),
@@ -2794,7 +3316,38 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         netflow_comm_allowlist_entries = netflow_comm_allowlist.len(),
         "decision engine ready"
     );
+    Policy {
+        netflow_blocklist,
+        installer_override,
+        chain_store,
+        ransom_tracker,
+        defense_detector,
+        engine,
+    }
+}
 
+/// What [`boot_response`] built.
+struct Response {
+    legacy_isolation_removed: bool,
+    /// The exec quarantine's copy of the executor's configuration.
+    execq_exec_cfg: ExecutorConfig,
+    executor: Executor,
+    correlation: CorrelationBuffer,
+    isolator: Option<Arc<NetworkIsolator>>,
+}
+
+/// The response side: the optional pid file (the hooks attached, the engine
+/// loaded), the exploit guard's response, an older agent's host-wide
+/// isolation removed, the quarantine's deny of the agent's own files, the
+/// executor and what an earlier run left (kill cgroups, contained
+/// processes), the correlation buffer, the network isolator.
+fn boot_response(
+    cli: &Cli,
+    exec_cfg: ExecutorConfig,
+    detect_only: bool,
+    audit_log: &AuditHandle,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+) -> Result<Response> {
     // Tappa 7 task 6 #2b-verify: optional PID file. `attach_anti_tamper`
     // above is fully synchronous (anti_tamper::attach attempts AND pins
     // every LSM hook before it returns — crates/nn-linux/src/anti_tamper/mod.rs),
@@ -2943,7 +3496,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                 .with_rules_v6(cli.combat_rules_v6.clone())
                 // External audit ATP-001 / DEP-003: the COMBAT files are
                 // applied only as shipped or admin-signed.
-                .with_overlay_gate(Arc::clone(&overlay_gate)),
+                .with_overlay_gate(Arc::clone(overlay_gate)),
         )),
         Err(e) => {
             // ERROR, not WARN: besides losing isolation, no isolator means
@@ -2974,7 +3527,46 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             ),
         }
     }
+    Ok(Response {
+        legacy_isolation_removed,
+        execq_exec_cfg,
+        executor,
+        correlation,
+        isolator,
+    })
+}
 
+/// What [`boot_posture`] built.
+struct Posture {
+    /// The COMBAT ladder's slot the posture's hooks read, set by
+    /// [`boot_ladder`].
+    ladder_slot: Arc<std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>>,
+    exempt: ExemptPids,
+    /// The operator's mass-write carve-outs, for the file-open sensor.
+    open_sensor_carveout: Vec<String>,
+    posture: PostureMachine,
+    /// The audit log the watchdog refresh signs to, set by [`boot_wire`].
+    watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
+    /// A stale COMBAT chain found at boot, signed once the state directory
+    /// is protected.
+    stale_combat: Option<northnarrow_agent::combat::reconcile::StaleChain>,
+}
+
+/// The posture: the COMBAT hooks on the ladder's slot, the stack's
+/// exemption, the posture machine (with the release through the isolator,
+/// or without one), its window, tracker and detector; the watchdog's and
+/// systemd-shutdown's refreshes; a stale COMBAT chain torn down.
+fn boot_posture(
+    cli: &Cli,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    lineage: &AuthSessionTracker,
+    isolator: &Option<Arc<NetworkIsolator>>,
+    installer_override: &Arc<
+        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    >,
+    ransom_tracker: &Arc<northnarrow_agent::impact::RansomTracker>,
+    defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
+) -> Posture {
     // The COMBAT graduated-response ladder is constructed once agent_id
     // + the audit log are available (further down). The posture combat
     // hooks reference it through this slot, so an admin-forced COMBAT
@@ -3151,20 +3743,20 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     };
     // Lab PR 162: inside the trusted-installer window a control-surface
     // tamper (NN-L-FIM-024) does not raise the posture; the rule still acts.
-    posture.set_installer_window(Arc::clone(&installer_override));
+    posture.set_installer_window(Arc::clone(installer_override));
     // Lab PR 225: the ransomware combination (RansomwareEncryption, never
     // locked; COMBAT without corroboration held behind the per-rule policy,
     // off by default) and the security tools switched off
     // (DefenseImpairment, ENGAGED), judged as the rules judge them.
-    posture.set_ransom_tracker(Arc::clone(&ransom_tracker));
-    posture.set_defense_detector(Arc::clone(&defense_detector));
+    posture.set_ransom_tracker(Arc::clone(ransom_tracker));
+    posture.set_defense_detector(Arc::clone(defense_detector));
     // Lab PR 225 (decision of 21/10): inside a valid signed trusted-installer
     // window a stop or restart of the agent's own units is sanctioned (Low,
     // the window named; no posture move).
-    defense_detector.set_installer_window(Arc::clone(&installer_override));
+    defense_detector.set_installer_window(Arc::clone(installer_override));
     // Lab PR 225: their counters in `status --key`.
-    northnarrow_agent::impact::publish(&ransom_tracker);
-    northnarrow_agent::impair::publish(&defense_detector);
+    northnarrow_agent::impact::publish(ransom_tracker);
+    northnarrow_agent::impair::publish(defense_detector);
     info!("posture state machine initialized (state: OBSERVING)");
 
     // Beta Step 3: keep the watchdog PID exemption fresh. The watchdog
@@ -3234,7 +3826,36 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             }
         }
     }
+    Posture {
+        ladder_slot,
+        exempt,
+        open_sensor_carveout,
+        posture,
+        watchdog_audit,
+        stale_combat,
+    }
+}
 
+/// The audit log reaches what was built before it opened (the late binding
+/// R11c turns into explicit handles): the BPF links' self-check, the
+/// watchdog refresh, the foreign pins, a rolled-back upgrade, the overlay
+/// gate, the executor, the telemetry probe, the self-integrity watcher, the
+/// chains' tasks, the ring drops, the deny hooks' fail-opens, the FIM
+/// drain, the trusted-installer window.
+#[allow(clippy::too_many_arguments)]
+fn boot_wire(
+    cli: &Cli,
+    audit_log: &AuditHandle,
+    watchdog_audit: &std::sync::OnceLock<WatchdogAudit>,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    executor: &Executor,
+    chain_anchor: &AnchorHandle,
+    chain_targets: Vec<northnarrow_agent::chain_anchor::ChainTarget>,
+    posture: &PostureMachine,
+    installer_override: &Arc<
+        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    >,
+) {
     // Tappa 10.8 BPF self-defence: the link self-check needs the audit log,
     // which did not exist when the hooks attached.
     northnarrow_agent::anti_tamper::bpf_defense::spawn_link_self_check(audit_log.clone());
@@ -3261,7 +3882,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     northnarrow_agent::self_integrity::spawn(
         audit_log.clone(),
         cli.watchdog_pidfile.clone(),
-        Some(Arc::clone(&overlay_gate)),
+        Some(Arc::clone(overlay_gate)),
     );
     // Lab PR 160: the heads re-anchored as they move, and the bounded
     // verification of the rotating logs in the background
@@ -3282,7 +3903,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // ALERTED (TelemetryLoss), outside trusted-installer windows.
     northnarrow_agent::sensors::ring_drops::set_posture(
         posture.clone(),
-        Some(Arc::clone(&installer_override)),
+        Some(Arc::clone(installer_override)),
     );
 
     // FIM-009 self-upgrade (§15.1): late-bind the audit-chain writer to
@@ -3290,7 +3911,35 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     if let Some(audit) = audit_log.as_ref() {
         installer_override.set_audit_log(Arc::clone(audit));
     }
+}
 
+/// What [`boot_ladder`] armed.
+struct Combat {
+    ladder: Arc<northnarrow_agent::combat::CombatLadder>,
+    /// Lab PR 181: the guard the `debug-protected-query` trigger asks.
+    #[cfg(feature = "debug-trigger")]
+    debug_guard: northnarrow_agent::combat::SystemProtectedProcs,
+    /// Tappa 8 A8: fired by a verified admin `ShutdownRequest`.
+    shutdown_signal: ShutdownSignal,
+}
+
+/// The COMBAT ladder on the system actuator and the signed evidence,
+/// published to the posture hooks' slot; the executor's tree guard; the
+/// copy-on-first-write guard; the ladder's tick and the watch on systemd
+/// stopping the host; the admin shutdown signal.
+#[allow(clippy::too_many_arguments)]
+fn boot_ladder(
+    cli: &Cli,
+    executor: &Executor,
+    isolator: &Option<Arc<NetworkIsolator>>,
+    detect_only: bool,
+    audit_log: &AuditHandle,
+    exempt: &ExemptPids,
+    posture: &PostureMachine,
+    ladder_slot: &std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    lineage: &AuthSessionTracker,
+) -> Combat {
     // Build the ladder with the system actuator (real kill / quarantine /
     // per-PID egress / full isolation) + the signed-audit evidence sink,
     // then publish it to the slot the posture combat hooks read. Driven
@@ -3447,7 +4096,30 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // cloned into `serve_with_marker_path` (Some(...)) and kept
     // here for the select-arm `wait()`.
     let shutdown_signal = ShutdownSignal::new();
+    Combat {
+        ladder,
+        #[cfg(feature = "debug-trigger")]
+        debug_guard,
+        shutdown_signal,
+    }
+}
 
+/// What [`boot_fim_paths`] read.
+struct FimPaths {
+    watched_paths_load: northnarrow_agent::fim::paths_config::WatchedPathsLoad,
+    paths_summary: admin_socket::WatchedPathsSummary,
+}
+
+/// FIM's watched paths (the shipped list and the signed overlay); the
+/// legacy isolation removed and the stale COMBAT chain, signed here, where
+/// the start has always signed them.
+fn boot_fim_paths(
+    cli: &Cli,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    audit_log: &AuditHandle,
+    legacy_isolation_removed: bool,
+    stale_combat: &Option<northnarrow_agent::combat::reconcile::StaleChain>,
+) -> FimPaths {
     // ── Tappa 9 C7 — FIM subsystem boot ────────────────────────────
     //
     // Order:
@@ -3484,7 +4156,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         }
     };
     report_builtin_defaults(
-        &overlay_gate,
+        overlay_gate,
         "fim-paths",
         &cli.fim_paths_v1,
         &watched_paths_load.defaults,
@@ -3514,7 +4186,34 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         );
     }
     let paths_summary = admin_socket::WatchedPathsSummary::from_load(&watched_paths_load);
+    FimPaths {
+        watched_paths_load,
+        paths_summary,
+    }
+}
 
+/// What [`boot_stores`] opened.
+struct Stores {
+    state_protection:
+        Option<std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>>,
+    rotation_protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,
+    fim_drift_rotation: northnarrow_agent::chainlog::RotationConfig,
+    netflow_rotation: northnarrow_agent::chainlog::RotationConfig,
+    detection_sink: Option<northnarrow_agent::detection_store::DetectionSink>,
+    detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>>,
+}
+
+/// The state directory's protection (BUG-026) and the rotation it lets the
+/// logs have (append-only without it), the stale chain's compatibility
+/// line, the head anchor in the same dance; the detection log, its writer
+/// and its reporter; the status-event log the detection triage writes.
+fn boot_stores(
+    cli: &Cli,
+    sensor: &mut SensorMultiplexer,
+    stale_combat: &Option<northnarrow_agent::combat::reconcile::StaleChain>,
+    chain_anchor: &AnchorHandle,
+    audit_log: &AuditHandle,
+) -> Stores {
     // BUG-026: ONE shared StateDirProtection for the rotating on-disk logs
     // under /var/lib/northnarrow (netflow + fim_drift share its dance
     // mutex so two concurrent rotations can't race the dir's chattr +i).
@@ -3702,7 +4401,42 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             }
         }
     };
+    Stores {
+        state_protection,
+        rotation_protection,
+        fim_drift_rotation,
+        netflow_rotation,
+        detection_sink,
+        detection_admin_state,
+    }
+}
 
+/// FIM (Tappa 9 C7): the baseline database and its verified cache, the
+/// observers attached and the file-open sensor armed on them, the late
+/// programs registered, the security tools' processes, the watched inodes,
+/// the recompute task, the drift log and its drain, the first-boot
+/// baseline; then the filesystems' identity report and the control-surface
+/// baits (Tappa 9.5.1).
+#[allow(clippy::too_many_arguments)]
+fn boot_fim(
+    cli: &Cli,
+    agent_id: [u8; 16],
+    audit_log: &AuditHandle,
+    sensor: &mut SensorMultiplexer,
+    open_sensor_carveout: Vec<String>,
+    posture: &PostureMachine,
+    own_prog_ids_file: &Option<PathBuf>,
+    watched_paths_load: northnarrow_agent::fim::paths_config::WatchedPathsLoad,
+    defense_detector: &Arc<northnarrow_agent::impair::DefenseDetector>,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    rotation_protection: &std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,
+    fim_drift_rotation: northnarrow_agent::chainlog::RotationConfig,
+    lineage: &AuthSessionTracker,
+    paths_summary: admin_socket::WatchedPathsSummary,
+    state_protection: &Option<
+        std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>,
+    >,
+) -> Option<Arc<admin_socket::FimAdminState>> {
     let fim_admin_state: Option<Arc<admin_socket::FimAdminState>> = {
         // Re-derive the signing key + agent_id for FIM the same way
         // the audit log does (re-load rather than steal the audit
@@ -3855,12 +4589,12 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     }
                 }
                 start_open_sensor(
-                    &mut sensor,
+                    sensor,
                     cli.file_open_sensor,
                     &fim_attached,
                     &open_sensor_carveout,
                     audit_log.clone(),
-                    &posture,
+                    posture,
                 );
                 // External audit ATP-013: the FIM observers and the file-open
                 // sensor were loaded after the BPF guard registered the
@@ -3899,7 +4633,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                         // A tool's exec registers its pid; a forking
                         // daemon's own process is registered by the
                         // `/proc` scans the exec asks for.
-                        let rescanner = Arc::clone(&defense_detector);
+                        let rescanner = Arc::clone(defense_detector);
                         tokio::spawn(async move {
                             let mut tick = tokio::time::interval(
                                 northnarrow_agent::impair::FORK_RESCAN_SPACING,
@@ -3989,7 +4723,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     .expect("freshly-constructed channel has a receiver");
                 let v1_for_snapshot = cli.fim_paths_v1.clone();
                 let local_for_snapshot = cli.fim_paths_local.clone();
-                let gate_for_snapshot = Arc::clone(&overlay_gate);
+                let gate_for_snapshot = Arc::clone(overlay_gate);
                 if let Some(baseline_db) = baseline_db_opt.as_ref() {
                     tokio::spawn(run_recompute_task(
                         receiver,
@@ -4037,7 +4771,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                             &cli.fim_drift_file,
                             key,
                             agent_id,
-                            std::sync::Arc::clone(&rotation_protection),
+                            std::sync::Arc::clone(rotation_protection),
                             fim_drift_rotation,
                         )
                     }) {
@@ -4216,7 +4950,24 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         // FIMR-008: in the signed audit chain, not only in the journal.
         attest_bait_integrity(audit_log.as_ref(), &report, rebooted);
     }
+    fim_admin_state
+}
 
+/// What [`boot_canary`] opened.
+struct Canary {
+    canary_admin_state: Option<Arc<admin_socket::CanaryAdminState>>,
+    canary_detector: Option<Arc<northnarrow_agent::canary::detector::Detector>>,
+}
+
+/// The canaries (Tappa 9.5 K6): the signed registry and access log, the
+/// indexes rebuilt, every decoy checked against what was deployed and
+/// watched again, the detector and the admin state.
+fn boot_canary(
+    cli: &Cli,
+    agent_id: [u8; 16],
+    audit_log: &AuditHandle,
+    fim_admin_state: &Option<Arc<admin_socket::FimAdminState>>,
+) -> Canary {
     // ── Tappa 9.5 K6 — canary subsystem boot ───────────────────────
     //
     // Order (mirrors the FIM boot above):
@@ -4454,7 +5205,33 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             _ => (None, None),
         }
     };
+    Canary {
+        canary_admin_state,
+        canary_detector,
+    }
+}
 
+/// The network drain (Tappa 10 N9): the netflow and listener logs (one that
+/// cannot be opened is a signed degradation and the drain runs without it:
+/// lab PR 218, P0 C-14), the rules' gate, the open-flow snapshots, the
+/// drain task.
+#[allow(clippy::too_many_arguments)]
+fn boot_net(
+    cli: &Cli,
+    agent_id: [u8; 16],
+    rotation_protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,
+    netflow_rotation: northnarrow_agent::chainlog::RotationConfig,
+    audit_log: &AuditHandle,
+    flow_tracker: Arc<parking_lot::Mutex<FlowTracker>>,
+    dns_cache: Arc<DnsCache>,
+    lineage: &AuthSessionTracker,
+    sensor: &mut SensorMultiplexer,
+    net_bufs: northnarrow_agent::sensors::multiplexer::NetRingBufs,
+    netflow_blocklist: Arc<NetBlocklist>,
+    chain_store: Arc<
+        parking_lot::Mutex<northnarrow_agent::decision::correlation::CorrelationStore>,
+    >,
+) {
     // ── Tappa 10 N9 — net drain subsystem boot ─────────────────────
     //
     // Closes the kernel→userland net loop: the multiplexer above
@@ -4601,7 +5378,33 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             info!("net: drain loop spawned (NET_FLOW_CLOSE_EVENTS + NET_LISTEN_EVENTS)");
         }
     }
+}
 
+/// The admin socket, started only with the network isolator (its ruleset):
+/// the admin key set (a skipped line signed, AUT-004; the one-key bootstrap
+/// over once a second key was added, ATP-004), the serve loop with the
+/// admin states of FIM, the canaries, the detections, the response verbs
+/// and the read verbs.
+#[allow(clippy::too_many_arguments)]
+fn boot_admin(
+    cli: &Cli,
+    isolator: &Option<Arc<NetworkIsolator>>,
+    agent_id: [u8; 16],
+    audit_log: &AuditHandle,
+    chain_anchor: &AnchorHandle,
+    posture: &PostureMachine,
+    shutdown_signal: &ShutdownSignal,
+    fim_admin_state: &Option<Arc<admin_socket::FimAdminState>>,
+    canary_admin_state: &Option<Arc<admin_socket::CanaryAdminState>>,
+    installer_override: &Arc<
+        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    >,
+    detection_admin_state: &Option<Arc<admin_socket::DetectionAdminState>>,
+    executor: &Executor,
+    ladder: &Arc<northnarrow_agent::combat::CombatLadder>,
+    detect_only_source: &Option<String>,
+    exempt: &ExemptPids,
+) {
     // Optional admin socket: only spawned if admin pubkey config
     // is present. Missing config = no unlock path; the agent still
     // runs but COMBAT can only be cleared by reboot.
@@ -4655,7 +5458,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                 let canary_state_for_serve = canary_admin_state.clone();
                 // FIM-009 self-upgrade (§15.1): the dispatcher arms this
                 // override on a verified TrustedInstallerGrantRequest.
-                let installer_override_for_serve = Some(Arc::clone(&installer_override));
+                let installer_override_for_serve = Some(Arc::clone(installer_override));
                 // Tappa 9.0.c: detection triage state (status-event chain).
                 let detection_state_for_serve = detection_admin_state.clone();
                 // External audit NN-AUD-082: the read verbs serve the
@@ -4670,7 +5473,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                 let response_state_for_serve = Some(Arc::new(admin_socket::ResponseAdminState {
                     config: executor.config().clone(),
                     combat_stage: {
-                        let ladder = Arc::clone(&ladder);
+                        let ladder = Arc::clone(ladder);
                         Arc::new(move || ladder.current_stage().map(|s| s.as_str().to_string()))
                     },
                     // External audit CMB-018 / CMB-027 (lab PR 193): `status`
@@ -4678,7 +5481,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     // audit log lacks of the ladder.
                     detect_only_source: detect_only_source.clone(),
                     combat_evidence: {
-                        let ladder = Arc::clone(&ladder);
+                        let ladder = Arc::clone(ladder);
                         Arc::new(move || ladder.evidence_counts())
                     },
                 }));
@@ -4742,7 +5545,39 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
              the watchdog STATUS ping will fail until the ruleset is installed and the agent restarted"
         );
     }
+}
 
+/// SIGINT, SIGTERM and SIGHUP, registered before the event loop.
+struct Signals {
+    sigint: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+    sighup: tokio::signal::unix::Signal,
+}
+
+/// What [`boot_tasks`] started.
+struct Tasks {
+    execq_handle: Option<northnarrow_agent::execq::Handle>,
+    execpol_handle: Option<northnarrow_agent::execpol::Handle>,
+    signals: Signals,
+}
+
+/// The running agent's tasks: the posture's decay, the trusted-installer
+/// window's deadline, the exec quarantine's and the exec policy's
+/// controllers (EXPERIMENTAL; one that cannot start is signed); then the
+/// shutdown signals, installed before the loop.
+#[allow(clippy::too_many_arguments)]
+fn boot_tasks(
+    posture: &PostureMachine,
+    installer_override: &Arc<
+        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    >,
+    execq_mode: northnarrow_agent::execq::Mode,
+    overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    detection_sink: &Option<northnarrow_agent::detection_store::DetectionSink>,
+    audit_log: &AuditHandle,
+    execq_exec_cfg: ExecutorConfig,
+    execpol_mode: northnarrow_agent::execpol::Mode,
+) -> Result<Tasks> {
     // Decay loop: walks the posture down (ALERTED→OBSERVING after 1h
     // idle, ENGAGED→ALERTED after 24h idle, and — external audit POS-001 —
     // an unlocked COMBAT, reached on heuristics alone, to ENGAGED after
@@ -4862,10 +5697,39 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // inside a signed trusted-installer window, or `systemd-shutdown` at
     // the end of a shutdown (the task_kill hook refuses everyone else) —
     // and from anyone on a kernel without `bpf` in its LSM chain.
-    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-    let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    let sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    let sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    Ok(Tasks {
+        execq_handle,
+        execpol_handle,
+        signals: Signals {
+            sigint,
+            sigterm,
+            sighup,
+        },
+    })
+}
 
+/// The boot is over: the capability manifest and the trust level are
+/// signed and systemd was told the agent is ready ([`boot_ready`]); the
+/// event loop takes it.
+struct Armed {
+    _private: (),
+}
+
+/// `BootPhase::Run` (lab PR 218, external review G-12): every attach of the
+/// boot is done — the capability manifest and the trust level are signed
+/// before systemd hears the agent is ready (`sd_notify`), then the boot's
+/// transient heap goes back to the kernel (lab PR 231).
+fn boot_ready(
+    boot: &mut BootSequence,
+    bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
+    self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
+    host_checks: Vec<northnarrow_agent::host_hardening::Check>,
+    detect_only: bool,
+    audit_log: &AuditHandle,
+) -> Result<Armed> {
     // Lab PR 218 (external review G-12): every attach of this boot is done.
     // The capability manifest — kernel, BTF, LSMs, deny hooks, self-test,
     // sensors, host hardening, degradations — and the trust level are
@@ -4950,7 +5814,48 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     // attach) back to the kernel; under aya 0.14 glibc kept it.
     let released = northnarrow_agent::boot::release_boot_heap();
     debug!(released, "boot heap released after READY (malloc_trim)");
+    Ok(Armed { _private: () })
+}
 
+/// Why the event loop ended (the signed `agent_stop`), and when it began.
+struct Stopped {
+    stop_reason: &'static str,
+    loop_started: Instant,
+}
+
+/// The event loop: every event offered to the telemetry probe, then
+/// [`process_event`]; every 5 s the telemetry tasks checked (SNS-001); a
+/// signal or the admin shutdown ends it.
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
+    _armed: Armed,
+    // the debug triggers' files sit next to the admin socket
+    #[cfg_attr(not(feature = "debug-trigger"), allow(unused_variables))] cli: &Cli,
+    sensor: &mut SensorMultiplexer,
+    engine: &RuleEngine,
+    executor: &Executor,
+    correlation: &CorrelationBuffer,
+    posture: &PostureMachine,
+    combat: &Combat,
+    canary_detector: &Option<Arc<northnarrow_agent::canary::detector::Detector>>,
+    installer_override: &Arc<
+        northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
+    >,
+    detection_sink: &Option<northnarrow_agent::detection_store::DetectionSink>,
+    audit_log: &AuditHandle,
+    signals: &mut Signals,
+) -> Stopped {
+    let Combat {
+        ladder,
+        #[cfg(feature = "debug-trigger")]
+        debug_guard,
+        shutdown_signal,
+    } = combat;
+    let Signals {
+        sigint,
+        sigterm,
+        sighup,
+    } = signals;
     // Why the event loop ended — written as the signed `agent_stop` entry
     // below; a run that never writes it is reported by the next boot.
     let loop_started = std::time::Instant::now();
@@ -4973,11 +5878,11 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     // the probe tracker before the decision engine.
                     northnarrow_agent::telemetry_probe::observe(&e);
                     process_event(
-                    &engine,
-                    &executor,
-                    &correlation,
-                    &posture,
-                    &ladder,
+                    engine,
+                    executor,
+                    correlation,
+                    posture,
+                    ladder,
                     // Tappa 9.5 K6: detector handle wired in. When
                     // the canary subsystem boot above failed
                     // (missing signing key, registry open error),
@@ -4986,7 +5891,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                     // canary filtering.
                     canary_detector.as_deref(),
                     // FIM-009 self-upgrade (§15.1): lazy TTL expiry sweep.
-                    &installer_override,
+                    installer_override,
                     // Tappa 9.0.a: detection-persistence sink (off the hot path).
                     detection_sink.as_ref(),
                     e,
@@ -5000,9 +5905,9 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             },
             _ = pump_check.tick() => {
                 #[cfg(feature = "debug-trigger")]
-                debug_abort_pump(&sensor, &cli.admin_socket);
+                debug_abort_pump(sensor, &cli.admin_socket);
                 #[cfg(feature = "debug-trigger")]
-                debug_protected_query(&debug_guard, &cli.admin_socket);
+                debug_protected_query(debug_guard, &cli.admin_socket);
                 #[cfg(feature = "debug-trigger")]
                 debug_stall_loop(&cli.admin_socket);
                 let dead = sensor.finished_pumps();
@@ -5077,6 +5982,29 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
             }
         }
     }
+    Stopped {
+        stop_reason,
+        loop_started,
+    }
+}
+
+/// The stop: the exec guards release what they hold, the BPF self-check
+/// is told the links go, the copy guard closes, the signed `agent_stop`,
+/// the heads anchored at stop, the pid file and the admin socket removed.
+/// A pump that exited is a failure (SNS-001): the watchdog restarts the
+/// agent.
+fn shutdown(
+    cli: &Cli,
+    execq_handle: Option<northnarrow_agent::execq::Handle>,
+    execpol_handle: Option<northnarrow_agent::execpol::Handle>,
+    audit_log: &AuditHandle,
+    chain_anchor: &AnchorHandle,
+    stopped: Stopped,
+) -> Result<()> {
+    let Stopped {
+        stop_reason,
+        loop_started,
+    } = stopped;
     // Lab PR 223: nothing stays held by an agent that stops.
     northnarrow_agent::execq::shutdown(execq_handle);
     // Lab PR 226: the kernel keeps the policy until its programs detach.
