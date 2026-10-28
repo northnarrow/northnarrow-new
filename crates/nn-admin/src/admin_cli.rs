@@ -1364,7 +1364,7 @@ fn map_admin_result_to_baseline(r: nn_proto::admin_protocol::AdminResult) -> Fim
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             FimBaselineOutcome::ProtocolVersionUnsupported { server_version }
         }
-        // Lab PR 217: no reply of this operation; out of spec.
+        // Lab PR 263: verified, not carried out (no recompute task this boot).
         AdminResult::ActionFailed => FimBaselineOutcome::UnknownOperation,
     }
 }
