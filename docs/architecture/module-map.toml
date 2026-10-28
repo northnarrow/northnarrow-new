@@ -278,6 +278,11 @@ planned = false
 "net" = "nn-core"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
+# R11a (lab PR 261): `main.rs`'s `process_event`, the event pipeline the
+# plan's R12 turns into the priority bus (§3.4), and whether systemd is
+# stopping the host, which it shares with the start's tasks: the
+# composition
+"pipeline" = "northnarrow-agent"
 # R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
 # agent's binding of it to the Linux host (its paths kept, the machine,
 # triggers, tracker and exemption as aliases on `LinuxHost`; it names
@@ -286,11 +291,18 @@ planned = false
 "posture" = "nn-core"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
 "removed_settings" = "northnarrow-agent"
+# R11a (lab PR 261): `main.rs`'s event loop, as the plan names it (§2.4:
+# `main` → `boot/*`, `pipeline/*`, `run_loop.rs`, `shutdown.rs`): the
+# composition
+"run_loop" = "northnarrow-agent"
 # R09b (lab PR 254): the sensors moved to nn-linux with the eBPF object's
 # embed (`build.rs`); the agent's `sensors.rs` keeps their paths and names
 # the loader on the agent's exec guards (`exec_guards`), an alias as the
 # posture's on `LinuxHost`
 "sensors" = "nn-linux"
+# R11a (lab PR 261): `main.rs`'s stop, after the event loop: the
+# composition
+"shutdown" = "northnarrow-agent"
 
 # ── agent/src: the shims of R05, R07 and R08a ─────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
