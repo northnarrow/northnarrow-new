@@ -146,7 +146,9 @@ planned = false
 # takes, the degradations of a run (`boot::degradation`, `[shims.agent]`)
 # and the sensors' attach points went to nn-linux, which the sensors
 # report to; the deny self-test, the BPF LSM gate, the trust level and the
-# signed manifest stay
+# signed manifest stay. R09c (lab PR 257): they still do — the plan gives
+# the boot to the agent (§2.4, `main` → `boot/*`, R11a's typed phases) and
+# the manifest to the sensor contract (R13), not to R09c
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1

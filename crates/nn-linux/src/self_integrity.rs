@@ -132,8 +132,8 @@ pub const WEAKENING_ENV: &[(&str, WeakensWith)] = &[
     ("NN_OVERLAY_ALLOW_UNSIGNED", is_one),
     // NN_ADE_ALLOW_MOCK and NN_ADE_ENFORCE (the LLM advisor's mock backend
     // and its licence to act) left with the advisor in Wave 4, lab PR 214:
-    // nothing reads them, the agent names them in a WARN at start
-    // (`crate::removed_settings`).
+    // nothing reads them, the agent names them in a WARN at start (the
+    // agent's `removed_settings`).
     // External audit MAIN-004: the evidence logs' rotation caps; any
     // override changes how much evidence survives.
     (crate::chainlog::FIM_DRIFT_CAP_ENV, any_value),

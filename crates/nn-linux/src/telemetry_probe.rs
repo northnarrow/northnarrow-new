@@ -47,7 +47,7 @@
 //! routed through the default gateway, off the host.
 //!
 //! Tap: [`observe`] is called on every event before the decision engine
-//! (`main.rs` event loop) and is a few comparisons when a round is open,
+//! (the agent's event loop) and is a few comparisons when a round is open,
 //! nothing otherwise. Disabled with `NN_TELEMETRY_PROBE_SECS=0`.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
