@@ -182,7 +182,8 @@ pub(crate) use nn_linux::runtime;
 /// R09c shim (lab PR 257; plan §4.1 rule 2, removed in R17): systemd's
 /// readiness notification is nn-linux's.
 pub use nn_linux::sd_notify;
-pub mod self_integrity;
+/// R09c shim: the self-integrity watcher is nn-linux's.
+pub use nn_linux::self_integrity;
 /// Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`).
 #[cfg(feature = "test-privileged")]
 pub mod sensor_feasibility;

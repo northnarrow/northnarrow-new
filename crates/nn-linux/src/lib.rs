@@ -284,8 +284,12 @@ pub mod runtime;
 // PR 257; was the agent's `sd_notify`).
 pub mod sd_notify;
 
-/// The self-integrity watcher's pieces the self-defence and the actuators
-/// name (R09a, lab PR 253; cut from the agent's `self_integrity`, R09c's).
+// The self-integrity watcher: what systemd and the kernel will do to the
+// agent next (drop-ins, unit copies, limits, `oom_score_adj`, mounts, the
+// overlays, an admin key on the host), each round against the boot and the
+// install, every finding signed (Tappa 10.8; R09c, lab PR 257; was the
+// agent's `self_integrity`, whose op and jitter, which the self-defence
+// names, came first, R09a).
 pub mod self_integrity;
 
 // The sensors (Tappa 4, Tappa 10): the embedded eBPF object and its boot
@@ -348,8 +352,18 @@ pub(crate) mod chainlog {
         nn_evidence::chainlog::RotatingChainLog<P, K>;
 }
 
-/// `crate::config::…`, nn-core's (the overlay a watched-paths load takes).
-use nn_core::config;
+/// `crate::config::overlay_auth::…`, nn-core's — the overlay a watched-paths
+/// load takes; the overlay read and the gate's trait the integrity check
+/// names (R09c) — and the shipped COMBAT defaults' lookup, nn-linux's (R09c,
+/// lab PR 257: from the agent's `config::overlay_auth`, which gives the
+/// same paths).
+pub(crate) mod config {
+    pub mod overlay_auth {
+        pub use nn_core::config::overlay_auth::*;
+
+        pub use crate::anti_tamper::network_isolate::shipped_default;
+    }
+}
 
 /// `crate::decision::…`, nn-core's (the exemption facts' trait).
 use nn_core::decision;
