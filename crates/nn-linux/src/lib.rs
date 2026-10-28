@@ -58,6 +58,12 @@ pub mod atomic_file;
 // `bounded_cmd`).
 pub mod bounded_cmd;
 
+// The boot's typed phases and the attach permit, the degradations of a run
+// and the sensors' attach points (R09b, lab PR 254; cut from the agent's
+// `boot`, whose deny self-test, BPF LSM gate, trust level and signed
+// manifest stay in the agent).
+pub mod boot;
+
 /// Deception (R09a, lab PR 253): the stores of the canary detector's host —
 /// the signed registry of deployed canaries and their access log, this
 /// host's interface addresses, the read-forward set the FIM drain consults
@@ -211,6 +217,10 @@ pub mod runtime;
 /// The self-integrity watcher's pieces the self-defence and the actuators
 /// name (R09a, lab PR 253; cut from the agent's `self_integrity`, R09c's).
 pub mod self_integrity;
+
+// The telemetry probe's piece the file-open sensor names (R09b, lab PR
+// 254; cut from the agent's `telemetry_probe`, R09c's).
+pub mod telemetry_probe;
 
 // The system directories' binaries, never `$PATH` (R09a; was the agent's
 // `trusted_bin`).

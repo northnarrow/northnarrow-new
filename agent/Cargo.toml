@@ -47,8 +47,10 @@ debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger", "nn-linux/de
 # that spawn the agent + nn-admin subprocesses and verify the
 # iptables ruleset against a live kernel. Requires root and a
 # working iptables binary; CI compiles but does not execute these.
-# See docs/integration-test-runbook.md for the manual run path.
-test-privileged = []
+# See docs/integration-test-runbook.md for the manual run path. R09b
+# (lab PR 254): the attach permit's test constructor is nn-linux's, which
+# takes the feature.
+test-privileged = ["nn-linux/test-privileged"]
 # Builds `examples/posture_demo.rs` (`required-features`). External audit
 # POS-013 made it compile `PostureMachine::admin_release_combat`, the
 # Sub-tappa 6.5 bool stub that leaves COMBAT without a signed token, for

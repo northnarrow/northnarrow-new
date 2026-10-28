@@ -144,7 +144,12 @@ planned = false
 # post-plan (lab PR 241, R04a): the audit log's writability before the
 # attach (`access(2)`), from `audit`
 "audit_preflight" = "nn-linux"
-# post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a
+# post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a.
+# R09b (lab PR 254): the phases, the attach permit the sensors' attach
+# takes, the degradations of a run (`boot::degradation`, `[shims.agent]`)
+# and the sensors' attach points went to nn-linux, which the sensors
+# report to; the deny self-test, the BPF LSM gate, the trust level and the
+# signed manifest stay
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
@@ -330,6 +335,9 @@ planned = false
 # access log, addresses and read-forward set (the canary host's associated
 # types and calls); the sampler; the DNS ingest
 "anti_tamper" = "nn-linux"
+# R09b (lab PR 254): the degradations of a run, which the sensors report,
+# moved to nn-linux with the boot's phases (`boot/mod.rs` re-exports them)
+"boot::degradation" = "nn-linux"
 "canary::access_log" = "nn-linux"
 "canary::network" = "nn-linux"
 "canary::read_forward" = "nn-linux"

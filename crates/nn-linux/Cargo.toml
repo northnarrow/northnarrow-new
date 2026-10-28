@@ -72,6 +72,12 @@ hex = "0.4"
 # `debug-trigger` here (plan §4.1 rule 4). Off by default; production
 # builds never see it.
 debug-trigger = []
+# R09b (lab PR 254): the attach permit without a boot sequence, for the
+# privileged tests that load the eBPF object outside the agent's start
+# (`boot::AttachPermit::for_tests`); the agent forwards its own
+# `test-privileged` here (plan §4.1 rule 4). Off by default; production
+# builds never see it.
+test-privileged = []
 # R09a (lab PR 253): the test doors this crate keeps for the agent's tests
 # that wire it — a capture of a process without a descriptor, the
 # host-critical guard on given identities, an unlock token minted without a
