@@ -261,10 +261,11 @@ planned = false
 # `net::blind_spots`): R08b (lab PR 251) moved them, with the resolvers,
 # to nn-core (`[shims.agent]`); `net/mod.rs` binds them to the agent's
 # host (inline modules); R09a (lab PR 253): the DNS cache carrying the
-# pump's ingest, and the ingest, moved to nn-linux (`[shims.agent]`)
+# pump's ingest, and the ingest, moved to nn-linux (`[shims.agent]`); R09b
+# (lab PR 254): the drain and the blind spots moved to nn-linux, and the
+# tracker's and the gate's binding to the Linux host with them, which the
+# drain names: `net/mod.rs` re-exports nn-linux's (`[shims.agent]`)
 "net" = "nn-core"
-"net::blind_spots" = "nn-linux"
-"net::drain" = "nn-linux"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
@@ -417,12 +418,21 @@ planned = false
 # (R06). R09a (lab PR 253): that module moved to nn-linux's `net` with the
 # ingest; the agent's path names it
 "net::dns_cache" = "nn-linux"
+# R09b (lab PR 254): the drain of the flow, listener and UDP rings with the
+# netflow and listener logs, and the blind spots it reports (the encrypted
+# flows no rule fingerprints, DNS over TLS to the resolver) moved to
+# nn-linux; the agent's paths name them
+"net::blind_spots" = "nn-linux"
+"net::drain" = "nn-linux"
 # R08b (lab PR 251): the flow tracker (connect → close, the flow id, the
-# open-flow snapshots), with the rules' network state; `net/mod.rs` names it
-# on the agent's host, whose notifier the drain awaits (an inline module)
+# open-flow snapshots), with the rules' network state; `net/mod.rs` named it
+# on the agent's host, whose notifier the drain awaits (an inline module).
+# R09b (lab PR 254): that binding is nn-linux's `net::flow_tracker`, with
+# the drain; the agent's path re-exports it
 "net::flow_tracker" = "nn-core"
 # R08b (lab PR 251): the netflow rows handed to the rules, paced per uid;
-# `net/mod.rs` names the gate on the agent's host (an inline module)
+# `net/mod.rs` named the gate on the agent's host (an inline module). R09b
+# (lab PR 254): nn-linux's `net::limiter`, with the drain, re-exported
 "net::limiter" = "nn-core"
 # post-plan (lab PR 224): the host's resolv.conf, mapped to nn-linux by
 # lab PR 239; R08b (lab PR 251): the set the network and chain rules
@@ -545,10 +555,14 @@ planned = false
 # permit, which only the sequence gives; the degradations' registry; the
 # sensor list), and the exec guards' kernel configuration the load writes
 # stays the agent's behind the loader's `ExecGuards` (`exec_guards`).
+# Then 23 → 22, nn-core 15 → 14: the network drain moved to nn-linux, and
+# the flow tracker's and the rules' gate's binding to the Linux host,
+# which the drain names, with it; `net/mod.rs` re-exports them, and names
+# `LinuxHost` no more (it keeps one reference, to nn-linux).
 
 [ratchet]
 nn-admin = 8
-nn-core = 15
+nn-core = 14
 nn-evidence = 0
 nn-linux = 0
 nn-proto = 0

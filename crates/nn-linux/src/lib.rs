@@ -162,8 +162,16 @@ pub mod keys;
 
 /// Network (R09a, lab PR 253): the DNS pump's ingest, and the DNS cache
 /// carrying it (were the agent's `net::dns_ingest` and `net::dns_cache`;
-/// the cache's state is nn-core's).
+/// the cache's state is nn-core's). R09b (lab PR 254): the drain of the
+/// flow and listener rings and its two signed logs, the blind spots it
+/// reports (were the agent's `net::{drain, blind_spots}`), and the flow
+/// tracker and the rules' gate on the Linux host.
 pub mod net {
+    // The flows the rules cannot judge on this host: the encrypted ones
+    // with no TLS fingerprint rule, DNS over TLS to the resolver (lab PRs
+    // 224, 247).
+    pub mod blind_spots;
+
     // How far the DNS pump has read its ring, and how a lookup waits for
     // it (lab PR 229).
     pub mod dns_ingest;
@@ -189,9 +197,13 @@ pub mod net {
         pub use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
     }
 
+    // The drain of the closed flows, listeners and UDP flows, and the
+    // netflow and listener logs (Tappa 10 N9).
+    pub mod drain;
+
     // R09b shims (lab PR 254; plan §4.1 rule 2, removed in R17): the paths
-    // the moved sensors name for nn-core's network state, as the agent's
-    // `net` gives them.
+    // the moved sensors and drain name for nn-core's network state, as the
+    // agent's `net` gives them.
 
     /// `crate::net::blocklist::…`, nn-core's (the connect deny's rules).
     pub(crate) use nn_core::net::blocklist;
@@ -206,6 +218,16 @@ pub mod net {
         /// [`nn_core::net::flow_tracker::FlowTracker`] on the Linux host.
         pub type FlowTracker =
             nn_core::net::flow_tracker::FlowTracker<crate::chain_host_linux::LinuxHost>;
+    }
+
+    /// The netflow rows handed to the rules, paced per uid, on the Linux
+    /// host: nn-core's (the drain's gate; R08b's alias of the agent's
+    /// `net`).
+    pub mod limiter {
+        pub use nn_core::net::limiter::*;
+
+        /// [`nn_core::net::limiter::RuleGate`] on the Linux host.
+        pub type RuleGate = nn_core::net::limiter::RuleGate<crate::chain_host_linux::LinuxHost>;
     }
 }
 
