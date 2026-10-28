@@ -143,7 +143,8 @@ pub const STATE_FLAGS: &[StateFlag] = &[
         file: "agent.pid",
         shared: false,
         what: "written once every hook is attached; the ids of the agent's BPF programs \
-               (bpf-own-ids) go beside it",
+               (bpf-own-ids) go beside it, and the refused starts the audit log could not take \
+               (boot-refusals.jsonl, lab PR 262)",
     },
     StateFlag {
         flag: "--watchdog-pidfile",
@@ -373,6 +374,11 @@ pub enum Launch {
     Sudo,
     /// Directly: the test runs as root.
     Direct,
+    /// Lab PR 262: as [`Launch::Sudo`], under `setpriv(1)` with these
+    /// capabilities (`kill`, …) dropped from the bounding and inheritable
+    /// sets, so the agent's effective set lacks them (a unit's
+    /// `CapabilityBoundingSet=` without them).
+    SudoWithout(&'static [&'static str]),
 }
 
 /// The agent of this build: `CARGO_BIN_EXE_northnarrow-agent` in the
@@ -399,34 +405,68 @@ fn agent_build() -> PathBuf {
 #[derive(Debug)]
 pub struct InstalledAgent {
     path: PathBuf,
+    /// The directory of its own [`InstalledAgent::install_as_northnarrow_agent`]
+    /// created, removed with the copy.
+    dir: Option<PathBuf>,
+}
+
+/// A name no other copy has (the time's nanoseconds).
+fn unique() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// `sudo install -D -m 755 -o root -g root <this build> <path>`; panics
+/// when it fails.
+fn install_at(path: &Path) {
+    let src = agent_build();
+    let status = Command::new(SUDO)
+        .args(["install", "-D", "-m", "755", "-o", "root", "-g", "root"])
+        .arg(&src)
+        .arg(path)
+        .stdin(Stdio::null())
+        .status()
+        .expect("spawn sudo install");
+    assert!(
+        status.success(),
+        "sudo install of {} to {} failed",
+        src.display(),
+        path.display()
+    );
 }
 
 impl InstalledAgent {
     /// Install this build's agent; panics when that fails.
     pub fn install() -> Self {
-        let src = agent_build();
-        let ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
         let path = PathBuf::from(format!(
-            "/usr/local/bin/northnarrow-agent-e2etest-{ns}-{}",
+            "/usr/local/bin/northnarrow-agent-e2etest-{}-{}",
+            unique(),
             std::process::id()
         ));
-        let status = Command::new(SUDO)
-            .args(["install", "-D", "-m", "755", "-o", "root", "-g", "root"])
-            .arg(&src)
-            .arg(&path)
-            .stdin(Stdio::null())
-            .status()
-            .expect("spawn sudo install");
-        assert!(
-            status.success(),
-            "sudo install of {} to {} failed",
-            src.display(),
-            path.display()
-        );
-        Self { path }
+        install_at(&path);
+        Self { path, dir: None }
+    }
+
+    /// Lab PR 262: this build's agent installed under the installed agent's
+    /// own name, `northnarrow-agent`, in a root-owned directory of its own
+    /// (`/usr/local/bin/northnarrow-agent-e2etest-<ns>-<pid>.d/`), so that an
+    /// install manifest whose `bin_dir` is that directory describes it — the
+    /// boot's binary integrity check compares only that name. Drop removes
+    /// the directory.
+    pub fn install_as_northnarrow_agent() -> Self {
+        let dir = PathBuf::from(format!(
+            "/usr/local/bin/northnarrow-agent-e2etest-{}-{}.d",
+            unique(),
+            std::process::id()
+        ));
+        let path = dir.join("northnarrow-agent");
+        install_at(&path);
+        Self {
+            path,
+            dir: Some(dir),
+        }
     }
 
     /// The installed copy's path, for what checks the agent's identity
@@ -460,6 +500,20 @@ impl InstalledAgent {
                 }
                 c
             }
+            Launch::SudoWithout(caps) => {
+                let drop: Vec<String> = caps.iter().map(|c| format!("-{c}")).collect();
+                let mut c = Command::new(SUDO);
+                c.arg("setpriv")
+                    .arg(format!("--inh-caps={}", drop.join(",")))
+                    .arg(format!("--bounding-set={}", drop.join(",")))
+                    .arg("--")
+                    .arg("env");
+                for (k, v) in env {
+                    c.arg(format!("{k}={v}"));
+                }
+                c.arg(&self.path);
+                c
+            }
         };
         cmd.args(state.args());
         cmd
@@ -468,11 +522,19 @@ impl InstalledAgent {
 
 impl Drop for InstalledAgent {
     fn drop(&mut self) {
-        let out = Command::new(SUDO)
-            .args(["rm", "-f"])
-            .arg(&self.path)
-            .stdin(Stdio::null())
-            .output();
+        let mut rm = Command::new(SUDO);
+        rm.args(["rm", "-f"]).arg(&self.path);
+        if let Some(dir) = &self.dir {
+            // the copy, then its directory (empty: `rmdir`, never `rm -r`)
+            rm = Command::new(SUDO);
+            rm.arg("sh")
+                .arg("-c")
+                .arg("rm -f -- \"$1\" && rmdir -- \"$2\"")
+                .arg("sh")
+                .arg(&self.path)
+                .arg(dir);
+        }
+        let out = rm.stdin(Stdio::null()).output();
         let failed = match &out {
             Ok(o) if o.status.success() => None,
             Ok(o) => Some(format!(

@@ -77,6 +77,11 @@ const HOST_PATH_USERS: &[(&str, &str)] = &[
         "the pinned PROTECTED_PIDS map, which a fixture's teardown evicts its agent from",
     ),
     (
+        "agent/tests/boot_refusal_privileged_e2e.rs",
+        "the pin root and the pinned PROTECTED_PIDS, read before and after a refused start \
+         (lab PR 262): it pinned nothing and left no registration; nothing there is written",
+    ),
+    (
         "agent/tests/privileged_map_pin.rs",
         "the pin root is what it tests: the pins outlive the agent and its restart reuses them",
     ),
