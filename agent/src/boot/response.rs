@@ -50,12 +50,15 @@ pub(crate) fn build(
     // supervisor that asked for a PID file cannot proceed without it,
     // and silently degrading would resurrect exactly the "agent is
     // alive but the watcher can't find it" bug this flag exists to
-    // kill. Production never passes --pid-file, so this is inert there.
+    // kill. The shipped unit passes `--pid-file /run/northnarrow/agent.pid`
+    // (the watchdog and the scripts read it; the BPF program-id list and,
+    // R11b, lab PR 262, the refused starts' fallback chains go beside it —
+    // review #466 N3: this said production never passed it).
     if let Some(pid_file) = cli.pid_file.as_deref() {
         write_pid_file(pid_file)
             .with_context(|| format!("writing --pid-file {}", pid_file.display()))?;
     } else {
-        debug!("no --pid-file provided; PID file write skipped (production default)");
+        debug!("no --pid-file provided; PID file write skipped");
     }
 
     // Lab PR 219: the exploit guard enforces only when asked to and outside

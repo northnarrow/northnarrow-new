@@ -676,9 +676,11 @@ pub(crate) struct Cli {
     /// EXISTENCE is itself the readiness signal (it cannot appear
     /// before every hook is live). A stale file from a previous
     /// crashed run is OVERWRITTEN, not respected — so readers must
-    /// confirm /proc/<pid> before trusting the contents. Omitting
-    /// the flag (the production default) is a no-op: behaviour is
-    /// exactly as before, no PID file is touched.
+    /// confirm /proc/<pid> before trusting the contents. The shipped
+    /// unit passes /run/northnarrow/agent.pid; the BPF program-id list
+    /// and the refused starts' fallback chains (boot-refusals/) go
+    /// beside it. Without the flag no PID file is touched, and neither
+    /// is written.
     #[arg(long = "pid-file", value_name = "PATH")]
     pub(crate) pid_file: Option<PathBuf>,
 
