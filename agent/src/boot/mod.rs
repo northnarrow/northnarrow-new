@@ -8,7 +8,10 @@
 //!    kernel: the embedded eBPF object, the state directory, the BTF
 //!    offsets, the capabilities, the install manifest, the audit log's
 //!    writability and (R11b, lab PR 262) its chain, opened, the active LSMs
-//!    ([`lsm`]). A refusal here leaves the host as it was.
+//!    ([`lsm`]), the deny hooks' pin root and BTF. A refusal here leaves
+//!    the kernel as it was, and creates no state file but what its
+//!    signature needs (review #466 F8): the agent's key and identity when
+//!    they are missing, and the chain that takes the refusal.
 //! 2. [`BootPhase::Attach`] — the eBPF object, the sensors and the deny
 //!    hooks. Only an [`IntegrityVerified`] opens it, and only
 //!    [`BootSequence::verify_integrity`] gives one, once every preflight
@@ -153,7 +156,6 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
     logging::init(&cli, undumpable);
     let preflight::Preflight {
         refused,
-        state_dir_linked,
         mut boot,
         tracepoint_degraded,
         hook_args_degraded,
@@ -162,7 +164,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         boot_chains,
         rollback_floor,
     } = preflight::check(&cli)?;
-    let state_ready = state::bootstrap(&cli, &heads_file, state_dir_linked);
+    let state_ready = state::bootstrap(&cli, &heads_file, refused.is_some());
     let identity::Identity {
         identity,
         agent_id,

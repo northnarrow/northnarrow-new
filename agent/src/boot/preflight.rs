@@ -22,11 +22,9 @@ pub(crate) struct Preflight {
     /// R11b (lab PR 262): the first of the eBPF object, the state directory
     /// and the BTF offsets that refused the start. The refusal is signed,
     /// with the identity read and the start registered, at the start of the
-    /// integrity phase — before anything is loaded.
+    /// integrity phase — before anything is loaded; the state files are not
+    /// bootstrapped (review #466 F8).
     pub(crate) refused: Option<Refusal>,
-    /// The state directory is reached through a link (the refusal above):
-    /// nothing reads or writes there before the start exits.
-    pub(crate) state_dir_linked: bool,
     /// The start's phases (lab PR 218), opened by the preflight.
     pub(crate) boot: BootSequence,
     /// Tracepoint fields left on their compiled offset (NN-AUD-098), signed
@@ -303,7 +301,6 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     boot.done(BootStep::ChainHeads)?;
     Ok(Preflight {
         refused,
-        state_dir_linked,
         boot,
         tracepoint_degraded,
         hook_args_degraded,
