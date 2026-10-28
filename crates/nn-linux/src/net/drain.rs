@@ -293,9 +293,10 @@ impl NetListenerDb {
     pub fn open(path: &Path, key: AgentSigningKey, agent_id: [u8; 16]) -> Result<Self> {
         // External audit NET-003: a torn last write used to make every
         // later open fail, and the network drain never ran again.
-        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
-            serde_json::from_slice::<NetListenerEntry>(l).is_ok()
-        })?;
+        let tail_repair =
+            crate::chainlog::repair_torn_tail::<crate::chain_host_linux::LinuxHost>(path, |l| {
+                serde_json::from_slice::<NetListenerEntry>(l).is_ok()
+            })?;
         let last_hash = read_tail_hash_listener(path)?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now

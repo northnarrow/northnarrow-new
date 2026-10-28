@@ -629,9 +629,10 @@ impl BaselineDb {
         // the chain resumes after the last readable row, and the rows
         // that do not verify are kept out of the drain's cache
         // (`BaselineCache::load_verified`) until a new baseline.
-        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
-            serde_json::from_slice::<BaselineEntry>(l).is_ok()
-        })?;
+        let tail_repair =
+            crate::chainlog::repair_torn_tail::<crate::chain_host_linux::LinuxHost>(path, |l| {
+                serde_json::from_slice::<BaselineEntry>(l).is_ok()
+            })?;
         let (last_hash, skipped_lines) = read_tail_hash(path)?;
         Ok(Self {
             // review 44: appends go through a directory fd taken now

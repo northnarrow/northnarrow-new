@@ -133,7 +133,9 @@ pub fn install_manifest(
     // sentinel, read (only in that case) before the decision.
     let (history, history_error) = match &outcome {
         IntegrityOutcome::NoManifest { .. } => {
-            match crate::audit::verified_boot_recorded(audit_log) {
+            match crate::audit::verified_boot_recorded::<crate::chain_host_linux::LinuxHost>(
+                audit_log,
+            ) {
                 Ok(true) => (BootHistory::VerifiedBefore, None),
                 Ok(false) => (BootHistory::NeverVerified, None),
                 Err(e) => (BootHistory::Unknown, Some(format!("{e:#}"))),
@@ -549,7 +551,7 @@ mod tests {
         let mut boot = BootSequence::new();
         let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
         assert!(
-            matches!(c.open, AuditOpen::Failed(ref why) if why.contains("parsing")),
+            matches!(c.open, AuditOpen::Failed(ref why) if why.contains("is not an audit row")),
             "{:?}",
             c.open
         );

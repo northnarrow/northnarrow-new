@@ -467,9 +467,10 @@ impl Registry {
         // good. A torn last write is repaired; a line that cannot be read
         // anywhere else is skipped and reported (`skipped_lines`), and the
         // canaries that can be read stay deployed and watched.
-        let tail_repair = crate::chainlog::repair_torn_tail(path, |l| {
-            serde_json::from_slice::<CanaryToken>(l).is_ok()
-        })?;
+        let tail_repair =
+            crate::chainlog::repair_torn_tail::<crate::chain_host_linux::LinuxHost>(path, |l| {
+                serde_json::from_slice::<CanaryToken>(l).is_ok()
+            })?;
         // External audit NN-AUD-174: every row is verified at open.
         let read = read_chain(path, &key.verifying_key())?;
         Ok(Self {
