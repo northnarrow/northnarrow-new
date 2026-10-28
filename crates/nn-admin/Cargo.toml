@@ -6,25 +6,59 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "NorthNarrow nn-admin: the operator client's library (Wave 4 restructure; empty until its lot moves code in)."
+description = "NorthNarrow nn-admin: the operator client's library (Wave 4 restructure, R10)."
 publish = false
 
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
 [dependencies]
-# R10 (lab PR 259): the agent id file's parse (`shutdown_marker`), and the
-# width of the id (nn-evidence's `audit`, with the identity types).
+# R10 (lab PR 259): the agent's `admin_cli` and the logic of its
+# `bin/nn_admin.rs` moved here with the dependencies they had there, the
+# same versions and features (one version each in the workspace).
+# The admin protocol, the signed payloads and their quorum, the agent id
+# file's parse (`shutdown_marker`).
 nn-proto = { workspace = true }
+# The chains' readers and verifiers (`audit`, `verify_lines`,
+# `chain_anchor`), the OS CSPRNG (`os_rng`), the width of the agent id.
 nn-evidence = { workspace = true }
-anyhow = { workspace = true }
-# The seam the agent binds (`host`): the gate's decision on an overlay and
-# the per-rule policy (nn-core), the chains' targets and boot check
-# (nn-evidence), the replayed events (nn-model), the agent key's public
-# half; the replay's decisions as JSON.
+# The seam the agent binds (`host`): the gate's decision on an overlay, the
+# overlays' content and signature file, the per-rule policy and the
+# replay's event parser, the COMBAT carve-out, the trusted-installer
+# window's ceiling.
 nn-core = { workspace = true }
+# The posture names `force-posture` takes, the replayed events.
 nn-model = { workspace = true }
-ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
+anyhow = { workspace = true }
+clap = { workspace = true }
+# serde_json with the agent's feature (`float_roundtrip`), so a build of
+# nn-admin alone parses as the agent does.
 serde_json = { version = "1", features = ["float_roundtrip"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+# Tappa 7 task 7 / Tappa 8: the operator's Ed25519 keys and signatures;
+# `rand_core` lets the OS CSPRNG (`os_rng`) feed `init`'s key generation.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
+sha2 = "0.11"
+hex = "0.4"
+# The private key's bytes wiped after use.
+zeroize = { version = "1.8", features = ["derive"] }
+# `config overlay sign`'s random nonce (the `Rng` trait over `os_rng`).
+rand = "0.10"
+# `init`'s private key file: `O_NOFOLLOW | O_CLOEXEC` (constants only).
+libc = "0.2"
+# The private key's owner check (external audit AUT-002): the effective uid,
+# through rustix's safe `geteuid` — nn-admin forbids unsafe code, and the
+# agent called libc's directly (`process`: a feature the workspace's build
+# already enables, procfs's).
+rustix = { version = "1", features = ["process"] }
+
+[features]
+# Exposes the `debug force-posture` subcommand (`DebugForcePosture` is
+# nn-proto's behind the same feature); the agent forwards its own
+# `debug-trigger` here (plan §4.1 rule 4). Never in production builds.
+debug-trigger = ["nn-proto/debug-trigger"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

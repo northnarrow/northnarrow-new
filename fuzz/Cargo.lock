@@ -847,12 +847,20 @@ name = "nn-admin"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "chrono",
+ "clap",
  "ed25519-dalek",
+ "hex",
+ "libc",
  "nn-core",
  "nn-evidence",
  "nn-model",
  "nn-proto",
+ "rand",
+ "rustix",
  "serde_json",
+ "sha2",
+ "zeroize",
 ]
 
 [[package]]

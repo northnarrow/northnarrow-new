@@ -138,8 +138,10 @@ planned = false
 [modules.agent]
 "lib" = "northnarrow-agent"
 "main" = "northnarrow-agent"
-"bin::nn_admin" = "nn-admin"
-"admin_cli" = "nn-admin"
+# R10 (lab PR 259): the binary's logic moved to nn-admin (its `cli`); the
+# root left here is the agent package's shim, which passes the agent's host
+# (`admin_host`) to nn-admin's `main`: the composition
+"bin::nn_admin" = "northnarrow-agent"
 # post-plan (lab PR 259, R10): nn-admin on the agent's host — the agent's
 # implementation of nn-admin's `host::AdminHost` (the hardening checks, the
 # agent key's files, its chains and where they lie under its state
@@ -300,6 +302,9 @@ planned = false
 # buffer and the detection budget to nn-core, the same way.
 
 [shims.agent]
+# R10 (lab PR 259): the operator client's library half moved to nn-admin;
+# the agent keeps its path (`lib.rs`, `pub use nn_admin::admin_cli`)
+"admin_cli" = "nn-admin"
 # R09a (lab PR 253): the utilities the actuators, the self-defence and the
 # hosts stand on moved to nn-linux; the agent keeps their paths in `lib.rs`
 # (`pub use nn_linux::…`): the identity on disk, the anchor of a log's
@@ -622,9 +627,13 @@ planned = false
 # the offline engine on the Linux host. The one arc left is the binary's
 # root, which passes the agent's host to nn-admin's logic: it leaves with
 # that logic (the root becomes the agent package's shim).
+# Then 15 → 14, nn-admin 1 → 0: `admin_cli` and the binary's logic moved
+# to nn-admin (`admin_cli`, `cli`), whose dependencies the layer gate
+# checks (nn-proto, nn-evidence, nn-core, nn-model: no nn-linux, no
+# agent); the binary's root is the agent package's shim.
 
 [ratchet]
-nn-admin = 1
+nn-admin = 0
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0

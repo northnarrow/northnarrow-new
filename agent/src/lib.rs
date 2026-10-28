@@ -11,7 +11,9 @@
 //! The on-host LLM advisor of Tappa 6 (ADE, its RAG knowledge base and
 //! XAI explanations) was removed in Wave 4 (lab PR 214).
 
-pub mod admin_cli;
+/// R10 shim (lab PR 259; plan §4.1 rule 2, removed in R17): the operator
+/// client's library half is nn-admin's.
+pub use nn_admin::admin_cli;
 /// The operator client's tests that wire the agent's key, chains and
 /// loaders (R10, lab PR 259: from `admin_cli`'s tests).
 #[cfg(test)]

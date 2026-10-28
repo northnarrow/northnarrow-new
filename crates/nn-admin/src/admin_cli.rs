@@ -34,10 +34,9 @@ use nn_proto::admin_protocol::{
 };
 use nn_proto::admin_signed_payload::{sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
 
-use nn_admin::host::{AdminHost, Chains};
-
+use crate::agent_id::{self, AGENT_ID_LEN};
+use crate::host::{AdminHost, Chains};
 use crate::os_rng::OsRng;
-use nn_admin::agent_id::{self, AGENT_ID_LEN};
 
 // ── public outcome types ────────────────────────────────────────────
 
@@ -2137,8 +2136,9 @@ fn read_priv_key(path: &Path) -> Result<SigningKey> {
                 meta.mode() & 0o7777
             );
         }
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        let euid = unsafe { libc::geteuid() };
+        // R10 (lab PR 259): rustix's safe wrapper of geteuid(2), which has
+        // no preconditions and cannot fail (nn-admin forbids unsafe code).
+        let euid = rustix::process::geteuid().as_raw();
         if meta.uid() != euid {
             bail!(
                 "private key {} belongs to uid {}, not to this user (uid {euid})",

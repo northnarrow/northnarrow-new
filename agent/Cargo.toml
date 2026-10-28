@@ -41,8 +41,9 @@ default = []
 demo-tappa5 = ["nn-core/demo-tappa5"]
 # Exposes the nn-admin `debug --force-posture <STATE>` subcommand and
 # the agent-side handler that consumes it. Used by the integration
-# test harness; never enabled in production builds.
-debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger", "nn-linux/debug-trigger"]
+# test harness; never enabled in production builds. R10 (lab PR 259): the
+# subcommand is nn-admin's, which takes the feature.
+debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger", "nn-linux/debug-trigger", "nn-admin/debug-trigger"]
 # Gates `agent/tests/privileged_e2e.rs` — full end-to-end scenarios
 # that spawn the agent + nn-admin subprocesses and verify the
 # iptables ruleset against a live kernel. Requires root and a
@@ -84,7 +85,8 @@ nn-core = { workspace = true }
 # modules here.
 nn-linux = { workspace = true }
 # R10 (lab PR 259): the operator client's library — the `nn-admin` binary
-# of this package is its shim — and its read of the agent's identity file.
+# of this package is its shim, which passes it the agent's host
+# (`admin_host`); `admin_cli` keeps its path here.
 nn-admin = { workspace = true }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
