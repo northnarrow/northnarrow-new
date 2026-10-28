@@ -330,8 +330,9 @@ pub(crate) fn start(
         // Re-derive the signing key + agent_id for FIM the same way
         // the audit log does (re-load rather than steal the audit
         // log's clone — they're separate domains with separate Db
-        // handles). A failure here downgrades the FIM CLI surface
-        // to "scheduled for next restart" + zero-snapshot status.
+        // handles). A failure here leaves no recompute task: `fim
+        // baseline` is refused (lab PR 263: it answered success),
+        // `fim status` still serves its snapshot.
         let mut baseline_pubkey: Option<ed25519_dalek::VerifyingKey> = None;
         let baseline_db_opt = match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(
             &cli.signing_key_file,

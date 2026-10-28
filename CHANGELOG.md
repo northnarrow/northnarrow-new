@@ -545,6 +545,50 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   programs and 22 links left pinned); `upgrade-check` from `main` and back
   OK; the boots the same 204 lines but the key's line and the preflight's
   step list, the same signed rows and capability manifest.
+- `nn-admin fim baseline` was answered `Success`, and its signed audit row
+  read "success", when no baseline would be recorded (lab PR 263, found
+  by R11d's table of the admin socket's verification copies): without
+  the FIM's admin state the verb logged "recompute scheduled for next
+  agent restart", which no restart does; and on a boot that found no
+  baseline database (its open failed, or the agent key did not load) the
+  recompute task's receiver is dropped, so the request was dropped with
+  it — `trigger` returned `false`, logged as `queued=false` — while the
+  reply and the row said success. Now the recompute sender says what
+  became of a request (`Triggered::{Queued, Coalesced, Dropped}`,
+  nn-linux) and the verb answers `UnknownOperation` without the FIM's
+  state (as `fim status` and every verb without its subsystem) and
+  `ActionFailed` for a dropped request (verified, not carried out); a
+  request a recompute in flight subsumes stays a success. The rows read
+  "failure: unknown_operation" / "failure: action_failed"; nn-admin
+  prints "fim baseline: nothing was recorded: the agent verified the
+  request but has no baseline recompute task this boot (…)" for the
+  dropped request (the independent review's L-3) and "server rejected
+  operation" without the state, exit 5 both.
+- The signed `detections` read served rows it had not verified on a
+  degraded boot (lab PR 263, found by R11d's table): without the
+  detection store's state — no agent key this boot, or a status-event
+  log that did not open, which dropped the whole state — it read the
+  built-in paths (not `--detections-file`) with no key to check the rows
+  by, so the check of external audit NN-AUD-112 was skipped and any
+  well-formed line was served as a detection. `DetectionAdminState` now
+  carries the agent key's public half (`agent_key`) and the status log
+  as an `Option`: the boot builds it whenever the key loads; the read
+  takes its paths and verifies every row with `agent_key`, and is refused
+  (`UnknownOperation`, as set-status) without a state; set-status is
+  refused when the status log did not open, as before.
+- Two `rotate-keys add` requests sent at once while the one-key
+  bootstrap was armed could both pass with its one signature (lab PR
+  263, the independent review's L-4; on `main` as well): the bootstrap
+  gate is read before the verify, and was read outside any lock, so
+  both found it armed — the first added the second key, the other a
+  third. No escalation (the bootstrap key can add a key of its own and
+  co-sign), but not the one add the design allows; and an add and a
+  revoke each rewrote the admin.pub it had read, so one could lose the
+  other's line (a revoked key kept, an added one dropped). `AdminAuth`
+  (nn-linux) holds a rotation lock now, which both rotate-keys verbs
+  take before the gate, the verify, the rewrite and the reload: a
+  second add waits, then finds the key set at two and the bootstrap
+  spent (`QuorumNotMet`).
 - A tripped canary came back armed when the agent stopped between the
   trip's two rows (lab PR 260; lab PR 258's KVM run on Ubuntu 24.04:
   the e2e fixture's restart signal landed there, and
@@ -2007,6 +2051,70 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   of the self-integrity watcher, whose next round came 10 to 15 s late,
   under its 15 s stall threshold — no finding; C15 alone, three times
   on each build, was OK every time.
+- Wave 4 restructure, R11d — nn-agent: the admin socket cut into
+  `admin/*`, one verification pipeline for its signed verbs (lab PR
+  263). `admin_socket.rs` (10,134 lines) is the agent's `admin` module,
+  in the plan's layout: `admin/transport` (the bind and the accept loop,
+  the connection table, the peer's credentials and identity, the
+  framing, the loop of one connection and one request's path,
+  `serve_request`), `admin/verify` (the pipeline), `admin/audit` (the
+  signed row of each request), `admin/handlers/*` (`dispatch` and the
+  verbs, one file per family: unlock, shutdown, posture, keys, config,
+  fim, installer, response, status, canary, net, detections, and the read
+  verbs' tail) and `admin/tests`; `admin_socket` stays its path
+  (`lib.rs`, until R17). Each of the 25 signed verbs carried its own copy
+  of the verification around nn-linux's verify — the signatures
+  collected, the verify called with its quorum, roles and operation, the
+  error mapped (in two verbs by an inline copy of the mapper), the
+  signers handed to the audit row, the extra matched again; now
+  `verify::signed` alone verifies a request by its verb's rule, one table
+  of operation, quorum and roles, writes the signers for the row and
+  hands the handler a `Verified` request only it can make (the request,
+  its extra typed, the matched keys and fingerprints, the token, the
+  server's clock). The two rules that are not "n keys, each role" are the
+  table's own: rotate-keys add needs one key while the one-key bootstrap
+  is armed, the telemetry status either read role (its refusal names the
+  signer). No reply and no audit row changed: a new table test drives
+  every verb through every refusal of the verification — no challenge, a
+  replay, the challenge spent, a bad signature, an unknown key, a missing
+  role, no signature, one key twice, a time 120 s off, another install's
+  id, another verb's payload or extra, nine signatures — and through the
+  accepted and the rate-limited cases, and gives the same 478 replies and
+  rows on `main` (the two fixes above aside). The history is kept (the
+  plan's Appendix A): 19 `git mv` copies merged beside the file and
+  trimmed one region at a time, so `git blame` of the parts reaches the
+  commits that wrote their lines; for the tests, `git blame -w
+  --ignore-revs-file .git-blame-ignore-revs` (new: the tests' dedent).
+  Every `nn-admin` subcommand gives `main` 4444f20's bytes (lot 259's
+  matrix, 1,964 cases, release and lab build); the wire, chain and
+  crypto pins pass unchanged (nn-proto, `common` and the eBPF crates
+  untouched), the golden replays too (five runs); the test list is
+  `main`'s but the admin socket's 108 tests at their new path
+  (`admin::`) and 9 new (3,110 → 3,119 names). On the lab guest (Ubuntu
+  22.04), against `main` 4444f20 on the same guest, the lot's code
+  passes `test-ignored` (76 suites, 85 passed: `main`'s 85 tests, each
+  with the same outcome), `tamper-check` — `main`'s outcomes and
+  verdicts, case by case (72 of 75 OK, the same two known gaps and
+  deviation), its trusted-installer grants and signed overlay through
+  the pipeline — and `policy-check` (the signed `policy set`), and
+  `upgrade-check` from `main` passes; 41 nn-admin commands against the
+  live agent — lab PR 259's, and the verification's refusals on the real
+  socket: an unknown key, another install's id, the roles the lab key
+  lacks, `shutdown` with one key (which nn-admin refuses before sending)
+  — give the same output, exit status and signed rows from `main`'s
+  agent and the lot's, with either build of nn-admin (the telemetry's
+  counters, the times and the boot's manifest hash aside).
+  After the independent review of the pull request: the bootstrap's
+  1-of-N is tested end to end through the pipeline (armed, then spent;
+  re-armed neither by a one-key admin.pub with a valid sentinel nor
+  after the signed chain spent it; the gate's closed states), every
+  verb against keys of every other role and of the default roles, the
+  shutdown's quorum is the watchdog's constant (`SHUTDOWN_QUORUM`) in
+  the table, the core has a test of the nonce binding, the rejection
+  table is a golden file of `cargo xtask golden`
+  (`agent/tests/golden/admin/expected`, `docs/validation/
+  GOLDEN_REPLAY.md` §7), and no test reads or removes the host's
+  bootstrap files any more.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

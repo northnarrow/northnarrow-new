@@ -1,4 +1,4 @@
-# Golden replays: the decision engine (lab PR 228), the posture and the COMBAT ladder (lab PR 243)
+# Golden replays: the decision engine (lab PR 228), the posture and the COMBAT ladder (lab PR 243), the admin socket's verification (lab PR 263)
 
 What the decision path answers to a recorded event stream, kept as a
 committed file and checked byte for byte on every `cargo test`: a change of a
@@ -403,3 +403,37 @@ request says why each transition, step or row moved. A case is a
 `stuck`, `deleted`), `files`, `entropy`, `isolation`, `release`,
 `rule_policy` (lab PR 249: the lines of the case's per-rule policy), and
 `items`. Pids are above `PID_MAX_LIMIT`, like §3's.
+
+## 7. The admin socket's verification (lab PR 263)
+
+What the agent's admin socket answers, and signs in its audit log, to
+every signed verb refused for each reason its verification has, accepted,
+and rate-limited — committed files, checked byte for byte on every `cargo
+test` (lab PR 263's review, L-2). A change of a reply or of an audit row
+(the verification's order, a verb's quorum or roles, a refusal's wire
+shape, a field of the row) is a diff of them in the pull request that
+makes it.
+
+- Harness: `agent/src/admin/pipeline_tests.rs` (tests of the agent
+  library), through `transport::serve_request` — the code a connection
+  runs for each frame — on an agent of its own per case.
+- Golden files: `agent/tests/golden/admin/expected/rejections.txt` (the
+  25 signed verbs × the 14 reasons, 353 lines with the requests that spend
+  a challenge), `accepted.txt` (25) and `rate-limited.txt` (100: each
+  verb's connection, its two counted failures, the third answered
+  `RateLimited`, and a request after it).
+- A line: `<verb> | <case> | reply <the reply> | row op=… result=…
+  key_fp=… cosigners=… client=… extra=…`.
+- Masked, as `<now>`: the server's clock (`server_ts`) and a payload's own
+  time in a row (`signed_ts`); and the telemetry status an accepted request
+  gets (`<the agent's counters>`: process-wide counters the crate's other
+  tests move, and that their own tests read). Nothing else of the host is
+  read: admin.pub, the audit log, the shutdown marker, the read verbs' files
+  and the bootstrap gate's files are in the case's directory, and the keys
+  are fixed seeds.
+- Beside the table, not in it: the one-key bootstrap, the keys of every
+  other role, the shutdown's quorum and the rotation lock, which tests of
+  their own assert.
+- Updating: as §5 — `cargo xtask golden --update`, `git diff --
+  agent/tests/golden/admin/expected` read line by line, and the pull
+  request says why each reply or row moved.

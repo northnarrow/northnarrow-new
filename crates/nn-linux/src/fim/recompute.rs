@@ -123,11 +123,28 @@ pub struct BaselineRecomputeSender {
     inner: mpsc::Sender<RecomputeRequest>,
 }
 
+/// What became of a recompute request. Lab PR 263 (R11d): a dropped
+/// request and a coalesced one were both `false`, and the admin verb
+/// answered both as done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Triggered {
+    /// Queued for the recompute task.
+    Queued,
+    /// The channel is full — a recompute in flight and one queued, which
+    /// this request joins.
+    Coalesced,
+    /// No recompute task takes requests: the boot found no baseline
+    /// database (it dropped the receiver), or the task has ended. The
+    /// request is dropped; no baseline will be recorded for it.
+    Dropped,
+}
+
 impl BaselineRecomputeSender {
-    /// Non-blocking fire. Returns `true` if the request was
-    /// queued; `false` if the channel is full (a recompute is
-    /// already in flight + one queued — semantically a coalesce).
-    pub fn trigger(&self, reason: RecomputeReason) -> bool {
+    /// Non-blocking fire: [`Triggered::Queued`] if the request was queued,
+    /// [`Triggered::Coalesced`] if the channel is full (a recompute is
+    /// already in flight + one queued), [`Triggered::Dropped`] if no task
+    /// receives.
+    pub fn trigger(&self, reason: RecomputeReason) -> Triggered {
         let req = RecomputeRequest {
             reason,
             requested_at_unix: SystemTime::now()
@@ -136,21 +153,21 @@ impl BaselineRecomputeSender {
                 .unwrap_or(0),
         };
         match self.inner.try_send(req) {
-            Ok(()) => true,
+            Ok(()) => Triggered::Queued,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::info!(
                     ?reason,
                     "fim recompute: channel full — request coalesced \
                      (an in-flight recompute will subsume it)"
                 );
-                false
+                Triggered::Coalesced
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!(
                     ?reason,
                     "fim recompute: channel closed (recompute task exited) — request dropped"
                 );
-                false
+                Triggered::Dropped
             }
         }
     }
@@ -247,20 +264,37 @@ pub async fn run_recompute_task<F>(
 mod tests {
     use super::*;
 
-    /// C7 #6: `trigger` returns true while the channel has room,
-    /// then false once full (coalescing behaviour). Confirms the
-    /// non-blocking contract from the doc-comment.
+    /// C7 #6: `trigger` queues while the channel has room, then
+    /// coalesces once full. Confirms the non-blocking contract from the
+    /// doc-comment.
     #[tokio::test]
     async fn trigger_coalesces_when_channel_full() {
         let chan = BaselineRecomputeChannel::new();
         let sender = chan.sender();
         // CAP recompute requests fit; the (CAP+1)th coalesces.
         for _ in 0..RECOMPUTE_CHANNEL_CAPACITY {
-            assert!(sender.trigger(RecomputeReason::AdminRequest));
+            assert_eq!(
+                sender.trigger(RecomputeReason::AdminRequest),
+                Triggered::Queued
+            );
         }
-        assert!(
-            !sender.trigger(RecomputeReason::AdminRequest),
+        assert_eq!(
+            sender.trigger(RecomputeReason::AdminRequest),
+            Triggered::Coalesced,
             "(CAP+1)th trigger must coalesce when no receiver drains"
+        );
+    }
+
+    /// Lab PR 263: with no receiver — a boot without a baseline
+    /// database drops it — a request is dropped, and says so.
+    #[test]
+    fn trigger_without_a_receiver_is_dropped() {
+        let mut chan = BaselineRecomputeChannel::new();
+        let sender = chan.sender();
+        drop(chan.take_receiver());
+        assert_eq!(
+            sender.trigger(RecomputeReason::AdminRequest),
+            Triggered::Dropped
         );
     }
 

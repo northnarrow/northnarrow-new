@@ -19,6 +19,9 @@ extern crate self as northnarrow_agent;
 /// R10 shim (lab PR 259; plan §4.1 rule 2, removed in R17): the operator
 /// client's library half is nn-admin's.
 pub use nn_admin::admin_cli;
+/// The admin socket: its transport, the verification of a signed
+/// request, the audit row and the verbs (R11d, lab PR 263).
+pub mod admin;
 /// The operator client's tests that wire the agent's key, chains and
 /// loaders (R10, lab PR 259: from `admin_cli`'s tests).
 #[cfg(test)]
@@ -26,7 +29,9 @@ mod admin_cli_tests;
 /// nn-admin on the agent's host: the agent's [`nn_admin::host::AdminHost`]
 /// (R10, lab PR 259), which the `nn-admin` binary passes to nn-admin.
 pub mod admin_host;
-pub mod admin_socket;
+/// R11d shim (lab PR 263; plan §4.1 rule 2, removed in R17): the admin
+/// socket's old path, `admin_socket.rs` before its split.
+pub use admin as admin_socket;
 /// R09a shim (lab PR 253; plan §4.1 rule 2, removed in R17): the agent's
 /// identity on disk is nn-linux's.
 pub use nn_linux::agent_id;

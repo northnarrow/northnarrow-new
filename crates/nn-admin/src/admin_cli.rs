@@ -1297,7 +1297,9 @@ pub fn load_audit_pubkey<H: AdminHost>(
 /// Outcome of `nn-admin fim baseline`. Mirrors
 /// [`ForcePostureOutcome`] (same 1-of-N quorum shape +
 /// AdminResult mapping); kept as a separate enum so the
-/// binary can render distinct human messages.
+/// binary can render distinct human messages. Lab PR 263:
+/// `ActionFailed` — the agent verified the request and recorded
+/// nothing (it has no baseline recompute task this boot).
 #[derive(Debug)]
 pub enum FimBaselineOutcome {
     Success,
@@ -1310,6 +1312,7 @@ pub enum FimBaselineOutcome {
     AgentIdMismatch,
     UnknownOperation,
     ProtocolVersionUnsupported { server_version: u16 },
+    ActionFailed,
 }
 
 /// Outcome of `nn-admin fim report`. Success carries the
@@ -1364,8 +1367,8 @@ fn map_admin_result_to_baseline(r: nn_proto::admin_protocol::AdminResult) -> Fim
         AdminResult::ProtocolVersionUnsupported { server_version } => {
             FimBaselineOutcome::ProtocolVersionUnsupported { server_version }
         }
-        // Lab PR 217: no reply of this operation; out of spec.
-        AdminResult::ActionFailed => FimBaselineOutcome::UnknownOperation,
+        // Lab PR 263: verified, not carried out (no recompute task this boot).
+        AdminResult::ActionFailed => FimBaselineOutcome::ActionFailed,
     }
 }
 
@@ -3502,6 +3505,38 @@ mod tests {
                 }
                 other => panic!("{result:?}/{released}: expected ReleaseFailed, got {other:?}"),
             }
+            server.join().unwrap();
+        }
+    }
+
+    /// Lab PR 263: `fim baseline` tells the agent's two refusals apart —
+    /// `ActionFailed` (verified, nothing recorded: no recompute task this
+    /// boot) is its own outcome, `UnknownOperation` (the agent without the
+    /// FIM's state) stays a rejection; `Success` is a success.
+    #[test]
+    fn cli_fim_baseline_tells_nothing_recorded_from_rejected() {
+        for (result, want) in [
+            (AdminResult::ActionFailed, "ActionFailed"),
+            (AdminResult::UnknownOperation, "UnknownOperation"),
+            (AdminResult::Success, "Success"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let socket = dir.path().join("admin.sock");
+            let priv_path = dir.path().join("admin.key");
+            write_priv_key_file(&priv_path, &SigningKey::generate(&mut OsRng));
+            let agent_id_path = write_agent_id_file(&dir, &[0x42u8; 16]);
+            let server = spawn_mock_server(&socket, move |stream| {
+                let _ = server_read_frame(stream);
+                server_write_frame(
+                    stream,
+                    &AdminMessage::Challenge(Challenge { nonce: [0u8; 32] }),
+                );
+                let _ = server_read_frame(stream);
+                server_write_frame(stream, &AdminMessage::FimBaselineResult(result));
+            });
+            let outcome =
+                run_fim_baseline(&socket, &priv_path, &agent_id_path).expect("fim baseline");
+            assert_eq!(format!("{outcome:?}"), want, "{result:?}");
             server.join().unwrap();
         }
     }

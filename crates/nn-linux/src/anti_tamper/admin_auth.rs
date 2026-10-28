@@ -211,6 +211,9 @@ pub struct AdminAuth {
     /// audit chain shows a `rotate_keys_add`, or this run added one): the
     /// 1-of-N bootstrap relaxation never applies again.
     bootstrap_consumed: std::sync::atomic::AtomicBool,
+    /// Lab PR 263's review (L-4): one rotation of `admin.pub` at a time
+    /// ([`Self::rotation_lock`]).
+    rotation: parking_lot::Mutex<()>,
 }
 
 impl AdminAuth {
@@ -377,6 +380,7 @@ impl AdminAuth {
             loaded_admin_pub: RwLock::new(Vec::new()),
             skipped_lines: RwLock::new(Vec::new()),
             bootstrap_consumed: std::sync::atomic::AtomicBool::new(false),
+            rotation: parking_lot::Mutex::new(()),
         }
     }
 
@@ -396,6 +400,16 @@ impl AdminAuth {
     /// signed audit chain, and after a second key is added.
     pub fn mark_bootstrap_consumed(&self) {
         self.bootstrap_consumed.store(true, Ordering::SeqCst);
+    }
+
+    /// Lab PR 263's review (L-4): one rotation of `admin.pub` at a time.
+    /// The admin socket holds it for a `rotate-keys add` or `revoke` from
+    /// its first look at the key set (the bootstrap gate, the verify) to
+    /// the reload: two concurrent adds could each find the one-key
+    /// bootstrap armed and pass with one signature, and two rewrites of
+    /// the file could each lose the other's line.
+    pub fn rotation_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.rotation.lock()
     }
 
     /// Verify `signature` over `nonce` — the challenge one connection
@@ -2980,6 +2994,51 @@ mod tests {
             ),
             Err(AdminAuthError::UnknownOperation { .. })
         ));
+    }
+
+    /// Lab PR 263's review (L-1): a payload signed over another
+    /// connection's challenge is refused on this one — `NonceMismatch`,
+    /// counted, the challenge spent — though both signatures are valid and
+    /// every other binding holds; on the connection that issued its nonce
+    /// it verifies. No test of the core reached the nonce check before.
+    #[test]
+    fn verify_signed_payload_quorum_rejects_another_challenges_nonce() {
+        use nn_proto::admin_signed_payload::{sign as sign_payload, OperationCode};
+        const T: u64 = 1_700_000_000;
+        let agent_id = [0x5c; 16];
+        let (auth, sks) = shutdown_pair(agent_id);
+        let conn = ConnAuth::new(&auth);
+        let other = ConnAuth::new(&auth);
+        let held = conn.issue_challenge().unwrap();
+        let foreign = other.issue_challenge().unwrap();
+        assert_ne!(held, foreign);
+        let payload = SignedPayload::new_shutdown(foreign, T, agent_id, 10);
+        let sigs: Vec<[u8; 64]> = sks
+            .iter()
+            .map(|sk| sign_payload(&payload, sk).unwrap())
+            .collect();
+        let verify = |conn: &ConnAuth<'_>| {
+            conn.verify_signed_payload_quorum_keys(
+                &payload,
+                &sigs,
+                2,
+                &[Role::Shutdown],
+                OperationCode::Shutdown,
+                T,
+            )
+        };
+        match verify(&conn) {
+            Err(AdminAuthError::NonceMismatch) => {}
+            other => panic!("expected NonceMismatch, got {other:?}"),
+        }
+        assert_eq!(conn.failures.get(), 1, "a nonce mismatch is counted");
+        assert!(
+            matches!(verify(&conn), Err(AdminAuthError::NoPendingChallenge)),
+            "the challenge it held is spent"
+        );
+        let verified = verify(&other).expect("on the connection that issued the nonce");
+        assert_eq!(verified.keys.len(), 2);
+        assert_eq!(other.failures.get(), 0);
     }
 
     /// External audit AUT-005: more than `MAX_SUBMITTED_SIGNATURES`

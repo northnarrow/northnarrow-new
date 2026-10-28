@@ -579,9 +579,12 @@ pub(crate) fn stores(
     // admin state for the admin socket (set-status writes here; the
     // detections read overlays current status from it). Lower-volume
     // than detections → smaller 4 MiB cap, overridable via
-    // NN_STATUS_EVENTS_CAP_BYTES. Degrade-not-fail: any error here
-    // means "no triage status changes this boot" (the `detections` read
-    // still works, showing initial Open), never an agent abort.
+    // NN_STATUS_EVENTS_CAP_BYTES. Degrade-not-fail: a status log that
+    // does not open means "no triage status changes this boot" (the
+    // `detections` read still works, showing initial Open, its rows
+    // verified with the agent key); without the agent key there is no
+    // state, and the read is refused too (lab PR 263: it served the
+    // built-in paths' rows unverified), never an agent abort.
     let detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>> = {
         let cap_bytes = northnarrow_agent::chainlog::cap_from_env(
             northnarrow_agent::chainlog::STATUS_EVENTS_CAP_ENV,
@@ -593,32 +596,38 @@ pub(crate) fn stores(
             file_mode: northnarrow_agent::chainlog::STATE_LOG_FILE_MODE,
         };
         match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
-            Ok(key) => match northnarrow_agent::detection_store::open_status_log(
-                &cli.status_events_file,
-                key,
-                status_rotation,
-                rotation_protection.clone(),
-            ) {
-                Ok(log) => Some(Arc::new(admin_socket::DetectionAdminState {
-                    status_log: Arc::new(parking_lot::Mutex::new(log)),
+            Ok(key) => {
+                let agent_key = key.verifying_key();
+                let status_log = match northnarrow_agent::detection_store::open_status_log(
+                    &cli.status_events_file,
+                    key,
+                    status_rotation,
+                    rotation_protection.clone(),
+                ) {
+                    Ok(log) => Some(Arc::new(parking_lot::Mutex::new(log))),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            path = %cli.status_events_file.display(),
+                            "status-event store open failed — detection triage \
+                             (set-status) DISABLED this boot"
+                        );
+                        None
+                    }
+                };
+                Some(Arc::new(admin_socket::DetectionAdminState {
+                    status_log,
+                    agent_key,
                     detections_path: cli.detections_file.clone(),
                     status_events_path: cli.status_events_file.clone(),
-                })),
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        path = %cli.status_events_file.display(),
-                        "status-event store open failed — detection triage \
-                         (set-status) DISABLED this boot"
-                    );
-                    None
-                }
-            },
+                }))
+            }
             Err(e) => {
                 warn!(
                     error = %e,
                     "status-event store needs the agent signing key — load failed; \
-                     detection triage (set-status) DISABLED this boot"
+                     detection triage (set-status) and the detections read DISABLED \
+                     this boot"
                 );
                 None
             }

@@ -162,7 +162,10 @@ enum Cmd {
     /// the verdicts compared byte for byte with agent/tests/golden/expected
     /// (the agent's `decision::golden` tests, which `cargo test` runs too);
     /// lab PR 243: and of the posture and the COMBAT ladder
-    /// (agent/tests/golden/posture, the agent's `posture::golden` tests).
+    /// (agent/tests/golden/posture, the agent's `posture::golden` tests);
+    /// lab PR 263: and the admin socket's verification table, every signed
+    /// verb's replies and audit rows (agent/tests/golden/admin, the agent's
+    /// `admin::pipeline_tests`).
     /// `--update` rewrites the golden files for review; refused under CI.
     Golden {
         /// Write the golden files from the replay instead of comparing.
