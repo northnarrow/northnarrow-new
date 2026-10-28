@@ -161,6 +161,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         identity,
         agent_id,
         overlay_gate,
+        ..
     } = identity::resolve(&cli, &mut boot, rollback_floor)?;
     let integrity::Integrity {
         exec_cfg,

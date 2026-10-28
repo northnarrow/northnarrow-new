@@ -954,6 +954,13 @@ impl Cli {
     }
 }
 
+/// Held by the tests that parse a command line (R11a, lab PR 261): its
+/// flags read the process environment, which `env_switches_read_1_and_0`
+/// sets, and in the library's test binary they run beside its other
+/// tests (in the binary's they were three).
+#[cfg(test)]
+pub(crate) static TEST_ENV: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,6 +969,7 @@ mod tests {
     /// advisor still parses — its flags are accepted, ignored and named.
     #[test]
     fn the_removed_advisor_flags_still_parse_and_are_named() {
+        let _env = TEST_ENV.lock();
         let cli = Cli::try_parse_from([
             "northnarrow-agent",
             "--no-ade",
@@ -998,6 +1006,7 @@ mod tests {
     /// on/off; anything else is refused, never read as on.
     #[test]
     fn env_switches_read_1_and_0() {
+        let _env = TEST_ENV.lock();
         const SWITCHES: &[(&str, &str)] = &[
             ("NN_NET_CONNECT_DENY", "--net-connect-deny"),
             ("NN_EXEC_POLICY_NO_ENV", "--exec-policy-no-env"),
@@ -1053,6 +1062,7 @@ mod tests {
     /// The removed flags are hidden: `--help` no longer offers them.
     #[test]
     fn the_removed_advisor_flags_are_not_in_the_help() {
+        let _env = TEST_ENV.lock();
         use clap::CommandFactory;
         let help = Cli::command().render_long_help().to_string();
         for flag in northnarrow_agent::removed_settings::REMOVED_FLAGS {

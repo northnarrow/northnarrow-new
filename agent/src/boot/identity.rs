@@ -9,7 +9,11 @@ use northnarrow_agent::boot::{BootSequence, BootStep};
 
 use super::cli::Cli;
 
-/// What [`resolve`] read.
+/// What [`resolve`] read. Only [`resolve`] builds one (`_once` is private
+/// to this module), `run` calls it once and it is the start's one caller
+/// of `agent_id::resolve` (the start's tests hold both): the phases after
+/// it take the agent's id from this value (MAIN-009; R11a, lab PR 261:
+/// the plan's "Identity si costruisce una volta sola").
 pub(crate) struct Identity {
     /// The agent's identity, read once (MAIN-009).
     pub(crate) identity: agent_id::AgentIdentity,
@@ -17,6 +21,7 @@ pub(crate) struct Identity {
     pub(crate) agent_id: [u8; 16],
     /// The operators' signed overlays, verified against that id.
     pub(crate) overlay_gate: Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    _once: (),
 }
 
 /// The agent's identity, read once (MAIN-009), and the signed overlays'
@@ -57,5 +62,55 @@ pub(crate) fn resolve(
         identity,
         agent_id,
         overlay_gate,
+        _once: (),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+    use northnarrow_agent::agent_id::IdentitySource;
+    use northnarrow_agent::config::overlay_floor::RollbackFloor;
+
+    use super::*;
+
+    fn cli(dir: &Path) -> Cli {
+        let _env = super::super::cli::TEST_ENV.lock();
+        let arg = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        Cli::try_parse_from([
+            "northnarrow-agent".to_string(),
+            "--agent-id-file".to_string(),
+            arg("agent_id"),
+            "--admin-pub".to_string(),
+            arg("admin.pub"),
+        ])
+        .expect("a command line with the test's paths")
+    }
+
+    /// The identity phase (R11a, lab PR 261): a first start mints the id
+    /// and writes it, and every value the phase gives — the identity, the
+    /// id the later phases take — is that file's; the next start reads the
+    /// same id back. The step is recorded in the boot sequence.
+    #[test]
+    fn the_phase_reads_the_identity_and_gives_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = cli(dir.path());
+        let floor = || RollbackFloor::scan(&dir.path().join("audit.log"), &dir.path().join("key"));
+
+        let mut boot = BootSequence::new();
+        let first = resolve(&cli, &mut boot, floor()).expect("the identity phase");
+        assert!(boot.has_done(BootStep::Identity));
+        assert!(matches!(first.identity.source, IdentitySource::Minted));
+        assert_eq!(first.agent_id, first.identity.id);
+        let on_disk = std::fs::read_to_string(dir.path().join("agent_id")).unwrap();
+        assert_eq!(on_disk, format!("{}\n", hex::encode(first.agent_id)));
+
+        let mut boot = BootSequence::new();
+        let again = resolve(&cli, &mut boot, floor()).expect("the identity phase");
+        assert!(matches!(again.identity.source, IdentitySource::Loaded));
+        assert_eq!(again.agent_id, first.agent_id);
+        assert_eq!(again.identity.id, first.agent_id);
+    }
 }
