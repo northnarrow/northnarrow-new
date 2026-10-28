@@ -300,8 +300,10 @@ pub mod sensors;
 // 257; was the agent's `systemd_state`).
 pub mod systemd_state;
 
-// The telemetry probe's piece the file-open sensor names (R09b, lab PR
-// 254; cut from the agent's `telemetry_probe`, R09c's).
+// The continuous telemetry probe: one known exec, file open and DNS
+// datagram a round, each checked against its sensor's pipeline (Tappa
+// 10.8; R09c, lab PR 257; was the agent's `telemetry_probe`, whose probe
+// files' directory, which the file-open sensor names, came first, R09b).
 pub mod telemetry_probe;
 
 // The system directories' binaries, never `$PATH` (R09a; was the agent's

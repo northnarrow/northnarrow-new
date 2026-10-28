@@ -191,7 +191,8 @@ pub mod shutdown_marker;
 /// R09c shim: what systemd reports the host as, over its private socket,
 /// is nn-linux's.
 pub use nn_linux::systemd_state;
-pub mod telemetry_probe;
+/// R09c shim: the continuous telemetry probe is nn-linux's.
+pub use nn_linux::telemetry_probe;
 /// R09a shim: the system directories' binaries are nn-linux's.
 pub use nn_linux::trusted_bin;
 pub mod upgrade_rollback;
