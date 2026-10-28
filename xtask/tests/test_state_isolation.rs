@@ -52,7 +52,9 @@ const HELPER: &str = "agent/tests/common/agent_state.rs";
 const COMMON: &str = "agent/tests/common/mod.rs";
 const WATCHDOG_SUITE: &str = "watchdog/tests/privileged_e2e.rs";
 const AGENT_MAIN: &str = "agent/src/main.rs";
-const NN_ADMIN_MAIN: &str = "agent/src/bin/nn_admin.rs";
+// R10 (lab PR 259): nn-admin's command line is nn-admin's (`cli`); the
+// agent package's `bin/nn_admin.rs` is the shim that runs it.
+const NN_ADMIN_MAIN: &str = "crates/nn-admin/src/cli.rs";
 const WATCHDOG_CLI: &str = "watchdog/src/lib.rs";
 const TEST_TREES: &[&str] = &["agent/tests", "watchdog/tests"];
 

@@ -2561,3 +2561,120 @@ only in the table below, in the same PR as the evidence.
     spawning child holds the copy while the deploy reads
     `/proc/net/tcp` (not seen failing).
   - Lab: Host only (the tests are host unit tests; no guest), WSL2 Ubuntu 24.04 (6.18.33.2-microsoft-standard-WSL2, 24 logical CPUs, 23 GiB), `CARGO_BUILD_JOBS=4`. Every loop under the same load: the workspace suite (`cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast`) back to back beside it, all of it started under `nohup` (whose ignored SIGHUP fails xtask's `the_aws_fixture_puts_back_what_it_found` in each of those background runs — the harness's; it passes in a plain shell and in the gates below). Before on `main` 48228ad, after on the lot's tree, the same two batches: batch 1, side by side, `cargo test -q -p nn-linux --lib --locked` 50 times, `-p northnarrow-watchdog --lib` 300 times and `-p northnarrow-agent --lib` 50 times: the quarantine test 0/50 → 0/50 failed, the sd_notify test 7/300 → 0/300 (the stale-socket test 2/300 → 0/300), the fanotify test 1/50 → 0/50; batch 2, side by side, `cargo test -q -p nn-linux --lib --locked -- combat::actuator response::quarantine` 200 times, `-p northnarrow-agent --lib --locked -- cow::` 1,000 times and `-p northnarrow-watchdog --lib --locked` 1,000 times: the quarantine test 161/200 → 0/200 (each failure `[]`, the note taken), the fanotify test 47/1,000 → 0/1,000, the sd_notify test 19/1,000 → 0/1,000 (the stale-socket test 3/1,000 → 0/1,000). No other test failed in those loops but the pidfd budget (0 → 4 of batch 1's 300 watchdog runs, 0 → 0 in batch 2). On `main` c0aa0c3, before lot 257 merged: batch 1 3/300 (sd_notify) and 2/50 (fanotify), the quarantine test 0/50, and 0/50 at `--test-threads=128`; the fanotify test alone (`cargo test -p northnarrow-agent --lib cow::fanotify::tests::own_threads_and_tgid`) 0/1,000; the watchdog's lib 18/1,000 (the stale-socket test 2, the pidfd budget 1). Diagnostics, the tests' reads in a loop of their own: 1,000,000 spawns and joins of a thread, half in each order — the thread still listed right after `join` 496 times and the assertion false 355 times in the test's old order, 53 and 0 with the `status` read first (200,000 more, the same halves: 90 and 62, 15 and 0); 3,000 abstract datagram sockets closed while four threads spawn `/bin/true`: 13 datagrams taken after the close, none after `shutdown` (21 `EPIPE`, 2,979 `ECONNREFUSED`); 3,000 stream sockets the same: 228 connections taken, none after `shutdown` (3,000 `ECONNREFUSED`). The new quarantine test with every vault under one key, as `main`'s one list: fails 5 of 5 runs (the other vault's executor takes the note). Host, on cf5e4e2b (the lot's code and documentation; this line is all that changed after it), in a plain shell, `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo xtask build-ebpf --release` (the stamp's source 235e2fed…, `main`'s: `common` and the eBPF crates untouched); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --all -- --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` three times, each 71 suites, 3,084 passed, 0 failed, 15 ignored (`main` 48228ad: 3,083, the new quarantine test the one more); `cargo xtask golden` (11 passed); `cargo +1.89.0 check --workspace --all-targets --locked`: all pass.
+- **Lab PR 259 — nn-admin: the operator client leaves the agent (Wave 4
+  Phase 2, R10 of the restructure plan; no level changes).**
+  - What was wrong: nn-admin, the operator client's crate (R01, lab PR
+    239), was empty. The `nn-admin` binary's code was the agent's:
+    `admin_cli` (the library half) and the logic of `bin/nn_admin.rs`
+    (the dispatcher), which named the agent's library for the rest, so
+    the operator client was built on the agent's whole crate graph
+    (aya, tokio, procfs, the eBPF embed). Ratchet 21: nn-admin 7 —
+    `admin_cli` → `agent_id`, `chains`, `os_rng`; `nn_admin.rs` →
+    `agent_id`, `anti_tamper` (the trusted-installer window's ceiling,
+    the role list's parse), `chains`, `host_hardening` — and nn-core
+    14. Under the count, through paths the map gives allowed crates,
+    nn-admin also named what is still nn-linux's or the agent's: the
+    agent key's files (nn-linux's `keys`, under the agent's `audit`),
+    the overlay gate and its rollback floor and the loaders' checks of
+    an overlay (`config`, the agent's until R04b), the offline engine
+    on the Linux host (`decision::replay`), the shipped COMBAT defaults.
+    Lab PR 239 left "nn-admin → nn-linux for the host checks" to R10.
+  - The decision: no nn-admin → nn-linux arc. The plan draws nn-admin
+    beside nn-linux, both below the agent (§2.1), and says that after
+    R10 nn-admin needs "nn-proto, nn-evidence, nn-core and the host
+    checks" (§2.2); the module map's rule for it (lab PR 239) has no
+    nn-linux, and no lot has loosened a rule. A seam was needed in any
+    case: what nn-admin reads of the agent itself — the list of its
+    chains (the payloads are the agent's and nn-linux's), the gate and
+    its floor, the loaders' checks — cannot be reached through nn-linux
+    either (nn-admin cannot depend on the agent: the agent package
+    carries the binary, a package cycle). An arc to nn-linux would only
+    have shrunk that seam, at the price of the layering and of a library
+    that builds aya, tokio, procfs and the eBPF embed for an operator
+    client (and a `chain verify` that cannot be built off Linux). So
+    the host checks come through the composition: the agent binds
+    nn-admin to its host as it binds nn-core's generics to `LinuxHost`.
+    nn-admin is not a pure crate (a Unix socket, `std::os::unix`, libc's
+    open flags), and stays out of `portable-core`.
+  - What changed, one commit each, bottom-up (§4.1 rule 3): the
+    trusted-installer window's ceiling (`MAX_TRUSTED_INSTALLER_WINDOW_SECS`,
+    what the agent clamps a grant to and nn-admin clamps `--window-secs`
+    to) cut verbatim to nn-core's `anti_tamper::trusted_installer`,
+    beside the window's vocabulary R08b put there, nn-linux's module
+    re-exporting it; nn-admin's `--new-roles` names nn-proto's
+    `admin_quorum::parse_role_list`, which nn-linux's `admin_auth` wraps
+    (the same text). nn-admin's read of the identity file
+    (`agent_id::load_existing`, MAIN-010: nn-admin was its one caller)
+    moved from nn-linux to nn-admin's own `agent_id`, the all-zero rule
+    both reads take (MAIN-009) cut from nn-linux's `agent_id::parse` to
+    nn-proto's `shutdown_marker::parse_minted_agent_id`, beside the
+    format's parse the watchdog uses (a `String` error, the text the
+    same); the two tests of nn-linux's `agent_id` that read both reads
+    cut verbatim into the agent's `agent_id_tests.rs`. The OS CSPRNG
+    (`os_rng`, lab PR 234) moved from nn-linux to nn-evidence (`git mv`,
+    100 %), below nn-linux and nn-admin (`init`'s keys, the offline
+    overlay signature's nonce): rand's portable `SysRng`, no OS crate
+    named, the pure crates' rules and `portable-core`'s five targets
+    hold; nn-linux re-exports it. The overlay signature file
+    (`OverlaySignature`, its hex helpers, `SIG_SUFFIX`, `sig_path`) and
+    the gate's `Decision` cut verbatim to nn-core's
+    `config::overlay_auth`, beside the verified content R07 put there,
+    the agent's module re-exporting them (unhex's `% 2 != 0` reads
+    `is_multiple_of`, the workspace lints). Then the twelve tests of
+    `admin_cli` that wire the agent's key, its audit log, its chains and
+    its loaders cut verbatim into the agent's `admin_cli_tests.rs`, with
+    a copy of the key-file helper they share (`read_overlay_for_signing`,
+    which one calls, is public). Then the seam: `nn_admin::host::AdminHost`
+    — the host's hardening checks (`HostChecks`), the agent key's files
+    (the published public half, its path, the private key's parse), the
+    agent's chains and where they lie under its state directory
+    (`Chains`, implemented by the agent's `ChainPaths`; the layout
+    `chain verify` built moved verbatim into the agent's implementation),
+    the overlay gate and its floor (`OverlayGate`, `RollbackFloor`,
+    implemented by the agent's types), the loaders' checks, the shipped
+    defaults, the offline engine — each method the call the code made
+    before, in the same place and order, implemented by the agent's
+    `admin_host::AgentAdminHost`; `admin_cli`'s five functions that made
+    them take the host or the chains, the dispatcher is generic over
+    the host. Then the move (`git mv`): `admin_cli` 99 %, the
+    dispatcher to nn-admin's `cli` 99 % (a rename with `git diff -B`:
+    the binary's root stays, the shim `nn_admin::main(&AgentAdminHost)`).
+    The moved files change only where the crate boundary needs it: the
+    paths the binary named the agent's library by read `crate::`, the
+    shadowed printing macros name `cli::emit`, `read_priv_key`'s owner
+    check reads the effective uid through rustix's safe `geteuid`
+    (nn-admin forbids unsafe code; the `process` feature the workspace
+    already builds), the moved docs' links. The clap help texts, two of
+    which name the agent's old paths, are unchanged. nn-admin takes the
+    dependencies the code had, the same versions and features, and
+    declares `debug-trigger`, which the agent forwards (§4.1 rule 4);
+    the agent keeps `admin_cli`'s path (`pub use nn_admin::admin_cli`,
+    removed in R17). xtask's `test_state_isolation.rs` reads nn-admin's
+    flags from its `cli`. Tests: 44 moved with their code and run in
+    nn-admin (`admin_cli`'s 26, the dispatcher's 18), 14 at a new path
+    in the agent; none added or removed. Ratchet 21 → 14: nn-admin 7 →
+    0 (the arcs to `anti_tamper` by the cut and nn-proto's parse, to
+    `agent_id` and `os_rng` by the moves, to `chains` and
+    `host_hardening` by the seam; the binary's root is the agent's
+    composition now), nn-core 14.
+  - Deviations from the plan: the shim takes the agent's host
+    (`nn_admin::main(&AgentAdminHost)`, not `nn_admin::main()`): the
+    host checks and the agent's parts come through the composition.
+    More moved than R10's list: nn-admin's identity read (from
+    nn-linux) and the OS CSPRNG (to nn-evidence); cut ahead: the
+    window's ceiling, the all-zero rule, the overlay signature file and
+    the gate's decision. The layout of the chains under the state
+    directory is the agent's implementation's now (it names the agent's
+    files). The tests of `admin_cli` that wire the agent stay in the
+    agent. R10's follow-ups are not done here, as the plan has them:
+    the private-key fallback's removal (§3.3; it is
+    `AdminHost::verifying_key_of_signing_key` now) and the 18
+    connect/challenge sequences' dedupe.
+  - Open: those two PRs; the seam's methods that bind the agent's own
+    parts go when those parts reach a crate below nn-admin (the gate,
+    its floor and the loaders' checks with R04b and the post-plan
+    content reaching nn-core; the chain list with the payloads, R04a/R05,
+    and `detection_store`); two help texts name the agent's old paths
+    (`northnarrow_agent::audit::verify_chain`, `…verify_chain_file`):
+    output, kept in a move; the shims, until R17.
+  - Lab: On Ubuntu 24.04 (6.8.0-147, the lab guest ubuntu2404, ssh 2322, QEMU for Windows with WHPX, 4 vCPU, 7 GiB; no other guest up), its disk at 29 % (8.0 of 29 GB used). The lot's code (fa4bc061) synced, built (release, test-privileged,debug-trigger) and installed (`nn-lab.sh sync`, `build`, `install`): `test-ignored` (every `#[ignore]` test as root, single-threaded, its five runs): 76 suites, 84 passed, 0 failed — lot 256's totals, `main`'s —, the 49 starts of the tests' agents that print their chain check `result="ok"`; `policy-check`: PASS (its 9 checks: MS-23 held built in, `policy set` of `enforce NN-L-IMP-001` stored and applied at once, a policy exempting by comm refused by nn-admin before signing, the kill, the signed policy at the next boot, back to the built-in defaults) — the signed `config overlay set` of the tip's nn-admin; `tamper-check` (its signed calls the tip's nn-admin's): 72 of 75 cases OK — C27 (no lockdown on the guest) and C57c (the journal's vacuum) known gaps, C64 (lab PR 215's stale own link id) the recorded deviation. `main` 48228ad on the same guest right after, synced, built and installed the same way: `policy-check` the same 9 PASS; `tamper-check` the same 75 outcomes and verdicts, case by case (C38's PIDs aside): 72 of 75 OK, the same two gaps and the same deviation; the evidence of 6 cases differs by what landed in a case's window — the self-integrity watcher's jittered rounds (an `integrity_drift` or its clearing in C14, C19, C26, C39), the overlay rollback floor's anchor (written once 256 entries verified since the last, at `main`'s C20 boot), denials and an R011 of systemd's in `main`'s C25. `upgrade-check` from that `main` to the lot's code: `install.sh` without `--upgrade` refused; with `--upgrade` and the lab's admin key the trusted-installer window opened, the pins dropped and NorthNarrow's BPF programs unloaded, both units restarted, "UPGRADE complete — health check passed"; a new agent pid and a new `agent_boot` (audit log 5,061 → 5,068 lines), the identity the same, 36 own LSM programs before and after, no foreign one. The two nn-admin binaries, each built in the guest (main's and the tip's), against the upgraded agent, every command run main, tip, main again, as root from a root-owned directory (run from `/tmp`, where the lab's build leaves them, the agent killed them, as it must: R009_RootExecFromUserPath with R001 — a first attempt): 35 commands — `--version`, `--help`, `host-check` (and `--json`), `status` and `status --json` with and without `--key`, `capabilities` (and `--json`), `net status` (with and without `--key`, `--json`), `detections` (twice), `fim status|report`, `canary list`, `net listeners|flows|resolve`, `response status`, `verify-keys`, `audit verify`, `chain verify` (all and `--log audit`), `config overlay status`, `policy show`, `policy test` (table, JSON, without the shipped lists), and four error paths (a missing key, a missing socket, `debug force-posture`) — give the same stdout, stderr and exit status, byte for byte, but `--help`'s usage line, which names the binary (`nn-admin-main`, `nn-admin-tip`): the same bytes when both run under the same name. Every boot of the installed agent on that guest — the lot's, `main`'s, the upgraded one: 19 — verified its own binary, the watchdog, nn-admin, the scanner and the embedded eBPF object against the install manifest ("binary integrity verified", `checked=5`, provenance `source-tree`) and signed one capability manifest, the same but its time and hashes (BTF 116 offsets resolved, 5 drifted, none absent; BPF LSM active; 19 of 19 deny hooks; the deny self-test denied; the BPF guard observing; no degradation). Each boot's chain check flags the guest's detections log — lab PR 256's class, lines signed by another key (324 → 288 of the 5,212 → 5,140 lines checked, leaving the 4 MiB window: the e2e fixtures' agents of the lots before lab PR 256 wrote them; none added by this run) — on `main`'s boots as on the tip's. The guest powered off after. Host, on fa4bc061 (the lot's code) and again on the final tree (the documentation commit; this line is all that changed after that run), `set -o pipefail`, `CARGO_BUILD_JOBS=6`: `cargo xtask build-ebpf --release` (the stamp's source 235e2fed…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 71 suites, 3,083 passed, 0 failed, 15 ignored (`main`'s totals); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` five times, each a process of its own: 11 tests passed each time, the 33 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed by the build); `portable-core`'s `cargo check` of the pure crates for its five targets (nn-evidence with `os_rng`'s rand); every one of the lot's commits checked (`cargo check` of the workspace and of the agent with the privileged features, `fmt`, clippy, the module map, path liveness, layer and state-isolation tests): all pass. The pins pass unchanged, by name: `encoded_frames_are_pinned`, `chain_format_pin` (5, its generator ignored), `chain_format_clock` (2), `crypto_vectors` (19: nn-parse 1, nn-proto 2, the agent 3, nn-linux 13), the TLS and DNS parser pins (5), the overlay-v1 fixture (2), the per-rule policy's format (its 12 tests, nn-core's; the exemption facts' 2, nn-linux's; the signed overlay's and the fuzz seeds' tests). The output matrix: 1,964 cases (every help text and nested one, clap's errors, `init`, `verify-keys`, `host-check`, `audit read|verify`, `chain verify` on chain-pin-v1's log and every class of lab PR 256, `config overlay status|sign|set`, `policy show|set|test` — the 24 golden cases and their 205 events as two streams, plain and wrapped, under the built-in defaults, the three golden candidates and one refused (it exempts uid 0), with the shipped lists and with none, as a table and as JSON: 520, and 16 error cases —, every socket verb against a mock agent with its success replies, the ten refusals and six transport faults and no socket: 647, the key and identity errors through every verb, closed pipes, the default paths), each with fixed fixtures (keys from constant seeds, chain-pin-v1's log and key, chains written by `main`'s chain code) in the same directory, under the same binary path and environment: `main`'s release binary and the tip's give the same stdout, stderr, exit status, files written and requests sent in 1,964 of 1,964 cases, `main`'s lab build and the tip's in 1,964 of 1,964 (`main`'s twice: 1,964 of 1,964); normalised alike on both sides, only after the value is checked: `init`'s fresh key, `config overlay sign`'s nonce and time, a floor reset now, `policy test`'s temporary `/proc`, the mock's view of nonces, times and signatures. Identity against `main` 48228ad, both built in one temporary checkout (the same path: the eBPF object carries its sources' absolute paths, and two checkouts gave two objects that differ in those strings only), the release job's commands (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`; unstripped: the same flags, `CARGO_PROFILE_RELEASE_STRIP=none`): the eBPF object is byte-identical (sha256 084ee12e… there), its stamp too (source 235e2fed…); the scanner (401,384 bytes) and the watchdog (2,337,064) are byte-identical, stripped and unstripped; `mk-tarball.sh`: the same 72 entries, paths and modes, the scanner's and the watchdog's SBOMs the same components and edges, the agent's lists nn-admin (146 components, was 145); `mk-packages.sh` (.deb): the same 79 paths and modes; `posture_demo` the same 29 lines; the test list is `main`'s — 3,098 names, every one found, 44 now nn-admin's (0 → 44: admin_cli's 26, the dispatcher's 18), 32 at a new path (admin_cli's 12 and agent_id's 2 in the agent, the dispatcher's 18 under nn-admin's `cli`), the agent's library 528 → 504, nn-linux 747 → 743, nn-evidence 119 → 121; no test added or removed, no `#[ignore]` added. The agent (15,297,832 → 15,298,288 bytes) and nn-admin (4,160,520 → 4,218,272) are not byte-identical. Function by function (unstripped, demangled names mapped to the new crates and modules, addresses and rip-relative targets dropped, trailing padding dropped): the agent 7,007 of 7,030 the same code (23 differ, 4 and 4 unpaired), nn-admin 2,991 of 3,170 (179; 15 and 21). Of the agent's 23: 9 by the `TypeId` constants of its types (clap's `try_remove_one::<T>` of its enums and its `Cli`'s parse: the agent crate's dependencies changed, so did its types' ids), 9 call a body of the same code under another name or lay out a frame otherwise (the overlay gate's read calls nn-core's `sig_path`, out of line now), 3 names with another count of bodies, 2 scheduled otherwise; the unpaired are which of identical bodies keeps the name, and `sig_path`: `.text` −48 bytes. Of nn-admin's 179: 127 names with another count of bodies — generic code instantiated both in nn-admin's library and in the binary's crate, where the dispatcher, generic over the host, is monomorphized (`Debug` of the admin messages, serde's deserializers) —, 33 call other callees (inlining at the new crate boundary; `read_priv_key` calls rustix's `geteuid` where it called libc's), 14 scheduled otherwise, 5 other operands; the unpaired are code inlined on one side only (`audit_read_into` into `run_audit_read` and the response verbs into the dispatcher on the tip; `run_init`, `print_capabilities`, `sig_path` out of line there), the seam's methods kept out of line (`chains`, `to_json_pretty`, `Chains::targets`) and the shim's `main`: `.text` +42,144 bytes (+1.26 %). `.rodata`, cut at every address the code, a relocation or a pointer of `.data.rel.ro` names: the same text but the moved files' paths (`agent/src/admin_cli.rs`, `agent/src/bin/nn_admin.rs`, `crates/nn-linux/src/os_rng.rs`), the callsite lines (`event <file>:<line>`) of the three edited files (the agent's `config/overlay_auth.rs`, nn-linux's `agent_id.rs` and `anti_tamper/trusted_installer.rs`), the all-zero id's message (a `String` from nn-proto's literal) and literals grouped otherwise. The documentation commit builds the same four binaries as the code commit, byte for byte (stripped and unstripped, the lab build of nn-admin too), and the same eBPF object and stamp: every edited source file kept its line count. `cargo doc --workspace --no-deps`: no warning the tree did not have; three fewer (the nn-admin binary's own: its dispatcher is a private module of nn-admin now).

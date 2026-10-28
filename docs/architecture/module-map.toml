@@ -96,7 +96,7 @@ allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidenc
 planned = true
 
 [crates.nn-admin]
-about = "the operator client's library; the nn-admin binary stays a shim of the agent package (R10)"
+about = "the operator client (R10, lab PR 259: admin_cli and the command line, from the agent): what it reads of the Linux host and of the agent goes through its `host::AdminHost`, which the agent implements — no arc to nn-linux, the plan's §2.1 and the decision lab PR 239 left to R10; the nn-admin binary stays a shim of the agent package"
 allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
 forbid_unsafe = true
 planned = false
@@ -138,8 +138,17 @@ planned = false
 [modules.agent]
 "lib" = "northnarrow-agent"
 "main" = "northnarrow-agent"
-"bin::nn_admin" = "nn-admin"
-"admin_cli" = "nn-admin"
+# R10 (lab PR 259): the binary's logic moved to nn-admin (its `cli`); the
+# root left here is the agent package's shim, which passes the agent's host
+# (`admin_host`) to nn-admin's `main`: the composition
+"bin::nn_admin" = "northnarrow-agent"
+# post-plan (lab PR 259, R10): nn-admin on the agent's host — the agent's
+# implementation of nn-admin's `host::AdminHost` (the hardening checks, the
+# agent key's files, its chains and where they lie under its state
+# directory, the overlay gate and its rollback floor, the loaders' checks,
+# the offline engine on the Linux host), which the `nn-admin` binary passes
+# to nn-admin: the composition, as `chains`
+"admin_host" = "northnarrow-agent"
 "admin_socket" = "northnarrow-agent"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a.
 # R09b (lab PR 254): the phases, the attach permit the sensors' attach
@@ -163,7 +172,10 @@ planned = false
 # the admin socket's), the payload of each rotating log, the canary chains'
 # full checks, the anchoring and boot-verify tasks — from `chain_anchor`.
 # nn-admin's `chain verify` reads the list: two nn-admin references until
-# the payloads have a crate below it (plan R04a/R05 "i payload"; R10)
+# the payloads have a crate below it (plan R04a/R05 "i payload"; R10). R10
+# (lab PR 259): it reads it through its host (`admin_host`, nn-admin's
+# `host::Chains` on `ChainPaths`), and the layout under the state
+# directory it named is the agent's implementation's
 "chains" = "northnarrow-agent"
 # the ladder and its evidence; SystemActuator and the probes of protected
 # and reconcile go to nn-linux (R04c). R08c (lab PR 252): the ladder moved
@@ -293,6 +305,9 @@ planned = false
 # buffer and the detection budget to nn-core, the same way.
 
 [shims.agent]
+# R10 (lab PR 259): the operator client's library half moved to nn-admin;
+# the agent keeps its path (`lib.rs`, `pub use nn_admin::admin_cli`)
+"admin_cli" = "nn-admin"
 # R09a (lab PR 253): the utilities the actuators, the self-defence and the
 # hosts stand on moved to nn-linux; the agent keeps their paths in `lib.rs`
 # (`pub use nn_linux::…`): the identity on disk, the anchor of a log's
@@ -308,7 +323,10 @@ planned = false
 "atomic_file" = "nn-linux"
 "bounded_cmd" = "nn-linux"
 "fs_type" = "nn-linux"
-"os_rng" = "nn-linux"
+# R10 (lab PR 259): the OS CSPRNG moved on to nn-evidence, below nn-linux
+# and nn-admin (the operator's keys and the offline overlay signatures'
+# nonces); the agent's path names it there
+"os_rng" = "nn-evidence"
 "runtime" = "nn-linux"
 "trusted_bin" = "nn-linux"
 # R09a (lab PR 253): the actuators, the self-defence, the agent's key, its
@@ -588,9 +606,38 @@ planned = false
 # (`DEFAULT_DETECTIONS_LIMIT`, what `limit = 0` means on the wire) went to
 # nn-proto's `admin_signed_payload` with the verb's fields, and nn-admin's
 # `detections` names it there: its reference to `detection_store` is gone.
+# Lab PR 259 (R10): 21 → 20, nn-admin 7 → 6. The trusted-installer window's
+# ceiling (`MAX_TRUSTED_INSTALLER_WINDOW_SECS`, what nn-admin clamps
+# `--window-secs` to) went to nn-core's `anti_tamper::trusted_installer`
+# with the window's vocabulary (nn-linux's module re-exports it), and
+# nn-admin's role list parse names nn-proto's `admin_quorum`, which the
+# agent's `admin_auth` wraps: `nn_admin.rs` names `anti_tamper` no more.
+# Then 20 → 18, nn-admin 6 → 4: nn-admin's read of the agent's identity
+# file (`load_existing`, MAIN-010; it was its one caller) moved from
+# nn-linux's `agent_id` to nn-admin's own, the all-zero rule both reads
+# take cut to nn-proto's `shutdown_marker` (`parse_minted_agent_id`)
+# beside the format's parse: `admin_cli` and `nn_admin.rs` name nn-admin.
+# Then 18 → 17, nn-admin 4 → 3: the OS CSPRNG (`os_rng`, post-plan, lab PR
+# 234) moved from nn-linux to nn-evidence, below nn-linux and nn-admin
+# (rand's portable `SysRng`; no OS crate named), and the agent's path and
+# nn-linux's name it there: `admin_cli`'s key generation and the offline
+# overlay signature's nonce draw from a crate nn-admin may depend on.
+# Then 17 → 15, nn-admin 3 → 1: what nn-admin reads of the Linux host and
+# of the agent goes through nn-admin's `host::AdminHost`, which the agent
+# implements (`admin_host`): the hardening checks, the agent key's files,
+# the agent's chains (both files named `chains`: the dispatcher built the
+# list, `admin_cli` ran its boot check), the overlay gate, its floor and
+# the loaders' checks, the offline engine on the Linux host. The one arc
+# left is the binary's root, which passes the agent's host to nn-admin's
+# logic: it leaves with that logic (the root becomes the agent package's
+# shim).
+# Then 15 → 14, nn-admin 1 → 0: `admin_cli` and the binary's logic moved
+# to nn-admin (`admin_cli`, `cli`), whose dependencies the layer gate
+# checks (nn-proto, nn-evidence, nn-core, nn-model: no nn-linux, no
+# agent); the binary's root is the agent package's shim.
 
 [ratchet]
-nn-admin = 7
+nn-admin = 0
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0

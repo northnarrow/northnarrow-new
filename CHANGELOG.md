@@ -1652,6 +1652,95 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   self-integrity findings over each run, kind by kind — an unsigned
   overlay is drift, a signed one is not (the gate's `is_signed` through
   `Vouch`).
+- Wave 4 restructure, R10 — nn-admin: the operator client leaves the
+  agent (lab PR 259). Moved to `crates/nn-admin` (`git mv`, 99 %): the
+  agent's `admin_cli` (the library half: the Unix-socket transport, the
+  signed requests, the readers and verifiers) and the logic of its
+  `bin/nn_admin.rs` (clap's dispatcher, the rendering, the exit codes;
+  nn-admin's `cli`). The `nn-admin` binary stays in the agent package, a
+  shim of three lines that runs nn-admin's `main` on the agent's host
+  (`CARGO_BIN_EXE_nn-admin`, the SBOMs, the release are unchanged).
+  nn-admin depends on nn-proto, nn-evidence, nn-core and nn-model — not
+  on nn-linux and not on the agent: the plan draws it beside nn-linux,
+  both below the agent (§2.1), and the module map's rule for it has no
+  nn-linux (the decision lab PR 239 left to R10). What it reads of the
+  Linux host and of the agent goes through one seam of its own,
+  `nn_admin::host::AdminHost`, which the agent implements
+  (`admin_host::AgentAdminHost`): the host hardening checks
+  (`host-check`, `status`'s summary line), the agent key's files (`audit
+  verify`, `chain verify`), the agent's chains and where they lie under
+  its state directory (`chain verify`), the overlay gate and its rollback
+  floor (`config overlay status`, `policy show`), the loaders' checks of
+  an overlay before it is signed (`config overlay set|sign`), the content
+  the agent was built with, the offline engine on the Linux host
+  (`policy test`); each method is the call the code made before, in the
+  same place and order. Cut or moved first, bottom-up: the
+  trusted-installer window's ceiling to nn-core's
+  `anti_tamper::trusted_installer`; nn-admin's read of the identity file
+  (`load_existing`, MAIN-010) from nn-linux's `agent_id` to nn-admin, the
+  all-zero rule both reads take to nn-proto's `shutdown_marker`
+  (`parse_minted_agent_id`); the OS CSPRNG (`os_rng`) from nn-linux to
+  nn-evidence, below both; the overlay signature file and the gate's
+  `Decision` to nn-core's `config::overlay_auth`. nn-admin's `--new-roles`
+  parse names nn-proto's `admin_quorum`. The 12 tests of `admin_cli` that
+  wire the agent's key, chains and loaders, and the 2 of `agent_id` that
+  read both identity reads, were cut into the agent first
+  (`admin_cli_tests.rs`, `agent_id_tests.rs`). `read_priv_key`'s owner
+  check reads the effective uid through rustix's safe `geteuid` (nn-admin
+  forbids unsafe code). The agent keeps `admin_cli`'s path as a shim
+  (removed in R17); nn-admin declares `debug-trigger`, which the agent
+  forwards. The ratchet goes from 21 to 14 (nn-admin 7 → 0).
+  Identity against `main` 48228ad, both built in one temporary
+  checkout (same path: the eBPF object carries its sources' absolute
+  paths), the release job's commands: the eBPF object and its stamp are
+  byte-identical (source hash 235e2fed…, `main`'s), the scanner and the
+  watchdog byte-identical, stripped and unstripped; the tarball's 72
+  entries and the .deb's 79 paths and modes are the same, the scanner's
+  and the watchdog's SBOMs too, the agent's lists nn-admin;
+  `posture_demo` prints the same lines; every `nn-admin` subcommand gives
+  `main`'s bytes — a matrix of 1,964 cases (every help text, clap's
+  errors, `init`, `verify-keys`, `host-check`, `audit read|verify`,
+  `chain verify` on chain-pin-v1's log and every class of lab PR 256,
+  `config overlay status|sign|set`, `policy show|set|test` — the 24
+  golden cases and their events as two streams under the built-in
+  defaults, the three golden candidates and a refused one, with the
+  shipped lists and with none, as a table and as JSON —, every socket
+  verb against a mock agent with its success, refusal and transport
+  replies, the key and identity errors, closed pipes) gives the same
+  stdout, stderr, exit status, files written and requests sent with
+  `main`'s binary and the tip's, release and lab builds alike; the
+  golden replays (five runs), the wire, chain and crypto pins, the
+  parser pins, the overlay-v1 fixture and the per-rule policy's format
+  pass unchanged; the test list is `main`'s (3,098 names: 44 now
+  nn-admin's, 32 at a new path — admin_cli's 12 and agent_id's 2 in the
+  agent, the dispatcher's 18 in nn-admin's `cli`). The agent
+  (15,297,832 → 15,298,288 bytes) and nn-admin (4,160,520 → 4,218,272)
+  are not byte-identical: function by function (unstripped, names
+  mapped to the new crates and modules,
+  addresses dropped) 7,007 of the agent's 7,030 functions and 2,991 of
+  nn-admin's 3,170 are the same code. The agent's 23: clap's `TypeId`
+  constants of its enums (its crate's dependencies changed), a call to a
+  body of the same code under another name, the overlay gate's read
+  calling nn-core's `sig_path` out of line; `.text` −48 bytes. nn-admin's
+  179: 127 generic instantiations made both in nn-admin's library and in
+  the binary's crate, where the dispatcher, generic over the host, is
+  monomorphized (`Debug` of the admin messages, serde's
+  deserializers), 33 inlining at the new crate boundary
+  (`read_priv_key` calls rustix's `geteuid`), 14 scheduling, 5
+  operands; unpaired, code inlined on one side only (`audit_read_into`
+  into `run_audit_read`, the response verbs into the dispatcher;
+  `run_init`, `print_capabilities`, `sig_path` out of line on the tip)
+  and the seam's methods kept out of line: `.text` +42,144 bytes
+  (+1.26 %). `.rodata` holds the same text but the moved files' paths,
+  the callsite lines of the edited files and literals grouped otherwise.
+  On the lab guest (Ubuntu 24.04) the lot's code passes `test-ignored`
+  (76 suites, 84 passed), `policy-check` and `tamper-check` — `main`'s
+  outcomes and verdicts, case by case (72 of 75 OK, the same two known
+  gaps and deviation) —, `upgrade-check` from `main` passes, and the two
+  nn-admin binaries against the live agent give the same bytes for 35
+  commands (status, capabilities, net status signed and not, the readers,
+  the verifiers, `policy test`, the error paths); every boot verified
+  its binaries, nn-admin among them, against the install manifest.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

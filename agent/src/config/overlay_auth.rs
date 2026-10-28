@@ -27,12 +27,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{anyhow, Context, Result};
-use nn_proto::admin_signed_payload::{
-    OperationCode, OperationExtra, OverlayKind, Role, SignedPayload,
-};
+use anyhow::{anyhow, Result};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, OverlayKind, Role};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use super::overlay_floor::RollbackFloor;
@@ -44,74 +41,20 @@ use crate::chain_host_linux::LinuxHost;
 // nn-core's (the verified content, its hash, the bounded read, the escape
 // hatch's name and the read's cap), under its old paths here; the gate,
 // the signature file, the content checks and the install stay in the agent.
-use nn_core::config::overlay_auth::Vouch;
+// R10 (lab PR 259): the signature file (`<overlay>.sig`, its path, its hex)
+// and the gate's decision on an overlay are nn-core's too, cut verbatim:
+// nn-admin writes the file (`config overlay sign`) and reads the decision
+// (`config overlay status`, `policy show`) without naming the agent.
 pub use nn_core::config::overlay_auth::{
-    content_sha256, read_overlay, Verified, ALLOW_UNSIGNED_ENV, MAX_OVERLAY_BYTES,
+    content_sha256, read_overlay, sig_path, Decision, OverlaySignature, Verified,
+    ALLOW_UNSIGNED_ENV, MAX_OVERLAY_BYTES, SIG_SUFFIX,
 };
+use nn_core::config::overlay_auth::{hex, Vouch};
 
-/// Suffix of the signature file next to an overlay.
-pub const SIG_SUFFIX: &str = ".sig";
 /// Audit op of an overlay accepted at boot with a content not yet in the chain.
 pub const AUDIT_OP_ACCEPTED: &str = "config_overlay_accepted";
 /// Audit op of an overlay stored through `nn-admin config overlay set`.
 pub const AUDIT_OP_SET: &str = "config_overlay_set";
-
-/// `<overlay>.sig` on disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OverlaySignature {
-    pub v: u8,
-    pub kind: String,
-    pub payload: SignedPayload,
-    /// Ed25519 signatures, hex.
-    pub signatures: Vec<String>,
-}
-
-impl OverlaySignature {
-    pub fn new(payload: SignedPayload, signatures: &[[u8; 64]]) -> Result<Self> {
-        let kind = match &payload.extra {
-            OperationExtra::ConfigOverlaySet(e) => e.kind.keyword().to_string(),
-            _ => return Err(anyhow!("payload is not a config-overlay payload")),
-        };
-        Ok(Self {
-            v: 1,
-            kind,
-            payload,
-            signatures: signatures.iter().map(|s| hex(s)).collect(),
-        })
-    }
-
-    pub fn signatures(&self) -> Result<Vec<[u8; 64]>> {
-        self.signatures
-            .iter()
-            .map(|h| {
-                let bytes = unhex(h).ok_or_else(|| anyhow!("signature is not hex"))?;
-                <[u8; 64]>::try_from(bytes.as_slice())
-                    .map_err(|_| anyhow!("signature is not 64 bytes"))
-            })
-            .collect()
-    }
-
-    pub fn to_json(&self) -> Result<String> {
-        let mut s = serde_json::to_string_pretty(self).context("serialising overlay signature")?;
-        s.push('\n');
-        Ok(s)
-    }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
-}
 
 /// Overlay paths as configured for this boot (CLI flags can move them);
 /// recorded by [`OverlayGate::verified`] so `config overlay set` writes
@@ -132,13 +75,6 @@ pub fn configured_path(kind: OverlayKind, config_dir: &Path) -> PathBuf {
         .get()
         .and_then(|m| m.lock().get(&kind).cloned())
         .unwrap_or_else(|| config_dir.join(kind.file_name()))
-}
-
-/// `<overlay>.sig`.
-pub fn sig_path(overlay: &Path) -> PathBuf {
-    let mut s = overlay.as_os_str().to_os_string();
-    s.push(SIG_SUFFIX);
-    PathBuf::from(s)
 }
 
 /// Parse `text` with the same rules the loader of `kind` applies; any
@@ -222,26 +158,6 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
 /// integrity check, which moves to nn-linux, compares a COMBAT file with
 /// it), under its path here.
 pub use crate::anti_tamper::network_isolate::shipped_default;
-
-/// Outcome of the boot check for one overlay.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decision {
-    /// No overlay file: nothing to load, nothing to check.
-    Absent,
-    /// Signed, matching, not a rollback. `new` = content not yet recorded
-    /// in the audit chain for this kind.
-    Accepted {
-        sha256: String,
-        signed_ts: u64,
-        key_fps: Vec<String>,
-        new: bool,
-    },
-    /// Present but not loadable: why.
-    Refused {
-        reason: String,
-        sha256: Option<String>,
-    },
-}
 
 /// One read of an overlay, as [`OverlayGate::verified`] decides on it.
 enum Read {
@@ -670,6 +586,9 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use nn_proto::admin_signed_payload::sign;
+    // R10 (lab PR 259): the signature file left for nn-core, and with it
+    // this module's one other use of the payload type.
+    use nn_proto::admin_signed_payload::SignedPayload;
 
     const AGENT: [u8; 16] = [3; 16];
 

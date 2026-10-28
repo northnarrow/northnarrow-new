@@ -80,18 +80,15 @@ use crate::audit::{AuditEntryDraft, AuditLog};
 use crate::posture::clock::{Clock, SystemClock};
 use common::wire::{FsGrant, KillGrant};
 
-/// Hard ceiling on a grant window. A grant whose `window_secs` exceeds
-/// this is clamped down — a captured or fat-fingered grant can never
-/// hold the FS pin open longer than this, and the operator lifecycle
-/// (arm → install → `systemctl restart`) closes it far sooner in
-/// practice. 10 minutes is generous for an in-place upgrade.
-pub const MAX_TRUSTED_INSTALLER_WINDOW_SECS: u32 = 600;
-
 // R08b (lab PR 251): the agent's own units and a window's grant are the
 // window's vocabulary, which the rules moving to nn-core read (NN-L-FIM-009,
 // NN-L-EVA-001's sanction): nn-core's `anti_tamper::trusted_installer`, cut
-// verbatim, here under their names.
-pub use nn_core::anti_tamper::trusted_installer::{WindowGrant, OWN_SYSTEMD_UNITS};
+// verbatim, here under their names. R10 (lab PR 259): the window's hard
+// ceiling too, which nn-admin clamps `--window-secs` to (it names no module
+// of nn-linux).
+pub use nn_core::anti_tamper::trusted_installer::{
+    WindowGrant, MAX_TRUSTED_INSTALLER_WINDOW_SECS, OWN_SYSTEMD_UNITS,
+};
 
 /// Userland state of the trusted-installer override. Shared via `Arc`
 /// across the admin-socket dispatcher (arms it), the `NN-L-FIM-009` rule

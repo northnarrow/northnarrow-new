@@ -275,8 +275,10 @@ pub mod net {
 }
 
 // The OS CSPRNG as an infallible generator (R09a; was the agent's
-// `os_rng`).
-pub mod os_rng;
+// `os_rng`). R10 (lab PR 259): nn-evidence's, below nn-linux and nn-admin,
+// which draws the operator's keys and the offline overlay signatures'
+// nonces from it; here under its path.
+pub use nn_evidence::os_rng;
 
 // The Linux host of the posture (nn-core's `PostureHost` and
 // `PostureAgent`; R09a; was the agent's `posture_host_linux`).

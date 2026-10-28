@@ -59,14 +59,15 @@
 //! and `integrity_drift` `agent_id_changed` with the old and the new id.
 //!
 //! External audit MAIN-010 (NN-AUD-252): only the agent mints.
-//! `nn-admin` reads with [`load_existing`]: before the agent's first start
-//! it fails naming the file and creates nothing.
+//! `nn-admin` reads with its own `load_existing` (nn-admin's `agent_id`,
+//! moved there from here in R10, lab PR 259): before the agent's first
+//! start it fails naming the file and creates nothing.
 
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::rngs::SysRng;
 use rand::TryRng;
 use tracing::{error, info};
@@ -141,8 +142,8 @@ pub fn resolve(path: &Path) -> AgentIdentity {
 
 /// Load the persisted agent_id from `path`, OR mint a fresh one and
 /// persist it if the file is absent. Returns the 16-byte value on
-/// success. The agent's ([`resolve`]); `nn-admin` never mints
-/// ([`load_existing`], external audit MAIN-010).
+/// success. The agent's ([`resolve`]); `nn-admin` never mints (its
+/// `agent_id::load_existing`, external audit MAIN-010).
 ///
 /// Atomicity and durability: a fresh mint goes through
 /// [`crate::atomic_file::replace`] — `.agent_id.tmp` next to the target
@@ -197,23 +198,6 @@ fn load_or_mint(path: &Path) -> Result<([u8; AGENT_ID_LEN], bool)> {
     }
 }
 
-/// Read an existing agent_id, never minting one (external audit MAIN-010,
-/// NN-AUD-252): what `nn-admin` uses. A missing file means the agent has
-/// not started yet on this host (or the path is wrong), and an id minted
-/// here would be one the agent then adopts without a trace.
-pub fn load_existing(path: &Path) -> Result<[u8; AGENT_ID_LEN]> {
-    match fs::read_to_string(path) {
-        Ok(content) => parse(&content)
-            .with_context(|| format!("agent_id file {} present but corrupted", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "agent_id not found at {}: the agent creates it at its first start \
-             (start northnarrow-agent once, or pass the right --agent-id-file)",
-            path.display()
-        ),
-        Err(e) => Err(anyhow!(e).context(format!("reading agent_id {}", path.display()))),
-    }
-}
-
 /// Parse a file body into a 16-byte agent_id. Trailing newline is
 /// optional (handles both `echo` and tidier writers). Returns an
 /// error on anything that isn't exactly `[HEX_LEN]` lowercase- or
@@ -222,14 +206,10 @@ pub fn load_existing(path: &Path) -> Result<[u8; AGENT_ID_LEN]> {
 /// lowercase ourselves), and on the all-zero id.
 fn parse(raw: &str) -> Result<[u8; AGENT_ID_LEN]> {
     // Shared with the watchdog, which reads the same file to check the
-    // install a shutdown was signed for (external audit WDG-001).
-    let id = nn_proto::shutdown_marker::parse_agent_id(raw).map_err(|e| anyhow!(e))?;
-    // External audit MAIN-009: zero is the identity the test fixtures sign
-    // with and the old fallback used; OsRng does not mint it (2^-128).
-    if id == [0u8; AGENT_ID_LEN] {
-        bail!("agent_id is all zeros — the test fixtures' identity, never minted");
-    }
-    Ok(id)
+    // install a shutdown was signed for (external audit WDG-001), and the
+    // all-zero id refused (MAIN-009) with nn-admin's read: nn-proto's (R10,
+    // lab PR 259).
+    nn_proto::shutdown_marker::parse_minted_agent_id(raw).map_err(|e| anyhow!(e))
 }
 
 /// Mint 16 fresh bytes from the OS CSPRNG (`SysRng`, getrandom; its
@@ -480,18 +460,6 @@ mod tests {
         assert!(format!("{err:#}").contains("all zeros"), "{err:#}");
     }
 
-    /// MAIN-009: the same for nn-admin's read and the agent's boot, which
-    /// signs as a per-boot id instead.
-    #[test]
-    fn an_all_zero_agent_id_is_unavailable_at_boot() {
-        let (_dir, path) = fresh_path();
-        fs::write(&path, format!("{}\n", "0".repeat(HEX_LEN))).unwrap();
-        assert!(load_existing(&path).is_err());
-        let r = resolve(&path);
-        assert!(matches!(r.source, IdentitySource::Unavailable(_)));
-        assert_ne!(r.id, [0u8; AGENT_ID_LEN]);
-    }
-
     /// MAIN-009: one read gives the id and where it came from; a file that
     /// cannot be used gives a per-boot id that is never zero, differs on
     /// every call and is never written.
@@ -534,28 +502,6 @@ mod tests {
         let r = resolve(&blocker.join("agent_id"));
         assert!(matches!(r.source, IdentitySource::Unavailable(_)), "{r:?}");
         assert_ne!(r.id, [0u8; AGENT_ID_LEN]);
-    }
-
-    /// MAIN-010: nn-admin's read never mints — a missing file fails naming
-    /// it and the agent's first start, and nothing is created (not even
-    /// the directory).
-    #[test]
-    fn load_existing_never_mints() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("etc/northnarrow/agent_id");
-        let err = load_existing(&path).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains(&path.display().to_string()), "{msg}");
-        assert!(msg.contains("first start"), "{msg}");
-        assert!(!path.exists());
-        assert!(!path.parent().unwrap().exists());
-
-        let (_d, path) = fresh_path();
-        let minted = load_or_bootstrap(&path).unwrap();
-        assert_eq!(load_existing(&path).unwrap(), minted);
-        fs::write(&path, "zz\n").unwrap();
-        let msg = format!("{:#}", load_existing(&path).unwrap_err());
-        assert!(msg.contains("corrupted"), "{msg}");
     }
 
     /// EVD-020: the mint goes through `atomic_file::replace`. What a crashed

@@ -817,6 +817,24 @@ dependencies = [
 [[package]]
 name = "nn-admin"
 version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "nn-core",
+ "nn-evidence",
+ "nn-model",
+ "nn-proto",
+ "rand",
+ "rustix",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "zeroize",
+]
 
 [[package]]
 name = "nn-core"
@@ -946,6 +964,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-admin",
  "nn-core",
  "nn-evidence",
  "nn-linux",

@@ -62,8 +62,9 @@ base64 = "0.23"
 # the agent's signing key; the admin keys' signatures. `rand_core` lets the
 # OS CSPRNG (`os_rng`) feed key generation.
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
-# `os_rng`, `agent_id`, the admin challenge: the OS CSPRNG (rand 0.10's
-# `SysRng`).
+# `agent_id`, the key's mint, the admin challenge: the OS CSPRNG (rand
+# 0.10's `SysRng`; `os_rng`, its infallible adapter, is nn-evidence's since
+# R10, lab PR 259, re-exported here).
 rand = "0.10"
 hex = "0.4"
 
