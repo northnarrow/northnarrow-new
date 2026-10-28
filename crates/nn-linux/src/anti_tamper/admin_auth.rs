@@ -2982,6 +2982,51 @@ mod tests {
         ));
     }
 
+    /// Lab PR 263's review (L-1): a payload signed over another
+    /// connection's challenge is refused on this one — `NonceMismatch`,
+    /// counted, the challenge spent — though both signatures are valid and
+    /// every other binding holds; on the connection that issued its nonce
+    /// it verifies. No test of the core reached the nonce check before.
+    #[test]
+    fn verify_signed_payload_quorum_rejects_another_challenges_nonce() {
+        use nn_proto::admin_signed_payload::{sign as sign_payload, OperationCode};
+        const T: u64 = 1_700_000_000;
+        let agent_id = [0x5c; 16];
+        let (auth, sks) = shutdown_pair(agent_id);
+        let conn = ConnAuth::new(&auth);
+        let other = ConnAuth::new(&auth);
+        let held = conn.issue_challenge().unwrap();
+        let foreign = other.issue_challenge().unwrap();
+        assert_ne!(held, foreign);
+        let payload = SignedPayload::new_shutdown(foreign, T, agent_id, 10);
+        let sigs: Vec<[u8; 64]> = sks
+            .iter()
+            .map(|sk| sign_payload(&payload, sk).unwrap())
+            .collect();
+        let verify = |conn: &ConnAuth<'_>| {
+            conn.verify_signed_payload_quorum_keys(
+                &payload,
+                &sigs,
+                2,
+                &[Role::Shutdown],
+                OperationCode::Shutdown,
+                T,
+            )
+        };
+        match verify(&conn) {
+            Err(AdminAuthError::NonceMismatch) => {}
+            other => panic!("expected NonceMismatch, got {other:?}"),
+        }
+        assert_eq!(conn.failures.get(), 1, "a nonce mismatch is counted");
+        assert!(
+            matches!(verify(&conn), Err(AdminAuthError::NoPendingChallenge)),
+            "the challenge it held is spent"
+        );
+        let verified = verify(&other).expect("on the connection that issued the nonce");
+        assert_eq!(verified.keys.len(), 2);
+        assert_eq!(other.failures.get(), 0);
+    }
+
     /// External audit AUT-005: more than `MAX_SUBMITTED_SIGNATURES`
     /// signatures — every one of them valid — are refused before any is
     /// checked, and the refusal is counted; the cap itself is accepted.
