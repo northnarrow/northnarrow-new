@@ -606,7 +606,7 @@ impl BaselineCache {
 /// Append-only writer for the FIM baseline DB. Holds the
 /// [`AgentSigningKey`] in memory + tracks the chain tail-hash
 /// so each `append` produces a well-chained next entry. Same
-/// shape as [`crate::audit::AuditLog`].
+/// shape as [`nn_evidence::audit::AuditLog`].
 pub struct BaselineDb {
     path: PathBuf,
     key: AgentSigningKey,

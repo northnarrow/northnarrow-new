@@ -1,6 +1,6 @@
 //! COMBAT-state network isolation (Tappa 7 task 7 / Tappa 8).
 //!
-//! On COMBAT entry the [`PostureMachine`](crate::posture::PostureMachine)
+//! On COMBAT entry the [`PostureMachine`](nn_core::posture::PostureMachine)
 //! fires a hook that invokes [`NetworkIsolator::engage`], which shells
 //! out to `iptables-restore` with the pre-built ruleset at
 //! `configs/combat-rules.v4`. The ruleset drops every packet on

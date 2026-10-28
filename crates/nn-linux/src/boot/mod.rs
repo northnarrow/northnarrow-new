@@ -98,13 +98,14 @@ pub enum BootStep {
     AuditWritable,
     /// The host hardening table.
     HostHardening,
-    /// `bpf` in the active LSMs, or the degraded-mode opt-in ([`lsm`]).
+    /// `bpf` in the active LSMs, or the degraded-mode opt-in (the agent's
+    /// `boot::lsm`).
     BpfLsm,
     /// The eBPF object loaded and the sensors attached.
     Sensors,
     /// The deny hooks attached and the agent registered.
     AntiTamper,
-    /// The deny self-test ran ([`deny_selftest`]).
+    /// The deny self-test ran (the agent's `boot::deny_selftest`).
     DenySelfTest,
     /// The signed `agent_boot` entry is written.
     AgentBoot,

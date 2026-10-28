@@ -1,8 +1,9 @@
 //! The exec guards' kernel configuration, which the eBPF loader writes once
 //! the exec sensor is attached (Wave 4 restructure, R09b, lab PR 254: cut
 //! verbatim from `sensors::multiplexer`'s load, which calls it through its
-//! [`ExecGuards`] seam). The exec quarantine (lab PR 223) and the exec
-//! policy (lab PR 226) are the agent's.
+//! [`ExecGuards`](crate::sensors::multiplexer::ExecGuards) seam). The exec
+//! quarantine (lab PR 223) and the exec policy (lab PR 226) are the
+//! agent's.
 
 use aya::Ebpf;
 use tracing::error;
