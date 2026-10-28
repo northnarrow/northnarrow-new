@@ -61,6 +61,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -75,9 +76,6 @@ const C2_PORT: u16 = 4444;
 /// set {22,53,80,443,8080,8443}); high ephemeral to dodge collisions.
 const WILDCARD_LISTEN_PORT: u16 = 42019;
 
-fn agent_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_northnarrow-agent")
-}
 fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
 }
@@ -170,7 +168,7 @@ struct Fixture {
     agent_id: PathBuf,
     admin_socket: PathBuf,
     _agent_guard: AgentGuard,
-    _installed_agent: InstalledBin,
+    _installed_agent: InstalledAgent,
     _installed_admin: InstalledBin,
 }
 
@@ -183,12 +181,14 @@ impl Fixture {
         wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
+        // Lab PR 256: every file the agent writes in the tempdir.
+        let state = AgentState::new(&dir);
 
-        let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
+        let installed_agent = InstalledAgent::install();
         let installed_admin = install_to_priv_bin(Path::new(nn_admin_bin()));
 
         // Per-test admin keypair (same shape as the net/canary fixtures).
-        let admin_pub = dir.join("admin.pub");
+        let admin_pub = state.admin_pub();
         let admin_priv = dir.join("admin.priv");
         let tmp_pub = dir.join("admin.pub.tmp");
         let init_status = Command::new(&installed_admin.path)
@@ -259,19 +259,13 @@ impl Fixture {
         let netflow_comm_allowlist_v1 = write_empty("netflow-comm-allowlist.v1");
         let netflow_comm_allowlist_local = write_empty("netflow-comm-allowlist.local");
 
-        let audit_log = dir.join("audit.log");
-        let signing_key = dir.join("agent.sig.key");
-        let agent_id = dir.join("agent_id");
-        let admin_socket = dir.join("admin.sock");
-        let marker = dir.join("agent.shutdown_authorised");
-        let baseline_log = dir.join("fim_baseline.jsonl");
-        let drift_log = dir.join("fim_drift.jsonl");
-        let canary_registry = dir.join("canaries.jsonl");
-        let canary_access = dir.join("canary_access.jsonl");
-        let netflow_log = dir.join("netflow.jsonl");
-        let netflow_listeners_log = dir.join("netflow_listeners.jsonl");
+        let agent_id = state.agent_id_file();
+        let admin_socket = state.admin_socket();
+        let drift_log = state.fim_drift();
+        let netflow_log = state.netflow();
+        let netflow_listeners_log = state.netflow_listeners();
         let agent_log = dir.join("agent.log");
-        let detections_log = dir.join("detections.jsonl");
+        let detections_log = state.detections();
 
         // Redirect the agent's stderr (tracing default sink) to a
         // file so the test can grep for VERDICT lines.
@@ -282,46 +276,16 @@ impl Fixture {
         let log_file_err = log_file.try_clone().expect("clone agent.log handle");
 
         common::require_bpftool();
-        let child = Command::new("sudo")
-            .arg("env")
-            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
-            .arg(&installed_agent.path)
+        let child = installed_agent
+            .command(&state, Launch::Sudo, &[common::OWN_DEFAULT_LISTS_ENV])
             .arg("--combat-rules")
             .arg(&combat)
-            .arg("--admin-pub")
-            .arg(&admin_pub)
-            .arg("--admin-socket")
-            .arg(&admin_socket)
-            .arg("--agent-id-file")
-            .arg(&agent_id)
-            .arg("--audit-log-file")
-            .arg(&audit_log)
-            .arg("--signing-key-file")
-            .arg(&signing_key)
-            .arg("--shutdown-marker-file")
-            .arg(&marker)
-            .arg("--detections-file")
-            .arg(&detections_log)
-            .arg("--status-events-file")
-            .arg(dir.join("status_events.jsonl"))
             .arg("--fim-paths-v1")
             .arg(&fim_paths_v1)
             .arg("--fim-paths-local")
             .arg(&fim_paths_local)
-            .arg("--fim-baseline-file")
-            .arg(&baseline_log)
-            .arg("--fim-drift-file")
-            .arg(&drift_log)
-            .arg("--canary-registry-file")
-            .arg(&canary_registry)
-            .arg("--canary-access-file")
-            .arg(&canary_access)
             .arg("--canary-template-dir")
             .arg(&templates_dir)
-            .arg("--netflow-file")
-            .arg(&netflow_log)
-            .arg("--netflow-listeners-file")
-            .arg(&netflow_listeners_log)
             .arg("--netflow-blocklist-v1")
             .arg(&netflow_blocklist_v1)
             .arg("--netflow-blocklist-local")

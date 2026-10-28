@@ -41,7 +41,7 @@
 #![cfg(feature = "test-privileged")]
 
 mod common;
-use common::{install_to_priv_bin, InstalledBin};
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -66,10 +66,6 @@ const OP_RENAMED: u64 = 4;
 const OP_LINKED: u64 = 5;
 const OP_OPENED: u64 = 6;
 const OP_ATTR_CHANGED: u64 = 8;
-
-fn agent_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_northnarrow-agent")
-}
 
 fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
@@ -116,9 +112,9 @@ struct FimFixture {
     /// `Option` so `Drop` can take ownership.
     _agent_guard: AgentGuard,
     /// External audit NN-AUD-423 (TST-017): the agent runs from a
-    /// root-owned copy (`common::install_to_priv_bin`), not from
-    /// `target/` under the user's home. Dropped after the agent stops.
-    _installed_agent: InstalledBin,
+    /// root-owned copy (`InstalledAgent`), not from `target/` under the
+    /// user's home. Dropped after the agent stops.
+    _installed_agent: InstalledAgent,
 }
 
 /// Lab PR 163's lesson, here too: the agent stops before the fields drop.
@@ -182,14 +178,19 @@ impl FimFixture {
         dir_name: Option<&str>,
     ) -> Self {
         wipe_pin_tree();
-        let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
+        let installed_agent = InstalledAgent::install();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path();
+        // Lab PR 256: every file the agent writes in the tempdir. The
+        // detection, status, netflow and canary logs were missing: the
+        // agent wrote them, under its own key, in the installed agent's
+        // chains (lot 255).
+        let state = AgentState::new(dir);
 
         // Per-test admin keypair (we don't actually use the admin
         // socket in these tests, but the agent refuses to spawn
         // its admin loop without a pubkey).
-        let admin_pub = dir.join("admin.pub");
+        let admin_pub = state.admin_pub();
         let admin_priv = dir.join("admin.priv");
         let init_status = Command::new(nn_admin_bin())
             .arg("init")
@@ -236,49 +237,25 @@ impl FimFixture {
         let fim_paths_local = dir.join("fim-paths.local");
         std::fs::write(&fim_paths_local, "# (no operator overlay)\n").unwrap();
 
-        let baseline_log = dir.join("fim_baseline.jsonl");
-        let drift_log = dir.join("fim_drift.jsonl");
-        let audit_log = dir.join("audit.log");
-        let signing_key = dir.join("agent.sig.key");
-        let agent_id = dir.join("agent_id");
-        let admin_socket = dir.join("admin.sock");
-        let marker = dir.join("agent.shutdown_authorised");
+        let baseline_log = state.fim_baseline();
+        let drift_log = state.fim_drift();
 
         common::require_bpftool();
-        let child = Command::new(&installed_agent.path)
-            .env(
-                common::OWN_DEFAULT_LISTS_ENV.0,
-                common::OWN_DEFAULT_LISTS_ENV.1,
-            )
+        let child = installed_agent
+            .command(&state, Launch::Direct, &[common::OWN_DEFAULT_LISTS_ENV])
             .arg("--combat-rules")
             .arg(&combat)
-            .arg("--admin-pub")
-            .arg(&admin_pub)
-            .arg("--admin-socket")
-            .arg(&admin_socket)
-            .arg("--agent-id-file")
-            .arg(&agent_id)
-            .arg("--audit-log-file")
-            .arg(&audit_log)
-            .arg("--signing-key-file")
-            .arg(&signing_key)
-            .arg("--shutdown-marker-file")
-            .arg(&marker)
             .arg("--fim-paths-v1")
             .arg(&fim_paths_v1)
             .arg("--fim-paths-local")
             .arg(&fim_paths_local)
-            .arg("--fim-baseline-file")
-            .arg(&baseline_log)
-            .arg("--fim-drift-file")
-            .arg(&drift_log)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn northnarrow-agent for FIM e2e");
         let guard = AgentGuard(Some(child));
 
-        wait_for_socket(&admin_socket);
+        wait_for_socket(&state.admin_socket());
 
         Self {
             _tempdir: tempdir,
@@ -598,9 +575,12 @@ fn fim_subprocess_unlink_records_deleted_event() {
 fn fim_subprocess_open_aws_creds_records_opened_event() {
     wipe_pin_tree();
     // Declared before the agent's guard: dropped after the agent stops.
-    let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
+    let installed_agent = InstalledAgent::install();
     let tempdir = tempfile::tempdir().expect("tempdir");
     let dir = tempdir.path();
+    // Lab PR 256: every file the agent writes in the tempdir (the netflow
+    // and canary logs went to the installed agent's).
+    let state = AgentState::new(dir);
     // Build the .aws/credentials shape so NN-L-FIM-011's
     // substring match (`/.aws/credentials`) would accept the
     // resulting drift event's path.
@@ -614,7 +594,7 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     // .aws-shaped watched path. (Refactoring FimFixture::setup
     // to accept an arbitrary watched_file path is a follow-up;
     // keeping this test self-contained for now.)
-    let admin_pub = dir.join("admin.pub");
+    let admin_pub = state.admin_pub();
     let admin_priv = dir.join("admin.priv");
     let init = Command::new(nn_admin_bin())
         .arg("init")
@@ -635,57 +615,27 @@ fn fim_subprocess_open_aws_creds_records_opened_event() {
     .expect("write fim-paths.v1");
     let fim_paths_local = dir.join("fim-paths.local");
     std::fs::write(&fim_paths_local, "").unwrap();
-    let baseline_log = dir.join("fim_baseline.jsonl");
-    let drift_log = dir.join("fim_drift.jsonl");
-    let audit_log = dir.join("audit.log");
-    let signing_key = dir.join("agent.sig.key");
-    let agent_id = dir.join("agent_id");
-    let admin_socket = dir.join("admin.sock");
-    let marker = dir.join("agent.shutdown_authorised");
+    let baseline_log = state.fim_baseline();
+    let drift_log = state.fim_drift();
     // Per-test detection store: the credential-read verdict is the
-    // artefact this test waits for, and the default path is the
-    // production chain under /var/lib/northnarrow.
-    let detections_log = dir.join("detections.jsonl");
-    let status_events_log = dir.join("status_events.jsonl");
+    // artefact this test waits for.
+    let detections_log = state.detections();
 
     common::require_bpftool();
-    let child = Command::new(&installed_agent.path)
-        .env(
-            common::OWN_DEFAULT_LISTS_ENV.0,
-            common::OWN_DEFAULT_LISTS_ENV.1,
-        )
+    let child = installed_agent
+        .command(&state, Launch::Direct, &[common::OWN_DEFAULT_LISTS_ENV])
         .arg("--combat-rules")
         .arg(&combat)
-        .arg("--admin-pub")
-        .arg(&admin_pub)
-        .arg("--admin-socket")
-        .arg(&admin_socket)
-        .arg("--agent-id-file")
-        .arg(&agent_id)
-        .arg("--audit-log-file")
-        .arg(&audit_log)
-        .arg("--signing-key-file")
-        .arg(&signing_key)
-        .arg("--shutdown-marker-file")
-        .arg(&marker)
-        .arg("--detections-file")
-        .arg(&detections_log)
-        .arg("--status-events-file")
-        .arg(&status_events_log)
         .arg("--fim-paths-v1")
         .arg(&fim_paths_v1)
         .arg("--fim-paths-local")
         .arg(&fim_paths_local)
-        .arg("--fim-baseline-file")
-        .arg(&baseline_log)
-        .arg("--fim-drift-file")
-        .arg(&drift_log)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn northnarrow-agent for FIM cred-read e2e");
     let _guard = AgentGuard(Some(child));
-    wait_for_socket(&admin_socket);
+    wait_for_socket(&state.admin_socket());
 
     // Wait for the TOFU baseline.
     let deadline = Instant::now() + BASELINE_POLL_TIMEOUT;

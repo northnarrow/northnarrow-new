@@ -34,6 +34,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -46,9 +47,6 @@ const DETECTIONS: &str = "/var/lib/northnarrow/detections";
 const PIN_ROOT: &str = "/sys/fs/bpf/northnarrow";
 const XATTR: &str = "user.nn_e2e_152";
 
-fn agent_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_northnarrow-agent")
-}
 fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
 }
@@ -74,13 +72,13 @@ impl Drop for AgentGuard {
 // ── agent fixture ───────────────────────────────────────────────────
 
 struct Fixture {
-    dir: PathBuf,
+    state: AgentState,
     agent_log: PathBuf,
     nn_admin: PathBuf,
     admin_priv: PathBuf,
     _tempdir: tempfile::TempDir,
     _agent_guard: AgentGuard,
-    _installed_agent: InstalledBin,
+    _installed_agent: InstalledAgent,
     _installed_admin: InstalledBin,
 }
 
@@ -88,15 +86,26 @@ impl Fixture {
     /// Spawn an agent whose own files live in a tempdir; the directories
     /// it protects are the fixed ones (`/etc/northnarrow`, the state
     /// directory, the pin root). Per-test admin key with every role.
+    ///
+    /// Lab PR 256: every file the agent writes in the tempdir
+    /// ([`AgentState`]). The detection and status logs were missing, so
+    /// the agent appended its records, under its own key, to the installed
+    /// agent's chain in `/var/lib/northnarrow/detections/` (lot 255).
     fn setup() -> Self {
-        // /etc/northnarrow is registered only if it exists at boot.
-        let _ = Command::new(REAL_SUDO).args(["mkdir", "-p", ETC]).status();
+        // /etc/northnarrow is registered only if it exists at boot, and so
+        // is the state directory's detections/: lab PR 256's agent writes
+        // its own records in the tempdir, so it no longer creates the
+        // installed agent's directory itself.
+        let _ = Command::new(REAL_SUDO)
+            .args(["mkdir", "-p", ETC, DETECTIONS])
+            .status();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
-        let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
+        let state = AgentState::new(&dir);
+        let installed_agent = InstalledAgent::install();
         let installed_admin = install_to_priv_bin(Path::new(nn_admin_bin()));
 
-        let admin_pub = dir.join("admin.pub");
+        let admin_pub = state.admin_pub();
         let admin_priv = dir.join("admin.priv");
         let tmp_pub = dir.join("admin.pub.tmp");
         let init = Command::new(&installed_admin.path)
@@ -141,40 +150,14 @@ impl Fixture {
         let agent_log = dir.join("agent.log");
         let log = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_err = log.try_clone().expect("clone log handle");
-        let child = Command::new(REAL_SUDO)
-            .arg("env")
-            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
-            .arg(&installed_agent.path)
+        let child = installed_agent
+            .command(&state, Launch::Sudo, &[common::OWN_DEFAULT_LISTS_ENV])
             .arg("--combat-rules")
             .arg(&combat)
-            .arg("--admin-pub")
-            .arg(&admin_pub)
-            .arg("--admin-socket")
-            .arg(dir.join("admin.sock"))
-            .arg("--agent-id-file")
-            .arg(dir.join("agent_id"))
-            .arg("--audit-log-file")
-            .arg(dir.join("audit.log"))
-            .arg("--signing-key-file")
-            .arg(dir.join("agent.sig.key"))
-            .arg("--shutdown-marker-file")
-            .arg(dir.join("agent.shutdown_authorised"))
             .arg("--fim-paths-v1")
             .arg(&fim_v1)
             .arg("--fim-paths-local")
             .arg(&fim_local)
-            .arg("--fim-baseline-file")
-            .arg(dir.join("fim_baseline.jsonl"))
-            .arg("--fim-drift-file")
-            .arg(dir.join("fim_drift.jsonl"))
-            .arg("--canary-registry-file")
-            .arg(dir.join("canaries.jsonl"))
-            .arg("--canary-access-file")
-            .arg(dir.join("canary_access.jsonl"))
-            .arg("--netflow-file")
-            .arg(dir.join("netflow.jsonl"))
-            .arg("--netflow-listeners-file")
-            .arg(dir.join("netflow_listeners.jsonl"))
             .arg("--netflow-blocklist-v1")
             .arg(&nb_v1)
             .arg("--netflow-blocklist-local")
@@ -198,7 +181,7 @@ impl Fixture {
         let guard = AgentGuard(Some(child));
         let fx = Self {
             nn_admin: installed_admin.path.clone(),
-            dir,
+            state,
             agent_log,
             admin_priv,
             _tempdir: tempdir,
@@ -206,7 +189,7 @@ impl Fixture {
             _installed_agent: installed_agent,
             _installed_admin: installed_admin,
         };
-        fx.wait_for_path(&fx.dir.join("admin.sock"), SOCKET_POLL_TIMEOUT);
+        fx.wait_for_path(&fx.state.admin_socket(), SOCKET_POLL_TIMEOUT);
         // The agent's own line once every filesystem deny hook attached.
         fx.wait_for_log("all inode_protect deny hooks attached");
         fx
@@ -288,10 +271,7 @@ impl Fixture {
             .arg(&self.admin_priv)
             .arg("--window-secs")
             .arg(secs.to_string())
-            .arg("--agent-id-file")
-            .arg(self.dir.join("agent_id"))
-            .arg("--socket")
-            .arg(self.dir.join("admin.sock"))
+            .args(self.state.client_args())
             .output()
             .expect("spawn nn-admin trusted-installer-grant");
         assert!(
