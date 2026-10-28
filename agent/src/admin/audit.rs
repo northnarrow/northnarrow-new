@@ -75,11 +75,12 @@ pub(super) struct DispatchNotes {
 /// plus continue: the operator's authorised action MUST succeed
 /// even if the audit log is temporarily unwritable (design §9
 /// states "the entry is the receipt; the action is the action").
-// PHASE_D_004: `matched_fps` is the dispatch_* fns' `fps_out`
-// values — empty for the legacy `Unlock` (refused since lab PR 217,
-// verified by no one) and for failure paths; populated for successful
-// signed-payload ops, the signed unlock included (lab PR 217: its row
-// names the signer).
+// PHASE_D_004: `matched_fps` is what the verification pipeline wrote
+// (`verify::signed`, R11d) — empty for the legacy `Unlock` (refused since
+// lab PR 217, verified by no one) and for failure paths, but the
+// telemetry status refused for its roles (lab PR 213: the row names the
+// key that tried); populated for every request the pipeline accepted,
+// the signed unlock included (lab PR 217: its row names the signer).
 pub(super) fn emit_audit_for(
     msg: &AdminMessage,
     reply: &AdminMessage,

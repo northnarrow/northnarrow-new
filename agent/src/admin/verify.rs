@@ -23,15 +23,15 @@
 //!    canonical payload, the quorum of distinct keys and the roles
 //!    (`InvalidSignature`, `QuorumNotMet`, `RoleDenied`).
 //!
-//! The connection counts 3, 4, 5, 6 and a submission no key signed; the
-//! third is answered `RateLimited` and the connection closed. The handler
+//! The connection counts 3, 4, 5, 6 and a submission no key signed; its
+//! third is answered `RateLimited`, closing the connection. The handler
 //! then receives a [`Verified`] request, which only this module can make,
 //! with the signers' keys and fingerprints. The fingerprints go to the
 //! audit row (`fps_out`), which the transport signs once the reply is
 //! built, for an accepted and a refused request alike, with the op names
 //! and fields of `audit::emit_audit_for`.
 //!
-//! The rules are one table ([`signed_verbs!`] below). Two are not "n
+//! The rules are one table (`signed_verbs!` below). Two are not "n
 //! distinct keys, each listed role carried by one of them":
 //! `rotate-keys add` needs one key while the one-key bootstrap is armed
 //! ([`Quorum::Bootstrap`]), and `telemetry-status` takes either of two
