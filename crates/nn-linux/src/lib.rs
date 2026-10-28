@@ -171,6 +171,11 @@ pub mod impair {
     pub type DefenderMap = aya::maps::HashMap<aya::maps::MapData, u32, u8>;
 }
 
+// The boot's check of the installed binaries and the embedded eBPF object
+// against the manifest `install.sh` writes (Tappa 10.8, external audit
+// DEP-009; R09c, lab PR 257; was the agent's `install_manifest`).
+pub mod install_manifest;
+
 // The agent's signing key and its files (R09a; was the agent's `keys`).
 pub mod keys;
 

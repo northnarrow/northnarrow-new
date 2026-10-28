@@ -145,7 +145,9 @@ pub mod fuzz_api;
 pub mod host_hardening;
 pub mod impact;
 pub mod impair;
-pub mod install_manifest;
+/// R09c shim: the boot's check of the installed binaries and the embedded
+/// eBPF object against the install manifest is nn-linux's.
+pub use nn_linux::install_manifest;
 /// The install manifest's check reached through the fuzz target's fixture
 /// (R09c, lab PR 257: from `install_manifest`'s tests).
 #[cfg(test)]

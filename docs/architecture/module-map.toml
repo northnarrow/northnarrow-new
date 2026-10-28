@@ -253,7 +253,6 @@ planned = false
 # nn-linux's `impair::DefenderMap`, cut there) and publishes the agent's
 # detector for `status`
 "impair" = "nn-core"
-"install_manifest" = "nn-linux"
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
@@ -373,6 +372,9 @@ planned = false
 # (its private socket); the agent keeps their paths (`lib.rs`)
 "sd_notify" = "nn-linux"
 "systemd_state" = "nn-linux"
+# R09c (lab PR 257): the boot's check of the installed binaries and the
+# embedded eBPF object against the manifest `install.sh` writes (DEP-009)
+"install_manifest" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"
