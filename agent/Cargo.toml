@@ -47,8 +47,10 @@ debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger", "nn-linux/de
 # that spawn the agent + nn-admin subprocesses and verify the
 # iptables ruleset against a live kernel. Requires root and a
 # working iptables binary; CI compiles but does not execute these.
-# See docs/integration-test-runbook.md for the manual run path.
-test-privileged = []
+# See docs/integration-test-runbook.md for the manual run path. R09b
+# (lab PR 254): the attach permit's test constructor is nn-linux's, which
+# takes the feature.
+test-privileged = ["nn-linux/test-privileged"]
 # Builds `examples/posture_demo.rs` (`required-features`). External audit
 # POS-013 made it compile `PostureMachine::admin_release_combat`, the
 # Sub-tappa 6.5 bool stub that leaves COMBAT without a signed token, for
@@ -155,13 +157,6 @@ base64 = "0.23"
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
 hex = "0.4"
 
-[build-dependencies]
-# Staleness guard: build.rs verifies the embedded eBPF `.o` was built
-# from the current source (matches the xtask-written stamp) and refuses
-# to embed a stale one. Shared crate so the hash matches xtask's writer
-# byte-for-byte.
-ebpf-guard = { path = "../ebpf-guard" }
-
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
@@ -175,14 +170,9 @@ nn-core = { workspace = true, features = ["test-util"] }
 # its test doors (`test-util`: a capture of a process without a descriptor,
 # the host-critical guard on given identities, an unlock token minted
 # without a signature, the admin key set's fingerprints, the isolator on
-# given binaries). A dev-dependency only: no build of the binaries has them.
+# given binaries; R09b, lab PR 254: the FIM's stand-in for the kernel's
+# watched inodes). A dev-dependency only: no build of the binaries has them.
 nn-linux = { workspace = true, features = ["test-util"] }
-# Lab PR 219: parse the embedded eBPF object in unit tests, with the parser
-# aya 0.14.0 itself runs: every map must be of a type aya 0.14 loads (a
-# task-storage map parsed and still stopped the agent), and the exploit
-# guard's maps and programs. Already in the tree through aya (lab PR 231:
-# 0.2.1 → 0.3.0 with aya 0.14).
-aya-obj = "=0.3.0"
 
 # Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal
 # builds with -D warnings do not flag it as an unexpected cfg.

@@ -15,42 +15,28 @@
 //! [`NetFlowEvent`]: nn_model::telemetry::NetFlowEvent
 //! [`NetListenerEvent`]: nn_model::telemetry::NetListenerEvent
 
-pub mod blind_spots;
 /// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the operator's
 /// blocklists are nn-core's, with the rules that read them; their loaders
 /// take the host that reads a `.v1` (the agent's `LinuxHost`).
 pub use nn_core::net::blocklist;
+/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the host's
+/// configured DNS resolvers are nn-core's, with the rules that read them.
+pub use nn_core::net::resolvers;
 /// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the DNS
 /// cache's state is nn-core's, with the rules that read it; the agent's
 /// cache carries the DNS pump's ingest (lab PR 229), and the reply parsers
 /// keep the path R06 (lab PR 242) left them. R09a (lab PR 253): the cache
 /// carrying the ingest, and the ingest, are nn-linux's, with the decision
 /// engine's host, which names them.
-pub use nn_linux::net::{dns_cache, dns_ingest};
-pub mod drain;
-/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the flow
-/// tracker (connect → close, the flow id, the open-flow snapshots) is
-/// nn-core's; its notifier, which the drain awaits, is the agent's host's
-/// (tokio's `Notify`).
-pub mod flow_tracker {
-    pub use nn_core::net::flow_tracker::*;
-
-    /// [`nn_core::net::flow_tracker::FlowTracker`] on the agent's host.
-    pub type FlowTracker =
-        nn_core::net::flow_tracker::FlowTracker<crate::chain_host_linux::LinuxHost>;
-}
-/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the netflow
-/// rows handed to the rules, paced per uid, are nn-core's, with the rules
-/// and the correlation store they read.
-pub mod limiter {
-    pub use nn_core::net::limiter::*;
-
-    /// [`nn_core::net::limiter::RuleGate`] on the agent's host.
-    pub type RuleGate = nn_core::net::limiter::RuleGate<crate::chain_host_linux::LinuxHost>;
-}
-/// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the host's
-/// configured DNS resolvers are nn-core's, with the rules that read them.
-pub use nn_core::net::resolvers;
+///
+/// R09b (lab PR 254): the drain of the flow and listener rings with its two
+/// signed logs, and the blind spots it reports, are nn-linux's; so are the
+/// flow tracker (connect → close, the flow id, the open-flow snapshots;
+/// R08b: nn-core's, its notifier, which the drain awaits, the host's) and
+/// the netflow rows' gate to the rules (paced per uid; R08b: nn-core's,
+/// with the rules and the correlation store they read) on the Linux host,
+/// which the drain names.
+pub use nn_linux::net::{blind_spots, dns_cache, dns_ingest, drain, flow_tracker, limiter};
 /// The ClientHello parser (JA3, JA4, SNI, ALPN): nn-parse's `tls` since R06
 /// of the Wave 4 restructure (lab PR 242), re-exported at the path the fuzz
 /// targets and `fuzz_api` name (until R17).

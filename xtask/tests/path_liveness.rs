@@ -420,9 +420,10 @@ fn every_file_the_xtask_tests_name_exists() {
 /// The places a member may still reach the repository by its own
 /// position: xtask lives at the root by definition; common's sources are
 /// the eBPF object's source closure (an edit rebuilds the object) and
-/// common stays where it is (nn-wire); agent/build.rs embeds the object and
-/// moves with the sensors (R09b), which switches it to `NN_REPO_ROOT`.
-const DEPTH_RELATIVE_ALLOWED: &[&str] = &["xtask/", "common/src/", "agent/build.rs"];
+/// common stays where it is (nn-wire). The build script that embeds the
+/// object moved with the sensors to nn-linux (R09b, lab PR 254) and reads
+/// `NN_REPO_ROOT` since.
+const DEPTH_RELATIVE_ALLOWED: &[&str] = &["xtask/", "common/src/"];
 
 #[test]
 fn members_reach_the_repository_through_nn_repo_root() {

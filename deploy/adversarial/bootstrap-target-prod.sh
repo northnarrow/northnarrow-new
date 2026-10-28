@@ -267,7 +267,7 @@ journalctl --namespace="$NN_JOURNAL_NS" --vacuum-time=1s 2>/dev/null || true
 # ── 3. rebuild the SHIPPED binary (no test-privileged; xtask) ────────
 # `test-privileged` is a CARGO FEATURE, not an install flag. A plain build
 # omits it, which is what we want. We MUST go through xtask: a bare
-# `cargo build` cannot produce an installable agent — agent/build.rs refuses
+# `cargo build` cannot produce an installable agent — crates/nn-linux/build.rs refuses
 # a stale/unstamped eBPF object (the eBPF freshness gate).
 log "Building shipped binary as '$BUILD_USER': cargo xtask build --release (NO test-privileged)..."
 as_build_user "cd $(printf '%q' "$NN_REPO_DIR") && cargo xtask build --release"

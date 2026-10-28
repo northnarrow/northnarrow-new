@@ -6,7 +6,7 @@
 //! consumes. Per design §6.3 + §6.5:
 //!
 //! 1. Drain `FS_FIM_EVENTS` via aya's `RingBuf::poll` (the
-//!    pattern matches `agent/src/sensors/multiplexer.rs::pump`).
+//!    pattern matches `sensors::multiplexer::pump`).
 //! 2. Decode each `FimDriftRaw` (C1 wire type).
 //! 3. Resolve `(target_dev, target_ino)` → absolute path via
 //!    the userland [`InodePathMap`] populated by C7 deploy
@@ -523,7 +523,7 @@ pub struct FimDriftDraft {
 // ── drift DB (mirror BaselineDb) ───────────────────────────────────
 
 /// Append-only writer for the drift log. BUG-026: now a thin wrapper
-/// over the shared [`crate::chainlog::RotatingChainLog`] — it builds the
+/// over the shared [`nn_evidence::chainlog::RotatingChainLog`] — it builds the
 /// [`FimDriftPayload`] and the core handles chaining, signing, rotation
 /// (size cap + retention), and the chattr dance via the shared
 /// `StateDirProtection`. New lines are v3 (`fmt_ver`, lab PR 204); existing

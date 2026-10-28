@@ -11,7 +11,7 @@
 //! `comm` is attacker-controllable (`prctl(PR_SET_NAME, …)`), so a guard
 //! that keyed on it would let any process rename itself to gain immunity —
 //! the exact bypass [`crate::posture::exempt`] and
-//! [`crate::posture::lineage`] are built to avoid. We therefore key on:
+//! [`nn_core::posture::lineage`] are built to avoid. We therefore key on:
 //!
 //! - `pid == 1` for init and `pid == agent_pid` for the agent (neither
 //!   can be a recycled impostor: PID 1 is init for the life of the boot,

@@ -9,7 +9,7 @@
 //! holds it):
 //!
 //! - it is kept for `nn-admin status --key` ([`snapshot`]) and counts
-//!   against the trust level ([`super::trust`]);
+//!   against the trust level (the agent's `boot::trust`);
 //! - it is signed in the audit chain as a `subsystem_degraded` (the
 //!   `integrity_drift` op, `source` naming the part): at once when the
 //!   caller holds the log, at the log's open for what came before it

@@ -43,8 +43,8 @@ forbid_unsafe = true
 planned = false
 
 [crates.nn-model]
-about = "the vocabulary: Event, verdicts, actions and outcomes, ProcessKey, PostureKind, log_escape, netaddr, OCSF (R02)"
-allowed = ["northnarrow-common", "nn-parse"]
+about = "the vocabulary: Event, verdicts, actions and outcomes, ProcessKey, PostureKind, log_escape, netaddr, OCSF (R02); nn-parse's QNAME walk left it with the DNS record's decode for nn-linux's sensor (R09b, lab PR 254)"
+allowed = ["northnarrow-common"]
 pure = true
 forbid_unsafe = true
 planned = false
@@ -144,15 +144,21 @@ planned = false
 # post-plan (lab PR 241, R04a): the audit log's writability before the
 # attach (`access(2)`), from `audit`
 "audit_preflight" = "nn-linux"
-# post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a
+# post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a.
+# R09b (lab PR 254): the phases, the attach permit the sensors' attach
+# takes, the degradations of a run (`boot::degradation`, `[shims.agent]`)
+# and the sensors' attach points went to nn-linux, which the sensors
+# report to; the deny self-test, the BPF LSM gate, the trust level and the
+# signed manifest stay
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
 # rule 4)
 "build_info" = "northnarrow-agent"
-# path_policy (R09b); `canary/mod.rs` binds nn-core's detector, readers and
-# templates to the Linux host. R09a (lab PR 253): the registry's store, the
-# access log, network and read_forward moved to nn-linux (`[shims.agent]`)
+# `canary/mod.rs` binds nn-core's detector, readers and templates to the
+# Linux host. R09a (lab PR 253): the registry's store, the access log,
+# network and read_forward moved to nn-linux (`[shims.agent]`); R09b (lab
+# PR 254): path_policy too
 "canary" = "nn-linux"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
 # the admin socket's), the payload of each rotating log, the canary chains'
@@ -221,6 +227,10 @@ planned = false
 # not in §2.4: the detection sink's queue and files, the records'
 # constructors from the engine's decisions (its payloads: above, R04a)
 "detection_store" = "nn-linux"
+# post-plan (lab PR 254, R09b): the exec guards' kernel configuration the
+# eBPF loader writes (nn-linux's `sensors::multiplexer::ExecGuards`), cut
+# from the loader: the exec quarantine's and the exec policy's, with them
+"exec_guards" = "nn-linux"
 # post-plan (lab PR 226): exec policy; the controller and the kernel maps
 "execpol" = "nn-linux"
 "execpol::policy" = "nn-core"
@@ -229,10 +239,6 @@ planned = false
 "execq" = "nn-linux"
 "execq::policy" = "nn-core"
 "execq::record" = "nn-core"
-# attach, drain (the ring half; R08b, lab PR 251, cut the drift's
-# classification to nn-core's `fim::drift`, re-exported by the drain),
-# baseline, honeypot, recompute; the rules: `[shims.agent]` (R08b)
-"fim" = "nn-linux"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
 "host_hardening" = "nn-linux"
@@ -256,10 +262,11 @@ planned = false
 # `net::blind_spots`): R08b (lab PR 251) moved them, with the resolvers,
 # to nn-core (`[shims.agent]`); `net/mod.rs` binds them to the agent's
 # host (inline modules); R09a (lab PR 253): the DNS cache carrying the
-# pump's ingest, and the ingest, moved to nn-linux (`[shims.agent]`)
+# pump's ingest, and the ingest, moved to nn-linux (`[shims.agent]`); R09b
+# (lab PR 254): the drain and the blind spots moved to nn-linux, and the
+# tracker's and the gate's binding to the Linux host with them, which the
+# drain names: `net/mod.rs` re-exports nn-linux's (`[shims.agent]`)
 "net" = "nn-core"
-"net::blind_spots" = "nn-linux"
-"net::drain" = "nn-linux"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
 # R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
@@ -275,6 +282,10 @@ planned = false
 "sd_notify" = "nn-linux"
 "self_integrity" = "nn-linux"
 "sensor_feasibility" = "nn-linux"
+# R09b (lab PR 254): the sensors moved to nn-linux with the eBPF object's
+# embed (`build.rs`); the agent's `sensors.rs` keeps their paths and names
+# the loader on the agent's exec guards (`exec_guards`), an alias as the
+# posture's on `LinuxHost`
 "sensors" = "nn-linux"
 # the file I/O; the marker's format is nn-proto's (R03, lab PR 240)
 "shutdown_marker" = "nn-linux"
@@ -330,8 +341,20 @@ planned = false
 # access log, addresses and read-forward set (the canary host's associated
 # types and calls); the sampler; the DNS ingest
 "anti_tamper" = "nn-linux"
+# R09b (lab PR 254): the degradations of a run, which the sensors report,
+# moved to nn-linux with the boot's phases (`boot/mod.rs` re-exports them)
+"boot::degradation" = "nn-linux"
+# R09b (lab PR 254): file integrity monitoring moved to nn-linux whole —
+# the attach, the drain (the ring half; R08b, lab PR 251, cut the drift's
+# classification to nn-core's `fim::drift`, re-exported by the drain), the
+# baseline, the honeypot baits, the recompute, and `fim/mod.rs` with the
+# watched paths' loader on `LinuxHost`; the agent keeps the path (`lib.rs`).
+# The rules and the list are nn-core's (below, R07 and R08b)
+"fim" = "nn-linux"
 "canary::access_log" = "nn-linux"
 "canary::network" = "nn-linux"
+# R09b (lab PR 254): where a decoy may be written (review `canary-path-1`)
+"canary::path_policy" = "nn-linux"
 "canary::read_forward" = "nn-linux"
 "canary::registry" = "nn-linux"
 "canary_host_linux" = "nn-linux"
@@ -398,12 +421,21 @@ planned = false
 # (R06). R09a (lab PR 253): that module moved to nn-linux's `net` with the
 # ingest; the agent's path names it
 "net::dns_cache" = "nn-linux"
+# R09b (lab PR 254): the drain of the flow, listener and UDP rings with the
+# netflow and listener logs, and the blind spots it reports (the encrypted
+# flows no rule fingerprints, DNS over TLS to the resolver) moved to
+# nn-linux; the agent's paths name them
+"net::blind_spots" = "nn-linux"
+"net::drain" = "nn-linux"
 # R08b (lab PR 251): the flow tracker (connect → close, the flow id, the
-# open-flow snapshots), with the rules' network state; `net/mod.rs` names it
-# on the agent's host, whose notifier the drain awaits (an inline module)
+# open-flow snapshots), with the rules' network state; `net/mod.rs` named it
+# on the agent's host, whose notifier the drain awaits (an inline module).
+# R09b (lab PR 254): that binding is nn-linux's `net::flow_tracker`, with
+# the drain; the agent's path re-exports it
 "net::flow_tracker" = "nn-core"
 # R08b (lab PR 251): the netflow rows handed to the rules, paced per uid;
-# `net/mod.rs` names the gate on the agent's host (an inline module)
+# `net/mod.rs` named the gate on the agent's host (an inline module). R09b
+# (lab PR 254): nn-linux's `net::limiter`, with the drain, re-exported
 "net::limiter" = "nn-core"
 # post-plan (lab PR 224): the host's resolv.conf, mapped to nn-linux by
 # lab PR 239; R08b (lab PR 251): the set the network and chain rules
@@ -518,10 +550,22 @@ planned = false
 # its crate, and `combat.rs`, `impact.rs` and `impair.rs` name `LinuxHost`
 # by its crate with it: one reference each, as before (`net/mod.rs` keeps
 # its two). nn-admin 8, nn-core 15, nn-linux 3.
+# Lab PR 254 (R09b): 26 → 23, nn-linux 3 → 0. The sensors moved to
+# nn-linux with the eBPF object's embed, and their three references to the
+# agent's `boot` (the loader's attach permit, the degradations the DNS, exec
+# and loader report, the sensor list) left the scan with them: what they
+# name of `boot` went to nn-linux first (its `boot`: the phases and the
+# permit, which only the sequence gives; the degradations' registry; the
+# sensor list), and the exec guards' kernel configuration the load writes
+# stays the agent's behind the loader's `ExecGuards` (`exec_guards`).
+# Then 23 → 22, nn-core 15 → 14: the network drain moved to nn-linux, and
+# the flow tracker's and the rules' gate's binding to the Linux host,
+# which the drain names, with it; `net/mod.rs` re-exports them, and names
+# `LinuxHost` no more (it keeps one reference, to nn-linux).
 
 [ratchet]
 nn-admin = 8
-nn-core = 15
+nn-core = 14
 nn-evidence = 0
-nn-linux = 3
+nn-linux = 0
 nn-proto = 0

@@ -37,6 +37,8 @@ nn-core = { workspace = true }
 # the DNS reply parsers re-exported at `net::dns_cache` (R06's paths).
 nn-parse = { workspace = true }
 aya = { workspace = true }
+# R09b (lab PR 254): the sensors' ring records read in place (`Pod`).
+bytemuck = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -72,13 +74,26 @@ hex = "0.4"
 # `debug-trigger` here (plan §4.1 rule 4). Off by default; production
 # builds never see it.
 debug-trigger = []
+# R09b (lab PR 254): the attach permit without a boot sequence, for the
+# privileged tests that load the eBPF object outside the agent's start
+# (`boot::AttachPermit::for_tests`); the agent forwards its own
+# `test-privileged` here (plan §4.1 rule 4). Off by default; production
+# builds never see it.
+test-privileged = []
 # R09a (lab PR 253): the test doors this crate keeps for the agent's tests
 # that wire it — a capture of a process without a descriptor, the
 # host-critical guard on given identities, an unlock token minted without a
 # signature, the admin key set's fingerprints, the isolator on given
-# binaries (the agent enables it as a dev-dependency only, as nn-core's
+# binaries; R09b (lab PR 254): the FIM's stand-in for the kernel's watched
+# inodes (the agent enables it as a dev-dependency only, as nn-core's
 # `test-util`). No build of the binaries has it.
 test-util = []
+
+[build-dependencies]
+# R09b (lab PR 254): the staleness guard of the eBPF object `build.rs`
+# embeds (was the agent's): the stamp's source hash and the object's sha
+# computed by the same crate as xtask's writer, byte for byte.
+ebpf-guard = { path = "../../ebpf-guard" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -86,6 +101,10 @@ tempfile = "3"
 tracing-subscriber = { workspace = true }
 # the trusted-installer window's tests run on nn-core's test clock.
 nn-core = { workspace = true, features = ["test-util"] }
+# R09b (lab PR 254; was the agent's): parse the embedded eBPF object in
+# unit tests, with the parser aya 0.14.0 itself runs (lab PR 219: every map
+# of a type aya loads; the exploit guard's maps and programs).
+aya-obj = "=0.3.0"
 
 [lints]
 workspace = true

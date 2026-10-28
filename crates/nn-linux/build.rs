@@ -30,17 +30,30 @@
 //! startup for an absent one — make "the eBPF object is rebuilt
 //! atomically with the agent" an enforced invariant, not a comment.
 
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
     let dst = out_dir.join("northnarrow-agent-ebpf");
 
-    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = manifest
-        .parent()
-        .expect("agent crate must live one level under the repo root")
-        .to_path_buf();
+    // Wave 4 restructure, R09b (lab PR 254): the repository root is
+    // `.cargo/config.toml`'s `[env] NN_REPO_ROOT` (R00, lab PR 239), not
+    // the parent of this crate's directory: the script moved from `agent/`
+    // to `crates/nn-linux/` with the embed. The inputs below, the source
+    // closure ebpf-guard hashes and the verdicts are the same. Cargo gives
+    // the root as `<repository>/.` (`relative = true` on "."): its
+    // components, collected, drop the `.`, so the paths the refusals print
+    // and the inputs watched read as they did.
+    let repo_root: PathBuf = Path::new(&env::var_os("NN_REPO_ROOT").expect(
+        "NN_REPO_ROOT is set by the repository's .cargo/config.toml ([env]): build from \
+         inside the repository",
+    ))
+    .components()
+    .collect();
+    println!("cargo:rerun-if-env-changed=NN_REPO_ROOT");
 
     let ebpf_artifact = ebpf_guard::ebpf_artifact_path(&repo_root);
     let stamp_path = ebpf_guard::ebpf_stamp_path(&repo_root);
@@ -86,7 +99,7 @@ fn main() {
             ebpf_guard::Verdict::StaleSource { stamped, current } => panic!(
                 "\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
-                  STALE eBPF OBJECT — refusing to embed (agent/build.rs staleness guard)\n\
+                  STALE eBPF OBJECT — refusing to embed (crates/nn-linux/build.rs staleness guard)\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
                 The compiled eBPF object at\n    {artifact}\n\
                 was built from a DIFFERENT source tree than the one compiling now:\n\
@@ -107,7 +120,7 @@ fn main() {
             ebpf_guard::Verdict::ObjectMismatch { stamped, actual } => panic!(
                 "\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
-                  eBPF OBJECT DOES NOT MATCH ITS STAMP — refusing to embed (agent/build.rs)\n\
+                  eBPF OBJECT DOES NOT MATCH ITS STAMP — refusing to embed (crates/nn-linux/build.rs)\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
                 The compiled eBPF object at\n    {artifact}\n\
                 is not the object `cargo xtask build-ebpf` stamped:\n    \
@@ -126,7 +139,7 @@ fn main() {
             ebpf_guard::Verdict::Unstamped => panic!(
                 "\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
-                  UNSTAMPED eBPF OBJECT — refusing to embed (agent/build.rs guard)\n\
+                  UNSTAMPED eBPF OBJECT — refusing to embed (crates/nn-linux/build.rs guard)\n\
                 ═══════════════════════════════════════════════════════════════════════\n\
                 The compiled eBPF object at\n    {artifact}\n\
                 has no usable provenance stamp ({stamp}), so its freshness cannot be\n\

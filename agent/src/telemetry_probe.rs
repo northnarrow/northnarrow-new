@@ -72,8 +72,9 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 60;
 pub const FIRST_ROUND_SECS: u64 = 20;
 /// Seconds a probed event has to reach the pipeline.
 pub const DEADLINE_SECS: u64 = 5;
-/// Directory of the probe files (RuntimeDirectory of the unit).
-pub const PROBE_DIR: &str = "/run/northnarrow/probe";
+/// [`nn_linux::telemetry_probe::PROBE_DIR`] (R09b, lab PR 254: the
+/// file-open sensor, which moves to nn-linux, names it), under its path here.
+pub use nn_linux::telemetry_probe::PROBE_DIR;
 /// The child's argv[1]; `argv[2]` is the nonce.
 pub const PROBE_FLAG: &str = "--telemetry-probe";
 /// Suffix of the probed DNS name (`.invalid` is reserved, never resolves).

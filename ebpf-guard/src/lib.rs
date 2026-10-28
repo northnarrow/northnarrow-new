@@ -6,7 +6,7 @@
 //! `agent-ebpf/` is a **separate cargo project** (nightly, `rust-src`
 //! and the `bpfel-unknown-none` target), deliberately excluded from the
 //! userland workspace (root `Cargo.toml` `exclude = ["agent-ebpf"]`).
-//! Only `cargo xtask build[-ebpf]` compiles it. `agent/build.rs` then
+//! Only `cargo xtask build[-ebpf]` compiles it. `crates/nn-linux/build.rs` then
 //! `include_bytes!`-embeds whatever `.o` is sitting in
 //! `agent-ebpf/target/…` into the agent binary.
 //!
@@ -33,7 +33,7 @@
 //! - `cargo xtask build-ebpf` calls [`write_stamp`] right after a
 //!   successful compile, with that hash and the SHA-256 of the object
 //!   it just built.
-//! - `agent/build.rs` reads the object once, then [`verdict`] compares
+//! - `crates/nn-linux/build.rs` reads the object once, then [`verdict`] compares
 //!   the stamp ([`read_stamp`]) with the current [`ebpf_source_hash`]
 //!   and with the SHA-256 of those bytes; anything but
 //!   [`Verdict::Fresh`] is a hard build failure.
@@ -57,13 +57,13 @@ use std::{
 use sha2::{Digest, Sha256};
 
 /// Relative path (from the repo root) of the compiled eBPF object that
-/// `agent/build.rs` embeds. The eBPF crate builds release-only (the
+/// `crates/nn-linux/build.rs` embeds. The eBPF crate builds release-only (the
 /// verifier needs it), so this is always the `release` artifact.
 pub const ARTIFACT_RELPATH: &str =
     "agent-ebpf/target/bpfel-unknown-none/release/northnarrow-agent-ebpf";
 
 /// The provenance stamp sits next to the artifact with a `.buildhash`
-/// suffix. `cargo xtask build-ebpf` writes it; `agent/build.rs` reads
+/// suffix. `cargo xtask build-ebpf` writes it; `crates/nn-linux/build.rs` reads
 /// it. Living under `agent-ebpf/target/` means it is gitignored and is
 /// recreated by every eBPF build — exactly like the `.o` itself.
 pub const STAMP_RELPATH: &str =
@@ -90,7 +90,7 @@ pub fn ebpf_stamp_path(repo_root: &Path) -> PathBuf {
 }
 
 /// SHA-256 of an arbitrary byte slice, lowercase hex. Exposed so
-/// `agent/build.rs` can fingerprint the exact `.o` bytes it embeds
+/// `crates/nn-linux/build.rs` can fingerprint the exact `.o` bytes it embeds
 /// (the runtime integrity check compares against this) without pulling
 /// its own `sha2` dependency or risking a different digest encoding.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -241,7 +241,8 @@ pub fn read_stamp(repo_root: &Path) -> io::Result<Option<Stamp>> {
     }
 }
 
-/// `agent/build.rs`'s decision on the object it is about to embed.
+/// The embedding build script's decision on the object it is about to embed
+/// (`crates/nn-linux/build.rs`, the agent's until R09b, lab PR 254).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Built from the current sources, and these are the bytes `xtask`

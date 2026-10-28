@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared eBPF-object provenance: source-closure hashing + build stamp. Used by xtask (writes the stamp after building the .o) and agent/build.rs (verifies it before embedding). Both sides MUST compute the hash identically, so the logic lives here once."
+description = "Shared eBPF-object provenance: source-closure hashing + build stamp. Used by xtask (writes the stamp after building the .o) and crates/nn-linux/build.rs (verifies it before embedding). Both sides MUST compute the hash identically, so the logic lives here once."
 publish = false
 
 [lib]
