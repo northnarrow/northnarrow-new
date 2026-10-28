@@ -8,11 +8,16 @@
 //! `RateLimited`, as is every request after it. And the requests that
 //! carry no signature are answered as they are.
 //!
-//! `NN_REJECTION_TABLE_OUT=<file>` also writes every request's reply and
-//! row to that file (the server's clock masked), to compare two builds.
+//! The three tables — the refusals, the accepted requests, the rate limit
+//! — are golden files (lab PR 263's review, L-2):
+//! `agent/tests/golden/admin/expected/{rejections,accepted,rate-limited}.txt`,
+//! compared byte for byte by every `cargo test`. A change of a reply or of a
+//! row is a diff of them in the pull request that makes it: `cargo xtask
+//! golden --update` (`NN_GOLDEN_UPDATE=1`) rewrites them for review, never
+//! under CI (`docs/validation/GOLDEN_REPLAY.md` §7).
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
@@ -1104,13 +1109,30 @@ fn mask_clock(text: &str) -> String {
     text
 }
 
+/// A reply as the table prints it: its `Debug`, but the telemetry status
+/// an accepted request gets — the agent's counters, process-wide (other
+/// tests of the crate move them), and not the pipeline's: their own tests
+/// read them.
+fn reply_text(reply: &AdminMessage) -> String {
+    match reply {
+        AdminMessage::TelemetryStatusResponse(TelemetryStatusResponse {
+            result,
+            status: Some(_),
+        }) => format!(
+            "TelemetryStatusResponse(TelemetryStatusResponse {{ result: {result:?}, \
+             status: Some(<the agent's counters>) }})"
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
 /// One line of the table: a request's reply and row, the clock masked.
 fn table_line(verb: &str, case: &str, s: &Served) -> String {
     let row = &s.row;
     mask_clock(&format!(
-        "{verb} | {case} | reply {:?} | row op={} result={:?} key_fp={:?} cosigners={:?} \
+        "{verb} | {case} | reply {} | row op={} result={:?} key_fp={:?} cosigners={:?} \
          client={}/{}/{}/{:?} extra={}",
-        s.reply,
+        reply_text(&s.reply),
         row.op,
         row.result,
         row.key_fp,
@@ -1312,7 +1334,7 @@ fn every_verb_refuses_every_reason_with_its_reply_and_row() {
             writeln!(table, "{}", table_line(verb.op, &case, last)).unwrap();
         }
     }
-    write_table("rejections", &table);
+    golden("rejections", &table);
 }
 
 /// A request the pipeline accepts reaches its handler: the reply is the
@@ -1360,7 +1382,7 @@ fn an_accepted_request_reaches_its_handler_with_its_signers_named() {
         )
         .unwrap();
     }
-    write_table("accepted", &table);
+    golden("accepted", &table);
 }
 
 /// A connection's third counted failure is answered `RateLimited` (its
@@ -1429,7 +1451,7 @@ fn the_third_counted_failure_closes_the_connections_verification() {
             .unwrap();
         }
     }
-    write_table("rate-limited", &table);
+    golden("rate-limited", &table);
 }
 
 /// The requests that carry no signature, answered as they are: a challenge
@@ -1973,11 +1995,50 @@ fn every_role_is_in_the_role_tests() {
     }
 }
 
-/// `NN_REJECTION_TABLE_OUT=<file>`: the table appended to `<file>.<part>`.
-fn write_table(part: &str, table: &str) {
-    if let Some(out) = std::env::var_os("NN_REJECTION_TABLE_OUT") {
-        let mut path = PathBuf::from(out).into_os_string();
-        path.push(format!(".{part}"));
-        std::fs::write(&path, table).unwrap();
+/// The tables' golden files (the module doc).
+const GOLDEN_DIR: &str = concat!(env!("NN_REPO_ROOT"), "/agent/tests/golden/admin/expected");
+
+/// The variable `cargo xtask golden --update` sets, as for the decision
+/// and posture replays.
+const UPDATE_ENV: &str = "NN_GOLDEN_UPDATE";
+
+/// `table` is the committed `<part>.txt`, byte for byte — or, with
+/// `NN_GOLDEN_UPDATE=1` (never under CI), becomes it.
+fn golden(part: &str, table: &str) {
+    let path = Path::new(GOLDEN_DIR).join(format!("{part}.txt"));
+    if std::env::var(UPDATE_ENV).is_ok_and(|v| v == "1") {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{UPDATE_ENV}=1 with CI set: the golden files are written by a maintainer \
+             (`cargo xtask golden --update`) and reviewed, never by CI"
+        );
+        std::fs::create_dir_all(GOLDEN_DIR).unwrap();
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(table) {
+            std::fs::write(&path, table).unwrap();
+            eprintln!("golden: wrote {}", path.display());
+        }
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e} — `cargo xtask golden --update` writes it",
+            path.display()
+        )
+    });
+    if committed != table {
+        let first = committed
+            .lines()
+            .zip(table.lines())
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| committed.lines().count().min(table.lines().count()));
+        panic!(
+            "{}: line {} moved\n  committed: {}\n  now:       {}\n\
+             a reply or an audit row of the admin socket changed — if it is intended, \
+             `cargo xtask golden --update` and say in the pull request why",
+            path.display(),
+            first + 1,
+            committed.lines().nth(first).unwrap_or("<no line>"),
+            table.lines().nth(first).unwrap_or("<no line>"),
+        );
     }
 }
