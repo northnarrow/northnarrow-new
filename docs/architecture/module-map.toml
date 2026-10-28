@@ -291,6 +291,9 @@ planned = false
 # the loader on the agent's exec guards (`exec_guards`), an alias as the
 # posture's on `LinuxHost`
 "sensors" = "nn-linux"
+# R11a (lab PR 261): `main.rs`'s stop, after the event loop: the
+# composition
+"shutdown" = "northnarrow-agent"
 
 # ── agent/src: the shims of R05, R07 and R08a ─────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
