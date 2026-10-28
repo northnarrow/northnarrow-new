@@ -570,6 +570,33 @@ mod tests {
         assert!(has(&boot, BootStep::AuditWritable));
     }
 
+    /// R11b (lab PR 262): while the previous agent's hooks may close the
+    /// agent's files to this process (its early registration failed), a key
+    /// it cannot read leaves the open to the attest phase, after the attach
+    /// registered it; otherwise it starts unaudited, as before.
+    #[test]
+    fn a_key_closed_to_an_unregistered_start_defers_the_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("agent.sig.key");
+        crate::keys::AgentSigningKey::load_or_bootstrap(&key).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&key).is_ok() {
+            // root reads it all the same: nothing to show here
+            return;
+        }
+        let path = dir.path().join("audit.log");
+        let mut boot = BootSequence::new();
+        let c = audit_log(&mut boot, &path, &key, [1; 16], true, None).unwrap();
+        assert!(matches!(c.open, AuditOpen::Deferred(_)), "{:?}", c.open);
+        assert!(!c.fatal);
+        assert!(has(&boot, BootStep::AuditWritable));
+        let mut boot = BootSequence::new();
+        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
+        assert!(!c.fatal);
+    }
+
     #[test]
     fn a_missing_bpf_lsm_records_nothing_unless_opted_in() {
         let dir = tempfile::tempdir().unwrap();
