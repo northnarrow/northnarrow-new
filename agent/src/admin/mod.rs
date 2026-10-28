@@ -25,55 +25,6 @@
 //! audit NN-AUD-078 / NN-AUD-079: the challenge and the failure count live
 //! with the connection ([`ConnAuth`]).
 
-use std::collections::HashMap;
-use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use anyhow::{Context, Result};
-use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tracing::{error, info, warn};
-
-use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
-use ed25519_dalek::VerifyingKey;
-use nn_proto::admin_protocol::{
-    decode_frame, encode_frame, AdminMessage, AdminResult, CanaryBurnRequest, CanaryDeployRequest,
-    CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
-    ConfigOverlaySetRequest, ConfigOverlaySetResponse, DetectionSetStatusRequest,
-    DetectionSetStatusResponse, DetectionsRequest, DetectionsResponse, FimBaselineRequest,
-    FimReportRequest, FimReportResponse, FimStatusRequest, FimStatusResponse, ForcePostureRequest,
-    NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
-    NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
-    RemediateRansomwareRequest, RemediateRansomwareResponse, ResponseReleaseRequest,
-    ResponseReleaseResponse, ResponseRestoreRequest, ResponseRestoreResponse,
-    ResponseStatusRequest, ResponseStatusResponse, RotateKeysAddRequest, RotateKeysRevokeRequest,
-    ShutdownRequest, SignedUnlockRequest, SignedUnlockResponse, StatusResponse,
-    TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockResult,
-    MAX_FRAME_BODY,
-};
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
-use sha2::{Digest, Sha256};
-
-use crate::anti_tamper::admin_auth::{AdminAuth, AdminAuthError, ConnAuth};
-use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};
-use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
-use crate::audit::{AuditEntryDraft, AuditLog};
-use crate::canary::detector::CanaryIndexes;
-use crate::canary::registry::{
-    CanaryToken, CanaryTokenDraft, DecoyContent, Registry, RegistryError,
-};
-use crate::chainlog::RotatingChainLog;
-use crate::detection_store::{Principal, StatusEvent};
-use crate::fim::drain::DriftRateLimiter;
-use crate::fim::recompute::{BaselineRecomputeSender, RecomputeReason};
-use crate::posture::{AdminReleaseError, PostureMachine};
-use crate::shutdown_marker::{self, ShutdownMarker, DEFAULT_MARKER_PATH};
-
-use tokio::sync::Notify;
-
 /// External audit WDG-007: the socket's identity and its watch.
 pub mod socket_watch;
 
