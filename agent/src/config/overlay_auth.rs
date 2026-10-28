@@ -216,18 +216,12 @@ pub fn validate_content(kind: OverlayKind, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// External audit ATP-001 / DEP-003: content of `kind` that needs no
-/// signature because it is what the agent was built with — the shipped
-/// COMBAT rulesets and carve-out. The `.local` overlays have none.
-pub fn shipped_default(kind: OverlayKind) -> Option<&'static str> {
-    use crate::anti_tamper::network_isolate as ni;
-    match kind {
-        OverlayKind::CombatRulesV4 => Some(ni::BUILTIN_RULES_V4),
-        OverlayKind::CombatRulesV6 => Some(ni::BUILTIN_RULES_V6),
-        OverlayKind::CombatAllow => Some(ni::BUILTIN_ALLOW),
-        _ => None,
-    }
-}
+/// External audit ATP-001 / DEP-003: the content of `kind` that needs no
+/// signature because the agent was built with it — nn-linux's, beside the
+/// shipped COMBAT rulesets and carve-out it returns (R09c, lab PR 257: the
+/// integrity check, which moves to nn-linux, compares a COMBAT file with
+/// it), under its path here.
+pub use crate::anti_tamper::network_isolate::shipped_default;
 
 /// Outcome of the boot check for one overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
