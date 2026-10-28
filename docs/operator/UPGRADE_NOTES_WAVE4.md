@@ -29,6 +29,11 @@ has the details of each change below.
    first start of this release (§3): look for its signed
    `canary_trip_recovered`, and re-arm it with `nn-admin canary refresh`
    if you want it armed.
+6. A start the agent refuses exits 78 whatever refused it (the capability
+   gate, the audit log, the demo rules, the eBPF object and the state
+   directory exited 1), and every refusal is a signed `agent_boot` row: a
+   monitor that matched exit status 1 sees 78 (§6). A broken audit chain
+   now refuses the start before anything is loaded.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -200,3 +205,44 @@ with the content, and the `.meta` says `"format": 2`.
   that reason (`response restore` exits non-zero, nothing is written):
   the entry was changed or damaged after it was written.
 
+## 6. Refused starts (lab PR 262)
+
+The agent checks its integrity before it loads anything into the kernel
+and refuses the start when a check fails (`BOOT_INTEGRITY.md` §1 and §7).
+What an operator sees change:
+
+- **Exit status 78 for every refusal** (`EX_CONFIG`; systemd shows
+  `status=78/CONFIG`). The capability gate (CAP_KILL missing in
+  enforcement), the audit log (not writable, or its chain cannot be
+  opened), the demo rules' gate, the embedded eBPF object, the state
+  directory as a link, the sensors' load and the deny hooks' shortfall
+  exited 1; the install manifest, the BPF LSM, the deny self-test and the
+  BTF offsets already exited 78. The watchdog restarts a refused agent as
+  before, within its ceiling.
+- **Every refusal is signed.** An `agent_boot` row with `result: refused`
+  names the gate in `refused_by`: `ebpf_object`, `state_dir`,
+  `btf_offsets`, `demo_rules`, `capabilities`, `install_manifest`,
+  `audit_log`, `bpf_lsm`, `sensors`, `deny_hooks`, `deny_self_test`. A
+  refusal before the install manifest's check carries `binary_integrity:
+  unchecked`. A query of refused boots finds rows it did not find before.
+- **When the audit log is what refuses** (not writable, its chain broken),
+  the refusal is signed in `/run/northnarrow/boot-refusals.jsonl` (the
+  audit log's format and key: `sudo nn-admin audit verify --from
+  /run/northnarrow/boot-refusals.jsonl`). The next start that opens the
+  audit log records it there — a `boot_refusals_recovered` row, before its
+  own `agent_boot` — and removes the file. The file is on tmpfs: a reboot
+  before that start loses it (the journal keeps the refusal's lines).
+- **A broken audit chain refuses before the load.** A line before the end
+  that is not a row used to refuse the start after the eBPF object was
+  loaded, its maps pinned and the hooks attached; now nothing is loaded and
+  the previous agent's hooks, when pinned, stay as they were.
+- **A refused start leaves no protected pid.** Its registration in the
+  pinned `PROTECTED_PIDS` (made before it bootstrapped its files) is
+  withdrawn before it exits.
+- **The journal of a start**: `reusing existing agent signing key`, which
+  the audit log's open logs, comes before the attach now (it came after
+  the deny self-test); every other line is where it was.
+- **Rollback to a release before this one.** Nothing to migrate: the rows
+  are the audit log's format. An older agent does not read
+  `boot-refusals.jsonl`; it stays in `/run/northnarrow` until a reboot or
+  until this release starts again and records it.

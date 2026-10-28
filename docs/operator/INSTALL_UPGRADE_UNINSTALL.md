@@ -255,9 +255,11 @@ stages are `stop` (step 3–4), `switch` (step 5), `start` and `health_check`
 does not start is found, and reported, at `health_check`.
 
 **When the rollback cannot finish: exit 4.** A new agent that pinned its
-hooks and then died (a refused boot, exit 78) or that runs without answering
-on its socket keeps the files protected, and its window opens only through
-that socket; the script starts it once more for the window (as in §1) and,
+hooks and then died (a boot refused after its attach — its deny hooks or
+its deny self-test —, exit 78; a refusal before the load pins nothing since
+lab PR 262, `BOOT_INTEGRITY.md` §7) or that runs without answering on its
+socket keeps the files protected, and its window opens only through that
+socket; the script starts it once more for the window (as in §1) and,
 when that fails too, stops with `ROLLBACK INCOMPLETE` (on the terminal and
 at `auth.crit`) and leaves `rollback.sh` in the transaction directory: the
 copies and the functions that restore them. Then:
@@ -1010,7 +1012,9 @@ deleting the audit chain as well makes the install look new — that shows
 as a chain restarting from genesis in `nn-admin audit verify`.
 
 **Recovering from a refused boot** (mismatch, unreadable or removed
-manifest). The refused agent has already attached and pinned its hooks, so
+manifest). The refused agent loaded and pinned nothing (lab PR 262; its
+refusal is the signed `agent_boot` row, `refused_by: install_manifest`), but
+the hooks of the agent that ran before it are still pinned, so
 `/etc/northnarrow` stays protected, and a trusted-installer window needs a
 running agent. Start it once with the override taken from the service
 manager's environment (the agent records it as a weakening variable),

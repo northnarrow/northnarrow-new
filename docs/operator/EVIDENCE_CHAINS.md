@@ -18,6 +18,8 @@ repository, not shipped with the release):
 | every start, before anything opens | anchored heads and checkpoints compared with the files | ERROR `chain integrity: evidence missing or altered` + signed `integrity_drift` |
 | every start, at open | canary registry rows (all), canary access rows (last 256), audit row numbers | same |
 | every start, after the canary chains open | the access log's first-trip rows of the canaries the registry holds armed (lab PR 260) | a trip the registry does not record: ERROR `canary: a trip the registry did not record` + signed `canary_trip_recovered` + a `trip` row; the canary stays tripped |
+| a start refused while the audit log cannot take the refusal (it is the gate: not writable, its chain broken) | the refusal signed with the agent's key in `boot-refusals.jsonl` beside the pid file, `/run/northnarrow` (lab PR 262; `BOOT_INTEGRITY.md` §7) | ERROR `refused boot recorded in the fallback chain`; `sudo nn-admin audit verify --from /run/northnarrow/boot-refusals.jsonl` |
+| every start, once the audit log is open | that fallback chain, verified with the agent's key | a signed `boot_refusals_recovered` (`recorded`, or `refused` with why for a file that does not verify) before the boot's `agent_boot`; the file removed |
 | after the start, in the background | last 4 MiB of each rotating log's active file | signed `chain_verify` (`ok`/`broken`, each broken log with its `class`) + `integrity_drift` `chain_verify_failed`, at every start while the lines are there |
 | every `nn-admin detections` | the rows served | rows that do not verify are left out; ERROR + `chain_lines_unverified` |
 | on demand | `sudo nn-admin chain verify` | `OK`/`BROKEN` per chain, exit 8 on any problem |

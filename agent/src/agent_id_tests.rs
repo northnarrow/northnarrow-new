@@ -32,7 +32,7 @@ fn the_agent_reads_its_identity_once() {
         assert!(main.contains(consumer), "{consumer}");
     }
     // the boot's own entry, and a refused boot's (lab PR 218: one
-    // helper, `record_refused_boot`, for every gate)
+    // helper for every gate, `boot::refusal` since R11b, lab PR 262)
     assert_eq!(main.matches(".attest_identity(&identity)").count(), 1);
     assert_eq!(main.matches(".attest_identity(identity)").count(), 1);
     assert!(main.contains("AuditLog::open(&cli.audit_log_file, key, identity.id)"));

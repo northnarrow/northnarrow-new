@@ -417,6 +417,91 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- Every integrity check before the eBPF load and the pin, enforced by the
+  types, and every refused start signed (lab PR 262, Wave 4 restructure,
+  R11b; `docs/operator/BOOT_INTEGRITY.md` §1 and §7). **The map.** Lab PR
+  218 had moved the capability, install-manifest and audit-writability
+  checks before the attach, but the audit chain itself (the key loaded and
+  `AuditLog::open`, which repairs a torn last write and refuses a log with
+  a line before the end that is not a row) was opened by the attest phase,
+  after the object was loaded, its maps pinned, the sensors and the deny
+  hooks attached and the self-test run; and only the install manifest's,
+  the BPF LSM's and the self-test's refusals were signed — the eBPF
+  object, the state directory, the BTF offsets, the demo rules, the
+  capability gate and the audit log refused with a journal line (exit 1,
+  78 for the BTF), as did the gates after the load. **The proof.**
+  nn-linux's `boot::IntegrityVerified` (lab PR 218's `AttachPermit`): no
+  public field, not `Clone`, `Copy` or `Default`, its one constructor
+  outside tests `BootSequence::verify_integrity`, which requires every
+  preflight step; the steps the attach depends on (the eBPF object, the
+  state directory — required now too —, the BTF offsets, the capabilities,
+  the install manifest, the audit log, the BPF LSM) are recorded only by
+  `boot::checks`, each after its check ran against the host and passed
+  (`BootSequence::done` refuses them, `BootOrderError::Unchecked`). The
+  load (`SensorMultiplexer::start`, `start_with_net`, `ExecSensor::start`;
+  the maps' by-name pins are made there), `attach_anti_tamper` and
+  `anti_tamper::attach` (the pins and the deny hooks) and
+  `attach_exploit_guard` take `&IntegrityVerified`; every later attach
+  goes through the multiplexer's object; `EBPF_BYTES` is nn-linux's own.
+  The agent's `attach::load` takes `&IntegrityVerified` and `&StateReady`
+  (the plan's `attach(&IntegrityVerified, &StateReady)`; only
+  `state::bootstrap` builds one). The BPF LSM gate moved to nn-linux
+  (`boot::lsm`, re-exported) so that its check records its step.
+  Compile-fail doctests: no proof built outside nn-linux, none cloned, no
+  access to the object's bytes. **The audit chain before the load.**
+  `checks::audit_log` opens the log after the writability preflight; a
+  chain that cannot be opened refuses the start before anything is loaded
+  (fatal unless `NN_AUDIT_ALLOW_UNWRITABLE=1`), and the attest phase
+  appends the boot's rows to that log in the same order as before. When
+  the previous agent's hooks close the key or the log to this process (its
+  early registration failed), the open stays after the attach, which
+  registers it. **Signed refusals.** `boot::refusal`: every gate logs what
+  it found, then the refusal is signed — the rollback floor, the identity,
+  a `subsystem_degraded` where the gate had one, an `agent_boot` with
+  `result: refused` and `refused_by` (`ebpf_object`, `state_dir`,
+  `btf_offsets`, `demo_rules`, `capabilities`, `install_manifest`,
+  `audit_log`, `bpf_lsm`; after the load `sensors`, `deny_hooks`,
+  `deny_self_test`, `audit_log`; `binary_integrity: unchecked` before the
+  manifest's check) — in the audit log, else, when the audit log is the
+  gate, in `boot-refusals.jsonl` beside `--pid-file` (the audit log's
+  format and key, `/run/northnarrow` under the unit), else the journal
+  says why; the start's pid is withdrawn from the pinned PROTECTED_PIDS
+  (the previous agent's map it registered in before the bootstraps, or
+  this boot's after the attach), and the agent exits 78 for every gate.
+  The preflight's three refusals, found before the identity is read, are
+  signed at the start of the integrity phase, still before the load (a
+  linked state directory is not read nor written first). The next start
+  that opens the audit log records the fallback chain there, verified with
+  the agent's key, as one `boot_refusals_recovered` row before its own
+  `agent_boot`, and removes the file (one that does not verify is recorded
+  as refused and removed too). The gates after the load (the sensors' load
+  and attach, the deny hooks, the self-test, the boot's own row) keep
+  their place: they need the loaded object, the attached hooks or the
+  write. **Happy path unchanged**: the same checks, signed rows and
+  capability manifest; the key's `reusing existing agent signing key` line
+  comes before the attach now. Found, not changed: a signing key that
+  cannot be loaded starts the agent unaudited, as before. Tests: the
+  checks record only when they pass, no proof without every one, the chain
+  opens before the load or refuses, the refusals in the audit log, the log
+  already open, the fallback chain (a directory there, a failed write),
+  unsigned without `--pid-file`, the fallback recorded at the next start
+  or refused; the start's code (every pre-load refusal before the load,
+  the preflight's at the integrity phase's start, one exit); privileged
+  e2e (`agent/tests/boot_refusal_privileged_e2e.rs`: a tampered binary, an
+  unwritable audit log, a broken audit chain, CAP_KILL dropped — each exit
+  78, its signed row verified by `nn-admin audit verify`, no BPF program,
+  link or pin left, no own program-id list, its pid not left in
+  PROTECTED_PIDS). On the lab guest (Ubuntu 24.04): `test-ignored` 77
+  suites, 89 passed (the four new e2e on the real kernel); `tamper-check`
+  the same 75 outcomes and verdicts as `main`; the refusal paths on the
+  installed agent — a tampered binary, `chattr +i` on the audit log,
+  CAP_KILL dropped, a broken audit chain, a tampered binary with no pin —
+  each exit 78, signed, nothing loaded, no program or pin left, the pid
+  withdrawn (on `main`: three unsigned exits 1, the pid left in
+  PROTECTED_PIDS, and the broken chain refused after the load with 22
+  programs and 22 links left pinned); `upgrade-check` from `main` and back
+  OK; the boots the same 204 lines but the key's line, the same signed
+  rows and capability manifest.
 - A tripped canary came back armed when the agent stopped between the
   trip's two rows (lab PR 260; lab PR 258's KVM run on Ubuntu 24.04:
   the e2e fixture's restart signal landed there, and
