@@ -16,7 +16,7 @@
 //! them. This test holds the tree to it:
 //!
 //! 1. the helper classifies every path flag of the agent's command line
-//!    (each `PathBuf` field of `Cli`, `agent/src/main.rs`): `STATE_FLAGS`
+//!    (each `PathBuf` field of `Cli`, `agent/src/boot/cli.rs`): `STATE_FLAGS`
 //!    (written, or the agent's identity: the helper passes them) or
 //!    `INPUT_FLAGS` (read), each once — a new flag fails until it is
 //!    classified; and the helper passes every one of `STATE_FLAGS`;
@@ -51,7 +51,9 @@ use support::{repo_root, rs_files};
 const HELPER: &str = "agent/tests/common/agent_state.rs";
 const COMMON: &str = "agent/tests/common/mod.rs";
 const WATCHDOG_SUITE: &str = "watchdog/tests/privileged_e2e.rs";
-const AGENT_MAIN: &str = "agent/src/main.rs";
+// R11a (lab PR 261): the agent's command line is its `boot::cli` (it was
+// `main.rs`'s).
+const AGENT_MAIN: &str = "agent/src/boot/cli.rs";
 // R10 (lab PR 259): nn-admin's command line is nn-admin's (`cli`); the
 // agent package's `bin/nn_admin.rs` is the shim that runs it.
 const NN_ADMIN_MAIN: &str = "crates/nn-admin/src/cli.rs";
@@ -534,7 +536,7 @@ fn cli_path_flags(main_rs: &str) -> Vec<String> {
     let code = strip_comments(main_rs);
     let start = code
         .find("struct Cli {")
-        .expect("agent/src/main.rs: struct Cli");
+        .expect("agent/src/boot/cli.rs: struct Cli");
     let body = balanced(&code, start + "struct Cli ".len());
     let mut flags = Vec::new();
     let mut attrs = String::new();
@@ -556,7 +558,11 @@ fn cli_path_flags(main_rs: &str) -> Vec<String> {
         }
         let (name, ty) = field.split_once(':').unwrap_or(("", ""));
         if ty.contains("PathBuf") {
-            let name = name.trim().trim_start_matches("pub ").trim();
+            let name = name
+                .trim()
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ")
+                .trim();
             let flag = attrs
                 .split("long = \"")
                 .nth(1)

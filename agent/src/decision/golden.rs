@@ -1,8 +1,8 @@
 //! Lab PR 228: the golden replay.
 //!
 //! Recorded event streams (`agent/tests/golden/cases/*.json`) go through
-//! the decision path of `process_event` (`main.rs`), on an engine built the
-//! way `main.rs` builds it — the shipped lists of `configs/`, every
+//! the decision path of `process_event` (`pipeline`), on an engine built the
+//! way the start (`boot`) builds it — the shipped lists of `configs/`, every
 //! per-rule policy switch at its production value (`response_policy`: off)
 //! — over host state of the case's own, so nothing of the machine running
 //! the test is read: an empty `/proc`, the package database of the fixture
@@ -336,7 +336,7 @@ impl Sampler for Answers {
 }
 
 /// The host a replay runs on: its own `/proc` (empty) and file root, the
-/// engine `main.rs` builds over them (`replay::engine`).
+/// engine the start builds over them (`replay::engine`).
 struct Host {
     _proc: tempfile::TempDir,
     root: tempfile::TempDir,

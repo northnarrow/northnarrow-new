@@ -25,7 +25,8 @@ on:
     paths:
       - common/src/btf_offsets.rs
       - crates/nn-linux/src/anti_tamper/btf_revalidate.rs
-      - agent/src/main.rs
+      - agent/src/boot/mod.rs
+      - agent/src/boot/preflight.rs
       - deploy/btf-matrix/**
       - .github/workflows/btf-matrix.yml
   schedule:

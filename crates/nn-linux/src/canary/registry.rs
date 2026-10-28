@@ -2212,7 +2212,7 @@ mod tests {
         }
     }
 
-    /// The boot (`main.rs`, `record_unrecorded_trips`, without its audit
+    /// The boot (the agent's `record_unrecorded_trips`, without its audit
     /// row): the registry opens, then the access log (its torn tail
     /// repaired), then each trip the registry does not record is recorded.
     fn boot(dir: &TempDir) -> (Registry, Vec<UnrecordedTrip>) {

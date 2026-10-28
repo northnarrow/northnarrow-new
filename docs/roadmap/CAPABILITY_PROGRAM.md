@@ -2757,3 +2757,113 @@ only in the table below, in the same PR as the evidence.
     refuses the file: the canary subsystem is off until the file is
     repaired, as before.
   - Lab: On Ubuntu 22.04 (5.15.0-198, the lab guest ubuntu2204, QEMU for Windows with WHPX, 4 vCPU, 7 GiB), each tree synced, built and installed (`nn-lab.sh sync`, `build`, `install`), the installed units then stopped the operator way (`lab_purge_pins`, no LSM program left), `canary_privileged_e2e` run as root, single-threaded, with `--include-ignored` (8 tests with this lot's), the units put back, the guest powered off at the end. Before: this lot's tree with the boot's recovery switched off (`Registry::unrecorded_trips` returning nothing; a patch for the sync only, reverted right after it): the failpoint test failed 5 of 5 runs the same way on `main` 495296d and 5 of 5 rebased on `main` b8b55a95 — the agent stopped by the failpoint after the access row, and the next start recorded no trip (`the start recorded the trip: []`: the registry at its deploy row, the canary armed again). After, this lot's code on `main` 495296d (local commit 97c2d511): the suite 20 of 20 runs passed (31.2 to 31.6 s a run), then the failpoint test alone 10 of 10 (6.7 s); rebased on `main` b8b55a95 (lab PR 259; local commit 38478cfa, this commit's code): the suite 20 of 20 (31.3 to 34.5 s), the failpoint test alone 10 of 10 (6.7 to 6.9 s). In every suite run the failpoint stopped the agent once and the next start recorded one trip; the access row was written 1.7 ms before the stop (`access_ts` 11:39:54.138691, the failpoint's WARN at .140381), the next start's ERROR said `canary: a trip the registry did not record … access_row=0 … first_trip_rows=1`, and the next read was a recorded access, not a first trip. Host, on 38478cfa (this line is all that changed after it) and, before the rebase, on 97c2d511, `set -o pipefail`, `CARGO_BUILD_JOBS=4`: `cargo xtask build-ebpf --release` (the stamp's source 235e2fed…, `main`'s: `common` and the eBPF crates untouched); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --all -- --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 71 suites, 3,094 passed, 0 failed, 15 ignored, both times (`main`: 3,084; the 10 new unit tests); the `test_state_isolation` ratchet (10 passed: the new e2e starts its agent through the fixture, on lab PR 256's helper); `cargo xtask golden` (11 passed, every golden and posture golden file unchanged); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed): all pass.
+- **Lab PR 261 — nn-agent: `main.rs` cut into typed phases (Wave 4
+  Phase 2, R11a of the restructure plan; no level changes).**
+  - What was wrong: the agent's start was one function, `main.rs`'s
+    `run` — 3,900 lines from the log stream to the stop, with
+    `process_event` and ~40 helpers beside it (7,093 lines). The boot's
+    phases (lab PR 218) were enforced by `BootSequence` and the
+    `AttachPermit`, but their code was one scope: every value of the
+    start was a local of `run`, any line could read any of them, and the
+    order of the steps was the order of the lines. The tests that guard
+    that order (`boot`'s, `agent_id_tests`) and the state-isolation
+    ratchet read `main.rs` as text.
+  - What changed: first, in place (`main.rs`, one commit), `run` cut into
+    the phases its code already ran in, each a function that takes what
+    the phases before it produced and returns a struct of what the ones
+    after it read — `boot_preflight` → `Preflight`, `boot_state` →
+    `StateReady`, `boot_identity` → `Identity`, `boot_integrity` →
+    `Integrity` (with the attach permit), `boot_attach` → `Attached`,
+    `boot_self_test` → `SelfTested`, `boot_attest` → `Attested`, then
+    the subsystems (`Policy`, `Response`, `Posture`, the audit log's late
+    binding, `Combat`, `FimPaths`, `Stores`, FIM, `Canary`, the network
+    drain, the admin socket, `Tasks`), `boot_ready` → `Armed`, `run_loop`
+    → `Stopped`, `shutdown`; `run` calls them in that order and holds
+    what the agent keeps until it stops, as its locals did. Every line of
+    `run` is kept, in its order, but 49 edits the new signatures need (a
+    `&x` of a value the phase now borrows: `&cli`, `&overlay_gate`,
+    `&identity`, `&posture`, `Arc::clone(&x)`, `&mut sensor`, the event
+    loop's arguments; three `let mut` whose mutation is in a later phase)
+    and the `use …::OverlayKind` line, which goes to the imports. Then
+    the history (the plan's Appendix A): 21 commits, each on a branch of
+    its own, `git mv agent/src/main.rs <part>` (R100), merged beside
+    main.rs in one merge commit; then eight rounds that each delete one
+    contiguous region from each copy (pure deletions: xdiff's prefix and
+    suffix stripping leaves `git blame` nothing to guess — the copies'
+    trim in one commit defeated its cost heuristic and plain `git blame`
+    lost most of a file's lines); then the move: the copies become
+    the library's modules (a module header, the visibility a crate
+    boundary needs, the phases' names `boot_x` → `x::verb`), `main.rs`
+    the binary's shim (`northnarrow_agent::boot::main()`), and `main`'s
+    one-shot modes and runtime with `run` go to `boot/mod.rs` (cut, found
+    by `-C -C`). The plan's layout (§2.4): `boot/{cli, logging, preflight,
+    state, identity, integrity, attach, evidence, policy, response,
+    posture, fim, canary, net, admin, tasks, ready}.rs`,
+    `pipeline/{mod, process_event}.rs`, `run_loop.rs`, `shutdown.rs`. The
+    library names itself as the binary did (`extern crate self as
+    northnarrow_agent`, a shim until R17), so the moved lines'
+    `northnarrow_agent::` paths are unchanged; the doc of
+    `spawn_watchdog_exempt_refresh`, which sat on `HOST_STOPPING`, moved
+    onto it. Last, the plan's "Identity si costruisce una volta sola":
+    `Identity` gets a private field — only `identity::resolve` builds
+    one, `run` calls it once (the order test asserts each phase call
+    once), it is the start's one caller of `agent_id::resolve`
+    (`agent_id_tests`) — and the phase's unit test (a first start mints
+    and writes the id, every value the phase gives is that file's, the
+    next reads it back). The type guarantees hold as they did and more
+    visibly: `attach::load` takes the `AttachPermit` by value, which only
+    `integrity::check` holds (`BootSequence::enter_attach`, once every
+    preflight step is done: the order test asserts `enter_attach` once,
+    in the integrity phase, before the attach); `run_loop::run` takes the
+    `ready::Armed` only `ready::arm` makes. The tests that read `main.rs`
+    read the start's sources: `main_runs_the_phases_in_order` rebuilds
+    the start in the order it runs (`run`'s body, then each phase's in
+    the order `run` calls it, each call once and after the one before)
+    and asserts what it asserted; the heap and net drain tests too; the
+    identity's read-once scan and the counts read every file of `boot/`
+    and `pipeline/`, `run_loop.rs`, `shutdown.rs` and `main.rs` (their
+    test modules left out; a new file there is read too). The three Cli
+    tests run in the library's tests, under a lock with the new one (they
+    read the process environment `env_switches_read_1_and_0` sets).
+    xtask's `test_state_isolation.rs` reads the agent's flags from
+    `boot/cli.rs` (its parse drops `pub(crate)`); `btf-matrix.yml`'s path
+    filter names `boot/mod.rs` (the modes) and `boot/preflight.rs`
+    (`--btf-check`) where it named `main.rs`; the module map maps
+    `pipeline`, `run_loop` and `shutdown` to the agent, the ratchet stays
+    14 (the moved code is the agent's, which may name every crate).
+    The lot was rebuilt on lab PR 260 (`main` 45eaae3, merged while it
+    was in the lab): that lot's step of the canary start (the trips the
+    access log holds and the registry does not record, recorded before
+    the detector runs, and its two helpers) is in the first commit's
+    `main.rs` and moved with the canary phase into `boot/canary.rs`, its
+    115 lines as lab PR 260 wrote them (plain `git blame` gives them to
+    its commit); the comments of its tests that named `main.rs` name the
+    agent's `record_unrecorded_trips`.
+  - Deviations from the plan: the plan's module list predates lab PR 218
+    and is adapted to the code: no `keys` (the ~10 key loads stay where
+    they are: one KeyStore is R14c and would change behaviour), `sensors`
+    is `attach` (the attach phase and the self-test), and `integrity`
+    (the checks before the attach) and `ready` (the run phase's
+    manifest and READY) are new; `evidence` holds the attest phase, the
+    late binding and the stores, `posture` the machine and the ladder,
+    `fim` the paths and the subsystem — a module may hold two phases that
+    run apart. The plan's chain of types (`Preflight → StateReady →
+    Identity → Keys → Attached → Policy → Response → Evidence →
+    Subsystems → Armed → StopReason`) is the chain above (no `Keys`;
+    `Evidence` is `Attested` and `Stores`); a phase takes the values it
+    reads as parameters from `run`, which holds them, rather than each
+    phase threading the whole start through (ten phases take more than
+    seven, `#[allow(clippy::too_many_arguments)]` as `process_event`).
+    Appendix A's recipe, adapted: main.rs stays beside the copies (no
+    `tmp` rename on the main line), one merge of the 21 side commits, and
+    the trim in eight rounds of single-region deletions instead of a
+    commit per file, so that every first-parent commit builds and passes
+    the per-commit checks and plain `git blame` stays exact. R11b–R11d
+    are not done here (the integrity checks before the load, the global
+    setters, the admin socket's split).
+  - Open: R11b (HIGH, the checks before the load and the pin); R11c (the
+    late-bound setters `evidence::wire` gathers become explicit handles);
+    R11d; the shims (`extern crate self`), until R17; comments elsewhere
+    that name `main.rs` as where the agent wires something (the start's
+    modules now).
+  - Lab: On Ubuntu 24.04 (6.8.0-147, the lab guest ubuntu2404, ssh 2322, QEMU for Windows with WHPX, 4 vCPU, 7 GiB; no other guest up — lab PR 260's ubuntu2204 was off), its disk at 31 % (8.6 of 29 GB used). The lot's code on `main` 45eaae3 (c4fc7c24) synced, built (release, test-privileged,debug-trigger) and installed three times (`nn-lab.sh sync`, `build`, `install` ×3: three boots): `test-ignored` (every `#[ignore]` test as root, single-threaded, its five runs): 76 suites, 85 passed, 0 failed — `main` 45eaae3's, run on the same guest after the lot's: the same 76 suites and 85 tests, each with the same outcome (lab PR 260's failpoint test the one more than lot 259's 84) —, the tests' agents' 52 chain checks `result="ok"`; `tamper-check`: 72 of 75 cases OK — C27 (no lockdown on the guest) and C57c (the journal's vacuum) known gaps, C64 (lab PR 215's stale own link id) the recorded deviation. `main` 45eaae3 on the same guest right after, synced, built and installed three times the same way: `tamper-check` the same 75 outcomes and verdicts, case by case: 72 of 75 OK, the same two gaps and the same deviation; the evidence of 8 cases differs by what landed in a case's window — the self-integrity watcher's jittered rounds (an `integrity_drift` or its clearing in C14, C19, C26, C34, C35, C39), the overlay rollback floor's anchor (the tip's C24 boot), an R011 of systemd's (the tip's C12) —; over each run the self-integrity findings are the same, kind by kind and count by count (32 rows each: the lab's admin key on the host (5), two unit drop-ins, two shadowed units, two unexpected limits, two mounts over protected paths and a second bpffs, each found and cleared, the agent stalled (C15), the watchdog gone, C23's unsigned overlay as `config_overlay` and `unauthorized_overlay`, the detections log's check at each boot), but one more `chain_verify_failed` on the tip — the boot its run's start made, `test-ignored` having stopped the units — and one more `limit_unexpected` cleared on `main` (on the tip the case's restart came 29 s after the finding, before a round). `upgrade-check` from that `main` to the lot's code: `install.sh` without `--upgrade` refused; with `--upgrade` and the lab's admin key the trusted-installer window opened, both units stopped, the pins dropped and NorthNarrow's BPF programs unloaded, both units started, "UPGRADE complete — health check passed"; a new agent pid and a new `agent_boot` (audit log 5,607 → 5,614 lines), the identity the same, 19 of 19 deny hooks, 36 own LSM programs before and after, no foreign one. The boot log: the journal of each boot from "NorthNarrow agent starting..." to READY — the lot's three, `main`'s three, the upgraded one —, compared line by line after the values one boot changes are masked (pids, the inodes of the files the installs rewrite, chain hashes, the chains' row counts, durations, and the time of the first line the detections log's check flags in its 4 MiB window, which moves as the log grows): the same 204 lines in the same order, every boot of both builds and the upgrade's; unmasked, 188 of the 204 are byte for byte the same (the journal's time aside) and the other 16 differ in pids (3), inodes (7), entry hashes (2), the floor's verified count and time (2), the sequence seed (1) and that window (1). Their signed rows, from the previous run's `agent_stop` to the boot's capability manifest, op by op with time, sequence, hashes, signatures, pids and the rows' counts masked: the same on all seven (`agent_boot`, `chain_verify`, its `integrity_drift`, `capability_manifest`), and the capability manifest the same but its time and hashes: kernel and BTF (116 offsets resolved, 5 drifted, none absent), BPF LSM active, 19 of 19 deny hooks, the deny self-test denied, the BPF guard observing (a debug-trigger lab build), the same nine sensors on the same attach points, the same host hardening table (11 checks), no degradation, trust level L3. Every boot verified its own binary, the watchdog, nn-admin, the scanner and the embedded eBPF object against the install manifest ("binary integrity verified", `checked=5`, provenance `source-tree`). Each boot's chain check flags the guest's detections log — lab PR 256's class, lines signed by another key (288 → 258 of ~5,070 lines checked as the window moves; none added by these runs) — on `main`'s boots as on the tip's. A first round, before lab PR 260 merged, on `main` b8b55a9 with the lot's code then (2a84d2dc; the same steps, `upgrade-check` too) gave the same results — `test-ignored` 76 suites, 84 passed; the boots the same 205/204 lines in the same order but for one line of a task the start spawns ("fim recompute task: ready"), one place apart in one boot, as between two boots of one build; the same signed rows and manifest — but C15 in `main`'s `tamper-check`, a DEVIATION: its 45 s cgroup freeze began 1.1 s after a round of the self-integrity watcher (13:24:06.27; the thaw at 13:24:52.39, when the agent answered the watchdog's timed-out STATUS ping), and the next round, 24 to 36 s after the last (jittered), came 10 to 15 s late, under the watcher's 15 s stall threshold (`STALL_SLACK_SECS`): no `agent_stalled`, by design; C15 alone, three times on that `main` and three times on the lot's code, was OK every time, with the same evidence run by run (an `agent_stalled`, then twice the watchdog's stuck recovery after two timed-out STATUS pings: SIGINT, SIGKILL, a new agent). The guest powered off after. Host, on c4fc7c24 (the lot's code) and again on the final tree (the documentation commit; this line is all that changed after that run), `set -o pipefail`, `CARGO_BUILD_JOBS=6`: `cargo xtask build-ebpf --release` (the stamp's source 235e2fed…, `main`'s); the four clippy runs with `-D warnings` (workspace all targets; agent and watchdog with test-privileged,debug-trigger; posture_demo); `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 71 suites, 3,095 passed, 0 failed, 15 ignored (`main` 45eaae3: 3,094, the identity phase's test the one more); `cargo test --no-run` with northnarrow-agent/test-privileged,debug-trigger; `cargo xtask attack-coverage --check`; `cargo xtask golden` five times, each a process of its own: 11 tests passed each time, the 33 golden files the same bytes after every run and the tree clean; `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (nightly-2025-12-01, cargo-fuzz 0.13.2, the 13 targets' seeds and regressions; no lockfile changed by the build); `portable-core`'s `cargo check` of the pure crates for its five targets; every first-parent commit of the lot checked on its own (`cargo check` of the workspace and of the agent with the privileged features, `fmt`, clippy, the module map, path liveness, layer and state-isolation tests, the start's textual tests and the Cli's: lib 20 and bin 3 before the move, 23 and 0 after it, 24 with the identity test): all pass. The pins pass unchanged, by name: `encoded_frames_are_pinned`, `chain_format_pin` (5, its generator ignored), `chain_format_clock` (2), `crypto_vectors` (19: nn-parse 1, nn-proto 2, the agent 3, nn-linux 13), the TLS and DNS parser pins (5), the overlay-v1 fixture (2), the per-rule policy's format (its 12 tests, nn-core's; the exemption facts' 2, nn-linux's; the signed overlay's and the fuzz seeds' tests). The output matrix of lot 259 (1,964 cases: every nn-admin subcommand, its help texts, errors, socket verbs against the mock agent with every reply), `main` 45eaae3's binaries and the tip's: the same stdout, stderr, exit status, files written and requests sent in 1,964 of 1,964 cases, release and lab build alike (`main` 45eaae3's against b8b55a9's: 1,964 of 1,964). Identity against `main` 45eaae3, both built in one exported tree (the same path), the release job's commands (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=x86-64-v2 cargo xtask build --release --locked`; unstripped: the same flags, `CARGO_PROFILE_RELEASE_STRIP=none`): the eBPF object is byte-identical, its stamp too (source 235e2fed…); the scanner (401,384 bytes) and the watchdog (2,337,064) are byte-identical, stripped and unstripped; `mk-tarball.sh`: the same 72 entries, paths and modes, the three SBOMs the same components and edges (agent 146, scanner 59, watchdog 112); `mk-packages.sh` (.deb): the same 79 paths and modes; `posture_demo` the same 29 lines; the agent's `--help` (380 lines), `--version`, `--build-features` (release and lab build), `--btf-check` on the host's BTF and a bad flag: the same text and exit status; the test list is `main`'s — 3,109 names, every one found, 3 at a new path (the Cli's tests, `src/main.rs::tests` → `src/lib.rs::boot::cli::tests`) — and one new (`boot::identity::tests::the_phase_reads_the_identity_and_gives_its_id`: 3,110); no `#[ignore]` added. The agent (15,338,880 → 15,182,136 bytes, `.text` 7,615,176 → 7,499,640, −1.5 %) and nn-admin (4,218,272 → 4,228,928) are not byte-identical. Function by function (unstripped, demangled names mapped to the new modules, addresses and rip-relative targets dropped, trailing padding dropped; unpaired functions paired again by their code): the agent 6,408 of 6,784 paired names the same code; of the 376 that differ, 214 have another count of bodies (generic code the binary's crate instantiated beside the library's is the library's now: fewer copies for 159, more for 55), 128 call other callees (inlining at the new crate boundary), 17 are scheduled otherwise, 11 differ in several bodies, 6 in operands; 53 are the same code under another name (the tasks `run` spawned, its closures then, a phase's now, and their tokio harnesses); unpaired, old 205 — `run`, its closures and their task harnesses (141), library code instantiated or inlined otherwise (61), `start_open_sensor`, `attest_chain_findings` and lab PR 260's `record_unrecorded_trips` with its `attest_trip_recovered`, inlined into their phases now — and new 187 — the 23 phases, their closures and harnesses (155), library code out of line now (32: the engine's `decide`, nn-core's `load_comm_allowlist`, `CanaryIndexes::rebuild_live`, …); nn-admin, which links the library, 3,135 of 3,188 (53: 34 another count of bodies, 17 callees, 2 scheduling; unpaired 3 and 8: the replay's `decide` and the security-tool detector's `assess` out of line). Against `main` b8b55a9 (the first round, the lot's code then) the same 376 functions differed in the same classes, the same 53 were renamed, the same 187 new: the two more old ones are lab PR 260's. `.rodata`: the same text but the 257 log callsites of the moved code, which name their new files (`event <file>:<line>`; 957 callsites in all, the same count), the new modules' paths (tracing's module path, not printed: the agent's journal lines have no target) and the moved files' paths (panic locations); the rest is laid out otherwise — each side's printable text is found in the other's, in pieces of 8 characters or more, but 0.08 % of the characters (printable bytes of binary constants at the strings' edges). The documentation commit builds the same binaries as the code commit, byte for byte — the four, stripped and unstripped, the agent and nn-admin of the lab build, the eBPF object and its stamp: every edited source file kept its line count. `cargo doc --workspace --no-deps`: no warning the tree did not have (the agent library's 52, `main`'s). History, `git blame` at the move commit: the 21 new files, 7,941 lines — plain `git blame` gives this lot 1,138 (the phases' signatures, structs and docs, the module headers and visibility) and the other 6,803 to the commits that wrote them, lab PR 260's 115 in `boot/canary.rs` to its commit; `git blame -C -C -M` gives this lot 1,064; `boot/mod.rs` (718 lines, which received `main`'s modes by a cut) 572 plain, 513 with `-C -C -M`.

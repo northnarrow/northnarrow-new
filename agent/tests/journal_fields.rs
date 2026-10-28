@@ -369,7 +369,7 @@ fn no_attacker_named_field_is_logged_raw() {
 /// The agent and the watchdog write their log through the line guard: the
 /// statement that installs the process's subscriber
 /// (`tracing_subscriber::fmt()…init()`), in whichever file of the daemon's
-/// sources it lives (R00: `main.rs` today, a boot phase after R11a).
+/// sources it lives (R00: `main.rs`; since R11a, `boot/logging.rs`).
 #[test]
 fn both_daemons_log_through_the_line_guard() {
     for (pkg, dir) in members() {

@@ -5,8 +5,8 @@
 //! answers — the posture state machine and the COMBAT ladder. This one
 //! does, before R08 moves them into nn-core: recorded streams
 //! (`agent/tests/golden/posture/cases/*.json`) go through the path
-//! `process_event` (`main.rs`) takes for the posture and the ladder, on a
-//! machine and a ladder wired the way `main.rs` wires them, over a host of
+//! `process_event` (`pipeline`) takes for the posture and the ladder, on a
+//! machine and a ladder wired the way `boot` wires them, over a host of
 //! the case's own, and what each step gives is one line of
 //! `agent/tests/golden/posture/expected/<case>.jsonl`: every posture
 //! transition (from, to, trigger, the evidence it cites), every call the
@@ -22,9 +22,9 @@
 //! - the clock: the replay's own ([`ReplayClock`]), on the events' clock
 //!   (`timestamp_ns`); the posture machine (`PostureMachine::with_clock`)
 //!   and the trusted-installer window (`TrustedInstallerOverride::
-//!   with_clock`) read it, the ladder is handed it as `main.rs` hands it
+//!   with_clock`) read it, the ladder is handed it as `boot` hands it
 //!   `Instant::now()`, and the wall clock starts at 2026-01-01T00:00:00Z
-//!   at the events' zero. The heartbeats of `main.rs` fire as the clock
+//!   at the events' zero. The heartbeats of `boot` fire as the clock
 //!   passes them: the window's expiry every second, the ladder's tick
 //!   every 5 s, the posture's decay every 60 s (in that order when they
 //!   fall together);
@@ -136,7 +136,7 @@ const THREADS: usize = 4;
 /// The replayed agent's identity (the audit rows' `agent_id`, the signed
 /// requests' binding).
 const AGENT_ID: [u8; 16] = *b"golden-posture-1";
-/// The replayed agent's own pid, exempt from the posture as `main.rs`
+/// The replayed agent's own pid, exempt from the posture as `boot`
 /// exempts `std::process::id()` (above `PID_MAX_LIMIT`, so never a case's).
 const AGENT_PID: u32 = 4_200_000;
 /// The administrator's key: a fixed seed, so its fingerprint is the same
@@ -148,15 +148,15 @@ const ADMIN_SEED: [u8; 32] = [0x2a; 32];
 const AUDIT_KEY_SEED: [u8; 32] = [0x5e; 32];
 /// The wall clock at the events' zero: 2026-01-01T00:00:00Z.
 const WALL_AT_ZERO_SECS: u64 = 1_767_225_600;
-/// `main.rs`'s heartbeats.
+/// `boot`'s heartbeats.
 const INSTALLER_TICK: Duration = Duration::from_secs(1);
 const LADDER_TICK: Duration = Duration::from_secs(5);
 const DECAY_TICK: Duration = Duration::from_secs(60);
-/// `main.rs`'s wait for the ladder's stand-down before a release.
+/// `boot`'s wait for the ladder's stand-down before a release.
 const LADDER_RELEASE_WAIT: Duration = Duration::from_secs(30);
 /// `/proc` clock ticks per second (`USER_HZ`).
 const USER_HZ: u64 = 100;
-/// The cgroup `main.rs`'s executor kills a tree in
+/// The cgroup `boot`'s executor kills a tree in
 /// (`ExecutorConfig::kill_cgroup_dir`), as the host's trace names it.
 const KILL_CGROUP: &str = "northnarrow.slice/blocked.scope/neutralize";
 
@@ -629,7 +629,7 @@ impl Host {
 struct HostActuator {
     host: Arc<Host>,
     detect_only: bool,
-    /// The executor's tree guard (`main.rs`: the ladder's guard, on every
+    /// The executor's tree guard (`boot`: the ladder's guard, on every
     /// pid the walk would kill).
     guard: SystemProtectedProcs,
 }
@@ -996,7 +996,7 @@ impl Replay {
         let fixture = Path::new(GOLDEN_DIR).join("host");
         let lineage = AuthSessionTracker::new(&proc_root).with_host_root(&fixture);
 
-        // The signed audit log and its key (`main.rs`: the agent's). Lab PR
+        // The signed audit log and its key (`boot`: the agent's). Lab PR
         // 249: a fixed key, the replay's clock and the replayed agent's pid,
         // so the rows — their hashes and signatures — are the same bytes in
         // every replay.
@@ -1020,7 +1020,7 @@ impl Replay {
             .unwrap(),
         ));
 
-        // The shared judges (`main.rs`: the shipped lists, the lineage).
+        // The shared judges (`boot`: the shipped lists, the lineage).
         let ransom = Arc::new(RansomTracker::with(
             lineage.clone(),
             ProgramOwners::new(&fixture),
@@ -1061,7 +1061,7 @@ impl Replay {
         );
 
         // The posture, its hooks reaching the ladder through a slot as in
-        // `main.rs`; the entry hook engages the ladder with the posture's
+        // `boot`; the entry hook engages the ladder with the posture's
         // entry (lab PR 245: the trigger, the evidence it cites, the
         // event's process); the release hook stands the ladder down, then
         // lifts the isolation and reads the tables back. (Weakly: the
@@ -1118,7 +1118,7 @@ impl Replay {
         posture.set_defense_detector(Arc::clone(&defense));
         defense.set_installer_window(Arc::clone(&window));
 
-        // The ladder (`main.rs`), its side effects in the caller.
+        // The ladder (`boot`), its side effects in the caller.
         let guard = || {
             SystemProtectedProcs::with_parts(
                 AGENT_PID,
