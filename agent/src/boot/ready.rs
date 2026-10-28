@@ -1,8 +1,16 @@
+//! `BootPhase::Run`, its first steps: the capability manifest and the trust
+//! level signed, then READY (R11a, lab PR 261: from `main.rs`'s `run`).
+
+use anyhow::Result;
+use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
+use tracing::{debug, info, warn};
+
+use super::evidence::AuditHandle;
 
 /// The boot is over: the capability manifest and the trust level are
-/// signed and systemd was told the agent is ready ([`boot_ready`]); the
+/// signed and systemd was told the agent is ready ([`arm`]); the
 /// event loop takes it.
-struct Armed {
+pub(crate) struct Armed {
     _private: (),
 }
 
@@ -10,7 +18,7 @@ struct Armed {
 /// boot is done — the capability manifest and the trust level are signed
 /// before systemd hears the agent is ready (`sd_notify`), then the boot's
 /// transient heap goes back to the kernel (lab PR 231).
-fn boot_ready(
+pub(crate) fn arm(
     boot: &mut BootSequence,
     bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
     self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,

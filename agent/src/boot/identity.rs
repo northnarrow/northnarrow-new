@@ -1,17 +1,27 @@
+//! The agent's identity, read once, and the overlay gate on it (R11a, lab
+//! PR 261: from `main.rs`'s `run`).
 
-/// What [`boot_identity`] read.
-struct Identity {
+use std::sync::Arc;
+
+use anyhow::Result;
+use northnarrow_agent::agent_id;
+use northnarrow_agent::boot::{BootSequence, BootStep};
+
+use super::cli::Cli;
+
+/// What [`resolve`] read.
+pub(crate) struct Identity {
     /// The agent's identity, read once (MAIN-009).
-    identity: agent_id::AgentIdentity,
+    pub(crate) identity: agent_id::AgentIdentity,
     /// Its id: every consumer takes this binding.
-    agent_id: [u8; 16],
+    pub(crate) agent_id: [u8; 16],
     /// The operators' signed overlays, verified against that id.
-    overlay_gate: Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
+    pub(crate) overlay_gate: Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
 }
 
 /// The agent's identity, read once (MAIN-009), and the signed overlays'
 /// gate on it (Tappa 10.8).
-fn boot_identity(
+pub(crate) fn resolve(
     cli: &Cli,
     boot: &mut BootSequence,
     rollback_floor: northnarrow_agent::config::overlay_floor::RollbackFloor,

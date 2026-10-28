@@ -1,27 +1,40 @@
+//! `BootPhase::Preflight`, its checks before anything attaches, and the
+//! attach permit (R11a, lab PR 261: from `main.rs`).
 
-/// What [`boot_integrity`] decided: the no-enforcement gate, the checks'
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Result;
+use northnarrow_agent::agent_id;
+use northnarrow_agent::boot::{BootSequence, BootStep};
+use northnarrow_agent::response::ExecutorConfig;
+use tracing::{debug, error, info, warn};
+
+use super::cli::Cli;
+
+/// What [`check`] decided: the no-enforcement gate, the checks'
 /// results the attest phase and the capability manifest sign, and the
 /// permit the attach takes.
-struct Integrity {
-    exec_cfg: ExecutorConfig,
-    detect_only: bool,
+pub(crate) struct Integrity {
+    pub(crate) exec_cfg: ExecutorConfig,
+    pub(crate) detect_only: bool,
     /// Where detect-only came from (MAIN-008), for `agent_boot`.
-    detect_only_source: Option<String>,
+    pub(crate) detect_only_source: Option<String>,
     /// The capabilities missing in enforcement, signed once the audit log
     /// is open.
-    caps_degraded: Vec<String>,
+    pub(crate) caps_degraded: Vec<String>,
     /// The install manifest's verdict, for `agent_boot`.
-    integrity: northnarrow_agent::install_manifest::IntegrityOutcome,
+    pub(crate) integrity: northnarrow_agent::install_manifest::IntegrityOutcome,
     /// The host hardening table, for the capability manifest.
-    host_checks: Vec<northnarrow_agent::host_hardening::Check>,
+    pub(crate) host_checks: Vec<northnarrow_agent::host_hardening::Check>,
     /// `NN_ANTI_TAMPER_ALLOW_DEGRADED`, for the self-test.
-    allow_degraded: bool,
+    pub(crate) allow_degraded: bool,
     /// The active LSMs, for the self-test, the trust level and the
     /// capability manifest.
-    bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
+    pub(crate) bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
     /// Lab PR 218: the only way into the kernel, given by
     /// `BootSequence::enter_attach` once every preflight step is done.
-    attach_permit: northnarrow_agent::boot::AttachPermit,
+    pub(crate) attach_permit: northnarrow_agent::boot::AttachPermit,
 }
 
 /// `BootPhase::Preflight`, its checks before anything attaches (lab PR 218,
@@ -31,7 +44,7 @@ struct Integrity {
 /// signed (`record_refused_boot`) and the start stops with the host
 /// untouched. It ends in `BootSequence::enter_attach`, which hands out the
 /// attach permit only once every preflight step is done.
-fn boot_integrity(
+pub(crate) fn check(
     cli: &Cli,
     boot: &mut BootSequence,
     identity: &agent_id::AgentIdentity,
@@ -364,7 +377,7 @@ fn boot_integrity(
 /// `subsystem_degraded` (`degraded`: source and detail) and the `agent_boot`
 /// `refused` naming the gate — so root cannot quietly remove the trace
 /// (lab PR 21).
-fn record_refused_boot(
+pub(crate) fn record_refused_boot(
     cli: &Cli,
     identity: &agent_id::AgentIdentity,
     overlay_gate: &northnarrow_agent::config::overlay_auth::OverlayGate,

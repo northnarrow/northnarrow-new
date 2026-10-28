@@ -1,29 +1,49 @@
+//! `BootPhase::Attach` and `BootPhase::SelfTest` (R11a, lab PR 261: from
+//! `main.rs`): the eBPF object, the sensors and the deny hooks attach on
+//! the permit the integrity checks gave, then one deny hook is exercised
+//! against the agent itself.
 
-/// What [`boot_attach`] attached.
-struct Attached {
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use nn_proto::admin_signed_payload::OverlayKind;
+use northnarrow_agent::agent_id;
+use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
+use northnarrow_agent::net::dns_cache::DnsCache;
+use northnarrow_agent::net::flow_tracker::FlowTracker;
+use northnarrow_agent::posture::AuthSessionTracker;
+use northnarrow_agent::sensors::SensorMultiplexer;
+use tracing::{debug, error, info, warn};
+
+use super::cli::{Cli, DnsSensor, ExecSensor, ExploitGuard, FileOpenSensor};
+use super::integrity::record_refused_boot;
+
+/// What [`load`] attached.
+pub(crate) struct Attached {
     /// The process lineage the posture, the rules and the pumps share.
-    lineage: AuthSessionTracker,
-    flow_tracker: Arc<parking_lot::Mutex<FlowTracker>>,
-    dns_cache: Arc<DnsCache>,
-    execq_mode: northnarrow_agent::execq::Mode,
-    execpol_mode: northnarrow_agent::execpol::Mode,
+    pub(crate) lineage: AuthSessionTracker,
+    pub(crate) flow_tracker: Arc<parking_lot::Mutex<FlowTracker>>,
+    pub(crate) dns_cache: Arc<DnsCache>,
+    pub(crate) execq_mode: northnarrow_agent::execq::Mode,
+    pub(crate) execpol_mode: northnarrow_agent::execpol::Mode,
     /// Where the ids of the agent's BPF programs go (DEP-006).
-    own_prog_ids_file: Option<PathBuf>,
-    sensor: SensorMultiplexer,
+    pub(crate) own_prog_ids_file: Option<PathBuf>,
+    pub(crate) sensor: SensorMultiplexer,
     /// The network drain's rings.
-    net_bufs: northnarrow_agent::sensors::multiplexer::NetRingBufs,
+    pub(crate) net_bufs: northnarrow_agent::sensors::multiplexer::NetRingBufs,
     /// The exploit guard off or unavailable, signed once the audit log is
     /// open.
-    exploit_guard_degraded: Option<String>,
+    pub(crate) exploit_guard_degraded: Option<String>,
 }
 
 /// `BootPhase::Attach`: the eBPF object loads and the sensors attach
 /// (`SensorMultiplexer::start_with_net`), the deny hooks attach and the
 /// agent registers in them (`attach_anti_tamper`), the exploit guard
 /// attaches. Both attaches take `attach_permit`, which only
-/// [`boot_integrity`] hands out: nothing reaches the kernel before every
+/// [`crate::boot::integrity::check`] hands out: nothing reaches the kernel before every
 /// preflight check has run.
-async fn boot_attach(
+pub(crate) async fn load(
     cli: &Cli,
     boot: &mut BootSequence,
     attach_permit: northnarrow_agent::boot::AttachPermit,
@@ -207,16 +227,16 @@ async fn boot_attach(
     })
 }
 
-/// What [`boot_self_test`] measured.
-struct SelfTested {
-    self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
+/// What [`self_test`] measured.
+pub(crate) struct SelfTested {
+    pub(crate) self_test: northnarrow_agent::boot::deny_selftest::SelfTestOutcome,
 }
 
 /// `BootPhase::SelfTest` (lab PR 218, external review AR-09 / G-12): one
 /// deny hook exercised against the agent itself; hooks attached but never
 /// run refuse the start (signed) unless the degraded mode is asked for.
 #[allow(clippy::too_many_arguments)]
-fn boot_self_test(
+pub(crate) fn self_test(
     cli: &Cli,
     boot: &mut BootSequence,
     identity: &agent_id::AgentIdentity,
@@ -286,7 +306,7 @@ fn own_prog_ids_file(cli: &Cli) -> Option<PathBuf> {
 
 /// Write the program-id list (see [`own_prog_ids_file`]); a failure is a
 /// WARN: the scripts then fall back to their older, host-wide wait.
-fn record_own_prog_ids(path: Option<&std::path::Path>, ebpf: &aya::Ebpf) {
+pub(crate) fn record_own_prog_ids(path: Option<&std::path::Path>, ebpf: &aya::Ebpf) {
     let Some(path) = path else {
         return;
     };

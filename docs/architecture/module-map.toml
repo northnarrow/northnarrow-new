@@ -137,6 +137,8 @@ planned = false
 
 [modules.agent]
 "lib" = "northnarrow-agent"
+# R11a (lab PR 261): the binary's root, the shim that runs the library's
+# start (`boot::main`)
 "main" = "northnarrow-agent"
 # R10 (lab PR 259): the binary's logic moved to nn-admin (its `cli`); the
 # root left here is the agent package's shim, which passes the agent's host
@@ -157,7 +159,9 @@ planned = false
 # report to; the deny self-test, the BPF LSM gate, the trust level and the
 # signed manifest stay. R09c (lab PR 257): they still do — the plan gives
 # the boot to the agent (§2.4, `main` → `boot/*`, R11a's typed phases) and
-# the manifest to the sensor contract (R13), not to R09c
+# the manifest to the sensor contract (R13), not to R09c. R11a (lab PR
+# 261): `main.rs`'s start is here, in its typed phases — the command line,
+# the checks, the attach, the evidence, the subsystems, READY
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1

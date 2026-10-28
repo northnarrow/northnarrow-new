@@ -1,3 +1,18 @@
+//! One event through the agent (R11a, lab PR 261: from `main.rs`): the
+//! canaries, the posture and the COMBAT ladder, the correlation buffer, the
+//! rules, the executor, the detection store.
+
+use std::time::Instant;
+
+use nn_model::Event;
+use northnarrow_agent::correlation::CorrelationBuffer;
+use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::detection_budget::{self, Admit};
+use northnarrow_agent::posture::PostureMachine;
+use northnarrow_agent::response::Executor;
+use tracing::{debug, error, info, warn};
+
+use super::{host_stopping, systemd_state, HOST_STOPPING};
 
 /// Categorise + log + evaluate + (maybe) execute.
 ///
@@ -11,7 +26,7 @@
 /// verdict: the LLM advisor that judged such execs was removed in Wave 4
 /// (lab PR 214).
 #[allow(clippy::too_many_arguments)]
-async fn process_event(
+pub(crate) async fn process_event(
     engine: &RuleEngine,
     executor: &Executor,
     correlation: &CorrelationBuffer,

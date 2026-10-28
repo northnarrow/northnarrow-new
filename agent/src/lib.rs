@@ -11,6 +11,11 @@
 //! The on-host LLM advisor of Tappa 6 (ADE, its RAG knowledge base and
 //! XAI explanations) was removed in Wave 4 (lab PR 214).
 
+/// R11a shim (lab PR 261; plan §4.1 rule 2, removed in R17): the start's code
+/// moved from the binary into this crate names the crate as the binary did
+/// (`northnarrow_agent::…`), unchanged.
+extern crate self as northnarrow_agent;
+
 /// R10 shim (lab PR 259; plan §4.1 rule 2, removed in R17): the operator
 /// client's library half is nn-admin's.
 pub use nn_admin::admin_cli;
@@ -175,6 +180,8 @@ pub use nn_evidence::os_rng;
 /// open sensor's paths (from `sensors::open_sensor`, R04b, lab PR 241) is
 /// nn-model's, the crate the module map names; the posture reads it.
 pub use nn_model::path_text;
+/// The event pipeline (R11a, lab PR 261: from `main.rs`).
+mod pipeline;
 pub mod posture;
 /// R09a shim: the Linux host of the posture — the process table, the host's
 /// files and the clocks of nn-core's `PostureHost` (R08a, lab PR 250) — is
@@ -187,6 +194,8 @@ pub mod removed_settings;
 /// R09a shim: the executor and its actions (kill, quarantine, the egress
 /// block, the throttle, the containment and its release) are nn-linux's.
 pub use nn_linux::response;
+/// The event loop (R11a, lab PR 261: from `main.rs`).
+mod run_loop;
 /// R09a shim: the work kept off the async runtime is nn-linux's.
 pub(crate) use nn_linux::runtime;
 /// R09c shim (lab PR 257; plan §4.1 rule 2, removed in R17): systemd's
@@ -201,6 +210,8 @@ pub use nn_linux::sensor_feasibility;
 pub mod sensors;
 /// R05 shim: the full verifiers' line reader.
 pub use nn_evidence::verify_lines;
+/// The agent's stop (R11a, lab PR 261: from `main.rs`).
+mod shutdown;
 /// R09c shim: the shutdown marker's file (its format is nn-proto's) is
 /// nn-linux's.
 pub use nn_linux::shutdown_marker;

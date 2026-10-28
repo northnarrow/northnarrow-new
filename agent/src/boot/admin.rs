@@ -1,3 +1,16 @@
+//! The admin socket at boot (R11a, lab PR 261: from `main.rs`'s `run`).
+
+use std::sync::Arc;
+
+use northnarrow_agent::admin_socket::{self, ShutdownSignal};
+use northnarrow_agent::anti_tamper::admin_auth::AdminAuth;
+use northnarrow_agent::anti_tamper::network_isolate::NetworkIsolator;
+use northnarrow_agent::posture::{ExemptPids, PostureMachine};
+use northnarrow_agent::response::Executor;
+use tracing::error;
+
+use super::cli::Cli;
+use super::evidence::{attest_degraded, attest_degraded_at, AnchorHandle, AuditHandle};
 
 /// The admin socket, started only with the network isolator (its ruleset):
 /// the admin key set (a skipped line signed, AUT-004; the one-key bootstrap
@@ -5,7 +18,7 @@
 /// admin states of FIM, the canaries, the detections, the response verbs
 /// and the read verbs.
 #[allow(clippy::too_many_arguments)]
-fn boot_admin(
+pub(crate) fn start(
     cli: &Cli,
     isolator: &Option<Arc<NetworkIsolator>>,
     agent_id: [u8; 16],

@@ -1,11 +1,22 @@
+//! The event pipeline (Wave 4 restructure, R11a, lab PR 261: from
+//! `main.rs`): `process_event`, and what it shares with the start's tasks —
+//! whether systemd is stopping the host.
+
+use std::time::{Duration, Instant};
+
+use tracing::{debug, warn};
+
+pub(crate) mod process_event;
+
 /// External audit EBPF-001: systemd (PID 1 itself, `SO_PEERCRED`) reported
 /// the host as stopping — no posture escalation and no ladder until the
 /// process ends at systemd-shutdown's final stage.
-static HOST_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static HOST_STOPPING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The host is shutting down: stand the ladder down once and stop
 /// escalating (see [`HOST_STOPPING`]).
-fn host_stopping(ladder: &northnarrow_agent::combat::CombatLadder) {
+pub(crate) fn host_stopping(ladder: &northnarrow_agent::combat::CombatLadder) {
     if !HOST_STOPPING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         warn!("host shutting down — active response stood down, detection continues");
         ladder.stand_down(Instant::now());
@@ -19,7 +30,7 @@ fn host_stopping(ladder: &northnarrow_agent::combat::CombatLadder) {
 /// at most once a second. `None` when
 /// systemd does not answer within 1 s, or the socket is not served by
 /// PID 1.
-async fn systemd_state() -> Option<String> {
+pub(crate) async fn systemd_state() -> Option<String> {
     static LAST: parking_lot::Mutex<Option<(Instant, Option<String>)>> =
         parking_lot::Mutex::new(None);
     if let Some((at, state)) = LAST.lock().clone() {
@@ -47,6 +58,6 @@ async fn systemd_state() -> Option<String> {
 
 /// PID 1 is `systemd-shutdown` (its comm, truncated to 15 bytes): the
 /// machine is in the last stage of a shutdown.
-fn pid1_is_systemd_shutdown() -> bool {
+pub(crate) fn pid1_is_systemd_shutdown() -> bool {
     std::fs::read_to_string("/proc/1/comm").is_ok_and(|c| c.trim_end() == "systemd-shutdow")
 }

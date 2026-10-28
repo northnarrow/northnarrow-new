@@ -1,16 +1,35 @@
+//! The running agent's tasks (R11a, lab PR 261: from `main.rs`): the
+//! watchdog's exemption and systemd-shutdown's identity kept fresh, the
+//! posture's decay, the trusted-installer window's deadline, the exec
+//! controllers, the shutdown signals.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use nn_proto::admin_signed_payload::OverlayKind;
+use northnarrow_agent::posture::{
+    resolve_verified_watchdog_pid, ExemptPids, PostureMachine, WatchdogResolution,
+};
+use northnarrow_agent::response::ExecutorConfig;
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{debug, error, info, warn};
+
+use super::evidence::{attest_degraded, AuditHandle};
 
 /// SIGINT, SIGTERM and SIGHUP, registered before the event loop.
-struct Signals {
-    sigint: tokio::signal::unix::Signal,
-    sigterm: tokio::signal::unix::Signal,
-    sighup: tokio::signal::unix::Signal,
+pub(crate) struct Signals {
+    pub(crate) sigint: tokio::signal::unix::Signal,
+    pub(crate) sigterm: tokio::signal::unix::Signal,
+    pub(crate) sighup: tokio::signal::unix::Signal,
 }
 
-/// What [`boot_tasks`] started.
-struct Tasks {
-    execq_handle: Option<northnarrow_agent::execq::Handle>,
-    execpol_handle: Option<northnarrow_agent::execpol::Handle>,
-    signals: Signals,
+/// What [`start`] started.
+pub(crate) struct Tasks {
+    pub(crate) execq_handle: Option<northnarrow_agent::execq::Handle>,
+    pub(crate) execpol_handle: Option<northnarrow_agent::execpol::Handle>,
+    pub(crate) signals: Signals,
 }
 
 /// The running agent's tasks: the posture's decay, the trusted-installer
@@ -18,7 +37,7 @@ struct Tasks {
 /// controllers (EXPERIMENTAL; one that cannot start is signed); then the
 /// shutdown signals, installed before the loop.
 #[allow(clippy::too_many_arguments)]
-fn boot_tasks(
+pub(crate) fn start(
     posture: &PostureMachine,
     installer_override: &Arc<
         northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride,
@@ -194,18 +213,9 @@ fn withdraw_watchdog_pid(
     }
 }
 
-/// Beta Step 3: background task that keeps the watchdog PID slot of
-/// `exempt` in sync with the live, exe-verified watchdog.
-///
-/// Re-resolves every 30 s (the first tick fires immediately so the
-/// exemption activates as soon as the watchdog publishes its pidfile).
-/// Logs only on a *change* of verified PID so a steady state doesn't
-/// flood the journal; any non-`Verified` outcome clears the exemption
-/// (fail toward over-triggering).
-
 /// External audit EBPF-001: re-record `systemd-shutdown`'s identity every
 /// minute (a package upgrade gives it a new inode).
-fn spawn_shutdown_exe_refresh() {
+pub(crate) fn spawn_shutdown_exe_refresh() {
     let Some(root) = northnarrow_agent::anti_tamper::prepare_pin_root() else {
         return;
     };
@@ -230,9 +240,17 @@ fn spawn_shutdown_exe_refresh() {
 }
 
 /// The signed audit log, as the watchdog refresh gets it once it is open.
-type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
+pub(crate) type WatchdogAudit = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
 
-fn spawn_watchdog_exempt_refresh(
+/// Beta Step 3: background task that keeps the watchdog PID slot of
+/// `exempt` in sync with the live, exe-verified watchdog.
+///
+/// Re-resolves every 30 s (the first tick fires immediately so the
+/// exemption activates as soon as the watchdog publishes its pidfile).
+/// Logs only on a *change* of verified PID so a steady state doesn't
+/// flood the journal; any non-`Verified` outcome clears the exemption
+/// (fail toward over-triggering).
+pub(crate) fn spawn_watchdog_exempt_refresh(
     exempt: ExemptPids,
     pidfile: PathBuf,
     expected_exe: PathBuf,

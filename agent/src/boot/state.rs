@@ -1,9 +1,15 @@
+//! The state files, bootstrapped before the attach (R11a, lab PR 261: from
+//! `main.rs`'s `run`).
 
-/// What [`boot_state`] found.
-struct StateReady {
+use tracing::{info, warn};
+
+use super::cli::Cli;
+
+/// What [`bootstrap`] found.
+pub(crate) struct StateReady {
     /// Lab PR 218: the previous agent's hooks may close the agent's files to
     /// this process until the attach registers it (the audit preflight).
-    early_registration_failed: bool,
+    pub(crate) early_registration_failed: bool,
 }
 
 /// The state files, before the attach (Tappa 8 A14): the agent registered
@@ -11,7 +17,7 @@ struct StateReady {
 /// log, the FIM, detection, status, canary and network logs and the head
 /// anchor bootstrapped, so the deny hooks protect their inodes from the
 /// moment they attach.
-fn boot_state(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
+pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
     // External audit EBPF-015: the predecessor's pinned deny hooks refuse
     // a new entry in the agent's directories to a process not yet
     // registered — the files bootstrapped below when one is missing, a map

@@ -1,4 +1,5 @@
-//! The agent reads its identity once (MAIN-009): a scan of its `main.rs`.
+//! The agent reads its identity once (MAIN-009): a scan of its start's
+//! code (R11a, lab PR 261: `main.rs` until it was cut into the phases).
 //! Wave 4 restructure, R09a (lab PR 253): cut verbatim from the tests of
 //! `agent_id`, which leaves for nn-linux; the scan reads the agent binary's
 //! source, so it stays with it. R10 (lab PR 259): and nn-admin's read of
@@ -6,10 +7,12 @@
 //! nn-linux's `agent_id` that read both.
 
 /// MAIN-009: the agent reads its identity once and every consumer gets
-/// that value — no second read, no zero fallback in `main.rs`.
+/// that value — no second read, no zero fallback in the start's code
+/// (`main.rs` and the phases cut from it, R11a, lab PR 261).
 #[test]
 fn the_agent_reads_its_identity_once() {
-    let main = include_str!("main.rs");
+    let main = crate::boot::start_sources();
+    let main = main.as_str();
     assert_eq!(main.matches("agent_id::resolve(").count(), 1);
     assert_eq!(main.matches("agent_id::load_or_bootstrap(").count(), 0);
     assert_eq!(main.matches("agent_id::load_existing(").count(), 0);

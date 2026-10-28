@@ -1,10 +1,20 @@
+//! The agent's stop (Wave 4 restructure, R11a, lab PR 261: from `main.rs`'s
+//! `run`).
+
+use anyhow::Result;
+use northnarrow_agent::admin_socket;
+use tracing::{debug, info, warn};
+
+use crate::boot::cli::Cli;
+use crate::boot::evidence::{AnchorHandle, AuditHandle};
+use crate::run_loop::Stopped;
 
 /// The stop: the exec guards release what they hold, the BPF self-check
 /// is told the links go, the copy guard closes, the signed `agent_stop`,
 /// the heads anchored at stop, the pid file and the admin socket removed.
 /// A pump that exited is a failure (SNS-001): the watchdog restarts the
 /// agent.
-fn shutdown(
+pub(crate) fn stop(
     cli: &Cli,
     execq_handle: Option<northnarrow_agent::execq::Handle>,
     execpol_handle: Option<northnarrow_agent::execpol::Handle>,

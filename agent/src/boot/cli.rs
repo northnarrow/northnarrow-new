@@ -1,3 +1,15 @@
+//! The agent's command line (Wave 4 restructure, R11a, lab PR 261: from
+//! `main.rs`): the flags and their environment variables, the paths they
+//! resolve to, the value enums, the removed advisor's flags. The one-shot
+//! modes it selects are `boot::main`'s.
+
+use std::path::PathBuf;
+
+use clap::Parser;
+use northnarrow_agent::net::blocklist::{
+    DEFAULT_NETFLOW_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_BLOCKLIST_V1,
+    DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL, DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -5,7 +17,7 @@
     version,
     about = "NorthNarrow XDR agent daemon (Linux)."
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Detect-only / monitor mode (BUG-033). Detection runs in full and
     /// posture still transitions (OBSERVING→ALERTED→COMBAT is logged for
     /// visibility), but NO enforcement touches the system: every
@@ -15,19 +27,19 @@ struct Cli {
     /// before arming autonomous response. Also settable via env
     /// `NN_DETECT_ONLY=1` (legacy `NORTHNARROW_DRY_RUN=1` is honoured too).
     #[arg(long = "detect-only", default_value_t = false)]
-    detect_only: bool,
+    pub(crate) detect_only: bool,
 
     /// Internal: run as the telemetry-probe child (one file open, one DNS
     /// packet, exit). Spawned by the agent itself every
     /// `NN_TELEMETRY_PROBE_SECS`; never meant for operators.
     #[arg(long = "telemetry-probe", hide = true, value_name = "NONCE")]
-    telemetry_probe: Option<String>,
+    pub(crate) telemetry_probe: Option<String>,
 
     /// Internal (lab PR 218): run as the deny self-test child — send one
     /// SIGURG to the parent, exit with what kill(2) said. Spawned by the
     /// agent itself once per boot, right after the deny hooks attach.
     #[arg(long = "deny-self-test", hide = true)]
-    deny_self_test: bool,
+    pub(crate) deny_self_test: bool,
 
     /// Compatibility check only: resolve every kernel struct offset and
     /// enumerator the eBPF programs need against the given BTF file
@@ -37,14 +49,14 @@ struct Cli {
     /// (that kernel would be refused at boot), 3 on unreadable/unparseable
     /// BTF. No eBPF is loaded, no root needed. Multi-kernel level 2.
     #[arg(long = "btf-check", value_name = "BTF_FILE")]
-    btf_check: Option<PathBuf>,
+    pub(crate) btf_check: Option<PathBuf>,
 
     /// Lab only (Tappa 10.9 step 0): load the sensor-feasibility probes on
     /// this kernel, exercise them, print the report and exit — 0 when every
     /// required property holds. Root, a `test-privileged` build, and the
     /// installed agent stopped (`deploy/lab/nn-lab.sh sensor-feasibility`).
     #[arg(long = "sensor-feasibility", hide = true)]
-    sensor_feasibility: bool,
+    pub(crate) sensor_feasibility: bool,
 
     /// Lab only: load the embedded eBPF object with the agent's loader setup
     /// (maps, BTF offsets armed and frozen), put every program through the
@@ -53,7 +65,7 @@ struct Cli {
     /// — 0 when every program the agent needs loads. Root and a
     /// `debug-trigger` build (`deploy/lab/nn-lab.sh verifier-check`).
     #[arg(long = "verifier-check", hide = true)]
-    verifier_check: bool,
+    pub(crate) verifier_check: bool,
 
     /// Print the test and debug cargo features this binary was built with
     /// (comma-separated: `debug-trigger`, `demo-tappa5`, `posture-demo`,
@@ -62,7 +74,7 @@ struct Cli {
     /// (external audit NN-AUD-211), and so does the release workflow's
     /// check of its artefacts (external audit PROC-015).
     #[arg(long = "build-features")]
-    build_features: bool,
+    pub(crate) build_features: bool,
 
     /// File-open sensor (Tappa 10.9 step 1). `lsm` (default): the FIM
     /// `file_open` observer classifies every open in the kernel and ships
@@ -76,7 +88,7 @@ struct Cli {
         value_enum,
         default_value_t = FileOpenSensor::Lsm
     )]
-    file_open_sensor: FileOpenSensor,
+    pub(crate) file_open_sensor: FileOpenSensor,
 
     /// Exec sensor (Tappa 10.9 step 2). `lsm` (default): LSM
     /// `bprm_check_security` reads the file the kernel opened, and the exec
@@ -90,7 +102,7 @@ struct Cli {
         value_enum,
         default_value_t = ExecSensor::Lsm
     )]
-    exec_sensor: ExecSensor,
+    pub(crate) exec_sensor: ExecSensor,
 
     /// DNS sensor (Tappa 10.9 step 3). `skb` (default): kprobes on
     /// `udp_send_skb` / `udp_v6_send_skb` read the query from the socket
@@ -105,7 +117,7 @@ struct Cli {
         value_enum,
         default_value_t = DnsSensor::Skb
     )]
-    dns_sensor: DnsSensor,
+    pub(crate) dns_sensor: DnsSensor,
 
     /// Exploit post-condition guard (lab PR 219, experimental): a gain of
     /// credentials, namespaces or root the kernel's own mechanisms did not
@@ -123,7 +135,7 @@ struct Cli {
         value_enum,
         default_value_t = ExploitGuard::Lite
     )]
-    exploit_guard: ExploitGuard,
+    pub(crate) exploit_guard: ExploitGuard,
 
     /// What the exploit guard does on a finding. `detect` (default): signed
     /// record, the task continues. `enforce`: SIGKILL in the kernel before
@@ -135,7 +147,7 @@ struct Cli {
         value_enum,
         default_value_t = ExploitGuardResponse::Detect
     )]
-    exploit_guard_response: ExploitGuardResponse,
+    pub(crate) exploit_guard_response: ExploitGuardResponse,
 
     /// Exploit guard: the size of the running variant's task map. Strict:
     /// default `/proc/sys/kernel/pid_max` (every live task fits; not
@@ -144,22 +156,22 @@ struct Cli {
     /// 1048576); records it evicts are re-taken, counted and attested (at
     /// most once per 600 s).
     #[arg(long = "exploit-guard-tasks", env = "NN_EXPLOIT_GUARD_TASKS")]
-    exploit_guard_tasks: Option<u32>,
+    pub(crate) exploit_guard_tasks: Option<u32>,
 
     /// Removed in Wave 4 (lab PR 214) with the on-host LLM advisor, as
     /// the four below: accepted so that a unit written for an older agent
     /// still starts, ignored, and named in a WARN at start
     /// ([`northnarrow_agent::removed_settings`]).
     #[arg(long = "no-ade", hide = true)]
-    removed_no_ade: bool,
+    pub(crate) removed_no_ade: bool,
     #[arg(long = "ade-model", hide = true, value_name = "PATH")]
-    removed_ade_model: Option<std::ffi::OsString>,
+    pub(crate) removed_ade_model: Option<std::ffi::OsString>,
     #[arg(long = "ade-timeout", hide = true, value_name = "SECS")]
-    removed_ade_timeout: Option<std::ffi::OsString>,
+    pub(crate) removed_ade_timeout: Option<std::ffi::OsString>,
     #[arg(long = "ade-prompt", hide = true, value_name = "PATH")]
-    removed_ade_prompt: Option<std::ffi::OsString>,
+    pub(crate) removed_ade_prompt: Option<std::ffi::OsString>,
     #[arg(long = "ade-threads", hide = true, value_name = "N")]
-    removed_ade_threads: Option<std::ffi::OsString>,
+    pub(crate) removed_ade_threads: Option<std::ffi::OsString>,
 
     /// Path to the iptables ruleset NetworkIsolator applies on
     /// COMBAT entry. Production install: /etc/northnarrow/combat-rules.v4.
@@ -169,7 +181,7 @@ struct Cli {
         value_name = "PATH",
         default_value = "/etc/northnarrow/combat-rules.v4"
     )]
-    combat_rules: PathBuf,
+    pub(crate) combat_rules: PathBuf,
 
     /// BUG-031 — the IPv6 (`ip6tables-restore`) ruleset NetworkIsolator
     /// applies on COMBAT entry alongside the v4 one. A missing file
@@ -181,7 +193,7 @@ struct Cli {
         value_name = "PATH",
         default_value = "/etc/northnarrow/combat-rules.v6"
     )]
-    combat_rules_v6: PathBuf,
+    pub(crate) combat_rules_v6: PathBuf,
 
     /// Beta Step 4b: opt-in management carve-out CIDR list. Each IPv4
     /// CIDR in this file is allowed through during COMBAT so a remote
@@ -193,7 +205,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::anti_tamper::combat_allow::DEFAULT_COMBAT_ALLOW_CIDRS
     )]
-    combat_allow_cidrs: PathBuf,
+    pub(crate) combat_allow_cidrs: PathBuf,
 
     /// Path to the admin pubkey file. If the file is missing, the
     /// admin socket is not started (the agent still runs, posture
@@ -205,7 +217,7 @@ struct Cli {
         value_name = "PATH",
         default_value = "/etc/northnarrow/admin.pub"
     )]
-    admin_pub: PathBuf,
+    pub(crate) admin_pub: PathBuf,
 
     /// Beta Step 3: expected install path of the watchdog binary, used
     /// to verify a candidate watchdog PID's `/proc/<pid>/exe` (a
@@ -213,7 +225,7 @@ struct Cli {
     /// `northnarrow-watchdog` next to this agent's own executable —
     /// `/usr/local/bin` for `install.sh`, `/usr/bin` for a package.
     #[arg(long = "watchdog-exe", value_name = "PATH")]
-    watchdog_exe: Option<PathBuf>,
+    pub(crate) watchdog_exe: Option<PathBuf>,
 
     /// Tappa 8 A3 + A8: per-install agent identity file. The agent
     /// reads (or, on first boot, mints) a 16-byte UUID at this
@@ -228,7 +240,7 @@ struct Cli {
         value_name = "PATH",
         default_value = "/etc/northnarrow/agent_id"
     )]
-    agent_id_file: PathBuf,
+    pub(crate) agent_id_file: PathBuf,
 
     /// Tappa 7 task 6 Watchdog W6: best-effort path to the
     /// watchdog daemon's PID file. If the file exists at agent
@@ -245,7 +257,7 @@ struct Cli {
         value_name = "PATH",
         default_value = "/run/northnarrow/watchdog.pid"
     )]
-    watchdog_pidfile: PathBuf,
+    pub(crate) watchdog_pidfile: PathBuf,
 
     /// Unix-socket path nn-admin connects to. Removed on startup if
     /// it already exists (stale file from prior unclean shutdown).
@@ -254,7 +266,7 @@ struct Cli {
         value_name = "PATH",
         default_value = "/run/northnarrow/admin.sock"
     )]
-    admin_socket: PathBuf,
+    pub(crate) admin_socket: PathBuf,
 
     /// PHASE_D_003: configurable path of the agent's audit
     /// signing key (Tappa 8 B1). Default mirrors the design's
@@ -266,7 +278,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::audit::DEFAULT_SIGNING_KEY_PATH,
     )]
-    signing_key_file: PathBuf,
+    pub(crate) signing_key_file: PathBuf,
 
     /// PHASE_D_003: configurable path of the agent's audit
     /// log (Tappa 8 B1 + B5). Default mirrors the design's
@@ -276,7 +288,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::audit::DEFAULT_AUDIT_LOG_PATH,
     )]
-    audit_log_file: PathBuf,
+    pub(crate) audit_log_file: PathBuf,
     /// Install manifest written by `install.sh` (provenance level + hashes
     /// of the installed binaries and eBPF object); the agent re-verifies
     /// itself against it at every boot. Absent: not installed by
@@ -287,7 +299,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::install_manifest::DEFAULT_INSTALL_MANIFEST_PATH,
     )]
-    install_manifest: PathBuf,
+    pub(crate) install_manifest: PathBuf,
 
     /// PHASE_D_003: configurable path of the
     /// shutdown-authorisation marker (Tappa 8 A8). Default is
@@ -300,7 +312,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::shutdown_marker::DEFAULT_MARKER_PATH,
     )]
-    shutdown_marker_file: PathBuf,
+    pub(crate) shutdown_marker_file: PathBuf,
 
     /// Tappa 9 C7: path to the curated default FIM watched-paths
     /// list (`fim-paths.v1` format — one absolute path per line,
@@ -311,7 +323,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::fim::paths_config::DEFAULT_PATHS_V1,
     )]
-    fim_paths_v1: PathBuf,
+    pub(crate) fim_paths_v1: PathBuf,
 
     /// Tappa 9 C7 / §13 Q7: path to the operator overlay.
     /// `+/abs/path` adds, `-/abs/path` disables a default. Optional
@@ -321,7 +333,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::fim::paths_config::DEFAULT_PATHS_LOCAL,
     )]
-    fim_paths_local: PathBuf,
+    pub(crate) fim_paths_local: PathBuf,
 
     /// Tappa 9 C3 / C7: configurable path of the chained FIM
     /// baseline log. Tests override this to a tempdir so each test
@@ -331,7 +343,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::fim::baseline::DEFAULT_BASELINE_PATH,
     )]
-    fim_baseline_file: PathBuf,
+    pub(crate) fim_baseline_file: PathBuf,
 
     /// Tappa 9 C4 / C7: configurable path of the chained FIM
     /// drift log. Same per-test override rationale as
@@ -341,7 +353,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::fim::drain::DEFAULT_DRIFT_LOG_PATH,
     )]
-    fim_drift_file: PathBuf,
+    pub(crate) fim_drift_file: PathBuf,
 
     /// Tappa 9.0.a: configurable path of the chained detection log
     /// (default `/var/lib/northnarrow/detections/detections.jsonl`).
@@ -351,7 +363,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::detection_store::DEFAULT_DETECTIONS_LOG_PATH,
     )]
-    detections_file: PathBuf,
+    pub(crate) detections_file: PathBuf,
 
     /// Tappa 9.0.c: configurable path of the chained status-event log
     /// (default `/var/lib/northnarrow/detections/status_events.jsonl`).
@@ -362,7 +374,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH,
     )]
-    status_events_file: PathBuf,
+    pub(crate) status_events_file: PathBuf,
 
     /// Tappa 9.5 K2 / K6: configurable path of the chained canary
     /// registry log. Tests override this to a tempdir so each test
@@ -374,7 +386,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::canary::registry::DEFAULT_REGISTRY_PATH,
     )]
-    canary_registry_file: PathBuf,
+    pub(crate) canary_registry_file: PathBuf,
 
     /// Tappa 9.5 K3 / K6: configurable path of the chained canary
     /// access log. Same per-test override rationale as
@@ -386,7 +398,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::canary::access_log::DEFAULT_ACCESS_LOG_PATH,
     )]
-    canary_access_file: PathBuf,
+    pub(crate) canary_access_file: PathBuf,
 
     /// Tappa 9.5 K4 / K6: directory holding the canary template
     /// files (`<family>.tmpl`). The K6 deploy dispatch renders
@@ -398,7 +410,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::canary::templates::DEFAULT_TEMPLATE_DIR,
     )]
-    canary_template_dir: PathBuf,
+    pub(crate) canary_template_dir: PathBuf,
 
     /// Tappa 10 N8: configurable path of the chained NetFlow log.
     /// Same per-test override rationale as `--fim-baseline-file` —
@@ -414,7 +426,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::admin_socket::DEFAULT_NETFLOW_JSONL_PATH,
     )]
-    netflow_file: PathBuf,
+    pub(crate) netflow_file: PathBuf,
 
     /// Tappa 10 N9: configurable path of the chained NetListener
     /// log (`netflow_listeners.jsonl`). Same per-test override
@@ -427,13 +439,13 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::net::drain::DEFAULT_NETFLOW_LISTENERS_JSONL_PATH,
     )]
-    netflow_listeners_file: PathBuf,
+    pub(crate) netflow_listeners_file: PathBuf,
 
     /// External audit NN-AUD-108 (lab PR 160): the signed head anchor of
     /// the chains. Default: `chain_heads.json` next to `--audit-log-file`
     /// (`/etc/northnarrow/chain_heads.json`).
     #[arg(long = "chain-heads-file", value_name = "PATH")]
-    chain_heads_file: Option<PathBuf>,
+    pub(crate) chain_heads_file: Option<PathBuf>,
 
     /// Tappa 10 N9: configurable path of the operator-curated
     /// NetFlow IP/CIDR blocklist (default — read at boot, feeds
@@ -443,7 +455,7 @@ struct Cli {
         value_name = "PATH",
         default_value = DEFAULT_NETFLOW_BLOCKLIST_V1,
     )]
-    netflow_blocklist_v1: PathBuf,
+    pub(crate) netflow_blocklist_v1: PathBuf,
 
     /// Tappa 10 N9: configurable path of the operator overlay
     /// for the NetFlow IP/CIDR blocklist (`+` adds, `-` disables
@@ -453,7 +465,7 @@ struct Cli {
         value_name = "PATH",
         default_value = DEFAULT_NETFLOW_BLOCKLIST_LOCAL,
     )]
-    netflow_blocklist_local: PathBuf,
+    pub(crate) netflow_blocklist_local: PathBuf,
 
     /// Tappa 10 N9: configurable path of the operator-curated
     /// NetFlow JA3 blocklist (default — read at boot, feeds
@@ -463,7 +475,7 @@ struct Cli {
         value_name = "PATH",
         default_value = DEFAULT_NETFLOW_JA3_BLOCKLIST_V1,
     )]
-    netflow_ja3_blocklist_v1: PathBuf,
+    pub(crate) netflow_ja3_blocklist_v1: PathBuf,
 
     /// Tappa 10 N9: configurable path of the operator overlay
     /// for the NetFlow JA3 blocklist. Missing file is fine.
@@ -472,7 +484,7 @@ struct Cli {
         value_name = "PATH",
         default_value = DEFAULT_NETFLOW_JA3_BLOCKLIST_LOCAL,
     )]
-    netflow_ja3_blocklist_local: PathBuf,
+    pub(crate) netflow_ja3_blocklist_local: PathBuf,
 
     /// Tappa 10.5 D2: path to the process-comm allowlist default
     /// (`process-comm-allowlist.v1` — bare comms exempt from the
@@ -483,7 +495,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::config::comm_allowlist::PROCESS_COMM_ALLOWLIST_V1,
     )]
-    process_comm_allowlist_v1: PathBuf,
+    pub(crate) process_comm_allowlist_v1: PathBuf,
 
     /// Tappa 10.5 D2: path to the process-comm allowlist operator
     /// overlay (`+comm` adds, `-comm` re-enables detection on a
@@ -493,7 +505,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::config::comm_allowlist::PROCESS_COMM_ALLOWLIST_LOCAL,
     )]
-    process_comm_allowlist_local: PathBuf,
+    pub(crate) process_comm_allowlist_local: PathBuf,
 
     /// Tappa 10.5 D4: path to the netflow-comm allowlist default
     /// (`netflow-comm-allowlist.v1` — trusted-actor comms the net
@@ -504,7 +516,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::config::comm_allowlist::NETFLOW_COMM_ALLOWLIST_V1,
     )]
-    netflow_comm_allowlist_v1: PathBuf,
+    pub(crate) netflow_comm_allowlist_v1: PathBuf,
 
     /// Tappa 10.5 D4: path to the netflow-comm allowlist operator
     /// overlay (`+comm` adds, `-comm` re-enables detection on a
@@ -514,7 +526,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::config::comm_allowlist::NETFLOW_COMM_ALLOWLIST_LOCAL,
     )]
-    netflow_comm_allowlist_local: PathBuf,
+    pub(crate) netflow_comm_allowlist_local: PathBuf,
 
     /// Lab PR 224 (CM-02 c): refuse in the kernel, with `EPERM`, every
     /// `connect()` to an address of the operator netflow blocklist (LSM
@@ -532,7 +544,7 @@ struct Cli {
         default_value_t = false,
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    net_connect_deny: bool,
+    pub(crate) net_connect_deny: bool,
 
     /// Lab PR 224 (CM-02 b): a TCP flow still open is re-judged every this
     /// many seconds (the rules that need no byte count, with the process's
@@ -544,7 +556,7 @@ struct Cli {
         default_value_t = northnarrow_agent::net::flow_tracker::DEFAULT_SNAPSHOT_SECS,
         value_parser = clap::value_parser!(u64).range(1..=86_400)
     )]
-    net_snapshot_interval_secs: u64,
+    pub(crate) net_snapshot_interval_secs: u64,
 
     /// Lab PR 224: a flow is first snapshotted once open this many seconds.
     #[arg(
@@ -554,7 +566,7 @@ struct Cli {
         default_value_t = northnarrow_agent::net::flow_tracker::DEFAULT_SNAPSHOT_SECS,
         value_parser = clap::value_parser!(u64).range(0..=86_400)
     )]
-    net_snapshot_min_age_secs: u64,
+    pub(crate) net_snapshot_min_age_secs: u64,
 
     /// Lab PR 224: at most this many open-flow snapshots per check (every
     /// 10 s); the others wait for the next one (`net status` counts them).
@@ -565,7 +577,7 @@ struct Cli {
         default_value_t = northnarrow_agent::net::flow_tracker::DEFAULT_SNAPSHOT_MAX,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=65_536)
     )]
-    net_snapshot_max: usize,
+    pub(crate) net_snapshot_max: usize,
 
     /// Lab PR 224 (CM-14): NN-L-NET-026 records one process (or the
     /// children of one parent) reaching this many distinct destination
@@ -577,7 +589,7 @@ struct Cli {
         default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_HOSTS,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
     )]
-    net_scan_hosts: usize,
+    pub(crate) net_scan_hosts: usize,
 
     /// Lab PR 224: … or this many distinct (address, port) pairs.
     #[arg(
@@ -587,7 +599,7 @@ struct Cli {
         default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_PAIRS,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
     )]
-    net_scan_pairs: usize,
+    pub(crate) net_scan_pairs: usize,
 
     /// Lab PR 224: NN-L-NET-026 kills a process reaching this many distinct
     /// addresses within the window (0: never kill).
@@ -598,7 +610,7 @@ struct Cli {
         default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_KILL_HOSTS,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000)
     )]
-    net_scan_kill_hosts: usize,
+    pub(crate) net_scan_kill_hosts: usize,
 
     /// Lab PR 224: the scan window.
     #[arg(
@@ -608,7 +620,7 @@ struct Cli {
         default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_SCAN_WINDOW_SECS,
         value_parser = clap::value_parser!(u64).range(1..=3_600)
     )]
-    net_scan_window_secs: u64,
+    pub(crate) net_scan_window_secs: u64,
 
     /// Lab PR 224: NN-L-NET-027 records this many connects to
     /// authentication services (SSH, Telnet, RDP, VNC) within its window.
@@ -619,7 +631,7 @@ struct Cli {
         default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_BRUTE_CONNECTS,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_000_000)
     )]
-    net_brute_connects: usize,
+    pub(crate) net_brute_connects: usize,
 
     /// Lab PR 224: … and kills a process reaching this many (0: never).
     #[arg(
@@ -629,7 +641,7 @@ struct Cli {
         default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_BRUTE_KILL_CONNECTS,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..=1_000_000)
     )]
-    net_brute_kill_connects: usize,
+    pub(crate) net_brute_kill_connects: usize,
 
     /// Lab PR 224: the brute-force window.
     #[arg(
@@ -639,7 +651,7 @@ struct Cli {
         default_value_t = northnarrow_agent::decision::rules::net_fanout::DEFAULT_BRUTE_WINDOW_SECS,
         value_parser = clap::value_parser!(u64).range(1..=86_400)
     )]
-    net_brute_window_secs: u64,
+    pub(crate) net_brute_window_secs: u64,
 
     /// Lab PR 224: a program (by name, its executable or the script an
     /// interpreter runs, installed in a root-owned system tree) whose
@@ -652,7 +664,7 @@ struct Cli {
         value_name = "PROGRAM",
         value_delimiter = ','
     )]
-    net_fanout_exempt: Vec<String>,
+    pub(crate) net_fanout_exempt: Vec<String>,
 
     /// Optional PID file path. After all anti-tamper LSM hooks are
     /// attached and pinned (the same synchronisation point at which
@@ -668,7 +680,7 @@ struct Cli {
     /// the flag (the production default) is a no-op: behaviour is
     /// exactly as before, no PID file is touched.
     #[arg(long = "pid-file", value_name = "PATH")]
-    pid_file: Option<PathBuf>,
+    pub(crate) pid_file: Option<PathBuf>,
 
     /// Lab PR 223 (EXPERIMENTAL): exec quarantine at first sight
     /// (docs/design/EXEC_QUARANTINE.md). `off` (default); `observe`: a new
@@ -684,7 +696,7 @@ struct Cli {
         value_enum,
         default_value_t = northnarrow_agent::execq::Mode::Off
     )]
-    exec_quarantine: northnarrow_agent::execq::Mode,
+    pub(crate) exec_quarantine: northnarrow_agent::execq::Mode,
 
     /// How long a held process waits for its decision before the default
     /// policy applies (100–10000 ms).
@@ -694,7 +706,7 @@ struct Cli {
         value_name = "MS",
         default_value_t = northnarrow_agent::execq::policy::DEFAULT_BUDGET_MS
     )]
-    exec_quarantine_budget_ms: u64,
+    pub(crate) exec_quarantine_budget_ms: u64,
 
     /// The default policy: what a held process without a verdict within the
     /// budget (or whose file cannot be scanned) gets. Signed either way.
@@ -704,7 +716,7 @@ struct Cli {
         value_enum,
         default_value_t = northnarrow_agent::execq::Action::Resume
     )]
-    exec_quarantine_on_expiry: northnarrow_agent::execq::Action,
+    pub(crate) exec_quarantine_on_expiry: northnarrow_agent::execq::Action,
 
     /// What a held process the scanner calls suspicious (heuristics, not a
     /// block-list hit) gets.
@@ -714,12 +726,12 @@ struct Cli {
         value_enum,
         default_value_t = northnarrow_agent::execq::Action::Resume
     )]
-    exec_quarantine_on_suspicious: northnarrow_agent::execq::Action,
+    pub(crate) exec_quarantine_on_suspicious: northnarrow_agent::execq::Action,
 
     /// The scanner binary. Default: `northnarrow-scan` next to the agent,
     /// else /usr/local/bin/northnarrow-scan.
     #[arg(long = "exec-quarantine-scanner", value_name = "PATH")]
-    exec_quarantine_scanner: Option<PathBuf>,
+    pub(crate) exec_quarantine_scanner: Option<PathBuf>,
 
     /// The account the scanner runs as (install.sh creates it).
     #[arg(
@@ -727,7 +739,7 @@ struct Cli {
         value_name = "USER",
         default_value = northnarrow_agent::execq::DEFAULT_SCAN_USER
     )]
-    exec_quarantine_scan_user: String,
+    pub(crate) exec_quarantine_scan_user: String,
 
     /// The signed hash list (`block <sha256> [label]` / `allow <sha256>
     /// [label]`), stored with `nn-admin config overlay set execq-hashes`.
@@ -736,7 +748,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::execq::DEFAULT_HASHES_LOCAL
     )]
-    execq_hashes_local: PathBuf,
+    pub(crate) execq_hashes_local: PathBuf,
 
     /// Lab PR 226 (EXPERIMENTAL): synchronous exec policies
     /// (docs/design/EXEC_POLICY.md). `off` (default); `audit`: every exec a
@@ -753,7 +765,7 @@ struct Cli {
         value_enum,
         default_value_t = northnarrow_agent::execpol::Mode::Off
     )]
-    exec_policy: northnarrow_agent::execpol::Mode,
+    pub(crate) exec_policy: northnarrow_agent::execpol::Mode,
 
     /// The built-in table the signed overlay starts from: `server`
     /// (default) or `desktop` (a login session's own staging locations
@@ -764,7 +776,7 @@ struct Cli {
         value_enum,
         default_value_t = northnarrow_agent::execpol::Profile::Server
     )]
-    exec_policy_profile: northnarrow_agent::execpol::Profile,
+    pub(crate) exec_policy_profile: northnarrow_agent::execpol::Profile,
 
     /// The signed policy (`exec <class> <tier> <action>`…), stored with
     /// `nn-admin config overlay set exec-policy`.
@@ -773,7 +785,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::execpol::DEFAULT_POLICY_LOCAL
     )]
-    exec_policy_local: PathBuf,
+    pub(crate) exec_policy_local: PathBuf,
 
     /// Lab PR 236: the signed per-rule response policy (`enforce|alert|audit|off
     /// <rule>`, `exempt <rule> …`), stored with `nn-admin policy set`.
@@ -783,7 +795,7 @@ struct Cli {
         value_name = "PATH",
         default_value = northnarrow_agent::decision::rule_policy::DEFAULT_LOCAL
     )]
-    rule_policy_local: PathBuf,
+    pub(crate) rule_policy_local: PathBuf,
 
     /// Do not read the new environment at exec (no LD_PRELOAD / LD_AUDIT /
     /// GLIBC_TUNABLES / history checks). Also `NN_EXEC_POLICY_NO_ENV=1`
@@ -793,7 +805,7 @@ struct Cli {
         env = "NN_EXEC_POLICY_NO_ENV",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    exec_policy_no_env: bool,
+    pub(crate) exec_policy_no_env: bool,
 
     /// Do not judge executable mappings (`mmap_file`). Also
     /// `NN_EXEC_POLICY_NO_MAP=1` (1/0, true/false, yes/no, on/off).
@@ -802,14 +814,14 @@ struct Cli {
         env = "NN_EXEC_POLICY_NO_MAP",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    exec_policy_no_map: bool,
+    pub(crate) exec_policy_no_map: bool,
 }
 
 impl Cli {
     /// `--chain-heads-file`, or `chain_heads.json` next to the audit log it
     /// anchors (an agent run with its own audit log and key, as the
     /// privileged tests do, never touches the installed agent's anchor).
-    fn resolved_chain_heads_file(&self) -> PathBuf {
+    pub(crate) fn resolved_chain_heads_file(&self) -> PathBuf {
         self.chain_heads_file.clone().unwrap_or_else(|| {
             self.audit_log_file
                 .parent()
@@ -819,7 +831,7 @@ impl Cli {
     }
 
     /// The chains the agent anchors, at the configured paths.
-    fn chain_paths(&self) -> northnarrow_agent::chains::ChainPaths {
+    pub(crate) fn chain_paths(&self) -> northnarrow_agent::chains::ChainPaths {
         northnarrow_agent::chains::ChainPaths {
             audit: self.audit_log_file.clone(),
             canary_registry: self.canary_registry_file.clone(),
@@ -833,7 +845,7 @@ impl Cli {
 
     /// Lab PR 223: the guard's configuration for this boot; a detect-only
     /// agent observes.
-    fn execq_config(&self, detect_only: bool) -> northnarrow_agent::execq::Config {
+    pub(crate) fn execq_config(&self, detect_only: bool) -> northnarrow_agent::execq::Config {
         use northnarrow_agent::execq::{policy, Config, Mode, Policy};
         let mode = match self.exec_quarantine {
             Mode::Enforce if detect_only => Mode::Observe,
@@ -858,7 +870,7 @@ impl Cli {
     }
 
     /// `--watchdog-exe`, or the watchdog next to this agent (review 26).
-    fn resolved_watchdog_exe(&self) -> PathBuf {
+    pub(crate) fn resolved_watchdog_exe(&self) -> PathBuf {
         self.watchdog_exe.clone().unwrap_or_else(|| {
             let own = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
             northnarrow_agent::posture::sibling_watchdog_exe(own.as_deref())
@@ -868,35 +880,35 @@ impl Cli {
 
 /// `--file-open-sensor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum FileOpenSensor {
+pub(crate) enum FileOpenSensor {
     Lsm,
     Tracepoint,
 }
 
 /// `--exec-sensor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ExecSensor {
+pub(crate) enum ExecSensor {
     Lsm,
     Tracepoint,
 }
 
 /// `--dns-sensor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum DnsSensor {
+pub(crate) enum DnsSensor {
     Skb,
     Sendmsg,
 }
 
 /// `--exploit-guard` (lab PR 219).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ExploitGuard {
+pub(crate) enum ExploitGuard {
     Off,
     Lite,
     Strict,
 }
 
 impl ExploitGuard {
-    fn variant(self) -> northnarrow_agent::sensors::epg::Variant {
+    pub(crate) fn variant(self) -> northnarrow_agent::sensors::epg::Variant {
         use northnarrow_agent::sensors::epg::Variant;
         match self {
             Self::Off => Variant::Off,
@@ -908,13 +920,13 @@ impl ExploitGuard {
 
 /// `--exploit-guard-response` (lab PR 219).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ExploitGuardResponse {
+pub(crate) enum ExploitGuardResponse {
     Detect,
     Enforce,
 }
 
 impl ExploitGuardResponse {
-    fn response(self) -> northnarrow_agent::sensors::epg::Response {
+    pub(crate) fn response(self) -> northnarrow_agent::sensors::epg::Response {
         use northnarrow_agent::sensors::epg::Response;
         match self {
             Self::Detect => Response::Detect,
@@ -926,7 +938,7 @@ impl ExploitGuardResponse {
 impl Cli {
     /// The flags of the removed LLM advisor this command line sets, in
     /// the order of [`northnarrow_agent::removed_settings::REMOVED_FLAGS`].
-    fn removed_flags(&self) -> Vec<&'static str> {
+    pub(crate) fn removed_flags(&self) -> Vec<&'static str> {
         let set = [
             self.removed_no_ade,
             self.removed_ade_model.is_some(),

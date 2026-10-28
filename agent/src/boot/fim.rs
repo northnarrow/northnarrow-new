@@ -1,3 +1,25 @@
+//! File integrity monitoring at boot (R11a, lab PR 261: from `main.rs`):
+//! the watched paths, the observers, the file-open sensor armed on them,
+//! the drain, the baseline, the filesystems' identity, the control-surface
+//! baits.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nn_proto::admin_signed_payload::OverlayKind;
+use northnarrow_agent::admin_socket;
+use northnarrow_agent::posture::{AuthSessionTracker, PostureMachine};
+use northnarrow_agent::sensors::SensorMultiplexer;
+use tracing::{debug, error, info, warn};
+
+use super::attach::record_own_prog_ids;
+use super::cli::{Cli, FileOpenSensor};
+use super::evidence::{
+    attest_degraded, attest_degraded_at, attest_open_findings, drain_ended, AuditHandle,
+};
+use super::policy::report_builtin_defaults;
+use super::response::attest_legacy_isolation_removed;
 
 /// Lab PR 218 (external review P0 C-13): the file-open sensor stays on
 /// `sys_enter_openat` — every open goes to userland and its path is read
@@ -190,16 +212,16 @@ fn report_open_rules(
     }
 }
 
-/// What [`boot_fim_paths`] read.
-struct FimPaths {
-    watched_paths_load: northnarrow_agent::fim::paths_config::WatchedPathsLoad,
-    paths_summary: admin_socket::WatchedPathsSummary,
+/// What [`paths`] read.
+pub(crate) struct FimPaths {
+    pub(crate) watched_paths_load: northnarrow_agent::fim::paths_config::WatchedPathsLoad,
+    pub(crate) paths_summary: admin_socket::WatchedPathsSummary,
 }
 
 /// FIM's watched paths (the shipped list and the signed overlay); the
 /// legacy isolation removed and the stale COMBAT chain, signed here, where
 /// the start has always signed them.
-fn boot_fim_paths(
+pub(crate) fn paths(
     cli: &Cli,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     audit_log: &AuditHandle,
@@ -285,7 +307,7 @@ fn boot_fim_paths(
 /// baseline; then the filesystems' identity report and the control-surface
 /// baits (Tappa 9.5.1).
 #[allow(clippy::too_many_arguments)]
-fn boot_fim(
+pub(crate) fn start(
     cli: &Cli,
     agent_id: [u8; 16],
     audit_log: &AuditHandle,

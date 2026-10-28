@@ -1,15 +1,36 @@
+//! The event loop (Wave 4 restructure, R11a, lab PR 261: from `main.rs`):
+//! the sensors' events through the pipeline, the telemetry tasks' liveness,
+//! the signals and the admin shutdown; the lab builds' triggers.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use northnarrow_agent::correlation::CorrelationBuffer;
+use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::posture::PostureMachine;
+use northnarrow_agent::response::Executor;
+use northnarrow_agent::sensors::SensorMultiplexer;
+use tracing::{error, info, warn};
+
+use crate::boot::cli::Cli;
+use crate::boot::evidence::{attest_degraded_at, AuditHandle};
+use crate::boot::posture::Combat;
+use crate::boot::ready::Armed;
+use crate::boot::tasks::Signals;
+use crate::pipeline::pid1_is_systemd_shutdown;
+use crate::pipeline::process_event::process_event;
 
 /// Why the event loop ended (the signed `agent_stop`), and when it began.
-struct Stopped {
-    stop_reason: &'static str,
-    loop_started: Instant,
+pub(crate) struct Stopped {
+    pub(crate) stop_reason: &'static str,
+    pub(crate) loop_started: Instant,
 }
 
 /// The event loop: every event offered to the telemetry probe, then
 /// [`process_event`]; every 5 s the telemetry tasks checked (SNS-001); a
 /// signal or the admin shutdown ends it.
 #[allow(clippy::too_many_arguments)]
-async fn run_loop(
+pub(crate) async fn run(
     _armed: Armed,
     // the debug triggers' files sit next to the admin socket
     #[cfg_attr(not(feature = "debug-trigger"), allow(unused_variables))] cli: &Cli,

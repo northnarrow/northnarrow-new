@@ -1,14 +1,23 @@
+//! The canaries at boot (R11a, lab PR 261: from `main.rs`).
 
-/// What [`boot_canary`] opened.
-struct Canary {
-    canary_admin_state: Option<Arc<admin_socket::CanaryAdminState>>,
-    canary_detector: Option<Arc<northnarrow_agent::canary::detector::Detector>>,
+use std::sync::Arc;
+
+use northnarrow_agent::admin_socket;
+use tracing::{error, info, warn};
+
+use super::cli::Cli;
+use super::evidence::{attest_chain_findings, attest_degraded, attest_open_findings, AuditHandle};
+
+/// What [`start`] opened.
+pub(crate) struct Canary {
+    pub(crate) canary_admin_state: Option<Arc<admin_socket::CanaryAdminState>>,
+    pub(crate) canary_detector: Option<Arc<northnarrow_agent::canary::detector::Detector>>,
 }
 
 /// The canaries (Tappa 9.5 K6): the signed registry and access log, the
 /// indexes rebuilt, every decoy checked against what was deployed and
 /// watched again, the detector and the admin state.
-fn boot_canary(
+pub(crate) fn start(
     cli: &Cli,
     agent_id: [u8; 16],
     audit_log: &AuditHandle,

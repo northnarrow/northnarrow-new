@@ -1,12 +1,25 @@
+//! The response executor and the network isolator (R11a, lab PR 261: from
+//! `main.rs`'s `run`).
 
-/// What [`boot_response`] built.
-struct Response {
-    legacy_isolation_removed: bool,
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use northnarrow_agent::anti_tamper::network_isolate::NetworkIsolator;
+use northnarrow_agent::correlation::CorrelationBuffer;
+use northnarrow_agent::response::{Executor, ExecutorConfig};
+use tracing::{debug, error, info, warn};
+
+use super::cli::{Cli, ExploitGuard};
+use super::evidence::{attest_degraded, AuditHandle};
+
+/// What [`build`] built.
+pub(crate) struct Response {
+    pub(crate) legacy_isolation_removed: bool,
     /// The exec quarantine's copy of the executor's configuration.
-    execq_exec_cfg: ExecutorConfig,
-    executor: Executor,
-    correlation: CorrelationBuffer,
-    isolator: Option<Arc<NetworkIsolator>>,
+    pub(crate) execq_exec_cfg: ExecutorConfig,
+    pub(crate) executor: Executor,
+    pub(crate) correlation: CorrelationBuffer,
+    pub(crate) isolator: Option<Arc<NetworkIsolator>>,
 }
 
 /// The response side: the optional pid file (the hooks attached, the engine
@@ -14,7 +27,7 @@ struct Response {
 /// isolation removed, the quarantine's deny of the agent's own files, the
 /// executor and what an earlier run left (kill cgroups, contained
 /// processes), the correlation buffer, the network isolator.
-fn boot_response(
+pub(crate) fn build(
     cli: &Cli,
     exec_cfg: ExecutorConfig,
     detect_only: bool,
@@ -211,7 +224,7 @@ fn boot_response(
 
 /// External audit CMB-006: the removal of an older agent's host-wide
 /// nftables isolation at start is recorded in the signed audit chain.
-fn attest_legacy_isolation_removed(
+pub(crate) fn attest_legacy_isolation_removed(
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
 ) {
     let Some(log) = audit_log else {

@@ -1,30 +1,45 @@
+//! `BootPhase::Preflight`, its first checks (R11a, lab PR 261: from
+//! `main.rs`): the embedded eBPF object, the state directory, the kernel's
+//! offsets from its BTF, the rlimits, the chains against their heads; and
+//! `--btf-check`, the same resolution against another kernel's BTF.
 
-/// What [`boot_preflight`] found, for the state files' bootstrap, the
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use northnarrow_agent::anti_tamper::btf_revalidate::{
+    publish_resolved, resolve_offsets, resolve_tracepoint_fields, RefuseReason, ResolveOutcome,
+};
+use northnarrow_agent::boot::{BootSequence, BootStep};
+use tracing::{error, info, warn};
+
+use super::cli::Cli;
+
+/// What [`check`] found, for the state files' bootstrap, the
 /// identity and the attest phase.
-struct Preflight {
+pub(crate) struct Preflight {
     /// The start's phases (lab PR 218), opened by the preflight.
-    boot: BootSequence,
+    pub(crate) boot: BootSequence,
     /// Tracepoint fields left on their compiled offset (NN-AUD-098), signed
     /// once the audit log is open.
-    tracepoint_degraded: Option<String>,
+    pub(crate) tracepoint_degraded: Option<String>,
     /// LSM hook arguments whose position was not resolved (lab PR 164),
     /// signed once the audit log is open.
-    hook_args_degraded: Option<String>,
+    pub(crate) hook_args_degraded: Option<String>,
     /// The chains' head anchor.
-    heads_file: PathBuf,
+    pub(crate) heads_file: PathBuf,
     /// The chains the agent anchors.
-    chain_targets: Vec<northnarrow_agent::chain_anchor::ChainTarget>,
+    pub(crate) chain_targets: Vec<northnarrow_agent::chain_anchor::ChainTarget>,
     /// The chains against their anchored heads (lab PR 160).
-    boot_chains: northnarrow_agent::chain_anchor::BootCheck,
+    pub(crate) boot_chains: northnarrow_agent::chain_anchor::BootCheck,
     /// The signed overlays' rollback floor (LLMR-014).
-    rollback_floor: northnarrow_agent::config::overlay_floor::RollbackFloor,
+    pub(crate) rollback_floor: northnarrow_agent::config::overlay_floor::RollbackFloor,
 }
 
 /// `BootPhase::Preflight`, its first checks: the embedded eBPF object, the
 /// state directory, the kernel's offsets from its BTF (a refusal exits 78),
 /// the rlimits, the chains against their heads and the overlays' rollback
 /// floor — nothing written yet, nothing loaded into the kernel.
-fn boot_preflight(cli: &Cli) -> Result<Preflight> {
+pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // Lab PR 218 (external review G-09 / Q11-03): the start's phases, in an
     // order the code enforces (`northnarrow_agent::boot`). Preflight —
     // checks only — until `enter_attach` hands out the permit the sensor
@@ -303,7 +318,7 @@ fn bump_memlock_rlimit() -> std::io::Result<()> {
 
 /// `--btf-check`: resolve the runtime offset table against a BTF file and
 /// print a one-line verdict plus every drifted or missing entry.
-fn btf_check(path: &std::path::Path) -> i32 {
+pub(crate) fn btf_check(path: &std::path::Path) -> i32 {
     use northnarrow_agent::anti_tamper::btf_revalidate::resolve_offsets_from;
     match resolve_offsets_from(path) {
         ResolveOutcome::Resolved(r) => {

@@ -1,14 +1,30 @@
+//! The signed content and the decision engine (R11a, lab PR 261: from
+//! `main.rs`'s `run`).
 
-/// What [`boot_policy`] loaded.
-struct Policy {
-    netflow_blocklist: Arc<NetBlocklist>,
-    installer_override:
+use std::sync::Arc;
+
+use nn_proto::admin_signed_payload::OverlayKind;
+use northnarrow_agent::chain_host_linux::LinuxHost;
+use northnarrow_agent::decision::RuleEngine;
+use northnarrow_agent::net::blocklist::{Ja3Blocklist, NetBlocklist};
+use northnarrow_agent::net::dns_cache::DnsCache;
+use northnarrow_agent::posture::AuthSessionTracker;
+use northnarrow_agent::sensors::SensorMultiplexer;
+use tracing::{error, info, warn};
+
+use super::cli::Cli;
+use super::evidence::{attest_degraded, AuditHandle};
+
+/// What [`load`] loaded.
+pub(crate) struct Policy {
+    pub(crate) netflow_blocklist: Arc<NetBlocklist>,
+    pub(crate) installer_override:
         Arc<northnarrow_agent::anti_tamper::trusted_installer::TrustedInstallerOverride>,
-    chain_store:
+    pub(crate) chain_store:
         Arc<parking_lot::Mutex<northnarrow_agent::decision::correlation::CorrelationStore>>,
-    ransom_tracker: Arc<northnarrow_agent::impact::RansomTracker>,
-    defense_detector: Arc<northnarrow_agent::impair::DefenseDetector>,
-    engine: RuleEngine,
+    pub(crate) ransom_tracker: Arc<northnarrow_agent::impact::RansomTracker>,
+    pub(crate) defense_detector: Arc<northnarrow_agent::impair::DefenseDetector>,
+    pub(crate) engine: RuleEngine,
 }
 
 /// The signed content and the decision engine: the network blocklists and
@@ -16,7 +32,7 @@ struct Policy {
 /// trusted-installer window, the chain rules' store, the network rules'
 /// thresholds, the ransomware tracker and the security-tool detector, the
 /// signed per-rule response policy, the rule engine.
-fn boot_policy(
+pub(crate) fn load(
     cli: &Cli,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     sensor: &mut SensorMultiplexer,
@@ -399,7 +415,7 @@ fn boot_policy(
 /// LLMR-015 (NN-AUD-327): so is one edited by hand, which is not applied.
 /// An earlier release's list, superseded by the built-in copy, is a WARN
 /// only: what is in force is what shipped.
-fn report_builtin_defaults(
+pub(crate) fn report_builtin_defaults(
     gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
     list: &str,
     v1: &std::path::Path,

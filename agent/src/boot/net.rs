@@ -1,10 +1,23 @@
+//! The network drain at boot (R11a, lab PR 261: from `main.rs`'s `run`).
+
+use std::sync::Arc;
+
+use northnarrow_agent::net::blocklist::NetBlocklist;
+use northnarrow_agent::net::dns_cache::DnsCache;
+use northnarrow_agent::net::flow_tracker::FlowTracker;
+use northnarrow_agent::posture::AuthSessionTracker;
+use northnarrow_agent::sensors::SensorMultiplexer;
+use tracing::{error, info, warn};
+
+use super::cli::Cli;
+use super::evidence::{drain_ended, AuditHandle};
 
 /// The network drain (Tappa 10 N9): the netflow and listener logs (one that
 /// cannot be opened is a signed degradation and the drain runs without it:
 /// lab PR 218, P0 C-14), the rules' gate, the open-flow snapshots, the
 /// drain task.
 #[allow(clippy::too_many_arguments)]
-fn boot_net(
+pub(crate) fn start(
     cli: &Cli,
     agent_id: [u8; 16],
     rotation_protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,

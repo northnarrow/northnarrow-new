@@ -1,9 +1,16 @@
+//! The log stream, the start's first lines (R11a, lab PR 261: from
+//! `main.rs`'s `run`).
+
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+
+use super::cli::Cli;
 
 /// The log stream (one event, one journal line: lab PR 167), then what the
 /// start says before anything else — the removed advisor's settings, a
 /// core-dump guard that failed, the OOM adjustment (R11a, lab PR 261:
 /// `run`'s first lines).
-fn boot_logging(cli: &Cli, undumpable: std::io::Result<()>) {
+pub(crate) fn init(cli: &Cli, undumpable: std::io::Result<()>) {
     // Lab finding (external audit EBPF-001 work): when the log stream is
     // gone — journald@northnarrow stopped, at shutdown or by root — the
     // fmt layer reported the failed write with `eprintln!`, which panics

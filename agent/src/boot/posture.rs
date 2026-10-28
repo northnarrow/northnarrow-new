@@ -1,25 +1,46 @@
+//! The posture machine and the COMBAT ladder (R11a, lab PR 261: from
+//! `main.rs`).
 
-/// What [`boot_posture`] built.
-struct Posture {
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nn_model::posture_types::PostureKind;
+use nn_proto::admin_signed_payload::OverlayKind;
+use northnarrow_agent::admin_socket::ShutdownSignal;
+use northnarrow_agent::anti_tamper::network_isolate::{NetworkIsolator, UnlockToken};
+use northnarrow_agent::posture::{
+    AuthSessionTracker, CombatEntryHook, CombatReleaseHook, ExemptPids, PostureMachine,
+    ReleaseResult, ReleaseScope,
+};
+use northnarrow_agent::response::Executor;
+use tracing::{debug, info, warn};
+
+use super::cli::Cli;
+use super::evidence::AuditHandle;
+use super::tasks::{spawn_shutdown_exe_refresh, spawn_watchdog_exempt_refresh, WatchdogAudit};
+use crate::pipeline::{host_stopping, systemd_state, HOST_STOPPING};
+
+/// What [`machine`] built.
+pub(crate) struct Posture {
     /// The COMBAT ladder's slot the posture's hooks read, set by
-    /// [`boot_ladder`].
-    ladder_slot: Arc<std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>>,
-    exempt: ExemptPids,
+    /// [`ladder`].
+    pub(crate) ladder_slot: Arc<std::sync::OnceLock<Arc<northnarrow_agent::combat::CombatLadder>>>,
+    pub(crate) exempt: ExemptPids,
     /// The operator's mass-write carve-outs, for the file-open sensor.
-    open_sensor_carveout: Vec<String>,
-    posture: PostureMachine,
-    /// The audit log the watchdog refresh signs to, set by [`boot_wire`].
-    watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
+    pub(crate) open_sensor_carveout: Vec<String>,
+    pub(crate) posture: PostureMachine,
+    /// The audit log the watchdog refresh signs to, set by [`crate::boot::evidence::wire`].
+    pub(crate) watchdog_audit: Arc<std::sync::OnceLock<WatchdogAudit>>,
     /// A stale COMBAT chain found at boot, signed once the state directory
     /// is protected.
-    stale_combat: Option<northnarrow_agent::combat::reconcile::StaleChain>,
+    pub(crate) stale_combat: Option<northnarrow_agent::combat::reconcile::StaleChain>,
 }
 
 /// The posture: the COMBAT hooks on the ladder's slot, the stack's
 /// exemption, the posture machine (with the release through the isolator,
 /// or without one), its window, tracker and detector; the watchdog's and
 /// systemd-shutdown's refreshes; a stale COMBAT chain torn down.
-fn boot_posture(
+pub(crate) fn machine(
     cli: &Cli,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
     lineage: &AuthSessionTracker,
@@ -299,14 +320,14 @@ fn boot_posture(
     }
 }
 
-/// What [`boot_ladder`] armed.
-struct Combat {
-    ladder: Arc<northnarrow_agent::combat::CombatLadder>,
+/// What [`ladder`] armed.
+pub(crate) struct Combat {
+    pub(crate) ladder: Arc<northnarrow_agent::combat::CombatLadder>,
     /// Lab PR 181: the guard the `debug-protected-query` trigger asks.
     #[cfg(feature = "debug-trigger")]
-    debug_guard: northnarrow_agent::combat::SystemProtectedProcs,
+    pub(crate) debug_guard: northnarrow_agent::combat::SystemProtectedProcs,
     /// Tappa 8 A8: fired by a verified admin `ShutdownRequest`.
-    shutdown_signal: ShutdownSignal,
+    pub(crate) shutdown_signal: ShutdownSignal,
 }
 
 /// The COMBAT ladder on the system actuator and the signed evidence,
@@ -314,7 +335,7 @@ struct Combat {
 /// copy-on-first-write guard; the ladder's tick and the watch on systemd
 /// stopping the host; the admin shutdown signal.
 #[allow(clippy::too_many_arguments)]
-fn boot_ladder(
+pub(crate) fn ladder(
     cli: &Cli,
     executor: &Executor,
     isolator: &Option<Arc<NetworkIsolator>>,
@@ -503,7 +524,7 @@ const LADDER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// (external audit MAIN-013). Lab follow-up (lab PR 188): written once the
 /// state directory's protection exists, a missing file created inside
 /// `protection`'s dance ([`northnarrow_agent::combat::reconcile::record_line`]).
-fn audit_combat_reconcile(
+pub(crate) fn audit_combat_reconcile(
     protection: &dyn northnarrow_agent::chainlog::ProtectionManager,
     rules_removed: usize,
 ) {

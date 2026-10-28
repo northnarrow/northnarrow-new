@@ -21,7 +21,7 @@
 // host's. [`HOST_PATHS`] are the paths the agent uses with no flag: every
 // agent a test starts shares them with the installed one, and none of them
 // is an evidence chain. `xtask/tests/test_state_isolation.rs` holds the two
-// flag lists to the agent's command line (`agent/src/main.rs`, `Cli`) and
+// flag lists to the agent's command line (`agent/src/boot/cli.rs`, `Cli`) and
 // the test sources to this file: an agent is started through
 // [`InstalledAgent::command`] or not at all.
 

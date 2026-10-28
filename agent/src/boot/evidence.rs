@@ -1,15 +1,38 @@
+//! The signed evidence of the start (R11a, lab PR 261: from `main.rs`):
+//! `BootPhase::Attest` — the audit log, the heads, `agent_boot`, the
+//! degradations so far —, the late binding of the audit log to what was
+//! built before it, the rotating logs and the detection stores; and the
+//! signed records the other phases write through it.
 
-/// The signed audit log, once [`boot_attest`] opened it (`None`: the boot
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Result;
+use northnarrow_agent::admin_socket;
+use northnarrow_agent::agent_id;
+use northnarrow_agent::boot::{BootPhase, BootSequence, BootStep};
+use northnarrow_agent::detection_report;
+use northnarrow_agent::posture::PostureMachine;
+use northnarrow_agent::response::Executor;
+use northnarrow_agent::sensors::SensorMultiplexer;
+use tracing::{error, info, warn};
+
+use super::cli::Cli;
+use super::posture::audit_combat_reconcile;
+use super::tasks::WatchdogAudit;
+
+/// The signed audit log, once [`attest`] opened it (`None`: the boot
 /// runs unaudited, as the attest phase allowed).
-type AuditHandle = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
+pub(crate) type AuditHandle = Option<Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>;
 
 /// The chains' head anchor of this run (lab PR 160).
-type AnchorHandle = Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>>;
+pub(crate) type AnchorHandle =
+    Option<Arc<parking_lot::Mutex<northnarrow_agent::chain_anchor::Anchor>>>;
 
-/// What [`boot_attest`] opened.
-struct Attested {
-    chain_anchor: AnchorHandle,
-    audit_log: AuditHandle,
+/// What [`attest`] opened.
+pub(crate) struct Attested {
+    pub(crate) chain_anchor: AnchorHandle,
+    pub(crate) audit_log: AuditHandle,
 }
 
 /// `BootPhase::Attest` (lab PR 218): the signed audit log opens — the heads
@@ -18,7 +41,7 @@ struct Attested {
 /// that cannot be written refuses the start unless that is allowed) — and
 /// every degradation found so far is signed. Then `BootPhase::Subsystems`.
 #[allow(clippy::too_many_arguments)]
-fn boot_attest(
+pub(crate) fn attest(
     cli: &Cli,
     boot: &mut BootSequence,
     heads_file: PathBuf,
@@ -233,7 +256,7 @@ fn boot_attest(
 /// chains' tasks, the ring drops, the deny hooks' fail-opens, the FIM
 /// drain, the trusted-installer window.
 #[allow(clippy::too_many_arguments)]
-fn boot_wire(
+pub(crate) fn wire(
     cli: &Cli,
     audit_log: &AuditHandle,
     watchdog_audit: &std::sync::OnceLock<WatchdogAudit>,
@@ -303,22 +326,23 @@ fn boot_wire(
     }
 }
 
-/// What [`boot_stores`] opened.
-struct Stores {
-    state_protection:
+/// What [`stores`] opened.
+pub(crate) struct Stores {
+    pub(crate) state_protection:
         Option<std::sync::Arc<northnarrow_agent::anti_tamper::filesystem::StateDirProtection>>,
-    rotation_protection: std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,
-    fim_drift_rotation: northnarrow_agent::chainlog::RotationConfig,
-    netflow_rotation: northnarrow_agent::chainlog::RotationConfig,
-    detection_sink: Option<northnarrow_agent::detection_store::DetectionSink>,
-    detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>>,
+    pub(crate) rotation_protection:
+        std::sync::Arc<dyn northnarrow_agent::chainlog::ProtectionManager>,
+    pub(crate) fim_drift_rotation: northnarrow_agent::chainlog::RotationConfig,
+    pub(crate) netflow_rotation: northnarrow_agent::chainlog::RotationConfig,
+    pub(crate) detection_sink: Option<northnarrow_agent::detection_store::DetectionSink>,
+    pub(crate) detection_admin_state: Option<Arc<admin_socket::DetectionAdminState>>,
 }
 
 /// The state directory's protection (BUG-026) and the rotation it lets the
 /// logs have (append-only without it), the stale chain's compatibility
 /// line, the head anchor in the same dance; the detection log, its writer
 /// and its reporter; the status-event log the detection triage writes.
-fn boot_stores(
+pub(crate) fn stores(
     cli: &Cli,
     sensor: &mut SensorMultiplexer,
     stale_combat: &Option<northnarrow_agent::combat::reconcile::StaleChain>,
@@ -524,7 +548,7 @@ fn boot_stores(
 
 /// External audit MAIN-003: a subsystem running degraded is recorded in
 /// the signed audit chain, not only in the journal.
-fn attest_degraded(
+pub(crate) fn attest_degraded(
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
     detail: &str,
 ) {
@@ -537,7 +561,7 @@ fn attest_degraded(
 ///
 /// Lab PR 218: through the degradation registry — signed now as before, and
 /// listed by `nn-admin status --key` and counted against the trust level.
-fn attest_degraded_at(
+pub(crate) fn attest_degraded_at(
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
     detail: &str,
     at_boot: bool,
@@ -549,7 +573,7 @@ fn attest_degraded_at(
 /// this run. Per-event errors never end a drain (they are logged and the
 /// loop goes on), so this is a tokio I/O failure — recorded in the signed
 /// chain, not only as a journal line (external audit MAIN-007).
-fn drain_ended(
+pub(crate) fn drain_ended(
     stream: &str,
     outcome: std::io::Result<()>,
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
@@ -615,7 +639,7 @@ fn start_chain_anchor(
 
 /// Lab PR 160: what a chain's open verification found (external audit
 /// NN-AUD-174), in the signed audit chain.
-fn attest_chain_findings(
+pub(crate) fn attest_chain_findings(
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
     findings: Vec<northnarrow_agent::chain_anchor::ChainFinding>,
 ) {
@@ -630,7 +654,7 @@ fn attest_chain_findings(
 
 /// External audit DEC-006 / NET-003: what a chain log's open repaired or
 /// skipped is recorded in the signed audit chain.
-fn attest_open_findings(
+pub(crate) fn attest_open_findings(
     audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
     file: &std::path::Path,
     (repair, skipped): (Option<northnarrow_agent::chainlog::TailRepair>, usize),
