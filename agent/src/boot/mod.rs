@@ -9,9 +9,11 @@
 //!    the install manifest, the audit log's writability, the active LSMs
 //!    ([`lsm`]). A refusal here leaves the host as it was.
 //! 2. [`BootPhase::Attach`] — the eBPF object, the sensors and the deny
-//!    hooks. Only an [`AttachPermit`] opens it, and only
-//!    [`BootSequence::enter_attach`] gives one, once every preflight check
-//!    has run: the sensor and anti-tamper attach take it as an argument.
+//!    hooks. Only an [`IntegrityVerified`] opens it, and only
+//!    [`BootSequence::verify_integrity`] gives one, once every preflight
+//!    check has passed — the ones the attach depends on recorded by their
+//!    checks alone ([`checks`], R11b, lab PR 262): the load, the pins and
+//!    the attaches take it as an argument.
 //! 3. [`BootPhase::SelfTest`] — one deny hook exercised against the agent
 //!    itself ([`deny_selftest`]): "attached but never run" is measured, not
 //!    assumed.
@@ -35,7 +37,7 @@
 //! `admin` and `tasks`, then `ready` (the run phase); the event loop and
 //! the stop are the crate's `run_loop` and `shutdown`. Each phase takes
 //! what the ones before it produced and returns what the ones after it
-//! read: the attach takes the permit only the integrity phase holds, the
+//! read: the attach takes the proof only the integrity phase holds, the
 //! event loop the proof of READY only `ready` makes.
 
 use anyhow::{Context, Result};
@@ -68,10 +70,12 @@ pub(crate) mod state;
 pub(crate) mod tasks;
 
 /// R09b shim (lab PR 254; plan §4.1 rule 2, removed in R17): the phases,
-/// the attach permit and the degradations of a run are nn-linux's, with
-/// the eBPF loader and the sensors that take and report them.
+/// the integrity proof and the degradations of a run are nn-linux's, with
+/// the eBPF loader and the sensors that take and report them; R11b (lab PR
+/// 262): the checks that record the steps the proof requires, and the BPF
+/// LSM gate among them.
 pub use nn_linux::boot::{
-    degradation, lsm, AttachPermit, BootOrderError, BootPhase, BootSequence, BootStep,
+    checks, degradation, lsm, BootOrderError, BootPhase, BootSequence, BootStep, IntegrityVerified,
 };
 
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command
@@ -153,9 +157,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         boot_chains,
         rollback_floor,
     } = preflight::check(&cli)?;
-    let state::StateReady {
-        early_registration_failed,
-    } = state::bootstrap(&cli, &heads_file);
+    let state_ready = state::bootstrap(&cli, &heads_file);
     let identity::Identity {
         identity,
         agent_id,
@@ -171,13 +173,13 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         host_checks,
         allow_degraded,
         bpf_lsm_state,
-        attach_permit,
+        verified,
     } = integrity::check(
         &cli,
         &mut boot,
         &identity,
         &overlay_gate,
-        early_registration_failed,
+        state_ready.early_registration_failed,
     )?;
     let attach::Attached {
         lineage,
@@ -189,7 +191,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
         mut sensor,
         net_bufs,
         exploit_guard_degraded,
-    } = attach::load(&cli, &mut boot, attach_permit, &overlay_gate).await?;
+    } = attach::load(&cli, &mut boot, &verified, &state_ready, &overlay_gate).await?;
     let attach::SelfTested { self_test } = attach::self_test(
         &cli,
         &mut boot,
@@ -618,8 +620,8 @@ mod tests {
     }
 
     /// The order of the start's code (R11a, lab PR 261: of `main.rs` until
-    /// it was cut into the phases): every preflight check and the permit
-    /// come before the first attach, the self-test right after the deny
+    /// it was cut into the phases): every preflight check and the proof
+    /// come before the first load, the self-test right after the deny
     /// hooks, the audit log before the subsystems, the manifest before the
     /// event loop.
     #[test]
@@ -631,16 +633,17 @@ mod tests {
         };
         let attach = at("SensorMultiplexer::start_with_net(");
         assert!(at(".attach_anti_tamper(") > attach);
+        // R11b (lab PR 262): the checks that record the proof's steps
+        // (`boot::checks`), and the proof, before the load.
         for check in [
-            "caps::boot_gate(",
-            "install_manifest::check(",
-            "audit_preflight::preflight_writable(",
-            "boot::lsm::gate(",
-            "boot.done(BootStep::Capabilities)",
-            "boot.done(BootStep::InstallManifest)",
-            "boot.done(BootStep::AuditWritable)",
-            "boot.done(BootStep::BpfLsm)",
-            "boot.enter_attach()",
+            "checks::ebpf_object(",
+            "checks::state_dir(",
+            "checks::btf_offsets(",
+            "checks::capabilities(",
+            "checks::install_manifest(",
+            "checks::audit_log(",
+            "checks::bpf_lsm(",
+            "boot.verify_integrity()",
         ] {
             assert!(at(check) < attach, "`{check}` after the attach");
         }
@@ -658,11 +661,23 @@ mod tests {
         assert!(manifest > at("boot.enter(BootPhase::Run)"));
         assert!(manifest < at("sd_notify::ready()"));
         assert!(at("boot.done(BootStep::CapabilityManifest)") > manifest);
-        // the permit is given once, in the integrity phase, which the
+        // the proof is given once, in the integrity phase, which the
         // attach follows
         let sources = start_sources();
-        assert_eq!(sources.matches("boot.enter_attach()").count(), 1);
-        assert!(function(PHASES[4].1, PHASES[4].2).contains("boot.enter_attach()"));
+        assert_eq!(sources.matches("boot.verify_integrity()").count(), 1);
+        assert!(function(PHASES[4].1, PHASES[4].2).contains("boot.verify_integrity()"));
+        // R11b (lab PR 262): the steps the proof requires are recorded by
+        // their checks only, never by `done` (which refuses them), and the
+        // start holds no test proof
+        for step in nn_linux::boot::BootPhase::Preflight.required() {
+            assert!(step.is_checked());
+            let done = format!("done(BootStep::{step:?})");
+            assert!(
+                !sources.contains(&done),
+                "the start records `{done}` itself"
+            );
+        }
+        assert!(!sources.contains("IntegrityVerified::for_tests"));
     }
 
     /// Lab PR 231: the boot's heap is released once, after READY — after

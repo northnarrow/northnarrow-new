@@ -44,7 +44,9 @@ impl ExecSensor {
     pub const CHANNEL_CAPACITY: usize = 1024;
 
     /// Load the eBPF object, attach the tracepoint, start the pump.
-    pub async fn start() -> Result<Self> {
+    /// `_verified`: the proof the load takes
+    /// ([`crate::boot::IntegrityVerified`]; R11b, lab PR 262).
+    pub async fn start(_verified: &crate::boot::IntegrityVerified) -> Result<Self> {
         if EBPF_BYTES.is_empty() {
             bail!(
                 "eBPF program not built: crates/nn-linux/build.rs found no artifact. Run \

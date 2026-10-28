@@ -11,8 +11,12 @@
 //! deny-hook shortfall already uses ([`ALLOW_DEGRADED_ENV`]`=1`, itself a
 //! signed `weakening_env`). Either way a signed `subsystem_degraded` names
 //! the list the kernel runs. A list that cannot be read (securityfs not
-//! mounted) is not a refusal: the deny self-test after the attach
-//! ([`super::deny_selftest`]) decides.
+//! mounted) is not a refusal: the deny self-test after the attach (the
+//! agent's `boot::deny_selftest`) decides.
+//!
+//! Wave 4 restructure, R11b (lab PR 262): moved here from the agent's
+//! `boot`, which re-exports it, so that its check records its boot step
+//! ([`super::checks::bpf_lsm`]).
 
 use std::path::Path;
 

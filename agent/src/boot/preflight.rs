@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use northnarrow_agent::anti_tamper::btf_revalidate::{
-    publish_resolved, resolve_offsets, resolve_tracepoint_fields, RefuseReason, ResolveOutcome,
+    publish_resolved, resolve_tracepoint_fields, RefuseReason, ResolveOutcome,
 };
+use northnarrow_agent::boot::checks::{self, Verdict};
 use northnarrow_agent::boot::{BootSequence, BootStep};
 use tracing::{error, info, warn};
 
@@ -42,8 +43,10 @@ pub(crate) struct Preflight {
 pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // Lab PR 218 (external review G-09 / Q11-03): the start's phases, in an
     // order the code enforces (`northnarrow_agent::boot`). Preflight —
-    // checks only — until `enter_attach` hands out the permit the sensor
-    // and anti-tamper attach take; a step out of its phase stops the start.
+    // checks only — until `verify_integrity` hands out the proof the load,
+    // the pins and the attaches take; a step out of its phase stops the
+    // start. R11b (lab PR 262): the steps the proof requires are recorded by
+    // their checks (`boot::checks`), each once it passed.
     let mut boot = BootSequence::new();
 
     // Boot preflight: prove the embedded eBPF half is real and intact
@@ -54,17 +57,20 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // silently disable every sensor, the anti-tamper LSM hooks, and
     // R011's PF_KTHREAD signal (the exact blindness that let R011
     // over-fire when a stale .o was embedded by a workspace build).
-    northnarrow_agent::sensors::ebpf_object::preflight()
-        .context("eBPF object boot preflight failed — refusing to start")?;
-    boot.done(BootStep::EbpfObject)?;
+    if let Verdict::Refused(why) = checks::ebpf_object(&mut boot)? {
+        return Err(anyhow::anyhow!(why))
+            .context("eBPF object boot preflight failed — refusing to start");
+    }
     // External audit ATP-007 (NN-AUD-260): the state directory, or one of
     // the agent's own entries in it, is not a symbolic link — checked before
     // anything below reads or writes there (the bootstraps would create
     // files in a link's target, the attach would protect it).
-    northnarrow_agent::anti_tamper::filesystem::refuse_linked_state_dir(std::path::Path::new(
-        northnarrow_agent::anti_tamper::filesystem::STATE_DIR,
-    ))?;
-    boot.done(BootStep::StateDir)?;
+    if let Verdict::Refused(why) = checks::state_dir(
+        &mut boot,
+        std::path::Path::new(northnarrow_agent::anti_tamper::filesystem::STATE_DIR),
+    )? {
+        anyhow::bail!(why);
+    }
 
     // External audit NN-AUD-098: tracepoint fields left on their compiled
     // offset, attested once the audit log is open.
@@ -81,7 +87,7 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // CLOSED + LOUD rather than attach hooks that read garbage. Exit 78
     // (EX_CONFIG) so the Restart=no agent unit lands in a VISIBLE `failed`
     // state; the watchdog's 5/60s restart ceiling bounds any respawn.
-    match resolve_offsets() {
+    match checks::btf_offsets(&mut boot)? {
         ResolveOutcome::Resolved(r) => {
             if r.drifted.is_empty() {
                 info!(
@@ -222,7 +228,6 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
             std::process::exit(EX_CONFIG);
         }
     }
-    boot.done(BootStep::BtfOffsets)?;
 
     // The COMBAT ladder holds a pidfd per attributed offender (external
     // audit CMB-004), up to its cap of 1 024, on top of the agent's own

@@ -24,6 +24,9 @@
 use std::time::Duration;
 
 use nn_model::Event;
+// R11b (lab PR 262): the load takes the integrity proof; a test that loads
+// the object outside the agent's start has the tests' one.
+use northnarrow_agent::boot::IntegrityVerified;
 use northnarrow_agent::sensors::ExecSensor;
 
 /// The argument the canary exec carries.
@@ -37,7 +40,7 @@ const CANARY_ARG: &str = "northnarrow-canary";
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires root and a Linux kernel with eBPF"]
 async fn the_canary_exec_is_observed_with_its_pid_parent_and_argv() {
-    let mut sensor = ExecSensor::start()
+    let mut sensor = ExecSensor::start(&IntegrityVerified::for_tests())
         .await
         .expect("ExecSensor::start (need root + built eBPF artifact)");
 
@@ -93,7 +96,7 @@ async fn the_canary_exec_is_observed_with_its_pid_parent_and_argv() {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires root and a Linux kernel with eBPF"]
 async fn long_argv_and_filename_are_marked_cut() {
-    let mut sensor = ExecSensor::start()
+    let mut sensor = ExecSensor::start(&IntegrityVerified::for_tests())
         .await
         .expect("ExecSensor::start (need root + built eBPF artifact)");
 
@@ -195,7 +198,7 @@ const HELPER_ENV: &str = "NN_E2E_THREAD_SPAWN_MARKER";
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires root and a Linux kernel with eBPF"]
 async fn a_child_of_a_non_leader_thread_names_its_parents_start() {
-    let mut sensor = ExecSensor::start()
+    let mut sensor = ExecSensor::start(&IntegrityVerified::for_tests())
         .await
         .expect("ExecSensor::start (need root + built eBPF artifact)");
 

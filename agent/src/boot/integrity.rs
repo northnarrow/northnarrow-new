@@ -1,12 +1,13 @@
 //! `BootPhase::Preflight`, its checks before anything attaches, and the
-//! attach permit (R11a, lab PR 261: from `main.rs`).
+//! integrity proof (R11a, lab PR 261: from `main.rs`; R11b, lab PR 262: the
+//! checks record their steps, `verify_integrity` gives the proof).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use northnarrow_agent::agent_id;
-use northnarrow_agent::boot::{BootSequence, BootStep};
+use northnarrow_agent::boot::{checks, BootSequence, BootStep};
 use northnarrow_agent::response::ExecutorConfig;
 use tracing::{debug, error, info, warn};
 
@@ -14,7 +15,7 @@ use super::cli::Cli;
 
 /// What [`check`] decided: the no-enforcement gate, the checks'
 /// results the attest phase and the capability manifest sign, and the
-/// permit the attach takes.
+/// proof the attach takes.
 pub(crate) struct Integrity {
     pub(crate) exec_cfg: ExecutorConfig,
     pub(crate) detect_only: bool,
@@ -33,8 +34,10 @@ pub(crate) struct Integrity {
     /// capability manifest.
     pub(crate) bpf_lsm_state: northnarrow_agent::boot::lsm::BpfLsm,
     /// Lab PR 218: the only way into the kernel, given by
-    /// `BootSequence::enter_attach` once every preflight step is done.
-    pub(crate) attach_permit: northnarrow_agent::boot::AttachPermit,
+    /// `BootSequence::verify_integrity` once every preflight check has
+    /// passed (R11b, lab PR 262: the load, the pins and the attaches take
+    /// it).
+    pub(crate) verified: northnarrow_agent::boot::IntegrityVerified,
 }
 
 /// `BootPhase::Preflight`, its checks before anything attaches (lab PR 218,
@@ -42,8 +45,9 @@ pub(crate) struct Integrity {
 /// rules' gate, the capability bounding set, the install manifest, the
 /// audit log's writability, the host hardening, the BPF LSM. A refusal is
 /// signed (`record_refused_boot`) and the start stops with the host
-/// untouched. It ends in `BootSequence::enter_attach`, which hands out the
-/// attach permit only once every preflight step is done.
+/// untouched. It ends in `BootSequence::verify_integrity`, which hands out
+/// the integrity proof only once every preflight check has passed (R11b,
+/// lab PR 262: each recorded by its check, `boot::checks`).
 pub(crate) fn check(
     cli: &Cli,
     boot: &mut BootSequence,
@@ -101,14 +105,14 @@ pub(crate) fn check(
     // (below); in detect-only a WARN.
     let caps_degraded: Vec<String> = {
         use northnarrow_agent::response::caps_preflight as caps;
-        let reading = caps::read_effective();
+        let (reading, gate) = checks::capabilities(boot, detect_only)?;
         if let caps::CapsReading::Read {
             note: Some(note), ..
         } = &reading
         {
             warn!("capability preflight: {note}");
         }
-        match caps::boot_gate(&reading, detect_only) {
+        match gate {
             caps::BootGate::Refuse(why) => anyhow::bail!("{why}"),
             caps::BootGate::Start { degraded } if degraded.is_empty() => {
                 debug!("capability preflight: all required caps present");
@@ -128,7 +132,6 @@ pub(crate) fn check(
             }
         }
     };
-    boot.done(BootStep::Capabilities)?;
 
     // Supply chain, runtime half: the binaries running now must be the
     // ones install.sh verified and recorded. Checked before the audit
@@ -136,35 +139,33 @@ pub(crate) fn check(
     // lab PR 218 (external review G-09 / Q11-03), before anything attaches.
     let integrity = {
         use northnarrow_agent::install_manifest::{
-            self, BootHistory, IntegrityOutcome, ALLOW_UNVERIFIED_ENV,
+            BootHistory, IntegrityOutcome, ALLOW_UNVERIFIED_ENV,
         };
         let own_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
-        let outcome = install_manifest::check(
-            &cli.install_manifest,
-            &own_exe,
-            northnarrow_agent::sensors::ebpf_object::OBJECT_SHA,
-        );
+        let allow = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
         // External audit DEP-009: a missing manifest is a removal once a
         // boot of this install verified against it — the signed chain is
         // the sentinel, read (only in that case) before the decision.
-        let history = match &outcome {
-            IntegrityOutcome::NoManifest { .. } => {
-                match northnarrow_agent::audit::verified_boot_recorded(&cli.audit_log_file) {
-                    Ok(true) => BootHistory::VerifiedBefore,
-                    Ok(false) => BootHistory::NeverVerified,
-                    Err(e) => {
-                        error!(
-                            error = format!("{e:#}"),
-                            path = %cli.audit_log_file.display(),
-                            "audit chain unreadable — cannot show that this install never had a \
-                             verified boot; the missing install manifest counts as removed"
-                        );
-                        BootHistory::Unknown
-                    }
-                }
-            }
-            _ => BootHistory::NeverVerified,
-        };
+        let checks::ManifestCheck {
+            outcome,
+            history,
+            history_error,
+            fatal,
+        } = checks::install_manifest(
+            boot,
+            &cli.install_manifest,
+            &own_exe,
+            &cli.audit_log_file,
+            allow.as_deref(),
+        )?;
+        if let Some(e) = &history_error {
+            error!(
+                error = %e,
+                path = %cli.audit_log_file.display(),
+                "audit chain unreadable — cannot show that this install never had a \
+                 verified boot; the missing install manifest counts as removed"
+            );
+        }
         match &outcome {
             IntegrityOutcome::Verified {
                 provenance,
@@ -214,8 +215,7 @@ pub(crate) fn check(
                 }
             }
         }
-        let allow = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
-        if outcome.is_fatal(allow.as_deref(), history) {
+        if fatal {
             error!(
                 "refusing to start: install-manifest check = {} (set {ALLOW_UNVERIFIED_ENV}=1 to \
                  override on a dev host; re-run install.sh to restore a verified install)",
@@ -263,16 +263,20 @@ pub(crate) fn check(
         }
         outcome
     };
-    boot.done(BootStep::InstallManifest)?;
 
     // Lab PR 218 (external review G-09 / Q11-03): the audit log's
     // writability before anything attaches — a read-only mount or an
     // immutable file refuses the start while the host is untouched. The
     // signed `agent_boot` after the attach still proves it with a row.
-    match northnarrow_agent::audit_preflight::preflight_writable(
+    let audit = checks::audit_log(
+        boot,
         &cli.audit_log_file,
         early_registration_failed,
-    ) {
+        std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    match audit.preflight {
         northnarrow_agent::audit_preflight::AuditPreflight::Writable => {
             debug!(path = %cli.audit_log_file.display(), "audit log writable (preflight)")
         }
@@ -282,11 +286,7 @@ pub(crate) fn check(
              decides"
         ),
         northnarrow_agent::audit_preflight::AuditPreflight::Unwritable(why) => {
-            let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
-                    .ok()
-                    .as_deref(),
-            );
+            let fatal = audit.fatal;
             error!(
                 why,
                 fatal,
@@ -303,7 +303,6 @@ pub(crate) fn check(
             }
         }
     }
-    boot.done(BootStep::AuditWritable)?;
 
     // Host hardening (Tappa 10.8): the anti-tamper holds only while root
     // cannot rewrite the kernel at runtime. One WARN per missing setting,
@@ -332,8 +331,9 @@ pub(crate) fn check(
     // anything attaches, unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1; signed
     // either way (`northnarrow_agent::boot::lsm`).
     let allow_degraded = northnarrow_agent::boot::lsm::allow_degraded_from_env();
-    let bpf_lsm_state = northnarrow_agent::boot::lsm::read_in(std::path::Path::new("/"));
-    match northnarrow_agent::boot::lsm::gate(&bpf_lsm_state, allow_degraded) {
+    let (bpf_lsm_state, lsm_gate) =
+        checks::bpf_lsm(boot, std::path::Path::new("/"), allow_degraded)?;
+    match lsm_gate {
         northnarrow_agent::boot::lsm::LsmGate::Proceed => info!(
             lsms = bpf_lsm_state.list().unwrap_or(""),
             "BPF LSM active — the deny hooks will run"
@@ -356,8 +356,7 @@ pub(crate) fn check(
             std::process::exit(78);
         }
     }
-    boot.done(BootStep::BpfLsm)?;
-    let attach_permit = boot.enter_attach()?;
+    let verified = boot.verify_integrity()?;
     Ok(Integrity {
         exec_cfg,
         detect_only,
@@ -367,7 +366,7 @@ pub(crate) fn check(
         host_checks,
         allow_degraded,
         bpf_lsm_state,
-        attach_permit,
+        verified,
     })
 }
 

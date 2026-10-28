@@ -1,7 +1,8 @@
 //! `BootPhase::Attach` and `BootPhase::SelfTest` (R11a, lab PR 261: from
 //! `main.rs`): the eBPF object, the sensors and the deny hooks attach on
-//! the permit the integrity checks gave, then one deny hook is exercised
-//! against the agent itself.
+//! the proof the integrity checks gave (R11b, lab PR 262:
+//! `IntegrityVerified`, and the state files bootstrapped before), then one
+//! deny hook is exercised against the agent itself.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use super::cli::{Cli, DnsSensor, ExecSensor, ExploitGuard, FileOpenSensor};
 use super::integrity::record_refused_boot;
+use super::state::StateReady;
 
 /// What [`load`] attached.
 pub(crate) struct Attached {
@@ -40,13 +42,17 @@ pub(crate) struct Attached {
 /// `BootPhase::Attach`: the eBPF object loads and the sensors attach
 /// (`SensorMultiplexer::start_with_net`), the deny hooks attach and the
 /// agent registers in them (`attach_anti_tamper`), the exploit guard
-/// attaches. Both attaches take `attach_permit`, which only
-/// [`crate::boot::integrity::check`] hands out: nothing reaches the kernel before every
-/// preflight check has run.
+/// attaches. The load, the pins and every attach take `verified`, which
+/// only [`crate::boot::integrity::check`] holds (R11b, lab PR 262: the
+/// plan's `attach(&IntegrityVerified, &StateReady)`): nothing reaches the
+/// kernel before every integrity check has passed, and the state files the
+/// deny hooks protect were bootstrapped before (`_state`, which only
+/// [`crate::boot::state::bootstrap`] builds).
 pub(crate) async fn load(
     cli: &Cli,
     boot: &mut BootSequence,
-    attach_permit: northnarrow_agent::boot::AttachPermit,
+    verified: &northnarrow_agent::boot::IntegrityVerified,
+    _state: &StateReady,
     overlay_gate: &Arc<northnarrow_agent::config::overlay_auth::OverlayGate>,
 ) -> Result<Attached> {
     // Process-lineage cache shared by the posture triggers and the FIM
@@ -144,7 +150,7 @@ pub(crate) async fn load(
         cli.exploit_guard_tasks,
         cli.exploit_guard.variant(),
     );
-    let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring, &attach_permit)
+    let (mut sensor, net_bufs) = SensorMultiplexer::start_with_net(net_wiring, verified)
         .await
         .context("starting the sensor multiplexer (with net observation)")?;
     boot.done(BootStep::Sensors)?;
@@ -187,7 +193,7 @@ pub(crate) async fn load(
     // refused by the preflight above (lab PR 218), or runs under that same
     // opt-in; hooks that attach and never run are the self-test's below.
     sensor
-        .attach_anti_tamper(&attach_permit, &pids, &keep)
+        .attach_anti_tamper(verified, &pids, &keep)
         .with_context(|| {
             format!(
                 "anti-tamper setup failed (agent_pid={agent_pid}) — \
@@ -200,7 +206,7 @@ pub(crate) async fn load(
     // until the no-enforcement gate is resolved below. Off or unavailable
     // is attested once the audit log is open.
     let exploit_guard_degraded: Option<String> =
-        match sensor.attach_exploit_guard(cli.exploit_guard.variant()) {
+        match sensor.attach_exploit_guard(verified, cli.exploit_guard.variant()) {
             Ok(()) => None,
             Err(_) if cli.exploit_guard == ExploitGuard::Off => Some(
                 "exploit post-condition guard off (--exploit-guard off / NN_EXPLOIT_GUARD=off): \

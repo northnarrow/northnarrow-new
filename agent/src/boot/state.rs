@@ -5,11 +5,15 @@ use tracing::{info, warn};
 
 use super::cli::Cli;
 
-/// What [`bootstrap`] found.
+/// What [`bootstrap`] found. Only [`bootstrap`] builds one (`_once` is
+/// private to this module): the attach takes it (R11b, lab PR 262: the
+/// plan's `attach(&IntegrityVerified, &StateReady)`), so the deny hooks
+/// never attach before the files they protect were bootstrapped.
 pub(crate) struct StateReady {
     /// Lab PR 218: the previous agent's hooks may close the agent's files to
     /// this process until the attach registers it (the audit preflight).
     pub(crate) early_registration_failed: bool,
+    _once: (),
 }
 
 /// The state files, before the attach (Tappa 8 A14): the agent registered
@@ -206,5 +210,6 @@ pub(crate) fn bootstrap(cli: &Cli, heads_file: &std::path::Path) -> StateReady {
     }
     StateReady {
         early_registration_failed,
+        _once: (),
     }
 }

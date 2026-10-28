@@ -31,7 +31,14 @@ use tracing::info;
 /// struct: aya's ELF parser does pointer-aligned reads internally and
 /// fails with "error parsing ELF data" if it gets a 1-byte-aligned
 /// slice (which is what `core::include_bytes!` produces).
-pub static EBPF_BYTES: &[u8] =
+///
+/// Wave 4 restructure, R11b (lab PR 262): this crate's alone. Its loaders
+/// take the start's [`crate::boot::IntegrityVerified`]
+/// ([`crate::sensors::SensorMultiplexer::start_with_net`],
+/// [`crate::sensors::ExecSensor::start`]); the lab builds' one-shot modes
+/// (`--sensor-feasibility`, `--verifier-check`) load it under a pin
+/// directory of their own and exit before any start.
+pub(crate) static EBPF_BYTES: &[u8] =
     include_bytes_aligned!(concat!(env!("OUT_DIR"), "/northnarrow-agent-ebpf"));
 
 /// `"1"` iff `build.rs` embedded a real, staleness-verified object.
