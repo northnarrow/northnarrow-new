@@ -17,42 +17,6 @@ fn open_sensor_on_tracepoint(why: &str) {
     );
 }
 
-/// `--exploit-guard` (lab PR 219).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ExploitGuard {
-    Off,
-    Lite,
-    Strict,
-}
-
-impl ExploitGuard {
-    fn variant(self) -> northnarrow_agent::sensors::epg::Variant {
-        use northnarrow_agent::sensors::epg::Variant;
-        match self {
-            Self::Off => Variant::Off,
-            Self::Lite => Variant::Lite,
-            Self::Strict => Variant::Strict,
-        }
-    }
-}
-
-/// `--exploit-guard-response` (lab PR 219).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ExploitGuardResponse {
-    Detect,
-    Enforce,
-}
-
-impl ExploitGuardResponse {
-    fn response(self) -> northnarrow_agent::sensors::epg::Response {
-        use northnarrow_agent::sensors::epg::Response;
-        match self {
-            Self::Detect => Response::Detect,
-            Self::Enforce => Response::Enforce,
-        }
-    }
-}
-
 /// Review 69: the LSM file-open sensor could not be armed, so
 /// `sys_enter_openat` (attached, inert until now) starts emitting.
 fn open_tracepoint_fallback(sensor: &mut SensorMultiplexer) {

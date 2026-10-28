@@ -3,11 +3,6 @@
 /// process ends at systemd-shutdown's final stage.
 static HOST_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// External audit CMB-012: how long the COMBAT release waits for the
-/// ladder's queued steps (a NEUTRALIZE of a large tree takes seconds)
-/// before it lifts the isolation anyway.
-const LADDER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// The host is shutting down: stand the ladder down once and stop
 /// escalating (see [`HOST_STOPPING`]).
 fn host_stopping(ladder: &northnarrow_agent::combat::CombatLadder) {

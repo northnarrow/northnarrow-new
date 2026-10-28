@@ -887,24 +887,6 @@ enum DnsSensor {
     Sendmsg,
 }
 
-/// Lab PR 218 (external review P0 C-13): the file-open sensor stays on
-/// `sys_enter_openat` — every open goes to userland and its path is read
-/// from the caller's memory. Signed and in `nn-admin status`, not only a
-/// WARN.
-fn open_sensor_on_tracepoint(why: &str) {
-    northnarrow_agent::boot::manifest::note_sensor(
-        "file_open",
-        "tracepoint:syscalls/sys_enter_openat (user memory)",
-    );
-    northnarrow_agent::boot::degradation::report(
-        "file_open_sensor",
-        &format!(
-            "file-open sensor on sys_enter_openat: every open goes to userland and its path is \
-             read from the caller's memory — {why}"
-        ),
-    );
-}
-
 /// `--exploit-guard` (lab PR 219).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ExploitGuard {
