@@ -1554,6 +1554,78 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `install` and `fail`, out of line on `main`, inlined into
   `AgentExecGuards::install`): `.text` +81,872 bytes (+1.09 %) in the
   agent, +2,000 in nn-admin. `cargo doc`: 336 warnings, `main` 337.
+- Wave 4 restructure, R09c — nn-linux, part 3: the hardening, the
+  integrity checks and the systemd integration (lab PR 257). Moved to
+  `crates/nn-linux` (`git mv`, 99–100 %): the systemd integration
+  (`systemd_state`: what systemd reports the host as, over its private
+  socket; `sd_notify`: the agent's `READY=1`), the install manifest's
+  boot check (`install_manifest`), the hardening (`host_hardening`: the
+  kernel and boot-chain checks of `nn-admin host-check`, the boot's
+  warnings and the capability manifest; `process_hardening`: no core
+  dump, no readable memory), the telemetry probe (`telemetry_probe`,
+  onto R09b's cut of it), the self-integrity watcher (`self_integrity`,
+  onto R09a's cut of it), the files around the agent's start and stop
+  (`audit_preflight`, the shutdown marker's file I/O,
+  `upgrade_rollback`) and the lab builds' probes (`sensor_feasibility`,
+  `verifier_check`, behind the features they had, nn-linux's now, which
+  the agent forwards). Cut first: the install manifest's test that reads
+  the agent's fuzz fixture stays in the agent
+  (`install_manifest_tests.rs`); the shipped COMBAT defaults' lookup
+  (`shipped_default`) sits beside the rulesets it returns, in nn-linux's
+  `anti_tamper::network_isolate` (the agent's overlay gate re-exports
+  it). One seam: the watcher holds the agent's signed-overlay gate
+  through nn-core's `Vouch` (R09a's, the network isolator's), which
+  takes `is_signed` beside `verified`; `self_integrity::spawn` takes the
+  `Arc` of any `Vouch`, so `main.rs` is unchanged. `systemd_state`'s
+  padding reads `is_multiple_of` (the workspace lints; its callers pass
+  4 and 8). The agent keeps every path as a shim (removed in R17);
+  `main.rs`, the admin socket, the tests, the replays, the examples and
+  the fuzz targets are unchanged; xtask's `operator_docs.rs` and
+  `path_liveness.rs` read the checks' new path, `install.sh`'s comments
+  name the new paths. The boot's deny self-test, BPF LSM gate, trust
+  level and signed manifest stay in the agent (the plan's R11a and R13).
+  The ratchet goes from 22 to 21: R09c's modules had no counted arc
+  (nn-linux 0), and nn-admin's `detections` names the detections'
+  default limit (`DEFAULT_DETECTIONS_LIMIT`, what `limit = 0` means on
+  the wire) where it now is, nn-proto's `admin_signed_payload` (nn-admin
+  8 → 7). Identity against `main` 8738784, both built in one temporary
+  checkout (same path), the release job's commands: the eBPF object and
+  its stamp are byte-identical (source hash 235e2fed…, `main`'s), the
+  scanner and the watchdog byte-identical, stripped and unstripped; the
+  tarball's 72 entries and the .deb's 79 paths and modes are the same;
+  `posture_demo` prints the same lines; `nn-admin policy test` on lab PR
+  251's samples gives the same 402 outputs; the golden replays (five
+  runs), the wire, chain and crypto pins, the parser pins, the
+  overlay-v1 fixture and the per-rule policy's format pass unchanged;
+  the test list is `main`'s (3,082 names: 89 now nn-linux's, one at a
+  new path — the fuzz fixture's test in the agent). The agent
+  (15,276,288 → 15,282,760 bytes) and nn-admin (4,130,440 → 4,149,576)
+  are not byte-identical: function by function (unstripped, names
+  mapped, addresses dropped) 7,856 of the agent's 7,958 functions and
+  3,555 of nn-admin's 3,580 are the same code; of the agent's 89 that
+  differ, 72 call other callees (inlining at the new crate boundary: the
+  watcher, the probe, the overlay read, generic code instantiated in
+  nn-linux), 10 are scheduled or allocated otherwise, 5 differ in
+  operands only (the watcher's task, whose state holds the gate as a
+  `dyn Vouch`, a wider pointer), one name has several bodies; the
+  unpaired are generic instantiations made in the other crate, code
+  inlined on one side only (`jittered` out of line on `main`; the
+  watcher's `collect_round` and the overlay read on `LinuxHost` out of
+  line on the tip) and the one new function, the gate's
+  `Vouch::is_signed`: `.text` +5,872 bytes (+0.08 %) in the agent,
+  +16,848 (+0.51 %) in nn-admin (serde_json's generic code instantiated
+  again in nn-linux for the install manifest). `.rodata`: the same text
+  but the callsite lines of the edited files. On the lab guest (Ubuntu
+  24.04) what the agent hashes and checks at boot gives `main`'s
+  verdicts: every boot of the installed agent — the lot's 11, `main`'s
+  7, the one `upgrade-check` made from `main` — verified its binaries
+  and the embedded object against the install manifest ("checked=5") and
+  signed the same capability manifest (the host hardening table
+  included); the `tamper-check` cases are `main`'s, case by case (72 of
+  75 OK, the same two known gaps and deviation), and so are the
+  self-integrity findings over each run, kind by kind — an unsigned
+  overlay is drift, a signed one is not (the gate's `is_signed` through
+  `Vouch`).
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

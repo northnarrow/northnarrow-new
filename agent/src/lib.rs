@@ -45,9 +45,9 @@ pub mod audit {
     /// another is named.
     pub type AuditLog<K = AgentSigningKey> = nn_evidence::audit::AuditLog<K>;
 }
-/// The audit log's writability before the attach (from `audit`, R04a, lab
-/// PR 241).
-pub mod audit_preflight;
+/// R09c shim: the audit log's writability before the attach (from `audit`,
+/// R04a, lab PR 241) is nn-linux's.
+pub use nn_linux::audit_preflight;
 /// Lab PR 218: the start as typed phases, the BPF LSM gate, the deny
 /// self-test, the degradations, the trust level and the capability manifest.
 pub mod boot;
@@ -142,10 +142,18 @@ pub use nn_linux::fim;
 pub use nn_linux::fs_type;
 #[doc(hidden)]
 pub mod fuzz_api;
-pub mod host_hardening;
+/// R09c shim: the host hardening checks (`nn-admin host-check`, the boot's
+/// warnings, the capability manifest's table) are nn-linux's.
+pub use nn_linux::host_hardening;
 pub mod impact;
 pub mod impair;
-pub mod install_manifest;
+/// R09c shim: the boot's check of the installed binaries and the embedded
+/// eBPF object against the install manifest is nn-linux's.
+pub use nn_linux::install_manifest;
+/// The install manifest's check reached through the fuzz target's fixture
+/// (R09c, lab PR 257: from `install_manifest`'s tests).
+#[cfg(test)]
+mod install_manifest_tests;
 /// R09a shim: the agent's signing key (from `audit`, R04a, lab PR 241) is
 /// nn-linux's.
 pub use nn_linux::keys;
@@ -162,28 +170,41 @@ pub mod posture;
 /// files and the clocks of nn-core's `PostureHost` (R08a, lab PR 250) — is
 /// nn-linux's.
 pub use nn_linux::posture_host_linux;
-pub mod process_hardening;
+/// R09c shim: the agent process's own hardening (no core dump, no
+/// readable memory) is nn-linux's.
+pub use nn_linux::process_hardening;
 pub mod removed_settings;
 /// R09a shim: the executor and its actions (kill, quarantine, the egress
 /// block, the throttle, the containment and its release) are nn-linux's.
 pub use nn_linux::response;
 /// R09a shim: the work kept off the async runtime is nn-linux's.
 pub(crate) use nn_linux::runtime;
-pub mod sd_notify;
-pub mod self_integrity;
-/// Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`).
+/// R09c shim (lab PR 257; plan §4.1 rule 2, removed in R17): systemd's
+/// readiness notification is nn-linux's.
+pub use nn_linux::sd_notify;
+/// R09c shim: the self-integrity watcher is nn-linux's.
+pub use nn_linux::self_integrity;
+/// R09c shim: Tappa 10.9 step 0, lab builds only (`--sensor-feasibility`),
+/// is nn-linux's (this crate's `test-privileged` turns on nn-linux's).
 #[cfg(feature = "test-privileged")]
-pub mod sensor_feasibility;
+pub use nn_linux::sensor_feasibility;
 pub mod sensors;
-pub mod shutdown_marker;
-pub mod systemd_state;
-pub mod telemetry_probe;
-/// R09a shim: the system directories' binaries are nn-linux's.
-pub use nn_linux::trusted_bin;
-pub mod upgrade_rollback;
-/// Lab builds only (`--verifier-check`): every program of the embedded
-/// eBPF object through the kernel's verifier.
-#[cfg(feature = "debug-trigger")]
-pub mod verifier_check;
 /// R05 shim: the full verifiers' line reader.
 pub use nn_evidence::verify_lines;
+/// R09c shim: the shutdown marker's file (its format is nn-proto's) is
+/// nn-linux's.
+pub use nn_linux::shutdown_marker;
+/// R09c shim: what systemd reports the host as, over its private socket,
+/// is nn-linux's.
+pub use nn_linux::systemd_state;
+/// R09c shim: the continuous telemetry probe is nn-linux's.
+pub use nn_linux::telemetry_probe;
+/// R09a shim: the system directories' binaries are nn-linux's.
+pub use nn_linux::trusted_bin;
+/// R09c shim: the signed record of a rolled-back upgrade is nn-linux's.
+pub use nn_linux::upgrade_rollback;
+/// R09c shim: lab builds only (`--verifier-check`), every program of the
+/// embedded eBPF object through the kernel's verifier, is nn-linux's (this
+/// crate's `debug-trigger` turns on nn-linux's).
+#[cfg(feature = "debug-trigger")]
+pub use nn_linux::verifier_check;

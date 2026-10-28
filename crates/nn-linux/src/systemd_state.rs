@@ -132,7 +132,7 @@ fn read_line(s: &mut impl Read) -> io::Result<String> {
 }
 
 fn pad(buf: &mut Vec<u8>, align: usize) {
-    while buf.len() % align != 0 {
+    while !buf.len().is_multiple_of(align) {
         buf.push(0);
     }
 }

@@ -767,10 +767,10 @@ fn last_id_in_file(path: &Path) -> Option<u64> {
 
 // ── bounded last-N read (9.0.b) ─────────────────────────────────────
 
-/// CLI default for `nn-admin detections --limit` when the operator
-/// gives none (the wire carries `limit = 0` ⇒ this default). A live
-/// dashboard wants the freshest handful, not the whole store.
-pub const DEFAULT_DETECTIONS_LIMIT: usize = 50;
+/// The detections' default limit (`limit = 0` on the wire): nn-proto's,
+/// the verb's (R09c, lab PR 257: the operator client names it and may not
+/// name this module, R10), under its path here.
+pub use nn_proto::admin_signed_payload::DEFAULT_DETECTIONS_LIMIT;
 
 /// Hard server-side ceiling on a single `Detections` read. Clamps a
 /// fat-fingered or hostile `--limit`: combined with the wire frame's

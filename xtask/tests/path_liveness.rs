@@ -410,7 +410,7 @@ fn every_file_the_xtask_tests_name_exists() {
     // the files the scans of lab_scripts.rs and operator_docs.rs read
     for known in [
         "crates/nn-linux/src/anti_tamper/mod.rs",
-        "agent/src/host_hardening.rs",
+        "crates/nn-linux/src/host_hardening.rs",
     ] {
         assert!(root.join(known).is_file(), "{known}");
     }

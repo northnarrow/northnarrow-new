@@ -72,7 +72,7 @@ UPGRADE_TXN_ROOT=${UPGRADE_TXN_ROOT:-/var/lib/northnarrow-upgrade}
 # How long the restarted units have to prove their health (upgrade_health_check).
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-60}
 # What a rolled-back upgrade leaves for the restored agent to sign
-# (agent/src/upgrade_rollback.rs, DEFAULT_MARKER_PATH).
+# (crates/nn-linux/src/upgrade_rollback.rs, DEFAULT_MARKER_PATH).
 ROLLBACK_MARKER=${ROLLBACK_MARKER:-$RUN_DIR/upgrade-rolled-back.json}
 
 AGENT_BIN="$TARGET_DIR/northnarrow-agent"
@@ -536,8 +536,8 @@ require_provenance_floor() {
 # Record what was installed: provenance level + sha256 of every installed
 # binary and of the eBPF object. The agent compares its own binary, the
 # watchdog, nn-admin and the embedded object hash against this file at
-# every boot (agent/src/install_manifest.rs) and refuses to start on a
-# mismatch; the file sits under the inode_protect hook with the rest of
+# every boot (crates/nn-linux/src/install_manifest.rs) and refuses to start
+# on a mismatch; the file sits under the inode_protect hook with the rest of
 # /etc/northnarrow.
 write_install_manifest() {
     local manifest="$ETC_DIR/install-manifest.json" version
@@ -843,7 +843,7 @@ pkg_health_or_fail() {   # <unit>...
     return 1
 }
 
-# >>> rollback_marker (agent/src/upgrade_rollback.rs reads what it writes; its test runs this block)
+# >>> rollback_marker (crates/nn-linux/src/upgrade_rollback.rs reads what it writes; its test runs this block)
 # Lab PR 220: what a rolled-back upgrade leaves for the restored agent, which
 # signs it at its boot as one `upgrade_rolled_back` row of the audit chain and
 # removes it. One JSON object of strings, control characters dropped, each

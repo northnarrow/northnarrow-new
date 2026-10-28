@@ -29,6 +29,18 @@
 //! degradations, the sensors' attach points. The exec guards whose kernel
 //! configuration the loader writes stay in the agent, behind
 //! [`ExecGuards`](sensors::multiplexer::ExecGuards).
+//! R09c (lab PR 257) moves the hardening — the host's kernel and boot-chain
+//! checks, the agent process's own —, the integrity checks — the
+//! self-integrity watcher, the install manifest's boot check, the telemetry
+//! probe —, the systemd integration (the readiness notification, what
+//! systemd reports the host as), the files around the agent's start and
+//! stop (the audit log's writability, the shutdown marker's file, the record
+//! of a rolled-back upgrade) and the lab builds' probes
+//! (`--sensor-feasibility`, `--verifier-check`); the watcher holds the
+//! agent's signed-overlay gate through nn-core's
+//! [`Vouch`](nn_core::config::overlay_auth::Vouch). The boot's deny
+//! self-test, BPF LSM gate, trust level and signed manifest stay in the
+//! agent.
 //!
 //! The only crate of the layout where `unsafe` is allowed (no
 //! `#![forbid(unsafe_code)]`, R01): its blocks moved verbatim, each with its
@@ -63,6 +75,11 @@ pub mod async_fd;
 // Replacing a file the agent protects, without following a planted link
 // (R09a; was the agent's `atomic_file`, the path of `antitamper-bpf`'s).
 pub mod atomic_file;
+
+// Whether the audit log can be written, checked before anything attaches
+// (lab PR 218; R04a's cut of the chain code's host call, lab PR 241; R09c,
+// lab PR 257; was the agent's `audit_preflight`).
+pub mod audit_preflight;
 
 // An external command with a deadline (R09a; was the agent's
 // `bounded_cmd`).
@@ -154,6 +171,13 @@ pub mod fim;
 // agent's `fs_type`).
 pub mod fs_type;
 
+// The host's kernel and boot-chain hardening: the settings that decide
+// whether a root that rewrites the kernel at runtime can bypass the
+// self-defence, for `nn-admin host-check`, the boot's warnings and the
+// capability manifest (Tappa 10.8; R09c, lab PR 257; was the agent's
+// `host_hardening`).
+pub mod host_hardening;
+
 /// The ransomware signal's Linux part (R09a, lab PR 253): the production
 /// sampler of the host's files (was the agent's `impact::entropy`; the
 /// signal is nn-core's).
@@ -170,6 +194,11 @@ pub mod impair {
     /// ([`DefenseDetector::attach_map`](nn_core::impair::DefenseDetector::attach_map)).
     pub type DefenderMap = aya::maps::HashMap<aya::maps::MapData, u32, u8>;
 }
+
+// The boot's check of the installed binaries and the embedded eBPF object
+// against the manifest `install.sh` writes (Tappa 10.8, external audit
+// DEP-009; R09c, lab PR 257; was the agent's `install_manifest`).
+pub mod install_manifest;
 
 // The agent's signing key and its files (R09a; was the agent's `keys`).
 pub mod keys;
@@ -253,6 +282,10 @@ pub mod os_rng;
 // `PostureAgent`; R09a; was the agent's `posture_host_linux`).
 pub mod posture_host_linux;
 
+// The agent's own process: no core dump, no readable memory (lab PR 216;
+// R09c, lab PR 257; was the agent's `process_hardening`).
+pub mod process_hardening;
+
 // The executor and its actions (Tappa 3, Tappa 5): kill, quarantine, the
 // egress block, the throttle, the containment and its release, the
 // capability preflight, the pidfd capture of a process (R09a; was the
@@ -263,9 +296,25 @@ pub mod response;
 // agent's `runtime`).
 pub mod runtime;
 
-/// The self-integrity watcher's pieces the self-defence and the actuators
-/// name (R09a, lab PR 253; cut from the agent's `self_integrity`, R09c's).
+// systemd's readiness notification (`READY=1` on `$NOTIFY_SOCKET`, T7.10),
+// through the datagram `antitamper-bpf` shares with the watchdog (R09c, lab
+// PR 257; was the agent's `sd_notify`).
+pub mod sd_notify;
+
+// The self-integrity watcher: what systemd and the kernel will do to the
+// agent next (drop-ins, unit copies, limits, `oom_score_adj`, mounts, the
+// overlays, an admin key on the host), each round against the boot and the
+// install, every finding signed (Tappa 10.8; R09c, lab PR 257; was the
+// agent's `self_integrity`, whose op and jitter, which the self-defence
+// names, came first, R09a).
 pub mod self_integrity;
+
+// Tappa 10.9, step 0, lab builds only (`--sensor-feasibility`): the
+// throw-away probes of the candidate attach points, loaded and exercised on
+// the running kernel (R09c, lab PR 257; was the agent's
+// `sensor_feasibility`, behind the same feature, which the agent forwards).
+#[cfg(feature = "test-privileged")]
+pub mod sensor_feasibility;
 
 // The sensors (Tappa 4, Tappa 10): the embedded eBPF object and its boot
 // preflight, the single loader that attaches every program and pumps every
@@ -274,13 +323,37 @@ pub mod self_integrity;
 // the agent's `sensors`; `build.rs` embeds the object).
 pub mod sensors;
 
-// The telemetry probe's piece the file-open sensor names (R09b, lab PR
-// 254; cut from the agent's `telemetry_probe`, R09c's).
+// The shutdown-authorisation marker's file: written before the agent's
+// authorised exit, read by the watchdog; its format and verification are
+// nn-proto's (Tappa 8 A7; R09c, lab PR 257; was the agent's
+// `shutdown_marker`).
+pub mod shutdown_marker;
+
+// What systemd reports the host as (`SystemState`), asked over its private
+// socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
+// 257; was the agent's `systemd_state`).
+pub mod systemd_state;
+
+// The continuous telemetry probe: one known exec, file open and DNS
+// datagram a round, each checked against its sensor's pipeline (Tappa
+// 10.8; R09c, lab PR 257; was the agent's `telemetry_probe`, whose probe
+// files' directory, which the file-open sensor names, came first, R09b).
 pub mod telemetry_probe;
 
 // The system directories' binaries, never `$PATH` (R09a; was the agent's
 // `trusted_bin`).
 pub mod trusted_bin;
+
+// The record of an upgrade `install.sh` rolled back, signed by the agent it
+// restored (lab PR 220; R09c, lab PR 257; was the agent's
+// `upgrade_rollback`).
+pub mod upgrade_rollback;
+
+// Lab builds only (`--verifier-check`): every program of the embedded eBPF
+// object through the kernel's verifier (R09c, lab PR 257; was the agent's
+// `verifier_check`, behind the same feature, which the agent forwards).
+#[cfg(feature = "debug-trigger")]
+pub mod verifier_check;
 
 // R09a shims (lab PR 253; plan §4.1 rule 2, removed in R17): the paths the
 // moved code names for what is nn-evidence's and nn-core's, as the agent's
@@ -320,8 +393,18 @@ pub(crate) mod chainlog {
         nn_evidence::chainlog::RotatingChainLog<P, K>;
 }
 
-/// `crate::config::…`, nn-core's (the overlay a watched-paths load takes).
-use nn_core::config;
+/// `crate::config::overlay_auth::…`, nn-core's — the overlay a watched-paths
+/// load takes; the overlay read and the gate's trait the integrity check
+/// names (R09c) — and the shipped COMBAT defaults' lookup, nn-linux's (R09c,
+/// lab PR 257: from the agent's `config::overlay_auth`, which gives the
+/// same paths).
+pub(crate) mod config {
+    pub mod overlay_auth {
+        pub use nn_core::config::overlay_auth::*;
+
+        pub use crate::anti_tamper::network_isolate::shipped_default;
+    }
+}
 
 /// `crate::decision::…`, nn-core's (the exemption facts' trait).
 use nn_core::decision;

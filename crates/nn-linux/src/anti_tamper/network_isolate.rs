@@ -28,6 +28,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, Context, Result};
+use nn_proto::admin_signed_payload::OverlayKind;
 use tracing::{error, info, warn};
 
 use super::combat_allow;
@@ -181,6 +182,19 @@ pub const BUILTIN_RULES_V6: &str =
 /// See [`BUILTIN_RULES_V4`]: comments only, no network spared.
 pub const BUILTIN_ALLOW: &str =
     include_str!(concat!(env!("NN_REPO_ROOT"), "/configs/combat-allow.cidrs"));
+
+/// External audit ATP-001 / DEP-003: content of `kind` that needs no
+/// signature because it is what the agent was built with — the shipped
+/// COMBAT rulesets and carve-out. The `.local` overlays have none.
+pub fn shipped_default(kind: OverlayKind) -> Option<&'static str> {
+    use crate::anti_tamper::network_isolate as ni;
+    match kind {
+        OverlayKind::CombatRulesV4 => Some(ni::BUILTIN_RULES_V4),
+        OverlayKind::CombatRulesV6 => Some(ni::BUILTIN_RULES_V6),
+        OverlayKind::CombatAllow => Some(ni::BUILTIN_ALLOW),
+        _ => None,
+    }
+}
 
 /// What a COMBAT ruleset must keep to still isolate: the filter table, the
 /// COMBAT chain and its catch-all DROP, the INPUT and OUTPUT jumps into

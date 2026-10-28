@@ -508,51 +508,6 @@ mod tests {
         }
     }
 
-    /// External audit WDG-R05 (NN-AUD-371): the fuzz target's fixture (a
-    /// fixed `bin_dir` holding a binary for each recorded file name,
-    /// `fuzz_api`) reaches the hash comparison. Through `/proc/self/exe`
-    /// every input ended `NotApplicable`, before any hash.
-    #[test]
-    fn fuzz_fixture_reaches_hash_comparison() {
-        use crate::fuzz_api::{
-            install_manifest_check_in_dir, write_install_manifest_fixture,
-            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        write_install_manifest_fixture(dir.path()).unwrap();
-        let sha = |n: &str| sha256_file(&dir.path().join(n)).unwrap();
-        let good = manifest_json(
-            Path::new("/somewhere/else"),
-            &sha("northnarrow-agent"),
-            &sha("northnarrow-watchdog"),
-            &sha("nn-admin"),
-            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
-        );
-        let (parsed, out) = install_manifest_check_in_dir(
-            good.as_bytes(),
-            dir.path(),
-            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
-        );
-        assert!(parsed.is_some());
-        assert!(
-            matches!(out, IntegrityOutcome::Verified { checked: 4, .. }),
-            "{out:?}"
-        );
-        let bad = good.replacen(&sha("nn-admin"), &"0".repeat(64), 1);
-        let (_, out) = install_manifest_check_in_dir(
-            bad.as_bytes(),
-            dir.path(),
-            INSTALL_MANIFEST_FIXTURE_EBPF_SHA,
-        );
-        assert!(matches!(out, IntegrityOutcome::Mismatch { .. }), "{out:?}");
-        let (parsed, out) = install_manifest_check_in_dir(b"{not json", dir.path(), "x");
-        assert!(parsed.is_none());
-        assert!(
-            matches!(out, IntegrityOutcome::Unreadable { .. }),
-            "{out:?}"
-        );
-    }
-
     #[test]
     fn unparseable_manifest_is_fatal() {
         let dir = tempfile::tempdir().unwrap();

@@ -71,14 +71,16 @@ hex = "0.4"
 # R09a (lab PR 253): the BPF guard observes, and does not enforce, in a
 # build with the nn-admin debug surface (`anti_tamper::bpf_defense`, its
 # `cfg!(feature = "debug-trigger")`); the agent forwards its own
-# `debug-trigger` here (plan §4.1 rule 4). Off by default; production
+# `debug-trigger` here (plan §4.1 rule 4). R09c (lab PR 257): the lab
+# builds' `--verifier-check` (`verifier_check`). Off by default; production
 # builds never see it.
 debug-trigger = []
 # R09b (lab PR 254): the attach permit without a boot sequence, for the
 # privileged tests that load the eBPF object outside the agent's start
 # (`boot::AttachPermit::for_tests`); the agent forwards its own
-# `test-privileged` here (plan §4.1 rule 4). Off by default; production
-# builds never see it.
+# `test-privileged` here (plan §4.1 rule 4). R09c (lab PR 257): the lab
+# builds' `--sensor-feasibility` (`sensor_feasibility`). Off by default;
+# production builds never see it.
 test-privileged = []
 # R09a (lab PR 253): the test doors this crate keeps for the agent's tests
 # that wire it — a capture of a process without a descriptor, the

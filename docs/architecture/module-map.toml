@@ -141,15 +141,14 @@ planned = false
 "bin::nn_admin" = "nn-admin"
 "admin_cli" = "nn-admin"
 "admin_socket" = "northnarrow-agent"
-# post-plan (lab PR 241, R04a): the audit log's writability before the
-# attach (`access(2)`), from `audit`
-"audit_preflight" = "nn-linux"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a.
 # R09b (lab PR 254): the phases, the attach permit the sensors' attach
 # takes, the degradations of a run (`boot::degradation`, `[shims.agent]`)
 # and the sensors' attach points went to nn-linux, which the sensors
 # report to; the deny self-test, the BPF LSM gate, the trust level and the
-# signed manifest stay
+# signed manifest stay. R09c (lab PR 257): they still do — the plan gives
+# the boot to the agent (§2.4, `main` → `boot/*`, R11a's typed phases) and
+# the manifest to the sensor contract (R13), not to R09c
 "boot" = "northnarrow-agent"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
@@ -241,7 +240,6 @@ planned = false
 "execq::record" = "nn-core"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
-"host_hardening" = "nn-linux"
 # post-plan (lab PR 225): the ransomware signal (sampler behind a trait).
 # R08b (lab PR 251): the tracker moved to nn-core; `impact.rs` binds it to
 # the Linux host and publishes the agent's tracker for `status`; R09a (lab
@@ -253,7 +251,6 @@ planned = false
 # nn-linux's `impair::DefenderMap`, cut there) and publishes the agent's
 # detector for `status`
 "impair" = "nn-core"
-"install_manifest" = "nn-linux"
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
@@ -275,26 +272,13 @@ planned = false
 # `chain_host_linux`, as `config/mod.rs` does for the loaders); the
 # posture's cross-module tests and golden replay stay in `posture/`
 "posture" = "nn-core"
-# post-plan (lab PR 216): no core dump, no readable memory
-"process_hardening" = "nn-linux"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
 "removed_settings" = "northnarrow-agent"
-"sd_notify" = "nn-linux"
-"self_integrity" = "nn-linux"
-"sensor_feasibility" = "nn-linux"
 # R09b (lab PR 254): the sensors moved to nn-linux with the eBPF object's
 # embed (`build.rs`); the agent's `sensors.rs` keeps their paths and names
 # the loader on the agent's exec guards (`exec_guards`), an alias as the
 # posture's on `LinuxHost`
 "sensors" = "nn-linux"
-# the file I/O; the marker's format is nn-proto's (R03, lab PR 240)
-"shutdown_marker" = "nn-linux"
-"systemd_state" = "nn-linux"
-"telemetry_probe" = "nn-linux"
-# post-plan (lab PR 220): the signed record of a rolled-back upgrade
-"upgrade_rollback" = "nn-linux"
-# post-plan (lab only): `--verifier-check`
-"verifier_check" = "nn-linux"
 
 # ── agent/src: the shims of R05, R07 and R08a ─────────────────────────
 # R05 (lab PR 241): these modules moved to nn-evidence. The agent keeps
@@ -370,6 +354,38 @@ planned = false
 "net::dns_ingest" = "nn-linux"
 "posture_host_linux" = "nn-linux"
 "response" = "nn-linux"
+# R09c (lab PR 257): the systemd integration moved to nn-linux — the
+# readiness notification (`READY=1`) and what systemd reports the host as
+# (its private socket); the agent keeps their paths (`lib.rs`)
+"sd_notify" = "nn-linux"
+"systemd_state" = "nn-linux"
+# R09c (lab PR 257): the boot's check of the installed binaries and the
+# embedded eBPF object against the manifest `install.sh` writes (DEP-009)
+"install_manifest" = "nn-linux"
+# R09c (lab PR 257): the hardening — the host's kernel and boot-chain
+# checks (`nn-admin host-check`, the boot's warnings, the capability
+# manifest's table) and the agent process's own (post-plan, lab PR 216:
+# no core dump, no readable memory)
+"host_hardening" = "nn-linux"
+"process_hardening" = "nn-linux"
+# R09c (lab PR 257): the continuous telemetry probe (Tappa 10.8)
+"telemetry_probe" = "nn-linux"
+# R09c (lab PR 257): the self-integrity watcher (Tappa 10.8); it holds the
+# agent's signed-overlay gate through nn-core's `Vouch`
+"self_integrity" = "nn-linux"
+# R09c (lab PR 257): the files around the agent's start and stop — the
+# audit log's writability before the attach (post-plan, lab PR 241, R04a:
+# `access(2)`, from `audit`), the shutdown marker's file I/O (its format
+# is nn-proto's, R03, lab PR 240), the signed record of a rolled-back
+# upgrade (post-plan, lab PR 220)
+"audit_preflight" = "nn-linux"
+"shutdown_marker" = "nn-linux"
+"upgrade_rollback" = "nn-linux"
+# R09c (lab PR 257): the lab builds' probes — `--sensor-feasibility`
+# (feature `test-privileged`) and `--verifier-check` (post-plan, feature
+# `debug-trigger`), behind nn-linux's features, which the agent forwards
+"sensor_feasibility" = "nn-linux"
+"verifier_check" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"
@@ -562,9 +578,19 @@ planned = false
 # the flow tracker's and the rules' gate's binding to the Linux host,
 # which the drain names, with it; `net/mod.rs` re-exports them, and names
 # `LinuxHost` no more (it keeps one reference, to nn-linux).
+# Lab PR 257 (R09c): 22 → 21, nn-admin 8 → 7. R09c's modules — the
+# systemd integration, the install manifest's check, the hardening, the
+# telemetry probe, the self-integrity watcher, the files around the start
+# and stop, the lab builds' probes — named no crate nn-linux may not
+# depend on (nn-linux 0), and what names them counts for nn-linux before
+# and after (nn-admin's `host-check`, `host_hardening`): their moves leave
+# the count as it was. The detections' default limit
+# (`DEFAULT_DETECTIONS_LIMIT`, what `limit = 0` means on the wire) went to
+# nn-proto's `admin_signed_payload` with the verb's fields, and nn-admin's
+# `detections` names it there: its reference to `detection_store` is gone.
 
 [ratchet]
-nn-admin = 8
+nn-admin = 7
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0

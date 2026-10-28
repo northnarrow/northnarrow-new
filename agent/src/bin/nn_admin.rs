@@ -273,7 +273,7 @@ enum Cmd {
         /// Maximum records to return — the bounded "last N". The agent
         /// caps this server-side and may further truncate to fit the
         /// wire frame.
-        #[arg(long, default_value_t = northnarrow_agent::detection_store::DEFAULT_DETECTIONS_LIMIT as u32)]
+        #[arg(long, default_value_t = nn_proto::admin_signed_payload::DEFAULT_DETECTIONS_LIMIT as u32)]
         limit: u32,
         /// Inclusive lower time bound (UNIX seconds): keep detections
         /// recorded at or after this instant.
