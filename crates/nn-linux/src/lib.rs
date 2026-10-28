@@ -29,6 +29,18 @@
 //! degradations, the sensors' attach points. The exec guards whose kernel
 //! configuration the loader writes stay in the agent, behind
 //! [`ExecGuards`](sensors::multiplexer::ExecGuards).
+//! R09c (lab PR 257) moves the hardening — the host's kernel and boot-chain
+//! checks, the agent process's own —, the integrity checks — the
+//! self-integrity watcher, the install manifest's boot check, the telemetry
+//! probe —, the systemd integration (the readiness notification, what
+//! systemd reports the host as), the files around the agent's start and
+//! stop (the audit log's writability, the shutdown marker's file, the record
+//! of a rolled-back upgrade) and the lab builds' probes
+//! (`--sensor-feasibility`, `--verifier-check`); the watcher holds the
+//! agent's signed-overlay gate through nn-core's
+//! [`Vouch`](nn_core::config::overlay_auth::Vouch). The boot's deny
+//! self-test, BPF LSM gate, trust level and signed manifest stay in the
+//! agent.
 //!
 //! The only crate of the layout where `unsafe` is allowed (no
 //! `#![forbid(unsafe_code)]`, R01): its blocks moved verbatim, each with its
