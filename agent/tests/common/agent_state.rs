@@ -144,7 +144,7 @@ pub const STATE_FLAGS: &[StateFlag] = &[
         shared: false,
         what: "written once every hook is attached; the ids of the agent's BPF programs \
                (bpf-own-ids) go beside it, and the refused starts the audit log could not take \
-               (boot-refusals.jsonl, lab PR 262)",
+               (boot-refusals/, one file each, lab PR 262)",
     },
     StateFlag {
         flag: "--watchdog-pidfile",

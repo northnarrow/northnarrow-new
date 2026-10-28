@@ -15,8 +15,8 @@
 //!
 //! Each start exits 78 with its gate's refusal signed — an `agent_boot` row
 //! with `result: refused` and `refused_by` the gate, in the audit log or,
-//! when the audit log is the gate, in the fallback chain beside
-//! `--pid-file` — which `nn-admin audit verify` accepts with the agent's
+//! when the audit log is the gate, in a fallback chain of its own beside
+//! `--pid-file` (`boot-refusals/`) — which `nn-admin audit verify` accepts with the agent's
 //! key; and the host's BPF objects are what they were before it: no program
 //! or link that nothing holds (pinned, or attached through a pinned link),
 //! the pin root as it was (absent: never created; present: the same names
@@ -278,6 +278,19 @@ fn signed_refusal(chain: &Path, state: &AgentState, gate: &str) -> serde_json::V
     row
 }
 
+/// The one fallback chain a refused start wrote beside the pid file: a file
+/// of its own in `boot-refusals/` (review #466 F1).
+fn fallback_chain(state: &AgentState) -> PathBuf {
+    let dir = state.pid_file().parent().unwrap().join("boot-refusals");
+    let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    files[0].clone()
+}
+
 /// What every refused start shows: exit 78, the start's refusal lines, none
 /// of the load's, nothing left in the kernel, no own program-id list, its
 /// pid not left protected.
@@ -449,11 +462,7 @@ fn an_unwritable_audit_log_is_refused_before_the_load_and_signed_beside_the_pid_
         "{}",
         tail(&log)
     );
-    let fallback = state
-        .pid_file()
-        .parent()
-        .unwrap()
-        .join("boot-refusals.jsonl");
+    let fallback = fallback_chain(&state);
     let row = signed_refusal(&fallback, &state, "audit_log");
     assert!(
         row["extra"]["detail"]
@@ -496,11 +505,7 @@ fn a_broken_audit_chain_is_refused_before_the_load() {
     );
     let text = assert_refused_before_the_load(status, &log, &state, &before, "audit_log");
     assert!(text.contains("audit log open failed"), "{}", tail(&log));
-    let fallback = state
-        .pid_file()
-        .parent()
-        .unwrap()
-        .join("boot-refusals.jsonl");
+    let fallback = fallback_chain(&state);
     let row = signed_refusal(&fallback, &state, "audit_log");
     assert!(
         row["extra"]["detail"]
@@ -513,6 +518,87 @@ fn a_broken_audit_chain_is_refused_before_the_load() {
         std::fs::read_to_string(state.audit_log()).unwrap(),
         "{\"not\": \"a row\"}\n{\"not\": \"a row either\"}\n"
     );
+}
+
+/// Review #466 F1, the reviewer's four probes on the real agent: an audit
+/// log that cannot take the refusal, and where its fallback directory goes
+/// a symbolic link to the agent's key, one to a file without a final
+/// newline, a dangling one, a FIFO. Each start refuses before the load
+/// (exit 78, nothing in the kernel), at once, the refusal in the journal
+/// alone; the key is in no line of its log and unchanged, the file
+/// unchanged, the dangling link's target not created.
+#[test]
+#[ignore = "root and bpftool: nn-lab.sh test-ignored"]
+fn names_planted_where_the_fallback_goes_are_never_followed() {
+    preconditions("start agents with names planted where their fallback goes");
+    let dir = tempfile::tempdir().unwrap();
+    let state = AgentState::new(dir.path());
+    std::fs::create_dir(state.audit_log()).unwrap();
+    northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&state.signing_key()).unwrap();
+    let key_text = std::fs::read_to_string(state.signing_key()).unwrap();
+    let target = dir.path().join("protected.json");
+    let body = b"{\"first\":1}\n{\"second\": \"no newline\"";
+    std::fs::write(&target, body).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let installed = InstalledAgent::install();
+    let rules = combat_rules(dir.path());
+    let manifest = manifest_of_another_copy(dir.path());
+    let fallback = state.pid_file().parent().unwrap().join("boot-refusals");
+    for (case, plant) in [
+        ("a link to the key", 0),
+        ("a link to a file without a final newline", 1),
+        ("a dangling link", 2),
+        ("a FIFO", 3),
+    ] {
+        match plant {
+            0 => std::os::unix::fs::symlink(state.signing_key(), &fallback).unwrap(),
+            1 => std::os::unix::fs::symlink(&target, &fallback).unwrap(),
+            2 => std::os::unix::fs::symlink(elsewhere.join("planted"), &fallback).unwrap(),
+            _ => {
+                let st = Command::new("mkfifo")
+                    .arg(&fallback)
+                    .status()
+                    .expect("mkfifo");
+                assert!(st.success());
+            }
+        }
+        let before = kernel();
+        let log = dir.path().join(format!("agent-{plant}.log"));
+        let status = run_until_exit(
+            &installed,
+            &state,
+            Launch::Sudo,
+            &[
+                "--install-manifest".as_ref(),
+                manifest.as_os_str(),
+                "--combat-rules".as_ref(),
+                rules.as_os_str(),
+            ],
+            &log,
+        );
+        let text = assert_refused_before_the_load(status, &log, &state, &before, "audit_log");
+        assert!(
+            text.contains("could not record the refused boot in a signed chain"),
+            "{case}: {}",
+            tail(&log)
+        );
+        assert!(
+            !text.contains(key_text.trim()),
+            "{case}: the key in the log"
+        );
+        assert!(
+            !text.contains("no newline"),
+            "{case}: the file's line in the log"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.signing_key()).unwrap(),
+            key_text
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), body, "{case}");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "{case}");
+        std::fs::remove_file(&fallback).unwrap();
+    }
 }
 
 /// The capability gate: an enforcing agent without CAP_KILL refuses before
