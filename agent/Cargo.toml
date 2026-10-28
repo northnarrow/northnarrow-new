@@ -149,7 +149,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 # advisor removed in Wave 4, lab PR 214, and stayed with the rest.)
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 clap = { workspace = true }
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # The evidence logs' signatures (`agent_sig`) are base64 in their JSONL
 # lines; the canary templates render base64-shaped secrets.
