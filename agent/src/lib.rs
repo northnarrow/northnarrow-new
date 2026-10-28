@@ -12,6 +12,10 @@
 //! XAI explanations) was removed in Wave 4 (lab PR 214).
 
 pub mod admin_cli;
+/// The operator client's tests that wire the agent's key, chains and
+/// loaders (R10, lab PR 259: from `admin_cli`'s tests).
+#[cfg(test)]
+mod admin_cli_tests;
 pub mod admin_socket;
 /// R09a shim (lab PR 253; plan §4.1 rule 2, removed in R17): the agent's
 /// identity on disk is nn-linux's.
