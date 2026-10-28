@@ -26,6 +26,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 // The agent's start (BTF, the eBPF object, the rules) took ~5 s on a lab
@@ -41,12 +42,6 @@ fn combat_rules_path() -> PathBuf {
     PathBuf::from(env!("NN_REPO_ROOT"))
         .join("configs")
         .join("combat-rules.v4")
-}
-
-/// `target/{profile}/northnarrow-agent`. Cargo provides this env
-/// var to integration tests automatically.
-fn agent_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_northnarrow-agent")
 }
 
 fn nn_admin_bin() -> &'static str {
@@ -77,11 +72,14 @@ impl Drop for AgentGuard {
 /// `R009_RootExecFromUserPath` rule never matches.
 struct AgentHandles {
     socket: PathBuf,
+    /// The agent's id, which every signed request names (lab PR 256: the
+    /// test's own, not the installed agent's `/etc/northnarrow/agent_id`).
+    agent_id_file: PathBuf,
     /// Path the tests pass to `run_nn_admin` — the installed
     /// nn-admin under /usr/local/bin/. Holding the corresponding
     /// `InstalledBin` in `_installed_admin` keeps it alive.
     nn_admin_path: PathBuf,
-    _installed_agent: InstalledBin,
+    _installed_agent: InstalledAgent,
     _installed_admin: InstalledBin,
 }
 
@@ -90,13 +88,13 @@ struct AgentHandles {
 /// trip the agent's `R009_RootExecFromUserPath` rule (which
 /// kills any root spawn originating from /home/, /tmp/, etc.).
 ///
-/// Mirrors `spawn_agent_b5_with_installs` for the simpler
-/// legacy callers that don't need the B5-era signing-key /
-/// audit-log / shutdown-marker per-test overrides.
+/// Lab PR 256: every file the agent writes, its key and its id in
+/// `tempdir` ([`AgentState`]). This fixture passed only its socket and its
+/// admin keys, so its agent signed the installed agent's audit chain with
+/// the installed key (84 `nn-admin-e2etest-*` rows on a lab guest).
 fn spawn_agent(tempdir: &Path) -> (AgentGuard, AgentHandles) {
     let (installed_agent, installed_admin) = install_priv_bins();
-    let socket = tempdir.join("admin.sock");
-    let pubkey = tempdir.join("admin.pub");
+    let state = AgentState::new(tempdir);
     let rules = tempdir.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules");
 
@@ -106,23 +104,20 @@ fn spawn_agent(tempdir: &Path) -> (AgentGuard, AgentHandles) {
     // the root subprocess because the kill comes from the test
     // process (also root via the outer `sudo cargo test`).
     common::require_bpftool();
-    let child = Command::new("sudo")
-        .arg(&installed_agent.path)
+    let child = installed_agent
+        .command(&state, Launch::Sudo, &[])
         .arg("--combat-rules")
         .arg(&rules)
-        .arg("--admin-pub")
-        .arg(&pubkey)
-        .arg("--admin-socket")
-        .arg(&socket)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn northnarrow-agent (installed copy)");
     let guard = AgentGuard(Some(child));
 
-    wait_for_socket(&socket);
+    wait_for_socket(&state.admin_socket());
     let handles = AgentHandles {
-        socket,
+        socket: state.admin_socket(),
+        agent_id_file: state.agent_id_file(),
         nn_admin_path: installed_admin.path.clone(),
         _installed_agent: installed_agent,
         _installed_admin: installed_admin,
@@ -253,6 +248,7 @@ fn e2e_force_combat_then_unlock_via_cli() {
     let (_guard, handles) = spawn_agent(dir.path());
     let nn = handles.nn_admin_path.as_path();
     let socket = handles.socket.as_path();
+    let agent_id = handles.agent_id_file.as_path();
 
     // Drive the agent into COMBAT via the debug feature.
     let out = run_nn_admin_at(
@@ -314,6 +310,8 @@ fn e2e_force_combat_then_unlock_via_cli() {
             "engaged",
             "--key",
             force_only_key.to_str().unwrap(),
+            "--agent-id-file",
+            agent_id.to_str().unwrap(),
             "--socket",
             socket.to_str().unwrap(),
         ],
@@ -345,6 +343,8 @@ fn e2e_force_combat_then_unlock_via_cli() {
             "unlock",
             "--key",
             priv_key.to_str().unwrap(),
+            "--agent-id-file",
+            agent_id.to_str().unwrap(),
             "--socket",
             socket.to_str().unwrap(),
         ],
@@ -402,6 +402,7 @@ fn e2e_unlock_with_wrong_key() {
     let (_guard, handles) = spawn_agent(dir.path());
     let nn = handles.nn_admin_path.as_path();
     let socket = handles.socket.as_path();
+    let agent_id = handles.agent_id_file.as_path();
 
     // Force Combat to make the test meaningful.
     let out = run_nn_admin_at(
@@ -423,6 +424,8 @@ fn e2e_unlock_with_wrong_key() {
             "unlock",
             "--key",
             other_priv.to_str().unwrap(),
+            "--agent-id-file",
+            agent_id.to_str().unwrap(),
             "--socket",
             socket.to_str().unwrap(),
         ],
@@ -460,6 +463,8 @@ fn e2e_unlock_with_wrong_key() {
             "unlock",
             "--key",
             _correct_priv.to_str().unwrap(),
+            "--agent-id-file",
+            agent_id.to_str().unwrap(),
             "--socket",
             socket.to_str().unwrap(),
         ],
@@ -480,6 +485,7 @@ fn e2e_failures_on_other_connections_do_not_rate_limit() {
     let (_guard, handles) = spawn_agent(dir.path());
     let nn = handles.nn_admin_path.as_path();
     let socket = handles.socket.as_path();
+    let agent_id = handles.agent_id_file.as_path();
 
     for attempt in 1..=4 {
         let out = run_nn_admin_at(
@@ -488,6 +494,8 @@ fn e2e_failures_on_other_connections_do_not_rate_limit() {
                 "unlock",
                 "--key",
                 other_priv.to_str().unwrap(),
+                "--agent-id-file",
+                agent_id.to_str().unwrap(),
                 "--socket",
                 socket.to_str().unwrap(),
             ],
@@ -506,6 +514,8 @@ fn e2e_failures_on_other_connections_do_not_rate_limit() {
             "unlock",
             "--key",
             correct_priv.to_str().unwrap(),
+            "--agent-id-file",
+            agent_id.to_str().unwrap(),
             "--socket",
             socket.to_str().unwrap(),
         ],
@@ -555,11 +565,11 @@ fn e2e_status_no_admin_action_initially() {
 //   2. Rotate-keys round-trip (A13 + B3 atomic rewrite + reload).
 //   3. Audit-verify e2e (B1 chain + B5 dispatch wiring).
 //
-// All three use a NEW agent-spawn helper `spawn_agent_b5` that
-// passes per-test tempdir paths for the three B5-era state files
-// the upstream `spawn_agent` doesn't configure (signing key,
-// audit log, shutdown marker). This avoids mutating the host's
-// `/etc/northnarrow/` and `/run/northnarrow/` state.
+// All three use the agent-spawn helper `spawn_agent_b5`, which
+// returns the per-test paths they inspect. Lab PR 256: every agent of
+// this file keeps all of its state in its tempdir (`AgentState`); this
+// helper's three B5-era files and id were not enough, its agent appended
+// rows under its own key to the installed agent's detection chain.
 //
 // R009 (root-exec-from-/home/) is not tripped because none of
 // these tests trigger malicious-looking activity — they only
@@ -567,13 +577,9 @@ fn e2e_status_no_admin_action_initially() {
 
 const NN_ADMIN_OP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// PHASE_D_003 agent-spawn helper: like `spawn_agent` but threads
-/// the three B5-era CLI flags (`--signing-key-file`,
-/// `--audit-log-file`, `--shutdown-marker-file`) plus an
-/// `--agent-id-file` per-test override so the agent's audit /
-/// rotate-keys / shutdown paths all stay scoped to the tempdir.
-/// Returns the running child + every per-test path the caller
-/// might need to inspect.
+/// PHASE_D_003 agent-spawn helper: like `spawn_agent`, and returns
+/// the running child + every per-test path the caller might need
+/// to inspect (all in the tempdir, [`AgentState`]).
 struct B5Paths {
     socket: PathBuf,
     admin_pub: PathBuf,
@@ -586,7 +592,7 @@ struct B5Paths {
     /// `/usr/local/bin/*-e2etest-*` on exit. The path string
     /// inside is what subprocesses invoke as `nn-admin`.
     nn_admin_path: PathBuf,
-    _installed_agent: InstalledBin,
+    _installed_agent: InstalledAgent,
     _installed_admin: InstalledBin,
 }
 
@@ -616,8 +622,8 @@ fn spawn_agent_b5(tempdir: &Path) -> (AgentGuard, B5Paths) {
 /// doesn't fire pre-spawn but the test code path stays
 /// uniform — once installed, every nn-admin call uses the same
 /// path whether the agent is up or not).
-fn install_priv_bins() -> (InstalledBin, InstalledBin) {
-    let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
+fn install_priv_bins() -> (InstalledAgent, InstalledBin) {
+    let installed_agent = InstalledAgent::install();
     let installed_admin = install_to_priv_bin(Path::new(nn_admin_bin()));
     (installed_agent, installed_admin)
 }
@@ -626,16 +632,17 @@ fn install_priv_bins() -> (InstalledBin, InstalledBin) {
 /// installed binaries.
 fn spawn_agent_b5_with_installs(
     tempdir: &Path,
-    installed_agent: InstalledBin,
+    installed_agent: InstalledAgent,
     installed_admin: InstalledBin,
 ) -> (AgentGuard, B5Paths) {
+    let state = AgentState::new(tempdir);
     let paths = B5Paths {
-        socket: tempdir.join("admin.sock"),
-        admin_pub: tempdir.join("admin.pub"),
-        agent_id_file: tempdir.join("agent_id"),
-        signing_key_file: tempdir.join("agent.sig.key"),
-        audit_log_file: tempdir.join("audit.log"),
-        shutdown_marker_file: tempdir.join("agent.shutdown_authorised"),
+        socket: state.admin_socket(),
+        admin_pub: state.admin_pub(),
+        agent_id_file: state.agent_id_file(),
+        signing_key_file: state.signing_key(),
+        audit_log_file: state.audit_log(),
+        shutdown_marker_file: state.shutdown_marker(),
         nn_admin_path: installed_admin.path.clone(),
         _installed_agent: installed_agent,
         _installed_admin: installed_admin,
@@ -649,22 +656,11 @@ fn spawn_agent_b5_with_installs(
     // the root subprocess because the kill comes from the test
     // process which is also root via the outer sudo.
     common::require_bpftool();
-    let child = Command::new("sudo")
-        .arg(&paths._installed_agent.path)
+    let child = paths
+        ._installed_agent
+        .command(&state, Launch::Sudo, &[])
         .arg("--combat-rules")
         .arg(&rules)
-        .arg("--admin-pub")
-        .arg(&paths.admin_pub)
-        .arg("--admin-socket")
-        .arg(&paths.socket)
-        .arg("--agent-id-file")
-        .arg(&paths.agent_id_file)
-        .arg("--signing-key-file")
-        .arg(&paths.signing_key_file)
-        .arg("--audit-log-file")
-        .arg(&paths.audit_log_file)
-        .arg("--shutdown-marker-file")
-        .arg(&paths.shutdown_marker_file)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -1426,25 +1422,26 @@ fn wait_ready(run: &mut GuardRun) -> Result<u32, String> {
 struct GuardFixture {
     dir: tempfile::TempDir,
     nn_admin: PathBuf,
-    agent: PathBuf,
-    admin_pub: PathBuf,
     agent_id_file: PathBuf,
     key_a: PathBuf,
     key_b: PathBuf,
     enforce_run: Option<GuardRun>,
     // Removed only after `drop` ran: the restore run needs this binary.
-    _installed_agent: InstalledBin,
+    agent: InstalledAgent,
     _installed_admin: InstalledBin,
 }
 
 #[cfg(feature = "debug-trigger")]
 impl GuardFixture {
-    /// Installed agent + nn-admin, two keys with the `shutdown` role.
+    /// Installed agent + nn-admin, two keys with the `shutdown` role. The
+    /// runs are agents of one directory (`AgentState::named`): one id and
+    /// these keys, each its own signing key, chains and socket.
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let (installed_agent, installed_admin) = install_priv_bins();
         let nn_admin = installed_admin.path.clone();
-        let admin_pub = dir.path().join("admin.pub");
+        let shared = AgentState::new(dir.path());
+        let admin_pub = shared.admin_pub();
         std::fs::write(&admin_pub, "").expect("touch admin.pub");
         let (key_a, _) = init_admin_keypair_with_roles(
             &nn_admin,
@@ -1463,15 +1460,13 @@ impl GuardFixture {
         std::fs::copy(combat_rules_path(), dir.path().join("combat-rules.v4"))
             .expect("copy combat rules");
         Self {
-            agent_id_file: dir.path().join("agent_id"),
-            agent: installed_agent.path.clone(),
+            agent_id_file: shared.agent_id_file(),
             dir,
             nn_admin,
-            admin_pub,
             key_a,
             key_b,
             enforce_run: None,
-            _installed_agent: installed_agent,
+            agent: installed_agent,
             _installed_admin: installed_admin,
         }
     }
@@ -1484,45 +1479,29 @@ impl GuardFixture {
         let err = out
             .try_clone()
             .map_err(|e| format!("clone {name}.log: {e}"))?;
-        let socket = d.join(format!("{name}.sock"));
-        let pid_file = d.join(format!("{name}.pid"));
-        let mut cmd = Command::new("sudo");
-        // sudo resets the environment: the variables go through env(1).
-        cmd.arg("env").arg("NO_COLOR=1");
+        let state = AgentState::named(d, name);
+        let mut env = vec![("NO_COLOR", "1")];
         if enforce {
-            cmd.arg(format!(
-                "{}=1",
-                northnarrow_agent::anti_tamper::bpf_defense::ENFORCE_ENV
+            env.push((
+                northnarrow_agent::anti_tamper::bpf_defense::ENFORCE_ENV,
+                "1",
             ));
         }
-        cmd.arg(&self.agent)
+        let child = self
+            .agent
+            .command(&state, Launch::Sudo, &env)
             .arg("--combat-rules")
             .arg(d.join("combat-rules.v4"))
-            .arg("--admin-pub")
-            .arg(&self.admin_pub)
-            .arg("--admin-socket")
-            .arg(&socket)
-            .arg("--agent-id-file")
-            .arg(&self.agent_id_file)
-            .arg("--signing-key-file")
-            .arg(d.join(format!("{name}.sig.key")))
-            .arg("--audit-log-file")
-            .arg(d.join(format!("{name}.audit.log")))
-            .arg("--shutdown-marker-file")
-            .arg(d.join(format!("{name}.shutdown_authorised")))
-            .arg("--pid-file")
-            .arg(&pid_file)
             .arg("--detect-only")
             .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err));
-        let child = cmd
+            .stderr(Stdio::from(err))
             .spawn()
             .map_err(|e| format!("spawn the {name} agent: {e}"))?;
         Ok(GuardRun {
             name,
             child,
-            socket,
-            pid_file,
+            socket: state.admin_socket(),
+            pid_file: state.pid_file(),
             log,
         })
     }
@@ -1842,33 +1821,20 @@ fn agent_without_admin_pub_starts_degraded_and_says_so() {
     let d = dir.path();
     let rules = d.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules");
-    let admin_pub = d.join("admin.pub");
-    let socket = d.join("admin.sock");
-    let audit_log = d.join("audit.log");
-    let signing_key = d.join("agent.sig.key");
+    // Lab PR 256: every file in the tempdir; `admin.pub` is never created.
+    let state = AgentState::new(d);
+    let socket = state.admin_socket();
+    let audit_log = state.audit_log();
+    let signing_key = state.signing_key();
     let log_path = d.join("agent.log");
     let log = std::fs::File::create(&log_path).expect("create agent.log");
     let log_err = log.try_clone().expect("clone the log handle");
 
     common::require_bpftool();
-    let child = Command::new("sudo")
-        .arg("env")
-        .arg("NO_COLOR=1")
-        .arg(&installed_agent.path)
+    let child = installed_agent
+        .command(&state, Launch::Sudo, &[("NO_COLOR", "1")])
         .arg("--combat-rules")
         .arg(&rules)
-        .arg("--admin-pub")
-        .arg(&admin_pub)
-        .arg("--admin-socket")
-        .arg(&socket)
-        .arg("--agent-id-file")
-        .arg(d.join("agent_id"))
-        .arg("--signing-key-file")
-        .arg(&signing_key)
-        .arg("--audit-log-file")
-        .arg(&audit_log)
-        .arg("--shutdown-marker-file")
-        .arg(d.join("agent.shutdown_authorised"))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))

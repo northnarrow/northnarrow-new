@@ -12,6 +12,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Lab PR 256: where an agent a test starts keeps its state, and the one
+/// way to start it ([`agent_state::InstalledAgent::command`]).
+pub mod agent_state;
+
 // ── Tappa 10 hotfix — EniIptablesGuard ────────────────────────────────
 //
 // Privileged tests that drive the agent into the COMBAT posture

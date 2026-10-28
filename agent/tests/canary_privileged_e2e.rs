@@ -59,15 +59,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::{install_to_priv_bin, EniIptablesGuard, InstalledBin};
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const ACCESS_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-fn agent_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_northnarrow-agent")
-}
 
 fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
@@ -102,12 +99,12 @@ impl Drop for AgentGuard {
 }
 
 /// K8.1 R009 avoidance: agent + nn-admin run from root-owned copies
-/// under `/usr/local/bin/` (`common::install_to_priv_bin`), so the
-/// post-spawn nn-admin canary deploy / refresh calls don't trip the
+/// under `/usr/local/bin/` (`InstalledAgent`, `common::install_to_priv_bin`),
+/// so the post-spawn nn-admin canary deploy / refresh calls don't trip the
 /// agent's `R009_RootExecFromUserPath` rule (which kills any root spawn
 /// originating from `/home/`, `/tmp/`, `/var/tmp/`).
-fn install_priv_bins() -> (InstalledBin, InstalledBin) {
-    let installed_agent = install_to_priv_bin(Path::new(agent_bin()));
+fn install_priv_bins() -> (InstalledAgent, InstalledBin) {
+    let installed_agent = InstalledAgent::install();
     let installed_admin = install_to_priv_bin(Path::new(nn_admin_bin()));
     (installed_agent, installed_admin)
 }
@@ -152,9 +149,9 @@ struct CanaryFixture {
     /// refresh, init) routes through this path so R009 doesn't
     /// kill the op mid-flight. Kept alive by `_installed_admin`.
     nn_admin_path: PathBuf,
-    /// The agent's binary and arguments, to start it again
+    /// The agent's state and its other arguments, to start it again
     /// ([`CanaryFixture::restart`]).
-    agent_bin: PathBuf,
+    state: AgentState,
     agent_args: Vec<std::ffi::OsString>,
     /// Drop order: AgentGuard first (SIGQUIT the agent), then
     /// the InstalledBin handles (sudo rm the /usr/local/bin/
@@ -162,7 +159,7 @@ struct CanaryFixture {
     /// so keep `_agent_guard` BEFORE the installed-bin RAII
     /// handles so the agent is gone before we yank its binary.
     _agent_guard: AgentGuard,
-    _installed_agent: InstalledBin,
+    _installed_agent: InstalledAgent,
     _installed_admin: InstalledBin,
 }
 
@@ -210,7 +207,9 @@ impl CanaryFixture {
         // which isn't enough for canary ops; we re-write the
         // admin.pub line below with `all` so canary-manage +
         // canary-read both verify.
-        let admin_pub = dir.join("admin.pub");
+        // Lab PR 256: every file the agent writes in the tempdir.
+        let state = AgentState::new(&dir);
+        let admin_pub = state.admin_pub();
         let admin_priv = dir.join("admin.priv");
         let tmp_pub = dir.join("admin.pub.tmp");
         let init_status = Command::new(&nn_admin_path)
@@ -283,16 +282,12 @@ impl CanaryFixture {
             }
         }
 
-        let audit_log = dir.join("audit.log");
-        let signing_key = dir.join("agent.sig.key");
-        let agent_id = dir.join("agent_id");
-        let admin_socket = dir.join("admin.sock");
-        let marker = dir.join("agent.shutdown_authorised");
-        let baseline_log = dir.join("fim_baseline.jsonl");
-        let drift_log = dir.join("fim_drift.jsonl");
-        let canary_registry = dir.join("canaries.jsonl");
-        let canary_access = dir.join("canary_access.jsonl");
-        let detections_log = dir.join("detections.jsonl");
+        let audit_log = state.audit_log();
+        let agent_id = state.agent_id_file();
+        let admin_socket = state.admin_socket();
+        let canary_registry = state.canary_registry();
+        let canary_access = state.canary_access();
+        let detections_log = state.detections();
 
         // K8.1 R009 avoidance: spawn the installed /usr/local/bin/
         // agent via sudo. Mirrors `agent/tests/privileged_e2e.rs`
@@ -301,52 +296,22 @@ impl CanaryFixture {
         // cargo test` invocation) but lets the test work under any
         // privilege-elevation flow that authorises sudo for the
         // user.
+        // The state files are the helper's (`AgentState::args`); these are
+        // the inputs.
         let agent_args: Vec<std::ffi::OsString> = [
             "--combat-rules".into(),
             combat.clone().into_os_string(),
-            "--admin-pub".into(),
-            admin_pub.clone().into_os_string(),
-            "--admin-socket".into(),
-            admin_socket.clone().into_os_string(),
-            "--agent-id-file".into(),
-            agent_id.clone().into_os_string(),
-            "--audit-log-file".into(),
-            audit_log.clone().into_os_string(),
-            "--signing-key-file".into(),
-            signing_key.clone().into_os_string(),
-            "--shutdown-marker-file".into(),
-            marker.clone().into_os_string(),
             "--fim-paths-v1".into(),
             fim_paths_v1.clone().into_os_string(),
             "--fim-paths-local".into(),
             fim_paths_local.clone().into_os_string(),
-            "--fim-baseline-file".into(),
-            baseline_log.clone().into_os_string(),
-            "--fim-drift-file".into(),
-            drift_log.clone().into_os_string(),
-            "--canary-registry-file".into(),
-            canary_registry.clone().into_os_string(),
-            "--canary-access-file".into(),
-            canary_access.clone().into_os_string(),
             "--canary-template-dir".into(),
             templates_dir.clone().into_os_string(),
-            // Lab PR 163: the records, flows and listeners of the test in
-            // its own directory (they went to the host's default paths).
-            "--detections-file".into(),
-            detections_log.clone().into_os_string(),
-            "--status-events-file".into(),
-            dir.join("status_events.jsonl").into_os_string(),
-            "--netflow-file".into(),
-            dir.join("netflow.jsonl").into_os_string(),
-            "--netflow-listeners-file".into(),
-            dir.join("netflow_listeners.jsonl").into_os_string(),
         ]
         .to_vec();
         common::require_bpftool();
-        let child = Command::new("sudo")
-            .arg("env")
-            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
-            .arg(&installed_agent.path)
+        let child = installed_agent
+            .command(&state, Launch::Sudo, &[common::OWN_DEFAULT_LISTS_ENV])
             .args(&agent_args)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -366,7 +331,7 @@ impl CanaryFixture {
             audit_log,
             detections_log,
             nn_admin_path,
-            agent_bin: installed_agent.path.clone(),
+            state,
             agent_args,
             _agent_guard: guard,
             _installed_agent: installed_agent,
@@ -391,10 +356,9 @@ impl CanaryFixture {
     /// Start the agent again after [`CanaryFixture::stop`].
     fn start(&mut self) {
         common::require_bpftool();
-        let child = Command::new("sudo")
-            .arg("env")
-            .arg(common::OWN_DEFAULT_LISTS_ASSIGNMENT)
-            .arg(&self.agent_bin)
+        let child = self
+            ._installed_agent
+            .command(&self.state, Launch::Sudo, &[common::OWN_DEFAULT_LISTS_ENV])
             .args(&self.agent_args)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())

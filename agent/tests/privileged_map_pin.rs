@@ -92,6 +92,7 @@ use northnarrow_agent::anti_tamper::{
 };
 
 mod common;
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 
 const PIN_APPEAR_TIMEOUT: Duration = Duration::from_secs(20);
 /// Aya's `Ebpf::load_from_bytes` only *creates* maps (which is when
@@ -164,7 +165,8 @@ fn stop_agent(mut c: Child) {
     }
 }
 
-/// `nn-admin init` into `<tempdir>/admin.pub` (and `admin.priv`).
+/// `nn-admin init` into the agent's `admin.pub` (and `admin.priv`) in
+/// `tempdir`.
 ///
 /// External audit NN-AUD-423 (TST-017): the agent was started with an
 /// `--admin-pub` that was never created, so it booted without its admin
@@ -172,39 +174,38 @@ fn stop_agent(mut c: Child) {
 /// this test checked an agent other than the one that ships. That path
 /// has its own test now (`privileged_e2e::
 /// agent_without_admin_pub_starts_degraded_and_says_so`).
-fn init_admin_pub(tempdir: &Path) {
+fn init_admin_pub(state: &AgentState) {
     let status = Command::new(env!("CARGO_BIN_EXE_nn-admin"))
         .arg("init")
         .arg("--priv-out")
-        .arg(tempdir.join("admin.priv"))
+        .arg(state.dir().join("admin.priv"))
         .arg("--pub-append")
-        .arg(tempdir.join("admin.pub"))
+        .arg(state.admin_pub())
         .stdin(Stdio::null())
         .status()
         .expect("spawn nn-admin init");
     assert!(status.success(), "nn-admin init failed");
 }
 
-/// Spawn the agent at `agent_exe` (a root-owned copy, see
-/// `common::install_to_priv_bin`) against per-test tempdir paths. Mirrors
-/// `privileged_e2e::spawn_agent`'s flag set.
+/// Spawn the installed agent (a root-owned copy) with every file it
+/// writes in `tempdir` ([`AgentState`]). Lab PR 256: it had its socket and
+/// admin keys there only, and wrote the installed agent's chains with the
+/// installed key. The pin root is the host's on purpose: it is what this
+/// test checks (the agent has no flag to move it).
 /// Its log goes to `<tempdir>/agent.log`, uncoloured, for the attach line.
-fn spawn_agent(agent_exe: &Path, tempdir: &Path) -> AgentGuard {
+fn spawn_agent(agent: &InstalledAgent, tempdir: &Path) -> AgentGuard {
+    let state = AgentState::new(tempdir);
     let rules = tempdir.join("combat-rules.v4");
     std::fs::copy(combat_rules_path(), &rules).expect("copy combat rules into tempdir");
-    init_admin_pub(tempdir);
+    init_admin_pub(&state);
     let log = std::fs::File::create(agent_log(tempdir)).expect("create agent.log");
     let log_err = log.try_clone().expect("clone the log handle");
 
     common::require_bpftool();
-    let child = Command::new(agent_exe)
+    let child = agent
+        .command(&state, Launch::Direct, &[("NO_COLOR", "1")])
         .arg("--combat-rules")
         .arg(&rules)
-        .arg("--admin-pub")
-        .arg(tempdir.join("admin.pub"))
-        .arg("--admin-socket")
-        .arg(tempdir.join("admin.sock"))
-        .env("NO_COLOR", "1")
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))
         .spawn()
@@ -530,11 +531,11 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
     // The agent runs from a root-owned copy, not from `target/` under the
     // user's home (external audit NN-AUD-423); declared first, it is
     // removed after both agents stopped.
-    let installed = common::install_to_priv_bin(Path::new(env!("CARGO_BIN_EXE_northnarrow-agent")));
+    let installed = InstalledAgent::install();
 
     // ---- Boot 1: fresh load pins the map and every deny hook. ----
     let dir1 = tempfile::tempdir().expect("tempdir boot1");
-    let mut agent1 = spawn_agent(&installed.path, dir1.path());
+    let mut agent1 = spawn_agent(&installed, dir1.path());
     wait_for_pin(&pin);
 
     let id1 = pinned_map_id(&pin);
@@ -562,7 +563,7 @@ fn protected_pids_kernel_id_is_stable_across_agent_restart() {
 
     // ---- Boot 2: must REUSE the pinned map, re-attach every hook. ----
     let dir2 = tempfile::tempdir().expect("tempdir boot2");
-    let mut agent2 = spawn_agent(&installed.path, dir2.path());
+    let mut agent2 = spawn_agent(&installed, dir2.path());
     wait_for_pin(&pin);
 
     let id2 = pinned_map_id(&pin);

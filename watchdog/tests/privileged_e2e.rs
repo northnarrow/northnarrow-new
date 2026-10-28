@@ -66,6 +66,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Lab PR 256: where the agent a test starts keeps its state, and the one
+// way to start it — the agent tests' helper, the same file (std only).
+#[allow(dead_code)]
+mod agent_state {
+    include!(concat!(
+        env!("NN_REPO_ROOT"),
+        "/agent/tests/common/agent_state.rs"
+    ));
+}
+use agent_state::{AgentState, InstalledAgent, Launch};
+
 // ── shared constants ────────────────────────────────────────────────
 
 /// bpffs root the agent pins PROTECTED_PIDS at — also the path
@@ -152,26 +163,9 @@ fn purge_bpffs_root() {
 
 // ── cargo-provided binary paths ─────────────────────────────────────
 
-/// Path of the release-mode `northnarrow-agent` binary cargo
-/// built. Tests install it under /usr/local/bin/ before launch.
-/// Note: the watchdog crate's tests can't reference the agent
-/// binary via `CARGO_BIN_EXE_<name>` because the agent lives in
-/// a different package; resolve via TARGET_DIR + filename.
-fn agent_bin_src() -> PathBuf {
-    // CARGO_TARGET_DIR is set by cargo during workspace builds;
-    // we resolve relative to it to find the agent binary in the
-    // sibling crate's output. Fallback to repo-root/target/release
-    // if the env var isn't set (e.g., invoked outside cargo).
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
-        PathBuf::from(env!("NN_REPO_ROOT"))
-            .join("target")
-            .to_string_lossy()
-            .into_owned()
-    });
-    PathBuf::from(target_dir)
-        .join("release")
-        .join("northnarrow-agent")
-}
+// The agent's: `agent_state::InstalledAgent::install` (the sibling
+// package's release output, which `CARGO_BIN_EXE_<name>` does not give
+// this crate's tests).
 
 fn watchdog_bin_src() -> &'static str {
     env!("CARGO_BIN_EXE_northnarrow-watchdog")
@@ -195,7 +189,7 @@ fn combat_rules_src() -> PathBuf {
 /// auto-removes its contents.
 struct E2eFixture {
     tempdir: tempfile::TempDir,
-    agent_install: Option<InstalledBin>,
+    agent_install: Option<InstalledAgent>,
     watchdog_install: Option<InstalledBin>,
     agent_child: Option<Child>,
     watchdog_child: Option<Child>,
@@ -207,7 +201,7 @@ impl E2eFixture {
         purge_bpffs_root();
         Self {
             tempdir: tempfile::tempdir().expect("create tempdir"),
-            agent_install: Some(install_to_priv_bin(&agent_bin_src())),
+            agent_install: Some(InstalledAgent::install()),
             watchdog_install: Some(install_to_priv_bin(Path::new(watchdog_bin_src()))),
             agent_child: None,
             watchdog_child: None,
@@ -219,31 +213,38 @@ impl E2eFixture {
     }
 
     fn agent_priv_path(&self) -> &Path {
-        &self.agent_install.as_ref().unwrap().path
+        self.agent_install.as_ref().unwrap().agent_exe()
     }
 
     fn watchdog_priv_path(&self) -> &Path {
         &self.watchdog_install.as_ref().unwrap().path
     }
 
+    /// Lab PR 256: every file the agent writes, its key and its id in the
+    /// tempdir. The agent had its socket, pid files and id there, and
+    /// signed the installed agent's chains with the installed key.
+    fn state(&self) -> AgentState {
+        AgentState::new(self.tempdir_path())
+    }
+
     fn agent_pidfile(&self) -> PathBuf {
-        self.tempdir_path().join("agent.pid")
+        self.state().pid_file()
     }
 
     fn watchdog_pidfile(&self) -> PathBuf {
-        self.tempdir_path().join("watchdog.pid")
+        self.state().watchdog_pidfile()
     }
 
     fn admin_socket(&self) -> PathBuf {
-        self.tempdir_path().join("admin.sock")
+        self.state().admin_socket()
     }
 
     fn admin_pub_path(&self) -> PathBuf {
-        self.tempdir_path().join("admin.pub")
+        self.state().admin_pub()
     }
 
     fn agent_id_path(&self) -> PathBuf {
-        self.tempdir_path().join("agent_id")
+        self.state().agent_id_file()
     }
 
     fn combat_rules_path(&self) -> PathBuf {
@@ -251,7 +252,7 @@ impl E2eFixture {
     }
 
     fn shutdown_marker_path(&self) -> PathBuf {
-        self.tempdir_path().join("agent.shutdown_authorised")
+        self.state().shutdown_marker()
     }
 
     /// Spawn the real agent with per-test tempdir paths. Agent
@@ -272,20 +273,13 @@ impl E2eFixture {
         }
         fs::copy(combat_rules_src(), self.combat_rules_path()).expect("copy combat-rules");
 
-        let child = Command::new("sudo")
-            .arg(self.agent_priv_path())
+        let child = self
+            .agent_install
+            .as_ref()
+            .unwrap()
+            .command(&self.state(), Launch::Sudo, &[])
             .arg("--combat-rules")
             .arg(self.combat_rules_path())
-            .arg("--admin-pub")
-            .arg(self.admin_pub_path())
-            .arg("--admin-socket")
-            .arg(self.admin_socket())
-            .arg("--pid-file")
-            .arg(self.agent_pidfile())
-            .arg("--agent-id-file")
-            .arg(self.agent_id_path())
-            .arg("--watchdog-pidfile")
-            .arg(self.watchdog_pidfile())
             // External audit MAIN-001 / ATP-002: the agent protects only
             // a watchdog running the binary it expects — here the test's.
             .arg("--watchdog-exe")
@@ -320,12 +314,11 @@ impl E2eFixture {
     fn spawn_watchdog(&mut self) {
         let child = Command::new("sudo")
             .arg(self.watchdog_priv_path())
-            .arg("--agent-pidfile")
-            .arg(self.agent_pidfile())
-            .arg("--admin-socket")
-            .arg(self.admin_socket())
-            .arg("--pidfile")
-            .arg(self.watchdog_pidfile())
+            // The agent's pid file and socket, this watchdog's pid file
+            // (the one the agent looks for), and — external audit WDG-001
+            // — the marker, and the keys and install id it is verified
+            // against: the agent's state, all in this test's directory.
+            .args(self.state().watchdog_args())
             .arg("--bpffs-root")
             .arg(BPFFS_ROOT)
             // --agent-bin: skip /proc/<pid>/exe readlink. The agent's
@@ -341,14 +334,6 @@ impl E2eFixture {
             .arg("exec")
             .arg("--agent-bin")
             .arg(self.agent_priv_path())
-            // External audit WDG-001: the marker, and the keys and install
-            // id it is verified against, all in this test's directory.
-            .arg("--shutdown-marker")
-            .arg(self.shutdown_marker_path())
-            .arg("--admin-pub")
-            .arg(self.admin_pub_path())
-            .arg("--agent-id-file")
-            .arg(self.agent_id_path())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
@@ -564,7 +549,7 @@ impl Drop for E2eFixture {
         // start applying iptables rules. pkill -QUIT is harmless
         // when nothing matches.
         if let Some(install) = &self.agent_install {
-            if let Some(basename) = install.path.file_name().and_then(|s| s.to_str()) {
+            if let Some(basename) = install.agent_exe().file_name().and_then(|s| s.to_str()) {
                 if let Ok(out) = Command::new("pgrep").args(["-f", basename]).output() {
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
                         if let Ok(p) = line.trim().parse::<u32>() {

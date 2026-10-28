@@ -43,6 +43,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
+use common::agent_state::{AgentState, InstalledAgent, Launch};
 use common::EniIptablesGuard;
 
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -50,9 +51,6 @@ const RECORD_POLL_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const BPFFS_PIN_ROOT: &str = "/sys/fs/bpf/northnarrow";
 
-fn agent_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_northnarrow-agent")
-}
 fn nn_admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_nn-admin")
 }
@@ -96,6 +94,9 @@ struct Fixture {
     agent_log: PathBuf,
     detections_log: PathBuf,
     _agent_guard: AgentGuard,
+    /// Lab PR 256: the agent runs from a root-owned copy, as in the other
+    /// suites (it ran from `target/`); removed after it stopped.
+    _installed_agent: InstalledAgent,
 }
 
 impl Fixture {
@@ -103,6 +104,8 @@ impl Fixture {
         wipe_pin_tree();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let dir = tempdir.path().to_path_buf();
+        let state = AgentState::new(&dir);
+        let installed_agent = InstalledAgent::install();
 
         // Before the agent runs: nn-admin is not exec'd again afterwards.
         let status = Command::new(nn_admin_bin())
@@ -110,7 +113,7 @@ impl Fixture {
             .arg("--priv-out")
             .arg(dir.join("admin.priv"))
             .arg("--pub-append")
-            .arg(dir.join("admin.pub"))
+            .arg(state.admin_pub())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .status()
@@ -135,50 +138,19 @@ impl Fixture {
         };
 
         let agent_log = dir.join("agent.log");
-        let detections_log = dir.join("detections.jsonl");
+        let detections_log = state.detections();
         let log = std::fs::File::create(&agent_log).expect("create agent.log");
         let log_err = log.try_clone().expect("clone agent.log");
-        let mut cmd = Command::new(agent_bin());
-        cmd.env(
-            common::OWN_DEFAULT_LISTS_ENV.0,
-            common::OWN_DEFAULT_LISTS_ENV.1,
-        );
+        let mut cmd =
+            installed_agent.command(&state, Launch::Direct, &[common::OWN_DEFAULT_LISTS_ENV]);
         cmd.arg("--combat-rules")
             .arg(&combat)
-            .arg("--admin-pub")
-            .arg(dir.join("admin.pub"))
-            .arg("--admin-socket")
-            .arg(dir.join("admin.sock"))
-            .arg("--agent-id-file")
-            .arg(dir.join("agent_id"))
-            .arg("--audit-log-file")
-            .arg(dir.join("audit.log"))
-            .arg("--signing-key-file")
-            .arg(dir.join("agent.sig.key"))
-            .arg("--shutdown-marker-file")
-            .arg(dir.join("agent.shutdown_authorised"))
-            .arg("--detections-file")
-            .arg(&detections_log)
-            .arg("--status-events-file")
-            .arg(dir.join("status_events.jsonl"))
             .arg("--fim-paths-v1")
             .arg(empty("fim-paths.v1"))
             .arg("--fim-paths-local")
             .arg(empty("fim-paths.local"))
-            .arg("--fim-baseline-file")
-            .arg(dir.join("fim_baseline.jsonl"))
-            .arg("--fim-drift-file")
-            .arg(dir.join("fim_drift.jsonl"))
-            .arg("--canary-registry-file")
-            .arg(dir.join("canaries.jsonl"))
-            .arg("--canary-access-file")
-            .arg(dir.join("canary_access.jsonl"))
             .arg("--canary-template-dir")
-            .arg(&templates)
-            .arg("--netflow-file")
-            .arg(dir.join("netflow.jsonl"))
-            .arg("--netflow-listeners-file")
-            .arg(dir.join("netflow_listeners.jsonl"));
+            .arg(&templates);
         for (flag, file) in [
             ("--netflow-blocklist-v1", "netflow-blocklist.v1"),
             ("--netflow-blocklist-local", "netflow-blocklist.local"),
@@ -208,7 +180,7 @@ impl Fixture {
             .expect("spawn northnarrow-agent for the response e2e");
         let guard = AgentGuard(Some(child));
 
-        let socket = dir.join("admin.sock");
+        let socket = state.admin_socket();
         let deadline = Instant::now() + SOCKET_POLL_TIMEOUT;
         while !socket.exists() {
             assert!(
@@ -224,6 +196,7 @@ impl Fixture {
             agent_log,
             detections_log,
             _agent_guard: guard,
+            _installed_agent: installed_agent,
         }
     }
 
