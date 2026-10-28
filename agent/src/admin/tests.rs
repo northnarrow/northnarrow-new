@@ -76,7 +76,7 @@ struct ServerHarness {
 /// The install id of the [`spawn_server`] harness.
 const HARNESS_AGENT_ID: [u8; 16] = [0x7a; 16];
 
-fn rules_path() -> PathBuf {
+pub(super) fn rules_path() -> PathBuf {
     PathBuf::from(env!("NN_REPO_ROOT"))
         .join("configs")
         .join("combat-rules.v4")
@@ -746,7 +746,7 @@ async fn shutdown_request_fires_in_process_shutdown_signal() {
 /// path + the Arc<Mutex<>> wrapped log. B5 dispatch wiring
 /// passes this Arc through; tests poke at the underlying
 /// file to verify emission.
-fn build_test_audit_log(dir: &TempDir) -> (PathBuf, Arc<Mutex<AuditLog>>) {
+pub(super) fn build_test_audit_log(dir: &TempDir) -> (PathBuf, Arc<Mutex<AuditLog>>) {
     let key_path = dir.path().join("agent.sig.key");
     let log_path = dir.path().join("audit.log");
     let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
@@ -754,7 +754,7 @@ fn build_test_audit_log(dir: &TempDir) -> (PathBuf, Arc<Mutex<AuditLog>>) {
     (log_path, Arc::new(Mutex::new(log)))
 }
 
-fn read_audit_entries(log_path: &Path) -> Vec<crate::audit::AuditEntry> {
+pub(super) fn read_audit_entries(log_path: &Path) -> Vec<crate::audit::AuditEntry> {
     std::fs::read_to_string(log_path)
         .ok()
         .unwrap_or_default()
@@ -764,12 +764,34 @@ fn read_audit_entries(log_path: &Path) -> Vec<crate::audit::AuditEntry> {
         .collect()
 }
 
-fn fake_client() -> AuditClient {
+pub(super) fn fake_client() -> AuditClient {
     AuditClient {
         pid: 12345,
         uid: 1000,
         comm: "nn-admin".to_string(),
         exe: Some("/usr/local/bin/nn-admin".to_string()),
+    }
+}
+
+/// A request's context with no subsystem wired: the posture, the
+/// isolator, the marker's path and the read verbs' files only.
+pub(super) fn bare_context<'a>(
+    posture: &'a PostureMachine,
+    isolator: &'a NetworkIsolator,
+    marker_path: &'a Path,
+    read_paths: &'a AdminReadPaths,
+) -> Wired<'a> {
+    Wired {
+        posture,
+        isolator,
+        marker_path,
+        shutdown_signal: None,
+        fim_state: None,
+        canary_state: None,
+        installer_override: None,
+        detection_state: None,
+        response_state: None,
+        read_paths,
     }
 }
 
@@ -1923,16 +1945,10 @@ fn status_reports_detect_only_and_combat_evidence() {
     let status = |state: Option<&ResponseAdminState>| match dispatch(
         AdminMessage::TelemetryStatusRequest(telemetry_req(&signing, &auth, [0x1c; 16])),
         &auth,
-        &posture,
-        &isolator,
-        &marker,
-        None,
-        None,
-        None,
-        None,
-        None,
-        state,
-        &AdminReadPaths::default(),
+        Wired {
+            response_state: state,
+            ..bare_context(&posture, &isolator, &marker, &AdminReadPaths::default())
+        },
         &fake_client(),
         &mut Vec::new(),
         &mut DispatchNotes::default(),
@@ -2016,16 +2032,10 @@ fn the_unsigned_status_withholds_the_telemetry() {
     let r = match dispatch(
         AdminMessage::Status(StatusRequest {}),
         &auth,
-        &posture,
-        &isolator,
-        &marker,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(&detect),
-        &AdminReadPaths::default(),
+        Wired {
+            response_state: Some(&detect),
+            ..bare_context(&posture, &isolator, &marker, &AdminReadPaths::default())
+        },
         &fake_client(),
         &mut fps,
         &mut DispatchNotes::default(),
@@ -4662,16 +4672,12 @@ fn the_legacy_unlock_is_refused_and_audited() {
     let reply = dispatch(
         req.clone(),
         &auth,
-        &posture,
-        &isolator,
-        &dir.path().join("marker"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &AdminReadPaths::default(),
+        bare_context(
+            &posture,
+            &isolator,
+            &dir.path().join("marker"),
+            &AdminReadPaths::default(),
+        ),
         &fake_client(),
         &mut fps,
         &mut DispatchNotes::default(),

@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use nn_proto::admin_protocol::{decode_frame, encode_frame, AdminMessage, MAX_FRAME_BODY};
 
 use super::audit::{emit_audit_for, AuditClient, DispatchNotes};
-use super::handlers::dispatch;
+use super::handlers::{dispatch, Wired};
 use super::{
     socket_watch, status_polls, AdminReadPaths, CanaryAdminState, DetectionAdminState,
     FimAdminState, ResponseAdminState, ShutdownSignal, StatusPolls,
@@ -633,6 +633,18 @@ pub(super) async fn handle_connection(
     // changes peers mid-stream (SO_PEERCRED is fixed at connect time).
     let client = peer_identity(stream.as_raw_fd(), &cred);
     let auth = ConnAuth::new(auth);
+    let ctx = Wired {
+        posture,
+        isolator,
+        marker_path,
+        shutdown_signal,
+        fim_state: fim_state.map(|s| s.as_ref()),
+        canary_state: canary_state.map(|s| s.as_ref()),
+        installer_override: installer_override.map(|s| s.as_ref()),
+        detection_state: detection_state.map(|s| s.as_ref()),
+        response_state: response_state.map(|s| s.as_ref()),
+        read_paths,
+    };
     let limits = slot.limits();
     loop {
         if !slot.waiting() {
@@ -677,32 +689,7 @@ pub(super) async fn handle_connection(
         // reply written after its audit row, as before. No lock is held
         // across an `.await`.
         let reply = crate::runtime::off_the_runtime(|| {
-            let mut matched_fps: Vec<String> = Vec::new();
-            let mut notes = DispatchNotes::default();
-            let reply = dispatch(
-                msg.clone(),
-                &auth,
-                posture,
-                isolator,
-                marker_path,
-                shutdown_signal,
-                fim_state.map(|s| s.as_ref()),
-                canary_state.map(|s| s.as_ref()),
-                installer_override.map(|s| s.as_ref()),
-                detection_state.map(|s| s.as_ref()),
-                response_state.map(|s| s.as_ref()),
-                read_paths,
-                &client,
-                &mut matched_fps,
-                &mut notes,
-            );
-            emit_audit_for(&msg, &reply, &client, audit_log, &matched_fps, &notes);
-            // External audit ASK-009 (lab PR 213): the unsigned status, one
-            // signed row per peer per hour.
-            if matches!(msg, AdminMessage::Status(_)) {
-                note_status_poll(status_polls, &client, audit_log);
-            }
-            reply
+            serve_request(&msg, &auth, ctx, &client, audit_log, status_polls)
         });
         if !slot.waiting() {
             return Ok(());
@@ -728,6 +715,33 @@ pub(super) async fn handle_connection(
             return Ok(());
         }
     }
+}
+
+/// One request's way from its frame to its reply, every request alike:
+/// `dispatch` (a signed verb verified by `verify::signed`, then its
+/// handler; the unsigned ones answered as they are), then the signed
+/// audit row of the request and its reply (`emit_audit_for`, accepted and
+/// refused alike), then, for the unsigned `status`, its peer's count.
+/// `handle_connection` runs it off the runtime and writes the reply after
+/// its row.
+pub(super) fn serve_request(
+    msg: &AdminMessage,
+    auth: &ConnAuth<'_>,
+    ctx: Wired<'_>,
+    client: &AuditClient,
+    audit_log: Option<&Arc<Mutex<AuditLog>>>,
+    status_polls: &StatusPolls,
+) -> AdminMessage {
+    let mut matched_fps: Vec<String> = Vec::new();
+    let mut notes = DispatchNotes::default();
+    let reply = dispatch(msg.clone(), auth, ctx, client, &mut matched_fps, &mut notes);
+    emit_audit_for(msg, &reply, client, audit_log, &matched_fps, &notes);
+    // External audit ASK-009 (lab PR 213): the unsigned status, one
+    // signed row per peer per hour.
+    if matches!(msg, AdminMessage::Status(_)) {
+        note_status_poll(status_polls, client, audit_log);
+    }
+    reply
 }
 
 /// External audit ASK-009 (lab PR 213): count an unsigned `status` and

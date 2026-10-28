@@ -51,27 +51,48 @@ use shutdown::dispatch_shutdown;
 use status::{dispatch_telemetry_status, public_status};
 use unlock::dispatch_signed_unlock;
 
+/// What a request may act on: the agent's subsystems as its boot wired
+/// them for the admin socket, borrowed for one request (`None`: not wired
+/// this boot, or by a legacy serve entry point).
+#[derive(Clone, Copy)]
+pub(in crate::admin) struct Wired<'a> {
+    pub(in crate::admin) posture: &'a PostureMachine,
+    pub(in crate::admin) isolator: &'a NetworkIsolator,
+    pub(in crate::admin) marker_path: &'a Path,
+    pub(in crate::admin) shutdown_signal: Option<&'a ShutdownSignal>,
+    pub(in crate::admin) fim_state: Option<&'a FimAdminState>,
+    pub(in crate::admin) canary_state: Option<&'a CanaryAdminState>,
+    pub(in crate::admin) installer_override: Option<&'a TrustedInstallerOverride>,
+    pub(in crate::admin) detection_state: Option<&'a DetectionAdminState>,
+    pub(in crate::admin) response_state: Option<&'a ResponseAdminState>,
+    pub(in crate::admin) read_paths: &'a AdminReadPaths,
+}
+
 /// Synchronous request→reply mapping. All AdminAuth + PostureMachine
 /// methods are sync; we don't `await` between read and write inside
-/// `handle_connection`, so the dispatch itself can stay sync.
-#[allow(clippy::too_many_arguments)]
+/// `handle_connection`, so the dispatch itself can stay sync. Every
+/// signed verb goes through `verify::signed` in its handler's entry; the
+/// arms without a signature are this function's own.
 pub(super) fn dispatch(
     msg: AdminMessage,
     auth: &ConnAuth<'_>,
-    posture: &PostureMachine,
-    isolator: &NetworkIsolator,
-    marker_path: &Path,
-    shutdown_signal: Option<&ShutdownSignal>,
-    fim_state: Option<&FimAdminState>,
-    canary_state: Option<&CanaryAdminState>,
-    installer_override: Option<&TrustedInstallerOverride>,
-    detection_state: Option<&DetectionAdminState>,
-    response_state: Option<&ResponseAdminState>,
-    read_paths: &AdminReadPaths,
+    ctx: Wired<'_>,
     client: &AuditClient,
     fps_out: &mut Vec<String>,
     notes: &mut DispatchNotes,
 ) -> AdminMessage {
+    let Wired {
+        posture,
+        isolator,
+        marker_path,
+        shutdown_signal,
+        fim_state,
+        canary_state,
+        installer_override,
+        detection_state,
+        response_state,
+        read_paths,
+    } = ctx;
     match msg {
         AdminMessage::ChallengeRequest(_) => match auth.issue_challenge() {
             Ok(nonce) => AdminMessage::Challenge(Challenge { nonce }),
