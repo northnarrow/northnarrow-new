@@ -241,8 +241,15 @@ pub struct DetectionAdminState {
     /// single `StatusEvent` synchronously on the handler thread (triage
     /// is human-initiated + low-frequency, NOT the hot path — so no
     /// off-thread writer like the 9.0.a detection sink). `&mut` for
-    /// `append`, hence the `Mutex`.
-    pub status_log: Arc<Mutex<RotatingChainLog<StatusEvent>>>,
+    /// `append`, hence the `Mutex`. `None` when it did not open this boot:
+    /// set-status is refused, the read still serves the detections (their
+    /// status the initial one).
+    pub status_log: Option<Arc<Mutex<RotatingChainLog<StatusEvent>>>>,
+    /// The public half of the agent key every detection row is signed
+    /// with: the read serves only the rows that verify (external audit
+    /// NN-AUD-112). Lab PR 263: the key's own, not the status log's, so
+    /// that a boot whose status log failed still verifies what it serves.
+    pub agent_key: ed25519_dalek::VerifyingKey,
     /// Path to `detections.jsonl`. `dispatch_detection_set_status`
     /// reads its max id for the `id <= max` validity guard;
     /// `dispatch_detections` reads its records.

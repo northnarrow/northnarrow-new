@@ -3037,7 +3037,8 @@ fn dispatch_detections_accepts_telemetry_read() {
     let nonce = auth.issue_challenge().unwrap();
     let req = signed_detections_req(&signing, nonce, agent_id);
     let mut fps = Vec::new();
-    let resp = dispatch_detections(req, &auth, None, &mut fps);
+    let (store, _store_dir) = detection_state_with_max_id(0);
+    let resp = dispatch_detections(req, &auth, Some(&store), &mut fps);
     assert!(
         matches!(resp.result, AdminResult::Success),
         "telemetry-read key must be accepted for detections, got {:?}",
@@ -3058,7 +3059,8 @@ fn dispatch_detections_role_denied_without_telemetry_read() {
     let nonce = auth.issue_challenge().unwrap();
     let req = signed_detections_req(&signing, nonce, agent_id);
     let mut fps = Vec::new();
-    let resp = dispatch_detections(req, &auth, None, &mut fps);
+    let (store, _store_dir) = detection_state_with_max_id(0);
+    let resp = dispatch_detections(req, &auth, Some(&store), &mut fps);
     assert!(matches!(resp.result, AdminResult::RoleDenied));
 }
 
@@ -3074,7 +3076,8 @@ fn dispatch_detections_role_denied_with_wrong_read_role() {
     let nonce = auth.issue_challenge().unwrap();
     let req = signed_detections_req(&signing, nonce, agent_id);
     let mut fps = Vec::new();
-    let resp = dispatch_detections(req, &auth, None, &mut fps);
+    let (store, _store_dir) = detection_state_with_max_id(0);
+    let resp = dispatch_detections(req, &auth, Some(&store), &mut fps);
     assert!(matches!(resp.result, AdminResult::RoleDenied));
 }
 
@@ -3089,7 +3092,8 @@ fn dispatch_detections_accepts_role_all() {
     let nonce = auth.issue_challenge().unwrap();
     let req = signed_detections_req(&signing, nonce, agent_id);
     let mut fps = Vec::new();
-    let resp = dispatch_detections(req, &auth, None, &mut fps);
+    let (store, _store_dir) = detection_state_with_max_id(0);
+    let resp = dispatch_detections(req, &auth, Some(&store), &mut fps);
     assert!(matches!(resp.result, AdminResult::Success));
 }
 
@@ -3105,7 +3109,8 @@ fn dispatch_detections_accepts_triage() {
     let nonce = auth.issue_challenge().unwrap();
     let req = signed_detections_req(&signing, nonce, agent_id);
     let mut fps = Vec::new();
-    let resp = dispatch_detections(req, &auth, None, &mut fps);
+    let (store, _store_dir) = detection_state_with_max_id(0);
+    let resp = dispatch_detections(req, &auth, Some(&store), &mut fps);
     assert!(
         matches!(resp.result, AdminResult::Success),
         "triage key must be accepted for detections (subsumes read), got {:?}",
@@ -3154,6 +3159,7 @@ fn detection_state_with_max_id(max_id: u64) -> (DetectionAdminState, TempDir) {
     std::fs::write(&det_path, body).unwrap();
     let key_path = dir.path().join("agent.sig.key");
     let key = crate::audit::AgentSigningKey::load_or_bootstrap(&key_path).unwrap();
+    let agent_key = key.verifying_key();
     let log = crate::detection_store::open_status_log(
         &evt_path,
         key,
@@ -3162,7 +3168,8 @@ fn detection_state_with_max_id(max_id: u64) -> (DetectionAdminState, TempDir) {
     )
     .unwrap();
     let state = DetectionAdminState {
-        status_log: Arc::new(Mutex::new(log)),
+        status_log: Some(Arc::new(Mutex::new(log))),
+        agent_key,
         detections_path: det_path,
         status_events_path: evt_path,
     };
@@ -3307,6 +3314,98 @@ fn dispatch_set_status_without_state_returns_unknown_operation() {
     let mut fps = Vec::new();
     let resp = dispatch_detection_set_status(req, &auth, None, &test_client(), &mut fps);
     assert!(matches!(resp.result, AdminResult::UnknownOperation));
+}
+
+/// Lab PR 263 (R11d): the detections read verifies what it serves on a
+/// degraded boot too. Without the detection store's state (no agent key
+/// this boot, or a serve path without it) it is refused, as set-status is:
+/// it read the built-in paths, not `--detections-file`, and served their
+/// rows unverified (external audit NN-AUD-112's check skipped). A boot
+/// whose status-event log did not open keeps the read, its rows verified
+/// with the agent key — a forged row left out — and refuses set-status.
+#[test]
+fn the_detections_read_verifies_its_rows_on_a_degraded_boot_too() {
+    use crate::chainlog::{NoProtection, RotatingChainLog, RotationConfig};
+    use crate::detection_store::DetectionRecord;
+    let signing = SigningKey::generate(&mut OsRng);
+    let agent_id = [0xE7; 16];
+    let (auth, dir) = build_auth_with_roles(&signing, "triage", agent_id);
+    let record = |id: u64| -> DetectionRecord {
+        serde_json::from_str(&format!(
+            r#"{{"id":{id},"ts":"2026-06-08T12:00:0{id}.000000Z","sensor":"Exec","path":"Rule","rule_id":"R001_ExecFromTmp","rule_name":"Exec from /tmp/","severity":"Medium","verdict":{{"Rule":"KillProcess"}},"confidence":1.0,"mitre":{{"tactic":[],"technique":[]}},"principal":{{"pid":4242,"comm":"evil","uid":0,"ppid":1}},"exe":"/tmp/payload","posture_at":"Engaged","response":"KillProcess","detection_type":"execution","status":"Open"}}"#
+        ))
+        .unwrap()
+    };
+    // the store: one row the agent key signed, one forged after it
+    let det_path = dir.path().join("detections.jsonl");
+    let key = crate::audit::AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key"))
+        .unwrap();
+    let agent_key = key.verifying_key();
+    RotatingChainLog::<DetectionRecord>::open(
+        &det_path,
+        key,
+        RotationConfig::default(),
+        Arc::new(NoProtection),
+    )
+    .unwrap()
+    .append(record(1))
+    .unwrap();
+    let mut forged = serde_json::to_value(record(2)).unwrap();
+    forged["fmt_ver"] = serde_json::json!(2);
+    forged["prev_hash"] = serde_json::json!("00".repeat(32));
+    forged["entry_hash"] = serde_json::json!("11".repeat(32));
+    forged["agent_sig"] = serde_json::json!("AAAA");
+    let mut body = std::fs::read_to_string(&det_path).unwrap();
+    body.push_str(&format!("{forged}\n"));
+    std::fs::write(&det_path, body).unwrap();
+    let triage_down = DetectionAdminState {
+        status_log: None,
+        agent_key,
+        detections_path: det_path,
+        status_events_path: dir.path().join("status_events.jsonl"),
+    };
+    let read = |state: Option<&DetectionAdminState>| {
+        let auth = ConnAuth::new(&auth);
+        let req = signed_detections_req(&signing, auth.issue_challenge().unwrap(), agent_id);
+        let mut fps = Vec::new();
+        let resp = dispatch_detections(req, &auth, state, &mut fps);
+        assert_eq!(fps.len(), 1, "verified: the signer is named");
+        resp
+    };
+    let refused = read(None);
+    assert_eq!(refused.result, AdminResult::UnknownOperation);
+    assert_eq!(
+        (refused.entries_count, refused.entries_jsonl.as_str()),
+        (0, "")
+    );
+    let served = read(Some(&triage_down));
+    assert_eq!(served.result, AdminResult::Success);
+    assert_eq!(served.entries_count, 1, "{}", served.entries_jsonl);
+    assert!(
+        served.entries_jsonl.contains(r#""id":1,"#),
+        "{}",
+        served.entries_jsonl
+    );
+    assert!(
+        !served.entries_jsonl.contains(r#""id":2,"#),
+        "the forged row is left out"
+    );
+    let auth = ConnAuth::new(&auth);
+    let req = signed_set_status_req(
+        &signing,
+        auth.issue_challenge().unwrap(),
+        agent_id,
+        1,
+        "acknowledged",
+    );
+    let resp = dispatch_detection_set_status(
+        req,
+        &auth,
+        Some(&triage_down),
+        &test_client(),
+        &mut Vec::new(),
+    );
+    assert_eq!(resp.result, AdminResult::UnknownOperation, "no status log");
 }
 
 // ── FIM-009 self-upgrade (§15.1) — trusted-installer grant dispatch ──

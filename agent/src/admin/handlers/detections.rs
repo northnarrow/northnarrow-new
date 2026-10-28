@@ -62,6 +62,15 @@ fn detections(
     use crate::detection_store::{self, DetectionFilter};
     const SOFT_CAP: usize = MAX_FRAME_BODY / 2;
 
+    // Lab PR 263 (R11d): the detection store's state — the files the
+    // command line names (`--detections-file`, `--status-events-file`) and
+    // the agent key every row is verified with. Without it the read is
+    // refused, as set-status is: it read the built-in paths and served
+    // their rows unverified (external audit NN-AUD-112's check skipped).
+    let Some(state) = det_state else {
+        warn!("detections: the detection store is not wired this boot (no agent key) — refused");
+        return empty_detections(AdminResult::UnknownOperation);
+    };
     let extra = v.extra();
 
     // Build the typed filter. A provided-but-unrecognised enum filter
@@ -109,32 +118,23 @@ fn detections(
         (extra.limit as usize).min(detection_store::MAX_DETECTIONS_LIMIT)
     };
 
-    // Resolve the store paths from the wired state when present (honours
-    // a custom --detections-file); fall back to the build defaults so
-    // the legacy/test path (no DetectionAdminState) still reads the
-    // canonical location — an absent file simply yields no records / no
-    // overlay. The read OVERLAYS the event-sourced current status from
-    // the status-event chain onto each record (9.0.c).
-    let (detections_path, status_events_path) = match det_state {
-        Some(s) => (s.detections_path.clone(), s.status_events_path.clone()),
-        None => (
-            std::path::PathBuf::from(detection_store::DEFAULT_DETECTIONS_LOG_PATH),
-            std::path::PathBuf::from(detection_store::DEFAULT_STATUS_EVENTS_LOG_PATH),
-        ),
-    };
+    // The store's paths from the wired state (a custom --detections-file
+    // honoured); an absent file simply yields no records / no overlay. The
+    // read OVERLAYS the event-sourced current status from the
+    // status-event chain onto each record (9.0.c).
+    let (detections_path, status_events_path) = (&state.detections_path, &state.status_events_path);
     // External audit NN-AUD-112: the rows served are verified with the
-    // agent key (the status log holds it); a row that does not verify is
-    // left out, logged and recorded in the signed chain.
-    let pubkey = det_state.map(|s| s.status_log.lock().verifying_key());
+    // agent key; a row that does not verify is left out, logged and
+    // recorded in the signed chain.
     let (records, unverified) = detection_store::read_last_n_overlaid_verified(
-        &detections_path,
-        &status_events_path,
+        detections_path,
+        status_events_path,
         limit,
         &filter,
-        pubkey.as_ref(),
+        Some(&state.agent_key),
     );
     if unverified > 0 {
-        crate::chains::report_unverified_rows("detections", &detections_path, unverified);
+        crate::chains::report_unverified_rows("detections", detections_path, unverified);
     }
 
     // Serialise newest-first, bounding the body at the wire soft cap.
@@ -238,6 +238,10 @@ fn detection_set_status(
         warn!("detection-set-status: detection store not wired this boot");
         return fail_set_status(AdminResult::UnknownOperation, extra.id);
     };
+    let Some(status_log) = state.status_log.as_ref() else {
+        warn!("detection-set-status: the status-event store did not open this boot");
+        return fail_set_status(AdminResult::UnknownOperation, extra.id);
+    };
 
     // Parse the target status. `open` and unknown strings are rejected
     // (`open` is the initial state, not a settable triage target).
@@ -276,7 +280,7 @@ fn detection_set_status(
         principal_exe: client.exe.clone(),
     };
     {
-        let mut log = state.status_log.lock();
+        let mut log = status_log.lock();
         if let Err(e) = log.append(event) {
             warn!(
                 error = %e,
