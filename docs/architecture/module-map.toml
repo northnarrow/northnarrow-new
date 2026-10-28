@@ -308,7 +308,10 @@ planned = false
 "atomic_file" = "nn-linux"
 "bounded_cmd" = "nn-linux"
 "fs_type" = "nn-linux"
-"os_rng" = "nn-linux"
+# R10 (lab PR 259): the OS CSPRNG moved on to nn-evidence, below nn-linux
+# and nn-admin (the operator's keys and the offline overlay signatures'
+# nonces); the agent's path names it there
+"os_rng" = "nn-evidence"
 "runtime" = "nn-linux"
 "trusted_bin" = "nn-linux"
 # R09a (lab PR 253): the actuators, the self-defence, the agent's key, its
@@ -599,9 +602,14 @@ planned = false
 # nn-linux's `agent_id` to nn-admin's own, the all-zero rule both reads
 # take cut to nn-proto's `shutdown_marker` (`parse_minted_agent_id`)
 # beside the format's parse: `admin_cli` and `nn_admin.rs` name nn-admin.
+# Then 18 → 17, nn-admin 4 → 3: the OS CSPRNG (`os_rng`, post-plan, lab PR
+# 234) moved from nn-linux to nn-evidence, below nn-linux and nn-admin
+# (rand's portable `SysRng`; no OS crate named), and the agent's path and
+# nn-linux's name it there: `admin_cli`'s key generation and the offline
+# overlay signature's nonce draw from a crate nn-admin may depend on.
 
 [ratchet]
-nn-admin = 4
+nn-admin = 3
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0

@@ -31,11 +31,18 @@ hex = "0.4"
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize"] }
+# R10 (lab PR 259): `os_rng`, the OS CSPRNG (rand 0.10's `SysRng`,
+# getrandom: portable, no OS crate named here), moved from nn-linux; the
+# same version and features as there (one version in the workspace). The
+# audit rows' byte-exact round trip test draws its strings from a seeded
+# RNG of it (a dev-dependency before).
+rand = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
-# The audit rows' byte-exact round trip draws its strings from a seeded RNG.
-rand = "0.10"
+# `os_rng`'s test generates an Ed25519 key with it (`rand_core`, the
+# feature nn-linux's and the agent's builds already enable).
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize", "rand_core"] }
 
 [lints]
 workspace = true

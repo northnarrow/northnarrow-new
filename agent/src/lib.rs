@@ -159,8 +159,9 @@ mod install_manifest_tests;
 pub use nn_linux::keys;
 pub mod loop_progress;
 pub mod net;
-/// R09a shim: the OS CSPRNG is nn-linux's.
-pub use nn_linux::os_rng;
+/// R09a shim: the OS CSPRNG is nn-evidence's (R10, lab PR 259: from
+/// nn-linux, below nn-admin).
+pub use nn_evidence::os_rng;
 /// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the text of the
 /// open sensor's paths (from `sensors::open_sensor`, R04b, lab PR 241) is
 /// nn-model's, the crate the module map names; the posture reads it.

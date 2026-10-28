@@ -880,6 +880,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "nn-model",
+ "rand",
  "serde",
  "serde_json",
  "sha2",

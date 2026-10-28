@@ -39,5 +39,10 @@ pub mod clock;
 /// ATT&CK tags, its principal (R08b, lab PR 251; cut from the agent's
 /// `detection_payload`, which keeps the records).
 pub mod detection_payload;
+/// The OS CSPRNG as an infallible generator, behind the keys and nonces of
+/// the signed artifacts (lab PR 234). R10 (lab PR 259): moved from
+/// nn-linux, so that nn-linux and nn-admin both draw from it; rand's
+/// portable `SysRng`, no libc of its own.
+pub mod os_rng;
 /// The full verifiers' bounded line reader (was the agent's `verify_lines`).
 pub mod verify_lines;
