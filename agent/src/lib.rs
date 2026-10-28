@@ -146,6 +146,10 @@ pub mod host_hardening;
 pub mod impact;
 pub mod impair;
 pub mod install_manifest;
+/// The install manifest's check reached through the fuzz target's fixture
+/// (R09c, lab PR 257: from `install_manifest`'s tests).
+#[cfg(test)]
+mod install_manifest_tests;
 /// R09a shim: the agent's signing key (from `audit`, R04a, lab PR 241) is
 /// nn-linux's.
 pub use nn_linux::keys;
