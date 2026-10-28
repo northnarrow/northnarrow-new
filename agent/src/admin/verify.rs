@@ -60,6 +60,7 @@ use nn_proto::admin_signed_payload::{
     ResponseRestoreExtra, ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra,
     ShutdownExtra, SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
 };
+use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 use tracing::warn;
 
 use crate::anti_tamper::admin_auth::{AdminAuthError, ConnAuth, VerifiedSigners};
@@ -174,9 +175,10 @@ signed_verbs! {
     // Design §3.3: the release of COMBAT, 1-of-N (lab PR 217).
     SignedUnlockRequest: Unlock(UnlockExtra),
         Quorum::Of(1), Roles::Each(&[Role::Unlock]), "unlock";
-    // §3.3, §10.3: 2-of-N, one signer holding `shutdown`.
+    // §3.3, §10.3: 2-of-N, one signer holding `shutdown` — the quorum the
+    // watchdog verifies the marker by, the one constant of both.
     ShutdownRequest: Shutdown(ShutdownExtra),
-        Quorum::Of(2), Roles::Each(&[Role::Shutdown]), "shutdown";
+        Quorum::Of(SHUTDOWN_QUORUM), Roles::Each(&[Role::Shutdown]), "shutdown";
     // §3.3: 1-of-N; out of COMBAT also a signer holding `unlock`, which
     // the posture checks under its lock (external audit NN-AUD-083).
     ForcePostureRequest: ForcePosture(ForcePostureExtra),
@@ -514,7 +516,8 @@ mod tests {
             (
                 "ShutdownRequest",
                 OperationCode::Shutdown,
-                Quorum::Of(2),
+                // the watchdog's (lab PR 263's review, M-2): 2
+                Quorum::Of(SHUTDOWN_QUORUM),
                 Roles::Each(&[Shutdown]),
             ),
             (

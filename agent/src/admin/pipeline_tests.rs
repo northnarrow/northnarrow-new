@@ -37,6 +37,7 @@ use nn_proto::admin_protocol::{
     StatusRequest, TelemetryStatusRequest, TelemetryStatusResponse, TrustedInstallerGrantRequest,
     UnlockRequest, UnlockResult,
 };
+use nn_proto::admin_quorum::role_keyword;
 use nn_proto::admin_signed_payload::{
     sign, CanaryBurnExtra, CanaryDeployExtra, CanaryDeploymentWire, CanaryListExtra,
     CanaryRefreshExtra, CanaryTypeWire, ConfigOverlaySetExtra, DetectionSetStatusExtra,
@@ -46,12 +47,13 @@ use nn_proto::admin_signed_payload::{
     ResponseStatusExtra, Role, RotateKeysAddExtra, RotateKeysRevokeExtra, ShutdownExtra,
     SignedPayload, TelemetryStatusExtra, TrustedInstallerGrantExtra, UnlockExtra,
 };
+use nn_proto::shutdown_marker::SHUTDOWN_QUORUM;
 
 use super::tests::{
     bare_context, build_test_audit_log, fake_client, read_audit_entries, rules_path,
 };
 use super::transport::serve_request;
-use super::verify::{now_unix_secs, Quorum, RULES};
+use super::verify::{now_unix_secs, Quorum, Signed, RULES};
 use super::{AdminReadPaths, StatusPolls};
 use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
 use crate::anti_tamper::network_isolate::NetworkIsolator;
@@ -281,7 +283,7 @@ fn verbs() -> Vec<Verb> {
         Verb {
             request: "ShutdownRequest",
             op: "shutdown",
-            quorum: 2,
+            quorum: usize::from(SHUTDOWN_QUORUM),
             extra: |_| OperationExtra::Shutdown(ShutdownExtra { grace_secs: 30 }),
             wrap: |payload, signatures| {
                 AdminMessage::ShutdownRequest(ShutdownRequest {
@@ -1669,6 +1671,212 @@ fn a_bootstrap_gate_not_armed_keeps_the_add_two_of_n() {
         assert!(!fx.auth.bootstrap_consumed(), "{case}");
         if case == "a sentinel over another admin.pub" {
             assert!(fx.sentinel().exists(), "{case}: kept for the operator");
+        }
+    }
+}
+
+/// Every role but `all`, by hand: a role the enum gains is a role these
+/// tests must place (`every_role_is_in_the_role_tests`).
+const EVERY_ROLE: [Role; 16] = [
+    Role::Unlock,
+    Role::Shutdown,
+    Role::ForcePosture,
+    Role::RotateKeys,
+    Role::AuditRead,
+    Role::FimManage,
+    Role::FimRead,
+    Role::CanaryRead,
+    Role::CanaryManage,
+    Role::NetRead,
+    Role::NetManage,
+    Role::TrustedInstaller,
+    Role::TelemetryRead,
+    Role::Triage,
+    Role::ConfigManage,
+    Role::ResponseManage,
+];
+
+/// The roles each signed verb needs, as its design names them (TAPPA8
+/// §3.3 and §4, FIM §13 Q6, the deception layer's §12 Q7, Tappa 9.0.b/c,
+/// 10 N1, 10.8, FIM-009, CMB-016, ASK-009, lab PR 222). Written here by
+/// hand, not read from `verify::RULES`: a role changed in the table and in
+/// its pin alike is still caught (lab PR 263's review, M-2).
+fn designed_roles(op: &str) -> &'static [Role] {
+    match op {
+        "unlock" => &[Role::Unlock],
+        "shutdown" => &[Role::Shutdown],
+        "force_posture" => &[Role::ForcePosture],
+        "rotate_keys_add" | "rotate_keys_revoke" => &[Role::RotateKeys],
+        "fim_baseline" => &[Role::FimManage],
+        "fim_report" | "fim_status" => &[Role::FimRead],
+        "canary_deploy" | "canary_burn" | "canary_refresh" => &[Role::CanaryManage],
+        "canary_list" => &[Role::CanaryRead],
+        "net_flows" | "net_listeners" | "net_resolve" | "net_fingerprint" => &[Role::NetRead],
+        "trusted_installer_grant" => &[Role::TrustedInstaller],
+        "detections" => &[Role::TelemetryRead],
+        "detection_set_status" => &[Role::Triage],
+        "config_overlay_set" => &[Role::ConfigManage],
+        "response_status" => &[Role::AuditRead],
+        "response_release" | "response_restore" | "remediate_ransomware" => &[Role::ResponseManage],
+        // either read role (lab PR 213)
+        "telemetry_status" => &[Role::AuditRead, Role::TelemetryRead],
+        other => panic!("{other}: a signed verb without a designed role"),
+    }
+}
+
+/// The distinct keys each signed verb needs by its design: the shutdown
+/// the watchdog's quorum (`shutdown_marker::SHUTDOWN_QUORUM`, which it
+/// verifies the marker by), rotate-keys 2 (§7.2), every other verb one.
+fn designed_quorum(op: &str) -> usize {
+    match op {
+        "shutdown" => usize::from(SHUTDOWN_QUORUM),
+        "rotate_keys_add" | "rotate_keys_revoke" => 2,
+        _ => 1,
+    }
+}
+
+/// Every role but the ones `op` needs and the ones that carry them
+/// (`triage` carries `telemetry-read`): an admin.pub role list.
+fn every_other_role(op: &str) -> String {
+    let designed = designed_roles(op);
+    EVERY_ROLE
+        .iter()
+        .filter(|r| !designed.contains(r))
+        .filter(|r| !(**r == Role::Triage && designed.contains(&Role::TelemetryRead)))
+        .map(|r| role_keyword(*r))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A verb's request signed by `signers`, on a connection of its own: its
+/// reply and its row.
+fn send_verb(
+    fx: &Fixture,
+    verb: &Verb,
+    k: &Keys,
+    signers: &[&SigningKey],
+) -> (AdminMessage, AuditEntry) {
+    let conn = ConnAuth::new(&fx.auth);
+    let nonce = fx.challenge(&conn);
+    let p = payload((verb.extra)(k), nonce, now_unix_secs(), AGENT_ID);
+    let request = (verb.wrap)(p.clone(), signatures(&p, signers));
+    let reply = fx.serve(&conn, &request);
+    (reply, fx.rows().pop().expect("its row"))
+}
+
+/// Two keys outside `Keys`, for admin.pub files of a test's own.
+fn spare_keys() -> [SigningKey; 2] {
+    [
+        SigningKey::from_bytes(&[0x61; 32]),
+        SigningKey::from_bytes(&[0x62; 32]),
+    ]
+}
+
+/// Lab PR 263's review, M-2: every verb is refused, `RoleDenied`, to
+/// keys holding every role but the ones its design names (and their
+/// carriers) — as many keys as its quorum. The rejection table's
+/// `WrongRole` signs with keys holding one read role; a role swapped for
+/// another (`response-manage` → `audit-read`, the role every key holds)
+/// passed it.
+#[test]
+fn every_verb_refuses_the_keys_of_every_other_role() {
+    let k = keys();
+    let spare = spare_keys();
+    for verb in verbs() {
+        let roles = every_other_role(verb.op);
+        let fx = Fixture::with_admin_pub(
+            &[admin_line(&spare[0], &roles), admin_line(&spare[1], &roles)].concat(),
+        );
+        let signers: Vec<&SigningKey> = spare.iter().take(designed_quorum(verb.op)).collect();
+        let (reply, row) = send_verb(&fx, &verb, &k, &signers);
+        let what = format!("{} signed by keys of {roles}", verb.op);
+        assert_eq!(
+            reply,
+            (verb.refused)(AdminResult::RoleDenied, true),
+            "{what}"
+        );
+        assert_eq!(row.result, "failure: role_denied", "{what}");
+        // the telemetry status names the key that tried (lab PR 213)
+        let named = if verb.op == "telemetry_status" {
+            fp(&spare[0])
+        } else {
+            String::new()
+        };
+        assert_eq!(row.key_fp, named, "{what}");
+    }
+}
+
+/// Lab PR 263's review, M-2: keys of the default roles (`unlock,audit-read`,
+/// an admin.pub line without roles — `install.sh`'s bootstrap key among
+/// them) reach the unlock, the response status and the telemetry status,
+/// by their design, and are refused every other verb.
+#[test]
+fn a_key_of_the_default_roles_does_what_they_allow_and_nothing_else() {
+    const REACHED: [&str; 3] = ["unlock", "response_status", "telemetry_status"];
+    let k = keys();
+    let spare = spare_keys();
+    for verb in verbs() {
+        let fx = Fixture::with_admin_pub(
+            &[admin_line(&spare[0], ""), admin_line(&spare[1], "")].concat(),
+        );
+        let signers: Vec<&SigningKey> = spare.iter().take(designed_quorum(verb.op)).collect();
+        let (reply, row) = send_verb(&fx, &verb, &k, &signers);
+        if REACHED.contains(&verb.op) {
+            assert_ne!(result_of(&reply), AdminResult::RoleDenied, "{}", verb.op);
+            assert_ne!(row.result, "failure: role_denied", "{}", verb.op);
+            assert_eq!(row.key_fp, fp(&spare[0]), "{}: verified", verb.op);
+        } else {
+            assert_eq!(
+                reply,
+                (verb.refused)(AdminResult::RoleDenied, true),
+                "{}",
+                verb.op
+            );
+            assert_eq!(row.result, "failure: role_denied", "{}", verb.op);
+        }
+    }
+}
+
+/// Lab PR 263's review, M-2: the agent asks a shutdown for the quorum the
+/// watchdog verifies its marker by (`shutdown_marker::SHUTDOWN_QUORUM`):
+/// with one key less it signs no "success" and writes no marker. Both the
+/// table and the expected refusal take the watchdog's constant, not a
+/// number of the agent's own.
+#[test]
+fn the_shutdown_needs_the_quorum_the_watchdog_verifies() {
+    assert_eq!(
+        <ShutdownRequest as Signed>::RULE.quorum,
+        Quorum::Of(SHUTDOWN_QUORUM)
+    );
+    let k = keys();
+    let holders = [&k.a, &k.b];
+    let quorum = usize::from(SHUTDOWN_QUORUM);
+    assert!((2..=holders.len()).contains(&quorum), "{quorum}");
+    let fx = Fixture::new(&k);
+    let shutdown = OperationExtra::Shutdown(ShutdownExtra { grace_secs: 30 });
+    let short = AdminResult::QuorumNotMet {
+        required: SHUTDOWN_QUORUM,
+        provided: SHUTDOWN_QUORUM - 1,
+    };
+    let (reply, row) = send(&fx, shutdown.clone(), &holders[..quorum - 1]);
+    assert_eq!(reply, AdminMessage::ShutdownResult(short));
+    assert_eq!(row.result, failure(&short));
+    assert!(!fx.marker.exists(), "no marker for the watchdog");
+    let (reply, row) = send(&fx, shutdown, &holders[..quorum]);
+    assert_eq!(reply, AdminMessage::ShutdownResult(AdminResult::Success));
+    assert_eq!(row.result, "success");
+    assert!(fx.marker.exists(), "the marker for the watchdog");
+}
+
+/// Every role a key can hold is in `EVERY_ROLE` (or is `all`).
+#[test]
+fn every_role_is_in_the_role_tests() {
+    for b in 0..=u8::MAX {
+        if let Ok(role) = Role::try_from(b) {
+            assert!(
+                role == Role::All || EVERY_ROLE.contains(&role),
+                "{role:?}: place it in EVERY_ROLE"
+            );
         }
     }
 }
