@@ -324,6 +324,9 @@ mod tests {
     /// copies that drifted (the hook's, `bpf_cmd_name`'s) and the four
     /// that happened to be right (the BPF rules', the agent's `OBJ_GET` and
     /// `MAP_FREEZE` wrappers, a decision test's) all read this module now.
+    /// Wave 4 restructure, R09a (lab PR 253): `crates/` too — the BPF rules
+    /// and the decision test moved to nn-core (R08b), the wrappers to
+    /// nn-linux with the self-defence (R09a), out of the directories below.
     #[test]
     fn no_other_copy_of_a_bpf_cmd_number() {
         assert_eq!(
@@ -349,6 +352,7 @@ mod tests {
             "antitamper-bpf/src",
             "cli/src",
             "common/src",
+            "crates",
             "watchdog/src",
             "watchdog/tests",
             "xtask/src",
@@ -361,6 +365,12 @@ mod tests {
                 .iter()
                 .any(|f| f.ends_with("agent-ebpf/src/bpf_defense.rs")),
             "the eBPF sources are in the scan"
+        );
+        assert!(
+            files
+                .iter()
+                .any(|f| f.ends_with("crates/nn-linux/src/anti_tamper/bpf_defense.rs")),
+            "the crates are in the scan"
         );
         let own = root.join("common/src/bpf_cmd.rs");
         let mut found = Vec::new();
