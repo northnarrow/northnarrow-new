@@ -9,6 +9,10 @@
 //! close, its clock — until R04b splits the window from its kernel sync.
 //! The rules that read them move to nn-core; they reach the window through
 //! their host ([`crate::posture::host::PostureAgent::InstallerWindow`]).
+//! R10 (lab PR 259): the window's ceiling too, which the agent clamps a
+//! signed grant to and nn-admin clamps `--window-secs` to before it signs
+//! ([`MAX_TRUSTED_INSTALLER_WINDOW_SECS`], cut verbatim; the agent's module
+//! re-exports it).
 
 /// The agent's OWN systemd unit paths — the ONLY units whose
 /// `NN-L-FIM-009` verdict the override downgrades. A write to any other
@@ -41,3 +45,10 @@ pub struct WindowGrant {
     /// The window's deadline, wall clock (UTC, RFC 3339 to the second).
     pub expires_at: String,
 }
+
+/// Hard ceiling on a grant window. A grant whose `window_secs` exceeds
+/// this is clamped down — a captured or fat-fingered grant can never
+/// hold the FS pin open longer than this, and the operator lifecycle
+/// (arm → install → `systemctl restart`) closes it far sooner in
+/// practice. 10 minutes is generous for an in-place upgrade.
+pub const MAX_TRUSTED_INSTALLER_WINDOW_SECS: u32 = 600;

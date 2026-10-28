@@ -1955,8 +1955,7 @@ fn main() -> ExitCode {
             // Clamp client-side to the agent's ceiling (the agent also
             // clamps; this gives the operator a clear message instead
             // of a silent server-side reduction).
-            let max =
-                northnarrow_agent::anti_tamper::trusted_installer::MAX_TRUSTED_INSTALLER_WINDOW_SECS;
+            let max = nn_core::anti_tamper::trusted_installer::MAX_TRUSTED_INSTALLER_WINDOW_SECS;
             let clamped = window_secs.clamp(1, max);
             if clamped != window_secs {
                 eprintln!(
@@ -3414,9 +3413,11 @@ fn parse_roles_csv(s: &str) -> anyhow::Result<Vec<nn_proto::admin_signed_payload
     // keyword table so `rotate-keys add --new-roles` can grant EVERY
     // role the agent understands (fim-*, canary-*, net-*, triage, …),
     // not the five-keyword subset this CLI used to hard-code — which
-    // made canary-manage / fim-manage ungrantable from the CLI.
+    // made canary-manage / fim-manage ungrantable from the CLI. R10 (lab
+    // PR 259): nn-proto's `admin_quorum`, the parser the agent's
+    // `admin_auth` reads admin.pub with (its `parse_role_list` wraps it).
     let tight: Vec<&str> = s.split(',').map(str::trim).collect();
-    northnarrow_agent::anti_tamper::admin_auth::parse_role_list(&tight.join(","))
+    nn_proto::admin_quorum::parse_role_list(&tight.join(","))
         .map_err(|e| anyhow::anyhow!("--new-roles: {e}"))
 }
 

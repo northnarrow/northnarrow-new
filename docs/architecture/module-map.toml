@@ -588,9 +588,15 @@ planned = false
 # (`DEFAULT_DETECTIONS_LIMIT`, what `limit = 0` means on the wire) went to
 # nn-proto's `admin_signed_payload` with the verb's fields, and nn-admin's
 # `detections` names it there: its reference to `detection_store` is gone.
+# Lab PR 259 (R10): 21 → 20, nn-admin 7 → 6. The trusted-installer window's
+# ceiling (`MAX_TRUSTED_INSTALLER_WINDOW_SECS`, what nn-admin clamps
+# `--window-secs` to) went to nn-core's `anti_tamper::trusted_installer`
+# with the window's vocabulary (nn-linux's module re-exports it), and
+# nn-admin's role list parse names nn-proto's `admin_quorum`, which the
+# agent's `admin_auth` wraps: `nn_admin.rs` names `anti_tamper` no more.
 
 [ratchet]
-nn-admin = 7
+nn-admin = 6
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0
