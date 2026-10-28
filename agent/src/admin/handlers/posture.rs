@@ -27,9 +27,11 @@ use crate::posture::{AdminReleaseError, PostureMachine};
 /// (Tappa 8 A7) and surfaces as `UnknownOperation` on the wire.
 ///
 /// On verify success, mutates the posture machine to the requested
-/// target via [`PostureMachine::admin_force_state_with_token`]
-/// (Tappa 8 A10), which fires the COMBAT entry/release hooks per
-/// §12.2 if the direction crosses the COMBAT boundary.
+/// target via [`PostureMachine::admin_force_state_signed_by`]
+/// (Tappa 8 A10, lab PR 245: the token, whether a signer holds `unlock`,
+/// and the signers a COMBAT it enters cites), which fires the COMBAT
+/// entry/release hooks per §12.2 if the direction crosses the COMBAT
+/// boundary.
 ///
 /// External audit NN-AUD-083: leaving COMBAT this way releases the
 /// containment exactly like `unlock`, so it also needs a signer that

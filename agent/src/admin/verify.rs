@@ -256,7 +256,11 @@ pub(super) struct Verified<'a, R: Signed> {
 }
 
 impl<'a, R: Signed> Verified<'a, R> {
-    /// The request, as verified.
+    /// The request, as verified. The signatures cover its payload alone: a
+    /// field of the request beside it is not signed — today
+    /// `ConfigOverlaySetRequest::content`, which its handler binds to the
+    /// signed hash and length before anything reads it. A verb given such a
+    /// field binds it the same way (lab PR 263's review, N-4).
     pub(super) fn request(&self) -> &'a R {
         self.request
     }
@@ -324,7 +328,7 @@ pub(super) fn signed<'a, R: Signed, T>(
     refuse: impl FnOnce(AdminResult) -> T,
     handle: impl FnOnce(Verified<'a, R>) -> T,
 ) -> T {
-    match verify(request, auth, now_unix_secs()) {
+    match verify(request, auth) {
         Ok(verified) => {
             *fps_out = verified.signers.fingerprints.clone();
             handle(verified)
@@ -336,11 +340,7 @@ pub(super) fn signed<'a, R: Signed, T>(
     }
 }
 
-fn verify<'a, R: Signed>(
-    request: &'a R,
-    auth: &ConnAuth<'_>,
-    server_now: u64,
-) -> Result<Verified<'a, R>, Refusal> {
+fn verify<'a, R: Signed>(request: &'a R, auth: &ConnAuth<'_>) -> Result<Verified<'a, R>, Refusal> {
     let rule = R::RULE;
     let (min_distinct, bootstrap) = match rule.quorum {
         Quorum::Of(n) => (n, false),
@@ -349,6 +349,9 @@ fn verify<'a, R: Signed>(
             (if armed { 1 } else { n }, armed)
         }
     };
+    // The server's clock for the skew window, read after the bootstrap
+    // gate's files, as before the pipeline (lab PR 263's review, N-2).
+    let server_now = now_unix_secs();
     let each: &[Role] = match rule.roles {
         Roles::Each(roles) => roles,
         Roles::AnyOf(_) => &[],
@@ -458,11 +461,9 @@ pub(super) fn bootstrap_paths(
     crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(admin_pub.to_path_buf())
 }
 
-/// Shared mapper from [`AdminAuthError`] to the wire
-/// [`AdminResult`]. Identical to the inline matches in
-/// dispatch_shutdown / dispatch_force_posture; factored out by
-/// A13 because dispatch_rotate_keys_add / _revoke would
-/// duplicate the same 11-arm match otherwise.
+/// The one mapper from [`AdminAuthError`] to the wire [`AdminResult`]
+/// (A13 factored it out of the rotate-keys handlers; with R11d no verb
+/// keeps a copy of its own — shutdown and force-posture had one, inline).
 pub(super) fn map_admin_auth_error(e: AdminAuthError, op_for_log: &str) -> AdminResult {
     match e {
         AdminAuthError::NoPendingChallenge => AdminResult::NoPendingChallenge,

@@ -35,9 +35,9 @@ fn empty_detections(result: AdminResult) -> DetectionsResponse {
 /// JSONL body. The read is bounded (see
 /// [`crate::detection_store::read_last_n`]); the body is capped at the
 /// wire soft cap and `entries_truncated` is set if the matching set
-/// would overflow the frame. Like the FIM/net read verbs, the store
-/// path is the build-default constant, so no extra serve-time state is
-/// threaded.
+/// would overflow the frame. The store's files and the key its rows are
+/// verified with are the detection state's (lab PR 263); a server without
+/// that state refuses the read.
 pub(in crate::admin) fn dispatch_detections(
     req: DetectionsRequest,
     auth: &ConnAuth<'_>,
@@ -68,7 +68,10 @@ fn detections(
     // refused, as set-status is: it read the built-in paths and served
     // their rows unverified (external audit NN-AUD-112's check skipped).
     let Some(state) = det_state else {
-        warn!("detections: the detection store is not wired this boot (no agent key) — refused");
+        warn!(
+            "detections: no detection store on this server (the agent key did not load \
+             this boot, or the server was started without it) — refused"
+        );
         return empty_detections(AdminResult::UnknownOperation);
     };
     let extra = v.extra();
