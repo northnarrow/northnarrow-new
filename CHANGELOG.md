@@ -417,6 +417,32 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- Three host tests failed now and then under load, each on a race of
+  its own (lab PR 258; the flakes lab PRs 254 and 256 recorded and lab
+  PR 234's hotfix saw); the first race was the product's. The
+  quarantine kept the repairs of a vault's index (external audit
+  CMB-017) in one list for the process, and every executor's record of
+  a quarantine took the whole list, even a refused one: the COMBAT
+  actuator's NEUTRALIZE tests took the note nn-linux's
+  `a_corrupt_index_is_rebuilt_from_the_meta_files` was waiting for. The
+  notes are kept per vault now, its directory the key, and an executor
+  takes its own vault's; the agent has one vault, its executor's and the
+  exec quarantine's, and records the same notes at the same quarantine.
+  The agent's `cow::fanotify::tests::own_threads_and_tgid` asked whether
+  a thread `join` had returned for was still listed, then read its
+  `status`: the kernel releases the thread after `join` returns, and a
+  release between the two reads left a listed thread without a
+  `status`. It reads the `status` first now, and looks at a thread it
+  holds too. The watchdog's `sd_notify_reaches_an_abstract_notify_socket`
+  closed its listener and expected the next `READY=1` refused, but a
+  child another test was spawning held a copy of the listener's
+  descriptor until its exec, and the socket took the datagram: the
+  listener is shut down before it is closed, and so are the sockets of
+  two tests with the same race (the watchdog's
+  `nothing_listening_at_the_path_is_absent_not_unresponsive`, which
+  failed so in this lot's runs, and nn-linux's
+  `ready_reaches_an_abstract_notify_socket`). No assertion weakened, no
+  sleep added.
 - The privileged suites wrote the installed agent's evidence, and the
   boot check's report did not say what was wrong (lab PR 256; lot 255's
   finding). Run as root on the lab guests and in the KVM CI, where an

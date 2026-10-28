@@ -520,14 +520,36 @@ mod tests {
         assert!(is_own_thread(me as i32));
         assert!(!is_own_thread(0));
         assert_eq!(tgid_of(me as i32), Some(me));
-        let child = std::thread::spawn(|| {
+        // Another thread of ours, held while it is looked at: listed, and
+        // its thread group is this process (its tid is not our pid).
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let held = std::thread::spawn(move || {
             // SAFETY: gettid has no preconditions.
-            unsafe { libc::syscall(libc::SYS_gettid) as i32 }
-        })
-        .join()
-        .unwrap();
-        // the thread has exited by now: no longer listed
-        assert!(!is_own_thread(child) || tgid_of(child) == Some(me));
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+            tid_tx.send(tid).unwrap();
+            let _ = done_rx.recv();
+        });
+        let child = tid_rx.recv().unwrap();
+        assert_ne!(child, me as i32);
+        assert!(is_own_thread(child));
+        assert_eq!(tgid_of(child), Some(me));
+        drop(done_tx);
+        held.join().unwrap();
+        // Exited: no longer listed, or still listed and ours. `join`
+        // returns once the kernel has cleared the thread's tid (at its
+        // `exit_mm`), before it releases the task: `/proc` may list the
+        // thread a little longer, and both of its entries go with the
+        // release. Lab PR 258: the listing was read first, and a release
+        // between the two reads left a listed thread without a `status`
+        // (lab PR 254's flake); the `status` is read first now — a thread
+        // still listed after it was read had its `status` then.
+        let tgid = tgid_of(child);
+        let listed = is_own_thread(child);
+        assert!(
+            !listed || tgid == Some(me),
+            "tid {child}: listed {listed}, tgid {tgid:?}"
+        );
     }
 
     /// The blocked-task read works on this host for a thread of our own
