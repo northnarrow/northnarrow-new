@@ -1,3 +1,18 @@
+//! The signed trusted-installer grant (R11d, lab PR 263: from
+//! `admin_socket.rs`): the window an upgrade needs, armed for the signed
+//! span.
+
+use std::time::Instant;
+
+use tracing::{info, warn};
+
+use nn_proto::admin_protocol::{AdminResult, TrustedInstallerGrantRequest};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+
 /// FIM-009 self-upgrade (§15.1) — handle one
 /// [`TrustedInstallerGrantRequest`]. Verifies the signed grant (M=1
 /// quorum carrying [`Role::TrustedInstaller`], with the full nonce +
@@ -10,7 +25,7 @@
 /// M=1 today — like COMBAT reactivation — but expressed through
 /// `min_distinct` so a future hardening can require co-signers without
 /// touching this dispatcher.
-fn dispatch_trusted_installer_grant(
+pub(in crate::admin) fn dispatch_trusted_installer_grant(
     req: TrustedInstallerGrantRequest,
     auth: &ConnAuth<'_>,
     installer_override: Option<&TrustedInstallerOverride>,

@@ -155,7 +155,6 @@ planned = false
 # the offline engine on the Linux host), which the `nn-admin` binary passes
 # to nn-admin: the composition, as `chains`
 "admin_host" = "northnarrow-agent"
-"admin_socket" = "northnarrow-agent"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a.
 # R09b (lab PR 254): the phases, the attach permit the sensors' attach
 # takes, the degradations of a run (`boot::degradation`, `[shims.agent]`)
@@ -325,6 +324,9 @@ planned = false
 # buffer and the detection budget to nn-core, the same way.
 
 [shims.agent]
+# R11d (lab PR 263): the admin socket, split into `admin/*`; the agent
+# keeps its old path (`lib.rs`, `pub use admin as admin_socket`)
+"admin_socket" = "northnarrow-agent"
 # R10 (lab PR 259): the operator client's library half moved to nn-admin;
 # the agent keeps its path (`lib.rs`, `pub use nn_admin::admin_cli`)
 "admin_cli" = "nn-admin"

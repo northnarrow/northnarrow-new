@@ -24,6 +24,41 @@
 //! each request and [`FRAME_WRITE_TIMEOUT`] to take each reply. External
 //! audit NN-AUD-078 / NN-AUD-079: the challenge and the failure count live
 //! with the connection ([`ConnAuth`]).
+//!
+//! R11d (lab PR 263): `admin_socket.rs` cut into this module's parts —
+//! `transport` (the socket, its peers, the framing and the loop of one
+//! connection), `verify` (the verification of a signed request),
+//! `audit` (the signed row of each request) and `handlers` (the verbs,
+//! one file per family). `admin_socket` is the module's old path, kept
+//! as a shim in `lib.rs` until R17.
+
+mod audit;
+mod handlers;
+#[cfg(test)]
+mod tests;
+mod transport;
+mod verify;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use tokio::sync::Notify;
+
+use crate::canary::detector::CanaryIndexes;
+use crate::canary::registry::Registry;
+use crate::chainlog::RotatingChainLog;
+use crate::detection_store::StatusEvent;
+use crate::fim::drain::DriftRateLimiter;
+use crate::fim::recompute::BaselineRecomputeSender;
+
+pub(crate) use audit::AuditClient;
+pub use handlers::canary::canary_path;
+pub use handlers::net::DEFAULT_NETFLOW_JSONL_PATH;
+pub use transport::{
+    serve, serve_with_audit_log, serve_with_canary_state, serve_with_fim_state,
+    serve_with_marker_path, unlink_socket, FOREIGN_PEER_KIND,
+};
 
 /// External audit WDG-007: the socket's identity and its watch.
 pub mod socket_watch;

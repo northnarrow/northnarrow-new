@@ -1,13 +1,61 @@
+//! The admin socket's tests (R11d, lab PR 263: `admin_socket.rs`'s
+//! `mod tests`, whole), over every part of the module.
+
+use super::audit::*;
+use super::handlers::canary::*;
+use super::handlers::detections::*;
+use super::handlers::fim::*;
+use super::handlers::installer::*;
+use super::handlers::keys::*;
+use super::handlers::net::*;
+use super::handlers::posture::*;
+use super::handlers::read::*;
+use super::handlers::response::*;
+use super::handlers::shutdown::*;
+use super::handlers::status::*;
+use super::handlers::unlock::*;
+use super::handlers::*;
+use super::transport::*;
+use super::verify::*;
 use super::*;
+
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::Result;
+use parking_lot::Mutex;
+
+use nn_proto::admin_protocol::{
+    decode_frame, encode_frame, AdminMessage, CanaryBurnRequest, CanaryDeployRequest,
+    CanaryDeployResponse, CanaryListRequest, CanaryListResponse, CanaryRefreshRequest, Challenge,
+    DetectionSetStatusRequest, DetectionsRequest, FimReportRequest, FimReportResponse,
+    ForcePostureRequest, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest,
+    NetFlowsResponse, NetListenersRequest, NetResolveRequest, NetResolveResponse,
+    ResponseReleaseRequest, ResponseReleaseResponse, ResponseRestoreRequest, ResponseStatusRequest,
+    RotateKeysAddRequest, SignedUnlockRequest, StatusResponse, TelemetryStatusRequest,
+    TelemetryStatusResponse, TrustedInstallerGrantRequest, UnlockResult,
+};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
 use crate::admin_cli::{run_status, run_unlock, run_verify_keys};
+use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
+use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+use crate::audit::AuditLog;
+use crate::canary::registry::{CanaryToken, CanaryTokenDraft, RegistryError};
 use crate::os_rng::OsRng;
+use crate::posture::PostureMachine;
+use crate::shutdown_marker;
 use ed25519_dalek::SigningKey;
 use nn_model::posture_types::PostureKind;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
 /// Spin up a tokio task running the admin server against a tempdir

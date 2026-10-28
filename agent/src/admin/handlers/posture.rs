@@ -1,3 +1,17 @@
+//! The signed `force-posture` (R11d, lab PR 263: from `admin_socket.rs`):
+//! the posture the administrator orders, out of COMBAT only with a signer
+//! holding `unlock`.
+
+use tracing::{error, info, warn};
+
+use nn_proto::admin_protocol::{AdminResult, ForcePostureRequest};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::audit::DispatchNotes;
+use crate::admin::verify::now_unix_secs;
+use crate::anti_tamper::admin_auth::{AdminAuthError, ConnAuth};
+use crate::posture::{AdminReleaseError, PostureMachine};
+
 /// Tappa 8 A10 — handle one [`ForcePostureRequest`] (design §4 +
 /// §12.2). Distinct from the existing `cfg(debug-trigger)`
 /// `DebugForcePosture` arm: that one bypasses every authentication
@@ -28,7 +42,7 @@
 /// External audit ASK-015: the journal line and the audit row (through
 /// `notes.force_from`) name the state the force left, as the posture
 /// machine read it under its lock; they named the state it entered.
-fn dispatch_force_posture(
+pub(in crate::admin) fn dispatch_force_posture(
     req: ForcePostureRequest,
     auth: &ConnAuth<'_>,
     posture: &PostureMachine,

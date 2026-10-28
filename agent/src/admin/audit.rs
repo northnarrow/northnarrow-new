@@ -1,3 +1,18 @@
+//! The signed audit row of each admin request (R11d, lab PR 263: from
+//! `admin_socket.rs`): who connected, what was asked and what was
+//! answered, as design §9.1 records them.
+
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
+use tracing::warn;
+
+use nn_proto::admin_protocol::{AdminMessage, AdminResult, UnlockResult};
+use nn_proto::admin_signed_payload::OperationExtra;
+
+use crate::audit::{AuditEntryDraft, AuditLog};
+
 /// A row the agent writes from one admin frame fits the line caps of the
 /// chain readers: the operator's strings come from one signed frame of at
 /// most `MAX_FRAME_BODY`, a JSON escape is at most six bytes for one, and
@@ -43,14 +58,14 @@ pub(crate) struct AuditClient {
 /// carries, for the audit row. Filled by `dispatch`, read by
 /// [`emit_audit_for`]; next to the signers' fingerprints (`matched_fps`).
 #[derive(Debug, Default)]
-struct DispatchNotes {
+pub(super) struct DispatchNotes {
     /// External audit ASK-015: the posture a force-posture left, when the
     /// transition was applied (also a no-op to the same state). `None`
     /// when it was refused: the state did not change.
-    force_from: Option<nn_model::posture_types::PostureKind>,
+    pub(super) force_from: Option<nn_model::posture_types::PostureKind>,
     /// Lab PR 217: a force-posture out of COMBAT — what its release
     /// released, or why it did not (the posture then stayed COMBAT).
-    force_release: Option<std::result::Result<String, String>>,
+    pub(super) force_release: Option<std::result::Result<String, String>>,
 }
 
 /// Inspect the (request, reply) pair after `dispatch` returns
@@ -65,7 +80,7 @@ struct DispatchNotes {
 // verified by no one) and for failure paths; populated for successful
 // signed-payload ops, the signed unlock included (lab PR 217: its row
 // names the signer).
-fn emit_audit_for(
+pub(super) fn emit_audit_for(
     msg: &AdminMessage,
     reply: &AdminMessage,
     client: &AuditClient,

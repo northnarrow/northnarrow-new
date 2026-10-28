@@ -1,3 +1,22 @@
+//! The FIM verbs (R11d, lab PR 263: from `admin_socket.rs`): `fim
+//! baseline`, `fim status` and `fim report`.
+
+use std::path::Path;
+
+use tracing::{info, warn};
+
+use nn_proto::admin_protocol::{
+    AdminResult, FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest,
+    FimStatusResponse,
+};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use super::read::{extract_ts_field, read_tail_jsonl};
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::{AdminReadPaths, FimAdminState};
+use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::fim::recompute::RecomputeReason;
+
 // PHASE_D_004: `fps_out` populated on success with the matched
 // signer fingerprint (1-of-N quorum → one fingerprint).
 //
@@ -10,7 +29,7 @@
 /// callsite that hasn't migrated to `serve_with_fim_state` —
 /// the dispatcher falls back to the C6 info-log shape ("scheduled
 /// for next restart") so legacy unit-test fixtures stay green.
-fn dispatch_fim_baseline(
+pub(in crate::admin) fn dispatch_fim_baseline(
     req: FimBaselineRequest,
     auth: &ConnAuth<'_>,
     fim_state: Option<&FimAdminState>,
@@ -75,7 +94,7 @@ fn dispatch_fim_baseline(
 /// stale test fixture doesn't accidentally serve stale data; the
 /// production code path always supplies state via
 /// `serve_with_fim_state`.
-fn dispatch_fim_status(
+pub(in crate::admin) fn dispatch_fim_status(
     req: FimStatusRequest,
     auth: &ConnAuth<'_>,
     fim_state: Option<&FimAdminState>,
@@ -215,7 +234,7 @@ fn count_and_last_ts_jsonl(path: &Path) -> (u32, String) {
 /// External audit NN-AUD-080/082: the drift log configured by
 /// `--fim-drift-file` (not the built-in path), newest rows first,
 /// rotated archives included ([`read_tail_jsonl`]).
-fn dispatch_fim_report(
+pub(in crate::admin) fn dispatch_fim_report(
     req: FimReportRequest,
     auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,

@@ -1,3 +1,20 @@
+//! The response verbs (R11d, lab PR 263: from `admin_socket.rs`): `response
+//! status`, `release` and `restore`, and `remediate ransomware`.
+
+use tracing::{info, warn};
+
+use nn_proto::admin_protocol::{
+    AdminResult, RemediateRansomwareRequest, RemediateRansomwareResponse, ResponseReleaseRequest,
+    ResponseReleaseResponse, ResponseRestoreRequest, ResponseRestoreResponse,
+    ResponseStatusRequest, ResponseStatusResponse,
+};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::ResponseAdminState;
+use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::posture::PostureMachine;
+
 // ── External audit CMB-016 — undoing a response ───────────────────
 
 fn empty_response_status(result: AdminResult) -> ResponseStatusResponse {
@@ -18,7 +35,7 @@ fn empty_response_status(result: AdminResult) -> ResponseStatusResponse {
 /// COMBAT stage. Read-only; `audit-read`, the role every key carries by
 /// default, so the operator who undoes a response sees what there is to
 /// undo.
-fn dispatch_response_status(
+pub(in crate::admin) fn dispatch_response_status(
     req: ResponseStatusRequest,
     auth: &ConnAuth<'_>,
     posture: &PostureMachine,
@@ -95,7 +112,7 @@ fn dispatch_response_status(
 /// contained back to the cgroup it came from, by its containment record
 /// (external audit CMB-010: never the root cgroup, and only while the pid
 /// still names the process moved). `response-manage`.
-fn dispatch_response_release(
+pub(in crate::admin) fn dispatch_response_release(
     req: ResponseReleaseRequest,
     auth: &ConnAuth<'_>,
     state: Option<&ResponseAdminState>,
@@ -195,7 +212,7 @@ fn dispatch_response_release(
 /// unless `--to` says otherwise; never over an existing file, through a
 /// link, or under a protected prefix (external audit CMB-026). The entry
 /// stays in the vault. `response-manage`: a restore can put malware back.
-fn dispatch_response_restore(
+pub(in crate::admin) fn dispatch_response_restore(
     req: ResponseRestoreRequest,
     auth: &ConnAuth<'_>,
     state: Option<&ResponseAdminState>,
@@ -261,7 +278,7 @@ fn dispatch_response_restore(
 /// journal, the files the process tree rewrote (or every file copied since
 /// the time). The agent does the work under the rules of
 /// [`crate::cow::restore`] and signs one `cow_restore` row per file.
-fn dispatch_remediate_ransomware(
+pub(in crate::admin) fn dispatch_remediate_ransomware(
     req: RemediateRansomwareRequest,
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,

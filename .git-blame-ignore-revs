@@ -1,0 +1,9 @@
+# Commits that only re-indent or reflow lines (plan §4.1 rule 1). `git
+# blame --ignore-revs-file .git-blame-ignore-revs` skips them (once per
+# clone: `git config blame.ignoreRevsFile .git-blame-ignore-revs`);
+# GitHub's blame view reads this file by itself. A rebase changes the
+# hashes: update them with it.
+
+# R11d (lab PR 263): admin_socket.rs's test module dedented into
+# agent/src/admin/tests.rs (rustfmt reflow only)
+5c9c0dd3acbdf1b6e4294b66451abed3c0dd52f3

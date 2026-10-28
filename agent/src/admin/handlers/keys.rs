@@ -1,3 +1,19 @@
+//! The signed `rotate-keys add` and `revoke` (R11d, lab PR 263: from
+//! `admin_socket.rs`): admin.pub rewritten atomically, protected again and
+//! reloaded.
+
+use std::path::Path;
+
+use tracing::{info, warn};
+
+use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
+use ed25519_dalek::VerifyingKey;
+use nn_proto::admin_protocol::{AdminResult, RotateKeysAddRequest, RotateKeysRevokeRequest};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::anti_tamper::admin_auth::ConnAuth;
+
 /// at-authz-1 verify-item 1: re-register the rotated admin.pub inode in
 /// `PROTECTED_INODES` after a rotate-keys rewrite. The atomic rewrite does
 /// tmp-write + `rename(2)`, installing a NEW inode the boot-time
@@ -41,7 +57,7 @@ fn reregister_admin_pub_after_rotate(
 /// External audit NN-AUD-084: the new key's roles must be a subset of
 /// what the matched signers hold, else `AdminResult::RoleDenied` and
 /// admin.pub is untouched.
-fn dispatch_rotate_keys_add(
+pub(in crate::admin) fn dispatch_rotate_keys_add(
     req: RotateKeysAddRequest,
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
@@ -223,7 +239,7 @@ fn dispatch_rotate_keys_add(
 /// checked.
 ///
 /// [`AdminKey::authorizes`]: nn_proto::admin_quorum::AdminKey::authorizes
-fn role_beyond_signers(
+pub(in crate::admin) fn role_beyond_signers(
     roles: &[Role],
     signers: &[nn_proto::admin_quorum::AdminKey],
 ) -> Option<Role> {
@@ -247,7 +263,7 @@ fn role_beyond_signers(
 /// LAST remaining key — that would soft-brick the agent
 /// (`AdminResult::InvalidSignature` rather than a dedicated
 /// variant; the operator-facing detail is in the agent's own log).
-fn dispatch_rotate_keys_revoke(
+pub(in crate::admin) fn dispatch_rotate_keys_revoke(
     req: RotateKeysRevokeRequest,
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,

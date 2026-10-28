@@ -1,3 +1,19 @@
+//! The status verbs (R11d, lab PR 263: from `admin_socket.rs`): the
+//! unsigned public status and the signed telemetry status.
+
+use tracing::warn;
+
+use nn_proto::admin_protocol::{
+    AdminResult, StatusResponse, TelemetryStatusRequest, TelemetryStatusResponse,
+};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::ResponseAdminState;
+use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};
+use crate::posture::PostureMachine;
+
 /// The whole status, telemetry included: the reply to the signed
 /// [`TelemetryStatusRequest`] (external audit ASK-009, lab PR 213).
 fn telemetry_status(
@@ -111,7 +127,7 @@ fn telemetry_status(
 /// COMBAT evidence gaps, the encrypted-flow counts) is not even computed:
 /// it told a local root without an admin key how much the agent was losing
 /// — the feedback of a ring flood — and is the signed verb's.
-fn public_status(
+pub(in crate::admin) fn public_status(
     posture: &PostureMachine,
     isolator: &NetworkIsolator,
     response_state: Option<&ResponseAdminState>,
@@ -140,7 +156,7 @@ const TELEMETRY_STATUS_ROLES: [Role; 2] = [Role::AuditRead, Role::TelemetryRead]
 /// `nn-admin status --key` / `nn-admin net status --key` (external audit
 /// ASK-009, lab PR 213): the whole status, 1-of-N, `audit-read` or
 /// `telemetry-read` ([`TELEMETRY_STATUS_ROLES`]); one audit row per request.
-fn dispatch_telemetry_status(
+pub(in crate::admin) fn dispatch_telemetry_status(
     req: TelemetryStatusRequest,
     auth: &ConnAuth<'_>,
     posture: &PostureMachine,

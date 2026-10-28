@@ -1,3 +1,19 @@
+//! The signed `shutdown` (R11d, lab PR 263: from `admin_socket.rs`): a
+//! verified 2-of-N request writes the marker the watchdog verifies, then
+//! signals the agent's exit.
+
+use std::path::Path;
+
+use tracing::{error, info, warn};
+
+use nn_proto::admin_protocol::{AdminResult, ShutdownRequest};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::verify::now_unix_secs;
+use crate::admin::ShutdownSignal;
+use crate::anti_tamper::admin_auth::{AdminAuthError, ConnAuth};
+use crate::shutdown_marker::{self, ShutdownMarker};
+
 /// Handle one [`ShutdownRequest`] (Tappa 8 A7, design §10.3).
 /// On verify success, atomically write the shutdown-authorisation
 /// marker (so the watchdog will stand down when it observes the
@@ -20,7 +36,7 @@
 // matched signer. dispatch() reads this for emit_audit_for
 // so the audit chain records WHICH operators authorised each
 // signed action.
-fn dispatch_shutdown(
+pub(in crate::admin) fn dispatch_shutdown(
     req: ShutdownRequest,
     auth: &ConnAuth<'_>,
     marker_path: &Path,

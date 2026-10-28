@@ -1,3 +1,17 @@
+//! The signed `unlock` (R11d, lab PR 263: from `admin_socket.rs`): a
+//! verified request releases COMBAT through the posture, and the reply says
+//! what the release did.
+
+use tracing::{error, info};
+
+use nn_proto::admin_protocol::{AdminResult, SignedUnlockRequest, SignedUnlockResponse};
+use nn_proto::admin_signed_payload::{OperationCode, Role};
+
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};
+use crate::posture::{AdminReleaseError, PostureMachine};
+
 /// Lab PR 217 (NN-AUD-243 residue, capability C17) — handle one signed
 /// `unlock` (`OperationCode::Unlock`, 1-of-N, `Role::Unlock`): verify, run
 /// the release through the posture — the ladder stood down, the iptables
@@ -9,7 +23,7 @@
 /// why, and the posture stays COMBAT (external audit ASK-017 / NN-AUD-243:
 /// this was `Success`, recorded "success", whatever the teardown did). The
 /// signer's fingerprint goes to the audit row.
-fn dispatch_signed_unlock(
+pub(in crate::admin) fn dispatch_signed_unlock(
     req: SignedUnlockRequest,
     auth: &ConnAuth<'_>,
     posture: &PostureMachine,

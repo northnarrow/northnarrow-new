@@ -1,3 +1,37 @@
+//! The admin socket's transport (R11d, lab PR 263: from
+//! `admin_socket.rs`): the bind and the accept loop, the table of
+//! connections, the peer's credentials and identity, the framing, and the
+//! loop of one connection — read a frame, have it dispatched and audited
+//! off the runtime, write the reply.
+
+use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use parking_lot::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::sync::Notify;
+use tracing::{error, info, warn};
+
+use nn_proto::admin_protocol::{decode_frame, encode_frame, AdminMessage, MAX_FRAME_BODY};
+
+use super::audit::{emit_audit_for, AuditClient, DispatchNotes};
+use super::handlers::dispatch;
+use super::{
+    socket_watch, status_polls, AdminReadPaths, CanaryAdminState, DetectionAdminState,
+    FimAdminState, ResponseAdminState, ShutdownSignal, StatusPolls,
+};
+use crate::anti_tamper::admin_auth::{AdminAuth, ConnAuth};
+use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+use crate::audit::AuditLog;
+use crate::posture::PostureMachine;
+use crate::shutdown_marker::DEFAULT_MARKER_PATH;
+
 /// Bind the admin socket and run the accept loop forever. Returns
 /// only on a listener error that is not transient (external audit
 /// NN-AUD-077: EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED and EINTR
@@ -326,7 +360,7 @@ pub fn unlink_socket(path: &Path) {
 /// the watchdog open one at a time; 32 leaves room for a dashboard and
 /// operators while bounding the fds and buffers the admin plane can take
 /// from the agent (systemd's default soft limit is 1024).
-const MAX_ADMIN_CONNECTIONS: usize = 32;
+pub(super) const MAX_ADMIN_CONNECTIONS: usize = 32;
 
 /// Time a peer gets to send each request. nn-admin and the watchdog send
 /// at once (nn-admin's own timeout is 5 s); an interactive or hardware-token
@@ -340,14 +374,14 @@ const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOG_EVERY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy)]
-struct ConnLimits {
-    max_conns: usize,
-    read_timeout: Duration,
-    write_timeout: Duration,
+pub(super) struct ConnLimits {
+    pub(super) max_conns: usize,
+    pub(super) read_timeout: Duration,
+    pub(super) write_timeout: Duration,
 }
 
 impl ConnLimits {
-    const DEFAULT: Self = Self {
+    pub(super) const DEFAULT: Self = Self {
         max_conns: MAX_ADMIN_CONNECTIONS,
         read_timeout: FRAME_READ_TIMEOUT,
         write_timeout: FRAME_WRITE_TIMEOUT,
@@ -364,7 +398,7 @@ impl ConnLimits {
 /// A legitimate client waits on itself only for microseconds; a slow or
 /// idle one is the first to go. Only when every connection is mid-request
 /// is the newcomer refused.
-struct ConnSlots {
+pub(super) struct ConnSlots {
     limits: ConnLimits,
     table: Mutex<SlotTable>,
 }
@@ -383,7 +417,7 @@ struct SlotEntry {
 }
 
 impl ConnSlots {
-    fn new(limits: ConnLimits) -> Arc<Self> {
+    pub(super) fn new(limits: ConnLimits) -> Arc<Self> {
         Arc::new(Self {
             limits,
             table: Mutex::new(SlotTable::default()),
@@ -392,7 +426,7 @@ impl ConnSlots {
 
     /// A slot for a new connection, closing the longest-waiting one when
     /// the table is full; `None` when every connection is mid-request.
-    fn admit(self: &Arc<Self>) -> Option<ConnSlot> {
+    pub(super) fn admit(self: &Arc<Self>) -> Option<ConnSlot> {
         let mut table = self.table.lock();
         let made_room = table.live.len() >= self.limits.max_conns;
         if made_room {
@@ -424,18 +458,18 @@ impl ConnSlots {
     }
 
     #[cfg(test)]
-    fn live(&self) -> usize {
+    pub(super) fn live(&self) -> usize {
         self.table.lock().live.len()
     }
 }
 
 /// One connection's place in [`ConnSlots`]; leaving the table on drop.
-struct ConnSlot {
+pub(super) struct ConnSlot {
     id: u64,
     slots: Arc<ConnSlots>,
     evict: Arc<Notify>,
     /// Another connection was closed to admit this one.
-    made_room: bool,
+    pub(super) made_room: bool,
 }
 
 impl ConnSlot {
@@ -445,13 +479,13 @@ impl ConnSlot {
 
     /// From now on the connection waits on its peer — evictable. `false`
     /// when it was already evicted.
-    fn waiting(&self) -> bool {
+    pub(super) fn waiting(&self) -> bool {
         self.set_waiting(Some(Instant::now()))
     }
 
     /// The connection serves a request — not evictable. `false` when it
     /// was already evicted.
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.set_waiting(None)
     }
 
@@ -466,7 +500,7 @@ impl ConnSlot {
     }
 
     /// Resolves when a newcomer took this connection's place.
-    async fn evicted(&self) {
+    pub(super) async fn evicted(&self) {
         self.evict.notified().await;
     }
 }
@@ -480,7 +514,7 @@ impl Drop for ConnSlot {
 /// External audit NN-AUD-077: the `accept()` errors that say nothing about
 /// the listener — the fd table or kernel memory is short, or one peer gave
 /// up — and must not end the admin plane.
-fn accept_error_is_transient(e: &std::io::Error) -> bool {
+pub(super) fn accept_error_is_transient(e: &std::io::Error) -> bool {
     matches!(
         e.raw_os_error(),
         Some(
@@ -576,7 +610,7 @@ impl LogEvery {
 /// [`ConnAuth`]; a connection that used up its failures is closed after
 /// the reply.
 #[allow(clippy::too_many_arguments)]
-async fn handle_connection(
+pub(super) async fn handle_connection(
     mut stream: UnixStream,
     cred: PeerCred,
     slot: ConnSlot,
@@ -699,7 +733,7 @@ async fn handle_connection(
 /// External audit ASK-009 (lab PR 213): count an unsigned `status` and
 /// append the `status_polled` row that opens its peer's window. A failed
 /// append is a WARN; the reply is sent anyway, as for the other rows.
-fn note_status_poll(
+pub(super) fn note_status_poll(
     polls: &StatusPolls,
     client: &AuditClient,
     audit_log: Option<&Arc<Mutex<AuditLog>>>,
@@ -754,7 +788,7 @@ pub(crate) fn peer_allowed(cred: &PeerCred, own_euid: u32) -> bool {
 /// `getsockopt(SO_PEERCRED)` on `fd`. A failure, or a reply shorter or
 /// longer than a `struct ucred`, is a refusal: the credentials used to
 /// fall back to uid 0.
-fn peer_cred(fd: std::os::unix::io::RawFd) -> Result<PeerCred, PeerRefusal> {
+pub(super) fn peer_cred(fd: std::os::unix::io::RawFd) -> Result<PeerCred, PeerRefusal> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -790,7 +824,10 @@ fn peer_cred(fd: std::os::unix::io::RawFd) -> Result<PeerCred, PeerRefusal> {
 }
 
 /// External audit ASK-012: the peer on `fd`, if it may use the admin plane.
-fn screen_peer(fd: std::os::unix::io::RawFd, own_euid: u32) -> Result<PeerCred, PeerRefusal> {
+pub(super) fn screen_peer(
+    fd: std::os::unix::io::RawFd,
+    own_euid: u32,
+) -> Result<PeerCred, PeerRefusal> {
     let cred = peer_cred(fd)?;
     if peer_allowed(&cred, own_euid) {
         Ok(cred)
@@ -802,7 +839,7 @@ fn screen_peer(fd: std::os::unix::io::RawFd, own_euid: u32) -> Result<PeerCred, 
 /// The agent's own euid ([`peer_allowed`]).
 fn own_euid(socket_path: &Path) -> u32 {
     #[cfg(test)]
-    if let Some(euid) = tests::own_euid_override(socket_path) {
+    if let Some(euid) = super::tests::own_euid_override(socket_path) {
         return euid;
     }
     let _ = socket_path;
@@ -873,7 +910,7 @@ fn peer_pidfd(sock: std::os::unix::io::RawFd, pid: u32) -> PeerPidfd {
 /// (its pid could already name another process), never whatever holds
 /// the pid now. Failure to read is degrade-not-fail: the audit row is
 /// still written, with `<unknown>` / no exe.
-fn peer_identity(sock: std::os::unix::io::RawFd, cred: &PeerCred) -> AuditClient {
+pub(super) fn peer_identity(sock: std::os::unix::io::RawFd, cred: &PeerCred) -> AuditClient {
     let mut client = AuditClient {
         pid: cred.pid,
         uid: cred.uid,

@@ -1,6 +1,14 @@
+//! The read verbs' bounded reads (R11d, lab PR 263: from
+//! `admin_socket.rs`): the newest rows of a chain log, its rotated archives
+//! included.
+
+use std::path::Path;
+
+use nn_proto::admin_protocol::MAX_FRAME_BODY;
+
 /// Half a frame: the rest of a read verb's response fits in the other
 /// half.
-const READ_VERB_SOFT_CAP: usize = MAX_FRAME_BODY / 2;
+pub(in crate::admin) const READ_VERB_SOFT_CAP: usize = MAX_FRAME_BODY / 2;
 
 /// External audit NN-AUD-080: the body of a read verb — the newest rows
 /// of the chain log whose active file is `path` (the active file, then
@@ -9,7 +17,7 @@ const READ_VERB_SOFT_CAP: usize = MAX_FRAME_BODY / 2;
 /// left out. `keep` selects rows by their raw line. Returns `(jsonl_body,
 /// count, truncated)`; `truncated` means older matching rows were left
 /// out. The read bounds are in [`crate::chain_tail`].
-fn read_tail_jsonl(
+pub(in crate::admin) fn read_tail_jsonl(
     path: &Path,
     since: Option<u64>,
     keep: Option<&dyn Fn(&str) -> bool>,
@@ -42,7 +50,7 @@ fn format_iso8601_unix(unix_ts: u64) -> String {
 /// opening + closing `"` quotes. Returns `None` on a malformed
 /// line — the caller treats that as "include the entry" to
 /// avoid silently dropping evidence the operator might need.
-fn extract_ts_field(line: &str) -> Option<String> {
+pub(in crate::admin) fn extract_ts_field(line: &str) -> Option<String> {
     // Expected shape: {"ts":"<iso8601>", ...
     // We find `"ts":"` and then the next `"`.
     let key = "\"ts\":\"";

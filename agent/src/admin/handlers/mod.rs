@@ -1,8 +1,61 @@
+//! The admin verbs (R11d, lab PR 263: from `admin_socket.rs`): `dispatch`
+//! routes each request to its handler, one file per family of verbs.
+
+pub(in crate::admin) mod canary;
+pub(in crate::admin) mod config;
+pub(in crate::admin) mod detections;
+pub(in crate::admin) mod fim;
+pub(in crate::admin) mod installer;
+pub(in crate::admin) mod keys;
+pub(in crate::admin) mod net;
+pub(in crate::admin) mod posture;
+pub(in crate::admin) mod read;
+pub(in crate::admin) mod response;
+pub(in crate::admin) mod shutdown;
+pub(in crate::admin) mod status;
+pub(in crate::admin) mod unlock;
+
+use std::path::Path;
+
+use tracing::{error, warn};
+
+use nn_proto::admin_protocol::{AdminMessage, Challenge, UnlockResult};
+
+use super::audit::{AuditClient, DispatchNotes};
+use super::{
+    AdminReadPaths, CanaryAdminState, DetectionAdminState, FimAdminState, ResponseAdminState,
+    ShutdownSignal,
+};
+use crate::anti_tamper::admin_auth::{AdminAuthError, ConnAuth};
+use crate::anti_tamper::network_isolate::NetworkIsolator;
+use crate::anti_tamper::trusted_installer::TrustedInstallerOverride;
+use crate::posture::PostureMachine;
+
+use canary::{
+    dispatch_canary_burn, dispatch_canary_deploy, dispatch_canary_list, dispatch_canary_refresh,
+};
+use config::dispatch_config_overlay_set;
+use detections::{dispatch_detection_set_status, dispatch_detections};
+use fim::{dispatch_fim_baseline, dispatch_fim_report, dispatch_fim_status};
+use installer::dispatch_trusted_installer_grant;
+use keys::{dispatch_rotate_keys_add, dispatch_rotate_keys_revoke};
+use net::{
+    dispatch_net_fingerprint, dispatch_net_flows, dispatch_net_listeners, dispatch_net_resolve,
+};
+use posture::dispatch_force_posture;
+use response::{
+    dispatch_remediate_ransomware, dispatch_response_release, dispatch_response_restore,
+    dispatch_response_status,
+};
+use shutdown::dispatch_shutdown;
+use status::{dispatch_telemetry_status, public_status};
+use unlock::dispatch_signed_unlock;
+
 /// Synchronous request→reply mapping. All AdminAuth + PostureMachine
 /// methods are sync; we don't `await` between read and write inside
 /// `handle_connection`, so the dispatch itself can stay sync.
 #[allow(clippy::too_many_arguments)]
-fn dispatch(
+pub(super) fn dispatch(
     msg: AdminMessage,
     auth: &ConnAuth<'_>,
     posture: &PostureMachine,

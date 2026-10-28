@@ -1,8 +1,17 @@
+//! The verification of a signed admin request (R11d, lab PR 263: from
+//! `admin_socket.rs`): the server's clock of the skew window, and the
+//! answer on the wire of each refusal of `ConnAuth`'s verify.
+
+use nn_proto::admin_protocol::AdminResult;
+use tracing::warn;
+
+use crate::anti_tamper::admin_auth::AdminAuthError;
+
 /// Read the current wall-clock as UNIX seconds for the
 /// `verify_signed_payload_quorum` skew check. Production-only
 /// helper; tests can call the verify path directly with an
 /// injected `server_now_unix_secs` value.
-fn now_unix_secs() -> u64 {
+pub(super) fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -14,7 +23,7 @@ fn now_unix_secs() -> u64 {
 /// dispatch_shutdown / dispatch_force_posture; factored out by
 /// A13 because dispatch_rotate_keys_add / _revoke would
 /// duplicate the same 11-arm match otherwise.
-fn map_admin_auth_error(e: AdminAuthError, op_for_log: &str) -> AdminResult {
+pub(super) fn map_admin_auth_error(e: AdminAuthError, op_for_log: &str) -> AdminResult {
     match e {
         AdminAuthError::NoPendingChallenge => AdminResult::NoPendingChallenge,
         AdminAuthError::NonceMismatch => AdminResult::InvalidSignature,

@@ -1,3 +1,20 @@
+//! The detection verbs (R11d, lab PR 263: from `admin_socket.rs`): the
+//! signed read and the triage status change.
+
+use tracing::{info, warn};
+
+use nn_proto::admin_protocol::{
+    AdminResult, DetectionSetStatusRequest, DetectionSetStatusResponse, DetectionsRequest,
+    DetectionsResponse, MAX_FRAME_BODY,
+};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::audit::AuditClient;
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::DetectionAdminState;
+use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::detection_store::{Principal, StatusEvent};
+
 /// An auth-failure / empty [`DetectionsResponse`] carrying `result`.
 /// Also used for the "filter recognised nothing" success path.
 fn empty_detections(result: AdminResult) -> DetectionsResponse {
@@ -21,7 +38,7 @@ fn empty_detections(result: AdminResult) -> DetectionsResponse {
 /// would overflow the frame. Like the FIM/net read verbs, the store
 /// path is the build-default constant, so no extra serve-time state is
 /// threaded.
-fn dispatch_detections(
+pub(in crate::admin) fn dispatch_detections(
     req: DetectionsRequest,
     auth: &ConnAuth<'_>,
     det_state: Option<&DetectionAdminState>,
@@ -186,7 +203,7 @@ fn fail_set_status(result: AdminResult, id: u64) -> DetectionSetStatusResponse {
 /// human-initiated + low-frequency, not the hot path — no off-thread
 /// writer). The detection chain (`detections.jsonl`) is never mutated;
 /// status is event-sourced and derived at read time.
-fn dispatch_detection_set_status(
+pub(in crate::admin) fn dispatch_detection_set_status(
     req: DetectionSetStatusRequest,
     auth: &ConnAuth<'_>,
     det_state: Option<&DetectionAdminState>,

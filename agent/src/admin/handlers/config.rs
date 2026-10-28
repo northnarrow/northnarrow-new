@@ -1,9 +1,23 @@
+//! The signed `config overlay set` (R11d, lab PR 263: from
+//! `admin_socket.rs`): an operator overlay and its signature, stored where
+//! the agent reads them at boot.
+
+use std::path::{Path, PathBuf};
+
+use tracing::{info, warn};
+
+use nn_proto::admin_protocol::{AdminResult, ConfigOverlaySetRequest, ConfigOverlaySetResponse};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::anti_tamper::admin_auth::ConnAuth;
+
 /// Tappa 10.8 — handle one [`ConfigOverlaySetRequest`]: verify the
 /// 1-of-N quorum carrying `Role::ConfigManage` (single-use challenge, skew,
 /// agent_id), check that `content` is exactly what was signed and parses as
 /// that overlay kind, then write the overlay and its `.sig` where the agent
 /// reads it at boot. Takes effect at the next agent start.
-fn dispatch_config_overlay_set(
+pub(in crate::admin) fn dispatch_config_overlay_set(
     req: ConfigOverlaySetRequest,
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,

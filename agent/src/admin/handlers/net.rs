@@ -1,3 +1,19 @@
+//! The network verbs (R11d, lab PR 263: from `admin_socket.rs`): `net
+//! flows`, `listeners`, `resolve` and `fingerprint`.
+
+use tracing::{info, warn};
+
+use nn_proto::admin_protocol::{
+    AdminResult, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
+    NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
+};
+use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+
+use super::read::read_tail_jsonl;
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::AdminReadPaths;
+use crate::anti_tamper::admin_auth::ConnAuth;
+
 // ── Tappa 10 N7 — net admin dispatches ────────────────────────────
 //
 // Four dispatches mirroring the FIM C6 + canary K6 shape:
@@ -20,7 +36,7 @@ pub const DEFAULT_NETFLOW_JSONL_PATH: &str = "/var/lib/northnarrow/netflow.jsonl
 /// `net flows`: the newest rows of the netflow log at
 /// `--netflow-file` (external audit NN-AUD-082), active file then
 /// archives, newest first (NN-AUD-080).
-fn dispatch_net_flows(
+pub(in crate::admin) fn dispatch_net_flows(
     req: NetFlowsRequest,
     auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
@@ -86,7 +102,7 @@ fn dispatch_net_flows(
 /// of the sockets open now: a closed listener stays in the log. External
 /// audit NN-AUD-081: this verb answered Success with an empty body while
 /// the log was being written.
-fn dispatch_net_listeners(
+pub(in crate::admin) fn dispatch_net_listeners(
     req: NetListenersRequest,
     auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
@@ -164,7 +180,7 @@ fn netflow_row_view(line: &str) -> Option<NetflowRowView> {
 /// answered Success with no name without reading anything; it now answers
 /// from the netflow log, and `qname: None` means no retained flow to that
 /// address carries a name. An address that does not parse is refused.
-fn dispatch_net_resolve(
+pub(in crate::admin) fn dispatch_net_resolve(
     req: NetResolveRequest,
     auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,
@@ -255,7 +271,7 @@ fn dispatch_net_resolve(
 /// would always answer empty. A null field says "not captured"; an empty
 /// body says the flow is not in the retained log. A flow id that is not
 /// 1 to 64 hex digits is refused.
-fn dispatch_net_fingerprint(
+pub(in crate::admin) fn dispatch_net_fingerprint(
     req: NetFingerprintRequest,
     auth: &ConnAuth<'_>,
     read_paths: &AdminReadPaths,

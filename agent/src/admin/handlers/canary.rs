@@ -1,3 +1,22 @@
+//! The canary verbs (R11d, lab PR 263: from `admin_socket.rs`): deploy,
+//! list, burn and refresh.
+
+use anyhow::Result;
+use tracing::{info, warn};
+
+use nn_proto::admin_protocol::{
+    AdminResult, CanaryBurnRequest, CanaryDeployRequest, CanaryDeployResponse, CanaryListRequest,
+    CanaryListResponse, CanaryRefreshRequest,
+};
+use nn_proto::admin_signed_payload::{OperationCode, Role};
+use sha2::{Digest, Sha256};
+
+use super::read::read_tail_jsonl;
+use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::CanaryAdminState;
+use crate::anti_tamper::admin_auth::ConnAuth;
+use crate::canary::registry::{CanaryToken, CanaryTokenDraft, DecoyContent, RegistryError};
+
 // ── Tappa 9.5 K6 — canary admin dispatch handlers ───────────────────
 
 /// Rebuild the K3 detector's hot-path indexes from the K2
@@ -28,7 +47,11 @@ pub fn canary_path(
 /// absent), or the FIM is not running — and the deploy is refused: a decoy
 /// whose opens are not seen never trips, and the deploy used to answer
 /// Success with only a WARN in the journal.
-fn watch_decoy(state: &CanaryAdminState, key: common::wire::InodeKey, path: &str) -> bool {
+pub(in crate::admin) fn watch_decoy(
+    state: &CanaryAdminState,
+    key: common::wire::InodeKey,
+    path: &str,
+) -> bool {
     match &state.fim_watch {
         Some(watch) => {
             if watch.watch(key, path, crate::fim::drain::WatchClass::Decoy) {
@@ -90,7 +113,7 @@ fn rebuild_canary_indexes(state: &CanaryAdminState) {
 /// return the freshly-allocated canary_id. Per §12 Q1
 /// EXPLICIT-PER-HOST lock-in: this is the ONLY way canaries
 /// get on-host (no default deployments).
-fn dispatch_canary_deploy(
+pub(in crate::admin) fn dispatch_canary_deploy(
     req: CanaryDeployRequest,
     auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
@@ -279,7 +302,7 @@ fn dispatch_canary_deploy(
 /// and the rule). Returns the decoy's inode and what it was written with
 /// — its SHA-256 and seed, for the registry row (DEC-010). Process +
 /// Network canaries write nothing: `(None, None)`.
-fn materialise_canary_file(
+pub(in crate::admin) fn materialise_canary_file(
     deployment: &nn_proto::admin_signed_payload::CanaryDeploymentWire,
     state: &CanaryAdminState,
 ) -> Result<(Option<common::wire::InodeKey>, Option<DecoyContent>)> {
@@ -320,7 +343,7 @@ fn materialise_canary_file(
 /// it, and the decoy is watched before the Refresh row records it — as
 /// a deploy (NN-AUD-120). A decoy that cannot be written or watched
 /// refuses the refresh: the canary stays as recorded.
-fn refresh_canary(
+pub(in crate::admin) fn refresh_canary(
     state: &CanaryAdminState,
     canary_id: &str,
     refreshed_by_fp: &str,
@@ -360,7 +383,7 @@ fn decoy_key(decoy: &std::fs::File) -> Result<common::wire::InodeKey> {
 /// flag (same shape as `dispatch_fim_report`). External audit
 /// NN-AUD-080: newest rows first, so a long history no longer
 /// hides the latest deploy, trip or burn.
-fn dispatch_canary_list(
+pub(in crate::admin) fn dispatch_canary_list(
     req: CanaryListRequest,
     auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
@@ -431,7 +454,7 @@ fn dispatch_canary_list(
 /// dispatch_canary_burn — verify 1-of-N quorum with
 /// `Role::CanaryManage`, call Registry::burn, rebuild indexes
 /// so the K3 detector stops matching on the burned canary.
-fn dispatch_canary_burn(
+pub(in crate::admin) fn dispatch_canary_burn(
     req: CanaryBurnRequest,
     auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
@@ -515,7 +538,7 @@ fn dispatch_canary_burn(
 /// `Role::CanaryManage`, write the decoy again and call
 /// Registry::refresh ([`refresh_canary`]), rebuild indexes (the
 /// decoy may be a new inode).
-fn dispatch_canary_refresh(
+pub(in crate::admin) fn dispatch_canary_refresh(
     req: CanaryRefreshRequest,
     auth: &ConnAuth<'_>,
     state: Option<&CanaryAdminState>,
