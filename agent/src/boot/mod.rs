@@ -44,7 +44,6 @@ use clap::Parser;
 use cli::Cli;
 
 pub mod deny_selftest;
-pub mod lsm;
 pub mod manifest;
 pub mod trust;
 
@@ -72,7 +71,7 @@ pub(crate) mod tasks;
 /// the attach permit and the degradations of a run are nn-linux's, with
 /// the eBPF loader and the sensors that take and report them.
 pub use nn_linux::boot::{
-    degradation, AttachPermit, BootOrderError, BootPhase, BootSequence, BootStep,
+    degradation, lsm, AttachPermit, BootOrderError, BootPhase, BootSequence, BootStep,
 };
 
 /// The agent daemon (R11a, lab PR 261: `main.rs`'s `main`): the command

@@ -7,6 +7,7 @@
 //! level and signed manifest stay in the agent).
 
 pub mod degradation;
+pub mod lsm;
 pub mod manifest;
 
 use tracing::info;
