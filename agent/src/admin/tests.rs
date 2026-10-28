@@ -4358,6 +4358,37 @@ pub(super) fn own_euid_override(path: &Path) -> Option<u32> {
         .map(|(_, euid)| *euid)
 }
 
+/// The bootstrap gate's files in a test (`verify::bootstrap_paths`): the
+/// sentinel and the install nonce beside the test's own admin.pub, never
+/// the host's `/etc/northnarrow` (lab PR 263's review: every rotate-keys
+/// add of a test read the host's sentinel, and removed it when the test's
+/// admin.pub held two keys).
+pub(super) fn bootstrap_paths_override(
+    admin_pub: &Path,
+) -> Option<crate::anti_tamper::bootstrap::BootstrapPaths> {
+    let dir = admin_pub.parent()?;
+    Some(crate::anti_tamper::bootstrap::BootstrapPaths {
+        sentinel: dir.join(".bootstrap"),
+        install_nonce: dir.join(".install_nonce"),
+        admin_pub: admin_pub.to_path_buf(),
+    })
+}
+
+/// Lab PR 263's review: no test reaches the host's bootstrap files — the
+/// gate reads, and scrubs, the ones beside the test's admin.pub.
+#[test]
+fn the_bootstrap_gate_reads_a_tests_own_files() {
+    let dir = TempDir::new().unwrap();
+    let admin_pub = dir.path().join("admin.pub");
+    let paths = bootstrap_paths(&admin_pub);
+    assert_eq!(paths.sentinel, dir.path().join(".bootstrap"));
+    assert_eq!(paths.install_nonce, dir.path().join(".install_nonce"));
+    assert_eq!(paths.admin_pub, admin_pub);
+    for path in [&paths.sentinel, &paths.install_nonce] {
+        assert!(!path.starts_with("/etc"), "{}", path.display());
+    }
+}
+
 fn test_euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }

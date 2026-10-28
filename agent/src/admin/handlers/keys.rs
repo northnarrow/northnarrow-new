@@ -28,8 +28,15 @@ fn reregister_admin_pub_after_rotate(
     config_path: &Path,
     old_inode_key: Option<common::wire::InodeKey>,
 ) {
+    // The agent's pinned maps — none in this crate's tests, which must not
+    // reach the host's bpffs: run as root, a test would register its own
+    // admin.pub in a running agent's map.
+    #[cfg(test)]
+    let pin_root = None;
+    #[cfg(not(test))]
+    let pin_root = crate::anti_tamper::prepare_pin_root();
     if let Err(e) = crate::anti_tamper::filesystem::reregister_protected_file(
-        crate::anti_tamper::prepare_pin_root(),
+        pin_root,
         config_path,
         old_inode_key,
         FS_PROTECT_MUTATE | FS_PROTECT_WRITE,
@@ -162,8 +169,7 @@ fn rotate_keys_add(v: Verified<'_, RotateKeysAddRequest>, auth: &ConnAuth<'_>) -
     // `evaluate` will remove it). If the gate was NOT armed (i.e.
     // we took the normal 2-of-N path), there's nothing to clean up.
     if bootstrap_armed {
-        let paths =
-            crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(config_path.clone());
+        let paths = crate::admin::verify::bootstrap_paths(&config_path);
         if let Err(e) = crate::anti_tamper::bootstrap::complete(&paths) {
             warn!(
                 error = ?e,

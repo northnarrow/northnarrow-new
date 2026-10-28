@@ -419,9 +419,7 @@ fn verify<'a, R: Signed>(
 fn bootstrap_armed(auth: &ConnAuth<'_>) -> bool {
     match auth.config_path() {
         Some(admin_pub_path) => {
-            let paths = crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(
-                admin_pub_path.to_path_buf(),
-            );
+            let paths = bootstrap_paths(admin_pub_path);
             // External audit ATP-004: the keys in memory, and the
             // consumption recorded in the signed chain.
             matches!(
@@ -438,6 +436,24 @@ fn bootstrap_armed(auth: &ConnAuth<'_>) -> bool {
         // existing 2-of-N path.
         None => false,
     }
+}
+
+/// The bootstrap gate's files for the admin.pub at `admin_pub`: the ones
+/// `install.sh` writes in `/etc/northnarrow/`
+/// ([`BootstrapPaths::default_paths`]). In this crate's tests they are
+/// beside the test's own admin.pub (`tests::bootstrap_paths_override`), so
+/// that no test reads the host's sentinel, nor removes it: the gate removes
+/// a leftover sentinel when the keys are two or more (lab PR 263's review).
+///
+/// [`BootstrapPaths::default_paths`]: crate::anti_tamper::bootstrap::BootstrapPaths::default_paths
+pub(super) fn bootstrap_paths(
+    admin_pub: &std::path::Path,
+) -> crate::anti_tamper::bootstrap::BootstrapPaths {
+    #[cfg(test)]
+    if let Some(paths) = super::tests::bootstrap_paths_override(admin_pub) {
+        return paths;
+    }
+    crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(admin_pub.to_path_buf())
 }
 
 /// Shared mapper from [`AdminAuthError`] to the wire
