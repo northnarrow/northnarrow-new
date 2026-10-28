@@ -45,7 +45,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 libc = "0.2"
 procfs = { version = "0.18", default-features = false }
-parking_lot = "0.12"
+parking_lot = "0.13"
 # the response vault (quarantine): AES-GCM, HKDF over SHA-256, the master
 # key zeroized, a vault's id.
 aes-gcm = "0.11"
