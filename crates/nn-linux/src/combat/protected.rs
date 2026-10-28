@@ -18,7 +18,7 @@
 //!   and `agent_pid` is our own live PID), and
 //! - the kernel-resolved **`/proc/<pid>/exe`** symlink for the watchdog
 //!   and sshd. The watchdog PID comes from the timer-refreshed
-//!   [`ExemptPids`] slot, but that slot is only re-verified every ~30 s —
+//!   `ExemptPids` slot, but that slot is only re-verified every ~30 s —
 //!   so we additionally re-check `/proc/<pid>/exe` against the watchdog
 //!   binary *inline at the kill/spare decision*. That closes the PID-reuse
 //!   race in the gap between refreshes (a recycled PID whose exe no longer
@@ -51,7 +51,7 @@
 //! with `prctl(PR_SET_DUMPABLE, 0)`, and as the only offender push the
 //! ladder straight to ISOLATE. An unreadable executable is therefore
 //! spared only on an anchor the process cannot forge: the watchdog slot's
-//! PID with the start time it was verified with ([`ExemptPids`],
+//! PID with the start time it was verified with (`ExemptPids`,
 //! POS-009), or real uid 0 inside the SSH units or the watchdog's own
 //! unit of the system manager (`/system.slice/…`; a user's manager can
 //! name a unit of its own anything, never run uid 0 in it). Every other
@@ -59,7 +59,7 @@
 //! each went. The boot declares the missing capability
 //! ([`crate::response::caps_preflight`]).
 //!
-//! The guard is injected into [`super::CombatLadder`] as a trait object
+//! The guard is injected into nn-core's `CombatLadder` as a trait object
 //! (like the actuator/evidence) so the ladder stays a pure, deterministic
 //! state machine in unit tests while production reads the live `/proc`.
 
@@ -81,7 +81,7 @@ use crate::posture::ExemptPids;
 pub const SSHD_EXES: &[&str] = &["/usr/sbin/sshd", "/usr/libexec/openssh/sshd"];
 
 /// Production guard: PID 1 + the agent + the watchdog (reused
-/// [`ExemptPids`] slot, re-verified inline by exe) + sshd, both identified
+/// `ExemptPids` slot, re-verified inline by exe) + sshd, both identified
 /// by kernel-resolved `/proc/<pid>/exe`.
 pub struct SystemProtectedProcs {
     /// The agent's own PID. Held directly (rather than via `ExemptPids`,

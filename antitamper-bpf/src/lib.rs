@@ -41,12 +41,12 @@
 //!   alongside the agent-side orchestration that knows about the
 //!   specific eBPF object the agent loads.
 //! - The agent's `attach()` orchestrator function — it stays in
-//!   `agent/src/anti_tamper/mod.rs` as a thin shim that calls into
+//!   `crates/nn-linux/src/anti_tamper/mod.rs` as a thin shim that calls into
 //!   this crate's helpers with the agent-specific names.
 //!
 //! ## Re-export contract
 //!
-//! `agent/src/anti_tamper/mod.rs` `pub use`s every item in this
+//! `crates/nn-linux/src/anti_tamper/mod.rs` `pub use`s every item in this
 //! crate's public surface so existing callers
 //! (`crate::anti_tamper::reattach_fresh`, `crate::anti_tamper::prepare_pin_root`,
 //! `crate::anti_tamper::read_self_comm`, …) compile byte-identically.

@@ -91,7 +91,7 @@ pub struct UnlockRequest {
 
 /// Outcome of [`UnlockRequest`] verification.
 ///
-/// `Success` mints an [`UnlockToken`](../../../agent/src/anti_tamper/network_isolate.rs)
+/// `Success` mints an [`UnlockToken`](../../nn-linux/src/anti_tamper/network_isolate.rs)
 /// inside the agent and calls `NetworkIsolator::release` plus
 /// `PostureMachine::admin_release_combat_with_token`. Every other
 /// variant leaves the lockdown in place.

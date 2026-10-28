@@ -491,5 +491,5 @@ a reused inode at the path; a 0-byte file is never copied. A file whose writer s
 what it could not protect. Exit codes as §6.
 
 Related: `configs/combat-rules.v4`,
-`agent/src/anti_tamper/network_isolate.rs`,
+`crates/nn-linux/src/anti_tamper/network_isolate.rs`,
 `crates/nn-core/src/anti_tamper/combat_allow.rs`.

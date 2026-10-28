@@ -1,11 +1,11 @@
 //! The Linux host of the COMBAT ladder: nn-core's
-//! [`CombatHost`](nn_core::combat::host::CombatHost) (Wave 4 restructure,
+//! [`CombatHost`] (Wave 4 restructure,
 //! R08c, lab PR 252) — the ladder's capture of a process is
-//! [`ProcRef`](crate::response::proc_ref::ProcRef), a pidfd and the start
+//! [`ProcRef`], a pidfd and the start
 //! `/proc` gives the process (external audit CMB-004), made and read with
 //! the calls the ladder made on it before, the same arguments. The host is
 //! the chains', the posture's and the engine's one
-//! ([`LinuxHost`](crate::chain_host_linux::LinuxHost), `chain_host_linux`):
+//! ([`LinuxHost`], `chain_host_linux`):
 //! one type, the agent's.
 
 use nn_core::combat::host::{Capture, CombatHost};

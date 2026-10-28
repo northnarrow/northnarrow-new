@@ -317,8 +317,8 @@ pub struct CanaryLiveState {
 /// produces a well-chained next row. Live-set is a BTreeMap
 /// keyed by `canary_id` for deterministic `list()` iteration.
 ///
-/// Same shape as [`crate::audit::AuditLog`] +
-/// [`crate::fim::baseline::BaselineDb`].
+/// Same shape as [`AuditLog`](nn_evidence::audit::AuditLog) +
+/// the agent's `fim::baseline::BaselineDb`.
 pub struct Registry {
     path: PathBuf,
     key: AgentSigningKey,
@@ -1041,7 +1041,7 @@ pub fn check_decoy(path: &Path, expected_sha256: Option<&str>) -> DecoyCheck {
 /// Outcome of one [`verify_chain`] run on a tampered chain.
 /// Carrying the 0-based index lets the operator pinpoint the
 /// first broken entry without re-running the verifier.
-/// Symmetric to [`crate::fim::baseline::BaselineVerifyError`]
+/// Symmetric to the agent's `fim::baseline::BaselineVerifyError`
 /// and [`crate::audit::AuditVerifyError`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RegistryVerifyError {

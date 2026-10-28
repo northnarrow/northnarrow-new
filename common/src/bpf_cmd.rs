@@ -13,7 +13,7 @@
 //! denial (NN-L-AT-001, COMBAT). `bpf_cmd_name` repeated the same 31.
 //! Every number is now defined here only. The tests compare each one with
 //! the uapi header of the build host and with `enum bpf_cmd` in the
-//! running kernel's BTF (`agent/src/anti_tamper/btf_revalidate.rs`), and
+//! running kernel's BTF (`crates/nn-linux/src/anti_tamper/btf_revalidate.rs`), and
 //! fail when anything else in the tree defines one of these numbers again.
 //!
 //! `u32`: the hook reads `cmd` as the kernel's `int` and compares it as
