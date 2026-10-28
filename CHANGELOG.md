@@ -417,6 +417,45 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   (`seal`, `open`); what is written and read is unchanged.
 
 ### Fixed
+- A tripped canary came back armed when the agent stopped between the
+  trip's two rows (lab PR 260; lab PR 258's KVM run on Ubuntu 24.04:
+  the e2e fixture's restart signal landed there, and
+  `file_canary_deployed_at_runtime_survives_an_agent_restart` saw the
+  next read a first trip). The detector writes and syncs the access row
+  (`first_trip: true`) and then the registry's `trip` row naming it; a
+  crash, a kill or a power loss between the two — or a `trip` row that
+  could not be written — left the registry at its deploy row, and the
+  next start re-armed the canary: the trip forgotten by the registry,
+  its next access answered as a first trip. The access row is the
+  trip's commit now: at each start, before the detector runs, the
+  registry reads the access log's first-trip rows of the canaries it
+  holds armed (`access_log::first_trip_rows`: hash, signature and
+  canonical bytes verified, a row placed by the `seq` it was signed
+  with, a copy or a moved row ignored) and finds the ones written in the
+  canary's current arming that no registry row names
+  (`Registry::unrecorded_trips`): the arming starts after the latest
+  first-trip row a registry row names, and a `refresh` row names the
+  trip it clears (`first_trip_access_hash`, with `tripped: false`; it
+  was always `null`), so a refresh after a `trip` row that could not be
+  written does not come back tripped; a refresh that names nothing (of
+  an armed canary, or written before) is placed by its time. Each trip
+  found is an ERROR, a signed `canary_trip_recovered` (the canary, the
+  access row, its accessor) and then a `trip` row naming the access
+  row: the canary stays tripped, `nn-admin canary list` shows it. The
+  signed access log keeps its format; the registry's rows keep theirs
+  (an agent before reads the `refresh` row's hash as cleared). A stop
+  after the `trip` row and before the verdict leaves both rows: the
+  trip holds, and a response that had not run does not run, as for any
+  event the agent had read. Tests: every stop of the detector (before
+  the access row, in it torn, after it, in the `trip` row torn, after
+  it, none) on nn-linux's stores, then the next start: an access row on
+  disk is one trip, recorded once, and the next access is not a first
+  trip; none, and the canary is armed; the refresh, legacy and forgery
+  cases; and the privileged e2e
+  `a_trip_the_agent_stopped_before_recording_is_kept_across_the_restart`,
+  which stops the agent at that point with a `debug-trigger` failpoint
+  (`debug-canary-stop-before-trip` next to the registry: the agent
+  aborts at the detector's trip mark).
 - Three host tests failed now and then under load, each on a race of
   its own (lab PR 258; the flakes lab PRs 254 and 256 recorded and lab
   PR 234's hotfix saw); the first race was the product's. The

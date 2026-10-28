@@ -649,6 +649,13 @@ longer follows from the operator key and the path, and no decoy names the
 product (DEC-007). At boot the agent compares each decoy with its record;
 a change found is a `decoy_check` row and a signed `integrity_drift`.
 
+Lab PR 260: the `refresh` row names the trip it clears —
+`first_trip_access_hash` is the hash of that trip's first access row, with
+`tripped: false`; `null` for the refresh of an armed canary, as on every
+`refresh` row written before (agents before lab PR 260 read the field as
+cleared, as they always did). It places the refresh in the access log for
+the boot's check in §7.5.
+
 ### 7.5 Single-trip lockout window
 
 Per §1 — single-trip semantics. The first access to a
@@ -663,6 +670,36 @@ External audit DEC-011 (lab PR 143): step 2 is a signed `trip` row in
 `canaries.jsonl` carrying the `entry_hash` of the access row of step 3
 (written first), so the trip survives an agent restart: "the same agent
 session" below holds across sessions until a refresh.
+
+Lab PR 260: the access row is the trip's commit. Each row is written and
+synced before the next step, so a stop of the agent (a crash, a kill, a
+power loss) leaves one of:
+
+| Stopped | On disk | The next start |
+|---|---|---|
+| before the access row, or in it | nothing, or a torn last line (cut at open) | armed: no access was recorded |
+| after the access row, before or in the `trip` row | the access row (`first_trip: true`), no `trip` row | records the trip (below) |
+| after the `trip` row, before the verdict | both rows | tripped, as recorded; the response that had not run does not run |
+
+Before lab PR 260 the second line came back armed — the trip forgotten by
+the registry, the next access a first trip again (lab PR 258's KVM run: the
+e2e fixture's restart signal landed between the two rows). The boot now
+reads, for each canary the registry holds armed, the genuine first-trip
+rows of its access log (hash, signature, canonical bytes; a row's place is
+the `seq` it was signed with), and one that no registry row names, written
+in the canary's current arming, is a trip: an ERROR, a signed
+`canary_trip_recovered` (the canary, the access row, its accessor), then a
+`trip` row naming the access row, before the detector runs. The current
+arming starts after the latest first-trip row a registry row names (a
+`trip` row's, the trip a `refresh` row cleared): the agent marks a canary
+tripped in memory at its first access, so it writes no other first-trip row
+for it until a refresh, which names the trip it clears (§7.4). A refresh
+that names nothing — of an armed canary, or written before lab PR 260 — is
+placed by its time: a first-trip row older than it was refreshed. Not
+covered: a torn first row of `canary_access.jsonl` or `canaries.jsonl`
+(the file's only line) is left untouched by the open's repair, which never
+empties a chain, and the open refuses the file: the canary subsystem is
+off until the file is repaired, as before lab PR 260.
 
 Subsequent accesses to the SAME canary in the same agent
 session:

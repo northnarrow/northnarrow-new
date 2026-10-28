@@ -19,6 +19,9 @@
 //!   §12 Q2 + §7.4 MANUAL-REFRESH contract);
 //! - external audit DEC-011: a trip is recorded in the registry and
 //!   survives an agent restart;
+//! - lab PR 260: a trip survives an agent stopped between its access row
+//!   and the registry's `Trip` row (the `debug-trigger` failpoint): the next
+//!   start records it from the access row;
 //! - external audit DEC-010: a decoy changed while the agent is down is
 //!   reported at the next start (signed `integrity_drift`, `decoy_check`
 //!   row);
@@ -527,6 +530,24 @@ impl CanaryFixture {
         );
     }
 
+    /// Lab PR 260: block until the agent exits by itself (a `debug-trigger`
+    /// stop); its exit status (sudo's, which waits for it).
+    #[cfg(feature = "debug-trigger")]
+    fn wait_agent_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        let child = self._agent_guard.0.as_mut().expect("the agent was started");
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait on the agent") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the agent kept running {timeout:?} after the stop it was asked for"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
     /// Block until `canary_access.jsonl` holds at least `n`
     /// chained rows; return them. Polls at `POLL_INTERVAL` until
     /// `ACCESS_LOG_POLL_TIMEOUT`.
@@ -730,6 +751,107 @@ fn file_canary_deployed_at_runtime_survives_an_agent_restart() {
         rows[0]["entry_hash"].as_str(),
         "the Trip row names the access row of the first trip"
     );
+}
+
+/// Lab PR 260: the agent stopped between a trip's access row and the
+/// registry's `Trip` row — where lab PR 258's KVM run saw the restart's
+/// SIGQUIT land in the test above, which then found the canary armed again
+/// — keeps the trip. The next start finds the access row, records the trip
+/// (a signed `canary_trip_recovered`, then a `Trip` row naming that row),
+/// and the next read is recorded, not a first trip; the start after finds
+/// nothing more to record. The stop is the `debug-trigger` failpoint: a
+/// file `debug-canary-stop-before-trip` next to the registry, and the agent
+/// aborts at the detector's trip mark, after the access row. On the
+/// starting code the canary came back armed and the next read was a first
+/// trip.
+#[cfg(feature = "debug-trigger")]
+#[test]
+#[ignore = "requires sudo + bpf LSM (run via integration runbook)"]
+fn a_trip_the_agent_stopped_before_recording_is_kept_across_the_restart() {
+    let _eni = EniIptablesGuard::install();
+    let tmp = tempfile::tempdir().expect("decoy tempdir");
+    let decoy = tmp.path().join("finance").join("q3_forecast.xlsx");
+    let mut fx = CanaryFixture::setup(&[]);
+    let canary_id = fx.deploy_file_canary("honeypot-forecast", &decoy);
+    let trigger = fx
+        .canary_registry
+        .with_file_name("debug-canary-stop-before-trip");
+    std::fs::write(&trigger, b"").expect("write the stop trigger");
+
+    let cat = || {
+        Command::new("cat")
+            .arg(&decoy)
+            .stdout(Stdio::null())
+            .status()
+            .expect("spawn cat for canary trip")
+    };
+    assert!(cat().success());
+    let rows = fx.wait_access(1);
+    assert_eq!(rows[0]["canary_id"].as_str(), Some(canary_id.as_str()));
+    assert_eq!(rows[0]["first_trip"].as_bool(), Some(true), "{rows:?}");
+    let status = fx.wait_agent_exit(ACCESS_LOG_POLL_TIMEOUT);
+    assert!(!status.success(), "the agent aborted: {status}");
+    assert!(!trigger.exists(), "the agent took the trigger");
+    let trips = |fx: &CanaryFixture| -> Vec<serde_json::Value> {
+        fx.registry_rows(&canary_id)
+            .into_iter()
+            .filter(|r| r["action"].as_str() == Some("trip"))
+            .collect()
+    };
+    let recovered = |fx: &CanaryFixture| -> Vec<serde_json::Value> {
+        common::read_jsonl_strict(&fx.audit_log)
+            .into_iter()
+            .filter(|r| r["op"].as_str() == Some("canary_trip_recovered"))
+            .collect()
+    };
+    assert!(
+        trips(&fx).is_empty(),
+        "stopped before the registry's Trip row: {:?}",
+        fx.registry_rows(&canary_id)
+    );
+
+    fx.stop();
+    fx.start();
+    let recorded = trips(&fx);
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the start recorded the trip: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0]["first_trip_access_hash"].as_str(),
+        rows[0]["entry_hash"].as_str(),
+        "the Trip row names the access row"
+    );
+    let audit = recovered(&fx);
+    assert_eq!(
+        audit.len(),
+        1,
+        "one signed canary_trip_recovered: {audit:?}"
+    );
+    assert_eq!(
+        audit[0]["extra"]["canary_id"].as_str(),
+        Some(canary_id.as_str())
+    );
+    assert_eq!(
+        audit[0]["extra"]["access_entry_hash"].as_str(),
+        rows[0]["entry_hash"].as_str()
+    );
+    assert_eq!(audit[0]["extra"]["first_trip_rows"].as_u64(), Some(1));
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(cat().success());
+    let rows = fx.wait_access(2);
+    assert_eq!(rows[1]["canary_id"].as_str(), Some(canary_id.as_str()));
+    assert_eq!(
+        rows[1]["first_trip"].as_bool(),
+        Some(false),
+        "the canary stayed tripped across the restart: {rows:?}"
+    );
+
+    fx.restart();
+    assert_eq!(trips(&fx).len(), 1, "recorded once");
+    assert_eq!(recovered(&fx).len(), 1, "attested once");
 }
 
 /// External audit DEC-010: a decoy changed while the agent is down is

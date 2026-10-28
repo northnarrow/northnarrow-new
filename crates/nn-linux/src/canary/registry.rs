@@ -54,6 +54,17 @@
 //!   verify_chain`. Replays a sequence of [`CanaryToken`]
 //!   rows, recomputing entry_hash + checking agent_sig
 //!   against a supplied verifying key.
+//! - Lab PR 260: the access row with `first_trip: true` is the trip's
+//!   commit — the detector writes and syncs it before the `Trip` row that
+//!   names it. An agent stopped between the two (lab PR 258's KVM run:
+//!   the e2e fixture's SIGQUIT landed there) left this registry at its
+//!   deploy row, and the next start re-armed a tripped canary: its trip
+//!   forgotten here, its next access a first trip again.
+//!   [`Registry::unrecorded_trips`] finds, at open, the first-trip rows of
+//!   an armed canary's arming that no row here names, and the boot records
+//!   each (a `Trip` row naming it). A `Refresh` row names the trip it
+//!   clears, so the open knows which first-trip rows a refresh re-armed
+//!   after.
 //!
 //! ## What this commit (K2) deliberately does NOT ship
 //!
@@ -73,7 +84,7 @@
 //! - **No K8 priv-e2e.** Deployment + trip end-to-end on a
 //!   real kernel is the K8 sprint.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -91,6 +102,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::audit::{AgentSigningKey, GENESIS_PREV_HASH};
+use crate::canary::access_log::{CanaryAccessEntry, FirstTripRow};
 
 /// Default deploy location of the chained registry log. Lives
 /// alongside the other Tappa 8/9 state files under
@@ -238,6 +250,12 @@ pub struct CanaryToken {
     /// `CanaryAccessEntry`'s entry_hash from the SEPARATE
     /// `canary_access.jsonl` chain (K3-side), for cross-chain
     /// reference. `None` until the first trip.
+    ///
+    /// Lab PR 260: on a `Refresh` row (`tripped: false`), the trip the
+    /// refresh cleared — its first access row's hash — and `None` for the
+    /// refresh of an armed canary (and on every `Refresh` row written
+    /// before; agents before lab PR 260 read the field as cleared, as
+    /// they always did).
     pub first_trip_access_hash: Option<String>,
     /// External audit DEC-010: SHA-256 (hex) of the decoy bytes written
     /// at deploy or the last refresh, on every row of a File /
@@ -309,6 +327,102 @@ pub struct CanaryLiveState {
     pub decoy_state: DecoyState,
 }
 
+/// Lab PR 260: what the registry's rows say of a canary id's armings, for
+/// [`Registry::unrecorded_trips`]. Kept for every id the rows name, a
+/// burned one included (an id deployed again carries its history).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ArmHistory {
+    /// The access rows the rows name (`first_trip_access_hash`: a `Trip`
+    /// row's trip, a `Refresh` row's cleared trip, the copy a `Burn` or
+    /// `DecoyCheck` row carries): trips the registry accounts for.
+    named: BTreeSet<String>,
+    /// The `ts` of the last `Deploy` or `Refresh` row: the last arming.
+    armed_at: String,
+    /// Whether that row is a `Refresh` (a `Deploy` otherwise).
+    refreshed: bool,
+    /// The trip that `Refresh` row cleared (its `first_trip_access_hash`).
+    cleared: Option<String>,
+}
+
+impl ArmHistory {
+    /// What a row the registry writes or applies says of its canary's
+    /// armings.
+    fn note(&mut self, row: &CanaryToken) {
+        if let Some(named) = &row.first_trip_access_hash {
+            self.named.insert(named.clone());
+        }
+        if matches!(row.action, RegistryAction::Deploy | RegistryAction::Refresh) {
+            self.armed_at = row.ts.clone();
+            self.refreshed = row.action == RegistryAction::Refresh;
+            self.cleared = row
+                .first_trip_access_hash
+                .clone()
+                .filter(|_| self.refreshed);
+        }
+    }
+
+    /// The trip of this arming among `rows` (the access log's genuine
+    /// first-trip rows, every canary's) that no registry row names, if
+    /// any.
+    ///
+    /// The first-trip rows of this canary up to the latest one the
+    /// registry names are accounted for: recorded trips, cleared by a
+    /// refresh, or written before them. After it, a first-trip row no row
+    /// names was written in this arming — the agent marks the canary
+    /// tripped in memory at a first trip, so it writes no other first-trip
+    /// row until a refresh, and a refresh names the trip it clears — but
+    /// for a refresh this registry cannot place in the access log: one of
+    /// an armed canary, one written before lab PR 260 (which named
+    /// nothing; an agent before lab PR 143 also wrote no `Trip` row), or
+    /// one whose trip's row is not in the log. A row written before that
+    /// refresh's time counts for it as before it.
+    fn unrecorded(&self, state: &CanaryLiveState, rows: &[FirstTripRow]) -> Option<UnrecordedTrip> {
+        let mine: Vec<&FirstTripRow> = rows
+            .iter()
+            .filter(|r| r.entry.canary_id == state.canary_id)
+            .collect();
+        let named = |r: &FirstTripRow| self.named.contains(&r.entry.entry_hash);
+        let fence = mine.iter().filter(|r| named(r)).map(|r| r.row).max();
+        let placed = self
+            .cleared
+            .as_ref()
+            .is_some_and(|c| mine.iter().any(|r| &r.entry.entry_hash == c));
+        let unnamed: Vec<&FirstTripRow> = mine
+            .into_iter()
+            .filter(|r| !named(r))
+            .filter(|r| fence.is_none_or(|f| r.row > f))
+            .filter(|r| !self.refreshed || placed || r.entry.ts >= self.armed_at)
+            .collect();
+        let last = unnamed.iter().max_by_key(|r| r.row)?;
+        Some(UnrecordedTrip {
+            canary_id: state.canary_id.clone(),
+            name: state.name.clone(),
+            access: last.entry.clone(),
+            access_row: last.row,
+            first_trip_rows: unnamed.len(),
+        })
+    }
+}
+
+/// Lab PR 260: a trip of an armed canary that its access log holds and
+/// the registry does not record ([`Registry::unrecorded_trips`]): the
+/// agent stopped between the access row and the `Trip` row (or that row
+/// could not be written), and the K5 response to the access did not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecordedTrip {
+    pub canary_id: String,
+    pub name: String,
+    /// The trip's access row: the latest first-trip row of the canary's
+    /// arming no registry row names.
+    pub access: CanaryAccessEntry,
+    /// Its position in the access log ([`FirstTripRow::row`]).
+    pub access_row: u64,
+    /// How many first-trip rows of that arming no registry row names: 1,
+    /// unless an agent before lab PR 260, re-arming the canary at a start,
+    /// stopped at the same point again.
+    pub first_trip_rows: usize,
+}
+
 // ── registry ────────────────────────────────────────────────────────
 
 /// Append-only writer + in-memory live-set for the canary
@@ -325,6 +439,8 @@ pub struct Registry {
     agent_id: [u8; 16],
     last_hash: String,
     live: BTreeMap<String, CanaryLiveState>,
+    /// Lab PR 260: each canary id's armings, as its genuine rows say.
+    history: BTreeMap<String, ArmHistory>,
     tail_repair: Option<crate::chainlog::TailRepair>,
     skipped_lines: usize,
     /// External audit NN-AUD-174: rows in the file (the next `seq`) and
@@ -332,6 +448,12 @@ pub struct Registry {
     rows: u64,
     chain_findings: Vec<crate::chain_anchor::ChainFinding>,
 }
+
+/// Lab PR 260, `debug-trigger` builds only: the file, next to the
+/// registry, that stops the agent at the detector's next trip mark
+/// ([`Registry::debug_stop_before_trip_mark`]).
+#[cfg(feature = "debug-trigger")]
+pub const DEBUG_STOP_BEFORE_TRIP_MARK: &str = "debug-canary-stop-before-trip";
 
 impl Registry {
     /// Open `path` for append, walk any existing entries to
@@ -357,11 +479,61 @@ impl Registry {
             agent_id,
             last_hash: read.last_hash,
             live: read.live,
+            history: read.history,
             tail_repair,
             skipped_lines: read.skipped,
             rows: read.seq.rows(),
             chain_findings: read.findings,
         })
+    }
+
+    /// Lab PR 260: the trips the access log at `access_log` holds for this
+    /// registry's armed canaries and the registry does not record — the
+    /// agent stopped between an access row and the `Trip` row naming it,
+    /// or that row could not be written. Read at open, before the detector
+    /// runs; the caller records each ([`Registry::mark_tripped`] with the
+    /// access row's hash) after attesting it. Only the genuine first-trip
+    /// rows of the armed canaries count
+    /// ([`crate::canary::access_log::first_trip_rows`]): a row this key did
+    /// not sign, or one moved, trips nothing. No armed canary: the log is
+    /// not read.
+    pub fn unrecorded_trips(&self, access_log: &Path) -> Result<Vec<UnrecordedTrip>> {
+        let armed: Vec<(&CanaryLiveState, &ArmHistory)> = self
+            .live
+            .values()
+            .filter(|s| !s.tripped)
+            .filter_map(|s| self.history.get(&s.canary_id).map(|h| (s, h)))
+            .collect();
+        if armed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: BTreeSet<String> = armed.iter().map(|(s, _)| s.canary_id.clone()).collect();
+        let rows = crate::canary::access_log::first_trip_rows(
+            access_log,
+            &self.key.verifying_key(),
+            &ids,
+        )?;
+        Ok(armed
+            .into_iter()
+            .filter_map(|(state, history)| history.unrecorded(state, &rows))
+            .collect())
+    }
+
+    /// Lab PR 260, `debug-trigger` builds only: when the file
+    /// [`DEBUG_STOP_BEFORE_TRIP_MARK`] is next to the registry, remove it
+    /// and abort — as a crash: no destructor runs, nothing more is written.
+    /// The Linux host calls it before the detector's trip mark, after the
+    /// access row: the privileged e2e stops the agent there and checks the
+    /// next start records the trip.
+    #[cfg(feature = "debug-trigger")]
+    pub fn debug_stop_before_trip_mark(&self) {
+        if std::fs::remove_file(self.path.with_file_name(DEBUG_STOP_BEFORE_TRIP_MARK)).is_ok() {
+            tracing::warn!(
+                "debug-trigger: the agent stops between the access row and the trip mark, on \
+                 request (lab test of lab PR 260)"
+            );
+            std::process::abort();
+        }
     }
 
     /// External audit NN-AUD-174: what the open's verification found (rows
@@ -470,8 +642,14 @@ impl Registry {
             .get(canary_id)
             .ok_or(RegistryError::CanaryIdNotFound)?
             .clone();
+        // Lab PR 260: the row names the trip it clears (its first access
+        // row), the place of this refresh in the access log: a first-trip
+        // row after that one is a trip of the arming this row starts. The
+        // live state keeps no hash.
+        if !state.tripped {
+            state.first_trip_access_hash = None;
+        }
         state.tripped = false;
-        state.first_trip_access_hash = None;
         let rewritten = content.is_some();
         if let Some(c) = content {
             state.content = Some(c);
@@ -484,6 +662,7 @@ impl Registry {
             refreshed_by_fp,
             decoy_state,
         )?;
+        state.first_trip_access_hash = None;
         self.live.insert(canary_id.to_string(), state);
         Ok(entry)
     }
@@ -495,7 +674,8 @@ impl Registry {
     }
 
     /// Mark a canary as tripped (called by the K3 detector on its
-    /// first access, after the access row is appended).
+    /// first access, after the access row is appended; lab PR 260: and by
+    /// the boot for a trip [`Registry::unrecorded_trips`] found).
     /// `access_hash` is the `entry_hash` of THAT row in the
     /// `canary_access.jsonl` chain, recorded for cross-reference.
     ///
@@ -595,6 +775,10 @@ impl Registry {
         )?;
         self.append_row(&entry)?;
         self.last_hash = entry.entry_hash.clone();
+        self.history
+            .entry(entry.canary_id.clone())
+            .or_default()
+            .note(&entry);
         Ok(entry)
     }
 
@@ -643,6 +827,7 @@ pub enum RegistryError {
 struct ChainRead {
     last_hash: String,
     live: BTreeMap<String, CanaryLiveState>,
+    history: BTreeMap<String, ArmHistory>,
     skipped: usize,
     seq: crate::chain_anchor::RowSeq,
     findings: Vec<crate::chain_anchor::ChainFinding>,
@@ -665,6 +850,9 @@ struct ChainRead {
 /// an unsigned `Burn` no longer removes a canary, which stays armed — and
 /// the chain is not continued from it; broken row numbers or links are
 /// reported. Unlike the FIM baseline, nothing before a bad row is dropped.
+///
+/// Lab PR 260: and (c) each canary id's armings, from the rows applied
+/// ([`ArmHistory`]), for [`Registry::unrecorded_trips`].
 fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
     let mut seq = crate::chain_anchor::RowSeq::default();
     let f = match OpenOptions::new().read(true).open(path) {
@@ -673,6 +861,7 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
             return Ok(ChainRead {
                 last_hash: GENESIS_PREV_HASH.to_string(),
                 live: BTreeMap::new(),
+                history: BTreeMap::new(),
                 skipped: 0,
                 seq,
                 findings: Vec::new(),
@@ -686,6 +875,7 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
     let mut reader = crate::canary::chain_lines::ChainLines::new(BufReader::new(f));
     let mut last: Option<String> = None;
     let mut live: BTreeMap<String, CanaryLiveState> = BTreeMap::new();
+    let mut history: BTreeMap<String, ArmHistory> = BTreeMap::new();
     let mut skipped = 0usize;
     let mut unverified = 0usize;
     let mut breaks: Vec<String> = Vec::new();
@@ -777,6 +967,11 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
                 }
             }
         }
+        // Lab PR 260: what the row says of the canary's armings.
+        history
+            .entry(entry.canary_id.clone())
+            .or_default()
+            .note(&entry);
         last = Some(entry.entry_hash);
     }
     let mut findings = Vec::new();
@@ -802,6 +997,7 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
     Ok(ChainRead {
         last_hash: last.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()),
         live,
+        history,
         skipped,
         seq,
         findings,
@@ -811,6 +1007,10 @@ fn read_chain(path: &Path, pubkey: &VerifyingKey) -> Result<ChainRead> {
 /// The actor of the rows the agent writes on its own (Trip, DecoyCheck),
 /// as in the audit log.
 pub const AGENT_ACTOR: &str = "agent-self";
+
+/// Lab PR 260: the audit op of a trip the boot found in the access log and
+/// the registry did not record ([`Registry::unrecorded_trips`]).
+pub const TRIP_RECOVERED_OP: &str = "canary_trip_recovered";
 
 /// Pure helper: compute `entry_hash` + signature for a chain
 /// row against a given `prev_hash` and signing key. Every row
@@ -1983,6 +2183,370 @@ mod tests {
             .take_chain_findings()
             .iter()
             .any(|f| f.kind == "chain_lines_unverified"));
+    }
+
+    // ── Lab PR 260: the trip the access log holds ──────────────────────
+
+    use crate::canary::access_log::{CanaryAccessDb, CanaryAccessDraft};
+    use nn_model::{CanaryAccessKind, CanaryTypeTag};
+
+    const ACCESS_LOG: &str = "canary_access.jsonl";
+
+    fn access_db(dir: &TempDir) -> CanaryAccessDb {
+        let (key, _) = fresh_signing_key(dir);
+        CanaryAccessDb::open(&dir.path().join(ACCESS_LOG), key, [0u8; 16]).unwrap()
+    }
+
+    /// An access of `canary_id` as the detector records it.
+    fn access(id: &str, first_trip: bool, pid: u32) -> CanaryAccessDraft {
+        CanaryAccessDraft {
+            canary_id: id.to_string(),
+            canary_name: "decoy".to_string(),
+            canary_type: CanaryTypeTag::File,
+            access_kind: CanaryAccessKind::FileOpen,
+            accessor_pid: pid,
+            accessor_uid: 1000,
+            accessor_comm: "cat".to_string(),
+            accessor_exe: Some("/usr/bin/cat".to_string()),
+            first_trip,
+        }
+    }
+
+    /// The boot (`main.rs`, `record_unrecorded_trips`, without its audit
+    /// row): the registry opens, then the access log (its torn tail
+    /// repaired), then each trip the registry does not record is recorded.
+    fn boot(dir: &TempDir) -> (Registry, Vec<UnrecordedTrip>) {
+        let mut reg = reopen(dir, &dir.path().join("canaries.jsonl"));
+        drop(access_db(dir));
+        let found = reg.unrecorded_trips(&dir.path().join(ACCESS_LOG)).unwrap();
+        for trip in &found {
+            assert!(reg
+                .mark_tripped(&trip.canary_id, Some(trip.access.entry_hash.clone()))
+                .unwrap());
+        }
+        (reg, found)
+    }
+
+    fn actions(path: &Path, id: &str) -> Vec<RegistryAction> {
+        rows(path)
+            .into_iter()
+            .filter(|r| r.canary_id == id)
+            .map(|r| r.action)
+            .collect()
+    }
+
+    /// The finding of lab PR 258's KVM run: the agent stopped between the
+    /// access row and the `Trip` row, and the next start re-armed the
+    /// canary. Now that start records the trip — a `Trip` row naming the
+    /// access row — and the one after it finds nothing more to record; the
+    /// chain verifies. On the starting code the canary came back armed.
+    #[test]
+    fn a_trip_the_registry_did_not_record_is_recorded_at_the_next_open() {
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let (id, trip) = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            assert!(reg.is_armed(&id));
+            let trip = access_db(&dir).append(access(&id, true, 4242)).unwrap();
+            // stopped here: no `Trip` row
+            (id, trip)
+        };
+        let (reg, found) = boot(&dir);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].canary_id, id);
+        assert_eq!(found[0].name, "test_canary_1");
+        assert_eq!(found[0].access, trip);
+        assert_eq!((found[0].access_row, found[0].first_trip_rows), (0, 1));
+        assert!(!reg.is_armed(&id), "tripped");
+        assert_eq!(
+            reg.get(&id).unwrap().first_trip_access_hash.as_deref(),
+            Some(trip.entry_hash.as_str())
+        );
+        let all = rows(&log_path);
+        assert_eq!(
+            actions(&log_path, &id),
+            [RegistryAction::Deploy, RegistryAction::Trip]
+        );
+        assert_eq!(all[1].first_trip_access_hash, Some(trip.entry_hash.clone()));
+        assert_eq!(all[1].deployed_by_fp, AGENT_ACTOR);
+        verify_chain(&all, &pubkey).unwrap();
+        drop(reg);
+        let (reg, found) = boot(&dir);
+        assert!(found.is_empty(), "recorded once: {found:?}");
+        assert!(!reg.is_armed(&id));
+        assert_eq!(rows(&log_path).len(), 2);
+    }
+
+    /// A refresh names the trip it clears (the field said nothing on a
+    /// `Refresh` row), the live state keeps no hash, and the canary is
+    /// armed after a restart: the first-trip row it cleared is not a trip
+    /// of the new arming. An agent before this lot reads the row as it
+    /// always did: it clears the trip.
+    #[test]
+    fn a_refresh_names_the_trip_it_clears_and_rearms_for_good() {
+        let dir = TempDir::new().unwrap();
+        let (key, pubkey) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+        let trip = access_db(&dir).append(access(&id, true, 1)).unwrap();
+        assert!(reg
+            .mark_tripped(&id, Some(trip.entry_hash.clone()))
+            .unwrap());
+        let refresh = reg.refresh(&id, "11111111", None).unwrap();
+        assert_eq!(refresh.action, RegistryAction::Refresh);
+        assert!(!refresh.tripped);
+        assert_eq!(
+            refresh.first_trip_access_hash,
+            Some(trip.entry_hash.clone())
+        );
+        assert_eq!(reg.get(&id).unwrap().first_trip_access_hash, None);
+        assert!(reg.is_armed(&id));
+        // a refresh of an armed canary names nothing
+        let again = reg.refresh(&id, "11111111", None).unwrap();
+        assert_eq!(again.first_trip_access_hash, None);
+        drop(reg);
+        verify_chain(&rows(&log_path), &pubkey).unwrap();
+        let (reg, found) = boot(&dir);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(reg.is_armed(&id));
+        assert_eq!(reg.get(&id).unwrap().first_trip_access_hash, None);
+    }
+
+    /// After a refresh, the next first-trip row is a trip of the new
+    /// arming: a stop before its `Trip` row is recorded at the next open,
+    /// the trip the refresh cleared is not (nor a later access).
+    #[test]
+    fn a_trip_after_a_refresh_is_recorded_the_one_it_cleared_is_not() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let (id, second) = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            let mut log = access_db(&dir);
+            let first = log.append(access(&id, true, 1)).unwrap();
+            reg.mark_tripped(&id, Some(first.entry_hash)).unwrap();
+            log.append(access(&id, false, 2)).unwrap();
+            reg.refresh(&id, "11111111", None).unwrap();
+            // stopped after this one's access row
+            let second = log.append(access(&id, true, 3)).unwrap();
+            (id, second)
+        };
+        let (reg, found) = boot(&dir);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].access, second);
+        assert_eq!(found[0].access_row, 2);
+        assert!(!reg.is_armed(&id));
+        assert_eq!(
+            actions(&log_path, &id),
+            [
+                RegistryAction::Deploy,
+                RegistryAction::Trip,
+                RegistryAction::Refresh,
+                RegistryAction::Trip
+            ]
+        );
+        // refreshed again: armed for good
+        let mut reg = reg;
+        reg.refresh(&id, "11111111", None).unwrap();
+        drop(reg);
+        let (reg, found) = boot(&dir);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(reg.is_armed(&id));
+    }
+
+    /// A `Trip` row that could not be written (the canary tripped for that
+    /// run), then a refresh that could: the refresh names the trip it
+    /// cleared, so the next open does not take that trip's access row for
+    /// a trip of the new arming. Without the name the canary would come
+    /// back tripped — a refresh the operator made, undone.
+    #[test]
+    fn a_refresh_after_a_trip_the_registry_could_not_record_rearms_for_good() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let aside = dir.path().join("canaries.jsonl.aside");
+        let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+        let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+        let trip = access_db(&dir).append(access(&id, true, 1)).unwrap();
+        // the registry cannot be appended to: a directory at its path
+        std::fs::rename(&log_path, &aside).unwrap();
+        std::fs::create_dir(&log_path).unwrap();
+        assert!(reg
+            .mark_tripped(&id, Some(trip.entry_hash.clone()))
+            .is_err());
+        assert!(!reg.is_armed(&id), "tripped for this run");
+        std::fs::remove_dir(&log_path).unwrap();
+        std::fs::rename(&aside, &log_path).unwrap();
+        let refresh = reg.refresh(&id, "11111111", None).unwrap();
+        assert_eq!(refresh.first_trip_access_hash, Some(trip.entry_hash));
+        drop(reg);
+        assert_eq!(
+            actions(&log_path, &id),
+            [RegistryAction::Deploy, RegistryAction::Refresh]
+        );
+        let (reg, found) = boot(&dir);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(reg.is_armed(&id));
+    }
+
+    /// Agents before lab PR 143 wrote no `Trip` row and agents before this
+    /// lot named nothing in a `Refresh` row: a first-trip row written
+    /// before such a refresh (by time) was refreshed, one written after it
+    /// is a trip of its arming.
+    #[test]
+    fn a_refresh_that_names_nothing_is_placed_by_its_time() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let id = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            // the trip lived in memory (no `Trip` row) ...
+            access_db(&dir).append(access(&id, true, 1)).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // ... and the refresh, of a canary the registry held armed,
+            // names nothing
+            assert_eq!(
+                reg.refresh(&id, "11111111", None)
+                    .unwrap()
+                    .first_trip_access_hash,
+                None
+            );
+            id
+        };
+        let (reg, found) = boot(&dir);
+        assert!(found.is_empty(), "refreshed after it: {found:?}");
+        assert!(reg.is_armed(&id));
+        drop(reg);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let after = access_db(&dir).append(access(&id, true, 2)).unwrap();
+        let (reg, found) = boot(&dir);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].access, after);
+        assert_eq!(
+            found[0].first_trip_rows, 1,
+            "the refreshed one is not counted"
+        );
+        assert!(!reg.is_armed(&id));
+    }
+
+    /// An agent before this lot that stopped in the gap re-armed the canary
+    /// at its next start, and its next first trip was recorded: the older
+    /// first-trip row is before a row the registry names, so a refresh
+    /// re-armed after both — one that names that trip (this lot's), or one
+    /// that names nothing (written before). Two such stops in a row leave
+    /// two rows no row names: the trip is recorded with the later one, and
+    /// both are counted.
+    #[test]
+    fn first_trip_rows_before_a_row_the_registry_names_are_accounted_for() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let (named, legacy) = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let named = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            let legacy = reg.deploy(sample_draft(2)).unwrap().canary_id;
+            let mut log = access_db(&dir);
+            for id in [&named, &legacy] {
+                log.append(access(id, true, 1)).unwrap();
+                let recorded = log.append(access(id, true, 2)).unwrap();
+                reg.mark_tripped(id, Some(recorded.entry_hash)).unwrap();
+            }
+            reg.refresh(&named, "11111111", None).unwrap();
+            // a refresh as written before this lot: it names nothing
+            let mut state = reg.get(&legacy).unwrap();
+            state.tripped = false;
+            state.first_trip_access_hash = None;
+            reg.append(RegistryAction::Refresh, &state, "11111111", None)
+                .unwrap();
+            (named, legacy)
+        };
+        let (reg, found) = boot(&dir);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(reg.is_armed(&named));
+        assert!(reg.is_armed(&legacy));
+        drop(reg);
+        let trips: BTreeMap<String, CanaryAccessEntry> = {
+            let mut log = access_db(&dir);
+            [&named, &legacy]
+                .into_iter()
+                .map(|id| {
+                    log.append(access(id, true, 3)).unwrap();
+                    (id.clone(), log.append(access(id, true, 4)).unwrap())
+                })
+                .collect()
+        };
+        let (reg, found) = boot(&dir);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for found in &found {
+            assert_eq!(found.access, trips[&found.canary_id], "the later one");
+            assert_eq!(found.first_trip_rows, 2);
+            assert!(!reg.is_armed(&found.canary_id));
+        }
+    }
+
+    /// What trips nothing: an access row nobody signed for an armed
+    /// canary, a copy of a trip a refresh cleared, a later access, another
+    /// canary's trip (each canary is judged on its own rows), the rows of a
+    /// burned canary; and with no armed canary the access log is not read.
+    #[test]
+    fn rows_that_trip_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canaries.jsonl");
+        let access_path = dir.path().join(ACCESS_LOG);
+        let (armed, other, burned) = {
+            let mut reg = Registry::open(&log_path, key, [0u8; 16]).unwrap();
+            let armed = reg.deploy(sample_draft(1)).unwrap().canary_id;
+            let other = reg.deploy(sample_draft(2)).unwrap().canary_id;
+            let burned = reg.deploy(sample_draft(3)).unwrap().canary_id;
+            let mut log = access_db(&dir);
+            let cleared = log.append(access(&armed, true, 1)).unwrap();
+            reg.mark_tripped(&armed, Some(cleared.entry_hash.clone()))
+                .unwrap();
+            reg.refresh(&armed, "11111111", None).unwrap();
+            log.append(access(&other, false, 2)).unwrap();
+            log.append(access(&burned, true, 3)).unwrap();
+            reg.burn(&burned, "11111111").unwrap();
+            drop(log);
+            let mut forged = cleared.clone();
+            forged.seq = Some(3);
+            forged.accessor_pid = 5;
+            forged.entry_hash = "cd".repeat(32);
+            let mut body = std::fs::read_to_string(&access_path).unwrap();
+            let copy = body.lines().next().unwrap().to_string();
+            body.push_str(&format!(
+                "{}\n{copy}\n",
+                serde_json::to_string(&forged).unwrap()
+            ));
+            std::fs::write(&access_path, body).unwrap();
+            (armed, other, burned)
+        };
+        let (reg, found) = boot(&dir);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(reg.is_armed(&armed));
+        assert!(reg.is_armed(&other));
+        assert!(reg.get(&burned).is_none());
+        // no armed canary: the log is not read (a directory at its path)
+        let dir2 = TempDir::new().unwrap();
+        let (key, _) = fresh_signing_key(&dir2);
+        let mut reg = Registry::open(&dir2.path().join("canaries.jsonl"), key, [0u8; 16]).unwrap();
+        let id = reg.deploy(sample_draft(1)).unwrap().canary_id;
+        reg.mark_tripped(&id, None).unwrap();
+        std::fs::create_dir(dir2.path().join(ACCESS_LOG)).unwrap();
+        assert!(reg
+            .unrecorded_trips(&dir2.path().join(ACCESS_LOG))
+            .unwrap()
+            .is_empty());
+        reg.refresh(&id, "11111111", None).unwrap();
+        assert!(
+            reg.unrecorded_trips(&dir2.path().join(ACCESS_LOG)).is_err(),
+            "an armed canary: the log is read, and a directory cannot be"
+        );
     }
 
     /// EVD-023 (NN-AUD-427): a pre-image that carries its seal is refused

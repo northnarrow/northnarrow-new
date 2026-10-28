@@ -23,6 +23,12 @@ has the details of each change below.
    file quarantined after the upgrade is written in a new record format
    that an agent from before it cannot restore (§5): restore such an
    entry with this release, also after a rollback.
+5. A canary whose trip an earlier agent lost when it stopped at the wrong
+   moment — its access row is in `canary_access.jsonl`, the registry has
+   no `trip` row for it, and the agent re-armed it — is tripped at the
+   first start of this release (§3): look for its signed
+   `canary_trip_recovered`, and re-arm it with `nn-admin canary refresh`
+   if you want it armed.
 
 ## 1. The on-host LLM advisor is removed (lab PR 214)
 
@@ -137,6 +143,31 @@ not above 11G the agent still raises its own `oom_score_adj` to 0 at start
   rows written before the upgrade keep their bytes and verify as before,
   and the INVESTIGATE row of an episode that opened with a failed soft
   block now carries the failure (it was a row of its own).
+
+- **A canary trip survives an agent that stops in the middle of it (lab
+  PR 260).** A trip is two signed rows, the access row in
+  `canary_access.jsonl` (`first_trip: true`) and then the `trip` row in
+  `canaries.jsonl`. An agent stopped between the two (a crash, a kill, a
+  power loss, or a `trip` row it could not write) re-armed the canary at
+  its next start: the next access was a first trip again, and the
+  registry never showed the first one. Each start now reads the access
+  log's first-trip rows of the canaries the registry holds armed, and
+  records one the registry does not: an ERROR (`canary: a trip the
+  registry did not record`), a signed `canary_trip_recovered` in the
+  audit log (`extra`: the canary's id and name, the access row's
+  position, hash and time, the accessor's pid, uid, comm and executable,
+  how many such rows) and a `trip` row naming the access row, which
+  `nn-admin canary list` shows; the canary stays tripped until `canary
+  refresh`. If the agent stopped before it answered the access, the
+  response (NN-L-CANARY-00x, the kill) did not run: check the accessor.
+  Only rows the agent's key signed count, at the place they were signed
+  with. A `refresh` row now names the trip it clears
+  (`first_trip_access_hash`, `tripped: false`; `null` when the canary was
+  armed): an agent from before reads it as before, the trip cleared.
+  A trip an agent before this release recorded only in memory (before lab
+  PR 143) or lost as above, and an operator refreshed afterwards, stays
+  refreshed: a refresh row that names nothing counts after the first-trip
+  rows older than it.
 
 ## 4. Build and development (source builds only)
 

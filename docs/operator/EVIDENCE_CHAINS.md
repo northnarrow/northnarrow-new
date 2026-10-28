@@ -17,6 +17,7 @@ repository, not shipped with the release):
 |---|---|---|
 | every start, before anything opens | anchored heads and checkpoints compared with the files | ERROR `chain integrity: evidence missing or altered` + signed `integrity_drift` |
 | every start, at open | canary registry rows (all), canary access rows (last 256), audit row numbers | same |
+| every start, after the canary chains open | the access log's first-trip rows of the canaries the registry holds armed (lab PR 260) | a trip the registry does not record: ERROR `canary: a trip the registry did not record` + signed `canary_trip_recovered` + a `trip` row; the canary stays tripped |
 | after the start, in the background | last 4 MiB of each rotating log's active file | signed `chain_verify` (`ok`/`broken`, each broken log with its `class`) + `integrity_drift` `chain_verify_failed`, at every start while the lines are there |
 | every `nn-admin detections` | the rows served | rows that do not verify are left out; ERROR + `chain_lines_unverified` |
 | on demand | `sudo nn-admin chain verify` | `OK`/`BROKEN` per chain, exit 8 on any problem |
@@ -262,7 +263,9 @@ start's own findings (`chain_truncated`, …) and are reported apart.
   admin bootstrap is closed for good; key changes need the usual two
   signatures.
 - A canary registry row that does not verify is not applied: a forged
-  `Burn` leaves the canary armed.
+  `Burn` leaves the canary armed. A canary access row that does not
+  verify (or a copy of one, out of the place it was signed with) trips
+  nothing at the next start (lab PR 260).
 
 ## Expected once, not an attack
 
