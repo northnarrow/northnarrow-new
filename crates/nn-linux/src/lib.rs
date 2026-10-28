@@ -64,6 +64,11 @@ pub mod async_fd;
 // (R09a; was the agent's `atomic_file`, the path of `antitamper-bpf`'s).
 pub mod atomic_file;
 
+// Whether the audit log can be written, checked before anything attaches
+// (lab PR 218; R04a's cut of the chain code's host call, lab PR 241; R09c,
+// lab PR 257; was the agent's `audit_preflight`).
+pub mod audit_preflight;
+
 // An external command with a deadline (R09a; was the agent's
 // `bounded_cmd`).
 pub mod bounded_cmd;
@@ -299,6 +304,12 @@ pub mod self_integrity;
 // the agent's `sensors`; `build.rs` embeds the object).
 pub mod sensors;
 
+// The shutdown-authorisation marker's file: written before the agent's
+// authorised exit, read by the watchdog; its format and verification are
+// nn-proto's (Tappa 8 A7; R09c, lab PR 257; was the agent's
+// `shutdown_marker`).
+pub mod shutdown_marker;
+
 // What systemd reports the host as (`SystemState`), asked over its private
 // socket, whose server must be PID 1 (external audit EBPF-001; R09c, lab PR
 // 257; was the agent's `systemd_state`).
@@ -313,6 +324,11 @@ pub mod telemetry_probe;
 // The system directories' binaries, never `$PATH` (R09a; was the agent's
 // `trusted_bin`).
 pub mod trusted_bin;
+
+// The record of an upgrade `install.sh` rolled back, signed by the agent it
+// restored (lab PR 220; R09c, lab PR 257; was the agent's
+// `upgrade_rollback`).
+pub mod upgrade_rollback;
 
 // R09a shims (lab PR 253; plan §4.1 rule 2, removed in R17): the paths the
 // moved code names for what is nn-evidence's and nn-core's, as the agent's

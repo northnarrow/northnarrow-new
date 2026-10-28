@@ -45,9 +45,9 @@ pub mod audit {
     /// another is named.
     pub type AuditLog<K = AgentSigningKey> = nn_evidence::audit::AuditLog<K>;
 }
-/// The audit log's writability before the attach (from `audit`, R04a, lab
-/// PR 241).
-pub mod audit_preflight;
+/// R09c shim: the audit log's writability before the attach (from `audit`,
+/// R04a, lab PR 241) is nn-linux's.
+pub use nn_linux::audit_preflight;
 /// Lab PR 218: the start as typed phases, the BPF LSM gate, the deny
 /// self-test, the degradations, the trust level and the capability manifest.
 pub mod boot;
@@ -188,7 +188,9 @@ pub use nn_linux::self_integrity;
 #[cfg(feature = "test-privileged")]
 pub mod sensor_feasibility;
 pub mod sensors;
-pub mod shutdown_marker;
+/// R09c shim: the shutdown marker's file (its format is nn-proto's) is
+/// nn-linux's.
+pub use nn_linux::shutdown_marker;
 /// R09c shim: what systemd reports the host as, over its private socket,
 /// is nn-linux's.
 pub use nn_linux::systemd_state;
@@ -196,7 +198,8 @@ pub use nn_linux::systemd_state;
 pub use nn_linux::telemetry_probe;
 /// R09a shim: the system directories' binaries are nn-linux's.
 pub use nn_linux::trusted_bin;
-pub mod upgrade_rollback;
+/// R09c shim: the signed record of a rolled-back upgrade is nn-linux's.
+pub use nn_linux::upgrade_rollback;
 /// Lab builds only (`--verifier-check`): every program of the embedded
 /// eBPF object through the kernel's verifier.
 #[cfg(feature = "debug-trigger")]

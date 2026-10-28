@@ -141,9 +141,6 @@ planned = false
 "bin::nn_admin" = "nn-admin"
 "admin_cli" = "nn-admin"
 "admin_socket" = "northnarrow-agent"
-# post-plan (lab PR 241, R04a): the audit log's writability before the
-# attach (`access(2)`), from `audit`
-"audit_preflight" = "nn-linux"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a.
 # R09b (lab PR 254): the phases, the attach permit the sensors' attach
 # takes, the degradations of a run (`boot::degradation`, `[shims.agent]`)
@@ -281,10 +278,6 @@ planned = false
 # the loader on the agent's exec guards (`exec_guards`), an alias as the
 # posture's on `LinuxHost`
 "sensors" = "nn-linux"
-# the file I/O; the marker's format is nn-proto's (R03, lab PR 240)
-"shutdown_marker" = "nn-linux"
-# post-plan (lab PR 220): the signed record of a rolled-back upgrade
-"upgrade_rollback" = "nn-linux"
 # post-plan (lab only): `--verifier-check`
 "verifier_check" = "nn-linux"
 
@@ -381,6 +374,14 @@ planned = false
 # R09c (lab PR 257): the self-integrity watcher (Tappa 10.8); it holds the
 # agent's signed-overlay gate through nn-core's `Vouch`
 "self_integrity" = "nn-linux"
+# R09c (lab PR 257): the files around the agent's start and stop — the
+# audit log's writability before the attach (post-plan, lab PR 241, R04a:
+# `access(2)`, from `audit`), the shutdown marker's file I/O (its format
+# is nn-proto's, R03, lab PR 240), the signed record of a rolled-back
+# upgrade (post-plan, lab PR 220)
+"audit_preflight" = "nn-linux"
+"shutdown_marker" = "nn-linux"
+"upgrade_rollback" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"
