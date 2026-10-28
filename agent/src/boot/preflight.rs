@@ -57,8 +57,9 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // checks only — until `verify_integrity` hands out the proof the load,
     // the pins and the attaches take; a step out of its phase stops the
     // start. R11b (lab PR 262): the steps the proof requires are recorded by
-    // their checks (`boot::checks`), each once it passed.
-    let mut boot = BootSequence::new();
+    // their checks (`boot::checks`), each once it passed. Review #466 F3:
+    // the process's one sequence — a second `begin` is refused.
+    let mut boot = BootSequence::begin()?;
 
     // Boot preflight: prove the embedded eBPF half is real and intact
     // BEFORE doing any work. The build-time staleness guard
@@ -78,10 +79,7 @@ pub(crate) fn check(cli: &Cli) -> Result<Preflight> {
     // anything below reads or writes there (the bootstraps would create
     // files in a link's target, the attach would protect it).
     let mut state_dir_linked = false;
-    if let Verdict::Refused(why) = checks::state_dir(
-        &mut boot,
-        std::path::Path::new(northnarrow_agent::anti_tamper::filesystem::STATE_DIR),
-    )? {
+    if let Verdict::Refused(why) = checks::state_dir(&mut boot)? {
         error!("{why}");
         state_dir_linked = true;
         refused.get_or_insert(Refusal::new("state_dir", why));

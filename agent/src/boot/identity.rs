@@ -99,7 +99,7 @@ mod tests {
         let cli = cli(dir.path());
         let floor = || RollbackFloor::scan(&dir.path().join("audit.log"), &dir.path().join("key"));
 
-        let mut boot = BootSequence::new();
+        let mut boot = BootSequence::for_tests();
         let first = resolve(&cli, &mut boot, floor()).expect("the identity phase");
         assert!(boot.has_done(BootStep::Identity));
         assert!(matches!(first.identity.source, IdentitySource::Minted));
@@ -107,7 +107,7 @@ mod tests {
         let on_disk = std::fs::read_to_string(dir.path().join("agent_id")).unwrap();
         assert_eq!(on_disk, format!("{}\n", hex::encode(first.agent_id)));
 
-        let mut boot = BootSequence::new();
+        let mut boot = BootSequence::for_tests();
         let again = resolve(&cli, &mut boot, floor()).expect("the identity phase");
         assert!(matches!(again.identity.source, IdentitySource::Loaded));
         assert_eq!(again.agent_id, first.agent_id);

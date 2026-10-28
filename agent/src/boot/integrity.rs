@@ -2,7 +2,6 @@
 //! integrity proof (R11a, lab PR 261: from `main.rs`; R11b, lab PR 262: the
 //! checks record their steps, `verify_integrity` gives the proof).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -129,7 +128,9 @@ pub(crate) fn check(
     // (below); in detect-only a WARN.
     let caps_degraded: Vec<String> = {
         use northnarrow_agent::response::caps_preflight as caps;
-        let (reading, gate) = checks::capabilities(boot, detect_only)?;
+        // review #466 F3: the check reads the environment's detect-only
+        // itself; the command line's flag is the one input it takes
+        let (reading, gate) = checks::capabilities(boot, cli.detect_only)?;
         if let caps::CapsReading::Read {
             note: Some(note), ..
         } = &reading
@@ -168,8 +169,6 @@ pub(crate) fn check(
         use northnarrow_agent::install_manifest::{
             BootHistory, IntegrityOutcome, ALLOW_UNVERIFIED_ENV,
         };
-        let own_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
-        let allow = std::env::var(ALLOW_UNVERIFIED_ENV).ok();
         // External audit DEP-009: a missing manifest is a removal once a
         // boot of this install verified against it — the signed chain is
         // the sentinel, read (only in that case) before the decision.
@@ -178,13 +177,7 @@ pub(crate) fn check(
             history,
             history_error,
             fatal,
-        } = checks::install_manifest(
-            boot,
-            &cli.install_manifest,
-            &own_exe,
-            &cli.audit_log_file,
-            allow.as_deref(),
-        )?;
+        } = checks::install_manifest(boot, &cli.install_manifest, &cli.audit_log_file)?;
         if let Some(e) = &history_error {
             error!(
                 error = %e,
@@ -299,9 +292,6 @@ pub(crate) fn check(
         &cli.signing_key_file,
         identity.id,
         early_registration_failed,
-        std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
-            .ok()
-            .as_deref(),
     )?;
     let preflight_deferred = matches!(
         audit.preflight,
@@ -451,8 +441,7 @@ pub(crate) fn check(
     // anything attaches, unless NN_ANTI_TAMPER_ALLOW_DEGRADED=1; signed
     // either way (`northnarrow_agent::boot::lsm`).
     let allow_degraded = northnarrow_agent::boot::lsm::allow_degraded_from_env();
-    let (bpf_lsm_state, lsm_gate) =
-        checks::bpf_lsm(boot, std::path::Path::new("/"), allow_degraded)?;
+    let (bpf_lsm_state, lsm_gate) = checks::bpf_lsm(boot)?;
     match lsm_gate {
         northnarrow_agent::boot::lsm::LsmGate::Proceed => info!(
             lsms = bpf_lsm_state.list().unwrap_or(""),

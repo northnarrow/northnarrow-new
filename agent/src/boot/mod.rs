@@ -708,6 +708,10 @@ mod tests {
             );
         }
         assert!(!sources.contains("IntegrityVerified::for_tests"));
+        // review #466 F3: the process's one sequence is the preflight's
+        assert_eq!(sources.matches("BootSequence::begin()").count(), 1);
+        assert!(function(PHASES[1].1, PHASES[1].2).contains("BootSequence::begin()?"));
+        assert!(!sources.contains("BootSequence::for_tests"));
     }
 
     /// R11b (lab PR 262): every refusal of the start goes through

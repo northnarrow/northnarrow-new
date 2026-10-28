@@ -17,13 +17,27 @@
 //! nothing reaches the kernel before every integrity check has passed. The
 //! BPF LSM gate moved here from the agent (`lsm`) so that its check records
 //! its step too.
+//!
+//! Review #466 F3: a process has one sequence — [`BootSequence::begin`],
+//! the only public way to one, refuses a second —, and the checks read the
+//! host's own roots (`/`, the state directory, the running binary): a
+//! caller gives the operator's configuration (the install manifest's and the
+//! audit log's paths, detect-only, the overrides), never a root of its
+//! choosing. So the one proof of a process says that its start ran every
+//! check against this host and was refused by none.
 
 pub mod checks;
 pub mod degradation;
 pub mod lsm;
 pub mod manifest;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tracing::info;
+
+/// Review #466 F3: a boot sequence was begun in this process
+/// ([`BootSequence::begin`]).
+static BEGUN: AtomicBool = AtomicBool::new(false);
 
 /// The phases of a start, in their order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -209,6 +223,9 @@ pub enum BootOrderError {
     /// records ([`BootStep::is_checked`]).
     #[error("boot step {step} is recorded by its check only (boot::checks)")]
     Unchecked { step: &'static str },
+    /// Review #466 F3: a second [`BootSequence::begin`] in one process.
+    #[error("a boot sequence was begun already in this process: one start, one sequence")]
+    Begun,
 }
 
 /// The proof that every integrity check of the start passed: the only way
@@ -226,10 +243,16 @@ pub enum BootOrderError {
 /// The object's bytes are this crate's (`sensors::ebpf_object`): only its
 /// loaders load them.
 ///
-/// No public field, not `Clone`, `Copy` nor `Default`: outside tests its
-/// one constructor is [`BootSequence::verify_integrity`], which gives one
-/// only once every preflight step is recorded — and the steps the attach
-/// depends on are recorded by their checks alone ([`checks`]).
+/// No public field, not `Clone`, `Copy` nor `Default` (the tests'
+/// `the_proof_and_the_sequence_are_neither_clone_nor_default` hold it on
+/// stable: the compile_fail examples below show it, rustdoc does not check
+/// their error codes there): outside tests its one constructor is
+/// [`BootSequence::verify_integrity`], on the one sequence a process can
+/// begin ([`BootSequence::begin`]), which gives one only once every
+/// preflight step is recorded — and the steps the attach depends on are
+/// recorded by their checks alone ([`checks`]), against the host's own
+/// roots. Like any zero-sized type it is forged by `unsafe` code
+/// (`mem::zeroed`, `transmute`): the guarantee is safe Rust's.
 ///
 /// ```compile_fail,E0451
 /// // Not built outside this crate: its field is private.
@@ -267,24 +290,41 @@ impl IntegrityVerified {
 }
 
 /// The start's position: the current phase and the steps it has done.
+///
+/// Review #466 F3: not `Clone` nor `Default`, and outside tests begun once
+/// per process ([`Self::begin`]): a second sequence would be a second
+/// proof.
 #[derive(Debug)]
 pub struct BootSequence {
     phase: BootPhase,
     done: Vec<BootStep>,
 }
 
-impl Default for BootSequence {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl BootSequence {
-    pub fn new() -> Self {
+    /// A sequence of this crate's own tests.
+    pub(crate) fn new() -> Self {
         BootSequence {
             phase: BootPhase::Preflight,
             done: Vec::new(),
         }
+    }
+
+    /// The start's boot sequence, in [`BootPhase::Preflight`] (review #466
+    /// F3): the only public way to one, once per process — a second call is
+    /// [`BootOrderError::Begun`], so no other path of the process gets a
+    /// sequence, and a proof, of its own.
+    pub fn begin() -> Result<Self, BootOrderError> {
+        if BEGUN.swap(true, Ordering::SeqCst) {
+            return Err(BootOrderError::Begun);
+        }
+        Ok(Self::new())
+    }
+
+    /// A sequence for the agent's tests (`test-util`, a dev-dependency
+    /// feature: a release build has none).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_tests() -> Self {
+        Self::new()
     }
 
     pub fn phase(&self) -> BootPhase {
@@ -301,7 +341,8 @@ impl BootSequence {
     ///
     /// ```
     /// use nn_linux::boot::{BootOrderError, BootSequence, BootStep};
-    /// let mut boot = BootSequence::new();
+    /// let mut boot = BootSequence::begin().unwrap();
+    /// assert!(matches!(BootSequence::begin(), Err(BootOrderError::Begun)));
     /// assert!(matches!(
     ///     boot.done(BootStep::InstallManifest),
     ///     Err(BootOrderError::Unchecked { .. })
@@ -377,7 +418,8 @@ impl BootSequence {
     /// [`Self::enter`] the attach phase and get the proof the load, the pins
     /// and the attaches take (lab PR 218's `enter_attach`): only once every
     /// preflight step is recorded, the checked ones by their checks
-    /// ([`checks`]). The proof's one constructor outside tests.
+    /// ([`checks`]), and once per sequence (the attach phase cannot be
+    /// entered twice). The proof's one constructor outside tests.
     pub fn verify_integrity(&mut self) -> Result<IntegrityVerified, BootOrderError> {
         self.enter(BootPhase::Attach)?;
         Ok(IntegrityVerified { _sealed: () })
@@ -504,6 +546,65 @@ mod tests {
                 current: "attach",
             }
         );
+    }
+
+    /// Review #466 F3: neither the proof nor the sequence is `Clone`,
+    /// `Copy` or `Default` — a copy of either would be a second proof. On
+    /// stable, without a doctest: an inherent associated const whose bound
+    /// holds shadows the trait's default of the same name (the `impls`
+    /// crate's probe), so each flag is `true` exactly when the type
+    /// implements the trait. A `#[derive]` of one of them fails the tests'
+    /// build (the assertions are evaluated when they compile).
+    #[test]
+    fn the_proof_and_the_sequence_are_neither_clone_nor_default() {
+        use std::marker::PhantomData;
+        struct Probe<T>(PhantomData<T>);
+        trait Absent {
+            const CLONE: bool = false;
+            const COPY: bool = false;
+            const DEFAULT: bool = false;
+        }
+        impl<T> Absent for Probe<T> {}
+        #[allow(dead_code)]
+        impl<T: Clone> Probe<T> {
+            const CLONE: bool = true;
+        }
+        #[allow(dead_code)]
+        impl<T: Copy> Probe<T> {
+            const COPY: bool = true;
+        }
+        #[allow(dead_code)]
+        impl<T: Default> Probe<T> {
+            const DEFAULT: bool = true;
+        }
+        // evaluated when the tests compile: a derive breaks the tests' build
+        const {
+            // the probe itself: it sees what a type does implement
+            assert!(Probe::<String>::CLONE && Probe::<String>::DEFAULT && !Probe::<String>::COPY);
+            assert!(Probe::<u8>::COPY);
+            assert!(
+                !Probe::<IntegrityVerified>::CLONE,
+                "IntegrityVerified: Clone"
+            );
+            assert!(!Probe::<IntegrityVerified>::COPY, "IntegrityVerified: Copy");
+            assert!(
+                !Probe::<IntegrityVerified>::DEFAULT,
+                "IntegrityVerified: Default"
+            );
+            assert!(!Probe::<BootSequence>::CLONE, "BootSequence: Clone");
+            assert!(!Probe::<BootSequence>::DEFAULT, "BootSequence: Default");
+        }
+    }
+
+    /// Review #466 F3: one sequence per process — the second `begin` is
+    /// refused, whoever calls it (this crate's other tests build theirs with
+    /// the crate-private constructor).
+    #[test]
+    fn a_process_begins_one_boot_sequence() {
+        let first = BootSequence::begin();
+        assert!(first.is_ok());
+        assert_eq!(BootSequence::begin().unwrap_err(), BootOrderError::Begun);
+        assert_eq!(BootSequence::begin().unwrap_err(), BootOrderError::Begun);
     }
 
     #[test]

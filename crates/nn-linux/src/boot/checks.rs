@@ -41,9 +41,16 @@ pub fn ebpf_object(boot: &mut BootSequence) -> Result<Verdict, BootOrderError> {
     }
 }
 
-/// The state directory `dir`, and the agent's own entries in it, are not
-/// symbolic links ([`crate::anti_tamper::filesystem::refuse_linked_state_dir`]).
-pub fn state_dir(boot: &mut BootSequence, dir: &Path) -> Result<Verdict, BootOrderError> {
+/// The state directory ([`crate::anti_tamper::filesystem::STATE_DIR`]),
+/// and the agent's own entries in it, are not symbolic links
+/// ([`crate::anti_tamper::filesystem::refuse_linked_state_dir`]). Review
+/// #466 F3: the host's directory, not one the caller names.
+pub fn state_dir(boot: &mut BootSequence) -> Result<Verdict, BootOrderError> {
+    state_dir_in(boot, Path::new(crate::anti_tamper::filesystem::STATE_DIR))
+}
+
+/// [`state_dir`] for `dir` (this crate's tests).
+fn state_dir_in(boot: &mut BootSequence, dir: &Path) -> Result<Verdict, BootOrderError> {
     match crate::anti_tamper::filesystem::refuse_linked_state_dir(dir) {
         Ok(()) => {
             boot.passed(BootStep::StateDir)?;
@@ -76,11 +83,15 @@ fn btf_offsets_decided(
 
 /// This thread's effective capabilities against what the response needs
 /// ([`caps::read_effective`], [`caps::boot_gate`]): [`BootGate::Start`]
-/// passes (its degradations are the caller's to sign).
+/// passes (its degradations are the caller's to sign). Detect-only is the
+/// command line's `--detect-only` (`cli_detect_only`) or the process's
+/// environment (`NN_DETECT_ONLY`, `NORTHNARROW_DRY_RUN`), read here (review
+/// #466 F3), as the response reads it.
 pub fn capabilities(
     boot: &mut BootSequence,
-    detect_only: bool,
+    cli_detect_only: bool,
 ) -> Result<(CapsReading, BootGate), BootOrderError> {
+    let detect_only = cli_detect_only || nn_core::response::config::detect_only_env().is_some();
     let reading = caps::read_effective();
     let gate = capabilities_decided(boot, &reading, detect_only)?;
     Ok((reading, gate))
@@ -114,12 +125,27 @@ pub struct ManifestCheck {
 }
 
 /// The running binaries against the install manifest at `manifest`
-/// ([`install_manifest::check`]; `own_exe`: the running agent): every
-/// outcome passes but a fatal one — a mismatch, an unreadable manifest, or
-/// a missing one after a verified boot of this install (DEP-009, the
-/// signed chain at `audit_log` the sentinel) — unless `allow_unverified`
-/// ([`install_manifest::ALLOW_UNVERIFIED_ENV`]) is `1`.
+/// ([`install_manifest::check`]): every outcome passes but a fatal one — a
+/// mismatch, an unreadable manifest, or a missing one after a verified boot
+/// of this install (DEP-009, the signed chain at `audit_log` the sentinel)
+/// — unless the process's environment has
+/// [`install_manifest::ALLOW_UNVERIFIED_ENV`]`=1`. Review #466 F3: the
+/// binary compared is the running one (`std::env::current_exe`, else
+/// `/proc/self/exe`) and the override the environment's, not what the
+/// caller names.
 pub fn install_manifest(
+    boot: &mut BootSequence,
+    manifest: &Path,
+    audit_log: &Path,
+) -> Result<ManifestCheck, BootOrderError> {
+    let own_exe =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/proc/self/exe"));
+    let allow = std::env::var(install_manifest::ALLOW_UNVERIFIED_ENV).ok();
+    install_manifest_for(boot, manifest, &own_exe, audit_log, allow.as_deref())
+}
+
+/// [`install_manifest`] for the binary `own_exe` (this crate's tests).
+fn install_manifest_for(
     boot: &mut BootSequence,
     manifest: &Path,
     own_exe: &Path,
@@ -239,8 +265,29 @@ impl std::fmt::Debug for AuditOpen {
 /// ([`crate::audit::AuditLog::open`]: its chain read, a broken one refused).
 /// An unwritable log, one that cannot be opened, or a key that cannot be
 /// loaded (review #466 F4; an absent one is minted) refuses the start unless
-/// `allow_unwritable` ([`crate::audit::AUDIT_ALLOW_UNWRITABLE_ENV`]) is `1`.
+/// the process's environment has
+/// [`crate::audit::AUDIT_ALLOW_UNWRITABLE_ENV`]`=1` (read here, review #466
+/// F3).
 pub fn audit_log(
+    boot: &mut BootSequence,
+    path: &Path,
+    signing_key: &Path,
+    agent_id: [u8; 16],
+    closed_by_previous_hooks: bool,
+) -> Result<AuditCheck, BootOrderError> {
+    let allow = std::env::var(crate::audit::AUDIT_ALLOW_UNWRITABLE_ENV).ok();
+    audit_log_with(
+        boot,
+        path,
+        signing_key,
+        agent_id,
+        closed_by_previous_hooks,
+        allow.as_deref(),
+    )
+}
+
+/// [`audit_log`] with the override `allow_unwritable` (this crate's tests).
+fn audit_log_with(
     boot: &mut BootSequence,
     path: &Path,
     signing_key: &Path,
@@ -304,11 +351,18 @@ fn open_audit_log(
     }
 }
 
-/// `bpf` in the LSMs the kernel runs (`sys/kernel/security/lsm` under
-/// `root`, `/` on a host; [`lsm::gate`]): every outcome but
-/// [`LsmGate::Refuse`] passes — the degraded-mode opt-in (`allow_degraded`)
-/// and an unreadable list go on, signed by the caller.
-pub fn bpf_lsm(
+/// `bpf` in the LSMs the kernel runs (`/sys/kernel/security/lsm`;
+/// [`lsm::gate`]): every outcome but [`LsmGate::Refuse`] passes — the
+/// degraded-mode opt-in and an unreadable list go on,
+/// signed by the caller. Review #466 F3: the host's list, under `/`, and
+/// the opt-in the process's environment's
+/// ([`lsm::allow_degraded_from_env`]).
+pub fn bpf_lsm(boot: &mut BootSequence) -> Result<(BpfLsm, LsmGate), BootOrderError> {
+    bpf_lsm_in(boot, Path::new("/"), lsm::allow_degraded_from_env())
+}
+
+/// [`bpf_lsm`] for the list under `root` (this crate's tests).
+fn bpf_lsm_in(
     boot: &mut BootSequence,
     root: &Path,
     allow_degraded: bool,
@@ -369,16 +423,16 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let mut boot = BootSequence::new();
         assert!(matches!(
-            state_dir(&mut boot, &link).unwrap(),
+            state_dir_in(&mut boot, &link).unwrap(),
             Verdict::Refused(why) if why.contains("symbolic link")
         ));
         assert!(!has(&boot, BootStep::StateDir));
-        assert_eq!(state_dir(&mut boot, &real).unwrap(), Verdict::Passed);
+        assert_eq!(state_dir_in(&mut boot, &real).unwrap(), Verdict::Passed);
         assert!(has(&boot, BootStep::StateDir));
         // a missing directory is fine (the attach creates it)
         let mut boot = BootSequence::new();
         assert_eq!(
-            state_dir(&mut boot, &dir.path().join("absent")).unwrap(),
+            state_dir_in(&mut boot, &dir.path().join("absent")).unwrap(),
             Verdict::Passed
         );
     }
@@ -471,7 +525,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut boot = BootSequence::new();
         // no manifest, no chain: a developer run, passed
-        let c = install_manifest(
+        let c = install_manifest_for(
             &mut boot,
             &dir.path().join("install-manifest.json"),
             Path::new("/proc/self/exe"),
@@ -486,7 +540,7 @@ mod tests {
         // a chain that cannot be read: the removal is assumed
         std::fs::write(dir.path().join("audit.log"), b"not a row\n").unwrap();
         let mut boot = BootSequence::new();
-        let c = install_manifest(
+        let c = install_manifest_for(
             &mut boot,
             &dir.path().join("install-manifest.json"),
             Path::new("/proc/self/exe"),
@@ -507,14 +561,14 @@ mod tests {
         let not_a_file = dir.path().join("audit.log");
         std::fs::create_dir(&not_a_file).unwrap();
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &not_a_file, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &not_a_file, &key, [1; 16], false, None).unwrap();
         assert!(matches!(c.preflight, AuditPreflight::Unwritable(_)));
         assert!(matches!(c.open, AuditOpen::NotTried), "{:?}", c.open);
         assert!(c.fatal);
         assert!(!has(&boot, BootStep::AuditWritable));
         assert!(!key.exists(), "nothing opened, no key minted");
         // the override: tried, it fails, the start goes on unaudited
-        let c = audit_log(&mut boot, &not_a_file, &key, [1; 16], false, Some("1")).unwrap();
+        let c = audit_log_with(&mut boot, &not_a_file, &key, [1; 16], false, Some("1")).unwrap();
         assert!(matches!(c.open, AuditOpen::Failed(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(has(&boot, BootStep::AuditWritable));
@@ -529,7 +583,7 @@ mod tests {
         let key = dir.path().join("agent.sig.key");
         let path = dir.path().join("audit.log");
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
         assert_eq!(c.preflight, AuditPreflight::Writable);
         let AuditOpen::Open(mut log) = c.open else {
             panic!("{:?}", c.open)
@@ -545,7 +599,7 @@ mod tests {
         drop(log);
         // written: opens again, the next row chains on
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
         let AuditOpen::Open(log) = c.open else {
             panic!("{:?}", c.open)
         };
@@ -555,7 +609,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{{not a row}}\n{text}")).unwrap();
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
         assert!(
             matches!(c.open, AuditOpen::Failed(ref why) if why.contains("is not an audit row")),
             "{:?}",
@@ -564,7 +618,7 @@ mod tests {
         assert!(c.fatal);
         assert!(!has(&boot, BootStep::AuditWritable));
         // under the override the start goes on, unaudited
-        let c = audit_log(&mut boot, &path, &key, [1; 16], false, Some("1")).unwrap();
+        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, Some("1")).unwrap();
         assert!(matches!(c.open, AuditOpen::Failed(_)));
         assert!(!c.fatal);
         // a key that cannot be loaded: refused (review #466 F4), below
@@ -588,11 +642,11 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         for key in [&corrupted, &empty, &null, &directory] {
             let mut boot = BootSequence::new();
-            let c = audit_log(&mut boot, &log, key, [1; 16], false, None).unwrap();
+            let c = audit_log_with(&mut boot, &log, key, [1; 16], false, None).unwrap();
             assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
             assert!(c.fatal, "{}", key.display());
             assert!(!has(&boot, BootStep::AuditWritable));
-            let c = audit_log(&mut boot, &log, key, [1; 16], false, Some("1")).unwrap();
+            let c = audit_log_with(&mut boot, &log, key, [1; 16], false, Some("1")).unwrap();
             assert!(matches!(c.open, AuditOpen::NoKey(_)));
             assert!(!c.fatal, "the override");
             assert!(has(&boot, BootStep::AuditWritable));
@@ -601,7 +655,7 @@ mod tests {
         // absent: minted, as at a first boot
         let fresh = dir.path().join("fresh.key");
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &log, &fresh, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &log, &fresh, [1; 16], false, None).unwrap();
         assert!(matches!(c.open, AuditOpen::Open(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(fresh.is_file());
@@ -624,13 +678,13 @@ mod tests {
         }
         let path = dir.path().join("audit.log");
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &path, &key, [1; 16], true, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, &key, [1; 16], true, None).unwrap();
         assert!(matches!(c.open, AuditOpen::Deferred(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(has(&boot, BootStep::AuditWritable));
         // registered (or no previous hooks): the key is unloadable, refused
         let mut boot = BootSequence::new();
-        let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
+        let c = audit_log_with(&mut boot, &path, &key, [1; 16], false, None).unwrap();
         assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
         assert!(c.fatal, "review #466 F4");
     }
@@ -645,11 +699,11 @@ mod tests {
         )
         .unwrap();
         let mut boot = BootSequence::new();
-        let (state, gate) = bpf_lsm(&mut boot, dir.path(), false).unwrap();
+        let (state, gate) = bpf_lsm_in(&mut boot, dir.path(), false).unwrap();
         assert!(matches!(state, BpfLsm::Absent { .. }));
         assert!(matches!(gate, LsmGate::Refuse { .. }));
         assert!(!has(&boot, BootStep::BpfLsm));
-        let (_, gate) = bpf_lsm(&mut boot, dir.path(), true).unwrap();
+        let (_, gate) = bpf_lsm_in(&mut boot, dir.path(), true).unwrap();
         assert!(matches!(gate, LsmGate::Degraded { .. }));
         assert!(has(&boot, BootStep::BpfLsm));
     }
@@ -665,7 +719,10 @@ mod tests {
         // the eBPF object and the BTF are the host's: decided here as they
         // pass on a host that has them
         boot.passed(BootStep::EbpfObject).unwrap();
-        assert_eq!(state_dir(&mut boot, dir.path()).unwrap(), Verdict::Passed);
+        assert_eq!(
+            state_dir_in(&mut boot, dir.path()).unwrap(),
+            Verdict::Passed
+        );
         btf_offsets_decided(
             &mut boot,
             &ResolveOutcome::SkippedNoBtf {
@@ -681,7 +738,7 @@ mod tests {
             capabilities_decided(&mut boot, &all, false).unwrap(),
             BootGate::Start { degraded } if degraded.is_empty()
         ));
-        let c = install_manifest(
+        let c = install_manifest_for(
             &mut boot,
             &dir.path().join("install-manifest.json"),
             Path::new("/proc/self/exe"),
@@ -691,7 +748,7 @@ mod tests {
         .unwrap();
         assert!(!c.fatal);
         let key = dir.path().join("agent.sig.key");
-        let audit = audit_log(
+        let audit = audit_log_with(
             &mut boot,
             &dir.path().join("audit.log"),
             &key,
@@ -703,7 +760,7 @@ mod tests {
         assert!(!audit.fatal);
         assert!(matches!(audit.open, AuditOpen::Open(_)));
         assert!(matches!(
-            bpf_lsm(&mut boot, dir.path(), false).unwrap().1,
+            bpf_lsm_in(&mut boot, dir.path(), false).unwrap().1,
             LsmGate::Proceed
         ));
         let _proof = boot.verify_integrity().expect("every check passed");
