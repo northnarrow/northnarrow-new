@@ -136,9 +136,23 @@ pub(crate) struct Context<'a> {
 impl Context<'_> {
     /// Refuse the start: sign the refusal ([`sign`]) — in `audit`, the audit
     /// log the integrity phase opened, once it did —, withdraw the start's
-    /// registration in the pinned `PROTECTED_PIDS`, exit [`EX_CONFIG`]. The
-    /// gate has logged what it found.
+    /// registration in the pinned `PROTECTED_PIDS`, exit [`EX_CONFIG`]
+    /// ([`Self::conclude`]). The gate has logged what it found.
     pub(crate) fn refuse(&self, audit: Option<&mut AuditLog>, refusal: Refusal) -> ! {
+        std::process::exit(self.conclude(audit, refusal, withdraw_registration))
+    }
+
+    /// What [`Self::refuse`] does before it exits (review #466 F7: the tail
+    /// a test can run): the refusal signed and said in the journal, then
+    /// `withdraw` of the start's registration under the bpffs root
+    /// ([`withdraw_registration`] for the start) — always, signed or not —,
+    /// then the status to exit with, [`EX_CONFIG`].
+    pub(crate) fn conclude(
+        &self,
+        audit: Option<&mut AuditLog>,
+        refusal: Refusal,
+        withdraw: impl FnOnce(&Path),
+    ) -> i32 {
         let gate = refusal.gate;
         match sign(self, audit, &refusal) {
             Signed::AuditLog { entry_hash } => {
@@ -162,11 +176,11 @@ impl Context<'_> {
                 "could not record the refused boot in a signed chain — the journal holds it alone"
             ),
         }
-        withdraw_registration(Path::new(
+        withdraw(Path::new(
             northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT,
         ));
         error!(gate, exit = EX_CONFIG, "start refused");
-        std::process::exit(EX_CONFIG)
+        EX_CONFIG
     }
 }
 
@@ -1639,6 +1653,43 @@ mod tests {
         );
         assert!(f.files().is_empty());
         assert_eq!(std::fs::read(&other).unwrap(), b"kept\n");
+    }
+
+    /// Review #466 F7: a refused start signs its refusal, then withdraws its
+    /// registration under the pinned root — once, signed or not — and exits
+    /// 78 (`EX_CONFIG`, a `failed` unit).
+    #[test]
+    fn a_refusal_signs_withdraws_the_registration_and_exits_78() {
+        assert_eq!(EX_CONFIG, 78);
+        let f = Fixture::new();
+        let ctx = Context {
+            cli: &f.cli,
+            identity: &f.id,
+            overlay_gate: &f.gate,
+            integrity: UNCHECKED,
+        };
+        let mut withdrawn = Vec::new();
+        let code = ctx.conclude(None, Refusal::new("audit_log", "x"), |root| {
+            withdrawn.push(root.to_path_buf());
+        });
+        assert_eq!(code, 78);
+        assert_eq!(
+            withdrawn,
+            vec![PathBuf::from(
+                northnarrow_agent::anti_tamper::DEFAULT_BPFFS_ROOT
+            )]
+        );
+        assert_eq!(f.files().len(), 1, "signed before the withdrawal");
+        // unsigned (no fallback either): withdrawn and 78 all the same
+        let mut cli = cli(f.dir.path(), &f.path("audit.log"));
+        cli.pid_file = None;
+        let ctx = Context { cli: &cli, ..ctx };
+        let mut withdrawn = 0;
+        assert_eq!(
+            ctx.conclude(None, Refusal::new("audit_log", "y"), |_| withdrawn += 1),
+            78
+        );
+        assert_eq!(withdrawn, 1);
     }
 
     /// No pinned map: nothing to withdraw, nothing touched.

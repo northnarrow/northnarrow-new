@@ -767,8 +767,22 @@ mod tests {
         assert!(recorded < at(".boot_probe("));
         let sources = start_sources();
         assert!(!sources.contains("record_refused_boot("));
-        assert!(!sources.contains("process::exit(78)"));
-        assert_eq!(sources.matches("process::exit(EX_CONFIG)").count(), 1);
+        // review #466 F7: no exit of the start but the refusal's — main()'s
+        // one-shot modes (`--build-features` and the probes) aside
+        let one_shots = function(
+            include_str!(concat!(env!("NN_REPO_ROOT"), "/agent/src/boot/mod.rs")),
+            "pub fn main() -> Result<()> {",
+        );
+        let phases = sources.replace(one_shots, "");
+        assert_eq!(phases.len() + one_shots.len(), sources.len(), "main() once");
+        assert_eq!(
+            phases.matches("process::exit(").count(),
+            1,
+            "an exit of the start that is not the refusal's"
+        );
+        assert!(phases
+            .contains("std::process::exit(self.conclude(audit, refusal, withdraw_registration))"));
+        assert!(!phases.contains("libc::exit(") && !phases.contains("libc::_exit("));
         assert!(
             sources
                 .contains("fn refuse(&self, audit: Option<&mut AuditLog>, refusal: Refusal) -> !"),
