@@ -173,8 +173,9 @@ pub struct AuditCheck {
     pub preflight: AuditPreflight,
     /// R11b (lab PR 262): the log's open — its chain read — before the load.
     pub open: AuditOpen,
-    /// The start is refused: the log cannot be written, or its chain cannot
-    /// be opened, and `NN_AUDIT_ALLOW_UNWRITABLE=1` is not set.
+    /// The start is refused: the log cannot be written, its chain cannot be
+    /// opened, or (review #466 F4) the agent's key cannot be loaded, and
+    /// `NN_AUDIT_ALLOW_UNWRITABLE=1` is not set.
     pub fatal: bool,
 }
 
@@ -189,8 +190,13 @@ pub enum AuditOpen {
     /// failed — only this boot's attach registers it. The attest phase opens
     /// it (as it did before R11b), and a failure refuses the start there.
     Deferred(String),
-    /// The agent's key cannot be loaded: the start runs unaudited, as before
-    /// R11b (lab PR 262 found it and left it).
+    /// The agent's key cannot be loaded — a file there that is not a key
+    /// (corrupted, empty, a bind mount of `/dev/null` or another file that
+    /// is not a regular one over the name, unreadable), or an absent one
+    /// that could not be minted: no row can be signed. Refused like an
+    /// unwritable log unless `NN_AUDIT_ALLOW_UNWRITABLE=1` (review #466 F4:
+    /// the start ran unaudited, with only a WARN, until then); the refusal
+    /// is the journal's alone. An absent key is minted, as at a first boot.
     NoKey(String),
     /// The log cannot be opened: a line before the end is not a row (the
     /// chain is broken), or the file cannot be opened for writing (under
@@ -231,7 +237,8 @@ impl std::fmt::Debug for AuditOpen {
 /// permission error is left to the attest phase); then (R11b, lab PR 262)
 /// opened with the agent's key at `signing_key` and the start's `agent_id`
 /// ([`crate::audit::AuditLog::open`]: its chain read, a broken one refused).
-/// An unwritable log or one that cannot be opened refuses the start unless
+/// An unwritable log, one that cannot be opened, or a key that cannot be
+/// loaded (review #466 F4; an absent one is minted) refuses the start unless
 /// `allow_unwritable` ([`crate::audit::AUDIT_ALLOW_UNWRITABLE_ENV`]) is `1`.
 pub fn audit_log(
     boot: &mut BootSequence,
@@ -250,7 +257,7 @@ pub fn audit_log(
     };
     let fatal = !allowed
         && (matches!(preflight, AuditPreflight::Unwritable(_))
-            || matches!(open, AuditOpen::Failed(_)));
+            || matches!(open, AuditOpen::Failed(_) | AuditOpen::NoKey(_)));
     if !fatal {
         boot.passed(BootStep::AuditWritable)?;
     }
@@ -515,8 +522,7 @@ mod tests {
 
     /// R11b (lab PR 262): the audit chain is opened before the load — a
     /// fresh one and a written one open (the attest phase appends to them),
-    /// a broken one refuses the start, a key that cannot be loaded leaves
-    /// the start unaudited as before.
+    /// a broken one refuses the start.
     #[test]
     fn the_audit_chain_opens_before_the_load_or_refuses() {
         let dir = tempfile::tempdir().unwrap();
@@ -561,21 +567,50 @@ mod tests {
         let c = audit_log(&mut boot, &path, &key, [1; 16], false, Some("1")).unwrap();
         assert!(matches!(c.open, AuditOpen::Failed(_)));
         assert!(!c.fatal);
-        // a key that cannot be loaded: unaudited, as before R11b
-        let bad_key = dir.path().join("bad.key");
-        std::fs::write(&bad_key, "not a key\n").unwrap();
+        // a key that cannot be loaded: refused (review #466 F4), below
+    }
+
+    /// Review #466 F4: a key file that is not a key — corrupted, empty (what
+    /// a bind mount of `/dev/null` reads), `/dev/null` itself, a directory —
+    /// refuses the start like an unwritable audit log, and records nothing;
+    /// only the override lets it start unaudited. An absent key is minted.
+    #[test]
+    fn a_key_that_is_there_but_cannot_be_loaded_refuses_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        let corrupted = dir.path().join("corrupted.key");
+        std::fs::write(&corrupted, "not a key\n").unwrap();
+        let empty = dir.path().join("empty.key");
+        std::fs::write(&empty, "").unwrap();
+        let null = dir.path().join("null.key");
+        std::os::unix::fs::symlink("/dev/null", &null).unwrap();
+        let directory = dir.path().join("dir.key");
+        std::fs::create_dir(&directory).unwrap();
+        for key in [&corrupted, &empty, &null, &directory] {
+            let mut boot = BootSequence::new();
+            let c = audit_log(&mut boot, &log, key, [1; 16], false, None).unwrap();
+            assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
+            assert!(c.fatal, "{}", key.display());
+            assert!(!has(&boot, BootStep::AuditWritable));
+            let c = audit_log(&mut boot, &log, key, [1; 16], false, Some("1")).unwrap();
+            assert!(matches!(c.open, AuditOpen::NoKey(_)));
+            assert!(!c.fatal, "the override");
+            assert!(has(&boot, BootStep::AuditWritable));
+        }
+        assert_eq!(std::fs::read(&empty).unwrap(), b"", "not replaced");
+        // absent: minted, as at a first boot
+        let fresh = dir.path().join("fresh.key");
         let mut boot = BootSequence::new();
-        let other = dir.path().join("other.log");
-        let c = audit_log(&mut boot, &other, &bad_key, [1; 16], false, None).unwrap();
-        assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
+        let c = audit_log(&mut boot, &log, &fresh, [1; 16], false, None).unwrap();
+        assert!(matches!(c.open, AuditOpen::Open(_)), "{:?}", c.open);
         assert!(!c.fatal);
-        assert!(has(&boot, BootStep::AuditWritable));
+        assert!(fresh.is_file());
     }
 
     /// R11b (lab PR 262): while the previous agent's hooks may close the
     /// agent's files to this process (its early registration failed), a key
     /// it cannot read leaves the open to the attest phase, after the attach
-    /// registered it; otherwise it starts unaudited, as before.
+    /// registered it; otherwise the start is refused (review #466 F4).
     #[test]
     fn a_key_closed_to_an_unregistered_start_defers_the_open() {
         use std::os::unix::fs::PermissionsExt;
@@ -593,10 +628,11 @@ mod tests {
         assert!(matches!(c.open, AuditOpen::Deferred(_)), "{:?}", c.open);
         assert!(!c.fatal);
         assert!(has(&boot, BootStep::AuditWritable));
+        // registered (or no previous hooks): the key is unloadable, refused
         let mut boot = BootSequence::new();
         let c = audit_log(&mut boot, &path, &key, [1; 16], false, None).unwrap();
         assert!(matches!(c.open, AuditOpen::NoKey(_)), "{:?}", c.open);
-        assert!(!c.fatal);
+        assert!(c.fatal, "review #466 F4");
     }
 
     #[test]

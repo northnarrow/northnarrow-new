@@ -377,10 +377,39 @@ pub(crate) fn check(
             checks::AuditOpen::Failed(why)
         }
         checks::AuditOpen::NoKey(why) => {
-            warn!(
+            let fatal = audit.fatal;
+            error!(
                 error = why,
-                "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED \
-                 this boot"
+                fatal,
+                path = %cli.signing_key_file.display(),
+                "agent signing key cannot be loaded — no row of the audit chain could be signed"
+            );
+            if fatal {
+                // Review #466 F4: a key that is there but is not one (or an
+                // absent one that cannot be minted) is an audit log that
+                // cannot be written: refused before the load. Nothing can
+                // sign it: the journal holds it.
+                let ctx = refusal::Context {
+                    integrity: (integrity.label(), integrity.provenance()),
+                    ..unchecked
+                };
+                ctx.refuse(
+                    None,
+                    Refusal::new(
+                        "audit_log",
+                        format!(
+                            "the agent's signing key {} cannot be loaded: {why}. Refusing to run \
+                             unaudited; set {}=1 to start anyway.",
+                            cli.signing_key_file.display(),
+                            northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                        ),
+                    ),
+                );
+            }
+            warn!(
+                "agent signing key unusable but {}=1 — COMBAT stage transitions + admin ops \
+                 UNAUDITED this boot",
+                northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
             );
             checks::AuditOpen::NoKey(why)
         }

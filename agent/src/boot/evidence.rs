@@ -273,41 +273,66 @@ pub(crate) fn attest(
 /// The audit log's open after the attach, when the integrity phase could
 /// not open it before the load (R11b, lab PR 262: `AuditOpen::Deferred`):
 /// as the attest phase opened it until then — fatal unless
-/// `NN_AUDIT_ALLOW_UNWRITABLE=1` (the refusal signed, `refusals`),
-/// unaudited without the agent's key.
+/// `NN_AUDIT_ALLOW_UNWRITABLE=1` (the refusal signed, `refusals`), and so is
+/// a key that cannot be loaded (review #466 F4: it ran unaudited; the
+/// refusal is then the journal's alone).
 fn open_after_attach(
     refusals: &refusal::Context<'_>,
     agent_id: [u8; 16],
 ) -> Option<northnarrow_agent::audit::AuditLog> {
     let cli = refusals.cli;
-    {
+    let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
+        std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let refuse = |what: String| -> ! {
+        refusals.refuse(
+            None,
+            Refusal::new(
+                "audit_log",
+                format!(
+                    "{what}. Refusing to run unaudited; set {}=1 to start anyway.",
+                    northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
+                ),
+            ),
+        )
+    };
+    let key =
         match northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file) {
-            Ok(key) => {
-                match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
-                    Ok(log) => Some(log),
-                    Err(e) => {
-                        let fatal = northnarrow_agent::audit::audit_failure_is_fatal(
-                            std::env::var(northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV)
-                                .ok()
-                                .as_deref(),
-                        );
-                        error!(error = format!("{e:#}"), fatal, "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED");
-                        if fatal {
-                            let detail = format!(
-                                "audit log {} cannot be opened: {e:#}. Refusing to run unaudited; set {}=1 to start anyway.",
-                                cli.audit_log_file.display(),
-                                northnarrow_agent::audit::AUDIT_ALLOW_UNWRITABLE_ENV
-                            );
-                            refusals.refuse(None, Refusal::new("audit_log", detail));
-                        }
-                        None
-                    }
-                }
-            }
+            Ok(key) => key,
             Err(e) => {
-                warn!(error = format!("{e:#}"), "agent signing key load failed — COMBAT stage transitions + admin ops UNAUDITED this boot");
-                None
+                error!(
+                    error = format!("{e:#}"),
+                    fatal,
+                    path = %cli.signing_key_file.display(),
+                    "agent signing key cannot be loaded — no row of the audit chain could be signed"
+                );
+                if fatal {
+                    refuse(format!(
+                        "the agent's signing key {} cannot be loaded: {e:#}",
+                        cli.signing_key_file.display()
+                    ));
+                }
+                warn!("COMBAT stage transitions + admin ops UNAUDITED this boot");
+                return None;
             }
+        };
+    match northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, agent_id) {
+        Ok(log) => Some(log),
+        Err(e) => {
+            error!(
+                error = format!("{e:#}"),
+                fatal,
+                "audit log open failed — COMBAT stage transitions + admin ops would be UNAUDITED"
+            );
+            if fatal {
+                refuse(format!(
+                    "audit log {} cannot be opened: {e:#}",
+                    cli.audit_log_file.display()
+                ));
+            }
+            None
         }
     }
 }

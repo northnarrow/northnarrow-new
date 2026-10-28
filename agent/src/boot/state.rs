@@ -92,11 +92,13 @@ pub(crate) fn bootstrap(
                  anti-tamper hooks — read after the attach"
             );
         } else {
+            // Review #466 F4: the integrity phase's audit check refuses the
+            // start on it (unless NN_AUDIT_ALLOW_UNWRITABLE=1).
             warn!(
                 error = %e,
                 path = %cli.signing_key_file.display(),
-                "agent signing key bootstrap failed pre-attach — audit log will be \
-                 unsigned this boot"
+                "agent signing key bootstrap failed pre-attach — the audit check refuses the \
+                 start unless NN_AUDIT_ALLOW_UNWRITABLE=1"
             );
         }
     }

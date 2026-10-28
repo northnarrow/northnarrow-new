@@ -601,6 +601,57 @@ fn names_planted_where_the_fallback_goes_are_never_followed() {
     }
 }
 
+/// Review #466 F4: a signing key that is there but is not one — the key's
+/// name a link to `/dev/null`, as a bind mount of it shows the name — is an
+/// audit log that cannot be written: the start refuses before the load
+/// (exit 78, nothing in the kernel, the pid withdrawn), and since nothing
+/// can sign it the journal alone holds the refusal; no row is written.
+#[test]
+#[ignore = "root and bpftool: nn-lab.sh test-ignored"]
+fn a_key_that_cannot_be_loaded_is_refused_before_the_load() {
+    preconditions("start an agent whose signing key is /dev/null");
+    let dir = tempfile::tempdir().unwrap();
+    let state = AgentState::new(dir.path());
+    std::os::unix::fs::symlink("/dev/null", state.signing_key()).unwrap();
+    let installed = InstalledAgent::install();
+    let rules = combat_rules(dir.path());
+    let manifest = manifest_of_another_copy(dir.path());
+    let before = kernel();
+    let log = dir.path().join("agent.log");
+    let status = run_until_exit(
+        &installed,
+        &state,
+        Launch::Sudo,
+        &[
+            "--install-manifest".as_ref(),
+            manifest.as_os_str(),
+            "--combat-rules".as_ref(),
+            rules.as_os_str(),
+        ],
+        &log,
+    );
+    let text = assert_refused_before_the_load(status, &log, &state, &before, "audit_log");
+    assert!(
+        text.contains("agent signing key cannot be loaded"),
+        "{}",
+        tail(&log)
+    );
+    assert!(
+        text.contains("could not record the refused boot in a signed chain"),
+        "{}",
+        tail(&log)
+    );
+    let rows = std::fs::read_to_string(state.audit_log()).unwrap_or_default();
+    assert!(!rows.contains("agent_boot"), "a row was signed: {rows}");
+    assert!(
+        std::fs::symlink_metadata(state.signing_key())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the key's name left as it was"
+    );
+}
+
 /// The capability gate: an enforcing agent without CAP_KILL refuses before
 /// the load (it used to exit 1 with no row) and signs `capabilities`.
 #[test]
