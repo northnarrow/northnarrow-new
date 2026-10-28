@@ -1050,37 +1050,6 @@ fn note_status_poll(
     }
 }
 
-/// Read the current wall-clock as UNIX seconds for the
-/// `verify_signed_payload_quorum` skew check. Production-only
-/// helper; tests can call the verify path directly with an
-/// injected `server_now_unix_secs` value.
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-// ── Tappa 8 B5 — SO_PEERCRED + audit-log emission ─────────────────
-
-/// Who connected, as the audit log records it: `(pid, uid)` from
-/// `SO_PEERCRED`, `comm` and `exe` from `/proc/<pid>`. The audit log's
-/// per-entry `client_*` fields (design §9.1) come from here so every
-/// admin operation records WHO connected, not just which key signed.
-#[derive(Debug, Clone)]
-pub(crate) struct AuditClient {
-    pub pid: u32,
-    pub uid: u32,
-    /// `/proc/<pid>/comm`. Self-reported (external audit ASK-013,
-    /// NN-AUD-239): the name the peer gave itself, which any process
-    /// chooses (`prctl(PR_SET_NAME)`). `<exited>` when the peer was gone
-    /// before it could be read, `<unknown>` when it could not be read.
-    pub comm: String,
-    /// `/proc/<pid>/exe`: the program the kernel says the peer runs
-    /// (external audit ASK-013). `None` when it could not be read.
-    pub exe: Option<String>,
-}
-
 /// A peer's `SO_PEERCRED`: the credentials of the process (the thread)
 /// that called `connect()`, fixed at that moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
