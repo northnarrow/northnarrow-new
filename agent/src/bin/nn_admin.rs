@@ -3859,7 +3859,7 @@ fn run_overlay_cmd(sub: OverlayCmd) -> ExitCode {
             audit_log,
             agent_sig_key,
         } => {
-            let agent_id = match northnarrow_agent::agent_id::load_existing(&agent_id_file) {
+            let agent_id = match nn_admin::agent_id::load_existing(&agent_id_file) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("config overlay status: {e:#}");
@@ -3944,7 +3944,7 @@ fn run_policy_cmd(sub: PolicyCmd) -> ExitCode {
             audit_log,
             agent_sig_key,
         } => {
-            let agent_id = match northnarrow_agent::agent_id::load_existing(&agent_id_file) {
+            let agent_id = match nn_admin::agent_id::load_existing(&agent_id_file) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("policy show: {e:#}");

@@ -10,3 +10,7 @@
 //! xtask/tests/workspace_layers.rs.
 
 #![forbid(unsafe_code)]
+
+/// The agent's identity on disk, read and never minted (R10, lab PR 259:
+/// from nn-linux's `agent_id`).
+pub mod agent_id;

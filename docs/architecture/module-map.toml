@@ -594,9 +594,14 @@ planned = false
 # with the window's vocabulary (nn-linux's module re-exports it), and
 # nn-admin's role list parse names nn-proto's `admin_quorum`, which the
 # agent's `admin_auth` wraps: `nn_admin.rs` names `anti_tamper` no more.
+# Then 20 → 18, nn-admin 6 → 4: nn-admin's read of the agent's identity
+# file (`load_existing`, MAIN-010; it was its one caller) moved from
+# nn-linux's `agent_id` to nn-admin's own, the all-zero rule both reads
+# take cut to nn-proto's `shutdown_marker` (`parse_minted_agent_id`)
+# beside the format's parse: `admin_cli` and `nn_admin.rs` name nn-admin.
 
 [ratchet]
-nn-admin = 6
+nn-admin = 4
 nn-core = 14
 nn-evidence = 0
 nn-linux = 0

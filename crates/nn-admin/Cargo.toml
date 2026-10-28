@@ -12,6 +12,11 @@ publish = false
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
 [dependencies]
+# R10 (lab PR 259): the agent id file's parse (`shutdown_marker`), and the
+# width of the id (nn-evidence's `audit`, with the identity types).
+nn-proto = { workspace = true }
+nn-evidence = { workspace = true }
+anyhow = { workspace = true }
 
 [lints]
 workspace = true

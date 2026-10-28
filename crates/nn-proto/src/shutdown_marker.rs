@@ -323,6 +323,24 @@ pub fn parse_agent_id(raw: &str) -> Result<[u8; 16], String> {
     Ok(out)
 }
 
+/// An install's id from `/etc/northnarrow/agent_id` ([`parse_agent_id`]),
+/// the all-zero id refused: what the agent's reads of its file take
+/// (nn-linux's `agent_id`) and nn-admin's (its `agent_id::load_existing`).
+/// Wave 4 restructure, R10 (lab PR 259): cut from nn-linux's
+/// `agent_id::parse` when nn-admin's read left it; the error is this
+/// module's `String`, the text the same.
+pub fn parse_minted_agent_id(raw: &str) -> Result<[u8; 16], String> {
+    let id = parse_agent_id(raw)?;
+    // External audit MAIN-009: zero is the identity the test fixtures sign
+    // with and the old fallback used; OsRng does not mint it (2^-128).
+    if id == [0u8; 16] {
+        return Err(String::from(
+            "agent_id is all zeros — the test fixtures' identity, never minted",
+        ));
+    }
+    Ok(id)
+}
+
 /// The line the watchdog appends to its record of honoured shutdowns.
 pub fn honoured_line(a: &Authorised) -> String {
     format!("{} {}\n", hex::encode(a.nonce), a.ts)

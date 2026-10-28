@@ -83,6 +83,9 @@ nn-core = { workspace = true }
 # agent's key and its Linux host — named through the shims of the same
 # modules here.
 nn-linux = { workspace = true }
+# R10 (lab PR 259): the operator client's library — the `nn-admin` binary
+# of this package is its shim — and its read of the agent's identity file.
+nn-admin = { workspace = true }
 # ISSUE_002: shared aya-handling primitives (bpffs pin paths, LSM
 # hook attach/reuse, /proc helpers). Watchdog binary consumes this
 # crate directly without pulling the rest of `agent` —

@@ -34,8 +34,8 @@ use nn_proto::admin_protocol::{
 };
 use nn_proto::admin_signed_payload::{sign, CanaryDeploymentWire, CanaryTypeWire, SignedPayload};
 
-use crate::agent_id::{self, AGENT_ID_LEN};
 use crate::os_rng::OsRng;
+use nn_admin::agent_id::{self, AGENT_ID_LEN};
 
 // ── public outcome types ────────────────────────────────────────────
 

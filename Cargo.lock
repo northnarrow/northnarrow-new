@@ -817,6 +817,11 @@ dependencies = [
 [[package]]
 name = "nn-admin"
 version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "nn-evidence",
+ "nn-proto",
+]
 
 [[package]]
 name = "nn-core"
@@ -946,6 +951,7 @@ dependencies = [
  "libc",
  "md-5",
  "nix",
+ "nn-admin",
  "nn-core",
  "nn-evidence",
  "nn-linux",
