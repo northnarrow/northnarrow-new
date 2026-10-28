@@ -43,8 +43,8 @@ forbid_unsafe = true
 planned = false
 
 [crates.nn-model]
-about = "the vocabulary: Event, verdicts, actions and outcomes, ProcessKey, PostureKind, log_escape, netaddr, OCSF (R02)"
-allowed = ["northnarrow-common", "nn-parse"]
+about = "the vocabulary: Event, verdicts, actions and outcomes, ProcessKey, PostureKind, log_escape, netaddr, OCSF (R02); nn-parse's QNAME walk left it with the DNS record's decode for nn-linux's sensor (R09b, lab PR 254)"
+allowed = ["northnarrow-common"]
 pure = true
 forbid_unsafe = true
 planned = false

@@ -62,5 +62,3 @@ mod wire {
 }
 /// `crate::epg::…`, the exploit guard's decision model.
 use common::epg;
-/// `crate::dns_qname::…`, the QNAME walk (nn-parse's).
-use nn_parse::dns_qname;

@@ -900,7 +900,6 @@ name = "nn-model"
 version = "0.0.1"
 dependencies = [
  "ciborium",
- "nn-parse",
  "northnarrow-common",
  "serde",
  "serde_json",

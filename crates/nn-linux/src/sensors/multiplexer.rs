@@ -42,6 +42,8 @@ use crate::net::dns_cache::DnsCache;
 use crate::net::flow_tracker::{FlowTracker, TcpConnectInfo};
 use crate::posture::lineage::AuthSessionTracker;
 
+/// The DNS record's decode (R09b, lab PR 254: nn-model's until then).
+use crate::sensors::dns_sensor::{nss_query_name, query_event};
 /// eBPF object embedded once in [`crate::sensors::ebpf_object`] (the
 /// single embed site + boot preflight). Re-used here so this loader and
 /// the Tappa 1 [`super::exec`] loader load byte-identical bytes.
@@ -1082,7 +1084,7 @@ fn dns_events(
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
 ) -> (Event, Option<Event>) {
-    let mut event = Event::from(raw);
+    let mut event = query_event(raw);
     let mut flood = None;
     if let Event::DnsQuery {
         pid,
@@ -1142,7 +1144,7 @@ fn nss_events(
     lineage: &AuthSessionTracker,
     dns_cache: Option<&DnsCache>,
 ) -> Option<Event> {
-    if let (Some(cache), Some(name)) = (dns_cache, nn_model::nss_query_name(raw)) {
+    if let (Some(cache), Some(name)) = (dns_cache, nss_query_name(raw)) {
         cache.on_dns_query(
             raw.pid,
             name,
