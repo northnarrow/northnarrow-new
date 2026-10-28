@@ -42,7 +42,7 @@ demo-tappa5 = ["nn-core/demo-tappa5"]
 # Exposes the nn-admin `debug --force-posture <STATE>` subcommand and
 # the agent-side handler that consumes it. Used by the integration
 # test harness; never enabled in production builds.
-debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger"]
+debug-trigger = ["nn-proto/debug-trigger", "nn-core/debug-trigger", "nn-linux/debug-trigger"]
 # Gates `agent/tests/privileged_e2e.rs` — full end-to-end scenarios
 # that spawn the agent + nn-admin subprocesses and verify the
 # iptables ruleset against a live kernel. Requires root and a
@@ -171,6 +171,12 @@ tempfile = "3"
 # reader, the lineage's test builders). A dev-dependency only: no build of
 # the binaries has them.
 nn-core = { workspace = true, features = ["test-util"] }
+# R09a (lab PR 253): the tests that stay here and wire nn-linux's code read
+# its test doors (`test-util`: a capture of a process without a descriptor,
+# the host-critical guard on given identities, an unlock token minted
+# without a signature, the admin key set's fingerprints, the isolator on
+# given binaries). A dev-dependency only: no build of the binaries has them.
+nn-linux = { workspace = true, features = ["test-util"] }
 # Lab PR 219: parse the embedded eBPF object in unit tests, with the parser
 # aya 0.14.0 itself runs: every map must be of a type aya 0.14 loads (a
 # task-storage map parsed and still stopped the agent), and the exploit

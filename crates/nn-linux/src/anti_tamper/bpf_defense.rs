@@ -302,7 +302,7 @@ static LOADED_MAP_IDS: parking_lot::Mutex<Option<std::result::Result<Vec<u32>, S
 
 /// Record the ids of every map of `ebpf` — call right after the load,
 /// before any `take_map`.
-pub(crate) fn remember_loaded_maps(ebpf: &Ebpf) {
+pub fn remember_loaded_maps(ebpf: &Ebpf) {
     let mut ids = Vec::new();
     let mut unreadable = Vec::new();
     for (name, map) in ebpf.maps() {

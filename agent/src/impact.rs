@@ -4,18 +4,21 @@
 //! vocabulary (`nn_core::impact`). The tracker takes its host as a type
 //! parameter: the agent's `LinuxHost` gives it the package database's
 //! `rpm`, the host's view of a path and the production sampler of the
-//! host's files, which stays here ([`entropy::FsSampler`]). Here the tracker
+//! host's files ([`entropy::FsSampler`], nn-linux's since R09a, lab PR 253,
+//! with the host: both named here by their crate). Here the tracker
 //! and the owners are aliases on that host, and the tracker `status`
 //! reports is published as before (the process-wide slot holds the agent's
 //! tracker: it is the agent's, cut verbatim from `impact`).
 
 use std::sync::Arc;
 
-use crate::chain_host_linux::LinuxHost;
+use nn_linux::chain_host_linux::LinuxHost;
 
 pub use nn_core::impact::*;
 
-pub mod entropy;
+/// The production sampler of the host's files (R09a, lab PR 253:
+/// nn-linux's, with the decision engine's host, which names it).
+pub use nn_linux::impact::entropy;
 
 /// [`nn_core::impact::RansomTracker`] on the agent's host.
 pub type RansomTracker = nn_core::impact::RansomTracker<LinuxHost>;
@@ -26,7 +29,7 @@ pub mod trust {
 
     /// [`nn_core::impact::trust::ProgramOwners`] on the agent's host.
     pub type ProgramOwners =
-        nn_core::impact::trust::ProgramOwners<crate::chain_host_linux::LinuxHost>;
+        nn_core::impact::trust::ProgramOwners<nn_linux::chain_host_linux::LinuxHost>;
 }
 
 /// The agent's tracker, for `status` ([`publish`]).

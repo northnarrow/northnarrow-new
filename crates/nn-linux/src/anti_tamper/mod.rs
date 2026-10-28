@@ -58,9 +58,12 @@ pub mod trusted_installer;
 /// tests that exercise code paths consuming the capability (e.g.
 /// `posture::admin_release_combat_with_token`). The production
 /// capability invariant is unaffected — this helper is only
-/// compiled under `cfg(test)`.
-#[cfg(test)]
-pub(crate) fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
+/// compiled under `cfg(test)`. R09a (lab PR 253): and under this crate's
+/// `test-util`, for the agent's tests (its posture's and its admin
+/// socket's), which enable it as a dev-dependency only: no build of the
+/// binaries has it.
+#[cfg(any(test, feature = "test-util"))]
+pub fn _test_mint_unlock_token() -> network_isolate::UnlockToken {
     network_isolate::mint_unlock_token()
 }
 

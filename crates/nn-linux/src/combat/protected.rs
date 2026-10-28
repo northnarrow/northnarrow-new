@@ -165,8 +165,8 @@ impl SystemProtectedProcs {
     /// Test seam: point `/proc` at a fixture tree and supply the
     /// watchdog/sshd exe(s) to match (lab PR 243: the golden replay of the
     /// posture and the ladder judges its fixture host with it).
-    #[cfg(test)]
-    pub(crate) fn with_parts(
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_parts(
         agent_pid: u32,
         stack: ExemptPids,
         proc_root: impl Into<PathBuf>,

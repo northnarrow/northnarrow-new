@@ -882,20 +882,33 @@ dependencies = [
 name = "nn-linux"
 version = "0.0.1"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "aya",
+ "base64",
+ "chrono",
+ "ed25519-dalek",
  "hex",
+ "hkdf",
  "libc",
+ "nn-core",
  "nn-evidence",
  "nn-model",
+ "nn-parse",
  "nn-proto",
  "northnarrow-antitamper-bpf",
  "northnarrow-common",
  "parking_lot",
+ "procfs",
  "rand",
+ "serde",
  "serde_json",
  "sha2",
+ "thiserror",
  "tokio",
  "tracing",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

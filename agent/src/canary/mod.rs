@@ -21,10 +21,14 @@
 //! - Rules NN-L-CANARY-001..004 live in
 //!   `agent/src/decision/rules/canary.rs` (K5).
 
-pub mod access_log;
 /// R05 shim (lab PR 241; removed in R17): the canary chains' line reader is
 /// nn-evidence's.
 pub use nn_evidence::chain_lines;
+/// R09a shim (lab PR 253; plan §4.1 rule 2, removed in R17): the stores of
+/// the canary detector's host — the signed registry and access log, this
+/// host's interface addresses, the read-forward set — are nn-linux's, with
+/// the host (`canary_host_linux`), which names them.
+pub use nn_linux::canary::{access_log, network, read_forward, registry};
 /// R08b shim (lab PR 251; plan §4.1 rule 2, removed in R17): the canary
 /// detector and its indexes are nn-core's, on the agent's host — its signed
 /// registry and access log, its interface addresses, the read-forward set,
@@ -43,9 +47,7 @@ pub mod detector {
 /// wire the agent's registry and access log).
 #[cfg(test)]
 mod detector_tests;
-pub mod network;
 pub mod path_policy;
-pub mod read_forward;
 /// R08a shim (lab PR 250; plan §4.1 rule 2, removed in R17): the readers a
 /// File or Credential canary spares are nn-core's; the agent's judge on the
 /// lineage cache of the Linux host.
@@ -56,7 +58,6 @@ pub mod readers {
     pub type CanaryReaders =
         nn_core::canary::readers::CanaryReaders<crate::chain_host_linux::LinuxHost>;
 }
-pub mod registry;
 /// R07 shim (lab PR 247; plan §4.1 rule 2, removed in R17): the credential
 /// renderer is nn-core's. It reads an operator template through the agent's
 /// host (`LinuxHost`), under its old name and signature; the deploy's seed

@@ -13,15 +13,16 @@ use std::sync::Arc;
 
 use nn_model::Event;
 
-use crate::chain_host_linux::LinuxHost;
+use nn_linux::chain_host_linux::LinuxHost;
 
 pub use nn_core::impair::*;
 
 /// [`nn_core::impair::DefenseDetector`] on the agent's host.
 pub type DefenseDetector = nn_core::impair::DefenseDetector<LinuxHost>;
 
-/// The kernel map of the tools' processes ([`DefenseDetector::attach_map`]).
-pub type DefenderMap = aya::maps::HashMap<aya::maps::MapData, u32, u8>;
+/// The kernel map of the tools' processes ([`DefenseDetector::attach_map`]):
+/// nn-linux's (R09a, lab PR 253: the decision engine's host names it).
+pub use nn_linux::impair::DefenderMap;
 
 /// The agent's detector, for `status` ([`publish`]).
 static PUBLISHED: std::sync::OnceLock<Arc<DefenseDetector>> = std::sync::OnceLock::new();

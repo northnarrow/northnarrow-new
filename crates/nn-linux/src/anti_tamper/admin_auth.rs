@@ -329,7 +329,7 @@ impl AdminAuth {
     /// Test-only: snapshot the current in-memory key fingerprints.
     /// Lets reload tests assert "after reload, the new key is
     /// present" without exposing `KeyEntry` to test code.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn key_fingerprints_snapshot(&self) -> Vec<String> {
         self.pub_keys
             .read()

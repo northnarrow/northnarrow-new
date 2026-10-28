@@ -383,7 +383,7 @@ fn upgrade_check_wants_every_deny_hook_of_the_agent() {
         .expect("upgrade-check sets deny_hooks_min")
         .parse()
         .unwrap();
-    let agent = read("agent/src/anti_tamper/mod.rs");
+    let agent = read("crates/nn-linux/src/anti_tamper/mod.rs");
     let n: usize = agent
         .lines()
         .find_map(|l| l.trim().strip_prefix("pub const DENY_HOOKS: [&str; "))

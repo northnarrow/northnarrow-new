@@ -45,7 +45,7 @@ use common::wire::{
 /// transparently — same bytes, just an agent-local nominal type.
 #[repr(transparent)]
 #[derive(Copy, Clone)]
-pub(crate) struct AyaInodeKey(pub(crate) InodeKey);
+pub struct AyaInodeKey(pub InodeKey);
 
 // SAFETY: `InodeKey` is `#[repr(C)]` over two `u64`s, has no
 // padding gaps, and `AyaInodeKey` is `#[repr(transparent)]` over
@@ -77,7 +77,7 @@ pub const CONFIG_DIR: &str = "/etc/northnarrow";
 /// in them from outside the agent's family, outside the window. Never on
 /// a directory the agent shares with the host (`/usr/local/bin`,
 /// `/etc/systemd/system`): only its own files are registered there.
-pub(crate) const PROTECTED_DIR_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE;
+pub const PROTECTED_DIR_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE;
 
 /// The directories of [`BINARY_AND_UNIT_PATHS`] that take
 /// [`PROTECTED_DIR_FLAGS`]: the agent unit's drop-in directory, which
@@ -1876,7 +1876,7 @@ fn ensure_own_dir(dir: &Path, mode: u32, uid: u32, gid: u32) -> Result<std::fs::
 /// respectively. The eBPF inode-protection hooks read the raw
 /// `s_dev` directly, so the BPF map key MUST be in the kernel form.
 /// See docs/TAPPA7_TASK5_DEEP_DEBUG.md §7 for the full diagnosis.
-pub(crate) fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
+pub fn stat_dev_to_kernel_dev(st_dev: u64) -> u64 {
     let major = libc::major(st_dev) as u64;
     let minor = libc::minor(st_dev) as u64;
     (major << 20) | minor

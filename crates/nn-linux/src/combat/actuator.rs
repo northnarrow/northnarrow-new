@@ -115,7 +115,7 @@ impl SystemActuator {
     /// guard, or beyond a walk cut short — is a threat the process level
     /// did not contain. (Lab PR 243: a function of its own, so the golden
     /// replay's host reports through the same words.)
-    pub(crate) fn kill_outcome(report: &ExecutionReport) -> (bool, String) {
+    pub fn kill_outcome(report: &ExecutionReport) -> (bool, String) {
         if !Self::contained(&report.primary) {
             (false, format!("kill outcome {:?}", report.primary))
         } else if let Some(reason) = Self::tree_not_contained(&report.additional) {
@@ -135,7 +135,7 @@ impl SystemActuator {
     /// Review 87: what became of an offender's binary, from the
     /// quarantine's outcome (lab PR 243: a function of its own, as
     /// [`Self::kill_outcome`]).
-    pub(crate) fn quarantine_text(pid: u32, outcome: &ExecutionOutcome) -> String {
+    pub fn quarantine_text(pid: u32, outcome: &ExecutionOutcome) -> String {
         match outcome {
             ExecutionOutcome::Quarantined { .. } => "quarantined".to_string(),
             ExecutionOutcome::AlreadyGone { .. } => "binary already gone".to_string(),
@@ -157,7 +157,7 @@ impl SystemActuator {
     /// External audit CMB-014: what a soft egress block's outcome means for
     /// the ladder (lab PR 243: a function of its own, as
     /// [`Self::kill_outcome`]).
-    pub(crate) fn soft_block_of(outcome: ExecutionOutcome) -> SoftBlock {
+    pub fn soft_block_of(outcome: ExecutionOutcome) -> SoftBlock {
         match outcome {
             ExecutionOutcome::Blocked { .. } => SoftBlock::Blocked,
             ExecutionOutcome::WouldExecute { .. } => SoftBlock::NotNeeded("detect-only"),
@@ -176,12 +176,12 @@ impl SystemActuator {
 
 /// Review 87: an offender with no binary on disk to quarantine (lab PR
 /// 243: named, for the golden replay's host).
-pub(crate) const NO_BINARY: &str =
+pub const NO_BINARY: &str =
     "no binary on disk to quarantine (exited before NEUTRALIZE, or deleted while running)";
 
 /// What ISOLATE answers in detect-only (lab PR 243: named, as
 /// [`NO_BINARY`]).
-pub(crate) const DETECT_ONLY_ISOLATE: &str = "detect-only: iptables NOT applied (no enforcement)";
+pub const DETECT_ONLY_ISOLATE: &str = "detect-only: iptables NOT applied (no enforcement)";
 
 impl CombatActuator<LinuxHost> for SystemActuator {
     /// `/proc/<pid>/exe` and `/proc/<pid>/cgroup`, read while the pidfd
@@ -386,7 +386,7 @@ impl CombatActuator<LinuxHost> for SystemActuator {
 /// cgroup that places it ([`super::offender::cgroup_path`]), each within
 /// [`super::offender::MAX_PATH_SHOWN`] bytes. The caller makes sure the pid
 /// still names the process it means (a pidfd, checked after the reads).
-pub(crate) fn read_proc_facts(proc_root: &std::path::Path, pid: u32) -> ProcFacts {
+pub fn read_proc_facts(proc_root: &std::path::Path, pid: u32) -> ProcFacts {
     use super::offender::{cgroup_path, shown};
     let dir = proc_root.join(pid.to_string());
     let exe = std::fs::read_link(dir.join("exe"))

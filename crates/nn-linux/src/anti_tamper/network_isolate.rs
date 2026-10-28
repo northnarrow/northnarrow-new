@@ -54,11 +54,12 @@ const DEFAULT_IPTABLES_BIN_V6: &str = "ip6tables";
 /// A binary COMBAT runs. External audit ATP-014 (NN-AUD-262): in
 /// production a name, looked up in the system directories at each use and
 /// run as the verified file ([`trusted_bin::resolve`]); a lookup that fails
-/// is an error of the step (no `PATH` fallback). Tests run a fixed mock.
+/// is an error of the step (no `PATH` fallback). Tests run a fixed mock
+/// (R09a, lab PR 253: the agent's too, through this crate's `test-util`).
 #[derive(Debug, Clone)]
 enum Bin {
     System(&'static str),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     Fixed(PathBuf),
 }
 
@@ -71,7 +72,7 @@ impl Bin {
                     .map_err(|e| anyhow!("{e} (external audit ATP-014: no PATH lookup)"))?;
                 Ok((bin.command(), bin.exe().to_path_buf()))
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             Bin::Fixed(path) => Ok((Command::new(path), path.clone())),
         }
     }
@@ -81,7 +82,7 @@ impl std::fmt::Display for Bin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Bin::System(name) => f.write_str(name),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             Bin::Fixed(path) => write!(f, "{}", path.display()),
         }
     }
@@ -97,7 +98,7 @@ const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 /// Marker line in `configs/combat-rules.v4` that [`NetworkIsolator::engage`]
 /// replaces with the management carve-out ACCEPT rules (Beta Step 4b).
 /// Placed inside the chain, immediately before its catch-all DROP.
-pub(crate) const CARVE_OUT_MARKER: &str = "# >>> NORTHNARROW_MGMT_CARVEOUT <<<";
+pub const CARVE_OUT_MARKER: &str = "# >>> NORTHNARROW_MGMT_CARVEOUT <<<";
 
 /// Capability token proving that an Ed25519-signed admin unlock has
 /// been verified. The only way to construct one is via
@@ -362,8 +363,8 @@ impl NetworkIsolator {
     /// `restore_bin` and `/bin/true` (exits 0 unconditionally) for
     /// `iptables_bin`, exercising the success path without root or
     /// real firewall side effects.
-    #[cfg(test)]
-    pub(crate) fn new_with_bin(
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_with_bin(
         rules_path: PathBuf,
         restore_bin: PathBuf,
         iptables_bin: PathBuf,
@@ -561,7 +562,7 @@ impl NetworkIsolator {
     /// spliced in ahead of the catch-all DROP. Returns the rendered
     /// ruleset and the list of IPv4 CIDRs actually carved out (for
     /// logging). Re-reads the allow file every call — never cached.
-    pub(crate) fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
+    pub fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
         use nn_proto::admin_signed_payload::OverlayKind;
         let base = self.trusted_source(
             OverlayKind::CombatRulesV4,
@@ -628,7 +629,7 @@ impl NetworkIsolator {
     /// ungated, so one created between the check and the read was applied
     /// unsigned; the gate already answers a missing file with the built-in
     /// list.
-    pub(crate) fn trusted_allow(&self) -> combat_allow::AllowLoad {
+    pub fn trusted_allow(&self) -> combat_allow::AllowLoad {
         use nn_proto::admin_signed_payload::OverlayKind;
         if self.gate.is_none() {
             return combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
@@ -1099,7 +1100,7 @@ fn count_chain_rules(iptables_s_output: &str) -> usize {
 /// inserting before the chain's catch-all DROP, then before `COMMIT`,
 /// so the carve-out is never silently dropped on the floor. An empty
 /// block removes the marker line and changes nothing else.
-pub(crate) fn splice_carveout(base: &str, accept_block: &str) -> String {
+pub fn splice_carveout(base: &str, accept_block: &str) -> String {
     let accept_lines: Vec<&str> = accept_block.lines().collect();
 
     // Primary: marker replacement.

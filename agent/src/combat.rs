@@ -14,15 +14,17 @@
 //! the admin socket and the posture's golden replay are unchanged; the
 //! replay's actuator implements the trait on the agent's host.
 //!
-//! What is Linux stays here, for nn-linux (R09): the production actuator
-//! ([`actuator::SystemActuator`]: the executor's kill, quarantine and
-//! per-PID egress block, the isolator, `/proc`), the production guard
-//! ([`protected::SystemProtectedProcs`]: `/proc`), the stale chain's
-//! compatibility line ([`reconcile`]); and the ladder's tests that wire the
-//! agent's signing key, its audit log, its posture or a real process
+//! What is Linux is nn-linux's since R09a (lab PR 253), under its paths
+//! here: the production actuator ([`actuator::SystemActuator`]: the
+//! executor's kill, quarantine and per-PID egress block, the isolator,
+//! `/proc`), the production guard ([`protected::SystemProtectedProcs`]:
+//! `/proc`), the stale chain's compatibility line ([`reconcile`]), and the
+//! host itself (`nn_linux::chain_host_linux::LinuxHost`, named here by its
+//! crate as those are). The ladder's tests that wire the agent's signing
+//! key, its audit log, its posture or a real process stay here
 //! (`host_tests`, `evidence_tests`).
 
-use crate::chain_host_linux::LinuxHost;
+use nn_linux::chain_host_linux::LinuxHost;
 
 pub use nn_core::combat::*;
 
@@ -40,9 +42,8 @@ pub type AuditEvidence = nn_core::combat::AuditEvidence<crate::audit::AgentSigni
 /// start of the process (`response::proc_ref::ProcRef`).
 pub type ProcRef = <LinuxHost as CombatHost>::Proc;
 
-pub mod actuator;
-pub mod protected;
-pub mod reconcile;
+/// The ladder's Linux parts (R09a, lab PR 253): nn-linux's.
+pub use nn_linux::combat::{actuator, protected, reconcile};
 
 pub use actuator::SystemActuator;
 pub use protected::SystemProtectedProcs;
