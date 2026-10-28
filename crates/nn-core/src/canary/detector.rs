@@ -46,6 +46,19 @@
 //!    family (K5 NN-L-CANARY-001..004), skipping the FIM
 //!    rule layer entirely (precedence guarantee).
 //!
+//! ## A stop between the steps (lab PR 260)
+//!
+//! Each row is written and synced before the next step. The access row of
+//! step 2 is the trip's commit: before it is on disk nothing records the
+//! access (a torn row is cut at the next open), and once it is, the trip
+//! holds — the registry's open records a first-trip row that no `Trip` row
+//! names (the Linux host: `Registry::unrecorded_trips`). A stop between
+//! steps 2 and 3 used to leave the registry at its deploy row, and the next
+//! start re-armed the canary: the trip forgotten, the next access a first
+//! trip again (lab PR 258's KVM run, the e2e fixture's SIGQUIT between
+//! the two rows). A stop after step 3 leaves both rows; as for any event
+//! the agent has read, a response that had not run by then does not run.
+//!
 //! ## Concurrency
 //!
 //! The detector shares Registry + AccessDb handles via
@@ -505,7 +518,8 @@ impl<H: CanaryHost> Detector<H> {
         // chain captures every access; re-fire suppression lives in
         // first_trip), then record the trip in the registry with that
         // row's hash. A failed write is reported and the event is still
-        // emitted.
+        // emitted. Lab PR 260: the access row is the trip's commit, the
+        // registry's row names it (see the module doc).
         let first_trip = {
             let mut reg = self.registry.lock();
             let first_trip = H::is_armed(&reg, &canary_id);
@@ -538,12 +552,20 @@ impl<H: CanaryHost> Detector<H> {
                 }
             };
             if first_trip {
+                let access_row_written = access_entry_hash.is_some();
                 if let Err(e) = H::mark_tripped(&mut reg, &canary_id, access_entry_hash) {
+                    // Lab PR 260: the next start records a trip its access
+                    // row holds.
+                    let after_a_restart = if access_row_written {
+                        "the next start records it from its access row"
+                    } else {
+                        "its access row is missing too: a restart re-arms the canary"
+                    };
                     error!(
                         error = %format!("{e:#}"),
                         canary_id = %canary_id,
-                        "canary trip not recorded in the registry — it holds for this run \
-                         only; a restart would re-arm the canary"
+                        after_a_restart,
+                        "canary trip not recorded in the registry — it holds for this run"
                     );
                 }
             }

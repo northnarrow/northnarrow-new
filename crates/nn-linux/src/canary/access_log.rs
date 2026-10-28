@@ -29,7 +29,17 @@
 //! — mirrors Tappa 9 §6.5 Q4 lock-in: evidence preservation
 //! is non-negotiable; downstream throttling is the rule-
 //! engine's concern.
+//!
+//! ## The trip's commit (lab PR 260)
+//!
+//! The access row with `first_trip: true` is the trip: it is written and
+//! synced before the registry's `Trip` row, which names it. An agent
+//! stopped between the two left the registry at its deploy row, and the
+//! next start re-armed a tripped canary. [`first_trip_rows`] gives the
+//! registry the genuine first-trip rows at open, and the registry records
+//! the trips it does not name (`Registry::unrecorded_trips`).
 
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -429,6 +439,70 @@ pub fn row_is_genuine(line: &[u8], pubkey: &VerifyingKey) -> bool {
     })
 }
 
+/// Lab PR 260: a genuine row with `first_trip: true`, at its place in the
+/// log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstTripRow {
+    /// Its position: the `seq` it was signed with, or, for a row written
+    /// before row numbers (lab PR 160), its line (those rows come first).
+    pub row: u64,
+    pub entry: CanaryAccessEntry,
+}
+
+/// Lab PR 260: the genuine first-trip rows of `canaries` in the log at
+/// `path`, in file order (empty when the file is missing). A row is
+/// genuine when its hash, its signature under `pubkey` and, for a numbered
+/// row, its canonical bytes verify ([`row_is_genuine`]); a row that does
+/// not is left out, as is a row without a number after a numbered one
+/// (its place is not signed: a copy of an old row moved to the end) and a
+/// second row at a position already given (a copy of a row). Only the
+/// first-trip rows of these canaries are verified: one per arming.
+pub fn first_trip_rows(
+    path: &Path,
+    pubkey: &VerifyingKey,
+    canaries: &BTreeSet<String>,
+) -> Result<Vec<FirstTripRow>> {
+    let f = match OpenOptions::new().read(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow!(e).context(format!("reading {}", path.display()))),
+    };
+    let mut reader = crate::canary::chain_lines::ChainLines::new(BufReader::new(f));
+    let mut seq = crate::chain_anchor::RowSeq::default();
+    let mut seen: BTreeSet<(String, u64)> = BTreeSet::new();
+    let mut found = Vec::new();
+    while let Some(line) = reader
+        .next_line()
+        .with_context(|| format!("reading line from {}", path.display()))?
+    {
+        let crate::canary::chain_lines::ChainLine::Text(l) = line else {
+            seq.skip();
+            continue;
+        };
+        let Ok(entry) = serde_json::from_str::<CanaryAccessEntry>(l) else {
+            seq.skip();
+            continue;
+        };
+        let (line_row, numbered_before) = (seq.rows(), seq.numbered());
+        // A break is the open's to report (`read_tail_hash`).
+        let _ = seq.push(entry.seq);
+        if !entry.first_trip || !canaries.contains(&entry.canary_id) {
+            continue;
+        }
+        let row = match entry.seq {
+            Some(s) => s,
+            None if !numbered_before => line_row,
+            None => continue,
+        };
+        if seen.contains(&(entry.canary_id.clone(), row)) || !row_is_genuine(l.as_bytes(), pubkey) {
+            continue;
+        }
+        seen.insert((entry.canary_id.clone(), row));
+        found.push(FirstTripRow { row, entry });
+    }
+    Ok(found)
+}
+
 fn format_ts(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
@@ -804,6 +878,103 @@ mod tests {
             .iter()
             .any(|f| f.kind == "chain_lines_unverified"));
         assert_eq!(db.last_hash(), first.entry_hash);
+    }
+
+    // ── Lab PR 260: the first-trip rows the registry's open reads ──────
+
+    /// The genuine first-trip rows of the canaries asked for, at the
+    /// position they were signed with. Not: a later access, another
+    /// canary's trip, a row nobody signed (a made-up hash, at a later
+    /// position), a copy of a genuine row (its signed position is the
+    /// original's), a missing file.
+    #[test]
+    fn first_trip_rows_are_the_genuine_first_trips_of_the_canaries_asked_for() {
+        let dir = TempDir::new().unwrap();
+        let (key, pk) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canary_access.jsonl");
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let trip = db.append(sample_draft(1, true)).unwrap();
+        db.append(sample_draft(1, false)).unwrap();
+        db.append(sample_draft(2, true)).unwrap();
+        drop(db);
+        let mut body = std::fs::read_to_string(&log_path).unwrap();
+        let first = body.lines().next().unwrap().to_string();
+        let mut forged = trip.clone();
+        forged.seq = Some(3);
+        forged.accessor_comm = "someone-else".to_string();
+        forged.entry_hash = "ab".repeat(32);
+        body.push_str(&format!(
+            "{}\n{first}\n",
+            serde_json::to_string(&forged).unwrap()
+        ));
+        std::fs::write(&log_path, &body).unwrap();
+
+        let ids: BTreeSet<String> = ["canary_id_1".to_string()].into();
+        let rows = first_trip_rows(&log_path, &pk, &ids).unwrap();
+        assert_eq!(
+            rows,
+            [FirstTripRow {
+                row: 0,
+                entry: trip
+            }]
+        );
+        let other: BTreeSet<String> = ["canary_id_2".to_string()].into();
+        let rows = first_trip_rows(&log_path, &pk, &other).unwrap();
+        assert_eq!(rows.iter().map(|r| r.row).collect::<Vec<_>>(), [2]);
+        assert!(first_trip_rows(&dir.path().join("absent"), &pk, &ids)
+            .unwrap()
+            .is_empty());
+        // another key signed nothing here
+        let (_, other_pk) = fresh_signing_key(&TempDir::new().unwrap());
+        assert!(first_trip_rows(&log_path, &other_pk, &ids)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Rows written before row numbers (lab PR 160) take their line: they
+    /// come first. One of them copied after the numbered rows has no place
+    /// it was signed with, and counts for nothing.
+    #[test]
+    fn unnumbered_first_trip_rows_take_their_line_but_not_after_numbered_rows() {
+        let dir = TempDir::new().unwrap();
+        let (key, pk) = fresh_signing_key(&dir);
+        let log_path = dir.path().join("canary_access.jsonl");
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        let mut body = String::new();
+        let mut legacy = Vec::new();
+        for first in [false, true] {
+            let mut e =
+                build_signed_entry(&sample_draft(1, first), &key, &[0u8; 16], &prev, 0).unwrap();
+            e.seq = None;
+            e.entry_hash.clear();
+            e.agent_sig.clear();
+            let h = compute_entry_hash(&e).unwrap();
+            e.entry_hash = hex::encode(h);
+            e.agent_sig = B64.encode(key.sign(&h).to_bytes());
+            let line = serde_json::to_string(&e).unwrap();
+            body.push_str(&line);
+            body.push('\n');
+            prev = e.entry_hash.clone();
+            legacy.push((e, line));
+        }
+        std::fs::write(&log_path, &body).unwrap();
+        let mut db = CanaryAccessDb::open(&log_path, key, [0u8; 16]).unwrap();
+        let numbered = db.append(sample_draft(1, true)).unwrap();
+        drop(db);
+        let mut body = std::fs::read_to_string(&log_path).unwrap();
+        body.push_str(&format!("{}\n", legacy[1].1));
+        std::fs::write(&log_path, &body).unwrap();
+
+        let ids: BTreeSet<String> = ["canary_id_1".to_string()].into();
+        let rows = first_trip_rows(&log_path, &pk, &ids).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.row, r.entry.seq))
+                .collect::<Vec<_>>(),
+            [(1, None), (2, Some(2))]
+        );
+        assert_eq!(rows[0].entry, legacy[1].0);
+        assert_eq!(rows[1].entry, numbered);
     }
 
     /// EVD-023 (NN-AUD-427): a pre-image that carries its seal is refused

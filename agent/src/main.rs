@@ -4311,6 +4311,19 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
                 };
                 match (registry, access_log) {
                     (Some(registry), Some(access_log)) => {
+                        // Lab PR 260: a trip the access log holds and the
+                        // registry does not record (the agent stopped
+                        // between the access row and the `Trip` row, or
+                        // that row could not be written) is recorded before
+                        // the detector runs — an ERROR, a signed
+                        // `canary_trip_recovered`, then the `Trip` row: the
+                        // canary stays tripped (before lab PR 260 the start
+                        // re-armed it).
+                        record_unrecorded_trips(
+                            &mut registry.lock(),
+                            &cli.canary_access_file,
+                            audit_log.as_ref(),
+                        );
                         let indexes = Arc::new(parking_lot::Mutex::new(
                             northnarrow_agent::canary::detector::CanaryIndexes::new(),
                         ));
@@ -6079,6 +6092,108 @@ fn attest_bait_integrity(
     };
     if let Err(e) = log.lock().append(draft) {
         warn!(error = %e, "recording the control-surface file check failed");
+    }
+}
+
+/// Lab PR 260: the boot's record of the trips the canary access log holds
+/// and the registry does not ([`Registry::unrecorded_trips`]), before the
+/// detector runs. Each is an ERROR and a signed `canary_trip_recovered`
+/// (attested first: a stop before the `Trip` row is written finds and
+/// attests it again), then a `Trip` row naming its access row
+/// (`Registry::mark_tripped`); a row that cannot be written leaves the trip
+/// for this run, and the next start finds it again. A log that cannot be
+/// read is a signed `subsystem_degraded`: the canaries are then as the
+/// registry says.
+///
+/// [`Registry::unrecorded_trips`]: northnarrow_agent::canary::registry::Registry::unrecorded_trips
+fn record_unrecorded_trips(
+    registry: &mut northnarrow_agent::canary::registry::Registry,
+    access_log: &std::path::Path,
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+) {
+    let trips = match registry.unrecorded_trips(access_log) {
+        Ok(trips) => trips,
+        Err(e) => {
+            error!(
+                error = %format!("{e:#}"),
+                path = %access_log.display(),
+                "canary: the access log could not be read for trips the registry does not \
+                 record — the canaries are as the registry says"
+            );
+            attest_degraded(
+                audit_log,
+                &format!(
+                    "canary: trips the registry does not record not looked for (the access log \
+                     could not be read: {e:#})"
+                ),
+            );
+            return;
+        }
+    };
+    for trip in trips {
+        error!(
+            canary_id = %trip.canary_id,
+            name = %nn_model::log_escape::Escaped(&trip.name),
+            access_row = trip.access_row,
+            access_ts = %trip.access.ts,
+            accessor_pid = trip.access.accessor_pid,
+            accessor_comm = %nn_model::log_escape::Escaped(&trip.access.accessor_comm),
+            first_trip_rows = trip.first_trip_rows,
+            "canary: a trip the registry did not record — its access row is in the access log \
+             (the agent stopped before the registry's row, or could not write it); recorded now, \
+             the canary stays tripped. If the agent stopped, the response to that access did not \
+             run: look for its detection and at its accessor"
+        );
+        attest_trip_recovered(audit_log, &trip);
+        if let Err(e) = registry.mark_tripped(&trip.canary_id, Some(trip.access.entry_hash.clone()))
+        {
+            error!(
+                error = %format!("{e:#}"),
+                canary_id = %trip.canary_id,
+                "canary: recording the trip found in the access log failed — it holds for this \
+                 run; the next start finds it again"
+            );
+        }
+    }
+}
+
+/// Lab PR 260: a trip found in the canary access log at boot, in the signed
+/// audit chain (`canary_trip_recovered`): the canary, its access row (row,
+/// hash, time, kind) and its accessor.
+fn attest_trip_recovered(
+    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
+    trip: &northnarrow_agent::canary::registry::UnrecordedTrip,
+) {
+    let Some(log) = audit_log else {
+        return;
+    };
+    let draft = northnarrow_agent::audit::AuditEntryDraft {
+        op: northnarrow_agent::canary::registry::TRIP_RECOVERED_OP.to_string(),
+        extra: serde_json::json!({
+            "canary_id": trip.canary_id,
+            "name": trip.name,
+            "canary_type": trip.access.canary_type,
+            "access_kind": trip.access.access_kind,
+            "access_row": trip.access_row,
+            "access_entry_hash": trip.access.entry_hash,
+            "access_ts": trip.access.ts,
+            "accessor_pid": trip.access.accessor_pid,
+            "accessor_uid": trip.access.accessor_uid,
+            "accessor_comm": trip.access.accessor_comm,
+            "accessor_exe": trip.access.accessor_exe,
+            "first_trip_rows": trip.first_trip_rows,
+            "at_boot": true,
+        }),
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: "recovered".to_string(),
+        client_pid: std::process::id(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    };
+    if let Err(e) = log.lock().append(draft) {
+        warn!(error = %e, "recording the canary trip found at boot failed");
     }
 }
 
