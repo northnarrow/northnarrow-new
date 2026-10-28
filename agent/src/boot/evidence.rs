@@ -545,56 +545,6 @@ fn attest_degraded_at(
     northnarrow_agent::boot::degradation::report_signed(audit_log, "", detail, at_boot);
 }
 
-/// Lab PR 218: a start refused by a boot gate (`install_manifest`,
-/// `bpf_lsm`, `deny_self_test`) leaves the refusal in the signed chain
-/// before the process exits — the rollback floor, the identity, then the
-/// `subsystem_degraded` (`degraded`: source and detail) and the `agent_boot`
-/// `refused` naming the gate — so root cannot quietly remove the trace
-/// (lab PR 21).
-fn record_refused_boot(
-    cli: &Cli,
-    identity: &agent_id::AgentIdentity,
-    overlay_gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
-    gate: &str,
-    (integrity, provenance): (&str, &str),
-    degraded: Option<(&str, &str)>,
-    detail: &str,
-) {
-    let Ok(key) =
-        northnarrow_agent::audit::AgentSigningKey::load_or_bootstrap(&cli.signing_key_file)
-    else {
-        return;
-    };
-    let Ok(mut log) =
-        northnarrow_agent::audit::AuditLog::open(&cli.audit_log_file, key, identity.id)
-    else {
-        return;
-    };
-    overlay_gate.attest_floor(&mut log);
-    // External audit EVD-020: a refused boot records its identity too.
-    if let Err(e) = log.attest_identity(identity) {
-        warn!(error = format!("{e:#}"), "agent identity not recorded");
-    }
-    if let Some((source, what)) = degraded {
-        northnarrow_agent::boot::degradation::sign_into(&mut log, source, what, true);
-    }
-    match log.boot_refused_by(
-        gate,
-        integrity,
-        provenance,
-        detail,
-        &northnarrow_agent::build_info::agent_build(),
-    ) {
-        Ok(e) => {
-            info!(entry_hash = %e.entry_hash, gate, "refused boot recorded in the audit chain")
-        }
-        Err(e) => error!(
-            error = format!("{e:#}"),
-            "could not record the refused boot in the audit chain"
-        ),
-    }
-}
-
 /// A drain loop returned: its telemetry stream is gone for the rest of
 /// this run. Per-event errors never end a drain (they are logged and the
 /// loop goes on), so this is a tokio I/O failure — recorded in the signed
