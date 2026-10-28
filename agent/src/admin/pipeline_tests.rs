@@ -60,6 +60,10 @@ use crate::posture::PostureMachine;
 
 const AGENT_ID: [u8; 16] = [0x5e; 16];
 
+/// The install nonce of the bootstrap tests (`install.sh` draws 32 random
+/// bytes).
+const INSTALL_NONCE: [u8; 32] = [0x4e; 32];
+
 /// The admin keys: two holding every role, two holding one role each
 /// (no verb needs both), one not installed.
 struct Keys {
@@ -91,10 +95,21 @@ fn fp(key: &SigningKey) -> String {
     hex::encode(fp_bytes(key))
 }
 
+/// An admin.pub line: the key and its roles (none: the default ones,
+/// `unlock,audit-read`).
+fn admin_line(key: &SigningKey, roles: &str) -> String {
+    let hex = hex::encode(key.verifying_key().to_bytes());
+    if roles.is_empty() {
+        format!("{hex}\n")
+    } else {
+        format!("{hex} {roles}\n")
+    }
+}
+
 /// One agent: its admin.pub (the keys above), audit log, posture,
 /// isolator, marker and read verbs' files in a directory of its own.
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     auth: AdminAuth,
     audit: Arc<Mutex<AuditLog>>,
     log_path: PathBuf,
@@ -107,22 +122,22 @@ struct Fixture {
 
 impl Fixture {
     fn new(k: &Keys) -> Self {
-        let dir = TempDir::new().unwrap();
-        let pub_path = dir.path().join("admin.pub");
-        let line = |key: &SigningKey, roles: &str| {
-            format!("{} {roles}\n", hex::encode(key.verifying_key().to_bytes()))
-        };
-        std::fs::write(
-            &pub_path,
-            [
-                line(&k.a, "all"),
-                line(&k.b, "all"),
-                line(&k.canary_read, "canary-read"),
-                line(&k.net_read, "net-read"),
+        Self::with_admin_pub(
+            &[
+                admin_line(&k.a, "all"),
+                admin_line(&k.b, "all"),
+                admin_line(&k.canary_read, "canary-read"),
+                admin_line(&k.net_read, "net-read"),
             ]
             .concat(),
         )
-        .unwrap();
+    }
+
+    /// An agent whose admin.pub is `admin_pub`.
+    fn with_admin_pub(admin_pub: &str) -> Self {
+        let dir = TempDir::new().unwrap();
+        let pub_path = dir.path().join("admin.pub");
+        std::fs::write(&pub_path, admin_pub).unwrap();
         let auth = AdminAuth::load_with_agent_id(&pub_path, AGENT_ID).unwrap();
         let (log_path, audit) = build_test_audit_log(&dir);
         let read_paths = AdminReadPaths {
@@ -139,8 +154,44 @@ impl Fixture {
             auth,
             audit,
             log_path,
-            _dir: dir,
+            dir,
         }
+    }
+
+    /// `install.sh`'s one-key install (BUG-013): admin.pub holding `key`
+    /// alone, every role, and beside it the install nonce and the sentinel
+    /// over the nonce and admin.pub — the files the bootstrap gate reads
+    /// (`verify::bootstrap_paths`: the test's own).
+    fn bootstrap(key: &SigningKey) -> Self {
+        let fx = Self::with_admin_pub(&admin_line(key, "all"));
+        std::fs::write(fx.dir.path().join(".install_nonce"), INSTALL_NONCE).unwrap();
+        fx.write_sentinel();
+        fx
+    }
+
+    /// The sentinel over the install nonce and admin.pub as it is now: what
+    /// `install.sh` writes, and what root, who can read the nonce, can
+    /// write again.
+    fn write_sentinel(&self) {
+        let admin_pub = std::fs::read(self.dir.path().join("admin.pub")).unwrap();
+        std::fs::write(
+            self.sentinel(),
+            crate::anti_tamper::bootstrap::compute_sentinel_content(&INSTALL_NONCE, &admin_pub),
+        )
+        .unwrap();
+    }
+
+    fn sentinel(&self) -> PathBuf {
+        self.dir.path().join(".bootstrap")
+    }
+
+    /// The keys admin.pub holds now.
+    fn admin_keys(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("admin.pub"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .count()
     }
 
     /// One frame of one connection, as `handle_connection` serves it.
@@ -1453,6 +1504,173 @@ fn the_requests_without_a_signature_are_answered_as_they_are() {
         (telemetry.refused)(AdminResult::NoPendingChallenge, true),
         "the legacy unlock spent the challenge"
     );
+}
+
+/// A signed request on a connection of its own, as nn-admin sends it: its
+/// reply and its audit row.
+fn send(
+    fx: &Fixture,
+    extra: OperationExtra,
+    signers: &[&SigningKey],
+) -> (AdminMessage, AuditEntry) {
+    let conn = ConnAuth::new(&fx.auth);
+    let nonce = fx.challenge(&conn);
+    let p = payload(extra, nonce, now_unix_secs(), AGENT_ID);
+    let signatures = signatures(&p, signers);
+    let request = match &p.extra {
+        OperationExtra::RotateKeysAdd(_) => {
+            AdminMessage::RotateKeysAddRequest(RotateKeysAddRequest {
+                payload: p,
+                signatures,
+            })
+        }
+        OperationExtra::RotateKeysRevoke(_) => {
+            AdminMessage::RotateKeysRevokeRequest(RotateKeysRevokeRequest {
+                payload: p,
+                signatures,
+            })
+        }
+        OperationExtra::Shutdown(_) => AdminMessage::ShutdownRequest(ShutdownRequest {
+            payload: p,
+            signatures,
+        }),
+        other => panic!("send: {other:?}"),
+    };
+    let reply = fx.serve(&conn, &request);
+    (reply, fx.rows().pop().expect("its row"))
+}
+
+/// A `rotate-keys add` of `new` (`audit-read`), signed by `signers`.
+fn add_key(fx: &Fixture, new: &SigningKey, signers: &[&SigningKey]) -> (AdminMessage, AuditEntry) {
+    let extra = OperationExtra::RotateKeysAdd(RotateKeysAddExtra {
+        new_pubkey: new.verifying_key().to_bytes(),
+        roles: vec![Role::AuditRead],
+    });
+    send(fx, extra, signers)
+}
+
+/// 2-of-N refused to one key.
+const ONE_OF_TWO: AdminResult = AdminResult::QuorumNotMet {
+    required: 2,
+    provided: 1,
+};
+
+/// The one-key bootstrap of `install.sh`, end to end through the pipeline
+/// (BUG-013, external audit ATP-004; lab PR 263's review, M-1). While it
+/// is armed the install's key alone adds the second key — its row names
+/// it — and nothing else: shutdown and revoke stay 2-of-N. The add removes
+/// the sentinel and spends the bootstrap: a second add with one key is
+/// refused, and so it is after the keys went back to one and root wrote a
+/// valid sentinel again — the add of a second key spent it for good.
+#[test]
+fn the_one_key_bootstrap_adds_one_key_and_is_then_spent() {
+    let k = keys();
+    let fx = Fixture::bootstrap(&k.a);
+    let shutdown = OperationExtra::Shutdown(ShutdownExtra { grace_secs: 30 });
+    assert_eq!(
+        send(&fx, shutdown, &[&k.a]).0,
+        AdminMessage::ShutdownResult(ONE_OF_TWO),
+        "the bootstrap relaxes the add alone"
+    );
+    let revoke = OperationExtra::RotateKeysRevoke(RotateKeysRevokeExtra {
+        fingerprint: fp_bytes(&k.a),
+    });
+    assert_eq!(
+        send(&fx, revoke, &[&k.a]).0,
+        AdminMessage::RotateKeysRevokeResult(ONE_OF_TWO)
+    );
+
+    // armed: one key adds the second
+    let (reply, row) = add_key(&fx, &k.b, &[&k.a]);
+    assert_eq!(
+        reply,
+        AdminMessage::RotateKeysAddResult(AdminResult::Success)
+    );
+    assert_eq!(
+        (row.op.as_str(), row.result.as_str(), row.key_fp.as_str()),
+        ("rotate_keys_add", "success", fp(&k.a).as_str())
+    );
+    assert!(row.cosigner_fps.is_empty());
+    assert_eq!(row.extra, json!({ "new_key_fp": fp(&k.b) }));
+    assert_eq!(fx.admin_keys(), 2);
+    assert!(!fx.sentinel().exists(), "the add removes the sentinel");
+    assert!(fx.auth.bootstrap_consumed(), "and spends the bootstrap");
+
+    // spent: one key adds no other
+    let (reply, row) = add_key(&fx, &k.canary_read, &[&k.a]);
+    assert_eq!(reply, AdminMessage::RotateKeysAddResult(ONE_OF_TWO));
+    assert_eq!(row.result, failure(&ONE_OF_TWO));
+    assert_eq!(fx.admin_keys(), 2);
+
+    // ATP-004: back to one key, a valid sentinel written again — still spent
+    let revoke = OperationExtra::RotateKeysRevoke(RotateKeysRevokeExtra {
+        fingerprint: fp_bytes(&k.b),
+    });
+    assert_eq!(
+        send(&fx, revoke, &[&k.a, &k.b]).0,
+        AdminMessage::RotateKeysRevokeResult(AdminResult::Success)
+    );
+    assert_eq!(fx.admin_keys(), 1);
+    fx.write_sentinel();
+    let (reply, row) = add_key(&fx, &k.canary_read, &[&k.a]);
+    assert_eq!(
+        reply,
+        AdminMessage::RotateKeysAddResult(ONE_OF_TWO),
+        "the bootstrap was armed again"
+    );
+    assert_eq!(row.result, failure(&ONE_OF_TWO));
+    assert_eq!(fx.admin_keys(), 1);
+}
+
+/// ATP-004 at boot: the signed chain holds a second key's add
+/// (`boot::admin` marks the bootstrap spent), and a one-key admin.pub with
+/// a valid sentinel is 2-of-N.
+#[test]
+fn a_bootstrap_the_signed_chain_spent_stays_closed() {
+    let k = keys();
+    let fx = Fixture::bootstrap(&k.a);
+    fx.auth.mark_bootstrap_consumed();
+    let (reply, row) = add_key(&fx, &k.b, &[&k.a]);
+    assert_eq!(reply, AdminMessage::RotateKeysAddResult(ONE_OF_TWO));
+    assert_eq!(row.result, failure(&ONE_OF_TWO));
+    assert_eq!(fx.admin_keys(), 1);
+}
+
+/// The gate is armed only when all its conditions hold (BUG-013): without
+/// the sentinel, with a sentinel that is not the hash of the install nonce
+/// and admin.pub, or without the nonce, one key adds no key. A sentinel
+/// that does not match is left for the operator to see.
+#[test]
+fn a_bootstrap_gate_not_armed_keeps_the_add_two_of_n() {
+    type Close = fn(&Fixture);
+    let k = keys();
+    let cases: [(&str, Close); 3] = [
+        ("no sentinel", |fx| {
+            std::fs::remove_file(fx.sentinel()).unwrap()
+        }),
+        ("a sentinel over another admin.pub", |fx| {
+            std::fs::write(fx.sentinel(), "0".repeat(64)).unwrap()
+        }),
+        ("no install nonce", |fx| {
+            std::fs::remove_file(fx.dir.path().join(".install_nonce")).unwrap()
+        }),
+    ];
+    for (case, close) in cases {
+        let fx = Fixture::bootstrap(&k.a);
+        close(&fx);
+        let (reply, row) = add_key(&fx, &k.b, &[&k.a]);
+        assert_eq!(
+            reply,
+            AdminMessage::RotateKeysAddResult(ONE_OF_TWO),
+            "{case}"
+        );
+        assert_eq!(row.result, failure(&ONE_OF_TWO), "{case}");
+        assert_eq!(fx.admin_keys(), 1, "{case}");
+        assert!(!fx.auth.bootstrap_consumed(), "{case}");
+        if case == "a sentinel over another admin.pub" {
+            assert!(fx.sentinel().exists(), "{case}: kept for the operator");
+        }
+    }
 }
 
 /// `NN_REJECTION_TABLE_OUT=<file>`: the table appended to `<file>.<part>`.
