@@ -2828,6 +2828,13 @@ mod tests {
         for _ in 0..2 {
             got.push(listener.recv(&mut buf).map(|n| buf[..n].to_vec()));
         }
+        // Lab PR 258: shut down before it is closed. A child another test
+        // spawns gets a copy of every descriptor of the process, the
+        // listener's too, and holds it until its exec (`CLOEXEC`): closed
+        // in that window, the socket lived on and took the datagram — the
+        // flake of the crate's tests under load. Shut down, it takes none,
+        // whoever holds a descriptor of it.
+        listener.shutdown(std::net::Shutdown::Both).unwrap();
         drop(listener);
         let refused = sd_notify_ready();
         // SAFETY: as above.
@@ -3636,7 +3643,18 @@ mod tests {
     async fn nothing_listening_at_the_path_is_absent_not_unresponsive() {
         let dir = tempfile::tempdir().unwrap();
         let stale = dir.path().join("stale.sock");
-        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        // Lab PR 258: shut down before it is closed, as in
+        // `sd_notify_reaches_an_abstract_notify_socket` — a child another
+        // test spawns holds a copy of the listener's descriptor until its
+        // exec, and the socket would still take the connection (served by
+        // this process: `NotTheAgent`).
+        let listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+        // SAFETY: shutdown(2) of the listener's own open descriptor.
+        assert_eq!(
+            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) },
+            0
+        );
+        drop(listener);
         let file = dir.path().join("file.sock");
         std::fs::write(&file, "").unwrap();
         let sub = dir.path().join("dir.sock");

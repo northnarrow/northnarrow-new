@@ -135,11 +135,11 @@ impl Executor {
         );
     }
 
-    /// External audit CMB-017: a quarantine (and any index repair) in the
-    /// signed audit log — the vault id, the path, the content's SHA-256
-    /// and size, the process.
+    /// External audit CMB-017: a quarantine (and any repair of this
+    /// executor's vault index) in the signed audit log — the vault id, the
+    /// path, the content's SHA-256 and size, the process.
     fn record_quarantine(&self, pid: u32, outcome: &ExecutionOutcome) {
-        let notes = quarantine::take_index_notes();
+        let notes = quarantine::take_index_notes(&self.config.quarantine_dir);
         let ExecutionOutcome::Quarantined {
             original_path,
             vault_id,

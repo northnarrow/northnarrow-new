@@ -85,6 +85,11 @@ mod tests {
         let sent = ready();
         let mut buf = [0u8; 64];
         let got = listener.recv(&mut buf).map(|n| buf[..n].to_vec());
+        // Lab PR 258 (the watchdog's twin of this test failed so): shut
+        // down before it is closed — a child another test spawns holds a
+        // copy of the listener's descriptor until its exec, and the socket
+        // would live on and take the datagram.
+        listener.shutdown(std::net::Shutdown::Both).unwrap();
         drop(listener);
         let refused = ready();
         std::env::remove_var("NOTIFY_SOCKET");
