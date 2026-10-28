@@ -140,6 +140,19 @@ pub(crate) fn attest(
                 if let Err(e) = log.attest_identity(&identity) {
                     warn!(error = format!("{e:#}"), "agent identity not recorded");
                 }
+                // R11b (lab PR 262): the refusals an earlier start could not
+                // sign here (the audit log could not take them), from their
+                // fallback chain beside --pid-file, before this boot's row.
+                if let Some(path) = refusal::fallback_path(cli) {
+                    let pk = northnarrow_agent::keys::boot_verifying_key(&cli.signing_key_file);
+                    if let Some(Err(e)) = refusal::record_fallback(&mut log, &path, pk.as_ref()) {
+                        warn!(
+                            error = %e,
+                            path = %path.display(),
+                            "boot refusals of the fallback chain NOT recorded — kept for the next start"
+                        );
+                    }
+                }
                 match log.boot_probe(
                     detect_only_source.as_deref(),
                     integrity.label(),

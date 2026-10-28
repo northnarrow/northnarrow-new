@@ -749,6 +749,11 @@ mod tests {
             assert!(at(&format!("Refusal::new(\"{gate}\"")) > load, "{gate}");
         }
         assert!(at("Refusal::new(\"deny_self_test\"") > at("boot::deny_selftest::run("));
+        // the refusals an earlier start left in the fallback chain, recorded
+        // in the audit log before this boot's own row
+        let recorded = at("refusal::record_fallback(");
+        assert!(recorded > at("boot.enter(BootPhase::Attest)"));
+        assert!(recorded < at(".boot_probe("));
         let sources = start_sources();
         assert!(!sources.contains("record_refused_boot("));
         assert!(!sources.contains("process::exit(78)"));

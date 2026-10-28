@@ -12,7 +12,8 @@
 //! 2. when the audit log cannot take them (it is the gate: not writable,
 //!    its chain broken, its write failed), into a chain of the same format,
 //!    signed with the same key, beside `--pid-file` ([`FALLBACK_FILE_NAME`];
-//!    `/run/northnarrow` in the unit);
+//!    `/run/northnarrow` in the unit), which the next start that opens the
+//!    audit log verifies and records there ([`record_fallback`]);
 //! 3. nowhere but the journal when neither can be written (no key, no
 //!    `--pid-file`): the line says so.
 //!
@@ -33,7 +34,7 @@
 use std::path::{Path, PathBuf};
 
 use northnarrow_agent::agent_id::AgentIdentity;
-use northnarrow_agent::audit::{AgentSigningKey, AuditLog};
+use northnarrow_agent::audit::{AgentSigningKey, AuditEntry, AuditLog};
 use northnarrow_agent::config::overlay_auth::OverlayGate;
 use tracing::{debug, error, info, warn};
 
@@ -46,6 +47,17 @@ pub(crate) const EX_CONFIG: i32 = 78;
 /// The chain beside `--pid-file` that holds the refusals the audit log
 /// could not take.
 pub(crate) const FALLBACK_FILE_NAME: &str = "boot-refusals.jsonl";
+
+/// The audit `op` of the row that records the fallback chain's refusals in
+/// the audit log ([`record_fallback`]).
+pub(crate) const RECOVERED_OP: &str = "boot_refusals_recovered";
+
+/// A fallback chain larger than this is not read: recorded as refused.
+pub(crate) const MAX_FALLBACK_BYTES: u64 = 1 << 20;
+
+/// The refused boots one [`RECOVERED_OP`] row lists (its count is the
+/// chain's, all of them).
+pub(crate) const MAX_LISTED: usize = 32;
 
 /// The `binary_integrity` and `install_provenance` of a refusal before the
 /// install manifest was checked.
@@ -280,6 +292,145 @@ pub(crate) fn withdraw_registration(bpffs_root: &Path) {
     }
 }
 
+/// The next start that opens the audit log: the refusals the fallback chain
+/// at `path` holds — the ones an earlier start could not sign there —,
+/// verified with the agent's key (`verifying_key`), recorded in `log` as one
+/// signed [`RECOVERED_OP`] row (the chain's rows and head, each refused
+/// boot's time, gate, detail, binary integrity and row hash, at most
+/// [`MAX_LISTED`] of them), then the file removed. A chain that does not
+/// verify, is too large, or is not a regular file is recorded too, with why
+/// and none of its contents, and removed all the same, so a bad file cannot
+/// repeat at every start (lab PR 220's rule for the rollback marker). When
+/// the row cannot be written the file stays for the next start. `None`: no
+/// fallback chain; else the row's hash, or why it was not written.
+pub(crate) fn record_fallback(
+    log: &mut AuditLog,
+    path: &Path,
+    verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+) -> Option<Result<String, String>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(write_recovered(
+                log,
+                path,
+                serde_json::json!({ "verified": false, "why": e.to_string() }),
+            ))
+        }
+    };
+    let extra = if !meta.file_type().is_file() {
+        serde_json::json!({ "verified": false, "why": "not a regular file" })
+    } else if meta.len() > MAX_FALLBACK_BYTES {
+        serde_json::json!({
+            "verified": false,
+            "why": format!("{} bytes, over {MAX_FALLBACK_BYTES}", meta.len()),
+        })
+    } else {
+        match verifying_key {
+            None => serde_json::json!({ "verified": false, "why": "no agent verifying key" }),
+            Some(pk) => fallback_contents(path, pk),
+        }
+    };
+    let result = write_recovered(log, path, extra);
+    if result.is_ok() {
+        if let Err(e) = std::fs::remove_file(path) {
+            warn!(
+                error = %e,
+                path = %path.display(),
+                "boot refusals recorded, their fallback chain NOT removed — recorded again at the \
+                 next start"
+            );
+        }
+    }
+    Some(result)
+}
+
+/// What a fallback chain at `path` says, once every row verifies with `pk`.
+fn fallback_contents(path: &Path, pk: &ed25519_dalek::VerifyingKey) -> serde_json::Value {
+    let report = match northnarrow_agent::audit::verify_chain_file(path, pk, None) {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({ "verified": false, "why": e.to_string() }),
+    };
+    if let Some(broken) = &report.broken {
+        return serde_json::json!({
+            "verified": false,
+            "why": broken.to_string(),
+            "rows_verified": report.rows,
+        });
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => return serde_json::json!({ "verified": false, "why": e.to_string() }),
+    };
+    let rows: Vec<AuditEntry> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let refused: Vec<&AuditEntry> = rows
+        .iter()
+        .filter(|e| e.op == "agent_boot" && e.result == "refused")
+        .collect();
+    let listed: Vec<serde_json::Value> = refused
+        .iter()
+        .take(MAX_LISTED)
+        .map(|e| {
+            serde_json::json!({
+                "ts": e.ts,
+                "refused_by": e.extra.get("refused_by"),
+                "detail": e.extra.get("detail"),
+                "binary_integrity": e.extra.get("binary_integrity"),
+                "entry_hash": e.entry_hash,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "verified": true,
+        "rows": rows.len(),
+        "head": rows.last().map(|e| e.entry_hash.clone()),
+        "refused_boots": refused.len(),
+        "listed": listed,
+    })
+}
+
+/// The [`RECOVERED_OP`] row, `extra` with the file's path.
+fn write_recovered(
+    log: &mut AuditLog,
+    path: &Path,
+    mut extra: serde_json::Value,
+) -> Result<String, String> {
+    extra["file"] = serde_json::Value::String(path.display().to_string());
+    let verified = extra["verified"].as_bool() == Some(true);
+    if verified {
+        error!(
+            path = %path.display(),
+            refused_boots = %extra["refused_boots"],
+            "boot refusals the audit log could not take are recorded in it now (their fallback \
+             chain verified)"
+        );
+    } else {
+        error!(
+            path = %path.display(),
+            why = %extra["why"],
+            "a fallback chain of boot refusals that does not verify — recorded and removed"
+        );
+    }
+    log.append(northnarrow_agent::audit::AuditEntryDraft {
+        op: RECOVERED_OP.to_string(),
+        extra,
+        key_fp: "agent-self".to_string(),
+        cosigner_fps: Vec::new(),
+        result: if verified { "recorded" } else { "refused" }.to_string(),
+        client_pid: log.self_pid(),
+        client_uid: 0,
+        client_comm: "northnarrow-agent".to_string(),
+        client_exe: None,
+    })
+    .map(|e| e.entry_hash)
+    .map_err(|e| format!("{e:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +656,100 @@ mod tests {
             matches!(&signed, Signed::Unsigned(why) if why.contains("--pid-file")),
             "{signed:?}"
         );
+    }
+
+    /// The next start that opens the audit log records the fallback chain's
+    /// refusal there, verified, and removes the file; a second start finds
+    /// nothing.
+    #[test]
+    fn the_next_start_records_the_fallback_chain_in_the_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit.log");
+        std::fs::create_dir(&audit).unwrap();
+        std::fs::create_dir(dir.path().join("run")).unwrap();
+        let cli = cli(dir.path(), &audit);
+        let id = identity(dir.path());
+        let gate_ = gate(dir.path(), id.id);
+        let ctx = Context {
+            cli: &cli,
+            identity: &id,
+            overlay_gate: &gate_,
+            integrity: ("verified", "source-tree"),
+        };
+        let Signed::Fallback {
+            path, entry_hash, ..
+        } = sign(
+            &ctx,
+            None,
+            &Refusal::new("audit_log", "audit.log: Is a directory"),
+        )
+        else {
+            panic!("not in the fallback chain")
+        };
+        // the operator puts the audit log back; the next start opens it
+        std::fs::remove_dir(&audit).unwrap();
+        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let mut log = AuditLog::open(&audit, key, id.id).unwrap();
+        let recorded = record_fallback(&mut log, &path, Some(&pk(dir.path())))
+            .expect("a fallback chain")
+            .expect("recorded");
+        assert!(
+            !path.exists(),
+            "the fallback chain is removed once recorded"
+        );
+        let main = rows(&audit);
+        let row = main.last().unwrap();
+        assert_eq!(row["op"], RECOVERED_OP);
+        assert_eq!(row["result"], "recorded");
+        assert_eq!(row["entry_hash"], recorded.as_str());
+        assert_eq!(row["extra"]["verified"], true);
+        assert_eq!(row["extra"]["refused_boots"], 1);
+        assert_eq!(row["extra"]["head"], entry_hash.as_str());
+        assert_eq!(row["extra"]["listed"][0]["refused_by"], "audit_log");
+        assert_eq!(row["extra"]["listed"][0]["entry_hash"], entry_hash.as_str());
+        assert_eq!(row["extra"]["file"], path.display().to_string());
+        verifies(&audit, dir.path());
+        assert!(record_fallback(&mut log, &path, Some(&pk(dir.path()))).is_none());
+    }
+
+    /// A fallback chain that does not verify (here: another key's) is
+    /// recorded as refused, with none of its contents, and removed.
+    #[test]
+    fn a_fallback_chain_that_does_not_verify_is_recorded_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let fake = dir.path().join(FALLBACK_FILE_NAME);
+        {
+            let key = AgentSigningKey::load_or_bootstrap(&other.path().join("k")).unwrap();
+            let mut f = AuditLog::open(&fake, key, [9; 16]).unwrap();
+            f.boot_refused_by(
+                "install_manifest",
+                "mismatch",
+                "none",
+                "forged",
+                &northnarrow_agent::build_info::agent_build(),
+            )
+            .unwrap();
+        }
+        let key = AgentSigningKey::load_or_bootstrap(&dir.path().join("agent.sig.key")).unwrap();
+        let mut log = AuditLog::open(&dir.path().join("audit.log"), key, [1; 16]).unwrap();
+        record_fallback(&mut log, &fake, Some(&pk(dir.path())))
+            .unwrap()
+            .unwrap();
+        assert!(!fake.exists());
+        let main = rows(&dir.path().join("audit.log"));
+        let row = main.last().unwrap();
+        assert_eq!(row["op"], RECOVERED_OP);
+        assert_eq!(row["result"], "refused");
+        assert_eq!(row["extra"]["verified"], false);
+        assert!(row["extra"].get("listed").is_none(), "{row}");
+        // a directory there is not read either
+        std::fs::create_dir(&fake).unwrap();
+        record_fallback(&mut log, &fake, Some(&pk(dir.path())))
+            .unwrap()
+            .unwrap();
+        let main = rows(&dir.path().join("audit.log"));
+        assert_eq!(main.last().unwrap()["extra"]["why"], "not a regular file");
     }
 
     /// No pinned map: nothing to withdraw, nothing touched.
