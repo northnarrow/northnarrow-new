@@ -8,11 +8,10 @@ use nn_proto::admin_protocol::{
     AdminResult, CanaryBurnRequest, CanaryDeployRequest, CanaryDeployResponse, CanaryListRequest,
     CanaryListResponse, CanaryRefreshRequest,
 };
-use nn_proto::admin_signed_payload::{OperationCode, Role};
 use sha2::{Digest, Sha256};
 
 use super::read::read_tail_jsonl;
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::admin::CanaryAdminState;
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::canary::registry::{CanaryToken, CanaryTokenDraft, DecoyContent, RegistryError};
@@ -119,38 +118,20 @@ pub(in crate::admin) fn dispatch_canary_deploy(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> CanaryDeployResponse {
-    use nn_proto::admin_signed_payload::OperationExtra;
-
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::CanaryManage],
-        OperationCode::CanaryDeploy,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return CanaryDeployResponse {
-                result: map_admin_auth_error(e, "canary-deploy"),
-                canary_id: String::new(),
-            };
-        }
+    let refuse = |result| CanaryDeployResponse {
+        result,
+        canary_id: String::new(),
     };
-    *fps_out = matched_fps;
+    signed(&req, auth, fps_out, refuse, |v| canary_deploy(v, state))
+}
 
-    let extra = match &req.payload.extra {
-        OperationExtra::CanaryDeploy(e) => e.clone(),
-        _ => {
-            warn!("canary-deploy payload extra is not CanaryDeploy variant");
-            return CanaryDeployResponse {
-                result: AdminResult::UnknownOperation,
-                canary_id: String::new(),
-            };
-        }
-    };
+/// The verified `canary deploy`: the decoy checked, written, watched and
+/// registered.
+fn canary_deploy(
+    v: Verified<'_, CanaryDeployRequest>,
+    state: Option<&CanaryAdminState>,
+) -> CanaryDeployResponse {
+    let extra = v.extra().clone();
 
     let state = match state {
         Some(s) => s,
@@ -163,7 +144,7 @@ pub(in crate::admin) fn dispatch_canary_deploy(
         }
     };
 
-    let primary_fp = fps_out.first().cloned().unwrap_or_default();
+    let primary_fp = v.signer_fp().to_string();
 
     // External audit DEC-015 (lab PR 178): a File / Credential path is
     // judged, written, recorded and watched in its normal form (`//`
@@ -389,39 +370,20 @@ pub(in crate::admin) fn dispatch_canary_list(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> CanaryListResponse {
-    use nn_proto::admin_signed_payload::OperationExtra;
-
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::CanaryRead],
-        OperationCode::CanaryList,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return CanaryListResponse {
-                result: map_admin_auth_error(e, "canary-list"),
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
-        }
+    let refuse = |result| CanaryListResponse {
+        result,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
     };
-    *fps_out = matched_fps;
-    if !matches!(&req.payload.extra, OperationExtra::CanaryList(_)) {
-        warn!("canary-list payload extra is not CanaryList variant");
-        return CanaryListResponse {
-            result: AdminResult::UnknownOperation,
-            entries_jsonl: String::new(),
-            entries_count: 0,
-            entries_truncated: false,
-        };
-    }
+    signed(&req, auth, fps_out, refuse, |v| canary_list(v, state))
+}
 
+/// The verified `canary list`: the registry log's newest rows.
+fn canary_list(
+    v: Verified<'_, CanaryListRequest>,
+    state: Option<&CanaryAdminState>,
+) -> CanaryListResponse {
     let log_path = match state {
         Some(s) => s.registry_log_path.clone(),
         None => {
@@ -438,7 +400,7 @@ pub(in crate::admin) fn dispatch_canary_list(
         read_tail_jsonl(&log_path, None, None, usize::MAX);
     info!(
         target: "admin.canary_list",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         entries = entries_count,
         truncated = entries_truncated,
         "canary list served"
@@ -460,30 +422,16 @@ pub(in crate::admin) fn dispatch_canary_burn(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
-    use nn_proto::admin_signed_payload::OperationExtra;
+    signed(&req, auth, fps_out, |r| r, |v| canary_burn(v, state))
+}
 
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::CanaryManage],
-        OperationCode::CanaryBurn,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => return map_admin_auth_error(e, "canary-burn"),
-    };
-    *fps_out = matched_fps;
-
-    let canary_id = match &req.payload.extra {
-        OperationExtra::CanaryBurn(e) => e.canary_id.clone(),
-        _ => {
-            warn!("canary-burn payload extra is not CanaryBurn variant");
-            return AdminResult::UnknownOperation;
-        }
-    };
+/// The verified `canary burn`: the registry's Burn row, the decoy no
+/// longer watched.
+fn canary_burn(
+    v: Verified<'_, CanaryBurnRequest>,
+    state: Option<&CanaryAdminState>,
+) -> AdminResult {
+    let canary_id = v.extra().canary_id.clone();
     let state = match state {
         Some(s) => s,
         None => {
@@ -491,7 +439,7 @@ pub(in crate::admin) fn dispatch_canary_burn(
             return AdminResult::UnknownOperation;
         }
     };
-    let primary_fp = fps_out.first().cloned().unwrap_or_default();
+    let primary_fp = v.signer_fp().to_string();
     let (result, decoy) = {
         let mut reg = state.registry.lock();
         let decoy = reg
@@ -544,30 +492,16 @@ pub(in crate::admin) fn dispatch_canary_refresh(
     state: Option<&CanaryAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
-    use nn_proto::admin_signed_payload::OperationExtra;
+    signed(&req, auth, fps_out, |r| r, |v| canary_refresh(v, state))
+}
 
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::CanaryManage],
-        OperationCode::CanaryRefresh,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => return map_admin_auth_error(e, "canary-refresh"),
-    };
-    *fps_out = matched_fps;
-
-    let canary_id = match &req.payload.extra {
-        OperationExtra::CanaryRefresh(e) => e.canary_id.clone(),
-        _ => {
-            warn!("canary-refresh payload extra is not CanaryRefresh variant");
-            return AdminResult::UnknownOperation;
-        }
-    };
+/// The verified `canary refresh`: the decoy written again, the canary
+/// re-armed.
+fn canary_refresh(
+    v: Verified<'_, CanaryRefreshRequest>,
+    state: Option<&CanaryAdminState>,
+) -> AdminResult {
+    let canary_id = v.extra().canary_id.clone();
     let state = match state {
         Some(s) => s,
         None => {
@@ -575,7 +509,7 @@ pub(in crate::admin) fn dispatch_canary_refresh(
             return AdminResult::UnknownOperation;
         }
     };
-    let primary_fp = fps_out.first().cloned().unwrap_or_default();
+    let primary_fp = v.signer_fp().to_string();
     let result = refresh_canary(state, &canary_id, &primary_fp);
     match result {
         Ok(_) => {

@@ -9,9 +9,9 @@ use tracing::{info, warn};
 use common::wire::{FS_PROTECT_MUTATE, FS_PROTECT_WRITE};
 use ed25519_dalek::VerifyingKey;
 use nn_proto::admin_protocol::{AdminResult, RotateKeysAddRequest, RotateKeysRevokeRequest};
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+use nn_proto::admin_signed_payload::Role;
 
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::anti_tamper::admin_auth::ConnAuth;
 
 /// at-authz-1 verify-item 1: re-register the rotated admin.pub inode in
@@ -62,67 +62,21 @@ pub(in crate::admin) fn dispatch_rotate_keys_add(
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
-    // BUG-013 (PHASE 15.1): bootstrap-mode 1-of-N gate. Consulted
-    // BEFORE verify_signed_payload_quorum so the relaxed min_distinct
-    // (1) goes into the verify call. The gate is evaluated against the
-    // key set in memory (one key), the signed chain (no second key ever
-    // added) and the sentinel + nonce on disk; ALL must hold, and any
-    // other outcome falls through to the permanent 2-of-N path. See
-    // `crate::anti_tamper::bootstrap` for the full security argument.
-    let bootstrap_armed = match auth.config_path() {
-        Some(admin_pub_path) => {
-            let paths = crate::anti_tamper::bootstrap::BootstrapPaths::default_paths(
-                admin_pub_path.to_path_buf(),
-            );
-            // External audit ATP-004: the keys in memory, and the
-            // consumption recorded in the signed chain.
-            matches!(
-                crate::anti_tamper::bootstrap::evaluate_loaded(
-                    &paths,
-                    &auth.loaded_admin_pub(),
-                    auth.bootstrap_consumed(),
-                ),
-                crate::anti_tamper::bootstrap::BootstrapGate::Armed
-            )
-        }
-        // In-memory test builders have no config_path; bootstrap
-        // gate is structurally inapplicable. Fall through to the
-        // existing 2-of-N path.
-        None => false,
-    };
-    let min_distinct: u8 = if bootstrap_armed { 1 } else { 2 };
+    // BUG-013 (PHASE 15.1): 2-of-N, or 1-of-N while the one-key
+    // bootstrap is armed — the pipeline's quorum (`verify::Quorum`).
+    signed(&req, auth, fps_out, |r| r, |v| rotate_keys_add(v, auth))
+}
 
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-
-    let signers = match auth.verify_signed_payload_quorum_keys(
-        &req.payload,
-        &sigs,
-        min_distinct, // 2-of-N normally; 1-of-N when bootstrap-armed (BUG-013)
-        &[Role::RotateKeys],
-        OperationCode::RotateKeysAdd,
-        server_now,
-    ) {
-        Ok(v) => v,
-        Err(e) => return map_admin_auth_error(e, "rotate-keys-add"),
-    };
-    *fps_out = signers.fingerprints;
-
-    let (new_pubkey_bytes, roles) = match &req.payload.extra {
-        OperationExtra::RotateKeysAdd(extra) => (extra.new_pubkey, extra.roles.clone()),
-        other => {
-            warn!(
-                extra = ?other,
-                "rotate-keys-add payload extra is not RotateKeysAdd variant"
-            );
-            return AdminResult::UnknownOperation;
-        }
-    };
+/// The verified `rotate-keys add`: the new key confined to its signers'
+/// roles, admin.pub rewritten, protected again and reloaded.
+fn rotate_keys_add(v: Verified<'_, RotateKeysAddRequest>, auth: &ConnAuth<'_>) -> AdminResult {
+    let bootstrap_armed = v.bootstrap_armed();
+    let (new_pubkey_bytes, roles) = (v.extra().new_pubkey, v.extra().roles.clone());
 
     // External audit NN-AUD-084: the new key may hold only roles its
     // signers hold, the bootstrap 1-of-N path included — a key with only
     // `rotate-keys` used to mint an `all` key.
-    if let Some(beyond) = role_beyond_signers(&roles, &signers.keys) {
+    if let Some(beyond) = role_beyond_signers(&roles, v.keys()) {
         warn!(
             target: "admin.rotate_keys",
             role = ?beyond,
@@ -268,32 +222,17 @@ pub(in crate::admin) fn dispatch_rotate_keys_revoke(
     auth: &ConnAuth<'_>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    // 2-of-N per §3.3, the pipeline's (`verify::signed`).
+    signed(&req, auth, fps_out, |r| r, |v| rotate_keys_revoke(v, auth))
+}
 
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        2, // 2-of-N per §3.3
-        &[Role::RotateKeys],
-        OperationCode::RotateKeysRevoke,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => return map_admin_auth_error(e, "rotate-keys-revoke"),
-    };
-    *fps_out = matched_fps;
-
-    let target_fp = match &req.payload.extra {
-        OperationExtra::RotateKeysRevoke(extra) => extra.fingerprint,
-        other => {
-            warn!(
-                extra = ?other,
-                "rotate-keys-revoke payload extra is not RotateKeysRevoke variant"
-            );
-            return AdminResult::UnknownOperation;
-        }
-    };
+/// The verified `rotate-keys revoke`: admin.pub rewritten without the
+/// key, protected again and reloaded.
+fn rotate_keys_revoke(
+    v: Verified<'_, RotateKeysRevokeRequest>,
+    auth: &ConnAuth<'_>,
+) -> AdminResult {
+    let target_fp = v.extra().fingerprint;
 
     let Some(config_path) = auth.config_path() else {
         warn!(

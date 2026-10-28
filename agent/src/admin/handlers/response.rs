@@ -8,9 +8,8 @@ use nn_proto::admin_protocol::{
     ResponseReleaseResponse, ResponseRestoreRequest, ResponseRestoreResponse,
     ResponseStatusRequest, ResponseStatusResponse,
 };
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
 
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::admin::ResponseAdminState;
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::posture::PostureMachine;
@@ -42,26 +41,21 @@ pub(in crate::admin) fn dispatch_response_status(
     state: Option<&ResponseAdminState>,
     fps_out: &mut Vec<String>,
 ) -> ResponseStatusResponse {
+    signed(&req, auth, fps_out, empty_response_status, |v| {
+        response_status(v, posture, state)
+    })
+}
+
+/// The verified `response status`: the containment record, the vault and
+/// the ladder's stage.
+fn response_status(
+    _v: Verified<'_, ResponseStatusRequest>,
+    posture: &PostureMachine,
+    state: Option<&ResponseAdminState>,
+) -> ResponseStatusResponse {
     use nn_proto::admin_protocol::{
         ContainedProcessWire, QuarantinedFileWire, MAX_RESPONSE_STATUS_ROWS,
     };
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::AuditRead],
-        OperationCode::ResponseStatus,
-        now_unix_secs(),
-    ) {
-        Ok(t) => t,
-        Err(e) => return empty_response_status(map_admin_auth_error(e, "response-status")),
-    };
-    *fps_out = matched_fps;
-    if !matches!(&req.payload.extra, OperationExtra::ResponseStatus(_)) {
-        warn!("response-status payload extra is not ResponseStatus variant");
-        return empty_response_status(AdminResult::UnknownOperation);
-    }
     let Some(state) = state else {
         warn!("response-status: agent boot did not wire ResponseAdminState");
         return empty_response_status(AdminResult::UnknownOperation);
@@ -123,24 +117,23 @@ pub(in crate::admin) fn dispatch_response_release(
         released: false,
         message,
     };
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::ResponseManage],
-        OperationCode::ResponseRelease,
-        now_unix_secs(),
-    ) {
-        Ok(t) => t,
-        Err(e) => return refuse(map_admin_auth_error(e, "response-release"), String::new()),
-    };
-    *fps_out = matched_fps;
-    let OperationExtra::ResponseRelease(extra) = &req.payload.extra else {
-        warn!("response-release payload extra is not ResponseRelease variant");
-        return refuse(AdminResult::UnknownOperation, String::new());
-    };
-    let pid = extra.pid;
+    signed(
+        &req,
+        auth,
+        fps_out,
+        |r| refuse(r, String::new()),
+        |v| response_release(v, state, refuse),
+    )
+}
+
+/// The verified `response release`: each scope of the pid's containment
+/// record released, and what that did.
+fn response_release(
+    v: Verified<'_, ResponseReleaseRequest>,
+    state: Option<&ResponseAdminState>,
+    refuse: impl Fn(AdminResult, String) -> ResponseReleaseResponse,
+) -> ResponseReleaseResponse {
+    let pid = v.extra().pid;
     let Some(state) = state else {
         warn!("response-release: agent boot did not wire ResponseAdminState");
         return refuse(AdminResult::UnknownOperation, String::new());
@@ -194,7 +187,7 @@ pub(in crate::admin) fn dispatch_response_release(
     let message = parts.join("; ");
     info!(
         target: "admin.response_release",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         pid,
         released,
         detail = %nn_model::log_escape::Escaped(&message),
@@ -224,23 +217,22 @@ pub(in crate::admin) fn dispatch_response_restore(
         path: String::new(),
         message,
     };
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::ResponseManage],
-        OperationCode::ResponseRestore,
-        now_unix_secs(),
-    ) {
-        Ok(t) => t,
-        Err(e) => return refuse(map_admin_auth_error(e, "response-restore"), String::new()),
-    };
-    *fps_out = matched_fps;
-    let OperationExtra::ResponseRestore(extra) = &req.payload.extra else {
-        warn!("response-restore payload extra is not ResponseRestore variant");
-        return refuse(AdminResult::UnknownOperation, String::new());
-    };
+    signed(
+        &req,
+        auth,
+        fps_out,
+        |r| refuse(r, String::new()),
+        |v| response_restore(v, state, refuse),
+    )
+}
+
+/// The verified `response restore`: the vault entry written back.
+fn response_restore(
+    v: Verified<'_, ResponseRestoreRequest>,
+    state: Option<&ResponseAdminState>,
+    refuse: impl Fn(AdminResult, String) -> ResponseRestoreResponse,
+) -> ResponseRestoreResponse {
+    let extra = v.extra();
     let Some(state) = state else {
         warn!("response-restore: agent boot did not wire ResponseAdminState");
         return refuse(AdminResult::UnknownOperation, String::new());
@@ -254,7 +246,7 @@ pub(in crate::admin) fn dispatch_response_restore(
             let path = path.to_string_lossy().into_owned();
             warn!(
                 target: "admin.response_restore",
-                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                signer_fp = %v.signer_fp(),
                 vault_id = %extra.vault_id,
                 path = %nn_model::log_escape::Escaped(&path),
                 "quarantined file restored by an administrator (mode 0600)"
@@ -296,29 +288,23 @@ pub(in crate::admin) fn dispatch_remediate_ransomware(
         refused: 0,
         skipped: 0,
     };
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::ResponseManage],
-        OperationCode::RemediateRansomware,
-        now_unix_secs(),
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return refuse(
-                map_admin_auth_error(e, "remediate-ransomware"),
-                String::new(),
-            )
-        }
-    };
-    *fps_out = matched_fps;
-    let OperationExtra::RemediateRansomware(extra) = &req.payload.extra else {
-        warn!("remediate-ransomware payload extra is not RemediateRansomware variant");
-        return refuse(AdminResult::UnknownOperation, String::new());
-    };
-    let key_fp = fps_out.first().cloned().unwrap_or_default();
+    signed(
+        &req,
+        auth,
+        fps_out,
+        |r| refuse(r, String::new()),
+        |v| remediate_ransomware(v, refuse),
+    )
+}
+
+/// The verified `remediate ransomware`: the journal's restore, and what
+/// it did.
+fn remediate_ransomware(
+    v: Verified<'_, RemediateRansomwareRequest>,
+    refuse: impl Fn(AdminResult, String) -> RemediateRansomwareResponse,
+) -> RemediateRansomwareResponse {
+    let extra = v.extra();
+    let key_fp = v.signer_fp().to_string();
     let report = match crate::cow::admin_restore(extra.pid, extra.since_unix, extra.dry_run, key_fp)
     {
         Ok(r) => r,
@@ -378,7 +364,7 @@ pub(in crate::admin) fn dispatch_remediate_ransomware(
     );
     warn!(
         target: "admin.remediate_ransomware",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         pid = ?extra.pid,
         since = ?extra.since_unix,
         dry_run = extra.dry_run,

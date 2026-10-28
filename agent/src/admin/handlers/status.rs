@@ -1,14 +1,11 @@
 //! The status verbs (R11d, lab PR 263: from `admin_socket.rs`): the
 //! unsigned public status and the signed telemetry status.
 
-use tracing::warn;
-
 use nn_proto::admin_protocol::{
     AdminResult, StatusResponse, TelemetryStatusRequest, TelemetryStatusResponse,
 };
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
 
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::admin::ResponseAdminState;
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};
@@ -146,16 +143,10 @@ pub(in crate::admin) fn public_status(
     )
 }
 
-/// The read roles the signed telemetry verb accepts, either one: the
-/// `audit-read` every key carries by default (the bootstrap key of
-/// `install.sh` included), and the `telemetry-read` of a dashboard key
-/// (`triage` and `all` imply it). The counters are no more than what an
-/// `audit-read` key already reads in the signed audit log.
-const TELEMETRY_STATUS_ROLES: [Role; 2] = [Role::AuditRead, Role::TelemetryRead];
-
 /// `nn-admin status --key` / `nn-admin net status --key` (external audit
 /// ASK-009, lab PR 213): the whole status, 1-of-N, `audit-read` or
-/// `telemetry-read` ([`TELEMETRY_STATUS_ROLES`]); one audit row per request.
+/// `telemetry-read` (the pipeline's `verify::Roles::AnyOf`); one audit row
+/// per request.
 pub(in crate::admin) fn dispatch_telemetry_status(
     req: TelemetryStatusRequest,
     auth: &ConnAuth<'_>,
@@ -168,38 +159,21 @@ pub(in crate::admin) fn dispatch_telemetry_status(
         result,
         status: None,
     };
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
     // No role in the quorum check (it would want each listed role): the
-    // signer's roles are checked below, any one of the two.
-    let signers = match auth.verify_signed_payload_quorum_keys(
-        &req.payload,
-        &sigs,
-        1,
-        &[],
-        OperationCode::TelemetryStatus,
-        now_unix_secs(),
-    ) {
-        Ok(v) => v,
-        Err(e) => return refuse(map_admin_auth_error(e, "telemetry-status")),
-    };
-    *fps_out = signers.fingerprints;
-    if !signers
-        .keys
-        .iter()
-        .any(|k| TELEMETRY_STATUS_ROLES.iter().any(|r| k.authorizes(*r)))
-    {
-        warn!(
-            target: "anti_tamper.admin_auth.verify_failure",
-            reason = "role_denied",
-            required = "audit-read or telemetry-read",
-            "telemetry-status refused: the signer holds neither read role"
-        );
-        return refuse(AdminResult::RoleDenied);
-    }
-    if !matches!(&req.payload.extra, OperationExtra::TelemetryStatus(_)) {
-        warn!("telemetry-status payload extra is not TelemetryStatus variant");
-        return refuse(AdminResult::UnknownOperation);
-    }
+    // signer's roles are checked after it, any one of the two — the
+    // pipeline's `Roles::AnyOf`, whose refusal names the signer.
+    signed(&req, auth, fps_out, refuse, |v| {
+        signed_telemetry_status(v, posture, isolator, response_state)
+    })
+}
+
+/// The verified telemetry status: the whole status.
+fn signed_telemetry_status(
+    _v: Verified<'_, TelemetryStatusRequest>,
+    posture: &PostureMachine,
+    isolator: &NetworkIsolator,
+    response_state: Option<&ResponseAdminState>,
+) -> TelemetryStatusResponse {
     TelemetryStatusResponse {
         result: AdminResult::Success,
         status: Some(telemetry_status(posture, isolator, response_state)),

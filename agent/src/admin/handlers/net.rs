@@ -7,18 +7,17 @@ use nn_proto::admin_protocol::{
     AdminResult, NetFingerprintRequest, NetFingerprintResponse, NetFlowsRequest, NetFlowsResponse,
     NetListenersRequest, NetListenersResponse, NetResolveRequest, NetResolveResponse,
 };
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
 
 use super::read::read_tail_jsonl;
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::admin::AdminReadPaths;
 use crate::anti_tamper::admin_auth::ConnAuth;
 
 // ── Tappa 10 N7 — net admin dispatches ────────────────────────────
 //
 // Four dispatches mirroring the FIM C6 + canary K6 shape:
-//   * Auth via `verify_signed_payload_quorum` (1-of-N per §13 Q6).
-//   * Op-extra-variant defensive check.
+//   * Auth via the pipeline (`verify::signed`, 1-of-N per §13 Q6), the
+//     extra typed by it.
 //   * Emit audit-grade `info!` line with the matched signer fp.
 //   * External audit NN-AUD-081: every verb answers from the
 //     chained logs the net drain writes (`netflow.jsonl`,
@@ -42,48 +41,24 @@ pub(in crate::admin) fn dispatch_net_flows(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFlowsResponse {
-    use nn_proto::admin_signed_payload::NetFlowsExtra;
-
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::NetRead],
-        OperationCode::NetFlows,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return NetFlowsResponse {
-                result: map_admin_auth_error(e, "net-flows"),
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
-        }
+    let refuse = |result| NetFlowsResponse {
+        result,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
     };
-    *fps_out = matched_fps;
+    signed(&req, auth, fps_out, refuse, |v| net_flows(v, read_paths))
+}
 
-    let since = match &req.payload.extra {
-        OperationExtra::NetFlows(NetFlowsExtra { since_unix_ts }) => *since_unix_ts,
-        _ => {
-            warn!("net-flows payload extra is not NetFlows variant");
-            return NetFlowsResponse {
-                result: AdminResult::UnknownOperation,
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
-        }
-    };
+/// The verified `net flows`: the netflow log's newest rows.
+fn net_flows(v: Verified<'_, NetFlowsRequest>, read_paths: &AdminReadPaths) -> NetFlowsResponse {
+    let since = v.extra().since_unix_ts;
 
     let (entries_jsonl, entries_count, entries_truncated) =
         read_tail_jsonl(&read_paths.netflow, since, None, usize::MAX);
     info!(
         target: "admin.net_flows",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         entries = entries_count,
         truncated = entries_truncated,
         "net flows served"
@@ -108,43 +83,27 @@ pub(in crate::admin) fn dispatch_net_listeners(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetListenersResponse {
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::NetRead],
-        OperationCode::NetListeners,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return NetListenersResponse {
-                result: map_admin_auth_error(e, "net-listeners"),
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
-        }
+    let refuse = |result| NetListenersResponse {
+        result,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
     };
-    *fps_out = matched_fps;
+    signed(&req, auth, fps_out, refuse, |v| {
+        net_listeners(v, read_paths)
+    })
+}
 
-    if !matches!(&req.payload.extra, OperationExtra::NetListeners(_)) {
-        warn!("net-listeners payload extra is not NetListeners variant");
-        return NetListenersResponse {
-            result: AdminResult::UnknownOperation,
-            entries_jsonl: String::new(),
-            entries_count: 0,
-            entries_truncated: false,
-        };
-    }
-
+/// The verified `net listeners`: the listener log's newest rows.
+fn net_listeners(
+    v: Verified<'_, NetListenersRequest>,
+    read_paths: &AdminReadPaths,
+) -> NetListenersResponse {
     let (entries_jsonl, entries_count, entries_truncated) =
         read_tail_jsonl(&read_paths.netflow_listeners, None, None, usize::MAX);
     info!(
         target: "admin.net_listeners",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         entries = entries_count,
         truncated = entries_truncated,
         "net listeners served"
@@ -186,41 +145,25 @@ pub(in crate::admin) fn dispatch_net_resolve(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetResolveResponse {
-    use nn_proto::admin_signed_payload::NetResolveExtra;
-
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::NetRead],
-        OperationCode::NetResolve,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return NetResolveResponse {
-                result: map_admin_auth_error(e, "net-resolve"),
-                qname: None,
-                queried_at_unix_ts: None,
-            };
-        }
+    let refuse = |result| NetResolveResponse {
+        result,
+        qname: None,
+        queried_at_unix_ts: None,
     };
-    *fps_out = matched_fps;
+    signed(&req, auth, fps_out, refuse, |v| net_resolve(v, read_paths))
+}
 
+/// The verified `net resolve`: the newest named flow to the address.
+fn net_resolve(
+    v: Verified<'_, NetResolveRequest>,
+    read_paths: &AdminReadPaths,
+) -> NetResolveResponse {
     let refused = NetResolveResponse {
         result: AdminResult::UnknownOperation,
         qname: None,
         queried_at_unix_ts: None,
     };
-    let ip_query = match &req.payload.extra {
-        OperationExtra::NetResolve(NetResolveExtra { ip }) => ip.clone(),
-        _ => {
-            warn!("net-resolve payload extra is not NetResolve variant");
-            return refused;
-        }
-    };
+    let ip_query = v.extra().ip.clone();
     let Ok(target) = ip_query.trim().parse::<std::net::IpAddr>() else {
         warn!(ip = %ip_query, "net-resolve: not an IP address");
         return refused;
@@ -250,7 +193,7 @@ pub(in crate::admin) fn dispatch_net_resolve(
     });
     info!(
         target: "admin.net_resolve",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         ip = %target,
         found = qname.is_some(),
         "net resolve served"
@@ -277,43 +220,29 @@ pub(in crate::admin) fn dispatch_net_fingerprint(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> NetFingerprintResponse {
-    use nn_proto::admin_signed_payload::NetFingerprintExtra;
-
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::NetRead],
-        OperationCode::NetFingerprint,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return NetFingerprintResponse {
-                result: map_admin_auth_error(e, "net-fingerprint"),
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
-        }
+    let refuse = |result| NetFingerprintResponse {
+        result,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
     };
-    *fps_out = matched_fps;
+    signed(&req, auth, fps_out, refuse, |v| {
+        net_fingerprint(v, read_paths)
+    })
+}
 
+/// The verified `net fingerprint`: the flow's netflow rows.
+fn net_fingerprint(
+    v: Verified<'_, NetFingerprintRequest>,
+    read_paths: &AdminReadPaths,
+) -> NetFingerprintResponse {
     let refused = NetFingerprintResponse {
         result: AdminResult::UnknownOperation,
         entries_jsonl: String::new(),
         entries_count: 0,
         entries_truncated: false,
     };
-    let flow_id = match &req.payload.extra {
-        OperationExtra::NetFingerprint(NetFingerprintExtra { flow_id }) => flow_id.clone(),
-        _ => {
-            warn!("net-fingerprint payload extra is not NetFingerprint variant");
-            return refused;
-        }
-    };
+    let flow_id = v.extra().flow_id.clone();
     let flow_id = flow_id.trim().to_ascii_lowercase();
     if flow_id.is_empty() || flow_id.len() > 64 || !flow_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         warn!(flow_id = %flow_id, "net-fingerprint: flow id is not hex");
@@ -326,7 +255,7 @@ pub(in crate::admin) fn dispatch_net_fingerprint(
         read_tail_jsonl(&read_paths.netflow, None, Some(&keep), usize::MAX);
     info!(
         target: "admin.net_fingerprint",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         flow_id = %flow_id,
         entries = entries_count,
         truncated = entries_truncated,

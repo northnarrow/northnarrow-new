@@ -5,9 +5,8 @@
 use tracing::{error, info};
 
 use nn_proto::admin_protocol::{AdminResult, SignedUnlockRequest, SignedUnlockResponse};
-use nn_proto::admin_signed_payload::{OperationCode, Role};
 
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::anti_tamper::network_isolate::{Family, NetworkIsolator};
 use crate::posture::{AdminReleaseError, PostureMachine};
@@ -37,24 +36,23 @@ pub(in crate::admin) fn dispatch_signed_unlock(
         isolation_v6: isolator.is_isolated(Family::V6),
         message,
     };
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1,
-        &[Role::Unlock],
-        OperationCode::Unlock,
-        now_unix_secs(),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            let r = map_admin_auth_error(e, "unlock");
-            return reply(r, false, "signature verification failed".to_string());
-        }
-    };
-    *fps_out = matched_fps;
-    let signer = fps_out.first().cloned().unwrap_or_default();
-    match posture.admin_release_combat_with_token(token) {
+    signed(
+        &req,
+        auth,
+        fps_out,
+        |r| reply(r, false, "signature verification failed".to_string()),
+        |v| signed_unlock(v, posture, reply),
+    )
+}
+
+/// The verified `unlock`: the release, and what it did.
+fn signed_unlock(
+    v: Verified<'_, SignedUnlockRequest>,
+    posture: &PostureMachine,
+    reply: impl Fn(AdminResult, bool, String) -> SignedUnlockResponse,
+) -> SignedUnlockResponse {
+    let signer = v.signer_fp().to_string();
+    match posture.admin_release_combat_with_token(v.into_token()) {
         Ok(out) => {
             let message = if out.left_combat {
                 format!(

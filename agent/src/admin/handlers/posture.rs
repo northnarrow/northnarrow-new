@@ -5,11 +5,11 @@
 use tracing::{error, info, warn};
 
 use nn_proto::admin_protocol::{AdminResult, ForcePostureRequest};
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+use nn_proto::admin_signed_payload::Role;
 
 use crate::admin::audit::DispatchNotes;
-use crate::admin::verify::now_unix_secs;
-use crate::anti_tamper::admin_auth::{AdminAuthError, ConnAuth};
+use crate::admin::verify::{signed, Verified};
+use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::posture::{AdminReleaseError, PostureMachine};
 
 /// Tappa 8 A10 — handle one [`ForcePostureRequest`] (design §4 +
@@ -20,8 +20,8 @@ use crate::posture::{AdminReleaseError, PostureMachine};
 ///
 /// Quorum semantics: 1-of-N per §3.3 (unlike shutdown's 2-of-N).
 /// Required role: [`Role::ForcePosture`]. Expected op tag:
-/// [`OperationCode::ForcePosture`]. The signed payload's `extra`
-/// MUST be [`OperationExtra::ForcePosture { target }`]; any other
+/// `OperationCode::ForcePosture`. The signed payload's `extra`
+/// MUST be `OperationExtra::ForcePosture { target }`; any other
 /// extra variant trips the op/extra invariant check inside
 /// [`crate::anti_tamper::admin_auth::ConnAuth::verify_signed_payload_quorum`]
 /// (Tappa 8 A7) and surfaces as `UnknownOperation` on the wire.
@@ -49,68 +49,30 @@ pub(in crate::admin) fn dispatch_force_posture(
     fps_out: &mut Vec<String>,
     notes: &mut DispatchNotes,
 ) -> AdminResult {
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    signed(
+        &req,
+        auth,
+        fps_out,
+        |r| r,
+        |v| force_posture(v, posture, notes),
+    )
+}
 
-    let verify_outcome = auth.verify_signed_payload_quorum_keys(
-        &req.payload,
-        &sigs,
-        1, // 1-of-N per §3.3
-        &[Role::ForcePosture],
-        OperationCode::ForcePosture,
-        server_now,
-    );
-
-    let signers = match verify_outcome {
-        Ok(v) => v,
-        Err(AdminAuthError::NoPendingChallenge) => return AdminResult::NoPendingChallenge,
-        Err(AdminAuthError::NonceMismatch) => return AdminResult::InvalidSignature,
-        Err(AdminAuthError::UnknownOperation { .. }) => return AdminResult::UnknownOperation,
-        Err(AdminAuthError::AgentIdMismatch) => return AdminResult::AgentIdMismatch,
-        Err(AdminAuthError::TimestampSkew {
-            server_ts,
-            max_skew_secs,
-        }) => {
-            return AdminResult::TimestampSkew {
-                server_ts,
-                max_skew_secs,
-            };
-        }
-        Err(AdminAuthError::InvalidSignature) => return AdminResult::InvalidSignature,
-        Err(AdminAuthError::QuorumNotMet { required, provided }) => {
-            return AdminResult::QuorumNotMet { required, provided };
-        }
-        Err(AdminAuthError::RoleDenied { .. }) => return AdminResult::RoleDenied,
-        Err(AdminAuthError::RateLimited { retry_after_secs }) => {
-            return AdminResult::RateLimited { retry_after_secs };
-        }
-        Err(AdminAuthError::TooManySignatures { .. }) => return AdminResult::InvalidSignature,
-        Err(AdminAuthError::PayloadVerify(e)) => {
-            warn!(error = ?e, "force-posture payload verify failed at common layer");
-            return AdminResult::InvalidSignature;
-        }
-    };
-    *fps_out = signers.fingerprints;
+/// The verified `force-posture`: the transition, through the posture's
+/// capability-gated path.
+fn force_posture(
+    v: Verified<'_, ForcePostureRequest>,
+    posture: &PostureMachine,
+    notes: &mut DispatchNotes,
+) -> AdminResult {
     // External audit NN-AUD-083: may this request release COMBAT?
-    let may_release = signers.keys.iter().any(|k| k.authorizes(Role::Unlock));
+    let may_release = v.keys().iter().any(|k| k.authorizes(Role::Unlock));
 
-    // Extract the target from the verified payload. The verify checks
-    // the op/extra invariant (`admin_signed_payload::check_op`, external
-    // audit AUT-001 — before it, only the op tag was checked and this
-    // match was the only guard), so this is the ForcePosture variant; the
-    // match keeps the compiler exhaustive and refuses with
-    // UnknownOperation if a future refactor ever breaks the invariant.
-    let target = match &req.payload.extra {
-        OperationExtra::ForcePosture(extra) => extra.target,
-        other => {
-            warn!(
-                extra = ?other,
-                "force-posture payload extra is not ForcePosture variant — \
-                 op/extra invariant breach"
-            );
-            return AdminResult::UnknownOperation;
-        }
-    };
+    // The target of the verified payload. The verify checks the op/extra
+    // invariant (`admin_signed_payload::check_op`, external audit AUT-001
+    // — before it, only the op tag was checked and a match here was the
+    // only guard), so the extra is the ForcePosture variant.
+    let target = v.extra().target;
 
     // Drive the posture mutation through the capability-gated path.
     // `admin_force_state_signed_by` consumes the token, fires
@@ -119,7 +81,9 @@ pub(in crate::admin) fn dispatch_force_posture(
     // `may_release`; any other error shape maps to InvalidSignature
     // defensively. Lab PR 245: a COMBAT it enters names the keys that
     // signed the order as its cause, in the ladder's signed rows.
-    match posture.admin_force_state_signed_by(signers.token, target, may_release, fps_out.clone()) {
+    let fps = v.fingerprints().to_vec();
+    let signer_fp = v.signer_fp().to_string();
+    match posture.admin_force_state_signed_by(v.into_token(), target, may_release, fps) {
         Ok(outcome) => {
             notes.force_from = Some(outcome.from);
             notes.force_release = outcome.release.map(Ok);
@@ -135,7 +99,7 @@ pub(in crate::admin) fn dispatch_force_posture(
             warn!(
                 target: "admin.force_posture",
                 to = ?target,
-                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                signer_fp = %signer_fp,
                 "force-posture out of COMBAT refused: no signer holds the `unlock` role"
             );
             AdminResult::RoleDenied

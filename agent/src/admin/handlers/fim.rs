@@ -9,10 +9,9 @@ use nn_proto::admin_protocol::{
     AdminResult, FimBaselineRequest, FimReportRequest, FimReportResponse, FimStatusRequest,
     FimStatusResponse,
 };
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
 
 use super::read::{extract_ts_field, read_tail_jsonl};
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::admin::{AdminReadPaths, FimAdminState};
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::fim::recompute::RecomputeReason;
@@ -35,32 +34,16 @@ pub(in crate::admin) fn dispatch_fim_baseline(
     fim_state: Option<&FimAdminState>,
     fps_out: &mut Vec<String>,
 ) -> AdminResult {
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    // 1-of-N per §13 Q6 (workflow gate, not security gate), the
+    // pipeline's (`verify::signed`).
+    signed(&req, auth, fps_out, |r| r, |v| fim_baseline(v, fim_state))
+}
 
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1, // 1-of-N per §13 Q6 (workflow gate, not security gate)
-        &[Role::FimManage],
-        OperationCode::FimBaseline,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => return map_admin_auth_error(e, "fim-baseline"),
-    };
-    *fps_out = matched_fps;
-
-    // The payload's extra MUST be FimBaseline (op/extra invariant
-    // already enforced inside verify_signed_payload_quorum).
-    if !matches!(&req.payload.extra, OperationExtra::FimBaseline(_)) {
-        warn!(
-            extra = ?req.payload.extra,
-            "fim-baseline payload extra is not FimBaseline variant"
-        );
-        return AdminResult::UnknownOperation;
-    }
-
+/// The verified `fim baseline`: the recompute channel fired.
+fn fim_baseline(
+    v: Verified<'_, FimBaselineRequest>,
+    fim_state: Option<&FimAdminState>,
+) -> AdminResult {
     match fim_state {
         Some(state) => {
             let queued = state
@@ -68,7 +51,7 @@ pub(in crate::admin) fn dispatch_fim_baseline(
                 .trigger(RecomputeReason::AdminRequest);
             info!(
                 target: "admin.fim_baseline",
-                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                signer_fp = %v.signer_fp(),
                 queued,
                 "fim baseline requested — recompute channel fired"
             );
@@ -76,7 +59,7 @@ pub(in crate::admin) fn dispatch_fim_baseline(
         None => {
             info!(
                 target: "admin.fim_baseline",
-                signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+                signer_fp = %v.signer_fp(),
                 "fim baseline requested — recompute scheduled for next agent restart \
                  (legacy serve_with_marker_path path; production main.rs uses \
                  serve_with_fim_state)"
@@ -100,30 +83,17 @@ pub(in crate::admin) fn dispatch_fim_status(
     fim_state: Option<&FimAdminState>,
     fps_out: &mut Vec<String>,
 ) -> FimStatusResponse {
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
+    // 1-of-N per §13 Q6, the pipeline's (`verify::signed`).
+    signed(&req, auth, fps_out, empty_fim_status, |v| {
+        fim_status(v, fim_state)
+    })
+}
 
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1, // 1-of-N per §13 Q6
-        &[Role::FimRead],
-        OperationCode::FimStatus,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => return empty_fim_status(map_admin_auth_error(e, "fim-status")),
-    };
-    *fps_out = matched_fps;
-
-    if !matches!(&req.payload.extra, OperationExtra::FimStatus(_)) {
-        warn!(
-            extra = ?req.payload.extra,
-            "fim-status payload extra is not FimStatus variant"
-        );
-        return empty_fim_status(AdminResult::UnknownOperation);
-    }
-
+/// The verified `fim status`: the in-process snapshot.
+fn fim_status(
+    v: Verified<'_, FimStatusRequest>,
+    fim_state: Option<&FimAdminState>,
+) -> FimStatusResponse {
     let state = match fim_state {
         Some(s) => s,
         None => {
@@ -140,7 +110,7 @@ pub(in crate::admin) fn dispatch_fim_status(
 
     info!(
         target: "admin.fim_status",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         watched = state.paths_summary.watched_paths_count,
         baseline_total = baseline_entries_total,
         drift_total = drift_entries_total,
@@ -240,49 +210,24 @@ pub(in crate::admin) fn dispatch_fim_report(
     read_paths: &AdminReadPaths,
     fps_out: &mut Vec<String>,
 ) -> FimReportResponse {
-    use nn_proto::admin_signed_payload::FimReportExtra;
-
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1, // 1-of-N per §13 Q6
-        &[Role::FimRead],
-        OperationCode::FimReport,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return FimReportResponse {
-                result: map_admin_auth_error(e, "fim-report"),
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
-        }
+    // 1-of-N per §13 Q6, the pipeline's (`verify::signed`).
+    let refuse = |result| FimReportResponse {
+        result,
+        entries_jsonl: String::new(),
+        entries_count: 0,
+        entries_truncated: false,
     };
-    *fps_out = matched_fps;
+    signed(&req, auth, fps_out, refuse, |v| fim_report(v, read_paths))
+}
 
-    let since = match &req.payload.extra {
-        OperationExtra::FimReport(FimReportExtra { since_unix_ts }) => *since_unix_ts,
-        _ => {
-            warn!("fim-report payload extra is not FimReport variant");
-            return FimReportResponse {
-                result: AdminResult::UnknownOperation,
-                entries_jsonl: String::new(),
-                entries_count: 0,
-                entries_truncated: false,
-            };
-        }
-    };
-
+/// The verified `fim report`: the drift log's newest rows.
+fn fim_report(v: Verified<'_, FimReportRequest>, read_paths: &AdminReadPaths) -> FimReportResponse {
+    let since = v.extra().since_unix_ts;
     let (entries_jsonl, entries_count, entries_truncated) =
         read_tail_jsonl(&read_paths.fim_drift, since, None, usize::MAX);
     info!(
         target: "admin.fim_report",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         entries = entries_count,
         truncated = entries_truncated,
         "fim report served"

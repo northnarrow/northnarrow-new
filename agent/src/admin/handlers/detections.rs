@@ -7,10 +7,10 @@ use nn_proto::admin_protocol::{
     AdminResult, DetectionSetStatusRequest, DetectionSetStatusResponse, DetectionsRequest,
     DetectionsResponse, MAX_FRAME_BODY,
 };
-use nn_proto::admin_signed_payload::{OperationCode, OperationExtra, Role};
+use nn_proto::admin_signed_payload::OperationExtra;
 
 use crate::admin::audit::AuditClient;
-use crate::admin::verify::{map_admin_auth_error, now_unix_secs};
+use crate::admin::verify::{signed, Verified};
 use crate::admin::DetectionAdminState;
 use crate::anti_tamper::admin_auth::ConnAuth;
 use crate::detection_store::{Principal, StatusEvent};
@@ -44,34 +44,25 @@ pub(in crate::admin) fn dispatch_detections(
     det_state: Option<&DetectionAdminState>,
     fps_out: &mut Vec<String>,
 ) -> DetectionsResponse {
+    // 1-of-N: a read verb, like fim-report / net-flows. Role::TelemetryRead
+    // — a Triage key also satisfies this via the 9.0.c subsumption (triage
+    // subsumes read), so a triage-only key can read the detections it
+    // triages. The pipeline's (`verify::signed`).
+    signed(&req, auth, fps_out, empty_detections, |v| {
+        detections(v, det_state)
+    })
+}
+
+/// The verified `detections`: the newest records, verified and filtered,
+/// with their current triage status.
+fn detections(
+    v: Verified<'_, DetectionsRequest>,
+    det_state: Option<&DetectionAdminState>,
+) -> DetectionsResponse {
     use crate::detection_store::{self, DetectionFilter};
     const SOFT_CAP: usize = MAX_FRAME_BODY / 2;
 
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1, // 1-of-N: a read verb, like fim-report / net-flows.
-        // Role::TelemetryRead — a Triage key also satisfies this via
-        // the 9.0.c subsumption (triage subsumes read), so a triage-
-        // only key can read the detections it triages.
-        &[Role::TelemetryRead],
-        OperationCode::Detections,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => return empty_detections(map_admin_auth_error(e, "detections")),
-    };
-    *fps_out = matched_fps;
-
-    let extra = match &req.payload.extra {
-        OperationExtra::Detections(e) => e,
-        _ => {
-            warn!("detections payload extra is not Detections variant");
-            return empty_detections(AdminResult::UnknownOperation);
-        }
-    };
+    let extra = v.extra();
 
     // Build the typed filter. A provided-but-unrecognised enum filter
     // can match nothing, so we short-circuit to an empty success
@@ -166,7 +157,7 @@ pub(in crate::admin) fn dispatch_detections(
     }
     info!(
         target: "admin.detections",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         entries = entries_count,
         truncated = entries_truncated,
         "detections served"
@@ -210,8 +201,6 @@ pub(in crate::admin) fn dispatch_detection_set_status(
     client: &AuditClient,
     fps_out: &mut Vec<String>,
 ) -> DetectionSetStatusResponse {
-    use crate::detection_store::{self, DetectionStatus};
-
     // Recover the requested id up front so every reply (including auth
     // failures) echoes it. Only meaningful for the matching extra
     // variant; 0 otherwise (an op/extra mismatch is rejected anyway).
@@ -220,28 +209,26 @@ pub(in crate::admin) fn dispatch_detection_set_status(
         _ => 0,
     };
 
-    let server_now = now_unix_secs();
-    let sigs: Vec<[u8; 64]> = req.signatures.iter().map(|s| s.signature).collect();
-    let (_token, matched_fps) = match auth.verify_signed_payload_quorum(
-        &req.payload,
-        &sigs,
-        1, // 1-of-N: a single triage operator suffices.
-        &[Role::Triage],
-        OperationCode::DetectionSetStatus,
-        server_now,
-    ) {
-        Ok(t) => t,
-        Err(e) => return fail_set_status(map_admin_auth_error(e, "detection_set_status"), req_id),
-    };
-    *fps_out = matched_fps;
+    // 1-of-N: a single triage operator suffices; the pipeline's
+    // (`verify::signed`).
+    signed(
+        &req,
+        auth,
+        fps_out,
+        |r| fail_set_status(r, req_id),
+        |v| detection_set_status(v, det_state, client),
+    )
+}
 
-    let extra = match &req.payload.extra {
-        OperationExtra::DetectionSetStatus(e) => e,
-        _ => {
-            warn!("detection-set-status payload extra is not DetectionSetStatus variant");
-            return fail_set_status(AdminResult::UnknownOperation, req_id);
-        }
-    };
+/// The verified `detection set-status`: one signed StatusEvent appended.
+fn detection_set_status(
+    v: Verified<'_, DetectionSetStatusRequest>,
+    det_state: Option<&DetectionAdminState>,
+    client: &AuditClient,
+) -> DetectionSetStatusResponse {
+    use crate::detection_store::{self, DetectionStatus};
+
+    let extra = v.extra();
 
     // The status-event store must be wired (it isn't on a degraded boot
     // where the detection store failed to open). Without it set-status
@@ -305,7 +292,7 @@ pub(in crate::admin) fn dispatch_detection_set_status(
     }
     info!(
         target: "admin.detection_set_status",
-        signer_fp = %fps_out.first().map(String::as_str).unwrap_or(""),
+        signer_fp = %v.signer_fp(),
         id = extra.id,
         new_status = new_status.as_str(),
         "detection triage status updated",
