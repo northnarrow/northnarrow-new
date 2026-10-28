@@ -18,12 +18,16 @@
 //!
 //! External audit NN-AUD-077: a transient `accept()` error (EMFILE,
 //! ECONNABORTED, …) backs off and retries instead of ending the admin
-//! plane; at most [`MAX_ADMIN_CONNECTIONS`] connections are served at
+//! plane; at most `MAX_ADMIN_CONNECTIONS` connections are served at
 //! once, and a full table makes room by closing the connection that has
-//! waited longest on its peer; a peer gets [`FRAME_READ_TIMEOUT`] to send
-//! each request and [`FRAME_WRITE_TIMEOUT`] to take each reply. External
+//! waited longest on its peer; a peer gets `FRAME_READ_TIMEOUT` to send
+//! each request and `FRAME_WRITE_TIMEOUT` to take each reply. External
 //! audit NN-AUD-078 / NN-AUD-079: the challenge and the failure count live
 //! with the connection ([`ConnAuth`]).
+//!
+//! [`AdminMessage`]: nn_proto::admin_protocol::AdminMessage
+//! [`PostureMachine::admin_release_combat_with_token`]: crate::posture::PostureMachine::admin_release_combat_with_token
+//! [`ConnAuth`]: crate::anti_tamper::admin_auth::ConnAuth
 //!
 //! R11d (lab PR 263): `admin_socket.rs` cut into this module's parts —
 //! `transport` (the socket, its peers, the framing and the loop of one
