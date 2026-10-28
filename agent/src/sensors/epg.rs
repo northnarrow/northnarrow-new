@@ -910,18 +910,6 @@ mod tests {
         assert_eq!(inject_words("a"), Some((0x61, 0)));
     }
 
-    /// `NN_EXPLOIT_GUARD=off` is reported as a weakening (signed
-    /// `integrity_drift`); `lite` and `strict` are not.
-    #[test]
-    fn the_off_value_is_a_weakening_variable() {
-        assert!(crate::self_integrity::WEAKENING_ENV
-            .iter()
-            .any(|(name, weakens)| *name == MODE_ENV
-                && weakens("off")
-                && !weakens("lite")
-                && !weakens("strict")));
-    }
-
     #[test]
     fn only_off_is_a_weakening_value() {
         assert!(turns_off("off"));

@@ -124,6 +124,10 @@ pub mod detection_payload;
 /// PR 250).
 pub mod detection_report;
 pub mod detection_store;
+/// The exploit guard's `off` is a weakening the agent reports (R09b, lab PR
+/// 254: from `sensors::epg`'s tests).
+#[cfg(test)]
+mod epg_tests;
 pub mod execpol;
 pub mod execq;
 pub mod fim;
