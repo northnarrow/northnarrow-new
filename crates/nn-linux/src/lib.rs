@@ -128,19 +128,13 @@ pub mod content_host_linux;
 // was the agent's `decision_host_linux`).
 pub mod decision_host_linux;
 
-/// FIM (R09a, lab PR 253): the helpers the self-defence and the canary
-/// registry name, cut from the agent's `fim::attach` (the FIM's attach,
-/// drain, baseline, honeypot and recompute are R09b's).
-pub mod fim {
-    /// The kernel's form of a `stat(2)` device number, a path's `InodeKey`.
-    pub mod attach;
-
-    // R09a shim (plan §4.1 rule 2, removed in R17): the path the isolator's
-    // tests name for the shipped FIM list.
-    /// `crate::fim::paths_config::…`, nn-core's.
-    #[cfg(test)]
-    pub(crate) use nn_core::fim::paths_config;
-}
+// File integrity monitoring (Tappa 9): the observers' attach and the
+// watched inodes, the ring's drain and the drift log, the baseline, the
+// honeypot baits, the baseline's recompute; the watched paths' loader on
+// the Linux host (R09b, lab PR 254; was the agent's `fim`, whose helpers
+// the self-defence and the canary registry name came first, R09a; the
+// rules, the list and the drift's classification are nn-core's).
+pub mod fim;
 
 // The filesystems the agent's files live on, by identity (R09a; was the
 // agent's `fs_type`).
@@ -284,11 +278,14 @@ pub(crate) mod chainlog {
     pub use nn_evidence::chainlog::*;
 
     /// [`nn_evidence::chainlog::RotatingChainLog`], signed by the agent's
-    /// key unless another is named (the Linux host's tests).
-    #[cfg(test)]
+    /// key unless another is named (the FIM drift log; the Linux host's
+    /// tests).
     pub type RotatingChainLog<P, K = crate::keys::AgentSigningKey> =
         nn_evidence::chainlog::RotatingChainLog<P, K>;
 }
+
+/// `crate::config::…`, nn-core's (the overlay a watched-paths load takes).
+use nn_core::config;
 
 /// `crate::decision::…`, nn-core's (the exemption facts' trait).
 use nn_core::decision;

@@ -170,7 +170,8 @@ nn-core = { workspace = true, features = ["test-util"] }
 # its test doors (`test-util`: a capture of a process without a descriptor,
 # the host-critical guard on given identities, an unlock token minted
 # without a signature, the admin key set's fingerprints, the isolator on
-# given binaries). A dev-dependency only: no build of the binaries has them.
+# given binaries; R09b, lab PR 254: the FIM's stand-in for the kernel's
+# watched inodes). A dev-dependency only: no build of the binaries has them.
 nn-linux = { workspace = true, features = ["test-util"] }
 
 # Kani proofs live behind cfg(kani) (Tappa 10.8); declare it so normal

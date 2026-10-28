@@ -84,7 +84,8 @@ test-privileged = []
 # that wire it — a capture of a process without a descriptor, the
 # host-critical guard on given identities, an unlock token minted without a
 # signature, the admin key set's fingerprints, the isolator on given
-# binaries (the agent enables it as a dev-dependency only, as nn-core's
+# binaries; R09b (lab PR 254): the FIM's stand-in for the kernel's watched
+# inodes (the agent enables it as a dev-dependency only, as nn-core's
 # `test-util`). No build of the binaries has it.
 test-util = []
 

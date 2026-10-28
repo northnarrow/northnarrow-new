@@ -238,10 +238,6 @@ planned = false
 "execq" = "nn-linux"
 "execq::policy" = "nn-core"
 "execq::record" = "nn-core"
-# attach, drain (the ring half; R08b, lab PR 251, cut the drift's
-# classification to nn-core's `fim::drift`, re-exported by the drain),
-# baseline, honeypot, recompute; the rules: `[shims.agent]` (R08b)
-"fim" = "nn-linux"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
 "host_hardening" = "nn-linux"
@@ -346,6 +342,13 @@ planned = false
 # R09b (lab PR 254): the degradations of a run, which the sensors report,
 # moved to nn-linux with the boot's phases (`boot/mod.rs` re-exports them)
 "boot::degradation" = "nn-linux"
+# R09b (lab PR 254): file integrity monitoring moved to nn-linux whole —
+# the attach, the drain (the ring half; R08b, lab PR 251, cut the drift's
+# classification to nn-core's `fim::drift`, re-exported by the drain), the
+# baseline, the honeypot baits, the recompute, and `fim/mod.rs` with the
+# watched paths' loader on `LinuxHost`; the agent keeps the path (`lib.rs`).
+# The rules and the list are nn-core's (below, R07 and R08b)
+"fim" = "nn-linux"
 "canary::access_log" = "nn-linux"
 "canary::network" = "nn-linux"
 "canary::read_forward" = "nn-linux"

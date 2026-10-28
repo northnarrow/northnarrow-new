@@ -133,7 +133,11 @@ mod epg_tests;
 pub mod exec_guards;
 pub mod execpol;
 pub mod execq;
-pub mod fim;
+/// R09b shim (lab PR 254): file integrity monitoring — the observers'
+/// attach, the drain and its drift log, the baseline, the honeypot baits,
+/// the recompute, the watched paths' loader on the Linux host — is
+/// nn-linux's (its rules and list nn-core's).
+pub use nn_linux::fim;
 /// R09a shim: the filesystems' identity is nn-linux's.
 pub use nn_linux::fs_type;
 #[doc(hidden)]
