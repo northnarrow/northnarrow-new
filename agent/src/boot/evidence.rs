@@ -570,30 +570,6 @@ fn drain_ended(
     );
 }
 
-/// External audit LLMR-016: a default list that could not be read, and
-/// gave way to the copy built into the agent, is recorded in the signed
-/// chain through the overlay gate (queued until the audit log is open);
-/// LLMR-015 (NN-AUD-327): so is one edited by hand, which is not applied.
-/// An earlier release's list, superseded by the built-in copy, is a WARN
-/// only: what is in force is what shipped.
-fn report_builtin_defaults(
-    gate: &northnarrow_agent::config::overlay_auth::OverlayGate,
-    list: &str,
-    v1: &std::path::Path,
-    source: &northnarrow_agent::config::overlay::DefaultsSource,
-) {
-    use northnarrow_agent::config::overlay::DefaultsSource;
-    match source {
-        DefaultsSource::BuiltIn(why) => gate.report_default_unavailable(list, v1, why),
-        DefaultsSource::Modified {
-            sha256,
-            builtin_sha256,
-            loaded_anyway,
-        } => gate.report_default_modified(list, v1, sha256, builtin_sha256, *loaded_anyway),
-        DefaultsSource::Disk | DefaultsSource::Superseded { .. } => {}
-    }
-}
-
 /// Lab PR 160: the head anchor of this run, written once now with the heads
 /// this boot found (before this boot appends anything). Reports a removed
 /// anchor first ([`northnarrow_agent::chain_anchor::BootCheck::heads_missing`]).
