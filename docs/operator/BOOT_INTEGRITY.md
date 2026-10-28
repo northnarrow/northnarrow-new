@@ -22,17 +22,31 @@ maps are made there), every pin and every attach take an
 `BootSequence::verify_integrity`, the move from preflight to attach, hands
 one out, once every preflight check has passed. The steps it requires —
 the eBPF object, the state directory, the BTF offsets, the capabilities,
-the install manifest, the audit log, the BPF LSM — are recorded only by
-the checks themselves (`boot::checks`, each after it ran against the host
-and passed; `BootSequence::done` refuses them): a load, pin or attach
-placed before a check does not compile, a check skipped or moved after it
-fails every start (and the tests `boot::tests::main_runs_the_phases_in_order`
-and `boot::checks::tests`). The proof cannot be built outside nn-linux,
-nor copied, and the object's bytes are nn-linux's alone.
+the install manifest, the audit log, the BPF LSM, the deny hooks' pin root
+and the kernel's BTF — are recorded only by the checks themselves
+(`boot::checks`, each after it ran against the host and passed;
+`BootSequence::done` refuses them): a load, pin or attach placed before a
+check does not compile, a check skipped or moved after it fails every
+start (and the tests `boot::tests::main_runs_the_phases_in_order` and
+`boot::checks::tests`).
+
+What the proof means (the independent review of the PR, #466 F3): a
+process has one boot sequence — `BootSequence::begin`, the only public
+way to one, refuses a second, and the start's preflight takes it first —
+and its checks read the host's own roots (the state directory, the active
+LSMs, the kernel's BTF, the running binary) and the overrides from the
+process's environment; what the start gives them is the operator's
+configuration (the install manifest's and the audit log's paths, the
+signing key's, `--detect-only`). So the one proof of a process says that
+its start ran every check against this host, under that configuration,
+and was refused by none. The proof has no public field and is not
+`Clone`, `Copy` nor `Default` (tests the compiler evaluates when they
+build), and the object's bytes are nn-linux's alone; like any zero-sized
+type it can be forged by `unsafe` code — the guarantee is safe Rust's.
 
 | Phase | What runs | Required before the next phase |
 |---|---|---|
-| 1. preflight | the embedded eBPF object; the state directory; the BTF offsets; the chains against their heads; the identity; the demo rules' gate; the capabilities (`caps::boot_gate`); the install manifest; the audit log's writability and its chain, opened; the host hardening table; the BPF LSM gate (section 2) | eBPF object, state directory, BTF offsets, capabilities, install manifest, audit log, BPF LSM |
+| 1. preflight | the embedded eBPF object; the state directory; the BTF offsets; the chains against their heads; the identity; the demo rules' gate; the capabilities (`caps::boot_gate`); the install manifest; the audit log's writability, the agent's key and the chain, opened; the host hardening table; the BPF LSM gate (section 2); the deny hooks' pin root and the kernel's BTF | eBPF object, state directory, BTF offsets, capabilities, install manifest, audit log, BPF LSM, pin root, vmlinux BTF |
 | 2. attach | the eBPF object loads (and pins its maps); the sensors; the deny hooks (`anti_tamper::attach`) | sensors, deny hooks |
 | 3. self-test | one deny hook exercised against the agent (section 3) | self-test |
 | 4. attest | the signed audit log, opened in the preflight, takes `agent_boot`; every degradation found so far is signed (section 4) | `agent_boot`, boot degradations |
@@ -43,10 +57,15 @@ A refusal in the preflight leaves the kernel as it was: nothing is loaded,
 nothing pinned, no hook attached, and the start's registration in the
 previous agent's pinned `PROTECTED_PIDS` (made before the state files'
 bootstrap, so that the previous hooks let it reach its own files) is
-withdrawn; the refusal is signed (section 7). The capability,
+withdrawn; the refusal is signed (section 7). It creates no state file
+but what its signature needs (review #466 F8): when the eBPF object, the
+state directory or the BTF offsets refuse, the state files are not
+bootstrapped; the agent's key and identity are made when they are
+missing, and the chain that takes the refusal. The capability,
 install-manifest and audit writability checks used to run after the eBPF
 programs were loaded, attached and pinned (until lab PR 218), and so did
-the audit chain's open (until lab PR 262).
+the audit chain's open (until lab PR 262) and the deny hooks' pin root
+and BTF (until review #466 F6).
 
 | Check | Before the load (L) and the first pin | Refuses with |
 |---|---|---|
@@ -56,8 +75,10 @@ the audit chain's open (until lab PR 262).
 | the demo rules' gate (a demo-tappa5 build in enforcement) | yes | `demo_rules` |
 | the capability bounding set (`CAP_KILL`) | yes | `capabilities` |
 | the install manifest: the binaries and the eBPF object against what `install.sh` recorded | yes | `install_manifest` |
-| the audit log writable, its chain opened (a line before the end that is not a row refuses) | yes (but when the previous agent's hooks close it to this process: after the attach registers it) | `audit_log` |
+| the audit log writable, the agent's key loaded (an absent one minted), its chain opened (a line before the end that is not a row refuses) | yes (but when the previous agent's hooks close it to this process: after the attach registers it) | `audit_log` (a key that cannot be loaded: unsigned) |
 | the BPF LSM in the active LSMs | yes | `bpf_lsm` |
+| the deny hooks' pin root (`/sys/fs/bpf/northnarrow`) not a symbolic link nor anything but a directory (ATP-007), unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` | yes (after L until review #466 F6) | `deny_hooks` |
+| the kernel's BTF (`/sys/kernel/btf/vmlinux`), which every deny hook resolves against (review 53: none attaches without it), unless `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` | yes (likewise; a BTF that does not parse is the BTF offsets' refusal) | `deny_hooks` |
 | the load itself and each mandatory sensor's attach | is L | `sensors` |
 | the deny hooks' attach and pins | after L (it is the attach) | `deny_hooks` |
 | the deny self-test | after the attach (it exercises an attached hook) | `deny_self_test` |
@@ -81,8 +102,13 @@ same order as before. The signed `agent_boot` row after the attach still
 proves the log with a write. When the previous agent's pinned hooks close
 the key or the log to this process (its early registration failed), the
 open is left to the attest phase, after this boot's attach registered the
-process. A key that cannot be loaded starts the agent unaudited, as it did
-(lab PR 262 found this and left it: a follow-up).
+process. A signing key that cannot be loaded — a file at its name that is
+not a key: corrupted, empty, a bind mount of `/dev/null` or of anything
+but a regular file, unreadable — or an absent one that cannot be minted
+refuses the start the same way, unless `NN_AUDIT_ALLOW_UNWRITABLE=1`
+(review #466 F4: it started unaudited, with one WARN, until then): no row
+can be signed without it, so the journal holds that refusal alone
+(section 7). An absent key is minted, as at a first boot.
 
 ## 2. The BPF LSM gate
 
@@ -254,19 +280,42 @@ line, and all but the BTF offsets' exited 1. Where the rows go:
 1. the audit log — the one the preflight opened, once it did;
 2. when the audit log cannot take them (its own gate: not writable, its
    chain broken, its write failed), a chain of the same format signed with
-   the same key: `boot-refusals.jsonl` beside `--pid-file`
-   (`/run/northnarrow/boot-refusals.jsonl` under the shipped unit — tmpfs:
-   gone at a reboot). Verify it with
-   `sudo nn-admin audit verify --from /run/northnarrow/boot-refusals.jsonl`.
-   The next start that opens the audit log verifies it and records it there
-   — one `boot_refusals_recovered` row (`result: recorded`; `extra`: the
-   file, its rows and head, the refused boots each with its time, gate,
-   detail, binary integrity and row hash, at most 32 listed), before the
-   boot's own `agent_boot` — and removes the file. A file that does not
-   verify, is over 1 MiB or is not a regular file is recorded with why
-   (`result: refused`, none of its contents) and removed all the same;
-3. nowhere when neither can be written (no key, no `--pid-file`): the
-   journal says so.
+   the same key, in a file of its own: `boot-refusals/refusal-<random>.jsonl`
+   beside `--pid-file` (`/run/northnarrow/boot-refusals/` under the shipped
+   unit). The agent creates the directory (0700) and, before it writes,
+   checks it and the pid file's directory: opened without following a
+   symbolic link, owned by the agent's user, closed to others, not another
+   filesystem mounted over the name. The file is new (`O_CREAT|O_EXCL`,
+   0600): no name another process put there is opened (review #466 F1).
+   Its first row, `boot_refusal_fallback`, names the audit log and its head
+   at the refusal (`audit_head`: its rows and last `entry_hash`, or `null`
+   and `audit_head_unreadable` with why). Verify it with
+   `sudo nn-admin audit verify --from /run/northnarrow/boot-refusals/refusal-<…>.jsonl`.
+   The next start that opens the audit log reads each file once (a regular
+   file of the agent's user, closed to others, one link, at most 1 MiB),
+   verifies it and records it there from those same bytes (review #466
+   F2) — one `boot_refusals_recovered` row per file (`result: recorded`;
+   `extra`: `fallback`, the chain's id — its first row's hash —, the
+   `audit_head` it named, its rows and head, the refused boot with its
+   time, gate, detail, binary integrity and row hash), before the boot's
+   own `agent_boot` — and removes the file. A chain is recorded only when
+   its first row is a fallback chain's, every row is signed for this
+   agent's id, the head it names is this audit log's row at that place, and
+   the log has not recorded that chain before. Anything else — a chain
+   that does not verify, a copy of one recorded before, a prefix of the
+   audit log, a link, a FIFO, a file open to others or over 1 MiB — is
+   recorded with why (`result: refused`, none of its content) and removed
+   all the same; a directory that is not the agent's is recorded and left.
+   At most 16 files per start;
+3. nowhere when neither can be written (no key, no absolute `--pid-file`,
+   a fallback directory that is not the agent's): the journal says why,
+   without the content of any file.
+
+The fallback is on the runtime directory's tmpfs: a reboot empties it,
+and root can delete a file there before the next start records it — the
+journal's `refused boot recorded in the fallback chain` line, with the
+chain's `entry_hash`, is then the trace. A persistent, protected place
+and an anchor for its head are a follow-up (review #466 F5).
 
 A refusal before the load leaves no BPF program, link or pin of its own: a
 host whose previous agent's hooks are pinned keeps them, unchanged (they go
@@ -277,12 +326,14 @@ ceiling (5 in 60 s).
 
 Journal lines: the gate's own ERROR (`refusing to start: …`, `binary
 integrity MISMATCH …`, `audit log NOT writable …`, `audit log open failed
-…`, `CAP_KILL missing …`), then `refused boot recorded in the audit chain`
+…`, `agent signing key cannot be loaded …`, `CAP_KILL missing …`), then
+`refused boot recorded in the audit chain`
 (or `refused boot recorded in the fallback chain: …`, or `could not record
 the refused boot in a signed chain …`), `anti-tamper: the refused start's
 pid withdrawn from the pinned PROTECTED_PIDS`, and `start refused gate=…
 exit=78`. At the next start: `boot refusals the audit log could not take
-are recorded in it now`.
+are recorded in it now`, or `a fallback chain of boot refusals that does
+not verify, or a file that is not one — recorded and removed`.
 
 ## 8. Journal lines
 

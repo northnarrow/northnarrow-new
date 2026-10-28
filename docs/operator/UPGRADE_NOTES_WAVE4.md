@@ -226,12 +226,38 @@ What an operator sees change:
   refusal before the install manifest's check carries `binary_integrity:
   unchecked`. A query of refused boots finds rows it did not find before.
 - **When the audit log is what refuses** (not writable, its chain broken),
-  the refusal is signed in `/run/northnarrow/boot-refusals.jsonl` (the
-  audit log's format and key: `sudo nn-admin audit verify --from
-  /run/northnarrow/boot-refusals.jsonl`). The next start that opens the
-  audit log records it there — a `boot_refusals_recovered` row, before its
-  own `agent_boot` — and removes the file. The file is on tmpfs: a reboot
-  before that start loses it (the journal keeps the refusal's lines).
+  the refusal is signed in a file of its own,
+  `/run/northnarrow/boot-refusals/refusal-<random>.jsonl` (the audit log's
+  format and key: `sudo nn-admin audit verify --from <file>`), whose first
+  row (`boot_refusal_fallback`) names the audit log and its head. The
+  agent creates that directory and checks it before it writes; a link, a
+  FIFO or any other name put there is never followed, written or waited
+  on — such a start's refusal is then in the journal alone. The next start
+  that opens the audit log records each file there — a
+  `boot_refusals_recovered` row, before its own `agent_boot`, `recorded`
+  for a chain bound to that log, `refused` with why for anything else —
+  and removes it. The files are on tmpfs: a reboot before that start
+  loses them, and root can delete them (the journal keeps the refusal's
+  lines).
+- **A signing key that is there but cannot be loaded refuses the start**
+  (corrupted, empty, a bind mount of `/dev/null` over it, not a regular
+  file): exit 78, `refused_by` cannot be signed — the journal's `start
+  refused gate=audit_log` and `agent signing key cannot be loaded` are the
+  record. Such a start ran unaudited before, with one WARN. An absent key
+  is minted as at a first boot; `NN_AUDIT_ALLOW_UNWRITABLE=1` starts it
+  unaudited, as for an unwritable audit log.
+- **The deny hooks' pin root and the kernel's BTF are checked before the
+  load.** A pin root that is a symbolic link, and a kernel without
+  `/sys/kernel/btf/vmlinux` (or a tmpfs over `/sys/kernel/btf`), refused
+  the start after the load (the maps pinned, on a host without them); now
+  before it (`refused_by: deny_hooks`), unless
+  `NN_ANTI_TAMPER_ALLOW_DEGRADED=1` as before. The preflight's
+  `boot phase done` line lists `pin_root` and `vmlinux_btf` among its
+  steps.
+- **A refusal before the load creates no state file but what it needs to
+  be signed**: the eBPF object's, the state directory's and the BTF
+  offsets' refusals no longer bootstrap the FIM, detection, canary and
+  network logs or the head anchor.
 - **A broken audit chain refuses before the load.** A line before the end
   that is not a row used to refuse the start after the eBPF object was
   loaded, its maps pinned and the hooks attached; now nothing is loaded and
@@ -244,5 +270,6 @@ What an operator sees change:
   the deny self-test); every other line is where it was.
 - **Rollback to a release before this one.** Nothing to migrate: the rows
   are the audit log's format. An older agent does not read
-  `boot-refusals.jsonl`; it stays in `/run/northnarrow` until a reboot or
-  until this release starts again and records it.
+  `/run/northnarrow/boot-refusals/`; it stays until a reboot or until this
+  release starts again and records it. An older agent starts unaudited on
+  a key that cannot be loaded, as it did.

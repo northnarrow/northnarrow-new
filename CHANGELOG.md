@@ -435,9 +435,15 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   outside tests `BootSequence::verify_integrity`, which requires every
   preflight step; the steps the attach depends on (the eBPF object, the
   state directory — required now too —, the BTF offsets, the capabilities,
-  the install manifest, the audit log, the BPF LSM) are recorded only by
-  `boot::checks`, each after its check ran against the host and passed
-  (`BootSequence::done` refuses them, `BootOrderError::Unchecked`). The
+  the install manifest, the audit log, the BPF LSM, the deny hooks' pin
+  root and the kernel's BTF) are recorded only by `boot::checks`, each
+  after its check ran against the host and passed (`BootSequence::done`
+  refuses them, `BootOrderError::Unchecked`). A process has one sequence
+  (`BootSequence::begin`, the only public way to one, refuses a second),
+  and the checks read the host's own roots and the overrides from the
+  environment: a caller gives the operator's configuration (the
+  manifest's and the audit log's paths, `--detect-only`), never a root.
+  The
   load (`SensorMultiplexer::start`, `start_with_net`, `ExecSensor::start`;
   the maps' by-name pins are made there), `attach_anti_tamper` and
   `anti_tamper::attach` (the pins and the deny hooks) and
@@ -446,9 +452,13 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   The agent's `attach::load` takes `&IntegrityVerified` and `&StateReady`
   (the plan's `attach(&IntegrityVerified, &StateReady)`; only
   `state::bootstrap` builds one). The BPF LSM gate moved to nn-linux
-  (`boot::lsm`, re-exported) so that its check records its step.
-  Compile-fail doctests: no proof built outside nn-linux, none cloned, no
-  access to the object's bytes. **The audit chain before the load.**
+  (`boot::lsm`, re-exported) so that its check records its step. Tests
+  evaluated when they build: neither the proof nor the sequence is
+  `Clone`, `Copy` or `Default` (compile-fail examples: no proof written
+  as a struct literal, none cloned, no access to the object's bytes;
+  stable rustdoc does not check their error codes). Unsafe code forges
+  any zero-sized type: the guarantee is safe Rust's. **The audit chain
+  before the load.**
   `checks::audit_log` opens the log after the writability preflight; a
   chain that cannot be opened refuses the start before anything is loaded
   (fatal unless `NN_AUDIT_ALLOW_UNWRITABLE=1`), and the attest phase
@@ -460,38 +470,67 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   a `subsystem_degraded` where the gate had one, an `agent_boot` with
   `result: refused` and `refused_by` (`ebpf_object`, `state_dir`,
   `btf_offsets`, `demo_rules`, `capabilities`, `install_manifest`,
-  `audit_log`, `bpf_lsm`; after the load `sensors`, `deny_hooks`,
-  `deny_self_test`, `audit_log`; `binary_integrity: unchecked` before the
-  manifest's check) — in the audit log, else, when the audit log is the
-  gate, in `boot-refusals.jsonl` beside `--pid-file` (the audit log's
-  format and key, `/run/northnarrow` under the unit), else the journal
-  says why; the start's pid is withdrawn from the pinned PROTECTED_PIDS
+  `audit_log`, `bpf_lsm`, `deny_hooks` for the pin root and the BTF;
+  after the load `sensors`, `deny_hooks`, `deny_self_test`, `audit_log`;
+  `binary_integrity: unchecked` before the manifest's check) — in the
+  audit log, else, when the audit log is the gate, in a fallback chain of
+  its own (the audit log's format and key): a new file, created
+  `O_CREAT|O_EXCL` under a random name in `boot-refusals/` beside
+  `--pid-file` (`/run/northnarrow/boot-refusals/` under the unit), a
+  directory the agent creates and checks — no name planted there is ever
+  opened —, its first row (`boot_refusal_fallback`) naming the audit log
+  and its head; else the journal says why, never with a file's content;
+  the start's pid is withdrawn from the pinned PROTECTED_PIDS
   (the previous agent's map it registered in before the bootstraps, or
   this boot's after the attach), and the agent exits 78 for every gate.
   The preflight's three refusals, found before the identity is read, are
-  signed at the start of the integrity phase, still before the load (a
-  linked state directory is not read nor written first). The next start
-  that opens the audit log records the fallback chain there, verified with
-  the agent's key, as one `boot_refusals_recovered` row before its own
-  `agent_boot`, and removes the file (one that does not verify is recorded
-  as refused and removed too). The gates after the load (the sensors' load
+  signed at the start of the integrity phase, still before the load, and
+  no state file is bootstrapped first (a linked state directory is not
+  read nor written). The next start that opens the audit log reads each
+  fallback chain once (bounded, without following a link or waiting on a
+  FIFO), verifies it with the agent's key and records it from those same
+  bytes, as one `boot_refusals_recovered` row before its own
+  `agent_boot`, when it is bound to that log (its first row a fallback
+  chain's, this agent's id, the head it names this log's row, not
+  recorded before), and removes the file (anything else in the directory
+  is recorded as refused, with why and none of its content, and removed
+  too). The gates after the load (the sensors' load
   and attach, the deny hooks, the self-test, the boot's own row) keep
   their place: they need the loaded object, the attached hooks or the
   write. **Happy path unchanged**: the same checks, signed rows and
   capability manifest; the key's `reusing existing agent signing key` line
-  comes before the attach now. Found, not changed: a signing key that
-  cannot be loaded starts the agent unaudited, as before. Tests: the
+  comes before the attach now, and the preflight's step list names the
+  two new checks. A signing key that is there but cannot be loaded
+  (corrupted, empty, a bind mount of `/dev/null`, not a regular file), or
+  an absent one that cannot be minted, refuses the start like an
+  unwritable audit log, unsigned (it started unaudited); an absent key is
+  minted as before. The audit chain's opens (the torn-tail repair, the
+  tail read, the append) follow no final symbolic link, wait on no FIFO,
+  take a regular file only, and a line that is not a row is named by its
+  number and length, never by its content (the independent review of the
+  PR, #466: F1–F4, F6–F8). Tests: the
   checks record only when they pass, no proof without every one, the chain
   opens before the load or refuses, the refusals in the audit log, the log
-  already open, the fallback chain (a directory there, a failed write),
-  unsigned without `--pid-file`, the fallback recorded at the next start
-  or refused; the start's code (every pre-load refusal before the load,
-  the preflight's at the integrity phase's start, one exit); privileged
-  e2e (`agent/tests/boot_refusal_privileged_e2e.rs`: a tampered binary, an
-  unwritable audit log, a broken audit chain, CAP_KILL dropped — each exit
-  78, its signed row verified by `nn-admin audit verify`, no BPF program,
+  already open, the fallback chain (a directory there, a failed write, the
+  head it names), unsigned without an absolute `--pid-file`, the fallback
+  recorded at the next start or refused (another key, a copy put back, a
+  prefix of the audit log, another agent id, another log's head); the
+  review's four probes where the fallback goes and inside it (a link to
+  the key, to a file without a final newline, a dangling one, a FIFO:
+  nothing followed, created, changed, quoted or waited on), and on the
+  audit chain's own open and append; the key's loader on what is not a
+  key; the withdrawal and the exit 78; the start's code (every pre-load
+  refusal before the load, the preflight's at the integrity phase's start,
+  one exit outside the one-shot modes); privileged e2e
+  (`agent/tests/boot_refusal_privileged_e2e.rs`: a tampered binary, an
+  unwritable audit log, a broken audit chain, CAP_KILL dropped, the key a
+  link to `/dev/null`, the four probes — each exit 78, its row signed and
+  verified by `nn-admin audit verify` where it can be, no BPF program,
   link or pin left, no own program-id list, its pid not left in
-  PROTECTED_PIDS). On the lab guest (Ubuntu 24.04): `test-ignored` 77
+  PROTECTED_PIDS). Follow-up (review #466 F5): the fallback is on the
+  runtime directory's tmpfs, and root can delete it before the next start
+  records it (the journal line, with the chain's hash, stays). On the lab
+  guest (Ubuntu 24.04): `test-ignored` 77
   suites, 89 passed (the four new e2e on the real kernel); `tamper-check`
   the same 75 outcomes and verdicts as `main`; the refusal paths on the
   installed agent — a tampered binary, `chattr +i` on the audit log,

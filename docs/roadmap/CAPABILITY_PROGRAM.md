@@ -2904,13 +2904,33 @@ only in the table below, in the same PR as the evidence.
     phase appends the same rows in the same order to it (deferred to the
     attest phase only while the previous agent's hooks close the key or
     the log to this process). `boot::refusal`: every gate's refusal signed
-    (`agent_boot` `refused`, `refused_by` the gate) in the audit log, else
-    in `boot-refusals.jsonl` beside `--pid-file` when the audit log is
-    the gate, recorded in the audit log by the next start that opens it
-    (`boot_refusals_recovered`) and removed; the registration withdrawn;
-    exit 78 for every gate. The preflight's three (eBPF object, state
+    (`agent_boot` `refused`, `refused_by` the gate) in the audit log, else,
+    when the audit log is the gate, in a fallback chain of its own — a new
+    file (`O_CREAT|O_EXCL`, a random name) in `boot-refusals/` beside
+    `--pid-file`, a directory the agent creates and checks, its first row
+    naming the audit log's head —, recorded in the audit log by the next
+    start that opens it (`boot_refusals_recovered`, read once, verified
+    and bound to that log) and removed; the registration withdrawn; exit
+    78 for every gate. The preflight's three (eBPF object, state
     directory, BTF) are signed at the start of the integrity phase, still
-    before the load. Privileged e2e of four refusal paths.
+    before the load, with no state file bootstrapped first. Privileged e2e
+    of six refusal paths.
+  - After the independent review (#466; second reviewer, verdict "merge
+    after fixes"), as new commits: F1 the fallback chain's writer and the
+    audit chain's opens (no link followed, no FIFO waited on, a regular
+    file only, no line's content in an error: a link planted at the old
+    single file's name put the agent's key in the journal, truncated or
+    created files, a FIFO hung the refused start); F2 its reader (one
+    bounded read, verified and listed from the same bytes, bound to the
+    audit log: a prefix of `audit.log` or a copy put back verified as a
+    fallback before); F3 one boot sequence per process
+    (`BootSequence::begin`), the checks on the host's own roots and the
+    environment's overrides, Clone/Copy/Default probed when the tests
+    build; F4 a signing key there but not loadable refuses (it ran
+    unaudited); F6 the deny hooks' pin root and BTF before the load (new
+    checked steps `pin_root`, `vmlinux_btf`); F7 the refusal's tail
+    unit-tested (the withdrawal, exit 78, no other exit); F8 no state file
+    before a preflight refusal. F5 open (below).
   - Checks that stay after the load, by their nature: the arming of
     `BTF_OFFSETS` (the map is the loaded object's; before any attach),
     the load and the mandatory sensors' attach themselves, the deny hooks'
@@ -2926,11 +2946,10 @@ only in the table below, in the same PR as the evidence.
     deferred open (the previous agent's hooks closing the log to an
     unregistered process) keeps the audit chain's open after the attach
     in that one case, which only this boot's attach can register.
-  - Found, not changed: a signing key that cannot be loaded starts the
-    agent unaudited (as the attest phase did; a follow-up should refuse
-    it as an unwritable log, unless the override).
   - Open: R11c (the late-bound setters), R11d; a refusal after the attach
-    keeps what attached (by design: the pins protect); the fallback chain
-    is on tmpfs (a reboot before the next start loses it; the journal
-    keeps the refusal's lines).
+    keeps what attached (by design: the pins protect); review #466 F5:
+    the fallback chains are on tmpfs, unprotected — a reboot before the
+    next start loses them and root can delete them (the journal keeps the
+    refusal's lines and the chain's hash); a persistent protected place
+    and a head anchor are the follow-up.
   - Lab: On Ubuntu 24.04 (6.8.0-147, the lab guest ubuntu2404, ssh 2322, QEMU for Windows with WHPX, 4 vCPU, 7 GiB; ubuntu2204 was lot 263's). The lot's code (ffcc95e2; the commits after it are a unit test and this documentation) synced, built (release, test-privileged,debug-trigger) and installed three times: `test-ignored`, its five runs exit 0: 77 suites, 89 passed, 0 failed — `main`'s 76 and 85 (lab PR 261) and the new suite's four, each on the real kernel (a tampered binary, an unwritable audit log, a broken audit chain, CAP_KILL dropped) —, the tests' agents' 52 chain checks `result="ok"`; `tamper-check` 72 of 75 OK, C27 and C57c the known gaps, C64 the recorded deviation. `main` 4444f20b on the same guest right after, the same way: `tamper-check` the same 75 outcomes and verdicts case by case (C38's status differs in its pids only); the evidence of 4 cases differs by what landed in a case's window (C23 the overlay rollback floor's anchor, C57c and C43 an `integrity_drift_cleared`, C39 a `chain_verify_failed` of the guest's detections log); the self-integrity findings the same kinds and counts, but the tip's one more boot (its `test-ignored` ran first). The refusal paths on the installed agent (a trusted-installer window, both units stopped, one check made to fail, `systemctl start`, bpftool's programs and links and the pin root's names and inodes before and after, the rows verified with `nn-admin audit verify`, the change undone, both units started): on the lot's code every case exits 78 with its signed row and loads nothing — one line appended to the binary (`install_manifest`, in the audit chain), `chattr +i` on the audit log (`audit_log`, in /run/northnarrow/boot-refusals.jsonl; the next start recorded it, `boot_refusals_recovered` verified, and removed the file), a drop-in `CapabilityBoundingSet=~CAP_KILL` (`capabilities`), a broken audit chain (the installed binary by hand on scratch state: `audit_log`, in its fallback chain), the tampered binary with the pin root purged first (`install_manifest`) —: none of the load's journal lines, no program or link left that no process holds, the pin root's names and inodes unchanged (absent before and after with no pins, and no NorthNarrow LSM program), the refused pid withdrawn from PROTECTED_PIDS. On `main` the tampered binary was refused signed but left its pid in PROTECTED_PIDS; the unwritable audit log and the capability gate exited 1 unsigned (the pid left); the broken chain was refused only after the load, the attach and the self-test (exit 1, unsigned), 22 LSM and raw-tracepoint programs and 22 links left pinned in place of the previous agent's, the maps re-pinned. `upgrade-check` from that `main` to the lot's code and back (the downgrade): both OK (refused without `--upgrade`, the window, both units restarted, a new `agent_boot`, the identity the same, 19 of 19 deny hooks, 36 own LSM programs before and after, no foreign one), and the refusal paths on the upgraded host as on the lot's own install. The boot log of 3 boots of each build, from "NorthNarrow agent starting..." to READY, masked as lab PR 261's (pids, inodes, hashes, counts, durations, the detections check's window): the same 204 lines in each boot of both builds; the one line placed otherwise is the key's `reusing existing agent signing key` of the audit log's open, before `boot phase done phase="preflight"` on the lot's code and after the self-test on `main` (and in one boot the trust level's line, a spawned task's, one place apart); the upgraded and the downgraded boot are their build's. Their signed rows (`agent_boot`, `chain_verify`, its `integrity_drift`, `capability_manifest`) and the capability manifest: the same. The guest powered off after. Host, on the code (0d48635f) and on the final tree, `set -o pipefail`, `CARGO_BUILD_JOBS=6`: `cargo xtask build-ebpf --release` (the stamp's source 235e2fed…, `main`'s); the four clippy runs with `-D warnings`; `cargo fmt --check`; `cargo test -q --workspace --exclude northnarrow-agent-ebpf --locked --no-fail-fast` 72 suites, 3,120 passed, 0 failed, 15 ignored (`main` 71, 3,095, 0, 15); the privileged no-run; `cargo xtask attack-coverage --check`; `cargo xtask golden` five times (11 passed each, the 33 golden files the same bytes, the tree clean); `cargo +1.89.0 check --workspace --all-targets --locked`; the fuzz replay (13 targets); `portable-core` (5 targets); every commit of the lot checked on its own (check, privileged check, fmt, clippy, xtask's tests, the boot tests): all pass.
