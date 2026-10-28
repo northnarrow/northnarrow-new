@@ -96,7 +96,7 @@ allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidenc
 planned = true
 
 [crates.nn-admin]
-about = "the operator client's library; the nn-admin binary stays a shim of the agent package (R10)"
+about = "the operator client (R10, lab PR 259: admin_cli and the command line, from the agent): what it reads of the Linux host and of the agent goes through its `host::AdminHost`, which the agent implements — no arc to nn-linux, the plan's §2.1 and the decision lab PR 239 left to R10; the nn-admin binary stays a shim of the agent package"
 allowed = ["northnarrow-common", "nn-parse", "nn-model", "nn-proto", "nn-evidence", "nn-core"]
 forbid_unsafe = true
 planned = false
@@ -172,7 +172,10 @@ planned = false
 # the admin socket's), the payload of each rotating log, the canary chains'
 # full checks, the anchoring and boot-verify tasks — from `chain_anchor`.
 # nn-admin's `chain verify` reads the list: two nn-admin references until
-# the payloads have a crate below it (plan R04a/R05 "i payload"; R10)
+# the payloads have a crate below it (plan R04a/R05 "i payload"; R10). R10
+# (lab PR 259): it reads it through its host (`admin_host`, nn-admin's
+# `host::Chains` on `ChainPaths`), and the layout under the state
+# directory it named is the agent's implementation's
 "chains" = "northnarrow-agent"
 # the ladder and its evidence; SystemActuator and the probes of protected
 # and reconcile go to nn-linux (R04c). R08c (lab PR 252): the ladder moved
@@ -622,11 +625,12 @@ planned = false
 # Then 17 → 15, nn-admin 3 → 1: what nn-admin reads of the Linux host and
 # of the agent goes through nn-admin's `host::AdminHost`, which the agent
 # implements (`admin_host`): the hardening checks, the agent key's files,
-# the agent's chains (`chain verify` named `chains` twice: the list and
-# its boot check), the overlay gate, its floor and the loaders' checks,
-# the offline engine on the Linux host. The one arc left is the binary's
-# root, which passes the agent's host to nn-admin's logic: it leaves with
-# that logic (the root becomes the agent package's shim).
+# the agent's chains (both files named `chains`: the dispatcher built the
+# list, `admin_cli` ran its boot check), the overlay gate, its floor and
+# the loaders' checks, the offline engine on the Linux host. The one arc
+# left is the binary's root, which passes the agent's host to nn-admin's
+# logic: it leaves with that logic (the root becomes the agent package's
+# shim).
 # Then 15 → 14, nn-admin 1 → 0: `admin_cli` and the binary's logic moved
 # to nn-admin (`admin_cli`, `cli`), whose dependencies the layer gate
 # checks (nn-proto, nn-evidence, nn-core, nn-model: no nn-linux, no

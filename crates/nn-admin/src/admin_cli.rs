@@ -1,10 +1,10 @@
 //! Library half of the `nn-admin` CLI binary.
 //!
-//! The binary at `src/bin/nn_admin.rs` is a thin clap dispatcher.
-//! All real logic lives here so it can be unit-tested without
-//! shelling out to a compiled binary. Each `run_*` function takes
-//! its inputs explicitly and returns a typed outcome; mapping to
-//! process exit codes happens in the binary.
+//! The command line, [`crate::cli`] (the agent's `src/bin/nn_admin.rs`
+//! until R10, lab PR 259), is a thin clap dispatcher. All real logic lives
+//! here so it can be unit-tested without shelling out to a compiled
+//! binary. Each `run_*` function takes its inputs explicitly and returns a
+//! typed outcome; mapping to process exit codes happens in [`crate::cli`].
 //!
 //! Transport: a one-shot synchronous request/response over the Unix
 //! socket at `/run/northnarrow/admin.sock`. We deliberately avoid
@@ -1186,7 +1186,7 @@ pub struct ChainVerifyLine {
 }
 
 /// External audit NN-AUD-112: `nn-admin chain verify` — every chain in
-/// full (the rotating logs with [`crate::chainlog::verify_log_set`],
+/// full (the rotating logs with [`nn_evidence::chainlog::verify_log_set`],
 /// archives, manifest and checkpoints included; the flat chains with their
 /// row numbers), then the files against the head anchor `heads` when it
 /// exists. `only`: chain names to check (empty: all). `paths`: the agent's

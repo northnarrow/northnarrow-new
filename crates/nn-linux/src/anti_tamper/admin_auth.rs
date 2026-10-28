@@ -1189,7 +1189,7 @@ pub fn parse_role_keyword(s: &str) -> Result<Role> {
 
 /// 8-hex-char pubkey fingerprint: first 4 bytes of SHA-256 over the
 /// raw pubkey. Same convention as `nn-admin verify-keys` output and
-/// `admin_cli::pubkey_fingerprint` — duplicated here rather than
+/// nn-admin's `admin_cli::pubkey_fingerprint` — duplicated here rather than
 /// imported so admin_auth stays free of an admin_cli dependency.
 /// Used in log/audit context (`RoleDenied` carries this).
 fn fingerprint(vk: &VerifyingKey) -> String {

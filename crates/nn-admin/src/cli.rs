@@ -1,9 +1,9 @@
 //! `nn-admin` — administrative client for the northnarrow-agent.
 //!
 //! Thin clap dispatcher over the per-subcommand functions in
-//! [`northnarrow_agent::admin_cli`]. All real logic, including the
-//! sync Unix-socket transport and the keypair file format, lives
-//! there.
+//! [`crate::admin_cli`] (R10, lab PR 259: the agent's `bin/nn_admin.rs`,
+//! whose shim runs [`crate::cli::run`] on the agent's host). All real logic, including the
+//! sync Unix-socket transport and the keypair file format, lives there.
 //!
 //! Exit codes (stable contract; do not renumber):
 //! - 0  success

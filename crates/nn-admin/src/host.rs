@@ -11,7 +11,7 @@
 //! chains, the gate that decides which overlays its next start loads and
 //! the rollback floor that gate keeps, the loaders' own checks of an
 //! overlay, the offline engine on the agent's host — is still the agent's
-//! (R04b, R04a/R05's payloads). [`AdminHost`] names them; the agent
+//! (R04b, R04a/R05's payloads). [`crate::host::AdminHost`] names them; the agent
 //! implements it (`northnarrow_agent::admin_host::AgentAdminHost`) and the
 //! `nn-admin` binary, a shim of the agent package, passes it in: the
 //! composition binds nn-admin to its host as it binds nn-core's generics to

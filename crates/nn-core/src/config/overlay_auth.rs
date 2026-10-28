@@ -17,8 +17,8 @@
 //! admin key set, `anti_tamper::admin_auth`, and writes the agent's audit
 //! log), signature file, content checks and install stay in the agent; the
 //! agent re-exports these under their old paths. R10 (lab PR 259): the
-//! signature file ([`OverlaySignature`] at [`sig_path`]) and the gate's
-//! decision on an overlay ([`Decision`]) were cut here the same way: the
+//! signature file (`OverlaySignature` at `sig_path`) and the gate's
+//! decision on an overlay (`Decision`) were cut here the same way: the
 //! gate reads the file and nn-admin writes it (`config overlay sign`), and
 //! nn-admin reads the gate's decisions (`config overlay status`, `policy
 //! show`) through its host.

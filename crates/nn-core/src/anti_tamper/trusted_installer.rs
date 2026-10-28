@@ -11,7 +11,7 @@
 //! their host ([`crate::posture::host::PostureAgent::InstallerWindow`]).
 //! R10 (lab PR 259): the window's ceiling too, which the agent clamps a
 //! signed grant to and nn-admin clamps `--window-secs` to before it signs
-//! ([`MAX_TRUSTED_INSTALLER_WINDOW_SECS`], cut verbatim; the agent's module
+//! (`MAX_TRUSTED_INSTALLER_WINDOW_SECS`, cut verbatim; the agent's module
 //! re-exports it).
 
 /// The agent's OWN systemd unit paths — the ONLY units whose
