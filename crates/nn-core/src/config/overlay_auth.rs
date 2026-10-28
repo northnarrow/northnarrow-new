@@ -16,11 +16,18 @@
 //! `config::overlay_auth`, whose gate (it verifies through the agent's
 //! admin key set, `anti_tamper::admin_auth`, and writes the agent's audit
 //! log), signature file, content checks and install stay in the agent; the
-//! agent re-exports these under their old paths.
+//! agent re-exports these under their old paths. R10 (lab PR 259): the
+//! signature file ([`OverlaySignature`] at [`sig_path`]) and the gate's
+//! decision on an overlay ([`Decision`]) were cut here the same way: the
+//! gate reads the file and nn-admin writes it (`config overlay sign`), and
+//! nn-admin reads the gate's decisions (`config overlay status`, `policy
+//! show`) through its host.
 
 use std::path::{Path, PathBuf};
 
-use nn_proto::admin_signed_payload::OverlayKind;
+use anyhow::{anyhow, Context, Result};
+use nn_proto::admin_signed_payload::{OperationExtra, OverlayKind, SignedPayload};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::content_host::ContentHost;
@@ -31,9 +38,98 @@ pub const ALLOW_UNSIGNED_ENV: &str = "NN_OVERLAY_ALLOW_UNSIGNED";
 /// file is refused rather than read whole into memory.
 pub const MAX_OVERLAY_BYTES: u64 = 4 << 20;
 
+/// Suffix of the signature file next to an overlay.
+pub const SIG_SUFFIX: &str = ".sig";
+
 /// SHA-256 of an overlay's bytes.
 pub fn content_sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// `<overlay>.sig` on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlaySignature {
+    pub v: u8,
+    pub kind: String,
+    pub payload: SignedPayload,
+    /// Ed25519 signatures, hex.
+    pub signatures: Vec<String>,
+}
+
+impl OverlaySignature {
+    pub fn new(payload: SignedPayload, signatures: &[[u8; 64]]) -> Result<Self> {
+        let kind = match &payload.extra {
+            OperationExtra::ConfigOverlaySet(e) => e.kind.keyword().to_string(),
+            _ => return Err(anyhow!("payload is not a config-overlay payload")),
+        };
+        Ok(Self {
+            v: 1,
+            kind,
+            payload,
+            signatures: signatures.iter().map(|s| hex(s)).collect(),
+        })
+    }
+
+    pub fn signatures(&self) -> Result<Vec<[u8; 64]>> {
+        self.signatures
+            .iter()
+            .map(|h| {
+                let bytes = unhex(h).ok_or_else(|| anyhow!("signature is not hex"))?;
+                <[u8; 64]>::try_from(bytes.as_slice())
+                    .map_err(|_| anyhow!("signature is not 64 bytes"))
+            })
+            .collect()
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        let mut s = serde_json::to_string_pretty(self).context("serialising overlay signature")?;
+        s.push('\n');
+        Ok(s)
+    }
+}
+
+/// Lowercase hex of `b`: the signature file's signatures, and the digests
+/// the gate reports (R10, lab PR 259: public for the agent's gate).
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// `<overlay>.sig`.
+pub fn sig_path(overlay: &Path) -> PathBuf {
+    let mut s = overlay.as_os_str().to_os_string();
+    s.push(SIG_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Outcome of the boot check for one overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// No overlay file: nothing to load, nothing to check.
+    Absent,
+    /// Signed, matching, not a rollback. `new` = content not yet recorded
+    /// in the audit chain for this kind.
+    Accepted {
+        sha256: String,
+        signed_ts: u64,
+        key_fps: Vec<String>,
+        new: bool,
+    },
+    /// Present but not loadable: why.
+    Refused {
+        reason: String,
+        sha256: Option<String>,
+    },
 }
 
 /// What the loader of an overlay gets from the gate (`OverlayGate::verified`)
