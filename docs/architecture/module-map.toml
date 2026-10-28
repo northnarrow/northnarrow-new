@@ -278,6 +278,11 @@ planned = false
 "net" = "nn-core"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
+# R11a (lab PR 261): `main.rs`'s `process_event`, the event pipeline the
+# plan's R12 turns into the priority bus (§3.4), and whether systemd is
+# stopping the host, which it shares with the start's tasks: the
+# composition
+"pipeline" = "northnarrow-agent"
 # R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
 # agent's binding of it to the Linux host (its paths kept, the machine,
 # triggers, tracker and exemption as aliases on `LinuxHost`; it names
