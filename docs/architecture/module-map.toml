@@ -155,9 +155,10 @@ planned = false
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
 # rule 4)
 "build_info" = "northnarrow-agent"
-# path_policy (R09b); `canary/mod.rs` binds nn-core's detector, readers and
-# templates to the Linux host. R09a (lab PR 253): the registry's store, the
-# access log, network and read_forward moved to nn-linux (`[shims.agent]`)
+# `canary/mod.rs` binds nn-core's detector, readers and templates to the
+# Linux host. R09a (lab PR 253): the registry's store, the access log,
+# network and read_forward moved to nn-linux (`[shims.agent]`); R09b (lab
+# PR 254): path_policy too
 "canary" = "nn-linux"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
 # the admin socket's), the payload of each rotating log, the canary chains'
@@ -352,6 +353,8 @@ planned = false
 "fim" = "nn-linux"
 "canary::access_log" = "nn-linux"
 "canary::network" = "nn-linux"
+# R09b (lab PR 254): where a decoy may be written (review `canary-path-1`)
+"canary::path_policy" = "nn-linux"
 "canary::read_forward" = "nn-linux"
 "canary::registry" = "nn-linux"
 "canary_host_linux" = "nn-linux"

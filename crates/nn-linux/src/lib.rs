@@ -68,14 +68,18 @@ pub mod boot;
 /// the signed registry of deployed canaries and their access log, this
 /// host's interface addresses, the read-forward set the FIM drain consults
 /// (were the agent's `canary::{registry, access_log, network,
-/// read_forward}`; the detector is nn-core's, the decoys' path policy
-/// R09b's).
+/// read_forward}`; the detector is nn-core's). R09b (lab PR 254): the
+/// decoys' path policy (was the agent's `canary::path_policy`).
 pub mod canary {
     // The chained log of canary accesses (Tappa 9.5 K3).
     pub mod access_log;
     // What a Network canary covers and its deploy check; this host's
     // addresses (lab PR 163).
     pub mod network;
+    // Where a file or credential canary may be written: not in the system
+    // trees, no planted link (review `canary-path-1`, external audit
+    // DEC-015).
+    pub mod path_policy;
     // The canaries' inodes whose read the FIM drain forwards (lab PR 178).
     pub mod read_forward;
     // The chained registry of deployed canaries (Tappa 9.5 K2).
