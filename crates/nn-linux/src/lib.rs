@@ -19,6 +19,16 @@
 //! the canary detector's and the COMBAT ladder's — with what they name: the
 //! canary registry and access log, the interface addresses and the
 //! read-forward set, the sampler of the host's files, the DNS pump's ingest.
+//! R09b (lab PR 254) moves the sensors — the single loader that attaches
+//! every program and pumps every ring, the exec, file-open, DNS, connect-deny
+//! and exploit-guard sensors — with the build script that embeds the eBPF
+//! object and refuses a stale one (`build.rs`), file integrity monitoring,
+//! the network drain and the blind spots it reports, the decoys' path policy
+//! and the DNS record's decode (from nn-model); with them, what they take and
+//! report of the agent's boot: the typed phases and the attach permit, the
+//! degradations, the sensors' attach points. The exec guards whose kernel
+//! configuration the loader writes stay in the agent, behind
+//! [`ExecGuards`](sensors::multiplexer::ExecGuards).
 //!
 //! The only crate of the layout where `unsafe` is allowed (no
 //! `#![forbid(unsafe_code)]`, R01): its blocks moved verbatim, each with its

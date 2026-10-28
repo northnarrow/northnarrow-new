@@ -1439,6 +1439,91 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   `Debug` strings (its vtable keeps them), a panic of serde_json's map
   serializer no longer reachable where it is inlined, and literals
   grouped otherwise.
+- Wave 4 restructure, R09b — nn-linux, part 2: the sensors, the eBPF
+  object's embed, file integrity monitoring and the network drain (lab
+  PR 254). Moved to `crates/nn-linux` (`git mv`, 96–100 %): the sensors
+  (`sensors/*`: the embedded object and its boot preflight, the single
+  loader that attaches every program and pumps every ring, the exec,
+  file-open, DNS, connect-deny and exploit-guard sensors, the ring drops
+  and the rejected records), the build script that embeds the object
+  and refuses a stale one (`build.rs`, 97 %: it finds the repository
+  through `NN_REPO_ROOT` now, ebpf-guard is nn-linux's build-dependency),
+  file integrity monitoring whole (`fim/*`: the observers' attach, the
+  drain and its drift log, the baseline, the honeypot baits, the
+  recompute, the watched paths' loader; `attach.rs` onto R09a's cut of
+  it), the network drain and the blind spots it reports
+  (`net::{drain, blind_spots}`), and the decoys' path policy
+  (`canary::path_policy`). The DNS record's decode left nn-model for the
+  DNS sensor (`sensors::dns_sensor::{query_event, nss_query_name}`, the
+  `From<&DnsQueryRaw> for Event` and its tests verbatim): it was
+  nn-model's one use of nn-parse, which nn-model no longer depends on
+  (the watchdog and the scanner, which reached nn-parse and md-5 through
+  nn-model only, drop both from their dependency trees and SBOMs). The
+  other decodes stay in nn-model: they need only nn-wire and the model,
+  whose vocabulary maps ABI bytes nn-core's rules read, and moving them
+  would rewrite every pump for no arc removed. Cut to nn-linux first,
+  what the sensors name of the agent's `boot`: the typed phases and the
+  attach permit (the permit's field is private to its module, so the
+  sequence that alone gives it went too), the degradations' registry
+  (`boot/degradation.rs`, moved whole) and the sensors' attach points
+  the capability manifest lists; and `telemetry_probe::PROBE_DIR`. One
+  seam: the loader writes the exec guards' kernel configuration
+  (`execq::install`, `execpol::install`, lab PRs 223 and 226) at a fixed
+  point of its load, and the guards stay in the agent — the loader is
+  `SensorMultiplexer<G: ExecGuards>`, the agent's
+  `exec_guards::AgentExecGuards` the block cut verbatim from the load,
+  and the agent's `sensors::SensorMultiplexer` the loader on it (an
+  alias): the same calls in the same order. The test that reads the
+  agent's weakening list was cut into the agent first (`epg_tests.rs`);
+  the admin-socket tests' stand-in for the kernel's watched inodes is
+  behind nn-linux's `test-util`. The flow tracker's and the rules'
+  gate's binding to the Linux host moved with the drain that names them
+  (the agent's `net` re-exports them). The agent keeps every path as a
+  shim (removed in R17); `main.rs`, the admin socket, the tests, the
+  replays, the examples and the fuzz targets are unchanged. CI's
+  ebpf-build runs the embed's map-type test where it lives
+  (`-p nn-linux`; filtered on the agent it would have matched nothing
+  and passed); path_liveness no longer exempts `agent/build.rs`. The
+  staleness guard, proven end to end on `main` and on the lot's tree
+  (a fresh object embeds; a stale closure, `common/` or `agent-ebpf/`
+  edited, refuses "STALE eBPF OBJECT"; other bytes than the stamped
+  ones refuse "DOES NOT MATCH ITS STAMP"; no stamp refuses "UNSTAMPED";
+  no object builds the placeholder the boot preflight refuses): the
+  same verdicts and the same messages but the script's path in their
+  banner line. The ratchet goes from 26 to 22 (nn-linux 3 → 0: the
+  sensors' references to `boot` left with them; nn-core 15 → 14: the
+  agent's `net/mod.rs` names `LinuxHost` no more).
+  Identity against `main` 482a956, both built in one temporary checkout
+  (same path), the release job's commands: the eBPF object and its stamp
+  are byte-identical (source hash 235e2fed…, `main`'s: `common/` and
+  `agent-ebpf/` untouched, so the agent embeds `main`'s build hash).
+  Through the moves the scanner and the watchdog stayed byte-identical;
+  the decode's move makes them differ: nn-model dropped nn-parse, which
+  changes its metadata hash, so the `TypeId`s of its types and the
+  symbols' order — function by function the scanner's 504 are the same
+  code and the watchdog's 2,468 of 2,470 (the two differ by the `TypeId`
+  constants of nn-model's types), the stripped `.text` ±16 bytes of
+  alignment; their SBOMs drop nn-parse and md-5. The tarball's 72
+  entries and the .deb's 79 paths and modes are the same; `posture_demo`
+  prints the same lines; `nn-admin policy test` on lab PR 251's samples
+  gives the same 402 outputs; the golden replays (five runs), the wire,
+  chain and crypto pins, the parser pins, the overlay-v1 fixture and the
+  per-rule policy's format pass unchanged; the test list is `main`'s
+  (3,082 names: 220 now nn-linux's, 7 at a new path — the weakening test
+  in the agent, the DNS decode's six in the DNS sensor). The agent
+  (15,192,112 → 15,276,256 bytes) and nn-admin (4,129,480 → 4,130,440)
+  are not byte-identical: function by function (unstripped, names
+  mapped, addresses dropped) 7,705 of the agent's 7,992 functions and
+  3,528 of nn-admin's 3,604 are the same code; of the agent's 147 that
+  differ, 105 call other callees (inlining at the new crate boundary:
+  the loader, the drains, the FIM, generic code instantiated in
+  nn-linux), 22 are scheduled or allocated otherwise, 14 differ in
+  operands only (10 by clap's and tracing's `TypeId` constants), 5 names
+  have several bodies; the unpaired are generic instantiations made in
+  the other crate and code inlined on one side only (the exec guards'
+  `install` and `fail`, out of line on `main`, inlined into
+  `AgentExecGuards::install`): `.text` +81,872 bytes (+1.09 %) in the
+  agent, +2,000 in nn-admin. `cargo doc`: 336 warnings, `main` 337.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and
