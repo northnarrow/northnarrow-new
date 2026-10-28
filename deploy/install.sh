@@ -280,7 +280,7 @@ FIM_PATHS_V1_SRC="$REPO_ROOT/configs/fim-paths.v1"
 # `canary deploy` time. install.sh drops the 5 .tmpl files into
 # /etc/northnarrow/canary-templates/. PROTECTED_INODES covers each
 # individual .tmpl file (see ETC_PROTECTED_TEMPLATES in
-# agent/src/anti_tamper/filesystem.rs) — tamper would silently
+# crates/nn-linux/src/anti_tamper/filesystem.rs) — tamper would silently
 # widen / narrow what bytes get written onto the host when an
 # operator deploys a credential canary.
 CANARY_TEMPLATES_SRC_DIR="$REPO_ROOT/configs/canary-templates"
@@ -298,7 +298,7 @@ HONEYPOT_BAITS_SRC_DIR="$REPO_ROOT/configs/honeypot-baits"
 # these at /etc/northnarrow/netflow-blocklist.v1 +
 # /etc/northnarrow/netflow-ja3-blocklist.v1 (install_shipped_v1); operators
 # extend / narrow via the matching `.local` overlays. ETC_PROTECTED_FILES
-# (agent/src/anti_tamper/filesystem.rs) widens to cover the four
+# (crates/nn-linux/src/anti_tamper/filesystem.rs) widens to cover the four
 # blocklist filenames so PROTECTED_INODES defends them against
 # tamper — the same lock-in as fim-paths.v1 / .local.
 NETFLOW_BLOCKLIST_V1_SRC="$REPO_ROOT/configs/netflow-blocklist.v1"
@@ -595,7 +595,7 @@ prereq_overrides_json() {
 # depend on nftables, so in --package-configure a missing `nft` (a forced
 # install) is a warning: a failing post-unpack hook would leave the package
 # half-configured. NFT_DIRS are the directories the agent looks in
-# (external audit ATP-014, agent/src/trusted_bin.rs): the system ones, never
+# (external audit ATP-014, crates/nn-linux/src/trusted_bin.rs): the system ones, never
 # /usr/local, and only a root-owned file nobody else can write.
 NFT_DIRS=${NFT_DIRS:-"/usr/sbin /usr/bin /sbin /bin"}
 find_nft() {
@@ -1941,7 +1941,7 @@ else
 fi
 
 # Tappa 9 C7: ensure /var/lib/northnarrow/ exists at mode 0700
-# (matches STATE_DIR_MODE in agent/src/anti_tamper/filesystem.rs)
+# (matches STATE_DIR_MODE in crates/nn-linux/src/anti_tamper/filesystem.rs)
 # and pre-touch the two chained FIM logs so PROTECTED_INODES has
 # inodes to register at the agent's very first attach. The agent
 # also bootstraps these (bootstrap_fim_log) but doing it here

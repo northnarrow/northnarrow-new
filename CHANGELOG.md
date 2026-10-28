@@ -1361,6 +1361,84 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
   the copy-on-write guard inlined otherwise. `.rodata` holds the same text
   but the callsite names of the moved and edited files, the stale chain
   record's path and tracing target, and literals grouped otherwise.
+- Wave 4 restructure, R09a — nn-linux, part 1: the actuators, the
+  self-defence, the agent's key and its Linux host (lab PR 253). Moved to
+  `crates/nn-linux` (`git mv`, 98–100 %): the executor and its actions
+  (`response`: kill, quarantine and its vault, the per-PID egress block,
+  the throttle, the containment and its release, the capability
+  preflight, `ProcRef`), the COMBAT ladder's production actuator, guard
+  and stale chain's compatibility line (`combat::{actuator, protected,
+  reconcile}`), the self-defence (`anti_tamper`: the LSM deny hooks and
+  their kernel maps, the BPF guard, the BTF revalidation, the fail-open
+  counters, the network isolator, the trusted-installer window, the
+  admin key set with its challenge and its `UnlockToken`), the agent's
+  signing key (`keys`), and the utilities they stand on (`agent_id`,
+  `anchored`, `async_fd`, `atomic_file`, `bounded_cmd`, `fs_type`,
+  `os_rng`, `runtime`, `trusted_bin`). The key's chains are written on
+  the agent's `LinuxHost`, so the host moved with it, and the
+  implementations of nn-core's and nn-evidence's host traits on it with
+  the host (a trait of another crate on a type of another crate is
+  implemented in neither): the chains', the content lists', the
+  posture's, the decision engine's, the canary detector's and the
+  ladder's, with what they name — the canary registry, its access log,
+  this host's addresses and the read-forward set (R09b's "store dei
+  canary" by the plan), the sampler of the host's files, the DNS pump's
+  ingest with the cache carrying it, the security tools' kernel map
+  (`impair::DefenderMap`, cut). `admin_auth` moved whole with
+  `anti_tamper`: its token's mint is `pub(in crate::anti_tamper)` beside
+  the isolator it unlocks, and stays that narrow; its role keywords went
+  to nn-proto's `admin_quorum` first, its verification is R04b's still.
+  Cut to nn-linux first: `self_integrity`'s op and jitter,
+  `fim::attach`'s device number and inode key; the four items the
+  moved code names of R09b's and R09c's modules. Seam: the network
+  isolator holds the agent's signed-overlay gate through nn-core's
+  `config::overlay_auth::Vouch` (the gate and the rollback floor stay in
+  the agent: the plan sends them to nn-core with the content, after
+  R04b). The tests that read the agent's own parts were cut into it
+  first (`agent_id`'s scan of `main.rs`, the content host's three, the
+  isolator's two with the gate). The agent keeps every path as a shim
+  (removed in R17); callers, tests, replays, examples and the fuzz
+  targets are unchanged. nn-linux forwards `debug-trigger` (the BPF
+  guard observes in such a build, as before) and keeps its tests' doors
+  behind `test-util`, a dev-dependency feature (no build of the binaries
+  has it). `btf-matrix.yml`'s path filter, xtask's `lab_scripts.rs` and
+  `path_liveness.rs` follow `anti_tamper`. The ratchet goes from 29 to
+  26 (nn-proto 3 → 0: `admin_auth.rs` left the scanned tree with
+  `anti_tamper`; its three references are nn-linux's own now, not cut).
+  Identity against `main` 0e89772, same path,
+  the release job's flags: the eBPF object is byte-identical (sha256
+  a568d328… at that path), its stamp's source hash c0365736… →
+  235e2fed… (a test and a comment of `common`: `bpf_cmd`'s scan for a
+  second copy of a BPF command number reads `crates/` too, as the BPF
+  rules and the self-defence's wrappers left the directories it listed;
+  the agent embeds that hash); the scanner and the watchdog are byte-identical,
+  stripped and unstripped; the tarball's 72 entries and the .deb's 79
+  paths and modes are the same, the agent's SBOM lists nn-linux;
+  `posture_demo` prints the same lines; `nn-admin policy test` on lab PR
+  251's samples gives the same 402 outputs; the golden replays (five
+  runs), the wire, chain and crypto pins, the parser pins, the overlay-v1
+  fixture and the per-rule policy's format pass unchanged; the test list
+  is `main`'s (3,082 names, 438 now nn-linux's, 6 at a new path in the
+  agent). The agent (14,998,040 → 15,192,208 bytes) and nn-admin
+  (4,086,576 → 4,129,480) are not byte-identical: function by function,
+  names mapped and addresses dropped, 7,550 of the agent's 7,739
+  functions and 3,476 of nn-admin's 3,527 are the same code; a control
+  (`main` with nn-linux's dependencies, no source moved) already changes
+  19 and 6 (clap's `TypeId`s, which of identical bodies keeps its name);
+  from the control, the move adds a second copy of generic code
+  instantiated in nn-linux as in the agent (the extra copies of an
+  instantiation go from 736 to 953 in the agent, 360 to 434 in nn-admin:
+  serde_json's deserializers and float parsers, anyhow's errors,
+  tracing's field values, aya's error formatting, the audit log's
+  `append` on the agent's key), inlining decisions at the new crate
+  boundary (the canary stores' chain readers kept out of line, the row
+  parsers inlined into them) and the gate's call through `Vouch`'s
+  vtable: `.text` +157,632 bytes in the agent (+2.15 %), +31,808 in
+  nn-admin (+0.97 %). `.rodata` holds the same text but the moved files'
+  paths and the callsite names of the moved and edited files, the gate's
+  `Debug` strings (its vtable keeps them), a panic of serde_json's map
+  serializer no longer reachable where it is inlined, and literals
+  grouped otherwise.
 - The rest of the dependencies refreshed (Wave 4 Phase 2, D3a of the
   dependency plan; lab PR 237; supersedes Dependabot #433): nix 0.29 →
   0.31.3 (the agent; its 271 `nix::` sites compile unchanged) and

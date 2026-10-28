@@ -20,7 +20,7 @@
 ///
 /// `f` must not hold a lock another task needs while it waits for that
 /// task: the caller's own task is suspended until `f` returns.
-pub(crate) fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T {
+pub fn off_the_runtime<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(f)

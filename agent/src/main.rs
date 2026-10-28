@@ -2797,7 +2797,7 @@ async fn run(cli: Cli, undumpable: std::io::Result<()>) -> Result<()> {
 
     // Tappa 7 task 6 #2b-verify: optional PID file. `attach_anti_tamper`
     // above is fully synchronous (anti_tamper::attach attempts AND pins
-    // every LSM hook before it returns — agent/src/anti_tamper/mod.rs),
+    // every LSM hook before it returns — crates/nn-linux/src/anti_tamper/mod.rs),
     // and the "decision engine ready" line has now flushed, so the
     // file's *existence* is a sound readiness gate: anything that sees
     // it knows every hook is attached and self-protection is live.

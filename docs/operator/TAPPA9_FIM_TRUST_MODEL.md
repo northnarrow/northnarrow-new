@@ -197,7 +197,7 @@ the trusted-installer window first, or expect the capability to be removed.
   Tappa 9 C8 will reject a tampered baseline chain.
 - The `fim_baseline.jsonl` + `fim_drift.jsonl` files are
   registered in `PROTECTED_INODES` (Tappa 9 C7 — see
-  `agent/src/anti_tamper/filesystem.rs::STATE_PROTECTED_FILES`).
+  `crates/nn-linux/src/anti_tamper/filesystem.rs::STATE_PROTECTED_FILES`).
   An attacker with root cannot truncate, unlink, rename, or chmod
   the files; the LSM hook denies the syscall before it reaches the
   filesystem.

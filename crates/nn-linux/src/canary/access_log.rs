@@ -112,7 +112,7 @@ pub use nn_core::canary::host::CanaryAccessDraft;
 /// Append-only writer for the canary access log. Holds the
 /// [`AgentSigningKey`] in memory + tracks the chain tail-hash
 /// so each `append` produces a well-chained next row. Same
-/// shape as [`crate::audit::AuditLog`] + Tappa 9 C3 +
+/// shape as [`AuditLog`](nn_evidence::audit::AuditLog) + Tappa 9 C3 +
 /// K2 `Registry`.
 pub struct CanaryAccessDb {
     path: PathBuf,

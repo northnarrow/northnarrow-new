@@ -141,38 +141,19 @@ planned = false
 "bin::nn_admin" = "nn-admin"
 "admin_cli" = "nn-admin"
 "admin_socket" = "northnarrow-agent"
-"agent_id" = "nn-linux"
-# the Linux host's anchor of a log's directory (`/proc/self/fd`), behind
-# `chain_host::ChainHost::anchor`: not moved to nn-evidence with the chains
-# (R05, lab PR 241)
-"anchored" = "nn-linux"
-"anti_tamper" = "nn-linux"
-# the role parse and the UnlockToken verification; key loading stays Linux
-"anti_tamper::admin_auth" = "nn-proto"
-"async_fd" = "nn-linux"
-"atomic_file" = "nn-linux"
 # post-plan (lab PR 241, R04a): the audit log's writability before the
 # attach (`access(2)`), from `audit`
 "audit_preflight" = "nn-linux"
 # post-plan (lab PR 218): typed boot phases, as main's boot/* of R11a
 "boot" = "northnarrow-agent"
-# post-plan (lab PR 217): an external command with a deadline
-"bounded_cmd" = "nn-linux"
 # post-plan (lab PR 241, R04a): the binary's version, cargo features and BPF
 # guard mode, from `audit` (a `cfg!(feature)` is read in the agent, §4.1
 # rule 4)
 "build_info" = "northnarrow-agent"
-# path_policy, the registry's store, network, access_log, read_forward
+# path_policy (R09b); `canary/mod.rs` binds nn-core's detector, readers and
+# templates to the Linux host. R09a (lab PR 253): the registry's store, the
+# access log, network and read_forward moved to nn-linux (`[shims.agent]`)
 "canary" = "nn-linux"
-# the format half goes to nn-core (R04c)
-"canary::registry" = "nn-linux"
-# post-plan (lab PR 251, R08b): the Linux host of the canary detector —
-# the signed registry and access log, the interface addresses, the
-# read-forward set, `stat(2)`, `/proc/<pid>/exe` — of nn-core's
-# `canary::host::CanaryHost`
-"canary_host_linux" = "nn-linux"
-# post-plan (lab PR 241, R04a): the chains' Linux file operations
-"chain_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the agent's chains — their paths (one is
 # the admin socket's), the payload of each rotating log, the canary chains'
 # full checks, the anchoring and boot-verify tasks — from `chain_anchor`.
@@ -187,27 +168,11 @@ planned = false
 # (`combat::host`); `combat.rs` is the agent's binding of it to the Linux
 # host (the ladder and its hook as aliases on `LinuxHost`, the evidence on
 # the agent's key); its tests that wire the agent's key, audit log,
-# posture, actuator or a real process stay in `combat/`, test modules
+# posture, actuator or a real process stay in `combat/`, test modules.
+# R09a (lab PR 253): the actuator, the guard and the compatibility line
+# moved to nn-linux (`[shims.agent]`); `combat.rs` names them and the host
+# by that crate
 "combat" = "nn-core"
-# R08c (lab PR 252): the production actuator (`SystemActuator`: the
-# executor's kill, quarantine and per-PID egress block, the isolator,
-# `/proc`) on the ladder's trait, which moved to nn-core's
-# `combat::actuator` with the outcomes it reports
-"combat::actuator" = "nn-linux"
-# R08c (lab PR 252): the production host-critical guard
-# (`SystemProtectedProcs`: the identities read from the live `/proc`); the
-# guard's trait and the reasons it names moved to nn-core's
-# `combat::protected`
-"combat::protected" = "nn-linux"
-# R08c (lab PR 252): the stale chain's record (the outcome, its signed
-# entry, its append) moved to nn-core's `combat::reconcile`; the agent's
-# file keeps the unsigned compatibility line's Linux file I/O (the
-# anchored `O_NOFOLLOW` open, the mode, the state directory's dance)
-"combat::reconcile" = "nn-linux"
-# post-plan (lab PR 252, R08c): the Linux host of the COMBAT ladder — its
-# capture of a process, a pidfd and its start (`response::proc_ref`) — of
-# nn-core's `combat::host::CombatHost`
-"combat_host_linux" = "nn-linux"
 # comm_allowlist, overlay_auth (verify), overlay_floor. R07 (lab PR 247):
 # `overlay` (the loader) and the part of `overlay_auth` the loaders take
 # moved to nn-core (`[shims.agent]`), `config/mod.rs` binding them to the
@@ -216,15 +181,14 @@ planned = false
 # (its `Judgement::apply`, which the rules call): it moved with them (R08b,
 # lab PR 251, `[shims.agent]`); the gate verifies through
 # `anti_tamper::admin_auth` (nn-proto, after R04b) and the floor reads the
-# agent's key (`keys`): they move when those are below nn-core (§4.1 rule 3)
+# agent's key (`keys`): they move when those are below nn-core (§4.1 rule 3).
+# R09a (lab PR 253): the network isolator (nn-linux's) holds the gate
+# through nn-core's `config::overlay_auth::Vouch`; `admin_auth` is
+# nn-linux's, with `anti_tamper`, until R04b cuts its verification
 "config" = "nn-core"
 # R04c (lab PR 247, with R07): overlay_auth's install half (`config overlay
 # set`'s atomic write and the new inodes' protection)
 "config::overlay_install" = "nn-linux"
-# post-plan (lab PR 247, R07): the Linux host of nn-core's content lists
-# (`content_host::ContentHost`: the open that follows no symlink and blocks
-# on no FIFO)
-"content_host_linux" = "nn-linux"
 # post-plan (lab PR 222): copy on first write; fanotify, copies, journal
 "cow" = "nn-linux"
 "cow::config" = "nn-core"
@@ -243,11 +207,6 @@ planned = false
 # docs it writes: the composition, as `chains`. `decision/catalogue.rs`
 # binds nn-core's table here
 "decision::catalogue::render" = "northnarrow-agent"
-# post-plan (lab PR 251, R08b): the Linux host of the decision engine —
-# the package database's `rpm`, the work kept off the async runtime, the
-# host's view of a path, the trusted-installer window, `DEFENDER_PIDS` —
-# of nn-core's `decision::host::DecisionHost`
-"decision_host_linux" = "nn-linux"
 # post-plan (lab PR 241, R04a): the detection log's records and their
 # parts, from `detection_store` (plan R04a: "i tipi dei payload vanno in
 # file propri"; the payloads are nn-evidence's). R08b (lab PR 251): the
@@ -274,27 +233,21 @@ planned = false
 # classification to nn-core's `fim::drift`, re-exported by the drain),
 # baseline, honeypot, recompute; the rules: `[shims.agent]` (R08b)
 "fim" = "nn-linux"
-"fs_type" = "nn-linux"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
 "host_hardening" = "nn-linux"
 # post-plan (lab PR 225): the ransomware signal (sampler behind a trait).
 # R08b (lab PR 251): the tracker moved to nn-core; `impact.rs` binds it to
-# the Linux host and publishes the agent's tracker for `status`
+# the Linux host and publishes the agent's tracker for `status`; R09a (lab
+# PR 253): the sampler moved to nn-linux (`[shims.agent]`)
 "impact" = "nn-core"
-# post-plan (lab PR 251, R08b): the production sampler of the host's files
-# (`FsSampler`: `O_NOFOLLOW`, the owners and mode bits, `/proc/1/root`);
-# the signal's vocabulary it re-exports is nn-core's
-"impact::entropy" = "nn-linux"
 # post-plan (lab PR 225): defences switched off, a shipped list. R08b (lab
 # PR 251): the detector moved to nn-core; `impair.rs` binds it to the
-# Linux host, names the kernel's `DEFENDER_PIDS` and publishes the agent's
+# Linux host, names the kernel's `DEFENDER_PIDS` (R09a, lab PR 253:
+# nn-linux's `impair::DefenderMap`, cut there) and publishes the agent's
 # detector for `status`
 "impair" = "nn-core"
 "install_manifest" = "nn-linux"
-# the agent's signing key and its files, from `audit` (plan R04a; nn-linux's
-# `keys`, R09a)
-"keys" = "nn-linux"
 # post-plan (lab PR 216): the event loop's progress, for the watchdog
 "loop_progress" = "northnarrow-agent"
 # flow_tracker, dns_cache (the state; its reply parser went to nn-parse's
@@ -302,35 +255,23 @@ planned = false
 # inactive-rules report, which reads the resolver's configuration, to
 # `net::blind_spots`): R08b (lab PR 251) moved them, with the resolvers,
 # to nn-core (`[shims.agent]`); `net/mod.rs` binds them to the agent's
-# host (inline modules)
+# host (inline modules); R09a (lab PR 253): the DNS cache carrying the
+# pump's ingest, and the ingest, moved to nn-linux (`[shims.agent]`)
 "net" = "nn-core"
 "net::blind_spots" = "nn-linux"
-# post-plan (lab PR 251, R08b): the DNS pump's ingest (lab PR 229: tokio's
-# `Notify`, `CLOCK_MONOTONIC`), cut from `net::dns_cache` when the cache's
-# state moved to nn-core; the agent's cache carries it
-"net::dns_ingest" = "nn-linux"
 "net::drain" = "nn-linux"
 # R06 (lab PR 242): net::tls_parser moved to nn-parse (`tls`); the agent
 # re-exports it as `net::tls_parser` until R17, a `pub use` in `net`.
-# post-plan (lab PR 234): the OS CSPRNG
-"os_rng" = "nn-linux"
 # R08a (lab PR 250): the posture moved to nn-core. `posture.rs` is the
 # agent's binding of it to the Linux host (its paths kept, the machine,
 # triggers, tracker and exemption as aliases on `LinuxHost`; it names
 # `chain_host_linux`, as `config/mod.rs` does for the loaders); the
 # posture's cross-module tests and golden replay stay in `posture/`
 "posture" = "nn-core"
-# post-plan (lab PR 250, R08a): the Linux host of the posture — the process
-# table (`/proc`), the host's files, a directory's owner, the clocks — of
-# nn-core's `posture::host::PostureHost`
-"posture_host_linux" = "nn-linux"
 # post-plan (lab PR 216): no core dump, no readable memory
 "process_hardening" = "nn-linux"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
 "removed_settings" = "northnarrow-agent"
-# the actuators and the Executor; ExecutionOutcome/Report → nn-model (R04a)
-"response" = "nn-linux"
-"runtime" = "nn-linux"
 "sd_notify" = "nn-linux"
 "self_integrity" = "nn-linux"
 "sensor_feasibility" = "nn-linux"
@@ -339,7 +280,6 @@ planned = false
 "shutdown_marker" = "nn-linux"
 "systemd_state" = "nn-linux"
 "telemetry_probe" = "nn-linux"
-"trusted_bin" = "nn-linux"
 # post-plan (lab PR 220): the signed record of a rolled-back upgrade
 "upgrade_rollback" = "nn-linux"
 # post-plan (lab only): `--verifier-check`
@@ -358,6 +298,55 @@ planned = false
 # buffer and the detection budget to nn-core, the same way.
 
 [shims.agent]
+# R09a (lab PR 253): the utilities the actuators, the self-defence and the
+# hosts stand on moved to nn-linux; the agent keeps their paths in `lib.rs`
+# (`pub use nn_linux::…`): the identity on disk, the anchor of a log's
+# directory (`/proc/self/fd`, behind `chain_host::ChainHost::anchor`; not
+# moved to nn-evidence with the chains, R05, lab PR 241), the async file
+# descriptor, the atomic replace, the external commands with a deadline
+# (post-plan, lab PR 217), the filesystems' identity, the OS CSPRNG
+# (post-plan, lab PR 234), the work kept off the async runtime, the system
+# directories' binaries
+"agent_id" = "nn-linux"
+"anchored" = "nn-linux"
+"async_fd" = "nn-linux"
+"atomic_file" = "nn-linux"
+"bounded_cmd" = "nn-linux"
+"fs_type" = "nn-linux"
+"os_rng" = "nn-linux"
+"runtime" = "nn-linux"
+"trusted_bin" = "nn-linux"
+# R09a (lab PR 253): the actuators, the self-defence, the agent's key, its
+# Linux host and what the host's trait implementations name moved to
+# nn-linux; the agent keeps their paths (`lib.rs`, `combat.rs`,
+# `canary/mod.rs`, `impact.rs`, `net/mod.rs`). The self-defence with
+# `admin_auth` (its `UnlockToken` mint is `pub(in crate::anti_tamper)`, so
+# it stays beside the isolator; its role keywords went to nn-proto's
+# `admin_quorum`; its verification is still headed for nn-proto, R04b's
+# cut); the executor and its actions (its configuration is nn-core's,
+# `response::config` below); the ladder's actuator, guard and compatibility
+# line; the key; the six Linux hosts (a trait of nn-core or nn-evidence on
+# nn-linux's `LinuxHost` is implemented in nn-linux); the canary registry,
+# access log, addresses and read-forward set (the canary host's associated
+# types and calls); the sampler; the DNS ingest
+"anti_tamper" = "nn-linux"
+"canary::access_log" = "nn-linux"
+"canary::network" = "nn-linux"
+"canary::read_forward" = "nn-linux"
+"canary::registry" = "nn-linux"
+"canary_host_linux" = "nn-linux"
+"chain_host_linux" = "nn-linux"
+"combat::actuator" = "nn-linux"
+"combat::protected" = "nn-linux"
+"combat::reconcile" = "nn-linux"
+"combat_host_linux" = "nn-linux"
+"content_host_linux" = "nn-linux"
+"decision_host_linux" = "nn-linux"
+"impact::entropy" = "nn-linux"
+"keys" = "nn-linux"
+"net::dns_ingest" = "nn-linux"
+"posture_host_linux" = "nn-linux"
+"response" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"
@@ -403,10 +392,12 @@ planned = false
 # R08b (lab PR 251): the operator's blocklists, with the rules; their
 # loaders take the host that reads a `.v1` (R07's `ContentHost`)
 "net::blocklist" = "nn-core"
-# R08b (lab PR 251): the DNS cache's state, with the rules; the agent's
-# `net::dns_cache` is an inline module of `net/mod.rs` that gives it the
-# pump's ingest (`net::dns_ingest`) and keeps the reply parsers' path (R06)
-"net::dns_cache" = "nn-core"
+# R08b (lab PR 251): the DNS cache's state, with the rules (nn-core's); the
+# agent's `net::dns_cache` was an inline module of `net/mod.rs` that gives it
+# the pump's ingest (`net::dns_ingest`) and keeps the reply parsers' path
+# (R06). R09a (lab PR 253): that module moved to nn-linux's `net` with the
+# ingest; the agent's path names it
+"net::dns_cache" = "nn-linux"
 # R08b (lab PR 251): the flow tracker (connect → close, the flow id, the
 # open-flow snapshots), with the rules' network state; `net/mod.rs` names it
 # on the agent's host, whose notifier the drain awaits (an inline module)
@@ -510,10 +501,27 @@ planned = false
 # (`SystemProtectedProcs`) are nn-linux's: the ladder's and the actuator's
 # four references to `anti_tamper` and `response` left nn-core (→ 14), and
 # `combat.rs`, which binds the ladder to the Linux host, names it (→ 15).
+# Lab PR 253 (R09a): 29 → 26, nn-proto 3 → 0. `anti_tamper::admin_auth`,
+# mapped to nn-proto for its role parse and its UnlockToken verification,
+# moved to nn-linux with the rest of `anti_tamper`: the token's mint is
+# `pub(in crate::anti_tamper)`, beside the isolator it unlocks, and widening
+# it is not an option. Its three references — the mint, `atomic_file`,
+# `os_rng` — are nn-linux's own there, out of this scan: they are not cut;
+# R04b still has to cut them before its verification can go to nn-proto.
+# Its role keywords went to nn-proto first (`admin_quorum::role_keyword`),
+# so `admin_cli` names nn-proto for them and nn-admin stays 8; its other
+# references to `anti_tamper` (the overlay gate's `AdminAuth`, nn-admin's
+# role list) fall in the pairs the scan counted already. The shims that
+# re-export a moved child — `combat.rs` (the actuator, the guard, the
+# compatibility line), `impact.rs` (the sampler), `impair.rs` (the
+# defenders' map), `net/mod.rs` (the DNS cache and its ingest) — name it by
+# its crate, and `combat.rs`, `impact.rs` and `impair.rs` name `LinuxHost`
+# by its crate with it: one reference each, as before (`net/mod.rs` keeps
+# its two). nn-admin 8, nn-core 15, nn-linux 3.
 
 [ratchet]
 nn-admin = 8
 nn-core = 15
 nn-evidence = 0
 nn-linux = 3
-nn-proto = 3
+nn-proto = 0

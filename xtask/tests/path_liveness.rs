@@ -409,7 +409,7 @@ fn every_file_the_xtask_tests_name_exists() {
     assert!(checked > 40, "only {checked} literal paths found");
     // the files the scans of lab_scripts.rs and operator_docs.rs read
     for known in [
-        "agent/src/anti_tamper/mod.rs",
+        "crates/nn-linux/src/anti_tamper/mod.rs",
         "agent/src/host_hardening.rs",
     ] {
         assert!(root.join(known).is_file(), "{known}");

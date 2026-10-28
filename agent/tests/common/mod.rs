@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 // command tolerates "rule does not exist" / "no chain by that
 // name" so dropping the guard on a clean state is a cheap
 // no-op. Same idempotency contract as
-// `agent/src/anti_tamper/network_isolate.rs::run_iptables_idempotent`.
+// `crates/nn-linux/src/anti_tamper/network_isolate.rs::run_iptables_idempotent`.
 
 /// External audit LLMR-015 (NN-AUD-327, lab PR 168): the agent applies a
 /// `.v1` default list only when it is the copy it was built with, and the
@@ -52,7 +52,7 @@ pub const OWN_DEFAULT_LISTS_ASSIGNMENT: &str = "NN_OVERLAY_ALLOW_UNSIGNED=1";
 const BASE_CHAINS: &[&str] = &["INPUT", "OUTPUT", "FORWARD"];
 
 /// Production combat chain name the agent installs. Mirrors
-/// `agent/src/anti_tamper/network_isolate.rs::COMBAT_CHAIN`.
+/// `crates/nn-linux/src/anti_tamper/network_isolate.rs::COMBAT_CHAIN`.
 pub const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 
 /// RAII cleanup guard for the production `NORTHNARROW_COMBAT`

@@ -13,7 +13,7 @@
 //! so the inode set is published here by [`CanaryIndexes`] rebuilds and
 //! consulted by the drain, with no new wiring.
 //!
-//! [`CanaryIndexes`]: crate::canary::detector::CanaryIndexes
+//! [`CanaryIndexes`]: nn_core::canary::detector::CanaryIndexes
 
 use std::collections::HashSet;
 use std::sync::LazyLock;

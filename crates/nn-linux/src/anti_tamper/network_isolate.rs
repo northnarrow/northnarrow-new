@@ -54,11 +54,12 @@ const DEFAULT_IPTABLES_BIN_V6: &str = "ip6tables";
 /// A binary COMBAT runs. External audit ATP-014 (NN-AUD-262): in
 /// production a name, looked up in the system directories at each use and
 /// run as the verified file ([`trusted_bin::resolve`]); a lookup that fails
-/// is an error of the step (no `PATH` fallback). Tests run a fixed mock.
+/// is an error of the step (no `PATH` fallback). Tests run a fixed mock
+/// (R09a, lab PR 253: the agent's too, through this crate's `test-util`).
 #[derive(Debug, Clone)]
 enum Bin {
     System(&'static str),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     Fixed(PathBuf),
 }
 
@@ -71,7 +72,7 @@ impl Bin {
                     .map_err(|e| anyhow!("{e} (external audit ATP-014: no PATH lookup)"))?;
                 Ok((bin.command(), bin.exe().to_path_buf()))
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             Bin::Fixed(path) => Ok((Command::new(path), path.clone())),
         }
     }
@@ -81,7 +82,7 @@ impl std::fmt::Display for Bin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Bin::System(name) => f.write_str(name),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             Bin::Fixed(path) => write!(f, "{}", path.display()),
         }
     }
@@ -97,7 +98,7 @@ const COMBAT_CHAIN: &str = "NORTHNARROW_COMBAT";
 /// Marker line in `configs/combat-rules.v4` that [`NetworkIsolator::engage`]
 /// replaces with the management carve-out ACCEPT rules (Beta Step 4b).
 /// Placed inside the chain, immediately before its catch-all DROP.
-pub(crate) const CARVE_OUT_MARKER: &str = "# >>> NORTHNARROW_MGMT_CARVEOUT <<<";
+pub const CARVE_OUT_MARKER: &str = "# >>> NORTHNARROW_MGMT_CARVEOUT <<<";
 
 /// Capability token proving that an Ed25519-signed admin unlock has
 /// been verified. The only way to construct one is via
@@ -162,8 +163,9 @@ pub struct NetworkIsolator {
     ip6tables_bin: Bin,
     /// External audit ATP-001 / DEP-003: who vouches for the three files
     /// COMBAT reads ([`Self::trusted_source`]). `None` (tests, tools):
-    /// the files are trusted as they are.
-    gate: Option<std::sync::Arc<crate::config::overlay_auth::OverlayGate>>,
+    /// the files are trusted as they are. R09a (lab PR 253): the agent's
+    /// signed-overlay gate, through nn-core's `Vouch`.
+    gate: Option<std::sync::Arc<dyn nn_core::config::overlay_auth::Vouch>>,
     /// Lab PR 217: how long each iptables / ip6tables invocation may take
     /// ([`EXTERNAL_CMD_TIMEOUT`]).
     cmd_timeout: std::time::Duration,
@@ -272,10 +274,12 @@ impl NetworkIsolator {
     }
 
     /// External audit ATP-001 / DEP-003: vouch for the COMBAT files with
-    /// the signed-overlay gate ([`Self::trusted_source`]).
-    pub fn with_overlay_gate(
+    /// the signed-overlay gate ([`Self::trusted_source`]). R09a (lab PR
+    /// 253): the gate is nn-core's [`Vouch`](nn_core::config::overlay_auth::Vouch),
+    /// the agent's `OverlayGate`.
+    pub fn with_overlay_gate<G: nn_core::config::overlay_auth::Vouch + 'static>(
         mut self,
-        gate: std::sync::Arc<crate::config::overlay_auth::OverlayGate>,
+        gate: std::sync::Arc<G>,
     ) -> Self {
         self.gate = Some(gate);
         self
@@ -302,7 +306,7 @@ impl NetworkIsolator {
         path: &std::path::Path,
         builtin: &'static str,
     ) -> String {
-        use crate::config::overlay_auth::Verified;
+        use nn_core::config::overlay_auth::Verified;
         let Some(gate) = &self.gate else {
             return match std::fs::read_to_string(path) {
                 Ok(t) => t,
@@ -359,8 +363,8 @@ impl NetworkIsolator {
     /// `restore_bin` and `/bin/true` (exits 0 unconditionally) for
     /// `iptables_bin`, exercising the success path without root or
     /// real firewall side effects.
-    #[cfg(test)]
-    fn new_with_bin(
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn new_with_bin(
         rules_path: PathBuf,
         restore_bin: PathBuf,
         iptables_bin: PathBuf,
@@ -558,7 +562,7 @@ impl NetworkIsolator {
     /// spliced in ahead of the catch-all DROP. Returns the rendered
     /// ruleset and the list of IPv4 CIDRs actually carved out (for
     /// logging). Re-reads the allow file every call — never cached.
-    fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
+    pub fn build_engaged_ruleset(&self) -> Result<(String, Vec<String>)> {
         use nn_proto::admin_signed_payload::OverlayKind;
         let base = self.trusted_source(
             OverlayKind::CombatRulesV4,
@@ -625,7 +629,7 @@ impl NetworkIsolator {
     /// ungated, so one created between the check and the read was applied
     /// unsigned; the gate already answers a missing file with the built-in
     /// list.
-    fn trusted_allow(&self) -> combat_allow::AllowLoad {
+    pub fn trusted_allow(&self) -> combat_allow::AllowLoad {
         use nn_proto::admin_signed_payload::OverlayKind;
         if self.gate.is_none() {
             return combat_allow::load_allow_cidrs(&self.allow_cidrs_path);
@@ -1096,7 +1100,7 @@ fn count_chain_rules(iptables_s_output: &str) -> usize {
 /// inserting before the chain's catch-all DROP, then before `COMMIT`,
 /// so the carve-out is never silently dropped on the floor. An empty
 /// block removes the marker line and changes nothing else.
-pub(crate) fn splice_carveout(base: &str, accept_block: &str) -> String {
+pub fn splice_carveout(base: &str, accept_block: &str) -> String {
     let accept_lines: Vec<&str> = accept_block.lines().collect();
 
     // Primary: marker replacement.
@@ -1717,103 +1721,6 @@ mod tests {
             let path = format!("/usr/sbin/{name}");
             assert!(listed.contains(path.as_str()), "{path} not in fim-paths.v1");
         }
-    }
-
-    /// External audit ATP-001 / DEP-003: with the overlay gate, a ruleset
-    /// rewritten to isolate nothing and a carve-out adding a network,
-    /// neither signed, are not applied — the built-in content is; the
-    /// shipped content is applied as it is; a deleted ruleset no longer
-    /// fails the engage.
-    #[test]
-    fn unsigned_combat_files_give_way_to_the_builtin_content() {
-        let Some(restore) = mock_restore_bin() else {
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let admin_pub = dir.path().join("admin.pub");
-        std::fs::write(&admin_pub, format!("{} config-manage\n", "00".repeat(32))).unwrap();
-        let gate = std::sync::Arc::new(crate::config::overlay_auth::OverlayGate::new(
-            &admin_pub,
-            [1; 16],
-            crate::config::overlay_floor::RollbackFloor::default(),
-        ));
-        let v4 = dir.path().join("combat-rules.v4");
-        let allow = dir.path().join("combat-allow.cidrs");
-        std::fs::write(
-            &v4,
-            "*filter\n:NORTHNARROW_COMBAT - [0:0]\n-A NORTHNARROW_COMBAT -j ACCEPT\nCOMMIT\n",
-        )
-        .unwrap();
-        std::fs::write(&allow, "203.0.113.0/24\n").unwrap();
-        let iso = NetworkIsolator::new_with_bin(v4.clone(), restore, PathBuf::from("/bin/true"))
-            .unwrap()
-            .with_allow_cidrs_path(allow.clone())
-            .with_overlay_gate(gate);
-        let (ruleset, carved) = iso.build_engaged_ruleset().expect("build");
-        assert!(
-            ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"),
-            "{ruleset}"
-        );
-        assert!(
-            !ruleset.contains("-A NORTHNARROW_COMBAT -j ACCEPT\n"),
-            "{ruleset}"
-        );
-        assert!(
-            carved.is_empty(),
-            "an unsigned carve-out spares nothing: {carved:?}"
-        );
-        // the shipped content is applied as it is
-        std::fs::write(&v4, BUILTIN_RULES_V4).unwrap();
-        std::fs::write(&allow, BUILTIN_ALLOW).unwrap();
-        let (ruleset, _) = iso.build_engaged_ruleset().expect("build");
-        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
-        // deleted: the built-in ruleset, not a failed engage
-        std::fs::remove_file(&v4).unwrap();
-        let (ruleset, _) = iso.build_engaged_ruleset().expect("built-in when deleted");
-        assert!(ruleset.contains("-A NORTHNARROW_COMBAT -j DROP"));
-        assert!(validate_ruleset(BUILTIN_RULES_V4).is_ok());
-        assert!(validate_ruleset(BUILTIN_RULES_V6).is_ok());
-        assert!(validate_ruleset("*filter\n:NORTHNARROW_COMBAT - [0:0]\nCOMMIT\n").is_err());
-    }
-
-    /// External audit NN-AUD-095: with a gate, a carve-out file that is
-    /// missing is answered by the gate (the built-in, empty list), not by
-    /// the ungated loader — whose read would apply a file created after
-    /// the old `exists()` check without a signature. The ungated loader's
-    /// mark is its `read_error` for the missing file.
-    #[test]
-    fn missing_allow_file_is_never_read_ungated() {
-        let dir = tempfile::tempdir().unwrap();
-        let admin_pub = dir.path().join("admin.pub");
-        std::fs::write(&admin_pub, format!("{} config-manage\n", "00".repeat(32))).unwrap();
-        let gate = std::sync::Arc::new(crate::config::overlay_auth::OverlayGate::new(
-            &admin_pub,
-            [1; 16],
-            crate::config::overlay_floor::RollbackFloor::default(),
-        ));
-        let allow = dir.path().join("combat-allow.cidrs");
-        let ungated = NetworkIsolator::new_with_bin(
-            combat_rules_path(),
-            PathBuf::from("/usr/bin/cat"),
-            PathBuf::from("/bin/true"),
-        )
-        .unwrap()
-        .with_allow_cidrs_path(allow.clone());
-        assert!(
-            ungated.trusted_allow().read_error.is_some(),
-            "without a gate the file is read directly"
-        );
-        let gated = ungated.with_overlay_gate(gate);
-        let load = gated.trusted_allow();
-        assert!(
-            load.read_error.is_none(),
-            "read outside the gate: {:?}",
-            load.read_error
-        );
-        assert!(load.entries.is_empty() && load.warnings.is_empty());
-        // and once the file appears, unsigned, it spares nothing either
-        std::fs::write(&allow, "203.0.113.0/24\n").unwrap();
-        assert!(gated.trusted_allow().entries.is_empty());
     }
 
     #[test]

@@ -44,6 +44,7 @@ use crate::chain_host_linux::LinuxHost;
 // nn-core's (the verified content, its hash, the bounded read, the escape
 // hatch's name and the read's cap), under its old paths here; the gate,
 // the signature file, the content checks and the install stay in the agent.
+use nn_core::config::overlay_auth::Vouch;
 pub use nn_core::config::overlay_auth::{
     content_sha256, read_overlay, Verified, ALLOW_UNSIGNED_ENV, MAX_OVERLAY_BYTES,
 };
@@ -276,6 +277,15 @@ impl std::fmt::Debug for OverlayGate {
         f.debug_struct("OverlayGate")
             .field("allow_unsigned", &self.allow_unsigned)
             .finish_non_exhaustive()
+    }
+}
+
+/// The network isolator (nn-linux's since R09a, lab PR 253) holds the gate
+/// through nn-core's [`Vouch`]: [`OverlayGate::verified`], the same read
+/// and check.
+impl Vouch for OverlayGate {
+    fn verified(&self, kind: OverlayKind, path: &Path) -> Verified {
+        OverlayGate::verified(self, kind, path)
     }
 }
 
@@ -650,6 +660,11 @@ fn append(log: &Arc<Mutex<AuditLog>>, draft: AuditEntryDraft) {
         warn!(error = format!("{e:#}"), "overlay gate: audit entry failed");
     }
 }
+
+/// The network isolator with this gate (R09a, lab PR 253: from the
+/// isolator's tests).
+#[cfg(test)]
+mod isolator_tests;
 
 #[cfg(test)]
 mod tests {

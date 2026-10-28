@@ -695,7 +695,7 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
         "entry_hash should be 64 hex chars (SHA-256)"
     );
     // K8.2: `agent_sig` is base64 of the 64-byte Ed25519
-    // signature, NOT hex. See `agent/src/canary/access_log.rs`
+    // signature, NOT hex. See `crates/nn-linux/src/canary/access_log.rs`
     // `entry.agent_sig = B64.encode(sig.to_bytes())` and the
     // matching `B64.decode + len==64` check in the verifier
     // (mirrors `agent/src/audit.rs` + `agent/src/fim/baseline.rs`).

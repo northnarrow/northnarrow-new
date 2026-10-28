@@ -6,12 +6,86 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "NorthNarrow nn-linux: the Linux adapters: the eBPF loader and sensors, /proc, the actuators, self-defence, systemd, the KeyStore and the sandbox (Wave 4 restructure; empty until its lot moves code in)."
+description = "NorthNarrow nn-linux: the Linux adapters: the eBPF loader and sensors, /proc, the actuators, self-defence, systemd, the KeyStore and the sandbox (Wave 4 restructure; its lots move the adapters in, R09)."
 publish = false
 
 # Wave 4 restructure, R01 (lab PR 239): created empty. The crates it may
 # depend on: docs/architecture/module-map.toml (xtask/tests/workspace_layers.rs).
 [dependencies]
+# R09a (lab PR 253): the actuators, the self-defence, the agent's key, its
+# Linux host and the utilities they stand on moved here with the
+# dependencies they had in the agent, the same versions and features (one
+# version each in the workspace).
+# `atomic_file`: the writer shared with the watchdog; `anti_tamper`: the
+# bpffs pins and the LSM attach it re-exports.
+antitamper-bpf = { workspace = true }
+# the kernel ABI: the maps' keys and grants (`common::wire`), the BTF
+# offsets, the `bpf_cmd` numbers.
+common = { workspace = true }
+# the audit chain and the rotating chains the moved code writes and reads,
+# the canary chains' line reader.
+nn-evidence = { workspace = true }
+# the admin protocol and signed payloads (`admin_auth`, the overlay kinds),
+# the identity's parser.
+nn-proto = { workspace = true }
+# the event model, log escaping, the network addresses.
+nn-model = { workspace = true }
+# the traits the Linux host implements (posture, decision engine, canary
+# detector, COMBAT ladder, content lists), the ladder's actuator and guard
+# traits, the executor's configuration, the COMBAT carve-out.
+nn-core = { workspace = true }
+# the DNS reply parsers re-exported at `net::dns_cache` (R06's paths).
+nn-parse = { workspace = true }
+aya = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+libc = "0.2"
+procfs = { version = "0.18", default-features = false }
+parking_lot = "0.12"
+# the response vault (quarantine): AES-GCM, HKDF over SHA-256, the master
+# key zeroized, a vault's id.
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+zeroize = { version = "1.8", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+# serde_json with the agent's feature (`float_roundtrip`), so a build of
+# nn-linux alone parses as the agent does.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std", "clock"] }
+base64 = "0.23"
+# the agent's signing key; the admin keys' signatures. `rand_core` lets the
+# OS CSPRNG (`os_rng`) feed key generation.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
+# `os_rng`, `agent_id`, the admin challenge: the OS CSPRNG (rand 0.10's
+# `SysRng`).
+rand = "0.10"
+hex = "0.4"
+
+[features]
+# R09a (lab PR 253): the BPF guard observes, and does not enforce, in a
+# build with the nn-admin debug surface (`anti_tamper::bpf_defense`, its
+# `cfg!(feature = "debug-trigger")`); the agent forwards its own
+# `debug-trigger` here (plan §4.1 rule 4). Off by default; production
+# builds never see it.
+debug-trigger = []
+# R09a (lab PR 253): the test doors this crate keeps for the agent's tests
+# that wire it — a capture of a process without a descriptor, the
+# host-critical guard on given identities, an unlock token minted without a
+# signature, the admin key set's fingerprints, the isolator on given
+# binaries (the agent enables it as a dev-dependency only, as nn-core's
+# `test-util`). No build of the binaries has it.
+test-util = []
+
+[dev-dependencies]
+tempfile = "3"
+# `anchored`'s tests read the warnings it logs.
+tracing-subscriber = { workspace = true }
+# the trusted-installer window's tests run on nn-core's test clock.
+nn-core = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

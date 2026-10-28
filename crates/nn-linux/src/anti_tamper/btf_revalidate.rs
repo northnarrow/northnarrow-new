@@ -1566,7 +1566,7 @@ trait TypeTable {
                     .ok_or_else(|| ResolveError::NotAStruct((*comp).to_string()))?;
             }
         }
-        if total_bits % 8 != 0 {
+        if !total_bits.is_multiple_of(8) {
             return Err(ResolveError::BitfieldNotByteAligned(format!(
                 "{total_bits} bits"
             )));

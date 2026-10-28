@@ -1908,9 +1908,9 @@ for id in $own_after; do sudo bpftool prog show id "$id" 2>/dev/null | grep -q "
 # message itself, never a field of another line: a file named like the line
 # is not it, deploy/lab/lib/lab-records.py), with deny_attached equal to
 # deny_expected and at least the 16 deny hooks of DENY_HOOKS
-# (agent/src/anti_tamper/mod.rs; xtask/tests/lab_scripts.rs keeps the two
-# equal); no fewer own LSM programs than before the upgrade (an observer
-# lost fails too) nor than the deny hooks; and no anti-tamper
+# (crates/nn-linux/src/anti_tamper/mod.rs; xtask/tests/lab_scripts.rs keeps
+# the two equal); no fewer own LSM programs than before the upgrade (an
+# observer lost fails too) nor than the deny hooks; and no anti-tamper
 # `subsystem_degraded` signed at the upgraded boot (a start under
 # NN_ANTI_TAMPER_ALLOW_DEGRADED=1, a missing observe hook).
 deny_hooks_min=16

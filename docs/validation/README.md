@@ -40,7 +40,7 @@ agent as built:
 - NN-L-CANARY-003 stays in it and can fire: a local process connecting to
   a network canary's address and port trips it (the connect kprobe; the
   agent opens no listener, a connection from another host is not seen —
-  [`agent/src/canary/network.rs`](../../agent/src/canary/network.rs)),
+  [`crates/nn-linux/src/canary/network.rs`](../../crates/nn-linux/src/canary/network.rs)),
   with a privileged e2e (`canary_privileged_e2e.rs`).
 
 The 100 % sub-gate can now pass if every one of the 25 has a PASS row in

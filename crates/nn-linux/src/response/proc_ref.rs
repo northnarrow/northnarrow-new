@@ -159,8 +159,8 @@ impl ProcRef {
     }
 
     /// A reference without a pidfd (unit tests: nothing is signalled).
-    #[cfg(test)]
-    pub(crate) fn for_test(pid: u32, start_ticks: Option<u64>) -> ProcRef {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_test(pid: u32, start_ticks: Option<u64>) -> ProcRef {
         ProcRef {
             start_ticks,
             ..ProcRef::unopened(pid)
@@ -298,7 +298,7 @@ pub(crate) fn proc_stat(pid: u32) -> Option<ProcStat> {
 }
 
 /// `pidfd_open(2)`.
-pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<RawFd> {
+pub fn pidfd_open(pid: u32) -> std::io::Result<RawFd> {
     // SAFETY: a plain syscall taking a pid_t and flags; returns an fd.
     let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
     if ret < 0 {
@@ -328,7 +328,7 @@ fn pidfd_signal(pidfd: RawFd, sig: libc::c_int) -> std::io::Result<()> {
 }
 
 /// The process behind `pidfd` has exited (a zombie, or reaped).
-pub(crate) fn pidfd_exited(pidfd: &OwnedFd) -> bool {
+pub fn pidfd_exited(pidfd: &OwnedFd) -> bool {
     let mut pfd = libc::pollfd {
         fd: pidfd.as_raw_fd(),
         events: libc::POLLIN,

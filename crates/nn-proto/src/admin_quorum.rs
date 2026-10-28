@@ -189,6 +189,41 @@ pub fn parse_role_keyword(s: &str) -> Result<Role, String> {
     })
 }
 
+/// The keyword of a role as `admin.pub` and the CLI write it: the inverse
+/// of [`parse_role_keyword`]. Wave 4 restructure, R09a (lab PR 253): cut
+/// verbatim from the agent's `anti_tamper::admin_auth`, which re-exports it
+/// (plan §2.4: the role parse is nn-proto's).
+pub fn role_keyword(r: Role) -> &'static str {
+    match r {
+        Role::Unlock => "unlock",
+        Role::Shutdown => "shutdown",
+        Role::ForcePosture => "force-posture",
+        Role::RotateKeys => "rotate-keys",
+        Role::AuditRead => "audit-read",
+        // Tappa 9 (C1) additions — same wire-byte keyword
+        // shape operators see in admin.pub lines + CLI.
+        Role::FimManage => "fim-manage",
+        Role::FimRead => "fim-read",
+        // Tappa 9.5 (K1) — design §12 Q7 split-role lock-in.
+        Role::CanaryRead => "canary-read",
+        Role::CanaryManage => "canary-manage",
+        // Tappa 10 (N1) — network observability split-role pair.
+        Role::NetRead => "net-read",
+        Role::NetManage => "net-manage",
+        // FIM-009 self-upgrade (§15.1).
+        Role::TrustedInstaller => "trusted-installer",
+        // Tappa 9.0.b — read-only telemetry role.
+        Role::TelemetryRead => "telemetry-read",
+        // Tappa 9.0.c — triage role (subsumes telemetry-read).
+        Role::Triage => "triage",
+        // Tappa 10.8 — signed operator overlays.
+        Role::ConfigManage => "config-manage",
+        // External audit CMB-016 — undo a response.
+        Role::ResponseManage => "response-manage",
+        Role::All => "all",
+    }
+}
+
 /// External audit AUT-005: the most signatures one submission may carry.
 /// Checking a submission costs `signatures × keys` Ed25519 verifications
 /// and the tally ([`quorum_decision`], [`distinct_matches`]) is quadratic

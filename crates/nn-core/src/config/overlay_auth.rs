@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
+use nn_proto::admin_signed_payload::OverlayKind;
 use sha2::{Digest, Sha256};
 
 use crate::content_host::ContentHost;
@@ -70,6 +71,19 @@ impl Verified {
             _ => None,
         }
     }
+}
+
+/// What vouches for a file before it is applied: the signed-overlay gate
+/// (the agent's `config::overlay_auth::OverlayGate`), as the network
+/// isolator holds it. Wave 4 restructure, R09a (lab PR 253): the isolator
+/// moves to nn-linux, and the gate stays in the agent until it can move
+/// here with the rest of this module (its admin key set's verification
+/// first goes to nn-proto, R04b): the isolator names the gate through this
+/// trait, and the agent's gate implements it with its own read and check.
+pub trait Vouch: Send + Sync + std::fmt::Debug {
+    /// What the gate decided on the file at `path` for `kind`, with the text
+    /// it read and verified (`OverlayGate::verified`).
+    fn verified(&self, kind: OverlayKind, path: &Path) -> Verified;
 }
 
 /// External audit LLMR-013: an overlay is read once, without following a
