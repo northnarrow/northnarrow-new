@@ -124,9 +124,20 @@ pub mod detection_payload;
 /// PR 250).
 pub mod detection_report;
 pub mod detection_store;
+/// The exploit guard's `off` is a weakening the agent reports (R09b, lab PR
+/// 254: from `sensors::epg`'s tests).
+#[cfg(test)]
+mod epg_tests;
+/// The exec guards' kernel configuration the eBPF loader writes (R09b, lab
+/// PR 254: from `sensors::multiplexer`).
+pub mod exec_guards;
 pub mod execpol;
 pub mod execq;
-pub mod fim;
+/// R09b shim (lab PR 254): file integrity monitoring — the observers'
+/// attach, the drain and its drift log, the baseline, the honeypot baits,
+/// the recompute, the watched paths' loader on the Linux host — is
+/// nn-linux's (its rules and list nn-core's).
+pub use nn_linux::fim;
 /// R09a shim: the filesystems' identity is nn-linux's.
 pub use nn_linux::fs_type;
 #[doc(hidden)]

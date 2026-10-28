@@ -60,7 +60,7 @@ deploy/lab/nn-lab.sh snapshot clean   # (guest down) revert point before an atta
 
 The eBPF object is built on the **host** (nightly + bpf-linker 0.10.3)
 and shipped with its provenance stamp; the guest only builds userland,
-so `agent/build.rs`'s staleness guard still holds. `respawn-check` is
+so the staleness guard of `crates/nn-linux/build.rs` still holds. `respawn-check` is
 the VM half of `docs/design/WATCHDOG_RESPAWN_V2_DESIGN.md` §4.
 
 **Base images are verified** (external audit LAB-009,

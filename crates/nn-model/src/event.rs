@@ -8,12 +8,11 @@
 use alloc::string::String;
 use serde::{Deserialize, Serialize};
 
-use crate::dns_qname::{decode_dns_qname, qname_wire_end};
 use crate::wire::{
-    DnsQueryRaw, ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw,
-    ADDR_LEN, FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK,
-    FS_OP_MKDIR, FS_OP_MKNOD, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR,
-    FS_OP_SIGNAL, FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
+    ExecCheckRaw, FileOpenRaw, FsProtectDenialRaw, ProcessSpawnRaw, TcpConnectRaw, ADDR_LEN,
+    FS_OP_BPF_LINK, FS_OP_BPF_MAP, FS_OP_CREATE, FS_OP_IOCTL, FS_OP_KEXEC, FS_OP_LINK, FS_OP_MKDIR,
+    FS_OP_MKNOD, FS_OP_PTRACE, FS_OP_READ, FS_OP_RENAME, FS_OP_RMDIR, FS_OP_SETATTR, FS_OP_SIGNAL,
+    FS_OP_SYMLINK, FS_OP_UNLINK, FS_OP_WRITE, FS_OP_XATTR,
 };
 
 /// Serde default of `Event::CanaryTripped::first_trip`.
@@ -1447,70 +1446,6 @@ impl From<&FsProtectDenialRaw> for Event {
     }
 }
 
-/// Lab PR 229: the name of a [`crate::wire::dns_flags::NSS`] record — the
-/// text the process passed to systemd-resolved's NSS module, up to its NUL
-/// — in the presentation form [`decode_dns_qname`] gives a wire name: the
-/// root dot of an absolute name dropped, a byte outside printable ASCII
-/// (and `\`) as `\DDD`. `None` for an empty name.
-pub fn nss_query_name(raw: &DnsQueryRaw) -> Option<alloc::string::String> {
-    let len = (raw.qname_len as usize).min(raw.query_name.len());
-    let bytes = &raw.query_name[..len];
-    let bytes = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
-    let bytes = bytes.strip_suffix(b".").unwrap_or(bytes);
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut out = alloc::string::String::with_capacity(bytes.len());
-    for &b in bytes {
-        if (32..=126).contains(&b) && b != b'\\' {
-            out.push(b as char);
-        } else {
-            out.push_str(&alloc::format!("\\{b:03}"));
-        }
-    }
-    Some(out)
-}
-
-impl From<&DnsQueryRaw> for Event {
-    fn from(raw: &DnsQueryRaw) -> Self {
-        let len = (raw.qname_len as usize).min(raw.query_name.len());
-        let bytes = &raw.query_name[..len];
-        let query_name = decode_dns_qname(bytes);
-        // Tappa 10.9 step 3: the socket-buffer sensor copies wire bytes from
-        // the start of the name; its end, and the type after it, are found
-        // here (a zero byte inside a label does not end the name). The
-        // `udp_sendmsg` sensor fills `qtype` in the kernel.
-        let (query_type, qname_partial) = if raw.flags & crate::wire::dns_flags::SKB != 0 {
-            match qname_wire_end(bytes) {
-                Some(end) => (
-                    bytes
-                        .get(end..end + 2)
-                        .map_or(0, |t| u16::from_be_bytes([t[0], t[1]])),
-                    false,
-                ),
-                None => (0, true),
-            }
-        } else {
-            (raw.qtype, false)
-        };
-        Event::DnsQuery {
-            pid: raw.pid,
-            uid: raw.uid,
-            comm: crate::wire::cstr_lossy(&raw.comm).into_owned(),
-            // FP-3: the sender exe is NOT carried on the wire (the BPF
-            // event has no room for a path); userland resolves it
-            // best-effort in `pump_dns_query` right after this `From`.
-            exe: None,
-            query_name,
-            query_type,
-            dns_server: raw.dns_server,
-            family: raw.family,
-            timestamp_ns: raw.timestamp_ns,
-            qname_partial,
-        }
-    }
-}
-
 /// Severity assigned to a verdict.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Severity {
@@ -1616,7 +1551,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
     }
-    use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, QNAME_LEN, QNAME_WIRE_LEN, TASK_COMM_LEN};
+    use crate::wire::{ProcessSpawnRaw, FILENAME_LEN, TASK_COMM_LEN};
 
     #[test]
     fn file_open_raw_to_event() {
@@ -1674,130 +1609,6 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
-    }
-
-    #[test]
-    fn dns_query_raw_to_event_decodes_qname() {
-        let mut raw = DnsQueryRaw::zeroed();
-        raw.pid = 99;
-        raw.qtype = 1;
-        let qname = b"\x07example\x03com\x00";
-        raw.qname_len = qname.len() as u16;
-        raw.query_name[..qname.len()].copy_from_slice(qname);
-        match Event::from(&raw) {
-            Event::DnsQuery {
-                query_name,
-                query_type,
-                ..
-            } => {
-                assert_eq!(query_name, "example.com");
-                assert_eq!(query_type, 1);
-            }
-            _ => panic!("wrong variant"),
-        }
-        // Sanity: the size constant is honoured.
-        assert_eq!(QNAME_LEN, 253);
-    }
-
-    /// Lab PR 229: the name of an NSS record — text as the process passed
-    /// it — in the form a wire name decodes to.
-    #[test]
-    fn an_nss_record_names_the_text_the_process_passed() {
-        let nss = |text: &[u8], len: usize| {
-            let mut raw = DnsQueryRaw::zeroed();
-            raw.flags = crate::wire::dns_flags::NSS;
-            raw.query_name[..text.len()].copy_from_slice(text);
-            raw.qname_len = len as u16;
-            nss_query_name(&raw)
-        };
-        let name = b"foo.northnarrow-e2etest.invalid.";
-        assert_eq!(
-            nss(name, name.len()).as_deref(),
-            Some("foo.northnarrow-e2etest.invalid"),
-            "the root dot of an absolute name dropped, as on the wire"
-        );
-        assert_eq!(nss(b"example.com", 11).as_deref(), Some("example.com"));
-        // up to the NUL, whatever the length says
-        assert_eq!(nss(b"a.b\0junk", 8).as_deref(), Some("a.b"));
-        // a byte outside printable ASCII, and the backslash, as \DDD
-        assert_eq!(nss(b"x\ny\\z", 5).as_deref(), Some("x\\010y\\092z"));
-        assert_eq!(nss(b"", 0), None);
-        assert_eq!(nss(b".", 1), None);
-        // a length past the buffer is cut to it
-        let mut raw = DnsQueryRaw::zeroed();
-        raw.query_name.fill(b'a');
-        raw.qname_len = u16::MAX;
-        assert_eq!(nss_query_name(&raw).map(|n| n.len()), Some(QNAME_WIRE_LEN));
-    }
-
-    /// A record from the socket-buffer sensor (Tappa 10.9 step 3): wire
-    /// bytes from the start of the name; the type comes after the root label.
-    fn skb_raw(wire: &[u8]) -> DnsQueryRaw {
-        let mut raw = DnsQueryRaw::zeroed();
-        raw.flags = crate::wire::dns_flags::SKB;
-        raw.qtype = 0xffff; // ignored in this mode
-        raw.qname_len = wire.len() as u16;
-        raw.query_name[..wire.len()].copy_from_slice(wire);
-        raw
-    }
-
-    fn dns_fields(ev: Event) -> (String, u16, bool) {
-        match ev {
-            Event::DnsQuery {
-                query_name,
-                query_type,
-                qname_partial,
-                ..
-            } => (query_name, query_type, qname_partial),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn skb_record_takes_the_type_after_the_root_label() {
-        // example.com, TXT (16), class IN
-        let raw = skb_raw(b"\x07example\x03com\x00\x00\x10\x00\x01");
-        assert_eq!(
-            dns_fields(Event::from(&raw)),
-            ("example.com".into(), 16, false)
-        );
-    }
-
-    /// The `udp_sendmsg` sensor stopped at the first zero byte, so a zero
-    /// inside a label cut the name; the label walk does not.
-    #[test]
-    fn skb_record_keeps_a_label_with_a_zero_byte() {
-        let raw = skb_raw(b"\x05ab\x00cd\x04evil\x00\x00\x01\x00\x01");
-        assert_eq!(
-            dns_fields(Event::from(&raw)),
-            // External audit NN-AUD-185: `\000`, not a `?` shared by every
-            // unprintable byte
-            ("ab\\000cd.evil".into(), 1, false)
-        );
-    }
-
-    /// The name runs past the bytes read (a corked send: the rest is in a
-    /// page fragment): partial, no type.
-    #[test]
-    fn skb_record_without_a_root_label_is_partial() {
-        let raw = skb_raw(b"\x10aaaaaaaaaaaaaaaa\x06bbb");
-        let (name, qtype, partial) = dns_fields(Event::from(&raw));
-        assert_eq!(name, "aaaaaaaaaaaaaaaa.bbb");
-        assert_eq!((qtype, partial), (0, true));
-        // Nothing read at all is partial too.
-        assert!(dns_fields(Event::from(&skb_raw(b""))).2);
-        // A compression pointer in a query's own name.
-        assert!(dns_fields(Event::from(&skb_raw(b"\x03abc\xc0\x0c"))).2);
-    }
-
-    #[test]
-    fn sendmsg_record_keeps_the_kernel_type() {
-        let mut raw = DnsQueryRaw::zeroed();
-        raw.qtype = 28;
-        let qname = b"\x04host\x00";
-        raw.qname_len = 5; // the string read does not count the root label
-        raw.query_name[..qname.len()].copy_from_slice(qname);
-        assert_eq!(dns_fields(Event::from(&raw)), ("host".into(), 28, false));
     }
 
     #[test]

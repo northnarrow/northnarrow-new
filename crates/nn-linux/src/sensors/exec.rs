@@ -6,7 +6,7 @@
 //! [`nn_model::Event::ProcessSpawn`] over a tokio mpsc channel.
 //!
 //! The eBPF object is embedded via the build script: see
-//! `agent/build.rs`.
+//! `crates/nn-linux/build.rs`.
 
 use std::time::Duration;
 
@@ -47,7 +47,7 @@ impl ExecSensor {
     pub async fn start() -> Result<Self> {
         if EBPF_BYTES.is_empty() {
             bail!(
-                "eBPF program not built: agent/build.rs found no artifact. Run \
+                "eBPF program not built: crates/nn-linux/build.rs found no artifact. Run \
                  `cargo xtask build-ebpf` first."
             );
         }

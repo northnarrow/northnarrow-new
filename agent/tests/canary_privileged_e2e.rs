@@ -698,7 +698,7 @@ fn file_canary_open_triggers_canary_tripped_event_and_combat() {
     // signature, NOT hex. See `crates/nn-linux/src/canary/access_log.rs`
     // `entry.agent_sig = B64.encode(sig.to_bytes())` and the
     // matching `B64.decode + len==64` check in the verifier
-    // (mirrors `agent/src/audit.rs` + `agent/src/fim/baseline.rs`).
+    // (mirrors nn-evidence's `audit` + nn-linux's `fim::baseline`).
     // Standard-padded base64 of 64 bytes is 88 chars, but
     // decode+length-check is the robust shape — it also catches
     // truncated / non-base64 garbage.

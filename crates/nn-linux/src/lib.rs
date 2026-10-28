@@ -19,6 +19,16 @@
 //! the canary detector's and the COMBAT ladder's — with what they name: the
 //! canary registry and access log, the interface addresses and the
 //! read-forward set, the sampler of the host's files, the DNS pump's ingest.
+//! R09b (lab PR 254) moves the sensors — the single loader that attaches
+//! every program and pumps every ring, the exec, file-open, DNS, connect-deny
+//! and exploit-guard sensors — with the build script that embeds the eBPF
+//! object and refuses a stale one (`build.rs`), file integrity monitoring,
+//! the network drain and the blind spots it reports, the decoys' path policy
+//! and the DNS record's decode (from nn-model); with them, what they take and
+//! report of the agent's boot: the typed phases and the attach permit, the
+//! degradations, the sensors' attach points. The exec guards whose kernel
+//! configuration the loader writes stay in the agent, behind
+//! [`ExecGuards`](sensors::multiplexer::ExecGuards).
 //!
 //! The only crate of the layout where `unsafe` is allowed (no
 //! `#![forbid(unsafe_code)]`, R01): its blocks moved verbatim, each with its
@@ -58,18 +68,28 @@ pub mod atomic_file;
 // `bounded_cmd`).
 pub mod bounded_cmd;
 
+// The boot's typed phases and the attach permit, the degradations of a run
+// and the sensors' attach points (R09b, lab PR 254; cut from the agent's
+// `boot`, whose deny self-test, BPF LSM gate, trust level and signed
+// manifest stay in the agent).
+pub mod boot;
+
 /// Deception (R09a, lab PR 253): the stores of the canary detector's host —
 /// the signed registry of deployed canaries and their access log, this
 /// host's interface addresses, the read-forward set the FIM drain consults
 /// (were the agent's `canary::{registry, access_log, network,
-/// read_forward}`; the detector is nn-core's, the decoys' path policy
-/// R09b's).
+/// read_forward}`; the detector is nn-core's). R09b (lab PR 254): the
+/// decoys' path policy (was the agent's `canary::path_policy`).
 pub mod canary {
     // The chained log of canary accesses (Tappa 9.5 K3).
     pub mod access_log;
     // What a Network canary covers and its deploy check; this host's
     // addresses (lab PR 163).
     pub mod network;
+    // Where a file or credential canary may be written: not in the system
+    // trees, no planted link (review `canary-path-1`, external audit
+    // DEC-015).
+    pub mod path_policy;
     // The canaries' inodes whose read the FIM drain forwards (lab PR 178).
     pub mod read_forward;
     // The chained registry of deployed canaries (Tappa 9.5 K2).
@@ -122,19 +142,13 @@ pub mod content_host_linux;
 // was the agent's `decision_host_linux`).
 pub mod decision_host_linux;
 
-/// FIM (R09a, lab PR 253): the helpers the self-defence and the canary
-/// registry name, cut from the agent's `fim::attach` (the FIM's attach,
-/// drain, baseline, honeypot and recompute are R09b's).
-pub mod fim {
-    /// The kernel's form of a `stat(2)` device number, a path's `InodeKey`.
-    pub mod attach;
-
-    // R09a shim (plan §4.1 rule 2, removed in R17): the path the isolator's
-    // tests name for the shipped FIM list.
-    /// `crate::fim::paths_config::…`, nn-core's.
-    #[cfg(test)]
-    pub(crate) use nn_core::fim::paths_config;
-}
+// File integrity monitoring (Tappa 9): the observers' attach and the
+// watched inodes, the ring's drain and the drift log, the baseline, the
+// honeypot baits, the baseline's recompute; the watched paths' loader on
+// the Linux host (R09b, lab PR 254; was the agent's `fim`, whose helpers
+// the self-defence and the canary registry name came first, R09a; the
+// rules, the list and the drift's classification are nn-core's).
+pub mod fim;
 
 // The filesystems the agent's files live on, by identity (R09a; was the
 // agent's `fs_type`).
@@ -162,8 +176,16 @@ pub mod keys;
 
 /// Network (R09a, lab PR 253): the DNS pump's ingest, and the DNS cache
 /// carrying it (were the agent's `net::dns_ingest` and `net::dns_cache`;
-/// the cache's state is nn-core's).
+/// the cache's state is nn-core's). R09b (lab PR 254): the drain of the
+/// flow and listener rings and its two signed logs, the blind spots it
+/// reports (were the agent's `net::{drain, blind_spots}`), and the flow
+/// tracker and the rules' gate on the Linux host.
 pub mod net {
+    // The flows the rules cannot judge on this host: the encrypted ones
+    // with no TLS fingerprint rule, DNS over TLS to the resolver (lab PRs
+    // 224, 247).
+    pub mod blind_spots;
+
     // How far the DNS pump has read its ring, and how a lookup waits for
     // it (lab PR 229).
     pub mod dns_ingest;
@@ -188,6 +210,39 @@ pub mod net {
         // paths the fuzz targets and `fuzz_api` name (until R17).
         pub use nn_parse::dns_records::{parse_a_records, parse_aaaa_records};
     }
+
+    // The drain of the closed flows, listeners and UDP flows, and the
+    // netflow and listener logs (Tappa 10 N9).
+    pub mod drain;
+
+    // R09b shims (lab PR 254; plan §4.1 rule 2, removed in R17): the paths
+    // the moved sensors and drain name for nn-core's network state, as the
+    // agent's `net` gives them.
+
+    /// `crate::net::blocklist::…`, nn-core's (the connect deny's rules).
+    pub(crate) use nn_core::net::blocklist;
+
+    /// The flow tracker (connect → close, the flow id, the open-flow
+    /// snapshots) on the Linux host: nn-core's, whose notifier is the
+    /// host's (the connect pump feeds it; R08b's alias of the agent's
+    /// `net`).
+    pub mod flow_tracker {
+        pub use nn_core::net::flow_tracker::*;
+
+        /// [`nn_core::net::flow_tracker::FlowTracker`] on the Linux host.
+        pub type FlowTracker =
+            nn_core::net::flow_tracker::FlowTracker<crate::chain_host_linux::LinuxHost>;
+    }
+
+    /// The netflow rows handed to the rules, paced per uid, on the Linux
+    /// host: nn-core's (the drain's gate; R08b's alias of the agent's
+    /// `net`).
+    pub mod limiter {
+        pub use nn_core::net::limiter::*;
+
+        /// [`nn_core::net::limiter::RuleGate`] on the Linux host.
+        pub type RuleGate = nn_core::net::limiter::RuleGate<crate::chain_host_linux::LinuxHost>;
+    }
 }
 
 // The OS CSPRNG as an infallible generator (R09a; was the agent's
@@ -211,6 +266,17 @@ pub mod runtime;
 /// The self-integrity watcher's pieces the self-defence and the actuators
 /// name (R09a, lab PR 253; cut from the agent's `self_integrity`, R09c's).
 pub mod self_integrity;
+
+// The sensors (Tappa 4, Tappa 10): the embedded eBPF object and its boot
+// preflight, the single loader that attaches every program and pumps every
+// ring into one channel, the exec, file-open, DNS, connect-deny and exploit
+// guard sensors, the ring drops and rejected records (R09b, lab PR 254; was
+// the agent's `sensors`; `build.rs` embeds the object).
+pub mod sensors;
+
+// The telemetry probe's piece the file-open sensor names (R09b, lab PR
+// 254; cut from the agent's `telemetry_probe`, R09c's).
+pub mod telemetry_probe;
 
 // The system directories' binaries, never `$PATH` (R09a; was the agent's
 // `trusted_bin`).
@@ -248,14 +314,20 @@ pub(crate) mod chainlog {
     pub use nn_evidence::chainlog::*;
 
     /// [`nn_evidence::chainlog::RotatingChainLog`], signed by the agent's
-    /// key unless another is named (the Linux host's tests).
-    #[cfg(test)]
+    /// key unless another is named (the FIM drift log; the Linux host's
+    /// tests).
     pub type RotatingChainLog<P, K = crate::keys::AgentSigningKey> =
         nn_evidence::chainlog::RotatingChainLog<P, K>;
 }
 
+/// `crate::config::…`, nn-core's (the overlay a watched-paths load takes).
+use nn_core::config;
+
 /// `crate::decision::…`, nn-core's (the exemption facts' trait).
 use nn_core::decision;
+
+/// `crate::path_text::…`, nn-model's (the file-open sensor's paths).
+use nn_model::path_text;
 
 /// `crate::posture::…`: nn-core's posture, and the stack exemption on the
 /// Linux host (the agent's alias).
@@ -264,4 +336,19 @@ pub(crate) mod posture {
 
     /// [`nn_core::posture::exempt::ExemptPids`] on the Linux host.
     pub type ExemptPids = nn_core::posture::exempt::ExemptPids<crate::chain_host_linux::LinuxHost>;
+
+    /// [`nn_core::posture::PostureMachine`] on the Linux host (R09b: the
+    /// ring-drop reporter's, the agent's alias).
+    pub type PostureMachine = nn_core::posture::PostureMachine<crate::chain_host_linux::LinuxHost>;
+
+    /// The lineage, its tracker on the Linux host (R09b: the sensors' exec
+    /// images, the agent's alias).
+    pub mod lineage {
+        pub use nn_core::posture::lineage::*;
+
+        /// [`nn_core::posture::lineage::AuthSessionTracker`] on the Linux
+        /// host.
+        pub type AuthSessionTracker =
+            nn_core::posture::lineage::AuthSessionTracker<crate::chain_host_linux::LinuxHost>;
+    }
 }

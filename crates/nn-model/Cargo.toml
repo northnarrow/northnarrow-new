@@ -14,9 +14,10 @@ publish = false
 # R02 (lab PR 240): `common`'s event model, posture types, network
 # addresses, log escaping and the std types of `wire` moved here; `common`
 # (the raw layouts they decode) and nn-parse (the QNAME walk) below it.
+# R09b (lab PR 254): the DNS record's decode, the one user of the QNAME
+# walk, moved to nn-linux's DNS sensor; nn-parse is no longer below it.
 [dependencies]
 common = { workspace = true }
-nn-parse = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

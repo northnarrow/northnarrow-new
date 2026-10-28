@@ -886,7 +886,9 @@ dependencies = [
  "anyhow",
  "aya",
  "base64",
+ "bytemuck",
  "chrono",
+ "ebpf-guard",
  "ed25519-dalek",
  "hex",
  "hkdf",
@@ -915,7 +917,6 @@ dependencies = [
 name = "nn-model"
 version = "0.0.1"
 dependencies = [
- "nn-parse",
  "northnarrow-common",
  "serde",
 ]
@@ -955,7 +956,6 @@ dependencies = [
  "bytemuck",
  "chrono",
  "clap",
- "ebpf-guard",
  "ed25519-dalek",
  "hex",
  "hkdf",

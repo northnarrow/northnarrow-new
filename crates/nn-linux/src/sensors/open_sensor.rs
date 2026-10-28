@@ -1104,7 +1104,7 @@ pub fn mount_points(mountinfo: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) use crate::path_text::unescape_octal;
+pub use crate::path_text::unescape_octal;
 /// The text of the paths this sensor renders, shared with their readers:
 /// `crate::path_text`'s since R04b (lab PR 241), named here as before.
 pub use crate::path_text::{path_is_exact, CUT_MARK, UNREAD_COMPONENT};

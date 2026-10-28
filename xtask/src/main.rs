@@ -450,9 +450,9 @@ fn build_ebpf(release: bool, locked: bool) -> Result<()> {
     btf_check::require_btf(&built).with_context(|| format!("refusing {}", bpf_obj.display()))?;
     println!("xtask: eBPF artifact carries .BTF");
 
-    // Stamp the RELEASE artifact (the one `agent/build.rs` embeds) with
+    // Stamp the RELEASE artifact (the one `crates/nn-linux/build.rs` embeds) with
     // the source-closure hash. This is the writer half of the staleness
-    // guard: `agent/build.rs` reads this stamp and refuses to embed a
+    // guard: `crates/nn-linux/build.rs` reads this stamp and refuses to embed a
     // `.o` whose stamp does not match the current source — so a plain
     // `cargo build` can no longer silently bake in a stale object. It
     // is what makes "the eBPF object is rebuilt atomically with the
@@ -464,7 +464,7 @@ fn build_ebpf(release: bool, locked: bool) -> Result<()> {
     // build against it trips the guard).
     //
     // The stamp also records the SHA-256 of the object just built
-    // (external audit EBPF-014): `agent/build.rs` refuses a `.o` whose
+    // (external audit EBPF-014): `crates/nn-linux/build.rs` refuses a `.o` whose
     // bytes differ, i.e. one rebuilt outside xtask or replaced later.
     if release {
         let source_hash = ebpf_guard::ebpf_source_hash(&root)

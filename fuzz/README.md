@@ -70,8 +70,8 @@ name and a deterministic unit test next to the parser.
 cargo install cargo-fuzz --version 0.13.2 --locked   # once
 cargo +nightly-2025-12-01 fuzz list                  # from the repository root
 cargo +nightly-2025-12-01 fuzz build                 # all targets, sanitizer on
-# run a built binary directly (cargo fuzz run re-invokes cargo, and
-# agent/build.rs re-runs whenever .git/refs changes — slow in a loop)
+# run a built binary directly (cargo fuzz run re-invokes cargo for every
+# run — slow in a loop)
 b=fuzz/target/x86_64-unknown-linux-gnu/release
 $b/install_manifest -runs=0 -timeout=25 fuzz/seeds/install_manifest fuzz/regressions/install_manifest
 $b/tls_client_hello -max_total_time=300 -max_len=8192 -timeout=25 \

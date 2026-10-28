@@ -23,12 +23,9 @@ pub const AUDIT_OP: &str = "capability_manifest";
 /// Bumped when a field changes meaning or goes.
 pub const MANIFEST_VERSION: u32 = 1;
 
-/// One sensor and where it is attached.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SensorEntry {
-    pub sensor: String,
-    pub attach: String,
-}
+/// R09b shim (lab PR 254; plan §4.1 rule 2, removed in R17): the sensors'
+/// attach points are noted by the eBPF loader and the sensors, nn-linux's.
+pub use nn_linux::boot::manifest::{note_sensor, sensors, SensorEntry};
 
 /// The deny hooks of the boot.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,27 +73,6 @@ pub struct CapabilityManifest {
     pub degradations: Vec<String>,
     pub trust_level: u8,
     pub trust_reasons: Vec<String>,
-}
-
-static SENSORS: Mutex<Vec<SensorEntry>> = Mutex::new(Vec::new());
-
-/// `sensor` is attached at `attach` (a later note for the same sensor
-/// replaces it: the file-open sensor moves from the tracepoint to LSM
-/// `file_open` once its observer is armed).
-pub fn note_sensor(sensor: &str, attach: &str) {
-    let mut s = SENSORS.lock();
-    match s.iter_mut().find(|e| e.sensor == sensor) {
-        Some(e) => e.attach = attach.to_string(),
-        None => s.push(SensorEntry {
-            sensor: sensor.to_string(),
-            attach: attach.to_string(),
-        }),
-    }
-}
-
-/// The sensors noted so far.
-pub fn sensors() -> Vec<SensorEntry> {
-    SENSORS.lock().clone()
 }
 
 /// The host hardening table as the manifest lists it.
@@ -241,17 +217,5 @@ mod tests {
         let cur: serde_json::Value = serde_json::from_str(&current_json().unwrap()).unwrap();
         assert_eq!(cur["entry_hash"], hash);
         assert_eq!(cur["manifest"]["trust_level"], 3);
-    }
-
-    #[test]
-    fn a_later_note_moves_a_sensor() {
-        note_sensor("test_sensor_x", "tracepoint:syscalls/sys_enter_openat");
-        note_sensor("test_sensor_x", "lsm:file_open");
-        let s: Vec<_> = sensors()
-            .into_iter()
-            .filter(|e| e.sensor == "test_sensor_x")
-            .collect();
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].attach, "lsm:file_open");
     }
 }
