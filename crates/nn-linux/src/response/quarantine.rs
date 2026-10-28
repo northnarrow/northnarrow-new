@@ -38,7 +38,7 @@
 //! link), after checking it against the SHA-256 recorded at capture.
 //! The vault entry stays.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -790,12 +790,22 @@ fn remove_verified(path: &Path, handle: &ExeHandle) -> Result<(), QuarantineErro
 
 /// External audit CMB-017: what happened to a quarantine index that did
 /// not parse, waiting to be recorded in the signed audit log by the
-/// executor ([`take_index_notes`]).
-static INDEX_NOTES: parking_lot::Mutex<Vec<String>> = parking_lot::const_mutex(Vec::new());
+/// executor ([`take_index_notes`]) — by vault, its directory the key (lab
+/// PR 258). One list for the process let an executor take the repairs of
+/// another vault: an executor's test took the note another test of the
+/// crate was waiting for. The agent has one vault, which its executor and
+/// the exec quarantine share: the same notes, recorded at the same
+/// quarantine as before.
+static INDEX_NOTES: parking_lot::Mutex<BTreeMap<PathBuf, Vec<String>>> =
+    parking_lot::const_mutex(BTreeMap::new());
 
-/// The index repairs since the last call (external audit CMB-017).
-pub fn take_index_notes() -> Vec<String> {
-    std::mem::take(&mut *INDEX_NOTES.lock())
+/// The repairs of the index of the vault `quarantine_dir` since the last
+/// call (external audit CMB-017).
+pub fn take_index_notes(quarantine_dir: &Path) -> Vec<String> {
+    INDEX_NOTES
+        .lock()
+        .remove(quarantine_dir)
+        .unwrap_or_default()
 }
 
 /// The `.meta` of a vault entry: what was quarantined (path, size,
@@ -894,7 +904,11 @@ fn update_index(
                     rebuilt.len()
                 );
                 warn!("{note}");
-                INDEX_NOTES.lock().push(note);
+                INDEX_NOTES
+                    .lock()
+                    .entry(quarantine_dir.to_path_buf())
+                    .or_default()
+                    .push(note);
                 rebuilt
             }
         },
@@ -1560,7 +1574,7 @@ mod tests {
             .unwrap();
         }
         std::fs::write(cfg.quarantine_dir.join("index.json"), b"{ not json").unwrap();
-        let _ = take_index_notes();
+        assert!(take_index_notes(&cfg.quarantine_dir).is_empty());
         update_index(
             &cfg.quarantine_dir,
             "cccccccccccccccccccccccccccccccc",
@@ -1595,14 +1609,54 @@ mod tests {
             })
             .collect();
         assert_eq!(kept.len(), 1, "the corrupt index is kept aside");
-        let notes = take_index_notes();
+        let notes = take_index_notes(&cfg.quarantine_dir);
         assert!(
             notes.len() == 1 && notes[0].contains("rebuilt from 3"),
             "{notes:?}"
         );
+        assert!(
+            take_index_notes(&cfg.quarantine_dir).is_empty(),
+            "taken once"
+        );
         assert_eq!(
             vault_meta("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &cfg).unwrap()["original_path"],
             "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    /// Lab PR 258: a repair of the index waits for its own vault's
+    /// executor. With one list for the process, any executor's quarantine
+    /// took it, even one refused with no vault touched: the NEUTRALIZE
+    /// tests of the COMBAT actuator (an executor and a vault of their own)
+    /// took the note of the test above, which then found none (lab PR
+    /// 256's flake).
+    #[test]
+    fn an_index_repair_is_taken_by_its_own_vaults_executor() {
+        let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (cfg, other) = (cfg_for(&a), cfg_for(&b));
+        std::fs::create_dir_all(cfg.quarantine_dir.join("vault")).unwrap();
+        std::fs::write(cfg.quarantine_dir.join("index.json"), b"{ not json").unwrap();
+        update_index(
+            &cfg.quarantine_dir,
+            "dddddddddddddddddddddddddddddddd",
+            "/tmp/dddddddddddddddddddddddddddddddd",
+            3,
+        )
+        .unwrap();
+        // Another vault's executor quarantines (PID 0: refused, and
+        // recorded with the repairs it takes).
+        let report = super::super::Executor::with_config(other.clone())
+            .execute(nn_model::ResponseAction::Quarantine, 0);
+        assert!(
+            matches!(report.primary, ExecutionOutcome::Refused { pid: 0, .. }),
+            "{:?}",
+            report.primary
+        );
+        assert!(take_index_notes(&other.quarantine_dir).is_empty());
+        let notes = take_index_notes(&cfg.quarantine_dir);
+        assert!(
+            notes.len() == 1 && notes[0].contains("rebuilt from 0"),
+            "{notes:?}"
         );
     }
 
