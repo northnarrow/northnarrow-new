@@ -472,7 +472,7 @@ fn section_references_after_a_guide_name_exist() {
             "README.md",
             "docs/TAPPA7_PREREQ.md",
             "docs/integration-test-runbook.md",
-            "agent/src/host_hardening.rs",
+            "crates/nn-linux/src/host_hardening.rs",
         ]
         .map(String::from),
     );
@@ -506,7 +506,7 @@ fn no_operator_facing_text_hands_out_a_fixed_lsm_list() {
             "README.md",
             "docs/TAPPA7_PREREQ.md",
             "docs/integration-test-runbook.md",
-            "agent/src/host_hardening.rs",
+            "crates/nn-linux/src/host_hardening.rs",
         ]
         .map(String::from),
     );

@@ -154,6 +154,13 @@ pub mod fim;
 // agent's `fs_type`).
 pub mod fs_type;
 
+// The host's kernel and boot-chain hardening: the settings that decide
+// whether a root that rewrites the kernel at runtime can bypass the
+// self-defence, for `nn-admin host-check`, the boot's warnings and the
+// capability manifest (Tappa 10.8; R09c, lab PR 257; was the agent's
+// `host_hardening`).
+pub mod host_hardening;
+
 /// The ransomware signal's Linux part (R09a, lab PR 253): the production
 /// sampler of the host's files (was the agent's `impact::entropy`; the
 /// signal is nn-core's).
@@ -257,6 +264,10 @@ pub mod os_rng;
 // The Linux host of the posture (nn-core's `PostureHost` and
 // `PostureAgent`; R09a; was the agent's `posture_host_linux`).
 pub mod posture_host_linux;
+
+// The agent's own process: no core dump, no readable memory (lab PR 216;
+// R09c, lab PR 257; was the agent's `process_hardening`).
+pub mod process_hardening;
 
 // The executor and its actions (Tappa 3, Tappa 5): kill, quarantine, the
 // egress block, the throttle, the containment and its release, the

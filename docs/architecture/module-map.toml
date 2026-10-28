@@ -241,7 +241,6 @@ planned = false
 "execq::record" = "nn-core"
 # into the crates it exercises in R17
 "fuzz_api" = "northnarrow-agent"
-"host_hardening" = "nn-linux"
 # post-plan (lab PR 225): the ransomware signal (sampler behind a trait).
 # R08b (lab PR 251): the tracker moved to nn-core; `impact.rs` binds it to
 # the Linux host and publishes the agent's tracker for `status`; R09a (lab
@@ -274,8 +273,6 @@ planned = false
 # `chain_host_linux`, as `config/mod.rs` does for the loaders); the
 # posture's cross-module tests and golden replay stay in `posture/`
 "posture" = "nn-core"
-# post-plan (lab PR 216): no core dump, no readable memory
-"process_hardening" = "nn-linux"
 # post-plan (lab PR 214): settings of the removed LLM advisor, named at boot
 "removed_settings" = "northnarrow-agent"
 "self_integrity" = "nn-linux"
@@ -375,6 +372,12 @@ planned = false
 # R09c (lab PR 257): the boot's check of the installed binaries and the
 # embedded eBPF object against the manifest `install.sh` writes (DEP-009)
 "install_manifest" = "nn-linux"
+# R09c (lab PR 257): the hardening — the host's kernel and boot-chain
+# checks (`nn-admin host-check`, the boot's warnings, the capability
+# manifest's table) and the agent process's own (post-plan, lab PR 216:
+# no core dump, no readable memory)
+"host_hardening" = "nn-linux"
+"process_hardening" = "nn-linux"
 # R07 (lab PR 247): the COMBAT carve-out
 "anti_tamper::combat_allow" = "nn-core"
 "audit" = "nn-evidence"

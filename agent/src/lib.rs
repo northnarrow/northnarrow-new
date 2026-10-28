@@ -142,7 +142,9 @@ pub use nn_linux::fim;
 pub use nn_linux::fs_type;
 #[doc(hidden)]
 pub mod fuzz_api;
-pub mod host_hardening;
+/// R09c shim: the host hardening checks (`nn-admin host-check`, the boot's
+/// warnings, the capability manifest's table) are nn-linux's.
+pub use nn_linux::host_hardening;
 pub mod impact;
 pub mod impair;
 /// R09c shim: the boot's check of the installed binaries and the embedded
@@ -168,7 +170,9 @@ pub mod posture;
 /// files and the clocks of nn-core's `PostureHost` (R08a, lab PR 250) — is
 /// nn-linux's.
 pub use nn_linux::posture_host_linux;
-pub mod process_hardening;
+/// R09c shim: the agent process's own hardening (no core dump, no
+/// readable memory) is nn-linux's.
+pub use nn_linux::process_hardening;
 pub mod removed_settings;
 /// R09a shim: the executor and its actions (kill, quarantine, the egress
 /// block, the throttle, the containment and its release) are nn-linux's.
