@@ -531,33 +531,6 @@ fn attest_degraded(
     attest_degraded_at(audit_log, detail, true);
 }
 
-/// External audit EBPF-016: the signed `subsystem_degraded` of
-/// [`northnarrow_agent::fs_type::IdentityReport`] (`reason:
-/// inode_identity_unverified`, the filesystems, their counts and first
-/// paths).
-fn attest_identity_unverified(
-    audit_log: Option<&Arc<parking_lot::Mutex<northnarrow_agent::audit::AuditLog>>>,
-    report: &northnarrow_agent::fs_type::IdentityReport,
-) {
-    let Some(log) = audit_log else {
-        return;
-    };
-    let draft = northnarrow_agent::audit::AuditEntryDraft {
-        op: northnarrow_agent::self_integrity::AUDIT_OP.to_string(),
-        extra: report.audit_extra(),
-        key_fp: "agent-self".to_string(),
-        cosigner_fps: Vec::new(),
-        result: "detected".to_string(),
-        client_pid: std::process::id(),
-        client_uid: 0,
-        client_comm: "northnarrow-agent".to_string(),
-        client_exe: None,
-    };
-    if let Err(e) = log.lock().append(draft) {
-        warn!(error = %e, "attesting the unverified inode identity failed");
-    }
-}
-
 /// [`attest_degraded`] for a subsystem that stopped after boot (external
 /// audit MAIN-007: a drain loop that returns ends a telemetry stream for
 /// the rest of the run).
