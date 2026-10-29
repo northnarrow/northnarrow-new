@@ -83,7 +83,22 @@ pub const PROTECTED_DIR_FLAGS: u8 = FS_PROTECT_MUTATE | FS_PROTECT_NOCREATE;
 /// [`PROTECTED_DIR_FLAGS`]: the agent unit's drop-in directory, which
 /// install.sh creates on a Debian-family host. A new drop-in there could
 /// replace `ExecStart=` or add a skipping `Condition*=` (DEP-002).
-pub const NOCREATE_UNIT_DIRS: &[&str] = &["/etc/systemd/system/northnarrow-agent.service.d"];
+///
+/// Lab PR 265 (review #466 F4-bis): and its runtime drop-in directory under
+/// `/run/systemd/system`, which the unit makes (empty) before every start
+/// (`ExecStartPre=+/bin/mkdir -p …`; `/run` is a tmpfs): a runtime drop-in
+/// there (`systemctl edit --runtime`, a `BindPaths=` or
+/// `TemporaryFileSystem=` that hides `/etc/northnarrow` from the next start)
+/// is refused outside a signed trusted-installer window. The unit's other
+/// drop-in directories (`system.control`, `transient`, the generators', the
+/// `northnarrow-.service.d` and `service.d` prefixes) are the host's or do
+/// not exist: a drop-in there is a self-integrity finding, and a mount it
+/// lays over the agent's directories refuses the start
+/// (`boot::checks::agent_mounts`).
+pub const NOCREATE_UNIT_DIRS: &[&str] = &[
+    "/etc/systemd/system/northnarrow-agent.service.d",
+    "/run/systemd/system/northnarrow-agent.service.d",
+];
 
 /// The files inside [`CONFIG_DIR`] that PROTECTED_INODES covers.
 /// Order is the operator-visible audit order — tests assert it for
@@ -388,6 +403,9 @@ pub const BINARY_AND_UNIT_PATHS: &[&str] = &[
     // exist, a drop-in made with it is reported by the integrity check.
     "/etc/systemd/system/northnarrow-agent.service.d",
     "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
+    // Lab PR 265 (review #466 F4-bis): the runtime drop-in directory the
+    // unit makes before every start (`NOCREATE_UNIT_DIRS`).
+    "/run/systemd/system/northnarrow-agent.service.d",
     // Lab PR 223 (EXPERIMENTAL): the exec quarantine's scanner, in both
     // layouts — a replaced scanner would call every file clean.
     "/usr/local/bin/northnarrow-scan",
@@ -2974,6 +2992,7 @@ mod tests {
                 "/usr/lib/systemd/system/northnarrow-watchdog-failed.service",
                 "/etc/systemd/system/northnarrow-agent.service.d",
                 "/etc/systemd/system/northnarrow-agent.service.d/10-debian-perf-paranoid.conf",
+                "/run/systemd/system/northnarrow-agent.service.d",
                 "/usr/local/bin/northnarrow-scan",
                 "/usr/bin/northnarrow-scan",
             ],
@@ -3151,6 +3170,7 @@ mod tests {
             "/usr/local/bin",
             "/usr/bin",
             "/etc/systemd/system",
+            "/run/systemd/system",
             "/usr/lib/systemd/system",
             "/etc",
         ] {
