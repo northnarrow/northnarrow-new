@@ -736,8 +736,10 @@ is neither the agent nor the watchdog gets `EPERM` for:
   device node or FIFO in `/etc/northnarrow`, `/var/lib/northnarrow` and
   its `detections/` directory, the agent's drop-in directory
   `/etc/systemd/system/northnarrow-agent.service.d` (Debian family, where
-  install.sh makes it), and the bpffs pin root — `op=create`, `mkdir`,
-  `symlink`, `link`, `mknod`;
+  install.sh makes it), its runtime drop-in directory
+  `/run/systemd/system/northnarrow-agent.service.d` (lab PR 265: the unit
+  makes it, empty, before every start), and the bpffs pin root —
+  `op=create`, `mkdir`, `symlink`, `link`, `mknod`;
 - an extended attribute set or removed on any protected inode (`setfattr`,
   `setcap`, `evmctl`, and `setfacl`, which 6.2+ kernels send through their
   own ACL hooks) — `op=xattr`. `security.selinux` is not refused:
@@ -746,7 +748,8 @@ is neither the agent nor the watchdog gets `EPERM` for:
 Each refusal is an `ANTI-TAMPER DENIAL`, an `NN-L-AT-001` detection and a
 decisive tamper signal (COMBAT), like a refused unlink. What changes for an
 operator: overlays go through `nn-admin config overlay set` (the agent
-writes them); `systemctl edit northnarrow-agent`, `nn-admin config overlay
+writes them); `systemctl edit northnarrow-agent` (and, since lab PR 265,
+`systemctl edit --runtime` and `systemctl revert`), `nn-admin config overlay
 sign` into `/etc/northnarrow`, `nn-admin init` creating a missing
 `admin.pub` and an editor's swap file need a window
 (`nn-admin trusted-installer-grant`) — editing those files in place was
@@ -844,6 +847,58 @@ watchdog create it 0700). Each unit bounds its start: `TimeoutStartSec=180s`
 for the agent (its `READY=1` follows the eBPF attach and the ADE load),
 `60s` for the watchdog (its own 30-s deadline for a verified agent fires
 first).
+
+### 3.10 Re-keying the agent (lab PR 265)
+
+The agent's signing key (`/etc/northnarrow/agent.sig.key`) signs every
+chain the install keeps; its public half (`agent.sig.pub`) is what
+`nn-admin audit verify` and an off-host auditor check them with. A start
+whose key is absent where an earlier identity is on record — the public
+half, `agent_id`, a signed row of the audit chain or of another chain —
+refuses (exit 78, `start refused gate=signing_identity`), and so does a
+start whose directories are mounted over (`gate=agent_mounts`): neither
+mints a key (`BOOT_INTEGRITY.md` §1.1). Before lab PR 265 such a start
+minted a new key with one INFO line, and the chains went on under another
+identity. Only a first install mints the key, so a new key is a new
+install's identity, made on purpose:
+
+1. Archive the old identity's evidence with the public half that verifies
+   it, and check the archive off the host:
+
+   ```sh
+   sudo tar -C / -czf /root/northnarrow-identity-$(date +%F).tgz \
+       etc/northnarrow/agent.sig.pub etc/northnarrow/agent_id \
+       etc/northnarrow/audit.log etc/northnarrow/chain_heads.json \
+       var/lib/northnarrow
+   # off the host, in the extracted archive:
+   nn-admin audit verify --from etc/northnarrow/audit.log \
+       --agent-pubkey "$(cat etc/northnarrow/agent.sig.pub)"
+   nn-admin chain verify --state-dir var/lib/northnarrow \
+       --audit-log etc/northnarrow/audit.log \
+       --agent-pubkey "$(cat etc/northnarrow/agent.sig.pub)"
+   ```
+
+2. Retire the identity with the signed uninstall:
+   `sudo ./deploy/uninstall.sh --purge --grant-key <trusted-installer key>`
+   (the window, both units stopped, the pins dropped; `/etc/northnarrow`
+   and `/var/lib/northnarrow` removed — the bootstrap admin key and the
+   namespace journal too). To keep the administrators' keys, copy
+   `admin.pub` aside first and put it back in a new `/etc/northnarrow`
+   (0755, the file 0600) before the next step: `install.sh` leaves an
+   existing `admin.pub` untouched, and it is not an identity of the agent.
+   Signed overlays bind the old `agent_id` and must be signed again.
+3. Install again (`sudo ./deploy/install.sh …`, §1): the first start mints
+   the new key, its public half and a new `agent_id`, and begins new
+   chains. Record the new `agent.sig.pub` where the old one is kept.
+
+Removing `agent.sig.key` alone, or hiding it, never re-keys: the start
+refuses and says what it found. Put the key back (or remove the mount or
+the drop-in, then `systemctl daemon-reload`) and `systemctl start
+northnarrow-agent`. Layouts: a separate `/var` or `/var/lib` filesystem is
+fine; `/etc/northnarrow` and `/var/lib/northnarrow` (and any directory a
+`--…-file` flag points the agent's state to) must not be mount points of
+their own — a bind of the directory onto itself, as the unit's
+`ReadWritePaths=` makes, is the one mount there the start accepts.
 
 ## 4. What still needs a reboot
 
