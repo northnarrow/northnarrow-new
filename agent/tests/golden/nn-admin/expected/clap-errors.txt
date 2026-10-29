@@ -1,0 +1,3631 @@
+# nn-admin output matrix: clap-errors (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### clap.root.unknown-flag
+$ nn-admin --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.root.unknown-subcommand
+$ nn-admin nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.init.unknown-flag
+$ nn-admin init --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin init [OPTIONS] --priv-out <PRIV_OUT>
+|
+| For more information, try '--help'.
+
+### clap.init.missing-required
+$ nn-admin init
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --priv-out <PRIV_OUT>
+|
+| Usage: nn-admin init --priv-out <PRIV_OUT>
+|
+| For more information, try '--help'.
+
+### clap.init.stray-positional
+$ nn-admin init stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin init [OPTIONS] --priv-out <PRIV_OUT>
+|
+| For more information, try '--help'.
+
+### clap.init.priv-out.missing-value
+$ nn-admin init --priv-out
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--priv-out <PRIV_OUT>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.init.pub-append.missing-value
+$ nn-admin init --pub-append
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--pub-append <PUB_APPEND>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.init.force.given-twice
+$ nn-admin init --force --force
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--force' cannot be used multiple times
+|
+| Usage: nn-admin init [OPTIONS] --priv-out <PRIV_OUT>
+|
+| For more information, try '--help'.
+
+### clap.init.force.with-a-value
+$ nn-admin init --force=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--force' found; no more were expected
+|
+| Usage: nn-admin init --priv-out <PRIV_OUT> --force
+|
+| For more information, try '--help'.
+
+### clap.unlock.unknown-flag
+$ nn-admin unlock --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin unlock [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.unlock.missing-required
+$ nn-admin unlock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin unlock --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.unlock.stray-positional
+$ nn-admin unlock stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin unlock [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.unlock.key.missing-value
+$ nn-admin unlock --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.unlock.agent-id-file.missing-value
+$ nn-admin unlock --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.unlock.socket.missing-value
+$ nn-admin unlock --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.status.unknown-flag
+$ nn-admin status --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin status [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.status.socket.missing-value
+$ nn-admin status --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.status.json.given-twice
+$ nn-admin status --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin status [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.status.json.with-a-value
+$ nn-admin status --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin status --json
+|
+| For more information, try '--help'.
+
+### clap.status.agent-id-file.missing-value
+$ nn-admin status --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.capabilities.unknown-flag
+$ nn-admin capabilities --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin capabilities [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.capabilities.missing-required
+$ nn-admin capabilities
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin capabilities --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.capabilities.stray-positional
+$ nn-admin capabilities stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin capabilities [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.capabilities.key.missing-value
+$ nn-admin capabilities --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.capabilities.json.given-twice
+$ nn-admin capabilities --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin capabilities [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.capabilities.json.with-a-value
+$ nn-admin capabilities --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin capabilities --key <KEY> --json
+|
+| For more information, try '--help'.
+
+### clap.capabilities.agent-id-file.missing-value
+$ nn-admin capabilities --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.capabilities.socket.missing-value
+$ nn-admin capabilities --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.host-check.unknown-flag
+$ nn-admin host-check --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin host-check [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.host-check.json.given-twice
+$ nn-admin host-check --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin host-check [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.host-check.json.with-a-value
+$ nn-admin host-check --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin host-check --json
+|
+| For more information, try '--help'.
+
+### clap.detections.unknown-flag
+$ nn-admin detections --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin detections [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.detections.missing-required
+$ nn-admin detections
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin detections --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.detections.stray-positional
+$ nn-admin detections stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin detections [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.detections.key.missing-value
+$ nn-admin detections --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detections.limit.missing-value
+$ nn-admin detections --limit
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--limit <LIMIT>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detections.since.missing-value
+$ nn-admin detections --since
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--since <SINCE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detections.until.missing-value
+$ nn-admin detections --until
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--until <UNTIL>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detections.agent-id-file.missing-value
+$ nn-admin detections --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detections.socket.missing-value
+$ nn-admin detections --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.unknown-flag
+$ nn-admin detection-set-status --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin detection-set-status [OPTIONS] --key <KEY> --id <ID> --status <STATUS>
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.missing-required
+$ nn-admin detection-set-status
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|   --id <ID>
+|   --status <STATUS>
+|
+| Usage: nn-admin detection-set-status --key <KEY> --id <ID> --status <STATUS>
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.stray-positional
+$ nn-admin detection-set-status stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin detection-set-status [OPTIONS] --key <KEY> --id <ID> --status <STATUS>
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.key.missing-value
+$ nn-admin detection-set-status --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.id.missing-value
+$ nn-admin detection-set-status --id
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--id <ID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.note.missing-value
+$ nn-admin detection-set-status --note
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--note <NOTE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.agent-id-file.missing-value
+$ nn-admin detection-set-status --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.detection-set-status.socket.missing-value
+$ nn-admin detection-set-status --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.verify-keys.unknown-flag
+$ nn-admin verify-keys --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin verify-keys [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.verify-keys.path.missing-value
+$ nn-admin verify-keys --path
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--path <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.shutdown.unknown-flag
+$ nn-admin shutdown --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin shutdown [OPTIONS] --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.shutdown.missing-required
+$ nn-admin shutdown
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|   --cosign-key <COSIGN_KEY>
+|
+| Usage: nn-admin shutdown --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.shutdown.stray-positional
+$ nn-admin shutdown stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin shutdown [OPTIONS] --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.shutdown.key.missing-value
+$ nn-admin shutdown --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.shutdown.agent-id-file.missing-value
+$ nn-admin shutdown --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.shutdown.grace-secs.missing-value
+$ nn-admin shutdown --grace-secs
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--grace-secs <GRACE_SECS>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.shutdown.socket.missing-value
+$ nn-admin shutdown --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.force-posture.unknown-flag
+$ nn-admin force-posture --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+|   tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'
+|
+| Usage: nn-admin force-posture [OPTIONS] --key <KEY> <TARGET>
+|
+| For more information, try '--help'.
+
+### clap.force-posture.missing-required
+$ nn-admin force-posture
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|   <TARGET>
+|
+| Usage: nn-admin force-posture --key <KEY> <TARGET>
+|
+| For more information, try '--help'.
+
+### clap.force-posture.key.missing-value
+$ nn-admin force-posture --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.force-posture.agent-id-file.missing-value
+$ nn-admin force-posture --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.force-posture.socket.missing-value
+$ nn-admin force-posture --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.unknown-flag
+$ nn-admin rotate-keys --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin rotate-keys <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.unknown-subcommand
+$ nn-admin rotate-keys nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin rotate-keys <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.unknown-flag
+$ nn-admin rotate-keys add --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin rotate-keys add [OPTIONS] --new-pubkey <NEW_PUBKEY> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.missing-required
+$ nn-admin rotate-keys add
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --new-pubkey <NEW_PUBKEY>
+|   --key <KEY>
+|   --cosign-key <COSIGN_KEY>
+|
+| Usage: nn-admin rotate-keys add --new-pubkey <NEW_PUBKEY> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.stray-positional
+$ nn-admin rotate-keys add stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin rotate-keys add [OPTIONS] --new-pubkey <NEW_PUBKEY> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.new-pubkey.missing-value
+$ nn-admin rotate-keys add --new-pubkey
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--new-pubkey <NEW_PUBKEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.new-roles.missing-value
+$ nn-admin rotate-keys add --new-roles
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--new-roles <NEW_ROLES>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.key.missing-value
+$ nn-admin rotate-keys add --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.agent-id-file.missing-value
+$ nn-admin rotate-keys add --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.add.socket.missing-value
+$ nn-admin rotate-keys add --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.unknown-flag
+$ nn-admin rotate-keys revoke --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin rotate-keys revoke [OPTIONS] --fingerprint <FINGERPRINT> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.missing-required
+$ nn-admin rotate-keys revoke
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --fingerprint <FINGERPRINT>
+|   --key <KEY>
+|   --cosign-key <COSIGN_KEY>
+|
+| Usage: nn-admin rotate-keys revoke --fingerprint <FINGERPRINT> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.stray-positional
+$ nn-admin rotate-keys revoke stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin rotate-keys revoke [OPTIONS] --fingerprint <FINGERPRINT> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.fingerprint.missing-value
+$ nn-admin rotate-keys revoke --fingerprint
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--fingerprint <FINGERPRINT>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.key.missing-value
+$ nn-admin rotate-keys revoke --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.cosign-key.missing-value
+$ nn-admin rotate-keys revoke --cosign-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--cosign-key <COSIGN_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.agent-id-file.missing-value
+$ nn-admin rotate-keys revoke --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.rotate-keys.revoke.socket.missing-value
+$ nn-admin rotate-keys revoke --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.audit.unknown-flag
+$ nn-admin audit --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.audit.unknown-subcommand
+$ nn-admin audit nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.audit.read.unknown-flag
+$ nn-admin audit read --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin audit read [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.audit.read.path.missing-value
+$ nn-admin audit read --path
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--path <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.audit.read.since.missing-value
+$ nn-admin audit read --since
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--since <SINCE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.audit.read.json.given-twice
+$ nn-admin audit read --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin audit read [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.audit.read.json.with-a-value
+$ nn-admin audit read --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin audit read --json
+|
+| For more information, try '--help'.
+
+### clap.audit.verify.unknown-flag
+$ nn-admin audit verify --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin audit verify [OPTIONS] --from <FROM>
+|
+| For more information, try '--help'.
+
+### clap.audit.verify.missing-required
+$ nn-admin audit verify
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --from <FROM>
+|
+| Usage: nn-admin audit verify --from <FROM>
+|
+| For more information, try '--help'.
+
+### clap.audit.verify.stray-positional
+$ nn-admin audit verify stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin audit verify [OPTIONS] --from <FROM>
+|
+| For more information, try '--help'.
+
+### clap.audit.verify.from.missing-value
+$ nn-admin audit verify --from
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--from <FROM>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.audit.verify.agent-pubkey.missing-value
+$ nn-admin audit verify --agent-pubkey
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-pubkey <AGENT_PUBKEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.audit.verify.agent-sig-key.missing-value
+$ nn-admin audit verify --agent-sig-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-sig-key <AGENT_SIG_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.audit.verify.min-seq.missing-value
+$ nn-admin audit verify --min-seq
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--min-seq <MIN_SEQ>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.chain.unknown-flag
+$ nn-admin chain --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin chain <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.chain.unknown-subcommand
+$ nn-admin chain nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin chain <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.chain.verify.unknown-flag
+$ nn-admin chain verify --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin chain verify [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.chain.verify.state-dir.missing-value
+$ nn-admin chain verify --state-dir
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--state-dir <STATE_DIR>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.chain.verify.audit-log.missing-value
+$ nn-admin chain verify --audit-log
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--audit-log <AUDIT_LOG>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.chain.verify.heads.missing-value
+$ nn-admin chain verify --heads
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--heads <HEADS>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.chain.verify.agent-pubkey.missing-value
+$ nn-admin chain verify --agent-pubkey
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-pubkey <AGENT_PUBKEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.chain.verify.agent-sig-key.missing-value
+$ nn-admin chain verify --agent-sig-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-sig-key <AGENT_SIG_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.unknown-flag
+$ nn-admin fim --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin fim <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.fim.unknown-subcommand
+$ nn-admin fim nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin fim <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.fim.baseline.unknown-flag
+$ nn-admin fim baseline --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin fim baseline [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.baseline.missing-required
+$ nn-admin fim baseline
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin fim baseline --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.baseline.stray-positional
+$ nn-admin fim baseline stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin fim baseline [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.baseline.key.missing-value
+$ nn-admin fim baseline --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.baseline.agent-id-file.missing-value
+$ nn-admin fim baseline --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.baseline.socket.missing-value
+$ nn-admin fim baseline --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.report.unknown-flag
+$ nn-admin fim report --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin fim report [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.report.missing-required
+$ nn-admin fim report
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin fim report --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.report.stray-positional
+$ nn-admin fim report stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin fim report [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.report.key.missing-value
+$ nn-admin fim report --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.report.since.missing-value
+$ nn-admin fim report --since
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--since <SINCE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.report.agent-id-file.missing-value
+$ nn-admin fim report --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.report.socket.missing-value
+$ nn-admin fim report --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.status.unknown-flag
+$ nn-admin fim status --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin fim status [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.status.missing-required
+$ nn-admin fim status
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin fim status --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.status.stray-positional
+$ nn-admin fim status stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin fim status [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.fim.status.key.missing-value
+$ nn-admin fim status --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.status.agent-id-file.missing-value
+$ nn-admin fim status --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.fim.status.socket.missing-value
+$ nn-admin fim status --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.unknown-flag
+$ nn-admin canary --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.canary.unknown-subcommand
+$ nn-admin canary nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin canary <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.unknown-flag
+$ nn-admin canary deploy --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary deploy [OPTIONS] --name <NAME> --key <KEY> <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.unknown-subcommand
+$ nn-admin canary deploy nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin canary deploy [OPTIONS] --name <NAME> --key <KEY> <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.file.unknown-flag
+$ nn-admin canary deploy file --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> file --path <PATH>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.file.missing-required
+$ nn-admin canary deploy file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --path <PATH>
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> file --path <PATH>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.file.stray-positional
+$ nn-admin canary deploy file stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> file --path <PATH>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.file.path.missing-value
+$ nn-admin canary deploy file --path
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--path <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.process.unknown-flag
+$ nn-admin canary deploy process --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> process --path <PATH> --fake-arg0 <FAKE_ARG0>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.process.missing-required
+$ nn-admin canary deploy process
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --path <PATH>
+|   --fake-arg0 <FAKE_ARG0>
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> process --path <PATH> --fake-arg0 <FAKE_ARG0>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.process.stray-positional
+$ nn-admin canary deploy process stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> process --path <PATH> --fake-arg0 <FAKE_ARG0>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.process.path.missing-value
+$ nn-admin canary deploy process --path
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--path <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.process.fake-arg0.missing-value
+$ nn-admin canary deploy process --fake-arg0
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--fake-arg0 <FAKE_ARG0>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.network.unknown-flag
+$ nn-admin canary deploy network --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> network --bind-addr <BIND_ADDR> --bind-port <BIND_PORT>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.network.missing-required
+$ nn-admin canary deploy network
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --bind-addr <BIND_ADDR>
+|   --bind-port <BIND_PORT>
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> network --bind-addr <BIND_ADDR> --bind-port <BIND_PORT>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.network.stray-positional
+$ nn-admin canary deploy network stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> network --bind-addr <BIND_ADDR> --bind-port <BIND_PORT>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.network.bind-addr.missing-value
+$ nn-admin canary deploy network --bind-addr
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--bind-addr <BIND_ADDR>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.network.bind-port.missing-value
+$ nn-admin canary deploy network --bind-port
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--bind-port <BIND_PORT>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.credential.unknown-flag
+$ nn-admin canary deploy credential --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> credential --path <PATH> --cred-family <CRED_FAMILY>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.credential.missing-required
+$ nn-admin canary deploy credential
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --path <PATH>
+|   --cred-family <CRED_FAMILY>
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> credential --path <PATH> --cred-family <CRED_FAMILY>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.credential.stray-positional
+$ nn-admin canary deploy credential stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> credential --path <PATH> --cred-family <CRED_FAMILY>
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.credential.path.missing-value
+$ nn-admin canary deploy credential --path
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--path <PATH>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.deploy.credential.cred-family.missing-value
+$ nn-admin canary deploy credential --cred-family
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--cred-family <CRED_FAMILY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.list.unknown-flag
+$ nn-admin canary list --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary list [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.list.missing-required
+$ nn-admin canary list
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin canary list --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.list.stray-positional
+$ nn-admin canary list stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin canary list [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.list.key.missing-value
+$ nn-admin canary list --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.list.agent-id-file.missing-value
+$ nn-admin canary list --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.list.socket.missing-value
+$ nn-admin canary list --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.burn.unknown-flag
+$ nn-admin canary burn --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary burn [OPTIONS] --canary-id <CANARY_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.burn.missing-required
+$ nn-admin canary burn
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --canary-id <CANARY_ID>
+|   --key <KEY>
+|
+| Usage: nn-admin canary burn --canary-id <CANARY_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.burn.stray-positional
+$ nn-admin canary burn stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin canary burn [OPTIONS] --canary-id <CANARY_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.burn.canary-id.missing-value
+$ nn-admin canary burn --canary-id
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--canary-id <CANARY_ID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.burn.key.missing-value
+$ nn-admin canary burn --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.burn.agent-id-file.missing-value
+$ nn-admin canary burn --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.burn.socket.missing-value
+$ nn-admin canary burn --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.refresh.unknown-flag
+$ nn-admin canary refresh --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin canary refresh [OPTIONS] --canary-id <CANARY_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.refresh.missing-required
+$ nn-admin canary refresh
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --canary-id <CANARY_ID>
+|   --key <KEY>
+|
+| Usage: nn-admin canary refresh --canary-id <CANARY_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.refresh.stray-positional
+$ nn-admin canary refresh stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin canary refresh [OPTIONS] --canary-id <CANARY_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.canary.refresh.canary-id.missing-value
+$ nn-admin canary refresh --canary-id
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--canary-id <CANARY_ID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.refresh.key.missing-value
+$ nn-admin canary refresh --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.refresh.agent-id-file.missing-value
+$ nn-admin canary refresh --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.canary.refresh.socket.missing-value
+$ nn-admin canary refresh --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.unknown-flag
+$ nn-admin net --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin net <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.net.unknown-subcommand
+$ nn-admin net nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin net <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.net.status.unknown-flag
+$ nn-admin net status --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin net status [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.net.status.socket.missing-value
+$ nn-admin net status --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.status.json.given-twice
+$ nn-admin net status --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin net status [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.net.status.json.with-a-value
+$ nn-admin net status --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin net status --json
+|
+| For more information, try '--help'.
+
+### clap.net.status.key.missing-value
+$ nn-admin net status --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.status.agent-id-file.missing-value
+$ nn-admin net status --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.flows.unknown-flag
+$ nn-admin net flows --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin net flows [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.flows.missing-required
+$ nn-admin net flows
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin net flows --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.flows.stray-positional
+$ nn-admin net flows stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin net flows [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.flows.key.missing-value
+$ nn-admin net flows --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.flows.since-unix.missing-value
+$ nn-admin net flows --since-unix
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--since-unix <SINCE_UNIX>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.flows.agent-id-file.missing-value
+$ nn-admin net flows --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.flows.socket.missing-value
+$ nn-admin net flows --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.listeners.unknown-flag
+$ nn-admin net listeners --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin net listeners [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.listeners.missing-required
+$ nn-admin net listeners
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin net listeners --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.listeners.stray-positional
+$ nn-admin net listeners stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin net listeners [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.listeners.key.missing-value
+$ nn-admin net listeners --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.listeners.agent-id-file.missing-value
+$ nn-admin net listeners --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.listeners.socket.missing-value
+$ nn-admin net listeners --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.resolve.unknown-flag
+$ nn-admin net resolve --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin net resolve [OPTIONS] --ip <IP> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.resolve.missing-required
+$ nn-admin net resolve
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --ip <IP>
+|   --key <KEY>
+|
+| Usage: nn-admin net resolve --ip <IP> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.resolve.stray-positional
+$ nn-admin net resolve stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin net resolve [OPTIONS] --ip <IP> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.resolve.key.missing-value
+$ nn-admin net resolve --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.resolve.agent-id-file.missing-value
+$ nn-admin net resolve --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.resolve.socket.missing-value
+$ nn-admin net resolve --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.fingerprint.unknown-flag
+$ nn-admin net fingerprint --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin net fingerprint [OPTIONS] --flow-id <FLOW_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.fingerprint.missing-required
+$ nn-admin net fingerprint
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --flow-id <FLOW_ID>
+|   --key <KEY>
+|
+| Usage: nn-admin net fingerprint --flow-id <FLOW_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.fingerprint.stray-positional
+$ nn-admin net fingerprint stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin net fingerprint [OPTIONS] --flow-id <FLOW_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.net.fingerprint.flow-id.missing-value
+$ nn-admin net fingerprint --flow-id
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--flow-id <FLOW_ID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.fingerprint.key.missing-value
+$ nn-admin net fingerprint --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.fingerprint.agent-id-file.missing-value
+$ nn-admin net fingerprint --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.net.fingerprint.socket.missing-value
+$ nn-admin net fingerprint --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.unknown-flag
+$ nn-admin trusted-installer-grant --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin trusted-installer-grant [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.missing-required
+$ nn-admin trusted-installer-grant
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin trusted-installer-grant --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.stray-positional
+$ nn-admin trusted-installer-grant stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin trusted-installer-grant [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.key.missing-value
+$ nn-admin trusted-installer-grant --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.window-secs.missing-value
+$ nn-admin trusted-installer-grant --window-secs
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--window-secs <WINDOW_SECS>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.agent-id-file.missing-value
+$ nn-admin trusted-installer-grant --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.trusted-installer-grant.socket.missing-value
+$ nn-admin trusted-installer-grant --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.unknown-flag
+$ nn-admin response --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin response <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.response.unknown-subcommand
+$ nn-admin response nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin response <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.response.status.unknown-flag
+$ nn-admin response status --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin response status [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.status.missing-required
+$ nn-admin response status
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin response status --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.status.stray-positional
+$ nn-admin response status stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin response status [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.status.key.missing-value
+$ nn-admin response status --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.status.agent-id-file.missing-value
+$ nn-admin response status --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.status.socket.missing-value
+$ nn-admin response status --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.release.unknown-flag
+$ nn-admin response release --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin response release [OPTIONS] --pid <PID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.release.missing-required
+$ nn-admin response release
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --pid <PID>
+|   --key <KEY>
+|
+| Usage: nn-admin response release --pid <PID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.release.stray-positional
+$ nn-admin response release stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin response release [OPTIONS] --pid <PID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.release.pid.missing-value
+$ nn-admin response release --pid
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--pid <PID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.release.key.missing-value
+$ nn-admin response release --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.release.agent-id-file.missing-value
+$ nn-admin response release --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.release.socket.missing-value
+$ nn-admin response release --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.restore.unknown-flag
+$ nn-admin response restore --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin response restore [OPTIONS] --vault-id <VAULT_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.restore.missing-required
+$ nn-admin response restore
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --vault-id <VAULT_ID>
+|   --key <KEY>
+|
+| Usage: nn-admin response restore --vault-id <VAULT_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.restore.stray-positional
+$ nn-admin response restore stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin response restore [OPTIONS] --vault-id <VAULT_ID> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.response.restore.vault-id.missing-value
+$ nn-admin response restore --vault-id
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--vault-id <VAULT_ID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.restore.to.missing-value
+$ nn-admin response restore --to
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--to <TO>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.restore.key.missing-value
+$ nn-admin response restore --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.restore.agent-id-file.missing-value
+$ nn-admin response restore --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.response.restore.socket.missing-value
+$ nn-admin response restore --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.remediate.unknown-flag
+$ nn-admin remediate --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin remediate <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.remediate.unknown-subcommand
+$ nn-admin remediate nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin remediate <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.unknown-flag
+$ nn-admin remediate ransomware --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin remediate ransomware [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.missing-required
+$ nn-admin remediate ransomware
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --key <KEY>
+|
+| Usage: nn-admin remediate ransomware --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.stray-positional
+$ nn-admin remediate ransomware stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin remediate ransomware [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.pid.missing-value
+$ nn-admin remediate ransomware --pid
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--pid <PID>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.since.missing-value
+$ nn-admin remediate ransomware --since
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--since <SINCE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.dry-run.given-twice
+$ nn-admin remediate ransomware --dry-run --dry-run
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--dry-run' cannot be used multiple times
+|
+| Usage: nn-admin remediate ransomware [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.dry-run.with-a-value
+$ nn-admin remediate ransomware --dry-run=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--dry-run' found; no more were expected
+|
+| Usage: nn-admin remediate ransomware --key <KEY> --dry-run
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.key.missing-value
+$ nn-admin remediate ransomware --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.agent-id-file.missing-value
+$ nn-admin remediate ransomware --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.socket.missing-value
+$ nn-admin remediate ransomware --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.json.given-twice
+$ nn-admin remediate ransomware --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin remediate ransomware [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.remediate.ransomware.json.with-a-value
+$ nn-admin remediate ransomware --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin remediate ransomware --key <KEY> --json
+|
+| For more information, try '--help'.
+
+### clap.config.unknown-flag
+$ nn-admin config --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin config <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.config.unknown-subcommand
+$ nn-admin config nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin config <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.unknown-flag
+$ nn-admin config overlay --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin config overlay <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.unknown-subcommand
+$ nn-admin config overlay nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin config overlay <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.set.unknown-flag
+$ nn-admin config overlay set --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+|   tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'
+|
+| Usage: nn-admin config overlay set [OPTIONS] --file <FILE> --key <KEY> <KIND>
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.set.missing-required
+$ nn-admin config overlay set
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --file <FILE>
+|   --key <KEY>
+|   <KIND>
+|
+| Usage: nn-admin config overlay set --file <FILE> --key <KEY> <KIND>
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.set.file.missing-value
+$ nn-admin config overlay set --file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--file <FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.set.key.missing-value
+$ nn-admin config overlay set --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.set.cosign-key.missing-value
+$ nn-admin config overlay set --cosign-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--cosign-key <COSIGN_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.set.agent-id-file.missing-value
+$ nn-admin config overlay set --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.set.socket.missing-value
+$ nn-admin config overlay set --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.sign.unknown-flag
+$ nn-admin config overlay sign --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+|   tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'
+|
+| Usage: nn-admin config overlay sign [OPTIONS] --file <FILE> --key <KEY> <KIND>
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.sign.missing-required
+$ nn-admin config overlay sign
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --file <FILE>
+|   --key <KEY>
+|   <KIND>
+|
+| Usage: nn-admin config overlay sign --file <FILE> --key <KEY> <KIND>
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.sign.file.missing-value
+$ nn-admin config overlay sign --file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--file <FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.sign.key.missing-value
+$ nn-admin config overlay sign --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.sign.cosign-key.missing-value
+$ nn-admin config overlay sign --cosign-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--cosign-key <COSIGN_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.sign.agent-id-file.missing-value
+$ nn-admin config overlay sign --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.sign.out.missing-value
+$ nn-admin config overlay sign --out
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--out <OUT>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.status.unknown-flag
+$ nn-admin config overlay status --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin config overlay status [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.status.dir.missing-value
+$ nn-admin config overlay status --dir
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--dir <DIR>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.status.admin-pub.missing-value
+$ nn-admin config overlay status --admin-pub
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--admin-pub <ADMIN_PUB>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.status.agent-id-file.missing-value
+$ nn-admin config overlay status --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.status.audit-log.missing-value
+$ nn-admin config overlay status --audit-log
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--audit-log <AUDIT_LOG>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.config.overlay.status.agent-sig-key.missing-value
+$ nn-admin config overlay status --agent-sig-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-sig-key <AGENT_SIG_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.unknown-flag
+$ nn-admin policy --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin policy <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.policy.unknown-subcommand
+$ nn-admin policy nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin policy <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.policy.show.unknown-flag
+$ nn-admin policy show --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin policy show [OPTIONS]
+|
+| For more information, try '--help'.
+
+### clap.policy.show.file.missing-value
+$ nn-admin policy show --file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--file <FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.show.admin-pub.missing-value
+$ nn-admin policy show --admin-pub
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--admin-pub <ADMIN_PUB>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.show.agent-id-file.missing-value
+$ nn-admin policy show --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.show.audit-log.missing-value
+$ nn-admin policy show --audit-log
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--audit-log <AUDIT_LOG>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.show.agent-sig-key.missing-value
+$ nn-admin policy show --agent-sig-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-sig-key <AGENT_SIG_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.set.unknown-flag
+$ nn-admin policy set --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin policy set [OPTIONS] --file <FILE> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.policy.set.missing-required
+$ nn-admin policy set
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --file <FILE>
+|   --key <KEY>
+|
+| Usage: nn-admin policy set --file <FILE> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.policy.set.stray-positional
+$ nn-admin policy set stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin policy set [OPTIONS] --file <FILE> --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.policy.set.file.missing-value
+$ nn-admin policy set --file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--file <FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.set.key.missing-value
+$ nn-admin policy set --key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--key <KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.set.cosign-key.missing-value
+$ nn-admin policy set --cosign-key
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--cosign-key <COSIGN_KEY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.set.agent-id-file.missing-value
+$ nn-admin policy set --agent-id-file
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--agent-id-file <AGENT_ID_FILE>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.set.socket.missing-value
+$ nn-admin policy set --socket
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--socket <SOCKET>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.test.unknown-flag
+$ nn-admin policy test --no-such-flag
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin policy test [OPTIONS] --events <EVENTS>
+|
+| For more information, try '--help'.
+
+### clap.policy.test.missing-required
+$ nn-admin policy test
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   --events <EVENTS>
+|
+| Usage: nn-admin policy test --events <EVENTS>
+|
+| For more information, try '--help'.
+
+### clap.policy.test.stray-positional
+$ nn-admin policy test stray-argument
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'stray-argument' found
+|
+| Usage: nn-admin policy test [OPTIONS] --events <EVENTS>
+|
+| For more information, try '--help'.
+
+### clap.policy.test.policy.missing-value
+$ nn-admin policy test --policy
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--policy <POLICY>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.test.config-dir.missing-value
+$ nn-admin policy test --config-dir
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: a value is required for '--config-dir <CONFIG_DIR>' but none was supplied
+|
+| For more information, try '--help'.
+
+### clap.policy.test.json.given-twice
+$ nn-admin policy test --json --json
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the argument '--json' cannot be used multiple times
+|
+| Usage: nn-admin policy test [OPTIONS] --events <EVENTS>
+|
+| For more information, try '--help'.
+
+### clap.policy.test.json.with-a-value
+$ nn-admin policy test --json=yes
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected value 'yes' for '--json' found; no more were expected
+|
+| Usage: nn-admin policy test --events <EVENTS> --json
+|
+| For more information, try '--help'.
+
+### clap.value.detections.limit-not-a-number
+$ nn-admin detections --limit many --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'many' for '--limit <LIMIT>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.detections.limit-negative
+$ nn-admin detections --limit -1 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '-1' found
+|
+| Usage: nn-admin detections [OPTIONS] --key <KEY>
+|
+| For more information, try '--help'.
+
+### clap.value.detections.limit-over-u32
+$ nn-admin detections --limit 4294967296 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value '4294967296' for '--limit <LIMIT>': 4294967296 is not in 0..=4294967295
+|
+| For more information, try '--help'.
+
+### clap.value.detections.since-not-a-number
+$ nn-admin detections --since 2025-06-15 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value '2025-06-15' for '--since <SINCE>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.detections.until-not-a-number
+$ nn-admin detections --until later --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'later' for '--until <UNTIL>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.detections.min-severity-unknown
+$ nn-admin detections --min-severity extreme --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'extreme' for '--min-severity <MIN_SEVERITY>'
+|   [possible values: low, medium, high, critical]
+|
+| For more information, try '--help'.
+
+### clap.value.detections.min-severity-case
+$ nn-admin detections --min-severity High --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'High' for '--min-severity <MIN_SEVERITY>'
+|   [possible values: low, medium, high, critical]
+|
+|   tip: a similar value exists: 'high'
+|
+| For more information, try '--help'.
+
+### clap.value.detections.status-unknown
+$ nn-admin detections --status closed --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'closed' for '--status <STATUS>'
+|   [possible values: open, acknowledged, investigating, resolved, false-positive]
+|
+| For more information, try '--help'.
+
+### clap.value.detections.sensor-unknown
+$ nn-admin detections --sensor gpu --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'gpu' for '--sensor <SENSOR>'
+|   [possible values: exec, file, module-load, network, anti-tamper, canary]
+|
+| For more information, try '--help'.
+
+### clap.value.detection-set-status.id-not-a-number
+$ nn-admin detection-set-status --id x --status resolved --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'x' for '--id <ID>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.detection-set-status.status-open
+$ nn-admin detection-set-status --id 1 --status open --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'open' for '--status <STATUS>'
+|   [possible values: acknowledged, investigating, resolved, false-positive]
+|
+| For more information, try '--help'.
+
+### clap.value.shutdown.grace-negative
+$ nn-admin shutdown --cosign-key key-b --grace-secs -5 --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '-5' found
+|
+| Usage: nn-admin shutdown [OPTIONS] --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| For more information, try '--help'.
+
+### clap.value.force-posture.target-unknown
+$ nn-admin force-posture panic --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'panic' for '<TARGET>'
+|   [possible values: observing, alerted, engaged, combat]
+|
+| For more information, try '--help'.
+
+### clap.value.force-posture.target-missing
+$ nn-admin force-posture --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: the following required arguments were not provided:
+|   <TARGET>
+|
+| Usage: nn-admin force-posture --key <KEY> --agent-id-file <AGENT_ID_FILE> --socket <SOCKET> <TARGET>
+|
+| For more information, try '--help'.
+
+### clap.value.trusted-installer-grant.window-not-a-number
+$ nn-admin trusted-installer-grant --window-secs ten --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'ten' for '--window-secs <WINDOW_SECS>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.response-release.pid-not-a-number
+$ nn-admin response release --pid init --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'init' for '--pid <PID>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.remediate-ransomware.pid-not-a-number
+$ nn-admin remediate ransomware --pid x --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'x' for '--pid <PID>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.net-flows.since-unix-not-a-number
+$ nn-admin net flows --since-unix now --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'now' for '--since-unix <SINCE_UNIX>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.fim-report.since-not-a-number
+$ nn-admin fim report --since yesterday --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'yesterday' for '--since <SINCE>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.canary-deploy.bind-port-over-u16
+$ nn-admin canary deploy --name n --key key-a --agent-id-file agent_id --socket admin.sock network --bind-addr 0.0.0.0 --bind-port 70000
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value '70000' for '--bind-port <BIND_PORT>': 70000 is not in 0..=65535
+|
+| For more information, try '--help'.
+
+### clap.value.canary-deploy.kind-missing
+$ nn-admin canary deploy --name n --key key-a --agent-id-file agent_id --socket admin.sock
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: 'nn-admin canary deploy' requires a subcommand but one was not provided
+|   [subcommands: file, process, network, credential, help]
+|
+| Usage: nn-admin canary deploy [OPTIONS] --name <NAME> --key <KEY> <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.value.canary-deploy.kind-unknown
+$ nn-admin canary deploy --name n --key key-a --agent-id-file agent_id --socket admin.sock smtp
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'smtp'
+|
+| Usage: nn-admin canary deploy [OPTIONS] --name <NAME> --key <KEY> <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.value.audit-verify.min-seq-not-a-number
+$ nn-admin audit verify --from audit.log --min-seq first
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'first' for '--min-seq <MIN_SEQ>': invalid digit found in string
+|
+| For more information, try '--help'.
+
+### clap.value.chain-verify.log-unknown
+$ nn-admin chain verify --log journal
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'journal' for '--log <LOG>'
+|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, all]
+|
+| For more information, try '--help'.
+
+### clap.value.chain-verify.log-case
+$ nn-admin chain verify --log Audit
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: invalid value 'Audit' for '--log <LOG>'
+|   [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, all]
+|
+|   tip: a similar value exists: 'audit'
+|
+| For more information, try '--help'.
+
+### clap.value.top.typo-suggests
+$ nn-admin statu
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'statu'
+|
+|   tip: a similar subcommand exists: 'status'
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.value.top.typo-nested-suggests
+$ nn-admin audit verfy
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'verfy'
+|
+|   tip: a similar subcommand exists: 'verify'
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.value.top.unknown
+$ nn-admin nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+(the same bytes as in clap.root.unknown-subcommand)
+
+### clap.value.top.debug-not-in-this-build
+$ nn-admin debug force-posture combat
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'debug'
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.value.top.double-dash
+$ nn-admin -- status
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument 'status' found
+|
+|   tip: subcommand 'status' exists; to use it, remove the '--' before it
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.value.top.empty-argument
+$ nn-admin ''
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand ''
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+
+### clap.value.top.not-utf8-like
+$ nn-admin 'stätus'
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'stätus'
+|
+|   tip: a similar subcommand exists: 'status'
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+

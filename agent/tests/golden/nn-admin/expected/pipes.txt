@@ -1,0 +1,686 @@
+# nn-admin output matrix: pipes (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### pipe.stdout.help
+$ nn-admin --help
+stdout: a pipe closed before the start
+exit: 0
+--- stderr
+(empty)
+
+### pipe.stderr.help
+$ nn-admin --help
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| NorthNarrow admin CLI
+|
+| Usage: nn-admin <COMMAND>
+|
+| Commands:
+|   init                     Generate a fresh Ed25519 keypair, install the public half into the agent's admin.pub, and write the private half to disk for the admin to safeguard. NB: V1 has no air-gapped split flow — keep the private key on a hardware token or removable medium and use `nn-admin unlock --key` only on machines you trust
+|   unlock                   Release COMBAT: sign an `unlock` payload over a server-issued challenge (with this install's agent_id and the time) and submit it. Succeeds only when the agent tore the isolation down and read the tables back clear; otherwise exit 9 with what is still in place (the posture stays COMBAT)
+|   status                   Print current posture + network isolation state. Add --json to get a machine-readable response for scripting. Without --key the agent answers the posture, the isolation, the last admin action and the COMBAT stage and lock (external audit ASK-009); --key signs the request and adds the telemetry: ring drops and rejected records, the response mode (detect-only), the COMBAT evidence gaps
+|   capabilities             Lab PR 218: this boot's signed capability manifest — kernel, BTF, active LSMs, deny hooks and their self-test, each sensor's attach point, host hardening, degradations, the trust level — with the row of the audit chain that signs it. A key with `audit-read` or `telemetry-read` (the signed telemetry read). Exit 1 when the agent has not signed one yet
+|   host-check               Host hardening checks (Tappa 10.8): kernel lockdown, module signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, single bpffs mount — the settings that keep root from rewriting the kernel at runtime, which is the only way around the agent's anti-tamper. Reads /sys and /proc only; no socket needed. Exit 0 with no warnings, 2 with warnings (`--json` for scripting)
+|   detections               Tappa 9.0.b — read the last N persisted detections (newest-first) over the admin socket. Requires a key carrying the low-privilege `telemetry-read` role — read-only telemetry, no COMBAT/control authority. The records stream as JSONL on stdout (so `| jq` works); a summary goes to stderr
+|   detection-set-status     Tappa 9.0.c — change a persisted detection's triage status over the admin socket. Requires a key carrying the `triage` role (which also subsumes `telemetry-read`, so a triage key can both read detections and re-status them). Event-sourced: the agent appends a signed status-change event to a separate chain and never mutates the detection log; the new status surfaces on the next `nn-admin detections` read
+|   verify-keys              Parse the installed admin.pub, count valid keys, print fingerprints. Local-only — does not touch the agent socket
+|   shutdown                 Tappa 8 A9 — signed agent shutdown (design §10)
+|   force-posture            Tappa 8 A10 — production signed force-posture (design §4 + §12.2)
+|   rotate-keys              Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change
+|   audit                    Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`
+|   chain                    External audit NN-AUD-112 (lab PR 160) — verify every signed chain in full, offline: the audit log and the canary chains (hashes, signatures, links, row numbers), the rotating logs with their archives, manifest and checkpoints, then the files against the signed head anchor. Exits 8 when a chain is broken or shorter than its anchored head, 0 when everything verifies. Reads the files directly (root: they are 0600 or under 0700 directories)
+|   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
+|   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
+|   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|   trusted-installer-grant  FIM-009 self-upgrade (§15.1) — arm the trusted-installer override for an in-place agent upgrade. Submits a 1-of-N (M=1) quorum-signed grant; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's FS pin is suspended (so install.sh can replace the protected binary) AND a write to the agent's OWN systemd units is downgraded from kill to an audit Log. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
+|   response                 External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
+|   remediate                Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|   config                   Tappa 10.8 — operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
+|   policy                   Lab PR 236 — the signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
+|   help                     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help     Print help
+|   -V, --version  Print version
+
+### pipe.stdout.help-sub
+$ nn-admin help audit read
+stdout: a pipe closed before the start
+exit: 0
+--- stderr
+(empty)
+
+### pipe.stderr.help-sub
+$ nn-admin help audit read
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| Stream the audit log to stdout, optionally filtered by timestamp. Default output is a compact human-readable summary; `--json` emits one canonical JSON object per line (matches the on-disk JSONL exactly).
+|
+| Who acted: the key fingerprint (`key_fp`, `cosigner_fps`) is the operator's identity. `client_pid`/`client_uid` come from the kernel (SO_PEERCRED); `client_comm` is the name the connecting process gave itself, which any process chooses; `client_exe` (rows from lab PR 179 on) is the program the kernel says it ran.
+|
+| A line that is not an audit row (cut, not JSON, not UTF-8, over 16 MiB) is skipped and named on stderr with its line number; every row before and after it is printed, and the exit code is 8. The rows are not verified here: `audit verify` does that.
+|
+| Usage: nn-admin audit read [OPTIONS]
+|
+| Options:
+|       --path <PATH>
+|           Path to the audit log file (default /etc/northnarrow/audit.log)
+|           
+|           [default: /etc/northnarrow/audit.log]
+|
+|       --since <SINCE>
+|           Optional ISO-8601 / RFC-3339 timestamp threshold; entries whose `ts` is lexicographically `>=` this value are kept (the field's fixed-width format makes string comparison equivalent to instant comparison)
+|
+|       --json
+|           Emit one canonical JSON object per line instead of the human summary
+|
+|   -h, --help
+|           Print help (see a summary with '-h')
+
+### pipe.stdout.version
+$ nn-admin --version
+stdout: a pipe closed before the start
+exit: 0
+--- stderr
+(empty)
+
+### pipe.stderr.version
+$ nn-admin --version
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| nn-admin 0.0.1
+
+### pipe.stdout.host-check
+$ nn-admin host-check
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.host-check
+$ nn-admin host-check
+stderr: a pipe closed before the start
+exit: <0, or 2 with the host's warnings: checked>
+--- stdout
+| <status>  BPF LSM in the active LSM list   <value>
+| <status>  Kernel lockdown mode             <value>
+| <status>  Unprivileged BPF disabled        <value>
+| <status>  Kernel module signature enforced <value>
+| <status>  UEFI Secure Boot                 <value>
+| <status>  IMA measurement / appraisal active <value>
+| <status>  kexec disabled                   <value>
+| <status>  bpffs mounted once at /sys/fs/bpf <value>
+| <status>  admin private key off the host   <value>
+| <status>  nftables for COMBAT containment  <value>
+| <status>  release verified at install      <value>
+| 11 check(s), <warnings> warning(s)<, and the anti-tamper note when there are any>
+
+### pipe.stdout.host-check-json
+$ nn-admin host-check --json
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.host-check-json
+$ nn-admin host-check --json
+stderr: a pipe closed before the start
+exit: <0, or 2 with the host's warnings: checked>
+--- stdout
+| [
+|   {
+|     "id": "bpf_lsm",
+|     "name": "BPF LSM in the active LSM list",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "append `bpf` to the LSM list the kernel runs (never a fixed `lsm=` list: it can switch SELinux or AppArmor off; docs/operator/KERNEL_COMPATIBILITY.md, \"Enabling the bpf LSM\") and reboot"
+|   },
+|   {
+|     "id": "lockdown",
+|     "name": "Kernel lockdown mode",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "boot with `lockdown=integrity` (Secure Boot enables it on most distros): blocks unsigned modules, kexec of unsigned kernels, /dev/mem and other runtime kernel modification by root"
+|   },
+|   {
+|     "id": "unprivileged_bpf",
+|     "name": "Unprivileged BPF disabled",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "`sysctl -w kernel.unprivileged_bpf_disabled=1` (persist in /etc/sysctl.d/) — only CAP_BPF/CAP_SYS_ADMIN may load BPF programs"
+|   },
+|   {
+|     "id": "module_sig_enforce",
+|     "name": "Kernel module signature enforced",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "boot with `module.sig_enforce=1` (or Secure Boot + lockdown, which forces it): an unsigned module is the classic way to blind a kernel sensor"
+|   },
+|   {
+|     "id": "secure_boot",
+|     "name": "UEFI Secure Boot",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "enable Secure Boot in firmware with the distro's shim (or your own keys): anchors the boot chain and turns on lockdown + module signing"
+|   },
+|   {
+|     "id": "ima",
+|     "name": "IMA measurement / appraisal active",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "boot with `ima_policy=tcb` (measure) or an appraise policy with signed binaries: makes a replaced agent binary fail before it runs"
+|   },
+|   {
+|     "id": "kexec_load_disabled",
+|     "name": "kexec disabled",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "`sysctl -w kernel.kexec_load_disabled=1` (one-way until reboot; persist in /etc/sysctl.d/) — kexec boots a different kernel without a reboot the sensor would notice"
+|   },
+|   {
+|     "id": "bpffs",
+|     "name": "bpffs mounted once at /sys/fs/bpf",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "mount bpffs once (`mount -t bpf bpf /sys/fs/bpf`, or the systemd sys-fs-bpf.mount unit) and investigate any extra bpffs mount"
+|   },
+|   {
+|     "id": "admin_key",
+|     "name": "admin private key off the host",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "move the admin private key offline (`mv <key> <offline media>`): on the host it lets root release COMBAT, open trusted-installer windows (the anti-tamper suspended) and sign overlays"
+|   },
+|   {
+|     "id": "nft",
+|     "name": "nftables for COMBAT containment",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "install nftables (`apt-get install nftables` / `dnf install nftables`); the agent runs the `nft` of /usr/sbin, /usr/bin, /sbin or /bin only, root's and writable by nobody else — without `nft` neither a BlockOutbound verdict nor the COMBAT soft egress block drops the offender's traffic (the agent records a signed subsystem_degraded at boot, and each episode records the failure and shortens INVESTIGATE)"
+|   },
+|   {
+|     "id": "install_provenance",
+|     "name": "release verified at install",
+|     "status": "<status>",
+|     "value": "<value>",
+|     "fix": "install from the release tarball (next to the tree, or `--tarball`) with `gh` or `cosign` for its tag-bound attestation (install.sh refuses less without `--allow-unverified`): `checksums`, `manifest`, `source-tree`, `unverified` and `package` mean nothing proved where these binaries were built"
+|   }
+| ]
+
+### pipe.stdout.verify-keys
+$ nn-admin verify-keys --path admin.pub
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.verify-keys
+$ nn-admin verify-keys --path admin.pub
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| verify-keys: 2 valid key(s)
+|   730a5edc  all
+|   b28baab3  unlock,audit-read
+
+### pipe.stdout.audit-read
+$ nn-admin audit read --path audit.log
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.audit-read
+$ nn-admin audit read --path audit.log
+stderr: a pipe closed before the start
+exit: 141
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+
+### pipe.stdout.audit-read-json
+$ nn-admin audit read --path audit.log --json
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.audit-read-json
+$ nn-admin audit read --path audit.log --json
+stderr: a pipe closed before the start
+exit: 141
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+
+### pipe.stdout.audit-verify
+$ nn-admin audit verify --from audit.log --agent-sig-key agent.sig.key
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.audit-verify
+$ nn-admin audit verify --from audit.log --agent-sig-key agent.sig.key
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+
+### pipe.stdout.chain-verify
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.chain-verify
+$ nn-admin chain verify --state-dir . --audit-log audit.log --agent-sig-key agent.sig.key
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| OK      audit            audit.log: 3 rows, all numbered
+| OK      canary_registry  ./canaries.jsonl: 0 rows in the old format
+| OK      canary_access    ./canary_access.jsonl: 0 rows in the old format
+| OK      detections       ./detections/detections.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      status_events    ./detections/status_events.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      netflow          ./netflow.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      fim_drift        ./fim_drift.jsonl: 0 records, 0 archive(s) from seq 0, 0 checkpoint(s) reachable
+| OK      heads            chain_heads.json: no head anchor to compare with
+
+### pipe.stdout.overlay-status
+$ nn-admin config overlay status --dir . --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.overlay-status
+$ nn-admin config overlay status --dir . --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| rollback-floor           reset at the next start: the audit log is missing or empty while the agent signing key exists: the chain's history is gone — an overlay signed before it is not loaded
+| fim-paths                absent
+| process-comm-allowlist   absent
+| netflow-comm-allowlist   absent
+| netflow-blocklist        absent
+| netflow-ja3-blocklist    absent
+| mass-write-carveout      absent
+| escalation-allow         absent
+| combat-rules-v4          absent
+| combat-rules-v6          absent
+| combat-allow             absent
+| canary-readers           absent
+| cow-guard                absent
+| execq-hashes             absent
+| exec-policy              absent
+| rule-policy              absent
+
+### pipe.stdout.policy-show
+$ nn-admin policy show --file rule-policy.local --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.policy-show
+$ nn-admin policy show --file rule-policy.local --admin-pub admin.pub --agent-id-file agent_id --audit-log audit.log --agent-sig-key agent.sig.key
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| rule-policy.local: absent — the built-in defaults apply
+| source: built-in defaults
+| every rule: builtin (its own response; the held kills below held)
+| ransomware COMBAT without corroboration: off (built-in default)
+| legacy ceiling: a rule not set to enforce never runs more than the first-match engine ran on the same event (lifted per rule by `enforce <rule>`)
+| built-in held responses (given back by `enforce <rule>` for that rule):
+|   held: the kill of the shell's process tree (R020, lab PR 224)
+|   held: the kill of one process past the scan kill threshold (NN-L-NET-026, lab PR 224)
+|   held: the kill of one process past the brute-force kill threshold (NN-L-NET-027, lab PR 224)
+|   held: the kill for a flow to port 53 of a server that is no configured resolver (port 53 was exempt before lab PR 224)
+|   held: the kill of an allowlisted transfer tool whose lineage holds a precursor (exempt before lab PR 224)
+|   held: the kill of the ransomware actor's process tree (NN-L-IMP-001, lab PR 225)
+|   held: the kill of the staged program that asked a security tool off (NN-L-EVA, lab PR 225)
+|   held: the kill for a rename seen only as a watched directory's new entry (NN-L-FIM-010, a match added by lab PR 225)
+
+### pipe.stdout.policy-test
+$ nn-admin policy test --events events.json --config-dir empty
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.policy-test
+$ nn-admin policy test --events events.json --config-dir empty
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| policy: built-in defaults
+|    0  -
+|    1  -
+|    2  R020_ShellWithSocketStdio Log Critical pid 5700003  (held)
+|    3  R020_ShellWithSocketStdio Log Critical pid 5700011  (held)
+|    4  R020_ShellWithSocketStdio Log Critical pid 5700012  (held)
+|    5  -
+
+### pipe.stdout.policy-test-json
+$ nn-admin policy test --events events.json --config-dir empty --json
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+
+### pipe.stderr.policy-test-json
+$ nn-admin policy test --events events.json --config-dir empty --json
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| {"decision":null,"seq":0}
+| {"decision":null,"seq":1}
+| {"decision":{"action":"Log","category":"execution","file":"/usr/bin/bash","mitre":{"tactic":["TA0002","TA0011"],"technique":["T1059.004","T1095"]},"name":"Shell or interpreter with stdin/stdout on a network socket","pid":5700003,"reasoning":"/usr/bin/bash started with stdin/stdout on a tcp socket it or an ancestor connected out to 203.0.113.7:4444 — a reverse shell (T1059.004; channel T1095); kill the process tree [held back: the kill of the shell's process tree (R020, lab PR 224) — alert only, by default, until the signed per-rule response policy enables it]","rule":"R020_ShellWithSocketStdio","severity":"Critical","ts":3600001000000},"seq":2}
+| {"decision":{"action":"Log","category":"execution","file":"/usr/bin/python3","mitre":{"tactic":["TA0002","TA0011"],"technique":["T1059.004","T1095"]},"name":"Shell or interpreter with stdin/stdout on a network socket","pid":5700011,"reasoning":"/usr/bin/python3 started with stdin/stdout on a tcp socket it or an ancestor connected out to 203.0.113.7:4444 — a reverse shell (T1059.004; channel T1095); kill the process tree [held back: the kill of the shell's process tree (R020, lab PR 224) — alert only, by default, until the signed per-rule response policy enables it]","rule":"R020_ShellWithSocketStdio","severity":"Critical","ts":3610000000000},"seq":3}
+| {"decision":{"action":"Log","category":"execution","file":"/usr/bin/bash","mitre":{"tactic":["TA0002","TA0011"],"technique":["T1059.004","T1095"]},"name":"Shell or interpreter with stdin/stdout on a network socket","pid":5700012,"reasoning":"shell /usr/bin/bash spawned by a process whose stdin/stdout is a tcp socket connected out to 203.0.113.7:4444 — a reverse shell wrapped in a pseudo-terminal (the socket dup2'd onto the parent's stdio, T1059.004); kill the process tree [held back: the kill of the shell's process tree (R020, lab PR 224) — alert only, by default, until the signed per-rule response policy enables it]","rule":"R020_ShellWithSocketStdio","severity":"Critical","ts":3610002000000},"seq":4}
+| {"decision":null,"seq":5}
+
+### pipe.stdout.clap-error
+$ nn-admin audit --no-such-flag
+stdout: a pipe closed before the start
+exit: 2
+--- stderr
+| error: unexpected argument '--no-such-flag' found
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| For more information, try '--help'.
+
+### pipe.stderr.clap-error
+$ nn-admin audit --no-such-flag
+stderr: a pipe closed before the start
+exit: 2
+--- stdout
+(empty)
+
+### pipe.stdout.missing-key
+$ nn-admin unlock --key absent.key --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 5
+--- stderr
+| unlock: the signed unlock got no reply — an agent older than this nn-admin (before lab PR 217) does not know it: unlock it with the nn-admin of its own release: reading private key absent.key: No such file or directory (os error 2)
+
+### pipe.stderr.missing-key
+$ nn-admin unlock --key absent.key --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 141
+--- stdout
+(empty)
+
+### pipe.stdout.sock.status
+$ nn-admin status --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"Status":{}}
+< StatusResponse (observing)
+> (closed)
+
+### pipe.stderr.sock.status
+$ nn-admin status --socket admin.sock
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| posture           : Observing
+| network isolation : clear
+| combat stage      : (agent predates the field)
+| last admin action : (none since agent start)
+| telemetry         : withheld from the unsigned status (response mode, COMBAT evidence, ring drops and rejected records, deny fail-opens, trust level, degradations) — `nn-admin status --key <key>` with `audit-read` or `telemetry-read` reads them, signed
+| host hardening : 11 check(s), <the host's warnings: checked>
+--- agent
+connection 1
+> {"Status":{}}
+< StatusResponse (observing)
+> (closed)
+
+### pipe.stdout.sock.status-key
+$ nn-admin status --key key-a --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"TelemetryStatusRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"TelemetryStatus":{}},"nonce":"<challenge>","op":25,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< TelemetryStatusResponse (full)
+> (closed)
+
+### pipe.stderr.sock.status-key
+$ nn-admin status --key key-a --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| posture           : Engaged
+| network isolation : ENGAGED (IPv4 isolated, IPv6 clear)
+| combat stage      : investigate
+| response mode     : DETECT-ONLY (config file) — no response action and no COMBAT isolation touch the system
+| combat evidence   : 1 stage transition(s) not written to the signed audit log when they happened — 2 queued for a late write, 0 dropped (never written); see the agent ERRORs
+| trust level       : L2 (enforcing and verified, degraded) — BTF offsets drifted: 5
+| degradations      : 1 this run (each signed in the audit log)
+|   - bpf_lsm: anti-tamper: no enforcement
+| exploit guard     : strict detect (experimental) — 12 calls judged, 30 skipped (fully privileged), 1 anomalies, 0 killed; 2 task(s) untracked (task map full: their calls are not judged)
+| exec quarantine   : observe — held 1, resumed 1, killed 0 (0 quarantined), default policy 0, known identity 3, known content 2, not held 9, scanner deaths 0, scripts refused 0
+| ransomware        : 0 decisive (NN-L-IMP-001), 4 shapes counted, 1 trusted bursts not counted, 8 entropy samplings
+| security tools    : 1 switched off (NN-L-EVA-*), 1 sanctioned (package, admin session); 6 tool processes watched for signals
+| exec policy       : audit — denied 0, would deny 2, quarantine 0 (1 inactive), environment denied 0 / reported 1, mappings denied 0 / reported 0
+| last admin action : 42s ago
+| ringbuf drops     : 3 (exec 2, file 1) — events lost since boot, see the agent WARNs
+| ringbuf rejected  : 1 (net 1) — malformed records since boot (a desynced ring), see the agent WARNs
+| deny fail-open    : 2 (file_open 2) — operations a deny hook let through undecided since boot (a kernel read it needed failed); see the agent WARNs and the signed deny_fail_open entries
+| copy on write     : active
+|   open flags from : built-in; auto-restore off
+|   scope /srv/data (mark=fanotify, 3 mark(s), reflink): 4096 of 1048576 bytes, 2 file copies in 2 objects, journal /srv/data/.nn-cow
+|   copies          : 0 reflink, 0 copied (0 bytes), 0 shared
+|   not protected   : budget 1
+|   open latency    : fast path avg - max 0 µs (0), copy path avg - max 0 µs (0)
+|   restores        : 0 run, 0 files restored, 0 kept both, 0 refused
+| host hardening : 11 check(s), <the host's warnings: checked>
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"TelemetryStatusRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"TelemetryStatus":{}},"nonce":"<challenge>","op":25,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< TelemetryStatusResponse (full)
+> (closed)
+
+### pipe.stdout.sock.detections
+$ nn-admin detections --key key-a --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"DetectionsRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"Detections":{"limit":50,"min_severity":null,"path":null,"sensor":null,"since_unix_ts":null,"status":null,"until_unix_ts":null}},"nonce":"<challenge>","op":19,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< DetectionsResponse (two-rows)
+> (closed)
+
+### pipe.stderr.sock.detections
+$ nn-admin detections --key key-a --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 141
+--- stdout
+| {"seq":0,"ts":"2025-06-15T15:06:40Z","path":"/etc/matrix/a"}
+| {"seq":1,"ts":"2025-06-15T15:06:41Z","path":"/etc/matrix/b"}
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"DetectionsRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"Detections":{"limit":50,"min_severity":null,"path":null,"sensor":null,"since_unix_ts":null,"status":null,"until_unix_ts":null}},"nonce":"<challenge>","op":19,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< DetectionsResponse (two-rows)
+> (closed)
+
+### pipe.stdout.sock.fim-report
+$ nn-admin fim report --since 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"FimReportRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"FimReport":{"since_unix_ts":1750000000}},"nonce":"<challenge>","op":8,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< FimReportResponse (two-rows)
+> (closed)
+
+### pipe.stderr.sock.fim-report
+$ nn-admin fim report --since 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 141
+--- stdout
+| {"seq":0,"ts":"2025-06-15T15:06:40Z","path":"/etc/matrix/a"}
+| {"seq":1,"ts":"2025-06-15T15:06:41Z","path":"/etc/matrix/b"}
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"FimReportRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"FimReport":{"since_unix_ts":1750000000}},"nonce":"<challenge>","op":8,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< FimReportResponse (two-rows)
+> (closed)
+
+### pipe.stdout.sock.canary-list
+$ nn-admin canary list --key key-a --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"CanaryListRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"CanaryList":{}},"nonce":"<challenge>","op":11,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< CanaryListResponse (two-rows)
+> (closed)
+
+### pipe.stderr.sock.canary-list
+$ nn-admin canary list --key key-a --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 141
+--- stdout
+| {"seq":0,"ts":"2025-06-15T15:06:40Z","path":"/etc/matrix/a"}
+| {"seq":1,"ts":"2025-06-15T15:06:41Z","path":"/etc/matrix/b"}
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"CanaryListRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"CanaryList":{}},"nonce":"<challenge>","op":11,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< CanaryListResponse (two-rows)
+> (closed)
+
+### pipe.stdout.sock.net-flows
+$ nn-admin net flows --since-unix 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"NetFlowsRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"NetFlows":{"since_unix_ts":1750000000}},"nonce":"<challenge>","op":14,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< NetFlowsResponse (two-rows)
+> (closed)
+
+### pipe.stderr.sock.net-flows
+$ nn-admin net flows --since-unix 1750000000 --key key-a --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 141
+--- stdout
+| {"seq":0,"ts":"2025-06-15T15:06:40Z","path":"/etc/matrix/a"}
+| {"seq":1,"ts":"2025-06-15T15:06:41Z","path":"/etc/matrix/b"}
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"NetFlowsRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"NetFlows":{"since_unix_ts":1750000000}},"nonce":"<challenge>","op":14,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< NetFlowsResponse (two-rows)
+> (closed)
+
+### pipe.stdout.sock.response-status
+$ nn-admin response status --key key-a --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"ResponseStatusRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"ResponseStatus":{}},"nonce":"<challenge>","op":22,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< ResponseStatusResponse (populated)
+> (closed)
+
+### pipe.stderr.sock.response-status
+$ nn-admin response status --key key-a --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| combat stage      : contain (locked)
+| contained         : 5
+|   pid 4242     blocked   from /system.slice/x.service  since 1750000000  running
+|   pid 4343     throttled from ?  since 1750000005  gone (or another process)
+|   … 3 older not shown
+| quarantined       : 3
+|   1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b  4096 bytes  at 1750000000  from /tmp/dropper
+|   … 2 older not shown
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"ResponseStatusRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"ResponseStatus":{}},"nonce":"<challenge>","op":22,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< ResponseStatusResponse (populated)
+> (closed)
+
+### pipe.stdout.sock.remediate-ransomware
+$ nn-admin remediate ransomware --pid 4242 --since 2025-06-15T15:00:00Z --key key-a --agent-id-file agent_id --socket admin.sock
+stdout: a pipe closed before the start
+exit: 141
+--- stderr
+(empty)
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"RemediateRansomwareRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"RemediateRansomware":{"dry_run":false,"pid":4242,"since_unix":1749999600}},"nonce":"<challenge>","op":26,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< RemediateRansomwareResponse (restored)
+> (closed)
+
+### pipe.stderr.sock.remediate-ransomware
+$ nn-admin remediate ransomware --pid 4242 --since 2025-06-15T15:00:00Z --key key-a --agent-id-file agent_id --socket admin.sock
+stderr: a pipe closed before the start
+exit: 0
+--- stdout
+| remediate ransomware: 2 file(s) restored
+|   restored               /srv/data/a.doc  (from the copy of 2025-06-15)
+|                          encrypted copy moved to: /srv/data/.nn-evidence/1
+|   kept-both              /srv/data/b.doc  (changed after the attack)
+|                          original written beside: /srv/data/b.doc.nn-restored-2
+--- agent
+connection 1
+> {"ChallengeRequest":{}}
+< Challenge(<challenge>)
+> {"RemediateRansomwareRequest":{"payload":{"agent_id":"hex:11111111111111111111111111111111","extra":{"RemediateRansomware":{"dry_run":false,"pid":4242,"since_unix":1749999600}},"nonce":"<challenge>","op":26,"ts":"<now>"},"signatures":["<sig of key-a>"]}}
+< RemediateRansomwareResponse (restored)
+> (closed)
+

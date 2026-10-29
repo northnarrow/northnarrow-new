@@ -6,6 +6,20 @@ follow the ROADMAP "Tappe"; `0.0.1` covers everything up to Tappa 9.0.
 ## [Unreleased]
 
 ### Added
+- nn-admin's output matrix, committed (lab PR 266, Wave 4, test
+  infrastructure; `docs/validation/GOLDEN_REPLAY.md` §8). Lab PRs 259 and
+  263 proved "nn-admin's output identical to `main`" with 1,964 cases run
+  from a scratchpad a stopped session deleted; `agent/tests/nn_admin_matrix/`
+  runs the `nn-admin` binary in 2,703 cases (help texts and clap errors,
+  `init`, `verify-keys`, `host-check`, `audit`, `chain verify`, overlays,
+  `policy show|test`, 37 socket verbs against a mock agent with their
+  replies, the ten refusals and the transport faults, key and identity
+  errors, closed pipes, default paths) and compares stdout, stderr, exit
+  status, files written and requests sent with
+  `agent/tests/golden/nn-admin/expected/` on every `cargo test` (about
+  10 s); fixed keys, ids and clock, the variable normalised after it is
+  checked. `cargo xtask golden [--update]` runs it after the library's
+  replays; `--update` is refused with `CI` set.
 - Golden replay of the posture and the COMBAT ladder (lab PR 243, Wave 4
   phase 2, before R08 moves them into nn-core;
   `docs/validation/GOLDEN_REPLAY.md` §6). `agent/src/posture/golden.rs`

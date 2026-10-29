@@ -1,0 +1,628 @@
+# nn-admin output matrix: audit (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### audit-read.pin
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.pin-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.matrix-log
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+| 2025-06-15T15:06:40.000000Z agent_boot       agent-self success aed4ba3ec4565f9a86fcbbd8c168312cbc39ddfcd473c37f13e9c56560db3b40
+| 2025-06-15T15:06:41.000000Z config_overlay_set 730a5edc success f962d44ca2469db685e17efdd8593988db987bad67a5270f8c44a83c7dff768b
+| 2025-06-15T15:06:42.000000Z config_overlay_set 730a5edc success 7449a2069fdcb967b4cf138380b44307fd5783c5ff521aa0259e81cd69d7fe6e
+| 2025-06-15T15:06:43.000000Z config_overlay_set 730a5edc success c616c57fb186f5ad88162dfe46e76cd82caca68491f570b18a198b64648c7ddc
+--- stderr
+| audit: 4 entries read from audit.log
+
+### audit-read.matrix-log-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+| {"ts":"2025-06-15T15:06:40.000000Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"n":0,"note":"matrix row 0"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"aed4ba3ec4565f9a86fcbbd8c168312cbc39ddfcd473c37f13e9c56560db3b40","agent_sig":"sKmq8NB3qH9i8XVEuhTYrecHZVYPpP5TZ9NDpZFFrfnYefGuCodYrMqpmEIwbAO0gRbu8ecVNkZs8kcJ1E9tDQ=="}
+| {"ts":"2025-06-15T15:06:41.000000Z","agent_id":"11111111111111111111111111111111","op":"config_overlay_set","extra":{"n":1,"note":"matrix row 1"},"key_fp":"730a5edc","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"aed4ba3ec4565f9a86fcbbd8c168312cbc39ddfcd473c37f13e9c56560db3b40","entry_hash":"f962d44ca2469db685e17efdd8593988db987bad67a5270f8c44a83c7dff768b","agent_sig":"xcH0GMwOOb7EIZWtdEv9CpR+pw9we4qs0+AgNMbtvZqiN0sqvl4Vf8atWf+CPF8HsXLc+YQNphLZJI+Oun6AAw=="}
+| {"ts":"2025-06-15T15:06:42.000000Z","agent_id":"11111111111111111111111111111111","op":"config_overlay_set","extra":{"n":2,"note":"matrix row 2"},"key_fp":"730a5edc","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":2,"prev_hash":"f962d44ca2469db685e17efdd8593988db987bad67a5270f8c44a83c7dff768b","entry_hash":"7449a2069fdcb967b4cf138380b44307fd5783c5ff521aa0259e81cd69d7fe6e","agent_sig":"MQH8RjqYTPxLgiw7XIzG4szYNI9vu2I10F1HWpDjupw4NXZ2omCS27rqVFwLVwuXR8BH8nLuYpmRav50StvbAA=="}
+| {"ts":"2025-06-15T15:06:43.000000Z","agent_id":"11111111111111111111111111111111","op":"config_overlay_set","extra":{"n":3,"note":"matrix row 3"},"key_fp":"730a5edc","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":3,"prev_hash":"7449a2069fdcb967b4cf138380b44307fd5783c5ff521aa0259e81cd69d7fe6e","entry_hash":"c616c57fb186f5ad88162dfe46e76cd82caca68491f570b18a198b64648c7ddc","agent_sig":"4GN8lbNvOuNc0jPU3SYO0xDoyyocWrbdmYKPnH/5wl5E9LF6foxvWgHBVgCkUaT1mp/lnu1OAz9a1nxXeWhiAA=="}
+--- stderr
+| audit: 4 entries read from audit.log
+
+### audit-read.since-before-every-row
+$ nn-admin audit read --path audit.log --since 2020-01-01T00:00:00Z
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.since-after-every-row
+$ nn-admin audit read --path audit.log --since 2030-01-01T00:00:00Z
+exit: 0
+--- stdout
+(empty)
+--- stderr
+| audit: 0 entries read from audit.log
+
+### audit-read.since-between-rows
+$ nn-admin audit read --path audit.log --since 2026-10-22T16:33:43.44
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 2 entries read from audit.log
+
+### audit-read.since-not-a-time
+$ nn-admin audit read --path audit.log --since yesterday
+exit: 0
+--- stdout
+(empty)
+--- stderr
+| audit: 0 entries read from audit.log
+
+### audit-read.since-json
+$ nn-admin audit read --path audit.log --since 2025-06-15T15:06:42Z --json
+exit: 0
+--- stdout
+| {"ts":"2025-06-15T15:06:43.000000Z","agent_id":"11111111111111111111111111111111","op":"config_overlay_set","extra":{"n":3,"note":"matrix row 3"},"key_fp":"730a5edc","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":3,"prev_hash":"7449a2069fdcb967b4cf138380b44307fd5783c5ff521aa0259e81cd69d7fe6e","entry_hash":"c616c57fb186f5ad88162dfe46e76cd82caca68491f570b18a198b64648c7ddc","agent_sig":"4GN8lbNvOuNc0jPU3SYO0xDoyyocWrbdmYKPnH/5wl5E9LF6foxvWgHBVgCkUaT1mp/lnu1OAz9a1nxXeWhiAA=="}
+--- stderr
+| audit: 1 entries read from audit.log
+
+### audit-read.content-altered
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 Xfailure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.content-altered-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"Xfailure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.link-broken
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 2 entries read from audit.log
+
+### audit-read.link-broken-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+--- stderr
+| audit: 2 entries read from audit.log
+
+### audit-read.malformed-line
+$ nn-admin audit read --path audit.log
+exit: 8
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: line 2 of audit.log skipped: not an audit row: expected ident at line 1 column 2
+| audit: 3 entries read from audit.log
+| audit: 1 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.malformed-line-json
+$ nn-admin audit read --path audit.log --json
+exit: 8
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+--- stderr
+| audit: line 2 of audit.log skipped: not an audit row: expected ident at line 1 column 2
+| audit: 3 entries read from audit.log
+| audit: 1 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.torn-last-line
+$ nn-admin audit read --path audit.log
+exit: 8
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+--- stderr
+| audit: line 3 of audit.log skipped: the last line, cut short (no newline): EOF while parsing a string at line 1 column 522
+| audit: 2 entries read from audit.log
+| audit: 1 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.torn-last-line-json
+$ nn-admin audit read --path audit.log --json
+exit: 8
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+--- stderr
+| audit: line 3 of audit.log skipped: the last line, cut short (no newline): EOF while parsing a string at line 1 column 522
+| audit: 2 entries read from audit.log
+| audit: 1 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.not-canonical
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.not-canonical-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.rows-reordered
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.rows-reordered-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+--- stderr
+| audit: 3 entries read from audit.log
+
+### audit-read.row-duplicated
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: 4 entries read from audit.log
+
+### audit-read.row-duplicated-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+| {"ts":"2026-10-22T16:33:43.450282Z","agent_id":"11111111111111111111111111111111","op":"agent_stop","extra":{"reason":"sigterm","uptime_secs":9},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":2,"prev_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","entry_hash":"3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1","agent_sig":"qjpRbI/uNn5UkKzbeabHnz+ASkIeGE6ipYC2l5Ek3A8TCaBpGRESFdYJUeJKhfPdLKzZJ7Dgm1D9KA+ulSR7DA=="}
+--- stderr
+| audit: 4 entries read from audit.log
+
+### audit-read.not-utf8-line
+$ nn-admin audit read --path audit.log
+exit: 8
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+--- stderr
+| audit: line 2 of audit.log skipped: not UTF-8 (invalid utf-8 sequence of 1 bytes from index 0)
+| audit: 2 entries read from audit.log
+| audit: 1 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.not-utf8-line-json
+$ nn-admin audit read --path audit.log --json
+exit: 8
+--- stdout
+| {"ts":"2026-10-22T16:33:43.411087Z","agent_id":"11111111111111111111111111111111","op":"agent_boot","extra":{"detect_only":false,"version":"pin"},"key_fp":"agent-self","cosigner_fps":[],"result":"success","client_pid":4242,"client_uid":0,"client_comm":"northnarrow-agent","seq":0,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","entry_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","agent_sig":"Pkk108ySziEFQPnWaqIQ2Ijpz7Jm2Bqnf7Ky0zaM6WcbdvNqy4/u5ZJ30FguIaB6M75g08JKoUSe7xxipw7VDQ=="}
+| {"ts":"2026-10-22T16:33:43.440961Z","agent_id":"11111111111111111111111111111111","op":"unlock","extra":{"n":[1,2,3],"reason":"line\nbreak \"q\" \\ é"},"key_fp":"a1b2c3d4","cosigner_fps":["e5f6a7b8","c9d0e1f2"],"result":"failure: role denied","client_pid":77,"client_uid":1000,"client_comm":"nn-admin","client_exe":"/usr/bin/nn-admin","seq":1,"prev_hash":"0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d","entry_hash":"47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742","agent_sig":"/UDJ932VP/jEMGTencJYUCUCcu2y1RzEDtZ2RIp4aO4TRwt/p/6tIE3L6k8DBsAUt+8TJOKuR+3V1scP5H38Ag=="}
+--- stderr
+| audit: line 2 of audit.log skipped: not UTF-8 (invalid utf-8 sequence of 1 bytes from index 0)
+| audit: 2 entries read from audit.log
+| audit: 1 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.empty
+$ nn-admin audit read --path audit.log
+exit: 0
+--- stdout
+(empty)
+--- stderr
+| audit: 0 entries read from audit.log
+
+### audit-read.empty-json
+$ nn-admin audit read --path audit.log --json
+exit: 0
+--- stdout
+(empty)
+--- stderr
+| audit: 0 entries read from audit.log
+
+### audit-read.many-lines-skipped
+$ nn-admin audit read --path audit.log
+exit: 8
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: line 4 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 5 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 6 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 7 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 8 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 9 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 10 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 11 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 12 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 13 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 14 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 15 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 16 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 17 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 18 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 19 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 20 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 21 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 22 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 23 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 24 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 25 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 26 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 27 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 28 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 29 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 30 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 31 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 32 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 33 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 34 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 35 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 36 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 37 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 38 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 39 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 40 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 41 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 42 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 43 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 44 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 45 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 46 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 47 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 48 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 49 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 50 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 51 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 52 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 53 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 54 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 55 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 56 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 57 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 58 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 59 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 60 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 61 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 62 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 63 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 64 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 65 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 66 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 67 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 68 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 69 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 70 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 71 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 72 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 73 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 74 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 75 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 76 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 77 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 78 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 79 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 80 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 81 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 82 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 83 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 84 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 85 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 86 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 87 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 88 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 89 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 90 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 91 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 92 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 93 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 94 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 95 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 96 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 97 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 98 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 99 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 100 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 101 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 102 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: line 103 of audit.log skipped: not an audit row: expected value at line 1 column 1
+| audit: 3 entries read from audit.log
+| audit: 5 more skipped line(s) not listed
+| audit: 105 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.line-over-16-mib
+$ nn-admin audit read --path audit.log
+exit: 8
+--- stdout
+| 2026-10-22T16:33:43.411087Z agent_boot       agent-self success 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+| 2026-10-22T16:33:43.440961Z unlock           a1b2c3d4 failure: role denied 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742
+| 2026-10-22T16:33:43.450282Z agent_stop       agent-self success 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+--- stderr
+| audit: line 4 of audit.log skipped: 16777217 bytes, longer than 16777216 bytes: not read
+| audit: 3 entries read from audit.log
+| audit: 1 line(s) skipped: not audit rows — the log is damaged; run `nn-admin audit verify` and see docs/operator/EVIDENCE_CHAINS.md
+
+### audit-read.missing
+$ nn-admin audit read --path absent.log
+exit: 0
+--- stdout
+(empty)
+--- stderr
+| audit: 0 entries read from absent.log
+
+### audit-read.a-directory
+$ nn-admin audit read --path log.d
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| audit: reading log.d after byte 0: Is a directory (os error 21)
+
+### audit-verify.pin-by-pubkey
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.pin-by-published-key
+$ nn-admin audit verify --from audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.pin-by-private-key-only
+$ nn-admin audit verify --from audit.log --agent-sig-key agent.sig.key
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.no-key-file
+$ nn-admin audit verify --from audit.log --agent-sig-key agent.sig.key
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| audit: no agent.sig.pub — deriving the agent pubkey from the signing key file agent.sig.key (refused once the agent protects it); pass --agent-pubkey <hex> when verifying off-host: reading agent.sig.key: No such file or directory (os error 2)
+
+### audit-verify.pubkey-short
+$ nn-admin audit verify --from audit.log --agent-pubkey abcd
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| audit: --agent-pubkey must be 64 hex chars (got 4)
+
+### audit-verify.pubkey-not-hex
+$ nn-admin audit verify --from audit.log --agent-pubkey zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+exit: 1
+--- stdout
+(empty)
+--- stderr
+| audit: --agent-pubkey is not valid hex: Invalid character 'z' at position 0
+
+### audit-verify.pubkey-not-a-point
+$ nn-admin audit verify --from audit.log --agent-pubkey ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 0: agent_sig invalid
+
+### audit-verify.pubkey-with-newline
+$ nn-admin audit verify --from audit.log --agent-pubkey 'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+'
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.wrong-key
+$ nn-admin audit verify --from audit.log --agent-pubkey bc7cbcb5636375fa1d82434d466724d92377f53b980695dd49d26d0ce12205a5
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 0: agent_sig invalid
+
+### audit-verify.matrix-log
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 0
+--- stdout
+| audit: 4 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.another-agents-key
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 0: agent_sig invalid
+
+### audit-verify.expect-head-the-last
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a --expect-head 3444df181308f87f202f2350830ad4d701853ec92706db9c21e13f7f873b57e1
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.expect-head-an-earlier
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a --expect-head 0e9cc1ba7484704107475d07aae1288a1b4b52fd8f61d7d12c2849319d51914d
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.expect-head-gone
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a --expect-head eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain cut — no entry has entry_hash eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee: the chain ends before that head
+
+### audit-verify.min-seq-held
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a --min-seq 2
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.min-seq-not-reached
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a --min-seq 3
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain cut — the last numbered row is Some(2), below the expected 3: rows were cut
+
+### audit-verify.expect-head-and-min-seq
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a --expect-head 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742 --min-seq 1
+exit: 0
+--- stdout
+| audit: 3 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.content-altered
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 1: entry_hash mismatch (recomputed 558bba6415c130e7c6ee52f579c43398ca5ee7bff9e84435cb05c0b7381ec9f9, stored 47b63ad3b4df2f054d3dbba6bf06315c94eebade6b9ea313174cae2f06bfd742)
+
+### audit-verify.link-broken
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 1: row 1 carries seq 2: rows before it were removed or inserted
+
+### audit-verify.malformed-line
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — line 2: not an audit row (not a row: expected ident at line 1 column 2); 1 row(s) verified before it
+
+### audit-verify.torn-last-line
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — line 3: not an audit row (the last line, cut short (no newline): EOF while parsing a string at line 1 column 522); 2 row(s) verified before it
+
+### audit-verify.not-canonical
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 1: a numbered row not in its canonical form (the bytes on disk are not what the agent wrote: a key added, reordered or re-spelled)
+
+### audit-verify.rows-reordered
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 0: row 0 carries seq 1: rows before it were removed or inserted
+
+### audit-verify.row-duplicated
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — entry 2: row 2 carries seq 1: rows before it were removed or inserted
+
+### audit-verify.not-utf8-line
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 8
+--- stdout
+(empty)
+--- stderr
+| audit: chain broken — line 2: not an audit row (not UTF-8 (invalid utf-8 sequence of 1 bytes from index 0)); 1 row(s) verified before it
+
+### audit-verify.empty
+$ nn-admin audit verify --from audit.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 0
+--- stdout
+| audit: 0 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+
+### audit-verify.missing
+$ nn-admin audit verify --from absent.log --agent-pubkey d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+exit: 0
+--- stdout
+| audit: 0 entries, hash chain intact, all sigs valid
+--- stderr
+(empty)
+

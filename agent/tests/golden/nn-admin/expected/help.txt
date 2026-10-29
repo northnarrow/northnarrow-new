@@ -1,0 +1,2324 @@
+# nn-admin output matrix: help (lab PR 266). Written by `cargo xtask golden --update`; never by hand. docs/validation/GOLDEN_REPLAY.md, §8.
+
+### help.no-arguments
+$ nn-admin
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| NorthNarrow admin CLI
+|
+| Usage: nn-admin <COMMAND>
+|
+| Commands:
+|   init                     Generate a fresh Ed25519 keypair, install the public half into the agent's admin.pub, and write the private half to disk for the admin to safeguard. NB: V1 has no air-gapped split flow — keep the private key on a hardware token or removable medium and use `nn-admin unlock --key` only on machines you trust
+|   unlock                   Release COMBAT: sign an `unlock` payload over a server-issued challenge (with this install's agent_id and the time) and submit it. Succeeds only when the agent tore the isolation down and read the tables back clear; otherwise exit 9 with what is still in place (the posture stays COMBAT)
+|   status                   Print current posture + network isolation state. Add --json to get a machine-readable response for scripting. Without --key the agent answers the posture, the isolation, the last admin action and the COMBAT stage and lock (external audit ASK-009); --key signs the request and adds the telemetry: ring drops and rejected records, the response mode (detect-only), the COMBAT evidence gaps
+|   capabilities             Lab PR 218: this boot's signed capability manifest — kernel, BTF, active LSMs, deny hooks and their self-test, each sensor's attach point, host hardening, degradations, the trust level — with the row of the audit chain that signs it. A key with `audit-read` or `telemetry-read` (the signed telemetry read). Exit 1 when the agent has not signed one yet
+|   host-check               Host hardening checks (Tappa 10.8): kernel lockdown, module signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, single bpffs mount — the settings that keep root from rewriting the kernel at runtime, which is the only way around the agent's anti-tamper. Reads /sys and /proc only; no socket needed. Exit 0 with no warnings, 2 with warnings (`--json` for scripting)
+|   detections               Tappa 9.0.b — read the last N persisted detections (newest-first) over the admin socket. Requires a key carrying the low-privilege `telemetry-read` role — read-only telemetry, no COMBAT/control authority. The records stream as JSONL on stdout (so `| jq` works); a summary goes to stderr
+|   detection-set-status     Tappa 9.0.c — change a persisted detection's triage status over the admin socket. Requires a key carrying the `triage` role (which also subsumes `telemetry-read`, so a triage key can both read detections and re-status them). Event-sourced: the agent appends a signed status-change event to a separate chain and never mutates the detection log; the new status surfaces on the next `nn-admin detections` read
+|   verify-keys              Parse the installed admin.pub, count valid keys, print fingerprints. Local-only — does not touch the agent socket
+|   shutdown                 Tappa 8 A9 — signed agent shutdown (design §10)
+|   force-posture            Tappa 8 A10 — production signed force-posture (design §4 + §12.2)
+|   rotate-keys              Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change
+|   audit                    Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`
+|   chain                    External audit NN-AUD-112 (lab PR 160) — verify every signed chain in full, offline: the audit log and the canary chains (hashes, signatures, links, row numbers), the rotating logs with their archives, manifest and checkpoints, then the files against the signed head anchor. Exits 8 when a chain is broken or shorter than its anchored head, 0 when everything verifies. Reads the files directly (root: they are 0600 or under 0700 directories)
+|   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
+|   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
+|   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|   trusted-installer-grant  FIM-009 self-upgrade (§15.1) — arm the trusted-installer override for an in-place agent upgrade. Submits a 1-of-N (M=1) quorum-signed grant; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's FS pin is suspended (so install.sh can replace the protected binary) AND a write to the agent's OWN systemd units is downgraded from kill to an audit Log. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
+|   response                 External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
+|   remediate                Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|   config                   Tappa 10.8 — operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
+|   policy                   Lab PR 236 — the signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
+|   help                     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help     Print help
+|   -V, --version  Print version
+
+### help.version-long
+$ nn-admin --version
+exit: 0
+--- stdout
+| nn-admin 0.0.1
+--- stderr
+(empty)
+
+### help.version-short
+$ nn-admin -V
+exit: 0
+--- stdout
+| nn-admin 0.0.1
+--- stderr
+(empty)
+
+### help.help-alone
+$ nn-admin help
+exit: 0
+--- stdout
+| NorthNarrow admin CLI
+|
+| Usage: nn-admin <COMMAND>
+|
+| Commands:
+|   init                     Generate a fresh Ed25519 keypair, install the public half into the agent's admin.pub, and write the private half to disk for the admin to safeguard. NB: V1 has no air-gapped split flow — keep the private key on a hardware token or removable medium and use `nn-admin unlock --key` only on machines you trust
+|   unlock                   Release COMBAT: sign an `unlock` payload over a server-issued challenge (with this install's agent_id and the time) and submit it. Succeeds only when the agent tore the isolation down and read the tables back clear; otherwise exit 9 with what is still in place (the posture stays COMBAT)
+|   status                   Print current posture + network isolation state. Add --json to get a machine-readable response for scripting. Without --key the agent answers the posture, the isolation, the last admin action and the COMBAT stage and lock (external audit ASK-009); --key signs the request and adds the telemetry: ring drops and rejected records, the response mode (detect-only), the COMBAT evidence gaps
+|   capabilities             Lab PR 218: this boot's signed capability manifest — kernel, BTF, active LSMs, deny hooks and their self-test, each sensor's attach point, host hardening, degradations, the trust level — with the row of the audit chain that signs it. A key with `audit-read` or `telemetry-read` (the signed telemetry read). Exit 1 when the agent has not signed one yet
+|   host-check               Host hardening checks (Tappa 10.8): kernel lockdown, module signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, single bpffs mount — the settings that keep root from rewriting the kernel at runtime, which is the only way around the agent's anti-tamper. Reads /sys and /proc only; no socket needed. Exit 0 with no warnings, 2 with warnings (`--json` for scripting)
+|   detections               Tappa 9.0.b — read the last N persisted detections (newest-first) over the admin socket. Requires a key carrying the low-privilege `telemetry-read` role — read-only telemetry, no COMBAT/control authority. The records stream as JSONL on stdout (so `| jq` works); a summary goes to stderr
+|   detection-set-status     Tappa 9.0.c — change a persisted detection's triage status over the admin socket. Requires a key carrying the `triage` role (which also subsumes `telemetry-read`, so a triage key can both read detections and re-status them). Event-sourced: the agent appends a signed status-change event to a separate chain and never mutates the detection log; the new status surfaces on the next `nn-admin detections` read
+|   verify-keys              Parse the installed admin.pub, count valid keys, print fingerprints. Local-only — does not touch the agent socket
+|   shutdown                 Tappa 8 A9 — signed agent shutdown (design §10)
+|   force-posture            Tappa 8 A10 — production signed force-posture (design §4 + §12.2)
+|   rotate-keys              Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change
+|   audit                    Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`
+|   chain                    External audit NN-AUD-112 (lab PR 160) — verify every signed chain in full, offline: the audit log and the canary chains (hashes, signatures, links, row numbers), the rotating logs with their archives, manifest and checkpoints, then the files against the signed head anchor. Exits 8 when a chain is broken or shorter than its anchored head, 0 when everything verifies. Reads the files directly (root: they are 0600 or under 0700 directories)
+|   fim                      Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
+|   canary                   Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
+|   net                      Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|   trusted-installer-grant  FIM-009 self-upgrade (§15.1) — arm the trusted-installer override for an in-place agent upgrade. Submits a 1-of-N (M=1) quorum-signed grant; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's FS pin is suspended (so install.sh can replace the protected binary) AND a write to the agent's OWN systemd units is downgraded from kill to an audit Log. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
+|   response                 External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
+|   remediate                Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|   config                   Tappa 10.8 — operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
+|   policy                   Lab PR 236 — the signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
+|   help                     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help     Print help
+|   -V, --version  Print version
+--- stderr
+(empty)
+
+### help.help-of-help
+$ nn-admin help help
+exit: 0
+--- stdout
+| Print this message or the help of the given subcommand(s)
+|
+| Usage: nn-admin help [COMMAND]...
+|
+| Arguments:
+|   [COMMAND]...  Print help for the subcommand(s)
+--- stderr
+(empty)
+
+### help.help-of-unknown
+$ nn-admin help nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin <COMMAND>
+|
+| For more information, try '--help'.
+
+### help.help-of-nested-unknown
+$ nn-admin help audit nosuch
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unrecognized subcommand 'nosuch'
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| For more information, try '--help'.
+
+### help.help-flag-after-subcommand-args
+$ nn-admin audit read --json --help
+exit: 0
+--- stdout
+| Stream the audit log to stdout, optionally filtered by timestamp. Default output is a compact human-readable summary; `--json` emits one canonical JSON object per line (matches the on-disk JSONL exactly).
+|
+| Who acted: the key fingerprint (`key_fp`, `cosigner_fps`) is the operator's identity. `client_pid`/`client_uid` come from the kernel (SO_PEERCRED); `client_comm` is the name the connecting process gave itself, which any process chooses; `client_exe` (rows from lab PR 179 on) is the program the kernel says it ran.
+|
+| A line that is not an audit row (cut, not JSON, not UTF-8, over 16 MiB) is skipped and named on stderr with its line number; every row before and after it is printed, and the exit code is 8. The rows are not verified here: `audit verify` does that.
+|
+| Usage: nn-admin audit read [OPTIONS]
+|
+| Options:
+|       --path <PATH>
+|           Path to the audit log file (default /etc/northnarrow/audit.log)
+|           
+|           [default: /etc/northnarrow/audit.log]
+|
+|       --since <SINCE>
+|           Optional ISO-8601 / RFC-3339 timestamp threshold; entries whose `ts` is lexicographically `>=` this value are kept (the field's fixed-width format makes string comparison equivalent to instant comparison)
+|
+|       --json
+|           Emit one canonical JSON object per line instead of the human summary
+|
+|   -h, --help
+|           Print help (see a summary with '-h')
+--- stderr
+(empty)
+
+### help.version-of-a-subcommand
+$ nn-admin audit --version
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| error: unexpected argument '--version' found
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| For more information, try '--help'.
+
+### help.root.long
+$ nn-admin --help
+exit: 0
+--- stdout
+(the same bytes as in help.help-alone)
+--- stderr
+(empty)
+
+### help.root.short
+$ nn-admin -h
+exit: 0
+--- stdout
+(the same bytes as in help.help-alone)
+--- stderr
+(empty)
+
+### help.init.long
+$ nn-admin init --help
+exit: 0
+--- stdout
+| Generate a fresh Ed25519 keypair, install the public half into the agent's admin.pub, and write the private half to disk for the admin to safeguard. NB: V1 has no air-gapped split flow — keep the private key on a hardware token or removable medium and use `nn-admin unlock --key` only on machines you trust
+|
+| Usage: nn-admin init [OPTIONS] --priv-out <PRIV_OUT>
+|
+| Options:
+|       --priv-out <PRIV_OUT>      Where to write the private key (mode 0600). Refuses to overwrite an existing file unless --force is also given
+|       --pub-append <PUB_APPEND>  Public key file to append to. Created mode 0644 if missing; left untouched if already present (the new key is appended) [default: /etc/northnarrow/admin.pub]
+|       --force                    Overwrite an existing private-key file. Off by default so a typo can't silently shred the operator's only key
+|   -h, --help                     Print help
+--- stderr
+(empty)
+
+### help.init.short
+$ nn-admin init -h
+exit: 0
+--- stdout
+(the same bytes as in help.init.long)
+--- stderr
+(empty)
+
+### help.init.subcommand
+$ nn-admin help init
+exit: 0
+--- stdout
+(the same bytes as in help.init.long)
+--- stderr
+(empty)
+
+### help.unlock.long
+$ nn-admin unlock --help
+exit: 0
+--- stdout
+| Release COMBAT: sign an `unlock` payload over a server-issued challenge (with this install's agent_id and the time) and submit it. Succeeds only when the agent tore the isolation down and read the tables back clear; otherwise exit 9 with what is still in place (the posture stays COMBAT).
+|
+| V1.1 will add a split offline flow; for now this command must run on a host with both the private key and a route to the agent's admin socket. An agent older than lab PR 217 needs the nn-admin of its own release.
+|
+| Usage: nn-admin unlock [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>
+|           Path to the hex-encoded private key file written by `nn-admin init`. Its admin.pub line needs the `unlock` role
+|
+|       --agent-id-file <AGENT_ID_FILE>
+|           [default: /etc/northnarrow/agent_id]
+|
+|       --socket <SOCKET>
+|           [default: /run/northnarrow/admin.sock]
+|
+|   -h, --help
+|           Print help (see a summary with '-h')
+--- stderr
+(empty)
+
+### help.unlock.short
+$ nn-admin unlock -h
+exit: 0
+--- stdout
+| Release COMBAT: sign an `unlock` payload over a server-issued challenge (with this install's agent_id and the time) and submit it. Succeeds only when the agent tore the isolation down and read the tables back clear; otherwise exit 9 with what is still in place (the posture stays COMBAT)
+|
+| Usage: nn-admin unlock [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the hex-encoded private key file written by `nn-admin init`. Its admin.pub line needs the `unlock` role
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help (see more with '--help')
+--- stderr
+(empty)
+
+### help.unlock.subcommand
+$ nn-admin help unlock
+exit: 0
+--- stdout
+(the same bytes as in help.unlock.long)
+--- stderr
+(empty)
+
+### help.status.long
+$ nn-admin status --help
+exit: 0
+--- stdout
+| Print current posture + network isolation state. Add --json to get a machine-readable response for scripting. Without --key the agent answers the posture, the isolation, the last admin action and the COMBAT stage and lock (external audit ASK-009); --key signs the request and adds the telemetry: ring drops and rejected records, the response mode (detect-only), the COMBAT evidence gaps
+|
+| Usage: nn-admin status [OPTIONS]
+|
+| Options:
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|       --json                           
+|       --key <KEY>                      A key with `audit-read` or `telemetry-read`: the signed read, telemetry included (one audit row per request)
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.status.short
+$ nn-admin status -h
+exit: 0
+--- stdout
+(the same bytes as in help.status.long)
+--- stderr
+(empty)
+
+### help.status.subcommand
+$ nn-admin help status
+exit: 0
+--- stdout
+(the same bytes as in help.status.long)
+--- stderr
+(empty)
+
+### help.capabilities.long
+$ nn-admin capabilities --help
+exit: 0
+--- stdout
+| Lab PR 218: this boot's signed capability manifest — kernel, BTF, active LSMs, deny hooks and their self-test, each sensor's attach point, host hardening, degradations, the trust level — with the row of the audit chain that signs it. A key with `audit-read` or `telemetry-read` (the signed telemetry read). Exit 1 when the agent has not signed one yet
+|
+| Usage: nn-admin capabilities [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      
+|       --json                           
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.capabilities.short
+$ nn-admin capabilities -h
+exit: 0
+--- stdout
+(the same bytes as in help.capabilities.long)
+--- stderr
+(empty)
+
+### help.capabilities.subcommand
+$ nn-admin help capabilities
+exit: 0
+--- stdout
+(the same bytes as in help.capabilities.long)
+--- stderr
+(empty)
+
+### help.host-check.long
+$ nn-admin host-check --help
+exit: 0
+--- stdout
+| Host hardening checks (Tappa 10.8): kernel lockdown, module signature enforcement, Secure Boot, unprivileged BPF, kexec, IMA, BPF LSM, single bpffs mount — the settings that keep root from rewriting the kernel at runtime, which is the only way around the agent's anti-tamper. Reads /sys and /proc only; no socket needed. Exit 0 with no warnings, 2 with warnings (`--json` for scripting)
+|
+| Usage: nn-admin host-check [OPTIONS]
+|
+| Options:
+|       --json  
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.host-check.short
+$ nn-admin host-check -h
+exit: 0
+--- stdout
+(the same bytes as in help.host-check.long)
+--- stderr
+(empty)
+
+### help.host-check.subcommand
+$ nn-admin help host-check
+exit: 0
+--- stdout
+(the same bytes as in help.host-check.long)
+--- stderr
+(empty)
+
+### help.detections.long
+$ nn-admin detections --help
+exit: 0
+--- stdout
+| Tappa 9.0.b — read the last N persisted detections (newest-first) over the admin socket. Requires a key carrying the low-privilege `telemetry-read` role — read-only telemetry, no COMBAT/control authority. The records stream as JSONL on stdout (so `| jq` works); a summary goes to stderr
+|
+| Usage: nn-admin detections [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's `telemetry-read`-role admin private key
+|       --limit <LIMIT>                  Maximum records to return — the bounded "last N". The agent caps this server-side and may further truncate to fit the wire frame [default: 50]
+|       --since <SINCE>                  Inclusive lower time bound (UNIX seconds): keep detections recorded at or after this instant
+|       --until <UNTIL>                  Inclusive upper time bound (UNIX seconds): keep detections recorded at or before this instant
+|       --min-severity <MIN_SEVERITY>    Keep detections at or above this severity rung [possible values: low, medium, high, critical]
+|       --status <STATUS>                Exact-match the triage status [possible values: open, acknowledged, investigating, resolved, false-positive]
+|       --sensor <SENSOR>                Exact-match the originating sensor [possible values: exec, file, module-load, network, anti-tamper, canary]
+|       --path <PATH>                    Substring filter on what a detection names: its executable (exec sensors), its file (file sensors) or the acting process's name (`comm`, every sensor). A record is kept when any of them contains the text, e.g. `--path /usr/bin/curl`, `--path /etc/cron.d/` or `--path curl`
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.detections.short
+$ nn-admin detections -h
+exit: 0
+--- stdout
+(the same bytes as in help.detections.long)
+--- stderr
+(empty)
+
+### help.detections.subcommand
+$ nn-admin help detections
+exit: 0
+--- stdout
+(the same bytes as in help.detections.long)
+--- stderr
+(empty)
+
+### help.detection-set-status.long
+$ nn-admin detection-set-status --help
+exit: 0
+--- stdout
+| Tappa 9.0.c — change a persisted detection's triage status over the admin socket. Requires a key carrying the `triage` role (which also subsumes `telemetry-read`, so a triage key can both read detections and re-status them). Event-sourced: the agent appends a signed status-change event to a separate chain and never mutates the detection log; the new status surfaces on the next `nn-admin detections` read
+|
+| Usage: nn-admin detection-set-status [OPTIONS] --key <KEY> --id <ID> --status <STATUS>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's `triage`-role admin private key
+|       --id <ID>                        The detection id to re-status (from a prior `detections` read). Must reference an existing detection
+|       --status <STATUS>                The new triage status. `open` is not a valid target (it is the initial state); the lifecycle only moves forward [possible values: acknowledged, investigating, resolved, false-positive]
+|       --note <NOTE>                    Optional free-text triage note recorded on the event
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.detection-set-status.short
+$ nn-admin detection-set-status -h
+exit: 0
+--- stdout
+(the same bytes as in help.detection-set-status.long)
+--- stderr
+(empty)
+
+### help.detection-set-status.subcommand
+$ nn-admin help detection-set-status
+exit: 0
+--- stdout
+(the same bytes as in help.detection-set-status.long)
+--- stderr
+(empty)
+
+### help.verify-keys.long
+$ nn-admin verify-keys --help
+exit: 0
+--- stdout
+| Parse the installed admin.pub, count valid keys, print fingerprints. Local-only — does not touch the agent socket
+|
+| Usage: nn-admin verify-keys [OPTIONS]
+|
+| Options:
+|       --path <PATH>  [default: /etc/northnarrow/admin.pub]
+|   -h, --help         Print help
+--- stderr
+(empty)
+
+### help.verify-keys.short
+$ nn-admin verify-keys -h
+exit: 0
+--- stdout
+(the same bytes as in help.verify-keys.long)
+--- stderr
+(empty)
+
+### help.verify-keys.subcommand
+$ nn-admin help verify-keys
+exit: 0
+--- stdout
+(the same bytes as in help.verify-keys.long)
+--- stderr
+(empty)
+
+### help.shutdown.long
+$ nn-admin shutdown --help
+exit: 0
+--- stdout
+| Tappa 8 A9 — signed agent shutdown (design §10).
+|
+| Submits a 2-of-N quorum-signed shutdown request. The agent verifies through every Tappa 8 layer (nonce binding, timestamp skew, agent_id binding, signature verify, distinct-key tally, role check), atomically writes the watchdog's shutdown-authorisation marker, replies Success, then exits cleanly. The watchdog (when present) reads the marker on the agent's pidfd POLLIN and stands down rather than respawning.
+|
+| BOTH keys are required — the quorum requires two distinct admin keys installed in admin.pub, at least one of them with the `shutdown` role; the other may be any installed key, whatever its roles (design §3.3), so every installed key is a control credential. Same key for both args fails server-side as QuorumNotMet { required: 2, provided: 1 } because the server tallies distinct fingerprints. The `--agent-id-file` path defaults to the design's canonical location; override only if `nn-admin` is run on a host where the file lives elsewhere (e.g., SSH-forwarded socket with a separate copy of the file).
+|
+| Usage: nn-admin shutdown [OPTIONS] --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| Options:
+|       --key <KEY>
+|           Path to the operator's primary admin private key
+|
+|       --cosign-key <COSIGN_KEY>
+|           Path to a second, DISTINCT admin private key (co-signer): any key installed in admin.pub. The quorum verify requires distinct fingerprints — passing the same key as both arms will be rejected by the agent
+|
+|       --agent-id-file <AGENT_ID_FILE>
+|           Path to the agent's per-install UUID file (design §6.5). nn-admin reads this to bind the signed payload to the specific agent install — a captured signature from agent-A cannot be replayed against agent-B
+|           
+|           [default: /etc/northnarrow/agent_id]
+|
+|       --grace-secs <GRACE_SECS>
+|           Grace period (seconds) the operator gives the agent to drain in-flight work before the watchdog's stand-down deadline expires. Capped at 300 s per design §10.2
+|           
+|           [default: 30]
+|
+|       --socket <SOCKET>
+|           [default: /run/northnarrow/admin.sock]
+|
+|   -h, --help
+|           Print help (see a summary with '-h')
+--- stderr
+(empty)
+
+### help.shutdown.short
+$ nn-admin shutdown -h
+exit: 0
+--- stdout
+| Tappa 8 A9 — signed agent shutdown (design §10)
+|
+| Usage: nn-admin shutdown [OPTIONS] --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's primary admin private key
+|       --cosign-key <COSIGN_KEY>        Path to a second, DISTINCT admin private key (co-signer): any key installed in admin.pub. The quorum verify requires distinct fingerprints — passing the same key as both arms will be rejected by the agent
+|       --agent-id-file <AGENT_ID_FILE>  Path to the agent's per-install UUID file (design §6.5). nn-admin reads this to bind the signed payload to the specific agent install — a captured signature from agent-A cannot be replayed against agent-B [default: /etc/northnarrow/agent_id]
+|       --grace-secs <GRACE_SECS>        Grace period (seconds) the operator gives the agent to drain in-flight work before the watchdog's stand-down deadline expires. Capped at 300 s per design §10.2 [default: 30]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help (see more with '--help')
+--- stderr
+(empty)
+
+### help.shutdown.subcommand
+$ nn-admin help shutdown
+exit: 0
+--- stdout
+(the same bytes as in help.shutdown.long)
+--- stderr
+(empty)
+
+### help.force-posture.long
+$ nn-admin force-posture --help
+exit: 0
+--- stdout
+| Tappa 8 A10 — production signed force-posture (design §4 + §12.2).
+|
+| Drives the agent's posture state machine to `target` via the full Tappa 8 verify path (nonce binding, timestamp skew, agent_id binding, signature verify, role check). 1-of-N quorum — only `--key` is required. The admin.pub line for that key MUST include the `force-posture` role, and also `unlock` to leave COMBAT.
+|
+| NOT the preferred path out of COMBAT. `nn-admin unlock` carries clearer audit semantics ("admin acknowledged COMBAT release") than a force-posture COMBAT → anything; use unlock when releasing COMBAT.
+|
+| Distinct from `nn-admin debug force-posture` (the integration-test path gated by the `debug-trigger` Cargo feature). Both subcommands stay; production uses this one.
+|
+| Usage: nn-admin force-posture [OPTIONS] --key <KEY> <TARGET>
+|
+| Arguments:
+|   <TARGET>
+|           Target posture state
+|           
+|           [possible values: observing, alerted, engaged, combat]
+|
+| Options:
+|       --key <KEY>
+|           Path to the operator's admin private key (role `force-posture` required in admin.pub)
+|
+|       --agent-id-file <AGENT_ID_FILE>
+|           Path to the agent's per-install UUID file (design §6.5)
+|           
+|           [default: /etc/northnarrow/agent_id]
+|
+|       --socket <SOCKET>
+|           [default: /run/northnarrow/admin.sock]
+|
+|   -h, --help
+|           Print help (see a summary with '-h')
+--- stderr
+(empty)
+
+### help.force-posture.short
+$ nn-admin force-posture -h
+exit: 0
+--- stdout
+| Tappa 8 A10 — production signed force-posture (design §4 + §12.2)
+|
+| Usage: nn-admin force-posture [OPTIONS] --key <KEY> <TARGET>
+|
+| Arguments:
+|   <TARGET>  Target posture state [possible values: observing, alerted, engaged, combat]
+|
+| Options:
+|       --key <KEY>                      Path to the operator's admin private key (role `force-posture` required in admin.pub)
+|       --agent-id-file <AGENT_ID_FILE>  Path to the agent's per-install UUID file (design §6.5) [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help (see more with '--help')
+--- stderr
+(empty)
+
+### help.force-posture.subcommand
+$ nn-admin help force-posture
+exit: 0
+--- stdout
+(the same bytes as in help.force-posture.long)
+--- stderr
+(empty)
+
+### help.rotate-keys.long
+$ nn-admin rotate-keys --help
+exit: 0
+--- stdout
+| Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change.
+|
+| Operator workflow per design §7.2: 1. `nn-admin init --priv-out new.key --bootstrap-only` on a trusted host. 2. Transfer the **public** key (out-of-band). 3. `nn-admin rotate-keys add --new-pubkey <hex> --new-roles unlock,audit-read --key … --cosign-key …`
+|
+| Usage: nn-admin rotate-keys <COMMAND>
+|
+| Commands:
+|   add     Install a new admin key. Requires --new-pubkey (64 hex chars) and --new-roles (CSV of role keywords, the same the agent accepts in admin.pub: unlock, shutdown, force-posture, rotate-keys, audit-read, fim-manage, fim-read, canary-read, canary-manage, net-read, net-manage, trusted-installer, telemetry-read, triage, all)
+|   revoke  Remove the admin.pub line whose pubkey 8-hex-char fingerprint matches `--fingerprint` (the same value `nn-admin verify-keys` prints). Refuses to revoke the last remaining key
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help
+|           Print help (see a summary with '-h')
+--- stderr
+(empty)
+
+### help.rotate-keys.short
+$ nn-admin rotate-keys -h
+exit: 0
+--- stdout
+| Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change
+|
+| Usage: nn-admin rotate-keys <COMMAND>
+|
+| Commands:
+|   add     Install a new admin key. Requires --new-pubkey (64 hex chars) and --new-roles (CSV of role keywords, the same the agent accepts in admin.pub: unlock, shutdown, force-posture, rotate-keys, audit-read, fim-manage, fim-read, canary-read, canary-manage, net-read, net-manage, trusted-installer, telemetry-read, triage, all)
+|   revoke  Remove the admin.pub line whose pubkey 8-hex-char fingerprint matches `--fingerprint` (the same value `nn-admin verify-keys` prints). Refuses to revoke the last remaining key
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help (see more with '--help')
+--- stderr
+(empty)
+
+### help.rotate-keys.subcommand
+$ nn-admin help rotate-keys
+exit: 0
+--- stdout
+(the same bytes as in help.rotate-keys.long)
+--- stderr
+(empty)
+
+### help.rotate-keys.without-subcommand
+$ nn-admin rotate-keys
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Tappa 8 A13 — atomically add or revoke an admin key in `/etc/northnarrow/admin.pub` (design §7.2 + §7.3). Both `add` and `revoke` need a 2-of-N quorum signed by two distinct installed admin keys, at least one of them carrying the `rotate-keys` role; the other may be any installed key, whatever its roles (design §3.3) — custody every installed key as a control credential. `add` grants only roles one of the two signers holds. On success the agent rewrites the file via tmpfile + `rename(2)` and reloads its in-memory key set so the next challenge already sees the change
+|
+| Usage: nn-admin rotate-keys <COMMAND>
+|
+| Commands:
+|   add     Install a new admin key. Requires --new-pubkey (64 hex chars) and --new-roles (CSV of role keywords, the same the agent accepts in admin.pub: unlock, shutdown, force-posture, rotate-keys, audit-read, fim-manage, fim-read, canary-read, canary-manage, net-read, net-manage, trusted-installer, telemetry-read, triage, all)
+|   revoke  Remove the admin.pub line whose pubkey 8-hex-char fingerprint matches `--fingerprint` (the same value `nn-admin verify-keys` prints). Refuses to revoke the last remaining key
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help (see more with '--help')
+
+### help.rotate-keys.add.long
+$ nn-admin rotate-keys add --help
+exit: 0
+--- stdout
+| Install a new admin key. Requires --new-pubkey (64 hex chars) and --new-roles (CSV of role keywords, the same the agent accepts in admin.pub: unlock, shutdown, force-posture, rotate-keys, audit-read, fim-manage, fim-read, canary-read, canary-manage, net-read, net-manage, trusted-installer, telemetry-read, triage, all)
+|
+| Usage: nn-admin rotate-keys add [OPTIONS] --new-pubkey <NEW_PUBKEY> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| Options:
+|       --new-pubkey <NEW_PUBKEY>        64-hex-char Ed25519 verifying key to install
+|       --new-roles <NEW_ROLES>          Comma-separated role allowlist for the new key. At least one role required. Maps to design §3.2 roles. Each role must be held by one of the signing keys (`all` only by a key holding `all`) [default: unlock,audit-read]
+|       --key <KEY>                      Path to the operator's primary admin private key. This key or the co-signer must carry the `rotate-keys` role
+|       --cosign-key <COSIGN_KEY>        Path to a SECOND, DISTINCT admin private key (co-signer): any key installed in admin.pub, whatever its roles
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.rotate-keys.add.short
+$ nn-admin rotate-keys add -h
+exit: 0
+--- stdout
+(the same bytes as in help.rotate-keys.add.long)
+--- stderr
+(empty)
+
+### help.rotate-keys.add.subcommand
+$ nn-admin help rotate-keys add
+exit: 0
+--- stdout
+(the same bytes as in help.rotate-keys.add.long)
+--- stderr
+(empty)
+
+### help.rotate-keys.revoke.long
+$ nn-admin rotate-keys revoke --help
+exit: 0
+--- stdout
+| Remove the admin.pub line whose pubkey 8-hex-char fingerprint matches `--fingerprint` (the same value `nn-admin verify-keys` prints). Refuses to revoke the last remaining key
+|
+| Usage: nn-admin rotate-keys revoke [OPTIONS] --fingerprint <FINGERPRINT> --key <KEY> --cosign-key <COSIGN_KEY>
+|
+| Options:
+|       --fingerprint <FINGERPRINT>      8-hex-char fingerprint of the key to revoke
+|       --key <KEY>                      
+|       --cosign-key <COSIGN_KEY>        
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.rotate-keys.revoke.short
+$ nn-admin rotate-keys revoke -h
+exit: 0
+--- stdout
+(the same bytes as in help.rotate-keys.revoke.long)
+--- stderr
+(empty)
+
+### help.rotate-keys.revoke.subcommand
+$ nn-admin help rotate-keys revoke
+exit: 0
+--- stdout
+(the same bytes as in help.rotate-keys.revoke.long)
+--- stderr
+(empty)
+
+### help.audit.long
+$ nn-admin audit --help
+exit: 0
+--- stdout
+| Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`.
+|
+| `audit verify` exits 8 (per design §5.3) on a broken chain, 0 on success — distinct from the other admin commands so CI can act on chain integrity specifically. An empty / missing log file is "0 entries, success" (not an error).
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| Commands:
+|   read    Stream the audit log to stdout, optionally filtered by timestamp. Default output is a compact human-readable summary; `--json` emits one canonical JSON object per line (matches the on-disk JSONL exactly)
+|   verify  Replay the chain in `--from <path>` through [`northnarrow_agent::audit::verify_chain_file`]. Loads the verifying key either from `--agent-pubkey <hex>` (off-host verification with the pubkey conveyed out-of-band) or from the local `--agent-sig-key <path>` (default /etc/northnarrow/agent.sig.key — zero-config on the agent host, requires sudo to read the mode-0400 file)
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help
+|           Print help (see a summary with '-h')
+--- stderr
+(empty)
+
+### help.audit.short
+$ nn-admin audit -h
+exit: 0
+--- stdout
+| Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| Commands:
+|   read    Stream the audit log to stdout, optionally filtered by timestamp. Default output is a compact human-readable summary; `--json` emits one canonical JSON object per line (matches the on-disk JSONL exactly)
+|   verify  Replay the chain in `--from <path>` through [`northnarrow_agent::audit::verify_chain_file`]. Loads the verifying key either from `--agent-pubkey <hex>` (off-host verification with the pubkey conveyed out-of-band) or from the local `--agent-sig-key <path>` (default /etc/northnarrow/agent.sig.key — zero-config on the agent host, requires sudo to read the mode-0400 file)
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help (see more with '--help')
+--- stderr
+(empty)
+
+### help.audit.subcommand
+$ nn-admin help audit
+exit: 0
+--- stdout
+(the same bytes as in help.audit.long)
+--- stderr
+(empty)
+
+### help.audit.without-subcommand
+$ nn-admin audit
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Tappa 8 A12 — read or verify the tamper-evident audit log (design §9). Two subcommands: `read` streams entries from the on-disk JSONL log, `verify` runs the SHA-256 hash chain + per-entry Ed25519 signature recomputation through `northnarrow_agent::audit::verify_chain`
+|
+| Usage: nn-admin audit <COMMAND>
+|
+| Commands:
+|   read    Stream the audit log to stdout, optionally filtered by timestamp. Default output is a compact human-readable summary; `--json` emits one canonical JSON object per line (matches the on-disk JSONL exactly)
+|   verify  Replay the chain in `--from <path>` through [`northnarrow_agent::audit::verify_chain_file`]. Loads the verifying key either from `--agent-pubkey <hex>` (off-host verification with the pubkey conveyed out-of-band) or from the local `--agent-sig-key <path>` (default /etc/northnarrow/agent.sig.key — zero-config on the agent host, requires sudo to read the mode-0400 file)
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help (see more with '--help')
+
+### help.audit.read.long
+$ nn-admin audit read --help
+exit: 0
+--- stdout
+(the same bytes as in help.help-flag-after-subcommand-args)
+--- stderr
+(empty)
+
+### help.audit.read.short
+$ nn-admin audit read -h
+exit: 0
+--- stdout
+| Stream the audit log to stdout, optionally filtered by timestamp. Default output is a compact human-readable summary; `--json` emits one canonical JSON object per line (matches the on-disk JSONL exactly)
+|
+| Usage: nn-admin audit read [OPTIONS]
+|
+| Options:
+|       --path <PATH>    Path to the audit log file (default /etc/northnarrow/audit.log) [default: /etc/northnarrow/audit.log]
+|       --since <SINCE>  Optional ISO-8601 / RFC-3339 timestamp threshold; entries whose `ts` is lexicographically `>=` this value are kept (the field's fixed-width format makes string comparison equivalent to instant comparison)
+|       --json           Emit one canonical JSON object per line instead of the human summary
+|   -h, --help           Print help (see more with '--help')
+--- stderr
+(empty)
+
+### help.audit.read.subcommand
+$ nn-admin help audit read
+exit: 0
+--- stdout
+(the same bytes as in help.help-flag-after-subcommand-args)
+--- stderr
+(empty)
+
+### help.audit.verify.long
+$ nn-admin audit verify --help
+exit: 0
+--- stdout
+| Replay the chain in `--from <path>` through [`northnarrow_agent::audit::verify_chain_file`]. Loads the verifying key either from `--agent-pubkey <hex>` (off-host verification with the pubkey conveyed out-of-band) or from the local `--agent-sig-key <path>` (default /etc/northnarrow/agent.sig.key — zero-config on the agent host, requires sudo to read the mode-0400 file).
+|
+| Exit 8 at the first row that does not verify or the first line that is not a row, named with its line number and the rows verified before it; one pass, one line in memory at a time.
+|
+| Usage: nn-admin audit verify [OPTIONS] --from <FROM>
+|
+| Options:
+|       --from <FROM>
+|           Path to a JSONL chain file (export from `audit read --json` or the on-disk log itself)
+|
+|       --agent-pubkey <AGENT_PUBKEY>
+|           Explicit 64-hex-char Ed25519 pubkey of the agent's audit signing key. Set this when running off-host (the auditor doesn't have access to the agent's `agent.sig.key`)
+|
+|       --agent-sig-key <AGENT_SIG_KEY>
+|           Local signing-key file the verifier derives the pubkey from when `--agent-pubkey` is not given. Mode 0400 — usually requires sudo
+|           
+|           [default: /etc/northnarrow/agent.sig.key]
+|
+|       --expect-head <EXPECT_HEAD>
+|           External audit NN-AUD-108: an `entry_hash` the chain must still hold (a head recorded earlier: a `chain.head` journal line forwarded off the host, or `chain verify` output kept there). Exit 8 when it is gone: rows were cut from the end
+|
+|       --min-seq <MIN_SEQ>
+|           The chain must hold a row numbered at least this (`seq`)
+|
+|   -h, --help
+|           Print help (see a summary with '-h')
+--- stderr
+(empty)
+
+### help.audit.verify.short
+$ nn-admin audit verify -h
+exit: 0
+--- stdout
+| Replay the chain in `--from <path>` through [`northnarrow_agent::audit::verify_chain_file`]. Loads the verifying key either from `--agent-pubkey <hex>` (off-host verification with the pubkey conveyed out-of-band) or from the local `--agent-sig-key <path>` (default /etc/northnarrow/agent.sig.key — zero-config on the agent host, requires sudo to read the mode-0400 file)
+|
+| Usage: nn-admin audit verify [OPTIONS] --from <FROM>
+|
+| Options:
+|       --from <FROM>                    Path to a JSONL chain file (export from `audit read --json` or the on-disk log itself)
+|       --agent-pubkey <AGENT_PUBKEY>    Explicit 64-hex-char Ed25519 pubkey of the agent's audit signing key. Set this when running off-host (the auditor doesn't have access to the agent's `agent.sig.key`)
+|       --agent-sig-key <AGENT_SIG_KEY>  Local signing-key file the verifier derives the pubkey from when `--agent-pubkey` is not given. Mode 0400 — usually requires sudo [default: /etc/northnarrow/agent.sig.key]
+|       --expect-head <EXPECT_HEAD>      External audit NN-AUD-108: an `entry_hash` the chain must still hold (a head recorded earlier: a `chain.head` journal line forwarded off the host, or `chain verify` output kept there). Exit 8 when it is gone: rows were cut from the end
+|       --min-seq <MIN_SEQ>              The chain must hold a row numbered at least this (`seq`)
+|   -h, --help                           Print help (see more with '--help')
+--- stderr
+(empty)
+
+### help.audit.verify.subcommand
+$ nn-admin help audit verify
+exit: 0
+--- stdout
+(the same bytes as in help.audit.verify.long)
+--- stderr
+(empty)
+
+### help.chain.long
+$ nn-admin chain --help
+exit: 0
+--- stdout
+| External audit NN-AUD-112 (lab PR 160) — verify every signed chain in full, offline: the audit log and the canary chains (hashes, signatures, links, row numbers), the rotating logs with their archives, manifest and checkpoints, then the files against the signed head anchor. Exits 8 when a chain is broken or shorter than its anchored head, 0 when everything verifies. Reads the files directly (root: they are 0600 or under 0700 directories)
+|
+| Usage: nn-admin chain <COMMAND>
+|
+| Commands:
+|   verify  Verify the chains in full (default: all of them)
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.chain.short
+$ nn-admin chain -h
+exit: 0
+--- stdout
+(the same bytes as in help.chain.long)
+--- stderr
+(empty)
+
+### help.chain.subcommand
+$ nn-admin help chain
+exit: 0
+--- stdout
+(the same bytes as in help.chain.long)
+--- stderr
+(empty)
+
+### help.chain.without-subcommand
+$ nn-admin chain
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| External audit NN-AUD-112 (lab PR 160) — verify every signed chain in full, offline: the audit log and the canary chains (hashes, signatures, links, row numbers), the rotating logs with their archives, manifest and checkpoints, then the files against the signed head anchor. Exits 8 when a chain is broken or shorter than its anchored head, 0 when everything verifies. Reads the files directly (root: they are 0600 or under 0700 directories)
+|
+| Usage: nn-admin chain <COMMAND>
+|
+| Commands:
+|   verify  Verify the chains in full (default: all of them)
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.chain.verify.long
+$ nn-admin chain verify --help
+exit: 0
+--- stdout
+| Verify the chains in full (default: all of them)
+|
+| Usage: nn-admin chain verify [OPTIONS]
+|
+| Options:
+|       --log <LOG>                      A chain to verify; repeat for several. Default: all [possible values: audit, canary-registry, canary-access, detections, status-events, netflow, fim-drift, all]
+|       --state-dir <STATE_DIR>          The state directory holding the canary chains and the rotating logs (`detections/` below it) [default: /var/lib/northnarrow]
+|       --audit-log <AUDIT_LOG>          The audit log [default: /etc/northnarrow/audit.log]
+|       --heads <HEADS>                  The head anchor (default: `chain_heads.json` next to `--audit-log`)
+|       --agent-pubkey <AGENT_PUBKEY>    Explicit 64-hex-char agent pubkey (off-host verification)
+|       --agent-sig-key <AGENT_SIG_KEY>  Signing-key file whose published `agent.sig.pub` (next to it) gives the pubkey when `--agent-pubkey` is not set [default: /etc/northnarrow/agent.sig.key]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.chain.verify.short
+$ nn-admin chain verify -h
+exit: 0
+--- stdout
+(the same bytes as in help.chain.verify.long)
+--- stderr
+(empty)
+
+### help.chain.verify.subcommand
+$ nn-admin help chain verify
+exit: 0
+--- stdout
+(the same bytes as in help.chain.verify.long)
+--- stderr
+(empty)
+
+### help.fim.long
+$ nn-admin fim --help
+exit: 0
+--- stdout
+| Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
+|
+| Usage: nn-admin fim <COMMAND>
+|
+| Commands:
+|   baseline  Queue a baseline (re)compute. Signed payload, single-sig `fim-manage` role per §13 Q6. V1.0 semantics: success schedules the recompute for the next agent restart (lazy — baseline is a "snapshot of trust" workflow op, not a security gate)
+|   report    Stream the chained drift log to stdout, newest rows first (rotated archives included). Signed payload, single-sig `fim-read` role. `--since <unix-ts>` filters server-side; the reply holds the newest rows that fit half MAX_FRAME_BODY — exit prints a truncation hint when older rows were left out
+|   status    Print the in-process FIM status snapshot: watched-paths summary (effective / added / disabled-default counts), baseline + drift chain row counts, last baseline ts, token-bucket state for the §6.5 hierarchical rate-limiter (`high_remaining/cap` + `medium_remaining/cap`). Read-only, signed payload, single-sig `fim-read` role
+|   help      Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.fim.short
+$ nn-admin fim -h
+exit: 0
+--- stdout
+(the same bytes as in help.fim.long)
+--- stderr
+(empty)
+
+### help.fim.subcommand
+$ nn-admin help fim
+exit: 0
+--- stdout
+(the same bytes as in help.fim.long)
+--- stderr
+(empty)
+
+### help.fim.without-subcommand
+$ nn-admin fim
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Tappa 9 C6 — FIM operator surface. `fim baseline` queues a re-compute of the watched-paths SHA-256 baseline (signed payload, single-sig `fim-manage` role per §13 Q6). `fim report [--since <unix-ts>]` reads the chained drift log (signed payload, single-sig `fim-read` role)
+|
+| Usage: nn-admin fim <COMMAND>
+|
+| Commands:
+|   baseline  Queue a baseline (re)compute. Signed payload, single-sig `fim-manage` role per §13 Q6. V1.0 semantics: success schedules the recompute for the next agent restart (lazy — baseline is a "snapshot of trust" workflow op, not a security gate)
+|   report    Stream the chained drift log to stdout, newest rows first (rotated archives included). Signed payload, single-sig `fim-read` role. `--since <unix-ts>` filters server-side; the reply holds the newest rows that fit half MAX_FRAME_BODY — exit prints a truncation hint when older rows were left out
+|   status    Print the in-process FIM status snapshot: watched-paths summary (effective / added / disabled-default counts), baseline + drift chain row counts, last baseline ts, token-bucket state for the §6.5 hierarchical rate-limiter (`high_remaining/cap` + `medium_remaining/cap`). Read-only, signed payload, single-sig `fim-read` role
+|   help      Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.fim.baseline.long
+$ nn-admin fim baseline --help
+exit: 0
+--- stdout
+| Queue a baseline (re)compute. Signed payload, single-sig `fim-manage` role per §13 Q6. V1.0 semantics: success schedules the recompute for the next agent restart (lazy — baseline is a "snapshot of trust" workflow op, not a security gate)
+|
+| Usage: nn-admin fim baseline [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's `fim-manage`-role admin private key
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.fim.baseline.short
+$ nn-admin fim baseline -h
+exit: 0
+--- stdout
+(the same bytes as in help.fim.baseline.long)
+--- stderr
+(empty)
+
+### help.fim.baseline.subcommand
+$ nn-admin help fim baseline
+exit: 0
+--- stdout
+(the same bytes as in help.fim.baseline.long)
+--- stderr
+(empty)
+
+### help.fim.report.long
+$ nn-admin fim report --help
+exit: 0
+--- stdout
+| Stream the chained drift log to stdout, newest rows first (rotated archives included). Signed payload, single-sig `fim-read` role. `--since <unix-ts>` filters server-side; the reply holds the newest rows that fit half MAX_FRAME_BODY — exit prints a truncation hint when older rows were left out
+|
+| Usage: nn-admin fim report [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's `fim-read`-role admin private key
+|       --since <SINCE>                  Unix-timestamp lower bound. Entries with `ts >= since` are returned
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.fim.report.short
+$ nn-admin fim report -h
+exit: 0
+--- stdout
+(the same bytes as in help.fim.report.long)
+--- stderr
+(empty)
+
+### help.fim.report.subcommand
+$ nn-admin help fim report
+exit: 0
+--- stdout
+(the same bytes as in help.fim.report.long)
+--- stderr
+(empty)
+
+### help.fim.status.long
+$ nn-admin fim status --help
+exit: 0
+--- stdout
+| Print the in-process FIM status snapshot: watched-paths summary (effective / added / disabled-default counts), baseline + drift chain row counts, last baseline ts, token-bucket state for the §6.5 hierarchical rate-limiter (`high_remaining/cap` + `medium_remaining/cap`). Read-only, signed payload, single-sig `fim-read` role
+|
+| Usage: nn-admin fim status [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's `fim-read`-role admin private key
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.fim.status.short
+$ nn-admin fim status -h
+exit: 0
+--- stdout
+(the same bytes as in help.fim.status.long)
+--- stderr
+(empty)
+
+### help.fim.status.subcommand
+$ nn-admin help fim status
+exit: 0
+--- stdout
+(the same bytes as in help.fim.status.long)
+--- stderr
+(empty)
+
+### help.canary.long
+$ nn-admin canary --help
+exit: 0
+--- stdout
+| Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
+|
+| Usage: nn-admin canary <COMMAND>
+|
+| Commands:
+|   deploy   Install a new canary (`canary-manage` role). One of four variants — `file`, `process`, `network`, `credential`. The server renders the on-disk artefact (for file + credential canaries) and prints the per-canary stable id on success
+|   list     Stream the chained canary registry log, newest rows first (`canary-read` role). Output mirrors `fim report`: JSONL on stdout, a 1-line summary on stderr
+|   burn     Permanently retire a canary by id (`canary-manage` role). File / credential artefacts are unlinked, network listeners closed, process canaries terminated. The K3 detector stops firing for the burned id immediately
+|   refresh  Re-render a canary's on-disk artefact (`canary-manage` role). §12 Q2 MANUAL lock-in: no auto-refresh; the operator must run this explicitly when a canary's bytes would otherwise grow stale
+|   help     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.canary.short
+$ nn-admin canary -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.long)
+--- stderr
+(empty)
+
+### help.canary.subcommand
+$ nn-admin help canary
+exit: 0
+--- stdout
+(the same bytes as in help.canary.long)
+--- stderr
+(empty)
+
+### help.canary.without-subcommand
+$ nn-admin canary
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Tappa 9.5 K6 — deception canary operator surface. `canary deploy` installs a new canary (File / Process / Network / Credential variants), `canary list` streams the chained registry log, `canary burn` permanently retires a canary, `canary refresh` re-renders the on-disk artefact. Authorisation: `canary-read` for `list`; `canary-manage` for `deploy` / `burn` / `refresh` (§12 Q7 SPLIT lock-in)
+|
+| Usage: nn-admin canary <COMMAND>
+|
+| Commands:
+|   deploy   Install a new canary (`canary-manage` role). One of four variants — `file`, `process`, `network`, `credential`. The server renders the on-disk artefact (for file + credential canaries) and prints the per-canary stable id on success
+|   list     Stream the chained canary registry log, newest rows first (`canary-read` role). Output mirrors `fim report`: JSONL on stdout, a 1-line summary on stderr
+|   burn     Permanently retire a canary by id (`canary-manage` role). File / credential artefacts are unlinked, network listeners closed, process canaries terminated. The K3 detector stops firing for the burned id immediately
+|   refresh  Re-render a canary's on-disk artefact (`canary-manage` role). §12 Q2 MANUAL lock-in: no auto-refresh; the operator must run this explicitly when a canary's bytes would otherwise grow stale
+|   help     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.canary.deploy.long
+$ nn-admin canary deploy --help
+exit: 0
+--- stdout
+| Install a new canary (`canary-manage` role). One of four variants — `file`, `process`, `network`, `credential`. The server renders the on-disk artefact (for file + credential canaries) and prints the per-canary stable id on success
+|
+| Usage: nn-admin canary deploy [OPTIONS] --name <NAME> --key <KEY> <COMMAND>
+|
+| Commands:
+|   file        Plain file canary. The server creates a placeholder file at `--path` (current K4 template renders sentinel bytes)
+|   process     Process canary. The server materialises a fake binary at `--path` and advertises `--fake-arg0` as its argv[0]
+|   network     Network canary: a decoy destination. A local process that connects to `--bind-addr:--bind-port` trips it (NN-L-CANARY-003); `0.0.0.0` / `::` is the port at any address of this host. The agent opens no listener, and a connection from another host is not seen. Refused when a listener on this host serves the port
+|   credential  Credential canary. Same shape as `file` plus a required `--cred-family` selecting which K4 template renders the fake credential bytes (e.g. "aws", "docker", "kube")
+|   help        Print this message or the help of the given subcommand(s)
+|
+| Options:
+|       --name <NAME>                    Operator-chosen human label (e.g. "honeypot-aws-creds"). Free-form; appears in audit + alerts
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.canary.deploy.short
+$ nn-admin canary deploy -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.subcommand
+$ nn-admin help canary deploy
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.without-subcommand
+$ nn-admin canary deploy
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Install a new canary (`canary-manage` role). One of four variants — `file`, `process`, `network`, `credential`. The server renders the on-disk artefact (for file + credential canaries) and prints the per-canary stable id on success
+|
+| Usage: nn-admin canary deploy [OPTIONS] --name <NAME> --key <KEY> <COMMAND>
+|
+| Commands:
+|   file        Plain file canary. The server creates a placeholder file at `--path` (current K4 template renders sentinel bytes)
+|   process     Process canary. The server materialises a fake binary at `--path` and advertises `--fake-arg0` as its argv[0]
+|   network     Network canary: a decoy destination. A local process that connects to `--bind-addr:--bind-port` trips it (NN-L-CANARY-003); `0.0.0.0` / `::` is the port at any address of this host. The agent opens no listener, and a connection from another host is not seen. Refused when a listener on this host serves the port
+|   credential  Credential canary. Same shape as `file` plus a required `--cred-family` selecting which K4 template renders the fake credential bytes (e.g. "aws", "docker", "kube")
+|   help        Print this message or the help of the given subcommand(s)
+|
+| Options:
+|       --name <NAME>                    Operator-chosen human label (e.g. "honeypot-aws-creds"). Free-form; appears in audit + alerts
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+
+### help.canary.deploy.file.long
+$ nn-admin canary deploy file --help
+exit: 0
+--- stdout
+| Plain file canary. The server creates a placeholder file at `--path` (current K4 template renders sentinel bytes)
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> file --path <PATH>
+|
+| Options:
+|       --path <PATH>  Absolute on-disk path the canary file should occupy
+|   -h, --help         Print help
+--- stderr
+(empty)
+
+### help.canary.deploy.file.short
+$ nn-admin canary deploy file -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.file.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.file.subcommand
+$ nn-admin help canary deploy file
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.file.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.process.long
+$ nn-admin canary deploy process --help
+exit: 0
+--- stdout
+| Process canary. The server materialises a fake binary at `--path` and advertises `--fake-arg0` as its argv[0]
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> process --path <PATH> --fake-arg0 <FAKE_ARG0>
+|
+| Options:
+|       --path <PATH>            
+|       --fake-arg0 <FAKE_ARG0>  What the canary binary should report as argv[0] (mirrors what `ps` shows)
+|   -h, --help                   Print help
+--- stderr
+(empty)
+
+### help.canary.deploy.process.short
+$ nn-admin canary deploy process -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.process.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.process.subcommand
+$ nn-admin help canary deploy process
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.process.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.network.long
+$ nn-admin canary deploy network --help
+exit: 0
+--- stdout
+| Network canary: a decoy destination. A local process that connects to `--bind-addr:--bind-port` trips it (NN-L-CANARY-003); `0.0.0.0` / `::` is the port at any address of this host. The agent opens no listener, and a connection from another host is not seen. Refused when a listener on this host serves the port
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> network --bind-addr <BIND_ADDR> --bind-port <BIND_PORT>
+|
+| Options:
+|       --bind-addr <BIND_ADDR>  
+|       --bind-port <BIND_PORT>  
+|   -h, --help                   Print help
+--- stderr
+(empty)
+
+### help.canary.deploy.network.short
+$ nn-admin canary deploy network -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.network.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.network.subcommand
+$ nn-admin help canary deploy network
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.network.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.credential.long
+$ nn-admin canary deploy credential --help
+exit: 0
+--- stdout
+| Credential canary. Same shape as `file` plus a required `--cred-family` selecting which K4 template renders the fake credential bytes (e.g. "aws", "docker", "kube")
+|
+| Usage: nn-admin canary deploy --name <NAME> --key <KEY> credential --path <PATH> --cred-family <CRED_FAMILY>
+|
+| Options:
+|       --path <PATH>                
+|       --cred-family <CRED_FAMILY>  
+|   -h, --help                       Print help
+--- stderr
+(empty)
+
+### help.canary.deploy.credential.short
+$ nn-admin canary deploy credential -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.credential.long)
+--- stderr
+(empty)
+
+### help.canary.deploy.credential.subcommand
+$ nn-admin help canary deploy credential
+exit: 0
+--- stdout
+(the same bytes as in help.canary.deploy.credential.long)
+--- stderr
+(empty)
+
+### help.canary.list.long
+$ nn-admin canary list --help
+exit: 0
+--- stdout
+| Stream the chained canary registry log, newest rows first (`canary-read` role). Output mirrors `fim report`: JSONL on stdout, a 1-line summary on stderr
+|
+| Usage: nn-admin canary list [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.canary.list.short
+$ nn-admin canary list -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.list.long)
+--- stderr
+(empty)
+
+### help.canary.list.subcommand
+$ nn-admin help canary list
+exit: 0
+--- stdout
+(the same bytes as in help.canary.list.long)
+--- stderr
+(empty)
+
+### help.canary.burn.long
+$ nn-admin canary burn --help
+exit: 0
+--- stdout
+| Permanently retire a canary by id (`canary-manage` role). File / credential artefacts are unlinked, network listeners closed, process canaries terminated. The K3 detector stops firing for the burned id immediately
+|
+| Usage: nn-admin canary burn [OPTIONS] --canary-id <CANARY_ID> --key <KEY>
+|
+| Options:
+|       --canary-id <CANARY_ID>          The per-canary stable id printed by `canary deploy` or `canary list`
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.canary.burn.short
+$ nn-admin canary burn -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.burn.long)
+--- stderr
+(empty)
+
+### help.canary.burn.subcommand
+$ nn-admin help canary burn
+exit: 0
+--- stdout
+(the same bytes as in help.canary.burn.long)
+--- stderr
+(empty)
+
+### help.canary.refresh.long
+$ nn-admin canary refresh --help
+exit: 0
+--- stdout
+| Re-render a canary's on-disk artefact (`canary-manage` role). §12 Q2 MANUAL lock-in: no auto-refresh; the operator must run this explicitly when a canary's bytes would otherwise grow stale
+|
+| Usage: nn-admin canary refresh [OPTIONS] --canary-id <CANARY_ID> --key <KEY>
+|
+| Options:
+|       --canary-id <CANARY_ID>          
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.canary.refresh.short
+$ nn-admin canary refresh -h
+exit: 0
+--- stdout
+(the same bytes as in help.canary.refresh.long)
+--- stderr
+(empty)
+
+### help.canary.refresh.subcommand
+$ nn-admin help canary refresh
+exit: 0
+--- stdout
+(the same bytes as in help.canary.refresh.long)
+--- stderr
+(empty)
+
+### help.net.long
+$ nn-admin net --help
+exit: 0
+--- stdout
+| Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|
+| Usage: nn-admin net <COMMAND>
+|
+| Commands:
+|   status       What the network observation covers now: netflow rows held back from the rules by the per-uid pacing, pending connects evicted, the network rings' drops, the network rules that cannot fire in this build or are blind (a resolver on DNS over TLS), and the rows no DNS or TLS reader sees into (DoT, QUIC). Signed since external audit ASK-009: give --key (without it the agent withholds them)
+|   flows        Stream the chained netflow log, newest rows first (rotated archives included). `--since-unix <ts>` filters server-side; the reply holds the newest rows that fit one frame
+|   listeners    Stream the listener log, newest rows first: one row per `listen()` the agent observed. Listen events, not a snapshot of the sockets open now (a closed listener stays listed)
+|   resolve      The hostname the agent attributed to the newest retained flow to this destination IP (netflow log), and when that flow was recorded. Nothing printed when no retained flow to it carries a name
+|   fingerprint  The netflow rows of a flow_id, with their `ja3` / `ja4` / `sni` (null: not captured — the ClientHello capture is not wired yet). No row: the flow is not in the retained log
+|   help         Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.net.short
+$ nn-admin net -h
+exit: 0
+--- stdout
+(the same bytes as in help.net.long)
+--- stderr
+(empty)
+
+### help.net.subcommand
+$ nn-admin help net
+exit: 0
+--- stdout
+(the same bytes as in help.net.long)
+--- stderr
+(empty)
+
+### help.net.without-subcommand
+$ nn-admin net
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Tappa 10 N7 — network observability operator surface. `net flows` reads the chained netflow log, `net listeners` snapshots active listeners, `net resolve <ip>` looks up DNS attribution, `net fingerprint --flow-id <hex>` dumps JA3/JA4. All four are `Role::NetRead` (1-of-N quorum per §13 Q6)
+|
+| Usage: nn-admin net <COMMAND>
+|
+| Commands:
+|   status       What the network observation covers now: netflow rows held back from the rules by the per-uid pacing, pending connects evicted, the network rings' drops, the network rules that cannot fire in this build or are blind (a resolver on DNS over TLS), and the rows no DNS or TLS reader sees into (DoT, QUIC). Signed since external audit ASK-009: give --key (without it the agent withholds them)
+|   flows        Stream the chained netflow log, newest rows first (rotated archives included). `--since-unix <ts>` filters server-side; the reply holds the newest rows that fit one frame
+|   listeners    Stream the listener log, newest rows first: one row per `listen()` the agent observed. Listen events, not a snapshot of the sockets open now (a closed listener stays listed)
+|   resolve      The hostname the agent attributed to the newest retained flow to this destination IP (netflow log), and when that flow was recorded. Nothing printed when no retained flow to it carries a name
+|   fingerprint  The netflow rows of a flow_id, with their `ja3` / `ja4` / `sni` (null: not captured — the ClientHello capture is not wired yet). No row: the flow is not in the retained log
+|   help         Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.net.status.long
+$ nn-admin net status --help
+exit: 0
+--- stdout
+| What the network observation covers now: netflow rows held back from the rules by the per-uid pacing, pending connects evicted, the network rings' drops, the network rules that cannot fire in this build or are blind (a resolver on DNS over TLS), and the rows no DNS or TLS reader sees into (DoT, QUIC). Signed since external audit ASK-009: give --key (without it the agent withholds them)
+|
+| Usage: nn-admin net status [OPTIONS]
+|
+| Options:
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|       --json                           
+|       --key <KEY>                      A key with `audit-read` or `telemetry-read` (one audit row per request)
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.net.status.short
+$ nn-admin net status -h
+exit: 0
+--- stdout
+(the same bytes as in help.net.status.long)
+--- stderr
+(empty)
+
+### help.net.status.subcommand
+$ nn-admin help net status
+exit: 0
+--- stdout
+(the same bytes as in help.net.status.long)
+--- stderr
+(empty)
+
+### help.net.flows.long
+$ nn-admin net flows --help
+exit: 0
+--- stdout
+| Stream the chained netflow log, newest rows first (rotated archives included). `--since-unix <ts>` filters server-side; the reply holds the newest rows that fit one frame
+|
+| Usage: nn-admin net flows [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's `net-read`-role admin private key
+|       --since-unix <SINCE_UNIX>        UNIX-timestamp lower bound; entries with `ts >= since` are returned
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.net.flows.short
+$ nn-admin net flows -h
+exit: 0
+--- stdout
+(the same bytes as in help.net.flows.long)
+--- stderr
+(empty)
+
+### help.net.flows.subcommand
+$ nn-admin help net flows
+exit: 0
+--- stdout
+(the same bytes as in help.net.flows.long)
+--- stderr
+(empty)
+
+### help.net.listeners.long
+$ nn-admin net listeners --help
+exit: 0
+--- stdout
+| Stream the listener log, newest rows first: one row per `listen()` the agent observed. Listen events, not a snapshot of the sockets open now (a closed listener stays listed)
+|
+| Usage: nn-admin net listeners [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.net.listeners.short
+$ nn-admin net listeners -h
+exit: 0
+--- stdout
+(the same bytes as in help.net.listeners.long)
+--- stderr
+(empty)
+
+### help.net.listeners.subcommand
+$ nn-admin help net listeners
+exit: 0
+--- stdout
+(the same bytes as in help.net.listeners.long)
+--- stderr
+(empty)
+
+### help.net.resolve.long
+$ nn-admin net resolve --help
+exit: 0
+--- stdout
+| The hostname the agent attributed to the newest retained flow to this destination IP (netflow log), and when that flow was recorded. Nothing printed when no retained flow to it carries a name
+|
+| Usage: nn-admin net resolve [OPTIONS] --ip <IP> --key <KEY>
+|
+| Options:
+|       --ip <IP>                        Target IP address (v4 or v6, string form)
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.net.resolve.short
+$ nn-admin net resolve -h
+exit: 0
+--- stdout
+(the same bytes as in help.net.resolve.long)
+--- stderr
+(empty)
+
+### help.net.resolve.subcommand
+$ nn-admin help net resolve
+exit: 0
+--- stdout
+(the same bytes as in help.net.resolve.long)
+--- stderr
+(empty)
+
+### help.net.fingerprint.long
+$ nn-admin net fingerprint --help
+exit: 0
+--- stdout
+| The netflow rows of a flow_id, with their `ja3` / `ja4` / `sni` (null: not captured — the ClientHello capture is not wired yet). No row: the flow is not in the retained log
+|
+| Usage: nn-admin net fingerprint [OPTIONS] --flow-id <FLOW_ID> --key <KEY>
+|
+| Options:
+|       --flow-id <FLOW_ID>              32-hex-char per-flow stable ID from a prior `net flows` row
+|       --key <KEY>                      
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.net.fingerprint.short
+$ nn-admin net fingerprint -h
+exit: 0
+--- stdout
+(the same bytes as in help.net.fingerprint.long)
+--- stderr
+(empty)
+
+### help.net.fingerprint.subcommand
+$ nn-admin help net fingerprint
+exit: 0
+--- stdout
+(the same bytes as in help.net.fingerprint.long)
+--- stderr
+(empty)
+
+### help.trusted-installer-grant.long
+$ nn-admin trusted-installer-grant --help
+exit: 0
+--- stdout
+| FIM-009 self-upgrade (§15.1) — arm the trusted-installer override for an in-place agent upgrade. Submits a 1-of-N (M=1) quorum-signed grant; the admin.pub line for `--key` MUST carry the `trusted-installer` role. While the window is open the agent's FS pin is suspended (so install.sh can replace the protected binary) AND a write to the agent's OWN systemd units is downgraded from kill to an audit Log. The window is bounded by --window-secs (clamped to the agent's 600 s ceiling) and by the next agent restart. Operator flow: grant → install.sh → `systemctl restart` → signed `fim baseline`
+|
+| Usage: nn-admin trusted-installer-grant [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      Path to the operator's `trusted-installer`-role admin private key
+|       --window-secs <WINDOW_SECS>      Override window in seconds. Clamped to the agent's 600 s ceiling. Keep it short — just long enough to run install.sh and restart the unit [default: 120]
+|       --agent-id-file <AGENT_ID_FILE>  Path to the agent's per-install UUID file (design §6.5) — binds the signed grant to this specific agent install [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.trusted-installer-grant.short
+$ nn-admin trusted-installer-grant -h
+exit: 0
+--- stdout
+(the same bytes as in help.trusted-installer-grant.long)
+--- stderr
+(empty)
+
+### help.trusted-installer-grant.subcommand
+$ nn-admin help trusted-installer-grant
+exit: 0
+--- stdout
+(the same bytes as in help.trusted-installer-grant.long)
+--- stderr
+(empty)
+
+### help.response.long
+$ nn-admin response --help
+exit: 0
+--- stdout
+| External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
+|
+| Usage: nn-admin response <COMMAND>
+|
+| Commands:
+|   status   What the response layer holds on this host: contained processes (scope, the cgroup each came from, whether the pid still names that process), quarantined files, the COMBAT stage. Read-only
+|   release  Release a process the agent blocked or throttled back to the cgroup it came from (never the root cgroup; only while the pid still names the process that was moved). During an open COMBAT episode the ladder may contain it again
+|   restore  Write a quarantined file back out of the vault, to the path it was taken from unless --to says otherwise. A new file only (never over an existing one, never through a link), mode 0600, outside the protected prefixes; the vault keeps the entry. The file may be malware: restore it to inspect it, not to run it
+|   help     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.response.short
+$ nn-admin response -h
+exit: 0
+--- stdout
+(the same bytes as in help.response.long)
+--- stderr
+(empty)
+
+### help.response.subcommand
+$ nn-admin help response
+exit: 0
+--- stdout
+(the same bytes as in help.response.long)
+--- stderr
+(empty)
+
+### help.response.without-subcommand
+$ nn-admin response
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| External audit CMB-016 — undo what the response layer did: `response status` lists the processes the agent holds in its containment scopes, the quarantine vault and the COMBAT stage (`audit-read`); `response release` returns a contained process to the cgroup it came from and `response restore` writes a quarantined file back out of the vault (`response-manage`). The agent does the work and records it in the signed audit log
+|
+| Usage: nn-admin response <COMMAND>
+|
+| Commands:
+|   status   What the response layer holds on this host: contained processes (scope, the cgroup each came from, whether the pid still names that process), quarantined files, the COMBAT stage. Read-only
+|   release  Release a process the agent blocked or throttled back to the cgroup it came from (never the root cgroup; only while the pid still names the process that was moved). During an open COMBAT episode the ladder may contain it again
+|   restore  Write a quarantined file back out of the vault, to the path it was taken from unless --to says otherwise. A new file only (never over an existing one, never through a link), mode 0600, outside the protected prefixes; the vault keeps the entry. The file may be malware: restore it to inspect it, not to run it
+|   help     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.response.status.long
+$ nn-admin response status --help
+exit: 0
+--- stdout
+| What the response layer holds on this host: contained processes (scope, the cgroup each came from, whether the pid still names that process), quarantined files, the COMBAT stage. Read-only
+|
+| Usage: nn-admin response status [OPTIONS] --key <KEY>
+|
+| Options:
+|       --key <KEY>                      A key with `audit-read`
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.response.status.short
+$ nn-admin response status -h
+exit: 0
+--- stdout
+(the same bytes as in help.response.status.long)
+--- stderr
+(empty)
+
+### help.response.status.subcommand
+$ nn-admin help response status
+exit: 0
+--- stdout
+(the same bytes as in help.response.status.long)
+--- stderr
+(empty)
+
+### help.response.release.long
+$ nn-admin response release --help
+exit: 0
+--- stdout
+| Release a process the agent blocked or throttled back to the cgroup it came from (never the root cgroup; only while the pid still names the process that was moved). During an open COMBAT episode the ladder may contain it again
+|
+| Usage: nn-admin response release [OPTIONS] --pid <PID> --key <KEY>
+|
+| Options:
+|       --pid <PID>                      
+|       --key <KEY>                      A key with `response-manage`
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.response.release.short
+$ nn-admin response release -h
+exit: 0
+--- stdout
+(the same bytes as in help.response.release.long)
+--- stderr
+(empty)
+
+### help.response.release.subcommand
+$ nn-admin help response release
+exit: 0
+--- stdout
+(the same bytes as in help.response.release.long)
+--- stderr
+(empty)
+
+### help.response.restore.long
+$ nn-admin response restore --help
+exit: 0
+--- stdout
+| Write a quarantined file back out of the vault, to the path it was taken from unless --to says otherwise. A new file only (never over an existing one, never through a link), mode 0600, outside the protected prefixes; the vault keeps the entry. The file may be malware: restore it to inspect it, not to run it
+|
+| Usage: nn-admin response restore [OPTIONS] --vault-id <VAULT_ID> --key <KEY>
+|
+| Options:
+|       --vault-id <VAULT_ID>            The 32-hex vault id (`nn-admin response status`)
+|       --to <TO>                        Absolute destination; the directory must exist
+|       --key <KEY>                      A key with `response-manage`
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.response.restore.short
+$ nn-admin response restore -h
+exit: 0
+--- stdout
+(the same bytes as in help.response.restore.long)
+--- stderr
+(empty)
+
+### help.response.restore.subcommand
+$ nn-admin help response restore
+exit: 0
+--- stdout
+(the same bytes as in help.response.restore.long)
+--- stderr
+(empty)
+
+### help.remediate.long
+$ nn-admin remediate --help
+exit: 0
+--- stdout
+| Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|
+| Usage: nn-admin remediate <COMMAND>
+|
+| Commands:
+|   ransomware  Restore the files a process tree rewrote (`--pid`: the process and everything it started), and/or the files copied since a time (`--since`, Unix seconds or RFC 3339: alone, every writer's earliest copy since then; with `--pid`, both must hold), from the copies the guard took before each first write. A file someone else changed after the attack, as far as the guard saw, is not overwritten: the original is written beside it (`<name>.nn-restored-<entry>`). `--dry-run` only reports the plan
+|   help        Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.remediate.short
+$ nn-admin remediate -h
+exit: 0
+--- stdout
+(the same bytes as in help.remediate.long)
+--- stderr
+(empty)
+
+### help.remediate.subcommand
+$ nn-admin help remediate
+exit: 0
+--- stdout
+(the same bytes as in help.remediate.long)
+--- stderr
+(empty)
+
+### help.remediate.without-subcommand
+$ nn-admin remediate
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Lab PR 222 — undo what ransomware rewrote, from the copy-on-first- write journal (`remediate ransomware`, `response-manage`). The agent restores and signs one `cow_restore` row per file
+|
+| Usage: nn-admin remediate <COMMAND>
+|
+| Commands:
+|   ransomware  Restore the files a process tree rewrote (`--pid`: the process and everything it started), and/or the files copied since a time (`--since`, Unix seconds or RFC 3339: alone, every writer's earliest copy since then; with `--pid`, both must hold), from the copies the guard took before each first write. A file someone else changed after the attack, as far as the guard saw, is not overwritten: the original is written beside it (`<name>.nn-restored-<entry>`). `--dry-run` only reports the plan
+|   help        Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.remediate.ransomware.long
+$ nn-admin remediate ransomware --help
+exit: 0
+--- stdout
+| Restore the files a process tree rewrote (`--pid`: the process and everything it started), and/or the files copied since a time (`--since`, Unix seconds or RFC 3339: alone, every writer's earliest copy since then; with `--pid`, both must hold), from the copies the guard took before each first write. A file someone else changed after the attack, as far as the guard saw, is not overwritten: the original is written beside it (`<name>.nn-restored-<entry>`). `--dry-run` only reports the plan
+|
+| Usage: nn-admin remediate ransomware [OPTIONS] --key <KEY>
+|
+| Options:
+|       --pid <PID>                      
+|       --since <SINCE>                  
+|       --dry-run                        
+|       --key <KEY>                      A key with `response-manage`
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|       --json                           
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.remediate.ransomware.short
+$ nn-admin remediate ransomware -h
+exit: 0
+--- stdout
+(the same bytes as in help.remediate.ransomware.long)
+--- stderr
+(empty)
+
+### help.remediate.ransomware.subcommand
+$ nn-admin help remediate ransomware
+exit: 0
+--- stdout
+(the same bytes as in help.remediate.ransomware.long)
+--- stderr
+(empty)
+
+### help.config.long
+$ nn-admin config --help
+exit: 0
+--- stdout
+| Tappa 10.8 — operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
+|
+| Usage: nn-admin config <COMMAND>
+|
+| Commands:
+|   overlay  Operator overlays (`/etc/northnarrow/*.local`): allowlists, blocklists, FIM paths, posture carve-outs. The agent loads one only if a key with the `config-manage` role signed its exact content (`<overlay>.sig`); otherwise it boots on the shipped defaults for that list and records the refusal
+|   help     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.config.short
+$ nn-admin config -h
+exit: 0
+--- stdout
+(the same bytes as in help.config.long)
+--- stderr
+(empty)
+
+### help.config.subcommand
+$ nn-admin help config
+exit: 0
+--- stdout
+(the same bytes as in help.config.long)
+--- stderr
+(empty)
+
+### help.config.without-subcommand
+$ nn-admin config
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Tappa 10.8 — operator configuration the agent loads only when an admin key signed it (`config overlay set|sign|status`)
+|
+| Usage: nn-admin config <COMMAND>
+|
+| Commands:
+|   overlay  Operator overlays (`/etc/northnarrow/*.local`): allowlists, blocklists, FIM paths, posture carve-outs. The agent loads one only if a key with the `config-manage` role signed its exact content (`<overlay>.sig`); otherwise it boots on the shipped defaults for that list and records the refusal
+|   help     Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.config.overlay.long
+$ nn-admin config overlay --help
+exit: 0
+--- stdout
+| Operator overlays (`/etc/northnarrow/*.local`): allowlists, blocklists, FIM paths, posture carve-outs. The agent loads one only if a key with the `config-manage` role signed its exact content (`<overlay>.sig`); otherwise it boots on the shipped defaults for that list and records the refusal
+|
+| Usage: nn-admin config overlay <COMMAND>
+|
+| Commands:
+|   set     Sign an overlay and store it through the running agent (role `config-manage`). The agent writes the overlay and its signature; it takes effect at the next agent start
+|   sign    Sign an overlay offline and write `<file>.sig` (or `--out`). For upgrades and hosts where the agent is stopped; with the agent running, use `set`
+|   status  Which overlays are present and whether each one would be loaded at the next agent start (exit 1 if any present overlay is not)
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.config.overlay.short
+$ nn-admin config overlay -h
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.long)
+--- stderr
+(empty)
+
+### help.config.overlay.subcommand
+$ nn-admin help config overlay
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.long)
+--- stderr
+(empty)
+
+### help.config.overlay.without-subcommand
+$ nn-admin config overlay
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Operator overlays (`/etc/northnarrow/*.local`): allowlists, blocklists, FIM paths, posture carve-outs. The agent loads one only if a key with the `config-manage` role signed its exact content (`<overlay>.sig`); otherwise it boots on the shipped defaults for that list and records the refusal
+|
+| Usage: nn-admin config overlay <COMMAND>
+|
+| Commands:
+|   set     Sign an overlay and store it through the running agent (role `config-manage`). The agent writes the overlay and its signature; it takes effect at the next agent start
+|   sign    Sign an overlay offline and write `<file>.sig` (or `--out`). For upgrades and hosts where the agent is stopped; with the agent running, use `set`
+|   status  Which overlays are present and whether each one would be loaded at the next agent start (exit 1 if any present overlay is not)
+|   help    Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.config.overlay.set.long
+$ nn-admin config overlay set --help
+exit: 0
+--- stdout
+| Sign an overlay and store it through the running agent (role `config-manage`). The agent writes the overlay and its signature; it takes effect at the next agent start
+|
+| Usage: nn-admin config overlay set [OPTIONS] --file <FILE> --key <KEY> <KIND>
+|
+| Arguments:
+|   <KIND>  fim-paths, process-comm-allowlist, netflow-comm-allowlist, netflow-blocklist, netflow-ja3-blocklist, mass-write-carveout, escalation-allow, canary-readers, cow-guard, execq-hashes, exec-policy, rule-policy
+|
+| Options:
+|       --file <FILE>                    The overlay content to store
+|       --key <KEY>                      
+|       --cosign-key <COSIGN_KEY>        Optional second signer
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.config.overlay.set.short
+$ nn-admin config overlay set -h
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.set.long)
+--- stderr
+(empty)
+
+### help.config.overlay.set.subcommand
+$ nn-admin help config overlay set
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.set.long)
+--- stderr
+(empty)
+
+### help.config.overlay.sign.long
+$ nn-admin config overlay sign --help
+exit: 0
+--- stdout
+| Sign an overlay offline and write `<file>.sig` (or `--out`). For upgrades and hosts where the agent is stopped; with the agent running, use `set`
+|
+| Usage: nn-admin config overlay sign [OPTIONS] --file <FILE> --key <KEY> <KIND>
+|
+| Arguments:
+|   <KIND>  
+|
+| Options:
+|       --file <FILE>                    
+|       --key <KEY>                      
+|       --cosign-key <COSIGN_KEY>        
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --out <OUT>                      
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.config.overlay.sign.short
+$ nn-admin config overlay sign -h
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.sign.long)
+--- stderr
+(empty)
+
+### help.config.overlay.sign.subcommand
+$ nn-admin help config overlay sign
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.sign.long)
+--- stderr
+(empty)
+
+### help.config.overlay.status.long
+$ nn-admin config overlay status --help
+exit: 0
+--- stdout
+| Which overlays are present and whether each one would be loaded at the next agent start (exit 1 if any present overlay is not)
+|
+| Usage: nn-admin config overlay status [OPTIONS]
+|
+| Options:
+|       --dir <DIR>                      [default: /etc/northnarrow]
+|       --admin-pub <ADMIN_PUB>          [default: /etc/northnarrow/admin.pub]
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --audit-log <AUDIT_LOG>          [default: /etc/northnarrow/audit.log]
+|       --agent-sig-key <AGENT_SIG_KEY>  The agent's audit signing key the chain is verified with (its public half `agent.sig.pub` when the key is closed to readers) [default: /etc/northnarrow/agent.sig.key]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.config.overlay.status.short
+$ nn-admin config overlay status -h
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.status.long)
+--- stderr
+(empty)
+
+### help.config.overlay.status.subcommand
+$ nn-admin help config overlay status
+exit: 0
+--- stdout
+(the same bytes as in help.config.overlay.status.long)
+--- stderr
+(empty)
+
+### help.policy.long
+$ nn-admin policy --help
+exit: 0
+--- stdout
+| Lab PR 236 — the signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
+|
+| Usage: nn-admin policy <COMMAND>
+|
+| Commands:
+|   show  The policy the agent applies: the signed file's (if its signature holds), else the built-in defaults, and the held responses (exit 1 when a present file would not be loaded)
+|   set   Validate, sign (role `config-manage`) and store a policy through the running agent, which applies it at once (a signed audit row). A bad line refuses the file; the policy in force stays
+|   test  Replay sample events through an offline engine (the shipped lists, an empty /proc) under a candidate policy and print each decision. Nothing is signed, stored, applied or executed
+|   help  Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+--- stderr
+(empty)
+
+### help.policy.short
+$ nn-admin policy -h
+exit: 0
+--- stdout
+(the same bytes as in help.policy.long)
+--- stderr
+(empty)
+
+### help.policy.subcommand
+$ nn-admin help policy
+exit: 0
+--- stdout
+(the same bytes as in help.policy.long)
+--- stderr
+(empty)
+
+### help.policy.without-subcommand
+$ nn-admin policy
+exit: 2
+--- stdout
+(empty)
+--- stderr
+| Lab PR 236 — the signed per-rule response policy (`rule-policy.local`): which rules enforce, alert, audit or are off, their exemptions. `show` the policy in force, `set` a new one (signed, applied at once), `test` a candidate on sample events
+|
+| Usage: nn-admin policy <COMMAND>
+|
+| Commands:
+|   show  The policy the agent applies: the signed file's (if its signature holds), else the built-in defaults, and the held responses (exit 1 when a present file would not be loaded)
+|   set   Validate, sign (role `config-manage`) and store a policy through the running agent, which applies it at once (a signed audit row). A bad line refuses the file; the policy in force stays
+|   test  Replay sample events through an offline engine (the shipped lists, an empty /proc) under a candidate policy and print each decision. Nothing is signed, stored, applied or executed
+|   help  Print this message or the help of the given subcommand(s)
+|
+| Options:
+|   -h, --help  Print help
+
+### help.policy.show.long
+$ nn-admin policy show --help
+exit: 0
+--- stdout
+| The policy the agent applies: the signed file's (if its signature holds), else the built-in defaults, and the held responses (exit 1 when a present file would not be loaded)
+|
+| Usage: nn-admin policy show [OPTIONS]
+|
+| Options:
+|       --file <FILE>                    [default: /etc/northnarrow/rule-policy.local]
+|       --admin-pub <ADMIN_PUB>          [default: /etc/northnarrow/admin.pub]
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --audit-log <AUDIT_LOG>          [default: /etc/northnarrow/audit.log]
+|       --agent-sig-key <AGENT_SIG_KEY>  [default: /etc/northnarrow/agent.sig.key]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.policy.show.short
+$ nn-admin policy show -h
+exit: 0
+--- stdout
+(the same bytes as in help.policy.show.long)
+--- stderr
+(empty)
+
+### help.policy.show.subcommand
+$ nn-admin help policy show
+exit: 0
+--- stdout
+(the same bytes as in help.policy.show.long)
+--- stderr
+(empty)
+
+### help.policy.set.long
+$ nn-admin policy set --help
+exit: 0
+--- stdout
+| Validate, sign (role `config-manage`) and store a policy through the running agent, which applies it at once (a signed audit row). A bad line refuses the file; the policy in force stays
+|
+| Usage: nn-admin policy set [OPTIONS] --file <FILE> --key <KEY>
+|
+| Options:
+|       --file <FILE>                    
+|       --key <KEY>                      
+|       --cosign-key <COSIGN_KEY>        
+|       --agent-id-file <AGENT_ID_FILE>  [default: /etc/northnarrow/agent_id]
+|       --socket <SOCKET>                [default: /run/northnarrow/admin.sock]
+|   -h, --help                           Print help
+--- stderr
+(empty)
+
+### help.policy.set.short
+$ nn-admin policy set -h
+exit: 0
+--- stdout
+(the same bytes as in help.policy.set.long)
+--- stderr
+(empty)
+
+### help.policy.set.subcommand
+$ nn-admin help policy set
+exit: 0
+--- stdout
+(the same bytes as in help.policy.set.long)
+--- stderr
+(empty)
+
+### help.policy.test.long
+$ nn-admin policy test --help
+exit: 0
+--- stdout
+| Replay sample events through an offline engine (the shipped lists, an empty /proc) under a candidate policy and print each decision. Nothing is signed, stored, applied or executed
+|
+| Usage: nn-admin policy test [OPTIONS] --events <EVENTS>
+|
+| Options:
+|       --policy <POLICY>          The candidate (`rule-policy.local` text); none = the built-in defaults
+|       --events <EVENTS>          One `nn_model::Event` JSON per line, `{"event": …}` per line, or a golden case (`agent/tests/golden/cases/*.json`)
+|       --config-dir <CONFIG_DIR>  Where the shipped lists (`*.v1`) are read; a missing one is the copy built into nn-admin [default: /etc/northnarrow]
+|       --json                     One JSON decision per line instead of the table
+|   -h, --help                     Print help
+--- stderr
+(empty)
+
+### help.policy.test.short
+$ nn-admin policy test -h
+exit: 0
+--- stdout
+(the same bytes as in help.policy.test.long)
+--- stderr
+(empty)
+
+### help.policy.test.subcommand
+$ nn-admin help policy test
+exit: 0
+--- stdout
+(the same bytes as in help.policy.test.long)
+--- stderr
+(empty)
+
