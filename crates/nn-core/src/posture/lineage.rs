@@ -66,6 +66,7 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use nn_model::Event;
 use parking_lot::RwLock;
 
 use super::host::PostureHost;
@@ -805,6 +806,41 @@ impl<H: PostureHost> AuthSessionTracker<H> {
         self.ingest_exec(pid, ppid, exe, argv, spawn_ns, 0, 0);
     }
 
+    /// Lab PR 267 (R12a): ingest `event` when it is an exec
+    /// (`Event::ProcessSpawn`), with what the posture's triggers and the
+    /// replay ingest — the file the kernel executed (else the caller's
+    /// string), the arguments, the exec's time, the process's own start,
+    /// the uid. Returns whether it was one. The priority bus calls it for
+    /// the execs still queued when an event of a higher class overtakes
+    /// them, so the lineage that event is judged on holds every exec that
+    /// reached the bus before it, as on a single queue.
+    pub fn ingest_spawn_event(&self, event: &Event) -> bool {
+        let Event::ProcessSpawn {
+            pid,
+            ppid,
+            uid,
+            filename,
+            argv,
+            timestamp_ns,
+            exe,
+            start_ns,
+            ..
+        } = event
+        else {
+            return false;
+        };
+        self.ingest_exec(
+            *pid,
+            *ppid,
+            exe.path_or(filename),
+            argv,
+            *timestamp_ns,
+            *start_ns,
+            *uid,
+        );
+        true
+    }
+
     /// External audit POS-003: [`Self::ingest_spawn_with_argv`] with the
     /// process's own start (`Event::ProcessSpawn::start_ns`, its fork),
     /// as the exec event carries it (production; 0 unknown). Lab PR 175:
@@ -859,6 +895,19 @@ impl<H: PostureHost> AuthSessionTracker<H> {
             uid,
         };
         let mut s = self.inner.state.write();
+        // Lab PR 267 (R12a): an exec the cache already holds (its time and
+        // its process's start), or one older than the exec it holds for the
+        // pid, changes nothing — the first ingest of an exec stays. The
+        // priority bus ingests an exec when an event of a higher class
+        // overtakes it ([`Self::ingest_spawn_event`]), and again when the
+        // exec itself is judged; one ring delivers a pid's execs in order,
+        // so on a single queue an older exec never followed a newer one.
+        if s.map.get(&pid).is_some_and(|prev| {
+            prev.spawn_ns > spawn_ns
+                || (prev.spawn_ns == spawn_ns && prev.start_ns == entry.start_ns)
+        }) {
+            return;
+        }
         // NN-AUD-284: whatever ran under this pid before is over.
         s.seen_running.remove(&pid);
         // Review 49: package-manager spawns also go to the side cache;

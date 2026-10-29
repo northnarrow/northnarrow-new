@@ -345,7 +345,7 @@ mod tests {
         let mut s = store.lock();
         let key = s.current_key(4300);
         let note = s
-            .take_egress_after(
+            .answer_sequence_after(
                 key,
                 4_000_000_000,
                 crate::decision::correlation::CORRELATION_WINDOW_NS,

@@ -418,28 +418,30 @@ impl Host {
                         .collect();
                     json!({"sweep": events.len(), "decisions": fired})
                 }
-                Item::Execpol(p) => {
-                    let records =
-                        crate::execpol::record::records_of(&p.raw(), &p.event(), &p.policy);
-                    Value::Array(
-                        records
-                            .iter()
-                            .map(|r| {
-                                let mut v = replay::outside_line(
-                                    Some(r.verdict.clone()),
-                                    r.attack.as_slice(),
-                                    Some(r.response.clone()),
-                                );
-                                v["execpol"] = serde_json::to_value(&r.evidence).unwrap();
-                                v
-                            })
-                            .collect(),
-                    )
-                }
+                Item::Execpol(p) => execpol_lines(p),
             });
         }
         out
     }
+}
+
+/// The exec policy's records of one kernel report, as decision lines.
+fn execpol_lines(p: &ExecPolInput) -> Value {
+    let records = crate::execpol::record::records_of(&p.raw(), &p.event(), &p.policy);
+    Value::Array(
+        records
+            .iter()
+            .map(|r| {
+                let mut v = replay::outside_line(
+                    Some(r.verdict.clone()),
+                    r.attack.as_slice(),
+                    Some(r.response.clone()),
+                );
+                v["execpol"] = serde_json::to_value(&r.evidence).unwrap();
+                v
+            })
+            .collect(),
+    )
 }
 
 /// The golden text of one replay: a header naming the case and the policy
@@ -795,4 +797,534 @@ fn every_case_shows_what_it_says() {
             "case {name}: `enforced` / `exempt` need a `policy`"
         );
     }
+}
+
+// ── Lab PR 267 (R12a): the priority bus does not change a verdict ────────
+//
+// R12a gives each class of events a queue of its own, taken by strict
+// priority with aging and FIFO inside a class (`nn_core::bus`): two events
+// of different classes can reach `process_event` in another order than the
+// kernel saw them — today's pumps already interleave them as they are
+// scheduled, the bus can hold a lower class back for longer. The property:
+// every order of a stream's events that keeps each class's own order gives
+// the same verdicts — for each rule and process, the strongest verdict the
+// rule gave the process, and the responses run on each process ([`Judged`];
+// not which event's line carried them, nor how often). The stream's order
+// is the order the events reached the bus: an event is judged on the
+// lineage of every exec that arrived before it, as the bus gives it
+// (`nn_linux::sensors::bus`: the execs an event of a higher class
+// overtakes are ingested first). Checked on every golden case: all such
+// orders while they are few (`EXHAUSTIVE_MAX`), else every class-major
+// order (each class whole, the classes in every order), the bus's own take
+// order with the consumer behind by 1 to all of the stream, and a fixed
+// sample of random merges.
+//
+// What it found (lab PR 267), fixed in the stores, not in this test: the
+// process lineage and the chains' ancestry tree learned an exec only when
+// it was judged, so a tamper event taken before the exec of its process,
+// or a fan-out counted before the execs of the children, was judged
+// without them (NN-L-EVA-003 lost its target, NN-L-NET-026/027 their
+// parent) — the bus now hands them the execs it overtakes, and an exec
+// ingested twice, or after a newer one of its pid, changes nothing; the
+// chain store let one chain keep another off a flow and a late exec pick a
+// held port-53 egress over the flow its kill is for — each chain now
+// answers a flow once, in any order.
+
+/// The lane of an exec policy report: not the bus — its own ring, read by
+/// the exec policy apart from the event loop.
+const OUTSIDE_BUS: usize = nn_core::bus::QUEUES;
+const LANES: usize = OUTSIDE_BUS + 1;
+/// Up to this many orders, every order is replayed.
+const EXHAUSTIVE_MAX: u128 = 2_000;
+/// Random merges replayed per case when not every order is.
+const RANDOM_ORDERS: u64 = 256;
+
+/// One item of a stream as the bus carries it: an event (a sweep is its
+/// events, each queued on its own) or an exec policy report.
+enum Unit<'a> {
+    Event(Event),
+    Execpol(&'a ExecPolInput),
+}
+
+/// A case's units in stream order, with their lanes.
+fn units(case: &Case) -> Vec<(usize, Unit<'_>)> {
+    let mut out = Vec::new();
+    for item in &case.items {
+        match item {
+            Item::Event(e) => out.push((
+                nn_core::bus::Priority::of_event(e).index(),
+                Unit::Event((**e).clone()),
+            )),
+            Item::TcpSweep(s) => {
+                for e in s.events() {
+                    out.push((nn_core::bus::Priority::of_event(&e).index(), Unit::Event(e)));
+                }
+            }
+            Item::Execpol(p) => out.push((OUTSIDE_BUS, Unit::Execpol(p))),
+        }
+    }
+    out
+}
+
+/// What a replay of a stream decided, whichever event carried each
+/// judgment: for every rule and process it judged, the rule's verdict —
+/// action, severity, policy mode, whether its response was held or the
+/// rule exempt, ATT&CK — the strongest when it judged the process more than
+/// once; and the responses that run, per process. Not compared: a decision
+/// line's composition (one line per event, so a correlation is combined
+/// with the matches of the event that completed it), the text and time a
+/// line carries (a chain completed late names the order it was processed
+/// in, by design: review 70, lab PRs 235 and 244), and how often a rule
+/// judged a process (in order a chain answers each flow of the process; a
+/// precursor processed late completes the chain once).
+#[derive(Debug, PartialEq, Eq)]
+struct Judged {
+    /// (rule, pid) → the strongest verdict, as text.
+    verdicts: std::collections::BTreeMap<(String, u64), String>,
+    /// pid → the actions run on it (a tree kill includes the process's).
+    effects: std::collections::BTreeMap<u64, BTreeSet<String>>,
+}
+
+/// The rule verdicts of one decision line: (rule, pid, strength, text).
+fn rule_verdicts(line: &Value, out: &mut Vec<(String, u64, (bool, u8), String)>) {
+    let view = |rule: &Value,
+                action: &Value,
+                severity: &Value,
+                pid: &Value,
+                mitre: &Value,
+                mode: &str,
+                held: bool,
+                exempt: bool| {
+        let text = serde_json::to_string(&json!({
+            "rule": rule, "action": action, "severity": severity, "pid": pid,
+            "mitre": mitre, "mode": mode, "held": held, "exempt": exempt,
+        }))
+        .unwrap();
+        let rank = match action.as_str().unwrap_or("Log") {
+            "Log" => 0,
+            "KillProcess" => 2,
+            "KillProcessTree" => 3,
+            _ => 1,
+        };
+        (
+            rule.as_str().unwrap_or("").to_string(),
+            pid.as_u64().unwrap_or(0),
+            (!held && !exempt, rank),
+            text,
+        )
+    };
+    match line.get("matches").and_then(Value::as_array) {
+        Some(ms) => {
+            for m in ms {
+                out.push(view(
+                    &m["rule"],
+                    &m["action"],
+                    &m["severity"],
+                    &m["pid"],
+                    &m["mitre"],
+                    m["mode"].as_str().unwrap(),
+                    m.get("held").is_some(),
+                    m.get("exempt").is_some(),
+                ));
+            }
+        }
+        None => out.push(view(
+            &line["rule"],
+            &line["action"],
+            &line["severity"],
+            &line["pid"],
+            &line["mitre"],
+            "builtin",
+            line["reasoning"]
+                .as_str()
+                .is_some_and(|r| r.contains("[held back: ")),
+            false,
+        )),
+    }
+    // An exec policy record carries its evidence and its response: outside
+    // the bus, they are compared whole.
+    if let Some(e) = line.get("execpol") {
+        let text = serde_json::to_string(&json!({"execpol": e, "response": line.get("response")}))
+            .unwrap();
+        out.push((format!("execpol {text}"), 0, (true, 0), text));
+    }
+}
+
+/// The responses one decision line runs, `(pid, action)`.
+fn line_effects(line: &Value) -> Vec<(u64, String)> {
+    if let Some(rs) = line.get("responses").and_then(Value::as_array) {
+        return rs
+            .iter()
+            .map(|r| {
+                (
+                    r["pid"].as_u64().unwrap(),
+                    r["action"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+    }
+    let pid = line["pid"].as_u64().unwrap_or(0);
+    let mut out = Vec::new();
+    if let Some(a) = line["action"].as_str().filter(|a| *a != "Log") {
+        out.push((pid, a.to_string()));
+    }
+    if let Some(r) = line.get("response").and_then(Value::as_str) {
+        out.push((pid, r.to_string()));
+    }
+    out
+}
+
+/// A fresh replay of a case with its units in `order`, the bus's way: an
+/// event is judged on the lineage of every exec that reached the bus
+/// before it (the units before it in the stream; `nn_linux::sensors::bus`
+/// ingests the execs an event of a higher class overtakes), and an exec
+/// judged after a newer one of its process changes nothing there.
+fn judged_in(name: &str, text: &str, order: &[usize]) -> Judged {
+    let root = tempfile::TempDir::new().unwrap();
+    let case = parse(name, text, root.path());
+    let host = Host::new(&case, root);
+    let units = units(&case);
+    assert_eq!(
+        order.len(),
+        units.len(),
+        "case {name}: an order of every unit"
+    );
+    let root_text = host.root.path().to_str().unwrap().to_string();
+    let mut arrived = vec![false; units.len()];
+    let mut lines = Vec::new();
+    for &i in order {
+        for (j, (_, u)) in units.iter().enumerate().take(i) {
+            if let (false, Unit::Event(e)) = (arrived[j], u) {
+                replay::arrive(&host.engine, &host.lineage, e);
+                arrived[j] = true;
+            }
+        }
+        arrived[i] = true;
+        let v = match &units[i].1 {
+            Unit::Event(e) => host.decide(e),
+            Unit::Execpol(p) => execpol_lines(p),
+        };
+        decisions(&v, &mut lines);
+    }
+    let lines: Vec<Value> = lines
+        .iter()
+        .map(|l| {
+            serde_json::from_str(
+                &serde_json::to_string(l)
+                    .unwrap()
+                    .replace(&root_text, ROOT_TOKEN),
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut all = Vec::new();
+    let mut effects: std::collections::BTreeMap<u64, BTreeSet<String>> = Default::default();
+    for l in &lines {
+        rule_verdicts(l, &mut all);
+        for (pid, a) in line_effects(l) {
+            effects.entry(pid).or_default().insert(a);
+        }
+    }
+    for actions in effects.values_mut() {
+        if actions.contains("KillProcessTree") {
+            actions.remove("KillProcess");
+        }
+    }
+    let mut verdicts: std::collections::BTreeMap<(String, u64), ((bool, u8), String)> =
+        Default::default();
+    for (rule, pid, strength, text) in all {
+        let e = verdicts
+            .entry((rule, pid))
+            .or_insert((strength, text.clone()));
+        if (strength, &text) > (e.0, &e.1) {
+            *e = (strength, text);
+        }
+    }
+    Judged {
+        verdicts: verdicts.into_iter().map(|(k, (_, t))| (k, t)).collect(),
+        effects,
+    }
+}
+
+/// A small deterministic generator (xorshift64*), for the random merges.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// The units of each lane, in stream order.
+fn lane_queues(lanes: &[usize]) -> [Vec<usize>; LANES] {
+    let mut q: [Vec<usize>; LANES] = Default::default();
+    for (i, &l) in lanes.iter().enumerate() {
+        q[l].push(i);
+    }
+    q
+}
+
+/// The order a sequence of lane picks gives (each pick the lane's next unit).
+fn order_of_picks(q: &[Vec<usize>; LANES], picks: &[usize]) -> Vec<usize> {
+    let mut next = [0usize; LANES];
+    picks
+        .iter()
+        .map(|&l| {
+            let u = q[l][next[l]];
+            next[l] += 1;
+            u
+        })
+        .collect()
+}
+
+/// How many orders keep each lane's order: n! / Π kᵢ! (saturating).
+fn fifo_order_count(q: &[Vec<usize>; LANES]) -> u128 {
+    let mut count: u128 = 1;
+    let mut placed: u128 = 0;
+    for lane in q {
+        for k in 1..=lane.len() as u128 {
+            placed += 1;
+            count = count.saturating_mul(placed) / k;
+        }
+    }
+    count
+}
+
+/// Every order that keeps each lane's order.
+fn all_fifo_orders(q: &[Vec<usize>; LANES]) -> Vec<Vec<usize>> {
+    fn go(
+        q: &[Vec<usize>; LANES],
+        left: &mut [usize; LANES],
+        picks: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        if left.iter().all(|&n| n == 0) {
+            out.push(order_of_picks(q, picks));
+            return;
+        }
+        for l in 0..LANES {
+            if left[l] > 0 {
+                left[l] -= 1;
+                picks.push(l);
+                go(q, left, picks, out);
+                picks.pop();
+                left[l] += 1;
+            }
+        }
+    }
+    let mut left = [0usize; LANES];
+    for (l, lane) in q.iter().enumerate() {
+        left[l] = lane.len();
+    }
+    let mut out = Vec::new();
+    go(q, &mut left, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Every class-major order: each non-empty lane whole, the lanes in every
+/// order.
+fn class_major_orders(q: &[Vec<usize>; LANES]) -> Vec<Vec<usize>> {
+    fn perms(items: &[usize]) -> Vec<Vec<usize>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let first = rest.remove(i);
+            for mut p in perms(&rest) {
+                p.insert(0, first);
+                out.push(p);
+            }
+        }
+        out
+    }
+    let lanes: Vec<usize> = (0..LANES).filter(|&l| !q[l].is_empty()).collect();
+    perms(&lanes)
+        .into_iter()
+        .map(|p| p.into_iter().flat_map(|l| q[l].iter().copied()).collect())
+        .collect()
+}
+
+/// The bus's own take order: the units arrive in stream order, one per
+/// tick; the consumer takes one each time more than `lag` wait, then
+/// drains the queues. An exec policy report is not queued.
+fn bus_order(lanes: &[usize], lag: usize) -> Vec<usize> {
+    let mut queues = nn_core::bus::ClassQueues::new([usize::MAX; nn_core::bus::QUEUES]);
+    let mut out = Vec::new();
+    let mut queued = 0usize;
+    for (i, &l) in lanes.iter().enumerate() {
+        let now = i as u64;
+        if l == OUTSIDE_BUS {
+            out.push(i);
+            continue;
+        }
+        queues.push(nn_core::bus::Priority::ALL[l], now, i).unwrap();
+        queued += 1;
+        while queued > lag {
+            out.push(queues.take(now).unwrap().item);
+            queued -= 1;
+        }
+    }
+    let end = lanes.len() as u64;
+    while let Some(t) = queues.take(end) {
+        out.push(t.item);
+    }
+    out
+}
+
+/// Random merges: at each step one non-empty lane, uniformly, for one unit
+/// or (every other merge) a run of up to 16.
+fn random_orders(q: &[Vec<usize>; LANES], seed: u64, n: u64) -> Vec<Vec<usize>> {
+    let total: usize = q.iter().map(Vec::len).sum();
+    (0..n)
+        .map(|k| {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (k + 1));
+            let mut left: Vec<usize> = q.iter().map(Vec::len).collect();
+            let mut picks = Vec::with_capacity(total);
+            while picks.len() < total {
+                let open: Vec<usize> = (0..LANES).filter(|&l| left[l] > 0).collect();
+                let l = open[rng.below(open.len())];
+                let run = if k % 2 == 1 { 1 + rng.below(16) } else { 1 };
+                for _ in 0..run.min(left[l]) {
+                    picks.push(l);
+                    left[l] -= 1;
+                }
+            }
+            order_of_picks(q, &picks)
+        })
+        .collect()
+}
+
+/// The orders a case is replayed in, each with what it is.
+fn orders_for(lanes: &[usize], seed: u64) -> Vec<(String, Vec<usize>)> {
+    let q = lane_queues(lanes);
+    if fifo_order_count(&q) <= EXHAUSTIVE_MAX {
+        return all_fifo_orders(&q)
+            .into_iter()
+            .enumerate()
+            .map(|(i, o)| (format!("order {i} of all"), o))
+            .collect();
+    }
+    let mut out: Vec<(String, Vec<usize>)> = class_major_orders(&q)
+        .into_iter()
+        .map(|o| ("class-major".to_string(), o))
+        .collect();
+    for lag in [1, 2, 4, 8, 32, 128, usize::MAX] {
+        out.push((
+            format!("the bus, consumer behind by {lag}"),
+            bus_order(lanes, lag),
+        ));
+    }
+    for (k, o) in random_orders(&q, seed, RANDOM_ORDERS)
+        .into_iter()
+        .enumerate()
+    {
+        out.push((format!("random merge {k}"), o));
+    }
+    out
+}
+
+/// The orders keep each lane's order and hold every unit once.
+fn assert_fifo_order(lanes: &[usize], order: &[usize]) {
+    let mut seen = vec![false; lanes.len()];
+    let mut last = [None::<usize>; LANES];
+    for &u in order {
+        assert!(!seen[u], "unit {u} twice");
+        seen[u] = true;
+        if let Some(prev) = last[lanes[u]] {
+            assert!(prev < u, "lane {} out of its order", lanes[u]);
+        }
+        last[lanes[u]] = Some(u);
+    }
+    assert!(seen.iter().all(|&s| s), "a unit left out");
+}
+
+/// Lab PR 267 (R12a): every order of a golden case's events that keeps
+/// each class's own order gives the verdicts of the stream's order.
+#[test]
+fn golden_verdicts_survive_every_per_class_fifo_interleaving() {
+    let cases = cases();
+    let mut failures = Vec::new();
+    let mut replays = 0usize;
+    let mut exhaustive = 0usize;
+    for (ci, (name, text)) in cases.iter().enumerate() {
+        let lanes: Vec<usize> = {
+            let root = tempfile::TempDir::new().unwrap();
+            let case = parse(name, text, root.path());
+            units(&case).iter().map(|(l, _)| *l).collect()
+        };
+        let in_order: Vec<usize> = (0..lanes.len()).collect();
+        let want = judged_in(name, text, &in_order);
+        let orders = orders_for(&lanes, ci as u64 + 1);
+        if fifo_order_count(&lane_queues(&lanes)) <= EXHAUSTIVE_MAX {
+            exhaustive += 1;
+        }
+        for (what, order) in &orders {
+            assert_fifo_order(&lanes, order);
+            replays += 1;
+            let got = judged_in(name, text, order);
+            if got != want {
+                let missing: Vec<&String> = want
+                    .verdicts
+                    .iter()
+                    .filter(|(k, v)| got.verdicts.get(*k) != Some(*v))
+                    .map(|(_, v)| v)
+                    .collect();
+                let extra: Vec<&String> = got
+                    .verdicts
+                    .iter()
+                    .filter(|(k, v)| want.verdicts.get(*k) != Some(*v))
+                    .map(|(_, v)| v)
+                    .collect();
+                let picks: Vec<String> = order.iter().map(|&u| lanes[u].to_string()).collect();
+                failures.push(format!(
+                    "case {name}, {what} (lanes in order: {}):\n  verdicts missing: {missing:?}\n  verdicts extra: {extra:?}\n  effects: {:?} -> {:?}",
+                    picks.join(""),
+                    want.effects,
+                    got.effects
+                ));
+                break;
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a verdict depends on the order between classes ({replays} replays):\n{}",
+        failures.join("\n")
+    );
+    assert!(replays > cases.len(), "no interleaving replayed");
+    eprintln!(
+        "bus property: {} cases, {replays} interleavings replayed, {exhaustive} cases with every order",
+        cases.len()
+    );
+}
+
+/// The generators keep each lane's order, and the bus's take order is a
+/// per-class FIFO order too.
+#[test]
+fn the_interleavings_keep_each_class_s_order() {
+    let lanes = [1, 2, 3, 2, 0, 1, 4, 3, 3, 0, 2];
+    let q = lane_queues(&lanes);
+    let all = all_fifo_orders(&q);
+    assert_eq!(all.len() as u128, fifo_order_count(&q));
+    let unique: BTreeSet<&Vec<usize>> = all.iter().collect();
+    assert_eq!(unique.len(), all.len());
+    for o in all.iter().chain(class_major_orders(&q).iter()) {
+        assert_fifo_order(&lanes, o);
+    }
+    for lag in [0, 1, 3, usize::MAX] {
+        assert_fifo_order(&lanes, &bus_order(&lanes, lag));
+    }
+    assert_eq!(bus_order(&lanes, 0), (0..lanes.len()).collect::<Vec<_>>());
+    for o in random_orders(&q, 7, 10) {
+        assert_fifo_order(&lanes, &o);
+    }
+    assert_eq!(class_major_orders(&q).len(), 120, "5 lanes, 5! orders");
 }

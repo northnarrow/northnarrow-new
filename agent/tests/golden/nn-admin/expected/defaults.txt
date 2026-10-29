@@ -196,7 +196,7 @@ exit: 0
 |   90  -
 |   91  NN-L-FIM-017_GpgKeyringAccessed KillProcess High pid 6400001
 |   92  NN-L-CHAIN-001_CredReadThenEgress KillProcessTree Critical pid 6400001  [NN-L-CHAIN-001_CredReadThenEgress builtin KillProcessTree; NN-L-NET-001_OutboundToBlockedIp builtin KillProcessTree; NN-L-NET-008_OutboundFromTmpExec builtin KillProcess]
-|   93  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6400001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
+|   93  NN-L-CHAIN-007_TmpCredExfilSequence KillProcessTree Critical pid 6400001  [NN-L-CHAIN-007_TmpCredExfilSequence builtin KillProcessTree; NN-L-CHAIN-002_TmpExecThenEgress builtin KillProcessTree; R009_RootExecFromUserPath builtin KillProcessTree; R001_ExecFromTmp builtin KillProcessTree]
 |   94  -
 |   95  -
 |   96  -

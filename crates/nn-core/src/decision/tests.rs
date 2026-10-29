@@ -1728,9 +1728,14 @@ fn a_late_exec_completes_chain002_and_the_flow_gets_two_chain_verdicts() {
     );
     assert_eq!(d.responses[0].action, ResponseAction::KillProcessTree);
     assert!(chains(p.decide(&flow(FlowPhase::Closed))).is_empty());
+    // Lab PR 267 (R12a): the late read gives the flow CHAIN-007 and the
+    // CHAIN-001 it has in kernel order, as the exec gave it CHAIN-002.
     assert_eq!(
         chains(p.decide(&read(11 * SEC))),
-        ["NN-L-CHAIN-007_TmpCredExfilSequence"]
+        [
+            "NN-L-CHAIN-007_TmpCredExfilSequence",
+            "NN-L-CHAIN-001_CredReadThenEgress"
+        ]
     );
     assert!(chains(p.decide(&read(11 * SEC + 5))).is_empty());
     assert!(chains(p.decide(&exec(10 * SEC + 5))).is_empty());

@@ -228,6 +228,21 @@ impl<H: DecisionHost> RuleEngine<H> {
     /// the connect, NN-L-CANARY-003 answers it — and no rule judges a row
     /// of that connection ([`Self::owned_by_trip`]).
     pub fn decide(&self, event: &Event) -> Option<Decision> {
+        self.decide_inner(event)
+    }
+
+    /// Lab PR 267 (R12a): `event` is queued on the bus behind an event of a
+    /// higher class that is judged first: every rule learns what it makes
+    /// known of the process tree ([`super::Rule::observe_arrival`]: the
+    /// chains' ancestry tree learns an exec), so the event judged first
+    /// sees the process tree of every event that reached the bus before it.
+    pub fn observe_arrival(&self, event: &Event) {
+        for rule in &self.rules {
+            rule.observe_arrival(event);
+        }
+    }
+
+    fn decide_inner(&self, event: &Event) -> Option<Decision> {
         if let Event::CanaryTripped {
             access_kind: CanaryAccessKind::NetworkConnect,
             accessor_pid,

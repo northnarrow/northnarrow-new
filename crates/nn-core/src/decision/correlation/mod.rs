@@ -15,6 +15,6 @@ pub mod store;
 
 pub use ancestry::AncestryTree;
 pub use store::{
-    retention_ns, ChainAge, CorrelationStore, EgressNote, PrecursorKind, ProcKey,
-    CORRELATION_WINDOW_NS, LONG_RETENTION_NS,
+    retention_ns, Answered, ChainAge, CorrelationStore, EgressChain, EgressNote, PrecursorKind,
+    ProcKey, CORRELATION_WINDOW_NS, LONG_RETENTION_NS,
 };

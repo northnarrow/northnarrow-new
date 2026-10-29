@@ -132,28 +132,7 @@ pub fn decide<H: DecisionHost>(
     lineage: &AuthSessionTracker<H>,
     event: &Event,
 ) -> Value {
-    if let Event::ProcessSpawn {
-        pid,
-        ppid,
-        uid,
-        filename,
-        argv,
-        timestamp_ns,
-        exe,
-        start_ns,
-        ..
-    } = event
-    {
-        lineage.ingest_exec(
-            *pid,
-            *ppid,
-            exe.path_or(filename),
-            argv,
-            *timestamp_ns,
-            *start_ns,
-            *uid,
-        );
-    }
+    lineage.ingest_spawn_event(event);
     match event {
         Event::FsProtectDenial { .. } => {
             let at001 = super::rules::anti_tamper::NnLAt001AntiTamperDenial;
@@ -166,6 +145,20 @@ pub fn decide<H: DecisionHost>(
             outside_line(v, rule.map_or(&[][..], |r| r.attack()), response)
         }
         _ => decision_line(engine.decide(event).as_ref()),
+    }
+}
+
+/// Lab PR 267 (R12a): what the bus does for an exec an event of a higher
+/// class overtakes (`nn_linux::sensors::bus`): the lineage ingests it and
+/// the engine's rules learn its place in the process tree
+/// ([`RuleEngine::observe_arrival`]); judging it later changes neither.
+pub fn arrive<H: DecisionHost>(
+    engine: &RuleEngine<H>,
+    lineage: &AuthSessionTracker<H>,
+    event: &Event,
+) {
+    if lineage.ingest_spawn_event(event) {
+        engine.observe_arrival(event);
     }
 }
 
